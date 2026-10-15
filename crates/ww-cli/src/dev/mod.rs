@@ -130,6 +130,11 @@ pub enum DevCommand {
     /// It refuses when stdin or stderr isn't a terminal, when nothing protected changed, when the
     /// PR is closed, a draft or not into main, and when the head moved after the summary.
     ///
+    /// After posting, it re-runs this PR's failed protected-test-check runs for that commit, so
+    /// the check sees the approval and turns green. If a run is still going, it waits for it for
+    /// up to 60 s first. If the re-run can't be requested, the approval still stands: it prints
+    /// a warning with the address to re-run the check from in the browser.
+    ///
     /// Run it from a ww built from a clean origin/main worktree that agents can't write to: a
     /// binary built from a tree an agent can change could capture the passphrase.
     #[command(verbatim_doc_comment)]

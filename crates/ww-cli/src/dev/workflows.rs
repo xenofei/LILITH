@@ -592,15 +592,27 @@ fn workflow_ci_guard_never_runs_head_code() {
     let (text, doc) = get("ci-guard.yml");
     let mut t = triggers(&doc);
     t.sort();
-    assert_eq!(t, ["pull_request", "pull_request_review"]);
+    // R40: every workflow run is its own check suite, and the ruleset refuses a merge while any
+    // suite on the head commit holds a cancelled or failed protected-test-check. So: only
+    // `pull_request`, no `pull_request_review` (it added a run per review), no
+    // `ready_for_review` (a draft-to-ready switch added a run for the same commit; the verdict
+    // doesn't depend on draft state), and no run ever cancels another run of the same commit.
+    // `ww dev approve` re-runs the commit's failed runs after posting the approval instead.
+    assert_eq!(t, ["pull_request"]);
+    assert!(doc["on"]["pull_request_review"].is_badvalue());
     assert_eq!(
         str_list(&doc["on"]["pull_request"]["types"]),
-        ["opened", "synchronize", "reopened", "ready_for_review"]
+        ["opened", "synchronize", "reopened"]
     );
+    // Per-head concurrency, never cancelling: a new push gets a new group, and a second run
+    // for the same commit (a close and reopen) waits instead of cancelling the first.
+    let concurrency = &doc["jobs"]["protected-test-check"]["concurrency"];
     assert_eq!(
-        str_list(&doc["on"]["pull_request_review"]["types"]),
-        ["submitted"]
+        s(&concurrency["group"]),
+        "guard-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}"
     );
+    assert_eq!(concurrency["cancel-in-progress"].as_bool(), Some(false));
+    assert!(doc["concurrency"].is_badvalue(), "no workflow-level group");
 
     let job = &doc["jobs"]["protected-test-check"];
     assert_eq!(

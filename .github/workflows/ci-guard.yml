@@ -13,8 +13,22 @@
 #   posts a same-named check. That is why `.github/workflows/**` is protected (QA-019, R21): such a
 #   PR itself needs the reviewer app's approval. `ww dev merge` also recomputes the verdict
 #   locally, and post-merge.yml judges every push to main from main.
-# - `pull_request_review` re-runs the check when a review is submitted, so the reviewer app's
-#   approval turns the check green without a new push.
+#
+# Runs and check suites (ruling R40). Every workflow run is its own check suite, and GitHub's
+# ruleset refuses the merge while any suite on the head commit holds a cancelled or failed
+# `protected-test-check`. So:
+# - Only `opened`, `synchronize` and `reopened` start it. There is no `pull_request_review`
+#   trigger (it added a run per review, which cancelled the earlier run) and no
+#   `ready_for_review` (a draft-to-ready switch added a second run for the same commit; the
+#   verdict doesn't depend on draft state). A close and reopen can still give a commit a second
+#   run.
+# - Concurrency is per PR and head commit, and never cancels: a new push gets a new group (runs
+#   for older heads finish on their own), and a second run for the same commit waits for the
+#   first instead of cancelling it.
+# - The reviewer app's approval turns the check green without a new push because
+#   `ww dev approve` re-runs every finished, non-green run of this workflow for that PR and
+#   commit after posting the review. A re-run keeps the original event payload, and the guard
+#   reads the PR's reviews live.
 #
 # No sccache here: the GitHub Actions cache this job could read is also written by jobs that run
 # PR code (every-push, pr-ready), so a cached object could swap the judge. `ww` is built from
@@ -24,9 +38,7 @@ name: "CI: protected-test check"
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  pull_request_review:
-    types: [submitted]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -45,8 +57,8 @@ jobs:
       contents: read # check out main and fetch the PR head
       pull-requests: read # read the PR's reviews for the reviewer app's approval
     concurrency:
-      group: guard-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
+      group: guard-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: false
     env:
       CARGO_TERM_COLOR: always
     steps:
