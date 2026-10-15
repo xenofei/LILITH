@@ -17,10 +17,23 @@
 //! passphrase stops here, before any network call); mint a 9-minute RS256 App JWT
 //! ([`app_jwt`]); exchange it for an installation token; re-read the PR and refuse unless it is
 //! still open, not a draft, into the base branch and at the exact head the summary was computed
-//! for; then post exactly one `APPROVE` review pinned to that head.
+//! for; then post exactly one `APPROVE` review pinned to that head; then re-run the guard check.
 //!
-//! **The token** is requested for this repo only, with only `pull_requests: write`, and is
-//! revoked (`DELETE /installation/token`) right after the post, whatever the outcome; a failed
+//! **Re-running the guard check** (ruling R40). `ci-guard.yml` runs only on `pull_request`, so
+//! each head commit has one check suite holding `protected-test-check`, and its run from before
+//! the approval failed. After the review is posted, `approve` finds that workflow's newest
+//! `pull_request` run for the approved head and asks GitHub to re-run it; the re-run keeps the
+//! original event payload and the guard reads the reviews live, so it passes. GitHub re-runs only
+//! finished runs, so an unfinished one is awaited for up to [`RERUN_WAIT`]. Nothing here can undo
+//! the approval: when the run isn't found, is still running, the PR head moved, or GitHub refuses
+//! (for example because the App lacks Actions write), `approve` still succeeds and returns a
+//! [`Rerun::Warning`] saying where to re-run the check by hand.
+//!
+//! **The token** is requested for this repo only, with `pull_requests: write` and
+//! `actions: write` ([`TokenScope::ReviewAndRerun`]). If GitHub refuses that because the
+//! installation hasn't granted Actions write yet, a `pull_requests: write` token is requested
+//! instead and the re-run is skipped with a warning. The token is revoked
+//! (`DELETE /installation/token`) after the post and the re-run, whatever the outcome; a failed
 //! revoke is only a warning, since the token expires within an hour anyway.
 //!
 //! **Secrets.** The passphrase, the decrypted PEM, the JWT and the installation token are never
@@ -35,7 +48,7 @@
 //! cursor or erase lines) are printed as `\u{1b}` and so on, and such paths always need approval
 //! (ruling R23).
 
-use super::github::{API_BASE, GitHubApi, PrInfo};
+use super::github::{API_BASE, GitHubApi, PrInfo, WorkflowRun};
 use super::guard;
 use super::merge::{
     self, MergeGuardConfig, blocker_lines, check_origin, committed_config, explain, fetch,
@@ -311,15 +324,62 @@ pub fn app_jwt(app_id: u64, pem: &[u8], now_unix: i64) -> Result<String> {
 // The installation-token exchange.
 // ---------------------------------------------------------------------------------------------
 
+/// What an installation token is requested for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenScope {
+    /// `pull_requests: write` and `actions: write`: post the review, then re-run the guard
+    /// check (ruling R40). Always asked for first.
+    ReviewAndRerun,
+    /// `pull_requests: write` only: the fallback when the installation hasn't granted Actions
+    /// write, so an approval still works (without the re-run).
+    ReviewOnly,
+}
+
+impl TokenScope {
+    /// The `permissions` object of the token request.
+    pub fn permissions(self) -> Value {
+        match self {
+            TokenScope::ReviewAndRerun => {
+                serde_json::json!({"pull_requests": "write", "actions": "write"})
+            }
+            TokenScope::ReviewOnly => serde_json::json!({"pull_requests": "write"}),
+        }
+    }
+}
+
+/// GitHub refused the installation-token exchange. 403 or 422 for a [`TokenScope::ReviewAndRerun`]
+/// request means the installation hasn't granted a permission asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRefused {
+    pub status: u16,
+    pub message: String,
+}
+
+impl fmt::Display for TokenRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GitHub refused the installation-token exchange with HTTP {}: {}",
+            self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for TokenRefused {}
+
 /// `POST /app/installations/{id}/access_tokens` (relative to [`API_BASE`]), asking for a token
-/// limited to `repo` and to `pull_requests: write`.
-pub fn build_token_request(installation_id: u64, repo: &str) -> (Method, String, Value) {
+/// limited to `repo` and to `scope`'s permissions.
+pub fn build_token_request(
+    installation_id: u64,
+    repo: &str,
+    scope: TokenScope,
+) -> (Method, String, Value) {
     (
         Method::POST,
         format!("/app/installations/{installation_id}/access_tokens"),
         serde_json::json!({
             "repositories": [repo],
-            "permissions": {"pull_requests": "write"}
+            "permissions": scope.permissions()
         }),
     )
 }
@@ -344,8 +404,15 @@ pub(crate) fn revoke_warning(e: &anyhow::Error, token: &str) -> String {
 
 /// The network seam for installation tokens: [`GitHubAppTokens`] for real, a fake in tests.
 pub trait InstallationTokens {
-    /// Exchanges the App JWT for an installation token scoped to `repo`.
-    fn exchange(&self, jwt: &str, installation_id: u64, repo: &str) -> Result<String>;
+    /// Exchanges the App JWT for an installation token scoped to `repo` and `scope`. A refusal
+    /// from GitHub is a [`TokenRefused`].
+    fn exchange(
+        &self,
+        jwt: &str,
+        installation_id: u64,
+        repo: &str,
+        scope: TokenScope,
+    ) -> Result<String>;
     /// Revokes an installation token.
     fn revoke(&self, token: &str) -> Result<()>;
 }
@@ -354,8 +421,14 @@ pub trait InstallationTokens {
 pub struct GitHubAppTokens;
 
 impl InstallationTokens for GitHubAppTokens {
-    fn exchange(&self, jwt: &str, installation_id: u64, repo: &str) -> Result<String> {
-        exchange_installation_token(jwt, installation_id, repo)
+    fn exchange(
+        &self,
+        jwt: &str,
+        installation_id: u64,
+        repo: &str,
+        scope: TokenScope,
+    ) -> Result<String> {
+        exchange_installation_token(jwt, installation_id, repo, scope)
     }
 
     fn revoke(&self, token: &str) -> Result<()> {
@@ -393,11 +466,12 @@ fn bearer(secret: &str) -> Result<HeaderValue> {
     Ok(value)
 }
 
-/// The `token` from a 201 response; anything else is an error carrying GitHub's message.
+/// The `token` from a 201 response; anything else is a [`TokenRefused`] carrying GitHub's
+/// message.
 pub fn parse_token_response(status: u16, body: &Value) -> Result<String> {
     if status != 201 {
-        let message = body["message"].as_str().unwrap_or("no message");
-        bail!("GitHub refused the installation-token exchange with HTTP {status}: {message}");
+        let message = body["message"].as_str().unwrap_or("no message").to_owned();
+        return Err(TokenRefused { status, message }.into());
     }
     match body["token"].as_str() {
         Some(t) if !t.is_empty() => Ok(t.to_owned()),
@@ -407,8 +481,13 @@ pub fn parse_token_response(status: u16, body: &Value) -> Result<String> {
 
 /// The real exchange: the JWT is sent as a bearer token and the installation token returned.
 /// Neither is ever printed or put in an error.
-pub fn exchange_installation_token(jwt: &str, installation_id: u64, repo: &str) -> Result<String> {
-    let (method, path, body) = build_token_request(installation_id, repo);
+pub fn exchange_installation_token(
+    jwt: &str,
+    installation_id: u64,
+    repo: &str,
+    scope: TokenScope,
+) -> Result<String> {
+    let (method, path, body) = build_token_request(installation_id, repo, scope);
     let url = format!("{API_BASE}{path}");
     let resp = http_client()?
         .request(method.clone(), &url)
@@ -545,7 +624,7 @@ pub(crate) fn review_body(head: &str, summary: &str) -> String {
 /// refusal posts nothing.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the brief's signature plus expected_head (ruling R20)"
+    reason = "the brief's signature plus expected_head (ruling R20) and pause (R40)"
 )]
 pub fn approve(
     pr: u64,
@@ -557,7 +636,8 @@ pub fn approve(
     summary: &str,
     now_unix: i64,
     expected_head: &str,
-) -> Result<()> {
+    pause: &dyn Fn(Duration),
+) -> Result<Rerun> {
     if !prompt.is_interactive() {
         bail!(NOT_INTERACTIVE);
     }
@@ -592,19 +672,188 @@ pub fn approve(
     drop(passphrase);
     let jwt = Zeroizing::new(app_jwt(key_file.app_id, &pem, now_unix)?);
     drop(pem);
-    let token = Zeroizing::new(
+    let exchange = |scope| {
         tokens
-            .exchange(&jwt, key_file.installation_id, &cfg.repo)
-            .context("exchanging the App JWT for an installation token; nothing was approved")?,
-    );
+            .exchange(&jwt, key_file.installation_id, &cfg.repo, scope)
+            .context("exchanging the App JWT for an installation token; nothing was approved")
+    };
+    // Ask for Actions write too, so the guard check can be re-run (R40). An installation that
+    // hasn't granted it yet makes GitHub refuse the whole request (403 or 422); then a
+    // review-only token still lets the approval through, without the re-run.
+    let (token, can_rerun) = match exchange(TokenScope::ReviewAndRerun) {
+        Ok(t) => (Zeroizing::new(t), true),
+        Err(e)
+            if e.downcast_ref::<TokenRefused>()
+                .is_some_and(|r| matches!(r.status, 403 | 422)) =>
+        {
+            (Zeroizing::new(exchange(TokenScope::ReviewOnly)?), false)
+        }
+        Err(e) => return Err(e),
+    };
     drop(jwt);
 
-    let posted = post_if_unchanged(pr, cfg, gh, summary, expected_head, &token);
+    let outcome = post_if_unchanged(pr, cfg, gh, summary, expected_head, &token).map(|()| {
+        if can_rerun {
+            rerun_guard_check(pr, cfg, gh, expected_head, &token, pause)
+        } else {
+            Rerun::Warning(rerun_warning(
+                &NO_ACTIONS_PERMISSION,
+                &checks_url(cfg, pr),
+                &token,
+            ))
+        }
+    });
     // Best effort, whatever happened: the token is useless once the review is posted.
     if let Err(e) = tokens.revoke(&token) {
         eprintln!("{}", revoke_warning(&e, &token));
     }
-    posted
+    outcome
+}
+
+/// What `approve` did about the guard check after posting the review (ruling R40).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rerun {
+    /// GitHub accepted the re-run of this `pull_request` run of the guard workflow.
+    Requested { run_id: u64 },
+    /// The approval is posted, but the check wasn't re-run. The text says why and where to
+    /// re-run it by hand; it never holds a token.
+    Warning(String),
+}
+
+/// The guard's workflow file, whose `pull_request` run `approve` re-runs.
+pub const GUARD_WORKFLOW: &str = "ci-guard.yml";
+/// The one event that starts the guard workflow.
+pub const GUARD_EVENT: &str = "pull_request";
+/// How long `approve` waits for an unfinished guard run before giving up on the re-run.
+pub const RERUN_WAIT: Duration = Duration::from_secs(60);
+/// How often it looks again while it waits.
+pub const RERUN_POLL: Duration = Duration::from_secs(5);
+
+/// Why the re-run is skipped when the installation only grants a review-only token.
+const NO_ACTIONS_PERMISSION: &str = "the reviewer app's installation hasn't granted Actions: Read and write; see docs/dev/merge-guard.md, section 2.5";
+
+/// The newest `pull_request` run for `head` among `runs`. Runs of another event or commit are
+/// ignored even if GitHub returned them.
+pub(crate) fn latest_guard_run(runs: &[WorkflowRun], head: &str) -> Option<WorkflowRun> {
+    runs.iter()
+        .filter(|r| r.event == GUARD_EVENT && r.head_sha == head)
+        .max_by_key(|r| r.id)
+        .cloned()
+}
+
+/// "Approval posted, but ... (<reason>). Re-run it in the browser: <url>", on one line, with
+/// control characters escaped and the token cut out.
+pub(crate) fn rerun_warning(reason: &dyn fmt::Display, url: &str, token: &str) -> String {
+    let mut reason = one_line(&format!("{reason:#}"));
+    if !token.is_empty() {
+        reason = reason.replace(token, "<redacted>");
+    }
+    format!(
+        "Approval posted, but the guard check couldn't be re-run automatically ({}). Re-run it in the browser: {}",
+        guard::escape_controls(&reason),
+        guard::escape_controls(url)
+    )
+}
+
+/// The PR's checks page.
+fn checks_url(cfg: &MergeGuardConfig, pr: u64) -> String {
+    format!(
+        "https://github.com/{}/{}/pull/{pr}/checks",
+        cfg.owner, cfg.repo
+    )
+}
+
+/// A workflow run's page. Built here rather than taken from GitHub's `html_url`.
+fn run_url(cfg: &MergeGuardConfig, run_id: u64) -> String {
+    format!(
+        "https://github.com/{}/{}/actions/runs/{run_id}",
+        cfg.owner, cfg.repo
+    )
+}
+
+/// Finds the guard's newest `pull_request` run for `head` and asks GitHub to re-run it (ruling
+/// R40). The re-run keeps the run's original event payload, and the guard reads the reviews
+/// live, so it now sees the approval. Never fails: whatever goes wrong becomes a
+/// [`Rerun::Warning`].
+///
+/// GitHub re-runs only finished runs. An unfinished run is looked at again every
+/// [`RERUN_POLL`] for up to [`RERUN_WAIT`]; if it is still running then, the warning gives its
+/// address instead of cancelling it (it may already have read the approval). Before asking,
+/// the PR is re-read: if its head moved, the approval no longer counts and re-running the old
+/// head's run would only cancel the new head's run (same concurrency group), so nothing is
+/// re-run.
+fn rerun_guard_check(
+    pr: u64,
+    cfg: &MergeGuardConfig,
+    gh: &dyn GitHubApi,
+    head: &str,
+    token: &str,
+    pause: &dyn Fn(Duration),
+) -> Rerun {
+    let checks = checks_url(cfg, pr);
+    let warn =
+        |reason: &dyn fmt::Display, url: &str| Rerun::Warning(rerun_warning(reason, url, token));
+    let mut waited = Duration::ZERO;
+    let run = loop {
+        let found = gh
+            .workflow_runs_as_app(GUARD_WORKFLOW, GUARD_EVENT, head, token)
+            .map(|runs| latest_guard_run(&runs, head));
+        let run = match found {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                return warn(
+                    &format!(
+                        "no `{GUARD_EVENT}` run of {GUARD_WORKFLOW} was found for {}",
+                        short(head)
+                    ),
+                    &checks,
+                );
+            }
+            Err(e) => {
+                return warn(&format!("listing the guard's runs failed: {e:#}"), &checks);
+            }
+        };
+        if run.status == "completed" {
+            break run;
+        }
+        if waited >= RERUN_WAIT {
+            return warn(
+                &format!(
+                    "guard run {} is still {} after {} s, and GitHub re-runs only finished runs",
+                    run.id,
+                    run.status,
+                    RERUN_WAIT.as_secs()
+                ),
+                &run_url(cfg, run.id),
+            );
+        }
+        if waited.is_zero() {
+            eprintln!(
+                "The guard check for {} is still running; waiting up to {} s for it to finish so it can be re-run.",
+                short(head),
+                RERUN_WAIT.as_secs()
+            );
+        }
+        pause(RERUN_POLL);
+        waited += RERUN_POLL;
+    };
+    let url = run_url(cfg, run.id);
+    match gh.pr(pr) {
+        Ok(info) if info.head_sha == head => {}
+        Ok(_) => {
+            return Rerun::Warning(format!(
+                "Approval posted, but the PR head moved after it, so it no longer counts and the guard check was not re-run. Run `ww dev approve {pr}` again for the new head."
+            ));
+        }
+        Err(e) => return warn(&format!("re-reading PR #{pr} failed: {e:#}"), &url),
+    }
+    match gh.rerun_as_app(run.id, token) {
+        Ok(()) => Rerun::Requested { run_id: run.id },
+        Err(e) => warn(
+            &format!("GitHub refused to re-run guard run {}: {e:#}", run.id),
+            &url,
+        ),
+    }
 }
 
 /// Re-reads the PR immediately before posting and posts only when it is still open, not a
@@ -860,13 +1109,20 @@ pub fn run_approve(pr: u64) -> i32 {
         &prepared.summary,
         unix_now(),
         &prepared.head,
+        &std::thread::sleep,
     ) {
-        Ok(()) => {
+        Ok(rerun) => {
             println!(
                 "Approved PR #{pr} at {} as {}.",
                 short(&prepared.head),
                 prepared.cfg.reviewer_login()
             );
+            match rerun {
+                Rerun::Requested { run_id } => println!(
+                    "Asked GitHub to re-run protected-test-check (workflow run {run_id}); it reads the approval and turns green when it finishes."
+                ),
+                Rerun::Warning(warning) => eprintln!("{warning}"),
+            }
             0
         }
         Err(e) => refuse(&format!("{e:#}")),
@@ -1076,30 +1332,57 @@ mod tests {
     struct Exchange<'a> {
         calls: RefCell<Vec<(String, u64)>>,
         repos: RefCell<Vec<String>>,
+        scopes: RefCell<Vec<TokenScope>>,
         revoked: RefCell<Vec<String>>,
         fail_exchange: bool,
+        /// Refuses exchanges for this scope with this HTTP status (as GitHub refuses a
+        /// permission the installation hasn't granted).
+        refuse_scope: Option<(TokenScope, u16)>,
         fail_revoke: bool,
         on_exchange: Option<Box<dyn Fn() + 'a>>,
+        on_revoke: Option<Box<dyn Fn() + 'a>>,
     }
 
     impl InstallationTokens for Exchange<'_> {
-        fn exchange(&self, jwt: &str, installation_id: u64, repo: &str) -> Result<String> {
+        fn exchange(
+            &self,
+            jwt: &str,
+            installation_id: u64,
+            repo: &str,
+            scope: TokenScope,
+        ) -> Result<String> {
             self.calls
                 .borrow_mut()
                 .push((jwt.to_string(), installation_id));
             self.repos.borrow_mut().push(repo.to_string());
+            self.scopes.borrow_mut().push(scope);
             if let Some(f) = &self.on_exchange {
                 f();
             }
             if self.fail_exchange {
-                bail!(
-                    "GitHub refused the installation-token exchange with HTTP 401: Bad credentials"
-                );
+                return Err(TokenRefused {
+                    status: 401,
+                    message: "Bad credentials".into(),
+                }
+                .into());
+            }
+            if let Some((refused, status)) = self.refuse_scope
+                && refused == scope
+            {
+                return Err(TokenRefused {
+                    status,
+                    message: "The permissions requested are not granted to this installation."
+                        .into(),
+                }
+                .into());
             }
             Ok(TOKEN.to_string())
         }
         fn revoke(&self, token: &str) -> Result<()> {
             self.revoked.borrow_mut().push(token.to_string());
+            if let Some(f) = &self.on_revoke {
+                f();
+            }
             if self.fail_revoke {
                 // A badly behaved error that echoes the token: the warning must hide it.
                 bail!("revoking {token} failed with HTTP 500");
@@ -1114,7 +1397,20 @@ mod tests {
         exchange: &Exchange,
         summary: &str,
         expected_head: &str,
-    ) -> Result<()> {
+    ) -> Result<Rerun> {
+        run_with_pause(fake, prompt, exchange, summary, expected_head, &|_| {
+            panic!("approve paused, but no guard run was unfinished")
+        })
+    }
+
+    fn run_with_pause(
+        fake: &FakeGitHub,
+        prompt: &FakePrompt,
+        exchange: &Exchange,
+        summary: &str,
+        expected_head: &str,
+        pause: &dyn Fn(Duration),
+    ) -> Result<Rerun> {
         approve(
             PR,
             &cfg(),
@@ -1125,8 +1421,32 @@ mod tests {
             summary,
             NOW,
             expected_head,
+            pause,
         )
     }
+
+    /// An open PR at [`HEAD`] whose guard has one finished `pull_request` run, id 12.
+    fn pr_with_guard_run() -> FakeGitHub {
+        let fake = open_pr();
+        fake.add_workflow_run(GUARD_WORKFLOW, 12, "pull_request", HEAD, "completed");
+        fake
+    }
+
+    fn approved() -> FakePrompt {
+        FakePrompt::new().confirms(&[true]).passphrases(&[PASS])
+    }
+
+    fn warning(r: Rerun) -> String {
+        match r {
+            Rerun::Warning(w) => w,
+            other => panic!("expected a warning, got {other:?}"),
+        }
+    }
+
+    const CHECKS_URL: &str = "https://github.com/xenofei/Worldwright-Suite/pull/42/checks";
+    const RUN_12_URL: &str = "https://github.com/xenofei/Worldwright-Suite/actions/runs/12";
+    const WARNING_START: &str =
+        "Approval posted, but the guard check couldn't be re-run automatically (";
 
     fn claims(jwt: &str) -> (serde_json::Value, serde_json::Value) {
         let parts: Vec<&str> = jwt.split('.').collect();
@@ -1137,7 +1457,7 @@ mod tests {
         (decode(parts[0]), decode(parts[1]))
     }
 
-    fn err_text(r: Result<()>) -> String {
+    fn err_text<T: fmt::Debug>(r: Result<T>) -> String {
         format!("{:#}", r.expect_err("expected a refusal"))
     }
 
@@ -1540,9 +1860,20 @@ mod tests {
 
     #[test]
     fn token_exchange_request_and_response() {
-        let (m, path, body) = build_token_request(456, "Worldwright-Suite");
+        // R40: the token can post the review and re-run the guard check, in this repo only.
+        let (m, path, body) =
+            build_token_request(456, "Worldwright-Suite", TokenScope::ReviewAndRerun);
         assert_eq!(m, reqwest::Method::POST);
         assert_eq!(path, "/app/installations/456/access_tokens");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "repositories": ["Worldwright-Suite"],
+                "permissions": {"pull_requests": "write", "actions": "write"}
+            })
+        );
+        // The fallback for an installation that hasn't granted Actions write yet.
+        let (_, _, body) = build_token_request(456, "Worldwright-Suite", TokenScope::ReviewOnly);
         assert_eq!(
             body,
             serde_json::json!({
@@ -1555,9 +1886,13 @@ mod tests {
         assert_eq!(path, "/installation/token");
         let ok = serde_json::json!({"token": "ghs_abc", "expires_at": "2026-10-13T00:00:00Z"});
         assert_eq!(parse_token_response(201, &ok).unwrap(), "ghs_abc");
-        let e = parse_token_response(401, &serde_json::json!({"message": "Bad credentials"}))
-            .unwrap_err()
-            .to_string();
+        let refused = parse_token_response(401, &serde_json::json!({"message": "Bad credentials"}))
+            .unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<TokenRefused>().map(|r| r.status),
+            Some(401)
+        );
+        let e = refused.to_string();
         assert!(e.contains("401") && e.contains("Bad credentials"), "{e}");
         assert!(parse_token_response(201, &serde_json::json!({})).is_err());
         assert!(parse_token_response(201, &serde_json::json!({"token": ""})).is_err());
@@ -1637,6 +1972,7 @@ mod tests {
                 SUMMARY,
                 NOW,
                 HEAD,
+                &|_| {},
             ));
             assert!(e.contains(DAMAGED_KEY), "{e}");
             assert!(e.contains("nothing was posted"), "{e}");
@@ -1691,6 +2027,319 @@ mod tests {
             left,
             vec![std::ffi::OsString::from("app-key.age")],
             "{left:?}"
+        );
+    }
+
+    // ---- R40: after the approval, re-run the guard's pull_request run ------------------------
+
+    #[test] // spec: QA-020, QA-033
+    fn approval_reruns_the_guard_run_for_that_head() {
+        let fake = open_pr();
+        // The run to re-run: the newest `pull_request` run of ci-guard.yml for HEAD.
+        fake.add_workflow_run(GUARD_WORKFLOW, 10, "pull_request", HEAD, "completed");
+        fake.add_workflow_run(GUARD_WORKFLOW, 12, "pull_request", HEAD, "completed");
+        // Decoys: another event, another commit, another workflow.
+        fake.add_workflow_run(GUARD_WORKFLOW, 15, "pull_request_review", HEAD, "completed");
+        fake.add_workflow_run(GUARD_WORKFLOW, 20, "pull_request", NEW, "completed");
+        fake.add_workflow_run("ci-pr-ready.yml", 30, "pull_request", HEAD, "completed");
+        let exchange = Exchange::default();
+        let rerun = run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap();
+
+        assert_eq!(rerun, Rerun::Requested { run_id: 12 });
+        assert_eq!(fake.reruns(), vec![12]);
+        assert_eq!(
+            fake.run_queries(),
+            vec![(
+                "ci-guard.yml".to_string(),
+                "pull_request".to_string(),
+                HEAD.to_string()
+            )]
+        );
+        assert_eq!(fake.posted_reviews().len(), 1);
+        assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
+    }
+
+    #[test] // spec: QA-020
+    fn latest_guard_run_ignores_other_events_and_commits() {
+        let r = |id: u64, event: &str, sha: &str, status: &str| WorkflowRun {
+            id,
+            event: event.into(),
+            head_sha: sha.into(),
+            status: status.into(),
+        };
+        // Even if GitHub ignored the query's filters, only a pull_request run for HEAD counts.
+        let runs = vec![
+            r(40, "pull_request_review", HEAD, "completed"),
+            r(30, "pull_request", NEW, "completed"),
+            r(7, "pull_request", HEAD, "in_progress"),
+            r(9, "pull_request", HEAD, "completed"),
+        ];
+        assert_eq!(latest_guard_run(&runs, HEAD).map(|r| r.id), Some(9));
+        assert_eq!(latest_guard_run(&runs[..2], HEAD), None);
+        assert_eq!(latest_guard_run(&[], HEAD), None);
+    }
+
+    #[test] // spec: QA-020
+    fn the_token_is_requested_with_actions_write() {
+        let fake = pr_with_guard_run();
+        let exchange = Exchange::default();
+        run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap();
+        assert_eq!(*exchange.scopes.borrow(), vec![TokenScope::ReviewAndRerun]);
+        assert_eq!(
+            *exchange.repos.borrow(),
+            vec!["Worldwright-Suite".to_string()]
+        );
+        assert_eq!(
+            TokenScope::ReviewAndRerun.permissions(),
+            serde_json::json!({"pull_requests": "write", "actions": "write"})
+        );
+    }
+
+    #[test] // spec: QA-020
+    fn post_then_rerun_then_revoke() {
+        let fake = pr_with_guard_run();
+        let exchange = Exchange {
+            on_revoke: Some(Box::new(|| fake.log_event("revoke"))),
+            ..Exchange::default()
+        };
+        run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap();
+        assert_eq!(
+            fake.events(),
+            ["post_review", "workflow_runs", "rerun 12", "revoke"]
+        );
+    }
+
+    #[test] // spec: QA-020
+    fn no_guard_run_found_warns_and_succeeds() {
+        let fake = open_pr();
+        let exchange = Exchange::default();
+        let w = warning(run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap());
+        assert!(w.starts_with(WARNING_START), "{w}");
+        assert!(w.contains("no `pull_request` run"), "{w}");
+        assert!(
+            w.ends_with(&format!("Re-run it in the browser: {CHECKS_URL}")),
+            "{w}"
+        );
+        assert!(!w.contains(TOKEN), "{w}");
+        assert_eq!(fake.posted_reviews().len(), 1);
+        assert!(fake.reruns().is_empty());
+        assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
+    }
+
+    #[test] // spec: QA-020
+    fn rerun_refused_warns_with_the_run_url_and_succeeds() {
+        let fake = pr_with_guard_run();
+        // An error that echoes the token: the warning must hide it.
+        fake.fail_rerun(&format!(
+            "HTTP 403: Resource not accessible by integration (token {TOKEN})"
+        ));
+        let exchange = Exchange::default();
+        let w = warning(run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap());
+        assert!(w.starts_with(WARNING_START), "{w}");
+        assert!(w.contains("403"), "{w}");
+        assert!(
+            w.ends_with(&format!("Re-run it in the browser: {RUN_12_URL}")),
+            "{w}"
+        );
+        assert!(!w.contains(TOKEN), "{w}");
+        assert_eq!(fake.posted_reviews().len(), 1);
+        assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
+    }
+
+    #[test] // spec: QA-020
+    fn listing_the_runs_fails_warns_and_succeeds() {
+        let fake = pr_with_guard_run();
+        fake.fail_workflow_runs("HTTP 502: Bad Gateway");
+        let w = warning(run(&fake, &approved(), &Exchange::default(), SUMMARY, HEAD).unwrap());
+        assert!(w.starts_with(WARNING_START), "{w}");
+        assert!(w.contains("502"), "{w}");
+        assert!(w.ends_with(CHECKS_URL), "{w}");
+        assert!(fake.reruns().is_empty());
+    }
+
+    #[test] // spec: QA-020
+    fn an_unfinished_run_is_awaited_then_rerun() {
+        let fake = open_pr();
+        fake.add_workflow_run(GUARD_WORKFLOW, 12, "pull_request", HEAD, "in_progress");
+        let pauses = RefCell::new(Vec::new());
+        let pause = |d: Duration| {
+            pauses.borrow_mut().push(d);
+            if pauses.borrow().len() == 2 {
+                fake.set_run_status(12, "completed");
+            }
+        };
+        let rerun = run_with_pause(
+            &fake,
+            &approved(),
+            &Exchange::default(),
+            SUMMARY,
+            HEAD,
+            &pause,
+        )
+        .unwrap();
+        assert_eq!(rerun, Rerun::Requested { run_id: 12 });
+        assert_eq!(*pauses.borrow(), vec![RERUN_POLL; 2]);
+        assert_eq!(fake.reruns(), vec![12]);
+    }
+
+    #[test] // spec: QA-020
+    fn a_run_still_unfinished_after_the_wait_warns_and_succeeds() {
+        let fake = open_pr();
+        fake.add_workflow_run(GUARD_WORKFLOW, 12, "pull_request", HEAD, "queued");
+        let pauses = RefCell::new(Vec::new());
+        let exchange = Exchange::default();
+        let w = warning(
+            run_with_pause(&fake, &approved(), &exchange, SUMMARY, HEAD, &|d| {
+                pauses.borrow_mut().push(d)
+            })
+            .unwrap(),
+        );
+        // Bounded: 60 s in 5 s steps, then a warning with the run's address.
+        assert_eq!(RERUN_WAIT, Duration::from_secs(60));
+        assert_eq!(RERUN_POLL, Duration::from_secs(5));
+        assert_eq!(pauses.borrow().iter().sum::<Duration>(), RERUN_WAIT);
+        assert!(w.starts_with(WARNING_START), "{w}");
+        assert!(w.contains("still queued"), "{w}");
+        assert!(w.ends_with(RUN_12_URL), "{w}");
+        assert!(fake.reruns().is_empty());
+        assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
+    }
+
+    #[test] // spec: QA-020
+    fn no_actions_permission_still_approves_and_warns() {
+        for status in [403, 422] {
+            let fake = pr_with_guard_run();
+            let exchange = Exchange {
+                refuse_scope: Some((TokenScope::ReviewAndRerun, status)),
+                ..Exchange::default()
+            };
+            let w = warning(run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap());
+            assert_eq!(
+                *exchange.scopes.borrow(),
+                vec![TokenScope::ReviewAndRerun, TokenScope::ReviewOnly]
+            );
+            assert_eq!(fake.posted_reviews().len(), 1);
+            assert!(w.starts_with(WARNING_START), "{w}");
+            assert!(w.contains("Actions: Read and write"), "{w}");
+            assert!(w.ends_with(CHECKS_URL), "{w}");
+            // Nothing is tried with a token that can't re-run.
+            assert!(fake.run_queries().is_empty());
+            assert!(fake.reruns().is_empty());
+            assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
+        }
+        // Any other refusal is not retried, and nothing is approved.
+        let fake = pr_with_guard_run();
+        let exchange = Exchange {
+            fail_exchange: true,
+            ..Exchange::default()
+        };
+        let e = err_text(run(&fake, &approved(), &exchange, SUMMARY, HEAD));
+        assert!(e.contains("nothing was approved"), "{e}");
+        assert_eq!(exchange.scopes.borrow().len(), 1);
+        assert!(fake.posted_reviews().is_empty());
+    }
+
+    #[test] // spec: QA-020
+    fn a_failed_post_reruns_nothing() {
+        let fake = pr_with_guard_run();
+        fake.set_head(PR, NEW);
+        let exchange = Exchange::default();
+        let e = err_text(run(&fake, &approved(), &exchange, SUMMARY, HEAD));
+        assert_eq!(e, HEAD_MOVED);
+        assert!(fake.run_queries().is_empty());
+        assert!(fake.reruns().is_empty());
+        assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
+    }
+
+    #[test] // spec: QA-020
+    fn a_head_moved_after_the_approval_reruns_nothing() {
+        // A push lands after the review: re-running the old head's run would cancel the new
+        // head's run (same concurrency group), and the approval no longer counts anyway.
+        let fake = pr_with_guard_run();
+        let exchange = Exchange::default();
+        let pushed = || fake.set_head(PR, NEW);
+        // The head moves once the review is posted (the fake logs it), before the re-run.
+        let w = {
+            let rerun = approve(
+                PR,
+                &cfg(),
+                &MovesAfterPost {
+                    fake: &fake,
+                    on_post: &pushed,
+                },
+                &approved(),
+                &key_file(),
+                &exchange,
+                SUMMARY,
+                NOW,
+                HEAD,
+                &|_| {},
+            )
+            .unwrap();
+            warning(rerun)
+        };
+        assert!(w.contains("head moved"), "{w}");
+        assert!(w.contains("ww dev approve"), "{w}");
+        assert!(fake.reruns().is_empty());
+        assert_eq!(fake.posted_reviews().len(), 1);
+    }
+
+    /// Forwards to the fake and runs `on_post` right after the review is posted.
+    struct MovesAfterPost<'a> {
+        fake: &'a FakeGitHub,
+        on_post: &'a dyn Fn(),
+    }
+
+    impl GitHubApi for MovesAfterPost<'_> {
+        fn pr(&self, n: u64) -> Result<PrInfo> {
+            self.fake.pr(n)
+        }
+        fn check(&self, sha: &str, name: &str) -> Result<crate::dev::github::CheckState> {
+            self.fake.check(sha, name)
+        }
+        fn reviews(&self, n: u64) -> Result<Vec<crate::dev::github::Review>> {
+            self.fake.reviews(n)
+        }
+        fn merge(&self, n: u64, sha: &str) -> Result<crate::dev::github::MergeOutcome> {
+            self.fake.merge(n, sha)
+        }
+        fn post_review_as_app(&self, n: u64, sha: &str, body: &str, token: &str) -> Result<()> {
+            let posted = self.fake.post_review_as_app(n, sha, body, token);
+            (self.on_post)();
+            posted
+        }
+        fn commit_pulls(&self, sha: &str) -> Result<Vec<crate::dev::github::CommitPull>> {
+            self.fake.commit_pulls(sha)
+        }
+        fn workflow_runs_as_app(
+            &self,
+            workflow: &str,
+            event: &str,
+            head_sha: &str,
+            token: &str,
+        ) -> Result<Vec<WorkflowRun>> {
+            self.fake
+                .workflow_runs_as_app(workflow, event, head_sha, token)
+        }
+        fn rerun_as_app(&self, run_id: u64, token: &str) -> Result<()> {
+            self.fake.rerun_as_app(run_id, token)
+        }
+    }
+
+    #[test] // spec: QA-020
+    fn rerun_warning_is_one_safe_line() {
+        let w = rerun_warning(
+            &anyhow!("first line\nsecond {TOKEN} \u{1b}[2J"),
+            CHECKS_URL,
+            TOKEN,
+        );
+        assert!(!w.contains('\n'), "{w}");
+        assert!(!w.contains('\u{1b}'), "{w}");
+        assert!(!w.contains(TOKEN), "{w}");
+        assert!(w.starts_with(WARNING_START), "{w}");
+        assert!(
+            w.ends_with(&format!("). Re-run it in the browser: {CHECKS_URL}")),
+            "{w}"
         );
     }
 
@@ -1835,6 +2484,19 @@ mod tests {
         }
         fn commit_pulls(&self, sha: &str) -> Result<Vec<crate::dev::github::CommitPull>> {
             self.0.commit_pulls(sha)
+        }
+        fn workflow_runs_as_app(
+            &self,
+            workflow: &str,
+            event: &str,
+            head_sha: &str,
+            token: &str,
+        ) -> Result<Vec<WorkflowRun>> {
+            self.0
+                .workflow_runs_as_app(workflow, event, head_sha, token)
+        }
+        fn rerun_as_app(&self, run_id: u64, token: &str) -> Result<()> {
+            self.0.rerun_as_app(run_id, token)
         }
     }
 

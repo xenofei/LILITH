@@ -13,8 +13,17 @@
 #   posts a same-named check. That is why `.github/workflows/**` is protected (QA-019, R21): such a
 #   PR itself needs the reviewer app's approval. `ww dev merge` also recomputes the verdict
 #   locally, and post-merge.yml judges every push to main from main.
-# - `pull_request_review` re-runs the check when a review is submitted, so the reviewer app's
-#   approval turns the check green without a new push.
+#
+# One trigger, one check suite (ruling R40). Only `pull_request` starts this workflow, so each head
+# commit has exactly one check suite holding `protected-test-check`. GitHub's ruleset and
+# `ww dev merge` then read the same run. (An earlier `pull_request_review` trigger made a second
+# suite; its run cancelled the first through `concurrency`, and the ruleset still read the first
+# suite's cancelled run and refused the merge.) The reviewer app's approval turns the check green
+# without a new push because `ww dev approve` re-runs this run after posting the review: a re-run
+# keeps the original event payload, and the guard reads the PR's reviews live.
+#
+# Concurrency is per PR with cancel-in-progress, so a newer push to the PR (a `synchronize`
+# event) supersedes a run for an older head.
 #
 # No sccache here: the GitHub Actions cache this job could read is also written by jobs that run
 # PR code (every-push, pr-ready), so a cached object could swap the judge. `ww` is built from
@@ -25,8 +34,6 @@ name: "CI: protected-test check"
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  pull_request_review:
-    types: [submitted]
 
 permissions:
   contents: read

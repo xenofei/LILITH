@@ -592,15 +592,23 @@ fn workflow_ci_guard_never_runs_head_code() {
     let (text, doc) = get("ci-guard.yml");
     let mut t = triggers(&doc);
     t.sort();
-    assert_eq!(t, ["pull_request", "pull_request_review"]);
+    // R40: exactly one trigger, so each head commit has exactly one check suite holding
+    // protected-test-check. (A `pull_request_review` trigger made a second suite; the ruleset
+    // then read the first suite's cancelled or failed run.) `ww dev approve` re-runs this
+    // suite's run after posting the approval instead.
+    assert_eq!(t, ["pull_request"]);
+    assert!(doc["on"]["pull_request_review"].is_badvalue());
     assert_eq!(
         str_list(&doc["on"]["pull_request"]["types"]),
         ["opened", "synchronize", "reopened", "ready_for_review"]
     );
+    // Per-PR concurrency: a newer push supersedes an older run.
+    let concurrency = &doc["jobs"]["protected-test-check"]["concurrency"];
     assert_eq!(
-        str_list(&doc["on"]["pull_request_review"]["types"]),
-        ["submitted"]
+        s(&concurrency["group"]),
+        "guard-${{ github.event.pull_request.number }}"
     );
+    assert_eq!(concurrency["cancel-in-progress"].as_bool(), Some(true));
 
     let job = &doc["jobs"]["protected-test-check"];
     assert_eq!(

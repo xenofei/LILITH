@@ -1,7 +1,7 @@
 //! In-memory [`GitHubApi`] for tests. Script it with the setters, then pass `&fake` wherever a
 //! `&dyn GitHubApi` is expected.
 
-use super::github::{CheckState, CommitPull, GitHubApi, MergeOutcome, PrInfo, Review};
+use super::github::{CheckState, CommitPull, GitHubApi, MergeOutcome, PrInfo, Review, WorkflowRun};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,6 +27,17 @@ struct State {
     commit_pulls: HashMap<String, Vec<CommitPull>>,
     /// commit sha -> the error `commit_pulls` answers with
     commit_pulls_errors: HashMap<String, String>,
+    /// (workflow file, run) pairs `workflow_runs_as_app` filters like GitHub does.
+    workflow_runs: Vec<(String, WorkflowRun)>,
+    /// (workflow, event, head_sha) of every `workflow_runs_as_app` call.
+    run_queries: Vec<(String, String, String)>,
+    workflow_runs_error: Option<String>,
+    /// Run ids `rerun_as_app` accepted.
+    reruns: Vec<u64>,
+    rerun_error: Option<String>,
+    /// The order of the app-token calls: `post_review`, `workflow_runs`, `rerun <id>`, plus
+    /// anything a test adds with [`FakeGitHub::log_event`].
+    events: Vec<String>,
 }
 
 #[derive(Default)]
@@ -123,6 +134,65 @@ impl FakeGitHub {
     pub fn posted_reviews(&self) -> Vec<PostedReview> {
         self.lock().posted.clone()
     }
+
+    /// Adds a run of `workflow` (a file name such as `ci-guard.yml`).
+    pub fn add_workflow_run(
+        &self,
+        workflow: &str,
+        id: u64,
+        event: &str,
+        head_sha: &str,
+        status: &str,
+    ) {
+        self.lock().workflow_runs.push((
+            workflow.into(),
+            WorkflowRun {
+                id,
+                event: event.into(),
+                head_sha: head_sha.into(),
+                status: status.into(),
+            },
+        ));
+    }
+
+    /// Changes run `id`'s status (a run finishing while `ww dev approve` waits).
+    pub fn set_run_status(&self, id: u64, status: &str) {
+        for (_, run) in self
+            .lock()
+            .workflow_runs
+            .iter_mut()
+            .filter(|(_, r)| r.id == id)
+        {
+            run.status = status.into();
+        }
+    }
+
+    /// Makes `workflow_runs_as_app` answer with an error.
+    pub fn fail_workflow_runs(&self, message: &str) {
+        self.lock().workflow_runs_error = Some(message.into());
+    }
+
+    /// Makes `rerun_as_app` answer with an error (for example GitHub's 403).
+    pub fn fail_rerun(&self, message: &str) {
+        self.lock().rerun_error = Some(message.into());
+    }
+
+    pub fn run_queries(&self) -> Vec<(String, String, String)> {
+        self.lock().run_queries.clone()
+    }
+
+    pub fn reruns(&self) -> Vec<u64> {
+        self.lock().reruns.clone()
+    }
+
+    /// Appends `event` to the call log ([`FakeGitHub::events`]).
+    pub fn log_event(&self, event: &str) {
+        self.lock().events.push(event.into());
+    }
+
+    pub fn events(&self) -> Vec<String> {
+        self.lock().events.clone()
+    }
 }
 
 impl GitHubApi for FakeGitHub {
@@ -187,6 +257,7 @@ impl GitHubApi for FakeGitHub {
         if !st.prs.contains_key(&number) {
             return Err(anyhow!("fake: no PR #{number}"));
         }
+        st.events.push("post_review".into());
         st.posted.push(PostedReview {
             number,
             sha: sha.into(),
@@ -206,5 +277,48 @@ impl GitHubApi for FakeGitHub {
             return Err(anyhow!("fake: {msg}"));
         }
         Ok(st.commit_pulls.get(sha).cloned().unwrap_or_default())
+    }
+
+    fn workflow_runs_as_app(
+        &self,
+        workflow: &str,
+        event: &str,
+        head_sha: &str,
+        _installation_token: &str,
+    ) -> Result<Vec<WorkflowRun>> {
+        let mut st = self.lock();
+        st.events.push("workflow_runs".into());
+        st.run_queries
+            .push((workflow.into(), event.into(), head_sha.into()));
+        if let Some(msg) = &st.workflow_runs_error {
+            return Err(anyhow!("fake: {msg}"));
+        }
+        // Like GitHub: the runs of that workflow file for that event and commit, newest first.
+        let mut runs: Vec<WorkflowRun> = st
+            .workflow_runs
+            .iter()
+            .filter(|(w, r)| w == workflow && r.event == event && r.head_sha == head_sha)
+            .map(|(_, r)| r.clone())
+            .collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.id));
+        Ok(runs)
+    }
+
+    fn rerun_as_app(&self, run_id: u64, _installation_token: &str) -> Result<()> {
+        let mut st = self.lock();
+        st.events.push(format!("rerun {run_id}"));
+        if let Some(msg) = &st.rerun_error {
+            return Err(anyhow!("fake: {msg}"));
+        }
+        let Some((_, run)) = st.workflow_runs.iter_mut().find(|(_, r)| r.id == run_id) else {
+            return Err(anyhow!("fake: HTTP 404: no workflow run {run_id}"));
+        };
+        // GitHub refuses to re-run a run that hasn't finished.
+        if run.status != "completed" {
+            return Err(anyhow!("fake: HTTP 403: This workflow is already running"));
+        }
+        run.status = "queued".into();
+        st.reruns.push(run_id);
+        Ok(())
     }
 }

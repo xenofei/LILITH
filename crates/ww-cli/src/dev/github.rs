@@ -12,6 +12,8 @@
 //! | `merge` | `PUT /repos/{o}/{r}/pulls/{n}/merge` with `{"sha", "merge_method": "merge"}` |
 //! | `post_review_as_app` | `POST /repos/{o}/{r}/pulls/{n}/reviews` with the installation token |
 //! | `commit_pulls` | `GET /repos/{o}/{r}/commits/{sha}/pulls?per_page=100`, following `Link: rel="next"` |
+//! | `workflow_runs_as_app` | `GET /repos/{o}/{r}/actions/workflows/{file}/runs?event={event}&head_sha={sha}&per_page=100` with the installation token |
+//! | `rerun_as_app` | `POST /repos/{o}/{r}/actions/runs/{id}/rerun` with the installation token |
 //!
 //! The owner and repo always come from the committed `dev/merge-guard.toml` (ruling R12); there
 //! are no hard-coded defaults here.
@@ -76,6 +78,17 @@ pub enum MergeOutcome {
     NotMergeable(String),
 }
 
+/// A GitHub Actions workflow run, as `ww dev approve` needs it (ruling R40).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRun {
+    pub id: u64,
+    /// The event that started the run (`pull_request`, `push`, ...).
+    pub event: String,
+    pub head_sha: String,
+    /// `completed`, or one of the unfinished states (`queued`, `in_progress`, `waiting`, ...).
+    pub status: String,
+}
+
 pub trait GitHubApi {
     fn pr(&self, number: u64) -> Result<PrInfo>;
     /// The most recent check run named `name` on `sha`.
@@ -96,6 +109,25 @@ pub trait GitHubApi {
     /// branch that is the merged PR that brought it in; an empty list means no PR. An error is
     /// an error: callers treat it as a flag, never as "no PR" or as a pass.
     fn commit_pulls(&self, sha: &str) -> Result<Vec<CommitPull>>;
+    /// The runs of workflow file `workflow` started by `event` for commit `head_sha` (the first
+    /// page, newest first), read with the reviewer app's `installation_token`. Only the real
+    /// client and the fake answer; other test doubles keep this default error.
+    fn workflow_runs_as_app(
+        &self,
+        workflow: &str,
+        event: &str,
+        head_sha: &str,
+        installation_token: &str,
+    ) -> Result<Vec<WorkflowRun>> {
+        let _ = (workflow, event, head_sha, installation_token);
+        bail!("this GitHub client can't list workflow runs")
+    }
+    /// Asks GitHub to re-run workflow run `run_id` (with its original event payload), using the
+    /// reviewer app's `installation_token`. Only the real client and the fake answer.
+    fn rerun_as_app(&self, run_id: u64, installation_token: &str) -> Result<()> {
+        let _ = (run_id, installation_token);
+        bail!("this GitHub client can't re-run workflow runs")
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -175,6 +207,31 @@ pub fn build_review_request(
         Method::POST,
         format!("/repos/{owner}/{repo}/pulls/{number}/reviews"),
         json!({ "commit_id": sha, "event": "APPROVE", "body": body }),
+    )
+}
+
+pub fn build_workflow_runs_request(
+    owner: &str,
+    repo: &str,
+    workflow: &str,
+    event: &str,
+    head_sha: &str,
+) -> (Method, String) {
+    (
+        Method::GET,
+        format!(
+            "/repos/{owner}/{repo}/actions/workflows/{}/runs?event={}&head_sha={}&per_page=100",
+            percent_encode(workflow),
+            percent_encode(event),
+            percent_encode(head_sha)
+        ),
+    )
+}
+
+pub fn build_rerun_request(owner: &str, repo: &str, run_id: u64) -> (Method, String) {
+    (
+        Method::POST,
+        format!("/repos/{owner}/{repo}/actions/runs/{run_id}/rerun"),
     )
 }
 
@@ -279,6 +336,32 @@ pub fn parse_commit_pulls(v: &Value) -> Result<Vec<CommitPull>> {
                 head_sha: text("/head/sha")?,
                 base_ref: text("/base/ref")?,
                 merged,
+            })
+        })
+        .collect()
+}
+
+/// Parses `GET .../actions/workflows/{file}/runs`. Fails closed: a body without a
+/// `workflow_runs` array, or an entry without `id`, `event`, `head_sha` or `status`, is an error.
+pub fn parse_workflow_runs(v: &Value) -> Result<Vec<WorkflowRun>> {
+    let arr = v["workflow_runs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("workflow runs response has no `workflow_runs` array"))?;
+    arr.iter()
+        .map(|r| {
+            let text = |key: &str| -> Result<String> {
+                r[key]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("workflow run entry is missing `{key}`"))
+            };
+            Ok(WorkflowRun {
+                id: r["id"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("workflow run entry is missing `id`"))?,
+                event: text("event")?,
+                head_sha: text("head_sha")?,
+                status: text("status")?,
             })
         })
         .collect()
@@ -499,6 +582,28 @@ impl GitHubApi for RestClient {
             all.extend(parse_commit_pulls(&page)?);
         }
         Ok(all)
+    }
+
+    fn workflow_runs_as_app(
+        &self,
+        workflow: &str,
+        event: &str,
+        head_sha: &str,
+        installation_token: &str,
+    ) -> Result<Vec<WorkflowRun>> {
+        let (m, path) =
+            build_workflow_runs_request(&self.owner, &self.repo, workflow, event, head_sha);
+        let url = self.abs(&path);
+        let (status, _, body) = self.send(m.clone(), &url, None, installation_token)?;
+        Self::expect_ok(&m, &url, status, &body)?;
+        parse_workflow_runs(&body).with_context(|| format!("{m} {url} (HTTP {status})"))
+    }
+
+    fn rerun_as_app(&self, run_id: u64, installation_token: &str) -> Result<()> {
+        let (m, path) = build_rerun_request(&self.owner, &self.repo, run_id);
+        let url = self.abs(&path);
+        let (status, _, body) = self.send(m.clone(), &url, None, installation_token)?;
+        Self::expect_ok(&m, &url, status, &body)
     }
 }
 #[cfg(test)]
@@ -827,6 +932,67 @@ mod tests {
         assert_eq!(fake.commit_pulls("c1").unwrap()[0].number, 7);
         fake.fail_commit_pulls("c1", "HTTP 502");
         assert!(fake.commit_pulls("c1").is_err());
+    }
+
+    /// R40: `ww dev approve` re-runs the guard's `pull_request` run.
+    #[test] // spec: QA-020, QA-033
+    fn workflow_run_requests() {
+        let (m, p) = build_workflow_runs_request(
+            "o",
+            "r",
+            "ci-guard.yml",
+            "pull_request",
+            "1234567890abcdef1234567890abcdef12345678",
+        );
+        assert_eq!(m, Method::GET);
+        assert_eq!(
+            p,
+            "/repos/o/r/actions/workflows/ci-guard.yml/runs?event=pull_request&head_sha=1234567890abcdef1234567890abcdef12345678&per_page=100"
+        );
+        let (m, p) = build_rerun_request("o", "r", 77);
+        assert_eq!(m, Method::POST);
+        assert_eq!(p, "/repos/o/r/actions/runs/77/rerun");
+    }
+
+    #[test]
+    fn workflow_runs_parsing_fails_closed() {
+        use serde_json::json;
+        let ok = json!({"total_count": 2, "workflow_runs": [
+            {"id": 9, "event": "pull_request", "head_sha": "h", "status": "completed", "conclusion": "failure"},
+            {"id": 8, "event": "pull_request", "head_sha": "h", "status": "in_progress", "conclusion": null}
+        ]});
+        assert_eq!(
+            parse_workflow_runs(&ok).unwrap(),
+            vec![
+                WorkflowRun {
+                    id: 9,
+                    event: "pull_request".into(),
+                    head_sha: "h".into(),
+                    status: "completed".into()
+                },
+                WorkflowRun {
+                    id: 8,
+                    event: "pull_request".into(),
+                    head_sha: "h".into(),
+                    status: "in_progress".into()
+                },
+            ]
+        );
+        assert_eq!(
+            parse_workflow_runs(&json!({"total_count": 0, "workflow_runs": []})).unwrap(),
+            vec![]
+        );
+        for bad in [
+            serde_json::Value::Null,
+            json!({}),
+            json!({"message": "Resource not accessible by integration"}),
+            json!({"workflow_runs": [{"event": "pull_request", "head_sha": "h", "status": "completed"}]}),
+            json!({"workflow_runs": [{"id": 1, "head_sha": "h", "status": "completed"}]}),
+            json!({"workflow_runs": [{"id": 1, "event": "pull_request", "status": "completed"}]}),
+            json!({"workflow_runs": [{"id": 1, "event": "pull_request", "head_sha": "h"}]}),
+        ] {
+            assert!(parse_workflow_runs(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

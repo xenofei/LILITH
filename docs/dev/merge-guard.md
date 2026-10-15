@@ -50,7 +50,7 @@ No single mechanism is trusted on its own. A local check can be skipped, so each
 | --- | --- | --- |
 | `every-push` | `ci-push.yml` | Runs on every push to a branch other than `main`: rustfmt, clippy, cargo-deny, the workspace tests, the spec tests and the spec traceability report. |
 | `pr-ready` | `ci-pr-ready.yml` | Runs on every pull request: everything `every-push` runs, plus cargo-audit and a release build. On a **draft** PR it fails on purpose (a skipped required check would count as passing). Marking the PR ready for review runs it again. |
-| `protected-test-check` | `ci-guard.yml` | Judges the PR's head commit with `ww` built from `main` (the PR's own code is never run). Fails when a protected file is modified or deleted without the reviewer App's approval of that exact commit. Re-runs when a review is submitted. |
+| `protected-test-check` | `ci-guard.yml` | Judges the PR's head commit with `ww` built from `main` (the PR's own code is never run). Fails when a protected file is modified or deleted without the reviewer App's approval of that exact commit. Runs on pull request events only, so each commit has exactly one such check; `ww dev approve` re-runs it after posting the approval. |
 | `privacy-check` | `ci-push.yml` | Runs `ww dev privacy-scan` on every commit of the pushed branch that `main` lacks. It fails if the `WW_PRIVACY_DENYLIST` secret is missing or empty. |
 
 A second privacy job, `privacy-check-pr`, runs on pull requests and shows the same verdict there. It is not a required check, because a required check name must come from exactly one job. `nightly.yml` (release build and coverage) is not required either.
@@ -226,7 +226,7 @@ The reviewer App is the second identity that approves protected changes. Agents 
    - **Name:** `worldwright-reviewer`. (App names are unique across GitHub. If it's taken, pick another and set `reviewer_app_slug` in `dev/merge-guard.toml` to match, which is a protected change.)
    - **Homepage URL:** any URL, for example the repository's.
    - **Webhook:** turn **Active** off.
-   - **Repository permissions:** **Pull requests: Read and write**, **Contents: Read-only**. (Metadata read-only is added automatically.) Nothing else.
+   - **Repository permissions:** **Pull requests: Read and write**, **Contents: Read-only**, **Actions: Read and write**. (Metadata read-only is added automatically.) Nothing else. Actions write is there so that an approval re-runs the guard check: `protected-test-check` runs only on pull request events, so its run for a commit happened before your approval and failed. Right after posting the approval, `ww dev approve` asks GitHub to re-run that run; the re-run reads the reviews again and passes. The App uses this permission for nothing else.
    - **Where can this GitHub App be installed?** **Only on this account**.
    - Create the App.
 2. On the App's settings page, note the **App id** (a number). Under Private keys, **Generate a private key**. A `.pem` file downloads.
@@ -239,6 +239,13 @@ The reviewer App is the second identity that approves protected changes. Agents 
 
    It asks for the App id, the installation id, the path to the `.pem` and a passphrase (at least 12 characters, typed twice). It writes the key, encrypted with that passphrase, to `%USERPROFILE%\.worldwright\reviewer\app-key.age`. It only runs at a real terminal. Keep the passphrase somewhere safe: if it is lost, generate a new private key on the App's page, delete the old one there, and run `reviewer-setup` again.
 5. **Delete the `.pem` yourself.** `ww` never deletes or changes it. Delete it permanently (Shift+Delete, or empty the Recycle Bin) and check the Downloads folder for copies.
+
+**If the App was created before it needed Actions write** (it then has only Pull requests and Contents), add the permission once. Nothing on your PC changes: the key, the App id and the installation id stay the same.
+
+1. **Browser, the App's settings:** Settings → Developer settings → GitHub Apps → `worldwright-reviewer` → **Edit** (or the equivalent current location) → **Permissions & events** → **Repository permissions** → **Actions** → **Read and write** → **Save changes** at the bottom of the page.
+2. **Browser, the installation:** the installation must accept the new permission before it applies. Open the installation's page (Settings → Applications → Installed GitHub Apps → `worldwright-reviewer` → **Configure**; its address ends in the installation id). A **Review request** banner at the top says the App asks for new permissions. Click it, check that the only addition is Actions read and write, and **Accept new permissions**.
+
+Until the installation accepts, `ww dev approve` still posts approvals, then prints the warning described in section 3 ("the reviewer app's installation hasn't granted Actions: Read and write") and you re-run the check by hand.
 
 ### 2.6 Creating the agent token (browser, then PowerShell)
 
@@ -321,7 +328,18 @@ You only act when an agent asks for approval of a protected change:
    ```
 
    It prints the commit and the protected changes, then asks `(y/N)`. If you answer `y`, it asks for the reviewer key's passphrase, then posts one approving review from the App, pinned to that exact commit. It needs a GitHub token to read the PR, so run it where the agent token is stored (`ww dev agent-token status`), and the key file from 2.5 has to be on that PC.
-3. `protected-test-check` re-runs when the review is submitted and turns green. The agent then runs `ww dev merge <PR>`.
+3. Right after posting, `ww dev approve` asks GitHub to re-run that commit's `protected-test-check` and says so ("Asked GitHub to re-run protected-test-check ..."). If that run is still going, it first waits for it to finish, for up to a minute. The re-run sees your approval and turns green within a few minutes. The agent then runs `ww dev merge <PR>`.
+
+   If it prints **"Approval posted, but the guard check couldn't be re-run automatically (...). Re-run it in the browser: ..."** instead, the approval is posted and only the re-run is missing. Open the address it gives, which is the check's run or the PR's checks page, signed in as yourself, and use **Re-run jobs** → **Re-run all jobs** on the `protected-test-check` run (the "CI: protected-test check" workflow). Don't push a new commit to trigger it: a new commit needs a new approval. The reason in brackets says what to fix for next time:
+
+   | Reason (shortened) | What to do |
+   | --- | --- |
+   | "the reviewer app's installation hasn't granted Actions: Read and write" | Add the permission (section 2.5, the part about an App created before it needed Actions write), and accept it on the installation. |
+   | "... HTTP 403 ..." when re-running | Usually the same missing permission, or the request was accepted on the App but not yet on the installation. Check both pages from section 2.5. |
+   | "guard run ... is still in_progress after 60 s" (or queued) | GitHub re-runs only finished runs. Wait until the run finishes. If it finishes green it already saw your approval; if it finishes red, re-run it. |
+   | "no `pull_request` run of ci-guard.yml was found" | The run hasn't been created yet or GitHub didn't list it. Check the PR's checks page: if the check is there and red, re-run it; if it's still running, wait. |
+
+   If it says **"the PR head moved after it"**, a commit was pushed while you approved. The approval doesn't count for the new commit: run `ww dev approve <PR>` again.
 
 An approval covers one commit. If anything is pushed to the PR after you approve, the old approval no longer counts and you will be asked again.
 
@@ -443,7 +461,7 @@ The dry runs against the public repository prove the guard works before real wor
 
 The dry runs, each with the expected outcome:
 
-1. **A protected change is refused, then approved, then merged.** On a branch `guard-dry-run`, change only a comment in `test-params.toml` and open a PR. `protected-test-check` fails. `ww dev merge <PR>` refuses with the "Protected files changed and the reviewer app hasn't approved this exact commit" message. The owner runs `ww dev approve <PR>`, the check re-runs and passes, and `ww dev merge <PR>` merges.
+1. **A protected change is refused, then approved, then merged.** On a branch `guard-dry-run`, change only a comment in `test-params.toml` and open a PR. `protected-test-check` fails. `ww dev merge <PR>` refuses with the "Protected files changed and the reviewer app hasn't approved this exact commit" message. The owner runs `ww dev approve <PR>`, which re-runs the check, the check passes, and `ww dev merge <PR>` merges. The PR's checks list one `protected-test-check`, not two.
 2. **A stale approval is refused.** On a second throwaway PR, approve it, then push one more commit. The old approval no longer counts and the merge is refused. Close or delete the throwaway branches.
 3. **A privacy dry run.** On a throwaway branch, add a file that contains a Windows profile path with a name that isn't a placeholder. The `pre-push` hook refuses the push. To see `privacy-check` go red as well, push the same branch once from a clone that has no hooks installed (your own clone, not the agents'). Never merge it, and delete the branch afterwards: the commit is public while it exists.
 4. **An agent-token check.** With the agent token, push a change under `.github/workflows/` to a throwaway branch. GitHub rejects it, since the token has no Workflows permission.
