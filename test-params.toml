@@ -9,6 +9,12 @@ integration_s = 120
 # The ww-cli package's tests (real git repositories), an override in .config/nextest.toml.
 ww_cli_s = 300
 spec_s = 300
+# The E2E tests (real ww and ww-core over a real pipe, QA-056): ww-spec-tests, ww-core and every
+# package that uses ww-testkit. An override in .config/nextest.toml.
+e2e_s = 300
+# The setup script build-testbins in .config/nextest.toml builds ww and ww-core into
+# target/testbins once per run (120 s x 5).
+testbins_build_s = 600
 
 [proptest]
 cases = 256

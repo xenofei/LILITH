@@ -6,14 +6,28 @@
 //! (roaming or local `Worldwright*` folders, `.worldwright-local`, the real registry root or
 //! credential prefix) panics with `test resolved a real Worldwright location: ...`, and
 //! building a stable or dev `Env` panics too.
+//!
+//! A `TestEnv` also runs the real `ww` with the child environment of its test channel
+//! ([`TestEnv::ww`]), lays out workspaces and state databases, and on drop drains any core
+//! still serving its channel (QA-041), so no core outlives its test and no temporary folder
+//! stays locked.
 
+use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use ww_platform::{Channel, Env, RealLocations, Roots, TEST_PIPE_SID, arm_test_guard};
+use ww_platform::{
+    Channel, ENV_CHANNEL, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env, RealLocations, Roots,
+    TEST_PIPE_SID, arm_test_guard,
+};
+
+use crate::bins::ensure_built;
 
 /// An isolated `Env`: channel `Test(<8 lowercase hex>)`, roots under a fresh temporary
 /// directory that is deleted on drop.
@@ -22,12 +36,33 @@ pub struct TestEnv {
     _dir: TempDir,
 }
 
+/// What a finished `ww` run printed and returned.
+#[derive(Debug, Clone)]
+pub struct WwOutput {
+    /// The exit code; -1 if `ww` ended without one.
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// Wall time from start to exit. For reports only, never for assertions (QA-031).
+    pub elapsed: Duration,
+}
+
 impl TestEnv {
     /// Arms the guard with the real locations, then builds the isolated `Env`.
     ///
     /// # Panics
     /// If the known folders cannot be resolved or the temporary directory cannot be created.
     pub fn new() -> TestEnv {
+        TestEnv::make("ww-testenv-".to_string())
+    }
+
+    /// [`TestEnv::new`], with `label` in the temporary directory's name. Spaces and non-ASCII
+    /// letters are kept, so paths with them get exercised.
+    pub fn with_label(label: &str) -> TestEnv {
+        TestEnv::make(format!("ww-testenv-{label}-"))
+    }
+
+    fn make(prefix: String) -> TestEnv {
         static REAL: OnceLock<RealLocations> = OnceLock::new();
         let real = REAL.get_or_init(|| {
             RealLocations::from_system().expect("cannot resolve the real known folders")
@@ -35,7 +70,7 @@ impl TestEnv {
         arm_test_guard(real.clone());
 
         let dir = tempfile::Builder::new()
-            .prefix("ww-testenv-")
+            .prefix(&prefix)
             .tempdir()
             .expect("cannot create the test directory");
         let roots = Roots {
@@ -54,11 +89,198 @@ impl TestEnv {
     pub fn root(&self) -> &Path {
         self._dir.path()
     }
+
+    /// The variables that put a child process on this test channel: `WW_CHANNEL=test-<id>`,
+    /// `WW_TEST_ROOT=<root>` and `WW_TEST_PARENT_PID=<this process>`. The same type as
+    /// `SpawnRequest::extra_env`.
+    pub fn child_env(&self) -> Vec<(OsString, OsString)> {
+        vec![
+            (
+                OsString::from(ENV_CHANNEL),
+                OsString::from(self.env.channel().to_string()),
+            ),
+            (
+                OsString::from(ENV_TEST_ROOT),
+                self.root().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from(ENV_TEST_PARENT_PID),
+                OsString::from(std::process::id().to_string()),
+            ),
+        ]
+    }
+
+    /// Runs the test build of `ww` with `args`, in [`TestEnv::root`], with
+    /// [`TestEnv::child_env`] and an empty stdin, and waits for it. `ww` itself runs through
+    /// `std::process::Command` because its output must be captured; any core it starts goes
+    /// through `ww-platform`'s detached spawn and inherits none of these pipes.
+    ///
+    /// # Panics
+    /// If `ww` cannot be started.
+    pub fn ww(&self, args: &[&str]) -> WwOutput {
+        self.run_ww(args, None)
+    }
+
+    /// [`TestEnv::ww`] with `stdin` written to `ww`'s standard input, which is then closed.
+    pub fn ww_with_stdin(&self, args: &[&str], stdin: &str) -> WwOutput {
+        self.run_ww(args, Some(stdin))
+    }
+
+    /// Starts `ww` like [`TestEnv::ww`] but does not wait: for long-running commands such as
+    /// `ww events --follow`. Stdout and stderr are piped (read stdout as it comes, stderr
+    /// after the child has ended); stdin is empty. The caller kills or waits for the child.
+    ///
+    /// # Panics
+    /// If `ww` cannot be started.
+    pub fn ww_spawn(&self, args: &[&str]) -> Child {
+        self.ww_command(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", ensure_built().ww.display()))
+    }
+
+    fn ww_command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(&ensure_built().ww);
+        cmd.args(args)
+            .current_dir(self.root())
+            .envs(self.child_env());
+        cmd
+    }
+
+    fn run_ww(&self, args: &[&str], stdin: Option<&str>) -> WwOutput {
+        let ww = &ensure_built().ww;
+        let start = Instant::now();
+        let mut child = self
+            .ww_command(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", ww.display()));
+        // Written from another thread, so a `ww` that prints before it reads cannot deadlock.
+        let writer = match (stdin, child.stdin.take()) {
+            (Some(text), Some(mut pipe)) => {
+                let text = text.to_string();
+                Some(std::thread::spawn(move || {
+                    let _ = pipe.write_all(text.as_bytes());
+                }))
+            }
+            _ => None,
+        };
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("waiting for {} failed: {e}", ww.display()));
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
+        WwOutput {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            elapsed: start.elapsed(),
+        }
+    }
+
+    /// Creates `<root>\ws-<name>\worldwright.yaml` containing `name: <name>` and returns the
+    /// workspace folder.
+    pub fn make_workspace(&self, name: &str) -> PathBuf {
+        let ws = self.root().join(format!("ws-{name}"));
+        std::fs::create_dir_all(&ws)
+            .unwrap_or_else(|e| panic!("cannot create {}: {e}", ws.display()));
+        let manifest = ws.join("worldwright.yaml");
+        std::fs::write(&manifest, format!("name: {name}\n"))
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", manifest.display()));
+        ws
+    }
+
+    /// Registers `ws` in this channel's `data_dir\suite.toml`: adds a `[[workspaces]]` entry
+    /// unless one has this path, and makes it `default_workspace` when `default` is true.
+    /// Other keys in the file are kept. The path is written as given.
+    ///
+    /// # Panics
+    /// If the file cannot be read or written, or `ws` is not valid UTF-8.
+    pub fn register_workspace(&self, ws: &Path, default: bool) {
+        let file = self.env.suite_toml();
+        let path = ws
+            .to_str()
+            .unwrap_or_else(|| panic!("{} is not valid UTF-8", ws.display()))
+            .to_string();
+        let mut table: toml::Table = match std::fs::read_to_string(&file) {
+            Ok(text) => text
+                .parse()
+                .unwrap_or_else(|e| panic!("{} is not TOML: {e}", file.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => panic!("cannot read {}: {e}", file.display()),
+        };
+        let entries = table
+            .entry("workspaces")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("`workspaces` in {} is not an array", file.display()));
+        let listed = entries
+            .iter()
+            .any(|e| e.get("path").and_then(toml::Value::as_str) == Some(path.as_str()));
+        if !listed {
+            let mut entry = toml::Table::new();
+            entry.insert("path".into(), toml::Value::String(path.clone()));
+            entries.push(toml::Value::Table(entry));
+        }
+        if default {
+            table.insert("default_workspace".into(), toml::Value::String(path));
+        }
+        let text = toml::to_string(&table).expect("a TOML table serialises");
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("cannot create {}: {e}", parent.display()));
+        }
+        std::fs::write(&file, text)
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", file.display()));
+    }
+
+    /// Creates or opens the SQLite database at `path` (creating its parent folders, ruling
+    /// P13) and sets its `user_version` and its journal mode: `wal` when `wal` is true, else
+    /// `delete`. No tables are created. Used to fake a newer or an older state
+    /// database.
+    ///
+    /// # Panics
+    /// If the folder or the database cannot be written.
+    pub fn write_state_db_version(&self, path: &Path, user_version: i64, wal: bool) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("cannot create {}: {e}", parent.display()));
+        }
+        let db = rusqlite::Connection::open(path)
+            .unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
+        let wanted = if wal { "wal" } else { "delete" };
+        let mode: String = db
+            .query_row(&format!("PRAGMA journal_mode = {wanted}"), [], |r| r.get(0))
+            .unwrap_or_else(|e| panic!("cannot set the journal mode of {}: {e}", path.display()));
+        assert_eq!(mode.to_ascii_lowercase(), wanted, "{}", path.display());
+        db.pragma_update(None, "user_version", user_version)
+            .unwrap_or_else(|e| panic!("cannot set user_version of {}: {e}", path.display()));
+        db.close()
+            .unwrap_or_else(|(_, e)| panic!("cannot close {}: {e}", path.display()));
+    }
 }
 
 impl Default for TestEnv {
     fn default() -> Self {
         TestEnv::new()
+    }
+}
+
+impl Drop for TestEnv {
+    /// Drains any core still serving this channel, for example one that `ww` started and this
+    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Runs before the
+    /// temporary directory is removed. Never panics.
+    fn drop(&mut self) {
+        crate::core::drain_channel(&self.env.pipe_name());
     }
 }
 
@@ -75,7 +297,8 @@ fn unique_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ww_platform::{Channel, Env, RealLocations, Roots};
+    use std::ffi::OsString;
+    use ww_platform::{Channel, Env, RealLocations, Roots, parse_registered_workspaces};
 
     #[test] // spec: QA-040
     fn testenv_paths_are_under_tempdir() {
@@ -160,6 +383,105 @@ mod tests {
                 .notification_aumid()
                 .starts_with("Worldwright.Suite.Test-")
         );
+    }
+
+    #[test] // spec: QA-040
+    fn child_env_names_test_channel_root_and_parent() {
+        let t = TestEnv::new();
+        let vars = t.child_env();
+        let get = |name: &str| {
+            let found: Vec<&OsString> = vars
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(found.len(), 1, "{name} in {vars:?}");
+            found[0].clone()
+        };
+        assert_eq!(
+            get("WW_CHANNEL"),
+            OsString::from(t.env.channel().to_string())
+        );
+        assert!(get("WW_CHANNEL").to_string_lossy().starts_with("test-"));
+        assert_eq!(get("WW_TEST_ROOT"), t.root().as_os_str());
+        assert_eq!(
+            get("WW_TEST_PARENT_PID"),
+            OsString::from(std::process::id().to_string())
+        );
+        assert_eq!(vars.len(), 3, "{vars:?}");
+
+        // A child given these variables resolves the same isolated folders.
+        let child = Env::from_vars("dev", &|name| {
+            vars.iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        })
+        .expect("a child Env from child_env");
+        assert_eq!(child.channel(), t.env.channel());
+        assert_eq!(child.data_dir(), t.env.data_dir());
+        assert_eq!(child.local_dir(), t.env.local_dir());
+        assert_eq!(child.pipe_name(), t.env.pipe_name());
+    }
+
+    #[test] // spec: QA-040
+    fn with_label_keeps_spaces_and_non_ascii() {
+        let t = TestEnv::with_label("Ünïcödé space");
+        let root = t.root().to_string_lossy().into_owned();
+        assert!(root.contains("Ünïcödé space"), "{root}");
+        assert!(t.root().join("roaming").is_dir());
+        assert!(t.env.data_dir().starts_with(t.root()));
+    }
+
+    #[test] // spec: QA-040
+    fn make_and_register_workspace_writes_suite_toml() {
+        let t = TestEnv::with_label("Ünïcödé space");
+        let a = t.make_workspace("alpha");
+        let b = t.make_workspace("beta");
+        assert_eq!(a, t.root().join("ws-alpha"));
+        assert_eq!(
+            std::fs::read_to_string(a.join("worldwright.yaml")).unwrap(),
+            "name: alpha
+"
+        );
+        t.register_workspace(&a, false);
+        t.register_workspace(&b, true);
+        t.register_workspace(&a, false); // registering twice keeps one entry
+        let text = std::fs::read_to_string(t.env.suite_toml()).unwrap();
+        // Default first, then the listed paths in order, without repeats.
+        assert_eq!(
+            parse_registered_workspaces(&text),
+            vec![b.clone(), a.clone()]
+        );
+        let table: toml::Table = text.parse().unwrap();
+        assert_eq!(
+            table["default_workspace"].as_str(),
+            Some(b.to_str().unwrap())
+        );
+        assert_eq!(table["workspaces"].as_array().unwrap().len(), 2, "{text}");
+    }
+
+    #[test] // spec: QA-040
+    fn write_state_db_version_sets_user_version_and_journal_mode() {
+        let t = TestEnv::new();
+        let read = |path: &Path| -> (i64, String) {
+            let db = rusqlite::Connection::open(path).unwrap();
+            let v: i64 = db
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            let mode: String = db
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            (v, mode)
+        };
+        // The parent folder does not exist yet (ruling P13).
+        let wal = t.env.suite_state_db();
+        assert!(!wal.parent().unwrap().exists());
+        t.write_state_db_version(&wal, 7, true);
+        assert_eq!(read(&wal), (7, "wal".to_string()));
+
+        let plain = t.root().join("nested").join("deeper").join("state.db");
+        t.write_state_db_version(&plain, -3, false);
+        assert_eq!(read(&plain), (-3, "delete".to_string()));
     }
 
     #[test] // spec: QA-040
