@@ -1,0 +1,17 @@
+[package]
+name = "ww-testkit"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ww-platform = { path = "../ww-platform" }
+tempfile.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

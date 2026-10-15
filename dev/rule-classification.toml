@@ -1,0 +1,11 @@
+# How each spec rule is checked (QA-028). `ww dev spec-report` reads this file.
+#
+# Classes: "test" (a Rust test cites the rule with `// spec: <ID>`), "lint" (a lint or CI
+# check enforces it), "manual" (a person checks it) and "n/a" (nothing to check).
+# Rules not listed under [rules] get `default`.
+#
+# Example:  QA-028 = "test"
+
+default = "unclassified"
+
+[rules]

@@ -1,0 +1,96 @@
+Worldwright Suite
+Copyright (C) 2026 the Worldwright Suite contributors.
+Licensed under the GNU General Public License, version 3 or (at your option) any later
+version. See LICENSE.
+
+This file lists third-party material that is included in this repository. Rust
+dependencies are not vendored: Cargo downloads them, and each keeps its own licence
+(see `cargo deny list`). Binaries built from this repository combine those
+dependencies; their licence texts must ship with any distributed binary.
+
+------------------------------------------------------------------------------------
+1. ComfyUI workflow templates (Comfy-Org/workflow_templates)
+------------------------------------------------------------------------------------
+
+Source:   https://github.com/Comfy-Org/workflow_templates
+          (Python package `comfyui-workflow-templates`, version 0.11.78)
+Licence:  MIT
+
+Used in the M0 spikes, as copies of or derivatives of the stock templates (including the
+templates' own Markdown note nodes):
+
+  spikes/comfy-measure/workflows/zimage_t2i.json          (API export of image_z_image_turbo)
+  spikes/comfy-measure/workflows/zimage_t2i_lora.json     (derived from zimage_t2i.json)
+  spikes/comfy-measure/workflows/zimage_inpaint_cn_lite.json
+                                                          (derived from the fun-union
+                                                           ControlNet template export)
+  spikes/comfy-measure/workflows/sam31_select.json        (derived from the SAM 3 template
+                                                           export)
+  spikes/comfy-measure/workflows/exports/image_z_image_turbo_fun_union_controlnet.api.json
+  spikes/comfy-measure/workflows/exports/utility_image_segment_sam3.api.json
+  spikes/webengine/fixtures/zimage_t2i.ui.json            (byte-for-byte copy of
+                                                           image_z_image_turbo.json)
+  spikes/webengine/fixtures/subgraph_muted.ui.json        (derived from the same template)
+
+spikes/comfy-measure/workflows/birefnet_rmbg.json is not template-derived (see section 2).
+The stock template's text prompt also appears in spikes/comfy-measure/workflows/
+build_workflows.py and in the spike result images.
+
+MIT License
+
+Copyright (c) 2023-present Comfy Org
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons
+to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------------
+2. BiRefNet workflow (hand-written)
+------------------------------------------------------------------------------------
+
+spikes/comfy-measure/workflows/birefnet_rmbg.json is a hand-written API workflow for the
+ComfyUI_BiRefNet_ll custom nodes (https://github.com/lldacing/ComfyUI_BiRefNet_ll,
+MIT License, Copyright (c) 2024 lldacing). It names the nodes and the BiRefNet
+`General.safetensors` model; per that project's LICENSE, the code and models of BiRefNet
+are released under the MIT License. No node code or model weights are included here.
+
+------------------------------------------------------------------------------------
+3. AI-generated test images
+------------------------------------------------------------------------------------
+
+spikes/comfy-measure/inputs/harbor_1024.jpg and the sheets under
+spikes/comfy-measure/results/samples/ are AI-generated test images. They were made locally
+with ComfyUI from the stock Z-Image Turbo template prompt (section 1), using
+Z-Image-Turbo (Apache-2.0), the Z-Image-Turbo Fun ControlNet Union 2.1 lite (Apache-2.0),
+SAM 3.1 (SAM License), BiRefNet (MIT), the TAEF1 preview decoder (MIT) and the LoRA
+`pixel_art_style_lora_z_image_turbo` (Apache-2.0). No model weights are included in this repository; docs/spikes/
+08-comfy-measurements.md lists the sources. The images show no real person.
+
+------------------------------------------------------------------------------------
+4. GNU General Public License text
+------------------------------------------------------------------------------------
+
+LICENSE is the unmodified text of the GNU General Public License, version 3,
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>. Everyone is
+permitted to copy and distribute verbatim copies of that licence document, but changing
+it is not allowed.
+
+------------------------------------------------------------------------------------
+5. Short quotations
+------------------------------------------------------------------------------------
+
+The research notes under docs/research/ contain short, attributed quotations from
+third-party documentation and terms (for example Anthropic's Claude Code legal and
+compliance page), used for commentary. Each is linked to its source.

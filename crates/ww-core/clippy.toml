@@ -1,0 +1,21 @@
+# ARCH-112 / QA-024: ww-core writes files only through `store::write_file_atomic`.
+# Every file-mutating std call is disallowed here; the single allowance is a function-level
+# `#[allow(clippy::disallowed_methods)]` in src/store.rs (enforced by
+# crates/ww-testkit/tests/single_write_allowance.rs).
+#
+# The `tokio::fs::*` entries (write, rename, remove_file, remove_dir_all) are added when
+# `ww-core` gains a tokio dependency (plan 2); clippy cannot resolve them before then.
+
+disallowed-methods = [
+    { path = "std::fs::write", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+    { path = "std::fs::rename", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+    { path = "std::fs::remove_file", reason = "ARCH-112: file mutation goes through ww_core::store" },
+    { path = "std::fs::remove_dir", reason = "ARCH-112: file mutation goes through ww_core::store" },
+    { path = "std::fs::remove_dir_all", reason = "ARCH-112: file mutation goes through ww_core::store" },
+    { path = "std::fs::copy", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+    { path = "std::fs::create_dir", reason = "ARCH-112: file mutation goes through ww_core::store" },
+    { path = "std::fs::create_dir_all", reason = "ARCH-112: file mutation goes through ww_core::store" },
+    { path = "std::fs::File::create", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+    { path = "std::fs::File::create_new", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+    { path = "std::fs::OpenOptions::open", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+]

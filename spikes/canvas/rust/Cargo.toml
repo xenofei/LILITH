@@ -1,0 +1,18 @@
+[package]
+name = "canvas_bridge"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+# CMake (cxx_qt_import_crate / Corrosion) links this static library into canvas.exe.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1.0.176"
+cxx-qt = "=0.10.0"
+cxx-qt-lib = "=0.10.0"
+
+[build-dependencies]
+cxx-qt-build = "=0.10.0"

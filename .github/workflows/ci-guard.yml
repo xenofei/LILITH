@@ -1,0 +1,82 @@
+# Protected-test check (QA-033, rulings R8 and R21). Judges a PR's head commit with the test-diff
+# guard, using a `ww` built from main, and counts the reviewer app's approval of that exact
+# commit. `ww dev merge` requires the `protected-test-check` check on the PR's head commit.
+#
+# Why this is safe to run on a PR:
+# - The job checks out main and builds `ww` from main only. The PR's head commit is fetched as git
+#   data and judged; its code is never built, tested or run here. (The spec tests run the PR's
+#   code, so they stay in the every-push and PR-ready tiers.)
+# - The trigger is `pull_request`, so the check run lands on the PR's head commit, where
+#   `ww dev merge` looks for it. (`pull_request_target` would attach it to the base branch's
+#   commit instead, and the merge would never see it.)
+# - This workflow file comes from the PR's merge ref, so a PR could edit it, or add a workflow that
+#   posts a same-named check. That is why `.github/workflows/**` is protected (QA-019, R21): such a
+#   PR itself needs the reviewer app's approval. `ww dev merge` also recomputes the verdict
+#   locally, and post-merge.yml judges every push to main from main.
+# - `pull_request_review` re-runs the check when a review is submitted, so the reviewer app's
+#   approval turns the check green without a new push.
+#
+# No sccache here: the GitHub Actions cache this job could read is also written by jobs that run
+# PR code (every-push, pr-ready), so a cached object could swap the judge. `ww` is built from
+# scratch every time instead.
+
+name: "CI: protected-test check"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  protected-test-check:
+    # The check run's name. `ww dev merge` requires it by exactly this name.
+    name: protected-test-check
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out main and fetch the PR head
+      pull-requests: read # read the PR's reviews for the reviewer app's approval
+    concurrency:
+      group: guard-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # Not kept: the repository is public, so the next step fetches the PR's head commit
+          # without credentials. The guard reads reviews through the API with GITHUB_TOKEN from
+          # its own step's env.
+          persist-credentials: false
+
+      - name: Fetch main and the PR head (as git data only)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --quiet origin "+refs/heads/main:refs/remotes/origin/main" "$HEAD_SHA"
+          git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+      - name: Rust toolchain from rust-toolchain.toml (main's)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Judge the PR head with ww built from main
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo run --locked -p ww-cli -- dev guard --base refs/remotes/origin/main --head "$HEAD_SHA" --pr "$PR_NUMBER"

@@ -1,0 +1,31 @@
+# Nextest profiles (QA-017, QA-030).
+# Owner-facing record of the test parameters: test-params.toml (protected, QA-019).
+# Values here are written out directly; they are not read from that file.
+
+# Where nextest keeps its run data, relative to the workspace root. nextest uses this directory
+# even when CARGO_TARGET_DIR points elsewhere; `ww dev spec-tests` reads this key (and
+# [profile.spec.junit] path below) to find the JUnit file. This is nextest's default, written out.
+[store]
+dir = "target/nextest"
+
+[profile.default]
+retries = 1
+slow-timeout = { period = "30s", terminate-after = 4 }
+fail-fast = false
+
+# The ww-cli tests build real git repositories; the slowest take about a minute. They get 5
+# minutes before nextest stops them. Retries stay at 1 (QA-030): an override never changes them.
+[[profile.default.overrides]]
+filter = 'package(ww-cli)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[profile.spec]
+# Inherits retries = 1 from default (QA-030). A test that passes on retry is not hidden:
+# `ww dev spec-tests` prints it as "flaky: <name> (passed on retry)".
+slow-timeout = { period = "60s", terminate-after = 5 }
+fail-fast = false
+
+# Written to <store dir>/spec/junit.xml: target/nextest/spec/junit.xml in the workspace.
+[profile.spec.junit]
+path = "junit.xml"
+

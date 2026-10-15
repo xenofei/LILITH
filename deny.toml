@@ -1,0 +1,42 @@
+# cargo-deny policy (ARCH-111, QA-027 alongside the dependency-boundary test).
+# Platform checks (no Qt/Windows crates in ww-schema / ww-protocol) live in
+# crates/ww-testkit/tests/dependency_boundaries.rs, not in `bans`.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+# Vulnerabilities are always denied. Unmaintained and yanked crates fail the check too.
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+# Third-party crates: permissive licences only, all compatible with distributing the
+# suite's binaries under GPL-3.0-or-later (the suite's own licence; see LICENSE).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+# Not every allowed licence is in the current dependency tree; that is expected.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# Workspace crates are the suite's own code: GPL-3.0-or-later (inherited from
+# [workspace.package]) and `publish = false`, so the allow list above doesn't apply to them.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

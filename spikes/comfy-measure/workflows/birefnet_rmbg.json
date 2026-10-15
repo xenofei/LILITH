@@ -1,0 +1,8 @@
+{
+  "1": {"inputs": {"image": "{{IMAGE}}"}, "class_type": "LoadImage", "_meta": {"title": "Load Image"}},
+  "2": {"inputs": {"model": "General.safetensors", "device": "AUTO", "use_weight": false, "dtype": "float32"},
+        "class_type": "LoadRembgByBiRefNetModel", "_meta": {"title": "LoadRembgByBiRefNetModel"}},
+  "3": {"inputs": {"model": ["2", 0], "images": ["1", 0]}, "class_type": "RembgByBiRefNet", "_meta": {"title": "RembgByBiRefNet"}},
+  "4": {"inputs": {"images": ["3", 0]}, "class_type": "PreviewImage", "_meta": {"title": "Preview Image (cut-out)"}},
+  "5": {"inputs": {"mask": ["3", 1]}, "class_type": "MaskPreview", "_meta": {"title": "Preview Mask"}}
+}

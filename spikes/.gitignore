@@ -1,0 +1,15 @@
+# Build and deploy outputs of every spike. Only images under results/ are committed;
+# raw JSON, logs and text outputs record the machine and stay local.
+*/build/
+*/deploy/
+*/rust/target/
+# written into the crate folder by cxx-qt-build at build time
+*/rust/.qmlls.ini
+# raw golden read-backs written by spikes/canvas/run-composite-check.ps1 (regenerated per run)
+*/golden/
+*/results/**/*.json
+*/results/**/*.jsonl
+*/results/**/*.log
+*/results/**/*.txt
+*/results/**/*.csv
+*/results/**/*.md

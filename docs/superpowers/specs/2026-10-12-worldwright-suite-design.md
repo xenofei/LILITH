@@ -1,0 +1,2382 @@
+# Worldwright Suite — Design Specification
+
+**Status:** design approved section by section (2026-10-12); this consolidated document awaits final review.
+**Date:** 2026-10-12 · **Audience:** a single user, who is also the tester · **Authors:** Claude Code (design), with independent review passes per section.
+**Facts:** third-party versions, prices, flags and terms were verified against primary sources on 2026-10-12 and will go stale; the plan re-verifies the ones it depends on (Appendix B).
+
+## 0. Purpose and how to read this document
+
+### 0.1 What we're building
+
+A **personal, hobby desktop creative suite** in the spirit of Adobe Creative Cloud: a family of full-scope, AI-enabled apps (image, 2D, 3D, audio, video and avatars over time) that share one workspace and can import, export and hand files to one another. It is designed for one person making creative art and assets for their own use. It is free software (GPL-3.0-or-later, OPS-108) rather than a commercial product, and it is built with quality in mind.
+
+**Success looks like:**
+- each app is usable on its own (open just the Image studio to make 2D sprites) and better together (shared assets, history, AI tools, spending view);
+- AI is everywhere but optional: flagship hosted models and local models through one tool surface, with Claude Code fully integrated as the default assistant engine;
+- nothing is lost: files are the source of truth, every output can be traced and rebuilt, and backups work from day one without paying for cloud;
+- the user steers and tests milestone builds; quality comes from the process (protected tests, reviews, CI), not from reading every line of code.
+
+**Not goals:** a content filter or IP screen of the suite's own (each provider's and model's own policies still apply); business machinery (approval gates, budgets as gates, billing ledgers, commercial-licence gates, provenance credentials, modes); multi-user collaboration; non-Windows platforms in the first milestones.
+
+### 0.2 Decisions that shape everything
+
+| Topic | Decision |
+|---|---|
+| Architecture | **A:** a headless Rust core service (`ww-core`, one per user) owns all state and engines; Qt 6 / QML apps (via cxx-qt) and AI agents are clients over a local named pipe; a `ww` CLI and a `ww-mcp` server expose the same tools. Every app works standalone. (§1) |
+| Build vs wrap | Hybrid: wrap strong, maintained projects (ComfyUI first), build in-house otherwise. |
+| Data | Files are the source of truth; databases are caches or durable local state. Sealed asset versions are immutable. (§1.5, §2) |
+| First app | Image studio: Invoke-style canvas with layers, a native ComfyUI node graph (view + tweak + run) and the embedded ComfyUI web UI; delivered as M1a then M1b; the in-app assistant arrives in M1b. (§5, AI-156) |
+| AI | Flagship providers (Anthropic, OpenRouter, NanoGPT, OpenAI, Google, fal, major Chinese providers) and local models through one tool surface; local LLMs in M1.5. (§4) |
+| Assistant | Co-pilot and director modes; default engine **Claude Code** on the user's own Claude sign-in (unmodified `claude` CLI); Anthropic API as the alternative; several Claude Code profiles with **manual** switching only. (§4.6, §4.6a, §4.7) |
+| Money | Track usage and cost of every external service, show account balances and quotas, optional spending caps that agents can't change; no budgets-as-gates. (§2.6, §4.2) |
+| Safety | Yes/no confirmations when AI agents delete, install or run scripts. The suite adds no content filter of its own; each provider's and model's policies apply. (§2.7) |
+| Testing | AI-written code kept honest by protected spec tests, reviews and CI on GitHub-hosted runners; real-engine/GPU tests on demand. (§6) |
+| Storage | Cloud optional: start with large files on this PC (optionally mirrored to an external drive) and encrypted local backups; OneDrive optional; Backblaze B2, Hetzner and others later. GitHub for code (the suite repository is public; a workspace repository is optional and private). Unsigned per-user installer. (§7) |
+| Platform | Windows 11 first; other platforms deferred but not designed out. |
+
+### 0.3 Rule IDs and tags
+
+Every requirement a plan task or test would point at is a bullet with a **stable ID**:
+
+`- **CORE-042** [M1] (invariant) …`
+
+- **Prefixes:** ARCH (§1), CORE (§2), APP (§3), AI (§4), IMG (§5), QA (§6), OPS (§7). IDs are never renumbered. A removed rule keeps its number, marked *withdrawn*; new rules get the next free number.
+- **Milestones:** `[M0]` is a spike that must pass before M1 work that depends on it. Then come `[M1]`, `[M1a]` and `[M1b]` (the Image studio's two halves of M1), `[M1.5]` and `[Later]`. A plain `[M1]` platform rule is sequenced by the plan so each M1a feature has what it needs, and is done by the end of M1b.
+- **Kinds:**
+  - `(invariant)` must always hold, and protected tests guard it;
+  - `(contract)` is an interface or format other components rely on;
+  - `(decision)` records a project decision;
+  - an untagged rule is an ordinary requirement.
+- Text without an ID is explanation and rationale.
+
+### 0.4 Glossary
+
+| Term | Meaning |
+|---|---|
+| Core (`ww-core`) | The per-user headless Rust service: the only writer of workspace state; it runs jobs, engines, metering and tools. |
+| App | A Qt/QML process (e.g. `ww-image`) that is a client of the core. |
+| Workspace | A folder holding projects, assets, registries and logs; versioned with git (+ LFS). |
+| Asset / version / candidate | An asset has sealed, immutable versions (`v<semver>/`). Generation runs produce candidates; signing off seals one as a version. |
+| Proposal | A staged change to a working document (e.g. an inpaint result) that you accept or discard. |
+| Document | A hand-edited working file (e.g. an Image studio canvas) in the Worldwright document format: a folder or `.wwdoc`, with content-addressed tiles. |
+| Tool | A typed operation in the core (e.g. `image.generate`) callable by apps, the CLI, MCP clients and the assistant through one dispatcher. |
+| Caller kind | Who is calling a tool — exactly one of `ui:<app>`, `assistant`, `mcp`, `cli` (§1.3); it decides confirmations and permissions. |
+| Effect class | `read`, `write`, `destructive`, `exec`: decides whether an agent's call needs your confirmation. |
+| Engine | An external program the core drives (ComfyUI; Claude Code as assistant Engine A; the Anthropic API as Engine B; later Blender, local LLM servers). |
+| Profile (Claude Code) | One Claude Code account's config folder (`CLAUDE_CONFIG_DIR`), selectable per conversation. |
+| Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records (lossless JSON/YAML round-trip). Its reference text is `docs/reference/workspace-format.md` (from the Worldwright plugin's manifest skill); this spec's changes to it (§2.12) take precedence. |
+| Store (large files) | Where Git LFS objects live besides this PC: none ("This PC only"), an external or second drive, or S3-compatible cloud (M1.5) (§7.2). |
+| Destination (backups) | A restic repository: the local primary drive, plus optional cloud destinations. |
+
+### 0.5 Document map
+
+§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes.
+
+---
+
+## 1. Processes, connections, trust and repo layout
+
+The suite is one headless Rust core service per user plus Qt 6 / QML apps that are its clients. AI agents (the built-in assistant, Claude Code) and scripts reach the same tools through the same pipe. This section defines the processes, how they connect and identify themselves, the safety rules the core enforces, how workspace files are written, where data lives, and how the code repository is laid out.
+
+- **ARCH-001** [M1] (decision) Architecture A: a headless Rust core service (`ww-core`) plus Qt 6 / QML apps built with cxx-qt. Every app is usable on its own. Windows 11 first.
+
+### 1.1 Processes
+
+| Process | Tech | Role |
+|---|---|---|
+| `ww-core` | Rust (tokio); per-user background process, started on demand | The authority on what a workspace means and the only writer of workspace files among suite processes. All module logic (image operations now; 2D, 3D and audio later) lives here as tools. Supervises engines and Claude Code engine processes. |
+| `ww-image` | Rust + Qt 6 Quick/QML (cxx-qt) + C++ shim | The Image studio (§5). In M1 it also hosts the suite's shared panels. |
+| `ww-mcp` | Rust (`rmcp`), stdio | The MCP server Claude Code spawns. Protocol adaptation only. |
+| `ww` | Rust CLI | Debugging, Claude Code hooks, setup checks, scheduled tasks, the end-to-end test harness. |
+| windowless launcher | Rust | Runs `ww` commands from Task Scheduler without a console window. |
+| `claude` (Engine A) | your installed, unmodified Claude Code CLI | Run headless by the core's `assistant` module as the default assistant engine (§4.6). |
+| Engines | external | ComfyUI in M1; managed by class (§1.4). |
+
+**The core**
+- **ARCH-002** [M1] (invariant) `ww-core` is the only writer of workspace files among suite processes; inside the core only the `store` module writes (§2.0). Apps, `ww-mcp`, `ww` and engines never write workspace files directly.
+- **ARCH-003** [M1] (invariant) All module logic lives in the core as tools in one registry. Apps use the same `tools/*` calls as agents (caller kind `ui:<app>`), so anything an app can do, an agent can do.
+- **ARCH-004** [M1] (invariant) The core is a per-user background process started on demand. It is never a Windows Service.
+- **ARCH-005** [M1] (invariant) The core never shows UI and never launches GUI apps. It reaches you through Windows notifications posted under the suite's Start-menu identity (AppUserModelID); Windows draws them, and clicking one activates a `ww:` URL that an app handles (§3.1, §3.3).
+  - Reason: the core may sit inside a terminal's job object, and Windows wouldn't let windows it launched come to the front.
+- **ARCH-006** [M1] (invariant) The core exposes no network port. The only exception is ARCH-007.
+- **ARCH-007** [M1.5] An optional OpenTelemetry receiver for interactive Claude Code sessions, bound to 127.0.0.1 only, `http/json`, requiring an auth header (§4.7). Engine A runs don't need it: from M1 they are recorded from their own output stream.
+- **ARCH-008** [M1] The core's `assistant` module launches and supervises Engine A: your installed, unmodified `claude` CLI, run headless, one long-lived process per active conversation, each in a kill-on-close Job Object (launch profile, environment allowlist and account profiles in §4.6 and §4.6a).
+
+**`ww-image` (Image studio)**
+- **ARCH-009** [M1] The open document (canvas, layers, undo) lives in the app process. The app autosaves it every 30 s to its recovery folder `%LOCALAPPDATA%\Worldwright\recovery\<app>\`; saving goes through the core's staged-save calls (§3.5).
+- **ARCH-010** [M1] In M1, `ww-image` hosts the shared suite panels — Home/projects, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant, Diagnostics (which in M1 holds the Backups panel and a backup status line, §7.4) — and the embedded ComfyUI web view (ARCH-070).
+- **ARCH-011** [Later] A separate `ww-hub` app takes over the shared panels when the second app arrives.
+
+**`ww-mcp` (Claude Code's MCP server)**
+- **ARCH-012** [M1] (contract) `ww-mcp` is a Rust (`rmcp`) stdio MCP server named `ww`, spawned by Claude Code. It does protocol adaptation only — MCP revision 2026-07-28 plus legacy revisions, and result lowering (ARCH-039). It holds no policy and no state; the core enforces everything.
+  - Tool names appear as `mcp__plugin_worldwright_ww__<tool>` in interactive sessions and `mcp__ww__<tool>` in Engine A; hooks and rules match both (§4.7).
+- **ARCH-013** [M1] (contract) A real copy of `ww-mcp.exe` (not a launcher) lives at the fixed per-user path `%LOCALAPPDATA%\Worldwright\bin\ww-mcp.exe`. Only the stable channel owns it: Velopack's after-install and after-update hooks copy it there with rename-then-replace (§7.5). The install is recorded under `HKCU\Software\Worldwright`. The plugin's `.mcp.json` points at this path (with `userConfig` as an override).
+- **ARCH-014** [M1] If `ww-mcp` and the running core are incompatible, `ww-mcp` still starts and exposes only `ww.status`, which reports the error.
+- **ARCH-015** [M1] `ww-mcp` may launch an app on an agent's behalf, using the launch command returned by `open_in` / `ui.show`, without taking focus (§3.4).
+
+**`ww` CLI and launcher**
+- **ARCH-016** [M1] `ww` provides at least `ww call`, `ww events --follow`, `ww doctor`, `ww notify <path>` and `ww status`. Other subcommands are specified where they're used: `ww doctor --claude-smoke` (§4.7; runs only when you confirm, because it uses plan quota, under the Claude Code profile you pick — default: the default profile; after a Claude Code version change Doctor offers it), `ww --confirm-window` (§3.3), `ww --non-interactive` (ARCH-055), `ww backup --scheduled` and `ww secret get` (§7.4), `ww test --real` (§6.4), `ww dev merge` (§6), and in M1.5 `ww statusline` (§4.7) and `ww lfs-agent` (§7.2).
+- **ARCH-017** [M1] The windowless launcher runs `ww` commands from Task Scheduler (e.g. `ww backup --scheduled`) without a console window. It may start the core (§7.4).
+
+**Starting and stopping the core**
+- **ARCH-018** [M1] Apps and `ww-mcp` start the core if none is running. `ww` invocations from Claude Code hooks pass `--no-start` and are a silent no-op when no core is running.
+  - Consequence: while Claude Code has the Worldwright MCP server loaded, the core stays alive. That's cheap; engines idle down separately.
+- **ARCH-019** [M1] The core is spawned detached. The spawner first tries `CREATE_BREAKAWAY_FROM_JOB` and, on access denied, retries without it; the core's life is then tied to its launcher's job, which is acceptable because jobs are persisted and the next client restarts the core cleanly.
+- **ARCH-020** [M1] The core exits after 10 minutes idle, and only when all of these hold: no connected clients; no queued or running jobs (director tasks are jobs); no pending confirmations (including cap confirmations); no outside jobs queued or running in ComfyUI (polled via `/api/jobs`). Once leases exist (ARCH-092), no active leases is added to this list.
+- **ARCH-021** [M1] (invariant) Graceful shutdown runs in this order:
+  1. drain — stop accepting work and let running jobs finish, up to a timeout;
+  2. cancel the suite's own remaining ComfyUI prompts with `POST /api/jobs/{id}/cancel` (never a bare `/interrupt`, which could hit an outside job);
+  3. persist those jobs as `interrupted`;
+  4. stop owned engines explicitly.
+
+  A hidden top-level window receives `WM_QUERYENDSESSION`, so logoff and Windows shutdown run the same sequence.
+- **ARCH-022** [M1] (invariant) On startup, every job without a final state becomes `interrupted` and is never re-run automatically (paid ones especially). Director tasks become `interrupted` too and resume only when you choose (§4.6).
+- **ARCH-023** [M1] A client that sees a major protocol mismatch asks the running core to "drain and exit when safe", waits for it to exit, then starts the new core. Apps show "restart the core when it's idle" meanwhile (§3.2). Suite updates also drain the core first and never run while jobs run (§7.5).
+
+### 1.2 Connections
+
+- **ARCH-024** [M1] (contract) The core listens on the named pipe `\\.\pipe\worldwright-core-<userSID>-<channel>`. Channels:
+
+  | Channel | Used by |
+  |---|---|
+  | `stable` | the installed suite, Velopack pack id `WorldwrightSuite` |
+  | `dev` | development builds, pack id `WorldwrightSuite.Dev` |
+  | `test-<id>` | each test run (§6.3) |
+
+  Dev builds and parallel tests therefore never collide with the installed suite.
+- **ARCH-025** [M1] (contract) The protocol is newline-delimited JSON-RPC 2.0 over stateful connections.
+- **ARCH-026** [M1] (invariant) Every pipe instance carries a security descriptor (SDDL) granting access only to the current user's SID and SYSTEM. The core creates its first instance with `first_pipe_instance(true)` as the singleton check and rejects remote clients. (The apps' own single-instance pipes use the same descriptor, §3.1.)
+- **ARCH-027** [M1] (invariant) Before trusting a pipe, a client verifies the server: `GetNamedPipeServerProcessId` → open that process immediately → its token user must be the current user, and its image path must be the install directory or, for dev builds, the client's own directory.
+- **ARCH-028** [M1] The core holds `LockFileEx` on `<workspace>\.worldwright\core.lock` for each workspace it serves. A second core (another channel) that finds the lock held gets read-only access to that workspace.
+- **ARCH-029** [M1] (contract) The mandatory first call on every connection is the handshake `core/hello`, callable by every caller kind (apps, `ww`, `ww-mcp`, Engine A). Its parameters: protocol `major.minor`, build id, schema hash, capabilities, declared caller kind, whether the caller is non-interactive (ARCH-055), workspace id (explicit, or `"none"`), and for Engine A connections the per-launch engine token and the Claude Code profile id (`WW_PROFILE`, §4.6a).
+  - Major version mismatch → refused (`protocol.incompatible`); minor mismatch → the session uses the shared capabilities; unknown parameters → rejected.
+- **ARCH-030** [M1] (contract) Which workspace a call uses:
+  - `mcp` callers: the call's explicit workspace argument, else the workspace containing Claude Code's working directory, else the default workspace in `suite.toml`;
+  - Engine A (`assistant`) connections: the workspace id from the handshake (or `"none"`), which overrides the working-directory rule;
+  - apps: the workspace chosen in the session (`core/hello`, `app/set_context`);
+  - `cli` callers (`ww`): the explicit `--workspace` argument, else the workspace containing the current directory, else the default workspace in `suite.toml`.
+- **ARCH-031** [M1] (contract) Method namespaces:
+  - `core/hello` — the handshake (ARCH-029), open to every caller kind;
+  - `tools/*` — the agent-visible tool registry, filtered per caller (e.g. Engine A's permission-prompt tool `approve` is exposed only to engine connections, §4.6);
+  - `app/*` — only what is specific to a running app: session, document hold and save, activation and open requests, confirmation answers and `caps.set` (§3.3). `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `ww` and tests;
+  - `ww/subscribe`, `ww/unsubscribe` and the `ww/event` notification.
+- **ARCH-032** [M1] (contract) `ww/subscribe(topics, since_seq)` delivers `ww/event` notifications with per-topic sequence numbers. The core keeps 10 minutes of history per topic; a cursor older than that gets a snapshot instead. Each client has a bounded queue; overflow sends `resync_required`. External file edits and git activity arrive on the same stream. Topics include `asset:<ref>` for live links.
+- **ARCH-033** [M1] (invariant) Bulk data never goes through the pipe. Calls and events carry file references into the workspace or into a staging/cache folder on the same volume (so ingest is a rename). Small previews (≤ 1 MB) may ride in events. No shared memory.
+- **ARCH-034** [M1] (contract) Long-running work returns a job id immediately.
+- **ARCH-035** [M1] (contract) Every mutating or metered call carries an idempotency key, which the core dedupes and persists with the job (scope and same-key rules in §2.2; Engine A uses session id + tool-use id, §4.6).
+- **ARCH-036** [M1] (contract) Every tool and RPC result is exactly one of `ok`, `pending_confirmation` or `error` (fields in §6.1). `pending_confirmation` is not an error.
+
+**Tool descriptors and lowering** — tool descriptors are shared; the wire protocols aren't.
+- **ARCH-037** [M1] (contract) Each tool has one internal descriptor: name; description of at most 2,000 characters with the critical information first (Claude Code truncates descriptions at 2,048 characters, verified 2026-10-12); input and output schemas generated by `schemars`, pinned to JSON Schema 2020-12; effect class (ARCH-051); annotations.
+- **ARCH-038** [M1] (contract) Each tool has one internal result shape: `{structured, artifacts: [FileRef], summary_text}`.
+- **ARCH-039** [M1] (contract) Lowering to MCP returns JSON text plus file paths. `structuredContent` and `resource_link` are added only as optional extras, because Claude Code doesn't document them. Tool failures are results with `isError: true` and JSON text; JSON-RPC errors are used only for protocol faults (§6.1).
+- **ARCH-040** [M1] M1 lowers to two targets: MCP, and Anthropic Messages tool definitions for Engine B (§4.6). Each target has snapshot tests.
+- **ARCH-041** [Later] Further lowering targets (OpenAI strict, Gemini, others) are added with the engines that need them.
+
+**Interchange primitives** (used by later sections)
+- **ARCH-042** [M1] (contract) The canonical asset reference is `ww://<workspace>/<project>/<asset>@<version>`, mapping 1:1 to the manifest link syntax. Candidates are referenced as `ww://<workspace>/<project>/<asset>@candidate/<run>/<file>` for viewing and provenance only — never as live links or recipe inputs.
+  - From M1, every reference to a version — `ww://` refs, `.wwref` files, exports and engine-import records — also carries the target version's SHA-256 content hash (field defined with the schema, §2). Resolving a reference through `renamed_from` comes with multi-machine Sync (ARCH-087).
+- **ARCH-043** [M1] (contract) Clipboard and drag-and-drop carry refs under the MIME type `application/x-worldwright-ref`.
+- **ARCH-044** [M1] (contract) Live links subscribe to the event topic `asset:<ref>`.
+
+Defined elsewhere: proposal references `doc:<doc_id>/proposal/<run_id>/<n>` (§5.5); the app handler registry, `open_in` and `ui.show` (§3.4); converters as tools (§2.10); checkout/checkin with the first interactive engine (*later*).
+
+### 1.3 Trust and safety
+
+All enforcement happens in the core's dispatcher (§2.2).
+
+**Caller identity — verified, not trusted**
+- **ARCH-045** [M1] (contract) Every connection has exactly one caller kind: `ui:<app>`, `assistant`, `mcp` or `cli`. The core decides it from `GetNamedPipeClientProcessId` and the handshake, never from the declared kind alone.
+- **ARCH-046** [M1] (invariant) A connection is `ui:<app>` only if the client process is a Worldwright app executable from the install directory (or the dev directory for dev builds).
+- **ARCH-047** [M1] A connection is `mcp` only if the client process is `ww-mcp.exe` from the install directory or the per-user bin folder (`%LOCALAPPDATA%\Worldwright\bin\`), with a best-effort check that a `claude.exe` is its parent or grandparent.
+- **ARCH-048** [M1] (invariant) A connection is `assistant` (`engine: claude_code`, with the conversation's workspace id) when it presents a valid per-launch engine token. The token is unguessable and issued per `claude` process; the core holds that process's handle, so its PID can't be reused. A token that is forged, reused or belongs to a `claude` process that has ended is invalid, and calls presenting it are refused (ARCH-050).
+- **ARCH-049** [M1] (invariant) The engine token is never in `claude`'s environment (it would leak into every command the agent runs). It reaches `ww-mcp` only through the core-generated MCP config entry's `env` (§4.6).
+- **ARCH-050** [M1] A connection that presents an invalid engine token is refused — it is never downgraded to `cli`. Every other connection that isn't `ui:<app>`, `mcp` or `assistant` is `cli`.
+
+The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` claiming Claude Code already confirmed something), not against malware running as you.
+
+**Effect classes and agent safety confirmations**
+- **ARCH-051** [M1] (contract) Every tool declares one effect class: `read | write | destructive | exec` (definitions in §2.7). In short: `destructive` = delete, purge trash, overwrite outside the version system, or an agent-initiated engine stop/restart that would kill outside jobs; `exec` = install nodes or packages, run scripts or arbitrary code, download executable formats.
+- **ARCH-052** [M1] (invariant) When an agent caller (`assistant`, `mcp` or `cli`) calls a `destructive` or `exec` tool, the call waits for your confirmation (`pending_confirmation`, ARCH-055). Your own actions in the apps never ask. Deletes are soft (ARCH-058) either way.
+- **ARCH-053** [M1] (invariant) Only two things can answer a confirmation (including a cap confirmation):
+  - a verified `ui:*` connection, sending after a real input event in the shared dialog (the core can verify the connection, not the click);
+  - Claude Code's own permission prompt, as in ARCH-054.
+
+  `cli`, `mcp` and `assistant` connections can never answer, and a caller-supplied `confirm: true` is never accepted. Every answer records how it was given (`app` or `claude_code`).
+- **ARCH-054** [M1] For interactive Claude Code sessions (`mcp`), the core marks `destructive` and `exec` tools with `_meta["anthropic/requiresUserInteraction"]: true`, so Claude Code prompts you every time and its hooks can't auto-allow. That prompt is the confirmation (recorded `confirmed_via: claude_code`), so you aren't asked twice. The core decides this per connection: for Engine A connections the tools aren't marked and the core's own confirmations apply (§4.6).
+- **ARCH-055** [M1] A call that needs your confirmation or a cap decision returns `pending_confirmation` with a confirmation id and retry token whenever a confirmation can be answered — an app is connected or the notification path can reach you. When no app is open, the core posts a Windows notification; clicking it opens `ww:confirm/<id>` (§3.3). The core never draws a dialog of its own.
+  - Callers that declare themselves non-interactive in the handshake (`ww --non-interactive`, scheduled tasks) get an error instead: `cap.exceeded` for caps, `confirm.unavailable` for agent safety confirmations (§6.1).
+
+**Caps, paid nodes, deletes, installs**
+- **ARCH-056** [M1] (invariant) Spending caps are optional (off by default) and suite-level. Only a verified UI action (`app/caps.set`) changes them; agents can't. Enforcement is reserve-then-settle, atomic (§2.6); caps also count calls made without a workspace, so reservations live in the suite-level `state.db` (§1.6). A call that needs both a confirmation and a cap decision gets one prompt covering both.
+- **ARCH-057** [M1] ComfyUI partner (paid API) nodes are detected from the workflow graph. The Comfy account key is injected into that single request only. Paid jobs submitted to ComfyUI from outside the suite are recorded as unattributed spend.
+- **ARCH-058** [M1] (invariant) Deletes are soft: files move to `<workspace>\.trash\<date>\` (gitignored) with restore records and are purged after 30 days.
+- **ARCH-059** [M1] Installs and scripts the suite runs (node packs, packages, bpy scripts) use pinned versions.
+- **ARCH-060** [M1] Untrusted content — model cards, workflow notes, PNG metadata, imported text, file names, raw engine and provider error text — is tagged in tool results and wrapped as data when an agent sees it. This protects agents from being tricked into acting; it isn't a rule about what you may create.
+
+**Secrets and engine environments**
+- **ARCH-061** [M1] (invariant) API keys live in Windows Credential Manager, accessed through `keyring` 4.x with `windows-native-keyring-store` (verified 2026-10-12), and are read just in time by `providers` and `accounts` through the `secrets` module. Secrets are never sent over the pipe, never given to apps, and never written to logs, databases, usage or job logs, or engine environments. The single exception is the per-request partner-node key (ARCH-057). Environment variables are only a one-time import source. Helper tools (restic, rclone, the LFS agent) receive secrets only through the mechanisms in §7.
+- **ARCH-062** [M1] (invariant) The suite never reads, stores or forwards your Claude Code sign-in. It never opens `.credentials.json` or `.claude.json` and never copies, moves or backs up a Claude Code profile folder (§4.6a).
+- **ARCH-063** [M1] (invariant) Engine processes get scrubbed environments: ComfyUI's has every provider key removed; Engine A's is built from the allowlist in §4.6.
+
+**Trust boundary, stated plainly.** Any process running as you can connect to the core. Verified caller identity, confirmations that only a verified app (or Claude Code's own prompt) can answer, and caps that agents can't change are the real defences.
+
+### 1.4 Engines
+
+| Class | Engines | The core may |
+|---|---|---|
+| **Owned** — started by the core | ComfyUI when nothing else started it (M1); `llama-server --api-key` on 127.0.0.1 (M1.5); headless Blender `-b --disable-autoexec` (later) | start, health-check, restart, idle down (`/free`, unload) |
+| **Attached** — someone else started it | ComfyUI started by `start-comfyui.ps1` or the comfy MCP (M1); Ollama (M1.5) | health-check, submit work, observe; never stop |
+| **User-interactive** (later) | Blender UI, Godot editor, Krita (via an in-house pykrita bridge plugin) | connect via add-on/bridge, observe, check in saved work; never restart or idle down |
+
+- **ARCH-064** [M1] (invariant) Owned engines run in a kill-on-close Job Object for crash cleanup only; normal exits stop them explicitly. Attached engines are never stopped by the suite.
+- **ARCH-065** [M1] (decision) In M1 the core manages ComfyUI only, as owned or attached depending on who started it.
+- **ARCH-066** [M1.5] (decision) Local LLM runtimes: `llama-server` as an owned engine (started with `--api-key`, bound to 127.0.0.1) and Ollama as an attached one (§4).
+- **ARCH-067** [Later] Headless Blender as an owned engine; Blender UI, Godot editor and Krita as user-interactive engines.
+
+**ComfyUI**
+- **ARCH-068** [M1] (invariant) ComfyUI listens on loopback only. The core refuses to start it with any other listen address and verifies the listening socket after start.
+- **ARCH-069** [M1] (invariant) The core observes ComfyUI's queue: outside jobs (from its own web UI, the comfy MCP or scripts) are discovered by polling `/queue` and `/api/jobs`, recorded, and scheduled around. The suite never cancels an outside job. The suite holds its own queue and keeps at most one prompt per lane pending in ComfyUI (§2.8, §5.5).
+- **ARCH-070** [M1a] ComfyUI's own web UI is embedded in the Image studio as a QtWebEngine view in the C++ shim, locked down: it loads ComfyUI's own loopback origin (`http://127.0.0.1:8188`) in a named persistent profile; navigation is pinned to that origin; popups are handled; downloads are blocked; there is no web channel or other bridge from the page into the core. It costs roughly 150 MB of install size. It is created on first show, and nothing links the WebEngine DLLs before then (§3.7, §5.8).
+
+**GPU scheduler**
+- **ARCH-071** [M1] One heavy GPU job runs at a time, holding the GPU lease of the `gpu-heavy` lane. Before dispatch the scheduler reads VRAM from `telemetry` (§2.5): total and free via NVML, and per-process dedicated usage via the Windows PDH counter `GPU Process Memory`, because NVML can't report per-process VRAM on GeForce/WDDM. An engine's own resident VRAM counts as available to it. If memory is short the job waits (`waiting_for_vram`). Engines are asked to unload when workloads switch. This is cooperative, not a hard guarantee. (M0 result, 2026-10-12: PDH `GPU Process Memory\Dedicated Usage` overstates usage for some processes: webengine.exe and dwm.exe grew past the card's size (23 GB and 22 GB on the 16 GB card), so per-process budgets should read `Local Usage` / `Total Committed` instead. Under ComfyUI's dynamic VRAM (on by default in 0.39.2) ComfyUI fills the card to its own headroom while it runs, which affects the free-VRAM wait (`waiting_for_vram`). `docs/spikes/08-comfy-measurements.md` §5.2, follow-ups 1 and 8.)
+- **ARCH-072** [M1] CUDA out-of-memory errors are retryable. A watchdog from `execution_start` flags jobs running more than 3× their expected time (the symptom of Windows' system-memory fallback). Setup asks you to set "Prefer no sysmem fallback" for ComfyUI's Python in the NVIDIA Control Panel.
+
+### 1.5 Workspace writes, outside writers and git
+
+- **ARCH-073** [M1] (invariant) The core is the only *suite* writer of workspace files. Outside writers — Claude Code tools (file tools, Bash, other MCP servers), you, git/LFS, engines — are tolerated, detected and reconciled.
+- **ARCH-074** [M1] (invariant) Every core write:
+  1. re-hashes the target and compares it with the hash the core expects — on a mismatch it re-reads, merges or raises a conflict, and never overwrites an outside edit;
+  2. writes a temp file in the same directory and flushes it;
+  3. replaces the target atomically (`ReplaceFileW` / `MoveFileExW` with write-through), retrying on sharing violations from Defender or the indexer.
+
+  The file watcher covers the small window between steps 1 and 3.
+- **ARCH-075** [M1] (invariant) Each operation writes in a fixed order: output file → manifest → jobs log line → index. On startup, outputs with no manifest entry (a crash mid-sequence) are listed as orphans for review and never deleted.
+- **ARCH-076** [M1] (invariant) Manifests round-trip losslessly: JSON is parsed with key order preserved (`serde_json` `preserve_order`) into typed structs that keep unknown fields in a flattened extras map, and written back with minimal diffs. Manifests carry `schema_version`; schema violations are warnings, not failures. YAML files (`worldwright.yaml`, `registry/*.yaml`) are changed with targeted edits that keep comments and order.
+- **ARCH-077** [M1] Golden round-trip tests use real workspace files, including the lantern manifest.
+- **ARCH-078** [M1] The core records the SHA-256 of every file it writes as that file's last generated hash; human-edit detection compares against it (LFS pointers by `oid`). SHA-256 is the only content hash.
+- **ARCH-079** [M1] The file watcher uses `ReadDirectoryChangesW` and does a full rescan on buffer overflow. An outside edit to a candidate or sealed file is recorded as a human edit and offered as a new version. `work/` (working documents) is excluded from human-edit tracking, and `.worldwright\staging\` is excluded from the watcher. An invalid manifest is marked "needs repair" and never rewritten.
+- **ARCH-080** [M1] (invariant) Engines never write into versioned folders. Headless jobs write into staging handles issued by `store` (`<workspace>\.worldwright\staging\`, gitignored, same volume), and the core ingests their outputs as candidate runs (§2.3).
+- **ARCH-081** [M1] (contract) The append-only logs are per machine and per month: `queue/jobs.<machine>.<yyyy-mm>.jsonl` and `registry/usage.<machine>.<yyyy-mm>.jsonl`. Calls made with no workspace open go to `%LOCALAPPDATA%\Worldwright\usage-loose.jsonl`.
+  - Appends take a cross-process lock that `ww` can also take; each line is one write and carries a `seq`; readers repair a torn last line and dedupe by `(machine, seq)`.
+  - No `merge=union` and no rotation moves: a new month starts a new file.
+  - Live queue state is held by the core (the per-workspace `state.db`); the files are logs.
+- **ARCH-082** [M1] There is no usage ledger: usage records go only to the usage logs (ARCH-081). An existing `registry/ledger.csv` is left alone and never written.
+- **ARCH-083** [M1] The core detects outside git activity (`.git/index.lock`, HEAD changes), queues its writes for up to 60 s, and resumes after a rescan once git is done.
+- **ARCH-084** [M1] The core commits to git when you press Sync (§7.3) or ask (the checkpoint tool, a plain `write` tool), and optionally on app close or when idle if you turn that setting on; never silently otherwise. During Sync, its writes pause only for Sync's own commit, merge and checkout steps (backups also pause them for seconds, OPS-074).
+- **ARCH-085** [M1] Without an LFS server there are no LFS locks, so `ww doctor` sets `lfs.setlockablereadonly=false` in the repo config; checkout locking will use core leases when they arrive (ARCH-092, Later). LFS pointer files that haven't been fetched are marked `not_fetched`, never treated as corrupt.
+- **ARCH-086** [M1] (contract) `.gitattributes` LFS patterns don't depend on where large files are stored; the large-file store is a per-workspace setting kept in each clone's own git config (§7.2).
+- **ARCH-087** [M1.5] (invariant) Sealed versions never get suffixes. When Sync finds a local sealed version that also exists remotely, it renumbers the local one before the merge and records `renamed_from` (§7.3). From then on references resolve through `renamed_from`, using the content hash they carry from M1 (ARCH-042).
+- **ARCH-088** [M1] The active project is per client session. `.worldwright\state.json` is only an untracked last-used hint.
+- **ARCH-089** [M1] The index is a disposable SQLite database (`index.db`, WAL, schema-versioned). It is rebuilt on a schema mismatch or a failed `quick_check`, and reconciled by path + size + mtime + NTFS FileId + ChangeTime, hashing only changed files.
+- **ARCH-090** [M1] `%APPDATA%\Worldwright\suite.toml` lists the known workspaces and the default one; one core serves them all. M1 supports one workspace, but the workspace id is in every request from the start.
+- **ARCH-091** [Later] Multiple workspaces served by one core.
+- **ARCH-092** [Later] Leases, with checkout/checkin: one lease record (holder, purpose, expiry; renewed by bridge heartbeat or an observed save) persisted in the manifest's `leases` extension field (the workspace format's `locks` path list is unchanged), so leases survive restarts and the plugin can see them.
+- **ARCH-093** [M1.5] Document checkpoints across machines upload to the cloud large-file store's `docs/` prefix (§7.2; needs an S3-compatible store), never to git — there is no git side ref. Local rolling snapshots (§3.5) are M1 and need no cloud store.
+
+### 1.6 Where data lives
+
+| Location | Contents |
+|---|---|
+| `<workspace>\` | The workspace: a local git repo with LFS (§7). Core-owned extras: `.worldwright\core.lock`, `.worldwright\staging\` (gitignored), `.worldwright\state.json` (untracked hint), `.trash\` (gitignored). |
+| `%APPDATA%\Worldwright\` | `suite.toml` (workspaces, default workspace, caps, display currency and dated exchange rates, fixed recurring costs, PSU efficiency, rest-of-system power baseline, electricity rate, the assistant engine choice, Claude Code profiles and labels; CORE-007); `providers\` (`providers.yaml`, `prices.yaml`, §4.1); `resources\` (personal Library resources, §3.4); the encrypted rclone config (§7.4). |
+| `%LOCALAPPDATA%\Worldwright\` | Suite-level `state.db` (cap reservations — caps are suite-wide and count no-workspace calls — and other state not tied to one workspace); machine-level `telemetry.db` (per-job rows tagged with the workspace); `usage-loose.jsonl`; `logs\`; `recovery\<app>\`; `bin\ww-mcp.exe`; `claude-profiles\<id>\`; `backup-stage\`; `pre-migration\<timestamp>\`; suite-level caches. |
+| `%LOCALAPPDATA%\Worldwright\workspaces\<workspace-hash>\` | Per-workspace local data, for a workspace on the same volume as `%LOCALAPPDATA%`: the document snapshot store, caches, `index.db`, per-workspace `state.db` (workspace state only), local proposals storage, `thumbs\`, `assistant\` (conversations). |
+| `<volume>:\.worldwright-local\<workspace-hash>\` | The same per-workspace local data, for a workspace on a different volume from `%LOCALAPPDATA%` — a Dev Drive (optional; creating one is a one-time admin step, §7.2) or any other drive — so hardlinked snapshots and rename-on-ingest stay on one volume. Staging is never here: it stays in `<workspace>\.worldwright\staging\`. |
+| `%LOCALAPPDATA%\<packId>\` | The Velopack install folder (§7.5). |
+| `HKCU\Software\Worldwright` | The install record. |
+| Windows Credential Manager | Secrets (ARCH-061). |
+
+- **ARCH-094** [M1] (invariant) No suite data ever lives in an install folder. Velopack deletes the whole folder on a fresh install over it or an uninstall, and replaces `current\` on update.
+- **ARCH-095** [M1] (invariant) Every path, registry root, Credential Manager target, pipe name and notification identity is resolved through one injectable environment provider keyed by channel (§6.3). No code reads `%APPDATA%`, `%LOCALAPPDATA%` or other known folders directly. (plan 1 clarification: the per-channel data-folder, registry, credential and workspace-hash naming is a contract, defined under QA-038.)
+- **ARCH-096** [M1] (invariant) Machine-local state — `index.db`, `state.db`, `telemetry.db`, caches, recovery files, proposals and snapshots — is never committed or synced between machines.
+- **ARCH-097** [M1] (contract) Per-workspace local data (snapshot store, caches, `index.db`, per-workspace `state.db`, local proposals storage) lives in `%LOCALAPPDATA%\Worldwright\workspaces\<workspace-hash>\` when the workspace is on the same volume as `%LOCALAPPDATA%`, and in `<volume>:\.worldwright-local\<workspace-hash>\` when it is on any other volume. The snapshot store is therefore always on the workspace's volume and snapshot layers are hardlinked; they're copied only where the file system can't hardlink (§3.5). The workspace's own `<workspace>\.worldwright\staging\` stays inside the workspace.
+
+### 1.7 Standalone use and the Claude Code plugin
+
+**Standalone apps**
+- **ARCH-098** [M1] An app opened from the Start menu or Explorer uses the default workspace from `suite.toml`; with no project chosen, work lands in the `sketchbook` project.
+- **ARCH-099** [M1] No-workspace mode: loose files outside any workspace are read and written by the app itself (documents as `.wwdoc`, §3.5). The core still offers providers and engines but writes no workspace files. Metered calls are allowed, logged to `usage-loose.jsonl` and counted against caps.
+- **ARCH-100** [M1] If the core is unavailable or the wrong version, the app keeps the open document, keeps autosaving to its recovery file, and disables AI and workspace features with a clear banner. When the core is back, the app re-acquires its document holds, resubscribes from its last `seq` (or reloads snapshots), and saves working documents changed meanwhile with a hash check against the last saved hash (conflict → keep both).
+
+**The Worldwright plugin for Claude Code**
+- **ARCH-101** [M1] (decision) The Worldwright Claude Code plugin 1.3 is the suite's plugin — MCP server plus hooks — shipped with the suite, with its source in the suite repo. It replaces the current 1.2.0 file-based plugin; its skills, output style and subagents are rewritten for the personal hobby suite (§2.12).
+- **ARCH-102** [M1] When a core is running, every state-changing step (new version, sign-off, transfer, promote, job, usage record) goes through the suite's MCP tools; direct file reads stay allowed. Skills detect a running suite with `ww status --no-start`, not by whether MCP tools are present. With no core running, the plugin falls back to working directly on workspace files.
+- **ARCH-103** [M1] Hooks: PostToolUse on Write/Edit under the workspace runs `ww notify --no-start <path>`; SessionStart reports the active project, open jobs and pending confirmations; Notification forwards Claude Code notices to Windows notifications via the suite (§4.7).
+- **ARCH-104** [M1] A PreToolUse hook guards direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json`. It starts **warn-only**; once every plugin skill has a matching tool it becomes **deny while a core is running** (checked with `ww status --no-start`) and stays allowed when no core runs, so skills can still work on files directly (ARCH-102). `ww doctor` lists skills still writing directly.
+- **ARCH-105** [M1] PreToolUse hooks return "ask" for Bash/PowerShell commands matching delete, install or script-run patterns and for the comfy MCP's install, update, download and restart tools (pattern list in §2.7).
+- **ARCH-106** [M1] Writes made through Bash, PowerShell or other MCP servers aren't hooked as writes; the reconciler absorbs them (ARCH-079). The comfy MCP's launch and stop tools are removed from the plugin config.
+- **ARCH-107** [M1] The plugin's hooks don't load in Engine A; if they run in some configuration, they see `WW_ENGINE=1` and do nothing.
+- **ARCH-108** [M1] The plugin is installed per Claude Code profile (config folder). Every profile's plugin points at the same fixed `ww-mcp.exe`, so all profiles connect to the same suite. `ww doctor` checks each profile and offers to install or update the plugin there, asking first (§4.6a).
+
+### 1.8 Repo layout
+
+- **ARCH-109** [M1] (decision) The code lives in the repo `Worldwright-Suite` (public on GitHub since Amendment A, 2026-10-13; worked on in a local clone, `<repo>`): suite source, this spec, tests and small fixtures, the Claude Code plugin source and build scripts (§7.1).
+  - Protected-test enforcement is layered: agents merge only through `ww dev merge`, git hooks refuse a merge that fails the protected-test check, server-side rulesets on the public repository require the CI checks and block force-pushes and deletion of `main`, and CI re-checks `main` after every merge (owned by §6).
+- **ARCH-110** [M1] Few crates with clear modules; a module is split into its own crate once its boundary has proven itself.
+
+| Crate | Contents |
+|---|---|
+| `ww-schema` | Workspace-format types (lossless round-trip; `docs/reference/workspace-format.md`), link syntax and `ww://` refs, schema generation |
+| `ww-protocol` | RPC methods, events, result and error types (§6.1), effect classes `read \| write \| destructive \| exec`, protocol version, tool descriptors and lowering |
+| `ww-client` | SDK for apps, `ww-mcp` and `ww`: find/start the core, verify the server, handshake, reconnect, resubscribe, idempotency keys |
+| `ww-core` | modules `store`, `watch`, `index`, `state`, `graph`, `projects`, `pipeline`, `settings`, `meter`, `accounts`, `telemetry`, `confirm`, `jobs` (with the GPU scheduler), `engines`, `providers`, `secrets`, `qa`, `convert`, `library`, `docs`, `resources`, `interchange`, `sync`, `lfs_store`, `backup`, `assistant` (supervises Claude Code processes), `tools` (registry and dispatcher), `mod_image`; `imports` *(later)* — one-line roles in §2.1 |
+| parser crate | platform-neutral parsers for untrusted input (clipboard/drag MIME payloads, workflows, metadata), with fuzz/property targets (§6.4) |
+| CPU compositor crate | the shared Rust CPU compositor used by the Image studio and the core (§5.3) |
+| platform crate | the only home of Windows API calls (§7.6) |
+| `ww-qt` | cxx-qt bridges: the `core` request singleton (`call` → request id, `cancel`, finished / failed / pending-confirmation signals), shared QObject list models (assets, jobs, confirmations, usage, telemetry, events, documents, resources) |
+| `ww-qt-shim` | C++: KDDockWidgets (Qt Quick) docking, `QQuickRhiItem` canvases, QtWebEngine view, clipboard/drag `QMimeData`, live-preview image provider, notification and `ww:` activation glue, monitor colour profile (a tablet event filter only if pen input is revived, IMG-046) — anything cxx-qt lacks |
+| `ww-ui-kit` | QML only: theme, shared shell and top bar, Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant panel, Diagnostics (with the Backups panel), the three shared dialogs (§3.1) |
+| `ww-testkit` | fixture workspaces (real lantern manifest), fake ComfyUI (HTTP + websocket, serving the pinned frontend), fake providers and recorded fixtures, fake `claude` (honours `CLAUDE_CONFIG_DIR`), git-ops simulator, handle-holding helper, fail points, watcher fence, injected clock and ids, the test environment provider, per-test pipe channel (§6.5) |
+| binaries | `ww-core`, `ww-mcp`, `ww`, `ww-image`, the windowless launcher; `ww-hub` *(later)* |
+
+- **ARCH-111** [M1] (invariant) `ww-schema` and `ww-protocol` have no Qt or Windows dependencies (checked by a dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, §6.2). Formats and the protocol are platform-neutral; Windows API calls live only in the platform crate. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test.)
+- **ARCH-112** [M1] (invariant) Within `ww-core`, file write, rename and remove APIs are disallowed by a per-crate `clippy.toml`, with a single allowance inside `store` (§6.2).
+- **ARCH-113** [M1] (invariant) The C++ shim only extracts raw clipboard and drag MIME bytes; all parsing happens in Rust, in the parser crate.
+- **ARCH-114** [M1] (decision) The build is CMake at the top level, using cxx-qt's documented CMake integration (`cxx_qt_import_crate`, built on Corrosion) for the Rust crates, plus KDDockWidgets, the C++ shim and `windeployqt`. Pinned: Qt 6.12 LTS with the Qt WebEngine release matching Qt 6.12 LTS (versioned separately; pinned in the M0 Qt-stack spike, ARCH-115, §6.6), cxx-qt 0.10, KDDockWidgets 2.4.1 (verified 2026-10-12). One planned upgrade per cxx-qt minor release; KDDockWidgets 2.5 when it ships (§3.1). (M0 result, 2026-10-12: Qt **6.12.0** (`msvc2022_64`) + Qt WebEngine **6.140.0** (Chromium 140 base), cxx-qt 0.10.0 with cxx-qt-cmake 0.10.0 (Corrosion v0.5.2), KDDockWidgets 2.4.1 (Qt Quick frontend). The stack passed on 6.12, so the Qt 6.11 fallback is not used. `docs/spikes/01-toolchain.md`, `02-qt-stack.md`.)
+- **ARCH-115** [M0] The stack spike must pass before M1 app work: cxx-qt 0.10 + KDDockWidgets 2.4.1 (Qt Quick) + a `QQuickRhiItem` shim + QtWebEngine + `windeployqt` on Qt 6.12 LTS with MSVC. If it fails on 6.12, fall back to Qt 6.11; the result fixes the Qt version for M1. (M0 result, 2026-10-12: PASS on Qt 6.12.0 + Qt WebEngine 6.140.0: all seven criteria in one scripted from-scratch run, zero build warnings at default settings, and the `windeployqt` output ran with Qt and MSVC off PATH. The Qt 6.11 fallback was not needed, so M1 is pinned to Qt 6.12.0 / WebEngine 6.140.0. `docs/spikes/02-qt-stack.md`.)
+- **ARCH-116** [M1] Floating docks are separate top-level windows; GPU canvases must survive their renderer being destroyed and recreated when moved between windows (§5.3). (M0 result, 2026-10-12: confirmed for a `QQuickRhiItem` shim that rebuilds its GPU resources in `initialize()`: floating and re-docking recreated the renderer against a new QRhi each time, with no crash. `docs/spikes/02-qt-stack.md`.)
+
+**Licences.** The suite's own code is GPL-3.0-or-later (OPS-108). Qt is used under LGPLv3. KDDockWidgets, Qt Quick 3D, Qt Graphs and the QML compiler are GPL, which a GPL-3.0 suite can combine with. Distributed binaries must also meet OPS-108's dependency-compatibility requirement.
+
+### 1.9 Observability
+
+- **ARCH-117** [M1] Every process writes `tracing` JSON logs to `%LOCALAPPDATA%\Worldwright\logs`, rolled, rotated and size-capped.
+- **ARCH-118** [M1] (contract) A `trace_id` is carried from the app or MCP call through the core to the engine job.
+- **ARCH-119** [M1] Engine stdout/stderr is captured into the logs. Every process installs a panic hook.
+- **ARCH-120** [Later] Minidumps on crashes.
+- **ARCH-121** [M1] The Diagnostics panel shows component versions, engine health, VRAM, the queue, recent errors, the event log, a telemetry summary and a backup status line, with "Export diagnostics bundle". The bundle redacts secrets and Claude Code profile labels and emails.
+- **ARCH-122** [M1] (invariant) Nothing is sent anywhere automatically; a diagnostics bundle leaves the machine only when you hand it on.
+
+### 1.10 Milestone scope
+
+- **ARCH-123** [M1] (decision) M1 is the core, the Image studio (split M1a / M1b, §5.11) and `ww-mcp`, against **one workspace**, with **ComfyUI as the only managed engine**. In M1 this section also covers: metering of every external call, optional caps, account info for the providers configured in M1, hardware telemetry, both assistant engines (Claude Code as default, Anthropic API as the alternative) with multiple Claude Code profiles, the §3 M1 app shell and panels, and the §7 M1 repo, backup and installer work.
+- **ARCH-124** [M1] (decision) Designed now so the protocol doesn't change later, but not built in M1:
+  - M1.5: local LLM runtimes (ARCH-066), the loopback OpenTelemetry receiver (ARCH-007), multi-machine Sync (ARCH-087), document checkpoints (ARCH-093);
+  - Later: the separate Hub app (ARCH-011), multiple workspaces (ARCH-091), leases and checkout/checkin (ARCH-092), interactive-engine bridges (ARCH-067), lowering beyond MCP and Anthropic Messages (ARCH-041), minidumps (ARCH-120).
+
+---
+
+## 2. Core modules
+
+This section describes the modules inside `ww-core`, the headless Rust core service (§1). It covers how every tool call is processed, how assets, versions, candidates and proposals are stored, and how usage, cost, caps, accounts, hardware telemetry, agent safety confirmations, jobs, QA and conversion work. The suite is a personal-scale tool: it adds no content filter or IP screen of its own (each provider's and model's own policies apply), and it has no approval gates and no business machinery. What stays is tracking (usage, cost, tokens, energy), optional caps you set yourself, account information pulled from providers, and safety confirmations when an AI agent deletes, installs or runs something.
+
+### 2.0 Ground rules for all modules
+
+- **CORE-001** [M1] (invariant) Each module lives in `ww-core`, has one job and a narrow Rust interface, and has no knowledge of any UI.
+- **CORE-002** [M1] (invariant) Only `store` writes workspace files. Engines, converters and apps write only into write areas that `store` issues, and `store` moves the results into place.
+  - Lint: `ww-core` has a per-crate `clippy.toml` that disallows file write/rename/remove APIs, with a single allowance inside `store` (§6).
+- **CORE-003** [M1] (contract) Three different things must not share a name:
+  - a **staging handle** is a write area `store` issues to engines and converters, in `<workspace>/.worldwright/staging/` (gitignored, excluded from the watcher, on the same volume so ingest is a rename);
+  - a **document save handle** is what `store` issues for a document save (`app/doc.stage`, §3.5);
+  - a **proposal run** is a set of canvas generation results waiting to be accepted or discarded (§2.3, §5.5).
+- **CORE-004** [M1] (contract) Databases use `rusqlite` (bundled SQLite with FTS5 and JSON1), with one connection each in M1:
+  - `index.db` (per workspace): a disposable cache of assets, versions, edges, files, thumbnails and search. It can be rebuilt at any time.
+  - `state.db` (per workspace): durable live state for that workspace only, which files can't recreate: jobs, pending confirmations for calls made in that workspace, idempotency keys, engine-side ids, pending usage records.
+  - `state.db` (suite level): durable state that isn't tied to one workspace. It holds **all cap reservations** and this machine's settled spend per cap and period, because caps are suite-wide and also count calls made with no workspace open (§2.6); it also holds pending confirmations and pending usage records for calls made with no workspace open.
+  - Both `state.db` files use `synchronous=FULL` and forward-only migrations, and are never deleted automatically.
+  - `telemetry.db` (machine level): hardware samples, with per-job rows tagged with their workspace (§2.5). It is disposable.
+- **CORE-005** [M1] (contract) Database and cache locations:
+  - per-workspace local data — the document snapshot store, caches including thumbnails (`thumbs\`), `index.db`, the per-workspace `state.db` and local proposal storage — normally lives in `%LOCALAPPDATA%\Worldwright\workspaces\<workspace-hash>\`;
+  - when the workspace is on a different volume from `%LOCALAPPDATA%` (a Dev Drive or any other drive), that data lives in `<volume>:\.worldwright-local\<workspace-hash>\` instead, so hardlinked snapshots and rename-on-ingest stay on one volume (§7.2);
+  - staging handles stay inside the workspace (`<workspace>\.worldwright\staging\`, CORE-003), which is on the workspace's volume by construction;
+  - suite-level `state.db`: `%LOCALAPPDATA%\Worldwright\state.db`;
+  - `telemetry.db`: `%LOCALAPPDATA%\Worldwright\telemetry.db`.
+- **CORE-006** [M1] (invariant) Machine-local state never goes into the workspace's git history: `index.db`, `state.db`, `telemetry.db`, caches, recovery files, proposals and document snapshots stay on the machine that made them.
+- **CORE-007** [M1] (contract) Suite-level settings that don't belong to a workspace live in `%APPDATA%\Worldwright\suite.toml`: spending caps, the display currency and dated exchange rates, fixed recurring costs, PSU efficiency, the rest-of-system power baseline and the electricity rate, the default workspace, and the Claude Code profiles (labels and folders, §4). Provider keys live in Windows Credential Manager (`secrets`). Provider profiles and prices live in `%APPDATA%\Worldwright\providers\` (§2.6).
+- **CORE-008** [M1] (invariant) Agents can't change suite-level caps or spending settings. Only a verified UI action (`app/caps.set` from a verified `ui:*` connection) can change them.
+- **CORE-009** [M1] (contract) Append-only logs are written through `store`'s locked-append API, one file per machine per month, so they never need merging:
+  - `queue/jobs.<machine>.<yyyy-mm>.jsonl`: jobs, with the workspace format's job fields (§2.8);
+  - `registry/usage.<machine>.<yyyy-mm>.jsonl`: every external call made for that workspace (§2.6);
+  - calls made with no workspace open go to `%LOCALAPPDATA%\Worldwright\usage-loose.jsonl` and count toward the same caps.
+  - Readers deduplicate by `(machine, seq)`. Files are never moved or rotated, and they don't use `merge=union`.
+- **CORE-010** [M1] (invariant) There are no dependency cycles between modules: `store` emits change events and `index` consumes them; `jobs` defines a `JobHandler` trait that tool modules register with.
+- **CORE-011** [M1] (invariant) Every external model or service call goes through `ProviderGate`, including internal callers (QA vision review, the assistant). `ProviderGate` doesn't restrict anything; it exists so that usage, cost and caps are recorded and enforced in one place.
+- **CORE-012** [M1] (invariant) Time: monotonic clocks for backoff and watchdogs; ordering by `seq`; caps reset on local-calendar boundaries. Providers report in UTC, and both are shown.
+- **CORE-013** [M1] (invariant) Money is stored as integer micro-units with a `currency` field, never as floats. In code it is a `Money(i64)` newtype with no float constructors.
+
+### 2.1 Module map
+
+- **CORE-014** [M1] (contract) `ww-core` is made of these modules, each with the one job listed:
+
+| Module | One job | Milestone |
+|---|---|---|
+| `store` | Lossless, crash-safe workspace I/O; version allocation; staging handles and document save handles; trash; orphans; LFS-pointer and long-path checks | M1 |
+| `watch` | Filesystem changes → reconcile actions | M1 |
+| `index` | Rebuildable search and graph cache | M1 |
+| `state` | Durable live state | M1 |
+| `graph` | Pure functions: dependents, staleness, cascade plans, cycle detection | M1 |
+| `projects` | Project lifecycle, status views, shared context | M1 |
+| `pipeline` | Asset status machine, sign-off, stage profiles | M1 |
+| `settings` | Settings cascade (workspace → project → request) | M1 |
+| `docs` | Worldwright document bundles, `.wwdoc`, holds, document saves, snapshots, garbage collection; checkpoints (M1.5) | M1 |
+| `resources` | Libraries (shared typed resources, §3.4) | M1 |
+| `interchange` | App handler registry, `open_in`, `ui.show`, `.wwref` files, Windows notifications, thumbnails | M1 |
+| `meter` | Usage and cost records for every external call; spend summaries; optional caps | M1 |
+| `accounts` | Pulls account information from providers (balances, quotas, limits, models and prices); reconciles tracked spend | M1 |
+| `telemetry` | Hardware sampling, power and energy estimates, per-job resource attribution | M1 |
+| `confirm` | Agent safety confirmations and cap confirmations | M1 |
+| `jobs` | Job lifecycle, scheduling lanes, GPU lease, recovery | M1 |
+| `engines` | Engine supervisors and clients: ComfyUI (M1); `llama-server` (owned) and Ollama (attached) (M1.5) | M1 |
+| `providers` | Model and provider adapters behind modality traits (§4) | M1 |
+| `secrets` | API keys in Windows Credential Manager | M1 |
+| `qa` | Technical quality gates, runners, reports, repair-loop control | M1 |
+| `convert` | Format converters, exposed as tools | M1 |
+| `library` | Transfer between projects (M1); promote and `lib:` links (Later) | M1 |
+| `imports` | Inbox, model identification, hub search and download, pickle scanning | Later |
+| `assistant` | Agent loop over the tool registry; supervises Claude Code processes (§4) | M1 |
+| `tools` | Tool registry and dispatcher | M1 |
+| `mod_image` | Image-module tools | M1 |
+| `lfs_store` | Large-file store settings and store changes (§7.2): "This PC only → External drive" (M1); changes involving a cloud store (M1.5) | M1 |
+| `backup` | restic backups, destinations, restore (§7.4) | M1 |
+| `sync` | Local commit and push (M1) — commits only when you press Sync or ask, and optionally on app close or when idle (a setting), never silently otherwise; multi-machine sync with collision handling (M1.5) (§7.3) | M1 |
+
+### 2.2 Dispatcher pipeline (every tool call, every caller)
+
+- **CORE-015** [M1] (contract) Every tool call from every caller goes through these stages, in this order:
+  1. **Resolve:** caller kind (`ui:<app>` verified app, `assistant`, `mcp`, `cli`, as declared in the connection's `core/hello` handshake and verified per §1), workspace, project, trace id, idempotency key.
+  2. **Validate** the parameters. Unknown parameters are rejected.
+  3. **Settings:** resolve workspace → project → request (§2.4). Caps are not part of this chain.
+  4. **Estimate** an upper-bound cost for external calls (§2.6); `0` for local work.
+  5. **Confirm and caps, one prompt at most:** if the caller is an agent and the tool is `destructive` or `exec` (§2.7), and/or a cap would be exceeded (§2.6), the call returns `pending_confirmation` with a single prompt that covers both. Agents never answer it. Callers that declared themselves non-interactive get an error instead (CORE-091, CORE-113).
+  6. **Reserve** the estimate against the caps (atomic, in the suite-level `state.db`).
+  7. **Execute:** inline for quick tools; otherwise as a job (§2.8), which runs stages 8–9 when it completes.
+  8. **Meter:** settle the actual cost (releasing the rest of the reservation), and record usage and the job's hardware use.
+  9. **Record:** see the Record branches below.
+- **CORE-016** [M1] (contract) Idempotency keys apply to jobs, metered calls, confirmations and cap reservations, and are scoped per caller kind + workspace. Same key + same arguments → the same job, result or confirmation. Same key + different arguments → rejected. Engine A's tool calls use `session id + tool-use id` as the key (§4).
+- **CORE-017** [M1] (contract) Every tool result is exactly one of `ok`, `pending_confirmation {confirmation_id, retry_token, expires_at, covers: [confirm, cap]}`, or `error` (error fields and codes in §6). `pending_confirmation` is a normal result, not an error.
+- **CORE-018** [M1] Graph tools, during Validate: apply ComfyUI's `/node_replacements` locally and extract model references. The references are recorded in the recipe and used to tell local work from paid partner (API) nodes (§2.6).
+- **CORE-019** [M1] New `proj:` or `lib:` references are recorded in the project's `links` during Validate. This isn't a gate; it keeps the dependency graph and "what links here" accurate.
+- **CORE-020** [M1] (contract) The Record stage has three branches:
+  - **asset candidate run:** candidate files, manifest, logs, a `progress.md` entry (one per Record stage), events;
+  - **sealed version** (sign-off): as §2.3, with manifest, logs, `progress.md` and events;
+  - **proposal run** (canvas generations, §5.5): no manifest, no `progress.md` entry and no candidate; only the proposal files, the job record and events.
+  
+  Every branch puts a **hand-off block** in the result: what this unlocks, what it made stale, and for proposal runs the proposal refs (`doc:<doc_id>/proposal/<run_id>/<n>`) and PNG paths.
+- **CORE-021** [M1] (contract) `app/*` methods (§3.3) run only the Resolve and Validate stages. A document save (`app/doc.commit`) records only index edges and events — no manifest or `progress.md` writes — and changes the project's `links` only when the set of inputs changes.
+- **CORE-022** [M1] (contract) Results are JSON text plus file paths. MCP `structuredContent` and `resource_link` are optional extras only, because Claude Code doesn't document them.
+
+### 2.3 Assets, versions, candidates and proposals
+
+- **CORE-023** [M1] (contract) **Candidate runs:** a generation run for an asset writes its N outputs to `assets/<id>/candidates/<run_id>/`. While a run awaits review the asset's status is `candidate`. `version` is the version the next sign-off will create; `approved_version` is the last sealed one. The manifest extension field `candidate_runs[]` holds each run's id, files (with seeds and roles), QA, recipe, usage and cost, and status.
+- **CORE-024** [M1] (contract) A candidate run made from a document ("Make candidate", §3.5) also contains `source/`: a copy of the document (`doc.json` plus the layer chunks it uses) at that exact state.
+- **CORE-025** [M1] (contract) **Completion chain** for a candidate run, in order: ingest → deterministic repairs (logged) → QA (written to `qa/<asset_id>/candidates/<run_id>/`) → record the run → events.
+- **CORE-026** [M1] (invariant) **Sign-off seals a version:** the chosen file, its derived files and its `source/` (if any) are **moved** into a staging version folder together with QA and a frozen `manifest.snapshot.json`, then renamed into `v<semver>/`. This happens under a per-asset version lock and retries when Defender or the indexer holds a handle. Sealed files are read-only.
+- **CORE-027** [M1] The tool proposes the version bump (major, minor or patch) and it is confirmed at sign-off.
+- **CORE-028** [M1] (invariant) `source/` is not a companion file: it is excluded from `id@version` references and from exports. Any sealed version that has a `source/` can be reopened for editing exactly as it was.
+- **CORE-029** [M1] (invariant) Link-external assets (path + hash recorded, file outside the workspace, §3.4) can't be signed off until "Collect into workspace" copies them in. Sealed versions are always inside the workspace and read-only.
+- **CORE-030** [M1] After approval, repairs and derivatives (cut-out, upscale…) open a new candidate run on the same asset; a different deliverable is a new asset whose inputs reference the source.
+- **CORE-031** [M1] (contract) **References:** `id@1.0.0` and `ww://…@1.0.0` mean that sealed version's primary file plus its declared companions. Recipe inputs reference sealed versions only. `@candidate/<run>/<file>` refers to a candidate for viewing and provenance only.
+- **CORE-032** [M1] Rejected candidates are kept on disk, gitignored, and purged 90 days after sign-off unless pinned.
+- **CORE-033** [M1] Pre-suite folders such as the lantern's `v1.0.0/` are read as-is and labelled `legacy`.
+- **CORE-034** [M1] (invariant) **Human edits:** when a candidate or sealed file's hash differs from the recorded hash (LFS pointers are compared by `oid`), the change is recorded in `human_edits` and the file is never overwritten. The merge options are a new version that regenerates only unlocked layers or regions, or a sibling variant. Document folders (`work/`) are excluded from human-edit tracking.
+- **CORE-035** [M1] Locks use the workspace format's path list.
+- **CORE-036** [Later] Leases go in a `leases` extension field.
+- **CORE-037** [M1] (contract) **Trash:** deletes move files to `.trash/<date>/` with restore records and `purge_after` (30 days).
+- **CORE-038** [M1] (invariant) Orphans are listed for review and never deleted automatically.
+- **CORE-039** [M1] (contract) `progress.md` entries go under `## Done` as `- YYYY-MM-DD: …`; other sections are edited section by section.
+- **CORE-040** [M1] (contract) **Paths:** a budget of about 180 characters per relative path; reserved Windows names are rejected. `ww doctor` sets `core.longpaths=true` and `lfs.setlockablereadonly=false`, and adds the `.gitignore` entries, including `assets/*/work/`.
+- **CORE-041** [M1] (contract) **Index reconcile** compares path + size + mtime + NTFS FileId + ChangeTime. A cold rebuild trusts manifest hashes and verifies them in the background. Hashes are SHA-256 only.
+- **CORE-042** [M1] Index rebuild times are benchmarked, and the benchmark is a CI gate.
+- **CORE-043** [M1] (contract) **Proposal runs** are kept separate from asset candidate runs. They live in `assets/<id>/work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with their recipe and saved inputs. They create no asset version, don't change the asset's status and don't run the QA chain.
+- **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.wwdoc`, open proposals move with the document.
+- **CORE-045** [M1] (contract) Document layers are stored as content-addressed chunks of 8×8 tiles (1024×1024 px) on a signed grid, each with a tile-presence/uniform bitmap header and a hash over the canonical uncompressed bytes (format in §5.2). `docs` garbage collection and snapshot hardlinking work at chunk level.
+- **CORE-046** [M1.5] (contract) Every asset carries a creation UUID (recorded from M1, CORE-047); a sealed version renumbered during multi-machine sync records `renamed_from: {version, machine, content_hash}` in its manifest; references resolve through `renamed_from` (using the content hash they carry, CORE-047), with a warning on a mismatch (§7.3).
+- **CORE-047** [M1] (contract) References to a sealed version — `ww://` refs, `.wwref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill.
+
+### 2.4 Pipeline, projects and settings
+
+- **CORE-048** [M1] (contract) **Status machine:** `planned → in_progress → candidate → in_review → approved → exported → released`, with side states `stale`, `blocked` (a reason is required) and `deprecated`. `status_before_stale` is kept so a restore can return to it.
+- **CORE-049** [M1] (contract) Assets with a working document carry a `has_working_doc` flag. Opening, editing or saving a document never changes the asset's status. The only save that changes status is one with `auto_candidate_on_save` (a project option, off by default), and it does so by creating a candidate run.
+- **CORE-050** [M1] A new document's first Save creates its asset with status `in_progress`.
+- **CORE-051** [M1] (decision) **Sign-off isn't gated.** It can be done by you in any app, by the assistant or Claude Code when you ask them to, or automatically for asset types listed in `auto_approve` once QA passes. It is recorded with `approved_by`. Versions are immutable, so nothing is lost.
+- **CORE-052** [M1] Automatic sign-off picks the candidate with the best vision-review score if a vision review ran; otherwise, among candidates passing every technical gate, the lowest seed.
+- **CORE-053** [M1] `asset.request_signoff` is a "flag this for me" marker: it sets the status to `in_review`.
+- **CORE-054** [M1] **Stage profiles:** `skip_stages` can skip stages, except check and record, which carry QA and the recipe.
+- **CORE-055** [M1] **Projects:** `project.create`, `project.set_status` (pause or archive; a staleness check runs on restore), `project.status`, `project.context`.
+- **CORE-056** [Later] `project.clone`, `project.delete` (lists inbound links first) and `portfolio.status`.
+- **CORE-057** [M1] (contract) **Settings cascade:** workspace `defaults` → `project.yaml` → per-request values, a plain override chain. It holds the default models or providers per task (`assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate` — which names a model profile, §5.6 — and others), provider preferences, the QA profile, `auto_approve`, `skip_stages`, `auto_candidate_on_save` and the enabled `modules`. Caps, currency, fixed costs, PSU efficiency, electricity rate and the assistant engine choice are suite-level (§2.0), not in this chain.
+- **CORE-058** [M1] Each tool declares its Worldwright module (for example image generation → `concept` or `2d`); tool suggestions are filtered by the project's enabled `modules`.
+
+### 2.5 Telemetry
+
+- **CORE-059** [M1] (contract) `telemetry` samples these sources, all verified without admin rights on the test machine (NVIDIA GeForce RTX-class 16 GB GPU, AMD desktop CPU) (verified 2026-10-12):
+  - **GPU via NVML** (`nvml-wrapper` 0.13): utilisation, power (1 s average; instantaneous via field values), the **total energy counter** (mJ), temperature, clocks, fan, throttle reasons, per-process SM utilisation. GeForce support in NVML is "limited", so features are detected at startup.
+  - **Per-process GPU memory** via the Windows PDH counter `GPU Process Memory` (NVML can't report it on GeForce).
+  - **CPU package power and energy** via the Windows "Energy Meter" PDH counter set (`rapl_package0_pkg` plus per-core counters), read through the `windows` crate. Only if that counter set is missing does it fall back to an estimate (utilisation × rated TDP).
+  - **CPU and RAM** via `sysinfo` 0.39: total and per-core load, memory, and per-process CPU and RAM for tracked engine processes only.
+  - **Network throughput** per adapter via `sysinfo`.
+  - **Disk:** free space per volume; workspace and model-folder sizes.
+- **CORE-060** [M1] CPU temperature is not sampled: Windows doesn't expose it without admin rights or a kernel driver.
+- **CORE-061** [M1] (contract) **Sampling rates:** 1 Hz for NVML, Energy Meter and CPU/RAM; per-process VRAM at 1 Hz while jobs run, otherwise every 5 s; disk sizes every 5 minutes.
+- **CORE-062** [M1] (contract) **Retention in `telemetry.db`:** 1-second samples for 24 h, 1-minute rows for 30 days, hourly rows forever. Downsampled rows keep min, average and max plus summed energy, so energy totals stay exact.
+- **CORE-063** [M1] (invariant) **Energy** is taken from the hardware energy counters, not from integrated power (which misses bursts). Counter resets after a driver reload or reboot are detected and re-baselined.
+- **CORE-064** [M1] (contract) **Whole-system estimate** = GPU + CPU package (both measured) + a configurable rest-of-system baseline, divided by PSU efficiency (default 0.9). Each part is labelled measured or estimated. An optional electricity rate turns energy into cost.
+- **CORE-065** [M1] (contract) **Per-job attribution:**
+  1. Time is sliced by ComfyUI execution windows (`execution_start` → success or error per prompt; prompts submitted outside the suite are found through `/api/jobs` and `/history`). ComfyUI runs one prompt at a time, so each candidate gets its own figures.
+  2. Within a window, GPU energy is split by per-process SM utilisation, so a game or browser running alongside isn't charged to the job.
+  3. CPU energy is split by each process's share of CPU time.
+  4. Results are reported as gross energy and energy above idle; GPU-seconds are SM-utilisation-weighted time.
+- **CORE-066** [M1] Thermal throttling and high temperatures raise alerts in the Hardware panel (§3.6).
+- **CORE-067** [M1] On core start the measured hardware profile is compared with `worldwright.yaml` `hardware`; the file is edited only when something changed.
+- **CORE-068** [M1] `telemetry` feeds the GPU scheduler (§2.8) and the Hardware panel (§3.6).
+
+### 2.6 Meter, caps and accounts
+
+**Usage records**
+
+- **CORE-069** [M1] (contract) `meter` writes a **usage record** for every external call:
+  - context: time, machine, `seq`, workspace, project, asset, job, tool, `caller_kind`;
+  - `account`: always an opaque id — the Claude Code profile id for Engine A, the key id for API providers — never a label or an email address (usage logs live in the workspace and may be pushed to GitHub);
+  - provider, model, route, service tier, region;
+  - billing basis: `payg | prepaid_credits | subscription_quota | free_tier | byok | local`;
+  - usage units as billed: uncached input, cache-read and cache-write tokens (with TTL class), output tokens, reasoning tokens (when separate), images, seconds, characters, requests;
+  - the raw provider usage object;
+  - `est_cost`, `cost`, `cost_source` (`provider_reported | computed_from_usage | estimated | reconciled`), `price_version`, `currency`;
+  - latency and status.
+- **CORE-070** [M1] Subscription quotas (for example NanoGPT's) are tracked in their own units, not in money.
+- **CORE-071** [M1] (invariant) **Write-ahead:** a `pending` usage record is written before the request is sent.
+- **CORE-072** [M1] (contract) Streaming usage arrives at the end of the stream: OpenRouter's last chunk includes `usage.cost`; Anthropic's `message_delta` carries cumulative output usage; OpenAI needs `stream_options.include_usage`. On cancel or disconnect the record uses what was seen and is flagged `estimated`. (verified 2026-10-12)
+- **CORE-073** [M1] Billed refusals (Anthropic bills refusals in some categories) are metered like any other call.
+- **CORE-074** [M1] (contract) **Cost sources, in order of preference:**
+  1. reported in the response (`provider_reported`): OpenRouter `usage.cost`, xAI `cost_in_usd_ticks` (1e10 ticks = $1), NanoGPT media `cost`, Kling `billing[]`;
+  2. looked up after the call (`reconciled`): OpenRouter `/api/v1/generation?id=`, NanoGPT `/api/v1/usage/requests/{X-Request-ID}` (within 24 h), fal `/v1/models/billing-events?request_id=` (billing-scoped key);
+  3. computed as usage × price table (`computed_from_usage`).
+- **CORE-075** [M1] **Reconciliation:** a daily job back-fills actual costs for `estimated` records where the provider allows it, and compares tracked spend with what providers report.
+
+**Prices**
+
+- **CORE-076** [M1] (contract) Provider profiles and prices are suite-level data, shipped and updated with the suite in `%APPDATA%\Worldwright\providers\` (`providers.yaml`, `prices.yaml`), with optional workspace overrides. `meter` reads prices from here.
+- **CORE-077** [M1] (contract) **Price entries** are dated, sourced and carry `effective_from`, so a scheduled price change is just a new entry. In M1 they support per-unit rates, prompt-length tiers and cached-input rates.
+- **CORE-078** [Later] Price entries also support time-of-day windows with a time zone and holiday calendar (for example DeepSeek's off-peak half price), cache storage per hour, service-tier and regional multipliers, batch discounts and CNY prices. Each is added when a provider that needs it is first used.
+- **CORE-079** [M1] **Reprice job:** because raw usage and `price_version` are kept, a correction to the price table can reprice past records.
+- **CORE-080** [M1] Machine-readable price and model lists (OpenRouter `/api/v1/models`, the xAI model list, Alibaba's native `/api/v1/models`) are refreshed daily; the rest are maintained by hand, showing "last verified" and warning after 60 days.
+
+**Currency, summaries and fixed costs**
+
+- **CORE-081** [M1] (contract) Each record keeps its native currency. The display currency and dated exchange rates live in `suite.toml`; summaries show per-currency totals plus a converted total in the display currency.
+- **CORE-082** [M1] (contract) `usage.summary` breaks spend down by provider, model, project, workspace (including "loose"), caller kind (you, assistant, Claude Code, `ww`), tool and account, by day and month. Billing bases are kept apart: subscription quota, money and local work are never added together. Estimated and reconciled costs are marked. Unattributed spend (paid ComfyUI jobs submitted outside the suite) is shown separately.
+- **CORE-083** [M1] (contract) **Fixed recurring costs** are subscriptions you enter once — each Claude plan (per Claude Code profile), OneDrive, BorgBase, Hetzner and similar — and are included in monthly totals. Caps don't apply to them.
+- **CORE-084** [M1] (contract) Backup and large-file destinations (§7) are providers with optional usage or quota APIs. Their spend comes from those APIs, from size × price estimates, or from fixed recurring costs. In M1, OneDrive usage comes from `rclone about --json`; BorgBase, R2, Wasabi and other destinations arrive with them in M1.5.
+
+**Caps (optional)**
+
+- **CORE-085** [M1] (decision) Caps are optional and off by default. There is an optional suite-wide monthly cap, an optional monthly cap per provider, and an optional per-call maximum. They are set in the display currency, and the exchange rate used is recorded with each reservation.
+- **CORE-086** [M1] (contract) Each call reserves an upper-bound estimate: for LLMs, input tokens × input price + `max_tokens` × output price; for images, count × unit price; for time-billed calls, the watchdog maximum × rate.
+- **CORE-087** [M1] (invariant) The cap check "settled + in-flight reservations + this estimate ≤ cap" is atomic, so concurrent calls can't overshoot. It runs as one transaction in the suite-level `state.db`, which holds every reservation (from any workspace or none) and this machine's settled totals per cap and period (CORE-004).
+- **CORE-088** [M1] (contract) A reservation settles to the actual cost. A failed call releases its reservation for providers that don't bill failures. A job in `interrupted_unknown` keeps its reservation until you resolve it.
+  - Each reservation records its workspace (or none) and its job or call id. Settling is idempotent by reservation id, so a crash between writing the usage record (workspace) and settling the reservation (suite level) is repaired on the next start.
+- **CORE-089** [M1] Cap alerts fire at 50 %, 80 % and 100 %.
+- **CORE-090** [M1] (invariant) Money caps never count `subscription_quota` usage (Engine A) or fixed recurring costs. Claude usage-credit spend is real money and counts.
+- **CORE-091** [M1] (contract) **When a cap would be exceeded** the call returns `pending_confirmation` covering `cap`: one record, bound to the arguments, with a lifetime. You choose: raise the cap, allow once, or cancel.
+  - Cap prompts on your own actions appear inline at the point of action and in the Confirmations panel; answering anywhere clears it everywhere (§3.3).
+  - Calls inside a running job (for example vision QA) never prompt: that step records `not_run`.
+  - Callers without an app of their own (`ww`, Claude Code via MCP) get `pending_confirmation` whenever the confirmation can be answered — an app is connected or the notification path (CORE-113) can reach you; its message says "confirm in Worldwright, then retry with token X".
+  - Callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks) get the error `cap.exceeded` instead (§6), as does any other call when no confirmation can be answered — except director tasks, which always get `pending_confirmation` and wait in `waiting_confirmation` (CORE-114).
+- **CORE-092** [M1] Caps are enforced on each machine. Spend synced from other machines is shown for information only; provider-side limits are the real cross-machine stop.
+- **CORE-093** [M1] (contract) **ComfyUI partner (paid API) nodes** are detected from the workflow graph. Their cost comes from a price table and is always flagged `estimated` (Comfy reports costs only after execution and has no balance API). Paid jobs submitted to ComfyUI from outside the suite are recorded as unattributed spend.
+- **CORE-094** [M1] (invariant) The Comfy account key is injected into the single request that needs it, never into ComfyUI's environment or configuration.
+- **CORE-095** [M1] (contract) Provider errors that mean "your provider-side limit is reached" (for example Anthropic `enforced_spend_limit_reached`, Gemini `RESOURCE_EXHAUSTED` from spend limits, "balance exhausted") are non-retryable and shown as such (`provider.spend_limit`).
+
+**Accounts**
+
+- **CORE-096** [M1] (contract) `accounts` pulls account information at these rates:
+  - *passively, on every response:* rate-limit headers (Anthropic `anthropic-ratelimit-*`, OpenAI `x-ratelimit-*`) and OpenRouter `usage.cost`;
+  - *balances and quotas:* when the spend panel opens, 60 s after metered calls, otherwise every 15 minutes while the core is active, never while idle;
+  - *organisation usage and cost reports* (only where you've added the separate admin or management key): hourly for today, daily to reconcile yesterday;
+  - *model lists and prices:* daily.
+- **CORE-097** [M1] (invariant) Every pulled value is cached with `fetched_at` and shown as stale when old; 401 and 429 responses back off.
+- **CORE-098** [M1] (contract) Account coverage per provider (verified 2026-10-12):
+
+| Provider | What `accounts` pulls | Milestone |
+|---|---|---|
+| Anthropic API | rate-limit headers | M1 |
+| Claude Code (Engine A) | plan-limit percentages and reset times per profile (below) | M1 |
+| OpenRouter | `GET /api/v1/key` (limit, remaining, usage by period, budgets); credits and activity with a management key | M1 |
+| NanoGPT | `check-balance`, `subscription/v1/usage` | M1 |
+| fal | account billing (billing-scoped key) | M1.5 (with hosted media) |
+| DeepSeek, Kimi, StepFun | balances with the normal key | Later (when used) |
+| Anthropic, OpenAI, Mistral, xAI | organisation usage/cost reports, only with an optional admin/management key (Anthropic's Usage & Cost API is for organisation accounts only) | Later |
+| Alibaba, Tencent | via cloud-signed keys | Later |
+| Kling, Tripo, Meshy, Rodin | balances | Later |
+| Gemini, Xiaomi MiMo, Z.ai, MiniMax, Replicate, Hugging Face personal accounts, Comfy | none — tracked spend only | — |
+
+- **CORE-099** [M1] Provider-side limits (OpenRouter key limits and budgets, the Anthropic Console spend limit, Gemini project caps) are shown, and the dashboard recommends setting them: they're the only hard stops for spend made outside the suite.
+- **CORE-100** [M1] (invariant) Admin and management keys are separate, optional Credential Manager entries, labelled as powerful, and never used for model calls.
+- **CORE-101** [M1] (decision) Providers in use: Anthropic API, OpenRouter, NanoGPT, OpenAI, Google, fal and others, plus the major Chinese flagship providers (DeepSeek, Alibaba/Qwen, Moonshot/Kimi, Z.ai/GLM, MiniMax, ByteDance/Seed via OpenRouter or fal, Tencent, Xiaomi MiMo, StepFun). Usage tracking covers every provider from M1 through the provider layer (§4).
+
+**Claude Code usage**
+
+- **CORE-102** [M1] (contract) Engine A runs (§4) are recorded from their own stream. Run totals are cumulative across resumes, so `meter` records the difference per session (from `modelUsage`, which includes subagents; crashed runs may report zeros). Records use billing basis `subscription_quota` and `account` = the profile id; the cost figure is stored as an "API-equivalent estimate" and excluded from spend totals and money caps.
+- **CORE-103** [M1] (contract) Each Claude Code profile shows its 5-hour and weekly usage percentages and reset times, with a "last seen" time. Sources: Engine A's `rate_limit_event` messages (and `system/api_retry` with `error: "rate_limit"` as the hard-stop signal), plus an occasional `/usage` check, at most every 15 minutes per profile and only when that profile is idle.
+- **CORE-104** [M1] (invariant) `claude auth status` and `/usage` checks run only when no suite-launched `claude` process is active in that profile (a per-profile lock), because they can start a token refresh that races with a running session.
+- **CORE-105** [M1] Usage-credit spend (when enabled on a Claude plan) is recorded per account as real money.
+- **CORE-106** [M1.5] (contract) A loopback OpenTelemetry receiver in the core records your **interactive** Claude Code sessions' token usage (`claude_code.token.usage`). It binds to 127.0.0.1 only, uses `http/json` with an auth header, and is the explicit exception to "the core exposes no network port" (§1). It deduplicates by session id (including Engine A's session ids), maps sessions to workspaces through the SessionStart hook (others go to "Claude Code — other projects"), attributes them to profiles through `ww.profile=<id>` in `OTEL_RESOURCE_ATTRIBUTES`, and stores one row per session per day.
+- **CORE-107** [M1] `registry/ledger.csv` is no longer written; usage logs replace it. Existing ledger files are left alone.
+
+### 2.7 Agent safety confirmations
+
+- **CORE-108** [M1] (contract) **Effect classes:** every tool declares one of `read`, `write`, `destructive`, `exec`.
+  - `destructive`: delete, purge trash, overwrite outside the version system, `resource.delete`, and an agent-initiated stop or restart of an engine that would kill jobs submitted from outside the suite.
+  - `exec`: install nodes or packages, run scripts or arbitrary code, download executable formats (pickled `.ckpt`/`.pt`/`.bin`, custom-node packs, wheels).
+  - Plain `write`: downloading `.safetensors` or `.gguf` files; the scheduler's own engine start and idle-down; document edits by agents, including layer deletion and discarding proposals, which are undoable inside the document (§5.10).
+- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (both engines), Claude Code via MCP, and scripts via `ww` — are asked to confirm, and only for `destructive` and `exec` tools. Your own actions in the apps never ask.
+- **CORE-110** [M1] (invariant) Deletes are always soft (to `.trash/`), whoever makes them.
+- **CORE-111** [M1] (invariant) A caller-supplied `confirm: true` is never accepted. A confirmation is answered only by a verified `ui:*` connection after a real input event in the shared dialog, or by Claude Code's own prompt (below). Every answer records how it was given (`confirmed_via: app | claude_code`).
+- **CORE-112** [M1] (contract) The core decides per connection whether a tool carries `_meta["anthropic/requiresUserInteraction"]`:
+  - **interactive Claude Code sessions** (caller kind `mcp`): `destructive` and `exec` tools carry it, so Claude Code always prompts you and hooks can't auto-allow it. That prompt **is** the confirmation (recorded `confirmed_via: claude_code`), so you aren't asked twice;
+  - **Engine A connections** (caller kind `assistant`): the suite's tools don't carry it; the core's confirmations apply, and the permission-prompt tool `mcp__ww__approve` auto-allows the suite's own tools, so again nothing is asked twice (§4).
+- **CORE-113** [M1] (contract) **Where other confirmations appear** (the assistant on either engine, `ww`, and cap prompts):
+  - in the open suite app (the Confirmations panel, and inline for your own actions);
+  - with no app open, the core posts a Windows notification; clicking it opens `ww:confirm/<id>`, which launches a minimal `ww-image --confirm <id>` window in front. `ww --confirm-window` can launch it directly (opt-in, for interactive use, not scripts). The core itself never shows UI (§3.3).
+  - The same rule as for caps (CORE-091) applies: a call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks), or other calls for which no confirmation can be answered, get the error `confirm.unavailable` (§6). Director tasks always get `pending_confirmation` (CORE-114).
+- **CORE-114** [M1] (contract) Co-pilot pending confirmations are cancelled when the app that started them closes. Director tasks' confirmations persist with the job, and the task continues with other steps or pauses in `waiting_confirmation` (§2.8, §4).
+- **CORE-115** [M1] (contract) Each pending confirmation has an expiry (`expires_at`); answering with deny or letting it expire returns `confirm.denied` or `confirm.expired` to a retry with its token (§6).
+- **CORE-116** [M1] (contract) **Outside the suite:** Plugin 1.3 adds Claude Code PreToolUse hooks that return "ask" for:
+  - Bash and PowerShell commands matching delete, install or script-run patterns (`rm`, `del`, `Remove-Item`, `rmdir`, `git clean`, `git reset --hard`, `pip` / `uv pip` / `npm` / `comfy node install`, `python <script>`, `blender -P`, …);
+  - the comfy MCP's install, update, download and restart tools.
+  
+  Direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json` have their own guard (ARCH-104): warn-only at first, later deny while a core is running. When the hooks run inside Engine A they see `WW_ENGINE=1` and do nothing.
+
+### 2.8 Jobs and the ComfyUI engine
+
+- **CORE-117** [M1] (contract) **Job record:** the workspace format's job fields plus `seq`, `kind`, `substatus`, idempotency key, `doc_id` (for proposal runs), usage, and hardware/energy attribution. Substatus maps onto status as follows:
+  - `submitting`, `waiting_for_vram`, `queued_in_engine` → `queued`;
+  - `interrupted` → `failed`;
+  - `interrupted_unknown` → `running` until you resolve it.
+- **CORE-118** [M1] (contract) **Director tasks** are jobs of kind `assistant_task` (§4) with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused`, `interrupted`. After a core restart a running task becomes `interrupted` and resumes only when you choose. `waiting_auth` (the Claude Code sign-in for that profile has expired) is distinct from `waiting_quota` and is never retried automatically; co-pilot calls in the same situation fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6). M1 allows one director task per workspace; others queue.
+- **CORE-119** [M1] (contract) Proposal runs are jobs too, with `doc_id` and full hardware/energy attribution. When a director's proposal run finishes while the document is closed, the core writes it into the document's proposals under its own hold.
+- **CORE-120** [M1] (invariant) **Exactly once:** the core mints the ComfyUI `prompt_id` (canonical lowercase UUID) or the provider's idempotency key, persists `submitting` before sending, and checks status before any resubmission.
+- **CORE-121** [M1] (contract) **Lanes:** `gpu-heavy` (holds the GPU lease) and `cpu`.
+- **CORE-122** [M1.5] (contract) A `network` lane runs hosted asynchronous jobs.
+- **CORE-123** [M1] (contract) **Suite-held queue:** the suite keeps its own queue and keeps **at most one prompt per lane pending in ComfyUI**, submitting the next when the running one finishes. ComfyUI's own queue can't be reordered usefully (its "front" option is last-in-first-out among front items, and nothing pre-empts a running prompt).
+- **CORE-124** [M1] (contract) **Priority classes:** interactive operations (select object, preprocessors) > your generations > agent and director batches. Within a class, first in, first out; batches may be grouped by model profile within their class, with a limit so nothing waits forever. Interactive operations still wait for the prompt already running, and the status bar says so.
+- **CORE-125** [M1] An optional setting cancels and resubmits a running **agent batch** prompt when an interactive operation arrives. It never does this to your own jobs.
+- **CORE-126** [M1] **GPU scheduler:** checks free VRAM via `telemetry`; an engine's own resident VRAM counts as available to that engine; the watchdog starts at `execution_start`.
+- **CORE-127** [M1.5] Local LLM engines (`llama-server` owned, Ollama attached) are scheduled around image jobs for VRAM and metered as local work ($0, GPU time and energy).
+- **CORE-128** [M1] (contract) **Retries:**
+  - transient failures retry with backoff; disk-full is non-retryable;
+  - a disk preflight checks space for the expected output plus staging; batches checkpoint their progress;
+  - **jobs with external side effects** (hosted media, paid partner nodes) retry automatically only when the request provably wasn't processed (connection failure, or 429/503 before acceptance) or the provider honours idempotency keys; otherwise a job stuck in `submitting` without an external id becomes `interrupted_unknown`;
+  - **inline metered calls** (LLM requests, assistant turns, vision QA) may be retried and may use refusal fallback or fallback chains; each attempt is metered;
+  - **local ComfyUI jobs:** if ComfyUI restarts mid-job, a known `prompt_id` that's no longer there is provably gone → `interrupted`; outputs already written are salvaged by the job's unique filename prefix; re-running is your choice (automatic for agent batches).
+- **CORE-129** [M1.5] (contract) **Hosted media jobs** never resubmit automatically and complete in this order: (1) pending usage record and cap reservation written at submit; (2) outputs downloaded into a staging handle; (3) substatus `ingesting`; (4) candidate run recorded; (5) only then done, with the cost settled.
+- **CORE-130** [M1] (contract) **ComfyUI client:**
+  - a stable `clientId`; `extra_data.preview_method` set on every prompt;
+  - outside jobs discovered by polling `/queue` and `/api/jobs`;
+  - cancel via `POST /api/jobs/{id}/cancel`, never a bare `/interrupt`;
+  - outputs fetched via `/history` + `/view` into a staging handle, with a unique filename prefix per job, and our copies cleaned up afterwards;
+  - inputs uploaded via `/upload/image` once, named by content hash, with reference-counted cleanup;
+  - the executed graph recorded from `/history`;
+  - `/free`, then VRAM re-read;
+  - environment capture: `/system_stats`, the NVML driver version, git/pyproject of ComfyUI and each custom node, and model hashes (cached by path + size + mtime + FileId);
+  - the model inventory matched to the registry by hash; operation capability states (§5.6) are computed from this inventory.
+- **CORE-131** [M1] Model downloads are core jobs with a disk-space check. Custom-node pack installs are `exec` and need a ComfyUI restart, with a warning about running jobs.
+
+### 2.9 QA and repair
+
+- **CORE-132** [M1] (contract) QA gates are technical and data-driven per asset type, overridable per project, plus checks that the recipe and environment are recorded and the inputs resolve. The suite adds no IP screen or licence check of its own: the user is responsible for the licences of the models and inputs they use, and each provider's and model's own terms apply.
+- **CORE-133** [M1] **Runners:** native Rust image measurements (dimensions, alpha histogram, colour count, pixel-grid estimate, perceptual hash), and an optional vision review through `ProviderGate` when a provider is configured, metered like any call.
+- **CORE-134** [M1] (contract) QA output goes to `qa/<asset_id>/…/report.md` and `report.json`, summarised in the manifest's `qa` block.
+- **CORE-135** [M1] (contract) **Repair loop:** detect → classify → deterministic fix → re-check. After 2 failed passes it proposes a narrow regeneration, then shows you the evidence. Originals are kept and repairs are logged.
+- **CORE-136** [M1] The first playbook entry snaps cut-out alpha 254 → 255.
+
+### 2.10 Convert
+
+- **CORE-137** [M1] (decision) The Worldwright document (folder or `.wwdoc`, §3.5) is the native layered format. OpenRaster (`.ora`) is import (best effort) and export (lossy, with a warning listing what is lost) only.
+- **CORE-138** [M1a] PNG, JPEG and WebP (lossless via `image`, lossy via libwebp), with ICC handling via `moxcms`.
+- **CORE-139** [M1b] TIFF (8- and 16-bit) and OpenRaster import/export (hand-rolled on `zip`).
+- **CORE-140** [Later] EXR (`exr`), PSD import out of process (`psd-tools` in the QA venv), KRA, glTF/USD/FBX, WAV/FLAC/OGG.
+- **CORE-141** [M1] (invariant) Decoders for untrusted files run with size limits and panic isolation, or out of process.
+- **CORE-142** [M1] ComfyUI's PNGs embed the prompt and workflow in text chunks; export offers to keep or strip them.
+
+### 2.11 Tools
+
+- **CORE-143** [M1] (contract) Regeneration tools take an explicit `scope`, write `partial_edits[]`, skip locked or human-edited files, and return a before/after comparison.
+- **CORE-144** [M1] (contract) Every `image.*` tool in CORE-146 takes a `target` (`doc:<id>` plus frame, or an asset) and a `destination` (`proposals`, `asset` or `both`), plus the generation settings the Generate panel has (§5.5). Their results are JSON text that includes the file paths of rendered PNGs of the frame and of the proposals (CORE-022).
+- **CORE-145** [M1] (invariant) `image.inpaint` and `image.outpaint` composite the result back so that everything outside the mask is unchanged, and verify it.
+- **CORE-146** [M1] (contract) The core exposes these tools, with these effect classes (§2.7):
+
+| Tool | Effect | Milestone | Notes |
+|---|---|---|---|
+| `image.generate` | write | M1a | N candidates or proposals |
+| `image.regenerate` | write | M1a | variations: re-runs a staged result's or candidate's recipe with new seeds, optionally with only the prompt changed (§5.5) |
+| `image.inpaint`, `image.outpaint` | write | M1a | |
+| `image.select_object` | write | M1a | SAM through ComfyUI |
+| `image.preprocess` | write | M1a | control-layer preprocessors |
+| `image.cutout` | write | M1a | BiRefNet: remove background; select subject / select background return a selection instead of a cut-out layer (§5.5) |
+| `image.edit` | write | M1b | instruction edit (Qwen-Image, FLUX.2 klein) |
+| `image.upscale` | write | M1b | upscale image, enhance layer, upscale document; Real-ESRGAN, SeedVR2 (§5.5) |
+| `image.workflow.run` | write | M1b | runs a saved, sent or layer workflow (any graph); labelled a full regeneration (§5.5, §5.7) |
+| `doc.layer.*` (add, properties, reorder, merge, delete), `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.references.*`, `doc.proposals.accept`, `doc.proposals.discard`, `doc.export`, `doc.make_candidate` | write | M1a | applied to the open document as one undoable step (agent calls are forwarded to the app holding it, §3.5), or by the core on closed documents under its own hold |
+| `doc.get_snapshot`, `doc.list_open`, `doc.proposals.list` | read | M1a | |
+| `asset.signoff`, `asset.request_signoff`, `asset.pin_input`, `asset.transfer`, `asset.import` | write | M1 | `asset.import` copies or links external |
+| `assets.query`, `asset.get` | read | M1 | |
+| `project.create`, `project.set_status` | write | M1 | |
+| `project.status`, `project.context` | read | M1 | |
+| `resource.save` | write | M1 | |
+| `resource.list`, `resource.get` | read | M1 | |
+| `resource.delete` | destructive | M1 | soft delete |
+| `qa.run`, `convert.export` | write | M1 | |
+| `job.cancel`, `job.retry`, `diagnostics.bundle` | write | M1 | |
+| `jobs.list`, `job.wait`, `engines.status` | read | M1 | `job.wait` waits ≤ ~90 s per call (§4) |
+| `usage.summary`, `caps.get`, `accounts.list` | read | M1 | caps are changed only through `app/caps.set` |
+| `accounts.refresh` | write | M1 | |
+| `telemetry.series`, `telemetry.snapshot`, `telemetry.jobs` | read | M1 | |
+| `handlers.for`, `open_in`, `ui.show` | read | M1 | agents never steal focus (§3.4) |
+| `project.clone` | write | Later | |
+| `project.delete` | destructive | Later | lists inbound links first |
+
+**Example — "generate 3 lantern candidates" from Claude Code:** resolve (caller `mcp`, project `sketchbook`) → validate → settings → estimate $0 (local) → no confirmation or cap prompt → job in the `gpu-heavy` lane with core-minted prompt ids, the three prompts submitted one after another as each finishes → `/history` + `/view` → `candidates/<run_id>/` → QA → meter ($0; about 20 s of GPU time at up to 360 W ≈ 2 Wh GPU, ~3 Wh whole system) → run recorded → events. The Image studio shows the candidates live; Claude Code gets JSON text with the file paths and a hand-off note.
+
+### 2.12 Workspace format, registries and the Worldwright plugin
+
+- **CORE-147** [M1] (contract) New workspace and asset files no longer get `mode`, `commercial`, `territories`, `content_rating`, `privacy_tier`, `provider_allowlist`, `budget_usd`, licence-gate or disclosure fields. Asset manifests no longer get `license_scope`, `commercial_use`, `content_rating`, or the licence/C2PA/disclosure parts of `provenance`; the recipe, environment and inputs stay.
+- **CORE-148** [M1] (invariant) Fields the suite no longer uses are ignored and preserved when files are rewritten (lossless round-trip).
+- **CORE-149** [M1] New optional workspace fields hold default model and provider preferences per task.
+- **CORE-150** [M1] (contract) **Registries:** workspace `registry/models.yaml` registers model files (sources, hashes, settings, routes, fallbacks); personal `model_profile` resources refer to model files by hash; `defaults.models.image_generate` names a profile. `providers.yaml` (endpoints, billing basis, account-API capabilities) and `prices.yaml` are suite-level (§2.6). `licenses.yaml` is no longer used, and `ledger.csv` is replaced by the usage logs.
+- **CORE-151** [M1] (decision) **Plugin 1.3** — the suite's Claude Code plugin, with the MCP server and hooks, shipped with the suite — replaces the current 1.2.0 file-based plugin and is rewritten for a personal hobby suite:
+  - not carried over: modes, licence gates, the plugin's own content-rule checks, approval thresholds, store disclosures and compliance workflows; the `licenses` and `compliance` skills and the `license-auditor` agent are retired;
+  - kept: projects, versions and candidates, recipes, QA and repair, the library, the dependency graph, routing, usage and cost tracking and caps, agent safety confirmations (including the hooks in §2.7), and the suite's MCP tools.
+
+### 2.13 Milestone scope
+
+- **M1:** every module in §2.1 except `imports` and multi-machine `sync`, with: the dispatcher; assets, candidates, sign-off, trash and proposals; content hashes in references; cap reservations in the suite-level `state.db`; creation UUIDs on every asset; the status machine and settings cascade; telemetry with per-job energy; usage records for every provider, cost sources, M1 price rules and the reprice job; optional caps; fixed recurring costs; account sync for Anthropic (headers), OpenRouter, NanoGPT and Claude Code plan usage per profile; agent safety confirmations; the suite-held ComfyUI queue; QA and repair; the converters and tools tagged M1, M1a or M1b in §2.10–§2.11 (M1a/M1b follow §5's split).
+- **M1.5:** the `network` lane and hosted media jobs (fal account sync with them); local LLM engines; the loopback OpenTelemetry receiver for interactive Claude Code sessions; document checkpoints (cloud store `docs/` prefix); large-file store changes involving a cloud store; destinations other than the local drive and OneDrive; multi-machine sync with UUID-based collision renames and resolution through `renamed_from`.
+- **Later:** leases; `project.clone`, `project.delete`, `portfolio.status`; `imports`; `lib:` links and promote; further price-rule kinds; account sync for further providers and admin-key reports; the later converters.
+
+---
+
+## 3. Core ↔ app interface, interchange, documents and dashboards
+
+This section covers what every app is made of, how apps talk to the core, how apps and outside programs exchange work, the Worldwright document (the suite's native editable format), and the dashboards. In M1 the dashboards are panels inside the Image studio; a separate Hub app comes later. Usage tracking, optional caps, account info, hardware telemetry and agent safety confirmations are all shown here; nothing in this section filters content or gates work on business rules.
+
+The core modules behind this section are `docs` (document bundles, `.wwdoc`, holds, save handles, snapshots, GC, checkpoints), `resources` (Libraries) and `interchange` (handler registry, `open_in`, `ui.show`, `.wwref`, notifications, thumbnails); see §2.1.
+
+### 3.1 What every app is made of
+
+- **APP-001** [M1] (decision) **One app = one process, one QML engine, one or more windows.** Windows use KDDockWidgets 2.4.1 (Qt Quick) for dockable, floatable and tabbable panels, themed through its ViewFactory QML (verified 2026-10-12).
+- **APP-002** [M1] (contract) **Layout preset format:** an app-level JSON file holding the list of main windows (unique name, normal geometry, screen name and scale) plus the KDDockWidgets layout blob.
+- **APP-003** [M1] (invariant) **Layout restore order:** create the windows → register the dock factory → restore → clamp every window to the current screen's available area. The clamp works around known mixed-DPI and maximized-restore bugs.
+- **APP-004** [M1] M1 keeps the "Default" layout plus the last state. Named layout presets arrive in M1.5.
+- **APP-005** [Later] Upgrade to KDDockWidgets 2.5 (per-window save, Qt Quick dark mode) when it ships.
+
+**Shared shell** (`ww-ui-kit`), identical in every app:
+
+- **APP-006** [M1] **Top bar:** workspace/project switcher, app switcher, assistant toggle, and status indicators for jobs, spend this month vs caps, GPU load/VRAM/temperature, and the core connection.
+- **APP-007** [Later] **Command palette** (Ctrl+K) in the top bar: assets, resources, tools, panels, recent files.
+- **APP-008** [M1] **Shared panels:** Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Backups (opened from Diagnostics in M1, APP-133), Assistant, and Diagnostics (with the event log). The Image studio also hosts its own panels (§5.1) and the ComfyUI web view, which is loaded lazily on first show (APP-137).
+- **APP-009** [M1a] (invariant) The embedded ComfyUI web view is locked down as in §1.4 and §5.8: it loads ComfyUI from its own loopback origin, navigation is pinned to that origin, **downloads are blocked**, and there is no bridge from the page into the suite.
+- **APP-010** [M1] **Shared dialogs:**
+  - "Open from Worldwright": search, type filter, version or candidate, and "Loose file…" which opens the native file dialog;
+  - "Place / use as input": linked or embedded;
+  - "Save to project": project (default `sketchbook`), asset name and type.
+- **APP-011** [M1] **One shortcut map** for the whole suite. App-specific hotkeys (§5.1) are checked against it for conflicts.
+- **APP-012** [M1] **Theme:** dark, built from design tokens. A light theme comes later.
+
+**Single instance and standalone launch**
+
+- **APP-013** [M1] (contract) **Single instance per app, independent of the core:** each app owns a per-user named pipe `\\.\pipe\worldwright-app-<app>-<userSID>-<channel>`, created with `first_pipe_instance` and the same user-only security descriptor as the core pipe (§1.2).
+- **APP-014** [M1] A second launch of an app (Start menu, Explorer double-click, `ww-image <file-or-ref>`) connects to that pipe, reads the running instance's process id, calls `AllowSetForegroundWindow(pid)`, passes its arguments, and exits. The running instance then activates its window.
+- **APP-015** [M1] **Standalone launch:** the app uses the default workspace from `suite.toml`; with no project chosen, work lands in `sketchbook`.
+- **APP-016** [M1] **No-workspace state** (no workspace at all): a banner with "Create or choose a workspace"; the Asset browser is replaced by a list of recent loose files; "Add to project" is disabled; metered calls are still allowed and logged as loose usage (§2.0).
+
+**Windows integration**
+
+- **APP-017** [M1a] **Per-user file associations** and "Open with Worldwright Image" for PNG, JPEG, WebP and `.wwdoc`, registered under `HKCU\Software\Classes` (no admin). The suite never sets itself as the default; you choose defaults yourself.
+- **APP-018** [M1b] TIFF and ORA join the file associations when their import and export land (§2.10, §5.11); before that the suite registers no association for a format it can't read.
+- **APP-019** [M1] A file opened from Explorer that lives inside a workspace opens as that asset. Sealed files open read-only, with "Edit → new working document".
+- **APP-020** [M1] (contract) **`ww:` URL protocol:** `ww:open/<ref>`, `ww:confirm/<id>` and `ww:task/<job_id>` (opens a director task in the Assistant panel, APP-050). Arguments are validated as untrusted input. It's used for notification clicks and for links in browsers and Markdown.
+- **APP-021** [M1] **`.wwref` pointer files:** links printed in Claude Code output point to a small `.wwref` file (associated with the suite) in the cache, because Windows Terminal only opens `http`, `https` and `file` links (verified 2026-10-12).
+- **APP-022** [M1] **Notifications:** the suite has a Start-menu identity (AppUserModelID) used for Windows notifications. The core posts notifications through it: job finished, confirmation waiting, cap confirmation waiting, cap alerts, and director-task decisions (APP-050). A notification is drawn by Windows, not by the core, and clicking it is your own input, so the app it launches comes to the front.
+- **APP-023** [Later] Jump Lists; Explorer thumbnails for `.wwdoc` (a small Rust COM thumbnail provider, out of process); an Explorer "Add to Worldwright project" context-menu entry.
+
+### 3.2 How an app talks to the core
+
+- **APP-024** [M1] (invariant) **`ww-client` runs on a background tokio runtime inside the app; the GUI thread never waits on the core.** The stall target is in APP-135.
+
+**Bridge (`ww-qt`, Rust via cxx-qt)**
+
+- **APP-025** [M1] **List models** are Rust `QAbstractListModel` subclasses (cxx-qt's `#[base]`, `#[inherit]`, `#[cxx_override]`), paged through `canFetchMore`/`fetchMore`. `ww-qt` also provides the request-id API below and the document and resource models.
+- **APP-026** [M1] Core events are applied on the GUI thread via `CxxQtThread::queue`; queued tasks handle the "object destroyed" error.
+- **APP-027** [M1] (invariant) **Update throttling is leading-edge:** the first update applies immediately, then at most 10 Hz for job progress and 1 Hz per telemetry series. Pending confirmations (agent safety and cap) are never throttled.
+- **APP-028** [M1] (contract) **Requests:** one `core` singleton with `call(tool, argsJson) → requestId`, `cancel(requestId)`, and the signals `callFinished(id, result)`, `callFailed(id, error)` and `callPendingConfirmation(id, pending)` — one per result kind in §6.1 (`ok | pending_confirmation | error`). `pending` carries `confirmation_id`, `retry_token`, `expires_at` and `covers` (`confirm`, `cap` or both). A small QML helper turns these signals into callbacks/promises.
+  - Per-request QObjects are not returned to QML, because QML can garbage-collect them before the request finishes.
+- **APP-029** [M1] (contract) **Automatic retry after a confirmation:** when an app's own call returns `pending_confirmation` (in practice a cap, APP-054), the QML helper keeps the request open and watches the `confirmations` topic. Once that confirmation is answered — inline, in the Confirmations panel or from a notification — or expires, the app re-sends the call once with its `retry_token` and settles the original callback with what the core returns: the result after approval, or `confirm.denied` / `confirm.expired` (§2.7, §6.1). The app never retries without an answer; if the app closes first, the pending request is cancelled.
+
+**C++ shim (`ww-qt-shim`)**
+
+- **APP-030** [M1] Things cxx-qt can't do go in the C++ shim: the clipboard/drag `QMimeData` (§3.4); the live-preview image provider; docking; GPU canvases; the web view; and the notification and `ww:` activation glue.
+- **APP-031** [M1] The **live-preview image provider** is a small (~50-line) `QQuickImageProvider` with a lock-protected frame map fed from Rust. Each preview frame gets a unique URL, with caching off.
+- **APP-032** [M1] (invariant) For incoming clipboard and drag data, the shim only extracts the raw MIME bytes; all parsing happens in Rust.
+
+**Connection lifecycle**
+
+- **APP-033** [M1] **Start:** `core/hello` (the §1.2 handshake, which every caller kind uses; an app declares caller kind `ui:<app>`, protocol version and workspace) → subscribe → snapshot.
+- **APP-034** [M1] **On connection loss:** a "Reconnecting…" banner; AI and workspace actions are disabled; the open document keeps working and autosaving.
+- **APP-035** [M1] **On reconnect:** the app re-acquires its document holds, resubscribes from the last `seq` (or reloads snapshots if the history is gone), and saves documents changed meanwhile with a hash check against the last saved hash (conflict → keep both). It does not "save as new version".
+- **APP-036** [M1] **Protocol version mismatch:** a banner offering "restart the core when it's idle".
+
+**Images**
+
+- **APP-037** [M1] (invariant) **Images never travel over the pipe.** Models carry file paths; QML loads images asynchronously.
+- **APP-038** [M1] **Thumbnails** come from the core's thumbnail cache in the per-workspace local data folder (`%LOCALAPPDATA%\Worldwright\workspaces\<hash>\thumbs\`, or `<volume>:\.worldwright-local\<hash>\thumbs\` when the workspace is on a different volume from `%LOCALAPPDATA%`, §1, §7.2) at the exact display size × screen scale (two sizes on mixed-DPI setups), because only JPEG decodes cheaply at reduced size. Grids reuse delegates and load asynchronously.
+
+### 3.3 The app interface
+
+- **APP-039** [M1] (invariant) **`app/*` contains only what's specific to a running app:** session, subscriptions, document hold/save, activation and open requests, confirmation answers and `caps.set`. Everything else is a normal `tools/*` call made with caller kind `ui:<app>`, so anything an app can do, an agent can do too (§1.1).
+- **APP-040** [M1] (invariant) `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `cli` callers (`ww`) and tests. The handshake `core/hello` is not an `app/*` method; every caller kind calls it (§1.2).
+- **APP-041** [M1] `app/*` methods run the dispatcher's resolve and validate stages (§2.2).
+- **APP-042** [M1] (invariant) Document saves (`app/doc.commit`) record only index edges and events: no manifest or `progress.md` writes and no status change. The project's `links` change only when the set of inputs changes.
+- **APP-043** [M1] (contract) **App interface map:**
+
+| Area | `app/*` methods | Agent-visible tools used by apps | Event topics |
+|---|---|---|---|
+| Session | `app/set_context` (the handshake before it is `core/hello`, §1.2) | — | `session` |
+| Subscriptions | `ww/subscribe`, `ww/unsubscribe` (events arrive as `ww/event`, §1.2) | — | — |
+| Assets | `app/thumbs.request` | `assets.query`, `asset.get`, `asset.import` (copy or link-external), `convert.export`, `asset.signoff`, `asset.request_signoff` | `project:<slug>`, `asset:<ref>` |
+| Documents | `app/doc.open`, `app/doc.stage`, `app/doc.commit`, `app/doc.recover`, `app/doc.close` | `doc.list_open`, `doc.get_snapshot`, `doc.make_candidate`, and the document tools of §5.10 (`doc.layer.*` such as `doc.layer.add`, `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.references.*`, `doc.proposals.*`, `doc.export`) | `doc:<id>` |
+| Resources | — | `resource.list`, `resource.get`, `resource.save`, `resource.delete` | `resources` |
+| Jobs | — | `jobs.list`, `job.cancel`, `job.retry` | `jobs`, `job:<id>`, `preview:<job>` |
+| Confirmations (agent safety and cap) | `app/confirmations.list`, `app/confirmation.answer` | — | `confirmations` |
+| Usage, caps, accounts | `app/caps.set` | `usage.summary`, `caps.get`, `accounts.list`, `accounts.refresh` | `usage`, `caps`, `accounts` |
+| Hardware | — | `telemetry.series`, `telemetry.snapshot`, `telemetry.jobs` | `telemetry` |
+| Interchange | `app/activate` (the target app brings a window forward after the requester granted it foreground rights) | `handlers.for`, `open_in` and `ui.show` (both return `{running, pid, launch_command}`; §3.4) | `open_requests:<app>` |
+| Diagnostics | — | `engines.status`, `diagnostics.bundle` | `engines`, `diagnostics` |
+
+**Confirmation answers**
+
+- **APP-044** [M1] (invariant) Confirmation answers are accepted only from verified `ui:*` connections. `cli`, `mcp` and `assistant` callers can never answer, and a caller-supplied `confirm: true` is ignored (§2.7). The shared dialog sends an answer only after a real input event. The core can verify the connection, not the click; that is the guarantee, stated plainly.
+- **APP-045** [M1] A single pending confirmation can cover an agent safety confirmation, a cap, or both (one prompt at most per call, §2.2 step 5).
+- **APP-046** [M1] Every answer records how it was given (`confirmed_via`: `app` or `claude_code`). The Confirmations panel has a history tab of past answers.
+
+**When no app is open**
+
+- **APP-047** [M1] Destructive/exec confirmations requested by interactive Claude Code sessions are answered in Claude Code's own prompt (§2.7).
+- **APP-048** [M1] Everything else — cap confirmations from Claude Code or `ww`, confirmations from `ww`, and director-task confirmations (§4.6) — uses the **notification path**: the core posts a Windows notification; clicking it opens `ww:confirm/<id>`, which launches a minimal `ww-image --confirm <id>` window in front. Director-task decisions (`waiting_quota`, `waiting_auth`) also start with a notification but are made in the Assistant panel (APP-050). The core never shows a dialog of its own.
+- **APP-049** [M1] `ww --confirm-window` launches the same minimal window directly. It's opt-in, for interactive use, not for scripts.
+- **APP-050** [M1] **Director-task decisions** — the three `waiting_quota` choices and the `waiting_auth` choices (§4.6a) — are shown in the **Assistant panel**, not in the minimal confirmation window:
+  - the core posts a notification naming the task, the Claude Code profile (by its label) and, for `waiting_quota`, the reset time; clicking it opens `ww:task/<job_id>`, which launches or brings forward the Image studio with the Assistant panel on that task;
+  - the panel lists the choices: for `waiting_quota` — wait for the reset (the default; the reset time is shown), switch to the API engine, and use a local model (M1.5, shown disabled in M1); for `waiting_auth` — sign in again (the app opens a terminal for `/login` in that profile; the core never launches it), use a different profile, and switch to the API engine;
+  - the Jobs panel shows the substatus with an "Open in Assistant" action. If you don't answer, a `waiting_quota` task takes the default (it waits and resumes at the reset time) and a `waiting_auth` task keeps waiting; the suite never picks a profile for you (§4.6a).
+- **APP-051** [M1] (contract) A call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks) never get `pending_confirmation`: a cap returns the error `cap.exceeded`, and an agent safety confirmation returns the error `confirm.unavailable` (§2.7, §6.1).
+
+**Assistant calls and app lifetime**
+
+- **APP-052** [M1] (invariant) **Co-pilot** calls come from an open app; if that app closes mid-turn, its pending calls are cancelled.
+- **APP-053** [M1] (invariant) **Director tasks** are jobs (`kind: assistant_task`, §4.6) owned by the core: they keep running when the app closes, and their pending confirmations stay pending and use the notification path (APP-048).
+
+**Cap confirmations on your own actions**
+
+- **APP-054** [M1] A cap confirmation on your own action appears inline at the point of action (raise the cap / allow once / cancel) and also in the Confirmations panel. Answering it anywhere clears it everywhere.
+
+### 3.4 Interchange between apps
+
+**References**
+
+- **APP-055** [M1] (contract) **Asset references** everywhere use `ww://<workspace>/<project>/<asset>@<version>` (§1.2). References to a sealed version — `ww://` refs, `.wwref` files, exports and engine-import records — also carry that version's SHA-256 content hash (§2.3, CORE-047).
+- **APP-056** [M1.5] When multi-machine sync has renumbered a sealed version, references resolve through its `renamed_from` record using the content hash they carry, with a warning on a mismatch (§7.3).
+- **APP-057** [M1] (contract) **Candidates** are referenced as `@candidate/<run>/<file>`, for viewing and provenance only. **Proposals** are referenced as `doc:<doc_id>/proposal/<run_id>/<n>`, for viewing and recalling settings only (§5.5).
+
+**Formats**
+
+- **APP-058** [M1] (decision) **One native layered format for every 2D app: the Worldwright document** (§3.5). Flattened files are for leaving the suite.
+- **APP-059** [M1b] **ORA import** is best effort (TIFF and ORA import/export arrive together, §2.10).
+- **APP-060** [M1b] **ORA export** is lossy and shows a warning listing what's lost: masks are baked into alpha, transforms are rasterised, blend modes outside ORA's 20 are approximated, and float depth is reduced to 16-bit (OpenRaster spec, verified 2026-10-12).
+
+**App handler registry**
+
+- **APP-061** [M1] (contract) Each installed app ships `apps/<app>.toml` declaring the asset types and formats it can open, edit and create, plus its "send to" actions. External programs register the same way. `handlers.for` answers "what can open this?".
+- **APP-062** [Later] "Edit in external app" (your default program or a chosen exe; flow in APP-110) and bridges to Krita, Blender and Godot.
+
+**Open in / send to**
+
+- **APP-063** [M1] (contract) The requester (an app, `ww`, or `ww-mcp` on behalf of an agent) calls `open_in(app, target, intent)` or `ui.show(target)`; the core returns `{running, pid, launch_command}`.
+  - If the target app is running, the requester calls `AllowSetForegroundWindow(pid)` (this works when the requester itself has foreground rights, e.g. the app you're using); then the core delivers `open_requests:<app>` and the target activates (`app/activate`).
+  - If it isn't running, the requester launches it with the request on its command line. `ww-mcp` may launch apps on an agent's behalf, without focus (below).
+- **APP-064** [M1] (invariant) **The core never launches GUI apps.** It may sit in a terminal's job object, and Windows wouldn't let its windows come forward.
+- **APP-065** [M1] (invariant) **Agents never steal focus.** `ui.show` and agent `open_in` show the content without activating the window (taskbar flash) and post a notification; clicking it brings the window forward. When Claude Code runs in a focused terminal, a launched app may come forward on its own; that's a bonus, not relied on.
+- **APP-066** [M1] (contract) **Intents:** `open`; `edit` (creates or resumes a working document); `use_as_input`.
+- **APP-067** [Later] Cross-app send-to beyond the Image studio (arrives with the second app).
+
+**Clipboard and drag-out** (one `QMimeData` subclass in the C++ shim)
+
+- **APP-068** [M1] (contract) Copy and drag-out offer these formats:
+  - `application/x-worldwright-ref` (refs plus type, version and thumbnail path) for the suite;
+  - a standard bitmap plus the exact PNG bytes (Windows "PNG" format) for image-aware programs;
+  - a file URL to an exported copy for Explorer, browsers and Discord;
+  - no plain text by default (it makes some programs paste text instead of the image). "Copy reference" is a separate command.
+
+  *Recipe note* (M0 result, 2026-10-12: the recipe in `docs/spikes/07-clipboard.md` §3.1 is confirmed. The exact PNG bytes need `setData("application/x-qt-windows-mime;value=\"PNG\"", bytes)`, because a plain `image/png` is re-encoded by Qt; the bitmap comes from `setImageData`, the file URL from `setUrls` (CF_HDROP); no `setText`. Qt also adds `UniformResourceLocator(W)` and 17 `image/*` formats that can't be removed through `QMimeData`; if an app ever pastes a link instead of the image, the fallback is a native `IDataObject`.)
+- **APP-069** [M1] (invariant) **Drags allow Copy only.** Qt's default would let Explorer *move* the file. (M0 result, 2026-10-12: `QDrag::exec(Qt::CopyAction, Qt::CopyAction)` confirmed; the manual check reported that an Explorer drag copied the file. `docs/spikes/07-clipboard.md`.)
+- **APP-070** [M1] (invariant) **Exported copies** live in a cache, aren't read-only, are never workspace paths, and are produced lazily when a program asks for them. The cache never evicts a file that's still on the clipboard or in a drag.
+- **APP-071** [M0] Pasting into Discord and Chromium is tested in the M0 spike (and again in the manual milestone checks, §6.4). (M0 result, 2026-10-12: the manual check reported that all checks (Discord, Chrome, Paint, Explorer drag) worked; only Chrome was named. `docs/spikes/07-clipboard.md`.)
+
+**Drag-in and paste**
+
+- **APP-072** [M1] Files from Explorer arrive as file URLs; web images arrive as http(s) URLs and are downloaded by the core. Virtual files (Outlook attachments, zip folders) come later.
+- **APP-073** [M1] Dropped or pasted content goes into the current document as a layer or an input, or becomes new assets via `asset.import`: copy, or "link external" for big loose files (path + hash recorded, checked on open). The source (file path, URL or app) is recorded as provenance.
+- **APP-074** [M1] (invariant) **Link-external assets** can be viewed and used as layer pixels, but can't be signed off or live-linked until "Collect into workspace" copies them in. Sealed versions must be inside the workspace and read-only.
+
+**Live links**
+
+- **APP-075** [M1] Documents that use another asset as an input store its ref in `doc.json`. The index turns these into graph edges on every save, marked `local` (documents are machine-local, §3.5), so "what uses this?", staleness and cascades include working documents even when they're closed.
+- **APP-076** [M1] A new sealed version of a linked input shows "update available"; pinning keeps the old one.
+- **APP-077** [M1] (invariant) **Only sealed versions can be live-linked.** Dropping a candidate (or a proposal) embeds its pixels and records `derived_from_candidate` as provenance. That record sits outside the recipe inputs (which must be sealed) and may dangle after the 90-day candidate purge, which is accepted. The drop UI offers "sign off first".
+
+**Libraries (shared resources)**
+
+- **APP-078** [M1] (contract) Libraries are typed resources usable in every app and by agents. Workspace resources live in `library/resources/<kind>/`; personal resources live in `%APPDATA%\Worldwright\resources\` and are available in no-workspace mode. One shared Libraries panel; changes are published on the `resources` topic.
+- **APP-079** [M1a] Resource kinds in M1a: `swatch`, `palette`, `prompt_preset`, `style_preset` (prompt + LoRAs + settings for a compatible model-profile family, §5.6), and `model_profile` (§5.6; personal by default, since models are machine-level, with workspace overrides).
+- **APP-080** [M1a] Resource kind `workflow`: a ComfyUI workflow with marked slots (§5.6, §5.7). It's saved from the ComfyUI tab (M1a) and opened by the Graph tab and workflow-on-layer (M1b).
+- **APP-081** [Later] Resource kinds `gradient`, `export_preset`, `brush` and `text_style` (the last two with the matching Image studio features, §5.11).
+- **APP-082** [M1] (invariant) `resource.delete` is soft (to trash) and is `destructive`, so it needs confirmation when an agent asks.
+
+### 3.5 Documents (things you edit by hand)
+
+**The Worldwright document** is the suite's native editable format. §5.2 defines the layer model and chunk encoding.
+
+- **APP-083** [M1] (contract) **Inside a workspace**, a document is a folder `assets/<id>/work/<doc_id>/` containing:
+  - `doc.json` — layer tree, blend modes, masks, transforms, linked inputs (refs), and `based_on` (the version or candidate it started from);
+  - `chunks/` — layer data as **content-addressed chunks** (1024×1024-px chunks of 8×8 tiles on a signed grid, each with a tile-presence/uniform header bitmap; §5.2). Each chunk is one file, `chunks/<sha256>.chunk`, where `<sha256>` is the lowercase hex SHA-256 of the chunk's canonical uncompressed bytes; the file holds the header and the zstd-compressed data. Raster and mask chunks share the folder. `doc.json` maps each layer's signed chunk coordinates `(cx, cy)` to a chunk hash, so a save writes only chunks that don't exist yet;
+  - `thumbnail.png`;
+  - `proposals/` — the document's proposal runs (APP-095).
+- **APP-084** [M1] (invariant) Chunk files are immutable: they're written once under their content hash and never modified in place (snapshots hardlink them).
+- **APP-085** [M1] (contract) **Outside a workspace** (loose files, no-workspace mode), the same layout (`doc.json`, `chunks/`, `thumbnail.png`, `proposals/`) is stored as a single uncompressed-zip file, **`.wwdoc`**, which is what file associations and Explorer thumbnails use. "Add to project" unpacks a `.wwdoc` into a workspace folder, and its open proposals move with it.
+
+**Three kinds of "staging"** — these names are used consistently across the spec:
+- **store staging handles** — temporary areas `store` issues to engines and converters (`.worldwright/staging/`, §2.0);
+- **document save handles** — what `app/doc.stage` returns for one document save;
+- **proposals** — generation results waiting on the canvas's staging bar (§5.5).
+
+**Saving**
+
+- **APP-086** [M1] (contract) **Save sequence:** the app asks `store` for a document save handle (`app/doc.stage`), writes the changed chunks and `doc.json` there, then calls `app/doc.commit(handle, expected_hash)`. `store` checks the hash (conflict → keep both; error `store.hash_conflict`), moves the files in atomically, records the new hash, and tells the watcher to ignore its own write.
+- **APP-087** [M1] (invariant) **Opening, editing and saving never change the asset's status.** A save updates index edges and emits events only — no manifest, `progress.md` or status change. The asset gets a `has_working_doc` flag so Home and the Asset browser can show "being edited". `auto_candidate_on_save` (APP-101) is the only kind of save that changes status, and it does so through a candidate run.
+- **APP-088** [M1] (invariant) **Documents are machine-local:** `work/` is gitignored (`ww doctor` adds `assets/*/work/` to `.gitignore`). On another clone of the workspace, documents simply aren't there until restored from a checkpoint (APP-092).
+
+**Protecting work**
+
+- **APP-089** [M1] **Autosave** every 30 s to `%LOCALAPPDATA%\Worldwright\recovery\<app>\`; after a crash, `app/doc.recover` offers the recovery file.
+- **APP-090** [M1] **Rolling snapshots:** the last 5 saves plus one per day for 14 days, kept in a separate content-addressed snapshot store in the per-workspace local data folder, which is always on the workspace's volume: `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\snapshots\`, or `<volume>:\.worldwright-local\<hash>\snapshots\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§1, §7.2). The store holds `chunks/<sha256>.chunk` (shared by all snapshots) and one `doc.json` per snapshot under `<doc_id>/`. Chunks are hardlinked from the document (deduplicated at chunk level) and copied only when the file system can't hardlink (e.g. an exFAT drive). Snapshots survive even if `work/` is wiped (e.g. by `git clean -X`).
+- **APP-091** [M1] **Backups:** `work/`, proposals and the rolling snapshots are included in the suite's restic backups (§7.4). Diagnostics shows the backup status line (APP-134).
+- **APP-092** [M1.5] **Checkpoints:** an explicit "Checkpoint document" uploads the document's content-addressed chunks and `doc.json` to the `docs/` prefix of the S3-compatible large-file store (§7.2); unchanged chunks are never re-uploaded. "Restore documents from checkpoint" brings documents to another machine. Retention is a suite-side mark-and-sweep that uses a separate delete-capable key reserved for that job (the suite asks before its first run). Without a cloud store, checkpoints aren't available; local snapshots still work.
+
+**Garbage collection**
+
+- **APP-093** [M1] (invariant) `store` runs a mark-and-sweep over a document's chunks while holding the document. Roots: the current `doc.json`, every snapshot's `doc.json`, open document save handles, and copies in progress. New chunks get a 24 h grace period.
+- **APP-094** [M1] (invariant) Proposal runs are not GC roots: accepting a proposal copies its pixels into new layer chunks. Sealed and candidate `source/` folders are independent copies and never part of a document's GC.
+
+**Proposals**
+
+- **APP-095** [M1] (invariant) **Proposal runs** live in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved and loose documents) and are separate from asset candidate runs: they create no asset versions, change no status and don't run the QA chain. They're kept until accepted or discarded, then for 14 days, and they move with a `.wwdoc` on "Add to project". Anchoring, the staging bar and destinations are in §5.5.
+
+**New and existing documents**
+
+- **APP-096** [M1] **New documents** are unsaved (recovery file only) until the first Save, which opens "Save to project" (default `sketchbook`) and creates the asset with status `in_progress`. In no-workspace mode the first Save writes a `.wwdoc`.
+- **APP-097** [M1] **Which document opens:** one primary document per asset per kind; others are listed and can be renamed or discarded (discard = trash).
+- **APP-098** [M1] Editing a candidate seeds a new document from that candidate; editing an approved asset seeds one from its sealed `source/` (APP-100).
+
+**From document to version**
+
+- **APP-099** [M1] **"Make candidate"** (and "Save & make candidate", Ctrl+Shift+S) renders the document into a candidate run (role `manual`) **and copies the document at that exact state** (`doc.json` plus the chunks it uses) into `candidates/<run_id>/source/`. The recipe records the document hash and its inputs resolved to sealed versions.
+- **APP-100** [M1] (invariant) **Sign-off moves the chosen file and its `source/`** into the sealed version (§2.3's move rule), so any sealed version can be reopened for editing exactly as it was. `source/` is not a companion: it's excluded from `id@version` refs and from exports.
+- **APP-101** [M1] `auto_candidate_on_save` is a project option, off by default, that makes every save also run "Make candidate".
+- **APP-102** [M1] **Staleness:** a document whose `based_on` is older than the asset's latest sealed version shows "based on v1.0.0 — v1.1.0 exists"; a document whose linked inputs have newer sealed versions shows "update available".
+
+**Holds**
+
+- **APP-103** [M1] (invariant) **The first app to open a document holds it.** Others open it read-only, with "held by Image studio" and "make a copy"; a write from a non-holder fails with `doc.held_elsewhere`.
+- **APP-104** [M1] (invariant) Holds live in the core's memory, tied to the connection; a marker in the workspace's `state.db` is cleared at startup. An app re-acquires its holds after a core restart, so a crashed app never leaves a hold behind.
+- **APP-105** [M1] The core takes its own hold on a closed document for the duration of each operation on it (agent `doc.*` calls, a director's proposals written into a closed document, GC).
+- **APP-106** [Later] Multi-app holds with external-tool leases.
+
+**Agents and documents**
+
+- **APP-107** [M1] Agent `doc.*` tools (§5.10) edit **closed** documents through `store`, under the core's hold. On **open** documents they're forwarded to the app holding the document and applied there as one undoable step. (The co-pilot needs this to work on the document you're editing.)
+
+**Outside edits**
+
+- **APP-108** [M1] (invariant) `work/` is excluded from human-edit tracking; human-edit tracking applies to candidate and sealed files only.
+- **APP-109** [M1] If a document changes on disk while open, the app offers "reload" or "keep mine and save as a copy".
+- **APP-110** [Later] **"Edit in external app":** exports a flattened copy and opens it in your chosen program; when you save there, the watcher offers "bring back as a new layer" or "make candidate".
+
+### 3.6 Dashboards
+
+In M1 these are panels inside the Image studio; a separate Hub app hosts them later.
+
+- **APP-111** [M1] **Home** (minimal in M1): workspace and projects, recent assets and loose files, assets by status (candidate / in review / stale / blocked), open jobs.
+- **APP-112** [M1] **Review:** candidate grid, QA results, pick / reject / pin, choose the version bump, sign off. Version history in the Inspector.
+- **APP-113** [Later] Review's A/B compare with synced zoom; version compare and "restore as new version" in the Inspector.
+- **APP-114** [M1] **Jobs:** queue with live previews and progress, ETA, GPU lane state (including waiting for VRAM and outside ComfyUI jobs), cancel/retry. Director tasks appear here as jobs with their substatus.
+- **APP-115** [M1] **Confirmations:** pending agent requests (who asked, the exact action, the files/packages/scripts involved), approve/deny, history; pending cap confirmations.
+
+**Usage & spend**
+
+- **APP-116** [M1] Month-to-date and daily spend, broken down by provider, model, project, workspace (including "loose"), **caller** (you / assistant / Claude Code / `ww`), **account** and tool. Unattributed outside-ComfyUI spend is shown separately.
+- **APP-117** [M1] Tokens, images and seconds by model; estimated vs reconciled costs marked; CSV export.
+- **APP-118** [M1] (invariant) **Billing bases are kept apart.** Claude Code (Engine A) usage is `subscription_quota`: shown in its own units with the API-equivalent estimate labelled as such, and excluded from spend totals and money caps. Usage-credit spend is real money and counts, per account (§4.6).
+- **APP-119** [M1] **Fixed recurring costs** you enter once — each Claude plan (per profile, §4.6a) and flat backup subscriptions (OneDrive, BorgBase, Hetzner; §7.4) — are included in monthly totals. Caps don't apply to them.
+- **APP-120** [M1] **Currencies:** per-currency totals plus a converted total in your display currency, using an exchange rate you set (dated). Caps are set in the display currency and converted at reservation time, with the rate recorded. Costs follow the price rules of §4.2: cached-input tiers and `effective_from` dates in M1; time-of-day windows (such as DeepSeek off-peak) are Later, so M1 dashboards don't show off-peak pricing. M1 supports one display currency.
+- **APP-121** [M1] **Cap gauges** with 50 / 80 / 100 % alerts.
+- **APP-122** [M1] **Accounts**, per provider: key label and status (valid / rejected / expired), last successful call, billing basis, balances and quotas (quota bars for subscription units such as NanoGPT's), rate limits, provider-side limits, and freshness. Providers without an account API show "tracked only" with a link to their console. Cloud backup destinations appear as providers, with usage/quota where they have an API (§7.4). M1 account sync covers Anthropic, OpenRouter and NanoGPT (§2.6, §4.3).
+- **APP-123** [M1] **Claude Code**, per profile (§4.6a): 5-hour and weekly usage percentages and reset times with "last seen" times, and Engine A usage — from Engine A's stream and occasional `/usage` checks.
+- **APP-124** [M1] (invariant) The account dimension uses opaque ids (profile id for Engine A, key id for API providers). Labels come from the suite's settings at display time and are never written into usage records.
+- **APP-125** [M1.5] Token panel for your **interactive** Claude Code sessions, per profile, fed by the loopback OpenTelemetry receiver (§4.7 D).
+- **APP-126** [Later] GitHub Actions minutes shown as spend like any other provider (§6.6).
+
+**Hardware**
+
+- **APP-127** [M1] **Live view:** GPU (utilisation, VRAM, temperature, power, clocks, fan, throttle reasons); "who's using the GPU" (per-process VRAM and utilisation); CPU (total, a per-core **load** strip, package power); RAM; disks (free space, workspace and model-folder sizes); network throughput.
+- **APP-128** [M1] CPU temperature is not shown: it isn't available on Windows without admin rights or a kernel driver.
+- **APP-129** [M1] **History:** storage follows §2.5 (1 s for 24 h, 1 min for 30 days, hourly forever). The panel opens on a 15-minute live window and zooms out to 24 h.
+- **APP-130** [Later] 30-day charts.
+- **APP-131** [M1] **Energy** per job, session, day, month and year, with optional cost.
+- **APP-132** [M1] Thermal and throttling alerts.
+
+**Backups and diagnostics**
+
+- **APP-133** [M1] **Backups** (reached from Diagnostics; in the Hub later): per destination — last successful backup, size, next run, estimated monthly cost, quota used/remaining where available, protection level, partial-backup file lists; warnings; **Add destination**; and restore into a side folder. Behaviour is specified in §7.4.
+- **APP-134** [M1] **Diagnostics:** component versions, engine health, recent errors, event log, telemetry summary, a **backup status line**, and "Export diagnostics bundle" (redacted — secrets, Claude Code profile labels and emails removed).
+
+### 3.7 Responsiveness targets
+
+These are verified in the M0 and M1 benchmarks and reported pass/fail in each milestone report (§6.7).
+
+- **APP-135** [M1] **GUI-thread stalls:** 99th percentile < 16 ms, with frame times measured while ComfyUI saturates the GPU. First measured in the M0 spike. (M0 result, 2026-10-12: passed with the render-thread pan (D3D11 load stall p99 6.3 ms), but **failed when the pan was driven from the GUI thread** (a scene-graph sync every frame, as mouse or tablet input would cause): stall p99 **17.8 ms** on D3D11 under ComfyUI load, 95 % of it the GUI thread blocked in the render loop's sync while the render thread waited on the saturated GPU. So **canvas input must avoid per-frame GUI-thread syncs** (IMG-037). Re-measure with an input-driven pan in M1. `docs/spikes/04-frametimes.md` §5.3, §8.1.)
+- **APP-136** [M1] **Cold start** < 2 s to an interactive window, measured after a reboot and after a Defender first scan.
+- **APP-137** [M1] (invariant) **WebEngine stays off the startup path:** `Qt::AA_ShareOpenGLContexts` is set before the application object is created (the documented replacement for `QtWebEngineQuick::initialize()`, deprecated in Qt 6.12; verified 2026-10-12); the `QtWebEngine` import lives only in a component loaded through a `Loader` when the ComfyUI panel is first shown; nothing in the executable or the shim links to the WebEngine DLLs. (M0 result, 2026-10-12: the pattern holds as specified: WebEngine was not in the process until the web dock was first shown. But the WebEngine-scripting spike's shim linked WebEngine directly, which would break this rule, so the page driver and hidden conversion page must live in a **separate, lazily loaded library** (e.g. a QML plugin imported only by the ComfyUI panel). `docs/spikes/02-qt-stack.md`, `06-webengine-comfyui.md` §8.)
+- **APP-138** [M1] **Asset browser:** first page of 10,000 assets shown in < 200 ms.
+- **APP-139** [M1] **Event-to-UI latency:** < 100 ms for job progress (leading-edge throttle); immediate for confirmations.
+
+### 3.8 Milestone scope
+
+- **M0 spike:** frame times and GUI-thread stalls under ComfyUI load (APP-135); pasting into Discord and Chromium (APP-071).
+- **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.wwdoc`; "Add to project"; the `ww:` protocol (including `ww:task/<job_id>`), `.wwref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
+- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile` and `workflow` resource kinds, and the ComfyUI web view land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
+- **M1.5:** named layout presets; document checkpoints and cross-machine restore (with the S3-compatible store); resolving references through `renamed_from`; the interactive Claude Code token panel.
+- **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
+
+---
+
+## 4. AI layer: providers, metering, assistant, Claude Code
+
+This section covers how the core talks to hosted and local AI models, how every call is metered, the built-in assistant and its two engines, Claude Code accounts, and Claude Code integration in both directions. All of it lives in the core's `providers` and `assistant` modules (§2) and is reached through the same tool surface as everything else (§1).
+
+- **AI-001** [M1] (decision) Providers in use: Anthropic API, OpenRouter, NanoGPT, OpenAI, Google and fal (xAI and Mistral optional), plus the Chinese flagship providers DeepSeek, Alibaba/Qwen, Moonshot/Kimi, Z.ai/GLM, MiniMax, Tencent, Xiaomi MiMo and StepFun. ByteDance Seed models are reached through OpenRouter or fal, because BytePlus doesn't list the US as a supported region (verified 2026-10-12).
+- **AI-002** [M1] (invariant) Every external model or service call, including the assistant's own calls and internal callers such as vision QA, goes through `ProviderGate` (estimate, optional user-set caps, meter; §2). The suite adds no content filter of its own; each provider's and model's own policies apply.
+- **AI-003** [M1] (decision) The assistant has two switchable modes, co-pilot and director (§4.6). Its engine defaults to **Claude Code on the user's own Pro/Max subscription** (Engine A), with **Claude via the Anthropic API** (Engine B) as the alternative. Claude Code is integrated in both directions (§4.7).
+
+### 4.1 Provider layer
+
+| Adapter | Covers | Why | Milestone |
+|---|---|---|---|
+| `anthropic_messages` | Anthropic (primary) and Anthropic-compatible endpoints where chosen | Native Anthropic features (adaptive thinking, effort, caching, compaction, strict tools, server-side fallbacks) only exist here; Anthropic's OpenAI-compatible layer is for testing only | M1 |
+| `openai_chat` | OpenAI, OpenRouter, NanoGPT, xAI, Mistral, the Chinese providers, and local LLMs (llama.cpp `llama-server`, Ollama) | Widest compatibility; provider quirks are profile flags | M1 (local LLMs M1.5) |
+| `gemini_native` | Google Gemini `generateContent` | Gemini's OpenAI-compatible layer silently ignores unsupported parameters | Later |
+| `media_job` | Hosted image/video/audio/3D services (§4.4) | Async lifecycle | M1.5 |
+
+- **AI-004** [M1] (contract) Adapters call providers over raw HTTPS with `reqwest`. There is no official Anthropic Rust SDK (official SDKs: Python, TypeScript, C#, Go, Java, PHP, Ruby; verified 2026-10-12), so request and response shapes come from the providers' API docs. Anthropic requests send `anthropic-version: 2023-06-01`.
+- **AI-005** [M1] (invariant) Every provider feature the suite uses has recorded request/response fixtures.
+- **AI-006** [M1] (contract) Provider profiles and prices are **suite-level data**, shipped and updated with the suite in `%APPDATA%\Worldwright\providers\` (`providers.yaml`, `prices.yaml`), with optional per-workspace overrides. The workspace's `registry/models.yaml` keeps routes and defaults (§4.5).
+- **AI-007** [M1] (contract) Each provider profile declares: base URLs per region; auth style; endpoints; capability flags (tools, strict, `json_schema`, parallel tools, streaming usage, vision, server-side fallback); quirk flags; usage-field mapping; account-API definitions (§4.3); error mapping.
+- **AI-008** [M1] `openai_chat` handles these quirks through profile flags:
+  - reasoning text field: `reasoning_content`, `reasoning`, `<think>` tags, or Mistral `thinking` chunks;
+  - reasoning passback: DeepSeek returns 400 without it when tools are present; Kimi, Alibaba, MiniMax and xAI also need it passed back;
+  - where cached-token counts are reported;
+  - structured-output and tool-choice limits;
+  - `parallel_tool_calls` defaults;
+  - where usage arrives in a stream;
+  - `max_tokens` vs `max_completion_tokens`;
+  - tool arguments sent as an object (Z.ai);
+  - fixed temperature rules;
+  - keep-alive lines and SSE comments (DeepSeek);
+  - errors inside SSE frames (Tencent);
+  - provider error envelopes.
+
+  (Provider behaviour verified 2026-10-12.)
+- **AI-009** [M1] M1 proves the quirk mechanism on OpenRouter, NanoGPT and DeepSeek. Other providers are added as profiles when the user starts using them, with no code change.
+- **AI-010** [M1] Transient errors are retried with backoff. Inline metered calls (LLM requests, assistant turns, vision QA) may be retried and may use refusal fallback or fallback chains; **each attempt is metered**.
+- **AI-011** [M1] (invariant) Provider errors meaning "your provider-side spend limit, balance or plan limit is reached" are non-retryable (`provider.spend_limit`, §6) and shown as such.
+- **AI-012** [M1] Each provider has a circuit breaker. Every step of a fallback chain re-runs `ProviderGate`.
+
+### 4.2 Usage normalisation and cost
+
+- **AI-013** [M1] (contract) The normalised usage record (extending §2's usage record) holds: uncached input, cache-read and cache-write tokens (with TTL class), output tokens, reasoning tokens when reported separately, images / seconds / characters / requests, service tier, region, billing basis, `account`, the raw provider usage object, and `price_version`.
+- **AI-014** [M1] (invariant) `account` is always an opaque id — the profile id for Engine A (§4.6a), the key id for API providers — never a label or an email address. Usage logs live in the workspace and may be pushed to GitHub.
+- **AI-015** [M1] (contract) Cost sources, in this order of preference:
+  1. **reported in the response** (`provider_reported`): OpenRouter `usage.cost`, xAI `cost_in_usd_ticks` (1e10 ticks = $1, the final billed amount), NanoGPT media `cost`, Kling `billing[]`;
+  2. **looked up after the call** (`reconciled`): OpenRouter `/api/v1/generation?id=`, NanoGPT `/api/v1/usage/requests/{X-Request-ID}` (available for 24 h), fal `/v1/models/billing-events?request_id=` (needs a billing-scoped key);
+  3. **computed** as usage × price table (`computed_from_usage`).
+
+  (Provider fields verified 2026-10-12.)
+- **AI-016** [M1] Anthropic bills refusals in some categories; when a refusal is billed, it is metered like any other call.
+- **AI-017** [M1] (contract) Price entries are dated, record their source, and carry `effective_from`, so a scheduled change (such as Gemini's 2027-01-01 increases on specific models) is just a new entry. An entry can express:
+  - per-unit rates;
+  - prompt-length tiers;
+  - cached-input (cache-read and cache-write) rates;
+  - time-of-day windows with a time zone and holiday calendar (DeepSeek: peak 01:00–04:00 and 06:00–10:00 UTC Mon–Fri excluding Chinese public holidays; off-peak is half price) — format only until AI-020;
+  - cache storage per hour;
+  - service-tier and regional multipliers;
+  - batch discounts.
+- **AI-018** [M1] (invariant) Raw usage and `price_version` are kept on every record, so a **reprice job** can recompute past records after a price-table correction.
+- **AI-019** [M1] M1 implements per-unit rates, prompt-length tiers, cached-input rates and `effective_from`. Off-peak pricing (such as DeepSeek's) isn't applied or shown in M1.
+- **AI-020** [Later] Time-of-day windows, cache storage, tier/regional multipliers and CNY pricing are implemented when a provider that needs them is first used.
+- **AI-021** [M1] Machine-readable price lists (OpenRouter `/api/v1/models`, the xAI model list, Alibaba native `/api/v1/models`) refresh daily. Other prices are updated by hand; each shows "last verified", with a warning once it is older than 60 days.
+- **AI-022** [M1] Each record keeps its native currency (USD or CNY; DeepSeek balances can be either). Display uses the dated conversion rate in `suite.toml`.
+
+### 4.3 Accounts
+
+What the suite can read from each provider's account (verified 2026-10-12):
+
+| Provider | What the suite can read | Key needed |
+|---|---|---|
+| OpenRouter | key limit, remaining, usage by day/week/month, budgets (`GET /api/v1/key`); credits and 30-day activity (`/api/v1/credits`, `/activity`) | normal key; management key (optional) for credits/activity |
+| NanoGPT | USD/XNO balance (`POST /api/check-balance`), subscription quotas (`/api/subscription/v1/usage`), per-key usage (`/api/v1/usage`) | normal key |
+| DeepSeek | balances per currency (`GET /user/balance`) | normal key |
+| Moonshot/Kimi | available, voucher and cash balance (`GET /v1/users/me/balance`) | normal key |
+| StepFun | balance, cash, voucher (`GET /v1/accounts`) | normal key |
+| fal | balance (`/v1/account/billing?expand=credits`), per-request cost | key with `billing:usage:read` |
+| Kling, Tripo, Meshy, Rodin *(later, with 3D/video)* | balances/credits | normal key |
+| Anthropic | rate limits from response headers; organisation usage/cost reports only with an Admin key (organisation accounts only) | admin key (optional) |
+| OpenAI | rate limits from headers; organisation usage/costs with an Admin key | admin key (optional) |
+| xAI | prepaid balance, usage, spending limits via the Management API | management key (optional) |
+| Mistral | monthly usage with currency, spend limit | admin key (optional) |
+| Alibaba, Tencent | quotas (Alibaba); billing needs cloud-signed AccessKey APIs *(later)* | cloud AccessKey (optional) |
+| Gemini, MiMo, Z.ai, MiniMax, Replicate | nothing — "tracked only", with a link to the console | — |
+| Claude Code (each profile, §4.6a) | 5-hour and weekly plan usage and reset times; usage-credit state | none (the profile's own sign-in) |
+
+- **AI-023** [M1] (invariant) Admin, management and billing keys are separate, optional Credential Manager entries, labelled as powerful, and never used for model calls. Polling cadence follows §2.
+- **AI-024** [M1] Account sync in M1 covers Anthropic (rate-limit headers), OpenRouter, NanoGPT, and Claude Code plan usage **per profile** (§4.6a, §4.7 D). Other providers' account APIs are added as profiles when they are used.
+
+### 4.4 Hosted media jobs
+
+Hosted image, video, audio and 3D services run through the `media_job` adapter. None of this is in M1, which uses local ComfyUI only.
+
+- **AI-025** [M1.5] (contract) The `media_job` trait is `submit / status / cancel / result / cost / recover / balance`, plus a capability record per service: async pattern, streaming status, cancel support, client-supplied id support, recovery method, output lifetime, cost source and `bills_failures`.
+- **AI-026** [M1.5] (invariant) A hosted media job follows this order:
+  1. the job intent (`submitting`), a pending usage record and any cap reservation are written at submit; a client-supplied id is passed where the provider supports one (only Kling's `external_task_id`);
+  2. the provider's job id is stored; status is polled (or streamed where offered: fal, Meshy, Gemini);
+  3. every output is downloaded into staging as soon as it is ready;
+  4. substatus `ingesting`;
+  5. the candidate run is recorded;
+  6. only then is the job done and its cost settled.
+- **AI-027** [M1.5] (invariant) A hosted media job is retried automatically only when the request provably wasn't processed (connection failure, or 429/503 before acceptance) or the provider honours idempotency keys (§6). Otherwise a job is never resubmitted automatically.
+- **AI-028** [M1.5] After a crash, a job left in `submitting` without an external id is matched through the provider's lookup where one exists (fal `requests/by-endpoint`, Replicate listing (~1 h), NanoGPT `/generate-video/recover`, Alibaba (24 h), Gemini operations list, Tripo/Meshy task lists, ElevenLabs history). With no match, it becomes `interrupted_unknown` and the user decides. Services with no lookup (OpenRouter video, MiniMax, Tencent, synchronous OpenAI/Gemini/ElevenLabs calls) are marked "not recoverable after a crash" in their capability record.
+- **AI-029** [M1.5] (invariant) An `interrupted_unknown` job keeps its cap reservation until it is resolved.
+- **AI-030** [M1.5] Output lifetimes drive download urgency: Tripo 5 min (re-query for a fresh URL), Replicate 1 h, MiniMax ~1 h, NanoGPT images ~1 h, Alibaba/BytePlus/Tencent 24 h, Gemini Veo 2 days, Meshy ≤ 3 days, Kling 30 days, fal set explicitly per request.
+- **AI-031** [M1.5] Status is delivered by polling by default (webhooks need a public URL, and fal drops private destinations).
+- **AI-032** [Later] An optional webhook relay.
+- **AI-033** [M1.5] The first hosted media providers are fal and OpenRouter images; video, audio and 3D services arrive with their apps.
+
+Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24; `gpt-image-1` shuts down 2026-10-23 (`gpt-image-2` and `gpt-image-2.5-*` are current); Google recommends its Interactions API (with background mode) for new work, Imagen 4 is shut down, and Veo jobs can't be cancelled (outputs kept 2 days); MiniMax's paid music API closed to new users on 2026-08-20; Rodin direct needs a business plan, so it is used via fal; Tripo has an official Rust SDK.
+
+### 4.5 Model registry and routing
+
+- **AI-034** [M1] (contract) Entries in the workspace's `registry/models.yaml` carry `routes[]` (provider profile + model id per route, e.g. DeepSeek direct vs OpenRouter vs NanoGPT), capabilities (tools, vision, structured output, context, max output), a price reference, recommended settings, fallbacks and `last_verified`. `models.yaml` also registers local model files by hash.
+- **AI-035** [M1] (contract) Personal `model_profile` Library resources (§5) refer to registered model files by hash.
+- **AI-036** [M1] (contract) Defaults per task live in the settings cascade (`defaults.models` in `worldwright.yaml`, overridable per project and per request): `assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate`, `image_edit`, and others as apps add tasks. `defaults.models.image_generate` names a model profile (§5).
+- **AI-037** [M1] There is no automatic cheapest-route selection in M1: the user chooses defaults and routes, and fallbacks apply on errors.
+- **AI-038** [M1] Model lists are refreshed daily from providers that expose them. A deprecation or 404 switches to the configured fallback and flags the entry. Known retirements (verified 2026-10-12): Xiaomi MiMo v2.5 ids retire 2026-10-21; DeepSeek's old names retired 2026-07-24; Kimi `moonshot-v1` retired 2026-08-31.
+
+### 4.6 The built-in assistant
+
+#### Modes
+
+- **AI-039** [M1b] **Co-pilot** (the default mode) acts on the user's requests step by step in the open app, including the document being edited (agent `doc.*` forwarding to the open document is in M1; §3, §5).
+- **AI-040** [M1b] (invariant) A co-pilot's pending calls (calls awaiting confirmation) are cancelled if its app closes.
+- **AI-041** [M1b] (contract) **Director** mode turns a goal into a **director task**: a first-class job (`kind: assistant_task`, §2) whose plan and step state are held by the core, with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused` and `interrupted`.
+- **AI-042** [M1b] (invariant) A director task keeps running when the user closes the app.
+- **AI-043** [M1b] (invariant) After a core restart a director task becomes `interrupted`, and only the user can resume it — never automatically.
+- **AI-044** [M1b] (invariant) Destructive/exec steps and cap confirmations never block a director run. The call returns `pending_confirmation` with a confirmation id (§6); the director continues with other steps and checks back. If nothing else can proceed, the task pauses (`waiting_confirmation`) and the notification path (§3) brings the user to the decision. A director task always gets `pending_confirmation`, never `cap.exceeded`: that error is only for callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks; §2, §6).
+- **AI-045** [M1b] M1 allows one director task per workspace; others queue.
+- **AI-046** [M1b] The engine is a suite-level setting (default Claude Code) with a per-conversation override for co-pilot; director tasks run on Engine A, or move to Engine B only by hand-off (AI-150) until direct Engine B director tasks arrive in M1.5 (AI-152). For Engine A, each conversation and director task also records the Claude Code profile it runs under (§4.6a).
+
+#### Engine A — Claude Code on the user's own sign-in (default)
+
+- **AI-047** [M1b] (decision) The core runs the user's installed, **unmodified** `claude` CLI headless. The suite never reads, stores or forwards the user's Claude login or tokens and never modifies the binary.
+  - Anthropic's terms describe subscription login as intended for ordinary use of Claude Code and say they don't prevent signing in to the unmodified binary with one's own subscription; third-party apps must not use or relay subscription credentials (verified 2026-10-12).
+  - Each user runs their own unmodified binary with their own sign-in, and the suite never handles their credentials (AI-091, AI-096). Use of Engine A, including long director runs, stays subject to Anthropic's terms; the API engine is always one switch away.
+- **AI-048** [M1b] The user's CLI install of `claude` is preferred over the copy bundled inside the Claude desktop app. The resolved path is shown in Doctor and can be overridden.
+- **AI-049** [M1b] (invariant) There is one long-lived `claude` process per active conversation, inside a kill-on-close Job Object, closed after an idle timeout and resumed on the next message. A co-pilot's process ends when its app closes; a director task's process belongs to the core.
+- **AI-050** [M1b] (contract) Launch profile (final flags set by the M0 spike, §4.8):
+  - `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --session-id <uuid>` (or `--resume <id>`);
+  - `--permission-mode default`, always — without it a `-p` run can start in `auto` mode, where a classifier approves actions before the suite sees them;
+  - `--setting-sources project,local` (or none, if M0 shows that works with the user's login and `--mcp-config`), so the user-level allow rules, default mode, hooks, `env` blocks, `apiKeyHelper` and plugin enablement don't load; plus `--settings <suite engine settings>` carrying the mode preset and `env: {CLAUDE_CODE_ENABLE_TELEMETRY: "0"}`;
+  - `--strict-mcp-config --mcp-config <core-generated file>` (below);
+  - `--disallowedTools WebFetch,WebSearch` (opt-in per task), `--disable-slash-commands` (the user's personal skills don't load), `--permission-prompt-tool mcp__ww__approve`;
+  - one fixed `--append-system-prompt-file` covering both modes;
+  - `--model`, `--effort` and `--max-turns` per task.
+- **AI-051** [M1b] (contract) The core-generated MCP config launches the **real `ww-mcp.exe` by absolute path**, so it is a direct child of `claude.exe`. Its entry's `env` carries the per-launch engine token, the conversation's workspace id (or `none`) and `WW_PROFILE=<profile id>` (passed explicitly, because Claude Code's subprocess scrub can strip `CLAUDE_CONFIG_DIR` from child processes). `ww-mcp` sends all three in its `core/hello` handshake (§1). The user's own MCP servers are added only if the user has opted them in. Strict mode drops plugin-provided servers, so nothing in Engine A depends on the plugin.
+- **AI-052** [M1b] (invariant) The generated MCP config file lives in a user-only temp folder and is deleted after `system/init`.
+- **AI-053** [M1b] (contract) `mcp__ww__approve` is a tool on the suite's own MCP server, exposed only to engine connections.
+- **AI-054** [M1b] (invariant) The appended system prompt is fixed for the life of a conversation: Claude Code records the system prompt on a conversation's first request and ignores a changed one on resume. The current mode is delivered as a short core-written preamble in each user turn.
+- **AI-055** [M1b] The working directory is always the workspace (or a suite-owned scratch folder in no-workspace mode). Loose files are passed with `--add-dir` or as file references.
+- **AI-056** [M1b] (invariant) `claude`'s environment is built from an allowlist: `PATH`, `SystemRoot`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, `CLAUDE_CODE_GIT_BASH_PATH`, proxy variables, `CLAUDE_CONFIG_DIR` (set to the profile's folder; unset for the default profile, §4.6a), the non-secret marker `WW_ENGINE=1`, plus `OTEL_METRICS_EXPORTER=none` and `OTEL_LOGS_EXPORTER=none`. Everything else is removed, including all `ANTHROPIC_*` (among them `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`), `CLAUDE_CODE_USE_*` (Bedrock, Vertex, Foundry), `CLAUDE_CODE_OAUTH_TOKEN` and every provider key — any of these would silently override the profile's sign-in and bill a different credential.
+- **AI-057** [M1b] (invariant) The per-launch engine token is **never** in `claude`'s environment (it would leak into every command the agent runs); it reaches `ww-mcp` only through the generated MCP config.
+- **AI-058** [M1b] (contract) Director preset: file edits allowed in project text files (`*.md`) and a scratch folder; edits **denied** on `assets/**`, `registry/**`, `queue/**`, `**/*.manifest.json` and `.worldwright/**` (those change only through the suite's tools, so `store` stays the only suite writer); a short allowlist of read-only commands; deletes, installs and scripts denied (the suite's own tools do those, with suite confirmations).
+- **AI-059** [M1b] (invariant) In director mode the approve tool **never waits**: anything Claude Code would ask about that isn't on the preset is denied with "use the `ww` tool, which can ask the user for confirmation" (the `ww` call then returns `pending_confirmation`). Claude Code's own prompts don't time out, so waiting would stall the run.
+- **AI-060** [M1b] (contract) Co-pilot preset: the same write denials; other actions Claude Code asks about are shown to the user in the suite (the user is present) and answered within a few minutes, or denied.
+- **AI-061** [M1b] (invariant) Before a run is used, the core checks (any failure refuses the run with a clear message and the fix):
+  - the Claude Code version is in the tested range from `claude_code.yaml` (minimum **2.1.268**, needed for `configDirectory`); older **and newer untested** versions are refused with `engine.claude_code.untested_version` (§6). A future release is expected to make `--bare` — no plugins, no subscription login — the default for `-p`; the version gate catches it;
+  - the profile's sign-in, verified as in AI-062;
+  - `system/init` reports `apiKeySource: "none"`, the `ww` server connected with its expected tools, and the `interrupt_receipt_v1` capability.
+- **AI-062** [M1b] (invariant) Profile verification and launch locking (per profile, §4.6a):
+  - when the profile has **no active suite session**, `claude auth status` runs with Engine A's exact environment and settings and must report exit code 0, `authMethod: "claude.ai"` and `configDirectory` equal to the profile's folder;
+  - when the profile is busy, a launch goes ahead only if a verification younger than 30 minutes exists **and** the stream's control-protocol `initialize` response reports an `account` (token source / subscription type) matching that verification — a per-launch check that triggers no extra token refresh (M0 confirms the field in headless runs). `apiKeySource: "none"` alone can't tell a claude.ai login from a bearer token, hence the account match;
+  - if neither holds, the launch waits until the profile is idle.
+- **AI-063** [M1b] (invariant) Engine calls are recognised by the **per-launch engine token** alone (unguessable, issued per process; the core holds the `claude` process handle, so the PID can't be reused) → caller kind `assistant`, `engine: claude_code`, with the conversation's workspace id. The token is invalid once its `claude` process has ended: calls with it are refused, not downgraded to `cli`. Caller kinds are `ui:*`, `assistant`, `mcp` and `cli` (§1).
+- **AI-064** [M1b] (invariant) Interactive Claude Code sessions are caller kind `mcp`: the connecting process must be `ww-mcp.exe` from the install folder or the per-user bin folder, with a best-effort check that a `claude.exe` is its parent or grandparent. This guards against accidents (a stray `ww-mcp` claiming Claude Code already confirmed something), not against malware running as the user — consistent with §1's trust boundary.
+- **AI-065** [M1b] (invariant) For engine connections the core's own confirmations apply (§2): the core marks the suite's tools as not `requiresUserInteraction` for these connections, and `mcp__ww__approve` auto-allows the suite's own tools, so nothing is asked twice.
+- **AI-066** [M1b] (invariant) The plugin's hooks don't run in Engine A (user settings and plugin enablement aren't loaded); if they run in some configuration, they see `WW_ENGINE=1` and do nothing.
+- **AI-067** [M1b] (contract) A turn is stopped with the stream's `interrupt` control request (feature-detected from `system/init` capabilities; Windows has no targetable SIGINT). Killing the process and `--resume` is the fallback.
+- **AI-068** [M1b] (invariant) Idempotency keys for suite tool calls from Engine A are `session id + tool-use id` (a retried tool call from Claude Code reuses its tool-use id; M0 confirms). The core's step state tells a resumed run what is already running.
+- **AI-069** [M1b] (invariant) The suite's conversation store is the source of truth. If a Claude Code session can't be resumed (its transcripts are cleaned up after a period), a new session starts, seeded with a summary.
+- **AI-070** [M1b] (contract) Usage and plan-limit signals from Engine A's stream:
+  - `rate_limit_event` messages (status `allowed` / `allowed_warning` / `rejected`, reset time, utilisation, `errorCode: "credits_required"`) feed the dashboard and director behaviour;
+  - `system/api_retry` with `error: "rate_limit"` is the hard-stop signal;
+  - run totals are cumulative across resumes, so the core records the difference per session, from `modelUsage` (which includes subagents; crashed runs may report zeros).
+- **AI-071** [M1b] (invariant) Engine A usage records use billing basis `subscription_quota` and carry the profile id as `account`. Their cost figure is stored as an "API-equivalent estimate" and excluded from spend totals and money caps.
+- **AI-072** [M1b] (invariant) **Usage credits** (if enabled on a plan) turn overflow into real money: credit spend is recorded per account as real money. **Director runs never spend credits unattended**: at the plan limit the director stops at the next turn boundary and waits (`waiting_quota`) unless the user has explicitly allowed credit spending for that task, in which case the suite's money caps apply at each turn boundary.
+- **AI-073** [M1b] Whether credits are on is checked with a separate `claude -p --no-session-persistence --output-format json "/usage"` run (experimental; M0 confirms it uses no quota and reports credit state), under the per-profile lock (§4.6a).
+- **AI-074** [M1b] (invariant) When a profile's plan limit is reached, the task or conversation pauses in `waiting_quota` and the user chooses what happens next (AI-104). For co-pilot calls this surfaces as `quota.plan_limit` (§6).
+- **AI-075** [M1b] A per-profile setting can keep director runs from starting above a chosen 5-hour usage %, leaving headroom for interactive work.
+- **AI-076** [M1b] (invariant) Each conversation has one owner: an Engine A process, the Claude Code desktop app, or an interactive terminal session. Handing it to the desktop app or a terminal stops the Engine A process and marks the conversation "moved to Claude Code" (read-only in the suite); "Take back" warns the user to close it there first, then resumes. The core refuses to resume a session held elsewhere.
+
+#### Engine B — Claude via the Anthropic API
+
+- **AI-077** [M1b] Models: `claude-opus-5-5` for the assistant; `claude-haiku-5-5` for high-volume helpers (vision QA, tagging); both changeable.
+- **AI-078** [M1b] Thinking and effort: adaptive thinking (it can't be disabled on Opus 5.5). Effort is `medium` for co-pilot, `high` for director planning and `low` for helpers, changed with per-message effort (beta) so the prompt cache isn't invalidated. `thinking.display: "updates"` (beta) lets the assistant panel show progress notes during long turns. (API behaviour verified 2026-10-12.)
+- **AI-079** [M1b] (invariant) Engine B conversations are **append-only** (Opus 5.5 preserved thinking returns 400 if earlier turns, the system prompt or the tool set change):
+  - the system prompt is fixed per conversation, and switching co-pilot/director doesn't rewrite it — mode instructions go in a core-authored mid-conversation system message;
+  - the tool set is fixed per conversation; changes use the inline tool add/remove beta;
+  - fresh context (selection, open document, project changes) goes into the newest user turn or tool results, wrapped as data — never into system messages.
+- **AI-080** [M1b] (invariant) Mid-conversation system messages contain only text the core writes and follow the API's placement rules: never first; after a user turn and before an assistant turn (or last); never between a tool call and its result.
+- **AI-081** [M1b] (invariant) Tools use `strict: true` and `eager_input_streaming`. `stop_reason` is checked first; inputs are validated against their schemas before running (eager streaming can deliver partial or invalid JSON), and invalid input returns an error result. `tool_choice` is `auto` only (forced tool choice returns 400).
+- **AI-082** [M1b] Prompt caching uses up to 4 breakpoints (tools → system → messages).
+- **AI-083** [M1b] Long director runs use on-demand compaction (`compact-2026-09-04`, which keeps thinking on retained turns) and task budgets (`task-budgets-2026-03-13`; advisory, minimum 20,000 tokens).
+- **AI-084** [M1b] Refusal fallback: `fallbacks: "default"` with `server-side-fallback-2026-07-01` on Opus 5.5. Provider profiles carry a `server_fallback` flag; Haiku 5.5 has none, so helpers retry on the client side. The fallback model runs without the original's thinking blocks; `usage.iterations` is metered.
+- **AI-085** [M1b] (invariant) Every Engine B call goes through `ProviderGate` (estimate, caps, meter).
+
+#### Both engines
+
+- **AI-086** [M1b] (invariant) External content (model cards, workflow notes, image metadata, web pages, file names) is wrapped and labelled as data in assistant context. This protects against agents being tricked into acting; it has nothing to do with what the user may create.
+- **AI-087** [M1b] (contract) Conversations are stored in the workspace's local data folder, in `assistant\` — normally `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\assistant\`, or `<volume>:\.worldwright-local\<hash>\assistant\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§2, §7) — not in git, and exportable. Each records its engine and, for Engine A, its profile id.
+
+### 4.6a Claude Code accounts (profiles)
+
+The suite supports several Claude Code profiles (separate config directories), switched manually. Each profile's account details stay in the suite's local settings.
+
+- **AI-088** [M1b] (contract) Claude Code keeps each sign-in, with its settings, history and plugins, in a **config folder**: by default `%USERPROFILE%\.claude`; the `CLAUDE_CONFIG_DIR` variable points it elsewhere. A suite profile is `{id, label, config_dir, last_verified}`, stored in the suite's settings in `%APPDATA%`.
+- **AI-089** [M1b] (invariant) The **default profile** uses Claude Code's normal folder with **no variable set**, so it is the account the user already uses in terminals and the desktop app. The suite never sets `CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude`, because with the variable set `.claude.json` (which holds the sign-in state) is looked for inside the folder instead.
+  - Engine A's headless sessions in the default profile appear in the user's own `claude --resume` picker (`-c` skips them); the suite labels them.
+- **AI-090** [M1b] (invariant) **Extra profiles** use folders the suite creates under `%LOCALAPPDATA%\Worldwright\claude-profiles\<id>\`, or an existing folder the user points it at. A folder is rejected if it is inside a workspace (committed and possibly pushed), inside a backed-up path, or inside a synced folder (§7's synced-folder detection).
+- **AI-091** [M1b] (invariant) The suite never opens `.credentials.json` or `.claude.json`, and never copies, moves or backs up a profile folder. It runs `claude` commands there and edits only that profile's `settings.json`, after asking.
+- **AI-092** [M1b] (invariant) Profile labels and any email shown by `auth status` stay in the suite's settings in `%APPDATA%` and are redacted from diagnostics bundles. Usage records store only the opaque profile id.
+- **AI-093** [M1b] Each profile can carry a plan price as a **fixed recurring cost**, so the dashboard's monthly total includes it (§7's fixed-cost mechanism). Caps don't apply to fixed costs.
+- **AI-094** [M1b] (invariant) Profile folders are never backed up (§7), and tests never touch real profile folders: the test environment provider covers them, and the fake `claude` honours `CLAUDE_CONFIG_DIR` (§6).
+
+#### Signing in
+
+- **AI-095** [M1b] "Add account" creates the folder and opens a terminal running `claude` with `CLAUDE_CONFIG_DIR` set to it; the user runs `/login` and signs in with that account in the browser. The suite then verifies the profile once with `claude auth status` in the same environment: exit code 0, `authMethod: "claude.ai"`, and `configDirectory` matching the profile's folder.
+- **AI-096** [M1b] (decision) Long-lived `claude setup-token` tokens aren't used: the suite would have to store them, and they lose plan features and usage data.
+
+#### Engine A under profiles
+
+- **AI-097** [M1b] Engine A launches `claude` with the conversation's profile (`CLAUDE_CONFIG_DIR` per AI-056). Engine A ignores user settings and plugins and generates its own MCP config, so it behaves identically under every profile.
+- **AI-098** [M1b] (invariant) The core keeps a **per-profile lock**: `claude auth status` and `/usage` checks run only when no suite-launched `claude` is active in that profile — repeated `auth status` calls can start a token refresh that races with a running session. There is no polling of `auth status`. In the default profile the suite can't see the user's own terminal or desktop sessions; that small race is accepted (at worst it asks the user to sign in again).
+- **AI-099** [M1b] (invariant) Profiles are independent; within one profile, launches are serialised: the suite starts its own sessions one at a time, and open sessions continue.
+- **AI-100** [M1b] (invariant) **Sign-in expired mid-task.** When a profile's login can no longer be refreshed, Claude Code fails every request with a "Login expired · Please run /login" error. Auth failures (that message, HTTP 401, or `authMethod: "none"`) put the task into substatus **`waiting_auth`** — distinct from `waiting_quota` and never retried automatically. The notification opens the task in the Assistant panel (APP-050), which offers "Sign in again (<label>)" (opens the terminal for `/login`, then resumes), "Use a different profile" and "Switch to the API engine". For co-pilot calls this surfaces as the error `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6).
+- **AI-101** [M1b] Doctor shows Claude Code's 3-day sign-in expiry warning if the M0 spike finds a headless way to read it.
+
+#### Usage per profile
+
+- **AI-102** [M1b] Each profile shows its 5-hour and weekly usage percentages and reset times, with a "last seen" time. Sources:
+  - Engine A's stream (`rate_limit_event`; `system/api_retry` with `error: "rate_limit"` as the hard stop);
+  - an occasional `/usage` check per profile, at most every 15 minutes and only when that profile is idle. `/usage` is itself rate-limited and can return a snapshot up to an hour old; its result format is experimental (M0 confirms what headless runs report);
+  - from M1.5, the statusline helper and OpenTelemetry for the user's interactive sessions in each profile (§4.7 D).
+- **AI-103** [M1b] Usage records carry the profile id (`account`), so the dashboard shows usage per account and in total. Usage-credit spend is per account and counts as real money.
+
+#### When a plan limit is reached
+
+- **AI-104** [M1b] (invariant) The task or conversation pauses (`waiting_quota`); the notification opens it in the Assistant panel (APP-050), which offers exactly these choices; **the user picks**, and the default is to wait:
+  1. **Wait for the reset** (the reset time is shown) and resume automatically at the reset time.
+  2. **Switch to the API engine** (Engine B): the core's plan, step results and a summary seed a new API conversation (a Claude Code transcript can't be continued over the API); caps apply from that point.
+  3. **Use a local model** (M1.5).
+- **AI-105** [M1b] (decision) The suite never chooses a profile; each conversation or task runs under the profile the user selects when starting it (profile picker), and the user can change it at any time.
+
+Use of each Claude account is subject to Anthropic's terms (AI-106 links them).
+
+- **AI-106** [M1b] The Settings → Claude Code page states once, plainly, that use of each Claude account is subject to Anthropic's terms, with links to them.
+
+### 4.7 Claude Code integration
+
+The Worldwright plugin **1.3** ships with the suite and adds the MCP server and hooks; plugin 1.2.0 is the current file-based plugin it replaces.
+
+#### A. Claude Code drives the suite
+
+- **AI-107** [M1] (contract) The installer places a real copy of `ww-mcp.exe` (not a launcher) at the fixed per-user path `%LOCALAPPDATA%\Worldwright\bin\ww-mcp.exe` and keeps it updated: only the stable channel owns that copy, and Velopack's after-install / after-update hooks copy it there with rename-then-replace (§7). The plugin's `.mcp.json` points there (with `userConfig` as an override), and the install is also recorded under `HKCU\Software\Worldwright`. That folder is one of the allowed image paths for `mcp` callers (§1).
+- **AI-108** [M1] (invariant) On a version mismatch `ww-mcp` still starts and exposes only `ww.status`, reporting the error.
+- **AI-109** [M1] (invariant) Plugin skills detect a running suite with `ww status --no-start`, not by "MCP tools present", so they never write files directly while the core is running.
+- **AI-110** [M1] (contract) The server is named `ww`. Tools appear as `mcp__plugin_worldwright_ww__<tool>` in the user's interactive sessions and as `mcp__ww__<tool>` in Engine A; hooks, permission rules and the approve tool match both forms.
+- **AI-111** [M1] (contract) Tool descriptions are ≤ 2,000 characters; the server has clear `instructions`; a few core tools (status, project context, job wait) are marked `alwaysLoad`.
+- **AI-112** [M1] (contract) Results are JSON text plus file paths. Claude Code doesn't document `structuredContent` or `resource_link`, so they are included only as optional extras.
+- **AI-113** [M1] (contract) Long work returns a job id; `job.wait` waits at most ~90 s per call (Claude Code backgrounds calls longer than ~2 min).
+- **AI-114** [M1] `ww doctor` offers allow rules for the suite's non-destructive tools in the workspace's `.claude/settings.json` and `ask` rules for destructive ones. In interactive sessions, destructive/exec tools also carry `requiresUserInteraction` (decided per connection by the core, §2).
+- **AI-115** [M1] Project context, the style bible, recent assets and job status are exposed as MCP resources; common workflows as MCP prompts (slash commands).
+- **AI-116** [M1] (contract) Plugin hooks:
+  - **SessionStart:** reports the active project, open jobs and pending confirmations (and, from M1.5, maps the session to its workspace for the telemetry receiver);
+  - **PostToolUse** on Write/Edit under the workspace: `ww notify --no-start`;
+  - **PreToolUse "ask"** for Bash/PowerShell deletes, installs and scripts; for the comfy MCP's install, update, download and restart tools; and a separate guard on direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json` (warn-only at first; once every plugin skill has a matching suite tool, they become **deny while a core is running** (checked with `ww status --no-start`) and stay allowed when no core runs, so skills can still work on files directly (ARCH-102));
+  - **Notification:** forwards Claude Code notices to Windows notifications via the suite.
+- **AI-117** [M1] The plugin is installed **per profile** (per config folder). For each profile, `ww doctor` checks `claude plugin list --json` (run with that profile's folder) and offers to install or update the plugin there (asks first). Every profile's plugin points at the same fixed `ww-mcp.exe`, so every profile connects to the same suite.
+
+#### B. The suite drives Claude Code
+
+Engine A (§4.6, §4.6a).
+
+#### C. Hand-off
+
+- **AI-118** [M1] (contract) "Open in Claude Code" for the **default profile** uses `claude-cli://open?q=<prompt>&cwd=<workspace>`: a terminal opens in the workspace with the prompt pre-filled, not sent. `q` is truncated to 5,000 characters; `cwd` must be absolute, local, and contain no `..`.
+- **AI-119** [M1] (invariant) If the link handler isn't registered yet (it registers after the user's first interactive Claude Code prompt), or the conversation uses a **non-default profile**, the suite launches `claude` in a terminal **without** a prompt — an argument vector, never a command-line string built from prompt text — with the profile's `CLAUDE_CONFIG_DIR` where applicable, and puts the prompt on the clipboard. `claude-cli://` deep links and the Claude desktop app use the default account only.
+- **AI-120** [M1b] (contract) "Open in Claude desktop" runs `claude --desktop` in the workspace, or `--resume <session>` for an assistant conversation, and needs Claude Code **2.1.285** or later and the desktop app (verified 2026-10-12); below 2.1.285 the action is hidden. It is offered only for conversations under the default profile; for other profiles the suite explains why.
+- **AI-121** [M1b] (invariant) Before handing a conversation to the desktop app or a terminal, the core stops that conversation's Engine A process and marks it "moved to Claude Code", so two programs never write the same session (ownership rules in §4.6).
+
+#### D. Usage and plan limits on the dashboard
+
+- **AI-122** [M1b] Engine A runs are recorded from their own stream (usage deltas and `rate_limit_event`s). Plan-limit percentages per profile come from Engine A's rate-limit events and the occasional per-profile `/usage` check, shown with "last seen" times. Summaries keep billing bases apart.
+- **AI-123** [M1.5] (contract) A loopback OpenTelemetry receiver in the core (bound to 127.0.0.1, `http/json`, with an auth header) records the user's **interactive** Claude Code sessions. It is the core's only network listener — an explicit exception to "the core exposes no network port" (§1). It deduplicates by session id (including Engine A session ids), maps sessions to workspaces through the SessionStart hook (others go to "Claude Code — other projects"), attributes sessions to profiles, and stores one row per session per day.
+- **AI-124** [M1.5] `ww doctor` writes the telemetry settings into **each** profile's `settings.json` (asks first): `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_METRICS_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`, the endpoint and header, and `OTEL_RESOURCE_ATTRIBUTES=ww.profile=<id>`.
+- **AI-125** [M1.5] A `ww statusline --profile <id>` helper, configured per profile, chains with any status line the user already has and reports that profile's `rate_limits.five_hour` / `seven_day` percentages and reset times from interactive sessions.
+
+#### E. Live push into an open session
+
+- **AI-126** [Later] Live push into an open interactive session through Claude Code channels (a research preview as of 2026-10-12).
+
+#### F. Setup and health (first run and `ww doctor` → "Claude Code" page)
+
+- **AI-127** [M1] Doctor checks:
+  - the resolved path to `claude.exe` (the user's CLI install, not the `.cmd` shim or the desktop app's bundled copy);
+  - `claude --version` against the tested range;
+  - per profile: `claude auth status` → `authMethod: "claude.ai"` and the expected `configDirectory`, checked both normally and with Engine A's environment and settings (only while the profile is idle, AI-098);
+  - per profile: plugin installed and enabled, MCP server connected with the expected tools;
+  - Git Bash present (Claude Code needs it on Windows);
+  - deep-link handler registered;
+  - telemetry and status-line settings;
+  - usage credits on/off.
+- **AI-128** [M1b] Doctor's Claude Code page lists every profile: signed in or not, its label, plugin state, last-seen limits, and "Sign in again" (opens the terminal for `/login`).
+- **AI-129** [M1] (invariant) The suite never handles the login itself: "Sign in" opens interactive `claude` in a terminal for `/login`.
+- **AI-130** [M1b] Doctor offers install or update hints and a `ww doctor --claude-smoke` headless run against a fixture tool (cheap model, `--max-turns 2`). The smoke run **runs only when the user confirms**, because it uses plan quota; after a Claude Code version change Doctor offers it again (it never runs by itself, and never in CI, §6). It runs under the profile the user picks (default: the default profile) and also checks that `configDirectory` matches that profile.
+- **AI-131** [M1] (contract) A capability table (`claude_code.yaml`) maps tested Claude Code versions to the flags used. The stream parser tolerates unknown events and records them; stream fixtures are recorded per tested version. An untested version is refused for Engine A (AI-061) and shows a banner: "Claude Code X.Y is untested — run the smoke test to add it, or use the API engine". A passing smoke run on the new version (AI-130) records it as tested for this machine.
+- **AI-132** [M1] If Claude Code is unusable, the API engine is offered when an Anthropic API key exists.
+
+### 4.8 Milestone scope
+
+#### M0 spike — Claude Code headless (pass/fail)
+
+- **AI-133** [M0] With Engine A's profile (`--setting-sources`, `--settings`, `--strict-mcp-config`, `--permission-mode default`): the claude.ai login still works (`claude auth status` and `apiKeySource: "none"`), and `ww-mcp` from `--mcp-config` connects. Decided by the M0 spike: whether `--setting-sources` can be empty rather than `project,local`.
+- **AI-134** [M0] Decided by the M0 spike: `--restricted` (managed + `--settings` only, file tools confined to the working directories, command tools only if named) and `--safe-mode` behaviour with OAuth and `--mcp-config`, and whether `--restricted` serves as the director profile.
+- **AI-135** [M0] Strict mode drops plugin servers; `ww-mcp.exe` launched by absolute path is a direct child of `claude.exe`.
+- **AI-136** [M0] The `-p` default permission mode, and that `--permission-mode default` overrides it.
+- **AI-137** [M0] The permission-prompt tool's input/output contract, and whether a long-waiting prompt-tool call gets backgrounded.
+- **AI-138** [M0] The `interrupt` control request, and `interrupt_receipt_v1` in `system/init` capabilities.
+- **AI-139** [M0] The system prompt recorded across `--resume`.
+- **AI-140** [M0] Tool-use id reuse on retried tool calls.
+- **AI-141** [M0] `rate_limit_event` shapes (per profile) and the plan-limit error.
+- **AI-142** [M0] `/usage` in a `-p` run: no quota used; whether it returns the structured usage report; present with and without usage credits.
+- **AI-143** [M0] Resume after a kill mid-tool; `defer` + `--resume`.
+- **AI-144** [M0] Where `.claude.json` lives under `CLAUDE_CONFIG_DIR` on Windows.
+- **AI-145** [M0] Which fields `claude auth status` reports (`configDirectory`, `authMethod`, account/plan — the account/plan fields are reported as unreliable), and the `account` field of the control-protocol `initialize` response in headless runs.
+- **AI-146** [M0] Two profiles running concurrently, and two sessions in one profile (community reports of `.claude.json` write races).
+- **AI-147** [M0] Nothing from `%USERPROFILE%\.claude` leaks into a non-default profile's run.
+- **AI-148** [M0] Decided by the M0 spike: whether a headless way exists to read Claude Code's 3-day sign-in expiry warning.
+
+#### M1
+
+- **AI-149** [M1] M1 delivers: provider profiles with `anthropic_messages` and `openai_chat` (OpenRouter, NanoGPT, DeepSeek); the usage/cost engine (per-unit rates, prompt-length tiers, cached-input rates, `effective_from`); account sync (Anthropic headers, OpenRouter, NanoGPT, Claude Code plan usage per profile); assistant co-pilot (including agent edits on the open document) and director on Engine A; Claude Code profiles (sign-in, per-conversation account, manual switching through the account picker and the limit-reached choices, per-account limits from Engine A, Doctor's profile list, plugin per profile); Claude Code integration A, B, C, F and the M1 part of D.
+- **AI-150** [M1b] Engine B in M1 supports co-pilot, and director tasks started by hand-off from Engine A.
+
+- **AI-156** [M1b] (decision) The in-app assistant — the Assistant panel, co-pilot and director modes, both engines, Claude Code profiles and plan-limit display (§4.6, §4.6a) — arrives in **M1b**. M1a already lets Claude Code drive the suite from the user's own sessions through plugin 1.3 and `ww-mcp` (§4.7 A), and records all metered usage. Rules elsewhere that exist only for the in-app assistant (`assistant_task` jobs, director decisions in the Assistant panel, engine-contract tests) are needed by the end of M1b, not for M1a.
+#### M1.5
+
+- **AI-151** [M1.5] (decision) Local LLMs: `llama-server` as an owned engine and Ollama as an attached one, both through `openai_chat`, selectable per task (captioning, tagging, prompt expansion, local vision QA) and as the "use a local model" choice at a plan limit; metered as local ($0, GPU time and energy) and scheduled around image jobs for VRAM.
+- **AI-152** [M1.5] Director tasks started directly on Engine B.
+- **AI-153** [M1.5] Hosted media through `media_job`: fal and OpenRouter images (§4.4).
+- **AI-154** [M1.5] The OpenTelemetry receiver and status-line helper for interactive sessions, per profile (§4.7 D).
+
+#### Later
+
+- **AI-155** [Later] `gemini_native`; local LLMs as a full assistant engine; other assistant engines; more providers' profiles as they are used; time-of-day, storage, multiplier and CNY price rules when needed; admin-key organisation reports; Claude Code channels; the webhook relay; video, audio and 3D hosted services with their apps.
+
+---
+
+## 5. Image studio
+
+The Image studio (`ww-image`, §1) is the suite's first app: an Invoke-style AI canvas with layers and solid painting basics, a native view of ComfyUI node graphs, and ComfyUI's own web UI embedded. Every operation described here is a core tool (§2.11), so the assistant and Claude Code can do anything the panels can. Research behind this section: `research-image-studio-ux.md`, `research-image-local-models.md`, `research-canvas-engine.md` (Appendix C).
+
+- **IMG-001** [M1] (decision) The Image studio provides an Invoke-level AI canvas plus solid basics (brush, eraser, selections including AI select object, transform, crop, common adjustments); a native node editor that can **view, tweak and run** ComfyUI workflows in M1 (adding nodes and editing connections in M1.5); and ComfyUI's own web UI embedded. Generation uses local ComfyUI models by default; hosted image providers arrive in M1.5 (§4.4).
+- **IMG-002** [M1] (decision) M1 for the Image studio is delivered in two halves, M1a (first usable studio) and M1b (completes the studio), as listed in §5.11. Rules in this section carry `[M1a]` or `[M1b]` accordingly.
+
+### 5.1 Layout
+
+- **IMG-003** [M1a] The main area has tabs: **Canvas** (one per open document) and **ComfyUI** (the embedded web UI, §5.8, created on first show).
+- **IMG-004** [M1b] The main area adds a **Graph** tab (native node editor, §5.7).
+- **IMG-005** [M1a] Panels: the studio's own Generate, Layers, Layer properties, Tool options, Staging and History panels, plus the shared suite panels (§3.1, §3.6): Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant and Diagnostics. The Assistant panel arrives in M1b with the in-app assistant (§4.6). Diagnostics carries the event log and a backup status line, and in M1 it is where the Backups panel is reached (§3.6, §7.4); the separate Hub app is Later.
+- **IMG-006** [M1a] Layer properties is its own panel and is never placed under tool settings (a known Invoke pain point).
+- **IMG-007** [M1a] The status bar shows zoom, cursor position and colour, document size and profile, the active model profile, GPU/VRAM, and queue state such as "waiting for GPU: Qwen edit, ~40 s" or "loading models…".
+- **IMG-008** [M1a] (contract) Hotkeys come from the one suite-wide map, checked for conflicts with §3: B brush, E eraser, V move, C crop, L lasso, U rectangle, Space pan, `[` / `]` brush size, Ctrl+Enter generate, ← / → cycle staging, Enter accept, Shift+Enter keep as hidden layer, Del discard, Ctrl+J duplicate layer, Ctrl+E merge down, Ctrl+G group, Ctrl+Shift+N new raster layer, Shift+N fit frame to layers, Shift+B fit frame to masks.
+- **IMG-009** [M1a] (invariant) Hotkey precedence: an active transform or crop first, then a visible staging bar, then the current tool. So Enter commits a transform before it accepts a result, and Del deletes selected pixels unless the staging bar has focus.
+
+### 5.2 The document model
+
+The canvas is stored as a Worldwright document (§3.5). This section fixes its layer model, pixel formats and on-disk layer format.
+
+- **IMG-010** [M1a] The canvas is a large coordinate space; the document has a nominal size that can grow (outpainting can extend it in any direction, including left and up).
+- **IMG-011** [M1a] Every layer can be named, shown/hidden, **enabled for generation** (separately from visibility), locked, reordered and grouped.
+- **IMG-012** [M1a] **Raster** layers hold pixels, opacity, a blend mode (the W3C Compositing and Blending set) and an optional layer mask.
+- **IMG-013** [M1a] **Group** layers have opacity and a blend mode that is either pass-through or isolated.
+- **IMG-014** [M1a] **Adjustment** layers are non-destructive and per-pixel: levels, curves, hue/saturation, brightness/contrast.
+- **IMG-015** [M1.5] Additional adjustment layers: colour balance, invert, threshold.
+- **IMG-016** [M1a] **Control** layers hold an image drawn by hand or derived by a preprocessor (depth, canny, lineart, pose, tile) plus control type, strength and start/end; they are used only for generation and never composited into the image.
+- **IMG-017** [M1.5] **Regional prompt** layers (experimental): a mask plus a prompt (see IMG-078).
+- **IMG-018** [M1a] **Inpaint mask** layers mark where generation may change pixels, with a per-mask denoise limit where the model profile supports it.
+- **IMG-019** [M1b] **References** are not canvas layers: they are a list in the Generate panel (image + role + strength), with "Create from frame / selection / layer".
+- **IMG-020** [M1a] (invariant) What generation sees (the "init image") is the composite of the visible, generation-enabled raster layers inside the frame, including their groups, adjustments and layer masks.
+- **IMG-021** [M1a] Tools act on the selected layer's kind (painting on a mask paints the mask).
+- **IMG-022** [M1a] The **selection** is an 8-bit mask, not a layer. Operations: rectangle, ellipse, lasso, polygon, select object (AI), add/subtract/intersect, feather, grow/shrink, invert, **refine edge** (BiRefNet within the selection's bounding box, for crisp AI masks at high resolution), and conversion selection ↔ inpaint mask / layer mask.
+- **IMG-023** [M1a] (contract) Raster layers are stored as 8-bit sRGB + alpha and masks as 8-bit. The tile type is designed so 16-bit half-float linear can be added later without a format change.
+- **IMG-024** [M1a] (contract) On disk (inside the document folder or `.wwdoc`), layers are stored as **content-addressed chunks of 8×8 tiles (1024×1024 px)** on a signed grid, so outpainting can grow left and up. Each chunk has a header with a tile-presence/uniform bitmap (empty and single-colour tiles aren't stored) followed by zstd-compressed raw RGBA8 (raster) or R8 (mask) data. Chunk files are named by their content hash in the document's layer chunk store (§3.5), and `doc.json` maps each layer's chunk coordinates to chunk hashes.
+  - A brush dab rewrites one chunk (≤ 4 MiB raw, ~1 MB compressed). An 8K (7680×4320) layer is ~40 chunks instead of ~2,000 tile files.
+- **IMG-025** [M1a] (invariant) A chunk's content hash is computed over its **canonical uncompressed** bytes, so recompressing (or a zstd version change) never changes its identity.
+- **IMG-026** [M1a] (invariant) Chunk files are never modified in place; a changed chunk is a new file. Snapshots (§3.5) hardlink chunks, so this keeps snapshots intact and dedupes them at chunk level.
+- **IMG-027** [M1a] Layer and document commands: merge down, merge visible, flatten, duplicate, convert raster ↔ control, selection ↔ mask, save frame or layer as an asset, and recall prompt/seed/settings from any staged result or candidate.
+
+### 5.3 Canvas engine
+
+**Tiles and GPU compositing**
+
+- **IMG-028** [M1a] In RAM the canvas uses 128×128 copy-on-write tiles; they back undo, disk spill and the chunk store.
+- **IMG-029** [M1a] Compositing runs on the GPU with QRhi compute shaders (compiled with `qsb`), with a fragment-shader fallback.
+- **IMG-030** [M1a] (invariant) Qt Quick defaults to **Direct3D 11** on Windows, whose compute shaders (Shader Model 5.0) can't read half-float images in place. Therefore layer tiles are only ever **read as sampled textures**, and every projection write is **store-only**: composite bottom-to-top in registers, then write once. No shader dispatch reads and writes the same image. (M0 result, 2026-10-12: RGBA8 typed UAV loads in SM 5.0 did work on the RTX 5080, which reports `TypedUAVLoadAdditionalFormats` (half-float was not tested). So in-place reads are a hardware-capability limit that is *not guaranteed* on D3D11, not an API ban; store-only stays the design. `docs/spikes/04-frametimes.md` §8.4.)
+- **IMG-031** [M1a] Isolated groups and non-trivial nesting use **multiple passes**: a group writes an intermediate texture that the next pass samples (allowed, since it's a separate texture). Layer tiles are looked up through a storage-buffer slot table; adjustment layers bind their curves as small lookup textures.
+- **IMG-032** [M1a] (invariant) The mip levels of each projection page are **separate textures**, so downsampling never reads and writes the same texture; the display shader picks the level and filters between levels itself.
+- **IMG-033** [M1b] *Withdrawn — M0 result, 2026-10-12: D3D12 is not built; D3D11 stays the only path. Condition 3 of the pre-registered rule failed (removing the group pass with an in-place read-write composite cut composite time by 12.4 % with DXIL SM 6.6 and 6.2 % with DXBC SM 5.0, against the 25 % required) and condition 2 was inconclusive (`docs/spikes/04-frametimes.md` §7). Reopen only if D3D12 becomes the only route to something needed (e.g. dxc's ≈ 32 % faster composite).* Run Qt Quick on **Direct3D 12** (shaders built for SM 6.6, shipping the DXC compiler DLLs), which lifts the D3D11 limits — only if the M0 spike (IMG-152) favours it. D3D11 with IMG-030 stays the baseline either way.
+- **IMG-034** [M1a] A software-renderer fallback (WARP) is detected and reported to the user, since it would be very slow.
+- **IMG-035** [M1a] (invariant) Layer textures are created **without** the sRGB flag, so blending happens in gamma-encoded sRGB (what Photoshop and Krita do by default).
+- **IMG-036** [M1a] (contract) A Rust CPU compositor implements the same formulas. It is used for export, agent renders and golden tests comparing CPU and GPU output, and lives in a shared crate the core can use too. (M0 result, 2026-10-12: bit-exact CPU/GPU parity is not available: the GPU composite matched the CPU reference within 1/255 per channel on D3D11 and D3D12, with about 2.4 % of channels off by 1 and none by 2. Golden tests therefore compare CPU and GPU output with a **±1/255 per-channel tolerance** (an image tolerance, so it belongs in `test-params.toml`, QA-019). `docs/spikes/03-canvas-compositing.md`.)
+
+**Qt integration**
+
+- **IMG-037** [M1a] The canvas is a `QQuickRhiItem` subclass in the C++ shim. `synchronize()` only swaps a pointer to data Rust has already prepared (the GUI thread is blocked while it runs). `render()` uploads a capped batch of tiles (limited by the resource-update batch's own capacity signal and a byte budget), visible tiles first, and requests another frame while the backlog isn't empty. (M0 result, 2026-10-12: per-frame view changes (pan, zoom, stroke preview) must reach the renderer through a thread-safe queue and repaint from the render thread with `QQuickRhiItemRenderer::update()`, not through QML properties and a GUI-thread `update()`. Every GUI-driven frame costs a scene-graph sync that blocks the GUI thread on the GPU under ComfyUI load, which failed APP-135. `docs/spikes/04-frametimes.md` §8.1.)
+- **IMG-038** [M1a] The renderer can be destroyed and recreated (moving windows between adapters, device loss), so the GPU tile cache is disposable and is rebuilt visible-first.
+- **IMG-039** [M1a] The GPU tile cache is built from texture arrays of up to 2048 slices of 128×128 (128 MiB each), ~12–16 arrays for a 1.5–2 GB cache.
+- **IMG-040** [M1a] (invariant) When a generation job is submitted, the GPU tile cache is **trimmed to the visible pages (a few hundred MB)** before ComfyUI loads models, because ComfyUI sizes model loading by the free VRAM at load time. (M0 result, 2026-10-12: the trim itself worked (cache down to ≤ 76 MiB within 62 ms of each trigger), but the cache **regrew** by 128 MiB arrays within a second while the view panned. A trim alone is not enough: **while a ComfyUI job is loading or running, the GPU tile cache is capped** at the trimmed size plus a small margin and grows in small arrays. The spike had no handshake between the trim and the prompt submission, so plan 6 must order trim → submit explicitly. Windows also demoted the canvas's VRAM under ComfyUI load (1,968 → 416 MiB resident), so expect re-paging on first touch after a job. `docs/spikes/04-frametimes.md` §8.2, `08-comfy-measurements.md` §5.2.)
+
+**Memory, undo and colour**
+
+- **IMG-041** [M1a] The RAM tile budget is ~50% of physical memory, with disk spill. (An 8K × 20-layer fully covered document is ~2.65 GB at 8-bit.)
+- **IMG-042** [M1a] Undo uses tile-map snapshots that share unchanged tiles, with a ~2 GB budget; older steps are compressed and spilled to disk. The History panel shows the steps.
+- **IMG-043** [M1a] The document profile is sRGB. The display transform is a 33³ lookup table sampled from a `moxcms` transform (document → monitor ICC profile) and applied in the canvas shader. The monitor profile is read in the C++ shim with the same Windows calls Qt uses internally.
+- **IMG-044** [M1a] (invariant) When Windows Advanced Color, auto colour management or HDR is active, Windows' compositor already colour-manages, so the lookup table is bypassed (otherwise colours would be corrected twice).
+
+**Previews and pen input**
+
+- **IMG-045** [M1a] (contract) ComfyUI sends sampler previews only when asked, so **every prompt the suite submits sets `extra_data.preview_method`**. Previews arrive as JPEG frames ≤ 512 px and are shown as an overlay inside the generation frame. Tiny preview decoders (TAE models for Z-Image/FLUX, Qwen-Image-2.1, FLUX.2) are part of the download set; without one, ComfyUI falls back to a rougher preview. (M0 result, 2026-10-12: for Z-Image the suite must send **`preview_method: "taesd"`**: only then does ComfyUI use TAEF1 (`taef1_decoder.pth` in `models/vae_approx`); `"auto"` gives the rougher Latent2RGB preview. The TAEF1 download is `taef1_decoder.pth` from the author's GitHub repo `madebyollin/taesd`; the Hugging Face repo `madebyollin/taef1` holds diffusers-format weights only, which ComfyUI's previewer can't load. TAEF1 previews cost ≈ 0.46 s per 8-step 1024² run. `docs/spikes/08-comfy-measurements.md` §5.6.)
+- **IMG-046** [Later] *On hold indefinitely (project decision 2026-10-12: mouse input only until this is revived).* Pen input uses Windows Ink (Qt 6's default) at the full sample rate. A C++ event filter on the window receives tablet events with pressure **and accepts them** (otherwise Qt also synthesises mouse events), then queues the samples to the Rust brush worker.
+
+### 5.4 Tools
+
+- **IMG-047** [M1a] Navigation: pan, zoom, fit, 100%.
+- **IMG-048** [M1.5] Rotate view.
+- **IMG-049** [M1a] Brush and eraser: an in-house round stamp engine with hardness, spacing, size/opacity/flow (pressure-driven curves wait for pen input, IMG-046), smoothing, and a stroke buffer.
+- **IMG-050** [M1.5] Textured brush tips.
+- **IMG-051** [M1a] Fill: paint bucket with tolerance and contiguous options.
+- **IMG-052** [M1.5] Gradient fill.
+- **IMG-053** [M1a] Selection tools: rectangle, ellipse, lasso, polygon, **select object**, select subject / select background (BiRefNet), refine edge.
+- **IMG-054** [M1a] Select object uses SAM 3.1 (native in ComfyUI) with click points or a text description. SAM 3.1 takes text, boxes and positive/negative points in the pixel coordinates of the uploaded image, which the suite maps from document coordinates. The flow is "add points → Process → Apply", so one click isn't one job.
+- **IMG-055** [M1.5] Magic wand.
+- **IMG-056** [M1a] Transform: move, scale, rotate, flip, free transform; crop; canvas resize.
+- **IMG-057** [M1a] Colour picker / eyedropper, and swatches and palettes from Libraries (§3.4).
+- **IMG-058** [M1a] Destructive filters: blur, sharpen, noise.
+
+### 5.5 Generating on the canvas
+
+**Generation frame and scaling**
+
+- **IMG-059** [M1a] The generation **frame** is any size in document pixels, with resize handles and "Fit to layers" (Shift+N), "Fit to masks" (Shift+B) and "Fit to selection". It shows an **Auto / Manual** indicator: in Auto it fits the mask or selection bounds plus a context margin, **clamped to the content bounds**; resizing it by hand switches it to Manual until you click Auto again.
+- **IMG-060** [M1a] **Generation size is separate from the frame**: *Auto* (~1 megapixel at the frame's aspect, snapped to the profile's preferred multiples), *Manual*, or *None* (generate at frame size). The panel shows e.g. "frame 256×256 → generates 1024×1024". The suite resizes the input (Lanczos when going down; an upscaler model when going up more than 2×), generates, and resizes the result back to the frame.
+- **IMG-061** [M1a] New and imported documents start with a frame of the profile's preferred size, not the whole image.
+
+**Mode selection**
+
+- **IMG-062** [M1a] (contract) The generation mode is chosen from what's inside the frame (Invoke's rule, with thresholds):
+  - nothing visible → **text-to-image**;
+  - partly transparent → **outpaint** (pixels with alpha ≥ 250 count as opaque, and transparent areas smaller than 0.5% of the frame are ignored, so near-opaque cut-outs don't trigger it);
+  - fully covered, no inpaint mask and no selection → **image-to-image**;
+  - fully covered with an inpaint mask **or an active selection** → **inpaint** (shown as "Inpaint (selection)" when driven by a selection).
+  - An active selection or inpaint mask wins over outpaint unless you choose outpaint.
+- **IMG-063** [M1a] The Generate panel shows the chosen mode, and you can override it.
+- **IMG-064** [M1a] Outpaint infill: before generation, empty areas are filled in Rust with *Tile* (default), solid colour, edge stretch/blur, or a Telea-style fill. The outpaint mask is the transparent area plus any inpaint masks. The infill choice is recorded in the recipe.
+- **IMG-065** [M1a] Each model profile declares how "strength" maps to model settings (denoise, start step or ControlNet context scale), and the panel shows the effective step count (on 8-step distilled models, 0.3 strength is ~2 steps). Capability flags hide controls a profile lacks: negative prompt (CFG-1 models ignore it), soft masks, per-area denoise.
+
+**Compositing results back**
+
+- **IMG-066** [M1a] Mask grow and mask blur (in document pixels) are per-job settings. The optional **edge-coherence pass** is a second, low-strength (≈ 0.3) generation over a band (default 32 px) around the mask edge, run as part of the same job.
+- **IMG-067** [M1a] (invariant) **Frame-sized results** (generate, inpaint, outpaint, edits) are pasted back **by the suite** at full resolution, so pixels outside the mask stay bit-identical. Accepting an inpaint result adds a new layer containing only the feathered masked region, above the untouched original.
+- **IMG-068** [M1a] With no selection or mask, the whole frame result becomes the new layer.
+- **IMG-069** [M1b] Edits have a per-job switch: *composite through the mask* (default for local edits) or *take the whole frame* (for edits that intentionally change light or colour everywhere, where compositing through a mask would leave seams).
+- **IMG-070** [M1b] (invariant) Workflow outputs the same size as their input slot are pasted back like frame-sized results; outputs of any other size become a new layer or document and are never silently resampled. "Replace layer" is one undo step.
+
+**Other AI operations**
+
+- **IMG-071** [M1b] **Instruction edit** on a layer, frame or selection, with references.
+- **IMG-072** [M1b] (contract) On Qwen-Image-2.1 the mask is *guidance* only: it is fed as an annotated reference, because the edit node has no hard-mask input (the Fun ControlNet inpaint path is also conditioning, not a hard mask), so **only paste-back (IMG-067) makes the edit exact**. The adapter passes the frame image as the first reference and sets the node's `resolution` from the generation size (the node sizes its output to the first reference's aspect at that resolution). The node has 16 reference slots, of which the model's authors validated 10.
+- **IMG-073** [M1a] Remove background (BiRefNet, tool `image.cutout`), alongside select object and refine edge (§5.4). Select subject / select background (IMG-053) use the same tool and return a selection instead of a cut-out layer.
+- **IMG-074** [M1b] Upscaling operations: **upscale image** (flatten → new document or candidate at N×); **enhance layer** (re-render one layer at its displayed size with an upscaler, e.g. a pasted low-resolution image, without touching other layers); **upscale document** (resizes every layer, with a warning that the other layers are resampled). Upscalers: Real-ESRGAN (fast) and SeedVR2 (tiled for large inputs).
+- **IMG-075** [M1a] **Variations**: re-run a staged result's or candidate's recipe with new seeds, optionally with only the prompt changed (tool `image.regenerate`).
+- **IMG-076** [M1b] **Transparent output** directly where the model supports it; otherwise a BiRefNet cut-out of the result.
+- **IMG-077** [M1b] **Run a workflow on a layer:** recipes with image and mask slots appear as layer "filters" with a destination (staging / replace layer / new layer / asset); they run through `image.workflow.run`.
+- **IMG-078** [M1.5] Regional prompts use ComfyUI's mask conditioning: it works with any model but averages per-region predictions (cost ≈ (regions + 1) × a normal step) and needs a full-coverage base prompt.
+
+**Proposals (staged results; the canvas never locks)**
+
+"Proposal" is the name for staged generation results on a document. It is distinct from two other kinds of staging: `store`'s staging handles (§2) and document save handles (§3.5).
+
+- **IMG-079** [M1a] (contract) Each generation on a document creates a **proposal run** stored in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with its recipe and saved inputs.
+- **IMG-080** [M1a] (invariant) A proposal run creates no asset version, doesn't change the asset's status and doesn't run the QA chain. When recorded (§2.2 "Record" step) it writes no manifest, `progress.md` or candidate; its hand-off block lists proposal refs and PNG paths.
+- **IMG-081** [M1a] **Anchoring:** a run records its frame rectangle and the version of every tile under that rectangle at submit time — enough to warn "this area changed since you generated" on accept, with the choice *accept on top*, *accept into a new layer group* or *discard*. No snapshot is written at submit time.
+- **IMG-082** [M1a] Runs stay until accepted or discarded, then for 14 days; "Discard all" clears them.
+- **IMG-083** [M1a] (invariant) Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots, and discarding a proposal after accepting it never loses the accepted pixels.
+- **IMG-084** [M1a] On "Add to project" from a `.wwdoc` (§3.5), open proposals move with the document.
+- **IMG-085** [M1a] The Generate panel has a **destination**: *Proposals* (default), *Asset* or *Both*. Asset candidate runs (§2.3, with QA and sign-off) are created only by "Make candidate" or when the destination is *Asset* or *Both*; choosing *Asset* on an unsaved document opens "Save to project" first.
+- **IMG-086** [M1a] The **staging bar** has a thumbnail strip, ← / →, an A/B toggle against the canvas, auto-switch (newest / in progress / off), **Accept** (adds a layer; one undo step), **Keep as hidden layer**, **Discard**, **Discard all**, **Cancel** a running job (via `job.cancel`), **Recall settings** and **Open in Review**.
+- **IMG-087** [M1a] You can keep editing while results arrive. Runs from several frames or callers stack, each labelled with who started it (e.g. "Claude Code").
+- **IMG-088** [M1b] A director's runs that finish while the app is closed are written into the closed document's proposals by the core (under the core's own hold) and appear the next time the document opens.
+- **IMG-089** [M1a] (contract) Proposals are referenced as `doc:<doc_id>/proposal/<run_id>/<n>`. These refs are for viewing and recalling only; live links still require sealed versions.
+- **IMG-090** [M1a] Until the Z-Image ControlNet is downloaded, inpaint uses ComfyUI's built-in latent noise mask with differential diffusion (works with any model, lower quality), and the panel says so.
+
+**Queue priority on the one GPU**
+
+ComfyUI's own queue can't be reordered usefully: its "front" option is last-in-first-out among front items, and nothing pre-empts a running prompt. So the suite holds the queue itself.
+
+- **IMG-091** [M1a] (invariant) The suite keeps its own queue and keeps **at most one prompt per lane pending in ComfyUI**; the next prompt is submitted when the running one finishes, so a multi-candidate run's prompts reach ComfyUI one after another (§2.8).
+- **IMG-092** [M1a] (invariant) The suite's queue orders by class — interactive (select object, preprocessors) > your generations > agent/director batches — first-in-first-out within a class. Batches may be grouped by model profile within their class, with a limit so nothing waits forever.
+- **IMG-093** [M1a] Interactive operations still wait for the prompt already running (up to ~40 s on a Qwen edit), and the status bar says so (IMG-007).
+- **IMG-094** [M1a] An optional setting cancels and resubmits a running *agent batch* prompt when an interactive one arrives. It never cancels your own jobs.
+- **IMG-095** [M1a] Source images are uploaded to ComfyUI once, named by content hash, with reference-counted cleanup.
+- **IMG-096** [M1a] Proposal runs are jobs (§2.8) carrying `doc_id`, with hardware and energy attribution like any other job.
+
+### 5.6 Model profiles
+
+- **IMG-097** [M1a] Architecture adapters are code. Each builds ComfyUI graphs from fragments for each operation and combination (inpaint + control + references + infill + scaling), since static templates can't cover the combinations. M1a ships the `zimage` adapter.
+- **IMG-098** [M1b] The `qwen_image_2_1` and `flux2` adapters.
+- **IMG-099** [M1a] (contract) A **model profile** is data on top of an adapter: model files (by hash), defaults, capabilities, required custom-node packs and the strength mapping (IMG-065).
+- **IMG-100** [M1a] (contract) Profiles and user workflows are Library resources (§3.4) of the kinds `model_profile` and `workflow` (a workflow with marked slots). Profiles live in personal resources by default (models are machine-level), with workspace overrides.
+- **IMG-101** [M1a] (invariant) "Recipe" keeps meaning a run's provenance (§2.3). Recipes record the **profile's content hash**, not just its name, since profiles can be edited.
+- **IMG-102** [M1a] Model files are registered in `registry/models.yaml` (§4.5); a profile refers to them by hash; the task default `defaults.models.image_generate` names a profile.
+- **IMG-103** [M1a] Utilities (SAM 3.1, depth and pose/edge preprocessors, upscalers, BiRefNet, preview decoders) are bound per operation, not to the active profile.
+- **IMG-104** [M1a] Each operation has a capability state — *supported / installed / missing* — computed from the core's hash inventory (§2.8).
+- **IMG-105** [M1a] Missing files show "Download (<size>)" (e.g. "Download (6.7 GB)"), which runs a core job with a disk-space check. `.safetensors` downloads are plain file writes. Custom-node packs are installs: they need your confirmation when an agent asks (§2.7) and a ComfyUI restart, with a warning about running jobs.
+- **IMG-106** [M1a] A run-time "model not found" error is shown as "model X missing → relink by hash or name".
+- **IMG-107** [M1a] **LoRAs:** a LoRA list in the Generate panel (name, weight, trigger words), from ComfyUI's LoRA folder. Profiles declare whether LoRAs work (some quantised paths can't apply them; see IMG-157). "Clone profile with this checkpoint" covers fine-tunes (e.g. from Civitai). (M0 result, 2026-10-12: the Z-Image `int8_convrot` profile's LoRA flag is **`supported`** (bf16 too): the LoRA visibly changed the output on both precisions, bf16+LoRA and int8+LoRA agreed (min SSIM 0.866), and int8's LoRA time overhead was 0–4.8 %. w4a8 was not measured, as there is no Z-Image w4a8 file. `docs/spikes/08-comfy-measurements.md` §5.4.)
+- **IMG-108** [M1a] (contract) A `style_preset` Library resource is prompt + LoRAs + settings for a compatible profile family. Swatches, palettes and prompt/style presets are M1 Library kinds (§3.4).
+- **IMG-109** [M1b] Each LoRA's base family is detected from its file header (metadata first, then a tensor-key fingerprint), with a tag you can set yourself; a mismatch with the profile warns but doesn't block.
+- **IMG-110** [Later] Importing models from hubs belongs to the later `imports` module, not the Image studio.
+
+**M1 profiles** (all model types and nodes verified native in ComfyUI 0.39.2; verified 2026-10-12). Downloads happen only when you choose them (IMG-105).
+
+| Profile | Files | Operations | State on the test machine (2026-10-12) |
+|---|---|---|---|
+| **Z-Image Turbo** | Z-Image-Turbo (installed; int8/NVFP4 variants optional) + Fun ControlNet Union 2.1 (lite 2.0 GB, or full 6.7 GB) + Tile lite | t2i, img2img, inpaint/outpaint and control via the ControlNet | Only the base model is installed — inpaint/outpaint/control need the ControlNet download. (M0 update, 2026-10-12: `z_image_turbo_int8_convrot`, the lite ControlNet `Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps` and a LoRA (`pixel_art_style_z_image_turbo`) are now installed, hash-verified.) |
+| **Qwen-Image 2.1** | int8 model + Turbo LoRA + text encoder (smaller w4a8 variant by default; the int8 one pushes the total to ~16.7 GB) + VAE + Fun ControlNet int8 | t2i, edit with up to 16 reference slots, mask as guidance, inpaint and control via the ControlNet, transparent output | Not installed. Runs 3–4× slower until ComfyUI's PyTorch is upgraded from the CUDA 12.8 build to a CUDA 13 build (an install change). (M0 update, 2026-10-12: the PyTorch upgrade is done, ComfyUI now runs 2.11.0+cu130; the Qwen model is still not installed.) |
+| **FLUX.2 klein 4B** | fp8 model + VAE | very fast t2i and edit with references | Not installed |
+| **Utilities** | SAM 3.1, Depth Anything 3, `comfyui_controlnet_aux` (pose/edges), SeedVR2 3B/7B, tiny preview decoders; BiRefNet and Real-ESRGAN (installed) | select object, preprocessors, upscale, previews | Mostly not installed. (M0 update, 2026-10-12: SAM 3.1 (`sam3.1_multiplex_fp16`) and the TAEF1 preview decoder (`taef1_decoder.pth`) are now installed; BiRefNet is installed and verified on cu130.) |
+
+- **IMG-111** [M1a] The **Z-Image Turbo** profile as in the table. Its default is the **int8 base + lite ControlNet**, unless the M0 VRAM measurement (IMG-155) shows bf16 fits: bf16 base 12.6 GB + lite ControlNet 2.0 GB + ~1.5 GB for the canvas, WebEngine and Windows' compositor is at or over the 16 GB card. (M0 result, 2026-10-12: the default is **`int8_convrot` + lite ControlNet (2602 8-step), on PyTorch cu130**, by this rule's default, because bf16 was not shown to fit reliably. The pre-registered fit rule gave different answers on identical repeats (bf16 "fits" in 1 of 3 series, by 6 MiB). In every fit run with the canvas and WebEngine running, bf16 kept 5.8–6.0 GB of weights in pinned system memory, against 280 MiB for int8. bf16 run times swung 2–4× in the t2i/LoRA series (6.8–28.6 s) and in the series without the canvas and WebEngine (9.5–21.4 s); in the fit series bf16 was stable, and int8 varied by < 1 % throughout. Under ComfyUI's dynamic VRAM (on by default in 0.39.2) the **peak-VRAM and log criteria don't discriminate**: ComfyUI fills the card to its own headroom and never logs offload. Overhead: measured untrimmed with a 1.5 GB cache budget (IMG-039), the canvas + WebEngine took ≈ 2.2 GB (canvas 1,968 MiB, WebEngine ≈ 230 MiB). With bf16's 13,820 MiB of weights (DiT + lite ControlNet + VAE) that is ≈ 16,020 MiB, under the 16,303 MiB card but over the 15,500 MiB budget. With IMG-040's trim/cap the canvas held ≈ 0.43–0.76 GB (spike 04 §5); the fit was not measured in that state. int8 needs **PyTorch cu130** for ComfyUI's optimised CUDA ops (2.5× faster than cu128 for int8 inpaint + lite ControlNet); the test machine's ComfyUI is now on 2.11.0+cu130. Decided during M0 review: int8 is the spec default and bf16 was not shown to fit reliably. `docs/spikes/08-comfy-measurements.md` §5.3–5.4, §7; `04-frametimes.md` §5.)
+- **IMG-112** [M1b] The **Qwen-Image 2.1** profile as in the table, with the w4a8 text encoder by default.
+- **IMG-113** [M1b] The **FLUX.2 klein 4B** profile as in the table.
+- **IMG-114** [M1a] The utilities as in the table needed by M1a operations (SAM 3.1, Depth Anything 3, `comfyui_controlnet_aux`, BiRefNet, Real-ESRGAN, tiny preview decoders); SeedVR2 comes with the M1b upscaling operations (IMG-074).
+- **IMG-115** [M1b] Model switching: ComfyUI keeps models cached in system RAM (the reference machine has well over 64 GB) and swaps them into VRAM; Z-Image and Qwen can't both stay resident, so switching between them costs a swap (measured in IMG-156). LoRA key mapping is confirmed in the ComfyUI 0.39.2 source for both Z-Image (Lumina2 architecture) and Qwen-Image-2.1.
+- **IMG-116** [M1a] Doctor checks ComfyUI's PyTorch/CUDA build from `/system_stats` (Qwen-Image 2.1 runs 3–4× slower on the CUDA 12.8 build). (M0 result, 2026-10-12: the test machine's ComfyUI was moved to PyTorch 2.11.0+cu130 during M0; the int8 Z-Image default (IMG-111) also needs the CUDA 13 build, as ComfyUI's optimised CUDA ops are disabled on cu128. `docs/spikes/08-comfy-measurements.md` §5.7.)
+
+### 5.7 Graph tab — native node editor (view, tweak, run)
+
+- **IMG-117** [M1b] The Graph tab opens workflows from Library `workflow` resources, from a candidate's or image's embedded workflow (sealed ones open read-only, with "Save as new"), from a file, from ComfyUI's saved workflows (`/userdata/workflows/…`), or from ComfyUI's templates (`/templates/index.json`, `/api/workflow_templates`). Open workflows are held like documents (§3.5).
+- **IMG-118** [M1b] It shows nodes, links, groups and subgraphs (navigate in/out) and widget values typed from `/object_info`. `/object_info` is cached, so a workflow can be viewed while ComfyUI is down (but not run). Missing nodes and models are highlighted.
+- **IMG-119** [M1b] Tweaks: widget values, mute/bypass, recipe slots, images/masks taken from the canvas or the Asset browser, seed behaviour.
+- **IMG-120** [M1.5] Connecting/disconnecting ports, editing dynamic (V3) inputs, adding nodes from the node library.
+- **IMG-121** [M1b] (invariant) Format fidelity: the parser reads both shapes ComfyUI writes (root version 0.4 with array links; subgraph definitions with object links), positional `widgets_values` and `widgets_values_named`, and converted group nodes. It **preserves every unknown field** and writes minimal diffs. Types come from vendored copies of the frontend's Zod schemas translated into Rust types with an extras map, and are tested against a corpus of real workflows.
+- **IMG-122** [M1b] Seeds follow each node's "control after generate" setting (randomize/increment applied before each run), so running again doesn't just hit ComfyUI's cache.
+- **IMG-123** [M1b] (contract) The suite's UI → API conversion replicates the official frontend: skip muted nodes, route through bypassed nodes by type, push primitive/reroute values, flatten subgraphs with ids like `3:12:7`, wrap array values, add `_meta`, and embed the UI workflow in outputs. Golden tests compare it against the pinned frontend package (§6).
+- **IMG-124** [M1b] Workflows using frontend-only extension nodes (e.g. Set/Get nodes, some widget packs) or dynamic inputs are detected; those nodes are read-only in the Graph tab, and the workflow is converted by ComfyUI's own frontend (`graphToPrompt`) in a hidden page with its **own off-the-record profile**. If M0 (IMG-159) shows the hidden page changes your ComfyUI tab's state (the frontend persists open workflows, partly in ComfyUI's server-side user settings), the fallback is "Run in ComfyUI tab". (M0 result, 2026-10-12: the hidden off-the-record page is safe: 10 conversions left ComfyUI's `user\` folder identical, because in frontend 1.53.10 the open-tab state lives in browser storage, not on the server. **The "Run in ComfyUI tab" fallback is not needed.** Caveat: on a ComfyUI that has never been opened, the first frontend boot (hidden or not) writes the three first-visit settings keys `Comfy.InstalledVersion`, `Comfy.TutorialCompleted` and `Comfy.Templates.SortBy`, like any first browser visit, and nothing else. Conversion: `app.loadGraphData(graph, true, false, null, {skipAssetScans: true, silentAssetErrors: true, deferWarnings: true})`, then `(await app.graphToPrompt()).output`, which equalled Export (API) after key sorting. Each conversion leaves a temporary tab in the hidden page, so close or reuse it. `docs/spikes/06-webengine-comfyui.md` §7.)
+- **IMG-125** [M1b] Every `SaveImage`-type output becomes a file in the run, with its role taken from the node title; temporary `PreviewImage` outputs are shown but not kept. Runs from the Graph tab go through `image.workflow.run`; the run goes to proposals or an asset according to the destination setting (IMG-085).
+
+Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5.8) and imported from there.
+
+### 5.8 ComfyUI tab — embedded web UI
+
+- **IMG-126** [M1a] (invariant) The ComfyUI tab is a QtWebEngine view loading ComfyUI from **its own origin** (`http://127.0.0.1:8188`) in a named persistent profile. Popups are handled, navigation is pinned to that origin, **downloads are blocked** (no file is saved from the page; use the suite's export), and there is no bridge from the page into the suite. The WebEngine is loaded only on first show of the tab.
+- **IMG-127** [M1a] **Open in ComfyUI** loads a workflow by calling the frontend's graph-loading function through `runJavaScript`, passing the graph as base64 decoded inside the page (no script injection), into a new workflow tab where possible (IMG-159). The call is async, so it reports success or failure through a page flag the suite polls. (M0 result, 2026-10-12: with frontend 1.53.10 the call is `await window.app.loadGraphData(graph, true, true, null, {openSource: 'worldwright'})`, which opens a new temporary tab ("Unsaved Workflow (n)") and leaves the open tabs alone. The graph is passed as a base64 string literal and decoded in the page (`atob` + strict UTF-8 `TextDecoder` + `JSON.parse`); every argument spliced into the script must fully match a **strictly anchored allowlist** (`\A[A-Za-z0-9+/=:._-]*\z`; a `^…$` pattern let a trailing newline through). The result goes to a page flag (`pending` → `ok` | `error:<msg>`); readiness is `window.app && app.canvas && app.extensionManager.workflow.activeWorkflow`. These are internal frontend APIs, so the suite pins them to frontend **1.53.10** and checks `window.__COMFYUI_FRONTEND_VERSION__` before scripting. `docs/spikes/06-webengine-comfyui.md` §7.)
+- **IMG-128** [M1a] (contract) Graphs opened this way are stamped `extra.worldwright: {source_ref, base_hash}` so they can be matched when they come back.
+- **IMG-129** [M1a] **Send to Worldwright** reads the current graph synchronously (`JSON.stringify(app.graph.serialize())` via `runJavaScript`) and offers **Update source** (hash check against `base_hash`; on conflict keep both) or **Save as new workflow**. (M0 result, 2026-10-12: `JSON.stringify(window.app.graph.serialize())` confirmed; `app.graph` is the root graph, so subgraph definitions are included even while a subgraph is open. **Update source must compare a normalised graph, not raw text**: the frontend adds `properties.proxyWidgetErrorQuarantine` to some nodes on load (seen on the Z-Image template), so a raw hash changes even when you changed nothing. `docs/spikes/06-webengine-comfyui.md` §8.)
+- **IMG-130** [M1b] Send to Worldwright also offers **Run now** (`image.workflow.run` through the suite's conversion, IMG-123). In M1a, workflows run in the ComfyUI tab itself.
+- **IMG-131** [M1a] (invariant) A graph read from the page is untrusted input: it gets a size limit and schema validation, and is wrapped as data whenever an agent sees it.
+- **IMG-132** [M1b] Fallback when page scripting fails: ComfyUI's own saved-workflow store (`/userdata/workflows/…`) is listed in the Graph tab.
+- **IMG-133** [M1a] Jobs run from the ComfyUI tab are observed by the core (§2.8) and their outputs can be imported.
+- **IMG-134** [M1a] Comfy account (paid partner nodes): the API key is set in the suite's settings and kept in Credential Manager; the core injects it per request (§2.6), and its spend is tracked like any external service. A key typed into the embedded UI itself is stored in its web profile, outside Credential Manager — the suite tells you so.
+
+### 5.9 Outputs
+
+- **IMG-135** [M1a] **Save** (the document, §3.5), **Make candidate** (flatten → asset candidate run, §3.5) and **Copy / drag** (§3.4).
+- **IMG-136** [M1a] **Export** to PNG, JPEG and WebP.
+- **IMG-137** [M1b] **Export** to TIFF 16-bit and OpenRaster (ORA, with a loss warning).
+- **IMG-138** [M1] (decision) ORA is import/export only; the Worldwright document is the canvas format.
+- **IMG-139** [M1a] Embedding the workflow in exports is off by default for documents (a multi-step document's single workflow would misrepresent it) and on by default for direct workflow outputs; an option embeds the document's recipe chain instead.
+- **IMG-140** [M1a] (contract) Every staged result and candidate records its recipe: profile (with content hash), model hashes, LoRAs, seed, prompt, frame and generation size, infill and mask settings, inputs (saved as files) and environment.
+
+### 5.10 Agents in the Image studio
+
+- **IMG-141** [M1a] Everything above is a core tool (§2.11), so the assistant and Claude Code can do it. Agent `doc.*` calls on a document open in the Image studio are forwarded to the app and applied there from M1 (§3.5, §4).
+- **IMG-142** [M1a] (contract) Generation tools `image.generate`, `image.regenerate` (variations, IMG-075), `image.inpaint`, `image.outpaint`, `image.select_object`, `image.preprocess` and `image.cutout` (IMG-073) take a **`target`** (`doc:<id>` + frame, or an asset) and a **`destination`** (proposals / asset / both), plus the settings the Generate panel has: generation size, references, LoRAs, infill, mask grow/blur, edge-coherence, edit compositing mode, profile.
+- **IMG-143** [M1b] (contract) `image.edit` (instruction edit, IMG-071), `image.upscale` (IMG-074) and `image.workflow.run` (a saved, sent or layer workflow: IMG-077, IMG-125, IMG-130) take the same `target` / `destination` / settings shape; they arrive with their operations.
+- **IMG-144** [M1a] (contract) Document tools: `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.layer.*` (add, properties, reorder, merge, delete — `doc.layer.add` is the only layer-adding tool), `doc.references.*`, `doc.proposals.list / accept / discard`, `doc.export`, `doc.make_candidate`; and the read tools `doc.list_open` and `doc.get_snapshot`.
+- **IMG-145** [M1a] (invariant) Each document tool call is applied to an open document as one undoable step, or by the core on a closed document under the core's own hold.
+- **IMG-146** [M1a] (invariant) All of these tools except the read-only `doc.list_open`, `doc.get_snapshot` and `doc.proposals.list` (effect class `read`) are effect class `write`: deleting layers and discarding proposals are undoable inside the document. None of them is `destructive`; that class covers deletes outside a document's undo (such as `resource.delete` and trash purges) and the other cases in §2.7 (CORE-108).
+- **IMG-147** [M1a] (contract) Results are JSON text that includes the file paths of rendered PNGs of the frame and of the proposals, so the agent can see what it did, and the hand-off block lists proposal refs (IMG-089). `structuredContent` / `resource_link` are optional extras (§4.7).
+
+### 5.11 Milestone scope
+
+- **IMG-148** [M1a] (decision) **M1a — first usable studio:**
+  - canvas core: GPU tiled canvas on D3D11 with the store-only rules, CPU reference compositor, undo/history, colour-managed display, round brush/eraser, fill, transform, crop, picker, destructive blur/sharpen/noise, canvas resize;
+  - layers: raster, group, adjustment (levels, curves, hue/saturation, brightness/contrast), control, inpaint mask, the generation-enabled flag;
+  - selections including select object, select subject/background and refine edge; remove background;
+  - swatches/palettes and prompt/style presets;
+  - the **Z-Image adapter** (t2i, img2img, inpaint, outpaint, control once the ControlNet is installed);
+  - frame with generation-size scaling, automatic mode selection, infill, paste-back with mask blur and edge-coherence;
+  - proposals with the full staging bar, destination routing and variations;
+  - the suite-held priority queue;
+  - model profiles with capability states, the download/relink flow and basic LoRAs;
+  - the ComfyUI tab;
+  - PNG/JPEG/WebP export;
+  - agent tools for all of the above.
+- **IMG-149** [M1b] (decision) **M1b — completes the studio:**
+  - Qwen-Image-2.1 and FLUX.2 klein adapters (instruction edit, references, transparent output);
+  - the Graph tab (view, widget tweaks, mute/bypass, slots, run with its own UI → API conversion), plus **Run now** from Send to Worldwright and the saved-workflow fallback list;
+  - workflow-on-layer;
+  - LoRA base-family detection;
+  - enhance layer / upscale image / upscale document with SeedVR2;
+  - TIFF 16-bit and ORA export;
+  - ~~the D3D12 path, if M0 favours it~~ (dropped: M0 did not favour it, so IMG-033 is withdrawn; M0 result, 2026-10-12).
+- **IMG-150** [M1.5] (decision) **M1.5:** regional prompts; adding nodes and editing connections in the Graph tab; magic wand, textured tips, rotate view, gradient; colour balance, invert, threshold adjustments; named layout presets (§3); hosted image providers (§4.4).
+- **IMG-151** [Later] **Later:** layer decomposition, text and vector layers, MyPaint-style brushes, 16-bit/float documents, HDR documents, LaMa infill, virtual-file drops.
+
+**M0 spike items for the Image studio** (each must be measured or proven before the M1 work that depends on it):
+
+- **IMG-152** [M0] Compute compositing on D3D11 (store-only writes, multi-pass groups, separate mip textures) and on D3D12; the result decides whether the D3D12 path (IMG-033) is built. (M0 result, 2026-10-12: PASS on D3D11: store-only compute compositing (sampled-only layer tiles through the slot table, an isolated group through an RGBA32F intermediate, curves as a lookup texture, separate mip textures, no sRGB flag) matched the CPU reference within 1/255, with no debug-layer hazard message, and 10 renderer recreations each rebuilt a matching view. D3D12 passed the same checks, but the D3D12 path is not built (IMG-033 withdrawn). `docs/spikes/03-canvas-compositing.md`, `04-frametimes.md`.)
+- **IMG-153** [M0] Canvas frame times while ComfyUI saturates the GPU. (M0 result, 2026-10-12: smooth on D3D11 with the render-thread pan (20 layers, 8192², 240 Hz): frame-time p99 6.8 ms idle and 11.4 ms while ComfyUI ran Z-Image prompts back to back; GUI-thread stall p99 6.3 ms under load (n = 3). User input was recorded during every final run. A pan driven from the GUI thread fails APP-135 (see there). `docs/spikes/04-frametimes.md`.)
+- **IMG-154** [Later] *On hold with IMG-046.* Tablet pressure through the window event filter (IMG-046).
+- **IMG-155** [M0] VRAM fit of Z-Image bf16 vs int8 + lite ControlNet with the canvas and WebEngine running; decides the Z-Image default (IMG-111). (M0 result, 2026-10-12: decided IMG-111 (int8 + lite ControlNet), but the pre-registered peak and log criteria don't discriminate under ComfyUI's dynamic VRAM; a re-measurement needs a dynamic-VRAM-aware signal (e.g. ComfyUI's PDH Shared Usage staying at its idle level, plus the time check) or `--disable-dynamic-vram`. `docs/spikes/08-comfy-measurements.md`.)
+- **IMG-156** [M0] Model-switch timing Z-Image ↔ Qwen (the 1–3 s estimate is unverified) and ComfyUI's "model reloads every run" bugs, including with symlinked model folders.
+- **IMG-157** [M0] Whether LoRAs apply correctly and quickly on int8 and w4a8 weights; decides each profile's LoRA capability flag (IMG-107). (M0 result, 2026-10-12: int8 LoRA flag `supported`; see IMG-107. `docs/spikes/08-comfy-measurements.md`.)
+- **IMG-158** [M0] SAM 3.1 latency through ComfyUI for select object. (M0 result, 2026-10-12: select object: warm (≈ 0.5 s, SAM already loaded) and after-generation (≈ 1.2–1.3 s, SAM reloads) are under the 1.5 s warm-p50 target; first use took 1.3–2.2 s. With ComfyUI's default cache, **SAM evicts Z-Image**, so the next generation reloads it, adding about 2–3.5 s. Suggested status-bar copy: "Selecting '<prompt>'…" with no time estimate, and "Loading model…" for the reload. `docs/spikes/08-comfy-measurements.md` §5.5.)
+- **IMG-159** [M0] `loadGraphData` / `serialize` / `graphToPrompt` in QtWebEngine; loading into a new workflow tab; and whether the hidden conversion page changes ComfyUI's saved state (decides IMG-124's fallback). (M0 result, 2026-10-12: PASS, all seven criteria; it decides IMG-124 (no fallback needed), IMG-127 and IMG-129. `docs/spikes/06-webengine-comfyui.md`.)
+- **IMG-160** [M0] Previews with the tiny decoders, including which decoder Z-Image uses. (M0 result, 2026-10-12: Z-Image uses TAEF1, and only with `preview_method: "taesd"`; `"auto"` maps to Latent2RGB. 8 frames per 8-step run, 512 × 512 JPEG. See IMG-045. `docs/spikes/08-comfy-measurements.md`.)
+
+---
+
+## 6. Errors, testing and quality
+
+AI agents write most of the code, working on your PC in your account; you test milestone builds and steer. Quality therefore has to come from the process, not from line-by-line code review. This section defines how results and errors are shaped, the rules that keep AI-written code and tests honest, how tests stay away from your real setup, the test layers, CI, and what each milestone build delivers.
+
+### 6.1 Results and errors
+
+- **QA-001** [M1] (contract) Every tool/RPC result is exactly one of `ok`, `pending_confirmation {confirmation_id, retry_token, expires_at, covers: [confirm, cap]}`, or `error`.
+  - The name `pending_confirmation` avoids a clash with document holds.
+- **QA-002** [M1] (contract) `pending_confirmation` is not an error. Agents receive it as a normal result:
+  - MCP: a non-error result whose JSON has `"status": "pending_confirmation"`, the retry token, and a plain sentence ("waiting for you to confirm in Worldwright; continue with other steps and check back");
+  - Engine B: a non-error `tool_result` with the same JSON.
+  - Directors continue with other steps while a confirmation is pending (§4.6).
+- **QA-003** [M1] (contract) Errors are defined in `ww-protocol` and carry:
+  - `code` — stable and namespaced;
+  - `category` — one of `user_fixable`, `transient`, `external_down`, `declined` (denied by you or by a preset), `data_conflict`, `cancelled`, `bug`;
+  - a short message and optional detail; raw engine/provider text in the detail is wrapped as untrusted data whenever an agent sees it;
+  - a **fix** in two forms: a UI action (e.g. "Start ComfyUI", "Download model", "Sign in to Claude Code", "Keep both") and an agent hint (a tool name plus arguments);
+  - the trace id;
+  - a retry policy (QA-004).
+- **QA-004** [M1] (contract) Retry policies:
+  - `auto` — the core retries by itself and emits "retrying 2/5" events, so nothing looks hung;
+  - `same_idempotency_key` — the caller may retry with the same idempotency key;
+  - `after_resolve` — retry only after the fix action or your decision (e.g. an `interrupted_unknown` job you've resolved, a model you've downloaded);
+  - `never`.
+- **QA-005** [M1] (contract) Stable error codes include:
+  - confirmations and caps: `confirm.denied`, `confirm.expired`, `confirm.unavailable` and `cap.exceeded` (the last two only when no confirmation can be answered, QA-016);
+  - documents and workspaces: `doc.held_elsewhere`, `store.hash_conflict`, `workspace.required` (no-workspace mode for sign-off, Make candidate, Add to project);
+  - protocol: `protocol.incompatible` (`ww-mcp` then exposes only `ww.status`);
+  - engines: `engine.claude_code.untested_version` (including any version below the minimum 2.1.268), `engine.claude_code.not_signed_in` (retry policy `after_resolve`), `comfyui.unreachable`, `model.missing`;
+  - providers: `provider.rate_limited`, `provider.spend_limit` (retry policy `never`).
+- **QA-006** [M1] (contract) Plan limits and sign-in failures of Claude Code:
+  - `quota.plan_limit` is an error for co-pilot calls; for director tasks it is the `waiting_quota` substatus, not an error.
+  - An expired Claude Code login (one that can no longer be refreshed): co-pilot calls fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, fix "Sign in to Claude Code"); director tasks go to the `waiting_auth` substatus (§4.6a), distinct from `waiting_quota` and never retried automatically.
+- **QA-007** [M1] (invariant) Jobs with external side effects (hosted media, paid partner nodes) are retried automatically only when the request provably wasn't processed (connection failure, a 429/503 before acceptance) or the provider honours idempotency keys. Otherwise the job becomes `interrupted_unknown` (retry policy `after_resolve`). `interrupted_unknown` is used only for jobs stuck in `submitting` without an external id (§2.8).
+- **QA-008** [M1] Inline metered calls (LLM requests, assistant turns, vision QA) may be retried and may use refusal fallback or fallback chains; every attempt is metered.
+- **QA-009** [M1] (invariant) Local ComfyUI jobs: if ComfyUI restarts mid-job, a known `prompt_id` that is no longer present is provably gone, so the job becomes `interrupted`. Outputs already written are salvaged by the job's unique filename prefix. Re-running is your choice (automatic for agent batches).
+  - This covers a ComfyUI restart while the core keeps running. After a **core** restart nothing is re-run automatically (§1).
+- **QA-010** [M1] (contract) Lowering to agents: MCP tool failures are results with `isError: true` and JSON text; JSON-RPC errors are used only for protocol faults. Engine B lowers failures to a `tool_result` with `is_error`. For every result, JSON text plus file paths are primary; `structuredContent` and `resource_link` are optional extras that no agent may need.
+- **QA-011** [M1] (invariant) Never lose data: unsaved documents always have their recovery file; failed jobs keep their inputs and any outputs already downloaded; failed writes never leave half-written files (§1.5).
+- **QA-012** [M1] (invariant) Core panics are caught at task boundaries (that job or tool fails with category `bug`). A panic in `store` or `state` stops the core cleanly, and apps show the reconnect banner.
+- **QA-013** [M1] (invariant) App callbacks catch panics at the cxx-qt boundary; an uncaught Rust panic inside a cxx-qt callback aborts the app. The recovery file is the safety net, tested by deliberately aborting the app mid-autosave.
+- **QA-014** [M1] GPU device loss and renderer recreation are handled (§5.3) and tested.
+- **QA-015** [M1] (invariant) QML runtime warnings fail tests.
+- **QA-016** [M1] (contract) When a call needs a confirmation — an agent safety confirmation or a cap confirmation — it returns `pending_confirmation` whenever that confirmation can be answered: an app is connected or the notification path (§3.3) can reach you. Otherwise it returns an error instead (director tasks excepted: they always get `pending_confirmation` and wait, CORE-114, AI-044):
+  - callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks) always get the error, never `pending_confirmation`;
+  - the error is `cap.exceeded` for a cap and `confirm.unavailable` for a safety confirmation; category `user_fixable`, retry policy `after_resolve` (fix: raise the cap, or run the call where you can confirm it).
+
+### 6.2 Keeping AI-written code honest
+
+- **QA-017** [M1] Interface first. For each feature:
+  1. the tool/event/file interface (`ww-protocol` descriptors and schemas) is agreed as a spec change;
+  2. for the high-risk modules — `store`, `state`, `jobs`, `confirm`, `meter` and document GC — a test-author agent writes scenario tests (`tests/spec/**`) against that interface and the `ww-testkit` API only, without seeing the implementation; they are merged as expected-to-fail and tracked;
+  3. the implementation change makes them pass.
+- **QA-018** [M1] (invariant) Spec tests drive only stable surfaces — tool calls, the `ww` CLI, file formats and events — so internal refactors never touch them.
+- **QA-019** [M1] (invariant) (Amendment A, 2026-10-13: the suite repository is public, so server-side rulesets on GitHub also require the guard's CI checks on `main` and block force-pushes and deletion of `main`. Whether a change touches protected files, and whether it carries the reviewer identity's approval, is still decided by the guard, QA-020 and QA-021.) Protected files are: spec tests, golden files, recorded fixtures, committed property-test seeds, and `test-params.toml` — the one file holding image tolerances, property-test case counts and test timeouts. The merge guard's own files are protected too: the git hook scripts, the sources of `ww dev merge` and the test-diff guard, and the committed list of protected path patterns, which every part of the guard (QA-033–QA-037) reads. (plan 1 clarification: the protected files also include the CI workflows that enforce the guard, `.github/workflows/ci-guard.yml` and `.github/workflows/post-merge.yml`. The committed pattern list lives in `dev/protected-paths.txt`, and `dev/merge-guard.toml` is protected too. `.config/nextest.toml` is protected as well: it defines the `spec` profile that `ww dev spec-tests` runs, and a `default-filter`, retry count or timeout there could silently drop a failing spec test.) (plan 1, R18: they control how the hooks run) The files that decide how the hooks' `cargo run` builds and runs `ww` are protected too: `.cargo/**`, the root `Cargo.toml`, `crates/ww-cli/Cargo.toml`, `crates/ww-cli/build.rs`, `crates/ww-cli/src/main.rs`, `rust-toolchain.toml` and `.gitattributes`. (`Cargo.lock` is not: it changes with every dependency update.) (plan 1, R21) Every file under `.github/workflows/` is protected, not just `ci-guard.yml` and `post-merge.yml`: the protected-test check runs on `pull_request`, so a PR could edit a workflow, or add one that posts a check run with the same name. (plan 1, R28) `.claude/**` is protected too: the repo's Claude Code project settings decide which commands agents are denied (QA-036).
+- **QA-020** [M1] (invariant) A change that **modifies or deletes** a protected file may reach `main` only with an approving GitHub review, on the change's exact head commit, from a **separate reviewer identity**: a second GitHub account (a collaborator on the repository) or a GitHub App that implementing agents can't act as. **Adding** tests, new fixture versions or new seeds is always allowed. (plan 1, R26: additions are free only in the test homes, the patterns marked `add-ok:` in `dev/protected-paths.txt`: `crates/ww-spec-tests/**` and `**/proptest-regressions/**`. Adding a file under any other protected pattern, such as a new workflow, hook or `.cargo` config, needs the same approval as modifying one.) (owner decision 2026-10-13: the second-account option is not used; the GitHub App is the reviewer identity. The separate reviewer identity is a **GitHub App** named `worldwright-reviewer`, installed on the repo with *Pull requests: write* and *Contents: read*. Approvals are posted only by `ww dev approve <PR>`, which needs the owner's passphrase for the App key (`%USERPROFILE%\.worldwright\reviewer\app-key.age`), typed interactively. An approval counts only when it is the App bot's `APPROVED` review on the PR's exact head commit.)
+  - (Amendment A, 2026-10-13) The suite repository is public. Server-side rulesets require the guard's CI checks (including the protected-test check, QA-021) on `main` and block force-pushes and deletion of `main`. The approval itself is still decided by the guard: QA-033–QA-036 enforce this rule locally, and in CI before and after the merge.
+- **QA-021** [M1] The **test-diff guard** (a script run by CI, `ww dev merge` and the git hooks) compares a change with `main`. It has two parts:
+  - **Blocking — the protected-test check.** It fails when a protected file is modified or deleted without the QA-020 approval, or when a protected test (spec or golden) fails on that commit, other than the expected-to-fail spec tests tracked under QA-017. CI runs these tests itself; `ww dev merge` and the hooks read CI's results for that exact commit, and a commit with no CI results fails the check.
+  - **Warnings** on removed or ignored tests, new sleeps/retries and new lint suppressions, listed in plain language in the milestone report.
+  - (plan 1 clarification: the protected tests are the `ww-spec-tests` crate. Expected-to-fail spec tests are listed in `crates/ww-spec-tests/expected-fail.toml`. A change may remove entries freely. It may add an entry only for a test file the same change adds; any other addition needs the QA-020 approval.)
+- **QA-022** [M1] Mutation testing with `cargo-mutants` runs at each milestone on `store`, `state`, `jobs` and `meter`.
+- **QA-023** [M1] Adversarial review by counterexample: for changes to `store`, `state`, `jobs`, the dispatcher, identity/confirmations, caps, the Claude Code engine or document GC, a reviewer with a different model or fresh context (not the implementer) must try to write a failing test, not just comment.
+- **QA-024** [M1] (invariant) `ww-core` has a per-crate `clippy.toml` that disallows file write, rename and remove APIs, with a single allowance inside `store`.
+- **QA-025** [M1] (invariant) Money is a `Money(i64 micro-units)` newtype with no float constructors.
+- **QA-026** [M1] (invariant) The blocking APIs of `ww-client` assert in debug builds that they are not called on the GUI thread.
+- **QA-027** [M1] (invariant) A dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, keeps `ww-schema` and `ww-protocol` free of Qt and Windows dependencies. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test rather than `cargo-deny` bans.)
+- **QA-028** [M1] Spec ↔ code traceability: this spec is the single source of rules. Each rule ID is classified *test*, *lint*, *manual* or *n/a*; tests cite the rule IDs they check (e.g. `// spec: QA-020`). At each milestone a report lists *test*-classified rules without tests and tests citing rule IDs that no longer exist.
+- **QA-029** [M1] (invariant) Spec changes land in their own change, before the code that depends on them.
+- **QA-030** [M1] Flaky tests: `cargo-nextest` runs each test in its own process with per-test timeouts and one retry, reporting flakes rather than hiding them; Qt/QML suites use CTest's repeat-until-pass with reporting. A test is quarantined only with an issue. The flake rate is in each milestone report.
+- **QA-031** [M1] (invariant) Unit and integration tests use no wall-clock time, randomness or network: they use the injected clock and ids and the fakes in `ww-testkit` (§6.5).
+- **QA-032** [M1] (invariant) Secrets canary: fake secrets (a provider key, a Comfy key, an engine token) are injected under the test credential prefix and searched for in:
+  - logs, the suite-level and per-workspace `state.db`, `telemetry.db`, `queue/jobs.<machine>.<yyyy-mm>.jsonl`, `registry/usage.<machine>.<yyyy-mm>.jsonl`, `usage-loose.jsonl` and diagnostics bundles;
+  - recorded fixtures, the test ComfyUI's history and database, and Claude Code transcripts from fake runs.
+  - None may appear. ComfyUI's own stripping of its sensitive keys is asserted, and `gitleaks` scans the fixtures.
+
+**Merge guard** (QA-020). On the public repository, server-side rulesets require the guard's CI checks and block force-pushes and deletion of `main`; the protected-file approval is decided by the guard itself, which runs before the merge on your PC and again in CI after it. A local guard can be bypassed (`--no-verify`, a direct API call), which is why the rulesets and the CI check after the merge exist.
+
+- **QA-033** [M1] (contract) **`ww dev merge <PR>`** is the merge command for the suite repo. It merges only when all of these hold for the PR's current head commit:
+  1. the every-push and PR-ready CI tiers (QA-070, QA-071) are green on that commit;
+  2. the protected-test check (QA-021) passes for that commit against `main` — including the reviewer identity's approval of that exact commit when protected files are modified or deleted;
+  3. the merge is made through GitHub's merge API pinned to the checked head commit, so a push after the check makes the merge fail instead of slipping in.
+  - On refusal it says which condition failed, in plain language.
+- **QA-034** [M1] (invariant) **Git hooks** in the suite repo — `pre-merge-commit` and `pre-push` — run the protected-test check and refuse a local merge into `main`, or any push to `main` (fast-forwards included), whose changes would fail it. `ww dev merge` refuses to run when the hooks aren't installed.
+- **QA-035** [M1] (invariant) **CI after every merge:** every push to `main` re-runs the protected-test check over the pushed range, plus the every-push tier. If anything slipped through — a protected test fails, or a protected file changed without an approved PR — CI opens a revert PR for the offending commits and an issue assigned to you, so GitHub notifies you. The milestone report lists every such event in plain language.
+- **QA-036** [M1] (invariant) **Agents merge only through `ww dev merge`.** The suite repo's Claude Code project settings deny direct pushes to `main`, `--no-verify`, `gh pr merge` and direct merge API calls; these patterns are part of the hook-pattern tests (QA-061). Pattern rules have known gaps; QA-034 and QA-035 back them up.
+- **QA-037** [M1] (decision) **Server-side enforcement:** the repository is public, so the same checks are required status checks in a ruleset on `main`, which also blocks force-pushes and deletion (Amendment A, 2026-10-13). A later option is a `CODEOWNERS` file, generated from the protected path list, naming the reviewer identity as a required reviewer. That is a configuration change, not a redesign; `ww dev merge`, the hooks and the post-merge check stay.
+
+### 6.3 Test isolation on your machine
+
+Agents build and test on your PC in your account, so tests must never touch your real setup.
+
+- **QA-038** [M1] (contract) One injectable **environment provider**, keyed by channel, supplies everything machine-specific; code never reads `%APPDATA%`, known folders or similar directly. It covers:
+  - paths (data folders, workspaces, logs, per-workspace local data — under `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\`, or `<volume>:\.worldwright-local\<hash>\` when the workspace is on another volume);
+  - the registry root (`HKCU\Software\Worldwright-test-<id>` in tests);
+  - the Credential Manager prefix (`Worldwright-test-<id>/…` in tests);
+  - pipe names and the notification identity;
+  - Claude Code profile folders (§4.6a), including the default `%USERPROFILE%\.claude`;
+  - backup destinations, rclone configs, Task Scheduler tasks, SSH keys and restic repositories (§7.4).
+  - (plan 1 clarification: **naming contract**, which other plans and CI depend on, shared with ARCH-095.)
+    - Channels are `stable`, `dev` or `test-<id>`. The pipe name is `\\.\pipe\worldwright-core-<userSID>-<channel>` (ARCH-024).
+    - Data folders: channel `stable` uses `%APPDATA%\Worldwright` and `%LOCALAPPDATA%\Worldwright`. Every other channel appends `-<channel>`, e.g. `%APPDATA%\Worldwright-dev`.
+    - Registry root: `HKCU\Software\Worldwright` for stable, `HKCU\Software\Worldwright-<channel>` otherwise. Tests use `HKCU\Software\Worldwright-test-<id>`.
+    - Credential prefix: `Worldwright/` for stable, `Worldwright-<channel>/` otherwise.
+    - Notification AUMID: `Worldwright.Suite.<Channel>`.
+    - Workspace hash `<hash>`: the first **16 lowercase hex chars of SHA-256** over the canonical workspace path. Canonical means: `std::fs::canonicalize`, `\\?\` stripped, ASCII-lowercased, using `\` separators.
+- **QA-039** [M1] (contract) The fake `claude` honours `CLAUDE_CONFIG_DIR`, so profile behaviour is tested against environment-provider folders only.
+- **QA-040** [M1] (invariant) Harness guard: test builds panic if any path, registry key or credential target resolves to your real Worldwright locations (`%APPDATA%\Worldwright`, `%LOCALAPPDATA%\Worldwright`, any `<volume>:\.worldwright-local`, `HKCU\Software\Worldwright`, the real credential prefix), a registered workspace, or a real Claude Code profile folder.
+- **QA-041** [M1] (invariant) Automated tests never reach the real OneDrive, Hetzner, B2 or other destinations, your Task Scheduler, or your real Claude Code profiles. The only exceptions are the on-demand runs you start or confirm (QA-063, QA-065).
+- **QA-042** [M1] (invariant) Desktop-touching tests (clipboard, drag, notifications, file associations, the `ww:` protocol) run as a serialised group **only in CI or Windows Sandbox**, never in your desktop session.
+  - Windows Sandbox is optional: enabling the Windows feature is a one-time admin step. Without it, these tests run in CI only, and the milestone report lists the Sandbox runs (QA-059, QA-060, QA-073) as not run.
+
+### 6.4 Test layers
+
+Each layer states what it covers and when it runs. "Every push", "PR-ready", "nightly" and "milestones/releases" are the CI tiers in §6.6.
+
+- **QA-043** [M1] **Unit** (every push): graph/staleness, settings cascade, price rules, version allocation, mode detection, infill, paste-back, mask math, chunk encoding, quirk mapping, idempotency, error lowering, handshake/version rules.
+- **QA-044** [M1] **Property / model-based** (every push; `proptest`, `proptest-state-machine`): round-trips of manifests, workflows, documents and `.wwdoc`.
+- **QA-045** [M1] (invariant) **Document GC** property tests (every push): random saves, snapshots, open save handles and copies interleaved with GC. Must hold:
+  - nothing reachable from a root is ever deleted;
+  - the 24 h grace period holds;
+  - accept-then-discard keeps the accepted pixels;
+  - proposals are purged 14 days after resolution;
+  - `source/` is copied at Make candidate and moved at sign-off;
+  - hard-linked snapshot chunks are never mutated in place.
+- **QA-046** [M1] (invariant) **Outside writers vs the reconciler** — two variants:
+  - a simulated-filesystem variant (shrinkable), every push;
+  - a real-NTFS variant (PR-ready) that uses a watcher fence (a sentinel file plus `watch.fence()`) so the test knows when the watcher has caught up.
+  - Scenarios: Claude Code edits including partial manifest edits, deletes, renames, git checkout/stash of many files with watcher overflow, LFS pointers, an edit between hash check and replace.
+  - Must hold: no outside edit is ever overwritten; invalid manifests are marked, not rewritten; the index converges; no orphan is deleted; writes wait for `.git/index.lock`.
+- **QA-047** [M1] **Concurrency** (every push): multi-threaded stress of cap reserve/settle against real SQLite (`BEGIN IMMEDIATE`) in the suite-level `state.db`, including calls made with no workspace; crash mid-reservation; month boundary and DST resets.
+- **QA-048** [M1] **Golden / corpus** (every push):
+  - manifest round-trip on real workspace files, including the lantern manifest;
+  - chunk hashes stable across zstd levels and versions;
+  - CPU compositor references (GPU output is compared with the CPU reference rather than with screenshots);
+  - provider usage/cost parsing;
+  - stream-json fixtures per tested Claude Code version.
+- **QA-049** [M1b] **Golden: ComfyUI UI→API conversion** (every push) compared with the official frontend's conversion, using the pinned `comfyui-frontend-package`; re-run whenever ComfyUI or its frontend changes.
+- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.wwdoc` readers, stream-json, SSE, `ww:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
+- **QA-051** [M1] (invariant) **Integration — ComfyUI queue ownership** (in-process core with fakes, every push):
+  - at most one pending prompt per lane in ComfyUI; priority classes; FIFO within a class;
+  - outside jobs are observed and never cancelled;
+  - cancel only through the per-job endpoint (the fake fails on a bare `/interrupt`);
+  - ComfyUI restart mid-job → `interrupted` with salvage (QA-009);
+  - no duplicate prompt ids;
+  - hash-named uploads are reference-counted.
+- **QA-052** [M1] (invariant) **Integration — documents** (every push): `.wwdoc` round-trip; Add to project moving proposals; save conflict → keep both; holds re-acquired after a core restart; proposal anchoring warning; director proposals written into a closed document; `git clean -X` on `work/` → restore from snapshots.
+- **QA-053** [M1] (invariant) **Claude Code engine contract** (every push), using the fake `claude`, which records its arguments and environment. Fails if:
+  - the environment is not a subset of the §4.6 allowlist;
+  - the engine token appears in `claude`'s environment;
+  - a flag required for the tested version by `claude_code.yaml` is missing;
+  - the generated MCP config file still exists after `system/init`;
+  - a `claude` older than the minimum 2.1.268 is launched instead of failing with `engine.claude_code.untested_version`;
+  - "Open in Claude desktop" is offered below Claude Code 2.1.285 (it must be hidden).
+  - It also scripts: interrupt (with and without the capability); rate limit → `waiting_quota` with no unattended usage-credit spend; resume after a kill mid-tool (tool-use-id idempotency); unknown stream events tolerated.
+  - Identity negatives: a forged or reused token, or a token whose `claude` process has ended, is **invalid**, and calls with it are refused (not downgraded to `cli`, ARCH-048, ARCH-050); `cli` and `mcp` callers can't answer confirmations; `confirm: true` in arguments is ignored.
+- **QA-054** [M1] (invariant) **Claude Code profiles** in the engine contract (every push):
+  - the `CLAUDE_CONFIG_DIR` allowlist entry (§4.6): set to the profile's folder for extra profiles and absent for the default profile;
+  - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_PROFILE` and `CLAUDE_CODE_USE_*` are never passed;
+  - the generated MCP config passes `WW_PROFILE=<id>` to `ww-mcp`, and `ww-mcp` sends that profile id in `core/hello`;
+  - the per-profile lock: `auth status` runs only when the profile has no active suite session; a busy profile launches only with a verification younger than 30 minutes and a matching `initialize` account, otherwise it waits; launches within one profile are serialised;
+  - an auth failure (the "Login expired" error, HTTP 401 or `authMethod: "none"`) → `waiting_auth` for director tasks, never retried; a co-pilot call → `engine.claude_code.not_signed_in` (QA-006);
+  - the suite never chooses or changes a task's profile by itself; a `waiting_quota` task offers only wait, the API engine or a local model.
+- **QA-055** [M1] **Crash and recovery** (fast subset every push, full suite nightly): fail points at every step of the write order and job submission; corrupt or missing databases (`index.db`, the suite-level and per-workspace `state.db`, `telemetry.db`); torn log lines; disk full; held handles (Defender-style); app abort mid-autosave → recovery offered.
+- **QA-056** [M1] **End-to-end through `ww`** (PR-ready): the real core over the real pipe on the test channel — the `core/hello` handshake for every caller kind, multiple clients, events and resubscribe, confirmations, caps (including `ww --non-interactive` getting `cap.exceeded` / `confirm.unavailable`, QA-016), identity.
+- **QA-057** [M1] **UI** (PR-ready): QtQuickTest for `ww-ui-kit` and the Image studio with the default Direct3D 11 renderer on a software adapter (`QSG_RHI_BACKEND=d3d11`, `QSG_RHI_PREFER_SOFTWARE_RENDERER=1`). The test asserts which adapter it got and logs the session. If hosted runners can't create swap chains, the UI tests fall back to offscreen `QQuickRenderControl`.
+  - The pure `software` scene-graph adaptation can't run `QQuickRhiItem`; it is used only to test the slow-renderer banner.
+- **QA-058** [M1] (invariant) A static check on compiled shader reflection data verifies that no dispatch reads and writes the same image (passing on WARP doesn't prove the D3D11 rules).
+- **QA-059** [M1] **Web view** (PR-ready, CI only; Windows Sandbox at milestones): navigation off the ComfyUI origin blocked; downloads blocked; no web channel; popups handled; base64 graph load survives hostile graph names (against the pinned frontend served by the fake ComfyUI); "Send to Worldwright" size limit and schema validation; no WebEngine DLLs loaded before the ComfyUI panel is first shown (checked in the process module list).
+- **QA-060** [M1] **Clipboard, drag and first run** (PR-ready, CI only, serialised group; Windows Sandbox at milestones):
+  - clipboard: formats offered and exact PNG bytes read back through OLE, no text by default; drop effect Copy only; lazy exports never evicted while on the clipboard;
+  - first run with a fresh profile through the environment provider: no workspace; ComfyUI absent or stopped; models missing → download flow; `claude` missing, older than 2.1.268, or signed out; Git Bash missing; deep-link handler not registered; `ww doctor` is idempotent (a second run changes nothing).
+- **QA-061** [M1] **Plugin hook patterns** (every push): PreToolUse JSON fed to the hook scripts, with a table of Bash/PowerShell commands that must and must not trigger "ask" (this also documents the known limits of pattern-based guards).
+- **QA-062** [M1] **Version skew**: handshake/version unit tests every push. At releases, the full matrix against the previous release (kept as GitHub Release assets, not CI artifacts): old app ↔ new core and new app ↔ old core; a stale per-user `ww-mcp.exe` vs a newer core; plugin vs suite version; `state.db` migrations from each earlier release; an older core **refuses** a newer `state.db`. The full suite runs on any Qt or cxx-qt upgrade.
+- **QA-063** [M1] (decision) **Real engines, on demand only**: `ww test --real`, run by you or by an agent in your session before milestones or when a ComfyUI or model change warrants it. Never on a schedule; there is no self-hosted runner.
+  - It uses an isolated ComfyUI test instance: port 8189, temporary base and user directories, in-memory database, your models and custom nodes through an extra-model-paths file; started only when your own ComfyUI is idle, so tests never touch its saved state or VRAM while you work.
+  - It covers the real GPU canvas and runs the **same scenario suite as the fake ComfyUI**, so the fake can't drift.
+- **QA-064** [M1] **Manual milestone checks**: hardware UI, paste into Explorer/Discord/Chromium, cold start after a reboot and after a Defender first scan, and performance numbers against the absolute targets in other sections (pass/fail in the milestone report).
+- **QA-065** [M1] (invariant) **Real Claude Code smoke** (`ww doctor --claude-smoke`): a cheap model with `--max-turns 2` against a fixture tool checks `authMethod: "claude.ai"`, `apiKeySource: "none"`, no user MCP servers or plugin hooks loaded, and writes to `assets/**` denied.
+  - It runs **only when you confirm**, because it uses plan quota; after a Claude Code version change Doctor *offers* it. It never runs in CI or on a schedule.
+  - It runs under the profile you pick (default: the default profile).
+
+### 6.5 Test infrastructure
+
+- **QA-066** [M1] (contract) `ww-testkit` provides:
+  - fixture workspaces (including the real lantern manifest);
+  - a scriptable fake ComfyUI (HTTP + websocket: progress, previews, errors, slow jobs, restarts, outside jobs) that also serves the pinned frontend package for web-view tests;
+  - fake providers (recorded fixtures, injected failures);
+  - a fake `claude` (stream-json, permission prompts, rate-limit events; records arguments and environment; honours `CLAUDE_CONFIG_DIR`);
+  - a git-ops simulator and a handle-holding helper;
+  - fail points, compiled only into test builds;
+  - the watcher fence;
+  - injected clock and ids, per-test pipe channels, and the environment provider (§6.3).
+- **QA-067** [M1] Recorded fixtures are captured from real runs by a manual job routed through the suite's own caps (with a per-call maximum), only for providers you use, with secrets scrubbed, and versioned. A drift comparison checks new captures against old ones, including ComfyUI's websocket, `/api/jobs` and `/history` shapes.
+- **QA-068** [M1] Qt-free crates (`ww-schema`, `ww-protocol`, `ww-core`, the parser crate) run under `cargo nextest`; `ww-qt` and QML tests run through CTest.
+
+### 6.6 CI
+
+- **QA-069** [M1] (decision) CI runs on **GitHub-hosted runners only** — Windows, plus Linux for libFuzzer runs. The suite repository is public, so hosted runner minutes are free and there is no minute budget (QA-075; Amendment A, 2026-10-13). There is no self-hosted runner; real-engine and GPU tests run on demand (QA-063), not in CI.
+- **QA-070** [M1] **Every push** (~10–12 min): debug build with `sccache` and cached Qt; `rustfmt`, `clippy -D warnings`, `cargo-deny`; Qt-free `cargo nextest` (unit, property, concurrency, golden, parser targets, integration, engine contract, crash fast subset, hook patterns); the test-diff guard. Workflows use `concurrency: cancel-in-progress`, so superseded pushes stop — except the post-merge check on `main` (QA-035), which runs for every push to `main` and is never cancelled. (Amendment A, 2026-10-13: the repository is public, so every push runs the full tier on GitHub-hosted runners; nothing is trimmed to save minutes.)
+- **QA-071** [M1] **PR ready / merge** (~25–30 min): adds QtQuickTest, the web view / clipboard / drag / first-run serialised group, E2E over the pipe, the real-NTFS reconciler tests, and `cargo-audit`. `ww dev merge` requires this tier green on the PR's head commit (QA-033).
+- **QA-072** [M1] **Nightly** (main only): release build, coverage, full crash suite.
+- **QA-073** [M1] **Releases and milestones**: version-skew matrix, mutation testing, time-boxed libFuzzer, the spec-rule report (QA-028), and the Windows Sandbox guided test.
+- **QA-074** [M1] (contract) **Release job**: `windeployqt` → copy the Visual C++ runtime DLLs, restic and rclone → `vpk pack` → `vpk upload github`. The runner needs the .NET SDK. Packaging, pack ids and channels are defined in §7.5.
+- **QA-075** [M1] **CI minutes:** the suite repository is public, and GitHub-hosted runner minutes are free and unlimited for public repositories, so there is no minute budget and no tier is moved or trimmed to save minutes. (Amendment A, 2026-10-13: this replaces the private-repository estimate of about 2,000–2,500 Windows minutes a month.)
+- **QA-076** [Later] CI minutes appear in the dashboard's usage panel like any other spend.
+- **QA-077** [M1] (invariant) Qt in CI: Qt 6.12 LTS and the Qt WebEngine release matching it (versioned separately; the exact version is pinned in the M0 Qt-stack spike, §1) are pinned as a pair, cached by the exact pair, and a CI check verifies the installed pair matches. (M0 result, 2026-10-12: the pair is **Qt 6.12.0 + Qt WebEngine 6.140.0** (`win64_msvc2022_64`, MSVC 14.44). The CI check must assert WebEngine 6.140.0, because the installer's default pick is an older build (QA-078). `docs/spikes/01-toolchain.md`.)
+- **QA-078** [M0] Decided by the M0 spike: which installer CI uses for the Qt pair — an `aqtinstall` version that includes the Qt 6.12 fix (PR #1048; earlier releases install the wrong Qt WebEngine for 6.12), `naqt`, or Qt's official installer CLI. (M0 result, 2026-10-12: **`naqt`**, pinned by source commit `43da90f1` (or the release zip's sha256, since the `latest` tag rolls), installing with `--extensions qtwebengine@6.140.0`. Without the explicit version naqt picks the older July 2026 WebEngine build, so CI must assert that the installed WebEngine is 6.140.0. `aqtinstall` is not used: PR #1048 is still unmerged and its latest release (3.3.0) lacks the fix; switching back is optional once it merges. The official installer CLI was not needed. `docs/spikes/01-toolchain.md`.)
+- **QA-079** [M1] (invariant) Agents' GitHub tokens have no permission to change workflow files or repository administration settings, and the repository's default workflow token is read-only. The one exception is the post-merge check's job (QA-035), which alone is granted write access to pull requests, issues and contents so it can open the revert PR and the issue. (Amendment A, 2026-10-13: agents use the restricted agent token of QA-087, supplied by the agent-token mechanism of plan 1 Task 13; the earlier waiver is withdrawn.)
+- **QA-086** [M1] (invariant) **Nothing personal in repository files.** The suite repository is public, so every tracked file, path and commit is public. None may contain a Windows user-profile path (write `%USERPROFILE%`), an e-mail address other than a GitHub no-reply address or the `noreply@anthropic.com` co-author trailer, a running-process list, machine-identifying details beyond what a test or measurement needs, or statements about the maintainer's accounts, habits, plans or preferences. Exempt are reserved test and example domains (`*.invalid`, `*.example`, `*.test`, `example.com`, `example.org`, `example.net`), the `git@github.com` SSH remote form, and the test placeholder user names of plan 1 Task 17 (ruling R30). `ww dev privacy-scan` enforces this in the git hooks and in CI (plan 1 Task 17).
+- **QA-087** [M1] (invariant) **Agent token.** Agents reach GitHub only with a fine-grained token limited to the suite repository, with no Administration and no Workflows permission, and with an expiry. It is stored in Windows Credential Manager under `Worldwright-dev/github/agent-token` (set with `ww dev agent-token set`), served to git by the suite's credential helper and to `gh` only in a child process, and never written to the repository, logs or settings files. The maintainer's full-access login is not stored on the machine where agents run.
+
+### 6.7 Milestone builds and your testing
+
+- **QA-080** [M1] Each milestone build ships with: all CI tiers green; the on-demand real-engine run (QA-063); the manual checks (QA-064); a test report (results, known issues, performance vs targets, flake rate, approved test changes in plain language); plain-language release notes; a 10–20 minute guided test script; and one-click problem reports (diagnostics bundle plus your note).
+- **QA-081** [M1] (invariant) Test builds install side by side with your stable build (separate channels and pack ids, §7.5). A test build never migrates your workspace in place: migrations are tested on a copy, and a pre-migration backup must succeed first (§7.4).
+
+### 6.8 Observability
+
+Builds on §1.9.
+
+- **QA-082** [M1] Structured logs carry trace ids across app → core → engines/providers, and are rotated and size-capped.
+- **QA-083** [M1] The Diagnostics panel shows versions, engine and provider health, recent errors grouped by code, telemetry, the queue, Claude Code status (per profile, §4.6a), and a backup status line. In M1 the Backups panel (§7.4) also lives in Diagnostics.
+- **QA-084** [M1] (invariant) The diagnostics bundle — logs, versions, redacted settings, recent errors, a hardware snapshot, and the failing job's recipe — is what you hand to an agent to debug. Secrets, Claude Code profile labels and account emails are redacted from it.
+- **QA-085** [M1] (invariant) Nothing is sent anywhere automatically.
+
+### 6.9 Milestone scope
+
+- **M0:** the Qt / Qt WebEngine installer choice for CI (QA-078).
+- **M1:** everything in §6.1–6.8 except the items below. The web-view tests (QA-059) cover the ComfyUI tab, which lands in M1a.
+- **M1b:** the golden test of the suite's own ComfyUI UI→API conversion (QA-049), which arrives with the Graph tab.
+- **Later:** CI minutes in the dashboard's usage panel (QA-076).
+
+---
+
+## 7. Sync, backup and builds
+
+Code and, optionally, workspace metadata live in GitHub repositories (free): the suite's own repository is public, and a workspace repository is private. No paid cloud is required: large files and backups start on this PC and an external or second drive, with OneDrive as the one cloud destination in M1. Backblaze B2, Hetzner, BorgBase, IDrive e2 and others are add-ons chosen later from a list. Builds are unsigned for now (unsigned builds need Smart App Control to be off), and real-engine tests run on demand (Section 6).
+
+- **OPS-001** [M1] (decision) Every cloud service is an optional **destination** that you can add, switch or remove at any time without redoing setup. Nothing in M1 requires a paid cloud service.
+- **OPS-002** [M1] Before any destination or store is created, the suite shows that option's estimated monthly cost at your current data size. Added services are tracked in the spending and account panels (§2) like any other provider.
+
+### 7.1 Repositories
+
+- **OPS-003** [M1] (decision) **`Worldwright-Suite`** (public GitHub repository since Amendment A, 2026-10-13; worked on in a local clone, `<repo>`) holds the suite source, the consolidated spec, tests and small fixtures, the Worldwright Claude Code plugin source (plugin 1.3 ships with the suite) and build scripts. Builds are attached to GitHub Releases (each file < 2 GiB). Server-side rulesets require the CI checks and block force-pushes and deletion of `main`; the protected-file approval is enforced through `ww dev merge`, git hooks and the CI guard, with CI on `main` as the backstop (§6).
+- **OPS-004** [M1] **`Worldwright-Workspace`** (private GitHub, optional) holds workspace metadata (`worldwright.yaml`, manifests, recipes, registries, `progress.md`, logs, small text files), with large files stored as Git LFS pointers.
+- **OPS-005** [M1] (invariant) The workspace may be pushed to GitHub only when a large-file store other than "This PC only" is configured (§7.2), so GitHub never holds pointers to files that exist nowhere else.
+- **OPS-108** [M1] (decision) The suite's own code is licensed **GPL-3.0-or-later**: `LICENSE` holds the unmodified GPL-3.0 text, the README states the "or (at your option) any later version" grant, every crate inherits `license = "GPL-3.0-or-later"` from `[workspace.package]`, and `NOTICE` lists third-party material in the repository. Every dependency linked into a **distributed binary** (Rust crates, Qt, KDDockWidgets, bundled runtimes) must be under a licence compatible with distributing that binary under GPL-3.0; `cargo-deny`'s licence allow list holds only such licences, and a release ships the dependencies' licence texts and the corresponding source. Closed runtimes are never linked into the GPL binary. (Amendment A, 2026-10-13.)
+
+**Why large files don't go to GitHub** (verified 2026-10-12): GitHub LFS includes 10 GiB storage and 10 GiB/month download, then charges $0.07/GiB-month storage and $0.0875/GiB download (about $64/month at 1 TB). Repositories should stay under 1–5 GB, and files over 100 MiB are blocked.
+
+- **OPS-006** [M1] **Tooling floor:** Git ≥ 2.38 (needed for `git merge-tree --write-tree`) and git-lfs ≥ 3.8. `ww doctor` checks both versions.
+- **OPS-007** [M1] When either version is below the floor, `ww doctor` and first-run setup offer the upgrade and install it only after you confirm. The M0 test machine had Git 2.55.0 and git-lfs 3.7.1 (checked 2026-10-12): Git meets the floor, git-lfs doesn't, so setup on such a machine must offer the git-lfs upgrade. (git-lfs 3.8.0 was released 2026-08-28.) The upgrade source — a newer Git for Windows that bundles git-lfs ≥ 3.8, or the standalone git-lfs installer — is decided by the M0 spike. (M0 result, 2026-10-12: the upgrade source is **Git for Windows ≥ 2.56.0.2**, which bundles git-lfs 3.8.0; the standalone git-lfs installer is not needed. winget's `Git.Git` manifest still lagged at 2.55.0.5, so `ww doctor` needs a fallback to the direct GitHub release installer, with hash and signature checks. The test machine has since been upgraded to Git 2.56.0.windows.2 / git-lfs 3.8.0, so the sentence above about it is out of date. Git 2.56 moved `git.exe` to `C:\Program Files\Git\cmd`; find it through PATH. `docs/spikes/01-toolchain.md`.)
+
+### 7.2 Large-file store
+
+Git LFS keeps every large file in the workspace's `.git/lfs/objects`. The **store** decides where else those objects go. You pick one store per workspace and can change it at any time.
+
+| Store | Cost | What it gives you | Milestone |
+|---|---|---|---|
+| **This PC only** (default) | $0 | Large files live only on this PC and are protected by backups (§7.4), not by the store. | M1 |
+| **External or second drive** | $0 | A bare repository on the drive receives LFS objects (and optionally metadata). | M1 |
+| **S3-compatible cloud** (presets: Backblaze B2, IDrive e2, Wasabi, Cloudflare R2, others by endpoint) | ~$6–15/TB-month | Every machine can fetch the whole workspace; enables the second-machine flow (§7.3). | M1.5 |
+
+- **OPS-008** [M1] (contract) The large-file store is a per-workspace setting. `.gitattributes` LFS patterns don't depend on the store.
+
+**This PC only**
+
+- **OPS-009** [M1] With the "This PC only" store the workspace is a local git repository with **no remotes**. git-lfs needs no endpoint for local clean, smudge and checkout.
+- **OPS-010** [M1] (invariant) The committed dummy `lfs.url` plus the installed pre-push hook make any accidental push fail. `ww doctor` checks that there are no remotes and that the pre-push hook is installed.
+
+**External or second drive**
+
+- **OPS-011** [M1] Setup runs `git init --bare <drive>\Worldwright-Workspace.git`. The clone's own `.git/config` sets `lfs.url = file:///<drive>:/Worldwright-Workspace.git`; local config overrides the committed dummy.
+  - A `file://` endpoint selects git-lfs's built-in local transfer automatically (git-lfs ≥ 2.10; since 3.4 the destination must be a git repository), so no transfer-agent keys are set, and any S3 agent keys from an earlier store are removed.
+  - The local `lfs.url` applies to every remote, so metadata can also go to GitHub while large files go to the drive. Optionally `git remote add drive file:///<drive>:/Worldwright-Workspace.git` mirrors the metadata to the drive too.
+- **OPS-012** [M1] Drive letters change, so before each push the suite rewrites `lfs.url` from the drive's volume GUID or marker file. A missing drive fails the push cleanly.
+- **OPS-013** [M1] `ww doctor` checks that `git lfs env` shows `Endpoint=file:///…` for a drive store.
+- **OPS-014** [M1] Old objects are never deleted from the drive (the local transfer only adds). It is still **one copy in one place**, so backups (§7.4) still run.
+
+**Rules for every store**
+
+- **OPS-015** [M1] (invariant) **The push order never loses content:** objects go to the store and are verified there before any metadata push (`git lfs push` → verify → `git push`).
+- **OPS-016** [M1] (invariant) `lfs.allowincompletepush=false`. `ww doctor` checks the effective value and that the pre-push hook is installed.
+- **OPS-017** [M1] (invariant) The suite never runs `git lfs prune` while the store is "This PC only". With any other store it prunes only objects the store verifiably holds.
+- **OPS-018** [M1] (contract) The committed `.lfsconfig` contains only a dummy `lfs.url` (so an unconfigured clone can never push to GitHub's paid LFS), `lfs.allowincompletepush=false` and `lfs.locksverify=false`. Store settings go in each clone's own git config, because git-lfs doesn't allow transfer-agent keys in `.lfsconfig`.
+- **OPS-019** [M1] (invariant) A push URL anywhere (`lfs.pushurl`, `remote.*.lfspushurl`) would override `lfs.url` for pushes, so `ww doctor` fails if one exists.
+
+**Changing stores**
+
+- **OPS-020** [M1] (invariant) Every store change copies everything across and verifies it before switching, in this order (which changes are offered in which milestone: OPS-022, OPS-023):
+  1. `git lfs fetch --all` from the old store, unless it is "This PC only" (a drive or cloud store may hold objects that are no longer kept locally);
+  2. re-hash every file in `.git/lfs/objects` against its object id (`git lfs fsck` only checks HEAD, so it isn't enough);
+  3. with the new store's URL **and its transfer settings** given only for these commands (`-c lfs.url=<new> -c lfs.standalonetransferagent=lfs-standalone-file`, or the `lfs-s3` custom-transfer keys for an S3 store), run `git lfs push --all <new-store-url>` **plus** `git lfs push --object-id <new-store-url> --stdin` fed with every object in `.git/lfs/objects` (`push --all` alone skips objects not reachable from local branches and tags; `--stdin` needs git-lfs ≥ 3.3);
+  4. verify every object listed by `git lfs ls-files --all --long` in the new store;
+  5. only then switch the clone's config.
+- **OPS-021** [M1] (invariant) Until that verification passes, a "store migration incomplete" flag blocks metadata pushes.
+- **OPS-022** [M1] The only store change offered in M1 is **"This PC only" → "External or second drive"**: OPS-020 without step 1 — push every local object to the drive repository (created as in OPS-011), verify every object there, then switch the clone's config.
+- **OPS-023** [M1.5] Every other store change — any change to, from or between cloud stores, and changes away from a drive store — follows the full OPS-020 order.
+
+**S3-compatible store**
+
+- **OPS-024** [M1.5] The S3 store uses `lfs-s3` (release 0.2.2, verified 2026-10-12) behind `ww lfs-agent`, with pinned arguments: `--endpoint=<preset endpoint>`, the bucket, a fixed `--root_path`, `--compression=none` (objects stay plain `<root>/<oid>`, readable by other tools) and `--delete_other_versions=false` (so keys don't need delete rights). `lfs-s3` skips objects already present, so re-sends are cheap.
+- **OPS-025** [M1.5] An in-house Rust transfer agent with the same object layout replaces `lfs-s3` (the protocol is small and `lfs-s3` maintenance is thin).
+- **OPS-026** [M1.5] (invariant) **Credentials never go in agent arguments**, because those live in git config. `ww lfs-agent` clears inherited `AWS_*` variables and the AWS config/credentials file variables, then sets `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from Credential Manager for the agent process only.
+- **OPS-027** [M1.5] For providers that reject the newer S3 checksum headers, `ww lfs-agent` sets `AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED` and `AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED`. This is tested per preset with objects > 5 MiB.
+- **OPS-028** [M1.5] **Bucket hygiene:** server-side encryption on; a lifecycle rule cancels unfinished multipart uploads after 3 days; everyday keys are bucket-scoped **without delete rights**; no age-based hide or delete rules (content-addressed objects are shared by later versions and checkpoints).
+- **OPS-029** [M1.5] **Working documents across machines:** "Checkpoint document" uploads content-addressed chunks and `doc.json` to a `docs/` prefix in the S3 store; unchanged chunks are never re-uploaded. Cross-machine document checkpoints need this cloud store; they don't use a git side ref.
+- **OPS-030** [M1.5] Checkpoint retention is a suite-side mark-and-sweep that uses a separate delete-capable key, used only by that job. The suite asks before the job's first run.
+- **OPS-031** [M1] Without a cloud store, checkpoints aren't available across machines; local document snapshots (§3.5) still work.
+- **OPS-032** [M1.5] Provider notes are kept in `providers.yaml`, with prices carrying `effective_from` and refreshed like other prices. As of 2026-10-12: B2 $6.95/TB with free egress up to 3× stored; IDrive e2 $6/TB but billed as at least 1 TB; Wasabi $7.99/TB with a 1 TB and 90-day minimum; R2 $15/TB with free egress.
+
+**Disk usage and model weights**
+
+- **OPS-033** [M1] Every checked-out LFS file also sits in `.git/lfs/objects`, which doubles local disk use on NTFS. git-lfs block-clones on ReFS when it writes files itself (`git lfs pull` / `git lfs checkout`), so Sync and store changes check out with `GIT_LFS_SKIP_SMUDGE=1` and then `git lfs checkout <paths>`.
+- **OPS-034** [M1] `ww doctor` recommends a **Dev Drive** for large workspaces (ReFS; ≥ 50 GB; not on C:; not removable). It is optional: creating one needs a one-time admin step in Windows Settings, and the suite works the same without it.
+- **OPS-035** [M1] (contract) **Per-workspace local data** (snapshot store, caches, `index.db`, the per-workspace `state.db`, local proposals storage) normally lives in `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\`. When the workspace is on a different volume from `%LOCALAPPDATA%` (a Dev Drive or any other drive), it lives at `<volume>:\.worldwright-local\<hash>\` instead, so hardlinked snapshots and rename-on-ingest stay on one volume. The workspace's own `<workspace>\.worldwright\staging\` stays inside the workspace (same volume by construction).
+- **OPS-036** [M1] Model weights aren't stored in the workspace. `registry/models.yaml` records their sources and hashes, and other machines re-download them by hash.
+
+### 7.3 Sync between machines
+
+With "This PC only" or a drive store there is one machine: the Sync button commits locally and, with a drive store and GitHub enabled, pushes. Multi-machine sync needs the S3-compatible store, or carrying the drive between machines, which works the same way.
+
+- **OPS-037** [M1] With one machine, Sync commits local changes and, when a drive store and a GitHub remote are configured, pushes in the order of OPS-015.
+  - (invariant) The core commits in the workspace only when you press Sync or ask for a commit, and, if you turn on the setting, on app close or when idle. It never commits silently otherwise.
+- **OPS-038** [M1.5] (invariant) Divergence between machines is normal; sync must be safe under any interleaving.
+- **OPS-039** [M1.5] On app start, if a remote exists, the suite runs a quick `git fetch` and warns "changed on another machine since your last sync".
+- **OPS-040** [M1.5] (invariant) **Sync** is a button, optionally also run on app close or when idle. Sync and backup never run at the same time. Its steps, in order:
+  1. *(writes paused)* commit local changes, using a repo-local author name and email;
+  2. *(unpaused)* fetch metadata and the LFS objects the incoming commits need;
+  3. *(writes paused through step 6)* **collision check** on the local, unpushed side, committing any renames (OPS-042);
+  4. compute the merge **outside the working tree** (`git merge-tree --write-tree`); the core resolves manifests (lossless field-level JSON merge), YAML registries and other structured files; real conflicts (the same field changed on both machines) are shown for you to pick, and nothing below runs until they're resolved;
+  5. write the merge commit;
+  6. update the working tree (skip-smudge, then `git lfs checkout` of changed paths), re-apply the read-only attribute to sealed files, resume writes;
+  7. *(unpaused)* `git lfs push` → verify in the store → `git push`. If the remote moved meanwhile, Sync loops back to step 2.
+- **OPS-041** [M1.5] (invariant) Writes pause only for Sync's commit, merge and checkout steps (1 and 3–6).
+- **OPS-042** [M1.5] (invariant) **Collisions:** sealed versions never get suffixes. A local sealed version that also exists remotely is renumbered to the next free version in a local commit that rewrites local references, before the merge. The manifest keeps `renamed_from: {version, machine, content_hash}`. References resolve through `renamed_from` using the content hash they carry (OPS-047), with a warning on a hash mismatch.
+- **OPS-043** [M1.5] (invariant) Assets are identified by their creation UUID (recorded from M1, OPS-047). A local asset whose slug collides with a different-UUID remote asset is renamed `<slug>-2` in the same pre-merge commit.
+- **OPS-044** [M1.5] You're told about every rename Sync makes.
+- **OPS-045** [M1] (contract) **Logs never need merging:** the jobs log is `queue/jobs.<machine>.<yyyy-mm>.jsonl` and the usage log is `registry/usage.<machine>.<yyyy-mm>.jsonl` (one file per machine per month; no `merge=union`, no rotation moves). Readers deduplicate by `(machine, seq)`. `progress.md` merges by union.
+- **OPS-046** [M1] (invariant) **Machine-local state stays local** and is never committed: `index.db`, `state.db`, `telemetry.db`, caches, recovery files, proposals and snapshots.
+- **OPS-047** [M1] (contract) From M1, every reference — `ww://` refs, `.wwref` links, exports and engine-import records — carries the target version's content hash, and every asset records its creation UUID when it is created, so Sync's renames (OPS-042, OPS-043) need no back-fill when multi-machine sync arrives.
+- **OPS-048** [M1.5] **Spending across machines:** caps are enforced locally on each machine (cap reservations live in that machine's suite-level `state.db`). The dashboard shows other machines' synced spend as information. Provider-side limits remain the real cross-machine stop (§2.6).
+
+### 7.4 Backups
+
+Backups use restic. The primary repository is local; cloud destinations are optional, can be added at any time, and more than one is allowed.
+
+**Tool and password**
+
+- **OPS-049** [M1] Backups use **restic 0.19.1** (verified 2026-10-12; portable exe, no admin rights; encrypted, deduplicated, JSON output, documented exit codes), shipped pinned and hash-checked with the suite (OPS-094).
+- **OPS-050** [M1] One password covers all restic repositories. restic reads it via `--password-command` from Credential Manager. It is generated at setup and shown once as a **recovery sheet**; the suite says plainly that backups can't be restored without it.
+
+**Primary repository**
+
+- **OPS-051** [M1] The primary repository is local and costs $0: an external or second drive, found by its volume GUID or a marker file, never by drive letter. This is the only backup destination M1 requires.
+
+**Cloud destinations**
+
+- **OPS-052** [M1] Each cloud destination is a separate restic repository created with `restic init --from-repo <primary> --copy-chunker-params` and filled with `restic copy`. This keeps **all existing snapshots** (history isn't lost by starting local), deduplicates, and resumes after an interruption, losing at most about 10 minutes of progress.
+- **OPS-053** [M1] (invariant) Each destination keeps a **pending-copy list**. Every snapshot a local run keeps is added to it — the second snapshot of a two-phase run, never the forgotten first (OPS-074). The list is retried every cycle until each snapshot is copied (`restic copy --from-repo <primary> <id…>` with `--from-password-command`), so a missed night (OneDrive offline, throttling, the PC asleep) is caught up. Entries drop off once local retention forgets them.
+- **OPS-054** [M1] (invariant) The suite never runs "copy everything missing", which would re-upload, every cycle, snapshots that the destination's own retention removed.
+- **OPS-055** [M1] If the primary drive hasn't been seen for 3 days, cloud destinations back up directly, using exactly the same path list, `--host`, tags and two-phase procedure as local backups.
+- **OPS-056** [M1] Retention runs separately in each repository with the same policy (OPS-080).
+- **OPS-057** [M1] The suite shows an estimated first-upload time from measured upload speed (for example, at 20 Mbps: ~22 h for 200 GB, ~4.6 days for 1 TB), throttles to a bandwidth you set, and can pause and resume.
+
+Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
+
+| Preset | Price | Connection | Protection against a stolen key or ransomware | Usage shown in the suite | Milestone |
+|---|---|---|---|---|---|
+| **OneDrive** (Microsoft 365) | $0 extra if you already pay: Personal 1 TB ($99.99/yr), Basic 100 GB ($1.99/mo); Family/Premium move to 2 TB shared (new subscriptions from 2026-10-08) | restic `rclone:` backend → rclone OneDrive | partial: "Restore your OneDrive" (30-day rollback) is the real protection; the recycle bin can purge its oldest items after 3 days when full | `rclone about --json` (total, used, trashed, free) | M1 |
+| **Hetzner Storage Box** | ~€3.20/mo 1 TB, €10.90/mo 5 TB; free traffic | SFTP on port 23 via Windows OpenSSH | strong: provider snapshots that the backup key can't delete | `df` over SFTP | M1.5 |
+| **BorgBase** | 10 GB free; $30/yr 250 GB; $110/yr 1 TB; $210/yr 2 TB; US region | native restic (REST) | strong: append-only mode (protected by 2FA) | API | M1.5 |
+| **IDrive e2** | $6/TB-month (billed as ≥ 1 TB); free restore up to 3× stored | S3 | Object Lock (advanced, OPS-070) | where an API exists | M1.5 |
+| **Custom S3** (templates: B2, Wasabi, R2, Storj, OVH, Impossible Cloud) | per provider | S3 | provider-dependent | where an API exists | M1.5 |
+| **Custom SFTP / REST server** (e.g. a NAS or a friend's box) | — | SFTP or `rest:` | provider-dependent | `df` | M1.5 |
+
+- **OPS-058** [M1] (decision) The destination presets and their milestones are as in the table above: OneDrive in M1; Hetzner Storage Box, BorgBase, IDrive e2, Custom S3 and Custom SFTP/REST in M1.5.
+- **OPS-059** [M1] Cold/archive storage classes (S3 Glacier / Deep Archive, Azure Archive, GCS Archive) are not offered as presets: restic restores from them are experimental or impractical, and early-delete fees make pruning expensive.
+- **OPS-060** [Later] Consumer cloud drives other than OneDrive work through a "Custom rclone" destination.
+
+**Synced-folder detection**
+
+- **OPS-061** [M1] (invariant) A restic repository is **never** placed inside a synced folder (the sync client uploads in its own order, can leave conflict copies, and can turn packs into online-only placeholders).
+- **OPS-062** [M1] (contract) **Synced-folder detection** is one core check, also used for Claude Code profile folders (§4.6a). It resolves the real path (`GetFinalPathNameByHandle`) and rejects the path if any of these holds:
+  - a Cloud Files sync root covers it or its nearest existing parent (`CfGetSyncRootInfoByPath` / `StorageProviderSyncRootManager.GetCurrentSyncRoots()` — covers OneDrive, current Dropbox and others);
+  - it is inside a OneDrive account folder (`HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder`) or the path in Dropbox's `info.json`;
+  - it is on the Google Drive virtual drive or inside a Google Drive mirror folder (best effort);
+  - files there carry online-only attributes (`RECALL_ON_DATA_ACCESS`, `PINNED`, `UNPINNED`).
+- **OPS-063** [M1] The **workspace** path is checked the same way at every backup run, since OneDrive's folder backup could later move the Desktop.
+
+**OneDrive**
+
+- **OPS-064** [M1] **Connecting:** the suite runs `rclone config` for an `onedrive` remote in a window (browser sign-in on `127.0.0.1:53682`, no admin rights).
+  - The rclone config is encrypted. Its password is supplied by `RCLONE_PASSWORD_COMMAND` (`ww secret get …`, read from Credential Manager), never by `RCLONE_CONFIG_PASS` holding the password itself. The variable is set in restic's environment, since restic starts rclone; its value is a space-separated command, so a `ww` path containing spaces is quoted.
+  - rclone refreshes tokens itself. If the remote goes **90 days unused** the token expires; the Backups panel then shows "OneDrive needs reconnecting" and runs `rclone config reconnect`.
+- **OPS-065** [M1] (contract) **Settings for OneDrive repositories:**
+  - `-o rclone.args="serve restic --stdio --tpslimit 8 --bwlimit <your limit>"` — setting `rclone.args` replaces the default, so it must start with `serve restic --stdio`;
+  - `-o rclone.connections=4`;
+  - `RESTIC_PACK_SIZE=64` for every write to that repository (needs 64 MiB × 5 of temp space);
+  - OneDrive throttling (429/503 with `Retry-After`) is honoured by rclone. If throttling persists, the panel suggests registering your own OneDrive client ID (guided).
+- **OPS-066** [M1] **Integrity:** a monthly `restic check --read-data-subset=5%` (reported OneDrive issues are transient errors during check and prune). Prune runs at most monthly, since every prune sends deleted packs to the OneDrive recycle bin.
+- **OPS-067** [M1] **Size guard:** quota comes from `rclone about` (no separate Microsoft sign-in; missing fields show as "unknown"). OneDrive quota is shared with mail and other Microsoft services, so the panel uses **remaining** space, shows the recycle bin's size separately, and warns when remaining space is under 10%. Exceeding quota (for example after a subscription lapses) can lead Microsoft to delete content.
+- **OPS-068** [M0] The M0 spike compares OneDrive quota used with the restic repository size (rclone notes that some operations create file versions that count against quota).
+
+**Hetzner Storage Box (when added)**
+
+- **OPS-069** [M1.5] A Hetzner destination uses a **sub-account** confined to the restic folder (host `uXXXXX-subN.your-storagebox.de`, user `uXXXXX-subN`, with "SSH support" and "External Reachability" turned on for it). restic uses `-o sftp.command="C:\Windows\System32\OpenSSH\ssh.exe -p 23 -i <key> -o BatchMode=yes -o IdentitiesOnly=yes -o UserKnownHostsFile=<suite file> -o ServerAliveInterval=60 -o ServerAliveCountMax=240 <user>@<host> -s sftp"`. The key is ed25519 without a passphrase, readable only by you; the host key is pinned at setup; the public key is installed with `install-ssh-key`; Storage Box snapshots are on (they use quota; BX11 has 10 automatic slots).
+
+**S3 Object Lock**
+
+- **OPS-070** [M1.5] S3 Object Lock with restic needs versioning plus a retention window and conflicts with lock-file deletes and pruning, so it is offered only as an advanced option with an explanation.
+
+**What's backed up**
+
+- **OPS-071** [M1] (contract) Backed up:
+  - the whole workspace folder including `.git` (so LFS objects are covered even with the "This PC only" store), `work/`, `candidates/` and proposals — excluding `.worldwright/core.lock`, `.worldwright/staging/` and `.git/*.lock`;
+  - `%APPDATA%\Worldwright` (settings, personal resources, providers and prices, the encrypted rclone config);
+  - from the local data folders (`%LOCALAPPDATA%\Worldwright`, and `<volume>:\.worldwright-local\<hash>\` for a workspace on another volume, OPS-035): rolling document snapshots, local proposals storage, `usage-loose.jsonl`, assistant conversations, and consistent copies of the per-workspace and suite-level `state.db` (made with SQLite online backup).
+- **OPS-072** [M1] (invariant) Not backed up: `index.db`, `telemetry.db`, caches, recovery files, model files (re-downloadable), and **Claude Code profile folders** (they hold sign-ins; §4.6a). A setting can also exclude proposals and rejected candidates.
+- **OPS-073** [M1.5] With a shared cloud store and several machines, one **full-backup machine** runs `git lfs fetch --all` (after a disk-space check) so every machine's versions are covered; the other machines back up what they have.
+
+**Consistency without admin rights (two phases)**
+
+- **OPS-074** [M1] (invariant) Each backup run has two phases:
+  1. pause suite writes for **seconds**; copy the small mutable set (manifests, logs, YAML, `progress.md`, the `state.db` backups) into `%LOCALAPPDATA%\Worldwright\backup-stage\`, with `stage-map.json` mapping each staged file to its original path; resume writes;
+  2. `restic backup` everything else live, excluding the staged originals. Files whose modification time changed during the run are picked up by a second `restic backup --parent <first>` over the **same full path set** with the same tags. The second snapshot is the one shown and kept; the first is forgotten only after the second is saved, so retention never keeps a partial snapshot.
+- **OPS-075** [M1] **Restore** overlays staged copies onto their original paths using `stage-map.json`.
+- **OPS-076** [M1] restic exit code 3 is shown as a **partial** backup, with the list of files it couldn't read.
+- **OPS-077** [M1] VSS is used only if you choose to run backups elevated.
+
+**Scheduling and retention**
+
+- **OPS-078** [M1] A per-user Task Scheduler task ("run only when user is logged on", `StartWhenAvailable`; no admin rights, no stored password) runs `ww backup --scheduled` through a **windowless launcher**, which starts the core so it can pause writes. Defaults: the local drive daily (when connected); each cloud destination nightly, after the local backup. (M0 result, 2026-10-12: the windowless launcher is **confirmed necessary**: the owner saw a console window flash when the task ran `pwsh -NoProfile -WindowStyle Hidden`. The task action must be the launcher's **absolute path**: a bare `pwsh` (a Store execution alias) failed with 0x80070002, and the Store `pwsh.exe` path changes on upgrade. `docs/spikes/09-scheduled-task.md`.)
+- **OPS-079** [M0] The M0 spike confirms that a standard (non-admin) account can register that task. (M0 result, 2026-10-12: a non-elevated (Medium-integrity) shell registered, ran, read back and removed the task with `-LogonType Interactive -RunLevel Limited`, `StartWhenAvailable` and no stored password. It was tested from a non-elevated token of an admin-group account; a separate standard account was not tested. `docs/spikes/09-scheduled-task.md`.)
+- **OPS-080** [M1] (contract) **Retention** uses a fixed `--host <machine-id>` and groups by host and tags:
+  - `restic forget --group-by host,tags --tag scheduled --keep-daily 7 --keep-weekly 4 --keep-monthly 12`;
+  - `restic forget --group-by host,tags --tag pre-migration,pre-risky --keep-within 90d`;
+  - then `prune` (at most monthly on OneDrive, OPS-066);
+  - a monthly `restic check` with a data sample.
+- **OPS-081** [M1] (invariant) On a stale lock (exit code 11) the suite runs `restic unlock` and retries once. It never uses `unlock --remove-all`.
+
+**Before risky changes**
+
+- **OPS-082** [M1] Before risky changes the suite makes a fast metadata-only backup: tagged `pre-migration` before any schema migration, and `pre-risky` before cascades and bulk deletes. It goes to the primary drive if it's connected, otherwise a local copy in `%LOCALAPPDATA%\Worldwright\pre-migration\<timestamp>\`, kept 90 days.
+- **OPS-083** [M1] (invariant) A migration never starts unless one of those two pre-migration copies succeeded.
+
+**Backups panel**
+
+- **OPS-084** [M1] The **Backups panel** lives in Diagnostics in M1 (the separate Hub app that later hosts shared panels is Later). It shows, per destination: last successful backup, size, next run, estimated monthly cost, quota used and remaining where available, protection level, and partial-backup file lists. Diagnostics itself also shows a one-line backup status.
+- **OPS-085** [M1] The panel warns: "external drive not seen for 7 days", "no off-site copy — your backups are all in this room", "OneDrive needs reconnecting", "OneDrive nearly full".
+- **OPS-086** [M1] **Add destination** shows the preset list with each option's cost at your current size and its estimated first-upload time.
+- **OPS-087** [M1] **Restore** brings back a file, asset, project or the whole workspace from any snapshot in any destination into a side folder; you then choose what to bring back into the workspace.
+
+**Spending and test isolation**
+
+- **OPS-088** [M1] (contract) Cloud destinations appear in the spending dashboard (§2): metered providers via their usage APIs or a size × price estimate. Destinations are providers with optional usage/quota APIs (Microsoft Graph through `rclone about`, BorgBase, R2, Wasabi).
+- **OPS-089** [M1] (contract) Flat subscriptions — OneDrive, BorgBase, Hetzner, and each Claude Code plan (§4.6a) — are **fixed recurring costs** you enter once. Caps don't apply to them; the dashboard includes them in the monthly total.
+- **OPS-090** [M1] (invariant) **Test isolation:** backup destinations, rclone configs, scheduled tasks, SSH keys, restic repositories and Claude Code profile folders are covered by §6.3's environment provider. Tests never reach the real OneDrive, Hetzner, B2, your Task Scheduler or your real profile folders.
+
+### 7.5 Builds and installation
+
+**Installer**
+
+- **OPS-091** [M1] (decision) The installer is **Velopack**, per-user (no admin rights), installing into `%LOCALAPPDATA%\<packId>`. Velopack behaviour that shapes the rules below (verified 2026-10-12): a fresh install over an existing folder, or an uninstall, deletes that whole folder; an update replaces its `current\` subfolder and force-stops processes running from it.
+- **OPS-092** [M1] (contract) Pack ids are `WorldwrightSuite` (stable) and `WorldwrightSuite.Dev` (dev), each mapped to its pipe channel (`stable` / `dev`, §1.2).
+- **OPS-093** [M1] (invariant) **No suite data ever lives in the install folders.** Data stays in `%APPDATA%\Worldwright`, `%LOCALAPPDATA%\Worldwright` and, for a workspace on another volume, `<volume>:\.worldwright-local\` (OPS-035).
+- **OPS-094** [M1] **Contents:** the core, the apps, `ww`, the windowless launcher, `ww-mcp`, restic and rclone (pinned, hash-checked), Qt plus the matching Qt WebEngine pair (§6.6), shaders, and the **Visual C++ runtime DLLs shipped app-local** (Microsoft permits this; no admin rights or redistributable installer needed; runtime fixes arrive with suite updates).
+- **OPS-095** [M1] (contract) **`ww-mcp` for Claude Code:** only the stable channel owns the fixed copy at `%LOCALAPPDATA%\Worldwright\bin\ww-mcp.exe`. Velopack's after-install and after-update hooks copy it there with rename-then-replace.
+
+**Updates**
+
+- **OPS-096** [M1] Updates come from the suite repository's GitHub Releases. Velopack's Rust GitHub source supports private repositories with a token and reads the newest 10 releases (verified 2026-10-12). (Amendment A, 2026-10-13: the repository is public, so reading releases needs no token; OPS-098 applies only to a private copy.)
+- **OPS-097** [M1] (contract) Stable builds are normal releases (`prerelease=false`); dev builds use `--channel dev` and are marked as pre-releases.
+- **OPS-098** [M1] The update token is read-only and stored in Credential Manager (or comes from your Git Credential Manager login). An expired token shows "update token expired".
+- **OPS-099** [M1] (invariant) The suite asks before updating, **drains the core first**, and never updates while jobs run.
+- **OPS-100** [M1] Going back to an older version means reinstalling that release. If a `state.db` migration happened in between, the pre-migration backup is restored too (an older core refuses a newer database — §6.4).
+
+**Release pipeline**
+
+- **OPS-101** [M1] (contract) The CI release job (§6.6) runs, in order: `windeployqt` → copy the VC++ runtime DLLs, restic and rclone → `vpk pack` → `vpk upload github`. The runner needs the .NET SDK for `vpk`.
+
+**First run on a machine**
+
+- **OPS-102** [M1] First run proceeds: install → (optional) sign in to GitHub → create a workspace or open one (from a drive or, with a cloud store, from GitHub) → provider keys → `ww doctor`.
+- **OPS-103** [M1] `ww doctor` at first run covers: Git and git-lfs versions (OPS-006/OPS-007, offering the upgrade); the Dev Drive recommendation; ComfyUI (guided install — asks first) and its recorded custom nodes; models re-downloaded by hash; Claude Code (you install it and sign in; minimum version per §4.6, AI-061) and its profiles (§4.6a); the Worldwright plugin registered with Claude Code (asks first); backups (pick the primary drive, optionally add destinations, reconnect existing ones from the recovery sheet); and the Smart App Control state.
+
+**Signing**
+
+- **OPS-104** [M1] (decision) Builds are **unsigned** for now. SmartScreen shows "Run anyway" once on other machines.
+- **OPS-105** [Later] If Smart App Control is on, unsigned builds are blocked outright; signing then moves to Azure Artifact Signing ($9.99/month, available to individuals in the US and Canada; verified 2026-10-12).
+
+### 7.6 Other platforms
+
+- **OPS-106** [Later] (decision) Other platforms are deferred. Linux would be the cheaper port.
+- **OPS-107** [M1] (invariant) To keep a port possible: rendering stays behind QRhi with D3D-specific code isolated; Windows APIs are used only in a platform crate; formats and the protocol are platform-neutral.
+
+### 7.7 Milestone scope
+
+- **M1:** the suite repository and CI; the workspace as a local git repository with LFS; large-file store "This PC only" or "External drive", and the one store change "This PC only → External drive" with copy-and-verify; optional workspace push to GitHub with a drive store; single-machine Sync (commit and push); content hashes in every reference and creation UUIDs on every asset; per-machine monthly job and usage logs; per-workspace local data on the workspace's volume; restic backups to the local drive (two-phase consistency with stage map, scheduled task, tagged retention, `pre-migration`/`pre-risky` backups with local fallback); the **OneDrive destination** via rclone; synced-folder detection; the Backups panel in Diagnostics with add-destination, costs, warnings and restore-to-side-folder; the Velopack installer with stable/dev pack ids, app-local runtime, updates and release pipeline; `ww doctor` tooling checks including the git-lfs upgrade offer.
+- **M1.5:** the S3-compatible large-file store (B2 and other presets) and every other store change; Sync between machines (collision renames resolved through `renamed_from`, conflict-pick UI, cross-machine spend view, full-backup machine); document checkpoints across machines with mark-and-sweep GC; Hetzner, BorgBase, IDrive e2, Custom S3 and Custom SFTP/REST destinations; S3 Object Lock as an advanced option; the in-house LFS transfer agent.
+- **Later:** Custom rclone destinations (other consumer drives); a models mirror; server-side store → backup copy; code signing if needed; other platforms.
+
+---
+
+## Appendix A. Milestones
+
+**Sequence.** M0 (spikes that prove risky assumptions) → **M1a** (first usable Image studio on the core platform) → **M1b** (completes the studio) → **M1.5** (multi-machine, cloud stores, local LLMs, interactive-session telemetry and the other deferred extras) → **Later**.
+
+- `[M1]` rules in §1–4, 6 and 7 are the platform for milestone 1. The plan orders them so each M1a feature has what it needs, and all of them are done by the end of M1b. §5 splits its own rules into `[M1a]` and `[M1b]`.
+- An `[M0]` rule is a spike. Work that depends on it doesn't start until it passes, and a failed spike comes back for review as a design change.
+- Each section ends with its own milestone-scope subsection listing the features in each milestone.
+
+| Section | M0 | M1 | M1a | M1b | M1.5 | Later | Total |
+|---|---|---|---|---|---|---|---|
+| §1 Processes, connections, trust and repo layout | 1 | 112 | 1 | 0 | 4 | 6 | 124 |
+| §2 Core modules | 0 | 140 | 1 | 1 | 5 | 4 | 151 |
+| §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 4 | 3 | 3 | 11 | 139 |
+| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 0 | 75 | 15 | 4 | 156 |
+| §5 Image studio | 8 | 3 | 107 | 29 | 9 | 4 | 160 |
+| §6 Errors, testing and quality | 1 | 84 | 0 | 1 | 0 | 1 | 87 |
+| §7 Sync, backup and builds | 2 | 83 | 0 | 0 | 20 | 3 | 108 |
+| **All** | **29** | **585** | **113** | **109** | **56** | **33** | **925** |
+
+## Appendix B. M0 spike checklist and facts to re-verify
+
+The M0 results (2026-10-12) are recorded in the rules themselves, as "(M0 result, 2026-10-12: …)" notes, and summarised in `docs/spikes/README.md`. The excerpts below are the rules' pre-M0 text.
+
+### B.1 Spike rules (`[M0]`)
+
+- **ARCH-115** The stack spike must pass before M1 app work: cxx-qt 0.10 + KDDockWidgets 2.4.1 (Qt Quick) + a `QQuickRhiItem` shim + QtWebEngine + `windeployqt` on Qt 6.12 LTS with MSVC. If it fails on 6.12, fall back to Qt 6.11; the result fixe…
+- **APP-071** Pasting into Discord and Chromium is tested in the M0 spike (and again in the manual milestone checks, §6.4).
+- **AI-133** With Engine A's profile (`--setting-sources`, `--settings`, `--strict-mcp-config`, `--permission-mode default`): the claude.ai login still works (`claude auth status` and `apiKeySource: "none"`), and `ww-mcp` from `--mcp-config` c…
+- **AI-134** Decided by the M0 spike: `--restricted` (managed + `--settings` only, file tools confined to the working directories, command tools only if named) and `--safe-mode` behaviour with OAuth and `--mcp-config`, and whether `--restricte…
+- **AI-135** Strict mode drops plugin servers; `ww-mcp.exe` launched by absolute path is a direct child of `claude.exe`.
+- **AI-136** The `-p` default permission mode, and that `--permission-mode default` overrides it.
+- **AI-137** The permission-prompt tool's input/output contract, and whether a long-waiting prompt-tool call gets backgrounded.
+- **AI-138** The `interrupt` control request, and `interrupt_receipt_v1` in `system/init` capabilities.
+- **AI-139** The system prompt recorded across `--resume`.
+- **AI-140** Tool-use id reuse on retried tool calls.
+- **AI-141** `rate_limit_event` shapes (per profile) and the plan-limit error.
+- **AI-142** `/usage` in a `-p` run: no quota used; whether it returns the structured usage report; present with and without usage credits.
+- **AI-143** Resume after a kill mid-tool; `defer` + `--resume`.
+- **AI-144** Where `.claude.json` lives under `CLAUDE_CONFIG_DIR` on Windows.
+- **AI-145** Which fields `claude auth status` reports (`configDirectory`, `authMethod`, account/plan — the account/plan fields are reported as unreliable), and the `account` field of the control-protocol `initialize` response in headless runs…
+- **AI-146** Two profiles running concurrently, and two sessions in one profile (community reports of `.claude.json` write races).
+- **AI-147** Nothing from `%USERPROFILE%\.claude` leaks into a non-default profile's run.
+- **AI-148** Decided by the M0 spike: whether a headless way exists to read Claude Code's 3-day sign-in expiry warning.
+- **IMG-152** Compute compositing on D3D11 (store-only writes, multi-pass groups, separate mip textures) and on D3D12; the result decides whether the D3D12 path (IMG-033) is built.
+- **IMG-153** Canvas frame times while ComfyUI saturates the GPU.
+- **IMG-155** VRAM fit of Z-Image bf16 vs int8 + lite ControlNet with the canvas and WebEngine running; decides the Z-Image default (IMG-111).
+- **IMG-156** Model-switch timing Z-Image ↔ Qwen (the 1–3 s estimate is unverified) and ComfyUI's "model reloads every run" bugs, including with symlinked model folders.
+- **IMG-157** Whether LoRAs apply correctly and quickly on int8 and w4a8 weights; decides each profile's LoRA capability flag (IMG-107).
+- **IMG-158** SAM 3.1 latency through ComfyUI for select object.
+- **IMG-159** `loadGraphData` / `serialize` / `graphToPrompt` in QtWebEngine; loading into a new workflow tab; and whether the hidden conversion page changes ComfyUI's saved state (decides IMG-124's fallback).
+- **IMG-160** Previews with the tiny decoders, including which decoder Z-Image uses.
+- **QA-078** Decided by the M0 spike: which installer CI uses for the Qt pair — an `aqtinstall` version that includes the Qt 6.12 fix (PR #1048; earlier releases install the wrong Qt WebEngine for 6.12), `naqt`, or Qt's official installer CLI.
+- **OPS-068** The M0 spike compares OneDrive quota used with the restic repository size (rclone notes that some operations create file versions that count against quota).
+- **OPS-079** The M0 spike confirms that a standard (non-admin) account can register that task.
+
+### B.2 M1 rules whose details an M0 spike confirms
+
+- **ARCH-114** The build is CMake at the top level, using cxx-qt's documented CMake integration (`cxx_qt_import_crate`, built on Corrosion) for the Rust crates, plus KDDockWidgets, the C++ shim and `windeployqt`. Pinned: Qt 6.12 LTS with the Qt …
+- **APP-135** GUI-thread stalls: 99th percentile < 16 ms, with frame times measured while ComfyUI saturates the GPU. First measured in the M0 spike.
+- **AI-050** Launch profile (final flags set by the M0 spike, §4.8):
+- **AI-062** Profile verification and launch locking (per profile, §4.6a):
+- **AI-068** Idempotency keys for suite tool calls from Engine A are `session id + tool-use id` (a retried tool call from Claude Code reuses its tool-use id; M0 confirms). The core's step state tells a resumed run what is already running.
+- **AI-073** Whether credits are on is checked with a separate `claude -p --no-session-persistence --output-format json "/usage"` run (experimental; M0 confirms it uses no quota and reports credit state), under the per-profile lock (§4.6a).
+- **AI-101** Doctor shows Claude Code's 3-day sign-in expiry warning if the M0 spike finds a headless way to read it.
+- **AI-102** Each profile shows its 5-hour and weekly usage percentages and reset times, with a "last seen" time. Sources:
+- **IMG-033** Run Qt Quick on Direct3D 12 (shaders built for SM 6.6, shipping the DXC compiler DLLs), which lifts the D3D11 limits — only if the M0 spike (IMG-152) favours it. D3D11 with IMG-030 stays the baseline either way. *(withdrawn — see §5.3)*
+- **IMG-107** LoRAs: a LoRA list in the Generate panel (name, weight, trigger words), from ComfyUI's LoRA folder. Profiles declare whether LoRAs work (some quantised paths can't apply them; see IMG-157). "Clone pro…
+- **IMG-111** The Z-Image Turbo profile as in the table. Its default is the int8 base + lite ControlNet, unless the M0 VRAM measurement (IMG-155) shows bf16 fits: bf16 base 12.6 GB + lite ControlNet 2.0 GB + ~1.5 GB for the canvas, WebEngine an… *(superseded — see §5.6 / IMG-111)*
+- **IMG-115** Model switching: ComfyUI keeps models cached in system RAM (the reference machine has well over 64 GB) and swaps them into VRAM; Z-Image and Qwen can't both stay resident, so switching between them costs a swap (…
+- **IMG-124** Workflows using frontend-only extension nodes (e.g. Set/Get nodes, some widget packs) or dynamic inputs are detected; those nodes are read-only in the Graph tab, and the workflow is converted by ComfyUI's own frontend (`graphToPro…
+- **IMG-127** Open in ComfyUI loads a workflow by calling the frontend's graph-loading function through `runJavaScript`, passing the graph as base64 decoded inside the page (no script injection), into a new workflo…
+- **IMG-149** M1b — completes the studio:
+- **QA-077** Qt in CI: Qt 6.12 LTS and the Qt WebEngine release matching it (versioned separately; the exact version is pinned in the M0 Qt-stack spike, §1) are pinned as a pair, cached by the exact pair, and a CI check verifies the installed …
+- **OPS-007** When either version is below the floor, `ww doctor` and first-run setup offer the upgrade and install it only after you confirm. The M0 test machine had Git 2.55.0 and git-lfs 3.7.1 (checked 2026-10-12): Git meets the floor, git-lfs…
+
+### B.3 External facts the plan depends on (verified 2026-10-12)
+
+Re-check these against their primary sources when the plan task that depends on them starts. The research notes (Appendix C) give the sources.
+
+**§1 Processes, connections, trust and repo layout**
+
+- MCP protocol revision 2026-07-28 and the legacy revisions `rmcp` must still speak.
+- Claude Code truncates tool descriptions at 2,048 characters — source: Claude Code docs (verified 2026-10-12).
+- Claude Code honours `_meta["anthropic/requiresUserInteraction"]: true` by always prompting, and hooks can't auto-allow it.
+- Claude Code doesn't document `structuredContent` / `resource_link`.
+- MCP tool names `mcp__plugin_worldwright_ww__<tool>` (plugin) vs `mcp__ww__<tool>` (own config).
+- `keyring` 4.x with `windows-native-keyring-store`.
+- Qt 6.12 LTS + the separately versioned Qt WebEngine release matching it (exact version pinned by the M0 spike, not stated as fact); cxx-qt 0.10 and `cxx_qt_import_crate` CMake integration via Corrosion; KDDockWidgets 2.4.1 (2.5 pending); QtWebEngine install-size cost ~150 MB.
+- Licences: Qt LGPLv3; KDDockWidgets, Qt Quick 3D, Qt Graphs and the QML compiler GPL (§1.8 licences paragraph).
+- ComfyUI HTTP API: `/api/jobs`, `POST /api/jobs/{id}/cancel`, `/queue`, `/free`, `/interrupt` semantics, `execution_start` websocket event, default origin `http://127.0.0.1:8188` — checked against local ComfyUI 0.39.2.
+- NVML can't report per-process VRAM on GeForce/WDDM; PDH counter `GPU Process Memory` works without admin.
+- Windows: `CREATE_BREAKAWAY_FROM_JOB` access-denied behaviour inside terminal job objects; `GetNamedPipeServerProcessId` / `GetNamedPipeClientProcessId`; `first_pipe_instance`; `ReplaceFileW` / `MoveFileExW` write-through; `WM_QUERYENDSESSION` via a hidden top-level window.
+- Velopack: per-user install into `%LOCALAPPDATA%\<packId>`; fresh install over an existing folder or uninstall deletes the folder; update replaces `current\` and force-stops its processes; after-install/after-update hooks.
+- NVIDIA Control Panel "Prefer no sysmem fallback" setting per executable.
+
+**§2 Core modules**
+
+- `nvml-wrapper` 0.13 features on GeForce (power, total energy counter, per-process SM utilisation; no per-process VRAM) — probed on the test machine (GeForce RTX-class GPU).
+- Windows PDH `GPU Process Memory` and "Energy Meter" (`rapl_package0_pkg`) counters readable without admin — probed on the test machine (AMD desktop CPU).
+- `sysinfo` 0.39 (CPU/RAM/per-process, network per adapter).
+- Streaming usage: OpenRouter last chunk `usage.cost`; Anthropic `message_delta` cumulative output usage; OpenAI `stream_options.include_usage`.
+- Cost sources: xAI `cost_in_usd_ticks` (1e10 = $1); NanoGPT media `cost`; Kling `billing[]`; OpenRouter `/api/v1/generation?id=`; NanoGPT `/api/v1/usage/requests/{X-Request-ID}` (24 h); fal `/v1/models/billing-events?request_id=` (billing-scoped key) — source research-llm-providers*.md, research-media-providers.md.
+- Account APIs: OpenRouter `GET /api/v1/key` and management-key credits/activity; NanoGPT `check-balance`, `subscription/v1/usage`; Anthropic Usage & Cost API (organisation accounts only); OpenAI org usage/costs; DeepSeek/Kimi/StepFun balance endpoints.
+- Price lists: OpenRouter `/api/v1/models`, xAI model list, Alibaba native `/api/v1/models`; DeepSeek off-peak windows (01:00–04:00 and 06:00–10:00 UTC Mon–Fri peak, excl. Chinese holidays, off-peak half price); Gemini 2027-01-01 price increases.
+- Error codes: Anthropic `enforced_spend_limit_reached`; Gemini `RESOURCE_EXHAUSTED` from spend limits.
+- ComfyUI (0.39.2 on the test machine): `/node_replacements`, `/api/jobs`, `POST /api/jobs/{id}/cancel`, `/queue`, `/history`, `/view`, `/upload/image`, `/free`, `/system_stats`, `execution_start` events, `extra_data.preview_method`, "front" queue semantics; partner-node costs reported only after execution, no balance API.
+- Claude Code: `_meta["anthropic/requiresUserInteraction"]` forces a prompt hooks can't auto-allow; `rate_limit_event`, `system/api_retry` `error: "rate_limit"`, `modelUsage` cumulative across resumes; `/usage` experimental and rate-limited; OpenTelemetry metric `claude_code.token.usage`, `OTEL_RESOURCE_ATTRIBUTES` — source research-claude-code.md, ccdocs.
+- `rclone about --json` fields for OneDrive (total, used, trashed, free).
+
+**§3 Core ↔ app interface, interchange, documents and dashboards**
+
+- KDDockWidgets 2.4.1 Qt Quick support, ViewFactory theming, and known mixed-DPI / maximized-restore bugs; 2.5 adding per-window save and Qt Quick dark mode. Checked against KDDockWidgets 2.4.1 sources.
+- cxx-qt 0.10: `#[base]`, `#[inherit]`, `#[cxx_override]`, `CxxQtThread::queue` and its "object destroyed" error.
+- Qt 6.12: `QtWebEngineQuick::initialize()` deprecated, with `Qt::AA_ShareOpenGLContexts` as the documented replacement. Checked against Qt 6.12 sources.
+- Windows Terminal opens only `http`, `https` and `file` links.
+- `AllowSetForegroundWindow` semantics: it works only when the caller itself has foreground rights, and clicking a notification counts as user input that grants foreground. Checked against Microsoft docs on foreground rules.
+- Windows clipboard "PNG" registered format behaviour, and Qt's default drag actions (allowing Move to Explorer). Sources: Qt's `qwindowsmimeregistry.cpp` and `qquickdrag.cpp`.
+- OpenRaster: 20 blend modes, no masks, 16-bit max.
+- CPU temperature on Windows isn't readable without admin rights or a kernel driver.
+- Only JPEG decodes cheaply at reduced size, which is why thumbnails are cached at exact display size.
+- Per-user file associations under `HKCU\Software\Classes` without admin; Windows still makes you choose defaults yourself.
+
+**§4 AI layer**
+
+- No official Anthropic Rust SDK; official SDK list; `anthropic-version: 2023-06-01`.
+- Provider quirks (reasoning fields/passback for DeepSeek, Kimi, Alibaba, MiniMax, xAI; Z.ai object args; DeepSeek keep-alives; Tencent SSE errors).
+- Cost fields/endpoints: OpenRouter `usage.cost` and `/api/v1/generation`; xAI `cost_in_usd_ticks` (1e10 = $1); NanoGPT `/api/v1/usage/requests/{X-Request-ID}` (24 h); fal billing-events; Kling `billing[]`.
+- DeepSeek peak/off-peak windows; Gemini 2027-01-01 price increases.
+- Account endpoints in the 4.3 table (OpenRouter, NanoGPT, DeepSeek, Kimi, StepFun, fal, xAI Management API, Mistral, Anthropic/OpenAI admin APIs).
+- Media landscape: OpenAI video API removed 2026-09-24; `gpt-image-1` shutdown 2026-10-23; Imagen 4 shut down; Veo non-cancellable, 2-day outputs; MiniMax music API closed 2026-08-20; Rodin via fal; Tripo Rust SDK; output lifetimes per provider; recovery lookups per provider; BytePlus not supporting the US.
+- Model retirements: MiMo v2.5 2026-10-21; DeepSeek old names 2026-07-24; Kimi moonshot-v1 2026-08-31.
+- Anthropic API: model ids `claude-opus-5-5`/`claude-haiku-5-5`; adaptive thinking not disableable on Opus 5.5; per-message effort beta; `thinking.display: "updates"` beta; preserved-thinking 400 on changed history; inline tool add/remove beta; strict tools + `eager_input_streaming`; forced tool choice 400; `compact-2026-09-04`; `task-budgets-2026-03-13`; `server-side-fallback-2026-07-01`; Haiku 5.5 has no server fallback; refusal billing.
+- Claude Code CLI: all flags in AI-050; `--bare` expected to become `-p` default; `system/init` fields (`apiKeySource`, capabilities, `interrupt_receipt_v1`); `rate_limit_event` fields; `system/api_retry` `error: "rate_limit"`; `modelUsage`; `/usage` in `-p` (experimental); `claude auth status` fields incl. `configDirectory`; `CLAUDE_CONFIG_DIR` semantics and `.claude.json` location; subprocess env scrub stripping `CLAUDE_CONFIG_DIR`; `claude-cli://open`; `claude --desktop`; description truncation at 2,048; MCP calls backgrounded after ~2 min; `alwaysLoad`; `requiresUserInteraction`; `claude plugin list --json`; statusline `rate_limits.five_hour/seven_day`; OTel env vars; "Login expired · Please run /login" message; 3-day expiry warning; channels (research preview).
+- Anthropic terms: Claude Code legal-and-compliance page (subscription login, ordinary individual usage); Consumer Terms (effective 2025-10-08) §3 item 7 automated-access clause and the "bypassing any of our systems or protective measures" clause — re-read verbatim on 2026-10-12 from https://www.anthropic.com/legal/consumer-terms; Usage Policy bypass clause.
+
+**§5 Image studio**
+
+- Qt Quick defaults to Direct3D 11 on Windows; D3D11 compute (SM 5.0) can't do in-place half-float image loads; D3D12 needs SM 6.6 shaders + shipped DXC DLLs; `QQuickRhiItem` synchronize/render semantics and resource-update batch capacity signal; Qt 6 uses Windows Ink by default and synthesises mouse events from unaccepted tablet events (Qt 6.12 sources).
+- Windows Advanced Color / auto colour management / HDR make the compositor colour-manage (Microsoft docs).
+- ComfyUI 0.39.2: SAM 3.1 native with text/box/point prompts in uploaded-image pixel coordinates; previews only when `extra_data.preview_method` is set, JPEG ≤ 512 px; queue "front" is LIFO among front items and nothing pre-empts a running prompt; LoRA key mapping for Z-Image (Lumina2) and Qwen-Image-2.1; built-in latent noise mask + differential diffusion; mask conditioning for regions; `/object_info`, `/system_stats`, `/templates/index.json`, `/api/workflow_templates`, `/userdata/workflows/…` endpoints.
+- ComfyUI frontend 1.53.10: workflow JSON shapes (root version 0.4 array links; subgraph object links; `widgets_values_named`), Zod schemas, `app.graph.serialize()`, `loadGraphData`, `graphToPrompt`, persistence of open workflows in server-side user settings; UI→API conversion rules.
+- Qwen-Image-2.1 edit node: no hard-mask input, `resolution` sizing to first reference's aspect, 16 reference slots with 10 validated; Fun ControlNet inpaint path is conditioning only; 3–4× slowdown on PyTorch CUDA 12.8 vs CUDA 13 build.
+- Model file sizes/VRAM: Z-Image bf16 base 12.6 GB, Fun ControlNet Union 2.1 lite 2.0 GB / full 6.7 GB; Qwen int8 text encoder pushes total to ~16.7 GB; FLUX.2 klein 4B fp8; TAE preview decoders exist for Z-Image/FLUX, Qwen-Image-2.1, FLUX.2; SeedVR2 3B/7B; Depth Anything 3; `comfyui_controlnet_aux`.
+- Reference hardware assumptions: 16 GB VRAM GPU, large system RAM (well over 64 GB).
+
+**§6 Errors, testing and quality**
+
+- GitHub Actions hosted-runner prices: Windows $0.010/min, Linux $0.006/min, included minutes 2,000 (Free) / 3,000 (Pro) for private repositories; standard GitHub-hosted runners are free for public repositories.
+- Qt WebEngine is versioned separately from Qt. The exact version comes from the M0 Qt-stack spike.
+- `aqtinstall` 3.3.0 installs the wrong Qt WebEngine for Qt 6.12; the fix is in PR #1048.
+- `QSG_RHI_BACKEND=d3d11` + `QSG_RHI_PREFER_SOFTWARE_RENDERER=1` selects WARP. The pure `software` adaptation can't run `QQuickRhiItem`.
+- ComfyUI strips its own sensitive keys from history/database.
+- `comfyui-frontend-package` is the pinned official frontend used for UI→API goldens and web-view tests.
+- Claude Code: `rate_limit_event`, `system/init` fields (`apiKeySource`), `auth status` fields, the "Login expired · Please run /login" message. QA-054 and QA-065 rely on them.
+- GitHub Free offers branch protection and rulesets (required status checks, no force-push, no deletion) on public repositories, not on private ones; the suite repository is public (Amendment A, 2026-10-13). Also relied on, not checked here: PR reviews by a collaborator account work on Free repos; the merge-PR API accepts the expected head `sha` and fails on mismatch; a workflow needs the repo setting "Allow GitHub Actions to create and approve pull requests" plus job-level write permissions to open the revert PR; git's `pre-merge-commit` hook doesn't run for fast-forward merges, so `pre-push` is the hook that catches those; with Pro, `CODEOWNERS` + "require review from Code Owners" gives the native equivalent.
+
+**§7 Sync, backup and builds**
+
+- Git ≥ 2.38 has `merge-tree --write-tree`; git-lfs 3.8.0 released 2026-08-28; `push --object-id --stdin` needs git-lfs ≥ 3.3; local `file://` transfer since 2.10, destination must be a git repo since 3.4; git-lfs disallows transfer-agent keys in `.lfsconfig`; `lfs.pushurl`/`remote.*.lfspushurl` override `lfs.url`; `git lfs fsck` checks HEAD only; block-cloning on ReFS for `pull`/`checkout`. Sources: github.com/git-lfs/git-lfs docs (`git-lfs-config.adoc`, `git-lfs-push.adoc`, `git-lfs-ls-files.adoc`, `custom-transfers.md`).
+- M0 test machine: Git 2.55.0, git-lfs 3.7.1 (checked 2026-10-12).
+- GitHub LFS pricing (10 GiB storage + 10 GiB/month included; $0.07/GiB-month; $0.0875/GiB download), repo size guidance 1–5 GB, 100 MiB file block, Release files < 2 GiB — docs.github.com billing/LFS/repository-limits/about-releases pages.
+- `lfs-s3` 0.2.2 (2026-04-21) flags `--endpoint`, `--root_path`, `--compression`, `--delete_other_versions`; skips present objects; research notes it was tested only with git-lfs 3.3–3.4 and R2/B2 are unverified — github.com/nicolas-graves/lfs-s3.
+- S3 store prices: B2 $6.95/TB, egress free to 3×; IDrive e2 $6/TB min 1 TB billed; Wasabi $7.99/TB, 1 TB and 90-day minimums; R2 $15/TB, free egress — backblaze.com, wasabi.com, developers.cloudflare.com pricing pages.
+- restic 0.19.1: `init --from-repo --copy-chunker-params`, `copy --from-repo/--from-password-command`, exit codes 3 (partial) and 11 (locked), `RESTIC_PACK_SIZE`, `rclone.args`/`rclone.connections`, `--group-by`, `--read-data-subset` — restic.readthedocs.io and the restic CHANGELOG.
+- rclone OneDrive: sign-in on 127.0.0.1:53682, `RCLONE_PASSWORD_COMMAND`, `about --json` fields, 90-day unused token expiry, `config reconnect`, 429/503 `Retry-After`, versions counting against quota — rclone docs (OneDrive backend and `rclone about` pages).
+- Microsoft 365 plans: Personal 1 TB $99.99/yr, Basic 100 GB $1.99/mo, Family/Premium 2 TB shared for new subscriptions from 2026-10-08; "Restore your OneDrive" 30-day rollback; recycle bin purge after 3 days when full; quota overrun can lead to deletion.
+- Hetzner Storage Box ~€3.20/mo 1 TB, €10.90/mo 5 TB — the price page didn't render during research; re-verify when the M1.5 preset is implemented. Sub-account host/user pattern, port 23, `install-ssh-key`, BX11 10 snapshot slots.
+- BorgBase: 10 GB free, $30/yr 250 GB, $110/yr 1 TB, $210/yr 2 TB, US region, append-only with 2FA.
+- IDrive e2 usage API: unverified; the preset says "where an API exists" — determine at M1.5 implementation.
+- Windows APIs: `GetFinalPathNameByHandle`, `CfGetSyncRootInfoByPath`, `StorageProviderSyncRootManager.GetCurrentSyncRoots()`, OneDrive `HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder`, Dropbox `info.json`, file attributes `RECALL_ON_DATA_ACCESS`/`PINNED`/`UNPINNED`.
+- Whether the Desktop is redirected into OneDrive is checked per machine (OPS-063).
+- Velopack: per-user install to `%LOCALAPPDATA%\<packId>`; install-over / uninstall deletes the folder; update replaces `current\` and force-stops processes; Rust GitHub source supports private repos with a token and reads newest 10 releases; `--channel`; `vpk upload github` needs .NET SDK — docs.velopack.io.
+- VC++ runtime DLLs may be shipped app-local (OPS-094); this supersedes the research file's earlier note that the redistributable installer is required.
+- Azure Artifact Signing $9.99/month, individuals in US/Canada — azure.microsoft.com/en-us/pricing/details/artifact-signing/; Smart App Control blocks unsigned builds — support.microsoft.com SAC FAQ.
+
+## Appendix C. Research notes
+
+The research behind each section is kept in [`docs/research/`](../../research/). It holds dated findings with source links, for re-verification and for the plan. It is reference material, not part of the specification. The workspace-format reference this spec builds on is [`docs/reference/workspace-format.md`](../../reference/workspace-format.md). Where it disagrees with this document, this document wins.
+
+- `research-canvas-engine.md`
+- `research-claude-code.md`
+- `research-image-local-models.md`
+- `research-image-studio-ux.md`
+- `research-llm-providers-cn-part1.md`
+- `research-llm-providers-cn-part2.md`
+- `research-llm-providers-cn-part3.md`
+- `research-llm-providers-west.md`
+- `research-llm-providers.md`
+- `research-media-providers.md`
+- `research-sync-backup-builds.md`

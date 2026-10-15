@@ -1,0 +1,32 @@
+#!/bin/sh
+# Guards main (QA-034, rulings R15 and R17) and runs the privacy scan on every pushed ref
+# (QA-086, ruling R32): see crates/ww-cli/src/dev/hooks.rs. Installed by `ww dev install-hooks`.
+#
+# The privacy scan applies to every branch and tag, so any push that names a ref is handed off
+# to `ww` (R32 updates R17's cheap filter). Only an empty push list passes without a build.
+# Rust stays authoritative. If this script can't tell, it hands off.
+
+# git sends "<local ref> <local sha> <remote ref> <remote sha>" per line on stdin.
+input=$(cat)
+
+printf '%s\n' "$input" | awk 'NF { hit = 1 } END { exit !hit }'
+rc=$?
+# awk exits 1 only when it ran and found no line at all. Any other status (0: found, or a
+# missing or broken awk) hands off.
+if [ "$rc" -eq 1 ]; then
+    exit 0
+fi
+
+# Hooks can run with a PATH that lacks cargo (a GUI client, an IDE): look in the usual place.
+if ! command -v cargo >/dev/null 2>&1; then
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "This push needs the privacy scan (and pushes to main go through \`ww dev merge <PR>\`), but cargo wasn't found on PATH or in \$HOME/.cargo/bin, so it is refused." >&2
+        exit 1
+    fi
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+printf '%s\n' "$input" | cargo run --quiet --locked -p ww-cli --bin ww -- dev hook pre-push "$@"
+exit $?

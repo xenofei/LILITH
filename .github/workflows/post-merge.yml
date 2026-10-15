@@ -1,0 +1,263 @@
+# Post-merge check (QA-035, rulings R24 and R27): every push to main is tested and judged. If
+# anything slipped through, a revert PR and an issue assigned to the owner are opened. Never
+# cancelled: every push to main gets its own run.
+#
+# Two jobs, so the pushed code never runs next to a write token:
+# - post-merge-tests runs the every-push tier on the pushed commit (`after`), read-only.
+# - post-merge-check is the only job in the repo with write access (QA-079). It never runs the
+#   pushed code: it builds `ww` from `before` (main as it was before the push, which was already
+#   judged) in a separate worktree, judges before..after with `ww dev guard --post-merge`, and if
+#   that or the tests failed (or were cancelled), runs `ww dev revert-pr`. Both run inside that
+#   worktree, because ww refuses to work on any checkout but the one it was built in (R38). It
+#   runs with `always()`, so a cancelled or failed test job still gets judged. It uses no sccache,
+#   since the Actions cache is written by jobs that run unreviewed code.
+# - post-merge-check also checks who the pushed commits say they are (QA-086): the same ww, in
+#   the same worktree, runs `ww dev privacy-scan --commits before..after`, which checks the author,
+#   committer and trailer e-mails of every commit in the range. That includes the merge commits
+#   GitHub creates itself when a PR is merged through its API, which no local hook or pre-push scan
+#   ever sees; GitHub writes them with the e-mail the account's web settings give it. Only this
+#   step gets the WW_PRIVACY_DENYLIST secret, and the binary that reads it is built from `before`,
+#   never from the pushed code. A finding (or a scan that couldn't run) fails the job and opens an
+#   issue assigned to the owner. No revert PR: the commit is already public, and a revert keeps it
+#   in history. The issue says what to check and never repeats the e-mail.
+# - When `before` is all zeros the push created the repository's main (R27): the tests run, but
+#   the judge, the identity check and the revert are skipped, and the log says "repository
+#   creation push; nothing to compare".
+#
+# Limits that are inherent to doing this in GitHub Actions:
+# - A push runs the workflow definition from `after`, the commit being judged. A push that edits
+#   this file (or adds a workflow) can change what runs. That is why `.github/workflows/**` is
+#   protected (QA-019, R21, R26), and why main is protected by server-side branch rules.
+# - When `before` has no crates/ww-cli, or `before` isn't in main's history, there is no trusted
+#   `ww`: the check refuses and opens a plain issue. `ww` is never built from the pushed commit,
+#   and the settings are never read from it (R38). The public repository starts with ww on main,
+#   so this only happens if main was rewritten.
+# - A cancelled workflow run (someone pressing Cancel) can stop before the judge runs. The run then
+#   shows as cancelled, not green, and the next push to main judges only its own range, so the
+#   owner has to look at a cancelled post-merge run by hand.
+#
+# Two things the owner needs to know:
+# - The revert PR is opened with the workflow's GITHUB_TOKEN, and GitHub starts no workflows for
+#   events caused by that token. The revert PR therefore gets no checks, and `ww dev merge` won't
+#   merge it until it has them. To get them, close and reopen the PR, or push an empty commit to
+#   its branch as yourself (`git commit --allow-empty -m "run checks"`, then push).
+# - Opening the PR needs the repository setting "Allow GitHub Actions to create and approve pull
+#   requests" (Settings > Actions > General) to be on. That is the owner's step in plan 1 task 15.
+#   Without it, `ww dev revert-pr` still opens the issue, with the verdict, and says so.
+
+name: "CI: post-merge"
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  post-merge-tests:
+    name: post-merge-tests
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-nextest@0.9.146,cargo-deny@0.20.2
+
+      # The every-push tier's test steps, on the pushed commit.
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo-deny
+        run: cargo deny check
+
+      - name: Workspace tests
+        run: cargo nextest run --workspace --locked
+
+      - name: Spec tests
+        run: cargo run --locked -p ww-cli -- dev spec-tests
+
+  post-merge-check:
+    name: post-merge-check
+    needs: post-merge-tests
+    # always(): even a failed or cancelled test job gets judged, and gets its revert PR and issue.
+    if: ${{ always() }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: write # push the revert/<after7>-<attempt> branch
+      pull-requests: write # open the revert PR (and read PRs and reviews to judge the push)
+      issues: write # open the issue assigned to the owner
+    env:
+      CARGO_TERM_COLOR: always
+      BEFORE: ${{ github.event.before }}
+      AFTER: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the judgement walks before..after.
+          fetch-depth: 0
+          # Not kept: the revert branch is pushed with `gh auth git-credential` as git's
+          # credential helper, which reads GH_TOKEN in that one step only.
+          persist-credentials: false
+
+      - name: Choose the source ww is built from
+        id: src
+        run: |
+          judge=true
+          dir=""
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            echo "repository creation push; nothing to compare"
+            judge=false
+          elif ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "::error::main before the push (${BEFORE}) isn't in main's history (was main force-pushed?), so there is no trusted ww to judge with."
+            exit 1
+          elif ! git cat-file -e "${BEFORE}:crates/ww-cli/Cargo.toml" 2>/dev/null; then
+            echo "::error::main before the push (${BEFORE}) has no crates/ww-cli, so there is no trusted ww to judge with. ww is never built from the pushed commit."
+            exit 1
+          else
+            echo "Building ww from main before the push (${BEFORE:0:7})."
+            git worktree add --detach "$RUNNER_TEMP/ww-before" "$BEFORE"
+            dir="$RUNNER_TEMP/ww-before"
+          fi
+          {
+            echo "judge=$judge"
+            echo "dir=$dir"
+            echo "ww=$RUNNER_TEMP/ww-target/debug/ww.exe"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rust toolchain from that source's rust-toolchain.toml
+        if: steps.src.outputs.judge == 'true'
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Build ww
+        id: build
+        if: steps.src.outputs.judge == 'true'
+        working-directory: ${{ steps.src.outputs.dir }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ww-target
+        run: cargo build --locked -p ww-cli
+
+      - name: Judge the push
+        id: guard
+        if: steps.src.outputs.judge == 'true'
+        # ww refuses to work on any checkout but the one it was built in (R38). The judgement
+        # reads only git objects, which the worktree shares with the main checkout.
+        working-directory: ${{ steps.src.outputs.dir }}
+        env:
+          WW: ${{ steps.src.outputs.ww }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          "$WW" dev guard --post-merge --before "$BEFORE" --after "$AFTER"
+
+      - name: Check the pushed commits' identities
+        id: identity
+        # Runs whether or not the judge passed, but only with a ww built from `before` (so never
+        # for repository creation, R27). A commit GitHub created server-side is checked here too.
+        if: ${{ always() && steps.src.outputs.judge == 'true' && steps.build.outcome == 'success' }}
+        # The worktree of `before` that ww was built in (R38), like the judge.
+        working-directory: ${{ steps.src.outputs.dir }}
+        env:
+          WW: ${{ steps.src.outputs.ww }}
+          # A repository secret, not an environment one, like the privacy-check jobs. What protects
+          # it: only the ww built from `before` (main as it was before the push, already judged)
+          # runs in this step, after it was built in the step above without the secret; the pushed
+          # commits are read as git data and never built or run. This step has no token.
+          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
+        run: |
+          if [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
+            echo "::error::The WW_PRIVACY_DENYLIST secret is missing or empty, so the identity check can't run."
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            exit 2
+          fi
+          status=0
+          "$WW" dev privacy-scan --commits "$BEFORE..$AFTER" || status=$?
+          case "$status" in
+            0) echo "result=clean" >> "$GITHUB_OUTPUT" ;;
+            1) echo "result=findings" >> "$GITHUB_OUTPUT" ;;
+            *) echo "result=error" >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit "$status"
+
+      - name: Open a revert PR and an issue
+        # Not for repository creation (R27); otherwise whenever the tests or the judge didn't pass,
+        # including when an earlier step here failed and the judge never ran.
+        if: ${{ always() && steps.src.outputs.judge != 'false' && (needs.post-merge-tests.result != 'success' || steps.guard.outcome != 'success') }}
+        # The worktree ww was built in (R38). The revert branch is made there; the worktree shares
+        # its objects and refs with the main checkout. When no source was chosen (the step above
+        # refused), there is no ww and only the plain issue is opened, from the workspace.
+        working-directory: ${{ steps.src.outputs.dir || github.workspace }}
+        env:
+          WW: ${{ steps.src.outputs.ww }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TESTS_RESULT: ${{ needs.post-merge-tests.result }}
+          OWNER: ${{ github.repository_owner }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          if [ -f "$WW" ] && "$WW" dev revert-pr --before "$BEFORE" --after "$AFTER" --tests-result "$TESTS_RESULT"; then
+            exit 0
+          fi
+          echo "::warning::ww dev revert-pr couldn't run or couldn't open its issue; opening a plain issue instead."
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue create --repo "$GITHUB_REPOSITORY" --assignee "$OWNER" \
+            --title "Post-merge check failed on main at ${AFTER:0:7}" \
+            --body "The post-merge check failed for ${BEFORE:0:7}..${AFTER:0:7} on main (tests: $TESTS_RESULT), and ww couldn't open its own revert PR or issue. Look at the run: $run_url"
+          exit 1
+
+      - name: Open an issue about a commit's identity
+        # No revert PR here: the commit is already public, and history keeps it after a revert.
+        # The body never repeats the e-mail; ww's own output (masked) is only in the run log.
+        if: ${{ always() && steps.identity.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          RESULT: ${{ steps.identity.outputs.result }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$RESULT" = "findings" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --assignee "$OWNER"               --title "A commit on main carries a non-no-reply e-mail"               --body "A commit pushed to main in ${BEFORE:0:7}..${AFTER:0:7} has an author, committer or trailer identity that isn't a GitHub no-reply address (or that matches the privacy denylist). The commit and that identity are now public, and reverting won't remove them from history. This often comes from a merge commit GitHub created itself, which uses the account's e-mail setting. Check Settings > Emails > \"Keep my email addresses private\" on the account, then consider rewriting main's history or recreating the repository. The run names the commit (with the e-mail masked): $run_url"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --assignee "$OWNER"               --title "The post-merge identity check couldn't run on main at ${AFTER:0:7}"               --body "The post-merge identity check for ${BEFORE:0:7}..${AFTER:0:7} on main couldn't run, so the commits' e-mails weren't checked. Look at the run: $run_url"
+          fi
+
+      - name: Fail when the pushed commit's tests didn't pass
+        if: ${{ always() && needs.post-merge-tests.result != 'success' }}
+        env:
+          TESTS_RESULT: ${{ needs.post-merge-tests.result }}
+        run: |
+          echo "::error::The tests on the pushed commit finished as: $TESTS_RESULT"
+          exit 1

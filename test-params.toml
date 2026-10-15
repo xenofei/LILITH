@@ -1,0 +1,17 @@
+# Owner-facing test parameters (QA-019). PROTECTED: changes require owner approval.
+# Plan-1 code does not consume this file yet; .config/nextest.toml carries the
+# same timeout values directly and points back here as the record.
+
+[timeouts]
+unit_s = 30
+integration_s = 120
+# The ww-cli package's tests (real git repositories), an override in .config/nextest.toml.
+ww_cli_s = 300
+spec_s = 300
+
+[proptest]
+cases = 256
+
+[images]
+# IMG-036: max per-channel difference tolerated in image comparisons.
+max_channel_diff = 1

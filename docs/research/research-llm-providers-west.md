@@ -1,0 +1,14 @@
+# LLM providers (West) — verified 2026-10-12 (summary of research agent report; primary sources)
+
+| Provider | Styles | Prices in model list | Cost in response | Account APIs | Rate-limit headers |
+|---|---|---|---|---|---|
+| OpenAI | `/v1/chat/completions`, Responses; no Anthropic-compat | No | No | Admin key: `GET /v1/organization/usage/completions`, `GET /v1/organization/costs` (USD), `POST /v1/organization/spend_limit`; no balance endpoint found | `x-ratelimit-{limit,remaining,reset}-{requests,tokens}` (+ project-tokens), `Retry-After` |
+| Gemini | native `generateContent` / `streamGenerateContent?alt=sse` (recommended for stability); Interactions API (stateful, default since Jun 2026, no batch/explicit cache); OpenAI-compat `/v1beta/openai/` (beta, unlisted params silently ignored) | No | No | None (AI Studio only); spend caps → 429 `RESOURCE_EXHAUSTED` | None documented |
+| xAI | Responses (recommended), chat completions (legacy), `/v1/messages` fully deprecated | **Yes** (USD cents per 100M tokens) | **Yes** `usage.cost_in_usd_ticks` (1e10 ticks = $1) | Management key at `management-api.x.ai`: prepaid balance, usage, invoice preview, spending limits, top-up (USD cents) | None documented |
+| Mistral | `/v1/chat/completions` (+ agents/conversations beta) | No | No | Admin key (`x-api-key`) `/v1/admin/usage` (with currency), `/spend-limit`, `/rate-limit` | `X-RateLimit-Remaining` only |
+
+## Key quirks
+- **OpenAI:** usage chunk last with empty `choices` (missing if stream interrupted); cached `prompt_tokens_details.cached_tokens`, reasoning `completion_tokens_details.reasoning_tokens`, `cache_write_tokens`; tiers Standard/Batch(~50%)/Flex/Fast(premium, renamed from Priority 2026-07-30)/Ultrafast; cache read 0.1× (0.05× GPT-6.1 Sol), cache write 1.25× on GPT-5.6+; long-context price above 272K on some models; +10% data residency.
+- **Gemini:** native `usageMetadata` (`promptTokenCount` includes cached, `cachedContentTokenCount`, `candidatesTokenCount`, `thoughtsTokenCount`, `toolUsePromptTokenCount`); thinking billed as output; thought signatures must be returned with function calling; explicit caching via `cachedContents` with storage billed per hour; Batch 50%, Flex = Batch price, Priority ≈1.8×; **many prices double on 2027-01-01**. OpenAI layer: `parallel_tool_calls`, `strict`, `reasoning_content`, cached/reasoning token details not documented → use native adapter.
+- **xAI:** reasoning in `reasoning_content` (chat) / `reasoning.encrypted_content` must be passed back (Responses); reasoning models reject `stop`/penalties; US regional endpoint 1.1×; batch 20% on some models; priority 2× billed only if response says so; prepaid by default.
+- **Mistral:** reasoning arrives as `{"type":"thinking"}` content chunks; `stream_options` not documented; cached tokens in 64-token multiples; priority 1.75×, regional 1.1×; currency USD or EUR (admin usage returns `currency`).

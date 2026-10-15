@@ -1,0 +1,15 @@
+#version 440
+// One dispatch fills the 256x256 RGBA16F storage image (binding 0). Write-only: nothing is read.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, rgba16f) uniform writeonly image2D outImage;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (p.x >= size.x || p.y >= size.y)
+        return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+    float checker = float(((p.x / 32) + (p.y / 32)) & 1);
+    imageStore(outImage, p, vec4(uv.x, uv.y, 0.35 + 0.4 * checker, 1.0));
+}

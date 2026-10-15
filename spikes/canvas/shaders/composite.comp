@@ -1,0 +1,197 @@
+#version 440
+// Store-only tile composite (IMG-030, IMG-031, IMG-035). One dispatch = one 128x128 output tile
+// (8x8 groups of 16x16). Each invocation walks the program's nodes bottom to top in registers and
+// writes its texel exactly once. Nothing bound here is both read and written:
+//   reads : layer tiles (sampled 2D-array textures, via the storage-buffer slot table), the curves
+//           LUT texture and, in the parent pass, the group intermediate (sampled);
+//   writes: COMPOSITE_GROUP: the group intermediate (RGBA32F, premultiplied, unclamped)
+//           otherwise:       the projection (RGBA8, premultiplied).
+// Built twice by qt_add_shaders: composite_group.comp.qsb (COMPOSITE_GROUP defined) and
+// composite_main.comp.qsb. The formulas are the same as rust/src/cpu_composite.rs.
+//
+// Task 4 (R5) variants, built from the same file with COMPOSITE_FLAT: the program is the whole tree,
+// with the isolated group as GROUP_BEGIN ... GROUP_END nodes, and there is no group pass and no
+// intermediate texture.
+//   composite_single.comp.qsb  (COMPOSITE_FLAT): the parent accumulator stays in registers while the
+//       group accumulates in a second register accumulator. Store-only, SM 5.0, both backends.
+//   composite_inplace.comp.qsb (COMPOSITE_FLAT + COMPOSITE_INPLACE): the projection is bound
+//       read-write. At GROUP_BEGIN the parent backdrop is stored into the projection texel; at
+//       GROUP_END it is loaded back from the projection in place and the group is blended onto it.
+//       imageLoad of an rgba8 image is a typed UAV load of R8G8B8A8_UNORM: SM 5.0 (fxc, D3D11)
+//       rejects it, SM 6.x (dxc, D3D12 with TypedUAVLoadAdditionalFormats) allows it.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#define MAX_NODES 32
+#define MAX_GROUPS 4
+
+#define KIND_PIXEL 0
+#define KIND_GROUP 1
+#define KIND_CURVES 3
+#define KIND_GROUP_BEGIN 4
+#define KIND_GROUP_END 5
+
+#define BLEND_NORMAL 0
+#define BLEND_MULTIPLY 1
+#define BLEND_SCREEN 2
+#define BLEND_OVERLAY 3
+
+// The program (one per group, one for the parent).
+layout(std140, binding = 0) uniform Scene {
+    ivec4 header;             // x = node count, y = slot-table stride (pixel layers), z/w = document size
+    ivec4 nodeI[MAX_NODES];   // x = kind, y = blend, z = pixel layer | group index | LUT row, w = visible
+    vec4 nodeF[MAX_NODES];    // x = opacity
+};
+
+// The job (dynamic offset: one 256-byte slot per dispatch).
+layout(std140, binding = 1) uniform Job {
+    ivec4 job;                       // xy = output tile, z = slot-table row
+    ivec4 atlasOut;                  // xy = this job's region in the group intermediate (group pass)
+    ivec4 groupOrigin[MAX_GROUPS];   // xy = region of group g's result for this tile (parent pass)
+};
+
+// (layer, tile) -> slice: slots[row * stride + pixelLayer] = (array << 16) | slice, or -1 (empty tile).
+layout(std430, binding = 2) readonly buffer Slots {
+    int slots[];
+};
+
+layout(binding = 3) uniform sampler2DArray tiles0;
+layout(binding = 4) uniform sampler2DArray tiles1;
+layout(binding = 5) uniform sampler2DArray tiles2;
+layout(binding = 6) uniform sampler2DArray tiles3;
+layout(binding = 7) uniform sampler2D curvesLut;   // 256 x rows, RGBA8
+layout(binding = 8) uniform sampler2D groupAtlas;  // RGBA32F (a 1x1 dummy in the group pass)
+
+#if defined(COMPOSITE_GROUP)
+layout(binding = 9, rgba32f) uniform writeonly image2D outImage;
+#elif defined(COMPOSITE_INPLACE)
+layout(binding = 9, rgba8) uniform image2D outImage;
+#else
+layout(binding = 9, rgba8) uniform writeonly image2D outImage;
+#endif
+
+vec4 fetchTile(int slot, ivec2 local)
+{
+    int arr = slot >> 16;
+    ivec3 c = ivec3(local, slot & 0xFFFF);
+    if (arr == 0)
+        return texelFetch(tiles0, c, 0);
+    if (arr == 1)
+        return texelFetch(tiles1, c, 0);
+    if (arr == 2)
+        return texelFetch(tiles2, c, 0);
+    return texelFetch(tiles3, c, 0);
+}
+
+float blendChannel(float cb, float ba, float cs, float sa, int mode)
+{
+    if (mode == BLEND_MULTIPLY)
+        return cs * (1.0 - ba) + cb * (1.0 - sa) + cs * cb;
+    if (mode == BLEND_SCREEN)
+        return cs + cb - cs * cb;
+    if (mode == BLEND_OVERLAY) {
+        float m = (2.0 * cb <= ba) ? 2.0 * cs * cb : sa * ba - 2.0 * (ba - cb) * (sa - cs);
+        return cs * (1.0 - ba) + cb * (1.0 - sa) + m;
+    }
+    return cs + cb * (1.0 - sa);
+}
+
+// s and b premultiplied; s has the layer opacity applied.
+vec4 blendOver(vec4 b, vec4 s, int mode)
+{
+    return vec4(blendChannel(b.r, b.a, s.r, s.a, mode),
+                blendChannel(b.g, b.a, s.g, s.a, mode),
+                blendChannel(b.b, b.a, s.b, s.a, mode),
+                s.a + b.a * (1.0 - s.a));
+}
+
+float curveAt(int row, int c, float v)
+{
+    float x = clamp(v, 0.0, 1.0) * 255.0;
+    float i0 = min(floor(x), 254.0);
+    float f = x - i0;
+    float a = texelFetch(curvesLut, ivec2(int(i0), row), 0)[c];
+    float b = texelFetch(curvesLut, ivec2(int(i0) + 1, row), 0)[c];
+    return a + (b - a) * f;
+}
+
+vec4 applyCurves(vec4 b, int row, float opacity)
+{
+    if (b.a <= 0.0)
+        return b;
+    vec4 o = b;
+    for (int c = 0; c < 3; ++c) {
+        float straight = min(b[c] / b.a, 1.0);
+        float adj = curveAt(row, c, straight) * b.a;
+        o[c] = b[c] + (adj - b[c]) * opacity;
+    }
+    return o;
+}
+
+void main()
+{
+    ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 p = job.xy * 128 + local;
+    if (local.x >= 128 || local.y >= 128 || p.x >= header.z || p.y >= header.w)
+        return;
+
+    int rowBase = job.z * header.y;
+    vec4 acc = vec4(0.0);
+#ifdef COMPOSITE_FLAT
+    int gBlend = 0;
+    float gOpacity = 1.0;
+    bool gVisible = true;
+#  ifndef COMPOSITE_INPLACE
+    vec4 parent = vec4(0.0);
+#  endif
+#endif
+    for (int i = 0; i < header.x; ++i) {
+        ivec4 n = nodeI[i];
+#ifdef COMPOSITE_FLAT
+        if (n.x == KIND_GROUP_BEGIN) {
+            gBlend = n.y;
+            gOpacity = nodeF[i].x;
+            gVisible = n.w != 0;
+#  ifdef COMPOSITE_INPLACE
+            imageStore(outImage, p, acc);   // park the parent backdrop in the projection
+#  else
+            parent = acc;
+#  endif
+            acc = vec4(0.0);                // isolated: the group starts from transparent black
+            continue;
+        }
+        if (n.x == KIND_GROUP_END) {
+#  ifdef COMPOSITE_INPLACE
+            vec4 b = imageLoad(outImage, p); // read the backdrop back in place
+#  else
+            vec4 b = parent;
+#  endif
+            acc = gVisible ? blendOver(b, acc * gOpacity, gBlend) : b;
+            continue;
+        }
+#endif
+        if (n.w == 0)
+            continue;
+        float opacity = nodeF[i].x;
+        if (n.x == KIND_PIXEL) {
+            int slot = slots[rowBase + n.z];
+            if (slot < 0)
+                continue;
+            vec4 t = fetchTile(slot, local);
+            float a = t.a * opacity;
+            acc = blendOver(acc, vec4(t.rgb * a, a), n.y);
+        } else if (n.x == KIND_GROUP) {
+#ifndef COMPOSITE_GROUP
+            vec4 g = texelFetch(groupAtlas, groupOrigin[n.z].xy + local, 0);
+            acc = blendOver(acc, g * opacity, n.y);
+#endif
+        } else if (n.x == KIND_CURVES) {
+            acc = applyCurves(acc, n.z, opacity);
+        }
+    }
+
+#ifdef COMPOSITE_GROUP
+    imageStore(outImage, atlasOut.xy + local, acc);
+#else
+    imageStore(outImage, p, clamp(acc, 0.0, 1.0));
+#endif
+}

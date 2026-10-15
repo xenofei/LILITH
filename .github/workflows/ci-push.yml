@@ -1,0 +1,143 @@
+# Every-push tier (QA-070): formatting, lints, cargo-deny, the workspace tests and the spec tests
+# on every push to a branch other than main. `ww dev merge` requires the `every-push` check on the
+# PR's head commit (QA-033). Pushes to main are judged by post-merge.yml instead.
+#
+# Every push runs everything (ruling R25): the repo is public, so GitHub-hosted minutes are free,
+# and a skipped run could report green on untested code.
+#
+# privacy-check (QA-086, rulings R32-R35) runs `ww dev privacy-scan --range` (with the pushed
+# branch name as `--ref-name`) on every commit of the pushed branch that main doesn't have
+# (refs/remotes/origin/main..<pushed sha>). It scans
+# the whole branch, not only before..sha: a later clean push must not turn the check green on a
+# branch whose earlier commits leaked something. `ww dev merge` and the main ruleset require
+# `privacy-check` on the PR's head commit. The denylist comes from the WW_PRIVACY_DENYLIST Actions
+# secret; a missing or empty secret (fork PRs never get secrets) fails the job.
+#
+# The secret must never reach code from the pushed branch (a build.rs or a test could print it).
+# So privacy-check follows ci-guard's pattern (R21): it checks out main, builds `ww` from main
+# without sccache (the Actions cache is written by jobs that run unreviewed code), fetches the
+# pushed commit as git data only, and never builds or runs it. The build is its own step, so
+# main's build scripts never see the secret either; only the built `ww` does. If main has no
+# `ww`, it fails. The workflow file itself comes from the pushed commit, which is why
+# `.github/workflows/**` is protected (QA-019).
+#
+# aws-lc-sys (the rustls crypto provider) builds with the MSVC toolchain on windows-2025; CMake
+# is preinstalled on that image if a future aws-lc-sys needs it. No NASM is needed for
+# x86_64-pc-windows-msvc.
+
+name: "CI: every push"
+
+on:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  every-push:
+    # The check run's name. `ww dev merge` requires it by exactly this name.
+    name: every-push
+    runs-on: windows-2025
+    timeout-minutes: 45
+    concurrency:
+      group: push-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-nextest@0.9.146,cargo-deny@0.20.2
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo-deny
+        run: cargo deny check
+
+      - name: Workspace tests
+        run: cargo nextest run --workspace --locked
+
+      - name: Spec tests
+        run: cargo run --locked -p ww-cli -- dev spec-tests
+
+      - name: Spec traceability report
+        run: cargo run --locked -p ww-cli -- dev spec-report
+
+  privacy-check:
+    # The check run's name. `ww dev merge` and the main ruleset require it by exactly this name.
+    name: privacy-check
+    runs-on: windows-2025
+    timeout-minutes: 30
+    concurrency:
+      group: privacy-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main, not the pushed code: ww is built from main only (ruling R33, as in ci-guard).
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the commits to scan (as git data only)
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags --quiet origin "+refs/heads/main:refs/remotes/origin/main" "$HEAD_SHA"
+          git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+      - name: Rust toolchain from rust-toolchain.toml (main's)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Build ww from main (no secret in this step)
+        run: |
+          if [ ! -f crates/ww-cli/Cargo.toml ]; then
+            echo "::error::main has no ww, so the privacy scan can't run."
+            exit 1
+          fi
+          cargo build --locked -p ww-cli --bin ww
+
+      - name: Privacy scan of the branch's commits that main lacks, with the ww built from main
+        env:
+          # A repository secret, not an environment one: every branch and every PR is scanned, so
+          # an environment would have to admit them all. What protects it is that only the ww
+          # built from main (in the step before, without the secret) runs here; the scanned
+          # commits are read as git data and never built.
+          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
+            echo "::error::The WW_PRIVACY_DENYLIST secret is missing or empty, so the privacy scan can't run."
+            exit 1
+          fi
+          ./target/debug/ww.exe dev privacy-scan --ref-name "$GITHUB_REF" --range "refs/remotes/origin/main..$HEAD_SHA"

@@ -1,0 +1,28 @@
+#!/bin/sh
+# Guards main (QA-034, rulings R16 and R17): see crates/ww-cli/src/dev/hooks.rs.
+# Installed by `ww dev install-hooks`.
+#
+# Cheap filter first: hand off to `ww` only when HEAD is refs/heads/main. `-q` makes a detached
+# HEAD exit 1 quietly (that passes); any other failure hands off, and Rust decides.
+
+head_ref=$(git symbolic-ref -q HEAD)
+rc=$?
+if [ "$rc" -eq 1 ]; then
+    exit 0
+fi
+if [ "$rc" -eq 0 ] && [ "$head_ref" != "refs/heads/main" ]; then
+    exit 0
+fi
+
+# Hooks can run with a PATH that lacks cargo (a GUI client, an IDE): look in the usual place.
+if ! command -v cargo >/dev/null 2>&1; then
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "Merge commits on main aren't allowed locally. This merge needs checking, but cargo wasn't found on PATH or in \$HOME/.cargo/bin, so it is refused." >&2
+        exit 1
+    fi
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+exec cargo run --quiet --locked -p ww-cli --bin ww -- dev hook pre-merge-commit "$@"

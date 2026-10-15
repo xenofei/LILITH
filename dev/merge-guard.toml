@@ -1,0 +1,6 @@
+owner = "xenofei"
+repo = "Worldwright-Suite"
+base_branch = "main"
+reviewer_app_slug = "worldwright-reviewer"
+required_checks = ["every-push", "pr-ready", "protected-test-check", "privacy-check"]
+hooks_path = "tools/git-hooks"

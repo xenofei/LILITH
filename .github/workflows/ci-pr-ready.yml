@@ -1,0 +1,156 @@
+# PR-ready tier (QA-071): everything the every-push tier runs, plus cargo-audit and a release
+# build, on every non-draft PR. `ww dev merge` requires the `pr-ready` check on the PR's head
+# commit (QA-033). On a draft PR, `pr-ready` fails in its first step, on purpose: GitHub counts a
+# skipped job as passing for required checks, so the job is never skipped (R38). Marking the PR
+# ready for review runs it again. `ww dev merge` refuses drafts too.
+#
+# The checkout is GitHub's merge of the PR into its base, so the tests run on what main would
+# become. This job runs the PR's code with a read-only token; the guard's own judgement runs from
+# main in ci-guard.yml.
+#
+# privacy-check-pr (QA-086, rulings R32-R35) runs `ww dev privacy-scan --range` (with the PR's
+# branch name as `--ref-name`) on the PR's commits (refs/remotes/origin/<base>..<head>), drafts
+# included, so the PR shows the privacy
+# verdict for exactly what it would merge. The required check is `privacy-check` from
+# ci-push.yml, which scans the same commits on every push; this job has its own name because a
+# required check name must come from exactly one job. The denylist comes from the
+# WW_PRIVACY_DENYLIST Actions secret; a missing or empty secret (fork PRs never get secrets) fails
+# the job. Like privacy-check, it follows ci-guard's pattern (R21): `ww` is built from main without
+# sccache in a step without the secret, the PR's commits are fetched as git data only, and the
+# PR's code is never built or run. If main has no `ww` yet, it fails.
+
+name: "CI: PR ready"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pr-ready:
+    # The check run's name. `ww dev merge` requires it by exactly this name.
+    name: pr-ready
+    runs-on: windows-2025
+    timeout-minutes: 60
+    concurrency:
+      group: pr-ready-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Drafts fail pr-ready
+        env:
+          DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          if [ "$DRAFT" != "false" ]; then
+            echo "::error::This PR is a draft, so pr-ready fails on purpose (a skipped check would count as passing). Mark the PR ready for review to run it."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-nextest@0.9.146,cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      # ---- the every-push tier ----
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo-deny
+        run: cargo deny check
+
+      - name: Workspace tests
+        run: cargo nextest run --workspace --locked
+
+      - name: Spec tests
+        run: cargo run --locked -p ww-cli -- dev spec-tests
+
+      # ---- PR-ready additions ----
+      - name: cargo-audit
+        run: cargo audit
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      # Plans 2-6 add their PR-ready steps here (QA-071): QtQuickTest, the serialised web view /
+      # clipboard / drag / first-run group, E2E over the pipe, and the real-NTFS reconciler tests.
+
+  privacy-check-pr:
+    name: privacy-check-pr
+    runs-on: windows-2025
+    timeout-minutes: 30
+    concurrency:
+      group: privacy-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main, not the pushed code: ww is built from main only (ruling R33, as in ci-guard).
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the commits to scan (as git data only)
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --quiet origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" "$HEAD_SHA"
+          git rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+      - name: Rust toolchain from rust-toolchain.toml (main's)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Build ww from main (no secret in this step)
+        run: |
+          if [ ! -f crates/ww-cli/Cargo.toml ]; then
+            echo "::error::main has no ww, so the privacy scan can't run."
+            exit 1
+          fi
+          cargo build --locked -p ww-cli --bin ww
+
+      - name: Privacy scan of the PR's commits, with the ww built from main
+        env:
+          # A repository secret, not an environment one: every branch and every PR is scanned, so
+          # an environment would have to admit them all. What protects it is that only the ww
+          # built from main (in the step before, without the secret) runs here; the scanned
+          # commits are read as git data and never built.
+          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
+            echo "::error::The WW_PRIVACY_DENYLIST secret is missing or empty, so the privacy scan can't run."
+            exit 1
+          fi
+          ./target/debug/ww.exe dev privacy-scan --ref-name "refs/heads/$HEAD_REF" --range "refs/remotes/origin/$BASE_REF..$HEAD_SHA"
