@@ -12,19 +12,20 @@ mod conn;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use ww_platform::pipe::{CreateError, client_pid, create_instance};
-use ww_platform::process;
+use ww_platform::{Env, process};
 use ww_protocol::{Request, Response};
 
 use crate::config::{CoreConfig, CoreExit};
 use crate::rpc::RpcRouter;
+use crate::state::{OnFatal, StateError, StateRegistry};
 
 /// Per-connection writer queue (responses and events).
 pub const OUTBOUND_CAPACITY: usize = 256;
@@ -176,6 +177,9 @@ pub struct RunningCore {
     stop: CancellationToken,
     serving: JoinHandle<io::Result<()>>,
     parent_watch: Option<JoinHandle<()>>,
+    state: Arc<StateRegistry>,
+    /// What died, once something reported a fatal error (the state actor, QA-012).
+    fatal: Arc<OnceLock<String>>,
 }
 
 impl RunningCore {
@@ -184,19 +188,28 @@ impl RunningCore {
         &self.pipe
     }
 
+    /// The core's databases: the suite `state.db` and the workspace ones.
+    pub fn state(&self) -> &Arc<StateRegistry> {
+        &self.state
+    }
+
     /// Asks the core to stop. (In this stage it stops serving at once.)
     pub fn request_drain(&self) {
         self.stop.cancel();
     }
 
-    /// Waits until the core has stopped serving.
+    /// Waits until the core has stopped serving. After a fatal error (a database actor died)
+    /// that is [`CoreExit::Fatal`].
     pub async fn wait(self) -> Result<(), CoreExit> {
         let served = self.serving.await;
         if let Some(watch) = self.parent_watch {
             watch.abort();
         }
         match served {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => match self.fatal.get() {
+                Some(what) => Err(CoreExit::Fatal(format!("the {what} actor died"))),
+                None => Ok(()),
+            },
             Ok(Err(e)) => Err(CoreExit::Fatal(format!("the pipe listener failed: {e}"))),
             Err(e) => Err(CoreExit::Fatal(format!("the pipe listener ended: {e}"))),
         }
@@ -211,9 +224,31 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 
 /// [`start`] with the pipe already claimed: the binary claims it before it opens its log
 /// (a core that loses the claim touches nothing).
+///
+/// Opens the suite `state.db` before serving (only the core that owns the pipe opens it, so
+/// it may release the `running` rows of an earlier core). A newer database is
+/// [`CoreExit::StateTooNew`], a damaged one [`CoreExit::StateDamaged`], anything else
+/// [`CoreExit::Startup`]; each is logged with the path, nothing on disk is changed, and the
+/// pipe is released as this returns.
 pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<RunningCore, CoreExit> {
     let pipe = listener.name().to_string();
     let stop = CancellationToken::new();
+    let fatal = Arc::new(OnceLock::new());
+    let on_fatal: OnFatal = {
+        let (stop, fatal) = (stop.clone(), fatal.clone());
+        Arc::new(move |what: &str| {
+            tracing::error!(what, "fatal error; the core stops");
+            let _ = fatal.set(what.to_string());
+            stop.cancel();
+        })
+    };
+    let state = match open_suite_state(&cfg.env, on_fatal) {
+        Ok(state) => Arc::new(state),
+        Err(exit) => {
+            drop(listener);
+            return Err(exit);
+        }
+    };
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe));
     let stats = Arc::new(ServerStats::default());
     let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
@@ -227,6 +262,40 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         stop,
         serving,
         parent_watch,
+        state,
+        fatal,
+    })
+}
+
+/// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6 or 2),
+/// logging each with the path.
+fn open_suite_state(env: &Env, on_fatal: OnFatal) -> Result<StateRegistry, CoreExit> {
+    let path = env.suite_state_db();
+    StateRegistry::open(env, on_fatal).map_err(|e| match e {
+        StateError::TooNew { found, known } => {
+            tracing::error!(
+                path = %path.display(),
+                found,
+                known,
+                "the suite state.db is from a newer version of Worldwright; nothing was changed"
+            );
+            CoreExit::StateTooNew(path)
+        }
+        StateError::Corrupt(why) => {
+            tracing::error!(
+                path = %path.display(),
+                why,
+                "the suite state.db is damaged; nothing was changed"
+            );
+            CoreExit::StateDamaged(path)
+        }
+        other => {
+            tracing::error!(path = %path.display(), error = %other, "cannot open the suite state.db");
+            CoreExit::Startup(format!(
+                "cannot open the state database {}: {other}",
+                path.display()
+            ))
+        }
     })
 }
 

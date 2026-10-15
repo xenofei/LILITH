@@ -15,8 +15,6 @@ tests = [
     { name = "ww-spec-tests::core_dispatch::app_methods_refuse_cli_callers", rule = "ARCH-031", file = "tests/core_dispatch.rs" },
     { name = "ww-spec-tests::core_dispatch::tool_panic_fails_with_bug_and_core_survives", rule = "QA-012", file = "tests/core_dispatch.rs" },
     { name = "ww-spec-tests::core_events::events_have_per_topic_sequence_and_replay_from_cursor", rule = "ARCH-032", file = "tests/core_events.rs" },
-    { name = "ww-spec-tests::core_state::newer_state_db_is_refused_and_kept", rule = "QA-062", file = "tests/core_state.rs" },
-    { name = "ww-spec-tests::core_state::corrupt_state_db_is_refused_and_kept", rule = "CORE-004", file = "tests/core_state.rs" },
     { name = "ww-spec-tests::cli_basics::status_starts_core_and_reports_it", rule = "ARCH-016", file = "tests/cli_basics.rs" },
     { name = "ww-spec-tests::cli_basics::status_no_start_reports_not_running", rule = "ARCH-018", file = "tests/cli_basics.rs" },
     { name = "ww-spec-tests::cli_basics::no_start_call_is_a_silent_noop", rule = "ARCH-018", file = "tests/cli_basics.rs" },

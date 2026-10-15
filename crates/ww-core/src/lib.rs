@@ -1,4 +1,5 @@
-//! Worldwright core. All file writes in this crate go through [`store`] (ARCH-112).
+//! Worldwright core. All file writes in this crate go through [`store`] (ARCH-112); the core's
+//! SQLite databases are [`state`] (CORE-004, CORE-005).
 //!
 //! `config`, `server`, `rpc`, `identity`, `workspace` and `session` are infrastructure, not
 //! CORE-014 modules.
@@ -8,6 +9,7 @@ pub mod identity;
 pub mod rpc;
 pub mod server;
 pub mod session;
+pub mod state;
 pub mod store;
 pub mod workspace;
 

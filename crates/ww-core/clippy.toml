@@ -1,7 +1,7 @@
 # ARCH-112 / QA-024: ww-core writes files only through the store module.
 # Every file-mutating std and tokio call is disallowed here; the allowances are function-level
-# `#[allow(clippy::disallowed_methods)]` attributes in src/store.rs, one per function (enforced
-# by crates/ww-testkit/tests/single_write_allowance.rs).
+# `#[allow(clippy::disallowed_methods)]` attributes in src/store/fsops.rs, one per function
+# (enforced by crates/ww-testkit/tests/single_write_allowance.rs).
 
 disallowed-methods = [
     { path = "std::fs::write", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },

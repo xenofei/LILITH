@@ -2,8 +2,9 @@
 //! (ARCH-005).
 //!
 //! Startup order: the process environment, then the pipe claim (a core that loses it exits 3
-//! having touched nothing, not even its log), then the log, then serving. Exit codes are
-//! [`CoreExit::code`]; 0 is a normal stop.
+//! having touched nothing, not even its log), then the log, then the suite `state.db` (a newer
+//! one exits 6, a damaged one 5, any other failure 2; nothing on disk is changed and the pipe
+//! is released first), then serving. Exit codes are [`CoreExit::code`]; 0 is a normal stop.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
