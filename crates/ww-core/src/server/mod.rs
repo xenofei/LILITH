@@ -1,0 +1,325 @@
+//! The core's transport (ARCH-024–026, ARCH-033): the named-pipe listener, the single instance
+//! per channel, and the running core (infrastructure, not a CORE-014 module).
+//!
+//! - [`claim_pipe`] creates the pipe's *first* instance. If the pipe already exists, another
+//!   core owns the channel and this one exits with code 3 before it touches anything else.
+//! - [`serve`] accepts connections. A new instance is always created before a connected one is
+//!   handed to its task, so the pipe name never disappears while the core runs.
+//! - Each connection runs in [`conn`]: NDJSON framing and the order rules of the [`Router`].
+
+mod conn;
+
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use tokio::net::windows::named_pipe::NamedPipeServer;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
+use ww_platform::pipe::{CreateError, client_pid, create_instance};
+use ww_platform::process;
+use ww_protocol::{Request, Response, RpcError, rpc_code};
+
+use crate::config::{CoreConfig, CoreExit};
+
+/// Per-connection writer queue (responses and events).
+pub const OUTBOUND_CAPACITY: usize = 256;
+
+/// What a [`Router`] knows about one connection.
+#[derive(Debug)]
+pub struct ConnCtx {
+    /// Unique within this core, counting from 1.
+    pub conn_id: u64,
+    /// From `GetNamedPipeClientProcessId` (ARCH-045); 0 if Windows did not report it.
+    pub client_pid: u32,
+    /// Lines to send to the client, without their `\n`.
+    pub outbound: tokio::sync::mpsc::Sender<String>,
+    /// Cancelling it ends the connection.
+    pub close: CancellationToken,
+}
+
+/// Decides what each request on a connection gets.
+pub trait Router: Send + Sync + 'static {
+    /// The connection was accepted; runs before any line is read (e.g. starts the hello
+    /// timeout).
+    fn opened(&self, conn: &ConnCtx);
+    /// `false`: each request is handled inline, in order, before the next line is read, so a
+    /// request pipelined right behind `core/hello` sees the session. `true`: each request
+    /// runs in its own task.
+    fn handshake_done(&self, conn: &ConnCtx) -> bool;
+    /// Handles one request (never a notification). `None` sends nothing.
+    fn handle<'a>(
+        &'a self,
+        conn: &'a ConnCtx,
+        req: Request,
+    ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>>;
+    /// The connection ended; runs exactly once.
+    fn closed(&self, conn: &ConnCtx);
+}
+
+/// Counters the transport keeps.
+#[derive(Debug, Default)]
+pub struct ServerStats {
+    /// Open connections.
+    pub connections: AtomicUsize,
+}
+
+/// The claimed pipe: its first, not yet connected, instance.
+#[derive(Debug)]
+pub struct Listener {
+    name: String,
+    first: NamedPipeServer,
+}
+
+impl Listener {
+    /// The full pipe name, `\\.\pipe\...`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Creates the first instance of `pipe` (a full `\\.\pipe\...` name). If the pipe exists,
+/// another core owns the channel: [`CoreExit::AlreadyRunning`]. Must be called inside a tokio
+/// runtime.
+pub fn claim_pipe(pipe: &str) -> Result<Listener, CoreExit> {
+    match create_instance(pipe, true) {
+        Ok(first) => Ok(Listener {
+            name: pipe.to_string(),
+            first,
+        }),
+        Err(CreateError::AlreadyOwned) => Err(CoreExit::AlreadyRunning),
+        Err(CreateError::Io(e)) => Err(CoreExit::Startup(format!(
+            "cannot create the pipe {pipe}: {e}"
+        ))),
+    }
+}
+
+/// Accepts connections on `listener` until `stop` is cancelled, then closes the pipe, ends
+/// every connection and waits for their tasks. Fails only if a new pipe instance cannot be
+/// created.
+pub async fn serve(
+    listener: Listener,
+    router: Arc<dyn Router>,
+    stats: Arc<ServerStats>,
+    stop: CancellationToken,
+) -> io::Result<()> {
+    let Listener { name, first } = listener;
+    let mut waiting = first;
+    let mut connections = JoinSet::new();
+    let next_id = AtomicU64::new(1);
+    let result = loop {
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => break Ok(()),
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            connected = waiting.connect() => {
+                // A fresh instance first, so the name never disappears (another core could
+                // otherwise claim it).
+                let fresh = match create_instance(&name, false) {
+                    Ok(fresh) => fresh,
+                    Err(e) => break Err(create_error(e)),
+                };
+                let server = std::mem::replace(&mut waiting, fresh);
+                if let Err(e) = connected {
+                    // The client left before the connection completed.
+                    tracing::debug!(error = %e, "a pipe connection failed");
+                    continue;
+                }
+                let client_pid = client_pid(&server).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "the client's process id is unknown");
+                    0
+                });
+                let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
+                stats.connections.fetch_add(1, Ordering::SeqCst);
+                let counted = Counted(stats.clone());
+                let router = router.clone();
+                let close = stop.child_token();
+                connections.spawn(async move {
+                    let _counted = counted;
+                    conn::run(server, conn_id, client_pid, router, close).await;
+                });
+            }
+        }
+    };
+    // Close the pipe to new clients, then end and wait for every connection (their `close`
+    // tokens are children of `stop`).
+    drop(waiting);
+    stop.cancel();
+    while connections.join_next().await.is_some() {}
+    result
+}
+
+fn create_error(e: CreateError) -> io::Error {
+    match e {
+        CreateError::Io(e) => e,
+        other => io::Error::other(other.to_string()),
+    }
+}
+
+/// Decrements the connection count when a connection task ends, however it ends.
+struct Counted(Arc<ServerStats>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The production router of this stage: every method is -32601. (`core/hello` and the
+/// dispatcher replace it.)
+struct NotFoundRouter;
+
+impl Router for NotFoundRouter {
+    fn opened(&self, _conn: &ConnCtx) {}
+
+    fn handshake_done(&self, _conn: &ConnCtx) -> bool {
+        false
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _conn: &'a ConnCtx,
+        req: Request,
+    ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>> {
+        Box::pin(async move {
+            Some(Response::Error {
+                id: req.id,
+                error: RpcError::new(rpc_code::METHOD_NOT_FOUND, "method not found"),
+            })
+        })
+    }
+
+    fn closed(&self, _conn: &ConnCtx) {}
+}
+
+/// A core that is serving.
+#[derive(Debug)]
+pub struct RunningCore {
+    pipe: String,
+    stop: CancellationToken,
+    serving: JoinHandle<io::Result<()>>,
+    parent_watch: Option<JoinHandle<()>>,
+}
+
+impl RunningCore {
+    /// The pipe the core serves.
+    pub fn pipe_name(&self) -> &str {
+        &self.pipe
+    }
+
+    /// Asks the core to stop. (In this stage it stops serving at once.)
+    pub fn request_drain(&self) {
+        self.stop.cancel();
+    }
+
+    /// Waits until the core has stopped serving.
+    pub async fn wait(self) -> Result<(), CoreExit> {
+        let served = self.serving.await;
+        if let Some(watch) = self.parent_watch {
+            watch.abort();
+        }
+        match served {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(CoreExit::Fatal(format!("the pipe listener failed: {e}"))),
+            Err(e) => Err(CoreExit::Fatal(format!("the pipe listener ended: {e}"))),
+        }
+    }
+}
+
+/// Claims the channel's pipe, then serves it. Must be called inside a tokio runtime.
+pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
+    let listener = claim_pipe(&cfg.env.pipe_name())?;
+    start_claimed(cfg, listener).await
+}
+
+/// [`start`] with the pipe already claimed: the binary claims it before it opens its log
+/// (a core that loses the claim touches nothing).
+pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<RunningCore, CoreExit> {
+    let pipe = listener.name().to_string();
+    let stop = CancellationToken::new();
+    let router: Arc<dyn Router> = Arc::new(NotFoundRouter);
+    let stats = Arc::new(ServerStats::default());
+    let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
+    let parent_watch = cfg
+        .test_parent_pid
+        .filter(|_| cfg.test_tools)
+        .map(|pid| tokio::spawn(watch_test_parent(pid, stop.clone())));
+    tracing::info!(pipe = %pipe, channel = %cfg.env.channel(), "core serving");
+    Ok(RunningCore {
+        pipe,
+        stop,
+        serving,
+        parent_watch,
+    })
+}
+
+/// Test channels: stops the core once the test process `pid` is gone, so a test core never
+/// outlives its test.
+async fn watch_test_parent(pid: u32, stop: CancellationToken) {
+    match process::open(pid) {
+        Ok(parent) => {
+            if let Err(e) = parent.wait().await {
+                tracing::warn!(pid, error = %e, "cannot wait for the test parent; stopping");
+            }
+        }
+        // Gone (`NotFound`), or a PID that now belongs to a process this user cannot open,
+        // which is not the test parent either.
+        Err(e) => tracing::info!(pid, error = %e, "the test parent is not running"),
+    }
+    tracing::info!(pid, "the test parent is gone; stopping");
+    stop.cancel();
+}
+
+/// A core on its own multi-thread runtime, for in-process tests. Dropping it stops the core.
+#[derive(Debug)]
+pub struct CoreThread {
+    core: Option<RunningCore>,
+    rt: Option<tokio::runtime::Runtime>,
+}
+
+impl CoreThread {
+    pub fn core(&self) -> &RunningCore {
+        self.core.as_ref().expect("the core runs until drop")
+    }
+}
+
+impl Drop for CoreThread {
+    fn drop(&mut self) {
+        let (Some(core), Some(rt)) = (self.core.take(), self.rt.take()) else {
+            return;
+        };
+        core.request_drain();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Inside another runtime blocking is not allowed; let it wind down by itself.
+            rt.shutdown_background();
+            return;
+        }
+        let _ = rt.block_on(async { tokio::time::timeout(STOP_WAIT, core.wait()).await });
+        rt.shutdown_timeout(STOP_WAIT);
+    }
+}
+
+/// How long dropping a [`CoreThread`] waits for its core to stop.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Starts a core on a new multi-thread runtime owned by the returned [`CoreThread`].
+///
+/// # Panics
+/// If the runtime cannot be built or the core cannot start; call it outside any runtime.
+pub fn start_in_thread(cfg: CoreConfig) -> CoreThread {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("cannot build the core's runtime");
+    let core = rt
+        .block_on(start(cfg))
+        .unwrap_or_else(|e| panic!("the core did not start: {e}"));
+    CoreThread {
+        core: Some(core),
+        rt: Some(rt),
+    }
+}

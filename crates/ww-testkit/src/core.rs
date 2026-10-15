@@ -74,7 +74,13 @@ impl CoreFixture {
     /// # Panics
     /// If `ww-core.exe` is missing or cannot be started.
     pub fn spawn_raw(env: &TestEnv) -> KillOnDrop {
-        KillOnDrop(spawn_core(env, &ensure_built().ww_core, &[]))
+        CoreFixture::spawn_raw_with_env(env, &[])
+    }
+
+    /// [`CoreFixture::spawn_raw`] with extra variables; each replaces a `child_env` variable
+    /// of the same name (compared case-insensitively).
+    pub fn spawn_raw_with_env(env: &TestEnv, extra: &[(&str, &str)]) -> KillOnDrop {
+        KillOnDrop(spawn_core(env, &ensure_built().ww_core, extra))
     }
 
     fn launch(env: &TestEnv, exe: &Path, extra: &[(&str, &str)]) -> CoreFixture {

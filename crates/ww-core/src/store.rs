@@ -32,6 +32,30 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Folder creation. (Plan 2a's state task moves this module, with `write_file_atomic`, into
+/// `store/fsops.rs`; the path `store::fsops` stays.)
+pub mod fsops {
+    use std::path::Path;
+
+    /// Creates `path` and any missing parents; an existing folder is fine.
+    #[allow(clippy::disallowed_methods)]
+    pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test] // spec: ARCH-112
+        fn ensure_dir_creates_nested_dirs() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let nested = dir.path().join("a").join("b c");
+            super::ensure_dir(&nested).expect("first call");
+            super::ensure_dir(&nested).expect("an existing folder is fine");
+            assert!(nested.is_dir());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::write_file_atomic;

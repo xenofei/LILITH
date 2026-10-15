@@ -6,8 +6,29 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The `ww-core` binary is src/main.rs: a Windows-subsystem executable, so starting it opens no
+# console window (ARCH-005).
+
+[dependencies]
+futures-util.workspace = true
+rusqlite.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `fs` only so clippy.toml can name the `tokio::fs` paths it forbids (ARCH-112).
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+ww-platform = { path = "../ww-platform" }
+ww-protocol = { path = "../ww-protocol" }
+ww-schema = { path = "../ww-schema" }
+
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+ww-testkit = { path = "../ww-testkit" }
 
 [lints]
 workspace = true

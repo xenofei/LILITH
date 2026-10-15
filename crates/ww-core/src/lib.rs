@@ -1,3 +1,13 @@
 //! Worldwright core. All file writes in this crate go through [`store`] (ARCH-112).
+//!
+//! `config` and `server` are infrastructure, not CORE-014 modules.
 
+pub mod config;
+pub mod server;
 pub mod store;
+
+pub use config::{CoreConfig, CoreExit};
+pub use server::{
+    ConnCtx, CoreThread, Listener, OUTBOUND_CAPACITY, Router, RunningCore, ServerStats, claim_pipe,
+    serve, start, start_claimed, start_in_thread,
+};
