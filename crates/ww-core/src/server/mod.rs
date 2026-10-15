@@ -26,6 +26,7 @@ use ww_protocol::{Request, Response};
 use crate::config::{CoreConfig, CoreExit};
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
+use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
 
 /// Per-connection writer queue (responses and events).
 pub const OUTBOUND_CAPACITY: usize = 256;
@@ -178,6 +179,8 @@ pub struct RunningCore {
     serving: JoinHandle<io::Result<()>>,
     parent_watch: Option<JoinHandle<()>>,
     state: Arc<StateRegistry>,
+    /// The gates `test.block` waits on (test channels).
+    test_gates: Arc<TestGates>,
     /// What died, once something reported a fatal error (the state actor, QA-012).
     fatal: Arc<OnceLock<String>>,
 }
@@ -191,6 +194,11 @@ impl RunningCore {
     /// The core's databases: the suite `state.db` and the workspace ones.
     pub fn state(&self) -> &Arc<StateRegistry> {
         &self.state
+    }
+
+    /// The gates of the test-channel tool `test.block`: in-process tests open them.
+    pub fn test_gates(&self) -> &TestGates {
+        &self.test_gates
     }
 
     /// Asks the core to stop. (In this stage it stops serving at once.)
@@ -249,7 +257,15 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             return Err(exit);
         }
     };
-    let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe));
+    let test_gates = Arc::new(TestGates::new());
+    let dispatcher = Dispatcher::new(
+        core_registry(cfg.test_tools, &test_gates, &state),
+        PipelineHooks::plan2(),
+        state.clone(),
+        cfg.ids.clone(),
+        cfg.clock.clone(),
+    );
+    let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
     let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
     let parent_watch = cfg
@@ -263,6 +279,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         serving,
         parent_watch,
         state,
+        test_gates,
         fatal,
     })
 }

@@ -2,7 +2,15 @@
 //! SQLite databases are [`state`] (CORE-004, CORE-005).
 //!
 //! `config`, `server`, `rpc`, `identity`, `workspace` and `session` are infrastructure, not
-//! CORE-014 modules.
+//! CORE-014 modules. The registry and the dispatcher are the [`tools`] module.
+//!
+//! Lint policy: `clippy::result_large_err` is allowed crate-wide. The plan fixes many
+//! signatures that return `Result<_, ErrorBody>`; `ErrorBody` is the wire error result, built
+//! at most once per call, so boxing it would only add noise.
+#![allow(
+    clippy::result_large_err,
+    reason = "ErrorBody is the wire error result the plan's signatures return; see the crate docs"
+)]
 
 pub mod config;
 pub mod identity;
@@ -11,6 +19,7 @@ pub mod server;
 pub mod session;
 pub mod state;
 pub mod store;
+pub mod tools;
 pub mod workspace;
 
 pub use config::{CoreConfig, CoreExit};

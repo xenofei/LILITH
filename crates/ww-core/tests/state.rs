@@ -292,10 +292,14 @@ fn running_rows_are_released_on_reopen() {
     assert_eq!(rows(&path).len(), 3);
 
     let db = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("reopen");
-    // The call that died with the earlier core is released; the 30-day-old outcome is pruned.
+    // The call that died with the earlier core is released. Old outcomes wait for the next
+    // `idem_begin`, which prunes by the caller's clock.
     assert_eq!(
         rows(&path),
-        vec![("cli|none".into(), "recent".into(), "done".into())]
+        vec![
+            ("cli|none".into(), "old".into(), "done".into()),
+            ("cli|none".into(), "recent".into(), "done".into()),
+        ]
     );
     runtime().block_on(async {
         assert_eq!(
@@ -304,11 +308,69 @@ fn running_rows_are_released_on_reopen() {
                 .unwrap(),
             IdemBegin::Fresh
         );
+        // The 30-day-old outcome is gone, so its key is fresh again.
+        assert_eq!(
+            db.idem_begin("cli|none", "old", "h", now).await.unwrap(),
+            IdemBegin::Fresh
+        );
         assert_eq!(
             db.idem_begin("cli|none", "recent", "h", now).await.unwrap(),
             IdemBegin::Replay("{}".into())
         );
     });
+}
+
+#[test] // spec: CORE-016
+fn prune_uses_the_callers_clock() {
+    // Rows stamped by a clock far ahead of the system clock (a `FakeClock` starts in 2027)
+    // are pruned only when that same clock says they are 30 days old.
+    let env = TestEnv::new();
+    let path = env.root().join("state.db");
+    let db = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("open");
+    let fake_now = now_secs() + 400 * 24 * 60 * 60;
+    runtime().block_on(async {
+        assert_eq!(
+            db.idem_begin("cli|none", "k", "h", fake_now).await.unwrap(),
+            IdemBegin::Fresh
+        );
+        db.idem_finish("cli|none", "k", Some("{}".into()))
+            .await
+            .unwrap();
+        // 29 days later by the same clock: still replayed.
+        let later = fake_now + THIRTY_DAYS - 24 * 60 * 60;
+        assert_eq!(
+            db.idem_begin("cli|none", "k", "h", later).await.unwrap(),
+            IdemBegin::Replay("{}".into())
+        );
+        // 31 days later: pruned, so the key is fresh.
+        let much_later = fake_now + THIRTY_DAYS + 24 * 60 * 60;
+        assert_eq!(
+            db.idem_begin("cli|none", "k", "h", much_later)
+                .await
+                .unwrap(),
+            IdemBegin::Fresh
+        );
+    });
+    drop(db);
+    // Reopening by the system clock prunes nothing the fake clock stamped.
+    let db = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("reopen");
+    runtime().block_on(async {
+        assert_eq!(
+            db.idem_begin("cli|none", "j", "h", fake_now).await.unwrap(),
+            IdemBegin::Fresh
+        );
+        db.idem_finish("cli|none", "j", Some("{}".into()))
+            .await
+            .unwrap();
+    });
+    drop(db);
+    let db = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("reopen");
+    drop(db);
+    assert_eq!(
+        rows(&path),
+        vec![("cli|none".into(), "j".into(), "done".into())],
+        "the running row k is released on reopen; j is kept"
+    );
 }
 
 /// `ws` as a resolved workspace: its canonical path without `\\?\`, and its id.
@@ -334,7 +396,10 @@ fn databases_live_where_core_005_says() {
     assert!(env.env.suite_state_db().is_file());
 
     let ws = workspace_ref(&env.make_workspace("alpha"));
-    let a = reg.for_workspace(&ws).expect("the workspace db");
+    let rt = runtime();
+    let a = rt
+        .block_on(reg.for_workspace(&ws))
+        .expect("the workspace db");
     let expected = env
         .env
         .workspace_local_dir(&ws.path)
@@ -343,7 +408,9 @@ fn databases_live_where_core_005_says() {
     assert_eq!(a.path(), expected);
     assert!(expected.is_file());
     // Cached: one actor per database (QA-012).
-    let again = reg.for_workspace(&ws).expect("the workspace db again");
+    let again = rt
+        .block_on(reg.for_workspace(&ws))
+        .expect("the workspace db again");
     assert!(Arc::ptr_eq(&a, &again));
 }
 

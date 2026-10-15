@@ -39,10 +39,6 @@ pub struct WorkspaceRef {
 /// # Panics
 /// When the harness guard is armed and the workspace is registered in a real `suite.toml`
 /// (QA-040).
-#[allow(
-    clippy::result_large_err,
-    reason = "the plan fixes this signature; ErrorBody is the wire error result, built once per call"
-)]
 pub fn resolve_workspace(
     env: &Env,
     requested: &str,

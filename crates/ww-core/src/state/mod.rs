@@ -14,8 +14,13 @@
 //! `state.db` (owner decision 5).
 //!
 //! **Stale rows.** On open, `running` idempotency rows (calls that died with an earlier core)
-//! are deleted and `done` rows older than 30 days are pruned. That is safe because only the
-//! core that owns the channel's pipe opens its databases (startup order: pipe, log, state).
+//! are deleted. That is safe because only the core that owns the channel's pipe opens its
+//! databases (startup order: pipe, log, state). `done` rows older than 30 days are pruned by
+//! `idem_begin`, against the caller's `now`: the same clock that stamped the rows.
+//!
+//! **Workspace databases** are opened on first use, on a blocking thread
+//! (`spawn_blocking`), each behind its own once-cell: opening one workspace's database never
+//! holds up calls for another.
 
 mod migrations;
 
@@ -26,12 +31,12 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension as _, TransactionBehavior, params,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{OnceCell, oneshot};
 use ww_platform::Env;
 
 use crate::store::fsops;
@@ -42,7 +47,7 @@ pub type OnFatal = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `PRAGMA busy_timeout`.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
-/// `done` idempotency rows older than this are pruned on open.
+/// `done` idempotency rows older than this are pruned by `idem_begin`.
 const DONE_KEPT_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Which kind of database: it decides the migrations.
@@ -185,7 +190,7 @@ impl StateDb {
             Migrate::State(e) => e,
             Migrate::Sql(e) => sql_error(&e),
         })?;
-        release_stale(&mut conn, utc_now_secs()).map_err(|e| sql_error(&e))?;
+        release_running(&mut conn).map_err(|e| sql_error(&e))?;
 
         let (jobs, inbox) = mpsc::channel::<Job>();
         let actor = std::thread::Builder::new()
@@ -231,6 +236,9 @@ impl StateDb {
     /// Looks up `(scope_key, key)`: no row → a `running` row is inserted ([`IdemBegin::Fresh`]);
     /// the same `args_hash` and `done` → [`IdemBegin::Replay`]; the same hash and `running` →
     /// [`IdemBegin::InProgress`]; another hash → [`IdemBegin::Conflict`].
+    ///
+    /// First, in the same transaction, `done` rows created more than 30 days before
+    /// `now_utc_secs` are pruned, so rows and pruning use the caller's clock.
     pub async fn idem_begin(
         &self,
         scope_key: &str,
@@ -433,18 +441,14 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<i64, Migrate> {
     }
 }
 
-/// Deletes the `running` rows of calls that died with an earlier core and prunes `done` rows
-/// older than 30 days.
-fn release_stale(conn: &mut Connection, now_utc_secs: i64) -> rusqlite::Result<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let released = tx.execute("DELETE FROM idempotency WHERE state = 'running'", [])?;
-    let pruned = tx.execute(
-        "DELETE FROM idempotency WHERE state = 'done' AND created_utc < ?1",
-        params![now_utc_secs - DONE_KEPT_SECS],
-    )?;
-    tx.commit()?;
-    if released + pruned > 0 {
-        tracing::info!(released, pruned, "stale idempotency rows removed");
+/// Deletes the `running` rows of calls that died with an earlier core.
+fn release_running(conn: &mut Connection) -> rusqlite::Result<()> {
+    let released = conn.execute("DELETE FROM idempotency WHERE state = 'running'", [])?;
+    if released > 0 {
+        tracing::info!(
+            released,
+            "running idempotency rows of an earlier core released"
+        );
     }
     Ok(())
 }
@@ -457,6 +461,13 @@ fn idem_begin(
     now_utc_secs: i64,
 ) -> rusqlite::Result<IdemBegin> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pruned = tx.execute(
+        "DELETE FROM idempotency WHERE state = 'done' AND created_utc < ?1",
+        params![now_utc_secs.saturating_sub(DONE_KEPT_SECS)],
+    )?;
+    if pruned > 0 {
+        tracing::info!(pruned, "idempotency rows older than 30 days pruned");
+    }
     let row: Option<(String, String, Option<String>)> = tx
         .query_row(
             "SELECT args_hash, state, outcome FROM idempotency WHERE scope = ?1 AND key = ?2",
@@ -483,19 +494,13 @@ fn idem_begin(
     Ok(begin)
 }
 
-/// Seconds since 1970 by the system clock, for pruning on open.
-fn utc_now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
 /// The suite database, opened at start, and the workspace databases, opened on first use.
 pub struct StateRegistry {
     env: Env,
     on_fatal: OnFatal,
     suite: StateDb,
-    workspaces: Mutex<HashMap<String, Arc<StateDb>>>,
+    /// One cell per workspace id: the map's lock is held only to find the cell.
+    workspaces: Mutex<HashMap<String, Arc<OnceCell<Arc<StateDb>>>>>,
 }
 
 impl std::fmt::Debug for StateRegistry {
@@ -534,29 +539,45 @@ impl StateRegistry {
     /// The database of `ws` at `Env::workspace_local_dir(ws)\state.db` (CORE-005), opened on
     /// first use and then cached: one actor per file (QA-012).
     ///
+    /// The open (folder, `quick_check`, migrations) runs on a blocking thread behind the
+    /// workspace's own once-cell, so concurrent callers for the same workspace wait for one
+    /// open and other workspaces are not held up. A failed open is retried by the next call.
+    ///
     /// # Errors
     /// As [`StateDb::open`]; [`StateError::Io`] if the workspace's local folder cannot be
-    /// worked out.
-    pub fn for_workspace(&self, ws: &WorkspaceRef) -> Result<Arc<StateDb>, StateError> {
-        let mut open = self
+    /// worked out or the blocking open did not finish.
+    pub async fn for_workspace(&self, ws: &WorkspaceRef) -> Result<Arc<StateDb>, StateError> {
+        let cell = self
             .workspaces
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(db) = open.get(&ws.id) {
-            return Ok(db.clone());
-        }
-        let dir = self
-            .env
-            .workspace_local_dir_for_canonical(&ws.path)
-            .map_err(|e| StateError::Io(e.to_string()))?;
-        let db = Arc::new(StateDb::open_named(
-            &dir.join("state.db"),
-            StateScope::Workspace,
-            format!("ww-state-ws-{}", ws.id),
-            self.on_fatal.clone(),
-        )?);
-        open.insert(ws.id.clone(), db.clone());
-        Ok(db)
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(ws.id.clone())
+            .or_default()
+            .clone();
+        let db = cell
+            .get_or_try_init(|| {
+                let (env, on_fatal, ws) = (self.env.clone(), self.on_fatal.clone(), ws.clone());
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let dir = env
+                            .workspace_local_dir_for_canonical(&ws.path)
+                            .map_err(|e| StateError::Io(e.to_string()))?;
+                        StateDb::open_named(
+                            &dir.join("state.db"),
+                            StateScope::Workspace,
+                            format!("ww-state-ws-{}", ws.id),
+                            on_fatal,
+                        )
+                        .map(Arc::new)
+                    })
+                    .await
+                    .map_err(|e| {
+                        StateError::Io(format!("opening the workspace database stopped: {e}"))
+                    })?
+                }
+            })
+            .await?;
+        Ok(db.clone())
     }
 }
 

@@ -7,7 +7,10 @@
 //! - [`ConnState::Refused`]: the hello named another major version and got the frozen
 //!   `protocol.incompatible` refusal. Everything is -32001 (`core/drain` included, until the
 //!   lifecycle decides it by the drain direction).
-//! - [`ConnState::Ready`]: the session exists. A second hello is -32600.
+//! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `tools/list` and
+//!   `tools/call` go to the [`Dispatcher`] (the `tools` module); `app/*` is refused with
+//!   `caller.not_allowed` for anyone but a verified `ui:*` caller, and is -32601 for one, since
+//!   plan 2 defines no `app/*` method (ARCH-031, APP-040).
 //!
 //! Hello handling follows a fixed order. `protocol` is read first and alone
 //! ([`peek_protocol`]), so a client of any version gets the frozen refusal before any other
@@ -31,16 +34,17 @@ use tokio_util::sync::CancellationToken;
 use ww_platform::process::{ProcessInfo, ProcessInspector};
 use ww_platform::{Env, IdSource};
 use ww_protocol::{
-    BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, HelloParams, HelloResult, Id, Negotiation,
-    Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError, ToolCallParams, WorkspaceInfo,
-    incompatible_refusal, method, negotiate, peek_protocol, rpc_code, schema_hash,
-    shared_capabilities,
+    BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, ErrorBody, HelloParams, HelloResult, Id,
+    Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError, ToolCallParams,
+    ToolOutput, ToolsListParams, ToolsListResult, WorkspaceInfo, codes, incompatible_refusal,
+    method, negotiate, peek_protocol, rpc_code, schema_hash, shared_capabilities,
 };
 
 use crate::config::CoreConfig;
 use crate::identity::{EngineTokens, TrustedDirs, claude_ancestor, resolve_caller};
 use crate::server::{ConnCtx, Router};
 use crate::session::Session;
+use crate::tools::Dispatcher;
 use crate::workspace::resolve_workspace;
 
 /// Where a connection stands in the handshake.
@@ -74,11 +78,13 @@ pub struct RpcRouter {
     instance_id: String,
     core: CoreInfo,
     conns: Mutex<HashMap<u64, Conn>>,
+    dispatcher: Dispatcher,
 }
 
 impl RpcRouter {
-    /// A router for the core configured by `cfg`, serving the pipe `pipe`.
-    pub fn new(cfg: &CoreConfig, pipe: &str) -> RpcRouter {
+    /// A router for the core configured by `cfg`, serving the pipe `pipe`, whose tool calls go
+    /// to `dispatcher`.
+    pub fn new(cfg: &CoreConfig, pipe: &str, dispatcher: Dispatcher) -> RpcRouter {
         RpcRouter {
             env: cfg.env.clone(),
             ids: cfg.ids.clone(),
@@ -93,6 +99,7 @@ impl RpcRouter {
                 pipe: pipe.to_string(),
             },
             conns: Mutex::new(HashMap::new()),
+            dispatcher,
         }
     }
 
@@ -114,7 +121,7 @@ impl RpcRouter {
         }
     }
 
-    fn route(&self, conn: &ConnCtx, req: Request) -> Option<Response> {
+    async fn route(&self, conn: &ConnCtx, req: Request) -> Option<Response> {
         let id = req.id?;
         let state = self.state(conn.conn_id).unwrap_or(ConnState::AwaitingHello);
         let response = match (state, req.method.as_str()) {
@@ -134,13 +141,47 @@ impl RpcRouter {
                 rpc_code::HANDSHAKE_REQUIRED,
                 "this connection's core/hello was refused (protocol.incompatible)",
             ),
-            (ConnState::Ready(_), method::TOOLS_CALL) => {
-                match parse_params::<ToolCallParams>(req.params) {
-                    Ok(_) => not_found(id),
+            (ConnState::Ready(session), method::TOOLS_LIST) => {
+                match parse_params::<ToolsListParams>(req.params) {
+                    Ok(ToolsListParams {}) => {
+                        let tools = self.dispatcher.registry().list_for(&session.caller);
+                        outcome(id, Outcome::Ok(ToolsListResult { tools }))
+                    }
                     Err(error) => Response::Error {
                         id: Some(id),
                         error,
                     },
+                }
+            }
+            (ConnState::Ready(session), method::TOOLS_CALL) => {
+                match parse_params::<ToolCallParams>(req.params) {
+                    Ok(params) => outcome(id, self.dispatcher.call(session, params).await),
+                    Err(error) => Response::Error {
+                        id: Some(id),
+                        error,
+                    },
+                }
+            }
+            (ConnState::Ready(session), m) if m.starts_with(method::APP_PREFIX) => {
+                match session.caller {
+                    // Plan 2 defines no `app/*` method.
+                    CallerKind::Ui(_) => not_found(id),
+                    _ => {
+                        let trace_id = self.ids.id("t");
+                        tracing::info!(
+                            conn_id = conn.conn_id,
+                            method = m,
+                            caller = %session.caller,
+                            trace_id,
+                            "app/* refused: the caller is not an app"
+                        );
+                        let error = ErrorBody::new(
+                            &codes::CALLER_NOT_ALLOWED,
+                            format!("{m} is for Worldwright apps only."),
+                            trace_id,
+                        );
+                        outcome::<ToolOutput>(id, Outcome::Error { error })
+                    }
                 }
             }
             (ConnState::Ready(_), _) => not_found(id),
@@ -354,7 +395,7 @@ impl Router for RpcRouter {
         conn: &'a ConnCtx,
         req: Request,
     ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>> {
-        Box::pin(async move { self.route(conn, req) })
+        Box::pin(self.route(conn, req))
     }
 
     fn closed(&self, conn: &ConnCtx) {

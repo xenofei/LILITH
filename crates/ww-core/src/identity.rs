@@ -91,10 +91,6 @@ impl EngineTokens for NoEngineTokens {
 /// # Errors
 /// - `params.invalid`: an engine token with a declared kind other than `assistant`;
 /// - `caller.engine_token_invalid`: an engine token that does not validate.
-#[allow(
-    clippy::result_large_err,
-    reason = "the plan fixes this signature; ErrorBody is the wire error result, built once per call"
-)]
 pub fn resolve_caller(
     declared: &CallerKind,
     engine_token: Option<&str>,
@@ -214,10 +210,6 @@ mod tests {
         }
     }
 
-    #[allow(
-        clippy::result_large_err,
-        reason = "returns what resolve_caller returns"
-    )]
     fn resolve(
         declared: &str,
         token: Option<&str>,
