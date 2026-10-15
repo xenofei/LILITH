@@ -32,6 +32,24 @@ base64 = "0.23"
 aws-lc-rs = "1"
 # Task 12: the workflow-file tests parse YAML 1.2 (ruling R2: a maintained parser, not serde_yaml).
 yaml-rust2 = "0.13"
+# Plan 2a (core platform I), pinned to the crates.io releases current on 2026-10-15.
+# tokio has no default features; each crate names its own:
+#   ww-platform: net, rt, sync, time
+#   ww-core:     rt-multi-thread, net, io-util, sync, time, macros, fs (+ test-util as a dev feature)
+#   ww-client:   rt, net, io-util, sync, time
+#   ww-testkit:  rt, net, io-util, time
+tokio = { version = "1.53.3", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false, features = ["codec"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
+# Bundled SQLite (CORE-004): the bundled build compiles in FTS5 and JSON1.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Tool schemas, JSON Schema 2020-12 (ARCH-037). ww-protocol depends on it (ARCH-111).
+schemars = "1.2.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json"] }
+tracing-appender = "0.2.5"
+# Session, trace and idempotency ids: ww-platform only, never ww-protocol (ARCH-111).
+getrandom = "0.4.3"
 
 # The reviewer key's scrypt (N = 2^18) takes minutes unoptimised; optimise just the KDF so
 # `ww dev reviewer-setup` / `approve` and their tests stay quick in dev and test builds.

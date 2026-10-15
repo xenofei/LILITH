@@ -3,3 +3,19 @@
 //! lowering (ARCH-110).
 //!
 //! Platform-neutral: this crate has no Qt or Windows dependencies (ARCH-111, QA-027).
+
+pub mod canonical;
+pub mod codes;
+pub mod events;
+pub mod jsonrpc;
+pub mod outcome;
+pub mod session;
+pub mod tools;
+
+pub use canonical::{args_hash, canonical_json};
+pub use codes::CodeSpec;
+pub use events::*;
+pub use jsonrpc::*;
+pub use outcome::*;
+pub use session::*;
+pub use tools::*;
