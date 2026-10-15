@@ -136,27 +136,12 @@ impl FakeGitHub {
     }
 
     /// Adds a run of `workflow` (a file name such as `ci-guard.yml`).
-    pub fn add_workflow_run(
-        &self,
-        workflow: &str,
-        id: u64,
-        event: &str,
-        head_sha: &str,
-        status: &str,
-    ) {
-        self.lock().workflow_runs.push((
-            workflow.into(),
-            WorkflowRun {
-                id,
-                event: event.into(),
-                head_sha: head_sha.into(),
-                status: status.into(),
-            },
-        ));
+    pub fn add_workflow_run(&self, workflow: &str, run: WorkflowRun) {
+        self.lock().workflow_runs.push((workflow.into(), run));
     }
 
-    /// Changes run `id`'s status (a run finishing while `ww dev approve` waits).
-    pub fn set_run_status(&self, id: u64, status: &str) {
+    /// Changes run `id`'s status and conclusion (a run finishing while `ww dev approve` waits).
+    pub fn set_run_status(&self, id: u64, status: &str, conclusion: Option<&str>) {
         for (_, run) in self
             .lock()
             .workflow_runs
@@ -164,6 +149,7 @@ impl FakeGitHub {
             .filter(|(_, r)| r.id == id)
         {
             run.status = status.into();
+            run.conclusion = conclusion.map(str::to_owned);
         }
     }
 
@@ -318,6 +304,7 @@ impl GitHubApi for FakeGitHub {
             return Err(anyhow!("fake: HTTP 403: This workflow is already running"));
         }
         run.status = "queued".into();
+        run.conclusion = None;
         st.reruns.push(run_id);
         Ok(())
     }

@@ -87,6 +87,16 @@ pub struct WorkflowRun {
     pub head_sha: String,
     /// `completed`, or one of the unfinished states (`queued`, `in_progress`, `waiting`, ...).
     pub status: String,
+    /// GitHub's `conclusion` once completed (`success`, `failure`, `cancelled`,
+    /// `action_required`, ...); `None` while unfinished.
+    pub conclusion: Option<String>,
+    /// The workflow file, such as `.github/workflows/ci-guard.yml`.
+    pub path: String,
+    /// `head_repository.full_name`: `owner/repo` the run's commit came from (a fork for fork PRs).
+    pub head_repo: String,
+    /// The numbers in `pull_requests[]`. GitHub lists only PRs from the same repository, so a
+    /// fork PR's run has none.
+    pub pr_numbers: Vec<u64>,
 }
 
 pub trait GitHubApi {
@@ -342,26 +352,47 @@ pub fn parse_commit_pulls(v: &Value) -> Result<Vec<CommitPull>> {
 }
 
 /// Parses `GET .../actions/workflows/{file}/runs`. Fails closed: a body without a
-/// `workflow_runs` array, or an entry without `id`, `event`, `head_sha` or `status`, is an error.
+/// `workflow_runs` array, or an entry without `id`, `event`, `head_sha`, `status`, `path`,
+/// `head_repository.full_name` or a `pull_requests` array of numbered entries, or with a
+/// `conclusion` that is neither null nor a string, is an error.
 pub fn parse_workflow_runs(v: &Value) -> Result<Vec<WorkflowRun>> {
     let arr = v["workflow_runs"]
         .as_array()
         .ok_or_else(|| anyhow!("workflow runs response has no `workflow_runs` array"))?;
     arr.iter()
         .map(|r| {
-            let text = |key: &str| -> Result<String> {
-                r[key]
-                    .as_str()
+            let text = |ptr: &str| -> Result<String> {
+                r.pointer(ptr)
+                    .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .ok_or_else(|| anyhow!("workflow run entry is missing `{key}`"))
+                    .ok_or_else(|| anyhow!("workflow run entry is missing `{ptr}`"))
             };
+            let conclusion = match r.get("conclusion") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(c)) => Some(c.clone()),
+                Some(_) => bail!("workflow run entry has an unusable `conclusion`"),
+            };
+            let pr_numbers = r["pull_requests"]
+                .as_array()
+                .ok_or_else(|| anyhow!("workflow run entry has no `pull_requests` array"))?
+                .iter()
+                .map(|p| {
+                    p["number"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("workflow run pull request has no `number`"))
+                })
+                .collect::<Result<Vec<u64>>>()?;
             Ok(WorkflowRun {
                 id: r["id"]
                     .as_u64()
                     .ok_or_else(|| anyhow!("workflow run entry is missing `id`"))?,
-                event: text("event")?,
-                head_sha: text("head_sha")?,
-                status: text("status")?,
+                event: text("/event")?,
+                head_sha: text("/head_sha")?,
+                status: text("/status")?,
+                conclusion,
+                path: text("/path")?,
+                head_repo: text("/head_repository/full_name")?,
+                pr_numbers,
             })
         })
         .collect()
@@ -957,39 +988,72 @@ mod tests {
     #[test]
     fn workflow_runs_parsing_fails_closed() {
         use serde_json::json;
+        let entry = |id: u64, status: &str, conclusion: Value| {
+            json!({
+                "id": id, "event": "pull_request", "head_sha": "h", "status": status,
+                "conclusion": conclusion, "path": ".github/workflows/ci-guard.yml",
+                "head_repository": {"full_name": "o/r"},
+                "pull_requests": [{"number": 7, "head": {"sha": "h"}}, {"number": 8}]
+            })
+        };
         let ok = json!({"total_count": 2, "workflow_runs": [
-            {"id": 9, "event": "pull_request", "head_sha": "h", "status": "completed", "conclusion": "failure"},
-            {"id": 8, "event": "pull_request", "head_sha": "h", "status": "in_progress", "conclusion": null}
+            entry(9, "completed", json!("failure")),
+            entry(8, "in_progress", Value::Null),
         ]});
+        let run = |id: u64, status: &str, conclusion: Option<&str>| WorkflowRun {
+            id,
+            event: "pull_request".into(),
+            head_sha: "h".into(),
+            status: status.into(),
+            conclusion: conclusion.map(str::to_owned),
+            path: ".github/workflows/ci-guard.yml".into(),
+            head_repo: "o/r".into(),
+            pr_numbers: vec![7, 8],
+        };
         assert_eq!(
             parse_workflow_runs(&ok).unwrap(),
             vec![
-                WorkflowRun {
-                    id: 9,
-                    event: "pull_request".into(),
-                    head_sha: "h".into(),
-                    status: "completed".into()
-                },
-                WorkflowRun {
-                    id: 8,
-                    event: "pull_request".into(),
-                    head_sha: "h".into(),
-                    status: "in_progress".into()
-                },
+                run(9, "completed", Some("failure")),
+                run(8, "in_progress", None)
             ]
         );
         assert_eq!(
             parse_workflow_runs(&json!({"total_count": 0, "workflow_runs": []})).unwrap(),
             vec![]
         );
+        // A fork PR's run lists no pull requests; that parses as an empty list.
+        let mut fork = entry(3, "completed", json!("action_required"));
+        fork["pull_requests"] = json!([]);
+        fork["head_repository"] = json!({"full_name": "someone/fork"});
+        let parsed = parse_workflow_runs(&json!({"workflow_runs": [fork]})).unwrap();
+        assert!(parsed[0].pr_numbers.is_empty());
+        assert_eq!(parsed[0].head_repo, "someone/fork");
+        assert_eq!(parsed[0].conclusion.as_deref(), Some("action_required"));
+
+        let without = |key: &str| {
+            let mut e = entry(1, "completed", json!("failure"));
+            e.as_object_mut().unwrap().remove(key);
+            json!({"workflow_runs": [e]})
+        };
+        let with = |key: &str, value: Value| {
+            let mut e = entry(1, "completed", json!("failure"));
+            e[key] = value;
+            json!({"workflow_runs": [e]})
+        };
         for bad in [
-            serde_json::Value::Null,
+            Value::Null,
             json!({}),
             json!({"message": "Resource not accessible by integration"}),
-            json!({"workflow_runs": [{"event": "pull_request", "head_sha": "h", "status": "completed"}]}),
-            json!({"workflow_runs": [{"id": 1, "head_sha": "h", "status": "completed"}]}),
-            json!({"workflow_runs": [{"id": 1, "event": "pull_request", "status": "completed"}]}),
-            json!({"workflow_runs": [{"id": 1, "event": "pull_request", "head_sha": "h"}]}),
+            without("id"),
+            without("event"),
+            without("head_sha"),
+            without("status"),
+            without("path"),
+            without("head_repository"),
+            without("pull_requests"),
+            with("head_repository", Value::Null),
+            with("pull_requests", json!([{"head": {"sha": "h"}}])),
+            with("conclusion", json!(5)),
         ] {
             assert!(parse_workflow_runs(&bad).is_err(), "{bad}");
         }

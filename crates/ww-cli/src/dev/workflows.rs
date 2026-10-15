@@ -592,23 +592,27 @@ fn workflow_ci_guard_never_runs_head_code() {
     let (text, doc) = get("ci-guard.yml");
     let mut t = triggers(&doc);
     t.sort();
-    // R40: exactly one trigger, so each head commit has exactly one check suite holding
-    // protected-test-check. (A `pull_request_review` trigger made a second suite; the ruleset
-    // then read the first suite's cancelled or failed run.) `ww dev approve` re-runs this
-    // suite's run after posting the approval instead.
+    // R40: every workflow run is its own check suite, and the ruleset refuses a merge while any
+    // suite on the head commit holds a cancelled or failed protected-test-check. So: only
+    // `pull_request`, no `pull_request_review` (it added a run per review), no
+    // `ready_for_review` (a draft-to-ready switch added a run for the same commit; the verdict
+    // doesn't depend on draft state), and no run ever cancels another run of the same commit.
+    // `ww dev approve` re-runs the commit's failed runs after posting the approval instead.
     assert_eq!(t, ["pull_request"]);
     assert!(doc["on"]["pull_request_review"].is_badvalue());
     assert_eq!(
         str_list(&doc["on"]["pull_request"]["types"]),
-        ["opened", "synchronize", "reopened", "ready_for_review"]
+        ["opened", "synchronize", "reopened"]
     );
-    // Per-PR concurrency: a newer push supersedes an older run.
+    // Per-head concurrency, never cancelling: a new push gets a new group, and a second run
+    // for the same commit (a close and reopen) waits instead of cancelling the first.
     let concurrency = &doc["jobs"]["protected-test-check"]["concurrency"];
     assert_eq!(
         s(&concurrency["group"]),
-        "guard-${{ github.event.pull_request.number }}"
+        "guard-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}"
     );
-    assert_eq!(concurrency["cancel-in-progress"].as_bool(), Some(true));
+    assert_eq!(concurrency["cancel-in-progress"].as_bool(), Some(false));
+    assert!(doc["concurrency"].is_badvalue(), "no workflow-level group");
 
     let job = &doc["jobs"]["protected-test-check"];
     assert_eq!(

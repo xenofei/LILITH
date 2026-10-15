@@ -749,6 +749,7 @@ git commit -m "dev: reviewer GitHub App setup and passphrase-gated approvals (QA
   - Leave a comment marking where plans 2–6 add QtQuickTest, E2E and the real-NTFS tests.
 - Create: `.github/workflows/ci-guard.yml`
   - Triggers: `pull_request` (same types) and `pull_request_review` (`submitted`).
+    (Later, R40: `pull_request_review` and `ready_for_review` were dropped and concurrency is per head without cancelling, because each run is its own check suite; `ww dev approve` re-runs the red runs instead.)
   - Job **`protected-test-check`**: `cargo run -p ww-cli -- dev guard --base origin/main --head ${{ github.event.pull_request.head.sha }} --pr ${{ github.event.pull_request.number }}`, then `dev spec-tests`.
   - Uses the default token, read-only.
   - The workflow file is protected.
