@@ -27,6 +27,7 @@ fn stable_env() -> &'static Env {
             user_profile: roots.user_profile,
             registry_root: r"HKCU\Software\Worldwright".to_string(),
             credential_prefix: "Worldwright/".to_string(),
+            workspaces: Vec::new(),
         });
         env
     })

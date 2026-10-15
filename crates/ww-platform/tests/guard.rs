@@ -13,6 +13,7 @@ fn fake_real() -> RealLocations {
         user_profile: PathBuf::from(r"C:\Users\Fake"),
         registry_root: r"HKCU\Software\Worldwright".to_string(),
         credential_prefix: "Worldwright/".to_string(),
+        workspaces: vec![PathBuf::from(r"C:\Users\Fake\Ws")],
     }
 }
 
@@ -210,4 +211,30 @@ fn real_path_matching_is_by_prefix_not_substring_and_case_insensitive() {
     assert!(!real.is_real_path(std::path::Path::new(
         r"C:\Users\Fake\AppData\Roaming2\Worldwright"
     )));
+}
+
+#[test] // spec: QA-040
+fn registered_real_workspace_trips_guard() {
+    arm();
+    let ws = PathBuf::from(r"C:\Users\Fake\Ws");
+    for inside in [
+        ws.clone(),
+        ws.join("projects"),
+        PathBuf::from(r"c:\users\fake\WS\Projects"),
+        PathBuf::from(r"\\?\C:\Users\Fake\Ws\projects"),
+    ] {
+        let msg = panics(|| {
+            let _ = ww_platform::guard::check_workspace(&inside);
+        })
+        .unwrap_or_else(|| panic!("{} must panic", inside.display()));
+        assert!(msg.contains("real Worldwright location"), "{msg}");
+    }
+    for outside in [
+        PathBuf::from(r"C:\Users\Fake\Other"),
+        PathBuf::from(r"C:\Users\Fake\Ws2"),
+        PathBuf::from(r"C:\Users\Fake"),
+    ] {
+        let got = ww_platform::guard::check_workspace(&outside);
+        assert_eq!(got, outside);
+    }
 }

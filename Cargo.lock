@@ -3205,8 +3205,10 @@ dependencies = [
 name = "ww-platform"
 version = "0.0.0"
 dependencies = [
+ "getrandom 0.4.3",
  "sha2 0.11.1",
  "tempfile",
+ "toml 0.8.23",
  "windows",
  "zeroize",
 ]

@@ -13,10 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tempfile::TempDir;
-use ww_platform::{Channel, Env, RealLocations, Roots, arm_test_guard};
-
-/// A fake but well-formed user SID for test pipe names.
-const TEST_SID: &str = "S-1-5-21-1000-2000-3000-1001";
+use ww_platform::{Channel, Env, RealLocations, Roots, TEST_PIPE_SID, arm_test_guard};
 
 /// An isolated `Env`: channel `Test(<8 lowercase hex>)`, roots under a fresh temporary
 /// directory that is deleted on drop.
@@ -49,7 +46,7 @@ impl TestEnv {
         for r in [&roots.roaming, &roots.local, &roots.user_profile] {
             std::fs::create_dir_all(r).expect("cannot create a test root");
         }
-        let env = Env::with_roots(Channel::Test(unique_id()), roots, TEST_SID.to_string());
+        let env = Env::with_roots(Channel::Test(unique_id()), roots, TEST_PIPE_SID.to_string());
         TestEnv { env, _dir: dir }
     }
 

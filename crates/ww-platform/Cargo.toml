@@ -8,7 +8,9 @@ publish.workspace = true
 
 # ARCH-111: ww-platform is the only crate allowed to call Windows APIs.
 [dependencies]
+getrandom.workspace = true
 sha2.workspace = true
+toml.workspace = true
 zeroize.workspace = true
 
 [dependencies.windows]

@@ -11,10 +11,15 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+use crate::process_env::{
+    ENV_CHANNEL, ENV_TEST_IDLE_SECS, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, TEST_PIPE_SID,
+    TestOverrides,
+};
 use crate::volume::{SystemVolumeResolver, VolumeResolver};
 use crate::{guard, known_folders, sid};
 
@@ -62,6 +67,27 @@ impl Channel {
     }
 }
 
+impl FromStr for Channel {
+    type Err = EnvError;
+
+    /// Parses the display form: `stable`, `dev` or `test-<id>` with a valid id.
+    fn from_str(s: &str) -> Result<Channel, EnvError> {
+        let channel = match s {
+            "stable" => Channel::Stable,
+            "dev" => Channel::Dev,
+            _ => match s.strip_prefix("test-") {
+                Some(id) => Channel::Test(id.to_string()),
+                None => return Err(EnvError::InvalidChannel(s.to_string())),
+            },
+        };
+        if channel.is_valid() {
+            Ok(channel)
+        } else {
+            Err(EnvError::InvalidChannel(s.to_string()))
+        }
+    }
+}
+
 impl fmt::Display for Channel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -91,6 +117,13 @@ pub enum EnvError {
     },
     /// The channel cannot be embedded in paths, registry keys or pipe names.
     InvalidChannel(String),
+    /// The process asked for a channel this build does not serve (a stable build serves only
+    /// `stable`; a dev build serves `dev` and `test-<id>`).
+    ChannelNotAllowed { build: String, requested: String },
+    /// A test channel was requested but `WW_TEST_ROOT` is not set.
+    TestRootMissing,
+    /// `WW_TEST_ROOT` is not an absolute path to an existing directory.
+    TestRootInvalid(PathBuf),
 }
 
 impl fmt::Display for EnvError {
@@ -99,6 +132,18 @@ impl fmt::Display for EnvError {
             EnvError::Windows { call, message } => write!(f, "{call} failed: {message}"),
             EnvError::Io { path, source } => write!(f, "{}: {source}", path.display()),
             EnvError::InvalidChannel(c) => write!(f, "invalid channel `{c}`"),
+            EnvError::ChannelNotAllowed { build, requested } => write!(
+                f,
+                "a {build} build cannot run on the `{requested}` channel ({ENV_CHANNEL})"
+            ),
+            EnvError::TestRootMissing => {
+                write!(f, "a test channel needs {ENV_TEST_ROOT} to be set")
+            }
+            EnvError::TestRootInvalid(p) => write!(
+                f,
+                "{ENV_TEST_ROOT} must be an absolute path to an existing folder: {}",
+                p.display()
+            ),
         }
     }
 }
@@ -133,6 +178,74 @@ impl Env {
             user_profile: known_folders::profile()?,
         };
         Ok(Env::with_roots(channel, roots, sid::current_user_sid()?))
+    }
+
+    /// The environment of the running process: [`Env::from_vars`] with the compile-time build
+    /// channel and the real process variables.
+    pub fn from_process() -> Result<Env, EnvError> {
+        Env::from_vars(crate::process_env::BUILD_CHANNEL, &|name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// Resolves the channel from the build channel and the `WW_CHANNEL` variable (ARCH-094).
+    ///
+    /// - A `stable` build serves only `stable`; any other `WW_CHANNEL` is refused.
+    /// - Any other build serves `dev` (the default) and `test-<id>`.
+    /// - A test channel needs `WW_TEST_ROOT`, an absolute existing folder, and uses
+    ///   `<root>\roaming`, `<root>\local` and `<root>\profile` with the fixed
+    ///   [`TEST_PIPE_SID`]. The harness guard is armed with the owner's real locations
+    ///   (including their registered workspaces) *before* the `Env` is built (QA-040).
+    pub fn from_vars(
+        build_channel: &str,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Env, EnvError> {
+        let requested = var(ENV_CHANNEL);
+        let not_allowed = |requested: &str| EnvError::ChannelNotAllowed {
+            build: build_channel.to_string(),
+            requested: requested.to_string(),
+        };
+        let channel = if build_channel == "stable" {
+            match requested.as_deref() {
+                None | Some("stable") => Channel::Stable,
+                Some(other) => return Err(not_allowed(other)),
+            }
+        } else {
+            match requested.as_deref() {
+                None | Some("dev") => Channel::Dev,
+                Some(other) => match other.parse::<Channel>() {
+                    Ok(channel @ Channel::Test(_)) => channel,
+                    Err(e) if other.starts_with("test-") => return Err(e),
+                    _ => return Err(not_allowed(other)),
+                },
+            }
+        };
+        if !matches!(channel, Channel::Test(_)) {
+            return Env::from_system(channel);
+        }
+        let root = PathBuf::from(var(ENV_TEST_ROOT).ok_or(EnvError::TestRootMissing)?);
+        if !root.is_absolute() || !root.is_dir() {
+            return Err(EnvError::TestRootInvalid(root));
+        }
+        guard::arm_test_guard(guard::RealLocations::from_system()?);
+        let roots = Roots {
+            roaming: root.join("roaming"),
+            local: root.join("local"),
+            user_profile: root.join("profile"),
+        };
+        Ok(Env::with_roots(channel, roots, TEST_PIPE_SID.to_string()))
+    }
+
+    /// The test-only knobs from the process variables: all `None` unless this is a test
+    /// channel. A value that does not parse is `None`.
+    pub fn test_overrides(&self, var: &dyn Fn(&str) -> Option<String>) -> TestOverrides {
+        if !matches!(self.channel, Channel::Test(_)) {
+            return TestOverrides::default();
+        }
+        TestOverrides {
+            parent_pid: var(ENV_TEST_PARENT_PID).and_then(|v| v.trim().parse().ok()),
+            idle_secs: var(ENV_TEST_IDLE_SECS).and_then(|v| v.trim().parse().ok()),
+        }
     }
 
     /// Builds an `Env` from explicit roots and SID. Used by `ww-testkit`; never touches the
@@ -172,6 +285,28 @@ impl Env {
     /// `<local>\Worldwright[-<channel>]`
     pub fn local_dir(&self) -> PathBuf {
         guard::check_path(self.roots.local.join(self.channel.app_name()))
+    }
+
+    /// The installed program folder, `<local root>\WorldwrightSuite\current`. Only the stable
+    /// channel is installed; the other channels run from a build folder (ARCH-094). It is a
+    /// sibling of the data folders, never a parent: nothing the suite writes goes inside it.
+    pub fn install_dir(&self) -> Option<PathBuf> {
+        match self.channel {
+            Channel::Stable => Some(guard::check_path(
+                self.roots.local.join("WorldwrightSuite").join("current"),
+            )),
+            Channel::Dev | Channel::Test(_) => None,
+        }
+    }
+
+    /// `data_dir\suite.toml`: the workspace registry.
+    pub fn suite_toml(&self) -> PathBuf {
+        self.data_dir().join("suite.toml")
+    }
+
+    /// `local_dir\state.db`: the suite state database (CORE-005).
+    pub fn suite_state_db(&self) -> PathBuf {
+        self.local_dir().join("state.db")
     }
 
     /// `local_dir\logs`
@@ -400,6 +535,161 @@ mod tests {
             assert!(!Channel::Test(bad.into()).is_valid(), "{bad:?}");
         }
         assert!(!Channel::Test("a".repeat(65)).is_valid());
+    }
+
+    /// A variable lookup over fixed pairs.
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test] // spec: ARCH-095
+    fn channel_parses_from_its_display_form() {
+        assert_eq!("stable".parse::<Channel>().unwrap(), Channel::Stable);
+        assert_eq!("dev".parse::<Channel>().unwrap(), Channel::Dev);
+        assert_eq!(
+            "test-ab_1".parse::<Channel>().unwrap(),
+            Channel::Test("ab_1".into())
+        );
+        for bad in [
+            "", "Stable", "test-", "test-a b", "test", "prod", "test-a/b",
+        ] {
+            assert!(bad.parse::<Channel>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test] // spec: ARCH-095
+    fn dev_build_defaults_to_dev() {
+        let env = Env::from_vars("dev", &vars(&[])).unwrap();
+        assert_eq!(env.channel(), &Channel::Dev);
+        let env = Env::from_vars("dev", &vars(&[(ENV_CHANNEL, "dev")])).unwrap();
+        assert_eq!(env.channel(), &Channel::Dev);
+    }
+
+    #[test] // spec: ARCH-095
+    fn stable_build_refuses_other_channels() {
+        let env = Env::from_vars("stable", &vars(&[])).unwrap();
+        assert_eq!(env.channel(), &Channel::Stable);
+        let env = Env::from_vars("stable", &vars(&[(ENV_CHANNEL, "stable")])).unwrap();
+        assert_eq!(env.channel(), &Channel::Stable);
+        for requested in ["dev", "test-ab", "staging", ""] {
+            let got = Env::from_vars("stable", &vars(&[(ENV_CHANNEL, requested)]));
+            assert!(
+                matches!(
+                    &got,
+                    Err(EnvError::ChannelNotAllowed { build, requested: r })
+                        if build == "stable" && r == requested
+                ),
+                "{requested:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test] // spec: ARCH-095
+    fn dev_build_refuses_unknown_channel() {
+        for requested in ["stable", "staging", "Dev", ""] {
+            let got = Env::from_vars("dev", &vars(&[(ENV_CHANNEL, requested)]));
+            assert!(
+                matches!(
+                    &got,
+                    Err(EnvError::ChannelNotAllowed { build, requested: r })
+                        if build == "dev" && r == requested
+                ),
+                "{requested:?}: {got:?}"
+            );
+        }
+        // A test channel whose id cannot go into names is an invalid channel, not "not allowed".
+        let got = Env::from_vars("dev", &vars(&[(ENV_CHANNEL, "test-a b")]));
+        assert!(matches!(got, Err(EnvError::InvalidChannel(_))), "{got:?}");
+    }
+
+    #[test] // spec: ARCH-095
+    fn test_channel_requires_existing_test_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let missing = dir.path().join("missing");
+
+        let no_root = Env::from_vars("dev", &vars(&[(ENV_CHANNEL, "test-ab")]));
+        assert!(
+            matches!(no_root, Err(EnvError::TestRootMissing)),
+            "{no_root:?}"
+        );
+
+        for bad in [
+            "relative\\root".to_string(),
+            missing.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+            String::new(),
+        ] {
+            let got = Env::from_vars(
+                "dev",
+                &vars(&[(ENV_CHANNEL, "test-ab"), (ENV_TEST_ROOT, &bad)]),
+            );
+            assert!(
+                matches!(&got, Err(EnvError::TestRootInvalid(p)) if p == Path::new(&bad)),
+                "{bad:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test] // spec: ARCH-095
+    fn test_overrides_only_on_test_channels() {
+        let all = [
+            (ENV_TEST_PARENT_PID, "4242"),
+            (ENV_TEST_IDLE_SECS, "7"),
+            (ENV_TEST_ROOT, r"C:\Ignored"),
+        ];
+        let test = Env::with_roots(Channel::Test("ab".into()), roots(), "S-1".into());
+        assert_eq!(
+            test.test_overrides(&vars(&all)),
+            TestOverrides {
+                parent_pid: Some(4242),
+                idle_secs: Some(7)
+            }
+        );
+        // Unset or unparsable values are None.
+        assert_eq!(test.test_overrides(&vars(&[])), TestOverrides::default());
+        assert_eq!(
+            test.test_overrides(&vars(&[
+                (ENV_TEST_PARENT_PID, "pid"),
+                (ENV_TEST_IDLE_SECS, "-1")
+            ])),
+            TestOverrides::default()
+        );
+        for channel in [Channel::Stable, Channel::Dev] {
+            let e = env(channel);
+            assert_eq!(e.test_overrides(&vars(&all)), TestOverrides::default());
+        }
+    }
+
+    #[test] // spec: ARCH-094
+    fn install_dir_only_for_stable_and_data_never_inside_it() {
+        let stable = env(Channel::Stable);
+        let install = stable.install_dir().expect("stable has an install dir");
+        assert_eq!(install, PathBuf::from(r"C:\L\WorldwrightSuite\current"));
+        assert!(!stable.data_dir().starts_with(&install));
+        assert!(!stable.local_dir().starts_with(&install));
+        assert!(!stable.suite_toml().starts_with(&install));
+        assert!(!stable.suite_state_db().starts_with(&install));
+        assert_eq!(
+            stable.suite_toml(),
+            PathBuf::from(r"C:\R\Worldwright\suite.toml")
+        );
+        assert_eq!(
+            stable.suite_state_db(),
+            PathBuf::from(r"C:\L\Worldwright\state.db")
+        );
+        for channel in [Channel::Dev, Channel::Test("ab".into())] {
+            let e = env(channel);
+            assert_eq!(e.install_dir(), None);
+            assert!(e.suite_toml().ends_with("suite.toml"));
+            assert!(e.suite_state_db().ends_with("state.db"));
+        }
     }
 
     #[test] // spec: ARCH-097
