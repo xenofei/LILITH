@@ -493,6 +493,11 @@ The dry runs, each with the expected outcome:
 
 | Date | Check | URL | Outcome |
 | --- | --- | --- | --- |
-| | | | |
-| | | | |
-| | | | |
+| 2026-10-15 | 1. Protected change refused, approved, merged | https://github.com/xenofei/Worldwright-Suite/pull/1 | `ww dev merge` refused until the App approved the exact head; merged after approval. Merge commit author is the no-reply address. |
+| 2026-10-15 | 1. (draft variant) | — | Not run yet. |
+| 2026-10-15 | 2. Stale approval refused | https://github.com/xenofei/Worldwright-Suite/pull/1 | A push after the approval made `ww dev merge` refuse ("hasn't approved this exact commit"); re-approved and merged. |
+| 2026-10-15 | 3. Privacy dry run | — (nothing reached GitHub) | `pre-push` refused a commit with a non-placeholder profile path; the finding was masked. Run against the first instance of this repository, before it was recreated. |
+| 2026-10-15 | 4. Agent-token workflow push | — | GitHub rejected a workflow-file push made with the agent token ("without `workflow` scope"). Workflow changes are pushed by the owner. |
+| 2026-10-15 | 5. Post-merge check | https://github.com/xenofei/Worldwright-Suite/actions/workflows/post-merge.yml | Green on `main` after each merge, including the identity check. |
+| 2026-10-15 | Found and fixed | https://github.com/xenofei/Worldwright-Suite/pull/2 | The ruleset refused a merge because an approval-triggered run cancelled the original `protected-test-check`, leaving a cancelled result next to a passing one. Fixed by one guard run per head and `ww dev approve` re-running it; confirmed on https://github.com/xenofei/Worldwright-Suite/pull/3, where the approval re-ran the check automatically. |
+| 2026-10-15 | Found and fixed | — | A GitHub-created merge commit used the account's web e-mail before "Keep my email addresses private" was in effect. The repository was recreated from a clean commit, and the post-merge identity check was added so this is flagged automatically. |
