@@ -72,6 +72,36 @@
 //!   script or program (`python`, `node`, `pwsh -c`) that opens the files itself. The private
 //!   denylist and the encrypted reviewer key must not rely on these rules alone.
 //!
+//! **Direct `gh` (QA-087).** The owner's full-access GitHub login stays on this PC, because other
+//! projects need it. Inside this repo, git uses only the agent token (a repo-local credential
+//! helper), and agents reach GitHub's CLI only through `ww dev gh -- <args>`, which runs `gh` with
+//! the agent token in the child process and refuses merge, auth and write API calls. A plain `gh`
+//! run by an agent would use the owner's login, so every spelling the matcher can read is denied:
+//! `gh *` (bare `gh` too), `gh.exe *`, and a path to either, unquoted (`*/gh *`, `*/gh.exe *`,
+//! `*\gh.exe *`) or quoted (`*gh.exe" *`, `*/gh' *`, and so on). The older narrow `gh auth ...`,
+//! `gh pr merge` and `gh api *merge*` rules stay: they are redundant while `gh *` is there and
+//! document what matters most if it is ever loosened. `ww dev gh` isn't hit, because its text has
+//! `gh` as an argument after `ww dev`, never as the command or after a `/` or `\`.
+//!
+//! Known limits of the direct-`gh` rules, stated plainly:
+//!
+//! - scripts and subprocesses that call `gh`: `bash -c 'gh ...'`, `sh -c`, `pwsh -c`,
+//!   `cmd /c gh ...`, `env gh ...`, Python (`subprocess`), a Makefile or cargo alias, any program
+//!   that spawns it;
+//! - other spellings: `& gh ...` or `Start-Process gh` in PowerShell, a quoted command name
+//!   (`"gh" pr list`), a copy or link of `gh.exe` under another name, a bare full path with no
+//!   arguments (it only prints help);
+//! - reading gh's stored login directly (its `hosts.yml` or the Windows Credential Manager entry)
+//!   or calling the GitHub API with it (`curl`, a script). The `.worldwright` rules protect only
+//!   the suite's own folder, not gh's;
+//! - a false positive: a path argument that has `/gh ` in it (`git add dev/gh x`) is denied too.
+//!
+//! So the owner's login remains reachable to a determined process running as the same Windows
+//! user. These rules stop an agent from doing it by habit or by a plain command; they don't stop
+//! one that goes around them. The full fix is a separate Windows account for agent sessions, with
+//! no GitHub login in that account (see `docs/dev/merge-guard.md`, section 2.7). GitHub's ruleset
+//! on `main` (no bypass) still blocks a push to `main` or a merge without checks, for anyone.
+//!
 //! **The credential helper.** `* dev git-credential*` denies running `ww dev git-credential`
 //! by hand, which would print the agent token. Pushes still work: git runs the helper itself
 //! (from `credential.helper`, as a child of `git`), never through Claude Code's Bash or
@@ -428,6 +458,29 @@ const MUST_MATCH: &[&str] = &[
     "git merge x --no-verify",
     "gh pr merge 3",
     "gh api -X PUT repos/x/y/pulls/3/merge",
+    // Direct gh (QA-087): any arguments, bare, `.exe`, a path, and in compound commands.
+    "gh pr list",
+    "gh api -X PUT repos/o/r/rulesets/1",
+    "gh",
+    "gh.exe repo view",
+    "gh.exe",
+    "cd x && gh pr merge 3",
+    "git status; gh repo view",
+    "echo y | gh pr list",
+    "C:\\Program Files\\GitHub CLI\\gh.exe pr list",
+    "\"C:\\Program Files\\GitHub CLI\\gh.exe\" pr list",
+    "'C:\\Program Files\\GitHub CLI\\gh.exe' pr list",
+    "/c/Program Files/GitHub CLI/gh.exe pr list",
+    "/c/Program Files/GitHub CLI/gh pr list",
+    "/usr/bin/gh pr list",
+    "\"/usr/bin/gh\" pr list",
+    // Reading GitHub (used to be allowed; now only `ww dev gh` reads).
+    "gh pr view 3",
+    "gh pr create --fill",
+    "gh pr checks 3",
+    "gh api repos/x/y/pulls/3",
+    "gh auth status",
+    "gh auth status -h github.com",
     // Pushes to main written other ways.
     "git push origin main --force",
     "git push --set-upstream origin main",
@@ -517,6 +570,9 @@ const MUST_MATCH_BASH: &[&str] = &[
     "timeout 30 git push origin main",
     "nohup gh pr merge 3",
     "FOO=1 git push origin main",
+    "FOO=1 gh pr list",
+    "timeout 30 gh pr list",
+    "& \"C:\\Program Files\\GitHub CLI\\gh.exe\" pr list",
     "GIT_TRACE=1 git commit -n -m x",
     "time git push --force",
     "command git push origin main",
@@ -533,6 +589,10 @@ const MUST_MATCH_POWERSHELL: &[&str] = &[
     "GH PR MERGE 3",
     "git status; Git Push --Force",
     "CMDKEY /list",
+    "GH.EXE repo view",
+    "Gh Pr List",
+    "& 'C:\\Program Files\\GitHub CLI\\gh.exe' pr list",
+    "& \"C:\\Program Files\\GitHub CLI\\GH.EXE\" pr list",
     "Set-Location repo; git push origin main",
 ];
 
@@ -564,17 +624,25 @@ const MUST_NOT_MATCH: &[&str] = &[
     "git status",
     "git config user.name x",
     "git config --get core.autocrlf",
-    // Reading GitHub.
-    "gh pr view 3",
-    "gh pr create --fill",
-    "gh pr checks 3",
-    "gh api repos/x/y/pulls/3",
-    "gh auth status",
-    "gh auth status -h github.com",
-    // The suite's own tooling.
+    // The suite's own tooling. `ww dev gh` is the agents' way to use gh (QA-087).
     "cargo run -p ww-cli --bin ww -- dev agent-token status",
     "cargo run -p ww-cli --bin ww -- dev gh -- pr view 3",
+    "cargo run -q -p ww-cli -- dev gh -- pr list",
+    ".\\target\\debug\\ww.exe dev gh -- pr view 2",
+    "target/debug/ww.exe dev gh -- pr view 2",
+    "ww dev gh -- issue list",
+    "cd x && ww dev gh -- pr list",
     "cargo run -p ww-cli --bin ww -- dev install-hooks",
+    // Not gh at all, or gh only as text or as part of another name.
+    "git push origin feature/x",
+    "git push origin fix/deny-direct-gh",
+    "git push origin feature/ghost",
+    "git log --oneline gh-pages",
+    "echo gh",
+    "echo gh pr list",
+    "echo gh.exe",
+    "ls gh-notes",
+    "cargo test ugh.exe-name",
     // A denied command only as text.
     "echo gh auth token",
     "git commit -m 'gh pr merge is denied'",
@@ -624,6 +692,10 @@ fn brief_rules_are_present_in_both_shells() {
         "git * --no-verify*",
         "git commit -n*",
         "gh pr merge:*",
+        "gh *",
+        "gh.exe *",
+        "*\\gh.exe *",
+        "*/gh *",
         "gh api *merge*",
         "git config core.hooksPath*",
         "gh auth token*",
@@ -697,6 +769,15 @@ fn matcher_follows_the_documented_examples() {
     assert!(!b("git push *", "git -C . push origin main"));
     assert!(!b("git push *", "git 'push' origin main"));
     assert!(!b("rm *", "/bin/rm -rf build/"));
+    // The direct-gh shapes: a trailing ` *` also matches the bare command; a leading `*` matches
+    // a path prefix but then the bare path needs its own rule.
+    assert!(b("gh *", "gh"));
+    assert!(b("gh *", "gh pr list"));
+    assert!(!b("gh *", "ghost"));
+    assert!(!b("gh *", "echo gh"));
+    assert!(b("*/gh *", "/usr/bin/gh pr list"));
+    assert!(!b("*/gh *", "/usr/bin/gh"));
+    assert!(!b("*/gh *", "ww dev gh -- pr list"));
     // PowerShell ignores case.
     let p =
         |rule: &str, cmd: &str| denying_rule(cmd, &[rule.to_string()], Shell::PowerShell).is_some();

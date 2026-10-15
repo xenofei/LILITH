@@ -68,7 +68,7 @@ The denylist is kept in two places that you keep in sync (section 6): the file `
 
 ### What the guard can't do
 
-- It can't stop someone who has a full-access login to the repository. That is why that login is removed from the PC agents use (step 2.7).
+- It can't fully stop a process that can use a full-access GitHub login on the same PC. Step 2.7 says how the login is kept away from agents, what that leaves open and what closes it.
 - It trusts the passphrase prompt of `ww dev approve`. Build the `ww` you approve with from a clean checkout that agents can't write to, so a modified binary can't capture the passphrase.
 
 ---
@@ -282,9 +282,28 @@ Until the installation accepts, `ww dev approve` still posts approvals, then pri
 
    `agent-token set` reads the token without echo, then asks for the expiry date GitHub showed (`YYYY-MM-DD`, or `none`). It stores the token in Windows Credential Manager as `Worldwright-dev/github/agent-token`. `install-hooks` sets `core.hooksPath` to `tools/git-hooks` and makes git in this clone use only the agent token. Check with `ww dev agent-token status`, which shows the first four characters and the expiry you entered.
 
-### 2.7 Removing the full-access login from the agents' PC
+### 2.7 Keeping the full-access login away from agents
 
-Do this last, and only on the PC agents run on, after step 2.6 works. Agents must have no credential stronger than the agent token.
+Agents must have no credential stronger than the agent token. Step 2.6 gives git that token. This step covers the other door: the GitHub CLI (`gh`), which uses whatever login is stored for the Windows user.
+
+Your full-access login can stay on the PC when other projects need it. This repository then relies on the following, in layers:
+
+1. **git here uses only the agent token.** `ww dev install-hooks` (step 2.6) sets a repo-local credential helper, so pushes and fetches in this clone never use the stored full-access login.
+2. **Agents can't run `gh` directly.** The project's Claude Code settings (`.claude/settings.json`) deny `gh`, `gh.exe` and a path to either, in both the Bash and PowerShell tools, including inside compound commands (`cd x && gh ...`). Agents use `ww dev gh -- <gh arguments>` instead. It runs `gh` with the agent token in the child process only, never your login, and refuses merge, auth and write API calls (see `ww dev gh --help` for what it allows). The older narrower rules (`gh pr merge`, `gh auth token` and so on) stay in the list as a second layer.
+3. **GitHub's ruleset on `main` has no bypass** (section 2.4), so nobody, you included, can push to `main` or merge without the required checks. This holds whatever credential is used.
+4. **The settings file is a protected path.** Changing the deny rules needs your approval of the pull request (`ww dev approve`).
+
+**What this does not stop.** The deny rules read the command text an agent writes, not the program it ends up running. They don't stop a script or subprocess that calls `gh` (`bash -c`, `pwsh -c`, `cmd /c`, `env gh`, Python), a copy of `gh.exe` under another name, or a program that reads the stored login directly (gh's own config file or the Windows Credential Manager entry) and calls the GitHub API. **Your login remains reachable to a determined process running as the same Windows user.** The ruleset still stops that process from landing code on `main`, but it could do other things your login can do, such as changing repository settings. The rules guard against a plain command and an agent's habits, not against an agent that goes around them.
+
+**Owner-only work** (settings, App and token pages, anything needing your login) is best done in the browser, not through an agent session.
+
+#### Stronger isolation (optional)
+
+Choose one of these if the gap above is not acceptable.
+
+**Option A: a separate Windows account for agent sessions.** This is the complete fix. Create a standard (non-administrator) Windows account used only for agent work, and run Claude Code, the clone and the agent token from that account. Don't sign in to GitHub there. The credentials in your own account are in a different profile and are not readable from it. Do step 2.6 again inside that account.
+
+**Option B: log the full-access login out of this PC.** Only if no other project on this PC needs it, and only after step 2.6 works.
 
 1. Log `gh` out:
 
@@ -294,7 +313,7 @@ Do this last, and only on the PC agents run on, after step 2.6 works. Agents mus
    ```
 
 2. Remove the Git Credential Manager entry for github.com: open Windows Credential Manager (search for it in the Start menu), choose **Windows Credentials**, find `git:https://github.com` under Generic Credentials, expand it and choose **Remove**. Leave the `Worldwright-dev/github/agent-token` entry alone: that is the agent token.
-3. From then on, do owner-only work (settings, App and token pages) in the browser, and keep any personal full-access login off this PC. Agents can read and manage PRs with `ww dev gh -- <gh arguments>` (see `ww dev gh --help` for what it allows).
+3. From then on, do owner-only work in the browser and keep any personal full-access login off this PC.
 
 ---
 
@@ -312,7 +331,7 @@ Do this last, and only on the PC agents run on, after step 2.6 works. Agents mus
 
    It merges only when CI is green for the PR's current head commit, any protected changes are approved, and the merge can be pinned to that commit.
 
-Agents never run `ww dev approve`, never use `gh pr merge`, never push to `main` and never use `--no-verify`. The project's Claude Code settings deny those, and the hooks, the ruleset and the post-merge check back that up.
+Agents never run `ww dev approve`, never run `gh` directly (they use `ww dev gh`), never push to `main` and never use `--no-verify`. The project's Claude Code settings deny those, and the hooks, the ruleset and the post-merge check back that up.
 
 ### What the owner does
 
