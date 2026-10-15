@@ -3306,6 +3306,11 @@ version = "0.0.0"
 [[package]]
 name = "ww-spec-tests"
 version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "ww-protocol",
+ "ww-testkit",
+]
 
 [[package]]
 name = "ww-testkit"

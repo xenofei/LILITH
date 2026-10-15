@@ -6,5 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Spec tests drive only stable surfaces (QA-018): the test kit, the protocol types and JSON.
+[dev-dependencies]
+serde_json.workspace = true
+ww-protocol = { path = "../ww-protocol" }
+ww-testkit = { path = "../ww-testkit" }
+
 [lints]
 workspace = true

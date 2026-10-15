@@ -1,5 +1,34 @@
-tests = []
 # Each entry: { name = "<binary>::<test file>::<test fn>", rule = "QA-xxx", file = "tests/....rs" }
 # e.g. name = "ww-spec-tests::smoke::spec_harness_runs" (the JUnit classname::name).
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
+tests = [
+    { name = "ww-spec-tests::core_session::single_core_per_channel", rule = "ARCH-026", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::hello_is_mandatory_first_call", rule = "ARCH-029", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::hello_major_mismatch_is_refused", rule = "ARCH-029", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::hello_minor_mismatch_uses_shared_capabilities", rule = "ARCH-029", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::hello_rejects_unknown_parameters", rule = "ARCH-029", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::drain_is_the_only_call_after_incompatible_hello", rule = "ARCH-023", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::older_client_cannot_drain_newer_core", rule = "ARCH-023", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::forged_engine_token_is_refused_not_downgraded", rule = "ARCH-048", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::declared_ui_from_unverified_process_is_cli", rule = "ARCH-045", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_session::hello_reports_pipe_contract", rule = "ARCH-024", file = "tests/core_session.rs" },
+    { name = "ww-spec-tests::core_dispatch::results_are_exactly_ok_pending_or_error", rule = "QA-001", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::errors_carry_code_category_trace_and_retry", rule = "QA-003", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::unknown_tool_arguments_are_rejected", rule = "CORE-015", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::write_without_idempotency_key_is_refused", rule = "ARCH-035", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::same_key_same_args_returns_same_result", rule = "CORE-016", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::same_key_different_args_is_rejected", rule = "CORE-016", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::agent_destructive_call_without_answer_path_is_unavailable", rule = "QA-016", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::app_methods_refuse_cli_callers", rule = "ARCH-031", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_dispatch::tool_panic_fails_with_bug_and_core_survives", rule = "QA-012", file = "tests/core_dispatch.rs" },
+    { name = "ww-spec-tests::core_events::events_have_per_topic_sequence_and_replay_from_cursor", rule = "ARCH-032", file = "tests/core_events.rs" },
+    { name = "ww-spec-tests::core_state::newer_state_db_is_refused_and_kept", rule = "QA-062", file = "tests/core_state.rs" },
+    { name = "ww-spec-tests::core_state::corrupt_state_db_is_refused_and_kept", rule = "CORE-004", file = "tests/core_state.rs" },
+    { name = "ww-spec-tests::cli_basics::status_starts_core_and_reports_it", rule = "ARCH-016", file = "tests/cli_basics.rs" },
+    { name = "ww-spec-tests::cli_basics::status_no_start_reports_not_running", rule = "ARCH-018", file = "tests/cli_basics.rs" },
+    { name = "ww-spec-tests::cli_basics::no_start_call_is_a_silent_noop", rule = "ARCH-018", file = "tests/cli_basics.rs" },
+    { name = "ww-spec-tests::cli_basics::call_maps_outcomes_to_exit_codes", rule = "ARCH-016", file = "tests/cli_basics.rs" },
+    { name = "ww-spec-tests::cli_basics::non_interactive_destructive_is_confirm_unavailable", rule = "QA-016", file = "tests/cli_basics.rs" },
+    { name = "ww-spec-tests::cli_basics::core_stop_drains_and_exits", rule = "ARCH-023", file = "tests/cli_basics.rs" },
+]
