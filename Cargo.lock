@@ -3460,6 +3460,10 @@ dependencies = [
 [[package]]
 name = "ww-schema"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "ww-spec-tests"

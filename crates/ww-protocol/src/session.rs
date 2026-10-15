@@ -408,6 +408,39 @@ mod tests {
         );
     }
 
+    #[test] // spec: ARCH-029, ARCH-023
+    fn drain_result_wire_is_frozen() {
+        let ok = crate::outcome::Outcome::Ok(DrainResult { draining: true });
+        assert_eq!(
+            serde_json::to_string(&ok).unwrap(),
+            r#"{"status":"ok","draining":true}"#
+        );
+    }
+
+    #[test] // spec: ARCH-029
+    fn hello_result_without_workspace_has_workspace_null() {
+        let result = HelloResult {
+            session_id: "s_1".into(),
+            instance_id: "c_1".into(),
+            protocol: "1.0".into(),
+            build_id: BUILD_ID.into(),
+            schema_hash: "0123456789abcdef".into(),
+            capabilities: vec!["tools.v1".into()],
+            caller_kind: "cli".into(),
+            workspace: None,
+            core: CoreInfo {
+                pid: 7,
+                channel: "test-x".into(),
+                pipe: r"\\.\pipe\p".into(),
+            },
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        let fields = wire.as_object().unwrap();
+        assert_eq!(fields.get("workspace"), Some(&serde_json::Value::Null));
+        assert_eq!(fields.len(), 9, "{wire}");
+        assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
+    }
+
     #[test] // spec: ARCH-029
     fn version_negotiation() {
         assert_eq!(PROTOCOL, v(1, 0));

@@ -1,13 +1,15 @@
-//! What a core needs to run: its `Env`, the clock and ids, the process inspector, and the
-//! timing knobs (infrastructure, not a CORE-014 module).
+//! What a core needs to run: its `Env`, the clock and ids, the process inspector, who it
+//! trusts, and the timing knobs (infrastructure, not a CORE-014 module).
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ww_platform::process::{ProcessInspector, SystemInspector};
+use ww_platform::process::{ProcessInspector, SystemInspector, current_exe_dir};
 use ww_platform::{Channel, Clock, Env, IdSource, RandomIds, SystemClock};
+
+use crate::identity::{EngineTokens, NoEngineTokens, TrustedDirs};
 
 /// A core with no connections, calls or busy blockers exits after this long (ARCH-020).
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(600);
@@ -21,6 +23,10 @@ pub struct CoreConfig {
     pub clock: Arc<dyn Clock>,
     pub ids: Arc<dyn IdSource>,
     pub inspector: Arc<dyn ProcessInspector>,
+    /// The folders whose app and MCP executables are trusted (ARCH-046, ARCH-047).
+    pub trusted: TrustedDirs,
+    /// Checks engine tokens; plan 2 refuses every token (ARCH-048).
+    pub engine_tokens: Arc<dyn EngineTokens>,
     /// 600 s, or `WW_TEST_IDLE_SECS` on a test channel.
     pub idle_after: Duration,
     /// 30 s.
@@ -32,17 +38,21 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    /// The system clock, random ids and the real process inspector, with the `WW_TEST_*`
-    /// overrides from the process environment (read through `env.test_overrides`, so they
-    /// apply on test channels only).
+    /// The system clock, random ids, the real process inspector, the trusted folders of
+    /// `env` (the running executable's folder on dev and test channels) and no engine tokens,
+    /// with the `WW_TEST_*` overrides from the process environment (read through
+    /// `env.test_overrides`, so they apply on test channels only).
     pub fn for_env(env: Env) -> io::Result<CoreConfig> {
         let overrides = env.test_overrides(&|name| std::env::var(name).ok());
         let test_tools = matches!(env.channel(), Channel::Test(_));
+        let trusted = TrustedDirs::for_env(&env, &current_exe_dir()?);
         Ok(CoreConfig {
             env,
             clock: Arc::new(SystemClock::new()),
             ids: Arc::new(RandomIds),
             inspector: Arc::new(SystemInspector),
+            trusted,
+            engine_tokens: Arc::new(NoEngineTokens),
             idle_after: overrides
                 .idle_secs
                 .map_or(DEFAULT_IDLE_AFTER, Duration::from_secs),

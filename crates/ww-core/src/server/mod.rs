@@ -21,9 +21,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use ww_platform::pipe::{CreateError, client_pid, create_instance};
 use ww_platform::process;
-use ww_protocol::{Request, Response, RpcError, rpc_code};
+use ww_protocol::{Request, Response};
 
 use crate::config::{CoreConfig, CoreExit};
+use crate::rpc::RpcRouter;
 
 /// Per-connection writer queue (responses and events).
 pub const OUTBOUND_CAPACITY: usize = 256;
@@ -168,33 +169,6 @@ impl Drop for Counted {
     }
 }
 
-/// The production router of this stage: every method is -32601. (`core/hello` and the
-/// dispatcher replace it.)
-struct NotFoundRouter;
-
-impl Router for NotFoundRouter {
-    fn opened(&self, _conn: &ConnCtx) {}
-
-    fn handshake_done(&self, _conn: &ConnCtx) -> bool {
-        false
-    }
-
-    fn handle<'a>(
-        &'a self,
-        _conn: &'a ConnCtx,
-        req: Request,
-    ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>> {
-        Box::pin(async move {
-            Some(Response::Error {
-                id: req.id,
-                error: RpcError::new(rpc_code::METHOD_NOT_FOUND, "method not found"),
-            })
-        })
-    }
-
-    fn closed(&self, _conn: &ConnCtx) {}
-}
-
 /// A core that is serving.
 #[derive(Debug)]
 pub struct RunningCore {
@@ -240,7 +214,7 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<RunningCore, CoreExit> {
     let pipe = listener.name().to_string();
     let stop = CancellationToken::new();
-    let router: Arc<dyn Router> = Arc::new(NotFoundRouter);
+    let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe));
     let stats = Arc::new(ServerStats::default());
     let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
     let parent_watch = cfg

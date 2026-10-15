@@ -3,16 +3,8 @@
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
 tests = [
-    { name = "ww-spec-tests::core_session::single_core_per_channel", rule = "ARCH-026", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::hello_is_mandatory_first_call", rule = "ARCH-029", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::hello_major_mismatch_is_refused", rule = "ARCH-029", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::hello_minor_mismatch_uses_shared_capabilities", rule = "ARCH-029", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::hello_rejects_unknown_parameters", rule = "ARCH-029", file = "tests/core_session.rs" },
     { name = "ww-spec-tests::core_session::drain_is_the_only_call_after_incompatible_hello", rule = "ARCH-023", file = "tests/core_session.rs" },
     { name = "ww-spec-tests::core_session::older_client_cannot_drain_newer_core", rule = "ARCH-023", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::forged_engine_token_is_refused_not_downgraded", rule = "ARCH-048", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::declared_ui_from_unverified_process_is_cli", rule = "ARCH-045", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::hello_reports_pipe_contract", rule = "ARCH-024", file = "tests/core_session.rs" },
     { name = "ww-spec-tests::core_dispatch::results_are_exactly_ok_pending_or_error", rule = "QA-001", file = "tests/core_dispatch.rs" },
     { name = "ww-spec-tests::core_dispatch::errors_carry_code_category_trace_and_retry", rule = "QA-003", file = "tests/core_dispatch.rs" },
     { name = "ww-spec-tests::core_dispatch::unknown_tool_arguments_are_rejected", rule = "CORE-015", file = "tests/core_dispatch.rs" },
