@@ -129,9 +129,9 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
   3. persist those jobs as `interrupted`;
   4. stop owned engines explicitly.
 
-  A hidden top-level window receives `WM_QUERYENDSESSION`, so logoff and Windows shutdown run the same sequence.
+  A hidden top-level window receives `WM_QUERYENDSESSION`, so logoff and Windows shutdown run the same sequence. (plan 2 clarification: Appendix D)
 - **ARCH-022** [M1] (invariant) On startup, every job without a final state becomes `interrupted` and is never re-run automatically (paid ones especially). Director tasks become `interrupted` too and resume only when you choose (§4.6).
-- **ARCH-023** [M1] A client that sees a major protocol mismatch asks the running core to "drain and exit when safe", waits for it to exit, then starts the new core. Apps show "restart the core when it's idle" meanwhile (§3.2). Suite updates also drain the core first and never run while jobs run (§7.5).
+- **ARCH-023** [M1] A client that sees a major protocol mismatch asks the running core to "drain and exit when safe", waits for it to exit, then starts the new core. Apps show "restart the core when it's idle" meanwhile (§3.2). Suite updates also drain the core first and never run while jobs run (§7.5). (plan 2 clarification) The request is `core/drain` (ARCH-031). Only a client with a greater major version drains a core automatically; an older client reports itself incompatible and leaves the core running (ARCH-014). Drain requests from a compatible (same-major) session are always honoured.
 
 ### 1.2 Connections
 
@@ -143,13 +143,14 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
   | `dev` | development builds, pack id `WorldwrightSuite.Dev` |
   | `test-<id>` | each test run (§6.3) |
 
-  Dev builds and parallel tests therefore never collide with the installed suite.
+  Dev builds and parallel tests therefore never collide with the installed suite. (plan 2 clarification: Appendix D)
 - **ARCH-025** [M1] (contract) The protocol is newline-delimited JSON-RPC 2.0 over stateful connections.
 - **ARCH-026** [M1] (invariant) Every pipe instance carries a security descriptor (SDDL) granting access only to the current user's SID and SYSTEM. The core creates its first instance with `first_pipe_instance(true)` as the singleton check and rejects remote clients. (The apps' own single-instance pipes use the same descriptor, §3.1.)
 - **ARCH-027** [M1] (invariant) Before trusting a pipe, a client verifies the server: `GetNamedPipeServerProcessId` → open that process immediately → its token user must be the current user, and its image path must be the install directory or, for dev builds, the client's own directory.
 - **ARCH-028** [M1] The core holds `LockFileEx` on `<workspace>\.worldwright\core.lock` for each workspace it serves. A second core (another channel) that finds the lock held gets read-only access to that workspace.
 - **ARCH-029** [M1] (contract) The mandatory first call on every connection is the handshake `core/hello`, callable by every caller kind (apps, `ww`, `ww-mcp`, Engine A). Its parameters: protocol `major.minor`, build id, schema hash, capabilities, declared caller kind, whether the caller is non-interactive (ARCH-055), workspace id (explicit, or `"none"`), and for Engine A connections the per-launch engine token and the Claude Code profile id (`WW_PROFILE`, §4.6a).
   - Major version mismatch → refused (`protocol.incompatible`); minor mismatch → the session uses the shared capabilities; unknown parameters → rejected.
+  - (plan 2 clarification) The `core/hello` method and its `protocol` field never change, and the core reads `protocol` before checking any other field. Other hello fields change only with a major version; a minor version adds features only as new `capabilities` strings (Appendix D).
 - **ARCH-030** [M1] (contract) Which workspace a call uses:
   - `mcp` callers: the call's explicit workspace argument, else the workspace containing Claude Code's working directory, else the default workspace in `suite.toml`;
   - Engine A (`assistant`) connections: the workspace id from the handshake (or `"none"`), which overrides the working-directory rule;
@@ -160,11 +161,13 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
   - `tools/*` — the agent-visible tool registry, filtered per caller (e.g. Engine A's permission-prompt tool `approve` is exposed only to engine connections, §4.6);
   - `app/*` — only what is specific to a running app: session, document hold and save, activation and open requests, confirmation answers and `caps.set` (§3.3). `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `ww` and tests;
   - `ww/subscribe`, `ww/unsubscribe` and the `ww/event` notification.
+
+  (plan 2 clarification) `core/drain` asks for "drain and exit when safe" (ARCH-023). On a connection whose `core/hello` was refused with `protocol.incompatible`, it is the only call allowed, and only from a client whose major version is greater than the core's. Its name, parameters and result never change (Appendix D).
 - **ARCH-032** [M1] (contract) `ww/subscribe(topics, since_seq)` delivers `ww/event` notifications with per-topic sequence numbers. The core keeps 10 minutes of history per topic; a cursor older than that gets a snapshot instead. Each client has a bounded queue; overflow sends `resync_required`. External file edits and git activity arrive on the same stream. Topics include `asset:<ref>` for live links.
 - **ARCH-033** [M1] (invariant) Bulk data never goes through the pipe. Calls and events carry file references into the workspace or into a staging/cache folder on the same volume (so ingest is a rename). Small previews (≤ 1 MB) may ride in events. No shared memory.
 - **ARCH-034** [M1] (contract) Long-running work returns a job id immediately.
 - **ARCH-035** [M1] (contract) Every mutating or metered call carries an idempotency key, which the core dedupes and persists with the job (scope and same-key rules in §2.2; Engine A uses session id + tool-use id, §4.6).
-- **ARCH-036** [M1] (contract) Every tool and RPC result is exactly one of `ok`, `pending_confirmation` or `error` (fields in §6.1). `pending_confirmation` is not an error.
+- **ARCH-036** [M1] (contract) Every tool and RPC result is exactly one of `ok`, `pending_confirmation` or `error` (fields in §6.1). `pending_confirmation` is not an error. (plan 2 clarification: Appendix D)
 
 **Tool descriptors and lowering** — tool descriptors are shared; the wire protocols aren't.
 - **ARCH-037** [M1] (contract) Each tool has one internal descriptor: name; description of at most 2,000 characters with the critical information first (Claude Code truncates descriptions at 2,048 characters, verified 2026-10-12); input and output schemas generated by `schemars`, pinned to JSON Schema 2020-12; effect class (ARCH-051); annotations.
@@ -431,6 +434,8 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 | `lfs_store` | Large-file store settings and store changes (§7.2): "This PC only → External drive" (M1); changes involving a cloud store (M1.5) | M1 |
 | `backup` | restic backups, destinations, restore (§7.4) | M1 |
 | `sync` | Local commit and push (M1) — commits only when you press Sync or ask, and optionally on app close or when idle (a setting), never silently otherwise; multi-machine sync with collision handling (M1.5) (§7.3) | M1 |
+
+(plan 2 clarification: Appendix D)
 
 ### 2.2 Dispatcher pipeline (every tool call, every caller)
 
@@ -1714,7 +1719,7 @@ AI agents write most of the code, working on your PC in your account; you test m
   - documents and workspaces: `doc.held_elsewhere`, `store.hash_conflict`, `workspace.required` (no-workspace mode for sign-off, Make candidate, Add to project);
   - protocol: `protocol.incompatible` (`ww-mcp` then exposes only `ww.status`);
   - engines: `engine.claude_code.untested_version` (including any version below the minimum 2.1.268), `engine.claude_code.not_signed_in` (retry policy `after_resolve`), `comfyui.unreachable`, `model.missing`;
-  - providers: `provider.rate_limited`, `provider.spend_limit` (retry policy `never`).
+  - providers: `provider.rate_limited`, `provider.spend_limit` (retry policy `never`). (plan 2 clarification: Appendix D)
 - **QA-006** [M1] (contract) Plan limits and sign-in failures of Claude Code:
   - `quota.plan_limit` is an error for co-pilot calls; for director tasks it is the `waiting_quota` substatus, not an error.
   - An expired Claude Code login (one that can no longer be refreshed): co-pilot calls fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, fix "Sign in to Claude Code"); director tasks go to the `waiting_auth` substatus (§4.6a), distinct from `waiting_quota` and never retried automatically.
@@ -2380,3 +2385,150 @@ The research behind each section is kept in [`docs/research/`](../../research/).
 - `research-llm-providers.md`
 - `research-media-providers.md`
 - `research-sync-backup-builds.md`
+
+## Appendix D. Core protocol (plan 2 clarification)
+
+This appendix records the protocol names, tables and exit codes that plan 2 implements. They are contracts. It adds no rule IDs; it clarifies ARCH-021, ARCH-023, ARCH-024, ARCH-029, ARCH-031, ARCH-036, CORE-014 and QA-005.
+
+- **Pipe:** `\\.\pipe\worldwright-core-<userSID>-<channel>` (ARCH-024). Test channels (`test-<id>`) use the fixed SID `S-1-5-21-1000-2000-3000-1001` in the *name*, so test processes agree on it without querying the token. The pipe's DACL always grants the real user SID and SYSTEM (ARCH-026).
+- **Process environment:**
+
+  | Variable | Meaning |
+  |---|---|
+  | `WW_BUILD_CHANNEL` (compile time) | `stable` only in release packaging; default `dev` |
+  | `WW_BUILD_ID` (compile time) | build id suffix; `build_id` is `<CARGO_PKG_VERSION>+<WW_BUILD_ID or "local">` |
+  | `WW_CHANNEL` | a dev build accepts `dev` or `test-<id>`; a stable build refuses any value but `stable` |
+  | `WW_TEST_ROOT` | test channels only: `<root>\{roaming,local,profile}` |
+  | `WW_TEST_PARENT_PID` | test channels only |
+  | `WW_TEST_IDLE_SECS` | test channels only |
+
+- **Framing** (ARCH-025): one JSON-RPC 2.0 object per line (`\n`), UTF-8, **at most 4 MiB** per line. Batches aren't supported.
+- **Methods and results** (ARCH-031). Every method's JSON-RPC `result` is an `Outcome<T>`. Tool failures are `Outcome` errors, never JSON-RPC errors (QA-010).
+
+  | Method | Params | `result` | Allowed |
+  |---|---|---|---|
+  | `core/hello` | `HelloParams` | `Outcome<HelloResult>` | first call on a connection, every caller kind |
+  | `core/drain` | `DrainParams {}` | `Outcome<DrainResult>` | after a successful hello; on a refused connection only when the client's major > the core's |
+  | `tools/list` | `ToolsListParams {}` | `Outcome<ToolsListResult>` | after hello |
+  | `tools/call` | `ToolCallParams` | `Outcome<ToolOutput>` | after hello |
+  | `ww/subscribe` | `SubscribeParams` | `Outcome<SubscribeResult>` | after hello |
+  | `ww/unsubscribe` | `UnsubscribeParams` | `Outcome<UnsubscribeResult>` | after hello |
+  | `app/*` | per method | `Outcome<per method>` | verified `ui:*` only; anyone else gets `caller.not_allowed`; plan 2 defines no `app/*` method |
+  | `ww/event` (notification, core → client) | `EventParams` | — | subscribed clients |
+
+- **`Outcome` envelope** (ARCH-036, QA-001, QA-002), tagged by `status`:
+  - `{"status":"ok", …T's fields}`;
+  - `{"status":"pending_confirmation","confirmation_id","retry_token","expires_at","covers":["confirm"|"cap",…]}`;
+  - `{"status":"error","error":{"code","category","message","detail"?,"fix"?,"data"?,"trace_id","retry"}}`.
+
+  A tool's ok payload is `{"structured","artifacts":[{"path","sha256"?}],"summary_text"}` (ARCH-038).
+- **`core/hello` fields** (ARCH-029):
+
+  | Field | Type | Notes |
+  |---|---|---|
+  | `protocol` | `"M.m"` | |
+  | `build_id` | string | |
+  | `schema_hash` | 16 hex | |
+  | `capabilities` | [string] | |
+  | `caller_kind` | `"ui:<app>"`, `"assistant"`, `"mcp"` or `"cli"` | |
+  | `non_interactive` | bool | |
+  | `workspace` | 16-hex workspace id, or `"none"` | |
+  | `engine_token` | optional | |
+  | `profile_id` | optional | |
+
+  Unknown fields → -32602. The result fields are `session_id`, `instance_id`, `protocol`, `build_id`, `schema_hash`, `capabilities` (shared), `caller_kind` (resolved), `workspace` (`{id, path}` or `null`) and `core {pid, channel, pipe}`. Current version **1.0**; capabilities `events.v1` and `tools.v1`.
+- **Frozen across every major version:**
+  - the `core/hello` method name and its `protocol` field (`"M.m"`), which the core reads *before* it checks any other field;
+  - the refusal for a major mismatch: `{"status":"error","error":{"code":"protocol.incompatible",…,"data":{"core_protocol":"M.m"}}}`;
+  - `core/drain`, with no parameters and the result `{"status":"ok","draining":true}`.
+
+  Within a major, hello fields don't change; a minor adds features only as new capability strings.
+- **JSON-RPC protocol-fault codes** (QA-010):
+
+  | Code | Meaning |
+  |---|---|
+  | -32700 | parse error (id `null`) |
+  | -32600 | invalid request; also a batch, and a second `core/hello` |
+  | -32601 | method not found |
+  | -32602 | invalid params; also an unknown `core/hello` field |
+  | -32001 | handshake required |
+  | -32002 | line too long; the connection is then closed |
+
+- **Error codes** (QA-003–005). Rows marked *provisional* are defined now and confirmed by the plan that first returns them.
+
+  | Code | Category | Retry | Source |
+  |---|---|---|---|
+  | `confirm.denied` | `declined` | `never` | QA-005, CORE-115 |
+  | `confirm.expired` | `cancelled` | `after_resolve` | QA-005, *provisional* |
+  | `confirm.unavailable` | `user_fixable` | `after_resolve` | QA-016 |
+  | `cap.exceeded` | `user_fixable` | `after_resolve` | QA-016 |
+  | `doc.held_elsewhere` | `data_conflict` | `after_resolve` | QA-005, *provisional* |
+  | `store.hash_conflict` | `data_conflict` | `after_resolve` | QA-005, *provisional* |
+  | `workspace.required` | `user_fixable` | `after_resolve` | QA-005, *provisional* |
+  | `protocol.incompatible` | `user_fixable` | `after_resolve` | QA-005; `data.core_protocol` |
+  | `engine.claude_code.untested_version` | `user_fixable` | `after_resolve` | QA-005, *provisional* |
+  | `engine.claude_code.not_signed_in` | `user_fixable` | `after_resolve` | QA-006 |
+  | `comfyui.unreachable` | `external_down` | `auto` | QA-005, *provisional* |
+  | `model.missing` | `user_fixable` | `after_resolve` | QA-005, *provisional* |
+  | `provider.rate_limited` | `transient` | `auto` | QA-005, *provisional* |
+  | `provider.spend_limit` | `external_down` | `never` | QA-005 |
+  | `quota.plan_limit` | `external_down` | `after_resolve` | QA-006, *provisional* |
+  | `workspace.unknown` | `user_fixable` | `after_resolve` | plan 2 |
+  | `workspace.unsupported` | `user_fixable` | `after_resolve` | plan 2; names the default workspace |
+  | `tool.unknown` | `user_fixable` | `after_resolve` | plan 2 |
+  | `params.invalid` | `user_fixable` | `after_resolve` | plan 2 |
+  | `idempotency.key_required` | `user_fixable` | `after_resolve` | plan 2 |
+  | `idempotency.conflict` | `data_conflict` | `never` | plan 2 |
+  | `idempotency.in_progress` | `transient` | `same_idempotency_key` | plan 2 |
+  | `caller.not_allowed` | `declined` | `never` | plan 2 |
+  | `caller.engine_token_invalid` | `declined` | `never` | plan 2 |
+  | `core.draining` | `transient` | `same_idempotency_key` | plan 2 |
+  | `core.bug` | `bug` | `never` | plan 2 |
+  | `state.unavailable` | `transient` | `same_idempotency_key` | plan 2 |
+
+- **Events** (ARCH-032).
+  - `ww/subscribe` params: `{"topics":[…], "since_seq":{"<topic>": <seq>, …}}`. The map is per topic; a topic missing from it means live events only.
+  - `ww/subscribe` result: `{"topics":[{"topic","seq"}]}`, where `seq` is the topic's current sequence number.
+  - `ww/unsubscribe`: params `{"topics":[…]}`, result `{"topics":[…]}` (the topics removed).
+  - `ww/event` params: `{"topic","seq","kind":"event"|"snapshot"|"resync_required","data"}`.
+  - Topic names match `^[a-z][a-z0-9_]*(:.+)?$`.
+  - History: 600 s per topic, by monotonic time. Per-client queue: 1024 events.
+- **Exit codes of `ww-core`:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | normal exit (idle, drained, session end, test parent gone) |
+  | 2 | startup failure for another reason; the cause is in the log |
+  | 3 | another core already owns the channel's pipe |
+  | 4 | stopped after a fatal error (e.g. the state actor died) |
+  | 5 | the suite `state.db` is damaged; nothing was changed |
+  | 6 | the suite `state.db` is from a newer version; nothing was changed |
+
+- **The `ww` user commands.** Global flags, accepted before or after the subcommand: `--workspace <PATH>`, `--non-interactive`, `--no-start`.
+
+  | Command | Output |
+  |---|---|
+  | `ww status [--json]` | human lines `core: running (pid <pid>, channel <channel>)`, `pipe: <pipe>`, `protocol: <protocol> (build <build_id>)`, `workspace: <path or none>`, `caller: <caller_kind>`; `--json` prints `{"running":true,"hello":<HelloResult>}` or `{"running":false}` |
+  | `ww call <tool> [<JSON object> \| -] [--idempotency-key <k>]` | the `Outcome` as pretty JSON on stdout. Arguments default to `{}`, and `-` reads them from stdin |
+  | `ww events --follow --topic <t>… [--since <topic>=<seq>]…` | one `EventParams` JSON per line, flushed per line, until the core goes away |
+  | `ww core stop [--timeout-secs <n>]` (default 60) | `core stopped` or `core not running`; never starts a core |
+
+  **Exit codes of `ww`:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | ok |
+  | 1 | the call returned an `error` result |
+  | 2 | couldn't run (usage, connection, untrusted core, start failure), with a plain message on stderr |
+  | 3 | `ww status` with `--no-start` found no core |
+  | 4 | `pending_confirmation` |
+
+  With `--no-start`, every command except `status` is a silent no-op that exits 0 when no core runs (ARCH-018). Core exit codes 5 and 6 become the plain messages "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside." and "… is from a newer version of Worldwright. Nothing was changed."
+- **Workspace id:** the 16-hex workspace hash of the canonical path (plan 1 contract), or `"none"`.
+- **`suite.toml`** keys read in this plan: `default_workspace = '<path>'` and `[[workspaces]] path = '<path>'`. Unknown keys are preserved by the type.
+- **Per-workspace `state.db`:** `Env::workspace_local_dir(ws)\state.db`. **Suite `state.db`:** `Env::local_dir()\state.db` (CORE-005).
+- **Idempotency scope** (CORE-016): `"<caller kind wire string>|<workspace id or none>"`, e.g. `ui:image|3f2a…` or `cli|none`.
+- **Clarifications recorded in Appendix D** (no new rule IDs):
+  - ARCH-021 clarification: a *requested* drain (`core/drain`, "exit when safe") waits for running work without a timeout. The timeout of step 1 applies to session-end and fatal shutdowns.
+  - ARCH-024 clarification: the fixed test SID in pipe names, as stated above.
+  - CORE-014 clarification: `config`, `server`, `rpc`, `identity`, `workspace`, `session`, `events` and `lifecycle` are infrastructure inside `ww-core`, not CORE-014 modules. The registry and dispatcher are the `tools` module. The core's own log file (the `tracing` sink) is exempt from the single-file-write-home rule (ARCH-112), as SQLite's own database files are. Creating its folder still goes through the store's `ensure_dir`.
