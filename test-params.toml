@@ -1,3 +1,4 @@
+# Trial: protected-file change used to test the approval flow.
 # Owner-facing test parameters (QA-019). PROTECTED: changes require owner approval.
 # Plan-1 code does not consume this file yet; .config/nextest.toml carries the
 # same timeout values directly and points back here as the record.
