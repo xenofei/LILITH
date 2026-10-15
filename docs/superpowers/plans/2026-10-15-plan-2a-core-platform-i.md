@@ -297,7 +297,7 @@ M0 results: `docs/spikes/README.md`. Spike 09 is why the core binary is a Window
 - [ ] **Step 1: Resolve the two contradictions** in the rule text. Mark each "(plan 2 clarification)".
   - **ARCH-031 and ARCH-023.** ARCH-029 makes `core/hello` the mandatory first call and refuses a major mismatch, yet ARCH-023 needs a client that sees a major mismatch to ask the core to drain.
     - Append to ARCH-031: "`core/drain` asks for 'drain and exit when safe' (ARCH-023). On a connection whose `core/hello` was refused with `protocol.incompatible`, it is the only call allowed, and only from a client whose major version is greater than the core's. Its name, parameters and result never change (Appendix D)."
-    - Append to ARCH-023: "The request is `core/drain` (ARCH-031). Only a client with a greater major version drains a core automatically; an older client reports itself incompatible and leaves the core running (ARCH-014)."
+    - Append to ARCH-023: "The request is `core/drain` (ARCH-031). Only a client with a greater major version drains a core automatically; an older client reports itself incompatible and leaves the core running (ARCH-014). Drain requests from a compatible (same-major) session are always honoured."
   - **ARCH-029.** Unknown hello parameters are rejected, so a minor version that added one would break, and a major bump would be refused as invalid params before it was ever seen as incompatible. Append: "The `core/hello` method and its `protocol` field never change, and the core reads `protocol` before checking any other field. Other hello fields change only with a major version; a minor version adds features only as new `capabilities` strings (Appendix D)."
 - [ ] **Step 2: Add the appendix pointers.** Append "(plan 2 clarification: Appendix D)" to:
   - ARCH-021 (the requested-drain timeout);
@@ -671,7 +671,7 @@ pub mod bins { pub struct Bins { pub dir: PathBuf, pub ww: PathBuf, pub ww_core:
                pub fn ensure_built() -> &'static Bins; }
 impl TestEnv {
     pub fn with_label(label: &str) -> TestEnv;                     // label goes into the tempdir name (spaces, non-ASCII allowed)
-    pub fn child_env(&self) -> Vec<(String, String)>;              // WW_CHANNEL, WW_TEST_ROOT, WW_TEST_PARENT_PID
+    pub fn child_env(&self) -> Vec<(OsString, OsString)>;          // WW_CHANNEL, WW_TEST_ROOT, WW_TEST_PARENT_PID; same type as SpawnRequest::extra_env and ClientConfig::spawn_env
     pub fn ww(&self, args: &[&str]) -> WwOutput;                   // runs bins.ww, cwd = self.root(), child_env, stdout/stderr captured
     pub fn ww_with_stdin(&self, args: &[&str], stdin: &str) -> WwOutput;
     pub fn make_workspace(&self, name: &str) -> PathBuf;           // <root>\ws-<name>\worldwright.yaml ("name: <name>")
@@ -680,16 +680,17 @@ impl TestEnv {
 }                                                                  // Drop: drains any core on this channel (below)
 pub struct WwOutput { pub code: i32, pub stdout: String, pub stderr: String, pub elapsed: Duration }
 pub fn sha256_file(path: &Path) -> String;                         // 64 hex
-pub struct CoreFixture { /* std::process::Child */ }
+pub struct CoreFixture { /* ww_platform::process::ProcessHandle from spawn_detached */ }
 impl CoreFixture {
     pub fn start(env: &TestEnv) -> CoreFixture;                    // bins.ww_core; waits ≤ 30 s for the pipe
     pub fn start_exe(env: &TestEnv, exe: &Path) -> CoreFixture;    // e.g. a copy of ww-core.exe in another folder
     pub fn start_with_env(env: &TestEnv, extra: &[(&str, &str)]) -> CoreFixture;  // extra vars override child_env
     pub fn spawn_raw(env: &TestEnv) -> KillOnDrop;                 // no wait; for exit-code tests
     pub fn pid(&self) -> u32;
-    pub fn wait_exit(&mut self, within: Duration) -> Option<i32>;
+    pub fn wait_exit(&mut self, within: Duration) -> Option<u32>;
 }
-pub struct KillOnDrop(pub std::process::Child);                    // Drop: kill + wait if still running
+pub struct KillOnDrop(pub ProcessHandle);                         // Drop: kill() + wait if exit_code() is still None
+impl KillOnDrop { pub fn wait_exit(&self, within: Duration) -> Option<u32>; }
 pub struct RawPipe { /* own current-thread runtime */ }
 impl RawPipe {
     pub fn connect(env: &TestEnv) -> RawPipe;                      // retries ≤ 30 s; no server verification
@@ -710,9 +711,12 @@ pub struct SeqIds;   // impl IdSource: "<prefix>_" + 16-digit zero-padded counte
 - **`ensure_built`** returns `<workspace>\target\testbins\debug`. If the setup script didn't already build the binaries, it runs the same `cargo build` once per process (`OnceLock`), using `env!("CARGO")` with `--manifest-path <workspace>\Cargo.toml` and with `CARGO_TARGET_DIR` removed from the child's environment.
   - A separate target directory means a running test core never locks a binary the main build wants to relink, and feature-unification differences never rebuild one under a running test.
   - A missing `ww-core.exe` (before Task 7) isn't an error here; `CoreFixture::start` panics naming it.
+- **How cores are spawned.** `CoreFixture` and `spawn_raw` start the core only through `ww_platform::process::spawn_detached` (Task 4), with `extra_env = child_env()` plus any overrides. They keep the returned `ProcessHandle`, which provides `pid`, `exit_code`, `wait` and `kill`.
+  - Never use `std::process::Command` for a core (Global Constraints, Dependency boundaries): it would let the core inherit nextest's capture pipes.
+  - `TestEnv::ww` runs `ww` itself with `std::process::Command`, because it must capture `ww`'s own output. The core `ww` spawns goes through `spawn_detached`.
 - **Cleanup**, so no core outlives its test and no temp folder stays locked:
   - **`CoreFixture`'s `Drop`:** connect, hello, `core/drain`. If the core answers with a JSON-RPC error (-32601 or -32001, i.e. before Tasks 8 and 12), or doesn't exit within 5 s, kill it.
-  - **`TestEnv`'s `Drop`:** `RawPipe::try_connect(self, 200 ms)`; if a core answers, hello + `core/drain`, then wait ≤ 5 s for the pipe to disappear. This covers cores started by `ww`, which are detached and have no `Child`.
+  - **`TestEnv`'s `Drop`:** `RawPipe::try_connect(self, 200 ms)`; if a core answers, hello + `core/drain`, then wait ≤ 5 s for the pipe to disappear. This covers cores started by `ww`, which this process holds no handle for.
 - **The default hello in `RawPipe::hello`:** `{protocol: "1.0", build_id: "testkit", schema_hash: ww_protocol::schema_hash(), capabilities: CAPABILITIES, caller_kind: "cli", non_interactive: false, workspace: "none"}`. An override value of `null` removes the key.
 
 - [ ] **Step 1: Write the failing unit tests:**
@@ -724,7 +728,7 @@ pub struct SeqIds;   // impl IdSource: "<prefix>_" + 16-digit zero-padded counte
   - `fake_clock_advances_only_when_told`;
   - `seq_ids_are_deterministic`;
   - `ensure_built_puts_ww_in_testbins` (`bins.ww` exists and is under `target\testbins\debug`);
-  - `kill_on_drop_kills_a_running_child` (`%ComSpec% /c pause` with stdin null → gone after drop);
+  - `kill_on_drop_kills_a_running_child` (`spawn_detached` of `%ComSpec% /c pause` → `exit_code()` is `Some` after drop);
   - `raw_pipe_hello_merge_removes_null_keys` (pure helper `merge_hello(overrides) -> Value`).
 - [ ] **Step 2: Run them.**
 
@@ -1206,6 +1210,9 @@ impl PipelineHooks { pub fn plan2() -> PipelineHooks; }
 pub struct Dispatcher;
 impl Dispatcher {
     pub fn new(reg: Registry, hooks: PipelineHooks, states: Arc<StateRegistry>, ids: Arc<dyn IdSource>, clock: Arc<dyn Clock>) -> Dispatcher;
+    // Task 11 adds `events: Arc<EventBus>` after `states`, for CallCtx.events.
+    // Task 12 then adds `lifecycle: Arc<Lifecycle>` after that, for CallGuard and core.draining.
+    // Final signature: new(reg, hooks, states, events, lifecycle, ids, clock)
     pub async fn call(&self, session: Arc<Session>, p: ToolCallParams) -> Outcome<ToolOutput>;
 }
 pub struct TestGates; impl TestGates { pub fn open(&self, gate: &str); }
@@ -1292,7 +1299,7 @@ git commit -m "core: tools module: dispatcher pipeline, registry, idempotency, f
 
 **Files:**
 - Create: `crates/ww-core/src/events.rs`.
-- Modify: `crates/ww-core/src/{rpc.rs, tools/test_tools.rs}` (`test.emit`).
+- Modify: `crates/ww-core/src/{rpc.rs, tools/mod.rs, tools/dispatcher.rs, tools/test_tools.rs}`: `CallCtx.events`, the `events` parameter of `Dispatcher::new`, and `test.emit`.
 - Test: unit tests in `events.rs`; `crates/ww-core/tests/events.rs`.
 
 **Interfaces:**
@@ -1313,7 +1320,8 @@ impl EventBus {
     pub fn register_snapshot(&self, topic_prefix: &str, p: Arc<dyn SnapshotProvider>);
     pub fn queued(&self, client: ClientId) -> usize;                                   // for tests
 }
-// addition to Task 10: CallCtx gains `pub events: Arc<EventBus>`, so tools (test.emit; 2b's store) can publish
+// addition to Task 10: CallCtx gains `pub events: Arc<EventBus>`, so tools (test.emit; 2b's store) can publish,
+// and Dispatcher::new gains `events: Arc<EventBus>` after `states`
 ```
 
 **Rules** (ARCH-032):
@@ -1336,7 +1344,7 @@ impl EventBus {
     - `cursor_older_than_ten_minutes_gets_snapshot` (advance 601 s, provider registered);
     - `cursor_older_without_provider_gets_resync_required`;
     - `cursor_from_the_future_gets_resync_required`;
-    - `overflow_clears_queue_and_sends_resync_required_once_per_topic`: an attached client whose `outbound` receiver isn't read; 1025 publishes; `queued == 2` for two subscribed topics, both `ResyncRequired`;
+    - `overflow_clears_queue_and_sends_resync_required_once_per_topic`. Attach a client to an `outbound` channel of capacity **1**, whose receiver is never read; subscribe it to two topics. Publish `CLIENT_QUEUE + 1 + 2` events (the forwarder holds at most one event and the channel one more). Then `queued == 2`, and both queued events are `ResyncRequired`, one per topic.
     - `responses_are_not_dropped_by_event_overflow`;
     - `unsubscribe_stops_delivery_and_returns_removed_topics`;
     - `dropped_client_is_forgotten`;
@@ -1527,6 +1535,7 @@ pub mod blocking { pub struct BlockingClient; /* same methods, synchronous; owns
    - `NotFound` otherwise → spawn the core once with `spawn_detached` (no args; `extra_env = spawn_env`), then retry.
    - The deadline is `start_timeout`. While the core this client spawned is still alive (e.g. Defender scanning a new exe), the deadline extends up to `start_hard_cap`.
    - If the spawned core has exited: code 3 means it lost the race, so keep connecting. Any other code → `StartFailed` (5 → `StateDamaged`, 6 → `StateTooNew`).
+   - **Connect race.** The core claims the pipe before it checks `state.db`, so this client can connect to a core that then exits with 5, 6 or 2. If the connection closes before the hello reply arrives and this client spawned that core, wait up to 10 s for the spawned `ProcessHandle`'s exit code and map it as above. Only if the process is still alive after that, or wasn't spawned by this client, report `Closed`.
 2. **Verify the server** (ARCH-027): `server_pid` → `inspect` immediately. The user SID must equal `current_user_sid()`, and the image's directory must be in `server_dirs`; otherwise `Untrusted`.
 3. **Send `core/hello`.** On `protocol.incompatible`, read `data.core_protocol`:
    - client major > core major (controller ruling 4): send `core/drain` on that connection, wait up to 60 s for the pipe to disappear, start a new core (unless `NoStart`) and handshake again once. Still incompatible → `Incompatible`.
@@ -1564,7 +1573,7 @@ pub mod blocking { pub struct BlockingClient; /* same methods, synchronous; owns
     - `incompatible_older_core_is_drained_and_replaced` (ARCH-023): with `cfg.protocol = 2.0`, the first core exits, a second one is started, and the result is `Incompatible { core_protocol: "1.0" }`;
     - `newer_core_is_never_drained_by_older_client` (ARCH-014, ruling 4): with `cfg.protocol = 0.9` → `Incompatible`, and the core's PID is unchanged and still serving;
     - `non_ascii_and_spaced_roots_work` (Review Focus 5): `TestEnv::with_label("Ünïcödé space")`; connect succeeds, and `env.suite_state_db()` exists;
-    - `damaged_state_db_is_a_plain_start_failure` (owner decision 5): a corrupt suite `state.db` → `StartFailed { exit_code: Some(5), kind: StateDamaged, .. }`; `Display` contains the path and "Nothing was changed", and the file is unchanged;
+    - `damaged_state_db_is_a_plain_start_failure` (owner decision 5): a corrupt suite `state.db` → `StartFailed { exit_code: Some(5), kind: StateDamaged, .. }`; `Display` contains the path and "Nothing was changed", and the file is unchanged. Run it 20 times in a loop, so a connection made before the core exits must also map to `StartFailed`, never `Closed` or `Io`;
     - `call_mints_an_idempotency_key`: two `test.write` calls without keys both execute;
     - `blocking_client_round_trip`.
 - [ ] **Step 2: Run them.**
