@@ -30,17 +30,20 @@ use windows::Win32::Storage::CloudFilters::{
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2,
     DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_BASIC_INFO,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+    FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileBasicInfo, FileDispositionInfo, FileIdInfo, FileStandardInfo, FlushFileBuffers,
-    GetDriveTypeW, GetFileAttributesW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetLongPathNameW, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, REPLACE_FILE_FLAGS, REPLACEFILE_IGNORE_ACL_ERRORS,
-    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SetFileAttributesW, SetFileInformationByHandle,
-    UnlockFileEx,
+    FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx, FileIdInfo,
+    FileStandardInfo, FlushFileBuffers, GetDriveTypeW, GetFileAttributesW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW,
+    GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS,
+    REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
+    SetFileAttributesW, SetFileInformationByHandle, UnlockFileEx,
 };
 use windows::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 use windows::core::PCWSTR;
@@ -646,6 +649,22 @@ pub fn open_shared(path: &Path, share: Share) -> io::Result<File> {
         .open(long_path(path))
 }
 
+/// The reparse tag of `path` when it is a reparse point (`FileAttributeTagInfo` through an
+/// attribute-only open that doesn't follow links), `None` otherwise.
+pub fn reparse_tag(path: &Path) -> io::Result<Option<u32>> {
+    let file = open_attributes(path)?;
+    // SAFETY: the class is read into its documented structure.
+    let info: FILE_ATTRIBUTE_TAG_INFO = unsafe { info(&file, FileAttributeTagInfo) }?;
+    Ok((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0).then_some(info.ReparseTag))
+}
+
+/// `IsReparseTagNameSurrogate`: the tag names another file or folder (a symbolic link, a
+/// junction or mount point), as opposed to one that only changes how the data is stored (a
+/// cloud file, a deduplicated file).
+pub fn is_name_surrogate(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+}
+
 /// A file opened for reading and deleting with no sharing: while it is open nobody else can
 /// open it to read, write, rename or delete, so what was read is what [`ExclusiveFile::delete`]
 /// deletes. An existing handle (even one sharing delete) makes the open fail with error 32.
@@ -654,13 +673,34 @@ pub struct ExclusiveFile {
     file: File,
 }
 
-/// Opens the existing file `path` with `GENERIC_READ | DELETE` and no sharing.
+/// Opens the existing file `path` with `GENERIC_READ | DELETE` and no sharing. A link is
+/// opened itself, never followed (`FILE_FLAG_OPEN_REPARSE_POINT`), so a delete through the
+/// handle removes the link, never the file it points to.
 pub fn open_exclusive(path: &Path) -> io::Result<ExclusiveFile> {
     let file = OpenOptions::new()
         .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
         .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(long_path(path))?;
     Ok(ExclusiveFile { file })
+}
+
+/// Sets a disposition class on `file`.
+///
+/// # Safety
+/// `T` must be the structure `class` takes.
+unsafe fn set_info<T>(file: &File, class: FILE_INFO_BY_HANDLE_CLASS, value: &T) -> io::Result<()> {
+    // SAFETY: `value` is a valid `T` of the size passed, and the caller guarantees it is the
+    // structure `class` takes; the handle is open while `file` is borrowed.
+    unsafe {
+        SetFileInformationByHandle(
+            handle(file),
+            class,
+            std::ptr::from_ref(value).cast(),
+            size_of::<T>() as u32,
+        )
+    }
+    .map_err(|e| io_error(&e))
 }
 
 impl ExclusiveFile {
@@ -669,21 +709,31 @@ impl ExclusiveFile {
         &self.file
     }
 
-    /// Deletes the file through this handle (`FileDispositionInfo`, then close): no other
-    /// open can come between the read and the delete.
+    /// Deletes the file through this handle, then closes it: no other open can come between
+    /// the read and the delete. `FileDispositionInfoEx` with `FILE_DISPOSITION_FLAG_DELETE |
+    /// FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`,
+    /// so a read-only file is deleted too and the name goes at once. A file system that
+    /// refuses POSIX semantics (error 87, 50 or 1) is tried without them, and one without the
+    /// `Ex` class with the plain `FileDispositionInfo` (which a read-only file refuses with 5).
     pub fn delete(self) -> io::Result<()> {
-        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: `info` is a valid FILE_DISPOSITION_INFO of the size passed; the handle is
-        // open while `self.file` lives and was opened with DELETE access.
-        unsafe {
-            SetFileInformationByHandle(
-                handle(&self.file),
-                FileDispositionInfo,
-                (&raw const info).cast(),
-                size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
+        let base =
+            FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE.0;
+        let unsupported = |e: &io::Error| matches!(e.raw_os_error(), Some(87 | 50 | 1));
+        for flags in [base | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0, base] {
+            let info = FILE_DISPOSITION_INFO_EX {
+                Flags: FILE_DISPOSITION_INFO_EX_FLAGS(flags),
+            };
+            // SAFETY: FileDispositionInfoEx takes FILE_DISPOSITION_INFO_EX; the handle has
+            // DELETE access.
+            match unsafe { set_info(&self.file, FileDispositionInfoEx, &info) } {
+                Ok(()) => return Ok(()),
+                Err(e) if unsupported(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
-        .map_err(|e| io_error(&e))
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: FileDispositionInfo takes FILE_DISPOSITION_INFO; the handle has DELETE access.
+        unsafe { set_info(&self.file, FileDispositionInfo, &info) }
     }
 }
 
@@ -700,6 +750,10 @@ pub trait Probe: Send + Sync + std::fmt::Debug {
     /// [`long_name`]: every 8.3 short component expanded (attribute-only, never reads data).
     fn long_name(&self, path: &Path) -> io::Result<PathBuf> {
         long_name(path)
+    }
+    /// [`reparse_tag`]: the reparse tag of a reparse point, read without following it.
+    fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {
+        reparse_tag(path)
     }
 }
 
@@ -942,6 +996,32 @@ mod tests {
         drop(reader);
         open_exclusive(&path).unwrap();
         assert!(path.exists(), "dropping without delete keeps the file");
+    }
+
+    #[test] // spec: ARCH-074
+    fn exclusive_delete_removes_a_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".ro.ww-bak-1-1");
+        std::fs::write(&path, b"old").unwrap();
+        set_readonly(&path, true).unwrap();
+        open_exclusive(&path)
+            .unwrap()
+            .delete()
+            .expect("a read-only file is deleted too");
+        assert!(!path.exists());
+    }
+
+    #[test] // spec: ARCH-074
+    fn reparse_tags_tell_links_from_stored_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(reparse_tag(&path).unwrap(), None);
+        assert_eq!(SystemProbe.reparse_tag(&path).unwrap(), None);
+        assert!(is_name_surrogate(0xA000_000C), "IO_REPARSE_TAG_SYMLINK");
+        assert!(is_name_surrogate(0xA000_0003), "IO_REPARSE_TAG_MOUNT_POINT");
+        assert!(!is_name_surrogate(0x9000_101A), "IO_REPARSE_TAG_CLOUD_1");
+        assert!(!is_name_surrogate(0x8000_0013), "IO_REPARSE_TAG_DEDUP");
     }
 
     #[test]

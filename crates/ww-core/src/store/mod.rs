@@ -17,7 +17,7 @@ pub mod write;
 
 pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
 pub use fsops::{ensure_dir, write_file_atomic};
-pub use paths::{WsPath, writable};
+pub use paths::{WsPath, path_key, writable};
 pub use write::{
     ChangeKind, ChangeSink, Expect, Phase, RecoveryReport, Step, Store, StoreError, StoreEvent,
     Written, lfs_pointer_oid, next_step,

@@ -146,36 +146,37 @@ fn conflict_without_backup(result: Result<impl std::fmt::Debug, StoreError>, rel
             path,
             backup: None,
             cloud_only: false,
-            kept: None,
-        }) => assert_eq!(path.as_str(), rel),
+            kept,
+        }) if kept.is_empty() => assert_eq!(path.as_str(), rel),
         other => panic!("expected a hash conflict without a backup, got {other:?}"),
     }
 }
 
 /// The conflict of a cloud-only placeholder (ruling Q11).
 fn cloud_only_conflict(result: Result<impl std::fmt::Debug, StoreError>, rel: &str) {
-    match result {
-        Err(
-            e @ StoreError::HashConflict {
-                cloud_only: true,
-                backup: None,
-                kept: None,
-                ..
-            },
-        ) => {
-            let body = e.to_error("t");
-            assert_eq!(body.code, "store.hash_conflict");
-            assert_eq!(body.data.as_ref().unwrap()["path"], rel);
-            assert_eq!(body.data.as_ref().unwrap()["cloud_only"], true);
-            assert!(body.message.contains("cloud-only"), "{}", body.message);
-            assert!(
-                body.message.contains("available offline"),
-                "{}",
-                body.message
-            );
-        }
-        other => panic!("expected a cloud-only conflict, got {other:?}"),
-    }
+    let Err(e) = result else {
+        panic!("expected a cloud-only conflict, got {result:?}");
+    };
+    let StoreError::HashConflict {
+        cloud_only: true,
+        backup: None,
+        kept,
+        ..
+    } = &e
+    else {
+        panic!("expected a cloud-only conflict, got {e:?}");
+    };
+    assert!(kept.is_empty(), "{e:?}");
+    let body = e.to_error("t");
+    assert_eq!(body.code, "store.hash_conflict");
+    assert_eq!(body.data.as_ref().unwrap()["path"], rel);
+    assert_eq!(body.data.as_ref().unwrap()["cloud_only"], true);
+    assert!(body.message.contains("cloud-only"), "{}", body.message);
+    assert!(
+        body.message.contains("available offline"),
+        "{}",
+        body.message
+    );
 }
 
 /// A hook that writes `text` to `path` as an outside editor would.
@@ -319,11 +320,12 @@ async fn put_back_held_past_budget_names_the_backup_and_recovers() {
         path,
         backup: Some(backup),
         cloud_only: false,
-        kept: None,
+        kept,
     }) = result.clone()
     else {
         panic!("expected a conflict that names the backup, got {result:?}");
     };
+    assert!(kept.is_empty(), "{kept:?}");
     assert_eq!(path.as_str(), "notes/a.txt");
     assert!(
         backup.as_str().starts_with("notes/.a.txt.ww-bak-"),
@@ -539,7 +541,7 @@ async fn cloud_only_target_is_a_conflict_and_never_read() {
         path: rel.clone(),
         backup: None,
         cloud_only: false,
-        kept: None,
+        kept: Vec::new(),
     };
     let message = edited.to_error("t").message;
     assert!(message.contains("changed outside"), "{message}");
@@ -918,12 +920,14 @@ async fn fallback_second_rename_never_replaces_a_new_outside_file() {
         let Err(StoreError::HashConflict {
             backup: None,
             cloud_only: false,
-            kept: Some(kept),
+            kept,
             ..
         }) = &result
         else {
             panic!("{variant}: expected the set-aside copy to be named, got {result:?}");
         };
+        assert_eq!(kept.len(), 1, "{variant}: {kept:?}");
+        let kept = &kept[0];
         assert_eq!(ws.read("notes/a.txt"), b"outside", "{variant}");
         let conflicts = ws.conflicts("notes");
         assert_eq!(conflicts.len(), 1, "{variant}: {:?}", ws.names("notes"));
@@ -1294,7 +1298,7 @@ fn store_errors_map_to_appendix_d_codes() {
                 path: path.clone(),
                 backup: None,
                 cloud_only: false,
-                kept: None,
+                kept: Vec::new(),
             },
             "store.hash_conflict",
             C::DataConflict,
@@ -1305,7 +1309,7 @@ fn store_errors_map_to_appendix_d_codes() {
                 path: path.clone(),
                 backup: None,
                 cloud_only: true,
-                kept: None,
+                kept: Vec::new(),
             },
             "store.hash_conflict",
             C::DataConflict,
@@ -1390,7 +1394,7 @@ fn store_errors_map_to_appendix_d_codes() {
         path: path.clone(),
         backup: None,
         cloud_only: false,
-        kept: None,
+        kept: Vec::new(),
     }
     .to_error("t");
     let data = plain.data.as_ref().unwrap();
@@ -1400,7 +1404,7 @@ fn store_errors_map_to_appendix_d_codes() {
         path: path.clone(),
         backup: Some(p("notes/.a.txt.ww-bak-1-1")),
         cloud_only: false,
-        kept: None,
+        kept: Vec::new(),
     }
     .to_error("t");
     assert_eq!(backed.data.unwrap()["backup"], "notes/.a.txt.ww-bak-1-1");
@@ -1408,12 +1412,18 @@ fn store_errors_map_to_appendix_d_codes() {
         path,
         backup: None,
         cloud_only: false,
-        kept: Some(p("notes/a.txt.ww-conflict-20270115T080000Z")),
+        kept: vec![
+            p("notes/a.txt.ww-conflict-20270115T080000Z"),
+            p("notes/a.txt.ww-conflict-20270115T080000Z-2"),
+        ],
     }
     .to_error("t");
     assert_eq!(
         kept.data.as_ref().unwrap()["kept"],
-        "notes/a.txt.ww-conflict-20270115T080000Z"
+        serde_json::json!([
+            "notes/a.txt.ww-conflict-20270115T080000Z",
+            "notes/a.txt.ww-conflict-20270115T080000Z-2"
+        ])
     );
     assert!(
         kept.message.contains("a.txt.ww-conflict-20270115T080000Z"),
@@ -1475,19 +1485,24 @@ async fn second_outside_save_during_put_back_is_kept_visibly() {
         let Err(StoreError::HashConflict {
             backup: None,
             cloud_only: false,
-            kept: Some(kept_copy),
+            kept: kept_copies,
             ..
         }) = &result
         else {
             panic!("fallback={fallback}: expected a conflict naming the kept save, got {result:?}");
         };
+        assert_eq!(kept_copies.len(), 1, "fallback={fallback}: {kept_copies:?}");
+        let kept_copy = &kept_copies[0];
         assert_eq!(
             ws.read(kept_copy.as_str()),
             b"outside 2",
             "fallback={fallback}"
         );
         let body = result.as_ref().unwrap_err().to_error("t");
-        assert_eq!(body.data.as_ref().unwrap()["kept"], kept_copy.as_str());
+        assert_eq!(
+            body.data.as_ref().unwrap()["kept"],
+            serde_json::json!([kept_copy.as_str()])
+        );
         assert_eq!(ws.read("notes/a.txt"), b"outside", "fallback={fallback}");
         let kept: Vec<String> = ws
             .names("notes")
@@ -1737,4 +1752,248 @@ async fn unchecked_backup_is_named_and_left_for_recovery() {
         Some(sha(b"v2"))
     );
     assert_eq!(ws.names("notes"), ["a.txt"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes (Task 6 fix round 2, ruling Q14).
+// ---------------------------------------------------------------------------------------------
+
+/// A file symbolic link at `link` to `target`, or `None` where this account may not create one
+/// (no Developer Mode and no elevation: error 1314).
+fn file_symlink(target: &Path, link: &Path) -> Option<()> {
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => Some(()),
+        Err(e) if e.raw_os_error() == Some(1314) => None,
+        Err(e) => panic!("cannot create a symbolic link: {e}"),
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074, CORE-040
+async fn link_targets_are_refused_and_never_followed() {
+    let ws = workspace();
+    let outside = ws.root.parent().unwrap().join("outside-real.txt");
+    write_file(&outside, b"real");
+    write_file(&ws.file("notes/keep.txt"), b"x");
+    let link = ws.file("notes/link.txt");
+    let Some(()) = file_symlink(&outside, &link) else {
+        eprintln!("skipped: this account can't create symbolic links");
+        return;
+    };
+    for spec in ["", "store.replace=unsupported"] {
+        let store = ws.store(Arc::new(FailPoints::parse(spec).unwrap()));
+        let result = store
+            .write(
+                &p("notes/link.txt"),
+                b"core".to_vec(),
+                Expect::Hash(sha(b"real")),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::PathInvalid { .. })),
+            "{spec}: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"real",
+            "{spec}: the real file changed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{spec}: the link itself is still there"
+        );
+        assert!(
+            ws.leftovers("notes").is_empty(),
+            "{spec}: {:?}",
+            ws.names("notes")
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074, ARCH-078
+async fn non_ascii_case_variant_finds_the_pending_row() {
+    let ws = workspace();
+    put(&ws.plain(), "notes/Ärger.txt", "v1", Expect::New).await;
+    let fp = Arc::new(FailPoints::parse("store.replace=unsupported").unwrap());
+    fp.on(
+        "store.between_renames",
+        Box::new(|| Err(io::Error::other("the process stops here"))),
+    );
+    let stopped = ws
+        .store(fp)
+        .write(&p("notes/Ärger.txt"), b"v2".to_vec(), Expect::Generated)
+        .await;
+    assert!(stopped.is_err());
+    assert!(!ws.file("notes/Ärger.txt").exists());
+    assert!(
+        ws.state.pending("notes/ärger.txt").await.unwrap().is_some(),
+        "the row under another spelling"
+    );
+    assert_eq!(
+        ws.state.generated("NOTES/äRGER.TXT").await.unwrap(),
+        Some(sha(b"v1"))
+    );
+    let store = ws.plain();
+    assert_eq!(
+        store.read(&p("notes/ärger.txt")).await.unwrap().as_deref(),
+        Some(&b"v1"[..]),
+        "the read under the other spelling recovers the content"
+    );
+    assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
+    assert_eq!(ws.state.pending("notes/Ärger.txt").await.unwrap(), None);
+}
+
+#[allow(clippy::disallowed_methods)]
+fn make_read_only(path: &Path) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn fallback_over_a_read_only_target_is_not_a_conflict() {
+    let ws = workspace();
+    put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+    make_read_only(&ws.file("notes/a.txt"));
+    let store = ws.store(Arc::new(
+        FailPoints::parse("store.replace=unsupported").unwrap(),
+    ));
+    store
+        .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+        .await
+        .expect("the fallback over a read-only target");
+    assert_eq!(ws.read("notes/a.txt"), b"v2");
+    assert_eq!(
+        ws.names("notes"),
+        ["a.txt"],
+        "the old content's backup is gone"
+    );
+    assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+}
+
+/// The real probe, except that one path reports `FILE_ATTRIBUTE_REPARSE_POINT` with the tag
+/// `tag`: a file symbolic link (`IO_REPARSE_TAG_SYMLINK`) or a hydrated cloud file
+/// (`IO_REPARSE_TAG_CLOUD_1`), which is a reparse point but not a link.
+#[derive(Debug)]
+struct ReparseProbe {
+    path: PathBuf,
+    tag: u32,
+}
+
+impl Probe for ReparseProbe {
+    fn identity(&self, path: &Path) -> io::Result<FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path == self.path {
+            id.attributes |= 0x400; // FILE_ATTRIBUTE_REPARSE_POINT
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+
+    fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {
+        if path == self.path {
+            Ok(Some(self.tag))
+        } else {
+            SystemProbe.reparse_tag(path)
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn a_link_at_the_target_is_refused_at_the_hash_check() {
+    let ws = workspace();
+    write_file(&ws.file("notes/link.txt"), b"through the link");
+    let probe = Arc::new(ReparseProbe {
+        path: ws.file("notes/link.txt"),
+        tag: 0xA000_000C, // IO_REPARSE_TAG_SYMLINK
+    });
+    let store = ws.store_with_probe(
+        Arc::new(FailPoints::parse("store.replace=unsupported").unwrap()),
+        probe,
+    );
+    let result = store
+        .write(
+            &p("notes/link.txt"),
+            b"core".to_vec(),
+            Expect::Hash(sha(b"through the link")),
+        )
+        .await;
+    let Err(e @ StoreError::PathInvalid { .. }) = &result else {
+        panic!("a link target is store.path_invalid, got {result:?}");
+    };
+    assert!(e.to_string().contains("link"), "{e}");
+    assert_eq!(e.to_error("t").code, "store.path_invalid");
+    assert_eq!(ws.read("notes/link.txt"), b"through the link");
+    assert_eq!(ws.names("notes"), ["link.txt"]);
+    for refused in [
+        store.read(&p("notes/link.txt")).await.map(drop),
+        store
+            .edit_text(&p("notes/link.txt"), &|t| Ok(format!("{t}!")))
+            .await
+            .map(drop),
+    ] {
+        assert!(
+            matches!(refused, Err(StoreError::PathInvalid { .. })),
+            "{refused:?}"
+        );
+    }
+
+    // A hydrated cloud file is a reparse point too, but holds its own data: written as usual.
+    let cloud = ws.store_with_probe(
+        FailPoints::none(),
+        Arc::new(ReparseProbe {
+            path: ws.file("notes/link.txt"),
+            tag: 0x9000_101A, // IO_REPARSE_TAG_CLOUD_1
+        }),
+    );
+    put(
+        &cloud,
+        "notes/link.txt",
+        "core",
+        Expect::Hash(sha(b"through the link")),
+    )
+    .await;
+    assert_eq!(ws.read("notes/link.txt"), b"core");
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn put_back_names_every_outside_version_it_sets_aside() {
+    let ws = workspace();
+    put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+    let target = ws.file("notes/a.txt");
+    let fp = Arc::new(FailPoints::parse("store.replace=unsupported").unwrap());
+    // First outside edit before the swap, a second save after it (moved into the second
+    // backup by the put-back), and a third file at the freed name before the first backup
+    // goes back.
+    fp.on("store.replace", outside_writer(target.clone(), "outside 1"));
+    fp.on(
+        "store.after_replace",
+        outside_writer(target.clone(), "outside 2"),
+    );
+    fp.on("store.put_back", outside_writer(target, "outside 3"));
+    let result = ws
+        .store(fp)
+        .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+        .await;
+    let Err(StoreError::HashConflict {
+        backup: None, kept, ..
+    }) = &result
+    else {
+        panic!("expected a conflict naming both copies, got {result:?}");
+    };
+    let contents: Vec<Vec<u8>> = kept.iter().map(|k| ws.read(k.as_str())).collect();
+    assert_eq!(contents, [b"outside 1".to_vec(), b"outside 2".to_vec()]);
+    assert_eq!(ws.read("notes/a.txt"), b"outside 3");
+    assert_eq!(ws.conflicts("notes").len(), 2, "{:?}", ws.names("notes"));
+    assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
+    assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
 }

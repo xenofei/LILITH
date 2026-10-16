@@ -19,17 +19,18 @@ const IDEMPOTENCY_PRUNE_V2: &str =
     "CREATE INDEX idempotency_prune ON idempotency(state, created_utc);";
 
 /// Migration 3 of a workspace database: the store's last generated hash per file (ARCH-078)
-/// and its pending replaces (write step 5, ARCH-074). Paths compare without case
-/// (`COLLATE NOCASE`), as Windows names do, so another spelling of one file finds its rows.
-/// `NOCASE` folds ASCII letters only; a spelling that differs in a non-ASCII letter misses
-/// the row and fails closed (a conflict).
+/// and its pending replaces (write step 5, ARCH-074). Rows are keyed on the case-folded path
+/// (`store::paths::path_key`, the folding of the store's path locks; ruling Q14), so every
+/// spelling of one file finds them; `path` keeps the spelling last written.
 const GENERATED_V3: &str = "CREATE TABLE generated (
-    path TEXT PRIMARY KEY COLLATE NOCASE,
+    key TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     written_utc INTEGER NOT NULL
 );
 CREATE TABLE generated_pending (
-    path TEXT PRIMARY KEY COLLATE NOCASE,
+    key TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
     old_sha256 TEXT,
     new_sha256 TEXT NOT NULL,
     started_utc INTEGER NOT NULL
@@ -103,10 +104,13 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap()
         };
-        assert_eq!(columns("generated"), ["path", "sha256", "written_utc"]);
+        assert_eq!(
+            columns("generated"),
+            ["key", "path", "sha256", "written_utc"]
+        );
         assert_eq!(
             columns("generated_pending"),
-            ["path", "old_sha256", "new_sha256", "started_utc"]
+            ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
         assert_eq!(SUITE_MIGRATIONS.len(), 2);
         assert_eq!(WORKSPACE_MIGRATIONS.len(), 3);

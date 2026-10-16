@@ -58,10 +58,10 @@ impl WsPath {
         self.0.rsplit_once('/').map(|(dir, _)| dir)
     }
 
-    /// The case-folded form: Windows names are case-insensitive, so two spellings of one
-    /// file share one key.
+    /// The case-folded form ([`path_key`]): Windows names are case-insensitive, so two
+    /// spellings of one file share one key.
     pub(crate) fn key(&self) -> String {
-        self.0.to_lowercase()
+        path_key(&self.0)
     }
 }
 
@@ -69,6 +69,22 @@ impl fmt::Display for WsPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// The case-folded key of a workspace-relative path: every character that has a one-character
+/// uppercase form is replaced by it, as the NTFS upcase table compares names (so `ä` and `Ä`
+/// fold together, and `ß`, whose uppercase is two characters, stays). The path locks and the
+/// `generated` and `generated_pending` rows use this one folding.
+pub fn path_key(rel: &str) -> String {
+    rel.chars()
+        .map(|c| {
+            let mut up = c.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 /// `v<major.minor.patch>`, the name of a sealed version folder (the `v` in either case, since
@@ -127,6 +143,20 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test] // spec: CORE-040
+    fn path_keys_fold_case_like_windows_names() {
+        assert_eq!(path_key("notes/Ärger.txt"), path_key("NOTES/ärger.TXT"));
+        assert_eq!(path_key("a/b"), "A/B");
+        assert_eq!(
+            path_key("straße"),
+            "STRAßE",
+            "ß has no one-character uppercase"
+        );
+        assert_ne!(path_key("a.txt"), path_key("b.txt"));
+        let p = WsPath::parse("Notes/Ä.txt").unwrap();
+        assert_eq!(p.key(), path_key("notes/ä.TXT"));
     }
 
     #[test] // spec: ARCH-082, CORE-026

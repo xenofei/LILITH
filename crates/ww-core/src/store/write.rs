@@ -82,13 +82,14 @@ pub enum StoreError {
     /// The target changed outside the suite, or (`cloud_only`) is a cloud-only placeholder,
     /// which is never read (ruling Q11). `backup` names the backup that holds the outside
     /// version when a put-back couldn't finish; the next `recover()` puts it back. `kept` names
-    /// the visible `<name>.ww-conflict-<utc>` copy of a newer outside save that the put-back
-    /// met at the target.
+    /// the visible `<name>.ww-conflict-<utc>` copies of outside versions the call set aside
+    /// (a newer save the put-back met at the target, or the backup beside an outside file that
+    /// took the freed name).
     HashConflict {
         path: WsPath,
         backup: Option<WsPath>,
         cloud_only: bool,
-        kept: Option<WsPath>,
+        kept: Vec<WsPath>,
     },
     /// Held by another program past the 10 s retry budget.
     Busy(WsPath),
@@ -140,7 +141,7 @@ impl StoreError {
             path: path.clone(),
             backup: None,
             cloud_only: false,
-            kept: None,
+            kept: Vec::new(),
         }
     }
 
@@ -149,7 +150,7 @@ impl StoreError {
             path: path.clone(),
             backup: Some(backup),
             cloud_only: false,
-            kept: None,
+            kept: Vec::new(),
         }
     }
 
@@ -158,7 +159,7 @@ impl StoreError {
             path: path.clone(),
             backup: None,
             cloud_only: true,
-            kept: None,
+            kept: Vec::new(),
         }
     }
 
@@ -179,8 +180,8 @@ impl StoreError {
                 if let Some(backup) = backup {
                     data["backup"] = Value::from(backup.as_str());
                 }
-                if let Some(kept) = kept {
-                    data["kept"] = Value::from(kept.as_str());
+                if !kept.is_empty() {
+                    data["kept"] = kept.iter().map(|k| Value::from(k.as_str())).collect();
                 }
                 (&STORE_HASH_CONFLICT, Some(data))
             }
@@ -228,8 +229,13 @@ impl std::fmt::Display for StoreError {
                     f,
                     "`{path}` changed outside Worldwright, so it was not overwritten"
                 )?;
-                if let Some(kept) = kept {
-                    write!(f, "; a newer outside save is kept beside it as `{kept}`")?;
+                if !kept.is_empty() {
+                    let names: Vec<String> = kept.iter().map(|k| format!("`{k}`")).collect();
+                    write!(
+                        f,
+                        "; outside versions are kept beside it as {}",
+                        names.join(" and ")
+                    )?;
                 }
                 if let Some(backup) = backup {
                     write!(
@@ -474,11 +480,25 @@ enum Seen<T> {
     Missing,
     /// A cloud-only placeholder: never read.
     Placeholder,
+    /// A symbolic link, junction or mount point (a name-surrogate reparse point): never read
+    /// or written through.
+    Link,
     Folder,
     Found(T),
 }
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// The `store.path_invalid` of a link at `rel`.
+fn link_refused(rel: &WsPath) -> StoreError {
+    StoreError::PathInvalid {
+        path: rel.as_str().to_string(),
+        why: "it is a symbolic link or junction; the suite never reads or writes through a \
+              link, so replace it with the file itself"
+            .to_string(),
+    }
+}
 
 /// `probe.identity` first; only a local file is opened, through `probe.open_read`.
 fn see<T>(probe: &dyn Probe, path: &Path, read: fn(File) -> io::Result<T>) -> io::Result<Seen<T>> {
@@ -489,6 +509,15 @@ fn see<T>(probe: &dyn Probe, path: &Path, read: fn(File) -> io::Result<T>) -> io
     };
     if id.is_cloud_placeholder() {
         return Ok(Seen::Placeholder);
+    }
+    // A reparse point that names another file (a link) is never followed. Other reparse
+    // points (a hydrated cloud file, a deduplicated file) hold their own data.
+    if id.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && probe
+            .reparse_tag(path)?
+            .is_some_and(ww_platform::fs::is_name_surrogate)
+    {
+        return Ok(Seen::Link);
     }
     if id.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         return Ok(Seen::Folder);
@@ -652,13 +681,15 @@ fn backups_of(dir: &Path, name: &str) -> io::Result<Vec<PathBuf>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let wanted = name.to_lowercase();
+    let wanted = super::paths::path_key(name);
     let mut found: Vec<(u32, u64, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             match parse_leftover(&file_name) {
-                Some((LeftoverKind::Backup, target, pid, n)) if target.to_lowercase() == wanted => {
+                Some((LeftoverKind::Backup, target, pid, n))
+                    if super::paths::path_key(&target) == wanted =>
+                {
                     Some((pid, n, dir.join(file_name)))
                 }
                 _ => None,
@@ -957,6 +988,7 @@ impl Store {
                       available offline first"
                     .to_string(),
             }),
+            Seen::Link => Err(link_refused(rel)),
             Seen::Folder => Err(StoreError::Io {
                 path: rel.as_str().to_string(),
                 why: "it is a folder".to_string(),
@@ -970,6 +1002,7 @@ impl Store {
             Seen::Missing => Ok(None),
             Seen::Found(bytes) => Ok(Some(bytes)),
             Seen::Placeholder => Err(StoreError::cloud_only(rel)),
+            Seen::Link => Err(link_refused(rel)),
             Seen::Folder => Err(StoreError::PathInvalid {
                 path: rel.as_str().to_string(),
                 why: "it is a folder".to_string(),
@@ -1213,9 +1246,9 @@ impl Store {
                 Err(StoreError::HashConflict {
                     backup: None,
                     cloud_only: false,
-                    kept: None,
+                    kept,
                     ..
-                }) if attempt < EDIT_RETRIES => {
+                }) if kept.is_empty() && attempt < EDIT_RETRIES => {
                     attempt += 1;
                     tracing::info!(path = %rel, attempt, "outside change during an edit; re-applying");
                 }
@@ -1372,6 +1405,7 @@ impl Store {
             Ok(Seen::Missing) => None,
             Ok(Seen::Found(h)) => Some(h),
             Ok(Seen::Placeholder) => return Err(StoreError::cloud_only(rel)),
+            Ok(Seen::Link) => return Err(link_refused(rel)),
             Ok(Seen::Folder) => {
                 return Err(StoreError::PathInvalid {
                     path: rel.as_str().to_string(),
@@ -1629,7 +1663,7 @@ impl Store {
                                 path: rel.clone(),
                                 backup: None,
                                 cloud_only: false,
-                                kept: Some(kept),
+                                kept: vec![kept],
                             }
                         }
                         Err(_) => StoreError::held_backup(rel, self.rel_of(&names.b1)),
@@ -1768,18 +1802,21 @@ impl Store {
             Err(e) if classify(&e) == RetryClass::TargetExists => {
                 match self.move_aside(&names.b1, &names.dir, &names.name).await {
                     Ok(aside) => match self.finish_put_back(rel, names, None).await {
-                        // The first outside edit's copy is named when nothing newer was kept.
+                        // The first outside edit's copy is named beside any newer one kept.
                         StoreError::HashConflict {
                             path,
-                            backup: None,
+                            backup,
                             cloud_only,
-                            kept: None,
-                        } => StoreError::HashConflict {
-                            path,
-                            backup: None,
-                            cloud_only,
-                            kept: Some(aside),
-                        },
+                            mut kept,
+                        } => {
+                            kept.insert(0, aside);
+                            StoreError::HashConflict {
+                                path,
+                                backup,
+                                cloud_only,
+                                kept,
+                            }
+                        }
                         other => other,
                     },
                     Err(_) => held(),
@@ -1810,12 +1847,12 @@ impl Store {
             })
             .await;
         let kept = match removed {
-            Ok(true) => None,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Ok(true) => Vec::new(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Ok(false) => match self.move_aside(&names.b2, &names.dir, &names.name).await {
                 Ok(kept) => {
                     tracing::warn!(path = %rel, kept = %kept, "a newer outside save met the put-back; kept beside the target");
-                    Some(kept)
+                    vec![kept]
                 }
                 Err(e) => {
                     tracing::warn!(path = %rel, error = %e, "a newer outside save stays in the backup until recovery");
@@ -1900,7 +1937,7 @@ impl Store {
             .await
             .map_err(|e| StoreError::state(&root_rel, &e))?
             .into_iter()
-            .map(|row| row.path.to_lowercase())
+            .map(|row| super::paths::path_key(&row.path))
             .collect();
         for backup in leftovers.iter().filter(|l| l.kind == LeftoverKind::Backup) {
             if !self.path_exists(&backup.path).await {

@@ -51,6 +51,7 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 use ww_platform::Env;
 
 use crate::store::fsops;
+use crate::store::paths::path_key;
 use crate::workspace::WorkspaceRef;
 
 /// Called once when a database actor dies, with `"state"`.
@@ -350,8 +351,8 @@ impl StateDb {
         let path = path.to_string();
         self.call(move |conn| {
             conn.query_row(
-                "SELECT sha256 FROM generated WHERE path = ?1",
-                params![path],
+                "SELECT sha256 FROM generated WHERE key = ?1",
+                params![path_key(&path)],
                 |r| r.get(0),
             )
             .optional()
@@ -370,9 +371,9 @@ impl StateDb {
         let (path, sha256) = (path.to_string(), sha256.to_string());
         self.call(move |conn| {
             conn.execute(
-                "INSERT INTO generated (path, sha256, written_utc) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(path) DO UPDATE SET sha256 = ?2, written_utc = ?3",
-                params![path, sha256, utc],
+                "INSERT INTO generated (key, path, sha256, written_utc) VALUES (?4, ?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET path = ?1, sha256 = ?2, written_utc = ?3",
+                params![path, sha256, utc, path_key(&path)],
             )
             .map(drop)
             .map_err(|e| sql_error(&e))
@@ -385,10 +386,17 @@ impl StateDb {
         let p = p.clone();
         self.call(move |conn| {
             conn.execute(
-                "INSERT INTO generated_pending (path, old_sha256, new_sha256, started_utc)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(path) DO UPDATE SET old_sha256 = ?2, new_sha256 = ?3, started_utc = ?4",
-                params![p.path, p.old_sha256, p.new_sha256, p.started_utc],
+                "INSERT INTO generated_pending (key, path, old_sha256, new_sha256, started_utc)
+                 VALUES (?5, ?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET path = ?1, old_sha256 = ?2, new_sha256 = ?3,
+                     started_utc = ?4",
+                params![
+                    p.path,
+                    p.old_sha256,
+                    p.new_sha256,
+                    p.started_utc,
+                    path_key(&p.path)
+                ],
             )
             .map(drop)
             .map_err(|e| sql_error(&e))
@@ -402,8 +410,8 @@ impl StateDb {
         self.call(move |conn| {
             conn.query_row(
                 "SELECT path, old_sha256, new_sha256, started_utc FROM generated_pending
-                 WHERE path = ?1",
-                params![path],
+                 WHERE key = ?1",
+                params![path_key(&path)],
                 pending_row,
             )
             .optional()
@@ -440,15 +448,14 @@ impl StateDb {
         self.call(move |conn| {
             let run = || -> rusqlite::Result<()> {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tx.execute(
-                    "DELETE FROM generated_pending WHERE path = ?1",
-                    params![path],
-                )?;
+                let key = path_key(&path);
+                tx.execute("DELETE FROM generated_pending WHERE key = ?1", params![key])?;
                 if let Some((sha, utc)) = generated {
                     tx.execute(
-                        "INSERT INTO generated (path, sha256, written_utc) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(path) DO UPDATE SET sha256 = ?2, written_utc = ?3",
-                        params![path, sha, utc],
+                        "INSERT INTO generated (key, path, sha256, written_utc)
+                         VALUES (?4, ?1, ?2, ?3)
+                         ON CONFLICT(key) DO UPDATE SET path = ?1, sha256 = ?2, written_utc = ?3",
+                        params![path, sha, utc, key],
                     )?;
                 }
                 tx.commit()
