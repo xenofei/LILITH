@@ -2,11 +2,4 @@
 # e.g. name = "ww-spec-tests::smoke::spec_harness_runs" (the JUnit classname::name).
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
-tests = [
-    { name = "ww-spec-tests::cli_basics::status_starts_core_and_reports_it", rule = "ARCH-016", file = "tests/cli_basics.rs" },
-    { name = "ww-spec-tests::cli_basics::status_no_start_reports_not_running", rule = "ARCH-018", file = "tests/cli_basics.rs" },
-    { name = "ww-spec-tests::cli_basics::no_start_call_is_a_silent_noop", rule = "ARCH-018", file = "tests/cli_basics.rs" },
-    { name = "ww-spec-tests::cli_basics::call_maps_outcomes_to_exit_codes", rule = "ARCH-016", file = "tests/cli_basics.rs" },
-    { name = "ww-spec-tests::cli_basics::non_interactive_destructive_is_confirm_unavailable", rule = "QA-016", file = "tests/cli_basics.rs" },
-    { name = "ww-spec-tests::cli_basics::core_stop_drains_and_exits", rule = "ARCH-023", file = "tests/cli_basics.rs" },
-]
+tests = []

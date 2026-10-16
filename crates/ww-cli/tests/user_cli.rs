@@ -1,0 +1,342 @@
+//! The `ww` user commands against the real `ww` and `ww-core` (QA-056): `status`, `call`,
+//! `events --follow` and `core stop`, run the way scripts and agents run them, with stdout and
+//! stderr captured through pipes (spec Appendix D, "The `ww` user commands").
+//!
+//! Every test runs on its own `TestEnv` channel; any core `ww` starts is drained when the env
+//! drops (QA-041). Durations are failure deadlines only, never measurements (QA-031).
+
+use std::io::{BufRead as _, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use ww_protocol::{EventKind, EventParams, Outcome, ToolOutput};
+use ww_testkit::{CoreFixture, RawPipe, TestEnv, WwOutput, ensure_built, sha256_file};
+
+/// A failure deadline only, never a measurement (QA-031).
+const DEADLINE: Duration = Duration::from_secs(30);
+
+fn stdout_json(out: &WwOutput) -> Value {
+    serde_json::from_str(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {out:?}"))
+}
+
+fn tool_outcome(out: &WwOutput) -> Outcome<ToolOutput> {
+    serde_json::from_value(stdout_json(out))
+        .unwrap_or_else(|e| panic!("stdout is not a tool Outcome ({e}): {out:?}"))
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// `path` as written, and its canonical form without the `\\?\` prefix: a process image name
+/// is the long form even when the temporary folder was given in 8.3 form.
+fn path_forms(path: &Path) -> Vec<String> {
+    let canonical = canonical(path).display().to_string();
+    let plain = canonical
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&canonical)
+        .to_string();
+    vec![path.display().to_string(), plain]
+}
+
+/// A `ww` started with `TestEnv::ww_spawn`: its stdout lines arrive on a channel, and it is
+/// killed if the test ends while it still runs.
+struct Spawned {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Spawned {
+    fn new(mut child: Child) -> Spawned {
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Spawned { child, lines }
+    }
+
+    fn next_line(&self) -> String {
+        self.lines
+            .recv_timeout(DEADLINE)
+            .unwrap_or_else(|e| panic!("no stdout line from `ww` within {DEADLINE:?}: {e}"))
+    }
+
+    /// The exit code once `ww` has exited; panics after the deadline.
+    fn wait(&mut self) -> i32 {
+        let end = Instant::now() + DEADLINE;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status.code().unwrap_or(-1);
+            }
+            assert!(Instant::now() < end, "`ww` still runs after {DEADLINE:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test] // spec: ARCH-016, ARCH-019
+fn ww_status_with_captured_output_returns_while_core_runs() {
+    let env = TestEnv::new();
+    // `TestEnv::ww` captures stdout and stderr through pipes, as `Command::output` does, and
+    // reads them to their end: a core holding them would keep it waiting.
+    let out = env.ww(&["status"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    // A failure deadline: the core stays up for minutes, so a `ww` tied to it never gets here.
+    assert!(out.elapsed < DEADLINE, "{out:?}");
+    assert!(out.stdout.starts_with("core: running (pid "), "{out:?}");
+    for line in ["pipe: ", "protocol: ", "workspace: none", "caller: cli"] {
+        assert!(out.stdout.contains(line), "no `{line}` in {out:?}");
+    }
+    let raw = RawPipe::try_connect(&env, Duration::from_secs(1));
+    assert!(
+        raw.is_some(),
+        "the core did not keep running after `ww status`"
+    );
+}
+
+#[test] // spec: ARCH-016
+fn call_reads_args_from_stdin_dash() {
+    let env = TestEnv::new();
+    let out = env.ww_with_stdin(
+        &["call", "test.echo", "-"],
+        "{\"text\":\"Ünïcödé space\"}\n",
+    );
+    assert_eq!(out.code, 0, "{out:?}");
+    match tool_outcome(&out) {
+        Outcome::Ok(output) => assert_eq!(output.structured["text"], "Ünïcödé space", "{out:?}"),
+        other => panic!("expected ok, got {other:?}"),
+    }
+}
+
+#[test] // spec: ARCH-016
+fn call_rejects_non_object_args_with_exit_2() {
+    let env = TestEnv::new();
+    for args in [
+        &["call", "test.echo", "[1, 2]"][..],
+        &["call", "test.echo", "\"text\""],
+        &["call", "test.echo", "{not json"],
+    ] {
+        let out = env.ww(args);
+        assert_eq!(out.code, 2, "{args:?}: {out:?}");
+        assert_eq!(out.stdout, "", "{args:?}: {out:?}");
+        assert!(out.stderr.contains("JSON"), "{args:?}: {out:?}");
+    }
+    let piped = env.ww_with_stdin(&["call", "test.echo", "-"], "42");
+    assert_eq!(piped.code, 2, "{piped:?}");
+    assert!(piped.stderr.contains("JSON object"), "{piped:?}");
+    // The arguments are checked before any core is started.
+    assert!(
+        RawPipe::try_connect(&env, Duration::from_secs(1)).is_none(),
+        "a rejected call started a core"
+    );
+}
+
+#[test] // spec: ARCH-016, ARCH-035
+fn call_passes_the_idempotency_key() {
+    let env = TestEnv::new();
+    let write = |key: &str| {
+        let out = env.ww(&[
+            "call",
+            "test.write",
+            "{\"label\":\"Ünïcödé space\"}",
+            "--idempotency-key",
+            key,
+        ]);
+        assert_eq!(out.code, 0, "{out:?}");
+        match tool_outcome(&out) {
+            Outcome::Ok(output) => output.structured["executions"].clone(),
+            other => panic!("expected ok, got {other:?}"),
+        }
+    };
+    let first = write("ik_cli_one");
+    // The same key replays the first call; the tool does not run again.
+    assert_eq!(write("ik_cli_one"), first);
+}
+
+#[test] // spec: ARCH-016, ARCH-032
+fn events_follow_prints_ndjson() {
+    let env = TestEnv::new();
+    let mut events = Spawned::new(env.ww_spawn(&[
+        "events", "--follow", "--topic", "test:a", "--since", "test:a=0",
+    ]));
+
+    let emit = env.ww(&[
+        "call",
+        "test.emit",
+        "{\"topic\":\"a\",\"data\":{\"label\":\"Ünïcödé space\"}}",
+    ]);
+    assert_eq!(emit.code, 0, "{emit:?}");
+
+    let line = events.next_line();
+    let event: EventParams = serde_json::from_str(&line)
+        .unwrap_or_else(|e| panic!("not an EventParams line ({e}): {line}"));
+    assert_eq!(event.topic, "test:a", "{line}");
+    assert_eq!(event.seq, 1, "{line}");
+    assert_eq!(event.kind, EventKind::Event, "{line}");
+    assert_eq!(event.data["label"], "Ünïcödé space", "{line}");
+
+    // `ww events` ends, with exit 0, when the core goes away.
+    let stop = env.ww(&["core", "stop"]);
+    assert_eq!(stop.code, 0, "{stop:?}");
+    assert_eq!(events.wait(), 0);
+}
+
+#[test] // spec: ARCH-030
+fn workspace_flag_selects_registered_default() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = env.make_workspace("Ünïcödé default");
+    env.register_workspace(&ws, true);
+    let ws_arg = ws.to_str().expect("a UTF-8 test path");
+
+    let reported = |out: &WwOutput| {
+        assert_eq!(out.code, 0, "{out:?}");
+        let status = stdout_json(out);
+        assert_eq!(status["running"], true, "{out:?}");
+        let path = status["hello"]["workspace"]["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no workspace path: {out:?}"));
+        canonical(Path::new(path))
+    };
+    // The flag, before or after the subcommand.
+    assert_eq!(
+        reported(&env.ww(&["status", "--json", "--workspace", ws_arg])),
+        canonical(&ws)
+    );
+    assert_eq!(
+        reported(&env.ww(&["--workspace", ws_arg, "status", "--json"])),
+        canonical(&ws)
+    );
+    // Without it, the registered default.
+    assert_eq!(reported(&env.ww(&["status", "--json"])), canonical(&ws));
+
+    // A folder that is not a workspace is a plain error, not a fallback.
+    let plain = env.root().join("not a workspace");
+    std::fs::create_dir_all(&plain).unwrap();
+    let out = env.ww(&["status", "--workspace", plain.to_str().unwrap()]);
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("worldwright.yaml"), "{out:?}");
+}
+
+#[test] // spec: ARCH-030, ARCH-016
+fn a_stale_default_workspace_names_suite_toml_and_core_stop_still_works() {
+    let env = TestEnv::new();
+    let gone = env.make_workspace("gone");
+    env.register_workspace(&gone, true);
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let status = env.ww(&["status"]);
+    assert_eq!(status.code, 2, "{status:?}");
+    assert!(status.stderr.contains("suite.toml"), "{status:?}");
+    assert!(status.stderr.contains("ws-gone"), "{status:?}");
+    let call = env.ww(&["call", "test.echo", "{\"text\":\"x\"}"]);
+    assert_eq!(call.code, 2, "{call:?}");
+    assert!(call.stderr.contains("suite.toml"), "{call:?}");
+
+    // Stopping never depends on workspace configuration.
+    let core = CoreFixture::start(&env);
+    let stop = env.ww(&["core", "stop"]);
+    assert_eq!(stop.code, 0, "{stop:?}");
+    assert_eq!(stop.stdout.trim(), "core stopped", "{stop:?}");
+    drop(core);
+
+    // With no core, `--no-start` stays silent even though the registry is stale (ARCH-018).
+    let quiet = env.ww(&["--no-start", "call", "test.echo"]);
+    assert_eq!(
+        (quiet.code, quiet.stdout.as_str(), quiet.stderr.as_str()),
+        (0, "", "")
+    );
+}
+
+#[test] // spec: ARCH-018
+fn without_a_core_stop_and_no_start_commands_start_nothing() {
+    let env = TestEnv::new();
+
+    let stop = env.ww(&["core", "stop"]);
+    assert_eq!(stop.code, 0, "{stop:?}");
+    assert_eq!(stop.stdout.trim(), "core not running", "{stop:?}");
+    assert_eq!(stop.stderr, "", "{stop:?}");
+
+    for args in [
+        &["--no-start", "core", "stop"][..],
+        &["events", "--follow", "--topic", "test:a", "--no-start"],
+        &["--no-start", "call", "test.echo"],
+    ] {
+        let out = env.ww(args);
+        assert_eq!(out.code, 0, "{args:?}: {out:?}");
+        assert_eq!(out.stdout, "", "{args:?}: {out:?}");
+        assert_eq!(out.stderr, "", "{args:?}: {out:?}");
+    }
+
+    let status = env.ww(&["--no-start", "status", "--json"]);
+    assert_eq!(status.code, 3, "{status:?}");
+    assert_eq!(stdout_json(&status), serde_json::json!({"running": false}));
+
+    assert!(
+        RawPipe::try_connect(&env, Duration::from_secs(1)).is_none(),
+        "a command started a core"
+    );
+}
+
+#[test] // spec: ARCH-027
+fn untrusted_core_message_names_the_exe() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let other = env.root().join("other bin");
+    std::fs::create_dir_all(&other).unwrap();
+    let copy = other.join("ww-core.exe");
+    std::fs::copy(&ensure_built().ww_core, &copy).unwrap();
+    let mut fixture = CoreFixture::start_exe(&env, &copy);
+
+    let out = env.ww(&["status"]);
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert!(
+        path_forms(&copy).iter().any(|p| out.stderr.contains(p)),
+        "{out:?}"
+    );
+    assert!(out.stderr.contains("ww core stop"), "{out:?}");
+
+    // The hint works: `ww core stop` asks that core to finish.
+    let stop = env.ww(&["core", "stop"]);
+    assert_eq!(stop.code, 0, "{stop:?}");
+    assert_eq!(stop.stdout.trim(), "core stopped", "{stop:?}");
+    assert_eq!(fixture.wait_exit(DEADLINE), Some(0));
+}
+
+#[test] // spec: CORE-004
+fn damaged_state_db_message_is_plain() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let db = env.env.suite_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
+    let before = sha256_file(&db);
+
+    let out = env.ww(&["status"]);
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert_eq!(
+        out.stderr.trim(),
+        format!(
+            "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+            db.display()
+        ),
+        "{out:?}"
+    );
+    assert_eq!(sha256_file(&db), before, "{} was changed", db.display());
+}

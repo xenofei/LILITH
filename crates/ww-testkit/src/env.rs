@@ -14,11 +14,11 @@
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -116,7 +116,9 @@ impl TestEnv {
     /// through `ww-platform`'s detached spawn and inherits none of these pipes.
     ///
     /// # Panics
-    /// If `ww` cannot be started.
+    /// If `ww` cannot be started; if it runs longer than 120 s (it is killed); or if its
+    /// stdout or stderr stays open after it exited (a process it started inherited them). The
+    /// message carries what `ww` printed so far.
     pub fn ww(&self, args: &[&str]) -> WwOutput {
         self.run_ww(args, None)
     }
@@ -152,6 +154,7 @@ impl TestEnv {
     fn run_ww(&self, args: &[&str], stdin: Option<&str>) -> WwOutput {
         let ww = &ensure_built().ww;
         let start = Instant::now();
+        let deadline = start + WW_DEADLINE;
         let mut child = self
             .ww_command(args)
             .stdin(if stdin.is_some() {
@@ -173,16 +176,60 @@ impl TestEnv {
             }
             _ => None,
         };
-        let output = child
-            .wait_with_output()
-            .unwrap_or_else(|e| panic!("waiting for {} failed: {e}", ww.display()));
+        let stdout = Captured::read(child.stdout.take());
+        let stderr = Captured::read(child.stderr.take());
+        let report = |what: &str, stdout: &Captured, stderr: &Captured| -> String {
+            format!(
+                "`ww {}` {what}\nstdout so far: {}\nstderr so far: {}",
+                args.join(" "),
+                stdout.text(),
+                stderr.text()
+            )
+        };
+
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => panic!("waiting for {} failed: {e}", ww.display()),
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                stdout.wait_closed(PIPE_GRACE);
+                stderr.wait_closed(PIPE_GRACE);
+                panic!(
+                    "{}",
+                    report(
+                        &format!("did not exit within {WW_DEADLINE:?}; it was killed"),
+                        &stdout,
+                        &stderr
+                    )
+                );
+            }
+            std::thread::sleep(POLL);
+        };
+        // `ww` has exited, so its pipes close unless a process it started inherited them
+        // (spec Appendix D: a core never holds the caller's output).
+        if !(stdout.wait_closed(PIPE_GRACE) && stderr.wait_closed(PIPE_GRACE)) {
+            panic!(
+                "{}",
+                report(
+                    &format!(
+                        "exited ({status}), but its stdout or stderr stayed open: a process it started inherited them"
+                    ),
+                    &stdout,
+                    &stderr
+                )
+            );
+        }
         if let Some(writer) = writer {
             let _ = writer.join();
         }
         WwOutput {
-            code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            code: status.code().unwrap_or(-1),
+            stdout: stdout.text(),
+            stderr: stderr.text(),
             elapsed: start.elapsed(),
         }
     }
@@ -292,6 +339,61 @@ fn unique_id() -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let h = RandomState::new().hash_one((std::process::id(), n));
     format!("{:08x}", h as u32)
+}
+
+/// How long one [`TestEnv::ww`] run may take before `ww` is killed and the test fails. A hang
+/// guard, never a measurement (QA-031). It is a constant rather than test-params.toml's `e2e_s`
+/// (300 s): that value is nextest's own stop for the whole test, so a per-call guard must fire
+/// well before it. 120 s covers the client's longest wait (a 60 s start cap, `ww core stop`'s
+/// default 60 s).
+const WW_DEADLINE: Duration = Duration::from_secs(120);
+/// How long to wait for `ww`'s pipes to close once it has exited or been killed. They close
+/// at once unless another process holds them.
+const PIPE_GRACE: Duration = Duration::from_secs(10);
+/// Pause between checks of whether `ww` has exited.
+const POLL: Duration = Duration::from_millis(10);
+
+/// A child's output pipe, read to its end on a thread of its own. What arrived so far stays
+/// readable even while the pipe is still open.
+struct Captured {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    closed: mpsc::Receiver<()>,
+}
+
+impl Captured {
+    fn read(pipe: Option<impl Read + Send + 'static>) -> Captured {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (done, closed) = mpsc::channel();
+        let sink = Arc::clone(&bytes);
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0_u8; 8192];
+                while let Ok(n) = pipe.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend_from_slice(&chunk[..n]);
+                }
+            }
+            let _ = done.send(());
+        });
+        Captured { bytes, closed }
+    }
+
+    /// True once the pipe has closed (now or within `within`).
+    fn wait_closed(&self, within: Duration) -> bool {
+        match self.closed.recv_timeout(within) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes.lock().unwrap_or_else(PoisonError::into_inner))
+            .into_owned()
+    }
 }
 
 #[cfg(test)]

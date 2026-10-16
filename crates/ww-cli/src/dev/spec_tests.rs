@@ -34,8 +34,13 @@ pub enum SpecVerdict {
     NowPassing(Vec<String>),
 }
 
+/// The JUnit classname prefix nextest gives a setup script's entry (ruling P18).
+const SETUP_SCRIPT_CLASS: &str = "@setup-script:";
+
 /// Reads every `<testcase>` from a JUnit document. A case is failed when it has a
 /// `<failure>` or `<error>` child; flaky-retry elements mark it flaky, not failed.
+/// A setup script's entry (classname `@setup-script:<name>`) is not a test and is left out,
+/// unless it failed: then it is kept as a failed case, so the run names it.
 /// Malformed XML or a document with no test cases is an error.
 pub fn parse_junit(xml: &str) -> Result<Vec<JunitCase>, String> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| format!("malformed JUnit XML: {e}"))?;
@@ -59,6 +64,7 @@ pub fn parse_junit(xml: &str) -> Result<Vec<JunitCase>, String> {
                 flaky: has(&["flakyFailure", "flakyError"]),
             }
         })
+        .filter(|c| c.failed || !c.name.starts_with(SETUP_SCRIPT_CLASS))
         .collect();
     if cases.is_empty() {
         return Err("JUnit output contains no test cases".to_string());
@@ -441,6 +447,45 @@ fail-fast = false
                 case("ww-spec-tests::smoke::bad_one", true)
             ]
         );
+    }
+
+    #[test]
+    fn setup_scripts_are_not_counted_as_tests() {
+        let script = |body: &str| {
+            format!(
+                r#"<testsuites>
+  <testsuite name="@setup-script:build-testbins" tests="1">
+    <testcase name="build-testbins" classname="@setup-script:build-testbins">{body}</testcase>
+  </testsuite>
+  <testsuite name="ww-spec-tests::smoke" tests="1">
+    <testcase name="ok_one" classname="ww-spec-tests::smoke"/>
+  </testsuite>
+</testsuites>"#
+            )
+        };
+        assert_eq!(
+            parse_junit(&script("")).unwrap(),
+            vec![case("ww-spec-tests::smoke::ok_one", false)]
+        );
+        // A failed setup script stays, as a failure the run reports.
+        let failed = parse_junit(&script(r#"<failure message="build failed"/>"#)).unwrap();
+        assert_eq!(
+            failed,
+            vec![
+                case("@setup-script:build-testbins::build-testbins", true),
+                case("ww-spec-tests::smoke::ok_one", false)
+            ]
+        );
+        assert_eq!(
+            evaluate(&failed, &[]),
+            SpecVerdict::UnexpectedFailures(vec![
+                "@setup-script:build-testbins::build-testbins".into()
+            ])
+        );
+        // A run with nothing but a passing setup script has no test cases.
+        let only = r#"<testsuites><testsuite name="@setup-script:b">
+    <testcase name="b" classname="@setup-script:b"/></testsuite></testsuites>"#;
+        assert!(parse_junit(only).is_err());
     }
 
     #[test]

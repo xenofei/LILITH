@@ -3408,7 +3408,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml 0.8.23",
+ "ww-client",
  "ww-platform",
+ "ww-protocol",
+ "ww-testkit",
  "yaml-rust2",
  "zeroize",
 ]

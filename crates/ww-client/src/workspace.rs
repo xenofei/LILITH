@@ -72,7 +72,21 @@ pub fn resolve_workspace_id(
         )
     })?;
     match suite.default_workspace.as_deref().filter(|p| !p.is_empty()) {
-        Some(default) => id_of(Path::new(default)),
+        Some(default) => {
+            let path = Path::new(default);
+            std::fs::canonicalize(path)
+                .map(|canonical| Env::workspace_hash(&canonical))
+                .map_err(|e| {
+                    plain(
+                        e.kind(),
+                        format!(
+                            "The default workspace {} named in {} cannot be opened: {e}. Pass --workspace, or change default_workspace there.",
+                            path.display(),
+                            file.display()
+                        ),
+                    )
+                })
+        }
         None => Ok(NO_WORKSPACE.to_string()),
     }
 }
@@ -161,6 +175,29 @@ mod tests {
             id(&explicit)
         );
         assert_eq!(id(&explicit).len(), 16);
+    }
+
+    #[test] // spec: ARCH-030
+    fn a_stale_or_unreadable_registry_is_an_error_naming_suite_toml() {
+        let env = TestEnv::with_label("Ünïcödé space");
+        let outside = mkdir(env.root().join("outside"));
+
+        // A default workspace whose folder is gone: never "none", never another workspace.
+        let gone = env.make_workspace("gone");
+        env.register_workspace(&gone, true);
+        std::fs::remove_dir_all(&gone).unwrap();
+        let text = resolve_workspace_id(&env.env, None, &outside)
+            .expect_err("a stale default workspace resolved")
+            .to_string();
+        assert!(text.contains("suite.toml"), "{text}");
+        assert!(text.contains(&gone.display().to_string()), "{text}");
+
+        // A registry that is not TOML.
+        std::fs::write(env.env.suite_toml(), "default_workspace = [").unwrap();
+        let text = resolve_workspace_id(&env.env, None, &outside)
+            .expect_err("an invalid suite.toml resolved")
+            .to_string();
+        assert!(text.contains("suite.toml"), "{text}");
     }
 
     #[test] // spec: ARCH-030
