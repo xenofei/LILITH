@@ -1523,7 +1523,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - `visual_pick`: a `choice` whose options get previews (AI-181).
   - A question is `{id, kind, text, slots[], reason, options[]}`. `id` is `q<step>`, `slots[]` names the slots it fills, and `reason` is one line. A choice question carries 2–6 options `{id, label}`, with ids `a`–`f` and labels of at most 80 characters. It always also accepts "I don't mind" and "Other…" (free text), which the UI always shows.
   - **Mostly multiple choice:** an interview asks at most one `free_text` question, unless `subject.main` is still unknown. The question bank prefers `choice`.
-  - Questions about look, style, mood, colour, lighting and composition may be `visual_pick`; all others are text. (Interpretation pending the owner's confirmation: the owner named look and aesthetic. This rule also allows mood, colour, lighting and composition, which the brief groups under look.)
+  - Questions about look, style, mood, colour, lighting and composition may be `visual_pick`; all others are text. (owner decision 2026-10-16: `visual_pick` covers mood, colour, lighting and composition as well as look and aesthetic.)
 - **AI-168** [M1a] (invariant) **Budget and stop rule.** One question per step. The budget comes from the settings `prompt_studio.question_budget.full` (default 5, used in the Prompt Studio) and `prompt_studio.question_budget.compact` (default 3, used in the "Improve this prompt" pop-over). Each is 0–8, where 0 means compile at once. No slot is asked about twice unless the person reopens it. The interview stops at the first of:
   - every slot the target kind marks as relevant is known or `dont_mind`;
   - the budget is spent;
@@ -1621,7 +1621,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - They are interactive operations (CORE-124, IMG-092). They wait for the prompt already running, and they never cancel or resubmit a running prompt: CORE-125's setting doesn't apply to them. A superseded preview job (the person answered, or the question changed) is cancelled by id.
   - They are logged like any job, as local work with GPU time and per-job energy (CORE-065), labelled "Prompt Studio previews" in Jobs.
   - They are **disposable**. They are kept in the per-workspace cache, never in the workspace or in git, and are deleted when the interview ends or after 24 h, whichever comes first. They are never asset candidates (CORE-023), proposals or references. The transcript keeps their seed, settings and profile hash, not their pixels.
-  - The setting `prompt_studio.previews` is `on`, `when_engine_running` (the default) or `off`. When previews are off, or no local image engine or model is available, the question is shown as text with the reason. (Interpretation pending the owner's confirmation: with the default, a session where the image engine hasn't started shows no previews until "Show previews" starts it.)
+  - The setting `prompt_studio.previews` is `on`, `when_engine_running` (the default) or `off`. When previews are off, or no local image engine or model is available, the question is shown as text with the reason. With the default and the image engine not running, the question shows a **Start and show previews** button, which starts the engine and renders them. (owner decision 2026-10-16.)
 
 #### Integration
 
