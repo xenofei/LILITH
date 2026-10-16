@@ -70,7 +70,7 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 
 ### 0.5 Document map
 
-§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification).
+§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification) · Appendix E Workspace data (plan 2b clarification).
 
 ---
 
@@ -163,7 +163,7 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
   - `ww/subscribe`, `ww/unsubscribe` and the `ww/event` notification.
 
   (plan 2 clarification) `core/drain` asks for "drain and exit when safe" (ARCH-023). On a connection whose `core/hello` was refused with `protocol.incompatible`, it is the only call allowed, and only from a client whose major version is greater than the core's. Its name, parameters and result never change (Appendix D).
-- **ARCH-032** [M1] (contract) `ww/subscribe(topics, since_seq)` delivers `ww/event` notifications with per-topic sequence numbers. The core keeps 10 minutes of history per topic; a cursor older than that gets a snapshot instead. Each client has a bounded queue; overflow sends `resync_required`. External file edits and git activity arrive on the same stream. Topics include `asset:<ref>` for live links.
+- **ARCH-032** [M1] (contract) `ww/subscribe(topics, since_seq)` delivers `ww/event` notifications with per-topic sequence numbers. The core keeps 10 minutes of history per topic; a cursor older than that gets a snapshot instead. Each client has a bounded queue; overflow sends `resync_required`. External file edits and git activity arrive on the same stream. Topics include `asset:<ref>` for live links. (plan 2b clarification: Appendix E) The history is also capped at 1024 events per topic; an older cursor gets a snapshot.
 - **ARCH-033** [M1] (invariant) Bulk data never goes through the pipe. Calls and events carry file references into the workspace or into a staging/cache folder on the same volume (so ingest is a rename). Small previews (≤ 1 MB) may ride in events. No shared memory.
 - **ARCH-034** [M1] (contract) Long-running work returns a job id immediately.
 - **ARCH-035** [M1] (contract) Every mutating or metered call carries an idempotency key, which the core dedupes and persists with the job (scope and same-key rules in §2.2; Engine A uses session id + tool-use id, §4.6).
@@ -180,7 +180,7 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
 - **ARCH-042** [M1] (contract) The canonical asset reference is `ww://<workspace>/<project>/<asset>@<version>`, mapping 1:1 to the manifest link syntax. Candidates are referenced as `ww://<workspace>/<project>/<asset>@candidate/<run>/<file>` for viewing and provenance only — never as live links or recipe inputs.
   - From M1, every reference to a version — `ww://` refs, `.wwref` files, exports and engine-import records — also carries the target version's SHA-256 content hash (field defined with the schema, §2). Resolving a reference through `renamed_from` comes with multi-machine Sync (ARCH-087).
 - **ARCH-043** [M1] (contract) Clipboard and drag-and-drop carry refs under the MIME type `application/x-worldwright-ref`.
-- **ARCH-044** [M1] (contract) Live links subscribe to the event topic `asset:<ref>`.
+- **ARCH-044** [M1] (contract) Live links subscribe to the event topic `asset:<ref>`. (plan 2b clarification: Appendix E) The topic of a ref is `asset:` plus the ref without its `@<version>` and hash, so one subscription sees every version.
 
 Defined elsewhere: proposal references `doc:<doc_id>/proposal/<run_id>/<n>` (§5.5); the app handler registry, `open_in` and `ui.show` (§3.4); converters as tools (§2.10); checkout/checkin with the first interactive engine (*later*).
 
@@ -254,12 +254,12 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
   2. writes a temp file in the same directory and flushes it;
   3. replaces the target atomically (`ReplaceFileW` / `MoveFileExW` with write-through), retrying on sharing violations from Defender or the indexer.
 
-  The file watcher covers the small window between steps 1 and 3.
-- **ARCH-075** [M1] (invariant) Each operation writes in a fixed order: output file → manifest → jobs log line → index. On startup, outputs with no manifest entry (a crash mid-sequence) are listed as orphans for review and never deleted.
-- **ARCH-076** [M1] (invariant) Manifests round-trip losslessly: JSON is parsed with key order preserved (`serde_json` `preserve_order`) into typed structs that keep unknown fields in a flattened extras map, and written back with minimal diffs. Manifests carry `schema_version`; schema violations are warnings, not failures. YAML files (`worldwright.yaml`, `registry/*.yaml`) are changed with targeted edits that keep comments and order.
-- **ARCH-077** [M1] Golden round-trip tests use real workspace files, including the lantern manifest.
+  The file watcher covers the small window between steps 1 and 3. (plan 2b clarification: Appendix E) `ReplaceFileW` has no write-through flag (`REPLACEFILE_WRITE_THROUGH` is documented as not supported), and its target, replacement and backup must be on one volume. The temp file is flushed before the swap. Renames are atomic (journaled) but may be lost on power failure (`MOVEFILE_WRITE_THROUGH` is documented to flush only a move done as a copy and delete), so the store records the pending old and new hashes first and accepts either version as its own. No rename replaces an existing file. The outside-edit window is closed by checking the replaced file's backup, and recovery never leaves an outside edit only in a backup file (Appendix E).
+- **ARCH-075** [M1] (invariant) Each operation writes in a fixed order: output file → manifest → jobs log line → index. On startup, outputs with no manifest entry (a crash mid-sequence) are listed as orphans for review and never deleted. (plan 2b clarification: Appendix E) The `progress.md` entry (CORE-020) comes between the jobs log line and the index; events go out last.
+- **ARCH-076** [M1] (invariant) Manifests round-trip losslessly: JSON is parsed with key order preserved (`serde_json` `preserve_order`) into typed structs that keep unknown fields in a flattened extras map, and written back with minimal diffs. Manifests carry `schema_version`; schema violations are warnings, not failures. YAML files (`worldwright.yaml`, `registry/*.yaml`) are changed with targeted edits that keep comments and order. (plan 2b clarification: Appendix E) The typed structs are views over the ordered map, which keeps unknown fields in their original place.
+- **ARCH-077** [M1] Golden round-trip tests use real workspace files, including the lantern manifest. (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
 - **ARCH-078** [M1] The core records the SHA-256 of every file it writes as that file's last generated hash; human-edit detection compares against it (LFS pointers by `oid`). SHA-256 is the only content hash.
-- **ARCH-079** [M1] The file watcher uses `ReadDirectoryChangesW` and does a full rescan on buffer overflow. An outside edit to a candidate or sealed file is recorded as a human edit and offered as a new version. `work/` (working documents) is excluded from human-edit tracking, and `.worldwright\staging\` is excluded from the watcher. An invalid manifest is marked "needs repair" and never rewritten.
+- **ARCH-079** [M1] The file watcher uses `ReadDirectoryChangesW` and does a full rescan on buffer overflow. An outside edit to a candidate or sealed file is recorded as a human edit and offered as a new version. `work/` (working documents) is excluded from human-edit tracking, and `.worldwright\staging\` is excluded from the watcher. An invalid manifest is marked "needs repair" and never rewritten. (plan 2b clarification: Appendix E) A hash counts only when the file's identity is the same before and after the read; an unstable or locked file is parked and re-checked, never recorded as a human edit or a removal. A directory event reconciles the folder's subtree. A human edit already recorded with the same SHA-256 isn't recorded again. A file the suite still expects on disk (listed in `hashes`, a file of an open run, or a manifest) that disappears is `missing` until the same content reappears (with CORE-038); the suite's own moves (sign-off, trash, maintenance) never make a file `missing`.
 - **ARCH-080** [M1] (invariant) Engines never write into versioned folders. Headless jobs write into staging handles issued by `store` (`<workspace>\.worldwright\staging\`, gitignored, same volume), and the core ingests their outputs as candidate runs (§2.3).
 - **ARCH-081** [M1] (contract) The append-only logs are per machine and per month: `queue/jobs.<machine>.<yyyy-mm>.jsonl` and `registry/usage.<machine>.<yyyy-mm>.jsonl`. Calls made with no workspace open go to `%LOCALAPPDATA%\Worldwright\usage-loose.jsonl`.
   - Appends take a cross-process lock that `ww` can also take; each line is one write and carries a `seq`; readers repair a torn last line and dedupe by `(machine, seq)`.
@@ -272,7 +272,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 - **ARCH-086** [M1] (contract) `.gitattributes` LFS patterns don't depend on where large files are stored; the large-file store is a per-workspace setting kept in each clone's own git config (§7.2).
 - **ARCH-087** [M1.5] (invariant) Sealed versions never get suffixes. When Sync finds a local sealed version that also exists remotely, it renumbers the local one before the merge and records `renamed_from` (§7.3). From then on references resolve through `renamed_from`, using the content hash they carry from M1 (ARCH-042).
 - **ARCH-088** [M1] The active project is per client session. `.worldwright\state.json` is only an untracked last-used hint.
-- **ARCH-089** [M1] The index is a disposable SQLite database (`index.db`, WAL, schema-versioned). It is rebuilt on a schema mismatch or a failed `quick_check`, and reconciled by path + size + mtime + NTFS FileId + ChangeTime, hashing only changed files.
+- **ARCH-089** [M1] The index is a disposable SQLite database (`index.db`, WAL, schema-versioned). It is rebuilt on a schema mismatch or a failed `quick_check`, and reconciled by path + size + mtime + NTFS FileId + ChangeTime, hashing only changed files. (plan 2b clarification: Appendix E) FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders.
 - **ARCH-090** [M1] `%APPDATA%\Worldwright\suite.toml` lists the known workspaces and the default one; one core serves them all. M1 supports one workspace, but the workspace id is in every request from the start.
 - **ARCH-091** [Later] Multiple workspaces served by one core.
 - **ARCH-092** [Later] Leases, with checkout/checkin: one lease record (holder, purpose, expiry; renewed by bridge heartbeat or an observed save) persisted in the manifest's `leases` extension field (the workspace format's `locks` path list is unchanged), so leases survive restarts and the plugin can see them.
@@ -452,7 +452,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-016** [M1] (contract) Idempotency keys apply to jobs, metered calls, confirmations and cap reservations, and are scoped per caller kind + workspace. Same key + same arguments → the same job, result or confirmation. Same key + different arguments → rejected. Engine A's tool calls use `session id + tool-use id` as the key (§4).
 - **CORE-017** [M1] (contract) Every tool result is exactly one of `ok`, `pending_confirmation {confirmation_id, retry_token, expires_at, covers: [confirm, cap]}`, or `error` (error fields and codes in §6). `pending_confirmation` is a normal result, not an error.
 - **CORE-018** [M1] Graph tools, during Validate: apply ComfyUI's `/node_replacements` locally and extract model references. The references are recorded in the recipe and used to tell local work from paid partner (API) nodes (§2.6).
-- **CORE-019** [M1] New `proj:` or `lib:` references are recorded in the project's `links` during Validate. This isn't a gate; it keeps the dependency graph and "what links here" accurate.
+- **CORE-019** [M1] New `proj:` or `lib:` references are recorded in the project's `links` during Validate. This isn't a gate; it keeps the dependency graph and "what links here" accurate. (plan 2b clarification: Appendix E) In plan 2b the links are written in the Execute stage of `asset.pin_input`, since Validate runs before Confirm and never writes.
 - **CORE-020** [M1] (contract) The Record stage has three branches:
   - **asset candidate run:** candidate files, manifest, logs, a `progress.md` entry (one per Record stage), events;
   - **sealed version** (sign-off): as §2.3, with manifest, logs, `progress.md` and events;
@@ -473,35 +473,35 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-029** [M1] (invariant) Link-external assets (path + hash recorded, file outside the workspace, §3.4) can't be signed off until "Collect into workspace" copies them in. Sealed versions are always inside the workspace and read-only.
 - **CORE-030** [M1] After approval, repairs and derivatives (cut-out, upscale…) open a new candidate run on the same asset; a different deliverable is a new asset whose inputs reference the source.
 - **CORE-031** [M1] (contract) **References:** `id@1.0.0` and `ww://…@1.0.0` mean that sealed version's primary file plus its declared companions. Recipe inputs reference sealed versions only. `@candidate/<run>/<file>` refers to a candidate for viewing and provenance only.
-- **CORE-032** [M1] Rejected candidates are kept on disk, gitignored, and purged 90 days after sign-off unless pinned.
+- **CORE-032** [M1] Rejected candidates are kept on disk, gitignored, and purged 90 days after sign-off unless pinned. (plan 2b clarification: Appendix E) Purged here means moved to trash (ARCH-058), which purges the entry 30 days later: 120 days after sign-off in all. The workspace `.gitignore` ignores all of `candidates/`, so open runs don't sync between machines.
 - **CORE-033** [M1] Pre-suite folders such as the lantern's `v1.0.0/` are read as-is and labelled `legacy`.
 - **CORE-034** [M1] (invariant) **Human edits:** when a candidate or sealed file's hash differs from the recorded hash (LFS pointers are compared by `oid`), the change is recorded in `human_edits` and the file is never overwritten. The merge options are a new version that regenerates only unlocked layers or regions, or a sibling variant. Document folders (`work/`) are excluded from human-edit tracking.
 - **CORE-035** [M1] Locks use the workspace format's path list.
 - **CORE-036** [Later] Leases go in a `leases` extension field.
 - **CORE-037** [M1] (contract) **Trash:** deletes move files to `.trash/<date>/` with restore records and `purge_after` (30 days).
-- **CORE-038** [M1] (invariant) Orphans are listed for review and never deleted automatically.
-- **CORE-039** [M1] (contract) `progress.md` entries go under `## Done` as `- YYYY-MM-DD: …`; other sections are edited section by section.
-- **CORE-040** [M1] (contract) **Paths:** a budget of about 180 characters per relative path; reserved Windows names are rejected. `ww doctor` sets `core.longpaths=true` and `lfs.setlockablereadonly=false`, and adds the `.gitignore` entries, including `assets/*/work/`.
-- **CORE-041** [M1] (contract) **Index reconcile** compares path + size + mtime + NTFS FileId + ChangeTime. A cold rebuild trusts manifest hashes and verifies them in the background. Hashes are SHA-256 only.
-- **CORE-042** [M1] Index rebuild times are benchmarked, and the benchmark is a CI gate.
+- **CORE-038** [M1] (invariant) Orphans are listed for review and never deleted automatically. (plan 2b clarification: Appendix E) A file the suite still expects on disk that disappears outside the suite is listed as `missing`, never forgotten (ARCH-079 clarification).
+- **CORE-039** [M1] (contract) `progress.md` entries go under `## Done` as `- YYYY-MM-DD: …`; other sections are edited section by section. (plan 2b clarification: Appendix E) A new entry goes on the line directly after `## Done`, newest first; the blank line before the next heading is kept.
+- **CORE-040** [M1] (contract) **Paths:** a budget of about 180 characters per relative path; reserved Windows names are rejected. `ww doctor` sets `core.longpaths=true` and `lfs.setlockablereadonly=false`, and adds the `.gitignore` entries, including `assets/*/work/`. (plan 2b clarification: Appendix E) The budget is exactly 180 characters. In the workspace's root `.gitignore`, `assets/*/work/` is written `projects/*/assets/*/work/`. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with.
+- **CORE-041** [M1] (contract) **Index reconcile** compares path + size + mtime + NTFS FileId + ChangeTime. A cold rebuild trusts manifest hashes and verifies them in the background. Hashes are SHA-256 only. (plan 2b clarification: Appendix E) FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders.
+- **CORE-042** [M1] Index rebuild times are benchmarked, and the benchmark is a CI gate. (plan 2b clarification: Appendix E) The budgets (a cold rebuild of 2,000 assets, a warm reconcile of 10,000) are recorded in `test-params.toml`.
 - **CORE-043** [M1] (contract) **Proposal runs** are kept separate from asset candidate runs. They live in `assets/<id>/work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with their recipe and saved inputs. They create no asset version, don't change the asset's status and don't run the QA chain.
 - **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.wwdoc`, open proposals move with the document.
 - **CORE-045** [M1] (contract) Document layers are stored as content-addressed chunks of 8×8 tiles (1024×1024 px) on a signed grid, each with a tile-presence/uniform bitmap header and a hash over the canonical uncompressed bytes (format in §5.2). `docs` garbage collection and snapshot hardlinking work at chunk level.
 - **CORE-046** [M1.5] (contract) Every asset carries a creation UUID (recorded from M1, CORE-047); a sealed version renumbered during multi-machine sync records `renamed_from: {version, machine, content_hash}` in its manifest; references resolve through `renamed_from` (using the content hash they carry, CORE-047), with a warning on a mismatch (§7.3).
-- **CORE-047** [M1] (contract) References to a sealed version — `ww://` refs, `.wwref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill.
+- **CORE-047** [M1] (contract) References to a sealed version — `ww://` refs, `.wwref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill. (plan 2b clarification: Appendix E) The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
 
 ### 2.4 Pipeline, projects and settings
 
 - **CORE-048** [M1] (contract) **Status machine:** `planned → in_progress → candidate → in_review → approved → exported → released`, with side states `stale`, `blocked` (a reason is required) and `deprecated`. `status_before_stale` is kept so a restore can return to it.
 - **CORE-049** [M1] (contract) Assets with a working document carry a `has_working_doc` flag. Opening, editing or saving a document never changes the asset's status. The only save that changes status is one with `auto_candidate_on_save` (a project option, off by default), and it does so by creating a candidate run.
 - **CORE-050** [M1] A new document's first Save creates its asset with status `in_progress`.
-- **CORE-051** [M1] (decision) **Sign-off isn't gated.** It can be done by you in any app, by the assistant or Claude Code when you ask them to, or automatically for asset types listed in `auto_approve` once QA passes. It is recorded with `approved_by`. Versions are immutable, so nothing is lost.
+- **CORE-051** [M1] (decision) **Sign-off isn't gated.** It can be done by you in any app, by the assistant or Claude Code when you ask them to, or automatically for asset types listed in `auto_approve` once QA passes. It is recorded with `approved_by`. Versions are immutable, so nothing is lost. (plan 2b clarification: Appendix E) `approved_by` is the sign-off run's `signed_off.by` field of the workspace format.
 - **CORE-052** [M1] Automatic sign-off picks the candidate with the best vision-review score if a vision review ran; otherwise, among candidates passing every technical gate, the lowest seed.
 - **CORE-053** [M1] `asset.request_signoff` is a "flag this for me" marker: it sets the status to `in_review`.
 - **CORE-054** [M1] **Stage profiles:** `skip_stages` can skip stages, except check and record, which carry QA and the recipe.
 - **CORE-055** [M1] **Projects:** `project.create`, `project.set_status` (pause or archive; a staleness check runs on restore), `project.status`, `project.context`.
 - **CORE-056** [Later] `project.clone`, `project.delete` (lists inbound links first) and `portfolio.status`.
-- **CORE-057** [M1] (contract) **Settings cascade:** workspace `defaults` → `project.yaml` → per-request values, a plain override chain. It holds the default models or providers per task (`assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate` — which names a model profile, §5.6 — and others), provider preferences, the QA profile, `auto_approve`, `skip_stages`, `auto_candidate_on_save` and the enabled `modules`. Caps, currency, fixed costs, PSU efficiency, electricity rate and the assistant engine choice are suite-level (§2.0), not in this chain.
+- **CORE-057** [M1] (contract) **Settings cascade:** workspace `defaults` → `project.yaml` → per-request values, a plain override chain. It holds the default models or providers per task (`assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate` — which names a model profile, §5.6 — and others), provider preferences, the QA profile, `auto_approve`, `skip_stages`, `auto_candidate_on_save` and the enabled `modules`. Caps, currency, fixed costs, PSU efficiency, electricity rate and the assistant engine choice are suite-level (§2.0), not in this chain. (plan 2b clarification: Appendix E) In plan 2b the per-request layer is the `settings` argument of a tool that declares one; a per-call `settings` field is a later protocol change (it changes `schema_hash`). The project layer is `project.yaml`'s top-level keys (I4), with `pipeline.skip_stages` and `pipeline.auto_approve` read as `skip_stages` and `auto_approve`.
 - **CORE-058** [M1] Each tool declares its Worldwright module (for example image generation → `concept` or `2d`); tool suggestions are filtered by the project's enabled `modules`.
 
 ### 2.5 Telemetry
@@ -1807,7 +1807,7 @@ Agents build and test on your PC in your account, so tests must never touch your
 Each layer states what it covers and when it runs. "Every push", "PR-ready", "nightly" and "milestones/releases" are the CI tiers in §6.6.
 
 - **QA-043** [M1] **Unit** (every push): graph/staleness, settings cascade, price rules, version allocation, mode detection, infill, paste-back, mask math, chunk encoding, quirk mapping, idempotency, error lowering, handshake/version rules.
-- **QA-044** [M1] **Property / model-based** (every push; `proptest`, `proptest-state-machine`): round-trips of manifests, workflows, documents and `.wwdoc`.
+- **QA-044** [M1] **Property / model-based** (every push; `proptest`, `proptest-state-machine`): round-trips of manifests, workflows, documents and `.wwdoc`. (plan 2b clarification: Appendix E) Plain `proptest` strategies over operation sequences are an acceptable reading of `proptest-state-machine`.
 - **QA-045** [M1] (invariant) **Document GC** property tests (every push): random saves, snapshots, open save handles and copies interleaved with GC. Must hold:
   - nothing reachable from a root is ever deleted;
   - the 24 h grace period holds;
@@ -1827,6 +1827,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - CPU compositor references (GPU output is compared with the CPU reference rather than with screenshots);
   - provider usage/cost parsing;
   - stream-json fixtures per tested Claude Code version.
+  - (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
 - **QA-049** [M1b] **Golden: ComfyUI UI→API conversion** (every push) compared with the official frontend's conversion, using the pinned `comfyui-frontend-package`; re-run whenever ComfyUI or its frontend changes.
 - **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.wwdoc` readers, stream-json, SSE, `ww:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
 - **QA-051** [M1] (invariant) **Integration — ComfyUI queue ownership** (in-process core with fakes, every push):
@@ -1883,6 +1884,8 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - fail points, compiled only into test builds;
   - the watcher fence;
   - injected clock and ids, per-test pipe channels, and the environment provider (§6.3).
+  - (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
+  - (plan 2b clarification: Appendix E) Fail points are disabled at compile time in stable builds and armed only on test channels.
 - **QA-067** [M1] Recorded fixtures are captured from real runs by a manual job routed through the suite's own caps (with a per-call maximum), only for providers you use, with secrets scrubbed, and versioned. A drift comparison checks new captures against old ones, including ComfyUI's websocket, `/api/jobs` and `/history` shapes.
 - **QA-068** [M1] Qt-free crates (`ww-schema`, `ww-protocol`, `ww-core`, the parser crate) run under `cargo nextest`; `ww-qt` and QML tests run through CTest.
 
@@ -2286,7 +2289,7 @@ Re-check these against their primary sources when the plan task that depends on 
 - Licences: Qt LGPLv3; KDDockWidgets, Qt Quick 3D, Qt Graphs and the QML compiler GPL (§1.8 licences paragraph).
 - ComfyUI HTTP API: `/api/jobs`, `POST /api/jobs/{id}/cancel`, `/queue`, `/free`, `/interrupt` semantics, `execution_start` websocket event, default origin `http://127.0.0.1:8188` — checked against local ComfyUI 0.39.2.
 - NVML can't report per-process VRAM on GeForce/WDDM; PDH counter `GPU Process Memory` works without admin.
-- Windows: `CREATE_BREAKAWAY_FROM_JOB` access-denied behaviour inside terminal job objects; `GetNamedPipeServerProcessId` / `GetNamedPipeClientProcessId`; `first_pipe_instance`; `ReplaceFileW` / `MoveFileExW` write-through; `WM_QUERYENDSESSION` via a hidden top-level window.
+- Windows: `CREATE_BREAKAWAY_FROM_JOB` access-denied behaviour inside terminal job objects; `GetNamedPipeServerProcessId` / `GetNamedPipeClientProcessId`; `first_pipe_instance`; `ReplaceFileW` (no write-through flag: `REPLACEFILE_WRITE_THROUGH` is not supported; one volume; the result keeps the replacement's file ID) and `MoveFileExW` `MOVEFILE_WRITE_THROUGH` (documented to flush only a move done as a copy and delete; re-checked 2026-10-16); `WM_QUERYENDSESSION` via a hidden top-level window.
 - Velopack: per-user install into `%LOCALAPPDATA%\<packId>`; fresh install over an existing folder or uninstall deletes the folder; update replaces `current\` and force-stops its processes; after-install/after-update hooks.
 - NVIDIA Control Panel "Prefer no sysmem fallback" setting per executable.
 
@@ -2464,8 +2467,8 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | `confirm.unavailable` | `user_fixable` | `after_resolve` | QA-016 |
   | `cap.exceeded` | `user_fixable` | `after_resolve` | QA-016 |
   | `doc.held_elsewhere` | `data_conflict` | `after_resolve` | QA-005, *provisional* |
-  | `store.hash_conflict` | `data_conflict` | `after_resolve` | QA-005, *provisional* |
-  | `workspace.required` | `user_fixable` | `after_resolve` | QA-005, *provisional* |
+  | `store.hash_conflict` | `data_conflict` | `after_resolve` | QA-005, confirmed by plan 2b; `data.backup` names the backup's workspace-relative path when a put-back couldn't finish |
+  | `workspace.required` | `user_fixable` | `after_resolve` | QA-005, confirmed by plan 2b |
   | `protocol.incompatible` | `user_fixable` | `after_resolve` | QA-005; `data.core_protocol` |
   | `engine.claude_code.untested_version` | `user_fixable` | `after_resolve` | QA-005, *provisional* |
   | `engine.claude_code.not_signed_in` | `user_fixable` | `after_resolve` | QA-006 |
@@ -2486,6 +2489,26 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | `core.draining` | `transient` | `same_idempotency_key` | plan 2 |
   | `core.bug` | `bug` | `never` | plan 2 |
   | `state.unavailable` | `transient` | `same_idempotency_key` | plan 2 |
+  | `store.busy` | `transient` | `same_idempotency_key` | plan 2b; a target held past the 10 s retry budget |
+  | `store.path_invalid` | `user_fixable` | `after_resolve` | plan 2b; budget, reserved name, outside the workspace, a sealed folder, `registry/ledger.csv` |
+  | `store.disk_full` | `user_fixable` | `after_resolve` | plan 2b |
+  | `store.io` | `transient` | `same_idempotency_key` | plan 2b |
+  | `store.git_busy` | `transient` | `same_idempotency_key` | plan 2b; git still active after 60 s |
+  | `store.locked` | `data_conflict` | `after_resolve` | plan 2b; the path is in the manifest's `locks` (CORE-035) |
+  | `workspace.read_only` | `user_fixable` | `after_resolve` | plan 2b; another core holds `core.lock` |
+  | `workspace.path_invalid` | `user_fixable` | `after_resolve` | plan 2b |
+  | `project.unknown` | `user_fixable` | `after_resolve` | plan 2b |
+  | `project.exists` | `data_conflict` | `never` | plan 2b |
+  | `asset.unknown` | `user_fixable` | `after_resolve` | plan 2b; also an unknown run or file |
+  | `asset.link_external` | `user_fixable` | `after_resolve` | plan 2b; fix: "Collect into workspace", agent hint `asset.collect` |
+  | `version.exists` | `data_conflict` | `after_resolve` | plan 2b |
+  | `status.invalid_transition` | `user_fixable` | `after_resolve` | plan 2b |
+  | `manifest.needs_repair` | `user_fixable` | `after_resolve` | plan 2b |
+  | `yaml.unsupported_edit` | `user_fixable` | `after_resolve` | plan 2b |
+  | `ref.invalid` | `user_fixable` | `after_resolve` | plan 2b |
+  | `ref.hash_mismatch` | `data_conflict` | `after_resolve` | plan 2b |
+  | `trash.unknown` | `user_fixable` | `after_resolve` | plan 2b |
+  | `trash.restore_conflict` | `data_conflict` | `after_resolve` | plan 2b |
 
 - **Events** (ARCH-032).
   - `ww/subscribe` params: `{"topics":[…], "since_seq":{"<topic>": <seq>, …}}`. The map is per topic; a topic missing from it means live events only.
@@ -2493,7 +2516,7 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   - `ww/unsubscribe`: params `{"topics":[…]}`, result `{"topics":[…]}` (the topics removed).
   - `ww/event` params: `{"topic","seq","kind":"event"|"snapshot"|"resync_required","data"}`.
   - Topic names match `^[a-z][a-z0-9_]*(:.+)?$`.
-  - History: 600 s per topic, by monotonic time. Per-client queue: 1024 events.
+  - History: 600 s per topic, by monotonic time and at most 1024 events. Per-client queue: 1024 events.
 - **Exit codes of `ww-core`:**
 
   | Code | Meaning |
@@ -2504,6 +2527,7 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | 4 | stopped after a fatal error (e.g. the state actor died) |
   | 5 | the suite `state.db` is damaged; nothing was changed |
   | 6 | the suite `state.db` is from a newer version; nothing was changed |
+  | 7 | the suite `state.db` has a hot rollback journal (a crash mid-write); nothing was changed |
 
 - **The `ww` user commands.** Global flags, accepted before or after the subcommand: `--workspace <PATH>`, `--non-interactive`, `--no-start`.
 
@@ -2524,7 +2548,7 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | 3 | `ww status` with `--no-start` found no core |
   | 4 | `pending_confirmation` |
 
-  With `--no-start`, every command except `status` is a silent no-op that exits 0 when no core runs (ARCH-018). Core exit codes 5 and 6 become the plain messages "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside." and "… is from a newer version of Worldwright. Nothing was changed."
+  With `--no-start`, every command except `status` is a silent no-op that exits 0 when no core runs (ARCH-018). Core exit codes 5 and 6 become the plain messages "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` can set it aside." and "… is from a newer version of Worldwright. Nothing was changed." Exit code 7 becomes "The core can't start: its state database at <path> was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery."
 - **Workspace id:** the 16-hex workspace hash of the canonical path (plan 1 contract), or `"none"`.
 - **`suite.toml`** keys read in this plan: `default_workspace = '<path>'` and `[[workspaces]] path = '<path>'`. Unknown keys are preserved by the type.
 - **Per-workspace `state.db`:** `Env::workspace_local_dir(ws)\state.db`. **Suite `state.db`:** `Env::local_dir()\state.db` (CORE-005).
@@ -2533,3 +2557,181 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   - ARCH-021 clarification: a *requested* drain (`core/drain`, "exit when safe") waits for running work without a timeout. The timeout of step 1 applies to session-end and fatal shutdowns.
   - ARCH-024 clarification: the fixed test SID in pipe names, as stated above.
   - CORE-014 clarification: `config`, `server`, `rpc`, `identity`, `workspace`, `session`, `events` and `lifecycle` are infrastructure inside `ww-core`, not CORE-014 modules. The registry and dispatcher are the `tools` module. The core's own log file (the `tracing` sink) is exempt from the single-file-write-home rule (ARCH-112), as SQLite's own database files are. Creating its folder still goes through the store's `ensure_dir`.
+
+## Appendix E. Workspace data (plan 2b clarification)
+
+This appendix records the workspace-data names, algorithms and tables that plan 2b implements. They are contracts, read the same way as the lead-in "Names that are contracts" of the plan they come from. It adds no rule IDs. It clarifies ARCH-032, ARCH-044, ARCH-074, ARCH-075, ARCH-076, ARCH-077, ARCH-079, ARCH-089, CORE-019, CORE-032, CORE-038, CORE-039, CORE-040, CORE-041, CORE-042, CORE-047, CORE-051, CORE-057, QA-044, QA-048 and QA-066. Where a rule carries a short clarification, this list governs. The error codes and exit code 7 are in Appendix D.
+
+- **Workspace-relative paths** use `/` and are checked before anything is written (CORE-040):
+  - at most 180 characters;
+  - no component may be a reserved Windows name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, and `COM¹`–`COM³`/`LPT¹`–`LPT³`), whatever its case and extension;
+  - no component may end in a dot or a space, contain `<>:"\|?*` or a control character, or be `.` or `..`;
+  - every component is at most 255 characters;
+  - absolute paths of 247 UTF-16 code units or more go to Windows with the `\\?\` (or `\\?\UNC\`) prefix, after they are made absolute with `\` separators and no `.` or `..` components. The suite doesn't depend on the `LongPathsEnabled` opt-in.
+- **Store write algorithm** (ARCH-074; ARCH-074 clarification):
+  1. Check the path.
+  2. If writes are paused for git, wait (ARCH-083). Writes are paused while the watcher's git flag is set **or** `<ws>\.git\index.lock` exists. The store checks that file itself (one `GetFileAttributesW`), so a write never races git during the watcher's batch window, or when no watcher runs.
+  3. Re-hash the target and compare it with the expected hash (the store reads file data only through `probe.open_read`):
+     - for a full write, the file's last generated hash (ARCH-078), or either hash of its pending row (step 5) while one exists. `Expect::Generated` with no generated row is a conflict when the file exists, and is treated as `Expect::New` when it doesn't;
+     - for a manifest or YAML edit, the hash read at the start of the edit;
+     - LFS pointers compare by `oid`;
+     - a cloud-only placeholder target is never read, since reading would download it: the write fails with `store.hash_conflict`, and the message says to make the file available offline first. The same check comes first in every store operation that reads a file's data (`Store::read`, `edit_manifest`, `edit_yaml`, `edit_text`): the attribute-only `probe.identity` runs before any byte is read, so the store never triggers a download. Edits of a placeholder fail with `store.hash_conflict`, and `Store::read` of one fails with `store.io`, with the same message.
+  4. Write `<dir>\.<name>.ww-tmp-<pid>-<n>` in the same folder, and flush it with `FlushFileBuffers` before closing it. The first backup name of step 6 uses the same `<pid>-<n>`.
+  5. Record the pending replace: a `generated_pending(path, old_sha256, new_sha256)` row in the workspace `state.db`. `old_sha256` is the hash checked in step 3, or null for a new target.
+  6. Replace the target. The fail point `store.replace` comes just before this step, and `store.after_replace` just after it.
+     - For an existing target, call `ReplaceFileW(REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS)` with a backup name `<dir>\.<name>.ww-bak-<pid>-<n>`. `REPLACEFILE_WRITE_THROUGH` is never passed: it is documented as not supported.
+     - For a new target, call `MoveFileExW(MOVEFILE_WRITE_THROUGH)` without `MOVEFILE_REPLACE_EXISTING`. Errors 80 and 183 mean an outside writer created the file after step 3: the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
+  7. Hash the backup. If it equals the hash checked in step 3, the backup is removed. Otherwise an outside edit landed between steps 3 and 6, and the outside version is put back:
+     - with `ReplaceFileW` (target = the core's new bytes, replacement = the backup, and a second backup name `<dir>\.<name>.ww-bak-<pid>-<n+1>`, which then holds the core's new bytes and is removed), or, where `ReplaceFileW` is unsupported, with the fallback's two `move_new` renames (target → the second backup name, then the first backup → target);
+     - the fail point `store.put_back` comes after the first half of the put-back (the `ReplaceFileW`, or the fallback's first rename) and before the rest, so a crash in the middle of a put-back can be tested;
+     - the put-back retries sharing violations under the same 10 s budget. If it still fails, the call ends with `store.hash_conflict` whose `data.backup` names the backup's workspace-relative path, and the pending row stays, so the next open's recovery puts the outside version back;
+     - the core's own new content is discarded (the call failed, so nothing of yours is lost), the pending row is cleared, and the call fails with `store.hash_conflict`.
+  8. In one `state.db` transaction, record the new SHA-256 as the file's last generated hash and clear the pending row.
+
+  Error handling:
+  - Sharing and lock violations (Windows errors 32, 33 and 1224) are retried, starting at 10 ms and doubling to a cap of 500 ms, for up to 10 s in total; after that the call fails with `store.busy`.
+  - Errors 1175 and 1176 leave both files under their own names (a backup name was given), so they are retried the same way. Error 1177 leaves the old target under the backup name and the replacement under its temp name: the store moves the replacement onto the freed target name with `move_new`, then runs step 7.
+  - Where `ReplaceFileW` is unsupported (errors 1 and 50, for example on some network volumes), the store makes two renames, both with `move_new` (`MoveFileExW(MOVEFILE_WRITE_THROUGH)`, no `MOVEFILE_REPLACE_EXISTING`): target → backup, then temp → target. The fail point `store.between_renames` comes between the two. Step 7 follows. If a crash leaves only the backup, the next workspace open restores it.
+  - On the fallback's second rename and on the move after 1177, the target name was just freed, so errors 80 and 183 mean an outside writer created a file there in the gap. That file is kept; the backup is moved aside with `move_new` to `<dir>\<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>`, the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
+  - Disk full (errors 112 and 39) fails at once with `store.disk_full`; the temp file is removed and the pending row cleared.
+
+  Durability: the temp file is flushed before the swap (step 4). Renames are atomic (journaled) but may be lost on power failure: `MOVEFILE_WRITE_THROUGH` is documented only to flush a move done as a copy and delete, so it adds no documented durability to a same-volume rename, and `ReplaceFileW` has no write-through option at all. A power cut can therefore leave either version. The temp flush makes both complete, and the pending row (step 5) makes either one acceptable as the core's own. `ReplaceFileW` needs the target, temp and backup files on one volume, which is why all three names are in the target's folder. The resulting file has the replacement's file ID, not the old target's, so the index records the identity the store reports after each write.
+- **Write order** (ARCH-075): output files → manifest → jobs log line → `progress.md` entry → index → events. Files already moved into place before the commit (a sealed version's files) reach the index in the index step too, never before the manifest edit. On workspace open, a read-write core runs `recover()`, which deletes no content:
+  - **Orphans** are listed and never deleted (CORE-038):
+    - `candidates/<run>/` folders missing from their manifest;
+    - `v<semver>/` folders that hold a `manifest.snapshot.json` but whose version is neither the manifest's `approved_version` nor a run's `signed_off.version` (a crash between sealing and the manifest edit);
+    - non-empty staging handles and `seal-*` folders left by a dead core (at open under `core.lock`, every existing handle belongs to a dead core);
+    - `*.ww-conflict-*` files.
+  - Stale `*.ww-tmp-*` files of processes that are no longer running, and empty staging handles, are removed.
+  - **Pending replaces** are resolved, one row at a time, in this order:
+    1. a backup whose hash equals the row's `new_sha256` holds the core's own new bytes (the second backup of a put-back cut short) and is removed;
+    2. target missing and a backup left (a crash between the fallback's renames, or between the fallback put-back's renames): the remaining backup, which is the old content or the outside edit and never the core's new bytes, is moved back with `move_new`;
+    3. backup and target both present, and the backup's hash equals the row's `old_sha256` (or the generated hash): the backup is removed;
+    4. backup and target both present, and the backup's hash is anything else: the backup holds an outside edit. The target (the core's bytes) is moved aside with `move_new` to `<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>` and the backup is moved back with `move_new`, so the outside edit is never left only in a dot-file;
+    5. then, if the target's hash equals `new_sha256`, it becomes the generated hash. The row is cleared in every case.
+  - A `*.ww-bak-*` file whose target is missing is restored the same way, with or without a pending row.
+- **Append logs** (ARCH-081, CORE-009):
+  - one JSON object per line, ending in `\n`, with `"machine"` and `"seq"` (from 1 per file) first, then the record;
+  - each line is one write under `LockFileEx` on the byte range starting at offset 2⁶⁴−2 with length 1 of the log file itself, which `ww` can take too. The lock is requested with `LOCKFILE_FAIL_IMMEDIATELY` and retried by the caller, under the store's retry budget (10 ms doubling to 500 ms, 10 s in all, then `store.busy`);
+  - while the lock is held, the file is read, a last line without `\n` is closed with `\n`, and the line's `seq` is computed from that text, so two appenders never write the same `(machine, seq)`;
+  - readers skip lines that don't parse and dedupe by `(machine, seq)`.
+
+  `<machine>` is the computer name, lowercased, with every character outside `[a-z0-9-]` replaced by `-`. On test channels it is `testmachine`. `<yyyy-mm>` is the UTC month of the line.
+- **Workspace areas** (ARCH-080, CORE-003, ARCH-028, ARCH-058, CORE-037, ARCH-088):
+  - staging handles: `<ws>\.worldwright\staging\<sh_16hex>\`; ingest is a rename onto the same volume;
+  - `<ws>\.worldwright\core.lock`, held with `LockFileEx` while the core serves the workspace;
+  - `<ws>\.worldwright\state.json` `{"active_project":"<slug>"}`, the untracked last-used hint;
+  - trash entries: `<ws>\.trash\<YYYY-MM-DD>\<te_16hex>\payload\<original name>`, with `restore.json` beside it: `{"entry_id","original_path","moved_utc","purge_after","reason","sha256"?}`.
+- **`core.lock`** (ARCH-028): the lock gates both read-write access to the workspace's `state.db` and the release of stale `running` idempotency rows. A core that finds it held serves the workspace read-only:
+  - read tools work;
+  - write tools get `workspace.read_only`;
+  - its `state.db` is opened read-only and its rows are never released. When that `state.db` doesn't exist yet (for example on another channel, whose local folder differs), an in-memory database with the migrations applied stands in, and nothing is created on disk;
+  - it uses an in-memory index (the same code over SQLite `:memory:`), rebuilt at open, and never opens the shared `index.db`.
+- **Local data** (ARCH-097, CORE-005): `index.db` sits next to the workspace `state.db`, in `Env::workspace_local_dir(ws)`. It uses WAL, and `PRAGMA user_version` is `1`. A different version, or a failed `quick_check`, means the file is deleted and rebuilt. Only the core holding `core.lock` opens it: on a non-system volume both channels share `<volume>\.worldwright-local\<hash>\`, so a read-only core must never write it.
+- **`.gitignore` entries** added by `workspace.create` and `ww doctor` (CORE-040, ARCH-096): `.worldwright/`, `.trash/`, `inbox/*`, `projects/*/assets/*/candidates/`, `projects/*/assets/*/work/` (the root-relative form of CORE-040's `assets/*/work/`). All of `candidates/` is ignored, not only rejected runs (CORE-032 clarification), so open runs don't sync between machines.
+- **`.gitattributes` entry** added by `workspace.create` and `ww doctor` (CORE-040 clarification): `projects/** -text`, so git never converts line endings inside asset trees and recorded SHA-256 values hold on every clone. An existing file is appended to, never rewritten; plan 7 adds its LFS patterns to the same file (ARCH-086).
+- **Refs** (ARCH-042, CORE-031, CORE-047):
+  - a sealed version: `ww://<workspace id>/<project>/<asset_id>@<major.minor.patch>`, optionally followed by `#sha256=<64 hex>`;
+  - a candidate: `ww://<workspace id>/<project>/<asset_id>@candidate/<run_id>/<file>`;
+  - manifest link forms (I6): `<asset_id>@<v>`, `proj:<slug>/<asset_id>@<v>`, `lib:<item>@<v>` and `style@<n>`;
+  - every new reference to a sealed version carries the hash, and manifest `inputs` entries gain `"sha256"`.
+
+  Name rules: a project slug matches `^[a-z0-9][a-z0-9-]{0,62}$`, an asset id `^[a-z][a-z0-9_]{0,62}$` and a run id `^r_\d{8}_\d{4}(_\d+)?$` (UTC). The `_<n>` suffix is the smallest one that is free among both the manifest's runs and the existing `candidates/*` folders, so a retry never collides with an orphan's folder. A version's **content hash** is the SHA-256 of a text with one line per file in `v<version>/`, except `source/**` and `manifest.snapshot.json`. The lines are sorted by `/`-separated relative path in byte order, and each reads `<sha256 hex>  <relative path>\n`.
+- **Manifest fields this plan writes** (`schema_version` 1 on new manifests):
+  - `creation_uuid` (UUID v4; CORE-047);
+  - `status_before_stale` and `status_before_blocked`;
+  - `has_working_doc`;
+  - `external: [{"path","sha256"}]` (link-external files);
+  - `hashes` (I5): keys are paths relative to the asset folder (`v1.0.0/x.png`), values are written `sha256:<64 hex>` as in I5. Every reader (the index, the watcher, the test kit) accepts a value with or without the `sha256:` prefix and compares the bare hex;
+  - `candidate_runs[]` in the I5 shape (`run_id`, `path`, `status`, `created`, `target_version`, `files`, …), plus `candidate_runs[].pinned`, `candidate_runs[].files[].sha256` (bare hex of the file as it was committed) and `candidate_runs[].trashed_utc` (RFC 3339, set when maintenance moves a rejected run's folder to trash; I5 clarification below);
+  - `human_edits[]` entries `{"path","sha256","previous_sha256","date"}`: I5's `path`, `sha256` and `date` (UTC `YYYY-MM-DD` of the detection), plus `previous_sha256`. I5's `author` and `note` are left out, since the core doesn't know them;
+  - `candidate_runs[].signed_off` `{"by","date","version"}`, the workspace format's field that CORE-051 calls `approved_by`; `by` is one of `user` (`ui:*`), `assistant`, `claude-code` (`mcp`) and `cli`;
+  - `version` (I5): when new work starts on an asset that has an `approved_version`, the first candidate run after it sets `version` to `approved_version` bumped by `minor`, and the run's `target_version` to the same value ("set it by the bump rules"); a sign-off with a confirmed `bump` replaces it.
+
+  Unknown fields are kept in place (CORE-148). Edits never reorder existing keys: a removed key (`external` after `asset.collect`, `status_before_stale` after a restore) is removed by shifting the keys after it, never by moving the last key into its slot. Edits never add `schema_version` to a manifest that lacks it (a legacy manifest stays a minimal diff), and a file keeps the line ending (`\n` or `\r\n`) it was read with.
+- **Product tools.** Every one declares the Worldwright module `workspace`, which is always available and never filtered by `modules` (CORE-058). Inputs reject unknown fields. A tool with a `project` argument uses the session's active project when it's omitted, else `sketchbook` (ARCH-088, ARCH-098). The one exception is `assets.query`, whose `project` is a filter: omitted means every project.
+
+  | Tool | Effect | Arguments | `structured` result |
+  |---|---|---|---|
+  | `workspace.create` | write | `{path, name?, default?}` | `{id, path, created: bool, default: bool, warnings: [string]}` |
+  | `workspace.set_default` | write | `{path}` | `{id, path}` |
+  | `workspace.doctor` | write | `{fix}` | `{checks: [{id, state: "ok"\|"fixed"\|"problem", detail}]}` |
+  | `watch.notify` | write | `{paths: [string]}` | `{reconciled: [string], ignored: [string]}` |
+  | `assets.query` | read | `{project?, status?, type?, text?, sort?, limit?, cursor?}` | `{assets: [AssetSummary], next_cursor: string\|null, total}` |
+  | `asset.get` | read | `{project?, asset_id}` | `AssetDetail` |
+  | `asset.import` | write | `{project?, asset_id, type, files: [path], mode: "copy"\|"link_external"}` | `{ref, run_id?, handoff}` |
+  | `asset.collect` | write | `{project?, asset_id}` | `{run_id, handoff}` |
+  | `asset.signoff` | write | `{project?, asset_id, run_id, files: [name], bump?, keep_runs?}` | `{ref, version, handoff}` |
+  | `asset.request_signoff` | write | `{project?, asset_id}` | `{status}` |
+  | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
+  | `project.create` | write | `{project, name, type?}` | `{project, path}` |
+  | `project.set_status` | write | `{project, status: "active"\|"paused"\|"archived"}` | `{project, status, stale: [ref]}` |
+  | `project.status` | read | `{project?}` | `{project, status, assets_by_status, orphans: [path], needs_repair: [path], missing: [path]}` |
+  | `project.context` | read | `{project?}` | `{project, settings, links, suggested_tools: [name]}` |
+  | `trash.list` | read | `{}` | `{entries: [restore record]}` |
+  | `trash.restore` | write | `{entry_id}` | `{path}` |
+
+  - `AssetSummary` is `{ref, project, asset_id, type, status, version, approved_version, updated, needs_repair}`; `updated` is the RFC 3339 UTC last-write time of the manifest as last indexed. An asset is identified by its folder, `projects/<project>/assets/<asset_id>/`, whose name is authoritative: `needs_repair` is `true` for a manifest that doesn't parse, or whose `asset_id` or `project` disagrees with its folder (a folder copied or moved outside the suite). Such a manifest is never rewritten automatically.
+  - **`assets.query` paging** (APP-025, APP-138):
+    - `sort` is `{field, dir}`: `field` is one of `asset_id`, `updated`, `status` and `type`, and `dir` is `asc` or `desc`. The default is `{field:"asset_id", dir:"asc"}`. Ties always break on `project`, then `asset_id`, ascending, so the order is total.
+    - A missing `status` or `type` (a legacy manifest may have no `type`) sorts as the empty string: it comes first ascending and last descending. The SQL sorts and compares on `COALESCE(<column>, '')`, and the cursor stores the sort value the same way, so no row drops out of later pages through a NULL comparison.
+    - `limit` is 1–1000 (default 200); anything else is `params.invalid`.
+    - `cursor` is the opaque `next_cursor` of the previous page. It is a keyset position (the last row's sort value, project and asset id) bound to the query's filters and sort: its `q` is the first 16 hex characters of the SHA-256 of `canonical_json({project, status, type, text, sort})`. `limit` is not part of it, so the page size may change between pages. It never expires: it stays valid across writes, restarts and index rebuilds. A cursor from a different query, or one that doesn't decode, is `params.invalid`. `next_cursor` is `null` on the last page.
+    - Every asset that matches the filters on every page and whose sort value doesn't change is returned exactly once, in order. An asset added, removed or re-sorted between pages may be missing from the pages or appear on two of them.
+    - `total` is exact: the number of assets matching the filters when that page was read, counted in the same read transaction as the page.
+    - The arguments are optional filters, so later plans add filters (for example tags, ratings, colour labels or collections) and sort fields as new optional keys. Unknown keys are rejected, so an older core answers a newer filter with `params.invalid` rather than ignoring it.
+  - `AssetDetail` is `AssetSummary` plus `{versions: [{version, ref, legacy}], next_versions: {major, minor, patch}, proposed_bump, candidate_runs, human_edits, external, files: [{path, state: "ok"|"not_fetched"|"cloud_only"|"human_edit"|"needs_repair"|"missing"}]}`.
+    - `missing` (ARCH-079, CORE-038 clarification) is a file the suite still expects on disk that disappeared outside the suite: a file listed in the manifest's `hashes`, a file of an `open` run, or the manifest itself. It stays listed with its last SHA-256, is never cleaned up automatically, and returns to `ok` when a file with the same SHA-256 reappears at that path. Files of `selected` or `rejected` runs, and of runs with `trashed_utc`, are not expected there: sign-off moves chosen files into `v<version>/` and maintenance moves rejected runs to trash, so their removal is never `missing`.
+    - `asset.get` of an asset whose manifest is missing fails with `manifest.needs_repair`, whose `data.missing` names the manifest path; the asset stays in `assets.query` and in `project.status.missing`.
+    - Read tools (`assets.query`, `asset.get`, `project.status`) answer only after the workspace's first reconcile or cold rebuild has finished, so a fresh open never returns an empty or partial page.
+  - `asset.pin_input` needs a ref that parses (`ref.invalid` otherwise). Its target doesn't have to exist on this machine, because a `proj:` or `lib:` source may be archived or not yet synced; the pin and the `links` entry are recorded either way (CORE-019).
+  - Every write result that records an operation carries `handoff: {unlocks: [ref], made_stale: [ref], refs: [ref]}` (CORE-020).
+  - `asset.import`'s `ref` is the candidate ref of its first file (for `link_external`, the asset's ref without a version); `handoff.refs` lists the ref of every file.
+- **Settings cascade** (CORE-057, I2, I4): workspace `worldwright.yaml` `defaults:` → `project.yaml` → the request layer, a plain override chain over dotted leaf keys. The project layer is `project.yaml`'s own top-level keys, as I4 says ("a project can override any of them"); there is no `overrides:` key. The cascade keys are `models`, `providers`, `qa_profile`, `modules`, `auto_candidate_on_save`, and `skip_stages` and `auto_approve`, which both layers write under `pipeline:` as in I4 (`pipeline.skip_stages`, `pipeline.auto_approve`). So `models: {image_generate: b}` at the top of `project.yaml` overrides `defaults: {models: {image_generate: a}}`, and both are the key `models.image_generate`.
+- **`progress.md` entries** (CORE-039): a new entry `- YYYY-MM-DD: <text>` (UTC) goes on the line directly after `## Done`, newest first; the blank line before the next heading and every other section stay byte for byte. A file without `## Done` gets `## Done` and the entry appended at the end. A CRLF file stays CRLF. A new project's `project.yaml` holds `status: active`, `links: []` and one comment line, so status changes and new links edit existing keys.
+- **Topics** (ARCH-044, ARCH-032):
+  - `asset:ww://<workspace id>/<project>/<asset_id>` (the ref without `@<version>` and hash, so one topic covers every version) carries `{kind: "manifest"|"candidate_run"|"version_sealed"|"human_edit"|"needs_repair"|"missing"|"status", …}`; its snapshot is the `asset.get` result;
+  - `project:<slug>` carries `{kind: "status"|"progress"|"asset"}`; its snapshot is the `project.status` result;
+  - `workspace` carries `{kind: "orphans"|"git_paused"|"git_resumed"|"rescan"|"default_changed"|"watcher_unavailable"}`.
+
+  History is kept per topic for 600 s and at most 1024 events (ARCH-032 clarification).
+- **The `ww` commands this plan adds.** Exit codes are as in Appendix D. `ww doctor` exits 0 when no problem remains, 1 when one does, and 2 when it couldn't run.
+
+  | Command | Output |
+  |---|---|
+  | `ww workspace init <path> [--name <n>] [--default]` | `workspace created at <path>` or `workspace registered at <path>`; then `default workspace: <path>` when it is the default |
+  | `ww workspace use <path>` | `default workspace: <path>`; it connects with workspace `"none"`, so a stale default never blocks it |
+  | `ww notify <path>…` | nothing on success; with `--no-start` and no core running, a silent no-op exiting 0 (ARCH-018) |
+  | `ww doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y`; an inherited `core.autocrlf=true` is a `problem`, set to `false` for the repository only after you type `y` (never with `--non-interactive`); with no `suite.toml` or no default workspace it prints `ok: no default workspace; workspace checks skipped` |
+
+  The core-start messages become:
+  - "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` can set it aside."
+  - "The core can't start: its state database at <path> was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery."
+
+  The `workspace.unsupported` and unregistered-workspace hints quote the path (`ww workspace use "<path>"`). A workspace named by `--workspace` is never told to become the default; it is told which workspace the core serves.
+- **Fail points** (QA-066, QA-055): `WW_TEST_FAILPOINTS=<name>=<action>[,…]`. They are read only on test channels, and disabled at compile time in builds whose `WW_BUILD_CHANNEL` is `stable` (a compile-time constant, so a stable build's checks are constant-false).
+  - Actions: `abort` (the process ends at once, as a crash would: `TerminateProcess` on the current process, so no destructor runs and Windows Error Reporting is not involved), `disk_full`, `busy`, `unsupported` and `io`.
+  - Names: `store.write_temp`, `store.replace`, `store.after_replace`, `store.between_renames`, `store.put_back`, `store.suite_toml`, `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress`, `store.after_index`, `store.after_seal`, `watch.start`.
+- **Dates:** `YYYY-MM-DD` and RFC 3339 `…Z`, in UTC. The set-aside suffix is `YYYYMMDDTHHMMSSZ`.
+- **Clarifications recorded in Appendix E** (no new rule IDs):
+  - ARCH-074: the write algorithm above. "`ReplaceFileW` / `MoveFileExW` with write-through" means `ReplaceFileW` without a write-through flag (`REPLACEFILE_WRITE_THROUGH` is documented as not supported) after the temp file is flushed, and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which is documented to flush only a move done as a copy and delete. Renames are atomic (journaled) but may be lost on power failure; the temp flush makes both states complete, and the pending row makes either acceptable. The window between the hash check and the replace is closed by checking the backup, not only by the watcher. No rename ever replaces an existing file, and recovery never leaves an outside edit only in a dot-file.
+  - ARCH-075: the `progress.md` entry (CORE-020) comes between the jobs log line and the index, and events go out last.
+  - ARCH-076: the typed structs are views over the ordered map, which is what keeps unknown fields in their original place.
+  - ARCH-077, QA-048, QA-066: the golden round-trip uses a synthetic manifest with the lantern manifest's structure (owner decision 6). Fixture workspaces are synthetic; none is copied from a real workspace.
+  - ARCH-044: the live topic of a ref is `asset:` plus the ref without `@<version>` and hash.
+  - ARCH-079: a file's hash counts only when its identity (size, last write, ChangeTime) is the same before and after the read; an unstable or locked file is parked and re-checked, and is never a human edit or a removal. A directory event reconciles the folder's whole subtree. A human edit already recorded with the same SHA-256 is not recorded again.
+  - ARCH-079, CORE-038: a file the suite still expects on disk (listed in `hashes`, a file of an `open` run, or a manifest) that disappears outside the suite is `missing`: it stays listed, is never cleaned up automatically, and recovers when the same content reappears. Moves the suite makes itself (sign-off, trash, maintenance) are never `missing`: files of `selected`, `rejected` or trashed runs aren't expected on disk, and the watcher defers removals under an asset whose sign-off is in progress until the sign-off ends, then reconciles that asset folder.
+  - CORE-047, ARCH-079: the asset folder name is authoritative. The index stores each asset's `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
+  - CORE-019: new `proj:` and `lib:` links are written to `links` in the Execute stage of `asset.pin_input`, because Validate runs before Confirm and never writes.
+  - CORE-032: "purged" means moved to trash (ARCH-058), where the entry is purged 30 days later, so a rejected run leaves the disk 120 days after sign-off. All of `candidates/` is gitignored, not only rejected runs, so open runs don't sync between machines.
+  - CORE-039: a new entry goes on the line directly after `## Done`, newest first, and the blank line before the next heading is kept.
+  - CORE-040: the budget is exactly 180 characters, and the `.gitignore` form is root-relative. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with, so a recorded SHA-256 holds on every clone.
+  - CORE-041, ARCH-089: FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs only detect changes in place: ReFS IDs change on a move across folders, so the store reports each file's identity after every write and move.
+  - CORE-042: the index budgets (a cold rebuild of 2,000 assets and a warm reconcile of 10,000) live in `test-params.toml`.
+  - CORE-051: `approved_by` is the run's `signed_off.by`.
+  - CORE-057: in plan 2b the per-request layer is the `settings` argument of a tool that declares one. A per-call `settings` field in `tools/call` is a later protocol change, and it changes `schema_hash`. The project layer is `project.yaml`'s top-level keys (I4), with `pipeline.skip_stages` and `pipeline.auto_approve` read as `skip_stages` and `auto_approve`.
+  - QA-044: plain `proptest` strategies over operation sequences are an acceptable reading of "`proptest-state-machine`".
+  - QA-066: fail points are disabled at compile time in stable builds and armed only on test channels.
+  - ARCH-032: the per-topic history also has a count cap of 1024.
+  - I5 (workspace format, `docs/reference/workspace-format.md`): "Runs are never edited after sign-off, apart from their status" also allows `trashed_utc`, which maintenance writes when it moves a rejected run's folder to trash (CORE-032).
+- **Decision recorded in Appendix E:** organising metadata (tags, ratings, labels, collections) lives in manifests or tracked YAML, never only in `index.db`. The fields and their UI are plan 4.
