@@ -124,6 +124,24 @@ fn clear_readonly(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Opens `path` with no sharing (`ww_platform::fs::open_exclusive`), lets `decide` read it
+/// through that handle, and deletes it through the same handle when `decide` says so; returns
+/// whether it was deleted. Nobody else can open the file between the read and the delete, and
+/// an existing handle on it (a writer still holding it) makes the open fail with error 32.
+#[allow(clippy::disallowed_methods)]
+pub fn remove_if(
+    path: &Path,
+    decide: &dyn Fn(&std::fs::File) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let held = ww_platform::fs::open_exclusive(path)?;
+    if decide(held.file())? {
+        held.delete()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Sets or clears `FILE_ATTRIBUTE_READONLY`.
 #[allow(clippy::disallowed_methods)]
 pub fn set_readonly(path: &Path, on: bool) -> std::io::Result<()> {
@@ -246,6 +264,24 @@ mod tests {
         set_readonly(&tree.join("sub"), true).unwrap();
         remove_dir_all(&tree).unwrap();
         assert!(!tree.exists());
+    }
+
+    #[test] // spec: ARCH-074
+    fn remove_if_deletes_only_what_it_decided_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = FailPoints::none();
+        let path = write_temp(dir.path(), ".a.ww-bak-1-1", b"old", &fp).unwrap();
+        let read = |f: &std::fs::File| {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut &*f, &mut s)?;
+            Ok::<_, std::io::Error>(s)
+        };
+        assert!(!remove_if(&path, &|f| Ok(read(f)? == "other")).unwrap());
+        assert!(path.exists());
+        assert!(remove_if(&path, &|f| Ok(read(f)? == "old")).unwrap());
+        assert!(!path.exists());
+        let gone = remove_if(&path, &|_| Ok(true)).unwrap_err();
+        assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test] // spec: ARCH-081

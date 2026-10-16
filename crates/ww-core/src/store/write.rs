@@ -79,12 +79,16 @@ pub struct Written {
 /// Why a store call failed; [`StoreError::to_error`] gives the Appendix D error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
-    /// The target changed outside the suite (or is a cloud-only placeholder, which is never
-    /// read). `backup` names the backup that holds the outside version when a put-back
-    /// couldn't finish; the next `recover()` puts it back.
+    /// The target changed outside the suite, or (`cloud_only`) is a cloud-only placeholder,
+    /// which is never read (ruling Q11). `backup` names the backup that holds the outside
+    /// version when a put-back couldn't finish; the next `recover()` puts it back. `kept` names
+    /// the visible `<name>.ww-conflict-<utc>` copy of a newer outside save that the put-back
+    /// met at the target.
     HashConflict {
         path: WsPath,
         backup: Option<WsPath>,
+        cloud_only: bool,
+        kept: Option<WsPath>,
     },
     /// Held by another program past the 10 s retry budget.
     Busy(WsPath),
@@ -135,6 +139,26 @@ impl StoreError {
         StoreError::HashConflict {
             path: path.clone(),
             backup: None,
+            cloud_only: false,
+            kept: None,
+        }
+    }
+
+    fn held_backup(path: &WsPath, backup: WsPath) -> StoreError {
+        StoreError::HashConflict {
+            path: path.clone(),
+            backup: Some(backup),
+            cloud_only: false,
+            kept: None,
+        }
+    }
+
+    fn cloud_only(path: &WsPath) -> StoreError {
+        StoreError::HashConflict {
+            path: path.clone(),
+            backup: None,
+            cloud_only: true,
+            kept: None,
         }
     }
 
@@ -145,10 +169,18 @@ impl StoreError {
     /// `version.exists`.
     pub fn to_error(&self, trace_id: &str) -> ErrorBody {
         let (spec, data) = match self {
-            StoreError::HashConflict { path, backup } => {
-                let mut data = json!({ "path": path.as_str() });
+            StoreError::HashConflict {
+                path,
+                backup,
+                cloud_only,
+                kept,
+            } => {
+                let mut data = json!({ "path": path.as_str(), "cloud_only": cloud_only });
                 if let Some(backup) = backup {
                     data["backup"] = Value::from(backup.as_str());
+                }
+                if let Some(kept) = kept {
+                    data["kept"] = Value::from(kept.as_str());
                 }
                 (&STORE_HASH_CONFLICT, Some(data))
             }
@@ -180,12 +212,25 @@ impl StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StoreError::HashConflict { path, backup } => {
+            StoreError::HashConflict {
+                cloud_only: true,
+                path,
+                ..
+            } => write!(
+                f,
+                "`{path}` is a cloud-only file, which the suite never reads or overwrites: make \
+                 it available offline first"
+            ),
+            StoreError::HashConflict {
+                path, backup, kept, ..
+            } => {
                 write!(
                     f,
-                    "`{path}` changed outside Worldwright, so it was not overwritten (a \
-                     cloud-only file is never read: make it available offline first)"
+                    "`{path}` changed outside Worldwright, so it was not overwritten"
                 )?;
+                if let Some(kept) = kept {
+                    write!(f, "; a newer outside save is kept beside it as `{kept}`")?;
+                }
                 if let Some(backup) = backup {
                     write!(
                         f,
@@ -392,7 +437,12 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Hashes an open file in 64 KiB pieces, keeping the start for the LFS check.
-fn hash_file(mut file: File) -> io::Result<FileHash> {
+fn hash_file(file: File) -> io::Result<FileHash> {
+    hash_reader(file)
+}
+
+/// [`hash_file`] over any reader (an exclusive handle's `&File`).
+fn hash_reader(mut file: impl io::Read) -> io::Result<FileHash> {
     let mut hasher = Sha256::new();
     let mut head = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -481,6 +531,8 @@ struct Names {
     temp: PathBuf,
     b1: PathBuf,
     b2: PathBuf,
+    /// The SHA-256 of the bytes this write puts in (set after the pick).
+    new_sha256: String,
 }
 
 /// The longest file name, in UTF-16 units, that Windows accepts.
@@ -502,6 +554,7 @@ impl Names {
                 temp_name,
                 b1: dir.join(format!(".{name}.ww-bak-{pid}-{n}")),
                 b2: dir.join(format!(".{name}.ww-bak-{pid}-{}", n + 1)),
+                new_sha256: String::new(),
             };
             if !exists(&names.temp) && !exists(&names.b1) && !exists(&names.b2) {
                 return Ok(names);
@@ -864,12 +917,28 @@ impl Store {
     }
 
     /// Ends a failed write in the middle of a swap: the temp file (the core's own bytes) is
-    /// removed, and the pending row and any backup stay for `recover()`.
-    async fn stop(&self, rel: &WsPath, names: &Names) {
+    /// removed, and the pending row and any backup stay for recovery (the next read of the
+    /// path, or `recover()`). Returns the call's error, which names the backup when one holds
+    /// the earlier content.
+    async fn stop(&self, rel: &WsPath, names: &Names, error: StoreError) -> StoreError {
         if let Err(e) = self.remove(&names.temp).await {
             tracing::warn!(path = %rel, error = %e, "a temp file could not be removed");
         }
-        tracing::warn!(path = %rel, "a write stopped mid-swap; recovery resolves it at the next open");
+        tracing::warn!(path = %rel, "a write stopped mid-swap; recovery resolves it");
+        if !self.path_exists(&names.b1).await {
+            return error;
+        }
+        let why = match &error {
+            StoreError::Io { why, .. } => why.clone(),
+            other => other.to_string(),
+        };
+        StoreError::Io {
+            path: rel.as_str().to_string(),
+            why: format!(
+                "{why}; the earlier content is kept in `{}` until recovery puts it back",
+                self.rel_of(&names.b1)
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -879,43 +948,87 @@ impl Store {
     /// The bytes of `rel`, `None` when there is no file. A cloud-only placeholder is never
     /// read: `store.io`, saying to make it available offline first.
     pub async fn read(&self, rel: &WsPath) -> Result<Option<Vec<u8>>, StoreError> {
-        let (probe, path) = (self.probe.clone(), rel.abs(&self.root));
-        match self
-            .fs_retry(None, move || see(probe.as_ref(), &path, read_all))
-            .await
-        {
-            Ok(Seen::Missing) => Ok(None),
-            Ok(Seen::Found(bytes)) => Ok(Some(bytes)),
-            Ok(Seen::Placeholder) => Err(StoreError::Io {
+        match self.see_data(rel).await? {
+            Seen::Missing => Ok(None),
+            Seen::Found(bytes) => Ok(Some(bytes)),
+            Seen::Placeholder => Err(StoreError::Io {
                 path: rel.as_str().to_string(),
                 why: "it is a cloud-only file, which the suite never downloads: make it \
                       available offline first"
                     .to_string(),
             }),
-            Ok(Seen::Folder) => Err(StoreError::Io {
+            Seen::Folder => Err(StoreError::Io {
                 path: rel.as_str().to_string(),
                 why: "it is a folder".to_string(),
             }),
-            Err(e) => Err(StoreError::io(rel, &e)),
         }
     }
 
     /// The bytes an edit starts from: `None` for no file; a placeholder is a conflict.
     async fn read_for_edit(&self, rel: &WsPath) -> Result<Option<Vec<u8>>, StoreError> {
-        let (probe, path) = (self.probe.clone(), rel.abs(&self.root));
-        match self
-            .fs_retry(None, move || see(probe.as_ref(), &path, read_all))
-            .await
-        {
-            Ok(Seen::Missing) => Ok(None),
-            Ok(Seen::Found(bytes)) => Ok(Some(bytes)),
-            Ok(Seen::Placeholder) => Err(StoreError::conflict(rel)),
-            Ok(Seen::Folder) => Err(StoreError::PathInvalid {
+        match self.see_data(rel).await? {
+            Seen::Missing => Ok(None),
+            Seen::Found(bytes) => Ok(Some(bytes)),
+            Seen::Placeholder => Err(StoreError::cloud_only(rel)),
+            Seen::Folder => Err(StoreError::PathInvalid {
                 path: rel.as_str().to_string(),
                 why: "it is a folder".to_string(),
             }),
-            Err(e) => Err(StoreError::io(rel, &e)),
         }
+    }
+
+    /// What is at `rel`, with its data (ruling Q12): a missing target with a pending row is
+    /// a swap that stopped part-way, so the row is resolved under the path lock and the path
+    /// read again. It is never "not found" while a backup holds the content: if the row can't
+    /// be resolved the read fails with `store.io` naming the backup.
+    async fn see_data(&self, rel: &WsPath) -> Result<Seen<Vec<u8>>, StoreError> {
+        let seen = self.see_bytes(rel).await?;
+        if !matches!(seen, Seen::Missing) {
+            return Ok(seen);
+        }
+        let pending = self
+            .state
+            .pending(rel.as_str())
+            .await
+            .map_err(|e| StoreError::state(rel, &e))?;
+        if pending.is_none() {
+            return Ok(seen);
+        }
+        let _held = self.lock_path(rel).await;
+        let pending = self
+            .state
+            .pending(rel.as_str())
+            .await
+            .map_err(|e| StoreError::state(rel, &e))?;
+        if let Some(row) = pending
+            && let Err(e) = self.resolve_row(&row, &mut RecoveryReport::default()).await
+        {
+            let abs = rel.abs(&self.root);
+            let dir = abs.parent().unwrap_or(&self.root).to_path_buf();
+            let name = rel.file_name().to_string();
+            let backups = blocking(move || backups_of(&dir, &name))
+                .await
+                .unwrap_or_default();
+            let named = backups.first().map_or_else(
+                || "a backup beside it".to_string(),
+                |b| format!("`{}`", self.rel_of(b)),
+            );
+            return Err(StoreError::Io {
+                path: rel.as_str().to_string(),
+                why: format!(
+                    "a write stopped part-way and its content is in {named} until recovery puts \
+                     it back: {e}"
+                ),
+            });
+        }
+        self.see_bytes(rel).await
+    }
+
+    async fn see_bytes(&self, rel: &WsPath) -> Result<Seen<Vec<u8>>, StoreError> {
+        let (probe, path) = (self.probe.clone(), rel.abs(&self.root));
+        self.fs_retry(None, move || see(probe.as_ref(), &path, read_all))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))
     }
 
     /// Whether `sha256` is the core's own for `rel`: its generated hash, or either hash of its
@@ -1097,7 +1210,12 @@ impl Store {
             };
             match self.write_quiet(rel, bytes, expect).await {
                 Ok((written, kind)) => return Ok((value, written, Some(kind))),
-                Err(StoreError::HashConflict { backup: None, .. }) if attempt < EDIT_RETRIES => {
+                Err(StoreError::HashConflict {
+                    backup: None,
+                    cloud_only: false,
+                    kept: None,
+                    ..
+                }) if attempt < EDIT_RETRIES => {
                     attempt += 1;
                     tracing::info!(path = %rel, attempt, "outside change during an edit; re-applying");
                 }
@@ -1113,32 +1231,42 @@ impl Store {
             .map_err(|e| StoreError::io(rel, &e))
     }
 
-    /// Step 1's check against the long form of the path, when a component could be an 8.3
-    /// short name (`PROJEC~1`), so a short name never reaches a sealed folder or the ledger.
+    /// Step 1's check against the long form of the path: the deepest existing part of it goes
+    /// through `probe.long_name`, so an 8.3 short name (`PROJEC~1`, or one set with
+    /// `SetFileShortName`) never reaches a sealed folder or the ledger. A lookup that fails, or
+    /// a long form that isn't under the workspace root, refuses the write (fail closed).
     async fn writable_on_disk(&self, rel: &WsPath) -> Result<(), StoreError> {
-        if !rel.as_str().contains('~') {
-            return Ok(());
-        }
-        let (root, abs) = (self.root.clone(), rel.abs(&self.root));
+        let refuse = |why: String| StoreError::PathInvalid {
+            path: rel.as_str().to_string(),
+            why,
+        };
+        let (root, abs, probe) = (self.root.clone(), rel.abs(&self.root), self.probe.clone());
         let long = blocking(move || {
             let existing = abs
                 .ancestors()
+                .take_while(|p| p.starts_with(&root))
                 .find(|p| exists(p))
                 .map(Path::to_path_buf)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "the workspace is missing")
+                })?;
             let tail = abs
                 .strip_prefix(&existing)
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
-            let long_root = ww_platform::fs::long_name(&root)?;
-            let long_existing = ww_platform::fs::long_name(&existing)?;
+            let long_root = probe.long_name(&root)?;
+            let long_existing = probe.long_name(&existing)?;
             let (lr, le) = (
-                long_root.to_string_lossy().into_owned(),
+                long_root
+                    .to_string_lossy()
+                    .trim_end_matches('\\')
+                    .to_string(),
                 long_existing.to_string_lossy().into_owned(),
             );
             let inside_root = le.len() >= lr.len()
                 && le.is_char_boundary(lr.len())
-                && le[..lr.len()].to_lowercase() == lr.to_lowercase();
+                && le[..lr.len()].to_lowercase() == lr.to_lowercase()
+                && (le.len() == lr.len() || le[lr.len()..].starts_with('\\'));
             if !inside_root {
                 return Ok(None);
             }
@@ -1155,7 +1283,10 @@ impl Store {
         .await;
         match long {
             Ok(Some(long)) => writable(&WsPath::from_disk(long)),
-            _ => Ok(()),
+            Ok(None) => Err(refuse(
+                "its long form is not under the workspace folder".to_string(),
+            )),
+            Err(e) => Err(refuse(format!("its long form can't be read: {e}"))),
         }
     }
 
@@ -1240,7 +1371,7 @@ impl Store {
         let seen = match self.see_hash(&abs).await {
             Ok(Seen::Missing) => None,
             Ok(Seen::Found(h)) => Some(h),
-            Ok(Seen::Placeholder) => return Err(StoreError::conflict(rel)),
+            Ok(Seen::Placeholder) => return Err(StoreError::cloud_only(rel)),
             Ok(Seen::Folder) => {
                 return Err(StoreError::PathInvalid {
                     path: rel.as_str().to_string(),
@@ -1275,7 +1406,7 @@ impl Store {
             .parent()
             .expect("a workspace path has a folder")
             .to_path_buf();
-        let names = {
+        let mut names = {
             let (dir, name) = (dir.clone(), name.clone());
             blocking(move || {
                 fsops::ensure_dir(&dir)?;
@@ -1284,6 +1415,7 @@ impl Store {
             .await
             .map_err(|e| StoreError::io(rel, &e))?
         };
+        names.new_sha256 = new_sha.clone();
         {
             let (dir, temp_name, fp) =
                 (names.dir.clone(), names.temp_name.clone(), self.fp.clone());
@@ -1362,8 +1494,7 @@ impl Store {
             });
         }
         if let Err(e) = self.fs(Some("store.after_replace"), || Ok(())).await {
-            self.stop(rel, names).await;
-            return Err(StoreError::io(rel, &e));
+            return Err(self.stop(rel, names, StoreError::io(rel, &e)).await);
         }
         Ok(())
     }
@@ -1422,16 +1553,14 @@ impl Store {
                         && !self.path_exists(&names.b1).await;
                     if untouched {
                         self.abandon(rel, names).await;
-                    } else {
-                        self.stop(rel, names).await;
+                        return Err(StoreError::io(rel, &e));
                     }
-                    return Err(StoreError::io(rel, &e));
+                    return Err(self.stop(rel, names, StoreError::io(rel, &e)).await);
                 }
             }
         }
         if let Err(e) = self.fs(Some("store.after_replace"), || Ok(())).await {
-            self.stop(rel, names).await;
-            return Err(StoreError::io(rel, &e));
+            return Err(self.stop(rel, names, StoreError::io(rel, &e)).await);
         }
         self.check_backup(rel, abs, names, old, fallback).await
     }
@@ -1496,21 +1625,23 @@ impl Store {
                             if let Err(e) = self.state.finish_pending(rel.as_str(), None).await {
                                 tracing::warn!(path = %rel, error = %e, "a pending row could not be cleared");
                             }
-                            StoreError::conflict(rel)
+                            StoreError::HashConflict {
+                                path: rel.clone(),
+                                backup: None,
+                                cloud_only: false,
+                                kept: Some(kept),
+                            }
                         }
-                        Err(_) => StoreError::HashConflict {
-                            path: rel.clone(),
-                            backup: Some(self.rel_of(&names.b1)),
-                        },
+                        Err(_) => StoreError::held_backup(rel, self.rel_of(&names.b1)),
                     },
                 );
             }
-            self.stop(rel, names).await;
-            return Err(match step {
+            let error = match step {
                 Step::Retry => StoreError::Busy(rel.clone()),
                 Step::DiskFull => StoreError::DiskFull(rel.clone()),
                 _ => StoreError::io(rel, &e),
-            });
+            };
+            return Err(self.stop(rel, names, error).await);
         }
     }
 
@@ -1525,25 +1656,28 @@ impl Store {
         old: &FileHash,
         fallback: bool,
     ) -> Result<bool, StoreError> {
-        let backup = match self.see_hash(&names.b1).await {
-            Ok(Seen::Missing) => {
+        // Hashed and removed through one handle that shares nothing, so no writer can slip into
+        // the backup between the check and the delete.
+        let (b1, old_sha) = (names.b1.clone(), old.sha256.clone());
+        let removed = self
+            .fs_retry(None, move || {
+                fsops::remove_if(&b1, &|file| Ok(hash_reader(file)?.sha256 == old_sha))
+            })
+            .await;
+        match removed {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(self.put_back(rel, abs, names, fallback).await),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 tracing::warn!(path = %rel, "the backup of a replace vanished before it was checked");
-                return Ok(true);
+                Ok(true)
             }
-            Ok(Seen::Found(h)) => Some(h),
-            Ok(_) => None,
-            Err(e) => return Err(StoreError::io(rel, &e)),
-        };
-        if backup.is_some_and(|h| h.sha256 == old.sha256) {
-            return Ok(match self.remove(&names.b1).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(path = %rel, error = %e, "the old backup stays until recovery");
-                    false
-                }
-            });
+            Err(e) => {
+                // Unchecked: the backup may hold an outside edit. It stays, with the row, and
+                // the error names it.
+                tracing::warn!(path = %rel, error = %e, "the backup could not be checked; recovery checks it");
+                Err(StoreError::held_backup(rel, self.rel_of(&names.b1)))
+            }
         }
-        Err(self.put_back(rel, abs, names, fallback).await)
     }
 
     /// Puts the outside version (in the first backup) back under the target's name and
@@ -1556,10 +1690,7 @@ impl Store {
         names: &Names,
         fallback: bool,
     ) -> StoreError {
-        let held = || StoreError::HashConflict {
-            path: rel.clone(),
-            backup: Some(self.rel_of(&names.b1)),
-        };
+        let held = || StoreError::held_backup(rel, self.rel_of(&names.b1));
         tracing::warn!(path = %rel, "an outside edit landed during a write; putting it back");
         if !fallback {
             let mut backoff = Backoff::new();
@@ -1627,10 +1758,7 @@ impl Store {
         names: &Names,
         point: Option<&'static str>,
     ) -> StoreError {
-        let held = || StoreError::HashConflict {
-            path: rel.clone(),
-            backup: Some(self.rel_of(&names.b1)),
-        };
+        let held = || StoreError::held_backup(rel, self.rel_of(&names.b1));
         let (b1, target) = (names.b1.clone(), abs.to_path_buf());
         match self
             .fs_retry(point, move || fsops::move_new(&b1, &target))
@@ -1639,7 +1767,21 @@ impl Store {
             Ok(()) => self.finish_put_back(rel, names, None).await,
             Err(e) if classify(&e) == RetryClass::TargetExists => {
                 match self.move_aside(&names.b1, &names.dir, &names.name).await {
-                    Ok(_) => self.finish_put_back(rel, names, None).await,
+                    Ok(aside) => match self.finish_put_back(rel, names, None).await {
+                        // The first outside edit's copy is named when nothing newer was kept.
+                        StoreError::HashConflict {
+                            path,
+                            backup: None,
+                            cloud_only,
+                            kept: None,
+                        } => StoreError::HashConflict {
+                            path,
+                            backup: None,
+                            cloud_only,
+                            kept: Some(aside),
+                        },
+                        other => other,
+                    },
                     Err(_) => held(),
                 }
             }
@@ -1650,26 +1792,50 @@ impl Store {
         }
     }
 
-    /// The outside version is in place: the core's bytes (the second backup) are removed and
-    /// the pending row cleared. If the removal fails the row stays, and recovery removes them.
+    /// The outside version is in place. The second backup holds whatever the target held when
+    /// the put-back moved it: the core's new bytes, which are removed, or a newer outside save
+    /// (the user saved again during the put-back), which is moved aside to a visible
+    /// `<name>.ww-conflict-<utc>` copy and named in `data.kept`. The pending row is then cleared;
+    /// if the second backup can't be handled it stays, with the row, for recovery.
     async fn finish_put_back(
         &self,
         rel: &WsPath,
         names: &Names,
         point: Option<&'static str>,
     ) -> StoreError {
-        let b2 = names.b2.clone();
-        match self.fs_retry(point, move || fsops::remove_file(&b2)).await {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                tracing::warn!(path = %rel, error = %e, "the discarded bytes stay until recovery");
-            }
-            _ => {
-                if let Err(e) = self.state.finish_pending(rel.as_str(), None).await {
-                    tracing::warn!(path = %rel, error = %e, "a pending row could not be cleared");
+        let (b2, new_sha) = (names.b2.clone(), names.new_sha256.clone());
+        let removed = self
+            .fs_retry(point, move || {
+                fsops::remove_if(&b2, &|file| Ok(hash_reader(file)?.sha256 == new_sha))
+            })
+            .await;
+        let kept = match removed {
+            Ok(true) => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Ok(false) => match self.move_aside(&names.b2, &names.dir, &names.name).await {
+                Ok(kept) => {
+                    tracing::warn!(path = %rel, kept = %kept, "a newer outside save met the put-back; kept beside the target");
+                    Some(kept)
                 }
+                Err(e) => {
+                    tracing::warn!(path = %rel, error = %e, "a newer outside save stays in the backup until recovery");
+                    return StoreError::held_backup(rel, self.rel_of(&names.b2));
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = %rel, error = %e, "the second backup stays until recovery");
+                return StoreError::held_backup(rel, self.rel_of(&names.b2));
             }
+        };
+        if let Err(e) = self.state.finish_pending(rel.as_str(), None).await {
+            tracing::warn!(path = %rel, error = %e, "a pending row could not be cleared");
         }
-        StoreError::conflict(rel)
+        StoreError::HashConflict {
+            path: rel.clone(),
+            backup: None,
+            cloud_only: false,
+            kept,
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1713,7 +1879,16 @@ impl Store {
         for row in &rows {
             let rel = WsPath::from_disk(row.path.clone());
             let _held = self.lock_path(&rel).await;
-            if let Err(e) = self.resolve_row(row, &mut report).await {
+            // The row as it is now, under the lock: a write may have resolved or replaced it.
+            let Some(row) = self
+                .state
+                .pending(&row.path)
+                .await
+                .map_err(|e| StoreError::state(&rel, &e))?
+            else {
+                continue;
+            };
+            if let Err(e) = self.resolve_row(&row, &mut report).await {
                 tracing::warn!(path = %rel, error = %e, "a pending replace stays for the next open");
             }
         }

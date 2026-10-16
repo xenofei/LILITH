@@ -139,10 +139,42 @@ async fn put(store: &Store, rel: &str, text: &str, expect: Expect) {
         .unwrap_or_else(|e| panic!("writing {rel}: {e}"));
 }
 
+/// A plain outside-edit conflict: no backup left, not a placeholder, nothing kept aside.
 fn conflict_without_backup(result: Result<impl std::fmt::Debug, StoreError>, rel: &str) {
     match result {
-        Err(StoreError::HashConflict { path, backup: None }) => assert_eq!(path.as_str(), rel),
+        Err(StoreError::HashConflict {
+            path,
+            backup: None,
+            cloud_only: false,
+            kept: None,
+        }) => assert_eq!(path.as_str(), rel),
         other => panic!("expected a hash conflict without a backup, got {other:?}"),
+    }
+}
+
+/// The conflict of a cloud-only placeholder (ruling Q11).
+fn cloud_only_conflict(result: Result<impl std::fmt::Debug, StoreError>, rel: &str) {
+    match result {
+        Err(
+            e @ StoreError::HashConflict {
+                cloud_only: true,
+                backup: None,
+                kept: None,
+                ..
+            },
+        ) => {
+            let body = e.to_error("t");
+            assert_eq!(body.code, "store.hash_conflict");
+            assert_eq!(body.data.as_ref().unwrap()["path"], rel);
+            assert_eq!(body.data.as_ref().unwrap()["cloud_only"], true);
+            assert!(body.message.contains("cloud-only"), "{}", body.message);
+            assert!(
+                body.message.contains("available offline"),
+                "{}",
+                body.message
+            );
+        }
+        other => panic!("expected a cloud-only conflict, got {other:?}"),
     }
 }
 
@@ -286,6 +318,8 @@ async fn put_back_held_past_budget_names_the_backup_and_recovers() {
     let Err(StoreError::HashConflict {
         path,
         backup: Some(backup),
+        cloud_only: false,
+        kept: None,
     }) = result.clone()
     else {
         panic!("expected a conflict that names the backup, got {result:?}");
@@ -489,22 +523,27 @@ async fn cloud_only_target_is_a_conflict_and_never_read() {
         Expect::Hash(sha(b"{\"asset_id\":\"a\"}\n")),
     ] {
         let result = store.write(&rel, b"x".to_vec(), expect.clone()).await;
-        conflict_without_backup(result, "notes/cloud.json");
+        cloud_only_conflict(result, "notes/cloud.json");
     }
     let manifest = store.edit_manifest(&rel, &|_| Ok(())).await;
-    conflict_without_backup(manifest, "notes/cloud.json");
+    cloud_only_conflict(manifest, "notes/cloud.json");
     let text = store.edit_text(&rel, &|t| Ok(format!("{t}x"))).await;
-    conflict_without_backup(text, "notes/cloud.json");
+    cloud_only_conflict(text, "notes/cloud.json");
     let read = store.read(&rel).await;
     let Err(e @ StoreError::Io { .. }) = &read else {
         panic!("a read of a placeholder is store.io, got {read:?}");
     };
     assert!(e.to_string().contains("available offline"), "{e}");
-    let conflict = StoreError::HashConflict {
+    // An outside edit's conflict says so, and doesn't talk about cloud files.
+    let edited = StoreError::HashConflict {
         path: rel.clone(),
         backup: None,
+        cloud_only: false,
+        kept: None,
     };
-    assert!(conflict.to_error("t").message.contains("available offline"));
+    let message = edited.to_error("t").message;
+    assert!(message.contains("changed outside"), "{message}");
+    assert!(!message.contains("cloud-only"), "{message}");
 
     assert_eq!(
         probe.opens.load(Ordering::SeqCst),
@@ -876,13 +915,26 @@ async fn fallback_second_rename_never_replaces_a_new_outside_file() {
             .store(fp)
             .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
             .await;
-        conflict_without_backup(result, "notes/a.txt");
+        let Err(StoreError::HashConflict {
+            backup: None,
+            cloud_only: false,
+            kept: Some(kept),
+            ..
+        }) = &result
+        else {
+            panic!("{variant}: expected the set-aside copy to be named, got {result:?}");
+        };
         assert_eq!(ws.read("notes/a.txt"), b"outside", "{variant}");
         let conflicts = ws.conflicts("notes");
         assert_eq!(conflicts.len(), 1, "{variant}: {:?}", ws.names("notes"));
         assert_eq!(
             ws.read(&format!("notes/{}", conflicts[0])),
             b"v1",
+            "{variant}"
+        );
+        assert_eq!(
+            kept.as_str(),
+            format!("notes/{}", conflicts[0]),
             "{variant}"
         );
         assert!(
@@ -1241,6 +1293,19 @@ fn store_errors_map_to_appendix_d_codes() {
             StoreError::HashConflict {
                 path: path.clone(),
                 backup: None,
+                cloud_only: false,
+                kept: None,
+            },
+            "store.hash_conflict",
+            C::DataConflict,
+            R::AfterResolve,
+        ),
+        (
+            StoreError::HashConflict {
+                path: path.clone(),
+                backup: None,
+                cloud_only: true,
+                kept: None,
             },
             "store.hash_conflict",
             C::DataConflict,
@@ -1324,15 +1389,37 @@ fn store_errors_map_to_appendix_d_codes() {
     let plain = StoreError::HashConflict {
         path: path.clone(),
         backup: None,
+        cloud_only: false,
+        kept: None,
     }
     .to_error("t");
-    assert!(plain.data.as_ref().unwrap().get("backup").is_none());
+    let data = plain.data.as_ref().unwrap();
+    assert!(data.get("backup").is_none() && data.get("kept").is_none());
+    assert_eq!(data["cloud_only"], false);
     let backed = StoreError::HashConflict {
-        path,
+        path: path.clone(),
         backup: Some(p("notes/.a.txt.ww-bak-1-1")),
+        cloud_only: false,
+        kept: None,
     }
     .to_error("t");
     assert_eq!(backed.data.unwrap()["backup"], "notes/.a.txt.ww-bak-1-1");
+    let kept = StoreError::HashConflict {
+        path,
+        backup: None,
+        cloud_only: false,
+        kept: Some(p("notes/a.txt.ww-conflict-20270115T080000Z")),
+    }
+    .to_error("t");
+    assert_eq!(
+        kept.data.as_ref().unwrap()["kept"],
+        "notes/a.txt.ww-conflict-20270115T080000Z"
+    );
+    assert!(
+        kept.message.contains("a.txt.ww-conflict-20270115T080000Z"),
+        "{}",
+        kept.message
+    );
 }
 
 #[test] // spec: CORE-016, CORE-004
@@ -1355,4 +1442,299 @@ fn idempotency_prune_uses_its_index() {
             "{scope:?}: {plan:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes (Task 6 fix round 1).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn second_outside_save_during_put_back_is_kept_visibly() {
+    for fallback in [false, true] {
+        let ws = workspace();
+        put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+        let fp = if fallback {
+            Arc::new(FailPoints::parse("store.replace=unsupported").unwrap())
+        } else {
+            FailPoints::none()
+        };
+        fp.on(
+            "store.replace",
+            outside_writer(ws.file("notes/a.txt"), "outside"),
+        );
+        // The user saves again after the swap, before the put-back runs: that save sits at the
+        // target and the put-back moves it into the second backup.
+        fp.on(
+            "store.after_replace",
+            outside_writer(ws.file("notes/a.txt"), "outside 2"),
+        );
+        let result = ws
+            .store(fp)
+            .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+            .await;
+        let Err(StoreError::HashConflict {
+            backup: None,
+            cloud_only: false,
+            kept: Some(kept_copy),
+            ..
+        }) = &result
+        else {
+            panic!("fallback={fallback}: expected a conflict naming the kept save, got {result:?}");
+        };
+        assert_eq!(
+            ws.read(kept_copy.as_str()),
+            b"outside 2",
+            "fallback={fallback}"
+        );
+        let body = result.as_ref().unwrap_err().to_error("t");
+        assert_eq!(body.data.as_ref().unwrap()["kept"], kept_copy.as_str());
+        assert_eq!(ws.read("notes/a.txt"), b"outside", "fallback={fallback}");
+        let kept: Vec<String> = ws
+            .names("notes")
+            .into_iter()
+            .filter(|n| ws.read(&format!("notes/{n}")) == b"outside 2")
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "fallback={fallback}: {:?}",
+            ws.names("notes")
+        );
+        assert!(
+            kept[0].starts_with("a.txt.ww-conflict-"),
+            "fallback={fallback}: the newest save is in a dot-file: {kept:?}"
+        );
+        assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
+        assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+    }
+}
+
+/// A store whose write stopped between the fallback's renames: the target is missing and its
+/// old content (`v1`) sits in the backup, with the pending row.
+async fn stopped_between_renames(ws: &Ws) -> StoreError {
+    put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+    let fp = Arc::new(FailPoints::parse("store.replace=unsupported").unwrap());
+    fp.on(
+        "store.between_renames",
+        Box::new(|| Err(io::Error::other("the process stops here"))),
+    );
+    let err = ws
+        .store(fp)
+        .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+        .await
+        .expect_err("the write stops");
+    assert!(!ws.file("notes/a.txt").exists());
+    err
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn read_after_a_stopped_swap_resolves_the_backup() {
+    let ws = workspace();
+    let err = stopped_between_renames(&ws).await;
+    assert!(
+        err.to_string().contains("notes/.a.txt.ww-bak-"),
+        "the stop names the backup: {err}"
+    );
+    let store = ws.plain();
+    assert_eq!(
+        store.read(&p("notes/a.txt")).await.unwrap().as_deref(),
+        Some(&b"v1"[..]),
+        "never 'not found' while a backup holds the content"
+    );
+    assert_eq!(ws.read("notes/a.txt"), b"v1");
+    assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
+    assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+
+    // An edit after another stopped swap starts from the restored content, not from nothing.
+    let ws = workspace();
+    stopped_between_renames(&ws).await;
+    ws.plain()
+        .edit_text(&p("notes/a.txt"), &|t| Ok(format!("{t}+edit")))
+        .await
+        .expect("the edit");
+    assert_eq!(ws.read("notes/a.txt"), b"v1+edit");
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn read_names_the_backup_when_it_cannot_be_restored() {
+    let ws = workspace();
+    stopped_between_renames(&ws).await;
+    let backup = ws.leftovers("notes").pop().expect("the backup");
+    let holder = HandleHolder::hold(&ws.file(&format!("notes/{backup}")), Share::None);
+    let result = ws.plain().read(&p("notes/a.txt")).await;
+    holder.release();
+    let Err(e @ StoreError::Io { .. }) = &result else {
+        panic!("expected store.io naming the backup, got {result:?}");
+    };
+    assert!(e.to_string().contains(&format!("notes/{backup}")), "{e}");
+    assert_eq!(e.to_error("t").code, "store.io");
+    assert!(ws.state.pending("notes/a.txt").await.unwrap().is_some());
+}
+
+/// The real probe, except that `long_name` expands the folder name `PROJEC~1` to `projects`,
+/// as Windows does for an 8.3 short name, or fails for every path.
+#[derive(Debug)]
+struct ShortNameProbe {
+    fail: bool,
+}
+
+impl Probe for ShortNameProbe {
+    fn identity(&self, path: &Path) -> io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+
+    fn long_name(&self, path: &Path) -> io::Result<PathBuf> {
+        if self.fail {
+            return Err(io::Error::other("the long-name lookup failed"));
+        }
+        let long = SystemProbe.long_name(path)?;
+        Ok(PathBuf::from(
+            long.to_string_lossy().replace(r"\PROJEC~1", r"\projects"),
+        ))
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026, CORE-040
+async fn short_names_are_checked_by_their_long_form_and_fail_closed() {
+    let ws = workspace();
+    // A folder whose name is what an 8.3 short name of `projects` looks like; the fake probe
+    // expands it as Windows would for the real short name.
+    write_file(&ws.file("PROJEC~1/p/assets/a/v1.0.0/x.png"), b"sealed");
+    write_file(&ws.file("notes/a.txt"), b"plain");
+    let short = ws.store_with_probe(FailPoints::none(), Arc::new(ShortNameProbe { fail: false }));
+    for rel in [
+        "PROJEC~1/p/assets/a/v1.0.0/x.png",
+        "PROJEC~1/p/assets/a/v1.0.0/new.png",
+    ] {
+        let result = short
+            .write(&p(rel), b"new".to_vec(), Expect::Hash(sha(b"sealed")))
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::PathInvalid { .. })),
+            "{rel}: {result:?}"
+        );
+    }
+    assert_eq!(ws.read("PROJEC~1/p/assets/a/v1.0.0/x.png"), b"sealed");
+    assert_eq!(ws.names("PROJEC~1/p/assets/a/v1.0.0"), ["x.png"]);
+    put(&short, "notes/b.txt", "fine", Expect::New).await;
+
+    // A lookup that fails refuses the write instead of letting it through.
+    let failing = ws.store_with_probe(FailPoints::none(), Arc::new(ShortNameProbe { fail: true }));
+    let result = failing
+        .write(
+            &p("notes/a.txt"),
+            b"x".to_vec(),
+            Expect::Hash(sha(b"plain")),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::PathInvalid { .. })),
+        "{result:?}"
+    );
+    assert_eq!(ws.read("notes/a.txt"), b"plain");
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-078, ARCH-074
+async fn another_spelling_finds_the_generated_and_pending_rows() {
+    let ws = workspace();
+    let store = ws.plain();
+    put(&store, "notes/a.txt", "v1", Expect::New).await;
+    assert_eq!(
+        ws.state.generated("Notes/A.TXT").await.unwrap(),
+        Some(sha(b"v1"))
+    );
+    // The core's own file, under another spelling, is still the core's.
+    put(&store, "Notes/A.txt", "v2", Expect::Generated).await;
+    assert_eq!(ws.read("notes/a.txt"), b"v2");
+    assert!(
+        store
+            .accepts_as_own(&p("NOTES/a.TXT"), &sha(b"v2"))
+            .await
+            .unwrap()
+    );
+
+    // A pending row left under one spelling is found under another.
+    let crashed = ws.store(Arc::new(
+        FailPoints::parse("store.after_replace=io").unwrap(),
+    ));
+    let result = crashed
+        .write(&p("notes/a.txt"), b"v3".to_vec(), Expect::Generated)
+        .await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+    let pending = ws
+        .state
+        .pending("NOTES/A.TXT")
+        .await
+        .unwrap()
+        .expect("the pending row");
+    assert_eq!(pending.new_sha256, sha(b"v3"));
+    assert!(
+        store
+            .accepts_as_own(&p("Notes/a.txt"), &sha(b"v3"))
+            .await
+            .unwrap()
+    );
+    put(&store, "NOTES/A.TXT", "v4", Expect::Generated).await;
+    assert_eq!(ws.read("notes/a.txt"), b"v4");
+    assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+    assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn unchecked_backup_is_named_and_left_for_recovery() {
+    let ws = workspace();
+    put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+    let held: Arc<Mutex<Option<HandleHolder>>> = Arc::default();
+    let fp = FailPoints::none();
+    // After the swap someone holds the backup with no sharing, so it can't be checked.
+    let (slot, dir) = (held.clone(), ws.file("notes"));
+    fp.on(
+        "store.after_replace",
+        Box::new(move || {
+            let backup = std::fs::read_dir(&dir)?
+                .map(|e| e.unwrap().path())
+                .find(|p| p.to_string_lossy().contains(".ww-bak-"))
+                .expect("the backup");
+            *slot.lock().unwrap() = Some(HandleHolder::hold(&backup, Share::None));
+            Ok(())
+        }),
+    );
+    let result = ws
+        .store(fp)
+        .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+        .await;
+    let Err(StoreError::HashConflict {
+        backup: Some(backup),
+        ..
+    }) = &result
+    else {
+        panic!("expected the unchecked backup to be named, got {result:?}");
+    };
+    assert!(
+        backup.as_str().starts_with("notes/.a.txt.ww-bak-"),
+        "{backup}"
+    );
+    assert!(ws.state.pending("notes/a.txt").await.unwrap().is_some());
+    held.lock().unwrap().take().unwrap().release();
+
+    let report = ws.plain().recover().await.unwrap();
+    assert_eq!(
+        report.backups_removed,
+        std::slice::from_ref(backup),
+        "it held the old content"
+    );
+    assert_eq!(ws.read("notes/a.txt"), b"v2");
+    assert_eq!(
+        ws.state.generated("notes/a.txt").await.unwrap(),
+        Some(sha(b"v2"))
+    );
+    assert_eq!(ws.names("notes"), ["a.txt"]);
 }

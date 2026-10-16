@@ -29,17 +29,18 @@ use windows::Win32::Storage::CloudFilters::{
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY,
+    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo,
-    FileStandardInfo, FlushFileBuffers, GetDriveTypeW, GetFileAttributesW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW,
-    GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS,
-    REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
-    SetFileAttributesW, UnlockFileEx,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileBasicInfo, FileDispositionInfo, FileIdInfo, FileStandardInfo, FlushFileBuffers,
+    GetDriveTypeW, GetFileAttributesW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetLongPathNameW, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, REPLACE_FILE_FLAGS, REPLACEFILE_IGNORE_ACL_ERRORS,
+    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SetFileAttributesW, SetFileInformationByHandle,
+    UnlockFileEx,
 };
 use windows::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 use windows::core::PCWSTR;
@@ -645,6 +646,47 @@ pub fn open_shared(path: &Path, share: Share) -> io::Result<File> {
         .open(long_path(path))
 }
 
+/// A file opened for reading and deleting with no sharing: while it is open nobody else can
+/// open it to read, write, rename or delete, so what was read is what [`ExclusiveFile::delete`]
+/// deletes. An existing handle (even one sharing delete) makes the open fail with error 32.
+#[derive(Debug)]
+pub struct ExclusiveFile {
+    file: File,
+}
+
+/// Opens the existing file `path` with `GENERIC_READ | DELETE` and no sharing.
+pub fn open_exclusive(path: &Path) -> io::Result<ExclusiveFile> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
+        .share_mode(0)
+        .open(long_path(path))?;
+    Ok(ExclusiveFile { file })
+}
+
+impl ExclusiveFile {
+    /// The open file, to read its data.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Deletes the file through this handle (`FileDispositionInfo`, then close): no other
+    /// open can come between the read and the delete.
+    pub fn delete(self) -> io::Result<()> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `info` is a valid FILE_DISPOSITION_INFO of the size passed; the handle is
+        // open while `self.file` lives and was opened with DELETE access.
+        unsafe {
+            SetFileInformationByHandle(
+                handle(&self.file),
+                FileDispositionInfo,
+                (&raw const info).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
+        .map_err(|e| io_error(&e))
+    }
+}
+
 /// The file facts the store, index and watcher read, behind a trait so tests fake volumes and
 /// placeholders.
 pub trait Probe: Send + Sync + std::fmt::Debug {
@@ -655,6 +697,10 @@ pub trait Probe: Send + Sync + std::fmt::Debug {
     /// Opens a file to read its data. It is the only way the store, index and watcher read
     /// file data.
     fn open_read(&self, path: &Path) -> io::Result<File>;
+    /// [`long_name`]: every 8.3 short component expanded (attribute-only, never reads data).
+    fn long_name(&self, path: &Path) -> io::Result<PathBuf> {
+        long_name(path)
+    }
 }
 
 /// The real [`Probe`]. `open_read` shares read, write and delete, so a reader never blocks a
@@ -873,6 +919,29 @@ mod tests {
         // The one move never replaces an existing file.
         assert_eq!(MOVE_FLAGS, MOVEFILE_WRITE_THROUGH.0);
         assert_eq!(MOVE_FLAGS & MOVEFILE_REPLACE_EXISTING.0, 0);
+    }
+
+    #[test] // spec: ARCH-074
+    fn exclusive_open_shuts_out_others_and_deletes_through_its_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".x.ww-bak-1-1");
+        std::fs::write(&path, b"old").unwrap();
+        let held = open_exclusive(&path).unwrap();
+        let mut text = String::new();
+        io::Read::read_to_string(&mut held.file(), &mut text).unwrap();
+        assert_eq!(text, "old");
+        let other = OpenOptions::new().write(true).open(&path).unwrap_err();
+        assert_eq!(other.raw_os_error(), Some(32), "{other:?}");
+        held.delete().unwrap();
+        assert!(!path.exists());
+
+        // A handle that is already open (sharing everything) keeps it out.
+        std::fs::write(&path, b"again").unwrap();
+        let reader = SystemProbe.open_read(&path).unwrap();
+        assert_eq!(open_exclusive(&path).unwrap_err().raw_os_error(), Some(32));
+        drop(reader);
+        open_exclusive(&path).unwrap();
+        assert!(path.exists(), "dropping without delete keeps the file");
     }
 
     #[test]

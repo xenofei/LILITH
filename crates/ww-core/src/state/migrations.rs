@@ -19,14 +19,17 @@ const IDEMPOTENCY_PRUNE_V2: &str =
     "CREATE INDEX idempotency_prune ON idempotency(state, created_utc);";
 
 /// Migration 3 of a workspace database: the store's last generated hash per file (ARCH-078)
-/// and its pending replaces (write step 5, ARCH-074).
+/// and its pending replaces (write step 5, ARCH-074). Paths compare without case
+/// (`COLLATE NOCASE`), as Windows names do, so another spelling of one file finds its rows.
+/// `NOCASE` folds ASCII letters only; a spelling that differs in a non-ASCII letter misses
+/// the row and fails closed (a conflict).
 const GENERATED_V3: &str = "CREATE TABLE generated (
-    path TEXT PRIMARY KEY,
+    path TEXT PRIMARY KEY COLLATE NOCASE,
     sha256 TEXT NOT NULL,
     written_utc INTEGER NOT NULL
 );
 CREATE TABLE generated_pending (
-    path TEXT PRIMARY KEY,
+    path TEXT PRIMARY KEY COLLATE NOCASE,
     old_sha256 TEXT,
     new_sha256 TEXT NOT NULL,
     started_utc INTEGER NOT NULL
