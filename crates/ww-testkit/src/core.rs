@@ -15,6 +15,8 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -34,7 +36,7 @@ const DRAIN_WAIT: Duration = Duration::from_secs(5);
 const CLEANUP_CALL: Duration = Duration::from_secs(5);
 /// How long `CoreFixture`'s drop tries to connect to a core that still runs.
 const FIXTURE_CONNECT: Duration = Duration::from_secs(2);
-/// How long `TestEnv`'s drop looks for a core on its channel.
+/// How long `TestEnv`'s drop retries a busy pipe on its channel.
 const ENV_CONNECT: Duration = Duration::from_millis(200);
 /// Pause between polls of a pipe.
 const POLL: Duration = Duration::from_millis(20);
@@ -237,11 +239,20 @@ enum DrainAsk {
 
 /// Connects to `pipe`, says hello and asks for `core/drain`. Never panics.
 fn ask_drain(pipe: &str, connect_within: Duration) -> DrainAsk {
-    let Some(mut conn) = RawPipe::connect_name(pipe, connect_within) else {
+    let Some(conn) = RawPipe::connect_name(pipe, connect_within) else {
         return DrainAsk::NoCore;
     };
+    drain_over(conn, None)
+}
+
+/// Says hello on `conn` and asks for `core/drain`, counting the hello in `counts`. Never
+/// panics.
+fn drain_over(mut conn: RawPipe, counts: Option<&DrainCounts>) -> DrainAsk {
     if conn.server_pid() == Some(std::process::id()) {
         return DrainAsk::InProcess;
+    }
+    if let Some(counts) = counts {
+        counts.hellos.fetch_add(1, Ordering::Relaxed);
     }
     if conn
         .try_call(
@@ -259,13 +270,38 @@ fn ask_drain(pipe: &str, connect_within: Duration) -> DrainAsk {
     }
 }
 
-/// `TestEnv`'s cleanup: if a core answers on `pipe` within 200 ms, hello and `core/drain`;
-/// if it accepts, wait up to 5 s for the pipe to disappear. An in-process core (served by this
-/// process) is left to its test. Never panics.
-pub(crate) fn drain_channel(pipe: &str) {
+/// What `TestEnv`'s drop did, for the test that checks it never waits without a core.
+#[derive(Debug, Default)]
+pub(crate) struct DrainCounts {
+    /// `open_client` probes of the channel's pipe.
+    pub(crate) probes: AtomicUsize,
+    /// `core/hello` attempts.
+    pub(crate) hellos: AtomicUsize,
+}
+
+/// `TestEnv`'s cleanup. One `open_client` probe of `pipe`: no pipe (`NotFound`, the common
+/// case) returns at once. A busy pipe is retried for up to 200 ms. A core that answers gets
+/// hello and `core/drain`; if it accepts, this waits up to 5 s for the pipe to disappear. An
+/// in-process core (served by this process) is left to its test. Never panics.
+pub(crate) fn drain_channel(pipe: &str, counts: Arc<DrainCounts>) {
     let pipe = pipe.to_string();
     off_runtime(move || {
-        if ask_drain(&pipe, ENV_CONNECT) != DrainAsk::Accepted {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        counts.probes.fetch_add(1, Ordering::Relaxed);
+        let conn = match rt.block_on(async { open_client(&pipe) }) {
+            Ok(client) => RawPipe::from_client(rt, client),
+            Err(ConnectError::Busy) => match RawPipe::connect_name(&pipe, ENV_CONNECT) {
+                Some(conn) => conn,
+                None => return,
+            },
+            Err(_) => return,
+        };
+        if drain_over(conn, Some(&counts)) != DrainAsk::Accepted {
             return;
         }
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()

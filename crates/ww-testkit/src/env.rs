@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
-use std::io::{Read, Write as _};
+use std::io::{BufRead as _, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,11 +28,14 @@ use ww_platform::{
 };
 
 use crate::bins::ensure_built;
+use crate::core::DrainCounts;
 
 /// An isolated `Env`: channel `Test(<8 lowercase hex>)`, roots under a fresh temporary
 /// directory that is deleted on drop.
 pub struct TestEnv {
     pub env: Env,
+    /// What the drop's cleanup did (probes and hellos), shared with the test that checks it.
+    drain_counts: Arc<DrainCounts>,
     _dir: TempDir,
 }
 
@@ -82,7 +85,11 @@ impl TestEnv {
             std::fs::create_dir_all(r).expect("cannot create a test root");
         }
         let env = Env::with_roots(Channel::Test(unique_id()), roots, TEST_PIPE_SID.to_string());
-        TestEnv { env, _dir: dir }
+        TestEnv {
+            env,
+            drain_counts: Arc::default(),
+            _dir: dir,
+        }
     }
 
     /// The temporary directory that holds every root.
@@ -91,10 +98,12 @@ impl TestEnv {
     }
 
     /// The variables that put a child process on this test channel: `WW_CHANNEL=test-<id>`,
-    /// `WW_TEST_ROOT=<root>` and `WW_TEST_PARENT_PID=<this process>`. The same type as
+    /// `WW_TEST_ROOT=<root>` and `WW_TEST_PARENT_PID=<this process>`, then
+    /// [`TestEnv::git_env`], so every `ww` and core a test starts, and every `git` they run,
+    /// is isolated from the system and user git config (QA-038). The same type as
     /// `SpawnRequest::extra_env`.
     pub fn child_env(&self) -> Vec<(OsString, OsString)> {
-        vec![
+        let mut vars = vec![
             (
                 OsString::from(ENV_CHANNEL),
                 OsString::from(self.env.channel().to_string()),
@@ -107,7 +116,9 @@ impl TestEnv {
                 OsString::from(ENV_TEST_PARENT_PID),
                 OsString::from(std::process::id().to_string()),
             ),
-        ]
+        ];
+        vars.extend(self.git_env());
+        vars
     }
 
     /// Runs the test build of `ww` with `args`, in [`TestEnv::root`], with
@@ -135,18 +146,15 @@ impl TestEnv {
     }
 
     /// Starts `ww` like [`TestEnv::ww`] but does not wait: for long-running commands such as
-    /// `ww events --follow`. Stdout and stderr are piped (read stdout as it comes, stderr
-    /// after the child has ended); stdin is empty. The caller kills or waits for the child.
+    /// `ww events --follow`. Stdin is empty; stdout is read line by line through
+    /// [`WwChild::stdout_lines`], and stderr is drained on a thread of its own
+    /// ([`WwChild::stderr_so_far`]). Dropping the [`WwChild`] kills `ww` if it still runs.
     ///
     /// # Panics
     /// If `ww` cannot be started.
-    pub fn ww_spawn(&self, args: &[&str]) -> Child {
-        self.ww_command(self.root(), args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("cannot start {}: {e}", ensure_built().ww.display()))
+    pub fn ww_spawn(&self, args: &[&str]) -> WwChild {
+        let mut cmd = self.ww_command(self.root(), args);
+        WwChild::spawn(&mut cmd, format!("ww {}", args.join(" ")))
     }
 
     fn ww_command(&self, dir: &Path, args: &[&str]) -> Command {
@@ -331,7 +339,7 @@ impl Drop for TestEnv {
     /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Runs before the
     /// temporary directory is removed. Never panics.
     fn drop(&mut self) {
-        crate::core::drain_channel(&self.env.pipe_name());
+        crate::core::drain_channel(&self.env.pipe_name(), Arc::clone(&self.drain_counts));
     }
 }
 
@@ -395,10 +403,140 @@ impl Captured {
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes.lock().unwrap_or_else(PoisonError::into_inner))
-            .into_owned()
+        text_of(&self.bytes)
     }
 }
+
+fn text_of(bytes: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&bytes.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+}
+
+/// A `ww` (or other child) started by [`TestEnv::ww_spawn`]. Its stdout arrives line by line
+/// through [`WwChild::stdout_lines`]; its stderr is drained on a thread, so the child never
+/// blocks on a full pipe, and every panic here carries what it printed there. Dropping it kills
+/// the child if it still runs and waits for it.
+pub struct WwChild {
+    child: Child,
+    what: String,
+    lines: StdoutLines,
+    stderr: Captured,
+}
+
+/// [`WwChild`]'s stdout lines: `None` once stdout has closed.
+struct StdoutLines {
+    rx: mpsc::Receiver<String>,
+    what: String,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Iterator for StdoutLines {
+    type Item = String;
+
+    /// The next line, without its line ending.
+    ///
+    /// # Panics
+    /// If none arrives within 30 s (a failure deadline, never a measurement); the message
+    /// carries the child's stderr so far.
+    fn next(&mut self) -> Option<String> {
+        match self.rx.recv_timeout(SPAWN_LINE_DEADLINE) {
+            Ok(line) => Some(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "no stdout line from `{}` within {SPAWN_LINE_DEADLINE:?}\nstderr so far: {}",
+                self.what,
+                text_of(&self.stderr)
+            ),
+        }
+    }
+}
+
+impl WwChild {
+    /// Starts `cmd` with stdin empty and stdout and stderr piped.
+    pub(crate) fn spawn(cmd: &mut Command, what: String) -> WwChild {
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start `{what}`: {e}"));
+        let stderr = Captured::read(child.stderr.take());
+        let stdout = child.stdout.take();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Some(stdout) = stdout else { return };
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let lines = StdoutLines {
+            rx,
+            what: what.clone(),
+            stderr: Arc::clone(&stderr.bytes),
+        };
+        WwChild {
+            child,
+            what,
+            lines,
+            stderr,
+        }
+    }
+
+    /// The child's stdout, line by line; it ends when stdout closes. Each `next` panics if no
+    /// line arrives within 30 s, with the child's stderr in the message.
+    pub fn stdout_lines(&mut self) -> &mut dyn Iterator<Item = String> {
+        &mut self.lines
+    }
+
+    /// What the child wrote to stderr so far.
+    pub fn stderr_so_far(&self) -> String {
+        self.stderr.text()
+    }
+
+    /// The child's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The exit code once the child has exited (-1 if it ended without one), or `None` if it
+    /// still runs after `within`, a failure deadline.
+    ///
+    /// # Panics
+    /// If waiting fails; the message carries the child's stderr.
+    pub fn wait(&mut self, within: Duration) -> Option<i32> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
+                Ok(None) => {}
+                Err(e) => panic!(
+                    "waiting for `{}` failed: {e}\nstderr so far: {}",
+                    self.what,
+                    self.stderr_so_far()
+                ),
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Drop for WwChild {
+    /// Kills the child if it still runs, then waits for it. Never panics.
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// How long [`WwChild::stdout_lines`] waits for a line before it fails the test.
+const SPAWN_LINE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
@@ -514,7 +652,9 @@ mod tests {
             get("WW_TEST_PARENT_PID"),
             OsString::from(std::process::id().to_string())
         );
-        assert_eq!(vars.len(), 3, "{vars:?}");
+        // The three channel variables come first; the git isolation follows them.
+        assert_eq!(vars.len(), 3 + t.git_env().len(), "{vars:?}");
+        assert_eq!(&vars[3..], t.git_env().as_slice(), "{vars:?}");
 
         // A child given these variables resolves the same isolated folders.
         let child = Env::from_vars("dev", &|name| {
@@ -598,5 +738,85 @@ mod tests {
             .env
             .workspace_local_dir(b.root())
             .expect("same-volume workspace");
+    }
+
+    /// A fresh `TestEnv` with no core on its channel: the drop probes the pipe once and makes
+    /// no hello attempt (checked through the drop's own counters, not a timer).
+    #[test] // spec: QA-041
+    fn drop_without_a_core_returns_without_waiting() {
+        let t = TestEnv::new();
+        let counts = Arc::clone(&t.drain_counts);
+        drop(t);
+        assert_eq!(counts.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.hellos.load(Ordering::Relaxed), 0);
+    }
+
+    /// Set in the helper child's environment: `core::tests::helper_sleep_forever` sleeps.
+    const HELPER_ENV: &str = "WW_TESTKIT_HELPER_SLEEP";
+
+    #[test] // spec: QA-041
+    fn ww_child_is_killed_on_drop() {
+        // The test binary is the long-running child (ruling P6), started as `ww_spawn` starts
+        // `ww`, with output piped.
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "core::tests::helper_sleep_forever",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, "1");
+        let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
+        let probe = ww_platform::process::open(child.pid()).expect("open the helper");
+        assert_eq!(
+            probe.exit_code().unwrap(),
+            None,
+            "the helper exited by itself"
+        );
+        assert_eq!(child.wait(Duration::ZERO), None);
+
+        drop(child);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Drop already waited; the deadline only bounds a failure.
+        let code = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(10), probe.wait()).await })
+            .expect("the helper still runs after its WwChild was dropped")
+            .unwrap();
+        assert_eq!(code, 1, "TerminateProcess exit code");
+    }
+
+    /// Set in the helper child's environment: `helper_print_lines` prints and returns.
+    const PRINT_ENV: &str = "WW_TESTKIT_HELPER_PRINT";
+
+    /// With `PRINT_ENV` set, prints one line to stdout and one to stderr; otherwise does
+    /// nothing.
+    #[test]
+    fn helper_print_lines() {
+        if std::env::var_os(PRINT_ENV).is_some() {
+            println!("out-line Ünïcödé space");
+            eprintln!("err-line Ünïcödé space");
+        }
+    }
+
+    #[test] // spec: QA-056
+    fn ww_child_reads_stdout_lines_and_drains_stderr() {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["env::tests::helper_print_lines", "--exact", "--nocapture"])
+            .env(PRINT_ENV, "1");
+        let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
+        let lines: Vec<String> = child.stdout_lines().collect();
+        assert!(
+            lines.iter().any(|l| l == "out-line Ünïcödé space"),
+            "{lines:?}"
+        );
+        assert_eq!(child.wait(Duration::from_secs(30)), Some(0));
+        // The stderr thread may finish just after the exit; wait for the pipe to close.
+        assert!(child.stderr.wait_closed(Duration::from_secs(30)));
+        let stderr = child.stderr_so_far();
+        assert!(stderr.contains("err-line Ünïcödé space"), "{stderr}");
+        assert!(!stderr.contains("out-line"), "{stderr}");
     }
 }

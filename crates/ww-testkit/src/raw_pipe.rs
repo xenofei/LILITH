@@ -9,6 +9,8 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -104,9 +106,14 @@ impl RawPipe {
                 Err(_) => return None,
             }
         };
+        Some(RawPipe::from_client(rt, client))
+    }
+
+    /// A `RawPipe` over a client already opened inside `rt` (`TestEnv`'s one-probe drop).
+    pub(crate) fn from_client(rt: Runtime, client: NamedPipeClient) -> RawPipe {
         let server_pid = server_pid(&client).ok();
         let (read, writer) = tokio::io::split(client);
-        Some(RawPipe {
+        RawPipe {
             reader: BufReader::new(read),
             writer,
             partial: Vec::new(),
@@ -114,7 +121,7 @@ impl RawPipe {
             events: VecDeque::new(),
             server_pid,
             rt,
-        })
+        }
     }
 
     /// The PID of the process serving the pipe, if Windows reported it.
@@ -191,7 +198,9 @@ impl RawPipe {
     }
 
     /// Sends a request and returns the whole response object (`result` or `error`). `ww/event`
-    /// notifications that arrive meanwhile are kept for [`RawPipe::next_event`].
+    /// notifications that arrive meanwhile are kept for [`RawPipe::next_event`]. An error
+    /// response whose `id` is `null` (the core could not read a request, -32700) is returned at
+    /// once too: no response with this call's id will follow it.
     ///
     /// # Panics
     /// If no response arrives within 30 s or the connection fails.
@@ -227,7 +236,12 @@ impl RawPipe {
                 }
                 continue;
             }
-            if message.get("id") == Some(&json!(id)) {
+            let answered = match message.get("id") {
+                Some(Value::Null) => message.get("error").is_some(),
+                Some(other) => *other == json!(id),
+                None => false,
+            };
+            if answered {
                 return Ok(message);
             }
         }
@@ -253,6 +267,40 @@ impl RawPipe {
             Some(result) => result.clone(),
             None => panic!("tools/call {name} returned no result: {response}"),
         }
+    }
+
+    /// [`RawPipe::tool`], checked: panics unless the `Outcome`'s `status` is `ok`, and returns
+    /// its `structured` value (`null` when it has none).
+    ///
+    /// # Panics
+    /// On a JSON-RPC error or any other status; the message carries the whole result.
+    pub fn tool_ok(&mut self, name: &str, args: Value, key: Option<&str>) -> Value {
+        let result = self.tool(name, args, key);
+        assert!(
+            result["status"] == "ok",
+            "tools/call {name} did not succeed: {result}"
+        );
+        result.get("structured").cloned().unwrap_or(Value::Null)
+    }
+
+    /// The watcher fence (Global Constraints, Tests): writes the new file
+    /// `<ws>\.worldwright\fence\<n>` (`n` unique in this process), then calls
+    /// `test.watch_fence {name: n}`, which returns once the workspace's first reconcile has
+    /// finished and the watcher has handled that file and everything before it. Tests wait on
+    /// the watcher with this, never with a sleep.
+    ///
+    /// # Panics
+    /// If the file cannot be written or the tool does not succeed.
+    pub fn fence(&mut self, ws: &Path) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let name = format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let file = ws.join(".worldwright").join("fence").join(&name);
+        crate::files::write_file(&file, name.as_bytes());
+        self.tool_ok("test.watch_fence", json!({ "name": name }), None);
     }
 
     /// The params of the next `ww/event` notification, or `None` if none arrived within
@@ -359,5 +407,106 @@ mod tests {
         assert_eq!(pipe.next_event(wait), Some(json!({"seq": 2})));
         server.join().expect("the fake server's checks");
         assert_eq!(pipe.read_line(wait), None);
+    }
+
+    /// Serves one connection on `env`'s pipe with `serve`, on its own thread and runtime.
+    fn fake_server<F>(env: &TestEnv, serve: F) -> std::thread::JoinHandle<()>
+    where
+        F: AsyncFnOnce(
+                tokio::io::Lines<
+                    BufReader<ReadHalf<tokio::net::windows::named_pipe::NamedPipeServer>>,
+                >,
+                WriteHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
+            ) + Send
+            + 'static,
+    {
+        let name = env.env.pipe_name();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let server = ww_platform::pipe::create_instance(&name, true).unwrap();
+                ready_tx.send(()).unwrap();
+                server.connect().await.unwrap();
+                let (read, write) = tokio::io::split(server);
+                serve(BufReader::new(read).lines(), write).await;
+            });
+        });
+        ready_rx.recv().unwrap();
+        server
+    }
+
+    /// A core that cannot read a request answers -32700 with `id: null`; `call` returns that
+    /// error instead of waiting for a response with its own id. The server keeps the
+    /// connection open until the client is done, so only the null-id rule can end the call
+    /// (the old behaviour waited the full 30 s and then failed).
+    #[test] // spec: QA-056
+    fn call_returns_on_a_null_id_error() {
+        let env = TestEnv::new();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = fake_server(&env, async move |mut lines, mut write| {
+            let line = lines.next_line().await.unwrap().unwrap();
+            // The fake reads every line as `{nope`: not a request it can parse.
+            assert!(line.contains("\"method\":\"echo\""), "{line}");
+            let error = json!({"jsonrpc": "2.0", "id": null,
+                "error": {"code": -32700, "message": "parse error"}});
+            write
+                .write_all(format!("{error}\n").as_bytes())
+                .await
+                .unwrap();
+            // Hold the connection open until the client has its answer.
+            let _ = done_rx.recv();
+        });
+
+        let mut pipe = RawPipe::connect(&env);
+        let response = pipe
+            .try_call("echo", json!({"text": "{nope"}), Duration::from_secs(30))
+            .expect("the null-id error ends the call");
+        assert_eq!(response["error"]["code"], -32700, "{response}");
+        assert_eq!(response["id"], Value::Null, "{response}");
+        done_tx.send(()).unwrap();
+        server.join().expect("the fake server's checks");
+    }
+
+    /// `fence` writes `<ws>\.worldwright\fence\<n>` before it calls `test.watch_fence {name:
+    /// n}`, and `tool_ok` returns `structured`; a failed fence panics with the outcome.
+    #[test] // spec: QA-031
+    fn fence_writes_its_file_then_calls_watch_fence() {
+        let env = TestEnv::new();
+        let ws = env.make_workspace("Ünïcödé space");
+        let ws_in_server = ws.clone();
+        let server = fake_server(&env, async move |mut lines, mut write| {
+            for status in ["ok", "error"] {
+                let call: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(call["method"], "tools/call");
+                assert_eq!(call["params"]["name"], "test.watch_fence");
+                let name = call["params"]["arguments"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let file = ws_in_server.join(".worldwright").join("fence").join(&name);
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), name);
+                let result = json!({"status": status, "structured": {}});
+                let reply = json!({"jsonrpc": "2.0", "id": call["id"], "result": result});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut pipe = RawPipe::connect(&env);
+        pipe.fence(&ws);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pipe.fence(&ws)));
+        assert!(failed.is_err(), "a fence whose tool failed must panic");
+        server.join().expect("the fake server's checks");
+        let fences = std::fs::read_dir(ws.join(".worldwright").join("fence"))
+            .unwrap()
+            .count();
+        assert_eq!(fences, 2, "each fence has its own file");
     }
 }
