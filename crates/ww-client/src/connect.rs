@@ -7,16 +7,19 @@
 //!    [`StartPolicy::NoStart`]; otherwise the core is spawned detached (no arguments, the
 //!    configured `spawn_env`) and the search goes on. The deadline is `start_timeout`; while
 //!    the core this client spawned is still alive it extends up to `start_hard_cap`. When that
-//!    core has exited, code 3 means it lost the start race to another core (so the search goes
-//!    on, and a new core is spawned only if that one is gone too); any other code is
-//!    [`ClientError::StartFailed`].
+//!    core has exited, code 3 (it lost the start race to another core) or 0 (it ran and was
+//!    stopped) means the search goes on, and a new core is spawned only if no other serves;
+//!    any other code is [`ClientError::StartFailed`].
 //! 2. **Verify** (ARCH-027): the pipe's server PID is opened at once; its user must be the
 //!    current user and its executable must be in `server_dirs`, else
 //!    [`ClientError::Untrusted`]. Nothing is sent to an untrusted server.
 //! 3. **`core/hello`.** The core claims its pipe before it opens the suite `state.db`, so the
 //!    connection may close before the hello reply when that core then fails to start. If this
-//!    client spawned that core, its exit code (waited for up to 10 s) says why; otherwise the
-//!    result is [`ClientError::Closed`].
+//!    client spawned that core, its exit code (waited for up to 10 s) says why. Otherwise the
+//!    find loop runs once more (the client's own core then reports its failure); a second
+//!    early close is [`ClientError::Closed`]. A server that cannot be inspected because it is
+//!    gone is the same race; one that cannot be inspected for any other reason (another
+//!    user's process) is [`ClientError::Untrusted`].
 //! 4. **Version direction** (controller ruling 4). On `protocol.incompatible` a client whose
 //!    major is greater than the core's sends `core/drain` on that connection, waits up to 60 s
 //!    for the pipe to go, starts a new core (unless `NoStart`) and says hello once more. Any
@@ -25,13 +28,15 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::windows::named_pipe::NamedPipeClient;
+#[cfg(test)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use ww_platform::IdSource as _;
 use ww_platform::RandomIds;
@@ -48,7 +53,7 @@ use ww_protocol::{
 };
 
 use crate::conn::{Conn, EventStream};
-use crate::{ClientConfig, ClientError, StartFailure, StartPolicy};
+use crate::{ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
 
 /// The first pause between attempts to open the pipe.
 const BACKOFF_START: Duration = Duration::from_millis(25);
@@ -56,6 +61,8 @@ const BACKOFF_START: Duration = Duration::from_millis(25);
 const BACKOFF_MAX: Duration = Duration::from_millis(250);
 /// The exit code of a core that lost the race for the pipe to another core.
 const LOST_RACE: u32 = 3;
+/// The exit code of a core that stopped normally (idle, drained, session end).
+const NORMAL_EXIT: u32 = 0;
 /// How long a client waits for the exit code of a core it started that closed the connection
 /// before saying hello.
 const EARLY_CLOSE_WAIT: Duration = Duration::from_secs(10);
@@ -234,15 +241,23 @@ pub async fn drain_and_wait(
         backoff.pause().await;
     };
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
-    match server_pid(&pipe).and_then(|pid| SystemInspector.inspect(pid)) {
+    let inspected = match server_pid(&pipe) {
+        Ok(pid) => SystemInspector
+            .inspect(pid)
+            .map_err(|e| unverifiable(pid, &e)),
+        Err(e) if gone(&e) => Err(None),
+        Err(e) => return Err(ClientError::Io(e)),
+    };
+    match inspected {
         Ok(info) => check_user(&info)?,
+        // A server that cannot be verified is never asked (ARCH-027).
+        Err(Some(untrusted)) => return Err(untrusted),
         // The server went away under us.
-        Err(e) if gone(&e) => {
+        Err(None) => {
             drop(pipe);
             wait_gone(&pipe_name, deadline).await?;
             return Ok(DrainOutcome::Stopped);
         }
-        Err(e) => return Err(ClientError::Io(e)),
     }
 
     let conn = Conn::start(pipe);
@@ -307,13 +322,32 @@ async fn wait_gone(pipe_name: &str, deadline: Instant) -> Result<(), ClientError
 async fn handshake(cfg: &ClientConfig) -> Result<Handshake, ClientError> {
     let mut finder = Finder::new(cfg);
     let pipe = finder.open().await?;
-    greet(cfg, &finder, pipe).await
+    handshake_from(cfg, &mut finder, pipe).await
+}
+
+/// Verify and hello on `pipe`, which `finder` opened. A connection that closes before the
+/// hello reply without a start failure to report (another client's core that exited, or this
+/// client's own core stopped normally) sends the client round the find loop once more, within
+/// the same deadline: hello has no side effects, and a core that cannot start is then this
+/// client's own, whose exit code is reported.
+async fn handshake_from(
+    cfg: &ClientConfig,
+    finder: &mut Finder<'_>,
+    pipe: NamedPipeClient,
+) -> Result<Handshake, ClientError> {
+    match greet(cfg, finder, pipe).await {
+        Err(ClientError::Closed) => {
+            let pipe = finder.open().await?;
+            greet(cfg, finder, pipe).await
+        }
+        other => other,
+    }
 }
 
 /// Steps 2 and 3 on the pipe `finder` opened: verify the server, then say hello.
 async fn greet(
     cfg: &ClientConfig,
-    finder: &Finder<'_>,
+    finder: &mut Finder<'_>,
     pipe: NamedPipeClient,
 ) -> Result<Handshake, ClientError> {
     // ARCH-027: the server process is opened at once, before anything is sent.
@@ -323,7 +357,11 @@ async fn greet(
     };
     let info = match SystemInspector.inspect(pid) {
         Ok(info) => info,
-        Err(_) => return Err(finder.closed_early(Some(pid)).await),
+        Err(e) => match unverifiable(pid, &e) {
+            Some(untrusted) if !finder.spawned_pid(pid) => return Err(untrusted),
+            // Gone (the connect race), or this client's own core.
+            _ => return Err(finder.closed_early(Some(pid)).await),
+        },
     };
     check_user(&info)?;
     check_dir(cfg, &info)?;
@@ -370,6 +408,11 @@ impl<'a> Finder<'a> {
             started: Instant::now(),
             spawned: None,
         }
+    }
+
+    /// Whether `pid` is the core this client spawned.
+    fn spawned_pid(&self, pid: u32) -> bool {
+        self.spawned.as_ref().is_some_and(|h| h.pid() == pid)
     }
 
     fn spawned_alive(&self) -> bool {
@@ -422,8 +465,9 @@ impl<'a> Finder<'a> {
             match handle.exit_code() {
                 // Still starting.
                 Ok(None) => return Ok(()),
-                // It lost the race, and the winner is gone too: start another below.
-                Ok(Some(LOST_RACE)) => self.spawned = None,
+                // It lost the race and the winner is gone too, or it ran and was stopped
+                // (drained by another client): not a start failure; start another below.
+                Ok(Some(LOST_RACE | NORMAL_EXIT)) => self.spawned = None,
                 Ok(Some(code)) => return Err(self.start_failed(Some(code))),
                 Err(e) => return Err(ClientError::Io(e)),
             }
@@ -452,7 +496,7 @@ impl<'a> Finder<'a> {
     /// The connection to the core serving `server_pid` (if known) closed before the hello
     /// reply, or the server could not be inspected. When this client started that core, its
     /// exit code says why (it claims the pipe before it opens the suite `state.db`).
-    async fn closed_early(&self, server_pid: Option<u32>) -> ClientError {
+    async fn closed_early(&mut self, server_pid: Option<u32>) -> ClientError {
         let Some(handle) = &self.spawned else {
             return ClientError::Closed;
         };
@@ -460,7 +504,14 @@ impl<'a> Finder<'a> {
             return ClientError::Closed;
         }
         match timeout(EARLY_CLOSE_WAIT, handle.wait()).await {
-            Ok(Ok(code)) if code != LOST_RACE => self.start_failed(Some(code)),
+            // It lost the race, or ran and was stopped normally (another client drained it
+            // inside the hello window): not a start failure. Forgotten, so a retry of the
+            // find loop may start a new one.
+            Ok(Ok(LOST_RACE | NORMAL_EXIT)) => {
+                self.spawned = None;
+                ClientError::Closed
+            }
+            Ok(Ok(code)) => self.start_failed(Some(code)),
             _ => ClientError::Closed,
         }
     }
@@ -487,6 +538,21 @@ impl Backoff {
         sleep(self.0).await;
         self.0 = (self.0 * 2).min(BACKOFF_MAX);
     }
+}
+
+/// What an `inspect` failure for the server `pid` means. `None`: the process is gone (the
+/// connect race). Anything else (another user's process that cannot be opened, say) makes
+/// the server untrusted (ARCH-027), named by its PID.
+fn unverifiable(pid: u32, e: &io::Error) -> Option<ClientError> {
+    if e.kind() == io::ErrorKind::NotFound {
+        return None;
+    }
+    Some(ClientError::Untrusted {
+        pid,
+        // Unknown: the process could not be opened to read it.
+        image: PathBuf::new(),
+        reason: format!("it cannot be verified: {e}"),
+    })
 }
 
 /// ARCH-027: the server runs as the current user.
@@ -520,10 +586,7 @@ fn check_dir(cfg: &ClientConfig, info: &ProcessInfo) -> Result<(), ClientError> 
     Err(ClientError::Untrusted {
         pid: info.pid,
         image: info.image.clone(),
-        reason: format!(
-            "its executable is not in the folder this client trusts ({})",
-            dirs.join("; ")
-        ),
+        reason: format!("{WRONG_FOLDER} ({})", dirs.join("; ")),
     })
 }
 
@@ -645,7 +708,7 @@ mod tests {
             let Some(pipe) = pipe else { continue };
             met += 1;
             let result = rt.block_on(async {
-                tokio::time::timeout(DEADLINE, greet(&cfg, &finder, pipe)).await
+                tokio::time::timeout(DEADLINE, greet(&cfg, &mut finder, pipe)).await
             });
             match result.expect("greet did not finish within the deadline") {
                 Err(ClientError::StartFailed {
@@ -681,6 +744,138 @@ mod tests {
         }
     }
 
+    /// A client connected to a fake server on a pipe of its own, named after `label`.
+    async fn fake_pair(label: &str) -> (Client, NamedPipeServer) {
+        let name = format!(r"\\.\pipe\ww-client-unit-{}-{label}", std::process::id());
+        let server = ww_platform::pipe::create_instance(&name, true).expect("fake server");
+        let pipe = open_client(&name).expect("open the fake server");
+        server.connect().await.expect("accept");
+        let client = Client {
+            conn: Conn::start(pipe),
+            hello: fake_hello(),
+        };
+        (client, server)
+    }
+
+    /// A line from the core that is not the protocol ends the connection: the call waiting
+    /// for its reply gets `Closed` instead of hanging.
+    #[test] // spec: ARCH-025
+    fn an_unreadable_line_closes_the_connection() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client, server) = fake_pair("garbage").await;
+            let fake = tokio::spawn(async move {
+                let (read, mut write) = tokio::io::split(server);
+                let mut lines = BufReader::new(read).lines();
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("the tools/list request");
+                write.write_all(b"this is not JSON\n").await.unwrap();
+                write.flush().await.unwrap();
+                // The fake keeps its end open: only the client may end the connection.
+                let _ = lines.next_line().await;
+            });
+            let result = tokio::time::timeout(Duration::from_secs(10), client.list_tools())
+                .await
+                .expect("the call hung after an unreadable line");
+            assert!(matches!(result, Err(ClientError::Closed)), "{result:?}");
+            drop(client);
+            fake.await.expect("the fake server");
+        });
+    }
+
+    /// Inspecting the server fails for another user's process (access denied): that server is
+    /// untrusted and named by its PID, never a closed connection. Only a process that is gone
+    /// is the connect race.
+    #[test] // spec: ARCH-027
+    fn inspect_failures_are_untrusted_unless_the_process_is_gone() {
+        let denied = io::Error::from_raw_os_error(5);
+        match unverifiable(4242, &denied) {
+            Some(ClientError::Untrusted { pid, image, reason }) => {
+                assert_eq!(pid, 4242);
+                assert!(image.as_os_str().is_empty(), "{}", image.display());
+                assert!(reason.contains("cannot be verified"), "{reason}");
+                let text = ClientError::Untrusted { pid, image, reason }.to_string();
+                assert!(text.contains("4242"), "{text}");
+                assert!(!text.contains("ww core stop"), "{text}");
+                assert!(!text.contains("by  ("), "{text}");
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
+        let gone = io::Error::new(io::ErrorKind::NotFound, "process 4242 is not running");
+        assert!(unverifiable(4242, &gone).is_none());
+    }
+
+    /// Two clients start at once on a damaged `state.db`, and this one connects to the
+    /// *other* client's core, which then exits: it retries the find loop once, starts its own
+    /// core and reports that core's start failure, not `Closed`.
+    #[test] // spec: CORE-004
+    fn early_close_of_another_clients_core_retries_into_the_start_failure() {
+        const DEADLINE: std::time::Duration = Duration::from_secs(30);
+        let env = TestEnv::new();
+        let bins = ensure_built();
+        let mut cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+        cfg.core_exe = bins.ww_core.clone();
+        cfg.server_dirs = vec![bins.dir.clone()];
+        cfg.spawn_env = env.child_env();
+        let db = env.env.suite_state_db();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut met = 0;
+        for round in 0..5 {
+            // The other client's core, connected to the moment its pipe exists.
+            let mut other = Finder::new(&cfg);
+            other.not_found().expect("spawn the other core");
+            let pipe = rt.block_on(async {
+                let deadline = Instant::now() + DEADLINE;
+                loop {
+                    match open_client(&other.pipe_name) {
+                        Ok(pipe) => return Some(pipe),
+                        Err(ConnectError::NotFound | ConnectError::Busy) => {}
+                        Err(ConnectError::Io(e)) => panic!("round {round}: {e}"),
+                    }
+                    if !other.spawned_alive() {
+                        return None;
+                    }
+                    assert!(Instant::now() < deadline, "round {round}: no pipe, no exit");
+                    tokio::task::yield_now().await;
+                }
+            });
+            let Some(pipe) = pipe else { continue };
+            met += 1;
+            let mut finder = Finder::new(&cfg);
+            let result = rt.block_on(async {
+                tokio::time::timeout(DEADLINE, handshake_from(&cfg, &mut finder, pipe)).await
+            });
+            match result.expect("the handshake did not finish within the deadline") {
+                Err(ClientError::StartFailed {
+                    exit_code: Some(5),
+                    kind: StartFailure::StateDamaged,
+                    ..
+                }) => {}
+                Err(other) => panic!("round {round}: expected StartFailed(5), got {other:?}"),
+                Ok(_) => panic!("round {round}: a damaged core said hello"),
+            }
+            let other_core = other.spawned.take().expect("the other core");
+            rt.block_on(async { tokio::time::timeout(DEADLINE, other_core.wait()).await })
+                .expect("the other core did not exit")
+                .unwrap();
+        }
+        assert!(met > 0, "no round connected before the other core exited");
+    }
+
     /// The core may queue a subscription's replayed events before its `ww/subscribe` reply
     /// (Task 11). A fake server sends them in that order, plus an event of a topic not
     /// subscribed: the stream gets every replayed and later event in order, nothing else, and
@@ -694,14 +889,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let name = format!(r"\\.\pipe\ww-client-unit-{}-replay", std::process::id());
-            let server = ww_platform::pipe::create_instance(&name, true).expect("fake server");
-            let pipe = open_client(&name).expect("open the fake server");
-            server.connect().await.expect("accept");
-            let client = Client {
-                conn: Conn::start(pipe),
-                hello: fake_hello(),
-            };
+            let (client, server) = fake_pair("replay").await;
 
             let fake = tokio::spawn(async move {
                 let (read, mut write) = tokio::io::split(server);

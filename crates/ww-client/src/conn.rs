@@ -9,8 +9,8 @@
 //! - A subscription's stream is registered *before* its `ww/subscribe` request is written:
 //!   replayed events may arrive before the reply (the core queues them while it subscribes),
 //!   and they are buffered in the stream until it is read.
-//! - When either task ends (the core closed the pipe, a read or write failed), the connection
-//!   is closed: waiting calls get [`ClientError::Closed`] and every stream ends after its
+//! - When either task ends (the core closed the pipe, a read or write failed, a line was
+//!   over-long, not UTF-8 or not a server line), the connection is closed: waiting calls get [`ClientError::Closed`] and every stream ends after its
 //!   buffered events.
 
 use std::collections::{BTreeSet, HashMap};
@@ -194,13 +194,17 @@ async fn read_lines(read: ReadHalf<NamedPipeClient>, shared: Arc<Shared>) {
     // End of stream, a read error, an over-long line or bytes that are not UTF-8 all end the
     // connection: none of them is the protocol.
     while let Some(Ok(line)) = lines.next().await {
-        route(&shared, &line);
+        if !route(&shared, &line) {
+            break;
+        }
     }
     shared.close();
 }
 
-/// Delivers one line from the core.
-fn route(shared: &Shared, line: &str) {
+/// Delivers one line from the core. `false`: the line is not a server line (not JSON, not
+/// JSON-RPC 2.0), so the connection is no longer the protocol and must close; a reply the
+/// line might have carried would otherwise leave its call waiting forever.
+fn route(shared: &Shared, line: &str) -> bool {
     match parse_server_line(line) {
         Ok(ServerLine::Response(Response::Result {
             id: Id::Num(id),
@@ -215,17 +219,19 @@ fn route(shared: &Shared, line: &str) {
                 .params
                 .and_then(|p| serde_json::from_value::<EventParams>(p).ok())
             else {
-                return;
+                return true;
             };
             // A stream whose receiver is gone is dropped here.
             shared.lock().sinks.retain(|sink| {
                 !sink.topics.contains(&event.topic) || sink.tx.send(event.clone()).is_ok()
             });
         }
+        Err(_) => return false,
         // A reply to nothing this client asked (a string id, or one already given up), a
-        // fault without an id, another notification or an unreadable line: nothing to deliver.
-        _ => {}
+        // fault without an id or another notification: nothing to deliver.
+        Ok(_) => {}
     }
+    true
 }
 
 fn reply(shared: &Shared, id: i64, reply: Reply) {

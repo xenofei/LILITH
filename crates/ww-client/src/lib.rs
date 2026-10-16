@@ -39,6 +39,11 @@ pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
 pub use workspace::{WORKSPACE_MANIFEST, resolve_workspace_id};
 
+/// The start of an `Untrusted` reason for a core of the current user whose executable is in
+/// another folder: the one case `ww core stop` can clear (`drain_and_wait` asks only cores of
+/// the current user that it could inspect).
+pub(crate) const WRONG_FOLDER: &str = "its executable is not in the folder this client trusts";
+
 /// The core executable's file name, next to the client's own executable.
 pub const CORE_EXE: &str = "ww-core.exe";
 
@@ -174,11 +179,27 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::NotRunning => f.write_str("The Worldwright core is not running."),
-            ClientError::Untrusted { pid, image, reason } => write!(
-                f,
-                "The Worldwright core pipe is served by {} (pid {pid}), which this client does not trust: {reason}. `ww core stop` can ask it to finish.",
-                image.display()
-            ),
+            ClientError::Untrusted { pid, image, reason } => {
+                if image.as_os_str().is_empty() {
+                    write!(f, "The Worldwright core pipe is served by process {pid}")?;
+                } else {
+                    write!(
+                        f,
+                        "The Worldwright core pipe is served by {} (pid {pid})",
+                        image.display()
+                    )?;
+                }
+                write!(f, ", which this client does not trust: {reason}.")?;
+                // Only a same-user core in another folder can be asked to drain.
+                if reason.starts_with(WRONG_FOLDER) {
+                    f.write_str(" `ww core stop` can ask it to finish.")?;
+                }
+                Ok(())
+            }
+            ClientError::Incompatible { core_protocol } if core_protocol.is_empty() => f
+                .write_str(
+                    "The running Worldwright core speaks a protocol version this client cannot use (it did not say which). Update the older of the two; the core was left running.",
+                ),
             ClientError::Incompatible { core_protocol } => write!(
                 f,
                 "The running Worldwright core speaks protocol {core_protocol}, which this client cannot use. Update the older of the two; the core was left running."
@@ -285,5 +306,30 @@ mod tests {
         let other = failed(Some(2), StartFailure::Other).to_string();
         assert!(other.contains(r"C:\t\local\logs"), "{other}");
         assert!(other.contains("exit code 2"), "{other}");
+    }
+
+    #[test] // spec: ARCH-014, ARCH-027
+    fn messages_stay_plain_when_details_are_missing() {
+        // A refusal without data.core_protocol.
+        let unknown = ClientError::Incompatible {
+            core_protocol: String::new(),
+        }
+        .to_string();
+        assert!(!unknown.contains("protocol ,"), "{unknown}");
+        assert!(unknown.contains("did not say which"), "{unknown}");
+
+        // `ww core stop` is offered only for a same-user core in another folder: the only
+        // kind `drain_and_wait` asks.
+        let untrusted = |reason: String| ClientError::Untrusted {
+            pid: 77,
+            image: PathBuf::from(r"C:\other bin\ww-core.exe"),
+            reason,
+        };
+        let folder = untrusted(format!(r"{WRONG_FOLDER} (C:\bin)")).to_string();
+        assert!(folder.contains("ww core stop"), "{folder}");
+        assert!(folder.contains(r"C:\other bin\ww-core.exe"), "{folder}");
+        let user = untrusted("it runs as another user".to_string()).to_string();
+        assert!(!user.contains("ww core stop"), "{user}");
+        assert!(user.contains("77"), "{user}");
     }
 }
