@@ -18,6 +18,11 @@
 //! Then the idempotency row is finished: `ok` and `pending_confirmation` outcomes are stored,
 //! an error releases the key. A `state.db` failure is `state.unavailable`.
 //!
+//! **Draining** (ARCH-021). Before stage 1 the call is admitted by the [`Lifecycle`]: a
+//! draining core answers `core.draining` (retry with the same idempotency key once a core
+//! runs again). An admitted call counts as in flight until its pipeline ends, even if its
+//! caller has gone, so a drain waits for it.
+//!
 //! **Cancellation.** [`Dispatcher::call`] runs the pipeline in a task of its own, so a caller
 //! that goes away (a client killed mid-call) cannot stop it between `idem_begin` and
 //! `idem_finish`: the outcome is stored for the retry. A [`Claim`] that is dropped unfinished
@@ -36,6 +41,7 @@ use ww_protocol::{
 use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{ConfirmDecision, PipelineHooks};
 use crate::events::EventBus;
+use crate::lifecycle::Lifecycle;
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
 
@@ -52,6 +58,7 @@ struct Inner {
     events: Arc<EventBus>,
     ids: Arc<dyn IdSource>,
     clock: Arc<dyn Clock>,
+    lifecycle: Arc<Lifecycle>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -70,6 +77,7 @@ impl Dispatcher {
         events: Arc<EventBus>,
         ids: Arc<dyn IdSource>,
         clock: Arc<dyn Clock>,
+        lifecycle: Arc<Lifecycle>,
     ) -> Dispatcher {
         Dispatcher {
             inner: Arc::new(Inner {
@@ -79,6 +87,7 @@ impl Dispatcher {
                 events,
                 ids,
                 clock,
+                lifecycle,
             }),
         }
     }
@@ -91,6 +100,11 @@ impl Dispatcher {
     /// The event bus its tools publish on (`CallCtx::events`).
     pub fn events(&self) -> &Arc<EventBus> {
         &self.inner.events
+    }
+
+    /// The lifecycle that admits its calls.
+    pub fn lifecycle(&self) -> &Arc<Lifecycle> {
+        &self.inner.lifecycle
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
@@ -108,9 +122,23 @@ impl Dispatcher {
                 self.inner.ids.id("t")
             }
         };
+        let Some(in_flight) = self.inner.lifecycle.try_call_started() else {
+            tracing::info!(tool = %p.name, caller = %session.caller, trace_id, "tool call refused: the core is draining");
+            return Outcome::Error {
+                error: ErrorBody::new(
+                    &codes::CORE_DRAINING,
+                    "The core is shutting down. Retry with the same idempotency key once it runs again.",
+                    trace_id,
+                ),
+            };
+        };
         let (name, inner, trace) = (p.name.clone(), self.inner.clone(), trace_id.clone());
-        // Its own task: a caller that goes away cannot cut the pipeline short.
-        let pipeline = tokio::spawn(async move { inner.pipeline(session, p, trace).await });
+        // Its own task: a caller that goes away cannot cut the pipeline short. The call stays
+        // in flight until the pipeline ends.
+        let pipeline = tokio::spawn(async move {
+            let _in_flight = in_flight;
+            inner.pipeline(session, p, trace).await
+        });
         match pipeline.await {
             Ok(outcome) => outcome,
             Err(e) => {

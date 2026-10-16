@@ -6,25 +6,29 @@
 //! - [`serve`] accepts connections. A new instance is always created before a connected one is
 //!   handed to its task, so the pipe name never disappears while the core runs.
 //! - Each connection runs in [`conn`]: NDJSON framing and the order rules of the [`Router`].
+//! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
+//!   wait and steps, then the state databases close, then the pipe.
 
 mod conn;
 
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use ww_platform::pipe::{CreateError, client_pid, create_instance};
+use ww_platform::session_end::{SessionEnd, SessionEndWatcher};
 use ww_platform::{Env, process};
 use ww_protocol::{Request, Response};
 
 use crate::config::{CoreConfig, CoreExit};
 use crate::events::EventBus;
+use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
@@ -173,17 +177,23 @@ impl Drop for Counted {
 }
 
 /// A core that is serving.
+///
+/// Its shutdown (ARCH-021) runs in a supervisor task once a drain begins: the lifecycle's
+/// wait and shutdown steps ([`Lifecycle::run_shutdown`]), then the state databases are closed
+/// (the queued jobs run, the actors stop), and only then is the pipe closed. A new core can
+/// claim the pipe only after this one has stopped writing `state.db`, so its clean-up of
+/// stale `running` idempotency rows never races calls of this one.
 #[derive(Debug)]
 pub struct RunningCore {
     pipe: String,
-    stop: CancellationToken,
-    serving: JoinHandle<io::Result<()>>,
-    parent_watch: Option<JoinHandle<()>>,
+    lifecycle: Arc<Lifecycle>,
     state: Arc<StateRegistry>,
     /// The gates `test.block` waits on (test channels).
     test_gates: Arc<TestGates>,
-    /// What died, once something reported a fatal error (the state actor, QA-012).
-    fatal: Arc<OnceLock<String>>,
+    /// The hidden session-end window; `None` if it could not be created.
+    session_end: Option<Arc<SessionEndWatcher>>,
+    /// The supervisor: ends with the shutdown's report.
+    shutdown: JoinHandle<ShutdownReport>,
 }
 
 impl RunningCore {
@@ -202,25 +212,37 @@ impl RunningCore {
         &self.test_gates
     }
 
-    /// Asks the core to stop. (In this stage it stops serving at once.)
-    pub fn request_drain(&self) {
-        self.stop.cancel();
+    /// Idle accounting, drains and shutdown steps.
+    pub fn lifecycle(&self) -> &Arc<Lifecycle> {
+        &self.lifecycle
     }
 
-    /// Waits until the core has stopped serving. After a fatal error (a database actor died)
-    /// that is [`CoreExit::Fatal`].
-    pub async fn wait(self) -> Result<(), CoreExit> {
-        let served = self.serving.await;
-        if let Some(watch) = self.parent_watch {
-            watch.abort();
-        }
-        match served {
-            Ok(Ok(())) => match self.fatal.get() {
-                Some(what) => Err(CoreExit::Fatal(format!("the {what} actor died"))),
-                None => Ok(()),
-            },
-            Ok(Err(e)) => Err(CoreExit::Fatal(format!("the pipe listener failed: {e}"))),
-            Err(e) => Err(CoreExit::Fatal(format!("the pipe listener ended: {e}"))),
+    /// Asks the core to exit when safe (`core/drain`, ARCH-023).
+    pub fn request_drain(&self) {
+        self.lifecycle.begin_drain(DrainReason::Requested);
+    }
+
+    /// Sends `msg` to the core's own session-end window, as Windows would (tests). `End`
+    /// blocks until the shutdown is complete or [`crate::lifecycle::SESSION_END_BUDGET`] is
+    /// spent, so call it from outside the core's runtime. `false` if the core has no window.
+    pub fn simulate_session_end(&self, msg: SessionEnd) -> bool {
+        self.session_end.as_ref().is_some_and(|w| w.simulate(msg))
+    }
+
+    /// Waits until the core has shut down. The report's `reason` says why (ruling P10) and
+    /// its `exit_code` is the process exit code; its `steps` end with `state.close` and
+    /// `pipe.close`.
+    pub async fn wait(self) -> ShutdownReport {
+        match self.shutdown.await {
+            Ok(report) => report,
+            Err(e) => {
+                tracing::error!(error = %e, "the shutdown supervisor ended abnormally");
+                ShutdownReport {
+                    reason: DrainReason::Fatal(format!("the shutdown supervisor ended: {e}")),
+                    steps: Vec::new(),
+                    abandoned_calls: 0,
+                }
+            }
         }
     }
 }
@@ -239,16 +261,18 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 /// [`CoreExit::StateTooNew`], a damaged one [`CoreExit::StateDamaged`], anything else
 /// [`CoreExit::Startup`]; each is logged with the path, nothing on disk is changed, and the
 /// pipe is released as this returns.
+///
+/// Then it serves, ticks the idle check every [`IDLE_TICK`] (or `idle_after`, if a test
+/// channel set it shorter), watches the session end and, on a test channel, the test
+/// parent. A state actor that dies begins a fatal drain (QA-012).
 pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<RunningCore, CoreExit> {
     let pipe = listener.name().to_string();
-    let stop = CancellationToken::new();
-    let fatal = Arc::new(OnceLock::new());
+    let lifecycle = Lifecycle::new(cfg.clock.clone(), cfg.idle_after);
     let on_fatal: OnFatal = {
-        let (stop, fatal) = (stop.clone(), fatal.clone());
+        let lifecycle = lifecycle.clone();
         Arc::new(move |what: &str| {
             tracing::error!(what, "fatal error; the core stops");
-            let _ = fatal.set(what.to_string());
-            stop.cancel();
+            lifecycle.begin_drain(DrainReason::Fatal(what.to_string()));
         })
     };
     let state = match open_suite_state(&cfg.env, on_fatal) {
@@ -267,24 +291,114 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         events,
         cfg.ids.clone(),
         cfg.clock.clone(),
+        lifecycle.clone(),
     );
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
+    let stop = CancellationToken::new();
     let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
-    let parent_watch = cfg
-        .test_parent_pid
-        .filter(|_| cfg.test_tools)
-        .map(|pid| tokio::spawn(watch_test_parent(pid, stop.clone())));
+
+    let mut helpers = vec![tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after))];
+    if let Some(pid) = cfg.test_parent_pid.filter(|_| cfg.test_tools) {
+        helpers.push(tokio::spawn(watch_test_parent(pid, lifecycle.clone())));
+    }
+    let session_end = match SessionEndWatcher::start() {
+        Ok((watcher, messages)) => {
+            helpers.push(tokio::spawn(watch_session_end(messages, lifecycle.clone())));
+            Some(Arc::new(watcher))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no session-end window; a logoff will not drain the core");
+            None
+        }
+    };
+    let shutdown = tokio::spawn(supervise(Supervised {
+        lifecycle: lifecycle.clone(),
+        state: state.clone(),
+        stop,
+        serving,
+        helpers,
+        session_end: session_end.clone(),
+    }));
     tracing::info!(pipe = %pipe, channel = %cfg.env.channel(), "core serving");
     Ok(RunningCore {
         pipe,
-        stop,
-        serving,
-        parent_watch,
+        lifecycle,
         state,
         test_gates,
-        fatal,
+        session_end,
+        shutdown,
     })
+}
+
+/// What the shutdown supervisor owns.
+struct Supervised {
+    lifecycle: Arc<Lifecycle>,
+    state: Arc<StateRegistry>,
+    stop: CancellationToken,
+    serving: JoinHandle<io::Result<()>>,
+    helpers: Vec<JoinHandle<()>>,
+    session_end: Option<Arc<SessionEndWatcher>>,
+}
+
+/// Waits for a drain (or for the listener to fail, which is fatal), then shuts down in the
+/// order of [`RunningCore`]'s docs.
+async fn supervise(s: Supervised) -> ShutdownReport {
+    let Supervised {
+        lifecycle,
+        state,
+        stop,
+        mut serving,
+        helpers,
+        session_end,
+    } = s;
+    let drain = lifecycle.drain_token();
+    let served_early = tokio::select! {
+        () = drain.cancelled() => None,
+        served = &mut serving => Some(served),
+    };
+    if let Some(served) = &served_early {
+        let why = match served {
+            Ok(Ok(())) => "the pipe listener stopped".to_string(),
+            Ok(Err(e)) => format!("the pipe listener failed: {e}"),
+            Err(e) => format!("the pipe listener ended: {e}"),
+        };
+        tracing::error!(why, "fatal error; the core stops");
+        lifecycle.begin_drain(DrainReason::Fatal(why));
+    }
+    let mut report = lifecycle.run_shutdown().await;
+
+    // The state databases close before the pipe is released (module docs).
+    let closing = state.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || closing.close()).await {
+        tracing::error!(error = %e, "closing the state databases failed");
+    }
+    report.steps.push("state.close");
+
+    stop.cancel();
+    if served_early.is_none() {
+        match serving.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "the pipe listener failed while stopping"),
+            Err(e) => tracing::warn!(error = %e, "the pipe listener ended while stopping"),
+        }
+    }
+    report.steps.push("pipe.close");
+
+    for helper in helpers {
+        helper.abort();
+    }
+    if let Some(window) = session_end {
+        window.shutdown_complete();
+    }
+    tracing::info!(
+        reason = %report.reason,
+        steps = ?report.steps,
+        abandoned_calls = report.abandoned_calls,
+        exit_code = report.exit_code(),
+        "core stopped"
+    );
+    report
 }
 
 /// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6 or 2),
@@ -319,9 +433,42 @@ fn open_suite_state(env: &Env, on_fatal: OnFatal) -> Result<StateRegistry, CoreE
     })
 }
 
-/// Test channels: stops the core once the test process `pid` is gone, so a test core never
+/// Ticks the idle check (ARCH-020) every [`IDLE_TICK`], or every `idle_after` when a test
+/// channel set that shorter (at least once a second), until the core is idle long enough.
+async fn tick_idle(lifecycle: Arc<Lifecycle>, idle_after: Duration) {
+    let every = IDLE_TICK.min(idle_after.max(Duration::from_secs(1)));
+    loop {
+        tokio::time::sleep(every).await;
+        if lifecycle.is_draining() {
+            return;
+        }
+        if let Some(reason) = lifecycle.tick() {
+            lifecycle.begin_drain(reason);
+            return;
+        }
+    }
+}
+
+/// The session-end window's messages: a query is only logged (another application can
+/// still cancel the logoff); the end of the session begins the drain.
+async fn watch_session_end(
+    mut messages: tokio::sync::mpsc::UnboundedReceiver<SessionEnd>,
+    lifecycle: Arc<Lifecycle>,
+) {
+    while let Some(msg) = messages.recv().await {
+        match msg {
+            SessionEnd::QueryEnd => tracing::info!("the Windows session may end"),
+            SessionEnd::End => {
+                tracing::info!("the Windows session ends");
+                lifecycle.begin_drain(DrainReason::SessionEnd);
+            }
+        }
+    }
+}
+
+/// Test channels: drains the core once the test process `pid` is gone, so a test core never
 /// outlives its test.
-async fn watch_test_parent(pid: u32, stop: CancellationToken) {
+async fn watch_test_parent(pid: u32, lifecycle: Arc<Lifecycle>) {
     match process::open(pid) {
         Ok(parent) => {
             if let Err(e) = parent.wait().await {
@@ -333,10 +480,11 @@ async fn watch_test_parent(pid: u32, stop: CancellationToken) {
         Err(e) => tracing::info!(pid, error = %e, "the test parent is not running"),
     }
     tracing::info!(pid, "the test parent is gone; stopping");
-    stop.cancel();
+    lifecycle.begin_drain(DrainReason::TestParentGone);
 }
 
-/// A core on its own multi-thread runtime, for in-process tests. Dropping it stops the core.
+/// A core on its own multi-thread runtime, for in-process tests. Dropping it stops the core
+/// (as a test whose parent is gone: running calls get at most `FATAL_BUDGET`).
 #[derive(Debug)]
 pub struct CoreThread {
     core: Option<RunningCore>,
@@ -347,6 +495,30 @@ impl CoreThread {
     pub fn core(&self) -> &RunningCore {
         self.core.as_ref().expect("the core runs until drop")
     }
+
+    /// Waits up to `within` for the core to shut down by itself (a drain something else
+    /// began) and returns its report; `None` if it still runs then (the core is then stopped
+    /// as on drop). `within` is a failure deadline, never a measurement.
+    ///
+    /// # Panics
+    /// If called inside a tokio runtime.
+    pub fn wait_stopped(mut self, within: Duration) -> Option<ShutdownReport> {
+        let (core, rt) = (self.core.take()?, self.rt.take()?);
+        let lifecycle = core.lifecycle().clone();
+        let report = rt.block_on(async {
+            let mut shutdown = std::pin::pin!(core.wait());
+            match tokio::time::timeout(within, &mut shutdown).await {
+                Ok(report) => Some(report),
+                Err(_) => {
+                    lifecycle.begin_drain(DrainReason::TestParentGone);
+                    let _ = tokio::time::timeout(STOP_WAIT, shutdown).await;
+                    None
+                }
+            }
+        });
+        rt.shutdown_timeout(STOP_WAIT);
+        report
+    }
 }
 
 impl Drop for CoreThread {
@@ -354,7 +526,7 @@ impl Drop for CoreThread {
         let (Some(core), Some(rt)) = (self.core.take(), self.rt.take()) else {
             return;
         };
-        core.request_drain();
+        core.lifecycle().begin_drain(DrainReason::TestParentGone);
         if tokio::runtime::Handle::try_current().is_ok() {
             // Inside another runtime blocking is not allowed; let it wind down by itself.
             rt.shutdown_background();
@@ -365,8 +537,8 @@ impl Drop for CoreThread {
     }
 }
 
-/// How long dropping a [`CoreThread`] waits for its core to stop.
-const STOP_WAIT: Duration = Duration::from_secs(5);
+/// How long dropping a [`CoreThread`] waits for its core to stop: past `FATAL_BUDGET`.
+const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// Starts a core on a new multi-thread runtime owned by the returned [`CoreThread`].
 ///

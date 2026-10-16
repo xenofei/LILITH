@@ -4,7 +4,9 @@
 //! Startup order: the process environment, then the pipe claim (a core that loses it exits 3
 //! having touched nothing, not even its log), then the log, then the suite `state.db` (a newer
 //! one exits 6, a damaged one 5, any other failure 2; nothing on disk is changed and the pipe
-//! is released first), then serving. Exit codes are [`CoreExit::code`]; 0 is a normal stop.
+//! is released first), then serving until the core shuts down (ARCH-021). Startup failures
+//! exit with [`CoreExit::code`]; a shutdown exits with its report's code: 4 after a fatal
+//! error, else 0.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -20,7 +22,7 @@ const LOG_FILES_KEPT: usize = 14;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(exit) => {
             tracing::error!(code = exit.code(), reason = %exit, "core exiting");
             ExitCode::from(exit.code())
@@ -28,7 +30,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), CoreExit> {
+fn run() -> Result<u8, CoreExit> {
     let env = Env::from_process().map_err(|e| CoreExit::Startup(e.to_string()))?;
     let cfg = CoreConfig::for_env(env).map_err(|e| CoreExit::Startup(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -38,7 +40,8 @@ fn run() -> Result<(), CoreExit> {
     rt.block_on(async {
         let listener = claim_pipe(&cfg.env.pipe_name())?;
         init_logs(&cfg.env)?;
-        start_claimed(cfg, listener).await?.wait().await
+        let report = start_claimed(cfg, listener).await?.wait().await;
+        Ok(report.exit_code())
     })
 }
 

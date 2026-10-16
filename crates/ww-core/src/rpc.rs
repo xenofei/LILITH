@@ -5,13 +5,21 @@
 //!   hello that fails with an error result (an invalid engine token, an unknown workspace)
 //!   leaves the connection here, so the client may try again until the hello timeout.
 //! - [`ConnState::Refused`]: the hello named another major version and got the frozen
-//!   `protocol.incompatible` refusal. Everything is -32001 (`core/drain` included, until the
-//!   lifecycle decides it by the drain direction).
-//! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `tools/list` and
-//!   `tools/call` go to the [`Dispatcher`] (the `tools` module); `ww/subscribe` and
-//!   `ww/unsubscribe` go to the [`EventBus`]; `app/*` is refused with `caller.not_allowed` for
-//!   anyone but a verified `ui:*` caller, and is -32601 for one, since plan 2 defines no
-//!   `app/*` method (ARCH-031, APP-040).
+//!   `protocol.incompatible` refusal. `core/drain` drains the core only when the client's
+//!   major is greater than the core's (a newer client may replace an older core, ARCH-023);
+//!   otherwise it gets the same frozen refusal and the core keeps running (an older client
+//!   never stops a newer core, ARCH-014). Everything else is -32001.
+//! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `core/drain` replies
+//!   `{"status":"ok","draining":true}` and begins a requested drain. `tools/list` and
+//!   `tools/call` go to the [`Dispatcher`] (the `tools` module; a draining core answers new
+//!   calls with `core.draining`); `ww/subscribe` and `ww/unsubscribe` go to the [`EventBus`];
+//!   `app/*` is refused with `caller.not_allowed` for anyone but a verified `ui:*` caller, and
+//!   is -32601 for one, since plan 2 defines no `app/*` method (ARCH-031, APP-040).
+//!
+//! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
+//! [`Lifecycle`]'s connection count. A refused connection stops counting when it is refused
+//! (an incompatible client cannot keep an otherwise idle core alive) and is closed once the
+//! core drains; `AwaitingHello` and `Ready` connections count until they close.
 //!
 //! **Events** (ARCH-032). A connection is attached to the event bus (its forwarder started on
 //! the connection's outbound channel) when its session is established, and dropped from it in
@@ -43,9 +51,9 @@ use tokio_util::sync::CancellationToken;
 use ww_platform::process::{ProcessInfo, ProcessInspector};
 use ww_platform::{Env, IdSource};
 use ww_protocol::{
-    BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, ErrorBody, HelloParams, HelloResult, Id,
-    Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError, SubscribeParams,
-    SubscribeResult, ToolCallParams, ToolOutput, ToolsListParams, ToolsListResult,
+    BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, DrainParams, DrainResult, ErrorBody, HelloParams,
+    HelloResult, Id, Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError,
+    SubscribeParams, SubscribeResult, ToolCallParams, ToolOutput, ToolsListParams, ToolsListResult,
     UnsubscribeParams, UnsubscribeResult, WorkspaceInfo, codes, incompatible_refusal,
     is_valid_topic, method, negotiate, peek_protocol, rpc_code, schema_hash, shared_capabilities,
 };
@@ -53,6 +61,7 @@ use ww_protocol::{
 use crate::config::CoreConfig;
 use crate::events::EventBus;
 use crate::identity::{EngineTokens, TrustedDirs, claude_ancestor, resolve_caller};
+use crate::lifecycle::{DrainReason, Lifecycle};
 use crate::server::{ConnCtx, Router};
 use crate::session::Session;
 use crate::tools::Dispatcher;
@@ -72,6 +81,8 @@ pub enum ConnState {
 /// One open connection.
 struct Conn {
     state: ConnState,
+    /// Counted in the lifecycle's connections (until it is refused or closes).
+    counted: bool,
     /// Cancelled once the hello succeeded or was refused, or the connection closed: ends the
     /// hello timeout.
     hello_settled: CancellationToken,
@@ -92,6 +103,8 @@ pub struct RpcRouter {
     dispatcher: Dispatcher,
     /// The dispatcher's bus.
     events: Arc<EventBus>,
+    /// The dispatcher's lifecycle.
+    lifecycle: Arc<Lifecycle>,
 }
 
 impl RpcRouter {
@@ -99,6 +112,7 @@ impl RpcRouter {
     /// to `dispatcher` and whose subscriptions to the dispatcher's event bus.
     pub fn new(cfg: &CoreConfig, pipe: &str, dispatcher: Dispatcher) -> RpcRouter {
         let events = dispatcher.events().clone();
+        let lifecycle = dispatcher.lifecycle().clone();
         RpcRouter {
             env: cfg.env.clone(),
             ids: cfg.ids.clone(),
@@ -115,6 +129,7 @@ impl RpcRouter {
             conns: Mutex::new(HashMap::new()),
             dispatcher,
             events,
+            lifecycle,
         }
     }
 
@@ -136,6 +151,33 @@ impl RpcRouter {
         }
     }
 
+    /// Settles `conn` as refused: it stops counting towards idle and is closed once the core
+    /// drains (ruling P23).
+    fn refuse(&self, conn: &ConnCtx, client_major: u16) {
+        let uncount = match self.conns().get_mut(&conn.conn_id) {
+            Some(c) => {
+                c.state = ConnState::Refused { client_major };
+                c.hello_settled.cancel();
+                std::mem::replace(&mut c.counted, false)
+            }
+            None => false,
+        };
+        if uncount {
+            self.lifecycle.connection_closed();
+        }
+        if self.lifecycle.is_draining() {
+            // Closing now could beat the refusal to the client; the pipe's close ends it.
+            return;
+        }
+        let (draining, close) = (self.lifecycle.drain_token(), conn.close.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = draining.cancelled() => close.cancel(),
+                () = close.cancelled() => {}
+            }
+        });
+    }
+
     async fn route(&self, conn: &ConnCtx, req: Request) -> Option<Response> {
         let id = req.id?;
         let state = self.state(conn.conn_id).unwrap_or(ConnState::AwaitingHello);
@@ -151,6 +193,21 @@ impl RpcRouter {
                 rpc_code::INVALID_REQUEST,
                 "core/hello was already called on this connection",
             ),
+            // The drain direction (ARCH-023, ARCH-014).
+            (ConnState::Refused { client_major }, method::DRAIN) => {
+                if client_major > PROTOCOL.major {
+                    return self.drain(conn, id, req.params).await;
+                }
+                let trace_id = self.ids.id("t");
+                tracing::info!(
+                    conn_id = conn.conn_id,
+                    client_major,
+                    trace_id,
+                    "core/drain refused: an older client does not stop a newer core"
+                );
+                let refusal = incompatible_refusal(PROTOCOL, &trace_id);
+                outcome::<DrainResult>(id, Outcome::Error { error: refusal })
+            }
             (ConnState::Refused { .. }, _) => fault(
                 id,
                 rpc_code::HANDSHAKE_REQUIRED,
@@ -177,6 +234,7 @@ impl RpcRouter {
                     },
                 }
             }
+            (ConnState::Ready(_), method::DRAIN) => return self.drain(conn, id, req.params).await,
             (ConnState::Ready(_), method::SUBSCRIBE) => self.subscribe(conn, id, req.params),
             (ConnState::Ready(_), method::UNSUBSCRIBE) => self.unsubscribe(conn, id, req.params),
             (ConnState::Ready(session), m) if m.starts_with(method::APP_PREFIX) => {
@@ -230,12 +288,7 @@ impl RpcRouter {
                     trace_id,
                     "core/hello refused: another major protocol version"
                 );
-                self.settle(
-                    conn.conn_id,
-                    ConnState::Refused {
-                        client_major: client_version.major,
-                    },
-                );
+                self.refuse(conn, client_version.major);
                 let refusal = incompatible_refusal(PROTOCOL, &trace_id);
                 return outcome::<HelloResult>(id, Outcome::Error { error: refusal });
             }
@@ -349,6 +402,30 @@ impl RpcRouter {
         outcome(id, Outcome::Ok(result))
     }
 
+    /// `core/drain` (ARCH-023): replies `{"status":"ok","draining":true}`, then begins a
+    /// requested drain. The reply is queued before the drain begins, so it is written before
+    /// the connection closes.
+    async fn drain(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Option<Response> {
+        if let Err(error) = parse_params::<DrainParams>(params) {
+            return Some(Response::Error {
+                id: Some(id),
+                error,
+            });
+        }
+        tracing::info!(
+            conn_id = conn.conn_id,
+            client_pid = conn.client_pid,
+            "core/drain"
+        );
+        let reply = outcome(id, Outcome::Ok(DrainResult { draining: true }));
+        let _ = conn
+            .outbound
+            .send(ww_protocol::encode_response(&reply))
+            .await;
+        self.lifecycle.begin_drain(DrainReason::Requested);
+        None
+    }
+
     /// `ww/subscribe` (ARCH-032).
     fn subscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
         let p: SubscribeParams = match parse_params(params).and_then(|p: SubscribeParams| {
@@ -433,10 +510,12 @@ impl RpcRouter {
 impl Router for RpcRouter {
     fn opened(&self, conn: &ConnCtx) {
         let hello_settled = CancellationToken::new();
+        self.lifecycle.connection_opened();
         self.conns().insert(
             conn.conn_id,
             Conn {
                 state: ConnState::AwaitingHello,
+                counted: true,
                 hello_settled: hello_settled.clone(),
             },
         );
@@ -468,12 +547,19 @@ impl Router for RpcRouter {
     }
 
     fn closed(&self, conn: &ConnCtx) {
-        let mut conns = self.conns();
-        if let Some(gone) = conns.remove(&conn.conn_id) {
-            gone.hello_settled.cancel();
+        let counted = {
+            let mut conns = self.conns();
+            let counted = conns.remove(&conn.conn_id).is_some_and(|gone| {
+                gone.hello_settled.cancel();
+                gone.counted
+            });
+            // Under the map lock: see the module docs on events.
+            self.events.drop_client(conn.conn_id);
+            counted
+        };
+        if counted {
+            self.lifecycle.connection_closed();
         }
-        // Under the map lock: see the module docs on events.
-        self.events.drop_client(conn.conn_id);
     }
 }
 

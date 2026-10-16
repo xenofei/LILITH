@@ -15,6 +15,7 @@ pub mod known_folders;
 pub mod pipe;
 pub mod process;
 pub mod process_env;
+pub mod session_end;
 pub mod sid;
 pub mod sockets;
 pub mod volume;

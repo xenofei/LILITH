@@ -21,6 +21,7 @@ use super::registry::schema_2020_12;
 use super::*;
 use crate::config::CoreConfig;
 use crate::events::EventBus;
+use crate::lifecycle::{IDLE_EXIT_AFTER, Lifecycle};
 use crate::session::Session;
 use crate::state::{OnFatal, StateRegistry};
 
@@ -223,7 +224,8 @@ fn fixture_with(hooks: PipelineHooks, log: &Log, extra: &[Arc<dyn Tool>]) -> Fix
     let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
     let clock: Arc<dyn Clock> = FakeClock::new();
     let events = Arc::new(EventBus::new(clock.clone()));
-    let dispatcher = Dispatcher::new(reg, hooks, states, events, ids, clock);
+    let lifecycle = Lifecycle::new(clock.clone(), IDLE_EXIT_AFTER);
+    let dispatcher = Dispatcher::new(reg, hooks, states, events, ids, clock, lifecycle);
     Fixture {
         env,
         log,
@@ -627,6 +629,7 @@ fn registry_and_dispatcher_live_in_the_tools_module() {
         Arc<EventBus>,
         Arc<dyn IdSource>,
         Arc<dyn Clock>,
+        Arc<Lifecycle>,
     ) -> crate::tools::Dispatcher;
     let _: NewDispatcher = crate::tools::Dispatcher::new;
     assert!(std::any::type_name::<Registry>().starts_with("ww_core::tools::"));
@@ -669,6 +672,7 @@ async fn test_tools_exist_only_on_test_channels() {
         Arc::new(EventBus::new(FakeClock::new())),
         Arc::new(SeqIds::new()),
         FakeClock::new(),
+        Lifecycle::new(FakeClock::new(), IDLE_EXIT_AFTER),
     );
     let out = dispatcher
         .call(cli(), params("test.echo", json!({"text": "x"}), None))

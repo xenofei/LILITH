@@ -117,5 +117,6 @@ async fn silent_connection_is_closed_after_hello_timeout() {
     assert_ne!(list["error"]["code"], -32001, "{list}");
 
     core.request_drain();
-    core.wait().await.expect("the core stops");
+    let report = core.wait().await;
+    assert_eq!(report.reason, ww_core::DrainReason::Requested);
 }

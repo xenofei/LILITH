@@ -3,8 +3,6 @@
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
 tests = [
-    { name = "ww-spec-tests::core_session::drain_is_the_only_call_after_incompatible_hello", rule = "ARCH-023", file = "tests/core_session.rs" },
-    { name = "ww-spec-tests::core_session::older_client_cannot_drain_newer_core", rule = "ARCH-023", file = "tests/core_session.rs" },
     { name = "ww-spec-tests::cli_basics::status_starts_core_and_reports_it", rule = "ARCH-016", file = "tests/cli_basics.rs" },
     { name = "ww-spec-tests::cli_basics::status_no_start_reports_not_running", rule = "ARCH-018", file = "tests/cli_basics.rs" },
     { name = "ww-spec-tests::cli_basics::no_start_call_is_a_silent_noop", rule = "ARCH-018", file = "tests/cli_basics.rs" },

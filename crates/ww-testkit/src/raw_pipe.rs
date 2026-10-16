@@ -146,6 +146,20 @@ impl RawPipe {
         self.try_read_line(within).ok().flatten()
     }
 
+    /// True once the core has closed the connection (lines it still sent are skipped); false
+    /// if it is still open after `within`, a failure deadline.
+    pub fn wait_closed(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.try_read_line(left) {
+                Ok(Some(_)) => {}
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
+        }
+    }
+
     /// `Ok(None)` on timeout (the bytes read so far are kept for the next call), `Err` with
     /// `UnexpectedEof` once the connection is closed and nothing is left.
     fn try_read_line(&mut self, within: Duration) -> io::Result<Option<String>> {

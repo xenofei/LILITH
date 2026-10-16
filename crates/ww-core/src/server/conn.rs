@@ -8,9 +8,11 @@
 //! - A line that is not a request gets its protocol fault. An over-long line gets -32002 with
 //!   id `null`, and the connection then closes. Notifications are ignored; a partial line at
 //!   end-of-stream is dropped.
-//! - Cancelling `ConnCtx::close` ends the connection.
+//! - Cancelling `ConnCtx::close` ends the connection. Lines already queued by then (the reply
+//!   to `core/drain` among them) are still written for up to `FLUSH_GRACE`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use codec::Frame;
 use futures_util::StreamExt as _;
@@ -22,6 +24,9 @@ use tokio_util::sync::CancellationToken;
 use ww_protocol::{Response, RpcError, encode_response, parse_request, rpc_code};
 
 use super::{ConnCtx, OUTBOUND_CAPACITY, Router};
+
+/// How long a closed connection may still spend writing the lines queued before it closed.
+const FLUSH_GRACE: Duration = Duration::from_secs(1);
 
 /// Serves one connected pipe instance until the client leaves, an over-long line arrives or
 /// `close` is cancelled.
@@ -118,30 +123,36 @@ async fn send(ctx: &ConnCtx, response: &Response) {
     let _ = ctx.outbound.send(encode_response(response)).await;
 }
 
-/// Writes each queued line with its `\n`. Stops at once when `close` is cancelled, and once
-/// the queue is empty after `finish` is cancelled.
+/// Writes each queued line with its `\n`. Stops once the queue is empty after `close` or
+/// `finish` is cancelled. After `close`, what is still queued may take at most `FLUSH_GRACE`
+/// to write, so a client that does not read cannot hold the connection open.
 async fn write_lines(
     mut write: WriteHalf<NamedPipeServer>,
     mut queue: mpsc::Receiver<String>,
     close: CancellationToken,
     finish: CancellationToken,
 ) {
+    let out_of_grace = async {
+        close.cancelled().await;
+        tokio::time::sleep(FLUSH_GRACE).await;
+    };
+    tokio::pin!(out_of_grace);
     loop {
         let line = tokio::select! {
             biased;
-            () = close.cancelled() => return,
             line = queue.recv() => match line {
                 Some(line) => line,
                 None => return,
             },
             // Reached only while the queue is empty (the branches are polled in order).
+            () = close.cancelled() => return,
             () = finish.cancelled() => return,
         };
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
         let written = tokio::select! {
             biased;
-            () = close.cancelled() => return,
+            () = &mut out_of_grace => return,
             written = write.write_all(&bytes) => written,
         };
         if written.is_err() {

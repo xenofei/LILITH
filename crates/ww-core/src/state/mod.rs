@@ -29,7 +29,8 @@ pub use migrations::{SUITE_MIGRATIONS, WORKSPACE_MIGRATIONS};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -138,13 +139,14 @@ pub struct StateDiagnostics {
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
-/// One `state.db`: a handle to its actor thread. Dropping it stops the actor and closes the
-/// connection.
+/// One `state.db`: a handle to its actor thread. [`StateDb::close`], or dropping it, stops
+/// the actor and closes the connection.
 pub struct StateDb {
     path: PathBuf,
     schema_version: i64,
-    jobs: Option<mpsc::Sender<Job>>,
-    actor: Option<JoinHandle<()>>,
+    /// `None` once closed.
+    jobs: Mutex<Option<mpsc::Sender<Job>>>,
+    actor: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for StateDb {
@@ -200,9 +202,27 @@ impl StateDb {
         Ok(StateDb {
             path: path.to_path_buf(),
             schema_version,
-            jobs: Some(jobs),
-            actor: Some(actor),
+            jobs: Mutex::new(Some(jobs)),
+            actor: Mutex::new(Some(actor)),
         })
+    }
+
+    /// Stops the actor once the jobs already queued have run, and waits for it to close the
+    /// connection (a blocking call). Every later call returns [`StateError::ActorGone`].
+    /// Closing again does nothing.
+    pub fn close(&self) {
+        drop(lock(&self.jobs).take());
+        let actor = lock(&self.actor).take();
+        if let Some(actor) = actor
+            && actor.thread().id() != std::thread::current().id()
+        {
+            let _ = actor.join();
+        }
+    }
+
+    /// Whether [`StateDb::close`] has run.
+    pub fn is_closed(&self) -> bool {
+        lock(&self.jobs).is_none()
     }
 
     /// The database file.
@@ -287,7 +307,7 @@ impl StateDb {
 
     /// Makes the actor panic. Used only by the test-channel tool `test.state_panic` (QA-012).
     pub fn panic_actor(&self) {
-        if let Some(jobs) = &self.jobs {
+        if let Some(jobs) = lock(&self.jobs).as_ref() {
             let _ = jobs.send(Box::new(|_| {
                 panic!("the state actor was asked to panic (test.state_panic)")
             }));
@@ -304,7 +324,7 @@ impl StateDb {
         let job: Job = Box::new(move |conn| {
             let _ = reply.send(f(conn));
         });
-        self.jobs
+        lock(&self.jobs)
             .as_ref()
             .ok_or(StateError::ActorGone)?
             .send(job)
@@ -316,13 +336,13 @@ impl StateDb {
 impl Drop for StateDb {
     /// Stops the actor and waits for it to close the connection.
     fn drop(&mut self) {
-        drop(self.jobs.take());
-        if let Some(actor) = self.actor.take()
-            && actor.thread().id() != std::thread::current().id()
-        {
-            let _ = actor.join();
-        }
+        self.close();
     }
+}
+
+/// Locks `m`; its value (an `Option` taken at most once) stays usable after a panic.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The actor: runs jobs in order until every sender is gone. A panicking job ends it:
@@ -501,6 +521,8 @@ pub struct StateRegistry {
     suite: StateDb,
     /// One cell per workspace id: the map's lock is held only to find the cell.
     workspaces: Mutex<HashMap<String, Arc<OnceCell<Arc<StateDb>>>>>,
+    /// Set by [`StateRegistry::close`]: no database is opened any more.
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for StateRegistry {
@@ -528,7 +550,24 @@ impl StateRegistry {
             on_fatal,
             suite,
             workspaces: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         })
+    }
+
+    /// Closes every database: the suite one and each workspace one opened so far, after the
+    /// jobs already queued on them have run (a blocking call). Later calls on them return
+    /// [`StateError::ActorGone`], and no workspace database is opened any more. The core
+    /// calls it at the end of its shutdown, before it releases its pipe, so a new core that
+    /// claims the pipe never finds this one still writing (ARCH-021).
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.suite.close();
+        let cells: Vec<_> = lock(&self.workspaces).values().cloned().collect();
+        for cell in cells {
+            if let Some(db) = cell.get() {
+                db.close();
+            }
+        }
     }
 
     /// The suite database.
@@ -545,8 +584,12 @@ impl StateRegistry {
     ///
     /// # Errors
     /// As [`StateDb::open`]; [`StateError::Io`] if the workspace's local folder cannot be
-    /// worked out or the blocking open did not finish.
+    /// worked out or the blocking open did not finish; [`StateError::ActorGone`] once the
+    /// registry is closed.
     pub async fn for_workspace(&self, ws: &WorkspaceRef) -> Result<Arc<StateDb>, StateError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(StateError::ActorGone);
+        }
         let cell = self
             .workspaces
             .lock()
@@ -577,6 +620,12 @@ impl StateRegistry {
                 }
             })
             .await?;
+        // A database opened while `close` ran: `close` either saw it in its cell or this sees
+        // the flag (both are ordered by `SeqCst`), so none stays open.
+        if self.closed.load(Ordering::SeqCst) {
+            db.close();
+            return Err(StateError::ActorGone);
+        }
         Ok(db.clone())
     }
 }
