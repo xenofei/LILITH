@@ -1,4 +1,5 @@
-//! Asset version numbers (I5): `major.minor.patch`, digits only (`^\d+\.\d+\.\d+$`).
+//! Asset version numbers (I5): `major.minor.patch`, each part `0|[1-9]\d*` (ruling Q7: no
+//! leading zeros, so a version always round-trips as text).
 
 use std::fmt;
 use std::str::FromStr;
@@ -38,9 +39,11 @@ impl Version {
     }
 }
 
-/// One `\d+` part: ASCII digits only (so no sign, space or other script), fitting `u64`.
-fn part(s: &str) -> Option<u64> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+/// One numeric part, `0|[1-9]\d*`: ASCII digits only (no sign, space or other script), no
+/// leading zero, fitting `u64`.
+pub(crate) fn part(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.is_empty() || !b.iter().all(u8::is_ascii_digit) || (b.len() > 1 && b[0] == b'0') {
         return None;
     }
     s.parse().ok()
@@ -133,9 +136,15 @@ mod tests {
             "1.4.x",
             "1.٤.0",
             "99999999999999999999.0.0",
+            // Ruling Q7: no leading zeros.
+            "01.2.3",
+            "1.02.3",
+            "1.2.00",
         ] {
             assert!(bad.parse::<Version>().is_err(), "{bad:?} parsed");
         }
+        assert_eq!("0.10.0".parse::<Version>(), Ok(Version::new(0, 10, 0)));
+        assert_eq!("0.0.0".parse::<Version>(), Ok(Version::new(0, 0, 0)));
         assert_eq!("minor".parse::<Bump>(), Ok(Bump::Minor));
         assert!("Minor".parse::<Bump>().is_err());
     }

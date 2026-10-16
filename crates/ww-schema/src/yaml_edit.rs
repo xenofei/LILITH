@@ -10,17 +10,24 @@
 //!
 //! A missing top-level key is appended at the end of the document (`key: value`, or
 //! `key: [item]` for [`YamlEdit::AppendToList`]); a missing nested key is `Unsupported`.
+//!
+//! A leading UTF-8 byte-order mark is set aside before the text is scanned and written back in
+//! front of the result.
 
 use yaml_rust2::{Yaml, YamlLoader};
+
+use crate::manifest::BOM;
 
 /// One edit. `path` is the chain of mapping keys from the document root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YamlEdit {
     /// Sets the key to the string `value`, written plain when that reads back as the same
-    /// string and double-quoted otherwise. A trailing comment is kept in its column.
+    /// string and double-quoted otherwise. A trailing comment is kept in its column. The
+    /// target may be a string or null; an existing integer, float or boolean is
+    /// `Unsupported` (the edit writes strings only and never retypes a value).
     SetScalar { path: Vec<String>, value: String },
     /// Appends the string `item` to a block or flow list (`[]` included). A key whose value is
-    /// empty (null) becomes `key: [item]`.
+    /// null (empty, `~` or `null`) becomes `key: [item]`.
     AppendToList { path: Vec<String>, item: String },
 }
 
@@ -44,6 +51,14 @@ impl std::fmt::Display for YamlEditError {
 
 /// Applies `edits` in order and returns the new text.
 pub fn apply(text: &str, edits: &[YamlEdit]) -> Result<String, YamlEditError> {
+    match text.strip_prefix(BOM) {
+        Some(body) => apply_body(body, edits).map(|out| format!("{BOM}{out}")),
+        None => apply_body(text, edits),
+    }
+}
+
+/// [`apply`] on text without a byte-order mark.
+fn apply_body(text: &str, edits: &[YamlEdit]) -> Result<String, YamlEditError> {
     let mut doc = parse_doc(text).map_err(|e| match e {
         Parse::Invalid(m) => YamlEditError::Invalid(m),
         Parse::NotMapping(m) => YamlEditError::Unsupported(m),
@@ -69,7 +84,7 @@ pub fn apply(text: &str, edits: &[YamlEdit]) -> Result<String, YamlEditError> {
 }
 
 /// `value` as a YAML scalar: plain when it reads back as the same string, else double-quoted.
-pub fn scalar(value: &str) -> String {
+pub(crate) fn scalar(value: &str) -> String {
     if plain_ok(value) {
         value.to_string()
     } else {
@@ -159,6 +174,12 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
     };
     let key = Yaml::String(last.clone());
     match (edit, h.get_mut(&key)) {
+        (YamlEdit::SetScalar { .. }, Some(Yaml::Integer(_) | Yaml::Real(_) | Yaml::Boolean(_))) => {
+            return Err(unsupported(
+                edit,
+                "the value is a number or a boolean; a scalar edit writes strings only".into(),
+            ));
+        }
         (YamlEdit::SetScalar { .. }, Some(v)) => *v = new,
         (YamlEdit::AppendToList { .. }, Some(Yaml::Array(a))) => a.push(new),
         (YamlEdit::AppendToList { .. }, Some(v @ Yaml::Null)) => *v = Yaml::Array(vec![new]),
@@ -473,6 +494,14 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
         }
         YamlEdit::AppendToList { .. } => {
             if first != '[' {
+                // A plain null becomes a one-item flow list. yaml-rust2 reads only `~` and
+                // `null` as null (`Null` and `NULL` are strings to it).
+                if let Some(vend) = scalar_end(text, hit.value, line.end)
+                    && matches!(&text[hit.value..vend], "~" | "null")
+                {
+                    let list = format!("[{new}]");
+                    return Ok(replace_keeping_comment(text, line, hit.value, vend, &list));
+                }
                 return Err(fail("the value is not a list"));
             }
             append_flow_item(text, hit.value, &new)
@@ -933,6 +962,66 @@ created: 2026-10-12
             )
             .is_err()
         );
+    }
+
+    #[test] // spec: ARCH-076, CORE-019
+    fn yaml_edit_keeps_a_bom_reads_null_lists_and_never_retypes() {
+        // `~` and `null` are null: appending makes a one-item list, keeping the comment.
+        for null in ["~", "null"] {
+            let text = format!("links: {null}    # sources\nname: x\n");
+            let out = apply(&text, &[append(&["links"], "proj:harbor")])
+                .unwrap_or_else(|e| panic!("{null}: {e}"));
+            // The list is longer than the old column allows: one space before the comment.
+            assert_eq!(out, "links: [proj:harbor] # sources\nname: x\n", "{null}");
+        }
+        // yaml-rust2 reads `Null` as a string, so it is not a list to append to.
+        assert!(matches!(
+            apply("links: Null\n", &[append(&["links"], "a")]),
+            Err(YamlEditError::Unsupported(_))
+        ));
+        let out = apply("links: ~\n", &[append(&["links"], "a")]).unwrap();
+        assert_eq!(out, "links: [a]\n");
+        let out = apply("links: null # c\n", &[set(&["links"], "x")]).unwrap();
+        assert_eq!(out, "links: x    # c\n");
+
+        // A number or boolean is never retyped into a string.
+        for text in ["vram_gb: 24\n", "ratio: 0.5\n", "auto: true\n"] {
+            let key = text.split(':').next().unwrap();
+            assert!(
+                matches!(
+                    apply(text, &[set(&[key], "x")]),
+                    Err(YamlEditError::Unsupported(_))
+                ),
+                "{text}"
+            );
+        }
+
+        // A byte-order mark is set aside, and written back.
+        let bom = format!("\u{feff}{PROJECT}");
+        let out = apply(
+            &bom,
+            &[
+                set(&["status"], "paused"),
+                append(&["links"], "proj:harbor"),
+            ],
+        )
+        .unwrap();
+        assert!(out.starts_with("\u{feff}# Project settings"), "{out:?}");
+        assert_eq!(out.matches('\u{feff}').count(), 1);
+        assert_eq!(
+            out.trim_start_matches('\u{feff}'),
+            apply(
+                PROJECT,
+                &[
+                    set(&["status"], "paused"),
+                    append(&["links"], "proj:harbor")
+                ]
+            )
+            .unwrap()
+        );
+        // A BOM in front of the first key still finds it.
+        let out = apply("\u{feff}name: a\n", &[set(&["name"], "b")]).unwrap();
+        assert_eq!(out, "\u{feff}name: b\n");
     }
 
     #[test] // spec: ARCH-076

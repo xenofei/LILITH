@@ -26,7 +26,7 @@ pub mod yaml_edit;
 
 pub use content_hash::{sha256_hex, version_content_hash};
 pub use manifest::{
-    CandidateFile, CandidateRun, ExternalFile, HumanEdit, Input, Manifest, ManifestView,
+    CandidateFile, CandidateRun, EditError, ExternalFile, HumanEdit, Input, Manifest, ManifestView,
     PinnedInput, SchemaWarning, SignedOff, bare_sha256, hash_value, remove_key,
 };
 pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};

@@ -22,15 +22,18 @@ fn config() -> ProptestConfig {
     ProptestConfig::with_cases(cases())
 }
 
-/// Leaves whose JSON text parses back to the same value: integers, and floats that are short
-/// binary fractions (serde_json's default float parser is exact for them).
+/// JSON leaves: null, booleans, any i64 and u64, any finite f64 (normal, subnormal, zero,
+/// both signs; serde_json's `float_roundtrip` makes their shortest text parse back exactly),
+/// and strings.
 fn leaf() -> impl Strategy<Value = Value> {
     prop_oneof![
         Just(Value::Null),
         any::<bool>().prop_map(Value::Bool),
         any::<i64>().prop_map(|n| Value::Number(n.into())),
-        (-1_000_000i32..1_000_000)
-            .prop_map(|n| { Value::Number(Number::from_f64(f64::from(n) / 8.0).expect("finite")) }),
+        any::<u64>().prop_map(|n| Value::Number(n.into())),
+        any::<f64>()
+            .prop_filter_map("finite", Number::from_f64)
+            .prop_map(Value::Number),
         "\\PC{0,12}".prop_map(Value::String),
         "[a-zÜïöé \\n\"\\\\]{0,6}".prop_map(Value::String),
     ]
@@ -115,9 +118,17 @@ proptest! {
                     if !model.contains(&k) {
                         model.push(k.clone());
                     }
-                    m.push(&k, v.clone());
-                    let list = m.get(&k).and_then(Value::as_array).expect("a list");
-                    prop_assert_eq!(list.last(), Some(&v));
+                    let before = m.get(&k).cloned();
+                    let listable = matches!(before, None | Some(Value::Null | Value::Array(_)));
+                    let pushed = m.push(&k, v.clone());
+                    prop_assert_eq!(pushed.is_ok(), listable);
+                    if listable {
+                        let list = m.get(&k).and_then(Value::as_array).expect("a list");
+                        prop_assert_eq!(list.last(), Some(&v));
+                    } else {
+                        // Refused: nothing changed (ruling Q5).
+                        prop_assert_eq!(m.get(&k), before.as_ref());
+                    }
                 }
                 Op::Remove(k) => {
                     let had = model.contains(&k);

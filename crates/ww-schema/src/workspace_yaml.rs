@@ -110,6 +110,7 @@ fn cascade_layer(layer: &Map<String, Value>) -> Map<String, Value> {
 
 /// The document's root mapping as JSON; an empty document is an empty mapping.
 fn root_map(text: &str, file: &str) -> Result<Map<String, Value>, String> {
+    let text = text.strip_prefix(crate::manifest::BOM).unwrap_or(text);
     let docs =
         YamlLoader::load_from_str(text).map_err(|e| format!("{file} is not valid YAML: {e}"))?;
     match docs.first() {
@@ -249,6 +250,11 @@ hardware: {gpu: none}
         assert!(!w.defaults.contains_key("vcs"));
         assert!(!w.defaults.contains_key("pipeline"));
         assert_eq!(w.defaults.len(), 3);
+
+        // A byte-order mark is skipped.
+        let with_bom = read_project_yaml(&format!("\u{feff}{PROJECT}")).unwrap();
+        assert_eq!(with_bom, p);
+        assert_eq!(read_workspace_yaml(&format!("\u{feff}{ws}")).unwrap(), w);
 
         // Empty files read as empty layers; text that isn't a mapping is an error.
         assert_eq!(read_project_yaml("").unwrap(), ProjectYaml::default());

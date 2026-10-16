@@ -134,10 +134,11 @@ impl FromStr for LinkRef {
             && !n.is_empty()
             && n.bytes().all(|b| b.is_ascii_digit())
         {
-            return n
-                .parse()
+            // `0|[1-9]\d*`, like a version part (ruling Q7).
+            return crate::version::part(n)
+                .and_then(|n| u32::try_from(n).ok())
                 .map(LinkRef::Style)
-                .map_err(|_| invalid("the style version is too large"));
+                .ok_or_else(|| invalid("the style version has a leading zero or is too large"));
         }
         if let Some(rest) = s.strip_prefix("proj:") {
             let (target, version) = split_version(rest).map_err(|e| invalid(&e))?;
@@ -224,8 +225,12 @@ impl FromStr for AssetRef {
             return Err(invalid("the asset id is not valid"));
         }
         if let Some(candidate) = after.strip_prefix("candidate/") {
+            // `#` only ever starts the sealed form's hash, so a candidate ref holds none: it
+            // carries no hash, and a file name containing `#` can't be referenced.
             if fragment.is_some() {
-                return Err(invalid("a candidate ref carries no hash"));
+                return Err(invalid(
+                    "a candidate ref carries no hash, and its file name can't contain `#`",
+                ));
             }
             let Some((run, file)) = candidate.split_once('/') else {
                 return Err(invalid("a candidate ref names `candidate/<run_id>/<file>`"));
@@ -336,6 +341,8 @@ mod tests {
                 },
             ),
             ("style@2", LinkRef::Style(2)),
+            ("style@0", LinkRef::Style(0)),
+            ("style@10", LinkRef::Style(10)),
             // An asset called `style` is a plain local ref: its version has three parts.
             (
                 "style@1.0.0",
@@ -451,6 +458,11 @@ mod tests {
                 .to_string(),
             "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/con.png"
                 .to_string(),
+            // `#` is refused in candidate file names (it only starts the sealed hash).
+            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/a#b.png"
+                .to_string(),
+            // Ruling Q7: no leading zeros.
+            "ww://0123456789abcdef/sketchbook/chr_paper_crane@01.0.0".to_string(),
         ];
         for text in &bad_asset_refs {
             assert!(text.parse::<AssetRef>().is_err(), "{text} parsed");
@@ -470,6 +482,10 @@ mod tests {
             "",
             "@1.0.0",
             "chr@1.0.0@1.0.0",
+            "style@02",
+            "style@00",
+            "chr@1.00.0",
+            "style@99999999999",
         ] {
             assert!(text.parse::<LinkRef>().is_err(), "{text} parsed");
         }

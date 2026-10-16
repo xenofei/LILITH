@@ -27,12 +27,39 @@ pub struct SchemaWarning {
     pub message: String,
 }
 
-/// A manifest: the ordered map and the line ending of its text.
+/// A manifest: the ordered map, the line ending of its text, and whether the text started
+/// with a UTF-8 byte-order mark (kept on output).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     map: Map<String, Value>,
     eol: &'static str,
+    bom: bool,
 }
+
+/// Why [`Manifest::push`] refused an edit. Nothing was changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// The key holds a value that is neither a list nor `null`.
+    NotAList { key: String },
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::NotAList { key } => {
+                write!(
+                    f,
+                    "`{key}` holds a value that is not a list; nothing was changed"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+/// The UTF-8 byte-order mark.
+pub(crate) const BOM: char = '\u{feff}';
 
 /// The typed read of a manifest.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -151,14 +178,23 @@ pub fn remove_key(map: &mut Map<String, Value>, key: &str) -> Option<Value> {
 impl Manifest {
     /// Parses a manifest. Only text that isn't a JSON object is an error; schema violations
     /// are returned as warnings.
+    ///
+    /// A leading UTF-8 byte-order mark is skipped and written back by `to_text`. A key that
+    /// appears twice in one object is a warning: the map keeps the first position and the last
+    /// value (serde_json's behaviour), so `to_text` writes it once.
     pub fn parse(text: &str) -> Result<(Manifest, Vec<SchemaWarning>), serde_json::Error> {
+        let (bom, text) = match text.strip_prefix(BOM) {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
         let map: Map<String, Value> = serde_json::from_str(text)?;
         let eol = match text.find('\n') {
             Some(i) if text[..i].ends_with('\r') => "\r\n",
             _ => "\n",
         };
-        let manifest = Manifest { map, eol };
-        let (_, warnings) = read_view(&manifest.map);
+        let manifest = Manifest { map, eol, bom };
+        let mut warnings = duplicate_keys(text);
+        warnings.extend(read_view(&manifest.map).1);
         Ok((manifest, warnings))
     }
 
@@ -182,17 +218,25 @@ impl Manifest {
         put("human_edits", Value::Array(Vec::new()));
         put("locks", Value::Array(Vec::new()));
         put("hashes", Value::Object(Map::new()));
-        Manifest { map, eol: "\n" }
+        Manifest {
+            map,
+            eol: "\n",
+            bom: false,
+        }
     }
 
     /// `serde_json` pretty (2 spaces) and a final line break, with the line ending `parse`
-    /// saw: `\r\n` when the text's first line break is CRLF, else `\n`.
+    /// saw: `\r\n` when the text's first line break is CRLF, else `\n`. A byte-order mark the
+    /// text started with is written back.
     pub fn to_text(&self) -> String {
         // Line breaks inside strings are escaped (`\n`), so every raw '\n' is a line end.
         let mut text = serde_json::to_string_pretty(&self.map).expect("a JSON map serialises");
         text.push('\n');
         if self.eol == "\r\n" {
             text = text.replace('\n', "\r\n");
+        }
+        if self.bom {
+            text.insert(0, BOM);
         }
         text
     }
@@ -230,22 +274,127 @@ impl Manifest {
         }
     }
 
-    /// Appends `value` to the list `list_key`, creating the list at the end when it is
-    /// missing. A `null` or non-list value is replaced in place by a one-item list.
-    pub fn push(&mut self, list_key: &str, value: Value) {
+    /// Appends `value` to the list `list_key`. A missing key gets a one-item list at the end, a
+    /// `null` value becomes a one-item list in place (ruling Q5). Any other value is
+    /// [`EditError::NotAList`], and nothing changes.
+    pub fn push(&mut self, list_key: &str, value: Value) -> Result<(), EditError> {
         match self.map.get_mut(list_key) {
             Some(Value::Array(list)) => list.push(value),
-            Some(other) => *other = Value::Array(vec![value]),
+            Some(null @ Value::Null) => *null = Value::Array(vec![value]),
+            Some(_) => {
+                return Err(EditError::NotAList {
+                    key: list_key.to_string(),
+                });
+            }
             None => {
                 self.map
                     .insert(list_key.to_string(), Value::Array(vec![value]));
             }
         }
+        Ok(())
     }
 
     /// Removes `key`; the keys after it keep their order.
     pub fn remove(&mut self, key: &str) -> Option<Value> {
         self.map.shift_remove(key)
+    }
+}
+
+/// A warning for every key that appears more than once in one object of `text`, which
+/// already parsed. serde_json keeps such a key once, at its first position, with the last
+/// value; this second pass over the text is the only way to notice.
+fn duplicate_keys(text: &str) -> Vec<SchemaWarning> {
+    let mut found = Vec::new();
+    let mut de = serde_json::Deserializer::from_str(text);
+    let walk = Walk {
+        at: String::new(),
+        found: &mut found,
+    };
+    // The text already parsed as a JSON object, so the walk can't fail.
+    let _ = serde::de::DeserializeSeed::deserialize(walk, &mut de);
+    found
+        .into_iter()
+        .map(|pointer| SchemaWarning {
+            pointer,
+            message: "duplicate key: kept once, at its first position, with the last value".into(),
+        })
+        .collect()
+}
+
+/// Walks a JSON value, recording the pointers of repeated object keys.
+struct Walk<'a> {
+    at: String,
+    found: &'a mut Vec<String>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Walk<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Walk<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let Walk { at, found } = self;
+        let mut i = 0usize;
+        while seq
+            .next_element_seed(Walk {
+                at: format!("{at}/{i}"),
+                found: &mut *found,
+            })?
+            .is_some()
+        {
+            i += 1;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let Walk { at, found } = self;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let pointer = format!("{at}/{}", esc(&key));
+            if !seen.insert(key) {
+                found.push(pointer.clone());
+            }
+            map.next_value_seed(Walk {
+                at: pointer,
+                found: &mut *found,
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -777,7 +926,8 @@ mod tests {
         // Wrong types are warnings and defaults, never errors.
         let mut odd = m2.clone();
         odd.set("status", json!("sideways"));
-        odd.set("version", json!("1.0"));
+        // Ruling Q7: a leading zero is a bad version, read as a warning.
+        odd.set("version", json!("01.0.0"));
         odd.set("approved_version", json!(3));
         odd.set("locks", json!("not a list"));
         odd.set("has_working_doc", json!("yes"));
@@ -827,6 +977,69 @@ mod tests {
         // Not a JSON object at all is the only parse error.
         assert!(Manifest::parse("[1, 2]").is_err());
         assert!(Manifest::parse("{\"a\": ").is_err());
+    }
+
+    #[test] // spec: ARCH-076, CORE-148
+    fn push_refuses_a_value_that_is_not_a_list() {
+        let (mut m, _) = Manifest::parse(LAMP).unwrap();
+        let before = m.clone();
+        // `notes` is a string, `legacy_tool` an object, `budget_usd` a number.
+        for key in ["notes", "legacy_tool", "budget_usd", "commercial_use"] {
+            assert_eq!(
+                m.push(key, json!("x")),
+                Err(EditError::NotAList { key: key.into() })
+            );
+        }
+        assert_eq!(m, before, "a refused push changes nothing");
+        // `null` becomes a one-item list in place; a missing key goes at the end.
+        let at = m
+            .as_map()
+            .keys()
+            .position(|k| k == "status_reason")
+            .unwrap();
+        m.push("status_reason", json!("why")).unwrap();
+        assert_eq!(m.get("status_reason"), Some(&json!(["why"])));
+        assert_eq!(
+            m.as_map().keys().position(|k| k == "status_reason"),
+            Some(at)
+        );
+        m.push("locks", json!("a")).unwrap();
+        m.push("locks", json!("b")).unwrap();
+        assert_eq!(m.get("locks"), Some(&json!(["a", "b"])));
+        assert_eq!(
+            m.as_map().keys().next_back().map(String::as_str),
+            Some("locks")
+        );
+    }
+
+    #[test] // spec: ARCH-076, CORE-148
+    fn bom_is_kept_and_duplicate_keys_warn() {
+        let with_bom = format!("\u{feff}{CRANE}");
+        let (mut m, warnings) = Manifest::parse(&with_bom).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(m.to_text(), with_bom);
+        assert_eq!(m.view().asset_id, "chr_paper_crane");
+        m.set("status", json!("in_review"));
+        assert!(m.to_text().starts_with("\u{feff}{\n"));
+        let crlf = with_bom.replace('\n', "\r\n");
+        let (m, _) = Manifest::parse(&crlf).unwrap();
+        assert_eq!(m.eol(), "\r\n");
+        assert_eq!(m.to_text(), crlf);
+
+        let dup =
+            "{\"a\": 1, \"b\": {\"x\": 1, \"x\": 2}, \"a\": 3, \"c\": [{\"k/y\": 1, \"k/y\": 2}]}";
+        let (m, warnings) = Manifest::parse(dup).unwrap();
+        let pointers: Vec<&str> = warnings
+            .iter()
+            .filter(|w| w.message.starts_with("duplicate key"))
+            .map(|w| w.pointer.as_str())
+            .collect();
+        assert_eq!(pointers, ["/b/x", "/a", "/c/0/k~1y"]);
+        // Kept once, at the first position, with the last value.
+        assert_eq!(
+            serde_json::to_string(m.as_map()).unwrap(),
+            "{\"a\":3,\"b\":{\"x\":2},\"c\":[{\"k/y\":2}]}"
+        );
     }
 
     #[test] // spec: CORE-047, CORE-048

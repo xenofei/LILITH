@@ -107,8 +107,9 @@ fn unknown_and_retired_fields_survive_edits() {
     m.push(
         "candidate_runs",
         json!({"run_id": "r_20261005_0800", "status": "open"}),
-    );
-    m.push("locks", json!("prompts/signal_lamp.txt"));
+    )
+    .unwrap();
+    m.push("locks", json!("prompts/signal_lamp.txt")).unwrap();
     m.set("updated", json!("2026-10-05T08:00:00Z"));
 
     let after = keys(&m);
@@ -181,7 +182,8 @@ fn legacy_manifest_reads_with_warnings_not_errors() {
 fn edits_never_add_schema_version_to_a_legacy_manifest() {
     let (mut m, _) = Manifest::parse(&read("prop_signal_lamp")).unwrap();
     m.set("status", json!("in_review"));
-    m.push("locks", json!("v1.0.0/prop_signal_lamp.png"));
+    m.push("locks", json!("v1.0.0/prop_signal_lamp.png"))
+        .unwrap();
     m.remove("status_reason");
     let out = m.to_text();
     assert!(!out.contains("schema_version"), "{out}");
@@ -272,4 +274,76 @@ fn removing_a_key_keeps_the_order_of_the_rest() {
     run_keys.remove(at);
     assert_eq!(run.keys().cloned().collect::<Vec<_>>(), run_keys);
     assert_eq!(remove_key(run, "created"), None);
+}
+
+#[test] // spec: ARCH-076, QA-048
+fn seventeen_digit_floats_round_trip_byte_for_byte() {
+    // Shortest-form f64 texts that need 17 significant digits, and the extremes; without
+    // serde_json's `float_roundtrip` some of them came back one digit shorter.
+    for f in [
+        "0.47960756426982587",
+        "-2.323068369499641e-11",
+        "1.7976931348623157e+308",
+        "5e-324",
+        "2.2250738585072014e-308",
+        "0.30000000000000004",
+        "123456.78901234567",
+    ] {
+        let text = format!("{{\n  \"budget_usd\": {f},\n  \"n\": [\n    {f}\n  ]\n}}\n");
+        let (m, _) = Manifest::parse(&text).unwrap();
+        assert_eq!(m.to_text(), text, "{f}");
+    }
+}
+
+/// Lowercase hex SHA-256 of a fixture file.
+fn sha256_of(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    ww_schema::sha256_hex(&bytes)
+}
+
+#[test] // spec: ARCH-077, ARCH-078, QA-048
+fn fixture_hashes_match_the_bytes_on_disk() {
+    let assets = fixtures().join("sample-workspace/projects/sketchbook/assets");
+    let mut checked = 0;
+    for asset in ASSETS {
+        let folder = assets.join(asset);
+        let (m, _) = Manifest::parse(&read(asset)).unwrap();
+        let view = m.view();
+        assert!(!view.hashes.is_empty(), "{asset}");
+        for (rel, hex) in &view.hashes {
+            assert_eq!(&sha256_of(&folder.join(rel)), hex, "{asset}: hashes {rel}");
+            checked += 1;
+        }
+        for run in &view.candidate_runs {
+            for file in &run.files {
+                let Some(hex) = &file.sha256 else { continue };
+                let on_disk = folder.join(&file.path);
+                let name = file.path.rsplit('/').next().unwrap();
+                if run.status.as_deref() == Some("open") {
+                    // An open run's files are all expected on disk.
+                    assert_eq!(&sha256_of(&on_disk), hex, "{asset}: {}", file.path);
+                } else if run.selected.iter().any(|s| s == name) {
+                    // A chosen file was moved into the sealed version.
+                    let version = run.signed_off.as_ref().unwrap().version;
+                    let sealed = folder.join(format!("v{version}")).join(name);
+                    assert!(!on_disk.exists(), "{}", file.path);
+                    assert_eq!(&sha256_of(&sealed), hex, "{asset}: {}", file.path);
+                } else {
+                    assert_eq!(&sha256_of(&on_disk), hex, "{asset}: {}", file.path);
+                }
+                checked += 1;
+            }
+        }
+    }
+    // The sealed snapshot records the same hashes.
+    let (snap, _) = Manifest::parse(
+        &std::fs::read_to_string(assets.join("chr_paper_crane/v1.0.0/manifest.snapshot.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    for (rel, hex) in &snap.view().hashes {
+        assert_eq!(&sha256_of(&assets.join("chr_paper_crane").join(rel)), hex);
+    }
+    // 5 legacy hashes; 1 sealed hash and 4 run files of chr_paper_crane.
+    assert_eq!(checked, 10, "every recorded hash was checked");
 }
