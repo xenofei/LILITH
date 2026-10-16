@@ -658,6 +658,71 @@ pub fn reparse_tag(path: &Path) -> io::Result<Option<u32>> {
     Ok((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0).then_some(info.ReparseTag))
 }
 
+/// `FSCTL_SET_REPARSE_POINT` (winioctl.h; the `windows` crate has it under
+/// `Win32_System_Ioctl`, a feature `ww-platform` does not otherwise need).
+const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+/// `IO_REPARSE_TAG_MOUNT_POINT`, the tag of a junction.
+pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+/// Creates the folder `link` as a junction (a mount-point reparse point) to the existing folder
+/// `target`. Unlike a symbolic link it needs no privilege. Test support for the store's link
+/// checks; the suite itself never creates links.
+pub fn create_junction(link: &Path, target: &Path) -> io::Result<()> {
+    let target = strip_verbatim(&std::path::absolute(target)?);
+    let print: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let substitute: Vec<u16> = r"\??\"
+        .encode_utf16()
+        .chain(print.iter().copied())
+        .collect();
+    let bytes = |units: &[u16]| {
+        u16::try_from(units.len() * 2)
+            .map_err(|_| io::Error::other("the junction target is too long"))
+    };
+    let (sub_len, print_len) = (bytes(&substitute)?, bytes(&print)?);
+    // MountPointReparseBuffer: four u16 offsets/lengths, then both names, each NUL-terminated.
+    let path_bytes = usize::from(sub_len) + 2 + usize::from(print_len) + 2;
+    let data_len = u16::try_from(8 + path_bytes)
+        .map_err(|_| io::Error::other("the junction target is too long"))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(8 + usize::from(data_len));
+    buf.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&sub_len.to_le_bytes());
+    buf.extend_from_slice(&(sub_len + 2).to_le_bytes());
+    buf.extend_from_slice(&print_len.to_le_bytes());
+    for unit in substitute.iter().chain(&[0]).chain(&print).chain(&[0]) {
+        buf.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::create_dir(long_path(link))?;
+    let made = (|| {
+        let dir = OpenOptions::new()
+            .write(true)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(long_path(link))?;
+        let mut returned = 0u32;
+        // SAFETY: `buf` is a valid REPARSE_DATA_BUFFER of the length passed; the handle is open
+        // while `dir` lives and the call is synchronous.
+        unsafe {
+            windows::Win32::System::IO::DeviceIoControl(
+                handle(&dir),
+                FSCTL_SET_REPARSE_POINT,
+                Some(buf.as_ptr().cast()),
+                u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|e| io_error(&e))
+    })();
+    if made.is_err() {
+        let _ = std::fs::remove_dir(long_path(link));
+    }
+    made
+}
+
 /// `IsReparseTagNameSurrogate`: the tag names another file or folder (a symbolic link, a
 /// junction or mount point), as opposed to one that only changes how the data is stored (a
 /// cloud file, a deduplicated file).
@@ -1009,6 +1074,29 @@ mod tests {
             .delete()
             .expect("a read-only file is deleted too");
         assert!(!path.exists());
+    }
+
+    #[test] // spec: ARCH-074
+    fn a_junction_is_a_name_surrogate_reparse_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside.txt"), b"x").unwrap();
+        let link = dir.path().join("link");
+        create_junction(&link, &target).unwrap();
+        let tag = reparse_tag(&link).unwrap();
+        assert_eq!(tag, Some(IO_REPARSE_TAG_MOUNT_POINT));
+        assert!(is_name_surrogate(tag.unwrap()));
+        assert_eq!(
+            std::fs::read(link.join("inside.txt")).unwrap(),
+            b"x",
+            "it resolves"
+        );
+        std::fs::remove_dir(&link).unwrap();
+        assert!(
+            target.join("inside.txt").exists(),
+            "removing the junction keeps the target"
+        );
     }
 
     #[test] // spec: ARCH-074

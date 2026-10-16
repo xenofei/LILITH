@@ -489,6 +489,7 @@ enum Seen<T> {
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 
 /// The `store.path_invalid` of a link at `rel`.
 fn link_refused(rel: &WsPath) -> StoreError {
@@ -1416,6 +1417,16 @@ impl Store {
         };
         if !want.accepts(seen.as_ref()) {
             return Err(StoreError::conflict(rel));
+        }
+        if seen.is_some() && self.identity(rel).await?.attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            // ReplaceFileW refuses a read-only target and the two-rename fallback would put a
+            // writable file in its place, so neither path writes it.
+            return Err(StoreError::Io {
+                path: rel.as_str().to_string(),
+                why: "it is read-only, so the suite doesn't write it; clear its read-only \
+                      attribute first"
+                    .to_string(),
+            });
         }
         let new_sha = sha256_hex(&bytes);
         if seen.as_ref().is_some_and(|h| h.sha256 == new_sha) {

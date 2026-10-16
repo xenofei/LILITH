@@ -40,6 +40,7 @@ disallowed-methods = [
     { path = "ww_platform::fs::open_shared", reason = "ARCH-112: file handles that block writers stay out of ww-core outside the store" },
     { path = "ww_platform::fs::flush", reason = "ARCH-112: file writes go through ww_core::store (fsops::write_temp)" },
     { path = "ww_platform::fs::open_exclusive", reason = "ARCH-112: exclusive handles and their deletes go through ww_core::store (fsops::remove_if)" },
+    { path = "ww_platform::fs::create_junction", reason = "ARCH-112: the suite never creates links; test support only" },
     { path = "ww_platform::fs::ExclusiveFile::delete", reason = "ARCH-112: file deletes go through ww_core::store (fsops::remove_if)" },
     # Manifests keep key order (ARCH-076, CORE-148): under `preserve_order`, Map::remove is
     # swap_remove and moves the last key into the removed slot. Use `shift_remove`.

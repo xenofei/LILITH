@@ -71,20 +71,12 @@ impl fmt::Display for WsPath {
     }
 }
 
-/// The case-folded key of a workspace-relative path: every character that has a one-character
-/// uppercase form is replaced by it, as the NTFS upcase table compares names (so `ä` and `Ä`
-/// fold together, and `ß`, whose uppercase is two characters, stays). The path locks and the
-/// `generated` and `generated_pending` rows use this one folding.
+/// The case-folded key of a workspace-relative path: `ww_platform::paths::upcase_name`, the
+/// system uppercase table Windows compares file names by (one UTF-16 unit to one unit), so two
+/// spellings share a key exactly when they name one file (`ᾳ`/`ᾼ` do, `ς`/`σ` don't). The path
+/// locks and the `generated` and `generated_pending` rows use this one folding.
 pub fn path_key(rel: &str) -> String {
-    rel.chars()
-        .map(|c| {
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(u), None) => u,
-                _ => c,
-            }
-        })
-        .collect()
+    ww_platform::paths::upcase_name(rel)
 }
 
 /// `v<major.minor.patch>`, the name of a sealed version folder (the `v` in either case, since
@@ -150,9 +142,14 @@ mod tests {
         assert_eq!(path_key("notes/Ärger.txt"), path_key("NOTES/ärger.TXT"));
         assert_eq!(path_key("a/b"), "A/B");
         assert_eq!(
-            path_key("straße"),
-            "STRAßE",
-            "ß has no one-character uppercase"
+            path_key("\u{1fb3}"),
+            path_key("\u{1fbc}"),
+            "one name on NTFS"
+        );
+        assert_ne!(
+            path_key("\u{3c2}"),
+            path_key("\u{3c3}"),
+            "two names on NTFS"
         );
         assert_ne!(path_key("a.txt"), path_key("b.txt"));
         let p = WsPath::parse("Notes/Ä.txt").unwrap();

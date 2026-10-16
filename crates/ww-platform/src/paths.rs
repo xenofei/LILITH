@@ -4,8 +4,31 @@
 //!   workspace paths). It is for comparison only and never hashed: the workspace hash keeps its
 //!   own plan-1 ASCII-lowercase normalisation (`env::normalise_for_hash`).
 //! - [`strip_verbatim`] removes the `\\?\` prefix from a path that is shown, keeping its case.
+//! - [`upcase_name`] folds a name the way Windows compares file names without case.
 
 use std::path::{Path, PathBuf};
+
+use windows::Wdk::System::SystemServices::RtlUpcaseUnicodeChar;
+
+/// `name` with every UTF-16 unit replaced by `RtlUpcaseUnicodeChar` of it: the operating
+/// system's uppercase table, one unit to one unit, independent of locale.
+///
+/// This is how Windows compares file names without case. Microsoft Learn ("Handling Sorting
+/// in Your Applications") names NTFS file names as non-linguistic strings to compare with
+/// `CompareStringOrdinal`, whose case-insensitive mode "maps case using the operating system
+/// uppercasing table … independent of locale"; NTFS writes that table to each volume's
+/// `$UpCase` when it is formatted. `LCMapStringEx(LCMAP_UPPERCASE)` is linguistic instead: it
+/// maps both `σ` and `ς` to `Σ` (same page), which NTFS keeps as two names. A volume formatted
+/// by an older Windows can carry an older `$UpCase`; characters added to Unicode since then
+/// may fold differently there.
+pub fn upcase_name(name: &str) -> String {
+    let units: Vec<u16> = name
+        .encode_utf16()
+        // SAFETY: a plain table lookup on a value; it has no pointers and no failure mode.
+        .map(|unit| unsafe { RtlUpcaseUnicodeChar(unit) })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
 
 /// A folder's spelling for comparison:
 /// - canonical when it exists (short names, junctions and `subst` drives resolved);
@@ -50,6 +73,24 @@ mod tests {
 
     use super::*;
     use crate::process::run_hidden;
+
+    #[test] // spec: CORE-040
+    fn upcase_name_follows_the_system_table() {
+        assert_eq!(upcase_name("notes/a.txt"), "NOTES/A.TXT");
+        assert_eq!(upcase_name("Ärger"), upcase_name("äRGER"));
+        // One name on NTFS: U+1FB3 and U+1FBC.
+        assert_eq!(upcase_name("\u{1FB3}"), upcase_name("\u{1FBC}"));
+        // Two names on NTFS: final and medial sigma.
+        assert_ne!(upcase_name("\u{03C2}"), upcase_name("\u{03C3}"));
+        // One unit to one unit: lengths never change.
+        for s in ["straße", "İı", "😀x"] {
+            assert_eq!(
+                upcase_name(s).encode_utf16().count(),
+                s.encode_utf16().count(),
+                "{s}"
+            );
+        }
+    }
 
     #[test] // spec: ARCH-027, ARCH-097
     fn folder_key_strips_prefixes_case_and_trailing_separators() {

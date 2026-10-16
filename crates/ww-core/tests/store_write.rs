@@ -1853,24 +1853,30 @@ fn make_read_only(path: &Path) {
 }
 
 #[tokio::test(start_paused = true)] // spec: ARCH-074
-async fn fallback_over_a_read_only_target_is_not_a_conflict() {
-    let ws = workspace();
-    put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
-    make_read_only(&ws.file("notes/a.txt"));
-    let store = ws.store(Arc::new(
-        FailPoints::parse("store.replace=unsupported").unwrap(),
-    ));
-    store
-        .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
-        .await
-        .expect("the fallback over a read-only target");
-    assert_eq!(ws.read("notes/a.txt"), b"v2");
-    assert_eq!(
-        ws.names("notes"),
-        ["a.txt"],
-        "the old content's backup is gone"
-    );
-    assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+async fn read_only_target_is_refused_on_both_paths() {
+    for spec in ["", "store.replace=unsupported"] {
+        let ws = workspace();
+        put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+        make_read_only(&ws.file("notes/a.txt"));
+        let result = ws
+            .store(Arc::new(FailPoints::parse(spec).unwrap()))
+            .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+            .await;
+        let Err(e @ StoreError::Io { .. }) = &result else {
+            panic!("{spec:?}: a read-only target is store.io, got {result:?}");
+        };
+        assert!(e.to_string().contains("read-only"), "{spec:?}: {e}");
+        assert_eq!(ws.read("notes/a.txt"), b"v1", "{spec:?}");
+        assert!(
+            std::fs::metadata(ws.file("notes/a.txt"))
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "{spec:?}: the attribute stays"
+        );
+        assert_eq!(ws.names("notes"), ["a.txt"], "{spec:?}");
+        assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+    }
 }
 
 /// The real probe, except that one path reports `FILE_ATTRIBUTE_REPARSE_POINT` with the tag
@@ -1996,4 +2002,83 @@ async fn put_back_names_every_outside_version_it_sets_aside() {
     assert_eq!(ws.conflicts("notes").len(), 2, "{:?}", ws.names("notes"));
     assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
     assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+}
+
+/// A junction at `link` to the folder `target` (no privilege needed).
+#[allow(clippy::disallowed_methods)]
+fn junction(link: &Path, target: &Path) {
+    ww_platform::fs::create_junction(link, target)
+        .unwrap_or_else(|e| panic!("cannot create a junction at {}: {e}", link.display()));
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074, CORE-040
+async fn a_junction_at_the_target_is_refused_through_the_real_reparse_tag() {
+    let ws = workspace();
+    let outside = ws.root.parent().unwrap().join("outside-folder");
+    write_file(&outside.join("inside.txt"), b"outside");
+    write_file(&ws.file("notes/keep.txt"), b"x");
+    junction(&ws.file("notes/link"), &outside);
+    let store = ws.plain();
+    let rel = p("notes/link");
+    let write = store.write(&rel, b"core".to_vec(), Expect::New).await;
+    let generated = store.write(&rel, b"core".to_vec(), Expect::Generated).await;
+    let read = store.read(&rel).await.map(drop);
+    let edit = store
+        .edit_text(&rel, &|t| Ok(format!("{t}!")))
+        .await
+        .map(drop);
+    for (what, result) in [
+        ("write", write.map(drop)),
+        ("generated write", generated.map(drop)),
+        ("read", read),
+        ("edit", edit),
+    ] {
+        let Err(e @ StoreError::PathInvalid { .. }) = &result else {
+            panic!("{what}: a junction is store.path_invalid, got {result:?}");
+        };
+        assert!(e.to_string().contains("link or junction"), "{what}: {e}");
+    }
+    assert_eq!(
+        std::fs::read(outside.join("inside.txt")).unwrap(),
+        b"outside"
+    );
+    assert_eq!(
+        ww_platform::fs::reparse_tag(&ws.file("notes/link")).unwrap(),
+        Some(ww_platform::fs::IO_REPARSE_TAG_MOUNT_POINT),
+        "the junction is still there"
+    );
+    assert_eq!(ws.names("notes"), ["keep.txt", "link"]);
+}
+
+/// Whether the volume holding `dir` treats the names `a` and `b` as one file.
+fn volume_says_same(dir: &Path, a: &str, b: &str) -> bool {
+    write_file(&dir.join(format!("probe-{a}")), b"x");
+    dir.join(format!("probe-{b}")).exists()
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-040, ARCH-074
+async fn path_keys_agree_with_the_volume() {
+    let env = TestEnv::new();
+    let cases = [
+        ("a", "A"),
+        ("\u{e4}", "\u{c4}"),     // ä Ä
+        ("\u{1fb3}", "\u{1fbc}"), // ᾳ ᾼ: one name on NTFS
+        ("\u{3c2}", "\u{3c3}"),   // ς σ: two names
+        ("\u{131}", "I"),         // ı I
+        ("\u{17f}", "S"),         // ſ S
+        ("\u{b5}", "\u{39c}"),    // µ Μ
+        ("\u{1c5}", "\u{1c4}"),   // ǅ Ǆ
+        ("\u{10d0}", "\u{1c90}"), // Georgian
+        ("\u{ab70}", "\u{13a0}"), // Cherokee
+    ];
+    for (i, (a, b)) in cases.iter().enumerate() {
+        let dir = env.root().join(format!("case-{i}"));
+        let same = volume_says_same(&dir, a, b);
+        assert_eq!(
+            ww_core::store::path_key(&format!("notes/{a}.txt"))
+                == ww_core::store::path_key(&format!("NOTES/{b}.TXT")),
+            same,
+            "{a:?} / {b:?}: the volume says same={same}"
+        );
+    }
 }
