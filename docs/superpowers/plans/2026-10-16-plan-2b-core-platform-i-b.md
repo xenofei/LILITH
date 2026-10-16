@@ -76,8 +76,8 @@ Decisions made in this plan (each stands unless the owner says otherwise; owner 
   - Even where they are stable, file IDs only detect changes in place; they never identify a file across folders. ReFS (Dev Drive) builds its 128-bit ID from the parent folder and the file within it (MS-FSCC), so a move to another folder changes it. The store reports each file's identity after every write and move, and the index takes that identity as is.
   - A volume whose facts can't be read (FAT or exFAT USB sticks, SMB shares, file systems without the cloud filter) is treated as having no stable IDs. It never fails `workspace.create` or an open; `workspace.create` returns a warning instead.
 - **Hashes are taken only from stable reads.** A file's identity (size, last write, ChangeTime) is taken before and after it is hashed, and the digest counts only when both match. A file that is still being written, or is held without read sharing (errors 32 and 33, common while Photoshop, Krita or Blender save), is parked and re-checked later. It is never reported as removed or as a human edit (ARCH-079 clarification).
-- **Long paths come from the `\\?\` prefix, not from `LongPathsEnabled`.** The opt-in needs a machine-wide registry value as well as a `longPathAware` manifest entry, and the suite changes no system setting. `ww-platform` prefixes absolute paths of 247 characters or more, as Rust's `std::fs` does: std prefixes once the path plus its terminating NUL reaches 248 UTF-16 units (`LEGACY_MAX_PATH`), the `CreateDirectoryW` limit that counts the NUL.
-- **Workspace asset trees get no line-ending conversion.** With `core.autocrlf=true` (Git for Windows' default), a clone or checkout would give text assets CRLF endings, so their SHA-256 would stop matching the manifest on every other machine. `workspace.create` and `ww doctor` therefore write `projects/** -text` to the workspace `.gitattributes` (plan 7 later adds its LFS patterns there, ARCH-086), and `ww doctor` sets `core.autocrlf false` in the repository's own config. Manifest, YAML and `progress.md` edits keep the line ending the file already has (CORE-040 clarification).
+- **Long paths come from the `\\?\` prefix, not from `LongPathsEnabled`.** The opt-in needs a machine-wide registry value as well as a `longPathAware` manifest entry, and the suite changes no system setting. `ww-platform` prefixes absolute paths of 247 UTF-16 code units or more, as Rust's `std::fs` does: std's `LEGACY_MAX_PATH` is 248 including the terminating NUL (the `CreateDirectoryW` limit, which counts the NUL), so a path of 247 or more code units gets the prefix.
+- **Workspace asset trees get no line-ending conversion.** With `core.autocrlf=true` (Git for Windows' default), a clone or checkout would give text assets CRLF endings, so their SHA-256 would stop matching the manifest on every other machine. `workspace.create` and `ww doctor` therefore write `projects/** -text` to the workspace `.gitattributes` (plan 7 later adds its LFS patterns there, ARCH-086), and `ww doctor` reports an inherited `core.autocrlf=true` as a `problem`. It sets `core.autocrlf false` in the repository's own config only after you answer `y` to a prompt: `--non-interactive` never answers yes, and the agent-callable `workspace.doctor` tool never changes it, because it overrides your own git setting and `projects/** -text` already protects the asset trees. Manifest, YAML and `progress.md` edits keep the line ending the file already has (CORE-040 clarification).
 - **The settings request layer comes from tool arguments in 2b.** `ToolCallParams` has no `settings` field, and product tools reject unknown fields, so the per-request layer of CORE-057 is the `settings` argument of a tool that declares one. In 2b only `test.settings` does; product tools pass none. A per-call `settings` field in `tools/call` would be a protocol change that alters `schema_hash`, so it waits for plan 3 and its job tools (Appendix E records this; Not in this plan).
 - **The asset folder name is authoritative.** The index keys an asset by its folder (`projects/<project>/assets/<asset_id>/`) and stores the manifest's `creation_uuid`. A manifest whose `asset_id` or `project` disagrees with its folder (for example a copy made in Explorer) is `needs_repair`, and is never rewritten automatically (CORE-047, ARCH-079 clarification).
 - **Organising metadata lives in workspace files.** Tags, ratings, colour labels and collections, when a later plan adds them, are stored in manifests or tracked YAML, never only in `index.db`, which is disposable (decision recorded in Appendix E; no fields in 2b).
@@ -97,7 +97,7 @@ Each question has the answer this plan uses unless you say otherwise.
 5. **`toml_edit` 0.22.27 now, with `toml` 1.x and `toml_edit` 0.25 moved together in a separate change?** Default: **yes**. 0.22.27 is the version `toml` 0.8.23 already locks, so `suite.toml` is read and edited by one TOML parser and `Cargo.lock` gains no second copy.
 6. **Reserve organising-metadata fields (tags, ratings, colour labels, collections)?** Default: **no fields in 2b**, but Appendix E records that such metadata will live in manifests or tracked YAML, never only in the index. Unknown fields already survive every edit (CORE-148), and `assets.query` takes new filters as new optional keys, so plan 4 can add them without breaking anything 2b writes.
 7. **A `missing` file state (research 5A-2)?** Default: **yes, in 2b**, as an ARCH-079/CORE-038 clarification with no new rule ID: a recorded candidate, sealed or manifest file that disappears outside the suite is listed as `missing`, never forgotten, and recovers when the same content reappears.
-8. **Line endings in workspaces:** add `projects/** -text` to the workspace `.gitattributes`, and have `ww doctor` flag `core.autocrlf=true` (and set it `false` in the repository's config when fixing)? Default: **yes**.
+8. **Line endings in workspaces:** add `projects/** -text` to the workspace `.gitattributes`, and have `ww doctor` flag `core.autocrlf=true` as a `problem`, setting it `false` in the repository's config only after you confirm at a y/N prompt (never with `--non-interactive`, never from an agent's `workspace.doctor` call)? Default: **yes**.
 9. **Keep all of `candidates/` gitignored, so open runs don't sync between machines?** CORE-032 gitignores only rejected candidates. Default: **yes**, recorded as a CORE-032 clarification.
 10. **Asset-folder copies and moves:** in 2b, only flag a folder/`asset_id` mismatch as `needs_repair`, and leave move pairing and duplicate-`creation_uuid` repair to the plan that adds `asset.rename`? Default: **yes**.
 
@@ -161,7 +161,7 @@ Each question has the answer this plan uses unless you say otherwise.
     - no component may be a reserved Windows name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, and `COM¹`–`COM³`/`LPT¹`–`LPT³`), whatever its case and extension;
     - no component may end in a dot or a space, contain `<>:"\|?*` or a control character, or be `.` or `..`;
     - every component is at most 255 characters;
-    - absolute paths of 247 characters or more go to Windows with the `\\?\` (or `\\?\UNC\`) prefix, after they are made absolute with `\` separators and no `.` or `..` components. The suite doesn't depend on the `LongPathsEnabled` opt-in.
+    - absolute paths of 247 UTF-16 code units or more go to Windows with the `\\?\` (or `\\?\UNC\`) prefix, after they are made absolute with `\` separators and no `.` or `..` components. The suite doesn't depend on the `LongPathsEnabled` opt-in.
   - **Store write algorithm** (ARCH-074; ARCH-074 clarification):
     1. Check the path.
     2. If writes are paused for git, wait (ARCH-083). Writes are paused while the watcher's git flag is set **or** `<ws>\.git\index.lock` exists. The store checks that file itself (one `GetFileAttributesW`), so a write never races git during the watcher's batch window, or when no watcher runs.
@@ -169,14 +169,15 @@ Each question has the answer this plan uses unless you say otherwise.
        - for a full write, the file's last generated hash (ARCH-078), or either hash of its pending row (step 5) while one exists. `Expect::Generated` with no generated row is a conflict when the file exists, and is treated as `Expect::New` when it doesn't;
        - for a manifest or YAML edit, the hash read at the start of the edit;
        - LFS pointers compare by `oid`;
-       - a cloud-only placeholder target is never read, since reading would download it: the write fails with `store.hash_conflict`, and the message says to make the file available offline first.
+       - a cloud-only placeholder target is never read, since reading would download it: the write fails with `store.hash_conflict`, and the message says to make the file available offline first. The same check comes first in every store operation that reads a file's data (`Store::read`, `edit_manifest`, `edit_yaml`, `edit_text`): the attribute-only `probe.identity` runs before any byte is read, so the store never triggers a download. Edits of a placeholder fail with `store.hash_conflict`, and `Store::read` of one fails with `store.io`, with the same message.
     4. Write `<dir>\.<name>.ww-tmp-<pid>-<n>` in the same folder, and flush it with `FlushFileBuffers` before closing it.
     5. Record the pending replace: a `generated_pending(path, old_sha256, new_sha256)` row in the workspace `state.db`. `old_sha256` is the hash checked in step 3, or null for a new target.
     6. Replace the target. The fail point `store.replace` comes just before this step, and `store.after_replace` just after it.
        - For an existing target, call `ReplaceFileW(REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS)` with a backup name `<dir>\.<name>.ww-bak-<pid>-<n>`. `REPLACEFILE_WRITE_THROUGH` is never passed: it is documented as not supported.
        - For a new target, call `MoveFileExW(MOVEFILE_WRITE_THROUGH)` without `MOVEFILE_REPLACE_EXISTING`. Errors 80 and 183 mean an outside writer created the file after step 3: the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
     7. Hash the backup. If it equals the hash checked in step 3, the backup is removed. Otherwise an outside edit landed between steps 3 and 6, and the outside version is put back:
-       - with `ReplaceFileW` (target = the core's new bytes, replacement = the backup, and a second backup name, which is then removed), or, where `ReplaceFileW` is unsupported, with the fallback's two `move_new` renames;
+       - with `ReplaceFileW` (target = the core's new bytes, replacement = the backup, and a second backup name `<dir>\.<name>.ww-bak-<pid>-<n+1>`, which then holds the core's new bytes and is removed), or, where `ReplaceFileW` is unsupported, with the fallback's two `move_new` renames (target → the second backup name, then the first backup → target);
+       - the fail point `store.put_back` comes after the first half of the put-back (the `ReplaceFileW`, or the fallback's first rename) and before the rest, so a crash in the middle of a put-back can be tested;
        - the put-back retries sharing violations under the same 10 s budget. If it still fails, the call ends with `store.hash_conflict` whose `data.backup` names the backup's workspace-relative path, and the pending row stays, so the next open's recovery puts the outside version back;
        - the core's own new content is discarded (the call failed, so nothing of yours is lost), the pending row is cleared, and the call fails with `store.hash_conflict`.
     8. In one `state.db` transaction, record the new SHA-256 as the file's last generated hash and clear the pending row.
@@ -196,11 +197,12 @@ Each question has the answer this plan uses unless you say otherwise.
       - non-empty staging handles and `seal-*` folders left by a dead core (at open under `core.lock`, every existing handle belongs to a dead core);
       - `*.ww-conflict-*` files.
     - Stale `*.ww-tmp-*` files of processes that are no longer running, and empty staging handles, are removed.
-    - **Pending replaces** are resolved, one row at a time:
-      - target missing and a backup present (a crash between the fallback's renames): the backup is moved back with `move_new`;
-      - backup and target both present, and the backup's hash equals the row's `old_sha256` (or the generated hash): the backup is removed;
-      - backup and target both present, and the backup's hash is anything else: the backup holds an outside edit. The target (the core's bytes) is moved aside with `move_new` to `<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>` and the backup is moved back with `move_new`, so the outside edit is never left only in a dot-file;
-      - then, if the target's hash equals `new_sha256`, it becomes the generated hash. The row is cleared in every case.
+    - **Pending replaces** are resolved, one row at a time, in this order:
+      1. a backup whose hash equals the row's `new_sha256` holds the core's own new bytes (the second backup of a put-back cut short) and is removed;
+      2. target missing and a backup left (a crash between the fallback's renames, or between the fallback put-back's renames): the remaining backup, which is the old content or the outside edit and never the core's new bytes, is moved back with `move_new`;
+      3. backup and target both present, and the backup's hash equals the row's `old_sha256` (or the generated hash): the backup is removed;
+      4. backup and target both present, and the backup's hash is anything else: the backup holds an outside edit. The target (the core's bytes) is moved aside with `move_new` to `<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>` and the backup is moved back with `move_new`, so the outside edit is never left only in a dot-file;
+      5. then, if the target's hash equals `new_sha256`, it becomes the generated hash. The row is cleared in every case.
     - A `*.ww-bak-*` file whose target is missing is restored the same way, with or without a pending row.
   - **Append logs** (ARCH-081, CORE-009):
     - one JSON object per line, ending in `\n`, with `"machine"` and `"seq"` (from 1 per file) first, then the record;
@@ -316,7 +318,7 @@ Each question has the answer this plan uses unless you say otherwise.
     | `ww workspace init <path> [--name <n>] [--default]` | `workspace created at <path>` or `workspace registered at <path>`; then `default workspace: <path>` when it is the default |
     | `ww workspace use <path>` | `default workspace: <path>`; it connects with workspace `"none"`, so a stale default never blocks it |
     | `ww notify <path>…` | nothing on success; with `--no-start` and no core running, a silent no-op exiting 0 (ARCH-018) |
-    | `ww doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y` |
+    | `ww doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y`; an inherited `core.autocrlf=true` is a `problem`, set to `false` for the repository only after you type `y` (never with `--non-interactive`) |
 
     The core-start messages become:
     - "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` can set it aside."
@@ -325,7 +327,7 @@ Each question has the answer this plan uses unless you say otherwise.
     The `workspace.unsupported` and unregistered-workspace hints quote the path (`ww workspace use "<path>"`). A workspace named by `--workspace` is never told to become the default; it is told which workspace the core serves.
   - **Fail points** (QA-066, QA-055): `WW_TEST_FAILPOINTS=<name>=<action>[,…]`. They are read only on test channels, and disabled at compile time in builds whose `WW_BUILD_CHANNEL` is `stable` (a compile-time constant, so a stable build's checks are constant-false).
     - Actions: `abort` (the process ends at once, as a crash would: `TerminateProcess` on the current process, so no destructor runs and Windows Error Reporting is not involved), `disk_full`, `busy`, `unsupported` and `io`.
-    - Names: `store.write_temp`, `store.replace`, `store.after_replace`, `store.suite_toml`, `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress`, `store.after_index`, `store.after_seal`, `watch.start`.
+    - Names: `store.write_temp`, `store.replace`, `store.after_replace`, `store.put_back`, `store.suite_toml`, `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress`, `store.after_index`, `store.after_seal`, `watch.start`.
   - **Dates:** `YYYY-MM-DD` and RFC 3339 `…Z`, in UTC. The set-aside suffix is `YYYYMMDDTHHMMSSZ`.
   - **Clarifications recorded in Appendix E** (no new rule IDs):
     - ARCH-074: the write algorithm above. "`ReplaceFileW` / `MoveFileExW` with write-through" means `ReplaceFileW` without a write-through flag (`REPLACEFILE_WRITE_THROUGH` is documented as not supported) after the temp file is flushed, and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which is documented to flush only a move done as a copy and delete. Renames are atomic (journaled) but may be lost on power failure; the temp flush makes both states complete, and the pending row makes either acceptable. The window between the hash check and the replace is closed by checking the backup, not only by the watcher. No rename ever replaces an existing file, and recovery never leaves an outside edit only in a dot-file.
@@ -368,9 +370,9 @@ Each question has the answer this plan uses unless you say otherwise.
      - an output with no manifest entry stays on disk and is listed as an orphan, never deleted;
      - a crash after the manifest step leaves a normal, readable run;
      - the dead core's `running` idempotency row is released at the restart (the restarted core holds `core.lock`), so a retry runs the operation again. The first attempt's files stay visible as an orphan or a run, and nothing is lost;
-     - a crash inside a replace leaves an outside edit visible under the file's own name, and the core's own new bytes are not later reported as a human edit;
+     - a crash inside a replace, or in the middle of putting an outside edit back, leaves the outside edit visible under the file's own name, and the core's own new bytes are not later reported as a human edit;
      - a crash between sealing a version and the manifest edit lists the sealed folder as an orphan, and no file is lost.
-   - **Covered by:** Task 14, `crash_at_each_write_order_step_recovers_cleanly` and `crash_between_seal_and_manifest_lists_the_version_and_loses_nothing`; Task 6, `crash_after_replace_keeps_outside_edit_visible` and `crash_after_replace_does_not_flag_own_write_as_human_edit`; Task 5, `crash_after_output_lists_orphan_and_keeps_files` (green in Task 12).
+   - **Covered by:** Task 14, `crash_at_each_write_order_step_recovers_cleanly` and `crash_between_seal_and_manifest_lists_the_version_and_loses_nothing`; Task 6, `crash_after_replace_keeps_outside_edit_visible`, `crash_after_replace_does_not_flag_own_write_as_human_edit` and `crash_during_put_back_keeps_the_outside_edit`; Task 5, `crash_after_output_lists_orphan_and_keeps_files` (green in Task 12).
 2. **A target is held open** by Defender, Explorer's preview pane or an image viewer when the core replaces it.
    - **Expected:** the write retries with backoff and succeeds once the handle is released. If the handle is still held after 10 s, the call fails with `store.busy` and leaves the target unchanged and no temp file behind.
    - **Covered by:** Task 6, `held_target_is_retried_until_released` and `target_held_past_budget_fails_with_store_busy_and_no_temp`.
@@ -521,7 +523,7 @@ Produces:
 ```rust
 // ww_platform::fs — every function opens paths through long_path()
 pub fn long_path(p: &Path) -> PathBuf;                            // made absolute ("\" separators, no "." or ".."), then
-                                                                  // "\\?\" (or "\\?\UNC\") when 247 chars or more (std's rule)
+                                                                  // "\\?\" (or "\\?\UNC\") when 247 UTF-16 code units or more (std's rule)
 pub fn flush(file: &std::fs::File) -> io::Result<()>;             // FlushFileBuffers
 pub fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> io::Result<()>;
     // ReplaceFileW(REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS); never REPLACEFILE_WRITE_THROUGH
@@ -604,7 +606,7 @@ pub fn terminate_self(code: u32) -> !;   // TerminateProcess(GetCurrentProcess()
     - `machine_id_is_lowercase_and_restricted`, and `test_channel_machine_id_is_testmachine`;
     - `random_uuid_is_v4` (version nibble 4, variant `8`–`b`);
     - `stable_ids_only_on_local_ntfs_or_refs_outside_sync_roots` (Review Focus 4): the truth table over `fs_name` (`NTFS`, `ReFS`, `FAT32`, `exFAT`), `remote` and `cloud_sync_root`;
-    - `long_path_prefixes_from_247_chars_and_unc` (246 unchanged, 247 prefixed, a UNC path gets `\\?\UNC\`, `..` is resolved first);
+    - `long_path_prefixes_from_247_units_and_unc` (lengths in UTF-16 code units: 246 unchanged, 247 prefixed, including a path whose non-BMP characters make its code-unit count larger than its `char` count; a UNC path gets `\\?\UNC\`, `..` is resolved first);
     - `sync_root_failure_is_false_off_local_ntfs` (Review Focus 4): `sync_root_from` over success, 390, and another failure, on `FAT32`, `exFAT`, remote `NTFS` and local `NTFS` (only another failure on local NTFS is an error);
     - `file_id_all_zero_or_all_ff_is_none`;
     - `terminate_self_ends_the_process_with_its_code` (the test binary re-runs itself through `run_hidden` with a helper flag that calls `terminate_self(0xDEAD)`; the exit code is `0xDEAD`);
@@ -752,7 +754,7 @@ pub fn run_id(unix_secs: i64) -> String;                 // r_<yyyymmdd>_<hhmm>
   - **`chr_paper_crane`**, in the modern I5 shape: a sealed `v1.0.0/` with `manifest.snapshot.json`, `hashes`, one `selected` and one open run, `inputs` with a `proj:` ref, and `locks`.
 - small made-up text and PNG files whose SHA-256 values are the ones recorded in the manifests.
 
-Both manifests are stored in `Manifest::to_text` format, with `\n` line endings; no fixture file contains `\r\n`.
+Both manifests are stored in `Manifest::to_text` format, with `\n` line endings; no text fixture file (`.json`, `.yaml`, `.yml`, `.toml`, `.md`, `.txt`) contains `\r\n`. Binary fixtures are excluded from that rule: every PNG signature contains the bytes `0D 0A`.
 
 - [ ] **Step 1: Write the failing tests.**
   - **`tests/golden.rs`** (ARCH-076, ARCH-077, CORE-148, QA-048):
@@ -762,7 +764,7 @@ Both manifests are stored in `Manifest::to_text` format, with `\n` line endings;
     - `hand_formatted_manifest_round_trips_by_value_and_order`: a compact one-line copy parses and keeps its key order;
     - `legacy_manifest_reads_with_warnings_not_errors`: `prop_signal_lamp` gives a `SchemaWarning` for the missing `schema_version` and parses;
     - `edits_never_add_schema_version_to_a_legacy_manifest`: `set("status", …)` on `prop_signal_lamp`, then `to_text` → no `schema_version` key;
-    - `fixture_files_have_no_crlf`: no file under `crates/ww-spec-tests/fixtures/` contains `\r\n` (the nested `.gitattributes` is in force);
+    - `fixture_files_have_no_crlf`: no file under `crates/ww-spec-tests/fixtures/` with one of the text extensions `.json`, `.yaml`, `.yml`, `.toml`, `.md` and `.txt` contains `\r\n` (the nested `.gitattributes` is in force). Other files are skipped, since a PNG signature always contains `0D 0A`; the test also fails if it finds no text file at all, so a wrong path can't make it pass;
     - `crlf_manifest_stays_crlf_and_a_one_field_edit_is_one_line`: a CRLF copy of `chr_paper_crane`'s manifest round-trips byte for byte, and setting `status` changes exactly one line;
     - `removing_a_key_keeps_the_order_of_the_rest` (`Manifest::remove` and `remove_key` of a middle key; the remaining keys keep their relative order).
   - **Unit tests:**
@@ -979,7 +981,7 @@ A test author who doesn't read the implementation writes these from the spec (wi
 
   | Test | Rules | Assertion | Green in |
   |---|---|---|---|
-  | `doctor_fixes_git_config_and_gitignore_then_changes_nothing` | CORE-040, ARCH-085, QA-060 | `git_init`, then `.gitignore` emptied and `.gitattributes` removed; `ww doctor` → exit 0 with `fixed:` lines; `git config core.longpaths` is `true`, `lfs.setlockablereadonly` is `false` and `core.autocrlf` is `false`; `.gitattributes` holds `projects/** -text`; a second run prints only `ok:` lines and the SHA-256 values of `.gitignore`, `.gitattributes` and `.git\config` are unchanged | 14 |
+  | `doctor_fixes_git_config_and_gitignore_then_changes_nothing` | CORE-040, ARCH-085, QA-060 | `git_init`, then `.gitignore` emptied and `.gitattributes` removed; `ww doctor` → exit 0 with `fixed:` lines; `git config core.longpaths` is `true` and `lfs.setlockablereadonly` is `false`; `core.autocrlf` is still unset (the isolated config has no inherited value, so doctor neither asks nor sets it); `.gitattributes` holds `projects/** -text`; a second run prints only `ok:` lines and the SHA-256 values of `.gitignore`, `.gitattributes` and `.git\config` are unchanged | 14 |
   | `doctor_sets_damaged_state_db_aside_only_after_yes` | CORE-004 | a corrupt suite `state.db`; `ww status` stderr says "`ww doctor` can set it aside." and not "(plan 2b)"; `ww doctor` with stdin `n` → exit 1, file unchanged; with `y` → `state.db.damaged-<YYYYMMDDTHHMMSSZ>` beside it with the old SHA-256; `ww status` → exit 0 | 14 |
   | `non_interactive_doctor_never_moves_state_db` | CORE-004 | `ww --non-interactive doctor` → exit 1, the file is unchanged, and stdout says to run `ww doctor` interactively | 14 |
 
@@ -1096,7 +1098,8 @@ pub fn append_locked(path: &Path, line: &str, within: Duration) -> io::Result<()
   - **`crash_after_replace_keeps_outside_edit_visible`** (ARCH-074, Review Focus 1): a hook on `store.replace` writes "outside" to the target, and `store.after_replace=io` stops the write before step 7. The store is dropped, and a new `Store` over the same root and `state.db` runs `recover()`: the target reads "outside", the core's bytes are in `<name>.ww-conflict-<utc>`, no `.ww-bak-` file remains and the pending row is gone;
   - **`crash_after_replace_does_not_flag_own_write_as_human_edit`** (ARCH-074, Review Focus 1): `store.after_replace=io` with no outside edit; after `recover()` in a new `Store`, the `generated` row holds the new SHA-256, `accepts_as_own(new)` is true, and the next `Expect::Generated` write succeeds. Before `recover()`, `accepts_as_own` is true for both the old and the new hash;
   - `expect_generated_without_a_row_is_conflict_or_new` (an existing file → `HashConflict`; a missing one is written);
-  - `cloud_only_target_is_a_conflict_and_never_read` (a fake `Probe` reports the target as a placeholder; `open_read` is never called);
+  - `cloud_only_target_is_a_conflict_and_never_read` (a fake `Probe` reports the file as a placeholder; `write`, `edit_manifest`, `edit_text` and `read` all refuse it, and no byte of it is read: the probe's `open_read` counter and a read counter in `fsops` stay at 0);
+  - **`crash_during_put_back_keeps_the_outside_edit`** (ARCH-074, Review Focus 1): a hook on `store.replace` writes "outside" to the target, and `store.put_back=io` stops the put-back halfway. Two variants: the `ReplaceFileW` put-back (the second backup, holding the core's new bytes, is left beside the target) and the fallback put-back with `store.replace=unsupported` (the target is missing, and both backups are left). In both, a new `Store` over the same root and `state.db` runs `recover()`: the target reads "outside", no `.ww-bak-` file and no pending row remains, and the core's new bytes are gone (they were its own, and the call had failed);
   - **`held_target_is_retried_until_released`** (Review Focus 2): `HandleHolder::hold(target, Share::Read)`; start the write; `advance(3 s)`; release; the write is ok;
   - **`target_held_past_budget_fails_with_store_busy_and_no_temp`** (Review Focus 2): `advance(11 s)` → `Busy`; the target's SHA-256 is unchanged; no `*.ww-tmp-*` file;
   - **`relative_path_over_180_chars_is_refused_before_any_write`** (Review Focus 3): no folder of the path was created;
@@ -1293,7 +1296,9 @@ Produces:
 // store/suite_toml.rs: the core is the only writer of suite.toml (owner decision 1)
 pub async fn register_workspace(env: &Env, path: &Path, make_default: bool, fp: &FailPoints) -> Result<bool, StoreError>;
     // read → suite_edit::register → fail point "store.suite_toml" → write_temp + replace with the read hash;
-    // an outside change re-reads once
+    // an outside change re-reads once. When suite.toml doesn't exist yet, register starts from an empty text and the
+    // first write is a new target: move_new (ReplaceFileW needs an existing target), whose 80/183 means another
+    // writer created the file meanwhile, so it re-reads once as for any outside change
 // tools/workspace_tools.rs
 pub fn register_workspace_tools(reg: &mut Registry, hub: Arc<WorkspaceHub>, env: Env, probe: Arc<dyn Probe>);
 #[serde(deny_unknown_fields)] pub struct WorkspaceCreateArgs { pub path: String, pub name: Option<String>, pub default: Option<bool> }
@@ -1494,8 +1499,8 @@ git commit -m "store: sealed read-only versions under a per-asset lock, legacy f
 - Create: `crates/ww-core/src/index/{mod.rs, schema.rs, reconcile.rs, query.rs}` and `crates/ww-core/src/tools/asset_read_tools.rs` (`assets.query`, `asset.get`).
 - Modify: `crates/ww-core/src/workspace.rs`. `OpenWorkspace` gains `pub index: Arc<Index>`; `open` opens it after the store and sets it as the store's `ChangeSink`. The first reconcile (or cold rebuild) runs in the background, so `open` doesn't wait for it, but read tools do: they await `Index::ready()` (below). `workspace.rs` also runs the `verify_pending` tick (1 s tokio interval) and, from Task 11 on, hands its mismatches to the watcher.
 - Modify (protected): `test-params.toml`.
-  - Add `[budgets]` with `index_rebuild_2000_assets_s = 30` and `index_warm_reconcile_10000_assets_s = <about twice the measured time, rounded up to whole seconds>`, with a comment naming CORE-042 and `crates/ww-core/tests/index_bench.rs`, and noting that the owner confirms the warm value at PR time (owner question 2).
-  - Replace the stale header line "Plan-1 code does not consume this file yet" with one saying that `ww_testkit::params` reads `[proptest]` and `[budgets]`, and that `.config/nextest.toml` still carries the timeout values directly.
+  - Add `[budgets]` with `index_rebuild_2000_assets_s = 30` and `index_warm_reconcile_10000_assets_s = <about twice the slower of two measurements, rounded up to whole seconds>`, with a comment naming CORE-042 and `crates/ww-core/tests/index_bench.rs`, and noting that the owner confirms the warm value at PR time (owner question 2). The two measurements are a local run and a run on the CI's Windows runner (the PR's CI log prints it), so the budget holds on the slower machine.
+  - Remove the stale header lines: the "# Trial: protected-file change used to test the approval flow …" line, and "Plan-1 code does not consume this file yet" (with its continuation). In their place, one comment says that `ww_testkit::params` reads `[proptest]` and `[budgets]`, and that `.config/nextest.toml` still carries the timeout values directly.
 - Test: unit tests; `crates/ww-core/tests/{index.rs, index_bench.rs, module_deps.rs}`.
 
 **Interfaces:**
@@ -1606,7 +1611,7 @@ pub fn register_asset_read_tools(reg: &mut Registry);  // assets.query, asset.ge
     - `index` uses none of `watch`, `pipeline`, `projects`, `settings`, `tools`.
   - **`tests/index_bench.rs`** (CORE-042; `std::time::Instant`, the stated exception to QA-031; budgets read through `ww_testkit::params::budget`; each prints its measured time):
     - `cold_rebuild_of_2000_assets_fits_the_budget`: 2,000 assets × 3 files in a tempdir; times `rebuild()` against `index_rebuild_2000_assets_s`;
-    - `warm_reconcile_of_10000_assets_fits_the_budget` (research 5A-8): 10,000 assets × 3 files, indexed once; times a second `reconcile(All)` with nothing changed (stats only, `hashed == 0`) against `index_warm_reconcile_10000_assets_s`.
+    - `warm_reconcile_of_10000_assets_fits_the_budget` (research 5A-8): 10,000 assets × 3 files, indexed once; times a second `reconcile(All)` with nothing changed (stats only, `hashed == 0`) against `index_warm_reconcile_10000_assets_s`. The budget comes from the slower of a local and a CI-runner measurement (above).
   - Remove `index_watch::damaged_index_is_rebuilt` from `expected-fail.toml`.
 - [ ] **Step 2: Run them.**
 
@@ -2042,6 +2047,8 @@ pub fn set_aside(env: &Env, now_utc: i64) -> io::Result<Vec<PathBuf>>;   // stat
 pub fn finish_recovery(env: &Env) -> io::Result<StateFileState>;         // one read-write open (SQLite rolls the journal back), then the check
 pub enum SuiteTomlState { Missing, Unreadable(String), NoDefault, DefaultMissing(PathBuf), Ok { default: PathBuf, id: String } }
 pub fn inspect_suite_toml(env: &Env) -> SuiteTomlState;                 // ww_schema::SuiteToml; never resolve_workspace_id
+pub fn set_repo_autocrlf_false(ws: &Path) -> io::Result<()>;            // git -C <ws> config --local core.autocrlf false (run_hidden);
+                                                                         // ww doctor calls it only after an interactive "y"
 // ww-core
 pub struct DoctorArgs { pub fix: bool }
 pub struct DoctorCheck { pub id: String, pub state: String /* ok | fixed | problem */, pub detail: String }
@@ -2060,7 +2067,9 @@ pub enum UserCommand { /* … */ Doctor }
    - If a `problem` remains here (the answer was `n`, or `--non-interactive`), the core can't start, so step 3 can't run: doctor prints `problem: workspace checks skipped — the core can't start` after step 2 and exits 1, not 2 (it did run; a problem remains).
 2. **`suite.toml`**, through `ww_client::doctor::inspect_suite_toml` (so `ww-cli` needs no `ww-schema` dependency and its protected `Cargo.toml` stays unchanged), never through `resolve_workspace_id`. If the default workspace is missing: `problem: … — run ww workspace use "<path>"`.
 3. **The workspace checks**, through a connection whose hello names the default workspace's id: `workspace.doctor {fix:true}`, printed line by line.
-   - The core runs `git config --local core.longpaths true`, `git config --local lfs.setlockablereadonly false` and `git config --local core.autocrlf false` with `run_hidden(find_on_path("git"))` (CORE-040, ARCH-085). Each check is `ok` when the repository's own config already has that value, else `fixed` (or a `problem` without `fix`); `git.core_autocrlf` explains that an inherited `core.autocrlf=true` would give text assets CRLF endings on checkout. Without `.git`, all three are `ok` with "not a git repository; skipped".
+   - The core runs `git config --local core.longpaths true` and `git config --local lfs.setlockablereadonly false` with `run_hidden(find_on_path("git"))` (CORE-040, ARCH-085). Each check is `ok` when the repository's own config already has that value, else `fixed` (or a `problem` without `fix`). Without `.git`, they are `ok` with "not a git repository; skipped".
+   - **`git.core_autocrlf`** is report-only in the tool: when the effective `core.autocrlf` (`git config core.autocrlf`) is `true` or `input`, it is a `problem` explaining that text files outside `projects/` get CRLF on checkout, and `workspace.doctor` never changes it, whatever `fix` says and whoever calls it (an agent-callable fix tool must not change persistent git config without the person's confirmation; CORE-040 doesn't ask for this setting, and `projects/** -text` already covers the asset trees). An unset value is `ok`.
+   - After printing the workspace checks, `ww doctor` asks "Set core.autocrlf=false for this repository only? [y/N]" when that check is a `problem`. Only `y` sets it, with `git -C <ws> config --local core.autocrlf false` through `ww_client::doctor::set_repo_autocrlf_false` (`run_hidden`): git itself writes `.git\config`, which is not a store-managed workspace file (ARCH-002). The line becomes `fixed:`. With `--non-interactive`, or any answer but `y`, nothing is set, the line stays a `problem` and doctor exits 1.
    - The five `.gitignore` entries and the `.gitattributes` line `projects/** -text` are appended through `edit_text` when missing (CORE-040 clarification).
    - `sealed.readonly` (CORE-026; research 5A-6, the doctor part): a sealed file without the read-only attribute whose SHA-256 matches the manifest (a clone or checkout drops the attribute, since git stores only file modes) gets it back with `fix`, through `fsops::set_readonly`; one whose hash doesn't match stays as it is, a human edit, and is listed. Re-applying it automatically after every rescan is deferred (Not in this plan).
    - Orphans, needs-repair manifests and `missing` files are listed as `problem`s, never fixed automatically (CORE-038).
@@ -2093,7 +2102,7 @@ pub enum UserCommand { /* … */ Doctor }
     - `doctor_without_git_skips_with_a_note`;
     - `doctor_lists_orphans_and_needs_repair_without_fixing` (and `missing` files);
     - `doctor_reports_a_missing_watcher` (`watch.start=unsupported`; the detail no longer says writes skip the git wait);
-    - `doctor_sets_core_autocrlf_false_and_adds_gitattributes` (CORE-040: with a repository whose config says `core.autocrlf=true`; a second run is all `ok`);
+    - `doctor_tool_reports_autocrlf_and_never_sets_it` (CORE-040: a repository whose config says `core.autocrlf=true`; `workspace.doctor {fix:true}` from a `cli` and from an `mcp` caller → `git.core_autocrlf` is a `problem` and `.git\config` is byte-identical; `.gitattributes` gains `projects/** -text`);
     - `doctor_restores_read_only_on_matching_sealed_files` (CORE-026: after `git checkout` leaves sealed files writable, `fix` makes the matching ones read-only and lists an edited one without touching it).
   - **`ww-client/tests/doctor.rs`:**
     - `inspect_never_creates_side_files`;
@@ -2104,6 +2113,8 @@ pub enum UserCommand { /* … */ Doctor }
   - **`ww-cli/tests/doctor_cli.rs`:**
     - `doctor_answers_n_keeps_the_file` (and prints `problem: workspace checks skipped — the core can't start`, exit 1) and `doctor_answers_y_sets_it_aside_and_the_core_starts`;
     - `non_interactive_doctor_never_moves_it`;
+    - `doctor_sets_autocrlf_only_after_yes` (a repository with `core.autocrlf=true`: answer `n` → unchanged, exit 1; answer `y` → `git config --local core.autocrlf` is `false`, a `fixed:` line, and a second run is all `ok:`);
+    - `non_interactive_doctor_never_sets_autocrlf` (`ww --non-interactive doctor` → no prompt, `.git\config` unchanged, exit 1);
     - `doctor_with_a_stale_default_reports_it_and_still_runs`.
   - Remove the three `doctor.rs` entries from `expected-fail.toml`. The list then holds no plan-2b test.
 - [ ] **Step 2: Run them.**
