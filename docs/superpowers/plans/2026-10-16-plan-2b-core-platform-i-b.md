@@ -217,7 +217,7 @@ Each question has the answer this plan uses unless you say otherwise.
     - staging handles: `<ws>\.worldwright\staging\<sh_16hex>\`; ingest is a rename onto the same volume;
     - `<ws>\.worldwright\core.lock`, held with `LockFileEx` while the core serves the workspace;
     - `<ws>\.worldwright\state.json` `{"active_project":"<slug>"}`, the untracked last-used hint;
-    - trash entries: `<ws>\.trash\<YYYY-MM-DD>\<te_16hex>\payload\<original name>`, with `restore.json` beside it: `{"entry_id","original_path","moved_utc","purge_after","reason","sha256"?}`.
+    - trash entries: `<ws>\.trash\<YYYY-MM-DD>\<te_16hex>\payload\<original name>`, with `restore.json` beside it: `{"entry_id","original_path","moved_utc","purge_after","reason","sha256"?}`. `original_path`, and the `path` that `trash.restore` returns, are workspace-relative with `/` separators (`notes/a.txt`).
   - **`core.lock`** (ARCH-028): the lock gates both read-write access to the workspace's `state.db` and the release of stale `running` idempotency rows. A core that finds it held serves the workspace read-only:
     - read tools work;
     - write tools get `workspace.read_only`;
@@ -240,7 +240,7 @@ Each question has the answer this plan uses unless you say otherwise.
     - `external: [{"path","sha256"}]` (link-external files);
     - `hashes` (I5): keys are paths relative to the asset folder (`v1.0.0/x.png`), values are written `sha256:<64 hex>` as in I5. Every reader (the index, the watcher, the test kit) accepts a value with or without the `sha256:` prefix and compares the bare hex;
     - `candidate_runs[]` in the I5 shape (`run_id`, `path`, `status`, `created`, `target_version`, `files`, …), plus `candidate_runs[].pinned`, `candidate_runs[].files[].sha256` (bare hex of the file as it was committed) and `candidate_runs[].trashed_utc` (RFC 3339, set when maintenance moves a rejected run's folder to trash; I5 clarification below);
-    - `human_edits[]` entries `{"path","sha256","previous_sha256","date"}`: I5's `path`, `sha256` and `date` (UTC `YYYY-MM-DD` of the detection), plus `previous_sha256`. I5's `author` and `note` are left out, since the core doesn't know them;
+    - `human_edits[]` entries `{"path","sha256","previous_sha256","date"}`: I5's `path` (relative to the asset folder, `v1.0.0/x.png`), `sha256` and `date` (UTC `YYYY-MM-DD` of the detection), plus `previous_sha256`. `sha256` and `previous_sha256` are bare 64-hex, without the `sha256:` prefix of `hashes`. I5's `author` and `note` are left out, since the core doesn't know them;
     - `candidate_runs[].signed_off` `{"by","date","version"}`, the workspace format's field that CORE-051 calls `approved_by`; `by` is one of `user` (`ui:*`), `assistant`, `claude-code` (`mcp`) and `cli`;
     - `version` (I5): when new work starts on an asset that has an `approved_version`, the first candidate run after it sets `version` to `approved_version` bumped by `minor`, and the run's `target_version` to the same value ("set it by the bump rules"); a sign-off with a confirmed `bump` replaces it.
 
@@ -366,7 +366,7 @@ Each question has the answer this plan uses unless you say otherwise.
   | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
   | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}`; it writes the files into a staging handle as an engine would, then commits a candidate run. An omitted `project` is `sketchbook` until Task 12's resolver, then the resolved project |
   | `test.trash` | write | `{path}` | `{entry_id}` |
-  | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.worldwright\fence\<name>` |
+  | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.worldwright\fence\<name>`; it returns while git is busy too, since paths deferred for git count as handled |
   | `test.settings` | read | `{project?, settings?}` | the resolved `Settings` with sources; its `settings` argument is plan 2b's only source of the request layer (CORE-057 clarification) |
 - **Privacy** (QA-086): no user-profile paths (write `%USERPROFILE%`), no personal names or e-mail addresses in code, fixtures, test names or reports.
   - Non-ASCII test labels use "Ünïcödé space".
@@ -712,7 +712,8 @@ pub struct CandidateRun { pub run_id: String, pub path: Option<String>, pub stat
 pub struct CandidateFile { pub path: String /* asset-relative, I5 */, pub seed: Option<i64>, pub role: String /* candidate | derived | repair */,
                            pub from: Option<String>, pub sha256: Option<String> /* bare hex; absent in pre-2b runs */ }
 pub struct SignedOff { pub by: String, pub date: String, pub version: Version }
-pub struct HumanEdit { pub path: String, pub sha256: String, pub previous_sha256: Option<String>, pub date: Option<String> }
+pub struct HumanEdit { pub path: String /* asset-relative, I5 */, pub sha256: String /* bare hex */, pub previous_sha256: Option<String> /* bare hex */,
+                       pub date: Option<String> }
     // I5's author and note are read when present and otherwise ignored; the core writes path, sha256, previous_sha256, date
 pub struct ExternalFile { pub path: String, pub sha256: String }
 pub fn bare_sha256(value: &str) -> Option<&str>;   // "sha256:<64 hex>" or "<64 hex>" → the hex; anything else → None
@@ -1010,7 +1011,7 @@ A test author who doesn't read the implementation writes these from the spec (wi
   | Test | Rules | Assertion | Green in |
   |---|---|---|---|
   | `signoff_seals_read_only_version_with_snapshot` | CORE-026, CORE-051 | `asset.import` (copy) then `asset.signoff` without `bump` → `v1.0.0/` holds the file and `manifest.snapshot.json`, both read-only; manifest `approved_version == "1.0.0"`, `status == "approved"`, the run `selected`, `signed_off.by == "cli"` | 13 |
-  | `signoff_uses_the_confirmed_bump` | CORE-027 | after `1.0.0`, `asset.get` `next_versions.minor == "1.1.0"`; a new run, then `signoff {bump:"minor"}` → `v1.1.0/` | 13 |
+  | `signoff_uses_the_confirmed_bump` | CORE-027 | after `1.0.0`, `asset.get` `next_versions.minor == "1.1.0"`; a new run, then `asset.get` `proposed_bump == "minor"`, and `signoff {bump:"major"}` → `v2.0.0/` and no `v1.1.0/` (a sign-off that ignored `bump` would seal the run's `1.1.0`) | 13 |
   | `sealed_ref_carries_the_content_hash` | ARCH-042, CORE-031, CORE-047 | the `signoff` `ref` is `ww://<id>/sketchbook/<asset>@1.0.0#sha256=<h>` with `h == version_content_hash_of(v1.0.0)` | 13 |
   | `link_external_asset_cannot_be_signed_off_until_collected` | CORE-029 | `asset.import {mode:"link_external"}` of a file outside the workspace, then `signoff` → `asset.link_external` with `fix.agent_hint.tool == "asset.collect"`; `asset.collect`, then `signoff` → ok and the version is inside the workspace | 13 |
   | `trash_keeps_restore_record_and_restores` | ARCH-058, CORE-037, CORE-110 | `test.trash {path}` → the file is gone; `trash.list` has an entry with `original_path` and a `purge_after` 30 days after `moved_utc` (`utc::parse_rfc3339` of both differ by `30 * 86400`); the folder is `.trash\<YYYY-MM-DD>\…` with `utc::today()`; `trash.restore` puts the bytes back | 9 |
@@ -1020,11 +1021,11 @@ A test author who doesn't read the implementation writes these from the spec (wi
   | Test | Rules | Assertion | Green in |
   |---|---|---|---|
   | `damaged_index_is_rebuilt` | ARCH-089 | stop the core; write 4 KiB of `0xAB` over `workspace_local_dir(ws)\index.db`; restart → the first `assets.query` (read tools wait for the first reconcile, Appendix E) lists both fixture assets | 10 |
-  | `outside_edit_to_sealed_file_is_a_human_edit` | CORE-034, ARCH-079 | clear the read-only bit of a `chr_paper_crane/v1.0.0/` file and change it; fence → `asset.get` `human_edits` has that path with the new SHA-256; the file keeps the edited bytes | 11 |
+  | `outside_edit_to_sealed_file_is_a_human_edit` | CORE-034, ARCH-079 | clear the read-only bit of a `chr_paper_crane/v1.0.0/` file and change it; fence → `asset.get` `human_edits` has that path, asset-relative as in I5 (`v1.0.0/crane_b.png`), with the new SHA-256 and `previous_sha256`, both bare hex; the file keeps the edited bytes | 11 |
   | `invalid_manifest_is_marked_needs_repair_and_kept` | ARCH-079, ARCH-076 | write `{` into a manifest; fence → `asset.get` `needs_repair == true`; the file is still exactly `{` | 11 |
   | `writes_wait_while_git_holds_index_lock` | ARCH-083 | in this order: subscribe to `workspace`; create `.git\index.lock`; `RawPipe::fence`; wait for the `git_paused` event; only then `send_line` a `test.store_write` (no response yet); remove the lock → `git_resumed` arrives before the write's ok response | 11 |
   | `lfs_pointer_is_not_fetched_not_corrupt` | ARCH-085 | replace a sealed file with an LFS pointer whose `oid` is its recorded SHA-256; fence → `asset.get` `files[].state == "not_fetched"`, no human edit | 11 |
-  | `ww_notify_reconciles_and_is_silent_without_core` | ARCH-016, ARCH-073 | with no core, `ww notify --no-start <file>` → exit 0, empty output; with a core running, an outside edit then `ww notify <file>` (no fence) → `asset.get` shows the human edit | 11 |
+  | `ww_notify_reconciles_and_is_silent_without_core` | ARCH-016, ARCH-073 | with no core, `ww notify --no-start <file>` → exit 0, empty output; with a core started with `watch.start=unsupported` (so only `ww notify` can find the edit) and a first `asset.get` (which waits for the reconcile at open), an outside edit then `ww notify <file>` (no fence) → `asset.get` shows the human edit | 11 |
 
   **`projects_settings.rs`**
 
@@ -1786,7 +1787,9 @@ pub struct Watcher;
 impl Watcher {
     pub fn start(store: Arc<Store>, index: Arc<Index>, events: Arc<EventBus>, topic_ws: String, cfg: WatchConfig) -> io::Result<Arc<Watcher>>;
     pub async fn notify(&self, paths: Vec<WsPath>) -> NotifyReport;
-    pub async fn fence(&self, name: &str);              // returns once `.worldwright/fence/<name>` and everything before it is handled
+    pub async fn fence(&self, name: &str);              // returns once `.worldwright/fence/<name>` and everything before it is handled;
+        // it also returns while git is busy: a path deferred for git (DeferUntilGitDone) counts as handled, and the
+        // post-git rescan decides it later
     pub fn stop(&self);
 }
 pub struct NotifyReport { pub reconciled: Vec<String>, pub ignored: Vec<String> }
@@ -1925,7 +1928,9 @@ Produces:
 
 ```rust
 // settings
+#[derive(Serialize)] #[serde(rename_all = "lowercase")]           // wire values: "workspace", "project", "request"
 pub enum SettingSource { Workspace, Project, Request }
+#[derive(Serialize)]                                               // test.settings returns it as is: {values, sources}
 pub struct Settings { pub values: BTreeMap<String, serde_json::Value>, pub sources: BTreeMap<String, SettingSource> }
 impl Settings { pub fn get(&self, key: &str) -> Option<&serde_json::Value>; pub fn model_for(&self, task: &str) -> Option<&str>;
                 pub fn auto_approve(&self) -> Vec<String>; pub fn skip_stages(&self) -> Vec<String>;

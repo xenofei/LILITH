@@ -171,15 +171,27 @@ fn signoff_uses_the_confirmed_bump() {
     assert_eq!(detail["next_versions"]["major"], "2.0.0", "{detail}");
     assert_eq!(detail["next_versions"]["patch"], "1.0.1", "{detail}");
 
+    // New work after 1.0.0 proposes a minor bump (the run targets 1.1.0); the person
+    // confirms a major one instead, so a sign-off that ignored `bump` would seal v1.1.0.
     let second = s.import("kite_two.png", b"kite two");
-    let result = s.signoff(&second, "kite_two.png", Some("minor"));
-    assert_eq!(result["version"], "1.1.0", "{result}");
-    let sealed = s.path(&format!("{ASSET_DIR}/v1.1.0/kite_two.png"));
+    let proposed = s.pipe.tool_ok(
+        "asset.get",
+        json!({"project": "sketchbook", "asset_id": ASSET}),
+        None,
+    );
+    assert_eq!(proposed["proposed_bump"], "minor", "{proposed}");
+    let result = s.signoff(&second, "kite_two.png", Some("major"));
+    assert_eq!(result["version"], "2.0.0", "{result}");
+    let sealed = s.path(&format!("{ASSET_DIR}/v2.0.0/kite_two.png"));
     assert_eq!(
         std::fs::read(&sealed).unwrap_or_else(|e| panic!("{}: {e}", sealed.display())),
         b"kite two"
     );
-    assert_eq!(s.manifest()["approved_version"], "1.1.0");
+    assert!(
+        !s.path(&format!("{ASSET_DIR}/v1.1.0")).exists(),
+        "the confirmed bump was ignored: v1.1.0 was sealed"
+    );
+    assert_eq!(s.manifest()["approved_version"], "2.0.0");
 }
 
 #[test] // spec: ARCH-042, CORE-031, CORE-047

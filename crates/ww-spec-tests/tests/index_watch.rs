@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use ww_testkit::{CoreFixture, RawPipe, TestEnv, sha256_bytes};
+use ww_testkit::{CoreFixture, RawPipe, TestEnv, failpoints, sha256_bytes};
 
 /// A failure deadline only, never a measurement (QA-031).
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -79,17 +79,26 @@ fn asset_get(pipe: &mut RawPipe, asset_id: &str) -> Value {
     )
 }
 
+/// The sealed crane file as `human_edits` names it: relative to the asset folder (I5,
+/// `docs/reference/workspace-format.md`).
+const SEALED_IN_ASSET: &str = "v1.0.0/crane_b.png";
+
 /// The `human_edits` entries of an `asset.get` result whose path is the sealed crane file.
+/// Any entry for another spelling of that file fails the test.
 fn crane_edits(detail: &Value) -> Vec<Value> {
-    detail["human_edits"]
+    let edits = detail["human_edits"]
         .as_array()
-        .unwrap_or_else(|| panic!("asset.get has no human_edits list: {detail}"))
+        .unwrap_or_else(|| panic!("asset.get has no human_edits list: {detail}"));
+    for edit in edits {
+        let path = edit["path"].as_str().unwrap_or_default();
+        assert!(
+            path == SEALED_IN_ASSET || !path.ends_with("crane_b.png"),
+            "human_edits names {path:?}, not the asset-relative {SEALED_IN_ASSET:?}: {detail}"
+        );
+    }
+    edits
         .iter()
-        .filter(|e| {
-            e["path"]
-                .as_str()
-                .is_some_and(|p| p.ends_with("v1.0.0/crane_b.png"))
-        })
+        .filter(|e| e["path"] == SEALED_IN_ASSET)
         .cloned()
         .collect()
 }
@@ -306,9 +315,13 @@ fn ww_notify_reconciles_and_is_silent_without_core() {
     assert_eq!(quiet.stdout, "", "{quiet:?}");
     assert_eq!(quiet.stderr, "", "{quiet:?}");
 
-    let _core = CoreFixture::start(&env);
+    // Without a watcher only `ww notify` can find the edit. `asset.get` answers only after the
+    // first reconcile at open, so that reconcile ran before the edit and cannot record it.
+    let points = failpoints::spec(&[("watch.start", "unsupported")]);
+    let _core = CoreFixture::start_with_env(&env, &[(failpoints::ENV, &points)]);
     let mut pipe = session(&env, &ws);
-    pipe.fence(&ws);
+    let before = asset_get(&mut pipe, CRANE);
+    assert!(crane_edits(&before).is_empty(), "{before}");
 
     let edited = b"edited, then announced with ww notify";
     edit_outside(&sealed, edited);
