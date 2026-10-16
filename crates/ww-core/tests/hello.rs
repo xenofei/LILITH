@@ -254,9 +254,55 @@ fn unverified_claims_resolve_to_cli_and_tokens_are_refused() {
         "{forged}"
     );
     assert!(!forged.to_string().contains("forged\""), "{forged}");
+    // That connection is closed (ARCH-050); a token with another kind is a params error.
+    let mut pipe = RawPipe::connect(&env);
     let wrong_kind = pipe.hello(json!({"caller_kind": "cli", "engine_token": "x"}));
     assert_eq!(
         wrong_kind["result"]["error"]["code"], "params.invalid",
         "{wrong_kind}"
     );
+}
+
+#[test] // spec: ARCH-048, ARCH-050
+fn engine_token_invalid_is_terminal_for_the_connection() {
+    let env = TestEnv::new();
+    let core = core(&env);
+    let lifecycle = core.core().lifecycle().clone();
+    let mut pipe = RawPipe::connect(&env);
+    // A request pipelined right behind the hello is never served.
+    pipe.send_line(&format!(
+        "{}
+{}",
+        request(
+            1,
+            "core/hello",
+            merge_hello(json!({"caller_kind": "assistant", "engine_token": "forged"}))
+        ),
+        request(2, "core/hello", merge_hello(json!({})))
+    ));
+    let refusal = read(&mut pipe);
+    assert_eq!(refusal["id"], 1, "{refusal}");
+    assert_eq!(
+        refusal["result"]["error"]["code"], "caller.engine_token_invalid",
+        "{refusal}"
+    );
+    // The refusal is written, then the connection is closed; nothing else is answered.
+    let next = pipe.read_line(DEADLINE);
+    assert_eq!(next, None, "a request after the refusal was answered");
+    assert!(
+        pipe.wait_closed(DEADLINE),
+        "the refused connection stays open"
+    );
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while lifecycle.connections() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refused connection still counts"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The core still serves.
+    let mut fresh = RawPipe::connect(&env);
+    let ok = fresh.hello(json!({}));
+    assert_eq!(ok["result"]["status"], "ok", "{ok}");
 }

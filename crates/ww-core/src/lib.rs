@@ -28,6 +28,6 @@ pub mod workspace;
 pub use config::{CoreConfig, CoreExit};
 pub use lifecycle::{DrainReason, Lifecycle, ShutdownReport};
 pub use server::{
-    ConnCtx, CoreThread, Listener, OUTBOUND_CAPACITY, Router, RunningCore, ServerStats, claim_pipe,
-    serve, start, start_claimed, start_in_thread,
+    ConnCtx, CoreThread, Listener, MAX_IN_FLIGHT_PER_CONN, OUTBOUND_CAPACITY, Router, RunningCore,
+    ServerStats, claim_pipe, serve, start, start_claimed, start_in_thread,
 };

@@ -2,28 +2,36 @@
 //!
 //! - Lines are read by one `FramedRead` with a `LinesCodec` capped at `MAX_LINE_BYTES`. A
 //!   writer task drains the outbound queue (`OUTBOUND_CAPACITY`), one line per message.
-//! - `Router::opened` runs first and `Router::closed` exactly once, at the end.
+//! - `Router::opened` runs first and `Router::closed` exactly once, at the end, also when a
+//!   handler on the reader panicked (a drop guard; the panic then ends the connection).
 //! - While the router reports no handshake, each request is awaited before the next line is
-//!   read; afterwards each request runs in its own task.
+//!   read; afterwards each request runs in its own task, except those the router keeps on
+//!   the reader (`Router::runs_inline`).
+//! - A request task holds one of the connection's `MAX_IN_FLIGHT_PER_CONN` permits. With
+//!   none free, the reader waits before it reads on: backpressure on the pipe, nothing is
+//!   dropped. Waiting for a permit ends when `close` is cancelled, so a drain or shutdown never
+//!   waits for a full connection. A request task that panics is answered with
+//!   `Router::panicked`.
 //! - A line that is not a request gets its protocol fault. An over-long line gets -32002 with
 //!   id `null`, and the connection then closes. Notifications are ignored; a partial line at
 //!   end-of-stream is dropped.
 //! - Cancelling `ConnCtx::close` ends the connection. Lines already queued by then (the reply
 //!   to `core/drain` among them) are still written for up to `FLUSH_GRACE`.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use codec::Frame;
-use futures_util::StreamExt as _;
+use futures_util::{FutureExt as _, StreamExt as _};
 use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::net::windows::named_pipe::NamedPipeServer;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 use ww_protocol::{Response, RpcError, encode_response, parse_request, rpc_code};
 
-use super::{ConnCtx, OUTBOUND_CAPACITY, Router};
+use super::{ConnCtx, MAX_IN_FLIGHT_PER_CONN, OUTBOUND_CAPACITY, Router};
 
 /// How long a closed connection may still spend writing the lines queued before it closed.
 const FLUSH_GRACE: Duration = Duration::from_secs(1);
@@ -51,16 +59,44 @@ pub(super) async fn run(
 
     tracing::debug!(conn_id, client_pid, "connection opened");
     router.opened(&ctx);
-    read_lines(read, &ctx, &router).await;
-    router.closed(&ctx);
-    tracing::debug!(conn_id, "connection closed");
-
-    finish.cancel();
+    {
+        // Runs `closed` and lets the writer finish however reading ends, panics included.
+        let _ending = Ending {
+            router: &router,
+            ctx: &ctx,
+            finish: &finish,
+        };
+        read_lines(read, &ctx, &router).await;
+    }
     let _ = writer.await;
+}
+
+/// The end of a connection's reading: [`Router::closed`], then the writer sends what is
+/// queued and stops. A drop guard, so it also runs when a handler on the reader panics.
+struct Ending<'a> {
+    router: &'a Arc<dyn Router>,
+    ctx: &'a Arc<ConnCtx>,
+    finish: &'a CancellationToken,
+}
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(
+                conn_id = self.ctx.conn_id,
+                "a request handler on the connection's reader panicked; the connection ends"
+            );
+        }
+        self.router.closed(self.ctx);
+        tracing::debug!(conn_id = self.ctx.conn_id, "connection closed");
+        self.finish.cancel();
+    }
 }
 
 async fn read_lines(read: ReadHalf<NamedPipeServer>, ctx: &Arc<ConnCtx>, router: &Arc<dyn Router>) {
     let mut lines = FramedRead::new(read, Frame::codec());
+    // Never closed, so acquiring fails only if it did.
+    let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONN));
     loop {
         let next = tokio::select! {
             biased;
@@ -97,11 +133,37 @@ async fn read_lines(read: ReadHalf<NamedPipeServer>, ctx: &Arc<ConnCtx>, router:
             // Clients send no notifications the core acts on.
             continue;
         }
-        if router.handshake_done(ctx) {
+        if router.handshake_done(ctx) && !router.runs_inline(&req) {
+            let permit = tokio::select! {
+                biased;
+                () = ctx.close.cancelled() => return,
+                permit = permits.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
             let ctx = ctx.clone();
             let router = router.clone();
             tokio::spawn(async move {
-                if let Some(response) = router.handle(&ctx, req).await {
+                // Held until the response is queued (or the task ends some other way).
+                let _permit = permit;
+                let id = req.id.clone();
+                let handled = AssertUnwindSafe(router.handle(&ctx, req))
+                    .catch_unwind()
+                    .await;
+                let response = match handled {
+                    Ok(response) => response,
+                    Err(payload) => {
+                        let text = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "a panic without a message".to_string());
+                        tracing::error!(conn_id = ctx.conn_id, panic = %text, "a request handler panicked");
+                        id.map(|id| router.panicked(&ctx, id))
+                    }
+                };
+                if let Some(response) = response {
                     send(&ctx, &response).await;
                 }
             });

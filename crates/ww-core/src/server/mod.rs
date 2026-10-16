@@ -6,6 +6,8 @@
 //! - [`serve`] accepts connections. A new instance is always created before a connected one is
 //!   handed to its task, so the pipe name never disappears while the core runs.
 //! - Each connection runs in [`conn`]: NDJSON framing and the order rules of the [`Router`].
+//!   After the handshake at most [`MAX_IN_FLIGHT_PER_CONN`] requests of one connection run at
+//!   once; the next line is read only when one of them has ended (backpressure on the pipe).
 //! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
 //!   wait and steps, then the state databases close, then the pipe.
 
@@ -24,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use ww_platform::pipe::{CreateError, client_pid, create_instance};
 use ww_platform::session_end::{SessionEnd, SessionEndWatcher};
 use ww_platform::{Env, process};
-use ww_protocol::{Request, Response};
+use ww_protocol::{Id, Request, Response};
 
 use crate::config::{CoreConfig, CoreExit};
 use crate::events::EventBus;
@@ -35,6 +37,11 @@ use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
 
 /// Per-connection writer queue (responses and events).
 pub const OUTBOUND_CAPACITY: usize = 256;
+
+/// The requests one connection may have running in their own tasks at once. Requests that
+/// run on the reader ([`Router::runs_inline`], and everything before the handshake) do not
+/// count.
+pub const MAX_IN_FLIGHT_PER_CONN: usize = 64;
 
 /// What a [`Router`] knows about one connection.
 #[derive(Debug)]
@@ -56,15 +63,25 @@ pub trait Router: Send + Sync + 'static {
     fn opened(&self, conn: &ConnCtx);
     /// `false`: each request is handled inline, in order, before the next line is read, so a
     /// request pipelined right behind `core/hello` sees the session. `true`: each request
-    /// runs in its own task.
+    /// runs in its own task (unless [`Router::runs_inline`]), holding one of the connection's
+    /// [`MAX_IN_FLIGHT_PER_CONN`] permits.
     fn handshake_done(&self, conn: &ConnCtx) -> bool;
+    /// After the handshake: `true` if `req` is still handled on the reader, in order and
+    /// without a permit (cheap requests that must not wait behind a full connection).
+    fn runs_inline(&self, req: &Request) -> bool {
+        let _ = req;
+        false
+    }
     /// Handles one request (never a notification). `None` sends nothing.
     fn handle<'a>(
         &'a self,
         conn: &'a ConnCtx,
         req: Request,
     ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>>;
-    /// The connection ended; runs exactly once.
+    /// The response to request `id`, whose handler panicked in its own task (a request run
+    /// on the reader that panics ends the connection instead).
+    fn panicked(&self, conn: &ConnCtx, id: Id) -> Response;
+    /// The connection ended; runs exactly once, also when a handler on the reader panicked.
     fn closed(&self, conn: &ConnCtx);
 }
 
@@ -188,6 +205,8 @@ pub struct RunningCore {
     pipe: String,
     lifecycle: Arc<Lifecycle>,
     state: Arc<StateRegistry>,
+    /// The event bus (ARCH-032).
+    events: Arc<EventBus>,
     /// The gates `test.block` waits on (test channels).
     test_gates: Arc<TestGates>,
     /// The hidden session-end window; `None` if it could not be created.
@@ -205,6 +224,11 @@ impl RunningCore {
     /// The core's databases: the suite `state.db` and the workspace ones.
     pub fn state(&self) -> &Arc<StateRegistry> {
         &self.state
+    }
+
+    /// The event bus.
+    pub fn events(&self) -> &Arc<EventBus> {
+        &self.events
     }
 
     /// The gates of the test-channel tool `test.block`: in-process tests open them.
@@ -288,7 +312,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         core_registry(cfg.test_tools, &test_gates, &state),
         PipelineHooks::plan2(),
         state.clone(),
-        events,
+        events.clone(),
         cfg.ids.clone(),
         cfg.clock.clone(),
         lifecycle.clone(),
@@ -325,6 +349,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         pipe,
         lifecycle,
         state,
+        events,
         test_gates,
         session_end,
         shutdown,
@@ -457,6 +482,9 @@ async fn watch_session_end(
     while let Some(msg) = messages.recv().await {
         match msg {
             SessionEnd::QueryEnd => tracing::info!("the Windows session may end"),
+            SessionEnd::CloseIgnored => {
+                tracing::warn!("the session-end window was sent WM_CLOSE from outside; ignored");
+            }
             SessionEnd::End => {
                 tracing::info!("the Windows session ends");
                 lifecycle.begin_drain(DrainReason::SessionEnd);

@@ -88,3 +88,20 @@ fn session_end_window_is_never_visible() {
     );
     drop(watcher);
 }
+
+#[test] // spec: ARCH-021
+fn outside_wm_close_does_not_destroy_the_window() {
+    let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
+    // A WM_CLOSE sent to the window, as another program could send it, is ignored.
+    assert!(
+        watcher.simulate(SessionEnd::CloseIgnored),
+        "WM_CLOSE destroyed the session-end window"
+    );
+    assert_eq!(recv(&mut rx), SessionEnd::CloseIgnored);
+    // The window still answers the session messages.
+    assert!(watcher.simulate(SessionEnd::QueryEnd));
+    assert_eq!(recv(&mut rx), SessionEnd::QueryEnd);
+    assert!(watcher.is_alive());
+    // Dropping the watcher still destroys it and ends its thread.
+    drop(watcher);
+}

@@ -6,6 +6,11 @@
 //! replies. If the actor panics, `on_fatal("state")` is called once and every queued and later
 //! call returns [`StateError::ActorGone`].
 //!
+//! **Bounded queue.** At most [`STATE_QUEUE`] jobs wait for an actor. A caller that finds the
+//! queue full awaits room (an async wait, never a blocked tokio worker); the actor takes jobs
+//! with `blocking_recv` on its own thread. The actor never waits for the runtime, so a full
+//! queue always drains, and [`StateDb::close`] (which waits for the queued jobs) always ends.
+//!
 //! **Check before write.** An existing file is first opened read-only: `PRAGMA quick_check`
 //! must say `ok` and `PRAGMA user_version` must not exceed the migrations this build knows.
 //! Only then is it opened read-write (WAL, `synchronous=FULL`, `busy_timeout=5000`,
@@ -29,15 +34,14 @@ pub use migrations::{SUITE_MIGRATIONS, WORKSPACE_MIGRATIONS};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension as _, TransactionBehavior, params,
 };
-use tokio::sync::{OnceCell, oneshot};
+use tokio::sync::{OnceCell, mpsc, oneshot};
 use ww_platform::Env;
 
 use crate::store::fsops;
@@ -45,6 +49,9 @@ use crate::workspace::WorkspaceRef;
 
 /// Called once when a database actor dies, with `"state"`.
 pub type OnFatal = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The jobs that may wait for one database actor; a caller past it awaits room.
+pub const STATE_QUEUE: usize = 1024;
 
 /// `PRAGMA busy_timeout`.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -194,10 +201,10 @@ impl StateDb {
         })?;
         release_running(&mut conn).map_err(|e| sql_error(&e))?;
 
-        let (jobs, inbox) = mpsc::channel::<Job>();
+        let (jobs, mut inbox) = mpsc::channel::<Job>(STATE_QUEUE);
         let actor = std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run_actor(conn, &inbox, &on_fatal))
+            .spawn(move || run_actor(conn, &mut inbox, &on_fatal))
             .map_err(|e| StateError::Io(format!("cannot start the database actor: {e}")))?;
         Ok(StateDb {
             path: path.to_path_buf(),
@@ -208,8 +215,9 @@ impl StateDb {
     }
 
     /// Stops the actor once the jobs already queued have run, and waits for it to close the
-    /// connection (a blocking call). Every later call returns [`StateError::ActorGone`].
-    /// Closing again does nothing.
+    /// connection (a blocking call). A call already waiting for room in a full queue still
+    /// gets its job in and run; every later call returns [`StateError::ActorGone`]. Closing
+    /// again does nothing.
     pub fn close(&self) {
         drop(lock(&self.jobs).take());
         let actor = lock(&self.actor).take();
@@ -306,12 +314,15 @@ impl StateDb {
     }
 
     /// Makes the actor panic. Used only by the test-channel tool `test.state_panic` (QA-012).
-    pub fn panic_actor(&self) {
-        if let Some(jobs) = lock(&self.jobs).as_ref() {
-            let _ = jobs.send(Box::new(|_| {
+    pub async fn panic_actor(&self) {
+        let Some(jobs) = lock(&self.jobs).clone() else {
+            return;
+        };
+        let _ = jobs
+            .send(Box::new(|_| {
                 panic!("the state actor was asked to panic (test.state_panic)")
-            }));
-        }
+            }))
+            .await;
     }
 
     /// Runs `f` on the actor's connection.
@@ -324,11 +335,11 @@ impl StateDb {
         let job: Job = Box::new(move |conn| {
             let _ = reply.send(f(conn));
         });
-        lock(&self.jobs)
-            .as_ref()
-            .ok_or(StateError::ActorGone)?
-            .send(job)
-            .map_err(|_| StateError::ActorGone)?;
+        // A clone, so the lock is not held across the wait for room; it is dropped as soon as
+        // the job is in, so it never keeps a closed actor running.
+        let jobs = lock(&self.jobs).clone().ok_or(StateError::ActorGone)?;
+        jobs.send(job).await.map_err(|_| StateError::ActorGone)?;
+        drop(jobs);
         answer.await.map_err(|_| StateError::ActorGone)?
     }
 }
@@ -347,9 +358,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The actor: runs jobs in order until every sender is gone. A panicking job ends it:
 /// `on_fatal("state")` once, then the inbox is dropped, so every queued and later call gets
-/// [`StateError::ActorGone`].
-fn run_actor(mut conn: Connection, inbox: &mpsc::Receiver<Job>, on_fatal: &OnFatal) {
-    while let Ok(job) = inbox.recv() {
+/// [`StateError::ActorGone`] (a caller waiting for room too).
+fn run_actor(mut conn: Connection, inbox: &mut mpsc::Receiver<Job>, on_fatal: &OnFatal) {
+    while let Some(job) = inbox.blocking_recv() {
         if std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut conn))).is_err() {
             tracing::error!(
                 thread = std::thread::current().name().unwrap_or("?"),
@@ -519,10 +530,16 @@ pub struct StateRegistry {
     env: Env,
     on_fatal: OnFatal,
     suite: StateDb,
-    /// One cell per workspace id: the map's lock is held only to find the cell.
-    workspaces: Mutex<HashMap<String, Arc<OnceCell<Arc<StateDb>>>>>,
+    /// The workspace databases and the closed flag, under one lock.
+    workspaces: Mutex<Workspaces>,
+}
+
+/// One cell per workspace id: the lock is held only to find a cell or to close.
+#[derive(Default)]
+struct Workspaces {
+    cells: HashMap<String, Arc<OnceCell<Arc<StateDb>>>>,
     /// Set by [`StateRegistry::close`]: no database is opened any more.
-    closed: AtomicBool,
+    closed: bool,
 }
 
 impl std::fmt::Debug for StateRegistry {
@@ -549,8 +566,7 @@ impl StateRegistry {
             env: env.clone(),
             on_fatal,
             suite,
-            workspaces: Mutex::new(HashMap::new()),
-            closed: AtomicBool::new(false),
+            workspaces: Mutex::new(Workspaces::default()),
         })
     }
 
@@ -560,9 +576,13 @@ impl StateRegistry {
     /// calls it at the end of its shutdown, before it releases its pipe, so a new core that
     /// claims the pipe never finds this one still writing (ARCH-021).
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        // The flag and the cells are read under one lock: see `for_workspace`.
+        let cells: Vec<_> = {
+            let mut workspaces = lock(&self.workspaces);
+            workspaces.closed = true;
+            workspaces.cells.values().cloned().collect()
+        };
         self.suite.close();
-        let cells: Vec<_> = lock(&self.workspaces).values().cloned().collect();
         for cell in cells {
             if let Some(db) = cell.get() {
                 db.close();
@@ -587,16 +607,13 @@ impl StateRegistry {
     /// worked out or the blocking open did not finish; [`StateError::ActorGone`] once the
     /// registry is closed.
     pub async fn for_workspace(&self, ws: &WorkspaceRef) -> Result<Arc<StateDb>, StateError> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(StateError::ActorGone);
-        }
-        let cell = self
-            .workspaces
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(ws.id.clone())
-            .or_default()
-            .clone();
+        let cell = {
+            let mut workspaces = lock(&self.workspaces);
+            if workspaces.closed {
+                return Err(StateError::ActorGone);
+            }
+            workspaces.cells.entry(ws.id.clone()).or_default().clone()
+        };
         let db = cell
             .get_or_try_init(|| {
                 let (env, on_fatal, ws) = (self.env.clone(), self.on_fatal.clone(), ws.clone());
@@ -620,9 +637,12 @@ impl StateRegistry {
                 }
             })
             .await?;
-        // A database opened while `close` ran: `close` either saw it in its cell or this sees
-        // the flag (both are ordered by `SeqCst`), so none stays open.
-        if self.closed.load(Ordering::SeqCst) {
+        // A database opened while `close` ran. The cell was filled before this takes the lock,
+        // and `close` sets the flag and copies the cells under the same lock: if `close` came
+        // first this sees the flag and closes the database; otherwise `close` finds it in its
+        // cell. Either way none stays open.
+        let closed = lock(&self.workspaces).closed;
+        if closed {
             db.close();
             return Err(StateError::ActorGone);
         }
@@ -653,11 +673,11 @@ mod tests {
 
         // A call queued behind the panic, and calls made after it, all fail with ActorGone.
         let pending = rt.block_on(async {
-            db.panic_actor();
+            db.panic_actor().await;
             db.idem_begin("cli|none", "k", "h", 0).await
         });
         assert_eq!(pending, Err(StateError::ActorGone));
-        db.panic_actor();
+        rt.block_on(db.panic_actor());
         for _ in 0..3 {
             assert_eq!(
                 rt.block_on(db.idem_finish("cli|none", "k", None)),
@@ -698,5 +718,80 @@ mod tests {
             .unwrap();
         assert_eq!(json, "{}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A database whose actor is held inside a job until the returned sender is used, with
+    /// [`STATE_QUEUE`] more jobs queued behind it (each counts itself in the returned counter).
+    fn held_and_full(db: &StateDb) -> (std::sync::mpsc::Sender<()>, Arc<AtomicUsize>) {
+        let jobs = lock(&db.jobs).clone().expect("the database is open");
+        assert_eq!(jobs.max_capacity(), STATE_QUEUE);
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        jobs.try_send(Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            let _ = held.recv();
+        }))
+        .unwrap_or_else(|_| panic!("the empty queue refused a job"));
+        started.recv().expect("the actor took the holding job");
+        let ran = Arc::new(AtomicUsize::new(0));
+        for n in 0..STATE_QUEUE {
+            let ran = ran.clone();
+            jobs.try_send(Box::new(move |_| {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }))
+            .unwrap_or_else(|_| panic!("the queue was full after {n} jobs"));
+        }
+        let full = jobs.try_send(Box::new(|_| {}));
+        assert!(
+            matches!(full, Err(mpsc::error::TrySendError::Full(_))),
+            "the queue takes more than {STATE_QUEUE} jobs"
+        );
+        (release, ran)
+    }
+
+    #[test] // spec: QA-012
+    fn state_queue_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_fatal: OnFatal = Arc::new(|_: &str| {});
+        let db = StateDb::open(&dir.path().join("state.db"), StateScope::Suite, on_fatal).unwrap();
+        let (release, ran) = held_and_full(&db);
+
+        // A caller with a full queue waits for room; it neither fails nor blocks its thread.
+        runtime().block_on(async {
+            let mut call = std::pin::pin!(db.diagnostics());
+            tokio::select! {
+                biased;
+                answer = &mut call => panic!("answered with a full queue: {answer:?}"),
+                () = std::future::ready(()) => {}
+            }
+            release.send(()).unwrap();
+            let diagnostics = call.await.expect("answered once there was room");
+            assert_eq!(diagnostics.journal_mode, "wal");
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), STATE_QUEUE);
+    }
+
+    #[test] // spec: ARCH-021, QA-012
+    fn close_drains_a_full_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_fatal: OnFatal = Arc::new(|_: &str| {});
+        let db = Arc::new(
+            StateDb::open(&dir.path().join("state.db"), StateScope::Suite, on_fatal).unwrap(),
+        );
+        let (release, ran) = held_and_full(&db);
+
+        // `close` waits for the queued jobs; with the queue full it still ends.
+        let closing = std::thread::spawn({
+            let db = db.clone();
+            move || db.close()
+        });
+        release.send(()).unwrap();
+        closing.join().expect("close ended");
+        assert_eq!(ran.load(Ordering::SeqCst), STATE_QUEUE);
+        assert!(db.is_closed());
+        assert_eq!(
+            runtime().block_on(db.diagnostics()),
+            Err(StateError::ActorGone)
+        );
     }
 }

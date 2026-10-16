@@ -341,6 +341,11 @@ impl EventBus {
         self.lock().providers.push((topic_prefix.to_string(), p));
     }
 
+    /// How many clients the bus knows (attached or subscribed, not yet dropped).
+    pub fn clients(&self) -> usize {
+        self.lock().clients.len()
+    }
+
     /// How many events wait in `client`'s queue (not yet taken by its forwarder).
     pub fn queued(&self, client: ClientId) -> usize {
         let inner = self.lock();

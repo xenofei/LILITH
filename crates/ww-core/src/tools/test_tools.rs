@@ -234,8 +234,9 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         EffectClass::Read,
         TEST_MODULE,
         move |_ctx, _args: NoArgs| {
-            states.suite().panic_actor();
+            let states = states.clone();
             Box::pin(async move {
+                states.suite().panic_actor().await;
                 Ok((
                     StatePanicResult { requested: true },
                     "the suite state actor was asked to panic".to_string(),

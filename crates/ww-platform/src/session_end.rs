@@ -12,10 +12,15 @@
 //!   blocks until [`SessionEndWatcher::shutdown_complete`] or [`SESSION_END_BUDGET`],
 //!   whichever comes first: Windows ends the process once the message returns.
 //!
+//! **Ownership.** Only the watcher destroys its window, in `Drop`, with a private message
+//! (`WM_APP + 1` carrying a per-watcher random key). A `WM_CLOSE` from anywhere else is
+//! ignored and reported as [`SessionEnd::CloseIgnored`], and a `WM_QUIT` posted from outside
+//! does not end the message loop, so the window lives exactly as long as its watcher.
+//!
 //! [`SessionEndWatcher::simulate`] sends those messages to the watcher's own window, for
 //! tests. Nothing here looks at or enumerates any other window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
@@ -28,10 +33,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IsWindowVisible,
-    MSG, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
-    WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IsWindow,
+    IsWindowVisible, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
+    WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -44,6 +49,9 @@ pub const SESSION_END_BUDGET: Duration = Duration::from_millis(4500);
 /// The window class.
 const CLASS_NAME: PCWSTR = w!("WorldwrightCoreSessionEnd");
 
+/// The private message that destroys the window; its lParam must be the watcher's key.
+const WM_DESTROY_WATCHER: u32 = WM_APP + 1;
+
 /// What the window was told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEnd {
@@ -51,6 +59,9 @@ pub enum SessionEnd {
     QueryEnd,
     /// `WM_ENDSESSION` with wParam TRUE: the session ends.
     End,
+    /// A `WM_CLOSE` (or a destroy message without the watcher's key) came from outside the
+    /// watcher; it was ignored and the window lives on.
+    CloseIgnored,
 }
 
 /// What the window thread and the watcher share.
@@ -59,6 +70,8 @@ struct Shared {
     tx: UnboundedSender<SessionEnd>,
     state: Mutex<Waiting>,
     changed: Condvar,
+    /// The lParam of [`WM_DESTROY_WATCHER`]: random, so only the watcher's `Drop` sends it.
+    destroy_key: isize,
 }
 
 #[derive(Debug, Default)]
@@ -98,9 +111,12 @@ thread_local! {
     /// The window thread's [`Shared`], for the window procedure (which runs on that thread,
     /// also for messages sent from other threads).
     static SHARED: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+    /// The window thread got `WM_DESTROY`: the next `WM_QUIT` ends its message loop.
+    static DESTROYED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The hidden session-end window and its thread. Dropping it destroys the window.
+/// The hidden session-end window and its thread. Dropping it destroys the window; nothing
+/// else does (module docs).
 #[derive(Debug)]
 pub struct SessionEndWatcher {
     /// The window handle's value (an `HWND` is not `Send`).
@@ -117,10 +133,14 @@ impl SessionEndWatcher {
     /// If the window class cannot be registered, or the thread or window cannot be created.
     pub fn start() -> io::Result<(SessionEndWatcher, UnboundedReceiver<SessionEnd>)> {
         let (tx, rx) = unbounded_channel();
+        let mut key = [0u8; 8];
+        getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
         let shared = Arc::new(Shared {
             tx,
             state: Mutex::new(Waiting::default()),
             changed: Condvar::new(),
+            // Never 0, so a message without an lParam never matches.
+            destroy_key: isize::from_ne_bytes(key) | 1,
         });
         let (created_tx, created_rx) = std::sync::mpsc::channel::<io::Result<isize>>();
         let for_thread = shared.clone();
@@ -158,12 +178,15 @@ impl SessionEndWatcher {
     /// window, and waits for the window to handle it. For `QueryEnd` the result is the
     /// window's answer (TRUE: the session may end); for `End`, whether the message was
     /// handled (it returns once the shutdown is complete or the budget is spent).
+    ///
+    /// `CloseIgnored` sends `WM_CLOSE`, as another program could; the result is whether the
+    /// window still answers afterwards.
     pub fn simulate(&self, msg: SessionEnd) -> bool {
         let hwnd = self.hwnd();
         match msg {
             SessionEnd::QueryEnd => {
-                // SAFETY: `hwnd` is this watcher's live window (destroyed only in `Drop`); the
-                // message carries no pointers.
+                // SAFETY: `hwnd` is this watcher's live window: only `Drop` destroys it
+                // (module docs). The message carries no pointers.
                 let answer = unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, None, None) };
                 answer.0 != 0
             }
@@ -172,7 +195,18 @@ impl SessionEndWatcher {
                 unsafe { SendMessageW(hwnd, WM_ENDSESSION, Some(WPARAM(1)), Some(LPARAM(0))) };
                 true
             }
+            SessionEnd::CloseIgnored => {
+                // SAFETY: as above; the window ignores the message.
+                unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
+                self.is_alive()
+            }
         }
+    }
+
+    /// Whether the window still exists. It does until the watcher is dropped.
+    pub fn is_alive(&self) -> bool {
+        // SAFETY: plain call on a handle value; a destroyed window reads as `false`.
+        unsafe { IsWindow(Some(self.hwnd())) }.as_bool()
     }
 
     /// Whether the window is visible. It never is (ARCH-005).
@@ -192,12 +226,20 @@ impl SessionEndWatcher {
 }
 
 impl Drop for SessionEndWatcher {
-    /// Lets a waiting `WM_ENDSESSION` return, closes the window and waits for its thread.
+    /// Lets a waiting `WM_ENDSESSION` return, destroys the window (the private message with
+    /// the key) and waits for its thread.
     fn drop(&mut self) {
         self.shutdown_complete();
-        // SAFETY: `hwnd` is this watcher's window; posting carries no pointers. If the window
-        // is already gone the post fails and the thread has ended by itself.
-        let posted = unsafe { PostMessageW(Some(self.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        // SAFETY: `hwnd` is this watcher's window, alive until this message is handled;
+        // posting carries no pointers. If posting fails anyway, the thread is not waited for.
+        let posted = unsafe {
+            PostMessageW(
+                Some(self.hwnd()),
+                WM_DESTROY_WATCHER,
+                WPARAM(0),
+                LPARAM(self.shared.destroy_key),
+            )
+        };
         if let Some(thread) = self.thread.take()
             && posted.is_ok()
             && thread.thread().id() != std::thread::current().id()
@@ -278,9 +320,17 @@ fn window_thread(shared: Arc<Shared>, created: &std::sync::mpsc::Sender<io::Resu
         // SAFETY: `msg` is a valid out-pointer; `None` takes messages for every window of
         // this thread (only the session-end window).
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        // 0: WM_QUIT; -1: an error.
-        if got.0 == 0 || got.0 == -1 {
+        // -1: an error.
+        if got.0 == -1 {
             break;
+        }
+        // 0: WM_QUIT. Only the one `WM_DESTROY` posts ends the loop; one posted from
+        // outside is ignored.
+        if got.0 == 0 {
+            if DESTROYED.with(Cell::get) {
+                break;
+            }
+            continue;
         }
         // SAFETY: `msg` was filled by `GetMessageW`.
         unsafe {
@@ -315,12 +365,21 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_CLOSE => {
-            // SAFETY: `hwnd` is the window this procedure serves, on its own thread.
+        WM_DESTROY_WATCHER if shared().is_some_and(|s| lparam.0 == s.destroy_key) => {
+            // SAFETY: `hwnd` is the window this procedure serves, on its own thread; the key
+            // shows the watcher's `Drop` sent this.
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
+        // From outside the watcher: the window stays (module docs).
+        WM_CLOSE | WM_DESTROY_WATCHER => {
+            if let Some(shared) = shared() {
+                let _ = shared.tx.send(SessionEnd::CloseIgnored);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            DESTROYED.with(|d| d.set(true));
             // SAFETY: plain call; ends this thread's message loop.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)

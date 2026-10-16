@@ -382,3 +382,82 @@ async fn refused_connections_leave_no_task_behind() {
     core.request_drain();
     assert_eq!(core.wait().await.reason, DrainReason::Requested);
 }
+
+/// One `test.block` call on `gate` with its own idempotency key, as a request line.
+fn block_line(id: u64, gate: &str) -> String {
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": "test.block", "arguments": {"gate": gate}, "idempotency_key": format!("k{id}")},
+    })
+    .to_string()
+}
+
+#[test] // spec: ARCH-025, ARCH-021
+fn in_flight_is_capped_per_connection() {
+    let env = TestEnv::new();
+    let core = core(&env);
+    let lifecycle = core.core().lifecycle().clone();
+    let cap = ww_core::MAX_IN_FLIGHT_PER_CONN as u64;
+    core.core().test_gates().open("free");
+
+    // One write: `cap` calls that wait on their own closed gates, then one on an open gate.
+    let mut busy = connect(&env, json!({}));
+    let mut lines: Vec<String> = (1..=cap)
+        .map(|id| block_line(id, &format!("held-{id}")))
+        .collect();
+    lines.push(block_line(cap + 1, "free"));
+    busy.send_line(&lines.join("\n"));
+    wait_until("the capped calls to be in flight", || {
+        lifecycle.in_flight() == ww_core::MAX_IN_FLIGHT_PER_CONN
+    });
+
+    // The call past the cap has not run: the first run on the open gate is this one, on
+    // another connection, which the cap does not touch.
+    let mut other = connect(&env, json!({}));
+    let first = other.tool("test.block", json!({"gate": "free"}), Some("other"));
+    assert_eq!(first["status"], "ok", "{first}");
+    assert_eq!(first["structured"]["executions"], 1, "{first}");
+
+    // One gate opens: that call answers, its permit goes to the waiting call, which runs then.
+    core.core().test_gates().open("held-1");
+    let answered: Vec<Value> = (0..2)
+        .map(|_| {
+            let line = busy
+                .read_line(DEADLINE)
+                .expect("a response within the deadline");
+            serde_json::from_str(&line).expect("a JSON line")
+        })
+        .collect();
+    assert_eq!(answered[0]["id"], 1, "{answered:?}");
+    assert_eq!(answered[1]["id"], cap + 1, "{answered:?}");
+    assert_eq!(
+        answered[1]["result"]["structured"]["executions"], 2,
+        "{answered:?}"
+    );
+
+    // A drain on the other connection is not held up by the full connection; it waits for
+    // the calls in flight, which end once their gates open, and the core stops.
+    let drain = other.call("core/drain", json!({}));
+    assert_eq!(
+        drain["result"],
+        json!({"status": "ok", "draining": true}),
+        "{drain}"
+    );
+    for id in 2..=cap {
+        core.core().test_gates().open(&format!("held-{id}"));
+    }
+    let report = core.wait_stopped(DEADLINE).expect("the core stops");
+    assert_eq!(report.reason, DrainReason::Requested);
+    assert_eq!(report.abandoned_calls, 0);
+}
+
+#[test] // spec: ARCH-020
+fn idle_core_exits_0_end_to_end() {
+    let env = TestEnv::new();
+    let mut core = CoreFixture::start_with_env(&env, &[(ww_platform::ENV_TEST_IDLE_SECS, "1")]);
+    assert_eq!(
+        core.wait_exit(DEADLINE),
+        Some(0),
+        "an idle test core with WW_TEST_IDLE_SECS=1 must exit 0"
+    );
+}

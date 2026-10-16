@@ -24,7 +24,7 @@ use ww_core::{
 use ww_platform::TEST_PIPE_SID;
 use ww_platform::pipe::open_client;
 use ww_platform::process::SystemInspector;
-use ww_protocol::{Request, Response, RpcError, rpc_code};
+use ww_protocol::{Id, Request, Response, RpcError, rpc_code};
 use ww_testkit::{CoreFixture, FakeClock, RawPipe, SeqIds, TestEnv};
 
 /// Failure deadline for anything the test waits on.
@@ -118,6 +118,13 @@ impl Router for Fake {
                 }),
             }
         })
+    }
+
+    fn panicked(&self, _conn: &ConnCtx, id: Id) -> Response {
+        Response::Error {
+            id: Some(id),
+            error: RpcError::new(-32603, "the handler panicked"),
+        }
     }
 
     fn closed(&self, _conn: &ConnCtx) {

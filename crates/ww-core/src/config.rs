@@ -35,6 +35,10 @@ pub struct CoreConfig {
     pub test_tools: bool,
     /// Test channels only: the core exits 0 once this process is gone.
     pub test_parent_pid: Option<u32>,
+    /// The crate's own unit tests only (compiled out of every build): a request with this
+    /// method panics in the router, to test how the transport survives a panicking handler.
+    #[cfg(test)]
+    pub panic_on_method: Option<&'static str>,
 }
 
 impl CoreConfig {
@@ -59,6 +63,8 @@ impl CoreConfig {
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
             test_tools,
             test_parent_pid: overrides.parent_pid,
+            #[cfg(test)]
+            panic_on_method: None,
         })
     }
 }
