@@ -1,4 +1,5 @@
-//! The store: the only module in `ww-core` allowed to write files (ARCH-112, QA-024).
+//! The file-write home of `ww-core` (ARCH-112, QA-024): the only file in the crate with
+//! `#[allow(clippy::disallowed_methods)]`, one per function.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -6,8 +7,8 @@ use std::path::Path;
 /// Writes `bytes` to `path` atomically: the data goes to `<path>.tmp-<pid>`, is flushed to disk
 /// with `sync_all`, and is then renamed over the target.
 ///
-/// This is the single file-write allowance in `ww-core` (ARCH-112); it is a stub that plan 2
-/// completes (directory fsync, crash-recovery of stale temp files, failure injection).
+/// This is a stub that plan 2b completes (directory fsync, crash-recovery of stale temp files,
+/// failure injection).
 ///
 /// On Windows, `std::fs::rename` replaces an existing target (MoveFileEx with
 /// replace-existing).
@@ -32,9 +33,24 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Creates `path` and any missing parents; an existing folder is fine.
+#[allow(clippy::disallowed_methods)]
+pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_file_atomic;
+    use super::{ensure_dir, write_file_atomic};
+
+    #[test] // spec: ARCH-112
+    fn ensure_dir_creates_nested_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("a").join("b c");
+        ensure_dir(&nested).expect("first call");
+        ensure_dir(&nested).expect("an existing folder is fine");
+        assert!(nested.is_dir());
+    }
 
     #[test]
     fn atomic_write_replaces_contents() {

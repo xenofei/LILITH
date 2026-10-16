@@ -1,5 +1,5 @@
-tests = []
 # Each entry: { name = "<binary>::<test file>::<test fn>", rule = "QA-xxx", file = "tests/....rs" }
 # e.g. name = "ww-spec-tests::smoke::spec_harness_runs" (the JUnit classname::name).
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
+tests = []

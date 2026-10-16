@@ -1,11 +1,12 @@
 //! Single file-write allowance test (ARCH-112, QA-024).
 //!
-//! `ww-core` forbids file-mutating std calls through `crates/ww-core/clippy.toml`. The one
-//! exception is `store::write_file_atomic`, which carries `#[allow(clippy::disallowed_methods)]`.
+//! `ww-core` forbids file-mutating std and tokio calls through `crates/ww-core/clippy.toml`.
+//! The exceptions are the functions of `src/store/fsops.rs` (`write_file_atomic`,
+//! `ensure_dir`, ...), each carrying its own `#[allow(clippy::disallowed_methods)]`.
 //! This test scans every `*.rs` file under `crates/ww-core/src` and asserts that the allowance
-//! (or an `expect` of the same lint) appears only in `store.rs`, and that each occurrence
-//! attaches to a single function (no module-level or crate-level blanket allowance, and at
-//! most one allowance per function).
+//! (or an `expect` of the same lint) appears only in `src/store/fsops.rs`, that the file exists,
+//! and that each occurrence attaches to a single function (no module-level or crate-level
+//! blanket allowance, and at most one allowance per function).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,20 +44,17 @@ fn is_allowance(line: &str) -> bool {
 
 #[test]
 fn disallowed_methods_allowance_only_in_store_on_single_functions() {
+    let src = core_src();
+    let fsops = src.join("store").join("fsops.rs");
     let mut files = Vec::new();
-    rust_files(&core_src(), &mut files);
+    rust_files(&src, &mut files);
     assert!(!files.is_empty(), "no sources found under ww-core/src");
 
     let mut problems = Vec::new();
     let mut store_seen = false;
 
     for file in &files {
-        let name = file
-            .file_name()
-            .expect("file name")
-            .to_string_lossy()
-            .into_owned();
-        let in_store = name == "store.rs";
+        let in_store = *file == fsops;
         store_seen |= in_store;
         let text = fs::read_to_string(file).expect("read source");
         let lines: Vec<&str> = text.lines().collect();
@@ -67,7 +65,7 @@ fn disallowed_methods_allowance_only_in_store_on_single_functions() {
             }
             if !in_store {
                 problems.push(format!(
-                    "{}:{}: allowance outside store.rs",
+                    "{}:{}: allowance outside store/fsops.rs",
                     file.display(),
                     i + 1
                 ));
@@ -120,7 +118,7 @@ fn disallowed_methods_allowance_only_in_store_on_single_functions() {
         }
     }
 
-    assert!(store_seen, "ww-core/src/store.rs is missing");
+    assert!(store_seen, "ww-core/src/store/fsops.rs is missing");
     assert!(
         problems.is_empty(),
         "single-write allowance violated:\n{}",
