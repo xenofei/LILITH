@@ -8,23 +8,43 @@
 /// The variable that arms fail points in a test-channel core.
 pub const ENV: &str = "WW_TEST_FAILPOINTS";
 
+/// Every fail point name (Global Constraints, "Fail points"), a closed list.
+pub const NAMES: &[&str] = &[
+    "store.write_temp",
+    "store.replace",
+    "store.after_replace",
+    "store.between_renames",
+    "store.put_back",
+    "store.suite_toml",
+    "store.after_output",
+    "store.after_manifest",
+    "store.after_jobs_log",
+    "store.after_progress",
+    "store.after_index",
+    "store.after_seal",
+    "watch.start",
+];
+
+/// Every fail point action, a closed list.
+pub const ACTIONS: &[&str] = &["abort", "disk_full", "busy", "unsupported", "io"];
+
 /// The value of [`ENV`] for `points`: `name=action` pairs joined by `,`, in the given order.
 ///
 /// # Panics
-/// If a name or action is empty or contains `=`, `,` or whitespace, which the format cannot
-/// carry.
+/// If a name is not in [`NAMES`] or an action not in [`ACTIONS`]: a core ignores an unknown
+/// fail point, so a typo would otherwise make the test silently test nothing.
 pub fn spec(points: &[(&str, &str)]) -> String {
-    let check = |what: &str, s: &str| {
-        assert!(
-            !s.is_empty() && !s.contains(['=', ',']) && !s.contains(char::is_whitespace),
-            "fail point {what} {s:?} cannot be written in {ENV}"
-        );
-    };
     points
         .iter()
         .map(|(name, action)| {
-            check("name", name);
-            check("action", action);
+            assert!(
+                NAMES.contains(name),
+                "unknown fail point name {name:?}; the names are {NAMES:?}"
+            );
+            assert!(
+                ACTIONS.contains(action),
+                "unknown fail point action {action:?} for {name}; the actions are {ACTIONS:?}"
+            );
             format!("{name}={action}")
         })
         .collect::<Vec<_>>()
@@ -48,7 +68,23 @@ mod tests {
             ]),
             "store.between_renames=abort,watch.start=unsupported,store.write_temp=disk_full"
         );
-        for bad in [("a=b", "abort"), ("store.replace", "a,b"), ("", "io")] {
+        // Every name and action of the closed lists is accepted.
+        assert_eq!((NAMES.len(), ACTIONS.len()), (13, 5));
+        for name in NAMES {
+            for action in ACTIONS {
+                assert_eq!(spec(&[(name, action)]), format!("{name}={action}"));
+            }
+        }
+        // A typo panics instead of arming nothing.
+        for bad in [
+            ("store.replcae", "abort"),
+            ("store.replace", "crash"),
+            ("Store.replace", "abort"),
+            ("store.replace", "Abort"),
+            ("a=b", "abort"),
+            ("store.replace", "a,b"),
+            ("", "io"),
+        ] {
             assert!(
                 std::panic::catch_unwind(|| spec(&[bad])).is_err(),
                 "{bad:?} was accepted"

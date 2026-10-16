@@ -17,7 +17,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead as _, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -29,13 +29,19 @@ use ww_platform::{
 
 use crate::bins::ensure_built;
 use crate::core::DrainCounts;
+use crate::gitops::LEAKY_GIT_VARS;
 
 /// An isolated `Env`: channel `Test(<8 lowercase hex>)`, roots under a fresh temporary
 /// directory that is deleted on drop.
 pub struct TestEnv {
     pub env: Env,
-    /// What the drop's cleanup did (probes and hellos), shared with the test that checks it.
+    /// What the drop's cleanup did (probes, retries and hellos), shared with the test that
+    /// checks it.
     drain_counts: Arc<DrainCounts>,
+    /// Set once this env started a `ww` that may outlive the call ([`TestEnv::ww_spawn`]) or a
+    /// core ([`crate::CoreFixture`]): the drop then gives a pipe that is not there yet a short
+    /// retry, since such a process may still be starting.
+    pub(crate) launched: AtomicBool,
     _dir: TempDir,
 }
 
@@ -88,6 +94,7 @@ impl TestEnv {
         TestEnv {
             env,
             drain_counts: Arc::default(),
+            launched: AtomicBool::new(false),
             _dir: dir,
         }
     }
@@ -153,14 +160,25 @@ impl TestEnv {
     /// # Panics
     /// If `ww` cannot be started.
     pub fn ww_spawn(&self, args: &[&str]) -> WwChild {
+        self.launched.store(true, Ordering::Relaxed);
         let mut cmd = self.ww_command(self.root(), args);
         WwChild::spawn(&mut cmd, format!("ww {}", args.join(" ")))
     }
 
     fn ww_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(&ensure_built().ww);
-        cmd.args(args).current_dir(dir).envs(self.child_env());
+        cmd.args(args).current_dir(dir);
+        self.apply_child_env(&mut cmd);
         cmd
+    }
+
+    /// Gives `cmd` this channel's environment: removes [`LEAKY_GIT_VARS`] (inherited or set
+    /// on `cmd`), then adds [`TestEnv::child_env`].
+    pub(crate) fn apply_child_env(&self, cmd: &mut Command) {
+        for var in LEAKY_GIT_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.envs(self.child_env());
     }
 
     fn run_ww(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> WwOutput {
@@ -339,7 +357,11 @@ impl Drop for TestEnv {
     /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Runs before the
     /// temporary directory is removed. Never panics.
     fn drop(&mut self) {
-        crate::core::drain_channel(&self.env.pipe_name(), Arc::clone(&self.drain_counts));
+        crate::core::drain_channel(
+            &self.env.pipe_name(),
+            self.launched.load(Ordering::Relaxed),
+            Arc::clone(&self.drain_counts),
+        );
     }
 }
 
@@ -748,23 +770,82 @@ mod tests {
         let counts = Arc::clone(&t.drain_counts);
         drop(t);
         assert_eq!(counts.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.retries.load(Ordering::Relaxed), 0);
         assert_eq!(counts.hellos.load(Ordering::Relaxed), 0);
     }
 
-    /// Set in the helper child's environment: `core::tests::helper_sleep_forever` sleeps.
-    const HELPER_ENV: &str = "WW_TESTKIT_HELPER_SLEEP";
+    /// After this env launched a `ww` or a core, a pipe that is not there yet gets the short
+    /// retry (it may still be starting); with none there, still no hello.
+    #[test] // spec: QA-041
+    fn drop_after_a_launch_retries_a_missing_pipe() {
+        let t = TestEnv::new();
+        t.launched.store(true, Ordering::Relaxed);
+        let counts = Arc::clone(&t.drain_counts);
+        drop(t);
+        assert_eq!(counts.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.retries.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.hellos.load(Ordering::Relaxed), 0);
+    }
+
+    /// Set in the helper child's environment: `helper_print_env` prints the variables below.
+    const PRINT_ENV_ENV: &str = "WW_TESTKIT_HELPER_PRINT_ENV";
+    /// The variables `helper_print_env` reports.
+    const PRINTED_VARS: &[&str] = &["GIT_DIR", "GIT_CONFIG_PARAMETERS", "WW_CHANNEL", "HOME"];
+
+    /// With `PRINT_ENV_ENV` set, prints `<name>=<value>` or `<name> unset` for each of
+    /// `PRINTED_VARS`; otherwise does nothing.
+    #[test]
+    fn helper_print_env() {
+        if std::env::var_os(PRINT_ENV_ENV).is_none() {
+            return;
+        }
+        for name in PRINTED_VARS {
+            match std::env::var_os(name) {
+                Some(value) => println!("{name}={}", value.to_string_lossy()),
+                None => println!("{name} unset"),
+            }
+        }
+    }
+
+    /// A child given this channel's environment never sees a `GIT_DIR` or
+    /// `GIT_CONFIG_PARAMETERS` from the test's own environment (here set on the `Command`,
+    /// which stands in for an inherited one), so a `ww`, the core it starts and their `git`
+    /// runs never act on another repository.
+    #[test] // spec: QA-038
+    fn ww_children_do_not_inherit_git_dir() {
+        let t = TestEnv::new();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["env::tests::helper_print_env", "--exact", "--nocapture"])
+            .env("GIT_DIR", t.root().join("elsewhere").join(".git"))
+            .env("GIT_CONFIG_PARAMETERS", "'core.autocrlf'='true'");
+        t.apply_child_env(&mut cmd);
+        cmd.env(PRINT_ENV_ENV, "1");
+        let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
+        let lines: Vec<String> = child.stdout_lines().collect();
+        assert_eq!(child.wait(Duration::from_secs(30)), Some(0));
+        for want in [
+            "GIT_DIR unset".to_string(),
+            "GIT_CONFIG_PARAMETERS unset".to_string(),
+            format!("WW_CHANNEL={}", t.env.channel()),
+            format!("HOME={}", t.root().join("profile").display()),
+        ] {
+            assert!(lines.contains(&want), "no `{want}` in {lines:?}");
+        }
+        for var in LEAKY_GIT_VARS {
+            assert!(
+                !t.child_env().iter().any(|(k, _)| k == var),
+                "{var} must be removed, never set"
+            );
+        }
+    }
 
     #[test] // spec: QA-041
     fn ww_child_is_killed_on_drop() {
         // The test binary is the long-running child (ruling P6), started as `ww_spawn` starts
         // `ww`, with output piped.
         let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args([
-            "core::tests::helper_sleep_forever",
-            "--exact",
-            "--nocapture",
-        ])
-        .env(HELPER_ENV, "1");
+        cmd.args([crate::core::HELPER_SLEEP_TEST, "--exact", "--nocapture"])
+            .env(crate::core::HELPER_SLEEP_ENV, "1");
         let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
         let probe = ww_platform::process::open(child.pid()).expect("open the helper");
         assert_eq!(

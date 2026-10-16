@@ -70,12 +70,14 @@ mod tests {
             assert_eq!(held.share(), share);
             let err = replace_file(&target, &replacement, &backup)
                 .expect_err("a replace while another handle holds the target");
+            // Recorded in the test output, for the store's retry classes.
+            eprintln!("held with {share:?}: {err:?}");
             assert!(
                 matches!(
                     classify(&err),
                     RetryClass::SharingViolation | RetryClass::ReplaceRetry
                 ),
-                "{share:?}: {err} ({:?})",
+                "{share:?}: {err:?} (os error {:?})",
                 err.raw_os_error()
             );
             held.release();

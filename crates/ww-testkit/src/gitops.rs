@@ -21,9 +21,11 @@ use crate::env::TestEnv;
 const AUTHOR: &str = "sample-author";
 const AUTHOR_EMAIL: &str = "sample-author@example.invalid";
 
-/// Variables that would make a kit `git` run act on another repository or read configuration
-/// from the environment. Removed from every run of [`TestEnv::git`] and [`TestEnv::git_init`].
-const LEAKY_GIT_VARS: &[&str] = &[
+/// Variables that would make a `git` run act on another repository or read configuration
+/// from the environment. Removed from every run of [`TestEnv::git`] and [`TestEnv::git_init`],
+/// and from every `ww` a test starts (so from the cores and `git` runs it starts too). They are
+/// removed, never set empty: git treats an empty `GIT_DIR` as set and fails.
+pub(crate) const LEAKY_GIT_VARS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
