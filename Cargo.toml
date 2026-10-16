@@ -11,7 +11,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 sha2 = "0.11"
 windows = "0.62"
@@ -50,6 +50,11 @@ tracing-subscriber = { version = "0.3.23", features = ["json"] }
 tracing-appender = "0.2.5"
 # Session, trace and idempotency ids: ww-platform only, never ww-protocol (ARCH-111).
 getrandom = "0.4.3"
+# Plan 2b (core platform I-b), pinned to the crates.io releases current on 2026-10-16.
+# proptest without `fork`, `timeout` and `bit-set`: no rusty-fork or wait-timeout in the tree.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+# suite.toml edits that keep comments and unknown keys (CORE-007).
+toml_edit = "0.22.27"
 
 # The reviewer key's scrypt (N = 2^18) takes minutes unoptimised; optimise just the KDF so
 # `ww dev reviewer-setup` / `approve` and their tests stay quick in dev and test builds.
@@ -60,6 +65,10 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.sha2]
+opt-level = 3
+
+# The index benchmarks (plan 2b Task 10) should not be dominated by unoptimised SQLite.
+[profile.dev.package.libsqlite3-sys]
 opt-level = 3
 
 [workspace.lints.rust]

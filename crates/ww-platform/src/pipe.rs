@@ -185,6 +185,23 @@ pub fn server_pid(client: &NamedPipeClient) -> io::Result<u32> {
 /// order. A missing (NULL) DACL, which would allow everyone, is an error, as is any other kind
 /// of entry.
 pub fn instance_dacl_sids(server: &NamedPipeServer) -> io::Result<Vec<String>> {
+    Ok(instance_dacl(server)?.into_iter().map(|e| e.sid).collect())
+}
+
+/// One entry of a pipe instance's DACL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaclEntry {
+    /// The SID string the entry applies to.
+    pub sid: String,
+    /// `true` for an access-allowed entry, `false` for access-denied.
+    pub allowed: bool,
+    /// The entry's access mask, as stored.
+    pub mask: u32,
+}
+
+/// The access-allowed and access-denied entries of the instance's DACL, in order, with their
+/// access masks. Errors as [`instance_dacl_sids`].
+pub fn instance_dacl(server: &NamedPipeServer) -> io::Result<Vec<DaclEntry>> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: the handle is the server's open pipe handle (opened with READ_CONTROL as part of
@@ -236,10 +253,17 @@ pub fn instance_dacl_sids(server: &NamedPipeServer) -> io::Result<Vec<String>> {
                 "the pipe's DACL has an unexpected entry type {kind}"
             )));
         }
-        // SAFETY: allowed and denied ACEs share the ACCESS_ALLOWED_ACE layout, whose SID
-        // starts at `SidStart`.
-        let sid = unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
-        sids.push(sid_string(PSID(sid))?);
+        // SAFETY: allowed and denied ACEs share the ACCESS_ALLOWED_ACE layout, whose `Mask`
+        // follows the header and whose SID starts at `SidStart`.
+        let (mask, sid) = unsafe {
+            let entry = ace.cast::<ACCESS_ALLOWED_ACE>();
+            ((*entry).Mask, (&raw mut (*entry).SidStart).cast())
+        };
+        sids.push(DaclEntry {
+            sid: sid_string(PSID(sid))?,
+            allowed: kind == ACCESS_ALLOWED_ACE_TYPE,
+            mask,
+        });
     }
     Ok(sids)
 }

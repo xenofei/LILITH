@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+use crate::paths::strip_verbatim;
 use crate::process_env::{
     ENV_CHANNEL, ENV_TEST_IDLE_SECS, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, TEST_PIPE_SID,
     TestOverrides,
@@ -156,6 +157,9 @@ impl std::error::Error for EnvError {
         }
     }
 }
+
+/// The machine id on every test channel (ARCH-081).
+pub const TEST_MACHINE_ID: &str = "testmachine";
 
 /// Machine-specific values for one channel.
 #[derive(Debug, Clone)]
@@ -392,6 +396,18 @@ impl Env {
         )
     }
 
+    /// The `<machine>` of append-log names (ARCH-081): [`TEST_MACHINE_ID`] on test channels,
+    /// else [`machine_id_from`] of the computer name (`COMPUTERNAME`; `unknown` when unset).
+    pub fn machine_id(&self) -> String {
+        match self.channel {
+            Channel::Test(_) => TEST_MACHINE_ID.to_string(),
+            Channel::Stable | Channel::Dev => match std::env::var("COMPUTERNAME") {
+                Ok(name) if !name.is_empty() => machine_id_from(&name),
+                _ => "unknown".to_string(),
+            },
+        }
+    }
+
     /// `<user_profile>\.claude`
     pub fn claude_default_profile_dir(&self) -> PathBuf {
         guard::check_path(self.roots.user_profile.join(".claude"))
@@ -403,16 +419,22 @@ impl Env {
     }
 }
 
-/// Removes a leading `\\?\` (and turns `\\?\UNC\server\share` into `\\server\share`).
-fn strip_verbatim(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        path.to_path_buf()
-    }
+/// The machine id of append-log names (ARCH-081): `computer_name` lowercased, with every
+/// character outside `[a-z0-9-]` replaced by `-`, one `-` per character. Lowercasing is ASCII:
+/// a non-ASCII letter is outside the set either way, so each input character maps to exactly
+/// one output character.
+pub fn machine_id_from(computer_name: &str) -> String {
+    computer_name
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// The spelling that is hashed: no `\\?\`, ASCII-lowercase, `\` separators, no trailing
@@ -803,6 +825,34 @@ mod tests {
             Env::from_system(Channel::Test("a b".into())),
             Err(EnvError::InvalidChannel(_))
         ));
+    }
+
+    #[test] // spec: ARCH-081
+    fn machine_id_is_lowercase_and_restricted() {
+        assert_eq!(machine_id_from("DESK_01.Ünï"), "desk-01--n-");
+        assert_eq!(machine_id_from("Build-Box-7"), "build-box-7");
+        for name in ["DESK_01.Ünï", r"a b\c", "Ünïcödé space", "😀x", "A-Z_0.9"] {
+            let id = machine_id_from(name);
+            assert_eq!(id.chars().count(), name.chars().count(), "{name:?}");
+            assert!(
+                id.bytes()
+                    .all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-')),
+                "{name:?} -> {id:?}"
+            );
+        }
+        // `Env::machine_id` is the pure function over the real name.
+        let real = std::env::var("COMPUTERNAME").unwrap_or_default();
+        let want = if real.is_empty() {
+            "unknown".to_string()
+        } else {
+            machine_id_from(&real)
+        };
+        assert_eq!(env(Channel::Dev).machine_id(), want);
+    }
+
+    #[test] // spec: ARCH-081
+    fn test_channel_machine_id_is_testmachine() {
+        assert_eq!(env(Channel::Test("ab".into())).machine_id(), "testmachine");
     }
 
     #[test]

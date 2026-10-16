@@ -111,6 +111,9 @@ pub enum ServerLine {
 
 /// Parses one line from a client. On failure, returns the id to echo (when it could be read)
 /// and the protocol fault to send.
+// `RpcError` carries a `serde_json::Value`, which `preserve_order` (ARCH-076) makes an ordered
+// map; the error path runs once per bad line, so its size costs nothing worth a box.
+#[allow(clippy::result_large_err)]
 pub fn parse_request(line: &str) -> Result<Request, (Option<Id>, RpcError)> {
     if line.len() > MAX_LINE_BYTES {
         return Err((

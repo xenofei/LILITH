@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ww_platform::paths::strip_verbatim;
 use ww_platform::{Env, check_workspace};
 use ww_protocol::codes::{WORKSPACE_UNKNOWN, WORKSPACE_UNSUPPORTED};
 use ww_protocol::{ErrorBody, Fix, NO_WORKSPACE, UiAction};
@@ -136,15 +137,8 @@ fn id_of(path: &Path) -> Option<(String, PathBuf)> {
         return None;
     }
     let id = Env::workspace_hash(&canonical);
-    let text = canonical.to_string_lossy();
-    let plain = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        canonical.clone()
-    };
-    Some((id, plain))
+    // Shown as `hello.workspace.path`: the prefix goes, the case stays (never `folder_key`).
+    Some((id, strip_verbatim(&canonical)))
 }
 
 #[cfg(test)]

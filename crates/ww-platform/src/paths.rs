@@ -1,0 +1,120 @@
+//! Path spellings for comparison and display (ARCH-027, ARCH-097, QA-038).
+//!
+//! - [`folder_key`] is the one spelling folders are compared by (trusted executable folders,
+//!   workspace paths). It is for comparison only and never hashed: the workspace hash keeps its
+//!   own plan-1 ASCII-lowercase normalisation (`env::normalise_for_hash`).
+//! - [`strip_verbatim`] removes the `\\?\` prefix from a path that is shown, keeping its case.
+
+use std::path::{Path, PathBuf};
+
+/// A folder's spelling for comparison:
+/// - canonical when it exists (short names, junctions and `subst` drives resolved);
+/// - without `\\?\`, and `\\?\UNC\server\share` as `\\server\share`;
+/// - `\` separators;
+/// - no trailing separator, except on a bare drive root, which stays `x:\`;
+/// - Unicode lowercase.
+pub fn folder_key(path: &Path) -> String {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    spelling_key(&path)
+}
+
+/// The pure half of [`folder_key`]: everything except canonicalisation.
+fn spelling_key(path: &Path) -> String {
+    let text = strip_verbatim(path).to_string_lossy().replace('/', r"\");
+    let trimmed = text.trim_end_matches('\\');
+    let key = if trimmed.ends_with(':') {
+        format!(r"{trimmed}\")
+    } else {
+        trimmed.to_string()
+    };
+    key.to_lowercase()
+}
+
+/// Removes a leading `\\?\` (and turns `\\?\UNC\server\share` into `\\server\share`). Keeps the
+/// case and everything else: for paths that are shown, such as `WorkspaceRef.path`.
+pub fn strip_verbatim(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::process::run_hidden;
+
+    #[test] // spec: ARCH-027, ARCH-097
+    fn folder_key_strips_prefixes_case_and_trailing_separators() {
+        assert_eq!(folder_key(Path::new(r"\\?\C:\Ws\")), r"c:\ws");
+        assert_eq!(folder_key(Path::new(r"c:\ws")), r"c:\ws");
+        assert_eq!(folder_key(Path::new("C:/Ws//")), r"c:\ws");
+        // UNC spellings go through the pure half: canonicalising `\\srv\share` would look the
+        // server up on the network, and tests use no network.
+        assert_eq!(
+            spelling_key(Path::new(r"\\?\UNC\srv\share\x")),
+            r"\\srv\share\x"
+        );
+        assert_eq!(spelling_key(Path::new(r"\\srv\share\X\")), r"\\srv\share\x");
+        assert_eq!(folder_key(Path::new(r"Z:\")), r"z:\");
+        assert_eq!(folder_key(Path::new(r"\\?\Z:\")), r"z:\");
+        assert_eq!(folder_key(Path::new("Z:")), r"z:\");
+        // Unicode lowercase, not just ASCII.
+        assert_eq!(
+            folder_key(Path::new(r"Z:\NO SUCH\ÜNÏCÖDÉ SPACE")),
+            r"z:\no such\ünïcödé space"
+        );
+    }
+
+    #[test] // spec: ARCH-097
+    fn strip_verbatim_keeps_case() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\Ünïcödé space\Ws")),
+            PathBuf::from(r"C:\Ünïcödé space\Ws")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\srv\share\X")),
+            PathBuf::from(r"\\srv\share\X")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\Plain\Ws")),
+            PathBuf::from(r"C:\Plain\Ws")
+        );
+    }
+
+    /// A junction compares equal to its target: `mklink /J` in a temp folder, run through
+    /// `%ComSpec%` with relative names so no quoting is involved.
+    #[test] // spec: ARCH-027
+    fn folder_key_resolves_a_junction_to_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        let comspec = std::env::var_os("ComSpec").expect("ComSpec is set");
+        let args: Vec<&OsStr> = ["/c", "mklink", "/J", "link", "target"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        let out = run_hidden(
+            Path::new(&comspec),
+            &args,
+            dir.path(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(0), "{out:?}");
+        let link = dir.path().join("link");
+        let target = dir.path().join("target");
+        assert!(link.is_dir());
+        assert_eq!(folder_key(&link), folder_key(&target));
+        assert_ne!(folder_key(&link), folder_key(dir.path()));
+        // The junction itself is removed, never its target's contents.
+        std::fs::remove_dir(&link).unwrap();
+    }
+}

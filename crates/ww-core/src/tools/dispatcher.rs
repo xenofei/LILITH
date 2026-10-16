@@ -229,7 +229,7 @@ impl Inner {
                 let hash = args_hash(&json!({"name": p.name, "arguments": args}));
                 match self.begin(session, scope, key, &hash, trace_id).await {
                     Ok(Begun::Fresh(claim)) => Some(claim),
-                    Ok(Begun::Done(outcome)) => return outcome,
+                    Ok(Begun::Done(outcome)) => return *outcome,
                     Err(e) => return state_unavailable(&e, trace_id),
                 }
             }
@@ -293,15 +293,15 @@ impl Inner {
                 key,
                 finished: false,
             }),
-            IdemBegin::Replay(stored) => Begun::Done(replay(&stored, &key, trace_id)),
-            IdemBegin::Conflict => Begun::Done(Outcome::Error {
+            IdemBegin::Replay(stored) => Begun::Done(Box::new(replay(&stored, &key, trace_id))),
+            IdemBegin::Conflict => Begun::Done(Box::new(Outcome::Error {
                 error: ErrorBody::new(
                     &codes::IDEMPOTENCY_CONFLICT,
                     format!("The idempotency key {key:?} was used before with other arguments."),
                     trace_id,
                 ),
-            }),
-            IdemBegin::InProgress => Begun::Done(Outcome::Error {
+            })),
+            IdemBegin::InProgress => Begun::Done(Box::new(Outcome::Error {
                 error: ErrorBody::new(
                     &codes::IDEMPOTENCY_IN_PROGRESS,
                     format!(
@@ -309,7 +309,7 @@ impl Inner {
                     ),
                     trace_id,
                 ),
-            }),
+            })),
         })
     }
 
@@ -382,8 +382,9 @@ impl Inner {
 enum Begun {
     /// Run it; the claim finishes the row.
     Fresh(Claim),
-    /// It is answered already: a replay or an idempotency error.
-    Done(Outcome<ToolOutput>),
+    /// It is answered already: a replay or an idempotency error. Boxed: an `Outcome` holds
+    /// `serde_json::Value`s, which `preserve_order` (ARCH-076) makes ordered maps.
+    Done(Box<Outcome<ToolOutput>>),
 }
 
 /// A database the dispatcher holds across the call.

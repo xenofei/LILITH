@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 /// JSON object: its fields sit next to `"status":"ok"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
+// `ErrorBody` holds `serde_json::Value`s, which `preserve_order` (ARCH-076) makes ordered maps.
+// Boxing it would change every `Outcome::Error { error }` match for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 pub enum Outcome<T> {
     Ok(T),
     PendingConfirmation(PendingConfirmation),

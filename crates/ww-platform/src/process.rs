@@ -1,5 +1,5 @@
-//! Process inspection, owned process handles and the detached, non-inheriting spawn
-//! (ARCH-019, ARCH-027).
+//! Process inspection, owned process handles, the detached, non-inheriting spawn
+//! (ARCH-019, ARCH-027), hidden captured runs and self-termination (ARCH-005, QA-066).
 //!
 //! **Why not `std::process::Command`.** On Windows it always calls `CreateProcessW` with
 //! `bInheritHandles = TRUE`. A caller that captures `ww`'s output (a script, Claude Code) hands
@@ -13,7 +13,9 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 use windows::Win32::Foundation::{
@@ -25,12 +27,13 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
-    PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, RegisterWaitForSingleObject, STARTUPINFOW, TerminateProcess,
-    UnregisterWaitEx, WT_EXECUTEONLYONCE, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+    RegisterWaitForSingleObject, STARTUPINFOW, TerminateProcess, UnregisterWaitEx,
+    WT_EXECUTEONLYONCE, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -548,9 +551,226 @@ fn environment_block(
     Ok(block)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Hidden, captured runs and self-termination (ARCH-005, QA-066).
+// ---------------------------------------------------------------------------------------------
+
+/// What a [`run_hidden`] child printed and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    /// The exit code; `None` when the child was killed because it ran past its time.
+    pub code: Option<i32>,
+    /// Standard output, decoded as UTF-8 with invalid sequences replaced.
+    pub stdout: String,
+    /// Standard error, decoded the same way.
+    pub stderr: String,
+}
+
+/// `CREATE_NO_WINDOW`: a console child gets no console window, so the core never flashes one
+/// (ARCH-005).
+const CREATE_NO_WINDOW_FLAG: u32 = CREATE_NO_WINDOW.0;
+
+/// How long the output readers are given after a timed-out child is killed (and at least how
+/// long after a normal exit). A grandchild that inherited the pipes can keep them open; its
+/// output is then dropped rather than waited for.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// Runs `exe` with `args` in `cwd`, with `env` added to the current environment, without a
+/// console window (`CREATE_NO_WINDOW`) and with stdin empty and stdout and stderr captured.
+/// A child still running after `within` is killed, and its `code` is `None`.
+///
+/// This is for short helper runs whose output is wanted (`git`, `cmd /c mklink`). It uses
+/// `std::process::Command`, which inherits inheritable handles; a long-lived detached child
+/// goes through [`spawn_detached`] instead.
+pub fn run_hidden(
+    exe: &Path,
+    args: &[&OsStr],
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    within: Duration,
+) -> io::Result<Captured> {
+    use std::os::windows::process::CommandExt as _;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW_FLAG);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn()?;
+    let stdout = reader(child.stdout.take());
+    let stderr = reader(child.stderr.take());
+    let millis = u32::try_from(within.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: the child's process handle is open for as long as `child` lives.
+    let waited = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), millis) };
+    let code = if waited == WAIT_OBJECT_0 {
+        child.wait()?.code()
+    } else {
+        // Timed out (or the wait failed): kill it. Already exited is not an error.
+        let _ = child.kill();
+        child.wait()?;
+        None
+    };
+    // After a normal exit the pipes end as soon as no grandchild holds them; one that does
+    // (a background helper the child started) is not waited for past `within`.
+    let grace = if code.is_some() {
+        within.max(READER_GRACE)
+    } else {
+        READER_GRACE
+    };
+    Ok(Captured {
+        code,
+        stdout: collect(&stdout, grace),
+        stderr: collect(&stderr, grace),
+    })
+}
+
+type Output = std::sync::mpsc::Receiver<Vec<u8>>;
+
+/// Reads `pipe` to its end on a thread and sends the bytes back.
+fn reader<R: io::Read + Send + 'static>(pipe: Option<R>) -> Output {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut pipe) = pipe {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+    }
+    rx
+}
+
+fn collect(rx: &Output, grace: Duration) -> String {
+    let bytes = rx.recv_timeout(grace).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The first `name` on `PATH`. A name without an extension is tried with each `PATHEXT`
+/// extension (default `.COM;.EXE;.BAT;.CMD`), as the shell does; a name with a folder part is
+/// checked as given.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    let candidate = Path::new(name);
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let names: Vec<String> = if candidate.extension().is_some() {
+        vec![name.to_string()]
+    } else {
+        pathext
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| format!("{name}{}", e.to_ascii_lowercase()))
+            .collect()
+    };
+    if candidate.components().count() > 1 {
+        return names.iter().map(PathBuf::from).find(|p| p.is_file());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
+        .find(|p| p.is_file())
+}
+
+/// Ends this process at once with `code`, as a crash would: `TerminateProcess` on the current
+/// process runs no destructor, notifies no DLL and involves no Windows Error Reporting
+/// (`std::process::abort` is `__fastfail`, which goes through WER). The fail point action
+/// `abort` uses it (QA-066).
+pub fn terminate_self(code: u32) -> ! {
+    // SAFETY: the pseudo-handle is always valid and has PROCESS_TERMINATE. A process that
+    // terminates itself does not return from the call (documented); nothing is borrowed.
+    let _ = unsafe { TerminateProcess(GetCurrentProcess(), code) };
+    // Unreachable in practice: TerminateProcess on the current process does not return.
+    std::process::abort()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set by `terminate_self_ends_the_process_with_its_code` for the child run only.
+    const TERMINATE_HELPER_VAR: &str = "WW_PLATFORM_TEST_TERMINATE_SELF";
+
+    /// The child half of `terminate_self_ends_the_process_with_its_code`. In a normal test run
+    /// the variable is unset and this passes without doing anything.
+    #[test]
+    fn terminate_self_helper() {
+        if std::env::var_os(TERMINATE_HELPER_VAR).is_some() {
+            terminate_self(0xDEAD);
+        }
+    }
+
+    #[test] // spec: QA-066
+    fn terminate_self_ends_the_process_with_its_code() {
+        let exe = std::env::current_exe().unwrap();
+        let args: Vec<&OsStr> = ["process::tests::terminate_self_helper", "--exact"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        let out = run_hidden(
+            &exe,
+            &args,
+            exe.parent().unwrap(),
+            &[(TERMINATE_HELPER_VAR.into(), "1".into())],
+            Duration::from_secs(120),
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(0xDEAD), "{out:?}");
+    }
+
+    #[test] // spec: ARCH-005
+    fn run_hidden_captures_output_and_exit_code() {
+        let comspec = std::env::var_os("ComSpec").expect("ComSpec is set");
+        let args: Vec<&OsStr> = ["/c", "echo", "hi", "&", "exit", "3"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        let dir = std::env::temp_dir();
+        let out = run_hidden(
+            Path::new(&comspec),
+            &args,
+            &dir,
+            &[],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(3), "{out:?}");
+        assert_eq!(out.stdout.trim(), "hi", "{out:?}");
+        assert_eq!(out.stderr, "");
+
+        // `env` reaches the child, and stderr is captured on its own.
+        let args: Vec<&OsStr> = ["/c", "echo", "%WW_RUN_HIDDEN_PROBE%", "1>&2"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        let out = run_hidden(
+            Path::new(&comspec),
+            &args,
+            &dir,
+            &[("WW_RUN_HIDDEN_PROBE".into(), "Ünïcödé space".into())],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(0), "{out:?}");
+        assert_eq!(out.stdout, "");
+        assert!(!out.stderr.trim().is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn find_on_path_finds_the_command_interpreter() {
+        let found = find_on_path("cmd").expect("cmd.exe is on PATH");
+        assert!(
+            found
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("cmd.exe"),
+            "{found:?}"
+        );
+        assert_eq!(find_on_path("ww-no-such-tool-on-path"), None);
+    }
 
     fn line(exe: &str, args: &[&str]) -> String {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
