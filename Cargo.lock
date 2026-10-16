@@ -3414,6 +3414,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ww-client"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "ww-platform",
+ "ww-protocol",
+ "ww-schema",
+ "ww-testkit",
+]
+
+[[package]]
 name = "ww-core"
 version = "0.0.0"
 dependencies = [
