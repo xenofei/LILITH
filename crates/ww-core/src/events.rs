@@ -8,7 +8,9 @@
 //!   a history that still holds `s+1..=current` replays those events in order; anything else
 //!   (older than the history, or beyond the current seq, such as a cursor from an earlier
 //!   core) gets one `snapshot` from the [`SnapshotProvider`] with the longest matching prefix,
-//!   or else one `resync_required`. No cursor means live events only.
+//!   or else one `resync_required`. No cursor means live events only. A topic the client
+//!   already subscribes to ignores its cursor, and a replay that overflows the queue stops
+//!   (the resyncs cover it).
 //! - **Delivery.** Each client has its own queue of at most [`CLIENT_QUEUE`] events, separate
 //!   from the connection's outbound channel that responses share. A forwarder task per client
 //!   moves events from the queue into that channel in order, as `ww/event` lines; only it
@@ -209,6 +211,12 @@ impl EventBus {
 
     /// Subscribes `client` to `topics` (valid names), replaying from the cursors in `since`
     /// (module docs). Returns each topic, once, in the order given, with its current seq.
+    ///
+    /// A topic the client already subscribes to keeps its subscription: its cursor is ignored
+    /// (no replay, snapshot or resync), so nothing it has queued or received is repeated. All
+    /// new topics join the client's set before any replay is queued, so if a replay overflows
+    /// the queue, the `resync_required` events cover every one of them; nothing more of the
+    /// replay is queued after that.
     pub fn subscribe(
         &self,
         client: ClientId,
@@ -219,24 +227,36 @@ impl EventBus {
         let mut guard = self.lock();
         let inner = &mut *guard;
         let entry = inner.clients.entry(client).or_insert_with(Client::new);
+        // 1. Prune, report and subscribe; collect the topics that are new to the client.
         let mut states: Vec<TopicState> = Vec::with_capacity(topics.len());
+        let mut fresh: Vec<&String> = Vec::new();
         for topic in topics {
             if states.iter().any(|s| &s.topic == topic) {
                 continue;
             }
-            if let Some(log) = inner.topics.get_mut(topic) {
-                prune(&mut log.history, now);
-            }
-            entry.topics.insert(topic.clone());
-            let log = inner.topics.get(topic);
-            let current = log.map_or(0, |l| l.seq);
+            let current = match inner.topics.get_mut(topic) {
+                Some(log) => {
+                    prune(&mut log.history, now);
+                    log.seq
+                }
+                None => 0,
+            };
             states.push(TopicState {
                 topic: topic.clone(),
                 seq: current,
             });
+            if entry.topics.insert(topic.clone()) {
+                fresh.push(topic);
+            }
+        }
+        // 2. Replay from the cursors of the new topics, until the queue overflows.
+        let mut queue = entry.pending.lock();
+        'topics: for topic in fresh {
             let Some(&cursor) = since.get(topic) else {
                 continue; // live events only
             };
+            let log = inner.topics.get(topic);
+            let current = log.map_or(0, |l| l.seq);
             if cursor == current {
                 continue;
             }
@@ -269,11 +289,19 @@ impl EventBus {
                     line: event_line(topic, current, kind, data),
                 });
             }
-            let mut queue = entry.pending.lock();
             for item in items {
-                enqueue(&mut queue, item, &entry.topics, &inner.topics);
+                if enqueue(&mut queue, item, &entry.topics, &inner.topics) {
+                    tracing::info!(
+                        client,
+                        topic = topic.as_str(),
+                        "a client's event queue overflowed during a replay; it gets resync_required"
+                    );
+                    // The resyncs cover every subscribed topic, this call's included.
+                    break 'topics;
+                }
             }
         }
+        drop(queue);
         entry.pending.wake.notify_one();
         states
     }
@@ -791,6 +819,77 @@ mod tests {
         })
         .await
         .expect("the forwarder did not end");
+    }
+
+    #[test] // spec: ARCH-032
+    fn replay_overflow_leaves_only_resync_required_once_per_topic() {
+        let (_clock, bus) = bus();
+        // The queue is 3 short of full with live `test:b` events.
+        bus.subscribe(1, &names(&["test:b"]), &cursors(&[]));
+        for n in 0..CLIENT_QUEUE - 3 {
+            bus.publish("test:b", json!(n));
+        }
+        for n in 1..=10 {
+            bus.publish("test:a", json!(n));
+        }
+        bus.publish("test:c", json!(1));
+        bus.publish("test:c", json!(2));
+        assert_eq!(bus.queued(1), CLIENT_QUEUE - 3);
+        // Replaying ten `test:a` events overflows it on the fourth; the replay stops there,
+        // and `test:c`, later in the same call, replays nothing either (P9).
+        let states = bus.subscribe(
+            1,
+            &names(&["test:a", "test:c"]),
+            &cursors(&[("test:a", 0), ("test:c", 0)]),
+        );
+        assert_eq!(states, [state("test:a", 10), state("test:c", 2)]);
+        assert_eq!(
+            bus.queued_events(1),
+            [
+                event("test:a", 10, EventKind::ResyncRequired, Value::Null),
+                event("test:b", 1021, EventKind::ResyncRequired, Value::Null),
+                event("test:c", 2, EventKind::ResyncRequired, Value::Null),
+            ]
+        );
+        // Live events queue normally behind the resyncs.
+        bus.publish("test:a", json!(11));
+        assert_eq!(bus.queued(1), 4);
+    }
+
+    #[test] // spec: ARCH-032
+    fn resubscribing_does_not_replay_a_topic_already_subscribed() {
+        let (_clock, bus) = bus();
+        bus.subscribe(1, &names(&["test:a"]), &cursors(&[]));
+        for n in 1..=3 {
+            bus.publish("test:a", json!(n));
+        }
+        bus.publish("test:b", json!(1));
+        assert_eq!(bus.queued(1), 3);
+        // `test:a` is subscribed already: its cursor (and a future one) replays nothing, but its
+        // state is reported. `test:b` is new and replays from its cursor.
+        let states = bus.subscribe(
+            1,
+            &names(&["test:a", "test:b"]),
+            &cursors(&[("test:a", 0), ("test:b", 0)]),
+        );
+        assert_eq!(states, [state("test:a", 3), state("test:b", 1)]);
+        let seen: Vec<(String, u64, EventKind)> = bus
+            .queued_events(1)
+            .into_iter()
+            .map(|e| (e.topic, e.seq, e.kind))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("test:a".to_string(), 1, EventKind::Event),
+                ("test:a".to_string(), 2, EventKind::Event),
+                ("test:a".to_string(), 3, EventKind::Event),
+                ("test:b".to_string(), 1, EventKind::Event),
+            ]
+        );
+        let states = bus.subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 99)]));
+        assert_eq!(states, [state("test:a", 3)]);
+        assert_eq!(bus.queued(1), 4);
     }
 
     #[test] // spec: CORE-012, QA-031
