@@ -1,17 +1,24 @@
 //! The file-write home of `ww-core` (ARCH-112, QA-024): the only file in the crate with
 //! `#[allow(clippy::disallowed_methods)]`, one per function.
+//!
+//! These are thin, blocking wrappers. The write algorithm (hash check, pending rows, retries,
+//! put-backs) is `store::write`, which calls them on blocking threads. Paths go to Windows
+//! through `ww_platform::fs::long_path`, so long absolute paths work without the
+//! `LongPathsEnabled` opt-in.
 
-use std::io::Write as _;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::{Path, PathBuf};
+
+use ww_platform::fs::{LockedFile, long_path};
+
+use super::failpoints::FailPoints;
 
 /// Writes `bytes` to `path` atomically: the data goes to `<path>.tmp-<pid>`, is flushed to disk
 /// with `sync_all`, and is then renamed over the target.
 ///
-/// This is a stub that plan 2b completes (directory fsync, crash-recovery of stale temp files,
-/// failure injection).
-///
-/// On Windows, `std::fs::rename` replaces an existing target (MoveFileEx with
-/// replace-existing).
+/// A plan-2 stub kept for the state tests' fixture files. It replaces an existing target, so
+/// workspace files never go through it: they go through `Store::write`.
 #[allow(clippy::disallowed_methods)]
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
@@ -36,12 +43,143 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Creates `path` and any missing parents; an existing folder is fine.
 #[allow(clippy::disallowed_methods)]
 pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
+    std::fs::create_dir_all(long_path(path))
+}
+
+/// Write step 4: creates `dir\name` (never an existing file), writes `bytes` and flushes them
+/// with `FlushFileBuffers` before closing. The fail point `store.write_temp` comes after the
+/// create, and its error stands for the write's. On any error after the create, the file is
+/// removed again.
+#[allow(clippy::disallowed_methods)]
+pub fn write_temp(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    fp: &FailPoints,
+) -> std::io::Result<PathBuf> {
+    let path = dir.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(long_path(&path))?;
+    let written = (|| {
+        fp.hit("store.write_temp")?;
+        file.write_all(bytes)?;
+        ww_platform::fs::flush(&file)
+    })();
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(long_path(&path));
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// `ReplaceFileW(target, temp, backup)` without a write-through flag (see `ww_platform::fs`).
+#[allow(clippy::disallowed_methods)]
+pub fn replace(target: &Path, temp: &Path, backup: &Path) -> std::io::Result<()> {
+    ww_platform::fs::replace_file(target, temp, backup)
+}
+
+/// `MoveFileExW(MOVEFILE_WRITE_THROUGH)`: the only move. An existing `to` is never replaced
+/// (errors 80 and 183); there is no replace-existing variant.
+#[allow(clippy::disallowed_methods)]
+pub fn move_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    ww_platform::fs::move_new(from, to)
+}
+
+/// Deletes a file, clearing `FILE_ATTRIBUTE_READONLY` first (`DeleteFile` fails with
+/// `ERROR_ACCESS_DENIED` on a read-only file).
+#[allow(clippy::disallowed_methods)]
+pub fn remove_file(path: &Path) -> std::io::Result<()> {
+    clear_readonly(path)?;
+    std::fs::remove_file(long_path(path))
+}
+
+/// Deletes a folder tree, clearing `FILE_ATTRIBUTE_READONLY` on every file and folder in it
+/// first. Links (symbolic links, junctions) are removed, never followed.
+#[allow(clippy::disallowed_methods)]
+pub fn remove_dir_all(path: &Path) -> std::io::Result<()> {
+    fn clear(path: &Path) -> std::io::Result<()> {
+        clear_readonly(path)?;
+        let meta = std::fs::symlink_metadata(long_path(path))?;
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            for entry in std::fs::read_dir(long_path(path))? {
+                clear(&path.join(entry?.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+    clear(path)?;
+    std::fs::remove_dir_all(long_path(path))
+}
+
+/// Clears `FILE_ATTRIBUTE_READONLY` (nothing when it is clear); a missing path is left to the
+/// call that follows to report.
+#[allow(clippy::disallowed_methods)]
+fn clear_readonly(path: &Path) -> std::io::Result<()> {
+    match ww_platform::fs::set_readonly(path, false) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Sets or clears `FILE_ATTRIBUTE_READONLY`.
+#[allow(clippy::disallowed_methods)]
+pub fn set_readonly(path: &Path, on: bool) -> std::io::Result<()> {
+    ww_platform::fs::set_readonly(path, on)
+}
+
+/// `CopyFile2(COPY_FILE_FAIL_IF_EXISTS)`: never overwrites `to`.
+#[allow(clippy::disallowed_methods)]
+pub fn copy_new(from: &Path, to: &Path) -> std::io::Result<u64> {
+    ww_platform::fs::copy_new(from, to)
+}
+
+/// Opens or creates the lock file `path` and takes its exclusive lock; `None` at once when
+/// another handle holds it (`core.lock`, ARCH-028).
+#[allow(clippy::disallowed_methods)]
+pub fn lock_exclusive(path: &Path) -> std::io::Result<Option<LockedFile>> {
+    ww_platform::fs::try_lock_exclusive(path)
+}
+
+/// Appends one line to the log `path` (created if missing) under the append lock
+/// (`try_lock_append`, ARCH-081). `None` at once when another holder has the lock: the caller
+/// polls under its retry budget. With the lock held the file is read, a torn last line is
+/// closed with `\n`, `make_line` gets the text as it then is (so the seq comes from what is
+/// really there), and the line goes out in one `write_all`. Returns the line.
+#[allow(clippy::disallowed_methods)]
+pub fn append_locked(
+    path: &Path,
+    make_line: &dyn Fn(&str) -> String,
+) -> std::io::Result<Option<String>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(long_path(path))?;
+    let Some(lock) = ww_platform::fs::try_lock_append(&file)? else {
+        return Ok(None);
+    };
+    let mut raw = Vec::new();
+    (&file).seek(SeekFrom::Start(0))?;
+    (&file).read_to_end(&mut raw)?;
+    let mut text = String::from_utf8_lossy(&raw).into_owned();
+    let mut out = String::new();
+    if !text.is_empty() && !text.ends_with('\n') {
+        out.push('\n');
+        text.push('\n');
+    }
+    let line = make_line(&text);
+    out.push_str(&line);
+    (&file).write_all(out.as_bytes())?;
+    drop(lock);
+    Ok(Some(line))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_dir, write_file_atomic};
+    use super::*;
 
     #[test] // spec: ARCH-112
     fn ensure_dir_creates_nested_dirs() {
@@ -69,6 +207,66 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test] // spec: ARCH-074, QA-011
+    fn write_temp_never_reuses_a_name_and_cleans_up_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = FailPoints::none();
+        let temp = write_temp(dir.path(), ".a.ww-tmp-1-1", b"x", &fp).unwrap();
+        assert_eq!(std::fs::read(&temp).unwrap(), b"x");
+        let again = write_temp(dir.path(), ".a.ww-tmp-1-1", b"y", &fp).unwrap_err();
+        assert_eq!(again.raw_os_error(), Some(80), "{again:?}");
+        assert_eq!(std::fs::read(&temp).unwrap(), b"x");
+
+        let full = FailPoints::parse("store.write_temp=disk_full").unwrap();
+        let err = write_temp(dir.path(), ".a.ww-tmp-1-3", b"z", &full).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(112));
+        assert!(!dir.path().join(".a.ww-tmp-1-3").exists());
+    }
+
+    #[test] // spec: ARCH-074
+    fn move_new_never_replaces_and_remove_clears_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = FailPoints::none();
+        let a = write_temp(dir.path(), "a", b"a", &fp).unwrap();
+        let b = write_temp(dir.path(), "b", b"b", &fp).unwrap();
+        let err = move_new(&a, &b).unwrap_err();
+        assert!(matches!(err.raw_os_error(), Some(80 | 183)), "{err:?}");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+        set_readonly(&b, true).unwrap();
+        remove_file(&b).unwrap();
+        assert!(!b.exists());
+
+        let tree = dir.path().join("t");
+        ensure_dir(&tree.join("sub")).unwrap();
+        let sealed = write_temp(&tree.join("sub"), "x.png", b"x", &fp).unwrap();
+        set_readonly(&sealed, true).unwrap();
+        set_readonly(&tree.join("sub"), true).unwrap();
+        remove_dir_all(&tree).unwrap();
+        assert!(!tree.exists());
+    }
+
+    #[test] // spec: ARCH-081
+    fn append_locked_closes_a_torn_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("jobs.jsonl");
+        let fp = FailPoints::none();
+        let torn = write_temp(dir.path(), "jobs.jsonl", b"{\"a\":1}\n{\"b\"", &fp).unwrap();
+        assert_eq!(torn, log);
+        let seen = std::sync::Mutex::new(String::new());
+        let line = append_locked(&log, &|text| {
+            *seen.lock().unwrap() = text.to_string();
+            "{\"c\":3}\n".to_string()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(line, "{\"c\":3}\n");
+        assert_eq!(*seen.lock().unwrap(), "{\"a\":1}\n{\"b\"\n");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "{\"a\":1}\n{\"b\"\n{\"c\":3}\n"
         );
     }
 }

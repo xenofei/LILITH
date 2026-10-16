@@ -1,11 +1,24 @@
-//! The store: the only module in `ww-core` allowed to write files (ARCH-112, QA-024).
+//! The store: the only module in `ww-core` allowed to write files (ARCH-112, QA-024), and the
+//! workspace write path (ARCH-002, ARCH-074, ARCH-078; CORE-014).
 //!
-//! Every file-mutating call of the crate lives in [`fsops`], one
-//! `#[allow(clippy::disallowed_methods)]` per function (enforced by
-//! `crates/ww-testkit/tests/single_write_allowance.rs`). SQLite creating and writing its own
-//! database files, and the log appender writing the core's log, are not `ww-core` file calls;
-//! the folders for them are created through [`fsops::ensure_dir`].
+//! - [`write`]: [`Store`], the hash-checked atomic write, edits, recovery and errors;
+//! - [`paths`]: workspace-relative paths and the paths the store never writes;
+//! - [`failpoints`]: the test-channel fail points (QA-066);
+//! - [`fsops`]: every file-mutating call of the crate, one
+//!   `#[allow(clippy::disallowed_methods)]` per function (enforced by
+//!   `crates/ww-testkit/tests/single_write_allowance.rs`). SQLite creating and writing its own
+//!   database files, and the log appender writing the core's log, are not `ww-core` file calls;
+//!   the folders for them are created through [`fsops::ensure_dir`].
 
+pub mod failpoints;
 pub mod fsops;
+pub mod paths;
+pub mod write;
 
+pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
 pub use fsops::{ensure_dir, write_file_atomic};
+pub use paths::{WsPath, writable};
+pub use write::{
+    ChangeKind, ChangeSink, Expect, Phase, RecoveryReport, Step, Store, StoreError, StoreEvent,
+    Written, lfs_pointer_oid, next_step,
+};

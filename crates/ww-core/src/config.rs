@@ -10,6 +10,7 @@ use ww_platform::process::{ProcessInspector, SystemInspector, current_exe_dir};
 use ww_platform::{Channel, Clock, Env, IdSource, RandomIds, SystemClock};
 
 use crate::identity::{EngineTokens, NoEngineTokens, TrustedDirs};
+use crate::store::FailPoints;
 
 /// A core with no connections, calls or busy blockers exits after this long (ARCH-020).
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(600);
@@ -35,6 +36,9 @@ pub struct CoreConfig {
     pub test_tools: bool,
     /// Test channels only: the core exits 0 once this process is gone.
     pub test_parent_pid: Option<u32>,
+    /// The fail points `WW_TEST_FAILPOINTS` arms (test channels of non-stable builds only;
+    /// QA-066), passed to every workspace store.
+    pub failpoints: Arc<FailPoints>,
     /// The crate's own unit tests only (compiled out of every build): a request with this
     /// method panics in the router, to test how the transport survives a panicking handler.
     #[cfg(test)]
@@ -45,11 +49,13 @@ impl CoreConfig {
     /// The system clock, random ids, the real process inspector, the trusted folders of
     /// `env` (the running executable's folder on dev and test channels) and no engine tokens,
     /// with the `WW_TEST_*` overrides from the process environment (read through
-    /// `env.test_overrides`, so they apply on test channels only).
+    /// `env.test_overrides`, so they apply on test channels only) and the fail points of
+    /// `WW_TEST_FAILPOINTS` (`FailPoints::from_env`).
     pub fn for_env(env: Env) -> io::Result<CoreConfig> {
         let overrides = env.test_overrides(&|name| std::env::var(name).ok());
         let test_tools = matches!(env.channel(), Channel::Test(_));
         let trusted = TrustedDirs::for_env(&env, &current_exe_dir()?);
+        let failpoints = FailPoints::from_env(&env, &|name| std::env::var(name).ok());
         Ok(CoreConfig {
             env,
             clock: Arc::new(SystemClock::new()),
@@ -63,6 +69,7 @@ impl CoreConfig {
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
             test_tools,
             test_parent_pid: overrides.parent_pid,
+            failpoints,
             #[cfg(test)]
             panic_on_method: None,
         })

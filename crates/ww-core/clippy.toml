@@ -29,4 +29,18 @@ disallowed-methods = [
     { path = "tokio::fs::set_permissions", reason = "ARCH-112: file mutation goes through ww_core::store" },
     { path = "tokio::fs::File::create", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
     { path = "tokio::fs::OpenOptions::open", reason = "ARCH-112: file writes go through ww_core::store::write_file_atomic" },
+    # The platform file layer: every function that mutates files (or holds them against
+    # writers) is reached only from src/store/fsops.rs.
+    { path = "ww_platform::fs::replace_file", reason = "ARCH-112: file writes go through ww_core::store (fsops::replace)" },
+    { path = "ww_platform::fs::move_new", reason = "ARCH-112: file moves go through ww_core::store (fsops::move_new)" },
+    { path = "ww_platform::fs::copy_new", reason = "ARCH-112: file copies go through ww_core::store (fsops::copy_new)" },
+    { path = "ww_platform::fs::set_readonly", reason = "ARCH-112: file mutation goes through ww_core::store (fsops::set_readonly)" },
+    { path = "ww_platform::fs::try_lock_exclusive", reason = "ARCH-112: lock files go through ww_core::store (fsops::lock_exclusive)" },
+    { path = "ww_platform::fs::try_lock_append", reason = "ARCH-112: log appends go through ww_core::store (fsops::append_locked)" },
+    { path = "ww_platform::fs::open_shared", reason = "ARCH-112: file handles that block writers stay out of ww-core outside the store" },
+    { path = "ww_platform::fs::flush", reason = "ARCH-112: file writes go through ww_core::store (fsops::write_temp)" },
+    # Manifests keep key order (ARCH-076, CORE-148): under `preserve_order`, Map::remove is
+    # swap_remove and moves the last key into the removed slot. Use `shift_remove`.
+    { path = "serde_json::Map::remove", reason = "ARCH-076: use shift_remove (ww_schema::remove_key); Map::remove reorders keys" },
+    { path = "serde_json::Map::remove_entry", reason = "ARCH-076: use shift_remove_entry; Map::remove_entry reorders keys" },
 ]

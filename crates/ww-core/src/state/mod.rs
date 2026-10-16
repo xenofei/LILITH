@@ -126,6 +126,32 @@ fn sql_error(e: &rusqlite::Error) -> StateError {
     }
 }
 
+/// The prune of `idem_begin`: `done` rows created before `?1`. Migration 2's
+/// `idempotency_prune` index serves it.
+pub const PRUNE_DONE_SQL: &str =
+    "DELETE FROM idempotency WHERE state = 'done' AND created_utc < ?1";
+
+/// A pending replace of the store (write step 5, ARCH-074): the hash the target had when it was
+/// checked (`None` for a new target) and the hash of the bytes going in. While the row exists
+/// either version is the core's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// Workspace-relative, `/` separators.
+    pub path: String,
+    pub old_sha256: Option<String>,
+    pub new_sha256: String,
+    pub started_utc: i64,
+}
+
+fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
+    Ok(Pending {
+        path: r.get(0)?,
+        old_sha256: r.get(1)?,
+        new_sha256: r.get(2)?,
+        started_utc: r.get(3)?,
+    })
+}
+
 /// What `idem_begin` found (CORE-016).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdemBegin {
@@ -319,6 +345,119 @@ impl StateDb {
         .await
     }
 
+    /// The last hash the store wrote to `path` (workspace databases; ARCH-078).
+    pub async fn generated(&self, path: &str) -> Result<Option<String>, StateError> {
+        let path = path.to_string();
+        self.call(move |conn| {
+            conn.query_row(
+                "SELECT sha256 FROM generated WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Records `sha256` as the last hash the store wrote to `path`, at `utc` (Unix seconds).
+    pub async fn set_generated(
+        &self,
+        path: &str,
+        sha256: &str,
+        utc: i64,
+    ) -> Result<(), StateError> {
+        let (path, sha256) = (path.to_string(), sha256.to_string());
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO generated (path, sha256, written_utc) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET sha256 = ?2, written_utc = ?3",
+                params![path, sha256, utc],
+            )
+            .map(drop)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Records (or replaces) the pending replace of `p.path` (write step 5).
+    pub async fn set_pending(&self, p: &Pending) -> Result<(), StateError> {
+        let p = p.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO generated_pending (path, old_sha256, new_sha256, started_utc)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET old_sha256 = ?2, new_sha256 = ?3, started_utc = ?4",
+                params![p.path, p.old_sha256, p.new_sha256, p.started_utc],
+            )
+            .map(drop)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// The pending replace of `path`, if one is recorded.
+    pub async fn pending(&self, path: &str) -> Result<Option<Pending>, StateError> {
+        let path = path.to_string();
+        self.call(move |conn| {
+            conn.query_row(
+                "SELECT path, old_sha256, new_sha256, started_utc FROM generated_pending
+                 WHERE path = ?1",
+                params![path],
+                pending_row,
+            )
+            .optional()
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Every pending replace, by path.
+    pub async fn pendings(&self) -> Result<Vec<Pending>, StateError> {
+        self.call(|conn| {
+            let read = || -> rusqlite::Result<Vec<Pending>> {
+                conn.prepare(
+                    "SELECT path, old_sha256, new_sha256, started_utc FROM generated_pending
+                     ORDER BY path",
+                )?
+                .query_map([], pending_row)?
+                .collect()
+            };
+            read().map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Write step 8, in one transaction: clears the pending row of `path` and, when
+    /// `generated` is given, records `(sha256, utc)` as its last generated hash.
+    pub async fn finish_pending(
+        &self,
+        path: &str,
+        generated: Option<(&str, i64)>,
+    ) -> Result<(), StateError> {
+        let path = path.to_string();
+        let generated = generated.map(|(sha, utc)| (sha.to_string(), utc));
+        self.call(move |conn| {
+            let run = || -> rusqlite::Result<()> {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "DELETE FROM generated_pending WHERE path = ?1",
+                    params![path],
+                )?;
+                if let Some((sha, utc)) = generated {
+                    tx.execute(
+                        "INSERT INTO generated (path, sha256, written_utc) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(path) DO UPDATE SET sha256 = ?2, written_utc = ?3",
+                        params![path, sha, utc],
+                    )?;
+                }
+                tx.commit()
+            };
+            run().map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
     /// Makes the actor panic. Used only by the test-channel tool `test.state_panic` (QA-012).
     pub async fn panic_actor(&self) {
         let Some(jobs) = lock(&self.jobs).clone() else {
@@ -499,7 +638,7 @@ fn idem_begin(
 ) -> rusqlite::Result<IdemBegin> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let pruned = tx.execute(
-        "DELETE FROM idempotency WHERE state = 'done' AND created_utc < ?1",
+        PRUNE_DONE_SQL,
         params![now_utc_secs.saturating_sub(DONE_KEPT_SECS)],
     )?;
     if pruned > 0 {

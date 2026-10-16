@@ -70,16 +70,10 @@ mod tests {
             assert_eq!(held.share(), share);
             let err = replace_file(&target, &replacement, &backup)
                 .expect_err("a replace while another handle holds the target");
-            // Recorded in the test output, for the store's retry classes.
-            eprintln!("held with {share:?}: {err:?}");
-            assert!(
-                matches!(
-                    classify(&err),
-                    RetryClass::SharingViolation | RetryClass::ReplaceRetry
-                ),
-                "{share:?}: {err:?} (os error {:?})",
-                err.raw_os_error()
-            );
+            // Observed on the plan-2b test machine (Windows 11, 2026-10-16): every share mode
+            // gives error 32, ERROR_SHARING_VIOLATION, which the store retries.
+            assert_eq!(err.raw_os_error(), Some(32), "{share:?}: {err:?}");
+            assert_eq!(classify(&err), RetryClass::SharingViolation, "{share:?}");
             held.release();
             // Nothing moved: the old content, and the replacement still under its own name
             // (read after the release, since `Share::None` refuses even readers).

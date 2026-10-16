@@ -61,14 +61,17 @@ pub const CONFIRM_UNAVAILABLE: CodeSpec = spec(
 pub const CAP_EXCEEDED: CodeSpec = spec("cap.exceeded", C::UserFixable, R::AfterResolve, false);
 pub const DOC_HELD_ELSEWHERE: CodeSpec =
     spec("doc.held_elsewhere", C::DataConflict, R::AfterResolve, true);
+/// Confirmed by plan 2b. `data.backup` names the backup's workspace-relative path when a
+/// put-back couldn't finish.
 pub const STORE_HASH_CONFLICT: CodeSpec = spec(
     "store.hash_conflict",
     C::DataConflict,
     R::AfterResolve,
-    true,
+    false,
 );
+/// Confirmed by plan 2b.
 pub const WORKSPACE_REQUIRED: CodeSpec =
-    spec("workspace.required", C::UserFixable, R::AfterResolve, true);
+    spec("workspace.required", C::UserFixable, R::AfterResolve, false);
 /// `data.core_protocol` carries the core's `"M.m"` (frozen across majors).
 pub const PROTOCOL_INCOMPATIBLE: CodeSpec = spec(
     "protocol.incompatible",
@@ -135,6 +138,77 @@ pub const STATE_UNAVAILABLE: CodeSpec = spec(
     false,
 );
 
+// Plan 2b (Appendix D), in table order.
+
+/// A target held past the 10 s retry budget.
+pub const STORE_BUSY: CodeSpec = spec("store.busy", C::Transient, R::SameIdempotencyKey, false);
+/// Budget, reserved name, outside the workspace, a sealed folder, `registry/ledger.csv`.
+pub const STORE_PATH_INVALID: CodeSpec =
+    spec("store.path_invalid", C::UserFixable, R::AfterResolve, false);
+pub const STORE_DISK_FULL: CodeSpec =
+    spec("store.disk_full", C::UserFixable, R::AfterResolve, false);
+pub const STORE_IO: CodeSpec = spec("store.io", C::Transient, R::SameIdempotencyKey, false);
+/// Git still active after 60 s.
+pub const STORE_GIT_BUSY: CodeSpec =
+    spec("store.git_busy", C::Transient, R::SameIdempotencyKey, false);
+/// The path is in the manifest's `locks` (CORE-035).
+pub const STORE_LOCKED: CodeSpec = spec("store.locked", C::DataConflict, R::AfterResolve, false);
+/// Another core holds `core.lock`.
+pub const WORKSPACE_READ_ONLY: CodeSpec = spec(
+    "workspace.read_only",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const WORKSPACE_PATH_INVALID: CodeSpec = spec(
+    "workspace.path_invalid",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const PROJECT_UNKNOWN: CodeSpec =
+    spec("project.unknown", C::UserFixable, R::AfterResolve, false);
+pub const PROJECT_EXISTS: CodeSpec = spec("project.exists", C::DataConflict, R::Never, false);
+/// Also an unknown run or file.
+pub const ASSET_UNKNOWN: CodeSpec = spec("asset.unknown", C::UserFixable, R::AfterResolve, false);
+/// Fix: "Collect into workspace", agent hint `asset.collect`.
+pub const ASSET_LINK_EXTERNAL: CodeSpec = spec(
+    "asset.link_external",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const VERSION_EXISTS: CodeSpec =
+    spec("version.exists", C::DataConflict, R::AfterResolve, false);
+pub const STATUS_INVALID_TRANSITION: CodeSpec = spec(
+    "status.invalid_transition",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const MANIFEST_NEEDS_REPAIR: CodeSpec = spec(
+    "manifest.needs_repair",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const YAML_UNSUPPORTED_EDIT: CodeSpec = spec(
+    "yaml.unsupported_edit",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const REF_INVALID: CodeSpec = spec("ref.invalid", C::UserFixable, R::AfterResolve, false);
+pub const REF_HASH_MISMATCH: CodeSpec =
+    spec("ref.hash_mismatch", C::DataConflict, R::AfterResolve, false);
+pub const TRASH_UNKNOWN: CodeSpec = spec("trash.unknown", C::UserFixable, R::AfterResolve, false);
+pub const TRASH_RESTORE_CONFLICT: CodeSpec = spec(
+    "trash.restore_conflict",
+    C::DataConflict,
+    R::AfterResolve,
+    false,
+);
+
 /// Every code, in table order.
 pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_DENIED,
@@ -164,6 +238,26 @@ pub const ALL: &[&CodeSpec] = &[
     &CORE_DRAINING,
     &CORE_BUG,
     &STATE_UNAVAILABLE,
+    &STORE_BUSY,
+    &STORE_PATH_INVALID,
+    &STORE_DISK_FULL,
+    &STORE_IO,
+    &STORE_GIT_BUSY,
+    &STORE_LOCKED,
+    &WORKSPACE_READ_ONLY,
+    &WORKSPACE_PATH_INVALID,
+    &PROJECT_UNKNOWN,
+    &PROJECT_EXISTS,
+    &ASSET_UNKNOWN,
+    &ASSET_LINK_EXTERNAL,
+    &VERSION_EXISTS,
+    &STATUS_INVALID_TRANSITION,
+    &MANIFEST_NEEDS_REPAIR,
+    &YAML_UNSUPPORTED_EDIT,
+    &REF_INVALID,
+    &REF_HASH_MISMATCH,
+    &TRASH_UNKNOWN,
+    &TRASH_RESTORE_CONFLICT,
 ];
 
 #[cfg(test)]
@@ -188,9 +282,9 @@ mod tests {
             "store.hash_conflict",
             C::DataConflict,
             R::AfterResolve,
-            true,
+            false,
         ),
-        ("workspace.required", C::UserFixable, R::AfterResolve, true),
+        ("workspace.required", C::UserFixable, R::AfterResolve, false),
         (
             "protocol.incompatible",
             C::UserFixable,
@@ -246,6 +340,61 @@ mod tests {
             R::SameIdempotencyKey,
             false,
         ),
+        ("store.busy", C::Transient, R::SameIdempotencyKey, false),
+        ("store.path_invalid", C::UserFixable, R::AfterResolve, false),
+        ("store.disk_full", C::UserFixable, R::AfterResolve, false),
+        ("store.io", C::Transient, R::SameIdempotencyKey, false),
+        ("store.git_busy", C::Transient, R::SameIdempotencyKey, false),
+        ("store.locked", C::DataConflict, R::AfterResolve, false),
+        (
+            "workspace.read_only",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "workspace.path_invalid",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        ("project.unknown", C::UserFixable, R::AfterResolve, false),
+        ("project.exists", C::DataConflict, R::Never, false),
+        ("asset.unknown", C::UserFixable, R::AfterResolve, false),
+        (
+            "asset.link_external",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        ("version.exists", C::DataConflict, R::AfterResolve, false),
+        (
+            "status.invalid_transition",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "manifest.needs_repair",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "yaml.unsupported_edit",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        ("ref.invalid", C::UserFixable, R::AfterResolve, false),
+        ("ref.hash_mismatch", C::DataConflict, R::AfterResolve, false),
+        ("trash.unknown", C::UserFixable, R::AfterResolve, false),
+        (
+            "trash.restore_conflict",
+            C::DataConflict,
+            R::AfterResolve,
+            false,
+        ),
     ];
 
     /// `^[a-z_]+(\.[a-z_]+)+$`
@@ -259,7 +408,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 27);
+        assert_eq!(TABLE.len(), 47);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);
