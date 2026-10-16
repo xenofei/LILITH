@@ -91,12 +91,12 @@ Decisions made in this plan (each stands unless the owner says otherwise; owner 
 Each question has the answer this plan uses unless you say otherwise.
 
 1. **Should `ww workspace init` also run `git init` (and `git lfs install --local`)?** Default: **no**. Sync (plan 7+) owns repository setup, and `ww doctor` skips its git checks with a note when the folder isn't a repository.
-2. **The index budgets (CORE-042, APP-138):** keep the cold rebuild of 2,000 assets at 30 s, and add a warm reconcile of 10,000 assets (nothing changed, stats only), measured in Task 10 and set at about twice the measurement at PR time? Default: **yes**. Both go in `test-params.toml` `[budgets]`; the benchmarks run in a debug test build with `libsqlite3-sys` optimised, and the report quotes the measured times and the machine class.
+2. **The index budgets (CORE-042, APP-138):** keep the cold rebuild of 2,000 assets at 30 s, and add a warm reconcile of 10,000 assets (nothing changed, stats only), measured in Task 10 and committed at about twice the local measurement, then checked against the CI runner's figure in the PR's CI log and adjusted by you, if needed, when you approve the PR? Default: **yes**. Both go in `test-params.toml` `[budgets]`; the benchmarks run in a debug test build with `libsqlite3-sys` optimised, and the report quotes the measured times and the machine class.
 3. **Approve the six protected-file changes at PR time?** Default: **yes**. They are the root `Cargo.toml` (Task 2); the new `crates/ww-spec-tests/fixtures/.gitattributes` (Task 3; without it the fixtures are checked out with CRLF and the golden and hash tests fail); the two plan-2a spec-test tightenings in `core_session.rs` and `cli_basics.rs` (Task 5); `test-params.toml` (Task 10); and one match arm in `crates/ww-cli/src/main.rs` (Task 15). Optionally, drop the two plan-2a tightenings and the `main.rs` change (hardening, not 2b scope) to shrink the set to three files.
 4. **Write `signed_off.by` only, with `cli` added to the format?** CORE-051 says a sign-off "is recorded with `approved_by`"; the workspace format records it as the run's `signed_off: {by, date, version}`. Default: **yes**: `signed_off.by` only, with the format's values `user`, `assistant` and `claude-code`, plus `cli` for `ww`, which Task 1 adds to `docs/reference/workspace-format.md`. Task 1 records `approved_by` as that field in an Appendix E clarification, so no manifest gains a second field.
 5. **`toml_edit` 0.22.27 now, with `toml` 1.x and `toml_edit` 0.25 moved together in a separate change?** Default: **yes**. 0.22.27 is the version `toml` 0.8.23 already locks, so `suite.toml` is read and edited by one TOML parser and `Cargo.lock` gains no second copy.
 6. **Reserve organising-metadata fields (tags, ratings, colour labels, collections)?** Default: **no fields in 2b**, but Appendix E records that such metadata will live in manifests or tracked YAML, never only in the index. Unknown fields already survive every edit (CORE-148), and `assets.query` takes new filters as new optional keys, so plan 4 can add them without breaking anything 2b writes.
-7. **A `missing` file state (research 5A-2)?** Default: **yes, in 2b**, as an ARCH-079/CORE-038 clarification with no new rule ID: a recorded candidate, sealed or manifest file that disappears outside the suite is listed as `missing`, never forgotten, and recovers when the same content reappears.
+7. **A `missing` file state (research 5A-2)?** Default: **yes, in 2b**, as an ARCH-079/CORE-038 clarification with no new rule ID: a file the suite still expects on disk (listed in `hashes`, a file of an open run, or a manifest) that disappears outside the suite is listed as `missing`, never forgotten, and recovers when the same content reappears. The suite's own moves (sign-off, trash, maintenance) never make a file `missing`.
 8. **Line endings in workspaces:** add `projects/** -text` to the workspace `.gitattributes`, and have `ww doctor` flag `core.autocrlf=true` as a `problem`, setting it `false` in the repository's config only after you confirm at a y/N prompt (never with `--non-interactive`, never from an agent's `workspace.doctor` call)? Default: **yes**.
 9. **Keep all of `candidates/` gitignored, so open runs don't sync between machines?** CORE-032 gitignores only rejected candidates. Default: **yes**, recorded as a CORE-032 clarification.
 10. **Asset-folder copies and moves:** in 2b, only flag a folder/`asset_id` mismatch as `needs_repair`, and leave move pairing and duplicate-`creation_uuid` repair to the plan that adds `asset.rename`? Default: **yes**.
@@ -135,7 +135,7 @@ Each question has the answer this plan uses unless you say otherwise.
 
   The same root edit adds `[profile.dev.package.libsqlite3-sys] opt-level = 3`, next to the existing `sha2` entry, so the index benchmarks (Task 10) aren't dominated by unoptimised SQLite.
 
-  **Existing workspace dependencies that crates newly use** (no root change): `ww-schema` adds `serde_json`, `yaml-rust2`, `toml_edit` and `sha2`, with `proptest` as a dev-dependency (Task 3); `ww-client` adds `rusqlite` (Task 14); `ww-core` adds `proptest` as a dev-dependency (Task 14).
+  **Existing workspace dependencies that crates newly use** (no root change): `ww-schema` adds `serde_json`, `yaml-rust2`, `toml_edit` and `sha2`, with `proptest` as a dev-dependency (Task 3); `ww-client` adds `rusqlite` (Task 14); `ww-core` adds `sha2` (Task 6: the store and the index hash file bytes) and `proptest` as a dev-dependency (Task 14).
 
   **New `windows` features in `ww-platform`:** `Win32_System_IO` (`OVERLAPPED`, `CancelIoEx`, `GetOverlappedResult`) and `Win32_Storage_CloudFilters` (`CfGetSyncRootInfoByPath`). `Win32_Storage_FileSystem` is already enabled.
 - **File writes in `ww-core`** (ARCH-002, ARCH-112, QA-024): every file-mutating call stays in `crates/ww-core/src/store/fsops.rs`, one `#[allow(clippy::disallowed_methods)]` per function. `crates/ww-testkit/tests/single_write_allowance.rs` keeps enforcing it.
@@ -143,7 +143,9 @@ Each question has the answer this plan uses unless you say otherwise.
   - Retry backoff, the 60 s git wait, watcher batching and the 30- and 90-day purges are tested with `#[tokio::test(start_paused = true)]` or `FakeClock`, never with real sleeps.
   - E2E tests wait on the watcher with the **watcher fence** (`RawPipe::fence`), never with a sleep.
   - The only wall-clock measurements are the two CORE-042 index benchmarks (Task 10). They are performance gates with their budgets in `test-params.toml`, not correctness assertions.
-  - Tests that need git use `TestEnv::git_init` (real `git`, isolated config, no remote, no network).
+  - Tests that need git use `TestEnv::git_init` (real `git`, isolated config, no remote, no network). The isolation is `TestEnv::git_env()` (`GIT_CONFIG_NOSYSTEM=1`, `HOME` and `XDG_CONFIG_HOME` set to `<root>\profile`, `GIT_CONFIG_GLOBAL` set to `<root>\profile\.gitconfig`). `child_env()` carries it too, so a spawned `ww` or core, and every `git` they run, never reads the system or user git config (QA-038): a developer machine or CI runner whose system git config sets `core.autocrlf=true` sees the same results as any other. In-process cores get it through `CoreConfig.git_env` (Task 14), which is empty in production.
+  - Unit and integration tests in `ww-core` create fixture files with `ww_testkit::files::write_file` (Task 4), never with `std::fs` in `crates/ww-core/src`, so `single_write_allowance.rs` keeps passing (QA-024). Other outside-writer steps (a move, a delete, clearing the read-only bit) happen only in `crates/ww-core/tests/`, through `ww_testkit` or under a per-function `#[allow(clippy::disallowed_methods)]` there.
+  - Spec tests get today's UTC date, month and set-aside suffix, and parse RFC 3339, through `ww_testkit::utc` (Task 4), which is written independently of `ww-schema::time` (QA-018).
 - **Isolation** (QA-038, QA-040, QA-041): as in plan 2a. Every workspace a test touches is under its `TestEnv` root. `workspace.create` and `WorkspaceHub::open` pass each path through `check_workspace`, so a test core never opens a workspace registered in a real `suite.toml`. No test touches real OneDrive: cloud placeholders are faked through file attributes (Task 10).
 - **Spec values used verbatim** (from the rule text):
   - path budget "about 180 characters per relative path" (CORE-040), fixed here at **180**;
@@ -155,7 +157,7 @@ Each question has the answer this plan uses unless you say otherwise.
   - `progress.md` entries "under `## Done` as `- YYYY-MM-DD: …`" (CORE-039);
   - "SHA-256 is the only content hash" (ARCH-078);
   - previews in events "≤ 1 MB" (ARCH-033).
-- **Names that are contracts.** Task 1 copies everything from here to the end of this section into spec Appendix E, except the test-channel tools table.
+- **Names that are contracts.** Task 1 copies the sub-bullets of this bullet into spec Appendix E, in the order Task 1 Step 3 lists them. The error-code table and exit code 7 go into Appendix D instead (Task 1 Step 2). The two bullets after this one (the test-channel tools table and Privacy) are not copied into the spec.
   - **Workspace-relative paths** use `/` and are checked before anything is written (CORE-040):
     - at most 180 characters;
     - no component may be a reserved Windows name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, and `COM¹`–`COM³`/`LPT¹`–`LPT³`), whatever its case and extension;
@@ -165,12 +167,12 @@ Each question has the answer this plan uses unless you say otherwise.
   - **Store write algorithm** (ARCH-074; ARCH-074 clarification):
     1. Check the path.
     2. If writes are paused for git, wait (ARCH-083). Writes are paused while the watcher's git flag is set **or** `<ws>\.git\index.lock` exists. The store checks that file itself (one `GetFileAttributesW`), so a write never races git during the watcher's batch window, or when no watcher runs.
-    3. Re-hash the target and compare it with the expected hash:
+    3. Re-hash the target and compare it with the expected hash (the store reads file data only through `probe.open_read`):
        - for a full write, the file's last generated hash (ARCH-078), or either hash of its pending row (step 5) while one exists. `Expect::Generated` with no generated row is a conflict when the file exists, and is treated as `Expect::New` when it doesn't;
        - for a manifest or YAML edit, the hash read at the start of the edit;
        - LFS pointers compare by `oid`;
        - a cloud-only placeholder target is never read, since reading would download it: the write fails with `store.hash_conflict`, and the message says to make the file available offline first. The same check comes first in every store operation that reads a file's data (`Store::read`, `edit_manifest`, `edit_yaml`, `edit_text`): the attribute-only `probe.identity` runs before any byte is read, so the store never triggers a download. Edits of a placeholder fail with `store.hash_conflict`, and `Store::read` of one fails with `store.io`, with the same message.
-    4. Write `<dir>\.<name>.ww-tmp-<pid>-<n>` in the same folder, and flush it with `FlushFileBuffers` before closing it.
+    4. Write `<dir>\.<name>.ww-tmp-<pid>-<n>` in the same folder, and flush it with `FlushFileBuffers` before closing it. The first backup name of step 6 uses the same `<pid>-<n>`.
     5. Record the pending replace: a `generated_pending(path, old_sha256, new_sha256)` row in the workspace `state.db`. `old_sha256` is the hash checked in step 3, or null for a new target.
     6. Replace the target. The fail point `store.replace` comes just before this step, and `store.after_replace` just after it.
        - For an existing target, call `ReplaceFileW(REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS)` with a backup name `<dir>\.<name>.ww-bak-<pid>-<n>`. `REPLACEFILE_WRITE_THROUGH` is never passed: it is documented as not supported.
@@ -185,12 +187,12 @@ Each question has the answer this plan uses unless you say otherwise.
     Error handling:
     - Sharing and lock violations (Windows errors 32, 33 and 1224) are retried, starting at 10 ms and doubling to a cap of 500 ms, for up to 10 s in total; after that the call fails with `store.busy`.
     - Errors 1175 and 1176 leave both files under their own names (a backup name was given), so they are retried the same way. Error 1177 leaves the old target under the backup name and the replacement under its temp name: the store moves the replacement onto the freed target name with `move_new`, then runs step 7.
-    - Where `ReplaceFileW` is unsupported (errors 1 and 50, for example on some network volumes), the store makes two renames, both with `move_new` (`MoveFileExW(MOVEFILE_WRITE_THROUGH)`, no `MOVEFILE_REPLACE_EXISTING`): target → backup, then temp → target. Step 7 follows. If a crash leaves only the backup, the next workspace open restores it.
+    - Where `ReplaceFileW` is unsupported (errors 1 and 50, for example on some network volumes), the store makes two renames, both with `move_new` (`MoveFileExW(MOVEFILE_WRITE_THROUGH)`, no `MOVEFILE_REPLACE_EXISTING`): target → backup, then temp → target. The fail point `store.between_renames` comes between the two. Step 7 follows. If a crash leaves only the backup, the next workspace open restores it.
     - On the fallback's second rename and on the move after 1177, the target name was just freed, so errors 80 and 183 mean an outside writer created a file there in the gap. That file is kept; the backup is moved aside with `move_new` to `<dir>\<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>`, the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
     - Disk full (errors 112 and 39) fails at once with `store.disk_full`; the temp file is removed and the pending row cleared.
 
     Durability: the temp file is flushed before the swap (step 4). Renames are atomic (journaled) but may be lost on power failure: `MOVEFILE_WRITE_THROUGH` is documented only to flush a move done as a copy and delete, so it adds no documented durability to a same-volume rename, and `ReplaceFileW` has no write-through option at all. A power cut can therefore leave either version. The temp flush makes both complete, and the pending row (step 5) makes either one acceptable as the core's own. `ReplaceFileW` needs the target, temp and backup files on one volume, which is why all three names are in the target's folder. The resulting file has the replacement's file ID, not the old target's, so the index records the identity the store reports after each write.
-  - **Write order** (ARCH-075): output files → manifest → jobs log line → `progress.md` entry → index → events. On workspace open, a read-write core runs `recover()`, which deletes no content:
+  - **Write order** (ARCH-075): output files → manifest → jobs log line → `progress.md` entry → index → events. Files already moved into place before the commit (a sealed version's files) reach the index in the index step too, never before the manifest edit. On workspace open, a read-write core runs `recover()`, which deletes no content:
     - **Orphans** are listed and never deleted (CORE-038):
       - `candidates/<run>/` folders missing from their manifest;
       - `v<semver>/` folders that hold a `manifest.snapshot.json` but whose version is neither the manifest's `approved_version` nor a run's `signed_off.version` (a crash between sealing and the manifest edit);
@@ -206,8 +208,8 @@ Each question has the answer this plan uses unless you say otherwise.
     - A `*.ww-bak-*` file whose target is missing is restored the same way, with or without a pending row.
   - **Append logs** (ARCH-081, CORE-009):
     - one JSON object per line, ending in `\n`, with `"machine"` and `"seq"` (from 1 per file) first, then the record;
-    - each line is one write under `LockFileEx` on the byte range starting at offset 2⁶⁴−2 with length 1 of the log file itself, which `ww` can take too;
-    - before appending, a last line without `\n` is closed with `\n`;
+    - each line is one write under `LockFileEx` on the byte range starting at offset 2⁶⁴−2 with length 1 of the log file itself, which `ww` can take too. The lock is requested with `LOCKFILE_FAIL_IMMEDIATELY` and retried by the caller, under the store's retry budget (10 ms doubling to 500 ms, 10 s in all, then `store.busy`);
+    - while the lock is held, the file is read, a last line without `\n` is closed with `\n`, and the line's `seq` is computed from that text, so two appenders never write the same `(machine, seq)`;
     - readers skip lines that don't parse and dedupe by `(machine, seq)`.
 
     `<machine>` is the computer name, lowercased, with every character outside `[a-z0-9-]` replaced by `-`. On test channels it is `testmachine`. `<yyyy-mm>` is the UTC month of the line.
@@ -219,8 +221,9 @@ Each question has the answer this plan uses unless you say otherwise.
   - **`core.lock`** (ARCH-028): the lock gates both read-write access to the workspace's `state.db` and the release of stale `running` idempotency rows. A core that finds it held serves the workspace read-only:
     - read tools work;
     - write tools get `workspace.read_only`;
-    - its `state.db` is opened read-only and its rows are never released.
-  - **Local data** (ARCH-097, CORE-005): `index.db` sits next to the workspace `state.db`, in `Env::workspace_local_dir(ws)`. It uses WAL, and `PRAGMA user_version` is `1`. A different version, or a failed `quick_check`, means the file is deleted and rebuilt.
+    - its `state.db` is opened read-only and its rows are never released. When that `state.db` doesn't exist yet (for example on another channel, whose local folder differs), an in-memory database with the migrations applied stands in, and nothing is created on disk;
+    - it uses an in-memory index (the same code over SQLite `:memory:`), rebuilt at open, and never opens the shared `index.db`.
+  - **Local data** (ARCH-097, CORE-005): `index.db` sits next to the workspace `state.db`, in `Env::workspace_local_dir(ws)`. It uses WAL, and `PRAGMA user_version` is `1`. A different version, or a failed `quick_check`, means the file is deleted and rebuilt. Only the core holding `core.lock` opens it: on a non-system volume both channels share `<volume>\.worldwright-local\<hash>\`, so a read-only core must never write it.
   - **`.gitignore` entries** added by `workspace.create` and `ww doctor` (CORE-040, ARCH-096): `.worldwright/`, `.trash/`, `inbox/*`, `projects/*/assets/*/candidates/`, `projects/*/assets/*/work/` (the root-relative form of CORE-040's `assets/*/work/`). All of `candidates/` is ignored, not only rejected runs (CORE-032 clarification), so open runs don't sync between machines.
   - **`.gitattributes` entry** added by `workspace.create` and `ww doctor` (CORE-040 clarification): `projects/** -text`, so git never converts line endings inside asset trees and recorded SHA-256 values hold on every clone. An existing file is appended to, never rewritten; plan 7 adds its LFS patterns to the same file (ARCH-086).
   - **Refs** (ARCH-042, CORE-031, CORE-047):
@@ -235,12 +238,14 @@ Each question has the answer this plan uses unless you say otherwise.
     - `status_before_stale` and `status_before_blocked`;
     - `has_working_doc`;
     - `external: [{"path","sha256"}]` (link-external files);
-    - `candidate_runs[].pinned`;
-    - `human_edits[]` entries `{"path","sha256","previous_sha256","detected"}`;
-    - `candidate_runs[].signed_off` `{"by","date","version"}`, the workspace format's field that CORE-051 calls `approved_by`; `by` is one of `user` (`ui:*`), `assistant`, `claude-code` (`mcp`) and `cli`.
+    - `hashes` (I5): keys are paths relative to the asset folder (`v1.0.0/x.png`), values are written `sha256:<64 hex>` as in I5. Every reader (the index, the watcher, the test kit) accepts a value with or without the `sha256:` prefix and compares the bare hex;
+    - `candidate_runs[]` in the I5 shape (`run_id`, `path`, `status`, `created`, `target_version`, `files`, …), plus `candidate_runs[].pinned`, `candidate_runs[].files[].sha256` (bare hex of the file as it was committed) and `candidate_runs[].trashed_utc` (RFC 3339, set when maintenance moves a rejected run's folder to trash; I5 clarification below);
+    - `human_edits[]` entries `{"path","sha256","previous_sha256","date"}`: I5's `path`, `sha256` and `date` (UTC `YYYY-MM-DD` of the detection), plus `previous_sha256`. I5's `author` and `note` are left out, since the core doesn't know them;
+    - `candidate_runs[].signed_off` `{"by","date","version"}`, the workspace format's field that CORE-051 calls `approved_by`; `by` is one of `user` (`ui:*`), `assistant`, `claude-code` (`mcp`) and `cli`;
+    - `version` (I5): when new work starts on an asset that has an `approved_version`, the first candidate run after it sets `version` to `approved_version` bumped by `minor`, and the run's `target_version` to the same value ("set it by the bump rules"); a sign-off with a confirmed `bump` replaces it.
 
     Unknown fields are kept in place (CORE-148). Edits never reorder existing keys: a removed key (`external` after `asset.collect`, `status_before_stale` after a restore) is removed by shifting the keys after it, never by moving the last key into its slot. Edits never add `schema_version` to a manifest that lacks it (a legacy manifest stays a minimal diff), and a file keeps the line ending (`\n` or `\r\n`) it was read with.
-  - **Product tools.** Every one declares the Worldwright module `workspace`, which is always available and never filtered by `modules` (CORE-058). Inputs reject unknown fields. A tool with a `project` argument uses the session's active project when it's omitted, else `sketchbook` (ARCH-088, ARCH-098).
+  - **Product tools.** Every one declares the Worldwright module `workspace`, which is always available and never filtered by `modules` (CORE-058). Inputs reject unknown fields. A tool with a `project` argument uses the session's active project when it's omitted, else `sketchbook` (ARCH-088, ARCH-098). The one exception is `assets.query`, whose `project` is a filter: omitted means every project.
 
     | Tool | Effect | Arguments | `structured` result |
     |---|---|---|---|
@@ -271,12 +276,15 @@ Each question has the answer this plan uses unless you say otherwise.
       - Every asset that matches the filters on every page and whose sort value doesn't change is returned exactly once, in order. An asset added, removed or re-sorted between pages may be missing from the pages or appear on two of them.
       - `total` is exact: the number of assets matching the filters when that page was read, counted in the same read transaction as the page.
       - The arguments are optional filters, so later plans add filters (for example tags, ratings, colour labels or collections) and sort fields as new optional keys. Unknown keys are rejected, so an older core answers a newer filter with `params.invalid` rather than ignoring it.
-    - `AssetDetail` is `AssetSummary` plus `{versions: [{version, ref, legacy}], next_versions: {major, minor, patch}, proposed_bump, candidate_runs, human_edits, external, files: [{path, state: "ok"|"not_fetched"|"cloud_only"|"human_edit"|"missing"}]}`.
-      - `missing` (ARCH-079, CORE-038 clarification) is a recorded candidate, sealed or manifest file that disappeared outside the suite. It stays listed with its last SHA-256, is never cleaned up automatically, and returns to `ok` when a file with the same SHA-256 reappears at that path.
+    - `AssetDetail` is `AssetSummary` plus `{versions: [{version, ref, legacy}], next_versions: {major, minor, patch}, proposed_bump, candidate_runs, human_edits, external, files: [{path, state: "ok"|"not_fetched"|"cloud_only"|"human_edit"|"needs_repair"|"missing"}]}`.
+      - `missing` (ARCH-079, CORE-038 clarification) is a file the suite still expects on disk that disappeared outside the suite: a file listed in the manifest's `hashes`, a file of an `open` run, or the manifest itself. It stays listed with its last SHA-256, is never cleaned up automatically, and returns to `ok` when a file with the same SHA-256 reappears at that path. Files of `selected` or `rejected` runs, and of runs with `trashed_utc`, are not expected there: sign-off moves chosen files into `v<version>/` and maintenance moves rejected runs to trash, so their removal is never `missing`.
       - `asset.get` of an asset whose manifest is missing fails with `manifest.needs_repair`, whose `data.missing` names the manifest path; the asset stays in `assets.query` and in `project.status.missing`.
       - Read tools (`assets.query`, `asset.get`, `project.status`) answer only after the workspace's first reconcile or cold rebuild has finished, so a fresh open never returns an empty or partial page.
     - `asset.pin_input` needs a ref that parses (`ref.invalid` otherwise). Its target doesn't have to exist on this machine, because a `proj:` or `lib:` source may be archived or not yet synced; the pin and the `links` entry are recorded either way (CORE-019).
     - Every write result that records an operation carries `handoff: {unlocks: [ref], made_stale: [ref], refs: [ref]}` (CORE-020).
+    - `asset.import`'s `ref` is the candidate ref of its first file (for `link_external`, the asset's ref without a version); `handoff.refs` lists the ref of every file.
+  - **Settings cascade** (CORE-057, I2, I4): workspace `worldwright.yaml` `defaults:` → `project.yaml` → the request layer, a plain override chain over dotted leaf keys. The project layer is `project.yaml`'s own top-level keys, as I4 says ("a project can override any of them"); there is no `overrides:` key. The cascade keys are `models`, `providers`, `qa_profile`, `modules`, `auto_candidate_on_save`, and `skip_stages` and `auto_approve`, which both layers write under `pipeline:` as in I4 (`pipeline.skip_stages`, `pipeline.auto_approve`). So `models: {image_generate: b}` at the top of `project.yaml` overrides `defaults: {models: {image_generate: a}}`, and both are the key `models.image_generate`.
+  - **`progress.md` entries** (CORE-039): a new entry `- YYYY-MM-DD: <text>` (UTC) goes on the line directly after `## Done`, newest first; the blank line before the next heading and every other section stay byte for byte. A file without `## Done` gets `## Done` and the entry appended at the end. A CRLF file stays CRLF. A new project's `project.yaml` holds `status: active`, `links: []` and one comment line, so status changes and new links edit existing keys.
   - **Topics** (ARCH-044, ARCH-032):
     - `asset:ww://<workspace id>/<project>/<asset_id>` (the ref without `@<version>` and hash, so one topic covers every version) carries `{kind: "manifest"|"candidate_run"|"version_sealed"|"human_edit"|"needs_repair"|"missing"|"status", …}`; its snapshot is the `asset.get` result;
     - `project:<slug>` carries `{kind: "status"|"progress"|"asset"}`; its snapshot is the `project.status` result;
@@ -318,7 +326,7 @@ Each question has the answer this plan uses unless you say otherwise.
     | `ww workspace init <path> [--name <n>] [--default]` | `workspace created at <path>` or `workspace registered at <path>`; then `default workspace: <path>` when it is the default |
     | `ww workspace use <path>` | `default workspace: <path>`; it connects with workspace `"none"`, so a stale default never blocks it |
     | `ww notify <path>…` | nothing on success; with `--no-start` and no core running, a silent no-op exiting 0 (ARCH-018) |
-    | `ww doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y`; an inherited `core.autocrlf=true` is a `problem`, set to `false` for the repository only after you type `y` (never with `--non-interactive`) |
+    | `ww doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y`; an inherited `core.autocrlf=true` is a `problem`, set to `false` for the repository only after you type `y` (never with `--non-interactive`); with no `suite.toml` or no default workspace it prints `ok: no default workspace; workspace checks skipped` |
 
     The core-start messages become:
     - "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` can set it aside."
@@ -327,7 +335,7 @@ Each question has the answer this plan uses unless you say otherwise.
     The `workspace.unsupported` and unregistered-workspace hints quote the path (`ww workspace use "<path>"`). A workspace named by `--workspace` is never told to become the default; it is told which workspace the core serves.
   - **Fail points** (QA-066, QA-055): `WW_TEST_FAILPOINTS=<name>=<action>[,…]`. They are read only on test channels, and disabled at compile time in builds whose `WW_BUILD_CHANNEL` is `stable` (a compile-time constant, so a stable build's checks are constant-false).
     - Actions: `abort` (the process ends at once, as a crash would: `TerminateProcess` on the current process, so no destructor runs and Windows Error Reporting is not involved), `disk_full`, `busy`, `unsupported` and `io`.
-    - Names: `store.write_temp`, `store.replace`, `store.after_replace`, `store.put_back`, `store.suite_toml`, `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress`, `store.after_index`, `store.after_seal`, `watch.start`.
+    - Names: `store.write_temp`, `store.replace`, `store.after_replace`, `store.between_renames`, `store.put_back`, `store.suite_toml`, `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress`, `store.after_index`, `store.after_seal`, `watch.start`.
   - **Dates:** `YYYY-MM-DD` and RFC 3339 `…Z`, in UTC. The set-aside suffix is `YYYYMMDDTHHMMSSZ`.
   - **Clarifications recorded in Appendix E** (no new rule IDs):
     - ARCH-074: the write algorithm above. "`ReplaceFileW` / `MoveFileExW` with write-through" means `ReplaceFileW` without a write-through flag (`REPLACEFILE_WRITE_THROUGH` is documented as not supported) after the temp file is flushed, and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which is documented to flush only a move done as a copy and delete. Renames are atomic (journaled) but may be lost on power failure; the temp flush makes both states complete, and the pending row makes either acceptable. The window between the hash check and the replace is closed by checking the backup, not only by the watcher. No rename ever replaces an existing file, and recovery never leaves an outside edit only in a dot-file.
@@ -336,31 +344,33 @@ Each question has the answer this plan uses unless you say otherwise.
     - ARCH-077, QA-048, QA-066: the golden round-trip uses a synthetic manifest with the lantern manifest's structure (owner decision 6). Fixture workspaces are synthetic; none is copied from a real workspace.
     - ARCH-044: the live topic of a ref is `asset:` plus the ref without `@<version>` and hash.
     - ARCH-079: a file's hash counts only when its identity (size, last write, ChangeTime) is the same before and after the read; an unstable or locked file is parked and re-checked, and is never a human edit or a removal. A directory event reconciles the folder's whole subtree. A human edit already recorded with the same SHA-256 is not recorded again.
-    - ARCH-079, CORE-038: a recorded candidate, sealed or manifest file that disappears outside the suite is `missing`: it stays listed, is never cleaned up automatically, and recovers when the same content reappears.
+    - ARCH-079, CORE-038: a file the suite still expects on disk (listed in `hashes`, a file of an `open` run, or a manifest) that disappears outside the suite is `missing`: it stays listed, is never cleaned up automatically, and recovers when the same content reappears. Moves the suite makes itself (sign-off, trash, maintenance) are never `missing`: files of `selected`, `rejected` or trashed runs aren't expected on disk, and the watcher defers removals under an asset whose sign-off is in progress until the sign-off ends, then reconciles that asset folder.
     - CORE-047, ARCH-079: the asset folder name is authoritative. The index stores each asset's `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
     - CORE-019: new `proj:` and `lib:` links are written to `links` in the Execute stage of `asset.pin_input`, because Validate runs before Confirm and never writes.
     - CORE-032: "purged" means moved to trash (ARCH-058), where the entry is purged 30 days later, so a rejected run leaves the disk 120 days after sign-off. All of `candidates/` is gitignored, not only rejected runs, so open runs don't sync between machines.
+    - CORE-039: a new entry goes on the line directly after `## Done`, newest first, and the blank line before the next heading is kept.
     - CORE-040: the budget is exactly 180 characters, and the `.gitignore` form is root-relative. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with, so a recorded SHA-256 holds on every clone.
     - CORE-041, ARCH-089: FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs only detect changes in place: ReFS IDs change on a move across folders, so the store reports each file's identity after every write and move.
     - CORE-042: the index budgets (a cold rebuild of 2,000 assets and a warm reconcile of 10,000) live in `test-params.toml`.
     - CORE-051: `approved_by` is the run's `signed_off.by`.
-    - CORE-057: in plan 2b the per-request layer is the `settings` argument of a tool that declares one. A per-call `settings` field in `tools/call` is a later protocol change, and it changes `schema_hash`.
+    - CORE-057: in plan 2b the per-request layer is the `settings` argument of a tool that declares one. A per-call `settings` field in `tools/call` is a later protocol change, and it changes `schema_hash`. The project layer is `project.yaml`'s top-level keys (I4), with `pipeline.skip_stages` and `pipeline.auto_approve` read as `skip_stages` and `auto_approve`.
     - QA-044: plain `proptest` strategies over operation sequences are an acceptable reading of "`proptest-state-machine`".
     - QA-066: fail points are disabled at compile time in stable builds and armed only on test channels.
     - ARCH-032: the per-topic history also has a count cap of 1024.
+    - I5 (workspace format, `docs/reference/workspace-format.md`): "Runs are never edited after sign-off, apart from their status" also allows `trashed_utc`, which maintenance writes when it moves a rejected run's folder to trash (CORE-032).
   - **Decision recorded in Appendix E:** organising metadata (tags, ratings, labels, collections) lives in manifests or tracked YAML, never only in `index.db`. The fields and their UI are plan 4.
 - **Test-channel tools added by this plan** (module `"test"`, registered only on `test-*` channels; a test contract, not copied into the spec):
 
   | Tool | Effect | Arguments | Result (`structured`) |
   |---|---|---|---|
   | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
-  | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}`; it writes the files into a staging handle as an engine would, then commits a candidate run |
+  | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}`; it writes the files into a staging handle as an engine would, then commits a candidate run. An omitted `project` is `sketchbook` until Task 12's resolver, then the resolved project |
   | `test.trash` | write | `{path}` | `{entry_id}` |
   | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.worldwright\fence\<name>` |
   | `test.settings` | read | `{project?, settings?}` | the resolved `Settings` with sources; its `settings` argument is plan 2b's only source of the request layer (CORE-057 clarification) |
 - **Privacy** (QA-086): no user-profile paths (write `%USERPROFILE%`), no personal names or e-mail addresses in code, fixtures, test names or reports.
   - Non-ASCII test labels use "Ünïcödé space".
-  - Fixture manifests are made up. Authors are `"sample-author"`, and hashes are SHA-256 values of the fixture's own bytes.
+  - Fixture manifests are made up. Authors are `"sample-author"`, and hashes are SHA-256 values of the fixture's own bytes (in `hashes`, written `sha256:<hex>` as in I5).
 
 ## Review Focus
 
@@ -446,7 +456,8 @@ The outline at the end of plan 2a gives 10 tasks. This plan keeps their content 
   7. `cargo run -q -p ww-cli -- dev privacy-scan --tree HEAD` (after the commit)
 
   Each task's own "Run" lines are the quick inner loop; the gate is what the task's report quotes.
-- **Tool registration.** Each task that adds a `register_*_tools` function also calls it from `core_registry` in `crates/ww-core/src/tools/mod.rs` (Task 8 gives it the hub, env and probe).
+- **Tool registration.** Each task that adds a `register_*_tools` function also calls it from `core_registry` in `crates/ww-core/src/tools/mod.rs` (Task 8 gives it the hub, env and probe; Task 14 the git environment).
+- **Plan 2a's pinning unit tests.** `crates/ww-core/src/tools/tests.rs` pins `Dispatcher::new`'s type, the test-tool names, the off-channel registry, every tool's module and the sync stages. Each task that changes one of those updates that file itself (Tasks 7, 8, 9, 11, 12, 13 and 14 list it): never delete a pin to get green.
 - **Adversarial review** (QA-023): Tasks 6, 7, 9, 11, 13 and 14 change `store`, `state` or the dispatcher. Their review is done by a reviewer with fresh context, who must try to write a failing test, not just comment.
 - **Spec tests** (QA-017, QA-018): Task 5's author reads only the spec (with Appendices D and E), this plan's Global Constraints and the Interfaces blocks. Later tasks only remove `expected-fail.toml` entries; none edits a spec test.
 
@@ -456,7 +467,9 @@ The outline at the end of plan 2a gives 10 tasks. This plan keeps their content 
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md`. No new IDs, no renumbering and no new `- **ID** [` lines; the ID check stays `925 925 []`.
-- Modify: `docs/reference/workspace-format.md` (not protected). In the sign-off step's `signed_off` object, `by` becomes `"user" | "assistant" | "claude-code" | "cli"` (owner question 4).
+- Modify: `docs/reference/workspace-format.md` (not protected), two edits in I5:
+  - in the sign-off step's `signed_off` object, `by` becomes `"user" | "assistant" | "claude-code" | "cli"` (owner question 4);
+  - "Runs are never edited after sign-off, apart from their status." becomes "Runs are never edited after sign-off, apart from their status and `trashed_utc`, which the suite sets when it moves a rejected run's folder to trash (plan 2b clarification: spec Appendix E)."
 
 **Interfaces:**
 - Produces: spec Appendix E and the Appendix D additions, which Tasks 2–15 implement.
@@ -467,29 +480,31 @@ The outline at the end of plan 2a gives 10 tasks. This plan keeps their content 
   - **ARCH-076.** "The typed structs are views over the ordered map, which keeps unknown fields in their original place."
   - **ARCH-044.** "The topic of a ref is `asset:` plus the ref without its `@<version>` and hash, so one subscription sees every version."
   - **ARCH-077, QA-048 and QA-066.** "(owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace."
-  - **ARCH-079.** "A hash counts only when the file's identity is the same before and after the read; an unstable or locked file is parked and re-checked, never recorded as a human edit or a removal. A directory event reconciles the folder's subtree. A human edit already recorded with the same SHA-256 isn't recorded again. A recorded candidate, sealed or manifest file that disappears is `missing` until the same content reappears (with CORE-038)."
-  - **CORE-038.** "A recorded file that disappears outside the suite is listed as `missing`, never forgotten (ARCH-079 clarification)."
+  - **ARCH-079.** "A hash counts only when the file's identity is the same before and after the read; an unstable or locked file is parked and re-checked, never recorded as a human edit or a removal. A directory event reconciles the folder's subtree. A human edit already recorded with the same SHA-256 isn't recorded again. A file the suite still expects on disk (listed in `hashes`, a file of an open run, or a manifest) that disappears is `missing` until the same content reappears (with CORE-038); the suite's own moves (sign-off, trash, maintenance) never make a file `missing`."
+  - **CORE-038.** "A file the suite still expects on disk that disappears outside the suite is listed as `missing`, never forgotten (ARCH-079 clarification)."
+  - **CORE-039.** "A new entry goes on the line directly after `## Done`, newest first; the blank line before the next heading is kept."
   - **CORE-047.** "The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`."
   - **CORE-019.** "In plan 2b the links are written in the Execute stage of `asset.pin_input`, since Validate runs before Confirm and never writes."
   - **CORE-032.** "Purged here means moved to trash (ARCH-058), which purges the entry 30 days later: 120 days after sign-off in all. The workspace `.gitignore` ignores all of `candidates/`, so open runs don't sync between machines."
   - **CORE-040.** "The budget is exactly 180 characters. In the workspace's root `.gitignore`, `assets/*/work/` is written `projects/*/assets/*/work/`. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with."
   - **CORE-041 and ARCH-089.** "FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders."
   - **CORE-051.** "`approved_by` is the sign-off run's `signed_off.by` field of the workspace format."
-  - **CORE-057.** "In plan 2b the per-request layer is the `settings` argument of a tool that declares one; a per-call `settings` field is a later protocol change (it changes `schema_hash`)."
+  - **CORE-057.** "In plan 2b the per-request layer is the `settings` argument of a tool that declares one; a per-call `settings` field is a later protocol change (it changes `schema_hash`). The project layer is `project.yaml`'s top-level keys (I4), with `pipeline.skip_stages` and `pipeline.auto_approve` read as `skip_stages` and `auto_approve`."
   - **QA-044.** "Plain `proptest` strategies over operation sequences are an acceptable reading of `proptest-state-machine`."
   - **QA-066.** "Fail points are disabled at compile time in stable builds and armed only on test channels."
   - **CORE-042.** "The budgets (a cold rebuild of 2,000 assets, a warm reconcile of 10,000) are recorded in `test-params.toml`."
   - **ARCH-032.** "The history is also capped at 1024 events per topic; an older cursor gets a snapshot."
+  - The I5 clarification of Global Constraints (`trashed_utc` on a signed-off run) has no rule text to attach to: it goes into Appendix E with the other clarifications (Step 3) and into `workspace-format.md` (Files).
   - **Appendix B.3**, the §1 Windows facts line: replace "`ReplaceFileW` / `MoveFileExW` write-through" with "`ReplaceFileW` (no write-through flag: `REPLACEFILE_WRITE_THROUGH` is not supported; one volume; the result keeps the replacement's file ID) and `MoveFileExW` `MOVEFILE_WRITE_THROUGH` (documented to flush only a move done as a copy and delete; re-checked 2026-10-16)". The line doesn't start with a rule ID, so the ID check is unaffected.
 - [ ] **Step 2: Edit Appendix D.**
-  - Add the 20 new error-code rows of Global Constraints (the ones whose source starts "plan 2b"). The existing rows `store.hash_conflict` and `workspace.required` lose *provisional* and gain "confirmed by plan 2b".
+  - Add the 20 new error-code rows of Global Constraints (the ones whose source starts "plan 2b"). The existing rows `store.hash_conflict` and `workspace.required` lose *provisional* and gain "confirmed by plan 2b". `store.hash_conflict`'s row says that `data.backup` names the backup's workspace-relative path when a put-back couldn't finish.
   - Add exit code 7 to the `ww-core` exit-code table.
   - In the `ww` commands paragraph, replace "`ww doctor` (plan 2b) can set it aside." with "`ww doctor` can set it aside.", and add the hot-journal message.
   - In the Events bullet, after "History: 600 s per topic, by monotonic time", add "and at most 1024 events".
 - [ ] **Step 3: Write `## Appendix E. Workspace data (plan 2b clarification)`** after Appendix D.
-  - It contains, in order, the "Names that are contracts" bullets of this plan's Global Constraints: paths, write algorithm, write order, append logs, areas, `core.lock`, local data, `.gitignore`, `.gitattributes`, refs, manifest fields, product tools, topics, the commands, fail points, dates, the clarifications and the organising-metadata decision.
+  - It contains, in order, the "Names that are contracts" bullets of this plan's Global Constraints: paths, write algorithm, write order, append logs, areas, `core.lock`, local data, `.gitignore`, `.gitattributes`, refs, manifest fields, product tools, settings cascade, `progress.md` entries, topics, the commands, fail points, dates, the clarifications and the organising-metadata decision. This list governs: the "Names that are contracts" lead-in is read the same way.
   - The error codes and exit code 7 go into Appendix D (Step 2), not here.
-  - **Exception:** the test-channel tools table stays out of the spec.
+  - **Exceptions:** the test-channel tools table and the Privacy bullet (the two Global Constraints bullets after "Names that are contracts") stay out of the spec.
   - The text is copied as written. No line may start with `- **` followed by a rule ID.
 - [ ] **Step 4: Update §0.5's document map** to end with "· Appendix E Workspace data (plan 2b clarification)".
 - [ ] **Step 5: Verify the IDs.**
@@ -512,7 +527,7 @@ git commit -m "spec: workspace data appendix and plan-2b clarifications (write p
 - Modify (protected): `Cargo.toml`. In one edit, add `proptest` and `toml_edit` to `[workspace.dependencies]`, give `serde_json` the `preserve_order` feature, and add `[profile.dev.package.libsqlite3-sys] opt-level = 3`.
 - Modify: `crates/ww-platform/Cargo.toml` (`windows` features `Win32_System_IO` and `Win32_Storage_CloudFilters`).
 - Create: `crates/ww-platform/src/{fs.rs, paths.rs}`. Modify `src/{lib.rs, env.rs, ids.rs, process.rs}`.
-- Modify: `crates/ww-core/src/{identity.rs, workspace.rs}` and `crates/ww-client/src/connect.rs`. The four private path normalisers become `ww_platform::paths::folder_key`.
+- Modify: `crates/ww-core/src/{identity.rs, workspace.rs}` and `crates/ww-client/src/connect.rs`. The private comparison normalisers (`identity.rs`'s `normalise`, `connect.rs`'s `folder_key`) become `ww_platform::paths::folder_key`. `workspace.rs`'s `id_of` is not a comparison: it produces `WorkspaceRef.path` (shown as `hello.workspace.path`) and keeps its case, so it uses `ww_platform::paths::strip_verbatim` (moved from `env.rs`'s private helper), never `folder_key`.
 - Modify: `crates/ww-testkit/src/ids.rs` (`SeqIds::uuid`).
 - Test: `crates/ww-platform/tests/fs.rs`; unit tests in `paths.rs`, `env.rs` and `ids.rs`; `crates/ww-platform/tests/pipes.rs` (hardened).
 
@@ -558,21 +573,26 @@ pub fn sync_root_from(cf: Result<(), i32 /* HRESULT */>, fs_name: &str, remote: 
     // failure → false on a non-NTFS or remote volume, and an error only on local NTFS
 pub struct LockedFile;                                            // Drop unlocks and closes
 pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<LockedFile>>;  // creates; LockFileEx EXCLUSIVE|FAIL_IMMEDIATELY on [0,1)
-pub struct AppendLock;
-pub fn lock_append(file: &std::fs::File, within: Duration) -> io::Result<AppendLock>;  // range [2^64-2, +1), polled
+pub struct AppendLock;                                            // Drop unlocks
+pub fn try_lock_append(file: &std::fs::File) -> io::Result<Option<AppendLock>>;
+    // LockFileEx(EXCLUSIVE | FAIL_IMMEDIATELY) on [2^64-2, +1): None at once when another handle holds it.
+    // It never waits: the caller (the store) polls with tokio time under its own budget
 pub enum Share { None, Read, ReadWrite }
 pub fn open_shared(path: &Path, share: Share) -> io::Result<std::fs::File>;  // the handle-holding helper's primitive
 pub trait Probe: Send + Sync + std::fmt::Debug {                  // injectable, so tests fake volumes and placeholders
     fn identity(&self, path: &Path) -> io::Result<FileIdentity>;
     fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo>;
-    fn open_read(&self, path: &Path) -> io::Result<std::fs::File>; // the only way index and watch read file data
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File>; // the only way store, index and watch read file data
 }
 pub struct SystemProbe;                                           // the functions above
 // ww_platform::paths
 pub fn folder_key(path: &Path) -> String;  // canonicalise (when it exists), strip \\?\ and \\?\UNC\, `\` separators,
-                                           // trim trailing separators, Unicode lowercase; for comparison only, never hashed
+                                           // trim trailing separators except on a bare drive root, which stays `x:\`
+                                           // (as connect.rs does today), Unicode lowercase; for comparison only, never hashed
+pub fn strip_verbatim(path: &Path) -> PathBuf;  // strips \\?\ (and \\?\UNC\ → \\); keeps case; for paths that are shown
 // env.rs
-impl Env { pub fn machine_id(&self) -> String; }                  // COMPUTERNAME rule; test channels "testmachine"
+impl Env { pub fn machine_id(&self) -> String; }                  // machine_id_from(COMPUTERNAME); test channels "testmachine"
+pub fn machine_id_from(computer_name: &str) -> String;           // pure: lowercase, every char outside [a-z0-9-] → '-'
 // ids.rs
 pub trait IdSource { fn id(&self, prefix: &str) -> String; fn uuid(&self) -> String; }   // uuid: v4, lowercase, hyphenated
 // process.rs
@@ -598,12 +618,13 @@ pub fn terminate_self(code: u32) -> !;   // TerminateProcess(GetCurrentProcess()
     - `identity_needs_no_data_access`: while `open_shared(path, Share::None)` holds the file, `identity` still succeeds; a file with `FILE_ATTRIBUTE_OFFLINE` set reports `is_cloud_placeholder()`;
     - `volume_info_reports_ntfs_for_the_temp_volume` (local, not a sync root, `stable_ids()`);
     - `exclusive_lock_is_refused_while_held_and_free_after_drop`;
-    - `append_lock_excludes_a_second_holder`;
+    - `append_lock_excludes_a_second_holder` (a second handle's `try_lock_append` returns `None` at once while the first holds it, and `Some` after the first is dropped);
     - `readonly_attribute_round_trip`.
   - **Unit tests:**
-    - `folder_key_strips_prefixes_case_and_trailing_separators`: `\\?\C:\Ws\`, `c:\ws` and `\\?\UNC\srv\share\x` → `\\srv\share\x`;
+    - `folder_key_strips_prefixes_case_and_trailing_separators`: `\\?\C:\Ws\`, `c:\ws` and `\\?\UNC\srv\share\x` → `\\srv\share\x`; a bare drive root keeps its separator (`Z:\` → `z:\`);
+    - `strip_verbatim_keeps_case` (`\\?\C:\Ünïcödé space\Ws` → `C:\Ünïcödé space\Ws`, `\\?\UNC\srv\share\X` → `\\srv\share\X`);
     - `folder_key_resolves_a_junction_to_its_target` (`mklink /J` in a tempdir through `run_hidden` of `%ComSpec%`);
-    - `machine_id_is_lowercase_and_restricted`, and `test_channel_machine_id_is_testmachine`;
+    - `machine_id_is_lowercase_and_restricted` (through the pure `machine_id_from`: `"DESK_01.Ünï"` → `"desk-01--n-"`, and every output character is in `[a-z0-9-]`; `Env::machine_id` itself is only checked to equal `machine_id_from` of the real name), and `test_channel_machine_id_is_testmachine`;
     - `random_uuid_is_v4` (version nibble 4, variant `8`–`b`);
     - `stable_ids_only_on_local_ntfs_or_refs_outside_sync_roots` (Review Focus 4): the truth table over `fs_name` (`NTFS`, `ReFS`, `FAT32`, `exFAT`), `remote` and `cloud_sync_root`;
     - `long_path_prefixes_from_247_units_and_unc` (lengths in UTF-16 code units: 246 unchanged, 247 prefixed, including a path whose non-BMP characters make its code-unit count larger than its `char` count; a UNC path gets `\\?\UNC\`, `..` is resolved first);
@@ -624,7 +645,7 @@ Expected: FAIL. Nothing is implemented.
   - Make the four root `Cargo.toml` edits, with the exact versions of Global Constraints: `proptest = { version = "1.12.0", default-features = false, features = ["std"] }`, `toml_edit = "0.22.27"`, `serde_json = { version = "1", features = ["preserve_order"] }`, and `[profile.dev.package.libsqlite3-sys] opt-level = 3` beside the `sha2` entry. These are exact pins: a different version needs a plan change, not an implementer's choice.
   - `copy_new`, `attributes`, `long_name` and `terminate_self` need no new `windows` feature: `CopyFile2`, `GetFileAttributesW` and `GetLongPathNameW` are in `Win32_Storage_FileSystem`, and `TerminateProcess` and `GetCurrentProcess` in `Win32_System_Threading`, both already enabled.
   - `volume_info`'s sync-root check calls `CfGetSyncRootInfoByPath` and maps the result through `sync_root_from`. Outside a sync root the call fails with `HRESULT_FROM_WIN32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT)` (390 in `windows` 0.62.2), which means `false`. On a volume without the cloud filter (FAT and exFAT USB sticks, SMB shares) the call may fail with other codes, so any failure on a non-NTFS or remote volume also means `false`; an error is returned only for local NTFS. A caller that still gets an error from `volume_info` treats the volume as having no stable IDs (Tasks 8 and 10).
-  - Replace the four normalisers with `folder_key`: `ww-core/src/identity.rs`, `ww-core/src/workspace.rs`, `ww-client/src/connect.rs`, and `ww-platform/src/env.rs`'s comparison use. `normalise_for_hash` stays: the workspace hash keeps its plan-1 ASCII-lowercase contract (QA-038).
+  - Replace the comparison normalisers with `folder_key`: `ww-core/src/identity.rs`'s `normalise` and `ww-client/src/connect.rs`'s `folder_key`; `connect.rs`'s existing `folder_keys_ignore_case_prefix_and_trailing_separator` (which pins `Z:\` → `z:\`) keeps passing unchanged. Move `env.rs`'s private `strip_verbatim` to `paths.rs` as the public `strip_verbatim`, and use it in `env.rs` and in `ww-core/src/workspace.rs`'s `id_of`, which keeps the path's case: `WorkspaceRef.path` and `hello.workspace.path` are never lowercased, so `default_workspace_id_resolves` keeps passing. `normalise_for_hash` stays: the workspace hash keeps its plan-1 ASCII-lowercase contract (QA-038).
   - Every `unsafe` block gets a `// SAFETY:` comment.
 - [ ] **Step 4: Run the whole workspace**, the boundary test and the licence check.
 
@@ -637,6 +658,7 @@ Expected: PASS.
 
 ```bash
 git add Cargo.toml Cargo.lock crates/ww-platform crates/ww-core/src/identity.rs crates/ww-core/src/workspace.rs crates/ww-client/src/connect.rs crates/ww-testkit/src/ids.rs
+git add <each test file Step 4 fixed, as listed in the report>
 git commit -m "platform: replace/move with write-through, file identity, volume facts, locks, long paths, folder_key; deps proptest, toml_edit"
 ```
 
@@ -680,6 +702,22 @@ pub struct ManifestView { pub schema_version: Option<u32>, pub asset_id: String,
     pub creation_uuid: Option<String>, pub inputs: Vec<Input>, pub pinned_inputs: Vec<PinnedInput>,
     pub candidate_runs: Vec<CandidateRun>, pub hashes: BTreeMap<String, String>, pub locks: Vec<String>,
     pub human_edits: Vec<HumanEdit>, pub external: Vec<ExternalFile>, pub has_working_doc: bool }
+    // hashes: key = path relative to the asset folder; value = bare 64-hex, read from "sha256:<hex>" or "<hex>"
+pub struct Input { pub r#ref: String, pub role: Option<String>, pub sha256: Option<String> }
+pub struct PinnedInput { pub r#ref: String, pub reason: Option<String>, pub by: Option<String>, pub date: Option<String> }
+pub struct CandidateRun { pub run_id: String, pub path: Option<String>, pub status: Option<String> /* open | selected | rejected */,
+                          pub created: Option<String>, pub target_version: Option<Version>, pub files: Vec<CandidateFile>,
+                          pub selected: Vec<String>, pub signed_off: Option<SignedOff>, pub pinned: bool,
+                          pub trashed_utc: Option<String> }
+pub struct CandidateFile { pub path: String /* asset-relative, I5 */, pub seed: Option<i64>, pub role: String /* candidate | derived | repair */,
+                           pub from: Option<String>, pub sha256: Option<String> /* bare hex; absent in pre-2b runs */ }
+pub struct SignedOff { pub by: String, pub date: String, pub version: Version }
+pub struct HumanEdit { pub path: String, pub sha256: String, pub previous_sha256: Option<String>, pub date: Option<String> }
+    // I5's author and note are read when present and otherwise ignored; the core writes path, sha256, previous_sha256, date
+pub struct ExternalFile { pub path: String, pub sha256: String }
+pub fn bare_sha256(value: &str) -> Option<&str>;   // "sha256:<64 hex>" or "<64 hex>" → the hex; anything else → None
+pub fn hash_value(hex: &str) -> String;            // "sha256:<hex>", the form the core writes into `hashes`
+// Every view field is read leniently: a wrong type is a SchemaWarning and the field's default, never a parse error.
 pub struct SchemaWarning { pub pointer: String, pub message: String }
 // version.rs
 pub struct Version { pub major: u64, pub minor: u64, pub patch: u64 }   // FromStr "^\d+\.\d+\.\d+$", Display, Ord
@@ -707,15 +745,24 @@ pub enum PathProblem { TooLong(usize), Reserved(String), BadComponent(String), N
 // yaml_edit.rs
 pub enum YamlEdit { SetScalar { path: Vec<String>, value: String }, AppendToList { path: Vec<String>, item: String } }
 pub fn apply(text: &str, edits: &[YamlEdit]) -> Result<String, YamlEditError>;   // line edits; re-parsed with yaml-rust2;
-                                                                                 // new lines use the file's line ending
+                                                                                 // new lines use the file's line ending.
+    // A missing top-level key is appended at the end of the document (`key: value`, or `key: [item]` for AppendToList);
+    // a missing nested key is Unsupported
 pub enum YamlEditError { Unsupported(String), Invalid(String) }
 // workspace_yaml.rs
 pub struct WorkspaceYaml { pub name: Option<String>, pub defaults: serde_json::Map<String, serde_json::Value> }
 pub struct ProjectYaml { pub name: Option<String>, pub slug: Option<String>, pub status: Option<String>, pub modules: Vec<String>,
                          pub links: Vec<String>, pub pipeline: serde_json::Map<String, serde_json::Value>,
                          pub overrides: serde_json::Map<String, serde_json::Value> }
+    // overrides is not a YAML key: it is extracted from project.yaml's top-level cascade keys (I4; Global Constraints
+    // "Settings cascade"): models, providers, qa_profile, modules, auto_candidate_on_save, and pipeline.skip_stages /
+    // pipeline.auto_approve stored as skip_stages / auto_approve. WorkspaceYaml.defaults is extracted the same way
+pub const CASCADE_KEYS: &[&str] = &["models", "providers", "qa_profile", "modules", "auto_candidate_on_save", "skip_stages", "auto_approve"];
 pub fn read_workspace_yaml(text: &str) -> Result<WorkspaceYaml, String>; pub fn read_project_yaml(text: &str) -> Result<ProjectYaml, String>;
-pub fn new_workspace_yaml(name: &str, created: &str) -> String; pub fn new_project_yaml(slug: &str, name: &str, kind: &str, created: &str) -> String;
+pub fn new_workspace_yaml(name: &str, created: &str) -> String;
+pub fn new_project_yaml(slug: &str, name: &str, kind: &str, created: &str) -> String;
+    // name, slug, type, `status: active`, `links: []`, created, and one comment line, so set_status and pin_input
+    // edit keys that already exist
 pub const PROGRESS_TEMPLATE: &str;                       // "# <name>\n\n## Done\n\n## Next\n\n## Open questions\n"
 // suite_edit.rs (toml_edit)
 pub fn register(text: &str, path: &str, make_default: bool) -> Result<String, String>;   // keeps comments, order and unknown keys
@@ -742,16 +789,16 @@ pub fn run_id(unix_secs: i64) -> String;                 // r_<yyyymmdd>_<hhmm>
 | `exported` | `Release` | `released` | |
 | `approved`, `exported`, `released` | `MarkStale` | `stale` | `status_before_stale` = from |
 | `stale` | `Restore` | `status_before_stale` | |
-| any but `deprecated` | `Block(reason)` | `blocked` | the reason must be non-empty; `status_before_blocked` = from |
+| any but `blocked`, `deprecated` | `Block(reason)` | `blocked` | the reason must be non-empty; `status_before_blocked` = from, so `Unblock` always leads out of `blocked` |
 | `blocked` | `Unblock` | `status_before_blocked` | |
 | any | `Deprecate` | `deprecated` | |
 
 **The synthetic fixture** (owner decision 6). `crates/ww-spec-tests/fixtures/sample-workspace/` contains:
 - `worldwright.yaml`, with comments;
-- `projects/sketchbook/{project.yaml, progress.md}`;
+- `projects/sketchbook/{project.yaml, progress.md}`; `project.yaml` has a comment line, `status: active` and `links: []`, as `new_project_yaml` writes;
 - two asset folders under `projects/sketchbook/assets/`:
   - **`prop_signal_lamp`**, the lantern's structure (CORE-033). A pre-suite `v1.0.0/` folder holds the candidates, the chosen file and a derived file together, and has no `manifest.snapshot.json`. The manifest has `"status": "candidate"` (so `asset.request_signoff` is a valid transition for the spec test `legacy_manifest_edit_is_a_minimal_diff`), no `candidate_runs` and no `schema_version`, but it does have fields the suite no longer uses (`license_scope`, `commercial_use`, `content_rating`, `budget_usd`; CORE-147/148), an unknown nested object and a `null` field.
-  - **`chr_paper_crane`**, in the modern I5 shape: a sealed `v1.0.0/` with `manifest.snapshot.json`, `hashes`, one `selected` and one open run, `inputs` with a `proj:` ref, and `locks`.
+  - **`chr_paper_crane`**, in the modern I5 shape: a sealed `v1.0.0/` with `manifest.snapshot.json`, `hashes` (values written `sha256:<64 hex>`, as in I5), one `selected` and one open run (each run file with its `sha256`), `inputs` with a `proj:` ref, and `locks`.
 - small made-up text and PNG files whose SHA-256 values are the ones recorded in the manifests.
 
 Both manifests are stored in `Manifest::to_text` format, with `\n` line endings; no text fixture file (`.json`, `.yaml`, `.yml`, `.toml`, `.md`, `.txt`) contains `\r\n`. Binary fixtures are excluded from that rule: every PNG signature contains the bytes `0D 0A`.
@@ -774,13 +821,17 @@ Both manifests are stored in `Manifest::to_text` format, with `\n` line endings;
     - `candidate_ref_is_view_only_form`;
     - `bad_refs_are_rejected` (uppercase slug, `@1.0`, a 63-hex hash);
     - `content_hash_follows_the_contract`: a hand-built two-line text hashed independently equals `version_content_hash`, and `source/a.png` and `manifest.snapshot.json` are ignored;
-    - `status_transitions_follow_the_table` (every row, plus three refusals: `planned` → `Signoff`, `deprecated` → anything but `Deprecate`, `Block("")`);
+    - `status_transitions_follow_the_table` (every row, plus four refusals: `planned` → `Signoff`, `deprecated` → anything but `Deprecate`, `Block("")`, and `blocked` → `Block("again")`, CORE-048);
+    - `hashes_read_with_or_without_prefix_and_are_written_prefixed` (`bare_sha256` accepts `sha256:<hex>` and `<hex>`, refuses 63 hex and other prefixes; `hash_value` writes `sha256:<hex>`; `ManifestView.hashes` of the fixture holds bare hex);
+    - `view_types_read_the_i5_run_shape` (the fixture's runs, files with `seed`, `role`, `from` and `sha256`, `signed_off`, `pinned_inputs`, `human_edits` with I5's `author`/`note` and with plan 2b's `previous_sha256`/`date`; a wrong type is a warning, not an error);
+    - `project_layer_is_the_top_level_keys` (`read_project_yaml` of an I4 file gives `overrides` with `models`, `modules`, `skip_stages` and `auto_approve` from `pipeline:`, and not `name`, `links` or `created`; `read_workspace_yaml` reads `defaults:` the same way);
+    - `new_project_yaml_has_status_links_and_a_comment` (it parses, has `status: active`, `links: []` and a `#` line, and a `SetScalar` of `status` and an `AppendToList` of `links` both apply);
     - `path_budget_is_180` (180 is ok, 181 is `TooLong`);
     - `reserved_names_are_refused_in_any_case_and_extension` (`con.png`, `Lpt1`, `com¹.txt`, `nul.tar.gz`);
     - `trailing_dot_space_and_bad_chars_are_refused`;
     - `yaml_set_scalar_keeps_comments_and_order`;
     - `yaml_edit_keeps_crlf_line_endings`;
-    - `yaml_append_to_block_and_flow_lists`;
+    - `yaml_append_to_block_and_flow_lists` (including the empty flow list `links: []`, and a missing top-level `links`, which is appended as `links: [proj:harbor]`);
     - `yaml_edit_refuses_anchor_and_flow_mapping_targets` (the text is unchanged and the error is `Unsupported`);
     - `suite_register_keeps_comments_and_unknown_tables` (a `# note` line and `[caps] monthly_usd = 50` survive; a second register is a no-op);
     - `log_lines_put_machine_and_seq_first`;
@@ -812,7 +863,10 @@ git commit -m "schema: lossless manifests, ww:// refs with content hashes, statu
 
 **Files:**
 - No dependency change: `registered()` parses `suite.toml` with the kit's own `toml`, like `register_workspace`, and nothing in the kit uses `ww-schema`, so spec tests never lean on the code they test (QA-018).
-- Create: `crates/ww-testkit/src/{workspace.rs, handles.rs, gitops.rs, failpoints.rs, params.rs}`. Modify `src/{lib.rs, env.rs, raw_pipe.rs, bins.rs, files.rs}`.
+- Create: `crates/ww-testkit/src/{workspace.rs, handles.rs, gitops.rs, failpoints.rs, params.rs, utc.rs}`. Modify `src/{lib.rs, env.rs, raw_pipe.rs, bins.rs, files.rs}`.
+  - `env.rs`: `child_env()` appends `git_env()`, so every `ww` and core a test spawns, and every `git` they run, is isolated from the system and user git config (QA-038). Without it, the core's `git config core.autocrlf` on a developer machine or CI runner whose system git config sets `core.autocrlf=true` would answer `true`, and the doctor spec test would get a prompt instead of "unset".
+  - `utc.rs`: date helpers for spec tests, written independently of `ww-schema::time` (QA-018), so no spec test re-implements date math and `crates/ww-spec-tests/src/lib.rs` (an existing file under `add-ok`, so a change needs approval) stays unchanged.
+  - `files.rs`: `write_file`, so `ww-core` tests create fixture files without `std::fs` in `crates/ww-core/src` (QA-024, `single_write_allowance.rs`).
 - Modify: `crates/ww-cli/tests/user_cli.rs`, the one caller of `ww_spawn`: its `Spawned` helper wraps `WwChild`, so `events_follow_prints_ndjson` drains its child's stderr and shows it on failure, and the workspace still builds after this task.
 - Test: unit tests in the new files.
 
@@ -826,14 +880,25 @@ impl TestEnv {
     pub fn workspace_id(&self, ws: &Path) -> String;               // Env::workspace_hash(canonicalize(ws))
     pub fn workspace_local_dir(&self, ws: &Path) -> PathBuf;
     pub fn registered(&self) -> (Option<PathBuf>, Vec<PathBuf>);  // parsed from this channel's suite.toml
-    pub fn git_init(&self, ws: &Path);                             // git init + one commit; GIT_CONFIG_NOSYSTEM=1, HOME and
-                                                                   // XDG_CONFIG_HOME under <root>\profile; no remote
+    pub fn git_env(&self) -> Vec<(OsString, OsString)>;            // GIT_CONFIG_NOSYSTEM=1; HOME and XDG_CONFIG_HOME =
+                                                                   // <root>\profile; GIT_CONFIG_GLOBAL = <root>\profile\.gitconfig
+    pub fn child_env(&self) -> Vec<(OsString, OsString)>;          // plan 2a's three variables, then git_env()
+    pub fn git_init(&self, ws: &Path);                             // git init + one commit, with git_env(); no remote
     pub fn git(&self, ws: &Path, args: &[&str]) -> String;         // same isolation; panics on failure
     pub fn ww_spawn(&self, args: &[&str]) -> WwChild;              // now a wrapper: Drop kills and waits
 }
 pub struct WwChild; impl WwChild { pub fn stdout_lines(&mut self) -> &mut dyn Iterator<Item = String>;
                                    pub fn stderr_so_far(&self) -> String; }   // stderr drained on a thread
 pub fn sha256_bytes(b: &[u8]) -> String;
+pub mod files { pub fn write_file(path: &Path, bytes: &[u8]); }   // creates parent folders; panics on failure
+pub mod utc {        // UTC, proleptic Gregorian, from the system clock; independent of ww-schema (QA-018)
+    pub fn today() -> String;                          // YYYY-MM-DD
+    pub fn year_month() -> String;                     // YYYY-MM
+    pub fn compact_now_pattern() -> impl Fn(&str) -> bool;
+        // accepts YYYYMMDDTHHMMSSZ whose date is today's or yesterday's UTC date (a call that crosses midnight)
+    pub fn parse_rfc3339(s: &str) -> i64;              // "…Z" → unix seconds; panics on anything else
+}
+// Tests that check "today" take today() before and after the call and accept either value.
 pub fn version_content_hash_of(dir: &Path) -> String;             // the Appendix E rule, written independently of ww-schema's
 pub struct HandleHolder; impl HandleHolder { pub fn hold(path: &Path, share: ww_platform::fs::Share) -> HandleHolder;
                                              pub fn release(self); }   // Defender- or viewer-style open handle
@@ -858,15 +923,19 @@ impl RawPipe {
 - `ww_spawn` returns `WwChild`, which kills its child on drop and drains its stderr on a thread; panics include that stderr.
 
 - [ ] **Step 1: Write the failing unit tests:**
-  - `fixture_workspace_copies_with_recorded_hashes` (every `hashes` entry matches `sha256_file`);
+  - `fixture_workspace_copies_with_recorded_hashes` (every `hashes` value, with its `sha256:` prefix stripped, matches `sha256_file`, and so does every run file's `sha256`);
   - `workspace_id_matches_platform_hash`;
   - `git_init_is_isolated_from_user_config` (`git config --show-origin user.name` names only the test profile);
+  - `child_env_carries_the_git_isolation` (`GIT_CONFIG_NOSYSTEM`, `HOME`, `XDG_CONFIG_HOME` and `GIT_CONFIG_GLOBAL` each appear once, under `<root>\profile`; a `git config --show-origin core.autocrlf` run with only `child_env()` prints nothing and exits 1, whatever the machine's system config says);
+  - `utc_helpers_agree_with_each_other` (`today()` starts `year_month()`; `parse_rfc3339("2028-02-29T00:00:00Z") - parse_rfc3339("2028-01-30T00:00:00Z") == 30 * 86400`; `compact_now_pattern()` accepts a suffix built from today's date and refuses `20261016T1200Z`);
+  - `write_file_creates_parents`;
   - `handle_holder_blocks_replace_until_released`;
   - `gitops_holds_index_lock_until_finish`;
   - `failpoint_spec_formats_pairs`;
   - `params_read_proptest_cases_and_panic_on_a_missing_budget` (`proptest_cases()` is 256 today; `budget("no_such_key")` panics naming the key and the file);
   - `version_content_hash_of_ignores_source_and_snapshot`;
   - `drop_without_a_core_returns_without_waiting` (a fresh `TestEnv`; dropping it makes no hello attempt, checked through a counter in the drop path, not a timer);
+  - plan 2a's `child_env_names_test_channel_root_and_parent` keeps passing (it looks the three variables up by name, so the appended git variables don't disturb it);
   - `call_returns_on_a_null_id_error` (a fake pipe server answers `{nope` with -32700);
   - `ww_child_is_killed_on_drop`;
   - `ensure_built_rebuilds_when_flagged_but_missing` (pure helper `needs_build(flag, exists) -> bool`).
@@ -903,7 +972,7 @@ A test author who doesn't read the implementation writes these from the spec (wi
 - No change to `crates/ww-spec-tests/Cargo.toml`: everything comes through `ww-testkit`, `ww-protocol` and `serde_json`.
 
 **Interfaces:**
-- Consumes: Task 4's testkit API, the Global Constraints contracts and test-channel tools, and the fixture of Task 3.
+- Consumes: Task 4's testkit API (including `ww_testkit::utc` for every date, month and set-aside suffix, and the git isolation that `child_env()` carries into every `ww` and core), the Global Constraints contracts and test-channel tools, and the fixture of Task 3. A test never edits the fixture under `crates/ww-spec-tests/fixtures/`: it adds what it needs to its own copy from `copy_fixture_workspace`.
 - Produces: the scenario tests that Tasks 7–14 turn green; each task removes its entries. The last column says which task.
 
 - [ ] **Step 1: Write the tests.**
@@ -924,14 +993,14 @@ A test author who doesn't read the implementation writes these from the spec (wi
   | `outside_edit_is_never_overwritten` | ARCH-074, ARCH-073 | `test.store_write {path:"notes/a.txt", text:"core", expect:"new"}` → ok; the test writes "mine" to the file; `test.store_write {…, text:"core 2", expect:"generated"}` → `store.hash_conflict`; the file reads "mine" | 7 |
   | `failed_write_leaves_no_half_written_file` | QA-011, ARCH-074 | core started with `store.write_temp=disk_full`; a write over an existing file → `store.disk_full`; the file's SHA-256 is unchanged and no `*.ww-tmp-*` file exists anywhere under the workspace | 7 |
   | `relative_path_over_budget_is_refused` | CORE-040 | a 181-character path → `store.path_invalid` and nothing exists under its first folder; `con.txt` → `store.path_invalid`; a 180-character path → ok | 7 |
-  | `registry_ledger_csv_is_never_written` | ARCH-082 | a fixture `registry/ledger.csv`; writing to it → `store.path_invalid`; its bytes are unchanged | 7 |
+  | `registry_ledger_csv_is_never_written` | ARCH-082 | the test creates `registry/ledger.csv` in its workspace copy (the Task 3 fixture has none); writing to it → `store.path_invalid`; its bytes are unchanged | 7 |
 
   **`store_order.rs`**
 
   | Test | Rules | Assertion | Green in |
   |---|---|---|---|
   | `crash_after_output_lists_orphan_and_keeps_files` | ARCH-075, CORE-038, QA-055 | core with `store.after_output=abort`; `test.ingest_run` → the core exits within 30 s; the run's files exist under `candidates/<run>/`; a restarted core's `project.status` lists that folder in `orphans`; the files still exist | 12 |
-  | `append_log_lines_are_per_machine_per_month_with_seq` | ARCH-081, CORE-009 | two `test.ingest_run {job_line:true}` → exactly one `queue/jobs.testmachine.<yyyy-mm>.jsonl`; its lines parse with `machine == "testmachine"` and `seq` 1 and 2, `machine` and `seq` being the first two keys | 7 |
+  | `append_log_lines_are_per_machine_per_month_with_seq` | ARCH-081, CORE-009 | two `test.ingest_run {job_line:true}` → exactly one `queue/jobs.testmachine.<yyyy-mm>.jsonl` (`<yyyy-mm>` from `utc::year_month()`); its lines parse with `machine == "testmachine"` and `seq` 1 and 2, `machine` and `seq` being the first two keys | 7 |
   | `torn_last_line_is_closed_before_the_next_append` | ARCH-081 | append `{"seq":` (no newline) to that file; one more `test.ingest_run` → the fragment is alone on its line, and the last line parses with `seq` 3 | 7 |
   | `staging_handle_is_in_workspace_and_ingest_moves_files` | ARCH-080, ARCH-033, CORE-003 | `test.ingest_run` → `staging_dir` starts with `<ws>\.worldwright\staging\` and no longer exists; the files are under `projects/sketchbook/assets/<id>/candidates/<run_id>/`; the manifest's `candidate_runs` has `run_id` | 7 |
   | `second_channel_core_gets_read_only_workspace` | ARCH-028 | two `TestEnv`s register the same workspace as default; the first core serves it; the second core's `test.store_write` → `workspace.read_only` | 7 |
@@ -944,7 +1013,7 @@ A test author who doesn't read the implementation writes these from the spec (wi
   | `signoff_uses_the_confirmed_bump` | CORE-027 | after `1.0.0`, `asset.get` `next_versions.minor == "1.1.0"`; a new run, then `signoff {bump:"minor"}` → `v1.1.0/` | 13 |
   | `sealed_ref_carries_the_content_hash` | ARCH-042, CORE-031, CORE-047 | the `signoff` `ref` is `ww://<id>/sketchbook/<asset>@1.0.0#sha256=<h>` with `h == version_content_hash_of(v1.0.0)` | 13 |
   | `link_external_asset_cannot_be_signed_off_until_collected` | CORE-029 | `asset.import {mode:"link_external"}` of a file outside the workspace, then `signoff` → `asset.link_external` with `fix.agent_hint.tool == "asset.collect"`; `asset.collect`, then `signoff` → ok and the version is inside the workspace | 13 |
-  | `trash_keeps_restore_record_and_restores` | ARCH-058, CORE-037, CORE-110 | `test.trash {path}` → the file is gone; `trash.list` has an entry with `original_path` and a `purge_after` 30 days after `moved_utc`; the folder is `.trash\<YYYY-MM-DD>\…`; `trash.restore` puts the bytes back | 9 |
+  | `trash_keeps_restore_record_and_restores` | ARCH-058, CORE-037, CORE-110 | `test.trash {path}` → the file is gone; `trash.list` has an entry with `original_path` and a `purge_after` 30 days after `moved_utc` (`utc::parse_rfc3339` of both differ by `30 * 86400`); the folder is `.trash\<YYYY-MM-DD>\…` with `utc::today()`; `trash.restore` puts the bytes back | 9 |
 
   **`index_watch.rs`** (each watcher assertion follows a `RawPipe::fence`)
 
@@ -962,9 +1031,9 @@ A test author who doesn't read the implementation writes these from the spec (wi
   | Test | Rules | Assertion | Green in |
   |---|---|---|---|
   | `project_create_status_and_context` | CORE-055 | `project.create {project:"harbor", name:"Harbor"}` → `projects/harbor/project.yaml` and `progress.md`; `project.status` ok; `project.context` lists settings and `suggested_tools`; a second create → `project.exists` | 12 |
-  | `settings_cascade_overrides_workspace_then_project_then_request` | CORE-057 | `defaults.models.image_generate: a` in `worldwright.yaml`, `b` in `project.yaml`; `test.settings` → `b` from `project`; with `settings {"models.image_generate":"c"}` → `c` from `request`; `{"caps.monthly_usd":1}` → `params.invalid` | 12 |
-  | `progress_entries_go_under_done` | CORE-039 | after `project.create`, `progress.md` has `- YYYY-MM-DD: ` (today, UTC) as the first line under `## Done`; the other sections are byte-equal to the template | 12 |
-  | `archived_project_restore_runs_staleness_check` | CORE-055, CORE-048 | archive `sketchbook`, give an input a newer sealed version on disk, restore → `stale` lists the dependent's ref, and its manifest `status == "stale"` with `status_before_stale` | 12 |
+  | `settings_cascade_overrides_workspace_then_project_then_request` | CORE-057 | `defaults: {models: {image_generate: a}}` in `worldwright.yaml`, and `models: {image_generate: b}` as a top-level key of `project.yaml` (Global Constraints "Settings cascade"); `test.settings` → `b` from `project`; with `settings {"models.image_generate":"c"}` → `c` from `request`; `{"caps.monthly_usd":1}` → `params.invalid` | 12 |
+  | `progress_entries_go_under_done` | CORE-039 | after `project.create`, the line directly after `## Done` in `progress.md` is `- YYYY-MM-DD: …` (`utc::today()`); the blank line before `## Next` and the other sections are byte-equal to the template | 12 |
+  | `archived_project_restore_runs_staleness_check` | CORE-055, CORE-048 | the test sets up both assets itself as an outside writer (the fixture promises no approved dependent, and `asset.signoff` is Task 13): it writes an input asset's manifest with `approved_version` `1.0.0` and a sealed `v1.0.0/`, and a dependent's manifest with `status: approved` whose `inputs` names the input `@1.0.0`, then fences; archive `sketchbook`; give the input a newer sealed version on disk (`approved_version` `1.1.0` and `v1.1.0/`) and fence; restore → `stale` lists the dependent's ref, and its manifest `status == "stale"` with `status_before_stale == "approved"` | 12 |
   | `active_project_is_per_session_with_state_json_hint` | ARCH-088 | connection A calls `project.status {project:"harbor"}`; connection B's `project.status {}` → the hint (`harbor`), not A's choice made later; after B names `sketchbook`, A's `project.status {}` is still `harbor`; `.worldwright\state.json` names the last one used | 12 |
 
   **`asset_record.rs`**
@@ -981,8 +1050,8 @@ A test author who doesn't read the implementation writes these from the spec (wi
 
   | Test | Rules | Assertion | Green in |
   |---|---|---|---|
-  | `doctor_fixes_git_config_and_gitignore_then_changes_nothing` | CORE-040, ARCH-085, QA-060 | `git_init`, then `.gitignore` emptied and `.gitattributes` removed; `ww doctor` → exit 0 with `fixed:` lines; `git config core.longpaths` is `true` and `lfs.setlockablereadonly` is `false`; `core.autocrlf` is still unset (the isolated config has no inherited value, so doctor neither asks nor sets it); `.gitattributes` holds `projects/** -text`; a second run prints only `ok:` lines and the SHA-256 values of `.gitignore`, `.gitattributes` and `.git\config` are unchanged | 14 |
-  | `doctor_sets_damaged_state_db_aside_only_after_yes` | CORE-004 | a corrupt suite `state.db`; `ww status` stderr says "`ww doctor` can set it aside." and not "(plan 2b)"; `ww doctor` with stdin `n` → exit 1, file unchanged; with `y` → `state.db.damaged-<YYYYMMDDTHHMMSSZ>` beside it with the old SHA-256; `ww status` → exit 0 | 14 |
+  | `doctor_fixes_git_config_and_gitignore_then_changes_nothing` | CORE-040, ARCH-085, QA-060 | `git_init`, then `.gitignore` emptied and `.gitattributes` removed; `ww doctor` → exit 0 with `fixed:` lines; `git config core.longpaths` is `true` and `lfs.setlockablereadonly` is `false`; `core.autocrlf` is still unset (`child_env()` carries the kit's git isolation into `ww`, the core and their `git` calls, so no system or user value is inherited, and doctor neither asks nor sets it); `.gitattributes` holds `projects/** -text`; a second run prints only `ok:` lines and the SHA-256 values of `.gitignore`, `.gitattributes` and `.git\config` are unchanged | 14 |
+  | `doctor_sets_damaged_state_db_aside_only_after_yes` | CORE-004 | a corrupt suite `state.db`; `ww status` stderr says "`ww doctor` can set it aside." and not "(plan 2b)"; `ww doctor` with stdin `n` → exit 1, file unchanged; with `y` → `state.db.damaged-<YYYYMMDDTHHMMSSZ>` beside it (the suffix accepted by `utc::compact_now_pattern()`) with the old SHA-256; `ww status` → exit 0. No workspace is registered, so the doctor prints `ok: no default workspace; workspace checks skipped` | 14 |
   | `non_interactive_doctor_never_moves_state_db` | CORE-004 | `ww --non-interactive doctor` → exit 1, the file is unchanged, and stdout says to run `ww doctor` interactively | 14 |
 
 - [ ] **Step 2: Run them and list the failures.**
@@ -1003,13 +1072,14 @@ git commit -m "spec-tests: plan-2b workspace data scenarios, expected to fail (Q
 
 **Files:**
 - Create: `crates/ww-core/src/store/{paths.rs, write.rs, failpoints.rs}`. Modify `store/{mod.rs, fsops.rs}`.
-- Modify: `crates/ww-core/clippy.toml`. Add `ww_platform::fs::{replace_file, move_new, copy_new, set_readonly, try_lock_exclusive, lock_append, open_shared, flush}` to `disallowed-methods`, with the ARCH-112 reason.
+- Modify: `crates/ww-core/clippy.toml`. Add `ww_platform::fs::{replace_file, move_new, copy_new, set_readonly, try_lock_exclusive, try_lock_append, open_shared, flush}` to `disallowed-methods`, with the ARCH-112 reason.
+- Modify: `crates/ww-core/Cargo.toml` (not protected): add `sha2.workspace = true`, since the store (and Task 10's index) hash file bytes. The root `Cargo.toml` already has `sha2` and doesn't change.
 - Modify: `crates/ww-core/src/state/{mod.rs, migrations.rs}`.
   - Migration 2, both scopes: `CREATE INDEX idempotency_prune ON idempotency(state, created_utc);`, so the prune in `idem_begin` no longer scans the table inside `BEGIN IMMEDIATE`.
   - Migration 3, workspace scope: `generated(path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, written_utc INTEGER NOT NULL)` and `generated_pending(path TEXT PRIMARY KEY, old_sha256 TEXT, new_sha256 TEXT NOT NULL, started_utc INTEGER NOT NULL)` (the pending replace of write step 5).
 - Modify: `crates/ww-core/src/config.rs` (`failpoints`).
 - Modify: `crates/ww-protocol/src/codes.rs`. Add the 20 plan-2b codes of Global Constraints as `CodeSpec` constants in table order, add them to `ALL`, set `provisional: false` on `STORE_HASH_CONFLICT` and `WORKSPACE_REQUIRED`, and extend the module's table test row by row. Codes aren't wire types, so `schema_hash` doesn't change.
-- Test: unit tests in `store/`; `crates/ww-core/tests/store_write.rs` (paused runtime).
+- Test: unit tests in `store/`; `crates/ww-core/tests/store_write.rs` (paused runtime). Tests create fixture files with `ww_testkit::files::write_file`, never with `std::fs` in `crates/ww-core/src` (`single_write_allowance.rs`, QA-024).
 
 **Interfaces:**
 
@@ -1027,10 +1097,13 @@ pub struct FailPoints;
 impl FailPoints {
     pub fn none() -> Arc<FailPoints>;
     pub fn parse(spec: &str) -> Result<FailPoints, String>;                  // "name=action[,…]"
-    pub fn from_env(env: &Env, var: &dyn Fn(&str) -> Option<String>) -> Arc<FailPoints>; // none unless test channel and BUILD_CHANNEL != "stable"
+    pub fn from_env(env: &Env, var: &dyn Fn(&str) -> Option<String>) -> Arc<FailPoints>; // none unless armed(env.channel(), BUILD_CHANNEL)
     pub fn hit(&self, name: &str) -> io::Result<()>;                         // Abort → ww_platform::process::terminate_self(0xDEAD)
-    pub fn on(&self, name: &str, hook: Box<dyn Fn() + Send + Sync>);         // in-process tests: run code at a point
+    pub fn on(&self, name: &str, hook: Box<dyn Fn() -> io::Result<()> + Send + Sync>);
+        // in-process tests: run code at a point. An Err from the hook is returned by hit() and treated by the store as
+        // the OS error of the call that follows the point (io::Error::from_raw_os_error(1177) simulates a 1177)
 }
+pub fn armed(channel: &Channel, build_channel: &str) -> bool;            // pure: a test-* channel and build_channel != "stable"
 // CoreConfig gains `pub failpoints: Arc<FailPoints>` (from_env in CoreConfig::for_env)
 // store/paths.rs
 pub struct WsPath(String);                                     // validated, '/' separators
@@ -1040,10 +1113,12 @@ pub fn writable(rel: &WsPath) -> Result<(), StoreError>;       // refuses regist
 // store/write.rs
 pub enum Expect { New, Generated, Hash(String) }
 pub struct Written { pub path: WsPath, pub sha256: String, pub identity: FileIdentity }
-pub enum StoreError { HashConflict(WsPath), Busy(WsPath), PathInvalid { path: String, why: String }, DiskFull(WsPath),
+pub enum StoreError { HashConflict { path: WsPath, backup: Option<WsPath> /* data.backup: a put-back that couldn't finish */ },
+                      Busy(WsPath), PathInvalid { path: String, why: String }, DiskFull(WsPath),
                       Io { path: String, why: String }, Locked(WsPath), GitBusy, ReadOnly, NeedsRepair(WsPath),
-                      YamlUnsupported(String), VersionExists(String) }
-impl StoreError { pub fn to_error(&self, trace_id: &str) -> ErrorBody; }   // the Appendix D codes
+                      YamlUnsupported(String), VersionExists(String) }   // Task 9 adds TrashUnknown and RestoreConflict
+impl StoreError { pub fn to_error(&self, trace_id: &str) -> ErrorBody; }   // the Appendix D codes; HashConflict with a
+                                                                           // backup sets data.backup to its relative path
 pub enum ChangeKind { Written, Created, Removed, MovedFrom(WsPath) }
 pub struct StoreEvent { pub path: WsPath, pub kind: ChangeKind, pub sha256: Option<String>, pub identity: Option<FileIdentity> }
 pub trait ChangeSink: Send + Sync {                            // the index step (Task 10); Store emits, the index consumes (CORE-010)
@@ -1055,6 +1130,7 @@ impl Store {
     pub fn new(root: PathBuf, state: Arc<StateDb>, failpoints: Arc<FailPoints>, clock: Arc<dyn Clock>, ids: Arc<dyn IdSource>,
                probe: Arc<dyn Probe>) -> Store;                 // probe: placeholder check in step 3, post-write identities
     pub fn root(&self) -> &Path;
+    pub fn ids(&self) -> &Arc<dyn IdSource>; pub fn clock(&self) -> &Arc<dyn Clock>;   // for tools that build manifests
     pub fn set_sink(&self, sink: Arc<dyn ChangeSink>);
     pub async fn read(&self, rel: &WsPath) -> Result<Option<Vec<u8>>, StoreError>;
     pub async fn write(&self, rel: &WsPath, bytes: Vec<u8>, expect: Expect) -> Result<Written, StoreError>;
@@ -1085,28 +1161,31 @@ pub fn remove_file(path: &Path) -> io::Result<()>; pub fn remove_dir_all(path: &
 pub fn set_readonly(path: &Path, on: bool) -> io::Result<()>;
 pub fn copy_new(from: &Path, to: &Path) -> io::Result<u64>;                     // ww_platform::fs::copy_new (CopyFile2, fail if exists)
 pub fn lock_exclusive(path: &Path) -> io::Result<Option<ww_platform::fs::LockedFile>>;
-pub fn append_locked(path: &Path, line: &str, within: Duration) -> io::Result<()>;   // lock_append, close a torn line, one write_all
+pub fn append_locked(path: &Path, make_line: &dyn Fn(&str /* current text */) -> String) -> io::Result<Option<String>>;
+    // try_lock_append; None at once when another holder has the lock (the caller polls with tokio::time::sleep under
+    // the 10 s budget, then store.busy). With the lock held: read the file, close a torn last line with "\n", call
+    // make_line on the text (so the seq comes from last_seq of what is really there), one write_all; returns the line
 ```
 
-**The write path** is exactly the Global Constraints algorithm, including the pending row (step 5), the put-back rules (step 7) and the `move_new`-only fallbacks. Blocking file calls run in `spawn_blocking`, and the retry sleeps are `tokio::time::sleep`, so paused-time tests drive them. Until Task 11 adds the git gate, step 2 is a no-op. `recover()` follows the Global Constraints recovery rules for temps, backups and pending rows; Task 7 adds the staging and orphan parts.
+**The write path** is exactly the Global Constraints algorithm, including the pending row (step 5), the put-back rules (step 7), the `move_new`-only fallbacks and the fail point `store.between_renames` between the fallback's two renames. Blocking file calls run in `spawn_blocking`, and the retry sleeps are `tokio::time::sleep`, so paused-time tests drive them. The store reads file data (`read`, the `edit_*` reads, the step-3 re-hash and the step-7 backup hash) only through `probe.open_read`, after the attribute-only `probe.identity` placeholder check. Until Task 11 adds the git gate, step 2 is a no-op. `recover()` follows the Global Constraints recovery rules for temps, backups and pending rows; Task 7 adds the staging and orphan parts.
 
 - [ ] **Step 1: Write the failing tests** (`tests/store_write.rs`, `#[tokio::test(start_paused = true)]`, tempdir workspaces):
   - `new_file_write_records_generated_hash` (ARCH-002, ARCH-078): the write goes through `Store::write`, the only file-write home, and the `generated` row holds the new SHA-256;
   - `full_write_over_outside_edit_is_hash_conflict` (ARCH-074);
   - `edit_between_check_and_replace_puts_the_outside_version_back` (ARCH-074): a hook on `store.replace` writes "outside" to the target; the result is `HashConflict`, the file reads "outside", and no backup, temp file or pending row remains;
-  - `put_back_held_past_budget_names_the_backup_and_recovers` (ARCH-074): as above, plus `HandleHolder::hold(target, Share::Read)` taken in the hook; `advance(11 s)` → `HashConflict` with `data.backup` set and the pending row kept; after release, `recover()` puts "outside" back under the target's name;
+  - `put_back_held_past_budget_names_the_backup_and_recovers` (ARCH-074): as above, plus `HandleHolder::hold(target, Share::Read)` taken in the hook; `advance(11 s)` → `HashConflict { backup: Some(_) }`, whose `to_error` has `data.backup` naming that backup's workspace-relative path, and the pending row kept; after release, `recover()` puts "outside" back under the target's name;
   - **`crash_after_replace_keeps_outside_edit_visible`** (ARCH-074, Review Focus 1): a hook on `store.replace` writes "outside" to the target, and `store.after_replace=io` stops the write before step 7. The store is dropped, and a new `Store` over the same root and `state.db` runs `recover()`: the target reads "outside", the core's bytes are in `<name>.ww-conflict-<utc>`, no `.ww-bak-` file remains and the pending row is gone;
   - **`crash_after_replace_does_not_flag_own_write_as_human_edit`** (ARCH-074, Review Focus 1): `store.after_replace=io` with no outside edit; after `recover()` in a new `Store`, the `generated` row holds the new SHA-256, `accepts_as_own(new)` is true, and the next `Expect::Generated` write succeeds. Before `recover()`, `accepts_as_own` is true for both the old and the new hash;
   - `expect_generated_without_a_row_is_conflict_or_new` (an existing file → `HashConflict`; a missing one is written);
-  - `cloud_only_target_is_a_conflict_and_never_read` (a fake `Probe` reports the file as a placeholder; `write`, `edit_manifest`, `edit_text` and `read` all refuse it, and no byte of it is read: the probe's `open_read` counter and a read counter in `fsops` stay at 0);
+  - `cloud_only_target_is_a_conflict_and_never_read` (a fake `Probe` reports the file as a placeholder; `write`, `edit_manifest`, `edit_text` and `read` all refuse it, and no byte of it is read: the fake probe's `open_read` counter, the store's only way to read file data, stays at 0);
   - **`crash_during_put_back_keeps_the_outside_edit`** (ARCH-074, Review Focus 1): a hook on `store.replace` writes "outside" to the target, and `store.put_back=io` stops the put-back halfway. Two variants: the `ReplaceFileW` put-back (the second backup, holding the core's new bytes, is left beside the target) and the fallback put-back with `store.replace=unsupported` (the target is missing, and both backups are left). In both, a new `Store` over the same root and `state.db` runs `recover()`: the target reads "outside", no `.ww-bak-` file and no pending row remains, and the core's new bytes are gone (they were its own, and the call had failed);
   - **`held_target_is_retried_until_released`** (Review Focus 2): `HandleHolder::hold(target, Share::Read)`; start the write; `advance(3 s)`; release; the write is ok;
   - **`target_held_past_budget_fails_with_store_busy_and_no_temp`** (Review Focus 2): `advance(11 s)` → `Busy`; the target's SHA-256 is unchanged; no `*.ww-tmp-*` file;
   - **`relative_path_over_180_chars_is_refused_before_any_write`** (Review Focus 3): no folder of the path was created;
   - **`deep_workspace_past_260_chars_writes_through_long_paths`** (Review Focus 3): the workspace root is nested so that the target's absolute path is 320 characters; the write and the read are ok;
   - **`replace_falls_back_to_two_renames_where_unsupported`** (Review Focus 4): `store.replace=unsupported` → ok with the new content;
-  - `fallback_crash_between_renames_is_restored_by_recover`: a hook stops after target → backup; `recover()` restores the old content;
-  - **`fallback_second_rename_never_replaces_a_new_outside_file`** (ARCH-074, Review Focus 4): `store.replace=unsupported`, and a hook between the two renames creates the target with "outside"; the result is `HashConflict`, the target reads "outside", the old content is in `<name>.ww-conflict-<utc>`, and no temp file or pending row remains. The same hook after a simulated 1177 gives the same result;
+  - `fallback_crash_between_renames_is_restored_by_recover`: `store.replace=unsupported`, and a hook on `store.between_renames` returns an `io` error, so the write stops after target → backup; the store is dropped, and `recover()` in a new `Store` restores the old content;
+  - **`fallback_second_rename_never_replaces_a_new_outside_file`** (ARCH-074, Review Focus 4): `store.replace=unsupported`, and a hook on `store.between_renames` creates the target with "outside" and returns `Ok`; the result is `HashConflict`, the target reads "outside", the old content is in `<name>.ww-conflict-<utc>`, and no temp file or pending row remains. The 1177 variant gives the same result: a hook on `store.replace` does what a real 1177 leaves behind (it renames the target to the first backup name, which is the one `.<name>.ww-tmp-<pid>-<n>` file in the folder with `ww-tmp` read as `ww-bak`), writes "outside" at the target, and returns `io::Error::from_raw_os_error(1177)`;
   - `replace_errors_map_to_retry_recover_or_fail` (pure: `RetryClass` → next step, for 32, 1175, 1176, 1177, 183, 50 and 112; 1177 and the fallback's second rename go to `move_new`);
   - `new_target_created_by_an_outside_writer_is_hash_conflict` (ARCH-074): a hook on `store.replace` creates the target before the move; the result is `HashConflict`, the outside file is unchanged, and no temp file remains;
   - `disk_full_leaves_no_temp_and_the_target_unchanged` (QA-011);
@@ -1116,7 +1195,7 @@ pub fn append_locked(path: &Path, line: &str, within: Duration) -> io::Result<()
   - `invalid_manifest_is_needs_repair_and_untouched`;
   - `yaml_edit_keeps_comments_and_is_hash_checked`;
   - `stale_temps_of_dead_processes_are_removed_by_recover` (a temp named for a live PID is kept);
-  - `failpoints_arm_only_on_test_channels_of_non_stable_builds` (QA-066);
+  - `failpoints_arm_only_on_test_channels_of_non_stable_builds` (QA-066): the pure `armed` over every channel kind (stable, dev, `test-*`) and the build channels `stable` and `dev`, since a stable or dev `Env` can't be built under the testkit's armed guard; plus `from_env` on a test `Env` arms a parsed spec;
   - `store_errors_map_to_appendix_d_codes`;
   - `idempotency_prune_uses_its_index` (`EXPLAIN QUERY PLAN` of the prune names `idempotency_prune`).
 - [ ] **Step 2: Run them.**
@@ -1146,9 +1225,11 @@ git commit -m "store: hash-checked atomic writes with ReplaceFileW backup check,
 **Files:**
 - Create: `crates/ww-core/src/store/{order.rs, logs.rs, staging.rs}`.
 - Modify: `crates/ww-core/src/workspace.rs` (`WorkspaceHub`, `OpenWorkspace`, `Access`).
-- Modify: `crates/ww-core/src/state/mod.rs`. `for_workspace` takes an `Access`; read-only opens never migrate or release rows.
+- Modify: `crates/ww-core/src/state/mod.rs`. `for_workspace` takes an `Access`; read-only opens never migrate the file or release rows. A `ReadOnly` open of a workspace whose `state.db` doesn't exist (SQLite can't open a missing file read-only; the second channel's local folder may differ from the first's) gets an in-memory `StateDb` (`rusqlite::Connection::open_in_memory`) with the workspace migrations applied, and creates nothing on disk (ARCH-028).
 - Modify: `crates/ww-core/src/tools/{registry.rs, dispatcher.rs, test_tools.rs, mod.rs}` and `crates/ww-core/src/server/mod.rs`. The hub opens the default workspace at start and `close_all` runs before the state databases close.
-- Test: unit tests in the new files; `crates/ww-core/tests/{store_order.rs, workspace_hub.rs}`; additions to `tests/state.rs` and `tests/dispatch.rs`.
+- Modify: `crates/ww-core/src/config.rs`: `CoreConfig` gains `pub probe: Arc<dyn Probe>` (`SystemProbe` in `CoreConfig::for_env`), which `server/mod.rs` passes to `WorkspaceHub::new`, so in-process tests can fake volumes and placeholders.
+- Modify: `crates/ww-core/src/tools/tests.rs` (plan 2a's unit tests, which pin what this task changes): `registry_and_dispatcher_live_in_the_tools_module`'s `NewDispatcher` type gains `Arc<WorkspaceHub>` in `Dispatcher::new`'s new position, every `Dispatcher::new` call in the file passes a hub, and `test_tools_exist_only_on_test_channels`'s name list gains `test.ingest_run` and `test.store_write` in sorted order.
+- Test: unit tests in the new files; `crates/ww-core/tests/{store_order.rs, workspace_hub.rs}`; additions to `tests/state.rs` and `tests/dispatch.rs`. Tests create fixture files with `ww_testkit::files::write_file`, never with `std::fs` in `crates/ww-core/src` (QA-024).
 
 **Interfaces:**
 
@@ -1161,7 +1242,8 @@ Produces:
 pub struct OutputMove { pub from: PathBuf /* inside a staging handle */, pub to: WsPath }
 pub type ManifestEdit = Arc<dyn Fn(&mut Manifest) -> Result<(), StoreError> + Send + Sync>;
 pub type TextEdit = Arc<dyn Fn(&str) -> Result<String, StoreError> + Send + Sync>;
-pub struct CommitOp { pub outputs: Vec<OutputMove>, pub manifest: Option<(WsPath, ManifestEdit)>,
+pub struct CommitOp { pub outputs: Vec<OutputMove>, pub moved: Vec<Written> /* files already in place, e.g. a sealed version */,
+                      pub manifest: Option<(WsPath, ManifestEdit)>,
                       pub job_line: Option<serde_json::Map<String, Value>>, pub progress: Option<(WsPath, TextEdit)> }
 pub struct CommitReport { pub outputs: Vec<Written>, pub manifest: Option<Manifest>, pub job_seq: Option<u64> }
 impl Store {
@@ -1176,6 +1258,8 @@ impl Store {
 // store/logs.rs
 pub enum LogKind { Jobs, Usage }
 impl Store { pub async fn append_log(&self, kind: LogKind, record: serde_json::Map<String, Value>) -> Result<u64, StoreError>; }
+    // fsops::append_locked in spawn_blocking; on None (another holder), tokio::time::sleep from 10 ms doubling to 500 ms,
+    // 10 s in all, then store.busy. The seq is last_seq(text under the lock, machine) + 1
 pub async fn append_loose_usage(env: &Env, record: serde_json::Map<String, Value>) -> Result<u64, StoreError>; // local_dir\usage-loose.jsonl
 // store/staging.rs
 pub struct StagingHandle { pub id: String, pub dir: PathBuf }
@@ -1202,13 +1286,14 @@ impl StateRegistry { pub async fn for_workspace(&self, ws: &WorkspaceRef, access
 // tools: CallCtx gains `pub workspace: Option<Arc<OpenWorkspace>>`
 impl CallCtx { pub fn workspace(&self) -> Result<&Arc<OpenWorkspace>, ErrorBody>; }   // workspace.required when None
 // Dispatcher::new(reg, hooks, states, events, hub, ids, clock, lifecycle)
+// config: CoreConfig gains `pub probe: Arc<dyn Probe>` (SystemProbe by default), passed to WorkspaceHub::new
 ```
 
 **Rules:**
 - **`WorkspaceHub::open`**, in order:
   1. `check_workspace(path)`;
   2. `fsops::ensure_dir(<ws>\.worldwright)` and `fsops::lock_exclusive(core.lock)`: `Some` → `ReadWrite`, `None` → `ReadOnly`;
-  3. `states.for_workspace(ws, access)`;
+  3. `states.for_workspace(ws, access)`; for `ReadOnly` with no `state.db` on disk, an in-memory `StateDb` with the migrations applied, and nothing is created;
   4. `Store::new`, then `store.recover()` (read-write only);
   5. `orphans()`, published once on `workspace` as `{kind:"orphans", paths}` when not empty.
 
@@ -1222,17 +1307,17 @@ impl CallCtx { pub fn workspace(&self) -> Result<&Arc<OpenWorkspace>, ErrorBody>
   2. `edit_manifest`;
   3. `append_log(Jobs)`;
   4. `edit_text(progress)`;
-  5. `sink.applied(events of 1–4)`.
+  5. `sink.applied(events of 1–4)`, plus one `ChangeKind::Written` event per entry of `op.moved`, with its `sha256` and `identity` as given. Files that a caller moved into place before the commit (Task 13's sealed version) therefore reach the index only after the manifest edit (ARCH-075).
 
   The fail points are `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress` and `store.after_index`. An error after step 1 leaves the outputs where they are (they become orphans); nothing is ever deleted.
 - **`recover`** (Task 6) gains the staging and orphan parts here: it calls `sweep_staging`, and `orphans()` lists everything the Global Constraints name, including `v<semver>/` folders that hold a `manifest.snapshot.json` whose version is neither the manifest's `approved_version` nor a run's `signed_off.version`.
-- **Test tools:** `test.store_write` and `test.ingest_run`, per the Global Constraints table. `test.ingest_run` uses `staging_handle`, writes the files through `fsops::write_temp` as an engine would, takes its run id from `next_run_id`, and commits one candidate run (`Manifest::new` if missing, status via `transition(…, CandidateRun)`).
+- **Test tools:** `test.store_write` and `test.ingest_run`, per the Global Constraints table. `test.ingest_run` uses `staging_handle`, writes the files through `fsops::write_temp` as an engine would, takes its run id from `next_run_id`, and commits one candidate run (`Manifest::new` with `store.ids().uuid()` if missing, status via `transition(…, CandidateRun)`, each run file with its `sha256`). An omitted `project` is `sketchbook` here; Task 12 replaces that default with its resolver.
 
 - [ ] **Step 1: Write the failing tests:**
   - **`tests/store_order.rs`:**
-    - `commit_writes_output_manifest_log_progress_then_index` (ARCH-075): a recording `ChangeSink` and hooks see the steps in that order;
+    - `commit_writes_output_manifest_log_progress_then_index` (ARCH-075): a recording `ChangeSink` and hooks see the steps in that order, and an `op.moved` entry reaches the sink only in step 5, with the identity it was given;
     - `error_after_output_leaves_a_listed_orphan_never_deleted` (ARCH-075, CORE-038), for each fail point after step 1;
-    - `append_takes_the_shared_lock_and_numbers_lines` (ARCH-081): a second `lock_append` holder delays the append until released;
+    - `append_takes_the_shared_lock_and_numbers_lines` (ARCH-081; paused time): a second handle holding the lock through `try_lock_append` delays the append until released; two concurrent `append_log` calls get seqs 1 and 2, never the same one;
     - `month_rollover_starts_a_new_file` (`FakeClock::shift_utc`);
     - `torn_last_line_is_closed_and_skipped_by_readers`;
     - `loose_usage_goes_to_the_local_folder` (ARCH-081);
@@ -1243,6 +1328,7 @@ impl CallCtx { pub fn workspace(&self) -> Result<&Arc<OpenWorkspace>, ErrorBody>
   - **`tests/workspace_hub.rs`:**
     - `core_lock_gives_read_write_and_releases_running_rows` (ARCH-028);
     - `second_hub_without_the_lock_is_read_only_and_keeps_rows` (ARCH-028): two `StateRegistry`s whose envs map the workspace to the same local folder; the second gets `ReadOnly`; the first's `running` row survives; the second's `state.db` connection is read-only;
+    - `read_only_open_without_a_state_db_uses_memory_and_creates_nothing` (ARCH-028): a second hub whose env maps the workspace to a different, empty local folder (another channel) opens it `ReadOnly`; reads work, a write tool gets `workspace.read_only`, and no file appears in that local folder;
     - `concurrent_first_opens_share_one_open_workspace`: 16 tasks → one `Arc` (`ptr_eq`) and one state actor;
     - `open_lists_orphans_once_on_the_workspace_topic`.
   - **`tests/dispatch.rs` additions:**
@@ -1260,7 +1346,7 @@ impl CallCtx { pub fn workspace(&self) -> Result<&Arc<OpenWorkspace>, ErrorBody>
 - [ ] **Step 2: Run them.**
 
 Run: `cargo nextest run -p ww-core`
-Expected: FAIL. Nothing is implemented.
+Expected: FAIL for the tests of the new code. The hardening tests (`write_tool_panic_is_core_bug_and_releases_the_key`, `state_errors_map_to_state_unavailable`, `replay_of_a_null_outcome_is_core_bug`, `newer_schema_is_refused_and_untouched_with_a_live_wal` and the extended `losing_core_never_touches_state_db`) may already pass on `main`: the report lists each one as RED or as a regression pin that passed before the change, never claims a RED it didn't see.
 
 - [ ] **Step 3: Implement it.**
 - [ ] **Step 4: Run them, then the spec tests.**
@@ -1281,7 +1367,12 @@ git commit -m "store: write order with orphans, locked per-machine monthly logs,
 
 **Files:**
 - Create: `crates/ww-core/src/store/suite_toml.rs` and `crates/ww-core/src/tools/workspace_tools.rs`.
-- Modify: `crates/ww-core/src/tools/{registry.rs, dispatcher.rs, mod.rs}` (`core_registry` gains `hub: &Arc<WorkspaceHub>`, `env: &Env` and `probe: &Arc<dyn Probe>`, and always registers the product tools) and `crates/ww-core/src/workspace.rs` (the agent hint, quoted paths).
+- Modify: `crates/ww-core/src/tools/{registry.rs, dispatcher.rs, mod.rs}` (`core_registry` gains `hub: &Arc<WorkspaceHub>`, `env: &Env` and `probe: &Arc<dyn Probe>`, and always registers the product tools), `crates/ww-core/src/server/mod.rs` (passes the hub, env and `CoreConfig.probe` to `core_registry`; wiring) and `crates/ww-core/src/workspace.rs` (the agent hint, quoted paths).
+- Modify: `crates/ww-core/src/tools/tests.rs` (plan 2a's unit tests, which pin what this task changes):
+  - every `core_registry` call passes the new arguments;
+  - `test_tools_exist_only_on_test_channels` compares only the names that start with `test.`, and its off-channel assertion becomes "no `test.*` tool is listed" (the product tools are registered on every channel);
+  - `every_tool_declares_a_module` accepts `test` for `test.*` tools and `workspace` for every other one;
+  - `RecArgs` gains `#[serde(deny_unknown_fields)]`, so its schema has `"additionalProperties": false` and `RecTool` still registers under the new precondition.
 - Modify: `crates/ww-client/src/lib.rs` (hint quoting, the `--workspace` wording, and the unregistered-workspace hint loses its "(plan 2b)" text; Task 14 removes the one in the start-failure message) and its tests (`tests/client.rs`).
 - Create: `crates/ww-cli/src/user/workspace.rs`. Modify `user/mod.rs` (`Workspace` subcommand; the `--no-start` probe).
 - Test: unit tests; `crates/ww-core/tests/{workspace_tools.rs, workspace_create_guard.rs}`; `crates/ww-cli/tests/workspace_cli.rs`; `crates/ww-cli/tests/user_cli.rs` (hygiene).
@@ -1301,6 +1392,8 @@ pub async fn register_workspace(env: &Env, path: &Path, make_default: bool, fp: 
     // writer created the file meanwhile, so it re-reads once as for any outside change
 // tools/workspace_tools.rs
 pub fn register_workspace_tools(reg: &mut Registry, hub: Arc<WorkspaceHub>, env: Env, probe: Arc<dyn Probe>);
+pub fn refuse_inside(path: &Path, install_dir: Option<&Path>) -> Result<(), String>;
+    // pure (ARCH-094): Err when `path` is the install folder or inside it, compared with folder_key; Ok for None
 #[serde(deny_unknown_fields)] pub struct WorkspaceCreateArgs { pub path: String, pub name: Option<String>, pub default: Option<bool> }
 pub struct WorkspaceCreateResult { pub id: String, pub path: String, pub created: bool, pub default: bool, pub warnings: Vec<String> }
 #[serde(deny_unknown_fields)] pub struct SetDefaultArgs { pub path: String }
@@ -1317,8 +1410,8 @@ pub enum WorkspaceCommand {
 
 **Rules:**
 - **`workspace.create`:**
-  1. Make the path absolute; `fsops::ensure_dir`; canonicalise; `check_workspace`.
-  2. Refuse with `workspace.path_invalid` a path inside `install_dir` (ARCH-094), inside another registered workspace, or one that is a file.
+  1. Make the path absolute and run `check_workspace` on it **before** anything is created (QA-040: a path inside a real workspace trips the guard before a folder exists); then `fsops::ensure_dir`, canonicalise, and run `check_workspace` again on the canonical path (a junction or short name can lead elsewhere).
+  2. Refuse with `workspace.path_invalid` a path that `refuse_inside(path, env.install_dir())` rejects (ARCH-094), one inside another registered workspace, or one that is a file. `Env::install_dir()` is `None` on test channels, so the install-folder rule is tested through the pure `refuse_inside` with a made-up install folder.
   3. If `worldwright.yaml` exists, register only (`created: false`); nothing is written in the folder.
   4. Otherwise `hub.open(ws)`. Through its store, write `projects/sketchbook/project.yaml`, `projects/sketchbook/progress.md` (`PROGRESS_TEMPLATE`, ARCH-098), `.gitignore` (the five entries) and `.gitattributes` (`projects/** -text`, CORE-040 clarification), each appended to an existing file through `edit_text`, and **last** `worldwright.yaml`, whose presence marks the folder as a workspace.
   5. `register_workspace` (`default` = the argument, else true when no default is set); `hub.refresh_default()`; `hub.close(id)` unless it is the default.
@@ -1346,18 +1439,18 @@ pub enum WorkspaceCommand {
   - **`tests/workspace_tools.rs`:**
     - `create_writes_layout_and_registers_last`: with `store.suite_toml=io` armed, the folder has its files and isn't registered; a retry adopts and registers it;
     - `create_adopts_an_existing_workspace_without_writing` (the SHA-256 of `worldwright.yaml` is unchanged);
-    - `create_refuses_install_dir_nested_workspace_and_files` (ARCH-094);
+    - `create_refuses_nested_workspace_and_files` (a folder inside another registered workspace, and a path that is a file, → `workspace.path_invalid`; nothing is created);
     - `create_warns_on_network_or_cloud_volumes` (fake `Probe`);
-    - **`create_on_a_fat_or_usb_volume_warns_and_succeeds`** (Review Focus 4; fake `Probe`): with `fs_name` `FAT32`, and again with a `volume_info` that returns an error, `workspace.create` succeeds with the "can't track files by ID" warning, and the workspace opens and serves a `test.store_write`;
+    - **`create_on_a_fat_or_usb_volume_warns_and_succeeds`** (Review Focus 4; fake `Probe` in an in-process core's `CoreConfig.probe`, Task 7): with `fs_name` `FAT32`, and again with a `volume_info` that returns an error, `workspace.create` succeeds with the "can't track files by ID" warning, and the workspace opens and serves a `test.store_write`;
     - `create_writes_gitattributes_and_appends_to_an_existing_one` (CORE-040: an existing `.gitattributes` keeps its lines, and `projects/** -text` is appended once);
     - `set_default_registers_and_switches` (ARCH-090);
     - `set_default_closes_the_old_workspace` (after the switch and the end of a call that held it, a second hub can take the old workspace's `core.lock`);
     - `suite_toml_keeps_comments_and_unknown_keys_and_is_hash_checked` (CORE-007): a `FailPoints::on("store.suite_toml", …)` hook changes the file between read and replace → re-read once → both edits are present;
     - `unsupported_fix_has_the_agent_hint_and_a_quoted_path` (QA-003).
-  - **`tests/workspace_create_guard.rs`:** `create_on_a_real_registered_workspace_trips_the_guard` (QA-040, its own binary, ordered as plan 2a's guard test).
+  - **`tests/workspace_create_guard.rs`:** `create_on_a_real_registered_workspace_trips_the_guard` (QA-040, its own binary, ordered as plan 2a's guard test): the guard trips for a new subfolder of that workspace, and the subfolder was never created.
   - **Unit tests:**
     - `registry_refuses_schemas_that_allow_unknown_properties`;
-    - `every_registered_tool_forbids_additional_properties`;
+    - `refuse_inside_rejects_the_install_folder_and_below` (ARCH-094: with a made-up install folder `C:\Programs\Worldwright`, that folder, a subfolder and a differently cased spelling are refused; a sibling folder and `None` pass);
     - `idem_finish_failure_says_what_happens`;
     - `ww-client`: `unregistered_hint_quotes_the_path_and_flag_source_is_not_told_to_switch` (the hint no longer says "(plan 2b)"; the existing unit test that expects that text is updated).
   - **`ww-cli` parse:** `workspace_init_and_use_parse`.
@@ -1394,8 +1487,8 @@ git commit -m "core: workspace.create/set_default writing suite.toml through sto
 
 **Files:**
 - Create: `crates/ww-core/src/store/{versions.rs, trash.rs}` and `crates/ww-core/src/tools/trash_tools.rs`.
-- Modify: `crates/ww-core/src/store/write.rs` (the `locks` check), `tools/{mod.rs, test_tools.rs}` (`test.trash`), and `workspace.rs` (maintenance at open and every 24 h).
-- Test: unit tests; `crates/ww-core/tests/{versions.rs, trash.rs}`.
+- Modify: `crates/ww-core/src/store/write.rs` (the `locks` check; `StoreError` gains `TrashUnknown(String)` → `trash.unknown` and `RestoreConflict(WsPath)` → `trash.restore_conflict`), `tools/{mod.rs, test_tools.rs}` (`test.trash`), `tools/tests.rs` (`test_tools_exist_only_on_test_channels`'s `test.*` name list gains `test.trash`), and `workspace.rs` (maintenance at open and every 24 h).
+- Test: unit tests; `crates/ww-core/tests/{versions.rs, trash.rs}`. Tests create fixture files with `ww_testkit::files::write_file`, never with `std::fs` in `crates/ww-core/src` (QA-024).
 
 **Interfaces:**
 
@@ -1425,8 +1518,10 @@ impl Store {
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError>;
     pub async fn trash_list(&self) -> Result<Vec<TrashRecord>, StoreError>;
     pub async fn trash_restore(&self, entry_id: &str) -> Result<WsPath, StoreError>;
+        // TrashUnknown(entry_id) for no such entry; RestoreConflict(original path) when that path is occupied
     pub async fn maintenance(&self, now_utc: i64) -> Result<MaintenanceReport, StoreError>;
 }
+// StoreError (Task 6) gains TrashUnknown(String) and RestoreConflict(WsPath); to_error maps them to the Appendix D codes
 pub fn register_trash_tools(reg: &mut Registry);       // trash.list, trash.restore
 ```
 
@@ -1437,7 +1532,7 @@ pub fn register_trash_tools(reg: &mut Registry);       // trash.list, trash.rest
 4. Write `manifest.snapshot.json` (`snapshot.to_text()`).
 5. `set_readonly` on every file.
 6. `move_new` the folder to `projects/<p>/assets/<a>/v<version>/`.
-7. Record the generated hashes, and compute `content_hash`. Identities for the index are taken after step 6 and returned in `Sealed.identities`: setting the read-only attribute moves ChangeTime, and on ReFS a move across folders changes the file ID (CORE-041 clarification).
+7. Record the generated hashes, and compute `content_hash`. `Sealed.files` holds bare hex, keyed by the path relative to the asset folder (`v<version>/<file>`); the manifest's `hashes` entries that Task 13's Record stage writes from it use `ww_schema::hash_value` (`sha256:<hex>`, I5). Identities for the index are taken after step 6 and returned in `Sealed.identities`: setting the read-only attribute moves ChangeTime, and on ReFS a move across folders changes the file ID (CORE-041 clarification).
 8. Hit the fail point `store.after_seal`. Between here and the Record stage's manifest edit, a crash leaves a `v<version>/` folder that no manifest records yet; `orphans()` lists it (Global Constraints), and nothing in it is lost.
 
 Each move hits the fail point `store.replace`, which covers every swap or move of a file into place, and retries sharing violations as in Task 6. On an error, already-moved files are moved back to the run folder, and the staging folder (if not empty) is left for the orphan listing. A half-filled `v<version>/` never exists.
@@ -1448,7 +1543,7 @@ Each move hits the fail point `store.replace`, which covers every swap or move o
 - **Trash** (ARCH-058, CORE-037, CORE-110). `trash` moves the file or folder to `.trash\<date>\<te_…>\payload\<name>` and writes `restore.json` next to it. `trash_restore` of a path under `projects/*/assets/*/v<semver>/` sets the read-only attribute again on every restored file (CORE-026).
 - **`maintenance`:**
   - It removes entries whose `purge_after` has passed. This is the core's own maintenance, not an agent call. `fsops::remove_file` and `remove_dir_all` clear the read-only attribute first, so a sealed payload can be purged (`DeleteFile` fails with `ERROR_ACCESS_DENIED` on a read-only file).
-  - It moves the folders of `rejected` runs to trash 90 days after their version's sign-off date, unless `pinned` (CORE-032), and records `"trashed_utc"` on the run. The trash entry is purged 30 days later, so a rejected run leaves the disk 120 days after sign-off (CORE-032 clarification: "purged" means moved to trash).
+  - It moves the folders of `rejected` runs to trash 90 days after their version's sign-off date, unless `pinned` (CORE-032), and records `"trashed_utc"` (RFC 3339) on the run with `edit_manifest`; the run is otherwise unchanged (the I5 clarification of Global Constraints allows this one field on a signed-off run). Files of rejected or trashed runs aren't expected on disk, so the index never lists them as `missing` (Task 10). The trash entry is purged 30 days later, so a rejected run leaves the disk 120 days after sign-off (CORE-032 clarification: "purged" means moved to trash).
   - The only hard deletes in `ww-core` are this purge, stale temps and settled backups (Task 6), empty staging handles (Task 7) and the index rebuild (Task 10).
 
 - [ ] **Step 1: Write the failing tests:**
@@ -1465,12 +1560,12 @@ Each move hits the fail point `store.replace`, which covers every swap or move o
     - `legacy_folder_is_listed_as_legacy` (fixture `prop_signal_lamp`, CORE-033).
   - **`tests/trash.rs`:**
     - `trash_moves_with_a_restore_record` (ARCH-058, CORE-037);
-    - `restore_refuses_an_occupied_path` (`trash.restore_conflict`);
+    - `restore_refuses_an_occupied_path` (`StoreError::RestoreConflict` → `trash.restore_conflict`; an unknown `entry_id` → `TrashUnknown` → `trash.unknown`);
     - `trash_purges_after_30_days_only` (`FakeClock`: 29 days kept, 31 days purged);
     - `purge_of_a_read_only_payload_succeeds` (a trashed sealed file, still read-only, is purged after 31 days);
     - `restore_under_a_version_folder_reapplies_read_only` (CORE-026);
-    - `rejected_runs_go_to_trash_90_days_after_signoff_unless_pinned` (CORE-032);
-    - `hard_deletes_happen_only_in_purge_temp_cleanup_and_index_rebuild` (CORE-110): a source scan of `crates/ww-core/src` finds `fsops::remove_` calls only in `store/trash.rs`, `store/write.rs` (temps, settled backups and `recover`), `store/staging.rs` (empty handle folders only) and `index/`;
+    - `rejected_runs_go_to_trash_90_days_after_signoff_unless_pinned` (CORE-032): the run gains `trashed_utc` and nothing else in it changes;
+    - `hard_deletes_happen_only_in_purge_temp_cleanup_and_index_rebuild` (CORE-110): a source scan of `crates/ww-core/src` finds every `remove_file(` and `remove_dir_all(` token, with or without a path prefix (so a `use … fsops::remove_file;` followed by a bare call is found too), only in `store/fsops.rs` (the definitions), `store/trash.rs`, `store/write.rs` (temps, settled backups and `recover`), `store/staging.rs` (empty handle folders only) and `index/`; the test also fails if it finds none at all;
     - `trash_tools_list_and_restore`.
   - Remove `versions_trash::trash_keeps_restore_record_and_restores` from `expected-fail.toml`.
 - [ ] **Step 2: Run them.**
@@ -1497,15 +1592,16 @@ git commit -m "store: sealed read-only versions under a per-asset lock, legacy f
 
 **Files:**
 - Create: `crates/ww-core/src/index/{mod.rs, schema.rs, reconcile.rs, query.rs}` and `crates/ww-core/src/tools/asset_read_tools.rs` (`assets.query`, `asset.get`).
-- Modify: `crates/ww-core/src/workspace.rs`. `OpenWorkspace` gains `pub index: Arc<Index>`; `open` opens it after the store and sets it as the store's `ChangeSink`. The first reconcile (or cold rebuild) runs in the background, so `open` doesn't wait for it, but read tools do: they await `Index::ready()` (below). `workspace.rs` also runs the `verify_pending` tick (1 s tokio interval) and, from Task 11 on, hands its mismatches to the watcher.
+- Create: `crates/ww-core/src/pipeline/{mod.rs, detail.rs}`: `asset.get`'s detail builder is the plain function `pipeline::asset_detail`, over `Store` and `Index`, taking no `tools` types, so Task 13's `asset:` snapshot provider (in `tools/`) can call it without a module cycle (CORE-010). `tools/asset_read_tools.rs` only parses arguments and calls it.
+- Modify: `crates/ww-core/src/workspace.rs`. `OpenWorkspace` gains `pub index: Arc<Index>`; `open` opens it after the store and sets it as the store's `ChangeSink`. A `ReadWrite` workspace opens `index.db` in `workspace_local_dir`; a `ReadOnly` one gets `Index::open_in_memory` and never touches `index.db`, which on a non-system volume is shared with the core that holds `core.lock` (ARCH-097, CORE-005). The first reconcile (or cold rebuild) runs in the background, so `open` doesn't wait for it, but read tools do: they await `Index::ready()` (below). `workspace.rs` also runs the `verify_pending` tick (1 s tokio interval) and, from Task 11 on, hands its mismatches to the watcher.
 - Modify (protected): `test-params.toml`.
-  - Add `[budgets]` with `index_rebuild_2000_assets_s = 30` and `index_warm_reconcile_10000_assets_s = <about twice the slower of two measurements, rounded up to whole seconds>`, with a comment naming CORE-042 and `crates/ww-core/tests/index_bench.rs`, and noting that the owner confirms the warm value at PR time (owner question 2). The two measurements are a local run and a run on the CI's Windows runner (the PR's CI log prints it), so the budget holds on the slower machine.
+  - Add `[budgets]` with `index_rebuild_2000_assets_s = 30` and `index_warm_reconcile_10000_assets_s = <about twice the local measurement, rounded up to whole seconds>`, with a comment naming CORE-042 and `crates/ww-core/tests/index_bench.rs`, saying that the value is twice the local measurement of this task, and that the owner checks it against the CI Windows runner's figure (printed in the PR's CI log) and adjusts it, if needed, when approving the PR (owner question 2). The CI run happens only after this commit, so this task doesn't wait for it.
   - Remove the stale header lines: the "# Trial: protected-file change used to test the approval flow …" line, and "Plan-1 code does not consume this file yet" (with its continuation). In their place, one comment says that `ww_testkit::params` reads `[proptest]` and `[budgets]`, and that `.config/nextest.toml` still carries the timeout values directly.
-- Test: unit tests; `crates/ww-core/tests/{index.rs, index_bench.rs, module_deps.rs}`.
+- Test: unit tests; `crates/ww-core/tests/{index.rs, index_bench.rs, module_deps.rs}`. Tests create fixture files with `ww_testkit::files::write_file`, never with `std::fs` in `crates/ww-core/src` (QA-024).
 
 **Interfaces:**
 
-Consumes: Task 6's `ChangeSink`, `StoreEvent`; Task 2's `Probe`.
+Consumes: Task 6's `ChangeSink`, `StoreEvent`; Task 9's `Store::versions`; Task 7's `Access`; Task 3's `ManifestView` (whose `hashes` and run-file `sha256` are bare hex, whatever prefix the file has); Task 2's `Probe`.
 
 Produces:
 
@@ -1525,7 +1621,7 @@ pub struct AssetRow { pub project: String, pub asset_id: String, pub asset_type:
     // project disagrees with the folder
 pub enum SortField { AssetId, Updated, Status, Type }
 pub enum SortDir { Asc, Desc }
-pub struct AssetQuery { pub project: Option<String>, pub status: Option<String>, pub asset_type: Option<String>,
+pub struct AssetQuery { pub project: Option<String> /* a filter: None means every project */, pub status: Option<String>, pub asset_type: Option<String>,
                         pub text: Option<String>, pub sort: (SortField, SortDir), pub limit: usize, pub after: Option<Keyset> }
 pub struct Keyset { pub sort_value: serde_json::Value, pub project: String, pub asset_id: String }
 pub struct AssetPage { pub rows: Vec<AssetRow>, pub next: Option<Keyset>, pub total: u64 }
@@ -1539,6 +1635,8 @@ pub enum ReconcileOrder { AsWalked, ManifestsFirst }   // ManifestsFirst: every 
 pub struct Index;                                    // one connection on its own thread ("ww-index-<id>")
 impl Index {
     pub fn open(path: &Path, root: &Path, probe: Arc<dyn Probe>) -> Result<Index, IndexError>;
+    pub fn open_in_memory(root: &Path, probe: Arc<dyn Probe>) -> Result<Index, IndexError>;   // ReadOnly workspaces: same
+                                                     // schema over SQLite :memory:, a cold rebuild at open, no file
     pub async fn ready(&self);                       // resolves once the first reconcile or cold rebuild has finished
     pub async fn reconcile(&self, scope: Scope) -> Result<ReconcileReport, IndexError>;   // ManifestsFirst
     pub async fn reconcile_ordered(&self, scope: Scope, order: ReconcileOrder) -> Result<ReconcileReport, IndexError>;
@@ -1554,7 +1652,11 @@ impl Index {
     pub async fn set_state(&self, path: &WsPath, state: FileState) -> Result<(), IndexError>;
 }
 impl ChangeSink for Index {}
-pub fn register_asset_read_tools(reg: &mut Registry);  // assets.query, asset.get (AssetSummary, AssetDetail)
+pub fn register_asset_read_tools(reg: &mut Registry);  // assets.query, asset.get
+// pipeline/detail.rs (no tools types: CORE-010)
+pub struct AssetSummary; pub struct AssetDetail;       // the Global Constraints shapes, Serialize
+pub async fn asset_detail(store: &Store, index: &Index, ws_id: &str, project: &str, asset_id: &str) -> Result<AssetDetail, ErrorBody>;
+pub fn file_state_wire(s: FileState) -> &'static str;   // ok, not_fetched, cloud_only, human_edit, needs_repair, missing
 ```
 
 **Rules:**
@@ -1570,12 +1672,13 @@ pub fn register_asset_read_tools(reg: &mut Registry);  // assets.query, asset.ge
   - **Stable reads** (ARCH-079 clarification): `identity` is taken again after the hash, and the digest counts only when size, last write and ChangeTime are unchanged. Otherwise, or when `open_read` fails with error 32 or 33, the path is parked: it keeps its old row (never `Removed`), goes on a bounded list (at most 4,096 paths; beyond that, the next rescan picks it up) and is re-checked by `retry_parked` after the next watcher batch or reconcile tick. A path still unstable after 5 re-checks is logged and left for the next rescan.
   - A manifest that changes is re-parsed into `assets` (with `creation_uuid`) and `edges`; one that doesn't parse, or whose `asset_id` or `project` disagrees with its folder (the folder name is authoritative), is `NeedsRepair` and its asset row is flagged. A folder copied in Explorer therefore gives two rows, one per folder, and only the copy is flagged; the manifest is never rewritten.
   - An LFS pointer's row keeps the pointer's `oid` as `sha256`, with state `NotFetched`.
-  - **Removed files** (ARCH-079, CORE-038 clarification): a recorded file of kind `Candidate`, `Sealed` or `Manifest` keeps its row and last SHA-256 with state `Missing`; other removed rows are deleted. A file that appears at a `Missing` path with the same SHA-256 returns to `Ok`. When the manifest is the missing file, the asset row stays in `assets` with its last values.
-- **Cold rebuild:** manifests are parsed, their `hashes` are trusted as the files' SHA-256 and marked unverified, and `verify_pending` hashes them in the background (at most 200 files per tick, on a 1 s tokio interval, driven from `workspace.rs`). Its mismatches are logged until Task 11, which runs `decide` on them.
+  - **Removed files** (ARCH-079, CORE-038 clarification): a file the suite still expects on disk keeps its row and last SHA-256 with state `Missing`. Expected means: a manifest, a file listed in its manifest's `hashes`, or a file of a run whose `status` is `open` and that has no `trashed_utc`. Every other removed row is deleted, including files of `selected` and `rejected` runs (sign-off moved the chosen files into `v<version>/`, maintenance moved rejected runs to trash) and `work/` files. A file that appears at a `Missing` path with the same SHA-256 returns to `Ok`. When the manifest is the missing file, the asset row stays in `assets` with its last values.
+- **Cold rebuild:** manifests are parsed, their `hashes` (read with or without the `sha256:` prefix, compared as bare hex) are trusted as the files' SHA-256 and marked unverified, and `verify_pending` hashes them in the background (at most 200 files per tick, on a 1 s tokio interval, driven from `workspace.rs`). Its mismatches are logged until Task 11, which runs `decide` on them.
 - **`Index::ready()`**: resolves when the first reconcile, or the cold rebuild, finishes. `assets.query`, `asset.get` and `project.status` await it with no timeout of their own (the dispatcher's call deadline applies), and so does `test.watch_fence` (Task 11). A fresh open therefore never answers with an empty or partial page, and `damaged_index_is_rebuilt` is deterministic.
 - **`ChangeSink::applied`:** takes the store's `sha256` and `identity` as is, without rehashing the file the store just wrote.
 - **`assets.query`** implements the paging contract of Global Constraints: one keyset `SELECT … ORDER BY COALESCE(<sort>, ''), project, asset_id LIMIT n+1`, whose keyset comparison uses the same `COALESCE`, and one `count(*)` with the same filters, in one read transaction; `next_cursor` comes from the last row returned, and its `q` is the hash the Global Constraints define. Tool schemas aren't in `schema_hash`, so the golden doesn't change.
-- **`asset.get`** reads the manifest through the store, the versions through `Store::versions` (with `legacy`), the file states from the index, and `next_versions` from `approved_version` (or `1.0.0` when there is none). `proposed_bump` is `patch` when the open run's `target_version` says so, else `minor`. An asset whose manifest is `Missing` gives `manifest.needs_repair` with `data.missing`.
+- **`assets.query`'s `project`** is a filter: omitted means every project (Global Constraints), so the session's active project never narrows it.
+- **`asset.get`** is `pipeline::asset_detail`: it reads the manifest through the store, the versions through `Store::versions` (with `legacy`), the file states from the index (`FileState::NeedsRepair` is `needs_repair` on the wire), and `next_versions` from `approved_version` (or `1.0.0` when there is none). `proposed_bump` is `patch` when the open run's `target_version` says so, else `minor`. An asset whose manifest is `Missing` gives `manifest.needs_repair` with `data.missing`.
 
 - [ ] **Step 1: Write the failing tests:**
   - **`tests/index.rs`:**
@@ -1590,7 +1693,9 @@ pub fn register_asset_read_tools(reg: &mut Registry);  // assets.query, asset.ge
     - `volume_info_error_counts_as_no_stable_ids` (the fake probe's `volume_info` fails; reconcile still works and compares size and last write only);
     - `unstable_read_is_parked_not_hashed` (ARCH-079): the fake probe reports a different last write after the read; the row keeps its old SHA-256, the path is in `parked`, and `retry_parked` with a stable probe indexes it;
     - `locked_read_is_parked_not_removed` (ARCH-079): `open_read` fails with error 32; the row is kept and parked, never removed;
-    - `removed_recorded_files_are_missing_and_recover` (ARCH-079, CORE-038): a sealed file, a candidate file and a manifest are removed → `Missing` with their last SHA-256, an untracked `work/` file's row is deleted, and the sealed file put back with the same bytes is `Ok` again;
+    - `removed_recorded_files_are_missing_and_recover` (ARCH-079, CORE-038): a sealed file listed in `hashes`, a candidate file of an `open` run and a manifest are removed → `Missing` with their last SHA-256; an untracked `work/` file's row, and the rows of a `selected` run's and a `rejected` run's files, are deleted, never `Missing`; the sealed file put back with the same bytes is `Ok` again;
+    - `read_only_workspace_uses_an_in_memory_index_and_leaves_index_db_alone` (ARCH-097, CORE-005): with a read-write hub serving the workspace, a second hub over the same local folder opens it `ReadOnly`; its `assets.query` lists the assets, and `index.db`'s bytes, its `-wal` and its mtime are unchanged, even when its `user_version` is made different first (no delete and rebuild);
+    - `cold_rebuild_reads_hashes_with_or_without_prefix` (a manifest whose `hashes` mixes `sha256:<hex>` and bare `<hex>` values → no mismatch from `verify_pending`);
     - `manifest_disagreeing_with_its_folder_is_needs_repair` (CORE-047): a copy of `chr_paper_crane/` as `chr_paper_crane_copy/` → two asset rows; only the copy has `needs_repair`; both rows store the `creation_uuid`; neither manifest is rewritten;
     - `reconcile_never_follows_a_junction` (a junction inside the workspace pointing at a folder outside it adds no rows);
     - `manifests_first_reconcile_judges_files_against_the_new_manifest` (a candidate file and its manifest change together; with `ManifestsFirst`, the candidate's recorded hash in the index is the new one when the file is looked at);
@@ -1599,19 +1704,21 @@ pub fn register_asset_read_tools(reg: &mut Registry);  // assets.query, asset.ge
     - `manifest_inputs_become_edges_and_dependents`;
     - `invalid_manifest_marks_needs_repair`;
     - `machine_local_files_never_land_in_the_workspace` (ARCH-096, CORE-005, CORE-006): after open, writes and reconciles, no `*.db*` file exists under the workspace, and `index.db` is in `workspace_local_dir`;
-    - `asset_get_reports_legacy_versions_and_next_versions`;
+    - `asset_get_reports_legacy_versions_and_next_versions` (and a `needs_repair` file state is `"needs_repair"` on the wire);
     - `assets_query_filters_by_project_status_type_and_text`;
-    - `assets_query_pages_every_asset_exactly_once_in_order`: 2,500 assets in three projects with repeated `status`, `type` and `updated` values, 40 of them with no `type` and 40 with no `status`; for every sort field and direction, `limit` 97, the pages joined equal the full list sorted by (sort value with a missing value as `""`, project, asset id), with no repeats and none missing; `total == 2500` on every page; the last page's `next_cursor` is `null`;
+    - `assets_query_pages_every_asset_exactly_once_in_order`: 2,500 assets in three projects with repeated `status`, `type` and `updated` values, 40 of them with no `type` and 40 with no `status`; for every sort field and direction, no `project` argument (a filter, so omitted means every project), `limit` 97, the pages joined equal the full list sorted by (sort value with a missing value as `""`, project, asset id), with no repeats and none missing; `total == 2500` on every page; the last page's `next_cursor` is `null`;
     - `assets_query_cursor_allows_a_new_limit` (page 2 with `limit` 50 from a cursor made with `limit` 97 continues exactly after page 1);
     - `assets_query_cursor_survives_an_unrelated_write`: with the default sort, after page 1, a store write to an asset outside the remaining pages, a manifest edit that doesn't change the sort value, and a `rebuild()`; page 2 from the old cursor is exactly what it would have been;
     - `assets_query_cursor_of_another_query_is_params_invalid` (a different filter, a different sort, and a truncated cursor).
   - **`tests/module_deps.rs`:** `module_dependencies_are_acyclic_and_store_depends_on_no_consumer` (CORE-010, CORE-014). It scans `use crate::<module>` in each CORE-014 module's files and asserts:
     - the graph is acyclic;
     - `store` uses none of `index`, `watch`, `graph`, `pipeline`, `projects`, `settings`, `tools`;
-    - `index` uses none of `watch`, `pipeline`, `projects`, `settings`, `tools`.
+    - `index` uses none of `watch`, `pipeline`, `projects`, `settings`, `tools`;
+    - `pipeline` uses no `tools` (the `tools` → `pipeline` direction only; Task 13 keeps it so).
   - **`tests/index_bench.rs`** (CORE-042; `std::time::Instant`, the stated exception to QA-031; budgets read through `ww_testkit::params::budget`; each prints its measured time):
     - `cold_rebuild_of_2000_assets_fits_the_budget`: 2,000 assets × 3 files in a tempdir; times `rebuild()` against `index_rebuild_2000_assets_s`;
-    - `warm_reconcile_of_10000_assets_fits_the_budget` (research 5A-8): 10,000 assets × 3 files, indexed once; times a second `reconcile(All)` with nothing changed (stats only, `hashed == 0`) against `index_warm_reconcile_10000_assets_s`. The budget comes from the slower of a local and a CI-runner measurement (above).
+    - `warm_reconcile_of_10000_assets_fits_the_budget` (research 5A-8): 10,000 assets × 3 files, indexed once; times a second `reconcile(All)` with nothing changed (stats only, `hashed == 0`) against `index_warm_reconcile_10000_assets_s`. The committed budget is about twice this task's local measurement; the owner checks the CI runner's figure at PR time (above).
+    - Both run under nextest's per-test cap for `ww-core` in `.config/nextest.toml` (protected, not changed by this plan). If either benchmark, with its setup, takes more than half of that cap locally, stop and report it instead of changing the file.
   - Remove `index_watch::damaged_index_is_rebuilt` from `expected-fail.toml`.
 - [ ] **Step 2: Run them.**
 
@@ -1622,7 +1729,7 @@ Expected: FAIL. Nothing is implemented.
 - [ ] **Step 4: Run them, then the spec tests.**
 
 Run: `cargo nextest run -p ww-core && cargo clippy -p ww-core --all-targets -- -D warnings && cargo run -q -p ww-cli -- dev spec-tests`
-Expected: PASS; `spec tests: 43 passed, 23 expected-fail`. The report quotes both benchmarks' measured times and the machine class, and the warm budget written to `test-params.toml`.
+Expected: PASS; `spec tests: 43 passed, 23 expected-fail`. The report quotes both benchmarks' measured times and the machine class, the warm budget written to `test-params.toml` (about twice the local time), and a reminder that the owner checks it against the CI runner's figure at PR time.
 
 - [ ] **Step 5: Commit.**
 
@@ -1638,9 +1745,10 @@ git commit -m "index: disposable index.db reconciled by path/size/mtime/FileId/C
 **Files:**
 - Create: `crates/ww-platform/src/watcher.rs` (`ReadDirectoryChangesW` on its own thread, overlapped and completed with `GetOverlappedResult`, stopped with `CancelIoEx`).
 - Create: `crates/ww-core/src/watch/{mod.rs, reconcile.rs, git.rs}`, `crates/ww-core/src/store/git_gate.rs` and `crates/ww-core/src/tools/watch_tools.rs`.
-- Modify: `store/write.rs` (step 2 waits on the gate, which also checks `.git\index.lock` itself), `workspace.rs` (`OpenWorkspace.watch`, started for `ReadWrite` workspaces and stopped by `close`; the `verify_pending` tick hands its mismatches to the watcher), and `tools/test_tools.rs` (`test.watch_fence`, which awaits `Index::ready()` first).
+- Modify: `store/write.rs` (step 2 waits on the gate, which also checks `.git\index.lock` itself), `workspace.rs` (`OpenWorkspace.watch`, started for `ReadWrite` workspaces and stopped by `close`; the `verify_pending` tick hands its mismatches to the watcher), `tools/test_tools.rs` (`test.watch_fence`, which awaits `Index::ready()` first), and `tools/tests.rs` (`test_tools_exist_only_on_test_channels`'s `test.*` name list gains `test.watch_fence`).
+- Modify: `crates/ww-core/src/config.rs` (`CoreConfig` gains `pub watch: WatchConfig`, the defaults below in `CoreConfig::for_env`) and `server/mod.rs`, which passes it to `WorkspaceHub::new`. `WorkspaceHub::new` gains a last parameter `watch: WatchConfig`; its callers (the server and the hub tests of Tasks 7–10) pass `WatchConfig::default()` unless a test needs another one.
 - Create: `crates/ww-cli/src/user/notify.rs`. Modify `user/mod.rs`.
-- Test: `crates/ww-platform/tests/watcher.rs`; unit tests; `crates/ww-core/tests/watch.rs`; `crates/ww-cli/tests/notify_cli.rs`.
+- Test: `crates/ww-platform/tests/watcher.rs`; unit tests; `crates/ww-core/tests/watch.rs`; `crates/ww-cli/tests/notify_cli.rs`. `ww-core` tests create fixture files with `ww_testkit::files::write_file`, never with `std::fs` in `crates/ww-core/src` (QA-024).
 
 **Interfaces:**
 
@@ -1672,6 +1780,8 @@ impl Store { pub fn git_gate(&self) -> &Arc<GitGate>; }
 // watch
 pub struct WatchConfig { pub buffer_bytes: u32 /* 65536 */, pub batch: Duration /* 200 ms */,
                          pub git_quiet: Duration /* 2 s: rebase and pull release and retake index.lock between steps */ }
+impl Default for WatchConfig {}                        // the values in the comments
+// CoreConfig gains `pub watch: WatchConfig`; WorkspaceHub::new(env, states, events, clock, ids, failpoints, probe, watch)
 pub struct Watcher;
 impl Watcher {
     pub fn start(store: Arc<Store>, index: Arc<Index>, events: Arc<EventBus>, topic_ws: String, cfg: WatchConfig) -> io::Result<Arc<Watcher>>;
@@ -1681,7 +1791,9 @@ impl Watcher {
 }
 pub struct NotifyReport { pub reconciled: Vec<String>, pub ignored: Vec<String> }
 // watch/reconcile.rs: pure, shared with the simulated QA-046 variant (Task 14). FileKind is index::FileKind
-pub struct Recorded { pub sha256: String, pub kind: FileKind, pub manifest: Option<WsPath>,
+pub struct Recorded { pub sha256: String /* bare hex */, pub kind: FileKind, pub manifest: Option<WsPath>,
+                      pub expected: bool /* still expected on disk: a manifest, a file in `hashes`, or a file of an
+                                            open run without trashed_utc (Task 10's Missing rule) */,
                       pub pending: Vec<String> /* old and new hashes of a pending store replace (Task 6) */,
                       pub last_human_edit: Option<String> /* the latest human_edits[path].sha256 */ }
 pub enum Observed { Changed { path: WsPath, sha256: String, lfs_oid: Option<String> }, CloudOnly(WsPath), Removed(WsPath), BadManifest(WsPath) }
@@ -1704,8 +1816,8 @@ pub enum UserCommand { /* … */ Notify { #[arg(required = true)] paths: Vec<Pat
 | any | any | yes | `DeferUntilGitDone` (decided by the rescan after git) |
 | `CloudOnly` | any | no | `Reindex` (state `CloudOnly`, not read) |
 | `BadManifest` | any | no | `NeedsRepair` (never rewritten) |
-| `Removed` | Candidate, Sealed or Manifest | no | `Missing` (row and last SHA-256 kept) |
-| `Removed` | Work, Other or none | no | `Reindex` (row removed) |
+| `Removed` | Candidate, Sealed or Manifest, and `expected` | no | `Missing` (row and last SHA-256 kept) |
+| `Removed` | anything else, or none | no | `Reindex` (row removed: a file of a `selected`, `rejected` or trashed run, a `work/` file, or an untracked one) |
 | `Changed` | Manifest | no | `Reindex` (a valid manifest is re-parsed; outside manifest edits are allowed) |
 | `Changed` | Work, Other or none | no | `Reindex` |
 | `Changed`, `lfs_oid == Some(recorded)` | Candidate/Sealed | no | `NotFetched` |
@@ -1714,7 +1826,7 @@ pub enum UserCommand { /* … */ Notify { #[arg(required = true)] paths: Vec<Pat
 | `Changed`, `sha256 == last_human_edit` | Candidate/Sealed | no | `Reindex` (already recorded, never pushed twice) |
 | `Changed`, any other `sha256` | Candidate/Sealed | no | `HumanEdit` (the file is never touched) |
 
-The recorded hash of a candidate or sealed file is its manifest's `hashes` entry, else its run's file record, else its last generated hash. A `Missing` path that reappears with its recorded SHA-256 is `Changed` with `sha256 == recorded`, so it goes back to `Ok` through `Reindex`.
+The recorded hash of a candidate or sealed file is its manifest's `hashes` entry (bare hex: the `sha256:` prefix of I5 is stripped, and an unprefixed value is accepted too), else its run's file record (`candidate_runs[].files[].sha256`), else its last generated hash. A `Missing` path that reappears with its recorded SHA-256 is `Changed` with `sha256 == recorded`, so it goes back to `Ok` through `Reindex`.
 
 **Watcher rules:**
 - The watcher uses `ReadDirectoryChangesW`, not `ReadDirectoryChangesExW`: the extended form is documented as NTFS-only, and every changed path is re-read through `probe.identity` anyway. The default buffer is 64 KiB, the largest a network folder accepts.
@@ -1724,14 +1836,20 @@ The recorded hash of a candidate or sealed file is its manifest's `hashes` entry
 - **Directory events.** A folder rename, move or add produces one `RenamedTo` or `Added` for the folder, not one per file (a `seal`'s `move_new` of the version folder, a `git checkout` that adds a folder, an Explorer move). Any event whose path is a folder schedules `index.reconcile(Paths([dir]))`, which walks the folder's whole subtree; a `Removed` or `RenamedFrom` folder marks the rows under it as removed (recorded files become `Missing`).
 - **Short names.** A `FILE_NOTIFY_INFORMATION` name may be the short or the long name ("it is unspecified which one", Microsoft Learn). Each event path goes through `map_notify_path` with `fs::long_name`; an unresolvable short component reconciles its parent folder instead.
 - `.worldwright\staging\` and `.trash\` are ignored. Of `.worldwright\` only `fence\` is watched; of `.git\` only `index.lock` and `HEAD`.
+- **The suite's own moves are never `missing`** (ARCH-079, CORE-038 clarification). A `Removed` or `RenamedFrom` event under an asset folder whose `version_lock` is held (a sign-off is between `seal` and its Record stage) is deferred: the watcher waits for the lock on its own task (it takes the lock and drops it at once), so other events keep flowing, and then reconciles that asset folder against the manifest the sign-off wrote. A fence covers the deferred work too. Maintenance moves only files of `rejected` runs, which aren't `expected`, so their removal is a plain `Reindex`.
 - **Git** (ARCH-083):
   - `index.lock` created, or `HEAD` changed → `git_gate.set_busy(true)` and `{kind:"git_paused"}`;
-  - `index.lock` gone and `HEAD` unchanged for `git_quiet` (2 s) → a full rescan in two phases: `index.reconcile_ordered(All, ManifestsFirst)` re-parses every manifest first and only then looks at every other file, and `decide` runs for every deferred and every changed path against the new manifests. Then `set_busy(false)` and `{kind:"git_resumed"}`.
+  - `index.lock` gone and `HEAD` unchanged for `git_quiet` (2 s) → the post-git sequence, in this order:
+    1. a full rescan, `index.reconcile_ordered(All, ManifestsFirst)`, which re-parses every manifest first and only then looks at every other file (index bookkeeping, not a store write);
+    2. `decide` for every deferred and every changed path against the new manifests (with `git_busy = false`); `Reindex` and `NotFetched` are applied to the index here, and the actions that write or publish (`HumanEdit`, `NeedsRepair`, `Missing`) are queued;
+    3. publish `{kind:"git_resumed"}`;
+    4. `set_busy(false)`;
+    5. apply the queued actions. `HumanEdit` writes through `edit_manifest`, whose step 2 would wait while the flag is set, so it must come after step 4: a human edit found by the post-git rescan is recorded at once, never after a 60 s wait ending in `store.git_busy`. `git_resumed` is published before any write can resume, so a client sees it before the response of a write that was waiting.
 
   Store writes wait in `wait_clear(GIT_WAIT)` and fail with `store.git_busy` after 60 s.
-- **Overflow** → the same two-phase full rescan, and `{kind:"rescan"}`.
+- **Overflow** → the same two-phase full rescan and `decide` (git isn't busy, so the actions are applied at once), and `{kind:"rescan"}`.
 - **`verify_pending` mismatches** (from the cold-rebuild tick in `workspace.rs`) become `Observed::Changed` and go through `decide`; the index never records a human edit itself (CORE-010).
-- `HumanEdit` → `edit_manifest` pushes `{path, sha256, previous_sha256, detected}` to `human_edits` (a human edit is offered as a new version; the UI is plan 4), then `asset:` `{kind:"human_edit"}`. Because `decide` treats a hash equal to the latest `human_edits[path].sha256` as recorded, the same edit is pushed once, however often it is re-observed (`ww notify`, the reconcile at open, an overflow rescan, `verify_pending` after a cold rebuild). `NeedsRepair` → `index.set_state`, then `asset:` `{kind:"needs_repair"}`. `Missing` → `index.set_state`, then `asset:` `{kind:"missing", path}`.
+- `HumanEdit` → `edit_manifest` pushes `{path, sha256, previous_sha256, date}` to `human_edits` (I5's field names; `date` is the UTC `YYYY-MM-DD` of the detection) (a human edit is offered as a new version; the UI is plan 4), then `asset:` `{kind:"human_edit"}`. Because `decide` treats a hash equal to the latest `human_edits[path].sha256` as recorded, the same edit is pushed once, however often it is re-observed (`ww notify`, the reconcile at open, an overflow rescan, `verify_pending` after a cold rebuild). `NeedsRepair` → `index.set_state`, then `asset:` `{kind:"needs_repair"}`. `Missing` → `index.set_state`, then `asset:` `{kind:"missing", path}`.
 - **`ww notify <path>…`** maps each path to the session workspace's relative path (with `folder_key`); a path outside it goes to `ignored`. It calls `watch.notify` and prints nothing on success. With `--no-start` and no core, it is a silent no-op (ARCH-018, ARCH-103).
 
 - [ ] **Step 1: Write the failing tests:**
@@ -1743,7 +1861,7 @@ The recorded hash of a candidate or sealed file is its manifest's `hashes` entry
     - `removing_the_watched_root_ends_with_failed` (the watched folder is renamed away, or removed once empty → `DirChange::Failed`, then the channel closes);
     - `stop_ends_the_thread` (a stop is a cancel, never a `Failed`).
   - **Unit tests:**
-    - `decide_follows_the_table` (every row, including a pending hash, a repeated human-edit hash and a mismatched LFS `oid`);
+    - `decide_follows_the_table` (every row, including a pending hash, a repeated human-edit hash, a mismatched LFS `oid`, and a `Removed` candidate file with `expected` true and false);
     - `git_gate_waits_up_to_60_s_then_git_busy` (paused time: 59 s pending, 61 s → `GitBusy`);
     - `git_gate_sees_index_lock_without_the_watcher` (ARCH-083: the flag is never set; with `.git\index.lock` present the gate is busy, and a write waits until the file is removed);
     - `notify_maps_paths_and_ignores_outside_ones`;
@@ -1761,8 +1879,10 @@ The recorded hash of a candidate or sealed file is its manifest's `hashes` entry
     - `locked_file_is_parked_not_removed` (ARCH-079): `HandleHolder::hold(sealed file, Share::None)` while it changes; after the fence the file is neither `Missing` nor a human edit; after release and another fence, the edit is recorded;
     - `human_edit_is_recorded_once_across_notify_rescan_and_rebuild` (CORE-034): one outside edit, then `watch.notify`, a forced overflow rescan, a restart with a damaged `index.db` (cold rebuild and `verify_pending`) → `human_edits` has one entry for the path;
     - `removed_sealed_file_is_missing_then_recovers` (ARCH-079, CORE-038): clear a sealed file's read-only bit and delete it → `asset.get` `files[].state == "missing"` and an `asset:` `{kind:"missing"}` event; put the same bytes back → `ok`, and no human edit;
+    - `removals_under_a_held_version_lock_wait_for_its_release` (ARCH-079, CORE-038): the test takes an asset's `version_lock`, moves an open run's candidate file into a new `v1.1.0/` and edits the manifest so the run is `selected` and `hashes` lists the moved file, then releases the lock; after the fence the old path is gone from the index (never `missing`), the new one is `ok`, and no `{kind:"missing"}` event was published. A removal under an asset whose lock is free is decided at once;
+    - `post_git_human_edit_is_recorded_without_waiting_for_the_gate` (ARCH-083, CORE-034; paused time): while `index.lock` exists, a sealed file is changed; after the lock is removed and `git_quiet` passes, the `human_edits` entry appears without `store.git_busy` and well inside the 60 s wait, and `git_resumed` was published before it;
     - **`unsupported_watcher_leaves_the_workspace_served`** (Review Focus 4): a core with `watch.start=unsupported` opens the workspace, `test.store_write` works, a `watcher_unavailable` event arrived on `workspace`, and an outside edit followed by `ww notify` records the human edit;
-    - **`checkout_of_3000_files_overflows_then_rescans_without_false_human_edits`** (Review Focus 5). With `WatchConfig.buffer_bytes = 4096`, `GitOps` rewrites 2,985 plain files, 5 sealed files and their manifests with matching new `hashes`, and 5 candidate files whose manifests' run records gain their new hashes, then finishes. The candidate files matter: `candidates/` sorts before `manifest.json`, so a rescan that decided files in walk order would judge them against the old manifest. After the fence:
+    - **`checkout_of_3000_files_overflows_then_rescans_without_false_human_edits`** (Review Focus 5). In an in-process core whose `CoreConfig.watch` has `buffer_bytes = 4096`, `GitOps` rewrites 2,985 plain files, 5 sealed files and their manifests with matching new `hashes`, and 5 candidate files whose manifests' run records gain their new hashes, then finishes. The candidate files matter: `candidates/` sorts before `manifest.json`, so a rescan that decided files in walk order would judge them against the old manifest. After the fence:
       - a `rescan` and a `git_resumed` event arrived;
       - `index.files` has every file at its new SHA-256;
       - no manifest gained a `human_edits` entry;
@@ -1793,12 +1913,13 @@ git commit -m "watch: ReadDirectoryChangesW with overflow rescan, human edits re
 
 **Files:**
 - Create: `crates/ww-core/src/settings/mod.rs`, `crates/ww-core/src/projects/{mod.rs, progress.rs, active.rs, staleness.rs}`, `crates/ww-core/src/graph/mod.rs` and `crates/ww-core/src/tools/project_tools.rs`.
-- Modify: `tools/stages.rs` (`Settings`, `SettingsStage`, `PipelineHooks::plan2` uses `CascadeSettings`), `tools/{registry.rs, dispatcher.rs, mod.rs, test_tools.rs}` (`CallCtx.project`; `test.settings`), and `rpc.rs` (`ActiveProjects::forget` in `Router::closed`).
+- Modify: `tools/stages.rs` (`Settings`, `SettingsStage`, `PipelineHooks::plan2` uses `CascadeSettings`), `tools/{registry.rs, dispatcher.rs, mod.rs, test_tools.rs}` (`CallCtx.project`; `test.settings`; `test.ingest_run` takes its omitted `project` from `CallCtx.project` instead of Task 7's `sketchbook` default), and `rpc.rs` (`ActiveProjects::forget` in `Router::closed`).
+- Modify: `crates/ww-core/src/tools/tests.rs` (plan 2a's unit tests): the `Recording` hooks' `SettingsStage` impl is ported to the async `resolve(SettingsInput)`, and `test_tools_exist_only_on_test_channels`'s `test.*` name list gains `test.settings`.
 - Test: unit tests; `crates/ww-core/tests/{projects.rs, settings.rs}`.
 
 **Interfaces:**
 
-Consumes: Task 3's `WorkspaceYaml`, `ProjectYaml`, `PROGRESS_TEMPLATE`; Task 10's `Index::dependents`.
+Consumes: Task 3's `WorkspaceYaml`, `ProjectYaml` (with `overrides` extracted from the top-level cascade keys), `CASCADE_KEYS`, `PROGRESS_TEMPLATE`, `new_project_yaml`, `transition`; Task 6's `Store::{edit_yaml, edit_text, write}`; Task 7's `Store::orphans`; Task 10's `Index::{ready, dependents, files_of}`.
 
 Produces:
 
@@ -1827,9 +1948,12 @@ impl ActiveProjects { pub fn get(&self, session_id: &str) -> Option<String>; pub
                       pub fn forget(&self, session_id: &str); }
 pub fn resolve_project(explicit: Option<&str>, active: Option<String>, hint: Option<String>) -> String;   // else "sketchbook"
 pub async fn write_hint(store: &Store, slug: &str) -> Result<(), StoreError>;      // .worldwright/state.json
-pub fn add_done_entry(text: &str, date: &str, entry: &str) -> Result<String, String>;  // first line under "## Done";
+pub fn add_done_entry(text: &str, date: &str, entry: &str) -> Result<String, String>;  // the line directly after "## Done";
                                                                                     // the new line uses the file's line ending
 pub async fn restore_staleness(ws: &OpenWorkspace, project: &str) -> Result<Vec<String /* ref */>, StoreError>;
+pub struct ProjectStatus;                               // the project.status result, Serialize
+pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<ProjectStatus, ErrorBody>;
+    // a plain function (no tools types), so tools/project_tools.rs and Task 13's project: snapshot provider share it
 // graph (pure)
 pub fn is_stale(input_version: &Version, approved: Option<&Version>, pinned: bool) -> bool;
 pub fn cycles(edges: &[((String, String), (String, String))]) -> Vec<Vec<(String, String)>>;
@@ -1839,6 +1963,7 @@ pub fn register_project_tools(reg: &mut Registry, tools: Arc<OnceLock<Vec<ToolDe
 **Rules:**
 - **Settings cascade** (CORE-057):
   - workspace `defaults` → `project.yaml` → the request's `settings` object: a plain override chain over dotted leaf keys (`models.<task>`, `providers.<…>`, `qa_profile`, `auto_approve`, `skip_stages`, `auto_candidate_on_save`, `modules`);
+  - **where the project layer comes from** (I4, CORE-057 clarification): `project.yaml`'s own top-level keys, as Task 3's `ProjectYaml.overrides` extracts them. There is no `overrides:` key. `pipeline.skip_stages` and `pipeline.auto_approve` are read as `skip_stages` and `auto_approve`, and the workspace's `defaults:` uses the same shape. Keys that aren't cascade keys (`name`, `slug`, `type`, `status`, `links`, `created`, …) are never settings;
   - **where the request layer comes from** (CORE-057 clarification): `ToolCallParams` has only `name`, `arguments`, `idempotency_key` and `trace_id`, and product tools reject unknown fields. So `SettingsInput.request` is the `settings` argument of a tool whose input schema declares one, which in 2b is only `test.settings`; every product tool passes `None`. Nothing on the wire changes, so `schema_hash` is unchanged. A per-call `settings` field in `tools/call` would change `schema_hash`; it is left to plan 3 (Not in this plan);
   - lists replace whole lists;
   - a request key from `SUITE_LEVEL_KEYS` or an unknown key → `params.invalid` ("… is a suite-level setting");
@@ -1850,17 +1975,18 @@ pub fn register_project_tools(reg: &mut Registry, tools: Arc<OnceLock<Vec<ToolDe
   3. `state.json`'s hint;
   4. `sketchbook`.
 
-  A call that names a project and ends `ok` sets the session's active project and, on a `ReadWrite` workspace, writes the hint.
+  A call that names a project and ends `ok` sets the session's active project and, on a `ReadWrite` workspace, writes the hint. `assets.query` is the exception: its `project` is a filter (omitted means every project), so it is never filled in from the session and never sets the active project.
 - **Project tools** (CORE-055):
   - `project.create` writes `project.yaml` (from the template), then `progress.md` with the entry `- <date>: project created` → `project.exists` / `params.invalid` (bad slug);
   - `project.set_status` edits `status` with `edit_yaml`. Moving from `archived` or `paused` to `active` runs `restore_staleness`: each asset of the project whose input's `approved_version` is newer than its ref and isn't pinned goes `MarkStale` (manifest `status_before_stale`), and is listed in `stale`. Archived projects are skipped when dependents are scanned (I6);
-  - `project.status` awaits `Index::ready()`, then gives counts by status, `orphans` (from `Store::orphans`), `needs_repair` and `missing` (files in state `Missing`);
+  - `project.status` is `projects::project_status`: it awaits `Index::ready()`, then gives counts by status, `orphans` (from `Store::orphans`), `needs_repair` and `missing` (files in state `Missing`);
   - `project.context` gives the settings with sources, `links`, and `suggested_tools`: the tools whose module is `workspace` or in `modules()` (CORE-058).
-- **`progress.md`** (CORE-039): the new entry is the first line under `## Done`; every other section is left byte for byte. A file without `## Done` gets the section appended at the end. A CRLF file stays CRLF.
+- **`progress.md`** (CORE-039 clarification): the new entry goes on the line directly after `## Done`, newest first, so the template's blank line stays between the last entry and `## Next`; every other section is left byte for byte. A file without `## Done` gets `## Done` and the entry appended at the end. A CRLF file stays CRLF.
+- **`project.yaml` edits** go to keys that `new_project_yaml` always writes (`status: active`, `links: []`): `project.set_status` is a `SetScalar` of `status`, and Task 13's `asset.pin_input` an `AppendToList` of `links`. A hand-written `project.yaml` without the key gets it appended by `edit_yaml`; one where the edit can't be made safely fails with `yaml.unsupported_edit` and changes nothing.
 
 - [ ] **Step 1: Write the failing tests:**
   - **`tests/settings.rs`:**
-    - `cascade_is_a_plain_override_chain` (CORE-057);
+    - `cascade_is_a_plain_override_chain` (CORE-057: `defaults: {models: {image_generate: a}}`, a top-level `models: {image_generate: b}` in `project.yaml`, and `pipeline: {skip_stages: [export]}` there giving `skip_stages`);
     - `request_cannot_set_suite_level_or_unknown_keys`;
     - `product_tools_resolve_settings_without_a_request_layer` (CORE-057: a product tool's `Settings` has no `Request` source, and its schema has no `settings` argument);
     - `check_and_record_cannot_be_skipped` (CORE-054);
@@ -1869,7 +1995,7 @@ pub fn register_project_tools(reg: &mut Registry, tools: Arc<OnceLock<Vec<ToolDe
     - `resolve_explicit_then_session_then_hint_then_sketchbook` (ARCH-088, ARCH-098);
     - `active_project_is_forgotten_when_the_connection_closes`;
     - `hint_is_written_only_on_read_write_workspaces`;
-    - `progress_entry_goes_first_under_done_and_other_sections_are_untouched` (CORE-039), for an LF and a CRLF file;
+    - `progress_entry_goes_first_under_done_and_other_sections_are_untouched` (CORE-039), for an LF and a CRLF file: the entry is the line directly after `## Done`, a second entry goes above the first, and the blank line before `## Next` is kept;
     - `project_create_refuses_existing_and_bad_slugs`;
     - `restore_marks_unpinned_dependents_stale_with_status_before_stale` (CORE-055, CORE-048);
     - `archived_projects_are_skipped_in_dependents`;
@@ -1900,29 +2026,41 @@ git commit -m "core: settings cascade, project tools, progress.md entries, per-s
 ### Task 13: Asset tools, the Record stage, and live topics with snapshots (ARCH-032, ARCH-042, ARCH-044, CORE-019, CORE-020, CORE-023, CORE-025, CORE-027, CORE-029, CORE-031, CORE-051–053, QA-005)
 
 **Files:**
-- Create: `crates/ww-core/src/pipeline/{mod.rs, record.rs, signoff.rs, topics.rs}` and `crates/ww-core/src/tools/asset_tools.rs`.
+- Create: `crates/ww-core/src/pipeline/{record.rs, signoff.rs}` (Task 10 created `pipeline/mod.rs` and `detail.rs`; modify `mod.rs`) and `crates/ww-core/src/tools/{asset_tools.rs, record_stage.rs, topics.rs}`.
+  - **Module direction (CORE-010, CORE-014).** `tools` uses `pipeline`; `pipeline` never uses `tools`. So `pipeline` holds plain functions and types over `Store`, `Index` and `EventBus` (`RecordPlan`, `apply_record`, `plan_signoff`, `asset_detail`), and everything that touches a `tools` type lives in `tools/`: `impl RecordStage for WorkspaceRecord` (`tools/record_stage.rs`, whose `record` takes `&CallCtx`) and the `asset:`/`project:` snapshot providers (`tools/topics.rs`, which call `pipeline::asset_detail` and `projects::project_status`). Task 10's `module_dependencies_are_acyclic_and_store_depends_on_no_consumer` stays green unchanged.
 - Modify: `tools/stages.rs` (`RecordStage` becomes asynchronous; `PipelineHooks::plan2` uses `WorkspaceRecord`), `tools/{registry.rs, dispatcher.rs}` (`CallCtx.record`), `events.rs` (snapshots outside the locks; history cap), `rpc.rs` (`ww/subscribe` awaits the bus; no connection lock is held across it), and `crates/ww-protocol/src/events.rs` (`HISTORY_MAX_EVENTS`).
-- Test: unit tests; `crates/ww-core/tests/{assets.rs, record.rs}`; additions to `tests/events.rs`.
+- Modify: `crates/ww-core/src/tools/tests.rs` (plan 2a's unit tests): the `Recording` hooks' `RecordStage` impl is ported to the async `record(ctx, d, plan, out)`.
+- Test: unit tests; `crates/ww-core/tests/{assets.rs, record.rs}`; additions to `tests/events.rs`. Tests create fixture files with `ww_testkit::files::write_file`, never with `std::fs` in `crates/ww-core/src` (QA-024).
 
 **Interfaces:**
 
-Consumes: Tasks 7, 9, 10 and 12.
+Consumes: Task 7's `Store::commit` and `CommitOp` (with `moved`); Task 9's `Store::{seal, version_lock}` and `Sealed`; Task 10's `Index::dependents` and `pipeline::asset_detail`; Task 12's `add_done_entry`, `project_status` and `CallCtx.project`; Task 3's `CandidateRun`, `CandidateFile`, `hash_value` and `Version::bump`.
 
 Produces:
 
 ```rust
 // ww-protocol
 pub const HISTORY_MAX_EVENTS: usize = 1024;
-// pipeline/record.rs
+// pipeline/record.rs (no tools types)
 pub enum RecordBranch { CandidateRun { run_id: String }, SealedVersion { version: Version } }
 pub struct HandOff { pub unlocks: Vec<String>, pub made_stale: Vec<String>, pub refs: Vec<String> }
 pub struct RecordPlan { pub branch: RecordBranch, pub project: String, pub asset_id: String, pub commit: CommitOp,
                         pub progress_entry: String, pub refs: Vec<String>,
                         pub version_guard: Option<tokio::sync::OwnedMutexGuard<()>> }
     // SealedVersion plans carry the asset's version_lock guard (lock_owned) from Execute; the Record stage drops it
-    // after commit returns, so no second sign-off of the asset can interleave between the seal and the manifest edit
+    // after commit returns, so no second sign-off of the asset can interleave between the seal and the manifest edit.
+    // progress_entry is the only source of the progress.md line: tools leave commit.progress as None, and
+    // apply_record fills it from progress_entry
 pub struct RecordSlot; impl RecordSlot { pub fn set(&self, plan: RecordPlan); pub fn take(&self) -> Option<RecordPlan>; }
-pub struct WorkspaceRecord;
+pub async fn apply_record(store: &Store, index: &Index, events: &EventBus, ws_id: &str, today: &str, plan: RecordPlan)
+    -> Result<HandOff, StoreError>;                   // the Record stage's steps 1–3 below
+pub fn start_candidate_run(m: &mut Manifest, run: serde_json::Map<String, Value>, now_utc: i64) -> Result<(), StoreError>;
+    // appends the run; when the manifest has an approved_version and no open run targets a newer one, sets
+    // `version` = approved.bump(Minor) and the run's `target_version` to it (I5 "set it by the bump rules"), else the
+    // run's target_version = `version`; then transition(…, CandidateRun)
+// tools/record_stage.rs
+pub struct WorkspaceRecord;                           // impl RecordStage: takes ctx.record's plan, calls apply_record,
+                                                      // maps a StoreError into the outcome, sets structured.handoff
 // tools/stages.rs (changed)
 pub trait RecordStage: Send + Sync {
     fn record<'a>(&'a self, ctx: &'a CallCtx, d: &'a ToolDescriptor, plan: Option<RecordPlan>,
@@ -1934,31 +2072,33 @@ pub fn signed_off_by(caller: &CallerKind) -> &'static str;        // ui:* user, 
 pub fn plan_signoff(m: &Manifest, run_id: &str, files: &[String], bump: Option<Bump>, keep_runs: &[String],
                     by: &str, now_utc: i64) -> Result<(Manifest, Version), ErrorBody>;   // the manifest after sign-off (I5 step 3)
 pub fn auto_pick(files: &[CandidateFile], vision: Option<&BTreeMap<String, f64>>, passes: &dyn Fn(&str) -> bool) -> Option<String>;
-// pipeline/topics.rs
-pub struct AssetSnapshots; pub struct ProjectSnapshots;          // impl SnapshotProvider
+// tools/topics.rs (in tools, not pipeline: CORE-010)
+pub struct AssetSnapshots; pub struct ProjectSnapshots;          // impl SnapshotProvider over pipeline::asset_detail
+                                                                 // and projects::project_status
 // events.rs (changed)
 pub trait SnapshotProvider: Send + Sync { fn snapshot<'a>(&'a self, topic: &'a str) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>>; }
 impl EventBus { pub async fn subscribe(&self, client: ClientId, topics: &[String], since: &BTreeMap<String, u64>) -> Vec<TopicState>; }
 pub fn register_asset_tools(reg: &mut Registry);  // asset.import, asset.collect, asset.signoff, asset.request_signoff, asset.pin_input
 ```
 
-**The Record stage** (CORE-015 stage 9, CORE-020) runs only when the outcome is `ok` and the tool set a plan:
-1. `store.commit(plan.commit)`, with `progress` = `add_done_entry(today, plan.progress_entry)`. That covers output → manifest → jobs log → progress → index. The plan's `version_guard` is dropped when `commit` returns, whether it succeeded or not.
+**The Record stage** (CORE-015 stage 9, CORE-020) runs only when the outcome is `ok` and the tool set a plan. `WorkspaceRecord` calls `pipeline::apply_record`, which does steps 1–3:
+1. `store.commit(plan.commit)`, with `progress` = `projects/<project>/progress.md` and a `TextEdit` that calls `add_done_entry(text, today, &plan.progress_entry)`, mapping its `Err(message)` to `StoreError::Io { path, why: message }`. That covers output → manifest → jobs log → progress → index (including `commit.moved`). The plan's `version_guard` is dropped when `commit` returns, whether it succeeded or not.
 2. For `SealedVersion`, the dependents from `index.dependents` that aren't pinned and are `approved`, `exported` or `released` go `MarkStale` (`edit_manifest`), into `made_stale`. `unlocks` lists dependents in `planned` or `blocked` whose every input is now sealed.
 3. Events go out: `asset:` `{kind:"candidate_run"|"version_sealed", version?, run_id?}` and `project:` `{kind:"progress"}`.
-4. `structured.handoff` is set.
+4. `WorkspaceRecord` sets `structured.handoff` from the returned `HandOff`.
 
 A commit error replaces the outcome with the store error. Outputs already moved stay as listed orphans (ARCH-075); a sealed `v<version>/` whose manifest edit failed, or was cut short by a crash (`store.after_seal`), is listed as an orphan too (Task 7). Repairs and QA (CORE-025's middle steps) are the empty stages between ingest and record.
 
 **Tools** (Global Constraints table):
 - **`asset.import`.** A missing asset gets `Manifest::new` with `ids.uuid()` as `creation_uuid` (CORE-047).
-  - `copy` copies each file into a staging handle with `fsops::copy_new` (`CopyFile2` with `COPY_FILE_FAIL_IF_EXISTS`, so nothing is ever overwritten), hashes the staged copy (not the source, which may change meanwhile), and plans a candidate run (CORE-023) whose id comes from `Store::next_run_id`.
+  - `copy` copies each file into a staging handle with `fsops::copy_new` (`CopyFile2` with `COPY_FILE_FAIL_IF_EXISTS`, so nothing is ever overwritten), hashes the staged copy (not the source, which may change meanwhile), and plans a candidate run (CORE-023) whose id comes from `Store::next_run_id`. Its manifest edit is `start_candidate_run`, and each run file records that staged hash as `files[].sha256`.
+  - The result `ref` is the candidate ref of the first file (`ww://<ws>/<project>/<asset>@candidate/<run_id>/<file>`), and `handoff.refs` lists every file's candidate ref. For `link_external`, `ref` is the asset's ref without a version and `handoff.refs` is empty.
   - `link_external` records `external: [{path, sha256}]` and no run; the status goes to `in_progress`. Untrusted file names are marked untrusted in the result (ARCH-060).
-- **`asset.collect`** re-hashes each external file. A mismatch is `ref.hash_mismatch`; otherwise the file is copied in (`copy_new`, hashing the staged copy) as a candidate run and `external` is removed with `Manifest::remove`, so the other keys keep their order.
+- **`asset.collect`** re-hashes each external file. A mismatch is `ref.hash_mismatch`; otherwise the file is copied in (`copy_new`, hashing the staged copy) as a candidate run (`start_candidate_run`) and `external` is removed with `Manifest::remove`, so the other keys keep their order.
 - **`asset.signoff`:**
   - with no session workspace → `workspace.required`;
   - with a non-empty `external` → `asset.link_external`, with `fix.ui_action {id:"asset.collect", label:"Collect into workspace"}` and `agent_hint {tool:"asset.collect", arguments:{project, asset_id}}`;
-  - otherwise, holding the `version_lock` guard (`lock_owned`) from Execute until the end of Record: `plan_signoff` (the version is `bump(approved)` or the manifest's `version`, CORE-027), `Store::seal` with the planned manifest as the snapshot, then a `SealedVersion` plan that carries the guard and whose manifest edit re-applies `plan_signoff` to the re-read manifest. Open runs for the version become `rejected` unless in `keep_runs`, which become `pinned: true`. The index gets the sealed files' post-move identities from `Sealed.identities`.
+  - otherwise, holding the `version_lock` guard (`lock_owned`) from Execute until the end of Record: `plan_signoff` (the version is `bump(approved)` or the manifest's `version`, which `start_candidate_run` set by the bump rules when new work started, CORE-027), `Store::seal` with the planned manifest as the snapshot, then a `SealedVersion` plan that carries the guard and whose manifest edit re-applies `plan_signoff` to the re-read manifest. `plan_signoff` writes each chosen file into `hashes` as `hash_value` of its run file record's `sha256` (`sha256:<hex>`, I5), keyed by `v<version>/<file>`, so the snapshot already holds them (I5 step 2 comes before step 4); a run file without a recorded `sha256` (a pre-2b run) is hashed first. The Record stage's re-applied edit checks that these equal `Sealed.files`, and a difference fails the call with `store.hash_conflict`. Open runs for the version become `rejected` unless in `keep_runs`, which become `pinned: true`. The index gets the sealed files' post-move identities through `commit.moved`: one `Written { path, sha256, identity }` per sealed file, built from `Sealed.files` and `Sealed.identities`, so they reach the index in the index step, after the manifest edit (ARCH-075), never from `seal` itself.
 
   The result `ref` is `ww://…@<v>#sha256=<content hash>` (ARCH-042).
 - **`asset.request_signoff`:** `RequestSignoff`, through `edit_manifest` (CORE-053). It writes no `progress.md` entry: it isn't a Record branch.
@@ -1988,6 +2128,10 @@ A commit error replaces the outcome with the store error. Outputs already moved 
     - `signed_off_by_follows_the_caller` (CORE-051);
     - `auto_pick_prefers_vision_score_then_lowest_passing_seed` (CORE-052);
     - `signoff_bump_is_proposed_then_confirmed` (CORE-027);
+    - `new_work_after_approval_sets_version_by_the_bump_rules` (I5, CORE-027): after a sign-off of `1.0.0`, an `asset.import` sets the manifest's `version` and the run's `target_version` to `1.1.0`; a sign-off without `bump` then seals `v1.1.0/`, not `version.exists`;
+    - `import_ref_is_the_first_file_and_handoff_lists_every_file` (a two-file import: `ref` is the first file's candidate ref, `handoff.refs` has both);
+    - `progress_entry_is_written_once_from_the_plan` (a recorded call adds exactly one `## Done` line, from `progress_entry`; `apply_record` has a `debug_assert!` that `commit.progress` arrives as `None`);
+    - `signoff_writes_prefixed_hashes_and_sealed_files_reach_the_index_after_the_manifest` (I5, ARCH-075: `hashes` values are `sha256:<hex>`; a recording sink sees the sealed files only after the manifest edit, with `Sealed.identities`);
     - `refs_exclude_source_and_carry_the_content_hash` (CORE-028, CORE-031);
     - `pin_input_records_proj_and_lib_links_keeping_comments` (CORE-019);
     - `pin_input_accepts_a_target_that_does_not_exist_yet` (CORE-019; `ref.invalid` only for a ref that doesn't parse);
@@ -2028,9 +2172,11 @@ git commit -m "core: asset tools, async Record stage with hand-off blocks, asset
 - Modify: `crates/ww-core/src/state/mod.rs`.
   - The read-only check opens with `immutable=1` (URI) when no `-wal` file exists, so a refused file never gets fresh `-wal`/`-shm` files.
   - A non-empty `-journal` beside the file is `StateError::HotJournal`.
-- Modify: `crates/ww-core/src/config.rs` and `server/mod.rs` (`CoreExit::StateHotJournal(PathBuf)` → exit 7).
-- Create: `crates/ww-core/src/tools/doctor_tools.rs` (`workspace.doctor`).
+- Modify: `crates/ww-core/src/config.rs` and `server/mod.rs` (`CoreExit::StateHotJournal(PathBuf)` → exit 7). `CoreConfig` also gains `pub git_env: Vec<(OsString, OsString)>`: empty in `CoreConfig::for_env` (production), set by in-process tests to `TestEnv::git_env()`, and passed to every `git` the core runs, so in-process doctor tests are isolated from the system and user git config too (QA-038). A spawned core needs nothing extra: it inherits `child_env()`'s git variables. `core_registry` (in `tools/mod.rs`) gains a last parameter `git_env: Arc<Vec<(OsString, OsString)>>` for `register_doctor_tools`; `server/mod.rs` passes `CoreConfig.git_env`, and the `core_registry` calls in `tools/tests.rs` pass an empty one.
+- Create: `crates/ww-core/src/tools/doctor_tools.rs` (`workspace.doctor`) and `crates/ww-core/src/store/git_config.rs`: the core's only `git` runner, so the repository-config writes are the store's like every other workspace write (ARCH-002, ARCH-112's intent).
+- Modify: `crates/ww-core/src/store/write.rs` (factor out the pure `decide_write`, for `tests/reconcile_sim.rs`).
 - Modify: `crates/ww-core/Cargo.toml` (dev-dependency `proptest`, for `tests/reconcile_sim.rs`).
+- Modify: `crates/ww-cli/tests/user_cli.rs` (`damaged_state_db_message_is_plain`) and `crates/ww-client/tests/client.rs` (the damaged-database test's `expected` text): both assert "`ww doctor` (plan 2b) can set it aside.", which this task changes to "`ww doctor` can set it aside." (neither file is protected).
 - Create: `crates/ww-client/src/doctor.rs`. Modify `crates/ww-client/{Cargo.toml (add rusqlite), src/lib.rs}`: `StartFailure::StateHotJournal`, and the messages without "(plan 2b)".
 - Create: `crates/ww-cli/src/user/doctor.rs`. Modify `user/mod.rs`.
 - Test: `crates/ww-core/tests/{crash_recovery.rs, reconcile_sim.rs, reconcile_ntfs.rs, doctor_tool.rs}`; `crates/ww-client/tests/doctor.rs`; `crates/ww-cli/tests/doctor_cli.rs`.
@@ -2052,7 +2198,15 @@ pub fn set_repo_autocrlf_false(ws: &Path) -> io::Result<()>;            // git -
 // ww-core
 pub struct DoctorArgs { pub fix: bool }
 pub struct DoctorCheck { pub id: String, pub state: String /* ok | fixed | problem */, pub detail: String }
-pub fn register_doctor_tools(reg: &mut Registry, probe: Arc<dyn Probe>);
+pub fn register_doctor_tools(reg: &mut Registry, probe: Arc<dyn Probe>, git_env: Arc<Vec<(OsString, OsString)>>);
+// store/git_config.rs
+impl Store { pub async fn git(&self, args: &[&str], git_env: &[(OsString, OsString)]) -> Result<Captured, StoreError>; }
+    // run_hidden(find_on_path("git"), args, cwd = the workspace root, git_env, 30 s); StoreError::Io when git is
+    // missing or times out. workspace.doctor reads and writes git config only through it
+// store/write.rs
+pub enum WriteDecision { Proceed, Conflict, TreatAsNew }
+pub fn decide_write(expect: &Expect, current: Option<&str /* sha256 or LFS oid */>, generated: Option<&str>,
+                    pending: &[String]) -> WriteDecision;   // pure: step 3 of the write algorithm
     // checks: git.repository, git.core_longpaths, git.lfs_setlockablereadonly, git.core_autocrlf, gitignore.entries,
     //         gitattributes.entries, sealed.readonly, workspace.volume, workspace.watcher, workspace.orphans,
     //         workspace.needs_repair, workspace.missing
@@ -2065,10 +2219,13 @@ pub enum UserCommand { /* … */ Doctor }
    - `Damaged` or `TooNew` → explain in plain words. With `--non-interactive`: `problem: … — run ww doctor interactively to set it aside`. Otherwise ask "Set it aside as state.db.damaged-<utc> and start with a fresh database? [y/N]". `y` → `set_aside` → `fixed: …`; anything else → `problem`.
    - `HotJournal` → ask "Let SQLite finish its recovery? [y/N]", then `finish_recovery`. If the file is still damaged, the set-aside question follows.
    - If a `problem` remains here (the answer was `n`, or `--non-interactive`), the core can't start, so step 3 can't run: doctor prints `problem: workspace checks skipped — the core can't start` after step 2 and exits 1, not 2 (it did run; a problem remains).
-2. **`suite.toml`**, through `ww_client::doctor::inspect_suite_toml` (so `ww-cli` needs no `ww-schema` dependency and its protected `Cargo.toml` stays unchanged), never through `resolve_workspace_id`. If the default workspace is missing: `problem: … — run ww workspace use "<path>"`.
+2. **`suite.toml`**, through `ww_client::doctor::inspect_suite_toml` (so `ww-cli` needs no `ww-schema` dependency and its protected `Cargo.toml` stays unchanged), never through `resolve_workspace_id`.
+   - `Missing` or `NoDefault` → `ok: no default workspace; workspace checks skipped`, and step 3 doesn't run (nothing is wrong: no workspace is set up yet).
+   - `Unreadable` → `problem: … — ` with the parse error; step 3 doesn't run.
+   - `DefaultMissing` → `problem: … — run ww workspace use "<path>"`; step 3 doesn't run.
 3. **The workspace checks**, through a connection whose hello names the default workspace's id: `workspace.doctor {fix:true}`, printed line by line.
-   - The core runs `git config --local core.longpaths true` and `git config --local lfs.setlockablereadonly false` with `run_hidden(find_on_path("git"))` (CORE-040, ARCH-085). Each check is `ok` when the repository's own config already has that value, else `fixed` (or a `problem` without `fix`). Without `.git`, they are `ok` with "not a git repository; skipped".
-   - **`git.core_autocrlf`** is report-only in the tool: when the effective `core.autocrlf` (`git config core.autocrlf`) is `true` or `input`, it is a `problem` explaining that text files outside `projects/` get CRLF on checkout, and `workspace.doctor` never changes it, whatever `fix` says and whoever calls it (an agent-callable fix tool must not change persistent git config without the person's confirmation; CORE-040 doesn't ask for this setting, and `projects/** -text` already covers the asset trees). An unset value is `ok`.
+   - The core runs `git config --local core.longpaths true` and `git config --local lfs.setlockablereadonly false` through `Store::git` (CORE-040, ARCH-085), with `CoreConfig.git_env`. Each check is `ok` when the repository's own config already has that value, else `fixed` (or a `problem` without `fix`). Without `.git`, they are `ok` with "not a git repository; skipped".
+   - **`git.core_autocrlf`** is report-only in the tool: when the effective `core.autocrlf` (`git config core.autocrlf`, through `Store::git`) is `true` or `input`, it is a `problem` explaining that text files outside `projects/` get CRLF on checkout, and `workspace.doctor` never changes it, whatever `fix` says and whoever calls it (an agent-callable fix tool must not change persistent git config without the person's confirmation; CORE-040 doesn't ask for this setting, and `projects/** -text` already covers the asset trees). An unset value is `ok`.
    - After printing the workspace checks, `ww doctor` asks "Set core.autocrlf=false for this repository only? [y/N]" when that check is a `problem`. Only `y` sets it, with `git -C <ws> config --local core.autocrlf false` through `ww_client::doctor::set_repo_autocrlf_false` (`run_hidden`): git itself writes `.git\config`, which is not a store-managed workspace file (ARCH-002). The line becomes `fixed:`. With `--non-interactive`, or any answer but `y`, nothing is set, the line stays a `problem` and doctor exits 1.
    - The five `.gitignore` entries and the `.gitattributes` line `projects/** -text` are appended through `edit_text` when missing (CORE-040 clarification).
    - `sealed.readonly` (CORE-026; research 5A-6, the doctor part): a sealed file without the read-only attribute whose SHA-256 matches the manifest (a clone or checkout drops the attribute, since git stores only file modes) gets it back with `fix`, through `fsops::set_readonly`; one whose hash doesn't match stays as it is, a human edit, and is listed. Re-applying it automatically after every rescan is deferred (Not in this plan).
@@ -2082,7 +2239,7 @@ pub enum UserCommand { /* … */ Doctor }
   - **`tests/crash_recovery.rs`** (QA-055, the fast subset):
     - **`crash_at_each_write_order_step_recovers_cleanly`** (Review Focus 1). For each of `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress` and `store.after_index`:
       1. `CoreFixture::start_with_env` with that point at `abort`; `test.ingest_run {job_line:true}` → the core exits.
-      2. A fresh core, same key: no `*.ww-tmp-*` or `*.ww-bak-*` remains; `project.status` lists the run in `orphans` only for `after_output`; every manifest parses; every log line parses (`read_lines` drops none); `assets.query` agrees with the manifests.
+      2. A fresh core, started only after `KillOnDrop::wait_exit` has seen the old one exit (Windows releases a dead process's `LockFileEx` locks when its handles close, and the docs say the timing depends on system resources; if this step flakes on `core.lock`, report it rather than adding a sleep), same key: no `*.ww-tmp-*` or `*.ww-bak-*` remains; `project.status` lists the run in `orphans` only for `after_output`; every manifest parses; every log line parses (`read_lines` drops none); `assets.query` agrees with the manifests.
       3. The retry with the same key runs again (the dead core's `running` row was released under `core.lock`), and both runs' files exist.
     - **`crash_between_seal_and_manifest_lists_the_version_and_loses_nothing`** (Review Focus 1, CORE-038): `asset.import` (copy), then a core with `store.after_seal=abort` and `asset.signoff` → the core exits. A fresh core: `project.status` lists `v1.0.0/` in `orphans`; every file of the run exists exactly once, in `v1.0.0/` or `candidates/<run>/`; the manifest parses and has no `approved_version`; nothing was deleted;
     - `disk_full_mid_commit_keeps_files_consistent`;
@@ -2092,16 +2249,17 @@ pub enum UserCommand { /* … */ Doctor }
     - `refused_wal_db_gets_no_new_side_files` (a WAL-mode db with `user_version` 999 and no `-wal`: after the refused start, no `-wal` or `-shm` exists);
     - `hot_journal_exits_7_with_nothing_changed`.
   - **`tests/reconcile_sim.rs`** (QA-046, simulated, shrinkable): `outside_writers_never_lose_edits`.
-    - A `proptest` strategy generates operation sequences, which shrink on failure. They run against an in-memory file map, applying the pure write decision (`store::write::decide_write(expect, current) -> WriteDecision`, factored out in this task) and `watch::reconcile::decide`.
+    - A `proptest` strategy generates operation sequences, which shrink on failure. They run against an in-memory file map, applying the pure write decision (`store::write::decide_write`, factored out of `store/write.rs` in this task; Interfaces) and `watch::reconcile::decide`.
     - Operations: outside edit, slow outside write (a write observed mid-way, with an unstable identity), delete, rename, folder move, partial manifest edit, invalid manifest, checkout of n files (with overflow, rewriting candidate files whose run records change in the same checkout), LFS pointer, edit between check and replace, core write, core manifest edit, crash at a write-order step, crash after the replace.
-    - Invariants: no outside edit is overwritten or left only in a backup file; invalid manifests are marked, never rewritten; no human edit comes from an unstable read, from the core's own pending bytes, or twice for one SHA-256; a removed recorded file is `missing`, never forgotten; the index model converges after a rescan; no orphan is deleted; no write happens while `index.lock` exists.
+    - Invariants: no outside edit is overwritten or left only in a backup file; invalid manifests are marked, never rewritten; no human edit comes from an unstable read, from the core's own pending bytes, or twice for one SHA-256; a removed file the suite still expects (in `hashes`, of an open run, or a manifest) is `missing`, never forgotten, and the suite's own moves never make one `missing`; the index model converges after a rescan; no orphan is deleted; no write happens while `index.lock` exists.
     - `cases` comes from `test-params.toml`, through `ww_testkit::params::proptest_cases()`.
   - **`tests/reconcile_ntfs.rs`** (QA-046, real NTFS with the fence): the same scenarios and invariants, through a real core and `GitOps`. Each scenario ends with a fence; then the core's view (`asset.get`, `assets.query`) and the files on disk are compared.
   - **`tests/doctor_tool.rs`:**
     - `doctor_sets_git_config_and_gitignore_then_changes_nothing` (CORE-040, ARCH-085, QA-060);
     - `doctor_without_git_skips_with_a_note`;
     - `doctor_lists_orphans_and_needs_repair_without_fixing` (and `missing` files);
-    - `doctor_reports_a_missing_watcher` (`watch.start=unsupported`; the detail no longer says writes skip the git wait);
+    - `doctor_reports_a_missing_watcher` (`watch.start=unsupported`; `workspace.watcher` is a `problem` whose detail says outside edits are found only by `ww notify` and at open);
+    - `doctor_git_calls_use_the_configured_git_env` (an in-process core whose `CoreConfig.git_env` is `TestEnv::git_env()`; a `core.autocrlf=true` in the test profile's `.gitconfig` is reported as a `problem`, and with an empty profile it is `ok`, so the core reads only the config it was given);
     - `doctor_tool_reports_autocrlf_and_never_sets_it` (CORE-040: a repository whose config says `core.autocrlf=true`; `workspace.doctor {fix:true}` from a `cli` and from an `mcp` caller → `git.core_autocrlf` is a `problem` and `.git\config` is byte-identical; `.gitattributes` gains `projects/** -text`);
     - `doctor_restores_read_only_on_matching_sealed_files` (CORE-026: after `git checkout` leaves sealed files writable, `fix` makes the matching ones read-only and lists an edited one without touching it).
   - **`ww-client/tests/doctor.rs`:**
@@ -2115,7 +2273,9 @@ pub enum UserCommand { /* … */ Doctor }
     - `non_interactive_doctor_never_moves_it`;
     - `doctor_sets_autocrlf_only_after_yes` (a repository with `core.autocrlf=true`: answer `n` → unchanged, exit 1; answer `y` → `git config --local core.autocrlf` is `false`, a `fixed:` line, and a second run is all `ok:`);
     - `non_interactive_doctor_never_sets_autocrlf` (`ww --non-interactive doctor` → no prompt, `.git\config` unchanged, exit 1);
-    - `doctor_with_a_stale_default_reports_it_and_still_runs`.
+    - `doctor_with_a_stale_default_reports_it_and_still_runs`;
+    - `doctor_without_a_default_workspace_skips_the_workspace_checks` (no `suite.toml`, then a `suite.toml` without `default_workspace` → `ok: no default workspace; workspace checks skipped`, exit 0, and no core is started);
+    - plan 2a's `damaged_state_db_message_is_plain` (`ww-cli/tests/user_cli.rs`) and the damaged-database test in `ww-client/tests/client.rs` assert the new message without "(plan 2b)".
   - Remove the three `doctor.rs` entries from `expected-fail.toml`. The list then holds no plan-2b test.
 - [ ] **Step 2: Run them.**
 
