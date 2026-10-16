@@ -62,6 +62,8 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 | Tool | A typed operation in the core (e.g. `image.generate`) callable by apps, the CLI, MCP clients and the assistant through one dispatcher. |
 | Caller kind | Who is calling a tool — exactly one of `ui:<app>`, `assistant`, `mcp`, `cli` (§1.3); it decides confirmations and permissions. |
 | Effect class | `read`, `write`, `destructive`, `exec`: decides whether an agent's call needs your confirmation. |
+| Brief / compile | Prompt Studio's model-neutral, versioned record of what a prompt should achieve (a `prompt_brief` asset), and its rendering into one target model's prompt, negative and settings hints (§4.7a). |
+| Prompt dialect | The form a model wants its prompt in — sentences, tags or an edit instruction — declared by each model profile and applied by the compiler (§4.7a, §5.6a). |
 | Engine | An external program the core drives (ComfyUI; Claude Code as assistant Engine A; the Anthropic API as Engine B; later Blender, local LLM servers). |
 | Profile (Claude Code) | One Claude Code account's config folder (`CLAUDE_CONFIG_DIR`), selectable per conversation. |
 | Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records (lossless JSON/YAML round-trip). Its reference text is `docs/reference/workspace-format.md` (from the Worldwright plugin's manifest skill); this spec's changes to it (§2.12) take precedence. |
@@ -70,7 +72,7 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 
 ### 0.5 Document map
 
-§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification).
+§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer (including §4.7a Prompt Studio) · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification).
 
 ---
 
@@ -324,7 +326,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 | `ww-schema` | Workspace-format types (lossless round-trip; `docs/reference/workspace-format.md`), link syntax and `ww://` refs, schema generation |
 | `ww-protocol` | RPC methods, events, result and error types (§6.1), effect classes `read \| write \| destructive \| exec`, protocol version, tool descriptors and lowering |
 | `ww-client` | SDK for apps, `ww-mcp` and `ww`: find/start the core, verify the server, handshake, reconnect, resubscribe, idempotency keys |
-| `ww-core` | modules `store`, `watch`, `index`, `state`, `graph`, `projects`, `pipeline`, `settings`, `meter`, `accounts`, `telemetry`, `confirm`, `jobs` (with the GPU scheduler), `engines`, `providers`, `secrets`, `qa`, `convert`, `library`, `docs`, `resources`, `interchange`, `sync`, `lfs_store`, `backup`, `assistant` (supervises Claude Code processes), `tools` (registry and dispatcher), `mod_image`; `imports` *(later)* — one-line roles in §2.1 |
+| `ww-core` | modules `store`, `watch`, `index`, `state`, `graph`, `projects`, `pipeline`, `settings`, `meter`, `accounts`, `telemetry`, `confirm`, `jobs` (with the GPU scheduler), `engines`, `providers`, `secrets`, `qa`, `convert`, `library`, `docs`, `resources`, `interchange`, `sync`, `lfs_store`, `backup`, `assistant` (supervises Claude Code processes), `prompt` (Prompt Studio, §4.7a), `tools` (registry and dispatcher), `mod_image`; `imports` *(later)* — one-line roles in §2.1 |
 | parser crate | platform-neutral parsers for untrusted input (clipboard/drag MIME payloads, workflows, metadata), with fuzz/property targets (§6.4) |
 | CPU compositor crate | the shared Rust CPU compositor used by the Image studio and the core (§5.3) |
 | platform crate | the only home of Windows API calls (§7.6) |
@@ -429,6 +431,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 | `library` | Transfer between projects (M1); promote and `lib:` links (Later) | M1 |
 | `imports` | Inbox, model identification, hub search and download, pickle scanning | Later |
 | `assistant` | Agent loop over the tool registry; supervises Claude Code processes (§4) | M1 |
+| `prompt` | Prompt Studio: briefs, the adaptive interview, the per-model prompt compiler and previews (§4.7a) | M1 |
 | `tools` | Tool registry and dispatcher | M1 |
 | `mod_image` | Image-module tools | M1 |
 | `lfs_store` | Large-file store settings and store changes (§7.2): "This PC only → External drive" (M1); changes involving a cloud store (M1.5) | M1 |
@@ -730,6 +733,8 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 | `accounts.refresh` | write | M1 | |
 | `telemetry.series`, `telemetry.snapshot`, `telemetry.jobs` | read | M1 | |
 | `handlers.for`, `open_in`, `ui.show` | read | M1 | agents never steal focus (§3.4) |
+| `prompt.interview_start`, `prompt.interview_answer`, `brief.create`, `brief.update`, `brief.compile`, `brief.stage_to`, `brief.promote` | write | M1a | Prompt Studio (§4.7a, AI-187); `brief.stage_to` is fill-only (AI-186) |
+| `prompt.interview_get`, `prompt.dialects`, `brief.get`, `briefs.list` | read | M1a | |
 | `project.clone` | write | Later | |
 | `project.delete` | destructive | Later | lists inbound links first |
 
@@ -933,7 +938,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 **Libraries (shared resources)**
 
 - **APP-078** [M1] (contract) Libraries are typed resources usable in every app and by agents. Workspace resources live in `library/resources/<kind>/`; personal resources live in `%APPDATA%\Worldwright\resources\` and are available in no-workspace mode. One shared Libraries panel; changes are published on the `resources` topic.
-- **APP-079** [M1a] Resource kinds in M1a: `swatch`, `palette`, `prompt_preset`, `style_preset` (prompt + LoRAs + settings for a compatible model-profile family, §5.6), and `model_profile` (§5.6; personal by default, since models are machine-level, with workspace overrides).
+- **APP-079** [M1a] Resource kinds in M1a: `swatch`, `palette`, `prompt_preset`, `style_preset` (prompt + LoRAs + settings for a compatible model-profile family, §5.6), `model_profile` (§5.6; personal by default, since models are machine-level, with workspace overrides), and `prompt_brief` (a promoted Prompt Studio brief, AI-183).
 - **APP-080** [M1a] Resource kind `workflow`: a ComfyUI workflow with marked slots (§5.6, §5.7). It's saved from the ComfyUI tab (M1a) and opened by the Graph tab and workflow-on-layer (M1b).
 - **APP-081** [Later] Resource kinds `gradient`, `export_preset`, `brush` and `text_style` (the last two with the matching Image studio features, §5.11).
 - **APP-082** [M1] (invariant) `resource.delete` is soft (to trash) and is `destructive`, so it needs confirmation when an agent asks.
@@ -1045,6 +1050,40 @@ In M1 these are panels inside the Image studio; a separate Hub app hosts them la
 - **APP-133** [M1] **Backups** (reached from Diagnostics; in the Hub later): per destination — last successful backup, size, next run, estimated monthly cost, quota used/remaining where available, protection level, partial-backup file lists; warnings; **Add destination**; and restore into a side folder. Behaviour is specified in §7.4.
 - **APP-134** [M1] **Diagnostics:** component versions, engine health, recent errors, event log, telemetry summary, a **backup status line**, and "Export diagnostics bundle" (redacted — secrets, Claude Code profile labels and emails removed).
 
+### 3.6a Prompt Studio surfaces
+
+Prompt Studio's brief, interview, compiler and tools are specified in §4.7a; its image-specific rules are in §5.6a. This subsection covers its two surfaces: the Prompt Studio view, and the "Improve this prompt" button beside other modules' prompt boxes.
+
+- **APP-149** [M1a] (decision) In M1 the Prompt Studio is a main-area tab of the Image studio (IMG-003). It opens from the app switcher (APP-006), from a brief in the Asset browser, or through "Open in Prompt Studio". Its QML lives in `ww-ui-kit`, so later apps host the same view and the same "Improve this prompt" button. A standalone Prompt Studio app comes Later, as the Hub does (ARCH-011).
+- **APP-150** [M1a] **Layout** (every part is a dockable panel):
+  - **Request box:** the rough request; the targets (kind, operation, profile); and the engine chip, which shows the engine, the model or profile label and, for API engines, the estimated cost per step.
+  - **Question flow:** one question at a time, with a "question 2 of up to 5" counter, "I don't mind", "Other…", **Just write it**, and Back to reopen an earlier answer.
+  - **Brief panel:** every field with a source chip (from your request, your answer, style bible §…, preset, or assumed), editable in place. It also shows the brief's version, a "Save version" button, and a stale or "draft differs" banner when one applies.
+  - **Compiled prompt per target:** one tab per target, with the prompt, the negative, the settings hints, a length meter, explanation chips on hover, an "edited" marker on overrides, and Recompile and Reword buttons.
+  - **Side-by-side test:** up to 4 columns (targets, or variants of the brief), rendered under the preview rule with one shared seed (AI-181). Each column has "Stage to canvas".
+- **APP-151** [M1a] **Question flow behaviour:**
+  - Options are buttons, also selectable with number keys 1–9.
+  - A `visual_pick` question shows its options as text at once, and the previews fill in as they arrive. Answering before they finish cancels them.
+  - A cap prompt appears inline (APP-054).
+  - If the engine fails, the flow falls back to the question bank with a one-line notice; it never dead-ends.
+- **APP-152** [M1a] **"Improve this prompt"** is a small button beside every prompt box. It is a `ww-ui-kit` component; in M1a it sits beside the Generate panel's prompt and negative prompt. It opens a pop-over that runs the compact interview (AI-168), using the box's current text as the source prompt and the panel's settings as the target. The pop-over then shows the original and the improved text with a diff, and three actions:
+  - **Use this:** creates the brief, fills the box as one undoable edit, and links the box to the brief (APP-153);
+  - **Open in Prompt Studio:** carries the interview and the draft over;
+  - **Cancel** (or Esc): leaves the box unchanged.
+  - The pop-over never runs a generation.
+- **APP-153** [M1a] **Recall chip.** A prompt box linked to a compile shows "From brief *title* v1.2 · *dialect*". The chip is marked "edited" when the box holds overrides, and "recompile available" when AI-179 applies.
+  - Clicking the chip opens the brief in Prompt Studio. Unlink keeps the text and drops the link.
+  - "Recall settings" from a staged result or a candidate (IMG-086) restores the link along with the text.
+- **APP-154** [M1a] **Staged cards.** A card from `brief.stage_to` is labelled with who staged it and the brief version, for example "Staged by Claude Code from brief *title* v1.2".
+  - It fills the prompt box and settings as one undoable step, and keeps the previous values for **Restore mine**. If you are typing in that box, the card waits with **Apply** instead of filling it.
+  - It never takes focus or activates the window (APP-065).
+  - A card for a document that isn't open waits in the core and appears when the document opens.
+  - A card is kept until it is applied or dismissed, for at most 14 days.
+- **APP-155** [M1a] **Briefs in the shared panels:**
+  - the Asset browser can filter by type `prompt_brief`;
+  - the Inspector shows a brief's versions, its transcripts, the compiles that runs used, and its "used by" list;
+  - Libraries lists promoted `prompt_brief` resources, each with "New brief from this" (AI-183).
+
 ### 3.7 Responsiveness targets
 
 These are verified in the M0 and M1 benchmarks and reported pass/fail in each milestone report (§6.7).
@@ -1059,15 +1098,15 @@ These are verified in the M0 and M1 benchmarks and reported pass/fail in each mi
 
 - **M0 spike:** frame times and GUI-thread stalls under ComfyUI load (APP-135); pasting into Discord and Chromium (APP-071).
 - **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.wwdoc`; "Add to project"; the `ww:` protocol (including `ww:task/<job_id>`), `.wwref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
-- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile` and `workflow` resource kinds, and the ComfyUI web view land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
+- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
 - **M1.5:** named layout presets; document checkpoints and cross-machine restore (with the S3-compatible store); resolving references through `renamed_from`; the interactive Claude Code token panel.
-- **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
+- **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; a standalone Prompt Studio app; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
 
 ---
 
 ## 4. AI layer: providers, metering, assistant, Claude Code
 
-This section covers how the core talks to hosted and local AI models, how every call is metered, the built-in assistant and its two engines, Claude Code accounts, and Claude Code integration in both directions. All of it lives in the core's `providers` and `assistant` modules (§2) and is reached through the same tool surface as everything else (§1).
+This section covers how the core talks to hosted and local AI models, how every call is metered, the built-in assistant and its two engines, Claude Code accounts, Claude Code integration in both directions, and Prompt Studio (§4.7a). All of it lives in the core's `providers`, `assistant` and `prompt` modules (§2) and is reached through the same tool surface as everything else (§1).
 
 - **AI-001** [M1] (decision) Providers in use: Anthropic API, OpenRouter, NanoGPT, OpenAI, Google and fal (xAI and Mistral optional), plus the Chinese flagship providers DeepSeek, Alibaba/Qwen, Moonshot/Kimi, Z.ai/GLM, MiniMax, Tencent, Xiaomi MiMo and StepFun. ByteDance Seed models are reached through OpenRouter or fal, because BytePlus doesn't list the US as a supported region (verified 2026-10-12).
 - **AI-002** [M1] (invariant) Every external model or service call, including the assistant's own calls and internal callers such as vision QA, goes through `ProviderGate` (estimate, optional user-set caps, meter; §2). The suite adds no content filter of its own; each provider's and model's own policies apply.
@@ -1376,7 +1415,225 @@ Engine A (§4.6, §4.6a).
 - **AI-131** [M1] (contract) A capability table (`claude_code.yaml`) maps tested Claude Code versions to the flags used. The stream parser tolerates unknown events and records them; stream fixtures are recorded per tested version. An untested version is refused for Engine A (AI-061) and shows a banner: "Claude Code X.Y is untested — run the smoke test to add it, or use the API engine". A passing smoke run on the new version (AI-130) records it as tested for this machine.
 - **AI-132** [M1] If Claude Code is unusable, the API engine is offered when an Anthropic API key exists.
 
+### 4.7a Prompt Studio
+
+Prompt Studio turns a rough request ("a lantern icon for a game inventory") into a prompt aimed at what the person needs. It asks the questions an art director would ask, then writes the answers out for the model that will run them. It is split in two:
+- the **brief** records what the person wants. It is model-neutral and versioned;
+- the **compile** records how one target model wants to be told. It is built from deterministic templates, with an optional AI wording step.
+
+Switching models therefore recompiles the same brief instead of starting over.
+
+The section sits in the AI layer because its engines, metering and agent tools are AI-layer concerns, and its core lives in the core module `prompt`. Following the prefix convention (§0.3), its app surfaces are in §3.6a and its image-specific rules in §5.6a.
+
+#### Shape and scope
+
+- **AI-157** [M1a] (decision) Prompt Studio is the core module `prompt` (CORE-014). It turns a request into a structured **brief** through an adaptive interview, then **compiles** the brief into the prompt dialect of each target model. Every module that drives AI models can use it in three ways: the Prompt Studio view, the "Improve this prompt" button beside its prompt boxes (§3.6a), or the tools in AI-187. Both surfaces use the same interview engine, the same tools and the same saved briefs.
+- **AI-158** [M1a] (decision) **Target kinds** are `image` (M1a), and later `video`, `audio`, `voice` and `llm_task`. The brief has a shared core of fields plus one section per target kind. Each target kind brings four things: its field relevance, its question bank (AI-170), its dialects (AI-180) and its settings map. Adding a kind adds those four things and nothing else. Existing brief versions, compiles and dialects stay valid, and a build that doesn't know a kind keeps that kind's section and targets untouched (AI-164).
+
+#### The brief
+
+- **AI-159** [M1a] (contract) **A brief is a project asset** of type `prompt_brief` (module `direction`, asset ids `brf_<slug>`), with the normal manifest, versions and sign-off (§2.3–2.4). Its primary file is `brief.json`, and `transcript.jsonl` is a declared companion (AI-165).
+  - Edits go to a **draft** in the asset's `work/` folder (`work/draft/brief.json`). The draft is written by `store`, and like documents it is machine-local and gitignored (APP-088). `brief.update` carries the draft's expected hash. When two surfaces, or a surface and an agent, edit at once, the later write gets `store.hash_conflict` instead of overwriting the other.
+  - In no-workspace mode a brief is a draft in the app cache only. Its compiles record its content hash instead of a version, and "Add to project" offers to save it as an asset.
+- **AI-160** [M1a] (contract) **Brief versions.** "Save version" makes a one-file candidate run from the draft (role `manual`, as Make candidate does, APP-099) and signs it off at once (CORE-026, CORE-051). Its technical QA is schema validation plus a check that every reference resolves. The proposed bump (CORE-027) is:
+  - major when the subject or the set of target kinds changes;
+  - patch when only `notes` change;
+  - minor otherwise.
+  - Recipe inputs reference sealed versions only (CORE-031), so **using a draft seals it**. When a run starts from a compile of a draft that differs from the latest sealed version, the core first seals the draft with the proposed bump, recording `approved_by` as whoever started the run. Compiling and staging (AI-186) never seal.
+- **AI-161** [M1a] (contract) **Brief fields.** Only `request` and `targets` are required; every other field is optional and may stay empty:
+  - `request`: the rough request, verbatim; plus `title` and `notes`;
+  - intent: `purpose` (what it is for) and `placement` (where it will be used: medium, size or aspect, background, tiling);
+  - content: `subject` (main subject, must-have details, setting);
+  - look:
+    - `look` (aesthetic);
+    - `style` (medium, technique, influences, and an optional `style_preset` reference, AI-182);
+    - `mood`;
+    - `colour` (words, or a `palette` or `swatch` resource reference);
+    - `lighting`;
+    - `composition` (framing, layout);
+    - `camera` (shot, angle, lens, depth of field);
+  - `avoid`: a list of things to keep out;
+  - `references` and `targets` (AI-163);
+  - `engine`: an optional engine override (AI-171);
+  - `sections.<kind>`: fields that only one target kind uses (§5.6a for `image`).
+- **AI-162** [M1a] (contract) **Slot values.** Each field from `purpose` to `avoid` holds a slot value. The value takes exactly one of three forms and records the `source` that produced it (`request`, `answer:<question id>`, `user`, `assistant`, `style` or `preset`). The forms are:
+  - a literal value;
+  - a **reference** instead of a copy. It is either a style-bible section, written `style@<n>#<anchor>` with heading anchors as in the workspace format's `style_bible` field, or a Library resource id with its content hash. The compiler resolves the reference (AI-173); the brief never copies the bible's or the preset's text;
+  - `dont_mind` (AI-169).
+  - A brief that references the style bible lists `style@<n>` in its manifest `inputs`. Raising the project's `style_version` therefore marks the brief stale under the normal staleness rule (AI-184).
+- **AI-163** [M1a] (contract) **References and targets.**
+  - `references[]`: entries of the form `{ref, role, weight, note}`. `ref` is a sealed version reference carrying its content hash (CORE-047), and `role` is `subject`, `style`, `composition` or `colour`. A loose or unsaved image is imported first (`asset.import`). Candidates and proposals can't be references (APP-077).
+  - `targets[]` (at least one): entries of the form `{kind, module, operation, profile, label}`. `profile` is optional and defaults to the module's task default (for images, `defaults.models.image_generate`, AI-036). One brief can carry several targets, and each target gets its own compile.
+- **AI-164** [M1a] (invariant) `brief.json` carries `schema_version` and round-trips losslessly (ARCH-076). Unknown fields, unknown target kinds and unknown `sections` entries are preserved on every rewrite (CORE-148) and shown read-only.
+
+#### The interview
+
+- **AI-165** [M1a] (contract) **Interview sessions** are held by the core in the per-workspace `state.db` and advance one step at a time. A session expires after 7 days without an answer. Each step records:
+  - the question and its options;
+  - the engine: its kind, the model id or the opaque Claude Code profile id (never a label, AI-014), and its usage record ids;
+  - for a preview job, its seed, settings and profile hash;
+  - the answer, and `answered_by` (`user`, `assistant` or `claude_code`).
+  - An expired session takes no more answers, but its recorded steps stay with the draft. When a brief version is sealed, the steps of every interview that changed the brief since the previous version become that version's `transcript.jsonl`.
+- **AI-166** [M1a] (contract) **"Already known" detection** runs before the first question and after every answer, in two passes:
+  1. deterministic: slots already filled in a linked brief, explicit `style@<n>` or resource references, and slots the target operation fixes (for example, composition and camera for image-to-image, IMG-174);
+  2. engine: maps phrases in the request, the source prompt and the project's style bible to slots, each with its `source`. The engine reads the current version of the bible, as wrapped data.
+  - A slot known through either pass is never asked about. The engine's mappings are proposals that the core validates against the schema, and the person can see and change every one in the brief panel.
+- **AI-167** [M1a] (contract) **Questions** are one of four kinds:
+  - `choice`: pick one option;
+  - `multi_choice`: pick several;
+  - `free_text`;
+  - `visual_pick`: a `choice` whose options get previews (AI-181).
+  - Each question names the slots it fills and gives a one-line reason. A choice question carries 2–6 options of at most 80 characters each, and always also accepts "I don't mind" and "Other…" (free text), which the UI always shows. Questions about look, style, mood, colour, lighting and composition may be `visual_pick`; all others are text.
+- **AI-168** [M1a] (invariant) **Budget and stop rule.** One question per step. The budget is 5 questions in the Prompt Studio and 3 in the "Improve this prompt" pop-over; a setting changes it within 0–8, where 0 means compile at once. No slot is asked about twice unless the person reopens it. The interview stops at the first of:
+  - every slot the target kind marks as relevant is known or `dont_mind`;
+  - the budget is spent;
+  - the person chooses **"Just write it"**. It is offered at every step and makes no further interview call;
+  - the engine returns `done` with a reason, judging that the remaining unknowns wouldn't change the result much.
+  - Slots still unknown at the stop are treated as `dont_mind` and listed as assumed (AI-176).
+- **AI-169** [M1a] (contract) **"I don't mind"** records `dont_mind` on the slots the question fills. At compile time such a slot takes the first of these that exists:
+  1. the style-bible section mapped to it;
+  2. the referenced preset's value;
+  3. the dialect's default for that slot.
+  
+  If none exists, the slot is left empty. The explanation labels the result "assumed" and names its source.
+- **AI-170** [M1a] (contract) **Engine step contract.** Each step sends the engine the request, the known slots, the open slots in priority order, the budget left and the target, all wrapped as data (ARCH-060, AI-086). The engine returns exactly one step object: `ask {question}` or `done {reason}`. Either may carry a `brief_patch` of newly known slots. The core validates the step against the schema, the budget and the no-repeat rule. An invalid step is re-asked once; if the second is also invalid, it is replaced by the **built-in question bank**.
+  - The question bank holds deterministic questions and options for each slot of each target kind. It is also used when no engine is configured or reachable. Prompt Studio therefore also works with no AI and no spend: questions come from the bank, and the compile skips the wording step.
+- **AI-171** [M1a] (contract) **Engines.** There are three engine kinds:
+  - `provider` [M1a]: any model on a configured API provider (AI-149) whose registry entry declares structured output. The model comes from the settings task `prompt_studio` (AI-036) unless the brief names one;
+  - `claude_code` [M1b]: Engine A (§4.6), on the profile the person picks;
+  - `local` [M1.5]: `llama-server` or Ollama (AI-151).
+  - The engine is chosen per brief (the `engine` field), per interview, and by a suite-level default kept in `suite.toml` next to the assistant engine choice. The default, `auto`, takes the first of these that is available:
+    1. Claude Code, when Engine A is usable on the picked profile (AI-061, AI-062);
+    2. the `prompt_studio` provider model;
+    3. from M1.5, a configured local model;
+    4. no engine (AI-170).
+  - Agent callers default to no engine (AI-185).
+  - A brief stores only the engine kind and a registry model id, never a Claude Code profile (AI-105).
+- **AI-172** [M1a] (invariant) **Metering.** Each engine step and each wording step is one metered call, with its own estimate and reservation through `ProviderGate` (CORE-011, AI-002). Every attempt is metered (AI-010) and counts toward caps. A cap prompt on your own action appears inline in the question flow (APP-054).
+  - Claude Code steps are `subscription_quota` (AI-071) and never count toward money caps (CORE-090). At a plan limit the interview fails with `quota.plan_limit` (QA-006) and offers another engine or the question bank.
+  - A Claude Code interview is an Engine A conversation under AI-047–AI-072, with a preset that allows no file edits, no commands and no suite tools. Context arrives as wrapped data in each turn's core-written preamble (AI-054), and the reply is the step object.
+  - Local steps are local work ($0, GPU time and energy, AI-151).
+
+#### The compiler
+
+- **AI-173** [M1a] (contract) **Compile steps.** `brief.compile` takes one brief state (a sealed version or the draft) and one target, and builds a compile record through these steps, in order:
+  1. resolve slot references (style-bible sections at the current `style_version`, with a warning when it is newer than the brief's `style@<n>`; presets; palettes) and `dont_mind` defaults (AI-169);
+  2. map the slots onto the dialect's slot order (AI-180) and fill its templates;
+  3. build the avoid part: a separate negative prompt when the profile honours one, otherwise inline phrasing or a listed omission (§5.6a);
+  4. derive settings hints from `placement`, the target operation and any preset (§5.6a);
+  5. optionally run the AI wording step (AI-175);
+  6. fit the length limit (AI-177);
+  7. attach the overrides the person chose to carry over (AI-178).
+- **AI-174** [M1a] (invariant) **Steps 1–4, 6 and 7 are deterministic.** The same brief content, style-bible text, target profile (by content hash), dialect version and preset hashes give byte-identical output. These steps use no clock, randomness, network or model call. Dialect templates are data; no model chooses which code runs.
+- **AI-175** [M1a] (contract) **The AI wording step** rewrites the template text into fluent text for the dialect. It is a per-brief switch: on by default for `natural_sentences`, off for `tag_list`. Its output is accepted only if it fits the length limit and every non-empty slot's key terms are still present, checked after normalising case and punctuation. Otherwise the template text is used and a warning says so.
+  - Accepted wording is stored in the compile. Recompiles reuse it until the brief content or the dialect kind changes, or the person asks to **Reword** (metered).
+- **AI-176** [M1a] (contract) **Compile record.** It holds:
+  - `compile_id`;
+  - the brief: `brf_…@<version>` once sealed, and always its content hash;
+  - the target: kind, module, operation, and profile id with its content hash;
+  - the dialect id, version and template hash; the `style_version` used; the hashes of the presets used;
+  - `prompt`, and `negative` (or null);
+  - `settings_hints`;
+  - `explain[]`: for each part of the prompt and the negative, and for each hint, where it came from. A source is one of: a brief field, an answer (by question id), `style@<n>#<anchor>`, a preset, a LoRA trigger word, a dialect default, an assumption, AI wording or an override;
+  - `assumed[]`, `trimmed[]` and `warnings[]`;
+  - `length {count, limit, unit, estimated}`;
+  - the wording engine and its usage record ids;
+  - `overrides`.
+  - Compiles live in the per-workspace `state.db` until a run uses one. The core then writes that compile into the brief asset as `compiles/<compile_id>.json`, listed in the manifest extension field `prompt_compiles[]`, so recipes can cite it (IMG-140).
+- **AI-177** [M1a] (contract) **Length limits** come from the target profile's dialect: a unit (`tokens`, `words` or `chars`), a limit and a target length. Tokens are counted with the tokenizer the dialect names; when no tokenizer ships, a conservative character estimate is used and marked `estimated`. Over the limit, the compiler drops whole slot phrases, lowest priority first, never cutting mid-word, and lists them in `trimmed[]`.
+- **AI-178** [M1a] (contract) **Overrides.** The person's edits to a compiled prompt, negative or settings hint are stored as overrides on that compile. Each override records the hash of the compiled text it replaced and who made it.
+  - Overrides are never dropped silently. A recompile (AI-179) shows "you edited the previous compile" with a diff and two choices: *keep mine* or *take the new compile*. Overrides carry over only on *keep mine*.
+- **AI-179** [M1a] (contract) **Recompile.**
+  - Changing the target model recompiles:
+    - between profiles with the same dialect kind, the stored wording is reused when it fits;
+    - for a different dialect, a deterministic recompile runs at no cost, and **Reword** is offered.
+  - A new brief version, a newer `style_version` than the compile used, or a new dialect version never rewrites a prompt in use. Instead, linked prompt boxes are marked "recompile available" (APP-153).
+- **AI-180** [M1a] (contract) **Dialect declaration.** A dialect is versioned data, shipped and updated with the suite in `%APPDATA%\Worldwright\dialects\`, alongside the provider profiles (CORE-076). It declares:
+  - `id`, `version`, and `form` (`sentences`, `tags` or `instruction`);
+  - the slot order, which is also the trim priority;
+  - per-slot templates and defaults, and joiners;
+  - the weight syntax: none, or `(term:1.2)`-style;
+  - a phrase table for writing avoid items inline;
+  - the length unit, tokenizer and limits.
+  
+  Each model profile names its dialect and may override the limits (IMG-173). The profile's content hash covers both, so a recipe pins the dialect through the profile hash (IMG-101).
+- **AI-181** [M1a] (contract) **Previews** for `visual_pick` questions:
+  - The core compiles the current brief once per option, without the wording step, and renders 3–4 small images with the same seed, on the local image engine only (§5.6a).
+  - They run as one job in the interactive class (CORE-124). They wait for the prompt already running, and they never cancel or resubmit a running prompt: CORE-125's setting doesn't apply to them. A superseded preview job (the person answered, or the question changed) is cancelled by id.
+  - They are logged like any job, as local work with GPU time and per-job energy (CORE-065), labelled "Prompt Studio previews" in Jobs.
+  - They are **disposable**. They are kept in the per-workspace cache, never in the workspace or in git, and are deleted when the interview ends or after 24 h, whichever comes first. They are never asset candidates (CORE-023), proposals or references. The transcript keeps their seed, settings and profile hash, not their pixels.
+  - A setting turns previews *on*, *only when the image engine is already running* (the default), or *off*. When previews are off, or no local image engine or model is available, the question is shown as text with the reason.
+
+#### Integration
+
+- **AI-182** [M1a] (contract) **Presets.** A brief refers to a `style_preset` or `prompt_preset` (APP-079, IMG-108) by resource id and content hash, and never copies it.
+  - When the target is in a style preset's profile family, the compiler uses the preset's prompt as the `style` slot's text, and its LoRAs and settings as hints. Outside that family it uses only the prompt text, with a warning.
+  - "Save as prompt preset" exports a compile's final text one way and records `from_compile`. A preset never turns back into a brief.
+- **AI-183** [M1a] (contract) **Promote.** `brief.promote` copies a sealed brief version (never the draft) into Libraries as a `prompt_brief` resource, personal or workspace (APP-078), recording `origin {project, asset_id, version}`. "New brief from Library" copies such a resource into a project as a new brief with that `origin`. This is a detached transfer, so the new brief never goes stale. Live `lib:` links to promoted briefs arrive with `lib:` links in general (the `library` module in CORE-014, Later).
+- **AI-184** [M1a] (contract) **Dependency graph and staleness.** An output made from a compile carries the brief as an input `{ref: brf_…@<version>, role: brief}`. Such outputs are candidate runs, sealed versions, and documents that accepted a proposal made from the compile (documents record it through their linked inputs, APP-075). When a new brief version is sealed, the normal rules apply to those outputs, unless they pin the older version:
+  - those assets become stale;
+  - those documents show "update available" (APP-102);
+  - the hand-off block lists what the new version made stale (CORE-020).
+  - A proposal's recipe records the brief ref for recall only (IMG-140).
+- **AI-185** [M1a] (contract) **Agents.** The assistant and the director (from M1b, AI-156) and Claude Code through MCP (from M1a) use the same tools. An agent may:
+  - run the interview, answering from what you told it or relaying the questions to you (recorded in `answered_by`);
+  - or fill a brief directly with `brief.create` and `brief.update`;
+  - then compile the brief and stage the result.
+  - When an agent calls `prompt.interview_start` without naming an `engine`, the interview uses no engine (question bank only), so the agent's own model isn't paid for twice.
+  - An agent that wants a run calls the generation tools itself, as before (§5.10); passing a `compile_id` records the brief in the recipe (IMG-176).
+- **AI-186** [M1a] (invariant) **Staging is fill-only.** `brief.stage_to` puts a labelled card into the target module's prompt and settings (APP-154, IMG-177). It never submits a job, never changes document pixels or layers, never seals a brief, and never takes focus or activates a window (APP-065). The staged values run only when the person presses Generate. The "stage settings" agent tool proposed in the flagship research (G14) is meant to reuse this mechanism rather than add a second one.
+
+#### Tools
+
+- **AI-187** [M1a] (contract) The `prompt` module exposes these tools (also listed in CORE-146):
+
+  | Tool | Effect | Milestone | Notes |
+  |---|---|---|---|
+  | `prompt.interview_start` | write | M1a | `{request, targets, brief?, source_prompt?, mode: full\|compact, engine?, budget?}`; returns the first step; each engine step is metered |
+  | `prompt.interview_answer` | write | M1a | `{interview_id, answer}`; the answer is option ids, text, `dont_mind`, `reopen` or `stop` ("Just write it"); returns the next step, or `done` with the draft brief |
+  | `prompt.interview_get` | read | M1a | the session's state, its steps so far and its preview job ids |
+  | `prompt.dialects` | read | M1a | the shipped dialects and versions, and the dialect each profile declares |
+  | `brief.create` | write | M1a | from a finished interview or from fields; creates the `prompt_brief` asset and its draft |
+  | `brief.update` | write | M1a | a field patch on the draft, with the expected hash |
+  | `brief.get`, `briefs.list` | read | M1a | the draft, versions, compiles and "used by" |
+  | `brief.compile` | write | M1a | `{brief, target, wording: auto\|off\|reword, overrides?}`; returns the compile record; metered only for the wording step |
+  | `brief.stage_to` | write | M1a | `{compile_id, module, target}`; fill-only (AI-186) |
+  | `brief.promote` | write | M1a | a sealed version → a `prompt_brief` resource |
+
+  - Briefs are sealed with `asset.signoff`.
+  - None of these tools is `destructive` or `exec` (CORE-108), so agent callers never need a safety confirmation (CORE-109). Their spending goes through caps (CORE-091).
+  - Mutating and metered calls carry idempotency keys (ARCH-035).
+
+#### Privacy and safety
+
+- **AI-188** [M1a] (decision) Prompt Studio adds **no content filter** of its own. It doesn't refuse, soften or reword subjects, and dialect defaults add only quality terms, which are visible and editable. Each provider's and model's own policies still apply (AI-002).
+- **AI-189** [M1a] (invariant) **Untrusted text and outbound calls.**
+  - Engine output, reference metadata, file names and style-bible text are wrapped as data whenever an engine sees them (AI-086, ARCH-060).
+  - Engine output can fill only the schema fields of a validated step, or the wording text, and every string is length-limited. It can't call tools, choose a target, change a profile or set settings: settings hints come only from the deterministic mapping.
+  - An interview or compile makes network calls only to the selected engine. Claude Code interviews run with web tools disallowed (AI-050). Reference images are sent only to the selected engine, and only when its registry entry declares vision. Previews are local.
+
+#### Tests
+
+- **AI-190** [M1a] (invariant) **Compiler goldens per dialect** (protected golden files, QA-019; run on every push). A fixed set of brief fixtures is compiled for each shipped dialect and profile, and compared with the expected prompt, negative, settings hints, explanation, trims and length.
+  - The fixtures cover `dont_mind` resolution, style-bible references, presets, inline avoid phrasing, trimming at the limit, recompiling across dialects, and kept overrides.
+  - The wording step runs against the fake provider (QA-066), and its checker is tested with both accepted and rejected rewrites.
+- **AI-191** [M1a] (invariant) **Spec tests** (every push, with a fake engine, QA-017):
+  - **question budget:** a fake engine that keeps asking, repeats a slot or returns invalid steps never exceeds the budget and never repeats a slot. It falls back to the question bank after one re-ask, and "Just write it" ends the interview with no further engine call;
+  - **staleness:** sealing a new brief version marks a candidate made from the old version stale and its document "update available", and leaves a pinned one alone; a `style_version` bump marks the brief stale;
+  - **fill-only staging:** for each agent caller kind, `brief.stage_to` submits no job (the fake ComfyUI receives no prompt), changes no document pixels, seals nothing, and makes no activation or focus call.
+- **AI-192** [M1a] **Interview-quality eval set:** about 20 rough requests, each with its expected slot outcomes and question count. It is kept small and run only on demand (as QA-063 is), never in CI, because it spends. Its results go in the milestone report.
+
+#### Milestones
+
+- **AI-193** [M1a] (decision) Prompt Studio is delivered in stages:
+  - **M1a**, v1, with the Image studio's generation work: the `image` target kind; briefs; the interview with the `provider` engine and the question bank; previews; the compiler with the `natural_sentences` and `tag_list` dialects; the tools; both surfaces; staging into the Generate panel; recall; promote.
+  - **M1b:** the `claude_code` engine; the assistant and director using these tools; the `edit_instruction` dialect with the edit adapters; references staged into the Generate panel's references (IMG-019).
+  - **M1.5:** the `local` engine; dialects for hosted image models as they arrive (AI-153).
+  - **Later:** the `video`, `audio`, `voice` and `llm_task` target kinds; a standalone Prompt Studio app (APP-149); live `lib:` links to promoted briefs.
+
 ### 4.8 Milestone scope
+
+Prompt Studio's milestones are set in AI-193: v1 for images with the `provider` engine in M1a, the `claude_code` engine in M1b, the `local` engine in M1.5, and further target kinds Later.
 
 #### M0 spike — Claude Code headless (pass/fail)
 
@@ -1425,7 +1682,7 @@ The Image studio (`ww-image`, §1) is the suite's first app: an Invoke-style AI 
 
 ### 5.1 Layout
 
-- **IMG-003** [M1a] The main area has tabs: **Canvas** (one per open document) and **ComfyUI** (the embedded web UI, §5.8, created on first show).
+- **IMG-003** [M1a] The main area has tabs: **Canvas** (one per open document), **ComfyUI** (the embedded web UI, §5.8, created on first show) and **Prompt Studio** (§3.6a, APP-149).
 - **IMG-004** [M1b] The main area adds a **Graph** tab (native node editor, §5.7).
 - **IMG-005** [M1a] Panels: the studio's own Generate, Layers, Layer properties, Tool options, Staging and History panels, plus the shared suite panels (§3.1, §3.6): Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant and Diagnostics. The Assistant panel arrives in M1b with the in-app assistant (§4.6). Diagnostics carries the event log and a backup status line, and in M1 it is where the Backups panel is reached (§3.6, §7.4); the separate Hub app is Later.
 - **IMG-006** [M1a] Layer properties is its own panel and is never placed under tool settings (a known Invoke pain point).
@@ -1576,7 +1833,7 @@ ComfyUI's own queue can't be reordered usefully: its "front" option is last-in-f
 
 - **IMG-097** [M1a] Architecture adapters are code. Each builds ComfyUI graphs from fragments for each operation and combination (inpaint + control + references + infill + scaling), since static templates can't cover the combinations. M1a ships the `zimage` adapter.
 - **IMG-098** [M1b] The `qwen_image_2_1` and `flux2` adapters.
-- **IMG-099** [M1a] (contract) A **model profile** is data on top of an adapter: model files (by hash), defaults, capabilities, required custom-node packs and the strength mapping (IMG-065).
+- **IMG-099** [M1a] (contract) A **model profile** is data on top of an adapter: model files (by hash), defaults, capabilities, required custom-node packs, the strength mapping (IMG-065) and the prompt dialect (IMG-173).
 - **IMG-100** [M1a] (contract) Profiles and user workflows are Library resources (§3.4) of the kinds `model_profile` and `workflow` (a workflow with marked slots). Profiles live in personal resources by default (models are machine-level), with workspace overrides.
 - **IMG-101** [M1a] (invariant) "Recipe" keeps meaning a run's provenance (§2.3). Recipes record the **profile's content hash**, not just its name, since profiles can be edited.
 - **IMG-102** [M1a] Model files are registered in `registry/models.yaml` (§4.5); a profile refers to them by hash; the task default `defaults.models.image_generate` names a profile.
@@ -1604,6 +1861,39 @@ ComfyUI's own queue can't be reordered usefully: its "front" option is last-in-f
 - **IMG-114** [M1a] The utilities as in the table needed by M1a operations (SAM 3.1, Depth Anything 3, `comfyui_controlnet_aux`, BiRefNet, Real-ESRGAN, tiny preview decoders); SeedVR2 comes with the M1b upscaling operations (IMG-074).
 - **IMG-115** [M1b] Model switching: ComfyUI keeps models cached in system RAM (the reference machine has well over 64 GB) and swaps them into VRAM; Z-Image and Qwen can't both stay resident, so switching between them costs a swap (measured in IMG-156). LoRA key mapping is confirmed in the ComfyUI 0.39.2 source for both Z-Image (Lumina2 architecture) and Qwen-Image-2.1.
 - **IMG-116** [M1a] Doctor checks ComfyUI's PyTorch/CUDA build from `/system_stats` (Qwen-Image 2.1 runs 3–4× slower on the CUDA 12.8 build). (M0 result, 2026-10-12: the test machine's ComfyUI was moved to PyTorch 2.11.0+cu130 during M0; the int8 Z-Image default (IMG-111) also needs the CUDA 13 build, as ComfyUI's optimised CUDA ops are disabled on cu128. `docs/spikes/08-comfy-measurements.md` §5.7.)
+
+### 5.6a Prompt dialects and image targets (Prompt Studio)
+
+The Image studio is Prompt Studio's first target (§4.7a). This subsection fixes the image dialects, which brief fields matter for each operation, how a compile maps onto the Generate panel, and how previews render.
+
+- **IMG-173** [M1a] (contract) Every architecture adapter (IMG-097) supplies a default prompt dialect (AI-180). A model profile (IMG-099) may name another dialect and override its length limits. The shipped dialects are:
+  - `natural_sentences` [M1a]: descriptive sentences, subject first. It is the Z-Image Turbo profile's dialect;
+  - `tag_list` [M1a]: comma-separated tags with `(term:1.2)` weights, for tag-trained models. The profiles that use it arrive with their adapters; it ships in M1a so that switching dialects is tested from the start;
+  - `edit_instruction` [M1b]: an imperative change plus what to keep ("Make the lantern brass; keep its shape and the background"). It is used by the instruction-edit operation on Qwen-Image 2.1 and FLUX.2 klein (IMG-071).
+- **IMG-174** [M1a] (contract) **Image target fields.** The brief's `image` section adds `edit.change`, `edit.keep` and `transparent_background`. Which slots are relevant, in priority order, depends on the operation:
+  - text-to-image: subject, purpose, placement, look, style, mood, colour, lighting, composition, camera, avoid;
+  - image-to-image and outpaint: as text-to-image, minus composition and camera, which the image already fixes;
+  - inpaint: the subject of the masked area, then style and lighting, so the result matches its surroundings;
+  - instruction edit: `edit.change`, then `edit.keep`.
+- **IMG-175** [M1a] (contract) **Settings hints for images:**
+  - `placement` maps to an aspect ratio and to a generation size snapped to the profile's preferred multiples (IMG-060). From M1b it also maps to transparent output where the profile supports it (IMG-076);
+  - strength for image-to-image, inpaint and edits goes through the profile's strength mapping (IMG-065);
+  - a different profile is only suggested, with a button to switch, and only when its capability state is *supported* or *installed* (IMG-104). The suite never switches it by itself;
+  - a style preset's LoRAs come with their trigger words (IMG-107);
+  - when the profile ignores negative prompts (IMG-065), the avoid list is phrased inline from the dialect's phrase table. Items with no inline phrasing are listed as "not expressible for this model".
+- **IMG-176** [M1a] (contract) **Generate panel.** A prompt box linked to a compile sends its `compile_id`, and any overrides, with the generation call. `image.generate`, `image.regenerate`, `image.inpaint` and `image.outpaint`, plus `image.edit` from M1b, accept them alongside the IMG-142 settings. The core then:
+  - records the overrides on the compile;
+  - seals the draft if it differs from the latest sealed version (AI-160);
+  - records the brief in the recipe (IMG-140).
+  
+  Switching the panel's profile recompiles a linked box (AI-179). Without overrides, the new text replaces the old as one undo step. With overrides, the overrides stay and the chip offers the new compile.
+- **IMG-177** [M1a] (contract) **Staging target.** `brief.stage_to` with `module: image` takes a `target` of `doc:<id>`, plus an optional frame. It fills that document's Generate panel as a staged card (APP-154): prompt, negative, profile suggestion, size, strength and LoRAs. It does nothing else (AI-186).
+- **IMG-178** [M1a] **Previews in the Image studio** (AI-181) render text-to-image:
+  - with the target profile when it is local and installed; otherwise with the `image_generate` default profile, labelled "preview with *profile*";
+  - at ≤ 512 px on the long side, snapped to the profile's multiples, with the profile's lowest recommended step count;
+  - with `preview_method` set, as for every prompt (IMG-045).
+  
+  They trim the canvas tile cache like any generation submit (IMG-040). Hosted image models are never used for previews.
 
 ### 5.7 Graph tab — native node editor (view, tweak, run)
 
@@ -1638,7 +1928,7 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
 - **IMG-137** [M1b] **Export** to TIFF 16-bit and OpenRaster (ORA, with a loss warning).
 - **IMG-138** [M1] (decision) ORA is import/export only; the Worldwright document is the canvas format.
 - **IMG-139** [M1a] Embedding the workflow in exports is off by default for documents (a multi-step document's single workflow would misrepresent it) and on by default for direct workflow outputs; an option embeds the document's recipe chain instead.
-- **IMG-140** [M1a] (contract) Every staged result and candidate records its recipe: profile (with content hash), model hashes, LoRAs, seed, prompt, frame and generation size, infill and mask settings, inputs (saved as files) and environment.
+- **IMG-140** [M1a] (contract) Every staged result and candidate records its recipe: profile (with content hash), model hashes, LoRAs, seed, prompt, frame and generation size, infill and mask settings, inputs (saved as files) and environment. When the prompt came from Prompt Studio, the recipe also records the brief ref `brf_…@<version>` with its content hash, the compile id and any overrides (AI-176, IMG-176).
 
 ### 5.10 Agents in the Image studio
 
@@ -1664,12 +1954,14 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
   - model profiles with capability states, the download/relink flow and basic LoRAs;
   - the ComfyUI tab;
   - PNG/JPEG/WebP export;
+  - Prompt Studio's image target: the `natural_sentences` and `tag_list` dialects, previews, the Generate panel link and staging (§5.6a, §4.7a);
   - agent tools for all of the above.
 - **IMG-149** [M1b] (decision) **M1b — completes the studio:**
   - Qwen-Image-2.1 and FLUX.2 klein adapters (instruction edit, references, transparent output);
   - the Graph tab (view, widget tweaks, mute/bypass, slots, run with its own UI → API conversion), plus **Run now** from Send to Worldwright and the saved-workflow fallback list;
   - workflow-on-layer;
   - LoRA base-family detection;
+  - the `edit_instruction` prompt dialect (IMG-173);
   - enhance layer / upscale image / upscale document with SeedVR2;
   - TIFF 16-bit and ORA export;
   - ~~the D3D12 path, if M0 favours it~~ (dropped: M0 did not favour it, so IMG-033 is withdrawn; M0 result, 2026-10-12).
@@ -2207,12 +2499,12 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 |---|---|---|---|---|---|---|---|
 | §1 Processes, connections, trust and repo layout | 1 | 112 | 1 | 0 | 4 | 6 | 124 |
 | §2 Core modules | 0 | 140 | 1 | 1 | 5 | 4 | 151 |
-| §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 4 | 3 | 3 | 11 | 139 |
-| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 0 | 75 | 15 | 4 | 156 |
-| §5 Image studio | 8 | 3 | 107 | 29 | 9 | 4 | 160 |
+| §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 11 | 3 | 3 | 11 | 146 |
+| §4 AI layer: providers, metering, assistant, Claude Code, Prompt Studio | 16 | 46 | 37 | 75 | 15 | 4 | 193 |
+| §5 Image studio | 8 | 3 | 113 | 29 | 9 | 4 | 166 |
 | §6 Errors, testing and quality | 1 | 84 | 0 | 1 | 0 | 1 | 87 |
 | §7 Sync, backup and builds | 2 | 83 | 0 | 0 | 20 | 3 | 108 |
-| **All** | **29** | **585** | **113** | **109** | **56** | **33** | **925** |
+| **All** | **29** | **585** | **163** | **109** | **56** | **33** | **975** |
 
 ## Appendix B. M0 spike checklist and facts to re-verify
 
