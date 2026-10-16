@@ -11,8 +11,7 @@
 //!
 //! **Draining** (ARCH-021 step 1). [`Lifecycle::begin_drain`] records the reason; from then
 //! on no new call is admitted ([`Lifecycle::try_call_started`]). [`Lifecycle::run_shutdown`]
-//! waits until no call is in flight and no blocker is busy, within the reason's budget
-//! counted from when the reason began:
+//! waits until no call is in flight and no blocker is busy, until the drain's deadline:
 //!
 //! | Reason | Wait |
 //! |---|---|
@@ -22,8 +21,13 @@
 //! | `Idle` | none |
 //!
 //! A later reason only escalates a drain: `Requested` or `Idle` < `TestParentGone` <
-//! `SessionEnd` < `Fatal`. So a logoff during an unlimited requested drain still gets its
-//! time-boxed shutdown, and a fatal error at any point exits 4.
+//! `SessionEnd` < `Fatal`. The deadline then becomes the earlier of the old one and the new
+//! reason's budget from now, so an escalation never extends the time box: a logoff during an
+//! unlimited requested drain still gets its 4.5 s, a fatal error during a session end keeps
+//! the session end's deadline, and a fatal error at any point exits 4.
+//!
+//! The core's idle exit is [`Lifecycle::drain_if_idle`]: the idle check and the drain under
+//! one lock, so a client that connects meanwhile never meets an idle exit.
 //!
 //! Then the [`ShutdownStep`]s run grouped by [`ShutdownPhase`], in the ARCH-021 order whatever
 //! the order they were registered in (registration order within a phase). The core then
@@ -166,8 +170,9 @@ struct Inner {
     /// Monotonic time the current idle period began; `None` while busy.
     idle_since: Option<Duration>,
     reason: Option<DrainReason>,
-    /// When `reason` began (its budget counts from then).
-    reason_since: Option<tokio::time::Instant>,
+    /// When the wait for running work ends; `None` with a reason: no limit. An escalation
+    /// can only bring it closer (`DrainReason::budget` from the escalation, or the old one).
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Shared {
@@ -210,7 +215,7 @@ impl Lifecycle {
                     steps: Vec::new(),
                     idle_since: Some(now),
                     reason: None,
-                    reason_since: None,
+                    deadline: None,
                 }),
                 changed: Notify::new(),
                 draining: CancellationToken::new(),
@@ -272,41 +277,84 @@ impl Lifecycle {
     /// `Some(Idle)` once the core has been idle for `idle_after`; `None` while it is busy, not
     /// idle long enough, or draining. It begins no drain itself.
     pub fn tick(&self) -> Option<DrainReason> {
-        let blockers = self.shared.lock().blockers.clone();
-        // Outside the lock: a blocker may take locks of its own.
-        let blocked = blockers.iter().any(|b| b.busy());
-        let now = self.shared.clock.monotonic();
+        let blocked = self.any_blocker_busy();
         let mut inner = self.shared.lock();
+        self.idle_long_enough(&mut inner, blocked)
+            .then_some(DrainReason::Idle)
+    }
+
+    /// [`Lifecycle::tick`] and [`Lifecycle::begin_drain`]`(Idle)` in one step: the counts
+    /// are checked and the drain begun under one lock, so a client that connects meanwhile
+    /// is never met by an idle exit. True if the idle drain began.
+    pub fn drain_if_idle(&self) -> bool {
+        let blocked = self.any_blocker_busy();
+        {
+            let mut inner = self.shared.lock();
+            if !self.idle_long_enough(&mut inner, blocked) {
+                return false;
+            }
+            Self::set_reason(&mut inner, DrainReason::Idle);
+        }
+        self.drain_begun();
+        true
+    }
+
+    /// Whether some blocker is busy. Looked at outside the lock: a blocker may take locks of
+    /// its own.
+    fn any_blocker_busy(&self) -> bool {
+        let blockers = self.shared.lock().blockers.clone();
+        blockers.iter().any(|b| b.busy())
+    }
+
+    /// The idle decision, under the lock (module docs).
+    fn idle_long_enough(&self, inner: &mut Inner, blocked: bool) -> bool {
         if inner.reason.is_some() {
-            return None;
+            return false;
         }
         if blocked || inner.connections > 0 || inner.in_flight > 0 {
             inner.idle_since = None;
-            return None;
+            return false;
         }
+        let now = self.shared.clock.monotonic();
         let since = *inner.idle_since.get_or_insert(now);
-        (now.saturating_sub(since) >= self.shared.idle_after).then_some(DrainReason::Idle)
+        now.saturating_sub(since) >= self.shared.idle_after
     }
 
     /// Begins draining for `r`. On a core that already drains, `r` only escalates the drain
     /// (module docs): a requested or idle drain becomes a session-end, test-parent or fatal
     /// one, and any drain becomes fatal; anything else changes nothing.
     pub fn begin_drain(&self, r: DrainReason) {
-        {
-            let mut inner = self.shared.lock();
-            match &inner.reason {
-                None => tracing::info!(reason = %r, "the core drains"),
-                Some(current) if r.urgency() > current.urgency() => {
-                    tracing::info!(from = %current, to = %r, "the drain escalates");
-                }
-                Some(current) => {
-                    tracing::debug!(current = %current, ignored = %r, "the core is already draining");
-                    return;
-                }
-            }
-            inner.reason = Some(r);
-            inner.reason_since = Some(tokio::time::Instant::now());
+        if Self::set_reason(&mut self.shared.lock(), r) {
+            self.drain_begun();
         }
+    }
+
+    /// Records `r` if it begins or escalates the drain (false: nothing changed). An
+    /// escalation keeps the earlier deadline when that comes first, so it never extends the
+    /// time box: a session end's window still returns after its 4.5 s.
+    fn set_reason(inner: &mut Inner, r: DrainReason) -> bool {
+        match &inner.reason {
+            None => tracing::info!(reason = %r, "the core drains"),
+            Some(current) if r.urgency() > current.urgency() => {
+                tracing::info!(from = %current, to = %r, "the drain escalates");
+            }
+            Some(current) => {
+                tracing::debug!(current = %current, ignored = %r, "the core is already draining");
+                return false;
+            }
+        }
+        let new = r.budget().map(|b| tokio::time::Instant::now() + b);
+        inner.deadline = match (inner.reason.is_some(), inner.deadline, new) {
+            (true, Some(old), Some(new)) => Some(old.min(new)),
+            (true, Some(old), None) => Some(old),
+            (_, _, new) => new,
+        };
+        inner.reason = Some(r);
+        true
+    }
+
+    /// After a reason was recorded: wakes everything waiting for a drain or watching it.
+    fn drain_begun(&self) {
         self.shared.draining.cancel();
         self.shared.changed.notify_waiters();
     }
@@ -363,9 +411,8 @@ impl Lifecycle {
         }
     }
 
-    /// Returns once no call is in flight and no blocker is busy, or once the budget of the
-    /// drain's reason is spent, counted from when that reason began (an escalation starts
-    /// its own budget).
+    /// Returns once no call is in flight and no blocker is busy, or once the drain's deadline
+    /// has passed (module docs).
     async fn wait_for_work(&self) {
         loop {
             let changed = self.shared.changed.notified();
@@ -373,23 +420,22 @@ impl Lifecycle {
             // Registered before the check, so a call ending (or an escalation) in between is
             // not missed.
             changed.as_mut().enable();
-            let (reason, since, in_flight, blockers) = {
+            let (reason, deadline, in_flight, blockers) = {
                 let inner = self.shared.lock();
                 (
                     inner.reason.clone(),
-                    inner.reason_since,
+                    inner.deadline,
                     inner.in_flight,
                     inner.blockers.clone(),
                 )
             };
-            let (Some(reason), Some(since)) = (reason, since) else {
+            let Some(reason) = reason else {
                 return;
             };
             let blocked = blockers.iter().any(|b| b.busy());
             if in_flight == 0 && !blocked {
                 return;
             }
-            let deadline = reason.budget().map(|budget| since + budget);
             if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
                 if !reason.budget().is_some_and(|b| b.is_zero()) {
                     tracing::warn!(
@@ -722,6 +768,90 @@ mod tests {
         assert_eq!(lc.drain_reason(), Some(DrainReason::Idle));
         lc.begin_drain(fatal());
         assert_eq!(lc.drain_reason(), Some(fatal()));
+    }
+
+    #[tokio::test(start_paused = true)] // spec: ARCH-021
+    async fn escalation_never_extends_the_time_box() {
+        // The session ends; a fatal error 4 s later keeps the session end's deadline (the
+        // window gives up after 4.5 s, and Windows ends the process then).
+        let lc = lifecycle(&FakeClock::new());
+        let _stuck = lc.call_started();
+        let started = tokio::time::Instant::now();
+        lc.begin_drain(DrainReason::SessionEnd);
+        let running = lc.clone();
+        let shutdown = tokio::spawn(async move { running.run_shutdown().await });
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        lc.begin_drain(DrainReason::Fatal("state".into()));
+        let report = shutdown.await.unwrap();
+        assert_eq!(started.elapsed(), SESSION_END_BUDGET);
+        assert_eq!(report.reason, DrainReason::Fatal("state".into()));
+        assert_eq!(report.exit_code(), 4);
+
+        // The test parent goes; the session ends 1 s later: the earlier 5 s deadline holds.
+        let lc = lifecycle(&FakeClock::new());
+        let _stuck = lc.call_started();
+        let started = tokio::time::Instant::now();
+        lc.begin_drain(DrainReason::TestParentGone);
+        let running = lc.clone();
+        let shutdown = tokio::spawn(async move { running.run_shutdown().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        lc.begin_drain(DrainReason::SessionEnd);
+        let report = shutdown.await.unwrap();
+        assert_eq!(started.elapsed(), FATAL_BUDGET);
+        assert_eq!(report.reason, DrainReason::SessionEnd);
+
+        // A requested drain has no deadline: the session end's budget counts from the end.
+        let lc = lifecycle(&FakeClock::new());
+        let _stuck = lc.call_started();
+        lc.begin_drain(DrainReason::Requested);
+        let running = lc.clone();
+        let shutdown = tokio::spawn(async move { running.run_shutdown().await });
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        let ended = tokio::time::Instant::now();
+        lc.begin_drain(DrainReason::SessionEnd);
+        shutdown.await.unwrap();
+        assert_eq!(ended.elapsed(), SESSION_END_BUDGET);
+    }
+
+    /// A blocker that opens a connection the first time it is looked at: a client that
+    /// connects while the idle check runs.
+    struct ConnectsOnce(std::sync::Weak<Lifecycle>, AtomicBool);
+
+    impl IdleBlocker for ConnectsOnce {
+        fn name(&self) -> &'static str {
+            "connects once"
+        }
+        fn busy(&self) -> bool {
+            if !self.1.swap(true, Ordering::SeqCst)
+                && let Some(lc) = self.0.upgrade()
+            {
+                lc.connection_opened();
+            }
+            false
+        }
+    }
+
+    #[test] // spec: ARCH-020
+    fn idle_drain_is_decided_under_the_lock() {
+        let clock = FakeClock::new();
+        let lc = lifecycle(&clock);
+        clock.advance(Duration::from_secs(599));
+        assert!(!lc.drain_if_idle(), "not idle long enough");
+        clock.advance(Duration::from_secs(1));
+        lc.add_blocker(Arc::new(ConnectsOnce(
+            Arc::downgrade(&lc),
+            AtomicBool::new(false),
+        )));
+        assert!(
+            !lc.drain_if_idle(),
+            "a client connected while the idle check ran"
+        );
+        assert!(!lc.is_draining());
+        lc.connection_closed();
+        clock.advance(Duration::from_secs(600));
+        assert!(lc.drain_if_idle());
+        assert_eq!(lc.drain_reason(), Some(DrainReason::Idle));
+        assert!(!lc.drain_if_idle(), "already draining");
     }
 
     #[tokio::test(start_paused = true)] // spec: ARCH-021

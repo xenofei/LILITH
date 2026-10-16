@@ -86,6 +86,8 @@ struct Conn {
     /// Cancelled once the hello succeeded or was refused, or the connection closed: ends the
     /// hello timeout.
     hello_settled: CancellationToken,
+    /// Cancelled in [`Router::closed`]: ends the tasks watching this connection.
+    ended: CancellationToken,
 }
 
 /// The core's router.
@@ -154,13 +156,14 @@ impl RpcRouter {
     /// Settles `conn` as refused: it stops counting towards idle and is closed once the core
     /// drains (ruling P23).
     fn refuse(&self, conn: &ConnCtx, client_major: u16) {
-        let uncount = match self.conns().get_mut(&conn.conn_id) {
+        let (uncount, ended) = match self.conns().get_mut(&conn.conn_id) {
             Some(c) => {
                 c.state = ConnState::Refused { client_major };
                 c.hello_settled.cancel();
-                std::mem::replace(&mut c.counted, false)
+                (std::mem::replace(&mut c.counted, false), c.ended.clone())
             }
-            None => false,
+            // Closed meanwhile: nothing to count or watch.
+            None => return,
         };
         if uncount {
             self.lifecycle.connection_closed();
@@ -169,11 +172,14 @@ impl RpcRouter {
             // Closing now could beat the refusal to the client; the pipe's close ends it.
             return;
         }
+        // Ends with the connection however it ends (an older client polling the core must
+        // not leave a task behind per connection).
         let (draining, close) = (self.lifecycle.drain_token(), conn.close.clone());
         tokio::spawn(async move {
             tokio::select! {
                 () = draining.cancelled() => close.cancel(),
                 () = close.cancelled() => {}
+                () = ended.cancelled() => {}
             }
         });
     }
@@ -517,6 +523,7 @@ impl Router for RpcRouter {
                 state: ConnState::AwaitingHello,
                 counted: true,
                 hello_settled: hello_settled.clone(),
+                ended: CancellationToken::new(),
             },
         );
         let close = conn.close.clone();
@@ -551,6 +558,7 @@ impl Router for RpcRouter {
             let mut conns = self.conns();
             let counted = conns.remove(&conn.conn_id).is_some_and(|gone| {
                 gone.hello_settled.cancel();
+                gone.ended.cancel();
                 gone.counted
             });
             // Under the map lock: see the module docs on events.

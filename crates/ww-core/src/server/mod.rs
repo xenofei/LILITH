@@ -442,8 +442,7 @@ async fn tick_idle(lifecycle: Arc<Lifecycle>, idle_after: Duration) {
         if lifecycle.is_draining() {
             return;
         }
-        if let Some(reason) = lifecycle.tick() {
-            lifecycle.begin_drain(reason);
+        if lifecycle.drain_if_idle() {
             return;
         }
     }

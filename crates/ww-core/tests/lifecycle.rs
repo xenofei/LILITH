@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use ww_core::lifecycle::{DrainReason, ShutdownPhase, ShutdownStep};
 use ww_core::state::StateError;
-use ww_core::{CoreConfig, CoreThread, start_in_thread};
+use ww_core::{CoreConfig, CoreThread, start, start_in_thread};
 use ww_platform::session_end::SessionEnd;
 use ww_testkit::{CoreFixture, FakeClock, RawPipe, SeqIds, TestEnv};
 
@@ -315,4 +315,70 @@ fn refused_connection_does_not_hold_idle_and_closes_on_drain() {
     core.core().test_gates().open("h");
     let report = core.wait_stopped(DEADLINE).expect("the core stops");
     assert_eq!(report.reason, DrainReason::Requested);
+}
+
+/// One older client: connects, says hello with protocol 0.9, reads the refusal, hangs up.
+async fn refused_cycle(pipe: &str) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use ww_platform::pipe::{ConnectError, open_client};
+
+    let deadline = Instant::now() + DEADLINE;
+    let client = loop {
+        match open_client(pipe) {
+            Ok(client) => break client,
+            Err(ConnectError::Busy) if Instant::now() < deadline => {
+                tokio::time::sleep(POLL).await;
+            }
+            Err(e) => panic!("cannot connect to {pipe}: {e}"),
+        }
+    };
+    let (read, mut write) = tokio::io::split(client);
+    let hello = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "core/hello",
+        "params": ww_testkit::merge_hello(json!({"protocol": "0.9"})),
+    });
+    write
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .expect("write the hello");
+    let mut line = String::new();
+    BufReader::new(read)
+        .read_line(&mut line)
+        .await
+        .expect("read the refusal");
+    assert!(line.contains("protocol.incompatible"), "{line}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-014, ARCH-020
+async fn refused_connections_leave_no_task_behind() {
+    let env = TestEnv::new();
+    let core = start(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        ..CoreConfig::for_env(env.env.clone()).expect("core config")
+    })
+    .await
+    .expect("the core starts");
+    let pipe = env.env.pipe_name();
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+
+    // An older client polling the core (ARCH-014): every connection ends, and so must every
+    // task it started.
+    for _ in 0..20 {
+        refused_cycle(&pipe).await;
+    }
+    let deadline = Instant::now() + DEADLINE;
+    while metrics.num_alive_tasks() > baseline {
+        assert!(
+            Instant::now() < deadline,
+            "{} tasks are alive after 20 refused connections closed; {baseline} before",
+            metrics.num_alive_tasks()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    assert!(!core.lifecycle().is_draining());
+    core.request_drain();
+    assert_eq!(core.wait().await.reason, DrainReason::Requested);
 }
