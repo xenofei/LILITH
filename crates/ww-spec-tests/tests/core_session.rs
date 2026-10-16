@@ -103,9 +103,10 @@ fn drain_is_the_only_call_after_incompatible_hello() {
     assert_eq!(drain["result"]["status"], "ok", "{drain}");
 
     drop(pipe);
-    assert!(
-        core.wait_exit(DEADLINE).is_some(),
-        "the core still runs {DEADLINE:?} after an accepted core/drain"
+    assert_eq!(
+        core.wait_exit(DEADLINE),
+        Some(0),
+        "an accepted core/drain ends the core with exit code 0 within {DEADLINE:?}"
     );
 }
 
