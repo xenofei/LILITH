@@ -1,0 +1,8 @@
+# Synthetic sample workspace for the spec tests: made up, not copied from a real workspace.
+name: Sample workspace
+created: 2026-10-01
+defaults:                         # inherited by every project unless it overrides them
+  vcs: git+lfs
+  models: {}                      # default model per task; empty means "use the routing matrix"
+routing: {litellm_proxy: null}
+tools: {}                         # local install locations (not secrets)

@@ -1,0 +1,67 @@
+{
+  "asset_id": "prop_signal_lamp",
+  "project": "sketchbook",
+  "module": "concept",
+  "type": "prop_2d",
+  "version": "1.0.0",
+  "status": "candidate",
+  "status_reason": null,
+  "license_scope": "personal",
+  "commercial_use": false,
+  "content_rating": "general",
+  "budget_usd": 0.5,
+  "notes": "Ünïcödé space",
+  "recipe": [
+    {
+      "step": "concept",
+      "tool": "comfyui",
+      "model": "sample-image-model",
+      "seeds": [
+        101,
+        102
+      ],
+      "prompt_ref": "prompts/signal_lamp.txt"
+    },
+    {
+      "step": "cutout",
+      "tool": "sample-cutout-tool",
+      "input": "v1.0.0/prop_signal_lamp.png"
+    }
+  ],
+  "legacy_tool": {
+    "name": "sample-tool",
+    "settings": {
+      "sampler": "euler",
+      "steps": 20,
+      "extras": null
+    }
+  },
+  "files": [
+    {
+      "path": "v1.0.0/signal_lamp_a.png",
+      "kind": "candidate"
+    },
+    {
+      "path": "v1.0.0/signal_lamp_b.png",
+      "kind": "candidate"
+    },
+    {
+      "path": "v1.0.0/prop_signal_lamp.png",
+      "kind": "chosen"
+    },
+    {
+      "path": "v1.0.0/prop_signal_lamp_cutout.png",
+      "kind": "derived"
+    }
+  ],
+  "selected": "v1.0.0/prop_signal_lamp.png",
+  "author": "sample-author",
+  "hashes": {
+    "v1.0.0/notes.txt": "59e5f69770e610a1d289a197674768cd4baffaef41d7c31b1b33fc82d1e04e31",
+    "v1.0.0/prop_signal_lamp.png": "4564ff7231849624a5b632fff8c1e3e0219d4fb8612ef1bb83263001079c2772",
+    "v1.0.0/prop_signal_lamp_cutout.png": "5fdf52b823829b8847e5de634b7bfaeef3c82f38c1055e0077b37ac48444c449",
+    "v1.0.0/signal_lamp_a.png": "0eaf94256e9ad75cf113dceeb38e3c2730ae35d2888f625f6418165b41f743d3",
+    "v1.0.0/signal_lamp_b.png": "5cd3c91a2cdc2ee698eabfe804b94b30db24f3dccb166a26eb06718830bc6b52"
+  },
+  "created": "2026-09-20T10:00:00Z"
+}

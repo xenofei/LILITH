@@ -1,0 +1,9 @@
+# ARCH-076 / CORE-148: edits never reorder existing manifest keys.
+# With serde_json's `preserve_order`, `Map::remove` and `Map::remove_entry` behave like
+# `swap_remove` (serde_json's own docs): the last key moves into the removed slot. Use
+# `shift_remove` (`Manifest::remove`, `manifest::remove_key`) instead.
+
+disallowed-methods = [
+    { path = "serde_json::Map::remove", reason = "ARCH-076: swap_remove under preserve_order; use shift_remove (manifest::remove_key)" },
+    { path = "serde_json::Map::remove_entry", reason = "ARCH-076: swap_remove under preserve_order; use shift_remove_entry" },
+]
