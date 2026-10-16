@@ -7,7 +7,7 @@ use std::path::Path;
 /// Writes `bytes` to `path` atomically: the data goes to `<path>.tmp-<pid>`, is flushed to disk
 /// with `sync_all`, and is then renamed over the target.
 ///
-/// This is a stub that plan 2 completes (directory fsync, crash-recovery of stale temp files,
+/// This is a stub that plan 2b completes (directory fsync, crash-recovery of stale temp files,
 /// failure injection).
 ///
 /// On Windows, `std::fs::rename` replaces an existing target (MoveFileEx with

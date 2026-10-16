@@ -3,8 +3,9 @@
 //! `suite.toml`, else none. A workspace is named by its id: the 16-hex hash of its canonical
 //! path (`Env::workspace_hash`), the same id the core computes.
 
+use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ww_platform::Env;
 use ww_protocol::NO_WORKSPACE;
@@ -15,7 +16,56 @@ use crate::ClientError;
 /// The file that makes a folder a Worldwright workspace.
 pub const WORKSPACE_MANIFEST: &str = "worldwright.yaml";
 
-/// The workspace id for a `cli` caller (ARCH-030):
+/// Which step of the `cli` chain named the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSource {
+    /// `--workspace <PATH>`.
+    Flag,
+    /// The current folder, or a folder above it, holds `worldwright.yaml`.
+    CurrentFolder,
+    /// `default_workspace` in `suite.toml`.
+    Default,
+}
+
+impl fmt::Display for WorkspaceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            WorkspaceSource::Flag => "named by --workspace",
+            WorkspaceSource::CurrentFolder => "found from the current folder",
+            WorkspaceSource::Default => "the default workspace in suite.toml",
+        })
+    }
+}
+
+/// Where a named workspace came from: its folder as the chain found it, and the step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceOrigin {
+    pub path: PathBuf,
+    pub source: WorkspaceSource,
+}
+
+/// What the `cli` chain resolved: the id said in `core/hello`, and where it came from
+/// (`None` for `"none"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkspace {
+    /// A 16-hex workspace id, or `"none"`.
+    pub id: String,
+    pub origin: Option<WorkspaceOrigin>,
+}
+
+/// The workspace id for a `cli` caller (ARCH-030): [`resolve_workspace`] without its origin.
+///
+/// # Errors
+/// As [`resolve_workspace`].
+pub fn resolve_workspace_id(
+    env: &Env,
+    explicit: Option<&Path>,
+    cwd: &Path,
+) -> Result<String, ClientError> {
+    resolve_workspace(env, explicit, cwd).map(|ws| ws.id)
+}
+
+/// The workspace for a `cli` caller (ARCH-030), with where it came from:
 /// 1. `explicit` (relative to `cwd` when relative), which must contain `worldwright.yaml`;
 /// 2. else the nearest folder from `cwd` upwards that contains `worldwright.yaml`;
 /// 3. else `default_workspace` in the channel's `suite.toml`;
@@ -24,11 +74,24 @@ pub const WORKSPACE_MANIFEST: &str = "worldwright.yaml";
 /// # Errors
 /// [`ClientError::Io`] with a plain message when the explicit path is not a workspace, when
 /// `suite.toml` cannot be read, or when the default workspace's folder does not exist.
-pub fn resolve_workspace_id(
+pub fn resolve_workspace(
     env: &Env,
     explicit: Option<&Path>,
     cwd: &Path,
-) -> Result<String, ClientError> {
+) -> Result<ResolvedWorkspace, ClientError> {
+    let found = |path: &Path, source: WorkspaceSource| -> Result<ResolvedWorkspace, ClientError> {
+        Ok(ResolvedWorkspace {
+            id: id_of(path)?,
+            origin: Some(WorkspaceOrigin {
+                path: path.to_path_buf(),
+                source,
+            }),
+        })
+    };
+    let none = || ResolvedWorkspace {
+        id: NO_WORKSPACE.to_string(),
+        origin: None,
+    };
     if let Some(explicit) = explicit {
         let path = cwd.join(explicit);
         if !path.join(WORKSPACE_MANIFEST).is_file() {
@@ -40,18 +103,18 @@ pub fn resolve_workspace_id(
                 ),
             ));
         }
-        return id_of(&path);
+        return found(&path, WorkspaceSource::Flag);
     }
     if let Some(dir) = cwd
         .ancestors()
         .find(|dir| dir.join(WORKSPACE_MANIFEST).is_file())
     {
-        return id_of(dir);
+        return found(dir, WorkspaceSource::CurrentFolder);
     }
     let file = env.suite_toml();
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(NO_WORKSPACE.to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(none()),
         Err(e) => {
             return Err(plain(
                 e.kind(),
@@ -75,7 +138,13 @@ pub fn resolve_workspace_id(
         Some(default) => {
             let path = Path::new(default);
             std::fs::canonicalize(path)
-                .map(|canonical| Env::workspace_hash(&canonical))
+                .map(|canonical| ResolvedWorkspace {
+                    id: Env::workspace_hash(&canonical),
+                    origin: Some(WorkspaceOrigin {
+                        path: path.to_path_buf(),
+                        source: WorkspaceSource::Default,
+                    }),
+                })
                 .map_err(|e| {
                     plain(
                         e.kind(),
@@ -87,7 +156,7 @@ pub fn resolve_workspace_id(
                     )
                 })
         }
-        None => Ok(NO_WORKSPACE.to_string()),
+        None => Ok(none()),
     }
 }
 
@@ -175,6 +244,39 @@ mod tests {
             id(&explicit)
         );
         assert_eq!(id(&explicit).len(), 16);
+    }
+
+    #[test] // spec: ARCH-030
+    fn the_chain_says_where_the_workspace_came_from() {
+        let env = TestEnv::new();
+        let outside = mkdir(env.root().join("outside"));
+        let origin = |explicit: Option<&Path>, cwd: &Path| {
+            resolve_workspace(&env.env, explicit, cwd)
+                .unwrap()
+                .origin
+                .map(|o| (o.source, o.path))
+        };
+        assert_eq!(origin(None, &outside), None);
+        let default = env.make_workspace("default");
+        env.register_workspace(&default, true);
+        assert_eq!(
+            origin(None, &outside),
+            Some((WorkspaceSource::Default, default.clone()))
+        );
+        let here = env.make_workspace("here");
+        let deep = mkdir(here.join("sub"));
+        assert_eq!(
+            origin(None, &deep),
+            Some((WorkspaceSource::CurrentFolder, here.clone()))
+        );
+        assert_eq!(
+            origin(Some(&default), &deep),
+            Some((WorkspaceSource::Flag, default.clone()))
+        );
+        assert_eq!(
+            resolve_workspace(&env.env, None, &deep).unwrap().id,
+            id(&here)
+        );
     }
 
     #[test] // spec: ARCH-030

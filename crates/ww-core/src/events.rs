@@ -17,6 +17,9 @@
 //!   ever waits on a slow client. When [`EventBus::publish`] finds a client's queue full, it
 //!   clears the queue and queues one `resync_required` per topic the client subscribes to, at
 //!   that topic's current seq. Responses are never dropped: only the bus queue overflows.
+//! - **Line cap** (ARCH-025). Each event's line is encoded once, when it is published (or
+//!   when a snapshot is taken), and shared by every queue and the history. A line that would
+//!   pass 4 MiB is replaced there by `resync_required` for its topic and seq, and logged.
 //! - **Forwarder lifetime.** A forwarder ends when its client is dropped
 //!   ([`EventBus::drop_client`], from `Router::closed`), re-attached, or the bus is dropped,
 //!   and when the outbound channel closes.
@@ -35,7 +38,8 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use ww_platform::Clock;
 use ww_protocol::{
-    CLIENT_QUEUE, EventKind, EventParams, HISTORY_SECS, TopicState, encode_notification, method,
+    CLIENT_QUEUE, EventKind, EventParams, HISTORY_SECS, TopicState, encode_notification, fits_line,
+    method,
 };
 
 /// A client of the bus: the connection's `ConnCtx::conn_id`.
@@ -411,16 +415,31 @@ fn prune(history: &mut VecDeque<Retained>, now: Duration) {
     }
 }
 
-/// The `ww/event` notification line of one event.
+/// The `ww/event` notification line of one event. A line that would pass the 4 MiB cap
+/// (ARCH-025) is never sent: it is logged and replaced by `resync_required` for the same topic
+/// and seq, so the subscriber knows it missed something.
 fn event_line(topic: &str, seq: u64, kind: EventKind, data: Value) -> Arc<str> {
-    let params = EventParams {
-        topic: topic.to_string(),
-        seq,
-        kind,
-        data,
+    let encode = |kind: EventKind, data: Value| {
+        let params = EventParams {
+            topic: topic.to_string(),
+            seq,
+            kind,
+            data,
+        };
+        let params = serde_json::to_value(&params).expect("EventParams serialise");
+        encode_notification(method::EVENT, &params)
     };
-    let params = serde_json::to_value(&params).expect("EventParams serialise");
-    Arc::from(encode_notification(method::EVENT, &params))
+    let line = encode(kind, data);
+    if fits_line(&line) {
+        return Arc::from(line);
+    }
+    tracing::warn!(
+        topic,
+        seq,
+        bytes = line.len(),
+        "an event was too large to send; subscribers get resync_required instead"
+    );
+    Arc::from(encode(EventKind::ResyncRequired, Value::Null))
 }
 
 /// A client's forwarder: moves its queued events into `outbound`, in order, until `stop` is
@@ -776,6 +795,39 @@ mod tests {
         let next = parse_line(&next_line(&mut rx).await.unwrap());
         assert_eq!(next, event("test:b", 1, EventKind::Event, json!("b1")));
         assert_eq!(bus.queued(5), 0);
+    }
+
+    #[tokio::test] // spec: ARCH-025, ARCH-032
+    async fn oversized_event_becomes_resync_required() {
+        let (_clock, bus) = bus();
+        let (tx, mut rx) = mpsc::channel(16);
+        bus.attach(6, tx);
+        bus.subscribe(6, &names(&["test:a"]), &cursors(&[]));
+
+        // An event whose line would pass the 4 MiB cap is never sent: the subscriber gets
+        // resync_required for its topic and seq instead, and later events flow as usual.
+        let seq = bus.publish("test:a", json!("x".repeat(ww_protocol::MAX_LINE_BYTES)));
+        let line = next_line(&mut rx).await.unwrap();
+        assert!(ww_protocol::fits_line(&line), "{} bytes", line.len());
+        assert_eq!(
+            parse_line(&line),
+            event("test:a", seq, EventKind::ResyncRequired, Value::Null)
+        );
+        bus.publish("test:a", json!("small"));
+        assert_eq!(
+            parse_line(&next_line(&mut rx).await.unwrap()),
+            event("test:a", seq + 1, EventKind::Event, json!("small"))
+        );
+
+        // A replay from the history gets the same replacement.
+        bus.subscribe(7, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        assert_eq!(
+            bus.queued_events(7),
+            [
+                event("test:a", seq, EventKind::ResyncRequired, Value::Null),
+                event("test:a", seq + 1, EventKind::Event, json!("small")),
+            ]
+        );
     }
 
     #[test] // spec: ARCH-032

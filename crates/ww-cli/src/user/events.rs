@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use super::{EXIT_OK, Exit, GlobalArgs, cannot_run, connect, print_line};
+use super::{EXIT_OK, Exit, GlobalArgs, UnknownCwdWorkspace, cannot_run, connect, print_line};
 
 pub(super) fn run(global: &GlobalArgs, topics: Vec<String>, since: &[String]) -> Result<i32, Exit> {
     let since = cursors(&topics, since).map_err(cannot_run)?;
-    let Some(client) = connect(global)? else {
+    let Some(client) = connect(global, UnknownCwdWorkspace::Fail)? else {
         return Ok(EXIT_OK);
     };
     let events = client.subscribe(topics, since).map_err(cannot_run)?;

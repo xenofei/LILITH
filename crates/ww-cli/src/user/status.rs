@@ -4,10 +4,13 @@
 use serde_json::json;
 use ww_protocol::HelloResult;
 
-use super::{EXIT_NOT_RUNNING, EXIT_OK, Exit, GlobalArgs, cannot_run, connect, print_line};
+use super::{
+    EXIT_NOT_RUNNING, EXIT_OK, Exit, GlobalArgs, UnknownCwdWorkspace, cannot_run, connect,
+    print_line,
+};
 
 pub(super) fn run(global: &GlobalArgs, json: bool) -> Result<i32, Exit> {
-    let Some(client) = connect(global)? else {
+    let Some(client) = connect(global, UnknownCwdWorkspace::WarnAndUseNone)? else {
         let text = if json {
             json!({ "running": false }).to_string()
         } else {

@@ -240,8 +240,10 @@ impl Lifecycle {
         self.shared.changed.notify_waiters();
     }
 
-    /// A call starts, draining or not; it is in flight until the guard is dropped.
-    pub fn call_started(&self) -> CallGuard {
+    /// A call starts, draining or not; it is in flight until the guard is dropped. Unit tests
+    /// only: the dispatcher admits calls with [`Lifecycle::try_call_started`].
+    #[cfg(test)]
+    pub(crate) fn call_started(&self) -> CallGuard {
         let mut inner = self.shared.lock();
         inner.in_flight += 1;
         inner.idle_since = None;
@@ -250,8 +252,9 @@ impl Lifecycle {
         }
     }
 
-    /// [`Lifecycle::call_started`], unless a drain has begun: then `None`, atomically with
-    /// the drain (a call is either admitted before the drain and waited for, or refused).
+    /// A call starts: it is in flight until the guard is dropped. Unless a drain has begun:
+    /// then `None`, atomically with the drain (a call is either admitted before the drain and
+    /// waited for, or refused).
     pub fn try_call_started(&self) -> Option<CallGuard> {
         let mut inner = self.shared.lock();
         if inner.reason.is_some() {

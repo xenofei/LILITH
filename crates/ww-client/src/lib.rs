@@ -4,11 +4,13 @@
 //! [`Client::connect`] finds the channel's core, or starts one on demand as a detached
 //! process (ARCH-004, ARCH-018, ARCH-019). It verifies the process serving the pipe before
 //! saying anything to it (ARCH-027), then says `core/hello` (ARCH-029). A core with an older
-//! major protocol is drained and replaced; a newer one is left running and this client reports
-//! itself incompatible (ARCH-023, ARCH-014). The client then calls tools, minting idempotency
-//! keys (ARCH-110), and follows events (ARCH-032). [`drain_and_wait`] is `ww core stop`.
-//! [`resolve_workspace_id`] is the `cli` workspace chain (ARCH-030). [`blocking`] wraps all of
-//! it for synchronous callers such as `ww`.
+//! major protocol is drained and replaced (unless the client may not start a core); a newer
+//! one is left running and this client reports itself incompatible (ARCH-023, ARCH-014). The
+//! client then calls tools, minting idempotency keys (ARCH-110), and follows events
+//! (ARCH-032). [`drain_and_wait`] is `ww core stop`. [`resolve_workspace`] is the `cli`
+//! workspace chain (ARCH-030); a core that does not know the workspace it names is
+//! [`ClientError::UnknownWorkspace`], naming the folder. [`blocking`] wraps all of it for
+//! synchronous callers such as `ww`.
 //!
 //! Deferred to plan 4: reconnecting and resubscribing after a core restart (APP-034/035;
 //! `HelloResult::instance_id` already tells a client that a core restarted), and QA-026's
@@ -37,7 +39,10 @@ use ww_protocol::{
 
 pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
-pub use workspace::{WORKSPACE_MANIFEST, resolve_workspace_id};
+pub use workspace::{
+    ResolvedWorkspace, WORKSPACE_MANIFEST, WorkspaceOrigin, WorkspaceSource, resolve_workspace,
+    resolve_workspace_id,
+};
 
 /// The start of an `Untrusted` reason for a core of the current user whose executable is in
 /// another folder: the one case `ww core stop` can clear (`drain_and_wait` asks only cores of
@@ -64,6 +69,9 @@ pub struct ClientConfig {
     pub non_interactive: bool,
     /// A 16-hex workspace id, or `"none"` ([`resolve_workspace_id`]).
     pub workspace: String,
+    /// Where `workspace` came from, when the `cli` chain named it: a core that does not know
+    /// it is then [`ClientError::UnknownWorkspace`], naming the folder, not the id.
+    pub workspace_origin: Option<WorkspaceOrigin>,
     pub start: StartPolicy,
     /// The core executable to start.
     pub core_exe: PathBuf,
@@ -104,6 +112,7 @@ impl ClientConfig {
             caller_kind,
             non_interactive: false,
             workspace: NO_WORKSPACE.to_string(),
+            workspace_origin: None,
             start: StartPolicy::StartIfNeeded,
             core_exe: own_dir.join(CORE_EXE),
             server_dirs,
@@ -114,6 +123,12 @@ impl ClientConfig {
             spawn_env: Vec::new(),
         })
     }
+
+    /// Names `ws` in `core/hello`: its id, and where it came from.
+    pub fn set_workspace(&mut self, ws: ResolvedWorkspace) {
+        self.workspace = ws.id;
+        self.workspace_origin = ws.origin;
+    }
 }
 
 /// Why a core this client started could not start, from its exit code.
@@ -123,7 +138,8 @@ pub enum StartFailure {
     StateDamaged,
     /// Exit code 6: the suite `state.db` is from a newer version; nothing was changed.
     StateTooNew,
-    /// Any other exit code; the core's log says why.
+    /// Any other exit code; the core's log may say why (a core that fails before its log
+    /// starts writes none).
     Other,
 }
 
@@ -164,9 +180,15 @@ pub enum ClientError {
     },
     /// The core did not appear or answer in time.
     Timeout,
-    /// The core answered with an error result (a `core/hello` refused for an unknown
-    /// workspace, say).
+    /// The core answered with an error result.
     Refused(ErrorBody),
+    /// The core refused the hello with `workspace.unknown` for the workspace the `cli` chain
+    /// found ([`ClientConfig::workspace_origin`]): most often a folder with `worldwright.yaml`
+    /// that is not registered in `suite.toml`.
+    UnknownWorkspace {
+        origin: WorkspaceOrigin,
+        error: ErrorBody,
+    },
     /// The core answered with a JSON-RPC protocol fault, or with something that is not the
     /// protocol.
     Protocol(RpcError),
@@ -232,10 +254,36 @@ impl fmt::Display for ClientError {
                 if let Some(code) = exit_code {
                     write!(f, " (exit code {code})")?;
                 }
-                write!(f, ". Its log in {} says why.", logs_dir.display())
+                write!(
+                    f,
+                    ". Its log folder {} may say why.",
+                    logs_dir.display()
+                )
             }
             ClientError::Timeout => f.write_str("The Worldwright core did not answer in time."),
             ClientError::Refused(body) => f.write_str(&body.message),
+            ClientError::UnknownWorkspace {
+                origin:
+                    WorkspaceOrigin {
+                        path,
+                        source: WorkspaceSource::Default,
+                    },
+                ..
+            } => write!(
+                f,
+                "The workspace {} ({}) is not one the core can use. Change default_workspace there, or pass --workspace.",
+                path.display(),
+                WorkspaceSource::Default
+            ),
+            ClientError::UnknownWorkspace {
+                origin: WorkspaceOrigin { path, source },
+                ..
+            } => write!(
+                f,
+                "The workspace {} ({source}) is not registered in suite.toml, so the core cannot use it. To use it, make it the default with `ww workspace use {}` (plan 2b).",
+                path.display(),
+                path.display()
+            ),
             ClientError::Protocol(e) => write!(
                 f,
                 "The Worldwright core answered with a protocol error ({}): {}",
@@ -306,6 +354,41 @@ mod tests {
         let other = failed(Some(2), StartFailure::Other).to_string();
         assert!(other.contains(r"C:\t\local\logs"), "{other}");
         assert!(other.contains("exit code 2"), "{other}");
+        // A core can fail before its log exists: the folder only "may" say why.
+        assert!(other.contains("may say why"), "{other}");
+    }
+
+    #[test] // spec: ARCH-030
+    fn unknown_workspace_names_the_folder_and_where_it_came_from() {
+        let error = ErrorBody::new(
+            &ww_protocol::codes::WORKSPACE_UNKNOWN,
+            "The workspace 0123456789abcdef is not one this core knows.",
+            "t_1",
+        );
+        let unknown = |source| ClientError::UnknownWorkspace {
+            origin: WorkspaceOrigin {
+                path: PathBuf::from(r"C:\ws\Ünïcödé space"),
+                source,
+            },
+            error: error.clone(),
+        };
+        for (source, said) in [
+            (WorkspaceSource::Flag, "--workspace"),
+            (WorkspaceSource::CurrentFolder, "current folder"),
+        ] {
+            let text = unknown(source).to_string();
+            assert!(text.contains(r"C:\ws\Ünïcödé space"), "{text}");
+            assert!(text.contains(said), "{text}");
+            assert!(text.contains("not registered in suite.toml"), "{text}");
+            assert!(
+                text.contains(r"`ww workspace use C:\ws\Ünïcödé space` (plan 2b)"),
+                "{text}"
+            );
+            assert!(!text.contains("0123456789abcdef"), "{text}");
+        }
+        let text = unknown(WorkspaceSource::Default).to_string();
+        assert!(text.contains(r"C:\ws\Ünïcödé space"), "{text}");
+        assert!(text.contains("default_workspace"), "{text}");
     }
 
     #[test] // spec: ARCH-014, ARCH-027

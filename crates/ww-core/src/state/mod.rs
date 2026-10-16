@@ -19,13 +19,19 @@
 //! `state.db` (owner decision 5).
 //!
 //! **Stale rows.** On open, `running` idempotency rows (calls that died with an earlier core)
-//! are deleted. That is safe because only the core that owns the channel's pipe opens its
-//! databases (startup order: pipe, log, state). `done` rows older than 30 days are pruned by
-//! `idem_begin`, against the caller's `now`: the same clock that stamped the rows.
+//! are deleted. For the suite database that is safe: it is per channel, and only the core that
+//! owns the channel's pipe opens it (startup order: pipe, log, state). A workspace database on
+//! another volume than the local folder, `<vol>:\.worldwright-local\<hash>\state.db`, is not
+//! per channel: the cores of every channel that open that workspace share it (ARCH-097), so a
+//! core opening it can delete the `running` rows of a call another channel's core is still
+//! running. Plan 2b gates this, and read-write workspace access, on the ARCH-028 `core.lock`.
+//! `done` rows older than 30 days are pruned by `idem_begin`, against the caller's `now`: the
+//! same clock that stamped the rows.
 //!
 //! **Workspace databases** are opened on first use, on a blocking thread
 //! (`spawn_blocking`), each behind its own once-cell: opening one workspace's database never
-//! holds up calls for another.
+//! holds up calls for another. An open whose thread starts after [`StateRegistry::close`] is
+//! refused before it touches the file, and `close` waits for the opens already past that check.
 
 mod migrations;
 
@@ -34,7 +40,7 @@ pub use migrations::{SUITE_MIGRATIONS, WORKSPACE_MIGRATIONS};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -531,7 +537,11 @@ pub struct StateRegistry {
     on_fatal: OnFatal,
     suite: StateDb,
     /// The workspace databases and the closed flag, under one lock.
-    workspaces: Mutex<Workspaces>,
+    workspaces: Arc<Mutex<Workspaces>>,
+    /// Held shared by each blocking workspace open from its closed check until its database
+    /// is open; [`StateRegistry::close`] takes it exclusively once it has set the flag, so no
+    /// open is still migrating or releasing rows when `close` returns.
+    opening: Arc<RwLock<()>>,
 }
 
 /// One cell per workspace id: the lock is held only to find a cell or to close.
@@ -566,7 +576,8 @@ impl StateRegistry {
             env: env.clone(),
             on_fatal,
             suite,
-            workspaces: Mutex::new(Workspaces::default()),
+            workspaces: Arc::new(Mutex::new(Workspaces::default())),
+            opening: Arc::new(RwLock::new(())),
         })
     }
 
@@ -582,6 +593,9 @@ impl StateRegistry {
             workspaces.closed = true;
             workspaces.cells.values().cloned().collect()
         };
+        // Waits for the opens that passed their check before the flag was set: they finish
+        // (migrations, stale rows) now, not after this returns. Later ones see the flag.
+        drop(self.opening.write().unwrap_or_else(PoisonError::into_inner));
         self.suite.close();
         for cell in cells {
             if let Some(db) = cell.get() {
@@ -617,18 +631,10 @@ impl StateRegistry {
         let db = cell
             .get_or_try_init(|| {
                 let (env, on_fatal, ws) = (self.env.clone(), self.on_fatal.clone(), ws.clone());
+                let (workspaces, opening) = (self.workspaces.clone(), self.opening.clone());
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        let dir = env
-                            .workspace_local_dir_for_canonical(&ws.path)
-                            .map_err(|e| StateError::Io(e.to_string()))?;
-                        StateDb::open_named(
-                            &dir.join("state.db"),
-                            StateScope::Workspace,
-                            format!("ww-state-ws-{}", ws.id),
-                            on_fatal,
-                        )
-                        .map(Arc::new)
+                        open_workspace_db(&env, on_fatal, &ws, &workspaces, &opening)
                     })
                     .await
                     .map_err(|e| {
@@ -648,6 +654,33 @@ impl StateRegistry {
         }
         Ok(db.clone())
     }
+}
+
+/// The blocking part of [`StateRegistry::for_workspace`]: opens `ws`'s database. Its thread
+/// may run only after [`StateRegistry::close`] has returned, so it checks the closed flag
+/// first, under the workspaces lock as `close` sets it, and is then refused before it creates,
+/// migrates or releases anything. It holds `opening` shared until the database is open.
+fn open_workspace_db(
+    env: &Env,
+    on_fatal: OnFatal,
+    ws: &WorkspaceRef,
+    workspaces: &Mutex<Workspaces>,
+    opening: &RwLock<()>,
+) -> Result<Arc<StateDb>, StateError> {
+    let _opening = opening.read().unwrap_or_else(PoisonError::into_inner);
+    if lock(workspaces).closed {
+        return Err(StateError::ActorGone);
+    }
+    let dir = env
+        .workspace_local_dir_for_canonical(&ws.path)
+        .map_err(|e| StateError::Io(e.to_string()))?;
+    StateDb::open_named(
+        &dir.join("state.db"),
+        StateScope::Workspace,
+        format!("ww-state-ws-{}", ws.id),
+        on_fatal,
+    )
+    .map(Arc::new)
 }
 
 #[cfg(test)]
@@ -769,6 +802,36 @@ mod tests {
             assert_eq!(diagnostics.journal_mode, "wal");
         });
         assert_eq!(ran.load(Ordering::SeqCst), STATE_QUEUE);
+    }
+
+    #[test] // spec: ARCH-021, CORE-016
+    fn a_workspace_open_that_runs_after_close_changes_nothing() {
+        let env = ww_testkit::TestEnv::new();
+        let reg = StateRegistry::open(&env.env, Arc::new(|_: &str| {})).unwrap();
+        let folder = std::fs::canonicalize(env.make_workspace("late")).unwrap();
+        let text = folder.to_string_lossy().into_owned();
+        let ws = WorkspaceRef {
+            id: Env::workspace_hash(&folder),
+            path: PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)),
+        };
+        let db = env
+            .env
+            .workspace_local_dir_for_canonical(&ws.path)
+            .unwrap()
+            .join("state.db");
+        reg.close();
+
+        // The blocking open as it runs when its thread starts only after `close` returned:
+        // refused before it creates, migrates or releases anything (no timing involved).
+        let late = open_workspace_db(
+            &reg.env,
+            reg.on_fatal.clone(),
+            &ws,
+            &reg.workspaces,
+            &reg.opening,
+        );
+        assert!(matches!(late, Err(StateError::ActorGone)), "{late:?}");
+        assert!(!db.exists(), "{} was created after close", db.display());
     }
 
     #[test] // spec: ARCH-021, QA-012

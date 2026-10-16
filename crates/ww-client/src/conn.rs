@@ -10,8 +10,8 @@
 //!   replayed events may arrive before the reply (the core queues them while it subscribes),
 //!   and they are buffered in the stream until it is read.
 //! - When either task ends (the core closed the pipe, a read or write failed, a line was
-//!   over-long, not UTF-8 or not a server line), the connection is closed: waiting calls get [`ClientError::Closed`] and every stream ends after its
-//!   buffered events.
+//!   over-long, not UTF-8 or not a server line), the connection is closed: waiting calls get
+//!   [`ClientError::Closed`] and every stream ends after its buffered events.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};

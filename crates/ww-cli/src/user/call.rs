@@ -8,7 +8,8 @@ use serde_json::{Map, Value};
 use ww_protocol::Outcome;
 
 use super::{
-    EXIT_ERROR_RESULT, EXIT_OK, EXIT_PENDING, Exit, GlobalArgs, cannot_run, connect, print_line,
+    EXIT_ERROR_RESULT, EXIT_OK, EXIT_PENDING, Exit, GlobalArgs, UnknownCwdWorkspace, cannot_run,
+    connect, print_line,
 };
 
 pub(super) fn run(
@@ -19,7 +20,7 @@ pub(super) fn run(
 ) -> Result<i32, Exit> {
     // Checked before any core is involved: a usage error never starts one.
     let args = arguments(args)?;
-    let Some(client) = connect(global)? else {
+    let Some(client) = connect(global, UnknownCwdWorkspace::Fail)? else {
         return Ok(EXIT_OK);
     };
     let outcome = client.call_tool(tool, args, key).map_err(cannot_run)?;

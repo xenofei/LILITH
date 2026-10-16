@@ -158,10 +158,12 @@ fn client_killed_mid_call_leaves_core_healthy() {
     let echo = b.tool("test.echo", json!({"text": "x"}), None);
     assert_eq!(echo["status"], "ok", "{echo}");
 
-    // 3. A's call is still running.
+    // 3. A's call is still running, and still in flight although its caller has gone.
     let mut c = connect(&env, json!({}));
     let busy = c.tool("test.block", args.clone(), Some("k"));
     assert_eq!(busy["error"]["code"], "idempotency.in_progress", "{busy}");
+    let lifecycle = core.core().lifecycle();
+    assert_eq!(lifecycle.in_flight(), 1);
 
     // 4. Open the gate; 5. C's retry gets the stored result of A's call.
     core.core().test_gates().open("g");
@@ -180,4 +182,56 @@ fn client_killed_mid_call_leaves_core_healthy() {
     };
     assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(result["structured"], json!({"gate": "g", "executions": 1}));
+
+    // 6. Nothing is left behind: with B and C gone, no connection is counted and no call is
+    // in flight, so the core can go idle (ARCH-020).
+    drop((b, c));
+    wait_until_idle(lifecycle);
+}
+
+/// Waits until `lifecycle` counts no connection and no call in flight. The deadline is a hang
+/// guard only, never a measurement (QA-031).
+fn wait_until_idle(lifecycle: &ww_core::Lifecycle) {
+    let deadline = Instant::now() + DEADLINE;
+    while lifecycle.connections() != 0 || lifecycle.in_flight() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "still {} connection(s) and {} call(s) in flight after {DEADLINE:?}",
+            lifecycle.connections(),
+            lifecycle.in_flight()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test] // spec: ARCH-025, CORE-016
+fn oversized_result_is_an_error_that_replays_and_connection_stays() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut pipe = connect(&env, json!({}));
+    let big = json!({"label": "big", "pad": ww_protocol::MAX_LINE_BYTES});
+
+    // The result would not fit in a line: the caller gets core.bug, plainly worded.
+    let first = pipe.tool("test.write", big.clone(), Some("k-big"));
+    // (Only the error is printed: a failing result is 4 MiB.)
+    assert_eq!(first["status"], "error", "error: {}", first["error"]);
+    assert_eq!(first["error"]["code"], "core.bug", "{}", first["error"]);
+    assert_eq!(first["error"]["category"], "bug", "{}", first["error"]);
+    let message = first["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("too large to send"), "{message}");
+
+    // The stored outcome is that error: a retry with the same key replays it, byte for byte,
+    // and does not run the tool again.
+    let replay = pipe.tool("test.write", big, Some("k-big"));
+    assert_eq!(replay, first);
+    let after = pipe.tool("test.write", json!({"label": "big"}), Some("k-after"));
+    assert_eq!(after["status"], "ok", "{after}");
+    assert_eq!(
+        after["structured"],
+        json!({"label": "big", "executions": 2})
+    );
+
+    // The connection stayed open throughout.
+    let echo = pipe.tool("test.echo", json!({"text": "still open"}), None);
+    assert_eq!(echo["status"], "ok", "{echo}");
 }

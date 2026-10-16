@@ -15,8 +15,12 @@
 //!    detail, and the core goes on (QA-012, ARCH-060).
 //! 8. **Meter** and 9. **record**: the hooks again.
 //!
-//! Then the idempotency row is finished: `ok` and `pending_confirmation` outcomes are stored,
-//! an error releases the key. A `state.db` failure is `state.unavailable`.
+//! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
+//! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
+//! `pending_confirmation` outcomes are stored, an error releases the key, except the
+//! too-large `core.bug`, which is stored (the tool ran; a retry must not run it again). The
+//! size is decided before the row is written, so the stored outcome and every replay agree.
+//! A `state.db` failure is `state.unavailable`.
 //!
 //! **Draining** (ARCH-021). Before stage 1 the call is admitted by the [`Lifecycle`]: a
 //! draining core answers `core.draining` (retry with the same idempotency key once a core
@@ -35,7 +39,8 @@ use serde_json::{Value, json};
 use tokio::task::JoinError;
 use ww_platform::{Clock, IdSource};
 use ww_protocol::{
-    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput, args_hash, codes,
+    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput, args_hash,
+    codes, fits_response_result,
 };
 
 use super::registry::{CallCtx, Registry, Tool};
@@ -233,21 +238,33 @@ impl Inner {
         // 3–9.
         let outcome = self.run(session, &tool, args, trace_id).await;
 
-        // Finish the idempotency row.
+        // The line cap (ARCH-025), decided once, before anything is stored: an outcome too
+        // large to send becomes `core.bug`, and that error is what the row keeps, so every
+        // replay gets it too. The tool has run, so the key is not released.
+        let encoded = serde_json::to_string(&outcome).expect("an Outcome serialises");
+        let (outcome, encoded, keep) = if fits_response_result(&encoded) {
+            let keep = !matches!(outcome, Outcome::Error { .. });
+            (outcome, encoded, keep)
+        } else {
+            tracing::error!(
+                tool = %p.name,
+                trace_id,
+                bytes = encoded.len(),
+                "a tool's result was too large to send; the caller gets core.bug"
+            );
+            let outcome = too_large(&p.name, trace_id);
+            let encoded = serde_json::to_string(&outcome).expect("an Outcome serialises");
+            (outcome, encoded, true)
+        };
+
+        // Finish the idempotency row: `ok` and `pending_confirmation` are stored, an error
+        // releases the key (except the one above).
         match claim {
             None => outcome,
-            Some(claim) => {
-                let stored = match &outcome {
-                    Outcome::Ok(_) | Outcome::PendingConfirmation(_) => {
-                        Some(serde_json::to_string(&outcome).expect("an Outcome serialises"))
-                    }
-                    Outcome::Error { .. } => None,
-                };
-                match claim.finish(stored).await {
-                    Ok(()) => outcome,
-                    Err(e) => state_unavailable(&e, trace_id),
-                }
-            }
+            Some(claim) => match claim.finish(keep.then_some(encoded)).await {
+                Ok(()) => outcome,
+                Err(e) => state_unavailable(&e, trace_id),
+            },
         }
     }
 
@@ -420,8 +437,34 @@ impl Drop for Claim {
     }
 }
 
-/// The outcome stored for `key`, as it was stored.
+/// `core.bug` for an outcome of `tool` too large to send in one line (ARCH-025).
+fn too_large(tool: &str, trace_id: &str) -> Outcome<ToolOutput> {
+    Outcome::Error {
+        error: ErrorBody::new(
+            &codes::CORE_BUG,
+            format!("The result of {tool} was too large to send. This is a bug in Worldwright."),
+            trace_id,
+        ),
+    }
+}
+
+/// The outcome stored for `key`, as it was stored. One too large to send (stored by an
+/// earlier build) is `core.bug` instead.
 fn replay(stored: &str, key: &str, trace_id: &str) -> Outcome<ToolOutput> {
+    if !fits_response_result(stored) {
+        tracing::error!(
+            key,
+            bytes = stored.len(),
+            "a stored outcome is too large to send; the caller gets core.bug"
+        );
+        return Outcome::Error {
+            error: ErrorBody::new(
+                &codes::CORE_BUG,
+                "The stored result of this call was too large to send. This is a bug in Worldwright.",
+                trace_id,
+            ),
+        };
+    }
     serde_json::from_str(stored).unwrap_or_else(|e| {
         tracing::error!(key, error = %e, "a stored outcome does not parse");
         Outcome::Error {

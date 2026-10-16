@@ -245,6 +245,36 @@ fn incompatible_older_core_is_drained_and_replaced() {
     stop(&cfg);
 }
 
+#[test] // spec: ARCH-018, ARCH-023
+fn newer_client_with_no_start_never_drains_the_core() {
+    let env = TestEnv::new();
+    let cfg = config(&env);
+    let mut core = CoreFixture::start(&env);
+
+    // A 2.0 client that may not start a core must not stop the one that runs either: it
+    // reports itself incompatible and leaves the 1.0 core serving.
+    let mut newer = cfg.clone();
+    newer.protocol = ProtocolVersion { major: 2, minor: 0 };
+    newer.start = StartPolicy::NoStart;
+    let err = connect_async(&newer).expect_err("a 2.0 client connected to a 1.0 core");
+    match &err {
+        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.0"),
+        other => panic!("expected Incompatible, got {other:?}"),
+    }
+    assert!(
+        !core_log(&env).contains("core/drain"),
+        "the --no-start client sent core/drain"
+    );
+    let mut same = cfg.clone();
+    same.start = StartPolicy::NoStart;
+    let client = BlockingClient::connect(&same).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(client.hello().core.pid, core.pid());
+    drop(client);
+
+    stop(&cfg);
+    assert_eq!(core.wait_exit(DEADLINE), Some(0));
+}
+
 #[test] // spec: ARCH-014, ARCH-023
 fn newer_core_is_never_drained_by_older_client() {
     let env = TestEnv::new();

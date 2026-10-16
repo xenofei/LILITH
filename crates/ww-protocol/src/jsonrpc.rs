@@ -1,12 +1,34 @@
 //! JSON-RPC 2.0 framing (ARCH-025): one object per line (`\n`), UTF-8, at most
 //! [`MAX_LINE_BYTES`] per line, no batches. JSON-RPC errors are used only for protocol faults
 //! (QA-010); every method's `result` is an `Outcome`.
+//!
+//! The cap holds both ways: the core checks every line it writes with [`fits_line`] before it
+//! is sent, since a client reading with the same cap closes the connection on a longer one.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Longest line, in bytes, without the `\n`.
 pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The room kept in a line for the response envelope around a `result`
+/// (`{"jsonrpc":"2.0","id":…,"result":…}`): enough for any numeric id and for string ids of
+/// a few thousand bytes. A longer id is still safe: [`encode_response_capped`] catches it.
+pub const RESPONSE_ENVELOPE_RESERVE: usize = 4096;
+
+/// Whether `encoded`, one line without its `\n`, is within [`MAX_LINE_BYTES`].
+pub fn fits_line(encoded: &str) -> bool {
+    encoded.len() <= MAX_LINE_BYTES
+}
+
+/// Whether `encoded_result`, the JSON of a response's `result`, leaves room in one line for
+/// its envelope ([`RESPONSE_ENVELOPE_RESERVE`]).
+pub fn fits_response_result(encoded_result: &str) -> bool {
+    encoded_result
+        .len()
+        .checked_add(RESPONSE_ENVELOPE_RESERVE)
+        .is_some_and(|n| n <= MAX_LINE_BYTES)
+}
 
 /// JSON-RPC protocol-fault codes (QA-010).
 pub mod rpc_code {
@@ -20,6 +42,8 @@ pub mod rpc_code {
     pub const HANDSHAKE_REQUIRED: i64 = -32001;
     /// The line is longer than `MAX_LINE_BYTES`; the connection is then closed.
     pub const LINE_TOO_LONG: i64 = -32002;
+    /// The core's response would have been longer than `MAX_LINE_BYTES`, so it was not sent.
+    pub const INTERNAL_ERROR: i64 = -32603;
 }
 
 /// Method names (ARCH-031).
@@ -205,6 +229,38 @@ pub fn encode_response(r: &Response) -> String {
         }
     }
     Value::Object(obj).to_string()
+}
+
+/// [`encode_response`], within the cap: a line that [`fits_line`] is returned as it is, with
+/// `None`. A longer one is never sent: it is replaced by a -32603 error for the same id (for
+/// `null` when even that id does not fit), returned with the length it would have had.
+pub fn encode_response_capped(r: &Response) -> (String, Option<usize>) {
+    let line = encode_response(r);
+    if fits_line(&line) {
+        return (line, None);
+    }
+    let oversized = line.len();
+    let id = match r {
+        Response::Result { id, .. } => Some(id.clone()),
+        Response::Error { id, .. } => id.clone(),
+    };
+    let error = RpcError::new(
+        rpc_code::INTERNAL_ERROR,
+        format!(
+            "internal error: the response was too large to send ({oversized} bytes; a line holds at most {MAX_LINE_BYTES})"
+        ),
+    );
+    let replacement = encode_response(&Response::Error {
+        id,
+        error: error.clone(),
+    });
+    if fits_line(&replacement) {
+        return (replacement, Some(oversized));
+    }
+    (
+        encode_response(&Response::Error { id: None, error }),
+        Some(oversized),
+    )
 }
 
 fn invalid(message: &str) -> RpcError {
@@ -397,5 +453,62 @@ mod tests {
             ["ww/subscribe", "ww/unsubscribe", "ww/event", "app/"]
         );
         assert_eq!(MAX_LINE_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test] // spec: ARCH-025
+    fn outbound_lines_respect_the_cap() {
+        assert!(fits_line(&"a".repeat(MAX_LINE_BYTES)));
+        assert!(!fits_line(&"a".repeat(MAX_LINE_BYTES + 1)));
+        // A result leaves room for its envelope.
+        assert!(fits_response_result(
+            &"a".repeat(MAX_LINE_BYTES - RESPONSE_ENVELOPE_RESERVE)
+        ));
+        assert!(!fits_response_result(
+            &"a".repeat(MAX_LINE_BYTES - RESPONSE_ENVELOPE_RESERVE + 1)
+        ));
+
+        // A response that fits is encoded as it is.
+        let small = Response::Result {
+            id: Id::Num(3),
+            result: json!({"status": "ok"}),
+        };
+        assert_eq!(
+            encode_response_capped(&small),
+            (encode_response(&small), None)
+        );
+
+        // One that does not becomes -32603 for the same id, so the caller is not left waiting.
+        let big = Response::Result {
+            id: Id::Str("req-1".into()),
+            result: json!({"status": "ok", "text": "a".repeat(MAX_LINE_BYTES)}),
+        };
+        let full = encode_response(&big).len();
+        let (line, oversized) = encode_response_capped(&big);
+        assert_eq!(oversized, Some(full));
+        assert!(fits_line(&line));
+        match parse_server_line(&line).unwrap() {
+            ServerLine::Response(Response::Error { id, error }) => {
+                assert_eq!(id, Some(Id::Str("req-1".into())));
+                assert_eq!(error.code, rpc_code::INTERNAL_ERROR);
+                assert!(error.message.contains("too large"), "{}", error.message);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // An id too long to echo in the error is replaced by null.
+        let long_id = Response::Error {
+            id: Some(Id::Str("i".repeat(MAX_LINE_BYTES))),
+            error: RpcError::new(rpc_code::INVALID_PARAMS, "bad"),
+        };
+        let (line, oversized) = encode_response_capped(&long_id);
+        assert!(oversized.is_some());
+        assert!(fits_line(&line));
+        match parse_server_line(&line).unwrap() {
+            ServerLine::Response(Response::Error { id, error }) => {
+                assert_eq!(id, None);
+                assert_eq!(error.code, rpc_code::INTERNAL_ERROR);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

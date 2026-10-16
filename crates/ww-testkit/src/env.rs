@@ -120,12 +120,18 @@ impl TestEnv {
     /// stdout or stderr stays open after it exited (a process it started inherited them). The
     /// message carries what `ww` printed so far.
     pub fn ww(&self, args: &[&str]) -> WwOutput {
-        self.run_ww(args, None)
+        self.run_ww(self.root(), args, None)
+    }
+
+    /// [`TestEnv::ww`] run in the folder `dir` instead of [`TestEnv::root`] (the `cli`
+    /// workspace chain looks at the current folder, ARCH-030).
+    pub fn ww_in(&self, dir: &Path, args: &[&str]) -> WwOutput {
+        self.run_ww(dir, args, None)
     }
 
     /// [`TestEnv::ww`] with `stdin` written to `ww`'s standard input, which is then closed.
     pub fn ww_with_stdin(&self, args: &[&str], stdin: &str) -> WwOutput {
-        self.run_ww(args, Some(stdin))
+        self.run_ww(self.root(), args, Some(stdin))
     }
 
     /// Starts `ww` like [`TestEnv::ww`] but does not wait: for long-running commands such as
@@ -135,7 +141,7 @@ impl TestEnv {
     /// # Panics
     /// If `ww` cannot be started.
     pub fn ww_spawn(&self, args: &[&str]) -> Child {
-        self.ww_command(args)
+        self.ww_command(self.root(), args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -143,20 +149,18 @@ impl TestEnv {
             .unwrap_or_else(|e| panic!("cannot start {}: {e}", ensure_built().ww.display()))
     }
 
-    fn ww_command(&self, args: &[&str]) -> Command {
+    fn ww_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(&ensure_built().ww);
-        cmd.args(args)
-            .current_dir(self.root())
-            .envs(self.child_env());
+        cmd.args(args).current_dir(dir).envs(self.child_env());
         cmd
     }
 
-    fn run_ww(&self, args: &[&str], stdin: Option<&str>) -> WwOutput {
+    fn run_ww(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> WwOutput {
         let ww = &ensure_built().ww;
         let start = Instant::now();
         let deadline = start + WW_DEADLINE;
         let mut child = self
-            .ww_command(args)
+            .ww_command(dir, args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {

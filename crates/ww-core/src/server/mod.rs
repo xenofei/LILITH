@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use ww_platform::pipe::{CreateError, client_pid, create_instance};
 use ww_platform::session_end::{SessionEnd, SessionEndWatcher};
 use ww_platform::{Env, process};
-use ww_protocol::{Id, Request, Response};
+use ww_protocol::{Id, Request, Response, encode_response_capped};
 
 use crate::config::{CoreConfig, CoreExit};
 use crate::events::EventBus;
@@ -54,6 +54,28 @@ pub struct ConnCtx {
     pub outbound: tokio::sync::mpsc::Sender<String>,
     /// Cancelling it ends the connection.
     pub close: CancellationToken,
+}
+
+impl ConnCtx {
+    /// The line for `response`, within the 4 MiB cap (ARCH-025): one that would be longer is
+    /// never sent; it becomes a -32603 error for the same id, and is logged.
+    pub fn response_line(&self, response: &Response) -> String {
+        let (line, oversized) = encode_response_capped(response);
+        if let Some(bytes) = oversized {
+            tracing::error!(
+                conn_id = self.conn_id,
+                bytes,
+                "a response was too large to send; the caller gets -32603 instead"
+            );
+        }
+        line
+    }
+
+    /// Queues `response` ([`ConnCtx::response_line`]). A connection whose writer has stopped
+    /// drops it.
+    pub async fn send_response(&self, response: &Response) {
+        let _ = self.outbound.send(self.response_line(response)).await;
+    }
 }
 
 /// Decides what each request on a connection gets.
@@ -85,7 +107,10 @@ pub trait Router: Send + Sync + 'static {
     fn closed(&self, conn: &ConnCtx);
 }
 
-/// Counters the transport keeps.
+/// Counters the transport keeps. The running core counts its connections in the
+/// [`Lifecycle`] (through its router); this count is the transport's own, whatever the
+/// router, and is what the transport tests (`tests/transport.rs`, with a fake [`Router`])
+/// watch to see a connection task end.
 #[derive(Debug, Default)]
 pub struct ServerStats {
     /// Open connections.

@@ -6,6 +6,10 @@
 //! ([`config`]). `status`, `call` and `events` name the workspace the `cli` chain resolves
 //! (ARCH-030); `core stop` names none, so a broken workspace registry never stops it.
 //!
+//! A workspace found from the current folder that is not registered in `suite.toml` stops
+//! `call` and `events` with a plain message naming the folder; `status` warns once on stderr
+//! and shows the status without a workspace ([`connect`]).
+//!
 //! A [`ClientError`] (about 250 bytes) never crosses a function boundary here: each command
 //! maps it where it occurs to its plain message on stderr and exit code 2 ([`cannot_run`]).
 
@@ -19,7 +23,10 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use ww_client::blocking::BlockingClient;
-use ww_client::{ClientConfig, ClientError, StartPolicy, resolve_workspace_id};
+use ww_client::{
+    ClientConfig, ClientError, ResolvedWorkspace, StartPolicy, WorkspaceOrigin, WorkspaceSource,
+    resolve_workspace,
+};
 use ww_platform::Env;
 use ww_protocol::{CallerKind, NO_WORKSPACE};
 
@@ -149,21 +156,38 @@ pub(crate) fn config(global: &GlobalArgs, start: StartPolicy) -> Result<ClientCo
     Ok(cfg)
 }
 
+/// What [`connect`] does when the core does not know a workspace found from the current
+/// folder (one not registered in `suite.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnknownCwdWorkspace {
+    /// The command cannot run (exit 2) and says why: `call`, `events`.
+    Fail,
+    /// One warning line on stderr naming the folder, then no workspace: `status`.
+    WarnAndUseNone,
+}
+
 /// Connects for `status`, `call` and `events`: the [`config`] with the workspace the `cli`
 /// chain resolves (ARCH-030). `None` when no core runs and `--no-start` forbids starting one.
 ///
 /// With `--no-start`, a workspace that cannot be resolved (a stale `default_workspace` in
 /// `suite.toml`, say) is reported only when a core runs: with none, the command stays a silent
 /// no-op (ARCH-018).
-pub(crate) fn connect(global: &GlobalArgs) -> Result<Option<BlockingClient>, Exit> {
+///
+/// A workspace the core does not know is named by its folder and where it came from
+/// ([`ClientError::UnknownWorkspace`]); one found from the current folder is handled as
+/// `unknown_cwd` says.
+pub(crate) fn connect(
+    global: &GlobalArgs,
+    unknown_cwd: UnknownCwdWorkspace,
+) -> Result<Option<BlockingClient>, Exit> {
     let mut cfg = config(global, StartPolicy::StartIfNeeded)?;
     let cwd = std::env::current_dir()
         .map_err(|e| cannot_run(format!("Cannot read the current folder: {e}")))?;
-    match resolve_workspace_id(&cfg.env, global.workspace.as_deref(), &cwd) {
-        Ok(id) => cfg.workspace = id,
+    match resolve_workspace(&cfg.env, global.workspace.as_deref(), &cwd) {
+        Ok(ws) => cfg.set_workspace(ws),
         Err(e) => {
             if cfg.start == StartPolicy::NoStart {
-                cfg.workspace = NO_WORKSPACE.to_string();
+                cfg.set_workspace(no_workspace());
                 if let Err(ClientError::NotRunning) = BlockingClient::connect(&cfg) {
                     return Ok(None);
                 }
@@ -174,7 +198,34 @@ pub(crate) fn connect(global: &GlobalArgs) -> Result<Option<BlockingClient>, Exi
     match BlockingClient::connect(&cfg) {
         Ok(client) => Ok(Some(client)),
         Err(ClientError::NotRunning) => Ok(None),
+        Err(ClientError::UnknownWorkspace {
+            origin:
+                WorkspaceOrigin {
+                    path,
+                    source: WorkspaceSource::CurrentFolder,
+                },
+            ..
+        }) if unknown_cwd == UnknownCwdWorkspace::WarnAndUseNone => {
+            eprintln!(
+                "warning: the workspace {} (found from the current folder) is not registered in suite.toml; showing the status without a workspace.",
+                path.display()
+            );
+            cfg.set_workspace(no_workspace());
+            match BlockingClient::connect(&cfg) {
+                Ok(client) => Ok(Some(client)),
+                Err(ClientError::NotRunning) => Ok(None),
+                Err(e) => Err(cannot_run(e)),
+            }
+        }
         Err(e) => Err(cannot_run(e)),
+    }
+}
+
+/// `"none"`: no workspace.
+fn no_workspace() -> ResolvedWorkspace {
+    ResolvedWorkspace {
+        id: NO_WORKSPACE.to_string(),
+        origin: None,
     }
 }
 

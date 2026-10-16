@@ -22,9 +22,9 @@
 //!    user's process) is [`ClientError::Untrusted`].
 //! 4. **Version direction** (controller ruling 4). On `protocol.incompatible` a client whose
 //!    major is greater than the core's sends `core/drain` on that connection, waits up to 60 s
-//!    for the pipe to go, starts a new core (unless `NoStart`) and says hello once more. Any
-//!    other client reports [`ClientError::Incompatible`] at once and leaves the core running
-//!    (ARCH-014).
+//!    for the pipe to go, starts a new core and says hello once more. Any other client, and
+//!    any client under [`StartPolicy::NoStart`] (it could not start the replacement), reports
+//!    [`ClientError::Incompatible`] at once and leaves the core running (ARCH-014).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -45,7 +45,7 @@ use ww_platform::process::{
     ProcessHandle, ProcessInfo, ProcessInspector as _, SpawnRequest, SystemInspector,
     current_user_sid, spawn_detached,
 };
-use ww_protocol::codes::PROTOCOL_INCOMPATIBLE;
+use ww_protocol::codes::{PROTOCOL_INCOMPATIBLE, WORKSPACE_UNKNOWN};
 use ww_protocol::{
     CAPABILITIES, DrainResult, HelloParams, HelloResult, NO_WORKSPACE, Outcome, RpcError,
     SubscribeParams, SubscribeResult, ToolCallParams, ToolDescriptor, ToolOutput, ToolsListResult,
@@ -106,11 +106,12 @@ impl Client {
             } => (core_protocol, conn),
         };
         // Controller ruling 4: only a newer client replaces the core (ARCH-023); an older one
-        // leaves it running (ARCH-014).
+        // leaves it running (ARCH-014). A client that may not start a core never stops one
+        // either: it could not put a new one in its place.
         let older_core = core_protocol
             .parse::<ww_protocol::ProtocolVersion>()
             .is_ok_and(|core| cfg.protocol.major > core.major);
-        if !older_core {
+        if !older_core || cfg.start == StartPolicy::NoStart {
             return Err(ClientError::Incompatible { core_protocol });
         }
         let deadline = Instant::now() + REPLACE_WAIT;
@@ -382,6 +383,15 @@ async fn greet(
                 Some(core_protocol) => Ok(Handshake::Incompatible {
                     core_protocol,
                     conn,
+                }),
+                None => Err(ClientError::Refused(error)),
+            }
+        }
+        Outcome::Error { error } if error.code == WORKSPACE_UNKNOWN.code => {
+            match &cfg.workspace_origin {
+                Some(origin) => Err(ClientError::UnknownWorkspace {
+                    origin: origin.clone(),
+                    error,
                 }),
                 None => Err(ClientError::Refused(error)),
             }

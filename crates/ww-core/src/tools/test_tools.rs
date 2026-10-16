@@ -4,12 +4,14 @@
 //! | Tool | Effect | Arguments | Result (`structured`) |
 //! |---|---|---|---|
 //! | `test.echo` | read | `{text}` | `{text}` |
-//! | `test.write` | write | `{label, fail?}` | `{label, executions}`; `fail: true` → `params.invalid` |
+//! | `test.write` | write | `{label, fail?, pad?}` | `{label, executions}`; `fail: true` → `params.invalid`; `pad: n` adds `padding`, n bytes long |
 //! | `test.block` | write | `{gate}` | `{gate, executions}` once a test opens the gate |
 //! | `test.panic` | read | `{}` | panics |
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
 //! | `test.destructive` | destructive | `{}` | `{executed: true}` |
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
+//!
+//! `pad` exists for the line-cap tests (ARCH-025): a result too large to send.
 //!
 //! `executions` counts the runs of that tool with that label or gate in this core, failed runs
 //! included. `test.emit` is `read`: it changes no state, only publishes an event (so it needs
@@ -94,12 +96,17 @@ struct WriteArgs {
     label: String,
     #[serde(default)]
     fail: bool,
+    /// Adds a `padding` string of this many bytes to the result.
+    #[serde(default)]
+    pad: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct WriteResult {
     label: String,
     executions: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    padding: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -172,7 +179,7 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
     let write_counters = counters.clone();
     reg.register(typed_tool(
         "test.write",
-        "Test channels only: a write that counts its runs per label. `fail: true` returns params.invalid.",
+        "Test channels only: a write that counts its runs per label. `fail: true` returns params.invalid; `pad: n` adds n bytes of padding to the result.",
         EffectClass::Write,
         TEST_MODULE,
         move |ctx, args: WriteArgs| {
@@ -190,6 +197,7 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
                     WriteResult {
                         label: args.label,
                         executions,
+                        padding: "p".repeat(args.pad),
                     },
                     summary,
                 ))

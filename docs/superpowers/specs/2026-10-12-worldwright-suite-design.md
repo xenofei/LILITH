@@ -70,7 +70,7 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 
 ### 0.5 Document map
 
-§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes.
+§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification).
 
 ---
 
@@ -2402,7 +2402,7 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | `WW_TEST_PARENT_PID` | test channels only |
   | `WW_TEST_IDLE_SECS` | test channels only |
 
-- **Framing** (ARCH-025): one JSON-RPC 2.0 object per line (`\n`), UTF-8, **at most 4 MiB** per line. Batches aren't supported.
+- **Framing** (ARCH-025): one JSON-RPC 2.0 object per line (`\n`), UTF-8, **at most 4 MiB** per line, in both directions. Batches aren't supported. The core never writes a longer line: a tool outcome that would not fit becomes the error `core.bug` (stored as the call's outcome, so a retry with the same key gets the same error), an event that would not fit is replaced by `resync_required` for its topic, and any other response that would not fit becomes -32603.
 - **Methods and results** (ARCH-031). Every method's JSON-RPC `result` is an `Outcome<T>`. Tool failures are `Outcome` errors, never JSON-RPC errors (QA-010).
 
   | Method | Params | `result` | Allowed |
@@ -2453,6 +2453,7 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | -32602 | invalid params; also an unknown `core/hello` field |
   | -32001 | handshake required |
   | -32002 | line too long; the connection is then closed |
+  | -32603 | internal error: the core's response would have been over 4 MiB, so it was not sent; the connection stays open |
 
 - **Error codes** (QA-003–005). Rows marked *provisional* are defined now and confirmed by the plan that first returns them.
 

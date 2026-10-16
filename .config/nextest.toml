@@ -27,9 +27,10 @@ retries = 1
 slow-timeout = { period = "30s", terminate-after = 4 }
 fail-fast = false
 
-# Which tests may use the binaries. `ww-client` does not exist yet, and nextest refuses a
-# `package()` that matches nothing, so it is covered by `rdeps(ww-testkit)`: every package whose
-# tests (dev-dependencies included) use the test kit, and the kit itself.
+# Which tests may use the binaries. `rdeps(ww-testkit)` covers every package whose tests
+# (dev-dependencies included) use the test kit, and the kit itself: `ww-client` among them, and
+# any package added later, without a `package()` that nextest would refuse while it matches
+# nothing.
 [[profile.default.scripts]]
 filter = 'package(ww-spec-tests) | package(ww-core) | package(ww-cli) | rdeps(ww-testkit)'
 setup = "build-testbins"

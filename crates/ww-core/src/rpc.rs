@@ -21,9 +21,11 @@
 //!   `app/*` is refused with `caller.not_allowed` for anyone but a verified `ui:*` caller, and
 //!   is -32601 for one, since plan 2 defines no `app/*` method (ARCH-031, APP-040).
 //!   `core/drain` and `ww/*` run on the connection's reader ([`Router::runs_inline`]): they
-//!   are cheap, and must not wait behind a connection that has
-//!   [`crate::MAX_IN_FLIGHT_PER_CONN`] requests running. A request handler that panics in its
-//!   own task is answered with `core.bug` ([`Router::panicked`]).
+//!   are cheap and take no in-flight permit, so they are not refused or delayed for want of
+//!   one. Reading stays in order, though: one read after a request that waits for a permit
+//!   (the connection has [`crate::MAX_IN_FLIGHT_PER_CONN`] requests running) waits with it. A
+//!   request handler that panics in its own task is answered with `core.bug`
+//!   ([`Router::panicked`]).
 //!
 //! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
 //! [`Lifecycle`]'s connection count. A refused connection stops counting when it is refused
@@ -456,10 +458,7 @@ impl RpcRouter {
             "core/drain"
         );
         let reply = outcome(id, Outcome::Ok(DrainResult { draining: true }));
-        let _ = conn
-            .outbound
-            .send(ww_protocol::encode_response(&reply))
-            .await;
+        conn.send_response(&reply).await;
         self.lifecycle.begin_drain(DrainReason::Requested);
         None
     }
@@ -535,10 +534,7 @@ impl RpcRouter {
             "core/hello refused: the engine token is invalid; the connection is closed"
         );
         let reply = outcome::<HelloResult>(id, Outcome::Error { error });
-        let _ = conn
-            .outbound
-            .send(ww_protocol::encode_response(&reply))
-            .await;
+        conn.send_response(&reply).await;
         conn.close.cancel();
     }
 }

@@ -76,8 +76,6 @@ pub enum CoreExit {
     AlreadyRunning,
     /// Startup failed for another reason.
     Startup(String),
-    /// Stopped after a fatal error.
-    Fatal(String),
     /// The suite `state.db` is damaged; nothing was changed.
     StateDamaged(PathBuf),
     /// The suite `state.db` is from a newer version; nothing was changed.
@@ -85,12 +83,12 @@ pub enum CoreExit {
 }
 
 impl CoreExit {
-    /// The exit code of `ww-core` (Appendix D): 3, 2, 4, 5 and 6.
+    /// The exit code of `ww-core` (Appendix D): 3, 2, 5 and 6. Code 4 (stopped after a fatal
+    /// error) is a shutdown's, from `ShutdownReport::exit_code`.
     pub fn code(&self) -> u8 {
         match self {
             CoreExit::AlreadyRunning => 3,
             CoreExit::Startup(_) => 2,
-            CoreExit::Fatal(_) => 4,
             CoreExit::StateDamaged(_) => 5,
             CoreExit::StateTooNew(_) => 6,
         }
@@ -102,7 +100,6 @@ impl std::fmt::Display for CoreExit {
         match self {
             CoreExit::AlreadyRunning => f.write_str("another core already owns the pipe"),
             CoreExit::Startup(why) => write!(f, "the core could not start: {why}"),
-            CoreExit::Fatal(why) => write!(f, "the core stopped after a fatal error: {why}"),
             CoreExit::StateDamaged(path) => {
                 write!(f, "the state database {} is damaged", path.display())
             }
@@ -127,13 +124,12 @@ mod tests {
         let codes: Vec<u8> = [
             CoreExit::AlreadyRunning,
             CoreExit::Startup(String::new()),
-            CoreExit::Fatal(String::new()),
             CoreExit::StateDamaged(path.clone()),
             CoreExit::StateTooNew(path),
         ]
         .iter()
         .map(CoreExit::code)
         .collect();
-        assert_eq!(codes, [3, 2, 4, 5, 6]);
+        assert_eq!(codes, [3, 2, 5, 6]);
     }
 }

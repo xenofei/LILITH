@@ -340,3 +340,43 @@ fn damaged_state_db_message_is_plain() {
     );
     assert_eq!(sha256_file(&db), before, "{} was changed", db.display());
 }
+
+#[test] // spec: ARCH-030, ARCH-016
+fn an_unregistered_workspace_folder_is_named_plainly() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = env.make_workspace("Ünïcödé unregistered");
+    let inside = ws.join("sub folder");
+    std::fs::create_dir_all(&inside).unwrap();
+    let id = ww_platform::Env::workspace_hash(&canonical(&ws));
+    let names_folder = |text: &str| path_forms(&ws).iter().any(|p| text.contains(p));
+
+    // `status` from inside it: one warning naming the folder, then the status without a
+    // workspace, exit 0.
+    let status = env.ww_in(&inside, &["status"]);
+    assert_eq!(status.code, 0, "{status:?}");
+    assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+    assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+    assert!(names_folder(&status.stderr), "{status:?}");
+    assert!(status.stderr.contains("suite.toml"), "{status:?}");
+
+    // `call` and `events` still cannot run (exit 2), with a plain message: the folder, where
+    // it came from and how to fix it; never just the workspace hash.
+    let call = env.ww_in(&inside, &["call", "test.echo", "{\"text\":\"x\"}"]);
+    let events = env.ww_in(&inside, &["events", "--follow", "--topic", "test:a"]);
+    for out in [&call, &events] {
+        assert_eq!(out.code, 2, "{out:?}");
+        assert_eq!(out.stdout, "", "{out:?}");
+        assert!(names_folder(&out.stderr), "{out:?}");
+        assert!(out.stderr.contains("current folder"), "{out:?}");
+        assert!(out.stderr.contains("suite.toml"), "{out:?}");
+        assert!(out.stderr.contains("ww workspace use"), "{out:?}");
+        assert!(!out.stderr.contains(&id), "{out:?}");
+    }
+
+    // Named with --workspace, `status` does not fall back.
+    let ws_arg = ws.to_str().expect("a UTF-8 test path");
+    let flagged = env.ww(&["status", "--workspace", ws_arg]);
+    assert_eq!(flagged.code, 2, "{flagged:?}");
+    assert!(names_folder(&flagged.stderr), "{flagged:?}");
+    assert!(flagged.stderr.contains("--workspace"), "{flagged:?}");
+}

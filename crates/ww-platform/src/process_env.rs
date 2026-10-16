@@ -3,6 +3,7 @@
 //! | Variable | Meaning |
 //! |---|---|
 //! | `WW_BUILD_CHANNEL` (compile time) | `stable` only in release packaging; default `dev` |
+//! | `WW_BUILD_ID` (compile time) | build id suffix; `build_id` is `<CARGO_PKG_VERSION>+<WW_BUILD_ID or "local">` |
 //! | `WW_CHANNEL` | a dev build accepts `dev` or `test-<id>`; a stable build refuses anything but `stable` |
 //! | `WW_TEST_ROOT` | test channels only: `<root>\{roaming,local,profile}` |
 //! | `WW_TEST_PARENT_PID` | test channels only |

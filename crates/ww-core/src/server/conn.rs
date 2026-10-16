@@ -13,8 +13,9 @@
 //!   waits for a full connection. A request task that panics is answered with
 //!   `Router::panicked`.
 //! - A line that is not a request gets its protocol fault. An over-long line gets -32002 with
-//!   id `null`, and the connection then closes. Notifications are ignored; a partial line at
-//!   end-of-stream is dropped.
+//!   id `null`, and the connection then closes. A response is never written over the cap
+//!   either: one that would be gets -32603 for its id instead ([`ConnCtx::send_response`]).
+//!   Notifications are ignored; a partial line at end-of-stream is dropped.
 //! - Cancelling `ConnCtx::close` ends the connection. Lines already queued by then (the reply
 //!   to `core/drain` among them) are still written for up to `FLUSH_GRACE`.
 
@@ -29,7 +30,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, LinesCodecError};
 use tokio_util::sync::CancellationToken;
-use ww_protocol::{Response, RpcError, encode_response, parse_request, rpc_code};
+use ww_protocol::{Response, RpcError, parse_request, rpc_code};
 
 use super::{ConnCtx, MAX_IN_FLIGHT_PER_CONN, OUTBOUND_CAPACITY, Router};
 
@@ -180,9 +181,9 @@ async fn read_lines(read: ReadHalf<NamedPipeServer>, ctx: &Arc<ConnCtx>, router:
     }
 }
 
-/// Queues `response` for the writer. A connection whose writer has stopped drops it.
+/// Queues `response` for the writer, within the line cap ([`ConnCtx::send_response`]).
 async fn send(ctx: &ConnCtx, response: &Response) {
-    let _ = ctx.outbound.send(encode_response(response)).await;
+    ctx.send_response(response).await;
 }
 
 /// Writes each queued line with its `\n`. Stops once the queue is empty after `close` or

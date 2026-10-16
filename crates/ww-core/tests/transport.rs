@@ -36,8 +36,8 @@ const POLL: Duration = Duration::from_millis(10);
 // The fake router.
 // ---------------------------------------------------------------------------------------------
 
-/// `echo` returns its params; `slow` waits until the test calls [`Fake::release`]; anything
-/// else is -32601. Records what happened.
+/// `echo` returns its params; `big` returns a result longer than a line may be; `slow` waits
+/// until the test calls [`Fake::release`]; anything else is -32601. Records what happened.
 struct Fake {
     handshake_done: bool,
     opened: AtomicUsize,
@@ -102,6 +102,10 @@ impl Router for Fake {
                         result: req.params.unwrap_or(Value::Null),
                     })
                 }
+                "big" => Some(Response::Result {
+                    id,
+                    result: json!("a".repeat(ww_protocol::MAX_LINE_BYTES)),
+                }),
                 "slow" => {
                     self.note("slow:start");
                     let _ = self.slow_started.lock().unwrap().send(());
@@ -432,6 +436,36 @@ fn oversized_line_closes_only_that_connection() {
     let response = other.call("echo", json!({"ok": true}));
     assert_eq!(response["result"], json!({"ok": true}), "{response}");
     assert_eq!(fake.closed.load(Ordering::SeqCst), 1);
+}
+
+#[test] // spec: ARCH-025, QA-010
+fn oversized_response_becomes_internal_error_and_connection_stays() {
+    let env = TestEnv::new();
+    let name = env.env.pipe_name();
+    let (fake, _started) = Fake::new(true);
+    let _served = Served::start(&name, fake.clone());
+    let mut pipe = RawPipe::connect(&env);
+
+    // The core never writes a line over the cap; the caller gets -32603 for its id instead.
+    let response = pipe.call("big", json!({}));
+    // (Only the error is printed: a failing response is 4 MiB.)
+    assert_eq!(
+        response["error"]["code"],
+        rpc_code::INTERNAL_ERROR,
+        "error: {}",
+        response["error"]
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("too large")),
+        "{}",
+        response["error"]
+    );
+    // The connection is still open.
+    let response = pipe.call("echo", json!({"after": "big"}));
+    assert_eq!(response["result"], json!({"after": "big"}), "{response}");
+    assert_eq!(fake.closed.load(Ordering::SeqCst), 0);
 }
 
 #[test] // spec: ARCH-025
