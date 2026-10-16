@@ -35,6 +35,7 @@ use ww_protocol::{
 
 use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{ConfirmDecision, PipelineHooks};
+use crate::events::EventBus;
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
 
@@ -48,6 +49,7 @@ struct Inner {
     reg: Registry,
     hooks: PipelineHooks,
     states: Arc<StateRegistry>,
+    events: Arc<EventBus>,
     ids: Arc<dyn IdSource>,
     clock: Arc<dyn Clock>,
 }
@@ -65,6 +67,7 @@ impl Dispatcher {
         reg: Registry,
         hooks: PipelineHooks,
         states: Arc<StateRegistry>,
+        events: Arc<EventBus>,
         ids: Arc<dyn IdSource>,
         clock: Arc<dyn Clock>,
     ) -> Dispatcher {
@@ -73,6 +76,7 @@ impl Dispatcher {
                 reg,
                 hooks,
                 states,
+                events,
                 ids,
                 clock,
             }),
@@ -82,6 +86,11 @@ impl Dispatcher {
     /// The tools this dispatcher serves.
     pub fn registry(&self) -> &Registry {
         &self.inner.reg
+    }
+
+    /// The event bus its tools publish on (`CallCtx::events`).
+    pub fn events(&self) -> &Arc<EventBus> {
+        &self.inner.events
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
@@ -299,6 +308,7 @@ impl Inner {
             session: session.clone(),
             trace_id: trace_id.to_string(),
             settings,
+            events: self.events.clone(),
         };
         let running = tool.clone();
         let joined = tokio::spawn(async move { running.run(&ctx, args).await }).await;

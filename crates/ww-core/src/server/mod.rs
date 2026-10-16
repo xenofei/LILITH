@@ -24,6 +24,7 @@ use ww_platform::{Env, process};
 use ww_protocol::{Request, Response};
 
 use crate::config::{CoreConfig, CoreExit};
+use crate::events::EventBus;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
@@ -258,10 +259,12 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     };
     let test_gates = Arc::new(TestGates::new());
+    let events = Arc::new(EventBus::new(cfg.clock.clone()));
     let dispatcher = Dispatcher::new(
         core_registry(cfg.test_tools, &test_gates, &state),
         PipelineHooks::plan2(),
         state.clone(),
+        events,
         cfg.ids.clone(),
         cfg.clock.clone(),
     );

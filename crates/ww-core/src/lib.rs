@@ -1,8 +1,9 @@
 //! Worldwright core. All file writes in this crate go through [`store`] (ARCH-112); the core's
 //! SQLite databases are [`state`] (CORE-004, CORE-005).
 //!
-//! `config`, `server`, `rpc`, `identity`, `workspace` and `session` are infrastructure, not
-//! CORE-014 modules. The registry and the dispatcher are the [`tools`] module.
+//! `config`, `server`, `rpc`, `identity`, `workspace`, `session` and `events` are
+//! infrastructure, not CORE-014 modules. The registry and the dispatcher are the [`tools`]
+//! module.
 //!
 //! Lint policy: `clippy::result_large_err` is allowed crate-wide. The plan fixes many
 //! signatures that return `Result<_, ErrorBody>`; `ErrorBody` is the wire error result, built
@@ -13,6 +14,7 @@
 )]
 
 pub mod config;
+pub mod events;
 pub mod identity;
 pub mod rpc;
 pub mod server;

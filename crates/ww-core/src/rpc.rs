@@ -8,9 +8,18 @@
 //!   `protocol.incompatible` refusal. Everything is -32001 (`core/drain` included, until the
 //!   lifecycle decides it by the drain direction).
 //! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `tools/list` and
-//!   `tools/call` go to the [`Dispatcher`] (the `tools` module); `app/*` is refused with
-//!   `caller.not_allowed` for anyone but a verified `ui:*` caller, and is -32601 for one, since
-//!   plan 2 defines no `app/*` method (ARCH-031, APP-040).
+//!   `tools/call` go to the [`Dispatcher`] (the `tools` module); `ww/subscribe` and
+//!   `ww/unsubscribe` go to the [`EventBus`]; `app/*` is refused with `caller.not_allowed` for
+//!   anyone but a verified `ui:*` caller, and is -32601 for one, since plan 2 defines no
+//!   `app/*` method (ARCH-031, APP-040).
+//!
+//! **Events** (ARCH-032). A connection is attached to the event bus (its forwarder started on
+//! the connection's outbound channel) when its session is established, and dropped from it in
+//! [`Router::closed`]. A subscription is made under the connection-map lock, and `closed`
+//! drops the client under it too, so a `ww/subscribe` still running when its connection closes
+//! cannot leave a forgotten client in the bus. A topic that is not a valid name, or a
+//! `since_seq` cursor for a topic not in `topics`, is -32602; the results are
+//! `Outcome<SubscribeResult>` and `Outcome<UnsubscribeResult>`.
 //!
 //! Hello handling follows a fixed order. `protocol` is read first and alone
 //! ([`peek_protocol`]), so a client of any version gets the frozen refusal before any other
@@ -35,12 +44,14 @@ use ww_platform::process::{ProcessInfo, ProcessInspector};
 use ww_platform::{Env, IdSource};
 use ww_protocol::{
     BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, ErrorBody, HelloParams, HelloResult, Id,
-    Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError, ToolCallParams,
-    ToolOutput, ToolsListParams, ToolsListResult, WorkspaceInfo, codes, incompatible_refusal,
-    method, negotiate, peek_protocol, rpc_code, schema_hash, shared_capabilities,
+    Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError, SubscribeParams,
+    SubscribeResult, ToolCallParams, ToolOutput, ToolsListParams, ToolsListResult,
+    UnsubscribeParams, UnsubscribeResult, WorkspaceInfo, codes, incompatible_refusal,
+    is_valid_topic, method, negotiate, peek_protocol, rpc_code, schema_hash, shared_capabilities,
 };
 
 use crate::config::CoreConfig;
+use crate::events::EventBus;
 use crate::identity::{EngineTokens, TrustedDirs, claude_ancestor, resolve_caller};
 use crate::server::{ConnCtx, Router};
 use crate::session::Session;
@@ -79,12 +90,15 @@ pub struct RpcRouter {
     core: CoreInfo,
     conns: Mutex<HashMap<u64, Conn>>,
     dispatcher: Dispatcher,
+    /// The dispatcher's bus.
+    events: Arc<EventBus>,
 }
 
 impl RpcRouter {
     /// A router for the core configured by `cfg`, serving the pipe `pipe`, whose tool calls go
-    /// to `dispatcher`.
+    /// to `dispatcher` and whose subscriptions to the dispatcher's event bus.
     pub fn new(cfg: &CoreConfig, pipe: &str, dispatcher: Dispatcher) -> RpcRouter {
+        let events = dispatcher.events().clone();
         RpcRouter {
             env: cfg.env.clone(),
             ids: cfg.ids.clone(),
@@ -100,6 +114,7 @@ impl RpcRouter {
             },
             conns: Mutex::new(HashMap::new()),
             dispatcher,
+            events,
         }
     }
 
@@ -162,6 +177,8 @@ impl RpcRouter {
                     },
                 }
             }
+            (ConnState::Ready(_), method::SUBSCRIBE) => self.subscribe(conn, id, req.params),
+            (ConnState::Ready(_), method::UNSUBSCRIBE) => self.unsubscribe(conn, id, req.params),
             (ConnState::Ready(session), m) if m.starts_with(method::APP_PREFIX) => {
                 match session.caller {
                     // Plan 2 defines no `app/*` method.
@@ -326,8 +343,60 @@ impl RpcRouter {
             core: self.core.clone(),
         };
         self.settle(conn.conn_id, ConnState::Ready(session));
+        // Events can reach the connection from now on.
+        self.events.attach(conn.conn_id, conn.outbound.clone());
         // 9. The reply.
         outcome(id, Outcome::Ok(result))
+    }
+
+    /// `ww/subscribe` (ARCH-032).
+    fn subscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
+        let p: SubscribeParams = match parse_params(params).and_then(|p: SubscribeParams| {
+            check_topics(&p.topics)?;
+            match p.since_seq.keys().find(|t| !p.topics.contains(t)) {
+                Some(t) => Err(RpcError::new(
+                    rpc_code::INVALID_PARAMS,
+                    format!("since_seq names {t:?}, which is not in topics"),
+                )),
+                None => Ok(p),
+            }
+        }) {
+            Ok(p) => p,
+            Err(error) => {
+                return Response::Error {
+                    id: Some(id),
+                    error,
+                };
+            }
+        };
+        let topics = {
+            let conns = self.conns();
+            if conns.contains_key(&conn.conn_id) {
+                self.events.subscribe(conn.conn_id, &p.topics, &p.since_seq)
+            } else {
+                // Closed meanwhile: nothing to subscribe, and nobody reads the reply.
+                Vec::new()
+            }
+        };
+        outcome(id, Outcome::Ok(SubscribeResult { topics }))
+    }
+
+    /// `ww/unsubscribe` (ARCH-032).
+    fn unsubscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
+        let p: UnsubscribeParams = match parse_params(params).and_then(|p: UnsubscribeParams| {
+            check_topics(&p.topics)?;
+            Ok(p)
+        }) {
+            Ok(p) => p,
+            Err(error) => {
+                return Response::Error {
+                    id: Some(id),
+                    error,
+                };
+            }
+        };
+        let topics = self.events.unsubscribe(conn.conn_id, &p.topics);
+        outcome(id, Outcome::Ok(UnsubscribeResult { topics }))
     }
 
     /// A hello that failed with an error result; the connection stays `AwaitingHello`.
@@ -399,9 +468,12 @@ impl Router for RpcRouter {
     }
 
     fn closed(&self, conn: &ConnCtx) {
-        if let Some(gone) = self.conns().remove(&conn.conn_id) {
+        let mut conns = self.conns();
+        if let Some(gone) = conns.remove(&conn.conn_id) {
             gone.hello_settled.cancel();
         }
+        // Under the map lock: see the module docs on events.
+        self.events.drop_client(conn.conn_id);
     }
 }
 
@@ -411,6 +483,17 @@ pub fn parse_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, Rpc
     let params = params.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     serde_json::from_value(params)
         .map_err(|e| RpcError::new(rpc_code::INVALID_PARAMS, format!("invalid params: {e}")))
+}
+
+/// -32602 unless every topic is a valid name (`^[a-z][a-z0-9_]*(:.+)?$`, ARCH-032).
+fn check_topics(topics: &[String]) -> Result<(), RpcError> {
+    match topics.iter().find(|t| !is_valid_topic(t)) {
+        Some(t) => Err(RpcError::new(
+            rpc_code::INVALID_PARAMS,
+            format!("{t:?} is not a valid topic name"),
+        )),
+        None => Ok(()),
+    }
 }
 
 fn fault(id: Id, code: i64, message: &str) -> Response {

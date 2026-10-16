@@ -20,6 +20,7 @@ use ww_testkit::{FakeClock, SeqIds, TestEnv};
 use super::registry::schema_2020_12;
 use super::*;
 use crate::config::CoreConfig;
+use crate::events::EventBus;
 use crate::session::Session;
 use crate::state::{OnFatal, StateRegistry};
 
@@ -221,7 +222,8 @@ fn fixture_with(hooks: PipelineHooks, log: &Log, extra: &[Arc<dyn Tool>]) -> Fix
     }
     let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
     let clock: Arc<dyn Clock> = FakeClock::new();
-    let dispatcher = Dispatcher::new(reg, hooks, states, ids, clock);
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let dispatcher = Dispatcher::new(reg, hooks, states, events, ids, clock);
     Fixture {
         env,
         log,
@@ -622,6 +624,7 @@ fn registry_and_dispatcher_live_in_the_tools_module() {
         crate::tools::Registry,
         PipelineHooks,
         Arc<StateRegistry>,
+        Arc<EventBus>,
         Arc<dyn IdSource>,
         Arc<dyn Clock>,
     ) -> crate::tools::Dispatcher;
@@ -649,6 +652,7 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.block",
             "test.destructive",
             "test.echo",
+            "test.emit",
             "test.panic",
             "test.state_panic",
             "test.write"
@@ -662,6 +666,7 @@ async fn test_tools_exist_only_on_test_channels() {
         reg,
         PipelineHooks::plan2(),
         states,
+        Arc::new(EventBus::new(FakeClock::new())),
         Arc::new(SeqIds::new()),
         FakeClock::new(),
     );

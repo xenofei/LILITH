@@ -9,9 +9,11 @@
 //! | `test.panic` | read | `{}` | panics |
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
 //! | `test.destructive` | destructive | `{}` | `{executed: true}` |
+//! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
 //!
 //! `executions` counts the runs of that tool with that label or gate in this core, failed runs
-//! included. `test.emit` comes with the event bus (Task 11).
+//! included. `test.emit` is `read`: it changes no state, only publishes an event (so it needs
+//! no idempotency key); a topic that makes no valid name is `params.invalid`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -19,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use ww_protocol::{EffectClass, ErrorBody, codes};
+use ww_protocol::{EffectClass, ErrorBody, codes, is_valid_topic};
 
 use super::registry::{Registry, typed_tool};
 use crate::state::StateRegistry;
@@ -110,6 +112,20 @@ struct BlockArgs {
 struct BlockResult {
     gate: String,
     executions: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EmitArgs {
+    /// Published on `test:<topic>`.
+    topic: String,
+    data: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct EmitResult {
+    topic: String,
+    seq: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -235,6 +251,28 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         TEST_MODULE,
         |_ctx, _args: NoArgs| {
             Box::pin(async move { Ok((DestructiveResult { executed: true }, "executed".into())) })
+        },
+    ));
+
+    reg.register(typed_tool(
+        "test.emit",
+        "Test channels only: publishes `data` as an event on the topic `test:<topic>`.",
+        EffectClass::Read,
+        TEST_MODULE,
+        |ctx, args: EmitArgs| {
+            Box::pin(async move {
+                let topic = format!("{TEST_MODULE}:{}", args.topic);
+                if !is_valid_topic(&topic) {
+                    return Err(ErrorBody::new(
+                        &codes::PARAMS_INVALID,
+                        format!("{topic:?} is not a valid topic name"),
+                        ctx.trace_id.clone(),
+                    ));
+                }
+                let seq = ctx.events.publish(&topic, args.data);
+                let summary = format!("published {topic} seq {seq}");
+                Ok((EmitResult { topic, seq }, summary))
+            })
         },
     ));
 }

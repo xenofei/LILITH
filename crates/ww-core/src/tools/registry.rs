@@ -19,6 +19,7 @@ use ww_protocol::{
 };
 
 use super::stages::Settings;
+use crate::events::EventBus;
 use crate::session::Session;
 
 /// What a tool's `run` returns.
@@ -30,6 +31,8 @@ pub struct CallCtx {
     pub session: Arc<Session>,
     pub trace_id: String,
     pub settings: Settings,
+    /// The core's event bus, for tools that publish (`test.emit`; plan 2b's store).
+    pub events: Arc<EventBus>,
 }
 
 /// One tool.
