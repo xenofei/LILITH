@@ -35,14 +35,21 @@
 //! retry is `version.exists` as before, so a sealed folder is never overwritten:
 //! - the manifest records the version nowhere (not `approved_version`, no run's
 //!   `signed_off.version`);
+//! - `v<version>` itself is a plain folder: a link (never followed), a file or a cloud-only
+//!   placeholder there is `version.exists` (ruling Q34);
 //! - nothing in it is a link or a cloud-only file;
 //! - its `manifest.snapshot.json` names this run as signed off as this version, with the
 //!   same chosen files;
 //! - every chosen file is there, every other top-level file is one the seal would have
 //!   sealed, and each has the run's recorded `sha256` (or, without one, the generated hash
-//!   the seal recorded); each `source/**` file has the generated hash the seal recorded.
+//!   the seal recorded); each `source/**` file has the generated hash the seal recorded;
+//! - no file the seal would have sealed is missing from it while the run still holds it
+//!   (it is exactly what the seal makes, ruling Q34).
 //!
-//! The adopted files are recorded as generated again, and [`Sealed::adopted`] is set.
+//! An adopted file that lost its read-only bit gets it back (the bit is only ever set, never
+//! cleared, ruling Q34). The adopted files are recorded as generated again,
+//! [`Sealed::adopted`] is set, and [`Sealed::signed_off_date`] carries the snapshot's
+//! `signed_off.date`, which the manifest then records (ruling Q34).
 //!
 //! Every copy and move hits the fail point `store.replace` and retries sharing violations
 //! under the store's budget (`store.busy` after it). On an error before step 6 finishes, each
@@ -81,6 +88,9 @@ use super::staging::SEAL_PREFIX;
 use super::write::{
     PathLock, Seen, Store, StoreError, blocking, exists, link_refused, lock, remove_if_hash, see,
 };
+
+/// `FILE_ATTRIBUTE_READONLY`.
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 
 /// The snapshot every sealed version holds (I5 sign-off step 4).
 pub const SNAPSHOT: &str = "manifest.snapshot.json";
@@ -124,6 +134,8 @@ pub struct Sealed {
     pub left_run: Vec<WsPath>,
     /// An unrecorded `v<version>/` of the same sign-off was adopted (module docs).
     pub adopted: bool,
+    /// For an adopted version: the snapshot's `signed_off.date`, the day it was sealed.
+    pub signed_off_date: Option<String>,
 }
 
 /// A `v<version>/` folder of an asset.
@@ -730,6 +742,7 @@ impl Store {
             snapshot_sha256,
             left_run: Vec::new(),
             adopted: false,
+            signed_off_date: None,
         })
     }
 
@@ -792,6 +805,15 @@ impl Store {
             return refuse("the manifest records this version");
         }
         let abs = version_rel.abs(self.root());
+        // The folder itself first: a link there is never followed, and a file or a
+        // placeholder is no seal (ruling Q34).
+        let (probe, at) = (self.probe().clone(), abs.clone());
+        let itself = blocking(move || see(probe.as_ref(), &at, |_| Ok(())))
+            .await
+            .map_err(|e| StoreError::io(version_rel, &e))?;
+        if !matches!(itself, Seen::Folder) {
+            return refuse("it isn't a plain folder (a link, a file or a cloud-only placeholder)");
+        }
         let (probe, dir) = (self.probe().clone(), abs.clone());
         let unsafe_inside = blocking(move || unsafe_entry(probe.as_ref(), &dir))
             .await
@@ -817,20 +839,18 @@ impl Store {
         };
         let keys =
             |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| path_key(n)).collect() };
-        let same_signoff = snapshot
-            .view()
+        let snapshot_view = snapshot.view();
+        let signed_off = snapshot_view
             .candidate_runs
             .iter()
             .find(|r| path_key(&r.run_id) == path_key(&req.run_id))
-            .is_some_and(|r| {
-                r.signed_off
-                    .as_ref()
-                    .is_some_and(|s| s.version == req.version)
-                    && keys(&r.selected) == keys(chosen)
-            });
-        if !same_signoff {
+            .filter(|r| keys(&r.selected) == keys(chosen))
+            .and_then(|r| r.signed_off.as_ref())
+            .filter(|s| s.version == req.version);
+        let Some(signed_off) = signed_off else {
             return refuse("its snapshot isn't this run's sign-off as this version");
-        }
+        };
+        let signed_off_date = signed_off.date.clone();
 
         // Every file is one the seal would have sealed, with the hash the run recorded (or
         // the one the seal recorded as generated).
@@ -878,6 +898,27 @@ impl Store {
         if chosen.iter().any(|c| !present.contains(&path_key(c))) {
             return refuse("a chosen file isn't in it");
         }
+        // Exactly what the seal makes: a file it would have sealed that the run still holds
+        // (a derived file put back, say) but the folder lacks is a mismatch.
+        let run_abs = found.run.abs(self.root());
+        for (name, _) in plan_names(chosen, records) {
+            if !present.contains(&path_key(&name)) && self.exists_now(&run_abs.join(&name)).await {
+                return refuse("a file the seal would have sealed is in the run, not in it");
+            }
+        }
+
+        // Every adopted file is read-only, as the seal leaves it: the bit is only ever set.
+        let paths: Vec<PathBuf> = listed.iter().map(|(_, path)| path.clone()).collect();
+        blocking(move || {
+            for path in &paths {
+                if ww_platform::fs::attributes(path)? & FILE_ATTRIBUTE_READONLY == 0 {
+                    fsops::set_readonly(path, true)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::io(version_rel, &e))?;
 
         let now = self.now_utc();
         let mut files = Vec::new();
@@ -905,6 +946,7 @@ impl Store {
             snapshot_sha256,
             left_run: Vec::new(),
             adopted: true,
+            signed_off_date: Some(signed_off_date),
         };
         sealed.left_run = self.left_run(found.run, &sealed).await;
         tracing::info!(version = %version_rel, "an unrecorded seal of the same sign-off is adopted");

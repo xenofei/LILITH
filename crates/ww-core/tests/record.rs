@@ -77,6 +77,7 @@ struct Fx {
     ws_ref: WorkspaceRef,
     ws: PathBuf,
     env: TestEnv,
+    clock: Arc<FakeClock>,
     _states: Arc<StateRegistry>,
 }
 
@@ -107,7 +108,8 @@ impl Fx {
             )
             .expect("the suite state.db"),
         );
-        let clock: Arc<dyn Clock> = FakeClock::new();
+        let fake = FakeClock::new();
+        let clock: Arc<dyn Clock> = fake.clone();
         let events = Arc::new(EventBus::new(clock.clone()));
         let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
         let probe: Arc<dyn Probe> = probe(&ws);
@@ -149,6 +151,7 @@ impl Fx {
             ws_ref: ws_ref(&ws),
             ws,
             env,
+            clock: fake,
             _states: states,
         }
     }
@@ -1137,4 +1140,42 @@ async fn a_cloud_only_progress_md_is_a_warning_and_the_operation_is_recorded() {
     );
     // The placeholder itself was never read or written.
     assert_eq!(std::fs::read(&progress).unwrap(), progress_before);
+}
+
+#[tokio::test] // spec: CORE-026, CORE-051 (ruling Q34)
+async fn an_adopted_signoff_keeps_the_snapshots_date() {
+    let fp = FailPoints::none();
+    let arm = Arc::new(AtomicBool::new(false));
+    fail_once(&fp, "store.after_output", arm.clone());
+    let fx = Fx::new(|_| {}, |h| h, fp);
+    let run = fx.import_run(KITE, "a.png", b"a").await;
+    let args = Fx::signoff_args(KITE, &run, "a.png", json!({}));
+    let idem = key();
+    arm.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        fx.call_keyed("asset.signoff", args.clone(), idem.clone())
+            .await,
+        Outcome::Error { .. }
+    ));
+    let snapshot: Value = serde_json::from_str(&read_text(
+        &fx.path(&format!("{KITE_DIR}/v1.0.0/manifest.snapshot.json")),
+    ))
+    .unwrap();
+    let sealed_on = snapshot["candidate_runs"][0]["signed_off"]["date"].clone();
+    assert!(sealed_on.is_string(), "{snapshot}");
+    // The retry comes two days later: the manifest still says when the version was sealed.
+    fx.clock.advance(Duration::from_secs(2 * 86_400));
+    match fx.call_keyed("asset.signoff", args, idem).await {
+        Outcome::Ok(_) => {}
+        other => panic!("the retry should succeed: {other:?}"),
+    }
+    let m = fx.manifest(KITE);
+    assert_eq!(
+        m["candidate_runs"][0]["signed_off"]["date"], sealed_on,
+        "{m}"
+    );
+    assert_eq!(
+        m["candidate_runs"][0]["signed_off"], snapshot["candidate_runs"][0]["signed_off"],
+        "{m}"
+    );
 }

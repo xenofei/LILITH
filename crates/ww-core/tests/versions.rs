@@ -1029,3 +1029,164 @@ async fn version_content_hashes_come_from_the_manifest() {
     assert!(!versions[0].cloud_only);
     assert!(!versions[0].legacy);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ruling Q34: adoption of an unrecorded seal is exact and never follows a link.
+// ---------------------------------------------------------------------------------------------
+
+/// `m` as the sign-off of `run` as `version` with `files` chosen leaves it: the snapshot a
+/// real sign-off seals.
+fn signed(mut m: Manifest, run: &str, version: &str, files: &[&str]) -> Manifest {
+    for r in m.runs_mut() {
+        if r.get("run_id").and_then(Value::as_str) == Some(run) {
+            r.insert("status".into(), json!("selected"));
+            r.insert("selected".into(), json!(files));
+            r.insert(
+                "signed_off".into(),
+                json!({"by": "user", "date": "2027-01-15", "version": version}),
+            );
+        }
+    }
+    m
+}
+
+/// Seals `files` of `r_1` as v1.0.0 with a signed-off snapshot and leaves it unrecorded, as
+/// a sign-off whose Record stage failed would; returns the request to retry with.
+async fn unrecorded_seal(
+    ws: &Ws,
+    run: &[(&str, &str, Option<&str>)],
+    files: &[&str],
+) -> SealRequest {
+    let m = ws.run("r_1", run);
+    let req = request("r_1", "1.0.0", files, signed(m, "r_1", "1.0.0", files));
+    seal(&ws.plain(), req.clone())
+        .await
+        .expect("the first seal");
+    req
+}
+
+/// Moves a file or folder as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn move_outside(from: &Path, to: &Path) {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::rename(from, to).unwrap();
+}
+
+/// Clears the read-only bit as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn clear_read_only(path: &Path) {
+    ww_platform::fs::set_readonly(path, false).unwrap();
+}
+
+/// A junction at `link` to the folder `target` (no privilege needed).
+#[allow(clippy::disallowed_methods)]
+fn junction(link: &Path, target: &Path) {
+    ww_platform::fs::create_junction(link, target)
+        .unwrap_or_else(|e| panic!("cannot create a junction at {}: {e}", link.display()));
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
+async fn a_linked_version_folder_is_never_adopted_or_followed() {
+    let ws = workspace();
+    let req = unrecorded_seal(&ws, &[("a.png", "candidate", None)], &["a.png"]).await;
+    // The sealed folder now lives outside the workspace, and `v1.0.0` is a junction to it.
+    let outside = ws.env.root().join("outside-v1");
+    move_outside(&ws.file(&format!("{ASSET}/v1.0.0")), &outside);
+    junction(&ws.file(&format!("{ASSET}/v1.0.0")), &outside);
+    let before = {
+        let mut out = Vec::new();
+        walk(&outside, "", &mut out);
+        out.sort();
+        out
+    };
+    let result = seal(&ws.plain(), req).await;
+    assert!(
+        matches!(result, Err(StoreError::VersionExists(ref v)) if v == "1.0.0"),
+        "{result:?}"
+    );
+    let mut after = Vec::new();
+    walk(&outside, "", &mut after);
+    after.sort();
+    assert_eq!(after, before);
+    assert_eq!(
+        ww_platform::fs::reparse_tag(&ws.file(&format!("{ASSET}/v1.0.0"))).unwrap(),
+        Some(ww_platform::fs::IO_REPARSE_TAG_MOUNT_POINT),
+        "the junction is still there"
+    );
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
+async fn a_file_named_like_the_version_folder_is_version_exists() {
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    write_file(
+        &ws.file(&format!("{ASSET}/v1.0.0")),
+        b"a file, not a folder",
+    );
+    let req = request(
+        "r_1",
+        "1.0.0",
+        &["a.png"],
+        signed(m, "r_1", "1.0.0", &["a.png"]),
+    );
+    let result = seal(&ws.plain(), req).await;
+    assert!(
+        matches!(result, Err(StoreError::VersionExists(ref v)) if v == "1.0.0"),
+        "{result:?}"
+    );
+    assert_eq!(ws.read(&format!("{ASSET}/v1.0.0")), b"a file, not a folder");
+    assert_eq!(
+        ws.read(&format!("{ASSET}/candidates/r_1/a.png")),
+        bytes_of("r_1", "a.png")
+    );
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
+async fn a_version_without_a_derived_file_still_in_the_run_is_not_adopted() {
+    let ws = workspace();
+    let req = unrecorded_seal(
+        &ws,
+        &[
+            ("a.png", "candidate", None),
+            ("a_cut.png", "derived", Some("a.png")),
+        ],
+        &["a.png"],
+    )
+    .await;
+    // The derived file went back to the run: the folder isn't what the seal made.
+    move_outside(
+        &ws.file(&format!("{ASSET}/v1.0.0/a_cut.png")),
+        &ws.file(&format!("{ASSET}/candidates/r_1/a_cut.png")),
+    );
+    let result = seal(&ws.plain(), req).await;
+    assert!(
+        matches!(result, Err(StoreError::VersionExists(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        ws.tree(&format!("{ASSET}/v1.0.0")),
+        ["a.png", "manifest.snapshot.json"]
+    );
+    assert!(ws.exists(&format!("{ASSET}/candidates/r_1/a_cut.png")));
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
+async fn adoption_makes_writable_sealed_files_read_only_again() {
+    let ws = workspace();
+    let req = unrecorded_seal(&ws, &[("a.png", "candidate", None)], &["a.png"]).await;
+    let a = format!("{ASSET}/v1.0.0/a.png");
+    clear_read_only(&ws.file(&a));
+    assert!(!ws.read_only(&a));
+    let sealed = seal(&ws.plain(), req).await.expect("the retry adopts");
+    assert!(sealed.adopted);
+    for name in ["a.png", "manifest.snapshot.json"] {
+        assert!(
+            ws.read_only(&format!("{ASSET}/v1.0.0/{name}")),
+            "{name} is writable after adoption"
+        );
+    }
+    assert_eq!(ws.read(&a), bytes_of("r_1", "a.png"));
+    assert_eq!(sealed.signed_off_date.as_deref(), Some("2027-01-15"));
+}

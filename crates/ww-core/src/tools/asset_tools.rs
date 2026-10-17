@@ -940,6 +940,9 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
 
     let prefix = format!("v{version}/");
     let sealed_files: Vec<(String, String)> = sealed.files.clone();
+    // An adopted seal was signed off when it was sealed: the manifest takes the snapshot's
+    // date (ruling Q34).
+    let sealed_on = sealed.signed_off_date.clone().filter(|_| sealed.adopted);
     let (rel, run_id, files, keep) = (
         a.manifest.clone(),
         run.run_id.clone(),
@@ -1002,6 +1005,17 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
             return Err(conflict(&rel));
         }
         out.set("hashes", Value::Object(hashes));
+        if let Some(date) = &sealed_on {
+            for run in out.runs_mut() {
+                let ours = run
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&run_id));
+                if let (true, Some(Value::Object(signed))) = (ours, run.get_mut("signed_off")) {
+                    signed.insert("date".into(), Value::from(date.as_str()));
+                }
+            }
+        }
         *m = out;
         Ok(())
     });
