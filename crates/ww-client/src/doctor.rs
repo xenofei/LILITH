@@ -12,6 +12,9 @@
 //! - [`set_aside`] renames `state.db` and its `-wal`, `-shm` and `-journal` files to
 //!   `<name>.damaged-<YYYYMMDDTHHMMSSZ>` in the same folder. Nothing is ever deleted or
 //!   overwritten.
+//!   Side files left without their database ([`StateFileState::Leftovers`]) are moved the same
+//!   way, so a fresh database never takes an old WAL for its own.
+//! - [`core_running`] tells whether a core serves the channel; nothing is offered while one does.
 //! - [`finish_recovery`] opens the database read-write once, so SQLite rolls a hot journal back,
 //!   then inspects it again.
 //! - [`inspect_suite_toml`] reads `suite.toml` itself and never resolves the `cli` workspace
@@ -25,6 +28,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 use ww_platform::Env;
 use ww_platform::fs::move_new;
+use ww_platform::pipe::{ConnectError, open_client};
 use ww_platform::process::{GIT_REPO_VARS, find_on_path, run_hidden_without};
 use ww_schema::{SUITE_STATE_SCHEMA, SuiteToml};
 
@@ -41,18 +45,34 @@ pub enum StateFileState {
     TooNew { found: i64, known: i64 },
     /// A hot rollback journal lies beside it: a crash mid-write.
     HotJournal,
+    /// No database, but some of its `-wal`, `-shm` or `-journal` files are left: a fresh
+    /// database created beside them could take an old WAL for its own, so they are set aside
+    /// first (only moved, never deleted).
+    Leftovers(Vec<PathBuf>),
 }
 
 /// The suite `state.db` (`Env::suite_state_db`), inspected without changing or creating
 /// anything.
 pub fn inspect_suite_state(env: &Env) -> StateFileState {
-    inspect_db(&env.suite_state_db())
+    // A running core may be writing it: then never `immutable=1`.
+    inspect_db(&env.suite_state_db(), !core_running(env))
 }
 
-/// [`inspect_suite_state`] of the database at `path`.
-fn inspect_db(path: &Path) -> StateFileState {
+/// [`inspect_suite_state`] of the database at `path`; `quiet`: no process may be writing it.
+fn inspect_db(path: &Path, quiet: bool) -> StateFileState {
     match path.try_exists() {
-        Ok(false) => return StateFileState::Missing,
+        Ok(false) => {
+            let left: Vec<PathBuf> = SIDE_FILES
+                .iter()
+                .map(|s| beside(path, s))
+                .filter(|p| p.exists())
+                .collect();
+            return if left.is_empty() {
+                StateFileState::Missing
+            } else {
+                StateFileState::Leftovers(left)
+            };
+        }
         Ok(true) => {}
         Err(e) => return StateFileState::Damaged(format!("it can't be looked at: {e}")),
     }
@@ -62,7 +82,7 @@ fn inspect_db(path: &Path) -> StateFileState {
     if has_hot_journal(path) {
         return StateFileState::HotJournal;
     }
-    let conn = match open_untouched(path) {
+    let conn = match open_untouched(path, quiet) {
         Ok(conn) => conn,
         Err(e) => return StateFileState::Damaged(e.to_string()),
     };
@@ -100,14 +120,15 @@ fn beside(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Moves the suite `state.db`, then each of its `-wal`, `-shm` and `-journal` files that
-/// exists, to `<name>.damaged-<YYYYMMDDTHHMMSSZ>` (the UTC time `now_utc`, in Unix seconds) in
+/// Moves the suite `state.db` (when there is one; [`StateFileState::Leftovers`] has none), then
+/// each of its `-wal`, `-shm` and `-journal` files that exists, to `<name>.damaged-<YYYYMMDDTHHMMSSZ>` (the UTC time `now_utc`, in Unix seconds) in
 /// the same folder, and returns the new paths. Nothing is deleted, and no existing file is
 /// replaced. The core then starts with a fresh database (owner decision 5).
 ///
 /// # Errors
-/// When a file can't be moved. A file another program holds open (Windows error 32) says so;
-/// the error names what was already moved, so nothing is lost track of.
+/// When there is nothing to set aside, or a file can't be moved. A file another program holds
+/// open (Windows error 32) says so; the error names what was already moved, so nothing is lost
+/// track of.
 pub fn set_aside(env: &Env, now_utc: i64) -> io::Result<Vec<PathBuf>> {
     set_aside_at(&env.suite_state_db(), now_utc)
 }
@@ -120,12 +141,17 @@ pub fn set_aside_suffix(now_utc: i64) -> String {
 fn set_aside_at(db: &Path, now_utc: i64) -> io::Result<Vec<PathBuf>> {
     let suffix = set_aside_suffix(now_utc);
     let mut moved = Vec::new();
-    let files = std::iter::once(db.to_path_buf()).chain(SIDE_FILES.iter().map(|s| beside(db, s)));
-    for (n, from) in files.enumerate() {
-        // The database must exist; its side files only when they do.
-        if n > 0 && !from.exists() {
-            continue;
-        }
+    let files: Vec<PathBuf> = std::iter::once(db.to_path_buf())
+        .chain(SIDE_FILES.iter().map(|s| beside(db, s)))
+        .filter(|p| p.exists())
+        .collect();
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("there is no {} and none of its side files", db.display()),
+        ));
+    }
+    for from in files {
         let to = beside(&from, &suffix);
         if let Err(e) = move_new(&from, &to) {
             let why = if e.raw_os_error() == Some(32) {
@@ -179,7 +205,7 @@ pub fn finish_recovery(env: &Env) -> io::Result<StateFileState> {
     if let Err(e) = rolled_back {
         return Ok(StateFileState::Damaged(e.to_string()));
     }
-    Ok(inspect_db(&path))
+    Ok(inspect_db(&path, true))
 }
 
 /// Whether `<path>-journal` is a hot rollback journal: not empty, and its header not zeroed (the
@@ -199,11 +225,13 @@ fn has_hot_journal(path: &Path) -> bool {
     read > 0 && head[..read].iter().any(|&b| b != 0)
 }
 
-/// A read-only connection that leaves no trace: `immutable=1` when there is no `-wal` file (no
-/// `-wal` or `-shm` is created), a plain read-only open when the WAL must be read.
-fn open_untouched(path: &Path) -> rusqlite::Result<Connection> {
+/// A read-only connection that leaves no trace: `immutable=1` on a quiet file without a `-wal`
+/// (no `-wal` or `-shm` is created); a plain read-only open when the WAL must be read, or when a
+/// core may be writing the file (immutable reads skip SQLite's locks).
+fn open_untouched(path: &Path, quiet: bool) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    if !beside(path, "-wal").exists()
+    if quiet
+        && !beside(path, "-wal").exists()
         && let Some(uri) = immutable_uri(path)
     {
         return Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI);
@@ -277,6 +305,20 @@ pub fn inspect_suite_toml(env: &Env) -> SuiteTomlState {
         },
         _ => SuiteTomlState::DefaultMissing(default),
     }
+}
+
+/// Whether a core serves this channel's pipe now (it holds the suite `state.db` open). Any
+/// answer but "no such pipe" counts as running, so a set-aside is never offered while one may
+/// be using the files.
+pub fn core_running(env: &Env) -> bool {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return true;
+    };
+    let pipe = env.pipe_name();
+    rt.block_on(async { !matches!(open_client(&pipe), Err(ConnectError::NotFound)) })
 }
 
 /// How long the `git config` run may take.

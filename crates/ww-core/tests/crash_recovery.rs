@@ -598,3 +598,77 @@ fn hot_journal_exits_7_with_nothing_changed() {
         assert!(!beside(&db, suffix).exists(), "{suffix} appeared");
     }
 }
+
+/// `project.status`'s `missing` list.
+fn missing(pipe: &mut RawPipe) -> Vec<String> {
+    let status = pipe.tool_ok("project.status", json!({"project": "sketchbook"}), None);
+    status["missing"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{status}"))
+        .iter()
+        .map(|m| m.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test] // spec: ARCH-079, CORE-038, CORE-005 (ruling Q25)
+fn files_gone_while_no_core_ran_are_missing_after_a_cold_rebuild() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = default_workspace(&env, "cold missing");
+    let sealed = format!("{ASSET_DIR}/v1.0.0/crane_b.png");
+    let open_run = format!("{ASSET_DIR}/candidates/r_20261003_1400/crane_c.png");
+    let sealed_bytes = std::fs::read(file(&ws, &sealed)).unwrap();
+    {
+        let _core = CoreFixture::start(&env);
+        let mut pipe = session(&env, &ws);
+        assert!(missing(&mut pipe).is_empty());
+    }
+    // Both vanish while no core runs, and so does the index.
+    outside_remove(&file(&ws, &sealed));
+    outside_remove(&file(&ws, &open_run));
+    let index = env.workspace_local_dir(&ws).join("index.db");
+    for suffix in ["", "-wal", "-shm"] {
+        outside_remove(&beside(&index, suffix));
+    }
+
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, &ws);
+    let listed = missing(&mut pipe);
+    assert!(listed.contains(&sealed), "{listed:?}");
+    assert!(listed.contains(&open_run), "{listed:?}");
+    let detail = pipe.tool_ok(
+        "asset.get",
+        json!({"project": "sketchbook", "asset_id": ASSET}),
+        None,
+    );
+    let state = |rel: &str| {
+        detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == rel)
+            .map(|f| f["state"].clone())
+    };
+    assert_eq!(
+        state("v1.0.0/crane_b.png"),
+        Some(json!("missing")),
+        "{detail}"
+    );
+
+    // A read-only core (another channel; an in-memory index, so every open is cold) sees it too.
+    let other = TestEnv::with_label("Ünïcödé other");
+    other.register_workspace(&ws, true);
+    {
+        let _reader = CoreFixture::start(&other);
+        let mut pipe = session(&other, &ws);
+        let listed = missing(&mut pipe);
+        assert!(listed.contains(&sealed), "read-only: {listed:?}");
+    }
+
+    // The same bytes coming back make it ok again.
+    pipe.fence(&ws);
+    write_file(&file(&ws, &sealed), &sealed_bytes);
+    pipe.fence(&ws);
+    let listed = missing(&mut pipe);
+    assert!(!listed.contains(&sealed), "{listed:?}");
+    assert!(listed.contains(&open_run), "{listed:?}");
+}

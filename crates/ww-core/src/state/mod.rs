@@ -14,7 +14,9 @@
 //! **Check before write.** An existing file with a hot rollback journal beside it (a crash
 //! mid-write) is refused before SQLite sees it ([`StateError::HotJournal`]): any open would roll
 //! the journal back. Otherwise the file is first opened read-only, `immutable=1` when there is
-//! no `-wal` file, so a file that is then refused never gets fresh `-wal` and `-shm` files:
+//! no `-wal` file and no other core can be writing it (never for a read-only workspace open,
+//! whose lock holder may be live), so a file that is then refused never gets fresh `-wal` and
+//! `-shm` files:
 //! `PRAGMA quick_check` must say `ok` and `PRAGMA user_version` must not exceed the migrations
 //! this build knows.
 //! Only then is it opened read-write (WAL, `synchronous=FULL`, `busy_timeout=5000`,
@@ -247,7 +249,9 @@ impl StateDb {
             .map_err(|e| StateError::Io(format!("cannot look at {}: {e}", path.display())))?;
         if exists {
             refuse_hot_journal(path)?;
-            check_existing(path, known)?;
+            // Only this core may write the file (the suite's pipe owner, or the holder of the
+            // workspace's `core.lock`), so no writer is live: `immutable=1` is safe here.
+            check_existing(path, known, Quiet::Yes)?;
         }
         let mut conn = open_read_write(path)?;
         let schema_version = migrate(&mut conn, migrations).map_err(Migrate::into_state)?;
@@ -294,7 +298,9 @@ impl StateDb {
             return StateDb::open_in_memory(scope, thread_name, on_fatal);
         }
         refuse_hot_journal(path)?;
-        check_existing(path, known)?;
+        // Another core holds `core.lock` and may be writing right now: `immutable=1` would read
+        // a torn view, so this check is a plain read-only open.
+        check_existing(path, known, Quiet::No)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -704,13 +710,24 @@ fn sqlite_uri(path: &Path, query: &str) -> Option<String> {
     Some(uri)
 }
 
-/// A read-only connection to an existing database that leaves no trace: without a `-wal`
-/// file it is opened `immutable=1`, so SQLite creates no `-wal` or `-shm` beside a file it
-/// may then refuse. With a `-wal` file (a live or crashed WAL database) the WAL must be read,
-/// so it is a plain read-only open.
-fn open_untouched(path: &Path) -> rusqlite::Result<Connection> {
+/// Whether a database file may have a live writer while it is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quiet {
+    /// No other process may write it: `immutable=1` is safe.
+    Yes,
+    /// Another core may be writing it: never `immutable=1`.
+    No,
+}
+
+/// A read-only connection to an existing database. On a quiet file without a `-wal` it is
+/// opened `immutable=1`, so SQLite creates no `-wal` or `-shm` beside a file it may then
+/// refuse. With a `-wal` file (a live or crashed WAL database) the WAL must be read, and a file
+/// another core may be writing must not be read as immutable (SQLite would skip its locks and
+/// could see a half-written page): both are plain read-only opens.
+fn open_untouched(path: &Path, quiet: Quiet) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    if !beside(path, "-wal").exists()
+    if quiet == Quiet::Yes
+        && !beside(path, "-wal").exists()
         && let Some(uri) = sqlite_uri(path, "immutable=1")
     {
         return Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI);
@@ -720,8 +737,8 @@ fn open_untouched(path: &Path) -> rusqlite::Result<Connection> {
 
 /// Step 2 of the open order: an existing file, read-only ([`open_untouched`]). `quick_check`
 /// must say `ok`, and `user_version` must be between 0 and `known`.
-fn check_existing(path: &Path, known: i64) -> Result<(), StateError> {
-    let conn = open_untouched(path).map_err(|e| sql_error(&e))?;
+fn check_existing(path: &Path, known: i64, quiet: Quiet) -> Result<(), StateError> {
+    let conn = open_untouched(path, quiet).map_err(|e| sql_error(&e))?;
     let checked = (|| -> rusqlite::Result<(Vec<String>, i64)> {
         let report = conn
             .prepare("PRAGMA quick_check")?

@@ -21,7 +21,9 @@
 //! - `sealed.readonly` (CORE-026): a sealed file (a `hashes` entry of a `v<semver>/` folder that
 //!   holds `manifest.snapshot.json`) without the read-only attribute gets it back with `fix`
 //!   when its SHA-256 matches the manifest (a clone or checkout drops the attribute); one that
-//!   doesn't match is a human edit, listed and left as it is.
+//!   doesn't match is a human edit, listed and left as it is. A git-lfs pointer whose `oid` is
+//!   the recorded hash is not fetched yet, not edited (ARCH-085): named and left writable. A
+//!   cloud-only placeholder is never read (that would download it): named as cloud-only.
 //! - `workspace.volume`: a network or cloud volume, or one without stable file IDs.
 //! - `workspace.watcher`: a workspace served without a folder watch (Task 11).
 //! - `workspace.orphans`, `workspace.needs_repair`, `workspace.missing` (CORE-038): listed,
@@ -36,7 +38,7 @@ use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use ww_platform::fs::Probe;
+use ww_platform::fs::{PLACEHOLDER_ATTRIBUTES, Probe};
 use ww_protocol::{EffectClass, ErrorBody};
 use ww_schema::{Manifest, Version, bare_sha256};
 
@@ -380,6 +382,8 @@ async fn sealed_check(d: &Doctor, open: &OpenWorkspace, fix: bool) -> DoctorChec
     let mut writable = Vec::new();
     let mut edited = Vec::new();
     let mut failed = Vec::new();
+    let mut not_fetched = Vec::new();
+    let mut cloud_only = Vec::new();
     for (rel, recorded) in sealed_files(open).await {
         let abs = rel.abs(store.root());
         let Ok(identity) = d.probe.identity(&abs) else {
@@ -388,8 +392,18 @@ async fn sealed_check(d: &Doctor, open: &OpenWorkspace, fix: bool) -> DoctorChec
         if identity.attributes & READONLY != 0 {
             continue;
         }
-        match store.hash(&rel).await {
-            Ok(Some(found)) if found == recorded => {
+        if identity.attributes & PLACEHOLDER_ATTRIBUTES != 0 {
+            // Reading it would download it (ARCH-074): it is left as it is, unread.
+            cloud_only.push(rel.as_str().to_string());
+            continue;
+        }
+        match store.hash_and_oid(&rel).await {
+            // A git-lfs pointer to the recorded bytes isn't fetched yet, not edited (ARCH-085):
+            // git writes the real file over it, so it stays writable.
+            Ok(Some((_, Some(oid)))) if oid == recorded => {
+                not_fetched.push(rel.as_str().to_string());
+            }
+            Ok(Some((found, None))) if found == recorded => {
                 if !fix {
                     writable.push(rel.as_str().to_string());
                     continue;
@@ -406,6 +420,21 @@ async fn sealed_check(d: &Doctor, open: &OpenWorkspace, fix: bool) -> DoctorChec
             Ok(None) => {}
             Err(e) => failed.push(format!("{rel} ({e})")),
         }
+    }
+    let mut notes = Vec::new();
+    if !not_fetched.is_empty() {
+        notes.push(format!(
+            "{} sealed file(s) are git-lfs pointers not fetched yet, left writable: {}",
+            not_fetched.len(),
+            not_fetched.join(", ")
+        ));
+    }
+    if !cloud_only.is_empty() {
+        notes.push(format!(
+            "{} sealed file(s) are cloud-only and weren't read: {}",
+            cloud_only.len(),
+            cloud_only.join(", ")
+        ));
     }
     let mut problems = Vec::new();
     if !edited.is_empty() {
@@ -438,17 +467,18 @@ async fn sealed_check(d: &Doctor, open: &OpenWorkspace, fix: bool) -> DoctorChec
             restored.join(", ")
         )
     });
-    match (problems.is_empty(), fixed) {
-        (true, None) => DoctorCheck::new(ID, OK, "every sealed file is read-only"),
-        (true, Some(fixed)) => DoctorCheck::new(ID, FIXED, fixed),
-        (false, fixed) => {
-            let mut detail = problems.join("; ");
-            if let Some(fixed) = fixed {
-                detail = format!("{fixed}; {detail}");
-            }
-            DoctorCheck::new(ID, PROBLEM, detail)
+    let (state, mut parts) = match (problems.is_empty(), fixed) {
+        (true, None) if notes.is_empty() => {
+            (OK, vec!["every sealed file is read-only".to_string()])
         }
-    }
+        (true, None) => (OK, vec!["the other sealed files are read-only".to_string()]),
+        (true, Some(fixed)) => (FIXED, vec![fixed]),
+        (false, fixed) => (PROBLEM, fixed.into_iter().collect()),
+    };
+    // The notes go before the problems, so a problem's ` — <what to do>` stays last.
+    parts.extend(notes);
+    parts.extend(problems);
+    DoctorCheck::new(ID, state, parts.join("; "))
 }
 
 /// Every sealed file the manifests record, with its recorded SHA-256 (bare hex): the `hashes`

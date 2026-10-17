@@ -1254,13 +1254,25 @@ impl Store {
     /// # Errors
     /// As above, and `store.io` (or `store.busy`) when the file can't be read.
     pub async fn hash(&self, rel: &WsPath) -> Result<Option<String>, StoreError> {
+        Ok(self.hash_and_oid(rel).await?.map(|(sha256, _)| sha256))
+    }
+
+    /// [`Store::hash`], with the `oid` when the file is a git-lfs pointer (ARCH-085): what the
+    /// file stands for is then the oid, as in step 3 of the write.
+    ///
+    /// # Errors
+    /// As [`Store::hash`].
+    pub async fn hash_and_oid(
+        &self,
+        rel: &WsPath,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
         match self
             .see_hash(&rel.abs(&self.root))
             .await
             .map_err(|e| StoreError::io(rel, &e))?
         {
             Seen::Missing => Ok(None),
-            Seen::Found(h) => Ok(Some(h.sha256)),
+            Seen::Found(h) => Ok(Some((h.sha256, h.lfs_oid))),
             Seen::Placeholder => Err(StoreError::cloud_only(rel)),
             Seen::Link => Err(link_refused(rel)),
             Seen::Folder => Err(StoreError::Io {

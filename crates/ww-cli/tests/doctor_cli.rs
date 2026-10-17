@@ -235,3 +235,121 @@ fn doctor_without_a_default_workspace_skips_the_workspace_checks() {
     let probe = env.ww(&["--no-start", "status"]);
     assert_eq!(probe.code, 3, "no core was started: {probe:?}");
 }
+
+/// `path` with `suffix` added to its file name.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The files beside `db` whose name starts with `prefix`.
+fn named(db: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(db.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test] // spec: CORE-004 (ruling Q26, M1)
+fn doctor_sets_leftover_side_files_aside_only_after_yes() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let db = env.env.suite_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let wal = beside(&db, "-wal");
+    std::fs::write(&wal, b"an old write-ahead log").unwrap();
+
+    let no = env.ww_with_stdin(&["doctor"], "n\n");
+    assert_eq!(no.code, 1, "{no:?}");
+    let lines = printed(&no);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("problem: the suite state database")
+                && l.contains("state.db-wal")),
+        "{no:?}"
+    );
+    assert!(
+        lines.contains(
+            &"problem: workspace checks skipped — the leftover files must be set aside before the core starts"
+        ),
+        "{no:?}"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), b"an old write-ahead log");
+    assert!(!db.exists(), "no database was created");
+
+    let yes = env.ww_with_stdin(&["doctor"], "y\n");
+    assert_eq!(yes.code, 0, "{yes:?}");
+    assert!(!wal.exists(), "{yes:?}");
+    let aside = named(&db, "state.db-wal.damaged-");
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(std::fs::read(&aside[0]).unwrap(), b"an old write-ahead log");
+}
+
+#[test] // spec: CORE-004 (ruling Q26, M3)
+fn doctor_offers_nothing_while_a_core_runs() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let _core = ww_testkit::CoreFixture::start(&env);
+    let db = env.env.suite_state_db();
+    // A hot journal beside the live database: the doctor must not open it read-write, nor
+    // move anything, while the core holds the files.
+    let journal = beside(&db, "-journal");
+    std::fs::write(
+        &journal,
+        [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7, 0, 0],
+    )
+    .unwrap();
+    let (db_before, journal_before) = (sha256_file(&db), sha256_file(&journal));
+
+    let out = env.ww_with_stdin(&["doctor"], "y\ny\n");
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(
+        out.stdout.contains("stop it first (ww core stop)"),
+        "{out:?}"
+    );
+    assert!(!out.stderr.contains("[y/N]"), "nothing is offered: {out:?}");
+    assert_eq!(sha256_file(&db), db_before);
+    assert_eq!(sha256_file(&journal), journal_before);
+    assert!(named(&db, "state.db.damaged-").is_empty());
+}
+
+#[test] // spec: CORE-004 (ruling Q26, M4)
+fn hot_journal_recovery_then_set_aside_when_still_unusable() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let db = env.env.suite_state_db();
+    // After SQLite rolls the journal back the database is still from a newer version.
+    env.write_hot_journal_db(&db, 999);
+
+    let out = env.ww_with_stdin(&["doctor"], "y\ny\n");
+    assert_eq!(out.code, 0, "{out:?}");
+    let recover = out
+        .stderr
+        .find("Let SQLite finish its recovery? [y/N]")
+        .unwrap_or_else(|| panic!("{out:?}"));
+    let still = out
+        .stderr
+        .find("still can't be used")
+        .unwrap_or_else(|| panic!("{out:?}"));
+    let aside = out
+        .stderr
+        .find("Set it aside as state.db.damaged-")
+        .unwrap_or_else(|| panic!("{out:?}"));
+    assert!(recover < still && still < aside, "{out:?}");
+    assert!(
+        printed(&out).iter().any(|l| l.starts_with("fixed:")
+            && l.contains("newer version")
+            && l.contains("set aside as state.db.damaged-")),
+        "{out:?}"
+    );
+    assert!(!db.exists(), "{out:?}");
+    assert_eq!(named(&db, "state.db.damaged-").len(), 1);
+
+    let status = env.ww(&["status"]);
+    assert_eq!(status.code, 0, "{status:?}");
+}

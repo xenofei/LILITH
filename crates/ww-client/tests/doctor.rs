@@ -251,3 +251,29 @@ fn suite_toml_states_cover_missing_unreadable_and_stale_default() {
         SuiteTomlState::DefaultMissing(gone)
     );
 }
+
+#[test] // spec: CORE-004 (ruling Q26, M1)
+fn leftover_side_files_are_reported_and_set_aside_not_deleted() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let db = env.env.suite_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let (wal, shm) = (beside(&db, "-wal"), beside(&db, "-shm"));
+    std::fs::write(&wal, b"old wal").unwrap();
+    std::fs::write(&shm, b"old shm").unwrap();
+
+    assert_eq!(
+        inspect_suite_state(&env.env),
+        StateFileState::Leftovers(vec![wal.clone(), shm.clone()])
+    );
+    let now = 1_792_200_000;
+    let suffix = set_aside_suffix(now);
+    let moved = set_aside(&env.env, now).expect("set aside");
+    assert_eq!(moved, [beside(&wal, &suffix), beside(&shm, &suffix)]);
+    assert_eq!(std::fs::read(&moved[0]).unwrap(), b"old wal");
+    assert_eq!(std::fs::read(&moved[1]).unwrap(), b"old shm");
+    assert!(!db.exists(), "set_aside created a database");
+    assert_eq!(inspect_suite_state(&env.env), StateFileState::Missing);
+    // With nothing left, there is nothing to set aside.
+    let err = set_aside(&env.env, now + 1).expect_err("nothing to move");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+}

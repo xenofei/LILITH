@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use ww_core::identity::{MCP_EXE, TrustedDirs};
 use ww_core::store::FailPoints;
 use ww_core::{CoreConfig, CoreThread, start_in_thread};
+use ww_platform::fs::{FileIdentity, PLACEHOLDER_ATTRIBUTES, Probe, SystemProbe, VolumeInfo};
 use ww_platform::process::{ProcessInfo, ProcessInspector, SystemInspector};
 use ww_testkit::files::{sha256_bytes, sha256_file, write_file};
 use ww_testkit::{RawPipe, TestEnv};
@@ -66,10 +67,45 @@ impl ProcessInspector for McpHere {
 
 /// An in-process core with the test profile's git environment and `fp`.
 fn core_with(env: &TestEnv, fp: FailPoints) -> CoreThread {
+    core_with_probe(env, fp, Arc::new(SystemProbe))
+}
+
+/// The real probe, except that files whose name ends in `suffix` carry the cloud placeholder
+/// attributes (a cloud-only file, faked without a real sync root).
+#[derive(Debug)]
+struct CloudOnly {
+    suffix: &'static str,
+}
+
+impl Probe for CloudOnly {
+    fn identity(&self, path: &Path) -> io::Result<FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path.to_string_lossy().ends_with(self.suffix) {
+            id.attributes |= PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        assert!(
+            !path.to_string_lossy().ends_with(self.suffix),
+            "a cloud-only file was read: {}",
+            path.display()
+        );
+        SystemProbe.open_read(path)
+    }
+}
+
+fn core_with_probe(env: &TestEnv, fp: FailPoints, probe: Arc<dyn Probe>) -> CoreThread {
     let mcp_dir = env.root().join("mcp bin");
     let base = CoreConfig::for_env(env.env.clone()).expect("core config");
     start_in_thread(CoreConfig {
         test_parent_pid: None,
+        probe,
         failpoints: Arc::new(fp),
         git_env: env.git_env(),
         inspector: Arc::new(McpHere {
@@ -389,13 +425,37 @@ fn doctor_restores_read_only_on_matching_sealed_files() {
         &manifest_path,
         format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()).as_bytes(),
     );
+    // A git-lfs pointer to a sealed file's recorded bytes (not fetched yet, ARCH-085), and a
+    // cloud-only sealed file (never read).
+    let pointer = format!("{CRANE}/v1.0.0/crane_lfs.png");
+    let behind = sha256_bytes(b"the real bytes behind the pointer");
+    write_file(
+        &file(&ws, &pointer),
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{behind}\nsize 33\n")
+            .as_bytes(),
+    );
+    let cloud = format!("{CRANE}/v1.0.0/crane_cloud.png");
+    write_file(&file(&ws, &cloud), b"cloud bytes");
+    manifest["hashes"]["v1.0.0/crane_lfs.png"] = json!(format!("sha256:{behind}"));
+    manifest["hashes"]["v1.0.0/crane_cloud.png"] =
+        json!(format!("sha256:{}", sha256_bytes(b"cloud bytes")));
+    write_file(
+        &manifest_path,
+        format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()).as_bytes(),
+    );
     let edited = format!("{CRANE}/v1.0.0/crane_b.png");
     write_file(&file(&ws, &edited), b"edited outside the suite");
-    for rel in [&extra, &edited] {
+    for rel in [&extra, &edited, &pointer, &cloud] {
         assert!(!readonly(&file(&ws, rel)), "{rel}");
     }
 
-    let _core = core(&env);
+    let _core = core_with_probe(
+        &env,
+        FailPoints::parse("").unwrap(),
+        Arc::new(CloudOnly {
+            suffix: "crane_cloud.png",
+        }),
+    );
     let mut pipe = session(&env, &ws);
     let report = doctor(&mut pipe, false);
     let (state, detail) = check(&report, "sealed.readonly");
@@ -430,5 +490,30 @@ fn doctor_restores_read_only_on_matching_sealed_files() {
     assert_eq!(
         std::fs::read(file(&ws, &edited)).unwrap(),
         b"edited outside the suite"
+    );
+    // The pointer is not fetched, not edited: named as such and left writable.
+    assert!(
+        detail.contains(&format!("not fetched yet, left writable: {pointer}")),
+        "{detail}"
+    );
+    assert!(
+        !readonly(&file(&ws, &pointer)),
+        "the pointer was made read-only"
+    );
+    // The cloud-only file is reported as such, never as unreadable, and never read.
+    assert!(
+        detail.contains(&format!("cloud-only and weren't read: {cloud}")),
+        "{detail}"
+    );
+    assert!(!detail.contains("can't be checked"), "{detail}");
+    assert!(!readonly(&file(&ws, &cloud)));
+    // The edited file is the only problem left.
+    let differ = detail
+        .split("; ")
+        .find(|p| p.contains("differ from the hash"))
+        .unwrap_or_else(|| panic!("{detail}"));
+    assert!(
+        !differ.contains(&pointer) && !differ.contains(&cloud),
+        "{differ}"
     );
 }

@@ -1291,6 +1291,7 @@ pub(super) async fn run(
     rows_all.extend(others.rows);
     parsed_all.extend(others.parsed);
     let cold_log = index.cold_log.clone();
+    let seen = present;
     let removals = index
         .db
         .call(move |conn| {
@@ -1307,6 +1308,7 @@ pub(super) async fn run(
                 &rows_all,
                 &parsed_all,
                 &gone,
+                &seen,
                 &replay,
                 whole.then_some(started),
             )
@@ -1330,15 +1332,22 @@ pub(super) async fn run(
 
 /// The run's last transaction: a cold rebuild clears the tables, writes every row (asset rows
 /// with their `expected` files, then the files), then replays the store's changes that landed
-/// while it ran (`replay`); a warm one writes its rows compare-and-set and settles the rows of
-/// files that are gone (`missing` when the suite still expects them, else deleted). Then the
-/// whole scan's start, if it was one. Returns (removed, missing).
+/// while it ran (`replay`), then gives every file the suite still expects that the walk didn't
+/// find (`seen`: present or parked) a `missing` row with its recorded SHA-256 (ruling Q25); a
+/// warm one writes its rows compare-and-set and settles the rows of files that are gone
+/// (`missing` when the suite still expects them, else deleted). Then the whole scan's start, if
+/// it was one. Returns (removed, missing).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one transaction's inputs; the cold rebuild's walk set joined Task 10's list"
+)]
 fn finish(
     tx: &Transaction<'_>,
     mode: Mode,
     rows: &[(DbFile, Option<DbFile>)],
     parsed: &[Parsed],
     gone: &[DbFile],
+    seen: &HashSet<String>,
     replay: &[StoreChanges],
     scan_start: Option<i64>,
 ) -> rusqlite::Result<(Vec<WsPath>, Vec<WsPath>)> {
@@ -1351,6 +1360,28 @@ fn finish(
         write_rows(tx, rows, parsed, false)?;
         for changes in replay {
             store_changes(tx, &changes.removed, &changes.rows, &changes.parsed)?;
+        }
+        // A recorded file that vanished while no core watched stays listed (Appendix E,
+        // ARCH-079 and CORE-038): it was never seen gone, but the manifest still expects it.
+        let absent: Vec<(String, String)> = tx
+            .prepare(
+                "SELECT e.key, e.path FROM expected e WHERE e.tracked = 1
+                 AND NOT EXISTS (SELECT 1 FROM files f WHERE f.key = e.key) ORDER BY e.key",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (key, path) in absent {
+            if seen.contains(&key) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO files (key, path, project, asset_id, size, last_write, change_time,
+                     file_id, volume_serial, attributes, sha256, state, verified)
+                 SELECT key, path, project, asset_id, 0, 0, NULL, NULL, 0, 0, sha256, 'missing', 1
+                 FROM expected WHERE key = ?1",
+                params![key],
+            )?;
+            missing.push(WsPath::from_disk(path));
         }
     } else {
         write_rows(tx, rows, parsed, true)?;

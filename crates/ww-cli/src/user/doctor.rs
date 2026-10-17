@@ -6,6 +6,8 @@
 //! 1. The suite `state.db` ([`inspect_suite_state`]). A damaged or newer one is explained and
 //!    set aside as `state.db.damaged-<utc>` (with its `-wal`, `-shm` and `-journal`) only after
 //!    the person types `y`; a hot rollback journal is offered to SQLite's own recovery first.
+//!    `-wal`, `-shm` or `-journal` files left without their database are set aside the same way.
+//!    Nothing is offered while a core runs on the channel (it holds the files open).
 //!    With `--non-interactive` nothing is asked and nothing is moved. If a problem remains, the
 //!    core can't start, so step 3 is skipped (`problem: workspace checks skipped — the core
 //!    can't start`).
@@ -22,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use ww_client::blocking::BlockingClient;
 use ww_client::doctor::{
-    StateFileState, SuiteTomlState, finish_recovery, inspect_suite_state, inspect_suite_toml,
-    set_aside, set_aside_suffix, set_repo_autocrlf_false,
+    StateFileState, SuiteTomlState, core_running, finish_recovery, inspect_suite_state,
+    inspect_suite_toml, set_aside, set_aside_suffix, set_repo_autocrlf_false,
 };
 use ww_client::{ClientError, StartPolicy, WorkspaceOrigin, WorkspaceSource};
 use ww_platform::Env;
@@ -69,7 +71,7 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
     let mut report = Report::default();
 
     // 1.
-    let core_can_start = suite_state(&env, interactive, &mut report);
+    let blocked = suite_state(&env, interactive, &mut report);
 
     // 2.
     let workspace = match inspect_suite_toml(&env) {
@@ -97,8 +99,8 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
             Some((default, id))
         }
     };
-    if !core_can_start {
-        report.problem("workspace checks skipped — the core can't start");
+    if let Some(skipped) = blocked {
+        report.problem(&skipped);
         return Ok(EXIT_ERROR_RESULT);
     }
 
@@ -113,8 +115,9 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
     })
 }
 
-/// Step 1. Returns whether the core can start (no problem remains with the database).
-fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> bool {
+/// Step 1. Returns why step 3 is skipped when a problem remains with the database.
+fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<String> {
+    const CANT_START: &str = "workspace checks skipped — the core can't start";
     let path = env.suite_state_db();
     let mut state = inspect_suite_state(env);
     if state == StateFileState::HotJournal {
@@ -126,7 +129,11 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> bool {
             report.problem(&format!(
                 "{what} — run ww doctor interactively to let SQLite finish its recovery"
             ));
-            return false;
+            return Some(CANT_START.to_string());
+        }
+        if core_running(env) {
+            report.problem(&format!("{what} — {STOP_THE_CORE}"));
+            return Some(CANT_START.to_string());
         }
         say(&format!(
             "The suite state database at {} was left mid-write by a crash. Nothing has been \
@@ -138,70 +145,109 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> bool {
             report.problem(&format!(
                 "{what} — run ww doctor again and answer y to let SQLite finish its recovery"
             ));
-            return false;
+            return Some(CANT_START.to_string());
         }
         match finish_recovery(env) {
             Ok(StateFileState::Healthy) => {
                 report.fixed("SQLite finished the suite state database's recovery");
-                return true;
+                return None;
             }
-            Ok(after) => state = after,
+            Ok(after) => {
+                say("SQLite finished its recovery, but the database still can't be used.");
+                state = after;
+            }
             Err(e) => {
                 report.problem(&format!(
                     "{what}, and the recovery couldn't run: {e} — close the Worldwright apps, \
                      then run ww doctor again"
                 ));
-                return false;
+                return Some(CANT_START.to_string());
             }
         }
     }
-    let what = match &state {
+    let (what, skip, explain, question) = match &state {
         StateFileState::Missing => {
             report.ok("no suite state database yet; the core creates one when it starts");
-            return true;
+            return None;
         }
         StateFileState::Healthy => {
             report.ok("the suite state database is healthy");
-            return true;
+            return None;
         }
-        StateFileState::Damaged(why) => format!(
-            "the suite state database at {} is damaged ({why})",
-            path.display()
+        StateFileState::Leftovers(left) => {
+            let names: Vec<String> = left
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            (
+                format!(
+                    "the suite state database at {} is gone, but SQLite files it left are still \
+                     there ({})",
+                    path.display(),
+                    names.join(", ")
+                ),
+                "workspace checks skipped — the leftover files must be set aside before the \
+                 core starts"
+                    .to_string(),
+                "A fresh database created beside them could take an old write-ahead log for its \
+                 own. Setting them aside renames them; nothing is deleted.",
+                "Set them aside as <name>{suffix} so the core starts clean? [y/N] ",
+            )
+        }
+        StateFileState::Damaged(why) => (
+            format!(
+                "the suite state database at {} is damaged ({why})",
+                path.display()
+            ),
+            CANT_START.to_string(),
+            SET_ASIDE_EXPLAINED,
+            "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ",
         ),
-        StateFileState::TooNew { found, known } => format!(
-            "the suite state database at {} is from a newer version of Worldwright (schema \
-             {found}; this ww knows {known})",
-            path.display()
+        StateFileState::TooNew { found, known } => (
+            format!(
+                "the suite state database at {} is from a newer version of Worldwright (schema \
+                 {found}; this ww knows {known})",
+                path.display()
+            ),
+            CANT_START.to_string(),
+            SET_ASIDE_EXPLAINED,
+            "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ",
         ),
-        StateFileState::HotJournal => format!(
-            "the suite state database at {} still has a hot rollback journal after the recovery",
-            path.display()
+        StateFileState::HotJournal => (
+            format!(
+                "the suite state database at {} still has a hot rollback journal after the \
+                 recovery",
+                path.display()
+            ),
+            CANT_START.to_string(),
+            SET_ASIDE_EXPLAINED,
+            "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ",
         ),
     };
     if !interactive {
         report.problem(&format!(
             "{what} — run ww doctor interactively to set it aside"
         ));
-        return false;
+        return Some(skip);
+    }
+    // A running core holds the files open: nothing is offered while one does.
+    if core_running(env) {
+        report.problem(&format!("{what} — {STOP_THE_CORE}"));
+        return Some(skip);
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     say(&format!(
-        "{}. The core can't start with it, and nothing has been changed. Setting it aside \
-         renames it (and its -wal, -shm and -journal files); nothing is deleted. The core then \
-         starts with a fresh database: idempotency records of earlier calls are left behind \
-         in the set-aside file.",
+        "{}. Nothing has been changed. {explain}",
         capitalised(&what)
     ));
-    let name = format!("state.db{}", set_aside_suffix(now));
-    if !ask(&format!(
-        "Set it aside as {name} and start with a fresh database? [y/N] "
-    )) {
+    if !ask(&question.replace("{suffix}", &set_aside_suffix(now))) {
         report.problem(&format!(
             "{what} — run ww doctor again and answer y to set it aside"
         ));
-        return false;
+        return Some(skip);
     }
     match set_aside(env, now) {
         Ok(moved) => {
@@ -211,17 +257,26 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> bool {
                 .map(|n| n.to_string_lossy().into_owned())
                 .collect();
             report.fixed(&format!(
-                "{what}; it was set aside as {}, and the core starts with a fresh database",
+                "{what}; set aside as {}, and the core starts with a fresh database",
                 names.join(", ")
             ));
-            true
+            None
         }
         Err(e) => {
             report.problem(&format!("{what}, and it couldn't be set aside: {e}"));
-            false
+            Some(skip)
         }
     }
 }
+
+/// What setting a damaged or newer database aside means, in plain words.
+const SET_ASIDE_EXPLAINED: &str = "The core can't start with it. Setting it aside renames it \
+    (and its -wal, -shm and -journal files); nothing is deleted. The core then starts with a \
+    fresh database: idempotency records of earlier calls stay behind in the set-aside file.";
+
+/// What to do while a core still holds the suite database.
+const STOP_THE_CORE: &str = "a Worldwright core is running and holds it open; stop it first \
+    (ww core stop), then run ww doctor again";
 
 /// Step 3: `workspace.doctor {fix: true}` in the default workspace, then the `core.autocrlf`
 /// question.
