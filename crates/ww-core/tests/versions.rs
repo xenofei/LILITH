@@ -220,6 +220,7 @@ fn request(run: &str, version: &str, files: &[&str], snapshot: Manifest) -> Seal
         run_id: run.to_string(),
         files: files.iter().map(|f| (*f).to_string()).collect(),
         snapshot,
+        expected: Default::default(),
     }
 }
 

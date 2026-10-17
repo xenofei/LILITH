@@ -116,6 +116,13 @@ pub enum StoreError {
     TrashUnknown(String),
     /// A trash entry's original path is taken, so it was not restored.
     RestoreConflict(WsPath),
+    /// A file the suite recorded (a run file about to be sealed) no longer has the recorded
+    /// SHA-256: it changed outside the suite, so it was not used. Hashes are bare hex.
+    Changed {
+        path: WsPath,
+        expected: String,
+        found: String,
+    },
 }
 
 impl StoreError {
@@ -174,7 +181,8 @@ impl StoreError {
     /// The Appendix D error: `store.hash_conflict` (with `data.backup`, the backup's
     /// workspace-relative path, when a put-back couldn't finish), `store.busy`,
     /// `store.path_invalid`, `store.disk_full`, `store.io`, `store.locked`, `store.git_busy`,
-    /// `workspace.read_only`, `manifest.needs_repair`, `yaml.unsupported_edit`,
+    /// `store.hash_conflict` with `data {path, expected, found}` for a recorded file that
+    /// changed, `workspace.read_only`, `manifest.needs_repair`, `yaml.unsupported_edit`,
     /// `version.exists`, `status.invalid_transition`, `trash.unknown` (with `data.entry_id`)
     /// and `trash.restore_conflict` (with `data.path`, the occupied original path).
     pub fn to_error(&self, trace_id: &str) -> ErrorBody {
@@ -214,6 +222,14 @@ impl StoreError {
             StoreError::VersionExists(v) => (&VERSION_EXISTS, Some(json!({ "version": v }))),
             StoreError::InvalidTransition(_) => (&STATUS_INVALID_TRANSITION, None),
             StoreError::TrashUnknown(id) => (&TRASH_UNKNOWN, Some(json!({ "entry_id": id }))),
+            StoreError::Changed {
+                path,
+                expected,
+                found,
+            } => (
+                &STORE_HASH_CONFLICT,
+                Some(json!({ "path": path.as_str(), "expected": expected, "found": found })),
+            ),
             StoreError::RestoreConflict(path) => (
                 &TRASH_RESTORE_CONFLICT,
                 Some(json!({ "path": path.as_str() })),
@@ -285,6 +301,11 @@ impl std::fmt::Display for StoreError {
             StoreError::TrashUnknown(id) => write!(
                 f,
                 "there is no trash entry `{id}`; trash.list lists the entries there are"
+            ),
+            StoreError::Changed { path, .. } => write!(
+                f,
+                "`{path}` changed outside Worldwright since the suite recorded it, so it was not \
+                 used; start a new run with the changed file, or put the recorded one back"
             ),
             StoreError::RestoreConflict(path) => write!(
                 f,

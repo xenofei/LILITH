@@ -156,6 +156,7 @@ async fn sealed_version(ws: &Ws, store: &Store) {
                 run_id: "r_1".to_string(),
                 files: vec!["a.png".to_string()],
                 snapshot: m,
+                expected: Default::default(),
             },
         )
         .await

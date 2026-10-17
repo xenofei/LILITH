@@ -12,7 +12,10 @@
 //!    `from` through the run) from `candidates/<run>/`, copying instead a file that another
 //!    run file was derived from (I5), and moves `source/` if the run has one;
 //! 4. writes `manifest.snapshot.json` (`snapshot.to_text()`);
-//! 5. sets the read-only attribute on every file;
+//! 5. sets the read-only attribute on every file, then checks each chosen file in the sealing
+//!    folder against its expected hash (`SealRequest::expected`, the run's recorded
+//!    `sha256`): a file changed outside the suite meanwhile is `store.hash_conflict` and the
+//!    seal is undone;
 //! 6. moves the folder to `projects/<p>/assets/<a>/v<version>/` with `move_new`;
 //! 7. hashes every sealed file, records each hash as the file's generated hash, takes the
 //!    identities after the move (the read-only bit moves ChangeTime, and a ReFS move across
@@ -70,6 +73,11 @@ pub struct SealRequest {
     /// The manifest as it stands after sign-off: written as `manifest.snapshot.json`, and the
     /// run's file records (`role`, `from`) say which files are derived.
     pub snapshot: Manifest,
+    /// The SHA-256 (bare hex) each chosen file must have, by name (the run's recorded
+    /// `files[].sha256`): checked in the sealing folder before the final move, so a file
+    /// changed outside the suite during the seal is never sealed. A chosen name without an
+    /// entry isn't checked.
+    pub expected: BTreeMap<String, String>,
 }
 
 /// A sealed version.
@@ -382,6 +390,11 @@ impl Store {
         let staged = self
             .fill_sealing(&run, &items, &req.snapshot, &sealing, &mut done)
             .await;
+        // 5b. Each chosen file, as it is in the sealing folder, is still what the run recorded.
+        let staged = match staged {
+            Ok(()) => self.check_expected(&req, &run, &sealing).await,
+            Err(e) => Err(e),
+        };
         // 6.
         let placed = match staged {
             Ok(()) => {
@@ -412,6 +425,49 @@ impl Store {
             .map_err(|e| StoreError::io(&version_rel, &e))?;
         tracing::info!(version = %version_rel, files = sealed.files.len(), "version sealed");
         Ok(sealed)
+    }
+
+    /// Step 5b: every chosen file in `sealing` has its expected hash, else
+    /// `store.hash_conflict` naming the run's file (the undo puts it back there).
+    async fn check_expected(
+        &self,
+        req: &SealRequest,
+        run: &WsPath,
+        sealing: &Path,
+    ) -> Result<(), StoreError> {
+        for name in &req.files {
+            let Some(expected) = req
+                .expected
+                .iter()
+                .find(|(n, _)| path_key(n) == path_key(name))
+                .map(|(_, hex)| hex.clone())
+            else {
+                continue;
+            };
+            let rel = run.join(name)?;
+            let found = match self
+                .see_hash(&sealing.join(name))
+                .await
+                .map_err(|e| StoreError::io(&rel, &e))?
+            {
+                Seen::Found(h) => h.sha256,
+                _ => {
+                    return Err(StoreError::Io {
+                        path: rel.as_str().to_string(),
+                        why: "a chosen file left its sealing folder".to_string(),
+                    });
+                }
+            };
+            if found != expected {
+                tracing::warn!(path = %rel, "a chosen file changed outside the suite during its seal; it goes back to the run");
+                return Err(StoreError::Changed {
+                    path: rel,
+                    expected,
+                    found,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `path` exists, by its attributes.

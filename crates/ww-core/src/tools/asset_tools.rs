@@ -56,7 +56,7 @@
 //! asset's topic: `{kind: "manifest"}` and `{kind: "status", status}`; the Record stage
 //! publishes the candidate runs and sealed versions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,7 +65,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use ww_protocol::codes::{
     ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID,
-    STORE_HASH_CONFLICT,
 };
 use ww_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use ww_schema::{
@@ -859,9 +858,11 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         .find(|r| r.run_id.eq_ignore_ascii_case(&args.run_id))
         .expect("plan_signoff found the run");
     // Before anything moves: each chosen file must still be what the run recorded. A file
-    // edited outside the suite is refused here, so no sealed folder is left behind.
+    // edited outside the suite is refused here (the fast path), and the seal checks again in
+    // its sealing folder, so a save that lands in between is never sealed either.
+    let mut expected = BTreeMap::new();
     for name in &run.selected {
-        let Some(expected) = run
+        let Some(hex) = run
             .files
             .iter()
             .find(|f| f.path.rsplit('/').next() == Some(name.as_str()))
@@ -875,20 +876,15 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
             .map_err(error)?;
         // A missing file is the seal's to report.
         if let Some(found) = store.hash(&rel).await.map_err(error)?
-            && found != expected
+            && found != hex
         {
-            let mut e = ErrorBody::new(
-                &STORE_HASH_CONFLICT,
-                format!(
-                    "`{rel}` changed outside Worldwright since its run recorded it, so it was \
-                     not signed off. Start a new run with the edited file, or put the \
-                     original back."
-                ),
-                ctx.trace_id.clone(),
-            );
-            e.data = Some(json!({"path": rel.as_str(), "expected": expected, "found": found}));
-            return Err(e);
+            return Err(error(StoreError::Changed {
+                path: rel,
+                expected: hex,
+                found,
+            }));
         }
+        expected.insert(name.clone(), hex);
     }
     let sealed = store
         .seal(
@@ -900,6 +896,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
                 run_id: run.run_id.clone(),
                 files: run.selected.clone(),
                 snapshot: planned.clone(),
+                expected,
             },
         )
         .await

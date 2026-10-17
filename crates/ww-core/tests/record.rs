@@ -762,3 +762,76 @@ async fn a_stray_hash_key_in_the_sealed_version_is_a_conflict() {
     assert_eq!(m["approved_version"], Value::Null, "{m}");
     assert_eq!(m["status"], "candidate", "{m}");
 }
+
+#[tokio::test] // spec: CORE-026, ARCH-079
+async fn a_candidate_edited_during_the_seal_is_put_back_and_refused() {
+    let fp = FailPoints::none();
+    let fx = Fx::new(|_| {}, |h| h, fp.clone());
+    let run = fx.import_run(KITE, "a.png", b"a").await;
+    let candidate = fx.path(&format!("{KITE_DIR}/candidates/{run}/a.png"));
+    // After the pre-seal check: an outside writer saves the chosen file just before the seal
+    // moves it into its sealing folder (the first `store.replace` of the seal).
+    let armed = Arc::new(AtomicBool::new(true));
+    let (hook_armed, target) = (armed.clone(), candidate.clone());
+    fp.on(
+        "store.replace",
+        Box::new(move || {
+            if hook_armed.swap(false, Ordering::SeqCst) {
+                write_file(&target, b"saved outside mid-seal");
+            }
+            Ok(())
+        }),
+    );
+    let e = fx
+        .err(
+            "asset.signoff",
+            Fx::signoff_args(KITE, &run, "a.png", json!({})),
+        )
+        .await;
+    assert!(!armed.load(Ordering::SeqCst), "the hook never ran");
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let data = e.data.clone().expect("data");
+    assert_eq!(
+        data["path"],
+        format!("{KITE_DIR}/candidates/{run}/a.png"),
+        "{e:?}"
+    );
+    assert_eq!(data["expected"], sha256_bytes(b"a"), "{e:?}");
+    assert_eq!(
+        data["found"],
+        sha256_bytes(b"saved outside mid-seal"),
+        "{e:?}"
+    );
+    // Nothing sealed, nothing left in staging, the outside bytes back in the run (writable).
+    assert!(!fx.path(&format!("{KITE_DIR}/v1.0.0")).exists());
+    assert_eq!(
+        std::fs::read(&candidate).unwrap(),
+        b"saved outside mid-seal"
+    );
+    assert!(
+        !std::fs::metadata(&candidate)
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+    let staging: Vec<String> = std::fs::read_dir(fx.path(".worldwright/staging"))
+        .map(|d| {
+            d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(staging.is_empty(), "{staging:?}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], Value::Null, "{m}");
+    // A fresh run then signs off.
+    let fresh = fx
+        .import_run(KITE, "a.png", b"saved outside mid-seal")
+        .await;
+    let r = fx
+        .ok(
+            "asset.signoff",
+            Fx::signoff_args(KITE, &fresh, "a.png", json!({})),
+        )
+        .await;
+    assert_eq!(r["version"], "1.0.0", "{r}");
+}
