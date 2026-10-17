@@ -630,7 +630,10 @@ impl Shared {
     }
 
     /// Whether the verification's result `m` is out of date: the row has been verified since
-    /// (a batch decided it), or the file's identity is no longer the one after its read.
+    /// (a batch decided it), or the file's skip key (size, last write, ChangeTime: what a
+    /// stable read compares, ARCH-079) is no longer the one after its read. The rest of the
+    /// identity (attributes, file id) is left out, so a metadata-only change, which FAT and
+    /// Explorer's archive bit make, never hides a human edit.
     async fn stale(&self, m: &Mismatch) -> bool {
         if !matches!(self.index.is_verified(&m.path).await, Ok(Some(false))) {
             return true;
@@ -640,7 +643,8 @@ impl Shared {
             .await
             .ok()
             .and_then(Result::ok);
-        now != Some(m.identity)
+        let key = |id: &ww_platform::fs::FileIdentity| (id.size, id.last_write, id.change_time);
+        now.as_ref().map(key) != Some(key(&m.identity))
     }
 
     /// Whether `project/asset`'s version lock is held now (a sign-off between `seal` and its

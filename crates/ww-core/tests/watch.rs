@@ -1398,3 +1398,69 @@ async fn a_file_dropped_into_a_sealed_version_is_a_human_edit() {
     // The snapshot itself is no outside addition.
     assert!(edits_of(&again, "v1.0.0/manifest.snapshot.json").is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079
+async fn a_metadata_only_change_keeps_the_verifications_result() {
+    // The staleness check compares the skip key (size, last write, ChangeTime), not the whole
+    // identity: an attribute or file-id difference alone (a FAT volume, Explorer setting the
+    // archive bit) never hides the verification's human edit.
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = canonical(&env.copy_fixture_workspace("metadata"));
+    let sealed = file(&ws, SEALED);
+    let edit = b"edited while no core ran";
+    edit_outside(&sealed, edit);
+    let state = Arc::new(
+        ww_core::state::StateDb::open(
+            &env.root().join("metadata-local").join("state.db"),
+            ww_core::state::StateScope::Workspace,
+            no_fatal(),
+        )
+        .unwrap(),
+    );
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
+    let store = Arc::new(ww_core::store::Store::new(
+        ws.clone(),
+        state,
+        FailPoints::none(),
+        clock.clone(),
+        Arc::new(SeqIds::new()),
+        probe.clone(),
+    ));
+    let index = Arc::new(ww_core::index::Index::open_in_memory(&ws, probe).unwrap());
+    store.set_sink(index.clone());
+    let events = Arc::new(EventBus::new(clock));
+    let ws_id = Env::workspace_hash(&std::fs::canonicalize(&ws).unwrap());
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher = Watcher::start_from(
+        store.clone(),
+        index.clone(),
+        events,
+        ws_id.clone(),
+        WatchConfig::default(),
+        rx,
+    );
+    index.start_first();
+    index.ready().await;
+
+    let mut mismatches = index.verify_pending(10_000).await.unwrap();
+    let found = mismatches
+        .iter_mut()
+        .find(|m| m.path.as_str() == SEALED)
+        .unwrap_or_else(|| panic!("{SEALED} isn't reported"));
+    assert_eq!(found.sha256, sha256_bytes(edit));
+    // What the file reports now differs from the read's identity only outside the skip key.
+    found.identity.attributes ^= 0x20;
+    found.identity.file_id = Some([7; 16]);
+    watcher.mismatches(mismatches).await;
+
+    let detail = asset_detail(&store, &index, &ws_id, "sketchbook", CRANE)
+        .await
+        .unwrap();
+    let detail = serde_json::to_value(detail).unwrap();
+    let edits = edits_of(&detail, "v1.0.0/crane_b.png");
+    assert_eq!(edits.len(), 1, "the human edit is recorded: {detail}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edit));
+    assert_eq!(edits[0]["previous_sha256"], SEALED_SHA256);
+    watcher.stop();
+}

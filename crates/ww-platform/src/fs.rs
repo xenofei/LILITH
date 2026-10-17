@@ -520,17 +520,25 @@ pub const HRESULT_NO_CLOUD_FILTER: i32 = ERROR_INVALID_FUNCTION.to_hresult().0;
 /// - success is `true`;
 /// - `HRESULT_FROM_WIN32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT)` (390) is `false`, and so is
 ///   `HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION)` (1: no cloud filter on the volume);
-/// - any other failure is `false` on a non-NTFS or remote volume (FAT and exFAT sticks and SMB
-///   shares have no cloud filter), and an error only on local NTFS.
+/// - any other failure is `false` on a remote volume or one that is neither NTFS nor ReFS (FAT
+///   and exFAT sticks and SMB shares have no cloud filter), and an error on local NTFS or ReFS,
+///   the volumes where stable ids could otherwise be trusted (ruling Q4: unreadable volume
+///   facts mean no stable ids).
 pub fn sync_root_from(cf: Result<(), i32>, fs_name: &str, remote: bool) -> io::Result<bool> {
     match cf {
         Ok(()) => Ok(true),
         // 390 is the documented "not under a sync root". 1 is what local NTFS returns when no
         // cloud filter is attached: observed for every system-volume path on the plan-2b test
         // machine (2026-10-16). Plan 2b ruling Q3 maps both to `false`; any other failure on
-        // local NTFS stays an error.
+        // local NTFS (or ReFS, ruling Q4) stays an error.
         Err(hr) if hr == HRESULT_NOT_UNDER_SYNC_ROOT || hr == HRESULT_NO_CLOUD_FILTER => Ok(false),
-        Err(_) if remote || !fs_name.eq_ignore_ascii_case("NTFS") => Ok(false),
+        Err(_)
+            if remote
+                || !(fs_name.eq_ignore_ascii_case("NTFS")
+                    || fs_name.eq_ignore_ascii_case("ReFS")) =>
+        {
+            Ok(false)
+        }
         Err(hr) => Err(io_error(&windows::core::Error::from_hresult(
             windows::core::HRESULT(hr),
         ))),
@@ -896,6 +904,8 @@ mod tests {
             ("exFAT", false),
             ("NTFS", true),
             ("NTFS", false),
+            ("ReFS", true),
+            ("ReFS", false),
         ];
         for (fs_name, remote) in cases {
             let label = format!("{fs_name} remote={remote}");
@@ -909,7 +919,8 @@ mod tests {
                 "{label}"
             );
             let got = sync_root_from(Err(other), fs_name, remote);
-            if fs_name == "NTFS" && !remote {
+            // Ruling Q4: ReFS is treated like NTFS.
+            if (fs_name == "NTFS" || fs_name == "ReFS") && !remote {
                 assert!(got.is_err(), "{label}: {got:?}");
             } else {
                 assert!(!got.unwrap(), "{label}");
@@ -927,12 +938,15 @@ mod tests {
         let no_filter = 0x8007_0001_u32 as i32; // HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION)
         assert!(!sync_root_from(Err(not_under), "NTFS", false).unwrap());
         assert!(!sync_root_from(Err(no_filter), "NTFS", false).unwrap());
-        // Neighbouring codes are not mapped: on local NTFS they stay errors.
+        // Neighbouring codes are not mapped: on local NTFS (and ReFS, ruling Q4) they stay
+        // errors.
         for other in [0x8007_0002_u32, 0x8007_0032, 0x8007_0185, 0x8000_4005] {
-            assert!(
-                sync_root_from(Err(other as i32), "NTFS", false).is_err(),
-                "{other:#x}"
-            );
+            for fs_name in ["NTFS", "ReFS"] {
+                assert!(
+                    sync_root_from(Err(other as i32), fs_name, false).is_err(),
+                    "{fs_name} {other:#x}"
+                );
+            }
         }
     }
 

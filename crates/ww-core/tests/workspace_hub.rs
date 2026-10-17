@@ -370,8 +370,17 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
             .await
             .expect("the replayed event")
             .expect("an event line");
-        let more = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        // No second event, without waiting on the clock (QA-031): the replay queued exactly
+        // the one event the topic's seq counts, nothing else is in the channel, and the
+        // topic's seq is still 1 (a client subscribing now, live only, sees it).
+        let more = rx.try_recv();
         assert!(more.is_err(), "a second event: {more:?}");
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(16);
+        events.attach(2, tx2);
+        let now = events
+            .subscribe(2, &["workspace".to_string()], &Default::default())
+            .await;
+        assert_eq!(now[0].seq, 1, "published once: {now:?}");
         line
     });
     let event: Value = serde_json::from_str(&lines).unwrap();
