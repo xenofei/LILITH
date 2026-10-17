@@ -134,8 +134,9 @@ fn relative_files(dir: &Path) -> Vec<String> {
 
 /// The content hash of the sealed version folder `dir` (`v<version>\`), by the Appendix E
 /// rule: the SHA-256 of a text with one line `<sha256 hex>  <relative path>\n` per file,
-/// except `source/**` and `manifest.snapshot.json`, sorted by `/`-separated relative path in
-/// byte order. Written independently of `ww-schema`'s (QA-018).
+/// except `source/**`, `manifest.snapshot.json` and OS metadata files (`Thumbs.db`,
+/// `desktop.ini`, `.DS_Store`; ruling Q32), sorted by `/`-separated relative path in byte
+/// order. Written independently of `ww-schema`'s (QA-018).
 ///
 /// # Panics
 /// If the folder or a file cannot be read.
@@ -143,6 +144,14 @@ pub fn version_content_hash_of(dir: &Path) -> String {
     let mut files: Vec<String> = relative_files(dir)
         .into_iter()
         .filter(|rel| !rel.starts_with("source/") && rel != "manifest.snapshot.json")
+        // OS metadata files (Explorer's `Thumbs.db` and `desktop.ini`, macOS's `.DS_Store`)
+        // are never part of a version's content hash (ruling Q32).
+        .filter(|rel| {
+            let name = rel.rsplit('/').next().unwrap_or(rel);
+            !["thumbs.db", "desktop.ini", ".ds_store"]
+                .iter()
+                .any(|m| name.eq_ignore_ascii_case(m))
+        })
         .collect();
     files.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     let mut text = String::new();
@@ -272,6 +281,14 @@ mod tests {
             version_content_hash_of(&v),
             want,
             "source and snapshot are ignored"
+        );
+        write("Thumbs.db", b"thumbnails");
+        write("sub/desktop.ini", b"[.ShellClassInfo]");
+        write(".DS_Store", b"finder");
+        assert_eq!(
+            version_content_hash_of(&v),
+            want,
+            "OS metadata files are ignored (ruling Q32)"
         );
 
         write("a.png", b"changed");

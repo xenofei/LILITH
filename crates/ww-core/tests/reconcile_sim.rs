@@ -307,6 +307,7 @@ impl Model {
             expected: r.expected,
             pending: self.own_hashes(path),
             last_human_edit: r.last_human_edit.clone(),
+            outside_addition: false,
         });
         let action = decide(&observed, recorded.as_ref(), self.index_lock);
         self.apply(path, action);

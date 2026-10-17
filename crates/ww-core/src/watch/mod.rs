@@ -822,12 +822,33 @@ impl Shared {
                 expected: true,
                 pending: Vec::new(),
                 last_human_edit: None,
+                outside_addition: false,
             }),
             FileKind::Candidate | FileKind::Sealed => {
                 let entry = self.index.expected_entry(path).await.ok().flatten();
                 let (mut pending, generated) =
                     self.store.own_hashes(path).await.unwrap_or_default();
                 if entry.is_none() && generated.is_none() && pending.is_empty() {
+                    // Ruling Q32: nothing records a file in a sealed version, so it was added
+                    // from outside.
+                    if kind == FileKind::Sealed && self.in_sealed_version(path).await {
+                        let manifest = self.manifest_path(path).await;
+                        let last_human_edit = match (obs, &manifest) {
+                            (Observed::Changed { .. }, Some(manifest)) => {
+                                self.last_human_edit(manifest, path).await
+                            }
+                            _ => None,
+                        };
+                        return Some(Recorded {
+                            sha256: String::new(),
+                            kind,
+                            manifest,
+                            expected: false,
+                            pending: Vec::new(),
+                            last_human_edit,
+                            outside_addition: true,
+                        });
+                    }
                     return None;
                 }
                 let (sha256, expected) = match entry {
@@ -853,9 +874,31 @@ impl Shared {
                     expected,
                     pending,
                     last_human_edit,
+                    outside_addition: false,
                 })
             }
         }
+    }
+
+    /// Whether `path` (a [`FileKind::Sealed`] path) is a file other than the snapshot in a
+    /// sealed `projects/<p>/assets/<a>/v<semver>/`, one that holds a `manifest.snapshot.json`
+    /// (a legacy folder without one is read as it is, CORE-033). Attributes only.
+    async fn in_sealed_version(&self, path: &WsPath) -> bool {
+        let parts: Vec<&str> = path.as_str().split('/').collect();
+        if parts.len() < 6
+            || (parts.len() == 6 && parts[5].eq_ignore_ascii_case(crate::store::SNAPSHOT))
+        {
+            return false;
+        }
+        let snapshot = WsPath::from_disk(format!(
+            "{}/{}",
+            parts[..5].join("/"),
+            crate::store::SNAPSHOT
+        ))
+        .abs(self.store.root());
+        tokio::task::spawn_blocking(move || ww_platform::fs::attributes(&snapshot).is_ok())
+            .await
+            .unwrap_or(false)
     }
 
     async fn apply_all(self: &Arc<Self>, decided: Vec<Decided>) {

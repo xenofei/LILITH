@@ -733,7 +733,7 @@ async fn legacy_folder_is_listed_as_legacy() {
     assert_eq!(legacy.dir.as_str(), format!("{lamp}/v1.0.0"));
     assert_eq!(
         legacy.content_hash,
-        version_content_hash_of(&ws.file(&format!("{lamp}/v1.0.0")))
+        Some(version_content_hash_of(&ws.file(&format!("{lamp}/v1.0.0"))))
     );
     // Read as it is: nothing moved, nothing made read-only.
     assert_eq!(ws.tree(&format!("{lamp}/v1.0.0")), before);
@@ -907,4 +907,125 @@ async fn crash_after_seal_leaves_the_version_as_an_orphan() {
         [format!("{ASSET}/v1.0.0").as_str()]
     );
     assert!(ws.exists(&format!("{ASSET}/v1.0.0/a.png")));
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-083, CORE-026
+async fn seal_waits_at_the_git_gate_before_its_final_move() {
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    let store = ws.plain();
+    write_file(&ws.file(".git/index.lock"), b"");
+    let sealing = {
+        let store = store.clone();
+        tokio::spawn(async move { seal(&store, request("r_1", "1.0.0", &["a.png"], m)).await })
+    };
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!sealing.is_finished(), "the seal waits while git works");
+    assert!(
+        !ws.exists(&format!("{ASSET}/v1.0.0")),
+        "no version folder appears in the middle of a checkout"
+    );
+    // Git still works after 60 s: `store.git_busy`, and the seal is undone.
+    let result = sealing.await.unwrap();
+    assert!(matches!(result, Err(StoreError::GitBusy)), "{result:?}");
+    assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+    assert_eq!(
+        ws.read(&format!("{ASSET}/candidates/r_1/a.png")),
+        bytes_of("r_1", "a.png")
+    );
+    assert!(!ws.read_only(&format!("{ASSET}/candidates/r_1/a.png")));
+    assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026, ARCH-079
+async fn a_derived_file_edited_outside_is_never_sealed() {
+    // Before anything moves.
+    let ws = workspace();
+    let m = ws.run(
+        "r_1",
+        &[
+            ("a.png", "candidate", None),
+            ("a_cut.png", "derived", Some("a.png")),
+        ],
+    );
+    let cut = format!("{ASSET}/candidates/r_1/a_cut.png");
+    write_file(&ws.file(&cut), b"cut again outside the suite");
+    let result = seal(&ws.plain(), request("r_1", "1.0.0", &["a.png"], m)).await;
+    let Err(StoreError::Changed {
+        path,
+        expected,
+        found,
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(path.as_str(), cut);
+    assert_eq!(expected, sha256_bytes(&bytes_of("r_1", "a_cut.png")));
+    assert_eq!(found, sha256_bytes(b"cut again outside the suite"));
+    assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+    assert_eq!(
+        ws.tree(&format!("{ASSET}/candidates/r_1")),
+        ["a.png", "a_cut.png"]
+    );
+
+    // During the seal: the derived file is saved just before its move into the sealing
+    // folder (the second `store.replace`; the first copies a.png), so the check there finds
+    // it and the seal is undone.
+    let ws = workspace();
+    let m = ws.run(
+        "r_1",
+        &[
+            ("a.png", "candidate", None),
+            ("a_cut.png", "derived", Some("a.png")),
+        ],
+    );
+    let fp = FailPoints::none();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (seen, target) = (calls.clone(), ws.file(&cut));
+    fp.on(
+        "store.replace",
+        Box::new(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                write_file(&target, b"saved outside mid-seal");
+            }
+            Ok(())
+        }),
+    );
+    let result = seal(&ws.store(fp), request("r_1", "1.0.0", &["a.png"], m)).await;
+    assert!(
+        matches!(&result, Err(StoreError::Changed { path, .. }) if path.as_str() == cut),
+        "{result:?}"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+    assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+    assert_eq!(ws.read(&cut), b"saved outside mid-seal");
+    assert!(!ws.read_only(&cut));
+    assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-047, CORE-026 (ruling Q32)
+async fn version_content_hashes_come_from_the_manifest() {
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    let store = ws.plain();
+    let sealed = seal(&store, request("r_1", "1.0.0", &["a.png"], m))
+        .await
+        .expect("the seal");
+    // Record the version as the Record stage would.
+    let a = sha256_bytes(&bytes_of("r_1", "a.png"));
+    let mut m = ws.manifest().unwrap();
+    m.set("approved_version", json!("1.0.0"));
+    m.set("hashes", json!({"v1.0.0/a.png": format!("sha256:{a}")}));
+    write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
+    // An OS metadata file and a file dropped in by hand change nothing.
+    write_file(&ws.file(&format!("{ASSET}/v1.0.0/Thumbs.db")), b"thumbs");
+    write_file(
+        &ws.file(&format!("{ASSET}/v1.0.0/extra.png")),
+        b"dropped in",
+    );
+    let versions = store.versions(PROJECT, ASSET_ID).await.unwrap();
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    assert_eq!(versions[0].content_hash, Some(sealed.content_hash.clone()));
+    assert!(!versions[0].cloud_only);
+    assert!(!versions[0].legacy);
 }

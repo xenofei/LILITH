@@ -20,6 +20,12 @@
 //! 3. Events: `asset:<ref>` `{kind: "candidate_run", run_id}` or
 //!    `{kind: "version_sealed", version}`, `project:<slug>` `{kind: "progress"}`, and
 //!    `{kind: "status", status: "stale"}` on the topic of each asset marked stale.
+//!
+//! Only an error before the commit's manifest edit is the call's error. Once the manifest
+//! records the operation, everything after it (the jobs line, `progress.md`, the index, the
+//! events and the dependents) is best-effort (ruling Q31): a failure is logged and returned in
+//! [`RecordOutcome::warnings`], which the Record stage puts in the result as `warnings`, and steps 2
+//! and 3 always run.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -53,6 +59,14 @@ pub struct HandOff {
     pub unlocks: Vec<String>,
     pub made_stale: Vec<String>,
     pub refs: Vec<String>,
+}
+
+/// What [`apply_record`] did: the hand-off block, and what failed after the manifest edit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordOutcome {
+    pub handoff: HandOff,
+    /// One line per step that failed after the manifest recorded the operation.
+    pub warnings: Vec<String>,
 }
 
 /// What the Record stage writes for one call (module docs).
@@ -125,8 +139,8 @@ pub fn asset_topic(ws_id: &str, project: &str, asset_id: &str) -> String {
 /// (module docs).
 ///
 /// # Errors
-/// The commit's error (`store.path_invalid` for a project that isn't a valid path segment);
-/// nothing after the commit fails the call.
+/// The commit's error before its manifest edit (`store.path_invalid` for a project that isn't
+/// a valid path segment); nothing after the manifest edit fails the call (module docs).
 pub async fn apply_record(
     store: &Store,
     index: &Index,
@@ -134,7 +148,7 @@ pub async fn apply_record(
     ws_id: &str,
     today: &str,
     plan: RecordPlan,
-) -> Result<HandOff, StoreError> {
+) -> Result<RecordOutcome, StoreError> {
     let RecordPlan {
         branch,
         project,
@@ -175,12 +189,13 @@ pub async fn apply_record(
     };
     drop(version_guard);
     release_handles(store, handles).await;
-    committed?;
+    let report = committed?;
 
     let mut handoff = HandOff {
         refs,
         ..HandOff::default()
     };
+    let mut warnings = report.warnings;
     let topic = asset_topic(ws_id, &project, &asset_id);
     match &branch {
         RecordBranch::CandidateRun { run_id } => {
@@ -195,6 +210,7 @@ pub async fn apply_record(
                 (&project, &asset_id),
                 *version,
                 &mut handoff,
+                &mut warnings,
             )
             .await;
             events.publish(
@@ -204,7 +220,7 @@ pub async fn apply_record(
         }
     }
     events.publish(&format!("project:{project}"), json!({"kind": "progress"}));
-    Ok(handoff)
+    Ok(RecordOutcome { handoff, warnings })
 }
 
 /// Gives back the staging handles in `dirs` (the folders the outputs came from); a handle that
@@ -259,7 +275,9 @@ fn pins(project: &str, view: &ManifestView, target: &(String, String)) -> bool {
         .any(|t| &t == target)
 }
 
-/// Step 2 (module docs): marks dependents stale and lists what the new version unlocks.
+/// Step 2 (module docs): marks dependents stale and lists what the new version unlocks. What
+/// fails is logged and added to `warnings`.
+#[allow(clippy::too_many_arguments)]
 async fn hand_off_dependents(
     store: &Store,
     index: &Index,
@@ -268,12 +286,16 @@ async fn hand_off_dependents(
     sealed: (&str, &str),
     version: Version,
     handoff: &mut HandOff,
+    warnings: &mut Vec<String>,
 ) {
     let target = (sealed.0.to_string(), sealed.1.to_string());
     let found = match dependents(store, index, sealed.0, sealed.1).await {
         Ok(found) => found,
         Err(e) => {
             tracing::warn!(project = sealed.0, asset = sealed.1, error = %e, "the dependents of a sealed version can't be listed");
+            warnings.push(format!(
+                "the dependents of the new version couldn't be listed, so none was marked stale: {e}"
+            ));
             return;
         }
     };
@@ -287,6 +309,9 @@ async fn hand_off_dependents(
                 asset_id,
                 "a dependent's manifest can't be read; it is skipped"
             );
+            warnings.push(format!(
+                "the dependent {project}/{asset_id} couldn't be read, so it wasn't checked for staleness"
+            ));
             continue;
         };
         let view = manifest.view();
@@ -325,6 +350,9 @@ async fn hand_off_dependents(
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(project, asset_id, error = %e, "a dependent couldn't be marked stale");
+                        warnings.push(format!(
+                            "the dependent {project}/{asset_id} couldn't be marked stale: {e}"
+                        ));
                     }
                 }
             }

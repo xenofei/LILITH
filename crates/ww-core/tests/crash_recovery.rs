@@ -431,6 +431,7 @@ async fn held_manifest_during_commit_is_retried() {
             to: p("projects/sketchbook/assets/crane/candidates/r_1/a.png"),
         }],
         moved: Vec::new(),
+        removed: Vec::new(),
         manifest: Some((p(manifest_rel), edit)),
         job_line: None,
         progress: None,

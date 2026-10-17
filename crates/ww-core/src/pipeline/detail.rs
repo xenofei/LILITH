@@ -6,7 +6,9 @@
 //!   indexed. `ref` names the approved version (`ww://<ws>/<project>/<asset_id>@<version>`),
 //!   or the asset without a version when none is approved.
 //! - `AssetDetail` adds `versions` (from `Store::versions`, with `legacy`, each ref carrying
-//!   its content hash), `next_versions` (bumps of `approved_version`, or `1.0.0` when there is
+//!   its content hash, computed from the manifest's `hashes` without opening a sealed file;
+//!   a legacy version holding a cloud-only file has a ref without `#sha256` and
+//!   `cloud_only: true`, ruling Q32), `next_versions` (bumps of `approved_version`, or `1.0.0` when there is
 //!   none), `proposed_bump` (`patch` when the open run's `target_version` is the patch bump,
 //!   else `minor`), the manifest's own `candidate_runs`, `human_edits` and `external`, and the
 //!   index's file states (paths relative to the asset folder).
@@ -46,11 +48,16 @@ pub struct AssetSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct VersionEntry {
     pub version: String,
-    /// `ww://<ws>/<project>/<asset_id>@<version>#sha256=<content hash>`.
+    /// `ww://<ws>/<project>/<asset_id>@<version>#sha256=<content hash>`; without the hash
+    /// when it isn't known (`cloud_only`).
     #[serde(rename = "ref")]
     pub r#ref: String,
     /// No snapshot and no run signed off as this version (CORE-033).
     pub legacy: bool,
+    /// A legacy version holds a cloud-only file, which is never downloaded, so its content
+    /// hash isn't known (ruling Q32). Present only when `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cloud_only: bool,
 }
 
 /// The version each bump would give.
@@ -203,10 +210,11 @@ pub async fn asset_detail(
                 project: project.to_string(),
                 asset: asset_id.to_string(),
                 version: v.version,
-                sha256: Some(v.content_hash),
+                sha256: v.content_hash,
             }
             .to_string(),
             legacy: v.legacy,
+            cloud_only: v.cloud_only,
         })
         .collect();
 

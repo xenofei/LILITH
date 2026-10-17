@@ -455,6 +455,7 @@ async fn ingest_run(ctx: &CallCtx, args: IngestArgs) -> Result<(IngestResult, St
             .commit(CommitOp {
                 outputs,
                 moved: Vec::new(),
+                removed: Vec::new(),
                 manifest: Some((manifest_rel, manifest)),
                 job_line,
                 progress: None,

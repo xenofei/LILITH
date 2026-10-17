@@ -242,7 +242,7 @@ pub async fn stale_ref(
         Ok(versions) => versions
             .into_iter()
             .find(|v| v.version == version)
-            .map(|v| v.content_hash),
+            .and_then(|v| v.content_hash),
         Err(e) => {
             tracing::warn!(project, asset_id, error = %e, "a stale asset's versions can't be read");
             None

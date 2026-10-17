@@ -3,8 +3,9 @@
 //! change events and the background verification.
 //!
 //! **The walk** covers the workspace without `.git/` (at any depth), the root's `.worldwright/`
-//! and `.trash/`, and the store's temp (`.<name>.ww-tmp-*`), backup (`.<name>.ww-bak-*`) and
-//! conflict (`*.ww-conflict-*`) names. It never follows a link: a symbolic link, junction or
+//! and `.trash/`, the store's temp (`.<name>.ww-tmp-*`), backup (`.<name>.ww-bak-*`) and
+//! conflict (`*.ww-conflict-*`) names, and OS metadata files (`Thumbs.db`, `desktop.ini`,
+//! `.DS_Store`, which are never indexed or hashed; ruling Q32). It never follows a link: a symbolic link, junction or
 //! mount point (a name-surrogate reparse point) is skipped, file or folder.
 //!
 //! **Per file:**
@@ -310,6 +311,7 @@ fn skip_folder(name: &str, at_root: bool) -> bool {
 fn skip_file(name: &str) -> bool {
     (name.starts_with('.') && (name.contains(".ww-tmp-") || name.contains(".ww-bak-")))
         || name.contains(".ww-conflict-")
+        || ww_schema::is_os_metadata(name)
 }
 
 /// Whether a scoped path is one the walk never enters.
@@ -1757,6 +1759,12 @@ mod tests {
         assert!(skip_file(".a.png.ww-bak-1-2"));
         assert!(skip_file("a.png.ww-conflict-20270101T000000Z"));
         assert!(!skip_file("a.png"));
+        // Ruling Q32: OS metadata files are never indexed.
+        for name in ["Thumbs.db", "desktop.ini", ".DS_Store", "THUMBS.DB"] {
+            assert!(skip_file(name), "{name}");
+        }
+        assert!(skipped_path("projects/p/assets/a/v1.0.0/Thumbs.db"));
+        assert!(!skip_file("Thumbs.db.png"));
         assert!(skipped_path(".trash/x"));
         assert!(skipped_path("projects/.git/x"));
         assert!(!skipped_path("projects/p/x"));

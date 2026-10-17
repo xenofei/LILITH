@@ -4,8 +4,10 @@
 //! It runs only when the outcome is `ok` and the tool left a
 //! [`RecordPlan`](crate::pipeline::RecordPlan): it calls [`apply_record`] in the call's
 //! workspace, on the store clock's UTC day, and sets the result's `structured.handoff` from
-//! the returned [`HandOff`](crate::pipeline::HandOff). A commit error replaces the outcome with
-//! the store error (outputs already moved stay as listed orphans, ARCH-075). A plan left by a
+//! the returned [`HandOff`](crate::pipeline::HandOff), and `structured.warnings` from what
+//! failed after the manifest edit (ruling Q31; an empty list when nothing did). A commit error
+//! before the manifest edit replaces the outcome with the store error (outputs already moved
+//! stay as listed orphans, ARCH-075); nothing after the manifest edit does. A plan left by a
 //! call that didn't end `ok` is dropped unwritten, and with it any version-lock guard.
 //! Repairs and QA (CORE-025's middle steps) are the empty stages between ingest (Execute) and
 //! this one.
@@ -65,12 +67,16 @@ impl RecordStage for WorkspaceRecord {
             )
             .await
             {
-                Ok(handoff) => {
-                    let handoff =
-                        serde_json::to_value(&handoff).expect("a hand-off block serialises");
+                Ok(recorded) => {
+                    let handoff = serde_json::to_value(&recorded.handoff)
+                        .expect("a hand-off block serialises");
+                    if !recorded.warnings.is_empty() {
+                        tracing::warn!(tool = %d.name, trace_id = %ctx.trace_id, warnings = ?recorded.warnings, "the call is recorded with warnings");
+                    }
                     match &mut output.structured {
                         Value::Object(map) => {
                             map.insert("handoff".into(), handoff);
+                            map.insert("warnings".into(), Value::from(recorded.warnings));
                         }
                         other => {
                             tracing::error!(tool = %d.name, "a recorded result that isn't an object gets no hand-off block");

@@ -5,8 +5,13 @@
 //! `progress.md` entry → index (the [`ChangeSink`](super::ChangeSink)); events go out after
 //! it. The fail points `store.after_output`, `store.after_manifest`, `store.after_jobs_log`,
 //! `store.after_progress` and `store.after_index` sit between the steps. An error after the
-//! outputs leaves them where they are: they become orphans, listed by [`Store::orphans`], and
-//! nothing is ever deleted.
+//! outputs and before the manifest edit leaves them where they are: they become orphans,
+//! listed by [`Store::orphans`], and nothing is ever deleted.
+//!
+//! Once the manifest edit has succeeded the operation is recorded (ruling Q31): the jobs log
+//! line, the `progress.md` entry and the fail points after the manifest are best-effort. A
+//! failure there is logged and returned in [`CommitReport::warnings`], never as the commit's
+//! error, and the index step always runs.
 
 use std::collections::{BTreeSet, HashSet};
 use std::io;
@@ -18,6 +23,7 @@ use ww_platform::fs::{RetryClass, classify};
 use ww_schema::{Manifest, ManifestView, Version};
 
 use super::fsops;
+use super::git_gate::GIT_WAIT;
 use super::logs::LogKind;
 use super::paths::{WsPath, path_key, writable};
 use super::write::{ChangeKind, Seen, Store, StoreError, StoreEvent, Written, blocking, event};
@@ -42,6 +48,10 @@ pub struct CommitOp {
     /// Files a caller already moved into place (a sealed version): they reach the index in
     /// the index step, with the hash and identity given, never before the manifest edit.
     pub moved: Vec<Written>,
+    /// Paths a caller already moved away (the run files a seal took out of
+    /// `candidates/<run>/`): they reach the index as removals in the index step, after the
+    /// manifest edit.
+    pub removed: Vec<WsPath>,
     pub manifest: Option<(WsPath, ManifestEdit)>,
     pub job_line: Option<Map<String, Value>>,
     pub progress: Option<(WsPath, TextEdit)>,
@@ -52,6 +62,7 @@ impl std::fmt::Debug for CommitOp {
         f.debug_struct("CommitOp")
             .field("outputs", &self.outputs)
             .field("moved", &self.moved)
+            .field("removed", &self.removed)
             .field("manifest", &self.manifest.as_ref().map(|(p, _)| p))
             .field("job_line", &self.job_line)
             .field("progress", &self.progress.as_ref().map(|(p, _)| p))
@@ -69,6 +80,9 @@ pub struct CommitReport {
     pub manifest: Option<Manifest>,
     /// The `seq` of the jobs log line.
     pub job_seq: Option<u64>,
+    /// What failed after the manifest edit (the jobs log line, the `progress.md` entry, a fail
+    /// point): the operation is recorded all the same (ruling Q31).
+    pub warnings: Vec<String>,
 }
 
 /// A folder entry: its name, whether it is a folder (not a link), and the path.
@@ -147,20 +161,26 @@ impl Store {
     }
 
     /// Writes `op` in the ARCH-075 order:
-    /// 1. each output is moved from its staging handle with `move_new` (never over a file),
-    ///    then hashed, and its identity taken after the move;
+    /// 1. after waiting at the git gate (ARCH-083), each output is moved from its staging
+    ///    handle with `move_new` (never over a file), then hashed, and its identity taken
+    ///    after the move;
     /// 2. the manifest edit (hash-checked, `Store::edit_manifest`);
     /// 3. the jobs log line;
     /// 4. the `progress.md` edit;
-    /// 5. the index: one `applied` call with the changes of 1–4, then one `Written` event per
-    ///    entry of `op.moved`, with its hash and identity as given.
+    /// 5. the index: one `applied` call with the changes of 1–4, then one `Removed` event per
+    ///    entry of `op.removed` and one `Written` event per entry of `op.moved`, with its hash
+    ///    and identity as given.
+    ///
+    /// Steps 3–5 and the fail points after step 2 are best-effort (ruling Q31): a failure is
+    /// logged and listed in [`CommitReport::warnings`], the later steps still run, and step 5
+    /// always runs.
     ///
     /// # Errors
-    /// `workspace.read_only` on a read-only store; `store.path_invalid` for an output that
-    /// isn't in a staging handle, a target the store never writes, or one under a linked
-    /// folder; `store.hash_conflict`
-    /// when a file is already at an output's target; any error of the steps. An error after
-    /// step 1 leaves the outputs in place (orphans until the manifest records them).
+    /// `workspace.read_only` on a read-only store; `store.git_busy` when git is still working
+    /// after 60 s; `store.path_invalid` for an output that isn't in a staging handle, a target
+    /// the store never writes, or one under a linked folder; `store.hash_conflict` when a file
+    /// is already at an output's target; any error of steps 1 and 2. An error after step 1
+    /// leaves the outputs in place (orphans until the manifest records them).
     pub async fn commit(&self, op: CommitOp) -> Result<CommitReport, StoreError> {
         self.writable_store()?;
         let subject = op
@@ -171,7 +191,11 @@ impl Store {
             .unwrap_or_else(|| WsPath::from_disk(String::new()));
         let mut events: Vec<StoreEvent> = Vec::new();
 
-        // 1. Outputs.
+        // 1. Outputs. They wait at the git gate first, as every write does: a run folder
+        // never appears in the middle of a checkout.
+        if !op.outputs.is_empty() {
+            self.git_gate().wait_clear(GIT_WAIT).await?;
+        }
         let staging = self.staging_root();
         let mut outputs = Vec::with_capacity(op.outputs.len());
         for out in &op.outputs {
@@ -233,40 +257,70 @@ impl Store {
             }
             manifest = Some(edited);
         }
-        self.point("store.after_manifest", &subject).await?;
+        // From here on the operation is recorded: what fails is a warning (ruling Q31).
+        let mut warnings = Vec::new();
+        let mut warn = |step: &str, e: &StoreError| {
+            tracing::warn!(manifest = %subject, step, error = %e, "a step after the manifest edit failed; the operation is recorded");
+            warnings.push(format!(
+                "{step} failed after the manifest recorded the operation: {e}"
+            ));
+        };
+        if let Err(e) = self.point("store.after_manifest", &subject).await {
+            warn("store.after_manifest", &e);
+        }
 
         // 3. The jobs log line.
         let mut job_seq = None;
         if let Some(record) = op.job_line.clone() {
-            let (seq, rel) = self.append_log_at(LogKind::Jobs, record).await?;
-            job_seq = Some(seq);
-            events.push(StoreEvent {
-                identity: Some(self.identity(&rel).await?),
-                path: rel,
-                kind: ChangeKind::Written,
-                sha256: None,
-            });
+            match self.append_log_at(LogKind::Jobs, record).await {
+                Ok((seq, rel)) => {
+                    job_seq = Some(seq);
+                    // Without an identity the index reconciles the log itself.
+                    let identity = self.identity(&rel).await.ok();
+                    events.push(StoreEvent {
+                        identity,
+                        path: rel,
+                        kind: ChangeKind::Written,
+                        sha256: None,
+                    });
+                }
+                Err(e) => warn("the jobs log line", &e),
+            }
         }
-        self.point("store.after_jobs_log", &subject).await?;
+        if let Err(e) = self.point("store.after_jobs_log", &subject).await {
+            warn("store.after_jobs_log", &e);
+        }
 
         // 4. progress.md.
         if let Some((rel, edit)) = &op.progress {
-            let (written, kind) = self.edit_text_quiet(rel, &**edit).await?;
-            if let Some(kind) = kind {
-                events.push(event(&written, kind));
+            match self.edit_text_quiet(rel, &**edit).await {
+                Ok((written, Some(kind))) => events.push(event(&written, kind)),
+                Ok((_, None)) => {}
+                Err(e) => warn("the progress.md entry", &e),
             }
         }
-        self.point("store.after_progress", &subject).await?;
+        if let Err(e) = self.point("store.after_progress", &subject).await {
+            warn("store.after_progress", &e);
+        }
 
-        // 5. The index, with the files already in place.
+        // 5. The index, with the files already moved away and into place.
+        events.extend(op.removed.iter().map(|path| StoreEvent {
+            path: path.clone(),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        }));
         events.extend(op.moved.iter().map(|w| event(w, ChangeKind::Written)));
         self.emit(events).await;
-        self.point("store.after_index", &subject).await?;
+        if let Err(e) = self.point("store.after_index", &subject).await {
+            warn("store.after_index", &e);
+        }
 
         Ok(CommitReport {
             outputs,
             manifest,
             job_seq,
+            warnings,
         })
     }
 

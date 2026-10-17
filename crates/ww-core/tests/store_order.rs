@@ -143,6 +143,7 @@ fn ingest_op(from: PathBuf, run: &str, name: &str) -> CommitOp {
             to: p(&format!("{ASSET}/candidates/{run}/{name}")),
         }],
         moved: Vec::new(),
+        removed: Vec::new(),
         manifest: Some((p(MANIFEST), manifest)),
         job_line: Some(record(json!({"kind": "ingest", "run_id": run}))),
         progress: Some((p("projects/sketchbook/progress.md"), progress)),
@@ -274,8 +275,37 @@ async fn commit_writes_output_manifest_log_progress_then_index() {
 
 #[tokio::test(start_paused = true)] // spec: ARCH-075, CORE-038
 async fn error_after_output_leaves_a_listed_orphan_never_deleted() {
+    let ws = workspace();
+    ws.write_manifest();
+    let fp = Arc::new(FailPoints::parse("store.after_output=io").unwrap());
+    let store = ws.store(fp);
+    let from = staged(&store, "a.png", b"kept").await;
+    let err = store
+        .commit(ingest_op(from, "r_1", "a.png"))
+        .await
+        .expect_err("the fail point stops the commit before the manifest edit");
+    assert_eq!(err.to_error("t").code, "store.io", "{err}");
+
+    // Nothing is ever deleted: the output stays where step 1 put it.
+    let output = format!("{ASSET}/candidates/r_1/a.png");
+    assert_eq!(ws.read(&output), b"kept");
+    // The manifest doesn't record the run, so its folder is an orphan.
+    let orphans = ws.plain().orphans().await.unwrap();
+    assert!(
+        orphans.contains(&p(&format!("{ASSET}/candidates/r_1"))),
+        "{orphans:?}"
+    );
+    assert!(!ws.text(MANIFEST).contains("r_1"));
+    // The later steps never ran.
+    assert!(!ws.exists(&jobs_log(MONTH)));
+    assert!(!ws.exists("projects/sketchbook/progress.md"));
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-075, CORE-020
+async fn failures_after_the_manifest_edit_are_warnings_and_every_step_still_runs() {
+    // Ruling Q31: once the manifest records the operation, the jobs line, `progress.md`, the
+    // index and the fail points between them are best-effort.
     for point in [
-        "store.after_output",
         "store.after_manifest",
         "store.after_jobs_log",
         "store.after_progress",
@@ -285,34 +315,144 @@ async fn error_after_output_leaves_a_listed_orphan_never_deleted() {
         ws.write_manifest();
         let fp = Arc::new(FailPoints::parse(&format!("{point}=io")).unwrap());
         let store = ws.store(fp);
+        let recorder = Arc::new(Recorder::default());
+        store.set_sink(recorder.clone());
         let from = staged(&store, "a.png", b"kept").await;
-        let err = store
+        let report = store
             .commit(ingest_op(from, "r_1", "a.png"))
             .await
-            .expect_err("the fail point stops the commit");
-        assert_eq!(err.to_error("t").code, "store.io", "{point}: {err}");
-
-        // Nothing is ever deleted: the output stays where step 1 put it.
+            .unwrap_or_else(|e| panic!("{point}: the operation is recorded, not failed: {e}"));
+        assert_eq!(report.warnings.len(), 1, "{point}: {:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains(point),
+            "{point}: {:?}",
+            report.warnings
+        );
         let output = format!("{ASSET}/candidates/r_1/a.png");
         assert_eq!(ws.read(&output), b"kept", "{point}");
-        // Before the manifest records the run, its folder is an orphan; after, it is a run.
-        let orphans = ws.plain().orphans().await.unwrap();
-        let folder = p(&format!("{ASSET}/candidates/r_1"));
-        assert_eq!(
-            orphans.contains(&folder),
-            point == "store.after_output",
-            "{point}: {orphans:?}"
+        assert!(ws.text(MANIFEST).contains("r_1"), "{point}");
+        // The steps after the failed one still ran, and the index learnt all of them.
+        assert!(ws.exists(&jobs_log(MONTH)), "{point}");
+        assert!(
+            ws.text("projects/sketchbook/progress.md").contains("a run"),
+            "{point}"
         );
-        // The later steps never ran.
-        let ran_log = ws.exists(&jobs_log(MONTH));
-        let ran_progress = ws.exists("projects/sketchbook/progress.md");
-        let (log, progress) = match point {
-            "store.after_output" | "store.after_manifest" => (false, false),
-            "store.after_jobs_log" => (true, false),
-            _ => (true, true),
-        };
-        assert_eq!((ran_log, ran_progress), (log, progress), "{point}");
+        assert_eq!(report.job_seq, Some(1), "{point}");
+        let applied = recorder.applied.lock().unwrap().clone();
+        assert_eq!(applied.len(), 1, "{point}: {applied:?}");
+        let paths: Vec<&str> = applied[0].iter().map(|e| e.path.as_str()).collect();
+        let log = jobs_log(MONTH);
+        assert_eq!(
+            paths,
+            [
+                output.as_str(),
+                MANIFEST,
+                log.as_str(),
+                "projects/sketchbook/progress.md"
+            ],
+            "{point}"
+        );
+        let orphans = ws.plain().orphans().await.unwrap();
+        assert!(orphans.is_empty(), "{point}: {orphans:?}");
     }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-075, CORE-039
+async fn a_cloud_only_progress_md_is_a_warning_and_the_index_still_learns() {
+    let ws = workspace();
+    ws.write_manifest();
+    write_file(
+        &ws.file("projects/sketchbook/progress.md"),
+        b"# Progress\n\n## Done\n",
+    );
+    let progress = ws.file("projects/sketchbook/progress.md");
+    let store = Arc::new(
+        Store::new(
+            ws.root.clone(),
+            ws.state.clone(),
+            FailPoints::none(),
+            ws.clock.clone(),
+            Arc::new(SeqIds::new()),
+            Arc::new(PlaceholderAt(progress.clone())),
+        )
+        .with_machine("testmachine"),
+    );
+    let recorder = Arc::new(Recorder::default());
+    store.set_sink(recorder.clone());
+    let from = staged(&store, "a.png", b"kept").await;
+    let report = store
+        .commit(ingest_op(from, "r_1", "a.png"))
+        .await
+        .expect("a cloud-only progress.md doesn't fail a recorded operation");
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("progress.md"),
+        "{:?}",
+        report.warnings
+    );
+    // The placeholder was never read or written.
+    assert_eq!(
+        std::fs::read(&progress).unwrap(),
+        b"# Progress\n\n## Done\n"
+    );
+    assert!(ws.text(MANIFEST).contains("r_1"));
+    let applied = recorder.applied.lock().unwrap().clone();
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    let output = format!("{ASSET}/candidates/r_1/a.png");
+    assert!(
+        applied[0].iter().any(|e| e.path.as_str() == output),
+        "{applied:?}"
+    );
+}
+
+/// The real probe, except that one path reports the cloud placeholder attributes and its data
+/// is never opened.
+#[derive(Debug)]
+struct PlaceholderAt(PathBuf);
+
+impl Probe for PlaceholderAt {
+    fn identity(&self, path: &Path) -> io::Result<ww_platform::fs::FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path == self.0 {
+            id.attributes |= ww_platform::fs::PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<ww_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        assert_ne!(path, self.0, "a placeholder's data was opened");
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-083, ARCH-075
+async fn commit_outputs_wait_at_the_git_gate() {
+    let ws = workspace();
+    ws.write_manifest();
+    let store = ws.plain();
+    let from = staged(&store, "a.png", b"a").await;
+    let lock = ws.file(".git/index.lock");
+    write_file(&lock, b"");
+    let commit = {
+        let store = store.clone();
+        tokio::spawn(async move { store.commit(ingest_op(from, "r_1", "a.png")).await })
+    };
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!commit.is_finished(), "the commit waits while git works");
+    let output = format!("{ASSET}/candidates/r_1/a.png");
+    assert!(!ws.exists(&output), "no output is moved meanwhile");
+    // Still busy after 60 s: `store.git_busy`, and nothing moved.
+    let err = commit
+        .await
+        .unwrap()
+        .expect_err("git is still working after 60 s");
+    assert_eq!(err.to_error("t").code, "store.git_busy", "{err}");
+    assert!(!ws.exists(&output));
+    assert!(!ws.text(MANIFEST).contains("r_1"));
 }
 
 #[tokio::test(start_paused = true)] // spec: ARCH-028

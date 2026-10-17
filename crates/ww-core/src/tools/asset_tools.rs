@@ -69,7 +69,7 @@ use ww_protocol::codes::{
 use ww_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use ww_schema::{
     AssetRef, Bump, LinkRef, Manifest, Status, StatusEvent, YamlEdit, bare_sha256, hash_value,
-    is_asset_id, is_slug, sha256_hex, transition,
+    is_asset_id, is_slug, transition,
 };
 
 use super::registry::{CallCtx, Registry, typed_tool};
@@ -153,6 +153,8 @@ struct ImportResult {
     run_id: Option<String>,
     handoff: HandOff,
     files: Vec<NamedFile>,
+    /// What failed after the manifest recorded the operation (ruling Q31).
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -168,6 +170,8 @@ struct CollectResult {
     run_id: String,
     handoff: HandOff,
     files: Vec<NamedFile>,
+    /// What failed after the manifest recorded the operation (ruling Q31).
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -210,6 +214,8 @@ struct SignoffResult {
     r#ref: String,
     version: String,
     handoff: HandOff,
+    /// What failed after the manifest recorded the operation (ruling Q31).
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -515,6 +521,7 @@ async fn stage_candidate_run(
         commit: CommitOp {
             outputs,
             moved: Vec::new(),
+            removed: Vec::new(),
             manifest: Some((a.manifest.clone(), edit)),
             job_line: None,
             progress: None,
@@ -555,6 +562,7 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
                         ..HandOff::default()
                     },
                     files: untrusted(&names),
+                    warnings: Vec::new(),
                 },
                 summary,
             ))
@@ -632,6 +640,7 @@ async fn link_external(
             run_id: None,
             handoff: HandOff::default(),
             files: untrusted(&names),
+            warnings: Vec::new(),
         },
         summary,
     ))
@@ -687,6 +696,7 @@ async fn collect(ctx: &CallCtx, args: AssetArgs) -> Result<(CollectResult, Strin
                 ..HandOff::default()
             },
             files: untrusted(&names),
+            warnings: Vec::new(),
         },
         summary,
     ))
@@ -909,7 +919,8 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         .map(|(p, id)| (p.as_str(), *id))
         .collect();
     let mut moved = Vec::with_capacity(sealed.files.len() + 1);
-    let snapshot_sha = sha256_hex(planned.to_text().as_bytes());
+    // The snapshot as it is in the version (an adopted seal's is its first attempt's).
+    let snapshot_sha = sealed.snapshot_sha256.clone();
     let snapshot_key = format!("v{version}/{SNAPSHOT}");
     for (key, sha256) in sealed
         .files
@@ -1009,6 +1020,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         commit: CommitOp {
             outputs: Vec::new(),
             moved,
+            removed: sealed.left_run.clone(),
             manifest: Some((a.manifest.clone(), edit)),
             job_line: None,
             progress: None,
@@ -1026,6 +1038,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
             },
             r#ref,
             version: version.to_string(),
+            warnings: Vec::new(),
         },
         summary,
     ))

@@ -6,21 +6,43 @@
 //! never allocate the same version and the watcher can defer removals under a sealing asset.
 //!
 //! [`Store::seal`]:
-//! 1. refuses an existing `v<version>/` (`version.exists`);
+//! 1. refuses an existing `v<version>/` (`version.exists`), unless it adopts it (below);
 //! 2. creates `<ws>\.worldwright\staging\seal-<sh_…>\`, a live staging entry while it works;
 //! 3. moves the chosen files and the files derived from them (`role: derived`, following
 //!    `from` through the run) from `candidates/<run>/`, copying instead a file that another
-//!    run file was derived from (I5), and moves `source/` if the run has one;
+//!    run file was derived from (I5), and moves `source/` if the run has one. Before anything
+//!    moves, each of them that the run records a `sha256` for must still have it (a derived
+//!    file is checked like a chosen one): one changed outside the suite is
+//!    `store.hash_conflict`;
 //! 4. writes `manifest.snapshot.json` (`snapshot.to_text()`);
-//! 5. sets the read-only attribute on every file, then checks each chosen file in the sealing
-//!    folder against its expected hash (`SealRequest::expected`, the run's recorded
-//!    `sha256`): a file changed outside the suite meanwhile is `store.hash_conflict` and the
-//!    seal is undone;
-//! 6. moves the folder to `projects/<p>/assets/<a>/v<version>/` with `move_new`;
+//! 5. sets the read-only attribute on every file, then checks each of those files in the
+//!    sealing folder against its expected hash (`SealRequest::expected` for the chosen files,
+//!    the run's recorded `sha256` for derived ones): a file changed outside the suite
+//!    meanwhile is `store.hash_conflict` and the seal is undone;
+//! 6. waits at the git gate (ARCH-083; `store.git_busy` after 60 s undoes the seal), then
+//!    moves the folder to `projects/<p>/assets/<a>/v<version>/` with `move_new`, so a version
+//!    folder never appears in the tracked tree in the middle of a checkout;
 //! 7. hashes every sealed file, records each hash as the file's generated hash, takes the
 //!    identities after the move (the read-only bit moves ChangeTime, and a ReFS move across
 //!    folders changes the file id), and computes the content hash;
 //! 8. hits the fail point `store.after_seal`.
+//!
+//! **Adopting an unrecorded seal** (ruling Q31). A sign-off whose seal succeeded but whose
+//! Record stage failed (git busy, a held manifest, a fail point) leaves a `v<version>/` that
+//! no manifest records. A retry of the same sign-off adopts it instead of failing with
+//! `version.exists`, and never undoes it (that would mean clearing read-only and moving files
+//! out of a sealed folder). It is adopted only when all of these hold, and otherwise the
+//! retry is `version.exists` as before, so a sealed folder is never overwritten:
+//! - the manifest records the version nowhere (not `approved_version`, no run's
+//!   `signed_off.version`);
+//! - nothing in it is a link or a cloud-only file;
+//! - its `manifest.snapshot.json` names this run as signed off as this version, with the
+//!   same chosen files;
+//! - every chosen file is there, every other top-level file is one the seal would have
+//!   sealed, and each has the run's recorded `sha256` (or, without one, the generated hash
+//!   the seal recorded); each `source/**` file has the generated hash the seal recorded.
+//!
+//! The adopted files are recorded as generated again, and [`Sealed::adopted`] is set.
 //!
 //! Every copy and move hits the fail point `store.replace` and retries sharing violations
 //! under the store's budget (`store.busy` after it). On an error before step 6 finishes, each
@@ -47,10 +69,12 @@ use tokio::sync::OwnedMutexGuard;
 
 use ww_platform::fs::{FileIdentity, Probe, RetryClass, classify};
 use ww_schema::{
-    CandidateFile, Manifest, ManifestView, Version, bare_sha256, sha256_hex, version_content_hash,
+    CandidateFile, Manifest, ManifestView, Version, bare_sha256, is_os_metadata, sha256_hex,
+    version_content_hash,
 };
 
 use super::fsops;
+use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
 use super::paths::{WsPath, path_key};
 use super::staging::SEAL_PREFIX;
@@ -93,6 +117,13 @@ pub struct Sealed {
     /// Every file in the version (the snapshot included), with its identity taken after the
     /// final move.
     pub identities: Vec<(WsPath, FileIdentity)>,
+    /// The bare SHA-256 of `manifest.snapshot.json` as it is in the version.
+    pub snapshot_sha256: String,
+    /// The run paths the seal moved away (`candidates/<run>/<name>`, and
+    /// `candidates/<run>/source`): the Record stage reports them to the index as removals.
+    pub left_run: Vec<WsPath>,
+    /// An unrecorded `v<version>/` of the same sign-off was adopted (module docs).
+    pub adopted: bool,
 }
 
 /// A `v<version>/` folder of an asset.
@@ -103,7 +134,12 @@ pub struct VersionDir {
     /// No `manifest.snapshot.json` and no run signed off as this version (CORE-033): read as
     /// it is, never moved.
     pub legacy: bool,
-    pub content_hash: String,
+    /// The content hash, computed only from the manifest's `hashes` for the version (ruling
+    /// Q32), or from the files on disk for a legacy version that has no `hashes` entries;
+    /// `None` when such a legacy version holds a cloud-only file (never downloaded).
+    pub content_hash: Option<String>,
+    /// A legacy version holds a cloud-only file, so its content hash isn't known.
+    pub cloud_only: bool,
 }
 
 /// One file or folder to put in the sealing folder.
@@ -125,9 +161,9 @@ enum Done {
     Made { path: PathBuf, sha256: String },
 }
 
-/// Every file under `dir` (links are skipped, never followed), as (`/`-separated path
-/// relative to `dir`, absolute path), sorted by the relative path in byte order. A missing
-/// `dir` has none.
+/// Every file under `dir` (links and OS metadata files such as `Thumbs.db` are skipped, never
+/// followed or read; ruling Q32), as (`/`-separated path relative to `dir`, absolute path),
+/// sorted by the relative path in byte order. A missing `dir` has none.
 pub(super) fn files_under(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     let mut found = Vec::new();
     let mut folders = vec![(String::new(), dir.to_path_buf())];
@@ -147,7 +183,7 @@ pub(super) fn files_under(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
             }
             if kind.is_dir() {
                 folders.push((format!("{name}/"), path));
-            } else {
+            } else if !is_os_metadata(&entry.file_name().to_string_lossy()) {
                 found.push((name, path));
             }
         }
@@ -301,12 +337,6 @@ impl Store {
         let folder_name = format!("v{}", req.version);
         let version_rel = asset.join(&folder_name)?;
         let version_abs = version_rel.abs(self.root());
-        // 1.
-        if self.exists_now(&version_abs).await {
-            return Err(StoreError::VersionExists(req.version.to_string()));
-        }
-
-        // The plan: every name is checked before anything moves.
         let records: Vec<CandidateFile> = req
             .snapshot
             .view()
@@ -315,6 +345,22 @@ impl Store {
             .find(|r| path_key(&r.run_id) == path_key(&req.run_id))
             .map(|r| r.files)
             .unwrap_or_default();
+        let want = expected_hashes(&req, &records);
+        // 1.
+        if self.exists_now(&version_abs).await {
+            let found = Found {
+                asset: &asset,
+                version: &version_rel,
+                folder: &folder_name,
+                run: &run,
+            };
+            if let Some(sealed) = self.adopt(&req, &found, &chosen, &records, &want).await? {
+                return Ok(sealed);
+            }
+            return Err(StoreError::VersionExists(req.version.to_string()));
+        }
+
+        // The plan: every name is checked before anything moves.
         let run_abs = run.abs(self.root());
         let mut planned: Vec<(String, bool)> = Vec::new();
         for (name, copy) in plan_names(&chosen, &records) {
@@ -325,7 +371,19 @@ impl Store {
                 .await
                 .map_err(|e| StoreError::io(&rel, &e))?
             {
-                Seen::Found(_) => planned.push((name, copy)),
+                Seen::Found(h) => {
+                    // A chosen or derived file edited outside the suite is never sealed.
+                    if let Some(expected) = want.get(&path_key(&name))
+                        && *expected != h.sha256
+                    {
+                        return Err(StoreError::Changed {
+                            path: rel,
+                            expected: expected.clone(),
+                            found: h.sha256,
+                        });
+                    }
+                    planned.push((name, copy));
+                }
                 Seen::Placeholder => return Err(StoreError::cloud_only(&rel)),
                 Seen::Link => return Err(link_refused(&rel)),
                 Seen::Missing | Seen::Folder if is_chosen => {
@@ -392,10 +450,15 @@ impl Store {
             .await;
         // 5b. Each chosen file, as it is in the sealing folder, is still what the run recorded.
         let staged = match staged {
-            Ok(()) => self.check_expected(&req, &run, &sealing).await,
+            Ok(()) => self.check_expected(&want, &items, &run, &sealing).await,
             Err(e) => Err(e),
         };
-        // 6.
+        // 6. Not while git works on the workspace: the version folder appears in the tracked
+        // tree with this move.
+        let staged = match staged {
+            Ok(()) => self.git_gate().wait_clear(GIT_WAIT).await,
+            Err(e) => Err(e),
+        };
         let placed = match staged {
             Ok(()) => {
                 let (from, to) = (sealing.clone(), version_abs.clone());
@@ -418,7 +481,8 @@ impl Store {
         self.forget_handle(&handle);
 
         // 7.
-        let sealed = self.record_sealed(&version_rel, &folder_name).await?;
+        let mut sealed = self.record_sealed(&version_rel, &folder_name).await?;
+        sealed.left_run = self.left_run(&run, &sealed).await;
         // 8.
         self.fs(Some("store.after_seal"), || Ok(()))
             .await
@@ -427,21 +491,17 @@ impl Store {
         Ok(sealed)
     }
 
-    /// Step 5b: every chosen file in `sealing` has its expected hash, else
-    /// `store.hash_conflict` naming the run's file (the undo puts it back there).
+    /// Step 5b: every chosen or derived file in `sealing` that `want` names has its expected
+    /// hash, else `store.hash_conflict` naming the run's file (the undo puts it back there).
     async fn check_expected(
         &self,
-        req: &SealRequest,
+        want: &BTreeMap<String, String>,
+        items: &[Item],
         run: &WsPath,
         sealing: &Path,
     ) -> Result<(), StoreError> {
-        for name in &req.files {
-            let Some(expected) = req
-                .expected
-                .iter()
-                .find(|(n, _)| path_key(n) == path_key(name))
-                .map(|(_, hex)| hex.clone())
-            else {
+        for name in items.iter().map(|i| &i.name) {
+            let Some(expected) = want.get(&path_key(name)).cloned() else {
                 continue;
             };
             let rel = run.join(name)?;
@@ -454,12 +514,12 @@ impl Store {
                 _ => {
                     return Err(StoreError::Io {
                         path: rel.as_str().to_string(),
-                        why: "a chosen file left its sealing folder".to_string(),
+                        why: "a file being sealed left its sealing folder".to_string(),
                     });
                 }
             };
             if found != expected {
-                tracing::warn!(path = %rel, "a chosen file changed outside the suite during its seal; it goes back to the run");
+                tracing::warn!(path = %rel, "a file changed outside the suite during its seal; it goes back to the run");
                 return Err(StoreError::Changed {
                     path: rel,
                     expected,
@@ -634,6 +694,7 @@ impl Store {
         let mut files = Vec::new();
         let mut hashes = Vec::new();
         let mut identities = Vec::new();
+        let mut snapshot_sha256 = String::new();
         for (inside, path) in listed {
             let rel = WsPath::from_disk(format!("{version}/{inside}"));
             let sha256 = match self
@@ -654,7 +715,9 @@ impl Store {
                 .await
                 .map_err(|e| StoreError::state(&rel, &e))?;
             identities.push((rel.clone(), self.identity(&rel).await?));
-            if inside != SNAPSHOT {
+            if inside == SNAPSHOT {
+                snapshot_sha256.clone_from(&sha256);
+            } else {
                 files.push((format!("{folder}/{inside}"), sha256.clone()));
             }
             hashes.push((inside, sha256));
@@ -664,15 +727,199 @@ impl Store {
             files,
             content_hash: version_content_hash(&hashes),
             identities,
+            snapshot_sha256,
+            left_run: Vec::new(),
+            adopted: false,
         })
+    }
+
+    /// The run paths `sealed` took away: for each top-level name in the version, the run's
+    /// `candidates/<run>/<name>` when it is no longer there (a copied file stays).
+    async fn left_run(&self, run: &WsPath, sealed: &Sealed) -> Vec<WsPath> {
+        let mut tops: Vec<String> = Vec::new();
+        for (key, _) in &sealed.files {
+            let inside = key.split_once('/').map_or(key.as_str(), |(_, rest)| rest);
+            let top = inside.split('/').next().unwrap_or(inside).to_string();
+            if !tops.iter().any(|t| path_key(t) == path_key(&top)) {
+                tops.push(top);
+            }
+        }
+        let mut gone = Vec::new();
+        for top in tops {
+            let rel = WsPath::from_disk(format!("{run}/{top}"));
+            if !self.exists_now(&rel.abs(self.root())).await {
+                gone.push(rel);
+            }
+        }
+        gone
+    }
+
+    /// Step 1's adoption (module docs): `Some` with the version as it is when `found` is the
+    /// unrecorded seal of this same sign-off, `None` (logged) when anything disagrees.
+    async fn adopt(
+        &self,
+        req: &SealRequest,
+        found: &Found<'_>,
+        chosen: &[String],
+        records: &[CandidateFile],
+        want: &BTreeMap<String, String>,
+    ) -> Result<Option<Sealed>, StoreError> {
+        let version_rel = found.version;
+        let refuse = |why: &str| {
+            tracing::warn!(version = %version_rel, why, "an existing version folder isn't this sign-off's; it is left as it is");
+            Ok(None)
+        };
+        // Recorded in the manifest: a real collision.
+        let manifest = WsPath::from_disk(format!("{}/{}.manifest.json", found.asset, req.asset_id));
+        let view = match self.read(&manifest).await {
+            Ok(Some(bytes)) => match std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|t| Manifest::parse(t).ok())
+            {
+                Some((m, _)) => m.view(),
+                None => return refuse("the manifest doesn't parse"),
+            },
+            Ok(None) => return refuse("the asset has no manifest"),
+            Err(e) => return Err(e),
+        };
+        let recorded = view.approved_version == Some(req.version)
+            || view.candidate_runs.iter().any(|r| {
+                r.signed_off
+                    .as_ref()
+                    .is_some_and(|s| s.version == req.version)
+            });
+        if recorded {
+            return refuse("the manifest records this version");
+        }
+        let abs = version_rel.abs(self.root());
+        let (probe, dir) = (self.probe().clone(), abs.clone());
+        let unsafe_inside = blocking(move || unsafe_entry(probe.as_ref(), &dir))
+            .await
+            .map_err(|e| StoreError::io(version_rel, &e))?;
+        if unsafe_inside.is_some() {
+            return refuse("it holds a link or a cloud-only file");
+        }
+        let dir = abs.clone();
+        let listed = blocking(move || files_under(&dir))
+            .await
+            .map_err(|e| StoreError::io(version_rel, &e))?;
+
+        // The snapshot names this run, signed off as this version, with the same files.
+        let snapshot_rel = WsPath::from_disk(format!("{version_rel}/{SNAPSHOT}"));
+        let Some(snapshot_bytes) = self.read(&snapshot_rel).await? else {
+            return refuse("it has no manifest.snapshot.json");
+        };
+        let Some((snapshot, _)) = std::str::from_utf8(&snapshot_bytes)
+            .ok()
+            .and_then(|t| Manifest::parse(t).ok())
+        else {
+            return refuse("its snapshot doesn't parse");
+        };
+        let keys =
+            |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| path_key(n)).collect() };
+        let same_signoff = snapshot
+            .view()
+            .candidate_runs
+            .iter()
+            .find(|r| path_key(&r.run_id) == path_key(&req.run_id))
+            .is_some_and(|r| {
+                r.signed_off
+                    .as_ref()
+                    .is_some_and(|s| s.version == req.version)
+                    && keys(&r.selected) == keys(chosen)
+            });
+        if !same_signoff {
+            return refuse("its snapshot isn't this run's sign-off as this version");
+        }
+
+        // Every file is one the seal would have sealed, with the hash the run recorded (or
+        // the one the seal recorded as generated).
+        let allowed: BTreeSet<String> = plan_names(chosen, records)
+            .into_iter()
+            .map(|(name, _)| path_key(&name))
+            .collect();
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        let mut hashes = Vec::new();
+        for (inside, path) in &listed {
+            let rel = WsPath::from_disk(format!("{version_rel}/{inside}"));
+            let sha256 = match self
+                .see_hash(path)
+                .await
+                .map_err(|e| StoreError::io(&rel, &e))?
+            {
+                Seen::Found(h) => h.sha256,
+                _ => return refuse("a file in it can't be read"),
+            };
+            let generated = self
+                .state()
+                .generated(rel.as_str())
+                .await
+                .map_err(|e| StoreError::state(&rel, &e))?;
+            let expected = if inside == SNAPSHOT {
+                Some(sha256.clone())
+            } else if let Some((top, _)) = inside.split_once('/') {
+                if !top.eq_ignore_ascii_case("source") {
+                    return refuse("it holds a folder the seal never makes");
+                }
+                generated
+            } else {
+                let key = path_key(inside);
+                if !allowed.contains(&key) {
+                    return refuse("it holds a file the seal wouldn't have sealed");
+                }
+                present.insert(key.clone());
+                want.get(&key).cloned().or(generated)
+            };
+            if expected.as_deref() != Some(sha256.as_str()) {
+                return refuse("a file in it isn't what the run recorded");
+            }
+            hashes.push((inside.clone(), rel, sha256));
+        }
+        if chosen.iter().any(|c| !present.contains(&path_key(c))) {
+            return refuse("a chosen file isn't in it");
+        }
+
+        let now = self.now_utc();
+        let mut files = Vec::new();
+        let mut content = Vec::new();
+        let mut identities = Vec::new();
+        let mut snapshot_sha256 = String::new();
+        for (inside, rel, sha256) in hashes {
+            self.state()
+                .set_generated(rel.as_str(), &sha256, now)
+                .await
+                .map_err(|e| StoreError::state(&rel, &e))?;
+            identities.push((rel.clone(), self.identity(&rel).await?));
+            if inside == SNAPSHOT {
+                snapshot_sha256.clone_from(&sha256);
+            } else {
+                files.push((format!("{}/{inside}", found.folder), sha256.clone()));
+            }
+            content.push((inside, sha256));
+        }
+        let mut sealed = Sealed {
+            dir: version_rel.clone(),
+            files,
+            content_hash: version_content_hash(&content),
+            identities,
+            snapshot_sha256,
+            left_run: Vec::new(),
+            adopted: true,
+        };
+        sealed.left_run = self.left_run(found.run, &sealed).await;
+        tracing::info!(version = %version_rel, "an unrecorded seal of the same sign-off is adopted");
+        Ok(Some(sealed))
     }
 
     /// The `v<version>/` folders of an asset, by version. A folder with no
     /// `manifest.snapshot.json`, in an asset whose manifest has no run signed off as that
-    /// version, is `legacy` (CORE-033). Each folder's content hash is computed from its files;
-    /// a cloud-only file counts with the hash its manifest records (`hashes`), and without one
-    /// the call fails with `store.hash_conflict`, since it would have to be downloaded. Nothing
-    /// is moved or changed.
+    /// version, is `legacy` (CORE-033). Nothing is moved or changed.
+    ///
+    /// The content hash (ruling Q32) is computed only over the files the manifest's `hashes`
+    /// lists for that version, with their recorded SHA-256, so no sealed file is opened and a
+    /// file added to the folder later never changes it. Only a legacy version with no
+    /// `hashes` entries is hashed from disk, skipping OS metadata files; one that holds a
+    /// cloud-only file gets no content hash (`cloud_only`), and the file is never read.
     ///
     /// # Errors
     /// `store.path_invalid` for a bad project or asset id; `store.io` when a folder can't be
@@ -706,30 +953,26 @@ impl Store {
                 continue;
             };
             let rel = WsPath::from_disk(format!("{asset}/{}", folder.name));
-            let path = folder.path.clone();
-            let listed = blocking(move || files_under(&path))
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?;
-            let has_snapshot = listed.iter().any(|(inside, _)| inside == SNAPSHOT);
-            let mut hashes = Vec::new();
-            for (inside, path) in listed {
-                let file_rel = WsPath::from_disk(format!("{rel}/{inside}"));
-                let sha256 = match self
-                    .see_hash(&path)
+            let recorded: Vec<(String, String)> = view
+                .hashes
+                .iter()
+                .filter_map(|(key, value)| {
+                    let (first, inside) = key.split_once('/')?;
+                    if version_folder(first) != Some(version) || is_os_metadata(inside) {
+                        return None;
+                    }
+                    Some((inside.to_string(), bare_sha256(value)?.to_string()))
+                })
+                .collect();
+            let (has_snapshot, content_hash, cloud_only) = if recorded.is_empty() {
+                self.hash_legacy(&rel, &folder.path).await?
+            } else {
+                let snapshot = folder.path.join(SNAPSHOT);
+                let has_snapshot = blocking(move || Ok(exists(&snapshot)))
                     .await
-                    .map_err(|e| StoreError::io(&file_rel, &e))?
-                {
-                    Seen::Found(h) => h.sha256,
-                    Seen::Placeholder => view
-                        .hashes
-                        .get(&format!("{}/{inside}", folder.name))
-                        .and_then(|h| bare_sha256(h))
-                        .map(str::to_string)
-                        .ok_or_else(|| StoreError::cloud_only(&file_rel))?,
-                    _ => continue,
-                };
-                hashes.push((inside, sha256));
-            }
+                    .unwrap_or(false);
+                (has_snapshot, Some(version_content_hash(&recorded)), false)
+            };
             let signed = view
                 .candidate_runs
                 .iter()
@@ -738,12 +981,70 @@ impl Store {
                 version,
                 dir: rel,
                 legacy: !has_snapshot && !signed,
-                content_hash: version_content_hash(&hashes),
+                content_hash,
+                cloud_only,
             });
         }
         found.sort_by_key(|v| v.version);
         Ok(found)
     }
+
+    /// A version folder with no `hashes` entries, read from disk: whether it holds a snapshot,
+    /// its content hash (`None` when a file in it is cloud-only, never read) and that flag.
+    async fn hash_legacy(
+        &self,
+        rel: &WsPath,
+        path: &Path,
+    ) -> Result<(bool, Option<String>, bool), StoreError> {
+        let path = path.to_path_buf();
+        let listed = blocking(move || files_under(&path))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))?;
+        let has_snapshot = listed.iter().any(|(inside, _)| inside == SNAPSHOT);
+        let mut hashes = Vec::new();
+        let mut cloud_only = false;
+        for (inside, path) in listed {
+            let file_rel = WsPath::from_disk(format!("{rel}/{inside}"));
+            match self
+                .see_hash(&path)
+                .await
+                .map_err(|e| StoreError::io(&file_rel, &e))?
+            {
+                Seen::Found(h) => hashes.push((inside, h.sha256)),
+                Seen::Placeholder => cloud_only = true,
+                _ => {}
+            }
+        }
+        let content_hash = (!cloud_only).then(|| version_content_hash(&hashes));
+        Ok((has_snapshot, content_hash, cloud_only))
+    }
+}
+
+/// Where an existing version folder is (step 1's adoption).
+struct Found<'a> {
+    /// `projects/<p>/assets/<a>`.
+    asset: &'a WsPath,
+    /// `<asset>/v<version>`.
+    version: &'a WsPath,
+    /// `v<version>`.
+    folder: &'a str,
+    /// `<asset>/candidates/<run>`.
+    run: &'a WsPath,
+}
+
+/// The SHA-256 each file to seal must have, by its name's `path_key`: the chosen files' from
+/// `req.expected`, and the derived ones' from the run's file records (a record without one
+/// isn't checked).
+fn expected_hashes(req: &SealRequest, records: &[CandidateFile]) -> BTreeMap<String, String> {
+    let mut want: BTreeMap<String, String> = records
+        .iter()
+        .filter(|r| r.role == "derived")
+        .filter_map(|r| Some((path_key(bare_name(&r.path)), r.sha256.clone()?)))
+        .collect();
+    for (name, hex) in &req.expected {
+        want.insert(path_key(name), hex.clone());
+    }
+    want
 }
 
 fn step_path(step: &Done) -> &Path {

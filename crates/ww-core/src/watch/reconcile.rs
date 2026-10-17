@@ -21,7 +21,10 @@
 //!
 //! Two readings the table leaves open:
 //! - A [`Recorded`] whose `sha256` is empty (a pre-2b run file recorded without a hash, and no
-//!   generated hash) has nothing to compare a change with, so a `Changed` file is `Reindex`.
+//!   generated hash) has nothing to compare a change with, so a `Changed` file is `Reindex`,
+//!   unless it is an [`Recorded::outside_addition`]: a file added to a sealed version folder
+//!   from outside (ruling Q32), which is a `HumanEdit` with an empty `previous_sha256` (then,
+//!   like any human edit, once per content).
 //! - An LFS pointer whose `oid` is the latest human edit's hash is `NotFetched`: that human
 //!   edit is what the pointer stands for, so it is recorded already and never pushed twice.
 
@@ -49,6 +52,10 @@ pub struct Recorded {
     pub pending: Vec<String>,
     /// The latest `human_edits[path].sha256`.
     pub last_human_edit: Option<String>,
+    /// A file in a sealed `v<semver>/` (one with a `manifest.snapshot.json`) that the
+    /// manifest's `hashes` doesn't list and the core never wrote: an outside addition to an
+    /// immutable version (ruling Q32). `sha256` is empty.
+    pub outside_addition: bool,
 }
 
 /// One file as a stable read saw it. Unstable or locked reads are parked by the index and never
@@ -138,7 +145,9 @@ pub fn decide(obs: &Observed, recorded: Option<&Recorded>, git_busy: bool) -> Ac
     let Some(r) = recorded else {
         return Action::Reindex(path);
     };
-    if !matches!(r.kind, FileKind::Candidate | FileKind::Sealed) || r.sha256.is_empty() {
+    if !matches!(r.kind, FileKind::Candidate | FileKind::Sealed)
+        || (r.sha256.is_empty() && !r.outside_addition)
+    {
         return Action::Reindex(path);
     }
     let human_edit = |sha256: &str| Action::HumanEdit {
@@ -255,6 +264,7 @@ mod tests {
             expected: true,
             pending: Vec::new(),
             last_human_edit: None,
+            outside_addition: false,
         }
     }
 
@@ -426,6 +436,34 @@ mod tests {
         assert_eq!(
             decide(&changed(SEALED, NEW), Some(&no_manifest), false),
             human(SEALED, NEW, OLD)
+        );
+        // Ruling Q32: a file added to a sealed version from outside is a human edit with an
+        // empty previous hash, recorded once; its removal is no `missing`.
+        let added = Recorded {
+            sha256: String::new(),
+            expected: false,
+            outside_addition: true,
+            ..rec(FileKind::Sealed)
+        };
+        assert_eq!(
+            decide(&changed(SEALED, NEW), Some(&added), false),
+            human(SEALED, NEW, "")
+        );
+        let added_once = Recorded {
+            last_human_edit: Some(NEW.to_string()),
+            ..added.clone()
+        };
+        assert_eq!(
+            decide(&changed(SEALED, NEW), Some(&added_once), false),
+            Action::Reindex(p(SEALED))
+        );
+        assert_eq!(
+            decide(&changed(SEALED, EDIT), Some(&added_once), false),
+            human(SEALED, EDIT, NEW)
+        );
+        assert_eq!(
+            decide(&Observed::Removed(p(SEALED)), Some(&added), false),
+            Action::Reindex(p(SEALED))
         );
     }
 

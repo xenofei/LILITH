@@ -21,12 +21,26 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+/// Whether the file name `name` (the last component of a path) is an OS metadata file that
+/// Explorer or macOS writes into folders on its own: `Thumbs.db`, `desktop.ini` or
+/// `.DS_Store`, compared without regard to case. The suite ignores them everywhere (ruling
+/// Q32): they are never indexed, hashed, flagged as edits or part of a content hash.
+pub fn is_os_metadata(name: &str) -> bool {
+    ["thumbs.db", "desktop.ini", ".ds_store"]
+        .iter()
+        .any(|m| name.eq_ignore_ascii_case(m))
+}
+
 /// The content hash of a version. `files` holds `(path relative to v<version>/ with '/',
 /// sha256 hex)` pairs in any order.
 pub fn version_content_hash(files: &[(String, String)]) -> String {
     let mut lines: Vec<(&str, &str)> = files
         .iter()
-        .filter(|(rel, _)| !rel.starts_with("source/") && rel != "manifest.snapshot.json")
+        .filter(|(rel, _)| {
+            !rel.starts_with("source/")
+                && rel != "manifest.snapshot.json"
+                && !is_os_metadata(rel.rsplit('/').next().unwrap_or(rel))
+        })
         .map(|(rel, sha)| (rel.as_str(), sha.as_str()))
         .collect();
     lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
@@ -57,6 +71,13 @@ mod tests {
             ("B.png".to_string(), B.to_string()),
         ];
         assert_eq!(version_content_hash(&files), want);
+        // OS metadata files are never part of it (ruling Q32), at any depth and in any case.
+        let mut with_metadata = files.clone();
+        for name in ["Thumbs.db", "sub/DESKTOP.INI", ".DS_Store"] {
+            with_metadata.push((name.to_string(), A.to_string()));
+        }
+        assert_eq!(version_content_hash(&with_metadata), want);
+        assert!(is_os_metadata("thumbs.DB") && !is_os_metadata("thumbs.db.png"));
 
         // Order of the input doesn't matter; ignored files don't count.
         let mut reversed = files.clone();

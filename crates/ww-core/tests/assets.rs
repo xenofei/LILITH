@@ -1118,3 +1118,204 @@ async fn import_refuses_link_and_cloud_only_sources() {
     }
     assert!(!fx.path(KITE_DIR).exists());
 }
+
+/// The real probe, recording every file whose data it opens.
+#[derive(Debug, Default)]
+struct CountingProbe {
+    opened: Mutex<Vec<PathBuf>>,
+}
+
+impl Probe for CountingProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<ww_platform::fs::FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<ww_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.opened.lock().unwrap().push(path.to_path_buf());
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test] // spec: CORE-047, ARCH-042 (ruling Q32)
+async fn asset_get_opens_no_sealed_file() {
+    let probe = Arc::new(CountingProbe::default());
+    let shared = probe.clone();
+    let fx = Fx::build(|_| {}, move |_| shared);
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let signed = fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+    probe.opened.lock().unwrap().clear();
+    for asset in [KITE, "prop_signal_lamp", "chr_paper_crane"] {
+        let detail = fx
+            .ok(
+                "asset.get",
+                json!({"project": "sketchbook", "asset_id": asset}),
+            )
+            .await;
+        let refs: Vec<&str> = detail["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["ref"].as_str().unwrap())
+            .collect();
+        assert!(!refs.is_empty(), "{asset}: {detail}");
+        assert!(
+            refs.iter().all(|r| r.contains("#sha256=")),
+            "{asset}: {detail}"
+        );
+        if asset == KITE {
+            assert_eq!(refs, [signed["ref"].as_str().unwrap()], "{detail}");
+        }
+    }
+    let opened = probe.opened.lock().unwrap().clone();
+    let sealed: Vec<&PathBuf> = opened
+        .iter()
+        .filter(|p| {
+            p.components().any(|c| {
+                let name = c.as_os_str().to_string_lossy();
+                name.starts_with('v') && name[1..].parse::<ww_schema::Version>().is_ok()
+            })
+        })
+        .collect();
+    assert!(
+        sealed.is_empty(),
+        "asset.get opened sealed files: {sealed:?}"
+    );
+}
+
+#[tokio::test] // spec: CORE-033, ARCH-079 (ruling Q32)
+async fn a_cloud_only_legacy_file_leaves_its_version_without_a_content_hash() {
+    const OLD: &str = "projects/sketchbook/assets/prop_old_sign";
+    let fx = Fx::build(
+        |ws| {
+            // A legacy asset: no `hashes`, no snapshot, two files in v1.0.0/.
+            write_file(
+                &file(ws, &format!("{OLD}/prop_old_sign.manifest.json")),
+                br#"{"asset_id": "prop_old_sign", "project": "sketchbook", "type": "image",
+  "status": "approved", "version": "1.0.0", "approved_version": "1.0.0"}
+"#,
+            );
+            write_file(&file(ws, &format!("{OLD}/v1.0.0/sign.png")), b"sign");
+            write_file(&file(ws, &format!("{OLD}/v1.0.0/sign_big.png")), b"big");
+            // And one whose files are all there.
+            write_file(
+                &file(
+                    ws,
+                    "projects/sketchbook/assets/prop_new_sign/prop_new_sign.manifest.json",
+                ),
+                br#"{"asset_id": "prop_new_sign", "project": "sketchbook", "type": "image",
+  "status": "approved", "version": "1.0.0", "approved_version": "1.0.0"}
+"#,
+            );
+            write_file(
+                &file(
+                    ws,
+                    "projects/sketchbook/assets/prop_new_sign/v1.0.0/sign.png",
+                ),
+                b"sign",
+            );
+        },
+        |env| {
+            let ws = env.root().join("ws-assets");
+            Arc::new(CloudProbe {
+                placeholder: file(&ws, &format!("{OLD}/v1.0.0/sign_big.png")),
+            })
+        },
+    );
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": "prop_old_sign"}),
+        )
+        .await;
+    assert_eq!(
+        detail["versions"],
+        json!([{
+            "version": "1.0.0",
+            "ref": format!("ww://{}/sketchbook/prop_old_sign@1.0.0", fx.ws_id()),
+            "legacy": true,
+            "cloud_only": true,
+        }]),
+        "{detail}"
+    );
+    // A legacy version whose files are all local is hashed from them, without the flag.
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": "prop_new_sign"}),
+        )
+        .await;
+    let hash = version_content_hash_of(&fx.path("projects/sketchbook/assets/prop_new_sign/v1.0.0"));
+    assert_eq!(
+        detail["versions"],
+        json!([{
+            "version": "1.0.0",
+            "ref": format!("ww://{}/sketchbook/prop_new_sign@1.0.0#sha256={hash}", fx.ws_id()),
+            "legacy": true,
+        }]),
+        "{detail}"
+    );
+}
+
+#[tokio::test] // spec: ARCH-075, CORE-026
+async fn the_seal_reports_the_run_files_it_moved_as_removals() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    write_file(
+        &fx.path(&format!("{KITE_DIR}/candidates/{run}/source/kite.kra")),
+        b"layered source",
+    );
+    let open = fx.open().await;
+    let recorder = Arc::new(Recorder {
+        index: open.index.clone(),
+        batches: Mutex::new(Vec::new()),
+    });
+    open.store.set_sink(recorder.clone());
+    fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+
+    let batches = recorder.batches.lock().unwrap().clone();
+    let sealed = format!("{KITE_DIR}/v1.0.0/kite.png");
+    let batch = batches
+        .iter()
+        .find(|b| b.iter().any(|e| e.path.as_str() == sealed))
+        .unwrap_or_else(|| panic!("{batches:?}"));
+    let manifest = format!("{KITE_DIR}/{KITE}.manifest.json");
+    let at = |p: &str| batch.iter().position(|e| e.path.as_str() == p);
+    for moved in [
+        format!("{KITE_DIR}/candidates/{run}/kite.png"),
+        format!("{KITE_DIR}/candidates/{run}/source"),
+    ] {
+        let i = at(&moved).unwrap_or_else(|| panic!("no removal of {moved}: {batch:?}"));
+        assert_eq!(
+            batch[i].kind,
+            ww_core::store::ChangeKind::Removed,
+            "{moved}"
+        );
+        assert!(
+            at(&manifest).unwrap() < i,
+            "after the manifest edit: {batch:?}"
+        );
+    }
+    // The index no longer lists the run's moved files, with or without a watcher.
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    let paths: Vec<&str> = detail["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.starts_with(&format!("candidates/{run}/"))),
+        "{detail}"
+    );
+}

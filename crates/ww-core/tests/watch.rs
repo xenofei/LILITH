@@ -1316,3 +1316,85 @@ async fn a_fence_written_before_the_watch_is_armed_is_handled() {
         .await
         .expect("a fence that predates the watch is covered by the first reconcile");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ruling Q32: files added to a sealed version.
+// ---------------------------------------------------------------------------------------------
+
+/// The crane's v1.0.0 ref, as `asset.get` gives it.
+fn crane_ref(detail: &Value) -> String {
+    detail["versions"][0]["ref"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-026, ARCH-042, ARCH-079
+async fn os_metadata_in_a_sealed_version_is_ignored() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let before = core.detail(CRANE).await;
+    for name in ["Thumbs.db", "desktop.ini", ".DS_Store"] {
+        write_file(&core.path(&format!("{BASE}/v1.0.0/{name}")), b"os metadata");
+    }
+    core.fence().await;
+    // `ww notify` of them changes nothing either.
+    let notified = core
+        .watch()
+        .notify(vec![p(&format!("{BASE}/v1.0.0/Thumbs.db"))])
+        .await;
+    assert!(notified.ignored.is_empty(), "{notified:?}");
+
+    let after = core.detail(CRANE).await;
+    assert_eq!(crane_ref(&after), crane_ref(&before), "{after}");
+    assert_eq!(after["human_edits"], before["human_edits"], "{after}");
+    assert_eq!(after["files"], before["files"], "never indexed: {after}");
+    for name in ["Thumbs.db", "desktop.ini", ".DS_Store"] {
+        assert!(
+            core.row(&format!("{BASE}/v1.0.0/{name}")).await.is_none(),
+            "{name} has an index row"
+        );
+    }
+    let events = core.published(&core.asset_topic(CRANE)).await;
+    assert!(
+        !kinds(&events).contains(&"human_edit".to_string()),
+        "{events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-026, CORE-034, ARCH-042, ARCH-079
+async fn a_file_dropped_into_a_sealed_version_is_a_human_edit() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let before = core.detail(CRANE).await;
+    let extra = format!("{BASE}/v1.0.0/extra.png");
+    write_file(&core.path(&extra), b"dropped in by hand");
+    core.fence().await;
+
+    let after = core.detail(CRANE).await;
+    // The version's identity doesn't move.
+    assert_eq!(crane_ref(&after), crane_ref(&before), "{after}");
+    assert_eq!(
+        edits_of(&after, "v1.0.0/extra.png"),
+        [
+            json!({"path": "v1.0.0/extra.png", "sha256": sha256_bytes(b"dropped in by hand"),
+                "previous_sha256": "", "date": TODAY})
+        ],
+        "{after}"
+    );
+    assert_eq!(Core::state(&after, "v1.0.0/extra.png"), "human_edit");
+    let events = core.published(&core.asset_topic(CRANE)).await;
+    let flagged: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "human_edit" && e["path"] == "v1.0.0/extra.png")
+        .collect();
+    assert_eq!(flagged.len(), 1, "{events:?}");
+    assert_eq!(flagged[0]["previous_sha256"], "", "{events:?}");
+    // Seen again (`ww notify`), it is recorded once; the file itself is never touched.
+    core.watch().notify(vec![p(&extra)]).await;
+    let again = core.detail(CRANE).await;
+    assert_eq!(edits_of(&again, "v1.0.0/extra.png").len(), 1, "{again}");
+    assert_eq!(
+        std::fs::read(core.path(&extra)).unwrap(),
+        b"dropped in by hand"
+    );
+    // The snapshot itself is no outside addition.
+    assert!(edits_of(&again, "v1.0.0/manifest.snapshot.json").is_empty());
+}

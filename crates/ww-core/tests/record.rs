@@ -86,6 +86,16 @@ impl Fx {
         hooks: impl FnOnce(PipelineHooks) -> PipelineHooks,
         failpoints: Arc<FailPoints>,
     ) -> Fx {
+        Fx::with_probe(setup, hooks, failpoints, |_| Arc::new(SystemProbe))
+    }
+
+    /// [`Fx::new`], with the probe `probe` makes for the fixture workspace's folder.
+    fn with_probe(
+        setup: impl FnOnce(&Path),
+        hooks: impl FnOnce(PipelineHooks) -> PipelineHooks,
+        failpoints: Arc<FailPoints>,
+        probe: impl FnOnce(&Path) -> Arc<dyn Probe>,
+    ) -> Fx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("record");
         setup(&ws);
@@ -100,7 +110,7 @@ impl Fx {
         let clock: Arc<dyn Clock> = FakeClock::new();
         let events = Arc::new(EventBus::new(clock.clone()));
         let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
-        let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
+        let probe: Arc<dyn Probe> = probe(&ws);
         let hub = WorkspaceHub::new(
             env.env.clone(),
             states.clone(),
@@ -148,6 +158,16 @@ impl Fx {
     }
 
     fn call(&self, name: &str, args: Value) -> impl Future<Output = Outcome<ToolOutput>> + use<> {
+        self.call_keyed(name, args, key())
+    }
+
+    /// A call with the idempotency key `idem` for a write tool (a retry passes the same one).
+    fn call_keyed(
+        &self,
+        name: &str,
+        args: Value,
+        idem: String,
+    ) -> impl Future<Output = Outcome<ToolOutput>> + use<> {
         let Value::Object(arguments) = args else {
             panic!("arguments must be an object");
         };
@@ -170,7 +190,7 @@ impl Fx {
         let params = ToolCallParams {
             name: name.into(),
             arguments,
-            idempotency_key: write.then(key),
+            idempotency_key: write.then_some(idem),
             trace_id: None,
         };
         let dispatcher = self.dispatcher.clone();
@@ -842,4 +862,279 @@ async fn a_candidate_edited_during_the_seal_is_put_back_and_refused() {
         )
         .await;
     assert_eq!(r["version"], "1.0.0", "{r}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ruling Q31: a Record failure after the seal is retryable, and what follows the manifest edit
+// is best-effort.
+// ---------------------------------------------------------------------------------------------
+
+/// Fail points whose `point` fails once (with a plain I/O error) after `arm` is set.
+fn fail_once(fp: &FailPoints, point: &str, arm: Arc<AtomicBool>) {
+    fp.on(
+        point,
+        Box::new(move || {
+            if arm.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other("a test failure"));
+            }
+            Ok(())
+        }),
+    );
+}
+
+/// The `v<semver>` folders of the kite asset.
+fn version_folders(fx: &Fx) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(fx.path(KITE_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('v'))
+        .collect();
+    found.sort();
+    found
+}
+
+/// A sign-off that fails at `point` once, after its seal, then is retried with the same
+/// idempotency key: the retry adopts the sealed folder and records it.
+async fn retried_signoff_adopts_the_seal(point: &str) {
+    let fp = FailPoints::none();
+    let arm = Arc::new(AtomicBool::new(false));
+    fail_once(&fp, point, arm.clone());
+    let fx = Fx::new(|_| {}, |h| h, fp);
+    let run = fx.import_run(KITE, "a.png", b"a").await;
+    let args = Fx::signoff_args(KITE, &run, "a.png", json!({}));
+    let idem = key();
+
+    arm.store(true, Ordering::SeqCst);
+    let e = match fx
+        .call_keyed("asset.signoff", args.clone(), idem.clone())
+        .await
+    {
+        Outcome::Error { error } => error,
+        other => panic!("{point}: the first sign-off should fail: {other:?}"),
+    };
+    assert_eq!(e.code, "store.io", "{point}: {e:?}");
+    assert_eq!(
+        e.retry,
+        ww_protocol::RetryPolicy::SameIdempotencyKey,
+        "{point}: {e:?}"
+    );
+    // The seal took effect and the manifest doesn't record it.
+    let sealed = fx.path(&format!("{KITE_DIR}/v1.0.0/a.png"));
+    assert_eq!(std::fs::read(&sealed).unwrap(), b"a", "{point}");
+    assert!(
+        !fx.path(&format!("{KITE_DIR}/candidates/{run}/a.png"))
+            .exists()
+    );
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], Value::Null, "{point}: {m}");
+    assert_eq!(m["candidate_runs"][0]["status"], "open", "{point}: {m}");
+
+    // The retry, with the same key, records the version that is there.
+    let r = match fx.call_keyed("asset.signoff", args, idem).await {
+        Outcome::Ok(out) => out.structured,
+        other => panic!("{point}: the retry should succeed: {other:?}"),
+    };
+    let hash = version_content_hash_of(&fx.path(&format!("{KITE_DIR}/v1.0.0")));
+    assert_eq!(r["version"], "1.0.0", "{point}: {r}");
+    assert_eq!(
+        r["ref"],
+        format!(
+            "ww://{}/sketchbook/{KITE}@1.0.0#sha256={hash}",
+            fx.ws_ref.id
+        ),
+        "{point}: {r}"
+    );
+    assert_eq!(r["warnings"], json!([]), "{point}: {r}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], "1.0.0", "{point}: {m}");
+    assert_eq!(m["status"], "approved", "{point}: {m}");
+    assert_eq!(m["candidate_runs"][0]["status"], "selected", "{point}: {m}");
+    assert_eq!(
+        m["hashes"]["v1.0.0/a.png"],
+        format!("sha256:{}", sha256_bytes(b"a")),
+        "{point}: {m}"
+    );
+    // Exactly one sealed version, untouched and still read-only, and no orphan.
+    assert_eq!(version_folders(&fx), ["v1.0.0"], "{point}");
+    assert_eq!(std::fs::read(&sealed).unwrap(), b"a", "{point}");
+    assert!(std::fs::metadata(&sealed).unwrap().permissions().readonly());
+    let status = fx
+        .ok("project.status", json!({"project": "sketchbook"}))
+        .await;
+    assert_eq!(status["orphans"], json!([]), "{point}: {status}");
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    assert_eq!(detail["versions"].as_array().unwrap().len(), 1, "{detail}");
+    assert_eq!(detail["versions"][0]["ref"], r["ref"], "{detail}");
+}
+
+#[tokio::test] // spec: CORE-026, CORE-020, ARCH-075
+async fn a_record_failure_after_the_seal_is_retried_with_the_same_key() {
+    // The Record stage's commit fails before its manifest edit.
+    retried_signoff_adopts_the_seal("store.after_output").await;
+}
+
+#[tokio::test] // spec: CORE-026, QA-066
+async fn a_failure_right_after_the_seal_is_retried_with_the_same_key() {
+    // The seal itself fails after its final move (Execute).
+    retried_signoff_adopts_the_seal("store.after_seal").await;
+}
+
+#[tokio::test] // spec: CORE-026
+async fn a_version_folder_that_differs_is_never_adopted() {
+    let fp = FailPoints::none();
+    let arm = Arc::new(AtomicBool::new(false));
+    fail_once(&fp, "store.after_output", arm.clone());
+    let fx = Fx::new(|_| {}, |h| h, fp);
+    let run = fx.import_run(KITE, "a.png", b"a").await;
+    let args = Fx::signoff_args(KITE, &run, "a.png", json!({}));
+    arm.store(true, Ordering::SeqCst);
+    assert_eq!(fx.err("asset.signoff", args.clone()).await.code, "store.io");
+    // Something else lands in the unrecorded version folder.
+    let extra = fx.path(&format!("{KITE_DIR}/v1.0.0/extra.png"));
+    write_file(&extra, b"not the seal's");
+    let before: Vec<(String, Vec<u8>)> = ["a.png", "extra.png", "manifest.snapshot.json"]
+        .iter()
+        .map(|n| {
+            let path = fx.path(&format!("{KITE_DIR}/v1.0.0/{n}"));
+            ((*n).to_string(), std::fs::read(path).unwrap())
+        })
+        .collect();
+    let e = fx.err("asset.signoff", args).await;
+    assert_eq!(e.code, "version.exists", "{e:?}");
+    // The sealed folder is never touched.
+    for (name, bytes) in before {
+        let path = fx.path(&format!("{KITE_DIR}/v1.0.0/{name}"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+    }
+    assert!(
+        std::fs::metadata(fx.path(&format!("{KITE_DIR}/v1.0.0/a.png")))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], Value::Null, "{m}");
+    assert_eq!(version_folders(&fx), ["v1.0.0"]);
+}
+
+/// The real probe, except that one path reports the cloud placeholder attributes and its data
+/// is never opened.
+#[derive(Debug)]
+struct PlaceholderAt(PathBuf);
+
+impl Probe for PlaceholderAt {
+    fn identity(&self, path: &Path) -> std::io::Result<ww_platform::fs::FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path == self.0 {
+            id.attributes |= ww_platform::fs::PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<ww_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        assert_ne!(path, self.0, "a placeholder's data was opened");
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test] // spec: CORE-020, CORE-039, ARCH-075
+async fn a_cloud_only_progress_md_is_a_warning_and_the_operation_is_recorded() {
+    let fx = Fx::with_probe(
+        |ws| {
+            let put = |project: &str, asset: &str, bytes: Vec<u8>| {
+                let dir = format!("projects/{project}/assets/{asset}");
+                write_file(&file(ws, &format!("{dir}/{asset}.manifest.json")), &bytes);
+                write_file(&file(ws, &format!("{dir}/v1.0.0/d.png")), asset.as_bytes());
+            };
+            put(
+                "sketchbook",
+                "dep_stale",
+                dependent(
+                    "dep_stale",
+                    "sketchbook",
+                    "approved",
+                    "prop_kite@1.0.0",
+                    false,
+                ),
+            );
+        },
+        |h| h,
+        FailPoints::none(),
+        |ws| Arc::new(PlaceholderAt(file(ws, "projects/sketchbook/progress.md"))),
+    );
+    let progress = fx.path("projects/sketchbook/progress.md");
+    let progress_before = std::fs::read(&progress).unwrap();
+
+    // An import: `ok` with a warning, and the index knows the run.
+    let r = fx
+        .ok("asset.import", fx.import_args(KITE, "kite.png", b"one"))
+        .await;
+    let warnings = r["warnings"].as_array().expect("warnings").clone();
+    assert_eq!(warnings.len(), 1, "{r}");
+    assert!(warnings[0].as_str().unwrap().contains("progress.md"), "{r}");
+    let run = r["run_id"].as_str().unwrap().to_string();
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    assert_eq!(detail["status"], "candidate", "{detail}");
+    assert!(
+        detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == format!("candidates/{run}/kite.png") && f["state"] == "ok"),
+        "{detail}"
+    );
+
+    // Two sign-offs: the second makes the dependent stale although progress.md can't be
+    // written, and the index learns the sealed version.
+    fx.ok(
+        "asset.signoff",
+        Fx::signoff_args(KITE, &run, "kite.png", json!({})),
+    )
+    .await;
+    let second = fx.import_run(KITE, "kite_two.png", b"two").await;
+    let r = fx
+        .ok(
+            "asset.signoff",
+            Fx::signoff_args(KITE, &second, "kite_two.png", json!({"bump": "major"})),
+        )
+        .await;
+    assert_eq!(r["version"], "2.0.0", "{r}");
+    assert_eq!(r["warnings"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(fx.manifest("dep_stale")["status"], "stale");
+    assert_eq!(
+        r["handoff"]["made_stale"].as_array().unwrap().len(),
+        1,
+        "{r}"
+    );
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    assert_eq!(detail["approved_version"], "2.0.0", "{detail}");
+    assert!(
+        detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "v2.0.0/kite_two.png" && f["state"] == "ok"),
+        "{detail}"
+    );
+    // The placeholder itself was never read or written.
+    assert_eq!(std::fs::read(&progress).unwrap(), progress_before);
 }
