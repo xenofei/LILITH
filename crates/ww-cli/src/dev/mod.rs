@@ -154,7 +154,8 @@ pub enum DevCommand {
     /// Also removes local URL-specific credential.<url>.helper entries and writes two
     /// repository-local credential.helper entries, in this order: an empty
     /// one, which drops inherited helpers such as Git Credential Manager, and then
-    /// `!cargo run -q --locked -p ww-cli --bin ww -- dev git-credential`. So git in this
+    /// `!sh "$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper"`,
+    /// which runs `dev git-credential` from the checkout's CLI crate. So git in this
     /// repository authenticates to github.com only with the agent token.
     #[command(verbatim_doc_comment)]
     InstallHooks,
@@ -409,6 +410,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `install-hooks --help` quotes the helper entry the command actually writes.
+    #[test]
+    fn install_hooks_help_quotes_the_written_helper() {
+        use clap::CommandFactory;
+        let mut cmd = T::command();
+        let help = cmd
+            .find_subcommand_mut("install-hooks")
+            .expect("install-hooks subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains(agent_access::GIT_CREDENTIAL_HELPER),
+            "install-hooks help doesn't quote the helper entry:\n{help}"
+        );
+        assert!(
+            !help.contains("cargo run"),
+            "install-hooks help still quotes the old entry:\n{help}"
+        );
     }
 
     #[test]
