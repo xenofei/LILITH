@@ -24,6 +24,10 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
+        Command::Dev(_) if cli.global.any_set() => {
+            eprintln!("`ww dev` doesn't take --workspace, --non-interactive or --no-start.");
+            2
+        }
         Command::Dev(cmd) => dev::run(cmd),
         Command::User(cmd) => user::run(cmd, &cli.global),
     };

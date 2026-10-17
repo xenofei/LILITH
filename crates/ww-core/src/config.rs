@@ -20,6 +20,10 @@ const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(600);
 /// A connection that has not said hello after this long is closed.
 const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A fault an in-process test injects into the creation of pipe instances
+/// ([`CoreConfig::pipe_instance_fault`]).
+pub type PipeInstanceFault = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// The core's configuration.
 #[derive(Clone)]
 pub struct CoreConfig {
@@ -53,6 +57,10 @@ pub struct CoreConfig {
     /// only the test profile's config, never the system or user one (QA-038). A spawned core
     /// needs nothing here: it inherits the variables from its parent.
     pub git_env: Vec<(OsString, OsString)>,
+    /// In-process tests only (`None` from [`CoreConfig::for_env`]): runs before each pipe
+    /// instance after the claimed first one is created, and an `Err` is that instance's
+    /// creation error. The core then stops as after a fatal error (exit 4).
+    pub pipe_instance_fault: Option<PipeInstanceFault>,
     /// The crate's own unit tests only (compiled out of every build): a request with this
     /// method panics in the router, to test how the transport survives a panicking handler.
     #[cfg(test)]
@@ -87,6 +95,7 @@ impl CoreConfig {
             probe: Arc::new(SystemProbe),
             watch: WatchConfig::default(),
             git_env: Vec::new(),
+            pipe_instance_fault: None,
             #[cfg(test)]
             panic_on_method: None,
         })
@@ -111,7 +120,9 @@ pub enum CoreExit {
 
 impl CoreExit {
     /// The exit code of `ww-core` (Appendix D): 3, 2, 5, 6 and 7. Code 4 (stopped after a fatal
-    /// error) is a shutdown's, from `ShutdownReport::exit_code`.
+    /// error: a state actor that died, a pipe instance after the first that could not be
+    /// created, a test parent that cannot be watched) is a shutdown's, from
+    /// `ShutdownReport::exit_code`.
     pub fn code(&self) -> u8 {
         match self {
             CoreExit::AlreadyRunning => 3,

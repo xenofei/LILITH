@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use ww_platform::session_end::{SessionEnd, SessionEndWatcher};
+use ww_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
 
 /// Failure deadline for anything the test waits on.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -30,7 +30,7 @@ fn recv(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEnd>) -> SessionEnd
 fn query_end_session_is_reported_and_not_acted_on() {
     let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
     assert!(
-        watcher.simulate(SessionEnd::QueryEnd),
+        watcher.simulate(SessionEndSim::QueryEnd),
         "WM_QUERYENDSESSION must answer TRUE (the session may end)"
     );
     assert_eq!(recv(&mut rx), SessionEnd::QueryEnd);
@@ -47,7 +47,7 @@ fn end_session_blocks_until_shutdown_complete() {
     let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
     let watcher = std::sync::Arc::new(watcher);
     let sender = watcher.clone();
-    let sent = std::thread::spawn(move || sender.simulate(SessionEnd::End));
+    let sent = std::thread::spawn(move || sender.simulate(SessionEndSim::End));
 
     assert_eq!(recv(&mut rx), SessionEnd::End);
     let deadline = Instant::now() + DEADLINE;
@@ -69,7 +69,7 @@ fn end_session_blocks_until_shutdown_complete() {
     assert!(!watcher.is_waiting_for_shutdown());
 
     // Once the shutdown is complete, a later WM_ENDSESSION returns at once.
-    assert!(watcher.simulate(SessionEnd::End));
+    assert!(watcher.simulate(SessionEndSim::End));
     assert_eq!(recv(&mut rx), SessionEnd::End);
 }
 
@@ -77,10 +77,10 @@ fn end_session_blocks_until_shutdown_complete() {
 fn session_end_window_is_never_visible() {
     let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
     assert!(!watcher.is_visible(), "the session-end window is visible");
-    assert!(watcher.simulate(SessionEnd::QueryEnd));
+    assert!(watcher.simulate(SessionEndSim::QueryEnd));
     assert_eq!(recv(&mut rx), SessionEnd::QueryEnd);
     watcher.shutdown_complete();
-    assert!(watcher.simulate(SessionEnd::End));
+    assert!(watcher.simulate(SessionEndSim::End));
     assert_eq!(recv(&mut rx), SessionEnd::End);
     assert!(
         !watcher.is_visible(),
@@ -94,14 +94,38 @@ fn outside_wm_close_does_not_destroy_the_window() {
     let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
     // A WM_CLOSE sent to the window, as another program could send it, is ignored.
     assert!(
-        watcher.simulate(SessionEnd::CloseIgnored),
+        watcher.simulate(SessionEndSim::Close),
         "WM_CLOSE destroyed the session-end window"
     );
     assert_eq!(recv(&mut rx), SessionEnd::CloseIgnored);
     // The window still answers the session messages.
-    assert!(watcher.simulate(SessionEnd::QueryEnd));
+    assert!(watcher.simulate(SessionEndSim::QueryEnd));
     assert_eq!(recv(&mut rx), SessionEnd::QueryEnd);
     assert!(watcher.is_alive());
     // Dropping the watcher still destroys it and ends its thread.
     drop(watcher);
+}
+
+#[test] // spec: ARCH-021
+fn simulate_selector_is_separate_from_reported_events() {
+    let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
+    // What a test sends (`SessionEndSim`) and what the window reports (`SessionEnd`) are two
+    // types: `Close` sends `WM_CLOSE`, which is reported as `CloseIgnored`.
+    let sent = [
+        SessionEndSim::Close,
+        SessionEndSim::QueryEnd,
+        SessionEndSim::End,
+    ];
+    let reported = [
+        SessionEnd::CloseIgnored,
+        SessionEnd::QueryEnd,
+        SessionEnd::End,
+    ];
+    watcher.shutdown_complete();
+    for (sim, expected) in sent.into_iter().zip(reported) {
+        assert!(watcher.simulate(sim), "{sim:?}");
+        assert_eq!(recv(&mut rx), expected, "{sim:?}");
+    }
+    assert!(watcher.is_alive());
+    assert!(rx.try_recv().is_err(), "one report per message");
 }

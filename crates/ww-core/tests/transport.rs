@@ -36,8 +36,9 @@ const POLL: Duration = Duration::from_millis(10);
 // The fake router.
 // ---------------------------------------------------------------------------------------------
 
-/// `echo` returns its params; `big` returns a result longer than a line may be; `slow` waits
-/// until the test calls [`Fake::release`]; anything else is -32601. Records what happened.
+/// `echo` returns its params; `ack` returns `"ack"` whatever its params; `big` returns a
+/// result longer than a line may be; `slow` waits until the test calls [`Fake::release`];
+/// anything else is -32601. Records what happened.
 struct Fake {
     handshake_done: bool,
     opened: AtomicUsize,
@@ -93,13 +94,24 @@ impl Router for Fake {
         req: Request,
     ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>> {
         Box::pin(async move {
-            let id = req.id.clone()?;
+            let Some(id) = req.id.clone() else {
+                // The transport never hands a notification over; record it if it does.
+                self.note(&format!("notification {}", req.method));
+                return None;
+            };
             match req.method.as_str() {
                 "echo" => {
                     self.note("echo");
                     Some(Response::Result {
                         id,
                         result: req.params.unwrap_or(Value::Null),
+                    })
+                }
+                "ack" => {
+                    self.note("ack");
+                    Some(Response::Result {
+                        id,
+                        result: json!("ack"),
                     })
                 }
                 "big" => Some(Response::Result {
@@ -239,6 +251,36 @@ impl Bare {
         let Bare { pipe, rt } = self;
         rt.block_on(pipe.write_all(bytes))
             .expect("write to the pipe");
+    }
+
+    /// Reads until the server has sent `n` whole lines and returns them without their `\n`;
+    /// panics if they have not all arrived within the deadline.
+    fn read_lines(&mut self, n: usize) -> Vec<String> {
+        let Bare { pipe, rt } = self;
+        let mut all = Vec::new();
+        let read = rt.block_on(async {
+            tokio::time::timeout(DEADLINE, async {
+                let mut chunk = vec![0u8; 64 * 1024];
+                while all.iter().filter(|&&b| b == b'\n').count() < n {
+                    match pipe.read(&mut chunk).await {
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        Ok(got) => all.extend_from_slice(&chunk[..got]),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })
+            .await
+        });
+        match read {
+            Ok(Ok(())) => String::from_utf8(all)
+                .expect("the server sent UTF-8")
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Ok(Err(e)) => panic!("reading the pipe failed: {e}"),
+            Err(_) => panic!("{n} lines did not arrive within {DEADLINE:?}"),
+        }
     }
 
     /// Reads until the server closes the connection and returns everything it sent; panics if
@@ -498,6 +540,99 @@ fn truncated_line_at_disconnect_is_ignored() {
         2,
         "closed once per connection"
     );
+}
+
+#[test] // spec: QA-010, ARCH-025
+fn non_utf8_line_is_a_parse_error() {
+    let env = TestEnv::new();
+    let name = env.env.pipe_name();
+    let (fake, _started) = Fake::new(true);
+    let served = Served::start(&name, fake.clone());
+    let mut pipe = Bare::connect(&name);
+
+    // A line that is not UTF-8 (a lone 0xFF, and half of a two-byte sequence), then a
+    // request, in one write: the bad line gets -32700 with id `null`, the request its answer.
+    let mut bytes =
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"echo\",\"params\":\"\xFF\xC3\"}\n".to_vec();
+    bytes.extend_from_slice(request(2, "echo", json!({"after": "Ünïcödé space"})).as_bytes());
+    bytes.push(b'\n');
+    pipe.write(&bytes);
+    let lines = pipe.read_lines(2);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let error = parse(&lines[0]);
+    assert_eq!(error["error"]["code"], rpc_code::PARSE_ERROR, "{error}");
+    assert_eq!(error["id"], Value::Null, "{error}");
+    let answer = parse(&lines[1]);
+    assert_eq!(answer["id"], 2, "{answer}");
+    assert_eq!(
+        answer["result"],
+        json!({"after": "Ünïcödé space"}),
+        "{answer}"
+    );
+
+    // Only the valid request reached the router, and the connection is still open.
+    assert_eq!(fake.log(), ["echo"]);
+    assert_eq!(fake.closed.load(Ordering::SeqCst), 0);
+    assert_eq!(served.connections(), 1);
+}
+
+#[test] // spec: ARCH-025
+fn client_notifications_are_ignored() {
+    // Before the handshake (handled on the reader) and after it (in their own tasks).
+    for handshake_done in [false, true] {
+        let env = TestEnv::new();
+        let (fake, _started) = Fake::new(handshake_done);
+        let _served = Served::start(&env.env.pipe_name(), fake.clone());
+        let mut pipe = RawPipe::connect(&env);
+
+        // Notifications (no `id`), of a method the router knows and of one it doesn't: no
+        // answer, and the router never sees them.
+        pipe.send_line(
+            &json!({"jsonrpc": "2.0", "method": "echo", "params": {"n": 1}}).to_string(),
+        );
+        pipe.send_line(&json!({"jsonrpc": "2.0", "method": "nonsense"}).to_string());
+        pipe.send_line(&request(5, "ack", json!({})));
+        let response = read(&mut pipe);
+        assert_eq!(response["id"], 5, "handshake {handshake_done}: {response}");
+        assert_eq!(
+            response["result"], "ack",
+            "handshake {handshake_done}: {response}"
+        );
+        // The next line is the answer to the next request: nothing was queued for the
+        // notifications in between.
+        pipe.send_line(&request(6, "echo", json!({"after": "notifications"})));
+        let response = read(&mut pipe);
+        assert_eq!(response["id"], 6, "handshake {handshake_done}: {response}");
+        assert_eq!(
+            response["result"],
+            json!({"after": "notifications"}),
+            "handshake {handshake_done}: {response}"
+        );
+        assert_eq!(fake.log(), ["ack", "echo"], "handshake {handshake_done}");
+    }
+}
+
+#[test] // spec: ARCH-025
+fn line_of_exactly_max_bytes_is_accepted() {
+    let env = TestEnv::new();
+    let (fake, _started) = Fake::new(true);
+    let _served = Served::start(&env.env.pipe_name(), fake.clone());
+    let mut pipe = RawPipe::connect(&env);
+
+    // A request whose line, without its `\n`, is exactly the cap.
+    let base = request(7, "ack", json!({"pad": ""}));
+    let pad = ww_protocol::MAX_LINE_BYTES - base.len();
+    let line = request(7, "ack", json!({"pad": "a".repeat(pad)}));
+    assert_eq!(line.len(), ww_protocol::MAX_LINE_BYTES);
+    pipe.send_line(&line);
+    let response = read(&mut pipe);
+    assert_eq!(response["id"], 7, "{response}");
+    assert_eq!(response["result"], "ack", "{response}");
+
+    // The connection is still open.
+    let response = pipe.call("echo", json!({"after": "max"}));
+    assert_eq!(response["result"], json!({"after": "max"}), "{response}");
+    assert_eq!(fake.closed.load(Ordering::SeqCst), 0);
 }
 
 #[test] // spec: ARCH-025, QA-010

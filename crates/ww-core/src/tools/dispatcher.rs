@@ -48,6 +48,10 @@
 //! runs again). An admitted call counts as in flight until its pipeline ends, even if its
 //! caller has gone, so a drain waits for it.
 //!
+//! **Tracing.** The pipeline and the tool's own task run in a `tool_call` span with `tool` and
+//! `trace_id`, so every line they log, the panic hook's among them (ARCH-119), carries the
+//! call's trace id.
+//!
 //! **Cancellation.** [`Dispatcher::call`] runs the pipeline in a task of its own, so a caller
 //! that goes away (a client killed mid-call) cannot stop it between `idem_begin` and
 //! `idem_finish`: the outcome is stored for the retry. A [`Claim`] that is dropped unfinished
@@ -58,6 +62,7 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
 use tokio::task::JoinError;
+use tracing::Instrument as _;
 use ww_platform::{Clock, IdSource};
 use ww_protocol::{
     CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolDescriptor, ToolOutput,
@@ -184,12 +189,16 @@ impl Dispatcher {
             };
         };
         let (name, inner, trace) = (p.name.clone(), self.inner.clone(), trace_id.clone());
+        let span = tracing::info_span!("tool_call", tool = %name, trace_id = %trace_id);
         // Its own task: a caller that goes away cannot cut the pipeline short. The call stays
         // in flight until the pipeline ends.
-        let pipeline = tokio::spawn(async move {
-            let _in_flight = in_flight;
-            inner.pipeline(session, p, trace).await
-        });
+        let pipeline = tokio::spawn(
+            async move {
+                let _in_flight = in_flight;
+                inner.pipeline(session, p, trace).await
+            }
+            .instrument(span),
+        );
         match pipeline.await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -475,7 +484,9 @@ impl Inner {
         };
         let running = tool.clone();
         let run_ctx = ctx.clone();
-        let joined = tokio::spawn(async move { running.run(&run_ctx, args).await }).await;
+        // In the pipeline's span: a panic in the tool is logged with the call's trace id.
+        let joined =
+            tokio::spawn(async move { running.run(&run_ctx, args).await }.in_current_span()).await;
         let mut outcome = match joined {
             Ok(Ok(output)) => Outcome::Ok(output),
             Ok(Err(mut error)) => {

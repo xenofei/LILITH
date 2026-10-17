@@ -4,9 +4,10 @@
 //! Startup order: the process environment, then the pipe claim (a core that loses it exits 3
 //! having touched nothing, not even its log), then the log, then the suite `state.db` (a newer
 //! one exits 6, a damaged one 5, one with a hot rollback journal 7, any other failure 2;
-//! nothing on disk is changed and the pipe is released first), then serving until the core shuts down (ARCH-021). Startup failures
-//! exit with [`CoreExit::code`]; a shutdown exits with its report's code: 4 after a fatal
-//! error, else 0.
+//! nothing on disk is changed and the pipe is released first), then serving until the core
+//! shuts down (ARCH-021). Startup failures exit with [`CoreExit::code`]; a shutdown exits with
+//! its report's code: 4 after a fatal error (a state actor that died, a pipe instance that
+//! could not be created, a test parent that cannot be watched), else 0.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -45,8 +46,10 @@ fn run() -> Result<u8, CoreExit> {
     })
 }
 
-/// JSON lines to `logs_dir\core.<date>.log`, rotated daily, 14 files kept, and a panic hook
-/// that logs the message and location before the default hook runs (ARCH-117, ARCH-119).
+/// JSON lines without ANSI escapes to `logs_dir\core.<date>.log`, rotated daily, 14 files
+/// kept, and a panic hook that logs the panic's text (`panic`) and location before the default
+/// hook runs (ARCH-117, ARCH-119). The hook's line is logged in the panicking task's span, so a
+/// tool's panic carries the call's `trace_id`.
 fn init_logs(env: &Env) -> Result<(), CoreExit> {
     let dir = env.logs_dir();
     let startup = |what: &str, e: &dyn std::fmt::Display| {
@@ -62,6 +65,7 @@ fn init_logs(env: &Env) -> Result<(), CoreExit> {
         .map_err(|e| startup("open the log in", &e))?;
     tracing_subscriber::fmt()
         .json()
+        .with_ansi(false)
         .with_writer(appender)
         .try_init()
         .map_err(|e| startup("start logging to", &e))?;
@@ -72,8 +76,8 @@ fn init_logs(env: &Env) -> Result<(), CoreExit> {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
-        let message = info.payload_as_str().unwrap_or("(no message)");
-        tracing::error!(%location, message, "panic");
+        let text = info.payload_as_str().unwrap_or("(no message)");
+        tracing::error!(%location, panic = text, "panic");
         default_hook(info);
     }));
     Ok(())

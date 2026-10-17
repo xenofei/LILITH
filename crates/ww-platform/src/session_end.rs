@@ -18,7 +18,8 @@
 //! does not end the message loop, so the window lives exactly as long as its watcher.
 //!
 //! [`SessionEndWatcher::simulate`] sends those messages to the watcher's own window, for
-//! tests. Nothing here looks at or enumerates any other window.
+//! tests. What it sends is a [`SessionEndSim`], a type of its own: the [`SessionEnd`] events are
+//! only what the window reports. Nothing here looks at or enumerates any other window.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -51,6 +52,19 @@ const CLASS_NAME: PCWSTR = w!("WorldwrightCoreSessionEnd");
 
 /// The private message that destroys the window; its lParam must be the watcher's key.
 const WM_DESTROY_WATCHER: u32 = WM_APP + 1;
+
+/// What [`SessionEndWatcher::simulate`] sends to the watcher's own window (tests). It is not
+/// a [`SessionEnd`]: those are what the window reports, and `Close` is reported as
+/// [`SessionEnd::CloseIgnored`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndSim {
+    /// `WM_QUERYENDSESSION`.
+    QueryEnd,
+    /// `WM_ENDSESSION` with wParam TRUE.
+    End,
+    /// `WM_CLOSE`, as another program could send it.
+    Close,
+}
 
 /// What the window was told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,23 +193,23 @@ impl SessionEndWatcher {
     /// window's answer (TRUE: the session may end); for `End`, whether the message was
     /// handled (it returns once the shutdown is complete or the budget is spent).
     ///
-    /// `CloseIgnored` sends `WM_CLOSE`, as another program could; the result is whether the
-    /// window still answers afterwards.
-    pub fn simulate(&self, msg: SessionEnd) -> bool {
+    /// `Close` sends `WM_CLOSE`, as another program could; the result is whether the window
+    /// still answers afterwards.
+    pub fn simulate(&self, msg: SessionEndSim) -> bool {
         let hwnd = self.hwnd();
         match msg {
-            SessionEnd::QueryEnd => {
+            SessionEndSim::QueryEnd => {
                 // SAFETY: `hwnd` is this watcher's live window: only `Drop` destroys it
                 // (module docs). The message carries no pointers.
                 let answer = unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, None, None) };
                 answer.0 != 0
             }
-            SessionEnd::End => {
+            SessionEndSim::End => {
                 // SAFETY: as above.
                 unsafe { SendMessageW(hwnd, WM_ENDSESSION, Some(WPARAM(1)), Some(LPARAM(0))) };
                 true
             }
-            SessionEnd::CloseIgnored => {
+            SessionEndSim::Close => {
                 // SAFETY: as above; the window ignores the message.
                 unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
                 self.is_alive()

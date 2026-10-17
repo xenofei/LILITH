@@ -4,7 +4,8 @@
 //! - [`claim_pipe`] creates the pipe's *first* instance. If the pipe already exists, another
 //!   core owns the channel and this one exits with code 3 before it touches anything else.
 //! - [`serve`] accepts connections. A new instance is always created before a connected one is
-//!   handed to its task, so the pipe name never disappears while the core runs.
+//!   handed to its task, so the pipe name never disappears while the core runs. If one cannot
+//!   be created, `serve` fails, and the running core stops as after a fatal error (exit 4).
 //! - Each connection runs in [`conn`]: NDJSON framing and the order rules of the [`Router`].
 //!   After the handshake at most [`MAX_IN_FLIGHT_PER_CONN`] requests of one connection run at
 //!   once; the next line is read only when one of them has ended (backpressure on the pipe).
@@ -25,11 +26,11 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use ww_platform::pipe::{CreateError, client_pid, create_instance};
-use ww_platform::session_end::{SessionEnd, SessionEndWatcher};
+use ww_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
 use ww_platform::{Env, process};
 use ww_protocol::{Id, Request, Response, encode_response_capped};
 
-use crate::config::{CoreConfig, CoreExit};
+use crate::config::{CoreConfig, CoreExit, PipeInstanceFault};
 use crate::events::EventBus;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::projects::ActiveProjects;
@@ -159,6 +160,18 @@ pub async fn serve(
     stats: Arc<ServerStats>,
     stop: CancellationToken,
 ) -> io::Result<()> {
+    serve_with(listener, router, stats, stop, None).await
+}
+
+/// [`serve`], with the in-process tests' fault ([`CoreConfig::pipe_instance_fault`]) run
+/// before each new instance.
+async fn serve_with(
+    listener: Listener,
+    router: Arc<dyn Router>,
+    stats: Arc<ServerStats>,
+    stop: CancellationToken,
+    fault: Option<PipeInstanceFault>,
+) -> io::Result<()> {
     let Listener { name, first } = listener;
     let mut waiting = first;
     let mut connections = JoinSet::new();
@@ -171,9 +184,12 @@ pub async fn serve(
             connected = waiting.connect() => {
                 // A fresh instance first, so the name never disappears (another core could
                 // otherwise claim it).
-                let fresh = match create_instance(&name, false) {
+                let fresh = match new_instance(&name, fault.as_ref()) {
                     Ok(fresh) => fresh,
-                    Err(e) => break Err(create_error(e)),
+                    Err(e) => {
+                        tracing::error!(pipe = %name, error = %e, "cannot create a new pipe instance");
+                        break Err(e);
+                    }
                 };
                 let server = std::mem::replace(&mut waiting, fresh);
                 if let Err(e) = connected {
@@ -203,6 +219,15 @@ pub async fn serve(
     stop.cancel();
     while connections.join_next().await.is_some() {}
     result
+}
+
+/// A further instance of the pipe `name`; `fault` (in-process tests) runs first, and its
+/// `Err` is the creation's.
+fn new_instance(name: &str, fault: Option<&PipeInstanceFault>) -> io::Result<NamedPipeServer> {
+    if let Some(fault) = fault {
+        fault()?;
+    }
+    create_instance(name, false).map_err(create_error)
 }
 
 fn create_error(e: CreateError) -> io::Error {
@@ -292,7 +317,7 @@ impl RunningCore {
     /// Sends `msg` to the core's own session-end window, as Windows would (tests). `End`
     /// blocks until the shutdown is complete or [`crate::lifecycle::SESSION_END_BUDGET`] is
     /// spent, so call it from outside the core's runtime. `false` if the core has no window.
-    pub fn simulate_session_end(&self, msg: SessionEnd) -> bool {
+    pub fn simulate_session_end(&self, msg: SessionEndSim) -> bool {
         self.session_end.as_ref().is_some_and(|w| w.simulate(msg))
     }
 
@@ -333,7 +358,11 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 /// Then it serves, opens the default workspace in the background (a failure is logged; the
 /// first call in it tries again), ticks the idle check every [`IDLE_TICK`] (or `idle_after`,
 /// if a test channel set it shorter), watches the session end and, on a test channel, the
-/// test parent. A state actor that dies begins a fatal drain (QA-012).
+/// test parent. Each of these begins a fatal drain, after which the core exits 4
+/// ([`ShutdownReport::exit_code`]): a state actor that dies (QA-012); a pipe instance that
+/// cannot be created (every connection needs a new one, made before the connected instance is
+/// handed over; the first is the claimed one); a test parent that is running but cannot be
+/// watched (opening it fails other than with `NotFound`, or waiting for it fails).
 pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<RunningCore, CoreExit> {
     let pipe = listener.name().to_string();
     let lifecycle = Lifecycle::new(cfg.clock.clone(), cfg.idle_after);
@@ -387,7 +416,13 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
-    let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
+    let serving = tokio::spawn(serve_with(
+        listener,
+        router,
+        stats,
+        stop.clone(),
+        cfg.pipe_instance_fault.clone(),
+    ));
 
     if let Some(ws) = hub.default_ref() {
         let hub = hub.clone();
@@ -585,17 +620,30 @@ async fn watch_session_end(
 }
 
 /// Test channels: drains the core once the test process `pid` is gone, so a test core never
-/// outlives its test.
+/// outlives its test. A parent that is not running (`NotFound`) is gone. One that cannot be
+/// watched (opening it fails otherwise, for example access denied, or the wait cannot be
+/// registered) is a fatal error: the core would otherwise outlive its test unseen.
 async fn watch_test_parent(pid: u32, lifecycle: Arc<Lifecycle>) {
+    let cannot_watch = |e: &io::Error| {
+        tracing::error!(pid, error = %e, "cannot watch the test parent; the core stops");
+        lifecycle.begin_drain(DrainReason::Fatal(format!(
+            "cannot watch the test parent {pid}: {e}"
+        )));
+    };
     match process::open(pid) {
         Ok(parent) => {
             if let Err(e) = parent.wait().await {
-                tracing::warn!(pid, error = %e, "cannot wait for the test parent; stopping");
+                cannot_watch(&e);
+                return;
             }
         }
-        // Gone (`NotFound`), or a PID that now belongs to a process this user cannot open,
-        // which is not the test parent either.
-        Err(e) => tracing::info!(pid, error = %e, "the test parent is not running"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            tracing::info!(pid, error = %e, "the test parent is not running");
+        }
+        Err(e) => {
+            cannot_watch(&e);
+            return;
+        }
     }
     tracing::info!(pid, "the test parent is gone; stopping");
     lifecycle.begin_drain(DrainReason::TestParentGone);

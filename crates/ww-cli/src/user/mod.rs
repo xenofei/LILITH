@@ -61,6 +61,14 @@ pub struct GlobalArgs {
     pub no_start: bool,
 }
 
+impl GlobalArgs {
+    /// Whether any of the flags was given. `ww dev` takes none of them: they are `global`, so
+    /// clap would accept them after a dev command, and `main` refuses them there.
+    pub fn any_set(&self) -> bool {
+        self.workspace.is_some() || self.non_interactive || self.no_start
+    }
+}
+
 #[derive(Debug, clap::Subcommand)]
 pub enum UserCommand {
     /// Show whether the core is running, and its pipe, protocol, build and workspace.
@@ -569,5 +577,52 @@ mod tests {
             parse(&["ww", "dev", "spec-tests"]).command,
             Command::Dev(crate::dev::DevCommand::SpecTests)
         ));
+    }
+
+    #[test] // spec: ARCH-016
+    fn dev_commands_reject_user_global_flags() {
+        // The user flags are clap `global = true`, so they parse after a dev command too;
+        // `any_set` sees each of them, and none on a plain command.
+        for (args, set) in [
+            (&["ww", "dev", "spec-report"][..], false),
+            (&["ww", "dev", "spec-report", "--no-start"], true),
+            (&["ww", "--non-interactive", "dev", "spec-report"], true),
+            (
+                &[
+                    "ww",
+                    "dev",
+                    "spec-report",
+                    "--workspace",
+                    r"C:\ws\Ünïcödé space",
+                ],
+                true,
+            ),
+            (&["ww", "status"], false),
+            (&["ww", "--no-start", "status"], true),
+        ] {
+            let cli = parse(args);
+            assert_eq!(cli.global.any_set(), set, "{args:?}");
+        }
+
+        // The real `ww` refuses them on `ww dev`: exit 2 and the message, and the dev command
+        // never runs (`spec-report` would print its report on stdout).
+        let env = ww_testkit::TestEnv::new();
+        for flags in [
+            &["--no-start"][..],
+            &["--non-interactive"],
+            &["--workspace", "Ünïcödé space"],
+        ] {
+            let mut args = vec!["dev", "spec-report"];
+            args.extend_from_slice(flags);
+            let out = env.ww(&args);
+            assert_eq!(out.code, 2, "{args:?}: {out:?}");
+            assert!(
+                out.stderr.contains(
+                    "`ww dev` doesn't take --workspace, --non-interactive or --no-start."
+                ),
+                "{args:?}: {out:?}"
+            );
+            assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        }
     }
 }
