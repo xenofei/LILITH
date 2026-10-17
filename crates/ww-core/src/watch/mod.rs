@@ -351,6 +351,13 @@ impl Watcher {
         let _apply = s.apply.lock().await;
         let busy = s.git_busy_now();
         for m in found {
+            if s.stale(&m).await {
+                // The file changed after the verification read it (or a batch has decided
+                // it since): the batch, `ww notify` or the next verification decides the
+                // newer content instead.
+                tracing::debug!(path = %m.path, "a verification result is out of date; dropped");
+                continue;
+            }
             let obs = Observed::Changed {
                 path: m.path.clone(),
                 lfs_oid: m.lfs.then(|| m.sha256.clone()),
@@ -579,10 +586,19 @@ impl Shared {
                 Class::Path => paths.push(path),
             }
         }
-        if overflow && self.store.git_gate().lock_exists() {
-            self.git_activity();
+        if matches!(
+            ww_platform::fs::attributes(self.store.root()).map_err(|e| e.raw_os_error()),
+            Err(Some(2 | 3))
+        ) {
+            // The watched folder was renamed (which completes no read: its changes would keep
+            // coming under the new name) or removed. Checked before anything is reconciled,
+            // so its files are never taken for missing.
+            self.lost("the workspace folder was renamed or removed", None);
+            return true;
         }
-        let busy = lock(&self.git).busy;
+        // The lock itself counts, not only its events: git may have taken it before the
+        // workspace opened, and then no event of it ever comes.
+        let busy = self.git_busy_now();
         if busy {
             let mut git = lock(&self.git);
             for path in paths {
@@ -605,16 +621,21 @@ impl Shared {
             );
             return true;
         }
-        if matches!(
-            ww_platform::fs::attributes(self.store.root()).map_err(|e| e.raw_os_error()),
-            Err(Some(2 | 3))
-        ) {
-            // A rename of the watched folder completes no read: its changes would keep coming
-            // under the new name.
-            self.lost("the workspace folder was renamed or removed", None);
+        false
+    }
+
+    /// Whether the verification's result `m` is out of date: the row has been verified since
+    /// (a batch decided it), or the file's identity is no longer the one after its read.
+    async fn stale(&self, m: &Mismatch) -> bool {
+        if !matches!(self.index.is_verified(&m.path).await, Ok(Some(false))) {
             return true;
         }
-        false
+        let (probe, abs) = (self.store.probe().clone(), m.path.abs(self.store.root()));
+        let now = tokio::task::spawn_blocking(move || probe.identity(&abs))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        now != Some(m.identity)
     }
 
     /// Whether `project/asset`'s version lock is held now (a sign-off between `seal` and its
@@ -794,12 +815,18 @@ impl Shared {
             }),
             FileKind::Candidate | FileKind::Sealed => {
                 let entry = self.index.expected_entry(path).await.ok().flatten();
-                let (pending, generated) = self.store.own_hashes(path).await.unwrap_or_default();
+                let (mut pending, generated) =
+                    self.store.own_hashes(path).await.unwrap_or_default();
                 if entry.is_none() && generated.is_none() && pending.is_empty() {
                     return None;
                 }
                 let (sha256, expected) = match entry {
-                    Some((sha, tracked)) => (sha.or(generated), tracked),
+                    Some((Some(sha), tracked)) => {
+                        // The core's last write is its own too, as `accepts_as_own` says.
+                        pending.extend(generated.filter(|g| *g != sha));
+                        (Some(sha), tracked)
+                    }
+                    Some((None, tracked)) => (generated, tracked),
                     None => (generated, false),
                 };
                 let manifest = self.manifest_path(path).await;
@@ -909,6 +936,13 @@ impl Shared {
     /// Pushes `{path, sha256, previous_sha256, date}` to the manifest's `human_edits`, unless
     /// its latest entry for the path already has this hash; the file itself is never touched
     /// (CORE-034). Then `asset:` `{kind:"human_edit"}`.
+    ///
+    /// It runs under the decision lock, and the manifest edit waits at the store's git gate
+    /// (write step 2). Should git take `index.lock` again between the decision and the write,
+    /// the edit waits there for up to 60 s, and the watcher's batches with it; then it fails
+    /// with `store.git_busy` and is logged. That fails safe: nothing is overwritten, and the
+    /// file stays different from its manifest, so the rescan after git or the next
+    /// verification finds it again.
     async fn human_edit(&self, manifest: &WsPath, path: &WsPath, sha256: &str, previous: &str) {
         match self.store.read(manifest).await {
             Ok(Some(_)) => {}

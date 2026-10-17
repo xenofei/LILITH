@@ -1619,6 +1619,7 @@ pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismat
                     sha256: read.lfs.clone().unwrap_or_else(|| read.sha256.clone()),
                     recorded: want.to_string(),
                     lfs: read.lfs.is_some(),
+                    identity: read.after,
                 });
             }
             _ => {

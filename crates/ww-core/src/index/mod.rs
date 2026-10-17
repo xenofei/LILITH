@@ -256,6 +256,10 @@ pub struct Mismatch {
     pub recorded: String,
     /// The file is a git-lfs pointer and `sha256` is its `oid` (ARCH-085).
     pub lfs: bool,
+    /// The file's identity right after the read (size, last write, ChangeTime, FileId): the
+    /// watcher drops the result when the file has changed since, so a stale read never
+    /// overrides a newer edit.
+    pub identity: FileIdentity,
 }
 
 /// In which order a reconcile looks at files.
@@ -770,6 +774,27 @@ impl Index {
                     |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)? != 0)),
                 )
                 .optional()
+                .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// Whether the row of `path` is verified (its hash read from the file, not trusted from a
+    /// manifest); `None` without a row.
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn is_verified(&self, path: &WsPath) -> Result<Option<bool>, IndexError> {
+        let key = path_key(path.as_str());
+        self.db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT verified FROM files WHERE key = ?1",
+                    params![key],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .map(|v| v.map(|v| v != 0))
                 .map_err(|e| sql(&e))
             })
             .await

@@ -43,7 +43,9 @@ pub struct Recorded {
     /// Still expected on disk: a manifest, a file in `hashes`, or a file of an open run without
     /// `trashed_utc` (Task 10's `missing` rule).
     pub expected: bool,
-    /// The old and new hashes of a pending store replace (Task 6).
+    /// The other hashes the store accepts as its own (`Store::own_hashes`): the old and new
+    /// hashes of a pending store replace (Task 6), and the last generated hash when the
+    /// manifest records another one.
     pub pending: Vec<String>,
     /// The latest `human_edits[path].sha256`.
     pub last_human_edit: Option<String>,

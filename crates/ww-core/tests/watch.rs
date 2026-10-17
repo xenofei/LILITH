@@ -1140,3 +1140,163 @@ fn unsupported_watcher_leaves_the_workspace_served() {
     assert_eq!(edits.len(), 1, "{detail}");
     assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes: a stale verification, and a lock taken before the open.
+// ---------------------------------------------------------------------------------------------
+
+/// The real probe, with one hook: armed on a file, the first `identity` of it after an
+/// `open_read` of it (the verification's identity taken after its read) writes `then` there
+/// first and answers with the identity from before that write. So the read of the old bytes
+/// counts as stable, and the file already holds newer ones when the decision comes.
+#[derive(Debug, Default)]
+struct SaveAfterRead {
+    armed: std::sync::Mutex<Option<(PathBuf, Vec<u8>, bool)>>,
+}
+
+impl Probe for SaveAfterRead {
+    fn identity(&self, path: &Path) -> std::io::Result<ww_platform::fs::FileIdentity> {
+        let before = SystemProbe.identity(path)?;
+        let mut armed = self.armed.lock().unwrap();
+        if let Some((at, then, read)) = armed.as_ref()
+            && *read
+            && at == path
+        {
+            write_file(path, then);
+            *armed = None;
+        }
+        Ok(before)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<ww_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        if let Some((at, _, read)) = self.armed.lock().unwrap().as_mut()
+            && at == path
+        {
+            *read = true;
+        }
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079
+async fn stale_verification_never_overrides_a_newer_edit() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = canonical(&env.copy_fixture_workspace("stale"));
+    let sealed = file(&ws, SEALED);
+    // Edit A while no core runs: the cold rebuild trusts the manifest's hash, so the
+    // verification reads A and reports it.
+    let (a, b) = (
+        b"edit A, read by the verification",
+        b"edit B, saved right after",
+    );
+    edit_outside(&sealed, a);
+
+    let probe = Arc::new(SaveAfterRead::default());
+    let state = Arc::new(
+        ww_core::state::StateDb::open(
+            &env.root().join("stale-local").join("state.db"),
+            ww_core::state::StateScope::Workspace,
+            no_fatal(),
+        )
+        .unwrap(),
+    );
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let store = Arc::new(ww_core::store::Store::new(
+        ws.clone(),
+        state,
+        FailPoints::none(),
+        clock.clone(),
+        Arc::new(SeqIds::new()),
+        probe.clone(),
+    ));
+    let index = Arc::new(ww_core::index::Index::open_in_memory(&ws, probe.clone()).unwrap());
+    store.set_sink(index.clone());
+    let events = Arc::new(EventBus::new(clock));
+    let ws_id = Env::workspace_hash(&std::fs::canonicalize(&ws).unwrap());
+    // No folder watch: this test plays the batch itself (`notify`).
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher = Watcher::start_from(
+        store.clone(),
+        index.clone(),
+        events,
+        ws_id.clone(),
+        WatchConfig::default(),
+        rx,
+    );
+    index.start_first();
+    index.ready().await;
+
+    *probe.armed.lock().unwrap() = Some((sealed.clone(), b.to_vec(), false));
+    let mismatches = index.verify_pending(10_000).await.unwrap();
+    let stale: Vec<_> = mismatches
+        .iter()
+        .filter(|m| m.path.as_str() == SEALED)
+        .collect();
+    assert_eq!(stale.len(), 1, "{mismatches:?}");
+    assert_eq!(stale[0].sha256, sha256_bytes(a), "the verification read A");
+    assert_eq!(
+        std::fs::read(&sealed).unwrap(),
+        b,
+        "B was saved after the read"
+    );
+
+    // A batch (here `ww notify`) sees B first and records it ...
+    watcher.notify(vec![p(SEALED)]).await;
+    // ... then the verification's result about A arrives.
+    watcher.mismatches(mismatches).await;
+
+    let detail = asset_detail(&store, &index, &ws_id, "sketchbook", CRANE)
+        .await
+        .unwrap();
+    let detail = serde_json::to_value(detail).unwrap();
+    let edits = edits_of(&detail, "v1.0.0/crane_b.png");
+    assert_eq!(edits.len(), 1, "only the newer edit: {detail}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(b));
+    let row = index.files_of_path(&p(SEALED)).await.unwrap().unwrap();
+    assert_eq!(
+        row.sha256,
+        Some(sha256_bytes(b)),
+        "the row holds what the file holds"
+    );
+    assert_eq!(row.state, FileState::HumanEdit);
+    watcher.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: ARCH-083, CORE-034
+async fn index_lock_taken_before_the_open_defers_checkout_writes() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = env.copy_fixture_workspace("lock-first");
+    // Git is already working when the workspace opens: no `index.lock` event will come.
+    let ops = GitOps::begin(&ws);
+    let core = Core::open(env, ws, fast(), FailPoints::none()).await;
+    core.fence().await;
+    let checked_out = b"v1.0.0 as the checkout writes it";
+    ops.write(SEALED, checked_out);
+    core.fence().await;
+    assert!(
+        edits_of(&core.detail(CRANE).await, "v1.0.0/crane_b.png").is_empty(),
+        "nothing is decided while git holds index.lock"
+    );
+    assert!(core.open.store.git_gate().is_busy());
+
+    ops.finish();
+    core.until("git_resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    // The checkout left bytes the manifest doesn't record (the test's checkout didn't update
+    // it), so the rescan after git records one human edit, once.
+    let edits = edits_of(&core.detail(CRANE).await, "v1.0.0/crane_b.png");
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(checked_out));
+    let workspace = kinds(&core.published("workspace").await);
+    assert!(
+        workspace.contains(&"git_paused".to_string()),
+        "{workspace:?}"
+    );
+}
