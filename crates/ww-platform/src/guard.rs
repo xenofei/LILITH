@@ -4,17 +4,22 @@
 //! `ww-testkit` arms the guard from `TestEnv::new()`. The guard is process-global and never
 //! disarms. Production code never arms it, so the checks are a single `OnceLock` read.
 //!
-//! What counts as "real" (decided by [`RealLocations`]):
+//! What counts as "real" (decided by [`RealLocations`]). Each rule covers both app names, the
+//! new [`names::APP_NAME`] and the legacy [`names::LEGACY_APP_NAME`] (R4), written `<App>`
+//! here:
 //!
 //! - a path under the real roaming or local root whose first component below that root starts
-//!   with `Worldwright` (so `Worldwright`, `Worldwright-dev`, `Worldwright-test-x`, ...);
-//! - any path with a `.worldwright-local` component;
+//!   with `<App>` (so `<App>`, `<App>-dev`, `<App>-test-x`, ...);
+//! - any path with a [`names::LOCAL_DIR`] or [`names::LEGACY_LOCAL_DIR`] component;
 //! - the real default Claude Code profile, `<real user profile>\.claude`, and anything below
 //!   it (the rest of the user profile is not real: `%TEMP%` lives under it);
-//! - the real registry root, `HKCU\Software\Worldwright`, and its `-<channel>` variants, except
-//!   `HKCU\Software\Worldwright-test-*`;
-//! - the real credential prefix, `Worldwright/`, and its `-<channel>` variants, except
-//!   `Worldwright-test-*`.
+//! - the real registry root, `HKCU\Software\<App>`, and its `-<channel>` variants, except
+//!   `HKCU\Software\<App>-test-*`;
+//! - the real credential prefix, `<App>/`, and its `-<channel>` variants, except
+//!   `<App>-test-*`.
+//!
+//! The registry root and credential prefix in [`RealLocations`] are built under one app name;
+//! the guard derives the other name's root and prefix from them.
 //!
 //! Paths are compared by prefix, not substring, and case-insensitively, after stripping a
 //! `\\?\` prefix. So a test directory such as `%TEMP%\.tmpXXXX\local\Worldwright-test-<id>`
@@ -23,9 +28,9 @@
 //!
 //! Workspaces are a separate check, [`check_workspace`]: a workspace registered in a real
 //! `suite.toml` (`default_workspace` or `[[workspaces]]`), or anything below it, is real.
-//! [`RealLocations::from_system`] reads those files, read-only, from every non-test
-//! `Worldwright*` roaming folder (the real stable and dev registries). That read is the only
-//! access to real Worldwright files.
+//! [`RealLocations::from_system`] reads those files, read-only, from every non-test `<App>` or
+//! `<App>-<channel>` roaming folder under either name (the real stable and dev registries).
+//! That read is the only access to the owner's real suite files.
 //!
 //! Matching is textual: it catches accidents, not deliberate evasion via 8.3 names or
 //! symlinks.
@@ -35,8 +40,14 @@ use std::sync::OnceLock;
 
 use crate::env::{Channel, EnvError, normalise_for_hash};
 use crate::known_folders;
+use crate::names;
 
 static ARMED: OnceLock<RealLocations> = OnceLock::new();
+
+/// Both app names: the guard treats each as real (R4).
+const APP_NAMES: [&str; 2] = [names::APP_NAME, names::LEGACY_APP_NAME];
+/// Both per-volume local-data folder names.
+const LOCAL_DIRS: [&str; 2] = [names::LOCAL_DIR, names::LEGACY_LOCAL_DIR];
 
 /// The owner's real Worldwright locations (the stable channel's), which tests must never touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,8 +84,8 @@ impl RealLocations {
     }
 
     /// The workspaces registered under `roaming`: reads, read-only, the `suite.toml` of every
-    /// folder directly below it named `Worldwright` or `Worldwright-<channel>`, except
-    /// `Worldwright-test-*`. That covers the real stable and dev registries. Folders are read
+    /// folder directly below it named `<App>` or `<App>-<channel>` under either app name,
+    /// except `<App>-test-*`. That covers the real stable and dev registries. Folders are read
     /// in name order; a missing or malformed file contributes nothing.
     pub fn registered_under(roaming: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(roaming) else {
@@ -114,41 +125,82 @@ impl RealLocations {
         })
     }
 
-    /// True when `path` is one of the real data folders (or inside one), the real default
-    /// Claude Code profile (or inside it), or is in a `.worldwright-local` folder.
+    /// True when `path` is one of the real data folders under either app name (or inside one),
+    /// the real default Claude Code profile (or inside it), or is in a local-data folder under
+    /// either name.
     pub fn is_real_path(&self, path: &Path) -> bool {
         let p = normalise_for_hash(path);
-        if p.split('\\').any(|c| c == ".worldwright-local") {
+        if p.split('\\')
+            .any(|c| LOCAL_DIRS.iter().any(|d| c.eq_ignore_ascii_case(d)))
+        {
             return true;
         }
-        let worldwright_folder = [&self.roaming, &self.local].into_iter().any(|root| {
-            first_component_below(&p, &normalise_for_hash(root))
-                .is_some_and(|c| c.starts_with("worldwright"))
+        let app_folder = [&self.roaming, &self.local].into_iter().any(|root| {
+            first_component_below(&p, &normalise_for_hash(root)).is_some_and(|c| {
+                APP_NAMES
+                    .iter()
+                    .any(|app| starts_with_ignore_ascii_case(c, app))
+            })
         });
-        worldwright_folder
+        app_folder
             || first_component_below(&p, &normalise_for_hash(&self.user_profile))
                 .is_some_and(|c| c == ".claude")
     }
 
-    /// True for the real registry root, its non-test channel variants and anything below them.
+    /// True for the real registry root under either app name, its non-test channel variants
+    /// and anything below them.
     pub fn is_real_registry(&self, value: &str) -> bool {
-        is_real_name(value, &self.registry_root, &['-', '\\'])
+        with_both_app_names(&self.registry_root)
+            .iter()
+            .any(|root| is_real_name(value, root, &['-', '\\']))
     }
 
-    /// True for the real credential prefix, its non-test channel variants and anything below.
+    /// True for the real credential prefix under either app name, its non-test channel variants
+    /// and anything below.
     pub fn is_real_credential(&self, value: &str) -> bool {
-        is_real_name(
-            value,
-            self.credential_prefix.trim_end_matches('/'),
-            &['-', '/'],
-        )
+        with_both_app_names(self.credential_prefix.trim_end_matches('/'))
+            .iter()
+            .any(|root| is_real_name(value, root, &['-', '/']))
     }
 }
 
-/// `Worldwright` or `Worldwright-<channel>`, but not a test channel (`Worldwright-test-*`).
+/// `<App>` or `<App>-<channel>` under either app name, but not a test channel
+/// (`<App>-test-*`). `<App>Suite` (the install folder) is not one: no hyphen.
 fn is_registry_folder(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n == "worldwright" || (n.starts_with("worldwright-") && !n.starts_with("worldwright-test-"))
+    APP_NAMES.iter().any(|app| {
+        let app = app.to_ascii_lowercase();
+        n == app
+            || n.strip_prefix(&app)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|channel| !channel.starts_with("test-"))
+    })
+}
+
+/// `s` starts with `prefix`, ASCII case-insensitively.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// `root` (a real registry root or credential prefix without its `/`) and the same root under
+/// the other app name, when `root` ends with one of them (ASCII case-insensitively). A root
+/// that ends with neither is returned alone.
+fn with_both_app_names(root: &str) -> Vec<String> {
+    for app in APP_NAMES {
+        let Some(cut) = root.len().checked_sub(app.len()) else {
+            continue;
+        };
+        if root
+            .get(cut..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(app))
+        {
+            let base = &root[..cut];
+            return APP_NAMES.iter().map(|a| format!("{base}{a}")).collect();
+        }
+    }
+    vec![root.to_string()]
 }
 
 /// The workspace paths a `suite.toml` registers: `default_workspace` first, then each
@@ -273,6 +325,151 @@ pub(crate) fn check_channel_constructible(channel: &Channel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::{APP_NAME, LEGACY_APP_NAME, LEGACY_LOCAL_DIR, LOCAL_DIR};
+
+    /// Fake real locations whose registry root and credential prefix are under `app`.
+    fn fake_real(app: &str) -> RealLocations {
+        RealLocations {
+            roaming: PathBuf::from(r"C:\Fake\AppData\Roaming"),
+            local: PathBuf::from(r"C:\Fake\AppData\Local"),
+            user_profile: PathBuf::from(r"C:\Fake"),
+            registry_root: format!(r"HKCU\Software\{app}"),
+            credential_prefix: format!("{app}/"),
+            workspaces: Vec::new(),
+        }
+    }
+
+    /// Both app names, whichever one the real locations were built from (R4).
+    const APPS: [&str; 2] = [APP_NAME, LEGACY_APP_NAME];
+
+    #[test] // spec: QA-040
+    fn guard_blocks_lilith_and_legacy_data_folders() {
+        for app in APPS {
+            let real = fake_real(app);
+            for root in [r"C:\Fake\AppData\Roaming", r"c:\fake\appdata\LOCAL"] {
+                for name in APPS {
+                    let lower = name.to_ascii_lowercase();
+                    for folder in [
+                        name.to_string(),
+                        format!("{lower}-dev"),
+                        format!("{lower}-test-x"),
+                        format!("{}-Test-x", name.to_ascii_uppercase()),
+                    ] {
+                        for p in [
+                            format!(r"{root}\{folder}"),
+                            format!(r"{root}\{folder}\logs"),
+                        ] {
+                            assert!(real.is_real_path(Path::new(&p)), "{app}: {p}");
+                        }
+                    }
+                }
+            }
+            for dir in [LOCAL_DIR, LEGACY_LOCAL_DIR] {
+                for p in [format!(r"D:\{dir}"), format!(r"\\?\E:\{dir}\abc")] {
+                    assert!(real.is_real_path(Path::new(&p)), "{app}: {p}");
+                }
+            }
+            for p in [
+                r"D:\.LiLiTh-Local\abc",
+                r"D:\.Worldwright-Local\abc", // legacy-guard
+            ] {
+                assert!(real.is_real_path(Path::new(p)), "{app}: {p}");
+            }
+            for name in APPS {
+                for p in [
+                    format!(r"C:\Fake\AppData\Local\Temp\{name}\x"),
+                    format!(r"C:\Elsewhere\{name}-test-abc"),
+                    format!(r"C:\Fake\AppData\Roaming2\{name}"),
+                    format!(r"D:\{name}-local\abc"),
+                    format!(r"D:\.{}-localx\abc", name.to_ascii_lowercase()),
+                ] {
+                    assert!(!real.is_real_path(Path::new(&p)), "{app}: {p}");
+                }
+            }
+        }
+    }
+
+    #[test] // spec: QA-040
+    fn lilithsuite_is_not_a_channel_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |folder: &str, ws: &str| {
+            let p = dir.path().join(folder);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("suite.toml"),
+                format!("default_workspace = '{ws}'\n"),
+            )
+            .unwrap();
+        };
+        write("LILITH", r"C:\Ws\Stable");
+        write("lilith-dev", r"C:\Ws\Dev");
+        write("LILITH-test-ab", r"C:\Ws\Test");
+        write("LILITHSuite", r"C:\Ws\NotAChannelFolder");
+        write("LILITHSuite.Dev", r"C:\Ws\NotAChannelFolderEither");
+        write(LEGACY_APP_NAME, r"C:\Ws\LegacyStable");
+        assert_eq!(
+            RealLocations::registered_under(dir.path()),
+            [
+                PathBuf::from(r"C:\Ws\Stable"),
+                PathBuf::from(r"C:\Ws\Dev"),
+                PathBuf::from(r"C:\Ws\LegacyStable"),
+            ]
+        );
+    }
+
+    #[test] // spec: QA-040
+    fn guard_blocks_both_real_credential_prefixes() {
+        for app in APPS {
+            let real = fake_real(app);
+            for name in APPS {
+                let upper = name.to_ascii_uppercase();
+                for t in [
+                    format!("{name}/x"),
+                    format!("{name}/"),
+                    format!("{name}-dev/x"),
+                    format!("{upper}-DEV/x"),
+                    format!("{name}-stable/x"),
+                ] {
+                    assert!(real.is_real_credential(&t), "{app}: {t}");
+                }
+                for t in [
+                    format!("{name}-test-abc/x"),
+                    format!("{upper}-TEST-abc/x"),
+                    format!("{name}Suite/x"),
+                    format!("{name}x/y"),
+                ] {
+                    assert!(!real.is_real_credential(&t), "{app}: {t}");
+                }
+            }
+            assert!(!real.is_real_credential("Other/x"), "{app}");
+        }
+    }
+
+    #[test] // spec: QA-040
+    fn guard_blocks_both_registry_roots() {
+        for app in APPS {
+            let real = fake_real(app);
+            for name in APPS {
+                let upper = name.to_ascii_uppercase();
+                for v in [
+                    format!(r"HKCU\Software\{name}"),
+                    format!(r"hkcu\software\{upper}-dev"),
+                    format!(r"HKCU\Software\{name}\Sub"),
+                    format!(r"HKCU\Software\{name}-stable\Sub"),
+                ] {
+                    assert!(real.is_real_registry(&v), "{app}: {v}");
+                }
+                for v in [
+                    format!(r"HKCU\Software\{name}-test-abc"),
+                    format!(r"HKCU\Software\{name}Suite"),
+                    format!(r"HKCU\Software\Other\{name}"),
+                ] {
+                    assert!(!real.is_real_registry(&v), "{app}: {v}");
+                }
+            }
+            assert!(!real.is_real_registry(r"HKCU\Software\Other"), "{app}");
+        }
+    }
 
     #[test] // spec: QA-040
     fn parse_registered_workspaces_reads_both_keys_and_ignores_garbage() {
