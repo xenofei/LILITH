@@ -819,16 +819,6 @@ mod tests {
         assert_eq!(read(&plain), (-3, "delete".to_string()));
     }
 
-    #[test] // spec: QA-040
-    fn second_testenv_does_not_trip_the_guard() {
-        let _a = TestEnv::new();
-        let b = TestEnv::new();
-        let _ = b
-            .env
-            .workspace_local_dir(b.root())
-            .expect("same-volume workspace");
-    }
-
     fn is_read_only(path: &Path) -> bool {
         std::fs::metadata(path).unwrap().permissions().readonly()
     }
@@ -890,6 +880,16 @@ mod tests {
             is_read_only(&kept),
             "the read-only flag was cleared through the junction"
         );
+    }
+
+    #[test] // spec: QA-040
+    fn second_testenv_does_not_trip_the_guard() {
+        let _a = TestEnv::new();
+        let b = TestEnv::new();
+        let _ = b
+            .env
+            .workspace_local_dir(b.root())
+            .expect("same-volume workspace");
     }
 
     /// A fresh `TestEnv` with no core on its channel: the drop probes the pipe once and makes

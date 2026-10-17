@@ -55,7 +55,8 @@
 //! **Cancellation.** [`Dispatcher::call`] runs the pipeline in a task of its own, so a caller
 //! that goes away (a client killed mid-call) cannot stop it between `idem_begin` and
 //! `idem_finish`: the outcome is stored for the retry. A [`Claim`] that is dropped unfinished
-//! anyway (a bug in a stage) releases its row from its `Drop`.
+//! anyway (a bug in a stage) releases its row from its `Drop`, in a task that counts as in
+//! flight, so a drain waits for the release too.
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -72,7 +73,7 @@ use ww_protocol::{
 use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
 use crate::events::EventBus;
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{CallGuard, FollowUp, Lifecycle};
 use crate::pipeline::RecordSlot;
 use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
 use crate::session::Session;
@@ -195,11 +196,7 @@ impl Dispatcher {
         // Its own task: a caller that goes away cannot cut the pipeline short. The call stays
         // in flight until the pipeline ends.
         let pipeline = tokio::spawn(
-            async move {
-                let _in_flight = in_flight;
-                inner.pipeline(session, p, trace).await
-            }
-            .instrument(span),
+            async move { inner.pipeline(&in_flight, session, p, trace).await }.instrument(span),
         );
         match pipeline.await {
             Ok(outcome) => outcome,
@@ -217,12 +214,13 @@ impl Dispatcher {
 impl Inner {
     async fn pipeline(
         &self,
+        in_flight: &CallGuard,
         session: Arc<Session>,
         p: ToolCallParams,
         trace_id: String,
     ) -> Outcome<ToolOutput> {
         let name = p.name.clone();
-        let outcome = self.stages(&session, p, &trace_id).await;
+        let outcome = self.stages(in_flight, &session, p, &trace_id).await;
         match &outcome {
             Outcome::Ok(_) => {
                 tracing::info!(tool = %name, caller = %session.caller, trace_id, "tool call ok")
@@ -239,6 +237,7 @@ impl Inner {
 
     async fn stages(
         &self,
+        in_flight: &CallGuard,
         session: &Arc<Session>,
         p: ToolCallParams,
         trace_id: &str,
@@ -297,7 +296,7 @@ impl Inner {
             Some(key) => {
                 let hash = args_hash(&json!({"name": p.name, "arguments": args}));
                 match self
-                    .begin(workspace.as_ref(), scope, key, &hash, trace_id)
+                    .begin(in_flight, workspace.as_ref(), scope, key, &hash, trace_id)
                     .await
                 {
                     Ok(Begun::Fresh(claim)) => Some(claim),
@@ -370,6 +369,7 @@ impl Inner {
     /// workspace.
     async fn begin(
         &self,
+        in_flight: &CallGuard,
         workspace: Option<&Arc<OpenWorkspace>>,
         scope: String,
         key: String,
@@ -390,6 +390,7 @@ impl Inner {
                 db,
                 scope,
                 key,
+                follow_up: Some(in_flight.follow_up()),
                 finished: false,
             }),
             IdemBegin::Replay(stored) => Begun::Done(Box::new(replay(&stored, &key, trace_id))),
@@ -590,11 +591,16 @@ impl DbHandle {
 }
 
 /// A `running` idempotency row this call owns. [`Claim::finish`] ends it; a claim dropped
-/// without finishing releases the row in a task of its own.
+/// without finishing releases the row in a task of its own, which stays in flight until the
+/// release is done.
 struct Claim {
     db: DbHandle,
     scope: String,
     key: String,
+    /// Counts the release as in flight, so the pipeline ending does not end the wait for it.
+    /// Started in `Drop`, while the pipeline still holds the call's own guard (the claim
+    /// lives inside the pipeline).
+    follow_up: Option<FollowUp>,
     finished: bool,
 }
 
@@ -617,8 +623,13 @@ impl Drop for Claim {
         let (db, scope, key) = (self.db.clone(), self.scope.clone(), self.key.clone());
         tracing::warn!(scope, key, "an unfinished idempotency claim is released");
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let in_flight = self.follow_up.take().map(FollowUp::start);
             rt.spawn(async move {
                 let _ = db.get().idem_finish(&scope, &key, None).await;
+                // The database before the call: whoever waits for the call (a drain) may
+                // close the database next.
+                drop(db);
+                drop(in_flight);
             });
         }
     }
