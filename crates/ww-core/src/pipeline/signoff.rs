@@ -4,7 +4,10 @@
 //! [`plan_signoff`] is I5's step 3 on a copy of the manifest, plus step 2 for the chosen
 //! files (their `hashes`, from each run file record's `sha256`), so the snapshot written
 //! before the move (step 4) already holds them:
-//! - the version is `approved_version` bumped by the confirmed `bump`; without one, the
+//! - an open run on an `approved`, `exported` or `released` asset (one kept open at an earlier
+//!   sign-off) takes `CandidateRun` first, then `Signoff` (ruling Q23); `stale` is refused;
+//! - the version is `approved_version` bumped by the confirmed `bump`; without one (ruling
+//!   Q22: omitting `bump` accepts the proposal), the
 //!   manifest's `version` when it is past `approved_version` (new work set it by the bump
 //!   rules), else the run's `target_version` when that is, else `approved_version` bumped by
 //!   `minor`. With nothing approved yet it is the manifest's `version` (`1.0.0` when unset);
@@ -36,6 +39,29 @@ pub fn signed_off_by(caller: &CallerKind) -> &'static str {
         CallerKind::Assistant => "assistant",
         CallerKind::Mcp => "claude-code",
         CallerKind::Cli => "cli",
+    }
+}
+
+/// The status an asset with an open run is in for a sign-off or a sign-off request (ruling
+/// Q23): `approved`, `exported` and `released` take `CandidateRun` first (the open run, kept
+/// at an earlier sign-off, is new work); every other status, `stale` included, is as it is.
+///
+/// # Errors
+/// The status machine's refusal.
+pub fn reopened(
+    from: Status,
+    before_stale: Option<Status>,
+    before_blocked: Option<Status>,
+) -> Result<Status, String> {
+    match from {
+        Status::Approved | Status::Exported | Status::Released => transition(
+            from,
+            before_stale,
+            before_blocked,
+            &StatusEvent::CandidateRun,
+        )
+        .map(|t| t.to),
+        other => Ok(other),
     }
 }
 
@@ -115,6 +141,8 @@ pub fn plan_signoff(
         ));
     }
 
+    // Ruling Q22: omitting `bump` accepts the proposal (CORE-027's proposed-then-confirmed);
+    // `version.exists` is only for a real collision.
     let version = match (view.approved_version, bump) {
         (None, _) => view.version.unwrap_or(Version::new(1, 0, 0)),
         (Some(approved), Some(b)) => approved.bump(b),
@@ -143,13 +171,17 @@ pub fn plan_signoff(
             .and_then(Value::as_str)
             .and_then(|s| s.parse::<Status>().ok())
     };
-    let moved = transition(
+    let (before_stale, before_blocked) =
+        (parse("status_before_stale"), parse("status_before_blocked"));
+    // Ruling Q23: an open run on an approved asset is new work, so it can be signed off.
+    let from = reopened(
         view.status.unwrap_or(Status::Planned),
-        parse("status_before_stale"),
-        parse("status_before_blocked"),
-        &StatusEvent::Signoff,
+        before_stale,
+        before_blocked,
     )
     .map_err(|why| fail(&STATUS_INVALID_TRANSITION, why))?;
+    let moved = transition(from, before_stale, before_blocked, &StatusEvent::Signoff)
+        .map_err(|why| fail(&STATUS_INVALID_TRANSITION, why))?;
 
     let mut out = m.clone();
     let needs_repair = |why: String| fail(&MANIFEST_NEEDS_REPAIR, why);
@@ -339,6 +371,34 @@ mod tests {
         assert_eq!(v, Version::new(2, 0, 0));
         let (_, v) = plan_signoff(&m, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap();
         assert_eq!(v, Version::new(1, 1, 0));
+    }
+
+    #[test] // spec: CORE-032, CORE-048 (ruling Q23)
+    fn a_kept_run_is_signable_after_approval_but_not_when_stale() {
+        let (signed, _) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &["a.png".into()],
+            None,
+            &["r_2".into()],
+            "cli",
+            0,
+        )
+        .unwrap();
+        let (again, v) =
+            plan_signoff(&signed, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap();
+        assert_eq!(v, Version::new(1, 1, 0));
+        assert_eq!(again.view().status, Some(Status::Approved));
+        let mut stale = signed.clone();
+        stale.set("status", json!("stale"));
+        stale.set("status_before_stale", json!("approved"));
+        let e = plan_signoff(&stale, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap_err();
+        assert_eq!(e.code, "status.invalid_transition");
+        assert_eq!(
+            reopened(Status::Exported, None, None),
+            Ok(Status::Candidate)
+        );
+        assert_eq!(reopened(Status::InReview, None, None), Ok(Status::InReview));
     }
 
     #[test] // spec: CORE-026

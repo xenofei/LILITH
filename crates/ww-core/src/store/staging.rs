@@ -261,11 +261,13 @@ impl Store {
                 why: "there is no file there".to_string(),
             }),
             Seen::Link => Err(refuse(
-                "it is a symbolic link or junction; the suite never reads through a link, so                  name the file itself",
+                "it is a symbolic link or junction; the suite never reads through a link, so \
+                 name the file itself",
             )),
             Seen::Folder => Err(refuse("it is a folder, not a file")),
             Seen::Placeholder => Err(refuse(
-                "it is a cloud-only file, which the suite never downloads: make it available                  offline first",
+                "it is a cloud-only file, which the suite never downloads: make it available \
+                 offline first",
             )),
         }
     }

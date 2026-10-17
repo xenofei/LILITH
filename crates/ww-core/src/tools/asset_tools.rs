@@ -17,6 +17,8 @@
 //!   with `Store::stage_copy` (never over a file) and the staged copy is hashed; the call then
 //!   leaves a candidate-run [`RecordPlan`] (run id from `Store::next_run_id`, manifest edit
 //!   [`start_candidate_run`], each run file with that `sha256`). The Record stage commits it.
+//!   The asset's version lock is held from the run id to the end of the Record stage, so two
+//!   imports of one asset in the same minute get different run ids.
 //!   `ref` is the first file's candidate ref, `handoff.refs` every file's.
 //! - **`asset.import`, `link_external`**: each file is hashed where it is and recorded in
 //!   `external: [{path, sha256}]` with a manifest edit; nothing is copied and no run is
@@ -29,7 +31,9 @@
 //!   "Collect into workspace", agent hint `asset.collect`). Otherwise, holding the asset's
 //!   version lock from here to the end of the Record stage: run files of a pre-2b run without
 //!   a recorded `sha256` are hashed, [`plan_signoff`] gives the manifest after the sign-off
-//!   and the version, `Store::seal` seals it with that manifest as the snapshot, and the call
+//!   and the version, each chosen file is hashed again and must match its recorded `sha256`
+//!   (`store.hash_conflict` with `data {path, expected, found}` otherwise, before anything
+//!   moves), `Store::seal` seals it with that manifest as the snapshot, and the call
 //!   leaves a sealed-version plan that carries the guard. Its manifest edit applies
 //!   `plan_signoff` again to the manifest as it is then, writes `hashes` for every sealed file
 //!   (derived and `source/**` files too, ruling Q17), and fails with `store.hash_conflict`
@@ -38,7 +42,8 @@
 //!   through `commit.moved`, after the manifest edit. `ref` carries the version's content hash
 //!   (ARCH-042). Sign-off isn't destructive, so an agent may do it (CORE-051).
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
-//!   edit; an asset already `in_review` is left as it is. It is not a Record branch, so it
+//!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
+//!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
 //!   writes no `progress.md` entry.
 //! - **`asset.pin_input`** needs a ref that parses (`ref.invalid`; a candidate ref is never an
 //!   input), whose target need not exist on this machine. It pushes `{ref, reason, by, date}`
@@ -60,6 +65,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use ww_protocol::codes::{
     ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID,
+    STORE_HASH_CONFLICT,
 };
 use ww_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use ww_schema::{
@@ -70,7 +76,7 @@ use ww_schema::{
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{
-    HandOff, RecordBranch, RecordPlan, asset_topic, plan_signoff, signed_off_by,
+    HandOff, RecordBranch, RecordPlan, asset_topic, plan_signoff, reopened, signed_off_by,
     start_candidate_run,
 };
 use crate::projects::{ProjectFile, project_yaml_path, read_project, unknown_project};
@@ -396,6 +402,12 @@ async fn stage_candidate_run(
 ) -> Result<(String, Vec<String>, Vec<String>), ErrorBody> {
     let store = a.store().clone();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    // The asset's version lock from the run id to the end of the Record stage: two runs of
+    // one asset started in the same minute never take the same id.
+    let guard = store
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
     let current = read_manifest(&store, &a.manifest).await.map_err(error)?;
     let now = store.now_utc();
     let run_id = store
@@ -510,7 +522,7 @@ async fn stage_candidate_run(
         },
         progress_entry: entry,
         refs: refs.clone(),
-        version_guard: None,
+        version_guard: Some(guard),
     });
     Ok((run_id, refs, names))
 }
@@ -846,6 +858,38 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         .into_iter()
         .find(|r| r.run_id.eq_ignore_ascii_case(&args.run_id))
         .expect("plan_signoff found the run");
+    // Before anything moves: each chosen file must still be what the run recorded. A file
+    // edited outside the suite is refused here, so no sealed folder is left behind.
+    for name in &run.selected {
+        let Some(expected) = run
+            .files
+            .iter()
+            .find(|f| f.path.rsplit('/').next() == Some(name.as_str()))
+            .and_then(|f| f.sha256.clone())
+        else {
+            continue;
+        };
+        let rel = a
+            .dir
+            .join(&format!("candidates/{}/{name}", run.run_id))
+            .map_err(error)?;
+        // A missing file is the seal's to report.
+        if let Some(found) = store.hash(&rel).await.map_err(error)?
+            && found != expected
+        {
+            let mut e = ErrorBody::new(
+                &STORE_HASH_CONFLICT,
+                format!(
+                    "`{rel}` changed outside Worldwright since its run recorded it, so it was \
+                     not signed off. Start a new run with the edited file, or put the \
+                     original back."
+                ),
+                ctx.trace_id.clone(),
+            );
+            e.data = Some(json!({"path": rel.as_str(), "expected": expected, "found": found}));
+            return Err(e);
+        }
+    }
     let sealed = store
         .seal(
             &guard,
@@ -908,15 +952,29 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         if again != version {
             return Err(conflict(&rel));
         }
-        // Ruling Q17: every sealed file is in `hashes`; the chosen ones must agree.
+        // Ruling Q17: the chosen files are a subset of the sealed ones, with the same hashes;
+        // then every sealed file goes into `hashes`, and the `v<version>/` keys must be
+        // exactly the sealed files (a stray key there is a conflict).
         let mut hashes: Map<String, Value> = match out.get("hashes") {
             Some(Value::Object(h)) => h.clone(),
             _ => Map::new(),
         };
-        for (key, value) in hashes.iter().filter(|(k, _)| k.starts_with(&prefix)) {
-            let agrees = sealed_files.iter().any(|(path, hex)| {
-                path == key && value.as_str().and_then(bare_sha256) == Some(hex.as_str())
-            });
+        let chosen: Vec<String> = out
+            .view()
+            .candidate_runs
+            .into_iter()
+            .find(|r| r.run_id.eq_ignore_ascii_case(&run_id))
+            .map(|r| r.selected)
+            .unwrap_or_default();
+        for name in &chosen {
+            let key = format!("{prefix}{name}");
+            let recorded = hashes
+                .get(&key)
+                .and_then(Value::as_str)
+                .and_then(bare_sha256);
+            let agrees = sealed_files
+                .iter()
+                .any(|(path, hex)| *path == key && recorded == Some(hex.as_str()));
             if !agrees {
                 tracing::warn!(path = %rel, file = %key, "a chosen file's hash differs from the sealed file");
                 return Err(conflict(&rel));
@@ -932,6 +990,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
             .collect();
         let expected: BTreeSet<&str> = sealed_files.iter().map(|(p, _)| p.as_str()).collect();
         if recorded != expected {
+            tracing::warn!(path = %rel, "the sealed version's keys in `hashes` aren't exactly its files");
             return Err(conflict(&rel));
         }
         out.set("hashes", Value::Object(hashes));
@@ -998,14 +1057,26 @@ async fn request_signoff(
                 .and_then(Value::as_str)
                 .and_then(|s| s.parse::<Status>().ok())
         };
-        let from = m.view().status.unwrap_or(Status::Planned);
+        let view = m.view();
+        let mut from = view.status.unwrap_or(Status::Planned);
         if from == Status::InReview {
             return Ok(());
         }
+        let (before_stale, before_blocked) =
+            (parse("status_before_stale"), parse("status_before_blocked"));
+        // Ruling Q23: an approved asset with an open (kept) run is new work.
+        let open_run = view
+            .candidate_runs
+            .iter()
+            .any(|r| matches!(r.status.as_deref(), None | Some("open")) && r.trashed_utc.is_none());
+        if open_run {
+            from = reopened(from, before_stale, before_blocked)
+                .map_err(StoreError::InvalidTransition)?;
+        }
         let moved = transition(
             from,
-            parse("status_before_stale"),
-            parse("status_before_blocked"),
+            before_stale,
+            before_blocked,
             &StatusEvent::RequestSignoff,
         )
         .map_err(StoreError::InvalidTransition)?;

@@ -66,9 +66,10 @@ pub struct RecordPlan {
     pub progress_entry: String,
     /// The refs the operation made, for the hand-off block.
     pub refs: Vec<String>,
-    /// A sealed version's guard of the asset's version lock, taken in Execute before the seal
-    /// and dropped once the commit returns, so no second sign-off of the asset runs between
-    /// the seal and the manifest edit.
+    /// The guard of the asset's version lock, taken in Execute (before the seal of a sealed
+    /// version, before the run id of a candidate run) and dropped once the commit returns, so
+    /// no second sign-off runs between the seal and the manifest edit, and no second run takes
+    /// the same run id.
     pub version_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -408,6 +409,12 @@ async fn mark_stale(
     Ok(marked.load(Ordering::SeqCst).then_some(after))
 }
 
+/// The manifest path a view names (for errors).
+fn manifest_rel_of(view: &ManifestView) -> WsPath {
+    manifest_rel(&view.project, &view.asset_id)
+        .unwrap_or_else(|_| WsPath::parse("manifest.json").expect("a plain name parses"))
+}
+
 /// Starts a candidate run on `m` (CORE-023, CORE-027; I5 "Version fields"): appends `run`
 /// (its `created` filled from `now_utc` when it has none) and moves the status by
 /// `transition(…, CandidateRun)`.
@@ -419,8 +426,9 @@ async fn mark_stale(
 /// has none).
 ///
 /// # Errors
-/// `status.invalid_transition` for a `blocked` or `deprecated` asset; `manifest.needs_repair`
-/// (logged) when `candidate_runs` isn't a list.
+/// `status.invalid_transition` for a `blocked` or `deprecated` asset; `store.hash_conflict`
+/// when the manifest has a run with the same `run_id` already (never two runs of one id);
+/// `manifest.needs_repair` (logged) when `candidate_runs` isn't a list.
 pub fn start_candidate_run(
     m: &mut Manifest,
     mut run: Map<String, Value>,
@@ -453,6 +461,22 @@ pub fn start_candidate_run(
         }
         _ => view.version.unwrap_or(Version::new(1, 0, 0)),
     };
+    let id = run
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if view
+        .candidate_runs
+        .iter()
+        .any(|r| r.run_id.eq_ignore_ascii_case(id))
+    {
+        return Err(StoreError::HashConflict {
+            path: manifest_rel_of(&view),
+            backup: None,
+            cloud_only: false,
+            kept: Vec::new(),
+        });
+    }
     run.insert("target_version".into(), Value::from(target.to_string()));
     if !run.contains_key("created") {
         run.insert(
@@ -460,13 +484,8 @@ pub fn start_candidate_run(
             Value::from(ww_schema::time::rfc3339(now_utc)),
         );
     }
-    let rel = WsPath::parse(&format!(
-        "projects/{}/assets/{}/{}.manifest.json",
-        view.project, view.asset_id, view.asset_id
-    ))
-    .unwrap_or_else(|_| WsPath::parse("manifest.json").expect("a plain name parses"));
     m.push("candidate_runs", Value::Object(run))
-        .map_err(|e| StoreError::manifest_edit(&rel, &e))?;
+        .map_err(|e| StoreError::manifest_edit(&manifest_rel_of(&view), &e))?;
     m.set("status", Value::from(moved.to.as_str()));
     Ok(())
 }
@@ -521,6 +540,17 @@ mod tests {
             v.candidate_runs[1].target_version,
             Some(Version::new(1, 1, 0))
         );
+    }
+
+    #[test] // spec: CORE-047
+    fn a_duplicate_run_id_is_refused() {
+        let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
+        start_candidate_run(&mut m, run("r_20261016_1200"), 0).unwrap();
+        assert!(matches!(
+            start_candidate_run(&mut m, run("R_20261016_1200"), 0),
+            Err(StoreError::HashConflict { .. })
+        ));
+        assert_eq!(m.view().candidate_runs.len(), 1);
     }
 
     #[test] // spec: CORE-048

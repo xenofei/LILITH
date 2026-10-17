@@ -83,7 +83,13 @@ impl Fx {
 
     /// The fixture workspace after `setup` wrote into it, registered as the default.
     fn with(setup: impl FnOnce(&Path)) -> Fx {
+        Fx::build(setup, |_| Arc::new(SystemProbe))
+    }
+
+    /// [`Fx::with`], with the probe `probe` makes for the test's env.
+    fn build(setup: impl FnOnce(&Path), probe: impl FnOnce(&TestEnv) -> Arc<dyn Probe>) -> Fx {
         let env = TestEnv::new();
+        let probe = probe(&env);
         let ws = env.copy_fixture_workspace("assets");
         setup(&ws);
         env.register_workspace(&ws, true);
@@ -97,7 +103,6 @@ impl Fx {
         let clock: Arc<dyn Clock> = FakeClock::new();
         let events = Arc::new(EventBus::new(clock.clone()));
         let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
-        let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
         let hub = WorkspaceHub::new(
             env.env.clone(),
             states.clone(),
@@ -619,6 +624,7 @@ async fn progress_entry_is_written_once_from_the_plan() {
 
 /// A plan whose operation carries its own `progress.md` edit is a bug: the stage is the only
 /// source of the line (debug builds assert it).
+#[cfg(debug_assertions)]
 #[tokio::test] // spec: CORE-020
 #[should_panic(expected = "a tool leaves commit.progress to the Record stage")]
 async fn a_plan_with_its_own_progress_edit_is_a_bug() {
@@ -988,4 +994,119 @@ async fn import_refuses_a_linked_asset_folder() {
         )
         .await;
     assert_eq!(e.code, "project.unknown");
+}
+
+#[tokio::test] // spec: CORE-026, ARCH-079
+async fn a_human_edited_candidate_is_refused_before_anything_moves() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let candidate_rel = format!("{KITE_DIR}/candidates/{run}/kite.png");
+    let candidate = fx.path(&candidate_rel);
+    write_file(&candidate, b"edited outside");
+    let e = fx
+        .err(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": KITE, "run_id": run,
+                   "files": ["kite.png"]}),
+        )
+        .await;
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let data = e.data.clone().expect("data");
+    assert_eq!(data["path"], candidate_rel.as_str(), "{e:?}");
+    assert_eq!(data["expected"], sha256_bytes(b"kite one"), "{e:?}");
+    assert_eq!(data["found"], sha256_bytes(b"edited outside"), "{e:?}");
+    // Nothing moved: no sealed folder, the edited file still in its run, nothing recorded.
+    assert!(!fx.path(&format!("{KITE_DIR}/v1.0.0")).exists());
+    assert_eq!(std::fs::read(&candidate).unwrap(), b"edited outside");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], Value::Null, "{m}");
+    assert_eq!(run_of(&m, &run)["status"], "open", "{m}");
+    // A fresh run of the edited file signs off as 1.0.0.
+    let fresh = fx.import_run(KITE, "kite.png", b"edited outside").await;
+    let r = fx.signoff(KITE, &fresh, &["kite.png"], json!({})).await;
+    assert_eq!(r["version"], "1.0.0", "{r}");
+    assert_eq!(
+        std::fs::read(fx.path(&format!("{KITE_DIR}/v1.0.0/kite.png"))).unwrap(),
+        b"edited outside"
+    );
+}
+
+#[tokio::test] // spec: CORE-032, CORE-053, CORE-048
+async fn a_kept_run_is_signable_once_the_asset_is_approved() {
+    let fx = Fx::new();
+    let first = fx.import_run(KITE, "a.png", b"a").await;
+    let kept = fx.import_run(KITE, "b.png", b"b").await;
+    fx.signoff(KITE, &first, &["a.png"], json!({"keep_runs": [kept]}))
+        .await;
+    assert_eq!(fx.manifest(KITE)["status"], "approved");
+    // Ruling Q23: the kept run is new work on the approved asset.
+    let r = fx
+        .ok(
+            "asset.request_signoff",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    assert_eq!(r["status"], "in_review", "{r}");
+    // Ruling Q22: no bump accepts the proposal, here 1.0.0 bumped by minor.
+    let r = fx.signoff(KITE, &kept, &["b.png"], json!({})).await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], "1.1.0");
+    assert_eq!(run_of(&m, &kept)["status"], "selected");
+}
+
+/// The real probe, except that one path reports the cloud placeholder attributes.
+#[derive(Debug)]
+struct CloudProbe {
+    placeholder: PathBuf,
+}
+
+impl Probe for CloudProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<ww_platform::fs::FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path == self.placeholder {
+            id.attributes |= ww_platform::fs::PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<ww_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        assert_ne!(path, self.placeholder, "a placeholder's data was opened");
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test] // spec: ARCH-079, CORE-023, CORE-029
+async fn import_refuses_link_and_cloud_only_sources() {
+    let fx = Fx::build(
+        |_| {},
+        |env| {
+            Arc::new(CloudProbe {
+                placeholder: env.root().join("import-src").join("cloud.png"),
+            })
+        },
+    );
+    let cloud = fx.outside("cloud.png", b"cloud");
+    let folder = fx.env.root().join("import-src").join("real");
+    write_file(&folder.join("x.png"), b"x");
+    let link = fx.env.root().join("import-src").join("linked.png");
+    junction(&link, &folder);
+    for (source, why) in [(&cloud, "cloud-only"), (&link, "link")] {
+        for mode in ["copy", "link_external"] {
+            let e = fx
+                .err(
+                    "asset.import",
+                    json!({"project": "sketchbook", "asset_id": KITE, "type": "image",
+                           "files": [source.to_string_lossy()], "mode": mode}),
+                )
+                .await;
+            assert_eq!(e.code, "store.path_invalid", "{mode} {why}: {e:?}");
+            assert!(e.message.contains(why), "{mode} {why}: {e:?}");
+        }
+    }
+    assert!(!fx.path(KITE_DIR).exists());
 }

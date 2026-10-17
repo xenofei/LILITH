@@ -426,17 +426,15 @@ async fn signoff_holds_the_version_lock_through_record() {
         Outcome::Ok(out) => assert_eq!(out.structured["version"], "1.0.0"),
         other => panic!("{other:?}"),
     }
-    // The second read the manifest only after the first's edit: it sees `approved`, which
-    // can't take another sign-off. Had it read before, it would have tried v1.0.0 again.
+    // The second read the manifest only after the first's edit: its kept run is signable on
+    // the approved asset (ruling Q23) and, with no bump, takes 1.0.0 bumped by minor (ruling
+    // Q22). Had it read before, it would have tried v1.0.0 again (`version.exists`).
     let two = tokio::time::timeout(DEADLINE, two).await.unwrap().unwrap();
     match two {
-        Outcome::Error { error } => {
-            assert_eq!(error.code, "status.invalid_transition", "{error:?}");
-            assert!(error.message.contains("approved"), "{error:?}");
-        }
+        Outcome::Ok(out) => assert_eq!(out.structured["version"], "1.1.0", "{out:?}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(fx.manifest(KITE)["approved_version"], "1.0.0");
+    assert_eq!(fx.manifest(KITE)["approved_version"], "1.1.0");
     assert!(lock.try_lock().is_ok());
 }
 
@@ -660,4 +658,107 @@ async fn handoff_is_in_every_recorded_result() {
         .await;
     check(&collected);
     assert_eq!(collected["handoff"]["refs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-023, CORE-047
+async fn concurrent_imports_get_distinct_runs() {
+    let fx = Fx::plain();
+    // The fake clock stands still: every run starts in the same minute.
+    for asset in ["prop_kite", "prop_lamp", "prop_sail"] {
+        let one = tokio::spawn(fx.call("asset.import", fx.import_args(asset, "a.png", b"a")));
+        let two = tokio::spawn(fx.call("asset.import", fx.import_args(asset, "b.png", b"b")));
+        let mut runs = Vec::new();
+        for call in [one, two] {
+            match tokio::time::timeout(DEADLINE, call).await.unwrap().unwrap() {
+                Outcome::Ok(out) => {
+                    runs.push(out.structured["run_id"].as_str().unwrap().to_string())
+                }
+                other => panic!("{asset}: {other:?}"),
+            }
+        }
+        assert_ne!(runs[0], runs[1], "{asset}: one run id for two imports");
+        let m = fx.manifest(asset);
+        let ids: Vec<&str> = m["candidate_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["run_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{m}");
+        assert_ne!(ids[0], ids[1], "{m}");
+        for (run, name) in runs.iter().zip(["a.png", "b.png"]) {
+            let dir = fx.path(&format!(
+                "projects/sketchbook/assets/{asset}/candidates/{run}"
+            ));
+            let names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(names, [name], "{asset}/{run}");
+        }
+    }
+}
+
+/// Fail points whose `store.after_seal` runs `edit` once on the asset's manifest JSON, as an
+/// outside writer would, between the seal and the Record stage's manifest edit.
+fn edit_after_seal(fp: &FailPoints, manifest: PathBuf, edit: fn(&mut Value)) {
+    let once = AtomicBool::new(true);
+    fp.on(
+        "store.after_seal",
+        Box::new(move || {
+            if once.swap(false, Ordering::SeqCst) {
+                let mut m: Value = serde_json::from_str(&read_text(&manifest)).unwrap();
+                edit(&mut m);
+                write_file(
+                    &manifest,
+                    format!("{}\n", serde_json::to_string_pretty(&m).unwrap()).as_bytes(),
+                );
+            }
+            Ok(())
+        }),
+    );
+}
+
+/// A sign-off whose manifest is edited between its seal and its Record stage by `edit`;
+/// returns the error and the fixture.
+async fn signoff_after_outside_edit(edit: fn(&mut Value)) -> (ErrorBody, Fx) {
+    let fp = FailPoints::none();
+    let fx = Fx::new(|_| {}, |h| h, fp.clone());
+    let run = fx.import_run(KITE, "a.png", b"a").await;
+    edit_after_seal(
+        &fp,
+        fx.path(&format!("{KITE_DIR}/{KITE}.manifest.json")),
+        edit,
+    );
+    let e = fx
+        .err(
+            "asset.signoff",
+            Fx::signoff_args(KITE, &run, "a.png", json!({})),
+        )
+        .await;
+    (e, fx)
+}
+
+#[tokio::test] // spec: CORE-026, I5 (ruling Q17)
+async fn a_chosen_hash_that_disagrees_with_the_seal_is_a_conflict() {
+    let (e, fx) = signoff_after_outside_edit(|m| {
+        m["candidate_runs"][0]["files"][0]["sha256"] = json!("0".repeat(64));
+    })
+    .await;
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], Value::Null, "{m}");
+    assert!(m["hashes"].get("v1.0.0/a.png").is_none(), "{m}");
+}
+
+#[tokio::test] // spec: CORE-026, I5 (ruling Q17)
+async fn a_stray_hash_key_in_the_sealed_version_is_a_conflict() {
+    let (e, fx) = signoff_after_outside_edit(|m| {
+        m["hashes"]["v1.0.0/stray.png"] = json!(format!("sha256:{}", "1".repeat(64)));
+    })
+    .await;
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], Value::Null, "{m}");
+    assert_eq!(m["status"], "candidate", "{m}");
 }

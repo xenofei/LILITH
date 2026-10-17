@@ -19,4 +19,4 @@ pub use detail::{
 pub use record::{
     HandOff, RecordBranch, RecordPlan, RecordSlot, apply_record, asset_topic, start_candidate_run,
 };
-pub use signoff::{auto_pick, plan_signoff, signed_off_by};
+pub use signoff::{auto_pick, plan_signoff, reopened, signed_off_by};
