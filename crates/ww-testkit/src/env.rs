@@ -344,7 +344,65 @@ impl TestEnv {
         db.close()
             .unwrap_or_else(|(_, e)| panic!("cannot close {}: {e}", path.display()));
     }
+
+    /// Lays out the SQLite database `path` as a crash mid-write leaves it: `path` with a hot
+    /// rollback journal `<path>-journal` beside it. The database (journal mode `delete`,
+    /// `user_version` set) holds table `t` with [`HOT_JOURNAL_ROWS`] rows whose `x` starts with
+    /// `before`; a transaction then rewrote every row to start with `after`, with a cache small
+    /// enough that SQLite wrote changed pages into the file before the commit, and the files
+    /// were copied at that moment. A read-write open rolls the journal back, after which every
+    /// `x` starts with `before` again.
+    ///
+    /// # Panics
+    /// If a step fails or the journal comes out empty.
+    pub fn write_hot_journal_db(&self, path: &Path, user_version: i64) {
+        let dir = path.parent().expect("the database has a folder");
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+        let live = dir.join("hot-journal-source.db");
+        let live_journal = dir.join("hot-journal-source.db-journal");
+        let db = rusqlite::Connection::open(&live)
+            .unwrap_or_else(|e| panic!("cannot open {}: {e}", live.display()));
+        let padding = "x".repeat(1000);
+        db.execute_batch(
+            "PRAGMA journal_mode = DELETE; PRAGMA cache_size = 8;
+             CREATE TABLE t (n INTEGER PRIMARY KEY, x TEXT NOT NULL);",
+        )
+        .expect("set up the source database");
+        db.execute_batch("BEGIN").unwrap();
+        for n in 0..HOT_JOURNAL_ROWS {
+            db.execute(
+                "INSERT INTO t (n, x) VALUES (?1, ?2)",
+                rusqlite::params![n, format!("before {padding}")],
+            )
+            .unwrap();
+        }
+        db.execute_batch("COMMIT").unwrap();
+        db.pragma_update(None, "user_version", user_version)
+            .unwrap();
+        db.execute_batch("BEGIN; UPDATE t SET x = 'after' || substr(x, 7);")
+            .expect("the open transaction");
+        let journal = std::fs::read(&live_journal)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", live_journal.display()));
+        assert!(!journal.is_empty(), "the open transaction wrote no journal");
+        let bytes =
+            std::fs::read(&live).unwrap_or_else(|e| panic!("cannot read {}: {e}", live.display()));
+        std::fs::write(path, bytes)
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+        let mut journal_path = path.as_os_str().to_owned();
+        journal_path.push("-journal");
+        std::fs::write(&journal_path, journal)
+            .unwrap_or_else(|e| panic!("cannot write the journal of {}: {e}", path.display()));
+        db.execute_batch("ROLLBACK").unwrap();
+        drop(db);
+        for leftover in [&live, &live_journal] {
+            let _ = std::fs::remove_file(leftover);
+        }
+    }
 }
+
+/// The rows of [`TestEnv::write_hot_journal_db`]'s table `t`.
+pub const HOT_JOURNAL_ROWS: i64 = 300;
 
 impl Default for TestEnv {
     fn default() -> Self {

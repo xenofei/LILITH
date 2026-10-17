@@ -323,7 +323,15 @@ fn direct(
         probe.clone(),
         ww_core::watch::WatchConfig::default(),
     );
-    let mut reg = core_registry(true, &gates, &states, &hub, &env.env, &probe);
+    let mut reg = core_registry(
+        true,
+        &gates,
+        &states,
+        &hub,
+        &env.env,
+        &probe,
+        Arc::default(),
+    );
     for tool in extra {
         reg.register(tool);
     }

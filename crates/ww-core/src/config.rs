@@ -1,6 +1,7 @@
 //! What a core needs to run: its `Env`, the clock and ids, the process inspector, who it
 //! trusts, and the timing knobs (infrastructure, not a CORE-014 module).
 
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +48,11 @@ pub struct CoreConfig {
     /// The workspace watchers' buffer, batch window and git quiet time
     /// (`WatchConfig::default()`: 64 KiB, 200 ms, 2 s).
     pub watch: WatchConfig,
+    /// Added to the environment of every `git` the core runs (`Store::git`): empty in
+    /// production, `TestEnv::git_env()` for in-process test cores, so their `git` runs read
+    /// only the test profile's config, never the system or user one (QA-038). A spawned core
+    /// needs nothing here: it inherits the variables from its parent.
+    pub git_env: Vec<(OsString, OsString)>,
     /// The crate's own unit tests only (compiled out of every build): a request with this
     /// method panics in the router, to test how the transport survives a panicking handler.
     #[cfg(test)]
@@ -80,6 +86,7 @@ impl CoreConfig {
             failpoints,
             probe: Arc::new(SystemProbe),
             watch: WatchConfig::default(),
+            git_env: Vec::new(),
             #[cfg(test)]
             panic_on_method: None,
         })
@@ -97,10 +104,13 @@ pub enum CoreExit {
     StateDamaged(PathBuf),
     /// The suite `state.db` is from a newer version; nothing was changed.
     StateTooNew(PathBuf),
+    /// The suite `state.db` has a hot rollback journal (a crash mid-write); nothing was
+    /// changed.
+    StateHotJournal(PathBuf),
 }
 
 impl CoreExit {
-    /// The exit code of `ww-core` (Appendix D): 3, 2, 5 and 6. Code 4 (stopped after a fatal
+    /// The exit code of `ww-core` (Appendix D): 3, 2, 5, 6 and 7. Code 4 (stopped after a fatal
     /// error) is a shutdown's, from `ShutdownReport::exit_code`.
     pub fn code(&self) -> u8 {
         match self {
@@ -108,6 +118,7 @@ impl CoreExit {
             CoreExit::Startup(_) => 2,
             CoreExit::StateDamaged(_) => 5,
             CoreExit::StateTooNew(_) => 6,
+            CoreExit::StateHotJournal(_) => 7,
         }
     }
 }
@@ -123,6 +134,11 @@ impl std::fmt::Display for CoreExit {
             CoreExit::StateTooNew(path) => write!(
                 f,
                 "the state database {} is from a newer version",
+                path.display()
+            ),
+            CoreExit::StateHotJournal(path) => write!(
+                f,
+                "the state database {} was left mid-write by a crash",
                 path.display()
             ),
         }
@@ -142,11 +158,12 @@ mod tests {
             CoreExit::AlreadyRunning,
             CoreExit::Startup(String::new()),
             CoreExit::StateDamaged(path.clone()),
-            CoreExit::StateTooNew(path),
+            CoreExit::StateTooNew(path.clone()),
+            CoreExit::StateHotJournal(path),
         ]
         .iter()
         .map(CoreExit::code)
         .collect();
-        assert_eq!(codes, [3, 2, 5, 6]);
+        assert_eq!(codes, [3, 2, 5, 6, 7]);
     }
 }

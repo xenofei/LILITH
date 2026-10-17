@@ -11,8 +11,12 @@
 //! with `blocking_recv` on its own thread. The actor never waits for the runtime, so a full
 //! queue always drains, and [`StateDb::close`] (which waits for the queued jobs) always ends.
 //!
-//! **Check before write.** An existing file is first opened read-only: `PRAGMA quick_check`
-//! must say `ok` and `PRAGMA user_version` must not exceed the migrations this build knows.
+//! **Check before write.** An existing file with a hot rollback journal beside it (a crash
+//! mid-write) is refused before SQLite sees it ([`StateError::HotJournal`]): any open would roll
+//! the journal back. Otherwise the file is first opened read-only, `immutable=1` when there is
+//! no `-wal` file, so a file that is then refused never gets fresh `-wal` and `-shm` files:
+//! `PRAGMA quick_check` must say `ok` and `PRAGMA user_version` must not exceed the migrations
+//! this build knows.
 //! Only then is it opened read-write (WAL, `synchronous=FULL`, `busy_timeout=5000`,
 //! `foreign_keys=ON`) and migrated, each migration in its own `BEGIN IMMEDIATE`. A newer or
 //! damaged file is never modified, and `ww-core` never deletes, renames or truncates a
@@ -102,6 +106,10 @@ pub enum StateError {
     TooNew { found: i64, known: i64 },
     /// SQLite reports the file damaged or not a database.
     Corrupt(String),
+    /// A hot rollback journal (`<file>-journal`, non-empty and not finished) lies beside the
+    /// file: a crash mid-write. Nothing was opened, so nothing was changed; only a read-write
+    /// open, which rolls the journal back, would change the file (`ww doctor` offers it).
+    HotJournal,
     /// Anything else.
     Io(String),
     /// The database's actor has stopped (it panicked).
@@ -116,6 +124,10 @@ impl std::fmt::Display for StateError {
                 "the database is from a newer version (schema {found}; this build knows {known})"
             ),
             StateError::Corrupt(why) => write!(f, "the database is damaged: {why}"),
+            StateError::HotJournal => f.write_str(
+                "the database was left mid-write by a crash (a hot rollback journal lies beside \
+                 it); nothing was changed",
+            ),
             StateError::Io(why) => f.write_str(why),
             StateError::ActorGone => f.write_str("the database actor has stopped"),
         }
@@ -234,6 +246,7 @@ impl StateDb {
             .try_exists()
             .map_err(|e| StateError::Io(format!("cannot look at {}: {e}", path.display())))?;
         if exists {
+            refuse_hot_journal(path)?;
             check_existing(path, known)?;
         }
         let mut conn = open_read_write(path)?;
@@ -280,6 +293,7 @@ impl StateDb {
             tracing::info!(path = %path.display(), "no state.db for a read-only workspace; an in-memory one stands in");
             return StateDb::open_in_memory(scope, thread_name, on_fatal);
         }
+        refuse_hot_journal(path)?;
         check_existing(path, known)?;
         let conn = Connection::open_with_flags(
             path,
@@ -630,14 +644,84 @@ fn run_actor(mut conn: Connection, inbox: &mut mpsc::Receiver<Job>, on_fatal: &O
     }
 }
 
-/// Step 2 of the open order: an existing file, read-only. `quick_check` must say `ok`, and
-/// `user_version` must be between 0 and `known`.
+/// `path` with `suffix` added to its file name (`state.db-journal`).
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Whether `<path>-journal` is a hot rollback journal: it exists, is not empty, and its header
+/// was not zeroed (the persistent journal mode zeroes a finished journal's header instead of
+/// deleting it). Only metadata and the first 8 bytes are read.
+fn has_hot_journal(path: &Path) -> bool {
+    use std::io::Read as _;
+    let journal = beside(path, "-journal");
+    let Ok(mut file) = std::fs::File::open(&journal) else {
+        return false;
+    };
+    let mut head = [0_u8; 8];
+    let mut read = 0;
+    while read < head.len() {
+        match file.read(&mut head[read..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => read += n,
+        }
+    }
+    read > 0 && head[..read].iter().any(|&b| b != 0)
+}
+
+/// Step 1 of the open order: an existing file with a hot rollback journal beside it is
+/// refused before SQLite sees it, since any open would roll the journal back.
+fn refuse_hot_journal(path: &Path) -> Result<(), StateError> {
+    if has_hot_journal(path) {
+        return Err(StateError::HotJournal);
+    }
+    Ok(())
+}
+
+/// `path` as a SQLite URI (`file:///C:/a%20b/state.db?<query>`), every byte outside the
+/// unreserved set percent-encoded; `None` for a path that isn't a plain drive path.
+fn sqlite_uri(path: &Path, query: &str) -> Option<String> {
+    let text = path.to_str()?;
+    let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return None;
+    }
+    let mut uri = String::from("file:///");
+    for &b in bytes {
+        match b {
+            b'\\' | b'/' => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                uri.push(char::from(b));
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri.push('?');
+    uri.push_str(query);
+    Some(uri)
+}
+
+/// A read-only connection to an existing database that leaves no trace: without a `-wal`
+/// file it is opened `immutable=1`, so SQLite creates no `-wal` or `-shm` beside a file it
+/// may then refuse. With a `-wal` file (a live or crashed WAL database) the WAL must be read,
+/// so it is a plain read-only open.
+fn open_untouched(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if !beside(path, "-wal").exists()
+        && let Some(uri) = sqlite_uri(path, "immutable=1")
+    {
+        return Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI);
+    }
+    Connection::open_with_flags(path, flags)
+}
+
+/// Step 2 of the open order: an existing file, read-only ([`open_untouched`]). `quick_check`
+/// must say `ok`, and `user_version` must be between 0 and `known`.
 fn check_existing(path: &Path, known: i64) -> Result<(), StateError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| sql_error(&e))?;
+    let conn = open_untouched(path).map_err(|e| sql_error(&e))?;
     let checked = (|| -> rusqlite::Result<(Vec<String>, i64)> {
         let report = conn
             .prepare("PRAGMA quick_check")?
@@ -1128,6 +1212,43 @@ mod tests {
         );
         assert!(matches!(late, Err(StateError::ActorGone)), "{late:?}");
         assert!(!db.exists(), "{} was created after close", db.display());
+    }
+
+    #[test] // spec: CORE-004, QA-062
+    fn suite_schema_constant_matches_the_migrations() {
+        assert_eq!(
+            i64::try_from(SUITE_MIGRATIONS.len()).unwrap(),
+            ww_schema::SUITE_STATE_SCHEMA,
+            "ww doctor tells a newer suite state.db apart by this constant"
+        );
+    }
+
+    #[test] // spec: CORE-004
+    fn sqlite_uris_percent_encode_the_path() {
+        assert_eq!(
+            sqlite_uri(Path::new(r"C:\t\Ünïcödé space\a#b?.db"), "immutable=1").as_deref(),
+            Some("file:///C:/t/%C3%9Cn%C3%AFc%C3%B6d%C3%A9%20space/a%23b%3F.db?immutable=1")
+        );
+        assert_eq!(
+            sqlite_uri(Path::new(r"\\?\D:\x\state.db"), "immutable=1").as_deref(),
+            Some("file:///D:/x/state.db?immutable=1")
+        );
+        assert_eq!(sqlite_uri(Path::new(r"\\server\share\state.db"), "q"), None);
+        assert_eq!(sqlite_uri(Path::new("relative.db"), "q"), None);
+    }
+
+    #[test] // spec: CORE-004
+    fn a_zeroed_or_empty_journal_is_not_hot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let journal = dir.path().join("state.db-journal");
+        assert!(!has_hot_journal(&db), "no journal");
+        crate::store::fsops::write_file_atomic(&journal, b"").unwrap();
+        assert!(!has_hot_journal(&db), "an empty journal");
+        crate::store::fsops::write_file_atomic(&journal, &[0_u8; 512]).unwrap();
+        assert!(!has_hot_journal(&db), "a journal whose header was zeroed");
+        crate::store::fsops::write_file_atomic(&journal, &[0xd9, 0xd5, 0x05, 0xf9, 0, 0]).unwrap();
+        assert!(has_hot_journal(&db), "a journal with a header");
     }
 
     #[test] // spec: ARCH-021, QA-012

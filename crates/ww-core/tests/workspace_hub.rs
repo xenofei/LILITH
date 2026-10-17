@@ -396,7 +396,15 @@ fn dispatcher(
     let clock: Arc<dyn Clock> = FakeClock::new();
     let probe: Arc<dyn ww_platform::fs::Probe> = Arc::new(SystemProbe);
     ww_core::tools::Dispatcher::new(
-        core_registry(true, &Arc::new(TestGates::new()), states, hub, env, &probe),
+        core_registry(
+            true,
+            &Arc::new(TestGates::new()),
+            states,
+            hub,
+            env,
+            &probe,
+            Arc::default(),
+        ),
         PipelineHooks::plan2(),
         states.clone(),
         events.clone(),

@@ -112,7 +112,15 @@ impl Fx {
             ww_core::watch::WatchConfig::default(),
         );
         let gates = Arc::new(TestGates::new());
-        let reg = core_registry(true, &gates, &states, &hub, &env.env, &probe);
+        let reg = core_registry(
+            true,
+            &gates,
+            &states,
+            &hub,
+            &env.env,
+            &probe,
+            Arc::default(),
+        );
         let lifecycle = ww_core::Lifecycle::new(clock.clone(), ww_core::lifecycle::IDLE_EXIT_AFTER);
         let dispatcher = Dispatcher::new(
             reg,

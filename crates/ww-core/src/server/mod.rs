@@ -325,9 +325,10 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 ///
 /// Opens the suite `state.db` before serving (only the core that owns the pipe opens it, so
 /// it may release the `running` rows of an earlier core). A newer database is
-/// [`CoreExit::StateTooNew`], a damaged one [`CoreExit::StateDamaged`], anything else
-/// [`CoreExit::Startup`]; each is logged with the path, nothing on disk is changed, and the
-/// pipe is released as this returns.
+/// [`CoreExit::StateTooNew`], a damaged one [`CoreExit::StateDamaged`], one with a hot
+/// rollback journal [`CoreExit::StateHotJournal`], anything else [`CoreExit::Startup`]; each
+/// is logged with the path, nothing on disk is changed, and the pipe is released as this
+/// returns.
 ///
 /// Then it serves, opens the default workspace in the background (a failure is logged; the
 /// first call in it tries again), ticks the idle check every [`IDLE_TICK`] (or `idle_after`,
@@ -372,6 +373,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             &hub,
             &cfg.env,
             &cfg.probe,
+            Arc::new(cfg.git_env.clone()),
         ),
         PipelineHooks::plan2(),
         state.clone(),
@@ -508,7 +510,7 @@ async fn supervise(s: Supervised) -> ShutdownReport {
     report
 }
 
-/// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6 or 2),
+/// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6, 7 or 2),
 /// logging each with the path.
 fn open_suite_state(env: &Env, on_fatal: OnFatal) -> Result<StateRegistry, CoreExit> {
     let path = env.suite_state_db();
@@ -529,6 +531,13 @@ fn open_suite_state(env: &Env, on_fatal: OnFatal) -> Result<StateRegistry, CoreE
                 "the suite state.db is damaged; nothing was changed"
             );
             CoreExit::StateDamaged(path)
+        }
+        StateError::HotJournal => {
+            tracing::error!(
+                path = %path.display(),
+                "the suite state.db has a hot rollback journal (a crash mid-write); nothing was changed"
+            );
+            CoreExit::StateHotJournal(path)
         }
         other => {
             tracing::error!(path = %path.display(), error = %other, "cannot open the suite state.db");

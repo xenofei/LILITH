@@ -3,8 +3,8 @@
 //!
 //! Startup order: the process environment, then the pipe claim (a core that loses it exits 3
 //! having touched nothing, not even its log), then the log, then the suite `state.db` (a newer
-//! one exits 6, a damaged one 5, any other failure 2; nothing on disk is changed and the pipe
-//! is released first), then serving until the core shuts down (ARCH-021). Startup failures
+//! one exits 6, a damaged one 5, one with a hot rollback journal 7, any other failure 2;
+//! nothing on disk is changed and the pipe is released first), then serving until the core shuts down (ARCH-021). Startup failures
 //! exit with [`CoreExit::code`]; a shutdown exits with its report's code: 4 after a fatal
 //! error, else 0.
 

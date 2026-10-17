@@ -324,6 +324,10 @@ pub struct SpawnRequest {
     /// Added to the current environment; a key here replaces any current variable with the
     /// same name, compared case-insensitively.
     pub extra_env: Vec<(OsString, OsString)>,
+    /// Removed from the current environment before `extra_env` is added, compared
+    /// case-insensitively (for example the git variables that would point a child's `git` at
+    /// another repository). A name that `extra_env` sets is set all the same.
+    pub remove_env: Vec<OsString>,
 }
 
 /// `CreateProcessW` behind a trait, so the breakaway retry can be tested.
@@ -347,7 +351,8 @@ impl RawSpawner for SystemSpawner {
     fn spawn(&self, req: &SpawnRequest, flags: u32) -> io::Result<ProcessHandle> {
         let application = wide_nul(req.exe.as_os_str(), "the exe path")?;
         let mut command_line = command_line(req.exe.as_os_str(), &req.args)?;
-        let environment = environment_block(current_environment()?, &req.extra_env)?;
+        let environment =
+            environment_block(current_environment()?, &req.extra_env, &req.remove_env)?;
         let directory = match req.exe.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => {
                 Some(wide_nul(dir.as_os_str(), "the exe folder")?)
@@ -517,14 +522,20 @@ fn env_key(name: &OsStr) -> String {
     name.to_string_lossy().to_uppercase()
 }
 
-/// `base` with `extra` applied (case-insensitive replacement, later entries win), sorted by
-/// upper-cased name, as a double-NUL-terminated UTF-16 block.
+/// `base` without the variables named in `remove`, then with `extra` applied (case-insensitive
+/// replacement, later entries win), sorted by upper-cased name, as a double-NUL-terminated
+/// UTF-16 block.
 fn environment_block(
     base: Vec<(OsString, OsString)>,
     extra: &[(OsString, OsString)],
+    remove: &[OsString],
 ) -> io::Result<Vec<u16>> {
+    let removed: Vec<String> = remove.iter().map(|n| env_key(n)).collect();
+    let base = base
+        .into_iter()
+        .filter(|(name, _)| !removed.contains(&env_key(name)));
     let mut vars: Vec<(String, OsString, OsString)> = Vec::new();
-    for (name, value) in base.into_iter().chain(extra.iter().cloned()) {
+    for (name, value) in base.chain(extra.iter().cloned()) {
         let wide: Vec<u16> = name.encode_wide().collect();
         if wide.is_empty() || wide.iter().skip(1).any(|&c| c == b'=' as u16) {
             return Err(invalid_input(
@@ -570,10 +581,28 @@ pub struct Captured {
 /// (ARCH-005).
 const CREATE_NO_WINDOW_FLAG: u32 = CREATE_NO_WINDOW.0;
 
-/// How long the output readers are given after a timed-out child is killed (and at least how
-/// long after a normal exit). A grandchild that inherited the pipes can keep them open; its
-/// output is then dropped rather than waited for.
+/// How long the output readers are given, in all, once the child has exited or been killed.
+/// The pipes end as soon as the child is gone unless a grandchild that inherited them keeps
+/// them open; what arrived until then is kept, and the rest is not waited for.
 const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// The git variables that point a `git` run at another repository, or inject configuration
+/// from the environment: the core and `ww` remove them from every `git` they run on a
+/// workspace ([`run_hidden_without`]), so `git -C <ws>` always means that workspace's own
+/// repository, even when they were started from inside a git hook.
+pub const GIT_REPO_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
 
 /// Runs `exe` with `args` in `cwd`, with `env` added to the current environment, without a
 /// console window (`CREATE_NO_WINDOW`) and with stdin empty and stdout and stderr captured.
@@ -582,11 +611,29 @@ const READER_GRACE: Duration = Duration::from_secs(2);
 /// This is for short helper runs whose output is wanted (`git`, `cmd /c mklink`). It uses
 /// `std::process::Command`, which inherits inheritable handles; a long-lived detached child
 /// goes through [`spawn_detached`] instead.
+///
+/// The whole run takes at most `within` plus [`READER_GRACE`] (2 s): after the child is gone,
+/// both output pipes share one 2 s deadline. A timeout kills only the child, never the
+/// processes it started: a grandchild that holds the pipes keeps running, and only the output
+/// that arrived before the deadline is returned.
 pub fn run_hidden(
     exe: &Path,
     args: &[&OsStr],
     cwd: &Path,
     env: &[(OsString, OsString)],
+    within: Duration,
+) -> io::Result<Captured> {
+    run_hidden_without(exe, args, cwd, env, &[], within)
+}
+
+/// [`run_hidden`], with the variables named in `remove` taken out of the inherited
+/// environment first (compared case-insensitively; `env` may set them again).
+pub fn run_hidden_without(
+    exe: &Path,
+    args: &[&OsStr],
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    remove: &[&str],
     within: Duration,
 ) -> io::Result<Captured> {
     use std::os::windows::process::CommandExt as _;
@@ -598,6 +645,10 @@ pub fn run_hidden(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW_FLAG);
+    for name in remove {
+        // `Command` compares environment names case-insensitively on Windows.
+        command.env_remove(name);
+    }
     for (name, value) in env {
         command.env(name, value);
     }
@@ -610,42 +661,54 @@ pub fn run_hidden(
     let code = if waited == WAIT_OBJECT_0 {
         child.wait()?.code()
     } else {
-        // Timed out (or the wait failed): kill it. Already exited is not an error.
+        // Timed out (or the wait failed): kill it. Already exited is not an error. Only the
+        // child is killed, not its process tree.
         let _ = child.kill();
         child.wait()?;
         None
     };
-    // After a normal exit the pipes end as soon as no grandchild holds them; one that does
-    // (a background helper the child started) is not waited for past `within`.
-    let grace = if code.is_some() {
-        within.max(READER_GRACE)
-    } else {
-        READER_GRACE
-    };
+    // One deadline for both pipes, so a grandchild holding both never doubles the wait.
+    let deadline = std::time::Instant::now() + READER_GRACE;
     Ok(Captured {
         code,
-        stdout: collect(&stdout, grace),
-        stderr: collect(&stderr, grace),
+        stdout: collect(&stdout, deadline),
+        stderr: collect(&stderr, deadline),
     })
 }
 
 type Output = std::sync::mpsc::Receiver<Vec<u8>>;
 
-/// Reads `pipe` to its end on a thread and sends the bytes back.
+/// Reads `pipe` on a thread and sends back each piece as it arrives, until the pipe ends.
 fn reader<R: io::Read + Send + 'static>(pipe: Option<R>) -> Output {
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut pipe) = pipe {
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            let _ = tx.send(bytes);
+            let mut chunk = [0_u8; 8192];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 || tx.send(chunk[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
         });
     }
     rx
 }
 
-fn collect(rx: &Output, grace: Duration) -> String {
-    let bytes = rx.recv_timeout(grace).unwrap_or_default();
+/// What `rx` delivers until its pipe ends or `deadline` passes; what arrived is kept either way.
+fn collect(rx: &Output, deadline: std::time::Instant) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            // Pieces already queued are kept; nothing more is waited for.
+            bytes.extend(rx.try_iter().take(64).flatten());
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(piece) => bytes.extend_from_slice(&piece),
+            Err(_) => break,
+        }
+    }
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -820,7 +883,7 @@ mod tests {
             ("ww_channel".into(), "test-x1".into()),
             ("Alpha".into(), "Ünïcödé space".into()),
         ];
-        let block = environment_block(base, &extra).unwrap();
+        let block = environment_block(base, &extra, &[]).unwrap();
         assert_eq!(
             block_entries(&block),
             [
@@ -831,8 +894,52 @@ mod tests {
                 "zeta=1",
             ]
         );
-        assert_eq!(environment_block(Vec::new(), &[]).unwrap(), [0, 0]);
-        assert!(environment_block(Vec::new(), &[("A=B".into(), "c".into())]).is_err());
+        assert_eq!(environment_block(Vec::new(), &[], &[]).unwrap(), [0, 0]);
+        assert!(environment_block(Vec::new(), &[("A=B".into(), "c".into())], &[]).is_err());
+    }
+
+    #[test] // spec: ARCH-005
+    fn collect_keeps_what_arrived_and_shares_one_deadline() {
+        // A pipe a grandchild still holds open: its senders stay alive. What arrived before
+        // the deadline is kept, never dropped.
+        let (held, rx) = std::sync::mpsc::channel();
+        held.send(b"partial ".to_vec()).unwrap();
+        held.send("Ünïcödé space".as_bytes().to_vec()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        assert_eq!(collect(&rx, deadline), "partial Ünïcödé space");
+        // The second pipe shares the deadline, which has passed: what is queued is returned
+        // without another wait.
+        let (also_held, rx2) = std::sync::mpsc::channel();
+        also_held.send(b"late".to_vec()).unwrap();
+        assert_eq!(collect(&rx2, deadline), "late");
+        // A pipe that ended returns at once.
+        let (ended, rx3) = std::sync::mpsc::channel();
+        ended.send(b"done".to_vec()).unwrap();
+        drop(ended);
+        let far = std::time::Instant::now() + Duration::from_secs(3600);
+        assert_eq!(collect(&rx3, far), "done");
+        drop((held, also_held));
+    }
+
+    #[test] // spec: QA-038
+    fn environment_block_removes_named_variables_case_insensitively() {
+        let base = vec![
+            ("Path".into(), r"C:\bin".into()),
+            ("Git_Dir".into(), r"C:\elsewhere\.git".into()),
+            ("GIT_CONFIG_PARAMETERS".into(), "'core.x=y'".into()),
+        ];
+        let extra = vec![("HOME".into(), "Ünïcödé space".into())];
+        let remove = vec![
+            "GIT_DIR".into(),
+            "git_config_parameters".into(),
+            "HOME".into(),
+        ];
+        let block = environment_block(base, &extra, &remove).unwrap();
+        // Removal applies to the inherited variables only: `extra` still sets HOME.
+        assert_eq!(
+            block_entries(&block),
+            ["HOME=Ünïcödé space", r"Path=C:\bin"]
+        );
     }
 
     #[test]

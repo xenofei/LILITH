@@ -10,6 +10,8 @@
 //! - [`logs`]: the locked per-machine monthly append logs;
 //! - [`staging`]: staging handles;
 //! - [`suite_toml`]: `suite.toml` writes (the core is the file's only writer, CORE-007);
+//! - [`git_config`]: [`Store::git`], the core's only `git` runner (the repository-config reads
+//!   and writes of `workspace.doctor`, CORE-040);
 //! - [`paths`]: workspace-relative paths and the paths the store never writes;
 //! - [`failpoints`]: the test-channel fail points (QA-066);
 //! - [`fsops`]: every file-mutating call of the crate, one
@@ -20,6 +22,7 @@
 
 pub mod failpoints;
 pub mod fsops;
+pub mod git_config;
 pub mod git_gate;
 pub mod logs;
 pub mod order;
@@ -42,5 +45,5 @@ pub use trash::{MaintenanceReport, REJECTED_KEEP_DAYS, TRASH_DIR, TRASH_KEEP_DAY
 pub use versions::{SNAPSHOT, SealRequest, Sealed, VersionDir};
 pub use write::{
     ChangeKind, ChangeSink, Expect, Phase, RecoveryReport, Step, Store, StoreError, StoreEvent,
-    Written, lfs_pointer_oid, next_step,
+    WriteDecision, Written, decide_write, lfs_pointer_oid, next_step,
 };

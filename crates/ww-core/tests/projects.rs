@@ -106,7 +106,15 @@ fn fx_full(
     );
     let reg = match registry {
         Some(make) => make(&hub, env, &probe),
-        None => core_registry(true, &gates, &states, &hub, &env.env, &probe),
+        None => core_registry(
+            true,
+            &gates,
+            &states,
+            &hub,
+            &env.env,
+            &probe,
+            Arc::default(),
+        ),
     };
     let lifecycle = ww_core::Lifecycle::new(clock.clone(), ww_core::lifecycle::IDLE_EXIT_AFTER);
     let dispatcher = Dispatcher::new(

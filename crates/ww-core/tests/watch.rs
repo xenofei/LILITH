@@ -1304,3 +1304,15 @@ async fn index_lock_taken_before_the_open_defers_checkout_writes() {
         "{workspace:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: QA-031, ARCH-079
+async fn a_fence_written_before_the_watch_is_armed_is_handled() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = canonical(&env.make_workspace("early fence"));
+    // Written before `Watcher::start`: no event of it ever comes.
+    write_file(&ws.join(".worldwright").join("fence").join("early"), b"f");
+    let (_store, _index, watcher, _events, _ws_id) = bare(&ws).await;
+    tokio::time::timeout(Duration::from_secs(30), watcher.fence("early"))
+        .await
+        .expect("a fence that predates the watch is covered by the first reconcile");
+}

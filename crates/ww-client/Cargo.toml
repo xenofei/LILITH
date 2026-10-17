@@ -10,6 +10,8 @@ publish.workspace = true
 # `ww-core`, then call tools and follow events. `blocking` wraps it for synchronous callers.
 [dependencies]
 futures-util.workspace = true
+# `ww doctor` inspects, sets aside and recovers the suite `state.db` without a core (CORE-004).
+rusqlite.workspace = true
 # Only for the `Serialize`/`DeserializeOwned` bounds of the generic request helpers.
 serde.workspace = true
 serde_json.workspace = true

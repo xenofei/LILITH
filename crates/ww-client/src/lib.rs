@@ -23,6 +23,7 @@
 pub mod blocking;
 mod conn;
 mod connect;
+pub mod doctor;
 mod workspace;
 
 use std::ffi::OsString;
@@ -138,6 +139,9 @@ pub enum StartFailure {
     StateDamaged,
     /// Exit code 6: the suite `state.db` is from a newer version; nothing was changed.
     StateTooNew,
+    /// Exit code 7: the suite `state.db` has a hot rollback journal (a crash mid-write);
+    /// nothing was changed.
+    StateHotJournal,
     /// Any other exit code; the core's log may say why (a core that fails before its log
     /// starts writes none).
     Other,
@@ -149,6 +153,7 @@ impl StartFailure {
         match code {
             Some(5) => StartFailure::StateDamaged,
             Some(6) => StartFailure::StateTooNew,
+            Some(7) => StartFailure::StateHotJournal,
             _ => StartFailure::Other,
         }
     }
@@ -234,7 +239,16 @@ impl fmt::Display for ClientError {
                 ..
             } => write!(
                 f,
-                "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+                "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` can set it aside.",
+                state_db.display()
+            ),
+            ClientError::StartFailed {
+                kind: StartFailure::StateHotJournal,
+                state_db,
+                ..
+            } => write!(
+                f,
+                "The core can't start: its state database at {} was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery.",
                 state_db.display()
             ),
             ClientError::StartFailed {
@@ -364,6 +378,10 @@ mod tests {
             StartFailure::from_exit_code(Some(6)),
             StartFailure::StateTooNew
         );
+        assert_eq!(
+            StartFailure::from_exit_code(Some(7)),
+            StartFailure::StateHotJournal
+        );
         for other in [Some(2), Some(4), Some(0), None] {
             assert_eq!(StartFailure::from_exit_code(other), StartFailure::Other);
         }
@@ -375,7 +393,11 @@ mod tests {
         };
         assert_eq!(
             failed(Some(5), StartFailure::StateDamaged).to_string(),
-            r"The core can't start: its state database at C:\t\local\state.db is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside."
+            r"The core can't start: its state database at C:\t\local\state.db is damaged. Nothing was changed. `ww doctor` can set it aside."
+        );
+        assert_eq!(
+            failed(Some(7), StartFailure::StateHotJournal).to_string(),
+            r"The core can't start: its state database at C:\t\local\state.db was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery."
         );
         assert_eq!(
             failed(Some(6), StartFailure::StateTooNew).to_string(),

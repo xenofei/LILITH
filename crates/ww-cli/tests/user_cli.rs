@@ -315,7 +315,7 @@ fn damaged_state_db_message_is_plain() {
     assert_eq!(
         out.stderr.trim(),
         format!(
-            "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+            "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` can set it aside.",
             db.display()
         ),
         "{out:?}"

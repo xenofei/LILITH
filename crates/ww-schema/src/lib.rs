@@ -32,6 +32,6 @@ pub use manifest::{
 pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};
 pub use refs::{AssetRef, LinkRef, is_asset_id, is_run_id, is_slug};
 pub use status::{Status, StatusEvent, Transition, transition};
-pub use suite::{SuiteToml, WorkspaceEntry};
+pub use suite::{SUITE_STATE_SCHEMA, SuiteToml, WorkspaceEntry};
 pub use version::{Bump, Version};
 pub use yaml_edit::{YamlEdit, YamlEditError};

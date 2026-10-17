@@ -23,7 +23,7 @@ pub mod workspace;
 pub use bins::{Bins, ensure_built};
 pub use clock::FakeClock;
 pub use core::{CoreFixture, KillOnDrop};
-pub use env::{TestEnv, WwChild, WwOutput};
+pub use env::{HOT_JOURNAL_ROWS, TestEnv, WwChild, WwOutput};
 pub use files::{sha256_bytes, sha256_file};
 pub use gitops::GitOps;
 pub use handles::HandleHolder;

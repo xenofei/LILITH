@@ -492,6 +492,7 @@ impl<'a> Finder<'a> {
                     exe: exe.clone(),
                     args: Vec::new(),
                     extra_env: self.cfg.spawn_env.clone(),
+                    remove_env: Vec::new(),
                 })
                 .map_err(|e| {
                     ClientError::Io(io::Error::new(

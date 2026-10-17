@@ -3460,6 +3460,7 @@ name = "ww-client"
 version = "0.0.0"
 dependencies = [
  "futures-util",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -3476,6 +3477,7 @@ name = "ww-core"
 version = "0.0.0"
 dependencies = [
  "futures-util",
+ "proptest",
  "rusqlite",
  "schemars",
  "serde",

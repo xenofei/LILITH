@@ -25,6 +25,7 @@ use ww_platform::process::{ProcessHandle, SpawnRequest, spawn_detached};
 
 use crate::bins::ensure_built;
 use crate::env::TestEnv;
+use crate::gitops::LEAKY_GIT_VARS;
 use crate::raw_pipe::{RawPipe, merge_hello};
 
 /// How long [`CoreFixture::start`] waits for the core's pipe.
@@ -141,7 +142,10 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// `spawn_detached` of `exe` with `env.child_env()`, `extra` replacing same-named variables.
+/// `spawn_detached` of `exe` with `env.child_env()`, `extra` replacing same-named variables,
+/// and [`LEAKY_GIT_VARS`] removed from what the core inherits (QA-038): a test run from inside
+/// a git hook never gives the core a `GIT_DIR` that points its `git` runs at another
+/// repository.
 fn spawn_core(env: &TestEnv, exe: &Path, extra: &[(&str, &str)]) -> ProcessHandle {
     // Set first, so a start that fails later (no pipe in time) still gets the drop's retry.
     env.launched
@@ -161,6 +165,7 @@ fn spawn_core(env: &TestEnv, exe: &Path, extra: &[(&str, &str)]) -> ProcessHandl
         exe: exe.to_path_buf(),
         args: Vec::new(),
         extra_env: vars,
+        remove_env: LEAKY_GIT_VARS.iter().map(OsString::from).collect(),
     })
     .unwrap_or_else(|e| panic!("cannot start {}: {e}", exe.display()))
 }
@@ -372,6 +377,7 @@ mod tests {
             exe: std::env::current_exe().unwrap(),
             args: vec![OsString::from(HELPER_SLEEP_TEST), OsString::from("--exact")],
             extra_env: vec![(OsString::from(HELPER_ENV), OsString::from("1"))],
+            remove_env: Vec::new(),
         })
         .expect("spawn the helper");
         // A separately held handle, so the check does not depend on the guard's own handle.

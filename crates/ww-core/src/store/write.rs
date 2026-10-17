@@ -477,13 +477,6 @@ pub(super) struct FileHash {
     lfs_oid: Option<String>,
 }
 
-impl FileHash {
-    /// Equal to `expected` by its SHA-256, or as an LFS pointer by its `oid`.
-    fn matches(&self, expected: &str) -> bool {
-        self.sha256 == expected || self.lfs_oid.as_deref() == Some(expected)
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::with_capacity(64), |mut s, b| {
@@ -823,18 +816,81 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What a write's step 3 accepts at the target.
+/// What step 3 of the write algorithm decides about the target (ARCH-074; Appendix E "Store
+/// write algorithm").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDecision {
+    /// The target holds what the write expects, or is absent where that is acceptable: write.
+    Proceed,
+    /// The target changed outside the suite (or appeared, or vanished): `store.hash_conflict`.
+    Conflict,
+    /// [`Expect::Generated`] with neither a generated hash nor a pending replace, and no file:
+    /// written as [`Expect::New`].
+    TreatAsNew,
+}
+
+/// Step 3 of the write algorithm, pure (the simulated QA-046 variant runs it too):
+/// - `current` is what the target holds: its SHA-256, or for a git-lfs pointer its `oid`
+///   (the store asks once with each); `None` when there is no file;
+/// - `generated` is the file's last generated hash (ARCH-078);
+/// - `pending` holds the hashes of its pending replace (write step 5): `[new]` for the replace
+///   of a new target, `[new, old]` otherwise, and nothing without a pending row.
+///
+/// [`Expect::New`] accepts only no file and [`Expect::Hash`] only that hash. [`Expect::Generated`]
+/// accepts the generated hash or either hash of the pending row, and no file only while the
+/// pending row is for a new target; with neither row, an existing file is a conflict and no
+/// file is [`WriteDecision::TreatAsNew`].
+pub fn decide_write(
+    expect: &Expect,
+    current: Option<&str>,
+    generated: Option<&str>,
+    pending: &[String],
+) -> WriteDecision {
+    let accept = |ok: bool| {
+        if ok {
+            WriteDecision::Proceed
+        } else {
+            WriteDecision::Conflict
+        }
+    };
+    match expect {
+        Expect::New => accept(current.is_none()),
+        Expect::Hash(h) => accept(current == Some(h.as_str())),
+        Expect::Generated if generated.is_none() && pending.is_empty() => match current {
+            None => WriteDecision::TreatAsNew,
+            Some(_) => WriteDecision::Conflict,
+        },
+        Expect::Generated => match current {
+            None => accept(pending.len() == 1),
+            Some(c) => accept(generated == Some(c) || pending.iter().any(|p| p == c)),
+        },
+    }
+}
+
+/// What a write's step 3 knows besides the target: the expectation and the recorded hashes.
 struct Want {
-    hashes: Vec<String>,
-    /// A missing file is acceptable.
-    absent_ok: bool,
+    expect: Expect,
+    generated: Option<String>,
+    /// `[new]` or `[new, old]` of the pending row; empty without one.
+    pending: Vec<String>,
 }
 
 impl Want {
+    /// [`decide_write`] with the target's SHA-256, or as an LFS pointer with its `oid`.
     fn accepts(&self, seen: Option<&FileHash>) -> bool {
+        let decide = |current: Option<&str>| {
+            decide_write(
+                &self.expect,
+                current,
+                self.generated.as_deref(),
+                &self.pending,
+            ) != WriteDecision::Conflict
+        };
         match seen {
-            None => self.absent_ok,
-            Some(h) => self.hashes.iter().any(|want| h.matches(want)),
+            None => decide(None),
+            Some(h) => {
+                decide(Some(&h.sha256)) || h.lfs_oid.as_deref().is_some_and(|oid| decide(Some(oid)))
+            }
         }
     }
 }
@@ -1666,48 +1722,32 @@ impl Store {
         Ok(())
     }
 
-    /// What step 3 accepts for `expect`.
+    /// What step 3 needs for `expect`: for [`Expect::Generated`], the generated hash and the
+    /// pending row's hashes.
     async fn want(&self, rel: &WsPath, expect: &Expect) -> Result<Want, StoreError> {
-        Ok(match expect {
-            Expect::New => Want {
-                hashes: Vec::new(),
-                absent_ok: true,
-            },
-            Expect::Hash(h) => Want {
-                hashes: vec![h.clone()],
-                absent_ok: false,
-            },
-            Expect::Generated => {
-                let path = rel.as_str();
-                let generated = self
-                    .state
-                    .generated(path)
-                    .await
-                    .map_err(|e| StoreError::state(rel, &e))?;
-                let pending = self
-                    .state
-                    .pending(path)
-                    .await
-                    .map_err(|e| StoreError::state(rel, &e))?;
-                if generated.is_none() && pending.is_none() {
-                    Want {
-                        hashes: Vec::new(),
-                        absent_ok: true,
-                    }
-                } else {
-                    let mut hashes: Vec<String> = generated.into_iter().collect();
-                    let mut absent_ok = false;
-                    if let Some(p) = pending {
-                        hashes.push(p.new_sha256);
-                        match p.old_sha256 {
-                            Some(old) => hashes.push(old),
-                            None => absent_ok = true,
-                        }
-                    }
-                    Want { hashes, absent_ok }
-                }
+        let mut want = Want {
+            expect: expect.clone(),
+            generated: None,
+            pending: Vec::new(),
+        };
+        if *expect == Expect::Generated {
+            let path = rel.as_str();
+            want.generated = self
+                .state
+                .generated(path)
+                .await
+                .map_err(|e| StoreError::state(rel, &e))?;
+            if let Some(p) = self
+                .state
+                .pending(path)
+                .await
+                .map_err(|e| StoreError::state(rel, &e))?
+            {
+                want.pending.push(p.new_sha256);
+                want.pending.extend(p.old_sha256);
             }
-        })
+        }
+        Ok(want)
     }
 
     /// Steps 1–8 without telling the sink; returns what the write was to the index.

@@ -376,7 +376,7 @@ fn damaged_state_db_is_a_plain_start_failure() {
     std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
     let before = sha256_file(&db);
     let expected = format!(
-        "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+        "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` can set it aside.",
         db.display()
     );
 

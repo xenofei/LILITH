@@ -28,6 +28,8 @@ ww-protocol = { path = "../ww-protocol" }
 ww-schema = { path = "../ww-schema" }
 
 [dev-dependencies]
+# The shrinkable simulated outside-writers reconciler (QA-046, tests/reconcile_sim.rs).
+proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 ww-testkit = { path = "../ww-testkit" }

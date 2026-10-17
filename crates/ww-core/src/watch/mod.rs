@@ -220,7 +220,7 @@ impl Watcher {
         cfg: WatchConfig,
     ) -> io::Result<Arc<Watcher>> {
         let (dir, rx) = DirWatcher::start(store.root(), cfg.buffer_bytes)?;
-        Ok(Watcher::spawn(
+        let watcher = Watcher::spawn(
             store,
             index,
             events,
@@ -228,7 +228,12 @@ impl Watcher {
             cfg,
             Some(rx),
             Some(Arc::new(dir)),
-        ))
+        );
+        // Fence files written before the folder watch was armed never send an event; the
+        // first reconcile, which every fence waits for, covers what came before them. One
+        // written after arming is both listed here and seen, which is harmless.
+        watcher.shared.seed_fences();
+        Ok(watcher)
     }
 
     /// A watcher fed by `changes` instead of a `DirWatcher` (paths relative to the workspace
@@ -701,6 +706,13 @@ impl Shared {
                 ReconcileReport::default()
             }
         };
+        self.seed_fences();
+        let decided = self.decide_report(&report, extra).await;
+        (report, decided)
+    }
+
+    /// Marks every fence file in `.worldwright/fence/` handled (test fences, QA-031).
+    fn seed_fences(&self) {
         let fence_dir = self.store.root().join(".worldwright").join("fence");
         if let Ok(entries) = std::fs::read_dir(&fence_dir) {
             let names: Vec<String> = entries
@@ -709,8 +721,6 @@ impl Shared {
                 .collect();
             self.fences.send_modify(|s| s.seen.extend(names));
         }
-        let decided = self.decide_report(&report, extra).await;
-        (report, decided)
     }
 
     /// Observations for every changed, missing and needs-repair path of `report`, and for

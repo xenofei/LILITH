@@ -6,6 +6,7 @@
 pub mod asset_read_tools;
 pub mod asset_tools;
 pub mod dispatcher;
+pub mod doctor_tools;
 pub mod project_tools;
 pub mod record_stage;
 pub mod registry;
@@ -19,11 +20,13 @@ pub mod workspace_tools;
 #[cfg(test)]
 mod tests;
 
+use std::ffi::OsString;
 use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
 pub use asset_tools::register_asset_tools;
 pub use dispatcher::Dispatcher;
+pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
 pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
@@ -45,7 +48,8 @@ use crate::state::StateRegistry;
 use crate::workspace::WorkspaceHub;
 
 /// The registry a core serves: the product tools on every channel and, on a test channel
-/// (`test_tools`), the test-channel tools.
+/// (`test_tools`), the test-channel tools. `git_env` is added to every `git` the doctor runs
+/// (`CoreConfig.git_env`).
 pub fn core_registry(
     test_tools: bool,
     gates: &Arc<TestGates>,
@@ -53,9 +57,11 @@ pub fn core_registry(
     hub: &Arc<WorkspaceHub>,
     env: &Env,
     probe: &Arc<dyn Probe>,
+    git_env: Arc<Vec<(OsString, OsString)>>,
 ) -> Registry {
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub.clone(), env.clone(), probe.clone());
+    register_doctor_tools(&mut reg, probe.clone(), git_env);
     register_trash_tools(&mut reg);
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg);

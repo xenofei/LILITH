@@ -1,12 +1,12 @@
 //! The `ww` user commands over `ww-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
-//! `events --follow`, `core stop`, `workspace init|use` and `notify`. Spec Appendix D, "The `ww` user
+//! `events --follow`, `core stop`, `workspace init|use`, `notify` and `doctor`. Spec Appendix D, "The `ww` user
 //! commands", and Appendix E, "The `ww` commands this plan adds", are the contract for their
 //! flags, output and exit codes.
 //!
 //! Every command builds its [`ClientConfig`] for the process's channel as a `cli` caller
 //! ([`config`]). `status`, `call` and `events` name the workspace the `cli` chain resolves
-//! (ARCH-030); `core stop` and `workspace init|use` name none, so a broken workspace registry
-//! never stops them.
+//! (ARCH-030); `core stop` and `workspace init|use` name none, and `doctor` names the default
+//! workspace it read itself, so a broken workspace registry never stops them.
 //!
 //! A workspace found from the current folder that is not registered in `suite.toml` stops
 //! `call` and `events` with a plain message naming the folder; `status` warns once on stderr
@@ -17,6 +17,7 @@
 
 mod call;
 mod core;
+mod doctor;
 mod events;
 mod notify;
 mod status;
@@ -103,6 +104,10 @@ pub enum UserCommand {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Check the suite's state database, the workspace registry and the default workspace, and
+    /// repair what is safe to repair. Anything persistent beyond that is done only after you
+    /// type y.
+    Doctor,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -159,6 +164,7 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
             workspace::use_default(global, &path)
         }
         UserCommand::Notify { paths } => notify::run(global, &paths),
+        UserCommand::Doctor => doctor::run(global),
     };
     match result {
         Ok(code) | Err(Exit(code)) => code,
@@ -460,6 +466,21 @@ mod tests {
         assert!(
             Cli::try_parse_from(["ww", "notify"]).is_err(),
             "notify needs a path"
+        );
+    }
+
+    #[test] // spec: CORE-004, CORE-040
+    fn doctor_parses() {
+        assert!(matches!(
+            user(parse(&["ww", "doctor"])),
+            UserCommand::Doctor
+        ));
+        let cli = parse(&["ww", "--non-interactive", "doctor"]);
+        assert!(cli.global.non_interactive);
+        assert!(matches!(user(cli), UserCommand::Doctor));
+        assert!(
+            Cli::try_parse_from(["ww", "doctor", "extra"]).is_err(),
+            "doctor takes no argument"
         );
     }
 

@@ -277,7 +277,7 @@ fn refusal(path: &Path, env: &Env) -> Option<String> {
 }
 
 /// The warnings for the workspace folder `path` (Review Focus 4).
-fn volume_warnings(probe: &dyn Probe, path: &Path) -> Vec<String> {
+pub(crate) fn volume_warnings(probe: &dyn Probe, path: &Path) -> Vec<String> {
     let cloud_attributes = probe
         .identity(path)
         .is_ok_and(|i| i.attributes & (PLACEHOLDER_ATTRIBUTES | CLOUD_PIN_ATTRIBUTES) != 0);
@@ -304,7 +304,7 @@ fn volume_warnings(probe: &dyn Probe, path: &Path) -> Vec<String> {
 
 /// `text` with each of `lines` that it lacks appended, in the file's own line ending; the
 /// text itself when it has them all.
-fn with_lines(text: &str, lines: &[&str]) -> String {
+pub(crate) fn with_lines(text: &str, lines: &[&str]) -> String {
     let have: HashSet<&str> = text.lines().map(str::trim_end).collect();
     let missing: Vec<&str> = lines
         .iter()

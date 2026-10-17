@@ -270,7 +270,15 @@ fn registry_with(
     hub: &Arc<WorkspaceHub>,
 ) -> Registry {
     let probe: Arc<dyn ww_platform::fs::Probe> = Arc::new(SystemProbe);
-    core_registry(test_tools, gates, states, hub, &env.env, &probe)
+    core_registry(
+        test_tools,
+        gates,
+        states,
+        hub,
+        &env.env,
+        &probe,
+        Arc::default(),
+    )
 }
 
 /// `core_registry` over `env`, with a hub of its own.
