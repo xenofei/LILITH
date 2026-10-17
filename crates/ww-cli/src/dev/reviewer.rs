@@ -219,12 +219,17 @@ pub fn legacy_key_path_in(profile: &Path) -> PathBuf {
         .join("app-key.age")
 }
 
-/// The reviewer key to use: [`key_path_in`] when that file exists, else [`legacy_key_path_in`]
-/// when that one does, else `None`. Only looks; nothing is created.
+/// The reviewer key to use: [`key_path_in`] when anything is there, else
+/// [`legacy_key_path_in`] when anything is there, else `None`. "Anything" means whatever isn't
+/// a plain not-found: a file, a folder, a link, or a path that can't be examined. So an occupied
+/// or unreadable new path is chosen, and loading it refuses; the legacy key is used only when
+/// nothing at all is at the new path. Only looks; nothing is created.
 pub fn find_key_in(profile: &Path) -> Option<PathBuf> {
     [key_path_in(profile), legacy_key_path_in(profile)]
         .into_iter()
-        .find(|p| p.is_file())
+        .find(|p| {
+            !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
 }
 
 /// [`find_key_in`], or an error naming both paths it looked at.
@@ -236,6 +241,14 @@ fn locate_key_in(profile: &Path) -> Result<PathBuf> {
             legacy_key_path_in(profile).display()
         )
     })
+}
+
+/// The key file [`locate_key_in`] finds, loaded, with its path. A key that can't be read or
+/// parsed is an error naming its path, never a reason to try the other one.
+fn load_key_in(profile: &Path) -> Result<(PathBuf, ReviewerKeyFile)> {
+    let path = locate_key_in(profile)?;
+    let key = ReviewerKeyFile::load(&path)?;
+    Ok((path, key))
 }
 
 /// Where `reviewer-setup` writes the key: the legacy path under `%USERPROFILE%` until Task B5
@@ -1208,13 +1221,10 @@ pub fn run_approve(pr: u64) -> i32 {
     if !prompt.is_interactive() {
         return refuse(NOT_INTERACTIVE);
     }
-    let key_file = match user_profile().and_then(|profile| locate_key_in(&profile)) {
-        Ok(p) => {
-            println!("Reviewer key: {}", p.display());
-            match ReviewerKeyFile::load(&p) {
-                Ok(k) => k,
-                Err(e) => return refuse(&format!("{e:#}")),
-            }
+    let key_file = match user_profile().and_then(|profile| load_key_in(&profile)) {
+        Ok((path, key)) => {
+            println!("Reviewer key: {}", path.display());
+            key
         }
         Err(e) => return refuse(&format!("{e:#}")),
     };
@@ -1866,10 +1876,39 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ww dev reviewer-setup"), "{text}");
-        // A folder where the key should be isn't a key.
-        std::fs::create_dir_all(key_path_in(profile)).unwrap();
-        assert_eq!(find_key_in(profile), None);
-        assert!(locate_key_in(profile).is_err());
+        assert!(load_key_in(profile).is_err());
+    }
+
+    /// Anything at the new key path is the key or a refusal; the legacy key is used only when
+    /// nothing is there at all.
+    #[test]
+    fn occupied_new_key_path_refuses_instead_of_falling_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path();
+        let legacy = legacy_key_path_in(profile);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        key_file().save(&legacy).unwrap();
+        assert_eq!(load_key_in(profile).unwrap().0, legacy);
+
+        // A folder at the new path: chosen, and loading it refuses.
+        let new = key_path_in(profile);
+        std::fs::create_dir_all(&new).unwrap();
+        assert_eq!(find_key_in(profile), Some(new.clone()));
+        let text = format!("{:#}", load_key_in(profile).unwrap_err());
+        assert!(text.contains(&new.display().to_string()), "{text}");
+        std::fs::remove_dir(&new).unwrap();
+
+        // A damaged file at the new path: the same.
+        std::fs::write(&new, "not a key file").unwrap();
+        assert_eq!(find_key_in(profile), Some(new.clone()));
+        let text = format!("{:#}", load_key_in(profile).unwrap_err());
+        assert!(text.contains(&new.display().to_string()), "{text}");
+
+        // A good file at the new path wins over the legacy one.
+        key_file().save(&new).unwrap();
+        assert_eq!(load_key_in(profile).unwrap().0, new);
+        // The legacy key was never touched.
+        assert!(ReviewerKeyFile::load(&legacy).is_ok());
     }
 
     // ---- R20: TOCTOU, nothing protected, PR state ----------------------------------------------

@@ -206,9 +206,9 @@ pub enum DevCommand {
     /// private denylist. The denylist comes from the first of these that is there:
     /// LIL_PRIVACY_DENYLIST (CI), the legacy WW_PRIVACY_DENYLIST,
     /// %USERPROFILE%\.lilith\privacy-denylist.txt, and the legacy
-    /// %USERPROFILE%\.worldwright\privacy-denylist.txt; without one, or when the first one
-    /// found is empty, it refuses. A denylist finding names only the entry's number and the
-    /// place.
+    /// %USERPROFILE%\.worldwright\privacy-denylist.txt. A blank variable is skipped. Without
+    /// a denylist, or when the first one found has no entries, it refuses. A denylist finding
+    /// names only the entry's number and the place.
     ///
     ///   --range <base>..<head>  every commit's added lines, paths, message and identities
     ///   --tree <rev>            every tracked file's content and path at <rev>
