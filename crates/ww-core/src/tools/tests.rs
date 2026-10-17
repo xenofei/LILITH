@@ -207,11 +207,13 @@ fn as_dyn(tool: &Arc<RecTool>) -> Arc<dyn Tool> {
 
 /// A dispatcher over the test-channel tools plus `extra`, with recording hooks.
 struct Fixture {
-    env: TestEnv,
     log: Log,
     gates: Arc<TestGates>,
     states: Arc<StateRegistry>,
     dispatcher: Dispatcher,
+    /// Last: fields drop in order, and the folder cannot go while the dispatcher holds
+    /// state.db open.
+    env: TestEnv,
 }
 
 fn no_fatal() -> OnFatal {
@@ -253,11 +255,11 @@ fn fixture_with(hooks: PipelineHooks, log: &Log, extra: &[Arc<dyn Tool>]) -> Fix
         lifecycle,
     );
     Fixture {
-        env,
         log,
         gates,
         states,
         dispatcher,
+        env,
     }
 }
 

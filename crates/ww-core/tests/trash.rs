@@ -37,10 +37,11 @@ const ASSET: &str = "projects/sketchbook/assets/crane";
 const MANIFEST: &str = "projects/sketchbook/assets/crane/crane.manifest.json";
 
 struct Ws {
-    _env: TestEnv,
     root: PathBuf,
     state: Arc<StateDb>,
     clock: Arc<FakeClock>,
+    /// Last: fields drop in order, and the folder cannot go while `state` holds state.db open.
+    _env: TestEnv,
 }
 
 fn no_fatal() -> Arc<dyn Fn(&str) + Send + Sync> {
@@ -59,10 +60,10 @@ fn workspace() -> Ws {
     let db = env.root().join("local-ws").join("state.db");
     let state = Arc::new(StateDb::open(&db, StateScope::Workspace, no_fatal()).expect("state.db"));
     Ws {
-        _env: env,
         root,
         state,
         clock: FakeClock::new(),
+        _env: env,
     }
 }
 

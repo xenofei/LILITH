@@ -77,9 +77,11 @@ struct Fx {
     events: Arc<EventBus>,
     ws_ref: WorkspaceRef,
     ws: PathBuf,
-    env: TestEnv,
     clock: Arc<FakeClock>,
     _states: Arc<StateRegistry>,
+    /// Last: fields drop in order, and the folder cannot go while the dispatcher holds
+    /// state.db open.
+    env: TestEnv,
 }
 
 impl Fx {
@@ -151,9 +153,9 @@ impl Fx {
             events,
             ws_ref: ws_ref(&ws),
             ws,
-            env,
             clock: fake,
             _states: states,
+            env,
         }
     }
 

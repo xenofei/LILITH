@@ -163,4 +163,16 @@ async fn watcher_failure_drops_to_no_watcher_mode() {
     let all = published(&events, "workspace").await;
     assert_eq!(all.len(), 1, "{all:?}");
     watcher.stop();
+    // The watcher's loop task holds the store, and with it state.db, until it sees the stop.
+    // Wait for that here: this runtime never polls the task again once the test returns, and
+    // the TestEnv cannot remove its folder while the file is open.
+    let weak = Arc::downgrade(&store);
+    drop((store, index, watcher));
+    tokio::time::timeout(DEADLINE, async {
+        while weak.strong_count() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the watcher's loop lets go of the store");
 }

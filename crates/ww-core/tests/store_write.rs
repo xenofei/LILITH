@@ -33,11 +33,11 @@ use ww_testkit::{FakeClock, HandleHolder, SeqIds, TestEnv, sha256_bytes, sha256_
 
 /// A workspace folder and its `state.db`, both under the test's own root.
 struct Ws {
-    /// Keeps the temporary folders alive.
-    _env: TestEnv,
     root: PathBuf,
     state: Arc<StateDb>,
     clock: Arc<FakeClock>,
+    /// Last: fields drop in order, and the folder cannot go while `state` holds state.db open.
+    _env: TestEnv,
 }
 
 fn no_fatal() -> Arc<dyn Fn(&str) + Send + Sync> {
@@ -56,10 +56,10 @@ impl Ws {
         let state =
             Arc::new(StateDb::open(&db, StateScope::Workspace, no_fatal()).expect("state.db"));
         Ws {
-            _env: env,
             root,
             state,
             clock: FakeClock::new(),
+            _env: env,
         }
     }
 

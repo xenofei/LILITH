@@ -114,12 +114,14 @@ fn make_dir(path: &Path) {
 
 /// An in-process hub with one open workspace.
 struct Core {
-    env: TestEnv,
     ws: PathBuf,
     cfg: WatchConfig,
     hub: Arc<WorkspaceHub>,
     events: Arc<EventBus>,
     open: Arc<OpenWorkspace>,
+    /// Last: fields drop in order, and the folder cannot go while the hub holds its
+    /// databases open.
+    env: TestEnv,
 }
 
 fn workspace_ref(ws: &Path) -> WorkspaceRef {
@@ -157,12 +159,12 @@ impl Core {
             .expect("the workspace opens");
         open.index.ready().await;
         Core {
-            env,
             ws: canonical(&ws),
             cfg,
             hub,
             events,
             open,
+            env,
         }
     }
 
@@ -675,6 +677,20 @@ async fn post_git_human_edit_is_recorded_without_waiting_for_the_gate() {
     assert_eq!(edits.len(), 1, "recorded, not store.git_busy: {edits:?}");
     assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
     watcher.stop();
+    // The watcher's loop tasks hold the store, and with it state.db, until they see the stop.
+    // Wait for that here (on the real clock: this one is paused): this runtime never polls
+    // them again once the test returns, and the TestEnv cannot remove its folder while the
+    // file is open.
+    let weak = Arc::downgrade(&store);
+    drop((store, index, watcher, events));
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while weak.strong_count() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher's loops still hold the store after {DEADLINE:?}"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")] // spec: ARCH-079, ARCH-083, CORE-034

@@ -73,8 +73,10 @@ struct Fx {
     hub: Arc<WorkspaceHub>,
     ws_ref: WorkspaceRef,
     ws: PathBuf,
-    env: TestEnv,
     _states: Arc<StateRegistry>,
+    /// Last: fields drop in order, and the folder cannot go while the dispatcher holds
+    /// state.db open.
+    env: TestEnv,
 }
 
 impl Fx {
@@ -140,8 +142,8 @@ impl Fx {
             hub,
             ws_ref: ws_ref(&ws),
             ws,
-            env,
             _states: states,
+            env,
         }
     }
 

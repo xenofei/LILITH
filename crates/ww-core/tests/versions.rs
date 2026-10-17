@@ -36,10 +36,11 @@ const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 
 /// A workspace folder and its `state.db`, both under the test's own root.
 struct Ws {
-    env: TestEnv,
     root: PathBuf,
     state: Arc<StateDb>,
     clock: Arc<FakeClock>,
+    /// Last: fields drop in order, and the folder cannot go while `state` holds state.db open.
+    env: TestEnv,
 }
 
 fn no_fatal() -> Arc<dyn Fn(&str) + Send + Sync> {
@@ -61,10 +62,10 @@ impl Ws {
         let state =
             Arc::new(StateDb::open(&db, StateScope::Workspace, no_fatal()).expect("state.db"));
         Ws {
-            env,
             root,
             state,
             clock: FakeClock::new(),
+            env,
         }
     }
 
