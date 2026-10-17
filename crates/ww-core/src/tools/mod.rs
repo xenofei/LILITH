@@ -2,6 +2,7 @@
 //! `tools/call` runs through (CORE-015–017), with the stages plan 3 replaces, the product
 //! tools and the test-channel tools.
 
+pub mod asset_read_tools;
 pub mod dispatcher;
 pub mod registry;
 pub mod stages;
@@ -14,6 +15,7 @@ mod tests;
 
 use std::sync::Arc;
 
+pub use asset_read_tools::register_asset_read_tools;
 pub use dispatcher::Dispatcher;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
 pub use stages::{
@@ -43,6 +45,7 @@ pub fn core_registry(
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub.clone(), env.clone(), probe.clone());
     register_trash_tools(&mut reg);
+    register_asset_read_tools(&mut reg);
     if test_tools {
         register_test_tools(&mut reg, gates.clone(), states.clone());
     }

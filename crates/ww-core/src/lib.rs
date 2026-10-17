@@ -16,7 +16,9 @@
 pub mod config;
 pub mod events;
 pub mod identity;
+pub mod index;
 pub mod lifecycle;
+pub mod pipeline;
 pub mod rpc;
 pub mod server;
 pub mod session;

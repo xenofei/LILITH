@@ -38,6 +38,7 @@ use ww_protocol::{AgentHint, ErrorBody, Fix, NO_WORKSPACE, UiAction};
 use ww_schema::SuiteToml;
 
 use crate::events::EventBus;
+use crate::index::{Index, IndexError};
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::{FailPoints, Store, WsPath, fsops};
 
@@ -193,6 +194,9 @@ pub struct OpenWorkspace {
     pub access: Access,
     pub state: Arc<StateDb>,
     pub store: Arc<Store>,
+    /// The workspace's index and the store's change sink: `index.db` in the workspace's local
+    /// folder when read-write, SQLite `:memory:` when read-only (ARCH-028, ARCH-097, CORE-005).
+    pub index: Arc<Index>,
     /// The orphans listed at open (CORE-038).
     pub orphans: Vec<WsPath>,
     /// `core.lock`, held while the workspace is open read-write.
@@ -223,6 +227,7 @@ impl OpenWorkspace {
         if self.shut.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.index.close();
         self.states.close_workspace(&self.ws.id);
         drop(lock(&self.lock).take());
         tracing::info!(workspace = %self.ws.path.display(), "workspace closed");
@@ -357,7 +362,11 @@ impl WorkspaceHub {
     /// 4. the store, and its `recover()` (read-write only); its `maintenance()` then starts in
     ///    the background and runs every [`MAINTENANCE_PERIOD`] while the workspace stays open;
     /// 5. `orphans()`, published once on the `workspace` topic as
-    ///    `{kind: "orphans", paths}` when there are any.
+    ///    `{kind: "orphans", paths}` when there are any;
+    /// 6. the index (`index.db` read-write, in memory read-only), set as the store's change
+    ///    sink. Its first reconcile (or cold rebuild) starts in the background, so the open
+    ///    doesn't wait for it; the read tools do ([`Index::ready`]). Its background
+    ///    verification then runs every [`VERIFY_PERIOD`].
     ///
     /// # Errors
     /// `store.io` when `core.lock` can't be opened, `state.unavailable` when the `state.db`
@@ -469,6 +478,10 @@ impl WorkspaceHub {
             self.events
                 .publish("workspace", json!({"kind": "orphans", "paths": paths}));
         }
+        // 6.
+        let index = self.open_index(ws, access).await;
+        store.set_sink(index.clone());
+        index.start_first();
         tracing::info!(
             workspace = %ws.path.display(),
             ?access,
@@ -480,6 +493,7 @@ impl WorkspaceHub {
             access,
             state,
             store,
+            index,
             orphans,
             lock: Mutex::new(taken),
             states: self.states.clone(),
@@ -489,7 +503,46 @@ impl WorkspaceHub {
         if access == Access::ReadWrite {
             spawn_daily_maintenance(&open);
         }
+        spawn_verify_ticks(&open);
         Ok(open)
+    }
+
+    /// The workspace's index (step 6): read-write, `index.db` in the workspace's local folder,
+    /// removed and rebuilt when damaged (ARCH-089); read-only, an in-memory index that never
+    /// touches `index.db`, which on a non-system volume both channels share (ARCH-097). When
+    /// `index.db` can't be opened at all, an in-memory index stands in (it is disposable).
+    async fn open_index(&self, ws: &WorkspaceRef, access: Access) -> Arc<Index> {
+        let (root, probe) = (ws.path.clone(), self.probe.clone());
+        let file = match access {
+            Access::ReadWrite => self
+                .env
+                .workspace_local_dir_for_canonical(&ws.path)
+                .map(|dir| dir.join("index.db"))
+                .map_err(|e| IndexError::Io(e.to_string())),
+            Access::ReadOnly => Err(IndexError::Io("read-only".to_string())),
+        };
+        let opened = match file {
+            Ok(file) => {
+                let (root, probe) = (root.clone(), probe.clone());
+                tokio::task::spawn_blocking(move || Index::open(&file, &root, probe))
+                    .await
+                    .unwrap_or_else(|e| Err(IndexError::Io(format!("the open stopped: {e}"))))
+                    .inspect_err(|e| {
+                        tracing::warn!(workspace = %ws.path.display(), error = %e, "index.db can't be opened; an in-memory index stands in");
+                    })
+                    .ok()
+            }
+            Err(_) => None,
+        };
+        let index = match opened {
+            Some(index) => index,
+            None => Index::open_in_memory(&root, probe).unwrap_or_else(|e| {
+                // SQLite can't make an in-memory database only when the process is out of
+                // memory; nothing sensible remains.
+                panic!("an in-memory index can't be created: {e}")
+            }),
+        };
+        Arc::new(index)
     }
 
     /// Lets go of the workspace `id` if it is open. Unless a call still holds it, it is closed
@@ -591,6 +644,49 @@ fn spawn_daily_maintenance(open: &Arc<OpenWorkspace>) {
                 }
                 Err(e) => {
                     tracing::warn!(workspace = %path.display(), error = %e, "the workspace maintenance stopped; it runs again later");
+                }
+            }
+        }
+    });
+}
+
+/// How often the index hashes files whose hash it took on trust (a cold rebuild's manifest
+/// hashes), and how many at most per tick (CORE-041).
+pub const VERIFY_PERIOD: Duration = Duration::from_secs(1);
+pub const VERIFY_BATCH: usize = 200;
+
+/// Runs [`Index::verify_pending`] on `open`'s index every [`VERIFY_PERIOD`] (on tokio's clock)
+/// while the workspace stays open. Its mismatches are logged; from Task 11 on the watcher
+/// decides what they are (the index never calls one a human edit, CORE-010). The task holds
+/// only a weak reference to the index and the `shut` flag, so it never keeps a closed
+/// workspace alive.
+fn spawn_verify_ticks(open: &Arc<OpenWorkspace>) {
+    let (index, shut, path) = (
+        Arc::downgrade(&open.index),
+        open.shut.clone(),
+        open.ws.path.clone(),
+    );
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(VERIFY_PERIOD);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            if shut.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(index) = index.upgrade() else {
+                break;
+            };
+            index.ready().await;
+            match index.verify_pending(VERIFY_BATCH).await {
+                Ok(mismatches) => {
+                    for m in mismatches {
+                        tracing::warn!(workspace = %path.display(), path = %m.path, sha256 = %m.sha256, recorded = %m.recorded, "a file differs from the hash its manifest records");
+                    }
+                }
+                Err(IndexError::ActorGone) => break,
+                Err(e) => {
+                    tracing::warn!(workspace = %path.display(), error = %e, "the index verification stopped; it runs again later");
                 }
             }
         }
