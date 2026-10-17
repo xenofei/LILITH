@@ -31,14 +31,37 @@ pub fn upcase_name(name: &str) -> String {
 }
 
 /// A folder's spelling for comparison:
-/// - canonical when it exists (short names, junctions and `subst` drives resolved);
+/// - canonical as far as it exists (short names, junctions and `subst` drives resolved): the
+///   deepest part of it that exists is canonicalised and a tail that doesn't exist yet keeps
+///   the spelling given, so a folder about to be created compares like its existing parent
+///   (`C:\Users\Fake\LONGFO~1\new` and `C:\Users\Fake\Long folder\new` are one key);
 /// - without `\\?\`, and `\\?\UNC\server\share` as `\\server\share`;
 /// - `\` separators;
 /// - no trailing separator, except on a bare drive root, which stays `x:\`;
 /// - Unicode lowercase.
 pub fn folder_key(path: &Path) -> String {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    spelling_key(&path)
+    spelling_key(&canonical_head(path))
+}
+
+/// `path` with its deepest existing part canonical and the rest appended as given; `path`
+/// itself when no part of it exists, or when a missing part is `..` (which can't be kept as
+/// a tail).
+fn canonical_head(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(mut found) = std::fs::canonicalize(at) {
+            found.extend(tail.iter().rev());
+            return found;
+        }
+        match (at.file_name(), at.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// The pure half of [`folder_key`]: everything except canonicalisation.
@@ -221,6 +244,13 @@ mod tests {
         assert!(link.is_dir());
         assert_eq!(folder_key(&link), folder_key(&target));
         assert_ne!(folder_key(&link), folder_key(dir.path()));
+        // A folder that doesn't exist yet compares like its existing parent: through the
+        // junction it is the same folder below the target.
+        assert_eq!(
+            folder_key(&link.join("Ünïcödé new").join("Deeper")),
+            folder_key(&target.join("ünïcödé NEW").join("deeper"))
+        );
+        assert!(!target.join("Ünïcödé new").exists());
         // The junction itself is removed, never its target's contents.
         std::fs::remove_dir(&link).unwrap();
     }

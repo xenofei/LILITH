@@ -384,6 +384,47 @@ fn create_refuses_nested_workspace_and_files() {
     assert_eq!(listed.len(), 1, "{listed:?}");
 }
 
+/// The nested check runs before anything is created, also when the new folder is spelled
+/// another way than the registered one (here through a junction; on CI the temp folder's
+/// short name `RUNNER~1` did the same): the part that exists is compared canonically.
+#[test] // spec: ARCH-094, QA-040
+fn create_refuses_a_nested_folder_spelled_through_a_link_without_creating_it() {
+    let env = TestEnv::new();
+    let outer = env.make_workspace("outer");
+    env.register_workspace(&outer, true);
+    let link = env.root().join("Ünïcödé link");
+    junction(&link, &outer);
+    let _core = core(&env);
+    let mut pipe = none(&env);
+
+    let inner = link.join("inner").join("deeper");
+    let nested = create(&mut pipe, json!({"path": arg(&inner)}));
+    assert_eq!(nested["status"], "error", "{nested}");
+    assert_eq!(
+        nested["error"]["code"], "workspace.path_invalid",
+        "{nested}"
+    );
+    assert!(
+        nested["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("inside the registered workspace")),
+        "{nested}"
+    );
+    assert!(
+        !outer.join("inner").exists(),
+        "the nested folder was created"
+    );
+    let (_, listed) = env.registered();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+}
+
+/// A junction at `link` to the folder `target` (no privilege needed).
+#[allow(clippy::disallowed_methods)]
+fn junction(link: &Path, target: &Path) {
+    ww_platform::fs::create_junction(link, target)
+        .unwrap_or_else(|e| panic!("cannot create a junction at {}: {e}", link.display()));
+}
+
 #[test] // spec: CORE-041, ARCH-089
 fn create_warns_on_network_or_cloud_volumes() {
     let env = TestEnv::new();
