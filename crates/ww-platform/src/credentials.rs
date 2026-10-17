@@ -6,8 +6,8 @@
 //!
 //! **Targets.** The real store, [`WindowsCredentialStore`], only touches targets under
 //! [`DEV_PREFIX`] (owner tooling such as the agent token), under the legacy owner-tooling
-//! prefix [`names::LEGACY_DEV_CREDENTIAL_PREFIX`] (R4; Task A2 limits it to reads and
-//! deletes), or under the test prefix `<legacy app name>-test-<id>/` (tests; it moves to the new name in Task B3).
+//! prefix [`names::LEGACY_DEV_CREDENTIAL_PREFIX`] (R4; read and deleted, never written), or
+//! under the test prefix `<legacy app name>-test-<id>/` (tests; it moves to the new name in Task B3).
 //! Anything else, including either name's stable channel prefix and other channels, is refused
 //! before any Windows call ([`check_target`]). Once the harness guard is armed, an
 //! owner-tooling target under either name also trips it (QA-040).
@@ -77,7 +77,7 @@ impl fmt::Display for CredentialError {
         match self {
             CredentialError::TargetRefused(t) => write!(
                 f,
-                "credential target {t:?} is refused: only {DEV_PREFIX}..., {}... and {TEST_PREFIX}<id>/... are used",
+                "credential target {t:?} is refused for this use: only {DEV_PREFIX}..., {}... (read and delete only) and {TEST_PREFIX}<id>/... are used",
                 names::LEGACY_DEV_CREDENTIAL_PREFIX
             ),
             CredentialError::Invalid(why) => write!(f, "the credential can't be stored: {why}"),
@@ -109,13 +109,13 @@ pub enum TargetUse {
 /// `Ok` for (ASCII case-insensitive, like Credential Manager):
 ///
 /// - `<DEV_PREFIX><name>`, every use;
-/// - `<LEGACY_DEV_CREDENTIAL_PREFIX><name>`, the legacy owner-tooling entries (R4). Every use
-///   for now: Task A2 refuses [`TargetUse::Write`] here when `agent-token set` moves to
-///   [`DEV_PREFIX`];
+/// - `<LEGACY_DEV_CREDENTIAL_PREFIX><name>`, the legacy owner-tooling entries (R4):
+///   [`TargetUse::Read`] and [`TargetUse::Delete`] only. Nothing writes the old name; the
+///   agent token is written under [`DEV_PREFIX`];
 /// - `<TEST_PREFIX><id>/<name>`, every use, where `<id>` is a valid test channel id.
 ///
 /// `<name>` is never empty, and no control characters are allowed anywhere.
-pub fn check_target(target: &str, _use: TargetUse) -> Result<(), CredentialError> {
+pub fn check_target(target: &str, use_: TargetUse) -> Result<(), CredentialError> {
     let refused = || {
         Err(CredentialError::TargetRefused(
             target.escape_debug().to_string(),
@@ -129,6 +129,9 @@ pub fn check_target(target: &str, _use: TargetUse) -> Result<(), CredentialError
     let name = if let Some(rest) = lower.strip_prefix(&DEV_PREFIX.to_ascii_lowercase()) {
         rest
     } else if let Some(rest) = lower.strip_prefix(&legacy_dev) {
+        if use_ == TargetUse::Write {
+            return refused();
+        }
         rest
     } else if let Some(rest) = lower.strip_prefix(&TEST_PREFIX.to_ascii_lowercase()) {
         match rest.split_once('/') {
@@ -469,6 +472,52 @@ mod tests {
             for use_ in USES {
                 assert!(check_target(prefix, use_).is_err(), "{prefix:?} {use_:?}");
             }
+        }
+    }
+
+    /// The legacy owner-tooling prefix is read and deleted, never written (R4).
+    #[test] // spec: QA-079
+    fn check_target_refuses_writing_the_legacy_dev_prefix() {
+        for t in [
+            format!("{LEGACY_DEV_CREDENTIAL_PREFIX}x"),
+            format!("{LEGACY_DEV_CREDENTIAL_PREFIX}github/agent-token"),
+            format!("{}x", LEGACY_DEV_CREDENTIAL_PREFIX.to_ascii_uppercase()),
+            format!("{}x", LEGACY_DEV_CREDENTIAL_PREFIX.to_ascii_lowercase()),
+        ] {
+            assert!(
+                matches!(
+                    check_target(&t, TargetUse::Write),
+                    Err(CredentialError::TargetRefused(_))
+                ),
+                "{t:?}"
+            );
+            assert_eq!(check_target(&t, TargetUse::Read), Ok(()), "{t:?}");
+            assert_eq!(check_target(&t, TargetUse::Delete), Ok(()), "{t:?}");
+            // The real store refuses the write before any Windows call, and so does the fake.
+            assert!(
+                matches!(
+                    WindowsCredentialStore.set(&t, &cred("s")),
+                    Err(CredentialError::TargetRefused(_))
+                ),
+                "{t:?}"
+            );
+            let store = MemoryCredentialStore::new();
+            assert!(
+                matches!(
+                    store.set(&t, &cred("s")),
+                    Err(CredentialError::TargetRefused(_))
+                ),
+                "{t:?}"
+            );
+            assert_eq!(store.get(&t), Ok(None), "{t:?}");
+            assert_eq!(store.delete(&t), Ok(false), "{t:?}");
+        }
+        // The legacy prefix with no name is still refused for every use.
+        for use_ in USES {
+            assert!(
+                check_target(LEGACY_DEV_CREDENTIAL_PREFIX, use_).is_err(),
+                "{use_:?}"
+            );
         }
     }
 

@@ -8,9 +8,12 @@
 //!
 //! **The key.** `ww dev reviewer-setup` encrypts the App's downloaded `.pem` with an age scrypt
 //! passphrase and writes it, with the App id and installation id, to
-//! `%USERPROFILE%\.worldwright\reviewer\app-key.age` ([`key_path_in`]). That is outside the repo
-//! and outside the suite's `%APPDATA%\Worldwright*` / `%LOCALAPPDATA%\Worldwright*` data. The
-//! plaintext `.pem` is never deleted or modified here; the owner deletes it.
+//! `%USERPROFILE%\<legacy home>\reviewer\app-key.age` ([`legacy_key_path_in`]; Task B5 moves the
+//! writer to [`key_path_in`], `%USERPROFILE%\<home>\reviewer\app-key.age`). `approve` reads the
+//! key from the new path when it exists, else from the legacy one ([`find_key_in`], R4), and
+//! prints which. Both are outside the repo and outside the suite's `%APPDATA%\<App>*` /
+//! `%LOCALAPPDATA%\<App>*` data. The plaintext `.pem` is never deleted or modified here; the
+//! owner deletes it.
 //!
 //! **Approving** ([`approve`]): refuse unless at a terminal; refuse when nothing protected
 //! changed; show the summary and ask "(y/N)"; read the passphrase; decrypt the key (a wrong
@@ -70,6 +73,7 @@ use std::fmt;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use ww_platform::names;
 use zeroize::Zeroizing;
 
 /// The shortest passphrase `reviewer-setup` accepts, in characters.
@@ -197,16 +201,51 @@ impl ReviewerKeyFile {
     }
 }
 
-/// `<profile>\.worldwright\reviewer\app-key.age`.
+/// `<profile>\<home>\reviewer\app-key.age` ([`names::HOME_DIR`]). `reviewer-setup` writes it
+/// from Task B5.
 pub fn key_path_in(profile: &Path) -> PathBuf {
     profile
-        .join(".worldwright")
+        .join(names::HOME_DIR)
         .join("reviewer")
         .join("app-key.age")
 }
 
-/// [`key_path_in`] for `%USERPROFILE%`.
-pub fn default_key_path() -> Result<PathBuf> {
+/// `<profile>\<legacy home>\reviewer\app-key.age` ([`names::LEGACY_HOME_DIR`]): where the key
+/// was written before the rename. Read when the new path has no key (R4).
+pub fn legacy_key_path_in(profile: &Path) -> PathBuf {
+    profile
+        .join(names::LEGACY_HOME_DIR)
+        .join("reviewer")
+        .join("app-key.age")
+}
+
+/// The reviewer key to use: [`key_path_in`] when that file exists, else [`legacy_key_path_in`]
+/// when that one does, else `None`. Only looks; nothing is created.
+pub fn find_key_in(profile: &Path) -> Option<PathBuf> {
+    [key_path_in(profile), legacy_key_path_in(profile)]
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// [`find_key_in`], or an error naming both paths it looked at.
+fn locate_key_in(profile: &Path) -> Result<PathBuf> {
+    find_key_in(profile).ok_or_else(|| {
+        anyhow!(
+            "there is no reviewer key at {} or at the legacy {}; run `ww dev reviewer-setup` first",
+            key_path_in(profile).display(),
+            legacy_key_path_in(profile).display()
+        )
+    })
+}
+
+/// Where `reviewer-setup` writes the key: the legacy path under `%USERPROFILE%` until Task B5
+/// moves it to [`key_path_in`] together with the `.claude` deny rules for the new folder.
+pub fn setup_key_path() -> Result<PathBuf> {
+    Ok(legacy_key_path_in(&user_profile()?))
+}
+
+/// `%USERPROFILE%`, which must be set and absolute.
+fn user_profile() -> Result<PathBuf> {
     let profile = std::env::var_os("USERPROFILE")
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
@@ -219,7 +258,7 @@ pub fn default_key_path() -> Result<PathBuf> {
             profile.display()
         );
     }
-    Ok(key_path_in(&profile))
+    Ok(profile)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1169,17 +1208,14 @@ pub fn run_approve(pr: u64) -> i32 {
     if !prompt.is_interactive() {
         return refuse(NOT_INTERACTIVE);
     }
-    let key_file = match default_key_path().and_then(|p| {
-        if p.exists() {
-            ReviewerKeyFile::load(&p)
-        } else {
-            bail!(
-                "there is no reviewer key at {}; run `ww dev reviewer-setup` first",
-                p.display()
-            )
+    let key_file = match user_profile().and_then(|profile| locate_key_in(&profile)) {
+        Ok(p) => {
+            println!("Reviewer key: {}", p.display());
+            match ReviewerKeyFile::load(&p) {
+                Ok(k) => k,
+                Err(e) => return refuse(&format!("{e:#}")),
+            }
         }
-    }) {
-        Ok(k) => k,
         Err(e) => return refuse(&format!("{e:#}")),
     };
     let repo = match super::root::repo_root() {
@@ -1254,7 +1290,7 @@ pub fn run_approve(pr: u64) -> i32 {
 
 /// `ww dev reviewer-setup`: exit 0 when the key file was written, 1 otherwise.
 pub fn run_reviewer_setup() -> i32 {
-    let result = default_key_path().and_then(|p| reviewer_setup(&TerminalPrompt, &p));
+    let result = setup_key_path().and_then(|p| reviewer_setup(&TerminalPrompt, &p));
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -1733,11 +1769,17 @@ mod tests {
     fn key_path_is_outside_repo_and_suite_data() {
         let profile = tempfile::tempdir().unwrap();
         let profile = profile.path();
-        let path = key_path_in(profile);
         assert_eq!(
-            path,
+            key_path_in(profile),
             profile
-                .join(".worldwright")
+                .join(names::HOME_DIR)
+                .join("reviewer")
+                .join("app-key.age")
+        );
+        assert_eq!(
+            legacy_key_path_in(profile),
+            profile
+                .join(names::LEGACY_HOME_DIR)
                 .join("reviewer")
                 .join("app-key.age")
         );
@@ -1745,38 +1787,89 @@ mod tests {
         let repo = crate::dev::spec_tests::workspace_root()
             .canonicalize()
             .unwrap();
-        assert!(!path.starts_with(&repo), "{path:?} is inside the repo");
 
-        /// `true` when `path` is under `root\Worldwright*` (any channel suffix).
+        /// `true` when `path` is under `root\<App>*` for either name (any channel suffix).
         fn under_suite_data(path: &Path, root: &Path) -> bool {
             path.strip_prefix(root).ok().is_some_and(|rest| {
                 rest.components().next().is_some_and(|c| {
-                    c.as_os_str()
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .starts_with("worldwright")
+                    let c = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+                    [names::APP_NAME, names::LEGACY_APP_NAME]
+                        .iter()
+                        .any(|app| c.starts_with(&app.to_ascii_lowercase()))
                 })
             })
         }
-        // Windows puts both app-data roots inside the profile; check that layout, injected.
-        for root in [
-            profile.join("AppData").join("Roaming"),
-            profile.join("AppData").join("Local"),
-        ] {
-            assert!(!under_suite_data(&path, &root), "{path:?} under {root:?}");
-        }
-        // And against this machine's roots (the variables' values only; nothing under them is
-        // resolved or touched).
-        for var in ["APPDATA", "LOCALAPPDATA"] {
-            if let Some(root) = std::env::var_os(var) {
-                assert!(
-                    !under_suite_data(&path, Path::new(&root)),
-                    "{path:?} under %{var}%"
-                );
+        for path in [key_path_in(profile), legacy_key_path_in(profile)] {
+            assert!(!path.starts_with(&repo), "{path:?} is inside the repo");
+            // Windows puts both app-data roots inside the profile; check that layout, injected.
+            for root in [
+                profile.join("AppData").join("Roaming"),
+                profile.join("AppData").join("Local"),
+            ] {
+                assert!(!under_suite_data(&path, &root), "{path:?} under {root:?}");
             }
+            // And against this machine's roots (the variables' values only; nothing under them
+            // is resolved or touched).
+            for var in ["APPDATA", "LOCALAPPDATA"] {
+                if let Some(root) = std::env::var_os(var) {
+                    assert!(
+                        !under_suite_data(&path, Path::new(&root)),
+                        "{path:?} under %{var}%"
+                    );
+                }
+            }
+            // The home folder itself, under either name, is not a suite data root.
+            assert!(!under_suite_data(&path, profile));
         }
-        // The `.worldwright` folder itself is not a suite data root.
-        assert!(!under_suite_data(&path, profile));
+    }
+
+    #[test]
+    fn key_lookup_prefers_the_new_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path();
+        for p in [key_path_in(profile), legacy_key_path_in(profile)] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "key").unwrap();
+        }
+        assert_eq!(find_key_in(profile), Some(key_path_in(profile)));
+        assert_eq!(locate_key_in(profile).unwrap(), key_path_in(profile));
+        // Only the new one: still the new one.
+        std::fs::remove_file(legacy_key_path_in(profile)).unwrap();
+        assert_eq!(find_key_in(profile), Some(key_path_in(profile)));
+    }
+
+    #[test]
+    fn key_lookup_finds_the_legacy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path();
+        let legacy = legacy_key_path_in(profile);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "key").unwrap();
+        assert_eq!(find_key_in(profile), Some(legacy.clone()));
+        assert_eq!(locate_key_in(profile).unwrap(), legacy);
+        // Looking never creates the new folder.
+        assert!(!profile.join(names::HOME_DIR).exists());
+    }
+
+    #[test]
+    fn missing_key_message_names_both_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path();
+        assert_eq!(find_key_in(profile), None);
+        let text = format!("{:#}", locate_key_in(profile).unwrap_err());
+        assert!(
+            text.contains(&key_path_in(profile).display().to_string()),
+            "{text}"
+        );
+        assert!(
+            text.contains(&legacy_key_path_in(profile).display().to_string()),
+            "{text}"
+        );
+        assert!(text.contains("ww dev reviewer-setup"), "{text}");
+        // A folder where the key should be isn't a key.
+        std::fs::create_dir_all(key_path_in(profile)).unwrap();
+        assert_eq!(find_key_in(profile), None);
+        assert!(locate_key_in(profile).is_err());
     }
 
     // ---- R20: TOCTOU, nothing protected, PR state ----------------------------------------------

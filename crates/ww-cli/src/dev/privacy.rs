@@ -23,10 +23,12 @@
 //!    (see [`Mode::Commits`]).
 //! 3. **The private denylist**: case-insensitive literal strings, one per line (blank lines
 //!    and `#` lines are ignored). Unicode format characters (zero-width spaces and the like) are
-//!    dropped from both sides before matching. It comes from the `WW_PRIVACY_DENYLIST`
-//!    environment variable when that is set (CI, from an Actions secret), and otherwise from
-//!    `%USERPROFILE%\.worldwright\privacy-denylist.txt`. A missing or empty denylist is a
-//!    refusal, never an empty pass.
+//!    dropped from both sides before matching. It comes from the first of these that is there
+//!    ([`load_denylist`]): the [`names::DENYLIST_ENV`] environment variable (CI, from an Actions
+//!    secret), the legacy [`names::LEGACY_DENYLIST_ENV`] variable,
+//!    `%USERPROFILE%\<home>\privacy-denylist.txt`, and the same file in the legacy home folder
+//!    (R4). The first one found is the denylist: an empty one is refused, not skipped. A missing
+//!    or empty denylist is a refusal, never an empty pass.
 //!
 //! Before paths and addresses are matched, `%5C`, `%2F`, `%40` and `%3A` are decoded, so a
 //! percent-encoded path or address is still seen.
@@ -94,9 +96,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-
-/// The environment variable that holds the denylist in CI (newline-separated entries).
-pub const DENYLIST_ENV: &str = "WW_PRIVACY_DENYLIST";
+use ww_platform::names;
 
 /// The refusal when no denylist can be found.
 pub const MISSING_DENYLIST: &str = "privacy denylist not found; see docs/dev/merge-guard.md";
@@ -265,43 +265,60 @@ impl Denylist {
     }
 }
 
-/// Loads the denylist: from `env_value` (the `WW_PRIVACY_DENYLIST` variable) when it is set,
-/// otherwise from `file`. Missing or empty is an error.
-pub fn load_denylist(env_value: Option<OsString>, file: Option<&Path>) -> Result<Denylist, String> {
-    if let Some(v) = env_value {
-        let text = v
-            .into_string()
-            .map_err(|_| format!("{DENYLIST_ENV} isn't valid UTF-8"))?;
-        return Denylist::parse(&text);
-    }
-    let Some(file) = file else {
-        return Err(MISSING_DENYLIST.to_string());
-    };
-    match std::fs::read(file) {
-        Ok(bytes) => {
-            let text = String::from_utf8(bytes)
-                .map_err(|_| "the privacy denylist isn't valid UTF-8".to_string())?;
-            Denylist::parse(&text)
+/// Loads the denylist from the first of these that is there: `env_new` (the
+/// [`names::DENYLIST_ENV`] variable) when it is set, else `env_legacy`
+/// ([`names::LEGACY_DENYLIST_ENV`]) when that is set, else the first of `files` that exists. What
+/// is found first is the denylist, even when it has no entries, so an empty one is refused
+/// rather than skipped. Nothing found, or no entries, is an error.
+pub fn load_denylist(
+    env_new: Option<OsString>,
+    env_legacy: Option<OsString>,
+    files: &[&Path],
+) -> Result<Denylist, String> {
+    for (name, value) in [
+        (names::DENYLIST_ENV, env_new),
+        (names::LEGACY_DENYLIST_ENV, env_legacy),
+    ] {
+        if let Some(v) = value {
+            let text = v
+                .into_string()
+                .map_err(|_| format!("{name} isn't valid UTF-8"))?;
+            return Denylist::parse(&text);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(MISSING_DENYLIST.to_string()),
-        Err(e) => Err(format!("couldn't read the privacy denylist: {}", e.kind())),
     }
+    for file in files {
+        match std::fs::read(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| "the privacy denylist isn't valid UTF-8".to_string())?;
+                return Denylist::parse(&text);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("couldn't read the privacy denylist: {}", e.kind())),
+        }
+    }
+    Err(MISSING_DENYLIST.to_string())
 }
 
-/// `%USERPROFILE%\.worldwright\privacy-denylist.txt`, when `USERPROFILE` is set.
-fn denylist_file() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            PathBuf::from(p)
-                .join(".worldwright")
-                .join("privacy-denylist.txt")
-        })
+/// The denylist files under `profile`, in the order they are read:
+/// `<home>\privacy-denylist.txt`, then the same file in the legacy home folder.
+fn denylist_files_in(profile: &Path) -> [PathBuf; 2] {
+    [names::HOME_DIR, names::LEGACY_HOME_DIR]
+        .map(|home| profile.join(home).join("privacy-denylist.txt"))
 }
 
-/// The real denylist: the environment variable first, then the file.
+/// The real denylist: the two environment variables, then the two files under `%USERPROFILE%`
+/// when that is set.
 pub fn real_denylist() -> Result<Denylist, String> {
-    load_denylist(std::env::var_os(DENYLIST_ENV), denylist_file().as_deref())
+    let files = std::env::var_os("USERPROFILE")
+        .filter(|p| !p.is_empty())
+        .map(|p| denylist_files_in(Path::new(&p)));
+    let files: Vec<&Path> = files.iter().flatten().map(PathBuf::as_path).collect();
+    load_denylist(
+        std::env::var_os(names::DENYLIST_ENV),
+        std::env::var_os(names::LEGACY_DENYLIST_ENV),
+        &files,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2272,22 +2289,147 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("privacy-denylist.txt");
         assert_eq!(
-            load_denylist(None, Some(&missing)),
+            load_denylist(None, None, &[&missing]),
             Err(MISSING_DENYLIST.to_string())
         );
-        assert_eq!(load_denylist(None, None), Err(MISSING_DENYLIST.to_string()));
+        assert_eq!(
+            load_denylist(None, None, &[]),
+            Err(MISSING_DENYLIST.to_string())
+        );
         // Present but with no entries: refused too.
         std::fs::write(&missing, "# nothing yet\n\n").unwrap();
-        assert!(load_denylist(None, Some(&missing)).is_err());
-        assert!(load_denylist(Some("".into()), None).is_err());
-        assert!(load_denylist(Some("\n# c\n".into()), None).is_err());
+        assert!(load_denylist(None, None, &[&missing]).is_err());
+        for env in ["", "\n# c\n"] {
+            assert!(load_denylist(Some(env.into()), None, &[]).is_err());
+            assert!(load_denylist(None, Some(env.into()), &[]).is_err());
+        }
         // The environment variable comes first (CI), so the file isn't needed then.
         let tmp2 = tempfile::tempdir().unwrap();
         let absent = tmp2.path().join("nope.txt");
-        assert!(load_denylist(Some("entry".into()), Some(&absent)).is_ok());
+        assert!(load_denylist(Some("entry".into()), None, &[&absent]).is_ok());
+        assert!(load_denylist(None, Some("entry".into()), &[&absent]).is_ok());
         // And a file with an entry loads.
         std::fs::write(&missing, "# c\nentry\n").unwrap();
-        assert!(load_denylist(None, Some(&missing)).is_ok());
+        assert!(load_denylist(None, None, &[&missing]).is_ok());
+    }
+
+    /// The 1-based entry numbers `d` finds in `text`; entries are never shown.
+    fn hits_of(d: &Result<Denylist, String>, text: &str) -> Vec<usize> {
+        d.as_ref().expect("a denylist").hits(text)
+    }
+
+    /// `<profile>\<home>\privacy-denylist.txt` with `text`, for the new or the legacy home.
+    fn write_denylist(profile: &Path, new: bool, text: &str) {
+        let [new_file, legacy_file] = denylist_files_in(profile);
+        let f = if new { new_file } else { legacy_file };
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, text).unwrap();
+    }
+
+    fn load_from(
+        env_new: Option<&str>,
+        env_legacy: Option<&str>,
+        profile: &Path,
+    ) -> Result<Denylist, String> {
+        let files = denylist_files_in(profile);
+        let files: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        load_denylist(env_new.map(Into::into), env_legacy.map(Into::into), &files)
+    }
+
+    #[test] // spec: QA-086
+    fn denylist_files_are_the_new_then_the_legacy_home_folder() {
+        let profile = Path::new(r"C:\Users\Fake");
+        assert_eq!(
+            denylist_files_in(profile),
+            [
+                profile.join(names::HOME_DIR).join("privacy-denylist.txt"),
+                profile
+                    .join(names::LEGACY_HOME_DIR)
+                    .join("privacy-denylist.txt"),
+            ]
+        );
+    }
+
+    #[test] // spec: QA-086
+    fn denylist_env_prefers_the_new_variable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_denylist(tmp.path(), true, "file-entry-new\n");
+        let d = load_from(Some("env-entry-new"), Some("env-entry-old"), tmp.path());
+        assert_eq!(hits_of(&d, "env-entry-new"), vec![1]);
+        assert!(hits_of(&d, "env-entry-old file-entry-new").is_empty());
+        // The new variable, once set, is the denylist: set but empty is refused, not skipped.
+        assert_eq!(
+            load_from(Some(" \n# c\n"), Some("env-entry-old"), tmp.path()).err(),
+            Some(EMPTY_DENYLIST.to_string())
+        );
+        // A legacy value that isn't UTF-8 isn't even looked at when the new one is set.
+        use std::os::windows::ffi::OsStringExt;
+        let bad = OsString::from_wide(&[0xD800]);
+        assert!(load_denylist(Some("env-entry-new".into()), Some(bad.clone()), &[]).is_ok());
+        let e = load_denylist(Some(bad), None, &[]).unwrap_err();
+        assert!(e.contains(names::DENYLIST_ENV), "{e}");
+    }
+
+    #[test] // spec: QA-086
+    fn denylist_env_falls_back_to_the_legacy_variable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_denylist(tmp.path(), true, "file-entry-new\n");
+        let d = load_from(None, Some("# c\nenv-entry-old\n"), tmp.path());
+        assert_eq!(hits_of(&d, "env-entry-old"), vec![1]);
+        assert!(hits_of(&d, "file-entry-new").is_empty());
+        assert_eq!(
+            load_from(None, Some(""), tmp.path()).err(),
+            Some(EMPTY_DENYLIST.to_string())
+        );
+        use std::os::windows::ffi::OsStringExt;
+        let e = load_denylist(None, Some(OsString::from_wide(&[0xD800])), &[]).unwrap_err();
+        assert!(e.contains(names::LEGACY_DENYLIST_ENV), "{e}");
+    }
+
+    #[test] // spec: QA-086
+    fn denylist_file_prefers_the_new_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_denylist(tmp.path(), true, "file-entry-new\n");
+        write_denylist(tmp.path(), false, "file-entry-old\n");
+        let d = load_from(None, None, tmp.path());
+        assert_eq!(hits_of(&d, "file-entry-new"), vec![1]);
+        assert!(hits_of(&d, "file-entry-old").is_empty());
+        // The first file that exists is the denylist: an empty new one is refused, not skipped.
+        write_denylist(tmp.path(), true, "# nothing yet\n");
+        assert_eq!(
+            load_from(None, None, tmp.path()).err(),
+            Some(EMPTY_DENYLIST.to_string())
+        );
+    }
+
+    #[test] // spec: QA-086
+    fn denylist_file_falls_back_to_the_legacy_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_denylist(tmp.path(), false, "file-entry-old\n");
+        let d = load_from(None, None, tmp.path());
+        assert_eq!(hits_of(&d, "file-entry-old"), vec![1]);
+        // Loading never creates the new folder.
+        assert!(!tmp.path().join(names::HOME_DIR).exists());
+    }
+
+    #[test] // spec: QA-086
+    fn no_denylist_anywhere_is_still_a_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_from(None, None, tmp.path()).err(),
+            Some(MISSING_DENYLIST.to_string())
+        );
+        // Empty home folders under both names hold no denylist.
+        std::fs::create_dir_all(tmp.path().join(names::HOME_DIR)).unwrap();
+        std::fs::create_dir_all(tmp.path().join(names::LEGACY_HOME_DIR)).unwrap();
+        assert_eq!(
+            load_from(None, None, tmp.path()).err(),
+            Some(MISSING_DENYLIST.to_string())
+        );
+        // A folder where the new file should be is an error, never a pass or a quiet fallback.
+        write_denylist(tmp.path(), false, "file-entry-old\n");
+        std::fs::create_dir_all(&denylist_files_in(tmp.path())[0]).unwrap();
+        assert!(load_from(None, None, tmp.path()).is_err());
     }
 
     // ---- git fixtures ------------------------------------------------------------------------
