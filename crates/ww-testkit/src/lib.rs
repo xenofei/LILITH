@@ -7,6 +7,7 @@
 //! owner's test parameters ([`params`]) and UTC date helpers ([`utc`]).
 
 pub mod bins;
+pub mod cleanup;
 pub mod clock;
 pub mod core;
 pub mod env;
