@@ -1170,6 +1170,74 @@ impl Store {
         }
     }
 
+    /// The SHA-256 of `rel`, `None` when there is no file. A cloud-only placeholder is never
+    /// read (`store.hash_conflict`, saying to make it available offline), a link is refused
+    /// (`store.path_invalid`) and a folder is `store.io`.
+    ///
+    /// # Errors
+    /// As above, and `store.io` (or `store.busy`) when the file can't be read.
+    pub async fn hash(&self, rel: &WsPath) -> Result<Option<String>, StoreError> {
+        match self
+            .see_hash(&rel.abs(&self.root))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))?
+        {
+            Seen::Missing => Ok(None),
+            Seen::Found(h) => Ok(Some(h.sha256)),
+            Seen::Placeholder => Err(StoreError::cloud_only(rel)),
+            Seen::Link => Err(link_refused(rel)),
+            Seen::Folder => Err(StoreError::Io {
+                path: rel.as_str().to_string(),
+                why: "it is a folder".to_string(),
+            }),
+        }
+    }
+
+    /// Refuses `rel` when it, or any folder above it inside the workspace, is a link (a
+    /// symbolic link, junction or mount point): the write checks only its target (Task 6), so
+    /// a linked parent folder would let a move or a write land outside the workspace. Parts
+    /// that don't exist yet are fine. Attributes and reparse tags only: nothing is followed or
+    /// read.
+    ///
+    /// # Errors
+    /// `store.path_invalid` naming the first linked part; `store.io` when a part's attributes
+    /// can't be read.
+    pub async fn refuse_links(&self, rel: &WsPath) -> Result<(), StoreError> {
+        let mut prefix = String::new();
+        for part in rel.as_str().split('/').filter(|p| !p.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let at = WsPath::from_disk(prefix.clone());
+            let (probe, path) = (self.probe.clone(), at.abs(&self.root));
+            let linked = blocking(move || {
+                let id = match probe.identity(&path) {
+                    Ok(id) => id,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                if id.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                    return Ok(Some(false));
+                }
+                Ok(Some(
+                    probe
+                        .reparse_tag(&path)?
+                        .is_some_and(ww_platform::fs::is_name_surrogate),
+                ))
+            })
+            .await
+            .map_err(|e| StoreError::io(&at, &e))?;
+            match linked {
+                // Nothing deeper exists either.
+                None => return Ok(()),
+                Some(true) => return Err(link_refused(&at)),
+                Some(false) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The bytes an edit starts from: `None` for no file; a placeholder is a conflict.
     async fn read_for_edit(&self, rel: &WsPath) -> Result<Option<Vec<u8>>, StoreError> {
         match self.see_data(rel).await? {

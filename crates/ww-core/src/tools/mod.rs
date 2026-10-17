@@ -1,13 +1,17 @@
 //! The `tools` module (CORE-014): the tool registry and the dispatcher pipeline every
-//! `tools/call` runs through (CORE-015–017), with the stages plan 3 replaces, the product
-//! tools and the test-channel tools.
+//! `tools/call` runs through (CORE-015–017), with the stages plan 3 replaces, the Record stage
+//! (CORE-020), the product tools, the live topics' snapshot providers and the test-channel
+//! tools.
 
 pub mod asset_read_tools;
+pub mod asset_tools;
 pub mod dispatcher;
 pub mod project_tools;
+pub mod record_stage;
 pub mod registry;
 pub mod stages;
 pub mod test_tools;
+pub mod topics;
 pub mod trash_tools;
 pub mod watch_tools;
 pub mod workspace_tools;
@@ -18,8 +22,10 @@ mod tests;
 use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
+pub use asset_tools::register_asset_tools;
 pub use dispatcher::Dispatcher;
 pub use project_tools::register_project_tools;
+pub use record_stage::WorkspaceRecord;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
 pub use stages::{
     CascadeSettings, ConfirmDecision, ConfirmStage, Estimate, EstimateStage, MeterStage,
@@ -27,6 +33,7 @@ pub use stages::{
     SettingsStage,
 };
 pub use test_tools::{TEST_MODULE, TestGates, register_test_tools};
+pub use topics::{AssetSnapshots, ProjectSnapshots, register_snapshots};
 pub use trash_tools::register_trash_tools;
 pub use watch_tools::register_watch_tools;
 pub use workspace_tools::{WORKSPACE_MODULE, register_workspace_tools};
@@ -51,6 +58,7 @@ pub fn core_registry(
     register_workspace_tools(&mut reg, hub.clone(), env.clone(), probe.clone());
     register_trash_tools(&mut reg);
     register_asset_read_tools(&mut reg);
+    register_asset_tools(&mut reg);
     register_watch_tools(&mut reg);
     let all_tools = Arc::new(OnceLock::new());
     register_project_tools(&mut reg, all_tools.clone());

@@ -3,15 +3,6 @@
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
 tests = [
-    { name = "ww-spec-tests::versions_trash::signoff_seals_read_only_version_with_snapshot", rule = "CORE-026", file = "tests/versions_trash.rs" },
-    { name = "ww-spec-tests::versions_trash::signoff_uses_the_confirmed_bump", rule = "CORE-027", file = "tests/versions_trash.rs" },
-    { name = "ww-spec-tests::versions_trash::sealed_ref_carries_the_content_hash", rule = "ARCH-042", file = "tests/versions_trash.rs" },
-    { name = "ww-spec-tests::versions_trash::link_external_asset_cannot_be_signed_off_until_collected", rule = "CORE-029", file = "tests/versions_trash.rs" },
-    { name = "ww-spec-tests::asset_record::import_creates_candidate_run_with_handoff_and_uuid", rule = "CORE-020", file = "tests/asset_record.rs" },
-    { name = "ww-spec-tests::asset_record::request_signoff_sets_in_review", rule = "CORE-053", file = "tests/asset_record.rs" },
-    { name = "ww-spec-tests::asset_record::asset_topic_delivers_events_and_snapshots", rule = "ARCH-044", file = "tests/asset_record.rs" },
-    { name = "ww-spec-tests::asset_record::proj_input_is_recorded_in_project_links", rule = "CORE-019", file = "tests/asset_record.rs" },
-    { name = "ww-spec-tests::asset_record::legacy_manifest_edit_is_a_minimal_diff", rule = "ARCH-076", file = "tests/asset_record.rs" },
     { name = "ww-spec-tests::doctor::doctor_fixes_git_config_and_gitignore_then_changes_nothing", rule = "CORE-040", file = "tests/doctor.rs" },
     { name = "ww-spec-tests::doctor::doctor_sets_damaged_state_db_aside_only_after_yes", rule = "CORE-004", file = "tests/doctor.rs" },
     { name = "ww-spec-tests::doctor::non_interactive_doctor_never_moves_state_db", rule = "CORE-004", file = "tests/doctor.rs" },

@@ -95,9 +95,15 @@ impl MeterStage for Recording {
 }
 
 impl RecordStage for Recording {
-    fn record(&self, s: &Session, d: &ToolDescriptor, out: &mut Outcome<ToolOutput>) {
+    fn record<'a>(
+        &'a self,
+        ctx: &'a CallCtx,
+        d: &'a ToolDescriptor,
+        plan: Option<crate::pipeline::RecordPlan>,
+        out: &'a mut Outcome<ToolOutput>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         self.log.push("record");
-        self.plan2.record.record(s, d, out);
+        self.plan2.record.record(ctx, d, plan, out)
     }
 }
 

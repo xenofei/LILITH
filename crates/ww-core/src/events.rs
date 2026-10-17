@@ -3,7 +3,8 @@
 //!
 //! - **Sequences.** Each topic's `seq` starts at 1 and goes up by one per [`EventBus::publish`].
 //! - **History.** Each topic keeps its events for [`HISTORY_SECS`] of *monotonic* time (a
-//!   wall-clock jump changes nothing), pruned on publish and on subscribe (CORE-012).
+//!   wall-clock jump changes nothing) and at most its [`HISTORY_MAX_EVENTS`] newest events
+//!   (ARCH-032 clarification), pruned on publish and on subscribe (CORE-012).
 //! - **Subscribing with a cursor `s`.** `s` equal to the topic's current seq replays nothing;
 //!   a history that still holds `s+1..=current` replays those events in order; anything else
 //!   (older than the history, or beyond the current seq, such as a cursor from an earlier
@@ -11,6 +12,16 @@
 //!   or else one `resync_required`. No cursor means live events only. A topic the client
 //!   already subscribes to ignores its cursor, and a replay that overflows the queue stops
 //!   (the resyncs cover it).
+//! - **Snapshots** are computed outside every lock ([`EventBus::subscribe`]):
+//!   1. under the bus lock, the topics are recorded, the replays the history covers are
+//!      queued, and each topic that needs a snapshot is marked *pending* for the client with
+//!      `s0`, its current seq. A pending topic's live events stay in the history and are not
+//!      queued;
+//!   2. each provider is awaited with no lock held;
+//!   3. under the bus lock again, if the client still subscribes to the topic (and it is still
+//!      pending from this call), the snapshot is queued at seq `s0`, then the history's events
+//!      after `s0` (or `resync_required` when the history no longer holds them all), and the
+//!      topic stops being pending.
 //! - **Delivery.** Each client has its own queue of at most [`CLIENT_QUEUE`] events, separate
 //!   from the connection's outbound channel that responses share. A forwarder task per client
 //!   moves events from the queue into that channel in order, as `ww/event` lines; only it
@@ -26,10 +37,13 @@
 //!
 //! **Locks.** One `std` mutex guards the topics and the clients; each client's queue has its
 //! own, taken after the bus lock when both are needed. Nothing is awaited while either is
-//! held. A [`SnapshotProvider`] runs under the bus lock, so the snapshot and the sequence it is
-//! labelled with agree; a provider must not call back into the bus.
+//! held: a [`SnapshotProvider`] runs with no lock held (it may read the workspace, and a
+//! publish to any client goes on meanwhile), and the events published while it ran follow
+//! its snapshot in order.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -38,17 +52,17 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use ww_platform::Clock;
 use ww_protocol::{
-    CLIENT_QUEUE, EventKind, EventParams, HISTORY_SECS, TopicState, encode_notification, fits_line,
-    method,
+    CLIENT_QUEUE, EventKind, EventParams, HISTORY_MAX_EVENTS, HISTORY_SECS, TopicState,
+    encode_notification, fits_line, method,
 };
 
 /// A client of the bus: the connection's `ConnCtx::conn_id`.
 pub type ClientId = u64;
 
 /// Gives the current state of a topic, for a subscriber whose cursor the history no longer
-/// covers. It runs under the bus lock and must not call back into the bus.
+/// covers. It runs with no bus lock held (module docs).
 pub trait SnapshotProvider: Send + Sync {
-    fn snapshot(&self, topic: &str) -> Value;
+    fn snapshot<'a>(&'a self, topic: &'a str) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
 }
 
 /// The core's event bus (module docs).
@@ -63,6 +77,8 @@ struct Inner {
     clients: HashMap<ClientId, Client>,
     /// `(topic prefix, provider)`.
     providers: Vec<(String, Arc<dyn SnapshotProvider>)>,
+    /// The last token handed to a pending snapshot.
+    tokens: u64,
 }
 
 /// One topic: its current seq and its retained events, oldest first, with consecutive seqs.
@@ -80,6 +96,16 @@ struct Retained {
     line: Arc<str>,
 }
 
+/// A snapshot [`EventBus::subscribe`] computes outside the lock.
+struct Wanted {
+    topic: String,
+    /// The topic's seq when the subscription began: the snapshot's label.
+    s0: u64,
+    /// Matches the client's pending mark only if nothing unsubscribed it meanwhile.
+    token: u64,
+    provider: Arc<dyn SnapshotProvider>,
+}
+
 /// One queued `ww/event`.
 #[derive(Clone)]
 struct Queued {
@@ -89,6 +115,9 @@ struct Queued {
 
 struct Client {
     topics: BTreeSet<String>,
+    /// Topics whose snapshot a `subscribe` is computing, with that call's token: their live
+    /// events wait in the history until the snapshot is queued.
+    snapshots: HashMap<String, u64>,
     pending: Arc<Pending>,
     /// Stops the forwarder, once one is attached.
     forwarder: Option<CancellationToken>,
@@ -112,6 +141,7 @@ impl Client {
     fn new() -> Client {
         Client {
             topics: BTreeSet::new(),
+            snapshots: HashMap::new(),
             pending: Arc::new(Pending::default()),
             forwarder: None,
         }
@@ -183,7 +213,7 @@ impl EventBus {
             line,
         };
         for (id, client) in &inner.clients {
-            if client.topics.contains(topic) {
+            if client.topics.contains(topic) && !client.snapshots.contains_key(topic) {
                 let overflowed = {
                     let mut queue = client.pending.lock();
                     enqueue(&mut queue, item.clone(), &client.topics, &inner.topics)
@@ -220,13 +250,94 @@ impl EventBus {
     /// (no replay, snapshot or resync), so nothing it has queued or received is repeated. All
     /// new topics join the client's set before any replay is queued, so if a replay overflows
     /// the queue, the `resync_required` events cover every one of them; nothing more of the
-    /// replay is queued after that.
-    pub fn subscribe(
+    /// replay is queued after that. Snapshots are awaited with no lock held, then queued at the
+    /// seq the topic had when this call began, followed by what was published meanwhile.
+    pub async fn subscribe(
         &self,
         client: ClientId,
         topics: &[String],
         since: &BTreeMap<String, u64>,
     ) -> Vec<TopicState> {
+        let (states, wanted) = self.subscribe_locked(client, topics, since);
+        if wanted.is_empty() {
+            return states;
+        }
+        // 2. The providers, with no lock held.
+        let mut taken = Vec::with_capacity(wanted.len());
+        for want in wanted {
+            let data = want.provider.snapshot(&want.topic).await;
+            taken.push((want, data));
+        }
+        // 3. Queue each snapshot the client still waits for, then what came after it.
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let Some(entry) = inner.clients.get_mut(&client) else {
+            return states; // dropped meanwhile
+        };
+        let mut queue = entry.pending.lock();
+        let mut overflowed = false;
+        for (want, data) in taken {
+            if entry.snapshots.get(&want.topic) != Some(&want.token) {
+                continue; // unsubscribed (and maybe subscribed again) meanwhile
+            }
+            entry.snapshots.remove(&want.topic);
+            if overflowed || !entry.topics.contains(&want.topic) {
+                continue;
+            }
+            let shared: Arc<str> = Arc::from(want.topic.as_str());
+            let mut items = vec![Queued {
+                topic: shared.clone(),
+                line: event_line(&want.topic, want.s0, EventKind::Snapshot, data),
+            }];
+            let log = inner.topics.get(&want.topic);
+            let current = log.map_or(0, |l| l.seq);
+            if current > want.s0 {
+                let covered = log
+                    .and_then(|l| l.history.front())
+                    .is_some_and(|first| first.seq <= want.s0 + 1);
+                if covered {
+                    let history = log.map(|l| &l.history).into_iter().flatten();
+                    items.extend(history.filter(|r| r.seq > want.s0).map(|r| Queued {
+                        topic: shared.clone(),
+                        line: r.line.clone(),
+                    }));
+                } else {
+                    items.push(Queued {
+                        topic: shared.clone(),
+                        line: event_line(
+                            &want.topic,
+                            current,
+                            EventKind::ResyncRequired,
+                            Value::Null,
+                        ),
+                    });
+                }
+            }
+            for item in items {
+                if enqueue(&mut queue, item, &entry.topics, &inner.topics) {
+                    tracing::info!(
+                        client,
+                        topic = want.topic.as_str(),
+                        "a client's event queue overflowed after a snapshot; it gets resync_required"
+                    );
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        drop(queue);
+        entry.pending.wake.notify_one();
+        states
+    }
+
+    /// [`EventBus::subscribe`]'s first step, under the bus lock: the states, the replays the
+    /// history covers (queued), and the snapshots to compute (their topics marked pending).
+    fn subscribe_locked(
+        &self,
+        client: ClientId,
+        topics: &[String],
+        since: &BTreeMap<String, u64>,
+    ) -> (Vec<TopicState>, Vec<Wanted>) {
         let now = self.clock.monotonic();
         let mut guard = self.lock();
         let inner = &mut *guard;
@@ -253,7 +364,9 @@ impl EventBus {
                 fresh.push(topic);
             }
         }
-        // 2. Replay from the cursors of the new topics, until the queue overflows.
+        // 2. Replay from the cursors of the new topics, until the queue overflows; mark the
+        // topics that need a snapshot as pending.
+        let mut wanted = Vec::new();
         let mut queue = entry.pending.lock();
         'topics: for topic in fresh {
             let Some(&cursor) = since.get(topic) else {
@@ -284,14 +397,22 @@ impl EventBus {
                     .iter()
                     .filter(|(prefix, _)| topic.starts_with(prefix.as_str()))
                     .max_by_key(|(prefix, _)| prefix.len());
-                let (kind, data) = match provider {
-                    Some((_, p)) => (EventKind::Snapshot, p.snapshot(topic)),
-                    None => (EventKind::ResyncRequired, Value::Null),
-                };
-                items.push(Queued {
-                    topic: shared_topic,
-                    line: event_line(topic, current, kind, data),
-                });
+                match provider {
+                    Some((_, p)) => {
+                        inner.tokens += 1;
+                        entry.snapshots.insert(topic.clone(), inner.tokens);
+                        wanted.push(Wanted {
+                            topic: topic.clone(),
+                            s0: current,
+                            token: inner.tokens,
+                            provider: p.clone(),
+                        });
+                    }
+                    None => items.push(Queued {
+                        topic: shared_topic,
+                        line: event_line(topic, current, EventKind::ResyncRequired, Value::Null),
+                    }),
+                }
             }
             for item in items {
                 if enqueue(&mut queue, item, &entry.topics, &inner.topics) {
@@ -307,7 +428,7 @@ impl EventBus {
         }
         drop(queue);
         entry.pending.wake.notify_one();
-        states
+        (states, wanted)
     }
 
     /// Unsubscribes `client` from `topics` and drops its queued events of those topics.
@@ -322,6 +443,9 @@ impl EventBus {
             .filter(|t| entry.topics.remove(t.as_str()))
             .cloned()
             .collect();
+        for topic in &removed {
+            entry.snapshots.remove(topic);
+        }
         if !removed.is_empty() {
             entry
                 .pending
@@ -404,13 +528,17 @@ fn enqueue(
     true
 }
 
-/// Drops the events older than [`HISTORY_SECS`] of monotonic time at `now`.
+/// Drops the events older than [`HISTORY_SECS`] of monotonic time at `now`, then the oldest
+/// beyond [`HISTORY_MAX_EVENTS`].
 fn prune(history: &mut VecDeque<Retained>, now: Duration) {
     let keep = Duration::from_secs(HISTORY_SECS);
     while history
         .front()
         .is_some_and(|r| now.saturating_sub(r.at) > keep)
     {
+        history.pop_front();
+    }
+    while history.len() > HISTORY_MAX_EVENTS {
         history.pop_front();
     }
 }
@@ -544,13 +672,16 @@ mod tests {
     struct Fixed(&'static str);
 
     impl SnapshotProvider for Fixed {
-        fn snapshot(&self, topic: &str) -> Value {
-            json!({"provider": self.0, "topic": topic})
+        fn snapshot<'a>(
+            &'a self,
+            topic: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
+            Box::pin(async move { json!({"provider": self.0, "topic": topic}) })
         }
     }
 
-    #[test] // spec: ARCH-032
-    fn seq_is_per_topic_and_monotonic() {
+    #[tokio::test] // spec: ARCH-032
+    async fn seq_is_per_topic_and_monotonic() {
         let (_clock, bus) = bus();
         assert_eq!(bus.publish("test:a", json!(1)), 1);
         assert_eq!(bus.publish("test:a", json!(2)), 2);
@@ -558,7 +689,9 @@ mod tests {
         assert_eq!(bus.publish("test:a", json!(3)), 3);
         assert_eq!(bus.publish("test:b", json!(2)), 2);
         // `ww/subscribe` reports each topic's current seq; a topic never published is at 0.
-        let states = bus.subscribe(1, &names(&["test:a", "test:b", "jobs"]), &cursors(&[]));
+        let states = bus
+            .subscribe(1, &names(&["test:a", "test:b", "jobs"]), &cursors(&[]))
+            .await;
         assert_eq!(
             states,
             [state("test:a", 3), state("test:b", 2), state("jobs", 0)]
@@ -576,15 +709,17 @@ mod tests {
         );
     }
 
-    #[test] // spec: ARCH-032, CORE-012
-    fn replay_from_cursor() {
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn replay_from_cursor() {
         let (clock, bus) = bus();
         for n in 1..=3 {
             bus.publish("test:a", json!({"n": n}));
             clock.advance(Duration::from_secs(10));
         }
         // A cursor inside the history replays what came after it, in order.
-        let states = bus.subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 1)]));
+        let states = bus
+            .subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 1)]))
+            .await;
         assert_eq!(states, [state("test:a", 3)]);
         assert_eq!(
             bus.queued_events(1),
@@ -594,12 +729,14 @@ mod tests {
             ]
         );
         // A cursor of 0 replays everything retained.
-        bus.subscribe(2, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        bus.subscribe(2, &names(&["test:a"]), &cursors(&[("test:a", 0)]))
+            .await;
         let seqs: Vec<u64> = bus.queued_events(2).iter().map(|e| e.seq).collect();
         assert_eq!(seqs, [1, 2, 3]);
         // A cursor at the current seq replays nothing; neither does no cursor.
-        bus.subscribe(3, &names(&["test:a"]), &cursors(&[("test:a", 3)]));
-        bus.subscribe(4, &names(&["test:a"]), &cursors(&[]));
+        bus.subscribe(3, &names(&["test:a"]), &cursors(&[("test:a", 3)]))
+            .await;
+        bus.subscribe(4, &names(&["test:a"]), &cursors(&[])).await;
         assert_eq!(bus.queued(3), 0);
         assert_eq!(bus.queued(4), 0);
         // Live events follow the replay.
@@ -610,8 +747,8 @@ mod tests {
         assert_eq!(bus.queued(4), 1);
     }
 
-    #[test] // spec: ARCH-032, CORE-012
-    fn cursor_older_than_ten_minutes_gets_snapshot() {
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn cursor_older_than_ten_minutes_gets_snapshot() {
         let (clock, bus) = bus();
         bus.register_snapshot("test:", Arc::new(Fixed("test")));
         bus.register_snapshot("test:a", Arc::new(Fixed("test:a")));
@@ -621,11 +758,13 @@ mod tests {
         clock.advance(Duration::from_secs(601));
         // The history no longer covers seq 2: one snapshot, at the current seq, from the
         // provider with the longest matching prefix.
-        let states = bus.subscribe(
-            1,
-            &names(&["test:a", "test:b"]),
-            &cursors(&[("test:a", 1), ("test:b", 0)]),
-        );
+        let states = bus
+            .subscribe(
+                1,
+                &names(&["test:a", "test:b"]),
+                &cursors(&[("test:a", 1), ("test:b", 0)]),
+            )
+            .await;
         assert_eq!(states, [state("test:a", 2), state("test:b", 1)]);
         assert_eq!(
             bus.queued_events(1),
@@ -648,8 +787,8 @@ mod tests {
         assert_eq!(bus.publish("test:a", json!(3)), 3);
     }
 
-    #[test] // spec: ARCH-032, CORE-012
-    fn cursor_older_without_provider_gets_resync_required() {
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn cursor_older_without_provider_gets_resync_required() {
         let (clock, bus) = bus();
         bus.register_snapshot("other:", Arc::new(Fixed("other")));
         bus.publish("jobs", json!(1));
@@ -657,29 +796,33 @@ mod tests {
         clock.advance(Duration::from_secs(601));
         bus.publish("jobs", json!(3));
         // Seq 3 is retained, seq 2 is not: the cursor 1 is not covered.
-        bus.subscribe(1, &names(&["jobs"]), &cursors(&[("jobs", 1)]));
+        bus.subscribe(1, &names(&["jobs"]), &cursors(&[("jobs", 1)]))
+            .await;
         assert_eq!(
             bus.queued_events(1),
             [event("jobs", 3, EventKind::ResyncRequired, Value::Null)]
         );
         // The cursor 2 is: seq 3 is replayed.
-        bus.subscribe(2, &names(&["jobs"]), &cursors(&[("jobs", 2)]));
+        bus.subscribe(2, &names(&["jobs"]), &cursors(&[("jobs", 2)]))
+            .await;
         assert_eq!(
             bus.queued_events(2),
             [event("jobs", 3, EventKind::Event, json!(3))]
         );
     }
 
-    #[test] // spec: ARCH-032
-    fn cursor_from_the_future_gets_resync_required() {
+    #[tokio::test] // spec: ARCH-032
+    async fn cursor_from_the_future_gets_resync_required() {
         let (_clock, bus) = bus();
         bus.publish("test:a", json!(1));
         // A cursor from an earlier core instance: beyond the current seq.
-        let states = bus.subscribe(
-            1,
-            &names(&["test:a", "test:new"]),
-            &cursors(&[("test:a", 5), ("test:new", 2)]),
-        );
+        let states = bus
+            .subscribe(
+                1,
+                &names(&["test:a", "test:new"]),
+                &cursors(&[("test:a", 5), ("test:new", 2)]),
+            )
+            .await;
         assert_eq!(states, [state("test:a", 1), state("test:new", 0)]);
         assert_eq!(
             bus.queued_events(1),
@@ -696,7 +839,8 @@ mod tests {
         // An outbound channel of capacity 1 whose receiver is never read.
         let (tx, _rx) = mpsc::channel(1);
         bus.attach(7, tx);
-        bus.subscribe(7, &names(&["test:a", "test:b"]), &cursors(&[]));
+        bus.subscribe(7, &names(&["test:a", "test:b"]), &cursors(&[]))
+            .await;
         // Two events leave the bus queue: one fills the channel, the forwarder holds the other
         // in a `send` that never completes.
         bus.publish("test:a", json!(1));
@@ -731,7 +875,7 @@ mod tests {
         // The connection's own sender, which responses use.
         let responses = tx.clone();
         bus.attach(3, tx);
-        bus.subscribe(3, &names(&["test:a"]), &cursors(&[]));
+        bus.subscribe(3, &names(&["test:a"]), &cursors(&[])).await;
         bus.publish("test:a", json!(0));
         drained(&bus, 3).await;
         // Seq 1 fills the channel. Overflow the client's bus queue with seqs 2..=1026;
@@ -779,7 +923,8 @@ mod tests {
         let (_clock, bus) = bus();
         let (tx, mut rx) = mpsc::channel(16);
         bus.attach(5, tx);
-        bus.subscribe(5, &names(&["test:a", "test:b"]), &cursors(&[]));
+        bus.subscribe(5, &names(&["test:a", "test:b"]), &cursors(&[]))
+            .await;
         bus.publish("test:a", json!("a1"));
         assert_eq!(parse_line(&next_line(&mut rx).await.unwrap()).seq, 1);
 
@@ -802,7 +947,7 @@ mod tests {
         let (_clock, bus) = bus();
         let (tx, mut rx) = mpsc::channel(16);
         bus.attach(6, tx);
-        bus.subscribe(6, &names(&["test:a"]), &cursors(&[]));
+        bus.subscribe(6, &names(&["test:a"]), &cursors(&[])).await;
 
         // An event whose line would pass the 4 MiB cap is never sent: the subscriber gets
         // resync_required for its topic and seq instead, and later events flow as usual.
@@ -820,7 +965,8 @@ mod tests {
         );
 
         // A replay from the history gets the same replacement.
-        bus.subscribe(7, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        bus.subscribe(7, &names(&["test:a"]), &cursors(&[("test:a", 0)]))
+            .await;
         assert_eq!(
             bus.queued_events(7),
             [
@@ -830,10 +976,11 @@ mod tests {
         );
     }
 
-    #[test] // spec: ARCH-032
-    fn unsubscribe_drops_queued_events_of_removed_topics() {
+    #[tokio::test] // spec: ARCH-032
+    async fn unsubscribe_drops_queued_events_of_removed_topics() {
         let (_clock, bus) = bus();
-        bus.subscribe(1, &names(&["test:a", "test:b"]), &cursors(&[]));
+        bus.subscribe(1, &names(&["test:a", "test:b"]), &cursors(&[]))
+            .await;
         bus.publish("test:a", json!(1));
         bus.publish("test:b", json!(1));
         bus.unsubscribe(1, &names(&["test:a"]));
@@ -848,7 +995,8 @@ mod tests {
         let (_clock, bus) = bus();
         let (tx, mut rx) = mpsc::channel(16);
         bus.attach(9, tx);
-        bus.subscribe(9, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        bus.subscribe(9, &names(&["test:a"]), &cursors(&[("test:a", 0)]))
+            .await;
         bus.drop_client(9);
         // Its forwarder has stopped: it dropped the only sender, so the channel ends.
         assert_eq!(next_line(&mut rx).await, None);
@@ -878,11 +1026,11 @@ mod tests {
         .expect("the forwarder did not end");
     }
 
-    #[test] // spec: ARCH-032
-    fn replay_overflow_leaves_only_resync_required_once_per_topic() {
+    #[tokio::test] // spec: ARCH-032
+    async fn replay_overflow_leaves_only_resync_required_once_per_topic() {
         let (_clock, bus) = bus();
         // The queue is 3 short of full with live `test:b` events.
-        bus.subscribe(1, &names(&["test:b"]), &cursors(&[]));
+        bus.subscribe(1, &names(&["test:b"]), &cursors(&[])).await;
         for n in 0..CLIENT_QUEUE - 3 {
             bus.publish("test:b", json!(n));
         }
@@ -894,11 +1042,13 @@ mod tests {
         assert_eq!(bus.queued(1), CLIENT_QUEUE - 3);
         // Replaying ten `test:a` events overflows it on the fourth; the replay stops there,
         // and `test:c`, later in the same call, replays nothing either (P9).
-        let states = bus.subscribe(
-            1,
-            &names(&["test:a", "test:c"]),
-            &cursors(&[("test:a", 0), ("test:c", 0)]),
-        );
+        let states = bus
+            .subscribe(
+                1,
+                &names(&["test:a", "test:c"]),
+                &cursors(&[("test:a", 0), ("test:c", 0)]),
+            )
+            .await;
         assert_eq!(states, [state("test:a", 10), state("test:c", 2)]);
         assert_eq!(
             bus.queued_events(1),
@@ -913,10 +1063,10 @@ mod tests {
         assert_eq!(bus.queued(1), 4);
     }
 
-    #[test] // spec: ARCH-032
-    fn resubscribing_does_not_replay_a_topic_already_subscribed() {
+    #[tokio::test] // spec: ARCH-032
+    async fn resubscribing_does_not_replay_a_topic_already_subscribed() {
         let (_clock, bus) = bus();
-        bus.subscribe(1, &names(&["test:a"]), &cursors(&[]));
+        bus.subscribe(1, &names(&["test:a"]), &cursors(&[])).await;
         for n in 1..=3 {
             bus.publish("test:a", json!(n));
         }
@@ -924,11 +1074,13 @@ mod tests {
         assert_eq!(bus.queued(1), 3);
         // `test:a` is subscribed already: its cursor (and a future one) replays nothing, but its
         // state is reported. `test:b` is new and replays from its cursor.
-        let states = bus.subscribe(
-            1,
-            &names(&["test:a", "test:b"]),
-            &cursors(&[("test:a", 0), ("test:b", 0)]),
-        );
+        let states = bus
+            .subscribe(
+                1,
+                &names(&["test:a", "test:b"]),
+                &cursors(&[("test:a", 0), ("test:b", 0)]),
+            )
+            .await;
         assert_eq!(states, [state("test:a", 3), state("test:b", 1)]);
         let seen: Vec<(String, u64, EventKind)> = bus
             .queued_events(1)
@@ -944,33 +1096,38 @@ mod tests {
                 ("test:b".to_string(), 1, EventKind::Event),
             ]
         );
-        let states = bus.subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 99)]));
+        let states = bus
+            .subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 99)]))
+            .await;
         assert_eq!(states, [state("test:a", 3)]);
         assert_eq!(bus.queued(1), 4);
     }
 
-    #[test] // spec: CORE-012, QA-031
-    fn utc_jump_does_not_expire_history() {
+    #[tokio::test] // spec: CORE-012, QA-031
+    async fn utc_jump_does_not_expire_history() {
         let (clock, bus) = bus();
         bus.publish("test:a", json!(1));
         clock.advance(Duration::from_secs(599));
         // The wall clock jumps back, then far ahead; only monotonic time counts.
         clock.shift_utc(-3600);
-        bus.subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        bus.subscribe(1, &names(&["test:a"]), &cursors(&[("test:a", 0)]))
+            .await;
         assert_eq!(
             bus.queued_events(1),
             [event("test:a", 1, EventKind::Event, json!(1))]
         );
         clock.shift_utc(7200);
         bus.publish("test:b", json!(1));
-        bus.subscribe(2, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        bus.subscribe(2, &names(&["test:a"]), &cursors(&[("test:a", 0)]))
+            .await;
         assert_eq!(
             bus.queued_events(2),
             [event("test:a", 1, EventKind::Event, json!(1))]
         );
         // Past 600 s of monotonic time it is gone.
         clock.advance(Duration::from_secs(2));
-        bus.subscribe(3, &names(&["test:a"]), &cursors(&[("test:a", 0)]));
+        bus.subscribe(3, &names(&["test:a"]), &cursors(&[("test:a", 0)]))
+            .await;
         assert_eq!(
             bus.queued_events(3),
             [event("test:a", 1, EventKind::ResyncRequired, Value::Null)]

@@ -157,7 +157,8 @@ impl Store {
     ///
     /// # Errors
     /// `workspace.read_only` on a read-only store; `store.path_invalid` for an output that
-    /// isn't in a staging handle or a target the store never writes; `store.hash_conflict`
+    /// isn't in a staging handle, a target the store never writes, or one under a linked
+    /// folder; `store.hash_conflict`
     /// when a file is already at an output's target; any error of the steps. An error after
     /// step 1 leaves the outputs in place (orphans until the manifest records them).
     pub async fn commit(&self, op: CommitOp) -> Result<CommitReport, StoreError> {
@@ -182,6 +183,8 @@ impl Store {
             }
             writable(&out.to)?;
             self.writable_on_disk(&out.to).await?;
+            // The move checks only its target: a linked folder above it is refused here.
+            self.refuse_links(&out.to).await?;
             let _held = self.lock_path(&out.to).await;
             let target = out.to.abs(self.root());
             let (from, to) = (out.from.clone(), target.clone());

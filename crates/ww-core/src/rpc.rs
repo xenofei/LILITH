@@ -35,9 +35,10 @@
 //!
 //! **Events** (ARCH-032). A connection is attached to the event bus (its forwarder started on
 //! the connection's outbound channel) when its session is established, and dropped from it in
-//! [`Router::closed`]. A subscription is made under the connection-map lock, and `closed`
-//! drops the client under it too, so a `ww/subscribe` still running when its connection closes
-//! cannot leave a forgotten client in the bus. A topic that is not a valid name, or a
+//! [`Router::closed`]. `closed` drops the client under the connection-map lock; a
+//! `ww/subscribe` awaits the bus (its snapshots read the workspace) with no lock held, then
+//! checks the map under the lock and drops the client again if its connection closed
+//! meanwhile, so it cannot leave a forgotten client in the bus. A topic that is not a valid name, or a
 //! `since_seq` cursor for a topic not in `topics`, is -32602; the results are
 //! `Outcome<SubscribeResult>` and `Outcome<UnsubscribeResult>`.
 //!
@@ -266,7 +267,7 @@ impl RpcRouter {
                 }
             }
             (ConnState::Ready(_), method::DRAIN) => return self.drain(conn, id, req.params).await,
-            (ConnState::Ready(_), method::SUBSCRIBE) => self.subscribe(conn, id, req.params),
+            (ConnState::Ready(_), method::SUBSCRIBE) => self.subscribe(conn, id, req.params).await,
             (ConnState::Ready(_), method::UNSUBSCRIBE) => self.unsubscribe(conn, id, req.params),
             (ConnState::Ready(session), m) if m.starts_with(method::APP_PREFIX) => {
                 match session.caller {
@@ -464,8 +465,10 @@ impl RpcRouter {
         None
     }
 
-    /// `ww/subscribe` (ARCH-032).
-    fn subscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
+    /// `ww/subscribe` (ARCH-032). The bus is awaited with no connection lock held (its
+    /// snapshots read the workspace); a connection that closed meanwhile is dropped from the
+    /// bus again under the map lock, so no forgotten client stays behind.
+    async fn subscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
         let p: SubscribeParams = match parse_params(params).and_then(|p: SubscribeParams| {
             check_topics(&p.topics)?;
             match p.since_seq.keys().find(|t| !p.topics.contains(t)) {
@@ -484,14 +487,22 @@ impl RpcRouter {
                 };
             }
         };
-        let topics = {
+        let open = self.conns().contains_key(&conn.conn_id);
+        let topics = if open {
+            let topics = self
+                .events
+                .subscribe(conn.conn_id, &p.topics, &p.since_seq)
+                .await;
             let conns = self.conns();
-            if conns.contains_key(&conn.conn_id) {
-                self.events.subscribe(conn.conn_id, &p.topics, &p.since_seq)
-            } else {
-                // Closed meanwhile: nothing to subscribe, and nobody reads the reply.
-                Vec::new()
+            if !conns.contains_key(&conn.conn_id) {
+                // Closed while the bus worked: `closed` may have dropped the client before the
+                // subscription re-created it.
+                self.events.drop_client(conn.conn_id);
             }
+            topics
+        } else {
+            // Closed meanwhile: nothing to subscribe, and nobody reads the reply.
+            Vec::new()
         };
         outcome(id, Outcome::Ok(SubscribeResult { topics }))
     }

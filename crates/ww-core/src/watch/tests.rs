@@ -82,7 +82,7 @@ async fn published(events: &EventBus, topic: &str) -> Vec<Value> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     events.attach(client, tx);
     let since = [(topic.to_string(), 0)].into_iter().collect();
-    let states = events.subscribe(client, &[topic.to_string()], &since);
+    let states = events.subscribe(client, &[topic.to_string()], &since).await;
     let mut out = Vec::new();
     for _ in 0..states[0].seq {
         let line = tokio::time::timeout(DEADLINE, rx.recv())

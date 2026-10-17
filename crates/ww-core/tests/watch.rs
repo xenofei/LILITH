@@ -262,7 +262,7 @@ async fn published(events: &EventBus, topic: &str) -> Vec<Value> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
     events.attach(client, tx);
     let since = [(topic.to_string(), 0)].into_iter().collect();
-    let states = events.subscribe(client, &[topic.to_string()], &since);
+    let states = events.subscribe(client, &[topic.to_string()], &since).await;
     let mut out = Vec::new();
     for _ in 0..states[0].seq {
         let line = tokio::time::timeout(DEADLINE, rx.recv())
@@ -641,7 +641,9 @@ async fn post_git_human_edit_is_recorded_without_waiting_for_the_gate() {
         "workspace".to_string(),
         format!("asset:ww://{ws_id}/sketchbook/{CRANE}"),
     ];
-    events.subscribe(9_000, &topics, &std::collections::BTreeMap::new());
+    events
+        .subscribe(9_000, &topics, &std::collections::BTreeMap::new())
+        .await;
     let finished = tokio::time::Instant::now();
     ops.finish();
     let mut order = Vec::new();
@@ -726,11 +728,13 @@ async fn checkout_of_3000_files_overflows_then_rescans_without_false_human_edits
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     core.events.attach(9_001, tx);
-    core.events.subscribe(
-        9_001,
-        &["workspace".to_string()],
-        &std::collections::BTreeMap::new(),
-    );
+    core.events
+        .subscribe(
+            9_001,
+            &["workspace".to_string()],
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
     let ops = GitOps::begin(&core.ws);
     for k in 0..PLAIN {
         ops.write(&format!("notes/n{k:04}.txt"), &new(k, "plain"));

@@ -100,6 +100,7 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         events,
         workspace: None,
         project: None,
+        record: Arc::new(ww_core::pipeline::RecordSlot::new()),
     };
 
     // 4. Creating a new subfolder of that workspace trips the guard before the folder exists.

@@ -11,9 +11,11 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ww_platform::fs::{RetryClass, classify};
+
 use super::fsops;
 use super::paths::WsPath;
-use super::write::{Store, StoreError, blocking};
+use super::write::{Seen, Store, StoreError, blocking};
 
 /// The staging folder, workspace-relative.
 pub const STAGING_DIR: &str = ".worldwright/staging";
@@ -158,6 +160,113 @@ impl Store {
                     why: format!("the staging handle can't be removed: {e}"),
                 })
             }
+        }
+    }
+
+    /// Copies the file `from` (outside the store's write path, such as a file to import) into
+    /// the live handle `h` as `name`, with `CopyFile2(COPY_FILE_FAIL_IF_EXISTS)`, so nothing is
+    /// ever overwritten, and returns the staged path and the SHA-256 of the staged copy (not of
+    /// the source, which may change meanwhile; CORE-023). Sharing violations are retried under
+    /// the store's budget.
+    ///
+    /// # Errors
+    /// `store.path_invalid` for a handle that isn't a live staging handle of this workspace, a
+    /// `name` that isn't one path component, or a source that is a link or a folder;
+    /// `store.hash_conflict` when `name` is already in the handle (nothing is overwritten);
+    /// the errors of [`Store::hash_outside`] for the source; `store.io` (`store.busy`,
+    /// `store.disk_full`) for a failed copy or read.
+    pub async fn stage_copy(
+        &self,
+        h: &StagingHandle,
+        from: &Path,
+        name: &str,
+    ) -> Result<(PathBuf, String), StoreError> {
+        self.writable_store()?;
+        let live = self
+            .live_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&h.id);
+        if !live || h.dir != self.staging_root().join(&h.id) {
+            return Err(StoreError::PathInvalid {
+                path: h.dir.display().to_string(),
+                why: "it is not a live staging handle of this workspace".to_string(),
+            });
+        }
+        let staged_rel = WsPath::parse(&format!("{STAGING_DIR}/{}/{name}", h.id))?;
+        if name.is_empty() || name.contains('/') {
+            return Err(StoreError::PathInvalid {
+                path: name.to_string(),
+                why: "a staged file name is one path component".to_string(),
+            });
+        }
+        // The source must be a local file that is not a link (never read through one).
+        self.hash_outside(from).await?;
+        let to = h.dir.join(name);
+        let (src, dst) = (from.to_path_buf(), to.clone());
+        self.fs_retry(None, move || fsops::copy_new(&src, &dst).map(drop))
+            .await
+            .map_err(|e| match classify(&e) {
+                RetryClass::TargetExists => StoreError::HashConflict {
+                    path: staged_rel.clone(),
+                    backup: None,
+                    cloud_only: false,
+                    kept: Vec::new(),
+                },
+                _ => StoreError::io(&staged_rel, &e),
+            })?;
+        match self
+            .see_hash(&to)
+            .await
+            .map_err(|e| StoreError::io(&staged_rel, &e))?
+        {
+            Seen::Found(h) => Ok((to, h.sha256)),
+            _ => Err(StoreError::Io {
+                path: staged_rel.as_str().to_string(),
+                why: "the staged copy can't be read back".to_string(),
+            }),
+        }
+    }
+
+    /// The SHA-256 of a file named by an absolute path that may be outside the workspace (a
+    /// link-external file, a file to import), read through the probe: the attributes first,
+    /// so a link is never followed and a cloud-only placeholder never downloaded.
+    ///
+    /// # Errors
+    /// `store.path_invalid` for a relative path, a link, a folder or a cloud-only placeholder
+    /// (with what to do); `store.io` when there is no file or it can't be read (`store.busy`
+    /// while another program holds it).
+    pub async fn hash_outside(&self, path: &Path) -> Result<String, StoreError> {
+        let shown = path.display().to_string();
+        let refuse = |why: &str| StoreError::PathInvalid {
+            path: shown.clone(),
+            why: why.to_string(),
+        };
+        if !path.is_absolute() {
+            return Err(refuse(
+                "a file outside the store is named by its absolute path",
+            ));
+        }
+        let seen = self.see_hash(path).await.map_err(|e| match classify(&e) {
+            RetryClass::SharingViolation => StoreError::Busy(WsPath::from_disk(shown.clone())),
+            _ => StoreError::Io {
+                path: shown.clone(),
+                why: e.to_string(),
+            },
+        })?;
+        match seen {
+            Seen::Found(h) => Ok(h.sha256),
+            Seen::Missing => Err(StoreError::Io {
+                path: shown.clone(),
+                why: "there is no file there".to_string(),
+            }),
+            Seen::Link => Err(refuse(
+                "it is a symbolic link or junction; the suite never reads through a link, so                  name the file itself",
+            )),
+            Seen::Folder => Err(refuse("it is a folder, not a file")),
+            Seen::Placeholder => Err(refuse(
+                "it is a cloud-only file, which the suite never downloads: make it available                  offline first",
+            )),
         }
     }
 

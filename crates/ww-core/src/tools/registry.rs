@@ -20,6 +20,7 @@ use ww_protocol::{
 
 use super::stages::Settings;
 use crate::events::EventBus;
+use crate::pipeline::RecordSlot;
 use crate::session::Session;
 use crate::workspace::OpenWorkspace;
 
@@ -40,6 +41,9 @@ pub struct CallCtx {
     /// argument, else the session's active project, else the workspace's `state.json` hint,
     /// else `sketchbook`. `None` without a workspace.
     pub project: Option<String>,
+    /// Where the tool leaves what the Record stage writes (CORE-020): a tool that records an
+    /// operation sets its [`RecordPlan`](crate::pipeline::RecordPlan) here during Execute.
+    pub record: Arc<RecordSlot>,
 }
 
 impl CallCtx {

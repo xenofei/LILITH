@@ -32,7 +32,7 @@ pub use active::{
     resolve_project, write_hint,
 };
 pub use progress::add_done_entry;
-pub use staleness::{dependents, restore_staleness};
+pub use staleness::{dependents, restore_staleness, stale_ref};
 
 /// The project statuses `project.yaml` takes (I4).
 pub const PROJECT_STATUSES: &[&str] = &["active", "paused", "archived"];

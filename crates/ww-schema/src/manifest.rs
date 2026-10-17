@@ -116,6 +116,9 @@ pub struct CandidateRun {
     pub signed_off: Option<SignedOff>,
     pub pinned: bool,
     pub trashed_utc: Option<String>,
+    /// The version whose sign-off rejected the run (`rejected_at_version`): its 90 days
+    /// start at that sign-off (CORE-032).
+    pub rejected_at_version: Option<Version>,
 }
 
 /// A `candidate_runs[].files` entry.
@@ -731,6 +734,7 @@ fn read_run(r: &mut Reader, o: Obj<'_>) -> Option<CandidateRun> {
         signed_off,
         pinned: r.opt_bool(o, "pinned"),
         trashed_utc: r.opt_str(o, "trashed_utc"),
+        rejected_at_version: r.opt_version(o, "rejected_at_version"),
     })
 }
 

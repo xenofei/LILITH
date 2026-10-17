@@ -22,7 +22,8 @@
 //! - moves the folders of `rejected` runs to the trash 90 days after their version's sign-off
 //!   date, unless `pinned` (CORE-032), and records `trashed_utc` on the run with
 //!   `edit_manifest` (the one change I5 allows on a signed-off run). A run's sign-off date is
-//!   the `signed_off.date` of the run signed off as its `target_version`, or else of the
+//!   the `signed_off.date` of the run signed off as its `rejected_at_version` (the version
+//!   whose sign-off rejected it), else as its `target_version`, or else of the
 //!   first sign-off on or after the day the run was created (a sign-off with a confirmed bump
 //!   seals another version than the run's target); a run with neither is kept. A due run
 //!   whose folder is already in the trash without `trashed_utc` (the manifest edit failed, or
@@ -209,6 +210,15 @@ fn signoff_date(view: &ManifestView, run: &CandidateRun) -> Option<i64> {
             .filter_map(|r| r.signed_off.as_ref())
             .filter_map(|s| parse_date(&s.date).map(|d| (s, d)))
     };
+    // The sign-off that rejected it, which records its version on the run (Task 13).
+    if let Some(rejecting) = run.rejected_at_version
+        && let Some(d) = signed()
+            .filter(|(s, _)| s.version == rejecting)
+            .map(|(_, d)| d)
+            .min()
+    {
+        return Some(d);
+    }
     if let Some(target) = run.target_version
         && let Some(d) = signed()
             .filter(|(s, _)| s.version == target)
@@ -708,6 +718,37 @@ mod tests {
         assert!(!is_entry_id("sh_0123456789abcdef"));
         assert!(!is_entry_id("te_0123456789abcdeg"));
         assert!(!is_entry_id("../te_0123456789abcdef"));
+    }
+
+    #[test] // spec: CORE-032
+    fn a_rejected_run_counts_from_the_sign_off_that_rejected_it() {
+        let text = serde_json::json!({
+            "asset_id": "a", "project": "p",
+            "candidate_runs": [
+                {"run_id": "r_1", "status": "selected", "created": "2026-10-01T00:00:00Z",
+                 "target_version": "1.0.0", "files": [],
+                 "signed_off": {"by": "cli", "date": "2026-10-02", "version": "1.0.0"}},
+                {"run_id": "r_2", "status": "selected", "created": "2026-10-05T00:00:00Z",
+                 "target_version": "1.1.0", "files": [],
+                 "signed_off": {"by": "cli", "date": "2026-11-20", "version": "2.0.0"}},
+                {"run_id": "r_3", "status": "rejected", "created": "2026-10-01T00:00:00Z",
+                 "target_version": "1.0.0", "rejected_at_version": "2.0.0", "files": []},
+                {"run_id": "r_4", "status": "rejected", "created": "2026-10-01T00:00:00Z",
+                 "target_version": "1.0.0", "files": []},
+            ],
+        })
+        .to_string();
+        let view = Manifest::parse(&text).unwrap().0.view();
+        // Recorded: the sign-off of 2.0.0 rejected it, though it targeted 1.0.0.
+        assert_eq!(
+            signoff_date(&view, &view.candidate_runs[2]),
+            parse_date("2026-11-20")
+        );
+        // Not recorded (older manifests): the sign-off of its target version.
+        assert_eq!(
+            signoff_date(&view, &view.candidate_runs[3]),
+            parse_date("2026-10-02")
+        );
     }
 
     #[test] // spec: CORE-026

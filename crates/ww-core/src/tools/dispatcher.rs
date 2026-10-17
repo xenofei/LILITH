@@ -27,7 +27,9 @@
 //!    detail, and the core goes on (QA-012, ARCH-060). A call that named a project and ended
 //!    `ok` makes it the session's active project and, on a read-write workspace, the hint
 //!    (a hint that can't be written is logged, never the call's error).
-//! 8. **Meter** and 9. **record**: the hooks again.
+//! 8. **Meter** and 9. **record**: the hooks again. The record hook gets the plan the tool
+//!    left in `CallCtx::record` (CORE-020); the plan-2b stage writes it only for an `ok`
+//!    outcome, and its error (a failed commit) becomes the call's.
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
 //! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
@@ -66,6 +68,7 @@ use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
 use crate::events::EventBus;
 use crate::lifecycle::Lifecycle;
+use crate::pipeline::RecordSlot;
 use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
@@ -468,9 +471,11 @@ impl Inner {
             events: self.events.clone(),
             workspace,
             project,
+            record: Arc::new(RecordSlot::new()),
         };
         let running = tool.clone();
-        let joined = tokio::spawn(async move { running.run(&ctx, args).await }).await;
+        let run_ctx = ctx.clone();
+        let joined = tokio::spawn(async move { running.run(&run_ctx, args).await }).await;
         let mut outcome = match joined {
             Ok(Ok(output)) => Outcome::Ok(output),
             Ok(Err(mut error)) => {
@@ -493,9 +498,10 @@ impl Inner {
         {
             tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
         }
-        // 8. Meter; 9. record.
+        // 8. Meter; 9. record (CORE-020): what the tool left in its record slot.
         hooks.meter.settle(session, &outcome);
-        hooks.record.record(session, d, &mut outcome);
+        let plan = ctx.record.take();
+        hooks.record.record(&ctx, d, plan, &mut outcome).await;
         outcome
     }
 

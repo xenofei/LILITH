@@ -216,7 +216,7 @@ pub async fn restore_staleness(
             .await?;
         if marked.load(Ordering::SeqCst) {
             let approved = after.view().approved_version;
-            stale.push(stale_ref(ws, project, &asset.asset_id, approved).await);
+            stale.push(stale_ref(&ws.store, &ws.ws.id, project, &asset.asset_id, approved).await);
         }
     }
     Ok(stale)
@@ -228,16 +228,17 @@ pub async fn restore_staleness(
 /// that version's folder isn't on this machine (or can't be read without a download), the
 /// hash can't be known and the ref names the version without it (logged); an asset with no
 /// approved version gets its ref without a version.
-async fn stale_ref(
-    ws: &OpenWorkspace,
+pub async fn stale_ref(
+    store: &Store,
+    ws_id: &str,
     project: &str,
     asset_id: &str,
     approved: Option<Version>,
 ) -> String {
     let Some(version) = approved else {
-        return format!("ww://{}/{project}/{asset_id}", ws.ws.id);
+        return format!("ww://{ws_id}/{project}/{asset_id}");
     };
-    let sha256 = match ws.store.versions(project, asset_id).await {
+    let sha256 = match store.versions(project, asset_id).await {
         Ok(versions) => versions
             .into_iter()
             .find(|v| v.version == version)
@@ -251,7 +252,7 @@ async fn stale_ref(
         tracing::warn!(project, asset_id, %version, "no folder for the approved version; its ref carries no content hash");
     }
     AssetRef::Sealed {
-        ws: ws.ws.id.clone(),
+        ws: ws_id.to_string(),
         project: project.to_string(),
         asset: asset_id.to_string(),
         version,

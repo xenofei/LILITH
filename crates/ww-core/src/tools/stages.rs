@@ -3,7 +3,8 @@
 //! recording). [`PipelineHooks::plan2`] holds the plan-2 versions: [`CascadeSettings`]
 //! resolves the settings cascade (CORE-057), [`ConfirmStage`] fails closed (QA-016: an
 //! agent's `destructive` or `exec` call has no way to ask you yet, so it gets
-//! `confirm.unavailable` and never runs), and the others do nothing.
+//! `confirm.unavailable` and never runs), [`WorkspaceRecord`] runs the Record stage (CORE-020),
+//! and the others do nothing.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,6 +17,9 @@ use ww_schema::workspace_yaml::{
     ProjectYaml, WorkspaceYaml, read_project_yaml, read_workspace_yaml,
 };
 
+use super::record_stage::WorkspaceRecord;
+use super::registry::CallCtx;
+use crate::pipeline::RecordPlan;
 use crate::session::Session;
 use crate::settings::cascade;
 pub use crate::settings::{SettingSource, Settings};
@@ -86,9 +90,16 @@ pub trait MeterStage: Send + Sync {
     fn settle(&self, s: &Session, out: &Outcome<ToolOutput>);
 }
 
-/// Stage 9: records the call (plan 2b) and may add to its outcome.
+/// Stage 9: records the call (plan 2b, CORE-020) and may change its outcome: `plan` is what
+/// the tool left in `ctx.record` during Execute (`None` when it recorded nothing).
 pub trait RecordStage: Send + Sync {
-    fn record(&self, s: &Session, d: &ToolDescriptor, out: &mut Outcome<ToolOutput>);
+    fn record<'a>(
+        &'a self,
+        ctx: &'a CallCtx,
+        d: &'a ToolDescriptor,
+        plan: Option<RecordPlan>,
+        out: &'a mut Outcome<ToolOutput>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 /// The replaceable stages a [`crate::tools::Dispatcher`] runs.
@@ -110,7 +121,8 @@ impl std::fmt::Debug for PipelineHooks {
 
 impl PipelineHooks {
     /// The plan-2 stages: the settings cascade, a zero estimate, fail-closed agent
-    /// confirmations, and no reservation, metering or recording.
+    /// confirmations, no reservation or metering, and the workspace Record stage
+    /// ([`WorkspaceRecord`], plan 2b).
     pub fn plan2() -> PipelineHooks {
         PipelineHooks {
             settings: Arc::new(CascadeSettings),
@@ -118,7 +130,7 @@ impl PipelineHooks {
             confirm: Arc::new(Plan2),
             reserve: Arc::new(Plan2),
             meter: Arc::new(Plan2),
-            record: Arc::new(Plan2),
+            record: Arc::new(WorkspaceRecord),
         }
     }
 }
@@ -236,8 +248,4 @@ impl ReserveStage for Plan2 {
 
 impl MeterStage for Plan2 {
     fn settle(&self, _s: &Session, _out: &Outcome<ToolOutput>) {}
-}
-
-impl RecordStage for Plan2 {
-    fn record(&self, _s: &Session, _d: &ToolDescriptor, _out: &mut Outcome<ToolOutput>) {}
 }

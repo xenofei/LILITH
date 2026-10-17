@@ -362,6 +362,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.probe.clone(),
         cfg.watch.clone(),
     );
+    // The live topics' snapshots (ARCH-044): `asset:` and `project:`.
+    crate::tools::register_snapshots(&events, &hub);
     let dispatcher = Dispatcher::new(
         core_registry(
             cfg.test_tools,

@@ -362,7 +362,9 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         events.attach(1, tx);
         let since = [("workspace".to_string(), 0)].into_iter().collect();
-        let states = events.subscribe(1, &["workspace".to_string()], &since);
+        let states = events
+            .subscribe(1, &["workspace".to_string()], &since)
+            .await;
         assert_eq!(states[0].seq, 1, "published once: {states:?}");
         let line = tokio::time::timeout(DEADLINE, rx.recv())
             .await

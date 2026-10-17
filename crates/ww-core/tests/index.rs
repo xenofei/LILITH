@@ -410,6 +410,7 @@ fn ctx(open: &Arc<OpenWorkspace>) -> CallCtx {
         events: Arc::new(EventBus::new(clock)),
         workspace: Some(open.clone()),
         project: None,
+        record: Arc::new(ww_core::pipeline::RecordSlot::new()),
     }
 }
 
