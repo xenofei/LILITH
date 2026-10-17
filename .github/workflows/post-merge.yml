@@ -19,9 +19,10 @@
 #   GitHub creates itself when a PR is merged through its API, which no local hook or pre-push scan
 #   ever sees; GitHub writes them with the e-mail the account's web settings give it. Only this
 #   step gets the LIL_PRIVACY_DENYLIST and WW_PRIVACY_DENYLIST secrets, and the binary that reads
-#   them is built from `before`, never from the pushed code. A finding (or a scan that couldn't run) fails the job and opens an
-#   issue assigned to the owner. No revert PR: the commit is already public, and a revert keeps it
-#   in history. The issue says what to check and never repeats the e-mail.
+#   them is built from `before`, never from the pushed code. A finding (or a scan that couldn't
+#   run) fails the job and opens an issue assigned to the owner. No revert PR: the commit is
+#   already public, and a revert keeps it in history. The issue says what to check and never
+#   repeats the e-mail.
 # - When `before` is all zeros the push created the repository's main (R27): the tests run, but
 #   the judge, the identity check and the revert are skipped, and the log says "repository
 #   creation push; nothing to compare".

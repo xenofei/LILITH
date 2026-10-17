@@ -1449,13 +1449,26 @@ fn no_step_outside_a_scan_sees_the_denylist_secret() {
         for (_, secret) in DENYLIST_SECRETS {
             assert_eq!(code.matches(secret).count(), expected, "{file}: {secret}");
         }
+        // GitHub expressions ignore case, so count every spelling, comments included.
+        let lower = text.to_lowercase();
+        for name in [
+            "secrets.lil_privacy_denylist",
+            "secrets.ww_privacy_denylist",
+        ] {
+            assert_eq!(
+                lower.matches(name).count(),
+                expected,
+                "{file}: {name} in any case"
+            );
+        }
         assert_eq!(
             code.matches("PRIVACY_DENYLIST }}").count(),
             2 * expected,
             "{file}: a denylist secret under another name"
         );
-        for whole in ["toJSON(secrets", "toJson(secrets", "secrets[", "secrets.*"] {
-            assert!(!code.contains(whole), "{file}: `{whole}`");
+        let lower_code = code.to_lowercase();
+        for whole in ["tojson(secrets", "secrets[", "secrets.*"] {
+            assert!(!lower_code.contains(whole), "{file}: `{whole}` in any case");
         }
         let mentions = |y: &Yaml| -> bool {
             y.as_hash().is_some_and(|h| {
