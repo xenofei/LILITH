@@ -225,11 +225,11 @@ fn request(run: &str, version: &str, files: &[&str], snapshot: Manifest) -> Seal
 
 /// Seals under the asset's version lock, as `asset.signoff` does.
 async fn seal(store: &Store, req: SealRequest) -> Result<ww_core::store::Sealed, StoreError> {
-    let _guard = store
+    let guard = store
         .version_lock(&req.project, &req.asset_id)
         .lock_owned()
         .await;
-    store.seal(req).await
+    store.seal(&guard, req).await
 }
 
 fn bytes_of(run: &str, name: &str) -> Vec<u8> {
@@ -432,7 +432,7 @@ async fn seals_of_one_asset_are_serialised() {
             let guard = store.version_lock(PROJECT, ASSET_ID).lock_owned().await;
             log.lock().unwrap().push(format!("start {version}"));
             tokio::task::yield_now().await;
-            let sealed = store.seal(request(run, version, &[file], m)).await;
+            let sealed = store.seal(&guard, request(run, version, &[file], m)).await;
             tokio::task::yield_now().await;
             log.lock().unwrap().push(format!("end {version}"));
             drop(guard);
@@ -753,4 +753,157 @@ async fn legacy_folder_is_listed_as_legacy() {
             .is_empty()
     );
     assert!(ws.env.root().exists());
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026
+async fn seal_refuses_a_guard_that_isnt_the_assets_version_lock() {
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    let store = ws.plain();
+    let other_asset = store.version_lock(PROJECT, "kite").lock_owned().await;
+    let stray = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    for guard in [&other_asset, &stray] {
+        let refused = store
+            .seal(guard, request("r_1", "1.0.0", &["a.png"], m.clone()))
+            .await;
+        let Err(StoreError::Io { why, .. }) = &refused else {
+            panic!("a seal under another lock ran: {refused:?}");
+        };
+        assert!(why.contains("version lock"), "{why}");
+    }
+    assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+    assert_eq!(ws.tree(&format!("{ASSET}/candidates/r_1")), ["a.png"]);
+    assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+    // The asset's own lock, spelled another way, is the same lock.
+    let own = store.version_lock("Sketchbook", "CRANE").lock_owned().await;
+    store
+        .seal(&own, request("r_1", "1.0.0", &["a.png"], m))
+        .await
+        .expect("the seal under the asset's lock");
+}
+
+/// The real probe, except that it reports the files named `link_name` as symbolic links and
+/// those named `cloud_name` as cloud-only placeholders, which it refuses to open.
+#[derive(Debug)]
+struct FakeEntries {
+    link_name: &'static str,
+    cloud_name: &'static str,
+}
+
+impl FakeEntries {
+    fn named(&self, path: &Path) -> (bool, bool) {
+        let name = path.file_name().unwrap().to_string_lossy();
+        (name == self.link_name, name == self.cloud_name)
+    }
+}
+
+impl Probe for FakeEntries {
+    fn identity(&self, path: &Path) -> io::Result<ww_platform::fs::FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        let (link, cloud) = self.named(path);
+        if link {
+            id.attributes |= 0x400; // FILE_ATTRIBUTE_REPARSE_POINT
+        }
+        if cloud {
+            id.attributes |= ww_platform::fs::PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<ww_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        assert!(
+            !self.named(path).1,
+            "a placeholder was opened: {}",
+            path.display()
+        );
+        SystemProbe.open_read(path)
+    }
+
+    fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {
+        if self.named(path).0 {
+            return Ok(Some(0xA000_000C)); // IO_REPARSE_TAG_SYMLINK
+        }
+        SystemProbe.reparse_tag(path)
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026, CORE-028
+async fn links_and_placeholders_inside_source_are_refused() {
+    for (link_name, cloud_name, want) in [
+        ("inner.psd", "", "store.path_invalid"),
+        ("", "inner.psd", "store.hash_conflict"),
+    ] {
+        let ws = workspace();
+        let m = ws.run(
+            "r_1",
+            &[
+                ("a.png", "candidate", None),
+                ("source/top.txt", "", None),
+                ("source/sub/inner.psd", "", None),
+            ],
+        );
+        let store = Arc::new(
+            Store::new(
+                ws.root.clone(),
+                ws.state.clone(),
+                FailPoints::none(),
+                ws.clock.clone(),
+                Arc::new(SeqIds::new()),
+                Arc::new(FakeEntries {
+                    link_name,
+                    cloud_name,
+                }),
+            )
+            .with_machine("testmachine"),
+        );
+        let refused = seal(&store, request("r_1", "1.0.0", &["a.png"], m)).await;
+        let Err(e) = refused else {
+            panic!("{want}: the seal went ahead");
+        };
+        assert_eq!(e.to_error("t").code, want, "{e}");
+        assert!(
+            e.to_string()
+                .contains(&format!("{ASSET}/candidates/r_1/source/sub/inner.psd")),
+            "{e}"
+        );
+        // Refused before anything moved.
+        assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+        assert_eq!(
+            ws.tree(&format!("{ASSET}/candidates/r_1")),
+            ["a.png", "source/sub/inner.psd", "source/top.txt"]
+        );
+        assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-026, CORE-038, QA-066
+async fn crash_after_seal_leaves_the_version_as_an_orphan() {
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    let fp = Arc::new(FailPoints::parse("store.after_seal=io").unwrap());
+    let store = ws.store(fp);
+    let result = seal(&store, request("r_1", "1.0.0", &["a.png"], m)).await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+
+    // The version stays whole, sealed and read-only; nothing went back to the run.
+    assert_eq!(
+        ws.tree(&format!("{ASSET}/v1.0.0")),
+        ["a.png", "manifest.snapshot.json"]
+    );
+    for name in ["a.png", "manifest.snapshot.json"] {
+        assert!(ws.read_only(&format!("{ASSET}/v1.0.0/{name}")), "{name}");
+    }
+    assert!(ws.tree(&format!("{ASSET}/candidates/r_1")).is_empty());
+    assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+    // No manifest records it: it is an orphan, listed and kept.
+    let orphans = store.orphans().await.unwrap();
+    assert_eq!(
+        orphans.iter().map(WsPath::as_str).collect::<Vec<_>>(),
+        [format!("{ASSET}/v1.0.0").as_str()]
+    );
+    assert!(ws.exists(&format!("{ASSET}/v1.0.0/a.png")));
 }

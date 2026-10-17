@@ -25,6 +25,11 @@
 //! removed only if it still holds the original's bytes (the store's `remove_if_hash`), the
 //! snapshot likewise, and the emptied folder is removed; anything that can't go back stays in
 //! the sealing folder, which is then an orphan. A half-filled `v<version>/` never exists.
+//! Those removals are hard deletes of the core's own just-written duplicates (CORE-110; the
+//! `crates/ww-core/tests/trash.rs` scan allows them here).
+//!
+//! The caller passes its guard of the asset's version lock, and a seal under any other lock
+//! is refused.
 //!
 //! The sealed files reach the index through the Record stage's `commit.moved`, after the
 //! manifest edit (ARCH-075), never from `seal`. A crash after step 6 and before that edit
@@ -35,7 +40,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
-use ww_platform::fs::{FileIdentity, RetryClass, classify};
+use tokio::sync::OwnedMutexGuard;
+
+use ww_platform::fs::{FileIdentity, Probe, RetryClass, classify};
 use ww_schema::{
     CandidateFile, Manifest, ManifestView, Version, bare_sha256, sha256_hex, version_content_hash,
 };
@@ -45,7 +52,7 @@ use super::order::{list, version_folder};
 use super::paths::{WsPath, path_key};
 use super::staging::SEAL_PREFIX;
 use super::write::{
-    PathLock, Seen, Store, StoreError, blocking, exists, link_refused, lock, remove_if_hash,
+    PathLock, Seen, Store, StoreError, blocking, exists, link_refused, lock, remove_if_hash, see,
 };
 
 /// The snapshot every sealed version holds (I5 sign-off step 4).
@@ -141,6 +148,27 @@ pub(super) fn files_under(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     Ok(found)
 }
 
+/// The first link or cloud-only file under `dir`, found through `probe` (attributes and
+/// reparse tags only, never following a link or reading a placeholder): its `/`-separated path
+/// relative to `dir`, and `true` for a link.
+fn unsafe_entry(probe: &dyn Probe, dir: &Path) -> io::Result<Option<(String, bool)>> {
+    let mut folders = vec![(String::new(), dir.to_path_buf())];
+    while let Some((prefix, folder)) = folders.pop() {
+        for entry in std::fs::read_dir(ww_platform::fs::long_path(&folder))? {
+            let entry = entry?;
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            let path = folder.join(entry.file_name());
+            match see(probe, &path, |_| Ok(()))? {
+                Seen::Link => return Ok(Some((name, true))),
+                Seen::Placeholder => return Ok(Some((name, false))),
+                Seen::Folder => folders.push((format!("{name}/"), path)),
+                Seen::Found(()) | Seen::Missing => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Sets (or clears) the read-only attribute of `path`, and of every file under it when it is
 /// a folder.
 pub(super) fn set_readonly_all(path: &Path, on: bool) -> io::Result<()> {
@@ -216,18 +244,33 @@ impl Store {
         held
     }
 
-    /// Seals run `req.run_id`'s chosen files as `v<req.version>/` (module docs). The caller
-    /// holds the asset's [`Store::version_lock`] guard.
+    /// Seals run `req.run_id`'s chosen files as `v<req.version>/` (module docs). `guard` is
+    /// the caller's guard of the asset's [`Store::version_lock`]: a seal under any other lock
+    /// (or another asset's) is refused, so no seal runs without the asset's version lock.
     ///
     /// # Errors
-    /// `workspace.read_only`; `store.path_invalid` for names that aren't single path
-    /// components, or a link; `version.exists`; `store.hash_conflict` for a cloud-only file
-    /// (it would have to be read); `store.io` for a chosen file that isn't in the run, or a
-    /// failed file call (`store.busy` when a file stays held, `store.disk_full`); and any
-    /// error after the final move, which leaves the sealed folder for the orphan list.
-    pub async fn seal(&self, req: SealRequest) -> Result<Sealed, StoreError> {
+    /// `workspace.read_only`; `store.io` when `guard` isn't the asset's version lock;
+    /// `store.path_invalid` for names that aren't single path components, or a link (also one
+    /// inside `source/`); `version.exists`; `store.hash_conflict` for a cloud-only file (it
+    /// would have to be read); `store.io` for a chosen file that isn't in the run, or a failed
+    /// file call (`store.busy` when a file stays held, `store.disk_full`); and any error after
+    /// the final move, which leaves the sealed folder for the orphan list.
+    pub async fn seal(
+        &self,
+        guard: &OwnedMutexGuard<()>,
+        req: SealRequest,
+    ) -> Result<Sealed, StoreError> {
         self.writable_store()?;
         let asset = WsPath::parse(&format!("projects/{}/assets/{}", req.project, req.asset_id))?;
+        if !Arc::ptr_eq(
+            OwnedMutexGuard::mutex(guard),
+            &self.version_lock(&req.project, &req.asset_id),
+        ) {
+            return Err(StoreError::Io {
+                path: asset.as_str().to_string(),
+                why: "a seal runs only under the asset's own version lock".to_string(),
+            });
+        }
         let single = |name: &str| {
             if name.is_empty() || name.contains('/') {
                 return Err(StoreError::PathInvalid {
@@ -298,6 +341,22 @@ impl Store {
             Seen::Link => return Err(link_refused(&source)),
             _ => false,
         };
+        if has_source {
+            // Nothing inside `source/` is a link (never moved through or sealed) or a
+            // cloud-only file (step 7 would have to read it).
+            let (probe, dir) = (self.probe().clone(), source.abs(self.root()));
+            let found = blocking(move || unsafe_entry(probe.as_ref(), &dir))
+                .await
+                .map_err(|e| StoreError::io(&source, &e))?;
+            if let Some((inside, link)) = found {
+                let rel = WsPath::from_disk(format!("{source}/{inside}"));
+                return Err(if link {
+                    link_refused(&rel)
+                } else {
+                    StoreError::cloud_only(&rel)
+                });
+            }
+        }
 
         // 2.
         let (handle, sealing) = self.sealing_folder().await?;
@@ -461,6 +520,12 @@ impl Store {
     /// run, writable again; copies and the snapshot are removed only while they still hold the
     /// bytes the seal put there. The folder is removed once it is empty; whatever stays in it
     /// is an orphan, and nothing is lost.
+    ///
+    /// CORE-110: removing a copy or the snapshot is a hard delete, of the core's own bytes
+    /// that this call wrote moments before (a copy whose original is still in the run, or the
+    /// snapshot of a manifest that is still on disk). It goes through the store's
+    /// `remove_if_hash`, which hashes and deletes through one unshared handle, so a file that
+    /// changed since is never deleted.
     async fn undo_seal(&self, done: &[Done], sealing: &Path) {
         for step in done.iter().rev() {
             match step {

@@ -485,8 +485,20 @@ pub(super) fn remove_if_hash(path: &Path, sha256: &str) -> io::Result<bool> {
 
 /// Removes a temp file the caller wrote itself (`.<name>.ww-tmp-<pid>-<n>`, the core's own
 /// bytes, never content anyone else has). Shared by `suite.toml` writes, so the hard deletes
-/// stay where CORE-110 allows them.
+/// stay where CORE-110 allows them. Any other name is refused (`InvalidInput`) and nothing is
+/// deleted.
 pub(super) fn remove_temp(path: &Path) -> io::Result<()> {
+    let is_temp = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(parse_leftover)
+        .is_some_and(|(kind, ..)| kind == LeftoverKind::Temp);
+    if !is_temp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a store temp file", path.display()),
+        ));
+    }
     fsops::remove_file(path)
 }
 
@@ -532,7 +544,7 @@ fn hash_reader(mut file: impl io::Read) -> io::Result<FileHash> {
     })
 }
 
-fn read_all(mut file: File) -> io::Result<Vec<u8>> {
+pub(super) fn read_all(mut file: File) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(bytes)
@@ -565,7 +577,11 @@ pub(super) fn link_refused(rel: &WsPath) -> StoreError {
 }
 
 /// `probe.identity` first; only a local file is opened, through `probe.open_read`.
-fn see<T>(probe: &dyn Probe, path: &Path, read: fn(File) -> io::Result<T>) -> io::Result<Seen<T>> {
+pub(super) fn see<T>(
+    probe: &dyn Probe,
+    path: &Path,
+    read: fn(File) -> io::Result<T>,
+) -> io::Result<Seen<T>> {
     let id = match probe.identity(path) {
         Ok(id) => id,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Seen::Missing),
@@ -2353,6 +2369,26 @@ mod tests {
         ] {
             assert_eq!(parse_leftover(no), None, "{no}");
         }
+    }
+
+    #[test] // spec: CORE-110
+    fn remove_temp_deletes_only_store_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = FailPoints::none();
+        for name in [
+            "suite.toml",
+            ".suite.toml.ww-bak-1-2",
+            "a.ww-tmp-1-2",
+            ".a.ww-tmp-1",
+        ] {
+            let path = fsops::write_temp(dir.path(), name, b"keep", &fp).unwrap();
+            let refused = remove_temp(&path).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{name}");
+            assert!(path.exists(), "{name} was deleted");
+        }
+        let temp = fsops::write_temp(dir.path(), ".suite.toml.ww-tmp-1-2", b"x", &fp).unwrap();
+        remove_temp(&temp).unwrap();
+        assert!(!temp.exists());
     }
 
     #[test] // spec: ARCH-078

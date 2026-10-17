@@ -11,17 +11,23 @@
 //! that is there now (`trash.restore_conflict`), and sets the read-only attribute again on
 //! every restored file under `projects/*/assets/*/v<semver>/` (CORE-026).
 //!
-//! [`Store::maintenance`], run by the core at workspace open and every 24 hours:
+//! [`Store::maintenance`], which the core runs in the background, right after a workspace
+//! opens and then every 24 hours ([`Store::maintenance_until`] stops between entries and
+//! assets once the workspace closes):
 //! - purges the entries whose `purge_after` has passed. This purge is one of the only hard
 //!   deletes in `ww-core` (CORE-110), with stale temps and settled backups, empty staging
-//!   handles and the index rebuild. `fsops::remove_dir_all` clears the read-only attribute
-//!   first, so a sealed payload is purged too. An entry whose record can't be read is kept;
+//!   handles, a failed seal's own copies and the index rebuild. `fsops::remove_dir_all` clears
+//!   the read-only attribute first, so a sealed payload is purged too. An entry whose record
+//!   can't be read, or is a cloud-only placeholder (never downloaded), is kept;
 //! - moves the folders of `rejected` runs to the trash 90 days after their version's sign-off
 //!   date, unless `pinned` (CORE-032), and records `trashed_utc` on the run with
 //!   `edit_manifest` (the one change I5 allows on a signed-off run). A run's sign-off date is
 //!   the `signed_off.date` of the run signed off as its `target_version`, or else of the
 //!   first sign-off on or after the day the run was created (a sign-off with a confirmed bump
-//!   seals another version than the run's target); a run with neither is kept.
+//!   seals another version than the run's target); a run with neither is kept. A due run
+//!   whose folder is already in the trash without `trashed_utc` (the manifest edit failed, or
+//!   the core stopped, after the move) gets the entry's `moved_utc` as its `trashed_utc`.
+//!   Assets without a `candidates/` folder are skipped before their manifest is read.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,7 +41,10 @@ use super::fsops;
 use super::order::{list, version_folder};
 use super::paths::{WsPath, path_key};
 use super::versions::{files_under, set_readonly_all};
-use super::write::{ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused};
+use super::write::{
+    ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
+};
+use ww_platform::fs::Probe;
 
 /// Days a trash entry is kept before it is purged (ARCH-058, CORE-037).
 pub const TRASH_KEEP_DAYS: i64 = 30;
@@ -145,8 +154,10 @@ fn is_entry_id(id: &str) -> bool {
         .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Every entry under `<root>\.trash` whose `restore.json` parses. Links are never followed.
-fn entries(root: &Path) -> io::Result<Vec<Entry>> {
+/// Every entry under `<root>\.trash` whose `restore.json` parses. Links are never followed,
+/// and each `restore.json` goes through `probe.identity` first: a cloud-only placeholder (or a
+/// link) is skipped, never read, so listing the trash never downloads anything.
+fn entries(root: &Path, probe: &dyn Probe) -> io::Result<Vec<Entry>> {
     let mut found = Vec::new();
     for day in list(&root.join(TRASH_DIR))?
         .into_iter()
@@ -154,9 +165,14 @@ fn entries(root: &Path) -> io::Result<Vec<Entry>> {
     {
         for entry in list(&day.path)?.into_iter().filter(|e| e.folder) {
             let record = entry.path.join(RECORD);
-            let parsed = std::fs::read(ww_platform::fs::long_path(&record))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<TrashRecord>(&bytes).ok());
+            let parsed = match see(probe, &record, read_all) {
+                Ok(Seen::Found(bytes)) => serde_json::from_slice::<TrashRecord>(&bytes).ok(),
+                Ok(Seen::Placeholder) => {
+                    tracing::warn!(entry = %entry.path.display(), "a trash entry whose restore.json is cloud-only is skipped; make it available offline to list it");
+                    continue;
+                }
+                _ => None,
+            };
             match parsed {
                 Some(record) => found.push(Entry {
                     dir: entry.path,
@@ -348,7 +364,8 @@ impl Store {
     /// `store.io` when the trash can't be listed.
     pub async fn trash_list(&self) -> Result<Vec<TrashRecord>, StoreError> {
         let root = self.root().to_path_buf();
-        let found = blocking(move || entries(&root))
+        let probe = self.probe().clone();
+        let found = blocking(move || entries(&root, probe.as_ref()))
             .await
             .map_err(|e| StoreError::io(&WsPath::from_disk(TRASH_DIR.to_string()), &e))?;
         Ok(found.into_iter().map(|e| e.record).collect())
@@ -368,7 +385,8 @@ impl Store {
             return Err(unknown());
         }
         let root = self.root().to_path_buf();
-        let found = blocking(move || entries(&root))
+        let probe = self.probe().clone();
+        let found = blocking(move || entries(&root, probe.as_ref()))
             .await
             .map_err(|e| StoreError::io(&WsPath::from_disk(TRASH_DIR.to_string()), &e))?;
         let entry = found
@@ -466,11 +484,25 @@ impl Store {
     /// The core's own retention work at `now_utc` (Unix seconds; module docs): purges the
     /// trash entries whose `purge_after` has passed, and moves rejected runs to the trash 90
     /// days after their sign-off. A problem with one entry or asset is logged and the rest go
-    /// on.
+    /// on. It is [`Store::maintenance_until`] with a `stop` that never fires.
     ///
     /// # Errors
     /// `workspace.read_only`; `store.io` when the trash or the projects can't be listed.
     pub async fn maintenance(&self, now_utc: i64) -> Result<MaintenanceReport, StoreError> {
+        self.maintenance_until(now_utc, &|| false).await
+    }
+
+    /// [`Store::maintenance`], checking `stop` before each trash entry and each asset: once it
+    /// returns true the pass ends there with what it did so far (the core passes its
+    /// workspace's "closed" flag, so a close never waits for a pass).
+    ///
+    /// # Errors
+    /// As [`Store::maintenance`].
+    pub async fn maintenance_until(
+        &self,
+        now_utc: i64,
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<MaintenanceReport, StoreError> {
         self.writable_store()?;
         let mut report = MaintenanceReport::default();
         let root = self.root().to_path_buf();
@@ -479,11 +511,15 @@ impl Store {
         // The purge.
         let found = {
             let root = root.clone();
-            blocking(move || entries(&root))
+            let probe = self.probe().clone();
+            blocking(move || entries(&root, probe.as_ref()))
                 .await
                 .map_err(|e| StoreError::io(&trash_rel, &e))?
         };
-        for entry in found {
+        for entry in &found {
+            if stop() {
+                return Ok(report);
+            }
             let Some(due) = parse_rfc3339(&entry.record.purge_after) else {
                 tracing::warn!(entry = %entry.dir.display(), "a trash entry whose purge_after can't be read is kept");
                 continue;
@@ -501,13 +537,16 @@ impl Store {
             {
                 Ok(()) => {
                     tracing::info!(entry = %entry.record.entry_id, "trash entry purged");
-                    report.purged.push(entry.record.entry_id);
+                    report.purged.push(entry.record.entry_id.clone());
                 }
                 Err(e) => {
                     tracing::warn!(entry = %entry.dir.display(), error = %e, "a trash entry couldn't be purged; the next run tries again");
                 }
             }
         }
+        // Every entry seen (purged in this pass or not), for runs whose folder went to the
+        // trash without `trashed_utc`.
+        let seen: Vec<TrashRecord> = found.into_iter().map(|e| e.record).collect();
 
         // Rejected runs.
         let projects = {
@@ -522,8 +561,22 @@ impl Store {
                 blocking(move || list(&dir)).await.unwrap_or_default()
             };
             for asset in assets.into_iter().filter(|a| a.folder) {
+                if stop() {
+                    return Ok(report);
+                }
+                // An asset without a `candidates/` folder has no run folder to move: its
+                // manifest isn't even read.
+                let candidates = asset.path.join("candidates");
+                let has_runs = blocking(move || {
+                    Ok(ww_platform::fs::attributes(&candidates).is_ok_and(|a| a & 0x10 != 0))
+                })
+                .await
+                .unwrap_or(false);
+                if !has_runs {
+                    continue;
+                }
                 match self
-                    .trash_rejected_runs(&project.name, &asset.name, now_utc)
+                    .trash_rejected_runs(&project.name, &asset.name, now_utc, &seen)
                     .await
                 {
                     Ok(trashed) => report.runs_trashed.extend(trashed),
@@ -537,12 +590,15 @@ impl Store {
     }
 
     /// Moves the due rejected runs of one asset to the trash and records their `trashed_utc`,
-    /// under the asset's version lock.
+    /// under the asset's version lock. A due run whose folder is already in the trash
+    /// (`in_trash` has an entry from that folder: the manifest edit failed, or the core
+    /// stopped, after the move) only gets its `trashed_utc`, the entry's `moved_utc`.
     async fn trash_rejected_runs(
         &self,
         project: &str,
         asset_id: &str,
         now_utc: i64,
+        in_trash: &[TrashRecord],
     ) -> Result<Vec<WsPath>, StoreError> {
         let asset = WsPath::parse(&format!("projects/{project}/assets/{asset_id}"))?;
         let manifest_rel = asset.join(&format!("{asset_id}.manifest.json"))?;
@@ -569,19 +625,29 @@ impl Store {
             }
             let folder = asset.join(&format!("candidates/{}", run.run_id))?;
             let abs = folder.abs(self.root());
-            if !blocking(move || Ok(ww_platform::fs::attributes(&abs).is_ok()))
+            let present = blocking(move || Ok(ww_platform::fs::attributes(&abs).is_ok()))
                 .await
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if let Err(e) = self.check_locks(&folder).await {
-                tracing::warn!(run = %folder, error = %e, "a locked rejected run stays");
-                continue;
-            }
-            self.trash_now(&folder, "rejected candidates, 90 days after sign-off")
-                .await?;
-            let (id, stamp) = (run.run_id.clone(), ww_schema::time::rfc3339(now_utc));
+                .unwrap_or(false);
+            let stamp = if present {
+                if let Err(e) = self.check_locks(&folder).await {
+                    tracing::warn!(run = %folder, error = %e, "a locked rejected run stays");
+                    continue;
+                }
+                self.trash_now(&folder, "rejected candidates, 90 days after sign-off")
+                    .await?;
+                tracing::info!(run = %folder, "a rejected run went to the trash");
+                trashed.push(folder.clone());
+                ww_schema::time::rfc3339(now_utc)
+            } else {
+                let key = path_key(folder.as_str());
+                let Some(entry) = in_trash.iter().find(|r| path_key(&r.original_path) == key)
+                else {
+                    continue;
+                };
+                tracing::info!(run = %folder, entry = %entry.entry_id, "a rejected run already in the trash gets its trashed_utc");
+                entry.moved_utc.clone()
+            };
+            let id = run.run_id.clone();
             self.edit_manifest(&manifest_rel, &|m: &mut Manifest| {
                 for entry in m.runs_mut() {
                     let this = entry.get("run_id").and_then(Value::as_str) == Some(id.as_str());
@@ -592,8 +658,6 @@ impl Store {
                 Ok(())
             })
             .await?;
-            tracing::info!(run = %folder, "a rejected run went to the trash");
-            trashed.push(folder);
         }
         Ok(trashed)
     }

@@ -200,7 +200,7 @@ pub struct OpenWorkspace {
     /// Closes the workspace's databases when it is dropped.
     states: Arc<StateRegistry>,
     /// Set once the workspace is closed; a drop then does nothing more.
-    shut: AtomicBool,
+    shut: Arc<AtomicBool>,
     /// Dropped last, after the drop has closed everything: the hub waits for it before it
     /// opens the workspace anew ([`WorkspaceHub::open`]).
     gone: watch::Sender<()>,
@@ -354,8 +354,8 @@ impl WorkspaceHub {
     /// 2. `<ws>\.worldwright\` and its `core.lock`: taken → [`Access::ReadWrite`], held by
     ///    another core → [`Access::ReadOnly`];
     /// 3. the workspace `state.db` for that access;
-    /// 4. the store, its `recover()` and its `maintenance()` (read-write only; maintenance then
-    ///    runs every [`MAINTENANCE_PERIOD`] while the workspace stays open);
+    /// 4. the store, and its `recover()` (read-write only); its `maintenance()` then starts in
+    ///    the background and runs every [`MAINTENANCE_PERIOD`] while the workspace stays open;
     /// 5. `orphans()`, published once on the `workspace` topic as
     ///    `{kind: "orphans", paths}` when there are any.
     ///
@@ -458,7 +458,6 @@ impl WorkspaceHub {
                     tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace recovery stopped; it runs again at the next open")
                 }
             }
-            run_maintenance(&store, &ws.path).await;
         }
         // 5.
         let orphans = store.orphans().await.unwrap_or_else(|e| {
@@ -484,7 +483,7 @@ impl WorkspaceHub {
             orphans,
             lock: Mutex::new(taken),
             states: self.states.clone(),
-            shut: AtomicBool::new(false),
+            shut: Arc::new(AtomicBool::new(false)),
             gone: watch::Sender::new(()),
         });
         if access == Access::ReadWrite {
@@ -554,42 +553,46 @@ impl WorkspaceHub {
     }
 }
 
-/// How often a read-write workspace runs [`Store::maintenance`] while it is open, after the
-/// run at open (ARCH-058, CORE-032, CORE-037).
+/// How often a read-write workspace runs [`Store::maintenance`] while it is open; the first
+/// pass starts right after the open (ARCH-058, CORE-032, CORE-037).
 pub const MAINTENANCE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// One [`Store::maintenance`] run at the store clock's time; a failure is logged, and the next
-/// run tries again.
-async fn run_maintenance(store: &Store, path: &Path) {
-    match store.maintenance(store.now_utc()).await {
-        Ok(report) => {
-            if !report.purged.is_empty() || !report.runs_trashed.is_empty() {
-                tracing::info!(workspace = %path.display(), ?report, "workspace maintenance");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(workspace = %path.display(), error = %e, "the workspace maintenance stopped; it runs again later");
-        }
-    }
-}
-
-/// Runs maintenance on `open` every [`MAINTENANCE_PERIOD`] (on tokio's clock) for as long as
-/// it is open. The task holds the workspace only while a run lasts, so a close is never held
-/// up for longer than one run; a workspace the hub has closed ends the task.
+/// Runs [`Store::maintenance`] on `open`'s store in the background: a first pass at once, then
+/// every [`MAINTENANCE_PERIOD`] (on tokio's clock), so an open never waits for it.
+///
+/// The task holds no reference to the [`OpenWorkspace`], only a weak one to its store and the
+/// workspace's `shut` flag, so a close (or a reopen, which waits for the close) is never held
+/// up by a pass. A pass stops between trash entries and between assets once the workspace is
+/// closed, and a closed workspace ends the task.
 fn spawn_daily_maintenance(open: &Arc<OpenWorkspace>) {
-    let weak = Arc::downgrade(open);
+    let (store, shut, path) = (
+        Arc::downgrade(&open.store),
+        open.shut.clone(),
+        open.ws.path.clone(),
+    );
     tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(MAINTENANCE_PERIOD);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::time::sleep(MAINTENANCE_PERIOD).await;
-            let Some(open) = weak.upgrade() else {
+            // The first tick fires at once.
+            ticks.tick().await;
+            if shut.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(store) = store.upgrade() else {
                 break;
             };
-            if open.shut.load(Ordering::SeqCst) {
-                break;
+            let stop = || shut.load(Ordering::SeqCst);
+            match store.maintenance_until(store.now_utc(), &stop).await {
+                Ok(report) => {
+                    if !report.purged.is_empty() || !report.runs_trashed.is_empty() {
+                        tracing::info!(workspace = %path.display(), ?report, "workspace maintenance");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(workspace = %path.display(), error = %e, "the workspace maintenance stopped; it runs again later");
+                }
             }
-            run_maintenance(&open.store, &open.ws.path).await;
-            // The last reference closes the workspace, a blocking call: off the async threads.
-            let _ = tokio::task::spawn_blocking(move || drop(open)).await;
         }
     });
 }

@@ -10,8 +10,8 @@
 //! its own allowance.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ use ww_core::store::{
 };
 use ww_core::workspace::{WorkspaceHub, WorkspaceRef};
 use ww_core::{CoreConfig, start_in_thread};
-use ww_platform::fs::SystemProbe;
+use ww_platform::fs::{FileIdentity, Probe, SystemProbe, VolumeInfo};
 use ww_platform::{Clock, Env};
 use ww_schema::Manifest;
 use ww_testkit::files::write_file;
@@ -145,16 +145,19 @@ async fn sealed_version(ws: &Ws, store: &Store) {
     )
     .unwrap();
     write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
-    let _guard = store.version_lock("sketchbook", "crane").lock_owned().await;
+    let guard = store.version_lock("sketchbook", "crane").lock_owned().await;
     store
-        .seal(SealRequest {
-            project: "sketchbook".to_string(),
-            asset_id: "crane".to_string(),
-            version: "1.0.0".parse().unwrap(),
-            run_id: "r_1".to_string(),
-            files: vec!["a.png".to_string()],
-            snapshot: m,
-        })
+        .seal(
+            &guard,
+            SealRequest {
+                project: "sketchbook".to_string(),
+                asset_id: "crane".to_string(),
+                version: "1.0.0".parse().unwrap(),
+                run_id: "r_1".to_string(),
+                files: vec!["a.png".to_string()],
+                snapshot: m,
+            },
+        )
         .await
         .expect("the seal");
 }
@@ -536,12 +539,29 @@ fn hard_deletes_happen_only_in_purge_temp_cleanup_and_index_rebuild() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
-    let allowed = |rel: &str| {
+    // Whole-file and whole-tree deletes: the purge, temps, settled backups, recovery, empty
+    // staging handles and the index rebuild.
+    let deletes = |rel: &str| {
         matches!(
             rel,
             "store/fsops.rs" | "store/trash.rs" | "store/write.rs" | "store/staging.rs"
         ) || rel.starts_with("index/")
     };
+    // Hash-checked deletes of the core's own bytes through one unshared handle: settled
+    // backups (the store's and `suite.toml`'s) and a failed seal's own copies and snapshot.
+    let checked = |rel: &str| {
+        matches!(
+            rel,
+            "store/fsops.rs" | "store/write.rs" | "store/suite_toml.rs" | "store/versions.rs"
+        )
+    };
+    type Allowed<'a> = &'a dyn Fn(&str) -> bool;
+    let tokens: [(&str, Allowed); 4] = [
+        ("remove_file(", &deletes),
+        ("remove_dir_all(", &deletes),
+        ("remove_if(", &checked),
+        ("remove_if_hash(", &checked),
+    ];
     let mut found = Vec::new();
     let mut outside = Vec::new();
     for file in &files {
@@ -552,7 +572,7 @@ fn hard_deletes_happen_only_in_purge_temp_cleanup_and_index_rebuild() {
             .replace('\\', "/");
         let text = std::fs::read_to_string(file).unwrap();
         for (i, line) in text.lines().enumerate() {
-            for token in ["remove_file(", "remove_dir_all("] {
+            for (token, allowed) in &tokens {
                 if line.contains(token) {
                     let at = format!("{rel}:{}: {}", i + 1, line.trim());
                     if allowed(&rel) {
@@ -568,10 +588,15 @@ fn hard_deletes_happen_only_in_purge_temp_cleanup_and_index_rebuild() {
         outside.is_empty(),
         "hard deletes outside the allowed places: {outside:#?}"
     );
-    assert!(
-        found.iter().any(|f| f.starts_with("store/trash.rs")),
-        "the purge's delete wasn't found: {found:#?}"
-    );
+    for (place, what) in [
+        ("store/trash.rs", "the purge's delete"),
+        ("store/versions.rs", "the seal rollback's checked delete"),
+    ] {
+        assert!(
+            found.iter().any(|f| f.starts_with(place)),
+            "{what} wasn't found: {found:#?}"
+        );
+    }
     assert!(!found.is_empty(), "the scan found no delete at all");
 }
 
@@ -688,7 +713,15 @@ async fn maintenance_runs_at_open_and_every_24_hours() {
         path: ws.clone(),
     };
     let open = hub.open(&reference).await.expect("the open");
-    assert!(!due.exists(), "the open didn't purge the due entry");
+    // The first pass runs in the background right after the open (on the paused clock, so
+    // these waits take no real time).
+    for _ in 0..1000 {
+        if !due.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!due.exists(), "the first pass didn't purge the due entry");
     assert!(later.exists());
 
     // A day and a bit later (both clocks), the daily run purges the other one.
@@ -703,4 +736,225 @@ async fn maintenance_runs_at_open_and_every_24_hours() {
     assert!(!later.exists(), "the daily maintenance didn't run");
     drop(open);
     hub.close_all().await;
+}
+
+/// The real probe, except that every `restore.json` it is asked about waits until the gate
+/// opens, announcing each wait first: a maintenance pass stalls inside the trash.
+#[derive(Debug, Default)]
+struct GatedTrash {
+    open: Mutex<bool>,
+    opened: Condvar,
+    waits: Mutex<u32>,
+    waited: Condvar,
+}
+
+impl GatedTrash {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    /// Blocks until `n` waits have begun, or the deadline passes (`false`).
+    fn wait_for_waits(&self, n: u32) -> bool {
+        let waits = self.waits.lock().unwrap();
+        let (waits, _) = self
+            .waited
+            .wait_timeout_while(waits, DEADLINE, |w| *w < n)
+            .unwrap();
+        *waits >= n
+    }
+}
+
+impl Probe for GatedTrash {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        if path.file_name().is_some_and(|n| n == "restore.json") {
+            *self.waits.lock().unwrap() += 1;
+            self.waited.notify_all();
+            let open = self.open.lock().unwrap();
+            let _open = self
+                .opened
+                .wait_timeout_while(open, DEADLINE, |o| !*o)
+                .unwrap();
+        }
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+}
+
+/// A failure deadline only, never a measurement (QA-031).
+const DEADLINE: Duration = Duration::from_secs(30);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-028, ARCH-058
+async fn open_and_close_never_wait_for_maintenance() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = canonical(&env.make_workspace("gated"));
+    let due = hand_entry(&ws, "te_00000000000000b1", "2027-01-15T07:59:59Z");
+    let probe = Arc::new(GatedTrash::default());
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let hub = WorkspaceHub::new(
+        env.env.clone(),
+        Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap()),
+        Arc::new(EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+        probe.clone(),
+    );
+    let reference = WorkspaceRef {
+        id: Env::workspace_hash(&std::fs::canonicalize(&ws).unwrap()),
+        path: ws.clone(),
+    };
+
+    // The open returns while its first maintenance pass is stalled in the trash.
+    let open = tokio::time::timeout(DEADLINE, hub.open(&reference))
+        .await
+        .expect("the open waited for maintenance")
+        .expect("the open");
+    let gate = probe.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || gate.wait_for_waits(1))
+            .await
+            .unwrap(),
+        "the first pass never started"
+    );
+    assert!(due.exists(), "the stalled pass purged something");
+
+    // The close isn't held up by the stalled pass either; the reopen waits for the close to
+    // finish, so it returning proves the close did.
+    drop(open);
+    tokio::time::timeout(DEADLINE, hub.close(&reference.id))
+        .await
+        .expect("the close waited for maintenance");
+    let again = tokio::time::timeout(DEADLINE, hub.open(&reference))
+        .await
+        .expect("the reopen waited for maintenance")
+        .expect("the reopen");
+
+    // Once the trash answers, a pass purges the due entry.
+    probe.release();
+    tokio::time::timeout(DEADLINE, async {
+        while due.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the due entry was never purged");
+    drop(again);
+    hub.close_all().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-032
+async fn a_run_already_in_the_trash_gets_its_trashed_utc() {
+    let ws = workspace();
+    let store = ws.store();
+    let manifest = json!({
+        "asset_id": "crane",
+        "project": "sketchbook",
+        "candidate_runs": [
+            {"run_id": "r_1", "status": "selected", "target_version": "1.0.0",
+             "signed_off": {"by": "user", "date": "2027-01-15", "version": "1.0.0"}},
+            {"run_id": "r_2", "status": "rejected", "target_version": "1.0.0",
+             "created": "2027-01-10T08:00:00Z"},
+            {"run_id": "r_3", "status": "rejected", "target_version": "1.0.0",
+             "created": "2027-01-10T09:00:00Z"},
+        ],
+    });
+    write_file(
+        &ws.file(MANIFEST),
+        (serde_json::to_string_pretty(&manifest).unwrap() + "\n").as_bytes(),
+    );
+    for run in ["r_2", "r_3"] {
+        write_file(&ws.file(&format!("{ASSET}/candidates/{run}/x.png")), b"x");
+    }
+    // Each folder was moved, then the manifest edit didn't happen (a crash, or a failed
+    // edit): r_2 long ago (its entry is purged in the same pass that records it), r_3 lately.
+    let moved = |run: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .trash(&p(&format!("{ASSET}/candidates/{run}")), "rejected")
+                .await
+                .unwrap()
+        }
+    };
+    let early = moved("r_2").await;
+    ws.after_days(85);
+    let late = moved("r_3").await;
+    let before = ws.manifest();
+
+    let report = store.maintenance(ws.after_days(6)).await.unwrap();
+    assert!(report.runs_trashed.is_empty(), "{report:?}");
+    assert_eq!(report.purged, std::slice::from_ref(&early.entry_id));
+    let mut want = before.clone();
+    want["candidate_runs"][1]["trashed_utc"] = json!(early.moved_utc);
+    want["candidate_runs"][2]["trashed_utc"] = json!(late.moved_utc);
+    assert_eq!(ws.manifest(), want);
+    assert_eq!(store.trash_list().await.unwrap(), [late]);
+    // Once recorded, nothing more happens.
+    let again = store.maintenance(ws.after_days(1)).await.unwrap();
+    assert!(
+        again.runs_trashed.is_empty() && again.purged.is_empty(),
+        "{again:?}"
+    );
+    assert_eq!(ws.manifest(), want);
+}
+
+/// The real probe, except that every `restore.json` is a cloud-only placeholder, which must
+/// never be opened.
+#[derive(Debug)]
+struct CloudRecords;
+
+impl Probe for CloudRecords {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path.file_name().is_some_and(|n| n == "restore.json") {
+            id.attributes |= ww_platform::fs::PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        assert!(
+            path.file_name().is_none_or(|n| n != "restore.json"),
+            "a cloud-only restore.json was read: {}",
+            path.display()
+        );
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-058, ARCH-079
+async fn cloud_only_restore_records_are_skipped_never_read() {
+    let ws = workspace();
+    let dir = hand_entry(&ws.root, "te_00000000000000c1", "2027-01-15T07:59:59Z");
+    let store = Arc::new(
+        Store::new(
+            ws.root.clone(),
+            ws.state.clone(),
+            FailPoints::none(),
+            ws.clock.clone(),
+            Arc::new(SeqIds::new()),
+            Arc::new(CloudRecords),
+        )
+        .with_machine("testmachine"),
+    );
+    assert!(store.trash_list().await.unwrap().is_empty());
+    let report = store.maintenance(ws.now()).await.unwrap();
+    assert!(report.purged.is_empty(), "{report:?}");
+    assert!(dir.join("payload").join("old.txt").exists());
+    assert_eq!(
+        store.trash_restore("te_00000000000000c1").await,
+        Err(StoreError::TrashUnknown("te_00000000000000c1".to_string()))
+    );
 }
