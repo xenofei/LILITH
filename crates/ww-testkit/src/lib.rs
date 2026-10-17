@@ -4,6 +4,7 @@
 //! ([`RawPipe`]), and the fake clock and ids for in-process tests ([`FakeClock`], [`SeqIds`]).
 
 pub mod bins;
+pub mod cleanup;
 pub mod clock;
 pub mod core;
 pub mod env;
