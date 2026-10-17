@@ -324,11 +324,13 @@ async fn purge_of_a_read_only_payload_succeeds() {
     let ws = workspace();
     let store = ws.store();
     sealed_version(&ws, &store).await;
-    let record = store
-        .trash(&p(&format!("{ASSET}/v1.0.0/a.png")), "test")
-        .await
-        .unwrap();
-    let payload = entry_dir(&ws, &record).join("payload").join("a.png");
+    // A whole asset goes to the trash with its sealed (read-only) version inside it.
+    let record = store.trash(&p(ASSET), "test").await.unwrap();
+    let payload = entry_dir(&ws, &record)
+        .join("payload")
+        .join("crane")
+        .join("v1.0.0")
+        .join("a.png");
     assert!(
         read_only(&payload),
         "the sealed file lost its read-only bit"
@@ -346,41 +348,55 @@ fn clear_read_only(path: &Path) {
     ww_platform::fs::set_readonly(path, false).unwrap();
 }
 
+/// A trash entry made by hand for `original`, as one made before sealed paths were refused
+/// would be: its record, and `payload/<name>` holding `files` (`""` names the file itself,
+/// anything else a file in the folder `<name>`).
+fn entry_by_hand(ws: &Ws, entry_id: &str, original: &str, files: &[(&str, &[u8])]) {
+    let moved = ww_schema::time::rfc3339(ws.now());
+    let dir = ws.file(&format!(".trash/{}/{entry_id}", &moved[..10]));
+    let name = original.rsplit('/').next().unwrap();
+    for (inside, bytes) in files {
+        let mut at = dir.join("payload").join(name);
+        if !inside.is_empty() {
+            at = at.join(inside);
+        }
+        write_file(&at, bytes);
+    }
+    let record = json!({
+        "entry_id": entry_id,
+        "original_path": original,
+        "moved_utc": moved,
+        "purge_after": ww_schema::time::rfc3339(ws.now() + TRASH_KEEP_DAYS * 86_400),
+        "reason": "test",
+    });
+    write_file(
+        &dir.join("restore.json"),
+        format!("{}\n", serde_json::to_string_pretty(&record).unwrap()).as_bytes(),
+    );
+}
+
 #[tokio::test(start_paused = true)] // spec: CORE-026
 async fn restore_under_a_version_folder_reapplies_read_only() {
     let ws = workspace();
     let store = ws.store();
     sealed_version(&ws, &store).await;
     let sealed = format!("{ASSET}/v1.0.0/a.png");
+    let snapshot_rel = format!("{ASSET}/v1.0.0/manifest.snapshot.json");
+    let (a, snapshot) = (ws.read(&sealed), ws.read(&snapshot_rel));
 
-    let record = store.trash(&p(&sealed), "test").await.unwrap();
-    let payload = entry_dir(&ws, &record).join("payload").join("a.png");
-    clear_read_only(&payload);
-    assert!(!read_only(&payload));
-    store.trash_restore(&record.entry_id).await.unwrap();
-    assert!(
-        read_only(&ws.file(&sealed)),
-        "the restored file is writable"
-    );
-
-    // The whole version folder too: every file comes back read-only.
-    let folder = store
-        .trash(&p(&format!("{ASSET}/v1.0.0")), "test")
-        .await
-        .unwrap();
-    let payload = entry_dir(&ws, &folder).join("payload").join("v1.0.0");
-    for name in ["a.png", "manifest.snapshot.json"] {
-        clear_read_only(&payload.join(name));
-    }
-    store.trash_restore(&folder.entry_id).await.unwrap();
-    for name in ["a.png", "manifest.snapshot.json"] {
+    // A sealed file or version folder is never moved to the trash (Minor 4 of the plan-2b
+    // review); nothing moves.
+    for path in [sealed.clone(), format!("{ASSET}/v1.0.0")] {
+        let refused = store.trash(&p(&path), "test").await;
         assert!(
-            read_only(&ws.file(&format!("{ASSET}/v1.0.0/{name}"))),
-            "{name}"
+            matches!(refused, Err(StoreError::PathInvalid { .. })),
+            "{path}: {refused:?}"
         );
     }
+    assert!(read_only(&ws.file(&sealed)));
+    assert_eq!(ws.read(&sealed), a);
 
-    // And a folder above it: only the files in the version folder are made read-only.
+    // A folder above it: only the files in the version folder are made read-only.
     let whole = store.trash(&p(ASSET), "test").await.unwrap();
     let payload = entry_dir(&ws, &whole).join("payload").join("crane");
     for name in ["a.png", "manifest.snapshot.json"] {
@@ -395,11 +411,95 @@ async fn restore_under_a_version_folder_reapplies_read_only() {
     }
     assert!(!read_only(&ws.file(MANIFEST)));
 
+    // An entry for a sealed file, made before that rule (here by hand), restores read-only.
+    let away = store.trash(&p(ASSET), "test").await.unwrap();
+    entry_by_hand(&ws, "te_00000000000000a1", &sealed, &[("", &a)]);
+    let restored = store.trash_restore("te_00000000000000a1").await.unwrap();
+    assert_eq!(restored.as_str(), sealed);
+    assert!(
+        read_only(&ws.file(&sealed)),
+        "the restored file is writable"
+    );
+
+    // The whole version folder too: every file comes back read-only.
+    let version = format!("{ASSET}/v2.0.0");
+    entry_by_hand(
+        &ws,
+        "te_00000000000000a2",
+        &version,
+        &[("a.png", &a), ("manifest.snapshot.json", &snapshot)],
+    );
+    store.trash_restore("te_00000000000000a2").await.unwrap();
+    for name in ["a.png", "manifest.snapshot.json"] {
+        assert!(read_only(&ws.file(&format!("{version}/{name}"))), "{name}");
+    }
+    assert!(away.entry_id.starts_with("te_"));
+
     // Elsewhere a restored file keeps the attributes it had.
     write_file(&ws.file("notes/a.txt"), b"a");
     let plain = store.trash(&p("notes/a.txt"), "test").await.unwrap();
     store.trash_restore(&plain.entry_id).await.unwrap();
     assert!(!read_only(&ws.file("notes/a.txt")));
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-083, ARCH-058
+async fn trash_waits_at_the_git_gate() {
+    let ws = workspace();
+    write_file(&ws.file("notes/a.txt"), b"a");
+    write_file(&ws.file(".git/index.lock"), b"");
+    let store = ws.store();
+    let trashing = {
+        let store = store.clone();
+        tokio::spawn(async move { store.trash(&p("notes/a.txt"), "test").await })
+    };
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!trashing.is_finished(), "the trash waits while git works");
+    assert!(ws.exists("notes/a.txt"));
+    let result = trashing.await.unwrap();
+    assert!(matches!(result, Err(StoreError::GitBusy)), "{result:?}");
+    assert_eq!(ws.read("notes/a.txt"), b"a");
+    assert!(store.trash_list().await.unwrap().is_empty());
+}
+
+/// A junction at `link` to the folder `target` (no privilege needed).
+#[allow(clippy::disallowed_methods)]
+fn junction(link: &Path, target: &Path) {
+    ww_platform::fs::create_junction(link, target)
+        .unwrap_or_else(|e| panic!("cannot create a junction at {}: {e}", link.display()));
+}
+
+/// Removes an empty folder as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn remove_empty_outside(path: &Path) {
+    std::fs::remove_dir(path).unwrap();
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-002, ARCH-058
+async fn restore_refuses_a_linked_folder_on_the_way() {
+    let ws = workspace();
+    write_file(&ws.file("notes/sub/a.txt"), b"a");
+    let store = ws.store();
+    let record = store.trash(&p("notes/sub/a.txt"), "test").await.unwrap();
+    // The emptied folder is replaced by a junction to a folder outside the workspace.
+    let outside = ws._env.root().join("outside");
+    write_file(&outside.join("keep.txt"), b"keep");
+    remove_empty_outside(&ws.file("notes/sub"));
+    junction(&ws.file("notes/sub"), &outside);
+    let refused = store.trash_restore(&record.entry_id).await;
+    assert!(
+        matches!(&refused, Err(StoreError::PathInvalid { why, .. }) if why.contains("link")),
+        "{refused:?}"
+    );
+    // Nothing landed outside, and the payload stays in the trash.
+    assert!(!outside.join("a.txt").exists());
+    let listed = store.trash_list().await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        entry_dir(&ws, &record)
+            .join("payload")
+            .join("a.txt")
+            .is_file()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

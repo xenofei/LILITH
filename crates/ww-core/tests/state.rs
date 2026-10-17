@@ -19,6 +19,7 @@ use ww_core::workspace::WorkspaceRef;
 use ww_core::{CoreConfig, CoreExit, start, start_in_thread};
 use ww_platform::Env;
 use ww_platform::process::SystemInspector;
+use ww_testkit::files::write_file;
 use ww_testkit::{CoreFixture, FakeClock, SeqIds, TestEnv, sha256_file};
 
 /// A failure deadline only, never a measurement (QA-031).
@@ -146,7 +147,7 @@ fn corrupt_file_is_refused_and_kept() {
     let env = TestEnv::new();
     let path = env.root().join("damaged").join("state.db");
     fsops::ensure_dir(path.parent().unwrap()).unwrap();
-    fsops::write_file_atomic(&path, &[0xAB_u8; 4096]).unwrap();
+    write_file(&path, &[0xAB_u8; 4096]);
     let before = sha256_file(&path);
 
     let err = StateDb::open(&path, StateScope::Suite, no_fatal())
@@ -197,7 +198,7 @@ fn wal_left_by_a_crashed_core_is_recovered() {
         if suffix == "-wal" {
             assert!(!bytes.is_empty(), "the WAL holds the writes");
         }
-        fsops::write_file_atomic(&to, &bytes).unwrap();
+        write_file(&to, &bytes);
     }
     drop(db);
 
@@ -481,7 +482,7 @@ fn startup_maps_state_errors_to_exit_codes() {
     let env = TestEnv::new();
     let db = env.env.suite_state_db();
     fsops::ensure_dir(db.parent().unwrap()).unwrap();
-    fsops::write_file_atomic(&db, &[0xAB_u8; 4096]).unwrap();
+    write_file(&db, &[0xAB_u8; 4096]);
     let before = sha256_file(&db);
     let core = CoreFixture::spawn_raw(&env);
     assert_eq!(core.wait_exit(DEADLINE), Some(5), "a damaged state.db");

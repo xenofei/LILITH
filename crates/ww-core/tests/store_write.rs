@@ -2082,3 +2082,111 @@ async fn path_keys_agree_with_the_volume() {
         );
     }
 }
+
+/// The real probe, except that the first data open of a `.ww-bak-` file reads a copy of it as
+/// it was, while an outside writer saves `then` into the real one right after: what was
+/// hashed is no longer what is there when recovery removes it.
+#[derive(Debug)]
+struct SaveAfterHash {
+    copy: PathBuf,
+    then: Vec<u8>,
+    done: AtomicBool,
+}
+
+impl Probe for SaveAfterHash {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        let backup = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains(".ww-bak-"));
+        if backup && !self.done.swap(true, Ordering::SeqCst) {
+            write_file(&self.copy, &std::fs::read(path)?);
+            write_file(path, &self.then);
+            return SystemProbe.open_read(&self.copy);
+        }
+        SystemProbe.open_read(path)
+    }
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074, CORE-110
+async fn recovery_never_deletes_a_backup_that_changed_after_its_hash() {
+    let ws = workspace();
+    put(&ws.plain(), "notes/a.txt", "v1", Expect::New).await;
+    let crashed = ws.store(Arc::new(
+        FailPoints::parse("store.after_replace=io").unwrap(),
+    ));
+    let result = crashed
+        .write(&p("notes/a.txt"), b"v2".to_vec(), Expect::Generated)
+        .await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+    drop(crashed);
+    // The backup holds the old bytes (rule 3 would remove it), but an outside save lands in
+    // it between recovery's hash and its delete.
+    let probe = Arc::new(SaveAfterHash {
+        copy: ws._env.root().join("hashed-copy.txt"),
+        then: b"saved outside".to_vec(),
+        done: AtomicBool::new(false),
+    });
+    let store = ws.store_with_probe(FailPoints::none(), probe.clone());
+    let report = store.recover().await.expect("recover");
+    assert!(probe.done.load(Ordering::SeqCst), "the save never happened");
+    // The outside save is kept, visible at the target; the core's bytes are set aside.
+    assert_eq!(ws.read("notes/a.txt"), b"saved outside");
+    let conflicts = ws.conflicts("notes");
+    assert_eq!(conflicts.len(), 1, "{:?}", ws.names("notes"));
+    assert_eq!(ws.read(&format!("notes/{}", conflicts[0])), b"v2");
+    assert!(report.backups_removed.is_empty(), "{report:?}");
+    assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
+    assert_eq!(ws.state.pending("notes/a.txt").await.unwrap(), None);
+}
+
+#[tokio::test(start_paused = true)] // spec: ARCH-002, CORE-040
+async fn a_linked_folder_above_the_target_is_refused_for_every_write() {
+    // Minor 3 of the plan-2b review: plain writes, edits and manifest edits check every
+    // folder on the way, as imports and sign-offs do, so a junction under the workspace never
+    // lets a write land outside it.
+    let ws = workspace();
+    let outside = ws.root.parent().unwrap().join("outside-target");
+    write_file(&outside.join("progress.md"), b"# Progress\n\n## Done\n");
+    write_file(&ws.file("projects/keep.txt"), b"x");
+    junction(&ws.file("projects/linked"), &outside);
+    let store = ws.plain();
+    let new = store
+        .write(&p("projects/linked/new.txt"), b"core".to_vec(), Expect::New)
+        .await
+        .map(drop);
+    let edit = store
+        .edit_text(&p("projects/linked/progress.md"), &|t| {
+            Ok(format!("{t}- 2027-01-15: an entry\n"))
+        })
+        .await
+        .map(drop);
+    let manifest = store
+        .edit_manifest(&p("projects/linked/assets/kite/kite.manifest.json"), &|m| {
+            m.set("status", serde_json::Value::from("planned"));
+            Ok(())
+        })
+        .await
+        .map(drop);
+    for (what, result) in [("write", new), ("edit", edit), ("manifest edit", manifest)] {
+        let Err(e @ StoreError::PathInvalid { path, .. }) = &result else {
+            panic!("{what}: a linked folder is store.path_invalid, got {result:?}");
+        };
+        assert_eq!(path, "projects/linked", "{what}: {e}");
+        assert!(e.to_string().contains("link or junction"), "{what}: {e}");
+    }
+    // Nothing landed outside the workspace.
+    assert_eq!(
+        std::fs::read(outside.join("progress.md")).unwrap(),
+        b"# Progress\n\n## Done\n"
+    );
+    assert!(!outside.join("new.txt").exists());
+    assert!(!outside.join("assets").exists());
+}

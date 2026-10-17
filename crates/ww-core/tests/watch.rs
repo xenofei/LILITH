@@ -1464,3 +1464,44 @@ async fn a_metadata_only_change_keeps_the_verifications_result() {
     assert_eq!(edits[0]["previous_sha256"], SEALED_SHA256);
     watcher.stop();
 }
+
+#[tokio::test(flavor = "multi_thread")] // spec: ARCH-083
+async fn a_gitdir_file_points_the_git_watch_at_the_real_git_folder() {
+    // Minor 1 of the plan-2b review: in a linked worktree (or a submodule, or
+    // `--separate-git-dir`) `.git` is a `gitdir:` file, and git's `index.lock` and `HEAD` are
+    // in the folder it names, outside the workspace's own watch.
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = env.copy_fixture_workspace("worktree");
+    let real = canonical(&env.root().join("ws-worktree"))
+        .parent()
+        .unwrap()
+        .join("main-repo")
+        .join(".git")
+        .join("worktrees")
+        .join("ws");
+    write_file(&real.join("HEAD"), b"ref: refs/heads/main\n");
+    write_file(
+        &ws.join(".git"),
+        format!("gitdir: {}\n", real.display()).as_bytes(),
+    );
+    let core = Core::open(env, ws, fast(), FailPoints::none()).await;
+    assert_eq!(core.open.store.git_gate().git_dir(), real);
+    core.fence().await;
+    assert!(!kinds(&core.published("workspace").await).contains(&"git_paused".to_string()));
+
+    // `HEAD` moves in the real git folder (a checkout in the worktree): git is working.
+    write_file(&real.join("HEAD"), b"ref: refs/heads/topic\n");
+    core.until("git_paused after HEAD moved", || async {
+        kinds(&core.published("workspace").await).contains(&"git_paused".to_string())
+    })
+    .await;
+    // Its `index.lock` holds writes back, with or without the watcher's flag.
+    write_file(&real.join("index.lock"), b"");
+    assert!(core.open.store.git_gate().lock_exists());
+    move_outside(&real.join("index.lock"), &real.join("index"));
+    core.until("git_resumed once git is quiet", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    assert!(!core.open.store.git_gate().is_busy());
+}

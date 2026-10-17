@@ -1171,6 +1171,21 @@ impl Store {
         }
     }
 
+    /// Removes the dot-file `path` only while it still holds `sha256`, hashing and deleting it
+    /// through one unshared handle (`remove_if_hash`), as the live write path does. Returns
+    /// whether it is gone (one already gone counts); `false` means it changed since it was
+    /// hashed, and it is kept.
+    async fn remove_same(&self, path: &Path, sha256: &str) -> io::Result<bool> {
+        let (path, sha256) = (path.to_path_buf(), sha256.to_string());
+        match self
+            .fs_retry(None, move || remove_if_hash(&path, &sha256))
+            .await
+        {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+            done => done,
+        }
+    }
+
     async fn path_exists(&self, path: &Path) -> bool {
         let path = path.to_path_buf();
         blocking(move || Ok(exists(&path))).await.unwrap_or(false)
@@ -1774,6 +1789,9 @@ impl Store {
         writable(rel)?;
         self.check_locks(rel).await?;
         self.writable_on_disk(rel).await?;
+        // A linked folder on the way would let the write land outside the workspace (the
+        // target itself is checked again at step 3). Attributes only, once per call.
+        self.refuse_links(rel).await?;
         let name = rel.file_name().to_string();
         if name.encode_utf16().count() + NAME_SUFFIX_UNITS > NAME_UNITS_MAX {
             return Err(StoreError::PathInvalid {
@@ -2420,10 +2438,23 @@ impl Store {
         let mut left: Vec<(PathBuf, FileHash)> = Vec::new();
         for (i, (backup, h)) in hashed.into_iter().enumerate() {
             if h.sha256 == row.new_sha256 && !(keep_one && i == 0) {
-                self.remove(&backup)
+                if self
+                    .remove_same(&backup, &h.sha256)
                     .await
-                    .map_err(|e| StoreError::io(&rel, &e))?;
-                report.backups_removed.push(self.rel_of(&backup));
+                    .map_err(|e| StoreError::io(&rel, &e))?
+                {
+                    report.backups_removed.push(self.rel_of(&backup));
+                    continue;
+                }
+                // It changed since it was hashed: what it holds now is resolved below.
+                tracing::warn!(backup = %backup.display(), "a backup changed while recovery looked at it; it is kept");
+                if let Some(now) = self
+                    .hash_of(&backup)
+                    .await
+                    .map_err(|e| StoreError::io(&rel, &e))?
+                {
+                    left.push((backup, now));
+                }
             } else {
                 left.push((backup, h));
             }
@@ -2454,11 +2485,16 @@ impl Store {
                 let ours = row.old_sha256.as_deref() == Some(h.sha256.as_str())
                     || generated.as_deref() == Some(h.sha256.as_str());
                 if ours {
-                    self.remove(&backup)
+                    if self
+                        .remove_same(&backup, &h.sha256)
                         .await
-                        .map_err(|e| StoreError::io(&rel, &e))?;
-                    report.backups_removed.push(self.rel_of(&backup));
-                    continue;
+                        .map_err(|e| StoreError::io(&rel, &e))?
+                    {
+                        report.backups_removed.push(self.rel_of(&backup));
+                        continue;
+                    }
+                    // It changed since it was hashed: an outside edit, put back below.
+                    tracing::warn!(backup = %backup.display(), "a backup changed while recovery looked at it; it is an outside edit");
                 }
                 // An outside edit: the core's bytes are set aside, the edit goes back.
                 if self.path_exists(&abs).await {
@@ -2527,9 +2563,9 @@ impl Store {
             .generated(rel.as_str())
             .await
             .map_err(|e| StoreError::state(&rel, &e))?;
-        if current.is_some_and(|c| c.sha256 == h.sha256) || generated.as_deref() == Some(&h.sha256)
-        {
-            self.remove(backup).await.map_err(io)?;
+        let ours = current.is_some_and(|c| c.sha256 == h.sha256)
+            || generated.as_deref() == Some(&h.sha256);
+        if ours && self.remove_same(backup, &h.sha256).await.map_err(io)? {
             report.backups_removed.push(self.rel_of(backup));
         } else {
             let kept = self.move_aside(backup, dir, name).await.map_err(io)?;

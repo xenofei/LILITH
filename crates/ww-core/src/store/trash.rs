@@ -39,8 +39,9 @@ use serde_json::Value;
 use ww_schema::{CandidateRun, Manifest, ManifestView};
 
 use super::fsops;
+use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
-use super::paths::{WsPath, path_key};
+use super::paths::{WsPath, path_key, writable};
 use super::versions::{files_under, set_readonly_all};
 use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
@@ -241,13 +242,18 @@ fn remove_if_empty(path: &Path) {
 }
 
 impl Store {
-    /// Moves `rel` (a file or a folder) to the trash with `reason` (module docs).
+    /// Moves `rel` (a file or a folder) to the trash with `reason` (module docs). A sealed
+    /// version folder, or anything in one, is never moved (CORE-026; it is refused as every
+    /// write there is, also through an 8.3 name). A folder above versions, such as a whole
+    /// asset, moves with its versions intact, and a restore makes their files read-only again.
+    /// It waits at the git gate like every write (ARCH-083).
     ///
     /// # Errors
     /// `workspace.read_only`; `store.path_invalid` for the trash itself, `.worldwright`,
-    /// `.git`, `registry/ledger.csv` or a link; `store.locked` for a path in its manifest's
-    /// `locks`; `store.io` when there is nothing at `rel` or a file call fails (`store.busy`
-    /// when it stays held).
+    /// `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, or a link;
+    /// `store.locked` for a path in its manifest's `locks`; `store.git_busy` when git is still
+    /// working after 60 s; `store.io` when there is nothing at `rel` or a file call fails
+    /// (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
         let first = rel.as_str().split('/').next().unwrap_or_default();
@@ -263,7 +269,10 @@ impl Store {
                     .to_string(),
             });
         }
+        writable(rel)?;
+        self.writable_on_disk(rel).await?;
         self.check_locks(rel).await?;
+        self.git_gate().wait_clear(GIT_WAIT).await?;
         self.trash_now(rel, reason).await
     }
 
@@ -387,8 +396,9 @@ impl Store {
     ///
     /// # Errors
     /// `workspace.read_only`; `trash.unknown` for no such entry; `trash.restore_conflict`
-    /// (naming the original path) when something is at the original path now; `store.io` when
-    /// a file call fails.
+    /// (naming the original path) when something is at the original path now;
+    /// `store.path_invalid` when a folder on the way to it is now a link (the payload stays in
+    /// the trash); `store.io` when a file call fails.
     pub async fn trash_restore(&self, entry_id: &str) -> Result<WsPath, StoreError> {
         self.writable_store()?;
         let unknown = || StoreError::TrashUnknown(entry_id.to_string());
@@ -427,6 +437,9 @@ impl Store {
                 }
             }
         };
+        // The move checks only its target: a linked folder above it would let it land outside
+        // the workspace.
+        self.refuse_links(&rel).await?;
         let target = rel.abs(self.root());
         let _held = self.lock_path(&rel).await;
         let (from, to) = (payload.clone(), target.clone());

@@ -6,6 +6,12 @@
 //! while `<ws>\.git\index.lock` exists. The gate checks that file itself with one
 //! `GetFileAttributesW`, so a write never races git during the watcher's batch window, or when
 //! no watcher runs at all (CORE-010: the store owns the gate, the watcher only sets its flag).
+//!
+//! **The git folder** is resolved once, when the gate is made (the workspace's open): `.git`
+//! is usually a folder, but in a linked worktree, a submodule or a repository made with
+//! `--separate-git-dir` it is a file holding `gitdir: <path>` (absolute, or relative to the
+//! workspace folder). The gate then checks `<that folder>\index.lock`, and the watcher watches
+//! that folder's `index.lock` and `HEAD` ([`GitGate::git_dir`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,17 +28,77 @@ pub const GIT_POLL: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 pub struct GitGate {
     busy: AtomicBool,
-    /// `<ws>\.git\index.lock`.
+    /// The repository's git folder ([`git_dir_of`]).
+    dir: PathBuf,
+    /// `<git folder>\index.lock`.
     lock: PathBuf,
 }
 
+/// The longest `.git` file read: a `gitdir:` line is one path.
+const GITDIR_FILE_MAX: u64 = 64 * 1024;
+
+/// The git folder of the workspace folder `root`: `<root>\.git`, unless that is a file whose
+/// first `gitdir: <path>` line names another folder (a linked worktree, a submodule,
+/// `--separate-git-dir`); a relative path is relative to `root`, and `.` and `..` are
+/// resolved. A `.git` file that can't be read, or holds no such line, leaves `<root>\.git`
+/// (logged).
+pub fn git_dir_of(root: &Path) -> PathBuf {
+    let dot = root.join(".git");
+    let is_file = std::fs::symlink_metadata(ww_platform::fs::long_path(&dot))
+        .is_ok_and(|m| m.is_file() && m.len() <= GITDIR_FILE_MAX);
+    if !is_file {
+        return dot;
+    }
+    let text = match std::fs::read_to_string(ww_platform::fs::long_path(&dot)) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!(path = %dot.display(), error = %e, "the .git file can't be read; git is watched at .git");
+            return dot;
+        }
+    };
+    let Some(target) = text
+        .lines()
+        .find_map(|l| l.trim_start_matches('\u{feff}').strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        tracing::warn!(path = %dot.display(), "the .git file holds no gitdir line; git is watched at .git");
+        return dot;
+    };
+    let named = PathBuf::from(target.replace('/', "\\"));
+    let joined = if named.is_absolute() {
+        named
+    } else {
+        root.join(named)
+    };
+    let mut resolved = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved
+}
+
 impl GitGate {
-    /// The gate of the workspace folder `root`, not busy.
+    /// The gate of the workspace folder `root`, not busy, at the git folder [`git_dir_of`]
+    /// resolves.
     pub fn new(root: &Path) -> GitGate {
+        let dir = git_dir_of(root);
         GitGate {
             busy: AtomicBool::new(false),
-            lock: root.join(".git").join("index.lock"),
+            lock: dir.join("index.lock"),
+            dir,
         }
+    }
+
+    /// The repository's git folder, whose `index.lock` the gate checks.
+    pub fn git_dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The watcher's flag: set when git starts, cleared after the post-git rescan.
@@ -40,13 +106,13 @@ impl GitGate {
         self.busy.store(busy, Ordering::SeqCst);
     }
 
-    /// The watcher's flag is set, or `<ws>\.git\index.lock` exists (`fs::attributes`; any
+    /// The watcher's flag is set, or `<git folder>\index.lock` exists (`fs::attributes`; any
     /// answer but "not found" counts as there, so an unreadable lock still holds writes back).
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst) || self.lock_exists()
     }
 
-    /// Whether `<ws>\.git\index.lock` exists.
+    /// Whether `<git folder>\index.lock` exists.
     pub fn lock_exists(&self) -> bool {
         match ww_platform::fs::attributes(&self.lock) {
             Ok(_) => true,
@@ -119,6 +185,53 @@ mod tests {
         gate.set_busy(false);
         assert_eq!(waiting.await.unwrap(), Ok(()));
         assert!(start.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test] // spec: ARCH-083
+    fn a_gitdir_file_points_the_gate_at_the_real_git_folder() {
+        // Minor 1 of the plan-2b review: a linked worktree, a submodule or
+        // `--separate-git-dir` has a `.git` file, and git's `index.lock` is in the folder it
+        // names.
+        let env = TestEnv::new();
+        let root = env.make_workspace("worktree");
+        let real = env
+            .root()
+            .join("repo")
+            .join(".git")
+            .join("worktrees")
+            .join("ws");
+        write_file(&real.join("HEAD"), b"ref: refs/heads/main\n");
+        write_file(
+            &root.join(".git"),
+            format!("gitdir: {}\n", real.display()).as_bytes(),
+        );
+        let gate = GitGate::new(&root);
+        assert_eq!(gate.git_dir(), real);
+        assert!(!gate.is_busy());
+        write_file(&real.join("index.lock"), b"");
+        assert!(gate.is_busy(), "the real index.lock holds writes back");
+        // `<root>\.git\index.lock` can't exist (`.git` is a file), and the gate never looks
+        // there.
+        assert!(!root.join(".git").is_dir());
+
+        // A relative gitdir (a submodule's `../.git/modules/<name>`), with `/` separators.
+        let sub = env.root().join("super").join("lib");
+        let modules = env
+            .root()
+            .join("super")
+            .join(".git")
+            .join("modules")
+            .join("lib");
+        write_file(&modules.join("HEAD"), b"ref: refs/heads/main\n");
+        write_file(&sub.join(".git"), b"gitdir: ../.git/modules/lib\r\n");
+        assert_eq!(git_dir_of(&sub), modules);
+
+        // A plain `.git` folder, or none, is used as it is; so is a `.git` file without a
+        // gitdir line.
+        let plain = env.make_workspace("plain");
+        assert_eq!(git_dir_of(&plain), plain.join(".git"));
+        write_file(&plain.join(".git"), b"not a gitdir file\n");
+        assert_eq!(git_dir_of(&plain), plain.join(".git"));
     }
 
     #[tokio::test(start_paused = true)] // spec: ARCH-083

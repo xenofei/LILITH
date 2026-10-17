@@ -32,7 +32,11 @@
 //! those tasks too.
 //!
 //! **Git** (ARCH-083). `index.lock` appearing (or any event of it) or `HEAD` changing sets the
-//! store's git flag and publishes `{kind:"git_paused"}`. Once `index.lock` is gone and nothing
+//! store's git flag and publishes `{kind:"git_paused"}`. Where `.git` is a `gitdir:` file (a
+//! linked worktree, a submodule, `--separate-git-dir`), the git folder it names is outside the
+//! workspace's watch, so [`Watcher::start`] watches that folder too, for its `index.lock` and
+//! `HEAD` ([`GitGate::git_dir`](crate::store::GitGate::git_dir)), and the store's gate checks
+//! the `index.lock` there. Once `index.lock` is gone and nothing
 //! of git has moved for [`WatchConfig::git_quiet`]: a full rescan (every manifest re-parsed
 //! first), `decide` for every deferred and changed path, `{kind:"git_resumed"}`, the flag
 //! cleared, and only then the actions that write or publish, so a human edit the rescan finds is
@@ -193,6 +197,8 @@ fn asset_folder_of(path: &WsPath) -> Option<(&str, &str)> {
 pub struct Watcher {
     shared: Arc<Shared>,
     dir: Mutex<Option<Arc<DirWatcher>>>,
+    /// The watch of a git folder outside the workspace (a `gitdir:` file's), if any.
+    git_dir: Mutex<Option<Arc<DirWatcher>>>,
     stop: CancellationToken,
 }
 
@@ -233,7 +239,29 @@ impl Watcher {
         // first reconcile, which every fence waits for, covers what came before them. One
         // written after arming is both listed here and seen, which is harmless.
         watcher.shared.seed_fences();
+        watcher.watch_outside_git_dir();
         Ok(watcher)
+    }
+
+    /// Watches the git folder a `.git` file names when it isn't the workspace's own `.git`
+    /// folder (module docs): its `index.lock` and `HEAD` (or a lost event there) count as git
+    /// activity. A folder that can't be watched is logged; the gate still checks its
+    /// `index.lock` before every write.
+    fn watch_outside_git_dir(&self) {
+        let root = self.shared.store.root();
+        let git_dir = self.shared.store.git_gate().git_dir().to_path_buf();
+        if git_dir == root.join(".git") || git_dir.starts_with(root) {
+            return;
+        }
+        match DirWatcher::start(&git_dir, 16 * 1024) {
+            Ok((dir, rx)) => {
+                *lock(&self.git_dir) = Some(Arc::new(dir));
+                tokio::spawn(watch_git(self.shared.clone(), rx, self.stop.clone()));
+            }
+            Err(e) => {
+                tracing::warn!(git_dir = %git_dir.display(), error = %e, "the repository's git folder can't be watched; writes still wait while its index.lock exists");
+            }
+        }
     }
 
     /// A watcher fed by `changes` instead of a `DirWatcher` (paths relative to the workspace
@@ -296,6 +324,7 @@ impl Watcher {
         Arc::new(Watcher {
             shared,
             dir: Mutex::new(dir),
+            git_dir: Mutex::new(None),
             stop,
         })
     }
@@ -310,6 +339,9 @@ impl Watcher {
     pub fn stop(&self) {
         self.stop.cancel();
         if let Some(dir) = lock(&self.dir).take() {
+            dir.stop();
+        }
+        if let Some(dir) = lock(&self.git_dir).take() {
             dir.stop();
         }
     }
@@ -416,6 +448,48 @@ async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
+    }
+}
+
+/// The loop of an outside git folder's watch: `index.lock` and `HEAD` at its top (or lost
+/// events) are git activity; nothing else there is looked at.
+async fn watch_git(
+    shared: Arc<Shared>,
+    mut rx: UnboundedReceiver<DirChange>,
+    stop: CancellationToken,
+) {
+    loop {
+        let change = tokio::select! {
+            biased;
+            () = stop.cancelled() => return,
+            change = rx.recv() => change,
+        };
+        let path = match change {
+            None => return,
+            Some(DirChange::Overflow) => {
+                shared.git_activity();
+                continue;
+            }
+            Some(DirChange::Failed(code)) => {
+                tracing::warn!(code, "the repository's git folder can no longer be watched");
+                return;
+            }
+            Some(
+                DirChange::Added(p)
+                | DirChange::Removed(p)
+                | DirChange::Modified(p)
+                | DirChange::RenamedFrom(p)
+                | DirChange::RenamedTo(p),
+            ) => p,
+        };
+        let mut parts = path.components();
+        let (Some(name), None) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let name = name.as_os_str().to_string_lossy();
+        if name.eq_ignore_ascii_case("index.lock") || name.eq_ignore_ascii_case("HEAD") {
+            shared.git_activity();
+        }
     }
 }
 

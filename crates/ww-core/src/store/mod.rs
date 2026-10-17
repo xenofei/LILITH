@@ -34,7 +34,7 @@ pub mod versions;
 pub mod write;
 
 pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
-pub use fsops::{ensure_dir, write_file_atomic};
+pub use fsops::ensure_dir;
 pub use git_gate::{GIT_WAIT, GitGate};
 pub use logs::{LogKind, append_loose_usage};
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};

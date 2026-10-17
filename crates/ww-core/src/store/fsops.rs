@@ -17,8 +17,10 @@ use super::failpoints::FailPoints;
 /// Writes `bytes` to `path` atomically: the data goes to `<path>.tmp-<pid>`, is flushed to disk
 /// with `sync_all`, and is then renamed over the target.
 ///
-/// A plan-2 stub kept for the state tests' fixture files. It replaces an existing target, so
-/// workspace files never go through it: they go through `Store::write`.
+/// A plan-2 stub kept for this crate's unit tests' fixture files, so it exists only in test
+/// builds. It replaces an existing target without any hash check, so nothing outside tests
+/// may use it: workspace files go through `Store::write`.
+#[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
