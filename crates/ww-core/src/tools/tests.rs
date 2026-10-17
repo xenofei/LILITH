@@ -21,7 +21,7 @@ use super::registry::schema_2020_12;
 use super::*;
 use crate::config::CoreConfig;
 use crate::events::EventBus;
-use crate::lifecycle::{IDLE_EXIT_AFTER, Lifecycle};
+use crate::lifecycle::{DrainReason, IDLE_EXIT_AFTER, Lifecycle};
 use crate::session::Session;
 use crate::state::{OnFatal, StateRegistry};
 
@@ -192,10 +192,12 @@ fn as_dyn(tool: &Arc<RecTool>) -> Arc<dyn Tool> {
 
 /// A dispatcher over the test-channel tools plus `extra`, with recording hooks.
 struct Fixture {
-    env: TestEnv,
     log: Log,
     gates: Arc<TestGates>,
     dispatcher: Dispatcher,
+    /// Last, because fields drop in order: the dispatcher holds the suite `state.db` open,
+    /// and the `TestEnv` cannot remove its folder until that handle is closed.
+    env: TestEnv,
 }
 
 fn no_fatal() -> OnFatal {
@@ -227,10 +229,10 @@ fn fixture_with(hooks: PipelineHooks, log: &Log, extra: &[Arc<dyn Tool>]) -> Fix
     let lifecycle = Lifecycle::new(clock.clone(), IDLE_EXIT_AFTER);
     let dispatcher = Dispatcher::new(reg, hooks, states, events, ids, clock, lifecycle);
     Fixture {
-        env,
         log,
         gates,
         dispatcher,
+        env,
     }
 }
 
@@ -769,6 +771,11 @@ async fn a_panicking_stage_releases_the_key() {
         "{e:?}"
     );
     assert_eq!(tool.executions(), 0);
-    // The claim released the row as it was dropped.
-    fx.wait_for_rows(&[]).await;
+    // The claim releases the row as it is dropped, in a task that stays in flight until the
+    // release is done: a drain waits for it, and the row is gone once the drain ends.
+    let lifecycle = fx.dispatcher.lifecycle();
+    lifecycle.begin_drain(DrainReason::Requested);
+    let report = lifecycle.run_shutdown().await;
+    assert_eq!(report.abandoned_calls, 0);
+    assert_eq!(fx.rows(), Vec::new());
 }

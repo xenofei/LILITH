@@ -136,6 +136,44 @@ impl fmt::Debug for CallGuard {
     }
 }
 
+impl CallGuard {
+    /// Leave for this admitted call to go on with work in a task of its own later (an
+    /// idempotency row released after a panic). Not counted until [`FollowUp::start`].
+    pub fn follow_up(&self) -> FollowUp {
+        FollowUp {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Work an admitted call may go on with after its pipeline ends ([`CallGuard::follow_up`]).
+pub struct FollowUp {
+    shared: Arc<Shared>,
+}
+
+impl fmt::Debug for FollowUp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FollowUp").finish_non_exhaustive()
+    }
+}
+
+impl FollowUp {
+    /// The work starts: in flight until the guard is dropped. Counted even while draining,
+    /// since the call was admitted before the drain, so the drain waits for this work too.
+    /// Start it while the call's own guard is still held, so the count never reaches zero
+    /// in between.
+    pub fn start(self) -> CallGuard {
+        {
+            let mut inner = self.shared.lock();
+            inner.in_flight += 1;
+            inner.idle_since = None;
+        }
+        CallGuard {
+            shared: self.shared,
+        }
+    }
+}
+
 impl Drop for CallGuard {
     fn drop(&mut self) {
         {
@@ -692,6 +730,38 @@ mod tests {
         assert_eq!(report.reason, DrainReason::Requested);
         assert_eq!(report.abandoned_calls, 0);
         assert_eq!(report.exit_code(), 0);
+    }
+
+    #[tokio::test(start_paused = true)] // spec: ARCH-021, CORE-016
+    async fn a_follow_up_counts_only_once_started_and_holds_the_drain() {
+        let clock = FakeClock::new();
+        let lc = lifecycle(&clock);
+        let guard = lc.try_call_started().expect("not draining");
+        let follow_up = guard.follow_up();
+        assert_eq!(
+            lc.in_flight(),
+            1,
+            "a follow-up not started yet is not counted"
+        );
+        lc.begin_drain(DrainReason::Requested);
+        // Started during the drain, while the call's own guard is still held.
+        let work = follow_up.start();
+        assert_eq!(lc.in_flight(), 2);
+        drop(guard);
+
+        let running = lc.clone();
+        let mut shutdown = tokio::spawn(async move { running.run_shutdown().await });
+        let an_hour = Duration::from_secs(3600);
+        assert!(
+            tokio::time::timeout(an_hour, &mut shutdown).await.is_err(),
+            "the follow-up holds the drain"
+        );
+        drop(work);
+        let report = tokio::time::timeout(an_hour, shutdown)
+            .await
+            .expect("the drain ends once the follow-up is done")
+            .unwrap();
+        assert_eq!(report.abandoned_calls, 0);
     }
 
     #[tokio::test(start_paused = true)] // spec: ARCH-021

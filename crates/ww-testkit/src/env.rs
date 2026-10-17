@@ -10,7 +10,9 @@
 //! A `TestEnv` also runs the real `ww` with the child environment of its test channel
 //! ([`TestEnv::ww`]), lays out workspaces and state databases, and on drop drains any core
 //! still serving its channel (QA-041), so no core outlives its test and no temporary folder
-//! stays locked.
+//! stays locked. It then removes its folder with [`crate::cleanup`], which clears sealed
+//! read-only files, never follows a junction out of the folder, retries briefly while another
+//! handle still holds a file, and reports anything it had to leave.
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
@@ -21,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-use tempfile::TempDir;
 use ww_platform::{
     Channel, ENV_CHANNEL, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env, RealLocations, Roots,
     TEST_PIPE_SID, arm_test_guard,
@@ -33,7 +34,9 @@ use crate::bins::ensure_built;
 /// directory that is deleted on drop.
 pub struct TestEnv {
     pub env: Env,
-    _dir: TempDir,
+    /// The temporary directory. Removed by this type's drop, not by `tempfile`, whose removal
+    /// stops at the first locked file and discards the error.
+    root: PathBuf,
 }
 
 /// What a finished `ww` run printed and returned.
@@ -69,25 +72,26 @@ impl TestEnv {
         });
         arm_test_guard(real.clone());
 
-        let dir = tempfile::Builder::new()
+        let root = tempfile::Builder::new()
             .prefix(&prefix)
             .tempdir()
-            .expect("cannot create the test directory");
+            .expect("cannot create the test directory")
+            .keep();
         let roots = Roots {
-            roaming: dir.path().join("roaming"),
-            local: dir.path().join("local"),
-            user_profile: dir.path().join("profile"),
+            roaming: root.join("roaming"),
+            local: root.join("local"),
+            user_profile: root.join("profile"),
         };
         for r in [&roots.roaming, &roots.local, &roots.user_profile] {
             std::fs::create_dir_all(r).expect("cannot create a test root");
         }
         let env = Env::with_roots(Channel::Test(unique_id()), roots, TEST_PIPE_SID.to_string());
-        TestEnv { env, _dir: dir }
+        TestEnv { env, root }
     }
 
     /// The temporary directory that holds every root.
     pub fn root(&self) -> &Path {
-        self._dir.path()
+        &self.root
     }
 
     /// The variables that put a child process on this test channel: `WW_CHANNEL=test-<id>`,
@@ -328,10 +332,15 @@ impl Default for TestEnv {
 
 impl Drop for TestEnv {
     /// Drains any core still serving this channel, for example one that `ww` started and this
-    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Runs before the
-    /// temporary directory is removed. Never panics.
+    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Then removes the
+    /// temporary directory with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
+    /// another handle still holds a file, and reports what it had to leave on stderr and in
+    /// [`crate::cleanup::leftovers_log`]. Never panics.
     fn drop(&mut self) {
         crate::core::drain_channel(&self.env.pipe_name());
+        if let Err(left) = crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR) {
+            crate::cleanup::report_leftovers(&self.root, &left);
+        }
     }
 }
 
@@ -588,6 +597,69 @@ mod tests {
         let plain = t.root().join("nested").join("deeper").join("state.db");
         t.write_state_db_version(&plain, -3, false);
         assert_eq!(read(&plain), (-3, "delete".to_string()));
+    }
+
+    fn is_read_only(path: &Path) -> bool {
+        std::fs::metadata(path).unwrap().permissions().readonly()
+    }
+
+    fn set_read_only(path: &Path) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test] // spec: QA-040
+    fn drop_removes_sealed_read_only_files_and_junctions_without_following_them() {
+        // A folder outside the TestEnv that a junction inside it points to, holding a
+        // read-only file that must stay exactly as it is.
+        let outside = tempfile::Builder::new()
+            .prefix("ww-testkit-junction-target-")
+            .tempdir()
+            .unwrap();
+        let kept = outside.path().join("kept.txt");
+        std::fs::write(&kept, "outside").unwrap();
+        set_read_only(&kept);
+
+        let t = TestEnv::with_label("Ünïcödé space");
+        let root = t.root().to_path_buf();
+        // A sealed version: read-only files in a read-only folder.
+        let sealed = t
+            .make_workspace("sealed")
+            .join("projects")
+            .join("sketchbook")
+            .join("assets")
+            .join("crane")
+            .join("v1.0.0");
+        std::fs::create_dir_all(&sealed).unwrap();
+        for name in ["crane.png", "manifest.snapshot.json"] {
+            std::fs::write(sealed.join(name), name).unwrap();
+            set_read_only(&sealed.join(name));
+        }
+        set_read_only(&sealed);
+        // A junction from inside the root to the outside folder.
+        let link = root.join("ws-sealed").join("linked");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+        assert!(
+            link.join("kept.txt").is_file(),
+            "the junction does not resolve"
+        );
+        assert!(is_read_only(&sealed.join("crane.png")));
+
+        drop(t);
+
+        assert!(!root.exists(), "{} was left behind", root.display());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "outside");
+        assert!(
+            is_read_only(&kept),
+            "the read-only flag was cleared through the junction"
+        );
     }
 
     #[test] // spec: QA-040
