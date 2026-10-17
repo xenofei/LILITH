@@ -416,6 +416,15 @@ async fn default_switched(
     }
 }
 
+/// After a failed create: the workspace's open (its `core.lock` and `state.db`) is let go of
+/// unless it is the default workspace, which the core serves anyway.
+async fn close_unless_default(t: &Tools, ws: &WorkspaceRef) {
+    t.hub.refresh_default();
+    if t.hub.default_id().as_deref() != Some(ws.id.as_str()) {
+        t.hub.close(&ws.id).await;
+    }
+}
+
 /// `workspace.create`'s body (module docs).
 async fn create(
     t: &Tools,
@@ -455,15 +464,19 @@ async fn create(
                 |n| n.to_string_lossy().into_owned(),
             )
         });
-        write_layout(t, &ws, &name, trace_id).await?;
+        if let Err(e) = write_layout(t, &ws, &name, trace_id).await {
+            close_unless_default(t, &ws).await;
+            return Err(e);
+        }
     }
     // 5.
     t.hub.refresh_default();
     let old = t.hub.default_ref();
     let make_default = args.default.unwrap_or(old.is_none());
-    register_workspace(&t.env, &ws.path, make_default, t.hub.failpoints())
-        .await
-        .map_err(|e| e.to_error(trace_id))?;
+    if let Err(e) = register_workspace(&t.env, &ws.path, make_default, t.hub.failpoints()).await {
+        close_unless_default(t, &ws).await;
+        return Err(e.to_error(trace_id));
+    }
     t.hub.refresh_default();
     let default = t.hub.default_id().as_deref() == Some(ws.id.as_str());
     if default {

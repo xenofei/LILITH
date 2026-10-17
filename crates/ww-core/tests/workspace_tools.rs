@@ -292,6 +292,10 @@ fn create_writes_layout_and_registers_last() {
         assert!(ws.join(rel).is_file(), "{rel} is missing");
     }
     assert_eq!(registration(&env, &ws), (false, false));
+    assert!(
+        lock_is_free(&ws),
+        "the failed create still holds the workspace's core.lock"
+    );
     let progress = std::fs::read_to_string(ws.join(r"projects\sketchbook\progress.md")).unwrap();
     assert!(progress.contains("## Done"), "{progress}");
     let project = lines(&ws.join(r"projects\sketchbook\project.yaml"));
@@ -730,6 +734,102 @@ async fn suite_toml_keeps_comments_and_unknown_keys_and_is_hash_checked() {
     assert_eq!(registration(&env, &two), (false, false));
     let text = std::fs::read_to_string(&suite).unwrap();
     assert!(text.ends_with("# outside 0\n# outside 1\n"), "{text}");
+}
+
+/// A fail point hook that writes `text` to `file` the first time it runs.
+fn write_once(file: &Path, text: &'static str) -> Box<dyn Fn() -> io::Result<()> + Send + Sync> {
+    let (file, done) = (file.to_path_buf(), AtomicBool::new(false));
+    Box::new(move || {
+        if !done.swap(true, Ordering::SeqCst) {
+            write_file(&file, text.as_bytes());
+        }
+        Ok(())
+    })
+}
+
+/// The names in `suite.toml`'s folder that contain `part`.
+fn beside(suite: &Path, part: &str) -> Vec<String> {
+    std::fs::read_dir(suite.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(part))
+        .collect()
+}
+
+/// Two outside saves race one write: X lands after the hash check and before the replace
+/// (so the backup holds X and is put back), and Y lands after the replace and before the
+/// put-back (so the put-back's second backup holds Y, not this core's bytes). X ends up under
+/// the name, and Y is kept beside it as a conflict copy, never deleted (Task 6's C1 rule).
+#[tokio::test] // spec: CORE-007, ARCH-074
+async fn suite_toml_put_back_keeps_a_second_outside_save() {
+    let env = TestEnv::new();
+    let suite = env.env.suite_toml();
+    write_file(&suite, b"# base\n");
+    let ws = env.make_workspace("raced");
+    let fp = FailPoints::none();
+    fp.on("store.replace", write_once(&suite, "# X\n"));
+    fp.on("store.after_replace", write_once(&suite, "# Y\n"));
+
+    let refused = register_workspace(&env.env, &canonical(&ws), true, &fp)
+        .await
+        .expect_err("the raced write succeeded");
+    let StoreError::HashConflict { kept, .. } = &refused else {
+        panic!("expected store.hash_conflict, got {refused:?}");
+    };
+    assert_eq!(std::fs::read_to_string(&suite).unwrap(), "# X\n");
+    let copies = beside(&suite, ".ww-conflict-");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert!(
+        copies[0].starts_with("suite.toml.ww-conflict-"),
+        "{copies:?}"
+    );
+    let copy = suite.parent().unwrap().join(&copies[0]);
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "# Y\n");
+    assert_eq!(
+        kept.iter()
+            .map(|k| k.as_str().to_string())
+            .collect::<Vec<_>>(),
+        copies
+    );
+    let error = refused.to_error("t");
+    assert_eq!(error.code, "store.hash_conflict");
+    assert_eq!(error.data.unwrap()["kept"], json!(copies));
+    assert!(beside(&suite, ".ww-tmp-").is_empty());
+    assert!(beside(&suite, ".ww-bak-").is_empty());
+}
+
+/// A failure after the replace leaves the replaced version in the backup, and the error names
+/// that backup (it is never deleted unchecked).
+#[tokio::test] // spec: CORE-007, ARCH-074
+async fn suite_toml_failure_after_the_replace_names_the_backup() {
+    let env = TestEnv::new();
+    let suite = env.env.suite_toml();
+    write_file(&suite, b"# before\n");
+    let ws = env.make_workspace("stopped");
+    let fp = FailPoints::none();
+    fp.on(
+        "store.after_replace",
+        Box::new(|| Err(io::Error::other("fail point store.after_replace: io"))),
+    );
+    let refused = register_workspace(&env.env, &canonical(&ws), true, &fp)
+        .await
+        .expect_err("the stopped write succeeded");
+    let StoreError::Io { path, .. } = &refused else {
+        panic!("expected store.io naming the backup, got {refused:?}");
+    };
+    let backups = beside(&suite, ".ww-bak-");
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert!(path.ends_with(&backups[0]), "{path} vs {backups:?}");
+    let backup = suite.parent().unwrap().join(&backups[0]);
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), "# before\n");
+    assert_eq!(
+        registration(&env, &ws),
+        (true, true),
+        "the new version is in place"
+    );
+    let error = refused.to_error("t");
+    assert_eq!(error.code, "store.io");
+    assert!(error.message.contains(&backups[0]), "{}", error.message);
 }
 
 #[tokio::test] // spec: CORE-007

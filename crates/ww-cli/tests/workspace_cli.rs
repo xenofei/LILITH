@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ww_testkit::{CoreFixture, TestEnv, WwOutput};
+use ww_testkit::{CoreFixture, TestEnv, WwOutput, ensure_built};
 
 /// The canonical spelling of `path` without `\\?\`, as the core shows workspace paths.
 fn canonical(path: &Path) -> String {
@@ -170,4 +170,39 @@ fn no_start_with_an_unresolvable_workspace_while_a_core_runs() {
     assert_eq!(out.stdout, "", "{out:?}");
     assert!(out.stderr.contains("worldwright.yaml"), "{out:?}");
     assert!(out.stderr.contains("not a workspace"), "{out:?}");
+}
+
+/// The `--no-start` probe for a running core reports its own failure: a core this client
+/// doesn't trust is named, with the way to stop it, not hidden behind the workspace message.
+#[test] // spec: ARCH-018, ARCH-027
+fn no_start_probe_reports_an_untrusted_core() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let plain = env.root().join("not a workspace");
+    std::fs::create_dir_all(&plain).unwrap();
+    let other = env.root().join("other bin");
+    std::fs::create_dir_all(&other).unwrap();
+    let copy = other.join("ww-core.exe");
+    std::fs::copy(&ensure_built().ww_core, &copy).unwrap();
+    let mut fixture = CoreFixture::start_exe(&env, &copy);
+
+    let out = env.ww(&[
+        "--no-start",
+        "--workspace",
+        arg(&plain),
+        "call",
+        "test.echo",
+        "{\"text\":\"x\"}",
+    ]);
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    let forms = [copy.display().to_string(), canonical(&copy)];
+    assert!(forms.iter().any(|p| out.stderr.contains(p)), "{out:?}");
+    assert!(out.stderr.contains("ww core stop"), "{out:?}");
+
+    let stop = env.ww(&["core", "stop"]);
+    assert_eq!(stop.code, 0, "{stop:?}");
+    assert_eq!(
+        fixture.wait_exit(std::time::Duration::from_secs(30)),
+        Some(0)
+    );
 }

@@ -456,6 +456,34 @@ pub(super) fn hash_file(file: File) -> io::Result<FileHash> {
     hash_reader(file)
 }
 
+/// Deletes the backup `path` only if its SHA-256 is `sha256`, hashing and deleting it through
+/// one handle that shares nothing (`fsops::remove_if`), so no writer slips into it between the
+/// check and the delete. Returns whether it was deleted. Shared by the store's backup checks
+/// and `suite.toml` writes.
+pub(super) fn remove_if_hash(path: &Path, sha256: &str) -> io::Result<bool> {
+    fsops::remove_if(path, &|file| Ok(hash_reader(file)?.sha256 == sha256))
+}
+
+/// Moves `from` aside to a free `<dir>\<name>.ww-conflict-<stamp>` (a `-<k>` suffix when that
+/// name is taken) with `move_new`, and returns the new path. Shared by the store and
+/// `suite.toml` writes.
+pub(super) fn set_aside(from: &Path, dir: &Path, name: &str, stamp: &str) -> io::Result<PathBuf> {
+    for k in 1..=100 {
+        let conflict = if k == 1 {
+            format!("{name}.ww-conflict-{stamp}")
+        } else {
+            format!("{name}.ww-conflict-{stamp}-{k}")
+        };
+        let to = dir.join(conflict);
+        match fsops::move_new(from, &to) {
+            Ok(()) => return Ok(to),
+            Err(e) if classify(&e) == RetryClass::TargetExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other("no free conflict name beside the target"))
+}
+
 /// [`hash_file`] over any reader (an exclusive handle's `&File`).
 fn hash_reader(mut file: impl io::Read) -> io::Result<FileHash> {
     let mut hasher = Sha256::new();
@@ -981,25 +1009,11 @@ impl Store {
     /// suffix when that name is taken) with `move_new`.
     async fn move_aside(&self, from: &Path, dir: &Path, name: &str) -> io::Result<WsPath> {
         let stamp = ww_schema::time::compact(self.now_utc());
-        for k in 1..=100 {
-            let conflict = if k == 1 {
-                format!("{name}.ww-conflict-{stamp}")
-            } else {
-                format!("{name}.ww-conflict-{stamp}-{k}")
-            };
-            let to = dir.join(conflict);
-            let from = from.to_path_buf();
-            let target = to.clone();
-            match self
-                .fs_retry(None, move || fsops::move_new(&from, &target))
-                .await
-            {
-                Ok(()) => return Ok(self.rel_of(&to)),
-                Err(e) if classify(&e) == RetryClass::TargetExists => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Err(io::Error::other("no free conflict name beside the target"))
+        let (from, dir, name) = (from.to_path_buf(), dir.to_path_buf(), name.to_string());
+        let to = self
+            .fs_retry(None, move || set_aside(&from, &dir, &name, &stamp))
+            .await?;
+        Ok(self.rel_of(&to))
     }
 
     /// Ends a failed write before the target changed: the temp file is removed and the pending
@@ -1788,9 +1802,7 @@ impl Store {
         // the backup between the check and the delete.
         let (b1, old_sha) = (names.b1.clone(), old.sha256.clone());
         let removed = self
-            .fs_retry(None, move || {
-                fsops::remove_if(&b1, &|file| Ok(hash_reader(file)?.sha256 == old_sha))
-            })
+            .fs_retry(None, move || remove_if_hash(&b1, &old_sha))
             .await;
         match removed {
             Ok(true) => Ok(true),
@@ -1936,9 +1948,7 @@ impl Store {
     ) -> StoreError {
         let (b2, new_sha) = (names.b2.clone(), names.new_sha256.clone());
         let removed = self
-            .fs_retry(point, move || {
-                fsops::remove_if(&b2, &|file| Ok(hash_reader(file)?.sha256 == new_sha))
-            })
+            .fs_retry(point, move || remove_if_hash(&b2, &new_sha))
             .await;
         let kept = match removed {
             Ok(true) => Vec::new(),

@@ -141,6 +141,34 @@ fn core_lock_gives_read_write_and_releases_running_rows() {
     assert!(lock_is_free(&ws), "close releases core.lock");
 }
 
+/// An open racing a close of the same workspace in one core either takes the workspace back
+/// or waits until the close has finished: it never finds the old `core.lock` still held (and
+/// serves read-only), and the old close never closes the new open's `state.db` (both are keyed
+/// by the workspace id).
+#[test] // spec: ARCH-028, CORE-005
+fn close_racing_open_never_serves_read_only_or_a_closed_state_db() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_workspace("raced"));
+    let rt = runtime();
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+    rt.block_on(async {
+        drop(hub.open(&ws).await.expect("the first open"));
+        for round in 0..50 {
+            let ((), open) = tokio::join!(hub.close(&ws.id), hub.open(&ws));
+            let open = open.unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            assert_eq!(open.access, Access::ReadWrite, "round {round}");
+            assert!(
+                open.state.diagnostics().await.is_ok(),
+                "round {round}: the open's state.db was closed under it"
+            );
+            drop(open);
+        }
+    });
+    rt.block_on(hub.close_all());
+    states.close();
+}
+
 #[test] // spec: ARCH-028, ARCH-097
 fn second_hub_without_the_lock_is_read_only_and_keeps_rows() {
     // Two registries whose envs map the workspace to one local folder, as two channels'

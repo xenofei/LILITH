@@ -490,29 +490,37 @@ impl WorkspaceHub {
     /// now: its `state.db` is closed (its queued jobs run first), then `core.lock` is released.
     /// Otherwise the last call that holds it closes it as it ends, and until then a new
     /// [`WorkspaceHub::open`] takes it back as it is (its running idempotency rows stay this
-    /// core's). A later open opens it anew.
+    /// core's). A later open opens it anew, once the close has finished.
+    ///
+    /// The workspace is entered in the closing list (and its "gone" signal subscribed to)
+    /// under the same lock that takes it out of the open cells, before this hub's reference is
+    /// dropped. So an open racing the close always sees it: while it lives, the open takes it
+    /// back; once its drop has begun, the open waits for that drop to release `core.lock` and
+    /// close its `state.db` (both keyed by the workspace id) before it opens anew. A workspace
+    /// whose first open is still running is left as it is.
     pub async fn close(&self, id: &str) {
-        let cell = lock(&self.opens).cells.remove(id);
-        let Some(open) = cell.and_then(|c| c.get().cloned()) else {
-            return;
-        };
-        match Arc::try_unwrap(open) {
-            Ok(open) => {
-                // Nothing else holds it: its drop closes it, on a blocking thread.
-                if let Err(e) = tokio::task::spawn_blocking(move || drop(open)).await {
-                    tracing::error!(error = %e, "closing a workspace failed");
-                }
-            }
-            Err(open) => {
-                tracing::info!(workspace = %open.ws.path.display(), "workspace let go of; it closes when its last call ends");
-                let closing = Closing {
+        let open = {
+            let mut opens = lock(&self.opens);
+            let Some(open) = opens.cells.get(id).and_then(|c| c.get().cloned()) else {
+                return;
+            };
+            opens.cells.remove(id);
+            opens.closing.retain(|_, c| c.open.strong_count() > 0);
+            opens.closing.insert(
+                id.to_string(),
+                Closing {
                     open: Arc::downgrade(&open),
                     gone: open.gone.subscribe(),
-                };
-                let mut opens = lock(&self.opens);
-                opens.closing.retain(|_, c| c.open.strong_count() > 0);
-                opens.closing.insert(id.to_string(), closing);
-            }
+                },
+            );
+            open
+        };
+        if Arc::strong_count(&open) > 1 {
+            tracing::info!(workspace = %open.ws.path.display(), "workspace let go of; it closes when its last call ends");
+        }
+        // The last reference closes it as it drops: on a blocking thread when that is this one.
+        if let Err(e) = tokio::task::spawn_blocking(move || drop(open)).await {
+            tracing::error!(error = %e, "closing a workspace failed");
         }
     }
 

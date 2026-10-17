@@ -14,16 +14,24 @@
 //!    `move_new` for a file that doesn't exist yet (`ReplaceFileW` needs an existing target).
 //!    Errors 80 and 183 from `move_new` mean another writer created the file meanwhile, an
 //!    outside change;
-//! 6. hash the backup: equal to step 1's hash, it is removed. Otherwise an outside edit landed
-//!    between steps 4 and 5: it is put back with `ReplaceFileW` (the second backup, which then
-//!    holds this core's bytes, is removed), and that is an outside change too.
+//! 6. the backup is removed only if its hash equals step 1's (hashed and deleted through one
+//!    unshared handle, the store's `remove_if_hash`). Otherwise an outside edit landed between
+//!    steps 4 and 5: it is put back with `ReplaceFileW`, and the second backup is removed only
+//!    if it holds this core's bytes. Anything else in it is a newer outside save, which the
+//!    store's `set_aside` keeps beside the file as `suite.toml.ww-conflict-<utc>`.
 //!
-//! An outside change re-reads and re-applies once; a second one is `store.hash_conflict`.
-//! Sharing violations are retried under the store's budget (`store.busy` after 10 s).
+//! The fail points are the store's at the same steps: `store.replace` just before the replace,
+//! `store.after_replace` just after it, and `store.put_back` after the put-back's replace.
+//!
+//! An outside change re-reads and re-applies once; a second one is `store.hash_conflict`, and
+//! so is a put-back that kept a newer save (`data.kept` names the copy). Sharing violations
+//! are retried under the store's budget (`store.busy` after 10 s). A failure after the
+//! replace is `store.io` naming the backup, which then holds the replaced version and stays.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ww_platform::Env;
 use ww_platform::fs::{RetryClass, classify};
@@ -33,7 +41,7 @@ use ww_schema::{sha256_hex, suite_edit};
 use super::failpoints::FailPoints;
 use super::fsops;
 use super::paths::WsPath;
-use super::write::{Backoff, StoreError};
+use super::write::{Backoff, StoreError, remove_if_hash, set_aside};
 
 /// The name `suite.toml` errors carry as their path.
 const LABEL: &str = "suite.toml";
@@ -43,11 +51,13 @@ const LABEL: &str = "suite.toml";
 static NEXT_N: AtomicU64 = AtomicU64::new(1);
 
 /// How one swap attempt ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Swap {
     Done,
     /// The file changed outside this core since it was read; nothing of the change was lost.
     Changed,
+    /// The put-back met a newer outside save, which was kept at this visible copy.
+    Kept(PathBuf),
 }
 
 /// Registers the workspace folder `path` in `env`'s `suite.toml` unless it is registered
@@ -115,8 +125,33 @@ pub async fn register_workspace(
                     kept: Vec::new(),
                 });
             }
+            // Two outside saves met this write: the first is back under the name, the newer
+            // one is kept beside it. Neither is overwritten by a retry.
+            Swap::Kept(copy) => {
+                let kept = copy
+                    .file_name()
+                    .and_then(|n| WsPath::parse(&n.to_string_lossy()).ok())
+                    .into_iter()
+                    .collect();
+                return Err(StoreError::HashConflict {
+                    path: label(),
+                    backup: None,
+                    cloud_only: false,
+                    kept,
+                });
+            }
         }
     }
+}
+
+/// Why a swap attempt failed.
+#[derive(Debug)]
+enum SwapError {
+    /// Before `suite.toml` changed: nothing to clean up; sharing violations are retried.
+    Before(io::Error),
+    /// After `ReplaceFileW` moved a version of `suite.toml` into `backup`: that file may hold
+    /// the earlier version or an outside one, so it stays and the error names it.
+    After { backup: PathBuf, error: io::Error },
 }
 
 /// Steps 4–6, retrying sharing violations (and errors 1175/1176, which leave both files under
@@ -129,85 +164,172 @@ async fn swap(
 ) -> Result<Swap, StoreError> {
     let mut backoff = Backoff::new();
     loop {
-        match swap_once(file, expected, bytes, fp) {
+        match swap_once(file, expected, bytes, fp).await {
             Ok(swap) => return Ok(swap),
-            Err(e)
-                if matches!(
-                    classify(&e),
-                    RetryClass::SharingViolation | RetryClass::ReplaceRetry
-                ) =>
-            {
+            Err(SwapError::Before(e)) if retryable(&e) => {
                 if !backoff.wait().await {
                     tracing::warn!(file = %file.display(), error = %e, "suite.toml stayed held past the retry budget");
                     return Err(StoreError::Busy(label()));
                 }
             }
-            Err(e) => return Err(error(file, &e)),
+            Err(SwapError::Before(e)) => return Err(error(file, &e)),
+            Err(SwapError::After { backup, error }) => {
+                tracing::warn!(file = %file.display(), backup = %backup.display(), %error, "a suite.toml swap stopped after the replace; the backup stays");
+                return Err(StoreError::Io {
+                    path: backup.display().to_string(),
+                    why: format!(
+                        "writing suite.toml stopped after its replace ({error}); this file \
+                         keeps the version of suite.toml that was replaced, which may hold \
+                         another program's change, so compare it with suite.toml before you \
+                         retry"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Sharing violations and errors 1175/1176 leave every file under its own name: retried.
+fn retryable(e: &io::Error) -> bool {
+    matches!(
+        classify(e),
+        RetryClass::SharingViolation | RetryClass::ReplaceRetry
+    )
+}
+
+/// `op`, retried while [`retryable`], under the store's budget.
+async fn retrying<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut backoff = Backoff::new();
+    loop {
+        match op() {
+            Err(e) if retryable(&e) && backoff.wait().await => {}
+            other => return other,
         }
     }
 }
 
 /// One attempt at steps 4–6. Small and quick: `suite.toml` is a few lines.
-fn swap_once(
+async fn swap_once(
     file: &Path,
     expected: Option<&str>,
     bytes: &[u8],
     fp: &FailPoints,
-) -> io::Result<Swap> {
+) -> Result<Swap, SwapError> {
+    let before = SwapError::Before;
     let dir = file
         .parent()
-        .ok_or_else(|| io::Error::other("suite.toml has no folder"))?;
+        .ok_or_else(|| before(io::Error::other("suite.toml has no folder")))?;
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| io::Error::other("suite.toml has no file name"))?;
-    fsops::ensure_dir(dir)?;
+        .ok_or_else(|| before(io::Error::other("suite.toml has no file name")))?;
+    fsops::ensure_dir(dir).map_err(before)?;
     // Step 4.
-    if hash_of(file)?.as_deref() != expected {
+    if hash_of(file).map_err(before)?.as_deref() != expected {
         return Ok(Swap::Changed);
     }
     // Step 5.
     let (pid, n) = (std::process::id(), NEXT_N.fetch_add(2, Ordering::Relaxed));
-    let b1 = dir.join(format!(".{name}.ww-bak-{pid}-{n}"));
-    let b2 = dir.join(format!(".{name}.ww-bak-{pid}-{}", n + 1));
-    let temp = fsops::write_temp(dir, &format!(".{name}.ww-tmp-{pid}-{n}"), bytes, fp)?;
-    let placed = place(file, &temp, &b1, &b2, expected);
+    let names = Names {
+        dir,
+        name: &name,
+        b1: dir.join(format!(".{name}.ww-bak-{pid}-{n}")),
+        b2: dir.join(format!(".{name}.ww-bak-{pid}-{}", n + 1)),
+    };
+    let temp =
+        fsops::write_temp(dir, &format!(".{name}.ww-tmp-{pid}-{n}"), bytes, fp).map_err(before)?;
+    let placed = place(file, &temp, &names, expected, &sha256_hex(bytes), fp).await;
     if temp.exists() {
         let _ = fsops::remove_file(&temp);
     }
     placed
 }
 
-/// Moves `temp` onto `file` and checks the backup (steps 5 and 6).
-fn place(
+/// The names beside `suite.toml` for one attempt.
+struct Names<'a> {
+    dir: &'a Path,
+    name: &'a str,
+    b1: PathBuf,
+    b2: PathBuf,
+}
+
+/// Moves `temp` onto `file` and checks the backup (steps 5 and 6). The fail points
+/// `store.replace` (just before the replace), `store.after_replace` (just after it) and
+/// `store.put_back` (after the put-back's replace) are the store's, at the same steps.
+async fn place(
     file: &Path,
     temp: &Path,
-    b1: &Path,
-    b2: &Path,
+    names: &Names<'_>,
     expected: Option<&str>,
-) -> io::Result<Swap> {
+    new_sha256: &str,
+    fp: &FailPoints,
+) -> Result<Swap, SwapError> {
     let Some(expected) = expected else {
         return match fsops::move_new(temp, file) {
             Ok(()) => Ok(Swap::Done),
             Err(e) if classify(&e) == RetryClass::TargetExists => Ok(Swap::Changed),
-            Err(e) => Err(e),
+            Err(e) => Err(SwapError::Before(e)),
         };
     };
+    let (b1, b2) = (&names.b1, &names.b2);
+    let after = |backup: &Path| {
+        let backup = backup.to_path_buf();
+        move |error| SwapError::After { backup, error }
+    };
+    fp.hit("store.replace").map_err(SwapError::Before)?;
     match fsops::replace(file, temp, b1) {
         Ok(()) => {}
         // The old file is under the backup name and the new one still under its temp name.
-        Err(e) if classify(&e) == RetryClass::ReplacementNotMoved => fsops::move_new(temp, file)?,
-        Err(e) => return Err(e),
+        Err(e) if classify(&e) == RetryClass::ReplacementNotMoved => {
+            fsops::move_new(temp, file).map_err(after(b1))?;
+        }
+        Err(e) => return Err(SwapError::Before(e)),
     }
-    // Step 6.
-    if hash_of(b1)?.as_deref() == Some(expected) {
-        fsops::remove_file(b1)?;
-        return Ok(Swap::Done);
+    fp.hit("store.after_replace").map_err(after(b1))?;
+    // Step 6: the backup is removed only if it is exactly what step 4 checked.
+    match retrying(|| remove_if_hash(b1, expected)).await {
+        Ok(true) => return Ok(Swap::Done),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            tracing::warn!(backup = %b1.display(), "the suite.toml backup vanished before it was checked");
+            return Ok(Swap::Done);
+        }
+        Err(e) => return Err(after(b1)(e)),
+        Ok(false) => {}
     }
-    // An outside edit landed between the check and the replace: it goes back under its name.
-    fsops::replace(file, b1, b2)?;
-    fsops::remove_file(b2)?;
-    Ok(Swap::Changed)
+    // An outside edit landed between the check and the replace: it goes back under its name,
+    // and the target (this core's bytes, or a newer outside save) goes to the second backup.
+    tracing::warn!(file = %file.display(), "an outside edit landed during a suite.toml write; putting it back");
+    match retrying(|| fsops::replace(file, b1, b2)).await {
+        Ok(()) => {}
+        // The target went to the second backup; the outside edit is still in the first.
+        Err(e) if classify(&e) == RetryClass::ReplacementNotMoved => {
+            fsops::move_new(b1, file).map_err(after(b1))?;
+        }
+        Err(e) => return Err(after(b1)(e)),
+    }
+    fp.hit("store.put_back").map_err(after(b2))?;
+    // The second backup is deleted only if it holds this core's bytes; anything else is a
+    // newer outside save, kept beside the file (Task 6's put-back rule).
+    match retrying(|| remove_if_hash(b2, new_sha256)).await {
+        Ok(true) => Ok(Swap::Changed),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Swap::Changed),
+        Ok(false) => {
+            let stamp = ww_schema::time::compact(now_secs());
+            let kept = retrying(|| set_aside(b2, names.dir, names.name, &stamp))
+                .await
+                .map_err(after(b2))?;
+            tracing::warn!(kept = %kept.display(), "a newer outside save of suite.toml met the put-back; kept beside it");
+            Ok(Swap::Kept(kept))
+        }
+        Err(e) => Err(after(b2)(e)),
+    }
+}
+
+/// Seconds since the Unix epoch, UTC.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// The SHA-256 of the file at `path`, `None` when there is none.
