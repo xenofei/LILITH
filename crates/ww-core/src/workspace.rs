@@ -41,6 +41,7 @@ use crate::events::EventBus;
 use crate::index::{Index, IndexError};
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::{FailPoints, Store, WsPath, fsops};
+use crate::watch::{WatchConfig, Watcher};
 
 /// The UI action and the tool that make another workspace the default (`ww workspace use`).
 pub const SET_DEFAULT_ACTION: &str = "workspace.set_default";
@@ -197,6 +198,10 @@ pub struct OpenWorkspace {
     /// The workspace's index and the store's change sink: `index.db` in the workspace's local
     /// folder when read-write, SQLite `:memory:` when read-only (ARCH-028, ARCH-097, CORE-005).
     pub index: Arc<Index>,
+    /// The watcher (read-write only; ARCH-079, ARCH-083): fed by `ReadDirectoryChangesW`, or
+    /// without a folder watch where watching is unsupported (`ww notify` and the git pause
+    /// still work then).
+    pub watch: Option<Arc<Watcher>>,
     /// The orphans listed at open (CORE-038).
     pub orphans: Vec<WsPath>,
     /// `core.lock`, held while the workspace is open read-write.
@@ -226,6 +231,9 @@ impl OpenWorkspace {
     fn close_now(&self) {
         if self.shut.swap(true, Ordering::SeqCst) {
             return;
+        }
+        if let Some(watch) = &self.watch {
+            watch.stop();
         }
         self.index.close();
         self.states.close_workspace(&self.ws.id);
@@ -272,6 +280,8 @@ pub struct WorkspaceHub {
     ids: Arc<dyn IdSource>,
     failpoints: Arc<FailPoints>,
     probe: Arc<dyn Probe>,
+    /// The watchers' knobs.
+    watch: WatchConfig,
     /// The default workspace of `suite.toml`, as last read.
     default: Mutex<Option<WorkspaceRef>>,
     opens: Mutex<Opens>,
@@ -287,6 +297,10 @@ impl std::fmt::Debug for WorkspaceHub {
 
 impl WorkspaceHub {
     /// A hub that has opened nothing yet; it reads the default workspace from `suite.toml`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "plan 2b Task 11's signature: Task 10's seven parameters plus the watcher's config"
+    )]
     pub fn new(
         env: Env,
         states: Arc<StateRegistry>,
@@ -295,6 +309,7 @@ impl WorkspaceHub {
         ids: Arc<dyn IdSource>,
         failpoints: Arc<FailPoints>,
         probe: Arc<dyn Probe>,
+        watch: WatchConfig,
     ) -> Arc<WorkspaceHub> {
         let hub = Arc::new(WorkspaceHub {
             env,
@@ -304,6 +319,7 @@ impl WorkspaceHub {
             ids,
             failpoints,
             probe,
+            watch,
             default: Mutex::new(None),
             opens: Mutex::new(Opens::default()),
         });
@@ -364,9 +380,14 @@ impl WorkspaceHub {
     /// 5. `orphans()`, published once on the `workspace` topic as
     ///    `{kind: "orphans", paths}` when there are any;
     /// 6. the index (`index.db` read-write, in memory read-only), set as the store's change
-    ///    sink. Its first reconcile (or cold rebuild) starts in the background, so the open
+    ///    sink;
+    /// 7. the watcher (read-write only): the fail point `watch.start` comes just before it.
+    ///    Where the folder can't be watched, the workspace is served without a folder watch
+    ///    and `{kind:"watcher_unavailable", reason}` is published on `workspace`;
+    /// 8. the index's first reconcile (or cold rebuild) starts in the background, so the open
     ///    doesn't wait for it; the read tools do ([`Index::ready`]). Its background
-    ///    verification then runs every [`VERIFY_PERIOD`].
+    ///    verification then runs every [`VERIFY_PERIOD`], and hands its mismatches to the
+    ///    watcher.
     ///
     /// # Errors
     /// `store.io` when `core.lock` can't be opened, `state.unavailable` when the `state.db`
@@ -481,6 +502,9 @@ impl WorkspaceHub {
         // 6.
         let index = self.open_index(ws, access).await;
         store.set_sink(index.clone());
+        // 7.
+        let watch = (access == Access::ReadWrite).then(|| self.start_watcher(ws, &store, &index));
+        // 8.
         index.start_first();
         tracing::info!(
             workspace = %ws.path.display(),
@@ -494,6 +518,7 @@ impl WorkspaceHub {
             state,
             store,
             index,
+            watch,
             orphans,
             lock: Mutex::new(taken),
             states: self.states.clone(),
@@ -505,6 +530,41 @@ impl WorkspaceHub {
         }
         spawn_verify_ticks(&open);
         Ok(open)
+    }
+
+    /// The workspace's watcher (step 7): `ReadDirectoryChangesW`, or the no-watcher mode when
+    /// the folder can't be watched (or the fail point `watch.start` says so).
+    fn start_watcher(
+        &self,
+        ws: &WorkspaceRef,
+        store: &Arc<Store>,
+        index: &Arc<Index>,
+    ) -> Arc<Watcher> {
+        let started = self.failpoints.hit("watch.start").and_then(|()| {
+            Watcher::start(
+                store.clone(),
+                index.clone(),
+                self.events.clone(),
+                ws.id.clone(),
+                self.watch.clone(),
+            )
+        });
+        match started {
+            Ok(watcher) => watcher,
+            Err(e) => {
+                tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace folder can't be watched");
+                Watcher::unwatched(
+                    store.clone(),
+                    index.clone(),
+                    self.events.clone(),
+                    ws.id.clone(),
+                    self.watch.clone(),
+                    &format!(
+                        "the workspace folder can't be watched ({e}); outside edits are found by `ww notify` and when the workspace opens"
+                    ),
+                )
+            }
+        }
     }
 
     /// The workspace's index (step 6): read-write, `index.db` in the workspace's local folder,
@@ -656,16 +716,17 @@ pub const VERIFY_PERIOD: Duration = Duration::from_secs(1);
 pub const VERIFY_BATCH: usize = 200;
 
 /// Runs [`Index::verify_pending`] on `open`'s index every [`VERIFY_PERIOD`] (on tokio's clock)
-/// while the workspace stays open. Its mismatches are logged; from Task 11 on the watcher
-/// decides what they are (the index never calls one a human edit, CORE-010). The task holds
-/// only a weak reference to the index and the `shut` flag, so it never keeps a closed
-/// workspace alive.
+/// while the workspace stays open. Its mismatches go to the watcher, which decides what they
+/// are (the index never calls one a human edit, CORE-010); a read-only workspace only logs
+/// them. The task holds only weak references to the index and the watcher and the `shut` flag,
+/// so it never keeps a closed workspace alive.
 fn spawn_verify_ticks(open: &Arc<OpenWorkspace>) {
     let (index, shut, path) = (
         Arc::downgrade(&open.index),
         open.shut.clone(),
         open.ws.path.clone(),
     );
+    let watch = open.watch.as_ref().map(Arc::downgrade);
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(VERIFY_PERIOD);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -688,8 +749,12 @@ fn spawn_verify_ticks(open: &Arc<OpenWorkspace>) {
             }
             match index.verify_pending(VERIFY_BATCH).await {
                 Ok(mismatches) => {
-                    for m in mismatches {
-                        tracing::warn!(workspace = %path.display(), path = %m.path, sha256 = %m.sha256, recorded = %m.recorded, "a file differs from the hash its manifest records");
+                    for m in &mismatches {
+                        tracing::info!(workspace = %path.display(), path = %m.path, sha256 = %m.sha256, recorded = %m.recorded, "a file differs from the hash its manifest records");
+                    }
+                    drop(index);
+                    if let Some(watch) = watch.as_ref().and_then(std::sync::Weak::upgrade) {
+                        watch.mismatches(mismatches).await;
                     }
                 }
                 Err(IndexError::ActorGone) => break,

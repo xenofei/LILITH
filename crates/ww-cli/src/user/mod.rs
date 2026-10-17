@@ -1,5 +1,5 @@
 //! The `ww` user commands over `ww-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
-//! `events --follow`, `core stop` and `workspace init|use`. Spec Appendix D, "The `ww` user
+//! `events --follow`, `core stop`, `workspace init|use` and `notify`. Spec Appendix D, "The `ww` user
 //! commands", and Appendix E, "The `ww` commands this plan adds", are the contract for their
 //! flags, output and exit codes.
 //!
@@ -18,6 +18,7 @@
 mod call;
 mod core;
 mod events;
+mod notify;
 mod status;
 mod workspace;
 
@@ -95,6 +96,13 @@ pub enum UserCommand {
     /// Create workspaces and choose the default one.
     #[command(subcommand)]
     Workspace(WorkspaceCommand),
+    /// Tell the core's watcher that files changed (for folders it can't watch). Prints nothing
+    /// on success.
+    Notify {
+        /// The changed files or folders, inside the workspace.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -150,6 +158,7 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
         UserCommand::Workspace(WorkspaceCommand::Use { path }) => {
             workspace::use_default(global, &path)
         }
+        UserCommand::Notify { paths } => notify::run(global, &paths),
     };
     match result {
         Ok(code) | Err(Exit(code)) => code,
@@ -425,6 +434,33 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[test] // spec: ARCH-016, ARCH-073
+    fn notify_parses() {
+        match user(parse(&[
+            "ww",
+            "notify",
+            r"C:\ws\Ünïcödé space\a.png",
+            "rel/b.png",
+        ])) {
+            UserCommand::Notify { paths } => assert_eq!(
+                paths,
+                [
+                    PathBuf::from(r"C:\ws\Ünïcödé space\a.png"),
+                    PathBuf::from("rel/b.png")
+                ]
+            ),
+            other => panic!("not notify: {other:?}"),
+        }
+        assert!(matches!(
+            user(parse(&["ww", "--no-start", "notify", "a.png"])),
+            UserCommand::Notify { .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["ww", "notify"]).is_err(),
+            "notify needs a path"
+        );
     }
 
     #[test] // spec: ARCH-016

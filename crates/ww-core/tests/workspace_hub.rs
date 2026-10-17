@@ -58,6 +58,7 @@ fn hub(env: &Env, states: &Arc<StateRegistry>) -> (Arc<WorkspaceHub>, Arc<EventB
         Arc::new(SeqIds::new()),
         FailPoints::none(),
         Arc::new(SystemProbe),
+        ww_core::watch::WatchConfig::default(),
     );
     (hub, events)
 }

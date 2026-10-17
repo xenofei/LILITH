@@ -13,6 +13,7 @@
 //! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
+//! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.worldwright\fence\<name>` |
 //!
 //! `test.store_write`, `test.ingest_run` and `test.trash` work in the session's workspace
 //! (`workspace.required` without one). `test.ingest_run` does what an engine and the core do
@@ -21,6 +22,12 @@
 //! order (a new manifest if there is none, status by `transition(…, CandidateRun)`, each run
 //! file with its `sha256`, and a jobs log line when `job_line` is true). An omitted `project`
 //! is `sketchbook` (Task 12 replaces that with its resolver).
+//!
+//! `test.watch_fence` is the watcher fence (Global Constraints, Tests): `RawPipe::fence` writes
+//! `<ws>\.worldwright\fence\<name>` (`<name>` is `<pid>-<n>`), then calls it, and it returns
+//! once the workspace's index is ready and the watcher has handled that file and everything
+//! before it. It also returns while git is busy (paths deferred for git count as handled), and
+//! at once where the workspace has no folder watch.
 //!
 //! `pad` exists for the line-cap tests (ARCH-025): a result too large to send.
 //!
@@ -201,6 +208,13 @@ struct TrashArgs {
 #[derive(Debug, Serialize, JsonSchema)]
 struct TrashResult {
     entry_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FenceArgs {
+    /// The file `<ws>\.worldwright\fence\<name>` the caller wrote first.
+    name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -578,6 +592,23 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         EffectClass::Write,
         TEST_MODULE,
         |ctx, args: TrashArgs| Box::pin(trash(ctx, args)),
+    ));
+
+    reg.register(typed_tool(
+        "test.watch_fence",
+        "Test channels only: returns once the workspace's first reconcile has finished and the watcher has handled the file `.worldwright/fence/<name>` and everything before it.",
+        EffectClass::Read,
+        TEST_MODULE,
+        |ctx, args: FenceArgs| {
+            Box::pin(async move {
+                let open = ctx.workspace()?;
+                open.index.ready().await;
+                if let Some(watch) = &open.watch {
+                    watch.fence(&args.name).await;
+                }
+                Ok((Nothing {}, format!("fence {} passed", args.name)))
+            })
+        },
     ));
 
     reg.register(typed_tool(

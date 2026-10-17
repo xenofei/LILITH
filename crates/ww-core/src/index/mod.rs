@@ -254,6 +254,8 @@ pub struct Mismatch {
     pub sha256: String,
     /// What the manifest records.
     pub recorded: String,
+    /// The file is a git-lfs pointer and `sha256` is its `oid` (ARCH-085).
+    pub lfs: bool,
 }
 
 /// In which order a reconcile looks at files.
@@ -743,6 +745,58 @@ impl Index {
                 )
                 .optional()
                 .map(Option::flatten)
+                .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// What the manifests record for `path`: its SHA-256 (`hashes`, or a run's
+    /// `files[].sha256`, bare hex; `None` for a run file recorded without one) and whether the
+    /// suite still expects it on disk (in `hashes`, or a file of an `open` run without
+    /// `trashed_utc`). `None` when no manifest names it.
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn expected_entry(
+        &self,
+        path: &WsPath,
+    ) -> Result<Option<(Option<String>, bool)>, IndexError> {
+        let key = path_key(path.as_str());
+        self.db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT sha256, tracked FROM expected WHERE key = ?1",
+                    params![key],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)? != 0)),
+                )
+                .optional()
+                .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// Records what the watcher decided about a file `verify_pending` reported (CORE-010):
+    /// its row takes `sha256` and `state` and becomes verified, so it is not reported again.
+    /// A file without a row is left alone (the next reconcile finds it).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn accept(
+        &self,
+        path: &WsPath,
+        sha256: &str,
+        state: FileState,
+    ) -> Result<(), IndexError> {
+        let key = path_key(path.as_str());
+        lock(&self.mismatched).remove(&key);
+        let sha256 = sha256.to_string();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE files SET sha256 = ?2, state = ?3, verified = 1 WHERE key = ?1",
+                    params![key, sha256, state.as_str()],
+                )
+                .map(drop)
                 .map_err(|e| sql(&e))
             })
             .await

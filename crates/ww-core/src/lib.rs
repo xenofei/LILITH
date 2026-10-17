@@ -25,6 +25,7 @@ pub mod session;
 pub mod state;
 pub mod store;
 pub mod tools;
+pub mod watch;
 pub mod workspace;
 
 pub use config::{CoreConfig, CoreExit};

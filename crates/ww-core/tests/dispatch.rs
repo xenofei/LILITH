@@ -321,6 +321,7 @@ fn direct(
         ids.clone(),
         ww_core::store::FailPoints::none(),
         probe.clone(),
+        ww_core::watch::WatchConfig::default(),
     );
     let mut reg = core_registry(true, &gates, &states, &hub, &env.env, &probe);
     for tool in extra {

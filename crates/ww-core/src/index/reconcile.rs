@@ -1618,6 +1618,7 @@ pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismat
                     path: WsPath::from_disk(row.path.clone()),
                     sha256: read.lfs.clone().unwrap_or_else(|| read.sha256.clone()),
                     recorded: want.to_string(),
+                    lfs: read.lfs.is_some(),
                 });
             }
             _ => {

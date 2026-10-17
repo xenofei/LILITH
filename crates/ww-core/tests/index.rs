@@ -389,6 +389,7 @@ fn hub(env: &TestEnv, probe: Arc<dyn Probe>) -> Arc<WorkspaceHub> {
         Arc::new(SeqIds::new()),
         FailPoints::none(),
         probe,
+        ww_core::watch::WatchConfig::default(),
     )
 }
 

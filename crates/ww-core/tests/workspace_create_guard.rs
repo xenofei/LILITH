@@ -80,6 +80,7 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         Arc::new(SeqIds::new()),
         FailPoints::none(),
         probe.clone(),
+        ww_core::watch::WatchConfig::default(),
     );
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub, env.env.clone(), probe);

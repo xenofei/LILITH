@@ -53,6 +53,42 @@ fn spelling_key(path: &Path) -> String {
     key.to_lowercase()
 }
 
+/// `path` relative to the folder `root`, with `/` separators, when it is inside it; `None` when
+/// it isn't (or is `root` itself). Inside means under `root` as [`folder_key`] compares folders:
+/// canonical (short names, junctions and `subst` drives resolved) and without regard to case.
+/// The part of `path` that exists keeps its spelling on disk; a tail that doesn't exist (a file
+/// just removed) keeps the spelling given.
+pub fn relative_inside(root: &Path, path: &Path) -> Option<String> {
+    let root =
+        std::fs::canonicalize(root).map_or_else(|_| root.to_path_buf(), |c| strip_verbatim(&c));
+    let mut tail: Vec<String> = Vec::new();
+    let mut at = path.to_path_buf();
+    let found = loop {
+        match std::fs::canonicalize(&at) {
+            Ok(c) => break strip_verbatim(&c),
+            Err(_) => {
+                tail.push(at.file_name()?.to_string_lossy().into_owned());
+                at = at.parent()?.to_path_buf();
+            }
+        }
+    };
+    let head: Vec<std::path::Component<'_>> = root.components().collect();
+    let all: Vec<std::path::Component<'_>> = found.components().collect();
+    if all.len() < head.len() {
+        return None;
+    }
+    let prefix: PathBuf = all[..head.len()].iter().collect();
+    if spelling_key(&prefix) != spelling_key(&root) {
+        return None;
+    }
+    let mut parts: Vec<String> = all[head.len()..]
+        .iter()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.extend(tail.into_iter().rev());
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// Removes a leading `\\?\` (and turns `\\?\UNC\server\share` into `\\server\share`). Keeps the
 /// case and everything else: for paths that are shown, such as `WorkspaceRef.path`.
 pub fn strip_verbatim(path: &Path) -> PathBuf {
@@ -73,6 +109,36 @@ mod tests {
 
     use super::*;
     use crate::process::run_hidden;
+
+    #[test] // spec: ARCH-016, ARCH-073
+    fn relative_inside_maps_paths_under_a_folder() {
+        let dir = tempfile::Builder::new()
+            .prefix("ww-paths-Ünïcödé space-")
+            .tempdir()
+            .unwrap();
+        let root = dir.path().join("Work Space");
+        std::fs::create_dir_all(root.join("Notes")).unwrap();
+        std::fs::write(root.join("Notes").join("A.txt"), b"a").unwrap();
+        // Another case finds the file and keeps the spelling on disk.
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase()).join(r"notes\a.txt");
+        assert_eq!(
+            relative_inside(&root, &upper).as_deref(),
+            Some("Notes/A.txt")
+        );
+        // A removed file keeps the name given.
+        assert_eq!(
+            relative_inside(&root, &root.join("Notes").join("gone.png")).as_deref(),
+            Some("Notes/gone.png")
+        );
+        // Outside, beside (a common text prefix is no folder) and the folder itself.
+        std::fs::create_dir_all(dir.path().join("Work Space 2")).unwrap();
+        assert_eq!(
+            relative_inside(&root, &dir.path().join("Work Space 2").join("x")),
+            None
+        );
+        assert_eq!(relative_inside(&root, dir.path()), None);
+        assert_eq!(relative_inside(&root, &root), None);
+    }
 
     #[test] // spec: CORE-040
     fn upcase_name_follows_the_system_table() {

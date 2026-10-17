@@ -41,6 +41,7 @@ use ww_schema::{EditError, Manifest, YamlEdit, YamlEditError, sha256_hex};
 
 use super::failpoints::FailPoints;
 use super::fsops;
+use super::git_gate::{GIT_WAIT, GitGate};
 use super::paths::{WsPath, writable};
 use crate::state::{Pending, StateDb, StateError};
 use crate::workspace::Access;
@@ -842,6 +843,8 @@ pub struct Store {
     /// One async lock per asset (`<project>/<asset_id>`, case-folded), held from a sign-off's
     /// seal to the end of its Record stage ([`Store::version_lock`]).
     pub(super) version_locks: Mutex<HashMap<String, Weak<PathLock>>>,
+    /// Write step 2: writes wait while git works on the workspace (ARCH-083).
+    git_gate: Arc<GitGate>,
 }
 
 impl std::fmt::Debug for Store {
@@ -866,7 +869,6 @@ impl Store {
         probe: Arc<dyn Probe>,
     ) -> Store {
         Store {
-            root,
             state,
             fp: failpoints,
             clock,
@@ -878,6 +880,8 @@ impl Store {
             machine: "unknown".to_string(),
             live_handles: Mutex::new(HashSet::new()),
             version_locks: Mutex::new(HashMap::new()),
+            git_gate: Arc::new(GitGate::new(&root)),
+            root,
         }
     }
 
@@ -937,6 +941,12 @@ impl Store {
 
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
+    }
+
+    /// The git gate of write step 2 (ARCH-083): the store owns it, the watcher sets its flag
+    /// (CORE-010).
+    pub fn git_gate(&self) -> &Arc<GitGate> {
+        &self.git_gate
     }
 
     /// The index step that hears every change (Task 10).
@@ -1246,23 +1256,40 @@ impl Store {
 
     /// Whether `sha256` is the core's own for `rel`: its generated hash, or either hash of its
     /// pending row (so the watcher never records the core's own write as a human edit).
+    ///
+    /// The pending row is read first: a write records its new hash as generated and clears its
+    /// row in one transaction (step 8), so a row gone at the first read means the generated
+    /// hash read after it is already the new one. Read the other way round, a step 8 between
+    /// the two reads would hide the core's own bytes from both.
     pub async fn accepts_as_own(&self, rel: &WsPath, sha256: &str) -> Result<bool, StoreError> {
+        let (pending, generated) = self.own_hashes(rel).await?;
+        Ok(generated.as_deref() == Some(sha256) || pending.iter().any(|h| h == sha256))
+    }
+
+    /// The hashes the store accepts as its own at `rel` (see [`Store::accepts_as_own`]): the
+    /// pending row's old and new hashes, then the generated hash, read in that order.
+    ///
+    /// # Errors
+    /// `store.io` when the workspace `state.db` fails.
+    pub async fn own_hashes(
+        &self,
+        rel: &WsPath,
+    ) -> Result<(Vec<String>, Option<String>), StoreError> {
         let path = rel.as_str();
-        let generated = self
-            .state
-            .generated(path)
-            .await
-            .map_err(|e| StoreError::state(rel, &e))?;
-        if generated.as_deref() == Some(sha256) {
-            return Ok(true);
-        }
         let pending = self
             .state
             .pending(path)
             .await
             .map_err(|e| StoreError::state(rel, &e))?;
-        Ok(pending
-            .is_some_and(|p| p.new_sha256 == sha256 || p.old_sha256.as_deref() == Some(sha256)))
+        let generated = self
+            .state
+            .generated(path)
+            .await
+            .map_err(|e| StoreError::state(rel, &e))?;
+        let pending = pending
+            .map(|p| p.old_sha256.into_iter().chain([p.new_sha256]).collect())
+            .unwrap_or_default();
+        Ok((pending, generated))
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1613,6 +1640,10 @@ impl Store {
                 why: "the file name is too long for the store's temporary names".to_string(),
             });
         }
+        // Step 2, the git gate (ARCH-083): the watcher's flag or `.git\index.lock` itself, for
+        // up to 60 s, then `store.git_busy`. Waited before the path lock, so a write queued
+        // behind git holds back no other write's path.
+        self.git_gate.wait_clear(GIT_WAIT).await?;
         let _held = self.lock_path(rel).await;
         // A replace that a failed call left pending is resolved first, so its backup is never
         // left behind without its row.
@@ -1625,8 +1656,6 @@ impl Store {
             self.resolve_row(&row, &mut RecoveryReport::default())
                 .await?;
         }
-        // Step 2, the git gate (ARCH-083), comes with the watcher.
-
         // Step 3.
         let abs = rel.abs(&self.root);
         let want = self.want(rel, &expect).await?;

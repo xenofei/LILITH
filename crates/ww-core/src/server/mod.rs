@@ -351,6 +351,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.ids.clone(),
         cfg.failpoints.clone(),
         cfg.probe.clone(),
+        cfg.watch.clone(),
     );
     let dispatcher = Dispatcher::new(
         core_registry(

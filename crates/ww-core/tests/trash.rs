@@ -707,6 +707,7 @@ async fn maintenance_runs_at_open_and_every_24_hours() {
         Arc::new(SeqIds::new()),
         FailPoints::none(),
         Arc::new(SystemProbe),
+        ww_core::watch::WatchConfig::default(),
     );
     let reference = WorkspaceRef {
         id: Env::workspace_hash(&std::fs::canonicalize(&ws).unwrap()),
@@ -806,6 +807,7 @@ async fn open_and_close_never_wait_for_maintenance() {
         Arc::new(SeqIds::new()),
         FailPoints::none(),
         probe.clone(),
+        ww_core::watch::WatchConfig::default(),
     );
     let reference = WorkspaceRef {
         id: Env::workspace_hash(&std::fs::canonicalize(&ws).unwrap()),

@@ -591,6 +591,7 @@ fn set_default_closes_the_old_workspace() {
         Arc::new(SeqIds::new()),
         FailPoints::none(),
         Arc::new(SystemProbe),
+        ww_core::watch::WatchConfig::default(),
     );
     let open = rt.block_on(hub.open(&workspace_ref(&a))).expect("the open");
     assert_eq!(open.access, Access::ReadWrite);

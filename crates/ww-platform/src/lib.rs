@@ -21,6 +21,7 @@ pub mod session_end;
 pub mod sid;
 pub mod sockets;
 pub mod volume;
+pub mod watcher;
 
 pub use clock::{Clock, SystemClock};
 pub use credentials::{

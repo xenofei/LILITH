@@ -20,6 +20,7 @@
 
 pub mod failpoints;
 pub mod fsops;
+pub mod git_gate;
 pub mod logs;
 pub mod order;
 pub mod paths;
@@ -31,6 +32,7 @@ pub mod write;
 
 pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
 pub use fsops::{ensure_dir, write_file_atomic};
+pub use git_gate::{GIT_WAIT, GitGate};
 pub use logs::{LogKind, append_loose_usage};
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
 pub use paths::{WsPath, path_key, writable};

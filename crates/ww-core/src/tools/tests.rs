@@ -292,6 +292,7 @@ fn hub_for(
         ids.clone(),
         FailPoints::none(),
         Arc::new(SystemProbe),
+        crate::watch::WatchConfig::default(),
     )
 }
 
@@ -731,6 +732,7 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.state_panic",
             "test.store_write",
             "test.trash",
+            "test.watch_fence",
             "test.write"
         ]
     );

@@ -12,6 +12,7 @@ use ww_platform::{Channel, Clock, Env, IdSource, RandomIds, SystemClock};
 
 use crate::identity::{EngineTokens, NoEngineTokens, TrustedDirs};
 use crate::store::FailPoints;
+use crate::watch::WatchConfig;
 
 /// A core with no connections, calls or busy blockers exits after this long (ARCH-020).
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(600);
@@ -43,6 +44,9 @@ pub struct CoreConfig {
     /// The file facts of the workspace stores (`SystemProbe`); in-process tests fake volumes
     /// and placeholders with their own.
     pub probe: Arc<dyn Probe>,
+    /// The workspace watchers' buffer, batch window and git quiet time
+    /// (`WatchConfig::default()`: 64 KiB, 200 ms, 2 s).
+    pub watch: WatchConfig,
     /// The crate's own unit tests only (compiled out of every build): a request with this
     /// method panics in the router, to test how the transport survives a panicking handler.
     #[cfg(test)]
@@ -75,6 +79,7 @@ impl CoreConfig {
             test_parent_pid: overrides.parent_pid,
             failpoints,
             probe: Arc::new(SystemProbe),
+            watch: WatchConfig::default(),
             #[cfg(test)]
             panic_on_method: None,
         })
