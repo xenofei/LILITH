@@ -235,3 +235,438 @@ fn oversized_result_is_an_error_that_replays_and_connection_stays() {
     let echo = pipe.tool("test.echo", json!({"text": "still open"}), None);
     assert_eq!(echo["status"], "ok", "{echo}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The dispatcher built directly, with tools of the test's own (plan 2b hardening).
+// ---------------------------------------------------------------------------------------------
+
+/// A session of `caller` in `workspace` (or none).
+fn direct_session(
+    workspace: Option<ww_core::workspace::WorkspaceRef>,
+) -> Arc<ww_core::session::Session> {
+    Arc::new(ww_core::session::Session {
+        id: "s_1".into(),
+        caller: ww_protocol::CallerKind::Cli,
+        non_interactive: false,
+        workspace,
+        capabilities: Vec::new(),
+        client_pid: 1,
+        profile_id: None,
+    })
+}
+
+fn call_params(name: &str, args: Value, key: Option<&str>) -> ww_protocol::ToolCallParams {
+    let Value::Object(arguments) = args else {
+        panic!("arguments must be an object");
+    };
+    ww_protocol::ToolCallParams {
+        name: name.into(),
+        arguments,
+        idempotency_key: key.map(str::to_string),
+        trace_id: None,
+    }
+}
+
+/// The error code of an outcome, after checking it is an error.
+fn code_of(outcome: &ww_protocol::Outcome<ww_protocol::ToolOutput>) -> String {
+    match outcome {
+        ww_protocol::Outcome::Error { error } => error.code.clone(),
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+/// The idempotency rows of `path` as `(scope, key, state)`, read-only.
+fn idem_rows(path: &Path) -> Vec<(String, String, String)> {
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
+    let mut stmt = db
+        .prepare("SELECT scope, key, state FROM idempotency ORDER BY scope, key")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A dispatcher over `env` with the test tools and `extra`, its state registry and its hub.
+fn direct(
+    env: &TestEnv,
+    extra: Vec<Arc<dyn ww_core::tools::Tool>>,
+) -> (
+    ww_core::tools::Dispatcher,
+    Arc<ww_core::state::StateRegistry>,
+    Arc<ww_core::workspace::WorkspaceHub>,
+) {
+    use ww_core::tools::{PipelineHooks, TestGates, core_registry};
+    let states = Arc::new(
+        ww_core::state::StateRegistry::open(
+            &env.env,
+            Arc::new(|what: &str| panic!("unexpected fatal report: {what}")),
+        )
+        .expect("the suite state.db"),
+    );
+    let gates = Arc::new(TestGates::new());
+    let clock: Arc<dyn ww_platform::Clock> = FakeClock::new();
+    let events = Arc::new(ww_core::events::EventBus::new(clock.clone()));
+    let ids: Arc<dyn ww_platform::IdSource> = Arc::new(SeqIds::new());
+    let probe: Arc<dyn ww_platform::fs::Probe> = Arc::new(ww_platform::fs::SystemProbe);
+    let hub = ww_core::workspace::WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        events.clone(),
+        clock.clone(),
+        ids.clone(),
+        ww_core::store::FailPoints::none(),
+        probe.clone(),
+        ww_core::watch::WatchConfig::default(),
+    );
+    let mut reg = core_registry(
+        true,
+        &gates,
+        &states,
+        &hub,
+        &env.env,
+        &probe,
+        Arc::default(),
+    );
+    for tool in extra {
+        reg.register(tool);
+    }
+    let lifecycle = ww_core::Lifecycle::new(clock.clone(), ww_core::lifecycle::IDLE_EXIT_AFTER);
+    let dispatcher = ww_core::tools::Dispatcher::new(
+        reg,
+        PipelineHooks::plan2(),
+        states.clone(),
+        events,
+        hub.clone(),
+        ids,
+        clock,
+        lifecycle,
+    );
+    (dispatcher, states, hub)
+}
+
+/// `ws` as a resolved workspace: its canonical path without `\\?\`, and its id.
+fn ws_ref(ws: &Path) -> ww_core::workspace::WorkspaceRef {
+    let canonical = std::fs::canonicalize(ws).expect("canonicalize");
+    let text = canonical.to_string_lossy().into_owned();
+    ww_core::workspace::WorkspaceRef {
+        id: ww_platform::Env::workspace_hash(&canonical),
+        path: std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)),
+    }
+}
+
+/// A write tool that panics on its first run and succeeds after.
+fn panics_once() -> Arc<dyn ww_core::tools::Tool> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct NoArgs {}
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Runs {
+        executions: u64,
+    }
+    let runs = Arc::new(AtomicU64::new(0));
+    ww_core::tools::typed_tool(
+        "rec.panic_write",
+        "A write that panics on its first run.",
+        ww_protocol::EffectClass::Write,
+        "test",
+        move |_ctx, _args: NoArgs| {
+            let executions = runs.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                assert!(executions > 1, "rec.panic_write panics on its first run");
+                Ok((Runs { executions }, format!("run {executions}")))
+            })
+        },
+    )
+}
+
+#[tokio::test] // spec: QA-012, CORE-016, ARCH-060
+async fn write_tool_panic_is_core_bug_and_releases_the_key() {
+    let env = TestEnv::new();
+    let (dispatcher, _states, _hub) = direct(&env, vec![panics_once()]);
+    let first = dispatcher
+        .call(
+            direct_session(None),
+            call_params("rec.panic_write", json!({}), Some("k")),
+        )
+        .await;
+    assert_eq!(code_of(&first), "core.bug");
+    let ww_protocol::Outcome::Error { error } = &first else {
+        unreachable!()
+    };
+    let detail = error.detail.as_ref().expect("the panic text as detail");
+    assert!(detail.untrusted, "{detail:?}");
+    assert!(
+        detail.text.contains("panics on its first run"),
+        "{detail:?}"
+    );
+    assert!(
+        idem_rows(&env.env.suite_state_db()).is_empty(),
+        "the key was kept after a panic"
+    );
+    // The key was released: the retry runs the tool again.
+    let retry = dispatcher
+        .call(
+            direct_session(None),
+            call_params("rec.panic_write", json!({}), Some("k")),
+        )
+        .await;
+    let ww_protocol::Outcome::Ok(output) = &retry else {
+        panic!("the retry runs: {retry:?}");
+    };
+    assert_eq!(output.structured, json!({"executions": 2}));
+}
+
+#[tokio::test] // spec: CORE-016, QA-012
+async fn state_errors_map_to_state_unavailable() {
+    // A workspace whose state.db is from a newer version can't be opened: its calls get
+    // `state.unavailable`, and the file is untouched.
+    let env = TestEnv::new();
+    let ws_path = env.make_workspace("newer");
+    env.register_workspace(&ws_path, true);
+    let ws = ws_ref(&ws_path);
+    let db = env
+        .env
+        .workspace_local_dir(&ws.path)
+        .unwrap()
+        .join("state.db");
+    env.write_state_db_version(&db, 99, true);
+    let before = ww_testkit::sha256_file(&db);
+    let (dispatcher, states, _hub) = direct(&env, Vec::new());
+    for (tool, args, key) in [
+        ("test.echo", json!({"text": "x"}), None),
+        ("test.write", json!({"label": "w"}), Some("k-ws")),
+    ] {
+        let out = dispatcher
+            .call(
+                direct_session(Some(ws.clone())),
+                call_params(tool, args, key),
+            )
+            .await;
+        assert_eq!(code_of(&out), "state.unavailable", "{tool}");
+    }
+    assert_eq!(
+        ww_testkit::sha256_file(&db),
+        before,
+        "the newer state.db changed"
+    );
+
+    // A closed registry: every database call fails (ActorGone).
+    let states_closing = states.clone();
+    tokio::task::spawn_blocking(move || states_closing.close())
+        .await
+        .unwrap();
+    let out = dispatcher
+        .call(
+            direct_session(None),
+            call_params("test.write", json!({"label": "s"}), Some("k")),
+        )
+        .await;
+    assert_eq!(code_of(&out), "state.unavailable");
+    let ww_protocol::Outcome::Error { error } = &out else {
+        unreachable!()
+    };
+    assert_eq!(error.category, ww_protocol::ErrorCategory::Transient);
+    assert_eq!(error.retry, ww_protocol::RetryPolicy::SameIdempotencyKey);
+}
+
+/// A read tool that needs the session's workspace and returns its folder.
+fn needs_workspace() -> Arc<dyn ww_core::tools::Tool> {
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct NoArgs {}
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Folder {
+        path: String,
+        read_only: bool,
+    }
+    ww_core::tools::typed_tool(
+        "rec.needs_workspace",
+        "A read that needs the session's workspace.",
+        ww_protocol::EffectClass::Read,
+        "test",
+        |ctx, _args: NoArgs| {
+            Box::pin(async move {
+                let open = ctx.workspace()?;
+                let folder = Folder {
+                    path: open.ws.path.display().to_string(),
+                    read_only: open.access == ww_core::workspace::Access::ReadOnly,
+                };
+                Ok((folder, "found the workspace".to_string()))
+            })
+        },
+    )
+}
+
+#[tokio::test] // spec: ARCH-028, CORE-016
+async fn read_only_workspace_refuses_writes_before_idempotency() {
+    // Two cores whose local folder for the workspace is one folder (two channels share
+    // `<volume>\.worldwright-local\<hash>\` for a workspace on another volume, ARCH-097; the
+    // harness guard keeps tests out of those folders, so both dispatchers here are on one
+    // env). The second core's `state.db` connection is read-only, so an `idem_begin` there
+    // would fail with `state.unavailable`: the refusal must come first.
+    let a = TestEnv::new();
+    let ws_path = a.make_workspace("shared");
+    a.register_workspace(&ws_path, true);
+    let ws = ws_ref(&ws_path);
+    let db = a
+        .env
+        .workspace_local_dir(&ws.path)
+        .unwrap()
+        .join("state.db");
+
+    let (first, _states_a, hub_a) = direct(&a, Vec::new());
+    let open = hub_a.open(&ws).await.unwrap();
+    assert_eq!(open.access, ww_core::workspace::Access::ReadWrite);
+    let ok = first
+        .call(
+            direct_session(Some(ws.clone())),
+            call_params("test.write", json!({"label": "a"}), Some("k-a")),
+        )
+        .await;
+    assert!(matches!(ok, ww_protocol::Outcome::Ok(_)), "{ok:?}");
+    let rows_before = idem_rows(&db);
+
+    let (second, _states_b, _hub_b) = direct(&a, vec![needs_workspace()]);
+    for (tool, args) in [
+        ("test.write", json!({"label": "b"})),
+        (
+            "test.store_write",
+            json!({"path": "notes/b.txt", "text": "b", "expect": "new"}),
+        ),
+        ("test.destructive", json!({})),
+    ] {
+        let out = second
+            .call(
+                direct_session(Some(ws.clone())),
+                call_params(tool, args, Some("k-b")),
+            )
+            .await;
+        assert_eq!(code_of(&out), "workspace.read_only", "{tool}");
+        let ww_protocol::Outcome::Error { error } = &out else {
+            unreachable!()
+        };
+        assert_eq!(error.category, ww_protocol::ErrorCategory::UserFixable);
+    }
+    assert_eq!(
+        idem_rows(&db),
+        rows_before,
+        "no idempotency row was touched"
+    );
+    assert!(!ws.path.join("notes").exists());
+    // Reads still work there.
+    let read = second
+        .call(
+            direct_session(Some(ws.clone())),
+            call_params("rec.needs_workspace", json!({}), None),
+        )
+        .await;
+    let ww_protocol::Outcome::Ok(output) = &read else {
+        panic!("a read works on a read-only workspace: {read:?}");
+    };
+    assert_eq!(output.structured["read_only"], true);
+}
+
+#[tokio::test] // spec: ARCH-090, QA-003
+async fn default_switch_makes_old_sessions_unsupported() {
+    let env = TestEnv::new();
+    let (old_path, new_path) = (env.make_workspace("old"), env.make_workspace("new"));
+    env.register_workspace(&old_path, true);
+    env.register_workspace(&new_path, false);
+    let (old, new) = (ws_ref(&old_path), ws_ref(&new_path));
+    let (dispatcher, _states, hub) = direct(&env, vec![needs_workspace()]);
+    assert_eq!(hub.default_id().as_deref(), Some(old.id.as_str()));
+    let before = dispatcher
+        .call(
+            direct_session(Some(old.clone())),
+            call_params("rec.needs_workspace", json!({}), None),
+        )
+        .await;
+    assert!(matches!(before, ww_protocol::Outcome::Ok(_)), "{before:?}");
+
+    // The default switches (as `workspace.set_default` does): the old session is refused,
+    // with the way back.
+    env.register_workspace(&new_path, true);
+    hub.refresh_default();
+    assert_eq!(hub.default_id().as_deref(), Some(new.id.as_str()));
+    for (tool, args, key) in [
+        ("rec.needs_workspace", json!({}), None),
+        ("test.write", json!({"label": "x"}), Some("k-old")),
+    ] {
+        let out = dispatcher
+            .call(
+                direct_session(Some(old.clone())),
+                call_params(tool, args, key),
+            )
+            .await;
+        assert_eq!(code_of(&out), "workspace.unsupported", "{tool}");
+        let ww_protocol::Outcome::Error { error } = &out else {
+            unreachable!()
+        };
+        assert!(
+            error.message.contains("ww workspace use"),
+            "{}",
+            error.message
+        );
+        let fix = error.fix.as_ref().expect("a fix");
+        assert_eq!(fix.ui_action.id, "workspace.set_default");
+    }
+    // A session in the new default works.
+    let after = dispatcher
+        .call(
+            direct_session(Some(new.clone())),
+            call_params("rec.needs_workspace", json!({}), None),
+        )
+        .await;
+    assert!(matches!(after, ww_protocol::Outcome::Ok(_)), "{after:?}");
+}
+
+#[tokio::test] // spec: QA-005, CORE-016
+async fn no_workspace_tool_gets_workspace_required() {
+    let env = TestEnv::new();
+    let ws_path = env.make_workspace("alpha");
+    env.register_workspace(&ws_path, true);
+    let (dispatcher, _states, _hub) = direct(&env, vec![needs_workspace()]);
+    let out = dispatcher
+        .call(
+            direct_session(None),
+            call_params("rec.needs_workspace", json!({}), None),
+        )
+        .await;
+    assert_eq!(code_of(&out), "workspace.required");
+    let ww_protocol::Outcome::Error { error } = &out else {
+        unreachable!()
+    };
+    assert_eq!(error.category, ww_protocol::ErrorCategory::UserFixable);
+    assert_eq!(error.retry, ww_protocol::RetryPolicy::AfterResolve);
+    // The test-channel store tools need one too.
+    let out = dispatcher
+        .call(
+            direct_session(None),
+            call_params(
+                "test.store_write",
+                json!({"path": "a.txt", "text": "a", "expect": "new"}),
+                Some("k"),
+            ),
+        )
+        .await;
+    assert_eq!(code_of(&out), "workspace.required");
+
+    let ws = ws_ref(&ws_path);
+    let found = dispatcher
+        .call(
+            direct_session(Some(ws.clone())),
+            call_params("rec.needs_workspace", json!({}), None),
+        )
+        .await;
+    let ww_protocol::Outcome::Ok(output) = &found else {
+        panic!("{found:?}");
+    };
+    assert_eq!(output.structured["path"], ws.path.display().to_string());
+    assert_eq!(output.structured["read_only"], false);
+}

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub const HISTORY_SECS: u64 = 600;
 /// Events queued per client before it gets `resync_required`.
 pub const CLIENT_QUEUE: usize = 1024;
+/// History kept per topic, by count (ARCH-032 clarification): the newest events, at most.
+pub const HISTORY_MAX_EVENTS: usize = 1024;
 
 /// `ww/subscribe` params. A topic missing from `since_seq` means live events only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -99,6 +101,7 @@ mod tests {
         }
         assert_eq!(HISTORY_SECS, 600);
         assert_eq!(CLIENT_QUEUE, 1024);
+        assert_eq!(HISTORY_MAX_EVENTS, 1024);
 
         // Wire shapes of the event messages.
         let ev = EventParams {

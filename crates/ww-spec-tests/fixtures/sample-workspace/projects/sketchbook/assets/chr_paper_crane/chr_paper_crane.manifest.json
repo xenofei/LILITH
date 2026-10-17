@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "asset_id": "chr_paper_crane",
+  "project": "sketchbook",
+  "creation_uuid": "6f1c2a3e-8b4d-4c5e-9a7b-1d2e3f405162",
+  "module": "concept",
+  "type": "image",
+  "version": "1.1.0",
+  "approved_version": "1.0.0",
+  "parent_version": "1.0.0",
+  "status": "candidate",
+  "status_reason": null,
+  "inputs": [
+    {
+      "ref": "proj:harbor/env_harbor_wall@1.0.0",
+      "role": "reference",
+      "sha256": "5a9db589b4907d4cfb2fb9a3a1da4efe5b2fa01d1b2aef2fed24ce2124a5a2a2"
+    }
+  ],
+  "pinned_inputs": [],
+  "recipe": [
+    {
+      "step": "concept",
+      "tool": "comfyui",
+      "model": "sample-image-model",
+      "prompt_ref": "prompts/crane.txt",
+      "ran_on": "local"
+    }
+  ],
+  "candidate_runs": [
+    {
+      "run_id": "r_20261002_0915",
+      "path": "candidates/r_20261002_0915/",
+      "status": "selected",
+      "created": "2026-10-02T09:15:00Z",
+      "target_version": "1.0.0",
+      "recipe": {
+        "step": "concept",
+        "tool": "comfyui"
+      },
+      "files": [
+        {
+          "path": "candidates/r_20261002_0915/crane_a.png",
+          "seed": 11,
+          "role": "candidate",
+          "sha256": "002dc46111d73e1d28dcd14323141096b5b624981f763ce5cdaf2df9bb35f4ad"
+        },
+        {
+          "path": "candidates/r_20261002_0915/crane_b.png",
+          "seed": 12,
+          "role": "candidate",
+          "sha256": "aaae4dbdb0e697350dac691b26928d34a69061cf320b175c257c103fcaa32766"
+        }
+      ],
+      "usage": {
+        "job_ids": [],
+        "est_cost": 0,
+        "cost": 0,
+        "currency": "USD"
+      },
+      "selected": [
+        "crane_b.png"
+      ],
+      "signed_off": {
+        "by": "user",
+        "date": "2026-10-02",
+        "version": "1.0.0"
+      },
+      "pinned": false
+    },
+    {
+      "run_id": "r_20261003_1400",
+      "path": "candidates/r_20261003_1400/",
+      "status": "open",
+      "created": "2026-10-03T14:00:00Z",
+      "target_version": "1.1.0",
+      "recipe": {
+        "step": "concept",
+        "tool": "comfyui"
+      },
+      "files": [
+        {
+          "path": "candidates/r_20261003_1400/crane_c.png",
+          "seed": 13,
+          "role": "candidate",
+          "sha256": "756151086e8b16ebaf3ccff573e1cad2c2cd958ed19d91ce32b2e30a1ca55f90"
+        },
+        {
+          "path": "candidates/r_20261003_1400/crane_c_cutout.png",
+          "role": "derived",
+          "from": "crane_c.png",
+          "sha256": "a488ae4d4b7442c6ac5ae1a6bd7e83c05804bf464e0251eb8f23427e879e6b31"
+        }
+      ],
+      "usage": {
+        "job_ids": [],
+        "est_cost": 0,
+        "cost": 0,
+        "currency": "USD"
+      },
+      "selected": null,
+      "signed_off": null
+    }
+  ],
+  "human_edits": [],
+  "locks": [
+    "prompts/crane.txt"
+  ],
+  "hashes": {
+    "v1.0.0/crane_b.png": "sha256:aaae4dbdb0e697350dac691b26928d34a69061cf320b175c257c103fcaa32766"
+  },
+  "created": "2026-10-02T09:00:00Z",
+  "updated": "2026-10-03T14:05:00Z"
+}

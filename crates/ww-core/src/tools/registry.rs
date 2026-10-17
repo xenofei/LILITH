@@ -20,7 +20,9 @@ use ww_protocol::{
 
 use super::stages::Settings;
 use crate::events::EventBus;
+use crate::pipeline::RecordSlot;
 use crate::session::Session;
+use crate::workspace::OpenWorkspace;
 
 /// What a tool's `run` returns.
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, ErrorBody>> + Send + 'a>>;
@@ -33,6 +35,39 @@ pub struct CallCtx {
     pub settings: Settings,
     /// The core's event bus, for tools that publish (`test.emit`; plan 2b's store).
     pub events: Arc<EventBus>,
+    /// The session's workspace, opened by the Resolve stage; `None` for a session without one.
+    pub workspace: Option<Arc<OpenWorkspace>>,
+    /// The call's project, resolved by the dispatcher (ARCH-088, ARCH-098): its `project`
+    /// argument, else the session's active project, else the workspace's `state.json` hint,
+    /// else `sketchbook`. `None` without a workspace.
+    pub project: Option<String>,
+    /// Where the tool leaves what the Record stage writes (CORE-020): a tool that records an
+    /// operation sets its [`RecordPlan`](crate::pipeline::RecordPlan) here during Execute.
+    pub record: Arc<RecordSlot>,
+}
+
+impl CallCtx {
+    /// [`CallCtx::project`], or `sketchbook` when the call has none.
+    pub fn project_or_default(&self) -> String {
+        self.project
+            .clone()
+            .unwrap_or_else(|| crate::projects::DEFAULT_PROJECT.to_string())
+    }
+
+    /// The session's open workspace.
+    ///
+    /// # Errors
+    /// `workspace.required` when the session has none (QA-005).
+    pub fn workspace(&self) -> Result<&Arc<OpenWorkspace>, ErrorBody> {
+        self.workspace.as_ref().ok_or_else(|| {
+            ErrorBody::new(
+                &codes::WORKSPACE_REQUIRED,
+                "This tool works in a workspace, and the session has none. Connect with a \
+                 workspace (`ww workspace use <path>` sets the default).",
+                self.trace_id.clone(),
+            )
+        })
+    }
 }
 
 /// One tool.
@@ -177,8 +212,10 @@ impl Registry {
     ///
     /// # Panics
     /// If a tool of the same name is registered already, its description is longer than
-    /// 2000 characters (ARCH-037), or it declares no module (CORE-058). These are programming
-    /// errors, caught by the registry tests.
+    /// 2000 characters (ARCH-037), it declares no module (CORE-058), or its input schema is an
+    /// object schema without `"additionalProperties": false` (inputs reject unknown fields;
+    /// `#[serde(deny_unknown_fields)]` gives it). These are programming errors, caught by the
+    /// registry tests.
     pub fn register(&mut self, t: Arc<dyn Tool>) {
         let d = t.descriptor();
         let chars = d.description.chars().count();
@@ -192,6 +229,14 @@ impl Registry {
             "tool {} declares no module (CORE-058)",
             d.name
         );
+        let schema = &d.input_schema;
+        assert!(
+            schema.get("type").and_then(serde_json::Value::as_str) != Some("object")
+                || schema.get("additionalProperties") == Some(&serde_json::Value::Bool(false)),
+            "tool {}: its input schema allows unknown properties; inputs reject unknown fields \
+             (add #[serde(deny_unknown_fields)])",
+            d.name
+        );
         let name = d.name.clone();
         assert!(
             !self.tools.contains_key(&name),
@@ -203,6 +248,14 @@ impl Registry {
     /// The tool called `name`, whoever may see it.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// The descriptors of every tool, by name, whoever may see it.
+    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.tools
+            .values()
+            .map(|t| t.descriptor().clone())
+            .collect()
     }
 
     /// The descriptors of the tools `caller` may see ([`Tool::visible_to`]), by name.

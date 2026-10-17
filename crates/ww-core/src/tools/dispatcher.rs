@@ -4,28 +4,53 @@
 //! 1. **Resolve.** The trace id is the caller's (`[A-Za-z0-9_-]{1,64}`) or a fresh one. The
 //!    tool must exist and be visible to the caller, else `tool.unknown`. A tool whose effect
 //!    is not `read` needs an idempotency key, else `idempotency.key_required` (ARCH-035).
+//!    With a session workspace: one that is no longer the default (after a switch; owner
+//!    decision 2) is `workspace.unsupported`; otherwise the [`WorkspaceHub`] opens it and
+//!    `CallCtx::workspace` is set (its errors, `state.unavailable` for one, are the call's).
+//!    An effect other than `read` on a workspace this core serves read-only (another core
+//!    holds its `core.lock`, ARCH-028) is `workspace.read_only`, before anything is stored.
 //! 2. **Validate.** The tool checks the arguments (`params.invalid`). For effect ≠ `read`,
 //!    `idem_begin` in the session's workspace `state.db`, or the suite one without a
 //!    workspace, under the scope `"<caller kind>|<workspace id or none>"`: a finished call
 //!    with the same arguments is replayed byte for byte, another hash is
 //!    `idempotency.conflict`, a running one `idempotency.in_progress`.
 //! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`, or a
-//!    `pending_confirmation` result), 6. **reserve**: the [`PipelineHooks`].
+//!    `pending_confirmation` result), 6. **reserve**: the [`PipelineHooks`]. Before the
+//!    settings, the Resolve stage's project part runs on the valid arguments (ARCH-088,
+//!    ARCH-098): with a session workspace, `CallCtx::project` is the `project` argument of a
+//!    tool that declares one, else the session's active project, else the workspace's
+//!    `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
+//!    never the call's project. The settings stage gets that project and, as the request
+//!    layer, the `settings` argument of a tool that declares one (only `test.settings` in
+//!    plan 2b, CORE-057); its error (`params.invalid`) is the call's.
 //! 7. **Execute** in its own task: a panic is `core.bug` with the panic text as untrusted
-//!    detail, and the core goes on (QA-012, ARCH-060).
-//! 8. **Meter** and 9. **record**: the hooks again.
+//!    detail, and the core goes on (QA-012, ARCH-060). A call that named a project and ended
+//!    `ok` makes it the session's active project and, on a read-write workspace, the hint
+//!    (a hint that can't be written is logged, never the call's error).
+//! 8. **Meter** and 9. **record**: the hooks again. The record hook gets the plan the tool
+//!    left in `CallCtx::record` (CORE-020); the plan-2b stage writes it only for an `ok`
+//!    outcome, and its error (a failed commit) becomes the call's.
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
 //! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
 //! `pending_confirmation` outcomes are stored, an error releases the key, except the
 //! too-large `core.bug`, which is stored (the tool ran; a retry must not run it again). The
 //! size is decided before the row is written, so the stored outcome and every replay agree.
-//! A `state.db` failure is `state.unavailable`.
+//! A `state.db` failure is `state.unavailable`. When the row can't be finished after the tool
+//! ran (an outcome to store), it stays `running` until the core restarts, because the tool
+//! must not run again for that key; the error then says so and carries `data.ran: true`.
+//!
+//! A call in a workspace holds its open workspace until its row is finished, so a workspace
+//! the hub lets go of mid-call (`workspace.set_default`) stays open until the call ends.
 //!
 //! **Draining** (ARCH-021). Before stage 1 the call is admitted by the [`Lifecycle`]: a
 //! draining core answers `core.draining` (retry with the same idempotency key once a core
 //! runs again). An admitted call counts as in flight until its pipeline ends, even if its
 //! caller has gone, so a drain waits for it.
+//!
+//! **Tracing.** The pipeline and the tool's own task run in a `tool_call` span with `tool` and
+//! `trace_id`, so every line they log, the panic hook's among them (ARCH-119), carries the
+//! call's trace id.
 //!
 //! **Cancellation.** [`Dispatcher::call`] runs the pipeline in a task of its own, so a caller
 //! that goes away (a client killed mid-call) cannot stop it between `idem_begin` and
@@ -38,18 +63,23 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
 use tokio::task::JoinError;
+use tracing::Instrument as _;
 use ww_platform::{Clock, IdSource};
 use ww_protocol::{
-    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput, args_hash,
-    codes, fits_response_result,
+    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolDescriptor, ToolOutput,
+    args_hash, codes, fits_response_result,
 };
 
 use super::registry::{CallCtx, Registry, Tool};
-use super::stages::{ConfirmDecision, PipelineHooks};
+use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
 use crate::events::EventBus;
 use crate::lifecycle::{CallGuard, FollowUp, Lifecycle};
+use crate::pipeline::RecordSlot;
+use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
+use crate::store::StoreError;
+use crate::workspace::{Access, OpenWorkspace, WorkspaceHub};
 
 /// Runs `tools/call` (module docs).
 #[derive(Clone)]
@@ -62,9 +92,12 @@ struct Inner {
     hooks: PipelineHooks,
     states: Arc<StateRegistry>,
     events: Arc<EventBus>,
+    hub: Arc<WorkspaceHub>,
     ids: Arc<dyn IdSource>,
     clock: Arc<dyn Clock>,
     lifecycle: Arc<Lifecycle>,
+    /// Each session's active project (ARCH-088).
+    active: Arc<ActiveProjects>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -76,11 +109,16 @@ impl std::fmt::Debug for Dispatcher {
 }
 
 impl Dispatcher {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the plan's signature: one handle per core service"
+    )]
     pub fn new(
         reg: Registry,
         hooks: PipelineHooks,
         states: Arc<StateRegistry>,
         events: Arc<EventBus>,
+        hub: Arc<WorkspaceHub>,
         ids: Arc<dyn IdSource>,
         clock: Arc<dyn Clock>,
         lifecycle: Arc<Lifecycle>,
@@ -91,11 +129,19 @@ impl Dispatcher {
                 hooks,
                 states,
                 events,
+                hub,
                 ids,
                 clock,
                 lifecycle,
+                active: Arc::new(ActiveProjects::new()),
             }),
         }
+    }
+
+    /// Each session's active project: the router forgets a session's when its connection
+    /// closes.
+    pub fn active_projects(&self) -> &Arc<ActiveProjects> {
+        &self.inner.active
     }
 
     /// The tools this dispatcher serves.
@@ -111,6 +157,11 @@ impl Dispatcher {
     /// The lifecycle that admits its calls.
     pub fn lifecycle(&self) -> &Arc<Lifecycle> {
         &self.inner.lifecycle
+    }
+
+    /// The workspace hub its calls open workspaces through.
+    pub fn hub(&self) -> &Arc<WorkspaceHub> {
+        &self.inner.hub
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
@@ -139,10 +190,14 @@ impl Dispatcher {
             };
         };
         let (name, inner, trace) = (p.name.clone(), self.inner.clone(), trace_id.clone());
+        // ERROR level, so the span and its `trace_id` stay on every line even under a raised
+        // level filter.
+        let span = tracing::error_span!("tool_call", tool = %name, trace_id = %trace_id);
         // Its own task: a caller that goes away cannot cut the pipeline short. The call stays
         // in flight until the pipeline ends.
-        let pipeline =
-            tokio::spawn(async move { inner.pipeline(&in_flight, session, p, trace).await });
+        let pipeline = tokio::spawn(
+            async move { inner.pipeline(&in_flight, session, p, trace).await }.instrument(span),
+        );
         match pipeline.await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -214,6 +269,18 @@ impl Inner {
                 );
             }
         };
+        let workspace = match self.open_workspace(session, trace_id).await {
+            Ok(workspace) => workspace,
+            Err(error) => return Outcome::Error { error },
+        };
+        if effect != EffectClass::Read
+            && let Some(open) = &workspace
+            && open.access == Access::ReadOnly
+        {
+            return Outcome::Error {
+                error: StoreError::ReadOnly.to_error(trace_id),
+            };
+        }
         let scope = format!("{}|{}", session.caller, session.workspace_id());
 
         // 2. Validate.
@@ -229,18 +296,18 @@ impl Inner {
             Some(key) => {
                 let hash = args_hash(&json!({"name": p.name, "arguments": args}));
                 match self
-                    .begin(in_flight, session, scope, key, &hash, trace_id)
+                    .begin(in_flight, workspace.as_ref(), scope, key, &hash, trace_id)
                     .await
                 {
                     Ok(Begun::Fresh(claim)) => Some(claim),
-                    Ok(Begun::Done(outcome)) => return outcome,
+                    Ok(Begun::Done(outcome)) => return *outcome,
                     Err(e) => return state_unavailable(&e, trace_id),
                 }
             }
         };
 
         // 3–9.
-        let outcome = self.run(session, &tool, args, trace_id).await;
+        let outcome = self.run(session, workspace, &tool, args, trace_id).await;
 
         // The line cap (ARCH-025), decided once, before anything is stored: an outcome too
         // large to send becomes `core.bug`, and that error is what the row keeps, so every
@@ -262,28 +329,55 @@ impl Inner {
         };
 
         // Finish the idempotency row: `ok` and `pending_confirmation` are stored, an error
-        // releases the key (except the one above).
+        // releases the key (except the one above). A row that can't be finished after the
+        // tool ran stays `running`: the tool must not run again for this key.
         match claim {
             None => outcome,
             Some(claim) => match claim.finish(keep.then_some(encoded)).await {
                 Ok(()) => outcome,
+                Err(e) if keep => ran_but_not_saved(&e, &p.name, trace_id),
                 Err(e) => state_unavailable(&e, trace_id),
             },
         }
     }
 
-    /// `idem_begin` for `key` in the session's database.
+    /// Stage 1's workspace part: `None` without a session workspace; `workspace.unsupported`
+    /// when it is no longer the default (the hub re-reads `suite.toml` before it says so, so
+    /// a default set outside this core is seen); else the hub's open workspace.
+    async fn open_workspace(
+        &self,
+        session: &Session,
+        trace_id: &str,
+    ) -> Result<Option<Arc<OpenWorkspace>>, ErrorBody> {
+        let Some(ws) = &session.workspace else {
+            return Ok(None);
+        };
+        let is_default = |hub: &WorkspaceHub| hub.default_id().as_deref() == Some(ws.id.as_str());
+        if !is_default(&self.hub) {
+            self.hub.refresh_default();
+            if !is_default(&self.hub) {
+                return Err(self.hub.unsupported(ws, trace_id));
+            }
+        }
+        self.hub.open(ws).await.map(Some).map_err(|mut error| {
+            error.trace_id = trace_id.to_string();
+            error
+        })
+    }
+
+    /// `idem_begin` for `key` in the workspace's database, or the suite one without a
+    /// workspace.
     async fn begin(
         &self,
         in_flight: &CallGuard,
-        session: &Session,
+        workspace: Option<&Arc<OpenWorkspace>>,
         scope: String,
         key: String,
         hash: &str,
         trace_id: &str,
     ) -> Result<Begun, StateError> {
-        let db = match &session.workspace {
-            Some(ws) => DbHandle::Workspace(self.states.for_workspace(ws).await?),
+        let db = match workspace {
+            Some(open) => DbHandle::Workspace(open.clone()),
             None => DbHandle::Suite(self.states.clone()),
         };
         let now = self
@@ -299,15 +393,15 @@ impl Inner {
                 follow_up: Some(in_flight.follow_up()),
                 finished: false,
             }),
-            IdemBegin::Replay(stored) => Begun::Done(replay(&stored, &key, trace_id)),
-            IdemBegin::Conflict => Begun::Done(Outcome::Error {
+            IdemBegin::Replay(stored) => Begun::Done(Box::new(replay(&stored, &key, trace_id))),
+            IdemBegin::Conflict => Begun::Done(Box::new(Outcome::Error {
                 error: ErrorBody::new(
                     &codes::IDEMPOTENCY_CONFLICT,
                     format!("The idempotency key {key:?} was used before with other arguments."),
                     trace_id,
                 ),
-            }),
-            IdemBegin::InProgress => Begun::Done(Outcome::Error {
+            })),
+            IdemBegin::InProgress => Begun::Done(Box::new(Outcome::Error {
                 error: ErrorBody::new(
                     &codes::IDEMPOTENCY_IN_PROGRESS,
                     format!(
@@ -315,7 +409,7 @@ impl Inner {
                     ),
                     trace_id,
                 ),
-            }),
+            })),
         })
     }
 
@@ -323,14 +417,40 @@ impl Inner {
     async fn run(
         &self,
         session: &Arc<Session>,
+        workspace: Option<Arc<OpenWorkspace>>,
         tool: &Arc<dyn Tool>,
         args: Value,
         trace_id: &str,
     ) -> Outcome<ToolOutput> {
         let hooks = &self.hooks;
         let d = tool.descriptor();
+        // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid.
+        let named = named_project(d, &args);
+        let project = match &workspace {
+            None => None,
+            Some(open) => Some(self.project_of(session, open, named.as_deref()).await),
+        };
         // 3. Settings; 4. estimate.
-        let settings = hooks.settings.resolve(session);
+        let request = declares(d, "settings")
+            .then(|| args.get("settings").and_then(Value::as_object))
+            .flatten();
+        let settings = match hooks
+            .settings
+            .resolve(SettingsInput {
+                session,
+                descriptor: d,
+                workspace: workspace.as_deref(),
+                project: project.as_deref(),
+                request,
+            })
+            .await
+        {
+            Ok(settings) => settings,
+            Err(mut error) => {
+                error.trace_id = trace_id.to_string();
+                return Outcome::Error { error };
+            }
+        };
         let estimate = hooks.estimate.estimate(d);
         // 5. Confirm and caps.
         match hooks.confirm.check(session, d, &estimate) {
@@ -355,14 +475,21 @@ impl Inner {
             return Outcome::Error { error };
         }
         // 7. Execute, in its own task: a panic stays in it.
+        let open = workspace.clone();
         let ctx = CallCtx {
             session: session.clone(),
             trace_id: trace_id.to_string(),
             settings,
             events: self.events.clone(),
+            workspace,
+            project,
+            record: Arc::new(RecordSlot::new()),
         };
         let running = tool.clone();
-        let joined = tokio::spawn(async move { running.run(&ctx, args).await }).await;
+        let run_ctx = ctx.clone();
+        // In the pipeline's span: a panic in the tool is logged with the call's trace id.
+        let joined =
+            tokio::spawn(async move { running.run(&run_ctx, args).await }.in_current_span()).await;
         let mut outcome = match joined {
             Ok(Ok(output)) => Outcome::Ok(output),
             Ok(Err(mut error)) => {
@@ -377,33 +504,88 @@ impl Inner {
                 }
             }
         };
-        // 8. Meter; 9. record.
+        // A call that named a project and ended `ok` makes it the session's active project
+        // and, on a read-write workspace, the workspace's hint (ARCH-088).
+        if let (Outcome::Ok(_), Some(open), Some(slug)) = (&outcome, &open, &named)
+            && ww_schema::is_slug(slug)
+            && let Err(e) = remember_project(&self.active, &session.id, open, slug).await
+        {
+            tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
+        }
+        // 8. Meter; 9. record (CORE-020): what the tool left in its record slot.
         hooks.meter.settle(session, &outcome);
-        hooks.record.record(session, d, &mut outcome);
+        let plan = ctx.record.take();
+        hooks.record.record(&ctx, d, plan, &mut outcome).await;
         outcome
     }
+
+    /// The call's project in `open`: `named`, else the session's active project, else the
+    /// workspace's `state.json` hint, else `sketchbook` (ARCH-088, ARCH-098).
+    async fn project_of(
+        &self,
+        session: &Session,
+        open: &OpenWorkspace,
+        named: Option<&str>,
+    ) -> String {
+        if let Some(named) = named {
+            return named.to_string();
+        }
+        let active = self.active.get(&session.id);
+        let hint = match active {
+            Some(_) => None,
+            None => read_hint(&open.store).await,
+        };
+        resolve_project(None, active, hint)
+    }
+}
+
+/// Tools whose `project` argument is a filter (omitted means every project), so it is never
+/// filled in from the session and never sets the active project.
+const PROJECT_FILTER_TOOLS: &[&str] = &["assets.query"];
+
+/// Whether `d`'s input schema declares the argument `arg`.
+fn declares(d: &ToolDescriptor, arg: &str) -> bool {
+    d.input_schema
+        .get("properties")
+        .and_then(|p| p.get(arg))
+        .is_some()
+}
+
+/// The project a call names in its `project` argument, for a tool that declares one and whose
+/// `project` isn't a filter. It is the call's project as given, slug or not: the tool checks
+/// it, so a bad name is never swapped for the session's project.
+fn named_project(d: &ToolDescriptor, args: &Value) -> Option<String> {
+    if PROJECT_FILTER_TOOLS.contains(&d.name.as_str()) || !declares(d, "project") {
+        return None;
+    }
+    args.get("project")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// What `idem_begin` let the call do.
 enum Begun {
     /// Run it; the claim finishes the row.
     Fresh(Claim),
-    /// It is answered already: a replay or an idempotency error.
-    Done(Outcome<ToolOutput>),
+    /// It is answered already: a replay or an idempotency error. Boxed: an `Outcome` holds
+    /// `serde_json::Value`s, which `preserve_order` (ARCH-076) makes ordered maps.
+    Done(Box<Outcome<ToolOutput>>),
 }
 
-/// A database the dispatcher holds across the call.
+/// A database the dispatcher holds across the call. A workspace one holds the whole open
+/// workspace, so a workspace the hub lets go of mid-call stays open until the row is finished
+/// (its last holder closes it).
 #[derive(Clone)]
 enum DbHandle {
     Suite(Arc<StateRegistry>),
-    Workspace(Arc<StateDb>),
+    Workspace(Arc<OpenWorkspace>),
 }
 
 impl DbHandle {
     fn get(&self) -> &StateDb {
         match self {
             DbHandle::Suite(states) => states.suite(),
-            DbHandle::Workspace(db) => db,
+            DbHandle::Workspace(open) => &open.state,
         }
     }
 }
@@ -491,6 +673,21 @@ fn replay(stored: &str, key: &str, trace_id: &str) -> Outcome<ToolOutput> {
             ),
         }
     })
+}
+
+/// `state.unavailable` for a call whose tool ran but whose outcome couldn't be stored: its row
+/// stays `running` until the core restarts, and `data.ran` is `true`.
+fn ran_but_not_saved(e: &StateError, tool: &str, trace_id: &str) -> Outcome<ToolOutput> {
+    tracing::error!(tool, trace_id, error = %e, "a tool ran, but its outcome could not be stored; its idempotency row stays running");
+    let mut error = ErrorBody::new(
+        &codes::STATE_UNAVAILABLE,
+        "The call ran, but the core could not save its result. Until the core restarts, a retry \
+         with the same idempotency key reports it as still running; check what it did before \
+         you retry with a new key.",
+        trace_id,
+    );
+    error.data = Some(json!({ "ran": true }));
+    Outcome::Error { error }
 }
 
 fn state_unavailable(e: &StateError, trace_id: &str) -> Outcome<ToolOutput> {

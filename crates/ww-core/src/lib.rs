@@ -15,14 +15,20 @@
 
 pub mod config;
 pub mod events;
+pub mod graph;
 pub mod identity;
+pub mod index;
 pub mod lifecycle;
+pub mod pipeline;
+pub mod projects;
 pub mod rpc;
 pub mod server;
 pub mod session;
+pub mod settings;
 pub mod state;
 pub mod store;
 pub mod tools;
+pub mod watch;
 pub mod workspace;
 
 pub use config::{CoreConfig, CoreExit};

@@ -23,6 +23,7 @@
 pub mod blocking;
 mod conn;
 mod connect;
+pub mod doctor;
 mod workspace;
 
 use std::ffi::OsString;
@@ -138,6 +139,9 @@ pub enum StartFailure {
     StateDamaged,
     /// Exit code 6: the suite `state.db` is from a newer version; nothing was changed.
     StateTooNew,
+    /// Exit code 7: the suite `state.db` has a hot rollback journal (a crash mid-write);
+    /// nothing was changed.
+    StateHotJournal,
     /// Any other exit code; the core's log may say why (a core that fails before its log
     /// starts writes none).
     Other,
@@ -149,6 +153,7 @@ impl StartFailure {
         match code {
             Some(5) => StartFailure::StateDamaged,
             Some(6) => StartFailure::StateTooNew,
+            Some(7) => StartFailure::StateHotJournal,
             _ => StartFailure::Other,
         }
     }
@@ -184,9 +189,11 @@ pub enum ClientError {
     Refused(ErrorBody),
     /// The core refused the hello with `workspace.unknown` for the workspace the `cli` chain
     /// found ([`ClientConfig::workspace_origin`]): most often a folder with `worldwright.yaml`
-    /// that is not registered in `suite.toml`.
+    /// that is not registered in `suite.toml`. `default` is the default workspace `suite.toml`
+    /// names, the one the core serves (`None` when none is set or it can't be read).
     UnknownWorkspace {
         origin: WorkspaceOrigin,
+        default: Option<PathBuf>,
         error: ErrorBody,
     },
     /// The core answered with a JSON-RPC protocol fault, or with something that is not the
@@ -232,7 +239,16 @@ impl fmt::Display for ClientError {
                 ..
             } => write!(
                 f,
-                "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+                "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` can set it aside.",
+                state_db.display()
+            ),
+            ClientError::StartFailed {
+                kind: StartFailure::StateHotJournal,
+                state_db,
+                ..
+            } => write!(
+                f,
+                "The core can't start: its state database at {} was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery.",
                 state_db.display()
             ),
             ClientError::StartFailed {
@@ -275,12 +291,40 @@ impl fmt::Display for ClientError {
                 path.display(),
                 WorkspaceSource::Default
             ),
+            // A workspace named by --workspace is never told to become the default: it is told
+            // which workspace the core serves.
+            ClientError::UnknownWorkspace {
+                origin:
+                    WorkspaceOrigin {
+                        path,
+                        source: WorkspaceSource::Flag,
+                    },
+                default,
+                ..
+            } => {
+                write!(
+                    f,
+                    "The workspace \"{}\" ({}) is not registered in suite.toml, so the core cannot use it. ",
+                    path.display(),
+                    WorkspaceSource::Flag
+                )?;
+                match default {
+                    Some(default) => write!(
+                        f,
+                        "The core serves only the default workspace, \"{}\": run the command without --workspace, or from inside that workspace.",
+                        default.display()
+                    ),
+                    None => f.write_str(
+                        "The core serves only the default workspace, and none is set: run the command without --workspace.",
+                    ),
+                }
+            }
             ClientError::UnknownWorkspace {
                 origin: WorkspaceOrigin { path, source },
                 ..
             } => write!(
                 f,
-                "The workspace {} ({source}) is not registered in suite.toml, so the core cannot use it. To use it, make it the default with `ww workspace use {}` (plan 2b).",
+                "The workspace \"{}\" ({source}) is not registered in suite.toml, so the core cannot use it. To use it, make it the default with `ww workspace use \"{}\"`.",
                 path.display(),
                 path.display()
             ),
@@ -334,6 +378,10 @@ mod tests {
             StartFailure::from_exit_code(Some(6)),
             StartFailure::StateTooNew
         );
+        assert_eq!(
+            StartFailure::from_exit_code(Some(7)),
+            StartFailure::StateHotJournal
+        );
         for other in [Some(2), Some(4), Some(0), None] {
             assert_eq!(StartFailure::from_exit_code(other), StartFailure::Other);
         }
@@ -345,7 +393,11 @@ mod tests {
         };
         assert_eq!(
             failed(Some(5), StartFailure::StateDamaged).to_string(),
-            r"The core can't start: its state database at C:\t\local\state.db is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside."
+            r"The core can't start: its state database at C:\t\local\state.db is damaged. Nothing was changed. `ww doctor` can set it aside."
+        );
+        assert_eq!(
+            failed(Some(7), StartFailure::StateHotJournal).to_string(),
+            r"The core can't start: its state database at C:\t\local\state.db was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery."
         );
         assert_eq!(
             failed(Some(6), StartFailure::StateTooNew).to_string(),
@@ -358,37 +410,70 @@ mod tests {
         assert!(other.contains("may say why"), "{other}");
     }
 
-    #[test] // spec: ARCH-030
-    fn unknown_workspace_names_the_folder_and_where_it_came_from() {
-        let error = ErrorBody::new(
-            &ww_protocol::codes::WORKSPACE_UNKNOWN,
-            "The workspace 0123456789abcdef is not one this core knows.",
-            "t_1",
-        );
-        let unknown = |source| ClientError::UnknownWorkspace {
+    fn unknown(source: WorkspaceSource, default: Option<&str>) -> ClientError {
+        ClientError::UnknownWorkspace {
             origin: WorkspaceOrigin {
                 path: PathBuf::from(r"C:\ws\Ünïcödé space"),
                 source,
             },
-            error: error.clone(),
-        };
+            default: default.map(PathBuf::from),
+            error: ErrorBody::new(
+                &ww_protocol::codes::WORKSPACE_UNKNOWN,
+                "The workspace 0123456789abcdef is not one this core knows.",
+                "t_1",
+            ),
+        }
+    }
+
+    #[test] // spec: ARCH-030
+    fn unknown_workspace_names_the_folder_and_where_it_came_from() {
         for (source, said) in [
             (WorkspaceSource::Flag, "--workspace"),
             (WorkspaceSource::CurrentFolder, "current folder"),
         ] {
-            let text = unknown(source).to_string();
+            let text = unknown(source, None).to_string();
             assert!(text.contains(r"C:\ws\Ünïcödé space"), "{text}");
             assert!(text.contains(said), "{text}");
             assert!(text.contains("not registered in suite.toml"), "{text}");
-            assert!(
-                text.contains(r"`ww workspace use C:\ws\Ünïcödé space` (plan 2b)"),
-                "{text}"
-            );
             assert!(!text.contains("0123456789abcdef"), "{text}");
+            assert!(!text.contains("plan 2b"), "{text}");
         }
-        let text = unknown(WorkspaceSource::Default).to_string();
+        let text = unknown(WorkspaceSource::CurrentFolder, None).to_string();
+        assert!(
+            text.contains(r#"`ww workspace use "C:\ws\Ünïcödé space"`"#),
+            "{text}"
+        );
+        let text = unknown(WorkspaceSource::Default, None).to_string();
         assert!(text.contains(r"C:\ws\Ünïcödé space"), "{text}");
         assert!(text.contains("default_workspace"), "{text}");
+    }
+
+    #[test] // spec: ARCH-090, QA-003
+    fn unregistered_hint_quotes_the_path_and_flag_source_is_not_told_to_switch() {
+        // Found from the current folder: the hint to make it the default quotes the path.
+        let text = unknown(WorkspaceSource::CurrentFolder, Some(r"D:\main ws")).to_string();
+        assert!(text.contains(r#""C:\ws\Ünïcödé space""#), "{text}");
+        assert!(
+            text.ends_with(r#"`ww workspace use "C:\ws\Ünïcödé space"`."#),
+            "{text}"
+        );
+        assert!(!text.contains("(plan 2b)"), "{text}");
+
+        // Named by --workspace: never told to become the default; told which workspace the
+        // core serves, and to run without --workspace or from inside it.
+        let text = unknown(WorkspaceSource::Flag, Some(r"D:\main ws")).to_string();
+        assert!(!text.contains("ww workspace use"), "{text}");
+        assert!(text.contains(r#""C:\ws\Ünïcödé space""#), "{text}");
+        assert!(
+            text.contains(r#"serves only the default workspace, "D:\main ws""#),
+            "{text}"
+        );
+        assert!(text.contains("without --workspace"), "{text}");
+        assert!(text.contains("from inside"), "{text}");
+        let text = unknown(WorkspaceSource::Flag, None).to_string();
+        assert!(!text.contains("ww workspace use"), "{text}");
+        assert!(text.contains("none is set"), "{text}");
+        assert!(text.contains("without --workspace"), "{text}");
     }
 
     #[test] // spec: ARCH-014, ARCH-027

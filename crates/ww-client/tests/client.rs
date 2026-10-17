@@ -182,6 +182,14 @@ fn racing_starts_yield_one_core() {
 
     assert_eq!(pids.len(), CLIENTS);
     assert!(pids.iter().all(|&p| p == pids[0]), "{pids:?}");
+    // The cores that lost the pipe claim touched nothing, not even a log: one core log.
+    let logs = env.env.logs_dir();
+    let core_logs: Vec<String> = std::fs::read_dir(&logs)
+        .unwrap_or_else(|e| panic!("cannot list {}: {e}", logs.display()))
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("core.") && name.ends_with(".log"))
+        .collect();
+    assert_eq!(core_logs.len(), 1, "{core_logs:?}");
     stop(&cfg);
 }
 
@@ -311,6 +319,33 @@ fn newer_core_is_never_drained_by_older_client() {
     assert_eq!(core.wait_exit(DEADLINE), Some(0));
 }
 
+#[test] // spec: ARCH-014, ARCH-023
+fn older_client_drain_and_wait_is_incompatible() {
+    let env = TestEnv::new();
+    let cfg = config(&env);
+    let mut core = CoreFixture::start(&env);
+
+    // `ww core stop` from an older major: the core refuses the drain, the client says why,
+    // and the core keeps serving.
+    let mut older = cfg.clone();
+    older.protocol = ProtocolVersion { major: 0, minor: 9 };
+    let err = runtime()
+        .block_on(drain_and_wait(&older, DEADLINE))
+        .expect_err("an older client drained a newer core");
+    match &err {
+        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.0"),
+        other => panic!("expected Incompatible, got {other:?}"),
+    }
+    let mut same = cfg.clone();
+    same.start = StartPolicy::NoStart;
+    let client = BlockingClient::connect(&same).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(client.hello().core.pid, core.pid());
+    drop(client);
+
+    stop(&cfg);
+    assert_eq!(core.wait_exit(DEADLINE), Some(0));
+}
+
 #[test] // spec: ARCH-004, ARCH-019
 fn non_ascii_and_spaced_roots_work() {
     let env = TestEnv::with_label("Ünïcödé space");
@@ -341,7 +376,7 @@ fn damaged_state_db_is_a_plain_start_failure() {
     std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
     let before = sha256_file(&db);
     let expected = format!(
-        "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+        "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` can set it aside.",
         db.display()
     );
 

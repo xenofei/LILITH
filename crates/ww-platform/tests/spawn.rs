@@ -103,6 +103,7 @@ fn dummy_request() -> SpawnRequest {
         exe: PathBuf::from(r"C:\nowhere\ww-core.exe"),
         args: Vec::new(),
         extra_env: Vec::new(),
+        remove_env: Vec::new(),
     }
 }
 
@@ -134,6 +135,7 @@ fn spawn_detached_runs_child_and_reports_exit_code() {
         exe: comspec(),
         args: vec!["/c".into(), "exit 7".into()],
         extra_env: Vec::new(),
+        remove_env: Vec::new(),
     })
     .unwrap();
     assert_ne!(child.pid(), 0);
@@ -160,6 +162,7 @@ fn detached_child_does_not_inherit_parent_handles() {
         exe: std::env::current_exe().unwrap(),
         args: helper_args(),
         extra_env: vec![(SLEEP_ENV.into(), "5000".into())],
+        remove_env: Vec::new(),
     })
     .unwrap();
     drop(writer);
@@ -204,6 +207,7 @@ fn spawn_quotes_paths_with_spaces_and_non_ascii() {
             (SLEEP_ENV.into(), "1".into()),
             (EXPECT_ARG_ENV.into(), TRICKY_ARG.into()),
         ],
+        remove_env: Vec::new(),
     })
     .unwrap();
     let code = runtime().block_on(child.wait()).unwrap();

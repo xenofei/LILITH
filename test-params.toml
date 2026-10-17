@@ -1,7 +1,6 @@
-# Trial: protected-file change used to test the approval flow (second commit).
 # Owner-facing test parameters (QA-019). PROTECTED: changes require owner approval.
-# Plan-1 code does not consume this file yet; .config/nextest.toml carries the
-# same timeout values directly and points back here as the record.
+# ww_testkit::params reads [proptest] and [budgets]; .config/nextest.toml still carries the
+# timeout values directly and points back here as the record.
 
 [timeouts]
 unit_s = 30
@@ -22,3 +21,13 @@ cases = 256
 [images]
 # IMG-036: max per-channel difference tolerated in image comparisons.
 max_channel_diff = 1
+
+[budgets]
+# CORE-042: the index budgets, in seconds, checked by crates/ww-core/tests/index_bench.rs.
+# A cold rebuild of 2,000 assets (3 files each) must fit in 30 s.
+index_rebuild_2000_assets_s = 30
+# A warm reconcile of 10,000 assets (3 files each, nothing changed). The value is twice this
+# reconcile's local measurement in plan 2b Task 10; the owner checks it against the CI
+# Windows runner's figure (printed in the PR's CI log) and adjusts it, if needed, when
+# approving the PR.
+index_warm_reconcile_10000_assets_s = 6

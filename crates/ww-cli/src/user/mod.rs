@@ -1,10 +1,12 @@
 //! The `ww` user commands over `ww-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
-//! `events --follow` and `core stop`. Spec Appendix D, "The `ww` user commands", is the
-//! contract for their flags, output and exit codes.
+//! `events --follow`, `core stop`, `workspace init|use`, `notify` and `doctor`. Spec Appendix D, "The `ww` user
+//! commands", and Appendix E, "The `ww` commands this plan adds", are the contract for their
+//! flags, output and exit codes.
 //!
 //! Every command builds its [`ClientConfig`] for the process's channel as a `cli` caller
 //! ([`config`]). `status`, `call` and `events` name the workspace the `cli` chain resolves
-//! (ARCH-030); `core stop` names none, so a broken workspace registry never stops it.
+//! (ARCH-030); `core stop` and `workspace init|use` name none, and `doctor` names the default
+//! workspace it read itself, so a broken workspace registry never stops them.
 //!
 //! A workspace found from the current folder that is not registered in `suite.toml` stops
 //! `call` and `events` with a plain message naming the folder; `status` warns once on stderr
@@ -15,8 +17,11 @@
 
 mod call;
 mod core;
+mod doctor;
 mod events;
+mod notify;
 mod status;
+mod workspace;
 
 use std::fmt::Display;
 use std::io::{self, Write as _};
@@ -56,6 +61,14 @@ pub struct GlobalArgs {
     pub no_start: bool,
 }
 
+impl GlobalArgs {
+    /// Whether any of the flags was given. `ww dev` takes none of them: they are `global`, so
+    /// clap would accept them after a dev command, and `main` refuses them there.
+    pub fn any_set(&self) -> bool {
+        self.workspace.is_some() || self.non_interactive || self.no_start
+    }
+}
+
 #[derive(Debug, clap::Subcommand)]
 pub enum UserCommand {
     /// Show whether the core is running, and its pipe, protocol, build and workspace.
@@ -89,6 +102,40 @@ pub enum UserCommand {
     /// Manage the core process.
     #[command(subcommand)]
     Core(CoreCommand),
+    /// Create workspaces and choose the default one.
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
+    /// Tell the core's watcher that files changed (for folders it can't watch). Prints nothing
+    /// on success.
+    Notify {
+        /// The changed files or folders, inside the workspace.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Check the suite's state database, the workspace registry and the default workspace, and
+    /// repair what is safe to repair. Anything persistent beyond that is done only after you
+    /// type y.
+    Doctor,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum WorkspaceCommand {
+    /// Create a workspace (or register an existing one) and make it the default when none is set.
+    Init {
+        /// The workspace folder; it is created when it doesn't exist.
+        path: PathBuf,
+        /// The workspace's name (default: the folder's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Make it the default workspace even when one is set.
+        #[arg(long)]
+        default: bool,
+    },
+    /// Make a workspace the default one the core serves.
+    Use {
+        /// A workspace folder (it holds worldwright.yaml).
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -116,6 +163,16 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
             since,
         } => events::run(global, topics, &since),
         UserCommand::Core(CoreCommand::Stop { timeout_secs }) => core::stop(global, timeout_secs),
+        UserCommand::Workspace(WorkspaceCommand::Init {
+            path,
+            name,
+            default,
+        }) => workspace::init(global, &path, name.as_deref(), default),
+        UserCommand::Workspace(WorkspaceCommand::Use { path }) => {
+            workspace::use_default(global, &path)
+        }
+        UserCommand::Notify { paths } => notify::run(global, &paths),
+        UserCommand::Doctor => doctor::run(global),
     };
     match result {
         Ok(code) | Err(Exit(code)) => code,
@@ -171,7 +228,8 @@ pub(crate) enum UnknownCwdWorkspace {
 ///
 /// With `--no-start`, a workspace that cannot be resolved (a stale `default_workspace` in
 /// `suite.toml`, say) is reported only when a core runs: with none, the command stays a silent
-/// no-op (ARCH-018).
+/// no-op (ARCH-018). The probe for a running core reports its own failures (an untrusted
+/// core, say) rather than hiding them behind the workspace message.
 ///
 /// A workspace the core does not know is named by its folder and where it came from
 /// ([`ClientError::UnknownWorkspace`]); one found from the current folder is handled as
@@ -188,8 +246,11 @@ pub(crate) fn connect(
         Err(e) => {
             if cfg.start == StartPolicy::NoStart {
                 cfg.set_workspace(no_workspace());
-                if let Err(ClientError::NotRunning) = BlockingClient::connect(&cfg) {
-                    return Ok(None);
+                match BlockingClient::connect(&cfg) {
+                    Err(ClientError::NotRunning) => return Ok(None),
+                    // A core runs: the workspace message stands.
+                    Ok(_) => {}
+                    Err(probe) => return Err(cannot_run(probe)),
                 }
             }
             return Err(cannot_run(e));
@@ -332,6 +393,105 @@ mod tests {
         }
     }
 
+    #[test] // spec: ARCH-003, ARCH-090
+    fn workspace_init_and_use_parse() {
+        match user(parse(&["ww", "workspace", "init", r"C:\ws\Ünïcödé space"])) {
+            UserCommand::Workspace(WorkspaceCommand::Init {
+                path,
+                name,
+                default,
+            }) => {
+                assert_eq!(path, PathBuf::from(r"C:\ws\Ünïcödé space"));
+                assert_eq!(name, None);
+                assert!(!default);
+            }
+            other => panic!("not workspace init: {other:?}"),
+        }
+        match user(parse(&[
+            "ww",
+            "workspace",
+            "init",
+            "rel ws",
+            "--name",
+            "Ünïcödé space",
+            "--default",
+        ])) {
+            UserCommand::Workspace(WorkspaceCommand::Init {
+                path,
+                name,
+                default,
+            }) => {
+                assert_eq!(path, PathBuf::from("rel ws"));
+                assert_eq!(name.as_deref(), Some("Ünïcödé space"));
+                assert!(default);
+            }
+            other => panic!("not workspace init: {other:?}"),
+        }
+        match user(parse(&[
+            "ww",
+            "--no-start",
+            "workspace",
+            "use",
+            r"D:\other",
+        ])) {
+            UserCommand::Workspace(WorkspaceCommand::Use { path }) => {
+                assert_eq!(path, PathBuf::from(r"D:\other"));
+            }
+            other => panic!("not workspace use: {other:?}"),
+        }
+        for bad in [
+            &["ww", "workspace"][..],
+            &["ww", "workspace", "init"],
+            &["ww", "workspace", "use"],
+            &["ww", "workspace", "use", "a", "b"],
+            &["ww", "workspace", "drop", "a"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test] // spec: ARCH-016, ARCH-073
+    fn notify_parses() {
+        match user(parse(&[
+            "ww",
+            "notify",
+            r"C:\ws\Ünïcödé space\a.png",
+            "rel/b.png",
+        ])) {
+            UserCommand::Notify { paths } => assert_eq!(
+                paths,
+                [
+                    PathBuf::from(r"C:\ws\Ünïcödé space\a.png"),
+                    PathBuf::from("rel/b.png")
+                ]
+            ),
+            other => panic!("not notify: {other:?}"),
+        }
+        assert!(matches!(
+            user(parse(&["ww", "--no-start", "notify", "a.png"])),
+            UserCommand::Notify { .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["ww", "notify"]).is_err(),
+            "notify needs a path"
+        );
+    }
+
+    #[test] // spec: CORE-004, CORE-040
+    fn doctor_parses() {
+        assert!(matches!(
+            user(parse(&["ww", "doctor"])),
+            UserCommand::Doctor
+        ));
+        let cli = parse(&["ww", "--non-interactive", "doctor"]);
+        assert!(cli.global.non_interactive);
+        assert!(matches!(user(cli), UserCommand::Doctor));
+        assert!(
+            Cli::try_parse_from(["ww", "doctor", "extra"]).is_err(),
+            "doctor takes no argument"
+        );
+    }
+
     #[test] // spec: ARCH-016
     fn events_needs_follow_and_a_topic() {
         assert!(Cli::try_parse_from(["ww", "events", "--topic", "test:a"]).is_err());
@@ -417,5 +577,52 @@ mod tests {
             parse(&["ww", "dev", "spec-tests"]).command,
             Command::Dev(crate::dev::DevCommand::SpecTests)
         ));
+    }
+
+    #[test] // spec: ARCH-016
+    fn dev_commands_reject_user_global_flags() {
+        // The user flags are clap `global = true`, so they parse after a dev command too;
+        // `any_set` sees each of them, and none on a plain command.
+        for (args, set) in [
+            (&["ww", "dev", "spec-report"][..], false),
+            (&["ww", "dev", "spec-report", "--no-start"], true),
+            (&["ww", "--non-interactive", "dev", "spec-report"], true),
+            (
+                &[
+                    "ww",
+                    "dev",
+                    "spec-report",
+                    "--workspace",
+                    r"C:\ws\Ünïcödé space",
+                ],
+                true,
+            ),
+            (&["ww", "status"], false),
+            (&["ww", "--no-start", "status"], true),
+        ] {
+            let cli = parse(args);
+            assert_eq!(cli.global.any_set(), set, "{args:?}");
+        }
+
+        // The real `ww` refuses them on `ww dev`: exit 2 and the message, and the dev command
+        // never runs (`spec-report` would print its report on stdout).
+        let env = ww_testkit::TestEnv::new();
+        for flags in [
+            &["--no-start"][..],
+            &["--non-interactive"],
+            &["--workspace", "Ünïcödé space"],
+        ] {
+            let mut args = vec!["dev", "spec-report"];
+            args.extend_from_slice(flags);
+            let out = env.ww(&args);
+            assert_eq!(out.code, 2, "{args:?}: {out:?}");
+            assert!(
+                out.stderr.contains(
+                    "`ww dev` doesn't take --workspace, --non-interactive or --no-start."
+                ),
+                "{args:?}: {out:?}"
+            );
+            assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        }
     }
 }

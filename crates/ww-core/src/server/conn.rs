@@ -12,9 +12,11 @@
 //!   dropped. Waiting for a permit ends when `close` is cancelled, so a drain or shutdown never
 //!   waits for a full connection. A request task that panics is answered with
 //!   `Router::panicked`.
-//! - A line that is not a request gets its protocol fault. An over-long line gets -32002 with
-//!   id `null`, and the connection then closes. A response is never written over the cap
-//!   either: one that would be gets -32603 for its id instead ([`ConnCtx::send_response`]).
+//! - A line that is not a request gets its protocol fault, and the connection stays open; one
+//!   that is not UTF-8 gets -32700 with id `null`. A line of up to `MAX_LINE_BYTES` before its
+//!   `\n` is read; a longer one gets -32002 with id `null`, and the connection then closes. A
+//!   response is never written over the cap either: one that would be gets -32603 for its id
+//!   instead ([`ConnCtx::send_response`]).
 //!   Notifications are ignored; a partial line at end-of-stream is dropped.
 //! - Cancelling `ConnCtx::close` ends the connection. Lines already queued by then (the reply
 //!   to `core/drain` among them) are still written for up to `FLUSH_GRACE`.

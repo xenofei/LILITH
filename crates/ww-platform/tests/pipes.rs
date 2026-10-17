@@ -7,12 +7,18 @@
 use std::collections::BTreeSet;
 
 use ww_platform::pipe::{
-    ConnectError, CreateError, client_pid, create_instance, instance_dacl_sids, open_client,
-    pipe_sddl, server_pid,
+    ConnectError, CreateError, client_pid, create_instance, instance_dacl, instance_dacl_sids,
+    open_client, pipe_sddl, server_pid,
 };
 use ww_platform::process::{ProcessInspector, SystemInspector, current_user_sid};
 use ww_platform::sockets::{SocketKind, sockets_of};
 use ww_platform::{IdSource, RandomIds, TEST_PIPE_SID};
+
+/// `GENERIC_ALL` (`GA` in SDDL).
+const GENERIC_ALL_MASK: u32 = 0x1000_0000;
+/// `FILE_ALL_ACCESS` (`STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1FF`): what `GENERIC_ALL`
+/// maps to for file objects, named pipes included.
+const FILE_ALL_ACCESS_MASK: u32 = 0x001F_01FF;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -45,6 +51,20 @@ fn instance_dacl_is_user_and_system_only() {
             .into_iter()
             .collect();
         assert_eq!(sids, expected);
+        // Each entry grants `GA` (GENERIC_ALL), as the SDDL says, and nothing narrower or wider.
+        // Windows maps generic rights to the object's specific rights when it stores the
+        // descriptor, so the stored mask is GENERIC_ALL through the file generic mapping,
+        // FILE_ALL_ACCESS; the unmapped bit is accepted too.
+        let entries = instance_dacl(&server).unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        for entry in &entries {
+            assert!(entry.allowed, "{entry:?}");
+            assert!(
+                entry.mask == GENERIC_ALL_MASK || entry.mask == FILE_ALL_ACCESS_MASK,
+                "{entry:?}: mask {:#x}",
+                entry.mask
+            );
+        }
     });
 }
 

@@ -15,6 +15,8 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -23,6 +25,7 @@ use ww_platform::process::{ProcessHandle, SpawnRequest, spawn_detached};
 
 use crate::bins::ensure_built;
 use crate::env::TestEnv;
+use crate::gitops::LEAKY_GIT_VARS;
 use crate::raw_pipe::{RawPipe, merge_hello};
 
 /// How long [`CoreFixture::start`] waits for the core's pipe.
@@ -34,7 +37,8 @@ const DRAIN_WAIT: Duration = Duration::from_secs(5);
 const CLEANUP_CALL: Duration = Duration::from_secs(5);
 /// How long `CoreFixture`'s drop tries to connect to a core that still runs.
 const FIXTURE_CONNECT: Duration = Duration::from_secs(2);
-/// How long `TestEnv`'s drop looks for a core on its channel.
+/// How long `TestEnv`'s drop retries a busy pipe on its channel, or a missing one after it
+/// launched a `ww` or core.
 const ENV_CONNECT: Duration = Duration::from_millis(200);
 /// Pause between polls of a pipe.
 const POLL: Duration = Duration::from_millis(20);
@@ -50,10 +54,42 @@ impl CoreFixture {
     /// Starts the test build of `ww-core` on `env`'s channel and waits up to 30 s for its
     /// pipe.
     ///
+    /// It returns early: the core claims its pipe before it opens its log and the suite
+    /// `state.db`, so when this returns the core may not have created or opened `state.db`
+    /// yet, nor be serving. A test that reads or writes `state.db` or its `-wal`, `-shm` or
+    /// `-journal` files before its first call uses [`CoreFixture::start_ready`]. (A first
+    /// `core/hello` waits by itself: it is answered only once the core serves.)
+    ///
     /// # Panics
     /// If `ww-core.exe` is missing, cannot be started, exits early or opens no pipe in time.
     pub fn start(env: &TestEnv) -> CoreFixture {
         CoreFixture::start_exe(env, &ensure_built().ww_core)
+    }
+
+    /// [`CoreFixture::start`], then waits up to 30 s for an `ok` answer to a `core/hello`
+    /// (on a connection closed again at once): by then the core has opened the suite
+    /// `state.db` and serves.
+    ///
+    /// # Panics
+    /// As [`CoreFixture::start`], and if the hello is not answered `ok` in time.
+    pub fn start_ready(env: &TestEnv) -> CoreFixture {
+        let fixture = CoreFixture::start(env);
+        let Some(mut conn) = RawPipe::connect_name(&fixture.pipe, PIPE_DEADLINE) else {
+            panic!(
+                "cannot connect to {} after the core opened it",
+                fixture.pipe
+            );
+        };
+        match conn.try_call(
+            ww_protocol::method::HELLO,
+            merge_hello(json!({})),
+            PIPE_DEADLINE,
+        ) {
+            Ok(hello) if hello["result"]["status"] == "ok" => {}
+            Ok(hello) => panic!("the core did not answer core/hello with ok: {hello}"),
+            Err(e) => panic!("the core did not answer core/hello: {e}"),
+        }
+        fixture
     }
 
     /// [`CoreFixture::start`] with another core executable, for example a copy of
@@ -138,8 +174,14 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// `spawn_detached` of `exe` with `env.child_env()`, `extra` replacing same-named variables.
+/// `spawn_detached` of `exe` with `env.child_env()`, `extra` replacing same-named variables,
+/// and [`LEAKY_GIT_VARS`] removed from what the core inherits (QA-038): a test run from inside
+/// a git hook never gives the core a `GIT_DIR` that points its `git` runs at another
+/// repository.
 fn spawn_core(env: &TestEnv, exe: &Path, extra: &[(&str, &str)]) -> ProcessHandle {
+    // Set first, so a start that fails later (no pipe in time) still gets the drop's retry.
+    env.launched
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(
         exe.is_file(),
         "the core executable {} does not exist; it is the `ww-core` binary of crates/ww-core, \
@@ -155,6 +197,7 @@ fn spawn_core(env: &TestEnv, exe: &Path, extra: &[(&str, &str)]) -> ProcessHandl
         exe: exe.to_path_buf(),
         args: Vec::new(),
         extra_env: vars,
+        remove_env: LEAKY_GIT_VARS.iter().map(OsString::from).collect(),
     })
     .unwrap_or_else(|e| panic!("cannot start {}: {e}", exe.display()))
 }
@@ -237,11 +280,20 @@ enum DrainAsk {
 
 /// Connects to `pipe`, says hello and asks for `core/drain`. Never panics.
 fn ask_drain(pipe: &str, connect_within: Duration) -> DrainAsk {
-    let Some(mut conn) = RawPipe::connect_name(pipe, connect_within) else {
+    let Some(conn) = RawPipe::connect_name(pipe, connect_within) else {
         return DrainAsk::NoCore;
     };
+    drain_over(conn, None)
+}
+
+/// Says hello on `conn` and asks for `core/drain`, counting the hello in `counts`. Never
+/// panics.
+fn drain_over(mut conn: RawPipe, counts: Option<&DrainCounts>) -> DrainAsk {
     if conn.server_pid() == Some(std::process::id()) {
         return DrainAsk::InProcess;
+    }
+    if let Some(counts) = counts {
+        counts.hellos.fetch_add(1, Ordering::Relaxed);
     }
     if conn
         .try_call(
@@ -259,13 +311,48 @@ fn ask_drain(pipe: &str, connect_within: Duration) -> DrainAsk {
     }
 }
 
-/// `TestEnv`'s cleanup: if a core answers on `pipe` within 200 ms, hello and `core/drain`;
-/// if it accepts, wait up to 5 s for the pipe to disappear. An in-process core (served by this
-/// process) is left to its test. Never panics.
-pub(crate) fn drain_channel(pipe: &str) {
+/// What `TestEnv`'s drop did, for the test that checks it never waits without a core.
+#[derive(Debug, Default)]
+pub(crate) struct DrainCounts {
+    /// `open_client` probes of the channel's pipe.
+    pub(crate) probes: AtomicUsize,
+    /// Short retries of a missing pipe after a launch.
+    pub(crate) retries: AtomicUsize,
+    /// `core/hello` attempts.
+    pub(crate) hellos: AtomicUsize,
+}
+
+/// `TestEnv`'s cleanup. One `open_client` probe of `pipe`. No pipe (`NotFound`) returns at
+/// once, unless the env `launched` a `ww` or core, which may still be starting: then, as for a
+/// busy pipe, connecting is retried for up to 200 ms. A core that answers gets hello and
+/// `core/drain`; if it accepts, this waits up to 5 s for the pipe to disappear. An in-process
+/// core (served by this process) is left to its test. Never panics.
+pub(crate) fn drain_channel(pipe: &str, launched: bool, counts: Arc<DrainCounts>) {
     let pipe = pipe.to_string();
     off_runtime(move || {
-        if ask_drain(&pipe, ENV_CONNECT) != DrainAsk::Accepted {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        counts.probes.fetch_add(1, Ordering::Relaxed);
+        let conn = match rt.block_on(async { open_client(&pipe) }) {
+            Ok(client) => RawPipe::from_client(rt, client),
+            Err(ConnectError::Busy) => match RawPipe::connect_name(&pipe, ENV_CONNECT) {
+                Some(conn) => conn,
+                None => return,
+            },
+            Err(ConnectError::NotFound) if launched => {
+                counts.retries.fetch_add(1, Ordering::Relaxed);
+                match RawPipe::connect_name(&pipe, ENV_CONNECT) {
+                    Some(conn) => conn,
+                    None => return,
+                }
+            }
+            Err(_) => return,
+        };
+        if drain_over(conn, Some(&counts)) != DrainAsk::Accepted {
             return;
         }
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -285,6 +372,14 @@ pub(crate) fn drain_channel(pipe: &str) {
     });
 }
 
+/// Set in a helper child's environment: the test `helper_sleep_forever` then sleeps. Shared
+/// by every test in the crate that needs a long-running child.
+#[cfg(test)]
+pub(crate) const HELPER_SLEEP_ENV: &str = "WW_TESTKIT_HELPER_SLEEP";
+/// The libtest name of that helper, for `<test binary> <name> --exact`.
+#[cfg(test)]
+pub(crate) const HELPER_SLEEP_TEST: &str = "core::tests::helper_sleep_forever";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,8 +387,7 @@ mod tests {
     use std::time::Duration;
     use ww_platform::process::{self, SpawnRequest, spawn_detached};
 
-    /// Set in the helper child's environment: run `helper_sleep_forever` as a sleeper.
-    const HELPER_ENV: &str = "WW_TESTKIT_HELPER_SLEEP";
+    use super::{HELPER_SLEEP_ENV as HELPER_ENV, HELPER_SLEEP_TEST};
 
     /// The test binary doubles as a long-running child (ruling P6): with `HELPER_ENV` set this
     /// test sleeps and never exits on its own within any test's lifetime; without it, it
@@ -313,11 +407,9 @@ mod tests {
     fn kill_on_drop_kills_a_running_child() {
         let handle = spawn_detached(&SpawnRequest {
             exe: std::env::current_exe().unwrap(),
-            args: vec![
-                OsString::from("core::tests::helper_sleep_forever"),
-                OsString::from("--exact"),
-            ],
+            args: vec![OsString::from(HELPER_SLEEP_TEST), OsString::from("--exact")],
             extra_env: vec![(OsString::from(HELPER_ENV), OsString::from("1"))],
+            remove_env: Vec::new(),
         })
         .expect("spawn the helper");
         // A separately held handle, so the check does not depend on the guard's own handle.

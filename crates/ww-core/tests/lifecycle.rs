@@ -5,14 +5,17 @@
 //! Wall-clock durations here are failure deadlines and poll pauses only, never measurements
 //! (QA-031).
 
+use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use ww_core::config::{ParentWatchFault, ParentWatchStep};
 use ww_core::lifecycle::{DrainReason, ShutdownPhase, ShutdownStep};
 use ww_core::state::StateError;
 use ww_core::{CoreConfig, CoreThread, start, start_in_thread};
-use ww_platform::session_end::SessionEnd;
+use ww_platform::session_end::SessionEndSim;
 use ww_testkit::{CoreFixture, FakeClock, RawPipe, SeqIds, TestEnv};
 
 /// Failure deadline for anything the test waits on.
@@ -51,6 +54,26 @@ fn response_for(pipe: &mut RawPipe, id: u64) -> Value {
             return message["result"].clone();
         }
     }
+}
+
+/// Every line of every log file of `env`'s cores, as JSON; panics on a line that is not.
+fn log_lines(env: &TestEnv) -> Vec<Value> {
+    let logs = env.env.logs_dir();
+    let mut lines = Vec::new();
+    for entry in
+        std::fs::read_dir(&logs).unwrap_or_else(|e| panic!("cannot list {}: {e}", logs.display()))
+    {
+        let path = entry.expect("a log folder entry").path();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for line in text.lines() {
+            lines.push(
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("a log line is not JSON ({e}): {line:?}")),
+            );
+        }
+    }
+    lines
 }
 
 /// Waits until `cond` holds; panics after the deadline.
@@ -192,20 +215,180 @@ fn state_actor_death_stops_core_with_exit_4() {
     );
 }
 
+/// An in-process core whose test parent is this test process, watched through `fault`.
+fn core_watching_parent(env: &TestEnv, fault: ParentWatchFault) -> CoreThread {
+    start_in_thread(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: Some(std::process::id()),
+        parent_watch_fault: Some(fault),
+        ..CoreConfig::for_env(env.env.clone()).expect("core config")
+    })
+}
+
+#[test] // spec: QA-012, QA-056
+fn failed_parent_watch_registration_exits_4() {
+    // The parent runs (it is this process), but opening it fails other than with `NotFound`
+    // (access denied, error 5), or the wait for it cannot be registered: the core cannot watch
+    // it, so it stops as after a fatal error.
+    for failing in [ParentWatchStep::Open, ParentWatchStep::Wait] {
+        let env = TestEnv::new();
+        let core = core_watching_parent(
+            &env,
+            Arc::new(move |step| {
+                if step == failing {
+                    Err(io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let report = core.wait_stopped(DEADLINE).expect("the core stops");
+        match &report.reason {
+            DrainReason::Fatal(why) => assert!(why.contains("test parent"), "{failing:?}: {why}"),
+            other => panic!("{failing:?}: not a fatal stop: {other:?}"),
+        }
+        assert_eq!(report.exit_code(), 4, "{failing:?}");
+    }
+}
+
+#[test] // spec: QA-056
+fn test_parent_not_found_at_open_is_gone_and_exits_0() {
+    let env = TestEnv::new();
+    let core = core_watching_parent(
+        &env,
+        Arc::new(|step| match step {
+            ParentWatchStep::Open => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not running",
+            )),
+            ParentWatchStep::Wait => panic!("a parent that is not running is never waited for"),
+        }),
+    );
+    let report = core.wait_stopped(DEADLINE).expect("the core stops");
+    assert_eq!(report.reason, DrainReason::TestParentGone);
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[test] // spec: QA-012, ARCH-024
+fn pipe_instance_creation_failure_is_fatal_exit_4() {
+    let env = TestEnv::new();
+    // The first instance after the claimed one is created; the next one fails.
+    let created = Arc::new(AtomicUsize::new(0));
+    let counted = created.clone();
+    let core = start_in_thread(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        pipe_instance_fault: Some(Arc::new(move || {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                // ERROR_PIPE_BUSY
+                Err(io::Error::from_raw_os_error(231))
+            }
+        })),
+        ..CoreConfig::for_env(env.env.clone()).expect("core config")
+    });
+
+    // The first connection is served.
+    let mut first = connect(&env, json!({}));
+    let echo = first.tool("test.echo", json!({"text": "Ünïcödé space"}), None);
+    assert_eq!(echo["status"], "ok", "{echo}");
+    // The second connection needs the instance that fails: the core stops, as after a fatal
+    // error.
+    let _second = RawPipe::try_connect(&env, DEADLINE);
+    let report = core.wait_stopped(DEADLINE).expect("the core stops");
+    assert_eq!(created.load(Ordering::SeqCst), 2);
+    match &report.reason {
+        DrainReason::Fatal(why) => assert!(why.contains("pipe"), "{why}"),
+        other => panic!("not a fatal stop: {other:?}"),
+    }
+    assert_eq!(report.exit_code(), 4);
+    assert_eq!(report.steps.last().copied(), Some("pipe.close"));
+}
+
+#[test] // spec: ARCH-117
+fn file_log_has_no_ansi_escapes() {
+    let env = TestEnv::new();
+    {
+        let _core = CoreFixture::start(&env);
+        let mut pipe = connect(&env, json!({}));
+        // Lines with fields, spans and errors: an ok call, a refused one and a failed one.
+        let ok = pipe.tool("test.echo", json!({"text": "Ünïcödé space"}), None);
+        assert_eq!(ok["status"], "ok", "{ok}");
+        let unknown = pipe.tool("test.nonsense", json!({}), None);
+        assert_eq!(unknown["status"], "error", "{unknown}");
+        let failed = pipe.tool(
+            "test.write",
+            json!({"label": "x", "fail": true}),
+            Some("k1"),
+        );
+        assert_eq!(failed["status"], "error", "{failed}");
+    }
+    let logs = env.env.logs_dir();
+    let mut text = String::new();
+    for entry in std::fs::read_dir(&logs).expect("the log folder") {
+        text.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+    }
+    assert!(text.lines().count() > 3, "too little was logged:\n{text}");
+    assert!(
+        !text.contains("\x1b["),
+        "the file log has ANSI escapes:\n{text}"
+    );
+    // Every line is JSON.
+    let _ = log_lines(&env);
+}
+
+#[test] // spec: ARCH-119, QA-012
+fn panic_log_line_carries_the_trace_id() {
+    let env = TestEnv::new();
+    {
+        let _core = CoreFixture::start(&env);
+        let mut pipe = connect(&env, json!({}));
+        let response = pipe.call(
+            "tools/call",
+            json!({"name": "test.panic", "arguments": {}, "trace_id": "t_panic-log_1"}),
+        );
+        assert_eq!(response["result"]["status"], "error", "{response}");
+        assert_eq!(
+            response["result"]["error"]["code"], "core.bug",
+            "{response}"
+        );
+        assert_eq!(
+            response["result"]["error"]["trace_id"], "t_panic-log_1",
+            "{response}"
+        );
+    }
+    let lines = log_lines(&env);
+    let panic_line = lines
+        .iter()
+        .find(|l| l["fields"]["message"] == "panic" && l["fields"].get("location").is_some())
+        .unwrap_or_else(|| panic!("no panic line in the log: {lines:?}"));
+    assert_eq!(
+        panic_line["fields"]["panic"], "test.panic was called",
+        "{panic_line}"
+    );
+    assert_eq!(
+        panic_line["span"]["trace_id"], "t_panic-log_1",
+        "{panic_line}"
+    );
+}
+
 #[test] // spec: ARCH-021
 fn end_session_runs_shutdown() {
     let env = TestEnv::new();
     let core = core(&env);
 
     // A query alone changes nothing: another application may still cancel the logoff.
-    assert!(core.core().simulate_session_end(SessionEnd::QueryEnd));
+    assert!(core.core().simulate_session_end(SessionEndSim::QueryEnd));
     let mut pipe = connect(&env, json!({}));
     let echo = pipe.tool("test.echo", json!({"text": "after the query"}), None);
     assert_eq!(echo["status"], "ok", "{echo}");
     assert!(!core.core().lifecycle().is_draining());
 
     // The end of the session runs the shutdown; the message returns once it is complete.
-    assert!(core.core().simulate_session_end(SessionEnd::End));
+    assert!(core.core().simulate_session_end(SessionEndSim::End));
     let report = core.wait_stopped(DEADLINE).expect("the core stops");
     assert_eq!(report.reason, DrainReason::SessionEnd);
     assert_eq!(report.exit_code(), 0);

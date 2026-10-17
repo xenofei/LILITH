@@ -5,15 +5,12 @@
 //! Every test runs on its own `TestEnv` channel; any core `ww` starts is drained when the env
 //! drops (QA-041). Durations are failure deadlines only, never measurements (QA-031).
 
-use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use ww_protocol::{EventKind, EventParams, Outcome, ToolOutput};
-use ww_testkit::{CoreFixture, RawPipe, TestEnv, WwOutput, ensure_built, sha256_file};
+use ww_testkit::{CoreFixture, RawPipe, TestEnv, WwChild, WwOutput, ensure_built, sha256_file};
 
 /// A failure deadline only, never a measurement (QA-031).
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -43,51 +40,36 @@ fn path_forms(path: &Path) -> Vec<String> {
     vec![path.display().to_string(), plain]
 }
 
-/// A `ww` started with `TestEnv::ww_spawn`: its stdout lines arrive on a channel, and it is
-/// killed if the test ends while it still runs.
+/// A `ww` started with `TestEnv::ww_spawn`. The `WwChild` drains its stderr on a thread and
+/// kills it if the test ends while it still runs; every failure here shows that stderr.
 struct Spawned {
-    child: Child,
-    lines: mpsc::Receiver<String>,
+    child: WwChild,
 }
 
 impl Spawned {
-    fn new(mut child: Child) -> Spawned {
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Spawned { child, lines }
+    fn new(child: WwChild) -> Spawned {
+        Spawned { child }
     }
 
-    fn next_line(&self) -> String {
-        self.lines
-            .recv_timeout(DEADLINE)
-            .unwrap_or_else(|e| panic!("no stdout line from `ww` within {DEADLINE:?}: {e}"))
+    fn next_line(&mut self) -> String {
+        match self.child.stdout_lines().next() {
+            Some(line) => line,
+            None => panic!(
+                "`ww` closed its stdout before printing a line\nstderr: {}",
+                self.child.stderr_so_far()
+            ),
+        }
     }
 
     /// The exit code once `ww` has exited; panics after the deadline.
     fn wait(&mut self) -> i32 {
-        let end = Instant::now() + DEADLINE;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("try_wait") {
-                return status.code().unwrap_or(-1);
-            }
-            assert!(Instant::now() < end, "`ww` still runs after {DEADLINE:?}");
-            std::thread::sleep(Duration::from_millis(20));
+        match self.child.wait(DEADLINE) {
+            Some(code) => code,
+            None => panic!(
+                "`ww` still runs after {DEADLINE:?}\nstderr: {}",
+                self.child.stderr_so_far()
+            ),
         }
-    }
-}
-
-impl Drop for Spawned {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -333,7 +315,7 @@ fn damaged_state_db_message_is_plain() {
     assert_eq!(
         out.stderr.trim(),
         format!(
-            "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` (plan 2b) can set it aside.",
+            "The core can't start: its state database at {} is damaged. Nothing was changed. `ww doctor` can set it aside.",
             db.display()
         ),
         "{out:?}"
@@ -369,14 +351,20 @@ fn an_unregistered_workspace_folder_is_named_plainly() {
         assert!(names_folder(&out.stderr), "{out:?}");
         assert!(out.stderr.contains("current folder"), "{out:?}");
         assert!(out.stderr.contains("suite.toml"), "{out:?}");
-        assert!(out.stderr.contains("ww workspace use"), "{out:?}");
+        assert!(out.stderr.contains("ww workspace use \""), "{out:?}");
         assert!(!out.stderr.contains(&id), "{out:?}");
     }
 
-    // Named with --workspace, `status` does not fall back.
+    // Named with --workspace, `status` does not fall back, and the folder is never told to
+    // become the default: the message says which workspace the core serves.
     let ws_arg = ws.to_str().expect("a UTF-8 test path");
     let flagged = env.ww(&["status", "--workspace", ws_arg]);
     assert_eq!(flagged.code, 2, "{flagged:?}");
     assert!(names_folder(&flagged.stderr), "{flagged:?}");
     assert!(flagged.stderr.contains("--workspace"), "{flagged:?}");
+    assert!(!flagged.stderr.contains("ww workspace use"), "{flagged:?}");
+    assert!(
+        flagged.stderr.contains("serves only the default workspace"),
+        "{flagged:?}"
+    );
 }

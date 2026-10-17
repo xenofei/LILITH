@@ -45,6 +45,13 @@ fn status_no_start_reports_not_running() {
         RawPipe::try_connect(&env, Duration::from_secs(1)).is_none(),
         "`ww --no-start status` started a core"
     );
+    // A started core always creates the suite state.db, so its absence shows none ran.
+    let db = env.env.suite_state_db();
+    assert!(
+        !db.exists(),
+        "`ww --no-start status` left {}: a core ran",
+        db.display()
+    );
 }
 
 #[test] // spec: ARCH-018

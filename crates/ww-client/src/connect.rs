@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use ww_platform::IdSource as _;
 use ww_platform::RandomIds;
+use ww_platform::paths::folder_key;
 use ww_platform::pipe::{ConnectError, open_client, server_pid};
 use ww_platform::process::{
     ProcessHandle, ProcessInfo, ProcessInspector as _, SpawnRequest, SystemInspector,
@@ -391,6 +392,7 @@ async fn greet(
             match &cfg.workspace_origin {
                 Some(origin) => Err(ClientError::UnknownWorkspace {
                     origin: origin.clone(),
+                    default: crate::workspace::registered_default(&cfg.env),
                     error,
                 }),
                 None => Err(ClientError::Refused(error)),
@@ -490,6 +492,7 @@ impl<'a> Finder<'a> {
                     exe: exe.clone(),
                     args: Vec::new(),
                     extra_env: self.cfg.spawn_env.clone(),
+                    remove_env: Vec::new(),
                 })
                 .map_err(|e| {
                     ClientError::Io(io::Error::new(
@@ -600,27 +603,6 @@ fn check_dir(cfg: &ClientConfig, info: &ProcessInfo) -> Result<(), ClientError> 
     })
 }
 
-/// A folder's spelling for comparison: canonical when it exists (short names, junctions and
-/// `subst` drives resolved), without `\\?\`, `\` separators, no trailing separator, lowercase.
-fn folder_key(path: &Path) -> String {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let text = path.to_string_lossy().replace('/', r"\");
-    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        text
-    };
-    let trimmed = text.trim_end_matches('\\');
-    let text = if trimmed.ends_with(':') {
-        &text
-    } else {
-        trimmed
-    };
-    text.to_lowercase()
-}
-
 /// The `core/hello` params of `cfg`, naming `workspace`.
 fn hello_params(cfg: &ClientConfig, workspace: &str) -> Value {
     to_value(&HelloParams {
@@ -667,6 +649,8 @@ fn unexpected_pending(method: &str) -> ClientError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use ww_protocol::CallerKind;
     use ww_testkit::{TestEnv, ensure_built, sha256_file};
 
@@ -914,8 +898,7 @@ mod tests {
                 );
                 let event = |topic: &str, seq: u64| {
                     let params = json!({"topic": topic, "seq": seq, "kind": "event", "data": {"n": seq}});
-                    format!("{}
-", ww_protocol::encode_notification(method::EVENT, &params))
+                    format!("{}\n", ww_protocol::encode_notification(method::EVENT, &params))
                 };
                 let mut out = String::new();
                 for seq in 1..=3 {
@@ -923,8 +906,7 @@ mod tests {
                 }
                 out.push_str(&event("test:other", 1));
                 out.push_str(&format!(
-                    "{}
-",
+                    "{}\n",
                     json!({"jsonrpc": "2.0", "id": request["id"], "result": {"status": "ok", "topics": [{"topic": "test:r", "seq": 3}]}})
                 ));
                 out.push_str(&event("test:r", 4));

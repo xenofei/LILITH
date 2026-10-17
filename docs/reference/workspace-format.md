@@ -204,14 +204,14 @@ Keys that are left out inherit the workspace `defaults`; a project can override 
 - A run records: `run_id`, `path`, `created`, `target_version`, the `recipe` (or the recipe step it runs), `files[]` (each with `path`, `seed` where one applies, `role` and, for `derived` and `repair` files, `from`), `qa` results, `usage` (the run's `job_ids`, `est_cost`, `cost`, `currency`) and `status`.
 - File roles: `candidate` (straight from the generator), `derived` (made from another file in the run: cutouts, upscales, conversions, exports) and `repair` (a fixed version of another file).
 - Run status: `open` (still in play), `selected` (a file from it was signed off) or `rejected`.
-- Runs are never edited after sign-off, apart from their status.
+- Runs are never edited after sign-off, apart from their status and `trashed_utc`, which the suite sets when it moves a rejected run's folder to trash (plan 2b clarification: spec Appendix E).
 
 **Sign-off**
 - The user, the suite's assistant or Claude Code may sign off. There's no approval gate; record who did it.
 - Steps:
   1. Move the chosen file or files from the run into a new `v<version>/` folder. Copy instead of moving when other files in the run were derived from them.
   2. Record their hashes under `hashes`.
-  3. Set `approved_version` to `version`, set `status: approved`, set the run's `status: selected`, `selected` (the chosen file names) and `signed_off: {"by": "user" | "assistant" | "claude-code", "date": "…", "version": "1.4.0"}`. Mark other open runs for that version `rejected` unless the user wants to keep them open.
+  3. Set `approved_version` to `version`, set `status: approved`, set the run's `status: selected`, `selected` (the chosen file names) and `signed_off: {"by": "user" | "assistant" | "claude-code" | "cli", "date": "…", "version": "1.4.0"}`. Mark other open runs for that version `rejected` unless the user wants to keep them open.
   4. Write `v<version>/manifest.snapshot.json`: a copy of the manifest as it stands after step 3.
 - From then on the `v<version>/` folder is sealed: never write into it again. Fixes and changes go into a new run and a new version.
 

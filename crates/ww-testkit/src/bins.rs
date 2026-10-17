@@ -6,8 +6,8 @@
 //!
 //! Under `cargo nextest` (profiles `default` and `spec`) the setup script `build-testbins` in
 //! `.config/nextest.toml` has built them once before any test starts. Anywhere else (plain
-//! `cargo test`, another profile) [`ensure_built`] runs the same `cargo build` itself, once per
-//! process.
+//! `cargo test`, another profile), or when either binary is missing although the script ran,
+//! [`ensure_built`] runs the same `cargo build` itself, once per process.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,16 +46,27 @@ pub fn ensure_built() -> &'static Bins {
     BINS.get_or_init(|| {
         let root = workspace_root();
         let target = root.join("target").join("testbins");
-        if !built_by_setup_script() {
-            build(&root, &target);
-        }
         let dir = target.join("debug");
-        Bins {
+        let bins = Bins {
             ww: dir.join("ww.exe"),
             ww_core: dir.join("ww-core.exe"),
             dir,
+        };
+        if needs_build(
+            built_by_setup_script(),
+            bins.ww.is_file() && bins.ww_core.is_file(),
+        ) {
+            build(&root, &target);
         }
+        bins
     })
+}
+
+/// Whether [`ensure_built`] must build: unless the setup script says it built the binaries
+/// **and** both exist. A flag alone is not trusted: a script that was skipped or filtered, or
+/// a binary deleted since, would otherwise surface as a confusing "cannot start" later.
+pub(crate) fn needs_build(built_by_script: bool, both_exist: bool) -> bool {
+    !(built_by_script && both_exist)
 }
 
 /// True inside a nextest run whose profile attaches `build-testbins`. Every package that can
@@ -102,6 +113,14 @@ fn build(root: &Path, target: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: QA-056
+    fn ensure_built_rebuilds_when_flagged_but_missing() {
+        assert!(!needs_build(true, true));
+        assert!(needs_build(true, false), "flagged but missing");
+        assert!(needs_build(false, true));
+        assert!(needs_build(false, false));
+    }
 
     #[test] // spec: QA-056
     fn ensure_built_puts_ww_in_testbins() {

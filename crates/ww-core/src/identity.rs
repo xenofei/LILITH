@@ -8,12 +8,14 @@
 //! - `assistant`: the client presented an engine token that validates. A token that does not
 //!   validate is refused, never downgraded (ARCH-048, ARCH-050).
 //!
-//! Every other claim resolves to `cli`. Folder paths compare case-insensitively after a
-//! `\\?\` prefix is stripped.
+//! Every other claim resolves to `cli`. Folder paths compare by
+//! `ww_platform::paths::folder_key`: canonical when they exist, without a `\\?\` prefix,
+//! case-insensitive.
 
 use std::path::{Path, PathBuf};
 
 use ww_platform::Env;
+use ww_platform::paths::folder_key;
 use ww_platform::process::{ProcessInfo, ProcessInspector};
 use ww_protocol::codes::{CALLER_ENGINE_TOKEN_INVALID, PARAMS_INVALID};
 use ww_protocol::{CallerKind, ErrorBody};
@@ -139,24 +141,10 @@ fn runs(client: &ProcessInfo, exe: &str, dirs: &[PathBuf]) -> bool {
     let (Some(name), Some(dir)) = (client.image.file_name(), client.image.parent()) else {
         return false;
     };
-    let dir = normalise(dir);
+    let dir = folder_key(dir);
     !dir.is_empty()
         && name.to_string_lossy().to_lowercase() == exe.to_lowercase()
-        && dirs.iter().any(|d| normalise(d) == dir)
-}
-
-/// A folder's spelling for comparison: no `\\?\` (`\\?\UNC\` becomes `\\`), `\` separators,
-/// no trailing separator, lowercase.
-fn normalise(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('/', r"\");
-    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        text
-    };
-    text.trim_end_matches('\\').to_lowercase()
+        && dirs.iter().any(|d| folder_key(d) == dir)
 }
 
 /// Best effort (ARCH-047): whether the MCP server `client` runs under Claude Code, that is,

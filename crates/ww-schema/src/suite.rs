@@ -6,6 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The suite `state.db` schema this build knows: its `PRAGMA user_version` after every suite
+/// migration (CORE-004, QA-062). `ww-core` applies the migrations and checks its own count
+/// against this; `ww doctor` reads it to tell a database from a newer version apart.
+pub const SUITE_STATE_SCHEMA: i64 = 2;
+
 /// The whole file. Unknown keys are preserved in `other`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SuiteToml {

@@ -16,10 +16,10 @@
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
-use std::io::{Read, Write as _};
+use std::io::{BufRead as _, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -29,11 +29,20 @@ use ww_platform::{
 };
 
 use crate::bins::ensure_built;
+use crate::core::DrainCounts;
+use crate::gitops::LEAKY_GIT_VARS;
 
 /// An isolated `Env`: channel `Test(<8 lowercase hex>)`, roots under a fresh temporary
 /// directory that is deleted on drop.
 pub struct TestEnv {
     pub env: Env,
+    /// What the drop's cleanup did (probes, retries and hellos), shared with the test that
+    /// checks it.
+    drain_counts: Arc<DrainCounts>,
+    /// Set once this env started a `ww` that may outlive the call ([`TestEnv::ww_spawn`]) or a
+    /// core ([`crate::CoreFixture`]): the drop then gives a pipe that is not there yet a short
+    /// retry, since such a process may still be starting.
+    pub(crate) launched: AtomicBool,
     /// The temporary directory. Removed by this type's drop, not by `tempfile`, whose removal
     /// stops at the first locked file and discards the error.
     root: PathBuf,
@@ -86,7 +95,12 @@ impl TestEnv {
             std::fs::create_dir_all(r).expect("cannot create a test root");
         }
         let env = Env::with_roots(Channel::Test(unique_id()), roots, TEST_PIPE_SID.to_string());
-        TestEnv { env, root }
+        TestEnv {
+            env,
+            drain_counts: Arc::default(),
+            launched: AtomicBool::new(false),
+            root,
+        }
     }
 
     /// The temporary directory that holds every root.
@@ -95,10 +109,12 @@ impl TestEnv {
     }
 
     /// The variables that put a child process on this test channel: `WW_CHANNEL=test-<id>`,
-    /// `WW_TEST_ROOT=<root>` and `WW_TEST_PARENT_PID=<this process>`. The same type as
+    /// `WW_TEST_ROOT=<root>` and `WW_TEST_PARENT_PID=<this process>`, then
+    /// [`TestEnv::git_env`], so every `ww` and core a test starts, and every `git` they run,
+    /// is isolated from the system and user git config (QA-038). The same type as
     /// `SpawnRequest::extra_env`.
     pub fn child_env(&self) -> Vec<(OsString, OsString)> {
-        vec![
+        let mut vars = vec![
             (
                 OsString::from(ENV_CHANNEL),
                 OsString::from(self.env.channel().to_string()),
@@ -111,7 +127,9 @@ impl TestEnv {
                 OsString::from(ENV_TEST_PARENT_PID),
                 OsString::from(std::process::id().to_string()),
             ),
-        ]
+        ];
+        vars.extend(self.git_env());
+        vars
     }
 
     /// Runs the test build of `ww` with `args`, in [`TestEnv::root`], with
@@ -139,24 +157,32 @@ impl TestEnv {
     }
 
     /// Starts `ww` like [`TestEnv::ww`] but does not wait: for long-running commands such as
-    /// `ww events --follow`. Stdout and stderr are piped (read stdout as it comes, stderr
-    /// after the child has ended); stdin is empty. The caller kills or waits for the child.
+    /// `ww events --follow`. Stdin is empty; stdout is read line by line through
+    /// [`WwChild::stdout_lines`], and stderr is drained on a thread of its own
+    /// ([`WwChild::stderr_so_far`]). Dropping the [`WwChild`] kills `ww` if it still runs.
     ///
     /// # Panics
     /// If `ww` cannot be started.
-    pub fn ww_spawn(&self, args: &[&str]) -> Child {
-        self.ww_command(self.root(), args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("cannot start {}: {e}", ensure_built().ww.display()))
+    pub fn ww_spawn(&self, args: &[&str]) -> WwChild {
+        self.launched.store(true, Ordering::Relaxed);
+        let mut cmd = self.ww_command(self.root(), args);
+        WwChild::spawn(&mut cmd, format!("ww {}", args.join(" ")))
     }
 
     fn ww_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(&ensure_built().ww);
-        cmd.args(args).current_dir(dir).envs(self.child_env());
+        cmd.args(args).current_dir(dir);
+        self.apply_child_env(&mut cmd);
         cmd
+    }
+
+    /// Gives `cmd` this channel's environment: removes [`LEAKY_GIT_VARS`] (inherited or set
+    /// on `cmd`), then adds [`TestEnv::child_env`].
+    pub(crate) fn apply_child_env(&self, cmd: &mut Command) {
+        for var in LEAKY_GIT_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.envs(self.child_env());
     }
 
     fn run_ww(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> WwOutput {
@@ -322,7 +348,65 @@ impl TestEnv {
         db.close()
             .unwrap_or_else(|(_, e)| panic!("cannot close {}: {e}", path.display()));
     }
+
+    /// Lays out the SQLite database `path` as a crash mid-write leaves it: `path` with a hot
+    /// rollback journal `<path>-journal` beside it. The database (journal mode `delete`,
+    /// `user_version` set) holds table `t` with [`HOT_JOURNAL_ROWS`] rows whose `x` starts with
+    /// `before`; a transaction then rewrote every row to start with `after`, with a cache small
+    /// enough that SQLite wrote changed pages into the file before the commit, and the files
+    /// were copied at that moment. A read-write open rolls the journal back, after which every
+    /// `x` starts with `before` again.
+    ///
+    /// # Panics
+    /// If a step fails or the journal comes out empty.
+    pub fn write_hot_journal_db(&self, path: &Path, user_version: i64) {
+        let dir = path.parent().expect("the database has a folder");
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+        let live = dir.join("hot-journal-source.db");
+        let live_journal = dir.join("hot-journal-source.db-journal");
+        let db = rusqlite::Connection::open(&live)
+            .unwrap_or_else(|e| panic!("cannot open {}: {e}", live.display()));
+        let padding = "x".repeat(1000);
+        db.execute_batch(
+            "PRAGMA journal_mode = DELETE; PRAGMA cache_size = 8;
+             CREATE TABLE t (n INTEGER PRIMARY KEY, x TEXT NOT NULL);",
+        )
+        .expect("set up the source database");
+        db.execute_batch("BEGIN").unwrap();
+        for n in 0..HOT_JOURNAL_ROWS {
+            db.execute(
+                "INSERT INTO t (n, x) VALUES (?1, ?2)",
+                rusqlite::params![n, format!("before {padding}")],
+            )
+            .unwrap();
+        }
+        db.execute_batch("COMMIT").unwrap();
+        db.pragma_update(None, "user_version", user_version)
+            .unwrap();
+        db.execute_batch("BEGIN; UPDATE t SET x = 'after' || substr(x, 7);")
+            .expect("the open transaction");
+        let journal = std::fs::read(&live_journal)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", live_journal.display()));
+        assert!(!journal.is_empty(), "the open transaction wrote no journal");
+        let bytes =
+            std::fs::read(&live).unwrap_or_else(|e| panic!("cannot read {}: {e}", live.display()));
+        std::fs::write(path, bytes)
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+        let mut journal_path = path.as_os_str().to_owned();
+        journal_path.push("-journal");
+        std::fs::write(&journal_path, journal)
+            .unwrap_or_else(|e| panic!("cannot write the journal of {}: {e}", path.display()));
+        db.execute_batch("ROLLBACK").unwrap();
+        drop(db);
+        for leftover in [&live, &live_journal] {
+            let _ = std::fs::remove_file(leftover);
+        }
+    }
 }
+
+/// The rows of [`TestEnv::write_hot_journal_db`]'s table `t`.
+pub const HOT_JOURNAL_ROWS: i64 = 300;
 
 impl Default for TestEnv {
     fn default() -> Self {
@@ -337,7 +421,11 @@ impl Drop for TestEnv {
     /// another handle still holds a file, and reports what it had to leave on stderr and in
     /// [`crate::cleanup::leftovers_log`]. Never panics.
     fn drop(&mut self) {
-        crate::core::drain_channel(&self.env.pipe_name());
+        crate::core::drain_channel(
+            &self.env.pipe_name(),
+            self.launched.load(Ordering::Relaxed),
+            Arc::clone(&self.drain_counts),
+        );
         if let Err(left) = crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR) {
             crate::cleanup::report_leftovers(&self.root, &left);
         }
@@ -404,10 +492,140 @@ impl Captured {
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes.lock().unwrap_or_else(PoisonError::into_inner))
-            .into_owned()
+        text_of(&self.bytes)
     }
 }
+
+fn text_of(bytes: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&bytes.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+}
+
+/// A `ww` (or other child) started by [`TestEnv::ww_spawn`]. Its stdout arrives line by line
+/// through [`WwChild::stdout_lines`]; its stderr is drained on a thread, so the child never
+/// blocks on a full pipe, and every panic here carries what it printed there. Dropping it kills
+/// the child if it still runs and waits for it.
+pub struct WwChild {
+    child: Child,
+    what: String,
+    lines: StdoutLines,
+    stderr: Captured,
+}
+
+/// [`WwChild`]'s stdout lines: `None` once stdout has closed.
+struct StdoutLines {
+    rx: mpsc::Receiver<String>,
+    what: String,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Iterator for StdoutLines {
+    type Item = String;
+
+    /// The next line, without its line ending.
+    ///
+    /// # Panics
+    /// If none arrives within 30 s (a failure deadline, never a measurement); the message
+    /// carries the child's stderr so far.
+    fn next(&mut self) -> Option<String> {
+        match self.rx.recv_timeout(SPAWN_LINE_DEADLINE) {
+            Ok(line) => Some(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "no stdout line from `{}` within {SPAWN_LINE_DEADLINE:?}\nstderr so far: {}",
+                self.what,
+                text_of(&self.stderr)
+            ),
+        }
+    }
+}
+
+impl WwChild {
+    /// Starts `cmd` with stdin empty and stdout and stderr piped.
+    pub(crate) fn spawn(cmd: &mut Command, what: String) -> WwChild {
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start `{what}`: {e}"));
+        let stderr = Captured::read(child.stderr.take());
+        let stdout = child.stdout.take();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Some(stdout) = stdout else { return };
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let lines = StdoutLines {
+            rx,
+            what: what.clone(),
+            stderr: Arc::clone(&stderr.bytes),
+        };
+        WwChild {
+            child,
+            what,
+            lines,
+            stderr,
+        }
+    }
+
+    /// The child's stdout, line by line; it ends when stdout closes. Each `next` panics if no
+    /// line arrives within 30 s, with the child's stderr in the message.
+    pub fn stdout_lines(&mut self) -> &mut dyn Iterator<Item = String> {
+        &mut self.lines
+    }
+
+    /// What the child wrote to stderr so far.
+    pub fn stderr_so_far(&self) -> String {
+        self.stderr.text()
+    }
+
+    /// The child's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The exit code once the child has exited (-1 if it ended without one), or `None` if it
+    /// still runs after `within`, a failure deadline.
+    ///
+    /// # Panics
+    /// If waiting fails; the message carries the child's stderr.
+    pub fn wait(&mut self, within: Duration) -> Option<i32> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
+                Ok(None) => {}
+                Err(e) => panic!(
+                    "waiting for `{}` failed: {e}\nstderr so far: {}",
+                    self.what,
+                    self.stderr_so_far()
+                ),
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Drop for WwChild {
+    /// Kills the child if it still runs, then waits for it. Never panics.
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// How long [`WwChild::stdout_lines`] waits for a line before it fails the test.
+const SPAWN_LINE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
@@ -523,7 +741,9 @@ mod tests {
             get("WW_TEST_PARENT_PID"),
             OsString::from(std::process::id().to_string())
         );
-        assert_eq!(vars.len(), 3, "{vars:?}");
+        // The three channel variables come first; the git isolation follows them.
+        assert_eq!(vars.len(), 3 + t.git_env().len(), "{vars:?}");
+        assert_eq!(&vars[3..], t.git_env().as_slice(), "{vars:?}");
 
         // A child given these variables resolves the same isolated folders.
         let child = Env::from_vars("dev", &|name| {
@@ -670,5 +890,144 @@ mod tests {
             .env
             .workspace_local_dir(b.root())
             .expect("same-volume workspace");
+    }
+
+    /// A fresh `TestEnv` with no core on its channel: the drop probes the pipe once and makes
+    /// no hello attempt (checked through the drop's own counters, not a timer).
+    #[test] // spec: QA-041
+    fn drop_without_a_core_returns_without_waiting() {
+        let t = TestEnv::new();
+        let counts = Arc::clone(&t.drain_counts);
+        drop(t);
+        assert_eq!(counts.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.retries.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.hellos.load(Ordering::Relaxed), 0);
+    }
+
+    /// After this env launched a `ww` or a core, a pipe that is not there yet gets the short
+    /// retry (it may still be starting); with none there, still no hello.
+    #[test] // spec: QA-041
+    fn drop_after_a_launch_retries_a_missing_pipe() {
+        let t = TestEnv::new();
+        t.launched.store(true, Ordering::Relaxed);
+        let counts = Arc::clone(&t.drain_counts);
+        drop(t);
+        assert_eq!(counts.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.retries.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.hellos.load(Ordering::Relaxed), 0);
+    }
+
+    /// Set in the helper child's environment: `helper_print_env` prints the variables below.
+    const PRINT_ENV_ENV: &str = "WW_TESTKIT_HELPER_PRINT_ENV";
+    /// The variables `helper_print_env` reports.
+    const PRINTED_VARS: &[&str] = &["GIT_DIR", "GIT_CONFIG_PARAMETERS", "WW_CHANNEL", "HOME"];
+
+    /// With `PRINT_ENV_ENV` set, prints `<name>=<value>` or `<name> unset` for each of
+    /// `PRINTED_VARS`; otherwise does nothing.
+    #[test]
+    fn helper_print_env() {
+        if std::env::var_os(PRINT_ENV_ENV).is_none() {
+            return;
+        }
+        for name in PRINTED_VARS {
+            match std::env::var_os(name) {
+                Some(value) => println!("{name}={}", value.to_string_lossy()),
+                None => println!("{name} unset"),
+            }
+        }
+    }
+
+    /// A child given this channel's environment never sees a `GIT_DIR` or
+    /// `GIT_CONFIG_PARAMETERS` from the test's own environment (here set on the `Command`,
+    /// which stands in for an inherited one), so a `ww`, the core it starts and their `git`
+    /// runs never act on another repository.
+    #[test] // spec: QA-038
+    fn ww_children_do_not_inherit_git_dir() {
+        let t = TestEnv::new();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["env::tests::helper_print_env", "--exact", "--nocapture"])
+            .env("GIT_DIR", t.root().join("elsewhere").join(".git"))
+            .env("GIT_CONFIG_PARAMETERS", "'core.autocrlf'='true'");
+        t.apply_child_env(&mut cmd);
+        cmd.env(PRINT_ENV_ENV, "1");
+        let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
+        let lines: Vec<String> = child.stdout_lines().collect();
+        assert_eq!(child.wait(Duration::from_secs(30)), Some(0));
+        for want in [
+            "GIT_DIR unset".to_string(),
+            "GIT_CONFIG_PARAMETERS unset".to_string(),
+            format!("WW_CHANNEL={}", t.env.channel()),
+            format!("HOME={}", t.root().join("profile").display()),
+        ] {
+            assert!(lines.contains(&want), "no `{want}` in {lines:?}");
+        }
+        for var in LEAKY_GIT_VARS {
+            assert!(
+                !t.child_env().iter().any(|(k, _)| k == var),
+                "{var} must be removed, never set"
+            );
+        }
+    }
+
+    #[test] // spec: QA-041
+    fn ww_child_is_killed_on_drop() {
+        // The test binary is the long-running child (ruling P6), started as `ww_spawn` starts
+        // `ww`, with output piped.
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([crate::core::HELPER_SLEEP_TEST, "--exact", "--nocapture"])
+            .env(crate::core::HELPER_SLEEP_ENV, "1");
+        let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
+        let probe = ww_platform::process::open(child.pid()).expect("open the helper");
+        assert_eq!(
+            probe.exit_code().unwrap(),
+            None,
+            "the helper exited by itself"
+        );
+        assert_eq!(child.wait(Duration::ZERO), None);
+
+        drop(child);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Drop already waited; the deadline only bounds a failure.
+        let code = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(10), probe.wait()).await })
+            .expect("the helper still runs after its WwChild was dropped")
+            .unwrap();
+        assert_eq!(code, 1, "TerminateProcess exit code");
+    }
+
+    /// Set in the helper child's environment: `helper_print_lines` prints and returns.
+    const PRINT_ENV: &str = "WW_TESTKIT_HELPER_PRINT";
+
+    /// With `PRINT_ENV` set, prints one line to stdout and one to stderr; otherwise does
+    /// nothing.
+    #[test]
+    fn helper_print_lines() {
+        if std::env::var_os(PRINT_ENV).is_some() {
+            println!("out-line Ünïcödé space");
+            eprintln!("err-line Ünïcödé space");
+        }
+    }
+
+    #[test] // spec: QA-056
+    fn ww_child_reads_stdout_lines_and_drains_stderr() {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["env::tests::helper_print_lines", "--exact", "--nocapture"])
+            .env(PRINT_ENV, "1");
+        let mut child = WwChild::spawn(&mut cmd, "helper".to_string());
+        let lines: Vec<String> = child.stdout_lines().collect();
+        assert!(
+            lines.iter().any(|l| l == "out-line Ünïcödé space"),
+            "{lines:?}"
+        );
+        assert_eq!(child.wait(Duration::from_secs(30)), Some(0));
+        // The stderr thread may finish just after the exit; wait for the pipe to close.
+        assert!(child.stderr.wait_closed(Duration::from_secs(30)));
+        let stderr = child.stderr_so_far();
+        assert!(stderr.contains("err-line Ünïcödé space"), "{stderr}");
+        assert!(!stderr.contains("out-line"), "{stderr}");
     }
 }
