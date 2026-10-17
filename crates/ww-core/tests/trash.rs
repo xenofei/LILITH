@@ -958,3 +958,54 @@ async fn cloud_only_restore_records_are_skipped_never_read() {
         Err(StoreError::TrashUnknown("te_00000000000000c1".to_string()))
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ruling Q19: a folder move retries error 5.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)] // spec: ARCH-074, ARCH-058
+async fn folder_moves_retry_access_denied_and_file_moves_do_not() {
+    let ws = workspace();
+    let fp = FailPoints::none();
+    let store = Store::new(
+        ws.root.clone(),
+        ws.state.clone(),
+        fp.clone(),
+        ws.clock.clone(),
+        Arc::new(SeqIds::new()),
+        Arc::new(SystemProbe),
+    )
+    .with_machine("testmachine");
+    write_file(&ws.file("notes/dir/a.txt"), b"a");
+    write_file(&ws.file("notes/b.txt"), b"b");
+    // A handle open inside a folder makes its rename fail with 5, whatever the share mode
+    // (MS-FSA 2.1.5.15.12): the first three moves are refused that way.
+    let denied = Arc::new(AtomicU64::new(3));
+    let left = denied.clone();
+    fp.on(
+        "store.replace",
+        Box::new(move || {
+            if left.load(Ordering::SeqCst) > 0 {
+                left.fetch_sub(1, Ordering::SeqCst);
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        }),
+    );
+    store
+        .trash(&p("notes/dir"), "test")
+        .await
+        .expect("a folder move retries error 5");
+    assert_eq!(
+        denied.load(Ordering::SeqCst),
+        0,
+        "all three refusals were retried"
+    );
+    assert!(!ws.exists("notes/dir"));
+
+    // A file move never retries 5: it is a real denial.
+    denied.store(1, Ordering::SeqCst);
+    let refused = store.trash(&p("notes/b.txt"), "test").await.unwrap_err();
+    assert!(matches!(refused, StoreError::Io { .. }), "{refused:?}");
+    assert!(ws.exists("notes/b.txt"));
+}

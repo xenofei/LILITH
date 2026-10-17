@@ -328,8 +328,9 @@ impl Store {
         };
         let to = dir.join(PAYLOAD).join(rel.file_name());
         let (from, target) = (abs.clone(), to.clone());
+        // A folder (a rejected run, a trashed folder) also retries error 5 (ruling Q19).
         let moved = self
-            .fs_retry(Some("store.replace"), move || {
+            .fs_retry_move(Some("store.replace"), &abs, move || {
                 fsops::move_new(&from, &target)
             })
             .await;
@@ -419,8 +420,9 @@ impl Store {
         let target = rel.abs(self.root());
         let _held = self.lock_path(&rel).await;
         let (from, to) = (payload.clone(), target.clone());
+        // A restored folder also retries error 5 (ruling Q19).
         let moved = self
-            .fs_retry(Some("store.replace"), move || {
+            .fs_retry_move(Some("store.replace"), &payload, move || {
                 if ww_platform::fs::attributes(&to).is_ok() {
                     return Err(io::Error::from_raw_os_error(183));
                 }

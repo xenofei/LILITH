@@ -1024,6 +1024,43 @@ impl Store {
         }
     }
 
+    /// [`Store::fs_retry`] for a move of `from`, which may be a folder: a folder move also
+    /// retries error 5, which a handle open anywhere in its subtree causes whatever its share
+    /// mode (the index, Defender, Search, Explorer; ruling Q19). A file move retries what
+    /// `fs_retry` retries.
+    pub(super) async fn fs_retry_move<T, F>(
+        &self,
+        point: Option<&'static str>,
+        from: &Path,
+        f: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: Fn() -> io::Result<T> + Send + Sync + 'static,
+    {
+        let folder = {
+            let from = from.to_path_buf();
+            blocking(move || {
+                Ok(ww_platform::fs::attributes(&from)
+                    .is_ok_and(|a| a & FILE_ATTRIBUTE_DIRECTORY != 0))
+            })
+            .await
+            .unwrap_or(false)
+        };
+        let f = Arc::new(f);
+        let mut backoff = Backoff::new();
+        loop {
+            let call = f.clone();
+            match self.fs(point, move || call()).await {
+                Err(e)
+                    if ww_platform::fs::classify_move(&e, folder)
+                        == RetryClass::SharingViolation
+                        && backoff.wait().await => {}
+                done => return done,
+            }
+        }
+    }
+
     /// What is at `path`, hashed, with sharing violations retried.
     pub(super) async fn see_hash(&self, path: &Path) -> io::Result<Seen<FileHash>> {
         let (probe, path) = (self.probe.clone(), path.to_path_buf());

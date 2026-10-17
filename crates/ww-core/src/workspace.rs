@@ -678,6 +678,14 @@ fn spawn_verify_ticks(open: &Arc<OpenWorkspace>) {
                 break;
             };
             index.ready().await;
+            if index.failed() {
+                // The first whole-workspace run failed: try it again (the read tools answer
+                // store.io until one succeeds).
+                if let Err(e) = index.retry_first().await {
+                    tracing::debug!(workspace = %path.display(), error = %e, "the workspace still can't be indexed");
+                }
+                continue;
+            }
             match index.verify_pending(VERIFY_BATCH).await {
                 Ok(mismatches) => {
                     for m in mismatches {

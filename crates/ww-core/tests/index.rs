@@ -175,13 +175,15 @@ enum Volume {
     Real,
     Fs(&'static str),
     Fails,
+    /// `volume_info` panics: the reconcile itself fails.
+    Panics,
 }
 
 /// What the fake probe changes on top of the real one. Files are named by their file name.
 #[derive(Debug)]
 struct Behaviour {
     volume: Volume,
-    /// A new FileId and ChangeTime on every identity call.
+    /// A new FileId on every identity call, and a new ChangeTime at every [`FakeProbe::next_epoch`].
     churn: bool,
     /// File ids built from the parent folder and the name, as on ReFS.
     refs_ids: bool,
@@ -215,6 +217,7 @@ type Hook = Box<dyn Fn(&Path) + Send + Sync>;
 struct FakeProbe {
     b: Mutex<Behaviour>,
     n: AtomicU64,
+    epoch: AtomicU64,
     reads: Mutex<HashMap<String, usize>>,
     /// The file names `identity` was asked about, in order.
     order: Mutex<Vec<String>>,
@@ -252,6 +255,11 @@ impl FakeProbe {
 
     fn set(&self, f: impl FnOnce(&mut Behaviour)) {
         f(&mut self.b.lock().unwrap());
+    }
+
+    /// A new ChangeTime for every file (with `churn`), as between two scans.
+    fn next_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn reads(&self, name: &str) -> usize {
@@ -301,7 +309,8 @@ impl Probe for FakeProbe {
             fid[..8].copy_from_slice(&n.to_le_bytes());
             fid[15] = 0x5a;
             id.file_id = Some(fid);
-            id.change_time = Some(filetime(NOW) + i64::try_from(n).unwrap());
+            let epoch = self.epoch.load(Ordering::SeqCst);
+            id.change_time = Some(filetime(NOW) + i64::try_from(epoch).unwrap() + 1);
         }
         if b.refs_ids {
             let parent = path
@@ -343,6 +352,7 @@ impl Probe for FakeProbe {
                 cloud_sync_root: false,
             }),
             Volume::Fails => Err(std::io::Error::other("the volume facts can't be read")),
+            Volume::Panics => panic!("a volume_info that fails the reconcile"),
         }
     }
 
@@ -637,6 +647,7 @@ async fn volume_without_stable_ids_ignores_id_churn() {
     let index = fx.open(probe.clone());
     index.reconcile(Scope::All).await.unwrap();
     fx.clock.advance(Duration::from_secs(60));
+    probe.next_epoch();
     let second = index.reconcile(Scope::All).await.unwrap();
     assert_eq!(
         second.hashed, 0,
@@ -760,6 +771,7 @@ async fn volume_info_error_counts_as_no_stable_ids() {
     });
     let index = fx.open(probe.clone());
     assert_eq!(index.reconcile(Scope::All).await.unwrap().hashed, 1);
+    probe.next_epoch();
     let second = index.reconcile(Scope::All).await.unwrap();
     assert_eq!(second.hashed, 0, "{second:?}");
     fx.write("notes/a.txt", b"longer a");
@@ -1864,4 +1876,202 @@ fn cursor_round_trips_and_is_bound_to_the_query() {
     );
     other.text = Some("x".into());
     assert!(decode_cursor(&other, &cursor).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1: concurrent store changes, closed-core edits, failed first reconciles.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-089, ARCH-075
+async fn store_changes_during_a_cold_rebuild_are_kept() {
+    let fx = fx();
+    fx.write("notes/a.txt", b"a");
+    fx.write("notes/b.txt", b"b");
+    let probe = FakeProbe::new();
+    let index = fx.open(probe.clone());
+    index.rebuild().await.unwrap();
+
+    // While the next rebuild looks at b.txt (it has already looked at a.txt), the store
+    // writes a file and a manifest, and moves a.txt away.
+    let fired = Arc::new(AtomicBool::new(false));
+    let (hook_index, root) = (index.clone(), fx.root.clone());
+    let handle = tokio::runtime::Handle::current();
+    let installed = probe.hook.set(Box::new(move |path: &Path| {
+        if name_of(path) != "b.txt" || fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let new = native(&root, "notes/new.txt");
+        write_file(&new, b"from the store");
+        let manifest = native(&root, "projects/p/assets/m/m.manifest.json");
+        let manifest_bytes = manifest_json("p", "m", json!({}));
+        write_file(&manifest, &manifest_bytes);
+        outside_remove(&native(&root, "notes/a.txt"));
+        let events = [
+            StoreEvent {
+                path: p("notes/new.txt"),
+                kind: ChangeKind::Created,
+                sha256: Some(sha256_bytes(b"from the store")),
+                identity: Some(SystemProbe.identity(&new).unwrap()),
+            },
+            StoreEvent {
+                path: p("projects/p/assets/m/m.manifest.json"),
+                kind: ChangeKind::Created,
+                sha256: Some(sha256_bytes(&manifest_bytes)),
+                identity: Some(SystemProbe.identity(&manifest).unwrap()),
+            },
+            StoreEvent {
+                path: p("notes/a.txt"),
+                kind: ChangeKind::Removed,
+                sha256: None,
+                identity: None,
+            },
+        ];
+        handle.block_on(hook_index.applied(&events));
+    }));
+    assert!(installed.is_ok());
+    index.rebuild().await.unwrap();
+
+    let new = index
+        .files_of_path(&p("notes/new.txt"))
+        .await
+        .unwrap()
+        .expect("the store's new file is kept");
+    assert_eq!(new.sha256, Some(sha256_bytes(b"from the store")));
+    assert!(
+        index.asset("p", "m").await.unwrap().is_some(),
+        "the store's new manifest is kept"
+    );
+    assert!(
+        index
+            .files_of_path(&p("notes/a.txt"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the store's removal is kept"
+    );
+}
+
+#[tokio::test] // spec: ARCH-079, CORE-034
+async fn outside_edit_while_the_core_was_closed_is_surfaced() {
+    let fx = fx();
+    let sealed = b"sealed bytes";
+    let path = format!("{ASSET}/v1.0.0/s.png");
+    fx.write(&path, sealed);
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"hashes": {"v1.0.0/s.png": format!("sha256:{}", sha256_bytes(sealed))}}),
+        ),
+    );
+    {
+        let index = fx.open(Arc::new(SystemProbe));
+        index.rebuild().await.unwrap();
+        assert!(index.verify_pending(100).await.unwrap().is_empty());
+    }
+
+    // No core runs while the sealed file is edited outside.
+    fx.write(&path, b"edited while closed");
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(!index.needs_rebuild());
+    index.start_first();
+    index.ready().await;
+    let row = index.files_of_path(&p(&path)).await.unwrap().unwrap();
+    assert_eq!(row.sha256, Some(sha256_bytes(b"edited while closed")));
+    let mismatches = index.verify_pending(100).await.unwrap();
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].path, p(&path));
+    assert_eq!(mismatches[0].sha256, sha256_bytes(b"edited while closed"));
+    assert_eq!(mismatches[0].recorded, sha256_bytes(sealed));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-089
+async fn read_tools_answer_store_io_until_a_whole_reconcile_succeeds() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.copy_fixture_workspace("failed"));
+    let probe = FakeProbe::with(|b| b.volume = Volume::Panics);
+    let hub = hub(&env, probe.clone());
+    let open = hub.open(&ws).await.unwrap();
+    let c = ctx(&open);
+    let refused = tokio::time::timeout(DEADLINE, call(&c, "assets.query", json!({})))
+        .await
+        .expect("the query answered")
+        .unwrap_err();
+    assert_eq!(refused.code, "store.io", "{refused:?}");
+    let refused = call(&c, "asset.get", json!({"asset_id": "chr_paper_crane"}))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "store.io", "{refused:?}");
+
+    probe.set(|b| b.volume = Volume::Real);
+    open.index.rebuild().await.unwrap();
+    let page = call_ok(&c, "assets.query", json!({})).await;
+    assert_eq!(page["total"], 2, "{page}");
+    drop(open);
+    hub.close_all().await;
+}
+
+#[tokio::test] // spec: CORE-041
+async fn scoped_reconciles_keep_the_scan_start() {
+    let fx = fx();
+    fx.write("notes/recent.txt", b"first");
+    fx.write("notes/other.txt", b"other");
+    let probe = FakeProbe::with(|b| {
+        b.volume = Volume::Fs("FAT32");
+        b.last_write.insert("recent.txt".into(), filetime(NOW - 1));
+        b.last_write
+            .insert("other.txt".into(), filetime(NOW - 3600));
+    });
+    let index = fx.open(probe.clone());
+    index.reconcile(Scope::All).await.unwrap();
+
+    // Rewritten in the same FAT tick; then, later, a scoped re-check of another file.
+    fx.write("notes/recent.txt", b"again");
+    fx.clock.advance(Duration::from_secs(60));
+    index
+        .reconcile(Scope::Paths(vec![p("notes/other.txt")]))
+        .await
+        .unwrap();
+    // The scoped run didn't move the scan start: the whole scan still hashes the file.
+    let report = index.reconcile(Scope::All).await.unwrap();
+    assert_eq!(report.changed, [p("notes/recent.txt")], "{report:?}");
+}
+
+#[tokio::test] // spec: CORE-041
+async fn verify_pending_examines_at_most_max_files_and_moves_on() {
+    let fx = fx();
+    let (x, y) = (b"x bytes".as_slice(), b"y bytes".as_slice());
+    fx.write(&format!("{ASSET}/v1.0.0/x.png"), x);
+    fx.write(&format!("{ASSET}/v1.0.0/y.png"), y);
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"hashes": {
+                "v1.0.0/x.png": format!("sha256:{}", sha256_bytes(x)),
+                "v1.0.0/y.png": format!("sha256:{}", sha256_bytes(y)),
+            }}),
+        ),
+    );
+    let probe = FakeProbe::new();
+    let index = fx.open(probe.clone());
+    index.rebuild().await.unwrap();
+    fx.write(&format!("{ASSET}/v1.0.0/x.png"), b"edited x");
+
+    // One row per call: x (a mismatch, reported once), then y, then x again (skipped: it
+    // hasn't changed since it was reported).
+    let first = index.verify_pending(1).await.unwrap();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!((probe.reads("x.png"), probe.reads("y.png")), (1, 0));
+    assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert_eq!((probe.reads("x.png"), probe.reads("y.png")), (1, 1));
+    assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert_eq!(
+        (probe.reads("x.png"), probe.reads("y.png")),
+        (1, 1),
+        "the reported file isn't read again, and y is verified"
+    );
 }

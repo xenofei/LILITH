@@ -386,14 +386,14 @@ impl Store {
         let placed = match staged {
             Ok(()) => {
                 let (from, to) = (sealing.clone(), version_abs.clone());
-                self.fs_retry(Some("store.replace"), move || fsops::move_new(&from, &to))
-                    .await
-                    .map_err(|e| match classify(&e) {
-                        RetryClass::TargetExists => {
-                            StoreError::VersionExists(req.version.to_string())
-                        }
-                        _ => StoreError::io(&version_rel, &e),
-                    })
+                self.fs_retry_move(Some("store.replace"), &sealing, move || {
+                    fsops::move_new(&from, &to)
+                })
+                .await
+                .map_err(|e| match classify(&e) {
+                    RetryClass::TargetExists => StoreError::VersionExists(req.version.to_string()),
+                    _ => StoreError::io(&version_rel, &e),
+                })
             }
             Err(e) => Err(e),
         };
@@ -491,9 +491,12 @@ impl Store {
                     sha256,
                 });
             } else {
-                self.fs_retry(Some("store.replace"), move || fsops::move_new(&from, &to))
-                    .await
-                    .map_err(|e| StoreError::io(&rel, &e))?;
+                // `source/` is a folder: its move also retries error 5 (ruling Q19).
+                self.fs_retry_move(Some("store.replace"), &item.from, move || {
+                    fsops::move_new(&from, &to)
+                })
+                .await
+                .map_err(|e| StoreError::io(&rel, &e))?;
                 done.push(Done::Moved {
                     sealing: item.to.clone(),
                     run: item.from.clone(),
@@ -530,9 +533,9 @@ impl Store {
         for step in done.iter().rev() {
             match step {
                 Done::Moved { sealing: at, run } => {
-                    let (at, run) = (at.clone(), run.clone());
+                    let (from, at, run) = (at.clone(), at.clone(), run.clone());
                     let back = self
-                        .fs_retry(None, move || {
+                        .fs_retry_move(None, &from, move || {
                             set_readonly_all(&at, false)?;
                             fsops::move_new(&at, &run)
                         })

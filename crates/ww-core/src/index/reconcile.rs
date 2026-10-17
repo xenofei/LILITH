@@ -35,8 +35,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -458,14 +458,15 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Reads `abs` through `probe.open_read` and takes its identity again: the digest counts only
-/// when size, last write and (on a volume with stable ids, `stable`) ChangeTime are what
-/// `before` says. Elsewhere ChangeTime churn is ignored, as in the decision itself.
+/// when size and last write are what `before` says, and ChangeTime too whenever both values
+/// are present and the volume isn't FAT (`change_time`; ruling Q21: FAT has no ChangeTime to
+/// trust).
 fn read_stable(
     probe: &dyn Probe,
     abs: &Path,
     before: &FileIdentity,
     keep: bool,
-    stable: bool,
+    change_time: bool,
 ) -> Result<Read, ReadFail> {
     let fail = |e: io::Error| match e.raw_os_error() {
         Some(32 | 33) => ReadFail::Parked,
@@ -495,7 +496,10 @@ fn read_stable(
     let after = probe.identity(abs).map_err(fail)?;
     if after.size != before.size
         || after.last_write != before.last_write
-        || (stable && after.change_time != before.change_time)
+        || (change_time
+            && after.change_time.is_some()
+            && before.change_time.is_some()
+            && after.change_time != before.change_time)
     {
         return Err(ReadFail::Parked);
     }
@@ -535,12 +539,18 @@ enum Outcome {
 struct Judge {
     probe: Arc<dyn Probe>,
     stable: bool,
+    /// A FAT or exFAT volume: no ChangeTime to compare after a read.
+    fat: bool,
     prev_scan: Option<i64>,
     rows: Arc<HashMap<String, DbFile>>,
     /// Manifest keys that have an asset row.
     known: Arc<HashSet<String>>,
-    /// Cold rebuild: the hashes manifests record, by key.
+    /// Cold rebuild: the hashes manifests record, by key, taken on trust (not read).
     trusted: Arc<HashMap<String, String>>,
+    /// Warm reconcile: the hashes manifests record, by key, read after the manifests were
+    /// re-parsed. A hashed file whose content differs stays unverified, so `verify_pending`
+    /// reports it (ruling Q20).
+    recorded: Arc<HashMap<String, String>>,
 }
 
 impl Judge {
@@ -612,7 +622,7 @@ impl Judge {
                 bytes: None,
             };
         }
-        match read_stable(self.probe.as_ref(), &w.abs, &id, manifest, self.stable) {
+        match read_stable(self.probe.as_ref(), &w.abs, &id, manifest, !self.fat) {
             Ok(read) => {
                 let (sha, state) = match read.lfs {
                     Some(oid) => (oid, FileState::NotFetched),
@@ -630,8 +640,11 @@ impl Judge {
                     }
                 };
                 let changed = old.is_none_or(|o| o.sha256.as_deref() != Some(sha.as_str()));
+                // Content its manifest doesn't record (an edit made outside, perhaps while no
+                // core ran) stays unverified for `verify_pending` to report.
+                let verified = self.recorded.get(&w.key).is_none_or(|want| *want == sha);
                 Outcome::Row {
-                    row: DbFile::new(&w.rel, &read.after, Some(sha), state, true),
+                    row: DbFile::new(&w.rel, &read.after, Some(sha), state, verified),
                     hashed: true,
                     changed,
                     bytes: read.bytes,
@@ -1100,21 +1113,77 @@ fn write_rows(
     Ok(())
 }
 
-/// Runs one reconcile or cold rebuild under the scan lock (`scan` holds the previous scan's
-/// start and gets this one's).
-/// Whether the workspace volume's FileId and ChangeTime can be trusted: unreadable volume facts
-/// count as no stable ids (CORE-041 clarification).
-async fn stable_ids(index: &Index) -> Result<bool, IndexError> {
+/// What the workspace volume says: whether its FileId and ChangeTime can be trusted, and
+/// whether it is FAT or exFAT. Unreadable facts count as no stable ids, and not FAT (CORE-041
+/// clarification; ruling Q21).
+async fn volume_facts(index: &Index) -> Result<(bool, bool), IndexError> {
     let (probe, root) = (index.probe.clone(), index.root.clone());
     Ok(match blocking(move || probe.volume_info(&root)).await? {
-        Ok(volume) => volume.stable_ids(),
+        Ok(volume) => (volume.stable_ids(), is_fat(&volume.fs_name)),
         Err(e) => {
             tracing::debug!(error = %e, "the volume facts can't be read; file ids aren't trusted");
-            false
+            (false, false)
         }
     })
 }
 
+/// `FAT`, `FAT12`, `FAT16`, `FAT32` or `exFAT`, in any case.
+fn is_fat(fs_name: &str) -> bool {
+    let fs_name = fs_name.to_ascii_lowercase();
+    fs_name.starts_with("fat") || fs_name == "exfat"
+}
+
+/// The hashes the manifests record for the files in `scope`, by key.
+fn load_recorded(conn: &Connection, scope: &Scope) -> rusqlite::Result<HashMap<String, String>> {
+    let pair = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+    let mut out = HashMap::new();
+    match scope {
+        Scope::All => {
+            let mut stmt =
+                conn.prepare("SELECT key, sha256 FROM expected WHERE sha256 IS NOT NULL")?;
+            for row in stmt.query_map([], pair)? {
+                let (key, sha) = row?;
+                out.insert(key, sha);
+            }
+        }
+        Scope::Paths(paths) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT key, sha256 FROM expected WHERE sha256 IS NOT NULL AND {UNDER}"
+            ))?;
+            for path in paths {
+                for row in stmt.query_map(params![path_key(path.as_str())], pair)? {
+                    let (key, sha) = row?;
+                    out.insert(key, sha);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The store's changes `apply_events` wrote: replayed in a cold rebuild's own transaction
+/// when they landed while it ran, so the rebuild never loses or reverts one.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StoreChanges {
+    removed: Vec<String>,
+    rows: Vec<DbFile>,
+    parsed: Vec<Parsed>,
+}
+
+/// While it lives, a cold rebuild is running: `apply_events` logs what it writes. Dropping it
+/// (the rebuild ended, either way) stops the log.
+struct ColdLog<'a>(&'a Mutex<Option<Vec<StoreChanges>>>);
+
+impl Drop for ColdLog<'_> {
+    fn drop(&mut self) {
+        *lock(self.0) = None;
+    }
+}
+
+/// Runs one reconcile or cold rebuild under the scan lock. `scan` holds the previous whole
+/// scan's start, and gets this one's when this one covers the whole workspace: a scoped run
+/// (a parked re-check, a path rescan) never moves it, so the 2-second rule still covers files
+/// written just before the last whole scan.
 pub(super) async fn run(
     index: &Index,
     scan: &mut Option<i64>,
@@ -1123,8 +1192,13 @@ pub(super) async fn run(
     mode: Mode,
 ) -> Result<ReconcileReport, IndexError> {
     let started = filetime_now(index.clock.as_ref());
+    let whole = scope == Scope::All;
     let mut report = ReconcileReport::default();
-    let stable = stable_ids(index).await?;
+    let (stable, fat) = volume_facts(index).await?;
+    let _cold = (mode == Mode::Cold).then(|| {
+        *lock(&index.cold_log) = Some(Vec::new());
+        ColdLog(&index.cold_log)
+    });
 
     let (rows, known) = match mode {
         Mode::Cold => (HashMap::new(), HashSet::new()),
@@ -1152,10 +1226,12 @@ pub(super) async fn run(
     let mut judge = Judge {
         probe: index.probe.clone(),
         stable,
+        fat,
         prev_scan: if mode == Mode::Cold { None } else { *scan },
         rows: rows.clone(),
         known: Arc::new(known),
         trusted: Arc::new(HashMap::new()),
+        recorded: Arc::new(HashMap::new()),
     };
 
     let (first, rest): (Vec<Walked>, Vec<Walked>) = match order {
@@ -1167,30 +1243,37 @@ pub(super) async fn run(
 
     // Manifests first: looked at, and (warm) written, before any other file.
     let mut manifests = look(index, Arc::new(clone_judge(&judge)), first, &mut report).await?;
-    if mode == Mode::Warm && !manifests.rows.is_empty() {
-        let (rows, parsed) = (
-            std::mem::take(&mut manifests.rows),
-            std::mem::take(&mut manifests.parsed),
-        );
-        index
-            .db
-            .call(move |conn| {
-                let tx = conn.transaction().map_err(|e| sql(&e))?;
-                write_rows(&tx, &rows, &parsed, true).map_err(|e| sql(&e))?;
-                tx.commit().map_err(|e| sql(&e))
-            })
-            .await?;
-    }
-    if mode == Mode::Cold {
-        let mut trusted = HashMap::new();
-        for p in &manifests.parsed {
-            for e in p.fields.iter().flat_map(|f| &f.expected) {
-                if let Some(sha) = &e.sha256 {
-                    trusted.insert(e.key.clone(), sha.clone());
+    match mode {
+        Mode::Warm => {
+            let (rows, parsed) = (
+                std::mem::take(&mut manifests.rows),
+                std::mem::take(&mut manifests.parsed),
+            );
+            let scope = scope.clone();
+            let recorded = index
+                .db
+                .call(move |conn| {
+                    if !rows.is_empty() {
+                        let tx = conn.transaction().map_err(|e| sql(&e))?;
+                        write_rows(&tx, &rows, &parsed, true).map_err(|e| sql(&e))?;
+                        tx.commit().map_err(|e| sql(&e))?;
+                    }
+                    load_recorded(conn, &scope).map_err(|e| sql(&e))
+                })
+                .await?;
+            judge.recorded = Arc::new(recorded);
+        }
+        Mode::Cold => {
+            let mut trusted = HashMap::new();
+            for p in &manifests.parsed {
+                for e in p.fields.iter().flat_map(|f| &f.expected) {
+                    if let Some(sha) = &e.sha256 {
+                        trusted.insert(e.key.clone(), sha.clone());
+                    }
                 }
             }
+            judge.trusted = Arc::new(trusted);
         }
-        judge.trusted = Arc::new(trusted);
     }
 
     let others = look(index, Arc::new(judge), rest, &mut report).await?;
@@ -1207,12 +1290,27 @@ pub(super) async fn run(
     let mut parsed_all = manifests.parsed;
     rows_all.extend(others.rows);
     parsed_all.extend(others.parsed);
+    let cold_log = index.cold_log.clone();
     let removals = index
         .db
         .call(move |conn| {
             let tx = conn.transaction().map_err(|e| sql(&e))?;
-            let done =
-                finish(&tx, mode, &rows_all, &parsed_all, &gone, started).map_err(|e| sql(&e))?;
+            // Taken on the actor, so every store change written before this job is in it; a
+            // later one is written after the rebuild commits.
+            let replay = match mode {
+                Mode::Cold => lock(&cold_log).take().unwrap_or_default(),
+                Mode::Warm => Vec::new(),
+            };
+            let done = finish(
+                &tx,
+                mode,
+                &rows_all,
+                &parsed_all,
+                &gone,
+                &replay,
+                whole.then_some(started),
+            )
+            .map_err(|e| sql(&e))?;
             tx.commit().map_err(|e| sql(&e))?;
             Ok(done)
         })
@@ -1224,21 +1322,25 @@ pub(super) async fn run(
     report.parked.sort();
     report.cloud_only.sort();
     report.needs_repair.sort();
-    *scan = Some(started);
+    if whole {
+        *scan = Some(started);
+    }
     Ok(report)
 }
 
-/// The run's last transaction: a cold rebuild clears the tables and writes every row (asset
-/// rows with their `expected` files, then the files); a warm one writes its rows
-/// compare-and-set and settles the rows of files that are gone (`missing` when the suite
-/// still expects them, else deleted). Then the scan's start. Returns (removed, missing).
+/// The run's last transaction: a cold rebuild clears the tables, writes every row (asset rows
+/// with their `expected` files, then the files), then replays the store's changes that landed
+/// while it ran (`replay`); a warm one writes its rows compare-and-set and settles the rows of
+/// files that are gone (`missing` when the suite still expects them, else deleted). Then the
+/// whole scan's start, if it was one. Returns (removed, missing).
 fn finish(
     tx: &Transaction<'_>,
     mode: Mode,
     rows: &[(DbFile, Option<DbFile>)],
     parsed: &[Parsed],
     gone: &[DbFile],
-    started: i64,
+    replay: &[StoreChanges],
+    scan_start: Option<i64>,
 ) -> rusqlite::Result<(Vec<WsPath>, Vec<WsPath>)> {
     let (mut removed, mut missing) = (Vec::new(), Vec::new());
     if mode == Mode::Cold {
@@ -1247,6 +1349,9 @@ fn finish(
              DELETE FROM edges; DELETE FROM expected;",
         )?;
         write_rows(tx, rows, parsed, false)?;
+        for changes in replay {
+            store_changes(tx, &changes.removed, &changes.rows, &changes.parsed)?;
+        }
     } else {
         write_rows(tx, rows, parsed, true)?;
         for old in gone {
@@ -1267,10 +1372,12 @@ fn finish(
             }
         }
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('scan_start', ?1)",
-        params![started],
-    )?;
+    if let Some(started) = scan_start {
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('scan_start', ?1)",
+            params![started],
+        )?;
+    }
     Ok((removed, missing))
 }
 
@@ -1299,10 +1406,12 @@ fn clone_judge(j: &Judge) -> Judge {
     Judge {
         probe: j.probe.clone(),
         stable: j.stable,
+        fat: j.fat,
         prev_scan: j.prev_scan,
         rows: j.rows.clone(),
         known: j.known.clone(),
         trusted: j.trusted.clone(),
+        recorded: j.recorded.clone(),
     }
 }
 
@@ -1374,11 +1483,22 @@ pub(super) async fn apply_events(index: &Index, events: &[StoreEvent]) -> Result
         }
     }
     if !rows.is_empty() || !removed.is_empty() {
+        let changes = StoreChanges {
+            removed,
+            rows,
+            parsed,
+        };
+        // Logged before it is written: a cold rebuild that commits after this write replays it,
+        // and one that commits before it is followed by it.
+        if let Some(log) = lock(&index.cold_log).as_mut() {
+            log.push(changes.clone());
+        }
         index
             .db
             .call(move |conn| {
                 let tx = conn.transaction().map_err(|e| sql(&e))?;
-                store_changes(&tx, &removed, &rows, &parsed).map_err(|e| sql(&e))?;
+                store_changes(&tx, &changes.removed, &changes.rows, &changes.parsed)
+                    .map_err(|e| sql(&e))?;
                 tx.commit().map_err(|e| sql(&e))
             })
             .await?;
@@ -1395,16 +1515,25 @@ pub(super) async fn apply_events(index: &Index, events: &[StoreEvent]) -> Result
 // Verification.
 // ---------------------------------------------------------------------------------------------
 
-/// [`Index::verify_pending`], under the scan lock.
+/// [`Index::verify_pending`], under the scan lock. It examines at most `max_files` unverified
+/// rows, in key order from where the last call stopped (wrapping round at the end), so a file
+/// already reported (skipped until it changes) never starves the others; every examined row
+/// counts, read or not.
 pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismatch>, IndexError> {
+    if max_files == 0 {
+        return Ok(Vec::new());
+    }
+    let from = lock(&index.verify_from).clone();
+    let limit = i64::try_from(max_files).unwrap_or(i64::MAX);
     let pending: Vec<(DbFile, Option<String>)> = index
         .db
-        .call(|conn| {
+        .call(move |conn| {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {}, e.sha256 FROM files f LEFT JOIN expected e ON e.key = f.key
                      WHERE f.verified = 0 AND f.state NOT IN ('cloud_only', 'missing')
-                     ORDER BY f.key",
+                       AND f.key > ?1
+                     ORDER BY f.key LIMIT ?2",
                     FILE_COLUMNS
                         .split(", ")
                         .map(|c| format!("f.{c}"))
@@ -1412,15 +1541,26 @@ pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismat
                         .join(", ")
                 ))
                 .map_err(|e| sql(&e))?;
-            stmt.query_map([], |r| Ok((db_file(r)?, r.get::<_, Option<String>>(11)?)))
-                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
-                .map_err(|e| sql(&e))
+            stmt.query_map(params![from, limit], |r| {
+                Ok((db_file(r)?, r.get::<_, Option<String>>(11)?))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|e| sql(&e))
         })
         .await?;
-    if pending.is_empty() || max_files == 0 {
+    // A short batch reached the end: the next call starts from the first row again.
+    *lock(&index.verify_from) = if pending.len() < max_files {
+        String::new()
+    } else {
+        pending
+            .last()
+            .map(|(row, _)| row.key.clone())
+            .unwrap_or_default()
+    };
+    if pending.is_empty() {
         return Ok(Vec::new());
     }
-    let stable = stable_ids(index).await?;
+    let (_, fat) = volume_facts(index).await?;
     // A file already reported is hashed again only once it changes.
     let mismatched = lock(&index.mismatched).clone();
 
@@ -1432,7 +1572,7 @@ pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismat
     let checked = blocking(move || {
         let mut out = Vec::new();
         for (row, recorded) in pending {
-            if closed.load(Ordering::Relaxed) || out.len() >= max_files {
+            if closed.load(Ordering::Relaxed) {
                 break;
             }
             let rel = WsPath::from_disk(row.path.clone());
@@ -1445,7 +1585,7 @@ pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismat
             {
                 continue;
             }
-            match read_stable(probe.as_ref(), &abs, &id, false, stable) {
+            match read_stable(probe.as_ref(), &abs, &id, false, !fat) {
                 Ok(read) => out.push((row, recorded, read)),
                 Err(ReadFail::Other(e)) => {
                     tracing::debug!(path = %rel, error = %e, "a file can't be verified now");
@@ -1460,7 +1600,9 @@ pub(super) async fn verify(index: &Index, max_files: usize) -> Result<Vec<Mismat
     let mut mismatches = Vec::new();
     let mut updates: Vec<(DbFile, Option<DbFile>)> = Vec::new();
     for (row, recorded, read) in checked {
-        let trusted = row.sha256.clone().or(recorded);
+        // The manifest's hash first (ruling Q20: a row whose content differs from it stays
+        // unverified until the watcher decides); else the hash the row was given.
+        let trusted = recorded.or_else(|| row.sha256.clone());
         let matches = |want: &str| read.sha256 == want || read.lfs.as_deref() == Some(want);
         match trusted.as_deref() {
             Some(want) if !matches(want) => {

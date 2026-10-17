@@ -134,7 +134,10 @@ async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), 
     if let Some(cursor) = &args.cursor {
         q.after = Some(decode_cursor(&q, cursor).map_err(|why| invalid(ctx, why))?);
     }
-    open.index.ready().await;
+    open.index
+        .ready_result()
+        .await
+        .map_err(|e| e.to_error(&ctx.trace_id))?;
     let page = open
         .index
         .assets(q.clone())
@@ -159,7 +162,10 @@ async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), 
 async fn get(ctx: &CallCtx, args: GetArgs) -> Result<(AssetDetail, String), ErrorBody> {
     let open = ctx.workspace()?;
     let project = args.project.unwrap_or_else(|| DEFAULT_PROJECT.to_string());
-    open.index.ready().await;
+    open.index
+        .ready_result()
+        .await
+        .map_err(|e| e.to_error(&ctx.trace_id))?;
     let detail = asset_detail(
         &open.store,
         &open.index,

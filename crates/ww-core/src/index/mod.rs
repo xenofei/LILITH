@@ -331,7 +331,7 @@ impl Db {
 // The index.
 // ---------------------------------------------------------------------------------------------
 
-/// A file's (size, last write, ChangeTime) as erify_pending saw it.
+/// A file's (size, last write, ChangeTime) as `verify_pending` saw it.
 pub(super) type Seen = (u64, i64, Option<i64>);
 
 /// A parked path and how often it was re-checked.
@@ -339,6 +339,17 @@ pub(super) type Seen = (u64, i64, Option<i64>);
 struct ParkedPath {
     path: WsPath,
     retries: u32,
+}
+
+/// Whether the index can answer reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Readiness {
+    /// The first reconcile (or cold rebuild) of the whole workspace hasn't finished.
+    Pending,
+    /// A reconcile or rebuild of the whole workspace has succeeded.
+    Ready,
+    /// The first one failed, and none has succeeded since: why.
+    Failed(String),
 }
 
 /// A workspace's index: one connection on its own thread.
@@ -350,13 +361,19 @@ pub struct Index {
     path: Option<PathBuf>,
     /// The first reconcile is a cold rebuild (a new, rebuilt or in-memory index).
     cold: bool,
-    ready: watch::Sender<bool>,
-    /// Held by each reconcile, rebuild and verification: the last scan's start (FILETIME).
+    ready: watch::Sender<Readiness>,
+    /// Held by each reconcile, rebuild and verification: the last whole scan's start
+    /// (FILETIME).
     scan: tokio::sync::Mutex<Option<i64>>,
     parked: Mutex<BTreeMap<String, ParkedPath>>,
     /// Files `verify_pending` found different, with the (size, last write, ChangeTime) it saw:
     /// not hashed again until one of them changes.
     mismatched: Mutex<HashMap<String, Seen>>,
+    /// Where the next `verify_pending` batch starts (a key; empty: from the first row).
+    verify_from: Mutex<String>,
+    /// While a cold rebuild runs: the store's changes applied meanwhile, replayed in the
+    /// rebuild's own transaction so none is lost (`None` otherwise).
+    cold_log: Arc<Mutex<Option<Vec<reconcile::StoreChanges>>>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -412,10 +429,12 @@ impl Index {
             db,
             path,
             cold,
-            ready: watch::Sender::new(false),
+            ready: watch::Sender::new(Readiness::Pending),
             scan: tokio::sync::Mutex::new(scan_start),
             parked: Mutex::new(BTreeMap::new()),
             mismatched: Mutex::new(HashMap::new()),
+            verify_from: Mutex::new(String::new()),
+            cold_log: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -443,18 +462,12 @@ impl Index {
         self.cold
     }
 
-    /// Starts the first reconcile in the background, or the cold rebuild when
-    /// [`Index::needs_rebuild`]; [`Index::ready`] resolves when it finishes, also when it
-    /// failed (then the error is logged and the next reconcile tries again).
+    /// Starts [`Index::retry_first`] in the background: the first reconcile, or the cold
+    /// rebuild when [`Index::needs_rebuild`]. [`Index::ready`] resolves when it finishes.
     pub fn start_first(self: &Arc<Self>) {
         let index = self.clone();
         tokio::spawn(async move {
-            let done = if index.cold {
-                index.rebuild().await
-            } else {
-                index.reconcile(Scope::All).await
-            };
-            match done {
+            match index.retry_first().await {
                 Ok(report) => tracing::info!(
                     root = %index.root.display(),
                     cold = index.cold,
@@ -463,18 +476,74 @@ impl Index {
                     "the first reconcile finished"
                 ),
                 Err(e) => {
-                    tracing::warn!(root = %index.root.display(), error = %e, "the first reconcile failed")
+                    tracing::warn!(root = %index.root.display(), error = %e, "the first reconcile failed; the read tools answer store.io until one succeeds")
                 }
             }
-            index.ready.send_replace(true);
+        });
+    }
+
+    /// Runs the first whole-workspace run again: a cold rebuild while the index has never
+    /// been built (a new, rebuilt or in-memory index), else a reconcile. The workspace's
+    /// background tick calls it while [`Index::failed`].
+    ///
+    /// # Errors
+    /// [`IndexError`] when the run fails.
+    pub async fn retry_first(&self) -> Result<ReconcileReport, IndexError> {
+        if self.cold && *self.ready.borrow() != Readiness::Ready {
+            self.rebuild().await
+        } else {
+            self.reconcile(Scope::All).await
+        }
+    }
+
+    /// Whether the first whole-workspace run failed and none has succeeded since.
+    pub fn failed(&self) -> bool {
+        matches!(*self.ready.borrow(), Readiness::Failed(_))
+    }
+
+    /// Records the outcome of a whole-workspace run: a success makes the index ready; a
+    /// failure before any success is remembered (a failure after one changes nothing: the
+    /// index still holds the last good state).
+    fn settle<T>(&self, done: &Result<T, IndexError>) {
+        self.ready.send_if_modified(|state| match (done, &*state) {
+            (Ok(_), Readiness::Ready) => false,
+            (Ok(_), _) => {
+                *state = Readiness::Ready;
+                true
+            }
+            (Err(_), Readiness::Ready) => false,
+            (Err(e), _) => {
+                *state = Readiness::Failed(e.to_string());
+                true
+            }
         });
     }
 
     /// Resolves once the first reconcile (of the whole workspace) or cold rebuild has
-    /// finished.
+    /// finished, whether it succeeded or not ([`Index::ready_result`] says which).
     pub async fn ready(&self) {
         let mut ready = self.ready.subscribe();
-        let _ = ready.wait_for(|r| *r).await;
+        let _ = ready.wait_for(|r| *r != Readiness::Pending).await;
+    }
+
+    /// [`Index::ready`], then whether a whole-workspace run has succeeded. The read tools
+    /// answer `store.io` while it hasn't.
+    ///
+    /// # Errors
+    /// [`IndexError::Io`] naming why the first run failed.
+    pub async fn ready_result(&self) -> Result<(), IndexError> {
+        let mut ready = self.ready.subscribe();
+        let state = ready
+            .wait_for(|r| *r != Readiness::Pending)
+            .await
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| Readiness::Failed("the index has stopped".to_string()));
+        match state {
+            Readiness::Failed(why) => Err(IndexError::Io(format!(
+                "the workspace could not be indexed yet ({why})"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Stops the actor once its queued jobs have run (a blocking call); later calls are
@@ -505,15 +574,15 @@ impl Index {
         let whole = scope == Scope::All;
         let mut scan = self.scan.lock().await;
         let done = reconcile::run(self, &mut scan, scope, order, reconcile::Mode::Warm).await;
-        if whole && done.is_ok() {
-            self.ready.send_replace(true);
+        if whole {
+            self.settle(&done);
         }
         done
     }
 
     /// Clears the index and builds it again from the workspace: manifests are parsed, the
     /// hashes they record are trusted (unverified, for [`Index::verify_pending`]), and only
-    /// files no manifest records are hashed.
+    /// files no manifest records are hashed. Store changes applied while it runs are kept.
     ///
     /// # Errors
     /// [`IndexError`] when the database fails or the workspace can't be listed.
@@ -527,9 +596,7 @@ impl Index {
             reconcile::Mode::Cold,
         )
         .await;
-        if done.is_ok() {
-            self.ready.send_replace(true);
-        }
+        self.settle(&done);
         done
     }
 

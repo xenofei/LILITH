@@ -298,6 +298,18 @@ pub fn classify(e: &io::Error) -> RetryClass {
     }
 }
 
+/// [`classify`] for a move of a folder (`folder`) or a file. A folder rename fails with error
+/// 5 (`ERROR_ACCESS_DENIED`) while any handle is open anywhere in its subtree, whatever that
+/// handle's share mode (MS-FSA 2.1.5.15.12): the index reading a file, Defender, Search or
+/// Explorer can hold one. So for a folder 5 is a [`RetryClass::SharingViolation`], retried
+/// under the store's budget (plan 2b ruling Q19). For a file, 5 stays `Other`: a real denial.
+pub fn classify_move(e: &io::Error, folder: bool) -> RetryClass {
+    match e.raw_os_error() {
+        Some(5) if folder => RetryClass::SharingViolation,
+        _ => classify(e),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // File identity and volume facts.
 // ---------------------------------------------------------------------------------------------
@@ -1018,6 +1030,16 @@ mod tests {
         }
         for code in [0, 2, 5, 87, 1178] {
             assert_eq!(class(code), RetryClass::Other, "{code}");
+        }
+        // Error 5 is retried for a folder move only (ruling Q19); a file operation never
+        // retries it, and every other code classifies as `classify` says.
+        let moving = |code, folder| classify_move(&io::Error::from_raw_os_error(code), folder);
+        assert_eq!(moving(5, true), RetryClass::SharingViolation);
+        assert_eq!(moving(5, false), RetryClass::Other);
+        for code in [0, 2, 32, 33, 80, 87, 112, 183, 1224] {
+            for folder in [false, true] {
+                assert_eq!(moving(code, folder), class(code), "{code} folder={folder}");
+            }
         }
         assert_eq!(classify(&io::Error::other("no code")), RetryClass::Other);
         // Errors that came through an HRESULT carry the plain Win32 code.
