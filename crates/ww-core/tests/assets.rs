@@ -19,6 +19,7 @@ use ww_core::store::{ChangeSink, CommitOp, StoreError, StoreEvent, WsPath};
 use ww_core::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
 use ww_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use ww_platform::fs::{Probe, SystemProbe};
+use ww_platform::paths::folder_key;
 use ww_platform::{Clock, IdSource};
 use ww_protocol::{CallerKind, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput};
 use ww_schema::CandidateFile;
@@ -1064,15 +1065,25 @@ async fn a_kept_run_is_signable_once_the_asset_is_approved() {
 }
 
 /// The real probe, except that one path reports the cloud placeholder attributes.
+///
+/// Paths are compared as `folder_key` compares them, not by spelling: the core asks about a
+/// workspace file under the canonical workspace folder, while the test spells it under the
+/// temp folder, which may be spelled with a short name (the runner's `RUNNER~1` on CI).
 #[derive(Debug)]
 struct CloudProbe {
     placeholder: PathBuf,
 }
 
+impl CloudProbe {
+    fn is_placeholder(&self, path: &Path) -> bool {
+        folder_key(path) == folder_key(&self.placeholder)
+    }
+}
+
 impl Probe for CloudProbe {
     fn identity(&self, path: &Path) -> std::io::Result<ww_platform::fs::FileIdentity> {
         let mut id = SystemProbe.identity(path)?;
-        if path == self.placeholder {
+        if self.is_placeholder(path) {
             id.attributes |= ww_platform::fs::PLACEHOLDER_ATTRIBUTES;
         }
         Ok(id)
@@ -1083,7 +1094,11 @@ impl Probe for CloudProbe {
     }
 
     fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
-        assert_ne!(path, self.placeholder, "a placeholder's data was opened");
+        assert!(
+            !self.is_placeholder(path),
+            "a placeholder's data was opened: {}",
+            path.display()
+        );
         SystemProbe.open_read(path)
     }
 }
