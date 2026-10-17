@@ -80,6 +80,8 @@ QA-062 = "test"
 # review); APP-025 and APP-138 (the index tests); QA-019 and QA-041 (the testkit's own
 # tests); ARCH-117 and ARCH-119 (the core's file log and panic hook). ARCH-002 is "test" too:
 # its tests cite it, and the clippy lint below backs them up.
+# APP-025, APP-138 and QA-019 are covered on the core side only: their app and CI parts are
+# still open (plans 4 and later).
 ARCH-002 = "test"
 ARCH-028 = "test"
 ARCH-042 = "test"

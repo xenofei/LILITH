@@ -22,7 +22,23 @@ const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A fault an in-process test injects into the creation of pipe instances
 /// ([`CoreConfig::pipe_instance_fault`]).
+#[doc(hidden)]
 pub type PipeInstanceFault = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+/// A step of watching the test parent ([`CoreConfig::parent_watch_fault`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentWatchStep {
+    /// Before the parent is opened (`process::open`).
+    Open,
+    /// Before the wait for its exit is registered (`ProcessHandle::wait`).
+    Wait,
+}
+
+/// A fault an in-process test injects into watching the test parent
+/// ([`CoreConfig::parent_watch_fault`]).
+#[doc(hidden)]
+pub type ParentWatchFault = Arc<dyn Fn(ParentWatchStep) -> io::Result<()> + Send + Sync>;
 
 /// The core's configuration.
 #[derive(Clone)]
@@ -60,7 +76,14 @@ pub struct CoreConfig {
     /// In-process tests only (`None` from [`CoreConfig::for_env`]): runs before each pipe
     /// instance after the claimed first one is created, and an `Err` is that instance's
     /// creation error. The core then stops as after a fatal error (exit 4).
+    #[doc(hidden)]
     pub pipe_instance_fault: Option<PipeInstanceFault>,
+    /// In-process tests only (`None` from [`CoreConfig::for_env`]): runs before each step of
+    /// watching the test parent, and an `Err` is that step's error. `NotFound` at `Open` means
+    /// the parent is gone (exit 0); any other error stops the core as after a fatal error
+    /// (exit 4).
+    #[doc(hidden)]
+    pub parent_watch_fault: Option<ParentWatchFault>,
     /// The crate's own unit tests only (compiled out of every build): a request with this
     /// method panics in the router, to test how the transport survives a panicking handler.
     #[cfg(test)]
@@ -96,6 +119,7 @@ impl CoreConfig {
             watch: WatchConfig::default(),
             git_env: Vec::new(),
             pipe_instance_fault: None,
+            parent_watch_fault: None,
             #[cfg(test)]
             panic_on_method: None,
         })

@@ -30,7 +30,7 @@ use ww_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
 use ww_platform::{Env, process};
 use ww_protocol::{Id, Request, Response, encode_response_capped};
 
-use crate::config::{CoreConfig, CoreExit, PipeInstanceFault};
+use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
 use crate::events::EventBus;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::projects::ActiveProjects;
@@ -434,7 +434,11 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     }
     let mut helpers = vec![tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after))];
     if let Some(pid) = cfg.test_parent_pid.filter(|_| cfg.test_tools) {
-        helpers.push(tokio::spawn(watch_test_parent(pid, lifecycle.clone())));
+        helpers.push(tokio::spawn(watch_test_parent(
+            pid,
+            lifecycle.clone(),
+            cfg.parent_watch_fault.clone(),
+        )));
     }
     let session_end = match SessionEndWatcher::start() {
         Ok((watcher, messages)) => {
@@ -622,17 +626,24 @@ async fn watch_session_end(
 /// Test channels: drains the core once the test process `pid` is gone, so a test core never
 /// outlives its test. A parent that is not running (`NotFound`) is gone. One that cannot be
 /// watched (opening it fails otherwise, for example access denied, or the wait cannot be
-/// registered) is a fatal error: the core would otherwise outlive its test unseen.
-async fn watch_test_parent(pid: u32, lifecycle: Arc<Lifecycle>) {
+/// registered) is a fatal error: the core would otherwise outlive its test unseen. `fault`
+/// (in-process tests, [`CoreConfig::parent_watch_fault`]) runs before each step, and its `Err`
+/// is that step's.
+async fn watch_test_parent(pid: u32, lifecycle: Arc<Lifecycle>, fault: Option<ParentWatchFault>) {
+    let fault = |step| fault.as_ref().map_or(Ok(()), |f| f(step));
     let cannot_watch = |e: &io::Error| {
         tracing::error!(pid, error = %e, "cannot watch the test parent; the core stops");
         lifecycle.begin_drain(DrainReason::Fatal(format!(
             "cannot watch the test parent {pid}: {e}"
         )));
     };
-    match process::open(pid) {
+    match fault(ParentWatchStep::Open).and_then(|()| process::open(pid)) {
         Ok(parent) => {
-            if let Err(e) = parent.wait().await {
+            let waited = match fault(ParentWatchStep::Wait) {
+                Ok(()) => parent.wait().await.map(drop),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = waited {
                 cannot_watch(&e);
                 return;
             }

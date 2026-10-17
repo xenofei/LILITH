@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use ww_core::config::{ParentWatchFault, ParentWatchStep};
 use ww_core::lifecycle::{DrainReason, ShutdownPhase, ShutdownStep};
 use ww_core::state::StateError;
 use ww_core::{CoreConfig, CoreThread, start, start_in_thread};
@@ -214,29 +215,59 @@ fn state_actor_death_stops_core_with_exit_4() {
     );
 }
 
+/// An in-process core whose test parent is this test process, watched through `fault`.
+fn core_watching_parent(env: &TestEnv, fault: ParentWatchFault) -> CoreThread {
+    start_in_thread(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: Some(std::process::id()),
+        parent_watch_fault: Some(fault),
+        ..CoreConfig::for_env(env.env.clone()).expect("core config")
+    })
+}
+
 #[test] // spec: QA-012, QA-056
 fn failed_parent_watch_registration_exits_4() {
-    // PID 4 is the System process: it runs, and this user may not open it (access denied,
-    // not `NotFound`), so the core cannot watch it.
-    match ww_platform::process::open(4) {
-        Ok(_) => panic!("this test needs a running process the user cannot open; PID 4 opened"),
-        Err(e) => assert_ne!(e.kind(), io::ErrorKind::NotFound, "PID 4: {e}"),
+    // The parent runs (it is this process), but opening it fails other than with `NotFound`
+    // (access denied, error 5), or the wait for it cannot be registered: the core cannot watch
+    // it, so it stops as after a fatal error.
+    for failing in [ParentWatchStep::Open, ParentWatchStep::Wait] {
+        let env = TestEnv::new();
+        let core = core_watching_parent(
+            &env,
+            Arc::new(move |step| {
+                if step == failing {
+                    Err(io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let report = core.wait_stopped(DEADLINE).expect("the core stops");
+        match &report.reason {
+            DrainReason::Fatal(why) => assert!(why.contains("test parent"), "{failing:?}: {why}"),
+            other => panic!("{failing:?}: not a fatal stop: {other:?}"),
+        }
+        assert_eq!(report.exit_code(), 4, "{failing:?}");
     }
+}
+
+#[test] // spec: QA-056
+fn test_parent_not_found_at_open_is_gone_and_exits_0() {
     let env = TestEnv::new();
-    let core = CoreFixture::spawn_raw_with_env(&env, &[(ww_platform::ENV_TEST_PARENT_PID, "4")]);
-    assert_eq!(
-        core.wait_exit(DEADLINE),
-        Some(4),
-        "a test core that cannot watch its parent must stop as after a fatal error"
+    let core = core_watching_parent(
+        &env,
+        Arc::new(|step| match step {
+            ParentWatchStep::Open => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not running",
+            )),
+            ParentWatchStep::Wait => panic!("a parent that is not running is never waited for"),
+        }),
     );
-    assert!(
-        log_lines(&env).iter().any(|l| l["fields"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("test parent"))
-            && l["level"] == "ERROR"),
-        "no error line names the test parent: {:?}",
-        log_lines(&env)
-    );
+    let report = core.wait_stopped(DEADLINE).expect("the core stops");
+    assert_eq!(report.reason, DrainReason::TestParentGone);
+    assert_eq!(report.exit_code(), 0);
 }
 
 #[test] // spec: QA-012, ARCH-024

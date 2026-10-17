@@ -54,10 +54,42 @@ impl CoreFixture {
     /// Starts the test build of `ww-core` on `env`'s channel and waits up to 30 s for its
     /// pipe.
     ///
+    /// It returns early: the core claims its pipe before it opens its log and the suite
+    /// `state.db`, so when this returns the core may not have created or opened `state.db`
+    /// yet, nor be serving. A test that reads or writes `state.db` or its `-wal`, `-shm` or
+    /// `-journal` files before its first call uses [`CoreFixture::start_ready`]. (A first
+    /// `core/hello` waits by itself: it is answered only once the core serves.)
+    ///
     /// # Panics
     /// If `ww-core.exe` is missing, cannot be started, exits early or opens no pipe in time.
     pub fn start(env: &TestEnv) -> CoreFixture {
         CoreFixture::start_exe(env, &ensure_built().ww_core)
+    }
+
+    /// [`CoreFixture::start`], then waits up to 30 s for an `ok` answer to a `core/hello`
+    /// (on a connection closed again at once): by then the core has opened the suite
+    /// `state.db` and serves.
+    ///
+    /// # Panics
+    /// As [`CoreFixture::start`], and if the hello is not answered `ok` in time.
+    pub fn start_ready(env: &TestEnv) -> CoreFixture {
+        let fixture = CoreFixture::start(env);
+        let Some(mut conn) = RawPipe::connect_name(&fixture.pipe, PIPE_DEADLINE) else {
+            panic!(
+                "cannot connect to {} after the core opened it",
+                fixture.pipe
+            );
+        };
+        match conn.try_call(
+            ww_protocol::method::HELLO,
+            merge_hello(json!({})),
+            PIPE_DEADLINE,
+        ) {
+            Ok(hello) if hello["result"]["status"] == "ok" => {}
+            Ok(hello) => panic!("the core did not answer core/hello with ok: {hello}"),
+            Err(e) => panic!("the core did not answer core/hello: {e}"),
+        }
+        fixture
     }
 
     /// [`CoreFixture::start`] with another core executable, for example a copy of

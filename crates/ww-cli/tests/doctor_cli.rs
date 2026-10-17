@@ -302,7 +302,8 @@ fn doctor_sets_leftover_side_files_aside_only_after_yes() {
 #[test] // spec: CORE-004 (ruling Q26, M3)
 fn doctor_offers_nothing_while_a_core_runs() {
     let env = TestEnv::with_label("Ünïcödé space");
-    let _core = ww_testkit::CoreFixture::start(&env);
+    // Ready: the core has opened the live database before the journal is put beside it.
+    let _core = ww_testkit::CoreFixture::start_ready(&env);
     let db = env.env.suite_state_db();
     // A hot journal beside the live database: the doctor must not open it read-write, nor
     // move anything, while the core holds the files.

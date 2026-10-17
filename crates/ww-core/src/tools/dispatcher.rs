@@ -189,7 +189,9 @@ impl Dispatcher {
             };
         };
         let (name, inner, trace) = (p.name.clone(), self.inner.clone(), trace_id.clone());
-        let span = tracing::info_span!("tool_call", tool = %name, trace_id = %trace_id);
+        // ERROR level, so the span and its `trace_id` stay on every line even under a raised
+        // level filter.
+        let span = tracing::error_span!("tool_call", tool = %name, trace_id = %trace_id);
         // Its own task: a caller that goes away cannot cut the pipeline short. The call stays
         // in flight until the pipeline ends.
         let pipeline = tokio::spawn(
