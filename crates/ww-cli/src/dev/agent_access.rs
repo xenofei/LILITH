@@ -46,8 +46,14 @@ pub const LEGACY_AGENT_TOKEN_TARGET: &str = "Worldwright-dev/github/agent-token"
 pub const AGENT_TOKEN_USERNAME: &str = "x-access-token";
 /// The repository-local `credential.helper` entry `ww dev install-hooks` writes after the
 /// empty reset entry. Git appends the action (`get`, `store`, `erase`).
+///
+/// It runs the committed script `tools/git-hooks/credential-helper` of the worktree git runs
+/// in, and the script runs `dev git-credential` from whichever CLI crate that checkout has
+/// (`lil-cli` or `ww-cli`). Every worktree of a clone shares this entry, so it survives the
+/// crate rename. A worktree on a commit from before the script has no helper until it is
+/// rebased.
 pub const GIT_CREDENTIAL_HELPER: &str =
-    "!cargo run -q --locked -p ww-cli --bin ww -- dev git-credential";
+    r#"!sh "$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper""#;
 /// Fine-grained personal access tokens start with this.
 const FINE_GRAINED_PREFIX: &str = "github_pat_";
 /// The stored credential's comment: `expires=<YYYY-MM-DD or none>`.
@@ -1630,11 +1636,12 @@ mod tests {
         assert_eq!(c.get_args().collect::<Vec<_>>(), ["issue", "list"]);
     }
 
+    /// `tests/credential_helper.rs` runs this same entry through git, from every worktree.
     #[test]
-    fn helper_entry_is_the_cargo_run_form_of_the_hooks() {
+    fn helper_entry_runs_the_committed_script() {
         assert_eq!(
             GIT_CREDENTIAL_HELPER,
-            "!cargo run -q --locked -p ww-cli --bin ww -- dev git-credential"
+            r#"!sh "$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper""#
         );
     }
 }
