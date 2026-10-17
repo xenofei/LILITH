@@ -1115,10 +1115,16 @@ async fn manifests_first_reconcile_judges_files_against_the_new_manifest() {
     // The candidate and its manifest change together. When the candidate is looked at, the
     // index already records the new manifest's hash for it.
     let seen = Arc::new(Mutex::new(None));
-    let (hook_index, hook_seen, target) = (index.clone(), seen.clone(), fx.file(&candidate));
+    // Weak: the index holds the probe, which holds this hook, so a strong reference would be a
+    // cycle that keeps index.db open after the test.
+    let (hook_index, hook_seen, target) =
+        (Arc::downgrade(&index), seen.clone(), fx.file(&candidate));
     let handle = tokio::runtime::Handle::current();
     let installed = probe.hook.set(Box::new(move |path: &Path| {
         if path == target {
+            let Some(hook_index) = hook_index.upgrade() else {
+                return;
+            };
             let recorded = handle
                 .block_on(hook_index.recorded_hash(&WsPath::parse(&candidate).unwrap()))
                 .unwrap();
@@ -1897,12 +1903,17 @@ async fn store_changes_during_a_cold_rebuild_are_kept() {
     // While the next rebuild looks at b.txt (it has already looked at a.txt), the store
     // writes a file and a manifest, and moves a.txt away.
     let fired = Arc::new(AtomicBool::new(false));
-    let (hook_index, root) = (index.clone(), fx.root.clone());
+    // Weak: the index holds the probe, which holds this hook, so a strong reference would be a
+    // cycle that keeps index.db open after the test.
+    let (hook_index, root) = (Arc::downgrade(&index), fx.root.clone());
     let handle = tokio::runtime::Handle::current();
     let installed = probe.hook.set(Box::new(move |path: &Path| {
         if name_of(path) != "b.txt" || fired.swap(true, Ordering::SeqCst) {
             return;
         }
+        let Some(hook_index) = hook_index.upgrade() else {
+            return;
+        };
         let new = native(&root, "notes/new.txt");
         write_file(&new, b"from the store");
         let manifest = native(&root, "projects/p/assets/m/m.manifest.json");
