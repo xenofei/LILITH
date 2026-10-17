@@ -34,8 +34,8 @@ use ww_platform::{Clock, IdSource};
 use ww_protocol::ErrorBody;
 use ww_protocol::codes::{
     MANIFEST_NEEDS_REPAIR, STATUS_INVALID_TRANSITION, STORE_BUSY, STORE_DISK_FULL, STORE_GIT_BUSY,
-    STORE_HASH_CONFLICT, STORE_IO, STORE_LOCKED, STORE_PATH_INVALID, VERSION_EXISTS,
-    WORKSPACE_READ_ONLY, YAML_UNSUPPORTED_EDIT,
+    STORE_HASH_CONFLICT, STORE_IO, STORE_LOCKED, STORE_PATH_INVALID, TRASH_RESTORE_CONFLICT,
+    TRASH_UNKNOWN, VERSION_EXISTS, WORKSPACE_READ_ONLY, YAML_UNSUPPORTED_EDIT,
 };
 use ww_schema::{EditError, Manifest, YamlEdit, YamlEditError, sha256_hex};
 
@@ -111,6 +111,10 @@ pub enum StoreError {
     VersionExists(String),
     /// A status change the status machine refuses (CORE-048), with why.
     InvalidTransition(String),
+    /// No trash entry has this `entry_id`.
+    TrashUnknown(String),
+    /// A trash entry's original path is taken, so it was not restored.
+    RestoreConflict(WsPath),
 }
 
 impl StoreError {
@@ -157,7 +161,7 @@ impl StoreError {
         }
     }
 
-    fn cloud_only(path: &WsPath) -> StoreError {
+    pub(super) fn cloud_only(path: &WsPath) -> StoreError {
         StoreError::HashConflict {
             path: path.clone(),
             backup: None,
@@ -170,7 +174,8 @@ impl StoreError {
     /// workspace-relative path, when a put-back couldn't finish), `store.busy`,
     /// `store.path_invalid`, `store.disk_full`, `store.io`, `store.locked`, `store.git_busy`,
     /// `workspace.read_only`, `manifest.needs_repair`, `yaml.unsupported_edit`,
-    /// `version.exists` and `status.invalid_transition`.
+    /// `version.exists`, `status.invalid_transition`, `trash.unknown` (with `data.entry_id`)
+    /// and `trash.restore_conflict` (with `data.path`, the occupied original path).
     pub fn to_error(&self, trace_id: &str) -> ErrorBody {
         let (spec, data) = match self {
             StoreError::HashConflict {
@@ -207,6 +212,11 @@ impl StoreError {
             StoreError::YamlUnsupported(_) => (&YAML_UNSUPPORTED_EDIT, None),
             StoreError::VersionExists(v) => (&VERSION_EXISTS, Some(json!({ "version": v }))),
             StoreError::InvalidTransition(_) => (&STATUS_INVALID_TRANSITION, None),
+            StoreError::TrashUnknown(id) => (&TRASH_UNKNOWN, Some(json!({ "entry_id": id }))),
+            StoreError::RestoreConflict(path) => (
+                &TRASH_RESTORE_CONFLICT,
+                Some(json!({ "path": path.as_str() })),
+            ),
         };
         let mut body = ErrorBody::new(spec, self.to_string(), trace_id);
         body.data = data;
@@ -271,6 +281,15 @@ impl std::fmt::Display for StoreError {
             StoreError::YamlUnsupported(why) => write!(f, "this YAML edit isn't supported: {why}"),
             StoreError::VersionExists(v) => write!(f, "version {v} already exists"),
             StoreError::InvalidTransition(why) => f.write_str(why),
+            StoreError::TrashUnknown(id) => write!(
+                f,
+                "there is no trash entry `{id}`; trash.list lists the entries there are"
+            ),
+            StoreError::RestoreConflict(path) => write!(
+                f,
+                "`{path}` is taken, so the trash entry was not restored; move or rename what is \
+                 there first, then restore it again"
+            ),
         }
     }
 }
@@ -464,6 +483,13 @@ pub(super) fn remove_if_hash(path: &Path, sha256: &str) -> io::Result<bool> {
     fsops::remove_if(path, &|file| Ok(hash_reader(file)?.sha256 == sha256))
 }
 
+/// Removes a temp file the caller wrote itself (`.<name>.ww-tmp-<pid>-<n>`, the core's own
+/// bytes, never content anyone else has). Shared by `suite.toml` writes, so the hard deletes
+/// stay where CORE-110 allows them.
+pub(super) fn remove_temp(path: &Path) -> io::Result<()> {
+    fsops::remove_file(path)
+}
+
 /// Moves `from` aside to a free `<dir>\<name>.ww-conflict-<stamp>` (a `-<k>` suffix when that
 /// name is taken) with `move_new`, and returns the new path. Shared by the store and
 /// `suite.toml` writes.
@@ -529,7 +555,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 
 /// The `store.path_invalid` of a link at `rel`.
-fn link_refused(rel: &WsPath) -> StoreError {
+pub(super) fn link_refused(rel: &WsPath) -> StoreError {
     StoreError::PathInvalid {
         path: rel.as_str().to_string(),
         why: "it is a symbolic link or junction; the suite never reads or writes through a \
@@ -568,7 +594,7 @@ fn see<T>(probe: &dyn Probe, path: &Path, read: fn(File) -> io::Result<T>) -> io
 }
 
 /// Whether a path exists, by its attributes (no handle, so a held file still counts).
-fn exists(path: &Path) -> bool {
+pub(super) fn exists(path: &Path) -> bool {
     ww_platform::fs::attributes(path).is_ok()
 }
 
@@ -750,12 +776,12 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-type PathLock = tokio::sync::Mutex<()>;
+pub(super) type PathLock = tokio::sync::Mutex<()>;
 
 /// An edit: the current bytes (`None`: no file) → the new bytes and a value for the caller.
 type EditFn<'a, T> = dyn Fn(Option<&[u8]>) -> Result<(Vec<u8>, T), StoreError> + Send + Sync + 'a;
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -797,6 +823,9 @@ pub struct Store {
     machine: String,
     /// The staging handles this store issued and hasn't released: never swept or listed.
     pub(super) live_handles: Mutex<HashSet<String>>,
+    /// One async lock per asset (`<project>/<asset_id>`, case-folded), held from a sign-off's
+    /// seal to the end of its Record stage ([`Store::version_lock`]).
+    pub(super) version_locks: Mutex<HashMap<String, Weak<PathLock>>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -832,6 +861,7 @@ impl Store {
             access: Access::ReadWrite,
             machine: "unknown".to_string(),
             live_handles: Mutex::new(HashSet::new()),
+            version_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -908,7 +938,8 @@ impl Store {
         }
     }
 
-    pub(super) fn now_utc(&self) -> i64 {
+    /// The store clock's UTC time, in Unix seconds.
+    pub(crate) fn now_utc(&self) -> i64 {
         self.clock
             .utc_now()
             .duration_since(UNIX_EPOCH)
@@ -1321,6 +1352,7 @@ impl Store {
     ) -> Result<(T, Written, Option<ChangeKind>), StoreError> {
         self.writable_store()?;
         writable(rel)?;
+        self.check_locks(rel).await?;
         let mut attempt = 0;
         loop {
             let current = self.read_for_edit(rel).await?;
@@ -1420,6 +1452,51 @@ impl Store {
         }
     }
 
+    /// CORE-035: `store.locked` for a path under an asset folder,
+    /// `projects/<p>/assets/<a>/<rest>`, whose manifest lists `<rest>` (or a folder above it)
+    /// in `locks`. Entries are relative to the asset folder (I5) and compare without regard to
+    /// case. The manifest itself is never locked by its own list, an asset without a manifest
+    /// locks nothing, and one whose manifest doesn't parse is logged and locks nothing; a
+    /// manifest that can't be read refuses the write with that read's error (fail closed).
+    pub(super) async fn check_locks(&self, rel: &WsPath) -> Result<(), StoreError> {
+        let parts: Vec<&str> = rel.as_str().split('/').collect();
+        if parts.len() < 5
+            || !parts[0].eq_ignore_ascii_case("projects")
+            || !parts[2].eq_ignore_ascii_case("assets")
+        {
+            return Ok(());
+        }
+        let asset_id = parts[3];
+        let inside = super::paths::path_key(&parts[4..].join("/"));
+        if inside == super::paths::path_key(&format!("{asset_id}.manifest.json")) {
+            return Ok(());
+        }
+        let manifest = WsPath::from_disk(format!(
+            "{}/{}/{}/{asset_id}/{asset_id}.manifest.json",
+            parts[0], parts[1], parts[2]
+        ));
+        let Some(bytes) = self.read(&manifest).await? else {
+            return Ok(());
+        };
+        let Some((m, _)) = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|t| Manifest::parse(t).ok())
+        else {
+            tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
+            return Ok(());
+        };
+        let locked = m.view().locks.iter().any(|entry| {
+            let entry = super::paths::path_key(entry.trim_end_matches('/'));
+            !entry.is_empty()
+                && (inside == entry
+                    || (inside.starts_with(&entry) && inside[entry.len()..].starts_with('/')))
+        });
+        if locked {
+            return Err(StoreError::Locked(rel.clone()));
+        }
+        Ok(())
+    }
+
     /// What step 3 accepts for `expect`.
     async fn want(&self, rel: &WsPath, expect: &Expect) -> Result<Want, StoreError> {
         Ok(match expect {
@@ -1474,6 +1551,7 @@ impl Store {
         self.writable_store()?;
         // Step 1.
         writable(rel)?;
+        self.check_locks(rel).await?;
         self.writable_on_disk(rel).await?;
         let name = rel.file_name().to_string();
         if name.encode_utf16().count() + NAME_SUFFIX_UNITS > NAME_UNITS_MAX {

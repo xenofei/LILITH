@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::{OnceCell, watch};
@@ -353,7 +354,8 @@ impl WorkspaceHub {
     /// 2. `<ws>\.worldwright\` and its `core.lock`: taken → [`Access::ReadWrite`], held by
     ///    another core → [`Access::ReadOnly`];
     /// 3. the workspace `state.db` for that access;
-    /// 4. the store, and its `recover()` (read-write only);
+    /// 4. the store, its `recover()` and its `maintenance()` (read-write only; maintenance then
+    ///    runs every [`MAINTENANCE_PERIOD`] while the workspace stays open);
     /// 5. `orphans()`, published once on the `workspace` topic as
     ///    `{kind: "orphans", paths}` when there are any.
     ///
@@ -456,6 +458,7 @@ impl WorkspaceHub {
                     tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace recovery stopped; it runs again at the next open")
                 }
             }
+            run_maintenance(&store, &ws.path).await;
         }
         // 5.
         let orphans = store.orphans().await.unwrap_or_else(|e| {
@@ -473,7 +476,7 @@ impl WorkspaceHub {
             orphans = orphans.len(),
             "workspace open"
         );
-        Ok(Arc::new(OpenWorkspace {
+        let open = Arc::new(OpenWorkspace {
             ws: ws.clone(),
             access,
             state,
@@ -483,7 +486,11 @@ impl WorkspaceHub {
             states: self.states.clone(),
             shut: AtomicBool::new(false),
             gone: watch::Sender::new(()),
-        }))
+        });
+        if access == Access::ReadWrite {
+            spawn_daily_maintenance(&open);
+        }
+        Ok(open)
     }
 
     /// Lets go of the workspace `id` if it is open. Unless a call still holds it, it is closed
@@ -545,6 +552,46 @@ impl WorkspaceHub {
             }
         }
     }
+}
+
+/// How often a read-write workspace runs [`Store::maintenance`] while it is open, after the
+/// run at open (ARCH-058, CORE-032, CORE-037).
+pub const MAINTENANCE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One [`Store::maintenance`] run at the store clock's time; a failure is logged, and the next
+/// run tries again.
+async fn run_maintenance(store: &Store, path: &Path) {
+    match store.maintenance(store.now_utc()).await {
+        Ok(report) => {
+            if !report.purged.is_empty() || !report.runs_trashed.is_empty() {
+                tracing::info!(workspace = %path.display(), ?report, "workspace maintenance");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %path.display(), error = %e, "the workspace maintenance stopped; it runs again later");
+        }
+    }
+}
+
+/// Runs maintenance on `open` every [`MAINTENANCE_PERIOD`] (on tokio's clock) for as long as
+/// it is open. The task holds the workspace only while a run lasts, so a close is never held
+/// up for longer than one run; a workspace the hub has closed ends the task.
+fn spawn_daily_maintenance(open: &Arc<OpenWorkspace>) {
+    let weak = Arc::downgrade(open);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MAINTENANCE_PERIOD).await;
+            let Some(open) = weak.upgrade() else {
+                break;
+            };
+            if open.shut.load(Ordering::SeqCst) {
+                break;
+            }
+            run_maintenance(&open.store, &open.ws.path).await;
+            // The last reference closes the workspace, a blocking call: off the async threads.
+            let _ = tokio::task::spawn_blocking(move || drop(open)).await;
+        }
+    });
 }
 
 /// The default workspace of `env`'s `suite.toml`, resolved; `None` for no file, a file that

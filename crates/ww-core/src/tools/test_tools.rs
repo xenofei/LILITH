@@ -12,8 +12,9 @@
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
 //! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
+//! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //!
-//! `test.store_write` and `test.ingest_run` work in the session's workspace
+//! `test.store_write`, `test.ingest_run` and `test.trash` work in the session's workspace
 //! (`workspace.required` without one). `test.ingest_run` does what an engine and the core do
 //! for a candidate run: it writes the files into a staging handle with `fsops::write_temp`,
 //! takes a run id from `Store::next_run_id`, and commits one candidate run in the ARCH-075
@@ -192,6 +193,18 @@ struct IngestResult {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct TrashArgs {
+    /// Workspace-relative, `/` separators: a file or a folder.
+    path: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TrashResult {
+    entry_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NoArgs {}
 
 /// What a tool that never returns normally would have returned.
@@ -246,6 +259,21 @@ async fn store_write(
     Ok((
         StoreWriteResult {
             sha256: written.sha256,
+        },
+        summary,
+    ))
+}
+
+/// `test.trash`'s body: `Store::trash` with the reason `test.trash`.
+async fn trash(ctx: &CallCtx, args: TrashArgs) -> Result<(TrashResult, String), ErrorBody> {
+    let store = &ctx.workspace()?.store;
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let rel = WsPath::parse(&args.path).map_err(error)?;
+    let record = store.trash(&rel, "test.trash").await.map_err(error)?;
+    let summary = format!("moved {rel} to the trash as {}", record.entry_id);
+    Ok((
+        TrashResult {
+            entry_id: record.entry_id,
         },
         summary,
     ))
@@ -542,6 +570,14 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         EffectClass::Write,
         TEST_MODULE,
         |ctx, args: IngestArgs| Box::pin(ingest_run(ctx, args)),
+    ));
+
+    reg.register(typed_tool(
+        "test.trash",
+        "Test channels only: moves `path` (a file or folder in the session's workspace) to the workspace trash through the store.",
+        EffectClass::Write,
+        TEST_MODULE,
+        |ctx, args: TrashArgs| Box::pin(trash(ctx, args)),
     ));
 
     reg.register(typed_tool(

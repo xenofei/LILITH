@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod registry;
 pub mod stages;
 pub mod test_tools;
+pub mod trash_tools;
 pub mod workspace_tools;
 
 #[cfg(test)]
@@ -20,6 +21,7 @@ pub use stages::{
     ReserveStage, Settings, SettingsStage,
 };
 pub use test_tools::{TEST_MODULE, TestGates, register_test_tools};
+pub use trash_tools::register_trash_tools;
 pub use workspace_tools::{WORKSPACE_MODULE, register_workspace_tools};
 
 use ww_platform::Env;
@@ -40,6 +42,7 @@ pub fn core_registry(
 ) -> Registry {
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub.clone(), env.clone(), probe.clone());
+    register_trash_tools(&mut reg);
     if test_tools {
         register_test_tools(&mut reg, gates.clone(), states.clone());
     }

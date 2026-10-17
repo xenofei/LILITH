@@ -8,7 +8,6 @@ tests = [
     { name = "ww-spec-tests::versions_trash::signoff_uses_the_confirmed_bump", rule = "CORE-027", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::versions_trash::sealed_ref_carries_the_content_hash", rule = "ARCH-042", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::versions_trash::link_external_asset_cannot_be_signed_off_until_collected", rule = "CORE-029", file = "tests/versions_trash.rs" },
-    { name = "ww-spec-tests::versions_trash::trash_keeps_restore_record_and_restores", rule = "ARCH-058", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::index_watch::damaged_index_is_rebuilt", rule = "ARCH-089", file = "tests/index_watch.rs" },
     { name = "ww-spec-tests::index_watch::outside_edit_to_sealed_file_is_a_human_edit", rule = "CORE-034", file = "tests/index_watch.rs" },
     { name = "ww-spec-tests::index_watch::invalid_manifest_is_marked_needs_repair_and_kept", rule = "ARCH-079", file = "tests/index_watch.rs" },

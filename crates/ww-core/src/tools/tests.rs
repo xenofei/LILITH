@@ -730,6 +730,7 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.panic",
             "test.state_panic",
             "test.store_write",
+            "test.trash",
             "test.write"
         ]
     );

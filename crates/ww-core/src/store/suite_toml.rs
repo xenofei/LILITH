@@ -41,7 +41,7 @@ use ww_schema::{sha256_hex, suite_edit};
 use super::failpoints::FailPoints;
 use super::fsops;
 use super::paths::WsPath;
-use super::write::{Backoff, StoreError, remove_if_hash, set_aside};
+use super::write::{Backoff, StoreError, remove_if_hash, remove_temp, set_aside};
 
 /// The name `suite.toml` errors carry as their path.
 const LABEL: &str = "suite.toml";
@@ -240,7 +240,7 @@ async fn swap_once(
         fsops::write_temp(dir, &format!(".{name}.ww-tmp-{pid}-{n}"), bytes, fp).map_err(before)?;
     let placed = place(file, &temp, &names, expected, &sha256_hex(bytes), fp).await;
     if temp.exists() {
-        let _ = fsops::remove_file(&temp);
+        let _ = remove_temp(&temp);
     }
     placed
 }

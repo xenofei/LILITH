@@ -72,15 +72,15 @@ pub struct CommitReport {
 }
 
 /// A folder entry: its name, whether it is a folder (not a link), and the path.
-struct Listed {
-    name: String,
-    folder: bool,
-    path: PathBuf,
+pub(super) struct Listed {
+    pub(super) name: String,
+    pub(super) folder: bool,
+    pub(super) path: PathBuf,
 }
 
 /// The entries of `dir` (none when it doesn't exist). Links are listed as non-folders, so
 /// nothing is ever followed through one.
-fn list(dir: &Path) -> io::Result<Vec<Listed>> {
+pub(super) fn list(dir: &Path) -> io::Result<Vec<Listed>> {
     let entries = match std::fs::read_dir(ww_platform::fs::long_path(dir)) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -101,7 +101,7 @@ fn list(dir: &Path) -> io::Result<Vec<Listed>> {
 }
 
 /// `v<major.minor.patch>` (the `v` in either case) → the version.
-fn version_folder(name: &str) -> Option<Version> {
+pub(super) fn version_folder(name: &str) -> Option<Version> {
     name.strip_prefix(['v', 'V'])?.parse().ok()
 }
 
