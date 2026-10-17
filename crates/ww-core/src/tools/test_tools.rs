@@ -10,6 +10,16 @@
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
 //! | `test.destructive` | destructive | `{}` | `{executed: true}` |
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
+//! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
+//! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
+//!
+//! `test.store_write` and `test.ingest_run` work in the session's workspace
+//! (`workspace.required` without one). `test.ingest_run` does what an engine and the core do
+//! for a candidate run: it writes the files into a staging handle with `fsops::write_temp`,
+//! takes a run id from `Store::next_run_id`, and commits one candidate run in the ARCH-075
+//! order (a new manifest if there is none, status by `transition(…, CandidateRun)`, each run
+//! file with its `sha256`, and a jobs log line when `job_line` is true). An omitted `project`
+//! is `sketchbook` (Task 12 replaces that with its resolver).
 //!
 //! `pad` exists for the line-cap tests (ARCH-025): a result too large to send.
 //!
@@ -19,14 +29,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::UNIX_EPOCH;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::watch;
 use ww_protocol::{EffectClass, ErrorBody, codes, is_valid_topic};
+use ww_schema::{Manifest, Status, StatusEvent, is_asset_id, is_slug, sha256_hex, transition};
 
-use super::registry::{Registry, typed_tool};
+use super::registry::{CallCtx, Registry, typed_tool};
 use crate::state::StateRegistry;
+use crate::store::{CommitOp, Expect, ManifestEdit, OutputMove, StoreError, WsPath, fsops};
 
 /// The module every test tool declares.
 pub const TEST_MODULE: &str = "test";
@@ -137,6 +151,47 @@ struct EmitResult {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct StoreWriteArgs {
+    /// Workspace-relative, `/` separators.
+    path: String,
+    text: String,
+    /// `new`, `generated` or a SHA-256 (64 lowercase hex).
+    expect: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct StoreWriteResult {
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct IngestFile {
+    name: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct IngestArgs {
+    #[serde(default)]
+    project: Option<String>,
+    asset_id: String,
+    files: Vec<IngestFile>,
+    job_line: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct IngestResult {
+    run_id: String,
+    /// The staging handle's folder (removed once the run is committed).
+    staging_dir: String,
+    /// The run's files, workspace-relative.
+    files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NoArgs {}
 
 /// What a tool that never returns normally would have returned.
@@ -156,6 +211,216 @@ struct DestructiveResult {
 /// `test.panic`'s body.
 fn boom() -> Result<(Nothing, String), ErrorBody> {
     panic!("test.panic was called")
+}
+
+fn params_invalid(ctx: &CallCtx, message: String) -> ErrorBody {
+    ErrorBody::new(&codes::PARAMS_INVALID, message, ctx.trace_id.clone())
+}
+
+/// `test.store_write`'s body.
+async fn store_write(
+    ctx: &CallCtx,
+    args: StoreWriteArgs,
+) -> Result<(StoreWriteResult, String), ErrorBody> {
+    let store = &ctx.workspace()?.store;
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let rel = WsPath::parse(&args.path).map_err(error)?;
+    let expect = match args.expect.as_str() {
+        "new" => Expect::New,
+        "generated" => Expect::Generated,
+        hex if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => {
+            Expect::Hash(hex.to_string())
+        }
+        other => {
+            return Err(params_invalid(
+                ctx,
+                format!("expect must be new, generated or a SHA-256, not {other:?}"),
+            ));
+        }
+    };
+    let written = store
+        .write(&rel, args.text.into_bytes(), expect)
+        .await
+        .map_err(error)?;
+    let summary = format!("wrote {rel}");
+    Ok((
+        StoreWriteResult {
+            sha256: written.sha256,
+        },
+        summary,
+    ))
+}
+
+/// `test.ingest_run`'s body (module docs).
+async fn ingest_run(ctx: &CallCtx, args: IngestArgs) -> Result<(IngestResult, String), ErrorBody> {
+    let store = ctx.workspace()?.store.clone();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let project = args.project.unwrap_or_else(|| "sketchbook".to_string());
+    if !is_slug(&project) {
+        return Err(params_invalid(
+            ctx,
+            format!("{project:?} is not a project slug"),
+        ));
+    }
+    if !is_asset_id(&args.asset_id) {
+        return Err(params_invalid(
+            ctx,
+            format!("{:?} is not an asset id", args.asset_id),
+        ));
+    }
+    if args.files.is_empty() {
+        return Err(params_invalid(
+            ctx,
+            "a run needs at least one file".to_string(),
+        ));
+    }
+    let asset_id = args.asset_id;
+    let asset_dir =
+        WsPath::parse(&format!("projects/{project}/assets/{asset_id}")).map_err(error)?;
+    let manifest_rel = asset_dir
+        .join(&format!("{asset_id}.manifest.json"))
+        .map_err(error)?;
+    let current = match store.read(&manifest_rel).await.map_err(error)? {
+        None => None,
+        Some(bytes) => std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|t| Manifest::parse(t).ok())
+            .map(|(m, _)| m),
+    };
+    let now = store
+        .clock()
+        .utc_now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let run_id = store
+        .next_run_id(&asset_dir, current.as_ref(), now)
+        .await
+        .map_err(error)?;
+
+    // Every name is checked before anything is written.
+    let mut planned = Vec::with_capacity(args.files.len());
+    let mut run_files = Vec::with_capacity(args.files.len());
+    for file in args.files {
+        if file.name.contains('/') || WsPath::parse(&file.name).is_err() {
+            return Err(params_invalid(
+                ctx,
+                format!("{:?} is not a file name", file.name),
+            ));
+        }
+        let to = asset_dir
+            .join(&format!("candidates/{run_id}/{}", file.name))
+            .map_err(error)?;
+        let bytes = file.text.into_bytes();
+        run_files.push(json!({
+            "path": format!("candidates/{run_id}/{}", file.name),
+            "role": "candidate",
+            "sha256": sha256_hex(&bytes),
+        }));
+        planned.push((file.name, bytes, to));
+    }
+
+    let ids = store.ids().clone();
+    let (edit_project, edit_asset, edit_run) = (project.clone(), asset_id.clone(), run_id.clone());
+    let (edit_rel, created) = (manifest_rel.clone(), ww_schema::time::rfc3339(now));
+    let manifest: ManifestEdit = Arc::new(move |m: &mut Manifest| {
+        if m.get("asset_id").is_none() {
+            *m = Manifest::new(&edit_project, &edit_asset, "image", &ids.uuid());
+        }
+        let view = m.view();
+        let parse = |key: &str| {
+            m.get(key)
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<Status>().ok())
+        };
+        let from = view.status.unwrap_or(Status::Planned);
+        let moved = transition(
+            from,
+            parse("status_before_stale"),
+            parse("status_before_blocked"),
+            &StatusEvent::CandidateRun,
+        )
+        .map_err(StoreError::InvalidTransition)?;
+        let target = view
+            .version
+            .map_or_else(|| "1.0.0".to_string(), |v| v.to_string());
+        m.set("status", Value::from(moved.to.as_str()));
+        m.push(
+            "candidate_runs",
+            json!({
+                "run_id": edit_run,
+                "path": format!("candidates/{edit_run}/"),
+                "status": "open",
+                "created": created,
+                "target_version": target,
+                "files": run_files,
+                "pinned": false,
+            }),
+        )
+        .map_err(|e| StoreError::manifest_edit(&edit_rel, &e))
+    });
+    let job_line = args.job_line.then(|| {
+        let mut record = serde_json::Map::new();
+        record.insert("job_id".into(), Value::from(store.ids().id("j")));
+        record.insert("kind".into(), Value::from("ingest"));
+        record.insert("project".into(), Value::from(project.as_str()));
+        record.insert("asset_id".into(), Value::from(asset_id.as_str()));
+        record.insert("run_id".into(), Value::from(run_id.as_str()));
+        record
+    });
+
+    // As an engine would: the files go into a staging handle, flushed; then the commit.
+    let handle = store.staging_handle().await.map_err(error)?;
+    let committed = async {
+        let mut outputs = Vec::with_capacity(planned.len());
+        for (name, bytes, to) in planned {
+            let (dir, file, fp) = (handle.dir.clone(), name.clone(), store.failpoints().clone());
+            let staged =
+                tokio::task::spawn_blocking(move || fsops::write_temp(&dir, &file, &bytes, &fp))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(std::io::Error::other(format!("the write stopped: {e}")))
+                    })
+                    .map_err(|e| {
+                        ErrorBody::new(
+                            &codes::STORE_IO,
+                            format!("the staged file {name} can't be written: {e}"),
+                            ctx.trace_id.clone(),
+                        )
+                    })?;
+            outputs.push(OutputMove { from: staged, to });
+        }
+        store
+            .commit(CommitOp {
+                outputs,
+                moved: Vec::new(),
+                manifest: Some((manifest_rel, manifest)),
+                job_line,
+                progress: None,
+            })
+            .await
+            .map_err(error)
+    }
+    .await;
+    let staging_dir = handle.dir.display().to_string();
+    // Given back either way: an emptied handle goes, one that still holds files stays as an
+    // orphan.
+    let released = store.release_handle(handle).await;
+    let report = committed?;
+    released.map_err(error)?;
+    let files: Vec<String> = report
+        .outputs
+        .iter()
+        .map(|w| w.path.as_str().to_string())
+        .collect();
+    let summary = format!("ingested {} file(s) as {run_id}", files.len());
+    Ok((
+        IngestResult {
+            run_id,
+            staging_dir,
+            files,
+        },
+        summary,
+    ))
 }
 
 /// Registers the test-channel tools on `reg`. `test.block` waits on `gates`;
@@ -261,6 +526,22 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         |_ctx, _args: NoArgs| {
             Box::pin(async move { Ok((DestructiveResult { executed: true }, "executed".into())) })
         },
+    ));
+
+    reg.register(typed_tool(
+        "test.store_write",
+        "Test channels only: writes `text` to `path` in the session's workspace through the store, checked against `expect` (new, generated or a SHA-256).",
+        EffectClass::Write,
+        TEST_MODULE,
+        |ctx, args: StoreWriteArgs| Box::pin(store_write(ctx, args)),
+    ));
+
+    reg.register(typed_tool(
+        "test.ingest_run",
+        "Test channels only: writes `files` into a staging handle as an engine would, then commits them as one candidate run of the asset.",
+        EffectClass::Write,
+        TEST_MODULE,
+        |ctx, args: IngestArgs| Box::pin(ingest_run(ctx, args)),
     ));
 
     reg.register(typed_tool(

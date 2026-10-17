@@ -21,6 +21,7 @@ use ww_protocol::{
 use super::stages::Settings;
 use crate::events::EventBus;
 use crate::session::Session;
+use crate::workspace::OpenWorkspace;
 
 /// What a tool's `run` returns.
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, ErrorBody>> + Send + 'a>>;
@@ -33,6 +34,25 @@ pub struct CallCtx {
     pub settings: Settings,
     /// The core's event bus, for tools that publish (`test.emit`; plan 2b's store).
     pub events: Arc<EventBus>,
+    /// The session's workspace, opened by the Resolve stage; `None` for a session without one.
+    pub workspace: Option<Arc<OpenWorkspace>>,
+}
+
+impl CallCtx {
+    /// The session's open workspace.
+    ///
+    /// # Errors
+    /// `workspace.required` when the session has none (QA-005).
+    pub fn workspace(&self) -> Result<&Arc<OpenWorkspace>, ErrorBody> {
+        self.workspace.as_ref().ok_or_else(|| {
+            ErrorBody::new(
+                &codes::WORKSPACE_REQUIRED,
+                "This tool works in a workspace, and the session has none. Connect with a \
+                 workspace (`ww workspace use <path>` sets the default).",
+                self.trace_id.clone(),
+            )
+        })
+    }
 }
 
 /// One tool.

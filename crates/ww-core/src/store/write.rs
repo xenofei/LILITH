@@ -17,7 +17,7 @@
 //! middle of a put-back), the call stops there and keeps its pending row, as a crash would, and
 //! the next `recover()` resolves the files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read as _};
@@ -33,9 +33,9 @@ use ww_platform::fs::{FileIdentity, Probe, RetryClass, classify};
 use ww_platform::{Clock, IdSource};
 use ww_protocol::ErrorBody;
 use ww_protocol::codes::{
-    MANIFEST_NEEDS_REPAIR, STORE_BUSY, STORE_DISK_FULL, STORE_GIT_BUSY, STORE_HASH_CONFLICT,
-    STORE_IO, STORE_LOCKED, STORE_PATH_INVALID, VERSION_EXISTS, WORKSPACE_READ_ONLY,
-    YAML_UNSUPPORTED_EDIT,
+    MANIFEST_NEEDS_REPAIR, STATUS_INVALID_TRANSITION, STORE_BUSY, STORE_DISK_FULL, STORE_GIT_BUSY,
+    STORE_HASH_CONFLICT, STORE_IO, STORE_LOCKED, STORE_PATH_INVALID, VERSION_EXISTS,
+    WORKSPACE_READ_ONLY, YAML_UNSUPPORTED_EDIT,
 };
 use ww_schema::{EditError, Manifest, YamlEdit, YamlEditError, sha256_hex};
 
@@ -43,6 +43,7 @@ use super::failpoints::FailPoints;
 use super::fsops;
 use super::paths::{WsPath, writable};
 use crate::state::{Pending, StateDb, StateError};
+use crate::workspace::Access;
 
 /// The first pause of a retry.
 pub const RETRY_FIRST: Duration = Duration::from_millis(10);
@@ -108,6 +109,8 @@ pub enum StoreError {
     NeedsRepair(WsPath),
     YamlUnsupported(String),
     VersionExists(String),
+    /// A status change the status machine refuses (CORE-048), with why.
+    InvalidTransition(String),
 }
 
 impl StoreError {
@@ -118,7 +121,7 @@ impl StoreError {
         StoreError::NeedsRepair(rel.clone())
     }
 
-    fn io(path: &WsPath, e: &io::Error) -> StoreError {
+    pub(super) fn io(path: &WsPath, e: &io::Error) -> StoreError {
         match classify(e) {
             RetryClass::DiskFull => StoreError::DiskFull(path.clone()),
             RetryClass::SharingViolation => StoreError::Busy(path.clone()),
@@ -129,7 +132,7 @@ impl StoreError {
         }
     }
 
-    fn state(path: &WsPath, e: &StateError) -> StoreError {
+    pub(super) fn state(path: &WsPath, e: &StateError) -> StoreError {
         StoreError::Io {
             path: path.as_str().to_string(),
             why: format!("the workspace state database failed: {e}"),
@@ -166,8 +169,8 @@ impl StoreError {
     /// The Appendix D error: `store.hash_conflict` (with `data.backup`, the backup's
     /// workspace-relative path, when a put-back couldn't finish), `store.busy`,
     /// `store.path_invalid`, `store.disk_full`, `store.io`, `store.locked`, `store.git_busy`,
-    /// `workspace.read_only`, `manifest.needs_repair`, `yaml.unsupported_edit` and
-    /// `version.exists`.
+    /// `workspace.read_only`, `manifest.needs_repair`, `yaml.unsupported_edit`,
+    /// `version.exists` and `status.invalid_transition`.
     pub fn to_error(&self, trace_id: &str) -> ErrorBody {
         let (spec, data) = match self {
             StoreError::HashConflict {
@@ -203,6 +206,7 @@ impl StoreError {
             ),
             StoreError::YamlUnsupported(_) => (&YAML_UNSUPPORTED_EDIT, None),
             StoreError::VersionExists(v) => (&VERSION_EXISTS, Some(json!({ "version": v }))),
+            StoreError::InvalidTransition(_) => (&STATUS_INVALID_TRANSITION, None),
         };
         let mut body = ErrorBody::new(spec, self.to_string(), trace_id);
         body.data = data;
@@ -266,6 +270,7 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::YamlUnsupported(why) => write!(f, "this YAML edit isn't supported: {why}"),
             StoreError::VersionExists(v) => write!(f, "version {v} already exists"),
+            StoreError::InvalidTransition(why) => f.write_str(why),
         }
     }
 }
@@ -317,8 +322,8 @@ pub fn lfs_pointer_oid(bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// What recovery did (Appendix E "Write order" recovery rules for temps, backups and pending
-/// rows; Task 7 adds staging and orphans).
+/// What recovery did (Appendix E "Write order" recovery rules for temps, backups, pending
+/// rows and staging).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub temps_removed: Vec<WsPath>,
@@ -328,6 +333,10 @@ pub struct RecoveryReport {
     /// edit, or a backup nothing else accounts for).
     pub conflicts_kept: Vec<WsPath>,
     pub pending_resolved: Vec<WsPath>,
+    /// Empty staging handles of a dead core, removed.
+    pub staging_removed: Vec<WsPath>,
+    /// Non-empty staging handles and `seal-*` folders of a dead core: kept, and orphans.
+    pub staging_kept: Vec<WsPath>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -395,13 +404,13 @@ pub fn next_step(class: RetryClass, phase: Phase) -> Step {
 // ---------------------------------------------------------------------------------------------
 
 /// The retry pauses of one call: 10 ms doubling to 500 ms, 10 s in all, on tokio's clock.
-struct Backoff {
+pub(super) struct Backoff {
     start: tokio::time::Instant,
     next: Duration,
 }
 
 impl Backoff {
-    fn new() -> Backoff {
+    pub(super) fn new() -> Backoff {
         Backoff {
             start: tokio::time::Instant::now(),
             next: RETRY_FIRST,
@@ -409,7 +418,7 @@ impl Backoff {
     }
 
     /// Pauses before the next attempt; `false` once the budget is spent.
-    async fn wait(&mut self) -> bool {
+    pub(super) async fn wait(&mut self) -> bool {
         let spent = self.start.elapsed();
         if spent >= RETRY_BUDGET {
             return false;
@@ -422,8 +431,8 @@ impl Backoff {
 
 /// A file's SHA-256 and, for a small file, its LFS pointer `oid`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileHash {
-    sha256: String,
+pub(super) struct FileHash {
+    pub(super) sha256: String,
     lfs_oid: Option<String>,
 }
 
@@ -443,7 +452,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Hashes an open file in 64 KiB pieces, keeping the start for the LFS check.
-fn hash_file(file: File) -> io::Result<FileHash> {
+pub(super) fn hash_file(file: File) -> io::Result<FileHash> {
     hash_reader(file)
 }
 
@@ -476,7 +485,7 @@ fn read_all(mut file: File) -> io::Result<Vec<u8>> {
 }
 
 /// What is at a path, found with the attribute-only `identity` before any data is read.
-enum Seen<T> {
+pub(super) enum Seen<T> {
     Missing,
     /// A cloud-only placeholder: never read.
     Placeholder,
@@ -536,7 +545,7 @@ fn exists(path: &Path) -> bool {
 }
 
 /// Runs a blocking call on the blocking pool; a panic in it is an I/O error.
-async fn blocking<T, F>(f: F) -> io::Result<T>
+pub(super) async fn blocking<T, F>(f: F) -> io::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -754,6 +763,12 @@ pub struct Store {
     sink: Mutex<Option<Arc<dyn ChangeSink>>>,
     /// One async lock per path (case-folded), so writes to one file never interleave.
     paths: Mutex<HashMap<String, Weak<PathLock>>>,
+    /// [`Access::ReadOnly`]: another core holds `core.lock`; nothing is written or resolved.
+    access: Access,
+    /// The `<machine>` of the append logs (ARCH-081).
+    machine: String,
+    /// The staging handles this store issued and hasn't released: never swept or listed.
+    pub(super) live_handles: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -766,8 +781,9 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
-    /// A store over the workspace folder `root` and its `state.db`. `probe` gives the
-    /// placeholder check of step 3 and the identities after each write.
+    /// A read-write store over the workspace folder `root` and its `state.db`. `probe` gives
+    /// the placeholder check of step 3 and the identities after each write. Its log machine is
+    /// `unknown` until [`Store::with_machine`].
     pub fn new(
         root: PathBuf,
         state: Arc<StateDb>,
@@ -785,11 +801,60 @@ impl Store {
             probe,
             sink: Mutex::new(None),
             paths: Mutex::new(HashMap::new()),
+            access: Access::ReadWrite,
+            machine: "unknown".to_string(),
+            live_handles: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// This store with `access`: a [`Access::ReadOnly`] store refuses every write
+    /// (`workspace.read_only`) and never resolves what a stopped write left (ARCH-028).
+    #[must_use]
+    pub fn with_access(mut self, access: Access) -> Store {
+        self.access = access;
+        self
+    }
+
+    /// This store with `machine` as the `<machine>` of its append logs (`Env::machine_id`).
+    #[must_use]
+    pub fn with_machine(mut self, machine: &str) -> Store {
+        self.machine = machine.to_string();
+        self
+    }
+
+    pub fn access(&self) -> Access {
+        self.access
+    }
+
+    pub fn machine(&self) -> &str {
+        &self.machine
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The workspace `state.db`.
+    pub fn state(&self) -> &Arc<StateDb> {
+        &self.state
+    }
+
+    /// The fail points (an engine-like writer of staging files passes them to
+    /// `fsops::write_temp`).
+    pub fn failpoints(&self) -> &Arc<FailPoints> {
+        &self.fp
+    }
+
+    pub fn probe(&self) -> &Arc<dyn Probe> {
+        &self.probe
+    }
+
+    /// `workspace.read_only` on a read-only store.
+    pub(super) fn writable_store(&self) -> Result<(), StoreError> {
+        match self.access {
+            Access::ReadWrite => Ok(()),
+            Access::ReadOnly => Err(StoreError::ReadOnly),
+        }
     }
 
     pub fn ids(&self) -> &Arc<dyn IdSource> {
@@ -805,7 +870,7 @@ impl Store {
         *lock(&self.sink) = Some(sink);
     }
 
-    async fn emit(&self, events: Vec<StoreEvent>) {
+    pub(super) async fn emit(&self, events: Vec<StoreEvent>) {
         if events.is_empty() {
             return;
         }
@@ -815,7 +880,7 @@ impl Store {
         }
     }
 
-    fn now_utc(&self) -> i64 {
+    pub(super) fn now_utc(&self) -> i64 {
         self.clock
             .utc_now()
             .duration_since(UNIX_EPOCH)
@@ -823,7 +888,7 @@ impl Store {
     }
 
     /// The workspace-relative form of a path under the root.
-    fn rel_of(&self, path: &Path) -> WsPath {
+    pub(super) fn rel_of(&self, path: &Path) -> WsPath {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         let parts: Vec<String> = rel
             .components()
@@ -832,7 +897,7 @@ impl Store {
         WsPath::from_disk(parts.join("/"))
     }
 
-    async fn lock_path(&self, rel: &WsPath) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn lock_path(&self, rel: &WsPath) -> tokio::sync::OwnedMutexGuard<()> {
         let held = {
             let mut paths = lock(&self.paths);
             paths.retain(|_, w| w.strong_count() > 0);
@@ -851,7 +916,7 @@ impl Store {
 
     /// One blocking file call, after the fail point `point` (whose error stands for the
     /// call's).
-    async fn fs<T, F>(&self, point: Option<&'static str>, f: F) -> io::Result<T>
+    pub(super) async fn fs<T, F>(&self, point: Option<&'static str>, f: F) -> io::Result<T>
     where
         T: Send + 'static,
         F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -868,7 +933,7 @@ impl Store {
 
     /// A blocking file call retried on sharing violations under the budget. Past it the last
     /// error (a sharing violation) is returned.
-    async fn fs_retry<T, F>(&self, point: Option<&'static str>, f: F) -> io::Result<T>
+    pub(super) async fn fs_retry<T, F>(&self, point: Option<&'static str>, f: F) -> io::Result<T>
     where
         T: Send + 'static,
         F: Fn() -> io::Result<T> + Send + Sync + 'static,
@@ -885,7 +950,7 @@ impl Store {
     }
 
     /// What is at `path`, hashed, with sharing violations retried.
-    async fn see_hash(&self, path: &Path) -> io::Result<Seen<FileHash>> {
+    pub(super) async fn see_hash(&self, path: &Path) -> io::Result<Seen<FileHash>> {
         let (probe, path) = (self.probe.clone(), path.to_path_buf());
         self.fs_retry(None, move || see(probe.as_ref(), &path, hash_file))
             .await
@@ -1028,6 +1093,16 @@ impl Store {
         if pending.is_none() {
             return Ok(seen);
         }
+        if self.access == Access::ReadOnly {
+            // Only the core that holds `core.lock` moves files or clears rows: this one names
+            // the backup that holds the content.
+            return Err(self
+                .held_in_backup(
+                    rel,
+                    "another Worldwright core serves this workspace, and it puts it back",
+                )
+                .await);
+        }
         let _held = self.lock_path(rel).await;
         let pending = self
             .state
@@ -1037,25 +1112,31 @@ impl Store {
         if let Some(row) = pending
             && let Err(e) = self.resolve_row(&row, &mut RecoveryReport::default()).await
         {
-            let abs = rel.abs(&self.root);
-            let dir = abs.parent().unwrap_or(&self.root).to_path_buf();
-            let name = rel.file_name().to_string();
-            let backups = blocking(move || backups_of(&dir, &name))
-                .await
-                .unwrap_or_default();
-            let named = backups.first().map_or_else(
-                || "a backup beside it".to_string(),
-                |b| format!("`{}`", self.rel_of(b)),
-            );
-            return Err(StoreError::Io {
-                path: rel.as_str().to_string(),
-                why: format!(
-                    "a write stopped part-way and its content is in {named} until recovery puts \
-                     it back: {e}"
-                ),
-            });
+            return Err(self.held_in_backup(rel, &e.to_string()).await);
         }
         self.see_bytes(rel).await
+    }
+
+    /// `store.io` for a missing `rel` whose content a stopped write left in a backup, naming
+    /// the backup, with `why` it wasn't put back.
+    async fn held_in_backup(&self, rel: &WsPath, why: &str) -> StoreError {
+        let abs = rel.abs(&self.root);
+        let dir = abs.parent().unwrap_or(&self.root).to_path_buf();
+        let name = rel.file_name().to_string();
+        let backups = blocking(move || backups_of(&dir, &name))
+            .await
+            .unwrap_or_default();
+        let named = backups.first().map_or_else(
+            || "a backup beside it".to_string(),
+            |b| format!("`{}`", self.rel_of(b)),
+        );
+        StoreError::Io {
+            path: rel.as_str().to_string(),
+            why: format!(
+                "a write stopped part-way and its content is in {named} until recovery puts it \
+                 back: {why}"
+            ),
+        }
     }
 
     async fn see_bytes(&self, rel: &WsPath) -> Result<Seen<Vec<u8>>, StoreError> {
@@ -1224,6 +1305,7 @@ impl Store {
         rel: &WsPath,
         apply: &EditFn<'_, T>,
     ) -> Result<(T, Written, Option<ChangeKind>), StoreError> {
+        self.writable_store()?;
         writable(rel)?;
         let mut attempt = 0;
         loop {
@@ -1258,7 +1340,7 @@ impl Store {
         }
     }
 
-    async fn identity(&self, rel: &WsPath) -> Result<FileIdentity, StoreError> {
+    pub(super) async fn identity(&self, rel: &WsPath) -> Result<FileIdentity, StoreError> {
         let (probe, path) = (self.probe.clone(), rel.abs(&self.root));
         self.fs_retry(None, move || probe.identity(&path))
             .await
@@ -1269,7 +1351,7 @@ impl Store {
     /// through `probe.long_name`, so an 8.3 short name (`PROJEC~1`, or one set with
     /// `SetFileShortName`) never reaches a sealed folder or the ledger. A lookup that fails, or
     /// a long form that isn't under the workspace root, refuses the write (fail closed).
-    async fn writable_on_disk(&self, rel: &WsPath) -> Result<(), StoreError> {
+    pub(super) async fn writable_on_disk(&self, rel: &WsPath) -> Result<(), StoreError> {
         let refuse = |why: String| StoreError::PathInvalid {
             path: rel.as_str().to_string(),
             why,
@@ -1375,6 +1457,7 @@ impl Store {
         bytes: Vec<u8>,
         expect: Expect,
     ) -> Result<(Written, ChangeKind), StoreError> {
+        self.writable_store()?;
         // Step 1.
         writable(rel)?;
         self.writable_on_disk(rel).await?;
@@ -1897,8 +1980,13 @@ impl Store {
     ///   removed when it equals the target or the generated hash, and else moved aside to a
     ///   visible conflict copy, so an outside edit is never left only in a dot-file.
     ///
-    /// No content is deleted that isn't the core's own or a duplicate.
+    /// Then the staging handles are swept ([`Store::sweep_staging`]): under `core.lock` every
+    /// handle is a dead core's, so empty ones are removed and the rest are kept as orphans.
+    ///
+    /// No content is deleted that isn't the core's own or a duplicate. A read-only store
+    /// recovers nothing (`workspace.read_only`).
     pub async fn recover(&self) -> Result<RecoveryReport, StoreError> {
+        self.writable_store()?;
         let mut report = RecoveryReport::default();
         let root_rel = WsPath::from_disk(String::new());
         let root = self.root.clone();
@@ -1979,6 +2067,10 @@ impl Store {
             });
         }
         self.emit(events).await;
+
+        let (removed, kept) = self.sweep().await?;
+        report.staging_removed = removed;
+        report.staging_kept = kept;
         Ok(report)
     }
 
@@ -2136,7 +2228,7 @@ impl Store {
     }
 }
 
-fn event(written: &Written, kind: ChangeKind) -> StoreEvent {
+pub(super) fn event(written: &Written, kind: ChangeKind) -> StoreEvent {
     StoreEvent {
         path: written.path.clone(),
         kind,

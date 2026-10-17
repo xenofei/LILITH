@@ -18,13 +18,17 @@
 //! damaged file is never modified, and `ww-core` never deletes, renames or truncates a
 //! `state.db` (owner decision 5).
 //!
-//! **Stale rows.** On open, `running` idempotency rows (calls that died with an earlier core)
-//! are deleted. For the suite database that is safe: it is per channel, and only the core that
-//! owns the channel's pipe opens it (startup order: pipe, log, state). A workspace database on
-//! another volume than the local folder, `<vol>:\.worldwright-local\<hash>\state.db`, is not
-//! per channel: the cores of every channel that open that workspace share it (ARCH-097), so a
-//! core opening it can delete the `running` rows of a call another channel's core is still
-//! running. Plan 2b gates this, and read-write workspace access, on the ARCH-028 `core.lock`.
+//! **Stale rows.** On a read-write open, `running` idempotency rows (calls that died with an
+//! earlier core) are deleted. For the suite database that is safe: it is per channel, and only
+//! the core that owns the channel's pipe opens it (startup order: pipe, log, state). A
+//! workspace database on another volume than the local folder,
+//! `<vol>:\.worldwright-local\<hash>\state.db`, is not per channel: the cores of every channel
+//! that open that workspace share it (ARCH-097). So a workspace database is opened read-write
+//! (and its rows released) only by the core that holds the workspace's ARCH-028 `core.lock`
+//! ([`Access::ReadWrite`]); every other core opens it [`Access::ReadOnly`]: a read-only
+//! connection that never migrates the file or releases a row. When there is no `state.db` on
+//! disk yet (another channel's local folder), a read-only open gets an in-memory database with
+//! the migrations applied, and nothing is created on disk.
 //! `done` rows older than 30 days are pruned by `idem_begin`, against the caller's `now`: the
 //! same clock that stamped the rows.
 //!
@@ -52,13 +56,16 @@ use ww_platform::Env;
 
 use crate::store::fsops;
 use crate::store::paths::path_key;
-use crate::workspace::WorkspaceRef;
+use crate::workspace::{Access, WorkspaceRef};
 
 /// Called once when a database actor dies, with `"state"`.
 pub type OnFatal = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The jobs that may wait for one database actor; a caller past it awaits room.
 pub const STATE_QUEUE: usize = 1024;
+
+/// The [`StateDb::path`] of an in-memory database.
+pub const IN_MEMORY: &str = ":memory:";
 
 /// `PRAGMA busy_timeout`.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -175,6 +182,8 @@ pub struct StateDiagnostics {
     pub synchronous: i64,
     pub busy_timeout_ms: i64,
     pub user_version: i64,
+    /// The connection can't write (`sqlite3_db_readonly`): a read-only workspace open.
+    pub read_only: bool,
 }
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -228,19 +237,105 @@ impl StateDb {
             check_existing(path, known)?;
         }
         let mut conn = open_read_write(path)?;
-        let schema_version = migrate(&mut conn, migrations).map_err(|e| match e {
-            Migrate::State(e) => e,
-            Migrate::Sql(e) => sql_error(&e),
-        })?;
+        let schema_version = migrate(&mut conn, migrations).map_err(Migrate::into_state)?;
         release_running(&mut conn).map_err(|e| sql_error(&e))?;
+        StateDb::start(
+            conn,
+            path.to_path_buf(),
+            schema_version,
+            thread_name,
+            on_fatal,
+        )
+    }
 
+    /// Opens the database at `path` for a core that doesn't hold the workspace's `core.lock`
+    /// (ARCH-028): an existing file is checked as [`StateDb::open`] checks it, then opened with
+    /// a read-only connection. It is never migrated and no row is released. With no file (or
+    /// one at an older schema, which only the lock holder may migrate) an in-memory database
+    /// with the migrations applied stands in, and nothing is created on disk.
+    ///
+    /// # Errors
+    /// [`StateError::TooNew`], [`StateError::Corrupt`] or [`StateError::Io`], as for
+    /// [`StateDb::open`].
+    pub fn open_read_only(
+        path: &Path,
+        scope: StateScope,
+        on_fatal: OnFatal,
+    ) -> Result<StateDb, StateError> {
+        StateDb::open_read_only_named(path, scope, scope.thread_name().to_string(), on_fatal)
+    }
+
+    fn open_read_only_named(
+        path: &Path,
+        scope: StateScope,
+        thread_name: String,
+        on_fatal: OnFatal,
+    ) -> Result<StateDb, StateError> {
+        let migrations = scope.migrations();
+        let known = i64::try_from(migrations.len()).expect("a handful of migrations");
+        let exists = path
+            .try_exists()
+            .map_err(|e| StateError::Io(format!("cannot look at {}: {e}", path.display())))?;
+        if !exists {
+            tracing::info!(path = %path.display(), "no state.db for a read-only workspace; an in-memory one stands in");
+            return StateDb::open_in_memory(scope, thread_name, on_fatal);
+        }
+        check_existing(path, known)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| sql_error(&e))?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| sql_error(&e))?;
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(|e| sql_error(&e))?;
+        if version < known {
+            tracing::info!(
+                path = %path.display(),
+                version,
+                known,
+                "a read-only core can't migrate this state.db; an in-memory one stands in"
+            );
+            drop(conn);
+            return StateDb::open_in_memory(scope, thread_name, on_fatal);
+        }
+        StateDb::start(conn, path.to_path_buf(), version, thread_name, on_fatal)
+    }
+
+    /// An in-memory database with `scope`'s migrations applied; its [`StateDb::path`] is
+    /// [`IN_MEMORY`].
+    fn open_in_memory(
+        scope: StateScope,
+        thread_name: String,
+        on_fatal: OnFatal,
+    ) -> Result<StateDb, StateError> {
+        let mut conn = Connection::open_in_memory().map_err(|e| sql_error(&e))?;
+        let schema_version = migrate(&mut conn, scope.migrations()).map_err(Migrate::into_state)?;
+        StateDb::start(
+            conn,
+            PathBuf::from(IN_MEMORY),
+            schema_version,
+            thread_name,
+            on_fatal,
+        )
+    }
+
+    /// Starts the actor that owns `conn`.
+    fn start(
+        conn: Connection,
+        path: PathBuf,
+        schema_version: i64,
+        thread_name: String,
+        on_fatal: OnFatal,
+    ) -> Result<StateDb, StateError> {
         let (jobs, mut inbox) = mpsc::channel::<Job>(STATE_QUEUE);
         let actor = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run_actor(conn, &mut inbox, &on_fatal))
             .map_err(|e| StateError::Io(format!("cannot start the database actor: {e}")))?;
         Ok(StateDb {
-            path: path.to_path_buf(),
+            path,
             schema_version,
             jobs: Mutex::new(Some(jobs)),
             actor: Mutex::new(Some(actor)),
@@ -287,6 +382,7 @@ impl StateDb {
                     synchronous: conn.pragma_query_value(None, "synchronous", |r| r.get(0))?,
                     busy_timeout_ms: conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?,
                     user_version: conn.pragma_query_value(None, "user_version", |r| r.get(0))?,
+                    read_only: conn.is_readonly(rusqlite::MAIN_DB)?,
                 })
             };
             read().map_err(|e| sql_error(&e))
@@ -320,7 +416,8 @@ impl StateDb {
 
     /// Ends the `running` row `(scope_key, key)`: `Some(outcome)` stores it as `done`; `None`
     /// deletes the row, so the key can be used again. A row that is not `running` is left as
-    /// it is.
+    /// it is, and the call is [`StateError::Io`] ("no idempotency row …"), logged: the claim it
+    /// ends was lost (another core released it), so the outcome was not stored.
     pub async fn idem_finish(
         &self,
         scope_key: &str,
@@ -341,7 +438,16 @@ impl StateDb {
                     params![scope_key, key],
                 ),
             };
-            changed.map(drop).map_err(|e| sql_error(&e))
+            match changed.map_err(|e| sql_error(&e))? {
+                0 => {
+                    tracing::error!(scope = %scope_key, key = %key, "no running idempotency row to finish");
+                    Err(StateError::Io(format!(
+                        "no idempotency row ({scope_key}, {key}) is running, so its outcome was \
+                         not recorded"
+                    )))
+                }
+                _ => Ok(()),
+            }
         })
         .await
     }
@@ -589,6 +695,15 @@ enum Migrate {
     Sql(rusqlite::Error),
 }
 
+impl Migrate {
+    fn into_state(self) -> StateError {
+        match self {
+            Migrate::State(e) => e,
+            Migrate::Sql(e) => sql_error(&e),
+        }
+    }
+}
+
 impl From<rusqlite::Error> for Migrate {
     fn from(e: rusqlite::Error) -> Migrate {
         Migrate::Sql(e)
@@ -690,10 +805,10 @@ pub struct StateRegistry {
     opening: Arc<RwLock<()>>,
 }
 
-/// One cell per workspace id: the lock is held only to find a cell or to close.
+/// One cell per workspace id and access: the lock is held only to find a cell or to close.
 #[derive(Default)]
 struct Workspaces {
-    cells: HashMap<String, Arc<OnceCell<Arc<StateDb>>>>,
+    cells: HashMap<(String, Access), Arc<OnceCell<Arc<StateDb>>>>,
     /// Set by [`StateRegistry::close`]: no database is opened any more.
     closed: bool,
 }
@@ -756,7 +871,11 @@ impl StateRegistry {
     }
 
     /// The database of `ws` at `Env::workspace_local_dir(ws)\state.db` (CORE-005), opened on
-    /// first use and then cached: one actor per file (QA-012).
+    /// first use and then cached per access: one actor per file and access (QA-012).
+    ///
+    /// [`Access::ReadWrite`] (the caller holds `core.lock`) checks, migrates and releases the
+    /// stale `running` rows; [`Access::ReadOnly`] is [`StateDb::open_read_only`], which changes
+    /// nothing and creates nothing (ARCH-028).
     ///
     /// The open (folder, `quick_check`, migrations) runs on a blocking thread behind the
     /// workspace's own once-cell, so concurrent callers for the same workspace wait for one
@@ -766,13 +885,21 @@ impl StateRegistry {
     /// As [`StateDb::open`]; [`StateError::Io`] if the workspace's local folder cannot be
     /// worked out or the blocking open did not finish; [`StateError::ActorGone`] once the
     /// registry is closed.
-    pub async fn for_workspace(&self, ws: &WorkspaceRef) -> Result<Arc<StateDb>, StateError> {
+    pub async fn for_workspace(
+        &self,
+        ws: &WorkspaceRef,
+        access: Access,
+    ) -> Result<Arc<StateDb>, StateError> {
         let cell = {
             let mut workspaces = lock(&self.workspaces);
             if workspaces.closed {
                 return Err(StateError::ActorGone);
             }
-            workspaces.cells.entry(ws.id.clone()).or_default().clone()
+            workspaces
+                .cells
+                .entry((ws.id.clone(), access))
+                .or_default()
+                .clone()
         };
         let db = cell
             .get_or_try_init(|| {
@@ -780,7 +907,7 @@ impl StateRegistry {
                 let (workspaces, opening) = (self.workspaces.clone(), self.opening.clone());
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        open_workspace_db(&env, on_fatal, &ws, &workspaces, &opening)
+                        open_workspace_db(&env, on_fatal, &ws, access, &workspaces, &opening)
                     })
                     .await
                     .map_err(|e| {
@@ -800,6 +927,25 @@ impl StateRegistry {
         }
         Ok(db.clone())
     }
+
+    /// Closes the databases of the workspace `id` (each access), after their queued jobs, and
+    /// forgets them, so a later [`StateRegistry::for_workspace`] opens the file again (a
+    /// blocking call). The workspace hub calls it when it closes a workspace, before it lets
+    /// go of `core.lock`.
+    pub fn close_workspace(&self, id: &str) {
+        let cells: Vec<_> = {
+            let mut workspaces = lock(&self.workspaces);
+            [Access::ReadWrite, Access::ReadOnly]
+                .into_iter()
+                .filter_map(|access| workspaces.cells.remove(&(id.to_string(), access)))
+                .collect()
+        };
+        for cell in cells {
+            if let Some(db) = cell.get() {
+                db.close();
+            }
+        }
+    }
 }
 
 /// The blocking part of [`StateRegistry::for_workspace`]: opens `ws`'s database. Its thread
@@ -810,6 +956,7 @@ fn open_workspace_db(
     env: &Env,
     on_fatal: OnFatal,
     ws: &WorkspaceRef,
+    access: Access,
     workspaces: &Mutex<Workspaces>,
     opening: &RwLock<()>,
 ) -> Result<Arc<StateDb>, StateError> {
@@ -820,12 +967,14 @@ fn open_workspace_db(
     let dir = env
         .workspace_local_dir_for_canonical(&ws.path)
         .map_err(|e| StateError::Io(e.to_string()))?;
-    StateDb::open_named(
-        &dir.join("state.db"),
-        StateScope::Workspace,
-        format!("ww-state-ws-{}", ws.id),
-        on_fatal,
-    )
+    let path = dir.join("state.db");
+    let thread = format!("ww-state-ws-{}", ws.id);
+    match access {
+        Access::ReadWrite => StateDb::open_named(&path, StateScope::Workspace, thread, on_fatal),
+        Access::ReadOnly => {
+            StateDb::open_read_only_named(&path, StateScope::Workspace, thread, on_fatal)
+        }
+    }
     .map(Arc::new)
 }
 
@@ -973,6 +1122,7 @@ mod tests {
             &reg.env,
             reg.on_fatal.clone(),
             &ws,
+            Access::ReadWrite,
             &reg.workspaces,
             &reg.opening,
         );

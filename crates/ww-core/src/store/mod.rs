@@ -1,7 +1,10 @@
 //! The store: the only module in `ww-core` allowed to write files (ARCH-112, QA-024), and the
-//! workspace write path (ARCH-002, ARCH-074, ARCH-078; CORE-014).
+//! workspace write path (ARCH-002, ARCH-074, ARCH-075, ARCH-078, ARCH-080, ARCH-081; CORE-014).
 //!
 //! - [`write`]: [`Store`], the hash-checked atomic write, edits, recovery and errors;
+//! - [`order`]: [`Store::commit`] in the ARCH-075 order, the orphan list and run ids;
+//! - [`logs`]: the locked per-machine monthly append logs;
+//! - [`staging`]: staging handles;
 //! - [`paths`]: workspace-relative paths and the paths the store never writes;
 //! - [`failpoints`]: the test-channel fail points (QA-066);
 //! - [`fsops`]: every file-mutating call of the crate, one
@@ -12,12 +15,18 @@
 
 pub mod failpoints;
 pub mod fsops;
+pub mod logs;
+pub mod order;
 pub mod paths;
+pub mod staging;
 pub mod write;
 
 pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
 pub use fsops::{ensure_dir, write_file_atomic};
+pub use logs::{LogKind, append_loose_usage};
+pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
 pub use paths::{WsPath, path_key, writable};
+pub use staging::{STAGING_DIR, StagingHandle};
 pub use write::{
     ChangeKind, ChangeSink, Expect, Phase, RecoveryReport, Step, Store, StoreError, StoreEvent,
     Written, lfs_pointer_oid, next_step,

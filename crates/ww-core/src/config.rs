@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ww_platform::fs::{Probe, SystemProbe};
 use ww_platform::process::{ProcessInspector, SystemInspector, current_exe_dir};
 use ww_platform::{Channel, Clock, Env, IdSource, RandomIds, SystemClock};
 
@@ -39,6 +40,9 @@ pub struct CoreConfig {
     /// The fail points `WW_TEST_FAILPOINTS` arms (test channels of non-stable builds only;
     /// QA-066), passed to every workspace store.
     pub failpoints: Arc<FailPoints>,
+    /// The file facts of the workspace stores (`SystemProbe`); in-process tests fake volumes
+    /// and placeholders with their own.
+    pub probe: Arc<dyn Probe>,
     /// The crate's own unit tests only (compiled out of every build): a request with this
     /// method panics in the router, to test how the transport survives a panicking handler.
     #[cfg(test)]
@@ -50,7 +54,7 @@ impl CoreConfig {
     /// `env` (the running executable's folder on dev and test channels) and no engine tokens,
     /// with the `WW_TEST_*` overrides from the process environment (read through
     /// `env.test_overrides`, so they apply on test channels only) and the fail points of
-    /// `WW_TEST_FAILPOINTS` (`FailPoints::from_env`).
+    /// `WW_TEST_FAILPOINTS` (`FailPoints::from_env`), and the real probe.
     pub fn for_env(env: Env) -> io::Result<CoreConfig> {
         let overrides = env.test_overrides(&|name| std::env::var(name).ok());
         let test_tools = matches!(env.channel(), Channel::Test(_));
@@ -70,6 +74,7 @@ impl CoreConfig {
             test_tools,
             test_parent_pid: overrides.parent_pid,
             failpoints,
+            probe: Arc::new(SystemProbe),
             #[cfg(test)]
             panic_on_method: None,
         })

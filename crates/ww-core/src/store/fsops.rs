@@ -46,6 +46,20 @@ pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(long_path(path))
 }
 
+/// Creates the folder `path`, whose parent exists; an existing file or folder there is an
+/// error (`AlreadyExists`), so a new staging handle is never one that is already in use.
+#[allow(clippy::disallowed_methods)]
+pub fn create_dir_new(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(long_path(path))
+}
+
+/// Removes the folder `path` only if it is empty (`RemoveDirectoryW` refuses one that isn't,
+/// with error 145), so no content is ever deleted (CORE-110). A link is never followed.
+#[allow(clippy::disallowed_methods)]
+pub fn remove_empty_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(long_path(path))
+}
+
 /// Write step 4: creates `dir\name` (never an existing file), writes `bytes` and flushes them
 /// with `FlushFileBuffers` before closing. The fail point `store.write_temp` comes after the
 /// create, and its error stands for the write's. On any error after the create, the file is

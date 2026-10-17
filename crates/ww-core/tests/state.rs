@@ -398,7 +398,7 @@ fn databases_live_where_core_005_says() {
     let ws = workspace_ref(&env.make_workspace("alpha"));
     let rt = runtime();
     let a = rt
-        .block_on(reg.for_workspace(&ws))
+        .block_on(reg.for_workspace(&ws, ww_core::workspace::Access::ReadWrite))
         .expect("the workspace db");
     let expected = env
         .env
@@ -409,7 +409,7 @@ fn databases_live_where_core_005_says() {
     assert!(expected.is_file());
     // Cached: one actor per database (QA-012).
     let again = rt
-        .block_on(reg.for_workspace(&ws))
+        .block_on(reg.for_workspace(&ws, ww_core::workspace::Access::ReadWrite))
         .expect("the workspace db again");
     assert!(Arc::ptr_eq(&a, &again));
 }
@@ -430,6 +430,10 @@ fn losing_core_never_touches_state_db() {
     let running = vec![("cli|none".into(), "k".into(), "running".into())];
     assert_eq!(rows(&path), running);
     let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    // The row is in the WAL (nothing checkpointed yet): a loser that touched the database
+    // would change the `-wal` file too.
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let wal_mtime = std::fs::metadata(&wal).unwrap().modified().unwrap();
 
     // A second in-process `start` on the same env loses the pipe and touches nothing.
     let lost = runtime()
@@ -452,6 +456,12 @@ fn losing_core_never_touches_state_db() {
         mtime,
         "the losing cores changed {}",
         path.display()
+    );
+    assert_eq!(
+        std::fs::metadata(&wal).unwrap().modified().unwrap(),
+        wal_mtime,
+        "the losing cores changed {}",
+        wal.display()
     );
 }
 
@@ -497,5 +507,124 @@ fn assert_log_names(env: &TestEnv, what: &str) {
         text.lines()
             .any(|l| l.contains("state.db") && l.contains(what)),
         "no log line names state.db with `{what}`:\n{text}"
+    );
+}
+
+#[test] // spec: QA-062, CORE-004
+fn newer_schema_is_refused_and_untouched_with_a_live_wal() {
+    let env = TestEnv::new();
+    let path = env.root().join("live-wal").join("state.db");
+    env.write_state_db_version(&path, known() + 1, true);
+    // Another connection keeps committed frames in the WAL, uncheckpointed, while the core
+    // checks the file: the newer `user_version` is only in those frames.
+    let live = Connection::open(&path).expect("a live connection");
+    live.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    live.execute_batch("CREATE TABLE held (x); INSERT INTO held VALUES (1);")
+        .unwrap();
+    live.pragma_update(None, "user_version", known() + 2)
+        .unwrap();
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    assert!(
+        std::fs::metadata(&wal).unwrap().len() > 0,
+        "the WAL holds the frames"
+    );
+    let (db_before, wal_before) = (sha256_file(&path), sha256_file(&wal));
+
+    let err = StateDb::open(&path, StateScope::Suite, no_fatal())
+        .expect_err("a newer database must be refused");
+    assert_eq!(
+        err,
+        StateError::TooNew {
+            found: known() + 2,
+            known: known()
+        }
+    );
+    assert_eq!(sha256_file(&path), db_before, "the database file changed");
+    assert_eq!(sha256_file(&wal), wal_before, "the WAL changed");
+    let held: i64 = live
+        .query_row("SELECT count(*) FROM held", [], |r| r.get(0))
+        .expect("the live connection still sees its frames");
+    assert_eq!(held, 1);
+    drop(live);
+}
+
+#[test] // spec: CORE-016, QA-012
+fn replay_of_a_null_outcome_is_core_bug() {
+    let env = TestEnv::new();
+    let path = env.env.suite_state_db();
+    drop(StateDb::open(&path, StateScope::Suite, no_fatal()).expect("create the suite db"));
+    // A `done` row whose outcome is NULL (a damaged row): `idem_begin` reads it as `Replay("")`.
+    let args = serde_json::json!({"label": "null"});
+    let hash =
+        ww_protocol::args_hash(&serde_json::json!({"name": "test.write", "arguments": args}));
+    let fake_now = 1_800_000_000_i64; // FakeClock's UTC start, so the row isn't pruned.
+    {
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO idempotency (scope, key, args_hash, state, outcome, created_utc)
+             VALUES ('cli|none', 'k-null', ?1, 'done', NULL, ?2)",
+            rusqlite::params![hash, fake_now],
+        )
+        .unwrap();
+    }
+    {
+        let db = StateDb::open(&path, StateScope::Suite, no_fatal()).unwrap();
+        assert_eq!(
+            runtime()
+                .block_on(db.idem_begin("cli|none", "k-null", &hash, fake_now))
+                .unwrap(),
+            IdemBegin::Replay(String::new())
+        );
+    }
+
+    let _core = start_in_thread(config(&env));
+    let mut pipe = ww_testkit::RawPipe::connect(&env);
+    let hello = pipe.hello(serde_json::json!({}));
+    assert_eq!(hello["result"]["status"], "ok", "{hello}");
+    let replayed = pipe.tool("test.write", args, Some("k-null"));
+    assert_eq!(replayed["status"], "error", "{replayed}");
+    assert_eq!(replayed["error"]["code"], "core.bug", "{replayed}");
+    // The tool did not run: a fresh key is its first execution.
+    let fresh = pipe.tool(
+        "test.write",
+        serde_json::json!({"label": "null"}),
+        Some("k-fresh"),
+    );
+    assert_eq!(fresh["structured"]["executions"], 1, "{fresh}");
+}
+
+#[test] // spec: CORE-016
+fn idem_finish_on_a_missing_row_is_an_error() {
+    let env = TestEnv::new();
+    let path = env.root().join("state.db");
+    let db = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("open");
+    let now = now_secs();
+    runtime().block_on(async {
+        for outcome in [None, Some("{}".to_string())] {
+            let err = db
+                .idem_finish("cli|none", "never-begun", outcome.clone())
+                .await
+                .expect_err("finishing a row that doesn't exist is an error");
+            let StateError::Io(why) = &err else {
+                panic!("expected StateError::Io, got {err:?}");
+            };
+            assert!(why.starts_with("no idempotency row"), "{why}");
+        }
+        // A row that is `done` already isn't `running` either.
+        assert_eq!(
+            db.idem_begin("cli|none", "k", "h", now).await.unwrap(),
+            IdemBegin::Fresh
+        );
+        db.idem_finish("cli|none", "k", Some("{}".into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.idem_finish("cli|none", "k", None).await,
+            Err(StateError::Io(_))
+        ));
+    });
+    assert_eq!(
+        rows(&path),
+        vec![("cli|none".into(), "k".into(), "done".into())]
     );
 }

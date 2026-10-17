@@ -24,6 +24,9 @@ use crate::events::EventBus;
 use crate::lifecycle::{IDLE_EXIT_AFTER, Lifecycle};
 use crate::session::Session;
 use crate::state::{OnFatal, StateRegistry};
+use crate::store::FailPoints;
+use crate::workspace::WorkspaceHub;
+use ww_platform::fs::SystemProbe;
 
 /// The CORE-015 stage names, in order.
 const ALL_STAGES: [&str; 9] = [
@@ -225,13 +228,33 @@ fn fixture_with(hooks: PipelineHooks, log: &Log, extra: &[Arc<dyn Tool>]) -> Fix
     let clock: Arc<dyn Clock> = FakeClock::new();
     let events = Arc::new(EventBus::new(clock.clone()));
     let lifecycle = Lifecycle::new(clock.clone(), IDLE_EXIT_AFTER);
-    let dispatcher = Dispatcher::new(reg, hooks, states, events, ids, clock, lifecycle);
+    let hub = hub_for(&env, &states, &events, &clock, &ids);
+    let dispatcher = Dispatcher::new(reg, hooks, states, events, hub, ids, clock, lifecycle);
     Fixture {
         env,
         log,
         gates,
         dispatcher,
     }
+}
+
+/// A workspace hub over `env` (no fail points, the real probe).
+fn hub_for(
+    env: &TestEnv,
+    states: &Arc<StateRegistry>,
+    events: &Arc<EventBus>,
+    clock: &Arc<dyn Clock>,
+    ids: &Arc<dyn IdSource>,
+) -> Arc<WorkspaceHub> {
+    WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        events.clone(),
+        clock.clone(),
+        ids.clone(),
+        FailPoints::none(),
+        Arc::new(SystemProbe),
+    )
 }
 
 fn session(caller: CallerKind, non_interactive: bool) -> Arc<Session> {
@@ -627,6 +650,7 @@ fn registry_and_dispatcher_live_in_the_tools_module() {
         PipelineHooks,
         Arc<StateRegistry>,
         Arc<EventBus>,
+        Arc<WorkspaceHub>,
         Arc<dyn IdSource>,
         Arc<dyn Clock>,
         Arc<Lifecycle>,
@@ -656,8 +680,10 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.destructive",
             "test.echo",
             "test.emit",
+            "test.ingest_run",
             "test.panic",
             "test.state_panic",
+            "test.store_write",
             "test.write"
         ]
     );
@@ -665,13 +691,18 @@ async fn test_tools_exist_only_on_test_channels() {
     // Off a test channel there are none, and calling one is `tool.unknown`.
     let reg = core_registry(false, &gates, &states);
     assert!(reg.list_for(&CallerKind::Cli).is_empty());
+    let events = Arc::new(EventBus::new(FakeClock::new()));
+    let (clock, ids): (Arc<dyn Clock>, Arc<dyn IdSource>) =
+        (FakeClock::new(), Arc::new(SeqIds::new()));
+    let hub = hub_for(&env, &states, &events, &clock, &ids);
     let dispatcher = Dispatcher::new(
         reg,
         PipelineHooks::plan2(),
         states,
-        Arc::new(EventBus::new(FakeClock::new())),
-        Arc::new(SeqIds::new()),
-        FakeClock::new(),
+        events,
+        hub,
+        ids,
+        clock,
         Lifecycle::new(FakeClock::new(), IDLE_EXIT_AFTER),
     );
     let out = dispatcher

@@ -9,7 +9,8 @@
 //!   After the handshake at most [`MAX_IN_FLIGHT_PER_CONN`] requests of one connection run at
 //!   once; the next line is read only when one of them has ended (backpressure on the pipe).
 //! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
-//!   wait and steps, then the state databases close, then the pipe.
+//!   wait and steps, then the open workspaces close (their `state.db` first, then
+//!   `core.lock`), then the state databases close, then the pipe.
 
 mod conn;
 
@@ -34,6 +35,7 @@ use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
+use crate::workspace::WorkspaceHub;
 
 /// Per-connection writer queue (responses and events).
 pub const OUTBOUND_CAPACITY: usize = 256;
@@ -230,6 +232,8 @@ pub struct RunningCore {
     pipe: String,
     lifecycle: Arc<Lifecycle>,
     state: Arc<StateRegistry>,
+    /// The workspaces this core serves (ARCH-028).
+    hub: Arc<WorkspaceHub>,
     /// The event bus (ARCH-032).
     events: Arc<EventBus>,
     /// The gates `test.block` waits on (test channels).
@@ -254,6 +258,11 @@ impl RunningCore {
     /// The event bus.
     pub fn events(&self) -> &Arc<EventBus> {
         &self.events
+    }
+
+    /// The workspace hub.
+    pub fn hub(&self) -> &Arc<WorkspaceHub> {
+        &self.hub
     }
 
     /// The gates of the test-channel tool `test.block`: in-process tests open them.
@@ -311,9 +320,10 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 /// [`CoreExit::Startup`]; each is logged with the path, nothing on disk is changed, and the
 /// pipe is released as this returns.
 ///
-/// Then it serves, ticks the idle check every [`IDLE_TICK`] (or `idle_after`, if a test
-/// channel set it shorter), watches the session end and, on a test channel, the test
-/// parent. A state actor that dies begins a fatal drain (QA-012).
+/// Then it serves, opens the default workspace in the background (a failure is logged; the
+/// first call in it tries again), ticks the idle check every [`IDLE_TICK`] (or `idle_after`,
+/// if a test channel set it shorter), watches the session end and, on a test channel, the
+/// test parent. A state actor that dies begins a fatal drain (QA-012).
 pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<RunningCore, CoreExit> {
     let pipe = listener.name().to_string();
     let lifecycle = Lifecycle::new(cfg.clock.clone(), cfg.idle_after);
@@ -333,11 +343,21 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     };
     let test_gates = Arc::new(TestGates::new());
     let events = Arc::new(EventBus::new(cfg.clock.clone()));
+    let hub = WorkspaceHub::new(
+        cfg.env.clone(),
+        state.clone(),
+        events.clone(),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        cfg.failpoints.clone(),
+        cfg.probe.clone(),
+    );
     let dispatcher = Dispatcher::new(
         core_registry(cfg.test_tools, &test_gates, &state),
         PipelineHooks::plan2(),
         state.clone(),
         events.clone(),
+        hub.clone(),
         cfg.ids.clone(),
         cfg.clock.clone(),
         lifecycle.clone(),
@@ -347,6 +367,14 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let stop = CancellationToken::new();
     let serving = tokio::spawn(serve(listener, router, stats, stop.clone()));
 
+    if let Some(ws) = hub.default_ref() {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hub.open(&ws).await {
+                tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
+            }
+        });
+    }
     let mut helpers = vec![tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after))];
     if let Some(pid) = cfg.test_parent_pid.filter(|_| cfg.test_tools) {
         helpers.push(tokio::spawn(watch_test_parent(pid, lifecycle.clone())));
@@ -364,6 +392,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let shutdown = tokio::spawn(supervise(Supervised {
         lifecycle: lifecycle.clone(),
         state: state.clone(),
+        hub: hub.clone(),
         stop,
         serving,
         helpers,
@@ -374,6 +403,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         pipe,
         lifecycle,
         state,
+        hub,
         events,
         test_gates,
         session_end,
@@ -385,6 +415,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
 struct Supervised {
     lifecycle: Arc<Lifecycle>,
     state: Arc<StateRegistry>,
+    hub: Arc<WorkspaceHub>,
     stop: CancellationToken,
     serving: JoinHandle<io::Result<()>>,
     helpers: Vec<JoinHandle<()>>,
@@ -397,6 +428,7 @@ async fn supervise(s: Supervised) -> ShutdownReport {
     let Supervised {
         lifecycle,
         state,
+        hub,
         stop,
         mut serving,
         helpers,
@@ -417,6 +449,10 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         lifecycle.begin_drain(DrainReason::Fatal(why));
     }
     let mut report = lifecycle.run_shutdown().await;
+
+    // The open workspaces close before the state databases (module docs). It is part of the
+    // state step, so the report's steps stay as plan 2 named them.
+    hub.close_all().await;
 
     // The state databases close before the pipe is released (module docs).
     let closing = state.clone();

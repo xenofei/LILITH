@@ -4,6 +4,11 @@
 //! 1. **Resolve.** The trace id is the caller's (`[A-Za-z0-9_-]{1,64}`) or a fresh one. The
 //!    tool must exist and be visible to the caller, else `tool.unknown`. A tool whose effect
 //!    is not `read` needs an idempotency key, else `idempotency.key_required` (ARCH-035).
+//!    With a session workspace: one that is no longer the default (after a switch; owner
+//!    decision 2) is `workspace.unsupported`; otherwise the [`WorkspaceHub`] opens it and
+//!    `CallCtx::workspace` is set (its errors, `state.unavailable` for one, are the call's).
+//!    An effect other than `read` on a workspace this core serves read-only (another core
+//!    holds its `core.lock`, ARCH-028) is `workspace.read_only`, before anything is stored.
 //! 2. **Validate.** The tool checks the arguments (`params.invalid`). For effect ≠ `read`,
 //!    `idem_begin` in the session's workspace `state.db`, or the suite one without a
 //!    workspace, under the scope `"<caller kind>|<workspace id or none>"`: a finished call
@@ -49,6 +54,8 @@ use crate::events::EventBus;
 use crate::lifecycle::Lifecycle;
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
+use crate::store::StoreError;
+use crate::workspace::{Access, OpenWorkspace, WorkspaceHub};
 
 /// Runs `tools/call` (module docs).
 #[derive(Clone)]
@@ -61,6 +68,7 @@ struct Inner {
     hooks: PipelineHooks,
     states: Arc<StateRegistry>,
     events: Arc<EventBus>,
+    hub: Arc<WorkspaceHub>,
     ids: Arc<dyn IdSource>,
     clock: Arc<dyn Clock>,
     lifecycle: Arc<Lifecycle>,
@@ -75,11 +83,16 @@ impl std::fmt::Debug for Dispatcher {
 }
 
 impl Dispatcher {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the plan's signature: one handle per core service"
+    )]
     pub fn new(
         reg: Registry,
         hooks: PipelineHooks,
         states: Arc<StateRegistry>,
         events: Arc<EventBus>,
+        hub: Arc<WorkspaceHub>,
         ids: Arc<dyn IdSource>,
         clock: Arc<dyn Clock>,
         lifecycle: Arc<Lifecycle>,
@@ -90,6 +103,7 @@ impl Dispatcher {
                 hooks,
                 states,
                 events,
+                hub,
                 ids,
                 clock,
                 lifecycle,
@@ -110,6 +124,11 @@ impl Dispatcher {
     /// The lifecycle that admits its calls.
     pub fn lifecycle(&self) -> &Arc<Lifecycle> {
         &self.inner.lifecycle
+    }
+
+    /// The workspace hub its calls open workspaces through.
+    pub fn hub(&self) -> &Arc<WorkspaceHub> {
+        &self.inner.hub
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
@@ -213,6 +232,18 @@ impl Inner {
                 );
             }
         };
+        let workspace = match self.open_workspace(session, trace_id).await {
+            Ok(workspace) => workspace,
+            Err(error) => return Outcome::Error { error },
+        };
+        if effect != EffectClass::Read
+            && let Some(open) = &workspace
+            && open.access == Access::ReadOnly
+        {
+            return Outcome::Error {
+                error: StoreError::ReadOnly.to_error(trace_id),
+            };
+        }
         let scope = format!("{}|{}", session.caller, session.workspace_id());
 
         // 2. Validate.
@@ -227,7 +258,10 @@ impl Inner {
             None => None,
             Some(key) => {
                 let hash = args_hash(&json!({"name": p.name, "arguments": args}));
-                match self.begin(session, scope, key, &hash, trace_id).await {
+                match self
+                    .begin(workspace.as_ref(), scope, key, &hash, trace_id)
+                    .await
+                {
                     Ok(Begun::Fresh(claim)) => Some(claim),
                     Ok(Begun::Done(outcome)) => return *outcome,
                     Err(e) => return state_unavailable(&e, trace_id),
@@ -236,7 +270,7 @@ impl Inner {
         };
 
         // 3–9.
-        let outcome = self.run(session, &tool, args, trace_id).await;
+        let outcome = self.run(session, workspace, &tool, args, trace_id).await;
 
         // The line cap (ARCH-025), decided once, before anything is stored: an outcome too
         // large to send becomes `core.bug`, and that error is what the row keeps, so every
@@ -268,17 +302,42 @@ impl Inner {
         }
     }
 
-    /// `idem_begin` for `key` in the session's database.
-    async fn begin(
+    /// Stage 1's workspace part: `None` without a session workspace; `workspace.unsupported`
+    /// when it is no longer the default (the hub re-reads `suite.toml` before it says so, so
+    /// a default set outside this core is seen); else the hub's open workspace.
+    async fn open_workspace(
         &self,
         session: &Session,
+        trace_id: &str,
+    ) -> Result<Option<Arc<OpenWorkspace>>, ErrorBody> {
+        let Some(ws) = &session.workspace else {
+            return Ok(None);
+        };
+        let is_default = |hub: &WorkspaceHub| hub.default_id().as_deref() == Some(ws.id.as_str());
+        if !is_default(&self.hub) {
+            self.hub.refresh_default();
+            if !is_default(&self.hub) {
+                return Err(self.hub.unsupported(ws, trace_id));
+            }
+        }
+        self.hub.open(ws).await.map(Some).map_err(|mut error| {
+            error.trace_id = trace_id.to_string();
+            error
+        })
+    }
+
+    /// `idem_begin` for `key` in the workspace's database, or the suite one without a
+    /// workspace.
+    async fn begin(
+        &self,
+        workspace: Option<&Arc<OpenWorkspace>>,
         scope: String,
         key: String,
         hash: &str,
         trace_id: &str,
     ) -> Result<Begun, StateError> {
-        let db = match &session.workspace {
-            Some(ws) => DbHandle::Workspace(self.states.for_workspace(ws).await?),
+        let db = match workspace {
+            Some(open) => DbHandle::Workspace(open.state.clone()),
             None => DbHandle::Suite(self.states.clone()),
         };
         let now = self
@@ -317,6 +376,7 @@ impl Inner {
     async fn run(
         &self,
         session: &Arc<Session>,
+        workspace: Option<Arc<OpenWorkspace>>,
         tool: &Arc<dyn Tool>,
         args: Value,
         trace_id: &str,
@@ -354,6 +414,7 @@ impl Inner {
             trace_id: trace_id.to_string(),
             settings,
             events: self.events.clone(),
+            workspace,
         };
         let running = tool.clone();
         let joined = tokio::spawn(async move { running.run(&ctx, args).await }).await;
