@@ -1,11 +1,13 @@
 # Protected-test check (QA-033, rulings R8 and R21). Judges a PR's head commit with the test-diff
-# guard, using a `ww` built from main, and counts the reviewer app's approval of that exact
+# guard, using the CLI built from main, and counts the reviewer app's approval of that exact
 # commit. `ww dev merge` requires the `protected-test-check` check on the PR's head commit.
+# The step "Pick the CLI crate" builds whichever CLI crate main has (crates/lil-cli, else
+# crates/ww-cli), so the check keeps working across the crate's rename.
 #
 # Why this is safe to run on a PR:
-# - The job checks out main and builds `ww` from main only. The PR's head commit is fetched as git
-#   data and judged; its code is never built, tested or run here. (The spec tests run the PR's
-#   code, so they stay in the every-push and PR-ready tiers.)
+# - The job checks out main and builds the CLI from main only. The PR's head commit is fetched as
+#   git data and judged; its code is never built, tested or run here. (The spec tests run the
+#   PR's code, so they stay in the every-push and PR-ready tiers.)
 # - The trigger is `pull_request`, so the check run lands on the PR's head commit, where
 #   `ww dev merge` looks for it. (`pull_request_target` would attach it to the base branch's
 #   commit instead, and the merge would never see it.)
@@ -31,7 +33,7 @@
 #   reads the PR's reviews live.
 #
 # No sccache here: the GitHub Actions cache this job could read is also written by jobs that run
-# PR code (every-push, pr-ready), so a cached object could swap the judge. `ww` is built from
+# PR code (every-push, pr-ready), so a cached object could swap the judge. The CLI is built from
 # scratch every time instead.
 
 name: "CI: protected-test check"
@@ -79,16 +81,38 @@ jobs:
           git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}"
           git cat-file -e "${HEAD_SHA}^{commit}"
 
+      - name: Pick the CLI crate
+        id: pick
+        # In main's working tree (the checkout above): lil-cli once main has it, else ww-cli.
+        run: |
+          if [ -f crates/lil-cli/Cargo.toml ]; then
+            pkg=lil-cli
+            bin=lil
+          elif [ -f crates/ww-cli/Cargo.toml ]; then
+            pkg=ww-cli
+            bin=ww
+          else
+            echo "::error::main has neither crates/lil-cli nor crates/ww-cli, so there is no CLI to build."
+            exit 1
+          fi
+          echo "Building $pkg (--bin $bin) from main."
+          {
+            echo "pkg=$pkg"
+            echo "bin=$bin"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Rust toolchain from rust-toolchain.toml (main's)
         run: |
           rustup toolchain install
           rustup show active-toolchain
           cargo --version
 
-      - name: Judge the PR head with ww built from main
+      - name: Judge the PR head with the CLI built from main
         env:
+          pkg: ${{ steps.pick.outputs.pkg }}
+          bin: ${{ steps.pick.outputs.bin }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cargo run --locked -p ww-cli -- dev guard --base refs/remotes/origin/main --head "$HEAD_SHA" --pr "$PR_NUMBER"
+          cargo run --locked -p "$pkg" --bin "$bin" -- dev guard --base refs/remotes/origin/main --head "$HEAD_SHA" --pr "$PR_NUMBER"

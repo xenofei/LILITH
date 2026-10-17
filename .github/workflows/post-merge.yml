@@ -5,19 +5,21 @@
 # Two jobs, so the pushed code never runs next to a write token:
 # - post-merge-tests runs the every-push tier on the pushed commit (`after`), read-only.
 # - post-merge-check is the only job in the repo with write access (QA-079). It never runs the
-#   pushed code: it builds `ww` from `before` (main as it was before the push, which was already
-#   judged) in a separate worktree, judges before..after with `ww dev guard --post-merge`, and if
-#   that or the tests failed (or were cancelled), runs `ww dev revert-pr`. Both run inside that
-#   worktree, because ww refuses to work on any checkout but the one it was built in (R38). It
-#   runs with `always()`, so a cancelled or failed test job still gets judged. It uses no sccache,
-#   since the Actions cache is written by jobs that run unreviewed code.
-# - post-merge-check also checks who the pushed commits say they are (QA-086): the same ww, in
-#   the same worktree, runs `ww dev privacy-scan --commits before..after`, which checks the author,
+#   pushed code: it builds the CLI from `before` (main as it was before the push, which was
+#   already judged) in a separate worktree, judges before..after with `dev guard --post-merge`,
+#   and if that or the tests failed (or were cancelled), runs `dev revert-pr`. Both run inside
+#   that worktree, because the CLI refuses to work on any checkout but the one it was built in
+#   (R38). The step "Pick the CLI crate" picks whichever CLI crate `before` has (crates/lil-cli,
+#   else crates/ww-cli). It runs with `always()`, so a cancelled or failed test job still gets
+#   judged. It uses no sccache, since the Actions cache is written by jobs that run unreviewed
+#   code.
+# - post-merge-check also checks who the pushed commits say they are (QA-086): the same CLI, in
+#   the same worktree, runs `dev privacy-scan --commits before..after`, which checks the author,
 #   committer and trailer e-mails of every commit in the range. That includes the merge commits
 #   GitHub creates itself when a PR is merged through its API, which no local hook or pre-push scan
 #   ever sees; GitHub writes them with the e-mail the account's web settings give it. Only this
-#   step gets the WW_PRIVACY_DENYLIST secret, and the binary that reads it is built from `before`,
-#   never from the pushed code. A finding (or a scan that couldn't run) fails the job and opens an
+#   step gets the LIL_PRIVACY_DENYLIST and WW_PRIVACY_DENYLIST secrets, and the binary that reads
+#   them is built from `before`, never from the pushed code. A finding (or a scan that couldn't run) fails the job and opens an
 #   issue assigned to the owner. No revert PR: the commit is already public, and a revert keeps it
 #   in history. The issue says what to check and never repeats the e-mail.
 # - When `before` is all zeros the push created the repository's main (R27): the tests run, but
@@ -28,10 +30,10 @@
 # - A push runs the workflow definition from `after`, the commit being judged. A push that edits
 #   this file (or adds a workflow) can change what runs. That is why `.github/workflows/**` is
 #   protected (QA-019, R21, R26), and why main is protected by server-side branch rules.
-# - When `before` has no crates/ww-cli, or `before` isn't in main's history, there is no trusted
-#   `ww`: the check refuses and opens a plain issue. `ww` is never built from the pushed commit,
-#   and the settings are never read from it (R38). The public repository starts with ww on main,
-#   so this only happens if main was rewritten.
+# - When `before` has neither crates/lil-cli nor crates/ww-cli, or `before` isn't in main's
+#   history, there is no trusted CLI: the check refuses and opens a plain issue. The CLI is never
+#   built from the pushed commit, and the settings are never read from it (R38). The public
+#   repository starts with the CLI on main, so this only happens if main was rewritten.
 # - A cancelled workflow run (someone pressing Cancel) can stop before the judge runs. The run then
 #   shows as cancelled, not green, and the next push to main judges only its own range, so the
 #   owner has to look at a cancelled post-merge run by hand.
@@ -127,7 +129,7 @@ jobs:
           # credential helper, which reads GH_TOKEN in that one step only.
           persist-credentials: false
 
-      - name: Choose the source ww is built from
+      - name: Choose the tree the CLI is built from
         id: src
         run: |
           judge=true
@@ -136,23 +138,43 @@ jobs:
             echo "repository creation push; nothing to compare"
             judge=false
           elif ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            echo "::error::main before the push (${BEFORE}) isn't in main's history (was main force-pushed?), so there is no trusted ww to judge with."
-            exit 1
-          elif ! git cat-file -e "${BEFORE}:crates/ww-cli/Cargo.toml" 2>/dev/null; then
-            echo "::error::main before the push (${BEFORE}) has no crates/ww-cli, so there is no trusted ww to judge with. ww is never built from the pushed commit."
+            echo "::error::main before the push (${BEFORE}) isn't in main's history (was main force-pushed?), so there is no trusted CLI to judge with."
             exit 1
           else
-            echo "Building ww from main before the push (${BEFORE:0:7})."
-            git worktree add --detach "$RUNNER_TEMP/ww-before" "$BEFORE"
-            dir="$RUNNER_TEMP/ww-before"
+            echo "The CLI is built from main before the push (${BEFORE:0:7})."
+            git worktree add --detach "$RUNNER_TEMP/cli-before" "$BEFORE"
+            dir="$RUNNER_TEMP/cli-before"
           fi
           {
             echo "judge=$judge"
             echo "dir=$dir"
-            echo "ww=$RUNNER_TEMP/ww-target/debug/ww.exe"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Rust toolchain from that source's rust-toolchain.toml
+      - name: Pick the CLI crate
+        id: pick
+        if: steps.src.outputs.judge == 'true'
+        # In the worktree of `before`, reading `before` itself: lil-cli once it has it, else
+        # ww-cli. Never the pushed commit (R38).
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          if git cat-file -e "${BEFORE}:crates/lil-cli/Cargo.toml" 2>/dev/null; then
+            pkg=lil-cli
+            bin=lil
+          elif git cat-file -e "${BEFORE}:crates/ww-cli/Cargo.toml" 2>/dev/null; then
+            pkg=ww-cli
+            bin=ww
+          else
+            echo "::error::main before the push (${BEFORE}) has neither crates/lil-cli nor crates/ww-cli, so there is no trusted CLI to judge with. The CLI is never built from the pushed commit."
+            exit 1
+          fi
+          echo "Building $pkg (--bin $bin) from main before the push (${BEFORE:0:7})."
+          {
+            echo "pkg=$pkg"
+            echo "bin=$bin"
+            echo "cli=$RUNNER_TEMP/cli-target/debug/$bin.exe"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rust toolchain from that tree's rust-toolchain.toml
         if: steps.src.outputs.judge == 'true'
         working-directory: ${{ steps.src.outputs.dir }}
         run: |
@@ -160,48 +182,54 @@ jobs:
           rustup show active-toolchain
           cargo --version
 
-      - name: Build ww
+      - name: Build the CLI from main
         id: build
         if: steps.src.outputs.judge == 'true'
         working-directory: ${{ steps.src.outputs.dir }}
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/ww-target
-        run: cargo build --locked -p ww-cli
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cli-target
+          pkg: ${{ steps.pick.outputs.pkg }}
+          bin: ${{ steps.pick.outputs.bin }}
+        run: cargo build --locked -p "$pkg" --bin "$bin"
 
       - name: Judge the push
         id: guard
         if: steps.src.outputs.judge == 'true'
-        # ww refuses to work on any checkout but the one it was built in (R38). The judgement
+        # The CLI refuses to work on any checkout but the one it was built in (R38). The judgement
         # reads only git objects, which the worktree shares with the main checkout.
         working-directory: ${{ steps.src.outputs.dir }}
         env:
-          WW: ${{ steps.src.outputs.ww }}
+          CLI_BIN: ${{ steps.pick.outputs.cli }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          "$WW" dev guard --post-merge --before "$BEFORE" --after "$AFTER"
+          "$CLI_BIN" dev guard --post-merge --before "$BEFORE" --after "$AFTER"
 
       - name: Check the pushed commits' identities
         id: identity
-        # Runs whether or not the judge passed, but only with a ww built from `before` (so never
+        # Runs whether or not the judge passed, but only with a CLI built from `before` (so never
         # for repository creation, R27). A commit GitHub created server-side is checked here too.
         if: ${{ always() && steps.src.outputs.judge == 'true' && steps.build.outcome == 'success' }}
-        # The worktree of `before` that ww was built in (R38), like the judge.
+        # The worktree of `before` that the CLI was built in (R38), like the judge.
         working-directory: ${{ steps.src.outputs.dir }}
         env:
-          WW: ${{ steps.src.outputs.ww }}
-          # A repository secret, not an environment one, like the privacy-check jobs. What protects
-          # it: only the ww built from `before` (main as it was before the push, already judged)
-          # runs in this step, after it was built in the step above without the secret; the pushed
-          # commits are read as git data and never built or run. This step has no token.
+          CLI_BIN: ${{ steps.pick.outputs.cli }}
+          # Repository secrets, not environment ones, like the privacy-check jobs. What protects
+          # them: only the CLI built from `before` (main as it was before the push, already
+          # judged) runs in this step, after it was built in the step above without the secrets;
+          # the pushed commits are read as git data and never built or run. This step has no
+          # token. Each variable comes from the secret of its own name: a secret that doesn't
+          # exist arrives as "", and the CLI skips a blank variable, so the check runs while
+          # either secret exists.
+          LIL_PRIVACY_DENYLIST: ${{ secrets.LIL_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
           WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
         run: |
-          if [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
-            echo "::error::The WW_PRIVACY_DENYLIST secret is missing or empty, so the identity check can't run."
+          if [ -z "${LIL_PRIVACY_DENYLIST:-}" ] && [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
+            echo "::error::Both the LIL_PRIVACY_DENYLIST and the WW_PRIVACY_DENYLIST secrets are missing or empty, so the identity check can't run."
             echo "result=error" >> "$GITHUB_OUTPUT"
             exit 2
           fi
           status=0
-          "$WW" dev privacy-scan --commits "$BEFORE..$AFTER" || status=$?
+          "$CLI_BIN" dev privacy-scan --commits "$BEFORE..$AFTER" || status=$?
           case "$status" in
             0) echo "result=clean" >> "$GITHUB_OUTPUT" ;;
             1) echo "result=findings" >> "$GITHUB_OUTPUT" ;;
@@ -213,12 +241,13 @@ jobs:
         # Not for repository creation (R27); otherwise whenever the tests or the judge didn't pass,
         # including when an earlier step here failed and the judge never ran.
         if: ${{ always() && steps.src.outputs.judge != 'false' && (needs.post-merge-tests.result != 'success' || steps.guard.outcome != 'success') }}
-        # The worktree ww was built in (R38). The revert branch is made there; the worktree shares
-        # its objects and refs with the main checkout. When no source was chosen (the step above
-        # refused), there is no ww and only the plain issue is opened, from the workspace.
+        # The worktree the CLI was built in (R38). The revert branch is made there; the worktree
+        # shares its objects and refs with the main checkout. When no tree was chosen (the step
+        # above refused), there is no CLI and only the plain issue is opened, from the workspace;
+        # when the pick step refused, CLI_BIN is empty and the same plain issue is opened.
         working-directory: ${{ steps.src.outputs.dir || github.workspace }}
         env:
-          WW: ${{ steps.src.outputs.ww }}
+          CLI_BIN: ${{ steps.pick.outputs.cli }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TESTS_RESULT: ${{ needs.post-merge-tests.result }}
@@ -228,19 +257,19 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
-          if [ -f "$WW" ] && "$WW" dev revert-pr --before "$BEFORE" --after "$AFTER" --tests-result "$TESTS_RESULT"; then
+          if [ -n "$CLI_BIN" ] && [ -f "$CLI_BIN" ] && "$CLI_BIN" dev revert-pr --before "$BEFORE" --after "$AFTER" --tests-result "$TESTS_RESULT"; then
             exit 0
           fi
-          echo "::warning::ww dev revert-pr couldn't run or couldn't open its issue; opening a plain issue instead."
+          echo "::warning::The CLI's dev revert-pr couldn't run or couldn't open its issue; opening a plain issue instead."
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           gh issue create --repo "$GITHUB_REPOSITORY" --assignee "$OWNER" \
             --title "Post-merge check failed on main at ${AFTER:0:7}" \
-            --body "The post-merge check failed for ${BEFORE:0:7}..${AFTER:0:7} on main (tests: $TESTS_RESULT), and ww couldn't open its own revert PR or issue. Look at the run: $run_url"
+            --body "The post-merge check failed for ${BEFORE:0:7}..${AFTER:0:7} on main (tests: $TESTS_RESULT), and the CLI couldn't open its own revert PR or issue. Look at the run: $run_url"
           exit 1
 
       - name: Open an issue about a commit's identity
         # No revert PR here: the commit is already public, and history keeps it after a revert.
-        # The body never repeats the e-mail; ww's own output (masked) is only in the run log.
+        # The body never repeats the e-mail; the CLI's own output (masked) is only in the run log.
         if: ${{ always() && steps.identity.outcome == 'failure' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

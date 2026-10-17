@@ -28,6 +28,60 @@ const FILES: [&str; 5] = [
     "post-merge.yml",
 ];
 
+/// The jobs that build the CLI from main (or, in post-merge, from `before`) to judge or scan
+/// commits they never build (R21, R33, R38): `(file, job id)`.
+const JUDGES: [(&str, &str); 4] = [
+    ("ci-guard.yml", "protected-test-check"),
+    ("ci-push.yml", "privacy-check"),
+    ("ci-pr-ready.yml", "privacy-check-pr"),
+    ("post-merge.yml", "post-merge-check"),
+];
+
+/// The jobs that build the PR's or the pushed tree itself. They keep `-p ww-cli` until the
+/// crate is renamed in that same tree.
+const TREE_BUILDERS: [(&str, &str); 3] = [
+    ("ci-push.yml", "every-push"),
+    ("ci-pr-ready.yml", "pr-ready"),
+    ("post-merge.yml", "post-merge-tests"),
+];
+
+/// The name of the step that picks the CLI crate a judge builds (D7).
+const PICK_STEP: &str = "Pick the CLI crate";
+
+/// The only steps that get the privacy denylist: `(file, job id, step name)`.
+const SCAN_STEPS: [(&str, &str, &str); 3] = [
+    (
+        "ci-push.yml",
+        "privacy-check",
+        "Privacy scan of the branch's commits that main lacks, with the CLI built from main",
+    ),
+    (
+        "ci-pr-ready.yml",
+        "privacy-check-pr",
+        "Privacy scan of the PR's commits, with the CLI built from main",
+    ),
+    (
+        "post-merge.yml",
+        "post-merge-check",
+        "Check the pushed commits' identities",
+    ),
+];
+
+/// The denylist variables a scan step sets, each from its own repository secret (ruling RN5):
+/// GitHub expands a secret that doesn't exist to "", and the reader skips a blank variable
+/// (RN4), so the scan works whichever of the two secrets exists.
+const DENYLIST_SECRETS: [(&str, &str); 2] = [
+    (
+        "LIL_PRIVACY_DENYLIST",
+        "${{ secrets.LIL_PRIVACY_DENYLIST }}",
+    ),
+    ("WW_PRIVACY_DENYLIST", "${{ secrets.WW_PRIVACY_DENYLIST }}"),
+];
+
+/// A scan step's first line: it fails only when both denylist variables are empty (RN5).
+const DENYLIST_GUARD: &str =
+    "if [ -z \"${LIL_PRIVACY_DENYLIST:-}\" ] && [ -z \"${WW_PRIVACY_DENYLIST:-}\" ]; then";
+
 fn dir() -> PathBuf {
     workspace_root().join(".github").join("workflows")
 }
@@ -119,6 +173,18 @@ fn uses(step: &Yaml) -> &str {
 
 fn run(step: &Yaml) -> &str {
     s(&step["run"])
+}
+
+/// The index of the one step of `steps` named `name`.
+fn step_named(steps: &[Yaml], name: &str) -> usize {
+    let found: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, st)| s(&st["name"]) == name)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one step {name:?}");
+    found[0]
 }
 
 /// The text without whole-line `#` comments, for checks that comments may legitimately mention.
@@ -369,27 +435,26 @@ fn workflow_job_ids_are_unique_across_workflows() {
 
 /// QA-086 / R32-R34: privacy-check scans every commit of a pushed branch that main doesn't
 /// have; privacy-check-pr scans a PR's commits. Both read the denylist from the Actions secret
-/// and fail when it is empty. Like ci-guard (R21), neither ever builds or runs the scanned code:
-/// one checkout, of main; the commits to scan are fetched as git data; `ww` is built from main's
-/// working tree in a step without the secret (so not even main's build scripts see it), and the
-/// built binary runs the scan in the only step that has the secret; no sccache (the Actions
-/// cache is written by jobs that run unreviewed code). Only `git fetch`, `git rev-parse` and
-/// `git cat-file` run.
+/// and fail when both denylist variables are empty. Like ci-guard (R21), neither ever builds or
+/// runs the scanned code: one checkout, of main; the commits to scan are fetched as git data; the
+/// CLI is built from main's working tree in a step without the secret (so not even main's build
+/// scripts see it), and the built binary runs the scan in the only step that has the secret; no
+/// sccache (the Actions cache is written by jobs that run unreviewed code). Only `git fetch`,
+/// `git rev-parse` and `git cat-file` run.
 #[test] // spec: QA-086
 fn workflow_privacy_checks_shape() {
-    let secret = "${{ secrets.WW_PRIVACY_DENYLIST }}";
-    let build_line = "cargo build --locked -p ww-cli --bin ww";
+    let build_line = "cargo build --locked -p \"$pkg\" --bin \"$bin\"";
     let cases = [
         (
             "ci-push.yml",
             "privacy-check",
-            "./target/debug/ww.exe dev privacy-scan --ref-name \"$GITHUB_REF\" --range \"refs/remotes/origin/main..$HEAD_SHA\"",
+            "\"$CLI_BIN\" dev privacy-scan --ref-name \"$GITHUB_REF\" --range \"refs/remotes/origin/main..$HEAD_SHA\"",
             vec![("HEAD_SHA", "${{ github.sha }}")],
         ),
         (
             "ci-pr-ready.yml",
             "privacy-check-pr",
-            "./target/debug/ww.exe dev privacy-scan --ref-name \"refs/heads/$HEAD_REF\" --range \"refs/remotes/origin/$BASE_REF..$HEAD_SHA\"",
+            "\"$CLI_BIN\" dev privacy-scan --ref-name \"refs/heads/$HEAD_REF\" --range \"refs/remotes/origin/$BASE_REF..$HEAD_SHA\"",
             vec![
                 ("BASE_REF", "${{ github.event.pull_request.base.ref }}"),
                 ("HEAD_SHA", "${{ github.event.pull_request.head.sha }}"),
@@ -413,6 +478,7 @@ fn workflow_privacy_checks_shape() {
         for key in [
             "RUSTC_WRAPPER",
             "SCCACHE_GHA_ENABLED",
+            "LIL_PRIVACY_DENYLIST",
             "WW_PRIVACY_DENYLIST",
         ] {
             assert!(job["env"][key].is_badvalue(), "{file}/{id}: job env {key}");
@@ -519,53 +585,42 @@ fn workflow_privacy_checks_shape() {
             !run(scan).contains("cargo"),
             "{file}/{id}: the scan step builds nothing"
         );
-        assert!(
-            run(build).contains("if [ ! -f crates/ww-cli/Cargo.toml ]; then"),
-            "{file}/{id}: no ww on main fails the build step"
-        );
+        // The build step takes the crate from the pick step (see
+        // judges_pick_the_cli_crate_from_the_tree_they_build), which refuses when main has none.
+        let pick = step_named(&steps, PICK_STEP);
+        assert!(pick < builds[0], "{file}/{id}: pick before build");
+        for out in ["pkg", "bin"] {
+            assert_eq!(
+                s(&build["env"][out]),
+                format!("${{{{ steps.pick.outputs.{out} }}}}"),
+                "{file}/{id}: build env {out}"
+            );
+        }
         assert_eq!(
-            s(&scan["env"]["WW_PRIVACY_DENYLIST"]),
-            secret,
-            "{file}/{id}"
+            s(&scan["env"]["CLI_BIN"]),
+            "./target/debug/${{ steps.pick.outputs.bin }}.exe",
+            "{file}/{id}: the binary built in the workspace (main)"
         );
+        for (k, v) in DENYLIST_SECRETS {
+            assert_eq!(s(&scan["env"][k]), v, "{file}/{id}: env {k}");
+        }
         for (k, v) in env {
             assert_eq!(s(&scan["env"][k]), v, "{file}/{id}: env {k}");
         }
-        // Fails closed when the secret is missing or empty (fork PRs get no secrets).
-        assert!(
-            run(scan).contains("if [ -z \"${WW_PRIVACY_DENYLIST:-}\" ]; then"),
+        // Fails closed when both secrets are missing or empty (fork PRs get no secrets).
+        assert_eq!(
+            run(scan).lines().next().map(str::trim),
+            Some(DENYLIST_GUARD),
             "{file}/{id}"
         );
         assert_eq!(run(scan).matches("exit 1").count(), 1, "{file}/{id}");
         // The secret reaches only the scan step.
         for (i, st) in steps.iter().enumerate() {
             if i != scans[0] {
-                assert!(
-                    st["env"]["WW_PRIVACY_DENYLIST"].is_badvalue(),
-                    "{file}/{id}: step {i} has the secret"
-                );
+                for (k, _) in DENYLIST_SECRETS {
+                    assert!(st["env"][k].is_badvalue(), "{file}/{id}: step {i} has {k}");
+                }
             }
-        }
-    }
-    // The denylist secret reaches these two jobs' scan steps and post-merge-check's identity
-    // step (checked in workflow_post_merge_identity_check_shape), and nothing else.
-    for (file, (text, doc)) in all() {
-        let expected = match file.as_str() {
-            "ci-push.yml" | "ci-pr-ready.yml" | "post-merge.yml" => 1,
-            _ => 0,
-        };
-        assert_eq!(
-            code_only(&text)
-                .matches("secrets.WW_PRIVACY_DENYLIST")
-                .count(),
-            expected,
-            "{file}"
-        );
-        for (id, job) in jobs(&doc) {
-            assert!(
-                job["env"]["WW_PRIVACY_DENYLIST"].is_badvalue(),
-                "{file}/{id}"
-            );
         }
     }
 }
@@ -647,12 +702,12 @@ fn workflow_ci_guard_never_runs_head_code() {
             assert!(!script.contains(forbidden), "ci-guard runs `{forbidden}`");
         }
         for line in script.lines().filter(|l| l.contains("cargo ")) {
-            // The only cargo calls: a version print, and building and running ww from main's
-            // checkout (the working tree) on the head commit as data.
+            // The only cargo calls: a version print, and building and running the CLI crate
+            // picked from main's checkout (the working tree) on the head commit as data.
             let l = line.trim();
             let version = l == "cargo --version";
             let run_guard = l
-                == "cargo run --locked -p ww-cli -- dev guard --base refs/remotes/origin/main --head \"$HEAD_SHA\" --pr \"$PR_NUMBER\"";
+                == "cargo run --locked -p \"$pkg\" --bin \"$bin\" -- dev guard --base refs/remotes/origin/main --head \"$HEAD_SHA\" --pr \"$PR_NUMBER\"";
             assert!(version || run_guard, "unexpected cargo call: {l}");
             guard_runs += usize::from(run_guard);
         }
@@ -668,7 +723,7 @@ fn workflow_ci_guard_never_runs_head_code() {
 }
 
 /// R24 and QA-079: only post-merge-check can write, and it never runs the pushed code's tests
-/// (those run in the read-only post-merge-tests job); it judges with a ww built from `before`.
+/// (those run in the read-only post-merge-tests job); it judges with a CLI built from `before`.
 #[test]
 fn workflow_post_merge_check_is_the_only_writer() {
     let mut writers = Vec::new();
@@ -727,32 +782,44 @@ fn workflow_post_merge_check_is_the_only_writer() {
     assert!(s(&revert["if"]).contains("always()"), "{:?}", revert["if"]);
     assert!(!s(&revert["if"]).contains("cancelled()"));
     // R27: repository creation runs the tests but skips the judge and the revert.
-    let src = by_name("Choose the source ww is built from");
+    let src = by_name("Choose the tree the CLI is built from");
     assert!(run(&src).contains("repository creation push; nothing to compare"));
     assert!(run(&src).contains("judge=false"));
-    // R38: no fallback to the pushed commit. When `before` has no ww, the step refuses (and the
-    // revert step opens the plain issue); ww is only ever built from the worktree of `before`.
+    // R38: no fallback to the pushed commit. When `before` has no CLI crate, the pick step
+    // refuses (and the revert step opens the plain issue); the CLI is only ever built from the
+    // worktree of `before`.
+    let pick = by_name(PICK_STEP);
+    for st in [&src, &pick] {
+        assert!(
+            !run(st).contains("$GITHUB_WORKSPACE"),
+            "the CLI must never be built from the pushed commit"
+        );
+        assert!(!run(st).contains("::warning::"), "{}", run(st));
+    }
+    for crate_path in ["crates/lil-cli/Cargo.toml", "crates/ww-cli/Cargo.toml"] {
+        assert!(
+            run(&pick).contains(&format!("git cat-file -e \"${{BEFORE}}:{crate_path}\"")),
+            "{}",
+            run(&pick)
+        );
+    }
     assert!(
-        !run(&src).contains("$GITHUB_WORKSPACE"),
-        "ww must never be built from the pushed commit"
+        run(&pick).contains("else\n  echo \"::error::"),
+        "no crate in `before` refuses: {}",
+        run(&pick)
     );
-    assert!(
-        run(&src).contains("git cat-file -e \"${BEFORE}:crates/ww-cli/Cargo.toml\""),
-        "{}",
-        run(&src)
-    );
+    assert_eq!(run(&pick).matches("exit 1").count(), 1, "{}", run(&pick));
     assert_eq!(
         run(&src).matches("dir=\"").count(),
         2,
         "dir is empty or before's worktree"
     );
-    assert!(run(&src).contains("dir=\"$RUNNER_TEMP/ww-before\""));
-    assert!(!run(&src).contains("::warning::"), "{}", run(&src));
+    assert!(run(&src).contains("dir=\"$RUNNER_TEMP/cli-before\""));
     assert!(
         run(&revert).contains("gh issue create"),
         "the plain issue stays"
     );
-    for name in ["Build ww", "Judge the push"] {
+    for name in [PICK_STEP, "Build the CLI from main", "Judge the push"] {
         assert_eq!(
             s(&by_name(name)["if"]),
             "steps.src.outputs.judge == 'true'",
@@ -760,11 +827,15 @@ fn workflow_post_merge_check_is_the_only_writer() {
         );
     }
     assert!(s(&revert["if"]).contains("steps.src.outputs.judge != 'false'"));
-    // R38: ww refuses to run outside the checkout it was built from, so the judge and the revert
-    // run in the worktree of `before` that ww was built in (the revert falls back to the
-    // workspace only when that step never chose a source, to open the plain issue).
+    // R38: the CLI refuses to run outside the checkout it was built from, so the judge and the
+    // revert run in the worktree of `before` that it was built in (the revert falls back to the
+    // workspace only when that step never chose a tree, to open the plain issue).
     let built_in = "${{ steps.src.outputs.dir }}";
-    assert_eq!(s(&by_name("Build ww")["working-directory"]), built_in);
+    assert_eq!(s(&pick["working-directory"]), built_in);
+    assert_eq!(
+        s(&by_name("Build the CLI from main")["working-directory"]),
+        built_in
+    );
     assert_eq!(s(&by_name("Judge the push")["working-directory"]), built_in);
     assert_eq!(
         s(&revert["working-directory"]),
@@ -786,19 +857,22 @@ fn workflow_post_merge_check_is_the_only_writer() {
 
 /// QA-086: GitHub creates a PR's merge commit itself, with the e-mail the account's web settings
 /// give it, so no local hook or pre-push scan sees it. post-merge-check therefore runs
-/// `ww dev privacy-scan --commits before..after` with the same `ww` the judge uses (built from
-/// `before`, in its worktree), in the only step of the job that gets the denylist secret. That
+/// `dev privacy-scan --commits before..after` with the same CLI the judge uses (built from
+/// `before`, in its worktree), in the only step of the job that gets the denylist secrets. That
 /// step builds nothing, runs no cargo and holds no token. A failure fails the job and opens an
-/// issue (no revert PR: history keeps the commit), whose body never repeats ww's output.
+/// issue (no revert PR: history keeps the commit), whose body never repeats the CLI's output.
 #[test] // spec: QA-086
 fn workflow_post_merge_identity_check_shape() {
-    let secret = "${{ secrets.WW_PRIVACY_DENYLIST }}";
     let (_, doc) = get("post-merge.yml");
     for (id, job) in jobs(&doc) {
-        assert!(job["env"]["WW_PRIVACY_DENYLIST"].is_badvalue(), "{id}");
+        for (k, _) in DENYLIST_SECRETS {
+            assert!(job["env"][k].is_badvalue(), "{id}: job env {k}");
+        }
     }
     for st in steps(&doc["jobs"]["post-merge-tests"]) {
-        assert!(st["env"]["WW_PRIVACY_DENYLIST"].is_badvalue());
+        for (k, _) in DENYLIST_SECRETS {
+            assert!(st["env"][k].is_badvalue(), "post-merge-tests: {k}");
+        }
         assert!(!run(&st).contains("privacy-scan"));
     }
     let check = &doc["jobs"]["post-merge-check"];
@@ -810,7 +884,7 @@ fn workflow_post_merge_identity_check_shape() {
             .unwrap_or_else(|| panic!("no step {name:?}"))
     };
     let (build, judge, identity, issue, revert) = (
-        pos("Build ww"),
+        pos("Build the CLI from main"),
         pos("Judge the push"),
         pos("Check the pushed commits' identities"),
         pos("Open an issue about a commit's identity"),
@@ -847,11 +921,13 @@ fn workflow_post_merge_identity_check_shape() {
         .collect();
     assert_eq!(
         env,
-        ["WW", "WW_PRIVACY_DENYLIST"],
+        ["CLI_BIN", "LIL_PRIVACY_DENYLIST", "WW_PRIVACY_DENYLIST"],
         "no token next to the secret"
     );
-    assert_eq!(s(&st["env"]["WW"]), "${{ steps.src.outputs.ww }}");
-    assert_eq!(s(&st["env"]["WW_PRIVACY_DENYLIST"]), secret);
+    assert_eq!(s(&st["env"]["CLI_BIN"]), "${{ steps.pick.outputs.cli }}");
+    for (k, v) in DENYLIST_SECRETS {
+        assert_eq!(s(&st["env"][k]), v, "identity step env {k}");
+    }
     let script = run(st);
     assert!(!script.contains("${{"), "template expansion");
     assert!(
@@ -870,9 +946,13 @@ fn workflow_post_merge_identity_check_shape() {
         .collect();
     assert_eq!(
         scans,
-        ["\"$WW\" dev privacy-scan --commits \"$BEFORE..$AFTER\" || status=$?"]
+        ["\"$CLI_BIN\" dev privacy-scan --commits \"$BEFORE..$AFTER\" || status=$?"]
     );
-    assert!(script.contains("if [ -z \"${WW_PRIVACY_DENYLIST:-}\" ]; then"));
+    assert_eq!(
+        script.lines().next().map(str::trim),
+        Some(DENYLIST_GUARD),
+        "fails only when both denylist variables are empty"
+    );
     assert!(script.contains("exit \"$status\""));
     // BEFORE and AFTER reach it through the job's env.
     assert_eq!(s(&check["env"]["BEFORE"]), "${{ github.event.before }}");
@@ -881,16 +961,15 @@ fn workflow_post_merge_identity_check_shape() {
     // The secret is on that step only, within post-merge-check.
     for (i, other) in steps.iter().enumerate() {
         if i != identity {
-            assert!(
-                other["env"]["WW_PRIVACY_DENYLIST"].is_badvalue(),
-                "step {i} has the secret"
-            );
+            for (k, _) in DENYLIST_SECRETS {
+                assert!(other["env"][k].is_badvalue(), "step {i} has {k}");
+            }
             assert!(!run(other).contains("privacy-scan"), "step {i} scans");
         }
     }
 
-    // The issue: opened on a failure of the identity step, assigned to the owner, without ww's
-    // output and without a revert.
+    // The issue: opened on a failure of the identity step, assigned to the owner, without the
+    // CLI's output and without a revert.
     let st = &steps[issue];
     assert_eq!(
         s(&st["if"]),
@@ -903,6 +982,7 @@ fn workflow_post_merge_identity_check_shape() {
     assert!(script.contains("--title \"A commit on main carries a non-no-reply e-mail\""));
     assert!(script.contains("Keep my email addresses private"));
     for forbidden in [
+        "$CLI_BIN",
         "$WW",
         "privacy-scan",
         "revert-pr",
@@ -1048,11 +1128,11 @@ fn workflow_every_push_and_pr_ready_shape() {
     );
 }
 
-/// R38: `ww` refuses to work on a repository other than the checkout it was built from, so every
-/// step that runs a built `ww` binary runs in the directory the build step built it in.
+/// R38: the CLI refuses to work on a repository other than the checkout it was built from, so
+/// every step that runs a built CLI binary runs in the directory the build step built it in.
 /// (`cargo run` builds and runs in one step, so it is always in its own checkout.)
 #[test]
-fn workflow_runs_ww_where_it_was_built() {
+fn workflow_runs_the_cli_where_it_was_built() {
     let dir_of = |st: &Yaml| -> String {
         s(&st["working-directory"])
             .trim()
@@ -1064,20 +1144,28 @@ fn workflow_runs_ww_where_it_was_built() {
             let steps = steps(&job);
             let builds: Vec<String> = steps
                 .iter()
-                .filter(|st| run(st).contains("cargo build") && run(st).contains("-p ww-cli"))
+                .filter(|st| {
+                    let script = run(st);
+                    script.contains("cargo build")
+                        && ["-p \"$pkg\"", "-p ww-cli", "-p lil-cli"]
+                            .iter()
+                            .any(|p| script.contains(p))
+                })
                 .map(dir_of)
                 .collect();
             for st in &steps {
                 let script = run(st);
-                let runs_binary = script.contains("ww.exe ") || script.contains("\"$WW\" ");
+                let runs_binary = ["\"$CLI_BIN\" ", "ww.exe ", "lil.exe ", "\"$WW\" "]
+                    .iter()
+                    .any(|r| script.contains(r));
                 if !runs_binary {
                     continue;
                 }
-                assert_eq!(builds.len(), 1, "{file}/{id}: one ww build per job");
+                assert_eq!(builds.len(), 1, "{file}/{id}: one CLI build per job");
                 assert_eq!(
                     dir_of(st),
                     builds[0],
-                    "{file}/{id}: step {:?} runs ww outside the directory it was built in",
+                    "{file}/{id}: step {:?} runs the CLI outside the directory it was built in",
                     s(&st["name"])
                 );
                 checked += 1;
@@ -1098,4 +1186,304 @@ fn workflow_text_has_no_first_merge_bootstrap() {
             assert!(!lower.contains(stale), "{file}: mentions {stale:?}");
         }
     }
+}
+
+/// Review Focus 4, R21, R33, R38: CI has to keep working while the CLI crate is renamed. Every
+/// judge (the jobs that build the CLI from main, or from `before` in post-merge, and never from
+/// the commits they judge) first runs the step "Pick the CLI crate" in the tree it builds. That
+/// step looks for `crates/lil-cli` first and then `crates/ww-cli`, refuses when neither is there,
+/// and hands `pkg` and `bin` to the one build step. Nothing else in the job names a crate, so
+/// the judge builds whichever crate that tree has. The jobs that build the PR's or the pushed
+/// tree itself keep `-p ww-cli` until that tree renames the crate.
+#[test] // spec: QA-086
+fn judges_pick_the_cli_crate_from_the_tree_they_build() {
+    for (file, id) in JUDGES {
+        let (_, doc) = get(file);
+        let job = &doc["jobs"][id];
+        let steps = steps(job);
+        let p = step_named(&steps, PICK_STEP);
+        let pick = &steps[p];
+        assert_eq!(s(&pick["id"]), "pick", "{file}/{id}");
+        let script = run(pick);
+        let from_before = file == "post-merge.yml";
+
+        // Both branches, the new crate first, and a refusal when neither is in the tree.
+        let (lil_test, ww_test) = if from_before {
+            (
+                "if git cat-file -e \"${BEFORE}:crates/lil-cli/Cargo.toml\" 2>/dev/null; then",
+                "elif git cat-file -e \"${BEFORE}:crates/ww-cli/Cargo.toml\" 2>/dev/null; then",
+            )
+        } else {
+            (
+                "if [ -f crates/lil-cli/Cargo.toml ]; then",
+                "elif [ -f crates/ww-cli/Cargo.toml ]; then",
+            )
+        };
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        assert!(lines.len() > 10, "{file}/{id}: {script}");
+        assert_eq!(
+            lines[..7],
+            [
+                lil_test,
+                "pkg=lil-cli",
+                "bin=lil",
+                ww_test,
+                "pkg=ww-cli",
+                "bin=ww",
+                "else"
+            ],
+            "{file}/{id}: {script}"
+        );
+        assert!(
+            lines[7].starts_with("echo \"::error::"),
+            "{file}/{id}: {script}"
+        );
+        assert_eq!(lines[8..10], ["exit 1", "fi"], "{file}/{id}: {script}");
+        assert_eq!(script.matches("exit ").count(), 1, "{file}/{id}: {script}");
+        for out in [
+            "echo \"pkg=$pkg\"",
+            "echo \"bin=$bin\"",
+            ">> \"$GITHUB_OUTPUT\"",
+        ] {
+            assert!(script.contains(out), "{file}/{id}: no `{out}`: {script}");
+        }
+        // R38: the pick reads the tree the judge builds, never the pushed commit's.
+        assert!(!script.contains("$GITHUB_WORKSPACE"), "{file}/{id}");
+        assert!(!script.contains("${{"), "{file}/{id}: template expansion");
+        assert!(
+            !script.contains("cargo"),
+            "{file}/{id}: the pick builds nothing"
+        );
+
+        // The tree: main's working tree (the job's one checkout, of main), or the worktree of
+        // `before` that the step before it made.
+        if from_before {
+            let src = step_named(&steps, "Choose the tree the CLI is built from");
+            assert!(src < p, "{file}/{id}: the tree is chosen first");
+            assert_eq!(s(&steps[src]["id"]), "src");
+            assert!(
+                run(&steps[src])
+                    .contains("git worktree add --detach \"$RUNNER_TEMP/cli-before\" \"$BEFORE\""),
+                "{}",
+                run(&steps[src])
+            );
+            assert_eq!(s(&job["env"]["BEFORE"]), "${{ github.event.before }}");
+            assert_eq!(
+                s(&pick["working-directory"]),
+                "${{ steps.src.outputs.dir }}"
+            );
+            assert_eq!(s(&pick["if"]), "steps.src.outputs.judge == 'true'");
+            assert!(
+                script.contains("echo \"cli=$RUNNER_TEMP/cli-target/debug/$bin.exe\""),
+                "{script}"
+            );
+        } else {
+            assert!(pick["working-directory"].is_badvalue(), "{file}/{id}");
+            let checkouts: Vec<usize> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, st)| uses(st).starts_with("actions/checkout@"))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(checkouts.len(), 1, "{file}/{id}: one checkout");
+            let checkout = &steps[checkouts[0]];
+            assert_eq!(s(&checkout["with"]["ref"]), "main", "{file}/{id}");
+            assert!(checkout["with"]["path"].is_badvalue(), "{file}/{id}");
+            assert!(checkouts[0] < p, "{file}/{id}: main is checked out first");
+        }
+
+        // One build (or build-and-run) step, after the pick, in the same tree, with its outputs.
+        let builds: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, st)| run(st).contains("cargo build") || run(st).contains("cargo run"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(builds.len(), 1, "{file}/{id}: one build step");
+        let b = builds[0];
+        let build = &steps[b];
+        assert!(p < b, "{file}/{id}: pick before build");
+        assert_eq!(
+            s(&build["env"]["pkg"]),
+            "${{ steps.pick.outputs.pkg }}",
+            "{file}/{id}"
+        );
+        assert_eq!(
+            s(&build["env"]["bin"]),
+            "${{ steps.pick.outputs.bin }}",
+            "{file}/{id}"
+        );
+        assert!(
+            run(build).contains("--locked -p \"$pkg\" --bin \"$bin\""),
+            "{file}/{id}: {}",
+            run(build)
+        );
+        assert_eq!(
+            s(&build["working-directory"]),
+            s(&pick["working-directory"]),
+            "{file}/{id}: built in the tree the crate was picked from"
+        );
+        if from_before {
+            assert_eq!(
+                s(&build["env"]["CARGO_TARGET_DIR"]),
+                "${{ runner.temp }}/cli-target"
+            );
+        }
+
+        // Only the pick names a crate; every binary run goes through CLI_BIN, from its outputs.
+        let expected_bin = if from_before {
+            "${{ steps.pick.outputs.cli }}"
+        } else {
+            "./target/debug/${{ steps.pick.outputs.bin }}.exe"
+        };
+        let mut runs = 0;
+        for (i, st) in steps.iter().enumerate() {
+            let script = run(st);
+            if i != p {
+                for name in ["ww-cli", "lil-cli", "ww.exe", "lil.exe", "\"$WW\""] {
+                    assert!(
+                        !script.contains(name),
+                        "{file}/{id}: step {:?} names `{name}`",
+                        s(&st["name"])
+                    );
+                }
+            }
+            if script.contains("\"$CLI_BIN\"") {
+                assert!(i > b, "{file}/{id}: runs the CLI before building it");
+                assert_eq!(s(&st["env"]["CLI_BIN"]), expected_bin, "{file}/{id}");
+                runs += 1;
+            }
+        }
+        let expected_runs = match id {
+            "protected-test-check" => 0, // `cargo run` builds and runs in one step
+            "post-merge-check" => 3,     // the judge, the identity check and the revert
+            _ => 1,                      // the scan
+        };
+        assert_eq!(runs, expected_runs, "{file}/{id}: CLI_BIN runs");
+    }
+
+    for (file, id) in TREE_BUILDERS {
+        let (_, doc) = get(file);
+        let steps = steps(&doc["jobs"][id]);
+        assert!(
+            steps
+                .iter()
+                .all(|st| s(&st["name"]) != PICK_STEP && s(&st["id"]) != "pick"),
+            "{file}/{id}: builds its own tree"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|st| run(st).contains("cargo run --locked -p ww-cli -- dev spec-tests")),
+            "{file}/{id}"
+        );
+    }
+}
+
+/// QA-086, rulings RN4 and RN5: each scan step sets both denylist variables, each from its own
+/// repository secret, and fails only when both are empty. GitHub expands a secret that doesn't
+/// exist to "", and the reader skips a blank variable, so the scan keeps working whichever secret
+/// exists. The scripts never expand either variable except in that guard, so nothing prints it.
+#[test] // spec: QA-086
+fn scan_steps_set_both_denylist_names_each_from_its_own_secret() {
+    // The names the CLI reads (privacy.rs), new first.
+    assert_eq!(
+        [
+            ww_platform::names::DENYLIST_ENV,
+            ww_platform::names::LEGACY_DENYLIST_ENV
+        ],
+        [DENYLIST_SECRETS[0].0, DENYLIST_SECRETS[1].0]
+    );
+    for (file, id, name) in SCAN_STEPS {
+        let (_, doc) = get(file);
+        let steps = steps(&doc["jobs"][id]);
+        let st = &steps[step_named(&steps, name)];
+        for (k, v) in DENYLIST_SECRETS {
+            assert_eq!(s(&st["env"][k]), v, "{file}/{id}: env {k}");
+            assert!(
+                s(&st["env"][k]).contains(&format!("secrets.{k} ")),
+                "{file}/{id}: {k} comes from the secret of the same name"
+            );
+        }
+        let script = run(st);
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        assert_eq!(lines[0], DENYLIST_GUARD, "{file}/{id}: {script}");
+        assert!(
+            lines[1].starts_with("echo \"::error::"),
+            "{file}/{id}: {script}"
+        );
+        for (k, _) in DENYLIST_SECRETS {
+            assert_eq!(
+                script.matches(&format!("[ -z \"${{{k}:-}}\" ]")).count(),
+                1,
+                "{file}/{id}: {k} is tested once, in the both-empty guard"
+            );
+            assert_eq!(
+                script.matches(&format!("${{{k}")).count(),
+                1,
+                "{file}/{id}: {k} is expanded only in the guard"
+            );
+            assert!(
+                !script.contains(&format!("${k}")),
+                "{file}/{id}: {k} expanded outside the guard"
+            );
+        }
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("PRIVACY_DENYLIST") && l.contains("||")),
+            "{file}/{id}: one empty variable must not fail the scan"
+        );
+    }
+}
+
+/// QA-086, R33: the denylist secrets reach the three scan steps and nothing else: no workflow
+/// or job env, no other step's env or action inputs, no other script, and no way of reading
+/// every secret at once.
+#[test] // spec: QA-086
+fn no_step_outside_a_scan_sees_the_denylist_secret() {
+    let mut scans_seen = 0;
+    for (file, (text, doc)) in all() {
+        let code = code_only(&text);
+        let expected = usize::from(SCAN_STEPS.iter().any(|(f, _, _)| *f == file));
+        for (_, secret) in DENYLIST_SECRETS {
+            assert_eq!(code.matches(secret).count(), expected, "{file}: {secret}");
+        }
+        assert_eq!(
+            code.matches("PRIVACY_DENYLIST }}").count(),
+            2 * expected,
+            "{file}: a denylist secret under another name"
+        );
+        for whole in ["toJSON(secrets", "toJson(secrets", "secrets[", "secrets.*"] {
+            assert!(!code.contains(whole), "{file}: `{whole}`");
+        }
+        let mentions = |y: &Yaml| -> bool {
+            y.as_hash().is_some_and(|h| {
+                h.iter().any(|(k, v)| {
+                    s(k).contains("PRIVACY_DENYLIST") || s(v).contains("PRIVACY_DENYLIST")
+                })
+            })
+        };
+        assert!(!mentions(&doc["env"]), "{file}: workflow env");
+        for (id, job) in jobs(&doc) {
+            assert!(!mentions(&job["env"]), "{file}/{id}: job env");
+            for st in steps(&job) {
+                let name = s(&st["name"]);
+                let is_scan = SCAN_STEPS
+                    .iter()
+                    .any(|(f, j, n)| *f == file && *j == id && *n == name);
+                if is_scan {
+                    scans_seen += 1;
+                    continue;
+                }
+                assert!(!mentions(&st["env"]), "{file}/{id}: step {name:?} env");
+                assert!(!mentions(&st["with"]), "{file}/{id}: step {name:?} with");
+                assert!(
+                    !run(&st).contains("PRIVACY_DENYLIST"),
+                    "{file}/{id}: step {name:?} script"
+                );
+            }
+        }
+    }
+    assert_eq!(scans_seen, SCAN_STEPS.len(), "every scan step exists once");
 }
