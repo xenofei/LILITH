@@ -66,7 +66,7 @@ use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
 use crate::events::EventBus;
 use crate::lifecycle::Lifecycle;
-use crate::projects::{ActiveProjects, read_hint, resolve_project, write_hint};
+use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
 use crate::store::StoreError;
@@ -489,13 +489,9 @@ impl Inner {
         // and, on a read-write workspace, the workspace's hint (ARCH-088).
         if let (Outcome::Ok(_), Some(open), Some(slug)) = (&outcome, &open, &named)
             && ww_schema::is_slug(slug)
+            && let Err(e) = remember_project(&self.active, &session.id, open, slug).await
         {
-            self.active.set(&session.id, slug);
-            if open.access == Access::ReadWrite
-                && let Err(e) = write_hint(&open.store, slug).await
-            {
-                tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
-            }
+            tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
         }
         // 8. Meter; 9. record.
         hooks.meter.settle(session, &outcome);

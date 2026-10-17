@@ -7,13 +7,13 @@
 //! durations here are failure deadlines only, never measurements.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ww_core::graph::cycles;
-use ww_core::projects::{add_done_entry, dependents};
+use ww_core::projects::{ActiveProjects, HintWrite, add_done_entry, dependents, remember_project};
 use ww_core::session::Session;
 use ww_core::state::StateRegistry;
 use ww_core::tools::{
@@ -27,7 +27,7 @@ use ww_platform::{Clock, IdSource};
 use ww_protocol::{CallerKind, EffectClass, Outcome, ToolCallParams, ToolOutput};
 use ww_schema::workspace_yaml::new_project_yaml;
 use ww_testkit::files::write_file;
-use ww_testkit::{FakeClock, RawPipe, SeqIds, TestEnv, sha256_bytes};
+use ww_testkit::{FakeClock, RawPipe, SeqIds, TestEnv, sha256_bytes, version_content_hash_of};
 
 /// A failure deadline only, never a measurement (QA-031).
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -73,6 +73,15 @@ struct Fx {
 type MakeRegistry = dyn Fn(&Arc<WorkspaceHub>, &TestEnv, &Arc<dyn Probe>) -> Registry;
 
 fn fx_with(env: &TestEnv, ws: &Path, registry: Option<&MakeRegistry>) -> Fx {
+    fx_full(env, ws, registry, ww_core::store::FailPoints::none())
+}
+
+fn fx_full(
+    env: &TestEnv,
+    ws: &Path,
+    registry: Option<&MakeRegistry>,
+    failpoints: Arc<ww_core::store::FailPoints>,
+) -> Fx {
     let states = Arc::new(
         StateRegistry::open(
             &env.env,
@@ -91,7 +100,7 @@ fn fx_with(env: &TestEnv, ws: &Path, registry: Option<&MakeRegistry>) -> Fx {
         events.clone(),
         clock.clone(),
         ids.clone(),
-        ww_core::store::FailPoints::none(),
+        failpoints,
         probe.clone(),
         ww_core::watch::WatchConfig::default(),
     );
@@ -341,6 +350,39 @@ async fn hint_is_written_only_on_read_write_workspaces() {
         .await;
     let hint: Value = serde_json::from_str(&read_text(&state)).unwrap();
     assert_eq!(hint, json!({"active_project": "sketchbook"}));
+
+    // The dispatcher's step itself: on the read-only workspace no write is even tried (a
+    // try would come back as `workspace.read_only`), and the session's project is set.
+    let active = ActiveProjects::new();
+    assert_eq!(
+        remember_project(&active, "s_x", &ro, "harbor").await,
+        Ok(HintWrite::ReadOnly)
+    );
+    assert_eq!(active.get("s_x").as_deref(), Some("harbor"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&read_text(&state)).unwrap(),
+        json!({"active_project": "sketchbook"})
+    );
+    // On the read-write one it writes the hint, keeping keys it doesn't know.
+    write_file(
+        &state,
+        br#"{"active_project": "sketchbook", "panel": {"open": true}, "zoom": 2}"#,
+    );
+    assert_eq!(
+        remember_project(&active, "s_x", &rw, "harbor").await,
+        Ok(HintWrite::Written)
+    );
+    let hint: Value = serde_json::from_str(&read_text(&state)).unwrap();
+    assert_eq!(
+        hint,
+        json!({"active_project": "harbor", "panel": {"open": true}, "zoom": 2})
+    );
+    let keys: Vec<&String> = hint.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        ["active_project", "panel", "zoom"],
+        "the key order is kept"
+    );
 }
 
 /// The lines of `text`, each with its line ending.
@@ -398,7 +440,10 @@ async fn progress_entry_goes_first_under_done_and_other_sections_are_untouched()
     let mut without = got.clone();
     without.remove(done + 1);
     assert_eq!(without.concat(), CRLF);
-    assert!(text.lines().all(|_| true) && !text.replace("\r\n", "").contains('\n'));
+    assert!(
+        !text.replace("\r\n", "").contains('\n'),
+        "a bare LF in {text:?}"
+    );
     let two = add_done_entry(&text, "2027-01-16", "harbour wall").unwrap();
     assert!(
         two.contains("## Done\r\n- 2027-01-16: harbour wall\r\n- 2027-01-15: project created\r\n")
@@ -572,6 +617,43 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
             "chr_orc",
             approved("chr_orc", "approved", input("env_arch@1.1.0"), json!([])),
         );
+        // A `proj:` input whose source project moved on, unpinned and pinned.
+        put(
+            "chr_wisp",
+            approved(
+                "chr_wisp",
+                "approved",
+                input("proj:harbor/env_tower@1.0.0"),
+                json!([]),
+            ),
+        );
+        put(
+            "chr_ghost",
+            approved(
+                "chr_ghost",
+                "released",
+                input("proj:harbor/env_tower@1.0.0"),
+                json!([{"ref": "proj:harbor/env_tower@1.0.0", "reason": "kept", "by": "user", "date": "2026-10-01"}]),
+            ),
+        );
+        write_file(
+            &file(ws, "projects/harbor/project.yaml"),
+            new_project_yaml("harbor", "Harbor", "game", "2026-10-01").as_bytes(),
+        );
+        let mut tower: Value =
+            serde_json::from_slice(&approved("env_tower", "approved", json!([]), json!([])))
+                .unwrap();
+        tower["project"] = json!("harbor");
+        tower["approved_version"] = json!("1.2.0");
+        write_file(
+            &file(ws, &manifest_rel("harbor", "env_tower")),
+            &serde_json::to_vec_pretty(&tower).unwrap(),
+        );
+        // chr_golem's approved version is sealed on disk, so its stale ref carries the
+        // version's content hash; chr_troll's folder isn't here, so its ref can't.
+        let golem_v1 = file(ws, "projects/sketchbook/assets/chr_golem/v1.0.0");
+        write_file(&golem_v1.join("golem.png"), b"stone golem");
+        write_file(&golem_v1.join("manifest.snapshot.json"), b"{}");
     });
     let fx = fx_with(&env, &ws, None);
     let yaml_before = read_text(&file(&ws, "projects/sketchbook/project.yaml"));
@@ -611,14 +693,17 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
         )
         .await;
     let ws_id = &fx.ws.id;
+    let golem_hash =
+        version_content_hash_of(&file(&ws, "projects/sketchbook/assets/chr_golem/v1.0.0"));
     assert_eq!(
         restored,
         json!({
             "project": "sketchbook",
             "status": "active",
             "stale": [
-                format!("ww://{ws_id}/sketchbook/chr_golem@1.0.0"),
+                format!("ww://{ws_id}/sketchbook/chr_golem@1.0.0#sha256={golem_hash}"),
                 format!("ww://{ws_id}/sketchbook/chr_troll@1.0.0"),
+                format!("ww://{ws_id}/sketchbook/chr_wisp@1.0.0"),
             ],
         })
     );
@@ -648,19 +733,23 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
         ),
         (Some("stale"), Some("exported"))
     );
+    let wisp = read_manifest(&ws, "sketchbook", "chr_wisp");
+    assert_eq!(wisp["status"], "stale");
+    assert_eq!(wisp["status_reason"], "input env_tower 1.2.0 signed off");
     for (asset, status) in [
         ("chr_imp", "approved"),
         ("chr_elf", "in_progress"),
         ("chr_orc", "approved"),
         ("env_arch", "approved"),
+        ("chr_ghost", "released"),
     ] {
         let m = read_manifest(&ws, "sketchbook", asset);
         assert_eq!(m["status"], status, "{asset}");
         assert!(m.get("status_before_stale").is_none(), "{asset}");
     }
 
-    // Active to active, or paused, checks nothing; paused to active checks again (and finds
-    // nothing new: the stale assets stay stale, nothing is marked twice).
+    // Every status but archived checks again, and finds nothing new: the stale assets stay
+    // stale, nothing is marked twice.
     let again = fx
         .ok(
             "s_1",
@@ -705,6 +794,186 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
         )
         .await,
         "params.invalid"
+    );
+}
+
+/// Fail points whose `store.replace` fails once, after `skip` more replaces, from when the
+/// returned arm is set (`arm.store(skip)`); `-1` is disarmed.
+fn fail_replace_once() -> (Arc<ww_core::store::FailPoints>, Arc<AtomicI64>) {
+    let fp = ww_core::store::FailPoints::none();
+    let arm = Arc::new(AtomicI64::new(-1));
+    let hook = arm.clone();
+    fp.on(
+        "store.replace",
+        Box::new(move || match hook.load(Ordering::SeqCst) {
+            n if n < 0 => Ok(()),
+            0 => {
+                hook.store(-1, Ordering::SeqCst);
+                Err(std::io::Error::other("fail point store.replace: test"))
+            }
+            n => {
+                hook.store(n - 1, Ordering::SeqCst);
+                Ok(())
+            }
+        }),
+    );
+    (fp, arm)
+}
+
+#[tokio::test] // spec: CORE-055, CORE-048
+async fn a_restore_that_failed_midway_is_finished_by_the_retry() {
+    let env = TestEnv::new();
+    let ws = workspace(&env, |ws| {
+        for (asset, bytes) in [
+            (
+                "env_arch",
+                approved("env_arch", "approved", json!([]), json!([])),
+            ),
+            (
+                "chr_golem",
+                approved("chr_golem", "approved", input("env_arch@1.0.0"), json!([])),
+            ),
+            (
+                "chr_troll",
+                approved("chr_troll", "approved", input("env_arch@1.0.0"), json!([])),
+            ),
+        ] {
+            write_file(&file(ws, &manifest_rel("sketchbook", asset)), &bytes);
+        }
+    });
+    let (fp, arm) = fail_replace_once();
+    let fx = fx_full(&env, &ws, None, fp);
+    fx.ok(
+        "s_1",
+        "project.set_status",
+        json!({"project": "sketchbook", "status": "archived"}),
+    )
+    .await;
+    let mut newer = read_manifest(&ws, "sketchbook", "env_arch");
+    newer["approved_version"] = json!("1.1.0");
+    write_file(
+        &file(&ws, &manifest_rel("sketchbook", "env_arch")),
+        &serde_json::to_vec_pretty(&newer).unwrap(),
+    );
+
+    // The restore writes `status: active` (one replace), then fails on its first manifest edit.
+    arm.store(1, Ordering::SeqCst);
+    assert_eq!(
+        fx.code(
+            "s_1",
+            "project.set_status",
+            json!({"project": "sketchbook", "status": "active"})
+        )
+        .await,
+        "store.io"
+    );
+    assert!(read_text(&file(&ws, "projects/sketchbook/project.yaml")).contains("status: active\n"));
+    assert_eq!(
+        read_manifest(&ws, "sketchbook", "chr_golem")["status"],
+        "approved"
+    );
+
+    // The retry finds the status already active and still runs the check.
+    let retried = fx
+        .ok(
+            "s_1",
+            "project.set_status",
+            json!({"project": "sketchbook", "status": "active"}),
+        )
+        .await;
+    let ws_id = &fx.ws.id;
+    assert_eq!(
+        retried["stale"],
+        json!([
+            format!("ww://{ws_id}/sketchbook/chr_golem@1.0.0"),
+            format!("ww://{ws_id}/sketchbook/chr_troll@1.0.0"),
+        ])
+    );
+    for asset in ["chr_golem", "chr_troll"] {
+        let m = read_manifest(&ws, "sketchbook", asset);
+        assert_eq!(
+            (m["status"].as_str(), m["status_before_stale"].as_str()),
+            (Some("stale"), Some("approved")),
+            "{asset}"
+        );
+    }
+
+    // Archived to paused catches up too.
+    fx.ok(
+        "s_1",
+        "project.set_status",
+        json!({"project": "sketchbook", "status": "archived"}),
+    )
+    .await;
+    write_file(
+        &file(&ws, &manifest_rel("sketchbook", "chr_late")),
+        &approved("chr_late", "approved", input("env_arch@1.0.0"), json!([])),
+    );
+    fx.ok(
+        "s_1",
+        "watch.notify",
+        json!({"paths": [manifest_rel("sketchbook", "chr_late")]}),
+    )
+    .await;
+    let paused = fx
+        .ok(
+            "s_1",
+            "project.set_status",
+            json!({"project": "sketchbook", "status": "paused"}),
+        )
+        .await;
+    assert_eq!(
+        paused["stale"],
+        json!([format!("ww://{ws_id}/sketchbook/chr_late@1.0.0")])
+    );
+}
+
+#[tokio::test] // spec: CORE-055, CORE-039
+async fn a_create_that_stopped_before_progress_is_finished_by_the_retry() {
+    let env = TestEnv::new();
+    let ws = workspace(&env, |_| {});
+    let (fp, arm) = fail_replace_once();
+    let fx = fx_full(&env, &ws, None, fp);
+    let create = json!({"project": "harbor", "name": "Harbor", "type": "game"});
+
+    // project.yaml is written (one replace), then the progress.md write fails.
+    arm.store(1, Ordering::SeqCst);
+    assert_eq!(
+        fx.code("s_1", "project.create", create.clone()).await,
+        "store.io"
+    );
+    let yaml = read_text(&file(&ws, "projects/harbor/project.yaml"));
+    assert_eq!(
+        yaml,
+        new_project_yaml("harbor", "Harbor", "game", "2027-01-15")
+    );
+    assert!(!file(&ws, "projects/harbor/progress.md").exists());
+
+    // A create with other arguments doesn't take it over.
+    assert_eq!(
+        fx.code(
+            "s_1",
+            "project.create",
+            json!({"project": "harbor", "name": "Other", "type": "game"})
+        )
+        .await,
+        "project.exists"
+    );
+    // The same create finishes it.
+    let done = fx.ok("s_1", "project.create", create.clone()).await;
+    assert_eq!(
+        done,
+        json!({"project": "harbor", "path": "projects/harbor"})
+    );
+    assert_eq!(read_text(&file(&ws, "projects/harbor/project.yaml")), yaml);
+    assert_eq!(
+        read_text(&file(&ws, "projects/harbor/progress.md")),
+        "# Harbor\n\n## Done\n- 2027-01-15: project created\n\n## Next\n\n## Open questions\n"
+    );
+    // Once finished, it is taken.
+    assert_eq!(
+        fx.code("s_1", "project.create", create).await,
+        "project.exists"
     );
 }
 
@@ -934,6 +1203,16 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
             ),
             b"elsewhere",
         );
+        // Conflict copies: the other project's and one outside every project are not
+        // sketchbook's.
+        write_file(
+            &file(ws, "projects/harbor/notes.txt.ww-conflict-20261001T100000Z"),
+            b"harbor's",
+        );
+        write_file(
+            &file(ws, "notes/a.txt.ww-conflict-20261001T100000Z"),
+            b"root",
+        );
     });
     let fx = fx_with(&env, &ws, None);
 
@@ -972,12 +1251,29 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
         "an orphan is never deleted"
     );
 
+    // A conflict copy that appears after the workspace was opened is found at the next call,
+    // anywhere under the project's folder.
+    let late = "projects/sketchbook/assets/env_stone/work/scene.blend.ww-conflict-20270115T080000Z";
+    write_file(&file(&ws, late), b"outside version");
+    let status = fx.ok("s_1", "project.status", json!({})).await;
+    assert_eq!(
+        status["orphans"],
+        json!([
+            "projects/sketchbook/assets/env_stone/candidates/r_20261001_1000",
+            late,
+        ]),
+        "{status}"
+    );
+
     let harbor = fx
         .ok("s_1", "project.status", json!({"project": "harbor"}))
         .await;
     assert_eq!(
         harbor["orphans"],
-        json!(["projects/harbor/assets/chr_troll/candidates/r_20261001_1000"])
+        json!([
+            "projects/harbor/assets/chr_troll/candidates/r_20261001_1000",
+            "projects/harbor/notes.txt.ww-conflict-20261001T100000Z",
+        ])
     );
     assert_eq!(harbor["assets_by_status"], json!({}));
     assert_eq!(

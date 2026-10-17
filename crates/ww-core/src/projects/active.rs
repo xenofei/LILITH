@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use ww_schema::is_slug;
 
 use crate::store::{Store, StoreError, WsPath};
+use crate::workspace::{Access, OpenWorkspace};
 
 /// The project of a call that names none, with no active project and no hint (ARCH-098).
 pub const DEFAULT_PROJECT: &str = "sketchbook";
@@ -109,6 +110,36 @@ pub async fn write_hint(store: &Store, slug: &str) -> Result<(), StoreError> {
         })
         .await
         .map(drop)
+}
+
+/// What [`remember_project`] did with the hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintWrite {
+    /// `state.json` names the project (written, or already so).
+    Written,
+    /// The workspace is served read-only (another core holds `core.lock`, ARCH-028), so the
+    /// hint was left alone and no write was tried.
+    ReadOnly,
+}
+
+/// After a call that named `slug` ended `ok` (ARCH-088): `slug` becomes the session's active
+/// project and, on a read-write workspace, the workspace's hint. A read-only workspace's
+/// `state.json` is never written to (a write would only be refused).
+///
+/// # Errors
+/// The store's error when the hint can't be written; the active project is set anyway.
+pub async fn remember_project(
+    active: &ActiveProjects,
+    session_id: &str,
+    open: &OpenWorkspace,
+    slug: &str,
+) -> Result<HintWrite, StoreError> {
+    active.set(session_id, slug);
+    if open.access != Access::ReadWrite {
+        return Ok(HintWrite::ReadOnly);
+    }
+    write_hint(&open.store, slug).await?;
+    Ok(HintWrite::Written)
 }
 
 #[cfg(test)]

@@ -2,12 +2,13 @@
 //! CORE-048, CORE-055).
 //!
 //! While a project is archived, dependents scans skip it ([`dependents`]), so its assets are
-//! not marked stale when their inputs move on. When it goes back to `active`,
+//! not marked stale when their inputs move on. Whenever it is set to anything but `archived`,
 //! [`restore_staleness`] catches up: each of its assets with an input whose
 //! `approved_version` is now higher than the version in the input's ref, and which isn't
 //! pinned, takes `MarkStale` (status `stale`, `status_before_stale` = the status it had, and a
 //! `status_reason` naming the input). Only `approved`, `exported` and `released` assets can go
-//! stale (CORE-048); others are left as they are.
+//! stale (CORE-048); others, and assets already `stale`, are left as they are, so the check
+//! can run again at any time (a retry after it failed midway finishes it).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -140,9 +141,10 @@ async fn stale_input(
     None
 }
 
-/// Marks the assets of `project` stale whose inputs moved on while it was archived or paused
-/// (module docs), and returns their refs (`ww://<ws>/<project>/<asset_id>@<approved version>`,
-/// or without a version when none is approved). Each edit is the store's hash-checked
+/// Marks the assets of `project` stale whose inputs moved on while it was archived (module
+/// docs), and returns the refs of those this call marked
+/// (`ww://<ws>/<project>/<asset_id>@<approved version>#sha256=<content hash>`, see
+/// `stale_ref`). Each edit is the store's hash-checked
 /// manifest edit; the status is checked again on the manifest as it is written.
 ///
 /// # Errors
@@ -213,19 +215,47 @@ pub async fn restore_staleness(
             })
             .await?;
         if marked.load(Ordering::SeqCst) {
-            let view = after.view();
-            stale.push(match view.approved_version {
-                Some(version) => AssetRef::Sealed {
-                    ws: ws.ws.id.clone(),
-                    project: project.to_string(),
-                    asset: asset.asset_id.clone(),
-                    version,
-                    sha256: None,
-                }
-                .to_string(),
-                None => format!("ww://{}/{project}/{}", ws.ws.id, asset.asset_id),
-            });
+            let approved = after.view().approved_version;
+            stale.push(stale_ref(ws, project, &asset.asset_id, approved).await);
         }
     }
     Ok(stale)
+}
+
+/// The ref of an asset marked stale: its approved version with the version's content hash
+/// (`ww://<ws>/<project>/<asset_id>@<version>#sha256=<hex>`; CORE-047: every new reference to
+/// a sealed version carries the hash), from `Store::versions` as `asset.get` gives it. When
+/// that version's folder isn't on this machine (or can't be read without a download), the
+/// hash can't be known and the ref names the version without it (logged); an asset with no
+/// approved version gets its ref without a version.
+async fn stale_ref(
+    ws: &OpenWorkspace,
+    project: &str,
+    asset_id: &str,
+    approved: Option<Version>,
+) -> String {
+    let Some(version) = approved else {
+        return format!("ww://{}/{project}/{asset_id}", ws.ws.id);
+    };
+    let sha256 = match ws.store.versions(project, asset_id).await {
+        Ok(versions) => versions
+            .into_iter()
+            .find(|v| v.version == version)
+            .map(|v| v.content_hash),
+        Err(e) => {
+            tracing::warn!(project, asset_id, error = %e, "a stale asset's versions can't be read");
+            None
+        }
+    };
+    if sha256.is_none() {
+        tracing::warn!(project, asset_id, %version, "no folder for the approved version; its ref carries no content hash");
+    }
+    AssetRef::Sealed {
+        ws: ws.ws.id.clone(),
+        project: project.to_string(),
+        asset: asset_id.to_string(),
+        version,
+        sha256,
+    }
+    .to_string()
 }

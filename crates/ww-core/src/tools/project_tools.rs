@@ -13,10 +13,15 @@
 //!   active`, `links: []`), then `progress.md` (the template, or the file that is there) with
 //!   the entry `- <date>: project created` under `## Done`. A taken slug is `project.exists`,
 //!   one that isn't a slug `params.invalid`. `type` is one of I4's project types (default
-//!   `custom`).
+//!   `custom`). A create that wrote `project.yaml` but stopped before the `progress.md` entry
+//!   is finished by a retry: when `project.yaml` is byte for byte what this call would write
+//!   and `progress.md` has no `- <date>: project created` line, the entry is added and the
+//!   call succeeds; anything else at that path is `project.exists`.
 //! - `project.set_status` sets `status` in `project.yaml` with the comment-preserving YAML
-//!   edit. Moving from `archived` or `paused` to `active` runs the staleness check
-//!   ([`restore_staleness`]); `stale` lists the assets it marked.
+//!   edit. Every status but `archived` runs the staleness check ([`restore_staleness`]), so a
+//!   project leaving `archived` catches up (to `active` or to `paused`), and a retry after a
+//!   check that failed midway finishes it. The check is idempotent: an asset already `stale`
+//!   is not marked again. `stale` lists the assets this call marked.
 //! - `project.status` is [`project_status`].
 //! - `project.context` gives the call's settings with their sources, the project's `links`,
 //!   and `suggested_tools`: the tools whose module is `workspace` or one of the project's
@@ -64,9 +69,9 @@ const CREATE_DESCRIPTION: &str = "Create a project in the workspace: projects/<p
 
 const SET_STATUS_DESCRIPTION: &str = "Set a project's status to active, paused or archived in \
     its project.yaml (comments are kept). Archived projects are skipped when dependents are \
-    looked for; moving a paused or archived project back to active runs the staleness check, \
-    and stale lists the refs of the assets it marked stale (their inputs got newer approved \
-    versions meanwhile and aren't pinned).";
+    looked for; setting active or paused runs the staleness check, and stale lists the refs \
+    of the assets it marked stale (their inputs got newer approved versions while the project \
+    was archived and aren't pinned).";
 
 const STATUS_DESCRIPTION: &str = "A project's status (active, paused or archived), the number \
     of its assets in each status, and the paths that need attention: orphans (left by an \
@@ -200,18 +205,36 @@ async fn create(ctx: &CallCtx, args: CreateArgs) -> Result<(CreateResult, String
         e.data = Some(json!({ "project": slug }));
         e
     };
-    if store.read(&yaml_rel).await.map_err(error)?.is_some() {
-        return Err(exists());
-    }
     let date = today(ctx)?;
     let yaml = new_project_yaml(&slug, name, kind, &date);
-    match store.write(&yaml_rel, yaml.into_bytes(), Expect::New).await {
-        Ok(_) => {}
-        // Another writer made it after the check above.
-        Err(StoreError::HashConflict {
-            cloud_only: false, ..
-        }) => return Err(exists()),
-        Err(e) => return Err(error(e)),
+    let entry = format!("- {date}: project created");
+    match store.read(&yaml_rel).await.map_err(error)? {
+        None => match store
+            .write(&yaml_rel, yaml.clone().into_bytes(), Expect::New)
+            .await
+        {
+            Ok(_) => {}
+            // Another writer made it after the read above.
+            Err(StoreError::HashConflict {
+                cloud_only: false, ..
+            }) => return Err(exists()),
+            Err(e) => return Err(error(e)),
+        },
+        // A create that stopped after `project.yaml` (module docs): finished only when the
+        // file is exactly this call's and the entry isn't there yet.
+        Some(current) if current == yaml.as_bytes() => {
+            let progress = store.read(&progress_rel).await.map_err(error)?;
+            let has_entry = progress.is_some_and(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .any(|l| l.trim_end() == entry)
+            });
+            if has_entry {
+                return Err(exists());
+            }
+            tracing::info!(project = %slug, "finishing a project create that stopped before progress.md");
+        }
+        Some(_) => return Err(exists()),
     }
     let template = PROGRESS_TEMPLATE.replace("<name>", name);
     store
@@ -248,9 +271,9 @@ async fn set_status(
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
     let slug = args.project;
     let yaml_rel = project_yaml_path(&slug).map_err(|e| traced(ctx, e))?;
-    let before = match read_project(&open.store, &slug).await.map_err(error)? {
+    match read_project(&open.store, &slug).await.map_err(error)? {
         ProjectFile::Missing => return Err(traced(ctx, unknown_project(&slug))),
-        ProjectFile::Parsed(p) => p.status.unwrap_or_else(|| "active".to_string()),
+        ProjectFile::Parsed(_) => {}
         ProjectFile::Unreadable(why) => {
             return Err(error(StoreError::YamlUnsupported(format!(
                 "{yaml_rel} doesn't parse ({why}); fix it first"
@@ -268,9 +291,9 @@ async fn set_status(
         )
         .await
         .map_err(error)?;
-    let restored =
-        args.status == StatusArg::Active && matches!(before.as_str(), "archived" | "paused");
-    let stale = if restored {
+    // Not only on a move out of `archived`: a check that failed midway (after `status` was
+    // written) must be finished by the retry, which then finds the status already set.
+    let stale = if args.status != StatusArg::Archived {
         restore_staleness(open, &slug).await.map_err(error)?
     } else {
         Vec::new()

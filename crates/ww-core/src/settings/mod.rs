@@ -18,6 +18,12 @@
 //! a [`SchemaWarning`]; in the request layer it is `params.invalid`, and so is a suite-level
 //! key ([`SUITE_LEVEL_KEYS`], CORE-057) or any other unknown key.
 //!
+//! The request layer takes dotted keys (`{"models.image_generate": "c"}`) or nested mappings
+//! (`{"models": {"image_generate": "c"}}`), which are walked to the same leaves. Like the
+//! files, it may write `skip_stages` and `auto_approve` under `pipeline`, in either form
+//! (`{"pipeline.skip_stages": […]}` or `{"pipeline": {"skip_stages": […]}}`), or as the
+//! plain keys; any other `pipeline.*` key is not a setting (`params.invalid`).
+//!
 //! `check` and `record` in `skip_stages` are dropped with a [`SchemaWarning`], whatever the
 //! layer (CORE-054). `auto_candidate_on_save` defaults to `false`; nothing in plan 2b acts on
 //! it (CORE-049).
@@ -171,11 +177,14 @@ pub fn cascade(
     if let Some(request) = request {
         let mut leaves = Vec::new();
         for (key, value) in request {
-            let key = PIPELINE_ALIASES
-                .iter()
-                .find(|(alias, _)| alias == key)
-                .map_or(key.as_str(), |(_, to)| to);
             leaves_of(key, value, &mut leaves);
+        }
+        // `pipeline.skip_stages` / `pipeline.auto_approve`, dotted or nested, are the cascade
+        // keys of the files' `pipeline:` mapping.
+        for (key, _) in &mut leaves {
+            if let Some((_, to)) = PIPELINE_ALIASES.iter().find(|(alias, _)| alias == key) {
+                *key = (*to).to_string();
+            }
         }
         for (key, value) in leaves {
             let first = key.split('.').next().unwrap_or_default();
@@ -356,5 +365,23 @@ mod tests {
         .unwrap();
         assert_eq!(s.skip_stages(), ["review"]);
         assert_eq!(s.sources["skip_stages"], SettingSource::Request);
+        // The nested form of the `pipeline` keys is the same setting.
+        let (s, _) = cascade(
+            &ws,
+            None,
+            Some(&obj(json!({"pipeline": {"skip_stages": ["record", "export"], "auto_approve": ["icon"]}}))),
+        )
+        .unwrap();
+        assert_eq!(s.skip_stages(), ["export"]);
+        assert_eq!(s.auto_approve(), ["icon"]);
+        assert_eq!(s.sources["auto_approve"], SettingSource::Request);
+        for bad in [
+            json!({"pipeline": {"extra_reviews": []}}),
+            json!({"pipeline.extra_reviews": []}),
+            json!({"pipeline": ["skip_stages"]}),
+        ] {
+            let err = cascade(&ws, None, Some(&obj(bad.clone()))).unwrap_err();
+            assert!(err.contains("not a setting"), "{bad}: {err}");
+        }
     }
 }

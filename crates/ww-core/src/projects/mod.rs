@@ -24,11 +24,12 @@ use ww_schema::is_slug;
 use ww_schema::workspace_yaml::{ProjectYaml, read_project_yaml};
 
 use crate::index::FileState;
-use crate::store::{Store, StoreError, WsPath, path_key};
+use crate::store::{Store, StoreError, WsPath};
 use crate::workspace::OpenWorkspace;
 
 pub use active::{
-    ActiveProjects, DEFAULT_PROJECT, STATE_JSON, read_hint, resolve_project, write_hint,
+    ActiveProjects, DEFAULT_PROJECT, HintWrite, STATE_JSON, read_hint, remember_project,
+    resolve_project, write_hint,
 };
 pub use progress::add_done_entry;
 pub use staleness::{dependents, restore_staleness};
@@ -182,14 +183,13 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
     }
     needs_repair.sort();
     needs_repair.dedup();
-    let prefix = path_key(&format!("projects/{project}/"));
+    // Only the project's own folder is walked, never the whole workspace.
     let orphans = ws
         .store
-        .orphans()
+        .orphans_in(project)
         .await
         .map_err(|e| e.to_error(""))?
         .into_iter()
-        .filter(|o| path_key(o.as_str()).starts_with(&prefix))
         .map(|o| o.as_str().to_string())
         .collect();
     Ok(ProjectStatus {

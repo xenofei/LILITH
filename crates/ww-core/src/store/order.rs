@@ -105,15 +105,16 @@ pub(super) fn version_folder(name: &str) -> Option<Version> {
     name.strip_prefix(['v', 'V'])?.parse().ok()
 }
 
-/// Every `*.ww-conflict-*` file under `root`, skipping `.git`, and the root's `.trash` and
-/// `.worldwright`, and never following a link.
-fn conflict_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+/// Every `*.ww-conflict-*` file under `start` (the workspace `root`, or a folder in it),
+/// skipping `.git`, and the root's `.trash` and `.worldwright`, and never following a link. A
+/// `start` that doesn't exist holds none.
+fn conflict_files(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
-    let mut folders = vec![root.to_path_buf()];
+    let mut folders = vec![start.to_path_buf()];
     while let Some(dir) = folders.pop() {
         let entries = match list(&dir) {
             Ok(entries) => entries,
-            Err(e) if dir == root => return Err(e),
+            Err(e) if dir == start => return Err(e),
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "the orphan scan can't list a folder");
                 continue;
@@ -289,23 +290,71 @@ impl Store {
             blocking(move || list(&dir)).await.map_err(io)?
         };
         for project in projects.into_iter().filter(|p| p.folder) {
-            let assets = {
-                let dir = project.path.join("assets");
-                blocking(move || list(&dir)).await.map_err(io)?
-            };
-            for asset in assets.into_iter().filter(|a| a.folder) {
-                let asset_rel = format!("projects/{}/assets/{}", project.name, asset.name);
-                self.asset_orphans(&asset_rel, &asset.name, &asset.path, &mut found)
-                    .await?;
-            }
+            self.project_asset_orphans(&project.name, &project.path, &mut found)
+                .await?;
         }
         found.extend(self.staging_orphans().await?);
         let conflicts = {
             let root = root.clone();
-            blocking(move || conflict_files(&root)).await.map_err(io)?
+            blocking(move || conflict_files(&root, &root))
+                .await
+                .map_err(io)?
         };
         found.extend(conflicts.iter().map(|path| self.rel_of(path)));
         Ok(found.into_iter().collect())
+    }
+
+    /// [`Store::orphans`] of one project, sorted: the orphan run folders and sealed versions of
+    /// `projects/<project>/assets/*`, and the `*.ww-conflict-*` files under
+    /// `projects/<project>/`. Only that folder is walked (`project.status`); staging handles
+    /// and conflict files elsewhere are not the project's. A project folder that doesn't exist
+    /// has none.
+    ///
+    /// # Errors
+    /// `store.path_invalid` for a project name that isn't a valid path segment; `store.io`
+    /// when the project's folder can't be listed.
+    pub async fn orphans_in(&self, project: &str) -> Result<Vec<WsPath>, StoreError> {
+        let rel = WsPath::parse(&format!("projects/{project}"))?;
+        if rel.as_str().matches('/').count() != 1 {
+            return Err(StoreError::PathInvalid {
+                path: rel.as_str().to_string(),
+                why: "a project name is one path segment".to_string(),
+            });
+        }
+        let mut found: BTreeSet<WsPath> = BTreeSet::new();
+        let dir = rel.abs(self.root());
+        self.project_asset_orphans(project, &dir, &mut found)
+            .await?;
+        let conflicts = {
+            let (root, start) = (self.root().to_path_buf(), dir);
+            blocking(move || conflict_files(&root, &start))
+                .await
+                .map_err(|e| StoreError::io(&rel, &e))?
+        };
+        found.extend(conflicts.iter().map(|path| self.rel_of(path)));
+        Ok(found.into_iter().collect())
+    }
+
+    /// The orphans of every asset folder of the project folder `dir` (named `project`).
+    async fn project_asset_orphans(
+        &self,
+        project: &str,
+        dir: &Path,
+        found: &mut BTreeSet<WsPath>,
+    ) -> Result<(), StoreError> {
+        let root_rel = WsPath::from_disk(String::new());
+        let assets = {
+            let dir = dir.join("assets");
+            blocking(move || list(&dir))
+                .await
+                .map_err(|e| StoreError::io(&root_rel, &e))?
+        };
+        for asset in assets.into_iter().filter(|a| a.folder) {
+            let asset_rel = format!("projects/{project}/assets/{}", asset.name);
+            self.asset_orphans(&asset_rel, &asset.name, &asset.path, found)
+                .await?;
+        }
+        Ok(())
     }
 
     /// The orphan run folders and sealed versions of one asset folder.
