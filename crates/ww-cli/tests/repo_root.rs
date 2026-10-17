@@ -60,6 +60,27 @@ fn git(dir: &Path, global: &Path, args: &[&str]) {
     assert!(ok, "git {args:?}");
 }
 
+/// What `git rev-parse <args>` prints in `dir`, trimmed.
+fn rev_parse(dir: &Path, global: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("rev-parse")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git rev-parse {args:?}: {}",
+        text(&out)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// A temporary repository with one commit, and an empty global git config file.
 fn other_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -218,15 +239,19 @@ fn the_other_repository_variables_are_refused_whenever_they_are_set() {
 fn the_variables_git_sets_for_our_own_hooks_are_accepted() {
     // What git exports when it runs pre-push or pre-merge-commit in this checkout: nothing, or
     // GIT_INDEX_FILE=.git/index (relative to the top level); `git --git-dir=.git
-    // --work-tree=. push` exports GIT_DIR=.git and GIT_WORK_TREE=. as given.
+    // --work-tree=. push` exports GIT_DIR=.git and GIT_WORK_TREE=. as given. In a linked
+    // worktree `.git` is a file, and git names `<main>/.git/worktrees/<name>` and the index in
+    // it instead, which is what `git rev-parse --git-dir` and `--git-path index` print.
     let (_tmp, _dir, global) = other_repo();
     let own = own_checkout();
-    let abs_git = own.join(".git");
-    let abs_index = own.join(".git").join("index");
+    let git_dir = PathBuf::from(rev_parse(&own, &global, &["--git-dir"]));
+    let index = PathBuf::from(rev_parse(&own, &global, &["--git-path", "index"]));
+    let abs_git = PathBuf::from(rev_parse(&own, &global, &["--absolute-git-dir"]));
+    let abs_index = abs_git.join("index");
     for env in [
-        &[("GIT_INDEX_FILE", Path::new(".git/index"))][..],
+        &[("GIT_INDEX_FILE", index.as_path())][..],
         &[
-            ("GIT_DIR", Path::new(".git")),
+            ("GIT_DIR", git_dir.as_path()),
             ("GIT_WORK_TREE", Path::new(".")),
         ],
         &[("GIT_DIR", &abs_git), ("GIT_INDEX_FILE", &abs_index)],
