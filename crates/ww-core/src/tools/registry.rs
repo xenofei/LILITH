@@ -197,8 +197,10 @@ impl Registry {
     ///
     /// # Panics
     /// If a tool of the same name is registered already, its description is longer than
-    /// 2000 characters (ARCH-037), or it declares no module (CORE-058). These are programming
-    /// errors, caught by the registry tests.
+    /// 2000 characters (ARCH-037), it declares no module (CORE-058), or its input schema is an
+    /// object schema without `"additionalProperties": false` (inputs reject unknown fields;
+    /// `#[serde(deny_unknown_fields)]` gives it). These are programming errors, caught by the
+    /// registry tests.
     pub fn register(&mut self, t: Arc<dyn Tool>) {
         let d = t.descriptor();
         let chars = d.description.chars().count();
@@ -210,6 +212,14 @@ impl Registry {
         assert!(
             !d.module.is_empty(),
             "tool {} declares no module (CORE-058)",
+            d.name
+        );
+        let schema = &d.input_schema;
+        assert!(
+            schema.get("type").and_then(serde_json::Value::as_str) != Some("object")
+                || schema.get("additionalProperties") == Some(&serde_json::Value::Bool(false)),
+            "tool {}: its input schema allows unknown properties; inputs reject unknown fields \
+             (add #[serde(deny_unknown_fields)])",
             d.name
         );
         let name = d.name.clone();

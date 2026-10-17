@@ -160,6 +160,17 @@ pub fn resolve_workspace(
     }
 }
 
+/// The default workspace `env`'s `suite.toml` names, as written there; `None` when there is
+/// no file, it doesn't parse, or it names none. For messages only.
+pub(crate) fn registered_default(env: &Env) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(env.suite_toml()).ok()?;
+    let suite = SuiteToml::parse(&text).ok()?;
+    suite
+        .default_workspace
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The id of the workspace folder `path`.
 fn id_of(path: &Path) -> Result<String, ClientError> {
     let canonical = std::fs::canonicalize(path).map_err(|e| {

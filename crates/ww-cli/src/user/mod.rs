@@ -1,10 +1,12 @@
 //! The `ww` user commands over `ww-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
-//! `events --follow` and `core stop`. Spec Appendix D, "The `ww` user commands", is the
-//! contract for their flags, output and exit codes.
+//! `events --follow`, `core stop` and `workspace init|use`. Spec Appendix D, "The `ww` user
+//! commands", and Appendix E, "The `ww` commands this plan adds", are the contract for their
+//! flags, output and exit codes.
 //!
 //! Every command builds its [`ClientConfig`] for the process's channel as a `cli` caller
 //! ([`config`]). `status`, `call` and `events` name the workspace the `cli` chain resolves
-//! (ARCH-030); `core stop` names none, so a broken workspace registry never stops it.
+//! (ARCH-030); `core stop` and `workspace init|use` name none, so a broken workspace registry
+//! never stops them.
 //!
 //! A workspace found from the current folder that is not registered in `suite.toml` stops
 //! `call` and `events` with a plain message naming the folder; `status` warns once on stderr
@@ -17,6 +19,7 @@ mod call;
 mod core;
 mod events;
 mod status;
+mod workspace;
 
 use std::fmt::Display;
 use std::io::{self, Write as _};
@@ -89,6 +92,29 @@ pub enum UserCommand {
     /// Manage the core process.
     #[command(subcommand)]
     Core(CoreCommand),
+    /// Create workspaces and choose the default one.
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum WorkspaceCommand {
+    /// Create a workspace (or register an existing one) and make it the default when none is set.
+    Init {
+        /// The workspace folder; it is created when it doesn't exist.
+        path: PathBuf,
+        /// The workspace's name (default: the folder's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Make it the default workspace even when one is set.
+        #[arg(long)]
+        default: bool,
+    },
+    /// Make a workspace the default one the core serves.
+    Use {
+        /// A workspace folder (it holds worldwright.yaml).
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -116,6 +142,14 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
             since,
         } => events::run(global, topics, &since),
         UserCommand::Core(CoreCommand::Stop { timeout_secs }) => core::stop(global, timeout_secs),
+        UserCommand::Workspace(WorkspaceCommand::Init {
+            path,
+            name,
+            default,
+        }) => workspace::init(global, &path, name.as_deref(), default),
+        UserCommand::Workspace(WorkspaceCommand::Use { path }) => {
+            workspace::use_default(global, &path)
+        }
     };
     match result {
         Ok(code) | Err(Exit(code)) => code,
@@ -171,7 +205,8 @@ pub(crate) enum UnknownCwdWorkspace {
 ///
 /// With `--no-start`, a workspace that cannot be resolved (a stale `default_workspace` in
 /// `suite.toml`, say) is reported only when a core runs: with none, the command stays a silent
-/// no-op (ARCH-018).
+/// no-op (ARCH-018). The probe for a running core reports its own failures (an untrusted
+/// core, say) rather than hiding them behind the workspace message.
 ///
 /// A workspace the core does not know is named by its folder and where it came from
 /// ([`ClientError::UnknownWorkspace`]); one found from the current folder is handled as
@@ -188,8 +223,11 @@ pub(crate) fn connect(
         Err(e) => {
             if cfg.start == StartPolicy::NoStart {
                 cfg.set_workspace(no_workspace());
-                if let Err(ClientError::NotRunning) = BlockingClient::connect(&cfg) {
-                    return Ok(None);
+                match BlockingClient::connect(&cfg) {
+                    Err(ClientError::NotRunning) => return Ok(None),
+                    // A core runs: the workspace message stands.
+                    Ok(_) => {}
+                    Err(probe) => return Err(cannot_run(probe)),
                 }
             }
             return Err(cannot_run(e));
@@ -327,6 +365,63 @@ mod tests {
             &["ww", "nonsense"],
             &["ww", "core"],
             &["ww", "call"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test] // spec: ARCH-003, ARCH-090
+    fn workspace_init_and_use_parse() {
+        match user(parse(&["ww", "workspace", "init", r"C:\ws\Ünïcödé space"])) {
+            UserCommand::Workspace(WorkspaceCommand::Init {
+                path,
+                name,
+                default,
+            }) => {
+                assert_eq!(path, PathBuf::from(r"C:\ws\Ünïcödé space"));
+                assert_eq!(name, None);
+                assert!(!default);
+            }
+            other => panic!("not workspace init: {other:?}"),
+        }
+        match user(parse(&[
+            "ww",
+            "workspace",
+            "init",
+            "rel ws",
+            "--name",
+            "Ünïcödé space",
+            "--default",
+        ])) {
+            UserCommand::Workspace(WorkspaceCommand::Init {
+                path,
+                name,
+                default,
+            }) => {
+                assert_eq!(path, PathBuf::from("rel ws"));
+                assert_eq!(name.as_deref(), Some("Ünïcödé space"));
+                assert!(default);
+            }
+            other => panic!("not workspace init: {other:?}"),
+        }
+        match user(parse(&[
+            "ww",
+            "--no-start",
+            "workspace",
+            "use",
+            r"D:\other",
+        ])) {
+            UserCommand::Workspace(WorkspaceCommand::Use { path }) => {
+                assert_eq!(path, PathBuf::from(r"D:\other"));
+            }
+            other => panic!("not workspace use: {other:?}"),
+        }
+        for bad in [
+            &["ww", "workspace"][..],
+            &["ww", "workspace", "init"],
+            &["ww", "workspace", "use"],
+            &["ww", "workspace", "use", "a", "b"],
+            &["ww", "workspace", "drop", "a"],
         ] {
             assert!(Cli::try_parse_from(bad).is_err(), "{bad:?} parsed");
         }

@@ -55,8 +55,7 @@ impl Spawned {
         match self.child.stdout_lines().next() {
             Some(line) => line,
             None => panic!(
-                "`ww` closed its stdout before printing a line
-stderr: {}",
+                "`ww` closed its stdout before printing a line\nstderr: {}",
                 self.child.stderr_so_far()
             ),
         }
@@ -67,8 +66,7 @@ stderr: {}",
         match self.child.wait(DEADLINE) {
             Some(code) => code,
             None => panic!(
-                "`ww` still runs after {DEADLINE:?}
-stderr: {}",
+                "`ww` still runs after {DEADLINE:?}\nstderr: {}",
                 self.child.stderr_so_far()
             ),
         }
@@ -353,14 +351,20 @@ fn an_unregistered_workspace_folder_is_named_plainly() {
         assert!(names_folder(&out.stderr), "{out:?}");
         assert!(out.stderr.contains("current folder"), "{out:?}");
         assert!(out.stderr.contains("suite.toml"), "{out:?}");
-        assert!(out.stderr.contains("ww workspace use"), "{out:?}");
+        assert!(out.stderr.contains("ww workspace use \""), "{out:?}");
         assert!(!out.stderr.contains(&id), "{out:?}");
     }
 
-    // Named with --workspace, `status` does not fall back.
+    // Named with --workspace, `status` does not fall back, and the folder is never told to
+    // become the default: the message says which workspace the core serves.
     let ws_arg = ws.to_str().expect("a UTF-8 test path");
     let flagged = env.ww(&["status", "--workspace", ws_arg]);
     assert_eq!(flagged.code, 2, "{flagged:?}");
     assert!(names_folder(&flagged.stderr), "{flagged:?}");
     assert!(flagged.stderr.contains("--workspace"), "{flagged:?}");
+    assert!(!flagged.stderr.contains("ww workspace use"), "{flagged:?}");
+    assert!(
+        flagged.stderr.contains("serves only the default workspace"),
+        "{flagged:?}"
+    );
 }

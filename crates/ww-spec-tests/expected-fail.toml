@@ -3,10 +3,6 @@
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
 tests = [
-    { name = "ww-spec-tests::ws_tools::workspace_init_writes_layout_and_registers_default", rule = "CORE-007", file = "tests/ws_tools.rs" },
-    { name = "ww-spec-tests::ws_tools::workspace_use_switches_default_and_old_sessions_get_unsupported", rule = "ARCH-090", file = "tests/ws_tools.rs" },
-    { name = "ww-spec-tests::ws_tools::unsupported_workspace_error_carries_set_default_hint", rule = "QA-003", file = "tests/ws_tools.rs" },
-    { name = "ww-spec-tests::ws_tools::suite_toml_edits_keep_comments_and_unknown_keys", rule = "CORE-007", file = "tests/ws_tools.rs" },
     { name = "ww-spec-tests::store_order::crash_after_output_lists_orphan_and_keeps_files", rule = "ARCH-075", file = "tests/store_order.rs" },
     { name = "ww-spec-tests::versions_trash::signoff_seals_read_only_version_with_snapshot", rule = "CORE-026", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::versions_trash::signoff_uses_the_confirmed_bump", rule = "CORE-027", file = "tests/versions_trash.rs" },

@@ -25,7 +25,12 @@
 //! `pending_confirmation` outcomes are stored, an error releases the key, except the
 //! too-large `core.bug`, which is stored (the tool ran; a retry must not run it again). The
 //! size is decided before the row is written, so the stored outcome and every replay agree.
-//! A `state.db` failure is `state.unavailable`.
+//! A `state.db` failure is `state.unavailable`. When the row can't be finished after the tool
+//! ran (an outcome to store), it stays `running` until the core restarts, because the tool
+//! must not run again for that key; the error then says so and carries `data.ran: true`.
+//!
+//! A call in a workspace holds its open workspace until its row is finished, so a workspace
+//! the hub lets go of mid-call (`workspace.set_default`) stays open until the call ends.
 //!
 //! **Draining** (ARCH-021). Before stage 1 the call is admitted by the [`Lifecycle`]: a
 //! draining core answers `core.draining` (retry with the same idempotency key once a core
@@ -292,11 +297,13 @@ impl Inner {
         };
 
         // Finish the idempotency row: `ok` and `pending_confirmation` are stored, an error
-        // releases the key (except the one above).
+        // releases the key (except the one above). A row that can't be finished after the
+        // tool ran stays `running`: the tool must not run again for this key.
         match claim {
             None => outcome,
             Some(claim) => match claim.finish(keep.then_some(encoded)).await {
                 Ok(()) => outcome,
+                Err(e) if keep => ran_but_not_saved(&e, &p.name, trace_id),
                 Err(e) => state_unavailable(&e, trace_id),
             },
         }
@@ -337,7 +344,7 @@ impl Inner {
         trace_id: &str,
     ) -> Result<Begun, StateError> {
         let db = match workspace {
-            Some(open) => DbHandle::Workspace(open.state.clone()),
+            Some(open) => DbHandle::Workspace(open.clone()),
             None => DbHandle::Suite(self.states.clone()),
         };
         let now = self
@@ -448,18 +455,20 @@ enum Begun {
     Done(Box<Outcome<ToolOutput>>),
 }
 
-/// A database the dispatcher holds across the call.
+/// A database the dispatcher holds across the call. A workspace one holds the whole open
+/// workspace, so a workspace the hub lets go of mid-call stays open until the row is finished
+/// (its last holder closes it).
 #[derive(Clone)]
 enum DbHandle {
     Suite(Arc<StateRegistry>),
-    Workspace(Arc<StateDb>),
+    Workspace(Arc<OpenWorkspace>),
 }
 
 impl DbHandle {
     fn get(&self) -> &StateDb {
         match self {
             DbHandle::Suite(states) => states.suite(),
-            DbHandle::Workspace(db) => db,
+            DbHandle::Workspace(open) => &open.state,
         }
     }
 }
@@ -537,6 +546,21 @@ fn replay(stored: &str, key: &str, trace_id: &str) -> Outcome<ToolOutput> {
             ),
         }
     })
+}
+
+/// `state.unavailable` for a call whose tool ran but whose outcome couldn't be stored: its row
+/// stays `running` until the core restarts, and `data.ran` is `true`.
+fn ran_but_not_saved(e: &StateError, tool: &str, trace_id: &str) -> Outcome<ToolOutput> {
+    tracing::error!(tool, trace_id, error = %e, "a tool ran, but its outcome could not be stored; its idempotency row stays running");
+    let mut error = ErrorBody::new(
+        &codes::STATE_UNAVAILABLE,
+        "The call ran, but the core could not save its result. Until the core restarts, a retry \
+         with the same idempotency key reports it as still running; check what it did before \
+         you retry with a new key.",
+        trace_id,
+    );
+    error.data = Some(json!({ "ran": true }));
+    Outcome::Error { error }
 }
 
 fn state_unavailable(e: &StateError, trace_id: &str) -> Outcome<ToolOutput> {

@@ -5,6 +5,7 @@
 //! - [`order`]: [`Store::commit`] in the ARCH-075 order, the orphan list and run ids;
 //! - [`logs`]: the locked per-machine monthly append logs;
 //! - [`staging`]: staging handles;
+//! - [`suite_toml`]: `suite.toml` writes (the core is the file's only writer, CORE-007);
 //! - [`paths`]: workspace-relative paths and the paths the store never writes;
 //! - [`failpoints`]: the test-channel fail points (QA-066);
 //! - [`fsops`]: every file-mutating call of the crate, one
@@ -19,6 +20,7 @@ pub mod logs;
 pub mod order;
 pub mod paths;
 pub mod staging;
+pub mod suite_toml;
 pub mod write;
 
 pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
@@ -27,6 +29,7 @@ pub use logs::{LogKind, append_loose_usage};
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
 pub use paths::{WsPath, path_key, writable};
 pub use staging::{STAGING_DIR, StagingHandle};
+pub use suite_toml::register_workspace;
 pub use write::{
     ChangeKind, ChangeSink, Expect, Phase, RecoveryReport, Step, Store, StoreError, StoreEvent,
     Written, lfs_pointer_oid, next_step,

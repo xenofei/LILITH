@@ -15,27 +15,32 @@
 //! core serves it [`Access::ReadOnly`]: read tools work, write tools get
 //! `workspace.read_only`, and its `state.db` is never written (an in-memory one stands in when
 //! there is none on disk).
+//!
+//! When the default changes, the hub lets go of the old default ([`WorkspaceHub::close`]): it
+//! closes once no call holds it, and until then an open in the same core takes it back as it
+//! is, so this core's own running idempotency rows are never released by a reopen.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use ww_platform::fs::{LockedFile, Probe};
 use ww_platform::paths::strip_verbatim;
 use ww_platform::{Clock, Env, IdSource, check_workspace};
 use ww_protocol::codes::{
     CORE_DRAINING, STATE_UNAVAILABLE, STORE_IO, WORKSPACE_UNKNOWN, WORKSPACE_UNSUPPORTED,
 };
-use ww_protocol::{ErrorBody, Fix, NO_WORKSPACE, UiAction};
+use ww_protocol::{AgentHint, ErrorBody, Fix, NO_WORKSPACE, UiAction};
 use ww_schema::SuiteToml;
 
 use crate::events::EventBus;
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::{FailPoints, Store, WsPath, fsops};
 
-/// The UI action that makes another workspace the default (plan 2b's `ww workspace use`).
+/// The UI action and the tool that make another workspace the default (`ww workspace use`).
 pub const SET_DEFAULT_ACTION: &str = "workspace.set_default";
 
 /// A resolved workspace.
@@ -123,10 +128,13 @@ pub fn resolve_workspace(
     }
 }
 
-/// `workspace.unsupported` for the registered workspace at `requested` (owner decision 2).
+/// `workspace.unsupported` for the registered workspace at `requested` (owner decision 2,
+/// QA-003): the message names the default workspace and says how to switch, with the path
+/// quoted (`ww workspace use "<path>"`); the fix is the UI action and the agent hint
+/// `workspace.set_default {path}`.
 pub(crate) fn unsupported(default: Option<&str>, requested: &str, trace_id: &str) -> ErrorBody {
     let serves = match default {
-        Some(default) => format!("This core serves only the default workspace, {default}."),
+        Some(default) => format!("This core serves only the default workspace, \"{default}\"."),
         None => "This core serves only the default workspace, and none is set.".to_string(),
     };
     ErrorBody {
@@ -135,12 +143,15 @@ pub(crate) fn unsupported(default: Option<&str>, requested: &str, trace_id: &str
                 id: SET_DEFAULT_ACTION.to_string(),
                 label: format!("Use {requested} as the default workspace"),
             },
-            agent_hint: None,
+            agent_hint: Some(AgentHint {
+                tool: SET_DEFAULT_ACTION.to_string(),
+                arguments: json!({ "path": requested }),
+            }),
         }),
         ..ErrorBody::new(
             &WORKSPACE_UNSUPPORTED,
             format!(
-                "{serves} To use {requested} instead, make it the default with `ww workspace use {requested}`."
+                "{serves} To use \"{requested}\" instead, make it the default with `ww workspace use \"{requested}\"`."
             ),
             trace_id,
         )
@@ -174,7 +185,8 @@ pub enum Access {
 
 /// A workspace this core serves: what [`WorkspaceHub::open`] set up, shared by every call.
 /// `core.lock` (read-write only) is held until the hub closes it, or until the last reference
-/// goes.
+/// goes: once the hub has let go of it ([`WorkspaceHub::close`]), the last call that holds it
+/// closes its `state.db` and releases `core.lock` as it drops it.
 pub struct OpenWorkspace {
     pub ws: WorkspaceRef,
     pub access: Access,
@@ -184,6 +196,13 @@ pub struct OpenWorkspace {
     pub orphans: Vec<WsPath>,
     /// `core.lock`, held while the workspace is open read-write.
     lock: Mutex<Option<LockedFile>>,
+    /// Closes the workspace's databases when it is dropped.
+    states: Arc<StateRegistry>,
+    /// Set once the workspace is closed; a drop then does nothing more.
+    shut: AtomicBool,
+    /// Dropped last, after the drop has closed everything: the hub waits for it before it
+    /// opens the workspace anew ([`WorkspaceHub::open`]).
+    gone: watch::Sender<()>,
 }
 
 impl std::fmt::Debug for OpenWorkspace {
@@ -197,9 +216,24 @@ impl std::fmt::Debug for OpenWorkspace {
 }
 
 impl OpenWorkspace {
-    /// Lets go of `core.lock`.
-    fn release_lock(&self) {
+    /// Closes the workspace now: its `state.db` (its queued jobs run first), then `core.lock`.
+    /// A blocking call; closing again does nothing.
+    fn close_now(&self) {
+        if self.shut.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.states.close_workspace(&self.ws.id);
         drop(lock(&self.lock).take());
+        tracing::info!(workspace = %self.ws.path.display(), "workspace closed");
+    }
+}
+
+impl Drop for OpenWorkspace {
+    /// The last reference closes the workspace (a short blocking call: the `state.db` actor
+    /// finishes its queued jobs), so a call that held a workspace the hub let go of releases
+    /// `core.lock` before its response is sent.
+    fn drop(&mut self) {
+        self.close_now();
     }
 }
 
@@ -207,10 +241,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The open workspaces, one once-cell per id, and whether the hub has closed.
+/// A workspace the hub let go of while calls still held it.
+struct Closing {
+    open: Weak<OpenWorkspace>,
+    /// Closed once the workspace's drop has finished closing it.
+    gone: watch::Receiver<()>,
+}
+
+/// The open workspaces, one once-cell per id, those let go of while still in use, and whether
+/// the hub has closed.
 #[derive(Default)]
 struct Opens {
     cells: HashMap<String, Arc<OnceCell<Arc<OpenWorkspace>>>>,
+    closing: HashMap<String, Closing>,
     closed: bool,
 }
 
@@ -262,6 +305,16 @@ impl WorkspaceHub {
         hub
     }
 
+    /// The fail points of the workspace stores and of `suite.toml` writes.
+    pub fn failpoints(&self) -> &Arc<FailPoints> {
+        &self.failpoints
+    }
+
+    /// The core's clock.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     /// The id of the default workspace, as last read from `suite.toml`.
     pub fn default_id(&self) -> Option<String> {
         lock(&self.default).as_ref().map(|w| w.id.clone())
@@ -290,6 +343,11 @@ impl WorkspaceHub {
     /// concurrent first calls share it. A failed open is retried by the next call. The errors
     /// carry an empty trace id; the caller sets its own.
     ///
+    /// A workspace the hub let go of ([`WorkspaceHub::close`]) while calls still hold it is
+    /// taken back as it is: the same `core.lock`, `state.db` and running idempotency rows, so a
+    /// reopen in the same core never releases this core's own in-flight calls. Once its last
+    /// holder has closed it, a new open waits for that close to finish before it starts.
+    ///
     /// The open, in order:
     /// 1. `check_workspace` (the harness guard, QA-040);
     /// 2. `<ws>\.worldwright\` and its `core.lock`: taken → [`Access::ReadWrite`], held by
@@ -306,7 +364,7 @@ impl WorkspaceHub {
     /// # Panics
     /// When the harness guard is armed and `ws` is registered in a real `suite.toml`.
     pub async fn open(&self, ws: &WorkspaceRef) -> Result<Arc<OpenWorkspace>, ErrorBody> {
-        let cell = {
+        let (cell, wait) = {
             let mut opens = lock(&self.opens);
             if opens.closed {
                 return Err(ErrorBody::new(
@@ -316,9 +374,29 @@ impl WorkspaceHub {
                     "",
                 ));
             }
-            opens.cells.entry(ws.id.clone()).or_default().clone()
+            let mut wait = None;
+            if !opens.cells.contains_key(&ws.id)
+                && let Some(closing) = opens.closing.remove(&ws.id)
+            {
+                if let Some(live) = closing.open.upgrade() {
+                    tracing::info!(workspace = %ws.path.display(), "a workspace still in use is taken back");
+                    let cell = Arc::new(OnceCell::new_with(Some(live.clone())));
+                    opens.cells.insert(ws.id.clone(), cell);
+                    return Ok(live);
+                }
+                wait = Some(closing.gone);
+            }
+            (opens.cells.entry(ws.id.clone()).or_default().clone(), wait)
         };
-        cell.get_or_try_init(|| self.open_now(ws)).await.cloned()
+        cell.get_or_try_init(|| async move {
+            if let Some(mut gone) = wait {
+                // Ends (with an error) once the last holder's drop has closed everything.
+                let _ = gone.changed().await;
+            }
+            self.open_now(ws).await
+        })
+        .await
+        .cloned()
     }
 
     async fn open_now(&self, ws: &WorkspaceRef) -> Result<Arc<OpenWorkspace>, ErrorBody> {
@@ -402,38 +480,62 @@ impl WorkspaceHub {
             store,
             orphans,
             lock: Mutex::new(taken),
+            states: self.states.clone(),
+            shut: AtomicBool::new(false),
+            gone: watch::Sender::new(()),
         }))
     }
 
-    /// Closes the workspace `id` if it is open: its `state.db` is closed (its queued jobs run
-    /// first), then `core.lock` is released. A later [`WorkspaceHub::open`] opens it anew.
+    /// Lets go of the workspace `id` if it is open. Unless a call still holds it, it is closed
+    /// now: its `state.db` is closed (its queued jobs run first), then `core.lock` is released.
+    /// Otherwise the last call that holds it closes it as it ends, and until then a new
+    /// [`WorkspaceHub::open`] takes it back as it is (its running idempotency rows stay this
+    /// core's). A later open opens it anew.
     pub async fn close(&self, id: &str) {
         let cell = lock(&self.opens).cells.remove(id);
-        if let Some(open) = cell.and_then(|c| c.get().cloned()) {
-            self.shut(open).await;
+        let Some(open) = cell.and_then(|c| c.get().cloned()) else {
+            return;
+        };
+        match Arc::try_unwrap(open) {
+            Ok(open) => {
+                // Nothing else holds it: its drop closes it, on a blocking thread.
+                if let Err(e) = tokio::task::spawn_blocking(move || drop(open)).await {
+                    tracing::error!(error = %e, "closing a workspace failed");
+                }
+            }
+            Err(open) => {
+                tracing::info!(workspace = %open.ws.path.display(), "workspace let go of; it closes when its last call ends");
+                let closing = Closing {
+                    open: Arc::downgrade(&open),
+                    gone: open.gone.subscribe(),
+                };
+                let mut opens = lock(&self.opens);
+                opens.closing.retain(|_, c| c.open.strong_count() > 0);
+                opens.closing.insert(id.to_string(), closing);
+            }
         }
     }
 
-    /// Closes every open workspace, and opens none after. The core runs it at shutdown,
-    /// before its state databases close.
+    /// Closes every open workspace now, also those still in use, and opens none after. The
+    /// core runs it at shutdown, after its calls have drained and before its state databases
+    /// close.
     pub async fn close_all(&self) {
-        let cells: Vec<_> = {
+        let opens: Vec<Arc<OpenWorkspace>> = {
             let mut opens = lock(&self.opens);
             opens.closed = true;
-            opens.cells.drain().map(|(_, cell)| cell).collect()
+            let cells: Vec<_> = opens.cells.drain().map(|(_, cell)| cell).collect();
+            let closing: Vec<_> = opens.closing.drain().map(|(_, c)| c.open).collect();
+            cells
+                .into_iter()
+                .filter_map(|c| c.get().cloned())
+                .chain(closing.into_iter().filter_map(|w| w.upgrade()))
+                .collect()
         };
-        for open in cells.into_iter().filter_map(|c| c.get().cloned()) {
-            self.shut(open).await;
+        for open in opens {
+            if let Err(e) = tokio::task::spawn_blocking(move || open.close_now()).await {
+                tracing::error!(error = %e, "closing a workspace failed");
+            }
         }
-    }
-
-    async fn shut(&self, open: Arc<OpenWorkspace>) {
-        let (states, id) = (self.states.clone(), open.ws.id.clone());
-        if let Err(e) = tokio::task::spawn_blocking(move || states.close_workspace(&id)).await {
-            tracing::error!(error = %e, "closing a workspace state.db failed");
-        }
-        open.release_lock();
-        tracing::info!(workspace = %open.ws.path.display(), "workspace closed");
     }
 }
 
@@ -546,7 +648,7 @@ mod tests {
         assert!(err.message.contains("ww workspace use"), "{}", err.message);
         assert!(
             err.message
-                .contains(&format!("`ww workspace use {second}`")),
+                .contains(&format!("`ww workspace use \"{second}\"`")),
             "{}",
             err.message
         );
@@ -556,7 +658,9 @@ mod tests {
             fix.ui_action.label,
             format!("Use {second} as the default workspace")
         );
-        assert!(fix.agent_hint.is_none());
+        let hint = fix.agent_hint.expect("an agent hint (QA-003)");
+        assert_eq!(hint.tool, "workspace.set_default");
+        assert_eq!(hint.arguments, json!({"path": second.to_string()}));
     }
 
     #[test] // spec: ARCH-090

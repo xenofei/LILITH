@@ -309,13 +309,10 @@ fn direct(
         .expect("the suite state.db"),
     );
     let gates = Arc::new(TestGates::new());
-    let mut reg = core_registry(true, &gates, &states);
-    for tool in extra {
-        reg.register(tool);
-    }
     let clock: Arc<dyn ww_platform::Clock> = FakeClock::new();
     let events = Arc::new(ww_core::events::EventBus::new(clock.clone()));
     let ids: Arc<dyn ww_platform::IdSource> = Arc::new(SeqIds::new());
+    let probe: Arc<dyn ww_platform::fs::Probe> = Arc::new(ww_platform::fs::SystemProbe);
     let hub = ww_core::workspace::WorkspaceHub::new(
         env.env.clone(),
         states.clone(),
@@ -323,8 +320,12 @@ fn direct(
         clock.clone(),
         ids.clone(),
         ww_core::store::FailPoints::none(),
-        Arc::new(ww_platform::fs::SystemProbe),
+        probe.clone(),
     );
+    let mut reg = core_registry(true, &gates, &states, &hub, &env.env, &probe);
+    for tool in extra {
+        reg.register(tool);
+    }
     let lifecycle = ww_core::Lifecycle::new(clock.clone(), ww_core::lifecycle::IDLE_EXIT_AFTER);
     let dispatcher = ww_core::tools::Dispatcher::new(
         reg,

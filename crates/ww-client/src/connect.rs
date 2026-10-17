@@ -392,6 +392,7 @@ async fn greet(
             match &cfg.workspace_origin {
                 Some(origin) => Err(ClientError::UnknownWorkspace {
                     origin: origin.clone(),
+                    default: crate::workspace::registered_default(&cfg.env),
                     error,
                 }),
                 None => Err(ClientError::Refused(error)),
@@ -896,8 +897,7 @@ mod tests {
                 );
                 let event = |topic: &str, seq: u64| {
                     let params = json!({"topic": topic, "seq": seq, "kind": "event", "data": {"n": seq}});
-                    format!("{}
-", ww_protocol::encode_notification(method::EVENT, &params))
+                    format!("{}\n", ww_protocol::encode_notification(method::EVENT, &params))
                 };
                 let mut out = String::new();
                 for seq in 1..=3 {
@@ -905,8 +905,7 @@ mod tests {
                 }
                 out.push_str(&event("test:other", 1));
                 out.push_str(&format!(
-                    "{}
-",
+                    "{}\n",
                     json!({"jsonrpc": "2.0", "id": request["id"], "result": {"status": "ok", "topics": [{"topic": "test:r", "seq": 3}]}})
                 ));
                 out.push_str(&event("test:r", 4));

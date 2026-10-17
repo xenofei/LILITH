@@ -112,6 +112,7 @@ fn recording_hooks(log: &Log) -> PipelineHooks {
 }
 
 #[derive(JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[expect(dead_code, reason = "only its schema is used")]
 struct RecArgs {
     n: Option<u64>,
@@ -198,6 +199,7 @@ struct Fixture {
     env: TestEnv,
     log: Log,
     gates: Arc<TestGates>,
+    states: Arc<StateRegistry>,
     dispatcher: Dispatcher,
 }
 
@@ -220,22 +222,58 @@ fn fixture_with(hooks: PipelineHooks, log: &Log, extra: &[Arc<dyn Tool>]) -> Fix
     let log = log.clone();
     let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).expect("the suite state.db"));
     let gates = Arc::new(TestGates::new());
-    let mut reg = core_registry(true, &gates, &states);
-    for tool in extra {
-        reg.register(tool.clone());
-    }
     let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
     let clock: Arc<dyn Clock> = FakeClock::new();
     let events = Arc::new(EventBus::new(clock.clone()));
     let lifecycle = Lifecycle::new(clock.clone(), IDLE_EXIT_AFTER);
     let hub = hub_for(&env, &states, &events, &clock, &ids);
-    let dispatcher = Dispatcher::new(reg, hooks, states, events, hub, ids, clock, lifecycle);
+    let mut reg = registry_with(&env, true, &gates, &states, &hub);
+    for tool in extra {
+        reg.register(tool.clone());
+    }
+    let dispatcher = Dispatcher::new(
+        reg,
+        hooks,
+        states.clone(),
+        events,
+        hub,
+        ids,
+        clock,
+        lifecycle,
+    );
     Fixture {
         env,
         log,
         gates,
+        states,
         dispatcher,
     }
+}
+
+/// `core_registry` over `env` with `hub` and the real probe.
+fn registry_with(
+    env: &TestEnv,
+    test_tools: bool,
+    gates: &Arc<TestGates>,
+    states: &Arc<StateRegistry>,
+    hub: &Arc<WorkspaceHub>,
+) -> Registry {
+    let probe: Arc<dyn ww_platform::fs::Probe> = Arc::new(SystemProbe);
+    core_registry(test_tools, gates, states, hub, &env.env, &probe)
+}
+
+/// `core_registry` over `env`, with a hub of its own.
+fn registry_for(
+    env: &TestEnv,
+    test_tools: bool,
+    gates: &Arc<TestGates>,
+    states: &Arc<StateRegistry>,
+) -> Registry {
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let hub = hub_for(env, states, &events, &clock, &ids);
+    registry_with(env, test_tools, gates, states, &hub)
 }
 
 /// A workspace hub over `env` (no fail points, the real probe).
@@ -601,7 +639,7 @@ fn tool_with(name: &str, description: String, module: &str) -> Arc<dyn Tool> {
 fn descriptors_use_json_schema_2020_12_and_fit_2000_chars() {
     let env = TestEnv::new();
     let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
-    let reg = core_registry(true, &Arc::new(TestGates::new()), &states);
+    let reg = registry_for(&env, true, &Arc::new(TestGates::new()), &states);
     let tools = reg.list_for(&CallerKind::Ui("image".into()));
     assert!(!tools.is_empty());
     for d in &tools {
@@ -632,9 +670,16 @@ fn descriptors_use_json_schema_2020_12_and_fit_2000_chars() {
 fn every_tool_declares_a_module() {
     let env = TestEnv::new();
     let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
-    let reg = core_registry(true, &Arc::new(TestGates::new()), &states);
-    for d in reg.list_for(&CallerKind::Cli) {
-        assert_eq!(d.module, TEST_MODULE, "{}", d.name);
+    let reg = registry_for(&env, true, &Arc::new(TestGates::new()), &states);
+    let tools = reg.list_for(&CallerKind::Cli);
+    assert!(tools.iter().any(|d| d.module == WORKSPACE_MODULE));
+    for d in tools {
+        let want = if d.name.starts_with("test.") {
+            TEST_MODULE
+        } else {
+            WORKSPACE_MODULE
+        };
+        assert_eq!(d.module, want, "{}", d.name);
     }
     let refused = std::panic::catch_unwind(AssertUnwindSafe(|| {
         Registry::new().register(tool_with("t.nomodule", "x".into(), ""));
@@ -668,10 +713,11 @@ async fn test_tools_exist_only_on_test_channels() {
     let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
     let gates = Arc::new(TestGates::new());
 
-    let names: Vec<String> = core_registry(true, &gates, &states)
+    let names: Vec<String> = registry_for(&env, true, &gates, &states)
         .list_for(&CallerKind::Cli)
         .into_iter()
         .map(|d| d.name)
+        .filter(|name| name.starts_with("test."))
         .collect();
     assert_eq!(
         names,
@@ -688,9 +734,15 @@ async fn test_tools_exist_only_on_test_channels() {
         ]
     );
 
-    // Off a test channel there are none, and calling one is `tool.unknown`.
-    let reg = core_registry(false, &gates, &states);
-    assert!(reg.list_for(&CallerKind::Cli).is_empty());
+    // Off a test channel no `test.*` tool is listed (the product tools are, on every
+    // channel), and calling one is `tool.unknown`.
+    let reg = registry_for(&env, false, &gates, &states);
+    let listed = reg.list_for(&CallerKind::Cli);
+    assert!(!listed.is_empty(), "the product tools are registered");
+    assert!(
+        listed.iter().all(|d| !d.name.starts_with("test.")),
+        "{listed:?}"
+    );
     let events = Arc::new(EventBus::new(FakeClock::new()));
     let (clock, ids): (Arc<dyn Clock>, Arc<dyn IdSource>) =
         (FakeClock::new(), Arc::new(SeqIds::new()));
@@ -802,4 +854,148 @@ async fn a_panicking_stage_releases_the_key() {
     assert_eq!(tool.executions(), 0);
     // The claim released the row as it was dropped.
     fx.wait_for_rows(&[]).await;
+}
+
+#[derive(JsonSchema)]
+#[expect(dead_code, reason = "only its schema is used")]
+struct LooseArgs {
+    n: Option<u64>,
+}
+
+#[test] // spec: CORE-058, ARCH-037
+fn registry_refuses_schemas_that_allow_unknown_properties() {
+    let log = Log::default();
+    // An object schema without `"additionalProperties": false` is a programming error.
+    let mut loose = RecTool::new("t.loose", EffectClass::Read, &log);
+    Arc::get_mut(&mut loose).unwrap().descriptor.input_schema = schema_2020_12::<LooseArgs>();
+    assert_ne!(
+        loose.descriptor.input_schema.get("additionalProperties"),
+        Some(&json!(false))
+    );
+    let refused = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        Registry::new().register(loose);
+    }));
+    let text = refused
+        .expect_err("a schema allowing unknown properties was registered")
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(text.contains("unknown properties"), "{text}");
+
+    // `deny_unknown_fields` gives it, so `RecTool` (and every core tool) registers.
+    let strict = RecTool::new("t.strict", EffectClass::Read, &log);
+    assert_eq!(
+        strict.descriptor.input_schema["additionalProperties"],
+        json!(false)
+    );
+    let mut reg = Registry::new();
+    reg.register(strict);
+    // A schema that isn't an object schema is not this rule's business.
+    let mut any = RecTool::new("t.any", EffectClass::Read, &log);
+    Arc::get_mut(&mut any).unwrap().descriptor.input_schema = schema_2020_12::<Value>();
+    reg.register(any);
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    for d in
+        registry_for(&env, true, &Arc::new(TestGates::new()), &states).list_for(&CallerKind::Cli)
+    {
+        assert_eq!(
+            d.input_schema["additionalProperties"],
+            json!(false),
+            "{}",
+            d.name
+        );
+    }
+}
+
+/// A write tool that closes the suite `state.db` while it runs, so its idempotency row can't
+/// be finished; with `fail`, it then fails.
+struct ClosesState {
+    descriptor: ToolDescriptor,
+    states: Mutex<Option<Arc<StateRegistry>>>,
+    fail: bool,
+}
+
+impl Tool for ClosesState {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, _args: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn run<'a>(&'a self, ctx: &'a CallCtx, _args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let states = self.states.lock().unwrap().take().expect("the states");
+            tokio::task::spawn_blocking(move || states.suite().close())
+                .await
+                .unwrap();
+            if self.fail {
+                return Err(ww_protocol::ErrorBody::new(
+                    &ww_protocol::codes::PARAMS_INVALID,
+                    "failed on purpose",
+                    ctx.trace_id.clone(),
+                ));
+            }
+            Ok(ToolOutput {
+                structured: json!({"ran": true}),
+                artifacts: Vec::new(),
+                summary_text: "ran".into(),
+            })
+        })
+    }
+}
+
+#[tokio::test] // spec: CORE-016, QA-012
+async fn idem_finish_failure_says_what_happens() {
+    for fail in [false, true] {
+        let name = if fail {
+            "rec.closes_and_fails"
+        } else {
+            "rec.closes"
+        };
+        let tool = Arc::new(ClosesState {
+            descriptor: ToolDescriptor {
+                name: name.into(),
+                description: "Closes the suite state.db.".into(),
+                effect: EffectClass::Write,
+                module: "test".into(),
+                input_schema: schema_2020_12::<RecArgs>(),
+                output_schema: schema_2020_12::<RecResult>(),
+                annotations: BTreeMap::new(),
+            },
+            states: Mutex::new(None),
+            fail,
+        });
+        let as_tool: Arc<dyn Tool> = tool.clone();
+        let fx = fixture(std::slice::from_ref(&as_tool));
+        *tool.states.lock().unwrap() = Some(fx.states.clone());
+        let out = fx.call(&cli(), name, json!({}), Some("k")).await;
+        let e = error(&out);
+        assert_eq!(e.code, "state.unavailable", "{name}: {e:?}");
+        if fail {
+            // The tool failed, so nothing was to be stored: the plain message.
+            assert!(e.data.is_none(), "{name}: {e:?}");
+        } else {
+            assert_eq!(
+                e.message,
+                "The call ran, but the core could not save its result. Until the core \
+                 restarts, a retry with the same idempotency key reports it as still running; \
+                 check what it did before you retry with a new key."
+            );
+            assert_eq!(e.data, Some(json!({"ran": true})), "{e:?}");
+            assert_eq!(e.retry, RetryPolicy::SameIdempotencyKey);
+        }
+        // The row stays `running`: the tool ran and must not run again for this key.
+        assert_eq!(
+            fx.rows(),
+            [(
+                "cli|none".to_string(),
+                "k".to_string(),
+                "running".to_string()
+            )],
+            "{name}"
+        );
+    }
 }

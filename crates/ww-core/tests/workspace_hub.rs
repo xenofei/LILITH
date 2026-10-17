@@ -135,9 +135,10 @@ fn core_lock_gives_read_write_and_releases_running_rows() {
     );
     assert!(!rt.block_on(open.state.diagnostics()).unwrap().read_only);
 
+    // The hub lets go of it; with no call holding it, it is closed at once.
+    drop(open);
     rt.block_on(hub.close(&ws.id));
     assert!(lock_is_free(&ws), "close releases core.lock");
-    drop(open);
 }
 
 #[test] // spec: ARCH-028, ARCH-097
@@ -198,7 +199,9 @@ fn second_hub_without_the_lock_is_read_only_and_keeps_rows() {
             .is_err()
     );
 
-    // Once the first core has let go, a new open takes the lock.
+    // Once the first core has let go, a new open takes the lock. (A hub closes a workspace
+    // once nothing holds it.)
+    drop((first, second));
     rt.block_on(hub_a.close(&ws.id));
     rt.block_on(hub_b.close(&ws.id));
     let third = rt.block_on(hub_b.open(&ws)).unwrap();
@@ -359,10 +362,10 @@ fn dispatcher(
     hub: &Arc<WorkspaceHub>,
 ) -> ww_core::tools::Dispatcher {
     use ww_core::tools::{PipelineHooks, TestGates, core_registry};
-    let _ = env;
     let clock: Arc<dyn Clock> = FakeClock::new();
+    let probe: Arc<dyn ww_platform::fs::Probe> = Arc::new(SystemProbe);
     ww_core::tools::Dispatcher::new(
-        core_registry(true, &Arc::new(TestGates::new()), states),
+        core_registry(true, &Arc::new(TestGates::new()), states, hub, env, &probe),
         PipelineHooks::plan2(),
         states.clone(),
         events.clone(),

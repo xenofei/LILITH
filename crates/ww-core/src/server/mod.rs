@@ -353,7 +353,14 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.probe.clone(),
     );
     let dispatcher = Dispatcher::new(
-        core_registry(cfg.test_tools, &test_gates, &state),
+        core_registry(
+            cfg.test_tools,
+            &test_gates,
+            &state,
+            &hub,
+            &cfg.env,
+            &cfg.probe,
+        ),
         PipelineHooks::plan2(),
         state.clone(),
         events.clone(),

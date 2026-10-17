@@ -184,9 +184,11 @@ pub enum ClientError {
     Refused(ErrorBody),
     /// The core refused the hello with `workspace.unknown` for the workspace the `cli` chain
     /// found ([`ClientConfig::workspace_origin`]): most often a folder with `worldwright.yaml`
-    /// that is not registered in `suite.toml`.
+    /// that is not registered in `suite.toml`. `default` is the default workspace `suite.toml`
+    /// names, the one the core serves (`None` when none is set or it can't be read).
     UnknownWorkspace {
         origin: WorkspaceOrigin,
+        default: Option<PathBuf>,
         error: ErrorBody,
     },
     /// The core answered with a JSON-RPC protocol fault, or with something that is not the
@@ -275,12 +277,40 @@ impl fmt::Display for ClientError {
                 path.display(),
                 WorkspaceSource::Default
             ),
+            // A workspace named by --workspace is never told to become the default: it is told
+            // which workspace the core serves.
+            ClientError::UnknownWorkspace {
+                origin:
+                    WorkspaceOrigin {
+                        path,
+                        source: WorkspaceSource::Flag,
+                    },
+                default,
+                ..
+            } => {
+                write!(
+                    f,
+                    "The workspace \"{}\" ({}) is not registered in suite.toml, so the core cannot use it. ",
+                    path.display(),
+                    WorkspaceSource::Flag
+                )?;
+                match default {
+                    Some(default) => write!(
+                        f,
+                        "The core serves only the default workspace, \"{}\": run the command without --workspace, or from inside that workspace.",
+                        default.display()
+                    ),
+                    None => f.write_str(
+                        "The core serves only the default workspace, and none is set: run the command without --workspace.",
+                    ),
+                }
+            }
             ClientError::UnknownWorkspace {
                 origin: WorkspaceOrigin { path, source },
                 ..
             } => write!(
                 f,
-                "The workspace {} ({source}) is not registered in suite.toml, so the core cannot use it. To use it, make it the default with `ww workspace use {}` (plan 2b).",
+                "The workspace \"{}\" ({source}) is not registered in suite.toml, so the core cannot use it. To use it, make it the default with `ww workspace use \"{}\"`.",
                 path.display(),
                 path.display()
             ),
@@ -358,37 +388,70 @@ mod tests {
         assert!(other.contains("may say why"), "{other}");
     }
 
-    #[test] // spec: ARCH-030
-    fn unknown_workspace_names_the_folder_and_where_it_came_from() {
-        let error = ErrorBody::new(
-            &ww_protocol::codes::WORKSPACE_UNKNOWN,
-            "The workspace 0123456789abcdef is not one this core knows.",
-            "t_1",
-        );
-        let unknown = |source| ClientError::UnknownWorkspace {
+    fn unknown(source: WorkspaceSource, default: Option<&str>) -> ClientError {
+        ClientError::UnknownWorkspace {
             origin: WorkspaceOrigin {
                 path: PathBuf::from(r"C:\ws\Ünïcödé space"),
                 source,
             },
-            error: error.clone(),
-        };
+            default: default.map(PathBuf::from),
+            error: ErrorBody::new(
+                &ww_protocol::codes::WORKSPACE_UNKNOWN,
+                "The workspace 0123456789abcdef is not one this core knows.",
+                "t_1",
+            ),
+        }
+    }
+
+    #[test] // spec: ARCH-030
+    fn unknown_workspace_names_the_folder_and_where_it_came_from() {
         for (source, said) in [
             (WorkspaceSource::Flag, "--workspace"),
             (WorkspaceSource::CurrentFolder, "current folder"),
         ] {
-            let text = unknown(source).to_string();
+            let text = unknown(source, None).to_string();
             assert!(text.contains(r"C:\ws\Ünïcödé space"), "{text}");
             assert!(text.contains(said), "{text}");
             assert!(text.contains("not registered in suite.toml"), "{text}");
-            assert!(
-                text.contains(r"`ww workspace use C:\ws\Ünïcödé space` (plan 2b)"),
-                "{text}"
-            );
             assert!(!text.contains("0123456789abcdef"), "{text}");
+            assert!(!text.contains("plan 2b"), "{text}");
         }
-        let text = unknown(WorkspaceSource::Default).to_string();
+        let text = unknown(WorkspaceSource::CurrentFolder, None).to_string();
+        assert!(
+            text.contains(r#"`ww workspace use "C:\ws\Ünïcödé space"`"#),
+            "{text}"
+        );
+        let text = unknown(WorkspaceSource::Default, None).to_string();
         assert!(text.contains(r"C:\ws\Ünïcödé space"), "{text}");
         assert!(text.contains("default_workspace"), "{text}");
+    }
+
+    #[test] // spec: ARCH-090, QA-003
+    fn unregistered_hint_quotes_the_path_and_flag_source_is_not_told_to_switch() {
+        // Found from the current folder: the hint to make it the default quotes the path.
+        let text = unknown(WorkspaceSource::CurrentFolder, Some(r"D:\main ws")).to_string();
+        assert!(text.contains(r#""C:\ws\Ünïcödé space""#), "{text}");
+        assert!(
+            text.ends_with(r#"`ww workspace use "C:\ws\Ünïcödé space"`."#),
+            "{text}"
+        );
+        assert!(!text.contains("(plan 2b)"), "{text}");
+
+        // Named by --workspace: never told to become the default; told which workspace the
+        // core serves, and to run without --workspace or from inside it.
+        let text = unknown(WorkspaceSource::Flag, Some(r"D:\main ws")).to_string();
+        assert!(!text.contains("ww workspace use"), "{text}");
+        assert!(text.contains(r#""C:\ws\Ünïcödé space""#), "{text}");
+        assert!(
+            text.contains(r#"serves only the default workspace, "D:\main ws""#),
+            "{text}"
+        );
+        assert!(text.contains("without --workspace"), "{text}");
+        assert!(text.contains("from inside"), "{text}");
+        let text = unknown(WorkspaceSource::Flag, None).to_string();
+        assert!(!text.contains("ww workspace use"), "{text}");
+        assert!(text.contains("none is set"), "{text}");
+        assert!(text.contains("without --workspace"), "{text}");
     }
 
     #[test] // spec: ARCH-014, ARCH-027
