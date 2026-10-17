@@ -21,7 +21,7 @@ use super::registry::schema_2020_12;
 use super::*;
 use crate::config::CoreConfig;
 use crate::events::EventBus;
-use crate::lifecycle::{IDLE_EXIT_AFTER, Lifecycle};
+use crate::lifecycle::{DrainReason, IDLE_EXIT_AFTER, Lifecycle};
 use crate::session::Session;
 use crate::state::{OnFatal, StateRegistry};
 
@@ -769,6 +769,11 @@ async fn a_panicking_stage_releases_the_key() {
         "{e:?}"
     );
     assert_eq!(tool.executions(), 0);
-    // The claim released the row as it was dropped.
-    fx.wait_for_rows(&[]).await;
+    // The claim releases the row as it is dropped, in a task that stays in flight until the
+    // release is done: a drain waits for it, and the row is gone once the drain ends.
+    let lifecycle = fx.dispatcher.lifecycle();
+    lifecycle.begin_drain(DrainReason::Requested);
+    let report = lifecycle.run_shutdown().await;
+    assert_eq!(report.abandoned_calls, 0);
+    assert_eq!(fx.rows(), Vec::new());
 }
