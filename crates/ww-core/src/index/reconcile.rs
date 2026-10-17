@@ -681,6 +681,9 @@ pub(super) struct Expected {
     sha256: Option<String>,
     /// The suite still expects it on disk (in `hashes`, or a file of an `open` run).
     tracked: bool,
+    /// It comes from a run's file list, not from `hashes` (a cold rebuild skips the files of
+    /// an open run whose folder isn't on this machine, ruling Q28).
+    from_run: bool,
 }
 
 /// What a manifest says, read leniently.
@@ -788,6 +791,7 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
                 path,
                 sha256: Some(sha.clone()),
                 tracked: true,
+                from_run: false,
             },
         );
     }
@@ -806,6 +810,7 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
                     path,
                     sha256: file.sha256.clone(),
                     tracked: open,
+                    from_run: true,
                 },
             );
         }
@@ -936,6 +941,49 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
         ])?;
     }
     Ok(())
+}
+
+/// `projects/<p>/assets/<a>/candidates/<run>` of a run file's path.
+fn run_folder(path: &str) -> Option<&str> {
+    let at = path.find("/candidates/")? + "/candidates/".len();
+    let end = path[at..].find('/')? + at;
+    Some(&path[..end])
+}
+
+/// The keys of open-run files whose `candidates/<run>/` folder doesn't exist (ruling Q28):
+/// `candidates/` is gitignored (CORE-032), so on a fresh clone a manifest lists runs whose
+/// files were never on this machine. A cold rebuild doesn't call those `missing`; a file gone
+/// from a run folder that is there still is, and `hashes` entries always are.
+async fn runs_elsewhere(index: &Index, parsed: &[Parsed]) -> Result<HashSet<String>, IndexError> {
+    let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
+    for e in parsed
+        .iter()
+        .flat_map(|p| p.fields.iter().flat_map(|f| &f.expected))
+        .filter(|e| e.from_run && e.tracked)
+    {
+        if let Some(folder) = run_folder(&e.path) {
+            by_folder
+                .entry(folder.to_string())
+                .or_default()
+                .push(e.key.clone());
+        }
+    }
+    if by_folder.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let (probe, root) = (index.probe.clone(), index.root.clone());
+    blocking(move || {
+        by_folder
+            .into_iter()
+            .filter(|(folder, _)| {
+                probe
+                    .identity(&WsPath::from_disk(folder.clone()).abs(&root))
+                    .is_err()
+            })
+            .flat_map(|(_, keys)| keys)
+            .collect()
+    })
+    .await
 }
 
 /// Removes the asset rows whose manifest is `key` or under it, with their edges, text and
@@ -1292,6 +1340,10 @@ pub(super) async fn run(
     parsed_all.extend(others.parsed);
     let cold_log = index.cold_log.clone();
     let seen = present;
+    let elsewhere = match mode {
+        Mode::Cold => runs_elsewhere(index, &parsed_all).await?,
+        Mode::Warm => HashSet::new(),
+    };
     let removals = index
         .db
         .call(move |conn| {
@@ -1309,6 +1361,7 @@ pub(super) async fn run(
                 &parsed_all,
                 &gone,
                 &seen,
+                &elsewhere,
                 &replay,
                 whole.then_some(started),
             )
@@ -1333,7 +1386,8 @@ pub(super) async fn run(
 /// The run's last transaction: a cold rebuild clears the tables, writes every row (asset rows
 /// with their `expected` files, then the files), then replays the store's changes that landed
 /// while it ran (`replay`), then gives every file the suite still expects that the walk didn't
-/// find (`seen`: present or parked) a `missing` row with its recorded SHA-256 (ruling Q25); a
+/// find (`seen`: present or parked) a `missing` row with its recorded SHA-256 (ruling Q25),
+/// except the files of open runs whose folder isn't on this machine (`elsewhere`, ruling Q28); a
 /// warm one writes its rows compare-and-set and settles the rows of files that are gone
 /// (`missing` when the suite still expects them, else deleted). Then the whole scan's start, if
 /// it was one. Returns (removed, missing).
@@ -1348,6 +1402,7 @@ fn finish(
     parsed: &[Parsed],
     gone: &[DbFile],
     seen: &HashSet<String>,
+    elsewhere: &HashSet<String>,
     replay: &[StoreChanges],
     scan_start: Option<i64>,
 ) -> rusqlite::Result<(Vec<WsPath>, Vec<WsPath>)> {
@@ -1371,7 +1426,7 @@ fn finish(
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         for (key, path) in absent {
-            if seen.contains(&key) {
+            if seen.contains(&key) || elsewhere.contains(&key) {
                 continue;
             }
             tx.execute(

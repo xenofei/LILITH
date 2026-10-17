@@ -633,8 +633,14 @@ fn files_gone_while_no_core_ran_are_missing_after_a_cold_rebuild() {
     let _core = CoreFixture::start(&env);
     let mut pipe = session(&env, &ws);
     let listed = missing(&mut pipe);
+    // The open run's folder is still there (its cutout is), so its gone file counts.
     assert!(listed.contains(&sealed), "{listed:?}");
     assert!(listed.contains(&open_run), "{listed:?}");
+    let doctor = workspace_missing(&mut pipe);
+    assert!(
+        doctor.contains(&sealed) && doctor.contains(&open_run),
+        "workspace.missing: {doctor}"
+    );
     let detail = pipe.tool_ok(
         "asset.get",
         json!({"project": "sketchbook", "asset_id": ASSET}),
@@ -671,4 +677,57 @@ fn files_gone_while_no_core_ran_are_missing_after_a_cold_rebuild() {
     let listed = missing(&mut pipe);
     assert!(!listed.contains(&sealed), "{listed:?}");
     assert!(listed.contains(&open_run), "{listed:?}");
+}
+
+/// The detail of `workspace.doctor {fix: false}`'s `workspace.missing` check.
+fn workspace_missing(pipe: &mut RawPipe) -> String {
+    let report = pipe.tool_ok("workspace.doctor", json!({"fix": false}), Some(&key()));
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "workspace.missing")
+        .map(|c| {
+            format!(
+                "{}: {}",
+                c["state"].as_str().unwrap(),
+                c["detail"].as_str().unwrap()
+            )
+        })
+        .unwrap_or_else(|| panic!("{report}"))
+}
+
+/// Removes a folder tree as an outside program (or a fresh clone) would.
+#[allow(clippy::disallowed_methods)]
+fn outside_remove_tree(path: &Path) {
+    std::fs::remove_dir_all(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+#[test] // spec: CORE-032, ARCH-079, CORE-038 (ruling Q28)
+fn a_fresh_clone_without_candidates_has_nothing_missing() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = default_workspace(&env, "fresh clone");
+    // `candidates/` is gitignored: a clone has the manifest's open run but none of its files,
+    // and no index yet.
+    outside_remove_tree(&file(&ws, &format!("{ASSET_DIR}/candidates")));
+
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, &ws);
+    let listed = missing(&mut pipe);
+    assert!(listed.is_empty(), "{listed:?}");
+    let doctor = workspace_missing(&mut pipe);
+    assert!(doctor.starts_with("ok: "), "workspace.missing: {doctor}");
+    let detail = pipe.tool_ok(
+        "asset.get",
+        json!({"project": "sketchbook", "asset_id": ASSET}),
+        None,
+    );
+    assert!(
+        !detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["state"] == "missing"),
+        "{detail}"
+    );
 }

@@ -283,6 +283,13 @@ fn doctor_sets_leftover_side_files_aside_only_after_yes() {
     );
     assert_eq!(std::fs::read(&wal).unwrap(), b"an old write-ahead log");
     assert!(!db.exists(), "no database was created");
+    assert!(
+        no.stderr
+            .contains("Set them aside as state.db-wal.damaged-"),
+        "the question names the real files: {no:?}"
+    );
+    assert!(!no.stderr.contains("<name>"), "{no:?}");
+    assert!(no.stdout.contains("answer y to set them aside"), "{no:?}");
 
     let yes = env.ww_with_stdin(&["doctor"], "y\n");
     assert_eq!(yes.code, 0, "{yes:?}");

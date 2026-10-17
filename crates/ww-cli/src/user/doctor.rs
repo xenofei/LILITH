@@ -165,7 +165,7 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
             }
         }
     }
-    let (what, skip, explain, question) = match &state {
+    let (what, skip, explain, question, them) = match &state {
         StateFileState::Missing => {
             report.ok("no suite state database yet; the core creates one when it starts");
             return None;
@@ -192,7 +192,15 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
                     .to_string(),
                 "A fresh database created beside them could take an old write-ahead log for its \
                  own. Setting them aside renames them; nothing is deleted.",
-                "Set them aside as <name>{suffix} so the core starts clean? [y/N] ",
+                format!(
+                    "Set them aside as {} so the core starts clean? [y/N] ",
+                    names
+                        .iter()
+                        .map(|n| format!("{n}{{suffix}}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "them",
             )
         }
         StateFileState::Damaged(why) => (
@@ -202,7 +210,8 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
             ),
             CANT_START.to_string(),
             SET_ASIDE_EXPLAINED,
-            "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ",
+            SET_ASIDE_QUESTION.to_string(),
+            "it",
         ),
         StateFileState::TooNew { found, known } => (
             format!(
@@ -212,7 +221,8 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
             ),
             CANT_START.to_string(),
             SET_ASIDE_EXPLAINED,
-            "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ",
+            SET_ASIDE_QUESTION.to_string(),
+            "it",
         ),
         StateFileState::HotJournal => (
             format!(
@@ -222,12 +232,13 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
             ),
             CANT_START.to_string(),
             SET_ASIDE_EXPLAINED,
-            "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ",
+            SET_ASIDE_QUESTION.to_string(),
+            "it",
         ),
     };
     if !interactive {
         report.problem(&format!(
-            "{what} — run ww doctor interactively to set it aside"
+            "{what} — run ww doctor interactively to set {them} aside"
         ));
         return Some(skip);
     }
@@ -245,7 +256,7 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
     ));
     if !ask(&question.replace("{suffix}", &set_aside_suffix(now))) {
         report.problem(&format!(
-            "{what} — run ww doctor again and answer y to set it aside"
+            "{what} — run ww doctor again and answer y to set {them} aside"
         ));
         return Some(skip);
     }
@@ -268,6 +279,10 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
         }
     }
 }
+
+/// The set-aside question for the database itself.
+const SET_ASIDE_QUESTION: &str =
+    "Set it aside as state.db{suffix} and start with a fresh database? [y/N] ";
 
 /// What setting a damaged or newer database aside means, in plain words.
 const SET_ASIDE_EXPLAINED: &str = "The core can't start with it. Setting it aside renames it \

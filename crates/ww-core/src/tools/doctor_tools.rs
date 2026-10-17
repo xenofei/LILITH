@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use ww_platform::fs::{PLACEHOLDER_ATTRIBUTES, Probe};
+use ww_platform::fs::Probe;
 use ww_protocol::{EffectClass, ErrorBody};
 use ww_schema::{Manifest, Version, bare_sha256};
 
@@ -392,7 +392,7 @@ async fn sealed_check(d: &Doctor, open: &OpenWorkspace, fix: bool) -> DoctorChec
         if identity.attributes & READONLY != 0 {
             continue;
         }
-        if identity.attributes & PLACEHOLDER_ATTRIBUTES != 0 {
+        if identity.is_cloud_placeholder() {
             // Reading it would download it (ARCH-074): it is left as it is, unread.
             cloud_only.push(rel.as_str().to_string());
             continue;

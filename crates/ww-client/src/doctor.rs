@@ -310,6 +310,10 @@ pub fn inspect_suite_toml(env: &Env) -> SuiteTomlState {
 /// Whether a core serves this channel's pipe now (it holds the suite `state.db` open). Any
 /// answer but "no such pipe" counts as running, so a set-aside is never offered while one may
 /// be using the files.
+///
+/// It opens a real client connection to the pipe and drops it at once, without a hello. That is
+/// harmless: the core ends a connection that closes before its hello like any other, and no
+/// core is started by it.
 pub fn core_running(env: &Env) -> bool {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
