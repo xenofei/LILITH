@@ -9,8 +9,9 @@
 //! | `asset.get` | read | `{project?, asset_id}` | `AssetDetail` |
 //!
 //! `assets.query`'s `project` is a filter: omitted, it means every project (the session's
-//! active project never narrows it). `asset.get`'s omitted `project` is `sketchbook` until
-//! Task 12's resolver.
+//! active project never narrows it). `asset.get`'s omitted `project` is the call's resolved
+//! project (`CallCtx::project`: the session's active project, else the workspace's hint, else
+//! `sketchbook`).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,8 +27,6 @@ use crate::pipeline::{AssetDetail, AssetSummary, asset_detail, asset_summary};
 pub const DEFAULT_LIMIT: usize = 200;
 /// The largest page.
 pub const MAX_LIMIT: usize = 1000;
-/// `asset.get`'s project when none is given (Task 12 replaces this with its resolver).
-const DEFAULT_PROJECT: &str = "sketchbook";
 
 const QUERY_DESCRIPTION: &str = "List the workspace's assets, a page at a time. Every argument \
     is an optional filter: project (omitted: every project), status, type, and text (words \
@@ -91,7 +90,7 @@ struct QueryResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GetArgs {
-    /// A project slug; omitted: `sketchbook`.
+    /// A project slug; omitted: the session's active project.
     project: Option<String>,
     asset_id: String,
 }
@@ -161,7 +160,7 @@ async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), 
 
 async fn get(ctx: &CallCtx, args: GetArgs) -> Result<(AssetDetail, String), ErrorBody> {
     let open = ctx.workspace()?;
-    let project = args.project.unwrap_or_else(|| DEFAULT_PROJECT.to_string());
+    let project = args.project.unwrap_or_else(|| ctx.project_or_default());
     open.index
         .ready_result()
         .await

@@ -36,9 +36,20 @@ pub struct CallCtx {
     pub events: Arc<EventBus>,
     /// The session's workspace, opened by the Resolve stage; `None` for a session without one.
     pub workspace: Option<Arc<OpenWorkspace>>,
+    /// The call's project, resolved by the dispatcher (ARCH-088, ARCH-098): its `project`
+    /// argument, else the session's active project, else the workspace's `state.json` hint,
+    /// else `sketchbook`. `None` without a workspace.
+    pub project: Option<String>,
 }
 
 impl CallCtx {
+    /// [`CallCtx::project`], or `sketchbook` when the call has none.
+    pub fn project_or_default(&self) -> String {
+        self.project
+            .clone()
+            .unwrap_or_else(|| crate::projects::DEFAULT_PROJECT.to_string())
+    }
+
     /// The session's open workspace.
     ///
     /// # Errors
@@ -233,6 +244,14 @@ impl Registry {
     /// The tool called `name`, whoever may see it.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// The descriptors of every tool, by name, whoever may see it.
+    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.tools
+            .values()
+            .map(|t| t.descriptor().clone())
+            .collect()
     }
 
     /// The descriptors of the tools `caller` may see ([`Tool::visible_to`]), by name.

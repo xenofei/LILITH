@@ -710,6 +710,62 @@ impl Index {
             .await
     }
 
+    /// Every asset of `project`, by asset id (`project.status`, the staleness check on
+    /// restore).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn assets_of(&self, project: &str) -> Result<Vec<AssetRow>, IndexError> {
+        let project = project.to_string();
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT {} FROM assets WHERE project = ?1 ORDER BY asset_id",
+                        query::ASSET_COLUMNS
+                    ))
+                    .map_err(|e| sql(&e))?;
+                stmt.query_map(params![project], query::asset_row)
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                    .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// The files of `project`'s asset folders whose state is one of `states`, by path.
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn files_in_states(
+        &self,
+        project: &str,
+        states: &[FileState],
+    ) -> Result<Vec<FileRow>, IndexError> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let project = project.to_string();
+        // The wire names are a fixed set of plain words, so they can be written into the SQL.
+        let states: Vec<String> = states.iter().map(|s| format!("'{}'", s.as_str())).collect();
+        let states = states.join(", ");
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT {} FROM files WHERE project = ?1 AND state IN ({states}) \
+                         ORDER BY path",
+                        reconcile::FILE_COLUMNS
+                    ))
+                    .map_err(|e| sql(&e))?;
+                let rows = stmt
+                    .query_map(params![project], reconcile::db_file)
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                    .map_err(|e| sql(&e))?;
+                Ok(rows.into_iter().map(reconcile::DbFile::into_row).collect())
+            })
+            .await
+    }
+
     /// The row of one file.
     ///
     /// # Errors

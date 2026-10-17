@@ -32,6 +32,7 @@ use ww_protocol::{Id, Request, Response, encode_response_capped};
 use crate::config::{CoreConfig, CoreExit};
 use crate::events::EventBus;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
+use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
@@ -238,6 +239,8 @@ pub struct RunningCore {
     events: Arc<EventBus>,
     /// The gates `test.block` waits on (test channels).
     test_gates: Arc<TestGates>,
+    /// Each session's active project (ARCH-088), shared with the dispatcher.
+    active_projects: Arc<ActiveProjects>,
     /// The hidden session-end window; `None` if it could not be created.
     session_end: Option<Arc<SessionEndWatcher>>,
     /// The supervisor: ends with the shutdown's report.
@@ -268,6 +271,12 @@ impl RunningCore {
     /// The gates of the test-channel tool `test.block`: in-process tests open them.
     pub fn test_gates(&self) -> &TestGates {
         &self.test_gates
+    }
+
+    /// Each session's active project (ARCH-088): set by calls that name a project, forgotten
+    /// when the session's connection closes.
+    pub fn active_projects(&self) -> &Arc<ActiveProjects> {
+        &self.active_projects
     }
 
     /// Idle accounting, drains and shutdown steps.
@@ -370,6 +379,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.clock.clone(),
         lifecycle.clone(),
     );
+    let active_projects = dispatcher.active_projects().clone();
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
@@ -414,6 +424,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         hub,
         events,
         test_gates,
+        active_projects,
         session_end,
         shutdown,
     })

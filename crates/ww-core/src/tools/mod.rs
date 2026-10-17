@@ -4,6 +4,7 @@
 
 pub mod asset_read_tools;
 pub mod dispatcher;
+pub mod project_tools;
 pub mod registry;
 pub mod stages;
 pub mod test_tools;
@@ -14,14 +15,16 @@ pub mod workspace_tools;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
 pub use dispatcher::Dispatcher;
+pub use project_tools::register_project_tools;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
 pub use stages::{
-    ConfirmDecision, ConfirmStage, Estimate, EstimateStage, MeterStage, PipelineHooks, RecordStage,
-    ReserveStage, Settings, SettingsStage,
+    CascadeSettings, ConfirmDecision, ConfirmStage, Estimate, EstimateStage, MeterStage,
+    PipelineHooks, RecordStage, ReserveStage, SettingSource, Settings, SettingsInput,
+    SettingsStage,
 };
 pub use test_tools::{TEST_MODULE, TestGates, register_test_tools};
 pub use trash_tools::register_trash_tools;
@@ -49,8 +52,12 @@ pub fn core_registry(
     register_trash_tools(&mut reg);
     register_asset_read_tools(&mut reg);
     register_watch_tools(&mut reg);
+    let all_tools = Arc::new(OnceLock::new());
+    register_project_tools(&mut reg, all_tools.clone());
     if test_tools {
         register_test_tools(&mut reg, gates.clone(), states.clone());
     }
+    // `project.context` suggests from every tool registered here.
+    let _ = all_tools.set(reg.descriptors());
     reg
 }

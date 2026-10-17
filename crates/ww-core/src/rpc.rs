@@ -30,7 +30,8 @@
 //! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
 //! [`Lifecycle`]'s connection count. A refused connection stops counting when it is refused
 //! (an incompatible client cannot keep an otherwise idle core alive) and is closed once the
-//! core drains; `AwaitingHello` and `Ready` connections count until they close.
+//! core drains; `AwaitingHello` and `Ready` connections count until they close. A `Ready`
+//! connection's session forgets its active project when it closes (ARCH-088).
 //!
 //! **Events** (ARCH-032). A connection is attached to the event bus (its forwarder started on
 //! the connection's outbound channel) when its session is established, and dropped from it in
@@ -682,6 +683,10 @@ impl Router for RpcRouter {
             let counted = conns.remove(&conn.conn_id).is_some_and(|gone| {
                 gone.hello_settled.cancel();
                 gone.ended.cancel();
+                // The session's active project lives as long as its connection (ARCH-088).
+                if let ConnState::Ready(session) = &gone.state {
+                    self.dispatcher.active_projects().forget(&session.id);
+                }
                 gone.counted
             });
             // Under the map lock: see the module docs on events.

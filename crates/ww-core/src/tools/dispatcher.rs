@@ -15,9 +15,18 @@
 //!    with the same arguments is replayed byte for byte, another hash is
 //!    `idempotency.conflict`, a running one `idempotency.in_progress`.
 //! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`, or a
-//!    `pending_confirmation` result), 6. **reserve**: the [`PipelineHooks`].
+//!    `pending_confirmation` result), 6. **reserve**: the [`PipelineHooks`]. Before the
+//!    settings, the Resolve stage's project part runs on the valid arguments (ARCH-088,
+//!    ARCH-098): with a session workspace, `CallCtx::project` is the `project` argument of a
+//!    tool that declares one, else the session's active project, else the workspace's
+//!    `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
+//!    never the call's project. The settings stage gets that project and, as the request
+//!    layer, the `settings` argument of a tool that declares one (only `test.settings` in
+//!    plan 2b, CORE-057); its error (`params.invalid`) is the call's.
 //! 7. **Execute** in its own task: a panic is `core.bug` with the panic text as untrusted
-//!    detail, and the core goes on (QA-012, ARCH-060).
+//!    detail, and the core goes on (QA-012, ARCH-060). A call that named a project and ended
+//!    `ok` makes it the session's active project and, on a read-write workspace, the hint
+//!    (a hint that can't be written is logged, never the call's error).
 //! 8. **Meter** and 9. **record**: the hooks again.
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
@@ -49,14 +58,15 @@ use serde_json::{Value, json};
 use tokio::task::JoinError;
 use ww_platform::{Clock, IdSource};
 use ww_protocol::{
-    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput, args_hash,
-    codes, fits_response_result,
+    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolDescriptor, ToolOutput,
+    args_hash, codes, fits_response_result,
 };
 
 use super::registry::{CallCtx, Registry, Tool};
-use super::stages::{ConfirmDecision, PipelineHooks};
+use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
 use crate::events::EventBus;
 use crate::lifecycle::Lifecycle;
+use crate::projects::{ActiveProjects, read_hint, resolve_project, write_hint};
 use crate::session::Session;
 use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
 use crate::store::StoreError;
@@ -77,6 +87,8 @@ struct Inner {
     ids: Arc<dyn IdSource>,
     clock: Arc<dyn Clock>,
     lifecycle: Arc<Lifecycle>,
+    /// Each session's active project (ARCH-088).
+    active: Arc<ActiveProjects>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -112,8 +124,15 @@ impl Dispatcher {
                 ids,
                 clock,
                 lifecycle,
+                active: Arc::new(ActiveProjects::new()),
             }),
         }
+    }
+
+    /// Each session's active project: the router forgets a session's when its connection
+    /// closes.
+    pub fn active_projects(&self) -> &Arc<ActiveProjects> {
+        &self.inner.active
     }
 
     /// The tools this dispatcher serves.
@@ -390,8 +409,33 @@ impl Inner {
     ) -> Outcome<ToolOutput> {
         let hooks = &self.hooks;
         let d = tool.descriptor();
+        // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid.
+        let named = named_project(d, &args);
+        let project = match &workspace {
+            None => None,
+            Some(open) => Some(self.project_of(session, open, named.as_deref()).await),
+        };
         // 3. Settings; 4. estimate.
-        let settings = hooks.settings.resolve(session);
+        let request = declares(d, "settings")
+            .then(|| args.get("settings").and_then(Value::as_object))
+            .flatten();
+        let settings = match hooks
+            .settings
+            .resolve(SettingsInput {
+                session,
+                descriptor: d,
+                workspace: workspace.as_deref(),
+                project: project.as_deref(),
+                request,
+            })
+            .await
+        {
+            Ok(settings) => settings,
+            Err(mut error) => {
+                error.trace_id = trace_id.to_string();
+                return Outcome::Error { error };
+            }
+        };
         let estimate = hooks.estimate.estimate(d);
         // 5. Confirm and caps.
         match hooks.confirm.check(session, d, &estimate) {
@@ -416,12 +460,14 @@ impl Inner {
             return Outcome::Error { error };
         }
         // 7. Execute, in its own task: a panic stays in it.
+        let open = workspace.clone();
         let ctx = CallCtx {
             session: session.clone(),
             trace_id: trace_id.to_string(),
             settings,
             events: self.events.clone(),
             workspace,
+            project,
         };
         let running = tool.clone();
         let joined = tokio::spawn(async move { running.run(&ctx, args).await }).await;
@@ -439,11 +485,66 @@ impl Inner {
                 }
             }
         };
+        // A call that named a project and ended `ok` makes it the session's active project
+        // and, on a read-write workspace, the workspace's hint (ARCH-088).
+        if let (Outcome::Ok(_), Some(open), Some(slug)) = (&outcome, &open, &named)
+            && ww_schema::is_slug(slug)
+        {
+            self.active.set(&session.id, slug);
+            if open.access == Access::ReadWrite
+                && let Err(e) = write_hint(&open.store, slug).await
+            {
+                tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
+            }
+        }
         // 8. Meter; 9. record.
         hooks.meter.settle(session, &outcome);
         hooks.record.record(session, d, &mut outcome);
         outcome
     }
+
+    /// The call's project in `open`: `named`, else the session's active project, else the
+    /// workspace's `state.json` hint, else `sketchbook` (ARCH-088, ARCH-098).
+    async fn project_of(
+        &self,
+        session: &Session,
+        open: &OpenWorkspace,
+        named: Option<&str>,
+    ) -> String {
+        if let Some(named) = named {
+            return named.to_string();
+        }
+        let active = self.active.get(&session.id);
+        let hint = match active {
+            Some(_) => None,
+            None => read_hint(&open.store).await,
+        };
+        resolve_project(None, active, hint)
+    }
+}
+
+/// Tools whose `project` argument is a filter (omitted means every project), so it is never
+/// filled in from the session and never sets the active project.
+const PROJECT_FILTER_TOOLS: &[&str] = &["assets.query"];
+
+/// Whether `d`'s input schema declares the argument `arg`.
+fn declares(d: &ToolDescriptor, arg: &str) -> bool {
+    d.input_schema
+        .get("properties")
+        .and_then(|p| p.get(arg))
+        .is_some()
+}
+
+/// The project a call names in its `project` argument, for a tool that declares one and whose
+/// `project` isn't a filter. It is the call's project as given, slug or not: the tool checks
+/// it, so a bad name is never swapped for the session's project.
+fn named_project(d: &ToolDescriptor, args: &Value) -> Option<String> {
+    if PROJECT_FILTER_TOOLS.contains(&d.name.as_str()) || !declares(d, "project") {
+        return None;
+    }
+    args.get("project")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// What `idem_begin` let the call do.

@@ -3,16 +3,10 @@
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
 tests = [
-    { name = "ww-spec-tests::store_order::crash_after_output_lists_orphan_and_keeps_files", rule = "ARCH-075", file = "tests/store_order.rs" },
     { name = "ww-spec-tests::versions_trash::signoff_seals_read_only_version_with_snapshot", rule = "CORE-026", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::versions_trash::signoff_uses_the_confirmed_bump", rule = "CORE-027", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::versions_trash::sealed_ref_carries_the_content_hash", rule = "ARCH-042", file = "tests/versions_trash.rs" },
     { name = "ww-spec-tests::versions_trash::link_external_asset_cannot_be_signed_off_until_collected", rule = "CORE-029", file = "tests/versions_trash.rs" },
-    { name = "ww-spec-tests::projects_settings::project_create_status_and_context", rule = "CORE-055", file = "tests/projects_settings.rs" },
-    { name = "ww-spec-tests::projects_settings::settings_cascade_overrides_workspace_then_project_then_request", rule = "CORE-057", file = "tests/projects_settings.rs" },
-    { name = "ww-spec-tests::projects_settings::progress_entries_go_under_done", rule = "CORE-039", file = "tests/projects_settings.rs" },
-    { name = "ww-spec-tests::projects_settings::archived_project_restore_runs_staleness_check", rule = "CORE-055", file = "tests/projects_settings.rs" },
-    { name = "ww-spec-tests::projects_settings::active_project_is_per_session_with_state_json_hint", rule = "ARCH-088", file = "tests/projects_settings.rs" },
     { name = "ww-spec-tests::asset_record::import_creates_candidate_run_with_handoff_and_uuid", rule = "CORE-020", file = "tests/asset_record.rs" },
     { name = "ww-spec-tests::asset_record::request_signoff_sets_in_review", rule = "CORE-053", file = "tests/asset_record.rs" },
     { name = "ww-spec-tests::asset_record::asset_topic_delivers_events_and_snapshots", rule = "ARCH-044", file = "tests/asset_record.rs" },

@@ -406,9 +406,10 @@ fn ctx(open: &Arc<OpenWorkspace>) -> CallCtx {
             profile_id: None,
         }),
         trace_id: "t_index".into(),
-        settings: Settings,
+        settings: Settings::default(),
         events: Arc::new(EventBus::new(clock)),
         workspace: Some(open.clone()),
+        project: None,
     }
 }
 

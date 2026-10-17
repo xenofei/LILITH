@@ -55,9 +55,14 @@ struct Recording {
 }
 
 impl SettingsStage for Recording {
-    fn resolve(&self, s: &Session) -> Settings {
+    fn resolve<'a>(
+        &'a self,
+        input: SettingsInput<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Settings, ww_protocol::ErrorBody>> + Send + 'a>,
+    > {
         self.log.push("settings");
-        self.plan2.settings.resolve(s)
+        self.plan2.settings.resolve(input)
     }
 }
 
@@ -729,6 +734,7 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.emit",
             "test.ingest_run",
             "test.panic",
+            "test.settings",
             "test.state_panic",
             "test.store_write",
             "test.trash",

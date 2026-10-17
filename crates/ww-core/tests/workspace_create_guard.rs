@@ -96,9 +96,10 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
             profile_id: None,
         }),
         trace_id: "t_1".into(),
-        settings: Settings,
+        settings: Settings::default(),
         events,
         workspace: None,
+        project: None,
     };
 
     // 4. Creating a new subfolder of that workspace trips the guard before the folder exists.

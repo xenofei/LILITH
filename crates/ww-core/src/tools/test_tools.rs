@@ -14,6 +14,12 @@
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.worldwright\fence\<name>` |
+//! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
+//!
+//! `test.settings`'s `settings` argument (dotted keys, or nested mappings) is plan 2b's only
+//! source of the settings cascade's request layer (CORE-057 clarification): the dispatcher's
+//! settings stage reads it because the tool's input schema declares it, and a key the cascade
+//! refuses is `params.invalid`.
 //!
 //! `test.store_write`, `test.ingest_run` and `test.trash` work in the session's workspace
 //! (`workspace.required` without one). `test.ingest_run` does what an engine and the core do
@@ -21,7 +27,8 @@
 //! takes a run id from `Store::next_run_id`, and commits one candidate run in the ARCH-075
 //! order (a new manifest if there is none, status by `transition(…, CandidateRun)`, each run
 //! file with its `sha256`, and a jobs log line when `job_line` is true). An omitted `project`
-//! is `sketchbook` (Task 12 replaces that with its resolver).
+//! is the call's resolved project (`CallCtx::project`: the session's active project, else the
+//! workspace's hint, else `sketchbook`).
 //!
 //! `test.watch_fence` is the watcher fence (Global Constraints, Tests): `RawPipe::fence` writes
 //! `<ws>\.worldwright\fence\<name>` (`<name>` is `<pid>-<n>`), then calls it, and it returns
@@ -219,6 +226,19 @@ struct FenceArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SettingsArgs {
+    /// A project slug; omitted: the session's active project.
+    #[serde(default)]
+    #[expect(dead_code, reason = "the dispatcher resolves the project from it")]
+    project: Option<String>,
+    /// The request layer: dotted setting keys (or nested mappings) and their values.
+    #[serde(default)]
+    #[expect(dead_code, reason = "the dispatcher's settings stage reads it")]
+    settings: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NoArgs {}
 
 /// What a tool that never returns normally would have returned.
@@ -297,7 +317,7 @@ async fn trash(ctx: &CallCtx, args: TrashArgs) -> Result<(TrashResult, String), 
 async fn ingest_run(ctx: &CallCtx, args: IngestArgs) -> Result<(IngestResult, String), ErrorBody> {
     let store = ctx.workspace()?.store.clone();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
-    let project = args.project.unwrap_or_else(|| "sketchbook".to_string());
+    let project = args.project.unwrap_or_else(|| ctx.project_or_default());
     if !is_slug(&project) {
         return Err(params_invalid(
             ctx,
@@ -607,6 +627,19 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
                     watch.fence(&args.name).await;
                 }
                 Ok((Nothing {}, format!("fence {} passed", args.name)))
+            })
+        },
+    ));
+
+    reg.register(typed_tool(
+        "test.settings",
+        "Test channels only: returns the call's resolved settings with their sources. `settings` is the request layer of the settings cascade.",
+        EffectClass::Read,
+        TEST_MODULE,
+        |ctx, _args: SettingsArgs| {
+            Box::pin(async move {
+                let summary = format!("{} settings", ctx.settings.values.len());
+                Ok((ctx.settings.clone(), summary))
             })
         },
     ));
