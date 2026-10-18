@@ -66,6 +66,16 @@ fn nvml_error(e: NvmlError) -> io::Error {
     io::Error::other(format!("NVML: {e}"))
 }
 
+/// A field the GPU may not have: `NotSupported` is `Ok(None)` (the field is unknown and the
+/// rest of the sample stands); any other error is still an error.
+fn supported<T>(read: Result<T, NvmlError>) -> Result<Option<T>, NvmlError> {
+    match read {
+        Ok(v) => Ok(Some(v)),
+        Err(NvmlError::NotSupported) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 type FieldValues = Result<Vec<Result<FieldValueSample, NvmlError>>, NvmlError>;
 
 fn instant_power(values: &FieldValues) -> Option<u32> {
@@ -113,7 +123,7 @@ impl GpuSource for NvmlGpu {
             name: self.name.clone(),
             driver: self.driver.clone(),
             util_pct: util.gpu.min(100) as u8,
-            power_mw: device.power_usage().map_err(nvml_error)?,
+            power_mw: supported(device.power_usage()).map_err(nvml_error)?,
             power_instant_mw: if features.instant_power {
                 instant_power(&device.field_values_for(&[FieldId(NVML_FI_DEV_POWER_INSTANT)]))
             } else {
@@ -149,5 +159,25 @@ impl GpuSource for NvmlGpu {
 
     fn features(&self) -> GpuFeatures {
         self.features
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One field the GPU doesn't support is unknown; it doesn't fail the sample, and other
+    /// errors still do (Task 5 review M4).
+    #[test] // spec: CORE-059
+    fn a_not_supported_field_is_unknown_not_an_error() {
+        assert_eq!(supported::<u32>(Ok(7)).unwrap(), Some(7));
+        assert_eq!(
+            supported::<u32>(Err(NvmlError::NotSupported)).unwrap(),
+            None
+        );
+        assert!(matches!(
+            supported::<u32>(Err(NvmlError::Unknown)),
+            Err(NvmlError::Unknown)
+        ));
     }
 }

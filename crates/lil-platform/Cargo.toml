@@ -14,6 +14,8 @@ getrandom.workspace = true
 nvml-wrapper.workspace = true
 # The SQLite file helpers lil doctor and the core share (sqlite_files, CORE-004).
 rusqlite.workspace = true
+# The fake hardware script the test kit and a test-channel core read (hw_fake, QA-066).
+serde_json.workspace = true
 sha2.workspace = true
 # CPU, RAM, per-process CPU time, network and disks (CORE-059).
 sysinfo.workspace = true

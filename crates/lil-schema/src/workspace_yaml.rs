@@ -63,6 +63,36 @@ pub fn read_workspace_yaml(text: &str) -> Result<WorkspaceYaml, String> {
     })
 }
 
+/// The `hardware:` key of the workspace file: what the last detection wrote (CORE-067). A value
+/// of another type is left out, as if it were missing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HardwareYaml {
+    pub gpu: Option<String>,
+    pub vram_gb: Option<u64>,
+    pub ram_gb: Option<u64>,
+}
+
+/// The `hardware:` key of `text`; everything missing when it has none.
+///
+/// # Errors
+/// When the text isn't a YAML mapping.
+pub fn read_hardware(text: &str) -> Result<HardwareYaml, String> {
+    let root = root_map(text, "the workspace file")?;
+    let Some(Value::Object(hardware)) = root.get("hardware") else {
+        return Ok(HardwareYaml::default());
+    };
+    let whole = |key: &str| hardware.get(key).and_then(Value::as_u64);
+    Ok(HardwareYaml {
+        gpu: match hardware.get("gpu") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        },
+        vram_gb: whole("vram_gb"),
+        ram_gb: whole("ram_gb"),
+    })
+}
+
 pub fn read_project_yaml(text: &str) -> Result<ProjectYaml, String> {
     let root = root_map(text, "project.yaml")?;
     let s = |k: &str| root.get(k).and_then(Value::as_str).map(str::to_string);
@@ -333,5 +363,25 @@ hardware: {gpu: none}
                 "../../lil-spec-tests/fixtures/sample-workspace/projects/sketchbook/progress.md"
             )
         );
+    }
+
+    #[test] // spec: CORE-067
+    fn hardware_reads_the_three_values_and_skips_other_types() {
+        let h = read_hardware("name: x\nhardware:\n  gpu: RTX 5090\n  vram_gb: 32\n  ram_gb: 64\n")
+            .unwrap();
+        assert_eq!(
+            h,
+            HardwareYaml {
+                gpu: Some("RTX 5090".into()),
+                vram_gb: Some(32),
+                ram_gb: Some(64)
+            }
+        );
+        let flow = read_hardware("hardware: {gpu: none}\n").unwrap();
+        assert_eq!((flow.gpu.as_deref(), flow.vram_gb), (Some("none"), None));
+        assert_eq!(read_hardware("name: x\n").unwrap(), HardwareYaml::default());
+        let odd = read_hardware("hardware: {gpu: [a], vram_gb: lots, ram_gb: -1}\n").unwrap();
+        assert_eq!(odd, HardwareYaml::default());
+        assert!(read_hardware("- a\n").is_err());
     }
 }

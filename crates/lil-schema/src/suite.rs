@@ -51,6 +51,37 @@ impl SuiteToml {
             .and_then(toml::Value::as_bool)
             .unwrap_or(false)
     }
+
+    /// The `[power]` table (CORE-064): each value as the decimal text it was written as (a TOML
+    /// string, integer or float); a key of another type is left out.
+    pub fn power(&self) -> PowerToml {
+        let power = self.other.get("power");
+        let text = |table: Option<&toml::Value>, key: &str| match table?.get(key)? {
+            toml::Value::String(s) => Some(s.clone()),
+            toml::Value::Integer(n) => Some(n.to_string()),
+            toml::Value::Float(f) => Some(f.to_string()),
+            _ => None,
+        };
+        let electricity = power.and_then(|p| p.get("electricity"));
+        PowerToml {
+            psu_efficiency: text(power, "psu_efficiency"),
+            rest_of_system_w: text(power, "rest_of_system_w"),
+            cpu_tdp_w: text(power, "cpu_tdp_w"),
+            electricity_rate: text(electricity, "rate"),
+            electricity_currency: text(electricity, "currency"),
+        }
+    }
+}
+
+/// The `[power]` table of `suite.toml`, unparsed (`SuiteToml::power`): `psu_efficiency`,
+/// `rest_of_system_w`, `cpu_tdp_w` and `electricity = {rate, currency}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PowerToml {
+    pub psu_efficiency: Option<String>,
+    pub rest_of_system_w: Option<String>,
+    pub cpu_tdp_w: Option<String>,
+    pub electricity_rate: Option<String>,
+    pub electricity_currency: Option<String>,
 }
 
 #[cfg(test)]
@@ -107,5 +138,27 @@ answer = 42
         assert!(suite.other.is_empty());
         assert!(SuiteToml::parse("[[workspaces]]\npinned = true\n").is_err());
         assert!(SuiteToml::parse("default_workspace = 3\n").is_err());
+    }
+
+    #[test] // spec: CORE-064
+    fn power_keeps_each_value_as_written_and_skips_other_types() {
+        let suite = SuiteToml::parse(
+            "[power]\npsu_efficiency = \"0.9\"\nrest_of_system_w = 40\ncpu_tdp_w = 65.5\n\
+             electricity = {rate = \"0.25\", currency = \"EUR\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            suite.power(),
+            PowerToml {
+                psu_efficiency: Some("0.9".into()),
+                rest_of_system_w: Some("40".into()),
+                cpu_tdp_w: Some("65.5".into()),
+                electricity_rate: Some("0.25".into()),
+                electricity_currency: Some("EUR".into()),
+            }
+        );
+        let odd = SuiteToml::parse("[power]\npsu_efficiency = true\nelectricity = 3\n").unwrap();
+        assert_eq!(odd.power(), PowerToml::default());
+        assert_eq!(SuiteToml::parse("").unwrap().power(), PowerToml::default());
     }
 }

@@ -14,6 +14,7 @@ pub mod env;
 pub mod fs;
 pub mod guard;
 pub mod hw;
+pub mod hw_fake;
 mod hw_nvml;
 mod hw_pdh;
 pub mod ids;

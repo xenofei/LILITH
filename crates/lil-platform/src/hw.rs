@@ -39,8 +39,11 @@ pub struct GpuSample {
     pub name: String,
     pub driver: String,
     pub util_pct: u8,
-    /// NVML's power reading (averaged by the driver).
-    pub power_mw: u32,
+    /// NVML's power reading (averaged by the driver); `None` where the GPU doesn't support it
+    /// (NVML says `NotSupported`). That one field missing must not fail the whole sample: the
+    /// telemetry falls back to `power_instant_mw`, then to the energy counter's rate, and
+    /// labels what it used.
+    pub power_mw: Option<u32>,
     /// The instantaneous power field, where the GPU has it.
     pub power_instant_mw: Option<u32>,
     /// The total energy counter since the driver loaded, where the GPU has it.
