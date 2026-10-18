@@ -96,11 +96,13 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
 - **Branches and PRs:**
   - Task 1 is its own branch and PR (`rename-cleanup`), merged first.
   - Plan 3 lands as **two PRs** through `lil dev merge` (owner question 10): **3a** = Tasks 2–13 (spec, carries, platform, test kit, spec tests, jobs, telemetry, scheduler, engines, ComfyUI client and observation) on `plan-3a-core-platform`, cut from `main` after this plan's docs PR and PR-D merge; **3b** = Tasks 14–21 on `plan-3b-agents-metering`, cut from `main` after 3a merges. 3b's spec tests stay expected-fail when 3a merges.
-  - Commit after every task; each message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Agents push and open PRs; the owner approves and merges (rename D10).
-- **Protected files** (QA-019/020, `dev/protected-paths.txt`). Four change, so the owner runs `lil dev approve <PR>` on each PR's final head:
+  - Commit after every task (Execution notes, "Commits"). Agents push and open PRs; the owner approves and merges (rename D10).
+- **Protected files** (QA-019/020, `dev/protected-paths.txt`). These change, so the owner runs `lil dev approve <PR>` on each PR's final head:
   - `/Cargo.toml`, Task 5 (PR 3a);
   - `.config/nextest.toml`, Task 6 (PR 3a): the `build-testbins` command also builds `-p lil-mcp -p lil-testkit`;
-  - `.claude/settings.json`, Task 20 (PR 3b): `deny` entries in the file's existing absolute form, `Edit(//**/LILITH*/suite.toml)` (like its `Edit(//**/.lilith/**)`), plus a `Write(//**/LILITH*/suite.toml)` twin only if Task 2 finds that `Edit` path rules don't already cover the Write tool (the file has no `Write` path rule today), and the write-like shell entries `Bash(*>*LILITH*suite.toml*)`, `PowerShell(*>*LILITH*suite.toml*)`, `PowerShell(*Set-Content*LILITH*suite.toml*)` and `PowerShell(*Add-Content*LILITH*suite.toml*)`. Together they stop the agents building the suite from changing a real `suite.toml`; reads are left to the existing private-path rules, and other write commands are a documented limit of pattern rules;
+  - `crates/lil-spec-tests/Cargo.toml`, Task 7 (PR 3a), only if the spec tests need a new dev-dependency;
+  - `crates/lil-spec-tests/tests/core_session.rs`, Task 14 (PR 3b): `hello_major_mismatch_is_refused` asserts `core_protocol == "1.0"`, which becomes `"1.1"` with protocol 1.1, and nothing else in the file changes;
+  - `.claude/settings.json`, Task 20 (PR 3b): **seven** `deny` entries in the file's existing absolute form. One path rule, `Edit(//**/LILITH*/suite.toml)` (like its `Edit(//**/.lilith/**)`), and three write-like shell patterns, each as a Bash and a PowerShell twin, because `brief_rules_are_present_in_both_shells` (`crates/lil-testkit/tests/claude_settings_patterns.rs`) requires equal Bash and PowerShell sets: `Bash(*>*LILITH*suite.toml*)`, `PowerShell(*>*LILITH*suite.toml*)`, `Bash(*Set-Content*LILITH*suite.toml*)`, `PowerShell(*Set-Content*LILITH*suite.toml*)`, `Bash(*Add-Content*LILITH*suite.toml*)` and `PowerShell(*Add-Content*LILITH*suite.toml*)`. An eighth entry, `Write(//**/LILITH*/suite.toml)`, is added only if Task 2's verification shows that `Edit` path rules don't cover the Write tool; in that case Task 20 also changes `claude_settings_patterns.rs` (not protected), whose `deny_rules()` panics on any `Write(` rule today, to accept exactly that rule, with a test. Together they stop the agents building the suite from changing a real `suite.toml`; reads are left to the existing private-path rules, and other write commands are a documented limit of pattern rules;
   - `.github/workflows/nightly.yml`, Task 21 (PR 3b): the full crash suite (QA-055, QA-072).
 
   New files under `crates/lil-spec-tests/**` are free additions (`add-ok`). No other protected file changes: not `crates/lil-cli/Cargo.toml`, not `crates/lil-cli/src/main.rs` (new user commands are flattened from `src/user/mod.rs`), not `test-params.toml`.
@@ -118,7 +120,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
   | `hyper-util` | `0.1.21`, `default-features = false`, `["tokio", "server", "http1"]` | MIT | the same |
 
   `lil-core` adds the existing `reqwest`. `lil-platform` adds the existing `rusqlite` (Task 4's shared helpers). Task 5 checks `cargo tree -d` for a second `schemars`; `rmcp` must use the workspace's 1.x.
-- **File writes in `lil-core`** (ARCH-002, ARCH-112, QA-024): every file-mutating call stays in `crates/lil-core/src/store/fsops.rs`. New homes there: the ComfyUI-side cleanup (`remove_engine_file`, refusing any path outside `<root>\output` and `<root>\input`), personal resource files and their trash, and suite-level job caches. `telemetry.db` is SQLite's own file.
+- **File writes in `lil-core`** (ARCH-002, ARCH-112, QA-024): every file-mutating call stays in `crates/lil-core/src/store/fsops.rs`. The append logs keep their existing home, `crates/lil-core/src/store/logs.rs`, which writes through `fsops::append_locked`: `Store::append_log(LogKind::Jobs | LogKind::Usage, …)` for the workspace logs and `logs::append_loose_usage(env, record)` for `usage-loose.jsonl`. New homes in `fsops.rs`: the ComfyUI-side cleanup (`remove_engine_file`, refusing any path outside `<root>\output` and `<root>\input`), personal resource files and their trash, and suite-level job caches. `telemetry.db` is SQLite's own file.
 - **Tests** (QA-031): as in plan 2b, plus:
   - in-process tests use `FakeClock`, `SeqIds`, the fake hardware sources and the in-process `FakeComfy`; never real time, NVML or a real ComfyUI;
   - E2E tests drive telemetry with `test.hw_tick`, never by waiting for the 1 Hz sampler;
@@ -131,9 +133,10 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
   | Task | Globs | `lines_with` | Why | Until |
   |---|---|---|---|---|
   | 1 | (existing rows) | — | the `LEGACY_` row, the `refs.rs` `legacy_ww_ref_parses_to_the_same_ref` row, and the spec Appendix E and `workspace-format.md` rows now outlive PR-D | the `LEGACY_` and `refs.rs` rows become "kept: `.worldwright\` stays reserved and `ww://` still parses for sealed snapshots (no planned end)"; the spec Appendix E and `workspace-format.md` rows become "the legacy workspace readers go"; the CI, helper, credential, `dev/mod.rs` help-text, `merge-guard.md` and `worldwright-reviewer` rows are removed with what they covered |
-  | 1, 3 | `crates/lil-core/tests/trash.rs`, `crates/lil-platform/tests/fs_lock.rs` | `".worldwright"`, `.worldwright\\core.lock` | tests that `.worldwright\` stays reserved and its lock keeps out an old core | kept: `.worldwright\` stays reserved (no planned end) |
-  | 4 | `crates/lil-cli/tests/doctor_workspace.rs`, `crates/lil-core/tests/workspace_tools.rs` | `worldwright.yaml`, `.worldwright\state.json`, `"ww://` | the legacy-name rename test builds a plugin-era workspace | the legacy workspace readers go |
-  | 2 | `docs/superpowers/specs/2026-10-12-lilith-design.md` | the exact Appendix F substrings that name `worldwright.yaml`, `.worldwright\`, `ww://`, `plugin/worldwright/`, `name: "worldwright"` and `worldwright@lilith` (listed in the row as copied) | Appendix F's legacy-name and plugin contracts | the legacy readers go (legacy names) or the plugin rename (plugin names) |
+  | 1 | `crates/lil-core/tests/trash.rs` | `".worldwright"` | tests that `.worldwright\` stays reserved | kept: `.worldwright\` stays reserved (no planned end) |
+  | 3 | `crates/lil-core/tests/workspace_hub.rs` | `.worldwright\\core.lock` | `core_lock_cannot_be_deleted_or_renamed_while_held`: the legacy lock keeps out an old core | kept: `.worldwright\` stays reserved (no planned end) |
+  | 4 | `crates/lil-cli/tests/doctor_workspace.rs`, `crates/lil-core/tests/workspace_tools.rs` | `worldwright.yaml`, `.worldwright\\state.json`, `"ww://` | the legacy-name rename test builds a plugin-era workspace | the legacy workspace readers go |
+  | 2 | `docs/superpowers/specs/2026-10-12-lilith-design.md` | the exact Appendix F substrings that name `worldwright.yaml`, `.worldwright\`, `ww://`, `plugin/worldwright/` and `name: "worldwright"` (listed in the row as copied) | Appendix F's legacy-name and plugin contracts | the legacy readers go (legacy names) or the plugin rename (plugin names) |
   | 20 | `plugin/**` | `plugin/worldwright/` | the plugin id stays `worldwright` (R1), so its folder does | plugin rename |
   | 20 | `plugin/worldwright/.claude-plugin/plugin.json`, `plugin/.claude-plugin/marketplace.json` | `"name": "worldwright"`, `"source": "./worldwright"` | the plugin and marketplace entries (R1) | plugin rename |
   | 20 | one glob per copied 1.2.0 skill or subagent folder (for example `plugin/worldwright/skills/<name>/**`), recorded when copied; never `skills/lilith/**` | (empty: the files are carried unchanged) | plugin 1.2.0's content, carried unchanged (owner question 2) | the skills port |
@@ -141,7 +144,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
   | 7, 19, 20 | `crates/lil-core/src/tools/doctor_tools.rs`, `crates/lil-cli/src/user/doctor.rs`, `crates/lil-cli/tests/{doctor_claude,plugin_files}.rs` (one glob each), `crates/lil-spec-tests/tests/{plugin_hooks,doctor_claude,mcp_server}.rs` (one glob each) | `worldwright@lilith`, `mcp__plugin_worldwright_`, `plugin/worldwright/`, `name: "worldwright"` | Claude Code's names for the plugin's tools and the install target (AI-110, D5) | plugin rename |
   | 20 | `crates/lil-cli/tests/plugin_files.rs` | `worldwright.yaml` | `hooks_work_in_a_plugin_era_workspace` | the legacy workspace readers go |
 
-  Write each substring exactly as it appears in its file: a backslash is doubled in Rust string literals (`.worldwright\\core.lock`) and single in Markdown and comments. Task 7 adds the spec-test globs of the 7/19/20 row when it creates those files; Tasks 19 and 20 add the rest. When Task 1 deletes a row, it also deletes that row's `allowed(...)` assertions in `no_stale_names.rs`. `every_allowlist_row_still_allows_something` keeps each row honest.
+  The table gives each substring exactly as it appears in the scanned file: in Rust source a backslash inside a string literal appears doubled (`.worldwright\\core.lock`), in Markdown and comments single (`.worldwright\state.json`). The row's own Rust literal escapes each backslash once more. If a test builds the path with a raw string or `Path::join`, record the substring as that line really reads. The 7/19/20 row has one owner per glob: Task 7 adds the spec-test globs (`plugin_hooks.rs`, `doctor_claude.rs`, `mcp_server.rs`) when it creates those files; Task 19 adds a glob only for a file it writes itself that names one of the row's substrings; Task 20 adds the doctor and plugin globs (`doctor_tools.rs`, `user/doctor.rs`, `crates/lil-cli/tests/{doctor_claude,plugin_files}.rs`) in the commit that writes those names into them. A glob whose file names none of the row's substrings is left out, because the honesty test would fail on it. When Task 1 deletes a row, it also deletes that row's `allowed(...)` assertions in `no_stale_names.rs`. `every_allowlist_row_still_allows_something` keeps each row honest.
 - **Spec values used verbatim:**
   - one heavy GPU job at a time, in the `gpu-heavy` lane (ARCH-071); lanes `gpu-heavy` and `cpu` (CORE-121);
   - the watchdog flags jobs running more than **3×** their expected time, measured from `execution_start` (ARCH-072, CORE-126);
@@ -161,12 +164,12 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
     - ids `j_<16 hex>`; lanes `gpu-heavy` and `cpu`; priority classes `interactive`, `user`, `agent` (a `ui:*` caller's job is `user` unless the tool marks it `interactive`; `assistant`, `mcp` and `cli` jobs are `agent`);
     - statuses `queued`, `running`, `succeeded`, `failed`, `cancelled`; substatuses and their status: `waiting`, `waiting_for_vram`, `submitting`, `queued_in_engine` → `queued`; `executing`, `ingesting`, `retrying_<n>_of_<m>`, `cancelling`, `interrupted_unknown` → `running`; `interrupted` → `failed`;
     - a job lives in the `state.db` of its call's scope: the workspace's, or the suite's for a call without a workspace (ARCH-099);
-    - `JobSummary` is `{job_id, kind, lane, priority, status, substatus, project?, asset_id?, doc_id?, created, updated, started?, finished?, attempt, progress?: {value, max, node?}, watchdog?: "slow", error?, result?: {structured, artifacts}, retry_of?, trace_id}`, times RFC 3339 UTC.
+    - `JobSummary` is `{job_id, kind, lane, priority, status, substatus, project?, asset_id?, doc_id?, created, updated, started?, finished?, attempt, progress?: {value, max, node?}, watchdog?: "slow", vram_unchecked?: true, error?, result?: {structured, artifacts}, retry_of?, trace_id}`, times RFC 3339 UTC.
   - **The suite-held queue** (CORE-123–125, ARCH-071):
     - per lane, at most one job is in an engine at a time; the next is submitted when it ends;
     - the order is class rank, then submission order; a job with a `group` (a model profile, plan 6a) may move ahead of older jobs of its class with another group, but no job is overtaken that way more than **8** times;
     - `[jobs] preempt_agent_batches = true` (default `false`) cancels a running `agent` prompt when an `interactive` job arrives and requeues it at the head of its class; it never touches a `user` job;
-    - the `gpu-heavy` lane holds the GPU lease; before dispatch the scheduler computes free VRAM as `min(total − Σ others, nvml_free + engine_local) − 512 MiB`, floored at 0, where `others` is the PDH `Local Usage` of every process outside the job's engine and `engine_local` is the engine processes' own; a job whose `vram_need_mib` doesn't fit waits in `waiting_for_vram` and is re-checked on every telemetry sample; without NVML there is no VRAM check, and the job carries the note `vram_unchecked`;
+    - the `gpu-heavy` lane holds the GPU lease; before dispatch the scheduler computes free VRAM as `min(total − Σ others, nvml_free + engine_local) − 512 MiB`, floored at 0, where `others` is the PDH `Local Usage` of every process outside the job's engine and `engine_local` is the engine processes' own; a job whose `vram_need_mib` doesn't fit waits in `waiting_for_vram` and is re-checked on every telemetry sample; without NVML there is no VRAM check, and the job's `JobSummary` has `vram_unchecked: true`;
     - when the lease passes to a job for another engine, the previous engine is asked to unload (`/free` for ComfyUI);
     - the watchdog sets `watchdog: "slow"` and publishes it; it never cancels.
   - **Retries and recovery** (CORE-128, QA-004, QA-007, QA-009, ARCH-022):
@@ -200,7 +203,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
     - `telemetry.db` (`Env::local_dir()\telemetry.db`, `PRAGMA user_version = 1`; a different version or a failed `quick_check` means the old file and its sidecars are renamed aside to `telemetry.db.damaged-<YYYYMMDDTHHMMSSZ>`, never deleted, and a new one is created) holds `s1` (1-second samples), `m1`, `h1`, `proc_s1` (per tracked process, 24 h) and `job_energy` (written by `meter` when a job completes); downsampled rows keep min, average and max per metric and the summed GPU and CPU energy;
     - series metrics: `gpu.util`, `gpu.power`, `gpu.energy`, `gpu.temp`, `gpu.vram_used`, `cpu.util`, `cpu.power`, `cpu.energy`, `ram.used`, `system.power`, `net.rx`, `net.tx`; for the two `*.energy` metrics each point's min, average and max are the interval's summed energy in mJ, so the points of a range add up to its energy;
     - `Snapshot` is `{ts, gpu?: {name, driver, util_pct, power_mw, energy_mj?, temp_c, sm_clock_mhz, mem_clock_mhz, fan_pct?, throttle: [string], vram_total_mib, vram_used_mib, measured}, processes: [{pid, name, role?, sm_permille?, vram_local_mib?, vram_committed_mib?, cpu_permille?, ram_mib?}], cpu: {util_permille, per_core_permille: [n], package_power_mw, measured}, ram: {total_mib, used_mib}, disks: [{volume, free_mib}], sizes: {workspace_mib?, models_mib?}, net: [{adapter, rx_bps, tx_bps}], system_power_mw, system_parts: [{part: "gpu" | "cpu" | "rest", mw, measured}], alerts: [{id, kind, value, since}]}`;
-    - `JobEnergy` is `{job_id, workspace, from, to, gpu_mj_gross, gpu_mj_above_idle, cpu_mj_gross, cpu_mj_above_idle, system_mj, gpu_seconds_milli, measured: {gpu, cpu}}`;
+    - `JobEnergy` is `{job_id, workspace, from, to, gpu_mj_gross, gpu_mj_above_idle, cpu_mj_gross, cpu_mj_above_idle, system_mj, gpu_seconds_milli, measured: {gpu, cpu}, idle_unknown?: true}`, where `idle_unknown` (present only when true) means no idle baseline existed, so the above-idle figures equal the gross ones;
     - energy comes from the hardware counters; a counter that goes down was reset, and that interval's delta is the new value; where a source has no counter, energy is integrated power, labelled `estimated`;
     - CPU package power comes from the Energy Meter counter set, whose energy values are picowatt-hours: the raw value is accumulated as an integer and converted to mJ (× 36 / 10⁷) only when read; without the counter set, CPU utilisation × `[power] cpu_tdp_w`, labelled `estimated`; with neither, the CPU part is `unknown`, shown as missing and left out of the whole-system and per-job CPU figures (never guessed);
     - whole system = (GPU + CPU package + `rest_of_system_w`) / `psu_efficiency`, each part labelled `measured`, `estimated` or `unknown`; `suite.toml` `[power]`: `psu_efficiency = "0.9"`, `rest_of_system_w = "0"` (0 means "not set" and is shown so), optional `cpu_tdp_w`, optional `electricity = {rate, currency}` per kWh;
@@ -216,7 +219,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
     - a call that needs a confirmation returns `pending_confirmation` while a verified `ui:*` connection is open (plan 4 adds the notification path); otherwise, and always for a non-interactive caller, it returns `confirm.unavailable` or `cap.exceeded`;
     - a `ui:*` session's pending cap confirmations are cancelled when its connection closes;
     - `retry_token` is the call's idempotency key. A retry with that key re-evaluates the stored `pending_confirmation`: approved runs the call (once; its outcome is then stored as usual), denied returns `confirm.denied`, expired returns `confirm.expired` (both release the key), and still pending returns the same `pending_confirmation`.
-  - **Usage records** (CORE-069, CORE-071, workspace format I10): one line per call in `registry/usage.<machine>.<yyyy-mm>.jsonl`, or `usage-loose.jsonl` without a workspace, after `machine` and `seq`: `ts, workspace` (id or `"loose"`), `project, asset, job_id, tool, caller_kind, account` (opaque id), `provider, model, route, service_tier, region, billing_basis` (`payg`, `prepaid_credits`, `subscription_quota`, `free_tier`, `byok`, `local`), the units that apply (`input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cache_ttl`, `output_tokens`, `reasoning_tokens`, `images`, `seconds`, `characters`, `requests`, `gpu_seconds`, `energy_wh_gross`, `energy_wh_above_idle`), `raw_usage, est_cost, cost, energy_cost, cost_source, price_version, currency, latency_ms, status` (`pending`, `succeeded`, `failed`, `cancelled`), `attribution` (`suite` or `unattributed`). Money fields are decimal strings. A `pending` row is written to the scope's `state.db` before the call is sent; a row left by a dead core becomes a `status: "pending"` line at startup and keeps its reservation.
+  - **Usage records** (CORE-069, CORE-071, workspace format I10): one line per call in `registry/usage.<machine>.<yyyy-mm>.jsonl`, or `usage-loose.jsonl` without a workspace, after `machine` and `seq`: `ts, workspace` (id or `"loose"`), `project, asset, job_id, tool, caller_kind, account` (opaque id), `provider, model, route, service_tier, region, billing_basis` (`payg`, `prepaid_credits`, `subscription_quota`, `free_tier`, `byok`, `local`), the units that apply (`input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cache_ttl`, `output_tokens`, `reasoning_tokens`, `images`, `seconds`, `characters`, `requests`, `gpu_seconds`, `energy_wh_gross`, `energy_wh_above_idle`), `idle_unknown?` (as in `JobEnergy`), `raw_usage, est_cost, cost, energy_cost, cost_source, price_version, currency, latency_ms, status` (`pending`, `succeeded`, `failed`, `cancelled`), `attribution` (`suite` or `unattributed`). Money fields are decimal strings. A `pending` row is written to the scope's `state.db` before the call is sent; a row left by a dead core becomes a `status: "pending"` line at startup and keeps its reservation.
   - **Caps and money in `suite.toml`** (CORE-081, CORE-083, CORE-085–092):
     - `[money] display_currency = "USD"`; `[[money.rates]] currency, in_display, date` (1 unit of `currency` = `in_display` display units);
     - `[caps]` `monthly`, `per_call_max`, `[caps.provider_monthly]`: decimal strings or integers in the display currency; the workspace format's `monthly_usd`, `per_call_max_usd` and `[caps.provider_monthly_usd]` are read only when the display currency is `USD` and the new key is absent; `app/caps.set` writes the new keys and removes the legacy ones, keeping comments;
@@ -276,7 +279,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
     | `lil test --real [--record <dir>]` | runs `cargo nextest run --workspace --run-ignored only -E 'test(/^real_/)'` from the source checkout, with `LIL_REAL_COMFYUI` set to `http://127.0.0.1:<port>` from `[engines.comfyui]`; outside a checkout it says so and exits 2 |
     | `lil doctor` | adds: the workspace `state.db` and its local folder (damaged, newer, hot journal, orphan `-wal`/`-shm`/`-journal`, each set aside only after you type `y`); legacy names (a workspace using `worldwright.yaml`, `.worldwright\state.json` or `ww://` refs is a `problem:`; only after you type `y` does the core rename `worldwright.yaml` to `lilith.yaml`, copy the `state.json` hint to `.lilith\`, and rewrite `ww://` to `lil://` in asset manifests with targeted edits, never in a sealed, read-only `manifest.snapshot.json`, which it lists as skipped (so `ww://` parsing stays for sealed versions); `.worldwright\` itself is left in place; never with `--non-interactive`); ComfyUI (`[engines.comfyui]` present, `root` and `python` exist, owned launch args loopback, an attached engine's exposure, the "Prefer no sysmem fallback" reminder, ARCH-072); Claude Code (`claude.exe` resolved; the plugin installed and at 1.3.0 in the default profile, installed or updated in place only after `y`, never removed; its `userConfig` `lil_mcp_path` and `lil_path` point into a folder the running channel trusts (`bin\` or the install folder for stable, the build folder for dev); the workspace's `.claude/settings.json` allow and ask rules, written only after `y`; skills still writing directly, from `skills-inventory.toml`) |
 
-  - **Fail points added:** `jobs.after_submitting`, `jobs.after_post`, `jobs.after_outputs`, `meter.after_pending`, `meter.after_usage_line`, `caps.after_reserve`, `confirm.after_answer`.
+  - **Fail points added:** `jobs.after_submitting`, `jobs.after_post`, `jobs.after_outputs`, `meter.after_pending`, `meter.after_usage_line`, `caps.after_reserve`, `confirm.after_answer`. (Plan note, not copied into Appendix F: the task that first fires a fail point adds it to `NAMES` in `crates/lil-core/src/store/failpoints.rs`, a closed list: `jobs.*` in Task 8, `confirm.after_answer` in Task 14, `meter.*` in Task 15, `caps.after_reserve` in Task 16.)
   - **Clarifications recorded in Appendix F** (no new rule IDs): ARCH-047, `mcp` needs `claude.exe` as the direct parent; ARCH-054 and CORE-112, `mcp_confirmation` and its default; ARCH-064, the engine is every process in its Job Object; ARCH-071, the free-VRAM formula and fit signal; ARCH-013/AI-107 `lil.exe` beside `lil-mcp.exe` in `bin\`; ARCH-055/CORE-113/APP-051 "can be answered" in plan 3; CORE-091/QA-002 the retry token; CORE-108 engine tool classes; CORE-069/CORE-013 money as decimal strings; CORE-085 cap keys and invalid caps; CORE-115 the 30-minute lifetime; CORE-130 the client id, prefixes and upload names; AI-110 dots in tool names; AI-115 what waits for the skills port; ARCH-106 the comfy MCP launch and stop; CORE-065 the idle baseline; the `.lilref` name.
 - **Test-channel tools added by this plan** (module `"test"`, registered only on `test-*` channels; a test contract, not copied into the spec):
 
@@ -286,7 +289,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
   | `test.job_release` | write | `{job_id}` | `{}` |
   | `test.comfy_submit` | write | `{graph?: "tiny" \| object, priority?, outputs? (default 1), vram_need_mib?, external_side_effects?}` | `{job}` (kind `comfy.prompt`) |
   | `test.meter_external` | write | `{provider, amount, currency?, basis?, fail?}` | `{usage_seq}`; an external call through estimate, caps, write-ahead and settle |
-  | `test.destructive` | destructive | `{cost?}` | `{count}`: how often it has run in this core |
+  | `test.destructive` | destructive | `{cost?}` (a decimal string) | `{count}`: how often it has run in this core. It exists today with `{}` → `{executed: true}`; Task 6 changes it, and Task 16's estimate stage reads `cost` |
   | `test.hw_tick` | write | `{samples}` | `Snapshot`; advances the fake hardware |
 
 - **Test fakes** (QA-066; not copied into the spec): `FakeComfy` (in process) and the `lil-fake-comfyui` binary, whose child mode (a `fake-child` file in its working folder) re-launches itself as a child that does the listening, as a venv launcher does; fake hardware from `LIL_TEST_FAKE_HW=<script.json>`; `lil-test-app` (`ui:test`); `lil-fake-comfy-cli`; a minimal fake `claude` that can also start a stdio server as its direct child (`claude --spawn-stdio <exe> [args]`, so `lil-mcp` tests run under a `claude.exe` parent); test-channel-only overrides `LIL_TEST_CONFIRM_LIFETIME_SECS` and `LIL_TEST_CLIENT_PROTOCOL` (Task 6).
@@ -338,40 +341,46 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
 
 ## Execution notes
 
-- **Per-task gate**, run at the end of every task before its commit:
-  1. `cargo nextest run --workspace --exclude lil-spec-tests`
+- **Per-task gate** (ledger ruling R-T: targeted tests only), run at the end of every task before its commit. "Run the gate" in a task means this list:
+  1. `cargo nextest run -p <crate> [-p <crate> …]`, one `-p` for each crate the task touched; never `--workspace`
   2. `cargo run -q -p lil-cli -- dev spec-tests` (exits 0; the expected-fail count only goes down after Task 7)
   3. `cargo clippy --workspace --all-targets -- -D warnings`
   4. `cargo fmt --check`
-  5. `cargo deny check`
-  6. `cargo run -q -p lil-cli -- dev spec-report` (981 rules, no dangling citations)
-  7. `cargo run -q -p lil-cli -- dev privacy-scan --tree HEAD` (after the commit)
+  5. `cargo run -q -p lil-cli -- dev spec-report` (981 rules, no dangling citations)
+  6. `cargo run -q -p lil-cli -- dev privacy-scan --tree HEAD` (after the commit)
+
+  A task that changes a `Cargo.toml` or `Cargo.lock` also runs `cargo deny check`. CI runs the full suite on every PR, so a cross-crate break shows up there; the owner runs it locally only if they choose.
+- **Commits.** Every task commits all the files it changed (afterwards `git status` shows nothing of the task's left unstaged), and every commit message ends with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. The commit blocks below give the subject line only.
 - **Types named but not spelled out** in an Interfaces block (`JobFilter`, `SeriesQuery`, `Series`, `SummaryQuery`, `UsageSummary`, `CapsView`, `CapsSetParams`, `EngineStatus`, `HandlerView`, `ResourceSummary`, `HoldView`, `OutputFile`, `QueueView`, `RemoteJob`) are the Rust forms of the Appendix F argument and result shapes of the same name, or of the ComfyUI response they parse.
 - **Tool registration.** Each task that adds a `register_*_tools` function also calls it from `core_registry` in `crates/lil-core/src/tools/mod.rs`, and updates the pins in `crates/lil-core/src/tools/tests.rs` (never delete a pin to get green).
 - **Adversarial review** (QA-023): Tasks 3, 4 (the legacy-name rename writes through `store`), 8, 10, 12, 14, 16 and 19 change `store`, `state`, `jobs`, the dispatcher, confirmations, caps or identity. Their reviewer has fresh context and must try to write a failing test.
-- **Spec tests** (QA-017, QA-018): Task 7's author reads only the spec (with Appendices D, E and F), this plan's Global Constraints and the Interfaces blocks. Later tasks only remove `expected-fail.toml` entries; none edits a spec test.
+- **Spec tests** (QA-017, QA-018): Task 7's author reads only the spec (with Appendices D, E and F), this plan's Global Constraints and the Interfaces blocks. Later tasks only remove `expected-fail.toml` entries; none edits a spec test, except Task 14's one-value change to the existing `core_session.rs` (protocol 1.1), approved as a protected change.
 
 ---
 
 ### Task 1: A reduced PR-D: CI, credential and copy-forward legacy only (separate PR)
 
-**Files:** the files the rename plan's section "Later: PR-D cleanup" (`docs/superpowers/plans/2026-10-17-lilith-rename.md`) names for the parts below, including its protected ones (the four workflows, `dev/merge-guard.toml`, `workflows.rs`, `agent_access.rs`, `reviewer.rs`, `privacy.rs`, `merge.rs`, `tools/git-hooks/credential-helper`), plus `crates/lil-core/src/state/mod.rs` and its copy-forward tests, and `crates/lil-testkit/tests/no_stale_names.rs` (the Task 1 rows of Global Constraints "Old names").
+**Files:** the files the rename plan's section "Later: PR-D cleanup" (`docs/superpowers/plans/2026-10-17-lilith-rename.md`) names for the parts below, including its protected ones (the four workflows, `dev/merge-guard.toml`, `workflows.rs`, `agent_access.rs`, `reviewer.rs`, `privacy.rs`, `merge.rs`, `tools/git-hooks/credential-helper`) and the two protected files ledger ruling P3-R3 adds, `crates/lil-cli/src/dev/mod.rs` (the help-text row) and `crates/lil-cli/src/dev/post_merge.rs` (its fixture's `reviewer_app_slug_next: None`), plus `crates/lil-core/src/state/mod.rs` and its copy-forward tests, and `crates/lil-testkit/tests/no_stale_names.rs` (the Task 1 rows of Global Constraints "Old names").
 
 **Interfaces:**
 - Consumes: the merged PR-C, the first green `post-merge-check` on the renamed `main`, and owner checklist steps 4, 7 and 12 done.
-- Produces, **removed:** the CI pick step's `ww-cli` branch and second denylist variable; the helper script's `ww-cli` branch; the legacy agent-token target, reviewer-key path, denylist file and `WW_PRIVACY_DENYLIST` reads; legacy get and delete in `check_target`; in `dev/merge-guard.toml`, `reviewer_app_slug = "lilith-reviewer"` (the live slug) and `reviewer_app_slug_next` removed, with the guard's code and tests and the allowlist row for the old slug; the `state.db` copy-forward from the legacy local folder; the allowlist rows those leave without a use.
+- Produces, **removed:** the CI pick step's `ww-cli` branch and second denylist variable; the helper script's `ww-cli` branch; the legacy agent-token target (with `dev agent-token clear --legacy`, ledger ruling P3-R2), reviewer-key path, denylist file and `WW_PRIVACY_DENYLIST` reads; legacy get and delete in `check_target`; in `dev/merge-guard.toml`, `reviewer_app_slug = "lilith-reviewer"` (the live slug) and `reviewer_app_slug_next` removed, with the guard's code and tests and the allowlist row for the old slug; the `state.db` copy-forward from the legacy local folder; the allowlist rows those leave without a use.
 - Produces, **kept** (owner question 1): `.worldwright` in every reserved and skipped set (store, trash, watch, reconcile), permanently; the legacy `core.lock` rule while `.worldwright\` exists (D4); the `worldwright.yaml` reader, the `.worldwright\state.json` hint, `ww://` parsing and the legacy dot-file markers in recovery, until `lil doctor`'s rename (Task 4) has been accepted; the legacy `suite.toml` read. Task 3's lock test and Task 20's hooks rely on these.
 
 - [ ] **Step 1:** Cut `rename-cleanup` from `main` and remove exactly the "removed" list, with its tests. In `no_stale_names.rs`, apply the Task 1 rows of Global Constraints "Old names": new `until` values for the four rows that outlive PR-D, the rows of removed code deleted, and the `trash.rs` test row added. Add `legacy_folder_stays_reserved_after_pr_d` (`crates/lil-core/tests/trash.rs`): trashing `.worldwright\x` or writing under it is `store.path_invalid`, and the watcher and reconcile skip it.
-- [ ] **Step 2:** Run the full gate. Expected: green, `0 expected-fail`, 981 rules. Record the passed spec-test count (66 unless a legacy spec test was removed, which needs the owner's approval as a protected change); Tasks 7 and 21 call it P.
-- [ ] **Step 3:** Commit, push, open the PR. The owner approves and merges it from a clean main checkout (rename D10), then does the rename checklist's step 14:
-  - `gh secret delete WW_PRIVACY_DENYLIST --repo <owner>/LILITH`;
-  - from a clean main checkout, `cargo run -q -p lil-cli -- dev agent-token clear --legacy`;
-  - delete `%USERPROFILE%\.worldwright\reviewer\app-key.age` and `%USERPROFILE%\.worldwright\privacy-denylist.txt`. The rest of `%USERPROFILE%\.worldwright\` stays.
+- [ ] **Step 2:** Run the gate (Execution notes) with `-p lil-cli -p lil-core -p lil-testkit` and `-p` for any other crate Step 1 touched. Expected: green, `0 expected-fail`, 981 rules. Record the passed spec-test count (66 unless a legacy spec test was removed, which needs the owner's approval as a protected change); Tasks 7 and 21 call it P.
+- [ ] **Step 3:** Commit.
 
 ```bash
 git commit -m "rename: reduced PR-D, remove the CI, credential and copy-forward legacy; .worldwright stays reserved"
 ```
+
+- [ ] **Step 4:** Push and open the PR. CI runs the full suite on the PR; the owner runs it locally only if they choose. **Before the PR merges** (ledger ruling P3-R2), the owner does the rename checklist's step 14 from a clean checkout of the current `main`, whose build still has the legacy commands:
+  - `gh secret delete WW_PRIVACY_DENYLIST --repo <owner>/LILITH`;
+  - `cargo run -q -p lil-cli -- dev agent-token clear --legacy`;
+  - delete `%USERPROFILE%\.worldwright\reviewer\app-key.age` and `%USERPROFILE%\.worldwright\privacy-denylist.txt`. The rest of `%USERPROFILE%\.worldwright\` stays.
+
+  Then the owner approves and merges the PR from a clean main checkout (rename D10). Nothing after the merge needs `clear --legacy`.
 
 ---
 
@@ -412,8 +421,8 @@ git commit -m "rename: reduced PR-D, remove the CI, credential and copy-forward 
     | `confirm.already_answered` | `data_conflict` | `never` |
     | `caps.invalid` | `user_fixable` | `after_resolve` |
 
-- [ ] **Step 4: Write `## Appendix F. Jobs, engines, metering and agents (plan 3 clarification)`** after Appendix E: the "Names that are contracts" sub-bullets of Global Constraints, in order, copied as written, without the protocol bullet (it went into Appendix D). No line may start with `- **` followed by a rule ID. Update §0.5's document map to end with "· Appendix F Jobs, engines, metering and agents (plan 3 clarification)".
-- [ ] **Step 5: Re-verify the external facts the contracts rely on** (Appendix B.3), from primary sources, and record each with the date in B.3: `rmcp` 3.5.1 speaks MCP 2026-07-28 and the legacy revisions; Claude Code's `_meta["anthropic/requiresUserInteraction"]` and the `alwaysLoad` key; plugin `userConfig` substitution as `${user_config.<key>}` and `${VAR}` expansion in `.mcp.json` and hooks; the PreToolUse and SessionStart output JSON; ComfyUI's `prompt_id` in `/prompt`, `/api/jobs`, `/api/jobs/{id}/cancel`, `/node_replacements`, `api_node` in `/object_info` and the preview frame header; comfy-cli's `node registry-install … --version`; the PDH `GPU Process Memory` and `Energy Meter` counter paths and the Energy Meter's picowatt-hour unit; that a venv `python.exe` on Windows starts the interpreter as a child; that Claude Code on Windows starts a stdio MCP server whose command is an `.exe` as its direct child (no `cmd.exe` between); the Claude Code permission-rule form for an absolute-path rule, `Edit(//**/LILITH*/suite.toml)`, and whether `Edit(...)` path rules also cover the Write tool (if not, Task 20 adds a `Write(//**/LILITH*/suite.toml)` twin and `repo_settings_deny_suite_toml_edits` checks it). Any fact that differs is reported to the controller before Task 7, with the corrected Appendix F line.
+- [ ] **Step 4: Write `## Appendix F. Jobs, engines, metering and agents (plan 3 clarification)`** after Appendix E: the "Names that are contracts" sub-bullets of Global Constraints, in order, copied as written, without the protocol bullet (it went into Appendix D) and without the parenthesised plan note in the fail-points bullet. No line may start with `- **` followed by a rule ID. Update §0.5's document map to end with "· Appendix F Jobs, engines, metering and agents (plan 3 clarification)".
+- [ ] **Step 5: Re-verify the external facts the contracts rely on** (Appendix B.3), from primary sources, and record each with the date in B.3: `rmcp` 3.5.1 speaks MCP 2026-07-28 and the legacy revisions; Claude Code's `_meta["anthropic/requiresUserInteraction"]` and the `alwaysLoad` key; plugin `userConfig` substitution as `${user_config.<key>}` and `${VAR}` expansion in `.mcp.json` and hooks; the PreToolUse and SessionStart output JSON; ComfyUI's `prompt_id` in `/prompt`, `/api/jobs`, `/api/jobs/{id}/cancel`, `/node_replacements`, `api_node` in `/object_info` and the preview frame header; comfy-cli's `node registry-install … --version`; the PDH `GPU Process Memory` and `Energy Meter` counter paths and the Energy Meter's picowatt-hour unit; that a venv `python.exe` on Windows starts the interpreter as a child; that Claude Code on Windows starts a stdio MCP server whose command is an `.exe` as its direct child (no `cmd.exe` between); the Claude Code permission-rule form for an absolute-path rule, `Edit(//**/LILITH*/suite.toml)`, and whether `Edit(...)` path rules also cover the Write tool (`claude_settings_patterns.rs` records, from the 2026-10-13 docs, that they do and that `Write(path)` rules are never consulted; if that no longer holds, Task 20 adds the conditional `Write(//**/LILITH*/suite.toml)` entry of Global Constraints and `repo_settings_deny_suite_toml_edits` checks it). Any fact that differs is reported to the controller before Task 7, with the corrected Appendix F line.
 - [ ] **Step 5a: Decide `mcp_confirmation`** (owner question 11). From Claude Code's documentation and changelog, check whether `requiresUserInteraction` forces a prompt in every permission mode: default, `acceptEdits`, auto mode and `bypassPermissions` (including `--dangerously-skip-permissions` and `-p`). Only if every mode is documented to honour it, write `mcp_confirmation: "claude_code"` into Appendix F; otherwise, or if any mode is undocumented, write `"core"`. Record the sources and the date in B.3.
 - [ ] **Step 6: Verify the IDs.**
 
@@ -423,7 +432,6 @@ Expected: `981`; 981 rules, no dangling citations.
 - [ ] **Step 7: Commit.**
 
 ```bash
-git add docs/superpowers/specs/2026-10-12-lilith-design.md docs/reference/workspace-format.md
 git commit -m "spec: jobs, engines, metering and agents appendix; protocol 1.1 and plan-3 codes"
 ```
 
@@ -433,20 +441,21 @@ git commit -m "spec: jobs, engines, metering and agents appendix; protocol 1.1 a
 
 **Files:**
 - Modify: `crates/lil-platform/src/fs.rs` (the lock open's share mode; long-name resolution), `crates/lil-core/src/workspace.rs` (`take_core_locks`), `crates/lil-core/src/store/{paths.rs, trash.rs, versions.rs}`.
-- Test: `crates/lil-platform/tests/fs_lock.rs`, additions to `crates/lil-core/tests/{trash.rs, workspace_hub.rs, versions.rs}`.
-- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: the Task 1 and 3 test row of Global Constraints "Old names".
+- Test: additions to `crates/lil-core/tests/{trash.rs, workspace_hub.rs, versions.rs}` (the lock test calls lil-core's `take_core_locks`, so it lives in `workspace_hub.rs`); a unit test in `crates/lil-core/src/store/paths.rs`.
+- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: the Task 3 row of Global Constraints "Old names" (Task 1 added the `trash.rs` row).
 
 **Interfaces:**
 - Produces: `lil_platform::fs::long_path(existing: &Path) -> io::Result<PathBuf>` (`GetLongPathNameW` over the longest existing prefix); `Store::trash` refuses sealed paths and waits at the git gate; `versions::exists_now` returns `Err(StoreError::Io)` on a probe error.
 
 - [ ] **Step 1: Write the failing tests:**
-  - `core_lock_cannot_be_deleted_or_renamed_while_held`: with the locks held, deleting or renaming `.lilith\core.lock`, and `.worldwright\core.lock` in a workspace that has `.worldwright\` (the D4 rule Task 1 keeps), fails with error 32, and a second `take_core_locks` returns `None`;
-  - `trash_of_a_reserved_folder_by_short_name_is_refused`: `.lilith`, `.worldwright`, `.git` and `.trash` named by their 8.3 short names (from `GetShortPathNameW`) → `store.path_invalid`, nothing moved; when the volume has 8.3 names disabled, the test prints that and checks the long-name path only;
+  - `core_lock_cannot_be_deleted_or_renamed_while_held` (`tests/workspace_hub.rs`): with the locks held, deleting or renaming `.lilith\core.lock`, and `.worldwright\core.lock` in a workspace that has `.worldwright\` (the D4 rule Task 1 keeps), fails with error 32, and a second `take_core_locks` returns `None`;
+  - `reserved_check_runs_on_the_long_name` (unit test in `store/paths.rs`; always runs): the reserved-name check takes its resolver as a parameter (`&dyn Fn(&Path) -> io::Result<PathBuf>`; `lil_platform::fs::long_path` in production); a stub resolver mapping `<ws>\LILITH~1\x` to `<ws>\.lilith\x`, `<ws>\WORLDW~1\x` to the legacy folder (built from `names::LEGACY_WORKSPACE_DIR`, so the source names it only through the constant), `<ws>\GIT~1\x` to `<ws>\.git\x` and `<ws>\TRASH~1\x` to `<ws>\.trash\x` → each is `store.path_invalid`; `<ws>\NOTES~1\x` mapped to `<ws>\notes.lilith\x` → allowed; a resolver error → `store.path_invalid` (fails closed);
+  - `trash_of_a_reserved_folder_by_short_name_is_refused` (`tests/trash.rs`, the real volume): `.lilith`, `.worldwright`, `.git` and `.trash` named by their 8.3 short names (from `GetShortPathNameW`) → `store.path_invalid`, and every file under them is still there; when `GetShortPathNameW` returns the long name (8.3 names disabled), the test prints that the real-volume half is skipped and asserts the long-name paths are refused, and the stub test above still covers the short-name rule;
   - `store_trash_refuses_sealed_paths_and_waits_at_the_git_gate` (plan-2b Minor 4);
   - `exists_now_fails_closed_on_a_probe_error` (ledger Q34 carry).
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-platform -p lil-core -E 'test(core_lock_) | test(short_name) | test(store_trash_) | test(exists_now_)'`. Expected: FAIL.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core -E 'test(core_lock_) | test(short_name) | test(reserved_check_) | test(store_trash_) | test(exists_now_)'`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Open both lock files with `FILE_SHARE_READ | FILE_SHARE_WRITE` only; resolve existing components to long names before the reserved-name and sealed-folder checks in `paths.rs`.
-- [ ] **Step 4: Run them, then the gate.** Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-platform -p lil-core -p lil-testkit`). Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -484,12 +493,12 @@ pub async fn rename_legacy(open: &OpenWorkspace) -> Result<(LegacyNames /* renam
   - `doctor_sets_a_damaged_workspace_state_db_aside_after_yes` (Minor 7, CORE-004): `n` → exit 1, unchanged; `y` → `state.db.damaged-<YYYYMMDDTHHMMSSZ>` with its sidecars; `--non-interactive` never moves it;
   - `doctor_offers_to_set_aside_orphan_sidecars_in_the_local_folder` (rename RN10 carry): a `state.db-wal` beside a missing `state.db` → `problem:` naming the full path; set aside only after `y`;
   - `workspace_open_walks_the_tree_once` (Minor 9): a counting `Probe` sees one walk before the index's own;
-  - `in_process_fixtures_leave_no_test_root` (rename carry): run `assets::import_copy_creates_asset_with_uuid_and_candidate_run`, `record::record_runs_after_meter_and_applies_the_plan_in_write_order`, `projects::resolve_explicit_then_session_then_hint_then_sketchbook`, `settings::cascade_is_a_plain_override_chain` and `versions::seal_moves_files_and_writes_a_read_only_snapshot`, then assert that `lil_testkit::cleanup::leftovers_log` gained no entry. First confirm, from the `leftovers_log` of a full run before the fix, that these five are among the leakers, and swap in a listed leaker for any that isn't;
+  - `in_process_fixtures_leave_no_test_root` (rename carry): run `assets::import_copy_creates_asset_with_uuid_and_candidate_run`, `record::record_runs_after_meter_and_applies_the_plan_in_write_order`, `projects::resolve_explicit_then_session_then_hint_then_sketchbook`, `settings::cascade_is_a_plain_override_chain` and `versions::seal_moves_files_and_writes_a_read_only_snapshot`, then assert that `lil_testkit::cleanup::leftovers_log` gained no entry. First confirm, from the `leftovers_log` of a targeted run before the fix (`cargo nextest run -p lil-core --test assets --test record --test projects --test settings --test versions`), that these five are among the leakers, and swap in a leaker that run lists for any that isn't;
   - `legacy_named_workspace_is_reported_not_reinitialised` (owner question 1): a folder with `worldwright.yaml`, `.worldwright\state.json` and a manifest whose `inputs` hold a `ww://` ref → `lil workspace init` prints "workspace registered", writes no `lilith.yaml` and leaves every existing byte unchanged; the core serves it (the hint's project is the active one); `lil doctor` prints `problem: legacy names …`; stdin `n` → nothing changes; `y` → `lilith.yaml` holds the old file's bytes, `worldwright.yaml` is gone, `.lilith\state.json` holds the hint, the manifest's ref reads `lil://` and nothing else in it changed, the snapshot is byte-identical and still read-only and is listed as `skipped:`, and `.worldwright\` is still there; a later `lil doctor` reports such a snapshot-only `ww://` as `info:` (sealed, left as is), never as a `problem:`; `--non-interactive` never renames;
   - `sqlite_helpers_have_one_home`: `lil-client` and `lil-core` contain no copy of `has_hot_journal` (a source scan).
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-cli -p lil-testkit -p lil-core -E 'test(doctor_) | test(walks_the_tree) | test(leave_no_test_root) | test(legacy_named) | test(one_home)'`. Expected: FAIL.
 - [ ] **Step 3: Implement.** The fixtures already hold the `TestEnv` last; what keeps `state.db` open is the hub's and state actors' background work, so each in-process fixture gets an async `shutdown()` (`WorkspaceHub::close_all`, then the state actors joined) that the tests await before returning. The leftover scan and the conflict-file scan become one walk, run behind `Index::ready`. The rename goes through the store: `move_new` for the workspace file, a write for `state.json`, `edit_manifest` for the refs.
-- [ ] **Step 4: Run them, then the gate.** Expected: PASS; the whole suite leaves no `TestEnv` root behind (`lil_testkit::cleanup` report).
+- [ ] **Step 4: Run them, then the gate** (`-p lil-platform -p lil-client -p lil-core -p lil-cli -p lil-testkit`). Expected: PASS; the targeted run of Step 1's five test binaries leaves no `TestEnv` root behind (`lil_testkit::cleanup` report). CI's full run covers the other fixtures.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -506,7 +515,7 @@ git commit -m "doctor: workspace state.db, local-folder and legacy-name repairs 
 - Create: `crates/lil-platform/src/{hw.rs, hw_nvml.rs, hw_pdh.rs, job_object.rs, engine_spawn.rs}`; modify `src/{lib.rs, clock.rs, sockets.rs}`.
 - Modify: `crates/lil-testkit/src/clock.rs` (`FakeClock` implements `local_offset_secs` from a scripted offset table: `FakeClock::set_offsets(&[(SystemTime, i32)])`).
 - Create (stub): `crates/lil-mcp/{Cargo.toml, src/main.rs}` (`main` prints "lil-mcp is not built yet" and exits 2).
-- Test: `crates/lil-platform/tests/{hw.rs, job_object.rs, engine_spawn.rs, clock.rs}`; `real_*` hardware probes `#[ignore]`d.
+- Test: `crates/lil-platform/tests/{hw.rs, job_object.rs, engine_spawn.rs, clock.rs}`, `crates/lil-testkit/tests/clock.rs`; `real_*` hardware probes `#[ignore]`d.
 
 **Interfaces:**
 - Produces:
@@ -556,15 +565,15 @@ pub trait Clock { … ; fn local_offset_secs(&self, utc: SystemTime) -> i32; } /
   - `job_object_lists_the_launcher_and_its_child`: `cmd.exe /d /c ping -n 30 127.0.0.1` in the job → `pids()` contains the `cmd` pid and the `ping` pid (a `conhost.exe` may be there too, so the test never asserts a count); `descendants(cmd pid)` has the `ping` pid;
   - `pwh_to_mj_is_exact`: `pwh_to_mj(10_000_000) == 36`, `pwh_to_mj(277_777_778) == 1000`, `pwh_to_mj(u64::MAX)` doesn't overflow;
   - `listening_sockets_report_loopback_and_wildcard` (the test process listening on `127.0.0.1:0` and on `0.0.0.0:0`; `pid_listening_on` finds it);
-  - `local_offset_follows_dst` (the system clock against a known zone through the API's own conversion; a `FakeClock` with a scripted offset table);
+  - `local_offset_follows_dst` (`lil-platform/tests/clock.rs`, the system clock): for 2026-01-15T12:00Z and 2026-07-15T12:00Z, each offset is a multiple of 900 s within ±50,400 s; when `GetTimeZoneInformation` reports a daylight date (`DaylightDate.wMonth != 0`), the two offsets differ, in absolute value, by exactly `(StandardBias − DaylightBias) × 60` s, and otherwise they are equal; and one of them equals `−(Bias + StandardBias) × 60` s (the API's raw fields, not its conversion routine);
+  - `fake_clock_offsets_follow_the_script` (`crates/lil-testkit/tests/clock.rs`, since lil-platform has no lil-testkit dev-dependency): `FakeClock::set_offsets(&[(t0, 3600), (t1, 7200)])` → `local_offset_secs` is 3600 at `t0` and one second before `t1`, 7200 at `t1` and after, and the first entry's offset before `t0`;
   - `real_nvml_reports_energy_and_process_sm`, `real_pdh_local_usage_reads_without_admin`, `real_energy_meter_power_matches_energy_delta` (within 10 %): `#[ignore]`d `real_*` tests.
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-platform`. Expected: FAIL.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-platform -p lil-testkit -E 'package(lil-platform) | test(fake_clock_)'`. Expected: FAIL.
 - [ ] **Step 3: Implement.** PDH: `\GPU Process Memory(pid_*_luid_0x<hi>_0x<lo>_phys_*)\{Local Usage,Dedicated Usage,Shared Usage,Total Committed}` on the NVIDIA LUID; the Energy Meter `\Energy Meter(RAPL_Package0_PKG)\Energy` (picowatt-hours, kept raw) and `\Power` (milliwatts).
-- [ ] **Step 4: Run them, `cargo deny check` and `cargo tree -i schemars -e normal`.** Expected: PASS; one `schemars` version.
+- [ ] **Step 4: Run them, the gate (`-p lil-platform -p lil-testkit -p lil-mcp`, with `cargo deny check`) and `cargo tree -i schemars -e normal`.** Expected: PASS; one `schemars` version.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/lil-platform crates/lil-mcp
 git commit -m "platform: NVML, PDH GPU memory, Energy Meter, sysinfo sources; kill-on-close engine spawn; local offset"
 ```
 
@@ -574,7 +583,8 @@ git commit -m "platform: NVML, PDH GPU memory, Energy Meter, sysinfo sources; ki
 
 **Files:**
 - Modify (protected): `.config/nextest.toml`: `build-testbins` becomes `cargo build --locked --offline --bins -p lil-cli -p lil-core -p lil-mcp -p lil-testkit --target-dir target/testbins`. No other change.
-- Create: `crates/lil-testkit/src/{fake_comfy.rs, fake_hw.rs, test_app.rs, ports.rs}` and bins `src/bin/{lil-fake-comfyui.rs, lil-test-app.rs, lil-fake-comfy-cli.rs, claude.rs}`; modify `src/{lib.rs, bins.rs}` and `Cargo.toml` (`hyper`, `hyper-util`, `tokio-tungstenite`).
+- Create: `crates/lil-testkit/src/{fake_comfy.rs, fake_hw.rs, test_app.rs, ports.rs}` and bins `src/bin/{lil-fake-comfyui.rs, lil-test-app.rs, lil-fake-comfy-cli.rs, claude.rs}`; modify `src/{lib.rs, bins.rs, env.rs}` and `Cargo.toml` (`hyper`, `hyper-util`, `tokio-tungstenite`).
+- Modify: `crates/lil-core/src/tools/test_tools.rs` and its pins in `crates/lil-core/src/tools/tests.rs`: `test.destructive` takes `{cost?: string}` (a decimal string; accepted and otherwise unused until Task 16's estimate stage reads it) and returns `{count}`, how often it has run in this core (a counter shared by the test tools), instead of `{}` → `{executed: true}`.
 - Modify: `crates/lil-core/src/identity.rs`: `TEST_APP_EXE = ("lil-test-app.exe", "test")`, accepted only when the core's channel is `Channel::Test(_)`; `crates/lil-core/src/config.rs`: read `LIL_TEST_FAKE_HW`, `LIL_TEST_CONFIRM_LIFETIME_SECS` (test channels only); `crates/lil-client`: `LIL_TEST_CLIENT_PROTOCOL` (test channels only).
 - Test: `crates/lil-testkit/tests/{fake_comfy.rs, test_app.rs}`; `crates/lil-core/tests/hello.rs` additions.
 
@@ -587,34 +597,46 @@ impl FakeComfy {
     pub fn start() -> FakeComfy;  pub fn port(&self) -> u16;  pub fn url(&self) -> String;
     pub fn hold_prompts(&self, on: bool);              // prompts stay running until release
     pub fn release(&self, prompt_id: &str);
-    pub fn add_outside_prompt(&self, running: bool) -> String;   // a prompt the suite didn't submit
+    pub fn add_outside_prompt(&self, running: bool, graph: Option<serde_json::Value>) -> String;
+        // a prompt the suite didn't submit; its graph (default: a one-node graph) appears in /queue and /api/jobs
     pub fn fail_next(&self, kind: FakeFailure);        // Oom, Execution { message }, Refuse503
+    pub fn drop_after_accept(&self, on: bool);         // each /prompt is queued, then the connection closes before any response
+    pub fn send_preview(&self, image_type: u32 /* 1 JPEG, 2 PNG */, payload_len: usize);
+        // one binary frame (4-byte event type 1, 4-byte image type, then payload_len bytes) to every websocket client
     pub fn restart(&self, after_outputs: u32);         // forgets every prompt; written outputs stay
     pub fn requests(&self) -> Vec<FakeRequest>;        // method, path, json body; "/interrupt" answers 500
     pub fn output_dir(&self) -> PathBuf;  pub fn set_object_info(&self, v: serde_json::Value);
 }
 pub fn free_loopback_port() -> u16;
-pub struct TestApp;     // spawns lil-test-app as ui:test on the env's channel
+pub struct TestApp;     // spawns lil-test-app as ui:test on the env's channel; its hello offers
+                        // events.v1, tools.v1, jobs.v1, confirmations.v1 and caps.v1 (shared once Task 14 adds them to the core)
 impl TestApp { pub fn start(env: &TestEnv, ws: Option<&Path>, topics: &[&str]) -> TestApp;
                pub fn call(&mut self, method: &str, params: Value) -> Value;
                pub fn tool(&mut self, name: &str, args: Value, key: Option<&str>) -> Value;
                pub fn next_event(&mut self, within: Duration) -> Option<Value>; pub fn pid(&self) -> u32; }
 pub struct FakeHwScript;  // JSON: {gpu: [samples], gpu_mem: [[{pid, local_mib, …}]], cpu_energy: [..] | null, sys: [..]};
                           // one entry per tick, the last repeated; an in-process FakeComfy's pid is the test's own
-impl FakeHwScript { pub fn write(&self, path: &Path); pub fn sources(&self) -> lil_platform_hw_sources_tuple; }
+impl FakeHwScript { pub fn write(&self, path: &Path);
+    pub fn sources(&self) -> (Option<Box<dyn lil_platform::hw::GpuSource>>, Option<Box<dyn lil_platform::hw::GpuMemSource>>,
+                              Option<Box<dyn lil_platform::hw::CpuEnergySource>>, Box<dyn lil_platform::hw::SysSource>); }
+    // the four fields of Task 9's HwSources, in order (the test kit can't name lil-core's type)
 impl TestEnv { pub fn suite_toml_set(&self, toml_fragment: &str); pub fn path_with_testbins(&self) -> OsString; }
 ```
 
   `lil-fake-comfyui <ignored main.py> --listen <a> --port <p>` serves `FakeComfy` and writes its argv, environment and pid to `<cwd>\fake-comfyui.json`. With a `fake-child` file in `<cwd>` (the environment is scrubbed, so a file is the switch), or with `--child` on its own command line, it re-launches itself as a child with the same arguments and waits for it; the child does the listening and writes `<cwd>\fake-comfyui-child.json`. That is how a venv `python.exe` launcher behaves. A `fake-child-any` file makes the child bind `0.0.0.0` whatever `--listen` says. `lil-fake-comfy-cli` appends its argv to `<--workspace>\fake-comfy-cli.log` and exits 1 when `<--workspace>\FAIL` exists. The fake `claude` honours `CLAUDE_CONFIG_DIR`: `--version`, `plugin list --json` (from `<config>\fake-plugins.json`), `plugin marketplace add` and `plugin install` (appended to `<config>\fake-claude.log`), and `--spawn-stdio <exe> [args]`, which starts `<exe>` as its direct child with stdin and stdout passed through. `TestEnv::mcp_under_claude(&self) -> McpStdio` starts `lil-mcp.exe` that way; `TestEnv::mcp_under_shell(&self) -> McpStdio` starts it through `claude --spawn-stdio cmd.exe /d /c lil-mcp.exe`.
 
-- [ ] **Step 1: Write the failing tests:** `fake_comfy_queues_one_at_a_time_and_records_requests`, `fake_comfy_interrupt_is_an_error`, `fake_comfy_restart_forgets_prompts_and_keeps_outputs`, `fake_comfy_sends_preview_frames_with_the_header`, `fake_comfyui_child_mode_listens_from_the_child` (the listening pid is the child's, not the launcher's), `test_app_resolves_to_ui_test_on_test_channels_only` (a dev-channel core resolves it to `cli`), `fake_claude_honours_claude_config_dir`, `fake_claude_spawn_stdio_is_the_direct_parent`.
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-testkit -p lil-core -E 'test(fake_) | test(test_app_)'`. Expected: FAIL.
+- [ ] **Step 1: Write the failing tests:** `fake_comfy_queues_one_at_a_time_and_records_requests`, `fake_comfy_interrupt_is_an_error`, `fake_comfy_restart_forgets_prompts_and_keeps_outputs`, `fake_comfy_sends_preview_frames_with_the_header`, `fake_comfyui_child_mode_listens_from_the_child` (the listening pid is the child's, not the launcher's), `test_app_resolves_to_ui_test_on_test_channels_only` (a dev-channel core resolves it to `cli`), `fake_claude_honours_claude_config_dir`, `fake_claude_spawn_stdio_is_the_direct_parent`, and:
+  - `fake_comfy_drop_after_accept_queues_then_closes`: with `drop_after_accept(true)`, a `/prompt` POST gets a closed connection and no status line, and `GET /api/jobs/<its prompt_id>` then finds it;
+  - `fake_comfy_injects_preview_frames_of_a_given_size`: `send_preview(2, 1_048_577)` → a websocket client receives one binary frame of 1,048,585 bytes whose first 8 bytes are big-endian 1 and 2;
+  - `fake_comfy_outside_prompts_carry_their_graph`: `add_outside_prompt(true, Some(g))` → `/queue`'s running entry and `/api/jobs` hold `g`;
+  - `test_app_offers_the_protocol_1_1_capabilities`: the hello `lil-test-app` sends lists `confirmations.v1` and `caps.v1`;
+  - `test_destructive_counts_runs_and_takes_a_cost` (`tools/tests.rs`): a `ui` session's `test.destructive {}` → `{count: 1}`; with another key and `{cost: "2"}` → `{count: 2}`; `{cost: 2}` (a number) and `{other: 1}` → `params.invalid`, count unchanged.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-testkit -p lil-core -E 'test(fake_) | test(test_app_) | test(test_destructive_)'`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run them, then the gate.** Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-testkit -p lil-core -p lil-client`, with `cargo deny check`). Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add .config/nextest.toml crates/lil-testkit crates/lil-core crates/lil-client Cargo.lock
 git commit -m "testkit: fake ComfyUI, fake hardware, ui:test app, fake comfy-cli and claude; testbins build lil-mcp and testkit bins"
 ```
 
@@ -627,7 +649,8 @@ A test author who doesn't read the implementation writes these from the spec (wi
 **Files:**
 - Create (free additions): `crates/lil-spec-tests/tests/{jobs_queue.rs, comfy_engine.rs, confirmations.rs, caps_meter.rs, telemetry.rs, resources_interchange.rs, mcp_server.rs, plugin_hooks.rs, doctor_claude.rs}`.
 - Modify: `crates/lil-spec-tests/expected-fail.toml`: one entry per new test, in plan 2b's form.
-- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: the spec-test globs of the Task 7/19/20 row of Global Constraints "Old names".
+- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: the spec-test globs of the Task 7/19/20 row of Global Constraints "Old names" (`plugin_hooks.rs`, `doctor_claude.rs`, `mcp_server.rs`; Task 7 is their only owner, since no later task edits a spec test).
+- If the spec tests need a new dev-dependency (for example `sha2` for "SHA-256 unchanged"), that change is to the protected `crates/lil-spec-tests/Cargo.toml` (`add-ok` covers new files only) and must be listed here and in the PR as a protected change.
 
 **Interfaces:**
 - Consumes: Task 6's test kit; the Global Constraints contracts and test-channel tools.
@@ -667,7 +690,7 @@ A test author who doesn't read the implementation writes these from the spec (wi
   | `outside_jobs_keep_the_core_up` | ARCH-020 | `LIL_TEST_IDLE_SECS=2`, an outside prompt running: the core is up after 6 s; after it ends the core exits 0 | 13 |
   | `owned_comfyui_is_loopback_only` | ARCH-068 | owned: `engines.start` → the fake's argv has `--listen 127.0.0.1`; `engines.status.listen == "loopback"`; with `extra_args = ["--listen", "0.0.0.0"]` → `comfyui.not_loopback` and no process | 11 |
   | `owned_comfyui_environment_has_no_keys` | ARCH-063, QA-032 | owned; the core started with `OPENAI_API_KEY`, `COMFY_API_KEY` and `MY_SERVICE_TOKEN` canaries; none is in the fake's recorded environment | 11 |
-  | `owned_comfyui_stops_with_the_core_and_dies_with_it` | ARCH-021, ARCH-064 | owned, in child mode (a `fake-child` file in `root`): `engines.status.pid` is the launcher's and the listening pid (from `fake-comfyui-child.json`) is checked for loopback; `lil core stop` → launcher and child are both gone; a core killed by `jobs.after_submitting=abort` → both are gone within 10 s | 11 |
+  | `owned_comfyui_stops_with_the_core_and_dies_with_it` | ARCH-021, ARCH-064 | owned, in child mode (a `fake-child` file in `root`): `engines.status.pid` is the launcher's and the listening pid (from `fake-comfyui-child.json`) is checked for loopback; `lil core stop` → launcher and child are both gone; a core killed by `jobs.after_submitting=abort` → both are gone within 10 s | 12 |
   | `attached_comfyui_is_never_stopped` | ARCH-064 | `TestApp` `engines.stop` → `engine.attached`; `lil core stop` → the fake still answers and saw no `/free` | 11 |
   | `node_install_needs_confirmation_and_a_pinned_version` | CORE-131, ARCH-052, ARCH-059 | `version: "latest"` → `params.invalid`; a `cli` call with no app → `confirm.unavailable`; with `TestApp` connected → `pending_confirmation`; approve; retry with the key → a job whose fake comfy-cli argv ends `registry-install <id> --version 1.2.3`; then `engines.status` `restart_needed: true` | 14 |
 
@@ -765,7 +788,6 @@ Expected: exit 0, `spec tests: P passed, 77 expected-fail`, where P is Task 1's 
 - [ ] **Step 3: Commit.**
 
 ```bash
-git add crates/lil-spec-tests
 git commit -m "spec-tests: plan-3 jobs, engines, confirmations, caps, telemetry, MCP and hook scenarios, expected to fail (QA-017)"
 ```
 
@@ -848,7 +870,7 @@ pub struct ReserveInput<'a> { pub session: &'a Session, pub estimate: &'a Estima
 pub trait ReserveStage: Send + Sync { fn reserve<'a>(&'a self, i: ReserveInput<'a>) -> BoxFuture<'a, Result<ReserveOutcome, ErrorBody>>; }
 pub struct SettleInput<'a> { pub session: &'a Session, pub reservation: Option<&'a str>, pub call_id: &'a str,
                              pub outcome: &'a Outcome<ToolOutput> }
-pub trait MeterStage: Send + Sync { fn settle<'a>(&'a self, i: SettleInput<'a>) -> BoxFuture<'a, ()>; } // inline calls only
+pub trait MeterStage: Send + Sync { fn settle<'a>(&'a self, i: SettleInput<'a>) -> BoxFuture<'a, ()>; } // inline calls only; Task 15's MeterSettle implements it
 // CallCtx gains: pub jobs: Arc<Jobs>, pub submitted: Arc<SubmittedSlot>, pub reservation: Option<String>,
 //                pub confirmed_via: Option<ConfirmedVia>, pub idem_key: Option<String>
 ```
@@ -873,8 +895,8 @@ pub trait MeterStage: Send + Sync { fn settle<'a>(&'a self, i: SettleInput<'a>) 
   - `completion_runs_meter_then_caps_then_record_in_write_order` (CORE-015 step 7, ARCH-075): two recording `JobCompletion`s registered as meter then caps, and a `RecordPlan`; the log reads `meter`, `caps`, `record`;
   - `jobs_blocker_holds_idle_and_drain` (ARCH-020, ARCH-021) and `shutdown_persists_interrupted_after_engine_cancel` (ARCH-021 steps 2–3);
   - `trace_id_reaches_the_job_record` (ARCH-118);
-  - `plan2_stage_defaults_still_hold` (the plan-2 dispatcher tests keep passing through the new signatures).
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test jobs`. Expected: FAIL.
+  - `plan2_stage_defaults_still_hold` (unit test in `tools/tests.rs`, through the new signatures with `PipelineHooks::plan2()`): `estimate` is `Estimate::Zero` for every registered tool with `{}` arguments; `check` gives `Unavailable` for a `cli` session calling `test.destructive`, and `Proceed { confirmed_via: None, cap_override: None }` for a `ui:test` session calling it and for a `cli` session calling a `read` tool; `reserve` gives `Ok(ReserveOutcome::None)`; `settle` writes nothing (the suite `state.db` and the workspace logs are byte-identical before and after). `stages_run_in_core_015_order` passes with its expected stage list unedited.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core -E 'binary(jobs) | test(plan2_stage_defaults_)'`. Expected: FAIL.
 - [ ] **Step 3: Implement**, with `test.job` and `test.job_release` (test channels) and the four job tools.
 - [ ] **Step 4: Run them, then the gate.** Remove the `jobs_queue.rs` entries marked 8 from `expected-fail.toml`. Expected: PASS.
 - [ ] **Step 5: Commit.**
@@ -907,9 +929,11 @@ pub struct VramView { pub total_mib: u64, pub nvml_free_mib: u64, pub local_by_p
 pub struct Measured { pub gpu: bool, pub cpu: bool }
 pub struct JobEnergy { pub job_id: String, pub workspace: String /* id or "loose" */, pub from: String, pub to: String,
     pub gpu_mj_gross: u64, pub gpu_mj_above_idle: u64, pub cpu_mj_gross: u64, pub cpu_mj_above_idle: u64,
-    pub system_mj: u64, pub gpu_seconds_milli: u64, pub measured: Measured }   // the Appendix F shape; Serialize
+    pub system_mj: u64, pub gpu_seconds_milli: u64, pub measured: Measured,
+    pub idle_unknown: bool /* serialized only when true */ }                   // the Appendix F shape; Serialize
 pub struct EnergySlice { pub gpu_mj: u64, pub cpu_mj: u64, pub sm_by_pid: BTreeMap<u32, u64 /* permille·s */>,
-                         pub cpu_ms_by_pid: BTreeMap<u32, u64>, pub idle_gpu_mw: u32, pub idle_cpu_mw: u32,
+                         pub cpu_ms_by_pid: BTreeMap<u32, u64>,
+                         pub idle_gpu_mw: Option<u32>, pub idle_cpu_mw: Option<u32>, // None: no idle baseline (idle_unknown)
                          pub gpu_measured: bool, pub cpu_measured: bool }
 pub struct Telemetry;
 impl Telemetry {
@@ -978,7 +1002,7 @@ pub fn watchdog_slow(expected_secs: u32, since_execution_start: Duration) -> boo
   - `waits_for_vram_then_runs_on_the_next_sample` (ARCH-071): a 4000 MiB job in the second case → `WaitForVram { need_mib: 4000, free_mib: 488 }`; the next sample (others {100: 2000}, `nvml_free` 14000) → `Go`;
   - `engine_own_local_usage_counts_as_free` (ARCH-071): the fourth case admits a 14000 MiB job for that engine and refuses it for a job of no engine;
   - `dedicated_usage_is_never_used_for_budgets` (M0 result): a process with Dedicated 23000 and Local 115 counts as 115;
-  - **`without_nvml_jobs_run_unchecked_with_a_note`** (Review Focus 5): `vram()` is `None` → `GoUnchecked`, and the job's summary carries `vram_unchecked`;
+  - **`without_nvml_jobs_run_unchecked_with_a_note`** (Review Focus 5): `vram()` is `None` → `GoUnchecked`, and the job's `JobSummary` has `vram_unchecked: true` (a job admitted with a VRAM check has no such key);
   - `lease_switch_asks_the_previous_engine_to_unload`: a recording `EngineControl` sees exactly one `unload(ComfyUi)` when the lease moves to a job for another engine kind (a test-only kind), and none between two ComfyUI jobs;
   - `watchdog_flags_slow_at_three_times_and_never_cancels` (ARCH-072): expected 10 s → `watchdog_slow(10, 30 s) == false`, `watchdog_slow(10, 31 s) == true`; the job keeps running;
   - `busy_flag_follows_running_jobs` (CORE-061): `set_busy(true)` when a job starts, `set_busy(false)` when the last one ends.
@@ -996,9 +1020,9 @@ git commit -m "jobs: GPU scheduler with Local Usage free-VRAM wait, engine-own V
 ### Task 11: `engines`: the ComfyUI supervisor, engine tools and node installs (ARCH-063–065, ARCH-068, ARCH-119, CORE-108, CORE-131)
 
 **Files:**
-- Create: `crates/lil-core/src/engines/{mod.rs, config.rs, comfyui/mod.rs, comfyui/supervisor.rs, comfyui/install.rs, tools.rs}`.
+- Create: `crates/lil-core/src/engines/{mod.rs, config.rs, comfyui/mod.rs, comfyui/supervisor.rs, comfyui/install.rs, comfyui/client.rs, tools.rs}`. `client.rs` starts here with only the HTTP calls this task needs (`/system_stats` for attached detection and readiness, `/free` for the idle free and `EngineControl::unload`); Task 12 extends it.
 - Create: `crates/lil-core/src/meter/{mod.rs, sink.rs}`: the usage types below and a logging `UsageSink` stand-in, which Task 15 replaces.
-- Modify: `crates/lil-core/src/{server/mod.rs, tools/mod.rs}`, `crates/lil-core/src/store/{suite_toml.rs, fsops.rs}` (reading `[engines.comfyui]`; `remove_engine_file`).
+- Modify: `crates/lil-core/Cargo.toml` (`reqwest.workspace = true`, its async API), `crates/lil-core/src/{server/mod.rs, tools/mod.rs}`, `crates/lil-core/src/store/{suite_toml.rs, fsops.rs}` (reading `[engines.comfyui]`; `remove_engine_file`).
 - Test: `crates/lil-core/tests/engines.rs` (the `lil-fake-comfyui` binary and `FakeComfy`).
 
 **Interfaces:**
@@ -1012,8 +1036,17 @@ pub struct UsageDraft { pub tool: String, pub provider: String, pub model: Optio
     pub basis: BillingBasis, pub units: serde_json::Map<String, serde_json::Value>, pub est_cost: Option<(Money, Currency)>,
     pub account: Option<String>, pub raw_usage: Option<serde_json::Value>, pub attribution: Attribution }
 pub struct UsageCtx { pub workspace: Option<Arc<OpenWorkspace>>, pub project: Option<String>, pub asset: Option<String>,
-                      pub job_id: Option<String>, pub caller_kind: String, pub reservation: Option<String> }
+                      pub job_id: Option<String>, pub call_id: String /* job id or c_<16 hex> */,
+                      pub caller_kind: String, pub reservation: Option<String> }
 pub trait UsageSink: Send + Sync { fn record<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, ()>; }
+// lil_core::engines::comfyui::client (started here; Task 12 adds the rest)
+pub enum ComfyError { Unreachable(String), Http(u16, String /* untrusted */), Protocol(String) }
+pub struct ComfyClient;
+impl ComfyClient {
+    pub fn new(url: &str) -> Result<ComfyClient, ErrorBody>;   // comfyui.not_loopback unless the host is 127.0.0.1, ::1 or localhost
+    pub async fn system_stats(&self) -> Result<serde_json::Value, ComfyError>;
+    pub async fn free(&self, unload_models: bool, free_memory: bool) -> Result<(), ComfyError>;   // POST /free
+}
 pub enum EngineClass { Owned, Attached, None }
 pub enum EngineState { Stopped, Starting, Ready, Unreachable }
 pub struct ComfyConfig { pub root: Option<PathBuf>, pub python: Option<PathBuf>, pub port: u16, pub extra_args: Vec<String>,
@@ -1051,10 +1084,11 @@ pub struct NodeInstallHandler;  // JobHandler kind "comfy.install_node", cpu lan
   - `idle_owned_engine_gets_free_after_the_configured_time`;
   - `engine_tools_have_the_declared_effects` (ARCH-051; `engines.stop` and `restart` destructive, `engines.comfyui.install_node` exec, `engines.start` write; CORE-108);
   - `install_requires_an_exact_version_and_records_usage_and_restart_needed` (ARCH-059, CORE-131, CORE-069; a recording `UsageSink` gets one draft with provider `comfy-registry`, basis `free_tier`, `requests: 1`);
-  - `install_failure_is_comfyui_node_install_failed_with_untrusted_detail` (ARCH-060).
+  - `install_failure_is_comfyui_node_install_failed_with_untrusted_detail` (ARCH-060);
+  - `client_refuses_non_loopback_urls` (ARCH-068): `ComfyClient::new` of `http://127.0.0.1:8188`, `http://[::1]:8188` and `http://localhost:8188` → ok; of `http://192.168.1.5:8188` and `http://example.com:8188` → `comfyui.not_loopback`, and no request is sent.
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test engines`. Expected: FAIL.
 - [ ] **Step 3: Implement**, with `engines.status`, `engines.start`, `engines.stop`, `engines.restart`, `engines.comfyui.install_node` and the `engines` topic.
-- [ ] **Step 4: Run them, then the gate.** Remove the entries marked 11 (four in `comfy_engine.rs`, one in `jobs_queue.rs`). Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-core`, with `cargo deny check`). Remove the entries marked 11 (three in `comfy_engine.rs`, one in `jobs_queue.rs`). Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1066,27 +1100,23 @@ git commit -m "engines: ComfyUI owned/attached supervisor, loopback-only launch,
 ### Task 12: The ComfyUI client and the `comfy.prompt` job handler (ARCH-021, ARCH-033, ARCH-060, ARCH-072, ARCH-080, CORE-120, CORE-123, CORE-128, CORE-130, QA-009, QA-051)
 
 **Files:**
-- Create: `crates/lil-core/src/engines/comfyui/{client.rs, ws.rs, handler.rs, salvage.rs}`.
-- Modify: `crates/lil-core/src/state/migrations.rs` (append `COMFY_CACHE` to the suite scope, migration 4: `comfy_client(id)`, `comfy_uploads(name PRIMARY KEY, sha256, refs, last_used_utc)`, `model_hashes(path PRIMARY KEY, size, mtime, file_id, sha256)`), `crates/lil-core/src/tools/test_tools.rs` (`test.comfy_submit`), `crates/lil-core/Cargo.toml` (`reqwest`, `tokio-tungstenite`).
+- Create: `crates/lil-core/src/engines/comfyui/{ws.rs, handler.rs, salvage.rs}`. Modify: `crates/lil-core/src/engines/comfyui/client.rs` (Task 11's client, extended).
+- Modify: `crates/lil-core/src/state/migrations.rs` (append `COMFY_CACHE` to the suite scope, migration 4: `comfy_client(id)`, `comfy_uploads(name PRIMARY KEY, sha256, refs, last_used_utc)`, `model_hashes(path PRIMARY KEY, size, mtime, file_id, sha256)`), `crates/lil-core/src/tools/test_tools.rs` (`test.comfy_submit`), `crates/lil-core/Cargo.toml` (`tokio-tungstenite`; `reqwest` came in Task 11).
 - Test: `crates/lil-core/tests/comfy_client.rs` (`FakeComfy`, paused runtime where no socket is involved).
 
 **Interfaces:**
-- Consumes: `Engines::ensure_ready`, `Jobs`, `Store::staging_handle`, `Telemetry::{track, energy_between}`.
+- Consumes: `Engines::ensure_ready`, `Jobs`, `Store::staging_handle`, `Telemetry::{track, energy_between}`; Task 11's `ComfyClient::{new, system_stats, free}` and `ComfyError`.
 - Produces:
 
 ```rust
-pub enum ComfyError { Unreachable(String), Http(u16, String /* untrusted */), Protocol(String) }
 pub enum RemoteState { Queued, Running, Done(serde_json::Value /* history */), Gone }
-pub struct ComfyClient;
-impl ComfyClient {
-    pub fn new(url: &str, client_id: String) -> ComfyClient;   // refuses a non-loopback host
-    pub async fn system_stats(&self) -> Result<serde_json::Value, ComfyError>;
+impl ComfyClient {                                             // Task 11's client, extended
+    pub fn with_client_id(self, client_id: String) -> ComfyClient;   // the channel's stable id from the suite state.db
     pub async fn submit(&self, prompt_id: &str, graph: &serde_json::Value, preview_method: &str, trace_id: &str) -> Result<(), ComfyError>;
     pub async fn state(&self, prompt_id: &str) -> Result<RemoteState, ComfyError>;
     pub async fn cancel(&self, prompt_id: &str) -> Result<(), ComfyError>;                 // POST /api/jobs/{id}/cancel
     pub async fn view_to(&self, file: &OutputFile, dest: &Path) -> Result<(u64, String /* sha256 of the stream */), ComfyError>;
     pub async fn upload_image(&self, name: &str, src: &Path) -> Result<(), ComfyError>;
-    pub async fn free(&self, unload_models: bool, free_memory: bool) -> Result<(), ComfyError>;
     pub async fn queue(&self) -> Result<QueueView, ComfyError>; pub async fn jobs(&self) -> Result<Vec<RemoteJob>, ComfyError>;
     pub async fn object_info(&self) -> Result<serde_json::Value, ComfyError>;
     pub async fn node_replacements(&self) -> Result<serde_json::Value, ComfyError>;
@@ -1105,7 +1135,7 @@ pub struct ComfyPromptHandler;  // JobHandler kind "comfy.prompt"; args {graph, 
 
 - [ ] **Step 1: Write the failing tests:**
   - `prompt_ids_are_minted_persisted_then_posted`: the `jobs` row holds `submitting` and the UUID before the fake records the POST; the UUID matches `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`;
-  - **`post_failure_checks_status_before_resubmitting`** (CORE-120, Review Focus 1): the fake accepts the prompt and drops the connection before answering → the core calls `GET /api/jobs/<id>` before anything else, finds it, and posts no second `/prompt`; when the fake had not accepted it, exactly one resubmission follows;
+  - **`post_failure_checks_status_before_resubmitting`** (CORE-120, Review Focus 1): the fake accepts the prompt and drops the connection before answering (`FakeComfy::drop_after_accept(true)`) → the core calls `GET /api/jobs/<id>` before anything else, finds it, and posts no second `/prompt`; when the fake had not accepted it, exactly one resubmission follows;
   - `one_suite_prompt_pending_per_lane` (CORE-123, QA-051): three held jobs → the fake's suite prompt count never exceeds 1;
   - `every_prompt_sets_preview_method_and_the_stable_client_id` (CORE-130): `extra_data.preview_method == "taesd"` unless the args say otherwise; the same `client_id` after a core restart;
   - `outputs_are_fetched_into_staging_with_the_prefix_and_engine_copies_removed` (CORE-130, ARCH-080): job `j_0123456789abcdef` → `filename_prefix == "lil_0123456789abcdef_"`; the staged file's SHA-256 equals the fake's; only then is the fake's copy gone. A staged copy whose hash differs (fail point `jobs.after_outputs=io` on the stream) leaves the engine copy in place;
@@ -1113,13 +1143,12 @@ pub struct ComfyPromptHandler;  // JobHandler kind "comfy.prompt"; args {graph, 
   - **`cancel_never_posts_interrupt`** (ARCH-021, Review Focus 2);
   - **`comfyui_killed_mid_job_interrupts_salvages_and_never_resubmits`** (QA-009, Review Focus 1), and `agent_jobs_rerun_once_while_the_core_runs`;
   - `oom_frees_then_retries_at_most_twice` (ARCH-072): the fake fails with OOM three times → three POSTs, exactly two `/free`, and the job ends `failed` with `comfyui.out_of_memory`; failing twice then succeeding → `succeeded`, `attempt` 3;
-  - `previews_up_to_1_mb_ride_the_preview_topic` (ARCH-033): a 1,048,576-byte PNG frame is published as `{format: "png", data_b64}`; a 1,048,577-byte one is dropped;
+  - `previews_up_to_1_mb_ride_the_preview_topic` (ARCH-033; frames from `FakeComfy::send_preview(2, n)`): a 1,048,576-byte PNG frame is published as `{format: "png", data_b64}`; a 1,048,577-byte one is dropped;
   - `execution_windows_feed_telemetry_and_the_watchdog_starts_at_execution_start` (CORE-065, CORE-126);
-  - `executed_graph_is_recorded_from_history`; `engine_error_text_is_untrusted_detail` (ARCH-060);
-  - `client_refuses_non_loopback_urls` (ARCH-068).
+  - `executed_graph_is_recorded_from_history`; `engine_error_text_is_untrusted_detail` (ARCH-060).
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test comfy_client`. Expected: FAIL.
-- [ ] **Step 3: Implement**, with the `CancelEnginePrompts` shutdown step.
-- [ ] **Step 4: Run them, then the gate.** Remove the `comfy_engine.rs` entries marked 12. Expected: PASS.
+- [ ] **Step 3: Implement**, with the `CancelEnginePrompts` shutdown step. A `comfy.prompt` job passes through `submitting`, which is what turns `owned_comfyui_stops_with_the_core_and_dies_with_it` green here.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-core`, with `cargo deny check`). Remove the `comfy_engine.rs` entries marked 12. Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1132,6 +1161,12 @@ git commit -m "engines: ComfyUI client and comfy.prompt jobs, exactly-once submi
 
 **Files:**
 - Create: `crates/lil-core/src/engines/comfyui/{outside.rs, environment.rs, inventory.rs, graph.rs}`.
+- Modify (the wiring):
+  - `crates/lil-core/src/server/mod.rs`: the `OutsideJobs` idle blocker and the 2 s poller while the engine is ready;
+  - `crates/lil-core/src/engines/{mod.rs, tools.rs}`: `engines.status`'s `outside_jobs` and `inventory`, the `outside_job` event on `engines`, and the `comfy.inventory` job submitted when the engine becomes ready;
+  - `crates/lil-core/src/jobs/scheduler.rs`: a job for an engine with outside prompts is not admitted; it stays `waiting` and is re-checked on each poll;
+  - `crates/lil-core/src/engines/comfyui/handler.rs`: graph checks (node replacements, model refs, partner nodes) before the POST;
+  - `crates/lil-core/src/tools/mod.rs` and its pins in `tools/tests.rs`, for the inventory job handler's registration.
 - Test: `crates/lil-core/tests/comfy_observe.rs`; unit tests in `graph.rs`.
 
 **Interfaces:**
@@ -1155,25 +1190,29 @@ pub struct InventoryHandler;   // JobHandler kind "comfy.inventory", cpu lane, o
   - `suite_jobs_wait_for_outside_prompts` (ARCH-069, CORE-123): a suite job stays `waiting` (never `queued_in_engine`) while an outside prompt runs, and is posted after it ends;
   - `node_replacements_apply_locally_and_model_refs_are_extracted` (CORE-018): map `{"OldLoader": "CheckpointLoaderSimple"}` over a graph with an `OldLoader` node → its `class_type` becomes `CheckpointLoaderSimple` and the result is `[("OldLoader", "CheckpointLoaderSimple")]`; a graph with `ckpt_name: "a.safetensors"`, `lora_name: "b.safetensors"`, `text: "c.safetensors"` and `model: "d.gguf"` → exactly three refs: `a.safetensors`, `b.safetensors`, `d.gguf`;
   - `partner_nodes_come_from_object_info_api_node` (ARCH-057, CORE-093): object info `{"OpenAIImageNode": {"api_node": true}, "KSampler": {}}` and a graph using both → `["OpenAIImageNode"]`; and `suite_jobs_with_partner_nodes_are_refused_until_plan_6b` (`comfyui.partner_nodes`; test tools only);
-  - `outside_paid_prompt_records_unattributed_usage` (ARCH-057, CORE-093): one outside prompt with that node → one `UsageSink` draft with `route: "comfy-partner"`, `attribution: Unattributed`, `est_cost: None`; the same prompt seen on later polls adds no second draft;
+  - `outside_paid_prompt_records_unattributed_usage` (ARCH-057, CORE-093): one outside prompt with that node (`FakeComfy::add_outside_prompt(true, Some(graph))`) → one `UsageSink` draft with `route: "comfy-partner"`, `attribution: Unattributed`, `est_cost: None`; the same prompt seen on later polls adds no second draft;
   - `environment_capture_has_versions_and_node_revisions`: two `custom_nodes` folders, one a git repo and one with `pyproject.toml` `version = "1.2.3"` → `nodes` lists the commit and `"1.2.3"`;
   - `model_hashes_are_cached_by_path_size_mtime_and_file_id` (CORE-130): a second inventory with nothing changed reads no model byte (a counting `Probe`: `open_read` count 0); touching one file's mtime rehashes that file only; `inventory_matches_registry_by_sha256`: a `registry/models.yaml` entry whose `files[].sha256` equals a file's hash → that file carries the entry's `id`.
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test comfy_observe`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run them, then the gate.** Remove the `comfy_engine.rs` entries marked 13. Expected: PASS. This ends PR 3a: run the full gate (expected `spec tests: P + 31 passed, 46 expected-fail`), push, and open the PR.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-core`). Remove the `comfy_engine.rs` entries marked 13. Expected: PASS, and `spec tests: P + 31 passed, 46 expected-fail`.
 - [ ] **Step 5: Commit.**
 
 ```bash
 git commit -m "engines: outside ComfyUI jobs, environment capture, model inventory by hash, node replacements, partner-node detection"
 ```
 
+- [ ] **Step 6: This ends PR 3a: push and open the PR.** CI runs the full suite on the PR; the owner runs it locally only if they choose.
+
 ---
 
 ### Task 14: `confirm`: agent safety confirmations, answers and retries (ARCH-020, ARCH-052–055, CORE-109–115, APP-044–046, APP-051, QA-016)
 
 **Files:**
-- Create: `crates/lil-core/src/confirm/{mod.rs, store.rs, stage.rs}`; `crates/lil-protocol/src/app.rs` (the `app/*` types; protocol 1.1, the capabilities).
-- Modify: `crates/lil-core/src/{rpc.rs, server/conn.rs, tools/dispatcher.rs, tools/stages.rs}`, `crates/lil-core/src/state/{mod.rs, migrations.rs}` (append `CONFIRMATIONS`: suite migration 5, workspace migration 5; `StateDb::idem_reclaim`).
+- Create: `crates/lil-core/src/confirm/{mod.rs, store.rs, stage.rs}`; `crates/lil-protocol/src/app.rs` (the `app/*` types).
+- Modify: `crates/lil-protocol/src/session.rs`: `PROTOCOL` becomes 1.1 and `CAPABILITIES` becomes `["events.v1", "tools.v1", "jobs.v1", "confirmations.v1", "caps.v1"]`, with its unit tests (they assert 1.0 and the two-entry list today). Task 2 changes only the spec's Appendix D; this task owns the code change.
+- Modify: `crates/lil-core/tests/hello.rs` (its shared-capabilities assertion) and, protected (Global Constraints), `crates/lil-spec-tests/tests/core_session.rs`: `hello_major_mismatch_is_refused`'s `core_protocol` becomes `"1.1"`, nothing else.
+- Modify: `crates/lil-core/src/{rpc.rs, server/conn.rs, tools/dispatcher.rs, tools/stages.rs}`, `crates/lil-core/src/state/{mod.rs, migrations.rs}` (append `CONFIRMATIONS`: suite migration 5, workspace migration 5; `StateDb::idem_reclaim`), `crates/lil-core/src/store/failpoints.rs` (`confirm.after_answer`, fired after `Confirm::answer` commits the row and before the `answered` event).
 - Test: `crates/lil-core/tests/confirm.rs`, additions to `tests/dispatch.rs`.
 
 **Interfaces:**
@@ -1226,10 +1265,11 @@ impl StateDb { pub async fn idem_reclaim(&self, scope: &str, key: &str, args_has
   - **`retry_with_other_arguments_is_a_conflict`**, **`another_caller_kind_cannot_use_the_token`**, **`pending_survives_core_restart_and_runs_once`** and **`approve_and_retry_race_runs_once`** (Review Focus 4);
   - `mcp_sessions_get_the_marker_and_follow_mcp_confirmation` (ARCH-054, CORE-112): the marker is on `destructive` and `exec` tools in an `mcp` session's `tools/list` and on none in a `cli` one; with `mcp_confirmation = "core"` an `mcp` call is treated like a `cli` one (pending with an app, `confirm.unavailable` without); with `"claude_code"` it proceeds and history records `confirmed_via: claude_code`. Both settings are tested through `Confirm`'s constructor;
   - `ui_cap_prompts_are_cancelled_when_the_app_closes`;
-  - `pending_confirmations_hold_idle` (ARCH-020); `app_methods_need_the_capability` (APP-043, protocol 1.1): `app/confirmations.list` from a `ui:*` session whose shared capabilities lack `confirmations.v1` → `caller.not_allowed`; with it → ok; `app/caps.set` likewise needs `caps.v1`.
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test confirm --test dispatch`. Expected: FAIL.
+  - `pending_confirmations_hold_idle` (ARCH-020); `app_methods_need_the_capability` (APP-043, protocol 1.1): `app/confirmations.list` and `app/confirmation.answer` from a `ui:*` session whose shared capabilities lack `confirmations.v1` → `caller.not_allowed`; with it → ok (`app/caps.set` is Task 16's);
+  - `protocol_is_1_1_with_five_capabilities` (`lil-protocol` unit test): `PROTOCOL.to_string() == "1.1"`; `shared_capabilities` of a client offering all five gives all five in the core's order.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core -p lil-protocol -E 'binary(confirm) | binary(dispatch) | binary(hello) | package(lil-protocol)'`. Expected: FAIL.
 - [ ] **Step 3: Implement**, with `app/confirmations.list`, `app/confirmation.answer`, the `confirmations` topic and `LIL_TEST_CONFIRM_LIFETIME_SECS`.
-- [ ] **Step 4: Run them, then the gate.** Remove the `confirmations.rs` entries and `node_install_needs_confirmation_and_a_pinned_version`. Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-core -p lil-protocol`). Remove the `confirmations.rs` entries and `node_install_needs_confirmation_and_a_pinned_version`. Expected: PASS, including the edited `hello_major_mismatch_is_refused`.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1241,8 +1281,9 @@ git commit -m "confirm: agent safety confirmations, app answers, retry by idempo
 ### Task 15: `meter`: usage records, per-job attribution, local work and summaries (CORE-013, CORE-064, CORE-065, CORE-069, CORE-071, CORE-081–083, QA-025)
 
 **Files:**
-- Create: `crates/lil-core/src/meter/{record.rs, attribution.rs, summary.rs, tools.rs}`. Modify: `crates/lil-schema/src/money.rs` (completed), `crates/lil-core/src/meter/{mod.rs, sink.rs}` (the stand-in goes).
-- Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 6), `crates/lil-core/src/telemetry/tools.rs` (`telemetry.jobs`), `crates/lil-core/src/tools/test_tools.rs` (`test.meter_external` without caps).
+- Create: `crates/lil-core/src/meter/{record.rs, attribution.rs, summary.rs, stage.rs, tools.rs}`. Modify: `crates/lil-schema/src/money.rs` (completed), `crates/lil-core/src/meter/{mod.rs, sink.rs}` (the stand-in goes).
+- Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 6), `crates/lil-core/src/telemetry/tools.rs` (`telemetry.jobs`), `crates/lil-core/src/tools/test_tools.rs` (`test.meter_external` without caps), `crates/lil-core/src/store/failpoints.rs` (`meter.after_pending`, fired after the pending row commits; `meter.after_usage_line`, fired after the log line and before any settle).
+- Usage lines go through the existing append-log home, `crates/lil-core/src/store/logs.rs`: `Store::append_log(LogKind::Usage, …)` with a workspace, `logs::append_loose_usage(env, record)` without one (Global Constraints, "File writes in `lil-core`"). Nothing in `meter` writes a file itself.
 - Test: `crates/lil-schema/tests/money.rs` (proptest), `crates/lil-core/tests/meter.rs`, `crates/lil-testkit/tests/money_has_no_float_constructor.rs`.
 
 **Interfaces:**
@@ -1270,6 +1311,12 @@ impl Meter {
     pub async fn summary(&self, q: SummaryQuery) -> Result<UsageSummary, ErrorBody>;
 }
 impl UsageSink for Meter {}  impl JobCompletion for Meter {}   // local-work records for comfy jobs; writes job_energy through Telemetry::put_job_energy
+impl Meter { pub async fn finish_call(&self, call_id: &str, status: &str) -> Result<Option<u64 /* seq */>, ErrorBody>; }
+    // finishes the call's still-pending usage row, if any, at its est_cost; None when the tool finished it itself
+// lil_core::meter::stage: stage 8 for inline (non-job) calls; the server's pipeline hooks use it in place of Plan2's no-op
+pub struct MeterSettle;
+impl MeterSettle { pub fn new(meter: Arc<Meter>) -> MeterSettle; }
+impl MeterStage for MeterSettle {}   // settle(): finish_call(call_id, "succeeded" | "failed" | "cancelled" from the outcome); Task 16 adds the reservation settle
 ```
 
 - [ ] **Step 1: Write the failing tests:**
@@ -1278,13 +1325,14 @@ impl UsageSink for Meter {}  impl JobCompletion for Meter {}   // local-work rec
   - `record_fields_match_appendix_f_and_money_is_decimal_strings` (CORE-069); `account_is_an_opaque_id` (CORE-069);
   - `loose_calls_go_to_usage_loose` (ARCH-081);
   - `attribution_splits_gpu_by_sm_share_and_cpu_by_cpu_time` (CORE-065): one 10 s window, GPU delta 2,000,000 mJ, idle GPU 40,000 mW, SM permille·s {launcher 200: 0, interpreter 201: 7500, other 100: 2500}, CPU delta 300,000 mJ, idle CPU 10,000 mW, CPU ms {201: 2000, 100: 6000} → `gpu_mj_gross` 1,500,000, `gpu_mj_above_idle` 1,200,000, `gpu_seconds_milli` 7,500, `cpu_mj_gross` 75,000, `cpu_mj_above_idle` 50,000 (engine pids `[200, 201]`);
-  - `idle_baseline_cases` (CORE-065, through `Telemetry::energy_between` over fake sources): (a) in the 60 s before the window, three samples under 5 % utilisation at 40, 42 and 44 W and the rest above → idle 42,000 mW; (b) no sample under 5 % in those 60 s, and 1-minute averages of 80, 55 and 70 W in the last hour → 55,000 mW; (c) neither (a fresh `telemetry.db`) → idle 0, above-idle equals gross, and the record says `idle_unknown`;
+  - `idle_baseline_cases` (CORE-065, through `Telemetry::energy_between` over fake sources): (a) in the 60 s before the window, three samples under 5 % utilisation at 40, 42 and 44 W and the rest above → idle 42,000 mW; (b) no sample under 5 % in those 60 s, and 1-minute averages of 80, 55 and 70 W in the last hour → 55,000 mW; (c) neither (a fresh `telemetry.db`) → `idle_gpu_mw` is `None`, above-idle equals gross, and both the `JobEnergy` and the usage line have `idle_unknown: true` (in (a) and (b) neither has the key);
   - `local_job_record_has_energy_and_cost_zero_with_energy_cost_apart` (CORE-064, CORE-082);
   - `summary_never_adds_bases_together_and_converts_with_dated_rates` and `fixed_costs_are_in_month_totals` (CORE-081–083);
-  - `telemetry_jobs_lists_job_energy` (CORE-146): after a comfy job, `telemetry.jobs {job_ids: [id]}` returns one `JobEnergy` with that `job_id`, the workspace id and `measured: {gpu: true, cpu: true}`.
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-schema -p lil-core -p lil-testkit -E 'test(money) | binary(meter)'`. Expected: FAIL.
-- [ ] **Step 3: Implement**, with `usage.summary`, `telemetry.jobs` and the `usage` topic.
-- [ ] **Step 4: Run them, then the gate.** Remove the entries marked 15. Expected: PASS.
+  - `telemetry_jobs_lists_job_energy` (CORE-146): after a comfy job, `telemetry.jobs {job_ids: [id]}` returns one `JobEnergy` with that `job_id`, the workspace id and `measured: {gpu: true, cpu: true}`;
+  - `meter_stage_finishes_inline_calls_once`: an inline `test.meter_external {provider: "p", amount: "0.5"}` whose tool leaves its row pending → after stage 8 the usage log has exactly one line for its call id with `status: "succeeded"` and `est_cost: "0.5"`; a second `settle` for the same call id adds no line; with `fail: true` the line has `status: "failed"`.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-schema -p lil-core -p lil-testkit -E 'test(money) | test(convert_rounds_half_even) | binary(meter)'`. Expected: FAIL.
+- [ ] **Step 3: Implement**, with `usage.summary`, `telemetry.jobs`, the `usage` topic and `MeterSettle` as stage 8.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-schema -p lil-core -p lil-testkit`). Remove the entries marked 15. Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1297,7 +1345,8 @@ git commit -m "meter: Money, write-ahead usage records, per-job energy attributi
 
 **Files:**
 - Create: `crates/lil-core/src/meter/{caps.rs, caps_settings.rs}`.
-- Modify: `crates/lil-core/src/state/migrations.rs` (append `CAPS` to the suite scope, migration 7: `cap_reservations`, `cap_settled`, `cap_alerts`), `crates/lil-core/src/{confirm/stage.rs, tools/stages.rs, rpc.rs, store/suite_toml.rs}`.
+- Modify: `crates/lil-core/src/state/migrations.rs` (append `CAPS` to the suite scope, migration 7: `cap_reservations`, `cap_settled`, `cap_alerts`), `crates/lil-core/src/{confirm/stage.rs, confirm/mod.rs, tools/stages.rs, rpc.rs, store/suite_toml.rs}` (`confirm/mod.rs`: `Confirm::answer` handles `cap.action` `allow_once` and `raise`), `crates/lil-core/src/meter/stage.rs` (the caps half of `MeterSettle`), `crates/lil-core/src/store/failpoints.rs` (`caps.after_reserve`, fired after the reservation commits; Task 21's `crash_full_*` exercises it).
+- The estimate stage (`tools/stages.rs`) reads `test.destructive`'s `cost` (Task 6) as `Estimate::External { provider: "test", amount: cost, currency: <display>, basis: Payg }`, and `test.meter_external`'s `{provider, amount, currency?, basis?}` as the matching external estimate (currency defaulting to the display currency, basis to `payg`).
 - Test: `crates/lil-core/tests/caps.rs` (threads against real SQLite in a temp folder), `crates/lil-core/tests/caps_concurrency.rs`.
 
 **Interfaces:**
@@ -1322,6 +1371,7 @@ impl Caps {
     pub async fn set(&self, by: &Session, p: CapsSetParams) -> Result<CapsView, ErrorBody>;   // verified ui:* only
 }
 impl ReserveStage for Caps {}  impl JobCompletion for Caps {}
+impl MeterSettle { pub fn with_caps(self, caps: Arc<Caps>) -> MeterSettle; }   // settle(): the usage line first, then Caps::settle(reservation)
 ```
 
 - [ ] **Step 1: Write the failing tests:**
@@ -1334,10 +1384,12 @@ impl ReserveStage for Caps {}  impl JobCompletion for Caps {}
   - `one_prompt_covers_confirm_and_cap` (CORE-015 step 5, APP-045) and `race_after_stage_5_asks_for_the_cap_only`;
   - `allow_once_and_raise_answers` (CORE-091); `non_interactive_is_cap_exceeded` (QA-016);
   - `invalid_cap_fails_closed_and_is_reported` and `legacy_usd_keys_read_only_when_display_is_usd`;
-  - `caps_set_needs_a_verified_ui_session_and_keeps_comments` (CORE-008).
+  - `caps_set_needs_a_verified_ui_session_and_keeps_comments` (CORE-008);
+  - `app_caps_set_needs_caps_v1` (APP-043, protocol 1.1; moved from Task 14): `app/caps.set` from a verified `ui:*` session whose shared capabilities lack `caps.v1` → `caller.not_allowed` and `suite.toml` unchanged; with it → ok;
+  - `inline_settle_writes_the_line_before_settling`: an inline `test.meter_external` call under a cap → the usage line exists before `cap_settled` changes, and settling the same reservation twice changes it once.
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test caps --test caps_concurrency`. Expected: FAIL.
 - [ ] **Step 3: Implement**, with `caps.get`, `app/caps.set` and the `caps` topic.
-- [ ] **Step 4: Run them, then the gate.** Remove the entries marked 16. Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-core`). Remove the entries marked 16. Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1450,7 +1502,7 @@ git commit -m "interchange: app handler registry, open_in and ui.show without fo
 - Modify: `crates/lil-core/src/identity.rs` and `crates/lil-core/src/rpc.rs`: `claude_ancestor` becomes `claude_is_direct_parent` (the parent only, no grandparent), and `rpc.rs` resolves a declared `mcp` whose check fails to `cli` instead of only logging a warning. The unit test `mcp_from_trusted_dir_is_mcp_without_claude_parent` becomes `mcp_without_claude_as_direct_parent_is_cli`, and `claude_parent_or_grandparent_is_found` becomes `only_a_direct_claude_parent_counts`.
 - Modify: `crates/lil-mcp/{Cargo.toml, src/main.rs}`; create `src/{server.rs, core_link.rs, resources.rs}`.
 - Create: `crates/lil-protocol/src/lowering.rs` (pure); modify `crates/lil-protocol/src/lib.rs`.
-- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: add the `mcp_server.rs` and doctor globs of the Task 7/19/20 row of Global Constraints "Old names" that Task 19 first needs.
+- `crates/lil-testkit/tests/no_stale_names.rs`: Task 19 adds a glob to the Task 7/19/20 row only for a file it writes itself that names one of the row's substrings (none is expected). Task 7 owns the spec-test globs, `mcp_server.rs` included; Task 20 owns the doctor and plugin globs.
 - Modify: `crates/lil-client` (connect as `mcp` from the server's working folder, `LIL_TEST_CLIENT_PROTOCOL`).
 - Test: `crates/lil-protocol/tests/lowering.rs` (snapshots, ARCH-040), `crates/lil-mcp/tests/stdio.rs`.
 
@@ -1487,9 +1539,9 @@ pub fn claude_is_direct_parent(inspector: &dyn ProcessInspector, client: &Proces
   - `job_wait_never_waits_past_90_seconds` (AI-113): `timeout_s: 91` comes back as a `params.invalid` error result, not a hang;
   - `resources_list_project_jobs_and_recent_assets` (AI-115): `resources/list` has exactly the three Appendix F URIs; `lil://assets/recent` returns at most 20 assets, newest first;
   - `descriptions_fit_2000_characters` (AI-111).
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-protocol -p lil-mcp`. Expected: FAIL.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-protocol -p lil-mcp -p lil-core -E 'package(lil-protocol) | package(lil-mcp) | (package(lil-core) & test(/^identity::/))'` (the identity tests are unit tests in `crates/lil-core/src/identity.rs`). Expected: FAIL.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run them, then the gate.** Remove the `mcp_server.rs` entries. Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-protocol -p lil-mcp -p lil-core -p lil-client`, with `cargo deny check`). Remove the `mcp_server.rs` entries. Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1502,12 +1554,13 @@ git commit -m "lil-mcp: rmcp stdio server lil, MCP lowering with markers and ret
 
 **Files:**
 - Create: `plugin/.claude-plugin/marketplace.json`, `plugin/worldwright/.claude-plugin/plugin.json`, `plugin/worldwright/.mcp.json`, `plugin/worldwright/hooks/hooks.json`, `plugin/worldwright/skills/lilith/SKILL.md`, `plugin/worldwright/skills-inventory.toml`.
-- Copy unchanged into `plugin/worldwright/` (owner question 2): plugin 1.2.0's skills, subagents and its `civitai` and `huggingface` MCP server entries, from the plugin 1.2.0 source folder the owner names at execution time (never written into the repo). Before the copy, run `lil dev privacy-scan` over that folder; anything it flags, and any token, key or personal path, is left out and reported; tokens stay in the user's environment or `userConfig`. Every copied skill is listed in `skills-inventory.toml`, with `writes_directly` as its text shows.
-- Modify (protected): `.claude/settings.json`: the four `deny` entries of Global Constraints, and nothing else.
+- Copy unchanged into `plugin/worldwright/` (owner question 2): plugin 1.2.0's skills, subagents and its `civitai` and `huggingface` MCP server entries, from the plugin 1.2.0 source folder the owner names at execution time (never written into the repo). Before the copy, run `lil dev privacy-scan` over that folder; anything it flags, and any token, key or personal path, is left out and reported; tokens stay in the user's environment or `userConfig`. Every copied skill is listed in `skills-inventory.toml`, with `writes_directly` as its text shows. Right after the copy, compare each copied file's SHA-256 with its source file's and report the result; then write `plugin/worldwright/carried-1.2.0.toml` (Create), one `[[file]] path = "<path relative to plugin/worldwright/>", sha256 = "<hex>"` per copied file, which pins the carried content.
+- Modify (protected): `.claude/settings.json`: the seven `deny` entries of Global Constraints (eight with the conditional `Write` entry), and nothing else.
+- Modify, only with the conditional `Write` entry: `crates/lil-testkit/tests/claude_settings_patterns.rs`. Its rule-kind check accepts `Write(//**/LILITH*/suite.toml)` and still panics on every other `Write(` rule, and its module docs say why.
 - Create: `crates/lil-cli/src/user/{hook.rs, hook_patterns.rs}`; modify `src/user/{mod.rs, doctor.rs}`.
 - Modify: `crates/lil-core/src/tools/doctor_tools.rs` (the `claude_rules` offer of Task 4's `offers`: the rules are written only when offered).
 - Test: `crates/lil-cli/tests/hook_patterns.rs` (the full QA-061 table, including the known limits), `crates/lil-cli/tests/doctor_claude.rs`, `crates/lil-cli/tests/plugin_files.rs`, `crates/lil-cli/tests/repo_settings.rs`.
-- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: the Task 19 and 20 rows of Global Constraints "Old names" (Task 19 adds the `mcp_server.rs` glob when it first needs it).
+- Modify: `crates/lil-testkit/tests/no_stale_names.rs`: the Task 20 rows of Global Constraints "Old names", and the doctor and plugin globs of the Task 7/19/20 row, added in the commit that writes those names into `doctor_tools.rs`, `user/doctor.rs`, `tests/doctor_claude.rs` and `tests/plugin_files.rs` (Task 7 added the spec-test globs).
 
 **Interfaces:**
 - Consumes: the workspace detection that accepts `lilith.yaml` or the legacy `worldwright.yaml` (Task 1 keeps that reader), so the hooks and the plugin's carried-over skills work in a plugin-era workspace.
@@ -1527,19 +1580,20 @@ pub fn run_hook(event: HookEvent, stdin: &str, global: &GlobalArgs) -> (String /
 - [ ] **Step 1: Write the failing tests:**
   - `hook_patterns_table` (QA-061): every row of the must-ask and must-not-ask tables, plus the documented limits (`$x = "rm"; & $x f` is not caught; `bash -c "…"` asks); `lil-mcp`, `lil-mcp.exe --x` and `& "D:\b\lil-mcp.exe"` ask (ARCH-047);
   - `suite_toml_guard` (ARCH-056, CORE-008): Write and Edit of `<APPDATA>\LILITH\suite.toml` and `<APPDATA>\LILITH-dev\suite.toml` ask; `Set-Content`, `Add-Content`, `Out-File`, `>` and `>>` redirection, `Remove-Item`, `Move-Item`, `cp x <it>` and `sed -i` on it ask; `Get-Content`, `cat`, `type` and `grep caps <it>` pass; a `suite.toml` outside a `LILITH` folder passes;
-  - `repo_settings_deny_suite_toml_edits`: `.claude/settings.json` parses, and its `permissions.deny` holds `Edit(//**/LILITH*/suite.toml)` and the four write-like shell entries of Global Constraints, plus the `Write` twin exactly when Task 2's verification (recorded in B.3) says the Write tool needs its own rule;
+  - `repo_settings_deny_suite_toml_edits`: `.claude/settings.json` parses, and its `permissions.deny` holds `Edit(//**/LILITH*/suite.toml)` and the six write-like shell entries of Global Constraints (three Bash bodies, each equal to a PowerShell body), plus `Write(//**/LILITH*/suite.toml)` exactly when Task 2's verification (recorded in B.3) says the Write tool needs its own rule; `claude_settings_patterns.rs`'s existing tests, `brief_rules_are_present_in_both_shells` included, still pass;
+  - only with the `Write` entry, `only_the_suite_toml_write_rule_is_accepted` (`claude_settings_patterns.rs`): the rule-kind check accepts `Write(//**/LILITH*/suite.toml)` and panics on `Write(//**/other.toml)` (`#[should_panic]`);
   - `comfy_mcp_rules` (ARCH-105, ARCH-106); `warn_only_guard_for_logs_and_manifests` (ARCH-104);
   - `engine_a_marker_silences_every_hook` (ARCH-107);
   - `session_start_and_post_tool_use_use_no_start` (ARCH-018, ARCH-103);
   - `plugin_files_are_valid_and_point_at_the_fixed_paths` (AI-107, ARCH-013);
   - `doctor_plugin_install_only_after_yes_in_the_default_profile` (AI-117, ARCH-108): an installed 1.2.0 is updated in place to 1.3.0 after `y`; the doctor never uninstalls; a `userConfig` path outside a trusted folder of the running channel is a `problem:` naming the folder it should point to (owner question 9);
-  - `plugin_carries_1_2_0_content`: every skill and subagent of the copied set is present byte for byte, and `.mcp.json` lists `lil`, `civitai` and `huggingface`;
+  - `plugin_carries_1_2_0_content` (against the committed `carried-1.2.0.toml`, since the 1.2.0 source is never in the repo): the manifest lists at least one file under `skills/` and one under `agents/`; every listed file exists and its SHA-256 equals the manifest's; every file under `plugin/worldwright/{skills,agents}/` outside `skills/lilith/` is listed; and `.mcp.json` lists `lil`, `civitai` and `huggingface`;
   - `hooks_work_in_a_plugin_era_workspace`: with `worldwright.yaml` and no `lilith.yaml`, PostToolUse still notifies and SessionStart still reports;
   - `doctor_claude_rules_name_both_tool_name_forms` (AI-110, AI-114);
   - `doctor_lists_skills_writing_directly` (ARCH-104).
-- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-cli -E 'binary(hook_patterns) | binary(doctor_claude) | binary(plugin_files) | binary(repo_settings)'`. Expected: FAIL.
+- [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-cli -p lil-testkit -E 'binary(hook_patterns) | binary(doctor_claude) | binary(plugin_files) | binary(repo_settings) | binary(claude_settings_patterns)'`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run them, then the gate.** Remove the `plugin_hooks.rs` and `doctor_claude.rs` entries. Expected: PASS.
+- [ ] **Step 4: Run them, then the gate** (`-p lil-cli -p lil-core -p lil-testkit`). Remove the `plugin_hooks.rs` and `doctor_claude.rs` entries. Expected: PASS.
 - [ ] **Step 5: Commit.**
 
 ```bash
@@ -1561,20 +1615,21 @@ git commit -m "plugin 1.3: MCP server lil, hooks via lil hook, suite.toml guard,
 - [ ] **Step 1: Write the tests:** the three `real_*` tests (attached only: they never start, stop, free or cancel anything but their own prompt); `fake_comfy_matches_recorded_shapes`; `crash_full_*` over every plan-3 fail point × each job kind, plus corrupt `telemetry.db` and both `state.db` scopes; `test_real_outside_a_checkout_exits_2` (ARCH-016, QA-063).
 - [ ] **Step 2: Record the fixtures.** With the owner's ComfyUI running, run `cargo run -q -p lil-cli -- test --real --record crates/lil-testkit/fixtures/comfyui`. If no ComfyUI is reachable, stop and report: the owner runs it before PR 3b is opened. Check the recorded files with `lil dev privacy-scan`.
 - [ ] **Step 3: Classify the rules** (QA-028): every rule a plan-3 test cites becomes `test`; ARCH-112 and QA-024 stay `lint`; QA-063 is `manual` (on demand).
-- [ ] **Step 4: Run the full gate.**
+- [ ] **Step 4: Run the gate** (targeted, as in Execution notes).
 
-Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo deny check && cargo nextest run --workspace && cargo run -q -p lil-cli -- dev spec-tests && cargo run -q -p lil-cli -- dev spec-report`
+Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run -p lil-cli -p lil-core -p lil-testkit && cargo run -q -p lil-cli -- dev spec-tests && cargo run -q -p lil-cli -- dev spec-report`
 Expected: everything passes; `spec tests: P + 77 passed, 0 expected-fail` (143 when P is 66); `spec-report` shows 981 rules, 0 dangling citations and no `test` rule without a test.
 
 - [ ] **Step 5: Commit, then the privacy scan.**
 
 ```bash
-git add .github/workflows/nightly.yml crates dev/rule-classification.toml
 git commit -m "close-out: lil test --real, ComfyUI shape fixtures and drift check, nightly full crash suite, rule classification"
 cargo run -q -p lil-cli -- dev privacy-scan --tree HEAD
 ```
 
 Expected: the privacy scan exits 0.
+
+- [ ] **Step 6: This ends PR 3b: push and open the PR.** CI runs the full suite on the PR; the owner runs it locally only if they choose.
 
 ---
 
