@@ -40,9 +40,10 @@ struct Allow {
     until: &'static str,
 }
 
-/// The allowlist. The first nine rows are the plan's Task B1 table, verbatim except that row 5
-/// is split so the workflows get only the pick step's exact text (ruling RN7). The rest are
-/// what the PR-A reviews and this test itself need; each says so in its `why`.
+/// The allowlist. The first ten rows are the plan's Task B1 table, verbatim except that row 5
+/// is split so the workflows and `workflows.rs` get only the pick step's exact text and the
+/// either-crate lists (ruling RN7, B1 follow-up). The rest are what the PR-A reviews and this
+/// test itself need; each says so in its `why`.
 const ALLOW: &[Allow] = &[
     Allow {
         globs: &["docs/superpowers/plans/**"],
@@ -68,17 +69,35 @@ const ALLOW: &[Allow] = &[
         why: "literal legacy cases of the test guard",
         until: "the owner says no legacy folder is left",
     },
-    // The plan's row 5, minus `.github/workflows/*.yml`: in the workflows a bare `ww-cli`
-    // would also allow the tree-builder `-p ww-cli` lines Task B2 must change (ruling RN7).
-    // The workflows get the narrow row right after this one.
+    // The plan's row 5, minus `.github/workflows/*.yml` and `workflows.rs`: there a bare
+    // `ww-cli` would also allow the tree-builder `-p ww-cli` lines and pins Task B2 must
+    // change (rulings RN7, B1 follow-up). Those two get the narrow rows right after this one.
+    // `ww.exe` and `WW_PRIVACY_DENYLIST` occur only in `workflows.rs`, so they moved with it.
     Allow {
         globs: &[
             "tools/git-hooks/credential-helper",
-            "crates/lil-cli/src/dev/workflows.rs",
             "crates/lil-cli/tests/credential_helper.rs",
         ],
-        lines_with: &["ww-cli", "ww.exe", "--bin ww", "WW_PRIVACY_DENYLIST"],
+        lines_with: &["ww-cli", "--bin ww"],
         why: "CI and helper transition (B1, B2, B5)",
+        until: "PR-D",
+    },
+    Allow {
+        globs: &["crates/lil-cli/src/dev/workflows.rs"],
+        lines_with: &[
+            // Pins of the pick step's transition branch.
+            "crates/ww-cli/Cargo.toml",
+            "pkg=ww-cli",
+            "first and then `crates/ww-cli`",
+            // Lists that recognise either crate's build or binary (negative checks).
+            "\"-p ww-cli\", \"-p lil-cli\"]",
+            "\"ww.exe \", \"lil.exe \"",
+            "[\"ww-cli\", \"lil-cli\", \"ww.exe\", \"lil.exe\"",
+            // The legacy secret (RN5).
+            "WW_PRIVACY_DENYLIST",
+        ],
+        why: "CI transition pins: the pick step's ww-cli branch, the either-crate lists and the \
+              legacy secret only, never a tree-builder `-p ww-cli -- dev` pin (B1 follow-up)",
         until: "PR-D",
     },
     Allow {
@@ -156,20 +175,27 @@ const ALLOW: &[Allow] = &[
     },
 ];
 
-/// Case-insensitive `worldwright`, or `ww` in any case with no ASCII letter or digit on
-/// either side.
+/// Case-insensitive `worldwright`; `ww` in any case with no ASCII letter or digit on either
+/// side; or a PascalCase identifier `Ww` + uppercase letter with no ASCII letter or digit
+/// before it (`WwOutput`, `WwChild`; ruling RN8).
 fn is_stale(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if lower.contains("worldwright") {
         return true;
     }
-    let b = lower.as_bytes();
-    (0..b.len().saturating_sub(1)).any(|i| {
-        b[i] == b'w'
-            && b[i + 1] == b'w'
-            && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
-            && (i + 2 == b.len() || !b[i + 2].is_ascii_alphanumeric())
-    })
+    let starts_word = |b: &[u8], i: usize| i == 0 || !b[i - 1].is_ascii_alphanumeric();
+    let l = lower.as_bytes();
+    let bare = (0..l.len().saturating_sub(1)).any(|i| {
+        l[i] == b'w'
+            && l[i + 1] == b'w'
+            && starts_word(l, i)
+            && (i + 2 == l.len() || !l[i + 2].is_ascii_alphanumeric())
+    });
+    let o = text.as_bytes();
+    let pascal = (0..o.len().saturating_sub(2)).any(|i| {
+        o[i] == b'W' && o[i + 1] == b'w' && o[i + 2].is_ascii_uppercase() && starts_word(o, i)
+    });
+    bare || pascal
 }
 
 /// Whether `pattern` (`*` within a segment, `**` across whole segments) matches `path`.
@@ -350,6 +376,13 @@ fn is_stale_finds_old_names_and_ignores_lookalikes() {
         "a.worldwright-local",
         "ww",
         "(Ww)",
+        // RN8: PascalCase identifiers.
+        "WwOutput",
+        "struct WwChild {",
+        "Vec<WwOutput>",
+        "let c: WwChild = x;",
+        "WwQtRoot",
+        "(WwW)",
     ] {
         assert!(is_stale(hit), "{hit:?} should be a hit");
     }
@@ -365,6 +398,16 @@ fn is_stale_finds_old_names_and_ignores_lookalikes() {
         "aww",
         "",
         "w",
+        // RN8 needs `Ww`, then an uppercase letter, at the start of a word.
+        "Www",
+        "Wwise",
+        "WwiseBank",
+        "MyWwOutput",
+        "XWwOutput",
+        "Ww2Output",
+        "WWOutput",
+        // camelCase is not covered by RN8 (`_wwFlags` exists only in spike history).
+        "wwOutput",
     ] {
         assert!(!is_stale(miss), "{miss:?} should not be a hit");
     }
@@ -398,6 +441,54 @@ fn allowlist_is_case_sensitive_so_the_old_spec_path_is_not_allowed() {
         "legacy_home_dir = \".worldwright\""
     ));
     assert!(!allowed("Docs/superpowers/plans/x.md", "Worldwright"));
+}
+
+/// B1 follow-up: `workflows.rs` may say `ww-cli` only in the pick step's pins, the
+/// either-crate lists and the legacy secret. Its tree-builder pins must be reported until
+/// Task B2 changes them to `-p lil-cli`.
+#[test]
+fn tree_builder_pins_in_workflows_rs_are_reported() {
+    const PATH: &str = "crates/lil-cli/src/dev/workflows.rs";
+    // The tree-builder pins as they stand at the start of PR-B.
+    for line in [
+        "        \"cargo run --locked -p ww-cli -- dev spec-tests\",",
+        "        \"cargo run --locked -p ww-cli -- dev spec-report\",",
+        "                .any(|st| run(st).contains(\"cargo run --locked -p ww-cli -- dev spec-tests\")),",
+        "/// tree itself keep `-p ww-cli` until that tree renames the crate.",
+    ] {
+        assert!(is_stale(line));
+        assert!(!allowed(PATH, line), "{line:?} must be reported");
+    }
+    // The pick-step pins, either-crate lists and the legacy secret stay allowed.
+    for line in [
+        "    for crate_path in [\"crates/lil-cli/Cargo.toml\", \"crates/ww-cli/Cargo.toml\"] {",
+        "                \"elif [ -f crates/ww-cli/Cargo.toml ]; then\",",
+        "                \"pkg=ww-cli\",",
+        "                        && [\"-p \\\"$pkg\\\"\", \"-p ww-cli\", \"-p lil-cli\"]",
+        "                let runs_binary = [\"\\\"$CLI_BIN\\\" \", \"ww.exe \", \"lil.exe \", \"\\\"$WW\\\" \"]",
+        "                for name in [\"ww-cli\", \"lil-cli\", \"ww.exe\", \"lil.exe\", \"\\\"$WW\\\"\"] {",
+        "    (\"WW_PRIVACY_DENYLIST\", \"${{ secrets.WW_PRIVACY_DENYLIST }}\"),",
+        "        \"$WW\",",
+    ] {
+        assert!(allowed(PATH, line), "{line:?}");
+    }
+    // And in the real tree (at either crate path), no line of `workflows.rs` that pins a
+    // tree-builder run is allowed.
+    for h in all_hits() {
+        let at_lil = h.path.replacen("crates/ww-cli/", "crates/lil-cli/", 1);
+        if at_lil == PATH
+            && (h.text.contains("-p ww-cli -- dev")
+                || h.text.contains("cargo run --locked -p ww-cli"))
+        {
+            assert!(
+                !allowed(PATH, &h.text),
+                "{}:{}: {} must be reported",
+                h.path,
+                h.line,
+                h.text.trim()
+            );
+        }
+    }
 }
 
 /// Ruling RN7: in the workflows only the pick step's transition branch may say `ww-cli`. The
