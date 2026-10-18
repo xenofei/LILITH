@@ -728,11 +728,12 @@ impl Inner {
             json!({"kind": "sample", "snapshot": serde_json::to_value(&out.snapshot)
                 .unwrap_or(Value::Null)}),
         );
+        // Counted before the hooks run: a hook's `sample_count` is this sample's.
+        self.samples.send_modify(|n| *n += 1);
         let hooks: Vec<SampleHook> = lock(&self.hooks).clone();
         for hook in hooks {
             hook();
         }
-        self.samples.send_modify(|n| *n += 1);
     }
 }
 
@@ -870,8 +871,8 @@ impl Telemetry {
         self.inner.busy.load(Ordering::Relaxed)
     }
 
-    /// Calls `f` after every sample (the scheduler's VRAM re-check). It runs on the sampler's
-    /// thread, so it must not block.
+    /// Calls `f` after every sample, once it is counted ([`Telemetry::sample_count`]): the
+    /// scheduler's VRAM re-check. It runs on the sampler's thread, so it must not block.
     pub fn on_sample(&self, f: Box<dyn Fn() + Send + Sync>) {
         lock(&self.inner.hooks).push(Arc::from(f));
     }

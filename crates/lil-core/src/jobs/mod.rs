@@ -367,6 +367,9 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
+    /// Every kind, [`EngineKind::Test`] included.
+    pub const ALL: [EngineKind; 2] = [EngineKind::ComfyUi, EngineKind::Test];
+
     pub fn wire(self) -> &'static str {
         match self {
             EngineKind::ComfyUi => "comfyui",
@@ -381,9 +384,7 @@ impl EngineKind {
 
     /// The `engine` column of a jobs row, which a test may have written as `"test"`.
     pub fn from_column(s: &str) -> Option<EngineKind> {
-        [EngineKind::ComfyUi, EngineKind::Test]
-            .into_iter()
-            .find(|e| e.wire() == s)
+        EngineKind::ALL.into_iter().find(|e| e.wire() == s)
     }
 }
 

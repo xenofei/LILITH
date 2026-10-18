@@ -112,6 +112,8 @@ impl JobHandler for Gates {
 struct Engines {
     pids: HashMap<EngineKind, Vec<u32>>,
     unloads: watch::Sender<Vec<EngineKind>>,
+    /// An unload that never finishes.
+    stuck: bool,
 }
 
 impl EngineControl for Engines {
@@ -121,16 +123,47 @@ impl EngineControl for Engines {
 
     fn unload<'a>(&'a self, e: EngineKind) -> BoxFuture<'a, ()> {
         self.unloads.send_modify(|u| u.push(e));
+        if self.stuck {
+            return Box::pin(std::future::pending());
+        }
         Box::pin(std::future::ready(()))
     }
 }
 
 type ReadEvent = (String, Value);
 
+/// One answer of the jobs' admission: the job's need, the telemetry sample it was asked at,
+/// and the answer.
+type Asked = (Option<u64>, u64, Admit);
+
+/// The scheduler as the jobs' admission, recording each answer it gives them.
+struct Recording {
+    scheduler: Arc<GpuScheduler>,
+    telemetry: Arc<Telemetry>,
+    asked: std::sync::Mutex<Vec<Asked>>,
+}
+
+impl Admission for Recording {
+    fn admit(&self, spec: &JobSpec) -> Admit {
+        let answer = self.scheduler.admit(spec);
+        self.asked.lock().unwrap().push((
+            spec.vram_need_mib,
+            self.telemetry.sample_count(),
+            answer,
+        ));
+        answer
+    }
+
+    fn busy(&self, busy: bool) {
+        self.scheduler.busy(busy);
+    }
+}
+
 struct Rig {
     jobs: Arc<Jobs>,
     telemetry: Arc<Telemetry>,
     scheduler: Arc<GpuScheduler>,
+    recording: Arc<Recording>,
     gates: Arc<Gates>,
     events: Arc<EventBus>,
     clock: Arc<FakeClock>,
@@ -186,7 +219,12 @@ impl Rig {
             TickMode::Manual,
         );
         let scheduler = GpuScheduler::new(telemetry.clone(), engines);
-        jobs.set_admission(scheduler.clone());
+        let recording = Arc::new(Recording {
+            scheduler: scheduler.clone(),
+            telemetry: telemetry.clone(),
+            asked: std::sync::Mutex::default(),
+        });
+        jobs.set_admission(recording.clone());
         let kicked = Arc::downgrade(&jobs);
         telemetry.on_sample(Box::new(move || {
             if let Some(jobs) = kicked.upgrade() {
@@ -202,6 +240,7 @@ impl Rig {
             jobs,
             telemetry,
             scheduler,
+            recording,
             gates,
             events,
             clock,
@@ -660,29 +699,99 @@ async fn with_nvml_a_job_waits_for_a_reading_instead_of_running_unchecked() {
     rig.shutdown().await;
 }
 
-/// I2a, ruling P3-R16: a need above the card counts as total − 512 MiB. The job waits until the
-/// card is that free, then runs, and the lane goes on with the job behind it.
+/// I2a, ruling P3-R16 as amended: a need above the card counts as total − 512 MiB, and on a card
+/// that never empties (600 MiB always held by another process) the job runs once the lane is
+/// idle, the other engine holding VRAM has been unloaded, and its free VRAM has not risen for
+/// 3 consecutive samples; a rise starts the count again. The lane then goes on.
 #[tokio::test] // spec: ARCH-071
-async fn a_need_above_the_card_waits_for_the_freest_card_then_runs() {
+async fn a_need_above_the_card_runs_once_free_vram_stops_rising() {
+    let engines = Arc::new(Engines {
+        pids: HashMap::from([(EngineKind::ComfyUi, vec![200])]),
+        ..Engines::default()
+    });
+    // free = min(16384 − 600 − 2000, nvml_free) − 512 = nvml_free − 512 throughout.
+    let nvml = [11000, 11500, 11500, 12000, 12000, 12000, 12000];
     let rig = Rig::new(
-        Some(script(vec![gpu(15000), gpu(TOTAL)], vec![mem(&[])])),
-        Arc::new(NoEngines),
+        Some(script(
+            nvml.iter().map(|f| gpu(*f)).collect(),
+            vec![mem(&[(100, 600), (200, 2000)])],
+        )),
+        engines.clone(),
     )
     .await;
     rig.telemetry.tick(1).await;
-    assert_eq!(
-        rig.scheduler.admit(&heavy(20000, None)),
-        Admit::WaitForVram {
-            need_mib: TOTAL - 512,
-            free_mib: 14488
-        }
-    );
     let big = rig.submit(heavy(20000, None)).await;
     let small = rig.submit(heavy(100, None)).await;
     rig.in_substatus(&big.job_id, "waiting_for_vram").await;
-    rig.telemetry.tick(1).await;
+    // ComfyUI holds VRAM, so it is asked to unload.
+    tokio::time::timeout(
+        DEADLINE,
+        engines.unloads.subscribe().wait_for(|u| !u.is_empty()),
+    )
+    .await
+    .expect("the other engine was never asked to unload")
+    .unwrap();
+    for _ in 2..=nvml.len() {
+        rig.telemetry.tick(1).await;
+    }
     assert_eq!(rig.finished(&big.job_id).await["status"], "succeeded");
     assert_eq!(rig.finished(&small.job_id).await["status"], "succeeded");
+    assert_eq!(*engines.unloads.borrow(), [EngineKind::ComfyUi]);
+    // Samples 1–7 read 10488, 10988 (rises: 0), 10988 (1), 11488 (rises: 0), then 1, 2, 3.
+    let asked: Vec<(u64, Admit)> = rig
+        .recording
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(need, _, _)| *need == Some(20000))
+        .map(|(_, sample, answer)| (*sample, *answer))
+        .collect();
+    let first_go = asked.iter().find(|(_, a)| *a == Admit::Go).map(|(s, _)| *s);
+    assert_eq!(first_go, Some(7), "{asked:?}");
+    let free = |nvml_free: u64| Admit::WaitForVram {
+        need_mib: TOTAL - 512,
+        free_mib: nvml_free - 512,
+    };
+    for (sample, answer) in &asked {
+        if *sample < 7 {
+            let at = usize::try_from(*sample).unwrap() - 1;
+            assert_eq!(*answer, free(nvml[at]), "sample {sample}: {asked:?}");
+        }
+    }
+    rig.shutdown().await;
+}
+
+/// P3-R18: a GPU whose reading stays lost keeps a `gpu-heavy` job waiting, visibly, with no
+/// fallback to unchecked; you can cancel it.
+#[tokio::test] // spec: ARCH-071
+async fn a_lost_gpu_keeps_the_job_waiting_until_you_cancel_it() {
+    let rig = Rig::new(
+        Some(script(
+            vec![gpu(15000), json!({"error": "GPU lost"})],
+            vec![mem(&[])],
+        )),
+        Arc::new(NoEngines),
+    )
+    .await;
+    rig.telemetry.tick(2).await;
+    assert!(rig.telemetry.has_gpu() && rig.telemetry.vram().is_none());
+    let job = rig.submit(heavy(1000, None)).await;
+    rig.in_substatus(&job.job_id, "waiting_for_vram").await;
+    rig.telemetry.tick(5).await;
+    let still = row(&rig, &job.job_id).await;
+    assert_eq!(
+        (still.status, still.substatus, still.vram_unchecked),
+        (JobStatus::Queued, Some(Substatus::WaitingForVram), false)
+    );
+    assert!(rig.gates.started.borrow().is_empty());
+    let cancelled = rig
+        .jobs
+        .cancel(&rig.caller(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, JobStatus::Cancelled);
+    rig.idle().await;
     rig.shutdown().await;
 }
 
@@ -854,6 +963,48 @@ async fn an_overtaken_vram_wait_goes_back_to_waiting() {
         .await
         .unwrap();
     rig.finished(&batch.job_id).await;
+    rig.idle().await;
+    rig.shutdown().await;
+}
+
+/// P3-R16 as amended: flat samples alone don't let an oversized job run while another engine
+/// that holds VRAM hasn't finished unloading.
+#[tokio::test] // spec: ARCH-071
+async fn an_oversized_job_waits_for_the_other_engines_unload() {
+    let engines = Arc::new(Engines {
+        pids: HashMap::from([(EngineKind::ComfyUi, vec![200])]),
+        stuck: true,
+        ..Engines::default()
+    });
+    let rig = Rig::new(
+        Some(script(
+            vec![gpu(12000)],
+            vec![mem(&[(100, 600), (200, 2000)])],
+        )),
+        engines.clone(),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let big = rig.submit(heavy(20000, None)).await;
+    rig.in_substatus(&big.job_id, "waiting_for_vram").await;
+    rig.telemetry.tick(6).await;
+    let asked = rig.recording.asked.lock().unwrap().clone();
+    assert!(
+        asked
+            .iter()
+            .all(|(_, _, a)| matches!(a, Admit::WaitForVram { .. })),
+        "{asked:?}"
+    );
+    assert_eq!(asked.last().map(|(_, sample, _)| *sample), Some(7));
+    assert_eq!(
+        *engines.unloads.borrow(),
+        [EngineKind::ComfyUi],
+        "asked once"
+    );
+    rig.jobs
+        .cancel(&rig.caller(), &JobId(big.job_id.clone()))
+        .await
+        .unwrap();
     rig.idle().await;
     rig.shutdown().await;
 }
