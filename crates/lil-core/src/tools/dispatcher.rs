@@ -40,7 +40,8 @@
 //! those arguments, under the retrying session and the retry's idempotency key: its confirm,
 //! estimate and reserve stages run as for a fresh call (an agent retrying a `destructive` or
 //! `exec` tool's job gets `confirm.unavailable`; a paid one reserves again), and the job it
-//! submits has `retry_of`.
+//! submits has `retry_of`. The call's project is the retried job's, not the one the retrying
+//! session would resolve.
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
 //! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
@@ -88,7 +89,7 @@ use super::stages::{
     SettingsInput, SettleInput,
 };
 use crate::events::EventBus;
-use crate::jobs::{JobId, JobSummary, Jobs, SubmittedSlot};
+use crate::jobs::{JobId, JobSummary, Jobs, RetryPlan, SubmittedSlot};
 use crate::lifecycle::{CallGuard, FollowUp, Lifecycle};
 use crate::pipeline::RecordSlot;
 use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
@@ -463,8 +464,8 @@ impl Inner {
         })
     }
 
-    /// Stages 3–9: the outcome, and the job the call submitted. `retry_of`: the call is a
-    /// retry of that job.
+    /// Stages 3–9: the outcome, and the job the call submitted. `retry`: the call is a retry
+    /// of that job, in that project.
     #[allow(
         clippy::too_many_arguments,
         reason = "the call's parts, each from a different stage"
@@ -477,15 +478,20 @@ impl Inner {
         args: Value,
         idem: Option<IdemRef<'_>>,
         trace_id: &str,
-        retry_of: Option<JobId>,
+        retry: Option<Retrying>,
     ) -> (Outcome<ToolOutput>, Option<JobId>) {
         let hooks = &self.hooks;
         let d = tool.descriptor();
-        // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid.
+        // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid. A
+        // retry runs in the retried job's project.
         let named = named_project(d, &args);
+        let (retry_of, retry_project) = retry.map_or((None, None), |r| (Some(r.of), r.project));
         let project = match &workspace {
             None => None,
-            Some(open) => Some(self.project_of(session, open, named.as_deref()).await),
+            Some(open) => Some(match retry_project {
+                Some(p) => p,
+                None => self.project_of(session, open, named.as_deref()).await,
+            }),
         };
         // 3. Settings; 4. estimate.
         let request = declares(d, "settings")
@@ -648,7 +654,7 @@ impl Inner {
     /// `job.retry` (module docs, "Retries"): the job its call submitted.
     async fn retry(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
         let caller = ctx.job_caller();
-        let origin = ctx.jobs.retry_origin(&caller, id).await?;
+        let RetryPlan { origin, project } = ctx.jobs.retry_origin(&caller, id).await?;
         let not_retryable =
             |why: String| ErrorBody::new(&codes::JOB_NOT_RETRYABLE, why, ctx.trace_id.clone());
         let session = &ctx.session;
@@ -683,7 +689,10 @@ impl Inner {
             origin.arguments,
             idem,
             &ctx.trace_id,
-            Some(id.clone()),
+            Some(Retrying {
+                of: id.clone(),
+                project,
+            }),
         ))
         .await;
         match outcome {
@@ -759,6 +768,12 @@ impl Redispatch {
         };
         inner.retry(ctx, id).await
     }
+}
+
+/// A call that retries job `of`, in the job's project.
+struct Retrying {
+    of: JobId,
+    project: Option<String>,
 }
 
 /// The idempotency hash of a call of `name` with `args`.

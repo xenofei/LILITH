@@ -458,6 +458,22 @@ pub async fn update(
     .await
 }
 
+/// The automatic re-run of `job_id` (CORE-128): the first job whose `retry_of` it is and that
+/// has no idempotency key (a `job.retry` always has one).
+pub async fn auto_rerun_of(db: &StateDb, job_id: &str) -> Result<Option<String>, StateError> {
+    let job_id = job_id.to_string();
+    db.call(move |conn| {
+        conn.query_row(
+            "SELECT job_id FROM jobs WHERE retry_of = ?1 AND idem_key IS NULL ORDER BY seq LIMIT 1",
+            params![job_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| sql(&e))
+    })
+    .await
+}
+
 /// The rows without a final status (recovery), by `seq`.
 pub async fn open_rows(db: &StateDb) -> Result<Vec<JobRow>, StateError> {
     db.call(|conn| {

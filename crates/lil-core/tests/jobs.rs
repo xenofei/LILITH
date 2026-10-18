@@ -1337,12 +1337,13 @@ async fn retry_only_failed_or_cancelled() {
         .await
         .unwrap();
     assert_eq!(
-        origin,
+        origin.origin,
         JobOrigin {
             tool: "t.submit".into(),
             arguments: json!({})
         }
     );
+    assert_eq!(origin.project, None, "a suite job has no project");
     for id in [&ok.job_id, &running.job_id] {
         let e = fx
             .jobs
@@ -2032,10 +2033,12 @@ async fn an_interrupted_unknown_job_is_resolved_only_by_you() {
     let resolved = fx.jobs.cancel(&you, &id).await.unwrap();
     assert_eq!(resolved.status, JobStatus::Cancelled);
     assert!(resolved.error.is_none());
+    // N4: a distinct outcome, so Caps settles the reservation at its reserved amount (P3-R15)
+    // instead of releasing it as for an ordinary cancel.
     let want = [(
         job.job_id.clone(),
         Some("rv_u".into()),
-        "job.cancelled".to_string(),
+        "job.resolved_unknown".to_string(),
         false,
     )];
     assert_eq!(seen(&log), want);
@@ -2188,4 +2191,120 @@ async fn jobs_list_gives_no_cursor_on_the_last_page() {
     assert_eq!((last.len(), next), (1, None));
     assert_ne!(first[0].job_id, last[0].job_id);
     fx.shutdown().await;
+}
+
+/// Earlier behaviour (re-review observation): an agent never retries a job that was already re-run
+/// automatically (the re-run is the retry); it is told which job that is. You still may.
+#[tokio::test(start_paused = true)] // spec: CORE-128, CORE-146, QA-009
+async fn an_agent_never_retries_a_job_that_was_re_run_automatically() {
+    let fx = Fx::suite().await;
+    let lost = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Agent,
+            json!({"fail": "interrupted"}),
+        ))
+        .await;
+    fx.finished(&lost.job_id).await;
+    let rerun = fx
+        .event_until(|d| d["kind"] == "job" && d["job"]["retry_of"] == lost.job_id.as_str())
+        .await
+        .unwrap();
+    let rerun = rerun["job"]["job_id"].as_str().unwrap().to_string();
+    fx.finished(&rerun).await;
+    let id = JobId(lost.job_id.clone());
+    for agent in [CallerKind::Cli, CallerKind::Mcp, CallerKind::Assistant] {
+        let e = fx
+            .jobs
+            .retry_origin(&fx.ctx_as(agent.clone(), None, "t_agent"), &id)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "job.not_retryable", "{agent}");
+        assert_eq!(e.data.as_ref().unwrap()["rerun"], rerun.as_str(), "{agent}");
+        assert!(e.message.contains(&rerun), "{}", e.message);
+    }
+    let you = fx.ctx_as(CallerKind::Ui("app".into()), None, "t_ui");
+    fx.jobs.retry_origin(&you, &id).await.unwrap();
+    // The re-run itself was never re-run, so it can be retried.
+    fx.jobs
+        .retry_origin(&fx.ctx(), &JobId(rerun.clone()))
+        .await
+        .unwrap();
+    fx.shutdown().await;
+}
+
+/// N3: a job whose Record step is still running when the shutdown's grace ends is left to
+/// write its own final state, so the row agrees with the run it recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-021, ARCH-075
+async fn a_record_step_that_outlasts_the_grace_still_ends_the_row_as_recorded() {
+    let fx = Fx::workspace().await;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, go_rx) = (Mutex::new(entered_tx), Mutex::new(go_rx));
+    // The hook runs on a blocking thread, in the Record step, after its manifest edit.
+    fx.failpoints.on(
+        "store.after_manifest",
+        Box::new(move || {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+            Ok(())
+        }),
+    );
+    let job = fx
+        .submit(spec(Lane::Cpu, Priority::Agent, json!({"record": true})))
+        .await;
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the Record step began");
+    fx.jobs.persist_interrupted_step().run().await;
+    let row = fx.row(&job.job_id).await;
+    assert_eq!(
+        (row.status, row.substatus),
+        (JobStatus::Running, Some(Substatus::Ingesting)),
+        "the shutdown step never marks a job in its Record step"
+    );
+    go_tx.send(()).unwrap();
+    let end = fx.finished(&job.job_id).await;
+    assert_eq!(end.status, JobStatus::Succeeded, "{end:?}");
+    assert!(end.result.unwrap().structured["handoff"].is_object());
+    fx.shutdown().await;
+}
+
+/// N1: a retry runs in the retried job's project, not in the one the retrying session would
+/// resolve (its active project).
+#[test] // spec: ARCH-088, ARCH-098, CORE-146
+fn a_retry_runs_in_the_retried_jobs_project() {
+    let env = TestEnv::new();
+    let ws = env.copy_fixture_workspace("jobs");
+    env.register_workspace(&ws, true);
+    let _core = lil_core::start_in_thread(lil_core::CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        ..lil_core::CoreConfig::for_env(env.env.clone()).unwrap()
+    });
+    let session = |project: &str| {
+        let mut pipe = lil_testkit::RawPipe::connect(&env);
+        let hello = pipe.hello(json!({"workspace": env.workspace_id(&ws)}));
+        assert_eq!(hello["result"]["status"], "ok", "{hello}");
+        // A call that names a project makes it the session's active project (ARCH-088).
+        pipe.tool_ok("test.settings", json!({"project": project}), None);
+        pipe
+    };
+    let mut first = session("castle");
+    let job = first.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "fail": "final"}),
+        Some("make"),
+    )["job"]
+        .clone();
+    assert_eq!(job["project"], "castle", "{job}");
+    let id = job["job_id"].as_str().unwrap().to_string();
+    let waited = first.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    assert_eq!(waited["job"]["status"], "failed", "{waited}");
+
+    let mut other = session("sketchbook");
+    let retried = other.tool_ok("job.retry", json!({"job_id": id}), Some("again"));
+    assert_eq!(retried["job"]["project"], "castle", "{retried}");
 }

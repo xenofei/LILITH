@@ -35,9 +35,10 @@ use super::queue::{self, Candidate};
 use super::record::{self, Change, Inserted, JobRow};
 use super::{
     Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, DISK_MARGIN_BYTES, JOB_CANCELLED,
-    JOB_NOT_STARTED, JobCaller, JobCompletion, JobCtx, JobDone, JobFailure, JobFilter, JobHandler,
-    JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS, MAX_WAIT,
-    NoReservations, Priority, Progress, Reservations, Substatus, backoff,
+    JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion, JobCtx, JobDone, JobFailure,
+    JobFilter, JobHandler, JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane,
+    MAX_ATTEMPTS, MAX_WAIT, NoReservations, Priority, Progress, Reservations, RetryPlan, Substatus,
+    backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -49,6 +50,15 @@ use crate::workspace::{Access, OpenWorkspace, WorkspaceHub};
 /// The error a cancelled job's completions get as its outcome ([`super::is_cancelled`]).
 const CANCELLED: CodeSpec = CodeSpec {
     code: JOB_CANCELLED,
+    category: ErrorCategory::Cancelled,
+    retry: RetryPolicy::AfterResolve,
+    provisional: true,
+};
+
+/// The error a resolved `interrupted_unknown` job's completions get
+/// ([`super::resolved_unknown`]).
+const RESOLVED_UNKNOWN: CodeSpec = CodeSpec {
+    code: JOB_RESOLVED_UNKNOWN,
     category: ErrorCategory::Cancelled,
     retry: RetryPolicy::AfterResolve,
     provisional: true,
@@ -152,6 +162,8 @@ struct Active {
     running: bool,
     /// Its end is being recorded: the completions, the Record step, the final state.
     completing: bool,
+    /// Its Record step has begun: the shutdown step leaves it to write its final state.
+    recording: bool,
     cancel: watch::Sender<bool>,
     cancelling: bool,
     preempted: bool,
@@ -619,6 +631,7 @@ impl Shared {
                     overtaken: 0,
                     running: false,
                     completing: false,
+                    recording: false,
                     cancel: watch::Sender::new(false),
                     cancelling: false,
                     preempted: false,
@@ -1030,7 +1043,10 @@ impl Shared {
     async fn complete(self: &Arc<Self>, info: &Info, attempt: u32, end: End) {
         {
             let mut q = self.queue();
-            if q.closed {
+            // A job whose end began before the shutdown step (a queued job being cancelled)
+            // still ends: the step waits for it.
+            let begun = q.jobs.get(info.id.as_str()).is_some_and(|a| a.completing);
+            if q.closed && !begun {
                 tracing::info!(job_id = %info.id, "a job ended after the shutdown step; its end is not recorded");
                 return;
             }
@@ -1089,7 +1105,16 @@ impl Shared {
         }
         let now = self.now();
         let c = match end {
-            End::Succeeded(done) => self.recorded(info, done, now).await,
+            End::Succeeded(done) => match self.recorded(info, done, now).await {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(
+                        job_id = id,
+                        "the shutdown step marked the job interrupted before its Record step; its end is not recorded"
+                    );
+                    return;
+                }
+            },
             End::Failed(error) => {
                 let mut c = Change::finished(JobStatus::Failed);
                 c.error = Some(Some(error));
@@ -1146,10 +1171,20 @@ impl Shared {
 
     /// The final change of a job that worked: its Record step first (CORE-015 step 9), whose
     /// hand-off block and warnings go into the result, as the inline Record stage does. A
-    /// Record step that fails before the manifest edit fails the job.
-    async fn recorded(&self, info: &Info, mut done: JobDone, now: i64) -> Change {
+    /// Record step that fails before the manifest edit fails the job. `None`: the shutdown
+    /// step gave up on the job before its Record step began, so nothing is recorded.
+    async fn recorded(&self, info: &Info, mut done: JobDone, now: i64) -> Option<Change> {
         let mut structured = std::mem::take(&mut done.structured);
         if let Some(plan) = done.record.take() {
+            // Claimed under the queue's lock: from here on the shutdown step leaves the job to
+            // write its own final state, so the row agrees with the recorded run.
+            {
+                let mut q = self.queue();
+                match q.jobs.get_mut(info.id.as_str()) {
+                    Some(a) if a.completing => a.recording = true,
+                    _ => return None,
+                }
+            }
             let recorded = match info.scope.workspace() {
                 None => Err(ErrorBody::new(
                     &codes::CORE_BUG,
@@ -1189,7 +1224,7 @@ impl Shared {
                     let mut c = Change::finished(JobStatus::Failed);
                     c.error = Some(Some(error));
                     c.finished_utc = Some(now);
-                    return c;
+                    return Some(c);
                 }
             }
         }
@@ -1200,7 +1235,7 @@ impl Shared {
             artifacts: done.artifacts,
         });
         c.finished_utc = Some(now);
-        c
+        Some(c)
     }
 
     /// The job leaves the queue and its lane.
@@ -1307,7 +1342,20 @@ impl Shared {
                 () = tokio::time::sleep_until(deadline) => break,
             }
         }
-        let late: Vec<Info> = self.queue().jobs.drain().map(|(_, a)| a.info).collect();
+        // A job in its Record step writes its own final state (module docs, "Crash windows").
+        let late: Vec<Info> = {
+            let mut q = self.queue();
+            let ids: Vec<String> = q
+                .jobs
+                .iter()
+                .filter(|(_, a)| !a.recording)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| q.jobs.remove(&id))
+                .map(|a| a.info)
+                .collect()
+        };
         for info in &late {
             tracing::warn!(job_id = %info.id, "a job's completions did not finish before the shutdown; it is marked interrupted");
             self.persist_one(info, true).await;
@@ -1695,14 +1743,13 @@ impl Jobs {
             && let Some(ctx) = s.ctx_from_row(&row, scope)
         {
             tracing::info!(job_id = %row.job_id, "an interrupted_unknown job is resolved: cancelled");
-            s.run_completions(
-                &ctx,
-                &Outcome::Error {
-                    error: cancelled_error(&row.trace_id),
-                },
-                None,
-            )
-            .await;
+            let error = ErrorBody::new(
+                &RESOLVED_UNKNOWN,
+                "You resolved the job, which may or may not have run.",
+                &row.trace_id,
+            );
+            s.run_completions(&ctx, &Outcome::Error { error }, None)
+                .await;
         }
         let after = record::get(scope.db(), &row.job_id)
             .await
@@ -1712,17 +1759,19 @@ impl Jobs {
             .ok_or_else(|| job_unknown(&row.job_id, &caller.trace_id))
     }
 
-    /// The tool call that made failed or cancelled job `id` of `caller`'s scope, for
-    /// `job.retry` to dispatch again (CORE-146). Never an `interrupted_unknown` job.
+    /// The tool call that made failed or cancelled job `id` of `caller`'s scope, and the job's
+    /// project, for `job.retry` to dispatch again (CORE-146). Never an `interrupted_unknown`
+    /// job; for an agent, never a job that was re-run automatically already (CORE-128: the
+    /// re-run is the retry).
     ///
     /// # Errors
-    /// `job.unknown`; `job.not_retryable` for any other state, or a job no tool call made;
-    /// `state.unavailable`.
+    /// `job.unknown`; `job.not_retryable` for any other state, a job no tool call made, or an
+    /// agent's retry of a re-run job (its `data.rerun` names the re-run); `state.unavailable`.
     pub async fn retry_origin(
         &self,
         caller: &JobCaller,
         id: &JobId,
-    ) -> Result<JobOrigin, ErrorBody> {
+    ) -> Result<RetryPlan, ErrorBody> {
         let s = &self.shared;
         let trace_id = &caller.trace_id;
         let scope = s.scope_of(caller);
@@ -1742,10 +1791,25 @@ impl Jobs {
                     .map_or_else(|| row.status.wire().to_string(), |s| s.wire())
             )));
         }
-        row.origin.ok_or_else(|| {
+        if caller.caller.is_agent()
+            && let Some(rerun) = record::auto_rerun_of(scope.db(), id.as_str())
+                .await
+                .map_err(|e| state_unavailable(&e, trace_id))?
+        {
+            let mut error = not_retryable(format!(
+                "Job {id} was re-run automatically as job {rerun}; follow that job instead."
+            ));
+            error.data = Some(json!({ "rerun": rerun }));
+            return Err(error);
+        }
+        let origin = row.origin.ok_or_else(|| {
             not_retryable(format!(
                 "Job {id} was not started by a tool call, so there is nothing to run again."
             ))
+        })?;
+        Ok(RetryPlan {
+            origin,
+            project: row.project,
         })
     }
 
@@ -1853,5 +1917,169 @@ impl SnapshotProvider for JobSnapshots {
             }
             unknown()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lil_platform::fs::SystemProbe;
+    use lil_testkit::{FakeClock, SeqIds, TestEnv};
+
+    /// Runs `t.hold` jobs until they are cancelled.
+    struct Hold;
+
+    impl JobHandler for Hold {
+        fn kind(&self) -> &'static str {
+            "t.hold"
+        }
+
+        fn run<'a>(
+            &'a self,
+            job: &'a JobCtx,
+        ) -> super::super::JobFuture<'a, Result<JobDone, JobFailure>> {
+            Box::pin(async move {
+                let mut cancel = job.cancel.clone();
+                let _ = cancel.wait_for(|c| *c).await;
+                Err(JobFailure::Final(cancelled_error(&job.trace_id)))
+            })
+        }
+
+        fn cancel_in_engine<'a>(&'a self, _job: &'a JobCtx) -> super::super::JobFuture<'a, ()> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// Logs `<job> <outcome code> <reservation>` for each completion.
+    struct Ends(Arc<Mutex<Vec<String>>>);
+
+    impl JobCompletion for Ends {
+        fn completed<'a>(
+            &'a self,
+            job: &'a JobCtx,
+            outcome: &'a Outcome<ToolOutput>,
+            _done: Option<&'a JobDone>,
+        ) -> super::super::JobFuture<'a, ()> {
+            let code = match outcome {
+                Outcome::Error { error } => error.code.clone(),
+                _ => "ok".to_string(),
+            };
+            lock(&self.0).push(format!(
+                "{} {code} {}",
+                job.id,
+                job.reservation.as_deref().unwrap_or("-")
+            ));
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    fn caller(reservation: Option<&str>) -> JobCaller {
+        JobCaller {
+            caller: lil_protocol::CallerKind::Cli,
+            idem_scope: "cli|none".into(),
+            workspace: None,
+            trace_id: "t_unit".into(),
+            idem_key: None,
+            call_id: "c_0000000000000001".into(),
+            reservation: reservation.map(str::to_string),
+            submitted: Arc::new(super::super::SubmittedSlot::new()),
+            origin: None,
+            retry_of: None,
+        }
+    }
+
+    fn hold() -> JobSpec {
+        JobSpec {
+            kind: "t.hold",
+            lane: Lane::Cpu,
+            priority: Priority::Agent,
+            module: "test".into(),
+            args: json!({}),
+            project: None,
+            asset_id: None,
+            doc_id: None,
+            expected_secs: 10,
+            expected_output_bytes: 0,
+            vram_need_mib: None,
+            engine: None,
+            group: None,
+            external_side_effects: false,
+        }
+    }
+
+    /// N2: a cancel of a queued job that races the shutdown step (its end has begun when the
+    /// step closes the queue) still ends the job at once as cancelled, with its completions
+    /// releasing the reservation; the step doesn't wait out its grace for it.
+    #[tokio::test(start_paused = true)] // spec: ARCH-021, CORE-088, CORE-146
+    async fn a_queued_cancel_that_races_the_shutdown_step_ends_at_once() {
+        let env = TestEnv::new();
+        let states = Arc::new(StateRegistry::open(&env.env, Arc::new(|_: &str| {})).unwrap());
+        let clock: Arc<dyn Clock> = FakeClock::new();
+        let events = Arc::new(EventBus::new(clock.clone()));
+        let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
+        let hub = WorkspaceHub::new(
+            env.env.clone(),
+            states.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            FailPoints::none(),
+            Arc::new(SystemProbe),
+            Default::default(),
+        );
+        let jobs = Jobs::new(states.clone(), hub, events, clock, ids, FailPoints::none());
+        jobs.register(Arc::new(Hold));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        jobs.add_completion(Arc::new(Ends(log.clone())));
+        let running = jobs.submit(&caller(None), hold()).await.unwrap();
+        let queued = jobs.submit(&caller(Some("rv_q")), hold()).await.unwrap();
+        let shared = jobs.shared.clone();
+        while !shared
+            .queue()
+            .jobs
+            .get(&running.job_id)
+            .is_some_and(|a| a.running)
+        {
+            tokio::task::yield_now().await;
+        }
+        // `job.cancel` has begun the queued job's end (under the queue's lock) ...
+        let info = {
+            let mut q = shared.queue();
+            let a = q.jobs.get_mut(&queued.job_id).unwrap();
+            assert!(!a.running);
+            a.completing = true;
+            a.info.clone()
+        };
+        // ... the shutdown step closes the queue meanwhile ...
+        let step = {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.persist_interrupted().await })
+        };
+        while !shared.queue().closed {
+            tokio::task::yield_now().await;
+        }
+        // ... and the cancel goes on.
+        let begun = tokio::time::Instant::now();
+        shared.complete(&info, 1, End::Cancelled).await;
+        step.await.unwrap();
+        assert_eq!(
+            begun.elapsed(),
+            Duration::ZERO,
+            "the step didn't wait out its grace"
+        );
+        let row = record::get(&states.suite_db(), &queued.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, JobStatus::Cancelled);
+        assert!(
+            lock(&log).contains(&format!("{} job.cancelled rv_q", queued.job_id)),
+            "{:?}",
+            lock(&log)
+        );
+        drop(jobs);
+        tokio::task::spawn_blocking(move || states.close())
+            .await
+            .unwrap();
     }
 }

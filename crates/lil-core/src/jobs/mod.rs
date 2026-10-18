@@ -54,13 +54,19 @@
 //! - a job that was running when a core stopped keeps its reservation (Appendix F's pending
 //!   usage rule): Task 16's startup repair owns it;
 //! - an `interrupted_unknown` job keeps it until you resolve it: `job.cancel` from the app
-//!   makes it `cancelled` and runs its completions (CORE-088, AI-029).
+//!   makes it `cancelled` and runs its completions with an outcome for which
+//!   [`resolved_unknown`] holds (CORE-088, AI-029). Task 16 (ruling P3-R15): that reservation
+//!   is settled at its reserved amount, never released, because the request may have been
+//!   charged; an ordinary cancel ([`is_cancelled`]) releases it.
 //!
 //! **Crash windows.** A job that worked is written `running`/`ingesting` with its result before
 //! its completions run, so a core that dies during the completions or its Record step leaves
 //! a row that recovery marks `interrupted` with that result kept as salvaged artifacts; a
 //! retry is then an informed choice. The `PersistInterrupted` step waits a short while
-//! ([`COMPLETION_GRACE`]) for jobs in their completions, and marks the rest the same way.
+//! ([`COMPLETION_GRACE`]) for jobs in their completions, and marks the rest the same way;
+//! a job whose Record step has begun is never marked by it: its final state is written once
+//! its run is recorded, so the row and the recorded run agree (or, when the core stops first,
+//! the next start's recovery marks it `interrupted` with its result, as after a crash).
 
 pub mod queue;
 pub mod record;
@@ -106,6 +112,16 @@ pub const JOB_CANCELLED: &str = "job.cancelled";
 /// The internal code of the outcome a job's completions get when it never started (a core
 /// stopped while it was `waiting`): nothing was used. Never on the wire either.
 pub const JOB_NOT_STARTED: &str = "job.not_started";
+
+/// The internal code of the outcome an `interrupted_unknown` job's completions get when you
+/// resolve it. Never on the wire.
+pub const JOB_RESOLVED_UNKNOWN: &str = "job.resolved_unknown";
+
+/// Whether `outcome` is the one of an `interrupted_unknown` job you resolved: Task 16 settles
+/// its reservation at the reserved amount (ruling P3-R15), Meter records it as cancelled.
+pub fn resolved_unknown(outcome: &Outcome<ToolOutput>) -> bool {
+    matches!(outcome, Outcome::Error { error } if error.code == JOB_RESOLVED_UNKNOWN)
+}
 
 /// Whether `outcome` is a cancelled job's (Task 15 writes `status: "cancelled"` for it).
 pub fn is_cancelled(outcome: &Outcome<ToolOutput>) -> bool {
@@ -591,6 +607,14 @@ impl SubmittedSlot {
 pub struct JobOrigin {
     pub tool: String,
     pub arguments: serde_json::Value,
+}
+
+/// What `job.retry` runs again: the tool call that made the job, in the job's own project
+/// (the row's; `None` without a workspace or a project).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryPlan {
+    pub origin: JobOrigin,
+    pub project: Option<String>,
 }
 
 /// Who submits a job or asks about one, for which call (CORE-010: `tools` builds it from its
