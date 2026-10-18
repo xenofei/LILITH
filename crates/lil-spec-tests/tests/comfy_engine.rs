@@ -71,15 +71,6 @@ fn gone_within(pid: u32, within: Duration) -> bool {
     !pid_alive(pid)
 }
 
-/// The path of a result artifact on disk: as given when absolute, else under the workspace.
-fn artifact_path(ws: &Path, artifact: &Value) -> PathBuf {
-    let path = artifact["path"]
-        .as_str()
-        .unwrap_or_else(|| panic!("an artifact without a path: {artifact}"));
-    let p = PathBuf::from(path.replace('/', "\\"));
-    if p.is_absolute() { p } else { ws.join(p) }
-}
-
 #[test] // spec: CORE-120, CORE-123, QA-051
 fn comfy_jobs_keep_one_prompt_in_comfyui_with_core_minted_ids() {
     let env = TestEnv::new();
@@ -162,18 +153,18 @@ fn outputs_land_in_staging_with_the_job_prefix() {
         .unwrap_or_else(|| panic!("no result.artifacts: {done}"))
         .clone();
     assert_eq!(artifacts.len(), 2, "{done}");
-    let staging = ws.join(".lilith").join("staging");
+    // Workspace-relative `WsPath`s under the staging folder, named with the job's prefix.
+    let prefix = format!("lil_{}_", &id[2..]);
     for artifact in &artifacts {
-        let path = artifact_path(&ws, artifact);
+        let path = artifact["path"].as_str().unwrap_or_default();
+        let name = path.rsplit('/').next().unwrap_or_default();
         assert!(
-            path.starts_with(&staging),
-            "{} is not under {}",
-            path.display(),
-            staging.display()
+            path.starts_with(".lilith/staging/")
+                && !path.contains('\\')
+                && name.starts_with(&prefix),
+            "{path:?} is not .lilith/staging/…/{prefix}…"
         );
-        assert!(path.is_file(), "{} is missing", path.display());
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with("lil_"), "{name}");
+        assert!(ws.join(path).is_file(), "{path} is missing");
     }
     let left = files_named(&fake.output_dir(), "lil_", "");
     assert!(

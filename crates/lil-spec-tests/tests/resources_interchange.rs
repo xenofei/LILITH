@@ -31,23 +31,6 @@ fn personal_file(env: &TestEnv, kind: &str, id: &str) -> PathBuf {
         .join(format!("{id}.json"))
 }
 
-/// Whether the path `a` (absolute, or relative to the workspace `ws`) and `b` name the same
-/// existing file, ignoring case and separators.
-fn same_path(a: &Value, b: &Path, ws: &Path) -> bool {
-    let a = PathBuf::from(a.as_str().unwrap_or_default().replace('/', "\\"));
-    let a = if a.is_absolute() { a } else { ws.join(a) };
-    let canon = |p: &Path| {
-        std::fs::canonicalize(p)
-            .map(|c| {
-                c.to_string_lossy()
-                    .trim_start_matches(r"\\?\")
-                    .to_ascii_lowercase()
-            })
-            .unwrap_or_default()
-    };
-    !canon(b).is_empty() && canon(&a) == canon(b)
-}
-
 /// A resource file as an outside program reads it.
 fn read_json(path: &Path) -> Value {
     let text = std::fs::read_to_string(path)
@@ -75,7 +58,10 @@ fn resources_round_trip_in_workspace_and_personal_scopes() {
         json!({"kind": "palette", "id": "sunset", "name": "Sunset", "data": palette}),
     );
     let file = workspace_file(&ws, "palette", "sunset");
-    assert!(same_path(&saved["path"], &file, &ws), "{saved}");
+    assert_eq!(
+        saved["path"], "palette/sunset.json",
+        "relative to the library root: {saved}"
+    );
     let on_disk = read_json(&file);
     assert_eq!(on_disk["schema_version"], 1, "{on_disk}");
     assert_eq!(on_disk["kind"], "palette", "{on_disk}");
@@ -94,7 +80,10 @@ fn resources_round_trip_in_workspace_and_personal_scopes() {
         json!({"kind": "model_profile", "id": "fast", "name": "Fast", "data": profile}),
     );
     let file = personal_file(&env, "model_profile", "fast");
-    assert!(same_path(&saved["path"], &file, &ws), "{saved}");
+    assert_eq!(
+        saved["path"], "model_profile/fast.json",
+        "relative to the library root: {saved}"
+    );
     assert_eq!(read_json(&file)["data"], profile);
 
     let list = ok(&mut pipe, "resource.list", json!({}), None);
@@ -116,6 +105,7 @@ fn resources_round_trip_in_workspace_and_personal_scopes() {
         None,
     );
     assert_eq!(got["resource"]["data"], palette, "{got}");
+    assert_eq!(got["path"], "palette/sunset.json", "{got}");
     let got = ok(
         &mut pipe,
         "resource.get",
