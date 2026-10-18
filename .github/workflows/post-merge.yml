@@ -9,8 +9,8 @@
 #   already judged) in a separate worktree, judges before..after with `dev guard --post-merge`,
 #   and if that or the tests failed (or were cancelled), runs `dev revert-pr`. Both run inside
 #   that worktree, because the CLI refuses to work on any checkout but the one it was built in
-#   (R38). The step "Pick the CLI crate" picks whichever CLI crate `before` has (crates/lil-cli,
-#   else crates/ww-cli). It runs with `always()`, so a cancelled or failed test job still gets
+#   (R38). The step "Pick the CLI crate" finds the CLI crate in `before` (crates/lil-cli). It
+#   runs with `always()`, so a cancelled or failed test job still gets
 #   judged. It uses no sccache, since the Actions cache is written by jobs that run unreviewed
 #   code.
 # - post-merge-check also checks who the pushed commits say they are (QA-086): the same CLI, in
@@ -18,8 +18,8 @@
 #   committer and trailer e-mails of every commit in the range. That includes the merge commits
 #   GitHub creates itself when a PR is merged through its API, which no local hook or pre-push scan
 #   ever sees; GitHub writes them with the e-mail the account's web settings give it. Only this
-#   step gets the LIL_PRIVACY_DENYLIST and WW_PRIVACY_DENYLIST secrets, and the binary that reads
-#   them is built from `before`, never from the pushed code. A finding (or a scan that couldn't
+#   step gets the LIL_PRIVACY_DENYLIST secret, and the binary that reads
+#   it is built from `before`, never from the pushed code. A finding (or a scan that couldn't
 #   run) fails the job and opens an issue assigned to the owner. No revert PR: the commit is
 #   already public, and a revert keeps it in history. The issue says what to check and never
 #   repeats the e-mail.
@@ -31,7 +31,7 @@
 # - A push runs the workflow definition from `after`, the commit being judged. A push that edits
 #   this file (or adds a workflow) can change what runs. That is why `.github/workflows/**` is
 #   protected (QA-019, R21, R26), and why main is protected by server-side branch rules.
-# - When `before` has neither crates/lil-cli nor crates/ww-cli, or `before` isn't in main's
+# - When `before` has no crates/lil-cli, or `before` isn't in main's
 #   history, there is no trusted CLI: the check refuses and opens a plain issue. The CLI is never
 #   built from the pushed commit, and the settings are never read from it (R38). The public
 #   repository starts with the CLI on main, so this only happens if main was rewritten.
@@ -154,18 +154,14 @@ jobs:
       - name: Pick the CLI crate
         id: pick
         if: steps.src.outputs.judge == 'true'
-        # In the worktree of `before`, reading `before` itself: lil-cli once it has it, else
-        # ww-cli. Never the pushed commit (R38).
+        # In the worktree of `before`, reading `before` itself. Never the pushed commit (R38).
         working-directory: ${{ steps.src.outputs.dir }}
         run: |
           if git cat-file -e "${BEFORE}:crates/lil-cli/Cargo.toml" 2>/dev/null; then
             pkg=lil-cli
             bin=lil
-          elif git cat-file -e "${BEFORE}:crates/ww-cli/Cargo.toml" 2>/dev/null; then
-            pkg=ww-cli
-            bin=ww
           else
-            echo "::error::main before the push (${BEFORE}) has neither crates/lil-cli nor crates/ww-cli, so there is no trusted CLI to judge with. The CLI is never built from the pushed commit."
+            echo "::error::main before the push (${BEFORE}) has no crates/lil-cli, so there is no trusted CLI to judge with. The CLI is never built from the pushed commit."
             exit 1
           fi
           echo "Building $pkg (--bin $bin) from main before the push (${BEFORE:0:7})."
@@ -218,14 +214,11 @@ jobs:
           # them: only the CLI built from `before` (main as it was before the push, already
           # judged) runs in this step, after it was built in the step above without the secrets;
           # the pushed commits are read as git data and never built or run. This step has no
-          # token. Each variable comes from the secret of its own name: a secret that doesn't
-          # exist arrives as "", and the CLI skips a blank variable, so the check runs while
-          # either secret exists.
+          # token. A secret that doesn't exist arrives as "", and the step then fails.
           LIL_PRIVACY_DENYLIST: ${{ secrets.LIL_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
-          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
         run: |
-          if [ -z "${LIL_PRIVACY_DENYLIST:-}" ] && [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
-            echo "::error::Both the LIL_PRIVACY_DENYLIST and the WW_PRIVACY_DENYLIST secrets are missing or empty, so the identity check can't run."
+          if [ -z "${LIL_PRIVACY_DENYLIST:-}" ]; then
+            echo "::error::The LIL_PRIVACY_DENYLIST secret is missing or empty, so the identity check can't run."
             echo "result=error" >> "$GITHUB_OUTPUT"
             exit 2
           fi

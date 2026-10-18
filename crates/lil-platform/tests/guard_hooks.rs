@@ -68,9 +68,3 @@ fn claude_default_profile_dir_hook_trips() {
 fn legacy_data_dir_hook_trips() {
     let _ = stable_env().legacy_data_dir();
 }
-
-#[test] // spec: QA-040
-#[should_panic(expected = "real LILITH location")]
-fn legacy_local_dir_hook_trips() {
-    let _ = stable_env().legacy_local_dir();
-}

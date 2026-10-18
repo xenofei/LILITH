@@ -67,20 +67,15 @@ const SCAN_STEPS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-/// The denylist variables a scan step sets, each from its own repository secret (ruling RN5):
-/// GitHub expands a secret that doesn't exist to "", and the reader skips a blank variable
-/// (RN4), so the scan works whichever of the two secrets exists.
-const DENYLIST_SECRETS: [(&str, &str); 2] = [
-    (
-        "LIL_PRIVACY_DENYLIST",
-        "${{ secrets.LIL_PRIVACY_DENYLIST }}",
-    ),
-    ("WW_PRIVACY_DENYLIST", "${{ secrets.WW_PRIVACY_DENYLIST }}"),
-];
+/// The denylist variable a scan step sets, from the repository secret of the same name. GitHub
+/// expands a secret that doesn't exist to "", and the step's guard then fails.
+const DENYLIST_SECRETS: [(&str, &str); 1] = [(
+    "LIL_PRIVACY_DENYLIST",
+    "${{ secrets.LIL_PRIVACY_DENYLIST }}",
+)];
 
-/// A scan step's first line: it fails only when both denylist variables are empty (RN5).
-const DENYLIST_GUARD: &str =
-    "if [ -z \"${LIL_PRIVACY_DENYLIST:-}\" ] && [ -z \"${WW_PRIVACY_DENYLIST:-}\" ]; then";
+/// A scan step's first line: it fails when the denylist variable is empty.
+const DENYLIST_GUARD: &str = "if [ -z \"${LIL_PRIVACY_DENYLIST:-}\" ]; then";
 
 fn dir() -> PathBuf {
     workspace_root().join(".github").join("workflows")
@@ -291,23 +286,23 @@ fn collect_uses(y: &Yaml, out: &mut Vec<String>) {
     }
 }
 
-/// Every string in `y`, keys and values at any depth, that names `--package` or the crate
-/// before the rename. A tree-builder job builds its own tree, which has only `lil-cli`, and
-/// names it with `-p` (B2 review).
-fn old_crate_or_package_flag(y: &Yaml, out: &mut Vec<String>) {
+/// Every string in `y`, keys and values at any depth, that names `--package`. A tree-builder
+/// job builds its own tree, which has only `lil-cli`, and names it with `-p` (B2 review). The
+/// crate's name before the rename is caught anywhere in the repo by `no_stale_names`.
+fn package_flag(y: &Yaml, out: &mut Vec<String>) {
     match y {
         Yaml::String(text) => {
-            if ["ww-cli", "--package"].iter().any(|n| text.contains(n)) {
+            if text.contains("--package") {
                 out.push(text.clone());
             }
         }
         Yaml::Hash(h) => {
             for (k, v) in h {
-                old_crate_or_package_flag(k, out);
-                old_crate_or_package_flag(v, out);
+                package_flag(k, out);
+                package_flag(v, out);
             }
         }
-        Yaml::Array(a) => a.iter().for_each(|v| old_crate_or_package_flag(v, out)),
+        Yaml::Array(a) => a.iter().for_each(|v| package_flag(v, out)),
         _ => {}
     }
 }
@@ -456,7 +451,7 @@ fn workflow_job_ids_are_unique_across_workflows() {
 
 /// QA-086 / R32-R34: privacy-check scans every commit of a pushed branch that main doesn't
 /// have; privacy-check-pr scans a PR's commits. Both read the denylist from the Actions secret
-/// and fail when both denylist variables are empty. Like ci-guard (R21), neither ever builds or
+/// and fail when the denylist variable is empty. Like ci-guard (R21), neither ever builds or
 /// runs the scanned code: one checkout, of main; the commits to scan are fetched as git data; the
 /// CLI is built from main's working tree in a step without the secret (so not even main's build
 /// scripts see it), and the built binary runs the scan in the only step that has the secret; no
@@ -500,7 +495,6 @@ fn workflow_privacy_checks_shape() {
             "RUSTC_WRAPPER",
             "SCCACHE_GHA_ENABLED",
             "LIL_PRIVACY_DENYLIST",
-            "WW_PRIVACY_DENYLIST",
         ] {
             assert!(job["env"][key].is_badvalue(), "{file}/{id}: job env {key}");
         }
@@ -628,7 +622,7 @@ fn workflow_privacy_checks_shape() {
         for (k, v) in env {
             assert_eq!(s(&scan["env"][k]), v, "{file}/{id}: env {k}");
         }
-        // Fails closed when both secrets are missing or empty (fork PRs get no secrets).
+        // Fails closed when the secret is missing or empty (fork PRs get no secrets).
         assert_eq!(
             run(scan).lines().next().map(str::trim),
             Some(DENYLIST_GUARD),
@@ -817,13 +811,11 @@ fn workflow_post_merge_check_is_the_only_writer() {
         );
         assert!(!run(st).contains("::warning::"), "{}", run(st));
     }
-    for crate_path in ["crates/lil-cli/Cargo.toml", "crates/ww-cli/Cargo.toml"] {
-        assert!(
-            run(&pick).contains(&format!("git cat-file -e \"${{BEFORE}}:{crate_path}\"")),
-            "{}",
-            run(&pick)
-        );
-    }
+    assert!(
+        run(&pick).contains("git cat-file -e \"${BEFORE}:crates/lil-cli/Cargo.toml\""),
+        "{}",
+        run(&pick)
+    );
     assert!(
         run(&pick).contains("else\n  echo \"::error::"),
         "no crate in `before` refuses: {}",
@@ -942,7 +934,7 @@ fn workflow_post_merge_identity_check_shape() {
         .collect();
     assert_eq!(
         env,
-        ["CLI_BIN", "LIL_PRIVACY_DENYLIST", "WW_PRIVACY_DENYLIST"],
+        ["CLI_BIN", "LIL_PRIVACY_DENYLIST"],
         "no token next to the secret"
     );
     assert_eq!(s(&st["env"]["CLI_BIN"]), "${{ steps.pick.outputs.cli }}");
@@ -972,7 +964,7 @@ fn workflow_post_merge_identity_check_shape() {
     assert_eq!(
         script.lines().next().map(str::trim),
         Some(DENYLIST_GUARD),
-        "fails only when both denylist variables are empty"
+        "fails when the denylist variable is empty"
     );
     assert!(script.contains("exit \"$status\""));
     // BEFORE and AFTER reach it through the job's env.
@@ -1004,7 +996,6 @@ fn workflow_post_merge_identity_check_shape() {
     assert!(script.contains("Keep my email addresses private"));
     for forbidden in [
         "$CLI_BIN",
-        "$WW",
         "privacy-scan",
         "revert-pr",
         "gh pr",
@@ -1168,7 +1159,7 @@ fn workflow_runs_the_cli_where_it_was_built() {
                 .filter(|st| {
                     let script = run(st);
                     script.contains("cargo build")
-                        && ["-p \"$pkg\"", "-p ww-cli", "-p lil-cli"]
+                        && ["-p \"$pkg\"", "-p lil-cli"]
                             .iter()
                             .any(|p| script.contains(p))
                 })
@@ -1176,7 +1167,7 @@ fn workflow_runs_the_cli_where_it_was_built() {
                 .collect();
             for st in &steps {
                 let script = run(st);
-                let runs_binary = ["\"$CLI_BIN\" ", "ww.exe ", "lil.exe ", "\"$WW\" "]
+                let runs_binary = ["\"$CLI_BIN\" ", "lil.exe "]
                     .iter()
                     .any(|r| script.contains(r));
                 if !runs_binary {
@@ -1209,13 +1200,12 @@ fn workflow_text_has_no_first_merge_bootstrap() {
     }
 }
 
-/// Review Focus 4, R21, R33, R38: CI has to keep working while the CLI crate is renamed. Every
-/// judge (the jobs that build the CLI from main, or from `before` in post-merge, and never from
-/// the commits they judge) first runs the step "Pick the CLI crate" in the tree it builds. That
-/// step looks for `crates/lil-cli` first and then `crates/ww-cli`, refuses when neither is there,
-/// and hands `pkg` and `bin` to the one build step. Nothing else in the job names a crate, so
-/// the judge builds whichever crate that tree has. The jobs that build the PR's or the pushed
-/// tree itself name `-p lil-cli`, the crate that tree has, and no other package.
+/// Review Focus 4, R21, R33, R38: every judge (the jobs that build the CLI from main, or from
+/// `before` in post-merge, and never from the commits they judge) first runs the step "Pick the
+/// CLI crate" in the tree it builds. That step looks for `crates/lil-cli`, refuses when it isn't
+/// there, and hands `pkg` and `bin` to the one build step. Nothing else in the job names a
+/// crate. The jobs that build the PR's or the pushed tree itself name `-p lil-cli` and no other
+/// package.
 #[test] // spec: QA-086
 fn judges_pick_the_cli_crate_from_the_tree_they_build() {
     for (file, id) in JUDGES {
@@ -1228,38 +1218,24 @@ fn judges_pick_the_cli_crate_from_the_tree_they_build() {
         let script = run(pick);
         let from_before = file == "post-merge.yml";
 
-        // Both branches, the new crate first, and a refusal when neither is in the tree.
-        let (lil_test, legacy_test) = if from_before {
-            (
-                "if git cat-file -e \"${BEFORE}:crates/lil-cli/Cargo.toml\" 2>/dev/null; then",
-                "elif git cat-file -e \"${BEFORE}:crates/ww-cli/Cargo.toml\" 2>/dev/null; then",
-            )
+        // The crate, and a refusal when it isn't in the tree.
+        let lil_test = if from_before {
+            "if git cat-file -e \"${BEFORE}:crates/lil-cli/Cargo.toml\" 2>/dev/null; then"
         } else {
-            (
-                "if [ -f crates/lil-cli/Cargo.toml ]; then",
-                "elif [ -f crates/ww-cli/Cargo.toml ]; then",
-            )
+            "if [ -f crates/lil-cli/Cargo.toml ]; then"
         };
         let lines: Vec<&str> = script.lines().map(str::trim).collect();
-        assert!(lines.len() > 10, "{file}/{id}: {script}");
+        assert!(lines.len() > 7, "{file}/{id}: {script}");
         assert_eq!(
-            lines[..7],
-            [
-                lil_test,
-                "pkg=lil-cli",
-                "bin=lil",
-                legacy_test,
-                "pkg=ww-cli",
-                "bin=ww",
-                "else"
-            ],
+            lines[..4],
+            [lil_test, "pkg=lil-cli", "bin=lil", "else"],
             "{file}/{id}: {script}"
         );
         assert!(
-            lines[7].starts_with("echo \"::error::"),
+            lines[4].starts_with("echo \"::error::"),
             "{file}/{id}: {script}"
         );
-        assert_eq!(lines[8..10], ["exit 1", "fi"], "{file}/{id}: {script}");
+        assert_eq!(lines[5..7], ["exit 1", "fi"], "{file}/{id}: {script}");
         assert_eq!(script.matches("exit ").count(), 1, "{file}/{id}: {script}");
         for out in [
             "echo \"pkg=$pkg\"",
@@ -1361,7 +1337,7 @@ fn judges_pick_the_cli_crate_from_the_tree_they_build() {
         for (i, st) in steps.iter().enumerate() {
             let script = run(st);
             if i != p {
-                for name in ["ww-cli", "lil-cli", "ww.exe", "lil.exe", "\"$WW\""] {
+                for name in ["lil-cli", "lil.exe"] {
                     assert!(
                         !script.contains(name),
                         "{file}/{id}: step {:?} names `{name}`",
@@ -1398,9 +1374,9 @@ fn judges_pick_the_cli_crate_from_the_tree_they_build() {
                 .any(|st| run(st).contains("cargo run --locked -p lil-cli -- dev spec-tests")),
             "{file}/{id}"
         );
-        // No `--package`, and no text naming the crate before the rename, anywhere in the job.
+        // No `--package` anywhere in the job.
         let mut bad = Vec::new();
-        old_crate_or_package_flag(&doc["jobs"][id], &mut bad);
+        package_flag(&doc["jobs"][id], &mut bad);
         assert!(bad.is_empty(), "{file}/{id}: {bad:?}");
         // The renamed crate only: every `-p` in these jobs names `lil-cli`.
         for st in &steps {
@@ -1415,48 +1391,41 @@ fn judges_pick_the_cli_crate_from_the_tree_they_build() {
     }
 }
 
-/// The tree-builder check sees `--package` and the old crate's name in any step, key or value.
+/// The tree-builder check sees `--package` in any step, key or value.
 #[test]
-fn old_crate_or_package_flag_finds_them_anywhere_in_a_job() {
+fn package_flag_finds_it_anywhere_in_a_job() {
     let job = &YamlLoader::load_from_str(
         "steps:\n  \
          - run: cargo run --locked -p lil-cli -- dev spec-tests\n  \
          - run: cargo run --locked --package lil-cli -- dev spec-report\n  \
          - name: check\n    \
            env:\n      \
-             manifest: crates/ww-cli/Cargo.toml\n",
+             args: x --package y\n",
     )
     .unwrap()[0];
     let mut bad = Vec::new();
-    old_crate_or_package_flag(job, &mut bad);
+    package_flag(job, &mut bad);
     assert_eq!(
         bad,
         [
             "cargo run --locked --package lil-cli -- dev spec-report",
-            "crates/ww-cli/Cargo.toml"
+            "x --package y"
         ]
     );
     let clean =
         &YamlLoader::load_from_str("steps:\n  - run: cargo run --locked -p lil-cli\n").unwrap()[0];
     let mut none = Vec::new();
-    old_crate_or_package_flag(clean, &mut none);
+    package_flag(clean, &mut none);
     assert!(none.is_empty(), "{none:?}");
 }
 
-/// QA-086, rulings RN4 and RN5: each scan step sets both denylist variables, each from its own
-/// repository secret, and fails only when both are empty. GitHub expands a secret that doesn't
-/// exist to "", and the reader skips a blank variable, so the scan keeps working whichever secret
-/// exists. The scripts never expand either variable except in that guard, so nothing prints it.
+/// QA-086: each scan step sets the denylist variable from the repository secret of the same
+/// name, and fails when it is empty (GitHub expands a secret that doesn't exist to ""). The
+/// scripts never expand the variable except in that guard, so nothing prints it.
 #[test] // spec: QA-086
-fn scan_steps_set_both_denylist_names_each_from_its_own_secret() {
-    // The names the CLI reads (privacy.rs), new first.
-    assert_eq!(
-        [
-            lil_platform::names::DENYLIST_ENV,
-            lil_platform::names::LEGACY_DENYLIST_ENV
-        ],
-        [DENYLIST_SECRETS[0].0, DENYLIST_SECRETS[1].0]
-    );
+fn scan_steps_set_the_denylist_from_its_secret() {
+    // The name the CLI reads (privacy.rs).
+    assert_eq!(lil_platform::names::DENYLIST_ENV, DENYLIST_SECRETS[0].0);
     for (file, id, name) in SCAN_STEPS {
         let (_, doc) = get(file);
         let steps = steps(&doc["jobs"][id]);
@@ -1479,7 +1448,7 @@ fn scan_steps_set_both_denylist_names_each_from_its_own_secret() {
             assert_eq!(
                 script.matches(&format!("[ -z \"${{{k}:-}}\" ]")).count(),
                 1,
-                "{file}/{id}: {k} is tested once, in the both-empty guard"
+                "{file}/{id}: {k} is tested once, in the guard"
             );
             assert_eq!(
                 script.matches(&format!("${{{k}")).count(),
@@ -1491,12 +1460,6 @@ fn scan_steps_set_both_denylist_names_each_from_its_own_secret() {
                 "{file}/{id}: {k} expanded outside the guard"
             );
         }
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("PRIVACY_DENYLIST") && l.contains("||")),
-            "{file}/{id}: one empty variable must not fail the scan"
-        );
     }
 }
 
@@ -1514,19 +1477,14 @@ fn no_step_outside_a_scan_sees_the_denylist_secret() {
         }
         // GitHub expressions ignore case, so count every spelling, comments included.
         let lower = text.to_lowercase();
-        for name in [
-            "secrets.lil_privacy_denylist",
-            "secrets.ww_privacy_denylist",
-        ] {
-            assert_eq!(
-                lower.matches(name).count(),
-                expected,
-                "{file}: {name} in any case"
-            );
-        }
+        assert_eq!(
+            lower.matches("secrets.lil_privacy_denylist").count(),
+            expected,
+            "{file}: secrets.lil_privacy_denylist in any case"
+        );
         assert_eq!(
             code.matches("PRIVACY_DENYLIST }}").count(),
-            2 * expected,
+            expected,
             "{file}: a denylist secret under another name"
         );
         let lower_code = code.to_lowercase();

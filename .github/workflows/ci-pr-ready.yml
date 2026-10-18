@@ -14,13 +14,11 @@
 # verdict for exactly what it would merge. The required check is `privacy-check` from
 # ci-push.yml, which scans the same commits on every push; this job has its own name because a
 # required check name must come from exactly one job. The denylist comes from the
-# LIL_PRIVACY_DENYLIST and WW_PRIVACY_DENYLIST Actions secrets, each passed in the variable of its
-# own name (the CLI reads the new name first and skips a blank one); when both are missing or
-# empty (fork PRs never get secrets), the job fails. Like privacy-check, it follows ci-guard's
+# LIL_PRIVACY_DENYLIST Actions secret, passed in the variable of the same name; when it is missing
+# or empty (fork PRs never get secrets), the job fails. Like privacy-check, it follows ci-guard's
 # pattern (R21): the CLI is built from main without sccache in a step without the secret, the PR's
 # commits are fetched as git data only, and the PR's code is never built or run. The step "Pick
-# the CLI crate" picks whichever CLI crate main has (crates/lil-cli, else crates/ww-cli), and
-# fails if main has neither.
+# the CLI crate" finds main's CLI crate (crates/lil-cli), and fails if main has none.
 
 name: "CI: PR ready"
 
@@ -129,16 +127,13 @@ jobs:
 
       - name: Pick the CLI crate
         id: pick
-        # In main's working tree (the checkout above): lil-cli once main has it, else ww-cli.
+        # In main's working tree (the checkout above).
         run: |
           if [ -f crates/lil-cli/Cargo.toml ]; then
             pkg=lil-cli
             bin=lil
-          elif [ -f crates/ww-cli/Cargo.toml ]; then
-            pkg=ww-cli
-            bin=ww
           else
-            echo "::error::main has neither crates/lil-cli nor crates/ww-cli, so there is no CLI to build."
+            echo "::error::main has no crates/lil-cli, so there is no CLI to build."
             exit 1
           fi
           echo "Building $pkg (--bin $bin) from main."
@@ -166,17 +161,15 @@ jobs:
           # Repository secrets, not environment ones: every branch and every PR is scanned, so an
           # environment would have to admit them all. What protects them is that only the CLI
           # built from main (in the step before, without the secrets) runs here; the scanned
-          # commits are read as git data and never built. Each variable comes from the secret of
-          # its own name: a secret that doesn't exist arrives as "", and the CLI skips a blank
-          # variable, so the scan runs while either secret exists.
+          # commits are read as git data and never built. A secret that doesn't exist arrives as
+          # "", and the step then fails.
           LIL_PRIVACY_DENYLIST: ${{ secrets.LIL_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
-          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }} # zizmor: ignore[secrets-outside-env]
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ -z "${LIL_PRIVACY_DENYLIST:-}" ] && [ -z "${WW_PRIVACY_DENYLIST:-}" ]; then
-            echo "::error::Both the LIL_PRIVACY_DENYLIST and the WW_PRIVACY_DENYLIST secrets are missing or empty, so the privacy scan can't run."
+          if [ -z "${LIL_PRIVACY_DENYLIST:-}" ]; then
+            echo "::error::The LIL_PRIVACY_DENYLIST secret is missing or empty, so the privacy scan can't run."
             exit 1
           fi
           "$CLI_BIN" dev privacy-scan --ref-name "refs/heads/$HEAD_REF" --range "refs/remotes/origin/$BASE_REF..$HEAD_SHA"

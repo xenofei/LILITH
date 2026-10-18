@@ -404,28 +404,18 @@ fn old_core_takes(path: &Path) -> Option<lil_platform::fs::LockedFile> {
     fsops::lock_exclusive(path).unwrap()
 }
 
-/// A legacy local `state.db` for `ws` (D3) with one `generated` row.
-fn legacy_local_db(env: &TestEnv, ws: &WorkspaceRef) -> PathBuf {
-    let path = env.legacy_workspace_local_dir(&ws.path).join("state.db");
-    let db = StateDb::open(&path, StateScope::Workspace, no_fatal()).expect("the legacy db");
-    runtime()
-        .block_on(db.set_generated("notes/a.txt", "sha-a", 1))
-        .unwrap();
-    drop(db);
-    path
-}
-
 #[test] // spec: ARCH-028
 fn held_legacy_core_lock_keeps_the_new_core_read_only() {
     let env = TestEnv::new();
     let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
     fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
-    let legacy_db = legacy_local_db(&env, &ws);
-    let new_db = env
+    // A state.db from an earlier open, so the read-only open has a file to open read-only.
+    let db_path = env
         .env
         .workspace_local_dir(&ws.path)
         .unwrap()
         .join("state.db");
+    drop(StateDb::open(&db_path, StateScope::Workspace, no_fatal()).expect("the state.db"));
     let rt = runtime();
 
     // An old core serves the workspace: it holds the legacy lock only.
@@ -440,7 +430,7 @@ fn held_legacy_core_lock_keeps_the_new_core_read_only() {
         lock_is_free(&ws),
         "a read-only open keeps .lilith\\core.lock"
     );
-    // Nothing is written beside the old core, and the copy-forward never ran.
+    // Nothing is written beside the old core.
     let refused = rt
         .block_on(open.store.write(
             &WsPath::parse("notes/b.txt").unwrap(),
@@ -449,8 +439,6 @@ fn held_legacy_core_lock_keeps_the_new_core_read_only() {
         ))
         .unwrap_err();
     assert_eq!(refused, StoreError::ReadOnly);
-    assert!(!new_db.exists(), "the copy-forward ran with one lock held");
-    assert!(legacy_db.is_file());
 
     // Once the old core has gone, the next open holds both and serves read-write.
     drop(open);
@@ -460,10 +448,6 @@ fn held_legacy_core_lock_keeps_the_new_core_read_only() {
     assert_eq!(open.access, Access::ReadWrite);
     assert!(!lock_is_free(&ws));
     assert!(old_core_takes(&legacy_lock(&ws)).is_none());
-    assert!(
-        new_db.is_file(),
-        "the copy-forward runs once both locks are held"
-    );
 }
 
 #[test] // spec: ARCH-028
@@ -515,16 +499,13 @@ fn no_legacy_folder_means_no_legacy_lock() {
     assert!(!ws.path.join(LEGACY_WORKSPACE_DIR).exists());
 }
 
-/// B3's copy-forward runs only once both locks are held (D4): with either one held by
-/// someone else the open is read-only, and nothing is copied or kept locked.
+/// D4: with either lock held by someone else the open is read-only, and the other lock is not
+/// kept.
 #[test] // spec: ARCH-028
-fn copy_forward_never_runs_while_only_one_lock_is_held() {
+fn either_lock_held_elsewhere_makes_the_open_read_only() {
     let env = TestEnv::new();
     let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
     fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
-    let legacy_db = legacy_local_db(&env, &ws);
-    let legacy_hash = lil_testkit::sha256_file(&legacy_db);
-    let new_dir = env.env.workspace_local_dir(&ws.path).unwrap();
     let rt = runtime();
     let states = registry(&env.env);
     let (hub, _) = hub(&env.env, &states);
@@ -533,11 +514,6 @@ fn copy_forward_never_runs_while_only_one_lock_is_held() {
         let other = old_core_takes(&held).expect("the other holder's lock");
         let open = rt.block_on(hub.open(&ws)).expect("the open");
         assert_eq!(open.access, Access::ReadOnly, "{}", held.display());
-        assert!(
-            !new_dir.join("state.db").exists(),
-            "copied forward while {} was held elsewhere",
-            held.display()
-        );
         // The lock this core could take is not kept.
         let free = if held == core_lock(&ws) {
             legacy_lock(&ws)
@@ -553,13 +529,10 @@ fn copy_forward_never_runs_while_only_one_lock_is_held() {
         rt.block_on(hub.close(&ws.id));
         drop(other);
     }
-    assert_eq!(lil_testkit::sha256_file(&legacy_db), legacy_hash);
 
-    // Both free: the open holds both, and only then copies forward.
+    // Both free: the open holds both.
     let open = rt.block_on(hub.open(&ws)).expect("the open");
     assert_eq!(open.access, Access::ReadWrite);
-    assert!(new_dir.join("state.db").is_file());
-    assert_eq!(lil_testkit::sha256_file(&legacy_db), legacy_hash);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -57,19 +57,6 @@ impl TestEnv {
             .unwrap_or_else(|e| panic!("no local folder for {}: {e}", ws.display()))
     }
 
-    /// This channel's legacy local data folder for `ws` (R4, D3): where a pre-rename core kept
-    /// its `state.db`, which a read-write open copies forward.
-    ///
-    /// # Panics
-    /// If `ws` does not exist or its volume cannot be resolved.
-    pub fn legacy_workspace_local_dir(&self, ws: &Path) -> PathBuf {
-        let canonical = std::fs::canonicalize(ws)
-            .unwrap_or_else(|e| panic!("cannot canonicalise {}: {e}", ws.display()));
-        self.env
-            .legacy_workspace_local_dir_for_canonical(&canonical)
-            .unwrap_or_else(|e| panic!("no legacy local folder for {}: {e}", ws.display()))
-    }
-
     /// What this channel's `suite.toml` registers: `default_workspace`, and every
     /// `[[workspaces]]` `path` in file order. A missing file registers nothing.
     ///

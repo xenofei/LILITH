@@ -38,10 +38,10 @@ struct Allow {
     until: &'static str,
 }
 
-/// The allowlist. The first ten rows are the plan's Task B1 table, verbatim except that row 5
-/// is split so the workflows and `workflows.rs` get only the pick step's exact text and the
-/// either-crate lists (ruling RN7, B1 follow-up). The rest are what the PR-A reviews and this
-/// test itself need; each says so in its `why`.
+/// The allowlist. The first rows are the plan's Task B1 table, as plan 3's Task 1 (the reduced
+/// PR-D) left it: the CI, helper, credential and merge-guard rows went with the code they
+/// covered, and the rows that outlive PR-D name their new end. The rest are what the PR-A
+/// reviews, plan 3 and this test itself need; each says so in its `why`.
 const ALLOW: &[Allow] = &[
     Allow {
         globs: &["docs/superpowers/plans/**"],
@@ -59,70 +59,14 @@ const ALLOW: &[Allow] = &[
         globs: &["**/*.rs"],
         lines_with: &["LEGACY_"],
         why: "legacy readers (R4) and their tests",
-        until: "PR-D",
+        until: "kept: `.worldwright\\` stays reserved and `ww://` still parses for sealed \
+                snapshots (no planned end)",
     },
     Allow {
         globs: &["crates/lil-platform/src/guard.rs"],
         lines_with: &["// legacy-guard"],
         why: "literal legacy cases of the test guard",
         until: "the owner says no legacy folder is left",
-    },
-    // The plan's row 5, minus `.github/workflows/*.yml` and `workflows.rs`: there a bare
-    // `ww-cli` would also allow the tree-builder `-p ww-cli` lines and pins Task B2 must
-    // change (rulings RN7, B1 follow-up). Those two get the narrow rows right after this one.
-    // `ww.exe` and `WW_PRIVACY_DENYLIST` occur only in `workflows.rs`, so they moved with it.
-    Allow {
-        globs: &[
-            "tools/git-hooks/credential-helper",
-            "crates/lil-cli/tests/credential_helper.rs",
-        ],
-        lines_with: &["ww-cli", "--bin ww"],
-        why: "CI and helper transition (B1, B2, B5)",
-        until: "PR-D",
-    },
-    Allow {
-        globs: &["crates/lil-cli/src/dev/workflows.rs"],
-        lines_with: &[
-            // Pins of the pick step's transition branch.
-            "crates/ww-cli/Cargo.toml",
-            "pkg=ww-cli",
-            "first and then `crates/ww-cli`",
-            // Lists that recognise either crate's build or binary (negative checks).
-            "\"-p ww-cli\", \"-p lil-cli\"]",
-            "\"ww.exe \", \"lil.exe \"",
-            "[\"ww-cli\", \"lil-cli\", \"ww.exe\", \"lil.exe\"",
-            // The pick step's `bin=ww` pin (B2 review, concern 1).
-            "\"bin=ww\",",
-            // The legacy secret (RN5), also as the lowercase name a check counts.
-            "WW_PRIVACY_DENYLIST",
-            "\"secrets.ww_privacy_denylist\",",
-            // The tree-builder check that rejects the old crate's name and `--package` (B2 review).
-            "[\"ww-cli\", \"--package\"]",
-        ],
-        why: "CI transition pins: the pick step's ww-cli branch, the either-crate lists, the \
-              legacy secret and the tree-builder negative check only, never a tree-builder \
-              `-p ww-cli -- dev` pin (B1 follow-up, B2 review)",
-        until: "PR-D",
-    },
-    Allow {
-        globs: &[".github/workflows/*.yml"],
-        lines_with: &[
-            // The pick step's transition branch, by its exact text.
-            "elif [ -f crates/ww-cli/Cargo.toml ]; then",
-            "elif git cat-file -e \"${BEFORE}:crates/ww-cli/Cargo.toml\"",
-            "pkg=ww-cli",
-            "nor crates/ww-cli",
-            // The comments that describe that branch.
-            "lil-cli once main has it, else ww-cli.",
-            "# ww-cli. Never the pushed commit",
-            "else crates/ww-cli)",
-            "# crates/ww-cli), so the check keeps working",
-            // The legacy secret (RN5).
-            "WW_PRIVACY_DENYLIST",
-        ],
-        why: "CI transition in the workflows: the pick step's ww-cli branch and the legacy \
-              secret only, never a tree-builder `-p ww-cli` line (B1 row 5 narrowed, RN7)",
-        until: "PR-D",
     },
     Allow {
         globs: &[
@@ -160,69 +104,30 @@ const ALLOW: &[Allow] = &[
             "the legacy `.worldwright\\core.lock` when `.worldwright\\` exists",
             "has `worldwright.yaml` but no `.worldwright\\`",
         ],
-        why: "Appendix E: how the core serves a workspace from before the rename (R4, D3, D4, \
-              RN9)",
-        until: "PR-D, with the legacy readers",
+        why: "Appendix E: how the core serves a workspace from before the rename (R4, D4)",
+        until: "the legacy workspace readers go",
     },
     Allow {
         globs: &["docs/reference/workspace-format.md"],
         lines_with: &["has `worldwright.yaml` and `.worldwright/` instead"],
         why: "the reference says a workspace from before the rename is still read (R4)",
-        until: "PR-D, with the legacy readers",
-    },
-    Allow {
-        globs: &["docs/dev/merge-guard.md"],
-        lines_with: &[
-            "the legacy `WW_PRIVACY_DENYLIST`",
-            "the legacy `%USERPROFILE%\\.worldwright\\",
-            "the legacy `Worldwright-dev/github/agent-token`",
-            "Both the LIL_PRIVACY_DENYLIST and the WW_PRIVACY_DENYLIST secrets are missing",
-        ],
-        why: "the maintainer's guide names the legacy denylist, key and token it still reads, and \
-              the CI message that names both secrets (A2, A4, B5)",
-        until: "PR-D, with the legacy readers and the second secret",
-    },
-    Allow {
-        globs: &["crates/lil-cli/src/dev/mod.rs"],
-        lines_with: &[
-            "%USERPROFILE%\\.worldwright\\reviewer\\app-key.age when the new one isn't there",
-            "Worldwright-dev/github/agent-token, is still read when the new target has none;",
-            "LIL_PRIVACY_DENYLIST (CI), the legacy WW_PRIVACY_DENYLIST,",
-            "%USERPROFILE%\\.worldwright\\privacy-denylist.txt. A blank variable is skipped.",
-            "(Worldwright-dev/github/agent-token), once `status` shows the new one.",
-        ],
-        why: "help text of `dev approve`, `dev agent-token`, `dev privacy-scan` and \
-              `agent-token clear --legacy`, naming the legacy key, token and denylist they still \
-              read (A2, B2 review)",
-        until: "PR-D, with the legacy readers",
-    },
-    // D9 as PR-C narrowed it: the repo is `LILITH` everywhere, and the App's current slug
-    // stays only in the settings and the tooling that reads them, since both slugs count
-    // until the owner renames the App (D6).
-    Allow {
-        globs: &["dev/merge-guard.toml", "crates/lil-cli/src/dev/*.rs"],
-        lines_with: &["worldwright-reviewer"],
-        why: "the reviewer App's current slug; approvals count from it or the next slug (D6, D9)",
-        until: "PR-D",
+        until: "the legacy workspace readers go",
     },
     // Rows beyond the plan's table.
-    Allow {
-        globs: &[".github/workflows/*.yml"],
-        lines_with: &["bin=ww"],
-        why: "the pick step's ww-cli transition branch sets bin=ww (D7, PR-A review)",
-        until: "PR-D, with the ww-cli branch",
-    },
-    Allow {
-        globs: &["crates/lil-cli/src/dev/workflows.rs"],
-        lines_with: &["\"$WW\""],
-        why: "negative check that no step runs the old CI variable (PR-A review)",
-        until: "PR-D",
-    },
     Allow {
         globs: &["crates/lil-schema/src/refs.rs"],
         lines_with: &["fn legacy_ww_ref_parses_to_the_same_ref()"],
         why: "the legacy-scheme reader test, by the name the plan's Task B4 gives it",
-        until: "PR-D, with LEGACY_SCHEME",
+        until: "kept: `.worldwright\\` stays reserved and `ww://` still parses for sealed \
+                snapshots (no planned end)",
+    },
+    // Plan 3, Global Constraints "Old names", rows 1 and 3. Task 3 adds
+    // `crates/lil-platform/tests/fs_lock.rs` and its `core.lock` substring.
+    Allow {
+        globs: &["crates/lil-core/tests/trash.rs"],
+        lines_with: &["\".worldwright\""],
+        why: "tests that `.worldwright\\` stays reserved, by its literal name",
+        until: "kept: `.worldwright\\` stays reserved (no planned end)",
     },
     Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
@@ -466,8 +371,8 @@ fn allowlist_is_case_sensitive_so_the_old_spec_path_is_not_allowed() {
         &format!("see [the spec]({old_spec})")
     ));
     assert!(!allowed("README.md", "WORLDWRIGHT-SUITE"));
-    // The D9 row, as PR-C narrowed it, allows only the App's current slug, as written, and
-    // only in the settings and the dev tooling. The old repo name is allowed nowhere.
+    // The old repo name and the App's old slug are allowed nowhere (the D9 row went with
+    // PR-D).
     assert!(!allowed(
         "README.md",
         "github.com/<owner>/Worldwright-Suite"
@@ -480,11 +385,11 @@ fn allowlist_is_case_sensitive_so_the_old_spec_path_is_not_allowed() {
         "crates/lil-cli/src/dev/merge.rs",
         "repo: \"Worldwright-Suite\".into(),"
     ));
-    assert!(allowed(
+    assert!(!allowed(
         "dev/merge-guard.toml",
         "reviewer_app_slug = \"worldwright-reviewer\""
     ));
-    assert!(allowed(
+    assert!(!allowed(
         "crates/lil-cli/src/dev/merge.rs",
         "const BOT: &str = \"worldwright-reviewer[bot]\";"
     ));
@@ -510,9 +415,8 @@ fn allowlist_is_case_sensitive_so_the_old_spec_path_is_not_allowed() {
     assert!(!allowed("Docs/superpowers/plans/x.md", "Worldwright"));
 }
 
-/// B1 follow-up: `workflows.rs` may say `ww-cli` only in the pick step's pins, the
-/// either-crate lists and the legacy secret. Its tree-builder pins must be reported until
-/// Task B2 changes them to `-p lil-cli`.
+/// B1 follow-up: `workflows.rs`'s old tree-builder pins are reported (since PR-D, every old
+/// name in `workflows.rs` is).
 #[test]
 fn tree_builder_pins_in_workflows_rs_are_reported() {
     const PATH: &str = "crates/lil-cli/src/dev/workflows.rs";
@@ -525,19 +429,6 @@ fn tree_builder_pins_in_workflows_rs_are_reported() {
     ] {
         assert!(is_stale(line));
         assert!(!allowed(PATH, line), "{line:?} must be reported");
-    }
-    // The pick-step pins, either-crate lists and the legacy secret stay allowed.
-    for line in [
-        "    for crate_path in [\"crates/lil-cli/Cargo.toml\", \"crates/ww-cli/Cargo.toml\"] {",
-        "                \"elif [ -f crates/ww-cli/Cargo.toml ]; then\",",
-        "                \"pkg=ww-cli\",",
-        "                        && [\"-p \\\"$pkg\\\"\", \"-p ww-cli\", \"-p lil-cli\"]",
-        "                let runs_binary = [\"\\\"$CLI_BIN\\\" \", \"ww.exe \", \"lil.exe \", \"\\\"$WW\\\" \"]",
-        "                for name in [\"ww-cli\", \"lil-cli\", \"ww.exe\", \"lil.exe\", \"\\\"$WW\\\"\"] {",
-        "    (\"WW_PRIVACY_DENYLIST\", \"${{ secrets.WW_PRIVACY_DENYLIST }}\"),",
-        "        \"$WW\",",
-    ] {
-        assert!(allowed(PATH, line), "{line:?}");
     }
     // And in the real tree (at either crate path), no line of `workflows.rs` that pins a
     // tree-builder run is allowed.
@@ -558,9 +449,8 @@ fn tree_builder_pins_in_workflows_rs_are_reported() {
     }
 }
 
-/// Ruling RN7: in the workflows only the pick step's transition branch may say `ww-cli`. The
-/// tree-builder steps run the pushed tree's CLI and must be reported until Task B2 changes
-/// them to `-p lil-cli`.
+/// Ruling RN7: the workflows' old tree-builder lines are reported (since PR-D, every old name
+/// in the workflows is).
 #[test]
 fn tree_builder_ww_cli_lines_in_the_workflows_are_reported() {
     // The tree-builder lines as they stand at the start of PR-B.
@@ -588,17 +478,6 @@ fn tree_builder_ww_cli_lines_in_the_workflows_are_reported() {
     ] {
         assert!(is_stale(line));
         assert!(!allowed(path, line), "{path}: {line:?} must be reported");
-    }
-    // The pick step's transition branch stays allowed.
-    for line in [
-        "          elif [ -f crates/ww-cli/Cargo.toml ]; then",
-        "            pkg=ww-cli",
-        "            bin=ww",
-        "            echo \"::error::main has neither crates/lil-cli nor crates/ww-cli, so there is no CLI to build.\"",
-        "        # In main's working tree (the checkout above): lil-cli once main has it, else ww-cli.",
-        "          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }}",
-    ] {
-        assert!(allowed(".github/workflows/ci-push.yml", line), "{line:?}");
     }
     // And in the real tree, no tracked workflow line that runs `-p ww-cli` is allowed.
     for h in all_hits() {

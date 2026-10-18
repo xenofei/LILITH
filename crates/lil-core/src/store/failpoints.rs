@@ -35,7 +35,6 @@ pub const NAMES: &[&str] = &[
     "store.after_index",
     "store.after_seal",
     "watch.start",
-    "state.copy_forward",
 ];
 
 /// The exit code of the `abort` action.

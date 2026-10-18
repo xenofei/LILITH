@@ -1,28 +1,25 @@
 //! `lil dev reviewer-setup` and `lil dev approve` (QA-020 as amended).
 //!
 //! Changes to protected files merge only with an APPROVED review from the reviewer GitHub App
-//! (`reviewer_app_slug` in `dev/merge-guard.toml`, or `reviewer_app_slug_next` while the App is
-//! being renamed) on the PR's exact head commit. This module is the only thing that
+//! (`reviewer_app_slug` in `dev/merge-guard.toml`) on the PR's exact head commit. This module is the only thing that
 //! posts that review, and it does so only for the owner, at a real terminal, after the owner has
 //! read the guard's summary, said yes, and typed the passphrase that unlocks the App's key.
 //! Agents have no terminal, so they can never approve.
 //!
 //! **The key.** `lil dev reviewer-setup` encrypts the App's downloaded `.pem` with an age scrypt
 //! passphrase and writes it, with the App id and installation id, to
-//! `%USERPROFILE%\<home>\reviewer\app-key.age` ([`key_path_in`]), and never to the legacy
-//! `%USERPROFILE%\<legacy home>\reviewer\app-key.age` ([`legacy_key_path_in`]), where keys were
-//! written before the rename. `approve` reads the key from the new path when it exists, else
-//! from the legacy one ([`find_key_in`], R4), and prints which. Both paths are outside the repo
-//! and outside the suite's `%APPDATA%\<App>*` / `%LOCALAPPDATA%\<App>*` data, and the repo's
-//! `.claude` deny rules keep agents out of both home folders. The plaintext `.pem` is never
+//! `%USERPROFILE%\<home>\reviewer\app-key.age` ([`key_path_in`]). `approve` reads the key from
+//! there ([`find_key_in`]) and prints the path. It is outside the repo and outside the suite's
+//! `%APPDATA%\<App>*` / `%LOCALAPPDATA%\<App>*` data, and the repo's `.claude` deny rules keep
+//! agents out of the home folder. The plaintext `.pem` is never
 //! deleted or modified here; the owner deletes it.
 //!
 //! **Approving** ([`approve`]): refuse unless at a terminal; refuse when nothing protected
 //! changed; show the summary and ask "(y/N)"; read the passphrase; decrypt the key (a wrong
 //! passphrase stops here, before any network call); mint a 9-minute RS256 App JWT
 //! ([`app_jwt`]); ask GitHub for the App's live slug with it (`GET /app`), print it, and refuse
-//! unless it is `reviewer_app_slug` or `reviewer_app_slug_next` (plan 2026-10-17, D6), so a key
-//! for any other App approves nothing; exchange the JWT for an installation token; re-read the
+//! unless it is `reviewer_app_slug` (plan 2026-10-17, D6), so a key for any other App approves
+//! nothing; exchange the JWT for an installation token; re-read the
 //! PR and refuse unless it is
 //! still open, not a draft, into the base branch and at the exact head the summary was computed
 //! for; then post exactly one `APPROVE` review pinned to that head; then re-run the guard check.
@@ -215,41 +212,28 @@ pub fn key_path_in(profile: &Path) -> PathBuf {
         .join("app-key.age")
 }
 
-/// `<profile>\<legacy home>\reviewer\app-key.age` ([`names::LEGACY_HOME_DIR`]): where the key
-/// was written before the rename. Read when the new path has no key (R4).
-pub fn legacy_key_path_in(profile: &Path) -> PathBuf {
-    profile
-        .join(names::LEGACY_HOME_DIR)
-        .join("reviewer")
-        .join("app-key.age")
-}
-
-/// The reviewer key to use: [`key_path_in`] when anything is there, else
-/// [`legacy_key_path_in`] when anything is there, else `None`. "Anything" means whatever isn't
-/// a plain not-found: a file, a folder, a link, or a path that can't be examined. So an occupied
-/// or unreadable new path is chosen, and loading it refuses; the legacy key is used only when
-/// nothing at all is at the new path. Only looks; nothing is created.
+/// The reviewer key to use: [`key_path_in`] when anything is there, else `None`. "Anything"
+/// means whatever isn't a plain not-found: a file, a folder, a link, or a path that can't be
+/// examined. So an occupied or unreadable path is chosen, and loading it refuses. Only looks;
+/// nothing is created.
 pub fn find_key_in(profile: &Path) -> Option<PathBuf> {
-    [key_path_in(profile), legacy_key_path_in(profile)]
-        .into_iter()
-        .find(|p| {
-            !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-        })
+    Some(key_path_in(profile)).filter(|p| {
+        !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
-/// [`find_key_in`], or an error naming both paths it looked at.
+/// [`find_key_in`], or an error naming the path it looked at.
 fn locate_key_in(profile: &Path) -> Result<PathBuf> {
     find_key_in(profile).ok_or_else(|| {
         anyhow!(
-            "there is no reviewer key at {} or at the legacy {}; run `lil dev reviewer-setup` first",
-            key_path_in(profile).display(),
-            legacy_key_path_in(profile).display()
+            "there is no reviewer key at {}; run `lil dev reviewer-setup` first",
+            key_path_in(profile).display()
         )
     })
 }
 
 /// The key file [`locate_key_in`] finds, loaded, with its path. A key that can't be read or
-/// parsed is an error naming its path, never a reason to try the other one.
+/// parsed is an error naming its path.
 fn load_key_in(profile: &Path) -> Result<(PathBuf, ReviewerKeyFile)> {
     let path = locate_key_in(profile)?;
     let key = ReviewerKeyFile::load(&path)?;
@@ -261,9 +245,7 @@ pub fn setup_key_path() -> Result<PathBuf> {
     Ok(setup_key_path_in(&user_profile()?))
 }
 
-/// Where `reviewer-setup` writes the key for `profile`: only ever [`key_path_in`], the new home
-/// folder. A key in the legacy home folder is left alone; `approve` still reads it while the new
-/// path has none.
+/// Where `reviewer-setup` writes the key for `profile`: [`key_path_in`].
 pub fn setup_key_path_in(profile: &Path) -> PathBuf {
     key_path_in(profile)
 }
@@ -743,8 +725,8 @@ pub fn approve(
     drop(passphrase);
     let jwt = Zeroizing::new(app_jwt(key_file.app_id, &pem, now_unix)?);
     drop(pem);
-    // Which App the key belongs to, as GitHub sees it now (D6): only the two configured slugs
-    // may approve. Asked before any installation token exists.
+    // Which App the key belongs to, as GitHub sees it now (D6): only the configured slug may
+    // approve. Asked before any installation token exists.
     let live = gh.app_slug(&jwt).context(
         "asking GitHub for the reviewer App's slug (GET /app) failed; nothing was approved",
     )?;
@@ -752,17 +734,12 @@ pub fn approve(
         "reviewer App slug: {}",
         guard::escape_controls(&live)
     ));
-    if !cfg.reviewer_slugs().contains(&live.as_str()) {
-        let known = cfg
-            .reviewer_slugs()
-            .iter()
-            .map(|s| format!("`{s}`"))
-            .collect::<Vec<_>>()
-            .join(" or ");
+    if live != cfg.reviewer_app_slug {
         bail!(
-            "GitHub says the reviewer key belongs to the App `{}`, but {} names {known}; nothing was approved",
+            "GitHub says the reviewer key belongs to the App `{}`, but {} names `{}`; nothing was approved",
             guard::escape_controls(&live),
-            merge::CONFIG_PATH
+            merge::CONFIG_PATH,
+            cfg.reviewer_app_slug
         );
     }
     let exchange = |scope| {
@@ -1779,12 +1756,7 @@ mod tests {
     #[test]
     fn review_is_pinned_to_head_sha() {
         let fake = open_pr();
-        fake.add_review(
-            PR,
-            "worldwright-reviewer[bot]",
-            "APPROVED",
-            "an-older-commit",
-        );
+        fake.add_review(PR, "lilith-reviewer[bot]", "APPROVED", "an-older-commit");
         let prompt = FakePrompt::new().confirms(&[true]).passphrases(&[PASS]);
         let exchange = Exchange::default();
         run(&fake, &prompt, &exchange, SUMMARY, HEAD).unwrap();
@@ -1813,7 +1785,7 @@ mod tests {
 
         // The merge guard now counts it.
         let reviews = fake.reviews(PR).unwrap();
-        assert!(app_approved(&reviews, &cfg().reviewer_logins(), HEAD));
+        assert!(app_approved(&reviews, &cfg().reviewer_login(), HEAD));
     }
 
     #[test]
@@ -1824,13 +1796,6 @@ mod tests {
             key_path_in(profile),
             profile
                 .join(names::HOME_DIR)
-                .join("reviewer")
-                .join("app-key.age")
-        );
-        assert_eq!(
-            legacy_key_path_in(profile),
-            profile
-                .join(names::LEGACY_HOME_DIR)
                 .join("reviewer")
                 .join("app-key.age")
         );
@@ -1850,60 +1815,42 @@ mod tests {
                 })
             })
         }
-        for path in [key_path_in(profile), legacy_key_path_in(profile)] {
-            assert!(!path.starts_with(&repo), "{path:?} is inside the repo");
-            // Windows puts both app-data roots inside the profile; check that layout, injected.
-            for root in [
-                profile.join("AppData").join("Roaming"),
-                profile.join("AppData").join("Local"),
-            ] {
-                assert!(!under_suite_data(&path, &root), "{path:?} under {root:?}");
-            }
-            // And against this machine's roots (the variables' values only; nothing under them
-            // is resolved or touched).
-            for var in ["APPDATA", "LOCALAPPDATA"] {
-                if let Some(root) = std::env::var_os(var) {
-                    assert!(
-                        !under_suite_data(&path, Path::new(&root)),
-                        "{path:?} under %{var}%"
-                    );
-                }
-            }
-            // The home folder itself, under either name, is not a suite data root.
-            assert!(!under_suite_data(&path, profile));
+        let path = key_path_in(profile);
+        assert!(!path.starts_with(&repo), "{path:?} is inside the repo");
+        // Windows puts both app-data roots inside the profile; check that layout, injected.
+        for root in [
+            profile.join("AppData").join("Roaming"),
+            profile.join("AppData").join("Local"),
+        ] {
+            assert!(!under_suite_data(&path, &root), "{path:?} under {root:?}");
         }
+        // And against this machine's roots (the variables' values only; nothing under them is
+        // resolved or touched).
+        for var in ["APPDATA", "LOCALAPPDATA"] {
+            if let Some(root) = std::env::var_os(var) {
+                assert!(
+                    !under_suite_data(&path, Path::new(&root)),
+                    "{path:?} under %{var}%"
+                );
+            }
+        }
+        // The home folder itself is not a suite data root.
+        assert!(!under_suite_data(&path, profile));
     }
 
     #[test]
-    fn key_lookup_prefers_the_new_path() {
+    fn key_lookup_finds_the_key_path() {
         let tmp = tempfile::tempdir().unwrap();
         let profile = tmp.path();
-        for p in [key_path_in(profile), legacy_key_path_in(profile)] {
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, "key").unwrap();
-        }
-        assert_eq!(find_key_in(profile), Some(key_path_in(profile)));
-        assert_eq!(locate_key_in(profile).unwrap(), key_path_in(profile));
-        // Only the new one: still the new one.
-        std::fs::remove_file(legacy_key_path_in(profile)).unwrap();
-        assert_eq!(find_key_in(profile), Some(key_path_in(profile)));
+        let p = key_path_in(profile);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "key").unwrap();
+        assert_eq!(find_key_in(profile), Some(p.clone()));
+        assert_eq!(locate_key_in(profile).unwrap(), p);
     }
 
     #[test]
-    fn key_lookup_finds_the_legacy_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let profile = tmp.path();
-        let legacy = legacy_key_path_in(profile);
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, "key").unwrap();
-        assert_eq!(find_key_in(profile), Some(legacy.clone()));
-        assert_eq!(locate_key_in(profile).unwrap(), legacy);
-        // Looking never creates the new folder.
-        assert!(!profile.join(names::HOME_DIR).exists());
-    }
-
-    #[test]
-    fn missing_key_message_names_both_paths() {
+    fn missing_key_message_names_the_path() {
         let tmp = tempfile::tempdir().unwrap();
         let profile = tmp.path();
         assert_eq!(find_key_in(profile), None);
@@ -1912,44 +1859,35 @@ mod tests {
             text.contains(&key_path_in(profile).display().to_string()),
             "{text}"
         );
-        assert!(
-            text.contains(&legacy_key_path_in(profile).display().to_string()),
-            "{text}"
-        );
         assert!(text.contains("lil dev reviewer-setup"), "{text}");
         assert!(load_key_in(profile).is_err());
+        // Looking never creates the home folder.
+        assert!(!profile.join(names::HOME_DIR).exists());
     }
 
-    /// Anything at the new key path is the key or a refusal; the legacy key is used only when
-    /// nothing is there at all.
+    /// Anything at the key path is the key or a refusal.
     #[test]
-    fn occupied_new_key_path_refuses_instead_of_falling_back() {
+    fn occupied_key_path_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         let profile = tmp.path();
-        let legacy = legacy_key_path_in(profile);
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        key_file().save(&legacy).unwrap();
-        assert_eq!(load_key_in(profile).unwrap().0, legacy);
 
-        // A folder at the new path: chosen, and loading it refuses.
-        let new = key_path_in(profile);
-        std::fs::create_dir_all(&new).unwrap();
-        assert_eq!(find_key_in(profile), Some(new.clone()));
+        // A folder at the path: chosen, and loading it refuses.
+        let path = key_path_in(profile);
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(find_key_in(profile), Some(path.clone()));
         let text = format!("{:#}", load_key_in(profile).unwrap_err());
-        assert!(text.contains(&new.display().to_string()), "{text}");
-        std::fs::remove_dir(&new).unwrap();
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        std::fs::remove_dir(&path).unwrap();
 
-        // A damaged file at the new path: the same.
-        std::fs::write(&new, "not a key file").unwrap();
-        assert_eq!(find_key_in(profile), Some(new.clone()));
+        // A damaged file at the path: the same.
+        std::fs::write(&path, "not a key file").unwrap();
+        assert_eq!(find_key_in(profile), Some(path.clone()));
         let text = format!("{:#}", load_key_in(profile).unwrap_err());
-        assert!(text.contains(&new.display().to_string()), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
 
-        // A good file at the new path wins over the legacy one.
-        key_file().save(&new).unwrap();
-        assert_eq!(load_key_in(profile).unwrap().0, new);
-        // The legacy key was never touched.
-        assert!(ReviewerKeyFile::load(&legacy).is_ok());
+        // A good file loads.
+        key_file().save(&path).unwrap();
+        assert_eq!(load_key_in(profile).unwrap().0, path);
     }
 
     // ---- R20: TOCTOU, nothing protected, PR state ----------------------------------------------
@@ -2047,63 +1985,24 @@ mod tests {
     }
 
     /// Every file under `dir` with its bytes, sorted; empty when `dir` doesn't exist.
-    fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut todo = vec![dir.to_path_buf()];
-        while let Some(d) = todo.pop() {
-            let Ok(entries) = std::fs::read_dir(&d) else {
-                continue;
-            };
-            for entry in entries {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    todo.push(path);
-                } else {
-                    let bytes = std::fs::read(&path).unwrap();
-                    out.push((path, bytes));
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
-    /// Task B5: `reviewer-setup` writes the key only under the new home folder. A key in the
-    /// legacy home folder is left byte for byte, nothing is created there, and `approve` then
-    /// finds the new key.
+    /// `reviewer-setup` writes the key at the key path, and `approve` then finds it.
     #[test]
-    fn reviewer_setup_writes_only_the_new_key_path() {
+    fn reviewer_setup_writes_the_key_path() {
         let tmp = tempfile::tempdir().unwrap();
         let pem_path = write_pem(tmp.path(), &test_key().pkcs1_pem);
         let pem_answer = pem_path.display().to_string();
-        for legacy_key_exists in [false, true] {
-            let profile = tmp.path().join(format!("profile-{legacy_key_exists}"));
-            std::fs::create_dir_all(&profile).unwrap();
-            let legacy_home = profile.join(names::LEGACY_HOME_DIR);
-            let legacy = legacy_key_path_in(&profile);
-            if legacy_key_exists {
-                std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-                std::fs::write(&legacy, b"legacy key bytes").unwrap();
-            }
-            let before = files_under(&legacy_home);
+        let profile = tmp.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = setup_key_path_in(&profile);
+        assert_eq!(path, key_path_in(&profile));
+        let prompt = FakePrompt::new()
+            .lines(&["123", "456", &pem_answer])
+            .passphrases(&[PASS, PASS]);
+        setup_with_work_factor(&prompt, &path, TEST_WORK_FACTOR).unwrap();
 
-            let path = setup_key_path_in(&profile);
-            assert_eq!(path, key_path_in(&profile));
-            let prompt = FakePrompt::new()
-                .lines(&["123", "456", &pem_answer])
-                .passphrases(&[PASS, PASS]);
-            setup_with_work_factor(&prompt, &path, TEST_WORK_FACTOR).unwrap();
-
-            let saved = ReviewerKeyFile::load(&key_path_in(&profile)).unwrap();
-            assert_eq!(saved.app_id, 123);
-            assert_eq!(files_under(&legacy_home), before, "legacy folder changed");
-            if legacy_key_exists {
-                assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy key bytes");
-            } else {
-                assert!(!legacy_home.exists(), "{legacy_home:?} was created");
-            }
-            assert_eq!(find_key_in(&profile), Some(key_path_in(&profile)));
-        }
+        let saved = ReviewerKeyFile::load(&key_path_in(&profile)).unwrap();
+        assert_eq!(saved.app_id, 123);
+        assert_eq!(find_key_in(&profile), Some(key_path_in(&profile)));
     }
 
     #[test]
@@ -2519,43 +2418,42 @@ mod tests {
         );
     }
 
-    // ---- PR-C: the App's live slug (plan 2026-10-17, D6) ----------------------------------------
+    // ---- the App's live slug (plan 2026-10-17, D6) ----------------------------------------------
 
     #[test] // spec: QA-020
     fn approve_prints_the_live_slug() {
-        for live in ["worldwright-reviewer", "lilith-reviewer"] {
-            let fake = pr_with_guard_run();
-            fake.set_app_slug(live);
-            let exchange = Exchange {
-                on_exchange: Some(Box::new(|| fake.log_event("exchange"))),
-                ..Exchange::default()
-            };
-            let prompt = approved();
-            run(&fake, &prompt, &exchange, SUMMARY, HEAD).unwrap();
-            let said = prompt.said();
-            assert!(
-                said.contains(&format!("reviewer App slug: {live}")),
-                "{said:?}"
-            );
-            // Asked once, with the App's JWT, before the token exchange.
-            let jwts = fake.app_jwts();
-            assert_eq!(jwts.len(), 1, "{jwts:?}");
-            assert_eq!(claims(&jwts[0]).1["iss"], "123");
-            assert_eq!(fake.events()[..2], ["app", "exchange"]);
-            // The approval is posted under the live slug, and the merge guard counts it.
-            let reviews = fake.reviews(PR).unwrap();
-            assert_eq!(reviews.last().unwrap().login, format!("{live}[bot]"));
-            assert!(app_approved(&reviews, &cfg().reviewer_logins(), HEAD));
-        }
+        let live = "lilith-reviewer";
+        let fake = pr_with_guard_run();
+        fake.set_app_slug(live);
+        let exchange = Exchange {
+            on_exchange: Some(Box::new(|| fake.log_event("exchange"))),
+            ..Exchange::default()
+        };
+        let prompt = approved();
+        run(&fake, &prompt, &exchange, SUMMARY, HEAD).unwrap();
+        let said = prompt.said();
+        assert!(
+            said.contains(&format!("reviewer App slug: {live}")),
+            "{said:?}"
+        );
+        // Asked once, with the App's JWT, before the token exchange.
+        let jwts = fake.app_jwts();
+        assert_eq!(jwts.len(), 1, "{jwts:?}");
+        assert_eq!(claims(&jwts[0]).1["iss"], "123");
+        assert_eq!(fake.events()[..2], ["app", "exchange"]);
+        // The approval is posted under the live slug, and the merge guard counts it.
+        let reviews = fake.reviews(PR).unwrap();
+        assert_eq!(reviews.last().unwrap().login, format!("{live}[bot]"));
+        assert!(app_approved(&reviews, &cfg().reviewer_login(), HEAD));
     }
 
     #[test] // spec: QA-020
-    fn approve_refuses_a_live_slug_that_is_neither() {
+    fn approve_refuses_a_live_slug_that_is_not_the_configured_one() {
         for live in [
             "github-actions",
             "lilith-reviewer-next",
             "Lilith-Reviewer",
-            "worldwright-reviewer[bot]",
+            "lilith-reviewer[bot]",
             "lilith-reviewer\u{1b}[2J",
         ] {
             let fake = pr_with_guard_run();
@@ -2564,8 +2462,7 @@ mod tests {
             let prompt = approved();
             let e = err_text(run(&fake, &prompt, &exchange, SUMMARY, HEAD));
             assert!(e.contains("nothing was approved"), "{e}");
-            assert!(e.contains("`worldwright-reviewer`"), "{e}");
-            assert!(e.contains("`lilith-reviewer`"), "{e}");
+            assert!(e.contains("names `lilith-reviewer`"), "{e}");
             assert!(!e.contains('\u{1b}'), "{e}");
             // The slug GitHub reported is still shown, escaped.
             let said = prompt.said();
@@ -2577,34 +2474,6 @@ mod tests {
             assert!(fake.posted_reviews().is_empty());
             assert!(fake.reruns().is_empty());
         }
-
-        // Settings without the next slug refuse the next slug.
-        let only_current = MergeGuardConfig {
-            reviewer_app_slug_next: None,
-            ..cfg()
-        };
-        let fake = pr_with_guard_run();
-        fake.set_app_slug("lilith-reviewer");
-        let exchange = Exchange::default();
-        let e = format!(
-            "{:#}",
-            approve(
-                PR,
-                &only_current,
-                &fake,
-                &approved(),
-                &key_file(),
-                &exchange,
-                SUMMARY,
-                NOW,
-                HEAD,
-                &|_| panic!("approve paused")
-            )
-            .expect_err("the next slug isn't in these settings")
-        );
-        assert!(e.contains("nothing was approved"), "{e}");
-        assert!(exchange.calls.borrow().is_empty());
-        assert!(fake.posted_reviews().is_empty());
 
         // GitHub not answering GET /app refuses too: the slug is never assumed.
         let fake = pr_with_guard_run();

@@ -1,8 +1,7 @@
 //! The committed credential helper, `tools/git-hooks/credential-helper` (QA-079, ruling R28).
 //!
 //! `lil dev install-hooks` writes one `credential.helper` entry that runs this script, and every
-//! worktree of a clone shares it. The script runs whichever CLI crate the checkout has
-//! (`lil-cli` after the LILITH rename, `ww-cli` before it), so the entry survives the rename.
+//! worktree of a clone shares it. The script runs the checkout's CLI crate, `lil-cli`.
 //!
 //! The script is run with `sh`, as the `pre-push` tests in `dev/hooks.rs` run their hook, in a
 //! temp repository. A fake `cargo` comes first on `PATH`: it records its arguments, its working
@@ -22,7 +21,6 @@ const HELPER_ENTRY: &str =
     r#"!sh "$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper""#;
 const NO_CLI: &str = "credential-helper: this checkout has no CLI crate";
 const LIL_RUN: &str = "cargo run -q --locked -p lil-cli --bin lil -- dev git-credential";
-const LEGACY_CLI_RUN: &str = "cargo run -q --locked -p ww-cli --bin ww -- dev git-credential";
 const REQUEST: &str = "protocol=https\nhost=github.com\npath=owner/repo.git\n\n";
 const ANSWER: &str = "username=x-access-token\npassword=fake-answer-from-the-stub\n";
 
@@ -206,28 +204,11 @@ fn helper_runs_lil_cli_when_the_checkout_has_it() {
     require_sh!();
     let e = Env::new();
     e.add_crate(&e.checkout, "lil-cli");
-    e.add_crate(&e.checkout, "ww-cli");
     // Run from a subdirectory: the script works from the top level of the checkout.
     let sub = e.checkout.join("crates").join("lil-cli");
     let ran = e.run_script(&sub, &["get"], REQUEST);
     assert_eq!(ran.code, Some(0), "{ran:?}");
     assert!(ran.log.contains(&format!("{LIL_RUN} get\n")), "{ran:?}");
-    assert!(!ran.log.contains("ww-cli"), "{ran:?}");
-    assert!(cargo_dir(&ran.log).ends_with("/checkout"), "{ran:?}");
-}
-
-#[test] // spec: QA-079
-fn helper_runs_the_legacy_cli_crate_when_only_it_exists() {
-    require_sh!();
-    let e = Env::new();
-    e.add_crate(&e.checkout, "ww-cli");
-    let ran = e.run_script(&e.checkout, &["get"], REQUEST);
-    assert_eq!(ran.code, Some(0), "{ran:?}");
-    assert!(
-        ran.log.contains(&format!("{LEGACY_CLI_RUN} get\n")),
-        "{ran:?}"
-    );
-    assert!(!ran.log.contains("lil-cli"), "{ran:?}");
     assert!(cargo_dir(&ran.log).ends_with("/checkout"), "{ran:?}");
 }
 
@@ -248,13 +229,13 @@ fn helper_fails_plainly_without_a_cli_crate() {
 fn helper_passes_the_action_and_stdin_through() {
     require_sh!();
     let e = Env::new();
-    e.add_crate(&e.checkout, "ww-cli");
+    e.add_crate(&e.checkout, "lil-cli");
     for action in ["get", "store", "erase"] {
         let _ = std::fs::remove_file(&e.log);
         let ran = e.run_script(&e.checkout, &[action], REQUEST);
         assert_eq!(ran.code, Some(0), "{action}: {ran:?}");
         assert!(
-            ran.log.contains(&format!("{LEGACY_CLI_RUN} {action}\n")),
+            ran.log.contains(&format!("{LIL_RUN} {action}\n")),
             "{action}: {ran:?}"
         );
         assert!(
@@ -281,7 +262,7 @@ fn helper_passes_the_action_and_stdin_through() {
 fn helper_finds_cargo_where_the_pre_push_hook_does() {
     require_sh!();
     let e = Env::new();
-    e.add_crate(&e.checkout, "ww-cli");
+    e.add_crate(&e.checkout, "lil-cli");
     // No cargo on PATH or in $HOME/.cargo/bin: a plain refusal, and nothing on stdout.
     let cmd = e.command("sh", &[script().as_str(), "get"], &e.checkout, e.path(None));
     let ran = e.output(cmd, REQUEST);
@@ -293,10 +274,7 @@ fn helper_finds_cargo_where_the_pre_push_hook_does() {
     let cmd = e.command("sh", &[script().as_str(), "get"], &e.checkout, e.path(None));
     let ran = e.output(cmd, REQUEST);
     assert_eq!(ran.code, Some(0), "{ran:?}");
-    assert!(
-        ran.log.contains(&format!("{LEGACY_CLI_RUN} get\n")),
-        "{ran:?}"
-    );
+    assert!(ran.log.contains(&format!("{LIL_RUN} get\n")), "{ran:?}");
     assert_eq!(ran.stdout, ANSWER, "{ran:?}");
 }
 
@@ -324,7 +302,7 @@ fn git_runs_the_helper_entry_from_every_worktree() {
     let hooks = repo.join("tools").join("git-hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     std::fs::copy(script(), hooks.join("credential-helper")).unwrap();
-    e.add_crate(repo, "ww-cli");
+    e.add_crate(repo, "lil-cli");
     e.git_ok(repo, &["add", "-A"]);
     e.git_ok(
         repo,
@@ -391,7 +369,7 @@ fn git_runs_the_helper_entry_from_every_worktree() {
         assert_eq!(ran.code, Some(0), "{cwd:?}: {ran:?}");
         assert!(ran.stdout.contains(ANSWER), "{cwd:?}: {ran:?}");
         assert!(
-            ran.log.contains(&format!("{LEGACY_CLI_RUN} get\n")),
+            ran.log.contains(&format!("{LIL_RUN} get\n")),
             "{cwd:?}: {ran:?}"
         );
         assert!(ran.log.contains("host=github.com\n"), "{cwd:?}: {ran:?}");

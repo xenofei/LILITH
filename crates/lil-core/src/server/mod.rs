@@ -36,7 +36,6 @@ use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
-use crate::store::FailPoints;
 use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
 use crate::workspace::WorkspaceHub;
 
@@ -374,7 +373,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             lifecycle.begin_drain(DrainReason::Fatal(what.to_string()));
         })
     };
-    let state = match open_suite_state(&cfg.env, on_fatal, cfg.failpoints.clone()) {
+    let state = match open_suite_state(&cfg.env, on_fatal) {
         Ok(state) => Arc::new(state),
         Err(exit) => {
             drop(listener);
@@ -552,13 +551,9 @@ async fn supervise(s: Supervised) -> ShutdownReport {
 
 /// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6, 7 or 2),
 /// logging each with the path.
-fn open_suite_state(
-    env: &Env,
-    on_fatal: OnFatal,
-    failpoints: Arc<FailPoints>,
-) -> Result<StateRegistry, CoreExit> {
+fn open_suite_state(env: &Env, on_fatal: OnFatal) -> Result<StateRegistry, CoreExit> {
     let path = env.suite_state_db();
-    StateRegistry::open_with_failpoints(env, on_fatal, failpoints).map_err(|e| match e {
+    StateRegistry::open(env, on_fatal).map_err(|e| match e {
         StateError::TooNew { found, known } => {
             tracing::error!(
                 path = %path.display(),

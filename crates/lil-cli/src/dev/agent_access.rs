@@ -2,16 +2,11 @@
 //!
 //! Agents never use the owner's full GitHub login. They use one fine-grained token, limited to
 //! the suite repository, that the owner stores once in Windows Credential Manager at target
-//! [`AGENT_TOKEN_TARGET`]. A token stored before the rename, at [`LEGACY_AGENT_TOKEN_TARGET`],
-//! is still read for one release (R4): the new target answers first, and the legacy one only
-//! when the new one holds no token ([`stored_token`]).
+//! [`AGENT_TOKEN_TARGET`] ([`stored_token`]).
 //!
-//! - `lil dev agent-token set|status|clear [--legacy]` manages it. `set` and `clear` only run at
-//!   a real terminal, and `set` reads the token without echo. `set` writes only the new target;
-//!   `clear` removes both, and `clear --legacy` only the legacy one. Nothing here ever writes the
-//!   legacy target, and the credential store refuses that write too. `status` names the target
-//!   that answered and shows the token's first four characters and the expiry the owner
-//!   entered, never the token.
+//! - `lil dev agent-token set|status|clear` manages it. `set` and `clear` only run at a real
+//!   terminal, and `set` reads the token without echo. `status` names the target and shows the
+//!   token's first four characters and the expiry the owner entered, never the token.
 //! - `lil dev git-credential <get|store|erase>` is git's credential helper for this repository
 //!   (`lil dev install-hooks` writes [`GIT_CREDENTIAL_HELPER`] after an empty entry that resets
 //!   inherited helpers such as Git Credential Manager). `get` answers only for
@@ -19,8 +14,7 @@
 //! - `lil dev gh -- <args>` runs an allow-listed `gh` command ([`gh_refusal`]) with `GH_TOKEN`
 //!   set in the child's environment only.
 //! - Every `lil dev` GitHub call, and the helper's `get`, resolves its token with
-//!   [`resolve_token`]: `GITHUB_TOKEN` (CI), otherwise the stored agent token under either
-//!   name, otherwise a refusal that explains `lil dev agent-token set`. There is no fallback to
+//!   [`resolve_token`]: `GITHUB_TOKEN` (CI), otherwise the stored agent token, otherwise a refusal that explains `lil dev agent-token set`. There is no fallback to
 //!   `gh auth token`.
 //!
 //! The token is never printed, logged or written to a file by this module. The one place it
@@ -37,29 +31,23 @@ use zeroize::Zeroizing;
 
 use super::reviewer::Prompt;
 
-/// Where the agent token lives in Windows Credential Manager. `set` writes only this target.
+/// Where the agent token lives in Windows Credential Manager.
 pub const AGENT_TOKEN_TARGET: &str = "LILITH-dev/github/agent-token";
-/// Where the agent token lived before the rename (R4). It is read when [`AGENT_TOKEN_TARGET`]
-/// holds no token, and deleted by `clear`; it is never written.
-pub const LEGACY_AGENT_TOKEN_TARGET: &str = "Worldwright-dev/github/agent-token";
 /// The user name GitHub accepts with a token over HTTPS.
 pub const AGENT_TOKEN_USERNAME: &str = "x-access-token";
 /// The repository-local `credential.helper` entry `lil dev install-hooks` writes after the
 /// empty reset entry. Git appends the action (`get`, `store`, `erase`).
 ///
 /// It runs the committed script `tools/git-hooks/credential-helper` of the worktree git runs
-/// in, and the script runs `dev git-credential` from whichever CLI crate that checkout has
-/// (`lil-cli`, or the CLI crate of a checkout from before the rename). Every worktree of a clone shares this entry, so it survives the
-/// crate rename. A worktree on a commit from before the script has no helper until it is
-/// rebased.
+/// in, and the script runs `dev git-credential` from that checkout's CLI crate, `lil-cli`.
+/// Every worktree of a clone shares this entry. A worktree on a commit from before the script
+/// has no helper until it is rebased.
 pub const GIT_CREDENTIAL_HELPER: &str =
     r#"!sh "$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper""#;
 /// Fine-grained personal access tokens start with this.
 const FINE_GRAINED_PREFIX: &str = "github_pat_";
 /// The stored credential's comment: `expires=<YYYY-MM-DD or none>`.
 const EXPIRY_KEY: &str = "expires=";
-/// Where the token is read from, in order (R4).
-const READ_ORDER: [&str; 2] = [AGENT_TOKEN_TARGET, LEGACY_AGENT_TOKEN_TARGET];
 
 pub const SET_NOT_INTERACTIVE: &str = "lil dev agent-token set only runs at a real terminal (stdin and stderr must both be one); nothing was stored";
 pub const CLEAR_NOT_INTERACTIVE: &str = "lil dev agent-token clear only runs at a real terminal (stdin and stderr must both be one); nothing was removed";
@@ -70,8 +58,7 @@ const NO_TOKEN: &str = "No GitHub token: GITHUB_TOKEN isn't set and no agent tok
 // ---------------------------------------------------------------------------------------------
 
 /// The token for a `lil dev` GitHub call: `github_token` (the `GITHUB_TOKEN` variable) when it
-/// is set and not blank, otherwise the stored agent token ([`stored_token`]: the new target,
-/// then the legacy one), otherwise an error explaining `lil dev agent-token set`. The store is
+/// is set and not blank, otherwise the stored agent token ([`stored_token`]), otherwise an error explaining `lil dev agent-token set`. The store is
 /// not read when `github_token` is usable.
 pub fn resolve_token(
     github_token: Option<Zeroizing<String>>,
@@ -84,7 +71,7 @@ pub fn resolve_token(
         }
     }
     match stored_token(store) {
-        Ok(Some((token, _))) => Ok(token),
+        Ok(Some(token)) => Ok(token),
         Ok(None) => Err(anyhow!(NO_TOKEN)),
         Err(e) => Err(anyhow!(
             "GITHUB_TOKEN isn't set, and reading the agent token from Windows Credential Manager failed: {e}"
@@ -92,26 +79,19 @@ pub fn resolve_token(
     }
 }
 
-/// The stored agent token, trimmed, and the target that answered: [`AGENT_TOKEN_TARGET`], or
-/// [`LEGACY_AGENT_TOKEN_TARGET`] when the new target is missing or blank. `None` when neither
-/// holds a token. A failed read is an error, never a reason to try the next target.
-fn stored_token(store: &dyn CredentialStore) -> Result<Option<(Zeroizing<String>, &'static str)>> {
-    Ok(stored_credential(store)?
-        .map(|(c, target)| (Zeroizing::new(c.secret.trim().to_string()), target)))
+/// The agent token stored at [`AGENT_TOKEN_TARGET`], trimmed. `None` when it is missing or
+/// blank. A failed read is an error.
+fn stored_token(store: &dyn CredentialStore) -> Result<Option<Zeroizing<String>>> {
+    Ok(stored_credential(store)?.map(|c| Zeroizing::new(c.secret.trim().to_string())))
 }
 
-/// The credential [`stored_token`] reads, with the target that answered.
+/// The credential [`stored_token`] reads.
 fn stored_credential(
     store: &dyn CredentialStore,
-) -> Result<Option<(Credential, &'static str)>, lil_platform::credentials::CredentialError> {
-    for target in READ_ORDER {
-        if let Some(c) = store.get(target)?
-            && !c.secret.trim().is_empty()
-        {
-            return Ok(Some((c, target)));
-        }
-    }
-    Ok(None)
+) -> Result<Option<Credential>, lil_platform::credentials::CredentialError> {
+    Ok(store
+        .get(AGENT_TOKEN_TARGET)?
+        .filter(|c| !c.secret.trim().is_empty()))
 }
 
 /// [`resolve_token`] with the real environment and Windows Credential Manager.
@@ -126,8 +106,7 @@ pub fn github_token() -> Result<Zeroizing<String>> {
 
 /// `lil dev agent-token set`. Returns the line to print on success; the error is a plain
 /// sentence. The token is read with `prompt.passphrase` (no echo) and never shown again. It is
-/// written only to [`AGENT_TOKEN_TARGET`]; a token under the legacy name is neither read nor
-/// changed here, and "already stored" means stored under the new name.
+/// written to [`AGENT_TOKEN_TARGET`].
 pub fn set_token(prompt: &dyn Prompt, store: &dyn CredentialStore) -> Result<String, String> {
     if !prompt.is_interactive() {
         return Err(SET_NOT_INTERACTIVE.to_string());
@@ -217,31 +196,28 @@ fn first_four(token: &str) -> String {
     token.chars().take(4).collect()
 }
 
-/// `lil dev agent-token status`: `(stored, text)`. The text names the target that answered (the
-/// one [`resolve_token`] uses), the token's first four characters and the expiry entered at
-/// `set`, never the token. A token found only under the legacy name counts as stored, since it
-/// still works, and the text says how to store it under the new name.
+/// `lil dev agent-token status`: `(stored, text)`. The text names the target, the token's first
+/// four characters and the expiry entered at `set`, never the token.
 pub fn status(store: &dyn CredentialStore) -> Result<(bool, String), String> {
     match stored_credential(store) {
-        Ok(Some((c, target))) => {
+        Ok(Some(c)) => {
             let expiry = c
                 .comment
                 .as_deref()
                 .and_then(|c| c.strip_prefix(EXPIRY_KEY))
                 .unwrap_or("not recorded");
-            let mut text = format!(
-                "Agent token: stored in Windows Credential Manager as {target}. Starts with: {}. Expiry entered at `set`: {expiry}.",
-                first_four(c.secret.trim())
-            );
-            if target == LEGACY_AGENT_TOKEN_TARGET {
-                text.push_str(" It is stored under the legacy name; run `lil dev agent-token set` at a terminal to store it under the new name.");
-            }
-            Ok((true, text))
+            Ok((
+                true,
+                format!(
+                    "Agent token: stored in Windows Credential Manager as {AGENT_TOKEN_TARGET}. Starts with: {}. Expiry entered at `set`: {expiry}.",
+                    first_four(c.secret.trim())
+                ),
+            ))
         }
         Ok(None) => Ok((
             false,
             format!(
-                "Agent token: none stored ({AGENT_TOKEN_TARGET}, or the legacy {LEGACY_AGENT_TOKEN_TARGET}). Run `lil dev agent-token set` at a terminal to store one."
+                "Agent token: none stored ({AGENT_TOKEN_TARGET}). Run `lil dev agent-token set` at a terminal to store one."
             ),
         )),
         Err(e) => Err(format!(
@@ -250,51 +226,23 @@ pub fn status(store: &dyn CredentialStore) -> Result<(bool, String), String> {
     }
 }
 
-/// `lil dev agent-token clear [--legacy]`: removes the token under both names, or with `legacy`
-/// only the one under [`LEGACY_AGENT_TOKEN_TARGET`]. Like `set`, it only runs at a real
-/// terminal. It only deletes; it never writes.
-pub fn clear(
-    prompt: &dyn Prompt,
-    store: &dyn CredentialStore,
-    legacy: bool,
-) -> Result<String, String> {
+/// `lil dev agent-token clear`: removes the token at [`AGENT_TOKEN_TARGET`]. Like `set`, it
+/// only runs at a real terminal. It only deletes; it never writes.
+pub fn clear(prompt: &dyn Prompt, store: &dyn CredentialStore) -> Result<String, String> {
     if !prompt.is_interactive() {
         return Err(CLEAR_NOT_INTERACTIVE.to_string());
     }
-    let targets: &[&str] = if legacy {
-        &[LEGACY_AGENT_TOKEN_TARGET]
-    } else {
-        &READ_ORDER
-    };
-    let mut removed = Vec::new();
-    for &target in targets {
-        match store.delete(target) {
-            Ok(true) => removed.push(target),
-            Ok(false) => {}
-            Err(e) => {
-                let done = if removed.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (already removed: {})", removed.join(", "))
-                };
-                return Err(format!(
-                    "couldn't remove the agent token {target} from Windows Credential Manager: {e}{done}"
-                ));
-            }
-        }
+    match store.delete(AGENT_TOKEN_TARGET) {
+        Ok(true) => Ok(format!(
+            "Agent token removed from Windows Credential Manager ({AGENT_TOKEN_TARGET})."
+        )),
+        Ok(false) => Ok(format!(
+            "No agent token was stored ({AGENT_TOKEN_TARGET}); nothing changed."
+        )),
+        Err(e) => Err(format!(
+            "couldn't remove the agent token {AGENT_TOKEN_TARGET} from Windows Credential Manager: {e}"
+        )),
     }
-    let which = if legacy { " under the legacy name" } else { "" };
-    Ok(if removed.is_empty() {
-        format!(
-            "No agent token was stored{which} ({}); nothing changed.",
-            targets.join(", ")
-        )
-    } else {
-        format!(
-            "Agent token{which} removed from Windows Credential Manager ({}).",
-            removed.join(", ")
-        )
-    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -595,14 +543,13 @@ pub fn run_status() -> i32 {
     }
 }
 
-/// `lil dev agent-token clear [--legacy]`.
-pub fn run_clear(legacy: bool) -> i32 {
+/// `lil dev agent-token clear`.
+pub fn run_clear() -> i32 {
     print_result(
         "lil dev agent-token clear",
         clear(
             &super::reviewer::TerminalPrompt,
             &lil_platform::credentials::WindowsCredentialStore,
-            legacy,
         ),
     )
 }
@@ -640,10 +587,8 @@ pub fn run_gh(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lil_platform::credentials::{
-        CredentialError, MemoryCredentialStore, TargetUse, check_target,
-    };
-    use lil_platform::names::{DEV_CREDENTIAL_PREFIX, LEGACY_DEV_CREDENTIAL_PREFIX};
+    use lil_platform::credentials::{CredentialError, MemoryCredentialStore, check_target};
+    use lil_platform::names::DEV_CREDENTIAL_PREFIX;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::ffi::OsString;
@@ -702,86 +647,15 @@ mod tests {
         }
     }
 
-    /// A store that can hold entries under either name, including the legacy one the real
-    /// store no longer writes. Seeding bypasses the checks; every call made by the code under
-    /// test goes through `check_target` like the real store, and is recorded.
-    #[derive(Default)]
-    struct FakeStore {
-        items: RefCell<std::collections::BTreeMap<String, Credential>>,
-        writes: RefCell<Vec<String>>,
-        deletes: RefCell<Vec<String>>,
-    }
-
-    impl FakeStore {
-        fn with(entries: &[(&str, &str, Option<&str>)]) -> Self {
-            let store = Self::default();
-            for (target, secret, comment) in entries {
-                store.items.borrow_mut().insert(
-                    target.to_ascii_lowercase(),
-                    Credential {
-                        username: AGENT_TOKEN_USERNAME.into(),
-                        secret: Zeroizing::new(secret.to_string()),
-                        comment: comment.map(str::to_string),
-                    },
-                );
-            }
-            store
-        }
-        fn secret(&self, target: &str) -> Option<String> {
-            self.items
-                .borrow()
-                .get(&target.to_ascii_lowercase())
-                .map(|c| c.secret.to_string())
-        }
-    }
-
-    impl CredentialStore for FakeStore {
-        fn get(&self, target: &str) -> Result<Option<Credential>, CredentialError> {
-            check_target(target, TargetUse::Read)?;
-            Ok(self
-                .items
-                .borrow()
-                .get(&target.to_ascii_lowercase())
-                .cloned())
-        }
-        fn set(&self, target: &str, credential: &Credential) -> Result<(), CredentialError> {
-            self.writes.borrow_mut().push(target.to_string());
-            check_target(target, TargetUse::Write)?;
-            self.items
-                .borrow_mut()
-                .insert(target.to_ascii_lowercase(), credential.clone());
-            Ok(())
-        }
-        fn delete(&self, target: &str) -> Result<bool, CredentialError> {
-            self.deletes.borrow_mut().push(target.to_string());
-            check_target(target, TargetUse::Delete)?;
-            Ok(self
-                .items
-                .borrow_mut()
-                .remove(&target.to_ascii_lowercase())
-                .is_some())
-        }
-    }
-
-    const OLD_TOKEN: &str = "github_pat_22OLDOLDOLD0123456789_legacylegacylegacylegacylegacyle";
-
-    /// The agent token's two targets sit under the new and the legacy owner-tooling prefix.
+    /// The agent token's target sits under the owner-tooling prefix, which the real store
+    /// reads, writes and deletes.
     #[test] // spec: QA-079
-    fn agent_token_targets_are_the_new_and_legacy_dev_names() {
+    fn agent_token_target_is_under_the_dev_prefix() {
         assert_eq!(
             AGENT_TOKEN_TARGET,
             format!("{DEV_CREDENTIAL_PREFIX}github/agent-token")
         );
-        assert_eq!(
-            LEGACY_AGENT_TOKEN_TARGET,
-            format!("{LEGACY_DEV_CREDENTIAL_PREFIX}github/agent-token")
-        );
-        // The real store writes the new target and refuses to write the legacy one.
-        assert_eq!(check_target(AGENT_TOKEN_TARGET, TargetUse::Write), Ok(()));
-        assert!(check_target(LEGACY_AGENT_TOKEN_TARGET, TargetUse::Write).is_err());
-        for use_ in [TargetUse::Read, TargetUse::Delete] {
-            assert_eq!(check_target(LEGACY_AGENT_TOKEN_TARGET, use_), Ok(()));
-        }
+        assert_eq!(check_target(AGENT_TOKEN_TARGET), Ok(()));
     }
 
     // ---- a scripted prompt -----------------------------------------------------------------
@@ -873,103 +747,6 @@ mod tests {
     fn a_store_error_is_an_error_not_a_missing_token() {
         let e = resolve_token(None, &BrokenStore).unwrap_err();
         assert!(format!("{e:#}").contains("access denied"), "{e:#}");
-    }
-
-    #[test] // spec: QA-079
-    fn resolve_token_prefers_the_new_target() {
-        let store = FakeStore::with(&[
-            (LEGACY_AGENT_TOKEN_TARGET, OLD_TOKEN, None),
-            (AGENT_TOKEN_TARGET, TOKEN, None),
-        ]);
-        assert_eq!(resolve_token(None, &store).unwrap().as_str(), TOKEN);
-        let (token, target) = stored_token(&store).unwrap().unwrap();
-        assert_eq!(token.as_str(), TOKEN);
-        assert_eq!(target, AGENT_TOKEN_TARGET);
-        // Reading never writes or deletes anything.
-        assert!(store.writes.borrow().is_empty());
-        assert!(store.deletes.borrow().is_empty());
-    }
-
-    /// Review Focus 1: a token stored only under the legacy name still authenticates `merge`,
-    /// `gh` and `git push`.
-    #[test] // spec: QA-079
-    fn resolve_token_falls_back_to_the_legacy_target() {
-        let padded = format!(" {OLD_TOKEN}\n");
-        let store = FakeStore::with(&[(LEGACY_AGENT_TOKEN_TARGET, &padded, None)]);
-        for env in [None, Some(""), Some("  ")] {
-            let t = resolve_token(env.map(|e| Zeroizing::new(e.to_string())), &store).unwrap();
-            assert_eq!(t.as_str(), OLD_TOKEN);
-        }
-        let (token, target) = stored_token(&store).unwrap().unwrap();
-        assert_eq!(token.as_str(), OLD_TOKEN);
-        assert_eq!(target, LEGACY_AGENT_TOKEN_TARGET);
-        assert!(store.writes.borrow().is_empty());
-        assert!(store.deletes.borrow().is_empty());
-        // Any case of the legacy name is the same Credential Manager entry.
-        let upper = LEGACY_AGENT_TOKEN_TARGET.to_ascii_uppercase();
-        let store = FakeStore::with(&[(&upper, OLD_TOKEN, None)]);
-        assert_eq!(resolve_token(None, &store).unwrap().as_str(), OLD_TOKEN);
-        // GITHUB_TOKEN still comes first, and then nothing is read.
-        let t = resolve_token(Some(Zeroizing::new("ci".into())), &Untouchable).unwrap();
-        assert_eq!(t.as_str(), "ci");
-        // Neither name: the same refusal as before.
-        let e = resolve_token(None, &FakeStore::default()).unwrap_err();
-        assert!(
-            format!("{e:#}").contains("lil dev agent-token set"),
-            "{e:#}"
-        );
-        assert!(stored_token(&FakeStore::default()).unwrap().is_none());
-    }
-
-    #[test] // spec: QA-079
-    fn blank_new_target_falls_back() {
-        for blank in ["", "   ", "\r\n"] {
-            let store = FakeStore::with(&[
-                (AGENT_TOKEN_TARGET, blank, None),
-                (LEGACY_AGENT_TOKEN_TARGET, OLD_TOKEN, None),
-            ]);
-            assert_eq!(resolve_token(None, &store).unwrap().as_str(), OLD_TOKEN);
-            assert_eq!(
-                stored_token(&store).unwrap().unwrap().1,
-                LEGACY_AGENT_TOKEN_TARGET
-            );
-            // Both blank: no token.
-            let store = FakeStore::with(&[
-                (AGENT_TOKEN_TARGET, blank, None),
-                (LEGACY_AGENT_TOKEN_TARGET, blank, None),
-            ]);
-            assert!(resolve_token(None, &store).is_err());
-            assert!(stored_token(&store).unwrap().is_none());
-        }
-    }
-
-    /// A failed read of the new target is an error; it never quietly falls back to the legacy
-    /// token.
-    #[test] // spec: QA-079
-    fn a_store_error_on_the_new_target_is_not_a_fallback_to_the_legacy_token() {
-        struct NewTargetBroken(FakeStore);
-        impl CredentialStore for NewTargetBroken {
-            fn get(&self, target: &str) -> Result<Option<Credential>, CredentialError> {
-                if target == AGENT_TOKEN_TARGET {
-                    return BrokenStore.get(target);
-                }
-                self.0.get(target)
-            }
-            fn set(&self, t: &str, c: &Credential) -> Result<(), CredentialError> {
-                self.0.set(t, c)
-            }
-            fn delete(&self, t: &str) -> Result<bool, CredentialError> {
-                self.0.delete(t)
-            }
-        }
-        let store = NewTargetBroken(FakeStore::with(&[(
-            LEGACY_AGENT_TOKEN_TARGET,
-            OLD_TOKEN,
-            None,
-        )]));
-        let e = resolve_token(None, &store).unwrap_err();
-        assert!(format!("{e:#}").contains("access denied"), "{e:#}");
-        assert!(status(&store).is_err());
     }
 
     // ---- set -------------------------------------------------------------------------------
@@ -1066,44 +843,6 @@ mod tests {
         assert_eq!(c.secret.as_str(), TOKEN);
     }
 
-    /// Review Focus 1: `set` writes the new name only. A token under the legacy name is left
-    /// exactly as it was, and no write ever names it.
-    #[test] // spec: QA-079
-    fn set_writes_only_the_new_target() {
-        let store = FakeStore::with(&[(
-            LEGACY_AGENT_TOKEN_TARGET,
-            OLD_TOKEN,
-            Some("expires=2026-12-31"),
-        )]);
-        // Only a token under the new name counts as "already stored": nothing is asked.
-        let prompt = FakePrompt::new(&[TOKEN], &["2027-01-31"], &[]);
-        let said = set_token(&prompt, &store).unwrap();
-        assert!(said.contains(AGENT_TOKEN_TARGET), "{said}");
-        assert!(!said.contains(TOKEN), "{said}");
-        assert_eq!(*store.writes.borrow(), vec![AGENT_TOKEN_TARGET.to_string()]);
-        assert!(store.deletes.borrow().is_empty());
-        assert_eq!(store.secret(AGENT_TOKEN_TARGET).as_deref(), Some(TOKEN));
-        assert_eq!(
-            store.secret(LEGACY_AGENT_TOKEN_TARGET).as_deref(),
-            Some(OLD_TOKEN)
-        );
-        // From now on the new token answers.
-        let (token, target) = stored_token(&store).unwrap().unwrap();
-        assert_eq!((token.as_str(), target), (TOKEN, AGENT_TOKEN_TARGET));
-        // Replacing it later writes the new name again, and only it.
-        let prompt = FakePrompt::new(&[TOKEN], &["none"], &[true]);
-        set_token(&prompt, &store).unwrap();
-        assert_eq!(
-            *store.writes.borrow(),
-            vec![AGENT_TOKEN_TARGET.to_string(); 2]
-        );
-        assert!(store.deletes.borrow().is_empty());
-        assert_eq!(
-            store.secret(LEGACY_AGENT_TOKEN_TARGET).as_deref(),
-            Some(OLD_TOKEN)
-        );
-    }
-
     #[test] // spec: QA-079
     fn set_reports_a_store_failure() {
         let prompt = FakePrompt::new(&[TOKEN], &["2027-01-31"], &[]);
@@ -1150,157 +889,24 @@ mod tests {
         let at_terminal = FakePrompt::new(&[], &[], &[]);
         let store = MemoryCredentialStore::new();
         stored(&store, TOKEN, None);
-        assert!(
-            clear(&at_terminal, &store, false)
-                .unwrap()
-                .contains("removed")
-        );
+        let said = clear(&at_terminal, &store).unwrap();
+        assert!(said.contains("removed"), "{said}");
+        assert!(said.contains(AGENT_TOKEN_TARGET), "{said}");
         assert_eq!(store.get(AGENT_TOKEN_TARGET).unwrap(), None);
+        assert!(resolve_token(None, &store).is_err());
         assert!(
-            clear(&at_terminal, &store, false)
+            clear(&at_terminal, &store)
                 .unwrap()
                 .contains("No agent token")
         );
-        assert!(clear(&at_terminal, &BrokenStore, false).is_err());
-        assert!(clear(&at_terminal, &BrokenStore, true).is_err());
+        assert!(clear(&at_terminal, &BrokenStore).is_err());
     }
 
     #[test] // spec: QA-079
     fn clear_refuses_without_a_terminal_and_touches_nothing() {
-        for legacy in [false, true] {
-            let e = clear(&FakePrompt::not_a_terminal(), &Untouchable, legacy).unwrap_err();
-            assert_eq!(e, CLEAR_NOT_INTERACTIVE);
-            assert!(e.contains("terminal"));
-        }
-    }
-
-    #[test] // spec: QA-079
-    fn status_names_the_target_that_answered() {
-        // The new name answers: no word about the legacy one.
-        let store = FakeStore::with(&[
-            (AGENT_TOKEN_TARGET, TOKEN, Some("expires=2027-01-31")),
-            (
-                LEGACY_AGENT_TOKEN_TARGET,
-                OLD_TOKEN,
-                Some("expires=2026-12-31"),
-            ),
-        ]);
-        let (present, text) = status(&store).unwrap();
-        assert!(present);
-        assert!(text.contains(AGENT_TOKEN_TARGET), "{text}");
-        assert!(text.contains("2027-01-31"), "{text}");
-        assert!(!text.contains(LEGACY_AGENT_TOKEN_TARGET), "{text}");
-        assert!(!text.contains("legacy"), "{text}");
-        // Only the legacy name holds a token: it is named, and the owner is told how to move it.
-        let store = FakeStore::with(&[(
-            LEGACY_AGENT_TOKEN_TARGET,
-            OLD_TOKEN,
-            Some("expires=2026-12-31"),
-        )]);
-        let (present, text) = status(&store).unwrap();
-        assert!(
-            present,
-            "a legacy token still works, so it counts as stored"
-        );
-        assert!(text.contains(LEGACY_AGENT_TOKEN_TARGET), "{text}");
-        assert!(text.contains("2026-12-31"), "{text}");
-        assert!(
-            text.contains(
-                "stored under the legacy name; run `lil dev agent-token set` at a terminal to store it under the new name"
-            ),
-            "{text}"
-        );
-        assert!(!text.contains(OLD_TOKEN), "{text}");
-        let without_names = text
-            .replace(LEGACY_AGENT_TOKEN_TARGET, "")
-            .replace(AGENT_TOKEN_TARGET, "");
-        assert!(
-            !without_names.contains(&OLD_TOKEN[..5]),
-            "more than four characters shown: {text}"
-        );
-        assert!(store.writes.borrow().is_empty());
-        assert!(store.deletes.borrow().is_empty());
-        // A blank new entry doesn't hide the legacy token.
-        let store = FakeStore::with(&[
-            (AGENT_TOKEN_TARGET, " ", None),
-            (LEGACY_AGENT_TOKEN_TARGET, OLD_TOKEN, None),
-        ]);
-        let (present, text) = status(&store).unwrap();
-        assert!(present);
-        assert!(text.contains(LEGACY_AGENT_TOKEN_TARGET), "{text}");
-        // Neither: both names are given in the "none stored" text.
-        let (present, text) = status(&FakeStore::default()).unwrap();
-        assert!(!present);
-        assert!(text.contains(AGENT_TOKEN_TARGET), "{text}");
-        assert!(text.contains(LEGACY_AGENT_TOKEN_TARGET), "{text}");
-        assert!(text.contains("lil dev agent-token set"), "{text}");
-    }
-
-    #[test] // spec: QA-079
-    fn clear_removes_both_targets() {
-        let at_terminal = FakePrompt::new(&[], &[], &[]);
-        let store = FakeStore::with(&[
-            (AGENT_TOKEN_TARGET, TOKEN, None),
-            (LEGACY_AGENT_TOKEN_TARGET, OLD_TOKEN, None),
-        ]);
-        let said = clear(&at_terminal, &store, false).unwrap();
-        assert!(said.contains(AGENT_TOKEN_TARGET), "{said}");
-        assert!(said.contains(LEGACY_AGENT_TOKEN_TARGET), "{said}");
-        assert_eq!(store.secret(AGENT_TOKEN_TARGET), None);
-        assert_eq!(store.secret(LEGACY_AGENT_TOKEN_TARGET), None);
-        assert!(store.writes.borrow().is_empty());
-        let mut deleted = store.deletes.borrow().clone();
-        deleted.sort();
-        let mut both = vec![
-            AGENT_TOKEN_TARGET.to_string(),
-            LEGACY_AGENT_TOKEN_TARGET.to_string(),
-        ];
-        both.sort();
-        assert_eq!(deleted, both);
-        assert!(resolve_token(None, &store).is_err());
-        // Only one of them stored: it goes, and nothing answers afterwards.
-        for only in [AGENT_TOKEN_TARGET, LEGACY_AGENT_TOKEN_TARGET] {
-            let store = FakeStore::with(&[(only, TOKEN, None)]);
-            let said = clear(&at_terminal, &store, false).unwrap();
-            assert!(said.contains("removed"), "{said}");
-            assert!(said.contains(only), "{said}");
-            assert!(stored_token(&store).unwrap().is_none());
-        }
-        // Nothing stored: nothing changed, and both names are given.
-        let said = clear(&at_terminal, &FakeStore::default(), false).unwrap();
-        assert!(said.contains("No agent token"), "{said}");
-        assert!(said.contains(AGENT_TOKEN_TARGET), "{said}");
-        assert!(said.contains(LEGACY_AGENT_TOKEN_TARGET), "{said}");
-    }
-
-    /// Review Focus 1: `clear --legacy` removes the old entry and nothing else.
-    #[test] // spec: QA-079
-    fn clear_legacy_removes_only_the_legacy_target() {
-        let at_terminal = FakePrompt::new(&[], &[], &[]);
-        let store = FakeStore::with(&[
-            (AGENT_TOKEN_TARGET, TOKEN, Some("expires=2027-01-31")),
-            (LEGACY_AGENT_TOKEN_TARGET, OLD_TOKEN, None),
-        ]);
-        let said = clear(&at_terminal, &store, true).unwrap();
-        assert!(said.contains(LEGACY_AGENT_TOKEN_TARGET), "{said}");
-        assert!(said.contains("removed"), "{said}");
-        assert_eq!(
-            *store.deletes.borrow(),
-            vec![LEGACY_AGENT_TOKEN_TARGET.to_string()]
-        );
-        assert!(store.writes.borrow().is_empty());
-        assert_eq!(store.secret(LEGACY_AGENT_TOKEN_TARGET), None);
-        assert_eq!(store.secret(AGENT_TOKEN_TARGET).as_deref(), Some(TOKEN));
-        // The new token still answers.
-        assert_eq!(resolve_token(None, &store).unwrap().as_str(), TOKEN);
-        // Again: nothing to remove, and still only the legacy name is touched.
-        let said = clear(&at_terminal, &store, true).unwrap();
-        assert!(said.contains("nothing changed"), "{said}");
-        assert_eq!(
-            *store.deletes.borrow(),
-            vec![LEGACY_AGENT_TOKEN_TARGET.to_string(); 2]
-        );
-        assert_eq!(store.secret(AGENT_TOKEN_TARGET).as_deref(), Some(TOKEN));
+        let e = clear(&FakePrompt::not_a_terminal(), &Untouchable).unwrap_err();
+        assert_eq!(e, CLEAR_NOT_INTERACTIVE);
+        assert!(e.contains("terminal"));
     }
 
     // ---- git-credential --------------------------------------------------------------------
@@ -1372,26 +978,6 @@ mod tests {
             .unwrap_err();
         assert!(format!("{e:#}").contains("lil dev agent-token set"));
         assert!(out.is_empty());
-    }
-
-    #[test] // spec: QA-079
-    fn git_credential_get_falls_back_to_the_legacy_target() {
-        let store = FakeStore::with(&[(LEGACY_AGENT_TOKEN_TARGET, OLD_TOKEN, None)]);
-        let token = || resolve_token(None, &store);
-        let mut out = Vec::new();
-        git_credential(
-            "get",
-            "protocol=https\nhost=github.com\n\n",
-            &token,
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            format!("username=x-access-token\npassword={OLD_TOKEN}\n")
-        );
-        assert!(store.writes.borrow().is_empty());
-        assert!(store.deletes.borrow().is_empty());
     }
 
     #[test] // spec: QA-079
