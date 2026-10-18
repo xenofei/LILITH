@@ -35,10 +35,19 @@ struct State {
     /// Run ids `rerun_as_app` accepted.
     reruns: Vec<u64>,
     rerun_error: Option<String>,
-    /// The order of the app-token calls: `post_review`, `workflow_runs`, `rerun <id>`, plus
+    /// The slug `app_slug` answers with; `None` means the App's current slug,
+    /// [`DEFAULT_APP_SLUG`]. Reviews posted as the App carry `<slug>[bot]`.
+    app_slug: Option<String>,
+    /// The JWTs `app_slug` was asked with (test JWTs only).
+    app_jwts: Vec<String>,
+    app_slug_error: Option<String>,
+    /// The order of the App calls: `app`, `post_review`, `workflow_runs`, `rerun <id>`, plus
     /// anything a test adds with [`FakeGitHub::log_event`].
     events: Vec<String>,
 }
+
+/// The reviewer App's slug before its rename (`reviewer_app_slug`).
+pub const DEFAULT_APP_SLUG: &str = "worldwright-reviewer";
 
 #[derive(Default)]
 pub struct FakeGitHub {
@@ -163,6 +172,22 @@ impl FakeGitHub {
         self.lock().rerun_error = Some(message.into());
     }
 
+    /// Makes `app_slug` answer `slug`, and reviews posted as the App carry `<slug>[bot]` (the
+    /// App after a rename).
+    pub fn set_app_slug(&self, slug: &str) {
+        self.lock().app_slug = Some(slug.into());
+    }
+
+    /// Makes `app_slug` answer with an error.
+    pub fn fail_app_slug(&self, message: &str) {
+        self.lock().app_slug_error = Some(message.into());
+    }
+
+    /// The JWTs `app_slug` was asked with, in order.
+    pub fn app_jwts(&self) -> Vec<String> {
+        self.lock().app_jwts.clone()
+    }
+
     pub fn run_queries(&self) -> Vec<(String, String, String)> {
         self.lock().run_queries.clone()
     }
@@ -249,8 +274,12 @@ impl GitHubApi for FakeGitHub {
             sha: sha.into(),
             body: body.into(),
         });
+        let login = format!(
+            "{}[bot]",
+            st.app_slug.as_deref().unwrap_or(DEFAULT_APP_SLUG)
+        );
         st.reviews.entry(number).or_default().push(Review {
-            login: "worldwright-reviewer[bot]".into(),
+            login,
             state: "APPROVED".into(),
             commit_id: sha.into(),
         });
@@ -307,5 +336,18 @@ impl GitHubApi for FakeGitHub {
         run.conclusion = None;
         st.reruns.push(run_id);
         Ok(())
+    }
+
+    fn app_slug(&self, jwt: &str) -> Result<String> {
+        let mut st = self.lock();
+        st.events.push("app".into());
+        st.app_jwts.push(jwt.into());
+        if let Some(msg) = &st.app_slug_error {
+            return Err(anyhow!("fake: {msg}"));
+        }
+        Ok(st
+            .app_slug
+            .clone()
+            .unwrap_or_else(|| DEFAULT_APP_SLUG.into()))
     }
 }

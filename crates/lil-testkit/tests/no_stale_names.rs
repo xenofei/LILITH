@@ -9,9 +9,10 @@
 //! **Matching.** A row allows a line when the file's path matches one of the row's globs and
 //! the line contains one of the row's `lines_with` substrings. A row with no substrings allows
 //! the whole file. A path hit is checked the same way, with the path itself as the line.
-//! Substrings match case-sensitively, so the D9 row's `Worldwright-Suite` never allows the
-//! old spec path `2026-10-12-worldwright-suite-design.md`. Globs are case-sensitive too: `*`
-//! matches within one path segment and `**` matches any number of whole segments.
+//! Substrings match case-sensitively, so the D9 row's `worldwright-reviewer` never allows
+//! `Worldwright-Reviewer`, and no row allows the old spec path
+//! `2026-10-12-worldwright-suite-design.md`. Globs are case-sensitive too: `*` matches within
+//! one path segment and `**` matches any number of whole segments.
 //!
 //! **Keep rows narrow.** One file or glob plus the exact substrings that must stay, with a
 //! reason and an end date. A row that would hide a new old name is a defect.
@@ -195,21 +196,14 @@ const ALLOW: &[Allow] = &[
               read (A2, B2 review)",
         until: "PR-D, with the legacy readers",
     },
+    // D9 as PR-C narrowed it: the repo is `LILITH` everywhere, and the App's current slug
+    // stays only in the settings and the tooling that reads them, since both slugs count
+    // until the owner renames the App (D6).
     Allow {
-        globs: &[
-            "crates/lil-cli/src/dev/merge.rs",
-            "crates/lil-cli/src/dev/reviewer.rs",
-        ],
-        lines_with: &["/worldwright-suite\"", "\"worldwright-app[bot]\""],
-        why: "D9 test literals in PR-C's files: a repo slug in another case and a lookalike App \
-              login, neither matched by the D9 row's exact substrings",
-        until: "PR-C, which reviews them with the D9 row",
-    },
-    Allow {
-        globs: &["**"],
-        lines_with: &["Worldwright-Suite", "worldwright-reviewer"],
-        why: "repo and App names (D9)",
-        until: "PR-C, which reviews and narrows it",
+        globs: &["dev/merge-guard.toml", "crates/lil-cli/src/dev/*.rs"],
+        lines_with: &["worldwright-reviewer"],
+        why: "the reviewer App's current slug; approvals count from it or the next slug (D6, D9)",
+        until: "PR-D",
     },
     // Rows beyond the plan's table.
     Allow {
@@ -472,15 +466,40 @@ fn allowlist_is_case_sensitive_so_the_old_spec_path_is_not_allowed() {
         &format!("see [the spec]({old_spec})")
     ));
     assert!(!allowed("README.md", "WORLDWRIGHT-SUITE"));
-    // The D9 row allows the repo and App names only as written.
-    assert!(allowed("README.md", "github.com/<owner>/Worldwright-Suite"));
+    // The D9 row, as PR-C narrowed it, allows only the App's current slug, as written, and
+    // only in the settings and the dev tooling. The old repo name is allowed nowhere.
+    assert!(!allowed(
+        "README.md",
+        "github.com/<owner>/Worldwright-Suite"
+    ));
+    assert!(!allowed(
+        "dev/merge-guard.toml",
+        "repo = \"Worldwright-Suite\""
+    ));
+    assert!(!allowed(
+        "crates/lil-cli/src/dev/merge.rs",
+        "repo: \"Worldwright-Suite\".into(),"
+    ));
     assert!(allowed(
         "dev/merge-guard.toml",
-        "app = \"worldwright-reviewer\""
+        "reviewer_app_slug = \"worldwright-reviewer\""
+    ));
+    assert!(allowed(
+        "crates/lil-cli/src/dev/merge.rs",
+        "const BOT: &str = \"worldwright-reviewer[bot]\";"
     ));
     assert!(!allowed(
         "dev/merge-guard.toml",
         "app = \"Worldwright-Reviewer\""
+    ));
+    assert!(!allowed(
+        "docs/dev/merge-guard.md",
+        "`worldwright-reviewer`"
+    ));
+    assert!(!allowed("README.md", "worldwright-reviewer"));
+    assert!(!allowed(
+        "crates/lil-cli/src/dev/nested/x.rs",
+        "worldwright-reviewer"
     ));
     // Other substrings and globs are case-sensitive too.
     assert!(allowed("crates/lil-core/src/x.rs", "LEGACY_HOME_DIR"));

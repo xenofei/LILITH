@@ -25,10 +25,13 @@
 //! `origin/<base_branch>` are the same ref. The guard diffs `base...head` (from the merge-base),
 //! so later commits on `main` are not counted as the PR's changes.
 //!
-//! **Approval** counts only when the latest review that `<reviewer_app_slug>[bot]` left on the
-//! checked head commit is `APPROVED`. GitHub lists reviews oldest first, so "latest" is the last
-//! one in the list; a later `DISMISSED`, `CHANGES_REQUESTED`, `COMMENTED` or `PENDING` review by
-//! the App on that commit cancels an earlier approval.
+//! **Approval** counts only when the latest review that the reviewer App left on the checked
+//! head commit is `APPROVED`. The App's login is `<reviewer_app_slug>[bot]`, or, while the App
+//! is being renamed, `<reviewer_app_slug_next>[bot]` ([`MergeGuardConfig::reviewer_logins`];
+//! plan 2026-10-17, D6). "Latest" is taken across both logins. GitHub lists reviews oldest
+//! first, so it is the last one in the list; a later `DISMISSED`, `CHANGES_REQUESTED`,
+//! `COMMENTED` or `PENDING` review by the App on that commit, under either login, cancels an
+//! earlier approval. No other login counts, a person's included.
 
 use super::agent_access::GIT_CREDENTIAL_HELPER;
 use super::github::{
@@ -50,6 +53,11 @@ pub struct MergeGuardConfig {
     pub repo: String,
     pub base_branch: String,
     pub reviewer_app_slug: String,
+    /// The App's slug after its rename (plan 2026-10-17, D6). While it is set, approvals count
+    /// from either slug. Optional, so settings without it still parse; unknown keys are still
+    /// refused, so a binary from before this key refuses settings that have it.
+    #[serde(default)]
+    pub reviewer_app_slug_next: Option<String>,
     pub required_checks: Vec<String>,
     pub hooks_path: String,
 }
@@ -82,6 +90,13 @@ impl MergeGuardConfig {
                 bail!("merge-guard settings: `{key}` = {value:?} is empty or not a plain name");
             }
         }
+        if let Some(next) = &cfg.reviewer_app_slug_next
+            && !is_plain_name(next)
+        {
+            bail!(
+                "merge-guard settings: `reviewer_app_slug_next` = {next:?} is empty or not a plain name"
+            );
+        }
         if cfg.required_checks.is_empty() {
             bail!(
                 "merge-guard settings: `required_checks` is empty; a merge needs at least one CI check"
@@ -93,9 +108,25 @@ impl MergeGuardConfig {
         Ok(cfg)
     }
 
-    /// The login GitHub shows on the reviewer App's reviews.
-    pub fn reviewer_login(&self) -> String {
-        format!("{}[bot]", self.reviewer_app_slug)
+    /// The reviewer App's slugs: `reviewer_app_slug`, then `reviewer_app_slug_next` when it is
+    /// set and differs.
+    pub fn reviewer_slugs(&self) -> Vec<&str> {
+        let mut slugs = vec![self.reviewer_app_slug.as_str()];
+        if let Some(next) = self.reviewer_app_slug_next.as_deref()
+            && next != self.reviewer_app_slug
+        {
+            slugs.push(next);
+        }
+        slugs
+    }
+
+    /// The logins GitHub shows on the reviewer App's reviews: `<slug>[bot]` for each of
+    /// [`Self::reviewer_slugs`]. A person's login never ends in `[bot]`.
+    pub fn reviewer_logins(&self) -> Vec<String> {
+        self.reviewer_slugs()
+            .iter()
+            .map(|slug| format!("{slug}[bot]"))
+            .collect()
     }
 }
 
@@ -143,11 +174,12 @@ pub enum Refusal {
     },
 }
 
-/// `true` when the latest review by `login` on commit `sha` is `APPROVED`.
-pub fn app_approved(reviews: &[Review], login: &str, sha: &str) -> bool {
+/// `true` when the latest review on commit `sha` by any of `logins` (compared exactly) is
+/// `APPROVED`.
+pub fn app_approved(reviews: &[Review], logins: &[String], sha: &str) -> bool {
     reviews
         .iter()
-        .rfind(|r| r.login == login && r.commit_id == sha)
+        .rfind(|r| r.commit_id == sha && logins.contains(&r.login))
         .is_some_and(|r| r.state == "APPROVED")
 }
 
@@ -312,7 +344,7 @@ pub fn merge_conditions(
                 &format!("reading the reviews of PR #{pr} failed"),
                 &e,
             )),
-            Ok(reviews) if app_approved(&reviews, &cfg.reviewer_login(), &head) => {}
+            Ok(reviews) if app_approved(&reviews, &cfg.reviewer_logins(), &head) => {}
             Ok(_) => refusals.push(Refusal::ProtectedNeedsApproval(blocker_lines(&v))),
         },
         Ok(_) => {}
@@ -763,11 +795,12 @@ pub fn run_guard(base: &str, head: &str, pr: Option<u64>) -> i32 {
             return 1;
         }
     };
-    let login = cfg.reviewer_login();
+    let logins = cfg.reviewer_logins();
+    let login = logins.join(" or ");
     let approved = github_token()
         .and_then(|token| RestClient::new(&cfg.owner, &cfg.repo, &token))
         .and_then(|client| client.reviews(pr))
-        .map(|reviews| app_approved(&reviews, &login, &head_sha));
+        .map(|reviews| app_approved(&reviews, &logins, &head_sha));
     match approved {
         Ok(true) => {
             println!(
@@ -808,13 +841,16 @@ mod tests {
     const OLD: &str = "fedcba0987654321fedcba0987654321fedcba09";
     const NEW: &str = "0000000000000000000000000000000000000abc";
     const BOT: &str = "worldwright-reviewer[bot]";
+    /// The login of the App after its rename (`reviewer_app_slug_next`, D6).
+    const NEXT_BOT: &str = "lilith-reviewer[bot]";
 
     fn cfg() -> MergeGuardConfig {
         MergeGuardConfig {
             owner: "xenofei".into(),
-            repo: "Worldwright-Suite".into(),
+            repo: "LILITH".into(),
             base_branch: "main".into(),
             reviewer_app_slug: "worldwright-reviewer".into(),
+            reviewer_app_slug_next: Some("lilith-reviewer".into()),
             required_checks: vec![
                 "every-push".into(),
                 "pr-ready".into(),
@@ -827,6 +863,18 @@ mod tests {
 
     fn hooks() -> Option<String> {
         Some("tools/git-hooks".into())
+    }
+
+    fn logins(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn review(login: &str, state: &str, commit_id: &str) -> Review {
+        Review {
+            login: login.into(),
+            state: state.into(),
+            commit_id: commit_id.into(),
+        }
     }
 
     /// An open PR at `HEAD` with every required check green on `HEAD`.
@@ -1054,9 +1102,10 @@ mod tests {
     fn approval_by_human_does_not_count() {
         let fake = green();
         fake.add_review(PR, "xenofei", "APPROVED", HEAD);
-        // Neither does the app's slug without the `[bot]` suffix, or another app.
+        // Neither does either app slug without the `[bot]` suffix, or another app.
         fake.add_review(PR, "worldwright-reviewer", "APPROVED", HEAD);
-        fake.add_review(PR, "worldwright-app[bot]", "APPROVED", HEAD);
+        fake.add_review(PR, "lilith-reviewer", "APPROVED", HEAD);
+        fake.add_review(PR, "lilith-app[bot]", "APPROVED", HEAD);
         let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
@@ -1230,7 +1279,7 @@ mod tests {
                     commit_id: HEAD.into(),
                 },
             ];
-            assert!(!app_approved(&reviews, BOT, HEAD), "{later}");
+            assert!(!app_approved(&reviews, &logins(&[BOT]), HEAD), "{later}");
         }
         // A human's later review does not touch the app's approval.
         let reviews = vec![
@@ -1245,7 +1294,7 @@ mod tests {
                 commit_id: HEAD.into(),
             },
         ];
-        assert!(app_approved(&reviews, BOT, HEAD));
+        assert!(app_approved(&reviews, &logins(&[BOT]), HEAD));
         // Re-approval after a dismissal counts.
         let reviews = vec![
             Review {
@@ -1259,8 +1308,8 @@ mod tests {
                 commit_id: HEAD.into(),
             },
         ];
-        assert!(app_approved(&reviews, BOT, HEAD));
-        assert!(!app_approved(&[], BOT, HEAD));
+        assert!(app_approved(&reviews, &logins(&[BOT]), HEAD));
+        assert!(!app_approved(&[], &logins(&[BOT]), HEAD));
     }
 
     #[test]
@@ -1320,7 +1369,7 @@ mod tests {
             Refusal::MergeCallFailed("timeout".into()),
             Refusal::WrongOrigin {
                 url: "C:/x/origin.git".into(),
-                expected: "github.com/xenofei/Worldwright-Suite".into(),
+                expected: "github.com/xenofei/LILITH".into(),
             },
         ];
         let text = explain(&all);
@@ -1622,6 +1671,7 @@ mod tests {
         let edited = COMMITTED
             .replace(r#""pr-ready", "#, "")
             .replace("worldwright-reviewer", "github-actions")
+            .replace("lilith-reviewer", "github-actions")
             .replace(
                 r#"hooks_path = "tools/git-hooks""#,
                 r#"hooks_path = ".git/hooks""#,
@@ -1629,6 +1679,10 @@ mod tests {
         let parsed = MergeGuardConfig::parse(&edited).unwrap();
         assert!(!parsed.required_checks.contains(&"pr-ready".to_string()));
         assert_eq!(parsed.reviewer_app_slug, "github-actions");
+        assert_eq!(
+            parsed.reviewer_app_slug_next.as_deref(),
+            Some("github-actions")
+        );
         assert_eq!(parsed.hooks_path, ".git/hooks");
         write_t(&work, CONFIG_PATH, &edited);
 
@@ -1799,7 +1853,7 @@ mod tests {
         let (checked, found) = preflight(&f.work).unwrap();
         push_settings_to_origin(
             &f,
-            &COMMITTED.replace(r#"repo = "Worldwright-Suite""#, r#"repo = "Elsewhere""#),
+            &COMMITTED.replace(r#"repo = "LILITH""#, r#"repo = "Elsewhere""#),
         );
         let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + 'static>> {
             panic!("GitHub must not be contacted")
@@ -1867,21 +1921,18 @@ mod tests {
         let r = check_origin(&f.work, &cfg()).unwrap_err();
         assert!(
             matches!(&r, Refusal::WrongOrigin { expected, .. }
-                if expected == "github.com/xenofei/Worldwright-Suite"),
+                if expected == "github.com/xenofei/LILITH"),
             "{r:?}"
         );
         let msg = explain(&[r]);
-        assert!(
-            msg.contains("expected github.com/xenofei/Worldwright-Suite"),
-            "{msg}"
-        );
+        assert!(msg.contains("expected github.com/xenofei/LILITH"), "{msg}");
         git_t(
             &f.work,
             &[
                 "remote",
                 "set-url",
                 "origin",
-                "https://github.com/xenofei/Worldwright-Suite.git",
+                "https://github.com/xenofei/LILITH.git",
             ],
         );
         assert_eq!(check_origin(&f.work, &cfg()), Ok(()));
@@ -1890,65 +1941,237 @@ mod tests {
     #[test]
     fn origin_url_matcher() {
         let ok = [
-            "https://github.com/xenofei/Worldwright-Suite",
-            "https://github.com/xenofei/Worldwright-Suite.git",
-            "https://github.com/xenofei/Worldwright-Suite/",
-            "https://github.com/xenofei/Worldwright-Suite.git/",
-            "HTTPS://GitHub.com/XENOFEI/worldwright-suite",
-            "git@github.com:xenofei/Worldwright-Suite",
-            "git@github.com:xenofei/Worldwright-Suite.git",
-            "git@GITHUB.COM:Xenofei/Worldwright-Suite.git/",
-            "ssh://git@github.com/xenofei/Worldwright-Suite",
-            "ssh://git@github.com/xenofei/Worldwright-Suite.git",
-            "  https://github.com/xenofei/Worldwright-Suite.git\n",
+            "https://github.com/xenofei/LILITH",
+            "https://github.com/xenofei/LILITH.git",
+            "https://github.com/xenofei/LILITH/",
+            "https://github.com/xenofei/LILITH.git/",
+            "HTTPS://GitHub.com/XENOFEI/lilith",
+            "git@github.com:xenofei/LILITH",
+            "git@github.com:xenofei/LILITH.git",
+            "git@GITHUB.COM:Xenofei/LILITH.git/",
+            "ssh://git@github.com/xenofei/LILITH",
+            "ssh://git@github.com/xenofei/LILITH.git",
+            "  https://github.com/xenofei/LILITH.git\n",
         ];
         for url in ok {
-            assert!(
-                origin_matches(url, "xenofei", "Worldwright-Suite"),
-                "{url:?}"
-            );
+            assert!(origin_matches(url, "xenofei", "LILITH"), "{url:?}");
         }
         let bad = [
             "",
             "C:/repos/origin.git",
-            "/srv/git/Worldwright-Suite.git",
-            "file:///srv/xenofei/Worldwright-Suite.git",
-            "http://github.com/xenofei/Worldwright-Suite",
-            "https://github.com.evil.example/xenofei/Worldwright-Suite",
-            "https://evil.example/github.com/xenofei/Worldwright-Suite",
-            "https://gitlab.com/xenofei/Worldwright-Suite",
-            "https://github.com/other/Worldwright-Suite",
-            "https://github.com/xenofei/Worldwright-Suite-fork",
-            "https://github.com/xenofei/Worldwright-Suite/extra",
-            "https://github.com/xenofei/Worldwright-Suite.git.git",
-            "https://github.com/xenofei//Worldwright-Suite",
+            "/srv/git/LILITH.git",
+            "file:///srv/xenofei/LILITH.git",
+            "http://github.com/xenofei/LILITH",
+            "https://github.com.evil.example/xenofei/LILITH",
+            "https://evil.example/github.com/xenofei/LILITH",
+            "https://gitlab.com/xenofei/LILITH",
+            "https://github.com/other/LILITH",
+            "https://github.com/xenofei/LILITH-fork",
+            "https://github.com/xenofei/LILITH/extra",
+            "https://github.com/xenofei/LILITH.git.git",
+            "https://github.com/xenofei//LILITH",
             "https://github.com/xenofei",
-            "https://token@github.com/xenofei/Worldwright-Suite",
-            "git@github.com/xenofei/Worldwright-Suite",
-            "evil@github.com:xenofei/Worldwright-Suite",
-            "ssh://git@github.com:22/xenofei/Worldwright-Suite",
-            "ssh://github.com/xenofei/Worldwright-Suite",
+            "https://token@github.com/xenofei/LILITH",
+            "git@github.com/xenofei/LILITH",
+            "evil@github.com:xenofei/LILITH",
+            "ssh://git@github.com:22/xenofei/LILITH",
+            "ssh://github.com/xenofei/LILITH",
         ];
         for url in bad {
-            assert!(
-                !origin_matches(url, "xenofei", "Worldwright-Suite"),
-                "{url:?}"
-            );
+            assert!(!origin_matches(url, "xenofei", "LILITH"), "{url:?}");
         }
     }
 
     #[test]
     fn wrong_origin_message_hides_credentials() {
         let msg = explain(&[Refusal::WrongOrigin {
-            url: "https://user:ghp_SECRET@evil.example/xenofei/Worldwright-Suite.git".into(),
-            expected: "github.com/xenofei/Worldwright-Suite".into(),
+            url: "https://user:ghp_SECRET@evil.example/xenofei/LILITH.git".into(),
+            expected: "github.com/xenofei/LILITH".into(),
         }]);
         assert!(!msg.contains("ghp_SECRET"), "{msg}");
         assert!(!msg.contains("user:"), "{msg}");
         assert!(msg.contains("evil.example"), "{msg}");
+        assert!(msg.contains("expected github.com/xenofei/LILITH"), "{msg}");
+    }
+
+    // ---- PR-C: the reviewer App's two slugs (plan 2026-10-17, D6) ---------------------------
+
+    /// The committed settings without the `reviewer_app_slug_next` line: the shape every
+    /// settings file had before PR-C.
+    fn committed_without_next() -> String {
+        let text: String = COMMITTED
+            .lines()
+            .filter(|l| !l.starts_with("reviewer_app_slug_next"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            text.lines().count() + 1,
+            COMMITTED.lines().count(),
+            "the committed settings name the next slug once"
+        );
+        text
+    }
+
+    #[test] // spec: QA-020
+    fn committed_config_without_the_next_slug_still_parses() {
+        let parsed = MergeGuardConfig::parse(&committed_without_next()).unwrap();
+        assert_eq!(parsed.reviewer_app_slug_next, None);
+        assert_eq!(parsed.reviewer_logins(), logins(&[BOT]));
+        assert_eq!(
+            parsed,
+            MergeGuardConfig {
+                reviewer_app_slug_next: None,
+                ..cfg()
+            }
+        );
+    }
+
+    #[test] // spec: QA-020
+    fn config_with_the_next_slug_parses() {
+        let parsed = MergeGuardConfig::parse(COMMITTED).unwrap();
+        assert_eq!(parsed, cfg());
+        assert_eq!(parsed.repo, "LILITH");
+        assert_eq!(parsed.reviewer_app_slug, "worldwright-reviewer");
+        assert_eq!(
+            parsed.reviewer_app_slug_next.as_deref(),
+            Some("lilith-reviewer")
+        );
+        assert_eq!(parsed.reviewer_logins(), logins(&[BOT, NEXT_BOT]));
+        // The next slug is checked like every other name.
+        for bad in ["", "-x", "a..b", "lilith reviewer", "lilith-reviewer[bot]"] {
+            let text = COMMITTED.replace(r#""lilith-reviewer""#, &format!("{bad:?}"));
+            assert_ne!(text, COMMITTED);
+            assert!(MergeGuardConfig::parse(&text).is_err(), "{bad:?}");
+        }
+        // The same slug twice is one login.
+        let same = COMMITTED.replace(r#""lilith-reviewer""#, r#""worldwright-reviewer""#);
+        assert_eq!(
+            MergeGuardConfig::parse(&same).unwrap().reviewer_logins(),
+            logins(&[BOT])
+        );
+    }
+
+    #[test] // spec: QA-020
+    fn unknown_config_keys_are_still_refused() {
+        for extra in [
+            "extra = 1",
+            "reviewer_app_slug_nxt = \"lilith-reviewer\"",
+            "reviewer_app_slugs = [\"lilith-reviewer\"]",
+            "reviewer_logins = [\"lilith-reviewer[bot]\"]",
+        ] {
+            for base in [COMMITTED.to_string(), committed_without_next()] {
+                let text = format!("{base}\n{extra}\n");
+                assert!(MergeGuardConfig::parse(&text).is_err(), "{extra}");
+            }
+        }
+        // A second next slug is refused, not merged or overridden.
+        let twice = format!("{COMMITTED}\nreviewer_app_slug_next = \"github-actions\"\n");
+        assert!(MergeGuardConfig::parse(&twice).is_err());
+    }
+
+    #[test] // spec: QA-020
+    fn approval_counts_from_either_slug() {
+        for login in [BOT, NEXT_BOT] {
+            let fake = green();
+            fake.add_review(PR, login, "APPROVED", HEAD);
+            assert_eq!(
+                merge_pr(&cfg(), &fake, PR, &protected, hooks()),
+                Ok(format!("merge-of-{HEAD}")),
+                "{login}"
+            );
+        }
+        // Without the next slug in the settings, only the current one counts.
+        let only_current = MergeGuardConfig {
+            reviewer_app_slug_next: None,
+            ..cfg()
+        };
+        let fake = green();
+        fake.add_review(PR, NEXT_BOT, "APPROVED", HEAD);
+        let r = refusals(merge_pr(&only_current, &fake, PR, &protected, hooks()));
         assert!(
-            msg.contains("expected github.com/xenofei/Worldwright-Suite"),
-            "{msg}"
+            matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
+            "{r:?}"
+        );
+    }
+
+    #[test] // spec: QA-020
+    fn approval_from_neither_slug_or_a_person_does_not_count() {
+        let fake = green();
+        for login in [
+            // People: an account may be named like either slug, but never ends in `[bot]`.
+            "xenofei",
+            "worldwright-reviewer",
+            "lilith-reviewer",
+            // Other Apps, lookalikes and other spellings.
+            "github-actions[bot]",
+            "lilith-reviewer-next[bot]",
+            "lilith[bot]",
+            "Lilith-Reviewer[bot]",
+            "lilith-reviewer[bot] ",
+            "lilith-reviewer[bot][bot]",
+            "ghost",
+            "",
+        ] {
+            fake.add_review(PR, login, "APPROVED", HEAD);
+        }
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        assert!(
+            matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
+            "{r:?}"
+        );
+        // The next slug's approval of an older commit doesn't count either.
+        fake.add_review(PR, NEXT_BOT, "APPROVED", OLD);
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        assert!(
+            matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
+            "{r:?}"
+        );
+        assert!(!app_approved(
+            &fake.reviews(PR).unwrap(),
+            &cfg().reviewer_logins(),
+            HEAD
+        ));
+        // No logins: nothing counts.
+        assert!(!app_approved(&[review(BOT, "APPROVED", HEAD)], &[], HEAD));
+    }
+
+    #[test] // spec: QA-020
+    fn latest_review_across_both_logins_wins() {
+        let l = cfg().reviewer_logins();
+        // An approval under one slug is cancelled by a later non-approval under the other.
+        for later in ["DISMISSED", "CHANGES_REQUESTED", "COMMENTED", "PENDING"] {
+            for (first, second) in [(BOT, NEXT_BOT), (NEXT_BOT, BOT)] {
+                let reviews = [review(first, "APPROVED", HEAD), review(second, later, HEAD)];
+                assert!(
+                    !app_approved(&reviews, &l, HEAD),
+                    "{first} then {second} {later}"
+                );
+            }
+        }
+        // A later approval under the other slug counts.
+        for (first, second) in [(BOT, NEXT_BOT), (NEXT_BOT, BOT)] {
+            let reviews = [
+                review(first, "DISMISSED", HEAD),
+                review(second, "APPROVED", HEAD),
+            ];
+            assert!(app_approved(&reviews, &l, HEAD), "{first} then {second}");
+        }
+        // Reviews by others, or on other commits, after it change nothing.
+        let reviews = [
+            review(NEXT_BOT, "APPROVED", HEAD),
+            review("xenofei", "CHANGES_REQUESTED", HEAD),
+            review(BOT, "DISMISSED", OLD),
+            review("lilith-reviewer", "DISMISSED", HEAD),
+        ];
+        assert!(app_approved(&reviews, &l, HEAD));
+        // Through the merge, too.
+        let fake = green();
+        fake.add_review(PR, BOT, "APPROVED", HEAD);
+        fake.add_review(PR, NEXT_BOT, "DISMISSED", HEAD);
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        assert!(
+            matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
+            "{r:?}"
         );
     }
 }

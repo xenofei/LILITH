@@ -14,7 +14,8 @@
 //!   changed.
 //! - If the step changed protected files (the guard verdict of the step against its first
 //!   parent), the reviewer App must have approved that PR's final head commit
-//!   ([`app_approved`]). A merge commit must then also be a plain merge of that head: exactly
+//!   ([`app_approved`], under either of its logins: [`MergeGuardConfig::reviewer_logins`]).
+//!   A merge commit must then also be a plain merge of that head: exactly
 //!   two parents, the second being the PR's head, and a tree equal to
 //!   `git merge-tree --write-tree <first parent> <head>`. A conflict or any difference is
 //!   flagged ([`Flag::MergeNotClean`]), because a merge commit can carry changes of its own
@@ -197,11 +198,11 @@ pub fn post_merge_flags(
             return flags;
         }
     };
-    let login = cfg.reviewer_login();
+    let logins = cfg.reviewer_logins();
     flags.extend(
         steps
             .iter()
-            .filter_map(|sha| judge_step(repo, sha, gh, cfg, &login)),
+            .filter_map(|sha| judge_step(repo, sha, gh, cfg, &logins)),
     );
     flags
 }
@@ -212,7 +213,7 @@ fn judge_step(
     sha: &str,
     gh: &dyn GitHubApi,
     cfg: &MergeGuardConfig,
-    login: &str,
+    logins: &[String],
 ) -> Option<Flag> {
     let parents = match parents(repo, sha) {
         Ok(p) => p,
@@ -305,7 +306,7 @@ fn judge_step(
     let mut errors = Vec::new();
     for p in &candidates {
         match gh.reviews(p.number) {
-            Ok(reviews) if app_approved(&reviews, login, &p.head_sha) => return None,
+            Ok(reviews) if app_approved(&reviews, logins, &p.head_sha) => return None,
             Ok(_) => {}
             Err(e) => errors.push(format!(
                 "reading the reviews of PR #{} failed: {e:#}",
@@ -1036,6 +1037,63 @@ mod tests {
         assert_eq!(explain_flags(&[]), "Nothing to flag.");
     }
 
+    /// Plan 2026-10-17, D6: the App's approval counts under its current slug or the next one
+    /// in the settings at `before`, and under no other login.
+    #[test] // spec: QA-035
+    fn post_merge_counts_either_login() {
+        let (_tmp, dir, before) = repo();
+        let (head, merge) = merge_pr(
+            &dir,
+            "spec",
+            SPEC,
+            "#[test]\nfn spec_harness_runs() { assert!(true) }\n",
+        );
+        for login in [BOT, "lilith-reviewer[bot]"] {
+            let fake = FakeGitHub::new();
+            fake.add_commit_pull(&merge, 7, &head, "main", true);
+            fake.add_review(7, login, "APPROVED", &head);
+            assert_eq!(
+                post_merge_flags(&dir, &before, &merge, &fake, &cfg()),
+                vec![],
+                "{login}"
+            );
+        }
+
+        // People named like either slug, other Apps, and the next slug once the settings at
+        // `before` don't name it: all flagged.
+        let only_current = MergeGuardConfig {
+            reviewer_app_slug_next: None,
+            ..cfg()
+        };
+        for (login, settings) in [
+            ("lilith-reviewer", cfg()),
+            ("worldwright-reviewer", cfg()),
+            ("github-actions[bot]", cfg()),
+            ("lilith-reviewer-next[bot]", cfg()),
+            ("lilith-reviewer[bot]", only_current),
+        ] {
+            let fake = FakeGitHub::new();
+            fake.add_commit_pull(&merge, 7, &head, "main", true);
+            fake.add_review(7, login, "APPROVED", &head);
+            let flags = post_merge_flags(&dir, &before, &merge, &fake, &settings);
+            assert!(
+                matches!(&flags[..], [Flag::UnapprovedProtected { sha, .. }] if *sha == merge),
+                "{login}: {flags:?}"
+            );
+        }
+
+        // The latest review across both logins decides.
+        let fake = FakeGitHub::new();
+        fake.add_commit_pull(&merge, 7, &head, "main", true);
+        fake.add_review(7, "lilith-reviewer[bot]", "APPROVED", &head);
+        fake.add_review(7, BOT, "DISMISSED", &head);
+        let flags = post_merge_flags(&dir, &before, &merge, &fake, &cfg());
+        assert!(
+            matches!(&flags[..], [Flag::UnapprovedProtected { .. }]),
+            "{flags:?}"
+        );
+    }
+
     // ---- fail closed and the edges ---------------------------------------------------------
 
     #[test]
@@ -1286,13 +1344,13 @@ mod tests {
     fn report() -> RevertReport {
         RevertReport {
             owner: "xenofei".into(),
-            repo: "Worldwright-Suite".into(),
+            repo: "LILITH".into(),
             base_branch: "main".into(),
             before: "1111111111111111111111111111111111111111".into(),
             after: "abcdef0123456789abcdef0123456789abcdef01".into(),
             verdict: "Commit abcdef0 was a direct push to main: no merged PR brought it in.".into(),
             tests_result: Some("failure".into()),
-            run_url: Some("https://github.com/xenofei/Worldwright-Suite/actions/runs/5".into()),
+            run_url: Some("https://github.com/xenofei/LILITH/actions/runs/5".into()),
         }
     }
 
@@ -1304,9 +1362,9 @@ mod tests {
                 stdin.map(str::to_string),
             ));
             Ok(if args.iter().any(|a| a == "pr") {
-                "https://github.com/xenofei/Worldwright-Suite/pull/9\n".to_string()
+                "https://github.com/xenofei/LILITH/pull/9\n".to_string()
             } else {
-                "https://github.com/xenofei/Worldwright-Suite/issues/10\n".to_string()
+                "https://github.com/xenofei/LILITH/issues/10\n".to_string()
             })
         }
     }
@@ -1355,10 +1413,7 @@ mod tests {
             args.starts_with(&["pr".into(), "create".into()]),
             "{args:?}"
         );
-        assert!(
-            has(args, ["--repo", "xenofei/Worldwright-Suite"]),
-            "{args:?}"
-        );
+        assert!(has(args, ["--repo", "xenofei/LILITH"]), "{args:?}");
         assert!(has(args, ["--base", "main"]), "{args:?}");
         assert!(has(args, ["--head", "revert/abcdef0"]), "{args:?}");
         assert!(has(args, ["--body-file", "-"]), "{args:?}");
@@ -1375,10 +1430,7 @@ mod tests {
             "{args:?}"
         );
         assert!(has(args, ["--assignee", "xenofei"]), "{args:?}");
-        assert!(
-            has(args, ["--repo", "xenofei/Worldwright-Suite"]),
-            "{args:?}"
-        );
+        assert!(has(args, ["--repo", "xenofei/LILITH"]), "{args:?}");
         let body = body.as_deref().unwrap();
         assert!(body.contains("/pull/9"), "{body}");
         assert!(body.contains("direct push to main"), "{body}");
@@ -1437,7 +1489,7 @@ mod tests {
                     "gh: GitHub Actions is not permitted to create pull requests"
                 ))
             } else {
-                Ok("https://github.com/xenofei/Worldwright-Suite/issues/10\n".into())
+                Ok("https://github.com/xenofei/LILITH/issues/10\n".into())
             }
         };
         publish_revert(
@@ -1471,7 +1523,7 @@ mod tests {
             if program == "git" {
                 Err(anyhow!("git push failed: rejected"))
             } else {
-                Ok("https://github.com/xenofei/Worldwright-Suite/issues/10\n".into())
+                Ok("https://github.com/xenofei/LILITH/issues/10\n".into())
             }
         };
         publish_revert(
