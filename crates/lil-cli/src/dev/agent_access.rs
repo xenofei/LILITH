@@ -49,7 +49,7 @@ pub const AGENT_TOKEN_USERNAME: &str = "x-access-token";
 ///
 /// It runs the committed script `tools/git-hooks/credential-helper` of the worktree git runs
 /// in, and the script runs `dev git-credential` from whichever CLI crate that checkout has
-/// (`lil-cli` or `lil-cli`). Every worktree of a clone shares this entry, so it survives the
+/// (`lil-cli`, or the CLI crate of a checkout from before the rename). Every worktree of a clone shares this entry, so it survives the
 /// crate rename. A worktree on a commit from before the script has no helper until it is
 /// rebased.
 pub const GIT_CREDENTIAL_HELPER: &str =
