@@ -330,15 +330,15 @@ impl Env {
     /// file if that exists (R4), else [`Env::suite_toml`]. Writes always go to
     /// [`Env::suite_toml`].
     ///
-    /// Only existence is checked; nothing is created or written. A new file whose existence
-    /// can't be checked counts as existing, so its read reports the error.
+    /// Only existence is checked; nothing is created or written. A file whose existence can't
+    /// be checked (new or legacy) counts as existing, so its read reports the error: a legacy
+    /// file that is there but can't be read is never taken for a missing one, or a write would
+    /// start from an empty text and drop its settings (caps among them).
     pub fn suite_toml_to_read(&self) -> PathBuf {
         let new = self.suite_toml();
-        if new.try_exists().unwrap_or(true) {
-            return new;
-        }
+        let new_exists = new.try_exists();
         let legacy = self.legacy_data_dir().join("suite.toml");
-        if legacy.is_file() { legacy } else { new }
+        choose_suite_toml(new, new_exists, legacy, |legacy| legacy.try_exists())
     }
 
     /// `<roaming>\<legacy app name>[-<channel>]`: read only, for [`Env::suite_toml_to_read`]
@@ -478,6 +478,22 @@ impl Env {
     /// `local_dir\claude-profiles`
     pub fn claude_profiles_dir(&self) -> PathBuf {
         self.local_dir().join("claude-profiles")
+    }
+}
+
+/// [`Env::suite_toml_to_read`]'s choice: `new` unless it is known to be missing, then `legacy`
+/// unless that is known to be missing, else `new`. An existence check that fails counts as
+/// "there", so the read that follows reports the error instead of a missing file.
+fn choose_suite_toml(
+    new: PathBuf,
+    new_exists: std::io::Result<bool>,
+    legacy: PathBuf,
+    legacy_exists: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> PathBuf {
+    if new_exists.unwrap_or(true) || !legacy_exists(&legacy).unwrap_or(true) {
+        new
+    } else {
+        legacy
     }
 }
 
@@ -954,6 +970,28 @@ mod tests {
     #[test] // spec: ARCH-081
     fn test_channel_machine_id_is_testmachine() {
         assert_eq!(env(Channel::Test("ab".into())).machine_id(), "testmachine");
+    }
+
+    /// A `suite.toml` whose existence can't be checked is never taken for a missing one: the
+    /// read must report the error, or a write would start from an empty text and drop the
+    /// legacy file's settings (its caps among them).
+    #[test] // spec: CORE-007, ARCH-090
+    fn suite_toml_choice_treats_an_unchecked_file_as_present() {
+        let (new, legacy) = (
+            PathBuf::from(r"C:\R\new.toml"),
+            PathBuf::from(r"C:\R\old.toml"),
+        );
+        let denied = || io::Error::from_raw_os_error(5);
+        let pick = |n: io::Result<bool>, l: Option<io::Result<bool>>| {
+            choose_suite_toml(new.clone(), n, legacy.clone(), |_| {
+                l.expect("the legacy file is looked at only when the new one is missing")
+            })
+        };
+        assert_eq!(pick(Ok(true), None), new);
+        assert_eq!(pick(Err(denied()), None), new);
+        assert_eq!(pick(Ok(false), Some(Ok(true))), legacy);
+        assert_eq!(pick(Ok(false), Some(Err(denied()))), legacy);
+        assert_eq!(pick(Ok(false), Some(Ok(false))), new);
     }
 
     #[test]

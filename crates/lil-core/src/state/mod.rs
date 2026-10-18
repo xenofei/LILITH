@@ -39,24 +39,29 @@
 //! same clock that stamped the rows.
 //!
 //! **Copy-forward (plan decision D3, R4).** A pre-rename core kept a workspace's database at
-//! `Env::legacy_workspace_local_dir_for_canonical(ws)\state.db`. A [`Access::ReadWrite`] open
-//! (the core holds the workspace's `core.lock`, so no other core writes either file) whose new
-//! `state.db` is missing copies the legacy one forward first ([`copy_forward`]): a leftover
-//! `.state.db.lil-tmp-*` from a killed copy is removed; the legacy file is checked like any
-//! existing one (hot journal, `quick_check`, `user_version`); a read-only connection on it runs
-//! `VACUUM INTO` a fresh `.state.db.lil-tmp-<pid>-<n>` beside the new path (the name is a bound
-//! parameter); the fail point `state.copy_forward` comes next; the temp file is flushed to disk
-//! and moved to `state.db` without replacing anything. The normal open then checks and migrates
-//! the copy. `VACUUM INTO` writes one self-contained file, so the legacy `-wal` is read (its
-//! committed rows are in the copy) and no `-wal` or `-shm` is ever copied. The legacy database
-//! and its `-wal` are never written, moved or deleted. The one write the legacy folder can see
-//! (D3's honest limit): a plain read-only connection on a WAL file (one with a `-wal`, or the
-//! read-only open below) may create or update its `-shm`, SQLite's index, and creates an empty
-//! `-wal` when there is none; neither changes a row. The copy's checks and `VACUUM INTO` open a
-//! legacy file without a `-wal` `immutable=1`, so they create nothing.
+//! `Env::legacy_workspace_local_dir_for_canonical(ws)\state.db`. Every [`Access::ReadWrite`]
+//! open (the core holds the workspace's `core.lock`, so no other core writes either file) first
+//! removes a leftover `.state.db.lil-tmp-*` from a killed copy, even when `state.db` exists.
+//! One whose new `state.db` is missing then copies the legacy one forward ([`copy_forward`]):
+//! the legacy file is checked like any existing one (hot journal, `quick_check`,
+//! `user_version`); a read-only connection on it runs `VACUUM INTO` a fresh
+//! `.state.db.lil-tmp-<pid>-<n>` beside the new path (the name is a bound parameter); the fail
+//! point `state.copy_forward` comes next; the temp file is flushed to disk; SQLite files left
+//! beside the missing `state.db` (`-wal`, `-shm`, `-journal`) refuse the copy (ruling RN10,
+//! [`refuse_orphans`]); the temp file is moved to `state.db` without replacing anything. The
+//! normal open then checks and migrates the copy. `VACUUM INTO` writes one self-contained file,
+//! so the legacy `-wal` is read (its committed rows are in the copy) and no `-wal` or `-shm` is
+//! ever copied. The legacy database and its `-wal` are never written, moved or deleted. The one
+//! write the legacy folder can see (D3's honest limit, ruling RN9): a plain read-only
+//! connection on a WAL file (one with a `-wal`, or the read-only open below) may create or
+//! update its `-shm`, SQLite's index, and creates an empty `-wal` when there is none; neither
+//! changes a row. The copy's checks and `VACUUM INTO` open a legacy file without a `-wal`
+//! `immutable=1`, so they create nothing.
 //! A [`Access::ReadOnly`] open uses the new file if it exists, else the legacy one read-only,
-//! else the in-memory database. A legacy file that can't be used fails the open with an error
-//! naming it, and nothing is written.
+//! else the in-memory database. A read-only core that opened the legacy file keeps reading it
+//! until it restarts, even after the lock holder has copied it forward (on another volume the
+//! folder is shared by every channel): its view goes stale, and it never writes. A legacy file
+//! that can't be used fails the open with an error naming it, and nothing is written.
 //!
 //! **Workspace databases** are opened on first use, on a blocking thread
 //! (`spawn_blocking`), each behind its own once-cell: opening one workspace's database never
@@ -1171,13 +1176,15 @@ fn naming_legacy(e: StateError, legacy: &Path) -> StateError {
 /// (nothing is created then); [`StateError::Io`] when the copy can't be made (its temp file is
 /// removed again, the legacy files are as they were).
 fn copy_forward(path: &Path, legacy: &Path, known: i64, fp: &FailPoints) -> Result<(), StateError> {
-    if exists(path)? {
-        return Ok(());
-    }
     let dir = path
         .parent()
         .ok_or_else(|| StateError::Io(format!("{} has no folder", path.display())))?;
+    // First, even when `state.db` exists: a copy killed after its rename can't leave a temp
+    // file behind for good.
     remove_copy_leftovers(dir)?;
+    if exists(path)? {
+        return Ok(());
+    }
     if !exists(legacy)? {
         return Ok(());
     }
@@ -1196,6 +1203,7 @@ fn copy_forward(path: &Path, legacy: &Path, known: i64, fp: &FailPoints) -> Resu
         fp.hit("state.copy_forward")
             .map_err(|e| io("the copy stopped at", e))?;
         fsops::flush_file(&temp).map_err(|e| io("cannot flush", e))?;
+        refuse_orphans(path)?;
         match fsops::move_new(&temp, path) {
             Ok(()) => Ok(()),
             // Another open made it meanwhile: that one wins, the copy is dropped.
@@ -1214,6 +1222,30 @@ fn copy_forward(path: &Path, legacy: &Path, known: i64, fp: &FailPoints) -> Resu
     copied?;
     tracing::info!(new = %path.display(), "the legacy workspace state.db was copied forward");
     Ok(())
+}
+
+/// Ruling RN10: SQLite files left beside a missing `state.db` (`-wal`, `-shm`, `-journal`, from
+/// a database whose main file is gone) would be applied to the copy once it is moved in: an
+/// orphan `-wal`'s frames would show up as rows. Their presence refuses the copy-forward with
+/// an error that names them and points to `lil doctor`, whose leftover set-aside moves them
+/// behind a confirmation. They are never moved or deleted here (owner decision 5).
+fn refuse_orphans(path: &Path) -> Result<(), StateError> {
+    let mut found = Vec::new();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let file = beside(path, suffix);
+        if exists(&file)? {
+            found.push(file.display().to_string());
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    tracing::error!(files = ?found, "SQLite files without their state.db lie where the copy-forward would go; refused");
+    Err(StateError::Io(format!(
+        "the workspace database {} is missing, but {} from an earlier database lie beside it, so          the legacy database was not copied forward (they would be applied to the copy); run          `lil doctor`, which sets them aside, then retry",
+        path.display(),
+        found.join(", ")
+    )))
 }
 
 /// Removes every copy-forward temp file in `dir` (a killed copy's), never anything else. A

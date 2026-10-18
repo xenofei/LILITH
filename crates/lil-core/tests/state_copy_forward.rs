@@ -15,10 +15,11 @@ use std::time::Duration;
 use lil_core::state::{StateDb, StateRegistry, StateScope};
 use lil_core::store::{FailPoints, fsops, path_key};
 use lil_core::workspace::{Access, WorkspaceRef};
+use lil_platform::fs::Share;
 use lil_platform::names::{LEGACY_APP_NAME, LEGACY_LOCAL_DIR, LOCAL_DIR};
 use lil_platform::{Channel, Env, Roots, VolumeResolver};
 use lil_testkit::files::write_file;
-use lil_testkit::{CoreFixture, RawPipe, TestEnv, failpoints, sha256_file};
+use lil_testkit::{CoreFixture, HandleHolder, RawPipe, TestEnv, failpoints, sha256_file};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 
@@ -481,10 +482,26 @@ fn suite_toml_registration_never_writes_the_legacy_file() {
     let old_ws = env.make_workspace("old");
     let new_ws = env.make_workspace("new");
     let legacy = env.env.legacy_data_dir().join("suite.toml");
+    // Settings beside the registry, the spending caps among them, must come over byte for
+    // byte: comments, nested tables and unknown keys included.
     let text = format!(
-        "# kept\ndefault_workspace = '{}'\n\n[[workspaces]]\npath = '{}'\n",
-        old_ws.display(),
-        old_ws.display()
+        "# my caps, do not lose\n\
+         default_workspace = '{old}'\n\
+         \n\
+         [caps]\n\
+         monthly_usd = 50\n\
+         daily_usd = 7.25 # tight\n\
+         \n\
+         [caps.providers.civitai]\n\
+         monthly_buzz = 1000 # nested\n\
+         \n\
+         [ui]\n\
+         theme = 'dark'\n\
+         \n\
+         [[workspaces]]\n\
+         path = '{old}'\n\
+         pinned = true\n",
+        old = old_ws.display()
     );
     write_file(&legacy, text.as_bytes());
     let before = sha256_file(&legacy);
@@ -514,7 +531,18 @@ fn suite_toml_registration_never_writes_the_legacy_file() {
     assert_eq!(default.as_deref(), Some(old_ws.as_path()));
     assert_eq!(listed, [old_ws.clone(), new_ws.clone()]);
     let new_text = std::fs::read_to_string(env.env.suite_toml()).unwrap();
-    assert!(new_text.starts_with("# kept"), "{new_text}");
+    assert!(
+        new_text.starts_with(&text),
+        "the legacy text is not kept byte for byte:\n{new_text}"
+    );
+    let parsed = lil_schema::SuiteToml::parse(&new_text).unwrap();
+    assert_eq!(parsed.other["caps"]["monthly_usd"].as_integer(), Some(50));
+    assert_eq!(parsed.other["caps"]["daily_usd"].as_float(), Some(7.25));
+    assert_eq!(
+        parsed.other["caps"]["providers"]["civitai"]["monthly_buzz"].as_integer(),
+        Some(1000)
+    );
+    assert_eq!(parsed.workspaces.len(), 2);
 
     // Registering again changes nothing anywhere.
     let again = runtime()
@@ -527,4 +555,146 @@ fn suite_toml_registration_never_writes_the_legacy_file() {
         .unwrap();
     assert!(!again);
     assert_eq!(sha256_file(&legacy), before);
+}
+
+/// A legacy `suite.toml` that exists but can't be read is an error, never "no file": a write
+/// that started from an empty text would drop its settings, the caps among them.
+#[test] // spec: CORE-007, ARCH-090
+fn suite_toml_registration_refuses_an_unreadable_legacy_file() {
+    let env = TestEnv::new();
+    let ws = env.make_workspace("held");
+    let legacy = env.env.legacy_data_dir().join("suite.toml");
+    write_file(&legacy, b"[caps]\nmonthly_usd = 50\n");
+    let before = sha256_file(&legacy);
+    let held = HandleHolder::hold(&legacy, Share::None);
+    assert_eq!(env.env.suite_toml_to_read(), legacy);
+    let got = runtime().block_on(lil_core::store::register_workspace(
+        &env.env,
+        &ws,
+        true,
+        &FailPoints::none(),
+    ));
+    assert!(
+        got.is_err(),
+        "an unreadable legacy suite.toml was taken as missing: {got:?}"
+    );
+    assert!(
+        !env.env.suite_toml().exists(),
+        "a new suite.toml was written without the caps"
+    );
+    held.release();
+    assert_eq!(sha256_file(&legacy), before);
+}
+
+/// Ruling RN10 (review probe P4): SQLite files left beside a missing new `state.db` would be
+/// applied to the copy (an orphan `-wal`'s frames turn into rows). The copy-forward refuses,
+/// naming them and `lil doctor`; it moves and deletes nothing, leaves no temp file and no new
+/// `state.db`, and the legacy files stay as they were.
+#[test] // spec: CORE-005, CORE-004
+fn copy_forward_refuses_beside_orphan_sqlite_files() {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let env = TestEnv::new();
+        let ws_dir = env.make_workspace("orphan");
+        let ws = workspace_ref(&ws_dir);
+        let legacy = legacy_db(&env.legacy_workspace_local_dir(&ws_dir), &["legacy.png"]);
+        let before = legacy_hashes(&legacy);
+        let new_dir = env.workspace_local_dir(&ws_dir);
+        let orphan = new_dir.join(format!("state.db{suffix}"));
+        if suffix == "-wal" {
+            // An earlier copy written to in WAL, then only its `state.db` deleted: the `-wal`
+            // holds a phantom row.
+            let earlier = env.root().join("earlier").join("state.db");
+            fsops::ensure_dir(earlier.parent().unwrap()).unwrap();
+            {
+                let src =
+                    Connection::open_with_flags(&legacy, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                src.execute("VACUUM INTO ?1", [earlier.to_str().unwrap()])
+                    .unwrap();
+            }
+            let conn = Connection::open(&earlier).unwrap();
+            let mode: String = conn
+                .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+            conn.execute(
+                "INSERT INTO generated (key, path, sha256, written_utc)
+                 VALUES (?1, 'phantom.png', 'sha-ph', 9)",
+                [path_key("phantom.png")],
+            )
+            .unwrap();
+            write_file(&orphan, &std::fs::read(beside(&earlier, "-wal")).unwrap());
+            drop(conn);
+        } else {
+            write_file(&orphan, b"left by an earlier database");
+        }
+        let orphan_before = sha256_file(&orphan);
+
+        let reg = StateRegistry::open(&env.env, no_fatal()).unwrap();
+        let rt = runtime();
+        let got = rt.block_on(reg.for_workspace(&ws, Access::ReadWrite));
+        reg.close();
+        let err = got.expect_err(&format!("{suffix}: the copy went in beside an orphan"));
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("state.db{suffix}")),
+            "{suffix}: {text}"
+        );
+        assert!(text.contains("lil doctor"), "{suffix}: {text}");
+        assert!(
+            !new_dir.join("state.db").exists(),
+            "{suffix}: a state.db was made"
+        );
+        assert_eq!(
+            sha256_file(&orphan),
+            orphan_before,
+            "{suffix}: the orphan changed"
+        );
+        let left = names_in(&new_dir);
+        assert_eq!(left, [format!("state.db{suffix}")], "{suffix}: {left:?}");
+        assert_legacy_untouched(&legacy, &before);
+    }
+}
+
+/// Review probe P7: a copy killed after its rename (so `state.db` is the copy) can leave an
+/// earlier kill's temp file; the next read-write open sweeps it even though `state.db` exists,
+/// and serves the copy. A look-alike that isn't one of the copy's names stays.
+#[test] // spec: CORE-005, QA-055
+fn a_stale_copy_temp_is_swept_when_state_db_exists() {
+    let env = TestEnv::new();
+    let ws_dir = env.make_workspace("after rename");
+    let ws = workspace_ref(&ws_dir);
+    let legacy = legacy_db(&env.legacy_workspace_local_dir(&ws_dir), &["a.png"]);
+    let before = legacy_hashes(&legacy);
+    let new_dir = env.workspace_local_dir(&ws_dir);
+    fsops::ensure_dir(&new_dir).unwrap();
+    {
+        let src = Connection::open_with_flags(&legacy, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        src.execute(
+            "VACUUM INTO ?1",
+            [new_dir.join("state.db").to_str().unwrap()],
+        )
+        .unwrap();
+    }
+    for name in [".state.db.lil-tmp-1-1", ".state.db.lil-tmp-1-1-journal"] {
+        write_file(&new_dir.join(name), b"stale");
+    }
+    write_file(&new_dir.join(".state.db.lil-tmp-notmine"), b"keep");
+    let reg = StateRegistry::open(&env.env, no_fatal()).unwrap();
+    let rt = runtime();
+    let db = rt
+        .block_on(reg.for_workspace(&ws, Access::ReadWrite))
+        .expect("the copy opens");
+    assert_eq!(
+        rt.block_on(db.generated("a.png")).unwrap().as_deref(),
+        Some("sha-a.png")
+    );
+    drop(db);
+    reg.close();
+    assert_eq!(
+        names_in(&new_dir),
+        [".state.db.lil-tmp-notmine", "state.db"],
+        "the stale temp files stayed, or a foreign name went"
+    );
+    assert_legacy_untouched(&legacy, &before);
 }
