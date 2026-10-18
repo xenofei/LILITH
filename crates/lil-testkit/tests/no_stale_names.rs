@@ -128,6 +128,28 @@ const ALLOW: &[Allow] = &[
         why: "tests that `.worldwright\\` stays reserved, by its literal name",
         until: "kept: `.worldwright\\` stays reserved (no planned end)",
     },
+    // Plan 3, Global Constraints "Old names", the Task 2 spec row: Appendix F's legacy-name
+    // contract (`lil doctor`'s legacy-name rename) and its plugin contract (plugin 1.3 keeps
+    // the id, R1), one row per end condition.
+    Allow {
+        globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
+        lines_with: &[
+            "a workspace using `worldwright.yaml`, `.worldwright\\state.json` or `ww://` refs",
+            "rename `worldwright.yaml` to `lilith.yaml`",
+            "rewrite `ww://` to `lil://` in asset manifests",
+            "(so `ww://` parsing stays for sealed versions)",
+            "`.worldwright\\` itself is left in place",
+        ],
+        why: "Appendix F: `lil doctor` offers the legacy-name rename of a workspace from before \
+              the rename (owner question 1)",
+        until: "the legacy workspace readers go",
+    },
+    Allow {
+        globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
+        lines_with: &["`plugin/worldwright/.claude-plugin/plugin.json` (`name: \"worldwright\"`"],
+        why: "Appendix F: plugin 1.3 keeps the id `worldwright`, so its folder and name do (R1)",
+        until: "plugin rename",
+    },
     Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
         lines_with: &[],
