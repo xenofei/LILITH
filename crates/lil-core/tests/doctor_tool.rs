@@ -116,6 +116,7 @@ fn core_with_probe(env: &TestEnv, fp: FailPoints, probe: Arc<dyn Probe>) -> Core
         trusted: TrustedDirs {
             app_dirs: base.trusted.app_dirs.clone(),
             mcp_dirs: vec![mcp_dir],
+            test_app: base.trusted.test_app,
         },
         ..base
     })

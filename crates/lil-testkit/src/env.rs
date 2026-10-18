@@ -337,6 +337,50 @@ impl TestEnv {
             .unwrap_or_else(|e| panic!("cannot write {}: {e}", file.display()));
     }
 
+    /// Merges `toml_fragment` into this channel's `suite.toml` (created when missing): tables
+    /// merge key by key, at any depth, and every other value in the fragment replaces the one
+    /// in the file. Comments in the file are not kept.
+    ///
+    /// # Panics
+    /// If the fragment or the file is not TOML, or the file cannot be written.
+    pub fn suite_toml_set(&self, toml_fragment: &str) {
+        fn merge(into: &mut toml::Table, from: toml::Table) {
+            for (key, value) in from {
+                match (into.get_mut(&key), value) {
+                    (Some(toml::Value::Table(old)), toml::Value::Table(new)) => merge(old, new),
+                    (_, value) => {
+                        into.insert(key, value);
+                    }
+                }
+            }
+        }
+        let fragment: toml::Table = toml_fragment
+            .parse()
+            .unwrap_or_else(|e| panic!("the suite.toml fragment is not TOML: {e}"));
+        let file = self.env.suite_toml();
+        let mut table: toml::Table = match std::fs::read_to_string(&file) {
+            Ok(text) => text
+                .parse()
+                .unwrap_or_else(|e| panic!("{} is not TOML: {e}", file.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => panic!("cannot read {}: {e}", file.display()),
+        };
+        merge(&mut table, fragment);
+        let text = toml::to_string(&table).expect("a TOML table serialises");
+        crate::files::write_file(&file, text.as_bytes());
+    }
+
+    /// This process's `PATH` with the test binaries' folder first, for a child that must find
+    /// the fake `claude.exe` (or another test binary) by name. The real `PATH` is never changed.
+    ///
+    /// # Panics
+    /// If a `PATH` entry holds a `;`.
+    pub fn path_with_testbins(&self) -> OsString {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(ensure_built().dir.clone()).chain(std::env::split_paths(&path));
+        std::env::join_paths(dirs).expect("PATH entries without ';'")
+    }
+
     /// Creates or opens the SQLite database at `path` (creating its parent folders, ruling
     /// P13) and sets its `user_version` and its journal mode: `wal` when `wal` is true, else
     /// `delete`. No tables are created. Used to fake a newer or an older state

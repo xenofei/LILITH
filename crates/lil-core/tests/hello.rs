@@ -1,15 +1,16 @@
 //! `core/hello` over the real pipe of an in-process core (ARCH-024, ARCH-029, ARCH-030,
-//! ARCH-045, QA-010): the session, the frozen version check, strict params and the
-//! connection-state rules.
+//! ARCH-045, QA-010): the session, the frozen version check, strict params, the
+//! connection-state rules and the test app's `ui:test` claim.
 //!
 //! Wall-clock durations here are failure deadlines only, never measurements (QA-031).
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use lil_core::identity::TrustedDirs;
 use lil_core::{CoreConfig, CoreThread, start_in_thread};
 use lil_platform::Env;
-use lil_testkit::{FakeClock, RawPipe, SeqIds, TestEnv, merge_hello};
+use lil_testkit::{FakeClock, RawPipe, SeqIds, TestApp, TestEnv, ensure_built, merge_hello};
 use serde_json::{Value, json};
 
 /// Failure deadline for anything the test waits on.
@@ -305,4 +306,44 @@ fn engine_token_invalid_is_terminal_for_the_connection() {
     let mut fresh = RawPipe::connect(&env);
     let ok = fresh.hello(json!({}));
     assert_eq!(ok["result"]["status"], "ok", "{ok}");
+}
+
+/// An in-process core that trusts the test binaries' folder for apps (`lil-test-app.exe` lives
+/// there), accepting the test app or not.
+fn core_trusting_testbins(env: &TestEnv, test_app: bool) -> CoreThread {
+    let base = CoreConfig::for_env(env.env.clone()).expect("core config");
+    start_in_thread(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        trusted: TrustedDirs {
+            app_dirs: vec![ensure_built().dir.clone()],
+            test_app,
+            ..base.trusted.clone()
+        },
+        ..base
+    })
+}
+
+#[test] // spec: ARCH-045, ARCH-046, QA-066
+fn test_app_resolves_to_ui_test_on_test_channels_only() {
+    // A test channel's core trusts the test app (`TrustedDirs::for_env`).
+    let env = TestEnv::new();
+    assert!(
+        CoreConfig::for_env(env.env.clone())
+            .unwrap()
+            .trusted
+            .test_app
+    );
+    let core = core_trusting_testbins(&env, true);
+    let app = TestApp::start(&env, None, &[]);
+    assert_eq!(app.hello()["caller_kind"], "ui:test", "{}", app.hello());
+    drop(app);
+    drop(core);
+
+    // A core that doesn't (a dev or stable channel's) resolves the same claim to `cli`.
+    let env = TestEnv::new();
+    let _core = core_trusting_testbins(&env, false);
+    let app = TestApp::start(&env, None, &[]);
+    assert_eq!(app.hello()["caller_kind"], "cli", "{}", app.hello());
 }

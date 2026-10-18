@@ -19,7 +19,7 @@ dir = "target/nextest"
 # itself when this script did not run (plain `cargo test`).
 # 120 s x 5 = 10 minutes for a cold build (test-params.toml: testbins_build_s).
 [scripts.setup.build-testbins]
-command = "cargo build --locked --offline --bins -p lil-cli -p lil-core --target-dir target/testbins"
+command = "cargo build --locked --offline --bins -p lil-cli -p lil-core -p lil-mcp -p lil-testkit --target-dir target/testbins"
 slow-timeout = { period = "120s", terminate-after = 5 }
 
 [profile.default]

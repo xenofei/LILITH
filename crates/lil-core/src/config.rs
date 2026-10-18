@@ -19,6 +19,32 @@ use crate::watch::WatchConfig;
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(600);
 /// A connection that has not said hello after this long is closed.
 const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// A confirmation expires this long after it was created (CORE-115, owner question 6).
+const DEFAULT_CONFIRM_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// Test channels only: the fake hardware script the sampler reads instead of the real sources
+/// (`lil_testkit::FakeHwScript`, QA-066).
+pub const ENV_TEST_FAKE_HW: &str = "LIL_TEST_FAKE_HW";
+/// Test channels only: a confirmation's lifetime in seconds instead of 30 minutes.
+pub const ENV_TEST_CONFIRM_LIFETIME_SECS: &str = "LIL_TEST_CONFIRM_LIFETIME_SECS";
+
+/// The plan-3 test knobs from `var`: `(LIL_TEST_FAKE_HW, LIL_TEST_CONFIRM_LIFETIME_SECS)`, both
+/// `None` off a test channel; a lifetime that does not parse is `None`.
+fn test_knobs(
+    channel: &Channel,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> (Option<PathBuf>, Option<Duration>) {
+    if !matches!(channel, Channel::Test(_)) {
+        return (None, None);
+    }
+    let fake_hw = var(ENV_TEST_FAKE_HW)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let lifetime = var(ENV_TEST_CONFIRM_LIFETIME_SECS)
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs);
+    (fake_hw, lifetime)
+}
 
 /// A fault an in-process test injects into the creation of pipe instances
 /// ([`CoreConfig::pipe_instance_fault`]).
@@ -55,6 +81,12 @@ pub struct CoreConfig {
     pub idle_after: Duration,
     /// 30 s.
     pub hello_timeout: Duration,
+    /// How long a confirmation stays answerable: 30 minutes, or
+    /// `LIL_TEST_CONFIRM_LIFETIME_SECS` on a test channel.
+    pub confirm_lifetime: Duration,
+    /// Test channels only: the fake hardware script `LIL_TEST_FAKE_HW` names, read instead of
+    /// NVML, PDH and `sysinfo`.
+    pub fake_hw: Option<PathBuf>,
     /// The channel is `test-*`: the test tools are registered.
     pub test_tools: bool,
     /// Test channels only: the core exits 0 once this process is gone.
@@ -94,10 +126,13 @@ impl CoreConfig {
     /// The system clock, random ids, the real process inspector, the trusted folders of
     /// `env` (the running executable's folder on dev and test channels) and no engine tokens,
     /// with the `LIL_TEST_*` overrides from the process environment (read through
-    /// `env.test_overrides`, so they apply on test channels only) and the fail points of
+    /// `env.test_overrides`, so they apply on test channels only), `LIL_TEST_FAKE_HW` and
+    /// `LIL_TEST_CONFIRM_LIFETIME_SECS` (test channels only too), the fail points of
     /// `LIL_TEST_FAILPOINTS` (`FailPoints::from_env`), and the real probe.
     pub fn for_env(env: Env) -> io::Result<CoreConfig> {
         let overrides = env.test_overrides(&|name| std::env::var(name).ok());
+        let (fake_hw, confirm_lifetime) =
+            test_knobs(env.channel(), &|name| std::env::var(name).ok());
         let test_tools = matches!(env.channel(), Channel::Test(_));
         let trusted = TrustedDirs::for_env(&env, &current_exe_dir()?);
         let failpoints = FailPoints::from_env(&env, &|name| std::env::var(name).ok());
@@ -112,6 +147,8 @@ impl CoreConfig {
                 .idle_secs
                 .map_or(DEFAULT_IDLE_AFTER, Duration::from_secs),
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
+            confirm_lifetime: confirm_lifetime.unwrap_or(DEFAULT_CONFIRM_LIFETIME),
+            fake_hw,
             test_tools,
             test_parent_pid: overrides.parent_pid,
             failpoints,
@@ -200,5 +237,30 @@ mod tests {
         .map(CoreExit::code)
         .collect();
         assert_eq!(codes, [3, 2, 5, 6, 7]);
+    }
+
+    /// `LIL_TEST_FAKE_HW` and `LIL_TEST_CONFIRM_LIFETIME_SECS` count on test channels only; a
+    /// value that does not parse is ignored.
+    #[test] // spec: QA-066, CORE-115
+    fn test_knobs_are_read_on_test_channels_only() {
+        let set = |name: &str| match name {
+            ENV_TEST_FAKE_HW => Some(r"C:\t\hw.json".to_string()),
+            ENV_TEST_CONFIRM_LIFETIME_SECS => Some("1".to_string()),
+            _ => None,
+        };
+        let test = Channel::Test("ab12cd34".into());
+        assert_eq!(
+            test_knobs(&test, &set),
+            (
+                Some(PathBuf::from(r"C:\t\hw.json")),
+                Some(Duration::from_secs(1))
+            )
+        );
+        let unparsable =
+            |name: &str| (name == ENV_TEST_CONFIRM_LIFETIME_SECS).then(|| "soon".into());
+        assert_eq!(test_knobs(&test, &unparsable), (None, None));
+        for channel in [Channel::Dev, Channel::Stable] {
+            assert_eq!(test_knobs(&channel, &set), (None, None), "{channel}");
+        }
     }
 }

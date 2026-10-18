@@ -1,4 +1,6 @@
-//! The real `lil` and `lil-core` binaries for E2E tests (QA-056).
+//! The real `lil`, `lil-core` and `lil-mcp` binaries and the test kit's own (`lil-test-app`,
+//! `lil-fake-comfyui`, `lil-fake-comfy-cli` and the fake `claude`) for E2E tests (QA-056,
+//! QA-066).
 //!
 //! They are built into their own target directory, `<workspace>\target\testbins`, so a test
 //! core that is still running never locks a binary the main build wants to relink, and the
@@ -6,7 +8,7 @@
 //!
 //! Under `cargo nextest` (profiles `default` and `spec`) the setup script `build-testbins` in
 //! `.config/nextest.toml` has built them once before any test starts. Anywhere else (plain
-//! `cargo test`, another profile), or when either binary is missing although the script ran,
+//! `cargo test`, another profile), or when any binary is missing although the script ran,
 //! [`ensure_built`] runs the same `cargo build` itself, once per process.
 
 use std::path::{Path, PathBuf};
@@ -23,6 +25,31 @@ pub struct Bins {
     /// `<dir>\lil-core.exe`. It may be missing (before the core binary exists);
     /// `CoreFixture::start` reports that.
     pub lil_core: PathBuf,
+    /// `<dir>\lil-mcp.exe`
+    pub lil_mcp: PathBuf,
+    /// `<dir>\lil-test-app.exe`: the `ui:test` app ([`crate::TestApp`]).
+    pub test_app: PathBuf,
+    /// `<dir>\lil-fake-comfyui.exe`
+    pub fake_comfyui: PathBuf,
+    /// `<dir>\lil-fake-comfy-cli.exe`
+    pub fake_comfy_cli: PathBuf,
+    /// `<dir>\claude.exe`: the fake Claude Code. Never on the real `PATH`; tests put the
+    /// folder on a child's `PATH` with [`crate::TestEnv::path_with_testbins`].
+    pub claude: PathBuf,
+}
+
+impl Bins {
+    fn all(&self) -> [&PathBuf; 7] {
+        [
+            &self.lil,
+            &self.lil_core,
+            &self.lil_mcp,
+            &self.test_app,
+            &self.fake_comfyui,
+            &self.fake_comfy_cli,
+            &self.claude,
+        ]
+    }
 }
 
 /// The nextest profiles whose setup script builds the binaries.
@@ -50,11 +77,16 @@ pub fn ensure_built() -> &'static Bins {
         let bins = Bins {
             lil: dir.join("lil.exe"),
             lil_core: dir.join("lil-core.exe"),
+            lil_mcp: dir.join("lil-mcp.exe"),
+            test_app: dir.join("lil-test-app.exe"),
+            fake_comfyui: dir.join("lil-fake-comfyui.exe"),
+            fake_comfy_cli: dir.join("lil-fake-comfy-cli.exe"),
+            claude: dir.join("claude.exe"),
             dir,
         };
         if needs_build(
             built_by_setup_script(),
-            bins.lil.is_file() && bins.lil_core.is_file(),
+            bins.all().iter().all(|b| b.is_file()),
         ) {
             build(&root, &target);
         }
@@ -63,10 +95,10 @@ pub fn ensure_built() -> &'static Bins {
 }
 
 /// Whether [`ensure_built`] must build: unless the setup script says it built the binaries
-/// **and** both exist. A flag alone is not trusted: a script that was skipped or filtered, or
+/// **and** all exist. A flag alone is not trusted: a script that was skipped or filtered, or
 /// a binary deleted since, would otherwise surface as a confusing "cannot start" later.
-pub(crate) fn needs_build(built_by_script: bool, both_exist: bool) -> bool {
-    !(built_by_script && both_exist)
+pub(crate) fn needs_build(built_by_script: bool, all_exist: bool) -> bool {
+    !(built_by_script && all_exist)
 }
 
 /// True inside a nextest run whose profile attaches `build-testbins`. Every package that can
@@ -79,8 +111,8 @@ fn built_by_setup_script() -> bool {
 }
 
 /// The setup script's command: `cargo build --locked --offline --bins -p lil-cli -p lil-core
-/// --target-dir <target>`, for this workspace's manifest. `CARGO_TARGET_DIR` is removed so it
-/// cannot redirect the build.
+/// -p lil-mcp -p lil-testkit --target-dir <target>`, for this workspace's manifest.
+/// `CARGO_TARGET_DIR` is removed so it cannot redirect the build.
 fn build(root: &Path, target: &Path) {
     let output = Command::new(env!("CARGO"))
         .args([
@@ -92,6 +124,10 @@ fn build(root: &Path, target: &Path) {
             "lil-cli",
             "-p",
             "lil-core",
+            "-p",
+            "lil-mcp",
+            "-p",
+            "lil-testkit",
         ])
         .arg("--target-dir")
         .arg(target)
@@ -135,5 +171,10 @@ mod tests {
         assert!(bins.lil.starts_with(&expected), "{}", bins.lil.display());
         assert_eq!(bins.lil, expected.join("lil.exe"));
         assert_eq!(bins.lil_core, expected.join("lil-core.exe"));
+        // The setup script's build covers lil-mcp and the test kit's binaries too.
+        for bin in bins.all() {
+            assert!(bin.is_file(), "{} is missing", bin.display());
+            assert_eq!(bin.parent(), Some(expected.as_path()));
+        }
     }
 }

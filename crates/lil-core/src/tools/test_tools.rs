@@ -8,7 +8,7 @@
 //! | `test.block` | write | `{gate}` | `{gate, executions}` once a test opens the gate |
 //! | `test.panic` | read | `{}` | panics |
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
-//! | `test.destructive` | destructive | `{}` | `{executed: true}` |
+//! | `test.destructive` | destructive | `{cost?}` (a decimal string) | `{count}`: its runs in this core |
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
 //! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
@@ -39,8 +39,10 @@
 //! `pad` exists for the line-cap tests (ARCH-025): a result too large to send.
 //!
 //! `executions` counts the runs of that tool with that label or gate in this core, failed runs
-//! included. `test.emit` is `read`: it changes no state, only publishes an event (so it needs
-//! no idempotency key); a topic that makes no valid name is `params.invalid`.
+//! included; `count` counts `test.destructive`'s runs in this core. Its `cost` is read by the
+//! estimate stage once caps exist (plan 3 Task 16) and is otherwise unused. `test.emit` is
+//! `read`: it changes no state, only publishes an event (so it needs no idempotency key); a
+//! topic that makes no valid name is `params.invalid`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -250,9 +252,18 @@ struct StatePanicResult {
     requested: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DestructiveArgs {
+    /// What the call would cost, a decimal string in the display currency.
+    #[serde(default)]
+    #[expect(dead_code, reason = "the estimate stage reads it (plan 3 Task 16)")]
+    cost: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct DestructiveResult {
-    executed: bool,
+    count: u64,
 }
 
 /// `test.panic`'s body.
@@ -533,7 +544,7 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         },
     ));
 
-    let block_counters = counters;
+    let block_counters = counters.clone();
     reg.register(typed_tool(
         "test.block",
         "Test channels only: a write that waits until an in-process test opens its gate.",
@@ -581,13 +592,15 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         },
     ));
 
+    let destructive_counters = counters;
     reg.register(typed_tool(
         "test.destructive",
-        "Test channels only: a destructive tool that does nothing.",
+        "Test channels only: a destructive tool that only counts its runs. `cost` is a decimal string.",
         EffectClass::Destructive,
         TEST_MODULE,
-        |_ctx, _args: NoArgs| {
-            Box::pin(async move { Ok((DestructiveResult { executed: true }, "executed".into())) })
+        move |_ctx, _args: DestructiveArgs| {
+            let count = destructive_counters.bump("test.destructive", "");
+            Box::pin(async move { Ok((DestructiveResult { count }, format!("run {count}"))) })
         },
     ));
 

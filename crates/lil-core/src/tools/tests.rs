@@ -587,7 +587,35 @@ async fn ui_destructive_proceeds() {
     let out = fx
         .call(&ui, "test.destructive", json!({}), Some("k2"))
         .await;
-    assert_eq!(ok(&out).structured, json!({"executed": true}));
+    assert_eq!(ok(&out).structured, json!({"count": 1}));
+}
+
+/// `test.destructive {cost?}` counts its runs in this core; `cost` is a decimal string, and a
+/// refused call doesn't count.
+#[tokio::test] // spec: CORE-109, QA-066
+async fn test_destructive_counts_runs_and_takes_a_cost() {
+    let fx = fixture(&[]);
+    let ui = session(CallerKind::Ui("image".into()), false);
+    let out = fx
+        .call(&ui, "test.destructive", json!({}), Some("k1"))
+        .await;
+    assert_eq!(ok(&out).structured, json!({"count": 1}));
+    let out = fx
+        .call(&ui, "test.destructive", json!({"cost": "2"}), Some("k2"))
+        .await;
+    assert_eq!(ok(&out).structured, json!({"count": 2}));
+    for (key, bad) in [("k3", json!({"cost": 2})), ("k4", json!({"other": 1}))] {
+        let out = fx.call(&ui, "test.destructive", bad, Some(key)).await;
+        assert_eq!(error(&out).code, "params.invalid", "{key}");
+    }
+    let out = fx
+        .call(&ui, "test.destructive", json!({}), Some("k5"))
+        .await;
+    assert_eq!(
+        ok(&out).structured,
+        json!({"count": 3}),
+        "the refusals did not count"
+    );
 }
 
 #[tokio::test] // spec: QA-012, ARCH-060
