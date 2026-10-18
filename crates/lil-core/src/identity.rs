@@ -357,8 +357,8 @@ mod tests {
 
     #[test] // spec: ARCH-046, ARCH-047
     fn stable_trusts_install_dir_and_bin_for_mcp() {
-        let install = PathBuf::from(r"C:\L\WorldwrightSuite\current");
-        let local = PathBuf::from(r"C:\L\Worldwright");
+        let install = PathBuf::from(r"C:\L\LILITHSuite\current");
+        let local = PathBuf::from(r"C:\L\LILITH");
         let dirs = TrustedDirs::installed(&install, &local);
         assert_eq!(dirs.app_dirs, vec![install.clone()]);
         assert_eq!(dirs.mcp_dirs, vec![install, local.join("bin")]);

@@ -1,8 +1,8 @@
 //! The one test that touches the real Windows Credential Manager (ruling R28).
 //!
-//! It round-trips a fresh `Worldwright-test-<8 hex>/roundtrip` target and deletes it again,
+//! It round-trips a fresh `LILITH-test-<8 hex>/roundtrip` target and deletes it again,
 //! through a drop guard, so the target is removed even when an assertion fails. No test
-//! touches `Worldwright/` or `Worldwright-dev/` targets.
+//! touches a stable or dev channel target, or an owner-tooling one, under either app name.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,7 +31,7 @@ fn fresh_id() -> String {
 
 #[test] // spec: QA-079
 fn test_target_round_trips_through_credential_manager() {
-    let target = format!("Worldwright-test-{}/roundtrip", fresh_id());
+    let target = format!("LILITH-test-{}/roundtrip", fresh_id());
     let _cleanup = DeleteOnDrop(target.clone());
     let store = WindowsCredentialStore;
 

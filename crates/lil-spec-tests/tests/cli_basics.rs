@@ -11,7 +11,7 @@ use serde_json::Value;
 /// The pipe name Appendix D fixes for a test channel: the fixed test SID, then the channel.
 fn contract_pipe(env: &TestEnv) -> String {
     format!(
-        r"\\.\pipe\worldwright-core-S-1-5-21-1000-2000-3000-1001-{}",
+        r"\\.\pipe\lilith-core-S-1-5-21-1000-2000-3000-1001-{}",
         env.env.channel()
     )
 }

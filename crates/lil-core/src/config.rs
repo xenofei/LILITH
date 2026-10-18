@@ -51,7 +51,7 @@ pub struct CoreConfig {
     pub trusted: TrustedDirs,
     /// Checks engine tokens; plan 2 refuses every token (ARCH-048).
     pub engine_tokens: Arc<dyn EngineTokens>,
-    /// 600 s, or `WW_TEST_IDLE_SECS` on a test channel.
+    /// 600 s, or `LIL_TEST_IDLE_SECS` on a test channel.
     pub idle_after: Duration,
     /// 30 s.
     pub hello_timeout: Duration,
@@ -59,7 +59,7 @@ pub struct CoreConfig {
     pub test_tools: bool,
     /// Test channels only: the core exits 0 once this process is gone.
     pub test_parent_pid: Option<u32>,
-    /// The fail points `WW_TEST_FAILPOINTS` arms (test channels of non-stable builds only;
+    /// The fail points `LIL_TEST_FAILPOINTS` arms (test channels of non-stable builds only;
     /// QA-066), passed to every workspace store.
     pub failpoints: Arc<FailPoints>,
     /// The file facts of the workspace stores (`SystemProbe`); in-process tests fake volumes
@@ -93,9 +93,9 @@ pub struct CoreConfig {
 impl CoreConfig {
     /// The system clock, random ids, the real process inspector, the trusted folders of
     /// `env` (the running executable's folder on dev and test channels) and no engine tokens,
-    /// with the `WW_TEST_*` overrides from the process environment (read through
+    /// with the `LIL_TEST_*` overrides from the process environment (read through
     /// `env.test_overrides`, so they apply on test channels only) and the fail points of
-    /// `WW_TEST_FAILPOINTS` (`FailPoints::from_env`), and the real probe.
+    /// `LIL_TEST_FAILPOINTS` (`FailPoints::from_env`), and the real probe.
     pub fn for_env(env: Env) -> io::Result<CoreConfig> {
         let overrides = env.test_overrides(&|name| std::env::var(name).ok());
         let test_tools = matches!(env.channel(), Channel::Test(_));

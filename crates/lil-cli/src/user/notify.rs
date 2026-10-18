@@ -106,7 +106,7 @@ mod tests {
     #[test] // spec: ARCH-016, ARCH-073
     fn paths_inside_the_workspace_become_relative() {
         let dir = tempfile::Builder::new()
-            .prefix("ww-notify-Ünïcödé space-")
+            .prefix("lil-notify-Ünïcödé space-")
             .tempdir()
             .unwrap();
         let ws = dir.path().join("ws");

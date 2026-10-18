@@ -1267,7 +1267,7 @@ async fn failpoints_arm_only_on_test_channels_of_non_stable_builds() {
     let env = TestEnv::new();
     let var = |spec: Option<&'static str>| {
         move |name: &str| {
-            (name == "WW_TEST_FAILPOINTS")
+            (name == "LIL_TEST_FAILPOINTS")
                 .then(|| spec.map(str::to_string))
                 .flatten()
         }

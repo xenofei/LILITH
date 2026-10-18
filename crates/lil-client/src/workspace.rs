@@ -111,7 +111,7 @@ pub fn resolve_workspace(
     {
         return found(dir, WorkspaceSource::CurrentFolder);
     }
-    let file = env.suite_toml();
+    let file = env.suite_toml_to_read();
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(none()),
@@ -163,7 +163,7 @@ pub fn resolve_workspace(
 /// The default workspace `env`'s `suite.toml` names, as written there; `None` when there is
 /// no file, it doesn't parse, or it names none. For messages only.
 pub(crate) fn registered_default(env: &Env) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(env.suite_toml()).ok()?;
+    let text = std::fs::read_to_string(env.suite_toml_to_read()).ok()?;
     let suite = SuiteToml::parse(&text).ok()?;
     suite
         .default_workspace

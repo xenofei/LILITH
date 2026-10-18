@@ -37,7 +37,7 @@ fn test_channel_env_uses_root_and_fixed_sid() {
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn test_channel_env_arms_the_guard() {
     let dir = tempfile::tempdir().unwrap();
     let _env = test_env("cd34", dir.path());

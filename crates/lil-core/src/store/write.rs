@@ -517,6 +517,39 @@ pub(super) fn remove_temp(path: &Path) -> io::Result<()> {
     fsops::remove_file(path)
 }
 
+/// The start of the workspace `state.db` copy-forward's temp name (plan decision D3, map row
+/// 22): `.state.db.lil-tmp-<pid>-<n>`.
+pub(crate) const COPY_FORWARD_TEMP: &str = ".state.db.lil-tmp-";
+
+/// Whether `file_name` is a copy-forward temp file: `.state.db.lil-tmp-<pid>-<n>`, or that name
+/// with SQLite's `-journal` after it.
+pub(crate) fn is_copy_forward_temp(file_name: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix(COPY_FORWARD_TEMP) else {
+        return false;
+    };
+    let rest = rest.strip_suffix("-journal").unwrap_or(rest);
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    rest.split_once('-')
+        .is_some_and(|(pid, n)| digits(pid) && digits(n))
+}
+
+/// Deletes a copy-forward temp file (the core's own bytes, never content anyone else has),
+/// so the hard deletes stay where CORE-110 allows them. Any other name is refused
+/// (`InvalidInput`) and nothing is deleted.
+pub(crate) fn remove_copy_forward_temp(path: &Path) -> io::Result<()> {
+    let ours = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_copy_forward_temp);
+    if !ours {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a copy-forward temp file", path.display()),
+        ));
+    }
+    fsops::remove_file(path)
+}
+
 /// Moves `from` aside to a free `<dir>\<name>.ww-conflict-<stamp>` (a `-<k>` suffix when that
 /// name is taken) with `move_new`, and returns the new path. Shared by the store and
 /// `suite.toml` writes.
@@ -2611,6 +2644,35 @@ mod tests {
             "a.txt.ww-conflict-20261016T120000Z",
         ] {
             assert_eq!(parse_leftover(no), None, "{no}");
+        }
+    }
+
+    #[test] // spec: CORE-110
+    fn remove_copy_forward_temp_deletes_only_its_own_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "state.db-shm",
+            ".state.db.lil-tmp-",
+            ".state.db.lil-tmp-1",
+            ".state.db.lil-tmp-1-",
+            ".state.db.lil-tmp-a-2",
+            ".state.db.lil-tmp-1-2x",
+            ".index.db.lil-tmp-1-2",
+            "x.state.db.lil-tmp-1-2",
+        ] {
+            let path = dir.path().join(name);
+            fsops::write_file_atomic(&path, b"kept").unwrap();
+            let err = remove_copy_forward_temp(&path).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}");
+            assert!(path.exists(), "{name}");
+        }
+        for name in [".state.db.lil-tmp-12-3", ".state.db.lil-tmp-12-3-journal"] {
+            let path = dir.path().join(name);
+            fsops::write_file_atomic(&path, b"copy").unwrap();
+            remove_copy_forward_temp(&path).unwrap();
+            assert!(!path.exists(), "{name}");
         }
     }
 

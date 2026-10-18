@@ -506,7 +506,7 @@ fn needs_workspace() -> Arc<dyn lil_core::tools::Tool> {
 #[tokio::test] // spec: ARCH-028, CORE-016
 async fn read_only_workspace_refuses_writes_before_idempotency() {
     // Two cores whose local folder for the workspace is one folder (two channels share
-    // `<volume>\.worldwright-local\<hash>\` for a workspace on another volume, ARCH-097; the
+    // `<volume>\.lilith-local\<hash>\` for a workspace on another volume, ARCH-097; the
     // harness guard keeps tests out of those folders, so both dispatchers here are on one
     // env). The second core's `state.db` connection is read-only, so an `idem_begin` there
     // would fail with `state.unavailable`: the refusal must come first.

@@ -35,12 +35,12 @@ pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 /// The capabilities this build offers. A minor version adds features only as new strings.
 pub const CAPABILITIES: &[&str] = &["events.v1", "tools.v1"];
 
-/// `<CARGO_PKG_VERSION>+<WW_BUILD_ID or "local">`; the suffix is fixed at compile time by
+/// `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">`; the suffix is fixed at compile time by
 /// this crate's build script.
 pub const BUILD_ID: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "+",
-    env!("WW_PROTOCOL_BUILD_SUFFIX")
+    env!("LIL_PROTOCOL_BUILD_SUFFIX")
 );
 
 /// The `workspace` value of a session without a workspace.

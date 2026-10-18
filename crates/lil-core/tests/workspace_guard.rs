@@ -28,11 +28,11 @@ fn write_manifest(ws: &Path) {
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn test_core_refuses_real_registered_workspace() {
     // 1. A workspace folder, as if the owner had registered it for real.
     let dir = tempfile::Builder::new()
-        .prefix("ww-guard-ws-")
+        .prefix("lil-guard-ws-")
         .tempdir()
         .expect("tempdir");
     let ws = canonical(dir.path());

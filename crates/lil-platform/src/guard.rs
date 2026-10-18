@@ -1,5 +1,5 @@
 //! The harness guard (QA-038, QA-040): once armed, no `Env` method may return the owner's real
-//! Worldwright locations and no stable or dev `Env` may be built.
+//! `<App>` locations (either app name, see below) and no stable or dev `Env` may be built.
 //!
 //! `lil-testkit` arms the guard from `TestEnv::new()`. The guard is process-global and never
 //! disarms. Production code never arms it, so the checks are a single `OnceLock` read.
@@ -22,9 +22,9 @@
 //! the guard derives the other name's root and prefix from them.
 //!
 //! Paths are compared by prefix, not substring, and case-insensitively, after stripping a
-//! `\\?\` prefix. So a test directory such as `%TEMP%\.tmpXXXX\local\Worldwright-test-<id>`
+//! `\\?\` prefix. So a test directory such as `%TEMP%\.tmpXXXX\local\<App>-test-<id>`
 //! (the temp folder lives under the real local root) is not real, but
-//! `%LOCALAPPDATA%\Worldwright-test-<id>` is.
+//! `%LOCALAPPDATA%\<App>-test-<id>` is.
 //!
 //! Workspaces are a separate check, [`check_workspace`]: a workspace registered in a real
 //! `suite.toml` (`default_workspace` or `[[workspaces]]`), or anything below it, is real.
@@ -49,18 +49,19 @@ const APP_NAMES: [&str; 2] = [names::APP_NAME, names::LEGACY_APP_NAME];
 /// Both per-volume local-data folder names.
 const LOCAL_DIRS: [&str; 2] = [names::LOCAL_DIR, names::LEGACY_LOCAL_DIR];
 
-/// The owner's real Worldwright locations (the stable channel's), which tests must never touch.
+/// The owner's real `<App>` locations (the stable channel's, under either app name), which
+/// tests must never touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealLocations {
-    /// The real roaming root (`%APPDATA%`), not the Worldwright folder inside it.
+    /// The real roaming root (`%APPDATA%`), not the `<App>` folder inside it.
     pub roaming: PathBuf,
-    /// The real local root (`%LOCALAPPDATA%`), not the Worldwright folder inside it.
+    /// The real local root (`%LOCALAPPDATA%`), not the `<App>` folder inside it.
     pub local: PathBuf,
     /// The real user profile (`%USERPROFILE%`). Only `<user_profile>\.claude` is real.
     pub user_profile: PathBuf,
-    /// `HKCU\Software\Worldwright`
+    /// `HKCU\Software\<App>` (the guard derives the other app name's root from it)
     pub registry_root: String,
-    /// `Worldwright/`
+    /// `<App>/` (the guard derives the other app name's prefix from it)
     pub credential_prefix: String,
     /// Every workspace registered in a real `suite.toml` (see [`RealLocations::registered_under`]).
     pub workspaces: Vec<PathBuf>,
@@ -265,7 +266,7 @@ pub fn arm_test_guard(real: RealLocations) {
 }
 
 fn trip(value: &str) -> ! {
-    panic!("test resolved a real Worldwright location: {value}");
+    panic!("test resolved a real {} location: {value}", names::APP_NAME);
 }
 
 pub(crate) fn check_path(path: PathBuf) -> PathBuf {
@@ -536,18 +537,20 @@ path = 'C:\Ws\Two'
             )
             .unwrap();
         };
-        write("Worldwright", r"C:\Ws\Stable");
-        write("Worldwright-dev", r"C:\Ws\Dev");
-        write("Worldwright-test-ab", r"C:\Ws\Test");
+        let legacy = LEGACY_APP_NAME;
+        write(APP_NAME, r"C:\Ws\Stable");
+        write(&format!("{APP_NAME}-dev"), r"C:\Ws\Dev");
+        write(&format!("{APP_NAME}-test-ab"), r"C:\Ws\Test");
         write("Other", r"C:\Ws\Other");
-        write("WorldwrightSuite", r"C:\Ws\NotAChannelFolder");
+        write(&format!("{APP_NAME}Suite"), r"C:\Ws\NotAChannelFolder");
+        write(&format!("{legacy}-test-ab"), r"C:\Ws\LegacyTest");
         // Missing and malformed files contribute nothing.
-        std::fs::create_dir_all(dir.path().join("Worldwright-empty")).unwrap();
-        let bad = dir.path().join("Worldwright-bad");
+        std::fs::create_dir_all(dir.path().join(format!("{APP_NAME}-empty"))).unwrap();
+        let bad = dir.path().join(format!("{legacy}-bad"));
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("suite.toml"), "][ not toml").unwrap();
         // A stray file named like a folder is skipped.
-        std::fs::write(dir.path().join("Worldwright-file"), b"x").unwrap();
+        std::fs::write(dir.path().join(format!("{APP_NAME}-file")), b"x").unwrap();
 
         assert_eq!(
             RealLocations::registered_under(dir.path()),
@@ -562,8 +565,8 @@ path = 'C:\Ws\Two'
             roaming: PathBuf::from(r"C:\R"),
             local: PathBuf::from(r"C:\L"),
             user_profile: PathBuf::from(r"C:\U"),
-            registry_root: r"HKCU\Software\Worldwright".to_string(),
-            credential_prefix: "Worldwright/".to_string(),
+            registry_root: format!(r"HKCU\Software\{APP_NAME}"),
+            credential_prefix: format!("{APP_NAME}/"),
             workspaces: vec![PathBuf::from(r"C:\Ws\One")],
         };
         assert!(real.is_real_workspace(Path::new(r"c:\ws\one")));

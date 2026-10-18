@@ -91,6 +91,15 @@ pub fn write_temp(
     Ok(path)
 }
 
+/// Flushes the existing file `path` to disk with `FlushFileBuffers`, through a handle opened
+/// for writing that writes nothing (never creates or truncates): the copy-forward's fsync of
+/// its temp file (plan decision D3).
+#[allow(clippy::disallowed_methods)]
+pub fn flush_file(path: &Path) -> std::io::Result<()> {
+    let file = OpenOptions::new().write(true).open(long_path(path))?;
+    lil_platform::fs::flush(&file)
+}
+
 /// `ReplaceFileW(target, temp, backup)` without a write-through flag (see `lil_platform::fs`).
 #[allow(clippy::disallowed_methods)]
 pub fn replace(target: &Path, temp: &Path, backup: &Path) -> std::io::Result<()> {

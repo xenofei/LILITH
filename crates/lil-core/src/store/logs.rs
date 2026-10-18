@@ -1,6 +1,6 @@
 //! The append logs (ARCH-081, CORE-009; Appendix E "Append logs"):
 //! `queue/jobs.<machine>.<yyyy-mm>.jsonl`, `registry/usage.<machine>.<yyyy-mm>.jsonl` and the
-//! loose usage log `%LOCALAPPDATA%\Worldwright\usage-loose.jsonl`.
+//! loose usage log `%LOCALAPPDATA%\LILITH\usage-loose.jsonl`.
 //!
 //! Each line is one write under the append lock of the log file itself (`LockFileEx` on
 //! `[2⁶⁴−2, +1)`, which `lil` can take too), requested with `LOCKFILE_FAIL_IMMEDIATELY` by

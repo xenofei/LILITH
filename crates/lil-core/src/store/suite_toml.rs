@@ -5,7 +5,9 @@
 //! An edit is targeted (`lil_schema::suite_edit::register`, through `toml_edit`), so comments,
 //! key order and unknown keys and tables survive. The write is the store's swap, applied to a
 //! file outside any workspace:
-//! 1. read the file (no file is an empty text) and take its SHA-256;
+//! 1. read the file and take its SHA-256. No file is an empty text, unless the legacy data
+//!    folder has a `suite.toml` (R4, `Env::suite_toml_to_read`): then its text is the starting
+//!    point and the result goes to the new file. The legacy file is only read, never written;
 //! 2. `register`; an unchanged text is not written;
 //! 3. the fail point `store.suite_toml`;
 //! 4. hash the file again: a change since step 1 is an outside change;
@@ -89,16 +91,26 @@ pub async fn register_workspace(
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(error(&file, &e)),
         };
-        let text = match &read {
+        // R4: with no new file, a legacy one is the starting text (read only).
+        let legacy = match &read {
+            Some(_) => None,
+            None => read_legacy(env)?,
+        };
+        let (source, bytes) = match (&read, &legacy) {
+            (Some(bytes), _) => (file.as_path(), Some(bytes)),
+            (None, Some((path, bytes))) => (path.as_path(), Some(bytes)),
+            (None, None) => (file.as_path(), None),
+        };
+        let text = match bytes {
             None => "",
             Some(bytes) => std::str::from_utf8(bytes).map_err(|_| StoreError::Io {
-                path: file.display().to_string(),
+                path: source.display().to_string(),
                 why: "suite.toml isn't UTF-8 text, so it was left as it is".to_string(),
             })?,
         };
         let new = suite_edit::register(text, spelling, make_default, &key).map_err(|why| {
             StoreError::Io {
-                path: file.display().to_string(),
+                path: source.display().to_string(),
                 why: format!("{why}; it was left as it is"),
             }
         })?;
@@ -141,6 +153,23 @@ pub async fn register_workspace(
                 });
             }
         }
+    }
+}
+
+/// The legacy `suite.toml` and its bytes, when there is no new file and the legacy one exists
+/// (`Env::suite_toml_to_read`); `None` otherwise. Only read.
+fn read_legacy(env: &Env) -> Result<Option<(PathBuf, Vec<u8>)>, StoreError> {
+    let path = env.suite_toml_to_read();
+    if path == env.suite_toml() {
+        return Ok(None);
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            tracing::info!(legacy = %path.display(), "no new suite.toml yet; the legacy one is the starting text");
+            Ok(Some((path, bytes)))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(error(&path, &e)),
     }
 }
 

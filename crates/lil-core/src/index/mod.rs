@@ -7,7 +7,7 @@
 //!   `missing` files, the cold rebuild and the store's change events;
 //! - [`query`]: `assets.query`'s keyset paging and its opaque cursor.
 //!
-//! One SQLite connection lives on its own thread (`ww-index-<id>`); callers send it jobs and
+//! One SQLite connection lives on its own thread (`lil-index-<id>`); callers send it jobs and
 //! await the answer, as `state` does. Walking and hashing run on blocking threads, never on
 //! that thread, so reads go on while a reconcile works. Reconciles, rebuilds and verification
 //! run one at a time.
@@ -427,7 +427,7 @@ impl Index {
             .optional()
             .map_err(|e| sql(&e))?
             .flatten();
-        let db = Db::start(conn, format!("ww-index-{}", Env::workspace_hash(root)))?;
+        let db = Db::start(conn, format!("lil-index-{}", Env::workspace_hash(root)))?;
         Ok(Index {
             root: root.to_path_buf(),
             probe,

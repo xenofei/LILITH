@@ -67,13 +67,13 @@ mod tests {
             core: CoreInfo {
                 pid: 42,
                 channel: "test-0a1b2c3d".into(),
-                pipe: r"\\.\pipe\worldwright-core-S-1-test-0a1b2c3d".into(),
+                pipe: r"\\.\pipe\lilith-core-S-1-test-0a1b2c3d".into(),
             },
         };
         assert_eq!(
             human(&hello),
             "core: running (pid 42, channel test-0a1b2c3d)\n\
-             pipe: \\\\.\\pipe\\worldwright-core-S-1-test-0a1b2c3d\n\
+             pipe: \\\\.\\pipe\\lilith-core-S-1-test-0a1b2c3d\n\
              protocol: 1.0 (build 0.0.0+local)\n\
              workspace: none\n\
              caller: cli"

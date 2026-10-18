@@ -55,7 +55,7 @@ mod tests {
     #[test] // spec: QA-066
     fn handle_holder_blocks_replace_until_released() {
         let dir = tempfile::Builder::new()
-            .prefix("ww-handles-Ünïcödé space-")
+            .prefix("lil-handles-Ünïcödé space-")
             .tempdir()
             .unwrap();
         let target = dir.path().join("target.txt");

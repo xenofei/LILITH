@@ -15,7 +15,7 @@ const DEADLINE: Duration = Duration::from_secs(20);
 
 fn temp() -> tempfile::TempDir {
     tempfile::Builder::new()
-        .prefix("ww-watcher-Ünïcödé space-")
+        .prefix("lil-watcher-Ünïcödé space-")
         .tempdir()
         .unwrap()
 }

@@ -159,7 +159,7 @@ impl DirWatcher {
         let words = buffer_bytes.div_ceil(4) as usize;
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
-            .name("ww-dir-watcher".to_string())
+            .name("lil-dir-watcher".to_string())
             .spawn(move || run(&thread_shared, &event, words, &tx, first_tx))?;
         match first_rx.recv() {
             Ok(Ok(())) => Ok((

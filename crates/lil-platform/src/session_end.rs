@@ -3,7 +3,7 @@
 //! Windows tells applications that the session is ending by sending `WM_QUERYENDSESSION` and
 //! then `WM_ENDSESSION` to their top-level windows. A message-only window (`HWND_MESSAGE`)
 //! does not get them, so the core owns one hidden top-level window of the class
-//! `WorldwrightCoreSessionEnd`. It is created without `WS_VISIBLE` and is never shown
+//! `LilithCoreSessionEnd`. It is created without `WS_VISIBLE` and is never shown
 //! (ARCH-005). It runs on its own thread with its own message loop.
 //!
 //! - `WM_QUERYENDSESSION` → [`SessionEnd::QueryEnd`] is reported and the window answers TRUE.
@@ -48,7 +48,7 @@ use crate::process::io_error;
 pub const SESSION_END_BUDGET: Duration = Duration::from_millis(4500);
 
 /// The window class.
-const CLASS_NAME: PCWSTR = w!("WorldwrightCoreSessionEnd");
+const CLASS_NAME: PCWSTR = w!("LilithCoreSessionEnd");
 
 /// The private message that destroys the window; its lParam must be the watcher's key.
 const WM_DESTROY_WATCHER: u32 = WM_APP + 1;
@@ -159,7 +159,7 @@ impl SessionEndWatcher {
         let (created_tx, created_rx) = std::sync::mpsc::channel::<io::Result<isize>>();
         let for_thread = shared.clone();
         let thread = std::thread::Builder::new()
-            .name("ww-session-end".into())
+            .name("lil-session-end".into())
             .spawn(move || window_thread(for_thread, &created_tx))?;
         let hwnd = match created_rx.recv() {
             Ok(Ok(hwnd)) => hwnd,
@@ -306,7 +306,7 @@ fn window_thread(shared: Arc<Shared>, created: &std::sync::mpsc::Sender<io::Resu
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 CLASS_NAME,
-                w!("Worldwright core"),
+                w!("LILITH core"),
                 WS_OVERLAPPED,
                 0,
                 0,

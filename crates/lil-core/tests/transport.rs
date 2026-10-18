@@ -348,7 +348,7 @@ fn serves_on_the_channel_pipe_name() {
     assert_eq!(
         name,
         format!(
-            r"\\.\pipe\worldwright-core-{TEST_PIPE_SID}-{}",
+            r"\\.\pipe\lilith-core-{TEST_PIPE_SID}-{}",
             env.env.channel()
         )
     );

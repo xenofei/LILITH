@@ -375,7 +375,7 @@ pub(crate) fn drain_channel(pipe: &str, launched: bool, counts: Arc<DrainCounts>
 /// Set in a helper child's environment: the test `helper_sleep_forever` then sleeps. Shared
 /// by every test in the crate that needs a long-running child.
 #[cfg(test)]
-pub(crate) const HELPER_SLEEP_ENV: &str = "WW_TESTKIT_HELPER_SLEEP";
+pub(crate) const HELPER_SLEEP_ENV: &str = "LIL_TESTKIT_HELPER_SLEEP";
 /// The libtest name of that helper, for `<test binary> <name> --exact`.
 #[cfg(test)]
 pub(crate) const HELPER_SLEEP_TEST: &str = "core::tests::helper_sleep_forever";

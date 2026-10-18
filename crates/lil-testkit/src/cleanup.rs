@@ -153,10 +153,10 @@ fn clear_read_only(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
-/// The file [`report_leftovers`] appends to: `%TEMP%\ww-testenv-leftovers.log`, beside the
-/// `ww-testenv-*` folders it describes.
+/// The file [`report_leftovers`] appends to: `%TEMP%\lil-testenv-leftovers.log`, beside the
+/// `lil-testenv-*` folders it describes.
 pub fn leftovers_log() -> PathBuf {
-    std::env::temp_dir().join("ww-testenv-leftovers.log")
+    std::env::temp_dir().join("lil-testenv-leftovers.log")
 }
 
 /// Says that `root` could not be fully removed and what is left: on stderr, and appended to

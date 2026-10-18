@@ -155,19 +155,6 @@ const ALLOW: &[Allow] = &[
         until: "PR-D",
     },
     Allow {
-        globs: &[
-            "crates/lil-platform/src/credentials.rs",
-            "crates/lil-platform/src/env.rs",
-            "crates/lil-platform/src/guard.rs",
-            "crates/lil-platform/tests/guard.rs",
-            "crates/lil-platform/tests/credential_manager_roundtrip.rs",
-            "crates/lil-testkit/src/env.rs",
-        ],
-        lines_with: &["Worldwright-test-"],
-        why: "the test credential prefix and its pins until Task B3 renames them (A1 review)",
-        until: "Task B3, which removes this row",
-    },
-    Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
         lines_with: &[],
         why: "this test names the old names it looks for",

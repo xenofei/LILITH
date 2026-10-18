@@ -173,8 +173,8 @@ fn close_racing_open_never_serves_read_only_or_a_closed_state_db() {
 #[test] // spec: ARCH-028, ARCH-097
 fn second_hub_without_the_lock_is_read_only_and_keeps_rows() {
     // Two registries whose envs map the workspace to one local folder, as two channels'
-    // cores share `<volume>\.worldwright-local\<hash>\` for a workspace on another volume
-    // (ARCH-097). The harness guard keeps tests out of every `.worldwright-local` folder, so
+    // cores share `<volume>\.lilith-local\<hash>\` for a workspace on another volume
+    // (ARCH-097). The harness guard keeps tests out of every per-volume local folder, so
     // the two envs here are one test channel's.
     let a = TestEnv::new();
     let (env_a, env_b) = (a.env.clone(), a.env.clone());

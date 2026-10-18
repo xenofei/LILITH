@@ -2,10 +2,10 @@
 //! QA-040).
 //!
 //! Creating a `TestEnv` arms the process-global harness guard in `lil-platform`. From then on,
-//! any `Env` method in the process that would return the owner's real Worldwright location
-//! (roaming or local `Worldwright*` folders, `.worldwright-local`, the real registry root or
-//! credential prefix) panics with `test resolved a real Worldwright location: ...`, and
-//! building a stable or dev `Env` panics too.
+//! any `Env` method in the process that would return the owner's real `<App>` location, under
+//! the new or the legacy app name (roaming or local `<App>*` folders, a per-volume local-data
+//! folder, the real registry root or credential prefix), panics with
+//! `test resolved a real LILITH location: ...`, and building a stable or dev `Env` panics too.
 //!
 //! A `TestEnv` also runs the real `lil` with the child environment of its test channel
 //! ([`TestEnv::lil`]), lays out workspaces and state databases, and on drop drains any core
@@ -65,13 +65,13 @@ impl TestEnv {
     /// # Panics
     /// If the known folders cannot be resolved or the temporary directory cannot be created.
     pub fn new() -> TestEnv {
-        TestEnv::make("ww-testenv-".to_string())
+        TestEnv::make("lil-testenv-".to_string())
     }
 
     /// [`TestEnv::new`], with `label` in the temporary directory's name. Spaces and non-ASCII
     /// letters are kept, so paths with them get exercised.
     pub fn with_label(label: &str) -> TestEnv {
-        TestEnv::make(format!("ww-testenv-{label}-"))
+        TestEnv::make(format!("lil-testenv-{label}-"))
     }
 
     fn make(prefix: String) -> TestEnv {
@@ -108,8 +108,8 @@ impl TestEnv {
         &self.root
     }
 
-    /// The variables that put a child process on this test channel: `WW_CHANNEL=test-<id>`,
-    /// `WW_TEST_ROOT=<root>` and `WW_TEST_PARENT_PID=<this process>`, then
+    /// The variables that put a child process on this test channel: `LIL_CHANNEL=test-<id>`,
+    /// `LIL_TEST_ROOT=<root>` and `LIL_TEST_PARENT_PID=<this process>`, then
     /// [`TestEnv::git_env`], so every `lil` and core a test starts, and every `git` they run,
     /// is isolated from the system and user git config (QA-038). The same type as
     /// `SpawnRequest::extra_env`.
@@ -188,7 +188,7 @@ impl TestEnv {
     fn run_lil(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> LilOutput {
         let lil = &ensure_built().lil;
         let start = Instant::now();
-        let deadline = start + WW_DEADLINE;
+        let deadline = start + LIL_DEADLINE;
         let mut child = self
             .lil_command(dir, args)
             .stdin(if stdin.is_some() {
@@ -235,7 +235,7 @@ impl TestEnv {
                 panic!(
                     "{}",
                     report(
-                        &format!("did not exit within {WW_DEADLINE:?}; it was killed"),
+                        &format!("did not exit within {LIL_DEADLINE:?}; it was killed"),
                         &stdout,
                         &stderr
                     )
@@ -447,7 +447,7 @@ fn unique_id() -> String {
 /// (300 s): that value is nextest's own stop for the whole test, so a per-call guard must fire
 /// well before it. 120 s covers the client's longest wait (a 60 s start cap, `lil core stop`'s
 /// default 60 s).
-const WW_DEADLINE: Duration = Duration::from_secs(120);
+const LIL_DEADLINE: Duration = Duration::from_secs(120);
 /// How long to wait for `lil`'s pipes to close once it has exited or been killed. They close
 /// at once unless another process holds them.
 const PIPE_GRACE: Duration = Duration::from_secs(10);
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test] // spec: QA-040
-    #[should_panic(expected = "real Worldwright location")]
+    #[should_panic(expected = "real LILITH location")]
     fn guard_panics_on_real_appdata() {
         let _t = TestEnv::new(); // arms the guard
         let real = RealLocations::from_system().expect("known folders");
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test] // spec: QA-040
-    #[should_panic(expected = "real Worldwright location")]
+    #[should_panic(expected = "real LILITH location")]
     fn guard_panics_on_stable_channel_in_tests() {
         let t = TestEnv::new();
         let roots = Roots {
@@ -707,15 +707,11 @@ mod tests {
         assert!(
             t.env
                 .registry_root()
-                .starts_with(r"HKCU\Software\Worldwright-test-")
+                .starts_with(r"HKCU\Software\LILITH-test-")
         );
-        assert!(t.env.credential_prefix().starts_with("Worldwright-test-"));
+        assert!(t.env.credential_prefix().starts_with("LILITH-test-"));
         assert!(t.env.pipe_name().contains("-test-"));
-        assert!(
-            t.env
-                .notification_aumid()
-                .starts_with("Worldwright.Suite.Test-")
-        );
+        assert!(t.env.notification_aumid().starts_with("LILITH.Suite.Test-"));
     }
 
     #[test] // spec: QA-040
@@ -732,13 +728,13 @@ mod tests {
             found[0].clone()
         };
         assert_eq!(
-            get("WW_CHANNEL"),
+            get("LIL_CHANNEL"),
             OsString::from(t.env.channel().to_string())
         );
-        assert!(get("WW_CHANNEL").to_string_lossy().starts_with("test-"));
-        assert_eq!(get("WW_TEST_ROOT"), t.root().as_os_str());
+        assert!(get("LIL_CHANNEL").to_string_lossy().starts_with("test-"));
+        assert_eq!(get("LIL_TEST_ROOT"), t.root().as_os_str());
         assert_eq!(
-            get("WW_TEST_PARENT_PID"),
+            get("LIL_TEST_PARENT_PID"),
             OsString::from(std::process::id().to_string())
         );
         // The three channel variables come first; the git isolation follows them.
@@ -765,6 +761,51 @@ mod tests {
         assert!(root.contains("Ünïcödé space"), "{root}");
         assert!(t.root().join("roaming").is_dir());
         assert!(t.env.data_dir().starts_with(t.root()));
+    }
+
+    /// The new `suite.toml` wins whenever it exists, even with a legacy one beside it (R4).
+    #[test] // spec: CORE-007, ARCH-090
+    fn suite_toml_prefers_the_new_file() {
+        let t = TestEnv::new();
+        let new = t.env.suite_toml();
+        let legacy = t.env.legacy_data_dir().join("suite.toml");
+        assert_ne!(new, legacy);
+        assert!(new.starts_with(t.root()) && legacy.starts_with(t.root()));
+        // Neither exists: the new name (the file a write creates).
+        assert_eq!(t.env.suite_toml_to_read(), new);
+        for (file, text) in [
+            (&legacy, "default_workspace = 'legacy'\n"),
+            (&new, "x = 1\n"),
+        ] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        assert_eq!(t.env.suite_toml_to_read(), new);
+        // Writes never name the legacy file.
+        assert_eq!(t.env.suite_toml(), new);
+    }
+
+    /// With only the legacy `suite.toml` there, it is the one read (R4), from the legacy folder
+    /// of the same channel.
+    #[test] // spec: CORE-007, ARCH-090
+    fn suite_toml_reads_the_legacy_file_when_the_new_one_is_missing() {
+        let t = TestEnv::new();
+        let legacy = t.env.legacy_data_dir().join("suite.toml");
+        let channel = t.env.channel().to_string();
+        assert_eq!(
+            legacy
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("{}-{channel}", lil_platform::names::LEGACY_APP_NAME)
+        );
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "default_workspace = 'legacy'\n").unwrap();
+        assert_eq!(t.env.suite_toml_to_read(), legacy);
+        assert!(!t.env.suite_toml().exists());
+        assert!(!t.env.data_dir().exists(), "reading created the new folder");
     }
 
     #[test] // spec: QA-040
@@ -918,9 +959,9 @@ mod tests {
     }
 
     /// Set in the helper child's environment: `helper_print_env` prints the variables below.
-    const PRINT_ENV_ENV: &str = "WW_TESTKIT_HELPER_PRINT_ENV";
+    const PRINT_ENV_ENV: &str = "LIL_TESTKIT_HELPER_PRINT_ENV";
     /// The variables `helper_print_env` reports.
-    const PRINTED_VARS: &[&str] = &["GIT_DIR", "GIT_CONFIG_PARAMETERS", "WW_CHANNEL", "HOME"];
+    const PRINTED_VARS: &[&str] = &["GIT_DIR", "GIT_CONFIG_PARAMETERS", "LIL_CHANNEL", "HOME"];
 
     /// With `PRINT_ENV_ENV` set, prints `<name>=<value>` or `<name> unset` for each of
     /// `PRINTED_VARS`; otherwise does nothing.
@@ -956,7 +997,7 @@ mod tests {
         for want in [
             "GIT_DIR unset".to_string(),
             "GIT_CONFIG_PARAMETERS unset".to_string(),
-            format!("WW_CHANNEL={}", t.env.channel()),
+            format!("LIL_CHANNEL={}", t.env.channel()),
             format!("HOME={}", t.root().join("profile").display()),
         ] {
             assert!(lines.contains(&want), "no `{want}` in {lines:?}");
@@ -1000,7 +1041,7 @@ mod tests {
     }
 
     /// Set in the helper child's environment: `helper_print_lines` prints and returns.
-    const PRINT_ENV: &str = "WW_TESTKIT_HELPER_PRINT";
+    const PRINT_ENV: &str = "LIL_TESTKIT_HELPER_PRINT";
 
     /// With `PRINT_ENV` set, prints one line to stdout and one to stderr; otherwise does
     /// nothing.

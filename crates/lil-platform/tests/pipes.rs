@@ -27,10 +27,10 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// `\\.\pipe\worldwright-core-<test SID>-test-<random>`.
+/// `\\.\pipe\lilith-core-<test SID>-test-<random>`.
 fn unique_pipe() -> String {
     let id = RandomIds.id("p").replace('_', "");
-    format!(r"\\.\pipe\worldwright-core-{TEST_PIPE_SID}-test-{id}")
+    format!(r"\\.\pipe\lilith-core-{TEST_PIPE_SID}-test-{id}")
 }
 
 #[test] // spec: ARCH-026

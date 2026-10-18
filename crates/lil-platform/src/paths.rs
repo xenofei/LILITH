@@ -136,7 +136,7 @@ mod tests {
     #[test] // spec: ARCH-016, ARCH-073
     fn relative_inside_maps_paths_under_a_folder() {
         let dir = tempfile::Builder::new()
-            .prefix("ww-paths-Ünïcödé space-")
+            .prefix("lil-paths-Ünïcödé space-")
             .tempdir()
             .unwrap();
         let root = dir.path().join("Work Space");

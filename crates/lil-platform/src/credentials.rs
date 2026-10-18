@@ -7,7 +7,8 @@
 //! **Targets.** The real store, [`WindowsCredentialStore`], only touches targets under
 //! [`DEV_PREFIX`] (owner tooling such as the agent token), under the legacy owner-tooling
 //! prefix [`names::LEGACY_DEV_CREDENTIAL_PREFIX`] (R4; read and deleted, never written), or
-//! under the test prefix `<legacy app name>-test-<id>/` (tests; it moves to the new name in Task B3).
+//! under the test prefix `LILITH-test-<id>/` (tests; [`crate::Env::credential_prefix`] of a test
+//! channel). The legacy test prefix is not used at all.
 //! Anything else, including either name's stable channel prefix and other channels, is refused
 //! before any Windows call ([`check_target`]). Once the harness guard is armed, an
 //! owner-tooling target under either name also trips it (QA-040).
@@ -32,11 +33,11 @@ use crate::env::Channel;
 use crate::guard;
 use crate::names;
 
-/// The owner-tooling prefix, every use. `Env::credential_prefix` for the dev channel moves to
-/// it in Task B3.
+/// The owner-tooling prefix, every use. It is also `Env::credential_prefix` of the dev
+/// channel.
 pub const DEV_PREFIX: &str = names::DEV_CREDENTIAL_PREFIX;
-/// Test channels keep the legacy name until Task B3 (`Env::credential_prefix`).
-const TEST_PREFIX: &str = "Worldwright-test-";
+/// The test channels' prefix: `Env::credential_prefix` of `test-<id>` is `LILITH-test-<id>/`.
+const TEST_PREFIX: &str = "LILITH-test-";
 /// Credential Manager's limit on a generic credential's secret, in bytes.
 pub const MAX_SECRET_BYTES: usize = 2560;
 /// Credential Manager's limit on a comment, in UTF-16 units.
@@ -363,7 +364,7 @@ impl CredentialStore for WindowsCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names::{DEV_CREDENTIAL_PREFIX, LEGACY_DEV_CREDENTIAL_PREFIX};
+    use crate::names::{DEV_CREDENTIAL_PREFIX, LEGACY_APP_NAME, LEGACY_DEV_CREDENTIAL_PREFIX};
 
     const USES: [TargetUse; 3] = [TargetUse::Read, TargetUse::Write, TargetUse::Delete];
 
@@ -375,45 +376,52 @@ mod tests {
         }
     }
 
-    const REFUSED: &[&str] = &[
-        "Worldwright/github/agent-token",
-        "Worldwright-stable/x",
-        "Worldwright-nightly/x",
-        "Worldwright-dev",
-        "Worldwright-dev/",
-        "Worldwright-devx/y",
-        "Worldwright-dev-x/y",
-        "Worldwright-test-/x",
-        "Worldwright-test-a b/x",
-        "Worldwright-test-a.b/x",
-        "Worldwright-test-abc",
-        "Worldwright-test-abc/",
-        "git:https://github.com",
-        "gh:github.com:",
-        "",
-        "Worldwright-dev/a\nb",
-        "Worldwright-dev/a\0b",
-        "LILITH/github/agent-token",
-        "LILITH-stable/x",
-        "LILITH-nightly/x",
-        "LILITH-dev",
-        "LILITH-dev/",
-        "LILITH-devx/y",
-        "LILITH-dev-x/y",
-        "LILITHSuite/x",
-        "LILITH-dev/a\nb",
-        "LILITH-dev/a\0b",
-        // Test channels keep the legacy prefix until Task B3.
-        "LILITH-test-0a1b2c3d/x",
-    ];
+    /// Targets every use refuses: either name's stable and other channel prefixes, the
+    /// owner-tooling prefixes with no name, malformed test ids, the legacy test prefix (test
+    /// channels moved to the new name in Task B3), and targets that are not ours.
+    fn refused() -> Vec<String> {
+        let mut all = Vec::new();
+        for app in [names::APP_NAME, LEGACY_APP_NAME] {
+            for suffix in [
+                "/github/agent-token",
+                "-stable/x",
+                "-nightly/x",
+                "-dev",
+                "-dev/",
+                "-devx/y",
+                "-dev-x/y",
+                "Suite/x",
+                "-dev/a\nb",
+                "-dev/a\0b",
+                "-test-/x",
+                "-test-a b/x",
+                "-test-a.b/x",
+                "-test-abc",
+                "-test-abc/",
+            ] {
+                all.push(format!("{app}{suffix}"));
+            }
+        }
+        for t in [
+            format!("{LEGACY_APP_NAME}-test-0a1b2c3d/x"),
+            format!("{LEGACY_APP_NAME}-test-a_b-1/x/y"),
+            format!("{}-TEST-0a1b2c3d/x", LEGACY_APP_NAME.to_ascii_uppercase()),
+        ] {
+            all.push(t);
+        }
+        for t in ["git:https://github.com", "gh:github.com:", ""] {
+            all.push(t.to_string());
+        }
+        all
+    }
 
     #[test] // spec: QA-079
     fn targets_outside_dev_and_test_prefixes_are_refused() {
         for use_ in USES {
-            for t in REFUSED {
+            for t in refused() {
                 assert!(
                     matches!(
-                        check_target(t, use_),
+                        check_target(&t, use_),
                         Err(CredentialError::TargetRefused(_))
                     ),
                     "{t:?} {use_:?}"
@@ -422,12 +430,49 @@ mod tests {
             for t in [
                 "LILITH-dev/github/agent-token",
                 "lilith-DEV/x",
-                "Worldwright-test-0a1b2c3d/roundtrip",
-                "Worldwright-test-a_b-1/x/y",
+                "LILITH-test-0a1b2c3d/roundtrip",
+                "LILITH-test-a_b-1/x/y",
             ] {
                 assert_eq!(check_target(t, use_), Ok(()), "{t:?} {use_:?}");
             }
-            assert!(check_target(&format!("Worldwright-test-{}/x", "a".repeat(65)), use_).is_err());
+            assert!(check_target(&format!("LILITH-test-{}/x", "a".repeat(65)), use_).is_err());
+        }
+    }
+
+    /// Test channels use `LILITH-test-<id>/` (Task B3): every use, any case, and it is what a
+    /// test channel's `Env` hands out. The legacy test prefix is no longer used at all.
+    #[test] // spec: QA-079, QA-038
+    fn test_channel_credential_prefix_is_lilith_test() {
+        for use_ in USES {
+            for t in [
+                "LILITH-test-0a1b2c3d/x",
+                "lilith-TEST-0a1b2c3d/a/b",
+                "LILITH-test-a_b-1/x",
+            ] {
+                assert_eq!(check_target(t, use_), Ok(()), "{t:?} {use_:?}");
+            }
+            let legacy = format!("{LEGACY_APP_NAME}-test-0a1b2c3d/x");
+            assert!(
+                matches!(
+                    check_target(&legacy, use_),
+                    Err(CredentialError::TargetRefused(_))
+                ),
+                "{legacy:?} {use_:?}"
+            );
+        }
+        let env = crate::Env::with_roots(
+            Channel::Test("0a1b2c3d".into()),
+            crate::Roots {
+                roaming: r"C:\Fake\R".into(),
+                local: r"C:\Fake\L".into(),
+                user_profile: r"C:\Fake\U".into(),
+            },
+            "S-1".into(),
+        );
+        assert_eq!(env.credential_prefix(), "LILITH-test-0a1b2c3d/");
+        let target = format!("{}github/x", env.credential_prefix());
+        for use_ in USES {
+            assert_eq!(check_target(&target, use_), Ok(()), "{use_:?}");
         }
     }
 
@@ -525,7 +570,7 @@ mod tests {
     #[test] // spec: QA-079
     fn real_store_refuses_other_targets_before_any_windows_call() {
         let store = WindowsCredentialStore;
-        for t in REFUSED {
+        for t in &refused() {
             assert!(
                 matches!(store.get(t), Err(CredentialError::TargetRefused(_))),
                 "{t:?}"
@@ -547,7 +592,7 @@ mod tests {
     #[test] // spec: QA-079
     fn invalid_credentials_are_refused_before_any_windows_call() {
         let store = WindowsCredentialStore;
-        let target = "Worldwright-test-00000000/never-written";
+        let target = "LILITH-test-00000000/never-written";
         let too_long = cred(&"x".repeat(MAX_SECRET_BYTES + 1));
         let mut long_comment = cred("s");
         long_comment.comment = Some("c".repeat(MAX_COMMENT_CHARS + 1));
@@ -584,7 +629,7 @@ mod tests {
         assert_eq!(store.delete(t), Ok(true));
         assert_eq!(store.delete(t), Ok(false));
         assert_eq!(store.get(t), Ok(None));
-        for bad in REFUSED {
+        for bad in &refused() {
             assert!(matches!(
                 store.get(bad),
                 Err(CredentialError::TargetRefused(_))

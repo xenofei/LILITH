@@ -641,6 +641,6 @@ fn idle_core_exits_0_end_to_end() {
     assert_eq!(
         core.wait_exit(DEADLINE),
         Some(0),
-        "an idle test core with WW_TEST_IDLE_SECS=1 must exit 0"
+        "an idle test core with LIL_TEST_IDLE_SECS=1 must exit 0"
     );
 }

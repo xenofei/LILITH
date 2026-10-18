@@ -243,7 +243,7 @@ fn resolve(abs: &Path, shown: &str, trace_id: &str) -> Result<WorkspaceRef, Erro
 /// The folders registered in `suite.toml` (none when it is missing or doesn't parse; a write
 /// then reports the file itself).
 fn registered(env: &Env) -> Vec<String> {
-    std::fs::read_to_string(env.suite_toml())
+    std::fs::read_to_string(env.suite_toml_to_read())
         .ok()
         .and_then(|text| SuiteToml::parse(&text).ok())
         .map(|suite| {
@@ -539,23 +539,23 @@ mod tests {
 
     #[test] // spec: ARCH-094
     fn refuse_inside_rejects_the_install_folder_and_below() {
-        let install = Path::new(r"C:\Programs\Worldwright");
+        let install = Path::new(r"C:\Programs\LILITHSuite");
         for refused in [
-            r"C:\Programs\Worldwright",
-            r"C:\Programs\Worldwright\",
-            r"C:\Programs\Worldwright\ws",
-            r"C:\Programs\Worldwright\a\Ünïcödé space",
-            r"c:\programs\WORLDWRIGHT\Ws",
+            r"C:\Programs\LILITHSuite",
+            r"C:\Programs\LILITHSuite\",
+            r"C:\Programs\LILITHSuite\ws",
+            r"C:\Programs\LILITHSuite\a\Ünïcödé space",
+            r"c:\programs\lilithsuite\Ws",
         ] {
             let why = refuse_inside(Path::new(refused), Some(install))
                 .expect_err(&format!("{refused} was accepted"));
             assert!(why.contains("install folder"), "{why}");
         }
         for accepted in [
-            r"C:\Programs\Worldwright2",
+            r"C:\Programs\LILITHSuite2",
             r"C:\Programs\Other",
             r"C:\Programs",
-            r"D:\Worldwright",
+            r"D:\LILITHSuite",
         ] {
             assert_eq!(
                 refuse_inside(Path::new(accepted), Some(install)),

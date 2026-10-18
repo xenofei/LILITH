@@ -280,7 +280,7 @@ pub enum SuiteTomlState {
 /// The channel's `suite.toml`, read with [`SuiteToml`]; never through the `cli` workspace
 /// chain, so a stale default is reported rather than refused.
 pub fn inspect_suite_toml(env: &Env) -> SuiteTomlState {
-    let file = env.suite_toml();
+    let file = env.suite_toml_to_read();
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return SuiteTomlState::Missing,

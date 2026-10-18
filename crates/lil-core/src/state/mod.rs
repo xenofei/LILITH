@@ -2,7 +2,7 @@
 //! `Env::local_dir()\state.db` and one per workspace at `Env::workspace_local_dir(ws)\state.db`.
 //!
 //! **One actor per database.** Each [`StateDb`] owns a single `rusqlite::Connection` on its
-//! own named thread (`ww-state-suite`, `ww-state-ws-<id>`); callers send it jobs and await the
+//! own named thread (`lil-state-suite`, `lil-state-ws-<id>`); callers send it jobs and await the
 //! replies. If the actor panics, `on_fatal("state")` is called once and every queued and later
 //! call returns [`StateError::ActorGone`].
 //!
@@ -28,7 +28,7 @@
 //! earlier core) are deleted. For the suite database that is safe: it is per channel, and only
 //! the core that owns the channel's pipe opens it (startup order: pipe, log, state). A
 //! workspace database on another volume than the local folder,
-//! `<vol>:\.worldwright-local\<hash>\state.db`, is not per channel: the cores of every channel
+//! `<vol>:\.lilith-local\<hash>\state.db`, is not per channel: the cores of every channel
 //! that open that workspace share it (ARCH-097). So a workspace database is opened read-write
 //! (and its rows released) only by the core that holds the workspace's ARCH-028 `core.lock`
 //! ([`Access::ReadWrite`]); every other core opens it [`Access::ReadOnly`]: a read-only
@@ -37,6 +37,26 @@
 //! the migrations applied, and nothing is created on disk.
 //! `done` rows older than 30 days are pruned by `idem_begin`, against the caller's `now`: the
 //! same clock that stamped the rows.
+//!
+//! **Copy-forward (plan decision D3, R4).** A pre-rename core kept a workspace's database at
+//! `Env::legacy_workspace_local_dir_for_canonical(ws)\state.db`. A [`Access::ReadWrite`] open
+//! (the core holds the workspace's `core.lock`, so no other core writes either file) whose new
+//! `state.db` is missing copies the legacy one forward first ([`copy_forward`]): a leftover
+//! `.state.db.lil-tmp-*` from a killed copy is removed; the legacy file is checked like any
+//! existing one (hot journal, `quick_check`, `user_version`); a read-only connection on it runs
+//! `VACUUM INTO` a fresh `.state.db.lil-tmp-<pid>-<n>` beside the new path (the name is a bound
+//! parameter); the fail point `state.copy_forward` comes next; the temp file is flushed to disk
+//! and moved to `state.db` without replacing anything. The normal open then checks and migrates
+//! the copy. `VACUUM INTO` writes one self-contained file, so the legacy `-wal` is read (its
+//! committed rows are in the copy) and no `-wal` or `-shm` is ever copied. The legacy database
+//! and its `-wal` are never written, moved or deleted. The one write the legacy folder can see
+//! (D3's honest limit): a plain read-only connection on a WAL file (one with a `-wal`, or the
+//! read-only open below) may create or update its `-shm`, SQLite's index, and creates an empty
+//! `-wal` when there is none; neither changes a row. The copy's checks and `VACUUM INTO` open a
+//! legacy file without a `-wal` `immutable=1`, so they create nothing.
+//! A [`Access::ReadOnly`] open uses the new file if it exists, else the legacy one read-only,
+//! else the in-memory database. A legacy file that can't be used fails the open with an error
+//! naming it, and nothing is written.
 //!
 //! **Workspace databases** are opened on first use, on a blocking thread
 //! (`spawn_blocking`), each behind its own once-cell: opening one workspace's database never
@@ -50,6 +70,7 @@ pub use migrations::{SUITE_MIGRATIONS, WORKSPACE_MIGRATIONS};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -60,8 +81,10 @@ use rusqlite::{
 };
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
+use crate::store::failpoints::FailPoints;
 use crate::store::fsops;
 use crate::store::paths::path_key;
+use crate::store::write::{COPY_FORWARD_TEMP, is_copy_forward_temp, remove_copy_forward_temp};
 use crate::workspace::{Access, WorkspaceRef};
 
 /// Called once when a database actor dies, with `"state"`.
@@ -95,8 +118,8 @@ impl StateScope {
 
     fn thread_name(self) -> &'static str {
         match self {
-            StateScope::Suite => "ww-state-suite",
-            StateScope::Workspace => "ww-state-ws",
+            StateScope::Suite => "lil-state-suite",
+            StateScope::Workspace => "lil-state-ws",
         }
     }
 }
@@ -904,6 +927,8 @@ pub struct StateRegistry {
     /// is open; [`StateRegistry::close`] takes it exclusively once it has set the flag, so no
     /// open is still migrating or releasing rows when `close` returns.
     opening: Arc<RwLock<()>>,
+    /// The core's fail points (`state.copy_forward`).
+    failpoints: Arc<FailPoints>,
 }
 
 /// One cell per workspace id and access: the lock is held only to find a cell or to close.
@@ -928,6 +953,19 @@ impl StateRegistry {
     /// # Errors
     /// As [`StateDb::open`].
     pub fn open(env: &Env, on_fatal: OnFatal) -> Result<StateRegistry, StateError> {
+        StateRegistry::open_with_failpoints(env, on_fatal, FailPoints::none())
+    }
+
+    /// [`StateRegistry::open`] with the core's fail points, which the workspace opens hit
+    /// (`state.copy_forward`, D3).
+    ///
+    /// # Errors
+    /// As [`StateDb::open`].
+    pub fn open_with_failpoints(
+        env: &Env,
+        on_fatal: OnFatal,
+        failpoints: Arc<FailPoints>,
+    ) -> Result<StateRegistry, StateError> {
         let suite = StateDb::open_named(
             &env.suite_state_db(),
             StateScope::Suite,
@@ -940,6 +978,7 @@ impl StateRegistry {
             suite,
             workspaces: Arc::new(Mutex::new(Workspaces::default())),
             opening: Arc::new(RwLock::new(())),
+            failpoints,
         })
     }
 
@@ -1006,9 +1045,10 @@ impl StateRegistry {
             .get_or_try_init(|| {
                 let (env, on_fatal, ws) = (self.env.clone(), self.on_fatal.clone(), ws.clone());
                 let (workspaces, opening) = (self.workspaces.clone(), self.opening.clone());
+                let fp = self.failpoints.clone();
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        open_workspace_db(&env, on_fatal, &ws, access, &workspaces, &opening)
+                        open_workspace_db(&env, on_fatal, &ws, access, &workspaces, &opening, &fp)
                     })
                     .await
                     .map_err(|e| {
@@ -1060,6 +1100,7 @@ fn open_workspace_db(
     access: Access,
     workspaces: &Mutex<Workspaces>,
     opening: &RwLock<()>,
+    fp: &FailPoints,
 ) -> Result<Arc<StateDb>, StateError> {
     let _opening = opening.read().unwrap_or_else(PoisonError::into_inner);
     if lock(workspaces).closed {
@@ -1069,14 +1110,162 @@ fn open_workspace_db(
         .workspace_local_dir_for_canonical(&ws.path)
         .map_err(|e| StateError::Io(e.to_string()))?;
     let path = dir.join("state.db");
-    let thread = format!("ww-state-ws-{}", ws.id);
+    let legacy = env
+        .legacy_workspace_local_dir_for_canonical(&ws.path)
+        .map_err(|e| StateError::Io(e.to_string()))?
+        .join("state.db");
+    let thread = format!("lil-state-ws-{}", ws.id);
+    let known = i64::try_from(WORKSPACE_MIGRATIONS.len()).expect("a handful of migrations");
     match access {
-        Access::ReadWrite => StateDb::open_named(&path, StateScope::Workspace, thread, on_fatal),
+        Access::ReadWrite => {
+            copy_forward(&path, &legacy, known, fp)?;
+            StateDb::open_named(&path, StateScope::Workspace, thread, on_fatal)
+        }
         Access::ReadOnly => {
-            StateDb::open_read_only_named(&path, StateScope::Workspace, thread, on_fatal)
+            if !exists(&path)? && exists(&legacy)? {
+                tracing::info!(legacy = %legacy.display(), "no new state.db yet; the legacy one is read read-only");
+                StateDb::open_read_only_named(&legacy, StateScope::Workspace, thread, on_fatal)
+                    .map_err(|e| naming_legacy(e, &legacy))
+            } else {
+                StateDb::open_read_only_named(&path, StateScope::Workspace, thread, on_fatal)
+            }
         }
     }
     .map(Arc::new)
+}
+
+/// Keeps the `<pid>-<n>` temp names of copies in one process apart.
+static NEXT_COPY: AtomicU64 = AtomicU64::new(1);
+
+/// Whether `path` exists; an error looking is [`StateError::Io`].
+fn exists(path: &Path) -> Result<bool, StateError> {
+    path.try_exists()
+        .map_err(|e| StateError::Io(format!("cannot look at {}: {e}", path.display())))
+}
+
+/// `e` from using the legacy database at `legacy`, as an error that names the file (D3). The
+/// variants that carry a message keep their kind; the others become [`StateError::Io`].
+fn naming_legacy(e: StateError, legacy: &Path) -> StateError {
+    tracing::error!(legacy = %legacy.display(), error = %e, "the legacy workspace state.db can't be used; nothing was written");
+    let named = |why: &dyn std::fmt::Display| {
+        format!("the legacy workspace database {}: {why}", legacy.display())
+    };
+    match e {
+        StateError::Io(why) => StateError::Io(named(&why)),
+        StateError::Corrupt(why) => StateError::Corrupt(named(&why)),
+        StateError::ActorGone => StateError::ActorGone,
+        other @ (StateError::TooNew { .. } | StateError::HotJournal) => {
+            StateError::Io(named(&other))
+        }
+    }
+}
+
+/// D3's copy-forward, for a read-write open only (the caller holds the workspace's
+/// `core.lock`). When the new database `path` is missing: removes any leftover copy-forward
+/// temp file beside it, and if the legacy database `legacy` exists, copies it
+/// to `path` (see the module docs). Does nothing when `path` exists. The legacy files are only
+/// read.
+///
+/// # Errors
+/// [`StateError::Io`] or [`StateError::Corrupt`] naming the legacy file when it can't be used
+/// (nothing is created then); [`StateError::Io`] when the copy can't be made (its temp file is
+/// removed again, the legacy files are as they were).
+fn copy_forward(path: &Path, legacy: &Path, known: i64, fp: &FailPoints) -> Result<(), StateError> {
+    if exists(path)? {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| StateError::Io(format!("{} has no folder", path.display())))?;
+    remove_copy_leftovers(dir)?;
+    if !exists(legacy)? {
+        return Ok(());
+    }
+    // No other core writes the legacy file while this one holds `core.lock`: `Quiet::Yes`.
+    refuse_hot_journal(legacy).map_err(|e| naming_legacy(e, legacy))?;
+    check_existing(legacy, known, Quiet::Yes).map_err(|e| naming_legacy(e, legacy))?;
+    fsops::ensure_dir(dir)
+        .map_err(|e| StateError::Io(format!("cannot create {}: {e}", dir.display())))?;
+    let n = NEXT_COPY.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!("{COPY_FORWARD_TEMP}{}-{n}", std::process::id()));
+    tracing::info!(legacy = %legacy.display(), new = %path.display(), "copying the legacy workspace state.db forward");
+    let copied = vacuum_into(legacy, &temp).and_then(|()| {
+        let io = |what: &str, e: std::io::Error| {
+            StateError::Io(format!("{what} {}: {e}", temp.display()))
+        };
+        fp.hit("state.copy_forward")
+            .map_err(|e| io("the copy stopped at", e))?;
+        fsops::flush_file(&temp).map_err(|e| io("cannot flush", e))?;
+        match fsops::move_new(&temp, path) {
+            Ok(()) => Ok(()),
+            // Another open made it meanwhile: that one wins, the copy is dropped.
+            Err(e) if lil_platform::fs::classify(&e) == lil_platform::fs::RetryClass::TargetExists => {
+                tracing::warn!(new = %path.display(), "a new state.db appeared during the copy; it is kept");
+                Ok(())
+            }
+            Err(e) => Err(io(&format!("cannot move to {}", path.display()), e)),
+        }
+    });
+    if temp.exists()
+        && let Err(e) = remove_copy_forward_temp(&temp)
+    {
+        tracing::warn!(temp = %temp.display(), error = %e, "the copy's temp file stays; the next open removes it");
+    }
+    copied?;
+    tracing::info!(new = %path.display(), "the legacy workspace state.db was copied forward");
+    Ok(())
+}
+
+/// Removes every copy-forward temp file in `dir` (a killed copy's), never anything else. A
+/// missing folder has none.
+fn remove_copy_leftovers(dir: &Path) -> Result<(), StateError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(StateError::Io(format!(
+                "cannot list {}: {e}",
+                dir.display()
+            )));
+        }
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| StateError::Io(format!("cannot list {}: {e}", dir.display())))?;
+        let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+        if is_file && is_copy_forward_temp(&entry.file_name().to_string_lossy()) {
+            let leftover = entry.path();
+            remove_copy_forward_temp(&leftover).map_err(|e| {
+                StateError::Io(format!("cannot remove {}: {e}", leftover.display()))
+            })?;
+            tracing::info!(leftover = %leftover.display(), "a killed copy-forward's temp file was removed");
+        }
+    }
+    Ok(())
+}
+
+/// `VACUUM INTO temp` on a read-only connection to `legacy` ([`open_untouched`], quiet): one
+/// self-contained file with every committed row, the WAL's included. The target name is a bound
+/// parameter, never part of the SQL text.
+fn vacuum_into(legacy: &Path, temp: &Path) -> Result<(), StateError> {
+    let target = temp
+        .to_str()
+        .ok_or_else(|| StateError::Io(format!("{} is not valid Unicode", temp.display())))?;
+    let conn =
+        open_untouched(legacy, Quiet::Yes).map_err(|e| naming_legacy(sql_error(&e), legacy))?;
+    let run = || -> rusqlite::Result<()> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.execute("VACUUM INTO ?1", params![target]).map(drop)
+    };
+    let ran = run();
+    conn.close().map_err(|(_, e)| sql_error(&e))?;
+    ran.map_err(|e| {
+        StateError::Io(format!(
+            "copying {} to {} failed: {e}",
+            legacy.display(),
+            temp.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1226,6 +1415,7 @@ mod tests {
             Access::ReadWrite,
             &reg.workspaces,
             &reg.opening,
+            &reg.failpoints,
         );
         assert!(matches!(late, Err(StateError::ActorGone)), "{late:?}");
         assert!(!db.exists(), "{} was created after close", db.display());

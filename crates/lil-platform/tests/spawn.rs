@@ -1,8 +1,8 @@
 //! Detached, non-inheriting spawn (ARCH-019; Review Focus 1 and 5).
 //!
-//! The test binary doubles as its own child: when `WW_SPAWN_HELPER_SLEEP_MS` is set, the test
+//! The test binary doubles as its own child: when `LIL_SPAWN_HELPER_SLEEP_MS` is set, the test
 //! `helper_sleep` sleeps that long and exits 0; otherwise it returns at once. When
-//! `WW_SPAWN_HELPER_EXPECT_ARG` is also set, the helper first checks its own command line and
+//! `LIL_SPAWN_HELPER_EXPECT_ARG` is also set, the helper first checks its own command line and
 //! working directory and exits with a distinct non-zero code if they are wrong.
 
 use std::ffi::OsString;
@@ -19,8 +19,8 @@ use lil_platform::process::{
 };
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 
-const SLEEP_ENV: &str = "WW_SPAWN_HELPER_SLEEP_MS";
-const EXPECT_ARG_ENV: &str = "WW_SPAWN_HELPER_EXPECT_ARG";
+const SLEEP_ENV: &str = "LIL_SPAWN_HELPER_SLEEP_MS";
+const EXPECT_ARG_ENV: &str = "LIL_SPAWN_HELPER_EXPECT_ARG";
 /// One argument with a space, non-ASCII letters, embedded quotes and a trailing backslash.
 const TRICKY_ARG: &str = r#"Ünïcödé space "quoted" trailing\"#;
 

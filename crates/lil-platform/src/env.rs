@@ -3,11 +3,16 @@
 //!
 //! Naming contract (QA-038):
 //!
-//! | Value             | Stable channel                                 | Other channels                        |
-//! |-------------------|------------------------------------------------|---------------------------------------|
-//! | Data folders      | `<roaming>\Worldwright`, `<local>\Worldwright` | `Worldwright-<channel>`               |
-//! | Registry root     | `HKCU\Software\Worldwright`                    | `HKCU\Software\Worldwright-<channel>` |
-//! | Credential prefix | `Worldwright/`                                 | `Worldwright-<channel>/`              |
+//! | Value             | Stable channel                       | Other channels                   |
+//! |-------------------|--------------------------------------|----------------------------------|
+//! | Data folders      | `<roaming>\LILITH`, `<local>\LILITH` | `LILITH-<channel>`               |
+//! | Registry root     | `HKCU\Software\LILITH`               | `HKCU\Software\LILITH-<channel>` |
+//! | Credential prefix | `LILITH/`                            | `LILITH-<channel>/`              |
+//!
+//! Legacy names (R4): the folders under the legacy app name ([`names::LEGACY_APP_NAME`]) are
+//! read, never written: `suite.toml` when the new one is missing
+//! ([`Env::suite_toml_to_read`]), and a workspace `state.db` that the core copies forward
+//! ([`Env::legacy_workspace_local_dir_for_canonical`], plan decision D3).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,7 +27,7 @@ use crate::process_env::{
     TestOverrides,
 };
 use crate::volume::{SystemVolumeResolver, VolumeResolver};
-use crate::{guard, known_folders, sid};
+use crate::{guard, known_folders, names, sid};
 
 /// Release channel. Display form: `stable`, `dev` or `test-<id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,11 +64,21 @@ impl Channel {
         }
     }
 
-    /// `Worldwright` for stable, `Worldwright-<channel>` otherwise.
+    /// `LILITH` for stable, `LILITH-<channel>` otherwise ([`names::APP_NAME`]).
     pub(crate) fn app_name(&self) -> String {
-        match self {
-            Channel::Stable => "Worldwright".to_string(),
-            other => format!("Worldwright-{other}"),
+        Channel::named(names::APP_NAME, self)
+    }
+
+    /// [`Channel::app_name`] under the legacy app name (R4 readers only).
+    pub(crate) fn legacy_app_name(&self) -> String {
+        Channel::named(names::LEGACY_APP_NAME, self)
+    }
+
+    /// `app` for stable, `app-<channel>` otherwise.
+    fn named(app: &str, channel: &Channel) -> String {
+        match channel {
+            Channel::Stable => app.to_string(),
+            other => format!("{app}-{other}"),
         }
     }
 }
@@ -121,9 +136,9 @@ pub enum EnvError {
     /// The process asked for a channel this build does not serve (a stable build serves only
     /// `stable`; a dev build serves `dev` and `test-<id>`).
     ChannelNotAllowed { build: String, requested: String },
-    /// A test channel was requested but `WW_TEST_ROOT` is not set.
+    /// A test channel was requested but `LIL_TEST_ROOT` is not set.
     TestRootMissing,
-    /// `WW_TEST_ROOT` is not an absolute path to an existing directory.
+    /// `LIL_TEST_ROOT` is not an absolute path to an existing directory.
     TestRootInvalid(PathBuf),
 }
 
@@ -192,11 +207,11 @@ impl Env {
         })
     }
 
-    /// Resolves the channel from the build channel and the `WW_CHANNEL` variable (ARCH-094).
+    /// Resolves the channel from the build channel and the `LIL_CHANNEL` variable (ARCH-094).
     ///
-    /// - A `stable` build serves only `stable`; any other `WW_CHANNEL` is refused.
+    /// - A `stable` build serves only `stable`; any other `LIL_CHANNEL` is refused.
     /// - Any other build serves `dev` (the default) and `test-<id>`.
-    /// - A test channel needs `WW_TEST_ROOT`, an absolute existing folder, and uses
+    /// - A test channel needs `LIL_TEST_ROOT`, an absolute existing folder, and uses
     ///   `<root>\roaming`, `<root>\local` and `<root>\profile` with the fixed
     ///   [`TEST_PIPE_SID`]. The harness guard is armed with the owner's real locations
     ///   (including their registered workspaces) *before* the `Env` is built (QA-040).
@@ -281,23 +296,26 @@ impl Env {
         &self.channel
     }
 
-    /// `<roaming>\Worldwright[-<channel>]`
+    /// `<roaming>\LILITH[-<channel>]`
     pub fn data_dir(&self) -> PathBuf {
         guard::check_path(self.roots.roaming.join(self.channel.app_name()))
     }
 
-    /// `<local>\Worldwright[-<channel>]`
+    /// `<local>\LILITH[-<channel>]`
     pub fn local_dir(&self) -> PathBuf {
         guard::check_path(self.roots.local.join(self.channel.app_name()))
     }
 
-    /// The installed program folder, `<local root>\WorldwrightSuite\current`. Only the stable
+    /// The installed program folder, `<local root>\LILITHSuite\current`. Only the stable
     /// channel is installed; the other channels run from a build folder (ARCH-094). It is a
     /// sibling of the data folders, never a parent: nothing the suite writes goes inside it.
     pub fn install_dir(&self) -> Option<PathBuf> {
         match self.channel {
             Channel::Stable => Some(guard::check_path(
-                self.roots.local.join("WorldwrightSuite").join("current"),
+                self.roots
+                    .local
+                    .join(format!("{}Suite", names::APP_NAME))
+                    .join("current"),
             )),
             Channel::Dev | Channel::Test(_) => None,
         }
@@ -306,6 +324,44 @@ impl Env {
     /// `data_dir\suite.toml`: the workspace registry.
     pub fn suite_toml(&self) -> PathBuf {
         self.data_dir().join("suite.toml")
+    }
+
+    /// The `suite.toml` to read: [`Env::suite_toml`] if it exists, else the legacy folder's
+    /// file if that exists (R4), else [`Env::suite_toml`]. Writes always go to
+    /// [`Env::suite_toml`].
+    ///
+    /// Only existence is checked; nothing is created or written. A new file whose existence
+    /// can't be checked counts as existing, so its read reports the error.
+    pub fn suite_toml_to_read(&self) -> PathBuf {
+        let new = self.suite_toml();
+        if new.try_exists().unwrap_or(true) {
+            return new;
+        }
+        let legacy = self.legacy_data_dir().join("suite.toml");
+        if legacy.is_file() { legacy } else { new }
+    }
+
+    /// `<roaming>\<legacy app name>[-<channel>]`: read only, for [`Env::suite_toml_to_read`]
+    /// (R4). Nothing is ever written there.
+    pub fn legacy_data_dir(&self) -> PathBuf {
+        guard::check_path(self.roots.roaming.join(self.channel.legacy_app_name()))
+    }
+
+    /// `<local>\<legacy app name>[-<channel>]`: read only (R4, D3). Nothing is ever written
+    /// there.
+    pub fn legacy_local_dir(&self) -> PathBuf {
+        guard::check_path(self.roots.local.join(self.channel.legacy_app_name()))
+    }
+
+    /// Where a pre-rename core kept `canonical`'s local data (D3): the same hash as
+    /// [`Env::workspace_local_dir_for_canonical`], under [`Env::legacy_local_dir`] on the
+    /// local folder's volume, else under the volume's [`names::LEGACY_LOCAL_DIR`]. Read only:
+    /// the core copies its `state.db` forward and never writes, moves or deletes anything there.
+    pub fn legacy_workspace_local_dir_for_canonical(
+        &self,
+        canonical: &Path,
+    ) -> Result<PathBuf, EnvError> {
+        self.local_dir_under(canonical, &self.legacy_local_dir(), names::LEGACY_LOCAL_DIR)
     }
 
     /// `local_dir\state.db`: the suite state database (CORE-005).
@@ -342,11 +398,22 @@ impl Env {
     /// The pure half of [`Env::workspace_local_dir`]: `canonical` is already canonical.
     ///
     /// - Same volume as `local_dir`: `<local_dir>\workspaces\<hash>`.
-    /// - Otherwise: `<volume root>\.worldwright-local\<hash>`.
+    /// - Otherwise: `<volume root>\.lilith-local\<hash>` ([`names::LOCAL_DIR`]).
     pub fn workspace_local_dir_for_canonical(&self, canonical: &Path) -> Result<PathBuf, EnvError> {
+        self.local_dir_under(canonical, &self.local_dir(), names::LOCAL_DIR)
+    }
+
+    /// `<local>\workspaces\<hash>` when `canonical` is on `local`'s volume, else
+    /// `<volume root>\<volume_dir>\<hash>`.
+    fn local_dir_under(
+        &self,
+        canonical: &Path,
+        local: &Path,
+        volume_dir: &str,
+    ) -> Result<PathBuf, EnvError> {
         let hash = Self::workspace_hash(canonical);
         let ws = strip_verbatim(canonical);
-        let local = self.local_dir();
+        let local = local.to_path_buf();
         let ws_volume = self
             .volumes
             .volume_root(&ws)
@@ -361,38 +428,33 @@ impl Env {
         if normalise_for_hash(&ws_volume) == normalise_for_hash(&local_volume) {
             Ok(guard::check_path(local.join("workspaces").join(hash)))
         } else {
-            Ok(guard::check_path(
-                ws_volume.join(".worldwright-local").join(hash),
-            ))
+            Ok(guard::check_path(ws_volume.join(volume_dir).join(hash)))
         }
     }
 
-    /// `HKCU\Software\Worldwright[-<channel>]`
+    /// `HKCU\Software\LILITH[-<channel>]`
     pub fn registry_root(&self) -> String {
         guard::check_registry(format!(r"HKCU\Software\{}", self.channel.app_name()))
     }
 
-    /// `Worldwright[-<channel>]/`
+    /// `LILITH[-<channel>]/`
     pub fn credential_prefix(&self) -> String {
         guard::check_credential(format!("{}/", self.channel.app_name()))
     }
 
-    /// `\\.\pipe\worldwright-core-<userSID>-<channel>`
+    /// `\\.\pipe\lilith-core-<userSID>-<channel>`. The legacy pipe is not served (R4, D8).
     pub fn pipe_name(&self) -> String {
         guard::check_channel_name(
             &self.channel,
-            format!(
-                r"\\.\pipe\worldwright-core-{}-{}",
-                self.user_sid, self.channel
-            ),
+            format!(r"\\.\pipe\lilith-core-{}-{}", self.user_sid, self.channel),
         )
     }
 
-    /// `Worldwright.Suite.<Channel>` with the capitalised channel: `Stable`, `Dev`, `Test-<id>`.
+    /// `LILITH.Suite.<Channel>` with the capitalised channel: `Stable`, `Dev`, `Test-<id>`.
     pub fn notification_aumid(&self) -> String {
         guard::check_channel_name(
             &self.channel,
-            format!("Worldwright.Suite.{}", self.channel.capitalised()),
+            format!("{}.Suite.{}", names::APP_NAME, self.channel.capitalised()),
         )
     }
 
@@ -486,48 +548,45 @@ mod tests {
     #[test] // spec: QA-038
     fn stable_paths() {
         let e = env(Channel::Stable);
-        assert_eq!(e.data_dir(), PathBuf::from(r"C:\R\Worldwright"));
-        assert_eq!(e.registry_root(), r"HKCU\Software\Worldwright");
-        assert_eq!(e.credential_prefix(), "Worldwright/");
+        assert_eq!(e.data_dir(), PathBuf::from(r"C:\R\LILITH"));
+        assert_eq!(e.registry_root(), r"HKCU\Software\LILITH");
+        assert_eq!(e.credential_prefix(), "LILITH/");
     }
 
     #[test] // spec: QA-038
     fn dev_paths_are_suffixed() {
         let e = env(Channel::Dev);
-        assert_eq!(e.data_dir(), PathBuf::from(r"C:\R\Worldwright-dev"));
-        assert_eq!(e.registry_root(), r"HKCU\Software\Worldwright-dev");
-        assert_eq!(e.credential_prefix(), "Worldwright-dev/");
+        assert_eq!(e.data_dir(), PathBuf::from(r"C:\R\LILITH-dev"));
+        assert_eq!(e.registry_root(), r"HKCU\Software\LILITH-dev");
+        assert_eq!(e.credential_prefix(), "LILITH-dev/");
     }
 
     #[test] // spec: QA-038
     fn local_logs_and_claude_dirs_follow_channel() {
         let e = env(Channel::Test("abc".into()));
-        assert_eq!(e.local_dir(), PathBuf::from(r"C:\L\Worldwright-test-abc"));
-        assert_eq!(
-            e.logs_dir(),
-            PathBuf::from(r"C:\L\Worldwright-test-abc\logs")
-        );
+        assert_eq!(e.local_dir(), PathBuf::from(r"C:\L\LILITH-test-abc"));
+        assert_eq!(e.logs_dir(), PathBuf::from(r"C:\L\LILITH-test-abc\logs"));
         assert_eq!(
             e.claude_profiles_dir(),
-            PathBuf::from(r"C:\L\Worldwright-test-abc\claude-profiles")
+            PathBuf::from(r"C:\L\LILITH-test-abc\claude-profiles")
         );
         assert_eq!(
             e.claude_default_profile_dir(),
             PathBuf::from(r"C:\U\.claude")
         );
-        assert_eq!(e.registry_root(), r"HKCU\Software\Worldwright-test-abc");
-        assert_eq!(e.credential_prefix(), "Worldwright-test-abc/");
+        assert_eq!(e.registry_root(), r"HKCU\Software\LILITH-test-abc");
+        assert_eq!(e.credential_prefix(), "LILITH-test-abc/");
     }
 
     #[test] // spec: ARCH-095
     fn pipe_name_format() {
         assert_eq!(
             env(Channel::Dev).pipe_name(),
-            r"\\.\pipe\worldwright-core-S-1-5-21-1-2-3-1001-dev"
+            r"\\.\pipe\lilith-core-S-1-5-21-1-2-3-1001-dev"
         );
         assert_eq!(
             env(Channel::Test("x1".into())).pipe_name(),
-            r"\\.\pipe\worldwright-core-S-1-5-21-1-2-3-1001-test-x1"
+            r"\\.\pipe\lilith-core-S-1-5-21-1-2-3-1001-test-x1"
         );
     }
 
@@ -535,15 +594,12 @@ mod tests {
     fn aumid_uses_capitalised_channel() {
         assert_eq!(
             env(Channel::Stable).notification_aumid(),
-            "Worldwright.Suite.Stable"
+            "LILITH.Suite.Stable"
         );
-        assert_eq!(
-            env(Channel::Dev).notification_aumid(),
-            "Worldwright.Suite.Dev"
-        );
+        assert_eq!(env(Channel::Dev).notification_aumid(), "LILITH.Suite.Dev");
         assert_eq!(
             env(Channel::Test("abc".into())).notification_aumid(),
-            "Worldwright.Suite.Test-abc"
+            "LILITH.Suite.Test-abc"
         );
     }
 
@@ -693,18 +749,18 @@ mod tests {
     fn install_dir_only_for_stable_and_data_never_inside_it() {
         let stable = env(Channel::Stable);
         let install = stable.install_dir().expect("stable has an install dir");
-        assert_eq!(install, PathBuf::from(r"C:\L\WorldwrightSuite\current"));
+        assert_eq!(install, PathBuf::from(r"C:\L\LILITHSuite\current"));
         assert!(!stable.data_dir().starts_with(&install));
         assert!(!stable.local_dir().starts_with(&install));
         assert!(!stable.suite_toml().starts_with(&install));
         assert!(!stable.suite_state_db().starts_with(&install));
         assert_eq!(
             stable.suite_toml(),
-            PathBuf::from(r"C:\R\Worldwright\suite.toml")
+            PathBuf::from(r"C:\R\LILITH\suite.toml")
         );
         assert_eq!(
             stable.suite_state_db(),
-            PathBuf::from(r"C:\L\Worldwright\state.db")
+            PathBuf::from(r"C:\L\LILITH\state.db")
         );
         for channel in [Channel::Dev, Channel::Test("ab".into())] {
             let e = env(channel);
@@ -766,18 +822,18 @@ mod tests {
         let h = Env::workspace_hash(ws);
         assert_eq!(
             e.workspace_local_dir_for_canonical(ws).unwrap(),
-            PathBuf::from(format!(r"C:\L\Worldwright\workspaces\{h}"))
+            PathBuf::from(format!(r"C:\L\LILITH\workspaces\{h}"))
         );
     }
 
     #[test] // spec: ARCH-097
-    fn other_volume_goes_to_worldwright_local() {
+    fn other_volume_goes_to_lilith_local() {
         let e = env(Channel::Stable);
         let ws = Path::new(r"D:\x");
         let h = Env::workspace_hash(ws);
         assert_eq!(
             e.workspace_local_dir_for_canonical(ws).unwrap(),
-            PathBuf::from(format!(r"D:\.worldwright-local\{h}"))
+            PathBuf::from(format!(r"D:\.lilith-local\{h}"))
         );
     }
 
@@ -788,7 +844,53 @@ mod tests {
         let h = Env::workspace_hash(ws);
         assert_eq!(
             e.workspace_local_dir_for_canonical(ws).unwrap(),
-            PathBuf::from(format!(r"D:\.worldwright-local\{h}"))
+            PathBuf::from(format!(r"D:\.lilith-local\{h}"))
+        );
+    }
+
+    /// The legacy layout (R4, D3) is read only to copy a workspace `state.db` forward: the same
+    /// hash under the legacy local folder, or under the legacy per-volume folder.
+    #[test] // spec: ARCH-097
+    fn legacy_workspace_local_dir_is_the_old_layout() {
+        use crate::names::{LEGACY_APP_NAME, LEGACY_LOCAL_DIR};
+        for channel in [Channel::Stable, Channel::Test("abc".into())] {
+            let suffix = match &channel {
+                Channel::Stable => String::new(),
+                other => format!("-{other}"),
+            };
+            let e = env(channel);
+            for ws in [r"C:\x", r"\\?\C:\x"] {
+                let h = Env::workspace_hash(Path::new(ws));
+                assert_eq!(
+                    e.legacy_workspace_local_dir_for_canonical(Path::new(ws))
+                        .unwrap(),
+                    PathBuf::from(format!(r"C:\L\{LEGACY_APP_NAME}{suffix}\workspaces\{h}")),
+                    "{ws}"
+                );
+                assert_ne!(
+                    e.legacy_workspace_local_dir_for_canonical(Path::new(ws))
+                        .unwrap(),
+                    e.workspace_local_dir_for_canonical(Path::new(ws)).unwrap()
+                );
+            }
+            for ws in [r"D:\x", r"\\?\D:\x"] {
+                let h = Env::workspace_hash(Path::new(ws));
+                assert_eq!(
+                    e.legacy_workspace_local_dir_for_canonical(Path::new(ws))
+                        .unwrap(),
+                    PathBuf::from(format!(r"D:\{LEGACY_LOCAL_DIR}\{h}")),
+                    "{ws}"
+                );
+            }
+        }
+        let e = env(Channel::Dev);
+        assert_eq!(
+            e.legacy_data_dir(),
+            PathBuf::from(format!(r"C:\R\{LEGACY_APP_NAME}-dev"))
+        );
+        assert_eq!(
+            e.legacy_local_dir(),
+            PathBuf::from(format!(r"C:\L\{LEGACY_APP_NAME}-dev"))
         );
     }
 
@@ -807,8 +909,7 @@ mod tests {
         let canonical = std::fs::canonicalize(tmp.path()).unwrap();
         let e = env(Channel::Stable).with_volume_resolver(Arc::new(OneVolume));
         let got = e.workspace_local_dir(tmp.path()).unwrap();
-        let want =
-            PathBuf::from(r"C:\L\Worldwright\workspaces").join(Env::workspace_hash(&canonical));
+        let want = PathBuf::from(r"C:\L\LILITH\workspaces").join(Env::workspace_hash(&canonical));
         assert_eq!(got, want);
         // A missing path is an Io error, not a panic.
         let missing = tmp.path().join("does-not-exist");

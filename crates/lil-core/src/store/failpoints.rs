@@ -1,8 +1,8 @@
 //! Fail points (QA-066, QA-055): named places in the store where a test makes the next file
 //! call fail, or ends the process as a crash would.
 //!
-//! `WW_TEST_FAILPOINTS=<name>=<action>[,…]` arms them, read only on test channels
-//! ([`armed`]); a build whose `WW_BUILD_CHANNEL` is `stable` compiles every check to a constant
+//! `LIL_TEST_FAILPOINTS=<name>=<action>[,…]` arms them, read only on test channels
+//! ([`armed`]); a build whose `LIL_BUILD_CHANNEL` is `stable` compiles every check to a constant
 //! `Ok` ([`FailPoints::hit`] tests a compile-time constant first).
 //!
 //! In-process tests can also run code at a point ([`FailPoints::on`]). At a point, the hooks
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use lil_platform::{BUILD_CHANNEL, Channel, Env};
 
 /// The variable that arms fail points on a test channel.
-pub const ENV_FAILPOINTS: &str = "WW_TEST_FAILPOINTS";
+pub const ENV_FAILPOINTS: &str = "LIL_TEST_FAILPOINTS";
 
 /// Every fail point name (Global Constraints, "Fail points"), a closed list.
 pub const NAMES: &[&str] = &[
@@ -35,6 +35,7 @@ pub const NAMES: &[&str] = &[
     "store.after_index",
     "store.after_seal",
     "watch.start",
+    "state.copy_forward",
 ];
 
 /// The exit code of the `abort` action.
@@ -160,7 +161,7 @@ impl FailPoints {
         Ok(points)
     }
 
-    /// The points `WW_TEST_FAILPOINTS` arms, read through `var`, when [`armed`] holds for the
+    /// The points `LIL_TEST_FAILPOINTS` arms, read through `var`, when [`armed`] holds for the
     /// env's channel and this build; otherwise (and for a spec that doesn't parse, which is
     /// logged) none.
     pub fn from_env(env: &Env, var: &dyn Fn(&str) -> Option<String>) -> Arc<FailPoints> {
@@ -178,7 +179,7 @@ impl FailPoints {
                 Arc::new(points)
             }
             Err(why) => {
-                tracing::error!(spec = %spec, %why, "WW_TEST_FAILPOINTS ignored");
+                tracing::error!(spec = %spec, %why, "LIL_TEST_FAILPOINTS ignored");
                 FailPoints::none()
             }
         }

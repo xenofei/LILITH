@@ -81,7 +81,7 @@ pub fn resolve_workspace(
             trace_id,
         )
     };
-    let file = env.suite_toml();
+    let file = env.suite_toml_to_read();
     let suite = match std::fs::read_to_string(&file) {
         Ok(text) => match SuiteToml::parse(&text) {
             Ok(suite) => suite,
@@ -769,7 +769,7 @@ fn spawn_verify_ticks(open: &Arc<OpenWorkspace>) {
 /// The default workspace of `env`'s `suite.toml`, resolved; `None` for no file, a file that
 /// doesn't parse, no default, or a default whose folder is gone.
 fn default_of(env: &Env) -> Option<WorkspaceRef> {
-    let text = std::fs::read_to_string(env.suite_toml()).ok()?;
+    let text = std::fs::read_to_string(env.suite_toml_to_read()).ok()?;
     let suite = SuiteToml::parse(&text).ok()?;
     let default = suite.default_workspace.filter(|p| !p.is_empty())?;
     let (id, path) = id_of(Path::new(&default))?;

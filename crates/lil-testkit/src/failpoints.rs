@@ -1,12 +1,12 @@
 //! Fail points (QA-066, QA-055): the variable a test sets on a test-channel core, and its
 //! value.
 //!
-//! `WW_TEST_FAILPOINTS=<name>=<action>[,…]`. A core reads it only on test channels, and builds
-//! whose `WW_BUILD_CHANNEL` is `stable` compile the checks out. Actions: `abort`, `disk_full`,
+//! `LIL_TEST_FAILPOINTS=<name>=<action>[,…]`. A core reads it only on test channels, and builds
+//! whose `LIL_BUILD_CHANNEL` is `stable` compile the checks out. Actions: `abort`, `disk_full`,
 //! `busy`, `unsupported` and `io` (Global Constraints, "Fail points").
 
 /// The variable that arms fail points in a test-channel core.
-pub const ENV: &str = "WW_TEST_FAILPOINTS";
+pub const ENV: &str = "LIL_TEST_FAILPOINTS";
 
 /// Every fail point name (Global Constraints, "Fail points"), a closed list.
 pub const NAMES: &[&str] = &[
@@ -23,6 +23,7 @@ pub const NAMES: &[&str] = &[
     "store.after_index",
     "store.after_seal",
     "watch.start",
+    "state.copy_forward",
 ];
 
 /// Every fail point action, a closed list.
@@ -57,7 +58,7 @@ mod tests {
 
     #[test] // spec: QA-066
     fn failpoint_spec_formats_pairs() {
-        assert_eq!(ENV, "WW_TEST_FAILPOINTS");
+        assert_eq!(ENV, "LIL_TEST_FAILPOINTS");
         assert_eq!(spec(&[]), "");
         assert_eq!(spec(&[("store.replace", "abort")]), "store.replace=abort");
         assert_eq!(
@@ -69,7 +70,7 @@ mod tests {
             "store.between_renames=abort,watch.start=unsupported,store.write_temp=disk_full"
         );
         // Every name and action of the closed lists is accepted.
-        assert_eq!((NAMES.len(), ACTIONS.len()), (13, 5));
+        assert_eq!((NAMES.len(), ACTIONS.len()), (14, 5));
         for name in NAMES {
             for action in ACTIONS {
                 assert_eq!(spec(&[(name, action)]), format!("{name}={action}"));

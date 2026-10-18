@@ -53,7 +53,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 fn create_on_a_real_registered_workspace_trips_the_guard() {
     // 1. A workspace folder, as if the owner had registered it for real.
     let dir = tempfile::Builder::new()
-        .prefix("ww-guard-create-")
+        .prefix("lil-guard-create-")
         .tempdir()
         .expect("tempdir");
     let real = canonical(dir.path());
@@ -121,7 +121,7 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         Ok(result) => panic!("the guard did not trip; workspace.create returned {result:?}"),
     };
     let text = panic_text(payload.as_ref());
-    assert!(text.contains("real Worldwright location"), "{text}");
+    assert!(text.contains("real LILITH location"), "{text}");
     assert!(
         !sub.exists(),
         "the subfolder was created before the guard tripped"

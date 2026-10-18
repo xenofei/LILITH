@@ -25,8 +25,8 @@ fn stable_env() -> &'static Env {
             roaming: roots.roaming,
             local: roots.local,
             user_profile: roots.user_profile,
-            registry_root: r"HKCU\Software\Worldwright".to_string(),
-            credential_prefix: "Worldwright/".to_string(),
+            registry_root: r"HKCU\Software\LILITH".to_string(),
+            credential_prefix: "LILITH/".to_string(),
             workspaces: Vec::new(),
         });
         env
@@ -34,31 +34,43 @@ fn stable_env() -> &'static Env {
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn registry_root_hook_trips() {
     let _ = stable_env().registry_root();
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn credential_prefix_hook_trips() {
     let _ = stable_env().credential_prefix();
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn pipe_name_hook_trips() {
     let _ = stable_env().pipe_name();
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn notification_aumid_hook_trips() {
     let _ = stable_env().notification_aumid();
 }
 
 #[test] // spec: QA-040
-#[should_panic(expected = "real Worldwright location")]
+#[should_panic(expected = "real LILITH location")]
 fn claude_default_profile_dir_hook_trips() {
     let _ = stable_env().claude_default_profile_dir();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn legacy_data_dir_hook_trips() {
+    let _ = stable_env().legacy_data_dir();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn legacy_local_dir_hook_trips() {
+    let _ = stable_env().legacy_local_dir();
 }

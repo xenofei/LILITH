@@ -4,6 +4,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
+use lil_platform::names::{LEGACY_APP_NAME, LEGACY_LOCAL_DIR};
 use lil_platform::{Channel, Env, RealLocations, Roots, arm_test_guard};
 
 fn fake_real() -> RealLocations {
@@ -11,8 +12,8 @@ fn fake_real() -> RealLocations {
         roaming: PathBuf::from(r"C:\Users\Fake\AppData\Roaming"),
         local: PathBuf::from(r"C:\Users\Fake\AppData\Local"),
         user_profile: PathBuf::from(r"C:\Users\Fake"),
-        registry_root: r"HKCU\Software\Worldwright".to_string(),
-        credential_prefix: "Worldwright/".to_string(),
+        registry_root: r"HKCU\Software\LILITH".to_string(),
+        credential_prefix: "LILITH/".to_string(),
         workspaces: vec![PathBuf::from(r"C:\Users\Fake\Ws")],
     }
 }
@@ -41,10 +42,11 @@ fn panics(f: impl FnOnce()) -> Option<String> {
 }
 
 #[test] // spec: QA-040
-fn real_roaming_and_local_worldwright_folders_trip() {
+fn real_roaming_and_local_lilith_folders_trip() {
     arm();
     let real = roots(r"C:\Users\Fake\AppData");
-    // Test channel under the real roots: names start with `Worldwright`.
+    // Test channel under the real roots: names start with `LILITH`, and the legacy readers
+    // with the legacy name.
     let env = Env::with_roots(
         Channel::Test("abc".into()),
         Roots {
@@ -59,10 +61,12 @@ fn real_roaming_and_local_worldwright_folders_trip() {
         |e| drop(e.local_dir()),
         |e| drop(e.logs_dir()),
         |e| drop(e.claude_profiles_dir()),
+        |e| drop(e.legacy_data_dir()),
+        |e| drop(e.legacy_local_dir()),
     ] {
         let msg = panics(|| f(&env)).expect("must panic");
         assert!(
-            msg.contains("test resolved a real Worldwright location"),
+            msg.contains("test resolved a real LILITH location"),
             "{msg}"
         );
     }
@@ -71,7 +75,8 @@ fn real_roaming_and_local_worldwright_folders_trip() {
 #[test] // spec: QA-040
 fn temp_style_paths_under_the_real_local_root_do_not_trip() {
     arm();
-    // %TEMP% lives under %LOCALAPPDATA%\Temp, which is not a Worldwright* folder.
+    // %TEMP% lives under %LOCALAPPDATA%\Temp, which is not a `LILITH*` folder
+    // (or a legacy-named one).
     let env = Env::with_roots(
         Channel::Test("abc".into()),
         Roots {
@@ -81,7 +86,11 @@ fn temp_style_paths_under_the_real_local_root_do_not_trip() {
         },
         "S-1".into(),
     );
-    assert!(env.data_dir().ends_with("Worldwright-test-abc"));
+    assert!(env.data_dir().ends_with("LILITH-test-abc"));
+    assert!(
+        env.legacy_data_dir()
+            .ends_with(format!("{LEGACY_APP_NAME}-test-abc"))
+    );
     assert!(env.logs_dir().ends_with("logs"));
 }
 
@@ -99,7 +108,7 @@ fn real_claude_default_profile_trips() {
         "S-1".into(),
     );
     let msg = panics(|| drop(env.claude_default_profile_dir())).expect("must panic");
-    assert!(msg.contains("real Worldwright location"), "{msg}");
+    assert!(msg.contains("real LILITH location"), "{msg}");
     assert!(msg.contains(".claude"), "{msg}");
 }
 
@@ -127,7 +136,7 @@ fn temp_style_profile_roots_under_the_real_profile_do_not_trip() {
 }
 
 #[test] // spec: QA-040
-fn worldwright_local_component_trips() {
+fn lilith_and_legacy_local_components_trip() {
     arm();
     let env = Env::with_roots(
         Channel::Test("abc".into()),
@@ -139,11 +148,16 @@ fn worldwright_local_component_trips() {
         let _ = env.workspace_local_dir_for_canonical(std::path::Path::new(r"E:\ws"));
     })
     .expect("must panic");
-    assert!(msg.contains("real Worldwright location"), "{msg}");
-    assert!(msg.contains(".worldwright-local"), "{msg}");
+    assert!(msg.contains("real LILITH location"), "{msg}");
+    assert!(msg.contains(".lilith-local"), "{msg}");
+    let msg = panics(|| {
+        let _ = env.legacy_workspace_local_dir_for_canonical(std::path::Path::new(r"E:\ws"));
+    })
+    .expect("the legacy layout must panic too");
+    assert!(msg.contains(LEGACY_LOCAL_DIR), "{msg}");
 }
 
-/// Puts every path on its own drive so the workspace lands in `<volume>\.worldwright-local`.
+/// Puts every path on its own drive so the workspace lands in `<volume>\.lilith-local`.
 #[derive(Debug)]
 struct OtherVolume;
 impl lil_platform::VolumeResolver for OtherVolume {
@@ -161,13 +175,13 @@ fn constructing_stable_or_dev_after_arming_panics() {
             let _ = Env::with_roots(ch.clone(), roots(r"D:\Scratch"), "S-1".into());
         })
         .unwrap_or_else(|| panic!("{ch} must panic"));
-        assert!(msg.contains("real Worldwright location"), "{msg}");
+        assert!(msg.contains("real LILITH location"), "{msg}");
     }
     let msg = panics(|| {
         let _ = Env::from_system(Channel::Stable);
     })
     .expect("from_system(Stable) must panic");
-    assert!(msg.contains("real Worldwright location"), "{msg}");
+    assert!(msg.contains("real LILITH location"), "{msg}");
 }
 
 #[test] // spec: QA-040
@@ -178,39 +192,46 @@ fn test_scoped_names_do_not_trip_and_real_ones_do() {
         roots(r"D:\Scratch"),
         "S-1".into(),
     );
-    assert_eq!(env.registry_root(), r"HKCU\Software\Worldwright-test-abc");
-    assert_eq!(env.credential_prefix(), "Worldwright-test-abc/");
+    assert_eq!(env.registry_root(), r"HKCU\Software\LILITH-test-abc");
+    assert_eq!(env.credential_prefix(), "LILITH-test-abc/");
 
     let real = fake_real();
-    assert!(real.is_real_registry(r"HKCU\Software\Worldwright"));
-    assert!(real.is_real_registry(r"hkcu\software\WORLDWRIGHT-dev"));
-    assert!(real.is_real_registry(r"HKCU\Software\Worldwright\Sub"));
-    assert!(!real.is_real_registry(r"HKCU\Software\Worldwright-test-abc"));
+    assert!(real.is_real_registry(r"HKCU\Software\LILITH"));
+    assert!(real.is_real_registry(r"hkcu\software\lilith-DEV"));
+    assert!(real.is_real_registry(r"HKCU\Software\LILITH\Sub"));
+    assert!(!real.is_real_registry(r"HKCU\Software\LILITH-test-abc"));
     assert!(!real.is_real_registry(r"HKCU\Software\Other"));
-    assert!(real.is_real_credential("Worldwright/"));
-    assert!(real.is_real_credential("Worldwright-dev/"));
-    assert!(real.is_real_credential("worldwright/token"));
-    assert!(!real.is_real_credential("Worldwright-test-abc/"));
+    assert!(real.is_real_credential("LILITH/"));
+    assert!(real.is_real_credential("LILITH-dev/"));
+    assert!(real.is_real_credential("lilith/token"));
+    assert!(!real.is_real_credential("LILITH-test-abc/"));
     assert!(!real.is_real_credential("Other/"));
+    // The legacy name is real too (R4), with the same test-channel exception.
+    assert!(real.is_real_registry(&format!(r"HKCU\Software\{LEGACY_APP_NAME}-dev")));
+    assert!(!real.is_real_registry(&format!(r"HKCU\Software\{LEGACY_APP_NAME}-test-abc")));
+    assert!(real.is_real_credential(&format!("{LEGACY_APP_NAME}/")));
+    assert!(!real.is_real_credential(&format!("{LEGACY_APP_NAME}-test-abc/")));
 }
 
 #[test] // spec: QA-040
 fn real_path_matching_is_by_prefix_not_substring_and_case_insensitive() {
     let real = fake_real();
     assert!(real.is_real_path(std::path::Path::new(
-        r"c:\users\fake\appdata\roaming\worldwright"
+        r"c:\users\fake\appdata\roaming\lilith"
     )));
     assert!(real.is_real_path(std::path::Path::new(
-        r"\\?\C:\Users\Fake\AppData\Local\Worldwright-dev\logs"
+        r"\\?\C:\Users\Fake\AppData\Local\LILITH-dev\logs"
     )));
-    assert!(real.is_real_path(std::path::Path::new(r"D:\.WorldWright-Local\abc")));
+    assert!(real.is_real_path(std::path::Path::new(r"D:\.LiLiTh-Local\abc")));
     assert!(!real.is_real_path(std::path::Path::new(
-        r"C:\Users\Fake\AppData\Local\Temp\Worldwright\x"
+        r"C:\Users\Fake\AppData\Local\Temp\LILITH\x"
     )));
-    assert!(!real.is_real_path(std::path::Path::new(r"C:\Elsewhere\Worldwright-test-abc")));
+    assert!(!real.is_real_path(std::path::Path::new(r"C:\Elsewhere\LILITH-test-abc")));
     assert!(!real.is_real_path(std::path::Path::new(
-        r"C:\Users\Fake\AppData\Roaming2\Worldwright"
+        r"C:\Users\Fake\AppData\Roaming2\LILITH"
     )));
+    let legacy_local = format!(r"D:\{}\abc", LEGACY_LOCAL_DIR.to_ascii_uppercase());
+    assert!(real.is_real_path(std::path::Path::new(&legacy_local)));
 }
 
 #[test] // spec: QA-040
@@ -227,7 +248,7 @@ fn registered_real_workspace_trips_guard() {
             let _ = lil_platform::guard::check_workspace(&inside);
         })
         .unwrap_or_else(|| panic!("{} must panic", inside.display()));
-        assert!(msg.contains("real Worldwright location"), "{msg}");
+        assert!(msg.contains("real LILITH location"), "{msg}");
     }
     for outside in [
         PathBuf::from(r"C:\Users\Fake\Other"),

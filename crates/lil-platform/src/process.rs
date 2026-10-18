@@ -754,7 +754,7 @@ mod tests {
     use super::*;
 
     /// Set by `terminate_self_ends_the_process_with_its_code` for the child run only.
-    const TERMINATE_HELPER_VAR: &str = "WW_PLATFORM_TEST_TERMINATE_SELF";
+    const TERMINATE_HELPER_VAR: &str = "LIL_PLATFORM_TEST_TERMINATE_SELF";
 
     /// The child half of `terminate_self_ends_the_process_with_its_code`. In a normal test run
     /// the variable is unset and this passes without doing anything.
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(out.stderr, "");
 
         // `env` reaches the child, and stderr is captured on its own.
-        let args: Vec<&OsStr> = ["/c", "echo", "%WW_RUN_HIDDEN_PROBE%", "1>&2"]
+        let args: Vec<&OsStr> = ["/c", "echo", "%LIL_RUN_HIDDEN_PROBE%", "1>&2"]
             .iter()
             .map(OsStr::new)
             .collect();
@@ -812,7 +812,7 @@ mod tests {
             Path::new(&comspec),
             &args,
             &dir,
-            &[("WW_RUN_HIDDEN_PROBE".into(), "Ünïcödé space".into())],
+            &[("LIL_RUN_HIDDEN_PROBE".into(), "Ünïcödé space".into())],
             Duration::from_secs(60),
         )
         .unwrap();
@@ -832,7 +832,7 @@ mod tests {
                 .eq_ignore_ascii_case("cmd.exe"),
             "{found:?}"
         );
-        assert_eq!(find_on_path("ww-no-such-tool-on-path"), None);
+        assert_eq!(find_on_path("lil-no-such-tool-on-path"), None);
     }
 
     fn line(exe: &str, args: &[&str]) -> String {
@@ -877,10 +877,10 @@ mod tests {
             ("Path".into(), r"C:\bin".into()),
             ("=C:".into(), r"C:\work".into()),
             ("zeta".into(), "1".into()),
-            ("WW_CHANNEL".into(), "dev".into()),
+            ("LIL_CHANNEL".into(), "dev".into()),
         ];
         let extra = vec![
-            ("ww_channel".into(), "test-x1".into()),
+            ("lil_channel".into(), "test-x1".into()),
             ("Alpha".into(), "Ünïcödé space".into()),
         ];
         let block = environment_block(base, &extra, &[]).unwrap();
@@ -889,8 +889,8 @@ mod tests {
             [
                 r"=C:=C:\work",
                 "Alpha=Ünïcödé space",
+                "lil_channel=test-x1",
                 r"Path=C:\bin",
-                "ww_channel=test-x1",
                 "zeta=1",
             ]
         );
