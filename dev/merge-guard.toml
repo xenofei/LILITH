@@ -1,7 +1,6 @@
 owner = "xenofei"
 repo = "LILITH"
 base_branch = "main"
-reviewer_app_slug = "worldwright-reviewer"
-reviewer_app_slug_next = "lilith-reviewer"
+reviewer_app_slug = "lilith-reviewer"
 required_checks = ["every-push", "pr-ready", "protected-test-check", "privacy-check"]
 hooks_path = "tools/git-hooks"

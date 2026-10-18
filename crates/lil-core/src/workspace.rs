@@ -499,8 +499,7 @@ impl WorkspaceHub {
     async fn open_now(&self, ws: &WorkspaceRef) -> Result<Arc<OpenWorkspace>, ErrorBody> {
         // 1.
         check_workspace(&ws.path);
-        // 2. Both locks (D4) before anything else: the access, and so the `state.db`
-        // copy-forward in step 3, which runs only read-write, follow from holding both.
+        // 2. Both locks (D4) before anything else: the access follows from holding both.
         let root = ws.path.clone();
         let taken = tokio::task::spawn_blocking(move || take_core_locks(&root))
             .await

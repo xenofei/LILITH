@@ -51,7 +51,7 @@ No single mechanism is trusted on its own. A local check can be skipped, so each
 | `every-push` | `ci-push.yml` | Runs on every push to a branch other than `main`: rustfmt, clippy, cargo-deny, the workspace tests, the spec tests and the spec traceability report. |
 | `pr-ready` | `ci-pr-ready.yml` | Runs on every pull request: everything `every-push` runs, plus cargo-audit and a release build. On a **draft** PR it fails on purpose (a skipped required check would count as passing). Marking the PR ready for review runs it again. |
 | `protected-test-check` | `ci-guard.yml` | Judges the PR's head commit with `lil` built from `main` (the PR's own code is never run). Fails when a protected file is modified or deleted without the reviewer App's approval of that exact commit. Runs when a PR is opened, pushed to or reopened (not on reviews, not on draft-to-ready), and never cancels a run for the same commit. Every run is its own check suite, so a commit can have more than one (after a close and reopen) and the merge needs all of them green; `lil dev approve` re-runs the red ones after posting the approval. |
-| `privacy-check` | `ci-push.yml` | Runs `lil dev privacy-scan` on every commit of the pushed branch that `main` lacks. It fails if both the `LIL_PRIVACY_DENYLIST` secret and the legacy `WW_PRIVACY_DENYLIST` secret are missing or empty. |
+| `privacy-check` | `ci-push.yml` | Runs `lil dev privacy-scan` on every commit of the pushed branch that `main` lacks. It fails if the `LIL_PRIVACY_DENYLIST` secret is missing or empty. |
 
 A second privacy job, `privacy-check-pr`, runs on pull requests and shows the same verdict there. It is not a required check, because a required check name must come from exactly one job. `nightly.yml` (release build and coverage) is not required either.
 
@@ -65,11 +65,6 @@ The repository is public, so every file, path and commit is public. The scan loo
 - Anything in the **private denylist**: your real e-mail addresses, name and username forms, one per line. A denylist finding names only the entry's number and the place, never the entry.
 
 The denylist is kept in two places that you keep in sync (section 6): the file `%USERPROFILE%\.lilith\privacy-denylist.txt` on your machine, and the Actions secret `LIL_PRIVACY_DENYLIST` for CI. It is never committed.
-
-**Names from before the rename.** Until a later cleanup removes them, `lil` still reads the old names when the new ones are missing, and writes only the new ones:
-- the denylist from the legacy `WW_PRIVACY_DENYLIST` variable (after `LIL_PRIVACY_DENYLIST`) and the legacy `%USERPROFILE%\.worldwright\privacy-denylist.txt` file (after `%USERPROFILE%\.lilith\privacy-denylist.txt`). CI passes both secrets, `LIL_PRIVACY_DENYLIST` and the legacy `WW_PRIVACY_DENYLIST`;
-- the reviewer key from the legacy `%USERPROFILE%\.worldwright\reviewer\app-key.age` when `%USERPROFILE%\.lilith\reviewer\app-key.age` isn't there. `lil dev approve` prints the path it used;
-- the agent token from the legacy `Worldwright-dev/github/agent-token` target when `LILITH-dev/github/agent-token` has none. `lil dev agent-token status` says which one answered, and `lil dev agent-token clear --legacy` removes only the legacy one.
 
 ### What the guard can't do
 
@@ -228,7 +223,7 @@ If the check picker offers only checks that have already run in the repository, 
 The reviewer App is the second identity that approves protected changes. Agents can't act as it.
 
 1. **Browser:** Settings → Developer settings → GitHub Apps → **New GitHub App**.
-   - **Name:** `lilith-reviewer`. (App names are unique across GitHub. If it's taken, pick another. While the App is being renamed (see "Renaming the App" below), the name you pick goes into `reviewer_app_slug_next` in `dev/merge-guard.toml`, and `reviewer_app_slug` keeps the App's current slug. Otherwise it goes into `reviewer_app_slug`. Either way it is a protected change.)
+   - **Name:** `lilith-reviewer`. (App names are unique across GitHub. If it's taken, pick another. The name you pick goes into `reviewer_app_slug` in `dev/merge-guard.toml`, a protected change.)
    - **Homepage URL:** any URL, for example the repository's.
    - **Webhook:** turn **Active** off.
    - **Repository permissions:** **Pull requests: Read and write**, **Contents: Read-only**, **Actions: Read and write**. (Metadata read-only is added automatically.) Nothing else. Actions write is there so that an approval re-runs the guard check: `protected-test-check` runs only on pull request events, so its run for a commit happened before your approval and failed. Right after posting the approval, `lil dev approve` asks GitHub to re-run that run; the re-run reads the reviews again and passes. The App uses this permission for nothing else.
@@ -252,13 +247,7 @@ The reviewer App is the second identity that approves protected changes. Agents 
 
 Until the installation accepts, `lil dev approve` still posts approvals, then prints the warning described in section 3 ("the reviewer app's installation hasn't granted Actions: Read and write") and you re-run the check by hand.
 
-**Renaming the App.** `dev/merge-guard.toml` can name the App twice: `reviewer_app_slug`, the slug it has now, and the optional `reviewer_app_slug_next`, the slug it gets after a rename (`lilith-reviewer`). While both are set:
-
-- An approval counts from either App login (`<slug>[bot]`) and from no other account, a person's included. The latest review on the commit under either login decides, so a later dismissal under one login cancels an approval under the other.
-- `lil dev approve` asks GitHub which App the key belongs to (`GET /app`, signed with the App's own key) before it asks for a token. It prints `reviewer App slug: <slug>` and refuses, approving nothing, when that slug is neither of the two.
-- Settings without `reviewer_app_slug_next` still work. A `lil` built before the key existed refuses settings that have it, so update every checkout to the new `main` before its next push.
-
-Once the rename is done and `lil dev approve` has printed the live slug, set `reviewer_app_slug` to it and remove `reviewer_app_slug_next` (a protected change).
+**The App's slug.** An approval counts only from the App's login, `<reviewer_app_slug>[bot]`, and from no other account, a person's included. `lil dev approve` asks GitHub which App the key belongs to (`GET /app`, signed with the App's own key) before it asks for a token. It prints `reviewer App slug: <slug>` and refuses, approving nothing, when that slug isn't `reviewer_app_slug`. If you rename the App and its slug changes, set `reviewer_app_slug` to the slug `lil dev approve` printed (a protected change).
 
 ### 2.6 Creating the agent token (browser, then PowerShell)
 
@@ -293,7 +282,7 @@ Once the rename is done and `lil dev approve` has printed the live slug, set `re
    cargo run -q -p lil-cli -- dev install-hooks
    ```
 
-   `agent-token set` reads the token without echo, then asks for the expiry date GitHub showed (`YYYY-MM-DD`, or `none`). It stores the token in Windows Credential Manager as `LILITH-dev/github/agent-token`. `install-hooks` sets `core.hooksPath` to `tools/git-hooks` and makes git in this clone use only the agent token. Check with `lil dev agent-token status`, which shows the first four characters and the expiry you entered. A token stored before the rename, under the legacy `Worldwright-dev/github/agent-token`, is still read while the new target has none.
+   `agent-token set` reads the token without echo, then asks for the expiry date GitHub showed (`YYYY-MM-DD`, or `none`). It stores the token in Windows Credential Manager as `LILITH-dev/github/agent-token`. `install-hooks` sets `core.hooksPath` to `tools/git-hooks` and makes git in this clone use only the agent token. Check with `lil dev agent-token status`, which shows the first four characters and the expiry you entered.
 
 ### 2.7 Keeping the full-access login away from agents
 
@@ -325,7 +314,7 @@ Choose one of these if the gap above is not acceptable.
    gh auth status          # should say you are not logged in
    ```
 
-2. Remove the Git Credential Manager entry for github.com: open Windows Credential Manager (search for it in the Start menu), choose **Windows Credentials**, find `git:https://github.com` under Generic Credentials, expand it and choose **Remove**. Leave the `LILITH-dev/github/agent-token` entry alone: that is the agent token (and so is the legacy `Worldwright-dev/github/agent-token` entry, while it is there).
+2. Remove the Git Credential Manager entry for github.com: open Windows Credential Manager (search for it in the Start menu), choose **Windows Credentials**, find `git:https://github.com` under Generic Credentials, expand it and choose **Remove**. Leave the `LILITH-dev/github/agent-token` entry alone: that is the agent token.
 3. From then on, do owner-only work in the browser and keep any personal full-access login off this PC.
 
 ---
@@ -391,7 +380,7 @@ An approval covers one commit. If anything is pushed to the PR after you approve
 | "CI check ... hasn't reported for ... yet" / "is still running" / "finished as failure, not success" | A required check hasn't run, hasn't finished or failed on that exact commit. | Wait, or fix the failure and push. `every-push` and `privacy-check` start on a push, while `pr-ready` and `protected-test-check` start on PR events. A draft PR fails `pr-ready` on purpose: mark it ready for review. |
 | "The git hooks aren't installed ..." or "The agent credential helper isn't installed ..." | This clone isn't set up, or someone changed `core.hooksPath` or the credential helper. | Run `lil dev install-hooks` in the clone. Nothing was contacted. |
 | "Privacy scan (QA-086): this push is refused." (from the `pre-push` hook), or `privacy-check` red | The scan found a user path, a stray e-mail address, a commit identity that isn't a no-reply address, or a denylist entry. Denylist findings give only the entry's number and the place. | Remove or replace each finding and **rewrite the commits that hold it** (amend or rebase): the scan covers every commit of the branch, so a later clean commit doesn't help. Set the clone's `user.email` to the no-reply address. Don't use `--no-verify`. |
-| "privacy denylist not found; see docs/dev/merge-guard.md" or "privacy denylist has no entries ..." | No denylist was found, or the first one found has no entries: the file `%USERPROFILE%\.lilith\privacy-denylist.txt` (or the legacy `%USERPROFILE%\.worldwright\privacy-denylist.txt`) is missing or empty, or `LIL_PRIVACY_DENYLIST` (or the legacy `WW_PRIVACY_DENYLIST`) is set to nothing useful. | Create it (section 2.1, step 4). In CI, a missing or empty secret fails the same way: section 6. |
+| "privacy denylist not found; see docs/dev/merge-guard.md" or "privacy denylist has no entries ..." | No denylist was found, or the first one found has no entries: the file `%USERPROFILE%\.lilith\privacy-denylist.txt` is missing or empty, or `LIL_PRIVACY_DENYLIST` is set to nothing useful. | Create it (section 2.1, step 4). In CI, a missing or empty secret fails the same way: section 6. |
 | "Pushes to main go through `lil dev merge <PR>`." | Someone tried to push to, or merge locally into, `main`. | Open a PR and use `lil dev merge`. |
 | "The PR is a draft", "is closed", or "targets ..., not main" | The PR can't be merged as it is. | Mark it ready, reopen it, or retarget it. |
 | "Couldn't finish the checks, so the merge is refused: ..." or "No GitHub access ..." | GitHub or git couldn't be reached, or the agent token is missing, expired or rejected. | Retry. If it persists, check `lil dev agent-token status` and section 5. Nothing is ever merged when a check can't be made. |
@@ -479,7 +468,7 @@ To remove the token completely (for example if it leaked), run `lil dev agent-to
 - **Add entries** to `%USERPROFILE%\.lilith\privacy-denylist.txt`: one per line, any new e-mail address, name form or username form. Matching is case-insensitive and finds the entry anywhere. Lines starting with `#` and blank lines are ignored. Don't make entries shorter than 5 characters unless you accept the warning.
 - **Never commit it.** It holds exactly what the repository must not contain. Keep it out of any folder that is, or will be, tracked. The scan never prints an entry: it names only the entry's number (counted among non-blank, non-comment lines) and the file and line.
 - **Keep the file and the secret in sync.** CI reads the secret, not your file. After every change, update the secret with the whole file (the command is in section 2.4, step 6, or use the secret's page in Settings → Secrets and variables → Actions). A secret can't be read back, so the file is the master copy. If the two differ, local pushes and CI will disagree.
-- **Careful with `LIL_PRIVACY_DENYLIST` on your own PC.** When that environment variable, or the legacy `WW_PRIVACY_DENYLIST`, is set and not blank, `lil` uses it and ignores the file.
+- **Careful with `LIL_PRIVACY_DENYLIST` on your own PC.** When that environment variable is set and not blank, `lil` uses it and ignores the file.
 - **After adding an entry,** check whether the public history already contains it:
 
   ```powershell
@@ -488,7 +477,7 @@ To remove the token completely (for example if it leaked), run `lil dev agent-to
   ```
 
   A single revision means its whole history. Findings in `main` can't be removed with a normal PR: treat that as an incident, and decide with care whether to rewrite history.
-- If `privacy-check` fails with "Both the LIL_PRIVACY_DENYLIST and the WW_PRIVACY_DENYLIST secrets are missing or empty", the secret was deleted, renamed or emptied. Set `LIL_PRIVACY_DENYLIST` again.
+- If `privacy-check` fails with "The LIL_PRIVACY_DENYLIST secret is missing or empty", the secret was deleted, renamed or emptied. Set `LIL_PRIVACY_DENYLIST` again.
 
 ---
 

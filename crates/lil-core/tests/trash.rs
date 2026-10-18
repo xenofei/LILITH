@@ -290,6 +290,98 @@ async fn trash_refuses_both_workspace_folders() {
         .unwrap();
 }
 
+/// The rename's cleanup removed the legacy credential and copy-forward code, but the legacy
+/// workspace data folder stays reserved for good (owner question 1). The folder's name is
+/// written out here, not taken from a constant, so this holds even if the constant goes:
+/// trashing it or anything in it, or writing under it, is `store.path_invalid`, and neither the
+/// watcher nor the index ever looks inside it.
+#[tokio::test(flavor = "multi_thread")] // spec: ARCH-058, ARCH-079
+async fn legacy_folder_stays_reserved_after_pr_d() {
+    const LEGACY: &str = ".worldwright";
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = canonical(&env.make_workspace("reserved"));
+    let inside = format!("{LEGACY}/x.txt");
+    write_file(&ws.join(LEGACY).join("x.txt"), b"an old core's");
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let hub = WorkspaceHub::new(
+        env.env.clone(),
+        Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap()),
+        Arc::new(EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+        Arc::new(SystemProbe),
+        lil_core::watch::WatchConfig::default(),
+    );
+    let reference = WorkspaceRef {
+        id: Env::workspace_hash(&std::fs::canonicalize(&ws).unwrap()),
+        path: ws.clone(),
+    };
+    let open = hub.open(&reference).await.expect("the open");
+    open.index.ready().await;
+
+    // The store refuses it, in any case, and leaves the file as it was.
+    for rel in [LEGACY.to_string(), LEGACY.to_uppercase(), inside.clone()] {
+        let refused = open.store.trash(&p(&rel), "test").await;
+        assert!(
+            matches!(&refused, Err(StoreError::PathInvalid { .. })),
+            "trash {rel}: {refused:?}"
+        );
+        assert_eq!(
+            refused.unwrap_err().to_error("t").code,
+            "store.path_invalid"
+        );
+    }
+    for (rel, expect) in [
+        (
+            inside.clone(),
+            lil_core::store::Expect::Hash(sha256_bytes(b"an old core's")),
+        ),
+        (format!("{LEGACY}/new.txt"), lil_core::store::Expect::New),
+    ] {
+        let refused = open.store.write(&p(&rel), b"new".to_vec(), expect).await;
+        assert!(
+            matches!(&refused, Err(StoreError::PathInvalid { .. })),
+            "write {rel}: {refused:?}"
+        );
+        assert_eq!(
+            refused.unwrap_err().to_error("t").code,
+            "store.path_invalid"
+        );
+    }
+    assert_eq!(
+        std::fs::read(ws.join(LEGACY).join("x.txt")).unwrap(),
+        b"an old core's"
+    );
+    assert!(!ws.join(LEGACY).join("new.txt").exists());
+
+    // The index's first reconcile skipped it, and the watcher ignores it.
+    let watcher = open
+        .watch
+        .as_ref()
+        .expect("a read-write open has a watcher");
+    write_file(&ws.join(LEGACY).join("later.txt"), b"later");
+    let report = watcher
+        .notify(vec![p(&inside), p(&format!("{LEGACY}/later.txt"))])
+        .await;
+    assert!(report.reconciled.is_empty(), "{report:?}");
+    assert_eq!(report.ignored.len(), 2, "{report:?}");
+    let fence = format!("reserved-{}", std::process::id());
+    write_file(&ws.join(".lilith").join("fence").join(&fence), b"f");
+    tokio::time::timeout(DEADLINE, watcher.fence(&fence))
+        .await
+        .expect("the fence returns");
+    for rel in [inside.as_str(), &format!("{LEGACY}/later.txt")] {
+        assert_eq!(
+            open.index.files_of_path(&p(rel)).await.unwrap(),
+            None,
+            "{rel} is indexed"
+        );
+    }
+    drop(open);
+    hub.close_all().await;
+}
+
 #[tokio::test(start_paused = true)] // spec: ARCH-058, CORE-037
 async fn restore_refuses_an_occupied_path() {
     let ws = workspace();
@@ -405,6 +497,57 @@ fn entry_by_hand(ws: &Ws, entry_id: &str, original: &str, files: &[(&str, &[u8])
         &dir.join("restore.json"),
         format!("{}\n", serde_json::to_string_pretty(&record).unwrap()).as_bytes(),
     );
+}
+
+/// A `restore.json` edited by hand can name a path the trash never takes: the restore refuses
+/// it like a write, before anything moves, and the entry stays exactly as it was.
+#[tokio::test(start_paused = true)] // spec: ARCH-058
+async fn restore_refuses_reserved_targets() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+    let ws = workspace();
+    let store = ws.store();
+    write_file(&ws.file("registry/ledger.csv"), b"user's");
+    for (n, target) in [
+        format!("{LEGACY_WORKSPACE_DIR}/x.txt"),
+        format!("{}/x.txt", LEGACY_WORKSPACE_DIR.to_uppercase()),
+        format!("{WORKSPACE_DIR}/x.txt"),
+        ".git/hooks/x".to_string(),
+        ".trash/x.txt".to_string(),
+        "registry/ledger.csv".to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("te_00000000000000c{n}");
+        entry_by_hand(&ws, &id, target, &[("", b"payload")]);
+        let dir = ws.file(&format!(
+            ".trash/{}/{id}",
+            &lil_schema::time::rfc3339(ws.now())[..10]
+        ));
+        let name = target.rsplit('/').next().unwrap();
+        let record = std::fs::read(dir.join("restore.json")).unwrap();
+
+        let refused = store.trash_restore(&id).await;
+        assert!(
+            matches!(&refused, Err(StoreError::PathInvalid { .. })),
+            "{target}: {refused:?}"
+        );
+        assert_eq!(
+            refused.unwrap_err().to_error("t").code,
+            "store.path_invalid"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("payload").join(name)).unwrap(),
+            b"payload",
+            "{target}"
+        );
+        assert_eq!(std::fs::read(dir.join("restore.json")).unwrap(), record);
+    }
+    assert!(!ws.exists(&format!("{LEGACY_WORKSPACE_DIR}/x.txt")));
+    assert!(!ws.exists(&format!("{WORKSPACE_DIR}/x.txt")));
+    assert!(!ws.exists(".git/hooks/x"));
+    assert_eq!(ws.read("registry/ledger.csv"), b"user's");
+    assert_eq!(store.trash_list().await.unwrap().len(), 6);
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026

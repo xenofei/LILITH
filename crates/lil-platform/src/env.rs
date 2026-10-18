@@ -9,10 +9,9 @@
 //! | Registry root     | `HKCU\Software\LILITH`               | `HKCU\Software\LILITH-<channel>` |
 //! | Credential prefix | `LILITH/`                            | `LILITH-<channel>/`              |
 //!
-//! Legacy names (R4): the folders under the legacy app name ([`names::LEGACY_APP_NAME`]) are
-//! read, never written: `suite.toml` when the new one is missing
-//! ([`Env::suite_toml_to_read`]), and a workspace `state.db` that the core copies forward
-//! ([`Env::legacy_workspace_local_dir_for_canonical`], plan decision D3).
+//! Legacy names (R4): the roaming folder under the legacy app name
+//! ([`names::LEGACY_APP_NAME`]) is read, never written: its `suite.toml` when the new one is
+//! missing ([`Env::suite_toml_to_read`]).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -345,23 +344,6 @@ impl Env {
     /// (R4). Nothing is ever written there.
     pub fn legacy_data_dir(&self) -> PathBuf {
         guard::check_path(self.roots.roaming.join(self.channel.legacy_app_name()))
-    }
-
-    /// `<local>\<legacy app name>[-<channel>]`: read only (R4, D3). Nothing is ever written
-    /// there.
-    pub fn legacy_local_dir(&self) -> PathBuf {
-        guard::check_path(self.roots.local.join(self.channel.legacy_app_name()))
-    }
-
-    /// Where a pre-rename core kept `canonical`'s local data (D3): the same hash as
-    /// [`Env::workspace_local_dir_for_canonical`], under [`Env::legacy_local_dir`] on the
-    /// local folder's volume, else under the volume's [`names::LEGACY_LOCAL_DIR`]. Read only:
-    /// the core copies its `state.db` forward and never writes, moves or deletes anything there.
-    pub fn legacy_workspace_local_dir_for_canonical(
-        &self,
-        canonical: &Path,
-    ) -> Result<PathBuf, EnvError> {
-        self.local_dir_under(canonical, &self.legacy_local_dir(), names::LEGACY_LOCAL_DIR)
     }
 
     /// `local_dir\state.db`: the suite state database (CORE-005).
@@ -864,49 +846,14 @@ mod tests {
         );
     }
 
-    /// The legacy layout (R4, D3) is read only to copy a workspace `state.db` forward: the same
-    /// hash under the legacy local folder, or under the legacy per-volume folder.
+    /// The legacy data folder (R4) is read only for `suite.toml`.
     #[test] // spec: ARCH-097
-    fn legacy_workspace_local_dir_is_the_old_layout() {
-        use crate::names::{LEGACY_APP_NAME, LEGACY_LOCAL_DIR};
-        for channel in [Channel::Stable, Channel::Test("abc".into())] {
-            let suffix = match &channel {
-                Channel::Stable => String::new(),
-                other => format!("-{other}"),
-            };
-            let e = env(channel);
-            for ws in [r"C:\x", r"\\?\C:\x"] {
-                let h = Env::workspace_hash(Path::new(ws));
-                assert_eq!(
-                    e.legacy_workspace_local_dir_for_canonical(Path::new(ws))
-                        .unwrap(),
-                    PathBuf::from(format!(r"C:\L\{LEGACY_APP_NAME}{suffix}\workspaces\{h}")),
-                    "{ws}"
-                );
-                assert_ne!(
-                    e.legacy_workspace_local_dir_for_canonical(Path::new(ws))
-                        .unwrap(),
-                    e.workspace_local_dir_for_canonical(Path::new(ws)).unwrap()
-                );
-            }
-            for ws in [r"D:\x", r"\\?\D:\x"] {
-                let h = Env::workspace_hash(Path::new(ws));
-                assert_eq!(
-                    e.legacy_workspace_local_dir_for_canonical(Path::new(ws))
-                        .unwrap(),
-                    PathBuf::from(format!(r"D:\{LEGACY_LOCAL_DIR}\{h}")),
-                    "{ws}"
-                );
-            }
-        }
+    fn legacy_data_dir_is_the_old_layout() {
+        use crate::names::LEGACY_APP_NAME;
         let e = env(Channel::Dev);
         assert_eq!(
             e.legacy_data_dir(),
             PathBuf::from(format!(r"C:\R\{LEGACY_APP_NAME}-dev"))
-        );
-        assert_eq!(
-            e.legacy_local_dir(),
-            PathBuf::from(format!(r"C:\L\{LEGACY_APP_NAME}-dev"))
         );
     }
 

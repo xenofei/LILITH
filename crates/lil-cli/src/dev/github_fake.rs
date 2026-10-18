@@ -35,8 +35,8 @@ struct State {
     /// Run ids `rerun_as_app` accepted.
     reruns: Vec<u64>,
     rerun_error: Option<String>,
-    /// The slug `app_slug` answers with; `None` means the App's current slug,
-    /// [`DEFAULT_APP_SLUG`]. Reviews posted as the App carry `<slug>[bot]`.
+    /// The slug `app_slug` answers with; `None` means the App's slug, [`DEFAULT_APP_SLUG`].
+    /// Reviews posted as the App carry `<slug>[bot]`.
     app_slug: Option<String>,
     /// The JWTs `app_slug` was asked with (test JWTs only).
     app_jwts: Vec<String>,
@@ -46,8 +46,8 @@ struct State {
     events: Vec<String>,
 }
 
-/// The reviewer App's slug before its rename (`reviewer_app_slug`).
-pub const DEFAULT_APP_SLUG: &str = "worldwright-reviewer";
+/// The reviewer App's slug (`reviewer_app_slug`).
+pub const DEFAULT_APP_SLUG: &str = "lilith-reviewer";
 
 #[derive(Default)]
 pub struct FakeGitHub {

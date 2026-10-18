@@ -242,6 +242,27 @@ fn remove_if_empty(path: &Path) {
     let _ = fsops::remove_empty_dir(path);
 }
 
+/// `store.path_invalid` for the paths the trash never touches, compared without regard to case:
+/// the trash itself, either workspace data folder ([`is_workspace_dir`]), `.git` and the ledger.
+/// `what` finishes the reason ("moved to the trash", "restored to").
+fn refuse_reserved(rel: &WsPath, what: &str) -> Result<(), StoreError> {
+    let first = rel.as_str().split('/').next().unwrap_or_default();
+    let refused = is_workspace_dir(first)
+        || [TRASH_DIR, ".git"]
+            .iter()
+            .any(|area| first.eq_ignore_ascii_case(area))
+        || path_key(rel.as_str()) == path_key("registry/ledger.csv");
+    if refused {
+        return Err(StoreError::PathInvalid {
+            path: rel.as_str().to_string(),
+            why: format!(
+                "the trash, the suite's own folders, .git and the ledger are never {what}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Store {
     /// Moves `rel` (a file or a folder) to the trash with `reason` (module docs). A sealed
     /// version folder, or anything in one, is never moved (CORE-026; it is refused as every
@@ -258,20 +279,7 @@ impl Store {
     /// (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
-        let first = rel.as_str().split('/').next().unwrap_or_default();
-        let refused = is_workspace_dir(first)
-            || [TRASH_DIR, ".git"]
-                .iter()
-                .any(|area| first.eq_ignore_ascii_case(area))
-            || path_key(rel.as_str()) == path_key("registry/ledger.csv");
-        if refused {
-            return Err(StoreError::PathInvalid {
-                path: rel.as_str().to_string(),
-                why: "the trash, the suite's own folders, .git and the ledger are never moved to \
-                      the trash"
-                    .to_string(),
-            });
-        }
+        refuse_reserved(rel, "moved to the trash")?;
         writable(rel)?;
         self.writable_on_disk(rel).await?;
         self.check_locks(rel).await?;
@@ -403,8 +411,12 @@ impl Store {
     /// # Errors
     /// `workspace.read_only`; `trash.unknown` for no such entry; `trash.restore_conflict`
     /// (naming the original path) when something is at the original path now;
-    /// `store.path_invalid` when a folder on the way to it is now a link (the payload stays in
-    /// the trash); `store.io` when a file call fails.
+    /// `store.path_invalid` when the original path is the trash, either workspace data folder,
+    /// `.git`, the ledger, or any other path a write refuses (also through an 8.3 name); a
+    /// `restore.json` edited by hand can name any of them. A path in a sealed version folder is
+    /// the exception: it is restored, read-only again (module docs). Also `store.path_invalid`
+    /// when a folder on the way to it is now a link. On every refusal the payload and
+    /// `restore.json` stay in the trash, untouched. `store.io` when a file call fails.
     pub async fn trash_restore(&self, entry_id: &str) -> Result<WsPath, StoreError> {
         self.writable_store()?;
         let unknown = || StoreError::TrashUnknown(entry_id.to_string());
@@ -425,6 +437,13 @@ impl Store {
             })
             .ok_or_else(unknown)?;
         let rel = WsPath::parse(&entry.record.original_path)?;
+        // The trash's own refusals, then a write's, before anything moves; the entry stays as it
+        // is. A sealed path is the one exception: it restores, read-only again (CORE-026).
+        refuse_reserved(&rel, "restored to")?;
+        if !in_version_folder(&rel) {
+            writable(&rel)?;
+            self.writable_on_disk(&rel).await?;
+        }
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
             let items = blocking(move || list(&dir))

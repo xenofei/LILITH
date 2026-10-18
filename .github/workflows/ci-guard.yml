@@ -1,8 +1,8 @@
 # Protected-test check (QA-033, rulings R8 and R21). Judges a PR's head commit with the test-diff
 # guard, using the CLI built from main, and counts the reviewer app's approval of that exact
 # commit. `lil dev merge` requires the `protected-test-check` check on the PR's head commit.
-# The step "Pick the CLI crate" builds whichever CLI crate main has (crates/lil-cli, else
-# crates/ww-cli), so the check keeps working across the crate's rename.
+# The step "Pick the CLI crate" finds main's CLI crate (crates/lil-cli) and refuses when main
+# has none.
 #
 # Why this is safe to run on a PR:
 # - The job checks out main and builds the CLI from main only. The PR's head commit is fetched as
@@ -83,16 +83,13 @@ jobs:
 
       - name: Pick the CLI crate
         id: pick
-        # In main's working tree (the checkout above): lil-cli once main has it, else ww-cli.
+        # In main's working tree (the checkout above).
         run: |
           if [ -f crates/lil-cli/Cargo.toml ]; then
             pkg=lil-cli
             bin=lil
-          elif [ -f crates/ww-cli/Cargo.toml ]; then
-            pkg=ww-cli
-            bin=ww
           else
-            echo "::error::main has neither crates/lil-cli nor crates/ww-cli, so there is no CLI to build."
+            echo "::error::main has no crates/lil-cli, so there is no CLI to build."
             exit 1
           fi
           echo "Building $pkg (--bin $bin) from main."

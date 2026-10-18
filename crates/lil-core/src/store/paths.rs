@@ -4,6 +4,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use lil_platform::names::LEGACY_WORKSPACE_DIR;
 use lil_schema::{Version, check_rel_path};
 
 use super::write::StoreError;
@@ -89,7 +90,9 @@ fn is_version_folder(name: &str) -> bool {
 /// Refuses the paths the store never writes, compared without regard to case:
 /// - `registry/ledger.csv`, which only the user edits (ARCH-082);
 /// - anything in a sealed version folder, `projects/<p>/assets/<a>/v<semver>/…` (CORE-026),
-///   and a file named like that folder.
+///   and a file named like that folder;
+/// - the root's workspace data folder from before the rename and anything in it (R4: only
+///   read; it stays reserved after the rename's cleanup).
 pub fn writable(rel: &WsPath) -> Result<(), StoreError> {
     let parts: Vec<String> = rel.as_str().split('/').map(str::to_lowercase).collect();
     let refuse = |why: &str| {
@@ -107,6 +110,11 @@ pub fn writable(rel: &WsPath) -> Result<(), StoreError> {
         && is_version_folder(&parts[4])
     {
         return refuse("a sealed version folder is never written; start a new version instead");
+    }
+    if parts[0].eq_ignore_ascii_case(LEGACY_WORKSPACE_DIR) {
+        return refuse(
+            "the workspace data folder from before the rename is only read; the suite never writes in it",
+        );
     }
     Ok(())
 }
@@ -168,6 +176,17 @@ mod tests {
             let p = WsPath::parse(refused).unwrap();
             assert!(writable(&p).is_err(), "{refused}");
         }
+        // The legacy workspace data folder, in any case (R4).
+        for refused in [
+            LEGACY_WORKSPACE_DIR.to_string(),
+            format!("{LEGACY_WORKSPACE_DIR}/state.json"),
+            format!("{}/x", LEGACY_WORKSPACE_DIR.to_uppercase()),
+        ] {
+            let p = WsPath::parse(&refused).unwrap();
+            assert!(writable(&p).is_err(), "{refused}");
+        }
+        let deeper = WsPath::parse(&format!("notes/{LEGACY_WORKSPACE_DIR}/x")).unwrap();
+        assert!(writable(&deeper).is_ok());
         for allowed in [
             "registry/ledger.csv.bak",
             "registry/other/ledger.csv",

@@ -14,7 +14,7 @@
 //!   changed.
 //! - If the step changed protected files (the guard verdict of the step against its first
 //!   parent), the reviewer App must have approved that PR's final head commit
-//!   ([`app_approved`], under either of its logins: [`MergeGuardConfig::reviewer_logins`]).
+//!   ([`app_approved`], under its login: [`MergeGuardConfig::reviewer_login`]).
 //!   A merge commit must then also be a plain merge of that head: exactly
 //!   two parents, the second being the PR's head, and a tree equal to
 //!   `git merge-tree --write-tree <first parent> <head>`. A conflict or any difference is
@@ -198,11 +198,11 @@ pub fn post_merge_flags(
             return flags;
         }
     };
-    let logins = cfg.reviewer_logins();
+    let login = cfg.reviewer_login();
     flags.extend(
         steps
             .iter()
-            .filter_map(|sha| judge_step(repo, sha, gh, cfg, &logins)),
+            .filter_map(|sha| judge_step(repo, sha, gh, cfg, &login)),
     );
     flags
 }
@@ -213,7 +213,7 @@ fn judge_step(
     sha: &str,
     gh: &dyn GitHubApi,
     cfg: &MergeGuardConfig,
-    logins: &[String],
+    login: &str,
 ) -> Option<Flag> {
     let parents = match parents(repo, sha) {
         Ok(p) => p,
@@ -306,7 +306,7 @@ fn judge_step(
     let mut errors = Vec::new();
     for p in &candidates {
         match gh.reviews(p.number) {
-            Ok(reviews) if app_approved(&reviews, logins, &p.head_sha) => return None,
+            Ok(reviews) if app_approved(&reviews, login, &p.head_sha) => return None,
             Ok(_) => {}
             Err(e) => errors.push(format!(
                 "reading the reviews of PR #{} failed: {e:#}",
@@ -821,7 +821,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
-    const BOT: &str = "worldwright-reviewer[bot]";
+    const BOT: &str = "lilith-reviewer[bot]";
     const SPEC: &str = "crates/lil-spec-tests/tests/smoke.rs";
 
     fn cfg() -> MergeGuardConfig {
@@ -1037,10 +1037,10 @@ mod tests {
         assert_eq!(explain_flags(&[]), "Nothing to flag.");
     }
 
-    /// Plan 2026-10-17, D6: the App's approval counts under its current slug or the next one
-    /// in the settings at `before`, and under no other login.
+    /// The App's approval counts under its login in the settings at `before`, and under no
+    /// other login.
     #[test] // spec: QA-035
-    fn post_merge_counts_either_login() {
+    fn post_merge_counts_only_the_app_login() {
         let (_tmp, dir, before) = repo();
         let (head, merge) = merge_pr(
             &dir,
@@ -1048,50 +1048,35 @@ mod tests {
             SPEC,
             "#[test]\nfn spec_harness_runs() { assert!(true) }\n",
         );
-        for login in [BOT, "lilith-reviewer[bot]"] {
-            let fake = FakeGitHub::new();
-            fake.add_commit_pull(&merge, 7, &head, "main", true);
-            fake.add_review(7, login, "APPROVED", &head);
-            assert_eq!(
-                post_merge_flags(&dir, &before, &merge, &fake, &cfg()),
-                vec![],
-                "{login}"
-            );
-        }
+        let fake = FakeGitHub::new();
+        fake.add_commit_pull(&merge, 7, &head, "main", true);
+        fake.add_review(7, BOT, "APPROVED", &head);
+        assert_eq!(
+            post_merge_flags(&dir, &before, &merge, &fake, &cfg()),
+            vec![]
+        );
 
-        // People named like either slug, other Apps, and the next slug once the settings at
-        // `before` don't name it: all flagged.
-        let only_current = MergeGuardConfig {
-            reviewer_app_slug_next: None,
-            ..cfg()
-        };
-        for (login, settings) in [
-            ("lilith-reviewer", cfg()),
-            ("worldwright-reviewer", cfg()),
-            ("github-actions[bot]", cfg()),
-            ("lilith-reviewer-next[bot]", cfg()),
-            ("lilith-reviewer[bot]", only_current),
+        // People named like the slug, the App's slug before its rename and other Apps: all
+        // flagged.
+        let old_bot = format!(
+            "{}-reviewer[bot]",
+            lil_platform::names::LEGACY_APP_NAME.to_lowercase()
+        );
+        for login in [
+            "lilith-reviewer",
+            old_bot.as_str(),
+            "github-actions[bot]",
+            "lilith-reviewer-next[bot]",
         ] {
             let fake = FakeGitHub::new();
             fake.add_commit_pull(&merge, 7, &head, "main", true);
             fake.add_review(7, login, "APPROVED", &head);
-            let flags = post_merge_flags(&dir, &before, &merge, &fake, &settings);
+            let flags = post_merge_flags(&dir, &before, &merge, &fake, &cfg());
             assert!(
                 matches!(&flags[..], [Flag::UnapprovedProtected { sha, .. }] if *sha == merge),
                 "{login}: {flags:?}"
             );
         }
-
-        // The latest review across both logins decides.
-        let fake = FakeGitHub::new();
-        fake.add_commit_pull(&merge, 7, &head, "main", true);
-        fake.add_review(7, "lilith-reviewer[bot]", "APPROVED", &head);
-        fake.add_review(7, BOT, "DISMISSED", &head);
-        let flags = post_merge_flags(&dir, &before, &merge, &fake, &cfg());
-        assert!(
-            matches!(&flags[..], [Flag::UnapprovedProtected { .. }]),
-            "{flags:?}"
-        );
     }
 
     // ---- fail closed and the edges ---------------------------------------------------------

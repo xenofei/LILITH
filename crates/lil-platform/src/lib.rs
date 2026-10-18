@@ -26,8 +26,7 @@ pub mod watcher;
 
 pub use clock::{Clock, SystemClock};
 pub use credentials::{
-    Credential, CredentialError, CredentialStore, MemoryCredentialStore, TargetUse,
-    WindowsCredentialStore,
+    Credential, CredentialError, CredentialStore, MemoryCredentialStore, WindowsCredentialStore,
 };
 pub use env::{Channel, Env, EnvError, Roots, TEST_MACHINE_ID, machine_id_from};
 pub use fs::{FileIdentity, Probe, SystemProbe, VolumeInfo};

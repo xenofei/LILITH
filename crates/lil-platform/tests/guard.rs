@@ -62,7 +62,6 @@ fn real_roaming_and_local_lilith_folders_trip() {
         |e| drop(e.logs_dir()),
         |e| drop(e.claude_profiles_dir()),
         |e| drop(e.legacy_data_dir()),
-        |e| drop(e.legacy_local_dir()),
     ] {
         let msg = panics(|| f(&env)).expect("must panic");
         assert!(
@@ -150,11 +149,6 @@ fn lilith_and_legacy_local_components_trip() {
     .expect("must panic");
     assert!(msg.contains("real LILITH location"), "{msg}");
     assert!(msg.contains(".lilith-local"), "{msg}");
-    let msg = panics(|| {
-        let _ = env.legacy_workspace_local_dir_for_canonical(std::path::Path::new(r"E:\ws"));
-    })
-    .expect("the legacy layout must panic too");
-    assert!(msg.contains(LEGACY_LOCAL_DIR), "{msg}");
 }
 
 /// Puts every path on its own drive so the workspace lands in `<volume>\.lilith-local`.

@@ -784,14 +784,14 @@ mod tests {
     fn fake_serves_the_app_slug() {
         let fake = FakeGitHub::new();
         fake.add_pr(7, "sha1", "main");
-        // By default the App has its current slug, and posts as it.
-        assert_eq!(fake.app_slug("jwt-1").unwrap(), "worldwright-reviewer");
-        fake.set_app_slug("lilith-reviewer");
-        assert_eq!(fake.app_slug("jwt-2").unwrap(), "lilith-reviewer");
+        // By default the App has its slug, and posts as it.
+        assert_eq!(fake.app_slug("jwt-1").unwrap(), "lilith-reviewer");
+        fake.set_app_slug("other-reviewer");
+        assert_eq!(fake.app_slug("jwt-2").unwrap(), "other-reviewer");
         fake.post_review_as_app(7, "sha1", "ok", "inst-token")
             .unwrap();
         let reviews = fake.reviews(7).unwrap();
-        assert_eq!(reviews.last().unwrap().login, "lilith-reviewer[bot]");
+        assert_eq!(reviews.last().unwrap().login, "other-reviewer[bot]");
         // The JWTs it was asked with are recorded, in order.
         assert_eq!(fake.app_jwts(), ["jwt-1", "jwt-2"]);
         fake.fail_app_slug("HTTP 401: A JSON web token could not be decoded");

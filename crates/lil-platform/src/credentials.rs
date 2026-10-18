@@ -5,13 +5,12 @@
 //! the trait, with [`MemoryCredentialStore`] standing in for Credential Manager in tests.
 //!
 //! **Targets.** The real store, [`WindowsCredentialStore`], only touches targets under
-//! [`DEV_PREFIX`] (owner tooling such as the agent token), under the legacy owner-tooling
-//! prefix [`names::LEGACY_DEV_CREDENTIAL_PREFIX`] (R4; read and deleted, never written), or
-//! under the test prefix `LILITH-test-<id>/` (tests; [`crate::Env::credential_prefix`] of a test
-//! channel). The legacy test prefix is not used at all.
-//! Anything else, including either name's stable channel prefix and other channels, is refused
-//! before any Windows call ([`check_target`]). Once the harness guard is armed, an
-//! owner-tooling target under either name also trips it (QA-040).
+//! [`DEV_PREFIX`] (owner tooling such as the agent token), or under the test prefix
+//! `LILITH-test-<id>/` (tests; [`crate::Env::credential_prefix`] of a test channel). Anything
+//! else, including either name's stable channel prefix, other channels and the owner-tooling
+//! and test prefixes from before the rename, is refused before any Windows call
+//! ([`check_target`]). Once the harness guard is armed, an owner-tooling target under either
+//! name also trips it (QA-040).
 //!
 //! **Secrets** are kept in [`Zeroizing`] strings, never printed, and `Debug` redacts them.
 //! A credential's comment is non-secret metadata (for the agent token, the expiry the owner
@@ -78,8 +77,7 @@ impl fmt::Display for CredentialError {
         match self {
             CredentialError::TargetRefused(t) => write!(
                 f,
-                "credential target {t:?} is refused for this use: only {DEV_PREFIX}..., {}... (read and delete only) and {TEST_PREFIX}<id>/... are used",
-                names::LEGACY_DEV_CREDENTIAL_PREFIX
+                "credential target {t:?} is refused: only {DEV_PREFIX}... and {TEST_PREFIX}<id>/... are used"
             ),
             CredentialError::Invalid(why) => write!(f, "the credential can't be stored: {why}"),
             CredentialError::Windows { call, message } => write!(f, "{call} failed: {message}"),
@@ -99,24 +97,14 @@ pub trait CredentialStore {
     fn delete(&self, target: &str) -> Result<bool, CredentialError>;
 }
 
-/// What a credential call does with its target ([`check_target`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetUse {
-    Read,
-    Write,
-    Delete,
-}
-
 /// `Ok` for (ASCII case-insensitive, like Credential Manager):
 ///
-/// - `<DEV_PREFIX><name>`, every use;
-/// - `<LEGACY_DEV_CREDENTIAL_PREFIX><name>`, the legacy owner-tooling entries (R4):
-///   [`TargetUse::Read`] and [`TargetUse::Delete`] only. Nothing writes the old name; the
-///   agent token is written under [`DEV_PREFIX`];
-/// - `<TEST_PREFIX><id>/<name>`, every use, where `<id>` is a valid test channel id.
+/// - `<DEV_PREFIX><name>`;
+/// - `<TEST_PREFIX><id>/<name>`, where `<id>` is a valid test channel id.
 ///
-/// `<name>` is never empty, and no control characters are allowed anywhere.
-pub fn check_target(target: &str, use_: TargetUse) -> Result<(), CredentialError> {
+/// `<name>` is never empty, and no control characters are allowed anywhere. Every use (read,
+/// write, delete) gets the same answer.
+pub fn check_target(target: &str) -> Result<(), CredentialError> {
     let refused = || {
         Err(CredentialError::TargetRefused(
             target.escape_debug().to_string(),
@@ -126,13 +114,7 @@ pub fn check_target(target: &str, use_: TargetUse) -> Result<(), CredentialError
         return refused();
     }
     let lower = target.to_ascii_lowercase();
-    let legacy_dev = names::LEGACY_DEV_CREDENTIAL_PREFIX.to_ascii_lowercase();
     let name = if let Some(rest) = lower.strip_prefix(&DEV_PREFIX.to_ascii_lowercase()) {
-        rest
-    } else if let Some(rest) = lower.strip_prefix(&legacy_dev) {
-        if use_ == TargetUse::Write {
-            return refused();
-        }
         rest
     } else if let Some(rest) = lower.strip_prefix(&TEST_PREFIX.to_ascii_lowercase()) {
         match rest.split_once('/') {
@@ -194,12 +176,12 @@ impl MemoryCredentialStore {
 
 impl CredentialStore for MemoryCredentialStore {
     fn get(&self, target: &str) -> Result<Option<Credential>, CredentialError> {
-        check_target(target, TargetUse::Read)?;
+        check_target(target)?;
         Ok(self.items().get(&target.to_ascii_lowercase()).cloned())
     }
 
     fn set(&self, target: &str, credential: &Credential) -> Result<(), CredentialError> {
-        check_target(target, TargetUse::Write)?;
+        check_target(target)?;
         check_credential(credential)?;
         self.items()
             .insert(target.to_ascii_lowercase(), credential.clone());
@@ -207,7 +189,7 @@ impl CredentialStore for MemoryCredentialStore {
     }
 
     fn delete(&self, target: &str) -> Result<bool, CredentialError> {
-        check_target(target, TargetUse::Delete)?;
+        check_target(target)?;
         Ok(self.items().remove(&target.to_ascii_lowercase()).is_some())
     }
 }
@@ -237,11 +219,11 @@ fn is_not_found(e: &windows::core::Error) -> bool {
     e.code() == ERROR_NOT_FOUND.to_hresult()
 }
 
-/// The checks every real call makes before it reaches Windows: the prefixes and the use, then
-/// the harness guard (an owner-tooling target under either name trips it once a test has armed
+/// The checks every real call makes before it reaches Windows: the prefixes, then the harness
+/// guard (an owner-tooling target under either name trips it once a test has armed
 /// it).
-fn checked_target(target: &str, use_: TargetUse) -> Result<Vec<u16>, CredentialError> {
-    check_target(target, use_)?;
+fn checked_target(target: &str) -> Result<Vec<u16>, CredentialError> {
+    check_target(target)?;
     guard::check_credential(target.to_string());
     Ok(wide(target))
 }
@@ -282,7 +264,7 @@ unsafe fn read_pwstr(p: PWSTR, field: &str) -> Result<Option<String>, Credential
 
 impl CredentialStore for WindowsCredentialStore {
     fn get(&self, target: &str) -> Result<Option<Credential>, CredentialError> {
-        let name = checked_target(target, TargetUse::Read)?;
+        let name = checked_target(target)?;
         let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
         // SAFETY: `name` is NUL-terminated and outlives the call; on success `ptr` receives a
         // buffer that `ReadBuffer` frees.
@@ -324,7 +306,7 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn set(&self, target: &str, credential: &Credential) -> Result<(), CredentialError> {
-        let mut name = checked_target(target, TargetUse::Write)?;
+        let mut name = checked_target(target)?;
         check_credential(credential)?;
         let mut user = wide(&credential.username);
         let mut comment = credential.comment.as_deref().map(wide);
@@ -351,7 +333,7 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn delete(&self, target: &str) -> Result<bool, CredentialError> {
-        let name = checked_target(target, TargetUse::Delete)?;
+        let name = checked_target(target)?;
         // SAFETY: `name` is NUL-terminated and outlives the call.
         match unsafe { CredDeleteW(PCWSTR(name.as_ptr()), CRED_TYPE_GENERIC, None) } {
             Ok(()) => Ok(true),
@@ -364,9 +346,7 @@ impl CredentialStore for WindowsCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names::{DEV_CREDENTIAL_PREFIX, LEGACY_APP_NAME, LEGACY_DEV_CREDENTIAL_PREFIX};
-
-    const USES: [TargetUse; 3] = [TargetUse::Read, TargetUse::Write, TargetUse::Delete];
+    use crate::names::{DEV_CREDENTIAL_PREFIX, LEGACY_APP_NAME};
 
     fn cred(secret: &str) -> Credential {
         Credential {
@@ -376,9 +356,10 @@ mod tests {
         }
     }
 
-    /// Targets every use refuses: either name's stable and other channel prefixes, the
+    /// Targets that are refused: either name's stable and other channel prefixes, the
     /// owner-tooling prefixes with no name, malformed test ids, the legacy test prefix (test
-    /// channels moved to the new name in Task B3), and targets that are not ours.
+    /// channels moved to the new name in Task B3), the legacy owner-tooling prefix (its last
+    /// reader went with PR-D), and targets that are not ours.
     fn refused() -> Vec<String> {
         let mut all = Vec::new();
         for app in [names::APP_NAME, LEGACY_APP_NAME] {
@@ -406,6 +387,10 @@ mod tests {
             format!("{LEGACY_APP_NAME}-test-0a1b2c3d/x"),
             format!("{LEGACY_APP_NAME}-test-a_b-1/x/y"),
             format!("{}-TEST-0a1b2c3d/x", LEGACY_APP_NAME.to_ascii_uppercase()),
+            format!("{LEGACY_APP_NAME}-dev/x"),
+            format!("{LEGACY_APP_NAME}-dev/github/agent-token"),
+            format!("{}-DEV/x", LEGACY_APP_NAME.to_ascii_uppercase()),
+            format!("{}-dev/x", LEGACY_APP_NAME.to_ascii_lowercase()),
         ] {
             all.push(t);
         }
@@ -417,49 +402,42 @@ mod tests {
 
     #[test] // spec: QA-079
     fn targets_outside_dev_and_test_prefixes_are_refused() {
-        for use_ in USES {
-            for t in refused() {
-                assert!(
-                    matches!(
-                        check_target(&t, use_),
-                        Err(CredentialError::TargetRefused(_))
-                    ),
-                    "{t:?} {use_:?}"
-                );
-            }
-            for t in [
-                "LILITH-dev/github/agent-token",
-                "lilith-DEV/x",
-                "LILITH-test-0a1b2c3d/roundtrip",
-                "LILITH-test-a_b-1/x/y",
-            ] {
-                assert_eq!(check_target(t, use_), Ok(()), "{t:?} {use_:?}");
-            }
-            assert!(check_target(&format!("LILITH-test-{}/x", "a".repeat(65)), use_).is_err());
-        }
-    }
-
-    /// Test channels use `LILITH-test-<id>/` (Task B3): every use, any case, and it is what a
-    /// test channel's `Env` hands out. The legacy test prefix is no longer used at all.
-    #[test] // spec: QA-079, QA-038
-    fn test_channel_credential_prefix_is_lilith_test() {
-        for use_ in USES {
-            for t in [
-                "LILITH-test-0a1b2c3d/x",
-                "lilith-TEST-0a1b2c3d/a/b",
-                "LILITH-test-a_b-1/x",
-            ] {
-                assert_eq!(check_target(t, use_), Ok(()), "{t:?} {use_:?}");
-            }
-            let legacy = format!("{LEGACY_APP_NAME}-test-0a1b2c3d/x");
+        for t in refused() {
             assert!(
-                matches!(
-                    check_target(&legacy, use_),
-                    Err(CredentialError::TargetRefused(_))
-                ),
-                "{legacy:?} {use_:?}"
+                matches!(check_target(&t), Err(CredentialError::TargetRefused(_))),
+                "{t:?}"
             );
         }
+        for t in [
+            "LILITH-dev/github/agent-token",
+            "lilith-DEV/x",
+            "LILITH-test-0a1b2c3d/roundtrip",
+            "LILITH-test-a_b-1/x/y",
+        ] {
+            assert_eq!(check_target(t), Ok(()), "{t:?}");
+        }
+        assert!(check_target(&format!("LILITH-test-{}/x", "a".repeat(65))).is_err());
+    }
+
+    /// Test channels use `LILITH-test-<id>/` (Task B3): any case, and it is what a test
+    /// channel's `Env` hands out. The legacy test prefix is no longer used at all.
+    #[test] // spec: QA-079, QA-038
+    fn test_channel_credential_prefix_is_lilith_test() {
+        for t in [
+            "LILITH-test-0a1b2c3d/x",
+            "lilith-TEST-0a1b2c3d/a/b",
+            "LILITH-test-a_b-1/x",
+        ] {
+            assert_eq!(check_target(t), Ok(()), "{t:?}");
+        }
+        let legacy = format!("{LEGACY_APP_NAME}-test-0a1b2c3d/x");
+        assert!(
+            matches!(
+                check_target(&legacy),
+                Err(CredentialError::TargetRefused(_))
+            ),
+            "{legacy:?}"
+        );
         let env = crate::Env::with_roots(
             Channel::Test("0a1b2c3d".into()),
             crate::Roots {
@@ -471,22 +449,18 @@ mod tests {
         );
         assert_eq!(env.credential_prefix(), "LILITH-test-0a1b2c3d/");
         let target = format!("{}github/x", env.credential_prefix());
-        for use_ in USES {
-            assert_eq!(check_target(&target, use_), Ok(()), "{use_:?}");
-        }
+        assert_eq!(check_target(&target), Ok(()));
     }
 
     #[test] // spec: QA-079
-    fn check_target_accepts_the_new_dev_prefix_for_every_use() {
-        for use_ in USES {
-            for t in [
-                format!("{DEV_CREDENTIAL_PREFIX}github/agent-token"),
-                format!("{DEV_CREDENTIAL_PREFIX}x"),
-                format!("{}x", DEV_CREDENTIAL_PREFIX.to_ascii_uppercase()),
-                "lilith-DEV/a/b".to_string(),
-            ] {
-                assert_eq!(check_target(&t, use_), Ok(()), "{t:?} {use_:?}");
-            }
+    fn check_target_accepts_the_dev_prefix() {
+        for t in [
+            format!("{DEV_CREDENTIAL_PREFIX}github/agent-token"),
+            format!("{DEV_CREDENTIAL_PREFIX}x"),
+            format!("{}x", DEV_CREDENTIAL_PREFIX.to_ascii_uppercase()),
+            "lilith-DEV/a/b".to_string(),
+        ] {
+            assert_eq!(check_target(&t), Ok(()), "{t:?}");
         }
         // The fake store writes, reads and deletes it.
         let store = MemoryCredentialStore::new();
@@ -494,76 +468,6 @@ mod tests {
         store.set(&t, &cred("s")).unwrap();
         assert_eq!(store.get(&t).unwrap(), Some(cred("s")));
         assert_eq!(store.delete(&t), Ok(true));
-    }
-
-    /// The legacy owner-tooling prefix is still read and deleted (R4), under any case.
-    #[test] // spec: QA-079
-    fn check_target_reads_and_deletes_both_dev_prefixes() {
-        for prefix in [DEV_CREDENTIAL_PREFIX, LEGACY_DEV_CREDENTIAL_PREFIX] {
-            for t in [
-                format!("{prefix}x"),
-                format!("{prefix}github/agent-token"),
-                format!("{}x", prefix.to_ascii_uppercase()),
-                format!("{}x", prefix.to_ascii_lowercase()),
-            ] {
-                for use_ in [TargetUse::Read, TargetUse::Delete] {
-                    assert_eq!(check_target(&t, use_), Ok(()), "{t:?} {use_:?}");
-                }
-                let store = MemoryCredentialStore::new();
-                assert_eq!(store.get(&t), Ok(None), "{t:?}");
-                assert_eq!(store.delete(&t), Ok(false), "{t:?}");
-            }
-            // Either prefix with no name is refused for every use.
-            for use_ in USES {
-                assert!(check_target(prefix, use_).is_err(), "{prefix:?} {use_:?}");
-            }
-        }
-    }
-
-    /// The legacy owner-tooling prefix is read and deleted, never written (R4).
-    #[test] // spec: QA-079
-    fn check_target_refuses_writing_the_legacy_dev_prefix() {
-        for t in [
-            format!("{LEGACY_DEV_CREDENTIAL_PREFIX}x"),
-            format!("{LEGACY_DEV_CREDENTIAL_PREFIX}github/agent-token"),
-            format!("{}x", LEGACY_DEV_CREDENTIAL_PREFIX.to_ascii_uppercase()),
-            format!("{}x", LEGACY_DEV_CREDENTIAL_PREFIX.to_ascii_lowercase()),
-        ] {
-            assert!(
-                matches!(
-                    check_target(&t, TargetUse::Write),
-                    Err(CredentialError::TargetRefused(_))
-                ),
-                "{t:?}"
-            );
-            assert_eq!(check_target(&t, TargetUse::Read), Ok(()), "{t:?}");
-            assert_eq!(check_target(&t, TargetUse::Delete), Ok(()), "{t:?}");
-            // The real store refuses the write before any Windows call, and so does the fake.
-            assert!(
-                matches!(
-                    WindowsCredentialStore.set(&t, &cred("s")),
-                    Err(CredentialError::TargetRefused(_))
-                ),
-                "{t:?}"
-            );
-            let store = MemoryCredentialStore::new();
-            assert!(
-                matches!(
-                    store.set(&t, &cred("s")),
-                    Err(CredentialError::TargetRefused(_))
-                ),
-                "{t:?}"
-            );
-            assert_eq!(store.get(&t), Ok(None), "{t:?}");
-            assert_eq!(store.delete(&t), Ok(false), "{t:?}");
-        }
-        // The legacy prefix with no name is still refused for every use.
-        for use_ in USES {
-            assert!(
-                check_target(LEGACY_DEV_CREDENTIAL_PREFIX, use_).is_err(),
-                "{use_:?}"
-            );
-        }
     }
 
     /// The real store refuses before calling Windows, so these never reach Credential Manager.
