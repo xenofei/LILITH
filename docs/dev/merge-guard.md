@@ -228,7 +228,7 @@ If the check picker offers only checks that have already run in the repository, 
 The reviewer App is the second identity that approves protected changes. Agents can't act as it.
 
 1. **Browser:** Settings → Developer settings → GitHub Apps → **New GitHub App**.
-   - **Name:** `lilith-reviewer`. (App names are unique across GitHub. If it's taken, pick another and set `reviewer_app_slug` in `dev/merge-guard.toml` to match, which is a protected change.)
+   - **Name:** `lilith-reviewer`. (App names are unique across GitHub. If it's taken, pick another. While the App is being renamed (see "Renaming the App" below), the name you pick goes into `reviewer_app_slug_next` in `dev/merge-guard.toml`, and `reviewer_app_slug` keeps the App's current slug. Otherwise it goes into `reviewer_app_slug`. Either way it is a protected change.)
    - **Homepage URL:** any URL, for example the repository's.
    - **Webhook:** turn **Active** off.
    - **Repository permissions:** **Pull requests: Read and write**, **Contents: Read-only**, **Actions: Read and write**. (Metadata read-only is added automatically.) Nothing else. Actions write is there so that an approval re-runs the guard check: `protected-test-check` runs only on pull request events, so its run for a commit happened before your approval and failed. Right after posting the approval, `lil dev approve` asks GitHub to re-run that run; the re-run reads the reviews again and passes. The App uses this permission for nothing else.

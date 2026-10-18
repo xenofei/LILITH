@@ -1105,7 +1105,7 @@ mod tests {
         // Neither does either app slug without the `[bot]` suffix, or another app.
         fake.add_review(PR, "worldwright-reviewer", "APPROVED", HEAD);
         fake.add_review(PR, "lilith-reviewer", "APPROVED", HEAD);
-        fake.add_review(PR, "worldwright-app[bot]", "APPROVED", HEAD);
+        fake.add_review(PR, "lilith-app[bot]", "APPROVED", HEAD);
         let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
