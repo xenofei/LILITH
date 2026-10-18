@@ -9,7 +9,8 @@
 //!   job that finished is never changed again, and cancellation happens once. Each state
 //!   change is one line of the workspace's jobs log (CORE-009, Appendix F field list); a job
 //!   without a workspace writes none. The `jobs` topic carries `{kind: "job", job}` and
-//!   `job:<id>` carries `status`, `progress` and `retrying` (snapshot: the [`JobSummary`]).
+//!   `job:<id>` carries `status`, `progress`, `retrying` and `watchdog` (snapshot: the
+//!   [`JobSummary`]).
 //! - **Lanes and the queue** ([`queue`]). Each lane (`gpu-heavy`, `cpu`) runs at most one job
 //!   at a time; the next starts when it ends (CORE-121, CORE-123, ARCH-071). The next job is
 //!   the first of the best class (`interactive` > `user` > `agent`), first in, first out
@@ -17,8 +18,11 @@
 //!   class, but never past one that was overtaken that way 8 times (CORE-124). With
 //!   `[jobs] preempt_agent_batches = true` an `interactive` job cancels the running `agent`
 //!   engine job of its lane, which goes back to the head of its class (CORE-125). Before a job
-//!   starts, the [`Admission`] (Task 10's GPU scheduler; [`AlwaysAdmit`] until then) may hold it
-//!   in `waiting_for_vram`.
+//!   starts, the [`Admission`] (the GPU scheduler, [`scheduler`]; [`AlwaysAdmit`] by default)
+//!   may hold it in `waiting_for_vram`, and it is told whether jobs run or wait for VRAM.
+//!   [`Jobs::kick`] (on every telemetry sample) asks again, and runs the watchdog: a running job
+//!   more than 3× its `expected_secs` past the moment its attempt became `executing` gets
+//!   `watchdog: "slow"` (a `watchdog` event on `job:<id>`); it keeps running (ARCH-072).
 //! - **Running** ([`runner`]). A free-space preflight on the staging volume (2 ×
 //!   `expected_output_bytes` + 64 MiB) fails a job with `store.disk_full` before its handler
 //!   runs. A [`JobFailure::Retryable`] is retried after 1 s, doubling, at most 30 s, at most 5
@@ -71,6 +75,7 @@
 pub mod queue;
 pub mod record;
 pub mod runner;
+pub mod scheduler;
 
 use std::fmt;
 use std::future::Future;
@@ -352,17 +357,26 @@ impl Substatus {
 pub enum EngineKind {
     #[serde(rename = "comfyui")]
     ComfyUi,
+    /// A second kind for the GPU lease's tests (no engine runs it). No tool input can name it:
+    /// serde and the schemas skip it; only its row column (`"test"`) reads it back.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    Test,
 }
 
 impl EngineKind {
     pub fn wire(self) -> &'static str {
         match self {
             EngineKind::ComfyUi => "comfyui",
+            EngineKind::Test => "test",
         }
     }
 
     pub fn parse(s: &str) -> Option<EngineKind> {
-        (s == "comfyui").then_some(EngineKind::ComfyUi)
+        [EngineKind::ComfyUi, EngineKind::Test]
+            .into_iter()
+            .find(|e| e.wire() == s)
     }
 }
 
@@ -380,7 +394,7 @@ pub struct JobSpec {
     pub project: Option<String>,
     pub asset_id: Option<String>,
     pub doc_id: Option<String>,
-    /// For the watchdog (Task 10).
+    /// For the watchdog (0: none).
     pub expected_secs: u32,
     /// For the disk preflight.
     pub expected_output_bytes: u64,
@@ -434,7 +448,7 @@ pub struct JobSummary {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<Progress>,
-    /// `"slow"` once the watchdog flagged the job (Task 10).
+    /// `"slow"` once the watchdog flagged the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog: Option<String>,
     /// Present (and `true`) only when the job ran without a VRAM check (no NVML).
@@ -550,12 +564,17 @@ pub trait JobHandler: Send + Sync + 'static {
     fn cancel_in_engine<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, ()>;
 }
 
-/// Whether a job may start now (the GPU scheduler, Task 10).
+/// Whether a job may start now (the GPU scheduler, [`scheduler::GpuScheduler`]). Both methods
+/// are called under the queue's lock, so neither may block or call back into [`Jobs`].
 pub trait Admission: Send + Sync {
+    /// Asked for the next job of a free lane, again on every [`Jobs::kick`] while it waits.
     fn admit(&self, spec: &JobSpec) -> Admit;
+    /// Whether any job runs or waits for VRAM, told whenever that changes (CORE-061: the
+    /// per-process GPU memory is read every second while it is `true`).
+    fn busy(&self, _busy: bool) {}
 }
 
-/// Admits everything: the default until Task 10's `GpuScheduler`.
+/// Admits everything: the default (the core sets the GPU scheduler).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AlwaysAdmit;
 

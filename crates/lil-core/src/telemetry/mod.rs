@@ -16,8 +16,9 @@
 //! - **Topic.** `telemetry` carries `{kind: "sample", snapshot}` once per sample,
 //!   `{kind: "alert", alert: {id, kind, value, since}}` when an alert is raised and
 //!   `{kind: "alert_cleared", id}` when it clears; subscribing gets the current [`Snapshot`].
-//! - **Consumers.** The GPU scheduler reads [`Telemetry::vram`] and re-checks on every
-//!   [`Telemetry::on_sample`] callback (Task 10); the engines [`Telemetry::track`] their
+//! - **Consumers.** The GPU scheduler reads [`Telemetry::vram`], sets
+//!   [`Telemetry::set_busy`], and re-checks on every [`Telemetry::on_sample`] callback (the
+//!   core kicks the jobs there); the engines [`Telemetry::track`] their
 //!   processes; `meter` takes a job's [`EnergySlice`] with [`Telemetry::energy_between`] and
 //!   writes its [`JobEnergy`] with [`Telemetry::put_job_energy`], the only writer (Task 15).
 //!   The hardware profile of a workspace is checked once, at start ([`profile`]).
@@ -862,6 +863,11 @@ impl Telemetry {
     /// Per-process GPU memory is read every second while jobs run, else every 5 s.
     pub fn set_busy(&self, busy: bool) {
         self.inner.busy.store(busy, Ordering::Relaxed);
+    }
+
+    /// What [`Telemetry::set_busy`] set last.
+    pub fn busy(&self) -> bool {
+        self.inner.busy.load(Ordering::Relaxed)
     }
 
     /// Calls `f` after every sample (the scheduler's VRAM re-check). It runs on the sampler's

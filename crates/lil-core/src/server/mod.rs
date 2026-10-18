@@ -17,7 +17,9 @@
 //!   stops them starting queued jobs once a drain begins, recovers the suite scope's jobs
 //!   (ARCH-022), and adds the `jobs` idle blocker (ARCH-020) and the `PersistInterrupted`
 //!   shutdown step (ARCH-021). The default workspace's jobs are
-//!   recovered once it opens.
+//!   recovered once it opens. The GPU scheduler ([`crate::jobs::scheduler`]) is their
+//!   admission, and every telemetry sample kicks them: a job waiting for VRAM is asked about
+//!   again, and the watchdog looks at the running ones.
 //! - The hardware telemetry ([`crate::telemetry`]) starts before the dispatcher is built: this
 //!   machine's hardware sampled once a second, or on a test channel the fake hardware script
 //!   (`LIL_TEST_FAKE_HW`) advanced only by `test.hw_tick`. Its tools and its topic's snapshot
@@ -44,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
 use crate::events::EventBus;
+use crate::jobs::scheduler::{GpuScheduler, NoEngines};
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
@@ -448,6 +451,14 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
     }
     jobs.set_preempt_agent_batches(preempt_agent_batches(&cfg.env));
+    // ARCH-071: the engines' processes and unload come with Task 11.
+    jobs.set_admission(GpuScheduler::new(telemetry.clone(), Arc::new(NoEngines)));
+    let kicked = Arc::downgrade(&jobs);
+    telemetry.on_sample(Box::new(move || {
+        if let Some(jobs) = kicked.upgrade() {
+            jobs.kick();
+        }
+    }));
     jobs.stop_on_drain(lifecycle.drain_token());
     // Completions (Tasks 15–16) are added before this: it runs them for jobs that never
     // started.

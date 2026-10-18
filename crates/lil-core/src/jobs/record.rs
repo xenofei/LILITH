@@ -159,6 +159,8 @@ pub struct Change {
     pub error: Option<Option<ErrorBody>>,
     pub result: Option<JobResult>,
     pub vram_unchecked: Option<bool>,
+    /// Sets the watchdog flag (`"slow"`); it is never cleared.
+    pub watchdog: Option<String>,
 }
 
 impl Change {
@@ -431,11 +433,14 @@ pub async fn update(
             if let Some(unchecked) = c.vram_unchecked {
                 r.vram_unchecked = unchecked;
             }
+            if let Some(watchdog) = c.watchdog {
+                r.watchdog = Some(watchdog);
+            }
             r.updated_utc = now_utc;
             tx.execute(
                 "UPDATE jobs SET status = ?2, substatus = ?3, attempt = ?4, updated_utc = ?5,
                      started_utc = ?6, finished_utc = ?7, error = ?8, result = ?9,
-                     vram_unchecked = ?10
+                     vram_unchecked = ?10, watchdog = ?11
                  WHERE job_id = ?1",
                 params![
                     job_id,
@@ -448,6 +453,7 @@ pub async fn update(
                     r.error.as_ref().map(to_text),
                     r.result.as_ref().map(to_text),
                     i64::from(r.vram_unchecked),
+                    r.watchdog,
                 ],
             )?;
             tx.commit()?;

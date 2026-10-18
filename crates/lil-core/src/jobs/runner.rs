@@ -33,6 +33,7 @@ use tracing::Instrument as _;
 
 use super::queue::{self, Candidate};
 use super::record::{self, Change, Inserted, JobRow};
+use super::scheduler::watchdog_slow;
 use super::{
     Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, DISK_MARGIN_BYTES, JOB_CANCELLED,
     JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion, JobCtx, JobDone, JobFailure,
@@ -173,6 +174,10 @@ struct Active {
     ctx: Option<Arc<JobCtx>>,
     progress: Option<Progress>,
     waiting_for_vram: bool,
+    /// When the current attempt became `executing` (monotonic): the watchdog's start.
+    exec_start: Option<Duration>,
+    /// The watchdog flagged it.
+    slow: bool,
 }
 
 #[derive(Default)]
@@ -189,6 +194,8 @@ struct Queue {
     next_order: u64,
     /// Set by the `PersistInterrupted` step: nothing starts or finishes any more.
     closed: bool,
+    /// What the admission was last told: a job runs or waits for VRAM.
+    busy: bool,
 }
 
 /// A state change applies only while the job, as the queue holds it, passes this check.
@@ -274,6 +281,16 @@ struct NewJob {
 impl Shared {
     fn queue(&self) -> MutexGuard<'_, Queue> {
         lock(&self.queue)
+    }
+
+    /// Tells the admission, under the queue's lock (so the calls keep the queue's order),
+    /// when whether any job runs or waits for VRAM changed.
+    fn tell_busy(&self, q: &mut Queue) {
+        let busy = q.jobs.values().any(|a| a.running || a.waiting_for_vram);
+        if busy != q.busy {
+            q.busy = busy;
+            read(&self.admission).busy(busy);
+        }
     }
 
     pub(crate) fn failpoints(&self) -> &Arc<FailPoints> {
@@ -384,6 +401,12 @@ impl Shared {
         let Some((before, row)) = record::update(scope.db(), id, c, self.now()).await? else {
             return Ok(None);
         };
+        if row.substatus == Some(Substatus::Executing)
+            && let Some(a) = self.queue().jobs.get_mut(id)
+            && a.exec_start.is_none()
+        {
+            a.exec_start = Some(self.clock.monotonic());
+        }
         self.announce(scope.workspace(), &row).await;
         if submitting
             && before != Some(Substatus::Submitting)
@@ -639,6 +662,8 @@ impl Shared {
                     ctx: None,
                     progress: None,
                     waiting_for_vram: false,
+                    exec_start: None,
+                    slow: false,
                 },
             );
             preempt
@@ -753,6 +778,7 @@ impl Shared {
                     }
                 }
             }
+            self.tell_busy(&mut q);
         }
         for (id, scope) in wait {
             let shared = self.clone();
@@ -864,6 +890,10 @@ impl Shared {
             }
             let mut first_attempt = true;
             loop {
+                // The watchdog measures each attempt from its own `execution_start`.
+                if let Some(a) = self.queue().jobs.get_mut(&id) {
+                    a.exec_start = None;
+                }
                 let initial = if info.spec.engine.is_some() {
                     Substatus::Submitting
                 } else {
@@ -1023,8 +1053,10 @@ impl Shared {
                 a.head = true;
                 a.preempted = false;
                 a.engine_cancel_sent = false;
+                a.exec_start = None;
                 a.cancel = watch::Sender::new(false);
             }
+            self.tell_busy(&mut q);
         }
         self.pump();
     }
@@ -1247,6 +1279,7 @@ impl Shared {
                 q.lanes[lane].running = None;
             }
             q.jobs.remove(info.id.as_str());
+            self.tell_busy(&mut q);
         }
         lock(&self.locks).remove(info.id.as_str());
         self.changed.send_modify(|n| *n += 1);
@@ -1281,6 +1314,46 @@ impl Shared {
             data["node"] = Value::from(node.as_str());
         }
         self.events.publish(&format!("job:{id}"), data);
+    }
+
+    /// The watchdog (ARCH-072, CORE-126): a running job past [`watchdog_slow`] since its
+    /// attempt became `executing` is flagged `watchdog: "slow"` once, with a `watchdog` event
+    /// on `job:<id>`. It never cancels.
+    fn watchdog(self: &Arc<Self>) {
+        let now = self.clock.monotonic();
+        let slow: Vec<(String, Scope)> = {
+            let mut q = self.queue();
+            q.jobs
+                .iter_mut()
+                .filter(|(_, a)| a.running && !a.completing && !a.slow)
+                .filter(|(_, a)| {
+                    a.exec_start.is_some_and(|start| {
+                        watchdog_slow(a.info.spec.expected_secs, now.saturating_sub(start))
+                    })
+                })
+                .map(|(id, a)| {
+                    a.slow = true;
+                    (id.clone(), a.info.scope.clone())
+                })
+                .collect()
+        };
+        for (id, scope) in slow {
+            let shared = self.clone();
+            tokio::spawn(async move {
+                tracing::warn!(job_id = %id, "a job runs more than 3 times its expected time; it keeps running");
+                let c = Change {
+                    watchdog: Some("slow".to_string()),
+                    ..Change::default()
+                };
+                let live: Guard = |a| a.running && !a.completing;
+                if shared.apply(&id, &scope, c, Some(live)).await.is_some() {
+                    shared.events.publish(
+                        &format!("job:{id}"),
+                        json!({"kind": "watchdog", "watchdog": "slow"}),
+                    );
+                }
+            });
+        }
     }
 
     /// Marks a job of this core that a shutdown leaves behind, as a recovery would; the
@@ -1320,13 +1393,16 @@ impl Shared {
                 .filter(|(_, a)| !a.completing)
                 .map(|(id, _)| id.clone())
                 .collect();
-            ids.into_iter()
+            let left = ids
+                .into_iter()
                 .filter_map(|id| q.jobs.remove(&id))
                 .map(|a| {
                     a.cancel.send_replace(true);
                     (a.info, a.running)
                 })
-                .collect()
+                .collect();
+            self.tell_busy(&mut q);
+            left
         };
         for (info, started) in &left {
             self.persist_one(info, *started).await;
@@ -1351,10 +1427,13 @@ impl Shared {
                 .filter(|(_, a)| !a.recording)
                 .map(|(id, _)| id.clone())
                 .collect();
-            ids.into_iter()
+            let late = ids
+                .into_iter()
                 .filter_map(|id| q.jobs.remove(&id))
                 .map(|a| a.info)
-                .collect()
+                .collect();
+            self.tell_busy(&mut q);
+            late
         };
         for info in &late {
             tracing::warn!(job_id = %info.id, "a job's completions did not finish before the shutdown; it is marked interrupted");
@@ -1423,7 +1502,7 @@ impl Jobs {
             .insert(h.kind(), h);
     }
 
-    /// Replaces the admission (Task 10's GPU scheduler).
+    /// Replaces the admission (the core sets the GPU scheduler).
     pub fn set_admission(&self, a: Arc<dyn Admission>) {
         *self
             .shared
@@ -1466,10 +1545,11 @@ impl Jobs {
         self.shared.preempt.store(on, Ordering::SeqCst);
     }
 
-    /// Looks at the lanes again: a job waiting for VRAM may start now (Task 10 calls it on each
-    /// telemetry sample).
+    /// Looks at the lanes again (a job waiting for VRAM may start now) and runs the watchdog.
+    /// The core calls it on every telemetry sample; it never blocks.
     pub fn kick(&self) {
         self.shared.pump();
+        self.shared.watchdog();
     }
 
     /// Submits `spec` in `caller`'s scope and returns it `queued` (ARCH-034): its row and its

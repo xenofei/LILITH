@@ -6,9 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 10
-    # ARCH-071, CORE-126
-    { name = "lil-spec-tests::jobs_queue::waiting_for_vram_until_memory_frees", rule = "ARCH-071", file = "tests/jobs_queue.rs" },
     # Task 11
     # ARCH-071
     { name = "lil-spec-tests::jobs_queue::an_engines_own_vram_counts_as_available", rule = "ARCH-071", file = "tests/jobs_queue.rs" },
