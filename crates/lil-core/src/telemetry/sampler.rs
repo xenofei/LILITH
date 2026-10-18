@@ -56,6 +56,8 @@ const SLACK: Duration = Duration::from_millis(100);
 
 /// Consecutive failed GPU reads before the source is opened again.
 const REOPEN_AFTER: u32 = 3;
+/// The most steps between two attempts to open a lost GPU again.
+const MAX_REOPEN_GAP: u32 = 60;
 /// A lost GPU's figures are estimated from its last power for at most this many steps.
 const HOLD_MAX_STEPS: u32 = 60;
 /// The GPU temperature that raises an alert (CORE-066).
@@ -140,6 +142,9 @@ struct GpuState {
     errors: u32,
     gap_steps: u32,
     after_gap: bool,
+    /// A counter reading has been seen from this device: a sample without one is then a missed
+    /// reading, not a device that has none.
+    counted: bool,
 }
 
 struct GpuFigures {
@@ -167,6 +172,7 @@ impl GpuState {
                 let after_gap = std::mem::take(&mut self.after_gap);
                 let direct = s.power_mw.or(s.power_instant_mw);
                 let mut derived = None;
+                self.counted |= s.energy_mj.is_some();
                 let energy = match s.energy_mj {
                     Some(cur) => match self.tracker.step(cur) {
                         CounterStep::Baseline if after_gap => {
@@ -180,6 +186,10 @@ impl GpuState {
                             Some((d, Basis::Measured))
                         }
                     },
+                    // A counter that missed one reading: no energy for this row. The baseline
+                    // stays, so the next delta carries this interval too, measured; integrating
+                    // the power here as well would count the interval twice (CORE-063).
+                    None if self.counted => None,
                     None => direct.map(|p| (integrate(est, p), Basis::Estimated)),
                 };
                 let power = match direct {
@@ -303,6 +313,9 @@ pub(crate) struct Sampler {
     sys: Box<dyn SysSource>,
     gpu_opener: Option<GpuOpener>,
     sizes_probe: Option<SizesProbe>,
+    /// Steps to wait before the next attempt to open the GPU, and the wait after a failure.
+    reopen_wait: u32,
+    reopen_gap: u32,
     power: PowerSettings,
     cadence: Cadence,
     gpu_state: GpuState,
@@ -330,6 +343,8 @@ impl Sampler {
             sys: src.sys,
             gpu_opener: None,
             sizes_probe: None,
+            reopen_wait: 0,
+            reopen_gap: REOPEN_AFTER,
             power,
             cadence: Cadence::default(),
             gpu_state: GpuState::default(),
@@ -361,6 +376,12 @@ impl Sampler {
     }
 
     /// The sample time for a step at `utc_ms`: strictly after the previous one.
+    /// Starts the sample times after `ts`, the newest a previous run stored: a clock that was
+    /// set back must not make this run write over rows that are there.
+    pub(crate) fn seed_ts(&mut self, ts: i64) {
+        self.last_ts = self.last_ts.max(ts);
+    }
+
     pub(crate) fn next_ts(&mut self, utc_ms: i64) -> i64 {
         let ts = utc_ms.max(self.last_ts.saturating_add(1));
         self.last_ts = ts;
@@ -374,12 +395,21 @@ impl Sampler {
         let tracked_pids: Vec<u32> = input.tracked.keys().copied().collect();
 
         // The GPU: reopened after repeated failures, then read.
+        // Each failed attempt doubles the steps before the next one, up to a minute: opening NVML
+        // is a DLL load and an init, and a GPU that is gone for good must not cost that each second.
         if self.gpu_state.errors >= REOPEN_AFTER
             && let Some(open) = self.gpu_opener.as_mut()
-            && let Some(source) = open()
         {
-            tracing::info!("the GPU source is open again");
-            self.gpu = Some(source);
+            if self.reopen_wait > 0 {
+                self.reopen_wait -= 1;
+            } else if let Some(source) = open() {
+                tracing::info!("the GPU source is open again");
+                self.gpu = Some(source);
+                self.reopen_gap = REOPEN_AFTER;
+            } else {
+                self.reopen_wait = self.reopen_gap;
+                self.reopen_gap = (self.reopen_gap * 2).min(MAX_REOPEN_GAP);
+            }
         }
         let gpu_read = self.gpu.as_mut().map(|g| g.sample());
         let gpu = self.gpu_state.figures(gpu_read, dt_ms);
@@ -403,7 +433,7 @@ impl Sampler {
             }
         }
 
-        let sys = self.sys.sample(&tracked_pids);
+        let sys = self.sys.sample(&tracked_pids, due.disks);
 
         // CPU power and energy.
         let meter_read = self.cpu_energy.as_mut().map(|m| m.sample());
@@ -420,9 +450,12 @@ impl Sampler {
                     free_mib: *free_mib,
                 })
                 .collect();
-            if let Some(probe) = self.sizes_probe.as_mut() {
-                self.sizes = probe();
-            }
+        }
+        // The folder sizes: every 5 minutes, and at every step until the first answer.
+        if (due.disks || self.sizes == Sizes::default())
+            && let Some(probe) = self.sizes_probe.as_mut()
+        {
+            self.sizes = probe();
         }
 
         // Network rates from the adapters' running totals.

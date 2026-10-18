@@ -25,7 +25,6 @@
 //!   caller sees one.
 
 pub mod profile;
-pub mod tools;
 
 mod db;
 mod energy;
@@ -33,7 +32,7 @@ mod sampler;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -91,7 +90,7 @@ impl std::fmt::Debug for HwSources {
 struct NoSys;
 
 impl SysSource for NoSys {
-    fn sample(&mut self, _tracked: &[u32]) -> SysSample {
+    fn sample(&mut self, _tracked: &[u32], _disks: bool) -> SysSample {
         SysSample::default()
     }
 }
@@ -424,7 +423,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// What there is before the first sample: nothing read, every part unknown.
-    fn empty(ts_ms: i64) -> Snapshot {
+    pub(crate) fn empty(ts_ms: i64) -> Snapshot {
         let part = |part, measured| SystemPart {
             part,
             mw: 0,
@@ -510,7 +509,9 @@ pub struct JobEnergyQuery {
 }
 
 /// The raw material of a job's energy over a stretch of time (`energy_between`): the totals of
-/// the samples in it, the shares of the GPU and the CPU by process, and the idle baselines
+/// the samples in it (the stretch is open at its start and closed at its end: a sample covers
+/// the second before its time, so two stretches that meet count the sample at the meeting point
+/// once), the shares of the GPU and the CPU by process, and the idle baselines
 /// before it.
 ///
 /// `sm_by_pid` is each process's SM utilisation summed over the stretch, in permille-seconds,
@@ -529,6 +530,24 @@ pub struct EnergySlice {
     pub idle_cpu_mw: Option<u32>,
     pub gpu_measured: bool,
     pub cpu_measured: bool,
+}
+
+/// The resolution `telemetry.series` uses when none is asked for: the finest that gives at most
+/// [`MAX_POINTS`] points of a range (a bucket counts when it holds any of the range, so one
+/// more than the span's whole buckets) and that the retention still holds: 1-second samples are
+/// kept 24 hours and 1-minute rows 30 days, so an older range gets a coarser answer than a
+/// finer one that would be empty.
+fn default_resolution(from: i64, to: i64, now: i64) -> Resolution {
+    const SECOND: i64 = 1000;
+    const MINUTE: i64 = 60 * SECOND;
+    let span = to - from;
+    if span < MAX_POINTS as i64 * SECOND && from >= now - db::KEEP_S1_MS {
+        Resolution::Second
+    } else if span <= (MAX_POINTS as i64 - 2) * MINUTE && from >= now - db::KEEP_M1_MS {
+        Resolution::Minute
+    } else {
+        Resolution::Hour
+    }
 }
 
 /// One point of a series: `[ts, min, average, max]`.
@@ -633,6 +652,9 @@ struct Inner {
     run: i64,
     /// The monotonic time of the start, ms: with `run`, it maps a monotonic time to a wall time.
     run_mono_ms: i64,
+    /// Held for a whole sample, from the step to the last hook, so concurrent samples (two
+    /// `test.hw_tick` calls) are stored and published in the order they were taken.
+    order: Mutex<()>,
     stepper: Mutex<Stepper>,
     latest: Mutex<Snapshot>,
     vram: Mutex<Option<VramView>>,
@@ -648,6 +670,7 @@ struct Inner {
 impl Inner {
     /// One sample: reads, stores, publishes.
     fn sample_once(&self) {
+        let _in_order = lock(&self.order);
         let mono = self.clock.monotonic();
         let out = {
             let mut stepper = lock(&self.stepper);
@@ -750,7 +773,10 @@ impl Telemetry {
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
         );
         let (run, run_mono_ms) = (unix_ms(started), mono_ms(clock.monotonic()));
-        let sampler = Sampler::new(src, power, mode == TickMode::Real);
+        let mut sampler = Sampler::new(src, power, mode == TickMode::Real);
+        if let Some(newest) = db.max_ts() {
+            sampler.seed_ts(newest);
+        }
         let has_gpu = sampler.has_gpu();
         let inner = Arc::new(Inner {
             clock,
@@ -759,6 +785,7 @@ impl Telemetry {
             db,
             run,
             run_mono_ms,
+            order: Mutex::new(()),
             stepper: Mutex::new(Stepper {
                 sampler,
                 virtual_secs: 0,
@@ -906,17 +933,7 @@ impl Telemetry {
                     "resolution {other:?} is not 1s, 1m or 1h"
                 )));
             }
-            // The finest resolution whose whole range fits in the point limit.
-            None => {
-                let span = to - from;
-                if span <= 3_600 * 1000 {
-                    Resolution::Second
-                } else if span <= 3_600 * 60_000 {
-                    Resolution::Minute
-                } else {
-                    Resolution::Hour
-                }
-            }
+            None => default_resolution(from, to, unix_ms(self.inner.clock.utc_now())),
         };
         let inner = self.inner.clone();
         let rows = tokio::task::spawn_blocking(move || {
@@ -1054,6 +1071,59 @@ async fn run_real(inner: Arc<Inner>, cancel: CancellationToken) {
     }
 }
 
+/// How long a measured folder size is kept before the folder is walked again.
+const SIZE_REFRESH: Duration = Duration::from_secs(270);
+
+/// A [`SizesProbe`] for the workspace folder (CORE-059): `workspace_mib` is the total size of the
+/// files under `root`, links not followed. A walk of a big workspace takes seconds, so the probe
+/// never walks on the sampler's thread: the first call starts a walk on a thread of its own and
+/// answers with nothing, and later calls answer with the last result and start a new walk when
+/// it is older than 4.5 minutes. `models_mib` is left for the engine that knows its models
+/// folder (plan 3 Task 11).
+pub fn folder_size_probe(root: PathBuf) -> SizesProbe {
+    // The newest total in MiB plus one; 0 is "not measured yet".
+    let total = Arc::new(AtomicU64::new(0));
+    let walking = Arc::new(AtomicBool::new(false));
+    let mut started: Option<std::time::Instant> = None;
+    Box::new(move || {
+        let stale = started.is_none_or(|at| at.elapsed() >= SIZE_REFRESH);
+        if stale && !walking.swap(true, Ordering::SeqCst) {
+            started = Some(std::time::Instant::now());
+            let (root, total, walking) = (root.clone(), total.clone(), walking.clone());
+            std::thread::spawn(move || {
+                total.store(folder_mib(&root) + 1, Ordering::SeqCst);
+                walking.store(false, Ordering::SeqCst);
+            });
+        }
+        Sizes {
+            workspace_mib: total.load(Ordering::SeqCst).checked_sub(1),
+            models_mib: None,
+        }
+    })
+}
+
+/// The size of the files under `root` in MiB (rounded down); links are not followed, and what
+/// can't be read counts as nothing.
+fn folder_mib(root: &std::path::Path) -> u64 {
+    let (mut bytes, mut pending) = (0_u64, vec![root.to_path_buf()]);
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                bytes += entry.metadata().map_or(0, |m| m.len());
+            }
+        }
+    }
+    bytes / (1024 * 1024)
+}
+
 /// The `telemetry` topic's snapshot (ARCH-044): the current [`Snapshot`]. Held weakly, because
 /// the telemetry holds the bus that holds the provider.
 struct TopicSnapshots {
@@ -1085,4 +1155,3 @@ pub fn register_snapshot(events: &EventBus, telemetry: &Arc<Telemetry>) {
 }
 
 pub use profile::profile_check;
-pub use tools::register_telemetry_tools;

@@ -262,14 +262,13 @@ fn create(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "user_version", USER_VERSION)
 }
 
-/// An existing file, checked: the schema version, `quick_check` and the tables. `Err` says
-/// why the file is not usable.
-fn check_existing(path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| e.to_string())?;
+/// Reads an existing file without touching it: the schema version, `quick_check` and the
+/// tables. The connection is read-only (`sqlite_files::open_untouched`), so it never
+/// checkpoints a `-wal` into the file, rolls a `-journal` back, or deletes a side file when it
+/// closes; a file that is then set aside keeps every byte it had (CORE-004).
+fn verify_existing(path: &Path) -> Result<(), String> {
+    let conn =
+        lil_platform::sqlite_files::open_untouched(path, false).map_err(|e| e.to_string())?;
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
@@ -290,6 +289,18 @@ fn check_existing(path: &Path) -> Result<Connection, String> {
         conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
             .map_err(|e| format!("table {table}: {e}"))?;
     }
+    Ok(())
+}
+
+/// An existing file, checked ([`verify_existing`]) and then opened for writing. `Err` says why
+/// the file is not usable.
+fn check_existing(path: &Path) -> Result<Connection, String> {
+    verify_existing(path)?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| e.to_string())?;
     configure(&conn).map_err(|e| e.to_string())?;
     Ok(conn)
 }
@@ -359,6 +370,14 @@ impl Db {
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // A statement that failed leaves the connection usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The newest sample time stored (`None` for an empty database).
+    pub(crate) fn max_ts(&self) -> Option<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT MAX(ts) FROM s1", [], |r| r.get(0))
+            .ok()
+            .flatten()
     }
 
     /// Flushes the write-ahead log into the database file (at shutdown).
@@ -507,9 +526,11 @@ impl Db {
         }
     }
 
-    /// The figures of the samples of core run `run` whose monotonic time is in `[from, to]`
+    /// The figures of the samples of core run `run` whose monotonic time is in `(from, to]`
     /// (milliseconds; the monotonic clock restarts with each core), and the idle baselines before
-    /// `from`: `wall_from` is `from` as a wall-clock time.
+    /// `from`: `wall_from` is `from` as a wall-clock time. A sample covers the second before its
+    /// time, so the window is open at `from`: two windows that meet at a time count its sample
+    /// once.
     pub(crate) fn slice(
         &self,
         run: i64,
@@ -525,7 +546,7 @@ impl Db {
         {
             let mut stmt = conn.prepare_cached(
                 "SELECT ts, est, gpu_energy, cpu_energy, cpu_ms_all FROM s1 \
-                 WHERE run = ?1 AND mono BETWEEN ?2 AND ?3 ORDER BY ts",
+                 WHERE run = ?1 AND mono > ?2 AND mono <= ?3 ORDER BY ts",
             )?;
             let mut found = stmt.query(params![run, from_mono, to_mono])?;
             while let Some(r) = found.next()? {

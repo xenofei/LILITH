@@ -51,6 +51,7 @@ use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
     Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry, register_hw_tick,
+    register_telemetry_tools,
 };
 use crate::workspace::WorkspaceHub;
 
@@ -427,7 +428,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         &cfg.probe,
         Arc::new(cfg.git_env.clone()),
     );
-    telemetry::register_telemetry_tools(&mut registry, &telemetry);
+    register_telemetry_tools(&mut registry, &telemetry);
     if cfg.test_tools {
         register_hw_tick(&mut registry, telemetry.clone());
     }
@@ -484,6 +485,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
+                    telemetry.set_sizes_probe(telemetry::folder_size_probe(open.ws.path.clone()));
                     telemetry::profile::spawn_check(telemetry, &open);
                 }
             }

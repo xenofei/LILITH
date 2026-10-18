@@ -28,7 +28,7 @@ use lil_platform::hw::{
     GpuFeatures, GpuMemSource, GpuSample, GpuSource, ProcGpuMem, SysSample, SysSource,
     ThrottleReasons,
 };
-use lil_platform::{Clock, IdSource, SystemClock};
+use lil_platform::{Clock, IdSource};
 use lil_testkit::{FakeClock, FakeHwScript, SeqIds, TestEnv, sha256_file};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -45,7 +45,7 @@ struct Rig {
     clock: Arc<FakeClock>,
     events: Arc<EventBus>,
     db: PathBuf,
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl Rig {
@@ -60,9 +60,19 @@ impl Rig {
     }
 
     fn over(sources: HwSources, power: PowerSettings, dir: tempfile::TempDir) -> Rig {
+        let db = dir.path().join("telemetry.db");
+        Rig::at(sources, power, db, Some(dir))
+    }
+
+    /// A telemetry on the database at `db` (which may be another rig's), with a clock of its own.
+    fn at(
+        sources: HwSources,
+        power: PowerSettings,
+        db: PathBuf,
+        dir: Option<tempfile::TempDir>,
+    ) -> Rig {
         let clock = FakeClock::new();
         let events = Arc::new(EventBus::new(clock.clone()));
-        let db = dir.path().join("telemetry.db");
         let telemetry = Telemetry::start(
             sources,
             db.clone(),
@@ -235,14 +245,21 @@ impl GpuMemSource for CountingMem {
     }
 }
 
-struct CountingSys(Arc<AtomicU64>);
+struct CountingSys(Arc<AtomicU64>, Arc<AtomicU64>);
 
 impl SysSource for CountingSys {
-    fn sample(&mut self, _tracked: &[u32]) -> SysSample {
+    fn sample(&mut self, _tracked: &[u32], disks: bool) -> SysSample {
         self.0.fetch_add(1, Ordering::SeqCst);
+        if disks {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
         SysSample {
             ram_total_mib: 100,
-            disks: vec![("C:\\".into(), 500)],
+            disks: if disks {
+                vec![("C:\\".into(), 500)]
+            } else {
+                Vec::new()
+            },
             ..SysSample::default()
         }
     }
@@ -252,7 +269,8 @@ impl SysSource for CountingSys {
 /// one while jobs run; the folder sizes every 300th (CORE-061).
 #[tokio::test] // spec: CORE-061
 async fn rates_follow_core_061() {
-    let (gpu, mem, sys_reads) = (
+    let (gpu, mem, sys_reads, disk_reads) = (
+        Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
@@ -261,7 +279,7 @@ async fn rates_follow_core_061() {
         gpu: Some(Box::new(CountingGpu(gpu.clone()))),
         gpu_mem: Some(Box::new(CountingMem(mem.clone()))),
         cpu_energy: None,
-        sys: Box::new(CountingSys(sys_reads.clone())),
+        sys: Box::new(CountingSys(sys_reads.clone(), disk_reads.clone())),
     };
     let rig = Rig::over(
         sources,
@@ -286,13 +304,28 @@ async fn rates_follow_core_061() {
     // 301 idle seconds (0 to 300): per-process memory at 0, 5, … 300; sizes at 0 and 300.
     let first = rig.telemetry.tick(1).await;
     assert_eq!(reads(), (1, 1, 1, 1), "the first sample reads everything");
+    assert_eq!(
+        disk_reads.load(Ordering::SeqCst),
+        1,
+        "disks are read at the first sample"
+    );
     assert_eq!(first.sizes.workspace_mib, Some(1));
     assert_eq!(first.disks.len(), 1);
     rig.telemetry.tick(299).await;
     assert_eq!(reads(), (300, 300, 60, 1));
+    assert_eq!(
+        disk_reads.load(Ordering::SeqCst),
+        1,
+        "not every second (Task 9 review M4)"
+    );
     assert_eq!(rig.telemetry.snapshot().sizes.workspace_mib, Some(1));
     let at_300 = rig.telemetry.tick(1).await;
     assert_eq!(reads(), (301, 301, 61, 2));
+    assert_eq!(
+        disk_reads.load(Ordering::SeqCst),
+        2,
+        "again after 5 minutes"
+    );
     assert_eq!(at_300.sizes.workspace_mib, Some(2));
 
     // Busy: per-process memory at every sample.
@@ -306,6 +339,7 @@ async fn rates_follow_core_061() {
     assert_eq!(reads().2, 71);
     rig.telemetry.tick(1).await;
     assert_eq!(reads().2, 72);
+    assert_eq!(disk_reads.load(Ordering::SeqCst), 2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1344,7 +1378,7 @@ async fn energy_between_reports_totals_shares_and_idle_baselines() {
     // The last quiet one is 65 s before the window: it doesn't count.
     rig.telemetry.track(200, "comfyui");
     rig.run(80).await;
-    let (from, to) = (Duration::from_secs(70), Duration::from_secs(79));
+    let (from, to) = (Duration::from_secs(69), Duration::from_secs(79));
     let slice = rig.telemetry.energy_between(from, to).await;
     assert_eq!(slice.idle_gpu_mw, Some(42_000));
     assert_eq!(slice.gpu_mj, 2_000_000, "ten seconds at 200 W");
@@ -1368,15 +1402,15 @@ async fn idle_baseline_falls_back_to_the_lowest_minute_then_to_unknown() {
             readings.push(gpu(minute_power, counter));
         }
     }
-    for _ in 0..10 {
+    for _ in 0..11 {
         counter += 200_000;
         readings.push(gpu(200_000, counter));
     }
     let rig = Rig::new(&script(readings, vec![sys(0)]));
-    rig.run(190).await;
+    rig.run(191).await;
     let slice = rig
         .telemetry
-        .energy_between(Duration::from_secs(180), Duration::from_secs(189))
+        .energy_between(Duration::from_secs(180), Duration::from_secs(190))
         .await;
     assert_eq!(slice.idle_gpu_mw, Some(55_000));
     assert_eq!(slice.gpu_mj, 2_000_000);
@@ -1423,25 +1457,25 @@ async fn vram_and_the_sample_hook_serve_the_scheduler() {
 }
 
 /// A real-mode telemetry samples on its own, once a second, and stops when told to. The test
-/// only waits (against a deadline) for samples to arrive.
-#[tokio::test] // spec: CORE-061
+/// runs on tokio's paused clock and the `FakeClock`: the sampler's timer jumps ahead while the
+/// test waits, so it takes no wall time (Task 9 review M8).
+#[tokio::test(start_paused = true)] // spec: CORE-061
 async fn the_real_sampler_runs_on_its_own_and_stops() {
     let dir = tempfile::tempdir().unwrap();
-    let events = Arc::new(EventBus::new(Arc::new(SystemClock::new())));
+    let clock = FakeClock::new();
+    let events = Arc::new(EventBus::new(clock.clone()));
     let sources = HwSources::from_fake(
         FakeHwScript::new(script(vec![gpu(100_000, 1000)], vec![sys(100)])).sources(),
     );
     let telemetry = Telemetry::start(
         sources,
         dir.path().join("telemetry.db"),
-        Arc::new(SystemClock::new()),
+        clock,
         PowerSettings::default(),
         events,
         TickMode::Real,
     );
-    let snap = tokio::time::timeout(Duration::from_secs(20), telemetry.wait_for_samples(2))
-        .await
-        .expect("two samples arrive");
+    let snap = telemetry.wait_for_samples(2).await;
     assert!(snap.gpu.is_some());
     // `tick` belongs to the manual mode: the real sampler takes no extra samples for it.
     let before = telemetry.sample_count();
@@ -1638,4 +1672,293 @@ async fn the_topic_snapshot_is_the_snapshot() {
         message["params"]["data"],
         serde_json::to_value(rig.telemetry.snapshot()).unwrap()
     );
+}
+
+/// A window is open at its start: two windows that meet at a sample count it once, and the
+/// sample at exactly the start belongs to the window before (Task 9 review M5).
+#[tokio::test] // spec: CORE-065
+async fn windows_that_meet_count_their_shared_sample_once() {
+    let rig = Rig::new(&script(
+        (0..30).map(|i| gpu(100_000, i * 100_000)).collect(),
+        vec![sys(0)],
+    ));
+    rig.run(30).await;
+    let at = Duration::from_secs;
+    let first = rig.telemetry.energy_between(at(0), at(10)).await;
+    let second = rig.telemetry.energy_between(at(10), at(20)).await;
+    let whole = rig.telemetry.energy_between(at(0), at(20)).await;
+    assert_eq!(
+        (first.gpu_mj, second.gpu_mj, whole.gpu_mj),
+        (1_000_000, 1_000_000, 2_000_000),
+        "ten one-second samples each; the one at 10 s is in the first window only"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fixes of Task 9's review.
+// ---------------------------------------------------------------------------------------------
+
+/// A GPU that answers NotSupported for one field (the NVML source turns that into an unknown
+/// field: power `None`, temperature, clocks and throttle reasons 0, no per-process shares) is not
+/// a lost GPU: the sample stays the device's own, the VRAM view stays, and no alert follows from
+/// a 0 (I1). The same GPU with each field missing in turn.
+#[tokio::test] // spec: CORE-059, ARCH-071
+async fn a_gpu_missing_any_one_optional_field_is_never_read_as_lost() {
+    for missing in [
+        "power_mw",
+        "temp_c",
+        "sm_clock_mhz",
+        "mem_clock_mhz",
+        "throttle",
+        "sm_by_pid",
+    ] {
+        let mut entry = gpu(100_000, 1000);
+        entry["sm_by_pid"] = json!([[7, 500]]);
+        entry.as_object_mut().unwrap().shift_remove(missing);
+        let rig = Rig::new(&script(vec![entry], vec![sys(100)]));
+        let snap = rig.run(3).await;
+        let shown = snap
+            .gpu
+            .as_ref()
+            .unwrap_or_else(|| panic!("{missing}: no GPU"));
+        assert!(shown.measured, "{missing}: the sample is the device's own");
+        assert_eq!(shown.vram_total_mib, 16384, "{missing}");
+        assert!(
+            rig.telemetry.vram().is_some(),
+            "{missing}: the VRAM check stays"
+        );
+        assert!(snap.alerts.is_empty(), "{missing}: nothing to alert on");
+        assert_eq!(rig.series("gpu.util", "1s").await.len(), 3, "{missing}");
+        assert_eq!(rig.series("gpu.energy", "1s").await.len(), 3, "{missing}");
+    }
+}
+
+/// A damaged database's side files are set aside with their bytes: the check reads the file
+/// read-only, so the old `-wal` is not checkpointed into it and deleted (I2).
+#[tokio::test] // spec: CORE-004
+async fn a_damaged_databases_wal_is_set_aside_with_its_bytes() {
+    let source = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (db, wal) = (
+        dir.path().join("telemetry.db"),
+        dir.path().join("telemetry.db-wal"),
+    );
+    {
+        // A database of another version whose newest pages are still in the WAL, as after a
+        // crash: copied while its connection is open, with no checkpoint.
+        let conn = rusqlite::Connection::open(source.path().join("telemetry.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE t (x); INSERT INTO t VALUES (1), (2), (3); PRAGMA user_version=7;",
+        )
+        .unwrap();
+        let copy = |from: &str, to: &Path| {
+            lil_testkit::files::write_file(
+                to,
+                &std::fs::read(source.path().join(from)).expect("the source file is there"),
+            );
+        };
+        copy("telemetry.db", &db);
+        copy("telemetry.db-wal", &wal);
+    }
+    let (db_sha, wal_sha) = (sha256_file(&db), sha256_file(&wal));
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+
+    let rig = Rig::over(
+        HwSources::from_fake(FakeHwScript::new(script(vec![gpu(1, 1)], vec![sys(0)])).sources()),
+        PowerSettings::default(),
+        dir,
+    );
+    rig.run(2).await;
+    assert_eq!(
+        rig.series("ram.used", "1s").await.len(),
+        2,
+        "a new database answers"
+    );
+    let folder = rig.db.parent().unwrap();
+    let kept = |name: &str| folder.join(format!("{name}.damaged-20270115T080000Z"));
+    assert_eq!(
+        sha256_file(&kept("telemetry.db")),
+        db_sha,
+        "the old file is as it was"
+    );
+    assert_eq!(
+        sha256_file(&kept("telemetry.db-wal")),
+        wal_sha,
+        "the old write-ahead log was renamed aside, not consumed"
+    );
+}
+
+/// A sample that misses the energy counter between two that have it does not count its
+/// interval twice: the next delta carries the whole interval, measured (I3).
+#[tokio::test] // spec: CORE-063
+async fn a_missed_counter_reading_does_not_count_its_interval_twice() {
+    let mut missed = gpu(100_000, 0);
+    missed.as_object_mut().unwrap().shift_remove("energy_mj");
+    let rig = Rig::new(&script(
+        vec![gpu(100_000, 0), missed, gpu(100_000, 200_000)],
+        vec![sys(0)],
+    ));
+    rig.run(3).await;
+    assert_eq!(rig.total("gpu.energy", "1s").await, 200_000.0);
+    assert_eq!(
+        rig.series("gpu.energy", "1s").await.len(),
+        2,
+        "no energy for the missed row"
+    );
+    assert!(
+        rig.est_bits().iter().all(|bits| bits & 2 == 0),
+        "nothing was estimated"
+    );
+}
+
+/// The default resolution never promises more than the point limit, and does not pick a
+/// resolution whose rows are gone (M1).
+#[tokio::test] // spec: CORE-062
+async fn the_default_resolution_fits_the_limit_and_the_retention() {
+    let rig = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
+    rig.run(3601).await;
+    let range = |from: i64, to: i64| SeriesQuery {
+        metrics: vec!["gpu.util".into()],
+        from: format_ts(from),
+        to: format_ts(to),
+        resolution: None,
+    };
+    // One hour of 1 Hz samples, both ends included, is 3,601 of them: it must not be asked of
+    // the 1-second rows.
+    let got = rig
+        .telemetry
+        .series(range(T0_MS, T0_MS + 3_600_000))
+        .await
+        .expect("the default resolution fits");
+    assert_eq!(got.series[0].points.len(), 61, "minute rows");
+    let short = rig
+        .telemetry
+        .series(range(T0_MS, T0_MS + 3_599_000))
+        .await
+        .unwrap();
+    assert_eq!(short.series[0].points.len(), 3600, "one second apart");
+
+    // Two days on, a half-hour range from the first day has no 1-second rows left: minute rows.
+    rig.clock.advance(Duration::from_secs(2 * 86_400));
+    rig.telemetry.tick(1).await;
+    let old = rig
+        .telemetry
+        .series(range(T0_MS, T0_MS + 1_800_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        old.series[0].points.len(),
+        31,
+        "minute rows, not an empty answer"
+    );
+}
+
+/// Samples taken at once are stored and published in the order they were taken (M2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-066
+async fn concurrent_samples_are_published_in_order() {
+    let rig = Rig::new(&script(vec![gpu(100_000, 1000)], vec![sys(100)]));
+    let ticks: Vec<_> = (0..12)
+        .map(|_| {
+            let t = rig.telemetry.clone();
+            tokio::spawn(async move { t.tick(1).await })
+        })
+        .collect();
+    for t in ticks {
+        t.await.unwrap();
+    }
+    let times: Vec<String> = rig
+        .events()
+        .await
+        .iter()
+        .filter(|e| e["kind"] == "sample")
+        .map(|e| e["snapshot"]["ts"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(times.len(), 12);
+    assert!(times.windows(2).all(|w| w[0] < w[1]), "{times:?}");
+    assert_eq!(rig.telemetry.snapshot().ts, *times.last().unwrap());
+}
+
+/// A lost GPU that stays lost is not opened again every second: the attempts back off, 3, 6, 12,
+/// 24 … steps apart (M6).
+#[tokio::test] // spec: CORE-059
+async fn reopening_a_lost_gpu_backs_off() {
+    let lost = json!({"error": "NVML: the driver was unloaded"});
+    let rig = Rig::new(&script(vec![gpu(100_000, 1000), lost], vec![sys(100)]));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let counted = attempts.clone();
+    rig.telemetry.set_gpu_opener(Box::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        None
+    }));
+    rig.run(61).await;
+    // At the starts of steps 5, 9, 16, 29 and 54 (3, 7, 14, 27 and 52 failures in).
+    assert_eq!(attempts.load(Ordering::SeqCst), 5);
+}
+
+/// A database that already holds samples from a run whose clock was ahead does not make this
+/// run's samples collide with them (M7).
+#[tokio::test] // spec: CORE-062
+async fn a_clock_set_back_between_runs_does_not_lose_samples() {
+    let hw = script(vec![gpu(100_000, 1000)], vec![sys(100)]);
+    let first = Rig::new(&hw);
+    first.run(3).await;
+    // The second run's clock starts at the same instant as the first run's did.
+    let second = Rig::at(
+        HwSources::from_fake(FakeHwScript::new(hw).sources()),
+        PowerSettings::default(),
+        first.db.clone(),
+        None,
+    );
+    second.run(3).await;
+    assert_eq!(first.series("ram.used", "1s").await.len(), 6);
+}
+
+/// The folder-size probe never blocks the sampler: it answers nothing at first, walks on a
+/// thread of its own, and then answers with the size (M9); and the sampler asks again at every
+/// step until the first answer, then every 5 minutes.
+#[tokio::test] // spec: CORE-059
+async fn folder_sizes_are_measured_off_the_sampler_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let mib = vec![1_u8; 1024 * 1024];
+    lil_testkit::files::write_file(
+        &dir.path().join("a.bin"),
+        &[mib.clone(), mib.clone()].concat(),
+    );
+    lil_testkit::files::write_file(&dir.path().join("sub").join("b.bin"), &mib);
+    lil_testkit::files::write_file(&dir.path().join("sub").join("small.txt"), b"x");
+    let mut probe = lil_core::telemetry::folder_size_probe(dir.path().to_path_buf());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let sizes = loop {
+        let sizes = probe();
+        if sizes.workspace_mib.is_some() {
+            break sizes;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the walk never finished"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!((sizes.workspace_mib, sizes.models_mib), (Some(3), None));
+
+    let rig = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
+    let calls = Arc::new(AtomicU64::new(0));
+    let counted = calls.clone();
+    rig.telemetry.set_sizes_probe(Box::new(move || {
+        match counted.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => Sizes::default(),
+            _ => Sizes {
+                workspace_mib: Some(7),
+                models_mib: None,
+            },
+        }
+    }));
+    let snap = rig.run(10).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "asked until it answered, then left alone"
+    );
+    assert_eq!(snap.sizes.workspace_mib, Some(7));
 }

@@ -2,10 +2,12 @@
 //!
 //! | Tool | Effect | Arguments | `structured` |
 //! |---|---|---|---|
-//! | `telemetry.snapshot` | read | `{}` | the [`Snapshot`](super::Snapshot) |
+//! | `telemetry.snapshot` | read | `{}` | the [`Snapshot`](crate::telemetry::Snapshot) |
 //! | `telemetry.series` | read | `{metrics, from, to, resolution?}` | `{series: [{metric, points: [[ts, min, avg, max]]}]}` |
 //!
-//! `telemetry.jobs` is `meter`'s (plan 3 Task 15): [`Telemetry::job_energy`] is ready for it.
+//! They live in `tools`, not in `telemetry`, so that `telemetry` depends on no `tools` type
+//! (CORE-010); `telemetry.jobs` is `meter`'s (plan 3 Task 15) and goes here too:
+//! [`Telemetry::job_energy`] is ready for it.
 
 use std::sync::Arc;
 
@@ -13,9 +15,9 @@ use lil_protocol::EffectClass;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{Series, SeriesQuery, Snapshot, TELEMETRY_MODULE, Telemetry};
-use crate::tools::{Registry, typed_tool};
+use super::registry::{Registry, typed_tool};
 
+use crate::telemetry::{Series, SeriesQuery, Snapshot, TELEMETRY_MODULE, Telemetry};
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}

@@ -97,69 +97,94 @@ impl GpuSource for NvmlGpu {
 
         let mut sm_by_pid = Vec::new();
         if features.process_sm {
-            match device.process_utilization_stats(self.last_seen_us) {
-                Ok(samples) => {
-                    // Average each process's samples over the window.
-                    let mut per_pid: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
-                    for s in &samples {
-                        let entry = per_pid.entry(s.pid).or_default();
-                        entry.0 += u64::from(s.sm_util.min(100));
-                        entry.1 += 1;
-                        self.last_seen_us = self.last_seen_us.max(Some(s.timestamp));
-                    }
-                    sm_by_pid = per_pid
-                        .into_iter()
-                        .filter(|&(pid, _)| pid != 0)
-                        .map(|(pid, (sum, n))| (pid, (sum * 10 / n) as u16))
-                        .collect();
+            // No process used the GPU in the window, or the driver won't say: either way this
+            // sample has no per-process shares, and the rest of it stands.
+            if let Ok(samples) = device.process_utilization_stats(self.last_seen_us) {
+                // Average each process's samples over the window.
+                let mut per_pid: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+                for s in &samples {
+                    let entry = per_pid.entry(s.pid).or_default();
+                    entry.0 += u64::from(s.sm_util.min(100));
+                    entry.1 += 1;
+                    self.last_seen_us = self.last_seen_us.max(Some(s.timestamp));
                 }
-                // No process used the GPU in the window.
-                Err(NvmlError::NotFound) => {}
-                Err(e) => return Err(nvml_error(e)),
+                sm_by_pid = per_pid
+                    .into_iter()
+                    .filter(|&(pid, _)| pid != 0)
+                    .map(|(pid, (sum, n))| (pid, (sum * 10 / n) as u16))
+                    .collect();
             }
         }
 
-        Ok(GpuSample {
-            name: self.name.clone(),
-            driver: self.driver.clone(),
-            util_pct: util.gpu.min(100) as u8,
-            power_mw: supported(device.power_usage()).map_err(nvml_error)?,
-            power_instant_mw: if features.instant_power {
-                instant_power(&device.field_values_for(&[FieldId(NVML_FI_DEV_POWER_INSTANT)]))
-            } else {
-                None
+        let mut sample = assemble(
+            (&self.name, &self.driver),
+            Readings {
+                util: Ok(util.gpu),
+                memory: Ok((memory.total, memory.used)),
+                power: device.power_usage(),
+                temp: device.temperature(TemperatureSensor::Gpu),
+                sm_clock: device.clock_info(Clock::SM),
+                mem_clock: device.clock_info(Clock::Memory),
+                throttle: device.current_throttle_reasons().map(|r| r.bits()),
             },
-            energy_mj: if features.energy_counter {
-                device.total_energy_consumption().ok()
-            } else {
-                None
-            },
-            temp_c: device
-                .temperature(TemperatureSensor::Gpu)
-                .map_err(nvml_error)?
-                .min(255) as u8,
-            sm_clock_mhz: device.clock_info(Clock::SM).map_err(nvml_error)?,
-            mem_clock_mhz: device.clock_info(Clock::Memory).map_err(nvml_error)?,
-            fan_pct: if features.fan {
-                device.fan_speed(0).ok().map(|v| v.min(100) as u8)
-            } else {
-                None
-            },
-            throttle: ThrottleReasons(
-                device
-                    .current_throttle_reasons()
-                    .map_err(nvml_error)?
-                    .bits(),
-            ),
-            vram_total_mib: memory.total / MIB,
-            vram_used_mib: memory.used / MIB,
-            sm_by_pid,
-        })
+        )?;
+        if features.instant_power {
+            sample.power_instant_mw =
+                instant_power(&device.field_values_for(&[FieldId(NVML_FI_DEV_POWER_INSTANT)]));
+        }
+        if features.energy_counter {
+            sample.energy_mj = device.total_energy_consumption().ok();
+        }
+        if features.fan {
+            sample.fan_pct = device.fan_speed(0).ok().map(|v| v.min(100) as u8);
+        }
+        sample.sm_by_pid = sm_by_pid;
+        Ok(sample)
     }
 
     fn features(&self) -> GpuFeatures {
         self.features
     }
+}
+
+/// What one sample read from the device, field by field.
+struct Readings {
+    util: Result<u32, NvmlError>,
+    /// `(total, used)` in bytes.
+    memory: Result<(u64, u64), NvmlError>,
+    power: Result<u32, NvmlError>,
+    temp: Result<u32, NvmlError>,
+    sm_clock: Result<u32, NvmlError>,
+    mem_clock: Result<u32, NvmlError>,
+    throttle: Result<u64, NvmlError>,
+}
+
+/// The sample from the readings. GeForce support in NVML is limited (CORE-059): a field the GPU
+/// answers `NotSupported` for is unknown, never a reason to fail the sample (and so to read the
+/// GPU as lost). Power stays `None`; temperature, clocks and throttle reasons, which Appendix F
+/// pins as numbers, read 0 (no alert follows from a 0). Utilisation and memory are the
+/// sample's core: if the device can't give them, or any field gives an error other than
+/// `NotSupported` (the GPU is gone, say), the sample fails.
+fn assemble(identity: (&str, &str), r: Readings) -> io::Result<GpuSample> {
+    let util = r.util.map_err(nvml_error)?;
+    let (total, used) = r.memory.map_err(nvml_error)?;
+    let optional = |read: Result<u32, NvmlError>| supported(read).map_err(nvml_error);
+    Ok(GpuSample {
+        name: identity.0.to_string(),
+        driver: identity.1.to_string(),
+        util_pct: util.min(100) as u8,
+        power_mw: optional(r.power)?,
+        power_instant_mw: None,
+        energy_mj: None,
+        temp_c: optional(r.temp)?.unwrap_or(0).min(255) as u8,
+        sm_clock_mhz: optional(r.sm_clock)?.unwrap_or(0),
+        mem_clock_mhz: optional(r.mem_clock)?.unwrap_or(0),
+        fan_pct: None,
+        throttle: ThrottleReasons(supported(r.throttle).map_err(nvml_error)?.unwrap_or(0)),
+        vram_total_mib: total / MIB,
+        vram_used_mib: used / MIB,
+        sm_by_pid: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -179,5 +204,136 @@ mod tests {
             supported::<u32>(Err(NvmlError::Unknown)),
             Err(NvmlError::Unknown)
         ));
+    }
+
+    fn readings() -> Readings {
+        Readings {
+            util: Ok(42),
+            memory: Ok((16 * 1024 * MIB, 2 * 1024 * MIB)),
+            power: Ok(150_000),
+            temp: Ok(61),
+            sm_clock: Ok(1800),
+            mem_clock: Ok(9000),
+            throttle: Ok(0x40),
+        }
+    }
+
+    /// A GeForce may answer NotSupported for any one of power, temperature, clocks and throttle
+    /// reasons: each in turn leaves the sample whole (so the GPU is never read as lost), with
+    /// that field unknown (0, or `None` for power) and the others as read (Task 9 review I1).
+    #[test] // spec: CORE-059
+    fn any_one_unsupported_optional_field_leaves_the_sample_whole() {
+        let id = ("GPU", "1.0");
+        let full = assemble(id, readings()).unwrap();
+        assert_eq!(
+            (
+                full.power_mw,
+                full.temp_c,
+                full.sm_clock_mhz,
+                full.mem_clock_mhz,
+                full.throttle.0
+            ),
+            (Some(150_000), 61, 1800, 9000, 0x40)
+        );
+        assert_eq!(
+            (full.util_pct, full.vram_total_mib, full.vram_used_mib),
+            (42, 16384, 2048)
+        );
+        let no = || Err::<u32, _>(NvmlError::NotSupported);
+        let no_flags = || Err::<u64, _>(NvmlError::NotSupported);
+        let cases: [(Readings, &str); 5] = [
+            (
+                Readings {
+                    power: no(),
+                    ..readings()
+                },
+                "power",
+            ),
+            (
+                Readings {
+                    temp: no(),
+                    ..readings()
+                },
+                "temp",
+            ),
+            (
+                Readings {
+                    sm_clock: no(),
+                    ..readings()
+                },
+                "sm_clock",
+            ),
+            (
+                Readings {
+                    mem_clock: no(),
+                    ..readings()
+                },
+                "mem_clock",
+            ),
+            (
+                Readings {
+                    throttle: no_flags(),
+                    ..readings()
+                },
+                "throttle",
+            ),
+        ];
+        for (r, which) in cases {
+            let s = assemble(id, r).unwrap_or_else(|e| panic!("{which} unsupported: {e}"));
+            assert_eq!((s.util_pct, s.vram_total_mib), (42, 16384), "{which}");
+            let unknown = |name: &str| which == name;
+            assert_eq!(s.power_mw.is_none(), unknown("power"), "{which}");
+            assert_eq!(s.temp_c == 0, unknown("temp"), "{which}");
+            assert_eq!(s.sm_clock_mhz == 0, unknown("sm_clock"), "{which}");
+            assert_eq!(s.mem_clock_mhz == 0, unknown("mem_clock"), "{which}");
+            assert_eq!(s.throttle.0 == 0, unknown("throttle"), "{which}");
+        }
+    }
+
+    /// What is not tolerated: no utilisation or memory, and any other error in an optional
+    /// field (a GPU that is gone is not an unsupported field).
+    #[test] // spec: CORE-059
+    fn a_missing_core_field_or_a_real_error_still_fails_the_sample() {
+        let id = ("GPU", "1.0");
+        assert!(
+            assemble(
+                id,
+                Readings {
+                    util: Err(NvmlError::NotSupported),
+                    ..readings()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            assemble(
+                id,
+                Readings {
+                    memory: Err(NvmlError::NotSupported),
+                    ..readings()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            assemble(
+                id,
+                Readings {
+                    temp: Err(NvmlError::GpuLost),
+                    ..readings()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            assemble(
+                id,
+                Readings {
+                    throttle: Err(NvmlError::Unknown),
+                    ..readings()
+                }
+            )
+            .is_err()
+        );
     }
 }

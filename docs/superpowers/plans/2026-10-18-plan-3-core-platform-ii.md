@@ -912,7 +912,7 @@ git commit -m "jobs: records, lanes, suite-held queue, recovery, job tools; disp
 ### Task 9: `telemetry`: sampling, `telemetry.db`, energy, estimates, alerts and the hardware profile (CORE-004, CORE-005, CORE-059–064, CORE-066–068)
 
 **Files:**
-- Create: `crates/lil-core/src/telemetry/{mod.rs, sampler.rs, db.rs, energy.rs, profile.rs, tools.rs}`.
+- Create: `crates/lil-core/src/telemetry/{mod.rs, sampler.rs, db.rs, energy.rs, profile.rs}` and `crates/lil-core/src/tools/telemetry_tools.rs` (the telemetry tools live in `tools`, so `telemetry` depends on no `tools` type: CORE-010).
 - Modify: `crates/lil-core/src/{server/mod.rs, config.rs, tools/test_tools.rs, tools/mod.rs}`, `crates/lil-core/src/store/fsops.rs` (setting a damaged `telemetry.db` aside through `lil_platform::sqlite_files::set_aside`).
 - Test: `crates/lil-core/tests/telemetry.rs` (fake sources, `FakeClock`), unit tests in `telemetry/`.
 
@@ -1026,6 +1026,7 @@ git commit -m "jobs: GPU scheduler with Local Usage free-VRAM wait, engine-own V
 - Create: `crates/lil-core/src/meter/{mod.rs, sink.rs}`: the usage types below and a logging `UsageSink` stand-in, which Task 15 replaces.
 - Modify: `crates/lil-core/Cargo.toml` (`reqwest.workspace = true`, its async API), `crates/lil-core/src/{server/mod.rs, tools/mod.rs}`, `crates/lil-core/src/store/{suite_toml.rs, fsops.rs}` (reading `[engines.comfyui]`; `remove_engine_file`).
 - Test: `crates/lil-core/tests/engines.rs` (the `lil-fake-comfyui` binary and `FakeComfy`).
+- Carry from Task 9: fill `Snapshot.sizes.models_mib`. The core already measures `workspace_mib` (`telemetry::folder_size_probe`, set when the default workspace opens); once the ComfyUI `root` is known, set a probe that also measures `<root>models` (same off-thread walk) with `Telemetry::set_sizes_probe`.
 
 **Interfaces:**
 - Consumes: Task 5's `spawn_engine`, `KillOnCloseJob`, `listening_sockets`, `pid_listening_on`; Task 8's `Jobs`, `BillingBasis` and `Money`; Task 10's `EngineControl`.
@@ -1287,7 +1288,8 @@ git commit -m "confirm: agent safety confirmations, app answers, retry by idempo
 
 **Files:**
 - Create: `crates/lil-core/src/meter/{record.rs, attribution.rs, summary.rs, stage.rs, tools.rs}`. Modify: `crates/lil-schema/src/money.rs` (completed), `crates/lil-core/src/meter/{mod.rs, sink.rs}` (the stand-in goes).
-- Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 6), `crates/lil-core/src/telemetry/tools.rs` (`telemetry.jobs`), `crates/lil-core/src/tools/test_tools.rs` (`test.meter_external` without caps), `crates/lil-core/src/store/failpoints.rs` (`meter.after_pending`, fired after the pending row commits; `meter.after_usage_line`, fired after the log line and before any settle).
+- Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 6), `crates/lil-core/src/tools/telemetry_tools.rs` (`telemetry.jobs`), `crates/lil-core/src/tools/test_tools.rs` (`test.meter_external` without caps), `crates/lil-core/src/store/failpoints.rs` (`meter.after_pending`, fired after the pending row commits; `meter.after_usage_line`, fired after the log line and before any settle).
+- Carry from Task 9 (review ruling 5): `EnergySlice.cpu_ms_by_pid` holds every untracked process together under pid 0, so the CPU share is the engine pids' `cpu_ms` divided by the map's sum, pid 0 included, never by the sum over tracked pids only. `energy_between` takes samples in `(from, to]` (open at the start). `cpu_measured: false` covers both estimated and unknown CPU.
 - Usage lines go through the existing append-log home, `crates/lil-core/src/store/logs.rs`: `Store::append_log(LogKind::Usage, …)` with a workspace, `logs::append_loose_usage(env, record)` without one (Global Constraints, "File writes in `lil-core`"). Nothing in `meter` writes a file itself.
 - Test: `crates/lil-schema/tests/money.rs` (proptest), `crates/lil-core/tests/meter.rs`, `crates/lil-testkit/tests/money_has_no_float_constructor.rs`.
 

@@ -4,7 +4,9 @@
 //!
 //! The key is `hardware: {gpu, vram_gb, ram_gb, detected}`: `gpu` is the name NVML gives (or
 //! `none` without a GPU), the sizes are in GB rounded to the nearest, `detected` is the UTC date
-//! of the reading. Only `lilith.yaml` is written: a workspace that still has only the legacy
+//! of the reading. The `hardware:` key is **machine-owned**: when it changes, the
+//! whole block is rewritten (CORE-067), so a comment or a key added by hand inside it does not
+//! survive; comments and keys around it do. Only `lilith.yaml` is written: a workspace that still has only the legacy
 //! file keeps it untouched (R4), and a read-only workspace is not written either.
 
 use std::sync::Arc;
@@ -112,10 +114,31 @@ pub async fn profile_check(open: &OpenWorkspace, snap: &Snapshot) -> Result<bool
     Ok(true)
 }
 
+/// Whether the profile can be checked with a snapshot, `samples` samples in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// A GPU reading is still to come.
+    Wait,
+    Check,
+    /// There is a GPU but it never answered: what the machine has is not known, and `none`
+    /// would be a false value in a file that is committed.
+    Skip,
+}
+
+fn verdict(snap: &Snapshot, has_gpu: bool, samples: u64) -> Verdict {
+    if snap.gpu.is_some() || !has_gpu {
+        Verdict::Check
+    } else if samples >= GPU_PATIENCE {
+        Verdict::Skip
+    } else {
+        Verdict::Wait
+    }
+}
+
 /// Checks `open`'s profile once, on the first reading that settles what the machine has (a
-/// reading with a GPU, or, for a machine with none, the first one; at most
-/// [`GPU_PATIENCE`] samples for a GPU that is slow to answer). It does nothing if the
-/// telemetry stops or the workspace is gone first.
+/// reading with a GPU, or, for a machine with no GPU source, the first one). A GPU that has not
+/// answered after [`GPU_PATIENCE`] samples is skipped, with a log line: nothing is written
+/// rather than `none`. It does nothing if the telemetry stops or the workspace is gone first.
 pub fn spawn_check(telemetry: Arc<Telemetry>, open: &Arc<OpenWorkspace>) {
     let open = Arc::downgrade(open);
     let stopped = telemetry.stopped();
@@ -124,16 +147,22 @@ pub fn spawn_check(telemetry: Arc<Telemetry>, open: &Arc<OpenWorkspace>) {
             let mut want = 1;
             loop {
                 let snap = telemetry.wait_for_samples(want).await;
-                if snap.gpu.is_some() || !telemetry.has_gpu() || want >= GPU_PATIENCE {
-                    return snap;
+                match verdict(&snap, telemetry.has_gpu(), want) {
+                    Verdict::Wait => want += 1,
+                    v => return (v, snap),
                 }
-                want += 1;
             }
         };
-        let snap = tokio::select! {
+        let (verdict, snap) = tokio::select! {
             () = stopped.cancelled() => return,
-            snap = settled => snap,
+            settled = settled => settled,
         };
+        if verdict == Verdict::Skip {
+            tracing::warn!(
+                "the GPU has not answered; the workspace's hardware profile is left as it is"
+            );
+            return;
+        }
         let Some(open) = open.upgrade() else {
             return;
         };
@@ -158,6 +187,33 @@ mod tests {
         assert_eq!(gb(32_616), 32);
         assert_eq!(gb(511), 0);
         assert_eq!(gb(512), 1);
+    }
+
+    /// A GPU that is there but silent is waited for, then skipped, never written as `none`
+    /// (Task 9 review M3); a machine with no GPU source is checked at once.
+    #[test] // spec: CORE-067
+    fn a_silent_gpu_is_skipped_not_written_as_none() {
+        let mut snap = Snapshot::empty(0);
+        assert_eq!(verdict(&snap, false, 1), Verdict::Check);
+        assert_eq!(verdict(&snap, true, 1), Verdict::Wait);
+        assert_eq!(verdict(&snap, true, GPU_PATIENCE - 1), Verdict::Wait);
+        assert_eq!(verdict(&snap, true, GPU_PATIENCE), Verdict::Skip);
+        snap.gpu = Some(crate::telemetry::GpuView {
+            name: "G".into(),
+            driver: "1".into(),
+            util_pct: 0,
+            power_mw: 0,
+            energy_mj: None,
+            temp_c: 0,
+            sm_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            fan_pct: None,
+            throttle: Vec::new(),
+            vram_total_mib: 0,
+            vram_used_mib: 0,
+            measured: true,
+        });
+        assert_eq!(verdict(&snap, true, 1), Verdict::Check);
     }
 
     #[test] // spec: CORE-067

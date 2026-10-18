@@ -3,7 +3,8 @@
 //! modules above it, `pipeline` takes no `tools` types (only `tools` → `pipeline`), so the
 //! snapshot providers in `tools/` can call `pipeline::asset_detail`, and `jobs` takes no `tools`
 //! types (only `tools` → `jobs`: tools submit jobs; `jobs` defines the `JobHandler` trait they
-//! register with, CORE-010).
+//! register with, CORE-010), and `telemetry` takes none either (only `tools` → `telemetry`: the
+//! telemetry tools and `test.hw_tick` live in `tools`).
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
 //! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
@@ -12,8 +13,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The CORE-014 modules (each plan-3 module is added as it lands).
-const MODULES: [&str; 9] = [
-    "store", "index", "watch", "graph", "pipeline", "projects", "settings", "tools", "jobs",
+const MODULES: [&str; 10] = [
+    "store",
+    "index",
+    "watch",
+    "graph",
+    "pipeline",
+    "projects",
+    "settings",
+    "tools",
+    "jobs",
+    "telemetry",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -164,7 +174,7 @@ fn cycle(graph: &BTreeMap<String, BTreeSet<String>>) -> Option<Vec<String>> {
 fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let graph = graph(&src);
-    for module in ["store", "index", "pipeline", "tools", "jobs"] {
+    for module in ["store", "index", "pipeline", "tools", "jobs", "telemetry"] {
         assert!(
             graph.contains_key(module),
             "no {module} module found: {graph:?}"
@@ -188,10 +198,12 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     );
     forbidden("pipeline", &["tools", "jobs"]);
     forbidden("jobs", &["tools"]);
+    forbidden("telemetry", &["tools", "jobs"]);
     // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
     assert!(graph["tools"].contains("jobs"), "{graph:?}");
     assert!(graph["jobs"].contains("pipeline"), "{graph:?}");
     assert!(graph["tools"].contains("pipeline"), "{graph:?}");
+    assert!(graph["tools"].contains("telemetry"), "{graph:?}");
     assert!(graph["pipeline"].contains("index"), "{graph:?}");
     assert!(graph["index"].contains("store"), "{graph:?}");
 }

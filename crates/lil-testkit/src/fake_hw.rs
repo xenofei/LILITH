@@ -82,8 +82,8 @@ mod tests {
             assert_eq!(gpu_mem.sample().unwrap()[0].local_mib, 100);
         }
         assert!(cpu.is_none());
-        let first = sys.sample(&[7]);
+        let first = sys.sample(&[7], true);
         assert_eq!((first.cpu_permille, first.procs), (500, vec![(7, 10, 20)]));
-        assert_eq!(sys.sample(&[]).procs, vec![]);
+        assert_eq!(sys.sample(&[], true).procs, vec![]);
     }
 }

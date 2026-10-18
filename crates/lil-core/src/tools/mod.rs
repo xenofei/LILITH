@@ -12,6 +12,7 @@ pub mod project_tools;
 pub mod record_stage;
 pub mod registry;
 pub mod stages;
+pub mod telemetry_tools;
 pub mod test_tools;
 pub mod topics;
 pub mod trash_tools;
@@ -38,6 +39,7 @@ pub use stages::{
     ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings, SettingsInput,
     SettingsStage, SettleInput,
 };
+pub use telemetry_tools::register_telemetry_tools;
 pub use test_tools::{
     TEST_JOB_KIND, TEST_MODULE, TestGates, TestJobHandler, register_hw_tick, register_test_tools,
 };

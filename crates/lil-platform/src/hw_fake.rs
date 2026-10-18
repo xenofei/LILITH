@@ -27,7 +27,7 @@
 //! The GPU source's features are what its entries use: `energy_counter` when any has
 //! `energy_mj`, `instant_power` with `power_instant_mw`, `process_sm` with a non-empty
 //! `sm_by_pid`, `fan` with `fan_pct`. `SysSource::sample` returns only the `procs` rows of the
-//! pids it is asked to track.
+//! pids it is asked to track, and the `disks` rows only when asked for disks.
 
 use std::io;
 use std::path::Path;
@@ -167,9 +167,12 @@ impl CpuEnergySource for Script<io::Result<CpuEnergySample>, ()> {
 }
 
 impl SysSource for Script<SysSample, ()> {
-    fn sample(&mut self, tracked: &[u32]) -> SysSample {
+    fn sample(&mut self, tracked: &[u32], disks: bool) -> SysSample {
         let mut sample = self.advance().unwrap_or_default();
         sample.procs.retain(|(pid, _, _)| tracked.contains(pid));
+        if !disks {
+            sample.disks.clear();
+        }
         sample
     }
 }
@@ -320,7 +323,7 @@ mod tests {
         std::fs::write(&good, r#"{"gpu": null, "sys": [{"cpu_permille": 7}]}"#).unwrap();
         let (gpu, _, _, mut sys) = sources_from_file(&good).unwrap();
         assert!(gpu.is_none());
-        assert_eq!(sys.sample(&[]).cpu_permille, 7);
+        assert_eq!(sys.sample(&[], true).cpu_permille, 7);
 
         let bad = dir.path().join("bad.json");
         std::fs::write(&bad, "not json").unwrap();

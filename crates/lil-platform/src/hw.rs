@@ -132,7 +132,10 @@ pub struct SysSample {
 
 pub trait SysSource: Send {
     /// Reads everything; `tracked` names the processes whose CPU time and memory are wanted.
-    fn sample(&mut self, tracked: &[u32]) -> SysSample;
+    /// The disks are read (and `SysSample::disks` filled) only when `disks` is true: asking a
+    /// sleeping or unreachable volume for its free space every second would stall the sampler,
+    /// and CORE-061 wants them every 5 minutes.
+    fn sample(&mut self, tracked: &[u32], disks: bool) -> SysSample;
 }
 
 /// The `sysinfo` source.
@@ -162,7 +165,7 @@ fn permille(pct: f32) -> u16 {
 }
 
 impl SysSource for SysinfoSource {
-    fn sample(&mut self, tracked: &[u32]) -> SysSample {
+    fn sample(&mut self, tracked: &[u32], disks: bool) -> SysSample {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
         let pids: Vec<Pid> = tracked.iter().map(|&p| Pid::from_u32(p)).collect();
@@ -172,7 +175,9 @@ impl SysSource for SysinfoSource {
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
         self.networks.refresh(true);
-        self.disks.refresh(true);
+        if disks {
+            self.disks.refresh(true);
+        }
         SysSample {
             cpu_permille: permille(self.system.global_cpu_usage()),
             per_core_permille: self
@@ -202,17 +207,20 @@ impl SysSource for SysinfoSource {
                     )
                 })
                 .collect(),
-            disks: self
-                .disks
-                .list()
-                .iter()
-                .map(|d| {
-                    (
-                        d.mount_point().display().to_string(),
-                        d.available_space() / MIB,
-                    )
-                })
-                .collect(),
+            disks: if disks {
+                self.disks
+                    .list()
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.mount_point().display().to_string(),
+                            d.available_space() / MIB,
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
