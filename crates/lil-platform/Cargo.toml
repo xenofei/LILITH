@@ -9,6 +9,8 @@ publish.workspace = true
 # ARCH-111: lil-platform is the only crate allowed to call Windows APIs.
 [dependencies]
 getrandom.workspace = true
+# The SQLite file helpers lil doctor and the core share (sqlite_files, CORE-004).
+rusqlite.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 toml.workspace = true

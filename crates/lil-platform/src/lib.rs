@@ -21,6 +21,7 @@ pub mod process_env;
 pub mod session_end;
 pub mod sid;
 pub mod sockets;
+pub mod sqlite_files;
 pub mod volume;
 pub mod watcher;
 

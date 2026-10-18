@@ -134,6 +134,16 @@ const ALLOW: &[Allow] = &[
               old core",
         until: "kept: `.worldwright\\` stays reserved (no planned end)",
     },
+    // Plan 3, Global Constraints "Old names", the Task 4 row.
+    Allow {
+        globs: &[
+            "crates/lil-cli/tests/doctor_workspace.rs",
+            "crates/lil-core/tests/workspace_tools.rs",
+        ],
+        lines_with: &["worldwright.yaml", ".worldwright\\\\state.json", "\"ww://"],
+        why: "the legacy-name rename test builds a plugin-era workspace",
+        until: "the legacy workspace readers go",
+    },
     // Plan 3, Global Constraints "Old names", the Task 2 spec row: Appendix F's legacy-name
     // contract (`lil doctor`'s legacy-name rename) and its plugin contract (plugin 1.3 keeps
     // the id, R1), one row per end condition.

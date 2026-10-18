@@ -18,7 +18,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lil_platform::fs::{RetryClass, classify};
+use lil_platform::fs::{Probe, RetryClass, SystemProbe, classify};
 use lil_platform::names::{CONFLICT_MARKER, LEGACY_CONFLICT_MARKER, is_workspace_dir};
 use lil_schema::{Manifest, ManifestView, Version};
 use serde_json::{Map, Value};
@@ -96,7 +96,12 @@ pub(super) struct Listed {
 /// The entries of `dir` (none when it doesn't exist). Links are listed as non-folders, so
 /// nothing is ever followed through one.
 pub(super) fn list(dir: &Path) -> io::Result<Vec<Listed>> {
-    let entries = match std::fs::read_dir(lil_platform::fs::long_path(dir)) {
+    list_with(&SystemProbe, dir)
+}
+
+/// [`list`], with the folder listed through `probe`.
+pub(super) fn list_with(probe: &dyn Probe, dir: &Path) -> io::Result<Vec<Listed>> {
+    let entries = match probe.read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -123,12 +128,12 @@ pub(super) fn version_folder(name: &str) -> Option<Version> {
 /// Every conflict copy (`*.lil-conflict-*`, or one with the legacy [`LEGACY_CONFLICT_MARKER`])
 /// under `start` (the workspace `root`, or a folder in it), skipping `.git`, and the root's
 /// `.trash` and both workspace data folders ([`is_workspace_dir`]), and never following a
-/// link. A `start` that doesn't exist holds none.
-fn conflict_files(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
+/// link. A `start` that doesn't exist holds none. Folders are listed through `probe`.
+fn conflict_files(root: &Path, start: &Path, probe: &dyn Probe) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut folders = vec![start.to_path_buf()];
     while let Some(dir) = folders.pop() {
-        let entries = match list(&dir) {
+        let entries = match list_with(probe, &dir) {
             Ok(entries) => entries,
             Err(e) if dir == start => return Err(e),
             Err(e) => {
@@ -146,14 +151,17 @@ fn conflict_files(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
                 if !skip {
                     folders.push(entry.path);
                 }
-            } else if entry.name.contains(CONFLICT_MARKER)
-                || entry.name.contains(LEGACY_CONFLICT_MARKER)
-            {
+            } else if is_conflict_copy(&entry.name) {
                 found.push(entry.path);
             }
         }
     }
     Ok(found)
+}
+
+/// Whether `name` is a conflict copy's (`*.lil-conflict-*`, or the legacy marker).
+pub(super) fn is_conflict_copy(name: &str) -> bool {
+    name.contains(CONFLICT_MARKER) || name.contains(LEGACY_CONFLICT_MARKER)
 }
 
 impl Store {
@@ -341,6 +349,26 @@ impl Store {
     /// # Errors
     /// `store.io` when the workspace can't be listed.
     pub async fn orphans(&self) -> Result<Vec<WsPath>, StoreError> {
+        let conflicts = {
+            let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
+            blocking(move || conflict_files(&root, &root, probe.as_ref()))
+                .await
+                .map_err(|e| StoreError::io(&WsPath::from_disk(String::new()), &e))?
+        };
+        let conflicts = conflicts.iter().map(|path| self.rel_of(path)).collect();
+        self.orphans_with_conflicts(conflicts).await
+    }
+
+    /// [`Store::orphans`], with the conflict copies already found (by the open's recovery walk,
+    /// [`RecoveryReport::conflict_copies`](super::RecoveryReport::conflict_copies)), so the
+    /// whole tree isn't walked again.
+    ///
+    /// # Errors
+    /// `store.io` when the workspace can't be listed.
+    pub async fn orphans_with_conflicts(
+        &self,
+        conflicts: Vec<WsPath>,
+    ) -> Result<Vec<WsPath>, StoreError> {
         let mut found: BTreeSet<WsPath> = BTreeSet::new();
         let root = self.root().to_path_buf();
         let root_rel = WsPath::from_disk(String::new());
@@ -355,13 +383,7 @@ impl Store {
                 .await?;
         }
         found.extend(self.staging_orphans().await?);
-        let conflicts = {
-            let root = root.clone();
-            blocking(move || conflict_files(&root, &root))
-                .await
-                .map_err(io)?
-        };
-        found.extend(conflicts.iter().map(|path| self.rel_of(path)));
+        found.extend(conflicts);
         Ok(found.into_iter().collect())
     }
 
@@ -387,8 +409,8 @@ impl Store {
         self.project_asset_orphans(project, &dir, &mut found)
             .await?;
         let conflicts = {
-            let (root, start) = (self.root().to_path_buf(), dir);
-            blocking(move || conflict_files(&root, &start))
+            let (root, start, probe) = (self.root().to_path_buf(), dir, self.probe().clone());
+            blocking(move || conflict_files(&root, &start, probe.as_ref()))
                 .await
                 .map_err(|e| StoreError::io(&rel, &e))?
         };

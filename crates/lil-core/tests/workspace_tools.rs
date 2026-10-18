@@ -988,3 +988,222 @@ fn unsupported_fix_has_the_agent_hint_and_a_quoted_path() {
         "{refused}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A plugin-era workspace and `workspace.doctor`'s legacy-name offer (owner question 1).
+// ---------------------------------------------------------------------------------------------
+
+/// A plugin-era workspace: the legacy workspace file, the legacy hint naming the project
+/// `kites`, an asset whose manifest's `inputs` hold a legacy ref (a note that only mentions
+/// one stays as written), and a sealed, read-only snapshot holding one too.
+struct PluginEra {
+    ws: PathBuf,
+    file: PathBuf,
+    hint: PathBuf,
+    manifest: PathBuf,
+    snapshot: PathBuf,
+}
+
+fn plugin_era(env: &TestEnv) -> PluginEra {
+    use lil_schema::LEGACY_SCHEME;
+    let ws = env.root().join("plugin era");
+    let file = ws.join("worldwright.yaml");
+    write_file(&file, b"name: plugin era\n");
+    let hint = ws.join(".worldwright\\state.json");
+    write_file(&hint, br#"{"active_project":"kites","panel":"left"}"#);
+    write_file(
+        &ws.join("projects").join("kites").join("project.yaml"),
+        b"name: Kites\nslug: kites\ntype: media\nstatus: active\nlinks: []\ncreated: 2026-09-01\n",
+    );
+    let id = env.workspace_id(&ws);
+    let asset = ws
+        .join("projects")
+        .join("kites")
+        .join("assets")
+        .join("kite_red");
+    let manifest = asset.join("kite_red.manifest.json");
+    let text = format!(
+        "{{\r\n  \"asset_id\": \"kite_red\",\r\n  \"project\": \"kites\",\r\n  \"type\": \
+         \"prop_2d\",\r\n  \"version\": \"1.1.0\",\r\n  \"approved_version\": \"1.0.0\",\r\n  \
+         \"notes\": \"copied by hand from {LEGACY_SCHEME}{id}/kites/kite_blue@1.0.0\",\r\n  \
+         \"inputs\": [\r\n    {{\"ref\": \"ww://{id}/kites/kite_blue@1.0.0\", \"role\": \
+         \"reference\"}}\r\n  ]\r\n}}\r\n"
+    );
+    write_file(&manifest, text.as_bytes());
+    let snapshot = asset.join("v1.0.0").join("manifest.snapshot.json");
+    write_file(
+        &snapshot,
+        format!("{{\"inputs\": [{{\"ref\": \"ww://{id}/kites/kite_blue@1.0.0\"}}]}}\n").as_bytes(),
+    );
+    lil_core::store::fsops::set_readonly(&snapshot, true).unwrap();
+    PluginEra {
+        ws,
+        file,
+        hint,
+        manifest,
+        snapshot,
+    }
+}
+
+/// The check `id` of a `workspace.doctor` result: its state and detail.
+fn doctor_check(out: &Value, id: &str) -> (String, String) {
+    let check = out["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no checks: {out}"))
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} check: {out}"));
+    (
+        check["state"].as_str().unwrap().to_string(),
+        check["detail"].as_str().unwrap().to_string(),
+    )
+}
+
+fn read_bytes(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+fn is_read_only(path: &Path) -> bool {
+    std::fs::metadata(path).unwrap().permissions().readonly()
+}
+
+#[test] // spec: ARCH-002, CORE-004, CORE-026 (owner question 1)
+fn legacy_names_are_renamed_only_when_offered_from_an_interactive_session() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_FILE};
+    let env = TestEnv::new();
+    let era = plugin_era(&env);
+    let _core = core(&env);
+    let mut admin = none(&env);
+    let out = create(&mut admin, json!({"path": arg(&era.ws)}));
+    assert_eq!(
+        out["structured"]["created"], false,
+        "registered, not made: {out}"
+    );
+    let (file, hint, manifest, snapshot) = (
+        read_bytes(&era.file),
+        read_bytes(&era.hint),
+        read_bytes(&era.manifest),
+        read_bytes(&era.snapshot),
+    );
+    let new_hint = era.ws.join(".lilith").join("state.json");
+
+    // The core serves it as it is: the legacy hint's project is the active one.
+    let mut s = session(&env, &era.ws);
+    let status = s.tool_ok("project.status", json!({}), None);
+    assert_eq!(status["project"], "kites", "{status}");
+
+    // Reported, never renamed without the offer.
+    let out = s.tool_ok("workspace.doctor", json!({"fix": true}), Some(&key()));
+    let (state, detail) = doctor_check(&out, "legacy.names");
+    assert_eq!(state, "problem", "{out}");
+    assert!(detail.starts_with("legacy names"), "{detail}");
+    for named in ["worldwright.yaml", "state.json", "kite_red.manifest.json"] {
+        assert!(detail.contains(named), "{named}: {detail}");
+    }
+    assert!(!detail.contains("manifest.snapshot.json"), "{detail}");
+    assert_eq!(doctor_check(&out, "legacy.sealed_refs").0, "info", "{out}");
+    assert!(!era.ws.join(WORKSPACE_FILE).exists());
+    assert!(!new_hint.exists());
+    assert_eq!(read_bytes(&era.manifest), manifest);
+
+    // A non-interactive session can't run the offer, whatever it asks.
+    let mut quiet = RawPipe::connect(&env);
+    let hello =
+        quiet.hello(json!({"workspace": env.workspace_id(&era.ws), "non_interactive": true}));
+    assert_eq!(hello["result"]["status"], "ok", "{hello}");
+    let refused = quiet.tool(
+        "workspace.doctor",
+        json!({"fix": true, "offers": ["legacy_names"]}),
+        Some(&key()),
+    );
+    assert_eq!(refused["error"]["code"], "caller.not_allowed", "{refused}");
+    assert_eq!(read_bytes(&era.file), file);
+    assert!(!era.ws.join(WORKSPACE_FILE).exists());
+
+    // Offered (`lil doctor` after a `y`): renamed through the store, nothing deleted.
+    let out = s.tool_ok(
+        "workspace.doctor",
+        json!({"fix": true, "offers": ["legacy_names"]}),
+        Some(&key()),
+    );
+    let (state, detail) = doctor_check(&out, "legacy.names");
+    assert_eq!(state, "fixed", "{out}");
+    let (state, detail_sealed) = doctor_check(&out, "legacy.sealed_refs");
+    assert_eq!(state, "skipped", "{out}");
+    assert!(
+        detail_sealed.contains("v1.0.0/manifest.snapshot.json"),
+        "{detail_sealed}"
+    );
+    assert_eq!(read_bytes(&era.ws.join(WORKSPACE_FILE)), file, "{detail}");
+    assert!(!era.file.exists(), "{detail}");
+    assert_eq!(read_bytes(&new_hint), hint, "the hint is copied as it was");
+    let rewritten = String::from_utf8(manifest.clone())
+        .unwrap()
+        .replace("\"ww://", "\"lil://");
+    assert_eq!(
+        String::from_utf8(read_bytes(&era.manifest)).unwrap(),
+        rewritten,
+        "only the ref changed"
+    );
+    assert_eq!(
+        read_bytes(&era.snapshot),
+        snapshot,
+        "the sealed snapshot is never rewritten"
+    );
+    assert!(is_read_only(&era.snapshot));
+    assert_eq!(
+        read_bytes(&era.hint),
+        hint,
+        "the legacy folder stays as it is"
+    );
+    assert!(era.ws.join(LEGACY_WORKSPACE_DIR).is_dir());
+
+    // Afterwards: nothing to rename, the sealed snapshot is information, and it still reads.
+    let out = s.tool_ok("workspace.doctor", json!({"fix": true}), Some(&key()));
+    assert_eq!(doctor_check(&out, "legacy.names").0, "ok", "{out}");
+    assert_eq!(doctor_check(&out, "legacy.sealed_refs").0, "info", "{out}");
+    let status = s.tool_ok("project.status", json!({}), None);
+    assert_eq!(status["project"], "kites", "{status}");
+}
+
+/// The rename's order (the hint, then the refs, then the workspace file last) means an
+/// interruption leaves a plugin-era workspace the core still serves; the next doctor reports
+/// what is left and its offer finishes it.
+#[test] // spec: ARCH-002, CORE-004 (owner question 1)
+fn an_interrupted_legacy_rename_is_finished_by_the_next_offer() {
+    use lil_platform::names::WORKSPACE_FILE;
+    let env = TestEnv::new();
+    let era = plugin_era(&env);
+    // Interrupted before the workspace file's move: the hint is copied, the ref rewritten.
+    let hint = read_bytes(&era.hint);
+    write_file(&era.ws.join(".lilith").join("state.json"), &hint);
+    let manifest = String::from_utf8(read_bytes(&era.manifest))
+        .unwrap()
+        .replace("\"ww://", "\"lil://");
+    write_file(&era.manifest, manifest.as_bytes());
+    env.register_workspace(&era.ws, true);
+    let _core = core(&env);
+
+    let mut s = session(&env, &era.ws);
+    assert_eq!(
+        s.tool_ok("project.status", json!({}), None)["project"],
+        "kites"
+    );
+    let out = s.tool_ok("workspace.doctor", json!({"fix": false}), Some(&key()));
+    let (state, detail) = doctor_check(&out, "legacy.names");
+    assert_eq!(state, "problem", "{out}");
+    assert!(detail.contains("worldwright.yaml"), "{detail}");
+    assert!(
+        !detail.contains("state.json") && !detail.contains("manifest"),
+        "{detail}"
+    );
+
+    let out = s.tool_ok(
+        "workspace.doctor",
+        json!({"fix": false, "offers": ["legacy_names"]}),
+        Some(&key()),
+    );
+    assert_eq!(doctor_check(&out, "legacy.names").0, "fixed", "{out}");
+    assert!(era.ws.join(WORKSPACE_FILE).is_file() && !era.file.exists());
+    assert_eq!(read_bytes(&era.manifest), manifest.as_bytes());
+}

@@ -4,7 +4,7 @@
 //!
 //! | Tool | Effect | Arguments | `structured` result |
 //! |---|---|---|---|
-//! | `workspace.doctor` | write | `{fix}` | `{checks: [{id, state: "ok"\|"fixed"\|"problem", detail}]}` |
+//! | `workspace.doctor` | write | `{fix, offers?}` | `{checks: [{id, state: "ok"\|"fixed"\|"problem"\|"info"\|"skipped", detail}]}` |
 //!
 //! The checks, in this order:
 //! - `git.repository`: whether the workspace root holds `.git`. Without it the three git checks
@@ -28,6 +28,15 @@
 //! - `workspace.watcher`: a workspace served without a folder watch (Task 11).
 //! - `workspace.orphans`, `workspace.needs_repair`, `workspace.missing` (CORE-038): listed,
 //!   never fixed automatically.
+//! - `legacy.names` (owner question 1): a workspace from before the rename that still uses the
+//!   legacy workspace file (`LEGACY_WORKSPACE_FILE`), the legacy hint
+//!   (`LEGACY_WORKSPACE_DIR`'s `state.json`) or legacy refs (`LEGACY_SCHEME`) in its asset
+//!   manifests is a `problem`. Only the offer `legacy_names` renames them ([`rename_legacy`]):
+//!   `lil doctor` lists it after the person typed `y`, and the core refuses it from an agent or a
+//!   non-interactive session (`caller.not_allowed`). `fix` alone never renames anything.
+//! - `legacy.sealed_refs`: sealed, read-only `manifest.snapshot.json` files that hold legacy
+//!   refs are never rewritten (`info`; `skipped` right after a rename), and those refs still
+//!   read.
 //!
 //! Git runs go through [`Store::git`](crate::store::Store::git) with the core's git
 //! environment. A second run changes nothing (QA-060).
@@ -37,17 +46,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lil_platform::fs::Probe;
-use lil_protocol::{EffectClass, ErrorBody};
-use lil_schema::{Manifest, Version, bare_sha256};
+use lil_platform::names::{
+    LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_DIR, WORKSPACE_FILE,
+};
+use lil_protocol::{CallerKind, EffectClass, ErrorBody, codes};
+use lil_schema::{AssetRef, LEGACY_SCHEME, Manifest, SCHEME, Version, bare_sha256};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::workspace_tools::{
     GITATTRIBUTES_ENTRY, GITIGNORE_ENTRIES, WORKSPACE_MODULE, volume_warnings, with_lines,
 };
 use crate::index::FileState;
+use crate::projects::active::STATE_JSON;
 use crate::store::versions::SNAPSHOT;
+use crate::store::write::Expect;
 use crate::store::{Store, StoreError, WsPath, fsops};
 use crate::workspace::OpenWorkspace;
 
@@ -66,6 +81,10 @@ const OK: &str = "ok";
 const FIXED: &str = "fixed";
 /// The `problem` state.
 const PROBLEM: &str = "problem";
+/// The `info` state: worth knowing, nothing to do.
+const INFO: &str = "info";
+/// The `skipped` state: left as it is on purpose.
+const SKIPPED: &str = "skipped";
 
 /// `workspace.doctor`'s arguments.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -74,6 +93,18 @@ pub struct DoctorArgs {
     /// Repair what is safe to repair (git config, ignore and attribute entries, the read-only
     /// attribute of unchanged sealed files). False only reports.
     pub fix: bool,
+    /// Repairs that run only when listed here, which `lil doctor` does after the person answers
+    /// y. Refused from an agent or a non-interactive session.
+    #[serde(default)]
+    pub offers: Vec<DoctorOffer>,
+}
+
+/// A repair `workspace.doctor` runs only when the call lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorOffer {
+    /// Rename the workspace's names from before the rename ([`rename_legacy`]).
+    LegacyNames,
 }
 
 /// One check's outcome.
@@ -134,6 +165,10 @@ async fn run(
 ) -> Result<(DoctorResult, String), ErrorBody> {
     let open = ctx.workspace()?.clone();
     let fix = args.fix;
+    let rename = args.offers.contains(&DoctorOffer::LegacyNames);
+    if !args.offers.is_empty() {
+        refuse_offers(ctx)?;
+    }
     let mut checks = git_checks(d, &open.store, fix).await;
     checks.push(
         lines_check(
@@ -159,6 +194,7 @@ async fn run(
     checks.push(volume_check(d, &open.ws.path));
     checks.push(watcher_check(&open));
     checks.extend(listed_checks(&open).await);
+    checks.extend(legacy_checks(&open, rename).await);
     let count = |state: &str| checks.iter().filter(|c| c.state == state).count();
     let summary = format!(
         "{} ok, {} fixed, {} problem(s)",
@@ -167,6 +203,23 @@ async fn run(
         count(PROBLEM)
     );
     Ok((DoctorResult { checks }, summary))
+}
+
+/// An offer runs only for the person: from `lil` (whose `lil doctor` asks first) or the app, in
+/// an interactive session. An agent's call (`mcp`, `assistant`) or a non-interactive session
+/// is `caller.not_allowed`, and nothing runs.
+fn refuse_offers(ctx: &CallCtx) -> Result<(), ErrorBody> {
+    let session = &ctx.session;
+    let person = matches!(session.caller, CallerKind::Cli | CallerKind::Ui(_));
+    if person && !session.non_interactive {
+        return Ok(());
+    }
+    Err(ErrorBody::new(
+        &codes::CALLER_NOT_ALLOWED,
+        "workspace.doctor's offers run only from lil doctor in a terminal (or the app), after \
+         you answer y; this session can't run them. Nothing was changed.",
+        ctx.trace_id.clone(),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -683,4 +736,343 @@ fn listed(id: &str, none: &str, what: &str, paths: Vec<String>, todo: &str) -> D
         PROBLEM,
         format!("{} {what}: {} — {todo}", paths.len(), paths.join(", ")),
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Legacy names (owner question 1).
+// ---------------------------------------------------------------------------------------------
+
+/// The names from before the rename that a workspace still uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyNames {
+    /// Its workspace file is the legacy one (`LEGACY_WORKSPACE_FILE`): there is no
+    /// [`WORKSPACE_FILE`].
+    pub workspace_file: bool,
+    /// Its active-project hint is the legacy folder's `state.json` (`LEGACY_WORKSPACE_DIR`):
+    /// [`STATE_JSON`] is missing.
+    pub state_json: bool,
+    /// The unsealed asset manifests that hold a legacy ref (`LEGACY_SCHEME`),
+    /// workspace-relative, sorted.
+    pub legacy_refs: Vec<String>,
+}
+
+impl LegacyNames {
+    fn is_empty(&self) -> bool {
+        !self.workspace_file && !self.state_json && self.legacy_refs.is_empty()
+    }
+
+    /// The names, in plain words.
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.workspace_file {
+            parts.push(format!(
+                "the workspace file {LEGACY_WORKSPACE_FILE} (becomes {WORKSPACE_FILE})"
+            ));
+        }
+        if self.state_json {
+            parts.push(format!(
+                "the active-project hint {LEGACY_WORKSPACE_DIR}\\state.json (copied to \
+                 {WORKSPACE_DIR}\\state.json; the old folder stays)"
+            ));
+        }
+        if !self.legacy_refs.is_empty() {
+            parts.push(format!(
+                "{LEGACY_SCHEME} refs (rewritten to {SCHEME}) in {} manifest(s): {}",
+                self.legacy_refs.len(),
+                self.legacy_refs.join(", ")
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+/// The legacy hint, in the legacy workspace data folder.
+fn legacy_state_json() -> WsPath {
+    WsPath::from_disk(format!("{LEGACY_WORKSPACE_DIR}/state.json"))
+}
+
+/// Whether there is something at `rel` (attributes only; a cloud-only file counts).
+fn present(root: &Path, rel: &WsPath) -> bool {
+    std::fs::symlink_metadata(lil_platform::fs::long_path(&rel.abs(root))).is_ok()
+}
+
+/// The asset manifests and the sealed snapshots of the workspace, workspace-relative:
+/// `projects/<p>/assets/<a>/<a>.manifest.json` and `.../v<semver>/manifest.snapshot.json`.
+/// Folders are listed without following links.
+fn manifests_and_snapshots(root: &Path) -> (Vec<WsPath>, Vec<WsPath>) {
+    let folders = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(lil_platform::fs::long_path(dir))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()))
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    };
+    let (mut manifests, mut snapshots) = (Vec::new(), Vec::new());
+    for project in projects(root) {
+        let assets = format!("projects/{project}/assets");
+        for asset in folders(&root.join("projects").join(&project).join("assets")) {
+            let dir = format!("{assets}/{asset}");
+            let manifest = WsPath::from_disk(format!("{dir}/{asset}.manifest.json"));
+            if present(root, &manifest) {
+                manifests.push(manifest);
+            }
+            let abs = WsPath::from_disk(dir.clone()).abs(root);
+            for version in folders(&abs) {
+                let sealed = version
+                    .strip_prefix('v')
+                    .is_some_and(|v| v.parse::<Version>().is_ok());
+                let snapshot = WsPath::from_disk(format!("{dir}/{version}/{SNAPSHOT}"));
+                if sealed && present(root, &snapshot) {
+                    snapshots.push(snapshot);
+                }
+            }
+        }
+    }
+    (manifests, snapshots)
+}
+
+/// The legacy refs (`LEGACY_SCHEME`) among the string values of `value`, at any depth: strings
+/// that read as a ref ([`AssetRef`]). Keys and strings that only mention one are not refs.
+fn find_legacy_refs(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) if s.starts_with(LEGACY_SCHEME) && s.parse::<AssetRef>().is_ok() => {
+            out.push(s.clone());
+        }
+        Value::Array(items) => items.iter().for_each(|v| find_legacy_refs(v, out)),
+        Value::Object(map) => map.values().for_each(|v| find_legacy_refs(v, out)),
+        _ => {}
+    }
+}
+
+/// The JSON of `text` (a leading byte-order mark is skipped), or `None`.
+fn json_of(text: &str) -> Option<Value> {
+    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text)).ok()
+}
+
+/// `value` with every legacy ref string written with [`SCHEME`] instead.
+fn with_new_scheme(value: &Value) -> Value {
+    match value {
+        Value::String(s) if s.starts_with(LEGACY_SCHEME) && s.parse::<AssetRef>().is_ok() => {
+            Value::String(format!("{SCHEME}{}", &s[LEGACY_SCHEME.len()..]))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(with_new_scheme).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), with_new_scheme(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// `text` (a manifest) with its legacy refs rewritten by targeted edits: each ref's quoted
+/// JSON string is replaced where it stands, so every other byte (spacing, line endings, key
+/// order, a note that only mentions a legacy ref) stays as it is. The result must read as the
+/// same JSON with only those strings changed; otherwise nothing is written.
+fn rewrite_legacy_refs(rel: &WsPath, text: &str) -> Result<String, StoreError> {
+    let refuse = |why: &str| StoreError::Io {
+        path: rel.as_str().to_string(),
+        why: why.to_string(),
+    };
+    let Some(before) = json_of(text) else {
+        return Err(refuse(
+            "it isn't valid JSON, so its refs can't be rewritten",
+        ));
+    };
+    let mut refs = Vec::new();
+    find_legacy_refs(&before, &mut refs);
+    refs.sort();
+    refs.dedup();
+    let mut out = text.to_string();
+    for old in &refs {
+        let new = format!("{SCHEME}{}", &old[LEGACY_SCHEME.len()..]);
+        let (old, new) = (Value::String(old.clone()), Value::String(new));
+        out = out.replace(&old.to_string(), &new.to_string());
+    }
+    if json_of(&out).as_ref() != Some(&with_new_scheme(&before)) {
+        return Err(refuse(
+            "a legacy ref in it is also written another way (escaped, or as a key), so it \
+             can't be rewritten with targeted edits; rewrite it by hand",
+        ));
+    }
+    Ok(out)
+}
+
+/// The names from before the rename that `open`'s workspace still uses (owner question 1).
+///
+/// # Errors
+/// `store.io` when a manifest can't be read.
+pub async fn legacy_names(open: &OpenWorkspace) -> Result<LegacyNames, ErrorBody> {
+    let store = &open.store;
+    let root = store.root();
+    let file = |name: &str| WsPath::from_disk(name.to_string());
+    let workspace_file =
+        present(root, &file(LEGACY_WORKSPACE_FILE)) && !present(root, &file(WORKSPACE_FILE));
+    let new_hint = WsPath::parse(STATE_JSON).expect("the state.json path is valid");
+    let state_json = present(root, &legacy_state_json()) && !present(root, &new_hint);
+    let mut legacy_refs = Vec::new();
+    for manifest in manifests_and_snapshots(root).0 {
+        let bytes = match store.read(&manifest).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(e) => return Err(e.to_error("")),
+        };
+        let mut refs = Vec::new();
+        if let Some(value) = std::str::from_utf8(&bytes).ok().and_then(json_of) {
+            find_legacy_refs(&value, &mut refs);
+        }
+        if !refs.is_empty() {
+            legacy_refs.push(manifest.as_str().to_string());
+        }
+    }
+    Ok(LegacyNames {
+        workspace_file,
+        state_json,
+        legacy_refs,
+    })
+}
+
+/// The sealed snapshots that hold a legacy ref, workspace-relative: never rewritten.
+async fn sealed_legacy_refs(open: &OpenWorkspace) -> Vec<String> {
+    let mut found = Vec::new();
+    for snapshot in manifests_and_snapshots(open.store.root()).1 {
+        let Ok(Some(bytes)) = open.store.read(&snapshot).await else {
+            continue;
+        };
+        let mut refs = Vec::new();
+        if let Some(value) = std::str::from_utf8(&bytes).ok().and_then(json_of) {
+            find_legacy_refs(&value, &mut refs);
+        }
+        if !refs.is_empty() {
+            found.push(snapshot.as_str().to_string());
+        }
+    }
+    found
+}
+
+/// Renames what [`legacy_names`] finds, through the store, in this order: the hint (the legacy
+/// `state.json`'s bytes are written to [`STATE_JSON`], a new file; the legacy folder is left as
+/// it is), the refs (each unsealed manifest by targeted, hash-checked edits), and last the
+/// workspace file (moved to [`WORKSPACE_FILE`], never over a file). Nothing is deleted. A
+/// sealed snapshot is never touched: it is returned as skipped.
+///
+/// Each step is one store write, and until the last one the workspace still reads as it did
+/// (its file is the legacy one, a missing new hint falls back to the legacy one, and legacy refs
+/// still parse), so an interruption leaves a workspace the core serves; the next call finds
+/// what is left and finishes it.
+///
+/// # Errors
+/// The first store error; the steps before it stay done.
+pub async fn rename_legacy(open: &OpenWorkspace) -> Result<(LegacyNames, Vec<String>), ErrorBody> {
+    let found = legacy_names(open).await?;
+    let store = &open.store;
+    let mut renamed = LegacyNames::default();
+    if found.state_json {
+        let legacy = legacy_state_json();
+        if let Some(bytes) = store.read(&legacy).await.map_err(|e| e.to_error(""))? {
+            let new_hint = WsPath::parse(STATE_JSON).expect("the state.json path is valid");
+            store
+                .write(&new_hint, bytes, Expect::New)
+                .await
+                .map_err(|e| e.to_error(""))?;
+            renamed.state_json = true;
+        }
+    }
+    for manifest in &found.legacy_refs {
+        let rel = WsPath::parse(manifest).map_err(|e| e.to_error(""))?;
+        let edit_rel = rel.clone();
+        let edit = move |current: &str| rewrite_legacy_refs(&edit_rel, current);
+        store
+            .edit_text(&rel, &edit)
+            .await
+            .map_err(|e| e.to_error(""))?;
+        renamed.legacy_refs.push(manifest.clone());
+    }
+    if found.workspace_file {
+        let (from, to) = (
+            WsPath::from_disk(LEGACY_WORKSPACE_FILE.to_string()),
+            WsPath::from_disk(WORKSPACE_FILE.to_string()),
+        );
+        store
+            .rename_new(&from, &to)
+            .await
+            .map_err(|e| e.to_error(""))?;
+        renamed.workspace_file = true;
+    }
+    tracing::info!(workspace = %open.ws.path.display(), ?renamed, "legacy names renamed");
+    Ok((renamed, sealed_legacy_refs(open).await))
+}
+
+/// `legacy.names` and, when sealed snapshots hold legacy refs, `legacy.sealed_refs`.
+async fn legacy_checks(open: &OpenWorkspace, rename: bool) -> Vec<DoctorCheck> {
+    const ID: &str = "legacy.names";
+    let found = match legacy_names(open).await {
+        Ok(found) => found,
+        Err(e) => {
+            return vec![DoctorCheck::new(
+                ID,
+                PROBLEM,
+                format!(
+                    "the names from before the rename can't be checked: {} — run lil doctor \
+                     again",
+                    e.message
+                ),
+            )];
+        }
+    };
+    let names = if found.is_empty() {
+        DoctorCheck::new(ID, OK, "the workspace uses LILITH's names")
+    } else if !rename {
+        DoctorCheck::new(
+            ID,
+            PROBLEM,
+            format!(
+                "legacy names from before the rename: {} — run lil doctor in a terminal; it \
+                 asks before it renames them",
+                found.describe()
+            ),
+        )
+    } else {
+        match rename_legacy(open).await {
+            Ok((renamed, _)) => DoctorCheck::new(
+                ID,
+                FIXED,
+                format!("legacy names renamed: {}", renamed.describe()),
+            ),
+            Err(e) => DoctorCheck::new(
+                ID,
+                PROBLEM,
+                format!(
+                    "legacy names from before the rename: {}; the rename stopped: {} — run \
+                     lil doctor again; it finishes what is left",
+                    found.describe(),
+                    e.message
+                ),
+            ),
+        }
+    };
+    let mut checks = vec![names];
+    let sealed = sealed_legacy_refs(open).await;
+    if !sealed.is_empty() {
+        let state = if rename && !found.is_empty() {
+            SKIPPED
+        } else {
+            INFO
+        };
+        checks.push(DoctorCheck::new(
+            "legacy.sealed_refs",
+            state,
+            format!(
+                "{} sealed snapshot(s) keep their {LEGACY_SCHEME} refs and are left as they are \
+                 (a sealed version is never rewritten, and those refs still read): {}",
+                sealed.len(),
+                sealed.join(", ")
+            ),
+        ));
+    }
+    checks
 }

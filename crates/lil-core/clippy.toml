@@ -42,6 +42,8 @@ disallowed-methods = [
     { path = "lil_platform::fs::open_exclusive", reason = "ARCH-112: exclusive handles and their deletes go through lil_core::store (fsops::remove_if)" },
     { path = "lil_platform::fs::create_junction", reason = "ARCH-112: the suite never creates links; test support only" },
     { path = "lil_platform::fs::ExclusiveFile::delete", reason = "ARCH-112: file deletes go through lil_core::store (fsops::remove_if)" },
+    # Owner decision 5: lil-core never renames a state.db; only lil doctor sets one aside, after a yes.
+    { path = "lil_platform::sqlite_files::set_aside", reason = "owner decision 5: only lil doctor sets a state.db aside, after the person's yes" },
     # Manifests keep key order (ARCH-076, CORE-148): under `preserve_order`, Map::remove is
     # swap_remove and moves the last key into the removed slot. Use `shift_remove`.
     { path = "serde_json::Map::remove", reason = "ARCH-076: use shift_remove (lil_schema::remove_key); Map::remove reorders keys" },

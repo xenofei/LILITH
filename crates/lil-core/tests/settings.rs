@@ -122,7 +122,23 @@ fn fx(env: &TestEnv, workspace_defaults: &str, project_extra: &str) -> (Fx, Path
     )
 }
 
+/// Removes the test's folder once its fixtures have shut down, failing the test if anything
+/// in it was left behind.
+fn assert_removed(env: TestEnv) {
+    if let Err(left) = env.close() {
+        panic!("the test's folder was left behind: {left:?}");
+    }
+}
+
 impl Fx {
+    /// Closes the hub (each open workspace's watcher, index, `state.db` and `core.lock`) and
+    /// joins the state actors, so nothing holds a file in the test's folder when its
+    /// `TestEnv` drops.
+    async fn shutdown(self) {
+        self.dispatcher.hub().close_all().await;
+        self._states.close();
+    }
+
     async fn call(&self, name: &str, args: Value) -> Outcome<ToolOutput> {
         let Value::Object(arguments) = args else {
             panic!("arguments must be an object");
@@ -227,6 +243,8 @@ async fn cascade_is_a_plain_override_chain() {
     // And the session's active project is the default for the layer.
     let s = fx.ok("test.settings", json!({})).await;
     assert_eq!(s["values"]["models.image_generate"], "a");
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-057
@@ -263,6 +281,8 @@ async fn request_cannot_set_suite_level_or_unknown_keys() {
         .await;
     assert_eq!(s["values"]["providers.image.order"], json!(["local"]));
     assert_eq!(s["sources"]["providers.image.order"], "request");
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-057
@@ -313,6 +333,8 @@ async fn product_tools_resolve_settings_without_a_request_layer() {
         )
         .await;
     assert_eq!(code, "params.invalid");
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-054
@@ -350,6 +372,8 @@ async fn check_and_record_cannot_be_skipped() {
     assert!(settings.skip_stages().is_empty());
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].message.contains("CORE-054"), "{warnings:?}");
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-049
@@ -405,4 +429,6 @@ async fn auto_candidate_on_save_defaults_off_and_has_working_doc_survives_edits(
     let keys: Vec<&String> = after.as_object().unwrap().keys().collect();
     let before: Vec<&String> = manifest.as_object().unwrap().keys().collect();
     assert_eq!(keys, before, "no key moved or was added");
+    fx.shutdown().await;
+    assert_removed(env);
 }

@@ -912,6 +912,11 @@ pub trait Probe: Send + Sync + std::fmt::Debug {
     fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {
         reparse_tag(path)
     }
+    /// The entries of the folder `dir` (`std::fs::read_dir` of its [`long_path`]). The store's
+    /// and the index's walks of the workspace list their folders through it.
+    fn read_dir(&self, dir: &Path) -> io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(long_path(dir))
+    }
 }
 
 /// The real [`Probe`]. `open_read` shares read, write and delete, so a reader never blocks a

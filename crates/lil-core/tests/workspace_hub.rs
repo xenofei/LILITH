@@ -388,6 +388,88 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
     );
 }
 
+/// The real probe, counting the listings of `root` itself: every whole-tree walk (the
+/// store's recovery and orphan scans, the index's reconcile) starts by listing the root.
+#[derive(Debug)]
+struct CountingWalks {
+    root: PathBuf,
+    walks: std::sync::atomic::AtomicUsize,
+}
+
+impl lil_platform::fs::Probe for CountingWalks {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+
+    fn read_dir(&self, dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+        if dir == self.root {
+            self.walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        SystemProbe.read_dir(dir)
+    }
+}
+
+/// Plan-2b Minor 9: a read-write open walks the tree once (recovery's leftover scan, which
+/// also finds the conflict copies the orphan list needs) before the index's own walk.
+#[test] // spec: CORE-038, CORE-041
+fn workspace_open_walks_the_tree_once() {
+    let env = TestEnv::new();
+    let ws_path = env.make_workspace("alpha");
+    let conflict = "notes/a.txt.lil-conflict-20261016T120000Z";
+    write_file(
+        &ws_path
+            .join("notes")
+            .join(conflict.rsplit('/').next().unwrap()),
+        b"outside",
+    );
+    // A conflict copy in the workspace data folder is no orphan.
+    write_file(
+        &ws_path
+            .join(".lilith")
+            .join("x.lil-conflict-20261016T120000Z"),
+        b"core's own",
+    );
+    let ws = workspace_ref(&ws_path);
+    let probe = Arc::new(CountingWalks {
+        root: ws.path.clone(),
+        walks: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let states = registry(&env.env);
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let hub = WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        Arc::new(EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+        probe.clone(),
+        lil_core::watch::WatchConfig::default(),
+    );
+    let rt = runtime();
+
+    let open = rt.block_on(hub.open(&ws)).expect("the workspace opens");
+    assert_eq!(open.access, Access::ReadWrite);
+    rt.block_on(open.index.ready());
+    assert_eq!(open.orphans, [WsPath::parse(conflict).unwrap()]);
+    assert_eq!(
+        probe.walks.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one walk before the index's own"
+    );
+    drop(open);
+    rt.block_on(hub.close_all());
+    states.close();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Both locks (plan decision D4, Review Focus 2).
 // ---------------------------------------------------------------------------------------------

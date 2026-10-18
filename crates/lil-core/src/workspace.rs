@@ -479,8 +479,10 @@ impl WorkspaceHub {
     ///    lock, copies a legacy `state.db` forward (D3);
     /// 4. the store, and its `recover()` (read-write only); its `maintenance()` then starts in
     ///    the background and runs every [`MAINTENANCE_PERIOD`] while the workspace stays open;
-    /// 5. `orphans()`, published once on the `workspace` topic as
-    ///    `{kind: "orphans", paths}` when there are any;
+    /// 5. the orphans, published once on the `workspace` topic as
+    ///    `{kind: "orphans", paths}` when there are any. Read-write, the conflict copies come
+    ///    from recovery's walk, so the open walks the tree once before the index's own walk
+    ///    (plan-2b Minor 9); read-only, `orphans()` walks it;
     /// 6. the index (`index.db` read-write, in memory read-only), set as the store's change
     ///    sink;
     /// 7. the watcher (read-write only): the fail point `watch.start` comes just before it.
@@ -583,18 +585,25 @@ impl WorkspaceHub {
             .with_access(access)
             .with_machine(&self.env.machine_id()),
         );
+        let mut conflicts = None;
         if access == Access::ReadWrite {
             match store.recover().await {
                 Ok(report) => {
-                    tracing::info!(workspace = %ws.path.display(), ?report, "workspace recovered")
+                    tracing::info!(workspace = %ws.path.display(), ?report, "workspace recovered");
+                    conflicts = Some(report.conflict_copies);
                 }
                 Err(e) => {
                     tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace recovery stopped; it runs again at the next open")
                 }
             }
         }
-        // 5.
-        let orphans = store.orphans().await.unwrap_or_else(|e| {
+        // 5. The conflict copies come from recovery's walk (plan-2b Minor 9); only without one
+        // (read-only, or a recovery that stopped) does the orphan scan walk the tree itself.
+        let orphans = match conflicts {
+            Some(conflicts) => store.orphans_with_conflicts(conflicts).await,
+            None => store.orphans().await,
+        };
+        let orphans = orphans.unwrap_or_else(|e| {
             tracing::warn!(workspace = %ws.path.display(), error = %e, "the orphans can't be listed");
             Vec::new()
         });
@@ -880,14 +889,21 @@ fn default_of(env: &Env) -> Option<WorkspaceRef> {
     Some(WorkspaceRef { id, path })
 }
 
-/// `state.unavailable` for a workspace `state.db` that can't be opened.
+/// `state.unavailable` for a workspace `state.db` that can't be opened. A damaged, newer or
+/// mid-write file needs the person: a retry can't help, and `lil doctor` offers the repair.
 fn state_unavailable(ws: &WorkspaceRef, e: &StateError) -> ErrorBody {
     tracing::error!(workspace = %ws.path.display(), error = %e, "the workspace state.db can't be opened");
+    let next = match e {
+        StateError::TooNew { .. } | StateError::Corrupt(_) | StateError::HotJournal => {
+            "this needs you: run `lil doctor` in a terminal; it explains what it found and asks \
+             before it sets the database aside"
+        }
+        _ => "retry with the same idempotency key",
+    };
     ErrorBody::new(
         &STATE_UNAVAILABLE,
         format!(
-            "The state database of the workspace {} is not available ({e}); retry with the same \
-             idempotency key.",
+            "The state database of the workspace {} is not available ({e}); {next}.",
             ws.path.display()
         ),
         "",

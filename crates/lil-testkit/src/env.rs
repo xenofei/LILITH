@@ -43,9 +43,11 @@ pub struct TestEnv {
     /// core ([`crate::CoreFixture`]): the drop then gives a pipe that is not there yet a short
     /// retry, since such a process may still be starting.
     pub(crate) launched: AtomicBool,
-    /// The temporary directory. Removed by this type's drop, not by `tempfile`, whose removal
-    /// stops at the first locked file and discards the error.
+    /// The temporary directory. Removed by this type's drop (or [`TestEnv::close`]), not by
+    /// `tempfile`, whose removal stops at the first locked file and discards the error.
     root: PathBuf,
+    /// Set by [`TestEnv::close`]: the drop then has nothing left to do.
+    closed: bool,
 }
 
 /// What a finished `lil` run printed and returned.
@@ -100,6 +102,7 @@ impl TestEnv {
             drain_counts: Arc::default(),
             launched: AtomicBool::new(false),
             root,
+            closed: false,
         }
     }
 
@@ -424,20 +427,45 @@ impl Default for TestEnv {
     }
 }
 
-impl Drop for TestEnv {
-    /// Drains any core still serving this channel, for example one that `lil` started and this
-    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Then removes the
-    /// temporary directory with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
-    /// another handle still holds a file, and reports what it had to leave on stderr and in
-    /// [`crate::cleanup::leftovers_log`]. Never panics.
-    fn drop(&mut self) {
+impl TestEnv {
+    /// What the drop does, now, for a fixture that has closed everything that held files in
+    /// the folder (its hub and state databases) and wants to know the folder went: drains any
+    /// core still on the channel, removes the folder (retrying for up to 2 s while another
+    /// handle holds a file), and returns what it had to leave, each entry as `<path>: <error>`.
+    /// Leftovers are also reported as the drop reports them.
+    ///
+    /// # Errors
+    /// The entries left behind.
+    pub fn close(mut self) -> Result<(), Vec<String>> {
+        self.closed = true;
+        self.clean_up()
+    }
+
+    /// The drop's work; `Err` lists what was left (already reported).
+    fn clean_up(&self) -> Result<(), Vec<String>> {
         crate::core::drain_channel(
             &self.env.pipe_name(),
             self.launched.load(Ordering::Relaxed),
             Arc::clone(&self.drain_counts),
         );
-        if let Err(left) = crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR) {
+        crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR).map_err(|left| {
             crate::cleanup::report_leftovers(&self.root, &left);
+            left.iter()
+                .map(|(path, e)| format!("{}: {e}", path.display()))
+                .collect()
+        })
+    }
+}
+
+impl Drop for TestEnv {
+    /// Drains any core still serving this channel, for example one that `lil` started and this
+    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Then removes the
+    /// temporary directory with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
+    /// another handle still holds a file, and reports what it had to leave on stderr and in
+    /// [`crate::cleanup::leftovers_log`]. Never panics. After [`TestEnv::close`] it does nothing.
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.clean_up();
         }
     }
 }
