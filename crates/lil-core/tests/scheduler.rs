@@ -1008,3 +1008,37 @@ async fn an_oversized_job_waits_for_the_other_engines_unload() {
     rig.idle().await;
     rig.shutdown().await;
 }
+
+/// P3-R16 (round 3): free VRAM creeping up 10 MiB a sample is drift, not a rise, so the
+/// oversized job still runs after 3 samples.
+#[tokio::test] // spec: ARCH-071
+async fn free_vram_drift_does_not_restart_the_flat_count() {
+    let nvml = [12000, 12010, 12020, 12030, 12040];
+    let rig = Rig::new(
+        Some(script(
+            nvml.iter().map(|f| gpu(*f)).collect(),
+            vec![mem(&[(100, 600)])],
+        )),
+        Arc::new(NoEngines),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let big = rig.submit(heavy(20000, None)).await;
+    rig.in_substatus(&big.job_id, "waiting_for_vram").await;
+    rig.telemetry.tick(3).await;
+    assert_eq!(rig.finished(&big.job_id).await["status"], "succeeded");
+    let first_go = rig
+        .recording
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, _, a)| *a == Admit::Go)
+        .map(|(_, sample, _)| *sample);
+    assert_eq!(
+        first_go,
+        Some(4),
+        "baseline at sample 1, then 3 samples of drift"
+    );
+    rig.shutdown().await;
+}

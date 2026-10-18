@@ -12,8 +12,8 @@
 //!   `total − 512 MiB` and never refused for its size. Such a job runs once the card is as
 //!   free as it can be (the driver and the desktop always hold some): the `gpu-heavy` lane is
 //!   idle (it is only asked about then), every other engine holding VRAM has been unloaded (the
-//!   scheduler asks it) or holds none, and its free VRAM has not risen for
-//!   [`FLAT_SAMPLES`] consecutive samples. The engine then offloads; out of memory is retried.
+//!   scheduler asks it) or holds none, and its free VRAM has not risen (by more than
+//!   [`RISE_MIB`] from one sample to the next) for [`FLAT_SAMPLES`] consecutive samples. The engine then offloads; out of memory is retried.
 //! - **Without a check.** On a machine with no GPU source at all ([`Telemetry::has_gpu`] is
 //!   `false`, so no NVML) the job runs unchecked, marked `vram_unchecked`. With NVML but no
 //!   live reading yet (before the first sample, or while the GPU is lost) it waits for the next
@@ -49,6 +49,10 @@ pub const VRAM_MARGIN_MIB: u64 = 512;
 /// A job whose need is above the card runs once its free VRAM has not risen for this many
 /// consecutive samples (ruling P3-R16).
 pub const FLAT_SAMPLES: u32 = 3;
+
+/// Free VRAM "rises" (restarting that count) only when it grows by more than this since the
+/// previous sample: small drift doesn't.
+pub const RISE_MIB: u64 = 64;
 
 /// A job's watchdog flags it once it runs longer than this many times its expected time.
 const WATCHDOG_FACTOR: u64 = 3;
@@ -194,7 +198,7 @@ impl GpuScheduler {
     }
 
     /// The consecutive samples, up to this one, over which the free VRAM `free_mib` of a job
-    /// of `engine` has not risen. Asked again within a sample, it answers the same; a sample
+    /// of `engine` has not risen by more than [`RISE_MIB`] a sample. Asked again within a sample, it answers the same; a sample
     /// missed, or another engine, starts the count again.
     fn flat_samples(&self, engine: Option<EngineKind>, free_mib: u64) -> u32 {
         let sample = self.telemetry.sample_count();
@@ -202,7 +206,11 @@ impl GpuScheduler {
         match flat.as_mut() {
             Some(f) if f.engine == engine && f.sample == sample => f.flat,
             Some(f) if f.engine == engine && f.sample + 1 == sample => {
-                f.flat = if free_mib > f.free_mib { 0 } else { f.flat + 1 };
+                f.flat = if free_mib > f.free_mib.saturating_add(RISE_MIB) {
+                    0
+                } else {
+                    f.flat + 1
+                };
                 f.free_mib = free_mib;
                 f.sample = sample;
                 f.flat
