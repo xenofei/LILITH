@@ -1962,3 +1962,47 @@ async fn folder_sizes_are_measured_off_the_sampler_thread() {
     );
     assert_eq!(snap.sizes.workspace_mib, Some(7));
 }
+
+/// A source that opens again but whose reads keep failing is backed off too, not reopened every
+/// second (re-review N1): the same 5 attempts in 61 steps as one that cannot be opened.
+#[tokio::test] // spec: CORE-059
+async fn a_source_that_opens_but_cannot_be_read_is_backed_off() {
+    let lost = json!({"error": "NVML: the driver was unloaded"});
+    let rig = Rig::new(&script(
+        vec![gpu(100_000, 1000), lost.clone()],
+        vec![sys(100)],
+    ));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let counted = attempts.clone();
+    rig.telemetry.set_gpu_opener(Box::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        FakeHwScript::new(script(vec![lost.clone()], vec![sys(100)]))
+            .sources()
+            .0
+    }));
+    rig.run(61).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 5);
+}
+
+/// A run that stored sample times far in the future (a wrong clock that was corrected) is not
+/// followed: the next run stamps its samples with the clock (re-review N2). A clock only a little
+/// behind is still followed (see the test above).
+#[tokio::test] // spec: CORE-062
+async fn a_forward_clock_jump_does_not_stick_across_restarts() {
+    let hw = script(vec![gpu(100_000, 1000)], vec![sys(100)]);
+    let first = Rig::new(&hw);
+    first.clock.advance(Duration::from_secs(10 * 86_400));
+    first.run(1).await;
+    let second = Rig::at(
+        HwSources::from_fake(FakeHwScript::new(hw).sources()),
+        PowerSettings::default(),
+        first.db.clone(),
+        None,
+    );
+    let snap = second.run(1).await;
+    assert_eq!(
+        snap.ts,
+        format_ts(T0_MS),
+        "the new run is back in real time"
+    );
+}

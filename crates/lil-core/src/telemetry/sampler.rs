@@ -375,13 +375,13 @@ impl Sampler {
         self.gpu.is_some()
     }
 
-    /// The sample time for a step at `utc_ms`: strictly after the previous one.
     /// Starts the sample times after `ts`, the newest a previous run stored: a clock that was
     /// set back must not make this run write over rows that are there.
     pub(crate) fn seed_ts(&mut self, ts: i64) {
         self.last_ts = self.last_ts.max(ts);
     }
 
+    /// The sample time for a step at `utc_ms`: strictly after the previous one.
     pub(crate) fn next_ts(&mut self, utc_ms: i64) -> i64 {
         let ts = utc_ms.max(self.last_ts.saturating_add(1));
         self.last_ts = ts;
@@ -402,16 +402,22 @@ impl Sampler {
         {
             if self.reopen_wait > 0 {
                 self.reopen_wait -= 1;
-            } else if let Some(source) = open() {
-                tracing::info!("the GPU source is open again");
-                self.gpu = Some(source);
-                self.reopen_gap = REOPEN_AFTER;
             } else {
+                if let Some(source) = open() {
+                    tracing::info!("the GPU source is open again");
+                    self.gpu = Some(source);
+                }
+                // The wait stands after a successful open too, until a read succeeds: a source
+                // that opens but cannot be read is as much a loss as one that cannot be opened.
                 self.reopen_wait = self.reopen_gap;
                 self.reopen_gap = (self.reopen_gap * 2).min(MAX_REOPEN_GAP);
             }
         }
         let gpu_read = self.gpu.as_mut().map(|g| g.sample());
+        if matches!(gpu_read, Some(Ok(_))) {
+            self.reopen_wait = 0;
+            self.reopen_gap = REOPEN_AFTER;
+        }
         let gpu = self.gpu_state.figures(gpu_read, dt_ms);
 
         // Per-process GPU memory: replaced whole, so processes that ended drop out.

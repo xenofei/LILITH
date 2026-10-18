@@ -61,6 +61,9 @@ pub const MAX_POINTS: usize = 3600;
 /// A step that took longer than this since the previous one counts as this much (a machine
 /// that slept must not integrate a power over the sleep).
 const MAX_DT_MS: u64 = 5000;
+/// How far ahead of the clock a stored sample time may be and still be followed (a clock set
+/// back between runs).
+const MAX_SEED_AHEAD_MS: i64 = 24 * 3_600_000;
 /// Retention is applied this often.
 const PRUNE_EVERY_MS: i64 = 60_000;
 
@@ -775,7 +778,15 @@ impl Telemetry {
         let (run, run_mono_ms) = (unix_ms(started), mono_ms(clock.monotonic()));
         let mut sampler = Sampler::new(src, power, mode == TickMode::Real);
         if let Some(newest) = db.max_ts() {
-            sampler.seed_ts(newest);
+            // A newer row than a day ahead of the clock is a wrong clock that was corrected:
+            // following it would keep every new sample in the future, and the old rows past
+            // pruning, so the clock wins.
+            let now = unix_ms(started);
+            sampler.seed_ts(if newest > now + MAX_SEED_AHEAD_MS {
+                now - 1
+            } else {
+                newest
+            });
         }
         let has_gpu = sampler.has_gpu();
         let inner = Arc::new(Inner {
