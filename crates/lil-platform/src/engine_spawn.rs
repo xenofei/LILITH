@@ -6,9 +6,10 @@
 //! resumed, so it can't start a process outside the job first. It inherits exactly two handles,
 //! the write ends of its stdout and stderr pipes (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`); stdin is
 //! none. Those two ends are inheritable only from just before `CreateProcessW` until our copies
-//! close right after it, so a `std::process::Command` spawned at that moment on another thread
-//! (which inherits every inheritable handle) could take a copy; the engine's output then
-//! still arrives, but its end-of-file waits until that other process exits as well.
+//! close right after it, and that window is held under the crate's spawn lock, which every
+//! `std::process::Command` spawn in `lil-platform` also takes (`process::spawn_lock`), so no
+//! helper child can inherit them and hold the engine's end-of-file open. A `Command` spawned
+//! by another crate in the same process is outside the lock; `lil-core` spawns none itself.
 //!
 //! The listening-socket reads for the loopback check are here too.
 
@@ -31,7 +32,9 @@ use windows::core::{PCWSTR, PWSTR};
 pub use crate::sockets::{listening_sockets, pid_listening_on};
 
 use crate::job_object::KillOnCloseJob;
-use crate::process::{ProcessHandle, command_line, environment_block, io_error, wide_nul};
+use crate::process::{
+    ProcessHandle, command_line, environment_block, io_error, spawn_lock, wide_nul,
+};
 
 /// What to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +64,9 @@ pub fn spawn_engine(
     let environment = environment_block(Vec::new(), &req.env, &[])?;
     let directory = wide_nul(req.cwd.as_os_str(), "the working directory")?;
 
+    // Held until our copies of the write ends are closed (see the module docs). Taken before
+    // the pipes exist, so on an early return they drop, and close, before it is released.
+    let spawning = spawn_lock();
     let (out_read, out_write) = std::io::pipe()?;
     let (err_read, err_write) = std::io::pipe()?;
     let inherited = [
@@ -105,6 +111,7 @@ pub fn spawn_engine(
     // The child has its own copies now; ours close, so the pipes end when the child's do.
     drop(attributes);
     drop((out_write, err_write));
+    drop(spawning);
     created.map_err(|e| io_error(&e))?;
 
     // SAFETY: `CreateProcessW` succeeded, so both handles are fresh and ours.

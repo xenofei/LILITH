@@ -68,12 +68,13 @@ impl KillOnCloseJob {
     }
 
     /// Every process now in the job: the launcher and each of its children, a `conhost.exe`
-    /// included when one was started.
+    /// included when one was started. Never a partial list: the loopback check and the
+    /// scheduler would miss a process. A list that keeps outgrowing the buffer is an error.
     pub fn pids(&self) -> io::Result<Vec<u32>> {
         // The list is a header of two u32 counts (one usize) followed by usize ids.
         let header = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() / size_of::<usize>() - 1;
         let mut room = 16usize;
-        loop {
+        for _ in 0..PID_LIST_TRIES {
             let mut buf = vec![0usize; header + room];
             // SAFETY: `buf` is writable for the size passed and aligned for the list.
             let queried = unsafe {
@@ -85,24 +86,52 @@ impl KillOnCloseJob {
                     None,
                 )
             };
+            let more_data = match queried {
+                Ok(()) => false,
+                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => true,
+                Err(e) => return Err(io_error(&e)),
+            };
             // SAFETY: `buf` starts with a JOBOBJECT_BASIC_PROCESS_ID_LIST header.
             let list = unsafe { &*buf.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-            let (assigned, listed) = (
-                list.NumberOfAssignedProcesses as usize,
-                list.NumberOfProcessIdsInList as usize,
-            );
-            match queried {
-                Ok(()) => {
-                    let ids = &buf[header..header + listed.min(room)];
-                    return Ok(ids.iter().map(|&id| id as u32).collect());
+            let assigned = list.NumberOfAssignedProcesses as usize;
+            let listed = list.NumberOfProcessIdsInList as usize;
+            match pid_list_step(more_data, assigned, listed, room) {
+                PidListStep::Complete(n) => {
+                    return Ok(buf[header..header + n]
+                        .iter()
+                        .map(|&id| id as u32)
+                        .collect());
                 }
-                // Processes joined since the last try: make room for them and a few more.
-                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                    room = room.max(assigned) + 16;
-                }
-                Err(e) => return Err(io_error(&e)),
+                PidListStep::Grow(to) => room = to,
             }
         }
+        Err(io::Error::other(format!(
+            "the job's process list kept growing past the buffer ({PID_LIST_TRIES} tries)"
+        )))
+    }
+}
+
+/// How many times [`KillOnCloseJob::pids`] grows its buffer before giving up.
+const PID_LIST_TRIES: usize = 8;
+
+/// What one `JobObjectBasicProcessIdList` query means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidListStep {
+    /// The list is whole: its first `n` ids are every process in the job.
+    Complete(usize),
+    /// The list is short: try again with room for this many ids.
+    Grow(usize),
+}
+
+/// Decides from a query's result and counts whether the list is whole. It is whole only when
+/// the call succeeded and it lists at least as many ids as the job has processes (all of which
+/// fit in `room`); otherwise there must be room for every assigned process and a few more,
+/// since more may join before the next try.
+fn pid_list_step(more_data: bool, assigned: usize, listed: usize, room: usize) -> PidListStep {
+    if !more_data && listed >= assigned && listed <= room {
+        PidListStep::Complete(listed)
+    } else {
+        PidListStep::Grow(room.max(assigned) + 16)
     }
 }
 
@@ -183,4 +212,23 @@ fn start_time(pid: u32) -> Option<u64> {
     }
     .ok()?;
     Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] // spec: ARCH-064
+    fn pid_list_step_grows_until_every_assigned_process_is_listed() {
+        // Whole: success and every assigned process listed.
+        assert_eq!(pid_list_step(false, 3, 3, 16), PidListStep::Complete(3));
+        // ERROR_MORE_DATA: room for every assigned process and some to spare.
+        assert_eq!(pid_list_step(true, 40, 16, 16), PidListStep::Grow(56));
+        // Success but short (processes joined between the counts): never a partial list.
+        assert_eq!(pid_list_step(false, 17, 16, 16), PidListStep::Grow(33));
+        // A count that says more ids were written than fit is not trusted either.
+        assert_eq!(pid_list_step(false, 20, 20, 16), PidListStep::Grow(36));
+        // Growth never shrinks the buffer.
+        assert_eq!(pid_list_step(true, 2, 0, 64), PidListStep::Grow(80));
+    }
 }

@@ -45,6 +45,14 @@ pub fn nvml_gpu() -> Option<Box<dyn GpuSource>> {
     }))
 }
 
+/// NVML device 0's name and total memory in bytes: what [`crate::hw::nvidia_adapter_luid`]
+/// matches the DXGI adapter by.
+pub(crate) fn nvml_identity() -> Option<(String, u64)> {
+    let nvml = Nvml::init().ok()?;
+    let device = nvml.device_by_index(0).ok()?;
+    Some((device.name().ok()?, device.memory_info().ok()?.total))
+}
+
 struct NvmlGpu {
     nvml: Nvml,
     name: String,

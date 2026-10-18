@@ -20,28 +20,76 @@ use windows::Win32::System::Performance::{
 use windows::core::{HSTRING, PCWSTR};
 
 use crate::hw::{CpuEnergySample, CpuEnergySource, GpuMemSource, ProcGpuMem};
+use crate::hw_nvml::nvml_identity;
 
 const MIB: u64 = 1024 * 1024;
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
-/// The `(LowPart, HighPart)` LUID of the first hardware NVIDIA adapter DXGI lists.
+/// The `(LowPart, HighPart)` LUID of the DXGI adapter that is the GPU [`nvml_gpu`] reads
+/// (NVML device 0), so per-process memory comes from the same card as the GPU figures.
+///
+/// DXGI and NVML share no id, so the adapter is matched by **name and total VRAM**: the
+/// NVIDIA hardware adapter whose description equals NVML's name (ignoring case and surrounding
+/// spaces) and whose dedicated video memory is within 1/16 of NVML's total. `None` when NVML
+/// is missing or when no adapter, or more than one (two identical cards), matches: the
+/// per-process GPU memory is then unknown, never read from another GPU.
+///
+/// [`nvml_gpu`]: crate::hw::nvml_gpu
 pub fn nvidia_adapter_luid() -> Option<(u32, i32)> {
+    let (name, vram_bytes) = nvml_identity()?;
+    match_adapter(&name, vram_bytes, &nvidia_adapters())
+}
+
+/// One NVIDIA hardware adapter as DXGI lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DxgiAdapter {
+    description: String,
+    dedicated_bytes: u64,
+    luid: (u32, i32),
+}
+
+fn nvidia_adapters() -> Vec<DxgiAdapter> {
+    let mut found = Vec::new();
     // SAFETY: plain call; the factory is released when dropped.
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return found;
+    };
     for index in 0.. {
         // SAFETY: the factory is live; an index past the last adapter is an error, which ends
         // the loop.
-        let adapter = unsafe { factory.EnumAdapters1(index) }.ok()?;
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
         // SAFETY: the adapter is live.
         let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
             continue;
         };
         let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
         if desc.VendorId == NVIDIA_VENDOR_ID && !software {
-            return Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart));
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            found.push(DxgiAdapter {
+                description: String::from_utf16_lossy(&desc.Description[..len]),
+                dedicated_bytes: desc.DedicatedVideoMemory as u64,
+                luid: (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart),
+            });
         }
     }
-    None
+    found
+}
+
+/// The one adapter matching `name` and `vram_bytes` (see [`nvidia_adapter_luid`]), or `None`
+/// when none or several do.
+fn match_adapter(name: &str, vram_bytes: u64, adapters: &[DxgiAdapter]) -> Option<(u32, i32)> {
+    let name = name.trim();
+    let mut matches = adapters.iter().filter(|a| {
+        let close =
+            a.dedicated_bytes.abs_diff(vram_bytes) <= a.dedicated_bytes.max(vram_bytes) / 16;
+        close && a.description.trim().eq_ignore_ascii_case(name)
+    });
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some(only.luid),
+        _ => None,
+    }
 }
 
 /// An open PDH query, closed on drop.
@@ -302,6 +350,49 @@ impl CpuEnergySource for EnergyMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn adapter(description: &str, dedicated_bytes: u64, low: u32) -> DxgiAdapter {
+        DxgiAdapter {
+            description: description.to_string(),
+            dedicated_bytes,
+            luid: (low, 0),
+        }
+    }
+
+    #[test] // spec: CORE-059, ARCH-071
+    fn match_adapter_needs_one_adapter_with_the_same_name_and_vram() {
+        let card = "NVIDIA GeForce RTX 4080";
+        let twelve = adapter("NVIDIA GeForce RTX 4070", 12 * GIB, 1);
+        let sixteen = adapter("NVIDIA GeForce RTX 4080", 16 * GIB - 300 * MIB, 2);
+        // NVML device 0 is the 16 GB card even when DXGI lists the other first; DXGI's
+        // dedicated memory is a little under NVML's total.
+        assert_eq!(
+            match_adapter(card, 16 * GIB, &[twelve.clone(), sixteen.clone()]),
+            Some((2, 0))
+        );
+        // Name compared ignoring case and surrounding spaces.
+        assert_eq!(
+            match_adapter(
+                " nvidia geforce rtx 4080 ",
+                16 * GIB,
+                std::slice::from_ref(&sixteen)
+            ),
+            Some((2, 0))
+        );
+        // Same name, different memory: not this card.
+        assert_eq!(
+            match_adapter(card, 8 * GIB, std::slice::from_ref(&sixteen)),
+            None
+        );
+        // No adapter of that name.
+        assert_eq!(match_adapter(card, 16 * GIB, &[twelve]), None);
+        // Two identical cards: ambiguous, so unknown.
+        let twin = adapter("NVIDIA GeForce RTX 4080", 16 * GIB - 300 * MIB, 3);
+        assert_eq!(match_adapter(card, 16 * GIB, &[sixteen, twin]), None);
+        assert_eq!(match_adapter(card, 16 * GIB, &[]), None);
+    }
 
     #[test] // spec: CORE-059
     fn instance_pid_reads_the_pid_of_a_gpu_process_memory_instance() {

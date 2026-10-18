@@ -609,6 +609,21 @@ pub const GIT_REPO_VARS: &[&str] = &[
     "GIT_CONFIG_COUNT",
 ];
 
+/// Serialises every spawn in this crate that inherits handles. `std::process::Command` always
+/// calls `CreateProcessW` with `bInheritHandles = TRUE`, so a child it starts takes a copy of
+/// every handle that is inheritable at that moment. `engine_spawn` makes an engine's two pipe
+/// write ends inheritable just before its own `CreateProcessW` and closes them right after; it
+/// holds this lock for that whole window, and every `Command::spawn` here holds it too, so no
+/// helper child (a `git` run) can inherit an engine's pipes and hold its end-of-file open.
+/// [`SystemSpawner`] passes `bInheritHandles = FALSE` and needs no lock.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes [`SPAWN_LOCK`]. A panic while it was held leaves nothing to repair, so a poisoned
+/// lock is taken all the same.
+pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Runs `exe` with `args` in `cwd`, with `env` added to the current environment, without a
 /// console window (`CREATE_NO_WINDOW`) and with stdin empty and stdout and stderr captured.
 /// A child still running after `within` is killed, and its `code` is `None`.
@@ -657,7 +672,10 @@ pub fn run_hidden_without(
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut child = command.spawn()?;
+    let mut child = {
+        let _spawning = spawn_lock();
+        command.spawn()?
+    };
     let stdout = reader(child.stdout.take());
     let stderr = reader(child.stderr.take());
     let millis = u32::try_from(within.as_millis()).unwrap_or(u32::MAX - 1);
