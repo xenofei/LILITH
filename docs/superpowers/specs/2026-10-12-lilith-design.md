@@ -26,8 +26,8 @@
 | Build vs wrap | Hybrid: wrap strong, maintained projects (ComfyUI first), build in-house otherwise. |
 | Data | Files are the source of truth; databases are caches or durable local state. Sealed asset versions are immutable. (§1.5, §2) |
 | First app | Image studio: Invoke-style canvas with layers, a native ComfyUI node graph (view + tweak + run) and the embedded ComfyUI web UI; delivered as M1a then M1b; the in-app assistant arrives in M1b. (§5, AI-156) |
-| AI | Flagship providers (Anthropic, OpenRouter, NanoGPT, OpenAI, Google, fal, major Chinese providers) and local models through one tool surface; local LLMs in M1.5. (§4) |
-| Assistant | Co-pilot and director modes; default engine **Claude Code** on the user's own Claude sign-in (unmodified `claude` CLI); Anthropic API as the alternative; several Claude Code profiles with **manual** switching only. (§4.6, §4.6a, §4.7) |
+| AI | Flagship providers (Anthropic, OpenRouter, NanoGPT, OpenAI, Google, fal, major Chinese providers) and local models through one tool surface; local LLMs for chat in M1b (plan 7a), for tool use in M1.5. (§4) |
+| Assistant | Three AI surfaces sharing one conversation store, the engines, the tool registry and the suite knowledge: **ORACLE** (general chat that never acts; a new chat starts on the local model), **TETHER** (the in-app, tool-using assistant) and **MAGI Core** (the director, a separate runner). TETHER and MAGI Core default to **Claude Code** on the user's own Claude sign-in (unmodified `claude` CLI); Anthropic API and any `openai_chat` route as alternatives; several Claude Code profiles with **manual** switching only. (§4.6–§4.6d, §4.7) |
 | Money | Track usage and cost of every external service, show account balances and quotas, optional spending caps that agents can't change; no budgets-as-gates. (§2.6, §4.2) |
 | Safety | Yes/no confirmations when AI agents delete, install or run scripts. The suite adds no content filter of its own; each provider's and model's policies apply. (§2.7) |
 | Testing | AI-written code kept honest by protected spec tests, reviews and CI on GitHub-hosted runners; real-engine/GPU tests on demand. (§6) |
@@ -64,7 +64,8 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 | Effect class | `read`, `write`, `destructive`, `exec`: decides whether an agent's call needs your confirmation. |
 | Brief / compile | Prompt Studio's model-neutral, versioned record of what a prompt should achieve (a `prompt_brief` asset), and its rendering into one target model's prompt, negative and settings hints (§4.7a). |
 | Prompt dialect | The form a model wants its prompt in — sentences, tags or an edit instruction — declared by each model profile and applied by the compiler (§4.7a, §5.6a). |
-| Engine | An external program the core drives (ComfyUI; Claude Code as assistant Engine A; the Anthropic API as Engine B; later Blender, local LLM servers). |
+| Engine | An external program the core drives (ComfyUI; Claude Code as assistant Engine A; the Anthropic API as Engine B; any `openai_chat` route, hosted or a local LLM server, as Engine C; later Blender). |
+| ORACLE / TETHER / MAGI Core | The assistant's three surfaces (§4.6): ORACLE is the general chat, which never acts (§4.6b); TETHER is the tool-using assistant inside a studio (AI-039); MAGI Core is the director, which runs tasks (§4.6c). |
 | Profile (Claude Code) | One Claude Code account's config folder (`CLAUDE_CONFIG_DIR`), selectable per conversation. |
 | Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records (lossless JSON/YAML round-trip). Its reference text is `docs/reference/workspace-format.md` (from the `worldwright` plugin's manifest skill); this spec's changes to it (§2.12) take precedence. |
 | Store (large files) | Where Git LFS objects live besides this PC: none ("This PC only"), an external or second drive, or S3-compatible cloud (M1.5) (§7.2). |
@@ -72,7 +73,7 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 
 ### 0.5 Document map
 
-§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer (including §4.7a Prompt Studio) · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification) · Appendix E Workspace data (plan 2b clarification).
+§1 Processes, connections, trust and repo layout · §2 Core modules · §3 Core ↔ app interface, interchange, documents and dashboards · §4 AI layer (including §4.6b ORACLE, §4.6c TETHER and MAGI Core, §4.6d rules shared by the AI surfaces, §4.7a Prompt Studio) · §5 Image studio · §6 Errors, testing and quality · §7 Sync, backup and builds · Appendix A Milestones · Appendix B M0 spike checklist and facts to re-verify · Appendix C Research notes · Appendix D Core protocol (plan 2 clarification) · Appendix E Workspace data (plan 2b clarification).
 
 ---
 
@@ -88,6 +89,7 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
 |---|---|---|
 | `lil-core` | Rust (tokio); per-user background process, started on demand | The authority on what a workspace means and the only writer of workspace files among suite processes. All module logic (image operations now; 2D, 3D and audio later) lives here as tools. Supervises engines and Claude Code engine processes. |
 | `lil-image` | Rust + Qt 6 Quick/QML (cxx-qt) + C++ shim | The Image studio (§5). In M1 it also hosts the suite's shared panels. |
+| `lil-oracle` | Rust + Qt 6 Quick/QML (cxx-qt), shared shell | ORACLE's small window of its own (§4.6b), usable with no studio open. Caller kind `ui:oracle`. From M1b (plan 7a). |
 | `lil-mcp` | Rust (`rmcp`), stdio | The MCP server Claude Code spawns. Protocol adaptation only. |
 | `lil` | Rust CLI | Debugging, Claude Code hooks, setup checks, scheduled tasks, the end-to-end test harness. |
 | windowless launcher | Rust | Runs `lil` commands from Task Scheduler without a console window. |
@@ -172,11 +174,11 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
 - **ARCH-036** [M1] (contract) Every tool and RPC result is exactly one of `ok`, `pending_confirmation` or `error` (fields in §6.1). `pending_confirmation` is not an error. (plan 2 clarification: Appendix D)
 
 **Tool descriptors and lowering** — tool descriptors are shared; the wire protocols aren't.
-- **ARCH-037** [M1] (contract) Each tool has one internal descriptor: name; description of at most 2,000 characters with the critical information first (Claude Code truncates descriptions at 2,048 characters, verified 2026-10-12); input and output schemas generated by `schemars`, pinned to JSON Schema 2020-12; effect class (ARCH-051); annotations.
+- **ARCH-037** [M1] (contract) Each tool has one internal descriptor: name; description of at most 2,000 characters with the critical information first (Claude Code truncates descriptions at 2,048 characters, verified 2026-10-12); input and output schemas generated by `schemars`, pinned to JSON Schema 2020-12; effect class (ARCH-051); egress class (AI-219, from M1b); annotations.
 - **ARCH-038** [M1] (contract) Each tool has one internal result shape: `{structured, artifacts: [FileRef], summary_text}`.
 - **ARCH-039** [M1] (contract) Lowering to MCP returns JSON text plus file paths. `structuredContent` and `resource_link` are added only as optional extras, because Claude Code doesn't document them. Tool failures are results with `isError: true` and JSON text; JSON-RPC errors are used only for protocol faults (§6.1).
-- **ARCH-040** [M1] M1 lowers to two targets: MCP, and Anthropic Messages tool definitions for Engine B (§4.6). Each target has snapshot tests.
-- **ARCH-041** [Later] Further lowering targets (OpenAI strict, Gemini, others) are added with the engines that need them.
+- **ARCH-040** [M1] M1 lowers to two targets: MCP, and Anthropic Messages tool definitions for Engine B (§4.6). A third, `openai_tools` for Engine C, arrives with TETHER in M1b (AI-210). Each target has snapshot tests.
+- **ARCH-041** [Later] Further lowering targets (Gemini, others) are added with the engines that need them. OpenAI-style function tools are no longer among them: they arrive in M1b (AI-210).
 
 **Interchange primitives** (used by later sections)
 - **ARCH-042** [M1] (contract) The canonical asset reference is `lil://<workspace>/<project>/<asset>@<version>`, mapping 1:1 to the manifest link syntax. Candidates are referenced as `lil://<workspace>/<project>/<asset>@candidate/<run>/<file>` for viewing and provenance only — never as live links or recipe inputs.
@@ -194,7 +196,7 @@ All enforcement happens in the core's dispatcher (§2.2).
 - **ARCH-045** [M1] (contract) Every connection has exactly one caller kind: `ui:<app>`, `assistant`, `mcp` or `cli`. The core decides it from `GetNamedPipeClientProcessId` and the handshake, never from the declared kind alone.
 - **ARCH-046** [M1] (invariant) A connection is `ui:<app>` only if the client process is a LILITH app executable from the install directory (or the dev directory for dev builds).
 - **ARCH-047** [M1] A connection is `mcp` only if the client process is `lil-mcp.exe` from the install directory or the per-user bin folder (`%LOCALAPPDATA%\LILITH\bin\`), with a best-effort check that a `claude.exe` is its parent or grandparent.
-- **ARCH-048** [M1] (invariant) A connection is `assistant` (`engine: claude_code`, with the conversation's workspace id) when it presents a valid per-launch engine token. The token is unguessable and issued per `claude` process; the core holds that process's handle, so its PID can't be reused. A token that is forged, reused or belongs to a `claude` process that has ended is invalid, and calls presenting it are refused (ARCH-050).
+- **ARCH-048** [M1] (invariant) A connection is `assistant` (`engine: claude_code`, with the conversation's workspace id) when it presents a valid per-launch engine token. The token is unguessable and issued per `claude` process; the core holds that process's handle, so its PID can't be reused. A token that is forged, reused or belongs to a `claude` process that has ended is invalid, and calls presenting it are refused (ARCH-050). The in-process engines (B and C) have no connection of their own: their model tool calls run under a core-built `assistant` session (AI-215).
 - **ARCH-049** [M1] (invariant) The engine token is never in `claude`'s environment (it would leak into every command the agent runs). It reaches `lil-mcp` only through the core-generated MCP config entry's `env` (§4.6).
 - **ARCH-050** [M1] A connection that presents an invalid engine token is refused — it is never downgraded to `cli`. Every other connection that isn't `ui:<app>`, `mcp` or `assistant` is `cli`.
 
@@ -236,7 +238,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 
 - **ARCH-064** [M1] (invariant) Owned engines run in a kill-on-close Job Object for crash cleanup only; normal exits stop them explicitly. Attached engines are never stopped by the suite.
 - **ARCH-065** [M1] (decision) In M1 the core manages ComfyUI only, as owned or attached depending on who started it.
-- **ARCH-066** [M1.5] (decision) Local LLM runtimes: `llama-server` as an owned engine (started with `--api-key`, bound to 127.0.0.1) and Ollama as an attached one (§4).
+- **ARCH-066** [M1.5] (decision) Local LLM runtimes: `llama-server` as an owned engine (started with `--api-key`, bound to 127.0.0.1) and Ollama as an attached one (§4). Their chat-only use in ORACLE arrives early, in M1b with plan 7a (AI-204); everything else stays M1.5.
 - **ARCH-067** [Later] Headless Blender as an owned engine; Blender UI, Godot editor and Krita as user-interactive engines.
 
 **ComfyUI**
@@ -334,7 +336,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 | `lil-qt-shim` | C++: KDDockWidgets (Qt Quick) docking, `QQuickRhiItem` canvases, QtWebEngine view, clipboard/drag `QMimeData`, live-preview image provider, notification and `lil:` activation glue, monitor colour profile (a tablet event filter only if pen input is revived, IMG-046) — anything cxx-qt lacks |
 | `lil-ui-kit` | QML only: theme, shared shell and top bar, Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant panel, Diagnostics (with the Backups panel), the three shared dialogs (§3.1) |
 | `lil-testkit` | fixture workspaces (real lantern manifest), fake ComfyUI (HTTP + websocket, serving the pinned frontend), fake providers and recorded fixtures, fake `claude` (honours `CLAUDE_CONFIG_DIR`), git-ops simulator, handle-holding helper, fail points, watcher fence, injected clock and ids, the test environment provider, per-test pipe channel (§6.5) |
-| binaries | `lil-core`, `lil-mcp`, `lil`, `lil-image`, the windowless launcher; `lil-hub` *(later)* |
+| binaries | `lil-core`, `lil-mcp`, `lil`, `lil-image`, `lil-oracle` (M1b), the windowless launcher; `lil-hub` *(later)* |
 
 - **ARCH-111** [M1] (invariant) `lil-schema` and `lil-protocol` have no Qt or Windows dependencies (checked by a dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, §6.2). Formats and the protocol are platform-neutral; Windows API calls live only in the platform crate. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test.)
 - **ARCH-112** [M1] (invariant) Within `lil-core`, file write, rename and remove APIs are disallowed by a per-crate `clippy.toml`, with a single allowance inside `store` (§6.2).
@@ -356,10 +358,10 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 
 ### 1.10 Milestone scope
 
-- **ARCH-123** [M1] (decision) M1 is the core, the Image studio (split M1a / M1b, §5.11) and `lil-mcp`, against **one workspace**, with **ComfyUI as the only managed engine**. In M1 this section also covers: metering of every external call, optional caps, account info for the providers configured in M1, hardware telemetry, both assistant engines (Claude Code as default, Anthropic API as the alternative) with multiple Claude Code profiles, the §3 M1 app shell and panels, and the §7 M1 repo, backup and installer work.
+- **ARCH-123** [M1] (decision) M1 is the core, the Image studio (split M1a / M1b, §5.11) and `lil-mcp`, against **one workspace**, with **ComfyUI as the only managed engine**. In M1 this section also covers: metering of every external call, optional caps, account info for the providers configured in M1, hardware telemetry, the assistant's three surfaces (ORACLE, TETHER and MAGI Core, §4.6) on Engines A, B and C (Claude Code as TETHER's and MAGI Core's default) with multiple Claude Code profiles, the §3 M1 app shell and panels, and the §7 M1 repo, backup and installer work.
 - **ARCH-124** [M1] (decision) Designed now so the protocol doesn't change later, but not built in M1:
-  - M1.5: local LLM runtimes (ARCH-066), the loopback OpenTelemetry receiver (ARCH-007), multi-machine Sync (ARCH-087), document checkpoints (ARCH-093);
-  - Later: the separate Hub app (ARCH-011), multiple workspaces (ARCH-091), leases and checkout/checkin (ARCH-092), interactive-engine bridges (ARCH-067), lowering beyond MCP and Anthropic Messages (ARCH-041), minidumps (ARCH-120).
+  - M1.5: local LLM runtimes (ARCH-066; their chat-only use in ORACLE is M1b, AI-204), the loopback OpenTelemetry receiver (ARCH-007), multi-machine Sync (ARCH-087), document checkpoints (ARCH-093);
+  - Later: the separate Hub app (ARCH-011), multiple workspaces (ARCH-091), leases and checkout/checkin (ARCH-092), interactive-engine bridges (ARCH-067), lowering beyond MCP, Anthropic Messages and `openai_tools` (ARCH-041), minidumps (ARCH-120).
 
 ---
 
@@ -571,7 +573,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 **Caps (optional)**
 
 - **CORE-085** [M1] (decision) Caps are optional and off by default. There is an optional suite-wide monthly cap, an optional monthly cap per provider, and an optional per-call maximum. They are set in the display currency, and the exchange rate used is recorded with each reservation.
-- **CORE-086** [M1] (contract) Each call reserves an upper-bound estimate: for LLMs, input tokens × input price + `max_tokens` × output price; for images, count × unit price; for time-billed calls, the watchdog maximum × rate.
+- **CORE-086** [M1] (contract) Each call reserves an upper-bound estimate: for LLMs, input tokens × input price + `max_tokens` × output price; for images, count × unit price; for time-billed calls, the watchdog maximum × rate. Every LLM request therefore sends an explicit output limit, so the bound holds; a provider profile that can't bound output isn't used for metered calls under a cap or the assistant's spend allowance (AI-216, AI-217).
 - **CORE-087** [M1] (invariant) The cap check "settled + in-flight reservations + this estimate ≤ cap" is atomic, so concurrent calls can't overshoot. It runs as one transaction in the suite-level `state.db`, which holds every reservation (from any workspace or none) and this machine's settled totals per cap and period (CORE-004).
 - **CORE-088** [M1] (contract) A reservation settles to the actual cost. A failed call releases its reservation for providers that don't bill failures. A job in `interrupted_unknown` keeps its reservation until you resolve it.
   - Each reservation records its workspace (or none) and its job or call id. Settling is idempotent by reservation id, so a crash between writing the usage record (workspace) and settling the reservation (suite level) is repaired on the next start.
@@ -629,7 +631,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - `destructive`: delete, purge trash, overwrite outside the version system, `resource.delete`, and an agent-initiated stop or restart of an engine that would kill jobs submitted from outside the suite.
   - `exec`: install nodes or packages, run scripts or arbitrary code, download executable formats (pickled `.ckpt`/`.pt`/`.bin`, custom-node packs, wheels).
   - Plain `write`: downloading `.safetensors` or `.gguf` files; the scheduler's own engine start and idle-down; document edits by agents, including layer deletion and discarding proposals, which are undoable inside the document (§5.10).
-- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (both engines), Claude Code via MCP, and scripts via `lil` — are asked to confirm, and only for `destructive` and `exec` tools. Your own actions in the apps never ask.
+- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (every engine and surface, §4.6), Claude Code via MCP, and scripts via `lil` — are asked to confirm, and only for `destructive` and `exec` tools, plus the egress confirmations for assistant sessions (AI-219, M1b). Your own actions in the apps never ask. A model's tool calls are never your own actions: they always run under a core-built agent session, never an app's `ui:*` session (AI-215; plan-3 ruling P3-R9).
 - **CORE-110** [M1] (invariant) Deletes are always soft (to `.trash/`), whoever makes them.
 - **CORE-111** [M1] (invariant) A caller-supplied `confirm: true` is never accepted. A confirmation is answered only by a verified `ui:*` connection after a real input event in the shared dialog, or by Claude Code's own prompt (below). Every answer records how it was given (`confirmed_via: app | claude_code`).
 - **CORE-112** [M1] (contract) The core decides per connection whether a tool carries `_meta["anthropic/requiresUserInteraction"]`:
@@ -639,7 +641,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - in the open suite app (the Confirmations panel, and inline for your own actions);
   - with no app open, the core posts a Windows notification; clicking it opens `lil:confirm/<id>`, which launches a minimal `lil-image --confirm <id>` window in front. `lil --confirm-window` can launch it directly (opt-in, for interactive use, not scripts). The core itself never shows UI (§3.3).
   - The same rule as for caps (CORE-091) applies: a call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks), or other calls for which no confirmation can be answered, get the error `confirm.unavailable` (§6). Director tasks always get `pending_confirmation` (CORE-114).
-- **CORE-114** [M1] (contract) Co-pilot pending confirmations are cancelled when the app that started them closes. Director tasks' confirmations persist with the job, and the task continues with other steps or pauses in `waiting_confirmation` (§2.8, §4).
+- **CORE-114** [M1] (contract) TETHER's pending confirmations are cancelled when the app that started them closes. Director tasks' confirmations persist with the job, and the task continues with other steps or pauses in `waiting_confirmation` (§2.8, §4).
 - **CORE-115** [M1] (contract) Each pending confirmation has an expiry (`expires_at`); answering with deny or letting it expire returns `confirm.denied` or `confirm.expired` to a retry with its token (§6).
 - **CORE-116** [M1] (contract) **Outside the suite:** Plugin 1.3 adds Claude Code PreToolUse hooks that return "ask" for:
   - Bash and PowerShell commands matching delete, install or script-run patterns (`rm`, `del`, `Remove-Item`, `rmdir`, `git clean`, `git reset --hard`, `pip` / `uv pip` / `npm` / `comfy node install`, `python <script>`, `blender -P`, …);
@@ -653,7 +655,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - `submitting`, `waiting_for_vram`, `queued_in_engine` → `queued`;
   - `interrupted` → `failed`;
   - `interrupted_unknown` → `running` until you resolve it.
-- **CORE-118** [M1] (contract) **Director tasks** are jobs of kind `assistant_task` (§4) with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused`, `interrupted`. After a core restart a running task becomes `interrupted` and resumes only when you choose. `waiting_auth` (the Claude Code sign-in for that profile has expired) is distinct from `waiting_quota` and is never retried automatically; co-pilot calls in the same situation fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6). M1 allows one director task per workspace; others queue.
+- **CORE-118** [M1] (contract) **Director tasks** are jobs of kind `assistant_task` (§4) with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused`, `interrupted`. After a core restart a running task becomes `interrupted` and resumes only when you choose. `waiting_auth` (the Claude Code sign-in for that profile has expired) is distinct from `waiting_quota` and is never retried automatically; TETHER and ORACLE calls in the same situation fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6). M1 allows one director task per workspace; others queue.
 - **CORE-119** [M1] (contract) Proposal runs are jobs too, with `doc_id` and full hardware/energy attribution. When a director's proposal run finishes while the document is closed, the core writes it into the document's proposals under its own hold.
 - **CORE-120** [M1] (invariant) **Exactly once:** the core mints the ComfyUI `prompt_id` (canonical lowercase UUID) or the provider's idempotency key, persists `submitting` before sending, and checks status before any resubmission.
 - **CORE-121** [M1] (contract) **Lanes:** `gpu-heavy` (holds the GPU lease) and `cpu`.
@@ -662,7 +664,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 - **CORE-124** [M1] (contract) **Priority classes:** interactive operations (select object, preprocessors, Prompt Studio previews, AI-181) > your generations > agent and director batches. Within a class, first in, first out; batches may be grouped by model profile within their class, with a limit so nothing waits forever. Interactive operations still wait for the prompt already running, and the status bar says so.
 - **CORE-125** [M1] An optional setting cancels and resubmits a running **agent batch** prompt when an interactive operation arrives. It never does this to your own jobs.
 - **CORE-126** [M1] **GPU scheduler:** checks free VRAM via `telemetry`; an engine's own resident VRAM counts as available to that engine; the watchdog starts at `execution_start`.
-- **CORE-127** [M1.5] Local LLM engines (`llama-server` owned, Ollama attached) are scheduled around image jobs for VRAM and metered as local work ($0, GPU time and energy).
+- **CORE-127** [M1.5] Local LLM engines (`llama-server` owned, Ollama attached) are scheduled around image jobs for VRAM and metered as local work ($0, GPU time and energy). ORACLE's chat-only use arrives earlier, in M1b, on the same scheduler (AI-204, AI-205).
 - **CORE-128** [M1] (contract) **Retries:**
   - transient failures retry with backoff; disk-full is non-retryable;
   - a disk preflight checks space for the expected output plus staging; batches checkpoint their progress;
@@ -753,7 +755,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 ### 2.13 Milestone scope
 
 - **M1:** every module in §2.1 except `imports` and multi-machine `sync`, with: the dispatcher; assets, candidates, sign-off, trash and proposals; content hashes in references; cap reservations in the suite-level `state.db`; creation UUIDs on every asset; the status machine and settings cascade; telemetry with per-job energy; usage records for every provider, cost sources, M1 price rules and the reprice job; optional caps; fixed recurring costs; account sync for Anthropic (headers), OpenRouter, NanoGPT and Claude Code plan usage per profile; agent safety confirmations; the suite-held ComfyUI queue; QA and repair; the converters and tools tagged M1, M1a or M1b in §2.10–§2.11 (M1a/M1b follow §5's split).
-- **M1.5:** the `network` lane and hosted media jobs (fal account sync with them); local LLM engines; the loopback OpenTelemetry receiver for interactive Claude Code sessions; document checkpoints (cloud store `docs/` prefix); large-file store changes involving a cloud store; destinations other than the local drive and OneDrive; multi-machine sync with UUID-based collision renames and resolution through `renamed_from`.
+- **M1.5:** the `network` lane and hosted media jobs (fal account sync with them); local LLM engines beyond ORACLE's chat-only use (which is M1b, AI-204); the loopback OpenTelemetry receiver for interactive Claude Code sessions; document checkpoints (cloud store `docs/` prefix); large-file store changes involving a cloud store; destinations other than the local drive and OneDrive; multi-machine sync with UUID-based collision renames and resolution through `renamed_from`.
 - **Later:** leases; `project.clone`, `project.delete`, `portfolio.status`; `imports`; `lib:` links and promote; further price-rule kinds; account sync for further providers and admin-key reports; the later converters.
 
 ---
@@ -874,7 +876,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Assistant calls and app lifetime**
 
-- **APP-052** [M1] (invariant) **Co-pilot** calls come from an open app; if that app closes mid-turn, its pending calls are cancelled.
+- **APP-052** [M1] (invariant) **TETHER** calls come from an open app; if that app closes mid-turn, its pending calls are cancelled.
 - **APP-053** [M1] (invariant) **Director tasks** are jobs (`kind: assistant_task`, §4.6) owned by the core: they keep running when the app closes, and their pending confirmations stay pending and use the notification path (APP-048).
 
 **Cap confirmations on your own actions**
@@ -1004,7 +1006,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Agents and documents**
 
-- **APP-107** [M1] Agent `doc.*` tools (§5.10) edit **closed** documents through `store`, under the core's hold. On **open** documents they're forwarded to the app holding the document and applied there as one undoable step. (The co-pilot needs this to work on the document you're editing.)
+- **APP-107** [M1] Agent `doc.*` tools (§5.10) edit **closed** documents through `store`, under the core's hold. On **open** documents they're forwarded to the app holding the document and applied there as one undoable step. (TETHER needs this to work on the document you're editing.)
 
 **Outside edits**
 
@@ -1101,7 +1103,7 @@ These are verified in the M0 and M1 benchmarks and reported pass/fail in each mi
 
 - **M0 spike:** frame times and GUI-thread stalls under ComfyUI load (APP-135); pasting into Discord and Chromium (APP-071).
 - **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.wwdoc`; "Add to project"; the `lil:` protocol (including `lil:task/<job_id>`), `.wwref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
-- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
+- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b, as do the ORACLE window (`lil-oracle`) and the Assistant dock's labelled levels (§4.6b).
 - **M1.5:** named layout presets; document checkpoints and cross-machine restore (with the S3-compatible store); resolving references through `renamed_from`; the interactive Claude Code token panel.
 - **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; a standalone Prompt Studio app; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
 
@@ -1109,11 +1111,11 @@ These are verified in the M0 and M1 benchmarks and reported pass/fail in each mi
 
 ## 4. AI layer: providers, metering, assistant, Claude Code
 
-This section covers how the core talks to hosted and local AI models, how every call is metered, the built-in assistant and its two engines, Claude Code accounts, Claude Code integration in both directions, and Prompt Studio (§4.7a). All of it lives in the core's `providers`, `assistant` and `prompt` modules (§2) and is reached through the same tool surface as everything else (§1).
+This section covers how the core talks to hosted and local AI models, how every call is metered, the built-in assistant with its three surfaces (ORACLE, TETHER and MAGI Core) and its engines, Claude Code accounts, Claude Code integration in both directions, and Prompt Studio (§4.7a). All of it lives in the core's `providers`, `assistant` and `prompt` modules (§2) and is reached through the same tool surface as everything else (§1).
 
 - **AI-001** [M1] (decision) Providers in use: Anthropic API, OpenRouter, NanoGPT, OpenAI, Google and fal (xAI and Mistral optional), plus the Chinese flagship providers DeepSeek, Alibaba/Qwen, Moonshot/Kimi, Z.ai/GLM, MiniMax, Tencent, Xiaomi MiMo and StepFun. ByteDance Seed models are reached through OpenRouter or fal, because BytePlus doesn't list the US as a supported region (verified 2026-10-12).
 - **AI-002** [M1] (invariant) Every external model or service call, including the assistant's own calls and internal callers such as vision QA, goes through `ProviderGate` (estimate, optional user-set caps, meter; §2). The suite adds no content filter of its own; each provider's and model's own policies apply.
-- **AI-003** [M1] (decision) The assistant has two switchable modes, co-pilot and director (§4.6). Its engine defaults to **Claude Code on the user's own Pro/Max subscription** (Engine A), with **Claude via the Anthropic API** (Engine B) as the alternative. Claude Code is integrated in both directions (§4.7).
+- **AI-003** [M1] (decision) The assistant has three surfaces (§4.6), not switchable modes: **ORACLE**, a general chat that never acts (§4.6b); **TETHER**, the tool-using assistant inside a studio (AI-039, §4.6c); and **MAGI Core**, the director, a separate runner and surface (AI-041, §4.6c). They share one conversation store (AI-087), the engines, the tool registry and dispatcher, and the suite knowledge (AI-203). Defaults are set per surface (AI-046): a new ORACLE chat starts on the local model; TETHER and MAGI Core default to **Claude Code on the user's own Pro/Max subscription** (Engine A), with **Claude via the Anthropic API** (Engine B) and any `openai_chat` route (Engine C, AI-199) as alternatives. Claude Code is integrated in both directions (§4.7).
 
 ### 4.1 Provider layer
 
@@ -1144,7 +1146,7 @@ This section covers how the core talks to hosted and local AI models, how every 
 
   (Provider behaviour verified 2026-10-12.)
 - **AI-009** [M1] M1 proves the quirk mechanism on OpenRouter, NanoGPT and DeepSeek. Other providers are added as profiles when the user starts using them, with no code change.
-- **AI-010** [M1] Transient errors are retried with backoff. Inline metered calls (LLM requests, assistant turns, vision QA) may be retried and may use refusal fallback or fallback chains; **each attempt is metered**.
+- **AI-010** [M1] Transient errors are retried with backoff. Inline metered calls (LLM requests, assistant turns, vision QA) may be retried and may use refusal fallback or fallback chains; **each attempt is metered**. A fallback never silently switches provider or billing basis (for example from local work or `subscription_quota` to paid): a step that would change either isn't taken automatically. The attempt ends with the original error, and the caller's surface offers the switch, naming the provider and the estimated cost, as an action the user takes. ORACLE and TETHER turns never switch on their own (AI-205). Fallbacks within the same provider and billing basis work as above.
 - **AI-011** [M1] (invariant) Provider errors meaning "your provider-side spend limit, balance or plan limit is reached" are non-retryable (`provider.spend_limit`, §6) and shown as such.
 - **AI-012** [M1] Each provider has a circuit breaker. Every step of a fallback chain re-runs `ProviderGate`.
 
@@ -1221,24 +1223,30 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 
 ### 4.5 Model registry and routing
 
-- **AI-034** [M1] (contract) Entries in the workspace's `registry/models.yaml` carry `routes[]` (provider profile + model id per route, e.g. DeepSeek direct vs OpenRouter vs NanoGPT), capabilities (tools, vision, structured output, context, max output), a price reference, recommended settings, fallbacks and `last_verified`. `models.yaml` also registers local model files by hash.
+- **AI-034** [M1] (contract) Entries in the workspace's `registry/models.yaml` carry `routes[]` (provider profile + model id per route, e.g. DeepSeek direct vs OpenRouter vs NanoGPT), capabilities (tools, vision, structured output, context, max output), a price reference, recommended settings, fallbacks and `last_verified`. `models.yaml` also registers local model files by hash. Each route also carries its tool-probe state and capability tier (AI-208, AI-209).
 - **AI-035** [M1] (contract) Personal `model_profile` Library resources (§5) refer to registered model files by hash.
-- **AI-036** [M1] (contract) Defaults per task live in the settings cascade (`defaults.models` in `lilith.yaml`, overridable per project and per request): `assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate`, `image_edit`, and others as apps add tasks. `defaults.models.image_generate` names a model profile (§5).
+- **AI-036** [M1] (contract) Defaults per task live in the settings cascade (`defaults.models` in `lilith.yaml`, overridable per project and per request): `chat` (the route a new ORACLE chat starts on; a local route by default, AI-202), `assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate`, `image_edit`, and others as apps add tasks. `defaults.models.image_generate` names a model profile (§5).
 - **AI-037** [M1] There is no automatic cheapest-route selection in M1: the user chooses defaults and routes, and fallbacks apply on errors.
-- **AI-038** [M1] Model lists are refreshed daily from providers that expose them. A deprecation or 404 switches to the configured fallback and flags the entry. Known retirements (verified 2026-10-12): Xiaomi MiMo v2.5 ids retire 2026-10-21; DeepSeek's old names retired 2026-07-24; Kimi `moonshot-v1` retired 2026-08-31.
+- **AI-038** [M1] Model lists are refreshed daily from providers that expose them. A deprecation or 404 switches to the configured fallback and flags the entry, under AI-010's rule: a fallback on another provider or billing basis is offered to the user, never taken silently. Known retirements (verified 2026-10-12): Xiaomi MiMo v2.5 ids retire 2026-10-21; DeepSeek's old names retired 2026-07-24; Kimi `moonshot-v1` retired 2026-08-31.
 
 ### 4.6 The built-in assistant
 
-#### Modes
+#### Surfaces
 
-- **AI-039** [M1b] **Co-pilot** (the default mode) acts on the user's requests step by step in the open app, including the document being edited (agent `doc.*` forwarding to the open document is in M1; §3, §5).
-- **AI-040** [M1b] (invariant) A co-pilot's pending calls (calls awaiting confirmation) are cancelled if its app closes.
-- **AI-041** [M1b] (contract) **Director** mode (the director agent, **MAGI Core**) turns a goal into a **director task**: a first-class job (`kind: assistant_task`, §2) whose plan and step state are held by the core, with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused` and `interrupted`.
+The assistant has three surfaces, written in capitals as product names: **ORACLE** (general chat, §4.6b), **TETHER** (the in-app, tool-using assistant) and **MAGI Core** (the director, §4.6c). They are a hybrid: MAGI Core is a separate runner and surface, while all three share one conversation store, the engines, the tool registry and dispatcher, and the suite knowledge. A conversation has one fixed level, ORACLE or TETHER (AI-054); MAGI Core is never a level of a conversation. Rules shared by the three are in §4.6d.
+
+- **AI-039** [M1b] **TETHER** (formerly called "co-pilot") acts on the user's requests step by step in the open studio, including the document being edited (agent `doc.*` forwarding to the open document is in M1; §3, §5). It is a level of the studio's Assistant dock (AI-201), offered only on routes at the `safe_tools` tier or above (AI-208), and uses the suite's tools and confirmations.
+- **AI-040** [M1b] (invariant) TETHER's pending calls (calls awaiting confirmation) are cancelled if its app closes.
+- **AI-041** [M1b] (contract) **MAGI Core** (the director) turns a goal into a **director task**: a first-class job (`kind: assistant_task`, §2) whose plan and step state are held by the core, with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused` and `interrupted`. A task is spawned from a proposal (AI-213), never switched into from a conversation: only the user's click on the core-built Start dialog starts it. Its job record holds `origin_conversation` (the conversation the proposal came from, or none), the sealed task policy (AI-214), the proposal's goal, outline and refs with a summary as its hand-off brief (never the raw transcript), and the taint it inherits (AI-220).
 - **AI-042** [M1b] (invariant) A director task keeps running when the user closes the app.
 - **AI-043** [M1b] (invariant) After a core restart a director task becomes `interrupted`, and only the user can resume it — never automatically.
 - **AI-044** [M1b] (invariant) Destructive/exec steps and cap confirmations never block a director run. The call returns `pending_confirmation` with a confirmation id (§6); the director continues with other steps and checks back. If nothing else can proceed, the task pauses (`waiting_confirmation`) and the notification path (§3) brings the user to the decision. A director task always gets `pending_confirmation`, never `cap.exceeded`: that error is only for callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks; §2, §6).
 - **AI-045** [M1b] M1 allows one director task per workspace; others queue.
-- **AI-046** [M1b] The engine is a suite-level setting (default Claude Code) with a per-conversation override for co-pilot; director tasks run on Engine A, or move to Engine B only by hand-off (AI-150) until direct Engine B director tasks arrive in M1.5 (AI-152). For Engine A, each conversation and director task also records the Claude Code profile it runs under (§4.6a).
+- **AI-046** [M1b] Each surface has its own default engine, kept as suite-level settings (`suite.toml`'s assistant engine choice, one per surface):
+  - **ORACLE:** a new chat starts on the local model (`defaults.models.chat`, AI-036, AI-202). Every configured route can be chosen per conversation.
+  - **TETHER:** Engine A (Claude Code), as before, with a per-conversation override offering every engine whose route is at the `safe_tools` tier or above (AI-208).
+  - **MAGI Core:** Engine A (Claude Code), as before. A task moves to Engine B only by hand-off (AI-150) until direct Engine B director tasks arrive in M1.5 (AI-152). Director tasks on Engine C stay Later (AI-155).
+  - Each conversation and director task records its engine and route, and for Engine A the Claude Code profile it runs under (§4.6a).
 
 #### Engine A — Claude Code on the user's own sign-in (default)
 
@@ -1246,25 +1254,26 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
   - Anthropic's terms describe subscription login as intended for ordinary use of Claude Code and say they don't prevent signing in to the unmodified binary with one's own subscription; third-party apps must not use or relay subscription credentials (verified 2026-10-12).
   - Each user runs their own unmodified binary with their own sign-in, and the suite never handles their credentials (AI-091, AI-096). Use of Engine A, including long director runs, stays subject to Anthropic's terms; the API engine is always one switch away.
 - **AI-048** [M1b] The user's CLI install of `claude` is preferred over the copy bundled inside the Claude desktop app. The resolved path is shown in Doctor and can be overridden.
-- **AI-049** [M1b] (invariant) There is one long-lived `claude` process per active conversation, inside a kill-on-close Job Object, closed after an idle timeout and resumed on the next message. A co-pilot's process ends when its app closes; a director task's process belongs to the core.
+- **AI-049** [M1b] (invariant) There is one long-lived `claude` process per active conversation, inside a kill-on-close Job Object, closed after an idle timeout and resumed on the next message. A TETHER or ORACLE conversation's process ends when the app or ORACLE window hosting it closes; a director task's process belongs to the core.
 - **AI-050** [M1b] (contract) Launch profile (final flags set by the M0 spike, §4.8):
   - `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --session-id <uuid>` (or `--resume <id>`);
   - `--permission-mode default`, always — without it a `-p` run can start in `auto` mode, where a classifier approves actions before the suite sees them;
-  - `--setting-sources project,local` (or none, if M0 shows that works with the user's login and `--mcp-config`), so the user-level allow rules, default mode, hooks, `env` blocks, `apiKeyHelper` and plugin enablement don't load; plus `--settings <suite engine settings>` carrying the mode preset and `env: {CLAUDE_CODE_ENABLE_TELEMETRY: "0"}`;
+  - `--setting-sources project,local` (or none, if M0 shows that works with the user's login and `--mcp-config`), so the user-level allow rules, default mode, hooks, `env` blocks, `apiKeyHelper` and plugin enablement don't load; plus `--settings <suite engine settings>` carrying the launch profile's preset (AI-058, AI-060) and `env: {CLAUDE_CODE_ENABLE_TELEMETRY: "0"}`;
   - `--strict-mcp-config --mcp-config <core-generated file>` (below);
   - `--disallowedTools WebFetch,WebSearch` (opt-in per task), `--disable-slash-commands` (the user's personal skills don't load), `--permission-prompt-tool mcp__lil__approve`;
-  - one fixed `--append-system-prompt-file` covering both modes;
+  - one fixed `--append-system-prompt-file` per launch profile: TETHER, director, ORACLE's `chat` profile (AI-207) and the interview profile (AI-194);
+  - the credential read-deny rules (AI-221), carried in `--settings`;
   - `--model`, `--effort` and `--max-turns` per task.
 - **AI-051** [M1b] (contract) The core-generated MCP config launches the **real `lil-mcp.exe` by absolute path**, so it is a direct child of `claude.exe`. Its entry's `env` carries the per-launch engine token, the conversation's workspace id (or `none`) and `LIL_PROFILE=<profile id>` (passed explicitly, because Claude Code's subprocess scrub can strip `CLAUDE_CONFIG_DIR` from child processes). `lil-mcp` sends all three in its `core/hello` handshake (§1). The user's own MCP servers are added only if the user has opted them in. Strict mode drops plugin-provided servers, so nothing in Engine A depends on the plugin.
 - **AI-052** [M1b] (invariant) The generated MCP config file lives in a user-only temp folder and is deleted after `system/init`.
 - **AI-053** [M1b] (contract) `mcp__lil__approve` is a tool on the suite's own MCP server, exposed only to engine connections.
-- **AI-054** [M1b] (invariant) The appended system prompt is fixed for the life of a conversation: Claude Code records the system prompt on a conversation's first request and ignores a changed one on resume. The current mode is delivered as a short core-written preamble in each user turn.
+- **AI-054** [M1b] (invariant) The appended system prompt is fixed for the life of a conversation: Claude Code records the system prompt on a conversation's first request and ignores a changed one on resume. A conversation's level (ORACLE or TETHER) and engine are therefore fixed for its life; a change forks the conversation (AI-079), and director tasks are spawned from a conversation (AI-041), never switched into. The short core-written preamble in each user turn carries only fresh context, never a mode.
 - **AI-055** [M1b] The working directory is always the workspace (or a suite-owned scratch folder in no-workspace mode). Loose files are passed with `--add-dir` or as file references.
 - **AI-056** [M1b] (invariant) `claude`'s environment is built from an allowlist: `PATH`, `SystemRoot`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, `CLAUDE_CODE_GIT_BASH_PATH`, proxy variables, `CLAUDE_CONFIG_DIR` (set to the profile's folder; unset for the default profile, §4.6a), the non-secret marker `LIL_ENGINE=1`, plus `OTEL_METRICS_EXPORTER=none` and `OTEL_LOGS_EXPORTER=none`. Everything else is removed, including all `ANTHROPIC_*` (among them `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`), `CLAUDE_CODE_USE_*` (Bedrock, Vertex, Foundry), `CLAUDE_CODE_OAUTH_TOKEN` and every provider key — any of these would silently override the profile's sign-in and bill a different credential.
 - **AI-057** [M1b] (invariant) The per-launch engine token is **never** in `claude`'s environment (it would leak into every command the agent runs); it reaches `lil-mcp` only through the generated MCP config.
-- **AI-058** [M1b] (contract) Director preset: file edits allowed in project text files (`*.md`) and a scratch folder; edits **denied** on `assets/**`, `registry/**`, `queue/**`, `**/*.manifest.json` and `.lilith/**` (those change only through the suite's tools, so `store` stays the only suite writer); a short allowlist of read-only commands; deletes, installs and scripts denied (the suite's own tools do those, with suite confirmations).
-- **AI-059** [M1b] (invariant) In director mode the approve tool **never waits**: anything Claude Code would ask about that isn't on the preset is denied with "use the `lil` tool, which can ask the user for confirmation" (the `lil` call then returns `pending_confirmation`). Claude Code's own prompts don't time out, so waiting would stall the run.
-- **AI-060** [M1b] (contract) Co-pilot preset: the same write denials; other actions Claude Code asks about are shown to the user in the suite (the user is present) and answered within a few minutes, or denied.
+- **AI-058** [M1b] (contract) Director preset: file edits allowed in project text files (`*.md`) and a scratch folder; edits **denied** on `assets/**`, `registry/**`, `queue/**`, `**/*.manifest.json` and `.lilith/**` (those change only through the suite's tools, so `store` stays the only suite writer), and on `**/CLAUDE.md` and `.claude/**`, which later Engine A sessions would load as instructions; a short allowlist of read-only commands, with no file readers (`type`, `cat`, `Get-Content`), because the read-deny rules (AI-221) don't cover commands; deletes, installs and scripts denied (the suite's own tools do those, with suite confirmations).
+- **AI-059** [M1b] (invariant) In director tasks the approve tool **never waits**: anything Claude Code would ask about that isn't on the preset is denied with "use the `lil` tool, which can ask the user for confirmation" (the `lil` call then returns `pending_confirmation`). Claude Code's own prompts don't time out, so waiting would stall the run.
+- **AI-060** [M1b] (contract) TETHER preset: the same write denials; other actions Claude Code asks about are shown to the user in the suite (the user is present) and answered within a few minutes, or denied.
 - **AI-061** [M1b] (invariant) Before a run is used, the core checks (any failure refuses the run with a clear message and the fix):
   - the Claude Code version is in the tested range from `claude_code.yaml` (minimum **2.1.268**, needed for `configDirectory`); older **and newer untested** versions are refused with `engine.claude_code.untested_version` (§6). A future release is expected to make `--bare` — no plugins, no subscription login — the default for `-p`; the version gate catches it;
   - the profile's sign-in, verified as in AI-062;
@@ -1287,17 +1296,17 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 - **AI-071** [M1b] (invariant) Engine A usage records use billing basis `subscription_quota` and carry the profile id as `account`. Their cost figure is stored as an "API-equivalent estimate" and excluded from spend totals and money caps.
 - **AI-072** [M1b] (invariant) **Usage credits** (if enabled on a plan) turn overflow into real money: credit spend is recorded per account as real money. **Director runs never spend credits unattended**: at the plan limit the director stops at the next turn boundary and waits (`waiting_quota`) unless the user has explicitly allowed credit spending for that task, in which case the suite's money caps apply at each turn boundary.
 - **AI-073** [M1b] Whether credits are on is checked with a separate `claude -p --no-session-persistence --output-format json "/usage"` run (experimental; M0 confirms it uses no quota and reports credit state), under the per-profile lock (§4.6a).
-- **AI-074** [M1b] (invariant) When a profile's plan limit is reached, the task or conversation pauses in `waiting_quota` and the user chooses what happens next (AI-104). For co-pilot calls this surfaces as `quota.plan_limit` (§6).
+- **AI-074** [M1b] (invariant) When a profile's plan limit is reached, the task or conversation pauses in `waiting_quota` and the user chooses what happens next (AI-104). For TETHER and ORACLE calls this surfaces as `quota.plan_limit` (§6).
 - **AI-075** [M1b] A per-profile setting can keep director runs from starting above a chosen 5-hour usage %, leaving headroom for interactive work.
 - **AI-076** [M1b] (invariant) Each conversation has one owner: an Engine A process, the Claude Code desktop app, or an interactive terminal session. Handing it to the desktop app or a terminal stops the Engine A process and marks the conversation "moved to Claude Code" (read-only in the suite); "Take back" warns the user to close it there first, then resumes. The core refuses to resume a session held elsewhere.
 
 #### Engine B — Claude via the Anthropic API
 
 - **AI-077** [M1b] Models: `claude-opus-5-5` for the assistant; `claude-haiku-5-5` for high-volume helpers (vision QA, tagging); both changeable.
-- **AI-078** [M1b] Thinking and effort: adaptive thinking (it can't be disabled on Opus 5.5). Effort is `medium` for co-pilot, `high` for director planning and `low` for helpers, changed with per-message effort (beta) so the prompt cache isn't invalidated. `thinking.display: "updates"` (beta) lets the assistant panel show progress notes during long turns. (API behaviour verified 2026-10-12.)
+- **AI-078** [M1b] Thinking and effort: adaptive thinking (it can't be disabled on Opus 5.5). Effort is `medium` for TETHER, `high` for director planning and `low` for helpers, changed with per-message effort (beta) so the prompt cache isn't invalidated. `thinking.display: "updates"` (beta) lets the assistant panel show progress notes during long turns. (API behaviour verified 2026-10-12.)
 - **AI-079** [M1b] (invariant) Engine B conversations are **append-only** (Opus 5.5 preserved thinking returns 400 if earlier turns, the system prompt or the tool set change):
-  - the system prompt is fixed per conversation, and switching co-pilot/director doesn't rewrite it — mode instructions go in a core-authored mid-conversation system message;
-  - the tool set is fixed per conversation; changes use the inline tool add/remove beta;
+  - the system prompt is fixed per conversation. There is no mode switch inside a conversation: a change of level (ORACLE ↔ TETHER) or of engine **forks** it into a new linked conversation seeded with a summary (AI-069), with a back-link in both. Director tasks are spawned (AI-041), never switched into. The same fork rule applies on every engine (AI-054); ORACLE's one-turn API choice while the GPU is busy is the one exception (AI-205);
+  - the tool set is fixed per conversation by its level and tier (AI-208); the inline tool add/remove beta is used only for that tier's own lazy tool loading;
   - fresh context (selection, open document, project changes) goes into the newest user turn or tool results, wrapped as data — never into system messages.
 - **AI-080** [M1b] (invariant) Mid-conversation system messages contain only text the core writes and follow the API's placement rules: never first; after a user turn and before an assistant turn (or last); never between a tool call and its result.
 - **AI-081** [M1b] (invariant) Tools use `strict: true` and `eager_input_streaming`. `stop_reason` is checked first; inputs are validated against their schemas before running (eager streaming can deliver partial or invalid JSON), and invalid input returns an error result. `tool_choice` is `auto` only (forced tool choice returns 400).
@@ -1306,10 +1315,21 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 - **AI-084** [M1b] Refusal fallback: `fallbacks: "default"` with `server-side-fallback-2026-07-01` on Opus 5.5. Provider profiles carry a `server_fallback` flag; Haiku 5.5 has none, so helpers retry on the client side. The fallback model runs without the original's thinking blocks; `usage.iterations` is metered.
 - **AI-085** [M1b] (invariant) Every Engine B call goes through `ProviderGate` (estimate, caps, meter).
 
-#### Both engines
+#### Engine C — any `openai_chat` route, hosted or local
+
+- **AI-199** [M1b] (contract) **Engine C** is the core's own turn loop, the same loop as Engine B's, over the `openai_chat` adapter with a provider profile and a route (AI-007, AI-008, AI-034). It covers:
+  - hosted OpenAI-compatible providers: OpenAI, the Chinese flagship providers (DeepSeek, Qwen, Kimi, GLM, MiniMax and others, AI-001), direct or through OpenRouter or NanoGPT, and Google through OpenRouter, NanoGPT or Google's OpenAI-compatible endpoint until `gemini_native` arrives (Later, AI-155). A direct provider is offered once its profile has recorded fixtures (AI-005, AI-009); until then it is reached through OpenRouter or NanoGPT;
+  - local models on `llama-server` or Ollama (AI-204).
+  - Engines B and C behave identically at the confirm, meter and record stages, and every Engine C call goes through `ProviderGate` (AI-002). A reasoning continuation (AI-008) is passed back only to the same model, so a route change within Engine C drops it. In plan 7a Engine C carries chat only; tool use arrives with TETHER (AI-210) and, for local routes, in M1.5 (AI-211).
+
+#### All engines
 
 - **AI-086** [M1b] (invariant) External content (model cards, workflow notes, image metadata, web pages, file names) is wrapped and labelled as data in assistant context. This protects against agents being tricked into acting; it has nothing to do with what the user may create.
-- **AI-087** [M1b] (contract) Conversations are stored in the workspace's local data folder, in `assistant\` — normally `%LOCALAPPDATA%\LILITH\workspaces\<hash>\assistant\`, or `<volume>:\.lilith-local\<hash>\assistant\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§2, §7) — not in git, and exportable. Each records its engine and, for Engine A, its profile id.
+- **AI-087** [M1b] (contract) Conversations are stored in the workspace's local data folder, in `assistant\` — normally `%LOCALAPPDATA%\LILITH\workspaces\<hash>\assistant\`, or `<volume>:\.lilith-local\<hash>\assistant\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§2, §7) — not in git, and exportable. One store serves ORACLE, TETHER and MAGI Core.
+  - A conversation with no workspace (an ORACLE chat started with none open) lives in the suite scope, `%LOCALAPPDATA%\LILITH\assistant\`, with its usage in `usage-loose.jsonl` (ARCH-081).
+  - Each conversation records its level (ORACLE or TETHER), engine, route and model, for Engine A its profile id, the hash of its suite card (AI-203), its taint (AI-220), and the back-links of any fork (AI-079). A director task records `origin_conversation` (AI-041).
+  - Turns are stored in one engine-neutral, append-only shape, so plan 7a builds the store that later plans use.
+  - Export runs the key redaction pass (AI-218).
 
 ### 4.6a Claude Code accounts (profiles)
 
@@ -1334,7 +1354,7 @@ The suite supports several Claude Code profiles (separate config directories), s
 - **AI-097** [M1b] Engine A launches `claude` with the conversation's profile (`CLAUDE_CONFIG_DIR` per AI-056). Engine A ignores user settings and plugins and generates its own MCP config, so it behaves identically under every profile.
 - **AI-098** [M1b] (invariant) The core keeps a **per-profile lock**: `claude auth status` and `/usage` checks run only when no suite-launched `claude` is active in that profile — repeated `auth status` calls can start a token refresh that races with a running session. There is no polling of `auth status`. In the default profile the suite can't see the user's own terminal or desktop sessions; that small race is accepted (at worst it asks the user to sign in again).
 - **AI-099** [M1b] (invariant) Profiles are independent; within one profile, launches are serialised: the suite starts its own sessions one at a time, and open sessions continue.
-- **AI-100** [M1b] (invariant) **Sign-in expired mid-task.** When a profile's login can no longer be refreshed, Claude Code fails every request with a "Login expired · Please run /login" error. Auth failures (that message, HTTP 401, or `authMethod: "none"`) put the task into substatus **`waiting_auth`** — distinct from `waiting_quota` and never retried automatically. The notification opens the task in the Assistant panel (APP-050), which offers "Sign in again (<label>)" (opens the terminal for `/login`, then resumes), "Use a different profile" and "Switch to the API engine". For co-pilot calls this surfaces as the error `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6).
+- **AI-100** [M1b] (invariant) **Sign-in expired mid-task.** When a profile's login can no longer be refreshed, Claude Code fails every request with a "Login expired · Please run /login" error. Auth failures (that message, HTTP 401, or `authMethod: "none"`) put the task into substatus **`waiting_auth`** — distinct from `waiting_quota` and never retried automatically. The notification opens the task in the Assistant panel (APP-050), which offers "Sign in again (<label>)" (opens the terminal for `/login`, then resumes), "Use a different profile" and "Switch to the API engine". For TETHER and ORACLE calls this surfaces as the error `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6).
 - **AI-101** [M1b] Doctor shows Claude Code's 3-day sign-in expiry warning if the M0 spike finds a headless way to read it.
 
 #### Usage per profile
@@ -1349,13 +1369,121 @@ The suite supports several Claude Code profiles (separate config directories), s
 
 - **AI-104** [M1b] (invariant) The task or conversation pauses (`waiting_quota`); the notification opens it in the Assistant panel (APP-050), which offers exactly these choices; **the user picks**, and the default is to wait:
   1. **Wait for the reset** (the reset time is shown) and resume automatically at the reset time.
-  2. **Switch to the API engine** (Engine B): the core's plan, step results and a summary seed a new API conversation (a Claude Code transcript can't be continued over the API); caps apply from that point.
+  2. **Switch to the API engine** (Engine B): the core's plan, step results and a summary seed a new API conversation (a Claude Code transcript can't be continued over the API); caps apply from that point. For a director task the switch asks for the task's budget again (AI-214).
   3. **Use a local model** (M1.5).
 - **AI-105** [M1b] (decision) The suite never chooses a profile; each conversation or task runs under the profile the user selects when starting it (profile picker), and the user can change it at any time.
 
 Use of each Claude account is subject to Anthropic's terms (AI-106 links them).
 
 - **AI-106** [M1b] The Settings → Claude Code page states once, plainly, that use of each Claude account is subject to Anthropic's terms, with links to them.
+
+### 4.6b ORACLE (general chat)
+
+ORACLE is the place to talk: the person can discuss anything with any model they have set up, and the suite makes sure the model knows what LILITH is. It arrives in **plan 7a**, the first M1b plan, which also brings a chat-only local engine. It doesn't need the Claude Code headless spikes, so it can run alongside them.
+
+- **AI-200** [M1b] (decision) **ORACLE** is a general chat in which the person can discuss anything. It never acts on its own. In plan 7a it makes no tool calls: it starts no tasks, changes no settings or files, and spends only on its own turns, from the shared allowance (AI-216). Its knowledge of the suite comes from retrieval the core does before each turn (AI-203).
+- **AI-201** [M1b] (contract) **Where it lives.**
+  - ORACLE has a small window of its own, the `lil-oracle` app on the shared shell (caller kind `ui:oracle`, ARCH-046), usable with no studio open. It shows the active workspace's conversations, or the suite scope's when no workspace is open (AI-087).
+  - The same conversations are reachable inside each studio's Assistant dock (APP-008), where ORACLE is a clearly labelled **level**. From the TETHER plan the dock also offers the TETHER level (AI-039). The ORACLE window has only the ORACLE level.
+  - Each conversation shows a level chip beside Send: the level's name; one plain line saying what it may do (for ORACLE: "Talk only: reads the suite's docs, changes nothing"); the engine and route; and the next turn's estimated cost (AI-216).
+  - MAGI Core is never a level. Its tasks appear as task cards, in the Assistant dock and in Jobs (APP-114).
+- **AI-202** [M1b] (contract) **Model choice, per conversation.** Every model option is offered:
+  - US flagships (Anthropic on Engine B; OpenAI and Google on Engine C);
+  - Chinese flagships (DeepSeek, Qwen, Kimi, GLM, MiniMax and others), direct or through OpenRouter or NanoGPT (AI-199);
+  - local models (AI-204);
+  - Claude Code (Engine A), from the later M1b plan that brings Engine A to chat (AI-207).
+
+  **A new chat starts on the local model** (`defaults.models.chat`, AI-036). When no local model is installed, the first-run card asks first (AI-206). Until the user picks a route, that chat has none: the suite never picks a hosted model on its own. Changing a conversation's route forks it (AI-079).
+- **AI-203** [M1b] (contract) **Suite knowledge.**
+  - A **suite card** of at most 1.5K tokens is in the fixed system prompt: the build id and the apps and modules in this build. Its hash is recorded with the conversation (AI-087).
+  - Before each turn the core runs **`suite.help`** on the user's message: SQLite FTS5 search (CORE-004) over a reference built per release from the tool descriptors, the error codes (QA-005), the settings schema and the user docs, filtered to shipped milestones. The best passages, with their citations, go into the newest user turn as wrapped data (AI-079). This needs no tool call, so it works on every model.
+  - `suite.help` is also registered as a `read` tool, so TETHER and Claude Code use the same search.
+- **AI-204** [M1b] (contract) **Local chat engine (plan 7a).** Chat only, with no AI tool use:
+  - `llama-server` as an owned engine (`--api-key`, bound to 127.0.0.1, ARCH-066) or Ollama as an attached one, both through `openai_chat` (Engine C). The suggested model is Qwen3.5-9B at Q4_K_M; plan 7a confirms the pick on the target machine.
+  - Each local turn is an `llm.generate` job in the `gpu-heavy` lane under plan 3's GPU scheduler (ARCH-071, CORE-121, CORE-126), in the "your generations" class (CORE-124). Hosted turns stay inline metered calls (CORE-128).
+  - It **never evicts ComfyUI**: it loads its model only when free VRAM fits, never asks ComfyUI to unload and never pre-empts a prompt. Before an image job dispatches, the scheduler unloads the owned `llama-server` model. Attached Ollama keeps its VRAM under its own `keep_alive`, which the suite can't schedule: ORACLE warns about this once, and its requests carry `keep_alive: 0` while an image job waits.
+  - The core sends an explicit context size (Ollama's `num_ctx`) and refuses a turn that doesn't fit, rather than letting the runtime truncate it.
+  - Local turns are metered as local work ($0, GPU time and energy, CORE-127).
+- **AI-205** [M1b] (invariant) **When the GPU is busy.** The level chip shows "Local · waiting for GPU" with the reason, and three choices:
+  - **Wait** (the default);
+  - **Run on CPU** (slower);
+  - **use an API model for this turn**, which the user picks, with its estimated cost shown first.
+
+  The suite never switches to a paid model on its own (AI-010, AI-037). The one-turn choice doesn't fork the conversation: the conversation stays on its local route, and that turn records the route it ran on.
+- **AI-206** [M1b] (invariant) **First run of local chat.** Nothing downloads without the user's click.
+  - The suite first detects what is there: VRAM, free disk space, an Ollama install, and suitable models already present. If a suitable model exists, it offers that and downloads nothing.
+  - Otherwise a card lists each file and its size (about 7 GB in total: the model weights, its vision projector, the `llama-server` build and the CUDA runtime; sizes verified 2026-10-18), the install path, and that chatting uses about 9 GB of GPU memory and waits while images render. The buttons are **Download** and **Cancel**.
+  - The download is a resumable, SHA-256-checked core job with pinned versions (CORE-131, ARCH-059), shown in Jobs and cancellable.
+  - After a cancel, new chats have no model until the user picks one (AI-202).
+- **AI-207** [M1b] (contract) **ORACLE on Claude Code** (Engine A) arrives with the later M1b plan that brings Engine A to chat, after the M1b headless spikes (AI-133–148). It runs under Engine A's rules (AI-047–072) with its own **`chat` launch profile**:
+  - its own fixed system-prompt file; no `--mcp-config`, so no `lil` tools, and AI-061's `lil`-server check doesn't apply (as for AI-194);
+  - `--disallowedTools Bash,PowerShell,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch`;
+  - the credential read-deny rules (AI-221), and `--restricted` as well if the M0 spike shows it confines file tools (AI-134).
+  - Its turns use plan quota (`subscription_quota`, AI-071).
+
+### 4.6c TETHER and MAGI Core
+
+TETHER works inside a studio with the suite's tools and confirmations. MAGI Core runs director tasks that survive the app closing (AI-042). Both come in later M1b plans, after plan 7a; TETHER on local models comes in M1.5.
+
+#### TETHER
+
+- **AI-208** [M1b] (contract) **Capability tiers.** Each route has one tier:
+  - `chat`: no tools;
+  - `safe_tools`: a curated set: `read` tools, `suite.help`, fill-only cards (AI-186), `task.propose`, and `write` tools that send nothing off the machine (egress `none`, AI-219) and spend no money; no `destructive` or `exec` tools;
+  - `planner`: the full TETHER set; required to plan director tasks.
+
+  The tier is a property of the session that the dispatcher enforces: the Resolve stage rejects a tool outside it (CORE-015). A tier limits only which tools are visible. Confirmations, egress, spending and taint apply the same way at every tier. TETHER is offered only on routes at `safe_tools` or above. The tier is set only by the probe (AI-209) or lowered by the user through a verified UI action; no model or agent can change it.
+- **AI-209** [M1b] (contract) **Tool probe.** About 25 scripted cases, run against the fake core (QA-066), each run three times. They cover schema-valid arguments, choosing the right tool, inventing no tools, stopping and resuming on `pending_confirmation`, recovering from a tool error, a multi-step chain, and a plan with a forced failure.
+  - The result is stored per route in `models.yaml` (AI-034) as `untested`, `passed:<tier>`, `failed` or `stale`, with `last_verified`. It is keyed by provider and model id, and for local routes also by model file hash, quant, runtime version and chat-template hash. It becomes `stale` when any key part or the suite's tool set changes.
+  - A probe runs only when the user starts it; the first use of TETHER on an untested route offers it. API probes spend and show their estimated cost first. Local probes run as GPU jobs (M1.5, AI-211).
+  - The pass bars for each tier are fixed in the TETHER plan.
+- **AI-210** [M1b] (contract) **TETHER on Engines B and C.**
+  - The core's turn loop parses streaming tool-call deltas (moved here from plan 6b), validates inputs against their schemas before running (AI-081's rule, for every adapter), and limits tool rounds per turn, as `--max-turns` does for Engine A (AI-050).
+  - Engine C lowers tools to a new **`openai_tools`** target (function tools; `strict` where the profile allows it), using the same name mapping as the other targets, with snapshot tests (ARCH-040).
+  - Hosted Engine C routes get tools in M1b; local routes in M1.5 (AI-211).
+- **AI-211** [M1.5] (decision) **Local tool use.** TETHER runs on local routes (`llama-server`, Ollama) once a route passes the probe on this machine (AI-209). Until then, local routes are chat only.
+
+#### MAGI Core
+
+- **AI-212** [M1b] (decision) **MAGI Core is the director only**: a separate runner and surface (AI-041). Its structure:
+  - **the council**: MELCHIOR, BALTHASAR and CASPER. Two of three carries. The vote is a quality check, not security: all three read the same, possibly injected, context. No vote can answer a confirmation, raise a budget or the spend allowance, change the task policy or start a task;
+  - **the wardens**: SRAOSHA is the deterministic `confirm` module (§2.7), and RASHNU the deterministic caps module (`meter` caps and reservations, §2.6, with the spend allowance, AI-216). They are code, not LLM personas, and the council can't outvote them;
+  - **the hands**, which carry out the task's steps through the suite's tools under the task's policy.
+
+  The full council design (each member's role, when it votes, which models sit on it, and how the hands map to tools) is due at the M1b director plan.
+- **AI-213** [M1b] (contract) **Proposing and starting a task.**
+  - `task.propose` carries only `{goal, outline, refs}`; any other field makes the call invalid. It creates a proposal and starts nothing. Director sessions can't call it.
+  - The core builds the **Start dialog** itself: the goal and the model's outline in a quoted box marked as the model's text; the policy (AI-214), taken from the user's preset, with any widening highlighted; the tools by effect class, with `destructive` and `exec` tools named; the money, token and time budget and the deadline; the egress grants; the engine, profile and providers; whether usage credits may be spent (AI-072); and whether the proposal is tainted (AI-220). Cancel is the default.
+  - Only the user's click on Start starts a task: `task.start` is accepted only from a verified `ui:*` connection after a real input event, as for confirmations (ARCH-053).
+- **AI-214** [M1b] (invariant) **The task policy is sealed for the run.**
+  - The policy is the tool allowlist, the budget, the deadline and the egress grants, with the engine and profile the task starts on. It is stored with the job (CORE-118) and fixed for the run, and the dispatcher enforces it through the director session's `task_id`. No tool lets a model change it.
+  - Any change needs a fresh decision by the user in a core-built dialog that shows the difference. An engine switch (AI-104) asks for the budget again. A resume (AI-043) keeps the sealed policy.
+  - The budget counts over the task's whole life, across resumes and engine switches, and draws from the shared allowance (AI-216).
+
+### 4.6d Rules shared by the AI surfaces
+
+These rules hold for ORACLE, TETHER and MAGI Core on every engine.
+
+- **AI-215** [M1b] (invariant) **Model tool calls run under a core-built agent session**, never an app's `ui:*` session (plan-3 ruling P3-R9).
+  - When an app hosts a conversation, its `ui:*` connection sends the user's messages, and the model request is metered as the user's action (cap prompts inline, APP-054). Every tool call the model makes runs under a session the core builds through one constructor, with caller kind `assistant` and an agent binding `{engine, route, conversation, task?, level, tier, taint}`.
+  - Engine A connections carry their per-launch token (ARCH-048). Engines B and C have no connection of their own and always get a core-built session.
+  - Spec test, with the TETHER plan: a fake model in an app-hosted TETHER conversation calls a `destructive` fixture tool and gets `pending_confirmation`.
+- **AI-216** [M1b] (invariant) **One shared spend allowance.**
+  - Every ORACLE and TETHER conversation and every MAGI Core task draws on one suite-level allowance pool. The user sets it the first time any of them would spend money; the prompt shows the estimated cost first. "Unlimited" is a valid answer, so caps stay optional (CORE-085). Only a verified UI action changes it, as for caps (ARCH-056); no agent can.
+  - Each paid call reserves from the pool atomically with the cap check (CORE-087). The reservation covers tool round-trips, retries, fallbacks, reasoning tokens, and helper and council calls, all charged to the conversation or task id. A call that won't fit gets the same choice as a cap (CORE-091): raise it, allow once, or cancel.
+  - The next turn's estimated cost is shown beside Send before it is spent (AI-201).
+  - `subscription_quota` usage and local work draw nothing from it (CORE-090).
+- **AI-217** [M1b] (invariant) **Unknown or zero prices.** A route whose price is unknown, or zero (such as a `:free` entry), runs only under a user-set price ceiling for that conversation or task. Every request carries an explicit output limit (CORE-086). OpenRouter requests carry the ceiling as `provider.max_price` and settle from `usage.cost` (AI-015).
+- **AI-218** [M1a] (invariant) **Key redaction.** A core pass runs over every outbound request body to a hosted provider, from any caller (Prompt Studio included), and over provider error text before a model sees it (ARCH-060). It replaces key-shaped strings (`sk-`, `sk-ant-`, `hf_`, `ghp_`, `github_pat_`, `AKIA` prefixes, PEM private-key blocks, `.env`-style `KEY=value` lines with secret-looking values) with a marker. From plan 7a the same pass runs on every conversation export (AI-087). The outbound pass is plan 6b provider plumbing.
+- **AI-219** [M1b] (contract) **Egress classes.** Every tool descriptor (ARCH-037) declares `egress: none | own_provider | allowlisted_host | arbitrary`, separate from its effect class.
+  - Tools of opted-in user MCP servers (AI-051) are `arbitrary` unless the user says otherwise. Model downloads (CORE-131) are `allowlisted_host`, for the hosts the user allows (Hugging Face and Civitai to start).
+  - For assistant sessions, an `arbitrary` call always needs confirmation, and a tainted session (AI-220) needs confirmation for any egress beyond `none` and `own_provider`. The dialog shows the full destination.
+  - This applies from the TETHER plan, before any suite tool reaches a model inside the suite. For `mcp` and `cli` callers the class is shown in their confirmation dialogs and changes nothing else.
+- **AI-220** [M1b] (invariant) **Taint.** A conversation or task becomes tainted when any untrusted-tagged content enters it (ARCH-060, AI-086): a tool result, an attachment or web content.
+  - Taint never clears within a conversation, and it survives summaries (AI-069), engine seeds (AI-104), forks (AI-079), task proposals and hand-off briefs (AI-213): whatever is derived from a tainted conversation starts tainted.
+  - It is recorded with the conversation (AI-087) and shown in the level chip and the Start dialog.
+  - Spec tests cover each path.
+- **AI-221** [M1b] (invariant) **Credential read-deny rules.** Every Engine A launch profile (TETHER, director, ORACLE's `chat` profile and the interview profile, AI-194) carries read-deny permission rules for credential files: `**/.credentials.json`, `**/.claude.json`, `**/.ssh/**`, `**/.aws/**`, the rclone config, `**/.env` and `**/*.env`, `**/*.pem`, and browser profile folders.
 
 ### 4.7 Claude Code integration
 
@@ -1560,7 +1688,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - Local steps are local work ($0, GPU time and energy, AI-195).
 - **AI-194** [M1b] (contract) **Claude Code interview engine.** A Claude Code interview step runs `claude` under Engine A's rules (AI-047–AI-072): the environment allowlist, the version gate, the sign-in checks, and metering as `subscription_quota`. It uses its own **`interview` launch profile**:
   - no `--mcp-config`, so no `lil` tools. AI-061's check that the `lil` server connected with its expected tools doesn't apply to this profile;
-  - its own fixed system-prompt file, an exception to AI-050's single file for both modes. Context arrives as wrapped data in the user turn, and the reply is the step object (AI-170);
+  - its own fixed system-prompt file, one of AI-050's files per launch profile. Context arrives as wrapped data in the user turn, and the reply is the step object (AI-170);
   - `--max-turns 1`, with web tools disallowed;
   - the profile named by the suite setting `prompt_studio.claude_code_profile`, which the person sets, so the suite never picks one (AI-105). With no profile set, `auto` skips Claude Code.
   - If the per-profile lock (AI-062) makes a launch wait more than 10 s, that step falls back to the provider engine, or else the question bank, with a notice.
@@ -1638,7 +1766,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - those documents show "update available" (APP-102);
   - the hand-off block lists what the new version made stale (CORE-020).
   - A proposal's recipe records the brief for recall only (AI-160, IMG-140).
-- **AI-185** [M1a] (contract) **Agents.** The assistant and the director (from M1b, AI-156), and Claude Code through MCP (from M1a), use the same tools. An agent may:
+- **AI-185** [M1a] (contract) **Agents.** TETHER and MAGI Core (from M1b, AI-156), and Claude Code through MCP (from M1a), use the same tools; ORACLE calls none (AI-200). An agent may:
   - run the interview, answering from what you told it or relaying the questions to you (`answered_by` records its caller kind);
   - or fill a brief directly with `brief.create` and `brief.update`;
   - then compile the brief and stage the result.
@@ -1706,7 +1834,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - staging into the Generate panel, recall and promote.
 - **AI-196** [M1b] (decision) **M1b:**
   - the `claude_code` engine (AI-194);
-  - the assistant and director using these tools (AI-185);
+  - TETHER and MAGI Core using these tools (AI-185);
   - the `edit_instruction` dialect with the edit adapters (IMG-179), and the `PromptBox` on the instruction-edit box (IMG-071);
   - references staged into the Generate panel's references (IMG-019).
 - **AI-197** [M1.5] (decision) **M1.5:**
@@ -1743,20 +1871,25 @@ Prompt Studio's milestones are set in AI-193 (M1a: v1 for images with the `provi
 
 #### M1
 
-- **AI-149** [M1] M1 delivers: provider profiles with `anthropic_messages` and `openai_chat` (OpenRouter, NanoGPT, DeepSeek); the usage/cost engine (per-unit rates, prompt-length tiers, cached-input rates, `effective_from`); account sync (Anthropic headers, OpenRouter, NanoGPT, Claude Code plan usage per profile); assistant co-pilot (including agent edits on the open document) and director on Engine A; Claude Code profiles (sign-in, per-conversation account, manual switching through the account picker and the limit-reached choices, per-account limits from Engine A, Doctor's profile list, plugin per profile); Claude Code integration A, B, C, F and the M1 part of D.
-- **AI-150** [M1b] Engine B in M1 supports co-pilot, and director tasks started by hand-off from Engine A.
+- **AI-149** [M1] M1 delivers: provider profiles with `anthropic_messages` and `openai_chat` (OpenRouter, NanoGPT, DeepSeek); the usage/cost engine (per-unit rates, prompt-length tiers, cached-input rates, `effective_from`); account sync (Anthropic headers, OpenRouter, NanoGPT, Claude Code plan usage per profile); ORACLE with the chat-only local engine (§4.6b); TETHER (including agent edits on the open document) and MAGI Core on Engine A; Claude Code profiles (sign-in, per-conversation account, manual switching through the account picker and the limit-reached choices, per-account limits from Engine A, Doctor's profile list, plugin per profile); Claude Code integration A, B, C, F and the M1 part of D.
+- **AI-150** [M1b] Engine B in M1 supports ORACLE (from plan 7a), TETHER, and director tasks started by hand-off from Engine A. Hosted Engine C routes support ORACLE from plan 7a and TETHER from the TETHER plan (AI-210).
 
-- **AI-156** [M1b] (decision) The in-app assistant — the Assistant panel, co-pilot and director modes, both engines, Claude Code profiles and plan-limit display (§4.6, §4.6a) — arrives in **M1b**. M1a already lets Claude Code drive the suite from the user's own sessions through plugin 1.3 and `lil-mcp` (§4.7 A), records all metered usage, and includes Prompt Studio's `provider` engine with the provider adapters it needs (§4.7a, AI-171). Rules elsewhere that exist only for the in-app assistant (`assistant_task` jobs, director decisions in the Assistant panel, engine-contract tests) are needed by the end of M1b, not for M1a.
+- **AI-156** [M1b] (decision) The in-app assistant — the Assistant panel, its three surfaces, Engines A, B and C, Claude Code profiles and plan-limit display (§4.6–§4.6d) — arrives in **M1b**, in this order:
+  - **plan 7a**, the first M1b plan: ORACLE (§4.6b) on Engine B and hosted Engine C, with the chat-only local engine (AI-204), the conversation store (AI-087), the shared allowance (AI-216) and `suite.help` (AI-203). It doesn't depend on the Claude Code headless spikes;
+  - **later M1b plans:** TETHER with its tools, tiers and probe (§4.6c), Engine A in chat (AI-207), and the director (MAGI Core, with the council design, AI-212).
+  - Local tool use follows in M1.5 (AI-211).
+
+  M1a already lets Claude Code drive the suite from the user's own sessions through plugin 1.3 and `lil-mcp` (§4.7 A), records all metered usage, and includes Prompt Studio's `provider` engine with the provider adapters it needs (§4.7a, AI-171). Rules elsewhere that exist only for the in-app assistant (`assistant_task` jobs, director decisions in the Assistant panel, engine-contract tests) are needed by the end of M1b, not for M1a.
 #### M1.5
 
-- **AI-151** [M1.5] (decision) Local LLMs: `llama-server` as an owned engine and Ollama as an attached one, both through `openai_chat`, selectable per task (captioning, tagging, prompt expansion, local vision QA) and as the "use a local model" choice at a plan limit; metered as local ($0, GPU time and energy) and scheduled around image jobs for VRAM.
+- **AI-151** [M1.5] (decision) Local LLMs: `llama-server` as an owned engine and Ollama as an attached one, both through `openai_chat`, selectable per task (captioning, tagging, prompt expansion, local vision QA) and as the "use a local model" choice at a plan limit; metered as local ($0, GPU time and energy) and scheduled around image jobs for VRAM. They also become a TETHER engine here, once a route passes the tool probe (AI-211). ORACLE's chat-only use of them comes earlier, in M1b (AI-204).
 - **AI-152** [M1.5] Director tasks started directly on Engine B.
 - **AI-153** [M1.5] Hosted media through `media_job`: fal and OpenRouter images (§4.4).
 - **AI-154** [M1.5] The OpenTelemetry receiver and status-line helper for interactive sessions, per profile (§4.7 D).
 
 #### Later
 
-- **AI-155** [Later] `gemini_native`; local LLMs as a full assistant engine; other assistant engines; more providers' profiles as they are used; time-of-day, storage, multiplier and CNY price rules when needed; admin-key organisation reports; Claude Code channels; the webhook relay; video, audio and 3D hosted services with their apps.
+- **AI-155** [Later] `gemini_native` (until then Google is reached through OpenAI-compatible routes, AI-199); director tasks on Engine C; more providers' profiles as they are used; time-of-day, storage, multiplier and CNY price rules when needed; admin-key organisation reports; Claude Code channels; the webhook relay; video, audio and 3D hosted services with their apps.
 
 ---
 
@@ -2111,8 +2244,8 @@ AI agents write most of the code, working on your PC in your account; you test m
     - `compile.not_found`: `user_fixable`, `never` (recompile);
     - `stage.target_unavailable` (the target document or module doesn't exist): `user_fixable`, `after_resolve`.
 - **QA-006** [M1] (contract) Plan limits and sign-in failures of Claude Code:
-  - `quota.plan_limit` is an error for co-pilot calls; for director tasks it is the `waiting_quota` substatus, not an error.
-  - An expired Claude Code login (one that can no longer be refreshed): co-pilot calls fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, fix "Sign in to Claude Code"); director tasks go to the `waiting_auth` substatus (§4.6a), distinct from `waiting_quota` and never retried automatically.
+  - `quota.plan_limit` is an error for TETHER and ORACLE calls; for director tasks it is the `waiting_quota` substatus, not an error.
+  - An expired Claude Code login (one that can no longer be refreshed): TETHER and ORACLE calls fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, fix "Sign in to Claude Code"); director tasks go to the `waiting_auth` substatus (§4.6a), distinct from `waiting_quota` and never retried automatically.
 - **QA-007** [M1] (invariant) Jobs with external side effects (hosted media, paid partner nodes) are retried automatically only when the request provably wasn't processed (connection failure, a 429/503 before acceptance) or the provider honours idempotency keys. Otherwise the job becomes `interrupted_unknown` (retry policy `after_resolve`). `interrupted_unknown` is used only for jobs stuck in `submitting` without an external id (§2.8).
 - **QA-008** [M1] Inline metered calls (LLM requests, assistant turns, vision QA) may be retried and may use refusal fallback or fallback chains; every attempt is metered.
 - **QA-009** [M1] (invariant) Local ComfyUI jobs: if ComfyUI restarts mid-job, a known `prompt_id` that is no longer present is provably gone, so the job becomes `interrupted`. Outputs already written are salvaged by the job's unique filename prefix. Re-running is your choice (automatic for agent batches).
@@ -2242,7 +2375,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_PROFILE` and `CLAUDE_CODE_USE_*` are never passed;
   - the generated MCP config passes `LIL_PROFILE=<id>` to `lil-mcp`, and `lil-mcp` sends that profile id in `core/hello`;
   - the per-profile lock: `auth status` runs only when the profile has no active suite session; a busy profile launches only with a verification younger than 30 minutes and a matching `initialize` account, otherwise it waits; launches within one profile are serialised;
-  - an auth failure (the "Login expired" error, HTTP 401 or `authMethod: "none"`) → `waiting_auth` for director tasks, never retried; a co-pilot call → `engine.claude_code.not_signed_in` (QA-006);
+  - an auth failure (the "Login expired" error, HTTP 401 or `authMethod: "none"`) → `waiting_auth` for director tasks, never retried; a TETHER or ORACLE call → `engine.claude_code.not_signed_in` (QA-006);
   - the suite never chooses or changes a task's profile by itself; a `waiting_quota` task offers only wait, the API engine or a local model.
 - **QA-055** [M1] **Crash and recovery** (fast subset every push, full suite nightly): fail points at every step of the write order and job submission; corrupt or missing databases (`index.db`, the suite-level and per-workspace `state.db`, `telemetry.db`); torn log lines; disk full; held handles (Defender-style); app abort mid-autosave → recovery offered.
 - **QA-056** [M1] **End-to-end through `lil`** (PR-ready): the real core over the real pipe on the test channel — the `core/hello` handshake for every caller kind, multiple clients, events and resubscribe, confirmations, caps (including `lil --non-interactive` getting `cap.exceeded` / `confirm.unavailable`, QA-016), identity.
@@ -2590,7 +2723,7 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 
 ## Appendix A. Milestones
 
-**Sequence.** M0 (spikes that prove risky assumptions) → **M1a** (first usable Image studio on the core platform) → **M1b** (completes the studio) → **M1.5** (multi-machine, cloud stores, local LLMs, interactive-session telemetry and the other deferred extras) → **Later**.
+**Sequence.** M0 (spikes that prove risky assumptions) → **M1a** (first usable Image studio on the core platform) → **M1b** (completes the studio; the assistant's three surfaces, with local LLMs for chat) → **M1.5** (multi-machine, cloud stores, local LLMs for tool use and per-task work, interactive-session telemetry and the other deferred extras) → **Later**.
 
 - `[M1]` rules in §1–4, 6 and 7 are the platform for milestone 1. The plan orders them so each M1a feature has what it needs, and all of them are done by the end of M1b. §5 splits its own rules into `[M1a]` and `[M1b]`.
 - An `[M0]` rule is a spike. Work that depends on it doesn't start until it passes, and a failed spike comes back for review as a design change.
@@ -2601,11 +2734,11 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 | §1 Processes, connections, trust and repo layout | 1 | 112 | 1 | 0 | 4 | 6 | 124 |
 | §2 Core modules | 0 | 140 | 1 | 1 | 5 | 4 | 151 |
 | §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 11 | 3 | 3 | 11 | 146 |
-| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 37 | 77 | 17 | 5 | 198 |
+| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 38 | 98 | 18 | 5 | 221 |
 | §5 Image studio | 8 | 3 | 113 | 30 | 9 | 4 | 167 |
 | §6 Errors, testing and quality | 1 | 84 | 0 | 1 | 0 | 1 | 87 |
 | §7 Sync, backup and builds | 2 | 83 | 0 | 0 | 20 | 3 | 108 |
-| **All** | **29** | **585** | **163** | **112** | **58** | **34** | **981** |
+| **All** | **29** | **585** | **164** | **133** | **59** | **34** | **1004** |
 
 ## Appendix B. M0 spike checklist and facts to re-verify
 
