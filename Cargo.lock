@@ -1490,6 +1490,131 @@ dependencies = [
 ]
 
 [[package]]
+name = "lil-cli"
+version = "0.0.0"
+dependencies = [
+ "age",
+ "anyhow",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "clap",
+ "globset",
+ "jsonwebtoken",
+ "lil-client",
+ "lil-platform",
+ "lil-protocol",
+ "lil-testkit",
+ "reqwest",
+ "roxmltree",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+ "yaml-rust2",
+ "zeroize",
+]
+
+[[package]]
+name = "lil-client"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "lil-platform",
+ "lil-protocol",
+ "lil-schema",
+ "lil-testkit",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lil-core"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "lil-platform",
+ "lil-protocol",
+ "lil-schema",
+ "lil-testkit",
+ "proptest",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "lil-platform"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "windows",
+ "zeroize",
+]
+
+[[package]]
+name = "lil-protocol"
+version = "0.0.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+]
+
+[[package]]
+name = "lil-schema"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toml 0.8.23",
+ "toml_edit",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "lil-spec-tests"
+version = "0.0.0"
+dependencies = [
+ "lil-protocol",
+ "lil-testkit",
+ "serde_json",
+]
+
+[[package]]
+name = "lil-testkit"
+version = "0.0.0"
+dependencies = [
+ "lil-platform",
+ "lil-protocol",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3428,131 +3553,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "ww-cli"
-version = "0.0.0"
-dependencies = [
- "age",
- "anyhow",
- "aws-lc-rs",
- "base64 0.23.1",
- "clap",
- "globset",
- "jsonwebtoken",
- "reqwest",
- "roxmltree",
- "rpassword",
- "serde",
- "serde_json",
- "tempfile",
- "toml 0.8.23",
- "ww-client",
- "ww-platform",
- "ww-protocol",
- "ww-testkit",
- "yaml-rust2",
- "zeroize",
-]
-
-[[package]]
-name = "ww-client"
-version = "0.0.0"
-dependencies = [
- "futures-util",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "ww-platform",
- "ww-protocol",
- "ww-schema",
- "ww-testkit",
-]
-
-[[package]]
-name = "ww-core"
-version = "0.0.0"
-dependencies = [
- "futures-util",
- "proptest",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "ww-platform",
- "ww-protocol",
- "ww-schema",
- "ww-testkit",
-]
-
-[[package]]
-name = "ww-platform"
-version = "0.0.0"
-dependencies = [
- "getrandom 0.4.3",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "toml 0.8.23",
- "windows",
- "zeroize",
-]
-
-[[package]]
-name = "ww-protocol"
-version = "0.0.0"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.11.1",
-]
-
-[[package]]
-name = "ww-schema"
-version = "0.0.0"
-dependencies = [
- "proptest",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "toml 0.8.23",
- "toml_edit",
- "yaml-rust2",
-]
-
-[[package]]
-name = "ww-spec-tests"
-version = "0.0.0"
-dependencies = [
- "serde_json",
- "ww-protocol",
- "ww-testkit",
-]
-
-[[package]]
-name = "ww-testkit"
-version = "0.0.0"
-dependencies = [
- "rusqlite",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "toml 0.8.23",
- "ww-platform",
- "ww-protocol",
-]
 
 [[package]]
 name = "x25519-dalek"

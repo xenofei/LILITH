@@ -1,0 +1,29 @@
+[package]
+name = "lil-client"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The client side of the core pipe (ARCH-110): find, start, verify and handshake with
+# `lil-core`, then call tools and follow events. `blocking` wraps it for synchronous callers.
+[dependencies]
+futures-util.workspace = true
+# `lil doctor` inspects, sets aside and recovers the suite `state.db` without a core (CORE-004).
+rusqlite.workspace = true
+# Only for the `Serialize`/`DeserializeOwned` bounds of the generic request helpers.
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
+tokio-util.workspace = true
+lil-platform = { path = "../lil-platform" }
+lil-protocol = { path = "../lil-protocol" }
+lil-schema = { path = "../lil-schema" }
+
+[dev-dependencies]
+tempfile.workspace = true
+lil-testkit = { path = "../lil-testkit" }
+
+[lints]
+workspace = true

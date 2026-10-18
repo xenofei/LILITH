@@ -1,6 +1,6 @@
 ---
 name: "manifest"
-description: "Worldwright reference I: workspace and project folder layout, worldwright.yaml and project.yaml settings, the asset manifest JSON schema, candidate runs, sign-off and sealed versions, link syntax, status and staleness rules, library items, the job queue, the model and provider registries, the usage log (registry/usage.jsonl) and user spending caps (suite.toml). Load when setting up a workspace or project, or writing or reading a manifest, run, link, library item, queue entry, registry entry or usage line."
+description: "LILITH (Latent Image & Likeness Instrumentality Toolchain Hub) reference I: workspace and project folder layout, lilith.yaml and project.yaml settings, the asset manifest JSON schema, candidate runs, sign-off and sealed versions, link syntax, status and staleness rules, library items, the job queue, the model and provider registries, the usage log (registry/usage.jsonl) and user spending caps (suite.toml). Load when setting up a workspace or project, or writing or reading a manifest, run, link, library item, queue entry, registry entry or usage line."
 user-invocable: false
 ---
 
@@ -15,9 +15,9 @@ Path bases:
 
 ```
 <workspace>/
-  worldwright.yaml                # workspace settings and defaults (I2)
-  .worldwright/state.json         # active project, last session; {"active_project": "ember-knight"}
-  .worldwright/staging/           # scratch space for in-flight work (gitignored)
+  lilith.yaml                     # workspace settings and defaults (I2)
+  .lilith/state.json              # active project, last session; {"active_project": "ember-knight"}
+  .lilith/staging/                # scratch space for in-flight work (gitignored)
   .trash/                         # files deleted through the suite land here first (gitignored)
   registry/models.yaml            # models, files, hashes, settings, last_verified, fallbacks (I9)
   registry/providers.yaml         # hosted providers, endpoints, billing basis, balance checks (I9)
@@ -29,16 +29,18 @@ Path bases:
   projects/<slug>/                # one folder per project (I3)
 ```
 
+A workspace made before the rename to LILITH, with the `worldwright` plugin, has `worldwright.yaml` and `.worldwright/` instead. For one release the core still finds and reads it, writes its own state to `.lilith/`, and never renames or rewrites the old files.
+
 Library kinds: `style-kits`, `palettes`, `characters`, `props`, `materials`, `audio`, `rigs`, `motions`, `fonts`, `ui-kits`, `loras`, `recipes`.
 
-Keep the workspace under git, with LFS (or the configured VCS) for binaries. `.gitignore` covers `inbox/*`, `.worldwright/staging/`, `.trash/` and `projects/*/assets/*/candidates/`. A project shared with others can be its own repository inside `projects/`.
+Keep the workspace under git, with LFS (or the configured VCS) for binaries. `.gitignore` covers `inbox/*`, `.lilith/staging/`, `.trash/` and `projects/*/assets/*/candidates/`. A project shared with others can be its own repository inside `projects/`.
 
-Outside the workspace, the user-level file `%APPDATA%\Worldwright\suite.toml` holds the user's spending caps (I10). It belongs to the user; agents read it and never write it.
+Outside the workspace, the user-level file `%APPDATA%\LILITH\suite.toml` holds the user's spending caps (I10). It belongs to the user; agents read it and never write it.
 
-## I2. Workspace settings (`worldwright.yaml`)
+## I2. Workspace settings (`lilith.yaml`)
 
 ```yaml
-name: My Worldwright
+name: My LILITH
 created: 2026-10-12
 defaults:                         # inherited by every project unless it overrides them
   vcs: git+lfs
@@ -309,7 +311,7 @@ Status values: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `downloa
 | Field | Meaning |
 |---|---|
 | `ts` | ISO 8601 UTC timestamp of the call |
-| `workspace` | `name` from `worldwright.yaml` |
+| `workspace` | `name` from `lilith.yaml` |
 | `project`, `asset` | Project slug and asset ID; `null` for calls outside an asset (for example registry refreshes) |
 | `job_id` | The queue job ID, or a generated ID for synchronous calls (`c_<yyyymmdd>_<hhmmss>_<n>`) |
 | `tool` | What made the call: `claude-code`, `comfyui`, `litellm`, `curl`, an MCP tool name, a script path |
@@ -328,13 +330,13 @@ Status values: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `downloa
 Examples:
 
 ```json
-{"ts": "2026-10-12T14:03:11Z", "workspace": "Worldwright", "project": "ember-knight", "asset": "itm_descriptions", "job_id": "c_20261012_140311_1", "tool": "litellm", "provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash", "route": "openrouter", "billing_basis": "prepaid_credits", "input_tokens": 18240, "output_tokens": 6120, "cached_tokens": 0, "reasoning_tokens": 0, "est_cost": 0.01, "cost": 0.0087, "cost_source": "provider_reported", "currency": "USD", "latency_ms": 9400, "status": "succeeded"}
-{"ts": "2026-10-12T15:20:42Z", "workspace": "Worldwright", "project": "sketchbook", "asset": "vid_lighthouse", "job_id": "j_20261012_0007", "tool": "curl", "provider": "fal", "model": "bytedance/seedance-2.5/text-to-video", "route": "direct", "billing_basis": "prepaid_credits", "seconds": 15, "est_cost": 1.80, "cost": 1.80, "cost_source": "computed_from_usage", "currency": "USD", "latency_ms": 184000, "status": "succeeded"}
+{"ts": "2026-10-12T14:03:11Z", "workspace": "LILITH", "project": "ember-knight", "asset": "itm_descriptions", "job_id": "c_20261012_140311_1", "tool": "litellm", "provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash", "route": "openrouter", "billing_basis": "prepaid_credits", "input_tokens": 18240, "output_tokens": 6120, "cached_tokens": 0, "reasoning_tokens": 0, "est_cost": 0.01, "cost": 0.0087, "cost_source": "provider_reported", "currency": "USD", "latency_ms": 9400, "status": "succeeded"}
+{"ts": "2026-10-12T15:20:42Z", "workspace": "LILITH", "project": "sketchbook", "asset": "vid_lighthouse", "job_id": "j_20261012_0007", "tool": "curl", "provider": "fal", "model": "bytedance/seedance-2.5/text-to-video", "route": "direct", "billing_basis": "prepaid_credits", "seconds": 15, "est_cost": 1.80, "cost": 1.80, "cost_source": "computed_from_usage", "currency": "USD", "latency_ms": 184000, "status": "succeeded"}
 ```
 
 **Month-to-date spend** = the sum of `cost` (or `est_cost` where `cost` is `null`) over the latest line per `job_id` with a `ts` in the current calendar month, grouped by project and provider as needed.
 
-**Spending caps (`%APPDATA%\Worldwright\suite.toml`).** Optional and set by the user only. Agents read the file and never create, edit or work around it. No file, or no `[caps]` table, means no caps. Format:
+**Spending caps (`%APPDATA%\LILITH\suite.toml`).** Optional and set by the user only. Agents read the file and never create, edit or work around it. No file, or no `[caps]` table, means no caps. Format:
 
 ```toml
 [caps]

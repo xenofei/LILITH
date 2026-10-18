@@ -30,7 +30,7 @@
 - `yaml-rust2` (already a workspace dependency) validates targeted YAML edits.
 - New `windows` features in `ww-platform` only: `Win32_System_IO` and `Win32_Storage_CloudFilters`.
 
-**Spec:** `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md`. Task 1 adds its Appendix E, "Workspace data (plan 2b clarification)". The plan follows roadmap row 2b (`docs/superpowers/plans/2026-10-12-roadmap.md`), which cites §1.5–1.6, §2.1 and §2.3–2.4.
+**Spec:** `docs/superpowers/specs/2026-10-12-lilith-design.md`. Task 1 adds its Appendix E, "Workspace data (plan 2b clarification)". The plan follows roadmap row 2b (`docs/superpowers/plans/2026-10-12-roadmap.md`), which cites §1.5–1.6, §2.1 and §2.3–2.4.
 
 The rules this plan implements, fully or in the part named:
 - §1.1: ARCH-002 (store), ARCH-016 (`ww notify`, `ww doctor` basics);
@@ -466,7 +466,7 @@ The outline at the end of plan 2a gives 10 tasks. This plan keeps their content 
 ### Task 1: Spec changes first (QA-029)
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md`. No new IDs, no renumbering and no new `- **ID** [` lines; the ID check stays `925 925 []`.
+- Modify: `docs/superpowers/specs/2026-10-12-lilith-design.md`. No new IDs, no renumbering and no new `- **ID** [` lines; the ID check stays `925 925 []`.
 - Modify: `docs/reference/workspace-format.md` (not protected), two edits in I5:
   - in the sign-off step's `signed_off` object, `by` becomes `"user" | "assistant" | "claude-code" | "cli"` (owner question 4);
   - "Runs are never edited after sign-off, apart from their status." becomes "Runs are never edited after sign-off, apart from their status and `trashed_utc`, which the suite sets when it moves a rejected run's folder to trash (plan 2b clarification: spec Appendix E)."
@@ -509,13 +509,13 @@ The outline at the end of plan 2a gives 10 tasks. This plan keeps their content 
 - [ ] **Step 4: Update §0.5's document map** to end with "· Appendix E Workspace data (plan 2b clarification)".
 - [ ] **Step 5: Verify the IDs.**
 
-Run: `python -I -c "import re;t=open('docs/superpowers/specs/2026-10-12-worldwright-suite-design.md',encoding='utf-8').read();ids=re.findall(r'(?m)^- \*\*([A-Z]+-\d{3})\*\* \[',t);refs=set(re.findall(r'\b(?:ARCH|CORE|APP|AI|IMG|QA|OPS)-\d{3}\b',t));print(len(ids),len(set(ids)),sorted(refs-set(ids)))"`
+Run: `python -I -c "import re;t=open('docs/superpowers/specs/2026-10-12-lilith-design.md',encoding='utf-8').read();ids=re.findall(r'(?m)^- \*\*([A-Z]+-\d{3})\*\* \[',t);refs=set(re.findall(r'\b(?:ARCH|CORE|APP|AI|IMG|QA|OPS)-\d{3}\b',t));print(len(ids),len(set(ids)),sorted(refs-set(ids)))"`
 Expected: `925 925 []`
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add docs/superpowers/specs/2026-10-12-worldwright-suite-design.md docs/reference/workspace-format.md
+git add docs/superpowers/specs/2026-10-12-lilith-design.md docs/reference/workspace-format.md
 git commit -m "spec: workspace data appendix and plan-2b clarifications (write path, codes, tools, golden)"
 ```
 

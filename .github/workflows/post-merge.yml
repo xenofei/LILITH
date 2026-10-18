@@ -41,12 +41,12 @@
 #
 # Two things the owner needs to know:
 # - The revert PR is opened with the workflow's GITHUB_TOKEN, and GitHub starts no workflows for
-#   events caused by that token. The revert PR therefore gets no checks, and `ww dev merge` won't
+#   events caused by that token. The revert PR therefore gets no checks, and `lil dev merge` won't
 #   merge it until it has them. To get them, close and reopen the PR, or push an empty commit to
 #   its branch as yourself (`git commit --allow-empty -m "run checks"`, then push).
 # - Opening the PR needs the repository setting "Allow GitHub Actions to create and approve pull
 #   requests" (Settings > Actions > General) to be on. That is the owner's step in plan 1 task 15.
-#   Without it, `ww dev revert-pr` still opens the issue, with the verdict, and says so.
+#   Without it, `lil dev revert-pr` still opens the issue, with the verdict, and says so.
 
 name: "CI: post-merge"
 
@@ -104,7 +104,7 @@ jobs:
         run: cargo nextest run --workspace --locked
 
       - name: Spec tests
-        run: cargo run --locked -p ww-cli -- dev spec-tests
+        run: cargo run --locked -p lil-cli -- dev spec-tests
 
   post-merge-check:
     name: post-merge-check

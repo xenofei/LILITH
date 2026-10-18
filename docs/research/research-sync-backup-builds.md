@@ -185,7 +185,7 @@ Status data comes from the GitHub API on 2026-10-12.
 - Its repo format is stable and well documented.
 
 Layout:
-- `restic -r E:\backup\worldwright backup --use-fs-snapshot --json ...` runs nightly via Task Scheduler. The suite can register the task.
+- `restic -r E:\backup\lilith backup --use-fs-snapshot --json ...` runs nightly via Task Scheduler. The suite can register the task.
 - `restic copy` (or a second `backup` run) sends to the cloud repo. Use B2 through its S3 endpoint, or SFTP to a Hetzner Storage Box.
 - Run `forget --prune` and periodic `check --read-data-subset` as maintenance.
 - Exclude large media that's already in the LFS bucket only if you accept relying on the bucket for those files. The user decided on full backups, so the cost table below assumes they're included.

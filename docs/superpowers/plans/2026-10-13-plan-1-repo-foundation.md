@@ -26,7 +26,7 @@ These sit behind a `GitHubApi` trait that has a fake for tests. GitHub Actions r
 - Crates: `clap`, `serde`, `toml`, `serde_json`, `globset`, `reqwest` (blocking, rustls), `jsonwebtoken`, `age` (passphrase), `rpassword`, `sha2`, `tempfile`, `windows` (in `ww-platform` only), `thiserror`, `anyhow`.
 - GitHub Actions on GitHub-hosted Windows runners. Git hooks run through Git for Windows' `sh`.
 
-**Spec:** `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md`. The rules this plan implements:
+**Spec:** `docs/superpowers/specs/2026-10-12-lilith-design.md`. The rules this plan implements:
 - §1.8: ARCH-109–113;
 - §1.6: ARCH-095, ARCH-097;
 - §6.2: QA-017–QA-021, QA-024, QA-027–QA-031, QA-033–QA-037;
@@ -118,7 +118,7 @@ Roadmap: `docs/superpowers/plans/2026-10-12-roadmap.md` (plan 1). M0 results: `d
 ### Task 1: Spec changes first (QA-029)
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md` (no renumbering; ID check stays `922 922 []`)
+- Modify: `docs/superpowers/specs/2026-10-12-lilith-design.md` (no renumbering; ID check stays `922 922 []`)
 
 **Interfaces:**
 - Produces: the spec text later tasks implement.
@@ -132,13 +132,13 @@ Roadmap: `docs/superpowers/plans/2026-10-12-roadmap.md` (plan 1). M0 results: `d
 
 - [ ] **Step 2: Verify the IDs.**
 
-Run: `python -I -c "import re;t=open('docs/superpowers/specs/2026-10-12-worldwright-suite-design.md',encoding='utf-8').read();ids=re.findall(r'(?m)^- \*\*([A-Z]+-\d{3})\*\* \[',t);refs=set(re.findall(r'\b(?:ARCH|CORE|APP|AI|IMG|QA|OPS)-\d{3}\b',t));print(len(ids),len(set(ids)),sorted(refs-set(ids)))"`
+Run: `python -I -c "import re;t=open('docs/superpowers/specs/2026-10-12-lilith-design.md',encoding='utf-8').read();ids=re.findall(r'(?m)^- \*\*([A-Z]+-\d{3})\*\* \[',t);refs=set(re.findall(r'\b(?:ARCH|CORE|APP|AI|IMG|QA|OPS)-\d{3}\b',t));print(len(ids),len(set(ids)),sorted(refs-set(ids)))"`
 Expected: `925 925 []` (922 when Task 1 ran; Task 16 added QA-086, QA-087 and OPS-108)
 
 - [ ] **Step 3: Commit.**
 
 ```bash
-git add docs/superpowers/specs/2026-10-12-worldwright-suite-design.md
+git add docs/superpowers/specs/2026-10-12-lilith-design.md
 git commit -m "spec: plan-1 owner decisions (reviewer App, agent token) and clarifications"
 ```
 

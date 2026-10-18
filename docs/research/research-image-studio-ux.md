@@ -5,7 +5,7 @@ Research date: 2026-10-12. Sources are primary (official docs, source repos, rel
 Markers used in this report:
 - **[V]** Verified: read directly in source code or official docs on 2026-10-12.
 - **[U]** Unverified: inference, recollection or my own assessment. Check it before relying on it.
-- **[R]** Recommendation for the Worldwright design. These are opinions.
+- **[R]** Recommendation for the design of LILITH (Latent Image & Likeness Instrumentality Toolchain Hub). These are opinions.
 
 ---
 
@@ -217,7 +217,7 @@ Historically highest-reaction canvas requests: "Canvas Layers" #4466 (17 reactio
 | [RFC #8988](https://github.com/invoke-ai/InvokeAI/issues/8988) | Implicit cross-page state leakage between Generate, Canvas and Workflow. |
 | v7 alpha | A one-way DB migration (v7 DB is unreadable by v6), Python 3.12 required, and "This is alpha software". |
 
-**[R] Takeaways for Worldwright's Image studio**
+**[R] Takeaways for LILITH's Image studio**
 - Copy the four-stack model, the enable-vs-visible split, the auto mode table (1.10), and staging with Accept-as-layer / Keep-hidden / Discard-all.
 - Keep layer properties (prompt, control model, weight) **visible and adjacent to the layer**, not under tool settings.
 - Allow non-destructive edits during staging where safe.
@@ -438,7 +438,7 @@ What the official frontend preserves:
 - `extensionPersistence.ts` (2026-09) explicitly round-trips **non-canonical node and graph fields** (as "legacy" fields) and a namespaced **`extensions`** object. It tolerates non-cloneable values (#18252). [V]
 - These changes are on `main` (Sept 2026). Whether they are in the 1.55.x line ComfyUI master pins is [U]. Check `core/1.55` before relying on them.
 
-**[R] Rules for Worldwright's native node editor**
+**[R] Rules for LILITH's native node editor**
 
 1. **Treat the JSON as the document and edit it surgically.** Keep the original `serde_json::Value`, apply edits as patches (widget value, pos, link add/remove, mode), and re-emit. Unknown keys on root, nodes, links, groups, `extra`, `properties` and `extensions` stay intact byte-for-byte, modulo number formatting.
 2. **Never renumber ids.** Bump `last_node_id` / `last_link_id` (0.4) or `state.*` (v1) on add. Keep 0.4 tuple links at the root and v1 object links inside `definitions.subgraphs`. Write `linkExtensions` when you change reroute parents.

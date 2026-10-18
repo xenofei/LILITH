@@ -1,15 +1,15 @@
 # Every-push tier (QA-070): formatting, lints, cargo-deny, the workspace tests and the spec tests
-# on every push to a branch other than main. `ww dev merge` requires the `every-push` check on the
+# on every push to a branch other than main. `lil dev merge` requires the `every-push` check on the
 # PR's head commit (QA-033). Pushes to main are judged by post-merge.yml instead.
 #
 # Every push runs everything (ruling R25): the repo is public, so GitHub-hosted minutes are free,
 # and a skipped run could report green on untested code.
 #
-# privacy-check (QA-086, rulings R32-R35) runs `ww dev privacy-scan --range` (with the pushed
+# privacy-check (QA-086, rulings R32-R35) runs `lil dev privacy-scan --range` (with the pushed
 # branch name as `--ref-name`) on every commit of the pushed branch that main doesn't have
 # (refs/remotes/origin/main..<pushed sha>). It scans
 # the whole branch, not only before..sha: a later clean push must not turn the check green on a
-# branch whose earlier commits leaked something. `ww dev merge` and the main ruleset require
+# branch whose earlier commits leaked something. `lil dev merge` and the main ruleset require
 # `privacy-check` on the PR's head commit. The denylist comes from the LIL_PRIVACY_DENYLIST and
 # WW_PRIVACY_DENYLIST Actions secrets, each passed in the variable of its own name (the CLI reads
 # the new name first and skips a blank one); when both are missing or empty (fork PRs never get
@@ -43,7 +43,7 @@ defaults:
 
 jobs:
   every-push:
-    # The check run's name. `ww dev merge` requires it by exactly this name.
+    # The check run's name. `lil dev merge` requires it by exactly this name.
     name: every-push
     runs-on: windows-2025
     timeout-minutes: 45
@@ -85,13 +85,13 @@ jobs:
         run: cargo nextest run --workspace --locked
 
       - name: Spec tests
-        run: cargo run --locked -p ww-cli -- dev spec-tests
+        run: cargo run --locked -p lil-cli -- dev spec-tests
 
       - name: Spec traceability report
-        run: cargo run --locked -p ww-cli -- dev spec-report
+        run: cargo run --locked -p lil-cli -- dev spec-report
 
   privacy-check:
-    # The check run's name. `ww dev merge` and the main ruleset require it by exactly this name.
+    # The check run's name. `lil dev merge` and the main ruleset require it by exactly this name.
     name: privacy-check
     runs-on: windows-2025
     timeout-minutes: 30

@@ -42,10 +42,19 @@ Decisions this plan makes. Each stands unless the owner says otherwise at review
     5. A leftover temp file from a killed copy is removed before the next attempt.
   - **Read-only opens** use the new file if it exists, else the legacy one read-only, else the in-memory database used today.
   - **Honest limit:** a read-only connection on a live WAL database may create or update its `-shm`, SQLite's index file. That is the one write the legacy folder can see; the database and its `-wal` are never written. If SQLite refuses a read-only read (a hot WAL that needs recovery), the open fails with `state.unavailable` naming the legacy file, and nothing is written.
+  - **Read-only limit (ruling RN9).** A read-only open of a legacy WAL database that has no `-wal` may create an empty `-wal` and a `-shm` beside it. No row and no database byte changes. Avoiding it would need `immutable=1`, which is unsafe while the lock holder may be writing.
+  - **Other volume.** A read-only core that opened the legacy database (in `<vol>:\.worldwright-local\<hash>`, shared by every channel) keeps reading it until it restarts, even after the lock holder has copied it forward. Its view goes stale, but it never writes.
+  - **Orphan SQLite files (rulings RN10 and RN10b).** If `state.db-wal`, `state.db-shm` or `state.db-journal` lies beside the missing new `state.db`, the copy-forward is refused with `state.unavailable`. Otherwise an orphan `-wal`'s frames would turn into rows in the copy.
+    - The message names the full path of each file. It tells the person to move those files aside themselves, for example by renaming each one to end in `.set-aside`, and then open the workspace again.
+    - It also says nothing is lost, because the legacy database was not touched.
+    - The suite never moves or deletes them (owner decision 5).
+    - `lil doctor` does not cover workspace local folders yet. A doctor path for them comes in a later plan.
+  - **Stale temp files.** A leftover `.state.db.lil-tmp-*` is swept on every read-write open, before the check for an existing `state.db`, so a crash after the rename can't leave one behind.
   - **Not copied forward: the suite `state.db`.** R4 lists only `suite.toml` for the data folders, and no suite `state.db` exists anywhere: no core has run outside test temp roots (inventory section 5). One created by a pre-rename build would be left in place, and the new core starts a fresh one.
 - **D4. Both locks count (R4 carve-out).** The core creates and locks `.lilith\core.lock`. When `.worldwright\` exists, it also creates and locks `.worldwright\core.lock`. It serves read-write only when it holds both, and otherwise read-only, which is how a held `core.lock` is handled today (ARCH-028).
   - The legacy lock file is a lock, not the person's data, so creating it is the one deliberate exception to "never write old names". The `.worldwright\` folder itself is never created.
-  - An old core and a new core never both write to one workspace, whichever starts first (B6).
+  - An old core and a new core never both write to one workspace, whichever starts first (B6), as long as `.worldwright\` exists.
+  - **Accepted risk (correction from the B4 review).** A fresh clone of a plugin-era workspace, or one cleaned with `git clean -fdX` where `.worldwright/` is gitignored, has `worldwright.yaml` but no `.worldwright\`. The new core then creates and locks only `.lilith\core.lock`, so an old core started after it could also write. D4 forbids creating `.worldwright\`, and no pre-rename core runs on a real workspace, so the risk is accepted. Appendix E of the spec states it.
 - **D5. The plugin keeps its id, the suite's MCP server becomes `lil`.**
   - The spec's future MCP server (plugin 1.3, built in this repo) is renamed `lil`. Tool names become `mcp__plugin_worldwright_lil__<tool>` and, in Engine A, `mcp__lil__<tool>`.
   - `WW_ENGINE` and `WW_PROFILE` become `LIL_*`.

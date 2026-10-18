@@ -1,6 +1,6 @@
 # Protected-test check (QA-033, rulings R8 and R21). Judges a PR's head commit with the test-diff
 # guard, using the CLI built from main, and counts the reviewer app's approval of that exact
-# commit. `ww dev merge` requires the `protected-test-check` check on the PR's head commit.
+# commit. `lil dev merge` requires the `protected-test-check` check on the PR's head commit.
 # The step "Pick the CLI crate" builds whichever CLI crate main has (crates/lil-cli, else
 # crates/ww-cli), so the check keeps working across the crate's rename.
 #
@@ -9,11 +9,11 @@
 #   git data and judged; its code is never built, tested or run here. (The spec tests run the
 #   PR's code, so they stay in the every-push and PR-ready tiers.)
 # - The trigger is `pull_request`, so the check run lands on the PR's head commit, where
-#   `ww dev merge` looks for it. (`pull_request_target` would attach it to the base branch's
+#   `lil dev merge` looks for it. (`pull_request_target` would attach it to the base branch's
 #   commit instead, and the merge would never see it.)
 # - This workflow file comes from the PR's merge ref, so a PR could edit it, or add a workflow that
 #   posts a same-named check. That is why `.github/workflows/**` is protected (QA-019, R21): such a
-#   PR itself needs the reviewer app's approval. `ww dev merge` also recomputes the verdict
+#   PR itself needs the reviewer app's approval. `lil dev merge` also recomputes the verdict
 #   locally, and post-merge.yml judges every push to main from main.
 #
 # Runs and check suites (ruling R40). Every workflow run is its own check suite, and GitHub's
@@ -28,7 +28,7 @@
 #   for older heads finish on their own), and a second run for the same commit waits for the
 #   first instead of cancelling it.
 # - The reviewer app's approval turns the check green without a new push because
-#   `ww dev approve` re-runs every finished, non-green run of this workflow for that PR and
+#   `lil dev approve` re-runs every finished, non-green run of this workflow for that PR and
 #   commit after posting the review. A re-run keeps the original event payload, and the guard
 #   reads the PR's reviews live.
 #
@@ -51,7 +51,7 @@ defaults:
 
 jobs:
   protected-test-check:
-    # The check run's name. `ww dev merge` requires it by exactly this name.
+    # The check run's name. `lil dev merge` requires it by exactly this name.
     name: protected-test-check
     runs-on: windows-2025
     timeout-minutes: 30

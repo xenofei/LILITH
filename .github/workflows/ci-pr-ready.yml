@@ -1,14 +1,14 @@
 # PR-ready tier (QA-071): everything the every-push tier runs, plus cargo-audit and a release
-# build, on every non-draft PR. `ww dev merge` requires the `pr-ready` check on the PR's head
+# build, on every non-draft PR. `lil dev merge` requires the `pr-ready` check on the PR's head
 # commit (QA-033). On a draft PR, `pr-ready` fails in its first step, on purpose: GitHub counts a
 # skipped job as passing for required checks, so the job is never skipped (R38). Marking the PR
-# ready for review runs it again. `ww dev merge` refuses drafts too.
+# ready for review runs it again. `lil dev merge` refuses drafts too.
 #
 # The checkout is GitHub's merge of the PR into its base, so the tests run on what main would
 # become. This job runs the PR's code with a read-only token; the guard's own judgement runs from
 # main in ci-guard.yml.
 #
-# privacy-check-pr (QA-086, rulings R32-R35) runs `ww dev privacy-scan --range` (with the PR's
+# privacy-check-pr (QA-086, rulings R32-R35) runs `lil dev privacy-scan --range` (with the PR's
 # branch name as `--ref-name`) on the PR's commits (refs/remotes/origin/<base>..<head>), drafts
 # included, so the PR shows the privacy
 # verdict for exactly what it would merge. The required check is `privacy-check` from
@@ -37,7 +37,7 @@ defaults:
 
 jobs:
   pr-ready:
-    # The check run's name. `ww dev merge` requires it by exactly this name.
+    # The check run's name. `lil dev merge` requires it by exactly this name.
     name: pr-ready
     runs-on: windows-2025
     timeout-minutes: 60
@@ -89,7 +89,7 @@ jobs:
         run: cargo nextest run --workspace --locked
 
       - name: Spec tests
-        run: cargo run --locked -p ww-cli -- dev spec-tests
+        run: cargo run --locked -p lil-cli -- dev spec-tests
 
       # ---- PR-ready additions ----
       - name: cargo-audit

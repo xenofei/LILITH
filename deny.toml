@@ -1,6 +1,6 @@
 # cargo-deny policy (ARCH-111, QA-027 alongside the dependency-boundary test).
-# Platform checks (no Qt/Windows crates in ww-schema / ww-protocol) live in
-# crates/ww-testkit/tests/dependency_boundaries.rs, not in `bans`.
+# Platform checks (no Qt/Windows crates in lil-schema / lil-protocol) live in
+# crates/lil-testkit/tests/dependency_boundaries.rs, not in `bans`.
 
 [graph]
 targets = ["x86_64-pc-windows-msvc"]
