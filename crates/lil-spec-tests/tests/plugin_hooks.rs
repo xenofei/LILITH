@@ -335,15 +335,10 @@ fn session_start_reports_jobs_and_confirmations() {
         context.contains("sketchbook"),
         "the active project: {context}"
     );
+    assert!(context.contains(&job), "the open job's id: {context}");
     assert!(
-        context.contains(&job) || context.contains("1 open job"),
-        "one open job: {context}"
-    );
-    assert!(
-        context.contains(&confirmation)
-            || context.contains("test.destructive")
-            || context.contains("1 pending confirmation"),
-        "one pending confirmation: {context}"
+        context.contains(&confirmation),
+        "the pending confirmation's id: {context}"
     );
     release(&mut pipe, &job);
 }
@@ -401,35 +396,45 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()))
 }
 
-/// A token's start (a well-known secret prefix) and the shortest run after it that counts.
-const TOKEN_PREFIXES: &[(&str, usize)] = &[
-    ("ghp_", 30),
-    ("gho_", 30),
-    ("ghs_", 30),
-    ("github_pat_", 30),
-    ("hf_", 30),
-    ("sk-ant-", 20),
-    ("sk-", 32),
-    ("AKIA", 16),
-    ("AIza", 30),
-    ("xoxb-", 20),
-    ("xoxp-", 20),
+/// A token's start (a well-known secret prefix), the shortest run after it that counts, and
+/// whether that run must hold a digit (`sk-` and `hf_` also start ordinary words and names).
+/// The privacy scan has no secret patterns, so the list is the test's own.
+const TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
+    ("ghp_", 30, false),
+    ("gho_", 30, false),
+    ("ghs_", 30, false),
+    ("github_pat_", 30, false),
+    ("hf_", 30, true),
+    ("sk-ant-", 20, false),
+    ("sk-", 32, true),
+    ("AKIA", 16, false),
+    ("AIza", 30, false),
+    ("xoxb-", 20, false),
+    ("xoxp-", 20, false),
 ];
 
-/// The first token-looking text in `line`.
+/// The first token-looking text in `line`: a prefix at a word start (no letter, digit or `_`
+/// before it), then a long enough run of token characters.
 fn token_in(line: &str) -> Option<String> {
     if line.contains("PRIVATE KEY-----") {
         return Some("a private key block".to_string());
     }
-    for (prefix, min) in TOKEN_PREFIXES {
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    for (prefix, min, needs_digit) in TOKEN_PREFIXES {
         for (at, _) in line.match_indices(prefix) {
-            let rest = &line[at + prefix.len()..];
-            let run = rest
+            let word_start = line[..at]
                 .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .count();
-            if run >= *min {
-                return Some(format!("{prefix}… ({run} characters)"));
+                .next_back()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+            if !word_start {
+                continue;
+            }
+            let run: String = line[at + prefix.len()..]
+                .chars()
+                .take_while(|c| is_token_char(*c))
+                .collect();
+            if run.len() >= *min && (!needs_digit || run.chars().any(|c| c.is_ascii_digit())) {
+                return Some(format!("{prefix}… ({} characters)", run.len()));
             }
         }
     }
@@ -489,8 +494,8 @@ fn plugin_uses_the_user_config_paths() {
         );
     }
 
-    let servers = read_json(&plugin.join(".mcp.json"));
-    let servers = servers.get("mcpServers").unwrap_or(&servers);
+    let mcp = read_json(&plugin.join(".mcp.json"));
+    let servers = &mcp["mcpServers"];
     assert_eq!(
         servers["lil"]["command"], "${user_config.lil_mcp_path}",
         "{servers}"
@@ -510,20 +515,12 @@ fn plugin_uses_the_user_config_paths() {
     for (event, groups) in events {
         for group in groups.as_array().into_iter().flatten() {
             let matcher = group["matcher"].as_str().unwrap_or_default().to_string();
+            // Every hook is the exec-form lil hook (plugin 1.2.0 had no `hooks.json`).
             for h in group["hooks"].as_array().into_iter().flatten() {
-                let names_user_config = h.to_string().contains("${user_config.");
-                if h.get("args").is_none() {
-                    assert!(
-                        !names_user_config,
-                        "a shell-form hook names a userConfig path: {h}"
-                    );
-                    continue;
-                }
-                if h["command"] == "${user_config.lil_path}" {
-                    assert_eq!(h["type"], "command", "{h}");
-                    assert_eq!(h["args"], hook_args(event), "{event}: {h}");
-                    lil_hooks.push((event.clone(), matcher.clone()));
-                }
+                let exec = json!({"type": "command", "command": "${user_config.lil_path}",
+                                  "args": hook_args(event)});
+                assert_eq!(h, &exec, "{event}: every hook is exec form");
+                lil_hooks.push((event.clone(), matcher.clone()));
             }
         }
     }

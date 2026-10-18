@@ -413,16 +413,6 @@ pub fn pid_alive(pid: u32) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }
 
-/// The value of `LIL_TEST_FAILPOINTS` for plan-3 fail points (Global Constraints, "Fail points
-/// added"), which the test kit's closed list does not name yet.
-pub fn failpoints(points: &[(&str, &str)]) -> String {
-    points
-        .iter()
-        .map(|(name, action)| format!("{name}={action}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// Sends a tool call on `pipe` to a core that is meant to abort while handling it (a fail
 /// point): the call's response, if one comes before the connection closes, must be `ok`; then
 /// the connection must close. Returns the `structured` value of that response, if any.
@@ -645,6 +635,21 @@ pub fn number(v: &Value) -> f64 {
         Value::String(s) => s.parse().unwrap_or(f64::NAN),
         _ => f64::NAN,
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`: RFC 3339 UTC with milliseconds, as `Snapshot.ts` and
+/// `JobEnergy`'s `from` and `to` are written (Appendix F, "Telemetry").
+pub fn is_rfc3339_millis(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 24
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            10 => *c == b'T',
+            13 | 16 => *c == b':',
+            19 => *c == b'.',
+            23 => *c == b'Z',
+            _ => c.is_ascii_digit(),
+        })
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of Unix seconds (UTC).

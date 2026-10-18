@@ -14,7 +14,9 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lil_testkit::{CoreFixture, FakeComfy, FakeFailure, TestApp, TestEnv, ensure_built};
+use lil_testkit::{
+    CoreFixture, FakeComfy, FakeFailure, TestApp, TestEnv, ensure_built, failpoints,
+};
 use serde_json::{Value, json};
 use support::*;
 
@@ -210,6 +212,12 @@ fn cancel_uses_the_per_job_endpoint_only() {
         !requests.iter().any(|r| r.path.ends_with("/interrupt")),
         "a bare /interrupt was sent: {requests:?}"
     );
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/api/jobs/cancel"),
+        "the bulk cancel was used: {requests:?}"
+    );
 }
 
 #[test] // spec: QA-009, CORE-128
@@ -264,8 +272,8 @@ fn core_abort_after_submitting_never_duplicates_a_prompt() {
     let mut seen: Vec<String> = Vec::new();
 
     for point in ["jobs.after_submitting", "jobs.after_post"] {
-        let spec = failpoints(&[(point, "abort")]);
-        let core = start_abortable(&env, &[("LIL_TEST_FAILPOINTS", &spec)]);
+        let spec = failpoints::spec(&[(point, "abort")]);
+        let core = start_abortable(&env, &[(failpoints::ENV, &spec)]);
         {
             let mut pipe = session(&env, None);
             call_into_abort(&mut pipe, "test.comfy_submit", json!({"graph": "tiny"}));
@@ -387,12 +395,21 @@ fn outside_jobs_are_observed_waited_for_and_never_cancelled() {
     let stop = env.lil(&["core", "stop"]);
     assert_eq!(stop.code, 0, "{stop:?}");
     let requests = fake.requests();
+    let touched: Vec<_> = requests
+        .iter()
+        .filter(|r| {
+            r.path.ends_with("/interrupt")
+                || (r.method == "POST"
+                    && (r.path.contains(&outside)
+                        || r.path == "/api/jobs/cancel"
+                        || r.body
+                            .as_ref()
+                            .is_some_and(|b| b.to_string().contains(&outside))))
+        })
+        .collect();
     assert!(
-        !requests
-            .iter()
-            .any(|r| (r.method == "POST" && r.path.contains(&outside))
-                || r.path.ends_with("/interrupt")),
-        "the outside job was cancelled or interrupted: {requests:?}"
+        touched.is_empty(),
+        "the outside job was cancelled or interrupted: {touched:?}"
     );
 }
 
@@ -502,6 +519,7 @@ fn owned_comfyui_stops_with_the_core_and_dies_with_it() {
         assert_eq!(listening["listen"], "127.0.0.1", "{listening}");
         let child = listening["pid"].as_u64().unwrap_or(0) as u32;
         let engine = until_engine(&mut pipe, "ready", |e| e["state"] == "ready");
+        assert_eq!(engine["listen"], "loopback", "{engine}");
         assert_eq!(
             engine["pid"], launcher,
             "the launcher is the engine's pid: {engine}"
@@ -523,8 +541,8 @@ fn owned_comfyui_stops_with_the_core_and_dies_with_it() {
     // A core that dies takes the engine with it (the kill-on-close Job Object).
     std::fs::remove_file(&launcher_file).unwrap();
     std::fs::remove_file(&child_file).unwrap();
-    let spec = failpoints(&[("jobs.after_submitting", "abort")]);
-    let core = start_abortable(&env, &[("LIL_TEST_FAILPOINTS", &spec)]);
+    let spec = failpoints::spec(&[("jobs.after_submitting", "abort")]);
+    let core = start_abortable(&env, &[(failpoints::ENV, &spec)]);
     let (launcher, child) = {
         let mut pipe = session(&env, None);
         assert_eq!(start_engine(&mut pipe)["status"], "ok");
@@ -581,9 +599,11 @@ fn node_install_needs_confirmation_and_a_pinned_version() {
     let env = TestEnv::new();
     let fake = FakeComfy::start();
     attach(&env, &fake);
+    // ComfyUI's Python goes first on `PATH` for the install (Appendix F).
     env.suite_toml_set(&format!(
-        "[engines.comfyui]\ncomfy_cli = '{}'\n",
-        path_str(&ensure_built().fake_comfy_cli)
+        "[engines.comfyui]\ncomfy_cli = '{}'\npython = '{}'\n",
+        path_str(&ensure_built().fake_comfy_cli),
+        path_str(&ensure_built().fake_comfyui)
     ));
     let _core = CoreFixture::start(&env);
     let mut pipe = session(&env, None);

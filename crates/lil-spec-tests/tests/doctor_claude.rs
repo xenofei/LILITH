@@ -134,14 +134,15 @@ fn doctor_installs_the_plugin_only_after_yes() {
         "nothing outside CLAUDE_CONFIG_DIR changed"
     );
 
-    // An older plugin is updated in place, never removed.
+    // An installed older plugin is installed over in place, never removed.
     installed(&env, "1.2.0");
     std::fs::remove_file(profile(&env).join("fake-claude.log")).unwrap();
     doctor(&env, &ws, "y");
     let log = claude_log(&env);
     assert!(
-        log.iter().any(|a| a.iter().any(|w| w == PLUGIN)),
-        "1.2.0 was not updated: {log:?}"
+        log.iter()
+            .any(|a| a.windows(2).any(|w| w == ["install", PLUGIN])),
+        "1.2.0 was not installed over: {log:?}"
     );
     assert!(
         !log.iter()

@@ -149,7 +149,7 @@ tests = [
     # ARCH-018
     { name = "lil-spec-tests::mcp_server::mcp_server_starts_the_core", rule = "ARCH-018", file = "tests/mcp_server.rs" },
     # ARCH-045, ARCH-047, ARCH-052
-    { name = "lil-spec-tests::mcp_server::model_tool_calls_never_run_as_ui", rule = "ARCH-045", file = "tests/mcp_server.rs" },
+    { name = "lil-spec-tests::mcp_server::mcp_calls_stay_mcp_while_an_app_is_connected", rule = "ARCH-045", file = "tests/mcp_server.rs" },
     # Task 20
     # ARCH-105, CORE-116, QA-061
     { name = "lil-spec-tests::plugin_hooks::delete_install_and_script_commands_ask", rule = "ARCH-105", file = "tests/plugin_hooks.rs" },

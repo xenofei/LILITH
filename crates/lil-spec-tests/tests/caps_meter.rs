@@ -12,7 +12,9 @@ mod support;
 
 use std::path::Path;
 
-use lil_testkit::{CoreFixture, FakeComfy, FakeHwScript, TestApp, TestEnv, sha256_file, utc};
+use lil_testkit::{
+    CoreFixture, FakeComfy, FakeHwScript, TestApp, TestEnv, failpoints, sha256_file,
+};
 use serde_json::{Value, json};
 use support::*;
 
@@ -45,36 +47,6 @@ fn usage_lines(path: &Path, tool: &str) -> Vec<Value> {
         .into_iter()
         .filter(|l| l["tool"] == tool)
         .collect()
-}
-
-/// A money value given as a decimal string, a number, or an object with an `amount`.
-fn money(v: &Value) -> f64 {
-    match v {
-        Value::Object(o) => o.get("amount").map_or(f64::NAN, number),
-        other => number(other),
-    }
-}
-
-/// The total for `currency` in a summary's `by_currency` (a map or a list of rows).
-fn by_currency(summary: &Value, currency: &str) -> f64 {
-    let by = &summary["by_currency"];
-    if let Some(v) = by.get(currency) {
-        return money(v);
-    }
-    by.as_array()
-        .and_then(|rows| rows.iter().find(|r| r["currency"] == currency))
-        .map_or(f64::NAN, |r| {
-            r.get("total")
-                .or_else(|| r.get("amount"))
-                .map_or(f64::NAN, money)
-        })
-}
-
-/// The level (50, 80 or 100) a `caps` `alert` event names.
-fn alert_level(data: &Value) -> Option<u64> {
-    ["level", "threshold", "percent", "at"]
-        .iter()
-        .find_map(|k| data.get(*k).and_then(Value::as_u64))
 }
 
 #[test] // spec: CORE-091, APP-045
@@ -116,14 +88,9 @@ fn destructive_and_over_cap_share_one_prompt() {
 
     let pending = pipe.tool("test.destructive", json!({"cost": "2"}), Some(&key()));
     pending_id(&pending);
-    let mut covers: Vec<&str> = pending["covers"]
-        .as_array()
-        .map(|c| c.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    covers.sort_unstable();
     assert_eq!(
-        covers,
-        ["cap", "confirm"],
+        pending["covers"],
+        json!(["confirm", "cap"]),
         "one prompt covers both: {pending}"
     );
     let open = confirmations(&mut app, "pending");
@@ -271,13 +238,16 @@ fn cap_alerts_fire_once_per_level() {
     }
     let mut events = session(&env, None);
     let seq = subscribe_replay(&mut events, "caps");
-    let mut levels: Vec<u64> = replayed(&mut events, "caps", seq)
+    let levels: Vec<Value> = replayed(&mut events, "caps", seq)
         .iter()
         .filter(|d| d["kind"] == "alert")
-        .map(|d| alert_level(d).unwrap_or_else(|| panic!("an alert without a level: {d}")))
+        .map(|d| d["threshold_pct"].clone())
         .collect();
-    levels.sort_unstable();
-    assert_eq!(levels, [50, 80, 100], "one alert per level, none repeated");
+    assert_eq!(
+        levels,
+        [json!(50), json!(80), json!(100)],
+        "one alert per level, in order, none repeated"
+    );
 }
 
 #[test] // spec: CORE-090
@@ -294,16 +264,16 @@ fn subscription_quota_never_counts_against_money_caps() {
         "no prompt and no cap error: {outcome}"
     );
     let row = monthly(&mut pipe);
-    assert_eq!(number(&row["settled"]), 0.0, "{row}");
-    assert_eq!(number(&row["held"]), 0.0, "{row}");
+    assert_eq!(row["settled"], "0", "{row}");
+    assert_eq!(row["held"], "0", "{row}");
 }
 
 #[test] // spec: CORE-071, CORE-088
 fn usage_is_written_ahead_and_survives_a_crash() {
     let env = TestEnv::new();
     caps(&env, "10");
-    let spec = failpoints(&[("meter.after_pending", "abort")]);
-    let core = start_abortable(&env, &[("LIL_TEST_FAILPOINTS", &spec)]);
+    let spec = failpoints::spec(&[("meter.after_pending", "abort")]);
+    let core = start_abortable(&env, &[(failpoints::ENV, &spec)]);
     {
         let mut pipe = session(&env, None);
         call_into_abort(&mut pipe, "test.meter_external", external("0.5"));
@@ -397,12 +367,11 @@ fn summary_keeps_bases_and_currencies_apart_and_adds_fixed_costs() {
     let env = TestEnv::new();
     let fake = FakeComfy::start();
     attach(&env, &fake);
-    env.suite_toml_set(&format!(
+    env.suite_toml_set(
         "[money]\ndisplay_currency = \"USD\"\n\
-         [[money.rates]]\ncurrency = \"EUR\"\nin_display = \"1.1\"\ndate = \"{}\"\n\
+         [[money.rates]]\ncurrency = \"EUR\"\nin_display = \"1.1\"\ndate = \"2026-01-01\"\n\
          [[fixed_costs]]\nname = \"storage\"\namount = \"5\"\ncurrency = \"USD\"\nperiod = \"monthly\"\n",
-        utc::today()
-    ));
+    );
     let hw = busy_gpu(&env, std::process::id());
     let _core = CoreFixture::start_with_env(&env, &[("LIL_TEST_FAKE_HW", &hw)]);
     let mut pipe = session(&env, None);
@@ -418,21 +387,21 @@ fn summary_keeps_bases_and_currencies_apart_and_adds_fixed_costs() {
     local_job(&mut pipe, &fake);
 
     let summary = ok(&mut pipe, "usage.summary", json!({"period": "month"}), None);
-    assert_eq!(by_currency(&summary, "USD"), 1.0, "{summary}");
-    assert_eq!(by_currency(&summary, "EUR"), 2.0, "{summary}");
-    // 1 USD + 2 EUR × 1.1 + the 5 USD fixed cost of the month (CORE-083).
-    let total = money(&summary["display_total"]);
-    assert!((total - 8.2).abs() < 1e-9, "display_total: {summary}");
-    let fixed = summary["fixed_costs"].to_string();
-    assert!(fixed.contains("storage"), "{summary}");
-    let bases = &summary["bases"];
-    for basis in ["money", "subscription_quota", "local"] {
-        assert!(!bases[basis].is_null(), "no {basis} basis: {summary}");
-    }
-    assert_ne!(
-        bases["local"], bases["money"],
-        "local work is its own basis: {summary}"
+    assert_eq!(
+        summary["by_currency"],
+        json!({"USD": "1", "EUR": "2"}),
+        "money only, per currency: {summary}"
     );
+    // 1 USD + 2 EUR × 1.1 + the 5 USD fixed cost of the month (CORE-083).
+    assert_eq!(summary["display_total"], "8.2", "{summary}");
+    assert_eq!(
+        summary["fixed_costs"],
+        json!([{"name": "storage", "amount": "5", "currency": "USD", "display_amount": "5"}]),
+        "{summary}"
+    );
+    let bases = &summary["bases"];
+    assert_eq!(bases["money"]["records"], 2, "{summary}");
+    assert_eq!(bases["local"]["records"], 1, "{summary}");
 }
 
 #[test] // spec: CORE-064, CORE-065, CORE-069

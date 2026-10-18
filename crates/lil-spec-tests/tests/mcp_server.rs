@@ -1,6 +1,7 @@
 //! The MCP server `lil-mcp`: its name and instructions, lowered tools, confirmations for `mcp`
 //! callers, the `mcp` identity rule, pending results and retry tokens, error results, an
-//! incompatible core, starting the core, and a model's calls never running as `ui:*` (spec
+//! incompatible core, starting the core, and `mcp` calls staying `mcp` while an app is
+//! connected (spec
 //! ARCH-012, ARCH-014, ARCH-018, ARCH-039, ARCH-045, ARCH-047, ARCH-052, ARCH-054, AI-108,
 //! AI-110, AI-111, APP-046, CORE-091, CORE-112, QA-002, QA-010, QA-062; Appendix F "MCP
 //! lowering", "Confirmations"). `lil-mcp.exe` from the test binaries runs over stdio as the
@@ -9,8 +10,11 @@
 //!
 //! Ruling P3-R10 (no double prompts): with `mcp_confirmation = "core"`, the value Appendix F
 //! records, the core's confirmation is the only prompt, so `destructive` and `exec` tools carry
-//! no `anthropic/requiresUserInteraction` marker for an `mcp` connection (Task 19 amends
-//! Appendix F, ARCH-054, CORE-112 and AI-114 to say so).
+//! no `anthropic/requiresUserInteraction` marker for an `mcp` connection (Appendix F,
+//! "Confirmations"; ARCH-054, CORE-112 and AI-114's plan-3 clarifications).
+//!
+//! Every `ok` result, `lil_status`'s included, is the JSON `{status: "ok", structured,
+//! artifacts, summary_text}` (Appendix F, "MCP lowering"), so the tests read `structured`.
 
 mod support;
 
@@ -27,9 +31,11 @@ fn mcp(env: &TestEnv) -> McpStdio {
     mcp
 }
 
-/// The `structured` part of an ok result's JSON, or the JSON itself.
-fn payload(json: &Value) -> &Value {
-    json.get("structured").unwrap_or(json)
+/// The `structured` part of an `ok` result, checked to be one.
+fn structured(call: &McpCall) -> &Value {
+    assert!(!call.is_error, "{}", call.text);
+    assert_eq!(call.json["status"], "ok", "{}", call.text);
+    &call.json["structured"]
 }
 
 /// How often `test.destructive` has run in this core, by running it once more from the app.
@@ -149,7 +155,7 @@ fn mcp_destructive_call_follows_mcp_confirmation() {
         json!({ "retry_token": token }),
     );
     assert!(!ran.is_error, "{}", ran.text);
-    assert_eq!(payload(&ran.json)["count"], 1, "{}", ran.text);
+    assert_eq!(structured(&ran)["count"], 1, "{}", ran.text);
 
     let history = confirmations(&mut app, "history");
     let entry = history
@@ -170,7 +176,7 @@ fn mcp_spawned_from_a_shell_is_cli() {
 
     let status = mcp_call(&mut mcp, "lil_status", json!({}));
     assert!(!status.is_error, "{}", status.text);
-    assert_eq!(payload(&status.json)["caller"], "cli", "{}", status.text);
+    assert_eq!(structured(&status)["caller"], "cli", "{}", status.text);
     let refused = mcp_call(&mut mcp, "test_destructive", json!({}));
     assert!(refused.is_error, "{}", refused.text);
     assert_eq!(
@@ -266,7 +272,7 @@ fn incompatible_core_exposes_only_lil_status() {
         "only lil_status on an incompatible core"
     );
     let status = mcp_call(&mut mcp, "lil_status", json!({}));
-    let reported = payload(&status.json);
+    let reported = structured(&status);
     assert_eq!(reported["status"], "incompatible", "{}", status.text);
     assert_eq!(
         reported["error"]["code"], "protocol.incompatible",
@@ -287,24 +293,20 @@ fn mcp_server_starts_the_core() {
 }
 
 #[test] // spec: ARCH-045, ARCH-047, ARCH-052
-fn model_tool_calls_never_run_as_ui() {
-    // Ruling P3-R9: a model's tool calls never run over a `ui:*` connection. Under Claude Code
-    // they are `mcp` calls: agent jobs, and destructive calls wait for the person.
+fn mcp_calls_stay_mcp_while_an_app_is_connected() {
+    // Ruling P3-R9: a model's tool calls never run over a `ui:*` connection. Under Claude Code,
+    // with the app connected, they stay `mcp` calls: agent jobs, and destructive calls wait for
+    // the person. (A `ui:*` connection submitting a model's call is tested with the plan that
+    // hosts a model in an app, TETHER, M1b.)
     let env = TestEnv::new();
     let _core = CoreFixture::start(&env);
     let mut app = TestApp::start(&env, None, &[]);
     let mut mcp = mcp(&env);
 
     let status = mcp_call(&mut mcp, "lil_status", json!({}));
-    assert_eq!(payload(&status.json)["caller"], "mcp", "{}", status.text);
+    assert_eq!(structured(&status)["caller"], "mcp", "{}", status.text);
     let job = mcp_call(&mut mcp, "test_job", json!({"lane": "cpu"}));
-    assert!(!job.is_error, "{}", job.text);
-    assert_eq!(
-        payload(&job.json)["job"]["priority"],
-        "agent",
-        "{}",
-        job.text
-    );
+    assert_eq!(structured(&job)["job"]["priority"], "agent", "{}", job.text);
 
     let pending = mcp_call(&mut mcp, "test_destructive", json!({}));
     let confirmation = pending_id(&pending.json);

@@ -45,11 +45,6 @@ fn part<'a>(snapshot: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no {name} part in {snapshot}"))
 }
 
-/// Whether a `measured` label says measured (a `true` flag or the word).
-fn is_measured(v: &Value) -> bool {
-    v == true || v == "measured"
-}
-
 /// Every key path in `v` whose last key mentions a temperature.
 fn temperature_keys(v: &Value, path: &str, out: &mut Vec<String>) {
     match v {
@@ -114,16 +109,14 @@ fn snapshot_labels_measured_and_estimated_parts() {
     tick(&mut pipe, 2);
     let snapshot = ok(&mut pipe, "telemetry.snapshot", json!({}), None);
 
-    assert!(is_measured(&snapshot["gpu"]["measured"]), "{snapshot}");
-    assert!(is_measured(&snapshot["cpu"]["measured"]), "{snapshot}");
     assert!(
-        is_measured(&part(&snapshot, "gpu")["measured"]),
-        "{snapshot}"
+        is_rfc3339_millis(snapshot["ts"].as_str().unwrap_or_default()),
+        "ts: {snapshot}"
     );
-    assert!(
-        is_measured(&part(&snapshot, "cpu")["measured"]),
-        "{snapshot}"
-    );
+    assert_eq!(snapshot["gpu"]["measured"], true, "{snapshot}");
+    assert_eq!(snapshot["cpu"]["measured"], true, "{snapshot}");
+    assert_eq!(part(&snapshot, "gpu")["measured"], "measured", "{snapshot}");
+    assert_eq!(part(&snapshot, "cpu")["measured"], "measured", "{snapshot}");
     let gpu_mw = number(&snapshot["gpu"]["power_mw"]);
     let cpu_mw = number(&snapshot["cpu"]["package_power_mw"]);
     assert_eq!((gpu_mw, cpu_mw), (200_000.0, 30_000.0), "{snapshot}");
@@ -367,6 +360,10 @@ fn job_energy_is_split_by_sm_share() {
     });
     let from = energy["from"].as_str().unwrap_or_default().to_string();
     let to = energy["to"].as_str().unwrap_or_default().to_string();
+    assert!(
+        is_rfc3339_millis(&from) && is_rfc3339_millis(&to),
+        "from and to: {energy}"
+    );
     let window = series_sum(&mut pipe, "gpu.energy", &from, &to);
     assert!(window > 0.0, "no GPU energy in the job's window: {energy}");
     let gross = number(&energy["gpu_mj_gross"]);
