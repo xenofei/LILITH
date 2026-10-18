@@ -38,7 +38,9 @@ pub use stages::{
     ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings, SettingsInput,
     SettingsStage, SettleInput,
 };
-pub use test_tools::{TEST_JOB_KIND, TEST_MODULE, TestGates, TestJobHandler, register_test_tools};
+pub use test_tools::{
+    TEST_JOB_KIND, TEST_MODULE, TestGates, TestJobHandler, register_hw_tick, register_test_tools,
+};
 pub use topics::{AssetSnapshots, ProjectSnapshots, register_snapshots};
 pub use trash_tools::register_trash_tools;
 pub use watch_tools::register_watch_tools;

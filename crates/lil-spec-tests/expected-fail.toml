@@ -6,19 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 9
-    # CORE-059, CORE-060, CORE-064
-    { name = "lil-spec-tests::telemetry::snapshot_labels_measured_and_estimated_parts", rule = "CORE-059", file = "tests/telemetry.rs" },
-    # CORE-062, CORE-063
-    { name = "lil-spec-tests::telemetry::energy_totals_come_from_counters_across_resets", rule = "CORE-062", file = "tests/telemetry.rs" },
-    # CORE-059
-    { name = "lil-spec-tests::telemetry::cpu_energy_estimate_when_the_meter_is_missing", rule = "CORE-059", file = "tests/telemetry.rs" },
-    # CORE-066
-    { name = "lil-spec-tests::telemetry::thermal_throttle_raises_and_clears_an_alert", rule = "CORE-066", file = "tests/telemetry.rs" },
-    # CORE-067
-    { name = "lil-spec-tests::telemetry::hardware_profile_is_written_only_when_it_changes", rule = "CORE-067", file = "tests/telemetry.rs" },
-    # CORE-004, QA-055
-    { name = "lil-spec-tests::telemetry::damaged_telemetry_db_is_rebuilt", rule = "CORE-004", file = "tests/telemetry.rs" },
     # Task 10
     # ARCH-071, CORE-126
     { name = "lil-spec-tests::jobs_queue::waiting_for_vram_until_memory_frees", rule = "ARCH-071", file = "tests/jobs_queue.rs" },

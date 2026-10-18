@@ -170,6 +170,15 @@ pub fn copy_new(from: &Path, to: &Path) -> std::io::Result<u64> {
     lil_platform::fs::copy_new(from, to)
 }
 
+/// Sets a damaged or foreign-version `telemetry.db` aside: it and its `-wal`, `-shm` and
+/// `-journal` files are renamed to `<name>.damaged-<utc>` (`lil_platform::sqlite_files::set_aside`),
+/// and nothing is deleted or replaced. For the disposable `telemetry.db` only (CORE-004): a
+/// `state.db` is set aside by `lil doctor` alone, after a yes.
+#[allow(clippy::disallowed_methods)]
+pub fn set_aside_db(db: &Path, utc: &str) -> std::io::Result<Vec<PathBuf>> {
+    lil_platform::sqlite_files::set_aside(db, utc)
+}
+
 /// Opens or creates the lock file `path` and takes its exclusive lock; `None` at once when
 /// another handle holds it (`core.lock`, ARCH-028).
 #[allow(clippy::disallowed_methods)]

@@ -18,6 +18,12 @@
 //!   (ARCH-022), and adds the `jobs` idle blocker (ARCH-020) and the `PersistInterrupted`
 //!   shutdown step (ARCH-021). The default workspace's jobs are
 //!   recovered once it opens.
+//! - The hardware telemetry ([`crate::telemetry`]) starts before the dispatcher is built: this
+//!   machine's hardware sampled once a second, or on a test channel the fake hardware script
+//!   (`LIL_TEST_FAKE_HW`) advanced only by `test.hw_tick`. Its tools and its topic's snapshot
+//!   are registered, the default workspace's hardware profile is checked once the workspace is
+//!   open and the first sample is in (CORE-067), and sampling stops right after the shutdown
+//!   steps.
 
 mod conn;
 
@@ -42,7 +48,10 @@ use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
-use crate::tools::{Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry};
+use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
+use crate::tools::{
+    Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry, register_hw_tick,
+};
 use crate::workspace::WorkspaceHub;
 
 /// Per-connection writer queue (responses and events).
@@ -268,6 +277,8 @@ pub struct RunningCore {
     hub: Arc<WorkspaceHub>,
     /// The event bus (ARCH-032).
     events: Arc<EventBus>,
+    /// The hardware telemetry (CORE-059).
+    telemetry: Arc<Telemetry>,
     /// The gates `test.block` waits on (test channels).
     test_gates: Arc<TestGates>,
     /// Each session's active project (ARCH-088), shared with the dispatcher.
@@ -292,6 +303,11 @@ impl RunningCore {
     /// The event bus.
     pub fn events(&self) -> &Arc<EventBus> {
         &self.events
+    }
+
+    /// The hardware telemetry.
+    pub fn telemetry(&self) -> &Arc<Telemetry> {
+        &self.telemetry
     }
 
     /// The workspace hub.
@@ -400,16 +416,23 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     );
     // The live topics' snapshots (ARCH-044): `asset:` and `project:`.
     crate::tools::register_snapshots(&events, &hub);
+    let telemetry = start_telemetry(&cfg, &events).await;
+    telemetry::register_snapshot(&events, &telemetry);
+    let mut registry = core_registry(
+        cfg.test_tools,
+        &test_gates,
+        &state,
+        &hub,
+        &cfg.env,
+        &cfg.probe,
+        Arc::new(cfg.git_env.clone()),
+    );
+    telemetry::register_telemetry_tools(&mut registry, &telemetry);
+    if cfg.test_tools {
+        register_hw_tick(&mut registry, telemetry.clone());
+    }
     let dispatcher = Dispatcher::new(
-        core_registry(
-            cfg.test_tools,
-            &test_gates,
-            &state,
-            &hub,
-            &cfg.env,
-            &cfg.probe,
-            Arc::new(cfg.git_env.clone()),
-        ),
+        registry,
         PipelineHooks::plan2(),
         state.clone(),
         events.clone(),
@@ -451,7 +474,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     ));
 
     if let Some(ws) = hub.default_ref() {
-        let (hub, jobs) = (hub.clone(), jobs.clone());
+        let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
         tokio::spawn(async move {
             match hub.open(&ws).await {
                 Err(e) => {
@@ -461,6 +484,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
+                    telemetry::profile::spawn_check(telemetry, &open);
                 }
             }
         });
@@ -490,6 +514,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         stop,
         serving,
         helpers,
+        telemetry: telemetry.clone(),
         session_end: session_end.clone(),
     }));
     tracing::info!(pipe = %pipe, channel = %cfg.env.channel(), "core serving");
@@ -499,6 +524,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         state,
         hub,
         events,
+        telemetry,
         test_gates,
         active_projects,
         session_end,
@@ -514,6 +540,7 @@ struct Supervised {
     stop: CancellationToken,
     serving: JoinHandle<io::Result<()>>,
     helpers: Vec<JoinHandle<()>>,
+    telemetry: Arc<Telemetry>,
     session_end: Option<Arc<SessionEndWatcher>>,
 }
 
@@ -527,6 +554,7 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         stop,
         mut serving,
         helpers,
+        telemetry,
         session_end,
     } = s;
     let drain = lifecycle.drain_token();
@@ -544,6 +572,9 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         lifecycle.begin_drain(DrainReason::Fatal(why));
     }
     let mut report = lifecycle.run_shutdown().await;
+
+    // Sampling stops and telemetry.db is flushed; it is disposable, so nothing waits on it.
+    telemetry.shutdown().await;
 
     // The open workspaces close before the state databases (module docs). It is part of the
     // state step, so the report's steps stay as plan 2 named them.
@@ -589,6 +620,53 @@ fn preempt_agent_batches(env: &Env) -> bool {
         .ok()
         .and_then(|text| lil_schema::SuiteToml::parse(&text).ok())
         .is_some_and(|suite| suite.preempt_agent_batches())
+}
+
+/// The `[power]` settings of `suite.toml` (CORE-064); the defaults where there are none.
+fn power_settings(env: &Env) -> PowerSettings {
+    std::fs::read_to_string(env.suite_toml_to_read())
+        .ok()
+        .and_then(|text| lil_schema::SuiteToml::parse(&text).ok())
+        .map_or_else(PowerSettings::default, |suite| {
+            PowerSettings::from_toml(&suite.power())
+        })
+}
+
+/// Starts the hardware telemetry (CORE-059): this machine's hardware sampled once a second, or,
+/// on a test channel, the fake hardware script `LIL_TEST_FAKE_HW` names (none: no hardware at
+/// all) advanced only by `test.hw_tick`. A test never reads real hardware counters (QA-038).
+async fn start_telemetry(cfg: &CoreConfig, events: &Arc<EventBus>) -> Arc<Telemetry> {
+    let (env, clock, events) = (cfg.env.clone(), cfg.clock.clone(), events.clone());
+    let (test, fake) = (cfg.test_tools, cfg.fake_hw.clone());
+    // The sources block (NVML, DXGI, PDH), and so does opening `telemetry.db`.
+    tokio::task::spawn_blocking(move || {
+        let (src, mode) = if test {
+            let fake = fake.and_then(|path| match lil_platform::hw_fake::sources_from_file(&path) {
+                Ok(sources) => Some(HwSources::from_fake(sources)),
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "the fake hardware script can't be read; the core samples no hardware");
+                    None
+                }
+            });
+            (fake.unwrap_or_else(HwSources::none), TickMode::Manual)
+        } else {
+            (HwSources::real(), TickMode::Real)
+        };
+        let telemetry = Telemetry::start(
+            src,
+            env.local_dir().join("telemetry.db"),
+            clock,
+            power_settings(&env),
+            events,
+            mode,
+        );
+        if mode == TickMode::Real {
+            telemetry.set_gpu_opener(Box::new(lil_platform::hw::nvml_gpu));
+        }
+        telemetry
+    })
+    .await
+    .expect("starting the telemetry does not panic")
 }
 
 /// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6, 7 or 2),

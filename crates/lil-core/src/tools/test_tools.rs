@@ -17,6 +17,7 @@
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
 //! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?}` | `{job}`: a job of kind `test.job` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
+//! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
 //!
 //! `test.job` submits a job that [`TestJobHandler`] runs (the core registers it on test
 //! channels): a gated one waits until `test.job_release` (or a cancel), `transient_2` fails
@@ -72,6 +73,7 @@ use crate::jobs::{
 };
 use crate::state::StateRegistry;
 use crate::store::{CommitOp, Expect, ManifestEdit, OutputMove, StoreError, WsPath, fsops};
+use crate::telemetry::Telemetry;
 
 /// The module every test tool declares.
 pub const TEST_MODULE: &str = "test";
@@ -675,6 +677,42 @@ async fn ingest_run(ctx: &CallCtx, args: IngestArgs) -> Result<(IngestResult, St
         },
         summary,
     ))
+}
+
+/// The most samples one `test.hw_tick` takes.
+const MAX_TICK_SAMPLES: u32 = 3600;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HwTickArgs {
+    /// 1–3600.
+    samples: u32,
+}
+
+/// Registers `test.hw_tick` on `reg`: it advances `telemetry`, which a test channel runs in
+/// manual mode, by `samples` samples (each one nominal second) and returns the snapshot after
+/// them. Tests never wait for the 1 Hz sampler.
+pub fn register_hw_tick(reg: &mut Registry, telemetry: Arc<Telemetry>) {
+    reg.register(typed_tool(
+        "test.hw_tick",
+        "Test channels only: takes `samples` hardware samples now (1-3600; each stands for one second of the fake hardware's script) and returns the Snapshot after them.",
+        EffectClass::Write,
+        TEST_MODULE,
+        move |ctx, args: HwTickArgs| {
+            let telemetry = telemetry.clone();
+            Box::pin(async move {
+                if !(1..=MAX_TICK_SAMPLES).contains(&args.samples) {
+                    return Err(ErrorBody::new(
+                        &codes::PARAMS_INVALID,
+                        format!("samples must be between 1 and {MAX_TICK_SAMPLES}"),
+                        ctx.trace_id.clone(),
+                    ));
+                }
+                let snapshot = telemetry.tick(args.samples).await;
+                Ok((snapshot, format!("{} sample(s) taken", args.samples)))
+            })
+        },
+    ));
 }
 
 /// Registers the test-channel tools on `reg`. `test.block` waits on `gates`;
