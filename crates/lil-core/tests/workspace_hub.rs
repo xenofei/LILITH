@@ -818,3 +818,48 @@ fn params(name: &str, args: Value, key: Option<&str>) -> lil_protocol::ToolCallP
         trace_id: None,
     }
 }
+
+/// `workspace.doctor`'s offers run only for the person (owner question 1): a verified `mcp`
+/// session (Claude Code) and an engine's `assistant` session get `caller.not_allowed`, and the
+/// legacy workspace file stays where it is.
+#[test] // spec: ARCH-047, ARCH-052 (owner question 1)
+fn an_agent_caller_cannot_run_a_doctor_offer() {
+    use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
+    let env = TestEnv::new();
+    let ws_path = env.make_legacy_workspace("plugin era");
+    env.register_workspace(&ws_path, true);
+    let ws = workspace_ref(&ws_path);
+    let states = registry(&env.env);
+    let (hub, events) = hub(&env.env, &states);
+    let dispatcher = dispatcher(&env.env, &states, &events, &hub);
+    let rt = runtime();
+    for (n, caller) in [
+        lil_protocol::CallerKind::Mcp,
+        lil_protocol::CallerKind::Assistant,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = Arc::new(lil_core::session::Session {
+            caller: caller.clone(),
+            ..(*session(Some(ws.clone()))).clone()
+        });
+        let out = rt.block_on(dispatcher.call(
+            session,
+            params(
+                "workspace.doctor",
+                json!({"fix": true, "offers": ["legacy_names"]}),
+                Some(&format!("agent-offer-{n}")),
+            ),
+        ));
+        let lil_protocol::Outcome::Error { error } = &out else {
+            panic!("{caller:?} ran the offer: {out:?}");
+        };
+        assert_eq!(error.code, "caller.not_allowed", "{caller:?}: {error:?}");
+        assert!(ws_path.join(LEGACY_WORKSPACE_FILE).is_file(), "{caller:?}");
+        assert!(!ws_path.join(WORKSPACE_FILE).exists(), "{caller:?}");
+    }
+    drop(dispatcher);
+    rt.block_on(hub.close_all());
+    states.close();
+}

@@ -1207,3 +1207,242 @@ fn an_interrupted_legacy_rename_is_finished_by_the_next_offer() {
     assert!(era.ws.join(WORKSPACE_FILE).is_file() && !era.file.exists());
     assert_eq!(read_bytes(&era.manifest), manifest.as_bytes());
 }
+
+/// A manifest whose ref fields hold `scheme` refs, and whose free text (`notes`, a pin's
+/// `reason`, a human edit's `note`) is exactly a legacy ref. One `"ref" : ` has a space before
+/// its colon.
+fn manifest_with_free_text(id: &str, scheme: &str) -> String {
+    use lil_schema::LEGACY_SCHEME;
+    format!(
+        "{{\n  \"asset_id\": \"kite_red\",\n  \"project\": \"kites\",\n  \"notes\": \
+         \"{LEGACY_SCHEME}{id}/kites/kite_blue@1.0.0\",\n  \"inputs\": [{{\"ref\" : \
+         \"{scheme}{id}/kites/kite_blue@1.0.0\"}}],\n  \"pinned_inputs\": [{{\"ref\": \
+         \"{scheme}{id}/kites/kite_green@2.0.0\", \"reason\": \
+         \"{LEGACY_SCHEME}{id}/kites/kite_green@2.0.0\"}}],\n  \"human_edits\": [{{\"path\": \
+         \"v1.0.0/a.png\", \"note\": \"{LEGACY_SCHEME}{id}/kites/kite_blue@1.0.0\"}}]\n}}\n"
+    )
+}
+
+/// Only `inputs[].ref` and `pinned_inputs[].ref` are rewritten: free text that is exactly a
+/// legacy ref stays byte for byte (the adversarial review's probe).
+#[test] // spec: CORE-148 (owner question 1)
+fn probe_free_text_equal_to_a_ref_is_left_alone() {
+    use lil_schema::LEGACY_SCHEME;
+    let env = TestEnv::new();
+    let era = plugin_era(&env);
+    let id = env.workspace_id(&era.ws);
+    write_file(
+        &era.manifest,
+        manifest_with_free_text(&id, LEGACY_SCHEME).as_bytes(),
+    );
+    env.register_workspace(&era.ws, true);
+    let _core = core(&env);
+    let mut s = session(&env, &era.ws);
+
+    let out = s.tool_ok(
+        "workspace.doctor",
+        json!({"fix": false, "offers": ["legacy_names"]}),
+        Some(&key()),
+    );
+    assert_eq!(doctor_check(&out, "legacy.names").0, "fixed", "{out}");
+    assert_eq!(
+        String::from_utf8(read_bytes(&era.manifest)).unwrap(),
+        manifest_with_free_text(&id, "lil://"),
+        "only the ref fields changed"
+    );
+}
+
+/// The real probe, with one file reported as a cloud-only placeholder (never read).
+#[derive(Debug)]
+struct CloudOnly(&'static str);
+
+impl Probe for CloudOnly {
+    fn identity(&self, path: &Path) -> io::Result<FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if path.file_name().is_some_and(|n| n == self.0) {
+            id.attributes |= lil_platform::fs::PLACEHOLDER_ATTRIBUTES;
+        }
+        Ok(id)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+}
+
+/// A cloud-only manifest is listed as skipped, never read or edited, and the rest of the
+/// rename goes on.
+#[test] // spec: ARCH-074, CORE-004 (owner question 1)
+fn a_cloud_only_manifest_is_skipped_and_the_rest_is_renamed() {
+    use lil_platform::names::WORKSPACE_FILE;
+    let env = TestEnv::new();
+    let era = plugin_era(&env);
+    let id = env.workspace_id(&era.ws);
+    let cloud = era
+        .ws
+        .join("projects")
+        .join("kites")
+        .join("assets")
+        .join("kite_cloud")
+        .join("kite_cloud.manifest.json");
+    let cloud_text =
+        format!("{{\"inputs\": [{{\"ref\": \"ww://{id}/kites/kite_blue@1.0.0\"}}]}}\n");
+    write_file(&cloud, cloud_text.as_bytes());
+    env.register_workspace(&era.ws, true);
+    let _core = core_with(
+        &env,
+        Arc::new(CloudOnly("kite_cloud.manifest.json")),
+        FailPoints::none(),
+    );
+    let mut s = session(&env, &era.ws);
+
+    let out = s.tool_ok(
+        "workspace.doctor",
+        json!({"fix": false, "offers": ["legacy_names"]}),
+        Some(&key()),
+    );
+    assert_eq!(doctor_check(&out, "legacy.names").0, "fixed", "{out}");
+    let (state, detail) = doctor_check(&out, "legacy.unreadable");
+    assert_eq!(state, "skipped", "{out}");
+    assert!(detail.contains("kite_cloud.manifest.json"), "{detail}");
+    assert!(detail.contains("make them available offline"), "{detail}");
+    assert_eq!(read_bytes(&cloud), cloud_text.as_bytes(), "never edited");
+    assert!(era.ws.join(WORKSPACE_FILE).is_file() && !era.file.exists());
+    assert!(era.ws.join(".lilith").join("state.json").is_file());
+    let manifest = String::from_utf8(read_bytes(&era.manifest)).unwrap();
+    assert!(manifest.contains("\"ref\": \"lil://"), "{manifest}");
+}
+
+/// Arms `store.replace` to fail while `armed` holds and `when()` is true; the hook runs before
+/// the file call it stands for, so the file it guards isn't written yet.
+fn fail_replace_when(
+    fp: &FailPoints,
+    armed: &Arc<AtomicBool>,
+    when: impl Fn() -> bool + Send + Sync + 'static,
+) {
+    let armed = armed.clone();
+    fp.on(
+        "store.replace",
+        Box::new(move || {
+            if armed.load(Ordering::SeqCst) && when() {
+                Err(io::Error::other("fail point: store.replace"))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+}
+
+/// P2: the rename is cut after the hint, at the manifest's edit. Nothing is lost, the core
+/// still serves the workspace, and the next offer finishes the rename.
+#[test] // spec: ARCH-074, CORE-004 (owner question 1)
+fn a_rename_cut_after_the_hint_is_finished_by_the_next_offer() {
+    use lil_platform::names::WORKSPACE_FILE;
+    let env = TestEnv::new();
+    let era = plugin_era(&env);
+    env.register_workspace(&era.ws, true);
+    let (file, hint, manifest) = (
+        read_bytes(&era.file),
+        read_bytes(&era.hint),
+        read_bytes(&era.manifest),
+    );
+    let new_hint = era.ws.join(".lilith").join("state.json");
+    let fp = FailPoints::none();
+    let armed = Arc::new(AtomicBool::new(true));
+    let watched = new_hint.clone();
+    fail_replace_when(&fp, &armed, move || watched.exists());
+    let _core = core_with(&env, Arc::new(SystemProbe), fp);
+    let mut s = session(&env, &era.ws);
+    let offer = json!({"fix": false, "offers": ["legacy_names"]});
+
+    let out = s.tool_ok("workspace.doctor", offer.clone(), Some(&key()));
+    let (state, detail) = doctor_check(&out, "legacy.names");
+    assert_eq!(state, "problem", "{out}");
+    assert!(detail.contains("the rename stopped"), "{detail}");
+    assert_eq!(read_bytes(&new_hint), hint, "the hint was copied");
+    assert_eq!(
+        read_bytes(&era.manifest),
+        manifest,
+        "the cut edit left the manifest"
+    );
+    assert_eq!(read_bytes(&era.file), file);
+    assert!(!era.ws.join(WORKSPACE_FILE).exists());
+    assert_eq!(
+        s.tool_ok("project.status", json!({}), None)["project"],
+        "kites"
+    );
+
+    armed.store(false, Ordering::SeqCst);
+    let out = s.tool_ok("workspace.doctor", offer, Some(&key()));
+    assert_eq!(doctor_check(&out, "legacy.names").0, "fixed", "{out}");
+    assert_eq!(read_bytes(&era.ws.join(WORKSPACE_FILE)), file);
+    let rewritten = String::from_utf8(manifest)
+        .unwrap()
+        .replace("\"ww://", "\"lil://");
+    assert_eq!(
+        String::from_utf8(read_bytes(&era.manifest)).unwrap(),
+        rewritten
+    );
+    assert_eq!(read_bytes(&era.hint), hint, "the legacy hint stays");
+    assert_eq!(
+        s.tool_ok("project.status", json!({}), None)["project"],
+        "kites"
+    );
+}
+
+/// P3: the workspace file's move fails, and then a new workspace file appears outside the
+/// suite. The legacy file is never touched: it is reported as information, nothing is lost,
+/// the core still serves, and the next offer has nothing left to do.
+#[test] // spec: ARCH-074, CORE-004 (owner question 1)
+fn a_failed_move_then_a_new_workspace_file_leaves_the_legacy_one_alone() {
+    use lil_platform::names::WORKSPACE_FILE;
+    let env = TestEnv::new();
+    let era = plugin_era(&env);
+    env.register_workspace(&era.ws, true);
+    let file = read_bytes(&era.file);
+    let new_file = era.ws.join(WORKSPACE_FILE);
+    let fp = FailPoints::none();
+    let armed = Arc::new(AtomicBool::new(true));
+    let (manifest, watched) = (era.manifest.clone(), new_file.clone());
+    fail_replace_when(&fp, &armed, move || {
+        !watched.exists()
+            && std::fs::read_to_string(&manifest).is_ok_and(|t| t.contains("\"lil://"))
+    });
+    let _core = core_with(&env, Arc::new(SystemProbe), fp);
+    let mut s = session(&env, &era.ws);
+    let offer = json!({"fix": false, "offers": ["legacy_names"]});
+
+    let out = s.tool_ok("workspace.doctor", offer.clone(), Some(&key()));
+    let (state, detail) = doctor_check(&out, "legacy.names");
+    assert_eq!(state, "problem", "{out}");
+    assert!(detail.contains("the rename stopped"), "{detail}");
+    assert_eq!(
+        read_bytes(&era.file),
+        file,
+        "the failed move kept the legacy file"
+    );
+    assert!(!new_file.exists());
+
+    // Someone writes a new workspace file outside the suite.
+    write_file(&new_file, b"name: made by hand\n");
+    assert_eq!(
+        s.tool_ok("project.status", json!({}), None)["project"],
+        "kites"
+    );
+    let out = s.tool_ok("workspace.doctor", offer, Some(&key()));
+    assert_eq!(doctor_check(&out, "legacy.names").0, "ok", "{out}");
+    let (state, detail) = doctor_check(&out, "legacy.stray_file");
+    assert_eq!(state, "info", "{out}");
+    assert!(detail.contains("worldwright.yaml"), "{detail}");
+    assert_eq!(
+        read_bytes(&era.file),
+        file,
+        "the legacy file is never touched"
+    );
+    assert_eq!(read_bytes(&new_file), b"name: made by hand\n");
+    armed.store(false, Ordering::SeqCst);
+}

@@ -344,3 +344,29 @@ fn legacy_named_workspace_is_reported_not_reinitialised() {
     );
     assert!(!later.stderr.contains("[y/N]"), "{later:?}");
 }
+
+/// `lil call` never passes the doctor's offers on: only `lil doctor`, after a `y`, lists them.
+#[test] // spec: ARCH-016 (owner question 1)
+fn lil_call_refuses_the_doctor_offers() {
+    use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = env.make_legacy_workspace("plugin era");
+    env.register_workspace(&ws, true);
+    let before = std::fs::read(ws.join(LEGACY_WORKSPACE_FILE)).unwrap();
+
+    let out = env.lil_in(
+        &ws,
+        &[
+            "call",
+            "workspace.doctor",
+            r#"{"fix": true, "offers": ["legacy_names"]}"#,
+        ],
+    );
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("lil doctor"), "{out:?}");
+    assert_eq!(
+        std::fs::read(ws.join(LEGACY_WORKSPACE_FILE)).unwrap(),
+        before
+    );
+    assert!(!ws.join(WORKSPACE_FILE).exists(), "{out:?}");
+}

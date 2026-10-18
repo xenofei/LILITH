@@ -196,7 +196,8 @@ impl Db {
                  before the core opens the workspace",
             explained: WORKSPACE_SET_ASIDE_EXPLAINED,
             fresh: "the core makes a fresh one when it opens the workspace",
-            missing: "no workspace state database yet; the core creates one when it opens the                  workspace",
+            missing: "no workspace state database yet; the core creates one when it opens the \
+                 workspace",
         }
     }
 }

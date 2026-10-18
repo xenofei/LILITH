@@ -3100,7 +3100,7 @@ This appendix records the workspace-data names, algorithms and tables that plan 
   |---|---|---|---|
   | `workspace.create` | write | `{path, name?, default?}` | `{id, path, created: bool, default: bool, warnings: [string]}` |
   | `workspace.set_default` | write | `{path}` | `{id, path}` |
-  | `workspace.doctor` | write | `{fix}` | `{checks: [{id, state: "ok"\|"fixed"\|"problem", detail}]}` |
+  | `workspace.doctor` | write | `{fix, offers?: ["legacy_names"]}` (an offer runs only when listed, and only for an interactive `cli` or `ui:*` session; anyone else gets `caller.not_allowed`) | `{checks: [{id, state: "ok"\|"fixed"\|"problem"\|"info"\|"skipped", detail}]}` |
   | `watch.notify` | write | `{paths: [string]}` | `{reconciled: [string], ignored: [string]}` |
   | `assets.query` | read | `{project?, status?, type?, text?, sort?, limit?, cursor?}` | `{assets: [AssetSummary], next_cursor: string\|null, total}` |
   | `asset.get` | read | `{project?, asset_id}` | `AssetDetail` |
