@@ -687,7 +687,7 @@ async fn pdh_instance_churn_drops_dead_processes() {
     assert_eq!(pids(&one), [10, 11, 900]);
     assert_eq!(
         rig.telemetry.vram().unwrap().local_by_pid,
-        BTreeMap::from([(10, 100), (11, 200), (900, 5)])
+        Some(BTreeMap::from([(10, 100), (11, 200), (900, 5)]))
     );
     let roles: Vec<Option<&str>> = one.processes.iter().map(|p| p.role.as_deref()).collect();
     assert_eq!(roles, [Some("comfyui"), Some("helper"), None]);
@@ -696,7 +696,7 @@ async fn pdh_instance_churn_drops_dead_processes() {
     assert_eq!(pids(&two), [10], "11 and 900 are gone");
     assert_eq!(
         rig.telemetry.vram().unwrap().local_by_pid,
-        BTreeMap::from([(10, 100)])
+        Some(BTreeMap::from([(10, 100)]))
     );
     let engine = &two.processes[0];
     // 1000 ms of CPU in one second on two cores is 500 permille of the machine.
@@ -1447,7 +1447,10 @@ async fn vram_and_the_sample_hook_serve_the_scheduler() {
     assert_eq!(rig.telemetry.sample_count(), 3);
     let vram = rig.telemetry.vram().unwrap();
     assert_eq!((vram.total_mib, vram.nvml_free_mib), (16384, 16384 - 2048));
-    assert_eq!(vram.local_by_pid, BTreeMap::from([(4, 300), (9, 1000)]));
+    assert_eq!(
+        vram.local_by_pid,
+        Some(BTreeMap::from([(4, 300), (9, 1000)]))
+    );
 
     let no_gpu =
         Rig::new(&json!({"gpu": null, "gpu_mem": null, "cpu_energy": null, "sys": [sys(0)]}));

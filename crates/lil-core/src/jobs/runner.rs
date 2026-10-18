@@ -401,11 +401,14 @@ impl Shared {
         let Some((before, row)) = record::update(scope.db(), id, c, self.now()).await? else {
             return Ok(None);
         };
-        if row.substatus == Some(Substatus::Executing)
-            && let Some(a) = self.queue().jobs.get_mut(id)
-            && a.exec_start.is_none()
-        {
-            a.exec_start = Some(self.clock.monotonic());
+        // The watchdog times only executing: any other substatus (retrying, cancelling,
+        // ingesting) stops its clock, and the next `executing` starts it again.
+        if let Some(a) = self.queue().jobs.get_mut(id) {
+            if row.substatus != Some(Substatus::Executing) {
+                a.exec_start = None;
+            } else if a.exec_start.is_none() {
+                a.exec_start = Some(self.clock.monotonic());
+            }
         }
         self.announce(scope.workspace(), &row).await;
         if submitting
@@ -718,6 +721,7 @@ impl Shared {
         let admission = read(&self.admission);
         let mut start = Vec::new();
         let mut wait = Vec::new();
+        let mut rewait = Vec::new();
         {
             let mut q = self.queue();
             if q.closed {
@@ -751,6 +755,14 @@ impl Shared {
                 let Some((id, overtakes)) = picked else {
                     continue;
                 };
+                // A job that waited for VRAM but is no longer the lane's pick waits for its
+                // turn again (`waiting`).
+                for (other, a) in &mut q.jobs {
+                    if a.waiting_for_vram && a.info.spec.lane == lane && *other != id {
+                        a.waiting_for_vram = false;
+                        rewait.push((other.clone(), a.info.scope.clone()));
+                    }
+                }
                 let a = q.jobs.get_mut(&id).expect("a picked job is queued");
                 match admission.admit(&a.info.spec) {
                     Admit::WaitForVram { need_mib, free_mib } => {
@@ -792,6 +804,16 @@ impl Shared {
                         Change::to(Substatus::WaitingForVram),
                         Some(still_waiting),
                     )
+                    .await;
+            });
+        }
+        for (id, scope) in rewait {
+            let shared = self.clone();
+            tokio::spawn(async move {
+                // Only while it still waits for its turn: not picked and waiting again since.
+                let overtaken: Guard = |a| !a.waiting_for_vram && !a.running && !a.completing;
+                shared
+                    .apply(&id, &scope, Change::to(Substatus::Waiting), Some(overtaken))
                     .await;
             });
         }
@@ -888,7 +910,6 @@ impl Shared {
             if let Some(error) = self.preflight(&info).await {
                 return self.complete(&info, attempt, End::Failed(error)).await;
             }
-            let mut first_attempt = true;
             loop {
                 // The watchdog measures each attempt from its own `execution_start`.
                 if let Some(a) = self.queue().jobs.get_mut(&id) {
@@ -902,8 +923,10 @@ impl Shared {
                 let mut c = Change::to(initial);
                 c.attempt = Some(attempt);
                 c.started_utc = Some(self.now());
-                if first_attempt {
-                    c.vram_unchecked = Some(unchecked);
+                // Only ever set: a job that ran unchecked once (a run before a preemption) stays
+                // marked.
+                if unchecked {
+                    c.vram_unchecked = Some(true);
                 }
                 // CORE-120: the attempt's state (`submitting` for an engine job) is persisted
                 // before the handler runs; a job being cancelled keeps `cancelling`.
@@ -957,6 +980,8 @@ impl Shared {
                 };
                 if let Some(a) = self.queue().jobs.get_mut(&id) {
                     a.ctx = None;
+                    // The attempt is over: neither its backoff nor its end counts (watchdog).
+                    a.exec_start = None;
                 }
                 let (cancelling, preempted) = self.flags(&id);
                 // An unknown outcome stays unknown, and an engine that lost the job is an
@@ -998,7 +1023,6 @@ impl Shared {
                             return self.complete(&info, attempt, End::Cancelled).await;
                         }
                         attempt += 1;
-                        first_attempt = false;
                         continue;
                     }
                     JobFailure::Retryable(error) | JobFailure::Final(error) => End::Failed(error),
@@ -1345,7 +1369,8 @@ impl Shared {
                     watchdog: Some("slow".to_string()),
                     ..Change::default()
                 };
-                let live: Guard = |a| a.running && !a.completing;
+                // Still in the attempt that was slow (not in a backoff, not ending).
+                let live: Guard = |a| a.running && !a.completing && a.exec_start.is_some();
                 if shared.apply(&id, &scope, c, Some(live)).await.is_some() {
                     shared.events.publish(
                         &format!("job:{id}"),

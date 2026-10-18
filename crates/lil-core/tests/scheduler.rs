@@ -19,7 +19,7 @@ use lil_core::jobs::scheduler::{
 };
 use lil_core::jobs::{
     Admission, Admit, EngineKind, JobCaller, JobCtx, JobDone, JobFailure, JobFuture, JobHandler,
-    JobSpec, JobStatus, JobSummary, Jobs, Lane, Priority, SubmittedSlot, Substatus,
+    JobId, JobSpec, JobStatus, JobSummary, Jobs, Lane, Priority, SubmittedSlot, Substatus,
 };
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
@@ -27,7 +27,7 @@ use lil_core::telemetry::{HwSources, PowerSettings, Telemetry, TickMode, VramVie
 use lil_core::workspace::WorkspaceHub;
 use lil_platform::fs::SystemProbe;
 use lil_platform::{Clock, IdSource};
-use lil_protocol::CallerKind;
+use lil_protocol::{CallerKind, ErrorBody, codes};
 use lil_testkit::{FakeClock, FakeHwScript, SeqIds, TestEnv};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
@@ -40,7 +40,9 @@ const TOTAL: u64 = 16384;
 // The fixture.
 // ---------------------------------------------------------------------------------------------
 
-/// Runs `t.gpu` jobs: with `{"gate": g}` it waits until [`Gates::open`]`(g)` (or a cancel).
+/// Runs `t.gpu` jobs: with `{"gate": g}` it waits until [`Gates::open`]`(g)` (or a cancel);
+/// `"gate_1"` is attempt 1's gate instead, and with `"fail_first": true` attempt 1 then fails
+/// transiently.
 #[derive(Default)]
 struct Gates {
     open: watch::Sender<HashSet<String>>,
@@ -71,13 +73,25 @@ impl JobHandler for Gates {
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
         Box::pin(async move {
             self.started.send_modify(|s| s.push(job.id.to_string()));
-            if let Some(gate) = job.spec.args.get("gate").and_then(Value::as_str) {
+            let args = &job.spec.args;
+            let gate = match args.get("gate_1") {
+                Some(g) if job.attempt == 1 => g.as_str(),
+                _ => args.get("gate").and_then(Value::as_str),
+            };
+            if let Some(gate) = gate {
                 let mut open = self.open.subscribe();
                 let mut cancel = job.cancel.clone();
                 tokio::select! {
                     _ = open.wait_for(|s| s.contains(gate)) => {}
                     _ = cancel.wait_for(|c| *c) => {}
                 }
+            }
+            if job.attempt == 1 && args.get("fail_first") == Some(&json!(true)) {
+                return Err(JobFailure::Retryable(ErrorBody::new(
+                    &codes::STORE_IO,
+                    "on purpose",
+                    job.trace_id.clone(),
+                )));
             }
             Ok(JobDone {
                 structured: json!({}),
@@ -357,7 +371,7 @@ fn view(nvml_free: u64, local: &[(u32, u64)]) -> VramView {
     VramView {
         total_mib: TOTAL,
         nvml_free_mib: nvml_free,
-        local_by_pid: local.iter().copied().collect(),
+        local_by_pid: Some(local.iter().copied().collect()),
     }
 }
 
@@ -469,7 +483,7 @@ async fn dedicated_usage_is_never_used_for_budgets() {
     .await;
     rig.telemetry.tick(1).await;
     let v = rig.telemetry.vram().unwrap();
-    assert_eq!(v.local_by_pid.get(&100), Some(&115));
+    assert_eq!(v.local_by_pid.as_ref().unwrap().get(&100), Some(&115));
     // min(16384 − 115, 16000) − 512; the 23000 MiB of Dedicated Usage would leave 0.
     assert_eq!(free_vram_mib(&v, &[]), 15488);
     assert_eq!(rig.scheduler.admit(&heavy(15000, None)), Admit::Go);
@@ -540,6 +554,7 @@ async fn watchdog_flags_slow_at_three_times_and_never_cancels() {
     );
 
     let rig = Rig::new(Some(roomy()), Arc::new(NoEngines)).await;
+    rig.telemetry.tick(1).await;
     let job = rig
         .submit(spec(Lane::GpuHeavy, json!({"gate": "slow"})))
         .await;
@@ -595,5 +610,250 @@ async fn busy_flag_follows_running_jobs() {
     rig.finished(&gpu.job_id).await;
     rig.idle().await;
     assert!(!rig.telemetry.busy(), "cleared when the last one ends");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1.
+// ---------------------------------------------------------------------------------------------
+
+/// The row of job `id` in the suite `state.db`.
+async fn row(rig: &Rig, id: &str) -> record::JobRow {
+    record::get(&rig.states.suite_db(), id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// I1: with NVML present, a job is never let through unchecked for want of a reading. Before
+/// the first sample it waits, and runs checked once the sample is in; while the GPU reading is
+/// lost it waits again.
+#[tokio::test] // spec: ARCH-071
+async fn with_nvml_a_job_waits_for_a_reading_instead_of_running_unchecked() {
+    let rig = Rig::new(
+        Some(script(
+            vec![gpu(15000), json!({"error": "GPU lost"}), gpu(15000)],
+            vec![mem(&[])],
+        )),
+        Arc::new(NoEngines),
+    )
+    .await;
+    assert!(rig.telemetry.has_gpu() && rig.telemetry.vram().is_none());
+    let job = rig.submit(heavy(1000, None)).await;
+    rig.in_substatus(&job.job_id, "waiting_for_vram").await;
+    rig.telemetry.tick(1).await;
+    let done = rig.finished(&job.job_id).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(done.get("vram_unchecked").is_none(), "{done}");
+    // The GPU reading is lost: wait for the next one.
+    rig.telemetry.tick(1).await;
+    assert_eq!(rig.telemetry.vram(), None);
+    assert_eq!(
+        rig.scheduler.admit(&heavy(1000, None)),
+        Admit::WaitForVram {
+            need_mib: 1000,
+            free_mib: 0
+        }
+    );
+    rig.telemetry.tick(1).await;
+    assert_eq!(rig.scheduler.admit(&heavy(1000, None)), Admit::Go);
+    rig.shutdown().await;
+}
+
+/// I2a, ruling P3-R16: a need above the card counts as total − 512 MiB. The job waits until the
+/// card is that free, then runs, and the lane goes on with the job behind it.
+#[tokio::test] // spec: ARCH-071
+async fn a_need_above_the_card_waits_for_the_freest_card_then_runs() {
+    let rig = Rig::new(
+        Some(script(vec![gpu(15000), gpu(TOTAL)], vec![mem(&[])])),
+        Arc::new(NoEngines),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    assert_eq!(
+        rig.scheduler.admit(&heavy(20000, None)),
+        Admit::WaitForVram {
+            need_mib: TOTAL - 512,
+            free_mib: 14488
+        }
+    );
+    let big = rig.submit(heavy(20000, None)).await;
+    let small = rig.submit(heavy(100, None)).await;
+    rig.in_substatus(&big.job_id, "waiting_for_vram").await;
+    rig.telemetry.tick(1).await;
+    assert_eq!(rig.finished(&big.job_id).await["status"], "succeeded");
+    assert_eq!(rig.finished(&small.job_id).await["status"], "succeeded");
+    rig.shutdown().await;
+}
+
+/// I2b, ruling P3-R17: without per-process GPU memory, a job of the engine that holds the lease
+/// runs unchecked; a job of another engine is checked (no per-process figures) and the holder
+/// is asked to unload.
+#[tokio::test] // spec: ARCH-071
+async fn unknown_per_process_memory_runs_the_lease_holders_job_unchecked() {
+    let engines = Arc::new(Engines {
+        pids: HashMap::from([(EngineKind::ComfyUi, vec![200])]),
+        ..Engines::default()
+    });
+    let rig = Rig::new(
+        Some(
+            json!({"gpu": [gpu(3000)], "gpu_mem": null, "cpu_energy": null,
+                    "sys": [{"cpu_permille": 100}]}),
+        ),
+        engines.clone(),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    assert_eq!(rig.telemetry.vram().unwrap().local_by_pid, None);
+    // The first ComfyUI job takes the lease, checked: min(16384, 3000) − 512 = 2488.
+    let first = rig.submit(heavy(1000, Some(EngineKind::ComfyUi))).await;
+    let done = rig.finished(&first.job_id).await;
+    assert!(done.get("vram_unchecked").is_none(), "{done}");
+    // ComfyUI holds the lease and may hold the card: its next job runs unchecked.
+    let next = rig.submit(heavy(14000, Some(EngineKind::ComfyUi))).await;
+    let done = rig.finished(&next.job_id).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["vram_unchecked"], true, "{done}");
+    rig.idle().await;
+    // Another engine's job is checked, and ComfyUI is asked to unload.
+    assert_eq!(
+        rig.scheduler.admit(&heavy(14000, Some(EngineKind::Test))),
+        Admit::WaitForVram {
+            need_mib: 14000,
+            free_mib: 2488
+        }
+    );
+    tokio::time::timeout(
+        DEADLINE,
+        engines.unloads.subscribe().wait_for(|u| !u.is_empty()),
+    )
+    .await
+    .expect("no unload")
+    .unwrap();
+    assert_eq!(*engines.unloads.borrow(), [EngineKind::ComfyUi]);
+    rig.shutdown().await;
+}
+
+/// I3: the watchdog times only the current attempt while it executes: not the backoff, not the
+/// attempts before it.
+#[tokio::test] // spec: ARCH-072, CORE-126
+async fn watchdog_ignores_backoff_and_earlier_attempts() {
+    let rig = Rig::new(Some(roomy()), Arc::new(NoEngines)).await;
+    rig.telemetry.tick(1).await;
+    let job = rig
+        .submit(spec(
+            Lane::GpuHeavy,
+            json!({"gate_1": "one", "gate": "two", "fail_first": true}),
+        ))
+        .await;
+    rig.gates.until_started(&job.job_id).await;
+    // Attempt 1 executes 25 s (not slow), then fails transiently.
+    rig.clock.advance(Duration::from_secs(25));
+    rig.jobs.kick();
+    rig.gates.open("one");
+    rig.in_substatus(&job.job_id, "retrying_1_of_5").await;
+    // In the 1 s backoff, 31 s after attempt 1 began executing.
+    rig.clock.advance(Duration::from_secs(6));
+    rig.jobs.kick();
+    assert_eq!(
+        rig.gates.started.borrow().len(),
+        1,
+        "the kick fell in the backoff"
+    );
+    // Attempt 2 starts its own clock.
+    let mut started = rig.gates.started.subscribe();
+    tokio::time::timeout(DEADLINE, started.wait_for(|s| s.len() == 2))
+        .await
+        .expect("attempt 2 never started")
+        .unwrap();
+    rig.clock.advance(Duration::from_secs(29));
+    rig.jobs.kick();
+    assert_eq!(row(&rig, &job.job_id).await.watchdog, None);
+    rig.gates.open("two");
+    let done = rig.finished(&job.job_id).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["attempt"], 2, "{done}");
+    assert!(done.get("watchdog").is_none(), "{done}");
+    rig.shutdown().await;
+}
+
+/// M1: the lease passes when the job is asked about, so a job for another engine that waits
+/// for the previous engine's memory gets that engine unloaded while it waits, and runs once the
+/// memory is free (deviation 1: passing it only at `Go` would leave it waiting for good).
+#[tokio::test] // spec: ARCH-071
+async fn a_job_waiting_on_the_previous_engines_memory_gets_it_unloaded() {
+    let engines = Arc::new(Engines {
+        pids: HashMap::from([(EngineKind::ComfyUi, vec![200])]),
+        ..Engines::default()
+    });
+    let rig = Rig::new(
+        Some(script(
+            vec![gpu(15000), gpu(2000), gpu(15000)],
+            vec![mem(&[(200, 1000)]), mem(&[])],
+        )),
+        engines.clone(),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let comfy = rig.submit(heavy(1000, Some(EngineKind::ComfyUi))).await;
+    assert_eq!(rig.finished(&comfy.job_id).await["status"], "succeeded");
+    rig.idle().await;
+    // ComfyUI now holds the card: min(16384 − 1000, 2000) − 512 = 1488 < 8000.
+    rig.telemetry.tick(1).await;
+    let other = rig.submit(heavy(8000, Some(EngineKind::Test))).await;
+    rig.in_substatus(&other.job_id, "waiting_for_vram").await;
+    tokio::time::timeout(
+        DEADLINE,
+        engines.unloads.subscribe().wait_for(|u| !u.is_empty()),
+    )
+    .await
+    .expect("the previous engine was never asked to unload")
+    .unwrap();
+    let waiting = row(&rig, &other.job_id).await;
+    assert_eq!(waiting.substatus, Some(Substatus::WaitingForVram));
+    assert_eq!(*engines.unloads.borrow(), [EngineKind::ComfyUi]);
+    // The unload freed it.
+    rig.telemetry.tick(1).await;
+    assert_eq!(rig.finished(&other.job_id).await["status"], "succeeded");
+    rig.shutdown().await;
+}
+
+/// M2: a job that waited for VRAM and is overtaken by a better class waits for its turn again.
+#[tokio::test] // spec: ARCH-071, CORE-124
+async fn an_overtaken_vram_wait_goes_back_to_waiting() {
+    let rig = Rig::new(
+        Some(script(vec![gpu(1000)], vec![mem(&[])])),
+        Arc::new(NoEngines),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let batch = rig.submit(heavy(4000, None)).await;
+    rig.in_substatus(&batch.job_id, "waiting_for_vram").await;
+    // An interactive job that fits (488 MiB free) is picked instead.
+    let quick = rig
+        .submit(JobSpec {
+            priority: Priority::Interactive,
+            vram_need_mib: Some(100),
+            ..spec(Lane::GpuHeavy, json!({"gate": "quick"}))
+        })
+        .await;
+    rig.gates.until_started(&quick.job_id).await;
+    // (Its first `waiting` event came at its submit, so the row tells.)
+    tokio::time::timeout(DEADLINE, async {
+        while row(&rig, &batch.job_id).await.substatus != Some(Substatus::Waiting) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the overtaken job still says waiting_for_vram");
+    assert_eq!(row(&rig, &batch.job_id).await.status, JobStatus::Queued);
+    rig.gates.open("quick");
+    rig.finished(&quick.job_id).await;
+    rig.jobs
+        .cancel(&rig.caller(), &JobId(batch.job_id.clone()))
+        .await
+        .unwrap();
+    rig.finished(&batch.job_id).await;
+    rig.idle().await;
     rig.shutdown().await;
 }

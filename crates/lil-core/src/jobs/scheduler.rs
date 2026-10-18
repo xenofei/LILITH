@@ -7,8 +7,16 @@
 //!   and `others` that of every other process. `Dedicated Usage` is never read: it overstates
 //!   some processes past the card's size (the M0 result in ARCH-071). A job whose
 //!   `vram_need_mib` doesn't fit waits in `waiting_for_vram`; the core calls [`Jobs::kick`] on
-//!   every telemetry sample, which asks again. Without NVML ([`Telemetry::vram`] is `None`)
-//!   there is no check: the job runs, marked `vram_unchecked`.
+//!   every telemetry sample, which asks again. A need above `total − 512 MiB` counts as
+//!   `total − 512 MiB` (ruling P3-R16): such a job waits until the card is as free as it can
+//!   be, then runs (the engine offloads; out of memory is retried), and is never refused for
+//!   its size.
+//! - **Without a check.** On a machine with no GPU source at all ([`Telemetry::has_gpu`] is
+//!   `false`, so no NVML) the job runs unchecked, marked `vram_unchecked`. With NVML but no
+//!   live reading yet (before the first sample, or while the GPU is lost) it waits for the next
+//!   sample. When per-process GPU memory can't be read, the formula can't credit an engine its
+//!   own memory: a job of the engine that holds the lease already runs unchecked (it manages
+//!   its own models; ruling P3-R17), any other job is checked with no per-process figures.
 //! - **The lease.** The `gpu-heavy` lane holds the GPU lease. It passes when the lane's next job
 //!   is admitted (asked, with the lane free), not when it starts: a job for another engine
 //!   must not wait for memory that only the previous engine's unload frees. When it passes to
@@ -43,6 +51,7 @@ pub fn free_vram_mib(v: &VramView, engine_pids: &[u32]) -> u64 {
     let (engine, others) =
         v.local_by_pid
             .iter()
+            .flatten()
             .fold((0u64, 0u64), |(engine, others), (pid, mib)| {
                 if engine_pids.contains(pid) {
                     (engine.saturating_add(*mib), others)
@@ -114,10 +123,14 @@ impl GpuScheduler {
     }
 
     /// The lease passes to a job of `to` (module docs): the previous engine, when another one,
-    /// is asked to unload.
-    fn pass_lease(&self, to: Option<EngineKind>) {
+    /// is asked to unload. Whether `to`'s engine held it already.
+    ///
+    /// Carry (the plan that adds `llm.generate`, spec-oracle's ARCH-071 exception): an
+    /// `llm.generate` job must never ask ComfyUI to `/free`, so it needs a per-job "no unload"
+    /// exception here.
+    fn pass_lease(&self, to: Option<EngineKind>) -> bool {
         let Some(to) = to else {
-            return;
+            return false;
         };
         let previous = self
             .lease
@@ -135,6 +148,7 @@ impl GpuScheduler {
             let engines = self.engines.clone();
             tokio::spawn(async move { engines.unload(previous).await });
         }
+        previous == Some(to)
     }
 }
 
@@ -143,16 +157,27 @@ impl Admission for GpuScheduler {
         if spec.lane != Lane::GpuHeavy {
             return Admit::Go;
         }
-        self.pass_lease(spec.engine);
+        let held = self.pass_lease(spec.engine);
+        let need_mib = spec.vram_need_mib.unwrap_or(0);
         let Some(view) = self.telemetry.vram() else {
-            return Admit::GoUnchecked;
+            if !self.telemetry.has_gpu() {
+                return Admit::GoUnchecked;
+            }
+            // NVML, but no live reading yet: the next sample tells.
+            return Admit::WaitForVram {
+                need_mib,
+                free_mib: 0,
+            };
         };
+        if view.local_by_pid.is_none() && held {
+            return Admit::GoUnchecked;
+        }
+        let need_mib = need_mib.min(view.total_mib.saturating_sub(VRAM_MARGIN_MIB));
         let pids = spec
             .engine
             .map(|e| self.engines.pids(e))
             .unwrap_or_default();
         let free_mib = free_vram_mib(&view, &pids);
-        let need_mib = spec.vram_need_mib.unwrap_or(0);
         if need_mib <= free_mib {
             Admit::Go
         } else {

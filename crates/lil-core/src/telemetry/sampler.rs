@@ -675,11 +675,12 @@ impl Sampler {
         let vram = gpu.sample.as_ref().filter(|_| gpu.live).map(|s| VramView {
             total_mib: s.vram_total_mib,
             nvml_free_mib: s.vram_total_mib.saturating_sub(s.vram_used_mib),
-            local_by_pid: self
-                .mem_cache
-                .iter()
-                .map(|p| (p.pid, p.local_mib))
-                .collect(),
+            local_by_pid: (self.gpu_mem.is_some() && !self.mem_failing).then(|| {
+                self.mem_cache
+                    .iter()
+                    .map(|p| (p.pid, p.local_mib))
+                    .collect()
+            }),
         });
 
         StepOut {

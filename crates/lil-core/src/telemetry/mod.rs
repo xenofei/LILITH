@@ -458,15 +458,15 @@ impl Snapshot {
     }
 }
 
-/// What the GPU scheduler reads (ARCH-071): `None` from [`Telemetry::vram`] means there is no
-/// VRAM check.
+/// What the GPU scheduler reads (ARCH-071), from a live GPU reading ([`Telemetry::vram`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VramView {
     pub total_mib: u64,
     /// What NVML says is free.
     pub nvml_free_mib: u64,
-    /// Each process's `Local Usage` on the GPU (PDH).
-    pub local_by_pid: BTreeMap<u32, u64>,
+    /// Each process's `Local Usage` on the GPU (PDH); `None` when per-process GPU memory can't
+    /// be read (no PDH source, or its last read failed).
+    pub local_by_pid: Option<BTreeMap<u32, u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -845,8 +845,8 @@ impl Telemetry {
     }
 
     /// What the GPU scheduler needs (ARCH-071), from the latest real GPU reading. `None`
-    /// without a GPU source, before the first reading and while the GPU is lost: there is then
-    /// no VRAM check.
+    /// without a GPU source, before the first reading and while the GPU is lost (the scheduler
+    /// tells these apart with [`Telemetry::has_gpu`]).
     pub fn vram(&self) -> Option<VramView> {
         lock(&self.inner.vram).clone()
     }

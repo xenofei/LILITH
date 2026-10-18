@@ -357,8 +357,9 @@ impl Substatus {
 pub enum EngineKind {
     #[serde(rename = "comfyui")]
     ComfyUi,
-    /// A second kind for the GPU lease's tests (no engine runs it). No tool input can name it:
-    /// serde and the schemas skip it; only its row column (`"test"`) reads it back.
+    /// A second kind for the GPU lease's tests (no engine runs it). No input can name it: serde
+    /// and the schemas skip it, and [`EngineKind::parse`] doesn't know it; only the row column
+    /// reader ([`EngineKind::from_column`]) reads it back.
     #[doc(hidden)]
     #[serde(skip)]
     #[schemars(skip)]
@@ -373,7 +374,13 @@ impl EngineKind {
         }
     }
 
+    /// An engine named in input (a tool argument, a setting): never [`EngineKind::Test`].
     pub fn parse(s: &str) -> Option<EngineKind> {
+        (s == "comfyui").then_some(EngineKind::ComfyUi)
+    }
+
+    /// The `engine` column of a jobs row, which a test may have written as `"test"`.
+    pub fn from_column(s: &str) -> Option<EngineKind> {
         [EngineKind::ComfyUi, EngineKind::Test]
             .into_iter()
             .find(|e| e.wire() == s)

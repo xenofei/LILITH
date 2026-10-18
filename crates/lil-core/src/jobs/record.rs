@@ -257,7 +257,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
         expected_output_bytes: u64_col(r, 27)?.unwrap_or(0),
         vram_need_mib: u64_col(r, 28)?,
         engine: engine
-            .map(|e| EngineKind::parse(&e).ok_or_else(|| bad(29, "engine")))
+            .map(|e| EngineKind::from_column(&e).ok_or_else(|| bad(29, "engine")))
             .transpose()?,
         group: r.get(30)?,
         external_side_effects: r.get::<_, i64>(31)? != 0,
