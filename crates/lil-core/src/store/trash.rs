@@ -41,7 +41,7 @@ use serde_json::Value;
 use super::fsops;
 use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
-use super::paths::{WsPath, path_key, writable};
+use super::paths::{WsPath, long_rel, path_key, writable};
 use super::versions::{files_under, set_readonly_all};
 use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
@@ -253,7 +253,8 @@ impl Store {
     /// folder, `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, by any
     /// name (an 8.3 short name too, or a long form that can't be read), or a link (also a
     /// linked folder on the way);
-    /// `store.locked` for a path in its manifest's `locks`, by any name; `store.git_busy` when
+    /// `store.locked` for a path in its manifest's `locks`, by any name, or a folder holding one
+    /// (ruling P3-R7: a whole asset or project too); `store.git_busy` when
     /// git is still working after 60 s; `store.io` when there is nothing at `rel` or a file
     /// call fails (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
@@ -263,11 +264,114 @@ impl Store {
         writable(&long)?;
         self.check_locks(rel).await?;
         self.check_long_locks(rel, &long).await?;
+        // A folder holding a locked path is never moved either (ruling P3-R7).
+        self.refuse_locks_within(rel, &long).await?;
         // The long form doesn't see through a junction: a linked folder on the way could reach
         // a sealed folder, `.lilith\` or `.git\`. Attributes only.
         self.refuse_links(rel).await?;
         self.git_gate().wait_clear(GIT_WAIT).await?;
         self.trash_now(rel, reason).await
+    }
+
+    /// Ruling P3-R7: `store.locked` when a manifest `locks` entry (CORE-035) and `long`, the
+    /// long form of `rel`, overlap: the entry is `long` or under it (a folder holding a locked
+    /// path, a whole asset or project too), or `long` is under the entry. Both sides are long
+    /// forms: each entry is resolved under its asset folder with `probe.long_form`, so one
+    /// written as an 8.3 alias still counts. The error names the locked path (`rel` when it is
+    /// under the entry). The manifest is never locked by its own list, and an entry that isn't
+    /// a valid path is skipped with a warning; a manifest, a listing or a long form that can't
+    /// be read refuses the trash (fail closed).
+    async fn refuse_locks_within(&self, rel: &WsPath, long: &WsPath) -> Result<(), StoreError> {
+        let parts: Vec<&str> = long.as_str().split('/').collect();
+        if !parts[0].eq_ignore_ascii_case("projects")
+            || (parts.len() >= 3 && !parts[2].eq_ignore_ascii_case("assets"))
+        {
+            return Ok(());
+        }
+        let assets = if parts.len() >= 4 {
+            vec![parts[..4].join("/")]
+        } else {
+            self.assets_under(&parts).await?
+        };
+        let target = long.key();
+        for asset in assets {
+            let asset_id = asset.rsplit('/').next().unwrap_or_default().to_string();
+            let manifest = WsPath::from_disk(format!("{asset}/{asset_id}.manifest.json"));
+            let Some(bytes) = self.read(&manifest).await? else {
+                continue;
+            };
+            let Some((m, _)) = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|t| Manifest::parse(t).ok())
+            else {
+                tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
+                continue;
+            };
+            let mut entries = Vec::new();
+            for entry in m.view().locks {
+                let trimmed = entry.trim_end_matches('/');
+                match WsPath::parse(&format!("{asset}/{trimmed}")) {
+                    Ok(path) if !trimmed.is_empty() && path.key() != manifest.key() => {
+                        entries.push(path);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(manifest = %manifest, entry = %entry, "a locks entry that isn't a workspace path is skipped");
+                    }
+                }
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
+            let longs = blocking(move || {
+                Ok(entries
+                    .iter()
+                    .map(|e| long_rel(&root, e, &|p| probe.long_form(p)))
+                    .collect::<Result<Vec<_>, _>>())
+            })
+            .await
+            .map_err(|e| StoreError::io(&manifest, &e))??;
+            for entry in longs {
+                let key = entry.key();
+                if key == target || key.starts_with(&format!("{target}/")) {
+                    return Err(StoreError::Locked(entry));
+                }
+                if target.starts_with(&format!("{key}/")) {
+                    return Err(StoreError::Locked(rel.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The asset folders, workspace-relative, under `parts`: `projects`, `projects/<p>` or
+    /// `projects/<p>/assets` (links are never followed).
+    async fn assets_under(&self, parts: &[&str]) -> Result<Vec<String>, StoreError> {
+        let root = self.root().to_path_buf();
+        let at = WsPath::from_disk(parts.join("/"));
+        let parts: Vec<String> = parts.iter().map(|p| (*p).to_string()).collect();
+        blocking(move || {
+            let projects = if parts.len() == 1 {
+                list(&root.join(&parts[0]))?
+                    .into_iter()
+                    .filter(|e| e.folder)
+                    .map(|e| format!("{}/{}", parts[0], e.name))
+                    .collect()
+            } else {
+                vec![format!("{}/{}", parts[0], parts[1])]
+            };
+            let mut assets = Vec::new();
+            for project in projects {
+                let dir = WsPath::from_disk(format!("{project}/assets")).abs(&root);
+                for e in list(&dir)?.into_iter().filter(|e| e.folder) {
+                    assets.push(format!("{project}/assets/{}", e.name));
+                }
+            }
+            Ok(assets)
+        })
+        .await
+        .map_err(|e| StoreError::io(&at, &e))
     }
 
     /// [`Store::trash`] after its checks.
@@ -667,7 +771,11 @@ impl Store {
                 .await
                 .unwrap_or(false);
             let stamp = if present {
-                if let Err(e) = self.check_locks(&folder).await {
+                let locked = match self.check_locks(&folder).await {
+                    Ok(()) => self.refuse_locks_within(&folder, &folder).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = locked {
                     tracing::warn!(run = %folder, error = %e, "a locked rejected run stays");
                     continue;
                 }

@@ -892,6 +892,78 @@ async fn locked_files_by_short_name_are_refused() {
     assert_eq!(ws.read(&locked), b"a crane");
 }
 
+/// Ruling P3-R7: a trash of a folder is refused when a manifest `locks` entry lies at it or
+/// anywhere under it (a whole asset or project too), naming the locked path, and nothing
+/// moves. Containment is decided on long forms on both sides, so an entry written as an 8.3
+/// alias (`PROMPT~1/`) protects the folder named by its long name. A folder without locks
+/// still goes to the trash.
+#[tokio::test(start_paused = true)] // spec: CORE-035, ARCH-058
+async fn trash_of_a_folder_holding_a_locked_path_is_refused() {
+    let ws = workspace();
+    let store = ws.store();
+    let locked = format!("{ASSET}/prompts/crane_prompt.txt");
+    let manifest = |locks: Value| {
+        let mut m = Manifest::new(
+            "sketchbook",
+            "crane",
+            "image",
+            "00000000-0000-4000-8000-0000000000aa",
+        );
+        m.set("locks", locks);
+        write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
+    };
+    manifest(json!(["prompts/crane_prompt.txt"]));
+    write_file(&ws.file(&locked), b"a crane");
+    write_file(&ws.file(&format!("{ASSET}/prompts/other.txt")), b"other");
+    write_file(&ws.file(&format!("{ASSET}/free/a.txt")), b"free");
+
+    for rel in [
+        format!("{ASSET}/prompts"),
+        ASSET.to_string(),
+        "projects/sketchbook".to_string(),
+        "projects".to_string(),
+    ] {
+        let refused = store.trash(&p(&rel), "test").await;
+        assert!(
+            matches!(&refused, Err(StoreError::Locked(at)) if at.as_str().eq_ignore_ascii_case(&locked)),
+            "{rel}: {refused:?}"
+        );
+        assert_eq!(ws.read(&locked), b"a crane", "{rel}");
+        assert_eq!(ws.read(&format!("{ASSET}/prompts/other.txt")), b"other");
+    }
+    assert!(store.trash_list().await.unwrap().is_empty());
+
+    // A folder without locks, in the same asset, goes as before.
+    store
+        .trash(&p(&format!("{ASSET}/free")), "test")
+        .await
+        .unwrap();
+    assert!(!ws.exists(&format!("{ASSET}/free/a.txt")));
+
+    // A lock entry written as the 8.3 alias of a folder protects it by its long name.
+    let folder = ws.file(&format!("{ASSET}/promptsfolder"));
+    write_file(&folder.join("x.txt"), b"x");
+    let short = lil_platform::fs::short_name(&folder).unwrap();
+    if short == folder {
+        println!("8.3 names are off on this volume: the short-alias lock entry is skipped");
+        return;
+    }
+    let alias = short.file_name().unwrap().to_string_lossy().into_owned();
+    manifest(json!([format!("{alias}/")]));
+    for rel in [
+        format!("{ASSET}/promptsfolder/x.txt"),
+        format!("{ASSET}/promptsfolder"),
+        ASSET.to_string(),
+    ] {
+        let refused = store.trash(&p(&rel), "test").await;
+        assert!(
+            matches!(&refused, Err(StoreError::Locked(_))),
+            "{rel} (locked as {alias}/): {refused:?}"
+        );
+        assert_eq!(ws.read(&format!("{ASSET}/promptsfolder/x.txt")), b"x");
+    }
+}
+
 #[tokio::test(start_paused = true)] // spec: ARCH-002, ARCH-058
 async fn restore_refuses_a_linked_folder_on_the_way() {
     let ws = workspace();
