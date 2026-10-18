@@ -40,7 +40,8 @@ struct Allow {
     until: &'static str,
 }
 
-/// The allowlist. The first eight rows are the plan's Task B1 table, verbatim. The rest are
+/// The allowlist. The first nine rows are the plan's Task B1 table, verbatim except that row 5
+/// is split so the workflows get only the pick step's exact text (ruling RN7). The rest are
 /// what the PR-A reviews and this test itself need; each says so in its `why`.
 const ALLOW: &[Allow] = &[
     Allow {
@@ -67,15 +68,37 @@ const ALLOW: &[Allow] = &[
         why: "literal legacy cases of the test guard",
         until: "the owner says no legacy folder is left",
     },
+    // The plan's row 5, minus `.github/workflows/*.yml`: in the workflows a bare `ww-cli`
+    // would also allow the tree-builder `-p ww-cli` lines Task B2 must change (ruling RN7).
+    // The workflows get the narrow row right after this one.
     Allow {
         globs: &[
-            ".github/workflows/*.yml",
             "tools/git-hooks/credential-helper",
             "crates/lil-cli/src/dev/workflows.rs",
             "crates/lil-cli/tests/credential_helper.rs",
         ],
         lines_with: &["ww-cli", "ww.exe", "--bin ww", "WW_PRIVACY_DENYLIST"],
         why: "CI and helper transition (B1, B2, B5)",
+        until: "PR-D",
+    },
+    Allow {
+        globs: &[".github/workflows/*.yml"],
+        lines_with: &[
+            // The pick step's transition branch, by its exact text.
+            "elif [ -f crates/ww-cli/Cargo.toml ]; then",
+            "elif git cat-file -e \"${BEFORE}:crates/ww-cli/Cargo.toml\"",
+            "pkg=ww-cli",
+            "nor crates/ww-cli",
+            // The comments that describe that branch.
+            "lil-cli once main has it, else ww-cli.",
+            "# ww-cli. Never the pushed commit",
+            "else crates/ww-cli)",
+            "# crates/ww-cli), so the check keeps working",
+            // The legacy secret (RN5).
+            "WW_PRIVACY_DENYLIST",
+        ],
+        why: "CI transition in the workflows: the pick step's ww-cli branch and the legacy \
+              secret only, never a tree-builder `-p ww-cli` line (B1 row 5 narrowed, RN7)",
         until: "PR-D",
     },
     Allow {
@@ -375,6 +398,62 @@ fn allowlist_is_case_sensitive_so_the_old_spec_path_is_not_allowed() {
         "legacy_home_dir = \".worldwright\""
     ));
     assert!(!allowed("Docs/superpowers/plans/x.md", "Worldwright"));
+}
+
+/// Ruling RN7: in the workflows only the pick step's transition branch may say `ww-cli`. The
+/// tree-builder steps run the pushed tree's CLI and must be reported until Task B2 changes
+/// them to `-p lil-cli`.
+#[test]
+fn tree_builder_ww_cli_lines_in_the_workflows_are_reported() {
+    // The tree-builder lines as they stand at the start of PR-B.
+    for (path, line) in [
+        (
+            ".github/workflows/ci-pr-ready.yml",
+            "        run: cargo run --locked -p ww-cli -- dev spec-tests",
+        ),
+        (
+            ".github/workflows/ci-push.yml",
+            "        run: cargo run --locked -p ww-cli -- dev spec-tests",
+        ),
+        (
+            ".github/workflows/ci-push.yml",
+            "        run: cargo run --locked -p ww-cli -- dev spec-report",
+        ),
+        (
+            ".github/workflows/post-merge.yml",
+            "        run: cargo run --locked -p ww-cli -- dev spec-tests",
+        ),
+        (
+            ".github/workflows/ci-push.yml",
+            "        run: cargo build --locked -p ww-cli --bin ww",
+        ),
+    ] {
+        assert!(is_stale(line));
+        assert!(!allowed(path, line), "{path}: {line:?} must be reported");
+    }
+    // The pick step's transition branch stays allowed.
+    for line in [
+        "          elif [ -f crates/ww-cli/Cargo.toml ]; then",
+        "            pkg=ww-cli",
+        "            bin=ww",
+        "            echo \"::error::main has neither crates/lil-cli nor crates/ww-cli, so there is no CLI to build.\"",
+        "        # In main's working tree (the checkout above): lil-cli once main has it, else ww-cli.",
+        "          WW_PRIVACY_DENYLIST: ${{ secrets.WW_PRIVACY_DENYLIST }}",
+    ] {
+        assert!(allowed(".github/workflows/ci-push.yml", line), "{line:?}");
+    }
+    // And in the real tree, no tracked workflow line that runs `-p ww-cli` is allowed.
+    for h in all_hits() {
+        if glob_matches(".github/workflows/*.yml", &h.path) && h.text.contains("-p ww-cli") {
+            assert!(
+                !allowed(&h.path, &h.text),
+                "{}:{}: {} must be reported",
+                h.path,
+                h.line,
+                h.text.trim()
+            );
+        }
+    }
 }
 
 #[test]
