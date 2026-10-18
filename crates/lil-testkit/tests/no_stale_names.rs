@@ -166,6 +166,23 @@ const ALLOW: &[Allow] = &[
         why: "Appendix F: plugin 1.3 keeps the id `worldwright`, so its folder and name do (R1)",
         until: "plugin rename",
     },
+    // Plan 3, Global Constraints "Old names", the Task 7/19/20 row: Task 7's spec-test globs.
+    // `mcp_server.rs` names none of the row's substrings, so it is left out (an honest row
+    // allows something through every glob).
+    Allow {
+        globs: &[
+            "crates/lil-spec-tests/tests/plugin_hooks.rs",
+            "crates/lil-spec-tests/tests/doctor_claude.rs",
+        ],
+        lines_with: &[
+            "worldwright@lilith",
+            "mcp__plugin_worldwright_",
+            "plugin/worldwright/",
+            "name: \"worldwright\"",
+        ],
+        why: "Claude Code's names for the plugin's tools and the install target (AI-110, D5)",
+        until: "plugin rename",
+    },
     Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
         lines_with: &[],
