@@ -39,7 +39,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
     FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx, FileIdInfo,
     FileStandardInfo, FlushFileBuffers, GetDriveTypeW, GetFileAttributesW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW, GetShortPathNameW,
     GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK,
     LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS,
     REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
@@ -254,6 +254,64 @@ pub fn long_name(path: &Path) -> io::Result<PathBuf> {
     } else {
         strip_verbatim(&long)
     })
+}
+
+/// `path` with every 8.3 short component of its longest existing prefix expanded by
+/// `long_name` ([`long_name`], or a [`Probe`]'s), and the rest appended as given: a name that
+/// doesn't exist has no short form. Only a missing component (`NotFound`, or `NotADirectory`
+/// below a file) moves the walk up a level; any other error is returned, so a check built on
+/// this fails closed.
+pub fn long_form(
+    path: &Path,
+    long_name: &dyn Fn(&Path) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    for existing in path.ancestors() {
+        match attributes(existing) {
+            Ok(_) => {
+                let long = long_name(existing)?;
+                let tail = path.strip_prefix(existing).unwrap_or(Path::new(""));
+                return Ok(if tail.as_os_str().is_empty() {
+                    long
+                } else {
+                    long.join(tail)
+                });
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no part of the path exists",
+    ))
+}
+
+/// `GetShortPathNameW`: `path` with each component that has an 8.3 short name in that form. A
+/// component without one (8.3 names off on the volume) keeps its long name. A `\\?\` prefix
+/// that [`long_path`] added is removed again. Test support for the store's short-name checks.
+pub fn short_name(path: &Path) -> io::Result<PathBuf> {
+    let input = wide(path)?;
+    let mut buf = vec![0u16; 260];
+    loop {
+        // SAFETY: `input` is NUL-terminated; `buf` is a writable slice of the length passed.
+        let len = unsafe { GetShortPathNameW(PCWSTR(input.as_ptr()), Some(&mut buf)) } as usize;
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len < buf.len() {
+            buf.truncate(len);
+            break;
+        }
+        // Too small: `len` is the size needed, terminating NUL included.
+        buf = vec![0u16; len];
+    }
+    Ok(strip_verbatim(&PathBuf::from(
+        std::ffi::OsString::from_wide(&buf),
+    )))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -606,13 +664,18 @@ impl Drop for LockedFile {
 
 /// Opens or creates the lock file at `path` and takes `LockFileEx(EXCLUSIVE |
 /// FAIL_IMMEDIATELY)` on `[0, 1)`. `None` at once when another handle holds it.
+///
+/// The handle shares read and write but not delete, so while it is open the file can't be
+/// deleted or renamed (error 32): a second core always opens this same file and finds the
+/// lock held, instead of creating a fresh one beside an orphaned handle. That second open
+/// still succeeds, since neither handle asks for delete access.
 pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<LockedFile>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .open(long_path(path))?;
     Ok(lock_byte(&file, 0)?.then_some(LockedFile { file }))
 }
@@ -835,6 +898,11 @@ pub trait Probe: Send + Sync + std::fmt::Debug {
     /// [`long_name`]: every 8.3 short component expanded (attribute-only, never reads data).
     fn long_name(&self, path: &Path) -> io::Result<PathBuf> {
         long_name(path)
+    }
+    /// [`long_form`] with [`Probe::long_name`]: the long form of a path that may not exist
+    /// yet, failing closed on any error but a missing component.
+    fn long_form(&self, path: &Path) -> io::Result<PathBuf> {
+        long_form(path, &|p| self.long_name(p))
     }
     /// [`reparse_tag`]: the reparse tag of a reparse point, read without following it.
     fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {

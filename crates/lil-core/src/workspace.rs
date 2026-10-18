@@ -285,7 +285,9 @@ pub struct LockError {
 ///
 /// `Some` only when every lock is held: only then may the core write. The legacy folder is
 /// never created; its lock file is created if missing, the one write under the old name
-/// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other.
+/// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other. Each
+/// lock file is held open without delete sharing (`try_lock_exclusive`), so while it is held
+/// it can't be deleted or renamed away and a second core always finds the held lock.
 ///
 /// # Errors
 /// A lock file that can't be opened, with its workspace-relative path.

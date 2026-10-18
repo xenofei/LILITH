@@ -120,12 +120,18 @@ const ALLOW: &[Allow] = &[
         until: "kept: `.worldwright\\` stays reserved and `ww://` still parses for sealed \
                 snapshots (no planned end)",
     },
-    // Plan 3, Global Constraints "Old names", rows 1 and 3. Task 3 adds
-    // `crates/lil-platform/tests/fs_lock.rs` and its `core.lock` substring.
+    // Plan 3, Global Constraints "Old names", the Task 1 `trash.rs` row and the Task 3 row.
     Allow {
         globs: &["crates/lil-core/tests/trash.rs"],
         lines_with: &["\".worldwright\""],
         why: "tests that `.worldwright\\` stays reserved, by its literal name",
+        until: "kept: `.worldwright\\` stays reserved (no planned end)",
+    },
+    Allow {
+        globs: &["crates/lil-core/tests/workspace_hub.rs"],
+        lines_with: &[".worldwright\\\\core.lock"],
+        why: "`core_lock_cannot_be_deleted_or_renamed_while_held`: the legacy lock keeps out an \
+              old core",
         until: "kept: `.worldwright\\` stays reserved (no planned end)",
     },
     // Plan 3, Global Constraints "Old names", the Task 2 spec row: Appendix F's legacy-name

@@ -1193,3 +1193,89 @@ async fn adoption_makes_writable_sealed_files_read_only_again() {
     assert_eq!(ws.read(&a), bytes_of("r_1", "a.png"));
     assert_eq!(sealed.signed_off_date.as_deref(), Some("2027-01-15"));
 }
+
+/// The real probe, except that `identity` of the path `fail_at` is access denied (error 5).
+#[derive(Debug)]
+struct FailingAt {
+    fail_at: PathBuf,
+}
+
+impl Probe for FailingAt {
+    fn identity(&self, path: &Path) -> io::Result<lil_platform::fs::FileIdentity> {
+        if path == self.fail_at {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+}
+
+/// Ledger Q34 carry: when the probe can't tell whether a path the seal checks is there, the
+/// seal fails with `store.io` instead of taking it as absent, and nothing moves. Both checks:
+/// step 1's version folder, and adoption's "a file the seal would have sealed is still in the
+/// run".
+#[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
+async fn exists_now_fails_closed_on_a_probe_error() {
+    let store_failing_at = |ws: &Ws, rel: &str| {
+        Arc::new(
+            Store::new(
+                ws.root.clone(),
+                ws.state.clone(),
+                FailPoints::none(),
+                ws.clock.clone(),
+                Arc::new(SeqIds::new()),
+                Arc::new(FailingAt {
+                    fail_at: ws.file(rel),
+                }),
+            )
+            .with_machine("testmachine"),
+        )
+    };
+
+    // Step 1: the version folder can't be checked.
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    let req = request(
+        "r_1",
+        "1.0.0",
+        &["a.png"],
+        signed(m, "r_1", "1.0.0", &["a.png"]),
+    );
+    let store = store_failing_at(&ws, &format!("{ASSET}/v1.0.0"));
+    let result = seal(&store, req).await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+    assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+    assert_eq!(
+        ws.read(&format!("{ASSET}/candidates/r_1/a.png")),
+        bytes_of("r_1", "a.png")
+    );
+
+    // Adoption: the version folder lacks a derived file, and whether the run still holds it
+    // can't be checked.
+    let ws = workspace();
+    let req = unrecorded_seal(
+        &ws,
+        &[
+            ("a.png", "candidate", None),
+            ("a_cut.png", "derived", Some("a.png")),
+        ],
+        &["a.png"],
+    )
+    .await;
+    move_outside(
+        &ws.file(&format!("{ASSET}/v1.0.0/a_cut.png")),
+        &ws.env.root().join("away").join("a_cut.png"),
+    );
+    let before = ws.tree(&format!("{ASSET}/v1.0.0"));
+    let store = store_failing_at(&ws, &format!("{ASSET}/candidates/r_1/a_cut.png"));
+    let result = seal(&store, req).await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+    assert_eq!(ws.tree(&format!("{ASSET}/v1.0.0")), before);
+}

@@ -535,6 +535,59 @@ fn either_lock_held_elsewhere_makes_the_open_read_only() {
     assert_eq!(open.access, Access::ReadWrite);
 }
 
+/// Deletes `path` as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn delete_outside(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// Renames `from` to `to` as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn rename_outside(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// A held `core.lock` is opened without `FILE_SHARE_DELETE`: while it is held its name can't
+/// be deleted or renamed away (error 32), so a second core always finds the held lock and
+/// serves read-only. Opening it again for the lock check still works.
+#[test] // spec: ARCH-028
+fn core_lock_cannot_be_deleted_or_renamed_while_held() {
+    use lil_core::workspace::take_core_locks;
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let held = take_core_locks(&ws.path)
+        .expect("the locks open")
+        .expect("both locks are free");
+
+    for (label, path) in [
+        (".lilith\\core.lock", core_lock(&ws)),
+        (".worldwright\\core.lock", legacy_lock(&ws)),
+    ] {
+        let deleted = delete_outside(&path);
+        assert_eq!(
+            deleted.as_ref().map_err(std::io::Error::raw_os_error),
+            Err(Some(32)),
+            "deleting {label}: {deleted:?}"
+        );
+        let renamed = rename_outside(&path, &path.with_file_name("core.lock.moved"));
+        assert_eq!(
+            renamed.as_ref().map_err(std::io::Error::raw_os_error),
+            Err(Some(32)),
+            "renaming {label}: {renamed:?}"
+        );
+        assert!(path.is_file(), "{label} is gone");
+        assert!(!path.with_file_name("core.lock.moved").exists(), "{label}");
+    }
+    // A second core opens both files and finds the lock held.
+    assert!(
+        take_core_locks(&ws.path).expect("the locks open").is_none(),
+        "a second core took the locks"
+    );
+    drop(held);
+    assert!(take_core_locks(&ws.path).unwrap().is_some());
+}
+
 // ---------------------------------------------------------------------------------------------
 // A dispatcher over a hub.
 // ---------------------------------------------------------------------------------------------

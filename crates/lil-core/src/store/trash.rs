@@ -47,7 +47,6 @@ use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
 };
 use lil_platform::fs::Probe;
-use lil_platform::names::is_workspace_dir;
 
 /// Days a trash entry is kept before it is purged (ARCH-058, CORE-037).
 pub const TRASH_KEEP_DAYS: i64 = 30;
@@ -242,27 +241,6 @@ fn remove_if_empty(path: &Path) {
     let _ = fsops::remove_empty_dir(path);
 }
 
-/// `store.path_invalid` for the paths the trash never touches, compared without regard to case:
-/// the trash itself, either workspace data folder ([`is_workspace_dir`]), `.git` and the ledger.
-/// `what` finishes the reason ("moved to the trash", "restored to").
-fn refuse_reserved(rel: &WsPath, what: &str) -> Result<(), StoreError> {
-    let first = rel.as_str().split('/').next().unwrap_or_default();
-    let refused = is_workspace_dir(first)
-        || [TRASH_DIR, ".git"]
-            .iter()
-            .any(|area| first.eq_ignore_ascii_case(area))
-        || path_key(rel.as_str()) == path_key("registry/ledger.csv");
-    if refused {
-        return Err(StoreError::PathInvalid {
-            path: rel.as_str().to_string(),
-            why: format!(
-                "the trash, the suite's own folders, .git and the ledger are never {what}"
-            ),
-        });
-    }
-    Ok(())
-}
-
 impl Store {
     /// Moves `rel` (a file or a folder) to the trash with `reason` (module docs). A sealed
     /// version folder, or anything in one, is never moved (CORE-026; it is refused as every
@@ -272,14 +250,14 @@ impl Store {
     ///
     /// # Errors
     /// `workspace.read_only`; `store.path_invalid` for the trash itself, either workspace data
-    /// folder ([`is_workspace_dir`]), `.git`, `registry/ledger.csv`, a sealed version folder or a
-    /// path in one, or a link;
+    /// folder, `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, by any
+    /// name (an 8.3 short name too, or a long form that can't be read), or a link;
     /// `store.locked` for a path in its manifest's `locks`; `store.git_busy` when git is still
     /// working after 60 s; `store.io` when there is nothing at `rel` or a file call fails
     /// (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
-        refuse_reserved(rel, "moved to the trash")?;
+        self.reserved_on_disk(rel, "moved to the trash").await?;
         writable(rel)?;
         self.writable_on_disk(rel).await?;
         self.check_locks(rel).await?;
@@ -437,9 +415,10 @@ impl Store {
             })
             .ok_or_else(unknown)?;
         let rel = WsPath::parse(&entry.record.original_path)?;
-        // The trash's own refusals, then a write's, before anything moves; the entry stays as it
-        // is. A sealed path is the one exception: it restores, read-only again (CORE-026).
-        refuse_reserved(&rel, "restored to")?;
+        // The trash's own refusals (by the long name too, so an 8.3 short name is refused like
+        // the long one), then a write's, before anything moves; the entry stays as it is. A
+        // sealed path is the one exception: it restores, read-only again (CORE-026).
+        self.reserved_on_disk(&rel, "restored to").await?;
         if !in_version_folder(&rel) {
             writable(&rel)?;
             self.writable_on_disk(&rel).await?;

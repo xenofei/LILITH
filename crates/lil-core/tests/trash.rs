@@ -636,6 +636,140 @@ async fn trash_waits_at_the_git_gate() {
     assert!(store.trash_list().await.unwrap().is_empty());
 }
 
+/// Plan-2b Minor 4: `Store::trash` refuses a sealed version folder and anything in it at once,
+/// also by an 8.3 short name, even while git works; an ordinary path waits at the git gate.
+/// Nothing moves either way.
+#[tokio::test(start_paused = true)] // spec: CORE-026, ARCH-083, ARCH-058
+async fn store_trash_refuses_sealed_paths_and_waits_at_the_git_gate() {
+    let ws = workspace();
+    let store = ws.store();
+    sealed_version(&ws, &store).await;
+    write_file(&ws.file("notes/a.txt"), b"a");
+    write_file(&ws.file(".git/index.lock"), b"");
+    let sealed = format!("{ASSET}/v1.0.0/a.png");
+    let version = ws.file(&format!("{ASSET}/v1.0.0"));
+    let short = lil_platform::fs::short_name(&version).unwrap();
+    let mut paths = vec![sealed.clone(), format!("{ASSET}/v1.0.0")];
+    if short != version {
+        let name = short.file_name().unwrap().to_string_lossy().into_owned();
+        paths.push(format!("{ASSET}/{name}"));
+        paths.push(format!("{ASSET}/{name}/a.png"));
+    } else {
+        println!("8.3 names are off on this volume: the short-name case is skipped");
+    }
+    for path in &paths {
+        let refused = tokio::time::timeout(Duration::from_secs(1), store.trash(&p(path), "test"))
+            .await
+            .unwrap_or_else(|_| panic!("{path}: the refusal waited at the git gate"));
+        assert!(
+            matches!(refused, Err(StoreError::PathInvalid { .. })),
+            "{path}: {refused:?}"
+        );
+    }
+    assert!(read_only(&ws.file(&sealed)));
+    assert_eq!(ws.read(&sealed), b"a");
+
+    let trashing = {
+        let store = store.clone();
+        tokio::spawn(async move { store.trash(&p("notes/a.txt"), "test").await })
+    };
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!trashing.is_finished(), "the trash waits while git works");
+    let result = trashing.await.unwrap();
+    assert!(matches!(result, Err(StoreError::GitBusy)), "{result:?}");
+    assert_eq!(ws.read("notes/a.txt"), b"a");
+    assert!(store.trash_list().await.unwrap().is_empty());
+}
+
+/// Every file under `dir`, workspace-relative to `dir`, with its bytes.
+fn files_of(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(at) = todo.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                todo.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.push((path.strip_prefix(dir).unwrap().to_path_buf(), bytes));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The trash's reserved folders named by their 8.3 short names (from `GetShortPathNameW`) are
+/// refused like their long names, and nothing under them moves. On a volume with 8.3 names off
+/// the real-volume half is skipped (the long names are still checked); the unit test
+/// `reserved_check_runs_on_the_long_name` covers the short-name rule everywhere.
+#[tokio::test(start_paused = true)] // spec: ARCH-058, CORE-040
+async fn trash_of_a_reserved_folder_by_short_name_is_refused() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+    let ws = workspace();
+    let store = ws.store();
+    let reserved = [WORKSPACE_DIR, LEGACY_WORKSPACE_DIR, ".git", ".trash"];
+    for dir in reserved {
+        write_file(&ws.file(&format!("{dir}/keep.txt")), dir.as_bytes());
+    }
+    let before: Vec<_> = reserved.iter().map(|d| files_of(&ws.file(d))).collect();
+    let mut shorts = Vec::new();
+    for dir in reserved {
+        let long = ws.file(dir);
+        let short = lil_platform::fs::short_name(&long).unwrap();
+        let mut names = vec![dir.to_string()];
+        if short != long {
+            let name = short.file_name().unwrap().to_string_lossy().into_owned();
+            shorts.push((dir, name.clone()));
+            names.push(name);
+        }
+        for name in names {
+            for rel in [name.clone(), format!("{name}/keep.txt")] {
+                let refused = store.trash(&p(&rel), "test").await;
+                assert!(
+                    matches!(&refused, Err(StoreError::PathInvalid { .. })),
+                    "{dir} as {rel}: {refused:?}"
+                );
+            }
+        }
+    }
+    if shorts.len() < reserved.len() {
+        println!("8.3 names are off on this volume: the real-volume short-name half is skipped");
+    }
+    let after: Vec<_> = reserved.iter().map(|d| files_of(&ws.file(d))).collect();
+    assert_eq!(before, after, "a refused trash moved something");
+    assert!(store.trash_list().await.unwrap().is_empty());
+
+    // A restore to a short name of one of them (a hand-edited `restore.json`) is refused too,
+    // and the entry stays as it was.
+    for (n, (dir, short)) in shorts.iter().enumerate() {
+        let id = format!("te_00000000000000d{n}");
+        entry_by_hand(
+            &ws,
+            &id,
+            &format!("{short}/restored.txt"),
+            &[("", b"payload")],
+        );
+        let refused = store.trash_restore(&id).await;
+        assert!(
+            matches!(&refused, Err(StoreError::PathInvalid { .. })),
+            "restore to {short}: {refused:?}"
+        );
+        let entry = ws.file(&format!(
+            ".trash/{}/{id}",
+            &lil_schema::time::rfc3339(ws.now())[..10]
+        ));
+        assert_eq!(
+            std::fs::read(entry.join("payload").join("restored.txt")).unwrap(),
+            b"payload"
+        );
+        assert!(entry.join("restore.json").is_file());
+        assert!(!ws.exists(&format!("{dir}/restored.txt")), "{dir}");
+    }
+    assert_eq!(store.trash_list().await.unwrap().len(), shorts.len());
+}
+
 /// A junction at `link` to the folder `target` (no privilege needed).
 #[allow(clippy::disallowed_methods)]
 fn junction(link: &Path, target: &Path) {

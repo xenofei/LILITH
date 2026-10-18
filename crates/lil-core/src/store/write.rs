@@ -50,7 +50,7 @@ use sha2::{Digest as _, Sha256};
 use super::failpoints::FailPoints;
 use super::fsops;
 use super::git_gate::{GIT_WAIT, GitGate};
-use super::paths::{WsPath, writable};
+use super::paths::{WsPath, long_rel, reserved_on_disk, writable};
 use crate::state::{Pending, StateDb, StateError};
 use crate::workspace::Access;
 
@@ -1670,63 +1670,41 @@ impl Store {
             .map_err(|e| StoreError::io(rel, &e))
     }
 
-    /// Step 1's check against the long form of the path: the deepest existing part of it goes
-    /// through `probe.long_name`, so an 8.3 short name (`PROJEC~1`, or one set with
-    /// `SetFileShortName`) never reaches a sealed folder or the ledger. A lookup that fails, or
-    /// a long form that isn't under the workspace root, refuses the write (fail closed).
+    /// Step 1's check against the long form of the path ([`long_rel`] through
+    /// `probe.long_form`), so an 8.3 short name (`PROJEC~1`, or one set with
+    /// `SetFileShortName`) never reaches a sealed folder, the ledger or the legacy workspace
+    /// data folder. A lookup that fails, or a long form that isn't under the workspace root,
+    /// refuses the write (fail closed).
     pub(super) async fn writable_on_disk(&self, rel: &WsPath) -> Result<(), StoreError> {
-        let refuse = |why: String| StoreError::PathInvalid {
-            path: rel.as_str().to_string(),
-            why,
-        };
-        let (root, abs, probe) = (self.root.clone(), rel.abs(&self.root), self.probe.clone());
-        let long = blocking(move || {
-            let existing = abs
-                .ancestors()
-                .take_while(|p| p.starts_with(&root))
-                .find(|p| exists(p))
-                .map(Path::to_path_buf)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "the workspace is missing")
-                })?;
-            let tail = abs
-                .strip_prefix(&existing)
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            let long_root = probe.long_name(&root)?;
-            let long_existing = probe.long_name(&existing)?;
-            let (lr, le) = (
-                long_root
-                    .to_string_lossy()
-                    .trim_end_matches('\\')
-                    .to_string(),
-                long_existing.to_string_lossy().into_owned(),
-            );
-            let inside_root = le.len() >= lr.len()
-                && le.is_char_boundary(lr.len())
-                && le[..lr.len()].to_lowercase() == lr.to_lowercase()
-                && (le.len() == lr.len() || le[lr.len()..].starts_with('\\'));
-            if !inside_root {
-                return Ok(None);
-            }
-            let inside = PathBuf::from(&le[lr.len()..]).join(tail);
-            let parts: Vec<String> = inside
-                .components()
-                .filter_map(|c| match c {
-                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Some(parts.join("/")))
+        let (root, owned, probe) = (self.root.clone(), rel.clone(), self.probe.clone());
+        let long = blocking(move || Ok(long_rel(&root, &owned, &|p| probe.long_form(p))))
+            .await
+            .map_err(|e| StoreError::PathInvalid {
+                path: rel.as_str().to_string(),
+                why: format!("its long form can't be read: {e}"),
+            })??;
+        writable(&long)
+    }
+
+    /// The trash's reserved-path check ([`reserved_on_disk`]) on `rel` and on its long form
+    /// through `probe.long_form`: the trash itself, either workspace data folder, `.git` and
+    /// the ledger are refused by any name, 8.3 short names included (fail closed).
+    pub(super) async fn reserved_on_disk(
+        &self,
+        rel: &WsPath,
+        what: &'static str,
+    ) -> Result<(), StoreError> {
+        let (root, owned, probe) = (self.root.clone(), rel.clone(), self.probe.clone());
+        blocking(move || {
+            Ok(reserved_on_disk(&root, &owned, what, &|p| {
+                probe.long_form(p)
+            }))
         })
-        .await;
-        match long {
-            Ok(Some(long)) => writable(&WsPath::from_disk(long)),
-            Ok(None) => Err(refuse(
-                "its long form is not under the workspace folder".to_string(),
-            )),
-            Err(e) => Err(refuse(format!("its long form can't be read: {e}"))),
-        }
+        .await
+        .map_err(|e| StoreError::PathInvalid {
+            path: rel.as_str().to_string(),
+            why: format!("its long form can't be read: {e}"),
+        })?
     }
 
     /// CORE-035: `store.locked` for a path under an asset folder,
