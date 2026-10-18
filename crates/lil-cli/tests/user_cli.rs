@@ -213,7 +213,7 @@ fn workspace_flag_selects_registered_default() {
     std::fs::create_dir_all(&plain).unwrap();
     let out = env.lil(&["status", "--workspace", plain.to_str().unwrap()]);
     assert_eq!(out.code, 2, "{out:?}");
-    assert!(out.stderr.contains("worldwright.yaml"), "{out:?}");
+    assert!(out.stderr.contains("lilith.yaml"), "{out:?}");
 }
 
 #[test] // spec: ARCH-030, ARCH-016

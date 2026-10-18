@@ -3,7 +3,7 @@
 //! recorded in the project's `links`, and minimal-diff edits of a legacy manifest (spec
 //! ARCH-032, ARCH-044, ARCH-076, ARCH-077, CORE-019, CORE-020, CORE-023, CORE-033, CORE-047,
 //! CORE-053, CORE-148; Appendix E "Product tools", "Topics", "Manifest fields this plan
-//! writes"). Driven through the asset tools and `ww/subscribe` on a real core, and the files
+//! writes"). Driven through the asset tools and `lil/subscribe` on a real core, and the files
 //! on disk (QA-018).
 
 use std::path::{Path, PathBuf};
@@ -138,7 +138,7 @@ fn import_creates_candidate_run_with_handoff_and_uuid() {
     assert!(
         result["ref"]
             .as_str()
-            .is_some_and(|r| r.starts_with(&format!("ww://{id}/sketchbook/{KITE}@candidate/"))),
+            .is_some_and(|r| r.starts_with(&format!("lil://{id}/sketchbook/{KITE}@candidate/"))),
         "the import's ref is the first file's candidate ref: {result}"
     );
 
@@ -204,8 +204,8 @@ fn asset_topic_delivers_events_and_snapshots() {
         .unwrap_or_else(|| panic!("asset.import returned no run_id: {imported}"))
         .to_string();
 
-    let topic = format!("asset:ww://{}/sketchbook/{KITE}", env.workspace_id(&ws));
-    let subscribed = a.call("ww/subscribe", json!({"topics": [topic], "since_seq": {}}));
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", env.workspace_id(&ws));
+    let subscribed = a.call("lil/subscribe", json!({"topics": [topic], "since_seq": {}}));
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");
 
     a.tool_ok(
@@ -230,7 +230,7 @@ fn asset_topic_delivers_events_and_snapshots() {
     let mut since = serde_json::Map::new();
     since.insert(topic.clone(), json!(999));
     let subscribed = b.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": [topic], "since_seq": since}),
     );
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");

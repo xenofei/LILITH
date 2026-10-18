@@ -13,7 +13,7 @@
 //! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
-//! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.worldwright\fence\<name>` |
+//! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
 //!
 //! `test.settings`'s `settings` argument (dotted keys, or nested mappings) is plan 2b's only
@@ -31,7 +31,7 @@
 //! workspace's hint, else `sketchbook`).
 //!
 //! `test.watch_fence` is the watcher fence (Global Constraints, Tests): `RawPipe::fence` writes
-//! `<ws>\.worldwright\fence\<name>` (`<name>` is `<pid>-<n>`), then calls it, and it returns
+//! `<ws>\.lilith\fence\<name>` (`<name>` is `<pid>-<n>`), then calls it, and it returns
 //! once the workspace's index is ready and the watcher has handled that file and everything
 //! before it. It also returns while git is busy (paths deferred for git count as handled), and
 //! at once where the workspace has no folder watch.
@@ -220,7 +220,7 @@ struct TrashResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FenceArgs {
-    /// The file `<ws>\.worldwright\fence\<name>` the caller wrote first.
+    /// The file `<ws>\.lilith\fence\<name>` the caller wrote first.
     name: String,
 }
 
@@ -617,7 +617,7 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
 
     reg.register(typed_tool(
         "test.watch_fence",
-        "Test channels only: returns once the workspace's first reconcile has finished and the watcher has handled the file `.worldwright/fence/<name>` and everything before it.",
+        "Test channels only: returns once the workspace's first reconcile has finished and the watcher has handled the file `.lilith/fence/<name>` and everything before it.",
         EffectClass::Read,
         TEST_MODULE,
         |ctx, args: FenceArgs| {

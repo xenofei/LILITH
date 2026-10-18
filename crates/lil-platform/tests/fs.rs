@@ -54,8 +54,8 @@ fn set_attributes(path: &Path, attrs: u32) {
 fn replace_file_swaps_content_and_keeps_the_backup() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target.txt");
-    let temp = dir.path().join(".target.txt.ww-tmp-1-1");
-    let backup = dir.path().join(".target.txt.ww-bak-1-1");
+    let temp = dir.path().join(".target.txt.lil-tmp-1-1");
+    let backup = dir.path().join(".target.txt.lil-bak-1-1");
     write(&target, "old");
     write(&temp, "new");
     replace_file(&target, &temp, &backup).unwrap();
@@ -70,8 +70,8 @@ fn replace_file_swaps_content_and_keeps_the_backup() {
 fn replaced_file_takes_the_replacement_file_id() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target.txt");
-    let temp = dir.path().join(".target.txt.ww-tmp-1-1");
-    let backup = dir.path().join(".target.txt.ww-bak-1-1");
+    let temp = dir.path().join(".target.txt.lil-tmp-1-1");
+    let backup = dir.path().join(".target.txt.lil-bak-1-1");
     write(&target, "old");
     write(&temp, "new");
     let old = identity(&target).unwrap();
@@ -140,8 +140,8 @@ fn copy_new_refuses_an_existing_target() {
 fn held_target_is_a_sharing_violation() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target.txt");
-    let temp = dir.path().join(".target.txt.ww-tmp-1-1");
-    let backup = dir.path().join(".target.txt.ww-bak-1-1");
+    let temp = dir.path().join(".target.txt.lil-tmp-1-1");
+    let backup = dir.path().join(".target.txt.lil-bak-1-1");
     write(&target, "old");
     write(&temp, "new");
     let held = open_shared(&target, Share::Read).unwrap();
@@ -183,8 +183,8 @@ fn long_path_round_trip_past_260() {
     std::fs::create_dir_all(long_path(&deep)).unwrap();
     let target = deep.join("target.txt");
     assert_eq!(target.as_os_str().encode_wide().count(), 300);
-    let temp = deep.join(".t.ww-tmp-1-1");
-    let backup = deep.join(".t.ww-bak-1-1");
+    let temp = deep.join(".t.lil-tmp-1-1");
+    let backup = deep.join(".t.lil-bak-1-1");
     write(&target, "old");
     write(&temp, "new");
 

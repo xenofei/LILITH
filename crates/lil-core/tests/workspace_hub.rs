@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lil_core::events::EventBus;
-use lil_core::state::{IdemBegin, StateRegistry, WORKSPACE_MIGRATIONS};
+use lil_core::state::{IdemBegin, StateDb, StateRegistry, StateScope, WORKSPACE_MIGRATIONS};
 use lil_core::store::{Expect, FailPoints, StoreError, WsPath, fsops};
 use lil_core::workspace::{Access, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::SystemProbe;
+use lil_platform::names::LEGACY_WORKSPACE_DIR;
 use lil_platform::{Clock, Env};
 use lil_testkit::files::write_file;
 use lil_testkit::{FakeClock, SeqIds, TestEnv};
@@ -84,7 +85,7 @@ fn rows(path: &Path) -> Vec<(String, String, String)> {
 }
 
 fn core_lock(ws: &WorkspaceRef) -> PathBuf {
-    ws.path.join(".worldwright").join("core.lock")
+    ws.path.join(".lilith").join("core.lock")
 }
 
 /// Whether another holder could take `core.lock` now (the probe's lock is released at once).
@@ -266,11 +267,7 @@ fn read_only_open_without_a_state_db_uses_memory_and_creates_nothing() {
     );
     // Reads work.
     let yaml = rt
-        .block_on(
-            second
-                .store
-                .read(&WsPath::parse("worldwright.yaml").unwrap()),
-        )
+        .block_on(second.store.read(&WsPath::parse("lilith.yaml").unwrap()))
         .unwrap();
     assert_eq!(yaml.as_deref(), Some(&b"name: shared\n"[..]));
     rt.block_on(second.store.orphans()).unwrap();
@@ -340,7 +337,7 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
     write_file(
         &ws_path
             .join("notes")
-            .join("a.txt.ww-conflict-20261016T120000Z"),
+            .join("a.txt.lil-conflict-20261016T120000Z"),
         b"outside",
     );
     let ws = workspace_ref(&ws_path);
@@ -352,7 +349,7 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
     let (a, b) = rt.block_on(async { tokio::join!(hub.open(&ws), hub.open(&ws)) });
     let (a, b) = (a.unwrap(), b.unwrap());
     let again = rt.block_on(hub.open(&ws)).unwrap();
-    let want = [WsPath::parse("notes/a.txt.ww-conflict-20261016T120000Z").unwrap()];
+    let want = [WsPath::parse("notes/a.txt.lil-conflict-20261016T120000Z").unwrap()];
     assert_eq!(a.orphans, want);
     assert!(Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &again));
     rt.block_on(hub.open(&clean)).unwrap();
@@ -387,8 +384,182 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
     assert_eq!(event["params"]["topic"], "workspace");
     assert_eq!(
         event["params"]["data"],
-        json!({"kind": "orphans", "paths": ["notes/a.txt.ww-conflict-20261016T120000Z"]})
+        json!({"kind": "orphans", "paths": ["notes/a.txt.lil-conflict-20261016T120000Z"]})
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Both locks (plan decision D4, Review Focus 2).
+// ---------------------------------------------------------------------------------------------
+
+/// The legacy folder's `core.lock`, the one a core from before the rename takes.
+fn legacy_lock(ws: &WorkspaceRef) -> PathBuf {
+    ws.path.join(LEGACY_WORKSPACE_DIR).join("core.lock")
+}
+
+/// Takes `path` the way a core from before the rename takes its `core.lock`: the folder made
+/// if missing, then the exclusive try-lock.
+fn old_core_takes(path: &Path) -> Option<lil_platform::fs::LockedFile> {
+    fsops::ensure_dir(path.parent().unwrap()).unwrap();
+    fsops::lock_exclusive(path).unwrap()
+}
+
+/// A legacy local `state.db` for `ws` (D3) with one `generated` row.
+fn legacy_local_db(env: &TestEnv, ws: &WorkspaceRef) -> PathBuf {
+    let path = env.legacy_workspace_local_dir(&ws.path).join("state.db");
+    let db = StateDb::open(&path, StateScope::Workspace, no_fatal()).expect("the legacy db");
+    runtime()
+        .block_on(db.set_generated("notes/a.txt", "sha-a", 1))
+        .unwrap();
+    drop(db);
+    path
+}
+
+#[test] // spec: ARCH-028
+fn held_legacy_core_lock_keeps_the_new_core_read_only() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let legacy_db = legacy_local_db(&env, &ws);
+    let new_db = env
+        .env
+        .workspace_local_dir(&ws.path)
+        .unwrap()
+        .join("state.db");
+    let rt = runtime();
+
+    // An old core serves the workspace: it holds the legacy lock only.
+    let old = old_core_takes(&legacy_lock(&ws)).expect("the old core's lock");
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+    let open = rt.block_on(hub.open(&ws)).expect("the open");
+    assert_eq!(open.access, Access::ReadOnly);
+    assert!(rt.block_on(open.state.diagnostics()).unwrap().read_only);
+    // It doesn't keep the new lock it could take: a later core isn't kept out by it.
+    assert!(
+        lock_is_free(&ws),
+        "a read-only open keeps .lilith\\core.lock"
+    );
+    // Nothing is written beside the old core, and the copy-forward never ran.
+    let refused = rt
+        .block_on(open.store.write(
+            &WsPath::parse("notes/b.txt").unwrap(),
+            b"b".to_vec(),
+            Expect::New,
+        ))
+        .unwrap_err();
+    assert_eq!(refused, StoreError::ReadOnly);
+    assert!(!new_db.exists(), "the copy-forward ran with one lock held");
+    assert!(legacy_db.is_file());
+
+    // Once the old core has gone, the next open holds both and serves read-write.
+    drop(open);
+    rt.block_on(hub.close(&ws.id));
+    drop(old);
+    let open = rt.block_on(hub.open(&ws)).expect("the open");
+    assert_eq!(open.access, Access::ReadWrite);
+    assert!(!lock_is_free(&ws));
+    assert!(old_core_takes(&legacy_lock(&ws)).is_none());
+    assert!(
+        new_db.is_file(),
+        "the copy-forward runs once both locks are held"
+    );
+}
+
+#[test] // spec: ARCH-028
+fn old_name_core_starting_second_cannot_take_the_legacy_lock() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let rt = runtime();
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+
+    // The new core serves first.
+    let open = rt.block_on(hub.open(&ws)).expect("the open");
+    assert_eq!(open.access, Access::ReadWrite);
+    assert!(
+        legacy_lock(&ws).is_file(),
+        "the legacy lock file was not created"
+    );
+    // An old core starting now gets nothing, so it would serve read-only.
+    assert!(
+        old_core_takes(&legacy_lock(&ws)).is_none(),
+        "an old core took the legacy lock while the new core serves"
+    );
+    assert!(!lock_is_free(&ws));
+
+    // The close releases both.
+    drop(open);
+    rt.block_on(hub.close(&ws.id));
+    assert!(lock_is_free(&ws));
+    assert!(old_core_takes(&legacy_lock(&ws)).is_some());
+}
+
+#[test] // spec: ARCH-028
+fn no_legacy_folder_means_no_legacy_lock() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("no folder"));
+    let rt = runtime();
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+    let open = rt.block_on(hub.open(&ws)).expect("the open");
+    assert_eq!(open.access, Access::ReadWrite);
+    assert!(core_lock(&ws).is_file());
+    assert!(
+        !ws.path.join(LEGACY_WORKSPACE_DIR).exists(),
+        "the legacy folder was created"
+    );
+    drop(open);
+    rt.block_on(hub.close(&ws.id));
+    assert!(!ws.path.join(LEGACY_WORKSPACE_DIR).exists());
+}
+
+/// B3's copy-forward runs only once both locks are held (D4): with either one held by
+/// someone else the open is read-only, and nothing is copied or kept locked.
+#[test] // spec: ARCH-028
+fn copy_forward_never_runs_while_only_one_lock_is_held() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let legacy_db = legacy_local_db(&env, &ws);
+    let legacy_hash = lil_testkit::sha256_file(&legacy_db);
+    let new_dir = env.env.workspace_local_dir(&ws.path).unwrap();
+    let rt = runtime();
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+
+    for held in [core_lock(&ws), legacy_lock(&ws)] {
+        let other = old_core_takes(&held).expect("the other holder's lock");
+        let open = rt.block_on(hub.open(&ws)).expect("the open");
+        assert_eq!(open.access, Access::ReadOnly, "{}", held.display());
+        assert!(
+            !new_dir.join("state.db").exists(),
+            "copied forward while {} was held elsewhere",
+            held.display()
+        );
+        // The lock this core could take is not kept.
+        let free = if held == core_lock(&ws) {
+            legacy_lock(&ws)
+        } else {
+            core_lock(&ws)
+        };
+        assert!(
+            fsops::lock_exclusive(&free).unwrap().is_some(),
+            "{} is kept by a read-only open",
+            free.display()
+        );
+        drop(open);
+        rt.block_on(hub.close(&ws.id));
+        drop(other);
+    }
+    assert_eq!(lil_testkit::sha256_file(&legacy_db), legacy_hash);
+
+    // Both free: the open holds both, and only then copies forward.
+    let open = rt.block_on(hub.open(&ws)).expect("the open");
+    assert_eq!(open.access, Access::ReadWrite);
+    assert!(new_dir.join("state.db").is_file());
+    assert_eq!(lil_testkit::sha256_file(&legacy_db), legacy_hash);
 }
 
 // ---------------------------------------------------------------------------------------------

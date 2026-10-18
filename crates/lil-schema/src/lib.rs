@@ -1,10 +1,10 @@
 //! Workspace-format types (lossless round-trip; `docs/reference/workspace-format.md`), link
-//! syntax and `ww://` refs, and schema generation (ARCH-110).
+//! syntax and `lil://` refs, and schema generation (ARCH-110).
 //!
 //! Platform-neutral: this crate has no Qt or Windows dependencies (ARCH-111, QA-027).
 //!
 //! - [`manifest`]: asset manifests as an ordered map with typed views (ARCH-076, CORE-148);
-//! - [`refs`], [`version`], [`content_hash`]: links, `ww://` refs and content hashes (ARCH-042,
+//! - [`refs`], [`version`], [`content_hash`]: links, `lil://` refs and content hashes (ARCH-042,
 //!   CORE-031, CORE-047);
 //! - [`status`]: the status machine (CORE-048);
 //! - [`paths`]: workspace-relative path rules (CORE-040);
@@ -30,7 +30,7 @@ pub use manifest::{
     PinnedInput, SchemaWarning, SignedOff, bare_sha256, hash_value, remove_key,
 };
 pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};
-pub use refs::{AssetRef, LinkRef, is_asset_id, is_run_id, is_slug};
+pub use refs::{AssetRef, LEGACY_SCHEME, LinkRef, SCHEME, is_asset_id, is_run_id, is_slug};
 pub use status::{Status, StatusEvent, Transition, transition};
 pub use suite::{SUITE_STATE_SCHEMA, SuiteToml, WorkspaceEntry};
 pub use version::{Bump, Version};

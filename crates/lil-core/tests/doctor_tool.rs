@@ -38,7 +38,7 @@ const CHECK_IDS: [&str; 12] = [
 
 /// The five `.gitignore` entries (Global Constraints, CORE-040).
 const GITIGNORE: [&str; 5] = [
-    ".worldwright/",
+    ".lilith/",
     ".trash/",
     "inbox/*",
     "projects/*/assets/*/candidates/",
@@ -257,6 +257,47 @@ fn doctor_sets_git_config_and_gitignore_then_changes_nothing() {
     for (path, before) in watched.iter().zip(&hashes) {
         assert_eq!(&sha256_file(path), before, "{} changed", path.display());
     }
+}
+
+#[test] // spec: CORE-040
+fn doctor_reports_a_missing_lilith_gitignore_line() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
+    let env = TestEnv::new();
+    let ws = env.make_legacy_workspace("plugin era");
+    // The `.gitignore` a workspace from before the rename has: the legacy folder's line.
+    let legacy_line = format!("{LEGACY_WORKSPACE_DIR}/");
+    let mut old = vec![legacy_line.clone()];
+    old.extend(GITIGNORE[1..].iter().map(|l| (*l).to_string()));
+    write_file(
+        &ws.join(".gitignore"),
+        format!("{}\n", old.join("\n")).as_bytes(),
+    );
+    let before = sha256_file(&ws.join(".gitignore"));
+    env.register_workspace(&ws, true);
+    let _core = core(&env);
+    let mut pipe = session(&env, &ws);
+
+    // Reported, never fixed without being asked.
+    let checks = doctor(&mut pipe, false);
+    let (state, detail) = check(&checks, "gitignore.entries");
+    assert_eq!(state, "problem", "{detail}");
+    assert!(detail.contains(".lilith/"), "{detail}");
+    assert!(!detail.contains(&legacy_line), "{detail}");
+    assert_eq!(sha256_file(&ws.join(".gitignore")), before);
+
+    // Asked to fix, it adds the line and keeps the legacy one.
+    let checks = doctor(&mut pipe, true);
+    assert_eq!(check(&checks, "gitignore.entries").0, "fixed");
+    let ignored = lines_of(&ws.join(".gitignore"));
+    assert_eq!(ignored[0], legacy_line, "{ignored:?}");
+    assert!(ignored.iter().any(|l| l == ".lilith/"), "{ignored:?}");
+    let checks = doctor(&mut pipe, false);
+    assert_eq!(
+        check(&checks, "gitignore.entries"),
+        ("ok", ".gitignore has its LILITH entries")
+    );
+    assert!(ws.join(LEGACY_WORKSPACE_FILE).is_file());
+    assert!(!ws.join(WORKSPACE_FILE).exists());
 }
 
 #[test] // spec: CORE-040

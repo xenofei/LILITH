@@ -17,7 +17,7 @@
 //! `DirWatcher` issues no read ([`DirWatcher::hold`]), so a burst larger than its buffer comes
 //! as one overflow, and an overflow is a full rescan. Each batch:
 //! 1. maps every path ([`reconcile::map_notify_path`]: 8.3 short names resolved, an
-//!    unresolvable one reconciles its folder) and drops what isn't watched (of `.worldwright\`
+//!    unresolvable one reconciles its folder) and drops what isn't watched (of `.lilith\`
 //!    only `fence\`, of `.git\` only `index.lock` and `HEAD`, and never `.trash\`);
 //! 2. notes git activity, which pauses the store's writes (below);
 //! 3. while git works, defers every path to the post-git rescan; otherwise has the index
@@ -60,8 +60,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use lil_platform::names::WORKSPACE_DIR;
 use lil_platform::watcher::{DirChange, DirWatcher};
-use lil_schema::Manifest;
+use lil_schema::{Manifest, SCHEME};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc::UnboundedReceiver, watch};
 use tokio::time::Instant;
@@ -103,7 +104,7 @@ impl Default for WatchConfig {
 pub struct NotifyReport {
     /// Reconciled (or, while git works, deferred to the post-git rescan).
     pub reconciled: Vec<String>,
-    /// Not watched: `.worldwright/`, `.trash/`, `.git/`.
+    /// Not watched: the workspace data folders, `.trash/`, `.git/`.
     pub ignored: Vec<String>,
 }
 
@@ -156,7 +157,7 @@ struct Shared {
     store: Arc<Store>,
     index: Arc<Index>,
     events: Arc<EventBus>,
-    /// The workspace id, for the `asset:ww://<id>/<project>/<asset_id>` topics.
+    /// The workspace id, for the `asset:lil://<id>/<project>/<asset_id>` topics.
     ws_id: String,
     cfg: WatchConfig,
     /// The workspace folder's long form, for resolving 8.3 names.
@@ -418,7 +419,7 @@ impl Watcher {
     }
 
     /// Returns once the workspace's first reconcile has finished and the watcher has handled
-    /// `.worldwright/fence/<name>` and everything before it, deferred removals included. It
+    /// `.lilith/fence/<name>` and everything before it, deferred removals included. It
     /// also returns while git works (a path deferred for git counts as handled), and at once
     /// without a `DirWatcher`.
     pub async fn fence(&self, name: &str) {
@@ -563,7 +564,7 @@ impl Shared {
 
     fn asset_topic(&self, path: &WsPath) -> Option<String> {
         let (project, asset) = asset_of(path.as_str())?;
-        Some(format!("asset:ww://{}/{project}/{asset}", self.ws_id))
+        Some(format!("asset:{SCHEME}{}/{project}/{asset}", self.ws_id))
     }
 
     /// `path` relative to its asset folder (`v1.0.0/x.png`), as `human_edits` names it.
@@ -789,9 +790,9 @@ impl Shared {
         (report, decided)
     }
 
-    /// Marks every fence file in `.worldwright/fence/` handled (test fences, QA-031).
+    /// Marks every fence file in `.lilith/fence/` handled (test fences, QA-031).
     fn seed_fences(&self) {
-        let fence_dir = self.store.root().join(".worldwright").join("fence");
+        let fence_dir = self.store.root().join(WORKSPACE_DIR).join("fence");
         if let Ok(entries) = std::fs::read_dir(&fence_dir) {
             let names: Vec<String> = entries
                 .flatten()

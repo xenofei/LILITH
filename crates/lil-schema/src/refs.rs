@@ -3,10 +3,14 @@
 //! - Manifest link forms ([`LinkRef`]): `<asset_id>@<v>`, `proj:<slug>/<asset_id>@<v>`,
 //!   `lib:<item>@<v>` and `style@<n>`.
 //! - Canonical refs ([`AssetRef`]): a sealed version
-//!   `ww://<workspace id>/<project>/<asset_id>@<major.minor.patch>`, optionally followed by
+//!   `lil://<workspace id>/<project>/<asset_id>@<major.minor.patch>`, optionally followed by
 //!   `#sha256=<64 hex>`, and a candidate
-//!   `ww://<workspace id>/<project>/<asset_id>@candidate/<run_id>/<file>`, which is for viewing
+//!   `lil://<workspace id>/<project>/<asset_id>@candidate/<run_id>/<file>`, which is for viewing
 //!   and provenance only, never a live link or a recipe input.
+//!
+//! Refs are always written with [`SCHEME`] (`lil://`). For one release (R4) the parser also
+//! accepts [`LEGACY_SCHEME`] and reads it as the same ref; this crate depends on no other
+//! crate (QA-027), so that one legacy name lives here rather than in `lil_platform::names`.
 //!
 //! Name rules: a project slug matches `^[a-z0-9][a-z0-9-]{0,62}$`, an asset id
 //! `^[a-z][a-z0-9_]{0,62}$` and a run id `^r_\d{8}_\d{4}(_\d+)?$`. A workspace id is the
@@ -16,6 +20,11 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::version::Version;
+
+/// The scheme every ref is written with (map row 20).
+pub const SCHEME: &str = "lil://";
+/// The scheme before the rename: parsed as the same ref, never written (R4).
+pub const LEGACY_SCHEME: &str = "ww://";
 
 /// A link as written in a manifest's `inputs`, `pinned_inputs` and recipe steps (I6).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -34,7 +43,7 @@ pub enum LinkRef {
     Style(u32),
 }
 
-/// A canonical `ww://` reference.
+/// A canonical `lil://` reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssetRef {
     /// A sealed version; `sha256` is the version's content hash (bare hex), when carried.
@@ -197,9 +206,12 @@ impl FromStr for AssetRef {
     type Err = String;
 
     fn from_str(s: &str) -> Result<AssetRef, String> {
-        let invalid = |why: &str| format!("`{s}` is not a ww:// ref: {why}");
-        let Some(rest) = s.strip_prefix("ww://") else {
-            return Err(invalid("it must start with `ww://`"));
+        let invalid = |why: &str| format!("`{s}` is not a lil:// ref: {why}");
+        let Some(rest) = s
+            .strip_prefix(SCHEME)
+            .or_else(|| s.strip_prefix(LEGACY_SCHEME))
+        else {
+            return Err(invalid("it must start with `lil://`"));
         };
         let (body, fragment) = match rest.split_once('#') {
             Some((body, fragment)) => (body, Some(fragment)),
@@ -278,7 +290,7 @@ impl fmt::Display for AssetRef {
                 version,
                 sha256,
             } => {
-                write!(f, "ww://{ws}/{project}/{asset}@{version}")?;
+                write!(f, "{SCHEME}{ws}/{project}/{asset}@{version}")?;
                 if let Some(hex) = sha256 {
                     write!(f, "#sha256={hex}")?;
                 }
@@ -290,7 +302,7 @@ impl fmt::Display for AssetRef {
                 asset,
                 run,
                 file,
-            } => write!(f, "ww://{ws}/{project}/{asset}@candidate/{run}/{file}"),
+            } => write!(f, "{SCHEME}{ws}/{project}/{asset}@candidate/{run}/{file}"),
         }
     }
 }
@@ -305,7 +317,7 @@ impl AssetRef {
         | AssetRef::Candidate {
             ws, project, asset, ..
         }) = self;
-        format!("asset:ww://{ws}/{project}/{asset}")
+        format!("asset:{SCHEME}{ws}/{project}/{asset}")
     }
 }
 
@@ -361,7 +373,7 @@ mod tests {
 
     #[test] // spec: ARCH-042, CORE-047, ARCH-044
     fn asset_ref_with_hash_round_trips_and_names_its_live_topic() {
-        let text = format!("ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={HEX}");
+        let text = format!("lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={HEX}");
         let r: AssetRef = text.parse().unwrap();
         assert_eq!(
             r,
@@ -376,23 +388,23 @@ mod tests {
         assert_eq!(r.to_string(), text);
         assert_eq!(
             r.live_topic(),
-            "asset:ww://0123456789abcdef/sketchbook/chr_paper_crane"
+            "asset:lil://0123456789abcdef/sketchbook/chr_paper_crane"
         );
 
-        let bare: AssetRef = "ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0"
+        let bare: AssetRef = "lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0"
             .parse()
             .unwrap();
         assert!(matches!(&bare, AssetRef::Sealed { sha256: None, .. }));
         assert_eq!(
             bare.to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0"
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0"
         );
         assert_eq!(bare.live_topic(), r.live_topic());
     }
 
     #[test] // spec: ARCH-042, CORE-031
     fn candidate_ref_is_view_only_form() {
-        let text = "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/crane_c.png";
+        let text = "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/crane_c.png";
         let r: AssetRef = text.parse().unwrap();
         assert_eq!(
             r,
@@ -407,17 +419,17 @@ mod tests {
         assert_eq!(r.to_string(), text);
         assert_eq!(
             r.live_topic(),
-            "asset:ww://0123456789abcdef/sketchbook/chr_paper_crane"
+            "asset:lil://0123456789abcdef/sketchbook/chr_paper_crane"
         );
         // A suffixed run id is fine; a candidate never carries a hash.
         assert!(
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400_2/a.png"
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400_2/a.png"
                 .parse::<AssetRef>()
                 .is_ok()
         );
         assert!(
             format!(
-                "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/a.png#sha256={HEX}"
+                "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/a.png#sha256={HEX}"
             )
             .parse::<AssetRef>()
             .is_err()
@@ -434,35 +446,35 @@ mod tests {
     fn bad_refs_are_rejected() {
         let hex63 = &HEX[..63];
         let bad_asset_refs = [
-            "ww://0123456789abcdef/Sketchbook/chr_paper_crane@1.0.0".to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0".to_string(),
-            format!("ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={hex63}"),
-            format!("ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={HEX}0"),
+            "lil://0123456789abcdef/Sketchbook/chr_paper_crane@1.0.0".to_string(),
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0".to_string(),
+            format!("lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={hex63}"),
+            format!("lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={HEX}0"),
             format!(
-                "ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={}",
+                "lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={}",
                 HEX.to_uppercase()
             ),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#md5=00".to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane".to_string(),
-            "ww://0123456789ABCDEF/sketchbook/chr_paper_crane@1.0.0".to_string(),
-            "ww://0123/sketchbook/chr_paper_crane@1.0.0".to_string(),
-            "ww://0123456789abcdef/sketchbook/Chr_paper_crane@1.0.0".to_string(),
-            "ww://0123456789abcdef/sketchbook/1chr@1.0.0".to_string(),
-            "ww://0123456789abcdef/-sketchbook/chr_paper_crane@1.0.0".to_string(),
-            "ww://0123456789abcdef/sketchbook/extra/chr_paper_crane@1.0.0".to_string(),
-            "ww:/0123456789abcdef/sketchbook/chr_paper_crane@1.0.0".to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/run1/a.png".to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/"
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#md5=00".to_string(),
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane".to_string(),
+            "lil://0123456789ABCDEF/sketchbook/chr_paper_crane@1.0.0".to_string(),
+            "lil://0123/sketchbook/chr_paper_crane@1.0.0".to_string(),
+            "lil://0123456789abcdef/sketchbook/Chr_paper_crane@1.0.0".to_string(),
+            "lil://0123456789abcdef/sketchbook/1chr@1.0.0".to_string(),
+            "lil://0123456789abcdef/-sketchbook/chr_paper_crane@1.0.0".to_string(),
+            "lil://0123456789abcdef/sketchbook/extra/chr_paper_crane@1.0.0".to_string(),
+            "lil:/0123456789abcdef/sketchbook/chr_paper_crane@1.0.0".to_string(),
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/run1/a.png".to_string(),
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/"
                 .to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/../x"
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/../x"
                 .to_string(),
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/con.png"
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/con.png"
                 .to_string(),
             // `#` is refused in candidate file names (it only starts the sealed hash).
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/a#b.png"
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/a#b.png"
                 .to_string(),
             // Ruling Q7: no leading zeros.
-            "ww://0123456789abcdef/sketchbook/chr_paper_crane@01.0.0".to_string(),
+            "lil://0123456789abcdef/sketchbook/chr_paper_crane@01.0.0".to_string(),
         ];
         for text in &bad_asset_refs {
             assert!(text.parse::<AssetRef>().is_err(), "{text} parsed");
@@ -506,5 +518,57 @@ mod tests {
         assert!(!is_run_id("r_2026100_1400"));
         assert!(!is_run_id("R_20261003_1400"));
         assert!(!is_run_id("r_20261003_1400_x"));
+    }
+
+    /// The bodies of a sealed ref with and without its hash, and of a candidate ref.
+    fn ref_bodies() -> [String; 3] {
+        [
+            format!("0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256={HEX}"),
+            "0123456789abcdef/sketchbook/chr_paper_crane@1.0.0".to_string(),
+            "0123456789abcdef/sketchbook/chr_paper_crane@candidate/r_20261003_1400/a.png"
+                .to_string(),
+        ]
+    }
+
+    #[test] // spec: ARCH-042
+    fn legacy_ww_ref_parses_to_the_same_ref() {
+        for body in ref_bodies() {
+            let new: AssetRef = format!("{SCHEME}{body}").parse().unwrap();
+            let legacy: AssetRef = format!("{LEGACY_SCHEME}{body}").parse().unwrap();
+            assert_eq!(legacy, new, "{body}");
+        }
+        // The legacy scheme gets no laxer rules: a bad body is still refused.
+        for bad in [
+            "0123456789ABCDEF/sketchbook/chr_paper_crane@1.0.0",
+            "0123456789abcdef/sketchbook/chr_paper_crane",
+        ] {
+            assert!(format!("{LEGACY_SCHEME}{bad}").parse::<AssetRef>().is_err());
+        }
+        // Only the two schemes are refs.
+        assert!(
+            "lilith://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0"
+                .parse::<AssetRef>()
+                .is_err()
+        );
+    }
+
+    #[test] // spec: ARCH-042
+    fn refs_display_with_lil_scheme() {
+        assert_eq!(SCHEME, "lil://");
+        for body in ref_bodies() {
+            let legacy: AssetRef = format!("{LEGACY_SCHEME}{body}").parse().unwrap();
+            assert_eq!(legacy.to_string(), format!("lil://{body}"));
+        }
+    }
+
+    #[test] // spec: ARCH-044
+    fn topic_of_a_legacy_ref_uses_lil() {
+        for body in ref_bodies() {
+            let legacy: AssetRef = format!("{LEGACY_SCHEME}{body}").parse().unwrap();
+            assert_eq!(
+                legacy.live_topic(),
+                "asset:lil://0123456789abcdef/sketchbook/chr_paper_crane"
+            );
+        }
     }
 }

@@ -17,10 +17,10 @@
 //! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `core/drain` replies
 //!   `{"status":"ok","draining":true}` and begins a requested drain. `tools/list` and
 //!   `tools/call` go to the [`Dispatcher`] (the `tools` module; a draining core answers new
-//!   calls with `core.draining`); `ww/subscribe` and `ww/unsubscribe` go to the [`EventBus`];
+//!   calls with `core.draining`); `lil/subscribe` and `lil/unsubscribe` go to the [`EventBus`];
 //!   `app/*` is refused with `caller.not_allowed` for anyone but a verified `ui:*` caller, and
 //!   is -32601 for one, since plan 2 defines no `app/*` method (ARCH-031, APP-040).
-//!   `core/drain` and `ww/*` run on the connection's reader ([`Router::runs_inline`]): they
+//!   `core/drain` and `lil/*` run on the connection's reader ([`Router::runs_inline`]): they
 //!   are cheap and take no in-flight permit, so they are not refused or delayed for want of
 //!   one. Reading stays in order, though: one read after a request that waits for a permit
 //!   (the connection has [`crate::MAX_IN_FLIGHT_PER_CONN`] requests running) waits with it. A
@@ -36,7 +36,7 @@
 //! **Events** (ARCH-032). A connection is attached to the event bus (its forwarder started on
 //! the connection's outbound channel) when its session is established, and dropped from it in
 //! [`Router::closed`]. `closed` drops the client under the connection-map lock; a
-//! `ww/subscribe` awaits the bus (its snapshots read the workspace) with no lock held, then
+//! `lil/subscribe` awaits the bus (its snapshots read the workspace) with no lock held, then
 //! checks the map under the lock and drops the client again if its connection closed
 //! meanwhile, so it cannot leave a forgotten client in the bus. A topic that is not a valid name, or a
 //! `since_seq` cursor for a topic not in `topics`, is -32602; the results are
@@ -465,7 +465,7 @@ impl RpcRouter {
         None
     }
 
-    /// `ww/subscribe` (ARCH-032). The bus is awaited with no connection lock held (its
+    /// `lil/subscribe` (ARCH-032). The bus is awaited with no connection lock held (its
     /// snapshots read the workspace); a connection that closed meanwhile is dropped from the
     /// bus again under the map lock, so no forgotten client stays behind.
     async fn subscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
@@ -507,7 +507,7 @@ impl RpcRouter {
         outcome(id, Outcome::Ok(SubscribeResult { topics }))
     }
 
-    /// `ww/unsubscribe` (ARCH-032).
+    /// `lil/unsubscribe` (ARCH-032).
     fn unsubscribe(&self, conn: &ConnCtx, id: Id, params: Option<Value>) -> Response {
         let p: UnsubscribeParams = match parse_params(params).and_then(|p: UnsubscribeParams| {
             check_topics(&p.topics)?;
@@ -662,7 +662,7 @@ impl Router for RpcRouter {
     }
 
     fn runs_inline(&self, req: &Request) -> bool {
-        req.method == method::DRAIN || req.method.starts_with("ww/")
+        req.method == method::DRAIN || req.method.starts_with(method::PREFIX)
     }
 
     fn handle<'a>(
@@ -819,7 +819,7 @@ mod panic_tests {
         assert_eq!(lifecycle.connections(), 1);
         assert_eq!(events.clients(), 1);
 
-        // `ww/subscribe` runs on the reader; its panic ends the connection, and `closed` still
+        // `lil/subscribe` runs on the reader; its panic ends the connection, and `closed` still
         // runs: the connection stops counting and leaves the event bus.
         pipe.send_line(
             &json!({

@@ -65,8 +65,8 @@ use lil_protocol::codes::{
 };
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
-    AssetRef, Bump, LinkRef, Manifest, Status, StatusEvent, YamlEdit, bare_sha256, hash_value,
-    is_asset_id, is_slug, transition,
+    AssetRef, Bump, LinkRef, Manifest, SCHEME, Status, StatusEvent, YamlEdit, bare_sha256,
+    hash_value, is_asset_id, is_slug, transition,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,7 @@ const REQUEST_SIGNOFF_DESCRIPTION: &str = "Flag an asset for sign-off: its statu
 
 const PIN_INPUT_DESCRIPTION: &str = "Pin an input of an asset, so a newer version of it \
     doesn't make the asset stale: ref is a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, \
-    lib:<item>@<v>, style@<n>) or a ww:// ref to a sealed version; its target need not exist \
+    lib:<item>@<v>, style@<n>) or a lil:// ref to a sealed version; its target need not exist \
     on this machine. A proj: or lib: source is added to the project's links.";
 
 // ---------------------------------------------------------------------------------------------
@@ -636,7 +636,7 @@ async fn link_external(
     );
     Ok((
         ImportResult {
-            r#ref: format!("ww://{}/{}/{}", a.open.ws.id, a.project, a.asset_id),
+            r#ref: format!("{SCHEME}{}/{}/{}", a.open.ws.id, a.project, a.asset_id),
             run_id: None,
             handoff: HandOff::default(),
             files: untrusted(&names),
@@ -1149,7 +1149,7 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
         let mut e = ErrorBody::new(
             &REF_INVALID,
             "ref is not a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, lib:<item>@<v>, \
-             style@<n>) or a ww:// ref to a sealed version",
+             style@<n>) or a lil:// ref to a sealed version",
             ctx.trace_id.clone(),
         );
         e.data = Some(json!({ "ref": args.r#ref }));

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lil_platform::fs::{RetryClass, classify};
+use lil_platform::names::{CONFLICT_MARKER, LEGACY_CONFLICT_MARKER, is_workspace_dir};
 use lil_schema::{Manifest, ManifestView, Version};
 use serde_json::{Map, Value};
 
@@ -119,9 +120,10 @@ pub(super) fn version_folder(name: &str) -> Option<Version> {
     name.strip_prefix(['v', 'V'])?.parse().ok()
 }
 
-/// Every `*.ww-conflict-*` file under `start` (the workspace `root`, or a folder in it),
-/// skipping `.git`, and the root's `.trash` and `.worldwright`, and never following a link. A
-/// `start` that doesn't exist holds none.
+/// Every conflict copy (`*.lil-conflict-*`, or one with the legacy [`LEGACY_CONFLICT_MARKER`])
+/// under `start` (the workspace `root`, or a folder in it), skipping `.git`, and the root's
+/// `.trash` and both workspace data folders ([`is_workspace_dir`]), and never following a
+/// link. A `start` that doesn't exist holds none.
 fn conflict_files(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut folders = vec![start.to_path_buf()];
@@ -140,11 +142,13 @@ fn conflict_files(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
                 let skip = entry.name.eq_ignore_ascii_case(".git")
                     || (at_root
                         && (entry.name.eq_ignore_ascii_case(".trash")
-                            || entry.name.eq_ignore_ascii_case(".worldwright")));
+                            || is_workspace_dir(&entry.name)));
                 if !skip {
                     folders.push(entry.path);
                 }
-            } else if entry.name.contains(".ww-conflict-") {
+            } else if entry.name.contains(CONFLICT_MARKER)
+                || entry.name.contains(LEGACY_CONFLICT_MARKER)
+            {
                 found.push(entry.path);
             }
         }
@@ -332,7 +336,7 @@ impl Store {
     ///   neither the manifest's `approved_version` nor a run's `signed_off.version`;
     /// - non-empty staging handles and `seal-*` folders that aren't this store's own (a dead
     ///   core's, at a read-write open);
-    /// - `*.ww-conflict-*` files.
+    /// - conflict copies, `*.lil-conflict-*` and legacy ones.
     ///
     /// # Errors
     /// `store.io` when the workspace can't be listed.
@@ -362,7 +366,7 @@ impl Store {
     }
 
     /// [`Store::orphans`] of one project, sorted: the orphan run folders and sealed versions of
-    /// `projects/<project>/assets/*`, and the `*.ww-conflict-*` files under
+    /// `projects/<project>/assets/*`, and the `*.lil-conflict-*` files under
     /// `projects/<project>/`. Only that folder is walked (`project.status`); staging handles
     /// and conflict files elsewhere are not the project's. A project folder that doesn't exist
     /// has none.

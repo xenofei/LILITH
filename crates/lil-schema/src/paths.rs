@@ -201,7 +201,7 @@ mod tests {
         for fine in [
             "projects/sketchbook/assets/chr_paper_crane/v1.0.0/crane_b.png",
             ".gitignore",
-            ".worldwright/state.json",
+            ".lilith/state.json",
             "a b/c d.txt",
             "x..y",
         ] {

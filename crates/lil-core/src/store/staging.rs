@@ -1,24 +1,29 @@
 //! Staging handles (ARCH-080, ARCH-033, CORE-003): the write areas the store issues to
-//! engines and converters, `<ws>\.worldwright\staging\<sh_16hex>\`. They are inside the
+//! engines and converters, `<ws>\.lilith\staging\<sh_16hex>\`. They are inside the
 //! workspace, so ingest is a rename on one volume, and the watcher never looks there.
 //!
 //! The handles this store issued and hasn't released are *live*. At a read-write open, under
 //! `core.lock`, every other handle (and every `seal-*` folder, Task 9's sealing area) belongs
 //! to a dead core: [`Store::sweep_staging`] removes the empty ones (empty folders only, which
 //! the CORE-110 scan allows) and returns the rest for the orphan list.
+//!
+//! The legacy workspace data folder's staging folder (`names::LEGACY_WORKSPACE_DIR`, R4) is
+//! only read: its non-empty entries are listed as orphans at a read-write open, and nothing in
+//! it is ever moved or deleted. New handles are made only under `.lilith\`.
 
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use lil_platform::fs::{RetryClass, classify};
+use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
 
 use super::fsops;
 use super::paths::WsPath;
 use super::write::{Seen, Store, StoreError, blocking};
 
 /// The staging folder, workspace-relative.
-pub const STAGING_DIR: &str = ".worldwright/staging";
+pub const STAGING_DIR: &str = ".lilith/staging";
 /// The prefix of a sealing folder in the staging folder (`seal-<sh_…>`).
 pub const SEAL_PREFIX: &str = "seal-";
 
@@ -66,9 +71,14 @@ fn entries(dir: &Path) -> io::Result<Vec<Entry>> {
 }
 
 impl Store {
-    /// `<root>\.worldwright\staging`.
+    /// `<root>\.lilith\staging`.
     pub(super) fn staging_root(&self) -> PathBuf {
-        self.root().join(".worldwright").join("staging")
+        self.root().join(WORKSPACE_DIR).join("staging")
+    }
+
+    /// The legacy staging folder, `<root>\<LEGACY_WORKSPACE_DIR>\staging`: only ever listed.
+    fn legacy_staging_root(&self) -> PathBuf {
+        self.root().join(LEGACY_WORKSPACE_DIR).join("staging")
     }
 
     /// Whether the staging entry `name` is one of this store's live handles (or its sealing
@@ -88,7 +98,7 @@ impl Store {
         WsPath::from_disk(format!("{STAGING_DIR}/{name}"))
     }
 
-    /// A new, empty staging handle `<ws>\.worldwright\staging\sh_<16 hex>\` (a folder that
+    /// A new, empty staging handle `<ws>\.lilith\staging\sh_<16 hex>\` (a folder that
     /// didn't exist), live until [`Store::release_handle`].
     ///
     /// # Errors
@@ -315,8 +325,9 @@ impl Store {
     }
 
     /// The staging orphans: entries that aren't live and are non-empty, or are `seal-*`
-    /// folders. A read-only store lists none: it can't tell the serving core's live handles
-    /// from a dead core's.
+    /// folders, and the non-empty entries of the legacy staging folder (R4: listed, never
+    /// moved or deleted). A read-only store lists none: it can't tell the serving core's live
+    /// handles from a dead core's.
     pub(super) async fn staging_orphans(&self) -> Result<Vec<WsPath>, StoreError> {
         if self.writable_store().is_err() {
             return Ok(Vec::new());
@@ -325,11 +336,23 @@ impl Store {
         let found = blocking(move || entries(&root))
             .await
             .map_err(|e| StoreError::io(&WsPath::from_disk(STAGING_DIR.to_string()), &e))?;
-        Ok(found
+        let mut orphans: Vec<WsPath> = found
             .into_iter()
             .filter(|e| !self.is_live(&e.name))
             .filter(|e| !e.empty_folder || e.name.starts_with(SEAL_PREFIX))
             .map(|e| Store::staging_rel(&e.name))
-            .collect())
+            .collect();
+        let legacy_rel = format!("{LEGACY_WORKSPACE_DIR}/staging");
+        let legacy = self.legacy_staging_root();
+        let found = blocking(move || entries(&legacy))
+            .await
+            .map_err(move |e| StoreError::io(&WsPath::from_disk(legacy_rel), &e))?;
+        orphans.extend(
+            found
+                .into_iter()
+                .filter(|e| !e.empty_folder)
+                .map(|e| WsPath::from_disk(format!("{LEGACY_WORKSPACE_DIR}/staging/{}", e.name))),
+        );
+        Ok(orphans)
     }
 }

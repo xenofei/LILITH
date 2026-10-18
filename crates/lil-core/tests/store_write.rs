@@ -110,15 +110,15 @@ impl Ws {
     fn leftovers(&self, rel_dir: &str) -> Vec<String> {
         self.names(rel_dir)
             .into_iter()
-            .filter(|n| n.contains(".ww-tmp-") || n.contains(".ww-bak-"))
+            .filter(|n| n.contains(".lil-tmp-") || n.contains(".lil-bak-"))
             .collect()
     }
 
-    /// The `<name>.ww-conflict-*` files in `rel_dir`.
+    /// The `<name>.lil-conflict-*` files in `rel_dir`.
     fn conflicts(&self, rel_dir: &str) -> Vec<String> {
         self.names(rel_dir)
             .into_iter()
-            .filter(|n| n.contains(".ww-conflict-"))
+            .filter(|n| n.contains(".lil-conflict-"))
             .collect()
     }
 }
@@ -328,7 +328,7 @@ async fn put_back_held_past_budget_names_the_backup_and_recovers() {
     assert!(kept.is_empty(), "{kept:?}");
     assert_eq!(path.as_str(), "notes/a.txt");
     assert!(
-        backup.as_str().starts_with("notes/.a.txt.ww-bak-"),
+        backup.as_str().starts_with("notes/.a.txt.lil-bak-"),
         "{backup}"
     );
     assert_eq!(
@@ -404,7 +404,7 @@ async fn crash_after_replace_keeps_outside_edit_visible() {
     let conflicts = ws.conflicts("notes");
     assert_eq!(conflicts.len(), 1, "{conflicts:?}");
     let stamp = lil_schema::time::compact(utc_secs(&ws));
-    assert_eq!(conflicts[0], format!("a.txt.ww-conflict-{stamp}"));
+    assert_eq!(conflicts[0], format!("a.txt.lil-conflict-{stamp}"));
     assert_eq!(ws.read(&format!("notes/{}", conflicts[0])), b"v2");
     assert_eq!(
         report.conflicts_kept,
@@ -762,7 +762,7 @@ async fn deep_workspace_past_260_chars_writes_through_long_paths() {
     }
     let target = root.join("notes").join("deep.txt");
     assert_eq!(units(&target), 320, "{}", target.display());
-    write_file(&root.join("worldwright.yaml"), b"name: deep\n");
+    write_file(&root.join("lilith.yaml"), b"name: deep\n");
     let ws = Ws::at(env, root);
     let store = ws.plain();
 
@@ -878,15 +878,15 @@ async fn fallback_crash_between_renames_is_restored_by_recover() {
 }
 
 /// What a real error 1177 leaves: the target under the first backup name (the temp file's
-/// name with `ww-tmp` read as `ww-bak`), then an outside writer takes the freed name.
+/// name with `lil-tmp` read as `lil-bak`), then an outside writer takes the freed name.
 #[allow(clippy::disallowed_methods)]
 fn act_out_1177(dir: &Path, name: &str) -> io::Result<()> {
     let temps: Vec<String> = std::fs::read_dir(dir)?
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(&format!(".{name}.ww-tmp-")))
+        .filter(|n| n.starts_with(&format!(".{name}.lil-tmp-")))
         .collect();
     assert_eq!(temps.len(), 1, "{temps:?}");
-    let backup = temps[0].replace("ww-tmp", "ww-bak");
+    let backup = temps[0].replace("lil-tmp", "lil-bak");
     std::fs::rename(dir.join(name), dir.join(backup))?;
     write_file(&dir.join(name), b"outside");
     Err(io::Error::from_raw_os_error(1177))
@@ -1236,8 +1236,8 @@ async fn stale_temps_of_dead_processes_are_removed_by_recover() {
     let ws = workspace();
     let (dead, _child) = exited_pid();
     let live = std::process::id();
-    let stale = format!(".a.txt.ww-tmp-{dead}-1");
-    let ours = format!(".a.txt.ww-tmp-{live}-1");
+    let stale = format!(".a.txt.lil-tmp-{dead}-1");
+    let ours = format!(".a.txt.lil-tmp-{live}-1");
     write_file(&ws.file(&format!("notes/{stale}")), b"half");
     write_file(&ws.file(&format!("notes/{ours}")), b"in use");
     write_file(&ws.file("notes/a.txt"), b"kept");
@@ -1248,6 +1248,46 @@ async fn stale_temps_of_dead_processes_are_removed_by_recover() {
     want.sort();
     assert_eq!(ws.names("notes"), want);
     assert_eq!(ws.read("notes/a.txt"), b"kept");
+}
+
+/// What a core from before the rename left in its own folder stays there (R4): recovery and
+/// reads never move, restore or delete anything in the legacy workspace data folder, even
+/// with a copied-forward pending row for it.
+#[tokio::test(start_paused = true)] // spec: ARCH-074
+async fn recovery_leaves_the_legacy_workspace_folder_alone() {
+    use lil_core::state::Pending;
+    use lil_platform::names::{LEGACY_BAK_MARKER, LEGACY_TMP_MARKER, LEGACY_WORKSPACE_DIR};
+    let ws = workspace();
+    let (dead, _child) = exited_pid();
+    let dir = LEGACY_WORKSPACE_DIR;
+    let temp = format!(".state.json{LEGACY_TMP_MARKER}{dead}-1");
+    let backup = format!(".state.json{LEGACY_BAK_MARKER}{dead}-2");
+    write_file(&ws.file(&format!("{dir}/{temp}")), b"half");
+    write_file(
+        &ws.file(&format!("{dir}/{backup}")),
+        br#"{"active_project":"p2"}"#,
+    );
+    ws.state
+        .set_pending(&Pending {
+            path: format!("{dir}/state.json"),
+            old_sha256: Some(sha(br#"{"active_project":"p2"}"#)),
+            new_sha256: sha(br#"{"active_project":"p3"}"#),
+            started_utc: 1,
+        })
+        .await
+        .unwrap();
+    let mut before = vec![temp, backup];
+    before.sort();
+
+    let store = ws.plain();
+    let report = store.recover().await.expect("recover");
+    assert!(report.temps_removed.is_empty(), "{report:?}");
+    assert!(report.backups_restored.is_empty(), "{report:?}");
+    assert_eq!(ws.names(dir), before);
+    // A read of the missing file finds nothing and puts nothing back.
+    let read = store.read(&p(&format!("{dir}/state.json"))).await.unwrap();
+    assert_eq!(read, None);
+    assert_eq!(ws.names(dir), before);
 }
 
 #[tokio::test(start_paused = true)] // spec: QA-066
@@ -1402,31 +1442,31 @@ fn store_errors_map_to_appendix_d_codes() {
     assert_eq!(data["cloud_only"], false);
     let backed = StoreError::HashConflict {
         path: path.clone(),
-        backup: Some(p("notes/.a.txt.ww-bak-1-1")),
+        backup: Some(p("notes/.a.txt.lil-bak-1-1")),
         cloud_only: false,
         kept: Vec::new(),
     }
     .to_error("t");
-    assert_eq!(backed.data.unwrap()["backup"], "notes/.a.txt.ww-bak-1-1");
+    assert_eq!(backed.data.unwrap()["backup"], "notes/.a.txt.lil-bak-1-1");
     let kept = StoreError::HashConflict {
         path,
         backup: None,
         cloud_only: false,
         kept: vec![
-            p("notes/a.txt.ww-conflict-20270115T080000Z"),
-            p("notes/a.txt.ww-conflict-20270115T080000Z-2"),
+            p("notes/a.txt.lil-conflict-20270115T080000Z"),
+            p("notes/a.txt.lil-conflict-20270115T080000Z-2"),
         ],
     }
     .to_error("t");
     assert_eq!(
         kept.data.as_ref().unwrap()["kept"],
         serde_json::json!([
-            "notes/a.txt.ww-conflict-20270115T080000Z",
-            "notes/a.txt.ww-conflict-20270115T080000Z-2"
+            "notes/a.txt.lil-conflict-20270115T080000Z",
+            "notes/a.txt.lil-conflict-20270115T080000Z-2"
         ])
     );
     assert!(
-        kept.message.contains("a.txt.ww-conflict-20270115T080000Z"),
+        kept.message.contains("a.txt.lil-conflict-20270115T080000Z"),
         "{}",
         kept.message
     );
@@ -1516,7 +1556,7 @@ async fn second_outside_save_during_put_back_is_kept_visibly() {
             ws.names("notes")
         );
         assert!(
-            kept[0].starts_with("a.txt.ww-conflict-"),
+            kept[0].starts_with("a.txt.lil-conflict-"),
             "fallback={fallback}: the newest save is in a dot-file: {kept:?}"
         );
         assert!(ws.leftovers("notes").is_empty(), "{:?}", ws.names("notes"));
@@ -1547,7 +1587,7 @@ async fn read_after_a_stopped_swap_resolves_the_backup() {
     let ws = workspace();
     let err = stopped_between_renames(&ws).await;
     assert!(
-        err.to_string().contains("notes/.a.txt.ww-bak-"),
+        err.to_string().contains("notes/.a.txt.lil-bak-"),
         "the stop names the backup: {err}"
     );
     let store = ws.plain();
@@ -1716,7 +1756,7 @@ async fn unchecked_backup_is_named_and_left_for_recovery() {
         Box::new(move || {
             let backup = std::fs::read_dir(&dir)?
                 .map(|e| e.unwrap().path())
-                .find(|p| p.to_string_lossy().contains(".ww-bak-"))
+                .find(|p| p.to_string_lossy().contains(".lil-bak-"))
                 .expect("the backup");
             *slot.lock().unwrap() = Some(HandleHolder::hold(&backup, Share::None));
             Ok(())
@@ -1734,7 +1774,7 @@ async fn unchecked_backup_is_named_and_left_for_recovery() {
         panic!("expected the unchecked backup to be named, got {result:?}");
     };
     assert!(
-        backup.as_str().starts_with("notes/.a.txt.ww-bak-"),
+        backup.as_str().starts_with("notes/.a.txt.lil-bak-"),
         "{backup}"
     );
     assert!(ws.state.pending("notes/a.txt").await.unwrap().is_some());
@@ -2083,7 +2123,7 @@ async fn path_keys_agree_with_the_volume() {
     }
 }
 
-/// The real probe, except that the first data open of a `.ww-bak-` file reads a copy of it as
+/// The real probe, except that the first data open of a `.lil-bak-` file reads a copy of it as
 /// it was, while an outside writer saves `then` into the real one right after: what was
 /// hashed is no longer what is there when recovery removes it.
 #[derive(Debug)]
@@ -2105,7 +2145,7 @@ impl Probe for SaveAfterHash {
     fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
         let backup = path
             .file_name()
-            .is_some_and(|n| n.to_string_lossy().contains(".ww-bak-"));
+            .is_some_and(|n| n.to_string_lossy().contains(".lil-bak-"));
         if backup && !self.done.swap(true, Ordering::SeqCst) {
             write_file(&self.copy, &std::fs::read(path)?);
             write_file(path, &self.then);

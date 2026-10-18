@@ -12,7 +12,7 @@ pub const CLIENT_QUEUE: usize = 1024;
 /// History kept per topic, by count (ARCH-032 clarification): the newest events, at most.
 pub const HISTORY_MAX_EVENTS: usize = 1024;
 
-/// `ww/subscribe` params. A topic missing from `since_seq` means live events only.
+/// `lil/subscribe` params. A topic missing from `since_seq` means live events only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubscribeParams {
@@ -21,7 +21,7 @@ pub struct SubscribeParams {
     pub since_seq: BTreeMap<String, u64>,
 }
 
-/// `ww/subscribe` result: each topic with its current sequence number.
+/// `lil/subscribe` result: each topic with its current sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SubscribeResult {
     pub topics: Vec<TopicState>,
@@ -33,20 +33,20 @@ pub struct TopicState {
     pub seq: u64,
 }
 
-/// `ww/unsubscribe` params.
+/// `lil/unsubscribe` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnsubscribeParams {
     pub topics: Vec<String>,
 }
 
-/// `ww/unsubscribe` result: the topics removed.
+/// `lil/unsubscribe` result: the topics removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UnsubscribeResult {
     pub topics: Vec<String>,
 }
 
-/// `ww/event` notification params (core → client).
+/// `lil/event` notification params (core → client).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EventParams {
     pub topic: String,

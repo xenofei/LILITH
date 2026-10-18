@@ -8,20 +8,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use lil_platform::Env;
+use lil_platform::names::{WORKSPACE_FILE, workspace_file_in};
 use lil_protocol::NO_WORKSPACE;
 use lil_schema::SuiteToml;
 
 use crate::ClientError;
-
-/// The file that makes a folder a Worldwright workspace.
-pub const WORKSPACE_MANIFEST: &str = "worldwright.yaml";
 
 /// Which step of the `cli` chain named the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceSource {
     /// `--workspace <PATH>`.
     Flag,
-    /// The current folder, or a folder above it, holds `worldwright.yaml`.
+    /// The current folder, or a folder above it, holds a workspace file (`lilith.yaml`, or the
+    /// legacy one).
     CurrentFolder,
     /// `default_workspace` in `suite.toml`.
     Default,
@@ -66,8 +65,9 @@ pub fn resolve_workspace_id(
 }
 
 /// The workspace for a `cli` caller (ARCH-030), with where it came from:
-/// 1. `explicit` (relative to `cwd` when relative), which must contain `worldwright.yaml`;
-/// 2. else the nearest folder from `cwd` upwards that contains `worldwright.yaml`;
+/// 1. `explicit` (relative to `cwd` when relative), which must contain a workspace file
+///    (`names::workspace_file_in`: `lilith.yaml`, or the legacy one, R4);
+/// 2. else the nearest folder from `cwd` upwards that contains one;
 /// 3. else `default_workspace` in the channel's `suite.toml`;
 /// 4. else `"none"`.
 ///
@@ -94,21 +94,18 @@ pub fn resolve_workspace(
     };
     if let Some(explicit) = explicit {
         let path = cwd.join(explicit);
-        if !path.join(WORKSPACE_MANIFEST).is_file() {
+        if workspace_file_in(&path).is_none() {
             return Err(plain(
                 io::ErrorKind::NotFound,
                 format!(
-                    "{} is not a Worldwright workspace: it has no {WORKSPACE_MANIFEST}.",
+                    "{} is not a LILITH workspace: it has no {WORKSPACE_FILE}.",
                     path.display()
                 ),
             ));
         }
         return found(&path, WorkspaceSource::Flag);
     }
-    if let Some(dir) = cwd
-        .ancestors()
-        .find(|dir| dir.join(WORKSPACE_MANIFEST).is_file())
-    {
+    if let Some(dir) = cwd.ancestors().find(|dir| workspace_file_in(dir).is_some()) {
         return found(dir, WorkspaceSource::CurrentFolder);
     }
     let file = env.suite_toml_to_read();
@@ -314,7 +311,7 @@ mod tests {
     }
 
     #[test] // spec: ARCH-030
-    fn explicit_path_without_worldwright_yaml_is_an_error() {
+    fn explicit_path_without_a_workspace_file_is_an_error() {
         let env = TestEnv::new();
         let ws = env.make_workspace("real");
         env.register_workspace(&ws, true);
@@ -324,13 +321,31 @@ mod tests {
             .unwrap();
 
         let err = resolve_workspace_id(&env.env, Some(plain.path()), &ws)
-            .expect_err("a folder without worldwright.yaml was accepted");
+            .expect_err("a folder without lilith.yaml was accepted");
         let text = err.to_string();
         assert!(text.contains(&plain.path().display().to_string()), "{text}");
-        assert!(text.contains("worldwright.yaml"), "{text}");
+        assert!(text.contains("lilith.yaml"), "{text}");
 
         // A missing folder is an error too, never a fallback to another workspace.
         let missing = plain.path().join("gone");
         assert!(resolve_workspace_id(&env.env, Some(&missing), &ws).is_err());
+    }
+
+    #[test] // spec: ARCH-030
+    fn a_legacy_workspace_file_is_found_from_a_subfolder_and_by_flag() {
+        let env = TestEnv::new();
+        let outside = mkdir(env.root().join("outside"));
+        let legacy = env.make_legacy_workspace("plugin era");
+        let deep = mkdir(legacy.join("projects").join("p2"));
+        assert_eq!(
+            resolve_workspace_id(&env.env, None, &deep).unwrap(),
+            id(&legacy)
+        );
+        assert_eq!(
+            resolve_workspace_id(&env.env, Some(&legacy), &outside).unwrap(),
+            id(&legacy)
+        );
+        // Nothing is written while finding it.
+        assert!(!legacy.join(lil_platform::names::WORKSPACE_FILE).exists());
     }
 }

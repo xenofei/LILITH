@@ -173,14 +173,14 @@ impl Ws {
 
     /// The staging folder's `seal-*` folders, workspace-relative.
     fn seal_folders(&self) -> Vec<String> {
-        let staging = self.file(".worldwright/staging");
+        let staging = self.file(".lilith/staging");
         let Ok(entries) = std::fs::read_dir(&staging) else {
             return Vec::new();
         };
         entries
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("seal-"))
-            .map(|n| format!(".worldwright/staging/{n}"))
+            .map(|n| format!(".lilith/staging/{n}"))
             .collect()
     }
 }

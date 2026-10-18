@@ -2,11 +2,13 @@
 //! decision, stable-snapshot hashing, manifests, `missing` files, the cold rebuild, the store's
 //! change events and the background verification.
 //!
-//! **The walk** covers the workspace without `.git/` (at any depth), the root's `.worldwright/`
-//! and `.trash/`, the store's temp (`.<name>.ww-tmp-*`), backup (`.<name>.ww-bak-*`) and
-//! conflict (`*.ww-conflict-*`) names, and OS metadata files (`Thumbs.db`, `desktop.ini`,
-//! `.DS_Store`, which are never indexed or hashed; ruling Q32). It never follows a link: a symbolic link, junction or
-//! mount point (a name-surrogate reparse point) is skipped, file or folder.
+//! **The walk** covers the workspace without `.git/` (at any depth), the root's workspace data
+//! folders (`.lilith/` and the legacy one, `names::is_workspace_dir`) and `.trash/`, the store's
+//! temp (`.<name>.lil-tmp-*`), backup (`.<name>.lil-bak-*`) and conflict (`*.lil-conflict-*`)
+//! names, and their legacy twins (R4), and OS metadata files (`Thumbs.db`, `desktop.ini`,
+//! `.DS_Store`, which are never indexed or hashed; ruling Q32). It never follows a link: a
+//! symbolic link, junction or mount point (a name-surrogate reparse point) is skipped, file or
+//! folder.
 //!
 //! **Per file:**
 //! 1. `probe.identity` (attribute-only).
@@ -42,6 +44,10 @@ use std::time::UNIX_EPOCH;
 
 use lil_platform::Clock;
 use lil_platform::fs::{FileIdentity, Probe};
+use lil_platform::names::{
+    BAK_MARKER, CONFLICT_MARKER, LEGACY_BAK_MARKER, LEGACY_CONFLICT_MARKER, LEGACY_TMP_MARKER,
+    TMP_MARKER, is_workspace_dir,
+};
 use lil_schema::{LinkRef, Manifest};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
@@ -304,14 +310,17 @@ fn walked(root: &Path, rel: String) -> Walked {
 
 fn skip_folder(name: &str, at_root: bool) -> bool {
     name.eq_ignore_ascii_case(".git")
-        || (at_root
-            && (name.eq_ignore_ascii_case(".worldwright") || name.eq_ignore_ascii_case(".trash")))
+        || (at_root && (is_workspace_dir(name) || name.eq_ignore_ascii_case(".trash")))
 }
 
+/// The store's own names, with the new and the legacy markers (R4): a temp or backup dot-file,
+/// or a conflict copy.
 fn skip_file(name: &str) -> bool {
-    (name.starts_with('.') && (name.contains(".ww-tmp-") || name.contains(".ww-bak-")))
-        || name.contains(".ww-conflict-")
-        || lil_schema::is_os_metadata(name)
+    let dot_marker = [TMP_MARKER, BAK_MARKER, LEGACY_TMP_MARKER, LEGACY_BAK_MARKER]
+        .iter()
+        .any(|m| name.contains(m));
+    let conflict = name.contains(CONFLICT_MARKER) || name.contains(LEGACY_CONFLICT_MARKER);
+    (name.starts_with('.') && dot_marker) || conflict || lil_schema::is_os_metadata(name)
 }
 
 /// Whether a scoped path is one the walk never enters.
@@ -1752,12 +1761,13 @@ mod tests {
     fn skips_store_names_and_private_folders() {
         assert!(skip_folder(".git", false));
         assert!(skip_folder(".GIT", true));
-        assert!(skip_folder(".worldwright", true));
-        assert!(!skip_folder(".worldwright", false));
+        assert!(skip_folder(".lilith", true));
+        assert!(!skip_folder(".lilith", false));
         assert!(skip_folder(".Trash", true));
-        assert!(skip_file(".a.png.ww-tmp-1-2"));
-        assert!(skip_file(".a.png.ww-bak-1-2"));
-        assert!(skip_file("a.png.ww-conflict-20270101T000000Z"));
+        assert!(skip_file(".a.png.lil-tmp-1-2"));
+        assert!(skip_file(".a.png.lil-bak-1-2"));
+        assert!(skip_file("a.png.lil-conflict-20270101T000000Z"));
+        assert!(!skip_file("a.png.lil-tmp-1-2"), "a temp name is a dot-file");
         assert!(!skip_file("a.png"));
         // Ruling Q32: OS metadata files are never indexed.
         for name in ["Thumbs.db", "desktop.ini", ".DS_Store", "THUMBS.DB"] {
@@ -1768,6 +1778,31 @@ mod tests {
         assert!(skipped_path(".trash/x"));
         assert!(skipped_path("projects/.git/x"));
         assert!(!skipped_path("projects/p/x"));
+    }
+
+    #[test] // spec: CORE-041
+    fn reconcile_skips_both_workspace_folders() {
+        use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+        for name in [WORKSPACE_DIR, LEGACY_WORKSPACE_DIR] {
+            assert!(skip_folder(name, true), "{name}");
+            assert!(skip_folder(&name.to_uppercase(), true), "{name}");
+            assert!(!skip_folder(name, false), "{name}");
+            assert!(skipped_path(&format!("{name}/state.json")), "{name}");
+            assert!(
+                skipped_path(&format!("{name}/staging/sh_1/a.png")),
+                "{name}"
+            );
+            assert!(!skipped_path(&format!("projects/{name}/a.png")), "{name}");
+        }
+        // The legacy markers are the store's names too (R4).
+        for name in [
+            format!(".a.png{LEGACY_TMP_MARKER}1-2"),
+            format!(".a.png{LEGACY_BAK_MARKER}1-2"),
+            format!("a.png{LEGACY_CONFLICT_MARKER}20270101T000000Z"),
+        ] {
+            assert!(skip_file(&name), "{name}");
+            assert!(skipped_path(&format!("notes/{name}")), "{name}");
+        }
     }
 
     #[test] // spec: CORE-041

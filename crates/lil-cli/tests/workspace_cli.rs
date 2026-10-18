@@ -48,7 +48,7 @@ fn init_creates_and_prints_the_default() {
         format!("workspace created at {shown}\ndefault workspace: {shown}\n"),
         "{out:?}"
     );
-    assert!(first.join("worldwright.yaml").is_file());
+    assert!(first.join("lilith.yaml").is_file());
     let (default, listed) = registered(&env, &first);
     assert!(listed);
     assert!(default.is_some_and(|d| same(&d, &first)));
@@ -66,7 +66,7 @@ fn init_creates_and_prints_the_default() {
         format!("workspace created at {}\n", canonical(&second)),
         "{out:?}"
     );
-    let yaml = std::fs::read_to_string(second.join("worldwright.yaml")).unwrap();
+    let yaml = std::fs::read_to_string(second.join("lilith.yaml")).unwrap();
     assert!(yaml.lines().any(|l| l == "name: Ünïcödé second"), "{yaml}");
     let (default, listed) = registered(&env, &second);
     assert!(listed);
@@ -132,7 +132,7 @@ fn use_works_with_a_stale_default() {
     std::fs::create_dir_all(&plain).unwrap();
     let out = env.lil(&["workspace", "use", arg(&plain)]);
     assert_eq!(out.code, 1, "{out:?}");
-    assert!(out.stderr.contains("worldwright.yaml"), "{out:?}");
+    assert!(out.stderr.contains("lilith.yaml"), "{out:?}");
 }
 
 #[test] // spec: ARCH-018, ARCH-030
@@ -168,7 +168,7 @@ fn no_start_with_an_unresolvable_workspace_while_a_core_runs() {
     ]);
     assert_eq!(out.code, 2, "{out:?}");
     assert_eq!(out.stdout, "", "{out:?}");
-    assert!(out.stderr.contains("worldwright.yaml"), "{out:?}");
+    assert!(out.stderr.contains("lilith.yaml"), "{out:?}");
     assert!(out.stderr.contains("not a workspace"), "{out:?}");
 }
 

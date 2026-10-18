@@ -202,7 +202,7 @@ fn sealed_ref_carries_the_content_hash() {
 
     let hash = version_content_hash_of(&s.path(&format!("{ASSET_DIR}/v1.0.0")));
     let expected = format!(
-        "ww://{}/sketchbook/{ASSET}@1.0.0#sha256={hash}",
+        "lil://{}/sketchbook/{ASSET}@1.0.0#sha256={hash}",
         s.env.workspace_id(&s.ws)
     );
     assert_eq!(result["ref"], json!(expected), "{result}");

@@ -1383,7 +1383,7 @@ async fn asset_get_reports_legacy_versions_and_next_versions() {
     assert_eq!(versions[0]["legacy"], true);
     assert!(
         versions[0]["ref"].as_str().unwrap().starts_with(&format!(
-            "ww://{}/sketchbook/prop_signal_lamp@1.0.0#sha256=",
+            "lil://{}/sketchbook/prop_signal_lamp@1.0.0#sha256=",
             ws.id
         )),
         "{lamp}"
@@ -1564,7 +1564,7 @@ async fn assets_query_filters_by_project_status_type_and_text() {
     let crane = &page["assets"][1];
     assert_eq!(
         crane["ref"],
-        format!("ww://{}/alpha/chr_paper_crane", ws.id)
+        format!("lil://{}/alpha/chr_paper_crane", ws.id)
     );
     assert_eq!(crane["needs_repair"], false);
     for bad in [

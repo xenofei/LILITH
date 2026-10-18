@@ -14,12 +14,13 @@
 //!    junction or a short name can lead elsewhere).
 //! 2. `workspace.path_invalid`: a file, the install folder or a folder inside it (ARCH-094,
 //!    [`refuse_inside`]), or a folder inside another registered workspace.
-//! 3. A folder that holds `worldwright.yaml` is registered only (`created: false`); nothing
+//! 3. A folder that holds a workspace file (`names::workspace_file_in`: `lilith.yaml`, or the
+//!    legacy one, R4) is registered only (`created: false`); nothing
 //!    is written in it.
 //! 4. Otherwise the hub opens it and its store writes `projects/sketchbook/project.yaml`,
 //!    `projects/sketchbook/progress.md` (ARCH-098), the five `.gitignore` entries and the
 //!    `.gitattributes` entry `projects/** -text` (CORE-040), each appended to a file that
-//!    exists, and **last** `worldwright.yaml`, whose presence makes the folder a workspace.
+//!    exists, and **last** `lilith.yaml`, whose presence makes the folder a workspace.
 //! 5. It is registered (the default when `default` says so, or when none is set), the hub
 //!    re-reads the default, and a workspace that isn't the default is closed again.
 //!
@@ -27,9 +28,10 @@
 //! that can't track files by ID (FAT, exFAT, or volume facts that can't be read). Such a
 //! workspace is created and served as one without stable IDs.
 //!
-//! **`workspace.set_default`:** the folder must hold `worldwright.yaml`. It is registered as
-//! the default, the hub re-reads the default, `{kind: "default_changed", id, path}` goes out on
-//! the `workspace` topic, and the old default is let go of: it closes once no call holds it.
+//! **`workspace.set_default`:** the folder must hold a workspace file (`lilith.yaml`, or the
+//! legacy one). It is registered as the default, the hub re-reads the default,
+//! `{kind: "default_changed", id, path}` goes out on the `workspace` topic, and the old default
+//! is let go of: it closes once no call holds it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use lil_platform::fs::{PLACEHOLDER_ATTRIBUTES, Probe};
+use lil_platform::names::{WORKSPACE_FILE, workspace_file_in};
 use lil_platform::paths::{folder_key, strip_verbatim};
 use lil_platform::{Env, check_workspace};
 use lil_protocol::{EffectClass, ErrorBody, codes};
@@ -53,12 +56,9 @@ use crate::workspace::{Access, WorkspaceHub, WorkspaceRef};
 /// The Worldwright module of every product tool: always available, never filtered (CORE-058).
 pub const WORKSPACE_MODULE: &str = "workspace";
 
-/// The file that makes a folder a workspace.
-const WORKSPACE_YAML: &str = "worldwright.yaml";
-
 /// The `.gitignore` entries `workspace.create` writes (CORE-040, ARCH-096).
 pub const GITIGNORE_ENTRIES: [&str; 5] = [
-    ".worldwright/",
+    ".lilith/",
     ".trash/",
     "inbox/*",
     "projects/*/assets/*/candidates/",
@@ -89,7 +89,7 @@ pub const NO_FILE_IDS_WARNING: &str = "This volume can't track files by ID, so c
 pub struct WorkspaceCreateArgs {
     /// The workspace folder, as an absolute path. It is created when it doesn't exist.
     pub path: String,
-    /// The name written to `worldwright.yaml`; the folder's name when omitted.
+    /// The name written to `lilith.yaml`; the folder's name when omitted.
     #[serde(default)]
     pub name: Option<String>,
     /// Make it the default workspace. Omitted, it becomes the default when none is set.
@@ -103,7 +103,7 @@ pub struct WorkspaceCreateResult {
     pub id: String,
     /// The canonical folder.
     pub path: String,
-    /// `false` when the folder already held `worldwright.yaml` and was only registered.
+    /// `false` when the folder already held a workspace file and was only registered.
     pub created: bool,
     /// Whether it is the default workspace now.
     pub default: bool,
@@ -113,7 +113,8 @@ pub struct WorkspaceCreateResult {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetDefaultArgs {
-    /// A workspace folder (it holds `worldwright.yaml`), as an absolute path.
+    /// A workspace folder (it holds `lilith.yaml`, or the legacy workspace file), as an
+    /// absolute path.
     pub path: String,
 }
 
@@ -131,13 +132,13 @@ struct Tools {
 }
 
 const CREATE_DESCRIPTION: &str = "Create a Worldwright workspace in a folder, or register a \
-    folder that already is one, in suite.toml. A new workspace gets worldwright.yaml, the \
+    folder that already is one, in suite.toml. A new workspace gets lilith.yaml, the \
     sketchbook project, .gitignore and .gitattributes entries. It becomes the default \
     workspace when `default` is true, or when no default is set; the core serves only the \
     default workspace. Warnings name volumes where files can't be tracked by ID.";
 
 const SET_DEFAULT_DESCRIPTION: &str = "Make a workspace folder (one that holds \
-    worldwright.yaml) the default workspace, the one the core serves. It is registered in \
+    lilith.yaml) the default workspace, the one the core serves. It is registered in \
     suite.toml if it isn't yet. Sessions in the old default get workspace.unsupported.";
 
 /// Registers `workspace.create` and `workspace.set_default` (module `workspace`).
@@ -335,7 +336,7 @@ fn today(hub: &WorkspaceHub) -> String {
     lil_schema::time::date(secs)
 }
 
-/// Step 4: the new workspace's files, through its store, `worldwright.yaml` last. Files that
+/// Step 4: the new workspace's files, through its store, `lilith.yaml` last. Files that
 /// exist keep their content (`.gitignore` and `.gitattributes` gain the entries they lack).
 async fn write_layout(
     t: &Tools,
@@ -387,7 +388,7 @@ async fn write_layout(
         .map_err(error)?;
     store
         .edit_text(
-            &rel(WORKSPACE_YAML),
+            &rel(WORKSPACE_FILE),
             &keep_or(new_workspace_yaml(name, &today)),
         )
         .await
@@ -456,7 +457,7 @@ async fn create(
     }
     let warnings = volume_warnings(t.probe.as_ref(), &ws.path);
     // 3. and 4.
-    let created = !ws.path.join(WORKSPACE_YAML).is_file();
+    let created = workspace_file_in(&ws.path).is_none();
     if created {
         let name = args.name.clone().unwrap_or_else(|| {
             ws.path.file_name().map_or_else(
@@ -512,10 +513,10 @@ async fn set_default(
     let trace_id = ctx.trace_id.as_str();
     let abs = absolute(&args.path, trace_id)?;
     check_workspace(&abs);
-    if !abs.join(WORKSPACE_YAML).is_file() {
+    if workspace_file_in(&abs).is_none() {
         return Err(path_invalid(
             &args.path,
-            &format!("it has no {WORKSPACE_YAML}; `lil workspace init` creates a workspace"),
+            &format!("it has no {WORKSPACE_FILE}; `lil workspace init` creates a workspace"),
             trace_id,
         ));
     }
@@ -573,5 +574,21 @@ mod tests {
         assert_eq!(with_lines("x", &["a"]), "x\na\n");
         assert_eq!(with_lines("x\r\ny\r\n", &["a"]), "x\r\ny\r\na\r\n");
         assert_eq!(with_lines("a  \r\nb\r\n", &["a", "b"]), "a  \r\nb\r\n");
+    }
+
+    #[test] // spec: CORE-040, ARCH-096
+    fn gitignore_entries_name_lilith() {
+        use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+        assert_eq!(GITIGNORE_ENTRIES[0], ".lilith/");
+        assert_eq!(GITIGNORE_ENTRIES[0], format!("{WORKSPACE_DIR}/"));
+        assert!(
+            !GITIGNORE_ENTRIES.contains(&format!("{LEGACY_WORKSPACE_DIR}/").as_str()),
+            "the legacy folder is never written into a new .gitignore"
+        );
+        // A legacy workspace's `.gitignore` keeps its old line and only gains the new one.
+        let legacy = format!("{LEGACY_WORKSPACE_DIR}/\n.trash/\n");
+        let out = with_lines(&legacy, &GITIGNORE_ENTRIES);
+        assert!(out.starts_with(&legacy), "{out}");
+        assert!(out.lines().any(|l| l == ".lilith/"), "{out}");
     }
 }

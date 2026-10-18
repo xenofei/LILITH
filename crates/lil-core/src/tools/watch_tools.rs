@@ -8,8 +8,8 @@
 //! workspace; the index reconciles them (a folder with its whole subtree) and the watcher
 //! decides what changed, as it does for the changes it sees itself. A path outside the
 //! workspace, one that isn't a valid workspace path, and one the watcher doesn't watch
-//! (`.worldwright/`, `.trash/`, `.git/`) is `ignored`. While git works the paths wait for the
-//! post-git rescan. It works where the workspace has no folder watch too: that is what it is
+//! (`.lilith/` and the legacy workspace data folder, `.trash/`, `.git/`) is `ignored`. While
+//! git works the paths wait for the post-git rescan. It works where the workspace has no folder watch too: that is what it is
 //! for.
 
 use lil_protocol::{EffectClass, ErrorBody};

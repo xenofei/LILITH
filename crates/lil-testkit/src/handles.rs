@@ -59,8 +59,8 @@ mod tests {
             .tempdir()
             .unwrap();
         let target = dir.path().join("target.txt");
-        let replacement = dir.path().join(".target.txt.ww-tmp-1-1");
-        let backup = dir.path().join(".target.txt.ww-bak-1-1");
+        let replacement = dir.path().join(".target.txt.lil-tmp-1-1");
+        let backup = dir.path().join(".target.txt.lil-bak-1-1");
         std::fs::write(&target, b"old").unwrap();
         std::fs::write(&replacement, b"new").unwrap();
 

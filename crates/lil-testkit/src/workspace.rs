@@ -208,7 +208,7 @@ mod tests {
         let t = TestEnv::with_label("Ünïcödé space");
         let ws = t.copy_fixture_workspace("sample");
         assert_eq!(ws, t.root().join("ws-sample"));
-        assert!(ws.join("worldwright.yaml").is_file());
+        assert!(ws.join("lilith.yaml").is_file());
 
         // Byte for byte: every fixture file is copied with the same hash.
         let source = fixture_workspace_dir();

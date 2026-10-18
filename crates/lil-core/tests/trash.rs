@@ -259,6 +259,37 @@ async fn trash_moves_with_a_restore_record() {
     assert!(ws.exists("registry/ledger.csv"));
 }
 
+#[tokio::test(start_paused = true)] // spec: ARCH-058
+async fn trash_refuses_both_workspace_folders() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+    let ws = workspace();
+    let store = ws.store();
+    for dir in [WORKSPACE_DIR, LEGACY_WORKSPACE_DIR] {
+        write_file(&ws.file(&format!("{dir}/state.json")), b"{}");
+        for rel in [
+            dir.to_string(),
+            dir.to_uppercase(),
+            format!("{dir}/state.json"),
+        ] {
+            let refused = store.trash(&p(&rel), "test").await;
+            assert!(
+                matches!(refused, Err(StoreError::PathInvalid { .. })),
+                "{rel}: {refused:?}"
+            );
+        }
+        assert_eq!(ws.read(&format!("{dir}/state.json")), b"{}");
+    }
+    // A folder of that name deeper down is an ordinary folder.
+    write_file(
+        &ws.file(&format!("notes/{LEGACY_WORKSPACE_DIR}/a.txt")),
+        b"a",
+    );
+    store
+        .trash(&p(&format!("notes/{LEGACY_WORKSPACE_DIR}")), "test")
+        .await
+        .unwrap();
+}
+
 #[tokio::test(start_paused = true)] // spec: ARCH-058, CORE-037
 async fn restore_refuses_an_occupied_path() {
     let ws = workspace();

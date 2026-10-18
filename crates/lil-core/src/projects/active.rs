@@ -1,14 +1,19 @@
-//! The active project (ARCH-088, ARCH-098): per client session, with `.worldwright\state.json`
+//! The active project (ARCH-088, ARCH-098): per client session, with `.lilith\state.json`
 //! `{"active_project":"<slug>"}` as the untracked last-used hint of the workspace.
 //!
 //! A call's project is, in this order: its `project` argument; the session's active project;
 //! the hint; `sketchbook` ([`resolve_project`]). A call that names a project and ends `ok` makes
 //! it the session's active project and, on a read-write workspace, the hint (the dispatcher
 //! does both). A session's active project is forgotten when its connection closes.
+//!
+//! The hint is read from `.lilith\state.json`, or, when that file is missing, from the legacy
+//! workspace data folder's `state.json` (`names::LEGACY_WORKSPACE_DIR`, R4). It is written only
+//! to `.lilith\state.json`; the legacy file is never written, moved or deleted.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use lil_platform::names::LEGACY_WORKSPACE_DIR;
 use lil_schema::is_slug;
 use serde_json::{Map, Value};
 
@@ -18,7 +23,7 @@ use crate::workspace::{Access, OpenWorkspace};
 /// The project of a call that names none, with no active project and no hint (ARCH-098).
 pub const DEFAULT_PROJECT: &str = "sketchbook";
 /// The hint file, workspace-relative.
-pub const STATE_JSON: &str = ".worldwright/state.json";
+pub const STATE_JSON: &str = ".lilith/state.json";
 
 /// The active project of each session, by session id.
 #[derive(Debug, Default)]
@@ -70,16 +75,32 @@ fn state_json() -> WsPath {
     WsPath::parse(STATE_JSON).expect("the state.json path is valid")
 }
 
+/// The legacy hint file (R4): read when [`STATE_JSON`] is missing, never written.
+fn legacy_state_json() -> WsPath {
+    WsPath::parse(&format!("{LEGACY_WORKSPACE_DIR}/state.json"))
+        .expect("the legacy state.json path is valid")
+}
+
+/// The bytes of the hint file: `.lilith\state.json`, else the legacy one when the new one is
+/// missing. `None` when neither can be read.
+async fn read_state_json(store: &Store) -> Option<Vec<u8>> {
+    for rel in [state_json(), legacy_state_json()] {
+        match store.read(&rel).await {
+            Ok(Some(bytes)) => return Some(bytes),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(path = %rel, error = %e, "state.json can't be read; no active-project hint");
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// The project `state.json` names, when it is a slug. A missing, unreadable or malformed file
 /// is no hint.
 pub async fn read_hint(store: &Store) -> Option<String> {
-    let bytes = match store.read(&state_json()).await {
-        Ok(bytes) => bytes?,
-        Err(e) => {
-            tracing::debug!(error = %e, "state.json can't be read; no active-project hint");
-            return None;
-        }
-    };
+    let bytes = read_state_json(store).await?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     value
         .get("active_project")
@@ -88,9 +109,10 @@ pub async fn read_hint(store: &Store) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Makes `slug` the hint in `state.json`, through the store's hash-checked edit. Other keys of
-/// the file are kept; a file that isn't a JSON object is replaced. Nothing is written when the
-/// file already names `slug`.
+/// Makes `slug` the hint in `.lilith\state.json`, through the store's hash-checked edit. Other
+/// keys of the file are kept; a file that isn't a JSON object is replaced. While the new file
+/// is missing, the legacy file's keys are the starting point (it is only read). Nothing is
+/// written when the hint already names `slug`.
 ///
 /// # Errors
 /// The store's error (`workspace.read_only` on a read-only workspace).
@@ -98,11 +120,20 @@ pub async fn write_hint(store: &Store, slug: &str) -> Result<(), StoreError> {
     if read_hint(store).await.as_deref() == Some(slug) {
         return Ok(());
     }
+    let legacy = match store.read(&state_json()).await {
+        Ok(None) => store.read(&legacy_state_json()).await.ok().flatten(),
+        _ => None,
+    };
+    let legacy: Map<String, Value> = match legacy.map(|b| serde_json::from_slice::<Value>(&b)) {
+        Some(Ok(Value::Object(map))) => map,
+        _ => Map::new(),
+    };
     let slug = slug.to_string();
     store
         .edit_text(&state_json(), &move |current: &str| {
             let mut map = match serde_json::from_str::<Value>(current) {
                 Ok(Value::Object(map)) => map,
+                _ if current.is_empty() => legacy.clone(),
                 _ => Map::new(),
             };
             map.insert("active_project".to_string(), Value::from(slug.as_str()));

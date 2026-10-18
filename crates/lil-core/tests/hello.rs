@@ -145,7 +145,7 @@ fn refused_hello_allows_nothing_else() {
     let mut pipe = RawPipe::connect(&env);
     let hello = pipe.hello(json!({"protocol": "2.0"}));
     assert_eq!(hello["result"]["error"]["code"], "protocol.incompatible");
-    for method in ["tools/list", "tools/call", "ww/subscribe", "app/anything"] {
+    for method in ["tools/list", "tools/call", "lil/subscribe", "app/anything"] {
         let response = pipe.call(method, json!({}));
         assert_eq!(response["error"]["code"], -32001, "{method}: {response}");
     }

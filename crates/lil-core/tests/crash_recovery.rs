@@ -134,7 +134,7 @@ fn assert_consistent(ws: &Path, pipe: &mut RawPipe, what: &str) {
     let files = all_files(ws);
     let leftovers: Vec<&String> = files
         .iter()
-        .filter(|f| f.contains(".ww-tmp-") || f.contains(".ww-bak-"))
+        .filter(|f| f.contains(".lil-tmp-") || f.contains(".lil-bak-"))
         .collect();
     assert!(leftovers.is_empty(), "{what}: {leftovers:?}");
 
@@ -467,7 +467,7 @@ async fn held_manifest_during_commit_is_retried() {
     assert!(
         !files
             .iter()
-            .any(|f| f.contains(".ww-tmp-") || f.contains(".ww-bak-")),
+            .any(|f| f.contains(".lil-tmp-") || f.contains(".lil-bak-")),
         "{files:?}"
     );
 }
@@ -730,5 +730,161 @@ fn a_fresh_clone_without_candidates_has_nothing_missing() {
             .iter()
             .any(|f| f["state"] == "missing"),
         "{detail}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leftovers from before the rename (map row 22, Review Focus 3).
+// ---------------------------------------------------------------------------------------------
+
+/// A process id that has certainly exited: a short child (this test binary, running no test)
+/// that was waited for. The returned handle keeps the id from being reused.
+fn exited_pid() -> (u32, std::process::Child) {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "no_such_test_runs_here", "--quiet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the test binary");
+    child.wait().expect("wait for it");
+    (child.id(), child)
+}
+
+/// The names in `dir`, sorted, with each conflict copy's stamp cut off and its marker read as
+/// `<conflict>`, so two folders whose leftovers used different markers compare equal.
+fn shape_of(dir: &Path) -> Vec<String> {
+    use lil_platform::names::{CONFLICT_MARKER, LEGACY_CONFLICT_MARKER};
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .map(|name| {
+            for marker in [CONFLICT_MARKER, LEGACY_CONFLICT_MARKER] {
+                if let Some(i) = name.find(marker) {
+                    let tag = if marker == CONFLICT_MARKER {
+                        "new"
+                    } else {
+                        "legacy"
+                    };
+                    return format!("{}<conflict {tag}>", &name[..i]);
+                }
+            }
+            name
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The ARCH-074 crash shapes a dead core leaves in `dir`, with `tmp` and `bak` as markers:
+/// a backup whose target is gone (restored), a backup equal to its target (removed), a backup
+/// of an outside save (moved aside to a visible conflict copy) and a temp file of a dead
+/// process (removed).
+fn crash_shapes(dir: &Path, tmp: &str, bak: &str, dead: u32) {
+    write_file(
+        &dir.join(format!(".a.txt{bak}{dead}-1")),
+        b"a, the only copy",
+    );
+    write_file(&dir.join("b.txt"), b"b");
+    write_file(&dir.join(format!(".b.txt{bak}{dead}-1")), b"b");
+    write_file(&dir.join("c.txt"), b"c, the core's");
+    write_file(
+        &dir.join(format!(".c.txt{bak}{dead}-1")),
+        b"c, an outside save",
+    );
+    write_file(&dir.join(format!(".d.txt{tmp}{dead}-1")), b"half a write");
+}
+
+#[test] // spec: QA-055, ARCH-074, CORE-041
+fn recovery_restores_legacy_leftovers_and_the_index_skips_them() {
+    use lil_platform::names::{BAK_MARKER, LEGACY_BAK_MARKER, LEGACY_TMP_MARKER, TMP_MARKER};
+    let env = TestEnv::new();
+    let ws = default_workspace(&env, "legacy-leftovers");
+    let (dead, _child) = exited_pid();
+    let work = file(&ws, &format!("{ASSET_DIR}/work"));
+    let (new, old) = (work.join("new"), work.join("old"));
+    crash_shapes(&new, TMP_MARKER, BAK_MARKER, dead);
+    crash_shapes(&old, LEGACY_TMP_MARKER, LEGACY_BAK_MARKER, dead);
+
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, &ws);
+    // A call waits for the workspace's open (begun in the background at start), which recovers.
+    pipe.tool_ok("project.status", json!({"project": "sketchbook"}), None);
+    // The open recovered both folders; the legacy one exactly as its `lil` twin.
+    let want = ["a.txt", "b.txt", "c.txt", "c.txt<conflict new>"];
+    assert_eq!(shape_of(&new), want);
+    assert_eq!(
+        shape_of(&old),
+        want,
+        "the legacy leftovers were not resolved"
+    );
+    for dir in [&new, &old] {
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"a, the only copy"
+        );
+        assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"c, the core's");
+    }
+
+    // The index never lists a leftover or a conflict copy.
+    let detail = pipe.tool_ok(
+        "asset.get",
+        json!({"project": "sketchbook", "asset_id": ASSET}),
+        None,
+    );
+    let files: Vec<&str> = detail["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{detail}"))
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"work/old/a.txt"), "{files:?}");
+    for path in &files {
+        assert!(
+            !path.contains("-tmp-") && !path.contains("-bak-") && !path.contains("-conflict-"),
+            "{path} is indexed: {files:?}"
+        );
+    }
+    assert_consistent(&ws, &mut pipe, "after recovering legacy leftovers");
+}
+
+#[test] // spec: CORE-038, CORE-041
+fn legacy_conflict_copies_are_left_alone_and_not_indexed() {
+    use lil_platform::names::LEGACY_CONFLICT_MARKER;
+    let env = TestEnv::new();
+    let ws = default_workspace(&env, "legacy-conflicts");
+    let name = format!("notes.txt{LEGACY_CONFLICT_MARKER}20261001T100000Z");
+    let copy = file(&ws, &format!("{ASSET_DIR}/work/{name}"));
+    write_file(&copy, b"an outside save, set aside before the rename");
+    let hash = sha256_file(&copy);
+
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, &ws);
+    // Listed as an orphan, like a new conflict copy, and never moved or changed.
+    assert!(
+        orphans(&mut pipe).contains(&format!("{ASSET_DIR}/work/{name}")),
+        "{:?}",
+        orphans(&mut pipe)
+    );
+    assert_eq!(sha256_file(&copy), hash);
+    let detail = pipe.tool_ok(
+        "asset.get",
+        json!({"project": "sketchbook", "asset_id": ASSET}),
+        None,
+    );
+    let files = detail["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{detail}"));
+    assert!(
+        files
+            .iter()
+            .all(|f| !f["path"].as_str().unwrap().contains(&name)),
+        "{detail}"
+    );
+    drop(pipe);
+    drop(_core);
+    assert_eq!(
+        sha256_file(&copy),
+        hash,
+        "the copy changed after the core stopped"
     );
 }

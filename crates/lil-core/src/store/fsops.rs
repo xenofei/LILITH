@@ -257,16 +257,16 @@ mod tests {
     fn write_temp_never_reuses_a_name_and_cleans_up_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let fp = FailPoints::none();
-        let temp = write_temp(dir.path(), ".a.ww-tmp-1-1", b"x", &fp).unwrap();
+        let temp = write_temp(dir.path(), ".a.lil-tmp-1-1", b"x", &fp).unwrap();
         assert_eq!(std::fs::read(&temp).unwrap(), b"x");
-        let again = write_temp(dir.path(), ".a.ww-tmp-1-1", b"y", &fp).unwrap_err();
+        let again = write_temp(dir.path(), ".a.lil-tmp-1-1", b"y", &fp).unwrap_err();
         assert_eq!(again.raw_os_error(), Some(80), "{again:?}");
         assert_eq!(std::fs::read(&temp).unwrap(), b"x");
 
         let full = FailPoints::parse("store.write_temp=disk_full").unwrap();
-        let err = write_temp(dir.path(), ".a.ww-tmp-1-3", b"z", &full).unwrap_err();
+        let err = write_temp(dir.path(), ".a.lil-tmp-1-3", b"z", &full).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(112));
-        assert!(!dir.path().join(".a.ww-tmp-1-3").exists());
+        assert!(!dir.path().join(".a.lil-tmp-1-3").exists());
     }
 
     #[test] // spec: ARCH-074
@@ -295,7 +295,7 @@ mod tests {
     fn remove_if_deletes_only_what_it_decided_on() {
         let dir = tempfile::tempdir().unwrap();
         let fp = FailPoints::none();
-        let path = write_temp(dir.path(), ".a.ww-bak-1-1", b"old", &fp).unwrap();
+        let path = write_temp(dir.path(), ".a.lil-bak-1-1", b"old", &fp).unwrap();
         let read = |f: &std::fs::File| {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut &*f, &mut s)?;

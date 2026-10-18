@@ -134,7 +134,7 @@ fn failed_write_leaves_no_half_written_file() {
     all_names(&ws, &mut names);
     let temps: Vec<_> = names
         .iter()
-        .filter(|p| p.to_string_lossy().contains(".ww-tmp-"))
+        .filter(|p| p.to_string_lossy().contains(".lil-tmp-"))
         .collect();
     assert!(temps.is_empty(), "temp files left behind: {temps:?}");
 }

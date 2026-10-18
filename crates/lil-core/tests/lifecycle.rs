@@ -124,7 +124,7 @@ fn draining_core_refuses_new_calls_with_core_draining() {
     );
     let write = other.tool("test.write", json!({"label": "Ünïcödé space"}), Some("k2"));
     assert_eq!(write["error"]["code"], "core.draining", "{write}");
-    let subscribed = other.call("ww/subscribe", json!({"topics": ["test:a"]}));
+    let subscribed = other.call("lil/subscribe", json!({"topics": ["test:a"]}));
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");
     let late = connect(&env, json!({}));
     drop(late);

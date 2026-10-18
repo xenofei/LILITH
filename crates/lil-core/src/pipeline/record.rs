@@ -32,7 +32,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use lil_schema::{Bump, LinkRef, Manifest, ManifestView, Status, StatusEvent, Version, transition};
+use lil_schema::{
+    Bump, LinkRef, Manifest, ManifestView, SCHEME, Status, StatusEvent, Version, transition,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -132,7 +134,7 @@ impl RecordSlot {
 
 /// The live topic of an asset (ARCH-044).
 pub fn asset_topic(ws_id: &str, project: &str, asset_id: &str) -> String {
-    format!("asset:ww://{ws_id}/{project}/{asset_id}")
+    format!("asset:{SCHEME}{ws_id}/{project}/{asset_id}")
 }
 
 /// The Record stage's steps 1–3 for `plan` in workspace `ws_id` on the UTC day `today`
@@ -385,7 +387,7 @@ async fn hand_off_dependents(
                 if all_sealed {
                     handoff
                         .unlocks
-                        .push(format!("ww://{ws_id}/{project}/{asset_id}"));
+                        .push(format!("{SCHEME}{ws_id}/{project}/{asset_id}"));
                 }
             }
             _ => {}

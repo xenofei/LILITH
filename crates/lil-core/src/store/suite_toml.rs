@@ -11,8 +11,8 @@
 //! 2. `register`; an unchanged text is not written;
 //! 3. the fail point `store.suite_toml`;
 //! 4. hash the file again: a change since step 1 is an outside change;
-//! 5. write `.suite.toml.ww-tmp-<pid>-<n>` beside it (flushed before it is closed) and swap it
-//!    in: `ReplaceFileW` with the backup `.suite.toml.ww-bak-<pid>-<n>` for an existing file,
+//! 5. write `.suite.toml.lil-tmp-<pid>-<n>` beside it (flushed before it is closed) and swap it
+//!    in: `ReplaceFileW` with the backup `.suite.toml.lil-bak-<pid>-<n>` for an existing file,
 //!    `move_new` for a file that doesn't exist yet (`ReplaceFileW` needs an existing target).
 //!    Errors 80 and 183 from `move_new` mean another writer created the file meanwhile, an
 //!    outside change;
@@ -20,7 +20,7 @@
 //!    unshared handle, the store's `remove_if_hash`). Otherwise an outside edit landed between
 //!    steps 4 and 5: it is put back with `ReplaceFileW`, and the second backup is removed only
 //!    if it holds this core's bytes. Anything else in it is a newer outside save, which the
-//!    store's `set_aside` keeps beside the file as `suite.toml.ww-conflict-<utc>`.
+//!    store's `set_aside` keeps beside the file as `suite.toml.lil-conflict-<utc>`.
 //!
 //! The fail points are the store's at the same steps: `store.replace` just before the replace,
 //! `store.after_replace` just after it, and `store.put_back` after the put-back's replace.
@@ -37,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lil_platform::Env;
 use lil_platform::fs::{RetryClass, classify};
+use lil_platform::names::{BAK_MARKER, TMP_MARKER};
 use lil_platform::paths::folder_key;
 use lil_schema::{sha256_hex, suite_edit};
 
@@ -262,11 +263,11 @@ async fn swap_once(
     let names = Names {
         dir,
         name: &name,
-        b1: dir.join(format!(".{name}.ww-bak-{pid}-{n}")),
-        b2: dir.join(format!(".{name}.ww-bak-{pid}-{}", n + 1)),
+        b1: dir.join(format!(".{name}{BAK_MARKER}{pid}-{n}")),
+        b2: dir.join(format!(".{name}{BAK_MARKER}{pid}-{}", n + 1)),
     };
-    let temp =
-        fsops::write_temp(dir, &format!(".{name}.ww-tmp-{pid}-{n}"), bytes, fp).map_err(before)?;
+    let temp = fsops::write_temp(dir, &format!(".{name}{TMP_MARKER}{pid}-{n}"), bytes, fp)
+        .map_err(before)?;
     let placed = place(file, &temp, &names, expected, &sha256_hex(bytes), fp).await;
     if temp.exists() {
         let _ = remove_temp(&temp);

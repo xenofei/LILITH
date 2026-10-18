@@ -1,5 +1,5 @@
-//! `worldwright.yaml` (I2) and `project.yaml` (I4): reading the settings layers and writing new
-//! files.
+//! The workspace file `lilith.yaml` (I2) and `project.yaml` (I4): reading the settings layers
+//! and writing new files.
 //!
 //! Settings cascade (CORE-057, I2, I4): workspace `defaults:` → `project.yaml` → the request
 //! layer. The project layer is `project.yaml`'s own top-level keys (there is no `overrides:`
@@ -25,7 +25,7 @@ pub const CASCADE_KEYS: &[&str] = &[
 /// Cascade keys that both layers write under `pipeline:`.
 const PIPELINE_KEYS: &[&str] = &["skip_stages", "auto_approve"];
 
-/// What the core reads from `worldwright.yaml`.
+/// What the core reads from the workspace file (`lilith.yaml`, or a legacy one).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceYaml {
     pub name: Option<String>,
@@ -52,7 +52,7 @@ pub struct ProjectYaml {
 pub const PROGRESS_TEMPLATE: &str = "# <name>\n\n## Done\n\n## Next\n\n## Open questions\n";
 
 pub fn read_workspace_yaml(text: &str) -> Result<WorkspaceYaml, String> {
-    let root = root_map(text, "worldwright.yaml")?;
+    let root = root_map(text, "the workspace file")?;
     let defaults = match root.get("defaults") {
         Some(Value::Object(d)) => cascade_layer(d),
         _ => Map::new(),
@@ -152,7 +152,7 @@ fn to_json(y: &Yaml) -> Value {
     }
 }
 
-/// A new `worldwright.yaml`.
+/// A new `lilith.yaml`.
 pub fn new_workspace_yaml(name: &str, created: &str) -> String {
     format!(
         "# Workspace settings (I2). Projects inherit `defaults` unless they override them.\n\

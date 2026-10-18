@@ -8,9 +8,13 @@
 //! only through `probe.open_read`, after the attribute-only `probe.identity` has ruled out a
 //! cloud placeholder, so it never downloads one.
 //!
-//! Names beside a target `<dir>\<name>`: the temp file `.<name>.ww-tmp-<pid>-<n>`, the
-//! backups `.<name>.ww-bak-<pid>-<n>` and `.<name>.ww-bak-<pid>-<n+1>`, and a visible conflict
-//! copy `<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>`. No rename ever replaces an existing file.
+//! Names beside a target `<dir>\<name>`: the temp file `.<name>.lil-tmp-<pid>-<n>`, the
+//! backups `.<name>.lil-bak-<pid>-<n>` and `.<name>.lil-bak-<pid>-<n+1>`, and a visible conflict
+//! copy `<name>.lil-conflict-<YYYYMMDDTHHMMSSZ>`. No rename ever replaces an existing file.
+//! Recovery and the conflict recognisers also read the legacy markers
+//! (`names::LEGACY_TMP_MARKER`, `LEGACY_BAK_MARKER` and `LEGACY_CONFLICT_MARKER`, R4), so a
+//! leftover from before the rename is resolved as its `lil` twin would be; writers use only the
+//! `lil` markers.
 //!
 //! A fail point's error stands for the error of the file call that follows it. Where that call
 //! is the rest of a swap (after `store.after_replace`, between the fallback's renames, in the
@@ -28,6 +32,10 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, UNIX_EPOCH};
 
 use lil_platform::fs::{FileIdentity, Probe, RetryClass, classify};
+use lil_platform::names::{
+    BAK_MARKER, CONFLICT_MARKER, LEGACY_BAK_MARKER, LEGACY_TMP_MARKER, LEGACY_WORKSPACE_DIR,
+    TMP_MARKER,
+};
 use lil_platform::{Clock, IdSource};
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{
@@ -84,7 +92,7 @@ pub enum StoreError {
     /// The target changed outside the suite, or (`cloud_only`) is a cloud-only placeholder,
     /// which is never read (ruling Q11). `backup` names the backup that holds the outside
     /// version when a put-back couldn't finish; the next `recover()` puts it back. `kept` names
-    /// the visible `<name>.ww-conflict-<utc>` copies of outside versions the call set aside
+    /// the visible `<name>.lil-conflict-<utc>` copies of outside versions the call set aside
     /// (a newer save the put-back met at the target, or the backup beside an outside file that
     /// took the freed name).
     HashConflict {
@@ -370,7 +378,7 @@ pub struct RecoveryReport {
     pub temps_removed: Vec<WsPath>,
     pub backups_restored: Vec<WsPath>,
     pub backups_removed: Vec<WsPath>,
-    /// `<name>.ww-conflict-<utc>` copies made (the core's bytes set aside beside an outside
+    /// `<name>.lil-conflict-<utc>` copies made (the core's bytes set aside beside an outside
     /// edit, or a backup nothing else accounts for).
     pub conflicts_kept: Vec<WsPath>,
     pub pending_resolved: Vec<WsPath>,
@@ -414,7 +422,7 @@ pub enum Step {
     /// pending row cleared, `store.hash_conflict`.
     Conflict,
     /// An outside writer took the freed name in the gap: that file is kept, the backup is moved
-    /// aside to `<name>.ww-conflict-<utc>`, the temp removed, `store.hash_conflict`.
+    /// aside to `<name>.lil-conflict-<utc>`, the temp removed, `store.hash_conflict`.
     KeepOutsideFile,
     /// `store.disk_full` at once.
     DiskFull,
@@ -498,7 +506,7 @@ pub(super) fn remove_if_hash(path: &Path, sha256: &str) -> io::Result<bool> {
     fsops::remove_if(path, &|file| Ok(hash_reader(file)?.sha256 == sha256))
 }
 
-/// Removes a temp file the caller wrote itself (`.<name>.ww-tmp-<pid>-<n>`, the core's own
+/// Removes a temp file the caller wrote itself (`.<name>.lil-tmp-<pid>-<n>`, the core's own
 /// bytes, never content anyone else has). Shared by `suite.toml` writes, so the hard deletes
 /// stay where CORE-110 allows them. Any other name is refused (`InvalidInput`) and nothing is
 /// deleted.
@@ -550,15 +558,15 @@ pub(crate) fn remove_copy_forward_temp(path: &Path) -> io::Result<()> {
     fsops::remove_file(path)
 }
 
-/// Moves `from` aside to a free `<dir>\<name>.ww-conflict-<stamp>` (a `-<k>` suffix when that
+/// Moves `from` aside to a free `<dir>\<name>.lil-conflict-<stamp>` (a `-<k>` suffix when that
 /// name is taken) with `move_new`, and returns the new path. Shared by the store and
 /// `suite.toml` writes.
 pub(super) fn set_aside(from: &Path, dir: &Path, name: &str, stamp: &str) -> io::Result<PathBuf> {
     for k in 1..=100 {
         let conflict = if k == 1 {
-            format!("{name}.ww-conflict-{stamp}")
+            format!("{name}{CONFLICT_MARKER}{stamp}")
         } else {
-            format!("{name}.ww-conflict-{stamp}-{k}")
+            format!("{name}{CONFLICT_MARKER}{stamp}-{k}")
         };
         let to = dir.join(conflict);
         match fsops::move_new(from, &to) {
@@ -694,8 +702,8 @@ struct Names {
 
 /// The longest file name, in UTF-16 units, that Windows accepts.
 const NAME_UNITS_MAX: usize = 255;
-/// Room for `.` + `.ww-tmp-` + a pid + `-` + a counter.
-const NAME_SUFFIX_UNITS: usize = 1 + 8 + 10 + 1 + 20;
+/// Room for `.` + [`TMP_MARKER`] (`.lil-tmp-`, 9 units) + a pid + `-` + a counter.
+const NAME_SUFFIX_UNITS: usize = 1 + TMP_MARKER.len() + 10 + 1 + 20;
 
 impl Names {
     /// Fresh names in `dir` whose temp and both backups don't exist yet.
@@ -703,14 +711,14 @@ impl Names {
         let pid = std::process::id();
         for _ in 0..100 {
             let n = NEXT_N.fetch_add(2, Ordering::Relaxed);
-            let temp_name = format!(".{name}.ww-tmp-{pid}-{n}");
+            let temp_name = format!(".{name}{TMP_MARKER}{pid}-{n}");
             let names = Names {
                 dir: dir.to_path_buf(),
                 name: name.to_string(),
                 temp: dir.join(&temp_name),
                 temp_name,
-                b1: dir.join(format!(".{name}.ww-bak-{pid}-{n}")),
-                b2: dir.join(format!(".{name}.ww-bak-{pid}-{}", n + 1)),
+                b1: dir.join(format!(".{name}{BAK_MARKER}{pid}-{n}")),
+                b2: dir.join(format!(".{name}{BAK_MARKER}{pid}-{}", n + 1)),
                 new_sha256: String::new(),
             };
             if !exists(&names.temp) && !exists(&names.b1) && !exists(&names.b2) {
@@ -728,13 +736,17 @@ enum LeftoverKind {
     Backup,
 }
 
-/// `.<target>.ww-tmp-<pid>-<n>` or `.<target>.ww-bak-<pid>-<n>` → (kind, target, pid, n).
+/// `.<target>.lil-tmp-<pid>-<n>` or `.<target>.lil-bak-<pid>-<n>` → (kind, target, pid, n). The
+/// legacy markers ([`LEGACY_TMP_MARKER`], [`LEGACY_BAK_MARKER`]) parse the same way (R4), so
+/// recovery resolves a leftover from before the rename as it would its `lil` twin.
 fn parse_leftover(file_name: &str) -> Option<(LeftoverKind, String, u32, u64)> {
     let rest = file_name.strip_prefix('.')?;
     // The marker that comes last names the kind: a target may itself hold the other marker.
     let (i, marker, kind) = [
-        (".ww-tmp-", LeftoverKind::Temp),
-        (".ww-bak-", LeftoverKind::Backup),
+        (TMP_MARKER, LeftoverKind::Temp),
+        (LEGACY_TMP_MARKER, LeftoverKind::Temp),
+        (BAK_MARKER, LeftoverKind::Backup),
+        (LEGACY_BAK_MARKER, LeftoverKind::Backup),
     ]
     .into_iter()
     .filter_map(|(marker, kind)| rest.rfind(marker).map(|i| (i, marker, kind)))
@@ -758,7 +770,17 @@ struct Leftover {
     n: u64,
 }
 
-/// Every temp and backup file under `root`, skipping `.git`, the root's `.trash` and links.
+/// Whether `rel` is in the root's legacy workspace data folder, where nothing is moved or
+/// deleted (R4): recovery leaves what a core from before the rename left there.
+fn in_legacy_workspace_dir(rel: &WsPath) -> bool {
+    rel.as_str()
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(LEGACY_WORKSPACE_DIR))
+}
+
+/// Every temp and backup file under `root`, skipping `.git`, the root's `.trash` and legacy
+/// workspace data folder (R4: nothing in it is moved or deleted), and links.
 /// A folder that can't be listed is logged and skipped.
 fn scan_leftovers(root: &Path) -> io::Result<Vec<Leftover>> {
     let mut found = Vec::new();
@@ -783,7 +805,9 @@ fn scan_leftovers(root: &Path) -> io::Result<Vec<Leftover>> {
             }
             if kind.is_dir() {
                 let skip = name.eq_ignore_ascii_case(".git")
-                    || (dir == root && name.eq_ignore_ascii_case(".trash"));
+                    || (dir == root
+                        && (name.eq_ignore_ascii_case(".trash")
+                            || name.eq_ignore_ascii_case(LEGACY_WORKSPACE_DIR)));
                 if !skip {
                     folders.push(path);
                 }
@@ -1224,7 +1248,7 @@ impl Store {
         blocking(move || Ok(exists(&path))).await.unwrap_or(false)
     }
 
-    /// Moves `from` aside to a free `<dir>\<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>` (a `-<k>`
+    /// Moves `from` aside to a free `<dir>\<name>.lil-conflict-<YYYYMMDDTHHMMSSZ>` (a `-<k>`
     /// suffix when that name is taken) with `move_new`.
     async fn move_aside(&self, from: &Path, dir: &Path, name: &str) -> io::Result<WsPath> {
         let stamp = lil_schema::time::compact(self.now_utc());
@@ -1403,7 +1427,8 @@ impl Store {
             .pending(rel.as_str())
             .await
             .map_err(|e| StoreError::state(rel, &e))?;
-        if pending.is_none() {
+        // A stopped swap in the legacy workspace data folder is never resolved (R4).
+        if pending.is_none() || in_legacy_workspace_dir(rel) {
             return Ok(seen);
         }
         if self.access == Access::ReadOnly {
@@ -2290,7 +2315,7 @@ impl Store {
     /// The outside version is in place. The second backup holds whatever the target held when
     /// the put-back moved it: the core's new bytes, which are removed, or a newer outside save
     /// (the user saved again during the put-back), which is moved aside to a visible
-    /// `<name>.ww-conflict-<utc>` copy and named in `data.kept`. The pending row is then cleared;
+    /// `<name>.lil-conflict-<utc>` copy and named in `data.kept`. The pending row is then cleared;
     /// if the second backup can't be handled it stays, with the row, for recovery.
     async fn finish_put_back(
         &self,
@@ -2376,6 +2401,12 @@ impl Store {
             .map_err(|e| StoreError::state(&root_rel, &e))?;
         for row in &rows {
             let rel = WsPath::from_disk(row.path.clone());
+            // A copied-forward row of a write a core from before the rename left in its own
+            // folder stays as it is: nothing in that folder is moved or deleted (R4).
+            if in_legacy_workspace_dir(&rel) {
+                tracing::info!(path = %rel, "a pending replace in the legacy workspace data folder is left alone");
+                continue;
+            }
             let _held = self.lock_path(&rel).await;
             // The row as it is now, under the lock: a write may have resolved or replaced it.
             let Some(row) = self
@@ -2620,30 +2651,86 @@ pub(super) fn event(written: &Written, kind: ChangeKind) -> StoreEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lil_platform::names::LEGACY_CONFLICT_MARKER;
 
     #[test] // spec: ARCH-074
     fn leftover_names_parse_back() {
         assert_eq!(
-            parse_leftover(".a.txt.ww-tmp-12-7"),
+            parse_leftover(".a.txt.lil-tmp-12-7"),
             Some((LeftoverKind::Temp, "a.txt".to_string(), 12, 7))
         );
         assert_eq!(
-            parse_leftover("..hidden.ww-bak-3-4"),
+            parse_leftover("..hidden.lil-bak-3-4"),
             Some((LeftoverKind::Backup, ".hidden".to_string(), 3, 4))
         );
         assert_eq!(
-            parse_leftover(".x.ww-tmp-1.ww-bak-2-3"),
-            Some((LeftoverKind::Backup, "x.ww-tmp-1".to_string(), 2, 3))
+            parse_leftover(".x.lil-tmp-1.lil-bak-2-3"),
+            Some((LeftoverKind::Backup, "x.lil-tmp-1".to_string(), 2, 3))
+        );
+        // The legacy markers parse the same way (R4), and the last marker of either set wins.
+        assert_eq!(
+            parse_leftover(&format!(".a.txt{LEGACY_TMP_MARKER}12-7")),
+            Some((LeftoverKind::Temp, "a.txt".to_string(), 12, 7))
+        );
+        assert_eq!(
+            parse_leftover(&format!("..hidden{LEGACY_BAK_MARKER}3-4")),
+            Some((LeftoverKind::Backup, ".hidden".to_string(), 3, 4))
+        );
+        assert_eq!(
+            parse_leftover(&format!(".x{LEGACY_TMP_MARKER}1.lil-bak-2-3")),
+            Some((LeftoverKind::Backup, format!("x{LEGACY_TMP_MARKER}1"), 2, 3))
+        );
+        assert_eq!(
+            parse_leftover(&format!(".x.lil-bak-1{LEGACY_TMP_MARKER}2-3")),
+            Some((LeftoverKind::Temp, "x.lil-bak-1".to_string(), 2, 3))
         );
         for no in [
-            "a.txt.ww-tmp-1-2",
-            ".ww-tmp-1-2",
-            ".a.ww-tmp-1",
-            ".a.ww-tmp-x-2",
-            ".a.ww-bak-1-2b",
-            "a.txt.ww-conflict-20261016T120000Z",
+            "a.txt.lil-tmp-1-2",
+            ".lil-tmp-1-2",
+            ".a.lil-tmp-1",
+            ".a.lil-tmp-x-2",
+            ".a.lil-bak-1-2b",
+            "a.txt.lil-conflict-20261016T120000Z",
         ] {
             assert_eq!(parse_leftover(no), None, "{no}");
+        }
+        for no in [
+            format!("a.txt{LEGACY_TMP_MARKER}1-2"),
+            format!("{LEGACY_TMP_MARKER}1-2"),
+            format!(".a{LEGACY_TMP_MARKER}1"),
+            format!(".a{LEGACY_BAK_MARKER}1-2b"),
+            format!("a.txt{LEGACY_CONFLICT_MARKER}20261016T120000Z"),
+        ] {
+            assert_eq!(parse_leftover(&no), None, "{no}");
+        }
+    }
+
+    #[test] // spec: ARCH-074
+    fn writer_names_use_only_lil_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = Names::pick(dir.path(), "a.txt").unwrap();
+        let pid = std::process::id();
+        let file_name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            names
+                .temp_name
+                .starts_with(&format!(".a.txt.lil-tmp-{pid}-"))
+        );
+        assert_eq!(file_name(&names.temp), names.temp_name);
+        assert!(file_name(&names.b1).starts_with(&format!(".a.txt.lil-bak-{pid}-")));
+        assert!(file_name(&names.b2).starts_with(&format!(".a.txt.lil-bak-{pid}-")));
+        assert_eq!(NAME_SUFFIX_UNITS, 1 + 9 + 10 + 1 + 20);
+
+        let from = dir.path().join("a.txt");
+        fsops::write_file_atomic(&from, b"outside").unwrap();
+        let kept = set_aside(&from, dir.path(), "a.txt", "20261017T120000Z").unwrap();
+        assert_eq!(file_name(&kept), "a.txt.lil-conflict-20261017T120000Z");
+
+        for path in [&names.temp, &names.b1, &names.b2, &kept] {
+            let name = file_name(path);
+            for legacy in [LEGACY_TMP_MARKER, LEGACY_BAK_MARKER, LEGACY_CONFLICT_MARKER] {
+                assert!(!name.contains(legacy), "{name}");
+            }
         }
     }
 
@@ -2682,16 +2769,16 @@ mod tests {
         let fp = FailPoints::none();
         for name in [
             "suite.toml",
-            ".suite.toml.ww-bak-1-2",
-            "a.ww-tmp-1-2",
-            ".a.ww-tmp-1",
+            ".suite.toml.lil-bak-1-2",
+            "a.lil-tmp-1-2",
+            ".a.lil-tmp-1",
         ] {
             let path = fsops::write_temp(dir.path(), name, b"keep", &fp).unwrap();
             let refused = remove_temp(&path).unwrap_err();
             assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{name}");
             assert!(path.exists(), "{name} was deleted");
         }
-        let temp = fsops::write_temp(dir.path(), ".suite.toml.ww-tmp-1-2", b"x", &fp).unwrap();
+        let temp = fsops::write_temp(dir.path(), ".suite.toml.lil-tmp-1-2", b"x", &fp).unwrap();
         remove_temp(&temp).unwrap();
         assert!(!temp.exists());
     }

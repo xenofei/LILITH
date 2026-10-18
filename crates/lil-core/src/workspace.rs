@@ -11,8 +11,11 @@
 //!
 //! [`WorkspaceHub`] opens a workspace once per id (ARCH-028, CORE-005): `core.lock`, its
 //! `state.db`, its [`Store`] and the store's recovery, and the orphan list. The core that
-//! takes `<ws>\.worldwright\core.lock` serves the workspace [`Access::ReadWrite`]; every other
-//! core serves it [`Access::ReadOnly`]: read tools work, write tools get
+//! takes `<ws>\.lilith\core.lock`, and also the legacy workspace data folder's `core.lock`
+//! when that folder exists (D4, [`take_core_locks`]), serves the workspace
+//! [`Access::ReadWrite`]. So a core from before the rename and this one never both write to a
+//! workspace, whichever starts first. Every other core serves it [`Access::ReadOnly`]: read
+//! tools work, write tools get
 //! `workspace.read_only`, and its `state.db` is never written (an in-memory one stands in when
 //! there is none on disk).
 //!
@@ -27,6 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use lil_platform::fs::{LockedFile, Probe};
+use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
 use lil_platform::paths::strip_verbatim;
 use lil_platform::{Clock, Env, IdSource, check_workspace};
 use lil_protocol::codes::{
@@ -204,8 +208,8 @@ pub struct OpenWorkspace {
     pub watch: Option<Arc<Watcher>>,
     /// The orphans listed at open (CORE-038).
     pub orphans: Vec<WsPath>,
-    /// `core.lock`, held while the workspace is open read-write.
-    lock: Mutex<Option<LockedFile>>,
+    /// Both `core.lock`s (D4), held while the workspace is open read-write.
+    lock: Mutex<Option<CoreLocks>>,
     /// Closes the workspace's databases when it is dropped.
     states: Arc<StateRegistry>,
     /// Set once the workspace is closed; a drop then does nothing more.
@@ -253,6 +257,65 @@ impl Drop for OpenWorkspace {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The lock file's name in a workspace data folder (ARCH-028).
+pub const CORE_LOCK: &str = "core.lock";
+
+/// The workspace locks a read-write core holds (D4): `.lilith\core.lock`, and the legacy
+/// folder's `core.lock` when that folder exists. Dropping it releases both.
+#[derive(Debug)]
+pub struct CoreLocks {
+    _new: LockedFile,
+    _legacy: Option<LockedFile>,
+}
+
+/// A `core.lock` that can't be opened: its workspace-relative path and the error.
+#[derive(Debug)]
+pub struct LockError {
+    pub file: PathBuf,
+    pub error: std::io::Error,
+}
+
+/// Takes the workspace's locks for a read-write open (D4), in this order:
+/// 1. creates `.lilith\` if needed and takes `.lilith\core.lock`; held elsewhere → `None`;
+/// 2. when the legacy workspace data folder exists, takes its `core.lock`, the one a core from
+///    before the rename takes. Held elsewhere → `None`, and the new lock is released at once,
+///    so it doesn't keep a later core from serving once the other holder is gone.
+///
+/// `Some` only when every lock is held: only then may the core write. The legacy folder is
+/// never created; its lock file is created if missing, the one write under the old name
+/// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other.
+///
+/// # Errors
+/// A lock file that can't be opened, with its workspace-relative path.
+pub fn take_core_locks(root: &Path) -> Result<Option<CoreLocks>, LockError> {
+    let take = |dir: &str| {
+        let fail = |error| LockError {
+            file: Path::new(dir).join(CORE_LOCK),
+            error,
+        };
+        fsops::lock_exclusive(&root.join(dir).join(CORE_LOCK)).map_err(fail)
+    };
+    fsops::ensure_dir(&root.join(WORKSPACE_DIR)).map_err(|error| LockError {
+        file: Path::new(WORKSPACE_DIR).join(CORE_LOCK),
+        error,
+    })?;
+    let Some(new) = take(WORKSPACE_DIR)? else {
+        return Ok(None);
+    };
+    let legacy = if root.join(LEGACY_WORKSPACE_DIR).is_dir() {
+        match take(LEGACY_WORKSPACE_DIR)? {
+            Some(held) => Some(held),
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
+    Ok(Some(CoreLocks {
+        _new: new,
+        _legacy: legacy,
+    }))
 }
 
 /// A workspace the hub let go of while calls still held it.
@@ -372,9 +435,11 @@ impl WorkspaceHub {
     ///
     /// The open, in order:
     /// 1. `check_workspace` (the harness guard, QA-040);
-    /// 2. `<ws>\.worldwright\` and its `core.lock`: taken → [`Access::ReadWrite`], held by
-    ///    another core → [`Access::ReadOnly`];
-    /// 3. the workspace `state.db` for that access;
+    /// 2. `<ws>\.lilith\` and its `core.lock`, then the legacy folder's `core.lock` when that
+    ///    folder exists ([`take_core_locks`]): every lock taken → [`Access::ReadWrite`], one
+    ///    held by another core → [`Access::ReadOnly`];
+    /// 3. the workspace `state.db` for that access: only a read-write open, which holds every
+    ///    lock, copies a legacy `state.db` forward (D3);
     /// 4. the store, and its `recover()` (read-write only); its `maintenance()` then starts in
     ///    the background and runs every [`MAINTENANCE_PERIOD`] while the workspace stays open;
     /// 5. `orphans()`, published once on the `workspace` topic as
@@ -434,27 +499,29 @@ impl WorkspaceHub {
     async fn open_now(&self, ws: &WorkspaceRef) -> Result<Arc<OpenWorkspace>, ErrorBody> {
         // 1.
         check_workspace(&ws.path);
-        // 2.
+        // 2. Both locks (D4) before anything else: the access, and so the `state.db`
+        // copy-forward in step 3, which runs only read-write, follow from holding both.
         let root = ws.path.clone();
-        let taken = tokio::task::spawn_blocking(move || {
-            let dir = root.join(".worldwright");
-            fsops::ensure_dir(&dir)?;
-            fsops::lock_exclusive(&dir.join("core.lock"))
-        })
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(format!("the open stopped: {e}"))))
-        .map_err(|e| {
-            tracing::error!(workspace = %ws.path.display(), error = %e, "core.lock can't be opened");
-            ErrorBody::new(
-                &STORE_IO,
-                format!(
-                    "The workspace {} can't be opened: its .worldwright\\core.lock can't be \
-                     opened ({e}).",
-                    ws.path.display()
-                ),
-                "",
-            )
-        })?;
+        let taken = tokio::task::spawn_blocking(move || take_core_locks(&root))
+            .await
+            .unwrap_or_else(|e| {
+                Err(LockError {
+                    file: Path::new(WORKSPACE_DIR).join(CORE_LOCK),
+                    error: std::io::Error::other(format!("the open stopped: {e}")),
+                })
+            })
+            .map_err(|LockError { file, error: e }| {
+                tracing::error!(workspace = %ws.path.display(), file = %file.display(), error = %e, "core.lock can't be opened");
+                ErrorBody::new(
+                    &STORE_IO,
+                    format!(
+                        "The workspace {} can't be opened: its {} can't be opened ({e}).",
+                        ws.path.display(),
+                        file.display()
+                    ),
+                    "",
+                )
+            })?;
         let access = if taken.is_some() {
             Access::ReadWrite
         } else {

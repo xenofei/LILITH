@@ -445,7 +445,7 @@ fn blocking_client_round_trip() {
 
     let mut events = client
         .subscribe(vec!["test:a".to_string()], BTreeMap::new())
-        .expect("ww/subscribe");
+        .expect("lil/subscribe");
     assert_eq!(events.topics().len(), 1);
     assert_eq!(events.topics()[0].topic, "test:a");
 
@@ -489,7 +489,7 @@ fn subscribe_keeps_replayed_events_in_order() {
     let since = BTreeMap::from([("test:r".to_string(), 0), ("test:stray".to_string(), 3)]);
     let mut events = client
         .subscribe(vec!["test:r".to_string()], since)
-        .expect("ww/subscribe");
+        .expect("lil/subscribe");
     assert_eq!(events.topics()[0].seq, 5);
     ok(client
         .call_tool(
@@ -522,4 +522,91 @@ fn drain_and_wait_stops_a_running_core() {
     assert_eq!(outcome, DrainOutcome::Stopped);
     assert_eq!(core.wait_exit(DEADLINE), Some(0));
     assert!(RawPipe::try_connect(&env, Duration::ZERO).is_none());
+}
+
+/// A plugin-era workspace (Review Focus 5): only the legacy workspace file and the legacy
+/// folder's `state.json`. It is found from a subfolder and served, its active project
+/// survives, new state goes to `.lilith\`, and no file of the person's is renamed or
+/// rewritten. "Setting the active project" is a call that names another project (ARCH-088).
+#[test] // spec: ARCH-030, ARCH-088, ARCH-098
+fn legacy_workspace_is_served_and_never_renamed() {
+    use lil_client::WorkspaceSource;
+    use lil_platform::names::{
+        LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_DIR, WORKSPACE_FILE,
+    };
+    let env = TestEnv::with_label("Ünïcödé space");
+    let ws = env.make_legacy_workspace("plugin era");
+    for (slug, name) in [("p2", "Two"), ("p3", "Three")] {
+        let dir = ws.join("projects").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yaml"),
+            format!("name: {name}\nslug: {slug}\ntype: media\nstatus: active\nlinks: []\n"),
+        )
+        .unwrap();
+    }
+    let legacy_state = ws.join(LEGACY_WORKSPACE_DIR).join("state.json");
+    std::fs::create_dir_all(legacy_state.parent().unwrap()).unwrap();
+    std::fs::write(&legacy_state, br#"{"active_project":"p2"}"#).unwrap();
+    env.register_workspace(&ws, true);
+    let legacy_file = ws.join(LEGACY_WORKSPACE_FILE);
+    let (file_hash, state_hash) = (sha256_file(&legacy_file), sha256_file(&legacy_state));
+
+    // Found from a subfolder.
+    let sub = ws.join("projects").join("p2");
+    let resolved = lil_client::resolve_workspace(&env.env, None, &sub).expect("resolve");
+    assert_eq!(resolved.id, env.workspace_id(&ws));
+    let origin = resolved.origin.clone().expect("an origin");
+    assert_eq!(origin.source, WorkspaceSource::CurrentFolder);
+    assert_eq!(canonical(&origin.path), canonical(&ws));
+
+    // Served, with the legacy hint as the active project.
+    let mut cfg = config(&env);
+    cfg.workspace = resolved.id.clone();
+    cfg.workspace_origin = resolved.origin;
+    let client = BlockingClient::connect(&cfg).unwrap_or_else(|e| panic!("{e}"));
+    let served = client
+        .hello()
+        .workspace
+        .clone()
+        .expect("the workspace is served");
+    assert_eq!(served.id, resolved.id);
+    let status = ok(client
+        .call_tool("project.status", args(json!({})), None)
+        .expect("project.status"));
+    assert_eq!(
+        status.structured["project"], "p2",
+        "{:?}",
+        status.structured
+    );
+
+    // Another project becomes the hint: in the new folder only.
+    ok(client
+        .call_tool("project.status", args(json!({"project": "p3"})), None)
+        .expect("project.status p3"));
+    let new_state = ws.join(WORKSPACE_DIR).join("state.json");
+    let hint: Value = serde_json::from_slice(&std::fs::read(&new_state).unwrap()).unwrap();
+    assert_eq!(hint, json!({"active_project": "p3"}));
+    let status = ok(client
+        .call_tool("project.status", args(json!({})), None)
+        .expect("project.status"));
+    assert_eq!(
+        status.structured["project"], "p3",
+        "{:?}",
+        status.structured
+    );
+    drop(client);
+    stop(&cfg);
+
+    // Nothing of the person's was renamed or rewritten. The legacy folder gained only its
+    // `core.lock` (D4), and there is still no new workspace file.
+    assert_eq!(sha256_file(&legacy_file), file_hash);
+    assert_eq!(sha256_file(&legacy_state), state_hash);
+    assert!(!ws.join(WORKSPACE_FILE).exists());
+    let mut legacy_names: Vec<String> = std::fs::read_dir(ws.join(LEGACY_WORKSPACE_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    legacy_names.sort();
+    assert_eq!(legacy_names, ["core.lock", "state.json"]);
 }

@@ -311,7 +311,7 @@ async fn import_copy_creates_asset_with_uuid_and_candidate_run() {
     let landed = fx.path(&format!("{KITE_DIR}/candidates/{run}/kite.png"));
     assert_eq!(std::fs::read(&landed).unwrap(), b"kite one");
     // The staging handle was given back once the run was committed.
-    let staging = fx.path(".worldwright/staging");
+    let staging = fx.path(".lilith/staging");
     let left: Vec<_> = std::fs::read_dir(&staging)
         .map(|d| d.map(|e| e.unwrap().file_name()).collect())
         .unwrap_or_default();
@@ -337,7 +337,7 @@ async fn import_link_external_records_path_and_hash_without_copying() {
                    "files": [source.to_string_lossy()], "mode": "link_external"}),
         )
         .await;
-    assert_eq!(r["ref"], format!("ww://{}/sketchbook/{KITE}", fx.ws_id()));
+    assert_eq!(r["ref"], format!("lil://{}/sketchbook/{KITE}", fx.ws_id()));
     assert!(r.get("run_id").is_none(), "{r}");
     assert_eq!(r["handoff"]["refs"], json!([]), "{r}");
     let m = fx.manifest(KITE);
@@ -598,7 +598,7 @@ async fn import_ref_is_the_first_file_and_handoff_lists_every_file() {
     let run = r["run_id"].as_str().unwrap();
     let candidate = |name: &str| {
         format!(
-            "ww://{}/sketchbook/{KITE}@candidate/{run}/{name}",
+            "lil://{}/sketchbook/{KITE}@candidate/{run}/{name}",
             fx.ws_id()
         )
     };
@@ -752,7 +752,7 @@ async fn refs_exclude_source_and_carry_the_content_hash() {
     assert_eq!(
         r["ref"],
         format!(
-            "ww://{}/sketchbook/{KITE}@1.0.0#sha256={only_kite}",
+            "lil://{}/sketchbook/{KITE}@1.0.0#sha256={only_kite}",
             fx.ws_id()
         )
     );
@@ -820,7 +820,7 @@ async fn pin_input_accepts_a_target_that_does_not_exist_yet() {
     for bad in [
         "not a ref",
         "proj:Harbor/x@1.0.0",
-        "ww://0123456789abcdef/sketchbook/prop_kite@candidate/r_20261016_1200/a.png",
+        "lil://0123456789abcdef/sketchbook/prop_kite@candidate/r_20261016_1200/a.png",
     ] {
         let e = fx
             .err(
@@ -1253,7 +1253,7 @@ async fn a_cloud_only_legacy_file_leaves_its_version_without_a_content_hash() {
         detail["versions"],
         json!([{
             "version": "1.0.0",
-            "ref": format!("ww://{}/sketchbook/prop_old_sign@1.0.0", fx.ws_id()),
+            "ref": format!("lil://{}/sketchbook/prop_old_sign@1.0.0", fx.ws_id()),
             "legacy": true,
             "cloud_only": true,
         }]),
@@ -1271,7 +1271,7 @@ async fn a_cloud_only_legacy_file_leaves_its_version_without_a_content_hash() {
         detail["versions"],
         json!([{
             "version": "1.0.0",
-            "ref": format!("ww://{}/sketchbook/prop_new_sign@1.0.0#sha256={hash}", fx.ws_id()),
+            "ref": format!("lil://{}/sketchbook/prop_new_sign@1.0.0#sha256={hash}", fx.ws_id()),
             "legacy": true,
         }]),
         "{detail}"

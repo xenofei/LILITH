@@ -52,10 +52,12 @@ pub mod method {
     pub const DRAIN: &str = "core/drain";
     pub const TOOLS_LIST: &str = "tools/list";
     pub const TOOLS_CALL: &str = "tools/call";
-    pub const SUBSCRIBE: &str = "ww/subscribe";
-    pub const UNSUBSCRIBE: &str = "ww/unsubscribe";
+    /// Namespace of the event methods (map row 19), a reserved prefix like [`APP_PREFIX`].
+    pub const PREFIX: &str = "lil/";
+    pub const SUBSCRIBE: &str = "lil/subscribe";
+    pub const UNSUBSCRIBE: &str = "lil/unsubscribe";
     /// Notification, core → client.
-    pub const EVENT: &str = "ww/event";
+    pub const EVENT: &str = "lil/event";
     /// Namespace of the app-only methods (verified `ui:*` callers).
     pub const APP_PREFIX: &str = "app/";
 }
@@ -376,7 +378,7 @@ mod tests {
         );
 
         // A notification (no id).
-        let note = parse_request(r#"{"jsonrpc":"2.0","method":"ww/event","params":{}}"#).unwrap();
+        let note = parse_request(r#"{"jsonrpc":"2.0","method":"lil/event","params":{}}"#).unwrap();
         assert_eq!(note.id, None);
         assert_eq!(note.method, method::EVENT);
 
@@ -425,7 +427,7 @@ mod tests {
 
         let note = encode_notification(method::EVENT, &json!({"topic": "test:a"}));
         match parse_server_line(&note).unwrap() {
-            ServerLine::Notification(r) => assert_eq!(r.method, "ww/event"),
+            ServerLine::Notification(r) => assert_eq!(r.method, "lil/event"),
             other => panic!("{other:?}"),
         }
 
@@ -453,9 +455,18 @@ mod tests {
                 method::EVENT,
                 method::APP_PREFIX
             ],
-            ["ww/subscribe", "ww/unsubscribe", "ww/event", "app/"]
+            ["lil/subscribe", "lil/unsubscribe", "lil/event", "app/"]
         );
         assert_eq!(MAX_LINE_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test] // spec: ARCH-031
+    fn rpc_methods_are_lil_prefixed() {
+        // The reserved prefixes: the event methods' and the app-only methods'.
+        assert_eq!([method::PREFIX, method::APP_PREFIX], ["lil/", "app/"]);
+        for m in [method::SUBSCRIBE, method::UNSUBSCRIBE, method::EVENT] {
+            assert!(m.starts_with(method::PREFIX), "{m}");
+        }
     }
 
     #[test] // spec: ARCH-025

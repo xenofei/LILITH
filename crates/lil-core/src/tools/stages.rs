@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
 use lil_protocol::codes::PARAMS_INVALID;
 use lil_protocol::{ErrorBody, Outcome, PendingConfirmation, ToolDescriptor, ToolOutput};
 use lil_schema::workspace_yaml::{
@@ -139,7 +140,7 @@ impl PipelineHooks {
 #[derive(Debug, Clone, Copy)]
 struct Plan2;
 
-/// The settings cascade (CORE-057): the workspace's `worldwright.yaml` `defaults:`, then the
+/// The settings cascade (CORE-057): the workspace file's (`lilith.yaml`) `defaults:`, then the
 /// call's project's `project.yaml`, then the request layer ([`crate::settings::cascade`]).
 /// Without a workspace only the request layer is there. A file that is missing, can't be read
 /// or doesn't parse is an empty layer (logged), so a damaged `project.yaml` never stops every
@@ -162,17 +163,38 @@ async fn read_text(store: &Store, rel: &str) -> Option<String> {
     }
 }
 
-/// The file layers of `open`: `worldwright.yaml` and `project`'s `project.yaml`.
+/// The workspace file's text: `lilith.yaml`, else the legacy workspace file when the new one is
+/// missing (R4; it is only read). `None` (logged) when neither can be read.
+async fn workspace_text(store: &Store) -> Option<String> {
+    for name in [WORKSPACE_FILE, LEGACY_WORKSPACE_FILE] {
+        let rel = WsPath::parse(name).ok()?;
+        match store.read(&rel).await {
+            Ok(None) => {}
+            Ok(Some(bytes)) => {
+                return String::from_utf8(bytes)
+                    .map_err(|_| tracing::warn!(path = %rel, "a settings file is not UTF-8; it is ignored"))
+                    .ok();
+            }
+            Err(e) => {
+                tracing::warn!(path = %rel, error = %e, "a settings file can't be read; it is ignored");
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// The file layers of `open`: the workspace file and `project`'s `project.yaml`.
 async fn file_layers(
     open: &OpenWorkspace,
     project: Option<&str>,
 ) -> (WorkspaceYaml, Option<ProjectYaml>) {
-    let ws = match read_text(&open.store, "worldwright.yaml").await {
+    let ws = match workspace_text(&open.store).await {
         None => WorkspaceYaml::default(),
         Some(text) => read_workspace_yaml(&text).unwrap_or_else(|why| {
             tracing::warn!(
                 why,
-                "worldwright.yaml doesn't parse; its defaults are ignored"
+                "the workspace file doesn't parse; its defaults are ignored"
             );
             WorkspaceYaml::default()
         }),

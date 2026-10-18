@@ -3,7 +3,7 @@
 //!
 //! - `AssetSummary` is `{ref, project, asset_id, type, status, version, approved_version,
 //!   updated, needs_repair}`; `updated` is the RFC 3339 UTC last write of the manifest as last
-//!   indexed. `ref` names the approved version (`ww://<ws>/<project>/<asset_id>@<version>`),
+//!   indexed. `ref` names the approved version (`lil://<ws>/<project>/<asset_id>@<version>`),
 //!   or the asset without a version when none is approved.
 //! - `AssetDetail` adds `versions` (from `Store::versions`, with `legacy`, each ref carrying
 //!   its content hash, computed from the manifest's `hashes` without opening a sealed file;
@@ -19,7 +19,7 @@
 
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR};
-use lil_schema::{AssetRef, Bump, Manifest, Version};
+use lil_schema::{AssetRef, Bump, Manifest, SCHEME, Version};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -48,7 +48,7 @@ pub struct AssetSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct VersionEntry {
     pub version: String,
-    /// `ww://<ws>/<project>/<asset_id>@<version>#sha256=<content hash>`; without the hash
+    /// `lil://<ws>/<project>/<asset_id>@<version>#sha256=<content hash>`; without the hash
     /// when it isn't known (`cloud_only`).
     #[serde(rename = "ref")]
     pub r#ref: String,
@@ -115,7 +115,7 @@ pub fn asset_summary(ws_id: &str, row: &AssetRow) -> AssetSummary {
             sha256: None,
         }
         .to_string(),
-        None => format!("ww://{ws_id}/{}/{}", row.project, row.asset_id),
+        None => format!("{SCHEME}{ws_id}/{}/{}", row.project, row.asset_id),
     };
     AssetSummary {
         r#ref,

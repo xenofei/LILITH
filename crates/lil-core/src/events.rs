@@ -1,5 +1,5 @@
-//! The event bus (ARCH-032, CORE-012) behind `ww/subscribe`, `ww/unsubscribe` and the
-//! `ww/event` notifications. Infrastructure, not a CORE-014 module.
+//! The event bus (ARCH-032, CORE-012) behind `lil/subscribe`, `lil/unsubscribe` and the
+//! `lil/event` notifications. Infrastructure, not a CORE-014 module.
 //!
 //! - **Sequences.** Each topic's `seq` starts at 1 and goes up by one per [`EventBus::publish`].
 //! - **History.** Each topic keeps its events for [`HISTORY_SECS`] of *monotonic* time (a
@@ -24,7 +24,7 @@
 //!      topic stops being pending.
 //! - **Delivery.** Each client has its own queue of at most [`CLIENT_QUEUE`] events, separate
 //!   from the connection's outbound channel that responses share. A forwarder task per client
-//!   moves events from the queue into that channel in order, as `ww/event` lines; only it
+//!   moves events from the queue into that channel in order, as `lil/event` lines; only it
 //!   ever waits on a slow client. When [`EventBus::publish`] finds a client's queue full, it
 //!   clears the queue and queues one `resync_required` per topic the client subscribes to, at
 //!   that topic's current seq. Responses are never dropped: only the bus queue overflows.
@@ -92,7 +92,7 @@ struct Retained {
     /// Monotonic time of the publish.
     at: Duration,
     seq: u64,
-    /// The event's `ww/event` line, shared with every queue it is in.
+    /// The event's `lil/event` line, shared with every queue it is in.
     line: Arc<str>,
 }
 
@@ -106,7 +106,7 @@ struct Wanted {
     provider: Arc<dyn SnapshotProvider>,
 }
 
-/// One queued `ww/event`.
+/// One queued `lil/event`.
 #[derive(Clone)]
 struct Queued {
     topic: Arc<str>,
@@ -232,7 +232,7 @@ impl EventBus {
     }
 
     /// Starts `client`'s forwarder, which sends its queued events into `outbound` as
-    /// `ww/event` lines. A forwarder attached earlier for the client is stopped. Must be
+    /// `lil/event` lines. A forwarder attached earlier for the client is stopped. Must be
     /// called inside a tokio runtime.
     pub fn attach(&self, client: ClientId, outbound: mpsc::Sender<String>) {
         let mut inner = self.lock();
@@ -543,7 +543,7 @@ fn prune(history: &mut VecDeque<Retained>, now: Duration) {
     }
 }
 
-/// The `ww/event` notification line of one event. A line that would pass the 4 MiB cap
+/// The `lil/event` notification line of one event. A line that would pass the 4 MiB cap
 /// (ARCH-025) is never sent: it is logged and replaced by `resync_required` for the same topic
 /// and seq, so the subscriber knows it missed something.
 fn event_line(topic: &str, seq: u64, kind: EventKind, data: Value) -> Arc<str> {
@@ -643,7 +643,7 @@ mod tests {
         }
     }
 
-    /// The `ww/event` params of an outbound line.
+    /// The `lil/event` params of an outbound line.
     fn parse_line(line: &str) -> EventParams {
         let message: Value = serde_json::from_str(line).expect("a JSON line");
         assert_eq!(message["method"], method::EVENT, "{line}");
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(bus.publish("test:b", json!(1)), 1);
         assert_eq!(bus.publish("test:a", json!(3)), 3);
         assert_eq!(bus.publish("test:b", json!(2)), 2);
-        // `ww/subscribe` reports each topic's current seq; a topic never published is at 0.
+        // `lil/subscribe` reports each topic's current seq; a topic never published is at 0.
         let states = bus
             .subscribe(1, &names(&["test:a", "test:b", "jobs"]), &cursors(&[]))
             .await;

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lil_schema::{
-    AssetRef, LinkRef, Manifest, ManifestView, Status, StatusEvent, Version, transition,
+    AssetRef, LinkRef, Manifest, ManifestView, SCHEME, Status, StatusEvent, Version, transition,
 };
 use serde_json::Value;
 
@@ -143,7 +143,7 @@ async fn stale_input(
 
 /// Marks the assets of `project` stale whose inputs moved on while it was archived (module
 /// docs), and returns the refs of those this call marked
-/// (`ww://<ws>/<project>/<asset_id>@<approved version>#sha256=<content hash>`, see
+/// (`lil://<ws>/<project>/<asset_id>@<approved version>#sha256=<content hash>`, see
 /// `stale_ref`). Each edit is the store's hash-checked
 /// manifest edit; the status is checked again on the manifest as it is written.
 ///
@@ -223,7 +223,7 @@ pub async fn restore_staleness(
 }
 
 /// The ref of an asset marked stale: its approved version with the version's content hash
-/// (`ww://<ws>/<project>/<asset_id>@<version>#sha256=<hex>`; CORE-047: every new reference to
+/// (`lil://<ws>/<project>/<asset_id>@<version>#sha256=<hex>`; CORE-047: every new reference to
 /// a sealed version carries the hash), from `Store::versions` as `asset.get` gives it. When
 /// that version's folder isn't on this machine (or can't be read without a download), the
 /// hash can't be known and the ref names the version without it (logged); an asset with no
@@ -236,7 +236,7 @@ pub async fn stale_ref(
     approved: Option<Version>,
 ) -> String {
     let Some(version) = approved else {
-        return format!("ww://{ws_id}/{project}/{asset_id}");
+        return format!("{SCHEME}{ws_id}/{project}/{asset_id}");
     };
     let sha256 = match store.versions(project, asset_id).await {
         Ok(versions) => versions

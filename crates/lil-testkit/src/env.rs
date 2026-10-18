@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use lil_platform::{
     Channel, ENV_CHANNEL, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env, RealLocations, Roots,
-    TEST_PIPE_SID, arm_test_guard,
+    TEST_PIPE_SID, arm_test_guard, names,
 };
 
 use crate::bins::ensure_built;
@@ -268,13 +268,23 @@ impl TestEnv {
         }
     }
 
-    /// Creates `<root>\ws-<name>\worldwright.yaml` containing `name: <name>` and returns the
+    /// Creates `<root>\ws-<name>\lilith.yaml` containing `name: <name>` and returns the
     /// workspace folder.
     pub fn make_workspace(&self, name: &str) -> PathBuf {
+        self.make_workspace_with(name, names::WORKSPACE_FILE)
+    }
+
+    /// A workspace from before the rename (R4): `<root>\ws-<name>\` with only the legacy
+    /// workspace file (`names::LEGACY_WORKSPACE_FILE`) containing `name: <name>`.
+    pub fn make_legacy_workspace(&self, name: &str) -> PathBuf {
+        self.make_workspace_with(name, names::LEGACY_WORKSPACE_FILE)
+    }
+
+    fn make_workspace_with(&self, name: &str, file: &str) -> PathBuf {
         let ws = self.root().join(format!("ws-{name}"));
         std::fs::create_dir_all(&ws)
             .unwrap_or_else(|e| panic!("cannot create {}: {e}", ws.display()));
-        let manifest = ws.join("worldwright.yaml");
+        let manifest = ws.join(file);
         std::fs::write(&manifest, format!("name: {name}\n"))
             .unwrap_or_else(|e| panic!("cannot write {}: {e}", manifest.display()));
         ws
@@ -815,7 +825,7 @@ mod tests {
         let b = t.make_workspace("beta");
         assert_eq!(a, t.root().join("ws-alpha"));
         assert_eq!(
-            std::fs::read_to_string(a.join("worldwright.yaml")).unwrap(),
+            std::fs::read_to_string(a.join("lilith.yaml")).unwrap(),
             "name: alpha
 "
         );

@@ -7,7 +7,7 @@
 //!
 //! [`Store::seal`]:
 //! 1. refuses an existing `v<version>/` (`version.exists`), unless it adopts it (below);
-//! 2. creates `<ws>\.worldwright\staging\seal-<sh_…>\`, a live staging entry while it works;
+//! 2. creates `<ws>\.lilith\staging\seal-<sh_…>\`, a live staging entry while it works;
 //! 3. moves the chosen files and the files derived from them (`role: derived`, following
 //!    `from` through the run) from `candidates/<run>/`, copying instead a file that another
 //!    run file was derived from (I5), and moves `source/` if the run has one. Before anything

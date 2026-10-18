@@ -41,8 +41,7 @@ use lil_protocol::{
 pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
 pub use workspace::{
-    ResolvedWorkspace, WORKSPACE_MANIFEST, WorkspaceOrigin, WorkspaceSource, resolve_workspace,
-    resolve_workspace_id,
+    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, resolve_workspace, resolve_workspace_id,
 };
 
 /// The start of an `Untrusted` reason for a core of the current user whose executable is in
@@ -188,7 +187,7 @@ pub enum ClientError {
     /// The core answered with an error result.
     Refused(ErrorBody),
     /// The core refused the hello with `workspace.unknown` for the workspace the `cli` chain
-    /// found ([`ClientConfig::workspace_origin`]): most often a folder with `worldwright.yaml`
+    /// found ([`ClientConfig::workspace_origin`]): most often a folder with `lilith.yaml`
     /// that is not registered in `suite.toml`. `default` is the default workspace `suite.toml`
     /// names, the one the core serves (`None` when none is set or it can't be read).
     UnknownWorkspace {

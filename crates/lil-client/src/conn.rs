@@ -4,9 +4,9 @@
 //! - A writer task owns the pipe's write half and writes whole lines from a queue, so a call
 //!   whose future is dropped never leaves half a line behind.
 //! - A reader task owns the read half. Each response goes to the call waiting for its id;
-//!   each `ww/event` notification goes, at any time, to every [`EventStream`] whose topics
+//!   each `lil/event` notification goes, at any time, to every [`EventStream`] whose topics
 //!   include its topic. One reader keeps the core's order, so no event is lost or reordered.
-//! - A subscription's stream is registered *before* its `ww/subscribe` request is written:
+//! - A subscription's stream is registered *before* its `lil/subscribe` request is written:
 //!   replayed events may arrive before the reply (the core queues them while it subscribes),
 //!   and they are buffered in the stream until it is read.
 //! - When either task ends (the core closed the pipe, a read or write failed, a line was

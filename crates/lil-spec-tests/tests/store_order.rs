@@ -292,7 +292,7 @@ fn staging_handle_is_in_workspace_and_ingest_moves_files() {
     let staging_dir = result["staging_dir"]
         .as_str()
         .unwrap_or_else(|| panic!("no staging_dir: {result}"));
-    let prefix = format!(r"{}\.worldwright\staging\", canon_lower(&ws));
+    let prefix = format!(r"{}\.lilith\staging\", canon_lower(&ws));
     let staging_lower = staging_dir.to_lowercase();
     let handle = staging_lower
         .strip_prefix(&prefix)

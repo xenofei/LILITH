@@ -1,5 +1,5 @@
 //! The snapshot providers of the live topics (ARCH-044, ARCH-032; Appendix E "Topics"):
-//! [`AssetSnapshots`] for `asset:ww://<workspace id>/<project>/<asset_id>`, whose snapshot is
+//! [`AssetSnapshots`] for `asset:lil://<workspace id>/<project>/<asset_id>`, whose snapshot is
 //! the `asset.get` result (`pipeline::asset_detail`), and [`ProjectSnapshots`] for
 //! `project:<slug>`, whose snapshot is the `project.status` result
 //! (`projects::project_status`). They are in `tools`, not `pipeline` (CORE-010).
@@ -16,6 +16,7 @@ use std::sync::{Arc, Weak};
 
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{CORE_DRAINING, PARAMS_INVALID, WORKSPACE_REQUIRED};
+use lil_schema::SCHEME;
 use serde_json::{Value, json};
 
 use crate::events::SnapshotProvider;
@@ -74,12 +75,13 @@ impl AssetSnapshots {
 
     async fn take(&self, topic: &str) -> Result<Value, ErrorBody> {
         let parsed = topic
-            .strip_prefix("asset:ww://")
+            .strip_prefix("asset:")
+            .and_then(|t| t.strip_prefix(SCHEME))
             .map(|rest| rest.split('/').collect::<Vec<_>>());
         let Some([ws, project, asset_id]) = parsed.as_deref() else {
             return Err(ErrorBody::new(
                 &PARAMS_INVALID,
-                format!("{topic:?} is not asset:ww://<workspace>/<project>/<asset_id>"),
+                format!("{topic:?} is not asset:lil://<workspace>/<project>/<asset_id>"),
                 "",
             ));
         };

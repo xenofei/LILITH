@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 /// The five `.gitignore` entries `workspace.create` writes (Global Constraints, CORE-040).
 const GITIGNORE_ENTRIES: [&str; 5] = [
-    ".worldwright/",
+    ".lilith/",
     ".trash/",
     "inbox/*",
     "projects/*/assets/*/candidates/",
@@ -102,7 +102,7 @@ fn workspace_init_writes_layout_and_registers_default() {
     );
 
     for rel in [
-        "worldwright.yaml",
+        "lilith.yaml",
         ".gitignore",
         ".gitattributes",
         r"projects\sketchbook\project.yaml",

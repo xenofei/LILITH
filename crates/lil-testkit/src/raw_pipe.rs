@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use lil_platform::names;
 use lil_platform::pipe::{open_client, server_pid};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -33,7 +34,7 @@ pub struct RawPipe {
     /// Bytes of a line not yet complete (a read that timed out keeps them here).
     partial: Vec<u8>,
     next_id: u64,
-    /// `ww/event` params that arrived while waiting for a response.
+    /// `lil/event` params that arrived while waiting for a response.
     events: VecDeque<Value>,
     server_pid: Option<u32>,
     /// Declared last so the pipe halves are dropped while it is still alive.
@@ -197,7 +198,7 @@ impl RawPipe {
         }
     }
 
-    /// Sends a request and returns the whole response object (`result` or `error`). `ww/event`
+    /// Sends a request and returns the whole response object (`result` or `error`). `lil/event`
     /// notifications that arrive meanwhile are kept for [`RawPipe::next_event`]. An error
     /// response whose `id` is `null` (the core could not read a request, -32700) is returned at
     /// once too: no response with this call's id will follow it.
@@ -284,7 +285,7 @@ impl RawPipe {
     }
 
     /// The watcher fence (Global Constraints, Tests): writes the new file
-    /// `<ws>\.worldwright\fence\<n>` (`n` unique in this process), then calls
+    /// `<ws>\.lilith\fence\<n>` (`n` unique in this process), then calls
     /// `test.watch_fence {name: n}`, which returns once the workspace's first reconcile has
     /// finished and the watcher has handled that file and everything before it. Tests wait on
     /// the watcher with this, never with a sleep.
@@ -298,12 +299,12 @@ impl RawPipe {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let file = ws.join(".worldwright").join("fence").join(&name);
+        let file = ws.join(names::WORKSPACE_DIR).join("fence").join(&name);
         crate::files::write_file(&file, name.as_bytes());
         self.tool_ok("test.watch_fence", json!({ "name": name }), None);
     }
 
-    /// The params of the next `ww/event` notification, or `None` if none arrived within
+    /// The params of the next `lil/event` notification, or `None` if none arrived within
     /// `within` or the connection closed. Other messages are skipped.
     pub fn next_event(&mut self, within: Duration) -> Option<Value> {
         if let Some(event) = self.events.pop_front() {
@@ -378,7 +379,7 @@ mod tests {
                 assert_eq!(hello["method"], "core/hello");
                 assert_eq!(hello["params"], merge_hello(Value::Null));
                 let id = hello["id"].clone();
-                send(json!({"jsonrpc": "2.0", "method": "ww/event", "params": {"seq": 1}})).await;
+                send(json!({"jsonrpc": "2.0", "method": "lil/event", "params": {"seq": 1}})).await;
                 send(json!({"jsonrpc": "2.0", "id": 999, "result": {"status": "stale"}})).await;
                 send(json!({"jsonrpc": "2.0", "id": id, "result": {"status": "ok"}})).await;
 
@@ -392,7 +393,7 @@ mod tests {
                 );
                 let result = json!({"status": "ok", "structured": {"text": "hi"}});
                 send(json!({"jsonrpc": "2.0", "id": call["id"], "result": result})).await;
-                send(json!({"jsonrpc": "2.0", "method": "ww/event", "params": {"seq": 2}})).await;
+                send(json!({"jsonrpc": "2.0", "method": "lil/event", "params": {"seq": 2}})).await;
             });
         });
         ready_rx.recv().unwrap();
@@ -471,7 +472,7 @@ mod tests {
         server.join().expect("the fake server's checks");
     }
 
-    /// `fence` writes `<ws>\.worldwright\fence\<n>` before it calls `test.watch_fence {name:
+    /// `fence` writes `<ws>\.lilith\fence\<n>` before it calls `test.watch_fence {name:
     /// n}`, and `tool_ok` returns `structured`; a failed fence panics with the outcome.
     #[test] // spec: QA-031
     fn fence_writes_its_file_then_calls_watch_fence() {
@@ -488,7 +489,10 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .to_string();
-                let file = ws_in_server.join(".worldwright").join("fence").join(&name);
+                let file = ws_in_server
+                    .join(names::WORKSPACE_DIR)
+                    .join("fence")
+                    .join(&name);
                 assert_eq!(std::fs::read_to_string(&file).unwrap(), name);
                 let result = json!({"status": status, "structured": {}});
                 let reply = json!({"jsonrpc": "2.0", "id": call["id"], "result": result});
@@ -504,7 +508,7 @@ mod tests {
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pipe.fence(&ws)));
         assert!(failed.is_err(), "a fence whose tool failed must panic");
         server.join().expect("the fake server's checks");
-        let fences = std::fs::read_dir(ws.join(".worldwright").join("fence"))
+        let fences = std::fs::read_dir(ws.join(names::WORKSPACE_DIR).join("fence"))
             .unwrap()
             .count();
         assert_eq!(fences, 2, "each fence has its own file");

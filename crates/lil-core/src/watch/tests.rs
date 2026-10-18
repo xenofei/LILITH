@@ -66,10 +66,10 @@ fn notify_maps_paths_and_ignores_outside_ones() {
     // Of the workspace paths, what the watcher doesn't watch is ignored too.
     for (path, watched) in [
         ("notes/b.txt", true),
-        (".worldwright/staging/sh_0000000000000001/a.png", false),
+        (".lilith/staging/sh_0000000000000001/a.png", false),
         (".trash/2027-01-01/te_0000000000000001/payload/a.txt", false),
         (".git/index", false),
-        (".worldwright/fence/1-1", false),
+        (".lilith/fence/1-1", false),
     ] {
         assert_eq!(classify(&p(path)) == Class::Path, watched, "{path}");
     }

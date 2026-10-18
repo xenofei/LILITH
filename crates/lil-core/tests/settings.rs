@@ -53,7 +53,7 @@ struct Fx {
 /// registered as the default, and a dispatcher over it with the core's registry.
 fn fx(env: &TestEnv, workspace_defaults: &str, project_extra: &str) -> (Fx, PathBuf) {
     let ws = env.copy_fixture_workspace("settings");
-    let yaml_path = file(&ws, "worldwright.yaml");
+    let yaml_path = file(&ws, "lilith.yaml");
     let yaml = read_text(&yaml_path);
     let start = yaml.find("defaults:").expect("the fixture has defaults");
     let end = yaml.find("routing:").expect("the fixture has routing");

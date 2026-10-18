@@ -49,7 +49,7 @@ pub const EXIT_PENDING: i32 = 4;
 
 #[derive(Debug, clap::Args)]
 pub struct GlobalArgs {
-    /// The workspace folder to use (it must contain worldwright.yaml).
+    /// The workspace folder to use (it must contain lilith.yaml).
     #[arg(long, global = true, value_name = "PATH")]
     pub workspace: Option<PathBuf>,
     /// Never wait for a person: a call that needs confirming fails instead.
@@ -133,7 +133,7 @@ pub enum WorkspaceCommand {
     },
     /// Make a workspace the default one the core serves.
     Use {
-        /// A workspace folder (it holds worldwright.yaml).
+        /// A workspace folder (it holds lilith.yaml).
         path: PathBuf,
     },
 }

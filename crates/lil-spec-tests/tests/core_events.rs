@@ -17,7 +17,7 @@ fn hello(pipe: &mut RawPipe) {
 
 fn subscribe(pipe: &mut RawPipe, since_seq: Value) {
     let response = pipe.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": ["test:a"], "since_seq": since_seq}),
     );
     assert_eq!(response["result"]["status"], "ok", "subscribe: {response}");
@@ -28,13 +28,13 @@ fn emit(pipe: &mut RawPipe, n: u64) {
     assert_eq!(outcome["status"], "ok", "test.emit: {outcome}");
 }
 
-/// The next `ww/event` on `pipe`, parsed as the protocol's `EventParams`.
+/// The next `lil/event` on `pipe`, parsed as the protocol's `EventParams`.
 fn next_event(pipe: &mut RawPipe) -> EventParams {
     let params = pipe
         .next_event(DEADLINE)
-        .unwrap_or_else(|| panic!("no ww/event within {DEADLINE:?}"));
+        .unwrap_or_else(|| panic!("no lil/event within {DEADLINE:?}"));
     serde_json::from_value(params.clone())
-        .unwrap_or_else(|e| panic!("ww/event params are not EventParams ({e}): {params}"))
+        .unwrap_or_else(|e| panic!("lil/event params are not EventParams ({e}): {params}"))
 }
 
 fn assert_event(event: &EventParams, seq: u64, n: u64) {

@@ -117,7 +117,7 @@ fn project_create_status_and_context() {
 fn settings_cascade_overrides_workspace_then_project_then_request() {
     let env = TestEnv::new();
     let ws = default_workspace(&env);
-    let workspace_yaml = ws.join("worldwright.yaml");
+    let workspace_yaml = ws.join("lilith.yaml");
     let text = read_text(&workspace_yaml);
     let models = text
         .lines()
@@ -364,7 +364,7 @@ fn archived_project_restore_runs_staleness_check() {
         json!({"project": "sketchbook", "status": "active"}),
         Some(&key()),
     );
-    let prefix = format!("ww://{}/sketchbook/{DEPENDENT}", env.workspace_id(&ws));
+    let prefix = format!("lil://{}/sketchbook/{DEPENDENT}", env.workspace_id(&ws));
     let stale: Vec<&str> = restored["stale"]
         .as_array()
         .unwrap_or_else(|| panic!("project.set_status has no stale list: {restored}"))
@@ -418,7 +418,7 @@ fn active_project_is_per_session_with_state_json_hint() {
     let b_again = b.tool_ok("project.status", json!({}), None);
     assert_eq!(b_again["project"], "sketchbook", "{b_again}");
 
-    let state = file(&ws, ".worldwright/state.json");
+    let state = file(&ws, ".lilith/state.json");
     let hint: Value = serde_json::from_slice(
         &std::fs::read(&state).unwrap_or_else(|e| panic!("{}: {e}", state.display())),
     )

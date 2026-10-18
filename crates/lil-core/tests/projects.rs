@@ -201,7 +201,7 @@ async fn resolve_explicit_then_session_then_hint_then_sketchbook() {
         project_of(&fx.ok("s_a", "project.status", json!({})).await),
         "sketchbook"
     );
-    assert!(!file(&ws, ".worldwright/state.json").exists());
+    assert!(!file(&ws, ".lilith/state.json").exists());
 
     // A call that names a project makes it the session's and the hint.
     fx.ok(
@@ -214,8 +214,7 @@ async fn resolve_explicit_then_session_then_hint_then_sketchbook() {
         project_of(&fx.ok("s_a", "project.status", json!({})).await),
         "harbor"
     );
-    let hint: Value =
-        serde_json::from_str(&read_text(&file(&ws, ".worldwright/state.json"))).unwrap();
+    let hint: Value = serde_json::from_str(&read_text(&file(&ws, ".lilith/state.json"))).unwrap();
     assert_eq!(hint, json!({"active_project": "harbor"}));
 
     // Another session has chosen nothing: the hint.
@@ -265,14 +264,14 @@ async fn resolve_explicit_then_session_then_hint_then_sketchbook() {
 
     // A hint that isn't a slug, or a file that isn't JSON, is no hint.
     write_file(
-        &file(&ws, ".worldwright/state.json"),
+        &file(&ws, ".lilith/state.json"),
         b"{\"active_project\": \"Not A Slug\"}",
     );
     assert_eq!(
         project_of(&fx.ok("s_d", "project.status", json!({})).await),
         "sketchbook"
     );
-    write_file(&file(&ws, ".worldwright/state.json"), b"not json");
+    write_file(&file(&ws, ".lilith/state.json"), b"not json");
     assert_eq!(
         project_of(&fx.ok("s_e", "project.status", json!({})).await),
         "sketchbook"
@@ -280,8 +279,7 @@ async fn resolve_explicit_then_session_then_hint_then_sketchbook() {
     // The next named project is written over it.
     fx.ok("s_e", "project.status", json!({"project": "harbor"}))
         .await;
-    let hint: Value =
-        serde_json::from_str(&read_text(&file(&ws, ".worldwright/state.json"))).unwrap();
+    let hint: Value = serde_json::from_str(&read_text(&file(&ws, ".lilith/state.json"))).unwrap();
     assert_eq!(hint, json!({"active_project": "harbor"}));
 }
 
@@ -322,8 +320,7 @@ fn active_project_is_forgotten_when_the_connection_closes() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // The hint stays: it is the workspace's last-used project, not the session's.
-    let hint: Value =
-        serde_json::from_str(&read_text(&file(&ws, ".worldwright/state.json"))).unwrap();
+    let hint: Value = serde_json::from_str(&read_text(&file(&ws, ".lilith/state.json"))).unwrap();
     assert_eq!(hint["active_project"], "sketchbook");
 }
 
@@ -331,7 +328,7 @@ fn active_project_is_forgotten_when_the_connection_closes() {
 async fn hint_is_written_only_on_read_write_workspaces() {
     let env = TestEnv::new();
     let ws = workspace(&env, |_| {});
-    let state = file(&ws, ".worldwright/state.json");
+    let state = file(&ws, ".lilith/state.json");
 
     // The first dispatcher's hub holds `core.lock`; the second serves the workspace read-only.
     let first = fx_with(&env, &ws, None);
@@ -709,9 +706,9 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
             "project": "sketchbook",
             "status": "active",
             "stale": [
-                format!("ww://{ws_id}/sketchbook/chr_golem@1.0.0#sha256={golem_hash}"),
-                format!("ww://{ws_id}/sketchbook/chr_troll@1.0.0"),
-                format!("ww://{ws_id}/sketchbook/chr_wisp@1.0.0"),
+                format!("lil://{ws_id}/sketchbook/chr_golem@1.0.0#sha256={golem_hash}"),
+                format!("lil://{ws_id}/sketchbook/chr_troll@1.0.0"),
+                format!("lil://{ws_id}/sketchbook/chr_wisp@1.0.0"),
             ],
         })
     );
@@ -893,8 +890,8 @@ async fn a_restore_that_failed_midway_is_finished_by_the_retry() {
     assert_eq!(
         retried["stale"],
         json!([
-            format!("ww://{ws_id}/sketchbook/chr_golem@1.0.0"),
-            format!("ww://{ws_id}/sketchbook/chr_troll@1.0.0"),
+            format!("lil://{ws_id}/sketchbook/chr_golem@1.0.0"),
+            format!("lil://{ws_id}/sketchbook/chr_troll@1.0.0"),
         ])
     );
     for asset in ["chr_golem", "chr_troll"] {
@@ -932,7 +929,7 @@ async fn a_restore_that_failed_midway_is_finished_by_the_retry() {
         .await;
     assert_eq!(
         paused["stale"],
-        json!([format!("ww://{ws_id}/sketchbook/chr_late@1.0.0")])
+        json!([format!("lil://{ws_id}/sketchbook/chr_late@1.0.0")])
     );
 }
 
@@ -1214,11 +1211,14 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
         // Conflict copies: the other project's and one outside every project are not
         // sketchbook's.
         write_file(
-            &file(ws, "projects/harbor/notes.txt.ww-conflict-20261001T100000Z"),
+            &file(
+                ws,
+                "projects/harbor/notes.txt.lil-conflict-20261001T100000Z",
+            ),
             b"harbor's",
         );
         write_file(
-            &file(ws, "notes/a.txt.ww-conflict-20261001T100000Z"),
+            &file(ws, "notes/a.txt.lil-conflict-20261001T100000Z"),
             b"root",
         );
     });
@@ -1261,7 +1261,8 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
 
     // A conflict copy that appears after the workspace was opened is found at the next call,
     // anywhere under the project's folder.
-    let late = "projects/sketchbook/assets/env_stone/work/scene.blend.ww-conflict-20270115T080000Z";
+    let late =
+        "projects/sketchbook/assets/env_stone/work/scene.blend.lil-conflict-20270115T080000Z";
     write_file(&file(&ws, late), b"outside version");
     let status = fx.ok("s_1", "project.status", json!({})).await;
     assert_eq!(
@@ -1280,7 +1281,7 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
         harbor["orphans"],
         json!([
             "projects/harbor/assets/chr_troll/candidates/r_20261001_1000",
-            "projects/harbor/notes.txt.ww-conflict-20261001T100000Z",
+            "projects/harbor/notes.txt.lil-conflict-20261001T100000Z",
         ])
     );
     assert_eq!(harbor["assets_by_status"], json!({}));

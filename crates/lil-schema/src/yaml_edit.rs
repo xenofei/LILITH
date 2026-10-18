@@ -1,4 +1,4 @@
-//! Targeted YAML edits that keep comments, order and formatting (ARCH-076): `worldwright.yaml`,
+//! Targeted YAML edits that keep comments, order and formatting (ARCH-076): `lilith.yaml`,
 //! `project.yaml` and `registry/*.yaml`.
 //!
 //! The edits are line edits on block-style YAML. Before and after each edit the text is parsed

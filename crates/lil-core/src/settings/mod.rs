@@ -1,7 +1,7 @@
 //! The settings cascade (CORE-057, CORE-054, CORE-049; I2, I4; Appendix E "Settings cascade").
 //!
 //! Three layers, a plain override chain over dotted leaf keys:
-//! 1. the workspace's `worldwright.yaml` `defaults:`;
+//! 1. the workspace file's (`lilith.yaml`, or the legacy one) `defaults:`;
 //! 2. the project's `project.yaml` top-level keys (there is no `overrides:` key);
 //! 3. the request layer: the `settings` argument of a tool whose input schema declares one
 //!    (in plan 2b only `test.settings`; every product tool has no request layer).
@@ -283,7 +283,7 @@ fn checked(
 /// Where a warning points: the layer and the dotted key.
 fn pointer(source: SettingSource, key: &str) -> String {
     let layer = match source {
-        SettingSource::Workspace => "worldwright.yaml defaults",
+        SettingSource::Workspace => "lilith.yaml defaults",
         SettingSource::Project => "project.yaml",
         SettingSource::Request => "request settings",
     };

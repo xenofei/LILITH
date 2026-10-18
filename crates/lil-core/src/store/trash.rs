@@ -47,6 +47,7 @@ use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
 };
 use lil_platform::fs::Probe;
+use lil_platform::names::is_workspace_dir;
 
 /// Days a trash entry is kept before it is purged (ARCH-058, CORE-037).
 pub const TRASH_KEEP_DAYS: i64 = 30;
@@ -249,17 +250,19 @@ impl Store {
     /// It waits at the git gate like every write (ARCH-083).
     ///
     /// # Errors
-    /// `workspace.read_only`; `store.path_invalid` for the trash itself, `.worldwright`,
-    /// `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, or a link;
+    /// `workspace.read_only`; `store.path_invalid` for the trash itself, either workspace data
+    /// folder ([`is_workspace_dir`]), `.git`, `registry/ledger.csv`, a sealed version folder or a
+    /// path in one, or a link;
     /// `store.locked` for a path in its manifest's `locks`; `store.git_busy` when git is still
     /// working after 60 s; `store.io` when there is nothing at `rel` or a file call fails
     /// (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
         let first = rel.as_str().split('/').next().unwrap_or_default();
-        let refused = [TRASH_DIR, ".worldwright", ".git"]
-            .iter()
-            .any(|area| first.eq_ignore_ascii_case(area))
+        let refused = is_workspace_dir(first)
+            || [TRASH_DIR, ".git"]
+                .iter()
+                .any(|area| first.eq_ignore_ascii_case(area))
             || path_key(rel.as_str()) == path_key("registry/ledger.csv");
         if refused {
             return Err(StoreError::PathInvalid {

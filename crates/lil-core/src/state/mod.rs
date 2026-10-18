@@ -40,8 +40,9 @@
 //!
 //! **Copy-forward (plan decision D3, R4).** A pre-rename core kept a workspace's database at
 //! `Env::legacy_workspace_local_dir_for_canonical(ws)\state.db`. Every [`Access::ReadWrite`]
-//! open (the core holds the workspace's `core.lock`, so no other core writes either file) first
-//! removes a leftover `.state.db.lil-tmp-*` from a killed copy, even when `state.db` exists.
+//! open (the core holds both of the workspace's `core.lock`s, D4, so no other core, old or new,
+//! writes either file) first removes a leftover `.state.db.lil-tmp-*` from a killed copy, even
+//! when `state.db` exists.
 //! One whose new `state.db` is missing then copies the legacy one forward ([`copy_forward`]):
 //! the legacy file is checked like any existing one (hot journal, `quick_check`,
 //! `user_version`); a read-only connection on it runs `VACUUM INTO` a fresh
@@ -1168,10 +1169,10 @@ fn naming_legacy(e: StateError, legacy: &Path) -> StateError {
     }
 }
 
-/// D3's copy-forward, for a read-write open only (the caller holds the workspace's
-/// `core.lock`). When the new database `path` is missing: removes any leftover copy-forward
-/// temp file beside it, and if the legacy database `legacy` exists, copies it
-/// to `path` (see the module docs). Does nothing when `path` exists. The legacy files are only
+/// D3's copy-forward, for a read-write open only (the caller holds both of the workspace's
+/// `core.lock`s, D4: `WorkspaceHub` asks for read-write only then). When the new database
+/// `path` is missing: removes any leftover copy-forward temp file beside it, and if the legacy
+/// database `legacy` exists, copies it to `path` (see the module docs). Does nothing when `path` exists. The legacy files are only
 /// read.
 ///
 /// # Errors
@@ -1191,7 +1192,8 @@ fn copy_forward(path: &Path, legacy: &Path, known: i64, fp: &FailPoints) -> Resu
     if !exists(legacy)? {
         return Ok(());
     }
-    // No other core writes the legacy file while this one holds `core.lock`: `Quiet::Yes`.
+    // No other core, old or new, writes the legacy file while this one holds both
+    // `core.lock`s (D4): `Quiet::Yes`.
     refuse_hot_journal(legacy).map_err(|e| naming_legacy(e, legacy))?;
     check_existing(legacy, known, Quiet::Yes).map_err(|e| naming_legacy(e, legacy))?;
     fsops::ensure_dir(dir)

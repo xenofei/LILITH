@@ -10,7 +10,7 @@ use lil_testkit::{LilOutput, TestEnv, sha256_file, utc};
 
 /// The five `.gitignore` entries `lil doctor` adds when missing (Global Constraints, CORE-040).
 const GITIGNORE_ENTRIES: [&str; 5] = [
-    ".worldwright/",
+    ".lilith/",
     ".trash/",
     "inbox/*",
     "projects/*/assets/*/candidates/",

@@ -164,7 +164,7 @@ impl Client {
         }
     }
 
-    /// `ww/subscribe` (ARCH-032). The stream gets every event of `topics` from now on, after
+    /// `lil/subscribe` (ARCH-032). The stream gets every event of `topics` from now on, after
     /// the replay from `since` (per topic; a topic missing from it means live events only).
     /// Cursors for topics not in `topics` are dropped.
     ///
@@ -870,7 +870,7 @@ mod tests {
         assert!(met > 0, "no round connected before the other core exited");
     }
 
-    /// The core may queue a subscription's replayed events before its `ww/subscribe` reply
+    /// The core may queue a subscription's replayed events before its `lil/subscribe` reply
     /// (Task 11). A fake server sends them in that order, plus an event of a topic not
     /// subscribed: the stream gets every replayed and later event in order, nothing else, and
     /// ends when the server goes away.
@@ -890,7 +890,7 @@ mod tests {
                 let mut lines = BufReader::new(read).lines();
                 let request: Value =
                     serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-                assert_eq!(request["method"], "ww/subscribe");
+                assert_eq!(request["method"], "lil/subscribe");
                 // The stray cursor was dropped (ruling P21).
                 assert_eq!(
                     request["params"],
@@ -919,7 +919,7 @@ mod tests {
             let mut stream = client
                 .subscribe(vec!["test:r".to_string()], since)
                 .await
-                .expect("ww/subscribe");
+                .expect("lil/subscribe");
             fake.await.expect("the fake server");
             assert_eq!(stream.topics()[0].seq, 3);
             let mut seqs = Vec::new();

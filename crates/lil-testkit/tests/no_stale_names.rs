@@ -155,6 +155,12 @@ const ALLOW: &[Allow] = &[
         until: "PR-D",
     },
     Allow {
+        globs: &["crates/lil-schema/src/refs.rs"],
+        lines_with: &["fn legacy_ww_ref_parses_to_the_same_ref()"],
+        why: "the legacy-scheme reader test, by the name the plan's Task B4 gives it",
+        until: "PR-D, with LEGACY_SCHEME",
+    },
+    Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
         lines_with: &[],
         why: "this test names the old names it looks for",

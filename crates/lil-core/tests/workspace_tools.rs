@@ -30,7 +30,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The five `.gitignore` entries (Global Constraints, CORE-040).
 const GITIGNORE: [&str; 5] = [
-    ".worldwright/",
+    ".lilith/",
     ".trash/",
     "inbox/*",
     "projects/*/assets/*/candidates/",
@@ -239,7 +239,7 @@ fn wait_for_running_row(db: &Path, key: &str) {
 
 /// Whether another holder could take `ws`'s `core.lock` now.
 fn lock_is_free(ws: &Path) -> bool {
-    lil_core::store::fsops::lock_exclusive(&ws.join(".worldwright").join("core.lock"))
+    lil_core::store::fsops::lock_exclusive(&ws.join(".lilith").join("core.lock"))
         .unwrap()
         .is_some()
 }
@@ -281,13 +281,13 @@ fn create_writes_layout_and_registers_last() {
     assert_eq!(first["status"], "error", "{first}");
     assert_eq!(first["error"]["code"], "store.io", "{first}");
     assert!(failed.load(Ordering::SeqCst));
-    // The folder has its files, worldwright.yaml included, and isn't registered.
+    // The folder has its files, lilith.yaml included, and isn't registered.
     for rel in [
         r"projects\sketchbook\project.yaml",
         r"projects\sketchbook\progress.md",
         ".gitignore",
         ".gitattributes",
-        "worldwright.yaml",
+        "lilith.yaml",
     ] {
         assert!(ws.join(rel).is_file(), "{rel} is missing");
     }
@@ -304,14 +304,14 @@ fn create_writes_layout_and_registers_last() {
         "{project:?}"
     );
     assert!(project.iter().any(|l| l == "status: active"), "{project:?}");
-    let yaml = lines(&ws.join("worldwright.yaml"));
+    let yaml = lines(&ws.join("lilith.yaml"));
     assert!(
         yaml.iter().any(|l| l == "name: Ünïcödé space ws"),
         "{yaml:?}"
     );
 
     // A retry adopts the folder and registers it, as the default (none is set).
-    let yaml_hash = sha256_file(&ws.join("worldwright.yaml"));
+    let yaml_hash = sha256_file(&ws.join("lilith.yaml"));
     let retry = create(&mut pipe, json!({"path": arg(&ws)}));
     assert_eq!(retry["status"], "ok", "{retry}");
     let s = &retry["structured"];
@@ -323,7 +323,7 @@ fn create_writes_layout_and_registers_last() {
         json!(canonical(&ws).display().to_string()),
         "{retry}"
     );
-    assert_eq!(sha256_file(&ws.join("worldwright.yaml")), yaml_hash);
+    assert_eq!(sha256_file(&ws.join("lilith.yaml")), yaml_hash);
     assert_eq!(registration(&env, &ws), (true, true));
 }
 
@@ -331,7 +331,7 @@ fn create_writes_layout_and_registers_last() {
 fn create_adopts_an_existing_workspace_without_writing() {
     let env = TestEnv::new();
     let ws = env.make_workspace("Ünïcödé adopted");
-    let before = sha256_file(&ws.join("worldwright.yaml"));
+    let before = sha256_file(&ws.join("lilith.yaml"));
     let _core = core(&env);
     let mut pipe = none(&env);
 
@@ -339,11 +339,55 @@ fn create_adopts_an_existing_workspace_without_writing() {
     assert_eq!(out["status"], "ok", "{out}");
     assert_eq!(out["structured"]["created"], false, "{out}");
     assert_eq!(out["structured"]["default"], false, "{out}");
-    assert_eq!(sha256_file(&ws.join("worldwright.yaml")), before);
-    for absent in [".gitignore", ".gitattributes", "projects", ".worldwright"] {
+    assert_eq!(sha256_file(&ws.join("lilith.yaml")), before);
+    for absent in [".gitignore", ".gitattributes", "projects", ".lilith"] {
         assert!(!ws.join(absent).exists(), "{absent} was written");
     }
     assert_eq!(registration(&env, &ws), (true, false));
+}
+
+#[test] // spec: ARCH-003, CORE-007
+fn create_writes_only_lilith_yaml_and_adopts_a_legacy_workspace() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut pipe = none(&env);
+
+    // A new workspace gets only the new file, and no legacy folder.
+    let fresh = env.root().join("fresh");
+    let out = create(&mut pipe, json!({"path": arg(&fresh), "default": false}));
+    assert_eq!(out["structured"]["created"], true, "{out}");
+    assert!(fresh.join(WORKSPACE_FILE).is_file());
+    for absent in [LEGACY_WORKSPACE_FILE, LEGACY_WORKSPACE_DIR] {
+        assert!(!fresh.join(absent).exists(), "{absent} was written");
+    }
+
+    // A legacy workspace is adopted as it is: registered, nothing written or renamed.
+    let legacy = env.make_legacy_workspace("legacy");
+    let before = sha256_file(&legacy.join(LEGACY_WORKSPACE_FILE));
+    let out = create(&mut pipe, json!({"path": arg(&legacy), "default": false}));
+    assert_eq!(out["status"], "ok", "{out}");
+    assert_eq!(out["structured"]["created"], false, "{out}");
+    assert_eq!(sha256_file(&legacy.join(LEGACY_WORKSPACE_FILE)), before);
+    for absent in [WORKSPACE_FILE, ".gitignore", "projects", ".lilith"] {
+        assert!(!legacy.join(absent).exists(), "{absent} was written");
+    }
+    assert_eq!(registration(&env, &legacy), (true, false));
+
+    // `workspace.set_default` accepts it too; serving it never creates the legacy folder.
+    let out = pipe.tool_ok(
+        "workspace.set_default",
+        json!({"path": arg(&legacy)}),
+        Some(&key()),
+    );
+    assert_eq!(out["id"], json!(env.workspace_id(&legacy)), "{out}");
+    assert_eq!(registration(&env, &legacy), (true, true));
+    let mut s = session(&env, &legacy);
+    let query = s.tool_ok("assets.query", json!({}), None);
+    assert_eq!(query["total"], 0, "{query}");
+    assert_eq!(sha256_file(&legacy.join(LEGACY_WORKSPACE_FILE)), before);
+    assert!(!legacy.join(WORKSPACE_FILE).exists());
+    assert!(!legacy.join(LEGACY_WORKSPACE_DIR).exists());
 }
 
 #[test] // spec: ARCH-094, QA-040
@@ -443,7 +487,7 @@ fn create_warns_on_network_or_cloud_volumes() {
         assert_eq!(out["status"], "ok", "{name}: {out}");
         let warnings = &out["structured"]["warnings"];
         assert_eq!(warnings, &json!([NETWORK_WARNING]), "{name}: {out}");
-        assert!(ws.join("worldwright.yaml").is_file(), "{name}");
+        assert!(ws.join("lilith.yaml").is_file(), "{name}");
     }
     // A local NTFS or ReFS folder has no warning.
     volume.set(facts("NTFS", false, false));
@@ -536,10 +580,10 @@ fn set_default_registers_and_switches() {
     let _core = core(&env);
     let mut s_a = session(&env, &a);
     let mut admin = none(&env);
-    let sub = admin.call("ww/subscribe", json!({"topics": ["workspace"]}));
+    let sub = admin.call("lil/subscribe", json!({"topics": ["workspace"]}));
     assert_eq!(sub["result"]["status"], "ok", "{sub}");
 
-    // A folder without worldwright.yaml is refused.
+    // A folder without lilith.yaml is refused.
     let plain = env.root().join("plain");
     write_file(&plain.join("notes.txt"), b"x");
     let refused = admin.tool(
@@ -738,7 +782,7 @@ async fn suite_toml_keeps_comments_and_unknown_keys_and_is_hash_checked() {
     let leftovers: Vec<String> = std::fs::read_dir(suite.parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".ww-"))
+        .filter(|n| n.contains(".lil-"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
@@ -819,10 +863,10 @@ async fn suite_toml_put_back_keeps_a_second_outside_save() {
         panic!("expected store.hash_conflict, got {refused:?}");
     };
     assert_eq!(std::fs::read_to_string(&suite).unwrap(), "# X\n");
-    let copies = beside(&suite, ".ww-conflict-");
+    let copies = beside(&suite, ".lil-conflict-");
     assert_eq!(copies.len(), 1, "{copies:?}");
     assert!(
-        copies[0].starts_with("suite.toml.ww-conflict-"),
+        copies[0].starts_with("suite.toml.lil-conflict-"),
         "{copies:?}"
     );
     let copy = suite.parent().unwrap().join(&copies[0]);
@@ -836,8 +880,8 @@ async fn suite_toml_put_back_keeps_a_second_outside_save() {
     let error = refused.to_error("t");
     assert_eq!(error.code, "store.hash_conflict");
     assert_eq!(error.data.unwrap()["kept"], json!(copies));
-    assert!(beside(&suite, ".ww-tmp-").is_empty());
-    assert!(beside(&suite, ".ww-bak-").is_empty());
+    assert!(beside(&suite, ".lil-tmp-").is_empty());
+    assert!(beside(&suite, ".lil-bak-").is_empty());
 }
 
 /// A failure after the replace leaves the replaced version in the backup, and the error names
@@ -859,7 +903,7 @@ async fn suite_toml_failure_after_the_replace_names_the_backup() {
     let StoreError::Io { path, .. } = &refused else {
         panic!("expected store.io naming the backup, got {refused:?}");
     };
-    let backups = beside(&suite, ".ww-bak-");
+    let backups = beside(&suite, ".lil-bak-");
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert!(path.ends_with(&backups[0]), "{path} vs {backups:?}");
     let backup = suite.parent().unwrap().join(&backups[0]);

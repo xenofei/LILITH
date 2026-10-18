@@ -88,7 +88,7 @@ fn outside_move(from: &Path, to: &Path) {
         .unwrap_or_else(|e| panic!("{} → {}: {e}", from.display(), to.display()));
 }
 
-/// The next `ww/event` on `topic` whose `data.kind` is `kind`; other events are skipped.
+/// The next `lil/event` on `topic` whose `data.kind` is `kind`; other events are skipped.
 fn wait_for_kind(pipe: &mut RawPipe, topic: &str, kind: &str) -> Value {
     loop {
         let event = pipe
@@ -373,7 +373,7 @@ fn a_checkout_is_reconciled_after_git_and_records_only_real_edits() {
     let mut pipe = session(&env, &ws);
     pipe.fence(&ws);
     let subscribed = pipe.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": ["workspace"], "since_seq": {}}),
     );
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");

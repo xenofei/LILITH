@@ -1,13 +1,15 @@
 //! Which event paths the watcher looks at, and the git pause (ARCH-079, ARCH-083).
 //!
-//! Of `.worldwright\` only `fence\<name>` is watched (the test fence), and `.trash\` not at
-//! all. Of `.git\` (at the root) only `index.lock` and `HEAD`; every other `.git` folder, at
-//! any depth, is ignored, as the index ignores it.
+//! Of `.lilith\` only `fence\<name>` is watched (the test fence); the legacy workspace data
+//! folder (`names::LEGACY_WORKSPACE_DIR`, R4) and `.trash\` not at all. Of `.git\` (at the
+//! root) only `index.lock` and `HEAD`; every other `.git` folder, at any depth, is ignored, as
+//! the index ignores it.
 //!
 //! Git counts as working from the moment `index.lock` appears or `HEAD` changes, until
 //! `index.lock` is gone and `HEAD` has stayed unchanged for `git_quiet` (rebase and pull take
 //! and release `index.lock` between their steps). Then the post-git rescan runs.
 
+use lil_platform::names::{WORKSPACE_DIR, is_workspace_dir};
 use tokio::time::Instant;
 
 use crate::store::WsPath;
@@ -15,14 +17,14 @@ use crate::store::WsPath;
 /// What an event path is to the watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Class {
-    /// `.worldwright/fence/<name>`.
+    /// `.lilith/fence/<name>`.
     Fence(String),
     /// `.git/index.lock`.
     GitLock,
     /// `.git/HEAD`.
     GitHead,
-    /// Not watched: the rest of `.worldwright/` and `.git/`, `.trash/`, `.git` folders deeper
-    /// down.
+    /// Not watched: the rest of `.lilith/`, all of the legacy workspace data folder, `.git/`,
+    /// `.trash/`, and `.git` folders deeper down.
     Ignored,
     /// A workspace file or folder.
     Path,
@@ -32,7 +34,7 @@ pub(crate) enum Class {
 pub(crate) fn classify(path: &WsPath) -> Class {
     let parts: Vec<&str> = path.as_str().split('/').collect();
     let first = parts[0];
-    if first.eq_ignore_ascii_case(".worldwright") {
+    if first.eq_ignore_ascii_case(WORKSPACE_DIR) {
         return match parts.as_slice() {
             [_, fence, name] if fence.eq_ignore_ascii_case("fence") => {
                 Class::Fence((*name).to_string())
@@ -40,7 +42,7 @@ pub(crate) fn classify(path: &WsPath) -> Class {
             _ => Class::Ignored,
         };
     }
-    if first.eq_ignore_ascii_case(".trash") {
+    if is_workspace_dir(first) || first.eq_ignore_ascii_case(".trash") {
         return Class::Ignored;
     }
     if first.eq_ignore_ascii_case(".git") {
@@ -119,19 +121,19 @@ mod tests {
     #[test] // spec: ARCH-079, ARCH-083
     fn only_fences_index_lock_and_head_are_watched_inside_private_folders() {
         assert_eq!(
-            classify(&p(".worldwright/fence/12-3")),
+            classify(&p(".lilith/fence/12-3")),
             Class::Fence("12-3".into())
         );
         assert_eq!(
-            classify(&p(".Worldwright/FENCE/12-3")),
+            classify(&p(".LiLiTh/FENCE/12-3")),
             Class::Fence("12-3".into())
         );
         for ignored in [
-            ".worldwright",
-            ".worldwright/fence",
-            ".worldwright/staging/sh_0000000000000001/a.png",
-            ".worldwright/core.lock",
-            ".worldwright/fence/a/b",
+            ".lilith",
+            ".lilith/fence",
+            ".lilith/staging/sh_0000000000000001/a.png",
+            ".lilith/core.lock",
+            ".lilith/fence/a/b",
             ".trash/2027-01-01/te_0000000000000001/payload/a.txt",
             ".git/index",
             ".git/objects/ab/cdef",
@@ -145,6 +147,40 @@ mod tests {
         assert_eq!(classify(&p(".GIT/head")), Class::GitHead);
         assert_eq!(classify(&p("projects/p/assets/a/work/x.psd")), Class::Path);
         assert_eq!(classify(&p("notes/.gitignore")), Class::Path);
+    }
+
+    #[test] // spec: ARCH-079
+    fn watcher_ignores_both() {
+        use lil_platform::names::LEGACY_WORKSPACE_DIR;
+        // Everything under the legacy folder is ignored, its `fence\` too: the fence is new.
+        for dir in [
+            LEGACY_WORKSPACE_DIR.to_string(),
+            LEGACY_WORKSPACE_DIR.to_uppercase(),
+        ] {
+            for rest in [
+                "",
+                "/state.json",
+                "/fence/12-3",
+                "/staging/sh_0000000000000001/a.png",
+                "/core.lock",
+            ] {
+                let path = format!("{dir}{rest}");
+                assert_eq!(classify(&p(&path)), Class::Ignored, "{path}");
+            }
+        }
+        for rest in ["", "/state.json", "/staging/sh_1/a.png", "/core.lock"] {
+            let path = format!("{WORKSPACE_DIR}{rest}");
+            assert_eq!(classify(&p(&path)), Class::Ignored, "{path}");
+        }
+        assert_eq!(
+            classify(&p(&format!("{WORKSPACE_DIR}/fence/1-1"))),
+            Class::Fence("1-1".into())
+        );
+        // Deeper down they are ordinary folders.
+        for dir in [WORKSPACE_DIR, LEGACY_WORKSPACE_DIR] {
+            let path = format!("notes/{dir}/a.txt");
+            assert_eq!(classify(&p(&path)), Class::Path, "{path}");
+        }
     }
 
     #[tokio::test(start_paused = true)] // spec: ARCH-083

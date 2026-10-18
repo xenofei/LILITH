@@ -764,10 +764,7 @@ async fn staging_handles_are_in_the_workspace_and_ingest_keeps_file_ids() {
     );
     assert_eq!(
         handle.dir,
-        ws.root
-            .join(".worldwright")
-            .join("staging")
-            .join(&handle.id)
+        ws.root.join(".lilith").join("staging").join(&handle.id)
     );
     assert!(handle.dir.is_dir());
 
@@ -849,7 +846,7 @@ async fn run_id_skips_orphan_candidate_folders() {
 #[tokio::test(start_paused = true)] // spec: CORE-003, CORE-038
 async fn recover_sweeps_empty_handles_and_lists_the_rest() {
     let ws = workspace();
-    let staging = ws.root.join(".worldwright").join("staging");
+    let staging = ws.root.join(".lilith").join("staging");
     let empty = staging.join("sh_00000000000000aa");
     fsops::ensure_dir(&empty).unwrap();
     write_file(
@@ -865,12 +862,12 @@ async fn recover_sweeps_empty_handles_and_lists_the_rest() {
     let report = store.recover().await.unwrap();
     assert_eq!(
         report.staging_removed,
-        [p(".worldwright/staging/sh_00000000000000aa")]
+        [p(".lilith/staging/sh_00000000000000aa")]
     );
     assert!(!empty.exists(), "the dead core's empty handle is removed");
     let kept = [
-        p(".worldwright/staging/seal-sh_00000000000000cc"),
-        p(".worldwright/staging/sh_00000000000000bb"),
+        p(".lilith/staging/seal-sh_00000000000000cc"),
+        p(".lilith/staging/sh_00000000000000bb"),
     ];
     assert_eq!(report.staging_kept, kept);
     assert_eq!(
@@ -892,8 +889,81 @@ async fn recover_sweeps_empty_handles_and_lists_the_rest() {
     let live = store.staging_handle().await.unwrap();
     assert_eq!(store.sweep_staging().await.unwrap(), kept);
     assert!(live.dir.is_dir());
-    let rel = p(&format!(".worldwright/staging/{}", live.id));
+    let rel = p(&format!(".lilith/staging/{}", live.id));
     assert!(!store.orphans().await.unwrap().contains(&rel));
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-003, CORE-038
+async fn legacy_staging_leftovers_are_orphans_and_untouched() {
+    use lil_platform::names::LEGACY_WORKSPACE_DIR;
+    let ws = workspace();
+    let legacy = ws.root.join(LEGACY_WORKSPACE_DIR).join("staging");
+    let empty = legacy.join("sh_00000000000000aa");
+    fsops::ensure_dir(&empty).unwrap();
+    let full = legacy.join("sh_00000000000000bb").join("out.png");
+    write_file(&full, b"left by a core from before the rename");
+    let seal = legacy.join("seal-sh_00000000000000cc").join("v.png");
+    write_file(&seal, b"sealing");
+
+    let store = ws.plain();
+    let report = store.recover().await.unwrap();
+    // The sweep never looks there: nothing is removed or reported as kept.
+    assert!(report.staging_removed.is_empty(), "{report:?}");
+    assert!(report.staging_kept.is_empty(), "{report:?}");
+    assert!(empty.is_dir(), "an empty legacy handle was removed");
+    assert_eq!(
+        std::fs::read(&full).unwrap(),
+        b"left by a core from before the rename"
+    );
+    assert!(seal.is_file());
+    // The non-empty entries are listed as orphans, read-only.
+    let orphans = store.orphans().await.unwrap();
+    let rel = |name: &str| p(&format!("{LEGACY_WORKSPACE_DIR}/staging/{name}"));
+    for name in ["sh_00000000000000bb", "seal-sh_00000000000000cc"] {
+        assert!(orphans.contains(&rel(name)), "{name}: {orphans:?}");
+    }
+    assert!(
+        !orphans.contains(&rel("sh_00000000000000aa")),
+        "{orphans:?}"
+    );
+    // New handles are made only under the new folder.
+    let live = store.staging_handle().await.unwrap();
+    assert!(
+        live.dir
+            .starts_with(ws.root.join(".lilith").join("staging"))
+    );
+    assert_eq!(std::fs::read_dir(&legacy).unwrap().count(), 3);
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-038
+async fn conflict_scan_skips_both_workspace_folders() {
+    use lil_platform::names::{LEGACY_CONFLICT_MARKER, LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+    let ws = workspace();
+    let mut want = Vec::new();
+    for dir in [WORKSPACE_DIR, LEGACY_WORKSPACE_DIR] {
+        // Inside a workspace data folder: never a conflict copy of the person's.
+        write_file(
+            &ws.file(&format!("{dir}/state.json.lil-conflict-20261016T120000Z")),
+            b"x",
+        );
+        write_file(
+            &ws.file(&format!(
+                "{dir}/state.json{LEGACY_CONFLICT_MARKER}20261016T120000Z"
+            )),
+            b"x",
+        );
+        // A folder of that name deeper down is an ordinary folder.
+        let deeper = format!("notes/{dir}/a.txt.lil-conflict-20261016T120000Z");
+        write_file(&ws.file(&deeper), b"x");
+        want.push(p(&deeper));
+    }
+    let legacy_copy = format!("notes/b.txt{LEGACY_CONFLICT_MARKER}20261016T120000Z");
+    write_file(&ws.file(&legacy_copy), b"x");
+    want.push(p(&legacy_copy));
+    want.sort();
+
+    let orphans = ws.plain().orphans().await.unwrap();
+    assert_eq!(orphans, want);
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-038, CORE-026
@@ -925,7 +995,7 @@ async fn orphans_include_unrecorded_sealed_versions_and_conflict_files() {
         (format!("{ASSET}/candidates/r_known/a.png"), b"a"),
         (format!("{ASSET}/candidates/r_unknown/b.png"), b"b"),
         (
-            "notes/notes.txt.ww-conflict-20261016T120000Z".to_string(),
+            "notes/notes.txt.lil-conflict-20261016T120000Z".to_string(),
             b"outside",
         ),
         ("notes/notes.txt".to_string(), b"current"),
@@ -936,7 +1006,7 @@ async fn orphans_include_unrecorded_sealed_versions_and_conflict_files() {
     assert_eq!(
         orphans,
         [
-            p("notes/notes.txt.ww-conflict-20261016T120000Z"),
+            p("notes/notes.txt.lil-conflict-20261016T120000Z"),
             p(&format!("{ASSET}/candidates/r_unknown")),
             p(&format!("{ASSET}/v1.1.0")),
         ]

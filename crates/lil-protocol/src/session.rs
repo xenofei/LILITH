@@ -527,7 +527,7 @@ mod tests {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
         assert_eq!(h, schema_hash());
-        assert_eq!(h, "649fc0f8aeeecf4c");
+        assert_eq!(h, "32310da4736fd670");
     }
 
     #[test] // spec: ARCH-029

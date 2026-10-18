@@ -36,7 +36,7 @@ fn canonical(path: &Path) -> PathBuf {
 /// store (ARCH-112).
 #[allow(clippy::disallowed_methods)]
 fn write_manifest(ws: &Path) {
-    let mut file = std::fs::File::create(ws.join("worldwright.yaml")).expect("create");
+    let mut file = std::fs::File::create(ws.join("lilith.yaml")).expect("create");
     file.write_all(b"name: guard\n").expect("write");
 }
 

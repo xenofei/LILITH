@@ -267,7 +267,7 @@ impl MeterStage for LoggingMeter {
     fn settle(&self, _s: &Session, _out: &Outcome<ToolOutput>) {
         let ws = self.ws.lock().unwrap().clone();
         let manifest = file(&ws, &format!("{KITE_DIR}/{KITE}.manifest.json"));
-        let staging = file(&ws, ".worldwright/staging");
+        let staging = file(&ws, ".lilith/staging");
         let staged = std::fs::read_dir(&staging)
             .map(|d| d.flatten().any(|h| h.path().join("kite.png").is_file()))
             .unwrap_or(false);
@@ -299,7 +299,7 @@ impl RecordStage for LoggingRecord {
     }
 }
 
-/// The `ww/event` lines a client attached with `rx` got, parsed, without waiting.
+/// The `lil/event` lines a client attached with `rx` got, parsed, without waiting.
 fn drain_events(rx: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<Value> {
     let mut out = Vec::new();
     while let Ok(line) = rx.try_recv() {
@@ -329,7 +329,7 @@ async fn record_runs_after_meter_and_applies_the_plan_in_write_order() {
     *ws_slot.lock().unwrap() = fx.ws.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     fx.events.attach(7, tx);
-    let topic = format!("asset:ww://{}/sketchbook/{KITE}", fx.ws_ref.id);
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_ref.id);
     fx.events
         .subscribe(
             7,
@@ -632,14 +632,14 @@ async fn signoff_marks_unpinned_dependents_stale_and_reports_them() {
     assert_eq!(
         r["handoff"]["made_stale"],
         json!([format!(
-            "ww://{}/sketchbook/dep_stale@1.0.0#sha256={hash}",
+            "lil://{}/sketchbook/dep_stale@1.0.0#sha256={hash}",
             fx.ws_ref.id
         )]),
         "{r}"
     );
     assert_eq!(
         r["handoff"]["unlocks"],
-        json!([format!("ww://{}/sketchbook/dep_waiting", fx.ws_ref.id)]),
+        json!([format!("lil://{}/sketchbook/dep_waiting", fx.ws_ref.id)]),
         "{r}"
     );
     let stale = fx.manifest("dep_stale");
@@ -849,7 +849,7 @@ async fn a_candidate_edited_during_the_seal_is_put_back_and_refused() {
             .permissions()
             .readonly()
     );
-    let staging: Vec<String> = std::fs::read_dir(fx.path(".worldwright/staging"))
+    let staging: Vec<String> = std::fs::read_dir(fx.path(".lilith/staging"))
         .map(|d| {
             d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect()
@@ -946,7 +946,7 @@ async fn retried_signoff_adopts_the_seal(point: &str) {
     assert_eq!(
         r["ref"],
         format!(
-            "ww://{}/sketchbook/{KITE}@1.0.0#sha256={hash}",
+            "lil://{}/sketchbook/{KITE}@1.0.0#sha256={hash}",
             fx.ws_ref.id
         ),
         "{point}: {r}"

@@ -103,7 +103,7 @@ fn crane_edits(detail: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The next `ww/event` on `topic` whose `data.kind` is `kind`; other events are skipped.
+/// The next `lil/event` on `topic` whose `data.kind` is `kind`; other events are skipped.
 fn wait_for_kind(pipe: &mut RawPipe, topic: &str, kind: &str) -> Value {
     loop {
         let event = pipe
@@ -217,7 +217,7 @@ fn writes_wait_while_git_holds_index_lock() {
     pipe.fence(&ws);
 
     let subscribed = pipe.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": ["workspace"], "since_seq": {}}),
     );
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");
@@ -247,7 +247,7 @@ fn writes_wait_while_git_holds_index_lock() {
             .unwrap_or_else(|| panic!("no response to the waiting write within {DEADLINE:?}"));
         let message: Value = serde_json::from_str(&line)
             .unwrap_or_else(|e| panic!("the core sent a line that is not JSON ({e}): {line}"));
-        if message["method"] == "ww/event" {
+        if message["method"] == "lil/event" {
             let params = &message["params"];
             if params["topic"] == "workspace" && params["data"]["kind"] == "git_resumed" {
                 resumed = true;

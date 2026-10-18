@@ -1,4 +1,4 @@
-//! `ww/subscribe`, `ww/unsubscribe` and `ww/event` over the real pipe of an in-process core
+//! `lil/subscribe`, `lil/unsubscribe` and `lil/event` over the real pipe of an in-process core
 //! (ARCH-032), driven with `RawPipe` and the test-channel tool `test.emit`; the bus with
 //! snapshots computed outside its lock and its history cap; and the `asset:` and `project:`
 //! topics with their snapshots (ARCH-044).
@@ -38,9 +38,9 @@ fn connect(env: &TestEnv) -> RawPipe {
 fn next_event(pipe: &mut RawPipe) -> EventParams {
     let params = pipe
         .next_event(DEADLINE)
-        .unwrap_or_else(|| panic!("no ww/event within {DEADLINE:?}"));
+        .unwrap_or_else(|| panic!("no lil/event within {DEADLINE:?}"));
     serde_json::from_value(params.clone())
-        .unwrap_or_else(|e| panic!("ww/event params are not EventParams ({e}): {params}"))
+        .unwrap_or_else(|e| panic!("lil/event params are not EventParams ({e}): {params}"))
 }
 
 fn emit(pipe: &mut RawPipe, topic: &str, data: Value) -> Value {
@@ -57,13 +57,13 @@ fn rpc_error(response: &Value) -> i64 {
 }
 
 #[test] // spec: ARCH-032
-fn events_arrive_as_ww_event_notifications() {
+fn events_arrive_as_lil_event_notifications() {
     let env = TestEnv::with_label("Ünïcödé space");
     let _core = core(&env);
     let mut pipe = connect(&env);
 
     // The result is an `Outcome<SubscribeResult>`: each topic with its current seq.
-    let response = pipe.call("ww/subscribe", json!({"topics": ["test:x", "test:y"]}));
+    let response = pipe.call("lil/subscribe", json!({"topics": ["test:x", "test:y"]}));
     assert_eq!(
         response["result"],
         json!({"status": "ok", "topics": [
@@ -93,7 +93,7 @@ fn events_arrive_as_ww_event_notifications() {
     // Another connection sees the same topic's sequence go on.
     let mut other = connect(&env);
     let response = other.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": ["test:x"], "since_seq": {"test:x": 0}}),
     );
     assert_eq!(response["result"]["topics"][0]["seq"], 1, "{response}");
@@ -102,7 +102,7 @@ fn events_arrive_as_ww_event_notifications() {
 
     // After unsubscribing from `test:x`, only `test:y` is delivered: the `test:y` event
     // emitted after a `test:x` one is the next event on the connection.
-    let response = pipe.call("ww/unsubscribe", json!({"topics": ["test:x", "test:z"]}));
+    let response = pipe.call("lil/unsubscribe", json!({"topics": ["test:x", "test:z"]}));
     assert_eq!(
         response["result"],
         json!({"status": "ok", "topics": ["test:x"]}),
@@ -134,7 +134,7 @@ fn invalid_topic_is_invalid_params() {
         json!({"topics": ["test:a"], "extra": true}),
         json!({"topics": "test:a"}),
     ] {
-        let response = pipe.call("ww/subscribe", params.clone());
+        let response = pipe.call("lil/subscribe", params.clone());
         assert_eq!(
             rpc_error(&response),
             rpc_code::INVALID_PARAMS,
@@ -142,7 +142,7 @@ fn invalid_topic_is_invalid_params() {
         );
     }
     for params in [json!({"topics": ["1a"]}), json!({"topics": ["a"], "x": 1})] {
-        let response = pipe.call("ww/unsubscribe", params.clone());
+        let response = pipe.call("lil/unsubscribe", params.clone());
         assert_eq!(
             rpc_error(&response),
             rpc_code::INVALID_PARAMS,
@@ -158,12 +158,12 @@ fn invalid_topic_is_invalid_params() {
     assert_eq!(outcome["error"]["code"], "params.invalid", "{outcome}");
 
     // The connection is still usable, and a valid subscription works.
-    let response = pipe.call("ww/subscribe", json!({"topics": ["test:a"]}));
+    let response = pipe.call("lil/subscribe", json!({"topics": ["test:a"]}));
     assert_eq!(response["result"]["status"], "ok", "{response}");
 
     // Before core/hello the methods need the handshake.
     let mut fresh = RawPipe::connect(&env);
-    let response = fresh.call("ww/subscribe", json!({"topics": ["test:a"]}));
+    let response = fresh.call("lil/subscribe", json!({"topics": ["test:a"]}));
     assert_eq!(
         rpc_error(&response),
         rpc_code::HANDSHAKE_REQUIRED,
@@ -407,9 +407,9 @@ fn asset_and_project_topics_carry_kinds_and_snapshots() {
     let mut pipe = RawPipe::connect(&env);
     let hello = pipe.hello(json!({"workspace": ws_id}));
     assert_eq!(hello["result"]["status"], "ok", "{hello}");
-    let asset = format!("asset:ww://{ws_id}/sketchbook/prop_kite");
+    let asset = format!("asset:lil://{ws_id}/sketchbook/prop_kite");
     let response = pipe.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": [asset, "project:sketchbook"]}),
     );
     assert_eq!(response["result"]["status"], "ok", "{response}");
@@ -470,7 +470,7 @@ fn asset_and_project_topics_carry_kinds_and_snapshots() {
     cursors.insert(asset.clone(), json!(999));
     cursors.insert("project:sketchbook".to_string(), json!(999));
     let response = other.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": [asset, "project:sketchbook"], "since_seq": cursors}),
     );
     assert_eq!(response["result"]["status"], "ok", "{response}");

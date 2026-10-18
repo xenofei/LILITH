@@ -346,7 +346,7 @@ async fn lines_check(
         .filter(|l| !have.contains(l))
         .collect();
     if missing.is_empty() {
-        return DoctorCheck::new(id, OK, format!("{file} has its Worldwright entries"));
+        return DoctorCheck::new(id, OK, format!("{file} has its LILITH entries"));
     }
     let listed = missing.join(", ");
     if !fix {

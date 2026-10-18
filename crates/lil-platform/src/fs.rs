@@ -1079,7 +1079,7 @@ mod tests {
     #[test] // spec: ARCH-074
     fn exclusive_open_shuts_out_others_and_deletes_through_its_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".x.ww-bak-1-1");
+        let path = dir.path().join(".x.lil-bak-1-1");
         std::fs::write(&path, b"old").unwrap();
         let held = open_exclusive(&path).unwrap();
         let mut text = String::new();
@@ -1102,7 +1102,7 @@ mod tests {
     #[test] // spec: ARCH-074
     fn exclusive_delete_removes_a_read_only_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".ro.ww-bak-1-1");
+        let path = dir.path().join(".ro.lil-bak-1-1");
         std::fs::write(&path, b"old").unwrap();
         set_readonly(&path, true).unwrap();
         open_exclusive(&path)

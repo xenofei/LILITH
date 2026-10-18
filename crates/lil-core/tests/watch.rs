@@ -6,7 +6,7 @@
 //! are missing until they come back, the suite's own moves wait for their version lock, and a
 //! workspace that can't be watched is still served.
 //!
-//! Tests wait on the watcher with the fence (a `.worldwright\fence\<name>` file, then
+//! Tests wait on the watcher with the fence (a `.lilith\fence\<name>` file, then
 //! `Watcher::fence`), on published events, or on a condition polled until a failure deadline,
 //! never on a sleep before an assertion (QA-031). Fixture files are written with
 //! `lil_testkit::files::write_file`; the other outside-writer steps carry their own allowance.
@@ -179,7 +179,7 @@ impl Core {
         file(&self.ws, rel)
     }
 
-    /// The watcher fence: a new `.worldwright\fence\<name>`, then `Watcher::fence`.
+    /// The watcher fence: a new `.lilith\fence\<name>`, then `Watcher::fence`.
     async fn fence(&self) {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let name = format!(
@@ -188,7 +188,7 @@ impl Core {
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
         write_file(
-            &self.ws.join(".worldwright").join("fence").join(&name),
+            &self.ws.join(".lilith").join("fence").join(&name),
             name.as_bytes(),
         );
         tokio::time::timeout(DEADLINE, self.watch().fence(&name))
@@ -233,7 +233,7 @@ impl Core {
     }
 
     fn asset_topic(&self, asset: &str) -> String {
-        format!("asset:ww://{}/sketchbook/{asset}", self.open.ws.id)
+        format!("asset:lil://{}/sketchbook/{asset}", self.open.ws.id)
     }
 
     /// Every event published on `topic` so far (replayed from its history).
@@ -396,7 +396,7 @@ async fn staging_trash_and_git_internals_are_not_watched() {
     let core = Core::fixture(fast()).await;
     core.fence().await;
     let unwatched = [
-        ".worldwright/staging/sh_00000000000000a1/a.png",
+        ".lilith/staging/sh_00000000000000a1/a.png",
         ".trash/2027-01-15/te_00000000000000a1/payload/a.txt",
         ".git/objects/ab/cdef0123",
         ".git/index",
@@ -605,7 +605,7 @@ async fn bare(
 async fn bare_fence(ws: &Path, watcher: &Watcher) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let name = format!("bare-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    write_file(&ws.join(".worldwright").join("fence").join(&name), b"f");
+    write_file(&ws.join(".lilith").join("fence").join(&name), b"f");
     watcher.fence(&name).await;
 }
 
@@ -641,7 +641,7 @@ async fn post_git_human_edit_is_recorded_without_waiting_for_the_gate() {
     events.attach(9_000, tx);
     let topics = [
         "workspace".to_string(),
-        format!("asset:ww://{ws_id}/sketchbook/{CRANE}"),
+        format!("asset:lil://{ws_id}/sketchbook/{CRANE}"),
     ];
     events
         .subscribe(9_000, &topics, &std::collections::BTreeMap::new())
@@ -1058,7 +1058,7 @@ async fn removals_under_a_held_version_lock_wait_for_its_release() {
         let core_watch = core.watch().clone();
         let name = "held-lock".to_string();
         write_file(
-            &core.ws.join(".worldwright").join("fence").join(&name),
+            &core.ws.join(".lilith").join("fence").join(&name),
             b"held-lock",
         );
         tokio::spawn(async move { core_watch.fence(&name).await })
@@ -1126,7 +1126,7 @@ fn unsupported_watcher_leaves_the_workspace_served() {
     );
     assert_eq!(written["sha256"], sha256_bytes(b"still served"));
     let subscribed = pipe.call(
-        "ww/subscribe",
+        "lil/subscribe",
         json!({"topics": ["workspace"], "since_seq": {"workspace": 0}}),
     );
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");
@@ -1326,7 +1326,7 @@ async fn a_fence_written_before_the_watch_is_armed_is_handled() {
     let env = TestEnv::with_label("Ünïcödé space");
     let ws = canonical(&env.make_workspace("early fence"));
     // Written before `Watcher::start`: no event of it ever comes.
-    write_file(&ws.join(".worldwright").join("fence").join("early"), b"f");
+    write_file(&ws.join(".lilith").join("fence").join("early"), b"f");
     let (_store, _index, watcher, _events, _ws_id) = bare(&ws).await;
     tokio::time::timeout(Duration::from_secs(30), watcher.fence("early"))
         .await
