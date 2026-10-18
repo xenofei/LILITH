@@ -981,21 +981,30 @@ git commit -m "telemetry: 1 Hz sampling, telemetry.db with exact energy downsamp
 ### Task 10: The GPU scheduler (ARCH-071, ARCH-072, CORE-125, CORE-126)
 
 **Files:**
-- Create: `crates/lil-core/src/jobs/scheduler.rs`. Modify `jobs/{queue.rs, runner.rs}`, `server/mod.rs`.
+- Create: `crates/lil-core/src/jobs/scheduler.rs`. Modify `jobs/{mod.rs, queue.rs, record.rs, runner.rs}`, `server/mod.rs`.
 - Test: `crates/lil-core/tests/scheduler.rs`.
 
 **Interfaces:**
-- Consumes: `Telemetry::{vram, on_sample, set_busy}`; `Admission`.
+- Consumes (as built in Tasks 8 and 9):
+  - `Telemetry::vram() -> Option<VramView>`, with `VramView { total_mib: u64, nvml_free_mib: u64, local_by_pid: BTreeMap<u32, u64> }`; `None` means there is no VRAM check;
+  - `Telemetry::on_sample(f: Box<dyn Fn() + Send + Sync>)`: `f` runs on the sampler's thread after every sample and must not block, so the server's hook only calls `Jobs::kick()`;
+  - `Telemetry::set_busy(bool)`; for tests, `Telemetry::tick(samples)` in `TickMode::Manual` over `lil_platform::hw_fake` sources (`FakeHwScript::sources()`, then `HwSources::from_fake`);
+  - `jobs::{Admission, Admit, AlwaysAdmit, EngineKind}`, `Jobs::{set_admission, kick}`, `JobSpec::{vram_need_mib, engine, expected_secs}`;
+  - `Admission::admit(&self, spec: &JobSpec) -> Admit` is the only hook, and `Admit` is `Go`, `GoUnchecked` (the summary then says `vram_unchecked`) or `WaitForVram { need_mib: u64, free_mib: u64 }` (substatus `waiting_for_vram`);
+  - `admit` hears of no job start or end, so this task adds that hook in `jobs/runner.rs`, for `set_busy`, the lease and the watchdog;
+  - nothing writes the row's `watchdog` column yet (`record::Change` has no such field): this task adds it, and publishes `watchdog` on `job:<id>`;
+  - `EngineKind` has only `ComfyUi`: this task adds the test-only kind that `lease_switch_asks_the_previous_engine_to_unload` needs;
+  - `jobs` → `telemetry` is a new edge: `tests/module_deps.rs` forbids only `telemetry` → `tools`/`jobs`.
 - Produces:
 
 ```rust
 pub const VRAM_MARGIN_MIB: u64 = 512;
 pub fn free_vram_mib(v: &VramView, engine_pids: &[u32]) -> u64;
-    // min(total − Σ local(others), nvml_free + Σ local(engine)) − margin, floored at 0 (saturating arithmetic)
+    // min(total_mib − Σ local(others), nvml_free_mib + Σ local(engine)) − margin, floored at 0 (saturating arithmetic)
 pub trait EngineControl: Send + Sync { fn pids(&self, e: EngineKind) -> Vec<u32>;
     fn unload<'a>(&'a self, e: EngineKind) -> BoxFuture<'a, ()>; }     // Task 11 implements it
 pub struct GpuScheduler; impl GpuScheduler { pub fn new(t: Arc<Telemetry>, e: Arc<dyn EngineControl>) -> Arc<Self>; }
-impl Admission for GpuScheduler {}
+impl Admission for GpuScheduler {}   // fn admit(&self, spec: &JobSpec) -> Admit
 pub fn watchdog_slow(expected_secs: u32, since_execution_start: Duration) -> bool;   // > 3×
 ```
 
@@ -1026,10 +1035,17 @@ git commit -m "jobs: GPU scheduler with Local Usage free-VRAM wait, engine-own V
 - Create: `crates/lil-core/src/meter/{mod.rs, sink.rs}`: the usage types below and a logging `UsageSink` stand-in, which Task 15 replaces.
 - Modify: `crates/lil-core/Cargo.toml` (`reqwest.workspace = true`, its async API), `crates/lil-core/src/{server/mod.rs, tools/mod.rs}`, `crates/lil-core/src/store/{suite_toml.rs, fsops.rs}` (reading `[engines.comfyui]`; `remove_engine_file`).
 - Test: `crates/lil-core/tests/engines.rs` (the `lil-fake-comfyui` binary and `FakeComfy`).
+- Modify: `crates/lil-core/tests/module_deps.rs`: `engines` joins `MODULES`; `jobs` and `telemetry` must not use it (`EngineControl` is how `jobs` reaches an engine).
 - Carry from Task 9: fill `Snapshot.sizes.models_mib`. The core already measures `workspace_mib` (`telemetry::folder_size_probe`, set when the default workspace opens); once the ComfyUI `root` is known, set a probe that also measures `<root>models` (same off-thread walk) with `Telemetry::set_sizes_probe`.
 
 **Interfaces:**
-- Consumes: Task 5's `spawn_engine`, `KillOnCloseJob`, `listening_sockets`, `pid_listening_on`; Task 8's `Jobs`, `BillingBasis` and `Money`; Task 10's `EngineControl`.
+- Consumes: Task 5's `spawn_engine`, `KillOnCloseJob`, `listening_sockets`, `pid_listening_on`; Task 10's `EngineControl`.
+  - From `jobs` (Task 8, final): `Jobs::{register, submit}`, where `submit(&self, caller: &JobCaller, spec: JobSpec) -> Result<JobSummary, ErrorBody>` and the tool builds the `JobCaller` with `ctx.job_caller()`;
+  - `JobHandler { kind() -> &'static str; run(&JobCtx) -> JobFuture<'_, Result<JobDone, JobFailure>>; cancel_in_engine(&JobCtx) -> JobFuture<'_, ()> }`;
+  - `NodeInstallHandler`'s `JobSpec`: `kind: "comfy.install_node"`, `lane: Lane::Cpu`, `external_side_effects: false`; the job keeps its tool call, so `job.retry` re-dispatches it (the tool is `exec`, so an agent's retry needs a confirmation);
+  - the `UsageCtx` of its usage draft comes from the `JobCtx`: `job_id` and `call_id` = `ctx.id`, `workspace`, `project` = `spec.project`, `asset` = `spec.asset_id`, `reservation` = `ctx.reservation`;
+  - `BillingBasis` is `crate::tools::stages::BillingBasis`; `Money` and `Currency` are `lil_schema::money::{Money, Currency}`;
+  - `Telemetry::track(pid: u32, role: &'static str)` and `Telemetry::untrack(pid)`.
 - Produces:
 
 ```rust
@@ -1105,12 +1121,27 @@ git commit -m "engines: ComfyUI owned/attached supervisor, loopback-only launch,
 **Files:**
 - Create: `crates/lil-core/src/engines/comfyui/{ws.rs, handler.rs, salvage.rs}`. Modify: `crates/lil-core/src/engines/comfyui/client.rs` (Task 11's client, extended).
 - Modify: `crates/lil-core/src/state/migrations.rs` (append `COMFY_CACHE` to the suite scope, migration 4: `comfy_client(id)`, `comfy_uploads(name PRIMARY KEY, sha256, refs, last_used_utc)`, `model_hashes(path PRIMARY KEY, size, mtime, file_id, sha256)`), `crates/lil-core/src/tools/test_tools.rs` (`test.comfy_submit`), `crates/lil-core/Cargo.toml` (`tokio-tungstenite`; `reqwest` came in Task 11).
+- Modify: `crates/lil-core/src/jobs/{mod.rs, record.rs, runner.rs}` for the `external_id` accessor (below).
 - Test: `crates/lil-core/tests/comfy_client.rs` (`FakeComfy`, paused runtime where no socket is involved).
 
 An attached engine's config is a `port` plus an optional `root`, with `autostart = false` in the tests; the ComfyUI-side cleanup of outputs and the salvage by filename prefix happen only when `root` is known (Appendix F, "ComfyUI client").
 
+**`external_id`** (Task 8 review, ruling 4). The ComfyUI prompt id lives in the `jobs` table's `external_id` column.
+- The column exists in both scopes (the JOBS migration: suite 3, workspace 4), so this task adds no migration for it.
+- Nothing reads or writes it yet: `record::JobRow`, `record::Change` and `COLUMNS` lack it.
+- This task adds `external_id: Option<String>` to `JobRow` and to `COLUMNS`, and an `external_id` field to `Change`. It is a guarded update like the others: a final row never changes.
+- It adds `JobCtx::set_external_id(&self, id: &str)` beside `set_substatus`. The handler calls it to persist the prompt id before the POST.
+- At the start of an attempt the handler reads the id back with `record::get(&job.state, job.id.as_str())`. If the row has one, it asks the engine about that id before posting (CORE-120).
+- Recovery ignores the column: `submitting` with `external_side_effects` decides `interrupted_unknown` (Appendix F).
+
 **Interfaces:**
-- Consumes: `Engines::ensure_ready`, `Jobs`, `Store::staging_handle`, `Telemetry::{track, energy_between}`; Task 11's `ComfyClient::{new, system_stats, free}` and `ComfyError`.
+- Consumes: `Engines::ensure_ready`, `Store::staging_handle`; Task 11's `ComfyClient::{new, system_stats, free}` and `ComfyError`.
+  - From `jobs` (Task 8, final): `Jobs::register`; `JobHandler { kind(); run(&JobCtx) -> JobFuture<'_, Result<JobDone, JobFailure>>; cancel_in_engine(&JobCtx) -> JobFuture<'_, ()> }`. `cancel_in_engine` is called at most once, after `job.cancel` turned `true`;
+  - the `JobSpec` of a `comfy.prompt` job: `engine: Some(EngineKind::ComfyUi)`, `lane: Lane::GpuHeavy`, `vram_need_mib`, `expected_secs`, `external_side_effects: false`; `test.comfy_submit` submits it with `ctx.job_caller()`;
+  - `JobCtx::{id, attempt (1-based), spec, cancel, state, workspace, set_substatus, progress, failpoint}`. The runner persists `Submitting` before `run` for an engine job; the handler sets `QueuedInEngine`, `Executing` and `Ingesting`. `failpoint("jobs.after_post")` and `("jobs.after_outputs")` return `io::Result<()>`;
+  - `JobDone { structured, artifacts: Vec<FileRef>, record: Option<RecordPlan>, windows: Vec<ExecWindow> }` and `ExecWindow { engine_pid: u32, start: Duration, end: Duration, ok: bool }`, in the core's `Clock::monotonic()` time;
+  - `JobFailure::{Retryable(ErrorBody), Final(ErrorBody), Interrupted { error, salvaged: Vec<FileRef> }, Unknown(ErrorBody)}`. The runner retries a `Retryable` after 1 s, doubling, up to 5 attempts, and re-runs an interrupted `agent` job once with `retry_of`;
+  - `Telemetry::{track, untrack}` go through `Engines` (Task 11); Task 15's Meter passes the windows to `Telemetry::energy_between(from: Duration, to: Duration) -> EnergySlice`.
 - Produces:
 
 ```rust
@@ -1139,17 +1170,17 @@ pub struct ComfyPromptHandler;  // JobHandler kind "comfy.prompt"; args {graph, 
 ```
 
 - [ ] **Step 1: Write the failing tests:**
-  - `prompt_ids_are_minted_persisted_then_posted`: the `jobs` row holds `submitting` and the UUID before the fake records the POST; the UUID matches `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`;
-  - **`post_failure_checks_status_before_resubmitting`** (CORE-120, Review Focus 1): the fake accepts the prompt and drops the connection before answering (`FakeComfy::drop_after_accept(true)`) → the core calls `GET /api/jobs/<id>` before anything else, finds it, and posts no second `/prompt`; when the fake had not accepted it, exactly one resubmission follows;
+  - `prompt_ids_are_minted_persisted_then_posted`: the `jobs` row holds substatus `submitting` and the UUID in `external_id` before the fake records the POST; the UUID matches `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`;
+  - **`post_failure_checks_status_before_resubmitting`** (CORE-120, Review Focus 1): the fake accepts the prompt and drops the connection before answering (`FakeComfy::drop_after_accept(true)`) → the core calls `GET /api/jobs/<id>` before anything else, finds it, and posts no second `/prompt`; when the fake had not accepted it, exactly one resubmission follows. `<id>` is the row's `external_id`, which a later attempt reads back from the row;
   - `one_suite_prompt_pending_per_lane` (CORE-123, QA-051): three held jobs → the fake's suite prompt count never exceeds 1;
   - `every_prompt_sets_preview_method_and_the_stable_client_id` (CORE-130): `extra_data.preview_method == "taesd"` unless the args say otherwise; the same `client_id` after a core restart;
   - `outputs_are_fetched_into_staging_with_the_prefix_and_engine_copies_removed` (CORE-130, ARCH-080): job `j_0123456789abcdef` → `filename_prefix == "lil_0123456789abcdef_"`; the staged file's SHA-256 equals the fake's; only then is the fake's copy gone. A staged copy whose hash differs (fail point `jobs.after_outputs=io` on the stream) leaves the engine copy in place;
   - `uploads_are_hash_named_once_and_reference_counted` (CORE-130, QA-051): two jobs with the same input → one `/upload/image` named `lil_<first 16 hex of its sha256>.png`, `refs` 2 → 0, the file removed 24 h after (paused clock), not at 23 h;
-  - **`cancel_never_posts_interrupt`** (ARCH-021, Review Focus 2);
-  - **`comfyui_killed_mid_job_interrupts_salvages_and_never_resubmits`** (QA-009, Review Focus 1), and `agent_jobs_rerun_once_while_the_core_runs`;
-  - `oom_frees_then_retries_at_most_twice` (ARCH-072): the fake fails with OOM three times → three POSTs, exactly two `/free`, and the job ends `failed` with `comfyui.out_of_memory`; failing twice then succeeding → `succeeded`, `attempt` 3;
+  - **`cancel_never_posts_interrupt`** (ARCH-021, Review Focus 2): `cancel_in_engine` posts `/api/jobs/<id>/cancel` once and never `/interrupt`;
+  - **`comfyui_killed_mid_job_interrupts_salvages_and_never_resubmits`** (QA-009, Review Focus 1), and `agent_jobs_rerun_once_while_the_core_runs`: the handler returns `JobFailure::Interrupted { error, salvaged }`; the re-run, its `retry_of` and the once-only rule are the runner's (Task 8);
+  - `oom_frees_then_retries_at_most_twice` (ARCH-072): the fake fails with OOM three times → three POSTs, exactly two `/free`, and the job ends `failed` with `comfyui.out_of_memory`; failing twice then succeeding → `succeeded`, `attempt` 3. The handler returns `JobFailure::Retryable` while `job.attempt <= OOM_RETRIES` and `Final` after; the runner supplies the 1 s, then 2 s backoff;
   - `previews_up_to_1_mb_ride_the_preview_topic` (ARCH-033; frames from `FakeComfy::send_preview(2, n)`): a 1,048,576-byte PNG frame is published as `{format: "png", data_b64}`; a 1,048,577-byte one is dropped; the core's websocket client never announces `supports_preview_metadata` (ruling P3-R6), so it gets these event-type-1 frames;
-  - `execution_windows_feed_telemetry_and_the_watchdog_starts_at_execution_start` (CORE-065, CORE-126);
+  - `execution_windows_feed_telemetry_and_the_watchdog_starts_at_execution_start` (CORE-065, CORE-126): the handler returns `JobDone.windows` (an `ExecWindow` from `execution_start` to success or error, with the engine's pid), and `JobSpec.expected_secs` feeds Task 10's `watchdog_slow`;
   - `executed_graph_is_recorded_from_history`; `engine_error_text_is_untrusted_detail` (ARCH-060).
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-core --test comfy_client`. Expected: FAIL.
 - [ ] **Step 3: Implement**, with the `CancelEnginePrompts` shutdown step. A `comfy.prompt` job passes through `submitting`, which is what turns `owned_comfyui_stops_with_the_core_and_dies_with_it` green here.
@@ -1169,13 +1200,17 @@ git commit -m "engines: ComfyUI client and comfy.prompt jobs, exactly-once submi
 - Modify (the wiring):
   - `crates/lil-core/src/server/mod.rs`: the `OutsideJobs` idle blocker and the 2 s poller while the engine is ready;
   - `crates/lil-core/src/engines/{mod.rs, tools.rs}`: `engines.status`'s `outside_jobs` and `inventory`, the `outside_job` event on `engines`, and the `comfy.inventory` job submitted when the engine becomes ready;
-  - `crates/lil-core/src/jobs/scheduler.rs`: a job for an engine with outside prompts is not admitted; it stays `waiting` and is re-checked on each poll;
+  - `crates/lil-core/src/jobs/{scheduler.rs, mod.rs, runner.rs}`: a job for an engine with outside prompts is not admitted (`Admit::Wait`, new in `mod.rs` and handled in `runner.rs`); it stays `waiting` and is re-checked on each poll;
   - `crates/lil-core/src/engines/comfyui/handler.rs`: graph checks (node replacements, model refs, partner nodes) before the POST;
   - `crates/lil-core/src/tools/mod.rs` and its pins in `tools/tests.rs`, for the inventory job handler's registration.
 - Test: `crates/lil-core/tests/comfy_observe.rs`; unit tests in `graph.rs`.
 
 **Interfaces:**
 - Consumes: Task 11's `UsageSink`, `UsageDraft`, `UsageCtx`; Task 12's `ComfyClient`.
+  - From `jobs` (Task 8, final): `Admission::admit(&self, spec: &JobSpec) -> Admit` with `Admit::{Go, GoUnchecked, WaitForVram { need_mib, free_mib }}`. `Admit` has no plain wait, and `WaitForVram` would show `waiting_for_vram`, so this task adds `Admit::Wait` (substatus stays `waiting`);
+  - `Jobs::kick()` after each poll, so a held job is looked at again;
+  - `lifecycle::IdleBlocker { name() -> &'static str; busy() -> bool }`, which `OutsideJobs` implements (`Jobs` implements it too);
+  - `comfy.inventory` is submitted by the core with no tool call, so the engine code builds the `JobCaller` itself for `Jobs::submit(&JobCaller, JobSpec)`: a fresh call id `c_<16 hex>`, `workspace: None` (the suite's scope), `reservation: None`, `origin: None`, `retry_of: None`, a new `SubmittedSlot`. `job.retry` answers `job.not_retryable` for such a job (no tool call made it).
 - Produces:
 
 ```rust
@@ -1221,6 +1256,10 @@ git commit -m "engines: outside ComfyUI jobs, environment capture, model invento
 - Test: `crates/lil-core/tests/confirm.rs`, additions to `tests/dispatch.rs`.
 
 **Interfaces:**
+- Consumes (Task 8, final): `job.retry` runs the retried job's tool call again.
+  - `Jobs::retry_origin(&JobCaller, &JobId) -> Result<RetryPlan { origin: JobOrigin { tool, arguments }, project }, ErrorBody>` finds the call;
+  - `Redispatch::retry(&CallCtx, &JobId)` (in `CallCtx::redispatch`) runs its stages 3–9 under the retrying session, the retry's idempotency key and `CallCtx::retry_of`, in the job's project;
+  - an inner `Outcome::PendingConfirmation` becomes `confirm.unavailable` today (a `Task 14` note in `tools/dispatcher.rs`); this task makes the `job.retry` call itself pending and, once approved, runs the retry once.
 - Produces:
 
 ```rust
@@ -1269,6 +1308,7 @@ impl StateDb { pub async fn idem_reclaim(&self, scope: &str, key: &str, args_has
   - `answering_anywhere_publishes_answered_once` (APP-054's core side);
   - `deny_and_expiry_return_their_codes_and_release_the_key` (CORE-115);
   - **`retry_with_other_arguments_is_a_conflict`**, **`another_caller_kind_cannot_use_the_token`**, **`pending_survives_core_restart_and_runs_once`** and **`approve_and_retry_race_runs_once`** (Review Focus 4);
+  - `job_retry_of_a_confirm_tool_is_pending_and_runs_once` (CORE-146, ARCH-052): a `cli` caller's `job.retry` of a failed job whose tool is `destructive` or `exec`, with `TestApp` connected, gives `pending_confirmation` for the retry call (not `confirm.unavailable`); after the answer, the same call again submits exactly one new job with `retry_of`; without an app it stays `confirm.unavailable`;
   - `mcp_sessions_get_no_marker_and_core_confirmations` (ARCH-054, CORE-112, P3-R10): with `mcp_confirmation = "core"` no tool in an `mcp` session's `tools/list` (nor a `cli` one's) carries `requiresUserInteraction`, and an `mcp` call is treated like a `cli` one (pending with an app, `confirm.unavailable` without), so the core's confirmation is the only prompt; with `"claude_code"` the marker is on `destructive` and `exec` tools of an `mcp` session, the call proceeds and history records `confirmed_via: claude_code`. Both settings are tested through `Confirm`'s constructor;
   - `ui_cap_prompts_are_cancelled_when_the_app_closes`;
   - `pending_confirmations_hold_idle` (ARCH-020); `app_methods_need_the_capability` (APP-043, protocol 1.1): `app/confirmations.list` and `app/confirmation.answer` from a `ui:*` session whose shared capabilities lack `confirmations.v1` → `caller.not_allowed`; with it → ok (`app/caps.set` is Task 16's);
@@ -1291,9 +1331,19 @@ git commit -m "confirm: agent safety confirmations, app answers, retry by idempo
 - Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 6), `crates/lil-core/src/tools/telemetry_tools.rs` (`telemetry.jobs`), `crates/lil-core/src/tools/test_tools.rs` (`test.meter_external` without caps), `crates/lil-core/src/store/failpoints.rs` (`meter.after_pending`, fired after the pending row commits; `meter.after_usage_line`, fired after the log line and before any settle).
 - Carry from Task 9 (review ruling 5): `EnergySlice.cpu_ms_by_pid` holds every untracked process together under pid 0, so the CPU share is the engine pids' `cpu_ms` divided by the map's sum, pid 0 included, never by the sum over tracked pids only. `energy_between` takes samples in `(from, to]` (open at the start). `cpu_measured: false` covers both estimated and unknown CPU.
 - Usage lines go through the existing append-log home, `crates/lil-core/src/store/logs.rs`: `Store::append_log(LogKind::Usage, …)` with a workspace, `logs::append_loose_usage(env, record)` without one (Global Constraints, "File writes in `lil-core`"). Nothing in `meter` writes a file itself.
+- Modify: `crates/lil-core/tests/module_deps.rs`: `meter` joins `MODULES`; `jobs` and `telemetry` must not use it (`JobCompletion` is how `meter` reaches `jobs`).
 - Test: `crates/lil-schema/tests/money.rs` (proptest), `crates/lil-core/tests/meter.rs`, `crates/lil-testkit/tests/money_has_no_float_constructor.rs`.
 
 **Interfaces:**
+- Consumes, from `telemetry` (Task 9, final):
+  - `Telemetry::energy_between(&self, from: Duration, to: Duration) -> EnergySlice`: monotonic times of this run, over the samples in `(from, to]`. An unreadable `telemetry.db` gives `EnergySlice::default()`, whose `gpu_measured` and `cpu_measured` are false;
+  - `EnergySlice.cpu_ms_by_pid`: **key 0 is every untracked process together**, so the map's sum is the machine's CPU time. The CPU share is `Σ cpu_ms(engine pids) / Σ all values of the map`, pid 0 included, never the sum over tracked pids alone. `sm_by_pid` has real pids only (no key 0);
+  - `Telemetry::put_job_energy(&self, e: &JobEnergy) -> Result<(), ErrorBody>` replaces an earlier write for the job. `Telemetry::job_energy(&self, q: JobEnergyQuery) -> Result<Vec<JobEnergy>, ErrorBody>` returns rows newest first. Neither has a caller yet: Meter writes, and the `telemetry.jobs` tool this task registers reads;
+  - `JobEnergyQuery { job_ids: Option<Vec<String>>, from: Option<String>, to: Option<String>, limit: Option<u32> /* 1–500, default 100 */ }`, `deny_unknown_fields`, is the tool's argument type.
+- Consumes, from `jobs` (Task 8, final):
+  - `JobCompletion::completed(&self, job: &JobCtx, outcome: &Outcome<ToolOutput>, done: Option<&JobDone>) -> JobFuture<'_, ()>`, added with `Jobs::add_completion` (Meter first, then Caps) before the server's `Jobs::recover_suite`, which runs completions for jobs that never started;
+  - `JobCtx::{id, spec.project, spec.asset_id, workspace, reservation}` build the `UsageCtx`; `JobDone.windows: Vec<ExecWindow { engine_pid, start, end, ok }>` (monotonic `Duration`s) are what `attribute` takes;
+  - the internal outcome codes `job.cancelled`, `job.resolved_unknown` and `job.not_started` are not in `codes::ALL` and never reach the wire, so match them only with the predicates `jobs::is_cancelled(&Outcome)`, `jobs::resolved_unknown(&Outcome)` and `jobs::never_started(&Outcome)`: `is_cancelled` and `resolved_unknown` both give usage `status: "cancelled"`, `never_started` gives no usage line and no energy, any other error gives `"failed"`.
 - Produces:
 
 ```rust
@@ -1308,7 +1358,7 @@ impl Money { pub const ZERO: Money; pub fn from_micros(m: i64) -> Money; pub fn 
     pub fn convert(self, r: &Rate) -> Money; }                 // round half to even
 // lil_core::meter (BillingBasis created in Task 8; UsageDraft, UsageCtx and UsageSink in Task 11; JobEnergy in Task 9)
 pub fn attribute(job_id: &str, workspace: &str, windows: &[ExecWindow], slices: &[EnergySlice],
-                 engine_pids: &[u32], power: &PowerSettings) -> JobEnergy;   // pure; sums over every engine pid
+                 engine_pids: &[u32], power: &PowerSettings) -> JobEnergy;   // pure; one slice per window (its `energy_between`); sums over every engine pid; the CPU share divides by the slice map's sum, pid 0 included
 pub struct Meter;
 impl Meter {
     pub async fn begin(&self, ctx: &UsageCtx, d: UsageDraft) -> Result<String /* us_<16 hex> */, ErrorBody>; // write-ahead
@@ -1317,7 +1367,7 @@ impl Meter {
     pub async fn recover(&self) -> Result<u32, ErrorBody>;    // dead core's rows → status "pending" lines
     pub async fn summary(&self, q: SummaryQuery) -> Result<UsageSummary, ErrorBody>;
 }
-impl UsageSink for Meter {}  impl JobCompletion for Meter {}   // local-work records for comfy jobs; writes job_energy through Telemetry::put_job_energy
+impl UsageSink for Meter {}  impl JobCompletion for Meter {}   // local-work records for comfy jobs; writes job_energy through Telemetry::put_job_energy(&JobEnergy)
 impl Meter { pub async fn finish_call(&self, call_id: &str, status: &str) -> Result<Option<u64 /* seq */>, ErrorBody>; }
     // finishes the call's still-pending usage row, if any, at its est_cost; None when the tool finished it itself
 // lil_core::meter::stage: stage 8 for inline (non-job) calls; the server's pipeline hooks use it in place of Plan2's no-op
@@ -1331,11 +1381,12 @@ impl MeterStage for MeterSettle {}   // settle(): finish_call(call_id, "succeede
   - `pending_row_is_written_before_the_call_and_the_line_after` (CORE-071); `meter_after_pending_abort_leaves_a_pending_line_after_restart`;
   - `record_fields_match_appendix_f_and_money_is_decimal_strings` (CORE-069); `account_is_an_opaque_id` (CORE-069);
   - `loose_calls_go_to_usage_loose` (ARCH-081);
-  - `attribution_splits_gpu_by_sm_share_and_cpu_by_cpu_time` (CORE-065): one 10 s window, GPU delta 2,000,000 mJ, idle GPU 40,000 mW, SM permille·s {launcher 200: 0, interpreter 201: 7500, other 100: 2500}, CPU delta 300,000 mJ, idle CPU 10,000 mW, CPU ms {201: 2000, 100: 6000} → `gpu_mj_gross` 1,500,000, `gpu_mj_above_idle` 1,200,000, `gpu_seconds_milli` 7,500, `cpu_mj_gross` 75,000, `cpu_mj_above_idle` 50,000 (engine pids `[200, 201]`);
-  - `idle_baseline_cases` (CORE-065, through `Telemetry::energy_between` over fake sources): (a) in the 60 s before the window, three samples under 5 % utilisation at 40, 42 and 44 W and the rest above → idle 42,000 mW; (b) no sample under 5 % in those 60 s, and 1-minute averages of 80, 55 and 70 W in the last hour → 55,000 mW; (c) neither (a fresh `telemetry.db`) → `idle_gpu_mw` is `None`, above-idle equals gross, and both the `JobEnergy` and the usage line have `idle_unknown: true` (in (a) and (b) neither has the key);
+  - `attribution_splits_gpu_by_sm_share_and_cpu_by_cpu_time` (CORE-065): one 10 s window, GPU delta 2,000,000 mJ, idle GPU 40,000 mW, SM permille·s {launcher 200: 0, interpreter 201: 7500, other 100: 2500}, CPU delta 300,000 mJ, idle CPU 10,000 mW, CPU ms {201: 2000, 0: 6000} (key 0 is every untracked process, as `energy_between` reports it) → `gpu_mj_gross` 1,500,000, `gpu_mj_above_idle` 1,200,000, `gpu_seconds_milli` 7,500, `cpu_mj_gross` 75,000, `cpu_mj_above_idle` 50,000 (engine pids `[200, 201]`; dividing by the tracked pids alone would give a `cpu_mj_gross` of 300,000);
+  - `idle_baseline_cases` (CORE-065, through `Telemetry::energy_between` over `lil_platform::hw_fake` sources: `FakeHwScript::sources()`, `HwSources::from_fake`, `Telemetry::tick` in `TickMode::Manual`): (a) in the 60 s before the window, three samples under 5 % utilisation at 40, 42 and 44 W and the rest above → idle 42,000 mW; (b) no sample under 5 % in those 60 s, and 1-minute averages of 80, 55 and 70 W in the last hour → 55,000 mW; (c) neither (a fresh `telemetry.db`) → `idle_gpu_mw` is `None`, above-idle equals gross, and both the `JobEnergy` and the usage line have `idle_unknown: true` (in (a) and (b) neither has the key);
   - `local_job_record_has_energy_and_cost_zero_with_energy_cost_apart` (CORE-064, CORE-082);
   - `summary_never_adds_bases_together_and_converts_with_dated_rates` and `fixed_costs_are_in_month_totals` (CORE-081–083);
-  - `telemetry_jobs_lists_job_energy` (CORE-146): after a comfy job, `telemetry.jobs {job_ids: [id]}` returns one `JobEnergy` with that `job_id`, the workspace id and `measured: {gpu: true, cpu: true}`;
+  - `telemetry_jobs_lists_job_energy` (CORE-146): after a comfy job, `telemetry.jobs {job_ids: [id]}` returns one `JobEnergy` with that `job_id`, the workspace id and `measured: {gpu: true, cpu: true}`; the tool is new here (`Telemetry::job_energy` had no caller), and `limit: 0` is `params.invalid`;
+  - `job_outcomes_map_to_usage_status` (CORE-088, AI-029): a cancelled job (`jobs::is_cancelled`) → one line with `status: "cancelled"`; an `interrupted_unknown` job resolved from the app (`jobs::resolved_unknown`) → `"cancelled"`; a job that never started (`jobs::never_started`) → no line; an engine failure → `"failed"`;
   - `meter_stage_finishes_inline_calls_once`: an inline `test.meter_external {provider: "p", amount: "0.5"}` whose tool leaves its row pending → after stage 8 the usage log has exactly one line for its call id with `status: "succeeded"` and `est_cost: "0.5"`; a second `settle` for the same call id adds no line; with `fail: true` the line has `status: "failed"`.
 - [ ] **Step 2: Run them.** Run: `cargo nextest run -p lil-schema -p lil-core -p lil-testkit -E 'test(money) | test(convert_rounds_half_even) | binary(meter)'`. Expected: FAIL.
 - [ ] **Step 3: Implement**, with `usage.summary`, `telemetry.jobs`, the `usage` topic and `MeterSettle` as stage 8.
@@ -1352,11 +1403,22 @@ git commit -m "meter: Money, write-ahead usage records, per-job energy attributi
 
 **Files:**
 - Create: `crates/lil-core/src/meter/{caps.rs, caps_settings.rs}`.
-- Modify: `crates/lil-core/src/state/migrations.rs` (append `CAPS` to the suite scope, migration 7: `cap_reservations`, `cap_settled`, `cap_alerts`), `crates/lil-core/src/{confirm/stage.rs, confirm/mod.rs, tools/stages.rs, rpc.rs, store/suite_toml.rs}` (`confirm/mod.rs`: `Confirm::answer` handles `cap.action` `allow_once` and `raise`), `crates/lil-core/src/meter/stage.rs` (the caps half of `MeterSettle`), `crates/lil-core/src/store/failpoints.rs` (`caps.after_reserve`, fired after the reservation commits; Task 21's `crash_full_*` exercises it).
+- Modify: `crates/lil-core/src/state/migrations.rs` (append `CAPS` to the suite scope, migration 7: `cap_reservations`, `cap_settled`, `cap_alerts`), `crates/lil-core/src/{confirm/stage.rs, confirm/mod.rs, tools/stages.rs, rpc.rs, store/suite_toml.rs}` (`confirm/mod.rs`: `Confirm::answer` handles `cap.action` `allow_once` and `raise`), `crates/lil-core/src/meter/stage.rs` (the caps half of `MeterSettle`), `crates/lil-core/src/store/failpoints.rs` (`caps.after_reserve`, fired after the reservation commits; Task 21's `crash_full_*` exercises it), `crates/lil-core/src/server/mod.rs` (`Jobs::add_completion` and `Jobs::set_reservations`, both before the `recover_suite` call).
 - The estimate stage (`tools/stages.rs`) reads `test.destructive`'s `cost` (Task 6) as `Estimate::External { provider: "test", amount: cost, currency: <display>, basis: Payg }`, and `test.meter_external`'s `{provider, amount, currency?, basis?}` as the matching external estimate (currency defaulting to the display currency, basis to `payg`).
 - Test: `crates/lil-core/tests/caps.rs` (threads against real SQLite in a temp folder), `crates/lil-core/tests/caps_concurrency.rs`.
 
 **Interfaces:**
+- Consumes, from `jobs` (Task 8, final; module docs "Reservations"):
+  - `Reservations`, set with `Jobs::set_reservations(Arc<dyn Reservations>)` (the default is `NoReservations`). Both methods return `JobFuture<'_, ()>`:
+    - `hand_over(&self, reservation: &str, from: &str, to: &JobId)`: `reservation` now belongs to job `to`. It is called after the job row commits. `from` is the call id `c_<16 hex>` (`ReserveInput.call_id`) when a job takes its call's reservation, or the old job id when an automatic re-run takes an interrupted job's. `Caps` rewrites the reservation's owner from `from` to `to` (CORE-088: it records its job or call id);
+    - `release(&self, reservation: &str, owner: &str)`: the reservation made for `owner` is released unused, with no usage line. `jobs` calls it with the call id when the call's idempotency key gave back an existing job (CORE-016): that call reserved for nothing, and its own reservation would stay held. It is idempotent, and it leaves a reservation that is settled or owned by someone else alone;
+  - `JobCompletion::completed(&self, job: &JobCtx, outcome: &Outcome<ToolOutput>, done: Option<&JobDone>)`, added after Meter's with `Jobs::add_completion`; `JobCtx.reservation: Option<String>` is the job's reservation, `None` once it was handed to an automatic re-run (nothing to settle);
+  - what each outcome does to the reservation (the predicates are `jobs::{is_cancelled, never_started, resolved_unknown}`; the codes are internal):
+    - success → `Caps::settle(rv, actual, true)`;
+    - `is_cancelled`, `never_started`, or a failure of a provider that doesn't bill failures → released;
+    - **`resolved_unknown` → settled at the reserved amount, never released** (ruling P3-R15: the provider may have charged, caps fail closed, and reconciliation, AI-015, corrects it later);
+    - an `interrupted_unknown` job has no completion yet (its row is `running`): its reservation stays held and counts as spent at the reserved amount (`CapHit.held`) until you resolve it with `job.cancel` from the app; an agent's `job.cancel` is `confirm.unavailable`;
+    - a job that was `running` when the core stopped (`failed`/`interrupted`, no completion) keeps its reservation too: `Caps::repair` and Meter's pending usage line own it.
 - Produces:
 
 ```rust
@@ -1372,12 +1434,13 @@ impl Caps {
     pub fn period(&self, utc: SystemTime) -> String;                         // local "YYYY-MM"
     pub async fn check(&self, est: &Estimate) -> Result<CapCheck, ErrorBody>;
     pub async fn reserve(&self, est: &Estimate, ctx: &UsageCtx, allow_once: Option<&str>) -> Result<ReserveOutcome, ErrorBody>; // one BEGIN IMMEDIATE
-    pub async fn settle(&self, reservation: &str, actual: Option<Money>, billed: bool) -> Result<(), ErrorBody>; // idempotent
+    pub async fn settle(&self, reservation: &str, actual: Option<Money>, billed: bool) -> Result<(), ErrorBody>;
+        // idempotent; billed = false releases; billed = true with actual = None settles at the reserved amount (P3-R15)
     pub async fn repair(&self) -> Result<u32, ErrorBody>;
     pub async fn view(&self) -> Result<CapsView, ErrorBody>;
     pub async fn set(&self, by: &Session, p: CapsSetParams) -> Result<CapsView, ErrorBody>;   // verified ui:* only
 }
-impl ReserveStage for Caps {}  impl JobCompletion for Caps {}
+impl ReserveStage for Caps {}  impl JobCompletion for Caps {}  impl jobs::Reservations for Caps {}   // hand_over and release, above
 impl MeterSettle { pub fn with_caps(self, caps: Arc<Caps>) -> MeterSettle; }   // settle(): the usage line first, then Caps::settle(reservation)
 ```
 
@@ -1385,8 +1448,10 @@ impl MeterSettle { pub fn with_caps(self, caps: Arc<Caps>) -> MeterSettle; }   /
   - **`concurrent_reserves_never_overshoot`** (CORE-087, QA-047, Review Focus 3): 16 threads × 100 reservations against one real `state.db`, mixed workspaces and none;
   - **`crash_between_usage_line_and_settle_is_repaired_once`** (CORE-088, Review Focus 3; `meter.after_usage_line=abort`);
   - **`month_boundary_and_dst_follow_local_calendar`** (CORE-012, Review Focus 3; `FakeClock` offsets across a DST change and a month end);
-  - `per_call_max_and_provider_caps_apply` (CORE-085); `reservation_records_rate_workspace_and_job` (CORE-085, CORE-088);
-  - `failed_unbilled_call_releases_and_interrupted_unknown_keeps` (CORE-088);
+  - `per_call_max_and_provider_caps_apply` (CORE-085); `reservation_records_rate_workspace_and_job` (CORE-085, CORE-088): the owner is the call id `c_…` until the job row commits (`hand_over`), then the job id `j_…`, and an automatic re-run takes it over (the owner becomes the re-run's id);
+  - `failed_unbilled_call_releases_and_interrupted_unknown_keeps` (CORE-088, AI-029, P3-R15): with a `monthly` cap of 10 and a reservation of 2, a failed unbilled call → held 0, settled 0; an `interrupted_unknown` job → held stays 2, and a further reserve of 9 gets `Exceeds` with `held: 2`;
+  - **`resolving_an_unknown_job_settles_at_the_reservation`** (CORE-088, AI-029, P3-R15): that `interrupted_unknown` job resolved by `job.cancel` from a `ui:*` session (outcome `resolved_unknown`) → held 0, settled 2, not released; an ordinary cancel of a queued paid job → held 0, settled 0;
+  - **`a_replayed_key_releases_its_own_reservation`** (CORE-016, CORE-088): a paid call (estimate 2) under key K submits a job that takes reservation `rv_1`; the core loses that call's outcome, and the client retries K: the new call reserves `rv_2` (held is 4), `Jobs::submit` gives back the first job, and `release(rv_2, <the new call id>)` runs → held is 2 (`rv_1`, the job's), and the replay writes no usage line;
   - `alerts_once_per_level_per_period` (CORE-089); `quota_local_and_fixed_never_count` (CORE-090);
   - `one_prompt_covers_confirm_and_cap` (CORE-015 step 5, APP-045) and `race_after_stage_5_asks_for_the_cap_only`;
   - `allow_once_and_raise_answers` (CORE-091); `non_interactive_is_cap_exceeded` (QA-016);
@@ -1532,7 +1597,7 @@ async fn main();  // rmcp stdio server "lil"; tools from the core's tools/list (
 pub fn claude_is_direct_parent(inspector: &dyn ProcessInspector, client: &ProcessInfo) -> bool; // parent image is claude.exe
 ```
 
-  `lil-mcp` keeps one core connection; a lost connection is re-established on the next call (starting the core, ARCH-018). `retry_token`, when present, is removed from the arguments and used as the idempotency key; otherwise each call gets a fresh key. MCP resources read `project.context`, `jobs.list` and `assets.query`.
+  `lil-mcp` keeps one core connection; a lost connection is re-established on the next call (starting the core, ARCH-018). `retry_token`, when present, is removed from the arguments and used as the idempotency key; otherwise each call gets a fresh key. MCP resources read `project.context`, `jobs.list` and `assets.query`. As built in Task 8: `jobs.list`'s `JobFilter` takes one `status`, so `lil://jobs/open` is `queued` and `running` fetched separately and merged, newest first; `job.wait` takes `{job_id, timeout_s? (1–90, default 90)}` and returns `{job, done}`, and the core answers `params.invalid` for a timeout outside 1–90.
 
 - [ ] **Step 1: Write the failing tests:**
   - `mcp_without_claude_as_direct_parent_is_cli` and `only_a_direct_claude_parent_counts` (ARCH-047): `lil-mcp.exe` from a trusted folder with parent `claude.exe` → `mcp`; with parent `cmd.exe`, `bash.exe` or `pwsh.exe` whose parent is `claude.exe` → `cli`; with no parent → `cli`;
