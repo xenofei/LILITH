@@ -1381,7 +1381,7 @@ Use of each Claude account is subject to Anthropic's terms (AI-106 links them).
 
 ORACLE is the place to talk: the person can discuss anything with any model they have set up, and the suite makes sure the model knows what LILITH is. It arrives in **plan 7a**, the first M1b plan, which also brings a chat-only local engine. It doesn't need the Claude Code headless spikes, so it can run alongside them.
 
-- **AI-200** [M1b] (decision) **ORACLE** is a general chat in which the person can discuss anything. It never acts on its own. In plan 7a it makes no tool calls: it starts no tasks, changes no settings or files, and spends only on its own turns, from the shared allowance (AI-216). Its knowledge of the suite comes from retrieval the core does before each turn (AI-203).
+- **AI-200** [M1b] (decision) **ORACLE** is a general chat in which the person can discuss anything. It never acts on its own. In plan 7a it makes no tool calls: it starts no tasks, changes no settings or files, and spends only on its own turns, from the shared allowance (AI-216). Its knowledge of the suite comes only from retrieval the core does before each turn (AI-203). This holds on every engine: on Claude Code its launch profile has no tools at all (AI-207).
 - **AI-201** [M1b] (contract) **Where it lives.**
   - ORACLE has a small window of its own, the `lil-oracle` app on the shared shell (caller kind `ui:oracle`, ARCH-046), usable with no studio open. It shows the active workspace's conversations, or the suite scope's when no workspace is open (AI-087).
   - The same conversations are reachable inside each studio's Assistant dock (APP-008), where ORACLE is a clearly labelled **level**. From the TETHER plan the dock also offers the TETHER level (AI-039). The ORACLE window has only the ORACLE level.
@@ -1417,8 +1417,9 @@ ORACLE is the place to talk: the person can discuss anything with any model they
   - After a cancel, new chats have no model until the user picks one (AI-202).
 - **AI-207** [M1b] (contract) **ORACLE on Claude Code** (Engine A) arrives with the later M1b plan that brings Engine A to chat, after the M1b headless spikes (AI-133–148). It runs under Engine A's rules (AI-047–072) with its own **`chat` launch profile**:
   - its own fixed system-prompt file; no `--mcp-config`, so no `lil` tools, and AI-061's `lil`-server check doesn't apply (as for AI-194);
-  - `--disallowedTools Bash,PowerShell,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch`;
-  - the credential read-deny rules (AI-221), and `--restricted` as well if the M0 spike shows it confines file tools (AI-134).
+  - **no tools at all, read tools included.** `--disallowedTools` (the mechanism AI-050 uses) lists every built-in tool: Read, Glob, Grep, LS, the Bash and PowerShell families, Edit, Write, MultiEdit, NotebookEdit, WebFetch, WebSearch, Task/Agent, and any other built-in tool the tested version has. The list is kept per tested version in `claude_code.yaml` (AI-131), and the M1b spike confirms that no tool remains;
+  - ORACLE's suite knowledge on Claude Code comes only from the suite card and the `suite.help` passages the core injects (AI-203), never from reading files;
+  - the credential read-deny rules (AI-221) are still carried, as on every Engine A profile.
   - Its turns use plan quota (`subscription_quota`, AI-071).
 
 ### 4.6c TETHER and MAGI Core
@@ -1438,7 +1439,7 @@ TETHER works inside a studio with the suite's tools and confirmations. MAGI Core
   - A probe runs only when the user starts it; the first use of TETHER on an untested route offers it. API probes spend and show their estimated cost first. Local probes run as GPU jobs (M1.5, AI-211).
   - The pass bars for each tier are fixed in the TETHER plan.
 - **AI-210** [M1b] (contract) **TETHER on Engines B and C.**
-  - The core's turn loop parses streaming tool-call deltas (moved here from plan 6b), validates inputs against their schemas before running (AI-081's rule, for every adapter), and limits tool rounds per turn, as `--max-turns` does for Engine A (AI-050).
+  - The core's turn loop parses streaming tool-call deltas (moved here from plan 6b), validates inputs against their schemas before running (AI-081's rule, for every adapter), and runs under the loop guard (AI-224).
   - Engine C lowers tools to a new **`openai_tools`** target (function tools; `strict` where the profile allows it), using the same name mapping as the other targets, with snapshot tests (ARCH-040).
   - Hosted Engine C routes get tools in M1b; local routes in M1.5 (AI-211).
 - **AI-211** [M1.5] (decision) **Local tool use.** TETHER runs on local routes (`llama-server`, Ollama) once a route passes the probe on this machine (AI-209). Until then, local routes are chat only.
@@ -1484,6 +1485,12 @@ These rules hold for ORACLE, TETHER and MAGI Core on every engine.
   - It is recorded with the conversation (AI-087) and shown in the level chip and the Start dialog.
   - Spec tests cover each path.
 - **AI-221** [M1b] (invariant) **Credential read-deny rules.** Every Engine A launch profile (TETHER, director, ORACLE's `chat` profile and the interview profile, AI-194) carries read-deny permission rules for credential files: `**/.credentials.json`, `**/.claude.json`, `**/.ssh/**`, `**/.aws/**`, the rclone config, `**/.env` and `**/*.env`, `**/*.pem`, and browser profile folders.
+- **AI-222** [M1b] (invariant) **Rendering model output.** In ORACLE, TETHER and the task view, model output never loads remote content automatically. Markdown images and remote links are shown, with their full URL, and never fetched; a link opens only on the user's click. `lil:` links in model text (APP-020) are shown as text and never act on a click without a confirmation that names the action. Only the suite's own chrome renders live `lil:` controls.
+- **AI-223** [M1b] (invariant) **Attachments.** A file attached to a conversation is data, not instructions: it is wrapped as untrusted (AI-086, ARCH-060) and taints the conversation (AI-220). Before it is sent to any remote route, the key redaction pass runs on it (AI-218). Its size and token count are shown before sending.
+- **AI-224** [M1b] (invariant) **TETHER loop guard** (TETHER plan). On every engine:
+  - a cap on tool rounds per turn (on Engine A, `--max-turns`, AI-050);
+  - a detector that stops the turn when the same failing call, with the same arguments, is repeated N times (N set in the TETHER plan);
+  - a burst breaker that pauses a turn after about 5 confirmation prompts and asks the user whether to continue.
 
 ### 4.7 Claude Code integration
 
@@ -2734,11 +2741,11 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 | §1 Processes, connections, trust and repo layout | 1 | 112 | 1 | 0 | 4 | 6 | 124 |
 | §2 Core modules | 0 | 140 | 1 | 1 | 5 | 4 | 151 |
 | §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 11 | 3 | 3 | 11 | 146 |
-| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 38 | 98 | 18 | 5 | 221 |
+| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 38 | 101 | 18 | 5 | 224 |
 | §5 Image studio | 8 | 3 | 113 | 30 | 9 | 4 | 167 |
 | §6 Errors, testing and quality | 1 | 84 | 0 | 1 | 0 | 1 | 87 |
 | §7 Sync, backup and builds | 2 | 83 | 0 | 0 | 20 | 3 | 108 |
-| **All** | **29** | **585** | **164** | **133** | **59** | **34** | **1004** |
+| **All** | **29** | **585** | **164** | **136** | **59** | **34** | **1007** |
 
 ## Appendix B. M0 spike checklist and facts to re-verify
 
