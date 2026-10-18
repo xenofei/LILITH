@@ -180,7 +180,12 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
-    fn raw(&self) -> HANDLE {
+    /// Takes ownership of a process handle (the engine spawn's `CreateProcessW` result).
+    pub(crate) fn from_owned(handle: OwnedHandle, pid: u32) -> ProcessHandle {
+        ProcessHandle { handle, pid }
+    }
+
+    pub(crate) fn raw(&self) -> HANDLE {
         HANDLE(self.handle.as_raw_handle())
     }
 
@@ -415,7 +420,7 @@ pub fn spawn_detached_with(
     }
 }
 
-fn wide_nul(s: &OsStr, what: &str) -> io::Result<Vec<u16>> {
+pub(crate) fn wide_nul(s: &OsStr, what: &str) -> io::Result<Vec<u16>> {
     let mut wide: Vec<u16> = s.encode_wide().collect();
     if wide.contains(&0) {
         return Err(invalid_input(&format!("{what} contains a NUL character")));
@@ -430,7 +435,7 @@ const SPACE: u16 = b' ' as u16;
 
 /// The NUL-terminated command line: the exe path always quoted, then each argument quoted by
 /// the rules `CommandLineToArgvW` and the C runtime parse back.
-fn command_line(exe: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>> {
+pub(crate) fn command_line(exe: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>> {
     let exe = wide_nul(exe, "the exe path")?;
     let exe = &exe[..exe.len() - 1];
     if exe.contains(&QUOTE) {
@@ -525,7 +530,7 @@ fn env_key(name: &OsStr) -> String {
 /// `base` without the variables named in `remove`, then with `extra` applied (case-insensitive
 /// replacement, later entries win), sorted by upper-cased name, as a double-NUL-terminated
 /// UTF-16 block.
-fn environment_block(
+pub(crate) fn environment_block(
     base: Vec<(OsString, OsString)>,
     extra: &[(OsString, OsString)],
     remove: &[OsString],

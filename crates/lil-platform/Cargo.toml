@@ -9,9 +9,14 @@ publish.workspace = true
 # ARCH-111: lil-platform is the only crate allowed to call Windows APIs.
 [dependencies]
 getrandom.workspace = true
+# GPU telemetry (CORE-059); loads the driver's nvml.dll at run time, so no NVIDIA GPU is needed
+# to build or test.
+nvml-wrapper.workspace = true
 # The SQLite file helpers lil doctor and the core share (sqlite_files, CORE-004).
 rusqlite.workspace = true
 sha2.workspace = true
+# CPU, RAM, per-process CPU time, network and disks (CORE-059).
+sysinfo.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 toml.workspace = true
 zeroize.workspace = true
@@ -20,6 +25,8 @@ zeroize.workspace = true
 workspace = true
 features = [
     "Win32_Foundation",
+    # The NVIDIA adapter's LUID, for the PDH GPU memory instances (CORE-059).
+    "Win32_Graphics_Dxgi",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
@@ -32,10 +39,16 @@ features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
     "Win32_System_IO",
+    # Kill-on-close engine Job Objects (ARCH-064).
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    # PDH: GPU Process Memory and the Energy Meter (CORE-059).
+    "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    # The local time offset through the dynamic time zone (CORE-012).
+    "Win32_System_Time",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     # RtlUpcaseUnicodeChar (ntdll): the system uppercase table that file names compare by.
@@ -44,8 +57,9 @@ features = [
 
 [dev-dependencies]
 tempfile.workspace = true
-# tests/spawn.rs marks a pipe handle inheritable to prove the spawn does not leak it.
-windows = { workspace = true, features = ["Win32_Foundation"] }
+# tests/spawn.rs and tests/engine_spawn.rs mark a pipe handle inheritable to prove the spawn
+# does not leak it; tests/clock.rs reads the time zone's raw fields.
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time"] }
 
 [lints]
 workspace = true
