@@ -130,6 +130,19 @@ const ALLOW: &[Allow] = &[
         until: "the owner says the folder is gone",
     },
     Allow {
+        globs: &["crates/lil-testkit/tests/claude_settings_patterns.rs"],
+        lines_with: &[
+            "fn worldwright_rules_are_kept()",
+            ".WorldWright",
+            ".WORLDWRIGHT/",
+            "notes\\worldwright.txt",
+            "docs/worldwright.md",
+        ],
+        why: "tests of the legacy folder's deny rules: the kept-rules test and the mixed-case \
+              and lookalike rows those rules are checked against (Task B5)",
+        until: "the owner says the folder is gone, with the .worldwright rules",
+    },
+    Allow {
         globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
         lines_with: &["`worldwright` plugin", "plugin_worldwright_"],
         why: "R1, D5",

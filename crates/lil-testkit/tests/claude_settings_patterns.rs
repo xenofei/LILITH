@@ -28,15 +28,18 @@
 //!   split on `|`, `;`, `&&` and `||`. (Alias canonicalisation doesn't matter for `git`, `gh`
 //!   and `cmdkey`; for `Get-Content` the list names the `gc`, `cat` and `type` aliases itself.)
 //!
-//! **The owner's key and denylist folder** (`%USERPROFILE%\.worldwright`, R38). `Read` and
-//! `Edit` deny rules keep agents out of it; [`path_rule_matches`] reimplements the docs'
-//! section "Read and Edit" (read 2026-10-14):
+//! **The owner's key and denylist folder** (`%USERPROFILE%\.lilith`, and the legacy
+//! `%USERPROFILE%\.worldwright` while it exists; R38, R4). `Read` and `Edit` deny rules keep
+//! agents out of both; every rule that names the legacy folder has a twin that names the new one
+//! (Task B5). [`path_rule_matches`] reimplements the docs' section "Read and Edit" (read
+//! 2026-10-14):
 //!
 //! - path rules use gitignore patterns: `*` matches within one path segment, `**` across
 //!   segments; `~/path` is anchored at the home directory and `//path` at the filesystem root;
 //! - on Windows, paths are normalised to POSIX form before matching (`C:\Users\<name>` becomes
-//!   `/c/Users/<name>`), and `//**/name` matches on every drive, so `//**/.worldwright/**` also
-//!   covers a profile that isn't the home directory Claude Code sees;
+//!   `/c/Users/<name>`), and `//**/name` matches on every drive, so `//**/.lilith/**` (and
+//!   `//**/.worldwright/**`) also covers a profile that isn't the home directory Claude Code
+//!   sees. It also covers a workspace's own `.lilith\` (and `.worldwright\`) data folder;
 //! - a `Read` deny rule also blocks the Edit and Write tools on the same path; `Edit` rules
 //!   cover every built-in editing tool (NotebookEdit included). A `Write(path)` rule is never
 //!   consulted (Claude Code warns about it at startup), so there is none: `Read` and `Edit`
@@ -46,7 +49,7 @@
 //!   read files without naming them or to subprocesses that open files themselves.
 //!
 //! The Bash and PowerShell rules `cat`, `type`, `Get-Content` and `gc` of any path containing
-//! `.worldwright` are a second, text-only layer on top.
+//! `.lilith` (or `.worldwright`) are a second, text-only layer on top.
 //!
 //! **Known limits of pattern guards.** A deny rule matches the command text the agent writes,
 //! not the program it runs, so none of this is a security boundary. Commands the patterns
@@ -65,12 +68,13 @@
 //!   HEAD` while on `main`, `git push --all`, `git push --mirror`;
 //! - API calls the patterns can't read: `gh api --input body.json graphql`, `curl` with the
 //!   token;
-//! - reads of `%USERPROFILE%\.worldwright` from a shell remain leaky: `Select-String`, `more`,
-//!   `less`, `copy`/`cp` elsewhere and then a read, `cd ~/.worldwright` and then a relative
-//!   name, a path built from variables or quotes (`~/.world''wright`), a mixed-case
-//!   `.WorldWright` (NTFS ignores case; the path rules here are matched as written), and any
-//!   script or program (`python`, `node`, `pwsh -c`) that opens the files itself. The private
-//!   denylist and the encrypted reviewer key must not rely on these rules alone.
+//! - reads of `%USERPROFILE%\.lilith` (or the legacy `%USERPROFILE%\.worldwright`) from a shell
+//!   remain leaky: `Select-String`, `more`, `less`, `copy`/`cp` elsewhere and then a read,
+//!   `cd ~/.lilith` and then a relative name, a path built from variables or quotes
+//!   (`~/.lil''ith`), a mixed-case `.Lilith` or `.WorldWright` (NTFS ignores case; the path
+//!   rules here are matched as written), and any script or program (`python`, `node`,
+//!   `pwsh -c`) that opens the files itself. The private denylist and the encrypted reviewer key
+//!   must not rely on these rules alone.
 //!
 //! **Direct `gh` (QA-087).** The owner's full-access GitHub login stays on this PC, because other
 //! projects need it. Inside this repo, git uses only the agent token (a repo-local credential
@@ -92,8 +96,8 @@
 //!   (`"gh" pr list`), a copy or link of `gh.exe` under another name, a bare full path with no
 //!   arguments (it only prints help);
 //! - reading gh's stored login directly (its `hosts.yml` or the Windows Credential Manager entry)
-//!   or calling the GitHub API with it (`curl`, a script). The `.worldwright` rules protect only
-//!   the suite's own folder, not gh's;
+//!   or calling the GitHub API with it (`curl`, a script). The `.lilith` and `.worldwright` rules
+//!   protect only the suite's own folders, not gh's;
 //! - a false positive: a path argument that has `/gh ` in it (`git add dev/gh x`) is denied too.
 //!
 //! So the owner's login remains reachable to a determined process running as the same Windows
@@ -423,6 +427,13 @@ const HOME: &str = r"C:\Users\Fake";
 
 /// Paths that every Read and every Edit deny list must cover.
 const PRIVATE_PATHS: &[&str] = &[
+    r"C:\Users\Fake\.lilith\privacy-denylist.txt",
+    r"C:\Users\Fake\.lilith\reviewer\app-key.age",
+    r"C:\Users\Fake\.lilith\new-file.txt",
+    "C:/Users/Fake/.lilith/privacy-denylist.txt",
+    "/c/Users/Fake/.lilith/reviewer/app-key.age",
+    r"D:\profiles\Fake\.lilith\privacy-denylist.txt",
+    // The legacy home folder (R4): its rules stay until the owner says it is gone.
     r"C:\Users\Fake\.worldwright\privacy-denylist.txt",
     r"C:\Users\Fake\.worldwright\reviewer\app-key.age",
     r"C:\Users\Fake\.worldwright\new-file.txt",
@@ -438,11 +449,23 @@ const ORDINARY_PATHS: &[&str] = &[
     r"C:\Users\Fake\Desktop\Worldwright-Suite\docs\dev\merge-guard.md",
     r"C:\Users\Fake\notes\worldwright.txt",
     r"C:\Users\Fake\.worldwright-old\notes.txt",
+    r"C:\Users\Fake\Desktop\LILITH\README.md",
+    r"C:\Users\Fake\Desktop\LILITH\lilith.yaml",
+    r"C:\Users\Fake\notes\lilith.txt",
+    r"C:\Users\Fake\.lilith-old\notes.txt",
+    r"D:\.lilith-local\0123abcd\state.db",
     r"C:\Users\Fake\.claude\settings.json",
 ];
 
 /// Shell reads of the folder, denied in both shells.
 const MUST_MATCH_PRIVATE_READS: &[&str] = &[
+    "cat ~/.lilith/privacy-denylist.txt",
+    "cat -n $HOME/.lilith/reviewer/app-key.age",
+    "type %USERPROFILE%\\.lilith\\privacy-denylist.txt",
+    "Get-Content $env:USERPROFILE\\.lilith\\privacy-denylist.txt",
+    "gc ~/.lilith/privacy-denylist.txt",
+    "git status; cat ~/.lilith/privacy-denylist.txt",
+    // The legacy home folder (R4).
     "cat ~/.worldwright/privacy-denylist.txt",
     "cat -n $HOME/.worldwright/reviewer/app-key.age",
     "type %USERPROFILE%\\.worldwright\\privacy-denylist.txt",
@@ -455,6 +478,11 @@ const MUST_MATCH_PRIVATE_READS: &[&str] = &[
 const MUST_NOT_MATCH_READS: &[&str] = &[
     "cat README.md",
     "cat docs/worldwright.md",
+    "cat docs/lilith.md",
+    "cat lilith.yaml",
+    "Get-Content lilith.yaml",
+    "type docs\\lilith.md",
+    "gc notes/lilith.txt",
     "type cargo",
     "Get-Content docs/dev/merge-guard.md",
     "gc Cargo.toml",
@@ -743,6 +771,11 @@ fn brief_rules_are_present_in_both_shells() {
         "git credential-manager*",
         "cmdkey*",
         "git config*credential*",
+        // Task B5: the new home folder, as the legacy one.
+        "cat *.lilith*",
+        "type *.lilith*",
+        "Get-Content *.lilith*",
+        "gc *.lilith*",
     ] {
         assert!(bash.iter().any(|r| r == rule), "missing Bash({rule})");
     }
@@ -829,7 +862,7 @@ fn matcher_follows_the_documented_examples() {
 #[test] // spec: QA-036
 fn private_folder_is_denied_to_read_and_edit() {
     let (read, edit) = path_rules();
-    for rule in ["~/.worldwright/**", "//**/.worldwright/**"] {
+    for rule in ["~/.lilith/**", "//**/.lilith/**"] {
         assert!(read.iter().any(|r| r == rule), "missing Read({rule})");
         assert!(edit.iter().any(|r| r == rule), "missing Edit({rule})");
     }
@@ -866,16 +899,61 @@ fn shell_reads_of_the_private_folder_are_denied() {
         }
     }
     // PowerShell ignores case.
-    if denying_rule(
+    for row in [
+        "GET-CONTENT ~/.LILITH/privacy-denylist.txt",
         "GET-CONTENT ~/.WORLDWRIGHT/privacy-denylist.txt",
-        &ps,
-        Shell::PowerShell,
-    )
-    .is_none()
-    {
-        wrong.push("PowerShell: upper-case Get-Content not denied".into());
+    ] {
+        if denying_rule(row, &ps, Shell::PowerShell).is_none() {
+            wrong.push(format!(
+                "PowerShell: upper-case Get-Content not denied: {row}"
+            ));
+        }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The legacy home folder's rules stay, verbatim, until the owner says the folder is gone
+/// (Task B5 adds the new folder's rules beside them; PR-D at the earliest removes these).
+#[test] // spec: QA-036
+fn worldwright_rules_are_kept() {
+    let (bash, ps) = deny_rules();
+    let (read, edit) = path_rules();
+    for rule in [
+        "cat *.worldwright*",
+        "type *.worldwright*",
+        "Get-Content *.worldwright*",
+        "gc *.worldwright*",
+    ] {
+        assert!(bash.iter().any(|r| r == rule), "missing Bash({rule})");
+        assert!(ps.iter().any(|r| r == rule), "missing PowerShell({rule})");
+    }
+    for rule in ["~/.worldwright/**", "//**/.worldwright/**"] {
+        assert!(read.iter().any(|r| r == rule), "missing Read({rule})");
+        assert!(edit.iter().any(|r| r == rule), "missing Edit({rule})");
+    }
+}
+
+/// Every deny rule that names the legacy home folder has a twin, of the same kind, that names
+/// the new one: the new folder is kept from agents exactly as the old one is (Task B5).
+#[test] // spec: QA-036
+fn every_legacy_home_rule_has_a_lilith_twin() {
+    let v: Value = serde_json::from_str(&settings_text()).expect(".claude/settings.json is JSON");
+    let deny: Vec<&str> = v["permissions"]["deny"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    let legacy: Vec<&str> = deny
+        .iter()
+        .copied()
+        .filter(|r| r.contains(".worldwright"))
+        .collect();
+    assert_eq!(legacy.len(), 12, "{legacy:?}");
+    for rule in legacy {
+        let twin = rule.replace(".worldwright", ".lilith");
+        assert!(deny.contains(&twin.as_str()), "{rule} has no twin {twin}");
+    }
 }
 
 #[test]

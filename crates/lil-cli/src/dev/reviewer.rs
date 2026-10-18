@@ -8,12 +8,13 @@
 //!
 //! **The key.** `lil dev reviewer-setup` encrypts the App's downloaded `.pem` with an age scrypt
 //! passphrase and writes it, with the App id and installation id, to
-//! `%USERPROFILE%\<legacy home>\reviewer\app-key.age` ([`legacy_key_path_in`]; Task B5 moves the
-//! writer to [`key_path_in`], `%USERPROFILE%\<home>\reviewer\app-key.age`). `approve` reads the
-//! key from the new path when it exists, else from the legacy one ([`find_key_in`], R4), and
-//! prints which. Both are outside the repo and outside the suite's `%APPDATA%\<App>*` /
-//! `%LOCALAPPDATA%\<App>*` data. The plaintext `.pem` is never deleted or modified here; the
-//! owner deletes it.
+//! `%USERPROFILE%\<home>\reviewer\app-key.age` ([`key_path_in`]), and never to the legacy
+//! `%USERPROFILE%\<legacy home>\reviewer\app-key.age` ([`legacy_key_path_in`]), where keys were
+//! written before the rename. `approve` reads the key from the new path when it exists, else
+//! from the legacy one ([`find_key_in`], R4), and prints which. Both paths are outside the repo
+//! and outside the suite's `%APPDATA%\<App>*` / `%LOCALAPPDATA%\<App>*` data, and the repo's
+//! `.claude` deny rules keep agents out of both home folders. The plaintext `.pem` is never
+//! deleted or modified here; the owner deletes it.
 //!
 //! **Approving** ([`approve`]): refuse unless at a terminal; refuse when nothing protected
 //! changed; show the summary and ask "(y/N)"; read the passphrase; decrypt the key (a wrong
@@ -201,8 +202,8 @@ impl ReviewerKeyFile {
     }
 }
 
-/// `<profile>\<home>\reviewer\app-key.age` ([`names::HOME_DIR`]). `reviewer-setup` writes it
-/// from Task B5.
+/// `<profile>\<home>\reviewer\app-key.age` ([`names::HOME_DIR`]): where `reviewer-setup`
+/// writes the key.
 pub fn key_path_in(profile: &Path) -> PathBuf {
     profile
         .join(names::HOME_DIR)
@@ -251,10 +252,16 @@ fn load_key_in(profile: &Path) -> Result<(PathBuf, ReviewerKeyFile)> {
     Ok((path, key))
 }
 
-/// Where `reviewer-setup` writes the key: the legacy path under `%USERPROFILE%` until Task B5
-/// moves it to [`key_path_in`] together with the `.claude` deny rules for the new folder.
+/// Where `reviewer-setup` writes the key: [`setup_key_path_in`] for `%USERPROFILE%`.
 pub fn setup_key_path() -> Result<PathBuf> {
-    Ok(legacy_key_path_in(&user_profile()?))
+    Ok(setup_key_path_in(&user_profile()?))
+}
+
+/// Where `reviewer-setup` writes the key for `profile`: only ever [`key_path_in`], the new home
+/// folder. A key in the legacy home folder is left alone; `approve` still reads it while the new
+/// path has none.
+pub fn setup_key_path_in(profile: &Path) -> PathBuf {
+    key_path_in(profile)
 }
 
 /// `%USERPROFILE%`, which must be set and absolute.
@@ -2003,6 +2010,66 @@ mod tests {
         assert!(!on_disk.contains("PRIVATE KEY"), "plaintext key on disk");
         // The plaintext .pem is the owner's to delete.
         assert_eq!(std::fs::read(&pem_path).unwrap(), test_key().pkcs1_pem);
+    }
+
+    /// Every file under `dir` with its bytes, sorted; empty when `dir` doesn't exist.
+    fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    out.push((path, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Task B5: `reviewer-setup` writes the key only under the new home folder. A key in the
+    /// legacy home folder is left byte for byte, nothing is created there, and `approve` then
+    /// finds the new key.
+    #[test]
+    fn reviewer_setup_writes_only_the_new_key_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pem_path = write_pem(tmp.path(), &test_key().pkcs1_pem);
+        let pem_answer = pem_path.display().to_string();
+        for legacy_key_exists in [false, true] {
+            let profile = tmp.path().join(format!("profile-{legacy_key_exists}"));
+            std::fs::create_dir_all(&profile).unwrap();
+            let legacy_home = profile.join(names::LEGACY_HOME_DIR);
+            let legacy = legacy_key_path_in(&profile);
+            if legacy_key_exists {
+                std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+                std::fs::write(&legacy, b"legacy key bytes").unwrap();
+            }
+            let before = files_under(&legacy_home);
+
+            let path = setup_key_path_in(&profile);
+            assert_eq!(path, key_path_in(&profile));
+            let prompt = FakePrompt::new()
+                .lines(&["123", "456", &pem_answer])
+                .passphrases(&[PASS, PASS]);
+            setup_with_work_factor(&prompt, &path, TEST_WORK_FACTOR).unwrap();
+
+            let saved = ReviewerKeyFile::load(&key_path_in(&profile)).unwrap();
+            assert_eq!(saved.app_id, 123);
+            assert_eq!(files_under(&legacy_home), before, "legacy folder changed");
+            if legacy_key_exists {
+                assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy key bytes");
+            } else {
+                assert!(!legacy_home.exists(), "{legacy_home:?} was created");
+            }
+            assert_eq!(find_key_in(&profile), Some(key_path_in(&profile)));
+        }
     }
 
     #[test]

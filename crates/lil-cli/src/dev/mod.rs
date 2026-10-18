@@ -117,7 +117,7 @@ pub enum DevCommand {
     ///
     /// Asks for the App id, the installation id and the path to the App's downloaded .pem, then
     /// for a passphrase (at least 12 characters, typed twice). Writes the key, encrypted with the
-    /// passphrase, to %USERPROFILE%\.worldwright\reviewer\app-key.age. The .pem is never deleted
+    /// passphrase, to %USERPROFILE%\.lilith\reviewer\app-key.age. The .pem is never deleted
     /// or changed: delete it yourself afterwards.
     #[command(verbatim_doc_comment)]
     ReviewerSetup,

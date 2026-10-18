@@ -67,6 +67,10 @@
       "Bash(type *.worldwright*)",
       "Bash(Get-Content *.worldwright*)",
       "Bash(gc *.worldwright*)",
+      "Bash(cat *.lilith*)",
+      "Bash(type *.lilith*)",
+      "Bash(Get-Content *.lilith*)",
+      "Bash(gc *.lilith*)",
       "PowerShell(git push origin main:*)",
       "PowerShell(git push * main:*)",
       "PowerShell(git push * main)",
@@ -133,10 +137,18 @@
       "PowerShell(type *.worldwright*)",
       "PowerShell(Get-Content *.worldwright*)",
       "PowerShell(gc *.worldwright*)",
+      "PowerShell(cat *.lilith*)",
+      "PowerShell(type *.lilith*)",
+      "PowerShell(Get-Content *.lilith*)",
+      "PowerShell(gc *.lilith*)",
       "Read(~/.worldwright/**)",
       "Edit(~/.worldwright/**)",
       "Read(//**/.worldwright/**)",
-      "Edit(//**/.worldwright/**)"
+      "Edit(//**/.worldwright/**)",
+      "Read(~/.lilith/**)",
+      "Edit(~/.lilith/**)",
+      "Read(//**/.lilith/**)",
+      "Edit(//**/.lilith/**)"
     ]
   }
 }

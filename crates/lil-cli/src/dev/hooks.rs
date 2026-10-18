@@ -12,8 +12,9 @@
 //!   never the possibly stale remote-tracking refs). Each such commit's added lines, paths,
 //!   message and identities are scanned. Deletions publish nothing and aren't scanned. A
 //!   finding, a missing denylist, a failed `ls-remote` or a scan that can't run refuses the
-//!   push. Until the denylist exists (`%USERPROFILE%\.worldwright\privacy-denylist.txt`),
-//!   every push is refused.
+//!   push. Until a denylist exists (`%USERPROFILE%\.lilith\privacy-denylist.txt`, the same file
+//!   in the legacy home folder, or one of the two variables; [`privacy::real_denylist`]), every
+//!   push is refused.
 //! - **Pushes** ([`pre_push`]): a push to `main` is refused unless it only moves `main` forward
 //!   (`remote_sha` is an ancestor of `local_sha`; a rollback, a force-push or rewritten history
 //!   is refused), the guard verdict for the range has no protected-file blockers (no approval is

@@ -2154,7 +2154,9 @@ mod tests {
                 assert_eq!(paths_in(&line), 0, "{line}");
             }
         }
-        assert_eq!(paths_in(r"%USERPROFILE%\.worldwright\reviewer"), 0);
+        for home in [names::HOME_DIR, names::LEGACY_HOME_DIR] {
+            assert_eq!(paths_in(&format!(r"%USERPROFILE%\{home}\reviewer")), 0);
+        }
     }
 
     #[test] // spec: QA-086
@@ -2610,7 +2612,7 @@ mod tests {
         r.write(
             "README.md",
             format!(
-                "Keys live in %USERPROFILE%\\.worldwright.\nExample: C:\\{u}\\<user>\\x\nContact {}\n",
+                "Keys live in %USERPROFILE%\\.lilith.\nExample: C:\\{u}\\<user>\\x\nContact {}\n",
                 mail("noreply", "github.com")
             )
             .as_bytes(),
