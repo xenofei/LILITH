@@ -318,9 +318,10 @@ fn fake_comfy_outside_prompts_carry_their_graph() {
     let queue = get(&fake, "/queue");
     let running = &queue["queue_running"][0];
     assert_eq!((&running[1], &running[2]), (&json!(id), &g), "{queue}");
+    // As in ComfyUI 0.41.0, a running job's detail has no graph yet: `/queue` holds it.
     let job = get(&fake, &format!("/api/jobs/{id}"));
     assert_eq!(job["status"], "in_progress", "{job}");
-    assert_eq!(job["workflow"]["prompt"], g, "{job}");
+    assert!(job.get("workflow").is_none(), "{job}");
     let listed = get(&fake, "/api/jobs");
     assert!(
         listed["jobs"]
@@ -339,9 +340,37 @@ fn fake_comfy_outside_prompts_carry_their_graph() {
     wait_until("the queued one runs", || {
         queue_ids(&fake) == (vec![queued.clone()], vec![])
     });
+    // Once finished, the detail carries the graph, the outputs and the execution status.
+    let done = get(&fake, &format!("/api/jobs/{id}"));
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["workflow"]["prompt"], g, "{done}");
+    assert_eq!(done["outputs"], json!({}), "{done}");
+    assert_eq!(done["execution_status"]["status_str"], "success", "{done}");
+}
+
+#[test] // spec: QA-066, ARCH-021
+fn fake_comfy_cancelled_pending_prompt_is_forgotten() {
+    let fake = FakeComfy::start();
+    fake.hold_prompts(true);
+    let (a, b) = (uuid(7), uuid(8));
+    submit(&fake, &a, &["lil_p_"]);
+    submit(&fake, &b, &["lil_q_"]);
+    let (status, answer) = http(fake.port(), "POST", &format!("/api/jobs/{b}/cancel"), None);
+    assert_eq!((status, answer), (200, json!({"cancelled": true})));
+    // Dequeued and forgotten, as ComfyUI deletes it from its queue.
+    assert_eq!(queue_ids(&fake), (vec![a.clone()], vec![]));
     assert_eq!(
-        get(&fake, &format!("/api/jobs/{id}"))["status"],
-        "completed"
+        http(fake.port(), "GET", &format!("/api/jobs/{b}"), None).0,
+        404
+    );
+    fake.release(&a);
+    wait_until("a is done", || {
+        get(&fake, &format!("/api/jobs/{a}"))["status"] == "completed"
+    });
+    let history = get(&fake, "/history");
+    assert!(
+        history.get(&a).is_some() && history.get(&b).is_none(),
+        "{history}"
     );
 }
 
@@ -420,6 +449,91 @@ fn fake_comfyui_child_mode_listens_from_the_child() {
     );
     // The launcher waits for its child.
     assert!(launcher.try_wait().unwrap().is_none());
+    drop(reap);
+    let _ = launcher.wait();
+}
+
+/// Runs `lil-fake-comfyui main.py <args>` in `dir`.
+fn launch(dir: &Path, args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_lil-fake-comfyui"))
+        .arg("main.py")
+        .args(args)
+        .current_dir(dir)
+        .spawn()
+        .expect("start lil-fake-comfyui")
+}
+
+fn exit_code(child: &mut Child) -> Option<i32> {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.code();
+        }
+        assert!(Instant::now() < deadline, "lil-fake-comfyui still runs");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The fake listens on 127.0.0.1 only (P3-R11). `--listen` is read as ComfyUI reads it (the
+/// last one wins; a bare one means all interfaces) and anything but loopback is refused. With
+/// `fake-child-any` the child still binds loopback and scripts its row as `0.0.0.0` instead.
+#[test] // spec: QA-066, ARCH-068
+fn fake_comfyui_listens_on_loopback_only() {
+    let root = tempfile::Builder::new()
+        .prefix("lil-fake-comfyui-")
+        .tempdir()
+        .unwrap();
+    let port = free_loopback_port().to_string();
+    for args in [
+        vec!["--listen", "0.0.0.0", "--port", &port],
+        vec![
+            "--listen",
+            "127.0.0.1",
+            "--listen",
+            "0.0.0.0",
+            "--port",
+            &port,
+        ],
+        vec!["--listen", "127.0.0.1,0.0.0.0", "--port", &port],
+        vec!["--port", &port, "--listen"],
+    ] {
+        let mut fake = launch(root.path(), &args);
+        assert_eq!(exit_code(&mut fake), Some(2), "{args:?}");
+    }
+    assert!(read_json(&root.path().join("fake-comfyui.json")).is_none());
+
+    std::fs::write(root.path().join("fake-child-any"), "").unwrap();
+    let args = [
+        "--listen",
+        "0.0.0.0",
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--child",
+    ];
+    let mut launcher = launch(root.path(), &args);
+    let mut reap = Reap(vec![launcher.id()]);
+    let child_file = root.path().join("fake-comfyui-child.json");
+    wait_until("the child listens", || read_json(&child_file).is_some());
+    let child_pid =
+        u32::try_from(read_json(&child_file).unwrap()["pid"].as_u64().unwrap()).unwrap();
+    reap.0.push(child_pid);
+
+    let real = lil_platform::sockets::listening_sockets(child_pid).unwrap();
+    assert!(
+        !real.is_empty() && real.iter().all(|a| a.ip().is_loopback()),
+        "{real:?}"
+    );
+    let rows = std::fs::read_to_string(root.path().join("fake-sockets.json")).unwrap();
+    let rows: Vec<Value> = rows
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        [json!({"pid": child_pid, "port": port.parse::<u16>().unwrap(), "as": "0.0.0.0"})]
+    );
     drop(reap);
     let _ = launcher.wait();
 }

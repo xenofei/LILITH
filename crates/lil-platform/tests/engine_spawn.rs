@@ -15,6 +15,7 @@ use lil_platform::engine_spawn::{
     EngineSpawn, OnLine, listening_sockets, pid_listening_on, spawn_engine,
 };
 use lil_platform::job_object::KillOnCloseJob;
+use lil_platform::sockets::{OsSockets, SocketTable as _};
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 const DONE: &str = "LIL_ENGINE_SPAWN_DONE";
@@ -130,24 +131,27 @@ fn engine_spawn_inherits_only_its_pipes_and_uses_exactly_the_given_env() {
     assert_eq!(read, Ok(Ok(0)), "the read end reaches end-of-file");
 }
 
+/// Real binds on loopback only (P3-R11: no test binds a wildcard socket); the wildcard rows are
+/// covered by the table-row conversion's unit test in `sockets.rs`.
 #[test] // spec: ARCH-068
-fn listening_sockets_report_loopback_and_wildcard() {
-    let loopback = TcpListener::bind("127.0.0.1:0").unwrap();
-    let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
-    let loopback_addr = loopback.local_addr().unwrap();
-    let wildcard_addr = wildcard.local_addr().unwrap();
+fn listening_sockets_report_loopback_v4_and_v6() {
+    let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let v6 = TcpListener::bind("[::1]:0").unwrap();
+    let v4_addr = v4.local_addr().unwrap();
+    let v6_addr = v6.local_addr().unwrap();
     // An outgoing connection is not a listening socket.
-    let client = std::net::TcpStream::connect(loopback_addr).unwrap();
+    let client = std::net::TcpStream::connect(v4_addr).unwrap();
 
     let me = std::process::id();
     let sockets: Vec<SocketAddr> = listening_sockets(me).unwrap();
-    assert!(sockets.contains(&loopback_addr), "{sockets:?}");
-    assert!(sockets.contains(&wildcard_addr), "{sockets:?}");
+    assert!(sockets.contains(&v4_addr), "{sockets:?}");
+    assert!(sockets.contains(&v6_addr), "{sockets:?}");
     assert!(
         !sockets.contains(&client.local_addr().unwrap()),
         "{sockets:?}"
     );
-    assert_eq!(pid_listening_on(loopback_addr.port()).unwrap(), Some(me));
-    assert_eq!(pid_listening_on(wildcard_addr.port()).unwrap(), Some(me));
-    drop((loopback, wildcard, client));
+    assert_eq!(OsSockets.listening(me).unwrap(), sockets);
+    assert_eq!(pid_listening_on(v4_addr.port()).unwrap(), Some(me));
+    assert_eq!(pid_listening_on(v6_addr.port()).unwrap(), Some(me));
+    drop((v4, v6, client));
 }

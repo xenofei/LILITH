@@ -219,9 +219,9 @@ impl FakeComfy {
                 st.running.is_none(),
                 "add_outside_prompt(true, ..) while another prompt runs"
             );
-            st.running = Some(id.clone());
+            st.set_running(&id);
         } else if st.running.is_none() {
-            st.running = Some(id.clone());
+            st.set_running(&id);
         } else {
             st.queue.push(id.clone());
         }
@@ -445,22 +445,34 @@ impl Prompt {
         if let Some(error) = &self.error {
             job["execution_error"] = error.clone();
         }
-        if detail {
+        // As ComfyUI 0.41.0: only a finished job's detail has these (a pending or running
+        // prompt's graph is in `/queue` only).
+        if detail && self.finished() {
             job["workflow"] = json!({"prompt": self.graph, "extra_data": self.extra_data});
             job["outputs"] = Value::Object(self.outputs.clone());
+            job["execution_status"] = self.status();
+        }
+        // ComfyUI prunes fields that are `None`.
+        if let Value::Object(fields) = &mut job {
+            fields.retain(|_, v| !v.is_null());
         }
         job
+    }
+
+    /// The history `status`: `{status_str, completed, messages}`.
+    fn status(&self) -> Value {
+        json!({
+            "status_str": if self.phase == Phase::Completed { "success" } else { "error" },
+            "completed": self.phase == Phase::Completed,
+            "messages": self.messages,
+        })
     }
 
     fn history(&self) -> Value {
         json!({
             "prompt": self.queue_entry(),
             "outputs": self.outputs,
-            "status": {
-                "status_str": if self.phase == Phase::Completed { "success" } else { "error" },
-                "completed": self.phase == Phase::Completed,
-                "messages": self.messages,
-            },
+            "status": self.status(),
             "meta": {},
         })
     }
@@ -604,13 +616,22 @@ impl State {
             json!({"node": Value::Null, "display_node": Value::Null, "prompt_id": id}),
         );
         if self.running.as_deref() == Some(id) {
-            self.running = if self.queue.is_empty() {
-                None
-            } else {
-                Some(self.queue.remove(0))
-            };
+            self.running = None;
+            if !self.queue.is_empty() {
+                let next = self.queue.remove(0);
+                self.set_running(&next);
+            }
         }
         self.broadcast_status();
+    }
+
+    /// Makes `id` the running prompt: `in_progress` from now on, though the executor sends its
+    /// `execution_start` a moment later.
+    fn set_running(&mut self, id: &str) {
+        self.running = Some(id.to_string());
+        if let Some(p) = self.prompt_mut(id) {
+            p.phase = Phase::Running;
+        }
     }
 
     fn fail(&mut self, id: &str, failure: &FakeFailure, node: (String, String)) {
@@ -1040,7 +1061,7 @@ fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, i
     let number = prompt.number;
     st.prompts.push(prompt);
     if st.running.is_none() {
-        st.running = Some(id.clone());
+        st.set_running(&id);
     } else {
         st.queue.push(id.clone());
     }
@@ -1059,7 +1080,8 @@ fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, i
     ))
 }
 
-/// `POST /api/jobs/{id}/cancel`: a pending prompt is removed, a running one interrupted.
+/// `POST /api/jobs/{id}/cancel`: a pending prompt is dequeued and forgotten (it never reaches
+/// `/history`, as in ComfyUI), a running one interrupted.
 fn cancel(shared: &Shared, id: &str) -> bool {
     let mut st = shared.lock();
     let Some(phase) = st.prompt(id).map(|p| p.phase) else {
@@ -1068,10 +1090,7 @@ fn cancel(shared: &Shared, id: &str) -> bool {
     let cancelled = match phase {
         Phase::Pending if st.queue.iter().any(|q| q == id) => {
             st.queue.retain(|q| q != id);
-            if let Some(p) = st.prompt_mut(id) {
-                p.phase = Phase::Cancelled;
-                p.end_time = Some(now_ms());
-            }
+            st.prompts.retain(|p| p.id != id);
             st.broadcast_status();
             true
         }
@@ -1272,6 +1291,7 @@ fn upgrade_ws(shared: &Arc<Shared>, req: &mut Request<Incoming>, query: &str) ->
             "status": {"exec_info": {"queue_remaining": st.queue_remaining()}},
             "sid": client_id}});
         let _ = tx.send(Message::text(status.to_string()));
+        st.clients.retain(|c| c.client_id != client_id);
         st.clients.push(Client {
             serial,
             client_id,

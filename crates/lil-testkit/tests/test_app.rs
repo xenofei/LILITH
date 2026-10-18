@@ -1,7 +1,8 @@
 //! The test kit's processes (QA-066): `lil-test-app`'s hello and relay, and the fake `claude`.
 //! Deadlines only bound a failure (QA-031).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -82,12 +83,15 @@ fn test_app_offers_the_protocol_1_1_capabilities() {
     }
 }
 
-fn claude(config: Option<&std::path::Path>, args: &[&str]) -> (i32, String) {
+/// The fake `claude` with `vars` added to an environment without `CLAUDE_CONFIG_DIR` or any
+/// channel variable: `(exit code, stdout)`.
+fn claude_with(vars: &[(OsString, OsString)], args: &[&str]) -> (i32, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_claude"));
-    cmd.args(args).env_remove("CLAUDE_CONFIG_DIR");
-    if let Some(config) = config {
-        cmd.env("CLAUDE_CONFIG_DIR", config);
+    cmd.args(args);
+    for var in ["CLAUDE_CONFIG_DIR", "LIL_CHANNEL", "LIL_TEST_ROOT"] {
+        cmd.env_remove(var);
     }
+    cmd.envs(vars.iter().cloned());
     let out = cmd.output().expect("run the fake claude");
     (
         out.status.code().unwrap_or(-1),
@@ -95,33 +99,48 @@ fn claude(config: Option<&std::path::Path>, args: &[&str]) -> (i32, String) {
     )
 }
 
+/// The fake `claude` on `env`'s test channel, with `CLAUDE_CONFIG_DIR` set to `config`.
+fn claude(env: &TestEnv, config: Option<&Path>, args: &[&str]) -> (i32, String) {
+    let mut vars = env.child_env();
+    if let Some(config) = config {
+        vars.push(("CLAUDE_CONFIG_DIR".into(), config.as_os_str().to_owned()));
+    }
+    claude_with(&vars, args)
+}
+
 #[test] // spec: QA-066, QA-041
 fn fake_claude_honours_claude_config_dir() {
+    let env = TestEnv::new();
     let config = tempfile::Builder::new()
         .prefix("lil-fake-claude-")
         .tempdir()
         .unwrap();
     let dir = config.path();
-    let (code, version) = claude(None, &["--version"]);
+    let (code, version) = claude(&env, None, &["--version"]);
     assert_eq!(code, 0);
     assert!(version.contains("(Claude Code)"), "{version}");
 
     assert_eq!(
-        claude(Some(dir), &["plugin", "list", "--json"]),
+        claude(&env, Some(dir), &["plugin", "list", "--json"]),
         (0, "[]\n".into())
     );
     let plugins = r#"[{"id":"demo@market","version":"1.3.0","enabled":true}]"#;
     std::fs::write(dir.join("fake-plugins.json"), plugins).unwrap();
     assert_eq!(
-        claude(Some(dir), &["plugin", "list", "--json"]),
+        claude(&env, Some(dir), &["plugin", "list", "--json"]),
         (0, format!("{plugins}\n"))
     );
     assert_eq!(
-        claude(Some(dir), &["plugin", "marketplace", "add", "./plugin"]).0,
+        claude(
+            &env,
+            Some(dir),
+            &["plugin", "marketplace", "add", "./plugin"]
+        )
+        .0,
         0
     );
     assert_eq!(
-        claude(Some(dir), &["plugin", "install", "demo@market"]).0,
+        claude(&env, Some(dir), &["plugin", "install", "demo@market"]).0,
         0
     );
     let log = std::fs::read_to_string(dir.join("fake-claude.log")).unwrap();
@@ -137,7 +156,7 @@ fn fake_claude_honours_claude_config_dir() {
         ]
     );
     // Without CLAUDE_CONFIG_DIR the plugin commands refuse: no real profile is ever read.
-    assert_eq!(claude(None, &["plugin", "list", "--json"]).0, 2);
+    assert_eq!(claude(&env, None, &["plugin", "list", "--json"]).0, 2);
 }
 
 /// Run by `fake_claude_spawn_stdio_is_the_direct_parent` as `claude`'s child: reads one stdin
@@ -175,9 +194,33 @@ fn fake_claude_spawn_stdio_is_the_direct_parent() {
     assert_eq!(server.wait(Duration::from_secs(30)), Some(0));
 
     // The fake passes the child's exit code through.
-    let out = Command::new(env!("CARGO_BIN_EXE_claude"))
-        .args(["--spawn-stdio", "cmd.exe", "/d", "/c", "exit 7"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(7));
+    let spawn = ["--spawn-stdio", "cmd.exe", "/d", "/c", "exit 7"];
+    assert_eq!(claude(&env, None, &spawn).0, 7);
+}
+
+/// Off a test channel the fake does nothing at all, so a `claude.exe` left in a build folder can
+/// never start a process under a `claude.exe` parent on a dev channel.
+#[test] // spec: QA-066, ARCH-047
+fn fake_claude_refuses_outside_a_test_channel() {
+    let env = TestEnv::new();
+    let root: OsString = env.root().as_os_str().to_owned();
+    let pair = |k: &str, v: &OsStr| (OsString::from(k), v.to_owned());
+    let spawn = ["--spawn-stdio", "cmd.exe", "/d", "/c", "exit 7"];
+    for vars in [
+        vec![],
+        vec![
+            pair("LIL_CHANNEL", OsStr::new("dev")),
+            pair("LIL_TEST_ROOT", &root),
+        ],
+        vec![pair("LIL_CHANNEL", OsStr::new("stable"))],
+        vec![pair("LIL_CHANNEL", OsStr::new("test-ab12cd34"))],
+    ] {
+        assert_eq!(
+            claude_with(&vars, &["--version"]),
+            (2, String::new()),
+            "{vars:?}"
+        );
+        assert_eq!(claude_with(&vars, &spawn).0, 2, "{vars:?}");
+    }
+    assert_eq!(claude(&env, None, &["--version"]).0, 0);
 }
