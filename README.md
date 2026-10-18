@@ -1,8 +1,8 @@
-# Worldwright Suite
+# LILITH
 
-Worldwright is a desktop creative suite at personal-hobby scale: a family of AI-enabled apps, starting with an Image studio, that share one workspace of projects and assets. It is Windows-first.
+LILITH (Latent Image & Likeness Instrumentality Toolchain Hub) is a desktop creative suite at personal-hobby scale: a family of AI-enabled apps, starting with an Image studio, that share one workspace of projects and assets. It is Windows-first.
 
-- **Rust core.** A headless core service (`ww-core`, one per user) owns all state and drives the engines (ComfyUI first). Apps, the `ww` command line and AI agents are all clients of the same tool surface.
+- **Rust core.** A headless core service (`lil-core`, one per user) owns all state and drives the engines (ComfyUI first). Apps, the `lil` command line and AI agents are all clients of the same tool surface.
 - **Qt apps.** The apps are Qt 6 / QML, bound to Rust with cxx-qt.
 - **AI where it helps.** Hosted and local models go through one tool surface, with usage and cost tracking and optional spending caps. Claude Code is the default assistant engine, run as the user's own unmodified CLI with their own sign-in. The suite adds no content filter of its own; each provider's and model's own policies and licences apply, and you are responsible for what you make with them.
 
@@ -20,31 +20,31 @@ cargo nextest run --workspace        # needs cargo-nextest; or: cargo test --wor
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo deny check                     # needs cargo-deny
-cargo run -q -p ww-cli -- dev spec-report
+cargo run -q -p lil-cli -- dev spec-report
 ```
 
 ## Merging into main
 
-Changes reach `main` only through pull requests merged with `ww dev merge <PR>`, which checks CI, the protected-file approvals and the pinned head commit first. The merge guard is described in the spec (§6.2); the maintainer's guide, with the one-time setup and everyday use, is [docs/dev/merge-guard.md](docs/dev/merge-guard.md).
+Changes reach `main` only through pull requests merged with `lil dev merge <PR>`, which checks CI, the protected-file approvals and the pinned head commit first. The merge guard is described in the spec (§6.2); the maintainer's guide, with the one-time setup and everyday use, is [docs/dev/merge-guard.md](docs/dev/merge-guard.md).
 
 Before working in a clone that pushes:
 
-1. Store the agent token with `cargo run -q -p ww-cli -- dev agent-token set` (at a terminal; it is kept in Windows Credential Manager).
-2. Run `cargo run -q -p ww-cli -- dev install-hooks`. It points git at the repository's hooks and sets the repository's git credential helper to the agent-token helper (`ww dev git-credential`), so git in this clone authenticates to GitHub only with that token.
-3. Create the private denylist `%USERPROFILE%\.worldwright\privacy-denylist.txt`, one entry per line. The `pre-push` hook runs `ww dev privacy-scan` on every pushed ref and refuses every push until this file exists.
+1. Store the agent token with `cargo run -q -p lil-cli -- dev agent-token set` (at a terminal; it is kept in Windows Credential Manager).
+2. Run `cargo run -q -p lil-cli -- dev install-hooks`. It points git at the repository's hooks and sets the repository's git credential helper to the agent-token helper (`lil dev git-credential`), so git in this clone authenticates to GitHub only with that token.
+3. Create the private denylist `%USERPROFILE%\.lilith\privacy-denylist.txt`, one entry per line. The `pre-push` hook runs `lil dev privacy-scan` on every pushed ref and refuses every push until this file exists.
 
-Run `ww` from the checkout it was built in (`cargo run` there): a `ww` built in one checkout refuses to work on another.
+Run `lil` from the checkout it was built in (`cargo run` there): a `lil` built in one checkout refuses to work on another.
 
 ## Documentation
 
-- **Design spec:** [docs/superpowers/specs/2026-10-12-worldwright-suite-design.md](docs/superpowers/specs/2026-10-12-worldwright-suite-design.md). Every requirement has a stable rule ID.
+- **Design spec:** [docs/superpowers/specs/2026-10-12-lilith-design.md](docs/superpowers/specs/2026-10-12-lilith-design.md). Every requirement has a stable rule ID.
 - **Plans:** [docs/superpowers/plans/](docs/superpowers/plans/), starting with the [roadmap](docs/superpowers/plans/2026-10-12-roadmap.md).
 - **M0 spike results:** [docs/spikes/README.md](docs/spikes/README.md).
 - **Research notes** behind the spec, dated with their sources: [docs/research/](docs/research/).
 
 ## Licence
 
-Copyright (C) 2026 the Worldwright Suite contributors.
+Copyright (C) 2026 the LILITH contributors.
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 

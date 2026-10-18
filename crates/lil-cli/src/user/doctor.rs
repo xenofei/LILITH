@@ -66,7 +66,7 @@ impl Report {
 /// `lil doctor`.
 pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
     let env = Env::from_process()
-        .map_err(|e| cannot_run(format!("Cannot tell which Worldwright folders to use: {e}")))?;
+        .map_err(|e| cannot_run(format!("Cannot tell which LILITH folders to use: {e}")))?;
     let interactive = !global.non_interactive;
     let mut report = Report::default();
 
@@ -158,7 +158,7 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
             }
             Err(e) => {
                 report.problem(&format!(
-                    "{what}, and the recovery couldn't run: {e} — close the Worldwright apps, \
+                    "{what}, and the recovery couldn't run: {e} — close the LILITH apps, \
                      then run lil doctor again"
                 ));
                 return Some(CANT_START.to_string());
@@ -215,7 +215,7 @@ fn suite_state(env: &Env, interactive: bool, report: &mut Report) -> Option<Stri
         ),
         StateFileState::TooNew { found, known } => (
             format!(
-                "the suite state database at {} is from a newer version of Worldwright (schema \
+                "the suite state database at {} is from a newer version of LILITH (schema \
                  {found}; this lil knows {known})",
                 path.display()
             ),
@@ -290,7 +290,7 @@ const SET_ASIDE_EXPLAINED: &str = "The core can't start with it. Setting it asid
     fresh database: idempotency records of earlier calls stay behind in the set-aside file.";
 
 /// What to do while a core still holds the suite database.
-const STOP_THE_CORE: &str = "a Worldwright core is running and holds it open; stop it first \
+const STOP_THE_CORE: &str = "a LILITH core is running and holds it open; stop it first \
     (lil core stop), then run lil doctor again";
 
 /// Step 3: `workspace.doctor {fix: true}` in the default workspace, then the `core.autocrlf`
@@ -327,7 +327,7 @@ fn workspace_checks(
         Outcome::Error { error } => return Err(cannot_run(error.message)),
         Outcome::PendingConfirmation(_) => {
             return Err(cannot_run(
-                "workspace.doctor is waiting for a confirmation in the Worldwright app.",
+                "workspace.doctor is waiting for a confirmation in the LILITH app.",
             ));
         }
     };

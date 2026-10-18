@@ -497,7 +497,7 @@ impl<'a> Finder<'a> {
                 .map_err(|e| {
                     ClientError::Io(io::Error::new(
                         e.kind(),
-                        format!("Cannot start the Worldwright core {}: {e}", exe.display()),
+                        format!("Cannot start the LILITH core {}: {e}", exe.display()),
                     ))
                 })?;
                 self.spawned = Some(handle);

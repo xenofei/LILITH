@@ -53,7 +53,7 @@ use super::registry::{CallCtx, Registry, typed_tool};
 use crate::store::{StoreError, WsPath, fsops, register_workspace};
 use crate::workspace::{Access, WorkspaceHub, WorkspaceRef};
 
-/// The Worldwright module of every product tool: always available, never filtered (CORE-058).
+/// The LILITH module of every product tool: always available, never filtered (CORE-058).
 pub const WORKSPACE_MODULE: &str = "workspace";
 
 /// The `.gitignore` entries `workspace.create` writes (CORE-040, ARCH-096).
@@ -77,7 +77,7 @@ const CLOUD_PIN_ATTRIBUTES: u32 = 0x0008_0000 | 0x0010_0000;
 
 /// The warning for a folder on a network or cloud-synced volume.
 pub const NETWORK_WARNING: &str = "This folder is on a network or cloud-synced volume. A sync \
-    client can change files there behind Worldwright's back, and file IDs there aren't \
+    client can change files there behind LILITH's back, and file IDs there aren't \
     trusted, so changes are found by size and time. A local disk is safer for a workspace.";
 
 /// The warning for a volume without stable file IDs.
@@ -131,7 +131,7 @@ struct Tools {
     probe: Arc<dyn Probe>,
 }
 
-const CREATE_DESCRIPTION: &str = "Create a Worldwright workspace in a folder, or register a \
+const CREATE_DESCRIPTION: &str = "Create a LILITH workspace in a folder, or register a \
     folder that already is one, in suite.toml. A new workspace gets lilith.yaml, the \
     sketchbook project, .gitignore and .gitattributes entries. It becomes the default \
     workspace when `default` is true, or when no default is set; the core serves only the \
@@ -184,7 +184,7 @@ pub fn refuse_inside(path: &Path, install_dir: Option<&Path>) -> Result<(), Stri
     };
     if is_inside(&folder_key(path), &folder_key(install)) {
         return Err(format!(
-            "it is the Worldwright install folder \"{}\" or inside it, which updates replace",
+            "it is the LILITH install folder \"{}\" or inside it, which updates replace",
             install.display()
         ));
     }

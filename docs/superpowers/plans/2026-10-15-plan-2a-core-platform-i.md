@@ -25,7 +25,7 @@
 - New crates: `tokio`, `tokio-util` (codec), `futures-util`, `rusqlite` (`bundled`), `schemars` 1.x, `tracing`, `tracing-subscriber` (`json`), `tracing-appender`, `getrandom`.
 - `windows` (in `ww-platform` only).
 
-**Spec:** `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md`. Task 1 adds its Appendix D (core protocol). Roadmap row 2 (`docs/superpowers/plans/2026-10-12-roadmap.md`), split into 2a and 2b by Task 1.
+**Spec:** `docs/superpowers/specs/2026-10-12-lilith-design.md`. Task 1 adds its Appendix D (core protocol). Roadmap row 2 (`docs/superpowers/plans/2026-10-12-roadmap.md`), split into 2a and 2b by Task 1.
 
 The rules this plan implements, fully or in the part named:
 - §1.1: ARCH-001, ARCH-003, ARCH-004, ARCH-005 (the core shows no UI; it has only the hidden session-end window), ARCH-006, ARCH-016 (`status`, `call`, `events --follow`), ARCH-018, ARCH-019, ARCH-020 (clients and in-flight calls; plan 3 registers jobs, confirmations and outside ComfyUI jobs as idle blockers), ARCH-021 (the drain phase, phase order and the session-end window; plan 3 registers the engine phases), ARCH-023;
@@ -288,7 +288,7 @@ M0 results: `docs/spikes/README.md`. Spike 09 is why the core binary is a Window
 ### Task 1: Spec changes first (QA-029)
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-10-12-worldwright-suite-design.md`. No new IDs, no renumbering and no new `- **ID** [` lines; the ID check stays `925 925 []`.
+- Modify: `docs/superpowers/specs/2026-10-12-lilith-design.md`. No new IDs, no renumbering and no new `- **ID** [` lines; the ID check stays `925 925 []`.
 - Modify: `docs/superpowers/plans/2026-10-12-roadmap.md`.
 
 **Interfaces:**
@@ -316,13 +316,13 @@ M0 results: `docs/spikes/README.md`. Spike 09 is why the core binary is a Window
   Each row depends on the one before.
 - [ ] **Step 5: Verify the IDs.**
 
-Run: `python -I -c "import re;t=open('docs/superpowers/specs/2026-10-12-worldwright-suite-design.md',encoding='utf-8').read();ids=re.findall(r'(?m)^- \*\*([A-Z]+-\d{3})\*\* \[',t);refs=set(re.findall(r'\b(?:ARCH|CORE|APP|AI|IMG|QA|OPS)-\d{3}\b',t));print(len(ids),len(set(ids)),sorted(refs-set(ids)))"`
+Run: `python -I -c "import re;t=open('docs/superpowers/specs/2026-10-12-lilith-design.md',encoding='utf-8').read();ids=re.findall(r'(?m)^- \*\*([A-Z]+-\d{3})\*\* \[',t);refs=set(re.findall(r'\b(?:ARCH|CORE|APP|AI|IMG|QA|OPS)-\d{3}\b',t));print(len(ids),len(set(ids)),sorted(refs-set(ids)))"`
 Expected: `925 925 []`
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add docs/superpowers/specs/2026-10-12-worldwright-suite-design.md docs/superpowers/plans/2026-10-12-roadmap.md
+git add docs/superpowers/specs/2026-10-12-lilith-design.md docs/superpowers/plans/2026-10-12-roadmap.md
 git commit -m "spec: core protocol appendix and plan-2 clarifications (core/drain, hello freezes); roadmap 2a/2b"
 ```
 

@@ -48,7 +48,7 @@ impl RecordStage for WorkspaceRecord {
                     error: ErrorBody::new(
                         &codes::CORE_BUG,
                         format!(
-                            "{} left a record without a workspace. This is a bug in Worldwright.",
+                            "{} left a record without a workspace. This is a bug in LILITH.",
                             d.name
                         ),
                         ctx.trace_id.clone(),

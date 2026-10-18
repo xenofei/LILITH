@@ -291,6 +291,27 @@ fn collect_uses(y: &Yaml, out: &mut Vec<String>) {
     }
 }
 
+/// Every string in `y`, keys and values at any depth, that names `--package` or the crate
+/// before the rename. A tree-builder job builds its own tree, which has only `lil-cli`, and
+/// names it with `-p` (B2 review).
+fn old_crate_or_package_flag(y: &Yaml, out: &mut Vec<String>) {
+    match y {
+        Yaml::String(text) => {
+            if ["ww-cli", "--package"].iter().any(|n| text.contains(n)) {
+                out.push(text.clone());
+            }
+        }
+        Yaml::Hash(h) => {
+            for (k, v) in h {
+                old_crate_or_package_flag(k, out);
+                old_crate_or_package_flag(v, out);
+            }
+        }
+        Yaml::Array(a) => a.iter().for_each(|v| old_crate_or_package_flag(v, out)),
+        _ => {}
+    }
+}
+
 /// `owner/repo[/path]@<40 lowercase hex>`.
 fn pinned_value(value: &str) -> bool {
     let Some((name, sha)) = value.trim().split_once('@') else {
@@ -1377,6 +1398,10 @@ fn judges_pick_the_cli_crate_from_the_tree_they_build() {
                 .any(|st| run(st).contains("cargo run --locked -p lil-cli -- dev spec-tests")),
             "{file}/{id}"
         );
+        // No `--package`, and no text naming the crate before the rename, anywhere in the job.
+        let mut bad = Vec::new();
+        old_crate_or_package_flag(&doc["jobs"][id], &mut bad);
+        assert!(bad.is_empty(), "{file}/{id}: {bad:?}");
         // The renamed crate only: every `-p` in these jobs names `lil-cli`.
         for st in &steps {
             let script = run(st);
@@ -1388,6 +1413,34 @@ fn judges_pick_the_cli_crate_from_the_tree_they_build() {
             }
         }
     }
+}
+
+/// The tree-builder check sees `--package` and the old crate's name in any step, key or value.
+#[test]
+fn old_crate_or_package_flag_finds_them_anywhere_in_a_job() {
+    let job = &YamlLoader::load_from_str(
+        "steps:\n  \
+         - run: cargo run --locked -p lil-cli -- dev spec-tests\n  \
+         - run: cargo run --locked --package lil-cli -- dev spec-report\n  \
+         - name: check\n    \
+           env:\n      \
+             manifest: crates/ww-cli/Cargo.toml\n",
+    )
+    .unwrap()[0];
+    let mut bad = Vec::new();
+    old_crate_or_package_flag(job, &mut bad);
+    assert_eq!(
+        bad,
+        [
+            "cargo run --locked --package lil-cli -- dev spec-report",
+            "crates/ww-cli/Cargo.toml"
+        ]
+    );
+    let clean =
+        &YamlLoader::load_from_str("steps:\n  - run: cargo run --locked -p lil-cli\n").unwrap()[0];
+    let mut none = Vec::new();
+    old_crate_or_package_flag(clean, &mut none);
+    assert!(none.is_empty(), "{none:?}");
 }
 
 /// QA-086, rulings RN4 and RN5: each scan step sets both denylist variables, each from its own

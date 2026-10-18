@@ -461,7 +461,7 @@ impl Inner {
                     error: ErrorBody::new(
                         &codes::CONFIRM_UNAVAILABLE,
                         format!(
-                            "{} needs your confirmation, and this session has no way to ask you. Run it from the Worldwright app.",
+                            "{} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app.",
                             d.name
                         ),
                         trace_id,
@@ -640,7 +640,7 @@ fn too_large(tool: &str, trace_id: &str) -> Outcome<ToolOutput> {
     Outcome::Error {
         error: ErrorBody::new(
             &codes::CORE_BUG,
-            format!("The result of {tool} was too large to send. This is a bug in Worldwright."),
+            format!("The result of {tool} was too large to send. This is a bug in LILITH."),
             trace_id,
         ),
     }
@@ -658,7 +658,7 @@ fn replay(stored: &str, key: &str, trace_id: &str) -> Outcome<ToolOutput> {
         return Outcome::Error {
             error: ErrorBody::new(
                 &codes::CORE_BUG,
-                "The stored result of this call was too large to send. This is a bug in Worldwright.",
+                "The stored result of this call was too large to send. This is a bug in LILITH.",
                 trace_id,
             ),
         };
@@ -705,7 +705,7 @@ fn state_unavailable(e: &StateError, trace_id: &str) -> Outcome<ToolOutput> {
 fn core_bug(tool: &str, panic_text: String, trace_id: &str) -> ErrorBody {
     let mut error = ErrorBody::new(
         &codes::CORE_BUG,
-        format!("{tool} failed with an internal error. This is a bug in Worldwright."),
+        format!("{tool} failed with an internal error. This is a bug in LILITH."),
         trace_id,
     );
     error.detail = Some(Detail {

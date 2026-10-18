@@ -95,7 +95,7 @@ fn call(global: &GlobalArgs, tool: &str, args: Map<String, Value>) -> Result<Cal
                 Called::Exit(EXIT_ERROR_RESULT)
             }
             Outcome::PendingConfirmation(_) => {
-                eprintln!("{tool} is waiting for a confirmation in the Worldwright app.");
+                eprintln!("{tool} is waiting for a confirmation in the LILITH app.");
                 Called::Exit(EXIT_PENDING)
             }
         },

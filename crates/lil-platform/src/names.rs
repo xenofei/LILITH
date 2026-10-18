@@ -120,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn markers_are_lil_and_legacy_markers_are_ww() {
+    fn markers_are_lil_and_legacy_markers_keep_their_tails() {
         assert_eq!(TMP_MARKER.len(), 9);
         for (new, old) in [
             (TMP_MARKER, LEGACY_TMP_MARKER),

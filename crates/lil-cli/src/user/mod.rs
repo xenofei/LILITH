@@ -201,7 +201,7 @@ pub(crate) fn print_line(text: &str) -> io::Result<()> {
 /// `start` says so, and no workspace (`"none"`).
 pub(crate) fn config(global: &GlobalArgs, start: StartPolicy) -> Result<ClientConfig, Exit> {
     let env = Env::from_process()
-        .map_err(|e| cannot_run(format!("Cannot tell which Worldwright folders to use: {e}")))?;
+        .map_err(|e| cannot_run(format!("Cannot tell which LILITH folders to use: {e}")))?;
     let mut cfg = ClientConfig::for_env(env, CallerKind::Cli)
         .map_err(|e| cannot_run(format!("Cannot find the folder lil runs from: {e}")))?;
     cfg.non_interactive = global.non_interactive;

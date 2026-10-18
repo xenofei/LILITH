@@ -284,7 +284,7 @@ impl RpcRouter {
                         );
                         let error = ErrorBody::new(
                             &codes::CALLER_NOT_ALLOWED,
-                            format!("{m} is for Worldwright apps only."),
+                            format!("{m} is for LILITH apps only."),
                             trace_id,
                         );
                         outcome::<ToolOutput>(id, Outcome::Error { error })
@@ -381,7 +381,7 @@ impl RpcRouter {
                 tracing::error!(conn_id = conn.conn_id, error = %e, trace_id, "core/hello stopped");
                 let error = ErrorBody::new(
                     &codes::CORE_BUG,
-                    "core/hello could not finish. This is a bug in Worldwright.",
+                    "core/hello could not finish. This is a bug in LILITH.",
                     trace_id,
                 );
                 return Some(self.hello_error(conn, id, error));
@@ -682,7 +682,7 @@ impl Router for RpcRouter {
         );
         let error = ErrorBody::new(
             &codes::CORE_BUG,
-            "The core failed with an internal error. This is a bug in Worldwright.",
+            "The core failed with an internal error. This is a bug in LILITH.",
             trace_id,
         );
         outcome::<ToolOutput>(id, Outcome::Error { error })

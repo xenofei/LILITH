@@ -440,7 +440,7 @@ async fn sealed_check(d: &Doctor, open: &OpenWorkspace, fix: bool) -> DoctorChec
     if !edited.is_empty() {
         problems.push(format!(
             "{} sealed file(s) differ from the hash their manifest records and are left as they \
-             are: {} — they were edited outside Worldwright; compare them with the version's \
+             are: {} — they were edited outside LILITH; compare them with the version's \
              manifest",
             edited.len(),
             edited.join(", ")
@@ -661,7 +661,7 @@ async fn listed_checks(open: &OpenWorkspace) -> Vec<DoctorCheck> {
             "no manifest or file needs repair",
             "manifest(s) or file(s) need repair",
             needs_repair,
-            "fix them by hand; Worldwright never rewrites them",
+            "fix them by hand; LILITH never rewrites them",
         ),
         listed(
             "workspace.missing",

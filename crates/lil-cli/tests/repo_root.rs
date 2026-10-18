@@ -40,7 +40,10 @@ fn lil_env(args: &[&str], cwd: &Path, global: &Path, env: &[(&str, &Path)]) -> O
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", global)
-        .env("WW_PRIVACY_DENYLIST", "not-a-real-denylist-entry")
+        .env(
+            lil_platform::names::DENYLIST_ENV,
+            "not-a-real-denylist-entry",
+        )
         .output()
         .expect("the built lil must start")
 }

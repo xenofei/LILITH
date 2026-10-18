@@ -166,7 +166,7 @@ pub async fn asset_detail(
         ..ErrorBody::new(
             &MANIFEST_NEEDS_REPAIR,
             format!(
-                "The manifest `{}` is missing: it disappeared outside Worldwright. Put it back \
+                "The manifest `{}` is missing: it disappeared outside LILITH. Put it back \
                  (from git or a backup); the asset stays listed until then.",
                 row.manifest
             ),

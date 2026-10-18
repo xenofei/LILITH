@@ -18,11 +18,8 @@
 //! [`every_allowlist_row_still_allows_something`] fails when a row, or any one glob or
 //! substring of a row, no longer allows any hit, so rows can't rot.
 //!
-//! The rows name the `crates/lil-*` paths the files have from Task B2 on. Until the rename is
-//! finished (Task B6) this test is red, so the two repo-scanning tests are `#[ignore]`d and
-//! [`ignores_come_off_once_no_stale_name_is_left`] fails as soon as the tree is clean, so the
-//! ignores can't outlive the rename. Run them with:
-//! `cargo nextest run -p ww-testkit -E 'binary(no_stale_names)' --run-ignored all`.
+//! The rows name the `crates/lil-*` paths the files have from Task B2 on. Task B6 finished the
+//! rename, so both repo-scanning tests run in every `cargo nextest run --workspace`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -93,11 +90,17 @@ const ALLOW: &[Allow] = &[
             "\"-p ww-cli\", \"-p lil-cli\"]",
             "\"ww.exe \", \"lil.exe \"",
             "[\"ww-cli\", \"lil-cli\", \"ww.exe\", \"lil.exe\"",
-            // The legacy secret (RN5).
+            // The pick step's `bin=ww` pin (B2 review, concern 1).
+            "\"bin=ww\",",
+            // The legacy secret (RN5), also as the lowercase name a check counts.
             "WW_PRIVACY_DENYLIST",
+            "\"secrets.ww_privacy_denylist\",",
+            // The tree-builder check that rejects the old crate's name and `--package` (B2 review).
+            "[\"ww-cli\", \"--package\"]",
         ],
-        why: "CI transition pins: the pick step's ww-cli branch, the either-crate lists and the \
-              legacy secret only, never a tree-builder `-p ww-cli -- dev` pin (B1 follow-up)",
+        why: "CI transition pins: the pick step's ww-cli branch, the either-crate lists, the \
+              legacy secret and the tree-builder negative check only, never a tree-builder \
+              `-p ww-cli -- dev` pin (B1 follow-up, B2 review)",
         until: "PR-D",
     },
     Allow {
@@ -147,6 +150,60 @@ const ALLOW: &[Allow] = &[
         lines_with: &["`worldwright` plugin", "plugin_worldwright_"],
         why: "R1, D5",
         until: "plugin rename",
+    },
+    // Rows Task B6 adds.
+    Allow {
+        globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
+        lines_with: &[
+            "the legacy `.worldwright\\state.json` is read only while",
+            "the legacy `.worldwright\\core.lock` when `.worldwright\\` exists",
+            "has `worldwright.yaml` but no `.worldwright\\`",
+        ],
+        why: "Appendix E: how the core serves a workspace from before the rename (R4, D3, D4, \
+              RN9)",
+        until: "PR-D, with the legacy readers",
+    },
+    Allow {
+        globs: &["docs/reference/workspace-format.md"],
+        lines_with: &["has `worldwright.yaml` and `.worldwright/` instead"],
+        why: "the reference says a workspace from before the rename is still read (R4)",
+        until: "PR-D, with the legacy readers",
+    },
+    Allow {
+        globs: &["docs/dev/merge-guard.md"],
+        lines_with: &[
+            "the legacy `WW_PRIVACY_DENYLIST`",
+            "the legacy `%USERPROFILE%\\.worldwright\\",
+            "the legacy `Worldwright-dev/github/agent-token`",
+            "Both the LIL_PRIVACY_DENYLIST and the WW_PRIVACY_DENYLIST secrets are missing",
+        ],
+        why: "the maintainer's guide names the legacy denylist, key and token it still reads, and \
+              the CI message that names both secrets (A2, A4, B5)",
+        until: "PR-D, with the legacy readers and the second secret",
+    },
+    Allow {
+        globs: &["crates/lil-cli/src/dev/mod.rs"],
+        lines_with: &[
+            "%USERPROFILE%\\.worldwright\\reviewer\\app-key.age when the new one isn't there",
+            "Worldwright-dev/github/agent-token, is still read when the new target has none;",
+            "LIL_PRIVACY_DENYLIST (CI), the legacy WW_PRIVACY_DENYLIST,",
+            "%USERPROFILE%\\.worldwright\\privacy-denylist.txt. A blank variable is skipped.",
+            "(Worldwright-dev/github/agent-token), once `status` shows the new one.",
+        ],
+        why: "help text of `dev approve`, `dev agent-token`, `dev privacy-scan` and \
+              `agent-token clear --legacy`, naming the legacy key, token and denylist they still \
+              read (A2, B2 review)",
+        until: "PR-D, with the legacy readers",
+    },
+    Allow {
+        globs: &[
+            "crates/lil-cli/src/dev/merge.rs",
+            "crates/lil-cli/src/dev/reviewer.rs",
+        ],
+        lines_with: &["/worldwright-suite\"", "\"worldwright-app[bot]\""],
+        why: "D9 test literals in PR-C's files: a repo slug in another case and a lookalike App \
+              login, neither matched by the D9 row's exact substrings",
+        until: "PR-C, which reviews them with the D9 row",
     },
     Allow {
         globs: &["**"],
@@ -306,7 +363,6 @@ fn disallowed(hits: &[Hit]) -> Vec<&Hit> {
 }
 
 #[test]
-#[ignore = "red until Task B6 finishes the rename; Task B6 removes this ignore"]
 fn no_stale_names_outside_the_allowlist() {
     let hits = all_hits();
     let bad = disallowed(&hits);
@@ -322,7 +378,6 @@ fn no_stale_names_outside_the_allowlist() {
 }
 
 #[test]
-#[ignore = "red until Task B6 finishes the rename; Task B6 removes this ignore"]
 fn every_allowlist_row_still_allows_something() {
     let hits = all_hits();
     let mut rotten = Vec::new();
@@ -352,19 +407,6 @@ fn every_allowlist_row_still_allows_something() {
         rotten.is_empty(),
         "allowlist rows that allow nothing (remove or narrow them):\n{}",
         rotten.join("\n")
-    );
-}
-
-/// Keeps the two `#[ignore]`s above from outliving the rename: once no stale name is left
-/// outside the allowlist, this fails until Task B6 removes both ignores and this test.
-#[test]
-fn ignores_come_off_once_no_stale_name_is_left() {
-    let hits = all_hits();
-    assert!(
-        !disallowed(&hits).is_empty(),
-        "no stale name is left outside the allowlist: remove the #[ignore]s from \
-         no_stale_names_outside_the_allowlist and every_allowlist_row_still_allows_something, \
-         and delete this test"
     );
 }
 

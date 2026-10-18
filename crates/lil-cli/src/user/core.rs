@@ -28,7 +28,7 @@ pub(super) fn stop(global: &GlobalArgs, timeout_secs: u64) -> Result<i32, Exit> 
         }
         Err(ClientError::Timeout) => {
             return Err(cannot_run(format!(
-                "The Worldwright core did not stop within {timeout_secs} s; it may still be finishing its work. Run `lil core stop` again to keep waiting."
+                "The LILITH core did not stop within {timeout_secs} s; it may still be finishing its work. Run `lil core stop` again to keep waiting."
             )));
         }
         Err(e) => return Err(cannot_run(e)),

@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The spec file the rule IDs come from, relative to the workspace root.
-const SPEC_PATH: &str = "docs/superpowers/specs/2026-10-12-worldwright-suite-design.md";
+const SPEC_PATH: &str = "docs/superpowers/specs/2026-10-12-lilith-design.md";
 /// The classification file, relative to the workspace root.
 const CLASSIFICATION_PATH: &str = "dev/rule-classification.toml";
 /// The classes a rule can have. `unclassified` is the default until a rule is classified.

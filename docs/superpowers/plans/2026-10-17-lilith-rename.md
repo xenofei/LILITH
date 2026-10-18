@@ -53,7 +53,8 @@ Decisions this plan makes. Each stands unless the owner says otherwise at review
   - **Not copied forward: the suite `state.db`.** R4 lists only `suite.toml` for the data folders, and no suite `state.db` exists anywhere: no core has run outside test temp roots (inventory section 5). One created by a pre-rename build would be left in place, and the new core starts a fresh one.
 - **D4. Both locks count (R4 carve-out).** The core creates and locks `.lilith\core.lock`. When `.worldwright\` exists, it also creates and locks `.worldwright\core.lock`. It serves read-write only when it holds both, and otherwise read-only, which is how a held `core.lock` is handled today (ARCH-028).
   - The legacy lock file is a lock, not the person's data, so creating it is the one deliberate exception to "never write old names". The `.worldwright\` folder itself is never created.
-  - An old core and a new core never both write to one workspace, whichever starts first (B6).
+  - An old core and a new core never both write to one workspace, whichever starts first (B6), as long as `.worldwright\` exists.
+  - **Accepted risk (correction from the B4 review).** A fresh clone of a plugin-era workspace, or one cleaned with `git clean -fdX` where `.worldwright/` is gitignored, has `worldwright.yaml` but no `.worldwright\`. The new core then creates and locks only `.lilith\core.lock`, so an old core started after it could also write. D4 forbids creating `.worldwright\`, and no pre-rename core runs on a real workspace, so the risk is accepted. Appendix E of the spec states it.
 - **D5. The plugin keeps its id, the suite's MCP server becomes `lil`.**
   - The spec's future MCP server (plugin 1.3, built in this repo) is renamed `lil`. Tool names become `mcp__plugin_worldwright_lil__<tool>` and, in Engine A, `mcp__lil__<tool>`.
   - `WW_ENGINE` and `WW_PROFILE` become `LIL_*`.

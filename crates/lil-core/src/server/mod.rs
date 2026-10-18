@@ -564,7 +564,7 @@ fn open_suite_state(
                 path = %path.display(),
                 found,
                 known,
-                "the suite state.db is from a newer version of Worldwright; nothing was changed"
+                "the suite state.db is from a newer version of LILITH; nothing was changed"
             );
             CoreExit::StateTooNew(path)
         }

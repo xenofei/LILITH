@@ -266,7 +266,7 @@ impl std::fmt::Display for StoreError {
             } => {
                 write!(
                     f,
-                    "`{path}` changed outside Worldwright, so it was not overwritten"
+                    "`{path}` changed outside LILITH, so it was not overwritten"
                 )?;
                 if !kept.is_empty() {
                     let names: Vec<String> = kept.iter().map(|k| format!("`{k}`")).collect();
@@ -296,9 +296,9 @@ impl std::fmt::Display for StoreError {
             StoreError::GitBusy => f.write_str(
                 "git is still working on the workspace after 60 s; try again when it has finished",
             ),
-            StoreError::ReadOnly => f.write_str(
-                "another Worldwright core serves this workspace, so it is read-only here",
-            ),
+            StoreError::ReadOnly => {
+                f.write_str("another LILITH core serves this workspace, so it is read-only here")
+            }
             StoreError::NeedsRepair(path) => write!(
                 f,
                 "`{path}` needs repair: it can't be edited as a manifest, so it was left as it is"
@@ -312,7 +312,7 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::Changed { path, .. } => write!(
                 f,
-                "`{path}` changed outside Worldwright since the suite recorded it, so it was not \
+                "`{path}` changed outside LILITH since the suite recorded it, so it was not \
                  used; start a new run with the changed file, or put the recorded one back"
             ),
             StoreError::RestoreConflict(path) => write!(
@@ -1437,7 +1437,7 @@ impl Store {
             return Err(self
                 .held_in_backup(
                     rel,
-                    "another Worldwright core serves this workspace, and it puts it back",
+                    "another LILITH core serves this workspace, and it puts it back",
                 )
                 .await);
         }

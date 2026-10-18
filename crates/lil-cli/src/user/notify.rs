@@ -78,7 +78,7 @@ pub(super) fn run(global: &GlobalArgs, paths: &[PathBuf]) -> Result<i32, Exit> {
                 EXIT_ERROR_RESULT
             }
             Outcome::PendingConfirmation(_) => {
-                eprintln!("watch.notify is waiting for a confirmation in the Worldwright app.");
+                eprintln!("watch.notify is waiting for a confirmation in the LILITH app.");
                 EXIT_PENDING
             }
         },

@@ -138,13 +138,15 @@ impl Settings {
 
 /// The settings of the layers `ws` (`defaults:`), `project` (`project.yaml`'s top-level keys)
 /// and `request` (a tool's `settings` argument, dotted keys or nested mappings), with a
-/// warning for each value a file layer gave that was skipped or dropped.
+/// warning for each value a file layer gave that was skipped or dropped. `workspace_file` is
+/// the name `ws` was read from (`lilith.yaml`, or the legacy file); warnings name it.
 ///
 /// # Errors
 /// The `params.invalid` message for a request key that is suite-level, unknown, or of the
 /// wrong type.
 pub fn cascade(
     ws: &WorkspaceYaml,
+    workspace_file: &str,
     project: Option<&ProjectYaml>,
     request: Option<&Map<String, Value>>,
 ) -> Result<(Settings, Vec<SchemaWarning>), String> {
@@ -155,6 +157,7 @@ pub fn cascade(
         (project.map(|p| &p.overrides), SettingSource::Project),
     ] {
         let Some(layer) = layer else { continue };
+        let label = layer_label(source, workspace_file);
         let mut leaves = Vec::new();
         for &key in CASCADE_KEYS {
             if let Some(value) = layer.get(key) {
@@ -165,10 +168,10 @@ pub fn cascade(
             if value.is_null() {
                 continue;
             }
-            match checked(&key, value, source, &mut warnings) {
+            match checked(&key, value, &label, &mut warnings) {
                 Ok(value) => settings.put(key, value, source),
                 Err(why) => warnings.push(SchemaWarning {
-                    pointer: pointer(source, &key),
+                    pointer: pointer(&label, &key),
                     message: format!("{why}; the value is ignored"),
                 }),
             }
@@ -200,7 +203,8 @@ pub fn cascade(
                      qa_profile, auto_approve, skip_stages, auto_candidate_on_save and modules"
                 ));
             }
-            let value = checked(&key, value, SettingSource::Request, &mut warnings)
+            let request_label = layer_label(SettingSource::Request, workspace_file);
+            let value = checked(&key, value, &request_label, &mut warnings)
                 .map_err(|why| format!("`{key}`: {why}"))?;
             settings.put(key, value, SettingSource::Request);
         }
@@ -230,7 +234,7 @@ fn is_scalar_key(key: &str) -> bool {
 fn checked(
     key: &str,
     value: Value,
-    source: SettingSource,
+    layer: &str,
     warnings: &mut Vec<SchemaWarning>,
 ) -> Result<Value, String> {
     let first = key.split('.').next().unwrap_or_default();
@@ -264,7 +268,7 @@ fn checked(
                 let stage = item.as_str().unwrap_or_default();
                 if UNSKIPPABLE_STAGES.contains(&stage) {
                     warnings.push(SchemaWarning {
-                        pointer: pointer(source, key),
+                        pointer: pointer(layer, key),
                         message: format!(
                             "the stage `{stage}` can't be skipped (it carries QA and the \
                              recipe, CORE-054); it is dropped from skip_stages"
@@ -280,18 +284,24 @@ fn checked(
     }
 }
 
-/// Where a warning points: the layer and the dotted key.
-fn pointer(source: SettingSource, key: &str) -> String {
-    let layer = match source {
-        SettingSource::Workspace => "lilith.yaml defaults",
-        SettingSource::Project => "project.yaml",
-        SettingSource::Request => "request settings",
-    };
+/// The name a warning gives a layer. The workspace layer is named after the workspace file it
+/// was read from: `lilith.yaml`, or the legacy file in a workspace from before the rename.
+fn layer_label(source: SettingSource, workspace_file: &str) -> String {
+    match source {
+        SettingSource::Workspace => format!("{workspace_file} defaults"),
+        SettingSource::Project => "project.yaml".to_string(),
+        SettingSource::Request => "request settings".to_string(),
+    }
+}
+
+/// Where a warning points: the layer's label and the dotted key.
+fn pointer(layer: &str, key: &str) -> String {
     format!("{layer}: {key}")
 }
 
 #[cfg(test)]
 mod tests {
+    use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
     use lil_schema::workspace_yaml::{read_project_yaml, read_workspace_yaml};
     use serde_json::json;
 
@@ -314,7 +324,7 @@ mod tests {
         let project =
             read_project_yaml("name: X\nmodels: {image_generate: b}\nmodules: [audio]\n").unwrap();
         let request = obj(json!({"models": {"vision_qa": "r"}, "qa_profile": "strict"}));
-        let (s, warnings) = cascade(&ws, Some(&project), Some(&request)).unwrap();
+        let (s, warnings) = cascade(&ws, WORKSPACE_FILE, Some(&project), Some(&request)).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(s.model_for("image_generate"), Some("b"));
         assert_eq!(s.sources["models.image_generate"], SettingSource::Project);
@@ -332,6 +342,25 @@ mod tests {
         );
     }
 
+    #[test] // spec: CORE-057
+    fn file_warnings_name_the_workspace_file_that_was_read() {
+        let ws = read_workspace_yaml("defaults:\n  qa_profile: 3\n").unwrap();
+        for file in [WORKSPACE_FILE, LEGACY_WORKSPACE_FILE] {
+            let (_, warnings) = cascade(&ws, file, None, None).unwrap();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].pointer, format!("{file} defaults: qa_profile"));
+        }
+        let project = read_project_yaml("name: X\nqa_profile: 3\n").unwrap();
+        let (_, warnings) = cascade(
+            &WorkspaceYaml::default(),
+            WORKSPACE_FILE,
+            Some(&project),
+            None,
+        )
+        .unwrap();
+        assert_eq!(warnings[0].pointer, "project.yaml: qa_profile");
+    }
+
     #[test] // spec: CORE-057, CORE-054
     fn bad_values_are_warnings_in_files_and_errors_in_requests() {
         let ws = read_workspace_yaml(
@@ -339,7 +368,7 @@ mod tests {
              skip_stages: [export, check, record]\n",
         )
         .unwrap();
-        let (s, warnings) = cascade(&ws, None, None).unwrap();
+        let (s, warnings) = cascade(&ws, WORKSPACE_FILE, None, None).unwrap();
         assert_eq!(s.qa_profile(), None);
         assert!(!s.values.contains_key("models.image_generate"));
         assert_eq!(s.skip_stages(), ["export"]);
@@ -354,11 +383,12 @@ mod tests {
             (json!({"modules": "x"}), "list"),
             (json!({"auto_candidate_on_save": "yes"}), "true or false"),
         ] {
-            let err = cascade(&ws, None, Some(&obj(bad.clone()))).unwrap_err();
+            let err = cascade(&ws, WORKSPACE_FILE, None, Some(&obj(bad.clone()))).unwrap_err();
             assert!(err.contains(why), "{bad}: {err}");
         }
         let (s, _) = cascade(
             &ws,
+            WORKSPACE_FILE,
             None,
             Some(&obj(json!({"pipeline.skip_stages": ["check", "review"]}))),
         )
@@ -368,6 +398,7 @@ mod tests {
         // The nested form of the `pipeline` keys is the same setting.
         let (s, _) = cascade(
             &ws,
+            WORKSPACE_FILE,
             None,
             Some(&obj(json!({"pipeline": {"skip_stages": ["record", "export"], "auto_approve": ["icon"]}}))),
         )
@@ -380,7 +411,7 @@ mod tests {
             json!({"pipeline.extra_reviews": []}),
             json!({"pipeline": ["skip_stages"]}),
         ] {
-            let err = cascade(&ws, None, Some(&obj(bad.clone()))).unwrap_err();
+            let err = cascade(&ws, WORKSPACE_FILE, None, Some(&obj(bad.clone()))).unwrap_err();
             assert!(err.contains("not a setting"), "{bad}: {err}");
         }
     }

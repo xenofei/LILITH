@@ -155,7 +155,7 @@ fn set_aside_at(db: &Path, now_utc: i64) -> io::Result<Vec<PathBuf>> {
         let to = beside(&from, &suffix);
         if let Err(e) = move_new(&from, &to) {
             let why = if e.raw_os_error() == Some(32) {
-                "another program holds it open; close the Worldwright apps (and any program \
+                "another program holds it open; close the LILITH apps (and any program \
                  that may have it open), then run lil doctor again"
                     .to_string()
             } else {

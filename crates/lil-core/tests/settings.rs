@@ -13,6 +13,7 @@ use lil_core::state::StateRegistry;
 use lil_core::tools::{Dispatcher, PipelineHooks, TestGates, WORKSPACE_MODULE, core_registry};
 use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, SystemProbe};
+use lil_platform::names::WORKSPACE_FILE;
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{CallerKind, EffectClass, Outcome, ToolCallParams, ToolOutput};
 use lil_schema::workspace_yaml::{WorkspaceYaml, read_workspace_yaml};
@@ -345,7 +346,7 @@ async fn check_and_record_cannot_be_skipped() {
 
     // The pure cascade says why.
     let ws = read_workspace_yaml("defaults:\n  pipeline:\n    skip_stages: [check]\n").unwrap();
-    let (settings, warnings) = cascade(&ws, None, None).unwrap();
+    let (settings, warnings) = cascade(&ws, WORKSPACE_FILE, None, None).unwrap();
     assert!(settings.skip_stages().is_empty());
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].message.contains("CORE-054"), "{warnings:?}");
@@ -354,11 +355,11 @@ async fn check_and_record_cannot_be_skipped() {
 #[tokio::test] // spec: CORE-049
 async fn auto_candidate_on_save_defaults_off_and_has_working_doc_survives_edits() {
     // Off unless a layer turns it on.
-    let (settings, _) = cascade(&WorkspaceYaml::default(), None, None).unwrap();
+    let (settings, _) = cascade(&WorkspaceYaml::default(), WORKSPACE_FILE, None, None).unwrap();
     assert!(!settings.auto_candidate_on_save());
     assert!(settings.get("auto_candidate_on_save").is_none());
     let on = read_workspace_yaml("defaults:\n  auto_candidate_on_save: true\n").unwrap();
-    let (settings, _) = cascade(&on, None, None).unwrap();
+    let (settings, _) = cascade(&on, WORKSPACE_FILE, None, None).unwrap();
     assert!(settings.auto_candidate_on_save());
     assert_eq!(
         settings.sources["auto_candidate_on_save"],
@@ -366,7 +367,7 @@ async fn auto_candidate_on_save_defaults_off_and_has_working_doc_survives_edits(
     );
     let mut request = Map::new();
     request.insert("auto_candidate_on_save".into(), json!(false));
-    let (settings, _) = cascade(&on, None, Some(&request)).unwrap();
+    let (settings, _) = cascade(&on, WORKSPACE_FILE, None, Some(&request)).unwrap();
     assert!(!settings.auto_candidate_on_save());
 
     let env = TestEnv::new();

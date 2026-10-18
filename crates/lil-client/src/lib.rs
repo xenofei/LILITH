@@ -206,14 +206,14 @@ pub enum ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::NotRunning => f.write_str("The Worldwright core is not running."),
+            ClientError::NotRunning => f.write_str("The LILITH core is not running."),
             ClientError::Untrusted { pid, image, reason } => {
                 if image.as_os_str().is_empty() {
-                    write!(f, "The Worldwright core pipe is served by process {pid}")?;
+                    write!(f, "The LILITH core pipe is served by process {pid}")?;
                 } else {
                     write!(
                         f,
-                        "The Worldwright core pipe is served by {} (pid {pid})",
+                        "The LILITH core pipe is served by {} (pid {pid})",
                         image.display()
                     )?;
                 }
@@ -226,11 +226,11 @@ impl fmt::Display for ClientError {
             }
             ClientError::Incompatible { core_protocol } if core_protocol.is_empty() => f
                 .write_str(
-                    "The running Worldwright core speaks a protocol version this client cannot use (it did not say which). Update the older of the two; the core was left running.",
+                    "The running LILITH core speaks a protocol version this client cannot use (it did not say which). Update the older of the two; the core was left running.",
                 ),
             ClientError::Incompatible { core_protocol } => write!(
                 f,
-                "The running Worldwright core speaks protocol {core_protocol}, which this client cannot use. Update the older of the two; the core was left running."
+                "The running LILITH core speaks protocol {core_protocol}, which this client cannot use. Update the older of the two; the core was left running."
             ),
             ClientError::StartFailed {
                 kind: StartFailure::StateDamaged,
@@ -256,7 +256,7 @@ impl fmt::Display for ClientError {
                 ..
             } => write!(
                 f,
-                "The core can't start: its state database at {} is from a newer version of Worldwright. Nothing was changed.",
+                "The core can't start: its state database at {} is from a newer version of LILITH. Nothing was changed.",
                 state_db.display()
             ),
             ClientError::StartFailed {
@@ -275,7 +275,7 @@ impl fmt::Display for ClientError {
                     logs_dir.display()
                 )
             }
-            ClientError::Timeout => f.write_str("The Worldwright core did not answer in time."),
+            ClientError::Timeout => f.write_str("The LILITH core did not answer in time."),
             ClientError::Refused(body) => f.write_str(&body.message),
             ClientError::UnknownWorkspace {
                 origin:
@@ -329,11 +329,11 @@ impl fmt::Display for ClientError {
             ),
             ClientError::Protocol(e) => write!(
                 f,
-                "The Worldwright core answered with a protocol error ({}): {}",
+                "The LILITH core answered with a protocol error ({}): {}",
                 e.code, e.message
             ),
             ClientError::Io(e) => write!(f, "{e}"),
-            ClientError::Closed => f.write_str("The Worldwright core closed the connection."),
+            ClientError::Closed => f.write_str("The LILITH core closed the connection."),
         }
     }
 }
@@ -400,7 +400,7 @@ mod tests {
         );
         assert_eq!(
             failed(Some(6), StartFailure::StateTooNew).to_string(),
-            r"The core can't start: its state database at C:\t\local\state.db is from a newer version of Worldwright. Nothing was changed."
+            r"The core can't start: its state database at C:\t\local\state.db is from a newer version of LILITH. Nothing was changed."
         );
         let other = failed(Some(2), StartFailure::Other).to_string();
         assert!(other.contains(r"C:\t\local\logs"), "{other}");
@@ -498,5 +498,40 @@ mod tests {
         let user = untrusted("it runs as another user".to_string()).to_string();
         assert!(!user.contains("lil core stop"), "{user}");
         assert!(user.contains("77"), "{user}");
+    }
+
+    #[test]
+    fn messages_name_the_core_lilith() {
+        for (err, want) in [
+            (ClientError::NotRunning, "The LILITH core is not running."),
+            (
+                ClientError::Timeout,
+                "The LILITH core did not answer in time.",
+            ),
+            (
+                ClientError::Closed,
+                "The LILITH core closed the connection.",
+            ),
+        ] {
+            assert_eq!(err.to_string(), want);
+        }
+        let incompatible = ClientError::Incompatible {
+            core_protocol: "9.0".to_string(),
+        }
+        .to_string();
+        assert!(
+            incompatible.starts_with("The running LILITH core speaks protocol 9.0"),
+            "{incompatible}"
+        );
+        let untrusted = ClientError::Untrusted {
+            pid: 5,
+            image: PathBuf::new(),
+            reason: "it runs as another user".to_string(),
+        }
+        .to_string();
+        assert!(
+            untrusted.starts_with("The LILITH core pipe is served by process 5"),
+            "{untrusted}"
+        );
     }
 }

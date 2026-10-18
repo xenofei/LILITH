@@ -1,4 +1,4 @@
-//! Worldwright core. All file writes in this crate go through [`store`] (ARCH-112); the core's
+//! LILITH core. All file writes in this crate go through [`store`] (ARCH-112); the core's
 //! SQLite databases are [`state`] (CORE-004, CORE-005).
 //!
 //! `config`, `server`, `rpc`, `identity`, `workspace`, `session`, `events` and `lifecycle`

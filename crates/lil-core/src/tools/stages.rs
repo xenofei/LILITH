@@ -163,9 +163,9 @@ async fn read_text(store: &Store, rel: &str) -> Option<String> {
     }
 }
 
-/// The workspace file's text: `lilith.yaml`, else the legacy workspace file when the new one is
-/// missing (R4; it is only read). `None` (logged) when neither can be read.
-async fn workspace_text(store: &Store) -> Option<String> {
+/// The workspace file's name and text: `lilith.yaml`, else the legacy workspace file when the
+/// new one is missing (R4; it is only read). `None` (logged) when neither can be read.
+async fn workspace_text(store: &Store) -> Option<(&'static str, String)> {
     for name in [WORKSPACE_FILE, LEGACY_WORKSPACE_FILE] {
         let rel = WsPath::parse(name).ok()?;
         match store.read(&rel).await {
@@ -173,7 +173,8 @@ async fn workspace_text(store: &Store) -> Option<String> {
             Ok(Some(bytes)) => {
                 return String::from_utf8(bytes)
                     .map_err(|_| tracing::warn!(path = %rel, "a settings file is not UTF-8; it is ignored"))
-                    .ok();
+                    .ok()
+                    .map(|text| (name, text));
             }
             Err(e) => {
                 tracing::warn!(path = %rel, error = %e, "a settings file can't be read; it is ignored");
@@ -184,12 +185,17 @@ async fn workspace_text(store: &Store) -> Option<String> {
     None
 }
 
-/// The file layers of `open`: the workspace file and `project`'s `project.yaml`.
+/// The file layers of `open`: the workspace file (with the name it was read from) and
+/// `project`'s `project.yaml`.
 async fn file_layers(
     open: &OpenWorkspace,
     project: Option<&str>,
-) -> (WorkspaceYaml, Option<ProjectYaml>) {
-    let ws = match workspace_text(&open.store).await {
+) -> (&'static str, WorkspaceYaml, Option<ProjectYaml>) {
+    let (ws_file, text) = match workspace_text(&open.store).await {
+        None => (WORKSPACE_FILE, None),
+        Some((name, text)) => (name, Some(text)),
+    };
+    let ws = match text {
         None => WorkspaceYaml::default(),
         Some(text) => read_workspace_yaml(&text).unwrap_or_else(|why| {
             tracing::warn!(
@@ -200,7 +206,7 @@ async fn file_layers(
         }),
     };
     let Some(slug) = project.filter(|p| lil_schema::is_slug(p)) else {
-        return (ws, None);
+        return (ws_file, ws, None);
     };
     let text = read_text(&open.store, &format!("projects/{slug}/project.yaml")).await;
     let project = text.and_then(|text| {
@@ -214,7 +220,7 @@ async fn file_layers(
             })
             .ok()
     });
-    (ws, project)
+    (ws_file, ws, project)
 }
 
 impl SettingsStage for CascadeSettings {
@@ -223,12 +229,12 @@ impl SettingsStage for CascadeSettings {
         input: SettingsInput<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<Settings, ErrorBody>> + Send + 'a>> {
         Box::pin(async move {
-            let (ws, project) = match input.workspace {
-                None => (WorkspaceYaml::default(), None),
+            let (ws_file, ws, project) = match input.workspace {
+                None => (WORKSPACE_FILE, WorkspaceYaml::default(), None),
                 Some(open) => file_layers(open, input.project).await,
             };
-            let (settings, warnings) =
-                cascade(&ws, project.as_ref(), input.request).map_err(|why| {
+            let (settings, warnings) = cascade(&ws, ws_file, project.as_ref(), input.request)
+                .map_err(|why| {
                     ErrorBody::new(
                         &PARAMS_INVALID,
                         format!("Invalid settings for {}: {why}", input.descriptor.name),

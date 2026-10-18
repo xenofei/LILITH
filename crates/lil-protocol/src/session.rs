@@ -311,7 +311,7 @@ pub fn incompatible_refusal(core: ProtocolVersion, trace_id: &str) -> ErrorBody 
         ..ErrorBody::new(
             &PROTOCOL_INCOMPATIBLE,
             format!(
-                "This Worldwright core speaks protocol {core}, and this client speaks a different major version. Update the older of the two."
+                "This LILITH core speaks protocol {core}, and this client speaks a different major version. Update the older of the two."
             ),
             trace_id,
         )

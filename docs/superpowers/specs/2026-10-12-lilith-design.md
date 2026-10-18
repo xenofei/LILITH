@@ -1,4 +1,4 @@
-# Worldwright Suite — Design Specification
+# LILITH — Design Specification
 
 **Status:** design approved section by section (2026-10-12); this consolidated document awaits final review.
 **Date:** 2026-10-12 · **Audience:** a single user, who is also the tester · **Authors:** Claude Code (design), with independent review passes per section.
@@ -8,7 +8,7 @@
 
 ### 0.1 What we're building
 
-A **personal, hobby desktop creative suite** in the spirit of Adobe Creative Cloud: a family of full-scope, AI-enabled apps (image, 2D, 3D, audio, video and avatars over time) that share one workspace and can import, export and hand files to one another. It is designed for one person making creative art and assets for their own use. It is free software (GPL-3.0-or-later, OPS-108) rather than a commercial product, and it is built with quality in mind.
+**LILITH** (Latent Image & Likeness Instrumentality Toolchain Hub) is a **personal, hobby desktop creative suite** in the spirit of Adobe Creative Cloud: a family of full-scope, AI-enabled apps (image, 2D, 3D, audio, video and avatars over time) that share one workspace and can import, export and hand files to one another. It is designed for one person making creative art and assets for their own use. It is free software (GPL-3.0-or-later, OPS-108) rather than a commercial product, and it is built with quality in mind.
 
 **Success looks like:**
 - each app is usable on its own (open just the Image studio to make 2D sprites) and better together (shared assets, history, AI tools, spending view);
@@ -22,7 +22,7 @@ A **personal, hobby desktop creative suite** in the spirit of Adobe Creative Clo
 
 | Topic | Decision |
 |---|---|
-| Architecture | **A:** a headless Rust core service (`ww-core`, one per user) owns all state and engines; Qt 6 / QML apps (via cxx-qt) and AI agents are clients over a local named pipe; a `ww` CLI and a `ww-mcp` server expose the same tools. Every app works standalone. (§1) |
+| Architecture | **A:** a headless Rust core service (`lil-core`, one per user) owns all state and engines; Qt 6 / QML apps (via cxx-qt) and AI agents are clients over a local named pipe; a `lil` CLI and a `lil-mcp` server expose the same tools. Every app works standalone. (§1) |
 | Build vs wrap | Hybrid: wrap strong, maintained projects (ComfyUI first), build in-house otherwise. |
 | Data | Files are the source of truth; databases are caches or durable local state. Sealed asset versions are immutable. (§1.5, §2) |
 | First app | Image studio: Invoke-style canvas with layers, a native ComfyUI node graph (view + tweak + run) and the embedded ComfyUI web UI; delivered as M1a then M1b; the in-app assistant arrives in M1b. (§5, AI-156) |
@@ -53,12 +53,12 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 
 | Term | Meaning |
 |---|---|
-| Core (`ww-core`) | The per-user headless Rust service: the only writer of workspace state; it runs jobs, engines, metering and tools. |
-| App | A Qt/QML process (e.g. `ww-image`) that is a client of the core. |
+| Core (`lil-core`) | The per-user headless Rust service: the only writer of workspace state; it runs jobs, engines, metering and tools. |
+| App | A Qt/QML process (e.g. `lil-image`) that is a client of the core. |
 | Workspace | A folder holding projects, assets, registries and logs; versioned with git (+ LFS). |
 | Asset / version / candidate | An asset has sealed, immutable versions (`v<semver>/`). Generation runs produce candidates; signing off seals one as a version. |
 | Proposal | A staged change to a working document (e.g. an inpaint result) that you accept or discard. |
-| Document | A hand-edited working file (e.g. an Image studio canvas) in the Worldwright document format: a folder or `.wwdoc`, with content-addressed tiles. |
+| Document | A hand-edited working file (e.g. an Image studio canvas) in the LILITH document format: a folder or `.wwdoc`, with content-addressed tiles. |
 | Tool | A typed operation in the core (e.g. `image.generate`) callable by apps, the CLI, MCP clients and the assistant through one dispatcher. |
 | Caller kind | Who is calling a tool — exactly one of `ui:<app>`, `assistant`, `mcp`, `cli` (§1.3); it decides confirmations and permissions. |
 | Effect class | `read`, `write`, `destructive`, `exec`: decides whether an agent's call needs your confirmation. |
@@ -66,7 +66,7 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 | Prompt dialect | The form a model wants its prompt in — sentences, tags or an edit instruction — declared by each model profile and applied by the compiler (§4.7a, §5.6a). |
 | Engine | An external program the core drives (ComfyUI; Claude Code as assistant Engine A; the Anthropic API as Engine B; later Blender, local LLM servers). |
 | Profile (Claude Code) | One Claude Code account's config folder (`CLAUDE_CONFIG_DIR`), selectable per conversation. |
-| Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records (lossless JSON/YAML round-trip). Its reference text is `docs/reference/workspace-format.md` (from the Worldwright plugin's manifest skill); this spec's changes to it (§2.12) take precedence. |
+| Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records (lossless JSON/YAML round-trip). Its reference text is `docs/reference/workspace-format.md` (from the `worldwright` plugin's manifest skill); this spec's changes to it (§2.12) take precedence. |
 | Store (large files) | Where Git LFS objects live besides this PC: none ("This PC only"), an external or second drive, or S3-compatible cloud (M1.5) (§7.2). |
 | Destination (backups) | A restic repository: the local primary drive, plus optional cloud destinations. |
 
@@ -80,49 +80,49 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 
 The suite is one headless Rust core service per user plus Qt 6 / QML apps that are its clients. AI agents (the built-in assistant, Claude Code) and scripts reach the same tools through the same pipe. This section defines the processes, how they connect and identify themselves, the safety rules the core enforces, how workspace files are written, where data lives, and how the code repository is laid out.
 
-- **ARCH-001** [M1] (decision) Architecture A: a headless Rust core service (`ww-core`) plus Qt 6 / QML apps built with cxx-qt. Every app is usable on its own. Windows 11 first.
+- **ARCH-001** [M1] (decision) Architecture A: a headless Rust core service (`lil-core`) plus Qt 6 / QML apps built with cxx-qt. Every app is usable on its own. Windows 11 first.
 
 ### 1.1 Processes
 
 | Process | Tech | Role |
 |---|---|---|
-| `ww-core` | Rust (tokio); per-user background process, started on demand | The authority on what a workspace means and the only writer of workspace files among suite processes. All module logic (image operations now; 2D, 3D and audio later) lives here as tools. Supervises engines and Claude Code engine processes. |
-| `ww-image` | Rust + Qt 6 Quick/QML (cxx-qt) + C++ shim | The Image studio (§5). In M1 it also hosts the suite's shared panels. |
-| `ww-mcp` | Rust (`rmcp`), stdio | The MCP server Claude Code spawns. Protocol adaptation only. |
-| `ww` | Rust CLI | Debugging, Claude Code hooks, setup checks, scheduled tasks, the end-to-end test harness. |
-| windowless launcher | Rust | Runs `ww` commands from Task Scheduler without a console window. |
+| `lil-core` | Rust (tokio); per-user background process, started on demand | The authority on what a workspace means and the only writer of workspace files among suite processes. All module logic (image operations now; 2D, 3D and audio later) lives here as tools. Supervises engines and Claude Code engine processes. |
+| `lil-image` | Rust + Qt 6 Quick/QML (cxx-qt) + C++ shim | The Image studio (§5). In M1 it also hosts the suite's shared panels. |
+| `lil-mcp` | Rust (`rmcp`), stdio | The MCP server Claude Code spawns. Protocol adaptation only. |
+| `lil` | Rust CLI | Debugging, Claude Code hooks, setup checks, scheduled tasks, the end-to-end test harness. |
+| windowless launcher | Rust | Runs `lil` commands from Task Scheduler without a console window. |
 | `claude` (Engine A) | your installed, unmodified Claude Code CLI | Run headless by the core's `assistant` module as the default assistant engine (§4.6). |
 | Engines | external | ComfyUI in M1; managed by class (§1.4). |
 
 **The core**
-- **ARCH-002** [M1] (invariant) `ww-core` is the only writer of workspace files among suite processes; inside the core only the `store` module writes (§2.0). Apps, `ww-mcp`, `ww` and engines never write workspace files directly.
+- **ARCH-002** [M1] (invariant) `lil-core` is the only writer of workspace files among suite processes; inside the core only the `store` module writes (§2.0). Apps, `lil-mcp`, `lil` and engines never write workspace files directly.
 - **ARCH-003** [M1] (invariant) All module logic lives in the core as tools in one registry. Apps use the same `tools/*` calls as agents (caller kind `ui:<app>`), so anything an app can do, an agent can do.
 - **ARCH-004** [M1] (invariant) The core is a per-user background process started on demand. It is never a Windows Service.
-- **ARCH-005** [M1] (invariant) The core never shows UI and never launches GUI apps. It reaches you through Windows notifications posted under the suite's Start-menu identity (AppUserModelID); Windows draws them, and clicking one activates a `ww:` URL that an app handles (§3.1, §3.3).
+- **ARCH-005** [M1] (invariant) The core never shows UI and never launches GUI apps. It reaches you through Windows notifications posted under the suite's Start-menu identity (AppUserModelID); Windows draws them, and clicking one activates a `lil:` URL that an app handles (§3.1, §3.3).
   - Reason: the core may sit inside a terminal's job object, and Windows wouldn't let windows it launched come to the front.
 - **ARCH-006** [M1] (invariant) The core exposes no network port. The only exception is ARCH-007.
 - **ARCH-007** [M1.5] An optional OpenTelemetry receiver for interactive Claude Code sessions, bound to 127.0.0.1 only, `http/json`, requiring an auth header (§4.7). Engine A runs don't need it: from M1 they are recorded from their own output stream.
 - **ARCH-008** [M1] The core's `assistant` module launches and supervises Engine A: your installed, unmodified `claude` CLI, run headless, one long-lived process per active conversation, each in a kill-on-close Job Object (launch profile, environment allowlist and account profiles in §4.6 and §4.6a).
 
-**`ww-image` (Image studio)**
-- **ARCH-009** [M1] The open document (canvas, layers, undo) lives in the app process. The app autosaves it every 30 s to its recovery folder `%LOCALAPPDATA%\Worldwright\recovery\<app>\`; saving goes through the core's staged-save calls (§3.5).
-- **ARCH-010** [M1] In M1, `ww-image` hosts the shared suite panels — Home/projects, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant, Diagnostics (which in M1 holds the Backups panel and a backup status line, §7.4) — and the embedded ComfyUI web view (ARCH-070).
-- **ARCH-011** [Later] A separate `ww-hub` app takes over the shared panels when the second app arrives.
+**`lil-image` (Image studio)**
+- **ARCH-009** [M1] The open document (canvas, layers, undo) lives in the app process. The app autosaves it every 30 s to its recovery folder `%LOCALAPPDATA%\LILITH\recovery\<app>\`; saving goes through the core's staged-save calls (§3.5).
+- **ARCH-010** [M1] In M1, `lil-image` hosts the shared suite panels — Home/projects, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant, Diagnostics (which in M1 holds the Backups panel and a backup status line, §7.4) — and the embedded ComfyUI web view (ARCH-070).
+- **ARCH-011** [Later] A separate `lil-hub` app takes over the shared panels when the second app arrives.
 
-**`ww-mcp` (Claude Code's MCP server)**
-- **ARCH-012** [M1] (contract) `ww-mcp` is a Rust (`rmcp`) stdio MCP server named `ww`, spawned by Claude Code. It does protocol adaptation only — MCP revision 2026-07-28 plus legacy revisions, and result lowering (ARCH-039). It holds no policy and no state; the core enforces everything.
-  - Tool names appear as `mcp__plugin_worldwright_ww__<tool>` in interactive sessions and `mcp__ww__<tool>` in Engine A; hooks and rules match both (§4.7).
-- **ARCH-013** [M1] (contract) A real copy of `ww-mcp.exe` (not a launcher) lives at the fixed per-user path `%LOCALAPPDATA%\Worldwright\bin\ww-mcp.exe`. Only the stable channel owns it: Velopack's after-install and after-update hooks copy it there with rename-then-replace (§7.5). The install is recorded under `HKCU\Software\Worldwright`. The plugin's `.mcp.json` points at this path (with `userConfig` as an override).
-- **ARCH-014** [M1] If `ww-mcp` and the running core are incompatible, `ww-mcp` still starts and exposes only `ww.status`, which reports the error.
-- **ARCH-015** [M1] `ww-mcp` may launch an app on an agent's behalf, using the launch command returned by `open_in` / `ui.show`, without taking focus (§3.4).
+**`lil-mcp` (Claude Code's MCP server)**
+- **ARCH-012** [M1] (contract) `lil-mcp` is a Rust (`rmcp`) stdio MCP server named `lil`, spawned by Claude Code. It does protocol adaptation only — MCP revision 2026-07-28 plus legacy revisions, and result lowering (ARCH-039). It holds no policy and no state; the core enforces everything.
+  - Tool names appear as `mcp__plugin_worldwright_lil__<tool>` in interactive sessions and `mcp__lil__<tool>` in Engine A; hooks and rules match both (§4.7).
+- **ARCH-013** [M1] (contract) A real copy of `lil-mcp.exe` (not a launcher) lives at the fixed per-user path `%LOCALAPPDATA%\LILITH\bin\lil-mcp.exe`. Only the stable channel owns it: Velopack's after-install and after-update hooks copy it there with rename-then-replace (§7.5). The install is recorded under `HKCU\Software\LILITH`. The plugin's `.mcp.json` points at this path (with `userConfig` as an override).
+- **ARCH-014** [M1] If `lil-mcp` and the running core are incompatible, `lil-mcp` still starts and exposes only `lil.status`, which reports the error.
+- **ARCH-015** [M1] `lil-mcp` may launch an app on an agent's behalf, using the launch command returned by `open_in` / `ui.show`, without taking focus (§3.4).
 
-**`ww` CLI and launcher**
-- **ARCH-016** [M1] `ww` provides at least `ww call`, `ww events --follow`, `ww doctor`, `ww notify <path>` and `ww status`. Other subcommands are specified where they're used: `ww doctor --claude-smoke` (§4.7; runs only when you confirm, because it uses plan quota, under the Claude Code profile you pick — default: the default profile; after a Claude Code version change Doctor offers it), `ww --confirm-window` (§3.3), `ww --non-interactive` (ARCH-055), `ww backup --scheduled` and `ww secret get` (§7.4), `ww test --real` (§6.4), `ww dev merge` (§6), and in M1.5 `ww statusline` (§4.7) and `ww lfs-agent` (§7.2).
-- **ARCH-017** [M1] The windowless launcher runs `ww` commands from Task Scheduler (e.g. `ww backup --scheduled`) without a console window. It may start the core (§7.4).
+**`lil` CLI and launcher**
+- **ARCH-016** [M1] `lil` provides at least `lil call`, `lil events --follow`, `lil doctor`, `lil notify <path>` and `lil status`. Other subcommands are specified where they're used: `lil doctor --claude-smoke` (§4.7; runs only when you confirm, because it uses plan quota, under the Claude Code profile you pick — default: the default profile; after a Claude Code version change Doctor offers it), `lil --confirm-window` (§3.3), `lil --non-interactive` (ARCH-055), `lil backup --scheduled` and `lil secret get` (§7.4), `lil test --real` (§6.4), `lil dev merge` (§6), and in M1.5 `lil statusline` (§4.7) and `lil lfs-agent` (§7.2).
+- **ARCH-017** [M1] The windowless launcher runs `lil` commands from Task Scheduler (e.g. `lil backup --scheduled`) without a console window. It may start the core (§7.4).
 
 **Starting and stopping the core**
-- **ARCH-018** [M1] Apps and `ww-mcp` start the core if none is running. `ww` invocations from Claude Code hooks pass `--no-start` and are a silent no-op when no core is running.
-  - Consequence: while Claude Code has the Worldwright MCP server loaded, the core stays alive. That's cheap; engines idle down separately.
+- **ARCH-018** [M1] Apps and `lil-mcp` start the core if none is running. `lil` invocations from Claude Code hooks pass `--no-start` and are a silent no-op when no core is running.
+  - Consequence: while Claude Code has the LILITH MCP server loaded, the core stays alive. That's cheap; engines idle down separately.
 - **ARCH-019** [M1] The core is spawned detached. The spawner first tries `CREATE_BREAKAWAY_FROM_JOB` and, on access denied, retries without it; the core's life is then tied to its launcher's job, which is acceptable because jobs are persisted and the next client restarts the core cleanly.
 - **ARCH-020** [M1] The core exits after 10 minutes idle, and only when all of these hold: no connected clients; no queued or running jobs (director tasks are jobs); no pending confirmations (including cap confirmations); no outside jobs queued or running in ComfyUI (polled via `/api/jobs`). Once leases exist (ARCH-092), no active leases is added to this list.
 - **ARCH-021** [M1] (invariant) Graceful shutdown runs in this order:
@@ -137,35 +137,35 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
 
 ### 1.2 Connections
 
-- **ARCH-024** [M1] (contract) The core listens on the named pipe `\\.\pipe\worldwright-core-<userSID>-<channel>`. Channels:
+- **ARCH-024** [M1] (contract) The core listens on the named pipe `\\.\pipe\lilith-core-<userSID>-<channel>`. Channels:
 
   | Channel | Used by |
   |---|---|
-  | `stable` | the installed suite, Velopack pack id `WorldwrightSuite` |
-  | `dev` | development builds, pack id `WorldwrightSuite.Dev` |
+  | `stable` | the installed suite, Velopack pack id `LILITHSuite` |
+  | `dev` | development builds, pack id `LILITHSuite.Dev` |
   | `test-<id>` | each test run (§6.3) |
 
   Dev builds and parallel tests therefore never collide with the installed suite. (plan 2 clarification: Appendix D)
 - **ARCH-025** [M1] (contract) The protocol is newline-delimited JSON-RPC 2.0 over stateful connections.
 - **ARCH-026** [M1] (invariant) Every pipe instance carries a security descriptor (SDDL) granting access only to the current user's SID and SYSTEM. The core creates its first instance with `first_pipe_instance(true)` as the singleton check and rejects remote clients. (The apps' own single-instance pipes use the same descriptor, §3.1.)
 - **ARCH-027** [M1] (invariant) Before trusting a pipe, a client verifies the server: `GetNamedPipeServerProcessId` → open that process immediately → its token user must be the current user, and its image path must be the install directory or, for dev builds, the client's own directory.
-- **ARCH-028** [M1] The core holds `LockFileEx` on `<workspace>\.worldwright\core.lock` for each workspace it serves. A second core (another channel) that finds the lock held gets read-only access to that workspace.
-- **ARCH-029** [M1] (contract) The mandatory first call on every connection is the handshake `core/hello`, callable by every caller kind (apps, `ww`, `ww-mcp`, Engine A). Its parameters: protocol `major.minor`, build id, schema hash, capabilities, declared caller kind, whether the caller is non-interactive (ARCH-055), workspace id (explicit, or `"none"`), and for Engine A connections the per-launch engine token and the Claude Code profile id (`WW_PROFILE`, §4.6a).
+- **ARCH-028** [M1] The core holds `LockFileEx` on `<workspace>\.lilith\core.lock` for each workspace it serves. A second core (another channel) that finds the lock held gets read-only access to that workspace.
+- **ARCH-029** [M1] (contract) The mandatory first call on every connection is the handshake `core/hello`, callable by every caller kind (apps, `lil`, `lil-mcp`, Engine A). Its parameters: protocol `major.minor`, build id, schema hash, capabilities, declared caller kind, whether the caller is non-interactive (ARCH-055), workspace id (explicit, or `"none"`), and for Engine A connections the per-launch engine token and the Claude Code profile id (`LIL_PROFILE`, §4.6a).
   - Major version mismatch → refused (`protocol.incompatible`); minor mismatch → the session uses the shared capabilities; unknown parameters → rejected.
   - (plan 2 clarification) The `core/hello` method and its `protocol` field never change, and the core reads `protocol` before checking any other field. Other hello fields change only with a major version; a minor version adds features only as new `capabilities` strings (Appendix D).
 - **ARCH-030** [M1] (contract) Which workspace a call uses:
   - `mcp` callers: the call's explicit workspace argument, else the workspace containing Claude Code's working directory, else the default workspace in `suite.toml`;
   - Engine A (`assistant`) connections: the workspace id from the handshake (or `"none"`), which overrides the working-directory rule;
   - apps: the workspace chosen in the session (`core/hello`, `app/set_context`);
-  - `cli` callers (`ww`): the explicit `--workspace` argument, else the workspace containing the current directory, else the default workspace in `suite.toml`.
+  - `cli` callers (`lil`): the explicit `--workspace` argument, else the workspace containing the current directory, else the default workspace in `suite.toml`.
 - **ARCH-031** [M1] (contract) Method namespaces:
   - `core/hello` — the handshake (ARCH-029), open to every caller kind;
   - `tools/*` — the agent-visible tool registry, filtered per caller (e.g. Engine A's permission-prompt tool `approve` is exposed only to engine connections, §4.6);
-  - `app/*` — only what is specific to a running app: session, document hold and save, activation and open requests, confirmation answers and `caps.set` (§3.3). `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `ww` and tests;
-  - `ww/subscribe`, `ww/unsubscribe` and the `ww/event` notification.
+  - `app/*` — only what is specific to a running app: session, document hold and save, activation and open requests, confirmation answers and `caps.set` (§3.3). `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `lil` and tests;
+  - `lil/subscribe`, `lil/unsubscribe` and the `lil/event` notification.
 
   (plan 2 clarification) `core/drain` asks for "drain and exit when safe" (ARCH-023). On a connection whose `core/hello` was refused with `protocol.incompatible`, it is the only call allowed, and only from a client whose major version is greater than the core's. Its name, parameters and result never change (Appendix D).
-- **ARCH-032** [M1] (contract) `ww/subscribe(topics, since_seq)` delivers `ww/event` notifications with per-topic sequence numbers. The core keeps 10 minutes of history per topic; a cursor older than that gets a snapshot instead. Each client has a bounded queue; overflow sends `resync_required`. External file edits and git activity arrive on the same stream. Topics include `asset:<ref>` for live links. (plan 2b clarification: Appendix E) The history is also capped at 1024 events per topic; an older cursor gets a snapshot.
+- **ARCH-032** [M1] (contract) `lil/subscribe(topics, since_seq)` delivers `lil/event` notifications with per-topic sequence numbers. The core keeps 10 minutes of history per topic; a cursor older than that gets a snapshot instead. Each client has a bounded queue; overflow sends `resync_required`. External file edits and git activity arrive on the same stream. Topics include `asset:<ref>` for live links. (plan 2b clarification: Appendix E) The history is also capped at 1024 events per topic; an older cursor gets a snapshot.
 - **ARCH-033** [M1] (invariant) Bulk data never goes through the pipe. Calls and events carry file references into the workspace or into a staging/cache folder on the same volume (so ingest is a rename). Small previews (≤ 1 MB) may ride in events. No shared memory.
 - **ARCH-034** [M1] (contract) Long-running work returns a job id immediately.
 - **ARCH-035** [M1] (contract) Every mutating or metered call carries an idempotency key, which the core dedupes and persists with the job (scope and same-key rules in §2.2; Engine A uses session id + tool-use id, §4.6).
@@ -179,9 +179,9 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
 - **ARCH-041** [Later] Further lowering targets (OpenAI strict, Gemini, others) are added with the engines that need them.
 
 **Interchange primitives** (used by later sections)
-- **ARCH-042** [M1] (contract) The canonical asset reference is `ww://<workspace>/<project>/<asset>@<version>`, mapping 1:1 to the manifest link syntax. Candidates are referenced as `ww://<workspace>/<project>/<asset>@candidate/<run>/<file>` for viewing and provenance only — never as live links or recipe inputs.
-  - From M1, every reference to a version — `ww://` refs, `.wwref` files, exports and engine-import records — also carries the target version's SHA-256 content hash (field defined with the schema, §2). Resolving a reference through `renamed_from` comes with multi-machine Sync (ARCH-087).
-- **ARCH-043** [M1] (contract) Clipboard and drag-and-drop carry refs under the MIME type `application/x-worldwright-ref`.
+- **ARCH-042** [M1] (contract) The canonical asset reference is `lil://<workspace>/<project>/<asset>@<version>`, mapping 1:1 to the manifest link syntax. Candidates are referenced as `lil://<workspace>/<project>/<asset>@candidate/<run>/<file>` for viewing and provenance only — never as live links or recipe inputs.
+  - From M1, every reference to a version — `lil://` refs, `.wwref` files, exports and engine-import records — also carries the target version's SHA-256 content hash (field defined with the schema, §2). Resolving a reference through `renamed_from` comes with multi-machine Sync (ARCH-087).
+- **ARCH-043** [M1] (contract) Clipboard and drag-and-drop carry refs under the MIME type `application/x-lilith-ref`.
 - **ARCH-044** [M1] (contract) Live links subscribe to the event topic `asset:<ref>`. (plan 2b clarification: Appendix E) The topic of a ref is `asset:` plus the ref without its `@<version>` and hash, so one subscription sees every version.
 
 Defined elsewhere: proposal references `doc:<doc_id>/proposal/<run_id>/<n>` (§5.5); the app handler registry, `open_in` and `ui.show` (§3.4); converters as tools (§2.10); checkout/checkin with the first interactive engine (*later*).
@@ -192,13 +192,13 @@ All enforcement happens in the core's dispatcher (§2.2).
 
 **Caller identity — verified, not trusted**
 - **ARCH-045** [M1] (contract) Every connection has exactly one caller kind: `ui:<app>`, `assistant`, `mcp` or `cli`. The core decides it from `GetNamedPipeClientProcessId` and the handshake, never from the declared kind alone.
-- **ARCH-046** [M1] (invariant) A connection is `ui:<app>` only if the client process is a Worldwright app executable from the install directory (or the dev directory for dev builds).
-- **ARCH-047** [M1] A connection is `mcp` only if the client process is `ww-mcp.exe` from the install directory or the per-user bin folder (`%LOCALAPPDATA%\Worldwright\bin\`), with a best-effort check that a `claude.exe` is its parent or grandparent.
+- **ARCH-046** [M1] (invariant) A connection is `ui:<app>` only if the client process is a LILITH app executable from the install directory (or the dev directory for dev builds).
+- **ARCH-047** [M1] A connection is `mcp` only if the client process is `lil-mcp.exe` from the install directory or the per-user bin folder (`%LOCALAPPDATA%\LILITH\bin\`), with a best-effort check that a `claude.exe` is its parent or grandparent.
 - **ARCH-048** [M1] (invariant) A connection is `assistant` (`engine: claude_code`, with the conversation's workspace id) when it presents a valid per-launch engine token. The token is unguessable and issued per `claude` process; the core holds that process's handle, so its PID can't be reused. A token that is forged, reused or belongs to a `claude` process that has ended is invalid, and calls presenting it are refused (ARCH-050).
-- **ARCH-049** [M1] (invariant) The engine token is never in `claude`'s environment (it would leak into every command the agent runs). It reaches `ww-mcp` only through the core-generated MCP config entry's `env` (§4.6).
+- **ARCH-049** [M1] (invariant) The engine token is never in `claude`'s environment (it would leak into every command the agent runs). It reaches `lil-mcp` only through the core-generated MCP config entry's `env` (§4.6).
 - **ARCH-050** [M1] A connection that presents an invalid engine token is refused — it is never downgraded to `cli`. Every other connection that isn't `ui:<app>`, `mcp` or `assistant` is `cli`.
 
-The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` claiming Claude Code already confirmed something), not against malware running as you.
+The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` claiming Claude Code already confirmed something), not against malware running as you.
 
 **Effect classes and agent safety confirmations**
 - **ARCH-051** [M1] (contract) Every tool declares one effect class: `read | write | destructive | exec` (definitions in §2.7). In short: `destructive` = delete, purge trash, overwrite outside the version system, or an agent-initiated engine stop/restart that would kill outside jobs; `exec` = install nodes or packages, run scripts or arbitrary code, download executable formats.
@@ -209,8 +209,8 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 
   `cli`, `mcp` and `assistant` connections can never answer, and a caller-supplied `confirm: true` is never accepted. Every answer records how it was given (`app` or `claude_code`).
 - **ARCH-054** [M1] For interactive Claude Code sessions (`mcp`), the core marks `destructive` and `exec` tools with `_meta["anthropic/requiresUserInteraction"]: true`, so Claude Code prompts you every time and its hooks can't auto-allow. That prompt is the confirmation (recorded `confirmed_via: claude_code`), so you aren't asked twice. The core decides this per connection: for Engine A connections the tools aren't marked and the core's own confirmations apply (§4.6).
-- **ARCH-055** [M1] A call that needs your confirmation or a cap decision returns `pending_confirmation` with a confirmation id and retry token whenever a confirmation can be answered — an app is connected or the notification path can reach you. When no app is open, the core posts a Windows notification; clicking it opens `ww:confirm/<id>` (§3.3). The core never draws a dialog of its own.
-  - Callers that declare themselves non-interactive in the handshake (`ww --non-interactive`, scheduled tasks) get an error instead: `cap.exceeded` for caps, `confirm.unavailable` for agent safety confirmations (§6.1).
+- **ARCH-055** [M1] A call that needs your confirmation or a cap decision returns `pending_confirmation` with a confirmation id and retry token whenever a confirmation can be answered — an app is connected or the notification path can reach you. When no app is open, the core posts a Windows notification; clicking it opens `lil:confirm/<id>` (§3.3). The core never draws a dialog of its own.
+  - Callers that declare themselves non-interactive in the handshake (`lil --non-interactive`, scheduled tasks) get an error instead: `cap.exceeded` for caps, `confirm.unavailable` for agent safety confirmations (§6.1).
 
 **Caps, paid nodes, deletes, installs**
 - **ARCH-056** [M1] (invariant) Spending caps are optional (off by default) and suite-level. Only a verified UI action (`app/caps.set`) changes them; agents can't. Enforcement is reserve-then-settle, atomic (§2.6); caps also count calls made without a workspace, so reservations live in the suite-level `state.db` (§1.6). A call that needs both a confirmation and a cap decision gets one prompt covering both.
@@ -258,24 +258,24 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 
   The file watcher covers the small window between steps 1 and 3. (plan 2b clarification: Appendix E; replaces "with write-through" in step 3) `ReplaceFileW` has no write-through flag (`REPLACEFILE_WRITE_THROUGH` is documented as not supported), and its target, replacement and backup must be on one volume. The temp file is flushed before the swap. Renames are atomic (journaled) but may be lost on power failure (`MOVEFILE_WRITE_THROUGH` is documented to flush only a move done as a copy and delete), so the store records the pending old and new hashes first and accepts either version as its own. No rename replaces an existing file. The outside-edit window is closed by checking the replaced file's backup, and recovery never leaves an outside edit only in a backup file (Appendix E).
 - **ARCH-075** [M1] (invariant) Each operation writes in a fixed order: output file → manifest → jobs log line → index. On startup, outputs with no manifest entry (a crash mid-sequence) are listed as orphans for review and never deleted. (plan 2b clarification: Appendix E) The `progress.md` entry (CORE-020) comes between the jobs log line and the index; events go out last.
-- **ARCH-076** [M1] (invariant) Manifests round-trip losslessly: JSON is parsed with key order preserved (`serde_json` `preserve_order`) into typed structs that keep unknown fields in a flattened extras map, and written back with minimal diffs. Manifests carry `schema_version`; schema violations are warnings, not failures. YAML files (`worldwright.yaml`, `registry/*.yaml`) are changed with targeted edits that keep comments and order. (plan 2b clarification: Appendix E) The typed structs are views over the ordered map, which keeps unknown fields in their original place.
+- **ARCH-076** [M1] (invariant) Manifests round-trip losslessly: JSON is parsed with key order preserved (`serde_json` `preserve_order`) into typed structs that keep unknown fields in a flattened extras map, and written back with minimal diffs. Manifests carry `schema_version`; schema violations are warnings, not failures. YAML files (`lilith.yaml`, `registry/*.yaml`) are changed with targeted edits that keep comments and order. (plan 2b clarification: Appendix E) The typed structs are views over the ordered map, which keeps unknown fields in their original place.
 - **ARCH-077** [M1] Golden round-trip tests use real workspace files, including the lantern manifest. (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
 - **ARCH-078** [M1] The core records the SHA-256 of every file it writes as that file's last generated hash; human-edit detection compares against it (LFS pointers by `oid`). SHA-256 is the only content hash.
-- **ARCH-079** [M1] The file watcher uses `ReadDirectoryChangesW` and does a full rescan on buffer overflow. An outside edit to a candidate or sealed file is recorded as a human edit and offered as a new version. `work/` (working documents) is excluded from human-edit tracking, and `.worldwright\staging\` is excluded from the watcher. An invalid manifest is marked "needs repair" and never rewritten. (plan 2b clarification: Appendix E) A hash counts only when the file's identity is the same before and after the read; an unstable or locked file is parked and re-checked, never recorded as a human edit or a removal. A directory event reconciles the folder's subtree. A human edit already recorded with the same SHA-256 isn't recorded again. A file the suite still expects on disk (listed in `hashes`, a file of an open run, or a manifest) that disappears is `missing` until the same content reappears (with CORE-038); the suite's own moves (sign-off, trash, maintenance) never make a file `missing`.
-- **ARCH-080** [M1] (invariant) Engines never write into versioned folders. Headless jobs write into staging handles issued by `store` (`<workspace>\.worldwright\staging\`, gitignored, same volume), and the core ingests their outputs as candidate runs (§2.3).
-- **ARCH-081** [M1] (contract) The append-only logs are per machine and per month: `queue/jobs.<machine>.<yyyy-mm>.jsonl` and `registry/usage.<machine>.<yyyy-mm>.jsonl`. Calls made with no workspace open go to `%LOCALAPPDATA%\Worldwright\usage-loose.jsonl`.
-  - Appends take a cross-process lock that `ww` can also take; each line is one write and carries a `seq`; readers repair a torn last line and dedupe by `(machine, seq)`.
+- **ARCH-079** [M1] The file watcher uses `ReadDirectoryChangesW` and does a full rescan on buffer overflow. An outside edit to a candidate or sealed file is recorded as a human edit and offered as a new version. `work/` (working documents) is excluded from human-edit tracking, and `.lilith\staging\` is excluded from the watcher. An invalid manifest is marked "needs repair" and never rewritten. (plan 2b clarification: Appendix E) A hash counts only when the file's identity is the same before and after the read; an unstable or locked file is parked and re-checked, never recorded as a human edit or a removal. A directory event reconciles the folder's subtree. A human edit already recorded with the same SHA-256 isn't recorded again. A file the suite still expects on disk (listed in `hashes`, a file of an open run, or a manifest) that disappears is `missing` until the same content reappears (with CORE-038); the suite's own moves (sign-off, trash, maintenance) never make a file `missing`.
+- **ARCH-080** [M1] (invariant) Engines never write into versioned folders. Headless jobs write into staging handles issued by `store` (`<workspace>\.lilith\staging\`, gitignored, same volume), and the core ingests their outputs as candidate runs (§2.3).
+- **ARCH-081** [M1] (contract) The append-only logs are per machine and per month: `queue/jobs.<machine>.<yyyy-mm>.jsonl` and `registry/usage.<machine>.<yyyy-mm>.jsonl`. Calls made with no workspace open go to `%LOCALAPPDATA%\LILITH\usage-loose.jsonl`.
+  - Appends take a cross-process lock that `lil` can also take; each line is one write and carries a `seq`; readers repair a torn last line and dedupe by `(machine, seq)`.
   - No `merge=union` and no rotation moves: a new month starts a new file.
   - Live queue state is held by the core (the per-workspace `state.db`); the files are logs.
 - **ARCH-082** [M1] There is no usage ledger: usage records go only to the usage logs (ARCH-081). An existing `registry/ledger.csv` is left alone and never written.
 - **ARCH-083** [M1] The core detects outside git activity (`.git/index.lock`, HEAD changes), queues its writes for up to 60 s, and resumes after a rescan once git is done.
 - **ARCH-084** [M1] The core commits to git when you press Sync (§7.3) or ask (the checkpoint tool, a plain `write` tool), and optionally on app close or when idle if you turn that setting on; never silently otherwise. During Sync, its writes pause only for Sync's own commit, merge and checkout steps (backups also pause them for seconds, OPS-074).
-- **ARCH-085** [M1] Without an LFS server there are no LFS locks, so `ww doctor` sets `lfs.setlockablereadonly=false` in the repo config; checkout locking will use core leases when they arrive (ARCH-092, Later). LFS pointer files that haven't been fetched are marked `not_fetched`, never treated as corrupt.
+- **ARCH-085** [M1] Without an LFS server there are no LFS locks, so `lil doctor` sets `lfs.setlockablereadonly=false` in the repo config; checkout locking will use core leases when they arrive (ARCH-092, Later). LFS pointer files that haven't been fetched are marked `not_fetched`, never treated as corrupt.
 - **ARCH-086** [M1] (contract) `.gitattributes` LFS patterns don't depend on where large files are stored; the large-file store is a per-workspace setting kept in each clone's own git config (§7.2).
 - **ARCH-087** [M1.5] (invariant) Sealed versions never get suffixes. When Sync finds a local sealed version that also exists remotely, it renumbers the local one before the merge and records `renamed_from` (§7.3). From then on references resolve through `renamed_from`, using the content hash they carry from M1 (ARCH-042).
-- **ARCH-088** [M1] The active project is per client session. `.worldwright\state.json` is only an untracked last-used hint.
+- **ARCH-088** [M1] The active project is per client session. `.lilith\state.json` is only an untracked last-used hint.
 - **ARCH-089** [M1] The index is a disposable SQLite database (`index.db`, WAL, schema-versioned). It is rebuilt on a schema mismatch or a failed `quick_check`, and reconciled by path + size + mtime + NTFS FileId + ChangeTime, hashing only changed files. (plan 2b clarification: Appendix E) FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders.
-- **ARCH-090** [M1] `%APPDATA%\Worldwright\suite.toml` lists the known workspaces and the default one; one core serves them all. M1 supports one workspace, but the workspace id is in every request from the start.
+- **ARCH-090** [M1] `%APPDATA%\LILITH\suite.toml` lists the known workspaces and the default one; one core serves them all. M1 supports one workspace, but the workspace id is in every request from the start.
 - **ARCH-091** [Later] Multiple workspaces served by one core.
 - **ARCH-092** [Later] Leases, with checkout/checkin: one lease record (holder, purpose, expiry; renewed by bridge heartbeat or an observed save) persisted in the manifest's `leases` extension field (the workspace format's `locks` path list is unchanged), so leases survive restarts and the plugin can see them.
 - **ARCH-093** [M1.5] Document checkpoints across machines upload to the cloud large-file store's `docs/` prefix (§7.2; needs an S3-compatible store), never to git — there is no git side ref. Local rolling snapshots (§3.5) are M1 and need no cloud store.
@@ -284,19 +284,19 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 
 | Location | Contents |
 |---|---|
-| `<workspace>\` | The workspace: a local git repo with LFS (§7). Core-owned extras: `.worldwright\core.lock`, `.worldwright\staging\` (gitignored), `.worldwright\state.json` (untracked hint), `.trash\` (gitignored). |
-| `%APPDATA%\Worldwright\` | `suite.toml` (workspaces, default workspace, caps, display currency and dated exchange rates, fixed recurring costs, PSU efficiency, rest-of-system power baseline, electricity rate, the assistant engine choice, Claude Code profiles and labels; CORE-007); `providers\` (`providers.yaml`, `prices.yaml`, §4.1); `resources\` (personal Library resources, §3.4); the encrypted rclone config (§7.4). |
-| `%LOCALAPPDATA%\Worldwright\` | Suite-level `state.db` (cap reservations — caps are suite-wide and count no-workspace calls — and other state not tied to one workspace); machine-level `telemetry.db` (per-job rows tagged with the workspace); `usage-loose.jsonl`; `logs\`; `recovery\<app>\`; `bin\ww-mcp.exe`; `claude-profiles\<id>\`; `backup-stage\`; `pre-migration\<timestamp>\`; suite-level caches. |
-| `%LOCALAPPDATA%\Worldwright\workspaces\<workspace-hash>\` | Per-workspace local data, for a workspace on the same volume as `%LOCALAPPDATA%`: the document snapshot store, caches, `index.db`, per-workspace `state.db` (workspace state only), local proposals storage, `thumbs\`, `assistant\` (conversations). |
-| `<volume>:\.worldwright-local\<workspace-hash>\` | The same per-workspace local data, for a workspace on a different volume from `%LOCALAPPDATA%` — a Dev Drive (optional; creating one is a one-time admin step, §7.2) or any other drive — so hardlinked snapshots and rename-on-ingest stay on one volume. Staging is never here: it stays in `<workspace>\.worldwright\staging\`. |
+| `<workspace>\` | The workspace: a local git repo with LFS (§7). Core-owned extras: `.lilith\core.lock`, `.lilith\staging\` (gitignored), `.lilith\state.json` (untracked hint), `.trash\` (gitignored). |
+| `%APPDATA%\LILITH\` | `suite.toml` (workspaces, default workspace, caps, display currency and dated exchange rates, fixed recurring costs, PSU efficiency, rest-of-system power baseline, electricity rate, the assistant engine choice, Claude Code profiles and labels; CORE-007); `providers\` (`providers.yaml`, `prices.yaml`, §4.1); `resources\` (personal Library resources, §3.4); the encrypted rclone config (§7.4). |
+| `%LOCALAPPDATA%\LILITH\` | Suite-level `state.db` (cap reservations — caps are suite-wide and count no-workspace calls — and other state not tied to one workspace); machine-level `telemetry.db` (per-job rows tagged with the workspace); `usage-loose.jsonl`; `logs\`; `recovery\<app>\`; `bin\lil-mcp.exe`; `claude-profiles\<id>\`; `backup-stage\`; `pre-migration\<timestamp>\`; suite-level caches. |
+| `%LOCALAPPDATA%\LILITH\workspaces\<workspace-hash>\` | Per-workspace local data, for a workspace on the same volume as `%LOCALAPPDATA%`: the document snapshot store, caches, `index.db`, per-workspace `state.db` (workspace state only), local proposals storage, `thumbs\`, `assistant\` (conversations). |
+| `<volume>:\.lilith-local\<workspace-hash>\` | The same per-workspace local data, for a workspace on a different volume from `%LOCALAPPDATA%` — a Dev Drive (optional; creating one is a one-time admin step, §7.2) or any other drive — so hardlinked snapshots and rename-on-ingest stay on one volume. Staging is never here: it stays in `<workspace>\.lilith\staging\`. |
 | `%LOCALAPPDATA%\<packId>\` | The Velopack install folder (§7.5). |
-| `HKCU\Software\Worldwright` | The install record. |
+| `HKCU\Software\LILITH` | The install record. |
 | Windows Credential Manager | Secrets (ARCH-061). |
 
 - **ARCH-094** [M1] (invariant) No suite data ever lives in an install folder. Velopack deletes the whole folder on a fresh install over it or an uninstall, and replaces `current\` on update.
 - **ARCH-095** [M1] (invariant) Every path, registry root, Credential Manager target, pipe name and notification identity is resolved through one injectable environment provider keyed by channel (§6.3). No code reads `%APPDATA%`, `%LOCALAPPDATA%` or other known folders directly. (plan 1 clarification: the per-channel data-folder, registry, credential and workspace-hash naming is a contract, defined under QA-038.)
 - **ARCH-096** [M1] (invariant) Machine-local state — `index.db`, `state.db`, `telemetry.db`, caches, recovery files, proposals and snapshots — is never committed or synced between machines.
-- **ARCH-097** [M1] (contract) Per-workspace local data (snapshot store, caches, `index.db`, per-workspace `state.db`, local proposals storage) lives in `%LOCALAPPDATA%\Worldwright\workspaces\<workspace-hash>\` when the workspace is on the same volume as `%LOCALAPPDATA%`, and in `<volume>:\.worldwright-local\<workspace-hash>\` when it is on any other volume. The snapshot store is therefore always on the workspace's volume and snapshot layers are hardlinked; they're copied only where the file system can't hardlink (§3.5). The workspace's own `<workspace>\.worldwright\staging\` stays inside the workspace.
+- **ARCH-097** [M1] (contract) Per-workspace local data (snapshot store, caches, `index.db`, per-workspace `state.db`, local proposals storage) lives in `%LOCALAPPDATA%\LILITH\workspaces\<workspace-hash>\` when the workspace is on the same volume as `%LOCALAPPDATA%`, and in `<volume>:\.lilith-local\<workspace-hash>\` when it is on any other volume. The snapshot store is therefore always on the workspace's volume and snapshot layers are hardlinked; they're copied only where the file system can't hardlink (§3.5). The workspace's own `<workspace>\.lilith\staging\` stays inside the workspace.
 
 ### 1.7 Standalone use and the Claude Code plugin
 
@@ -305,39 +305,39 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 - **ARCH-099** [M1] No-workspace mode: loose files outside any workspace are read and written by the app itself (documents as `.wwdoc`, §3.5). The core still offers providers and engines but writes no workspace files. Metered calls are allowed, logged to `usage-loose.jsonl` and counted against caps.
 - **ARCH-100** [M1] If the core is unavailable or the wrong version, the app keeps the open document, keeps autosaving to its recovery file, and disables AI and workspace features with a clear banner. When the core is back, the app re-acquires its document holds, resubscribes from its last `seq` (or reloads snapshots), and saves working documents changed meanwhile with a hash check against the last saved hash (conflict → keep both).
 
-**The Worldwright plugin for Claude Code**
-- **ARCH-101** [M1] (decision) The Worldwright Claude Code plugin 1.3 is the suite's plugin — MCP server plus hooks — shipped with the suite, with its source in the suite repo. It replaces the current 1.2.0 file-based plugin; its skills, output style and subagents are rewritten for the personal hobby suite (§2.12).
-- **ARCH-102** [M1] When a core is running, every state-changing step (new version, sign-off, transfer, promote, job, usage record) goes through the suite's MCP tools; direct file reads stay allowed. Skills detect a running suite with `ww status --no-start`, not by whether MCP tools are present. With no core running, the plugin falls back to working directly on workspace files.
-- **ARCH-103** [M1] Hooks: PostToolUse on Write/Edit under the workspace runs `ww notify --no-start <path>`; SessionStart reports the active project, open jobs and pending confirmations; Notification forwards Claude Code notices to Windows notifications via the suite (§4.7).
-- **ARCH-104** [M1] A PreToolUse hook guards direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json`. It starts **warn-only**; once every plugin skill has a matching tool it becomes **deny while a core is running** (checked with `ww status --no-start`) and stays allowed when no core runs, so skills can still work on files directly (ARCH-102). `ww doctor` lists skills still writing directly.
+**The `worldwright` plugin for Claude Code**
+- **ARCH-101** [M1] (decision) The `worldwright` plugin 1.3 for Claude Code is the suite's plugin — MCP server plus hooks — shipped with the suite, with its source in the suite repo. It replaces the current 1.2.0 file-based plugin; its skills, output style and subagents are rewritten for the personal hobby suite (§2.12).
+- **ARCH-102** [M1] When a core is running, every state-changing step (new version, sign-off, transfer, promote, job, usage record) goes through the suite's MCP tools; direct file reads stay allowed. Skills detect a running suite with `lil status --no-start`, not by whether MCP tools are present. With no core running, the plugin falls back to working directly on workspace files.
+- **ARCH-103** [M1] Hooks: PostToolUse on Write/Edit under the workspace runs `lil notify --no-start <path>`; SessionStart reports the active project, open jobs and pending confirmations; Notification forwards Claude Code notices to Windows notifications via the suite (§4.7).
+- **ARCH-104** [M1] A PreToolUse hook guards direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json`. It starts **warn-only**; once every plugin skill has a matching tool it becomes **deny while a core is running** (checked with `lil status --no-start`) and stays allowed when no core runs, so skills can still work on files directly (ARCH-102). `lil doctor` lists skills still writing directly.
 - **ARCH-105** [M1] PreToolUse hooks return "ask" for Bash/PowerShell commands matching delete, install or script-run patterns and for the comfy MCP's install, update, download and restart tools (pattern list in §2.7).
 - **ARCH-106** [M1] Writes made through Bash, PowerShell or other MCP servers aren't hooked as writes; the reconciler absorbs them (ARCH-079). The comfy MCP's launch and stop tools are removed from the plugin config.
-- **ARCH-107** [M1] The plugin's hooks don't load in Engine A; if they run in some configuration, they see `WW_ENGINE=1` and do nothing.
-- **ARCH-108** [M1] The plugin is installed per Claude Code profile (config folder). Every profile's plugin points at the same fixed `ww-mcp.exe`, so all profiles connect to the same suite. `ww doctor` checks each profile and offers to install or update the plugin there, asking first (§4.6a).
+- **ARCH-107** [M1] The plugin's hooks don't load in Engine A; if they run in some configuration, they see `LIL_ENGINE=1` and do nothing.
+- **ARCH-108** [M1] The plugin is installed per Claude Code profile (config folder). Every profile's plugin points at the same fixed `lil-mcp.exe`, so all profiles connect to the same suite. `lil doctor` checks each profile and offers to install or update the plugin there, asking first (§4.6a).
 
 ### 1.8 Repo layout
 
 - **ARCH-109** [M1] (decision) The code lives in the repo `Worldwright-Suite` (public on GitHub since Amendment A, 2026-10-13; worked on in a local clone, `<repo>`): suite source, this spec, tests and small fixtures, the Claude Code plugin source and build scripts (§7.1).
-  - Protected-test enforcement is layered: agents merge only through `ww dev merge`, git hooks refuse a merge that fails the protected-test check, server-side rulesets on the public repository require the CI checks and block force-pushes and deletion of `main`, and CI re-checks `main` after every merge (owned by §6).
+  - Protected-test enforcement is layered: agents merge only through `lil dev merge`, git hooks refuse a merge that fails the protected-test check, server-side rulesets on the public repository require the CI checks and block force-pushes and deletion of `main`, and CI re-checks `main` after every merge (owned by §6).
 - **ARCH-110** [M1] Few crates with clear modules; a module is split into its own crate once its boundary has proven itself.
 
 | Crate | Contents |
 |---|---|
-| `ww-schema` | Workspace-format types (lossless round-trip; `docs/reference/workspace-format.md`), link syntax and `ww://` refs, schema generation |
-| `ww-protocol` | RPC methods, events, result and error types (§6.1), effect classes `read \| write \| destructive \| exec`, protocol version, tool descriptors and lowering |
-| `ww-client` | SDK for apps, `ww-mcp` and `ww`: find/start the core, verify the server, handshake, reconnect, resubscribe, idempotency keys |
-| `ww-core` | modules `store`, `watch`, `index`, `state`, `graph`, `projects`, `pipeline`, `settings`, `meter`, `accounts`, `telemetry`, `confirm`, `jobs` (with the GPU scheduler), `engines`, `providers`, `secrets`, `qa`, `convert`, `library`, `docs`, `resources`, `interchange`, `sync`, `lfs_store`, `backup`, `assistant` (supervises Claude Code processes), `prompt` (Prompt Studio, §4.7a), `tools` (registry and dispatcher), `mod_image`; `imports` *(later)* — one-line roles in §2.1 |
+| `lil-schema` | Workspace-format types (lossless round-trip; `docs/reference/workspace-format.md`), link syntax and `lil://` refs, schema generation |
+| `lil-protocol` | RPC methods, events, result and error types (§6.1), effect classes `read \| write \| destructive \| exec`, protocol version, tool descriptors and lowering |
+| `lil-client` | SDK for apps, `lil-mcp` and `lil`: find/start the core, verify the server, handshake, reconnect, resubscribe, idempotency keys |
+| `lil-core` | modules `store`, `watch`, `index`, `state`, `graph`, `projects`, `pipeline`, `settings`, `meter`, `accounts`, `telemetry`, `confirm`, `jobs` (with the GPU scheduler), `engines`, `providers`, `secrets`, `qa`, `convert`, `library`, `docs`, `resources`, `interchange`, `sync`, `lfs_store`, `backup`, `assistant` (supervises Claude Code processes), `prompt` (Prompt Studio, §4.7a), `tools` (registry and dispatcher), `mod_image`; `imports` *(later)* — one-line roles in §2.1 |
 | parser crate | platform-neutral parsers for untrusted input (clipboard/drag MIME payloads, workflows, metadata), with fuzz/property targets (§6.4) |
 | CPU compositor crate | the shared Rust CPU compositor used by the Image studio and the core (§5.3) |
 | platform crate | the only home of Windows API calls (§7.6) |
-| `ww-qt` | cxx-qt bridges: the `core` request singleton (`call` → request id, `cancel`, finished / failed / pending-confirmation signals), shared QObject list models (assets, jobs, confirmations, usage, telemetry, events, documents, resources) |
-| `ww-qt-shim` | C++: KDDockWidgets (Qt Quick) docking, `QQuickRhiItem` canvases, QtWebEngine view, clipboard/drag `QMimeData`, live-preview image provider, notification and `ww:` activation glue, monitor colour profile (a tablet event filter only if pen input is revived, IMG-046) — anything cxx-qt lacks |
-| `ww-ui-kit` | QML only: theme, shared shell and top bar, Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant panel, Diagnostics (with the Backups panel), the three shared dialogs (§3.1) |
-| `ww-testkit` | fixture workspaces (real lantern manifest), fake ComfyUI (HTTP + websocket, serving the pinned frontend), fake providers and recorded fixtures, fake `claude` (honours `CLAUDE_CONFIG_DIR`), git-ops simulator, handle-holding helper, fail points, watcher fence, injected clock and ids, the test environment provider, per-test pipe channel (§6.5) |
-| binaries | `ww-core`, `ww-mcp`, `ww`, `ww-image`, the windowless launcher; `ww-hub` *(later)* |
+| `lil-qt` | cxx-qt bridges: the `core` request singleton (`call` → request id, `cancel`, finished / failed / pending-confirmation signals), shared QObject list models (assets, jobs, confirmations, usage, telemetry, events, documents, resources) |
+| `lil-qt-shim` | C++: KDDockWidgets (Qt Quick) docking, `QQuickRhiItem` canvases, QtWebEngine view, clipboard/drag `QMimeData`, live-preview image provider, notification and `lil:` activation glue, monitor colour profile (a tablet event filter only if pen input is revived, IMG-046) — anything cxx-qt lacks |
+| `lil-ui-kit` | QML only: theme, shared shell and top bar, Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant panel, Diagnostics (with the Backups panel), the three shared dialogs (§3.1) |
+| `lil-testkit` | fixture workspaces (real lantern manifest), fake ComfyUI (HTTP + websocket, serving the pinned frontend), fake providers and recorded fixtures, fake `claude` (honours `CLAUDE_CONFIG_DIR`), git-ops simulator, handle-holding helper, fail points, watcher fence, injected clock and ids, the test environment provider, per-test pipe channel (§6.5) |
+| binaries | `lil-core`, `lil-mcp`, `lil`, `lil-image`, the windowless launcher; `lil-hub` *(later)* |
 
-- **ARCH-111** [M1] (invariant) `ww-schema` and `ww-protocol` have no Qt or Windows dependencies (checked by a dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, §6.2). Formats and the protocol are platform-neutral; Windows API calls live only in the platform crate. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test.)
-- **ARCH-112** [M1] (invariant) Within `ww-core`, file write, rename and remove APIs are disallowed by a per-crate `clippy.toml`, with a single allowance inside `store` (§6.2).
+- **ARCH-111** [M1] (invariant) `lil-schema` and `lil-protocol` have no Qt or Windows dependencies (checked by a dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, §6.2). Formats and the protocol are platform-neutral; Windows API calls live only in the platform crate. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test.)
+- **ARCH-112** [M1] (invariant) Within `lil-core`, file write, rename and remove APIs are disallowed by a per-crate `clippy.toml`, with a single allowance inside `store` (§6.2).
 - **ARCH-113** [M1] (invariant) The C++ shim only extracts raw clipboard and drag MIME bytes; all parsing happens in Rust, in the parser crate.
 - **ARCH-114** [M1] (decision) The build is CMake at the top level, using cxx-qt's documented CMake integration (`cxx_qt_import_crate`, built on Corrosion) for the Rust crates, plus KDDockWidgets, the C++ shim and `windeployqt`. Pinned: Qt 6.12 LTS with the Qt WebEngine release matching Qt 6.12 LTS (versioned separately; pinned in the M0 Qt-stack spike, ARCH-115, §6.6), cxx-qt 0.10, KDDockWidgets 2.4.1 (verified 2026-10-12). One planned upgrade per cxx-qt minor release; KDDockWidgets 2.5 when it ships (§3.1). (M0 result, 2026-10-12: Qt **6.12.0** (`msvc2022_64`) + Qt WebEngine **6.140.0** (Chromium 140 base), cxx-qt 0.10.0 with cxx-qt-cmake 0.10.0 (Corrosion v0.5.2), KDDockWidgets 2.4.1 (Qt Quick frontend). The stack passed on 6.12, so the Qt 6.11 fallback is not used. `docs/spikes/01-toolchain.md`, `02-qt-stack.md`.)
 - **ARCH-115** [M0] The stack spike must pass before M1 app work: cxx-qt 0.10 + KDDockWidgets 2.4.1 (Qt Quick) + a `QQuickRhiItem` shim + QtWebEngine + `windeployqt` on Qt 6.12 LTS with MSVC. If it fails on 6.12, fall back to Qt 6.11; the result fixes the Qt version for M1. (M0 result, 2026-10-12: PASS on Qt 6.12.0 + Qt WebEngine 6.140.0: all seven criteria in one scripted from-scratch run, zero build warnings at default settings, and the `windeployqt` output ran with Qt and MSVC off PATH. The Qt 6.11 fallback was not needed, so M1 is pinned to Qt 6.12.0 / WebEngine 6.140.0. `docs/spikes/02-qt-stack.md`.)
@@ -347,7 +347,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 
 ### 1.9 Observability
 
-- **ARCH-117** [M1] Every process writes `tracing` JSON logs to `%LOCALAPPDATA%\Worldwright\logs`, rolled, rotated and size-capped.
+- **ARCH-117** [M1] Every process writes `tracing` JSON logs to `%LOCALAPPDATA%\LILITH\logs`, rolled, rotated and size-capped.
 - **ARCH-118** [M1] (contract) A `trace_id` is carried from the app or MCP call through the core to the engine job.
 - **ARCH-119** [M1] Engine stdout/stderr is captured into the logs. Every process installs a panic hook.
 - **ARCH-120** [Later] Minidumps on crashes.
@@ -356,7 +356,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 
 ### 1.10 Milestone scope
 
-- **ARCH-123** [M1] (decision) M1 is the core, the Image studio (split M1a / M1b, §5.11) and `ww-mcp`, against **one workspace**, with **ComfyUI as the only managed engine**. In M1 this section also covers: metering of every external call, optional caps, account info for the providers configured in M1, hardware telemetry, both assistant engines (Claude Code as default, Anthropic API as the alternative) with multiple Claude Code profiles, the §3 M1 app shell and panels, and the §7 M1 repo, backup and installer work.
+- **ARCH-123** [M1] (decision) M1 is the core, the Image studio (split M1a / M1b, §5.11) and `lil-mcp`, against **one workspace**, with **ComfyUI as the only managed engine**. In M1 this section also covers: metering of every external call, optional caps, account info for the providers configured in M1, hardware telemetry, both assistant engines (Claude Code as default, Anthropic API as the alternative) with multiple Claude Code profiles, the §3 M1 app shell and panels, and the §7 M1 repo, backup and installer work.
 - **ARCH-124** [M1] (decision) Designed now so the protocol doesn't change later, but not built in M1:
   - M1.5: local LLM runtimes (ARCH-066), the loopback OpenTelemetry receiver (ARCH-007), multi-machine Sync (ARCH-087), document checkpoints (ARCH-093);
   - Later: the separate Hub app (ARCH-011), multiple workspaces (ARCH-091), leases and checkout/checkin (ARCH-092), interactive-engine bridges (ARCH-067), lowering beyond MCP and Anthropic Messages (ARCH-041), minidumps (ARCH-120).
@@ -365,15 +365,15 @@ The `mcp` and `assistant` checks protect against accidents (a stray `ww-mcp` cla
 
 ## 2. Core modules
 
-This section describes the modules inside `ww-core`, the headless Rust core service (§1). It covers how every tool call is processed, how assets, versions, candidates and proposals are stored, and how usage, cost, caps, accounts, hardware telemetry, agent safety confirmations, jobs, QA and conversion work. The suite is a personal-scale tool: it adds no content filter or IP screen of its own (each provider's and model's own policies apply), and it has no approval gates and no business machinery. What stays is tracking (usage, cost, tokens, energy), optional caps you set yourself, account information pulled from providers, and safety confirmations when an AI agent deletes, installs or runs something.
+This section describes the modules inside `lil-core`, the headless Rust core service (§1). It covers how every tool call is processed, how assets, versions, candidates and proposals are stored, and how usage, cost, caps, accounts, hardware telemetry, agent safety confirmations, jobs, QA and conversion work. The suite is a personal-scale tool: it adds no content filter or IP screen of its own (each provider's and model's own policies apply), and it has no approval gates and no business machinery. What stays is tracking (usage, cost, tokens, energy), optional caps you set yourself, account information pulled from providers, and safety confirmations when an AI agent deletes, installs or runs something.
 
 ### 2.0 Ground rules for all modules
 
-- **CORE-001** [M1] (invariant) Each module lives in `ww-core`, has one job and a narrow Rust interface, and has no knowledge of any UI.
+- **CORE-001** [M1] (invariant) Each module lives in `lil-core`, has one job and a narrow Rust interface, and has no knowledge of any UI.
 - **CORE-002** [M1] (invariant) Only `store` writes workspace files. Engines, converters and apps write only into write areas that `store` issues, and `store` moves the results into place.
-  - Lint: `ww-core` has a per-crate `clippy.toml` that disallows file write/rename/remove APIs, with a single allowance inside `store` (§6).
+  - Lint: `lil-core` has a per-crate `clippy.toml` that disallows file write/rename/remove APIs, with a single allowance inside `store` (§6).
 - **CORE-003** [M1] (contract) Three different things must not share a name:
-  - a **staging handle** is a write area `store` issues to engines and converters, in `<workspace>/.worldwright/staging/` (gitignored, excluded from the watcher, on the same volume so ingest is a rename);
+  - a **staging handle** is a write area `store` issues to engines and converters, in `<workspace>/.lilith/staging/` (gitignored, excluded from the watcher, on the same volume so ingest is a rename);
   - a **document save handle** is what `store` issues for a document save (`app/doc.stage`, §3.5);
   - a **proposal run** is a set of canvas generation results waiting to be accepted or discarded (§2.3, §5.5).
 - **CORE-004** [M1] (contract) Databases use `rusqlite` (bundled SQLite with FTS5 and JSON1), with one connection each in M1:
@@ -383,18 +383,18 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
   - Both `state.db` files use `synchronous=FULL` and forward-only migrations, and are never deleted automatically.
   - `telemetry.db` (machine level): hardware samples, with per-job rows tagged with their workspace (§2.5). It is disposable.
 - **CORE-005** [M1] (contract) Database and cache locations:
-  - per-workspace local data — the document snapshot store, caches including thumbnails (`thumbs\`), `index.db`, the per-workspace `state.db` and local proposal storage — normally lives in `%LOCALAPPDATA%\Worldwright\workspaces\<workspace-hash>\`;
-  - when the workspace is on a different volume from `%LOCALAPPDATA%` (a Dev Drive or any other drive), that data lives in `<volume>:\.worldwright-local\<workspace-hash>\` instead, so hardlinked snapshots and rename-on-ingest stay on one volume (§7.2);
-  - staging handles stay inside the workspace (`<workspace>\.worldwright\staging\`, CORE-003), which is on the workspace's volume by construction;
-  - suite-level `state.db`: `%LOCALAPPDATA%\Worldwright\state.db`;
-  - `telemetry.db`: `%LOCALAPPDATA%\Worldwright\telemetry.db`.
+  - per-workspace local data — the document snapshot store, caches including thumbnails (`thumbs\`), `index.db`, the per-workspace `state.db` and local proposal storage — normally lives in `%LOCALAPPDATA%\LILITH\workspaces\<workspace-hash>\`;
+  - when the workspace is on a different volume from `%LOCALAPPDATA%` (a Dev Drive or any other drive), that data lives in `<volume>:\.lilith-local\<workspace-hash>\` instead, so hardlinked snapshots and rename-on-ingest stay on one volume (§7.2);
+  - staging handles stay inside the workspace (`<workspace>\.lilith\staging\`, CORE-003), which is on the workspace's volume by construction;
+  - suite-level `state.db`: `%LOCALAPPDATA%\LILITH\state.db`;
+  - `telemetry.db`: `%LOCALAPPDATA%\LILITH\telemetry.db`.
 - **CORE-006** [M1] (invariant) Machine-local state never goes into the workspace's git history: `index.db`, `state.db`, `telemetry.db`, caches, recovery files, proposals and document snapshots stay on the machine that made them.
-- **CORE-007** [M1] (contract) Suite-level settings that don't belong to a workspace live in `%APPDATA%\Worldwright\suite.toml`: spending caps, the display currency and dated exchange rates, fixed recurring costs, PSU efficiency, the rest-of-system power baseline and the electricity rate, the default workspace, and the Claude Code profiles (labels and folders, §4). Provider keys live in Windows Credential Manager (`secrets`). Provider profiles and prices live in `%APPDATA%\Worldwright\providers\` (§2.6).
+- **CORE-007** [M1] (contract) Suite-level settings that don't belong to a workspace live in `%APPDATA%\LILITH\suite.toml`: spending caps, the display currency and dated exchange rates, fixed recurring costs, PSU efficiency, the rest-of-system power baseline and the electricity rate, the default workspace, and the Claude Code profiles (labels and folders, §4). Provider keys live in Windows Credential Manager (`secrets`). Provider profiles and prices live in `%APPDATA%\LILITH\providers\` (§2.6).
 - **CORE-008** [M1] (invariant) Agents can't change suite-level caps or spending settings. Only a verified UI action (`app/caps.set` from a verified `ui:*` connection) can change them.
 - **CORE-009** [M1] (contract) Append-only logs are written through `store`'s locked-append API, one file per machine per month, so they never need merging:
   - `queue/jobs.<machine>.<yyyy-mm>.jsonl`: jobs, with the workspace format's job fields (§2.8);
   - `registry/usage.<machine>.<yyyy-mm>.jsonl`: every external call made for that workspace (§2.6);
-  - calls made with no workspace open go to `%LOCALAPPDATA%\Worldwright\usage-loose.jsonl` and count toward the same caps.
+  - calls made with no workspace open go to `%LOCALAPPDATA%\LILITH\usage-loose.jsonl` and count toward the same caps.
   - Readers deduplicate by `(machine, seq)`. Files are never moved or rotated, and they don't use `merge=union`.
 - **CORE-010** [M1] (invariant) There are no dependency cycles between modules: `store` emits change events and `index` consumes them; `jobs` defines a `JobHandler` trait that tool modules register with.
 - **CORE-011** [M1] (invariant) Every external model or service call goes through `ProviderGate`, including internal callers (QA vision review, the assistant). `ProviderGate` doesn't restrict anything; it exists so that usage, cost and caps are recorded and enforced in one place.
@@ -403,7 +403,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 
 ### 2.1 Module map
 
-- **CORE-014** [M1] (contract) `ww-core` is made of these modules, each with the one job listed:
+- **CORE-014** [M1] (contract) `lil-core` is made of these modules, each with the one job listed:
 
 | Module | One job | Milestone |
 |---|---|---|
@@ -415,7 +415,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 | `projects` | Project lifecycle, status views, shared context | M1 |
 | `pipeline` | Asset status machine, sign-off, stage profiles | M1 |
 | `settings` | Settings cascade (workspace → project → request) | M1 |
-| `docs` | Worldwright document bundles, `.wwdoc`, holds, document saves, snapshots, garbage collection; checkpoints (M1.5) | M1 |
+| `docs` | LILITH document bundles, `.wwdoc`, holds, document saves, snapshots, garbage collection; checkpoints (M1.5) | M1 |
 | `resources` | Libraries (shared typed resources, §3.4) | M1 |
 | `interchange` | App handler registry, `open_in`, `ui.show`, `.wwref` files, Windows notifications, thumbnails | M1 |
 | `meter` | Usage and cost records for every external call; spend summaries; optional caps | M1 |
@@ -475,7 +475,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-028** [M1] (invariant) `source/` is not a companion file: it is excluded from `id@version` references and from exports. Any sealed version that has a `source/` can be reopened for editing exactly as it was.
 - **CORE-029** [M1] (invariant) Link-external assets (path + hash recorded, file outside the workspace, §3.4) can't be signed off until "Collect into workspace" copies them in. Sealed versions are always inside the workspace and read-only.
 - **CORE-030** [M1] After approval, repairs and derivatives (cut-out, upscale…) open a new candidate run on the same asset; a different deliverable is a new asset whose inputs reference the source.
-- **CORE-031** [M1] (contract) **References:** `id@1.0.0` and `ww://…@1.0.0` mean that sealed version's primary file plus its declared companions. Recipe inputs reference sealed versions only. `@candidate/<run>/<file>` refers to a candidate for viewing and provenance only.
+- **CORE-031** [M1] (contract) **References:** `id@1.0.0` and `lil://…@1.0.0` mean that sealed version's primary file plus its declared companions. Recipe inputs reference sealed versions only. `@candidate/<run>/<file>` refers to a candidate for viewing and provenance only.
 - **CORE-032** [M1] Rejected candidates are kept on disk, gitignored, and purged 90 days after sign-off unless pinned. (plan 2b clarification: Appendix E) Purged here means moved to trash (ARCH-058), which purges the entry 30 days later: 120 days after sign-off in all. The workspace `.gitignore` ignores all of `candidates/`, so open runs don't sync between machines.
 - **CORE-033** [M1] Pre-suite folders such as the lantern's `v1.0.0/` are read as-is and labelled `legacy`.
 - **CORE-034** [M1] (invariant) **Human edits:** when a candidate or sealed file's hash differs from the recorded hash (LFS pointers are compared by `oid`), the change is recorded in `human_edits` and the file is never overwritten. The merge options are a new version that regenerates only unlocked layers or regions, or a sibling variant. Document folders (`work/`) are excluded from human-edit tracking.
@@ -484,14 +484,14 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-037** [M1] (contract) **Trash:** deletes move files to `.trash/<date>/` with restore records and `purge_after` (30 days).
 - **CORE-038** [M1] (invariant) Orphans are listed for review and never deleted automatically. (plan 2b clarification: Appendix E) A file the suite still expects on disk that disappears outside the suite is listed as `missing`, never forgotten (ARCH-079 clarification).
 - **CORE-039** [M1] (contract) `progress.md` entries go under `## Done` as `- YYYY-MM-DD: …`; other sections are edited section by section. (plan 2b clarification: Appendix E) A new entry goes on the line directly after `## Done`, newest first; the blank line before the next heading is kept.
-- **CORE-040** [M1] (contract) **Paths:** a budget of about 180 characters per relative path; reserved Windows names are rejected. `ww doctor` sets `core.longpaths=true` and `lfs.setlockablereadonly=false`, and adds the `.gitignore` entries, including `assets/*/work/`. (plan 2b clarification: Appendix E) The budget is exactly 180 characters. In the workspace's root `.gitignore`, `assets/*/work/` is written `projects/*/assets/*/work/`. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with.
+- **CORE-040** [M1] (contract) **Paths:** a budget of about 180 characters per relative path; reserved Windows names are rejected. `lil doctor` sets `core.longpaths=true` and `lfs.setlockablereadonly=false`, and adds the `.gitignore` entries, including `assets/*/work/`. (plan 2b clarification: Appendix E) The budget is exactly 180 characters. In the workspace's root `.gitignore`, `assets/*/work/` is written `projects/*/assets/*/work/`. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with.
 - **CORE-041** [M1] (contract) **Index reconcile** compares path + size + mtime + NTFS FileId + ChangeTime. A cold rebuild trusts manifest hashes and verifies them in the background. Hashes are SHA-256 only. (plan 2b clarification: Appendix E) FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders.
 - **CORE-042** [M1] Index rebuild times are benchmarked, and the benchmark is a CI gate. (plan 2b clarification: Appendix E) The budgets (a cold rebuild of 2,000 assets, a warm reconcile of 10,000) are recorded in `test-params.toml`.
 - **CORE-043** [M1] (contract) **Proposal runs** are kept separate from asset candidate runs. They live in `assets/<id>/work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with their recipe and saved inputs. They create no asset version, don't change the asset's status and don't run the QA chain.
 - **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.wwdoc`, open proposals move with the document.
 - **CORE-045** [M1] (contract) Document layers are stored as content-addressed chunks of 8×8 tiles (1024×1024 px) on a signed grid, each with a tile-presence/uniform bitmap header and a hash over the canonical uncompressed bytes (format in §5.2). `docs` garbage collection and snapshot hardlinking work at chunk level.
 - **CORE-046** [M1.5] (contract) Every asset carries a creation UUID (recorded from M1, CORE-047); a sealed version renumbered during multi-machine sync records `renamed_from: {version, machine, content_hash}` in its manifest; references resolve through `renamed_from` (using the content hash they carry, CORE-047), with a warning on a mismatch (§7.3).
-- **CORE-047** [M1] (contract) References to a sealed version — `ww://` refs, `.wwref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill. (plan 2b clarification: Appendix E) The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
+- **CORE-047** [M1] (contract) References to a sealed version — `lil://` refs, `.wwref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill. (plan 2b clarification: Appendix E) The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
 
 ### 2.4 Pipeline, projects and settings
 
@@ -505,7 +505,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-055** [M1] **Projects:** `project.create`, `project.set_status` (pause or archive; a staleness check runs on restore), `project.status`, `project.context`.
 - **CORE-056** [Later] `project.clone`, `project.delete` (lists inbound links first) and `portfolio.status`.
 - **CORE-057** [M1] (contract) **Settings cascade:** workspace `defaults` → `project.yaml` → per-request values, a plain override chain. It holds the default models or providers per task (`assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate` — which names a model profile, §5.6 — and others), provider preferences, the QA profile, `auto_approve`, `skip_stages`, `auto_candidate_on_save` and the enabled `modules`. Caps, currency, fixed costs, PSU efficiency, electricity rate and the assistant engine choice are suite-level (§2.0), not in this chain. (plan 2b clarification: Appendix E) In plan 2b the per-request layer is the `settings` argument of a tool that declares one; a per-call `settings` field is a later protocol change (it changes `schema_hash`). The project layer is `project.yaml`'s top-level keys (I4 of `docs/reference/workspace-format.md`), with `pipeline.skip_stages` and `pipeline.auto_approve` read as `skip_stages` and `auto_approve`.
-- **CORE-058** [M1] Each tool declares its Worldwright module (for example image generation → `concept` or `2d`); tool suggestions are filtered by the project's enabled `modules`.
+- **CORE-058** [M1] Each tool declares its LILITH module (for example image generation → `concept` or `2d`); tool suggestions are filtered by the project's enabled `modules`.
 
 ### 2.5 Telemetry
 
@@ -527,7 +527,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
   3. CPU energy is split by each process's share of CPU time.
   4. Results are reported as gross energy and energy above idle; GPU-seconds are SM-utilisation-weighted time.
 - **CORE-066** [M1] Thermal throttling and high temperatures raise alerts in the Hardware panel (§3.6).
-- **CORE-067** [M1] On core start the measured hardware profile is compared with `worldwright.yaml` `hardware`; the file is edited only when something changed.
+- **CORE-067** [M1] On core start the measured hardware profile is compared with `lilith.yaml` `hardware`; the file is edited only when something changed.
 - **CORE-068** [M1] `telemetry` feeds the GPU scheduler (§2.8) and the Hardware panel (§3.6).
 
 ### 2.6 Meter, caps and accounts
@@ -555,7 +555,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 
 **Prices**
 
-- **CORE-076** [M1] (contract) Provider profiles and prices are suite-level data, shipped and updated with the suite in `%APPDATA%\Worldwright\providers\` (`providers.yaml`, `prices.yaml`), with optional workspace overrides. `meter` reads prices from here.
+- **CORE-076** [M1] (contract) Provider profiles and prices are suite-level data, shipped and updated with the suite in `%APPDATA%\LILITH\providers\` (`providers.yaml`, `prices.yaml`), with optional workspace overrides. `meter` reads prices from here.
 - **CORE-077** [M1] (contract) **Price entries** are dated, sourced and carry `effective_from`, so a scheduled price change is just a new entry. In M1 they support per-unit rates, prompt-length tiers and cached-input rates.
 - **CORE-078** [Later] Price entries also support time-of-day windows with a time zone and holiday calendar (for example DeepSeek's off-peak half price), cache storage per hour, service-tier and regional multipliers, batch discounts and CNY prices. Each is added when a provider that needs it is first used.
 - **CORE-079** [M1] **Reprice job:** because raw usage and `price_version` are kept, a correction to the price table can reprice past records.
@@ -564,7 +564,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 **Currency, summaries and fixed costs**
 
 - **CORE-081** [M1] (contract) Each record keeps its native currency. The display currency and dated exchange rates live in `suite.toml`; summaries show per-currency totals plus a converted total in the display currency.
-- **CORE-082** [M1] (contract) `usage.summary` breaks spend down by provider, model, project, workspace (including "loose"), caller kind (you, assistant, Claude Code, `ww`), tool and account, by day and month. Billing bases are kept apart: subscription quota, money and local work are never added together. Estimated and reconciled costs are marked. Unattributed spend (paid ComfyUI jobs submitted outside the suite) is shown separately.
+- **CORE-082** [M1] (contract) `usage.summary` breaks spend down by provider, model, project, workspace (including "loose"), caller kind (you, assistant, Claude Code, `lil`), tool and account, by day and month. Billing bases are kept apart: subscription quota, money and local work are never added together. Estimated and reconciled costs are marked. Unattributed spend (paid ComfyUI jobs submitted outside the suite) is shown separately.
 - **CORE-083** [M1] (contract) **Fixed recurring costs** are subscriptions you enter once — each Claude plan (per Claude Code profile), OneDrive, BorgBase, Hetzner and similar — and are included in monthly totals. Caps don't apply to them.
 - **CORE-084** [M1] (contract) Backup and large-file destinations (§7) are providers with optional usage or quota APIs. Their spend comes from those APIs, from size × price estimates, or from fixed recurring costs. In M1, OneDrive usage comes from `rclone about --json`; BorgBase, R2, Wasabi and other destinations arrive with them in M1.5.
 
@@ -580,8 +580,8 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-091** [M1] (contract) **When a cap would be exceeded** the call returns `pending_confirmation` covering `cap`: one record, bound to the arguments, with a lifetime. You choose: raise the cap, allow once, or cancel.
   - Cap prompts on your own actions appear inline at the point of action and in the Confirmations panel; answering anywhere clears it everywhere (§3.3).
   - Calls inside a running job (for example vision QA) never prompt: that step records `not_run`.
-  - Callers without an app of their own (`ww`, Claude Code via MCP) get `pending_confirmation` whenever the confirmation can be answered — an app is connected or the notification path (CORE-113) can reach you; its message says "confirm in Worldwright, then retry with token X".
-  - Callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks) get the error `cap.exceeded` instead (§6), as does any other call when no confirmation can be answered — except director tasks, which always get `pending_confirmation` and wait in `waiting_confirmation` (CORE-114).
+  - Callers without an app of their own (`lil`, Claude Code via MCP) get `pending_confirmation` whenever the confirmation can be answered — an app is connected or the notification path (CORE-113) can reach you; its message says "confirm in LILITH, then retry with token X".
+  - Callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks) get the error `cap.exceeded` instead (§6), as does any other call when no confirmation can be answered — except director tasks, which always get `pending_confirmation` and wait in `waiting_confirmation` (CORE-114).
 - **CORE-092** [M1] Caps are enforced on each machine. Spend synced from other machines is shown for information only; provider-side limits are the real cross-machine stop.
 - **CORE-093** [M1] (contract) **ComfyUI partner (paid API) nodes** are detected from the workflow graph. Their cost comes from a price table and is always flagged `estimated` (Comfy reports costs only after execution and has no balance API). Paid jobs submitted to ComfyUI from outside the suite are recorded as unattributed spend.
 - **CORE-094** [M1] (invariant) The Comfy account key is injected into the single request that needs it, never into ComfyUI's environment or configuration.
@@ -620,7 +620,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 - **CORE-103** [M1] (contract) Each Claude Code profile shows its 5-hour and weekly usage percentages and reset times, with a "last seen" time. Sources: Engine A's `rate_limit_event` messages (and `system/api_retry` with `error: "rate_limit"` as the hard-stop signal), plus an occasional `/usage` check, at most every 15 minutes per profile and only when that profile is idle.
 - **CORE-104** [M1] (invariant) `claude auth status` and `/usage` checks run only when no suite-launched `claude` process is active in that profile (a per-profile lock), because they can start a token refresh that races with a running session.
 - **CORE-105** [M1] Usage-credit spend (when enabled on a Claude plan) is recorded per account as real money.
-- **CORE-106** [M1.5] (contract) A loopback OpenTelemetry receiver in the core records your **interactive** Claude Code sessions' token usage (`claude_code.token.usage`). It binds to 127.0.0.1 only, uses `http/json` with an auth header, and is the explicit exception to "the core exposes no network port" (§1). It deduplicates by session id (including Engine A's session ids), maps sessions to workspaces through the SessionStart hook (others go to "Claude Code — other projects"), attributes them to profiles through `ww.profile=<id>` in `OTEL_RESOURCE_ATTRIBUTES`, and stores one row per session per day.
+- **CORE-106** [M1.5] (contract) A loopback OpenTelemetry receiver in the core records your **interactive** Claude Code sessions' token usage (`claude_code.token.usage`). It binds to 127.0.0.1 only, uses `http/json` with an auth header, and is the explicit exception to "the core exposes no network port" (§1). It deduplicates by session id (including Engine A's session ids), maps sessions to workspaces through the SessionStart hook (others go to "Claude Code — other projects"), attributes them to profiles through `lil.profile=<id>` in `OTEL_RESOURCE_ATTRIBUTES`, and stores one row per session per day.
 - **CORE-107** [M1] `registry/ledger.csv` is no longer written; usage logs replace it. Existing ledger files are left alone.
 
 ### 2.7 Agent safety confirmations
@@ -629,23 +629,23 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
   - `destructive`: delete, purge trash, overwrite outside the version system, `resource.delete`, and an agent-initiated stop or restart of an engine that would kill jobs submitted from outside the suite.
   - `exec`: install nodes or packages, run scripts or arbitrary code, download executable formats (pickled `.ckpt`/`.pt`/`.bin`, custom-node packs, wheels).
   - Plain `write`: downloading `.safetensors` or `.gguf` files; the scheduler's own engine start and idle-down; document edits by agents, including layer deletion and discarding proposals, which are undoable inside the document (§5.10).
-- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (both engines), Claude Code via MCP, and scripts via `ww` — are asked to confirm, and only for `destructive` and `exec` tools. Your own actions in the apps never ask.
+- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (both engines), Claude Code via MCP, and scripts via `lil` — are asked to confirm, and only for `destructive` and `exec` tools. Your own actions in the apps never ask.
 - **CORE-110** [M1] (invariant) Deletes are always soft (to `.trash/`), whoever makes them.
 - **CORE-111** [M1] (invariant) A caller-supplied `confirm: true` is never accepted. A confirmation is answered only by a verified `ui:*` connection after a real input event in the shared dialog, or by Claude Code's own prompt (below). Every answer records how it was given (`confirmed_via: app | claude_code`).
 - **CORE-112** [M1] (contract) The core decides per connection whether a tool carries `_meta["anthropic/requiresUserInteraction"]`:
   - **interactive Claude Code sessions** (caller kind `mcp`): `destructive` and `exec` tools carry it, so Claude Code always prompts you and hooks can't auto-allow it. That prompt **is** the confirmation (recorded `confirmed_via: claude_code`), so you aren't asked twice;
-  - **Engine A connections** (caller kind `assistant`): the suite's tools don't carry it; the core's confirmations apply, and the permission-prompt tool `mcp__ww__approve` auto-allows the suite's own tools, so again nothing is asked twice (§4).
-- **CORE-113** [M1] (contract) **Where other confirmations appear** (the assistant on either engine, `ww`, and cap prompts):
+  - **Engine A connections** (caller kind `assistant`): the suite's tools don't carry it; the core's confirmations apply, and the permission-prompt tool `mcp__lil__approve` auto-allows the suite's own tools, so again nothing is asked twice (§4).
+- **CORE-113** [M1] (contract) **Where other confirmations appear** (the assistant on either engine, `lil`, and cap prompts):
   - in the open suite app (the Confirmations panel, and inline for your own actions);
-  - with no app open, the core posts a Windows notification; clicking it opens `ww:confirm/<id>`, which launches a minimal `ww-image --confirm <id>` window in front. `ww --confirm-window` can launch it directly (opt-in, for interactive use, not scripts). The core itself never shows UI (§3.3).
-  - The same rule as for caps (CORE-091) applies: a call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks), or other calls for which no confirmation can be answered, get the error `confirm.unavailable` (§6). Director tasks always get `pending_confirmation` (CORE-114).
+  - with no app open, the core posts a Windows notification; clicking it opens `lil:confirm/<id>`, which launches a minimal `lil-image --confirm <id>` window in front. `lil --confirm-window` can launch it directly (opt-in, for interactive use, not scripts). The core itself never shows UI (§3.3).
+  - The same rule as for caps (CORE-091) applies: a call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks), or other calls for which no confirmation can be answered, get the error `confirm.unavailable` (§6). Director tasks always get `pending_confirmation` (CORE-114).
 - **CORE-114** [M1] (contract) Co-pilot pending confirmations are cancelled when the app that started them closes. Director tasks' confirmations persist with the job, and the task continues with other steps or pauses in `waiting_confirmation` (§2.8, §4).
 - **CORE-115** [M1] (contract) Each pending confirmation has an expiry (`expires_at`); answering with deny or letting it expire returns `confirm.denied` or `confirm.expired` to a retry with its token (§6).
 - **CORE-116** [M1] (contract) **Outside the suite:** Plugin 1.3 adds Claude Code PreToolUse hooks that return "ask" for:
   - Bash and PowerShell commands matching delete, install or script-run patterns (`rm`, `del`, `Remove-Item`, `rmdir`, `git clean`, `git reset --hard`, `pip` / `uv pip` / `npm` / `comfy node install`, `python <script>`, `blender -P`, …);
   - the comfy MCP's install, update, download and restart tools.
   
-  Direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json` have their own guard (ARCH-104): warn-only at first, later deny while a core is running. When the hooks run inside Engine A they see `WW_ENGINE=1` and do nothing.
+  Direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json` have their own guard (ARCH-104): warn-only at first, later deny while a core is running. When the hooks run inside Engine A they see `LIL_ENGINE=1` and do nothing.
 
 ### 2.8 Jobs and the ComfyUI engine
 
@@ -692,7 +692,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 
 ### 2.10 Convert
 
-- **CORE-137** [M1] (decision) The Worldwright document (folder or `.wwdoc`, §3.5) is the native layered format. OpenRaster (`.ora`) is import (best effort) and export (lossy, with a warning listing what is lost) only.
+- **CORE-137** [M1] (decision) The LILITH document (folder or `.wwdoc`, §3.5) is the native layered format. OpenRaster (`.ora`) is import (best effort) and export (lossy, with a warning listing what is lost) only.
 - **CORE-138** [M1a] PNG, JPEG and WebP (lossless via `image`, lossy via libwebp), with ICC handling via `moxcms`.
 - **CORE-139** [M1b] TIFF (8- and 16-bit) and OpenRaster import/export (hand-rolled on `zip`).
 - **CORE-140** [Later] EXR (`exr`), PSD import out of process (`psd-tools` in the QA venv), KRA, glTF/USD/FBX, WAV/FLAC/OGG.
@@ -740,7 +740,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 
 **Example — "generate 3 lantern candidates" from Claude Code:** resolve (caller `mcp`, project `sketchbook`) → validate → settings → estimate $0 (local) → no confirmation or cap prompt → job in the `gpu-heavy` lane with core-minted prompt ids, the three prompts submitted one after another as each finishes → `/history` + `/view` → `candidates/<run_id>/` → QA → meter ($0; about 20 s of GPU time at up to 360 W ≈ 2 Wh GPU, ~3 Wh whole system) → run recorded → events. The Image studio shows the candidates live; Claude Code gets JSON text with the file paths and a hand-off note.
 
-### 2.12 Workspace format, registries and the Worldwright plugin
+### 2.12 Workspace format, registries and the `worldwright` plugin
 
 - **CORE-147** [M1] (contract) New workspace and asset files no longer get `mode`, `commercial`, `territories`, `content_rating`, `privacy_tier`, `provider_allowlist`, `budget_usd`, licence-gate or disclosure fields. Asset manifests no longer get `license_scope`, `commercial_use`, `content_rating`, or the licence/C2PA/disclosure parts of `provenance`; the recipe, environment and inputs stay.
 - **CORE-148** [M1] (invariant) Fields the suite no longer uses are ignored and preserved when files are rewritten (lossless round-trip).
@@ -760,7 +760,7 @@ This section describes the modules inside `ww-core`, the headless Rust core serv
 
 ## 3. Core ↔ app interface, interchange, documents and dashboards
 
-This section covers what every app is made of, how apps talk to the core, how apps and outside programs exchange work, the Worldwright document (the suite's native editable format), and the dashboards. In M1 the dashboards are panels inside the Image studio; a separate Hub app comes later. Usage tracking, optional caps, account info, hardware telemetry and agent safety confirmations are all shown here; nothing in this section filters content or gates work on business rules.
+This section covers what every app is made of, how apps talk to the core, how apps and outside programs exchange work, the LILITH document (the suite's native editable format), and the dashboards. In M1 the dashboards are panels inside the Image studio; a separate Hub app comes later. Usage tracking, optional caps, account info, hardware telemetry and agent safety confirmations are all shown here; nothing in this section filters content or gates work on business rules.
 
 The core modules behind this section are `docs` (document bundles, `.wwdoc`, holds, save handles, snapshots, GC, checkpoints), `resources` (Libraries) and `interchange` (handler registry, `open_in`, `ui.show`, `.wwref`, notifications, thumbnails); see §2.1.
 
@@ -772,14 +772,14 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 - **APP-004** [M1] M1 keeps the "Default" layout plus the last state. Named layout presets arrive in M1.5.
 - **APP-005** [Later] Upgrade to KDDockWidgets 2.5 (per-window save, Qt Quick dark mode) when it ships.
 
-**Shared shell** (`ww-ui-kit`), identical in every app:
+**Shared shell** (`lil-ui-kit`), identical in every app:
 
 - **APP-006** [M1] **Top bar:** workspace/project switcher, app switcher, assistant toggle, and status indicators for jobs, spend this month vs caps, GPU load/VRAM/temperature, and the core connection.
 - **APP-007** [Later] **Command palette** (Ctrl+K) in the top bar: assets, resources, tools, panels, recent files.
 - **APP-008** [M1] **Shared panels:** Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Backups (opened from Diagnostics in M1, APP-133), Assistant, and Diagnostics (with the event log). The Image studio also hosts its own panels (§5.1) and the ComfyUI web view, which is loaded lazily on first show (APP-137).
 - **APP-009** [M1a] (invariant) The embedded ComfyUI web view is locked down as in §1.4 and §5.8: it loads ComfyUI from its own loopback origin, navigation is pinned to that origin, **downloads are blocked**, and there is no bridge from the page into the suite.
 - **APP-010** [M1] **Shared dialogs:**
-  - "Open from Worldwright": search, type filter, version or candidate, and "Loose file…" which opens the native file dialog;
+  - "Open from LILITH": search, type filter, version or candidate, and "Loose file…" which opens the native file dialog;
   - "Place / use as input": linked or embedded;
   - "Save to project": project (default `sketchbook`), asset name and type.
 - **APP-011** [M1] **One shortcut map** for the whole suite. App-specific hotkeys (§5.1) are checked against it for conflicts.
@@ -787,37 +787,37 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Single instance and standalone launch**
 
-- **APP-013** [M1] (contract) **Single instance per app, independent of the core:** each app owns a per-user named pipe `\\.\pipe\worldwright-app-<app>-<userSID>-<channel>`, created with `first_pipe_instance` and the same user-only security descriptor as the core pipe (§1.2).
-- **APP-014** [M1] A second launch of an app (Start menu, Explorer double-click, `ww-image <file-or-ref>`) connects to that pipe, reads the running instance's process id, calls `AllowSetForegroundWindow(pid)`, passes its arguments, and exits. The running instance then activates its window.
+- **APP-013** [M1] (contract) **Single instance per app, independent of the core:** each app owns a per-user named pipe `\\.\pipe\lilith-app-<app>-<userSID>-<channel>`, created with `first_pipe_instance` and the same user-only security descriptor as the core pipe (§1.2).
+- **APP-014** [M1] A second launch of an app (Start menu, Explorer double-click, `lil-image <file-or-ref>`) connects to that pipe, reads the running instance's process id, calls `AllowSetForegroundWindow(pid)`, passes its arguments, and exits. The running instance then activates its window.
 - **APP-015** [M1] **Standalone launch:** the app uses the default workspace from `suite.toml`; with no project chosen, work lands in `sketchbook`.
 - **APP-016** [M1] **No-workspace state** (no workspace at all): a banner with "Create or choose a workspace"; the Asset browser is replaced by a list of recent loose files; "Add to project" is disabled; metered calls are still allowed and logged as loose usage (§2.0).
 
 **Windows integration**
 
-- **APP-017** [M1a] **Per-user file associations** and "Open with Worldwright Image" for PNG, JPEG, WebP and `.wwdoc`, registered under `HKCU\Software\Classes` (no admin). The suite never sets itself as the default; you choose defaults yourself.
+- **APP-017** [M1a] **Per-user file associations** and "Open with LILITH Image" for PNG, JPEG, WebP and `.wwdoc`, registered under `HKCU\Software\Classes` (no admin). The suite never sets itself as the default; you choose defaults yourself.
 - **APP-018** [M1b] TIFF and ORA join the file associations when their import and export land (§2.10, §5.11); before that the suite registers no association for a format it can't read.
 - **APP-019** [M1] A file opened from Explorer that lives inside a workspace opens as that asset. Sealed files open read-only, with "Edit → new working document".
-- **APP-020** [M1] (contract) **`ww:` URL protocol:** `ww:open/<ref>`, `ww:confirm/<id>` and `ww:task/<job_id>` (opens a director task in the Assistant panel, APP-050). Arguments are validated as untrusted input. It's used for notification clicks and for links in browsers and Markdown.
+- **APP-020** [M1] (contract) **`lil:` URL protocol:** `lil:open/<ref>`, `lil:confirm/<id>` and `lil:task/<job_id>` (opens a director task in the Assistant panel, APP-050). Arguments are validated as untrusted input. It's used for notification clicks and for links in browsers and Markdown.
 - **APP-021** [M1] **`.wwref` pointer files:** links printed in Claude Code output point to a small `.wwref` file (associated with the suite) in the cache, because Windows Terminal only opens `http`, `https` and `file` links (verified 2026-10-12).
 - **APP-022** [M1] **Notifications:** the suite has a Start-menu identity (AppUserModelID) used for Windows notifications. The core posts notifications through it: job finished, confirmation waiting, cap confirmation waiting, cap alerts, and director-task decisions (APP-050). A notification is drawn by Windows, not by the core, and clicking it is your own input, so the app it launches comes to the front.
-- **APP-023** [Later] Jump Lists; Explorer thumbnails for `.wwdoc` (a small Rust COM thumbnail provider, out of process); an Explorer "Add to Worldwright project" context-menu entry.
+- **APP-023** [Later] Jump Lists; Explorer thumbnails for `.wwdoc` (a small Rust COM thumbnail provider, out of process); an Explorer "Add to LILITH project" context-menu entry.
 
 ### 3.2 How an app talks to the core
 
-- **APP-024** [M1] (invariant) **`ww-client` runs on a background tokio runtime inside the app; the GUI thread never waits on the core.** The stall target is in APP-135.
+- **APP-024** [M1] (invariant) **`lil-client` runs on a background tokio runtime inside the app; the GUI thread never waits on the core.** The stall target is in APP-135.
 
-**Bridge (`ww-qt`, Rust via cxx-qt)**
+**Bridge (`lil-qt`, Rust via cxx-qt)**
 
-- **APP-025** [M1] **List models** are Rust `QAbstractListModel` subclasses (cxx-qt's `#[base]`, `#[inherit]`, `#[cxx_override]`), paged through `canFetchMore`/`fetchMore`. `ww-qt` also provides the request-id API below and the document and resource models.
+- **APP-025** [M1] **List models** are Rust `QAbstractListModel` subclasses (cxx-qt's `#[base]`, `#[inherit]`, `#[cxx_override]`), paged through `canFetchMore`/`fetchMore`. `lil-qt` also provides the request-id API below and the document and resource models.
 - **APP-026** [M1] Core events are applied on the GUI thread via `CxxQtThread::queue`; queued tasks handle the "object destroyed" error.
 - **APP-027** [M1] (invariant) **Update throttling is leading-edge:** the first update applies immediately, then at most 10 Hz for job progress and 1 Hz per telemetry series. Pending confirmations (agent safety and cap) are never throttled.
 - **APP-028** [M1] (contract) **Requests:** one `core` singleton with `call(tool, argsJson) → requestId`, `cancel(requestId)`, and the signals `callFinished(id, result)`, `callFailed(id, error)` and `callPendingConfirmation(id, pending)` — one per result kind in §6.1 (`ok | pending_confirmation | error`). `pending` carries `confirmation_id`, `retry_token`, `expires_at` and `covers` (`confirm`, `cap` or both). A small QML helper turns these signals into callbacks/promises.
   - Per-request QObjects are not returned to QML, because QML can garbage-collect them before the request finishes.
 - **APP-029** [M1] (contract) **Automatic retry after a confirmation:** when an app's own call returns `pending_confirmation` (in practice a cap, APP-054), the QML helper keeps the request open and watches the `confirmations` topic. Once that confirmation is answered — inline, in the Confirmations panel or from a notification — or expires, the app re-sends the call once with its `retry_token` and settles the original callback with what the core returns: the result after approval, or `confirm.denied` / `confirm.expired` (§2.7, §6.1). The app never retries without an answer; if the app closes first, the pending request is cancelled.
 
-**C++ shim (`ww-qt-shim`)**
+**C++ shim (`lil-qt-shim`)**
 
-- **APP-030** [M1] Things cxx-qt can't do go in the C++ shim: the clipboard/drag `QMimeData` (§3.4); the live-preview image provider; docking; GPU canvases; the web view; and the notification and `ww:` activation glue.
+- **APP-030** [M1] Things cxx-qt can't do go in the C++ shim: the clipboard/drag `QMimeData` (§3.4); the live-preview image provider; docking; GPU canvases; the web view; and the notification and `lil:` activation glue.
 - **APP-031** [M1] The **live-preview image provider** is a small (~50-line) `QQuickImageProvider` with a lock-protected frame map fed from Rust. Each preview frame gets a unique URL, with caching off.
 - **APP-032** [M1] (invariant) For incoming clipboard and drag data, the shim only extracts the raw MIME bytes; all parsing happens in Rust.
 
@@ -831,12 +831,12 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 **Images**
 
 - **APP-037** [M1] (invariant) **Images never travel over the pipe.** Models carry file paths; QML loads images asynchronously.
-- **APP-038** [M1] **Thumbnails** come from the core's thumbnail cache in the per-workspace local data folder (`%LOCALAPPDATA%\Worldwright\workspaces\<hash>\thumbs\`, or `<volume>:\.worldwright-local\<hash>\thumbs\` when the workspace is on a different volume from `%LOCALAPPDATA%`, §1, §7.2) at the exact display size × screen scale (two sizes on mixed-DPI setups), because only JPEG decodes cheaply at reduced size. Grids reuse delegates and load asynchronously.
+- **APP-038** [M1] **Thumbnails** come from the core's thumbnail cache in the per-workspace local data folder (`%LOCALAPPDATA%\LILITH\workspaces\<hash>\thumbs\`, or `<volume>:\.lilith-local\<hash>\thumbs\` when the workspace is on a different volume from `%LOCALAPPDATA%`, §1, §7.2) at the exact display size × screen scale (two sizes on mixed-DPI setups), because only JPEG decodes cheaply at reduced size. Grids reuse delegates and load asynchronously.
 
 ### 3.3 The app interface
 
 - **APP-039** [M1] (invariant) **`app/*` contains only what's specific to a running app:** session, subscriptions, document hold/save, activation and open requests, confirmation answers and `caps.set`. Everything else is a normal `tools/*` call made with caller kind `ui:<app>`, so anything an app can do, an agent can do too (§1.1).
-- **APP-040** [M1] (invariant) `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `cli` callers (`ww`) and tests. The handshake `core/hello` is not an `app/*` method; every caller kind calls it (§1.2).
+- **APP-040** [M1] (invariant) `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `cli` callers (`lil`) and tests. The handshake `core/hello` is not an `app/*` method; every caller kind calls it (§1.2).
 - **APP-041** [M1] `app/*` methods run the dispatcher's resolve and validate stages (§2.2).
 - **APP-042** [M1] (invariant) Document saves (`app/doc.commit`) record only index edges and events: no manifest or `progress.md` writes and no status change. The project's `links` change only when the set of inputs changes.
 - **APP-043** [M1] (contract) **App interface map:**
@@ -844,7 +844,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 | Area | `app/*` methods | Agent-visible tools used by apps | Event topics |
 |---|---|---|---|
 | Session | `app/set_context` (the handshake before it is `core/hello`, §1.2) | — | `session` |
-| Subscriptions | `ww/subscribe`, `ww/unsubscribe` (events arrive as `ww/event`, §1.2) | — | — |
+| Subscriptions | `lil/subscribe`, `lil/unsubscribe` (events arrive as `lil/event`, §1.2) | — | — |
 | Assets | `app/thumbs.request` | `assets.query`, `asset.get`, `asset.import` (copy or link-external), `convert.export`, `asset.signoff`, `asset.request_signoff` | `project:<slug>`, `asset:<ref>` |
 | Documents | `app/doc.open`, `app/doc.stage`, `app/doc.commit`, `app/doc.recover`, `app/doc.close` | `doc.list_open`, `doc.get_snapshot`, `doc.make_candidate`, and the document tools of §5.10 (`doc.layer.*` such as `doc.layer.add`, `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.references.*`, `doc.proposals.*`, `doc.export`) | `doc:<id>` |
 | Resources | — | `resource.list`, `resource.get`, `resource.save`, `resource.delete` | `resources` |
@@ -864,13 +864,13 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 **When no app is open**
 
 - **APP-047** [M1] Destructive/exec confirmations requested by interactive Claude Code sessions are answered in Claude Code's own prompt (§2.7).
-- **APP-048** [M1] Everything else — cap confirmations from Claude Code or `ww`, confirmations from `ww`, and director-task confirmations (§4.6) — uses the **notification path**: the core posts a Windows notification; clicking it opens `ww:confirm/<id>`, which launches a minimal `ww-image --confirm <id>` window in front. Director-task decisions (`waiting_quota`, `waiting_auth`) also start with a notification but are made in the Assistant panel (APP-050). The core never shows a dialog of its own.
-- **APP-049** [M1] `ww --confirm-window` launches the same minimal window directly. It's opt-in, for interactive use, not for scripts.
+- **APP-048** [M1] Everything else — cap confirmations from Claude Code or `lil`, confirmations from `lil`, and director-task confirmations (§4.6) — uses the **notification path**: the core posts a Windows notification; clicking it opens `lil:confirm/<id>`, which launches a minimal `lil-image --confirm <id>` window in front. Director-task decisions (`waiting_quota`, `waiting_auth`) also start with a notification but are made in the Assistant panel (APP-050). The core never shows a dialog of its own.
+- **APP-049** [M1] `lil --confirm-window` launches the same minimal window directly. It's opt-in, for interactive use, not for scripts.
 - **APP-050** [M1] **Director-task decisions** — the three `waiting_quota` choices and the `waiting_auth` choices (§4.6a) — are shown in the **Assistant panel**, not in the minimal confirmation window:
-  - the core posts a notification naming the task, the Claude Code profile (by its label) and, for `waiting_quota`, the reset time; clicking it opens `ww:task/<job_id>`, which launches or brings forward the Image studio with the Assistant panel on that task;
+  - the core posts a notification naming the task, the Claude Code profile (by its label) and, for `waiting_quota`, the reset time; clicking it opens `lil:task/<job_id>`, which launches or brings forward the Image studio with the Assistant panel on that task;
   - the panel lists the choices: for `waiting_quota` — wait for the reset (the default; the reset time is shown), switch to the API engine, and use a local model (M1.5, shown disabled in M1); for `waiting_auth` — sign in again (the app opens a terminal for `/login` in that profile; the core never launches it), use a different profile, and switch to the API engine;
   - the Jobs panel shows the substatus with an "Open in Assistant" action. If you don't answer, a `waiting_quota` task takes the default (it waits and resumes at the reset time) and a `waiting_auth` task keeps waiting; the suite never picks a profile for you (§4.6a).
-- **APP-051** [M1] (contract) A call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks) never get `pending_confirmation`: a cap returns the error `cap.exceeded`, and an agent safety confirmation returns the error `confirm.unavailable` (§2.7, §6.1).
+- **APP-051** [M1] (contract) A call returns `pending_confirmation` whenever the confirmation can be answered (an app is connected or the notification path can reach you). Callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks) never get `pending_confirmation`: a cap returns the error `cap.exceeded`, and an agent safety confirmation returns the error `confirm.unavailable` (§2.7, §6.1).
 
 **Assistant calls and app lifetime**
 
@@ -885,13 +885,13 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **References**
 
-- **APP-055** [M1] (contract) **Asset references** everywhere use `ww://<workspace>/<project>/<asset>@<version>` (§1.2). References to a sealed version — `ww://` refs, `.wwref` files, exports and engine-import records — also carry that version's SHA-256 content hash (§2.3, CORE-047).
+- **APP-055** [M1] (contract) **Asset references** everywhere use `lil://<workspace>/<project>/<asset>@<version>` (§1.2). References to a sealed version — `lil://` refs, `.wwref` files, exports and engine-import records — also carry that version's SHA-256 content hash (§2.3, CORE-047).
 - **APP-056** [M1.5] When multi-machine sync has renumbered a sealed version, references resolve through its `renamed_from` record using the content hash they carry, with a warning on a mismatch (§7.3).
 - **APP-057** [M1] (contract) **Candidates** are referenced as `@candidate/<run>/<file>`, for viewing and provenance only. **Proposals** are referenced as `doc:<doc_id>/proposal/<run_id>/<n>`, for viewing and recalling settings only (§5.5).
 
 **Formats**
 
-- **APP-058** [M1] (decision) **One native layered format for every 2D app: the Worldwright document** (§3.5). Flattened files are for leaving the suite.
+- **APP-058** [M1] (decision) **One native layered format for every 2D app: the LILITH document** (§3.5). Flattened files are for leaving the suite.
 - **APP-059** [M1b] **ORA import** is best effort (TIFF and ORA import/export arrive together, §2.10).
 - **APP-060** [M1b] **ORA export** is lossy and shows a warning listing what's lost: masks are baked into alpha, transforms are rasterised, blend modes outside ORA's 20 are approximated, and float depth is reduced to 16-bit (OpenRaster spec, verified 2026-10-12).
 
@@ -902,9 +902,9 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Open in / send to**
 
-- **APP-063** [M1] (contract) The requester (an app, `ww`, or `ww-mcp` on behalf of an agent) calls `open_in(app, target, intent)` or `ui.show(target)`; the core returns `{running, pid, launch_command}`.
+- **APP-063** [M1] (contract) The requester (an app, `lil`, or `lil-mcp` on behalf of an agent) calls `open_in(app, target, intent)` or `ui.show(target)`; the core returns `{running, pid, launch_command}`.
   - If the target app is running, the requester calls `AllowSetForegroundWindow(pid)` (this works when the requester itself has foreground rights, e.g. the app you're using); then the core delivers `open_requests:<app>` and the target activates (`app/activate`).
-  - If it isn't running, the requester launches it with the request on its command line. `ww-mcp` may launch apps on an agent's behalf, without focus (below).
+  - If it isn't running, the requester launches it with the request on its command line. `lil-mcp` may launch apps on an agent's behalf, without focus (below).
 - **APP-064** [M1] (invariant) **The core never launches GUI apps.** It may sit in a terminal's job object, and Windows wouldn't let its windows come forward.
 - **APP-065** [M1] (invariant) **Agents never steal focus.** `ui.show` and agent `open_in` show the content without activating the window (taskbar flash) and post a notification; clicking it brings the window forward. When Claude Code runs in a focused terminal, a launched app may come forward on its own; that's a bonus, not relied on.
 - **APP-066** [M1] (contract) **Intents:** `open`; `edit` (creates or resumes a working document); `use_as_input`.
@@ -913,7 +913,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 **Clipboard and drag-out** (one `QMimeData` subclass in the C++ shim)
 
 - **APP-068** [M1] (contract) Copy and drag-out offer these formats:
-  - `application/x-worldwright-ref` (refs plus type, version and thumbnail path) for the suite;
+  - `application/x-lilith-ref` (refs plus type, version and thumbnail path) for the suite;
   - a standard bitmap plus the exact PNG bytes (Windows "PNG" format) for image-aware programs;
   - a file URL to an exported copy for Explorer, browsers and Discord;
   - no plain text by default (it makes some programs paste text instead of the image). "Copy reference" is a separate command.
@@ -937,7 +937,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Libraries (shared resources)**
 
-- **APP-078** [M1] (contract) Libraries are typed resources usable in every app and by agents. Workspace resources live in `library/resources/<kind>/`; personal resources live in `%APPDATA%\Worldwright\resources\` and are available in no-workspace mode. One shared Libraries panel; changes are published on the `resources` topic.
+- **APP-078** [M1] (contract) Libraries are typed resources usable in every app and by agents. Workspace resources live in `library/resources/<kind>/`; personal resources live in `%APPDATA%\LILITH\resources\` and are available in no-workspace mode. One shared Libraries panel; changes are published on the `resources` topic.
 - **APP-079** [M1a] Resource kinds in M1a: `swatch`, `palette`, `prompt_preset`, `style_preset` (prompt + LoRAs + settings for a compatible model-profile family, §5.6), `model_profile` (§5.6; personal by default, since models are machine-level, with workspace overrides), and `prompt_brief` (a promoted Prompt Studio brief, AI-183).
 - **APP-080** [M1a] Resource kind `workflow`: a ComfyUI workflow with marked slots (§5.6, §5.7). It's saved from the ComfyUI tab (M1a) and opened by the Graph tab and workflow-on-layer (M1b).
 - **APP-081** [Later] Resource kinds `gradient`, `export_preset`, `brush` and `text_style` (the last two with the matching Image studio features, §5.11).
@@ -945,7 +945,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 ### 3.5 Documents (things you edit by hand)
 
-**The Worldwright document** is the suite's native editable format. §5.2 defines the layer model and chunk encoding.
+**The LILITH document** is the suite's native editable format. §5.2 defines the layer model and chunk encoding.
 
 - **APP-083** [M1] (contract) **Inside a workspace**, a document is a folder `assets/<id>/work/<doc_id>/` containing:
   - `doc.json` — layer tree, blend modes, masks, transforms, linked inputs (refs), and `based_on` (the version or candidate it started from);
@@ -956,7 +956,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 - **APP-085** [M1] (contract) **Outside a workspace** (loose files, no-workspace mode), the same layout (`doc.json`, `chunks/`, `thumbnail.png`, `proposals/`) is stored as a single uncompressed-zip file, **`.wwdoc`**, which is what file associations and Explorer thumbnails use. "Add to project" unpacks a `.wwdoc` into a workspace folder, and its open proposals move with it.
 
 **Three kinds of "staging"** — these names are used consistently across the spec:
-- **store staging handles** — temporary areas `store` issues to engines and converters (`.worldwright/staging/`, §2.0);
+- **store staging handles** — temporary areas `store` issues to engines and converters (`.lilith/staging/`, §2.0);
 - **document save handles** — what `app/doc.stage` returns for one document save;
 - **proposals** — generation results waiting on the canvas's staging bar (§5.5).
 
@@ -964,12 +964,12 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 - **APP-086** [M1] (contract) **Save sequence:** the app asks `store` for a document save handle (`app/doc.stage`), writes the changed chunks and `doc.json` there, then calls `app/doc.commit(handle, expected_hash)`. `store` checks the hash (conflict → keep both; error `store.hash_conflict`), moves the files in atomically, records the new hash, and tells the watcher to ignore its own write.
 - **APP-087** [M1] (invariant) **Opening, editing and saving never change the asset's status.** A save updates index edges and emits events only — no manifest, `progress.md` or status change. The asset gets a `has_working_doc` flag so Home and the Asset browser can show "being edited". `auto_candidate_on_save` (APP-101) is the only kind of save that changes status, and it does so through a candidate run.
-- **APP-088** [M1] (invariant) **Documents are machine-local:** `work/` is gitignored (`ww doctor` adds `assets/*/work/` to `.gitignore`). On another clone of the workspace, documents simply aren't there until restored from a checkpoint (APP-092).
+- **APP-088** [M1] (invariant) **Documents are machine-local:** `work/` is gitignored (`lil doctor` adds `assets/*/work/` to `.gitignore`). On another clone of the workspace, documents simply aren't there until restored from a checkpoint (APP-092).
 
 **Protecting work**
 
-- **APP-089** [M1] **Autosave** every 30 s to `%LOCALAPPDATA%\Worldwright\recovery\<app>\`; after a crash, `app/doc.recover` offers the recovery file.
-- **APP-090** [M1] **Rolling snapshots:** the last 5 saves plus one per day for 14 days, kept in a separate content-addressed snapshot store in the per-workspace local data folder, which is always on the workspace's volume: `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\snapshots\`, or `<volume>:\.worldwright-local\<hash>\snapshots\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§1, §7.2). The store holds `chunks/<sha256>.chunk` (shared by all snapshots) and one `doc.json` per snapshot under `<doc_id>/`. Chunks are hardlinked from the document (deduplicated at chunk level) and copied only when the file system can't hardlink (e.g. an exFAT drive). Snapshots survive even if `work/` is wiped (e.g. by `git clean -X`).
+- **APP-089** [M1] **Autosave** every 30 s to `%LOCALAPPDATA%\LILITH\recovery\<app>\`; after a crash, `app/doc.recover` offers the recovery file.
+- **APP-090** [M1] **Rolling snapshots:** the last 5 saves plus one per day for 14 days, kept in a separate content-addressed snapshot store in the per-workspace local data folder, which is always on the workspace's volume: `%LOCALAPPDATA%\LILITH\workspaces\<hash>\snapshots\`, or `<volume>:\.lilith-local\<hash>\snapshots\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§1, §7.2). The store holds `chunks/<sha256>.chunk` (shared by all snapshots) and one `doc.json` per snapshot under `<doc_id>/`. Chunks are hardlinked from the document (deduplicated at chunk level) and copied only when the file system can't hardlink (e.g. an exFAT drive). Snapshots survive even if `work/` is wiped (e.g. by `git clean -X`).
 - **APP-091** [M1] **Backups:** `work/`, proposals and the rolling snapshots are included in the suite's restic backups (§7.4). Diagnostics shows the backup status line (APP-134).
 - **APP-092** [M1.5] **Checkpoints:** an explicit "Checkpoint document" uploads the document's content-addressed chunks and `doc.json` to the `docs/` prefix of the S3-compatible large-file store (§7.2); unchanged chunks are never re-uploaded. "Restore documents from checkpoint" brings documents to another machine. Retention is a suite-side mark-and-sweep that uses a separate delete-capable key reserved for that job (the suite asks before its first run). Without a cloud store, checkpoints aren't available; local snapshots still work.
 
@@ -1024,7 +1024,7 @@ In M1 these are panels inside the Image studio; a separate Hub app hosts them la
 
 **Usage & spend**
 
-- **APP-116** [M1] Month-to-date and daily spend, broken down by provider, model, project, workspace (including "loose"), **caller** (you / assistant / Claude Code / `ww`), **account** and tool. Unattributed outside-ComfyUI spend is shown separately.
+- **APP-116** [M1] Month-to-date and daily spend, broken down by provider, model, project, workspace (including "loose"), **caller** (you / assistant / Claude Code / `lil`), **account** and tool. Unattributed outside-ComfyUI spend is shown separately.
 - **APP-117** [M1] Tokens, images and seconds by model; estimated vs reconciled costs marked; CSV export.
 - **APP-118** [M1] (invariant) **Billing bases are kept apart.** Claude Code (Engine A) usage is `subscription_quota`: shown in its own units with the API-equivalent estimate labelled as such, and excluded from spend totals and money caps. Usage-credit spend is real money and counts, per account (§4.6).
 - **APP-119** [M1] **Fixed recurring costs** you enter once — each Claude plan (per profile, §4.6a) and flat backup subscriptions (OneDrive, BorgBase, Hetzner; §7.4) — are included in monthly totals. Caps don't apply to them.
@@ -1054,7 +1054,7 @@ In M1 these are panels inside the Image studio; a separate Hub app hosts them la
 
 Prompt Studio's brief, interview, compiler and tools are specified in §4.7a; its image-specific rules are in §5.6a. This subsection covers its two surfaces: the Prompt Studio view, and the "Improve this prompt" button beside other modules' prompt boxes.
 
-- **APP-149** [M1a] (decision) In M1 the Prompt Studio is a full main-area tab of the Image studio (IMG-003). It opens from a brief in the Asset browser, through "Open in Prompt Studio", or from the app switcher (APP-006), whose "Prompt Studio" entry focuses the Image studio's tab in M1. Its QML lives in `ww-ui-kit`, so later apps host the same view and the same `PromptBox` (APP-152). A standalone Prompt Studio app comes Later, staged as the Hub is (ARCH-011).
+- **APP-149** [M1a] (decision) In M1 the Prompt Studio is a full main-area tab of the Image studio (IMG-003). It opens from a brief in the Asset browser, through "Open in Prompt Studio", or from the app switcher (APP-006), whose "Prompt Studio" entry focuses the Image studio's tab in M1. Its QML lives in `lil-ui-kit`, so later apps host the same view and the same `PromptBox` (APP-152). A standalone Prompt Studio app comes Later, staged as the Hub is (ARCH-011).
 - **APP-150** [M1a] **Layout** (panels within the tab, dockable where the shell supports it):
   - **Request box:** the rough request; the targets (kind, operation, profile); and the engine chip, which shows the engine, the model or profile label and, for API engines, the estimated cost per step.
   - **Question flow:** one question at a time, with a "question 2 of up to 5" counter, "I don't mind", "Other…", **Just write it**, and Back to reopen an earlier answer.
@@ -1066,7 +1066,7 @@ Prompt Studio's brief, interview, compiler and tools are specified in §4.7a; it
   - A `visual_pick` question shows its options as text at once, and the previews fill in as they arrive. Answering before they finish cancels them.
   - A cap prompt appears inline (APP-054).
   - If the engine fails, the flow falls back to the question bank with a one-line notice; it never dead-ends.
-- **APP-152** [M1a] (invariant) **"Improve this prompt".** Every prompt-text field in `ww-ui-kit` is the shared `PromptBox` component, which carries the "Improve this prompt" button and the recall chip (APP-153). Its placements, by milestone, are listed in AI-193, AI-196 and AI-197. The button opens a pop-over that runs the compact interview (AI-168), using the box's current text as the source prompt and the box's context as the target. A preset's prompt field targets the preset's profile family.
+- **APP-152** [M1a] (invariant) **"Improve this prompt".** Every prompt-text field in `lil-ui-kit` is the shared `PromptBox` component, which carries the "Improve this prompt" button and the recall chip (APP-153). Its placements, by milestone, are listed in AI-193, AI-196 and AI-197. The button opens a pop-over that runs the compact interview (AI-168), using the box's current text as the source prompt and the box's context as the target. A preset's prompt field targets the preset's profile family.
   - On a box already **linked** to a brief, the interview runs with that brief (`brief: <linked>`) and patches its draft; no new brief is created.
   - On a box that isn't linked, the result is a document-held draft (AI-159), not a new asset.
   - The pop-over then shows the original and the improved text with a diff, and three actions:
@@ -1100,7 +1100,7 @@ These are verified in the M0 and M1 benchmarks and reported pass/fail in each mi
 ### 3.8 Milestone scope
 
 - **M0 spike:** frame times and GUI-thread stalls under ComfyUI load (APP-135); pasting into Discord and Chromium (APP-071).
-- **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.wwdoc`; "Add to project"; the `ww:` protocol (including `ww:task/<job_id>`), `.wwref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
+- **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.wwdoc`; "Add to project"; the `lil:` protocol (including `lil:task/<job_id>`), `.wwref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
 - **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
 - **M1.5:** named layout presets; document checkpoints and cross-machine restore (with the S3-compatible store); resolving references through `renamed_from`; the interactive Claude Code token panel.
 - **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; a standalone Prompt Studio app; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
@@ -1126,7 +1126,7 @@ This section covers how the core talks to hosted and local AI models, how every 
 
 - **AI-004** [M1] (contract) Adapters call providers over raw HTTPS with `reqwest`. There is no official Anthropic Rust SDK (official SDKs: Python, TypeScript, C#, Go, Java, PHP, Ruby; verified 2026-10-12), so request and response shapes come from the providers' API docs. Anthropic requests send `anthropic-version: 2023-06-01`.
 - **AI-005** [M1] (invariant) Every provider feature the suite uses has recorded request/response fixtures.
-- **AI-006** [M1] (contract) Provider profiles and prices are **suite-level data**, shipped and updated with the suite in `%APPDATA%\Worldwright\providers\` (`providers.yaml`, `prices.yaml`), with optional per-workspace overrides. The workspace's `registry/models.yaml` keeps routes and defaults (§4.5).
+- **AI-006** [M1] (contract) Provider profiles and prices are **suite-level data**, shipped and updated with the suite in `%APPDATA%\LILITH\providers\` (`providers.yaml`, `prices.yaml`), with optional per-workspace overrides. The workspace's `registry/models.yaml` keeps routes and defaults (§4.5).
 - **AI-007** [M1] (contract) Each provider profile declares: base URLs per region; auth style; endpoints; capability flags (tools, strict, `json_schema`, parallel tools, streaming usage, vision, server-side fallback); quirk flags; usage-field mapping; account-API definitions (§4.3); error mapping.
 - **AI-008** [M1] `openai_chat` handles these quirks through profile flags:
   - reasoning text field: `reasoning_content`, `reasoning`, `<think>` tags, or Mistral `thinking` chunks;
@@ -1223,7 +1223,7 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 
 - **AI-034** [M1] (contract) Entries in the workspace's `registry/models.yaml` carry `routes[]` (provider profile + model id per route, e.g. DeepSeek direct vs OpenRouter vs NanoGPT), capabilities (tools, vision, structured output, context, max output), a price reference, recommended settings, fallbacks and `last_verified`. `models.yaml` also registers local model files by hash.
 - **AI-035** [M1] (contract) Personal `model_profile` Library resources (§5) refer to registered model files by hash.
-- **AI-036** [M1] (contract) Defaults per task live in the settings cascade (`defaults.models` in `worldwright.yaml`, overridable per project and per request): `assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate`, `image_edit`, and others as apps add tasks. `defaults.models.image_generate` names a model profile (§5).
+- **AI-036** [M1] (contract) Defaults per task live in the settings cascade (`defaults.models` in `lilith.yaml`, overridable per project and per request): `assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate`, `image_edit`, and others as apps add tasks. `defaults.models.image_generate` names a model profile (§5).
 - **AI-037** [M1] There is no automatic cheapest-route selection in M1: the user chooses defaults and routes, and fallbacks apply on errors.
 - **AI-038** [M1] Model lists are refreshed daily from providers that expose them. A deprecation or 404 switches to the configured fallback and flags the entry. Known retirements (verified 2026-10-12): Xiaomi MiMo v2.5 ids retire 2026-10-21; DeepSeek's old names retired 2026-07-24; Kimi `moonshot-v1` retired 2026-08-31.
 
@@ -1233,10 +1233,10 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 
 - **AI-039** [M1b] **Co-pilot** (the default mode) acts on the user's requests step by step in the open app, including the document being edited (agent `doc.*` forwarding to the open document is in M1; §3, §5).
 - **AI-040** [M1b] (invariant) A co-pilot's pending calls (calls awaiting confirmation) are cancelled if its app closes.
-- **AI-041** [M1b] (contract) **Director** mode turns a goal into a **director task**: a first-class job (`kind: assistant_task`, §2) whose plan and step state are held by the core, with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused` and `interrupted`.
+- **AI-041** [M1b] (contract) **Director** mode (the director agent, **MAGI Core**) turns a goal into a **director task**: a first-class job (`kind: assistant_task`, §2) whose plan and step state are held by the core, with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused` and `interrupted`.
 - **AI-042** [M1b] (invariant) A director task keeps running when the user closes the app.
 - **AI-043** [M1b] (invariant) After a core restart a director task becomes `interrupted`, and only the user can resume it — never automatically.
-- **AI-044** [M1b] (invariant) Destructive/exec steps and cap confirmations never block a director run. The call returns `pending_confirmation` with a confirmation id (§6); the director continues with other steps and checks back. If nothing else can proceed, the task pauses (`waiting_confirmation`) and the notification path (§3) brings the user to the decision. A director task always gets `pending_confirmation`, never `cap.exceeded`: that error is only for callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks; §2, §6).
+- **AI-044** [M1b] (invariant) Destructive/exec steps and cap confirmations never block a director run. The call returns `pending_confirmation` with a confirmation id (§6); the director continues with other steps and checks back. If nothing else can proceed, the task pauses (`waiting_confirmation`) and the notification path (§3) brings the user to the decision. A director task always gets `pending_confirmation`, never `cap.exceeded`: that error is only for callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks; §2, §6).
 - **AI-045** [M1b] M1 allows one director task per workspace; others queue.
 - **AI-046** [M1b] The engine is a suite-level setting (default Claude Code) with a per-conversation override for co-pilot; director tasks run on Engine A, or move to Engine B only by hand-off (AI-150) until direct Engine B director tasks arrive in M1.5 (AI-152). For Engine A, each conversation and director task also records the Claude Code profile it runs under (§4.6a).
 
@@ -1252,31 +1252,31 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
   - `--permission-mode default`, always — without it a `-p` run can start in `auto` mode, where a classifier approves actions before the suite sees them;
   - `--setting-sources project,local` (or none, if M0 shows that works with the user's login and `--mcp-config`), so the user-level allow rules, default mode, hooks, `env` blocks, `apiKeyHelper` and plugin enablement don't load; plus `--settings <suite engine settings>` carrying the mode preset and `env: {CLAUDE_CODE_ENABLE_TELEMETRY: "0"}`;
   - `--strict-mcp-config --mcp-config <core-generated file>` (below);
-  - `--disallowedTools WebFetch,WebSearch` (opt-in per task), `--disable-slash-commands` (the user's personal skills don't load), `--permission-prompt-tool mcp__ww__approve`;
+  - `--disallowedTools WebFetch,WebSearch` (opt-in per task), `--disable-slash-commands` (the user's personal skills don't load), `--permission-prompt-tool mcp__lil__approve`;
   - one fixed `--append-system-prompt-file` covering both modes;
   - `--model`, `--effort` and `--max-turns` per task.
-- **AI-051** [M1b] (contract) The core-generated MCP config launches the **real `ww-mcp.exe` by absolute path**, so it is a direct child of `claude.exe`. Its entry's `env` carries the per-launch engine token, the conversation's workspace id (or `none`) and `WW_PROFILE=<profile id>` (passed explicitly, because Claude Code's subprocess scrub can strip `CLAUDE_CONFIG_DIR` from child processes). `ww-mcp` sends all three in its `core/hello` handshake (§1). The user's own MCP servers are added only if the user has opted them in. Strict mode drops plugin-provided servers, so nothing in Engine A depends on the plugin.
+- **AI-051** [M1b] (contract) The core-generated MCP config launches the **real `lil-mcp.exe` by absolute path**, so it is a direct child of `claude.exe`. Its entry's `env` carries the per-launch engine token, the conversation's workspace id (or `none`) and `LIL_PROFILE=<profile id>` (passed explicitly, because Claude Code's subprocess scrub can strip `CLAUDE_CONFIG_DIR` from child processes). `lil-mcp` sends all three in its `core/hello` handshake (§1). The user's own MCP servers are added only if the user has opted them in. Strict mode drops plugin-provided servers, so nothing in Engine A depends on the plugin.
 - **AI-052** [M1b] (invariant) The generated MCP config file lives in a user-only temp folder and is deleted after `system/init`.
-- **AI-053** [M1b] (contract) `mcp__ww__approve` is a tool on the suite's own MCP server, exposed only to engine connections.
+- **AI-053** [M1b] (contract) `mcp__lil__approve` is a tool on the suite's own MCP server, exposed only to engine connections.
 - **AI-054** [M1b] (invariant) The appended system prompt is fixed for the life of a conversation: Claude Code records the system prompt on a conversation's first request and ignores a changed one on resume. The current mode is delivered as a short core-written preamble in each user turn.
 - **AI-055** [M1b] The working directory is always the workspace (or a suite-owned scratch folder in no-workspace mode). Loose files are passed with `--add-dir` or as file references.
-- **AI-056** [M1b] (invariant) `claude`'s environment is built from an allowlist: `PATH`, `SystemRoot`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, `CLAUDE_CODE_GIT_BASH_PATH`, proxy variables, `CLAUDE_CONFIG_DIR` (set to the profile's folder; unset for the default profile, §4.6a), the non-secret marker `WW_ENGINE=1`, plus `OTEL_METRICS_EXPORTER=none` and `OTEL_LOGS_EXPORTER=none`. Everything else is removed, including all `ANTHROPIC_*` (among them `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`), `CLAUDE_CODE_USE_*` (Bedrock, Vertex, Foundry), `CLAUDE_CODE_OAUTH_TOKEN` and every provider key — any of these would silently override the profile's sign-in and bill a different credential.
-- **AI-057** [M1b] (invariant) The per-launch engine token is **never** in `claude`'s environment (it would leak into every command the agent runs); it reaches `ww-mcp` only through the generated MCP config.
-- **AI-058** [M1b] (contract) Director preset: file edits allowed in project text files (`*.md`) and a scratch folder; edits **denied** on `assets/**`, `registry/**`, `queue/**`, `**/*.manifest.json` and `.worldwright/**` (those change only through the suite's tools, so `store` stays the only suite writer); a short allowlist of read-only commands; deletes, installs and scripts denied (the suite's own tools do those, with suite confirmations).
-- **AI-059** [M1b] (invariant) In director mode the approve tool **never waits**: anything Claude Code would ask about that isn't on the preset is denied with "use the `ww` tool, which can ask the user for confirmation" (the `ww` call then returns `pending_confirmation`). Claude Code's own prompts don't time out, so waiting would stall the run.
+- **AI-056** [M1b] (invariant) `claude`'s environment is built from an allowlist: `PATH`, `SystemRoot`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, `CLAUDE_CODE_GIT_BASH_PATH`, proxy variables, `CLAUDE_CONFIG_DIR` (set to the profile's folder; unset for the default profile, §4.6a), the non-secret marker `LIL_ENGINE=1`, plus `OTEL_METRICS_EXPORTER=none` and `OTEL_LOGS_EXPORTER=none`. Everything else is removed, including all `ANTHROPIC_*` (among them `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`), `CLAUDE_CODE_USE_*` (Bedrock, Vertex, Foundry), `CLAUDE_CODE_OAUTH_TOKEN` and every provider key — any of these would silently override the profile's sign-in and bill a different credential.
+- **AI-057** [M1b] (invariant) The per-launch engine token is **never** in `claude`'s environment (it would leak into every command the agent runs); it reaches `lil-mcp` only through the generated MCP config.
+- **AI-058** [M1b] (contract) Director preset: file edits allowed in project text files (`*.md`) and a scratch folder; edits **denied** on `assets/**`, `registry/**`, `queue/**`, `**/*.manifest.json` and `.lilith/**` (those change only through the suite's tools, so `store` stays the only suite writer); a short allowlist of read-only commands; deletes, installs and scripts denied (the suite's own tools do those, with suite confirmations).
+- **AI-059** [M1b] (invariant) In director mode the approve tool **never waits**: anything Claude Code would ask about that isn't on the preset is denied with "use the `lil` tool, which can ask the user for confirmation" (the `lil` call then returns `pending_confirmation`). Claude Code's own prompts don't time out, so waiting would stall the run.
 - **AI-060** [M1b] (contract) Co-pilot preset: the same write denials; other actions Claude Code asks about are shown to the user in the suite (the user is present) and answered within a few minutes, or denied.
 - **AI-061** [M1b] (invariant) Before a run is used, the core checks (any failure refuses the run with a clear message and the fix):
   - the Claude Code version is in the tested range from `claude_code.yaml` (minimum **2.1.268**, needed for `configDirectory`); older **and newer untested** versions are refused with `engine.claude_code.untested_version` (§6). A future release is expected to make `--bare` — no plugins, no subscription login — the default for `-p`; the version gate catches it;
   - the profile's sign-in, verified as in AI-062;
-  - `system/init` reports `apiKeySource: "none"`, the `ww` server connected with its expected tools, and the `interrupt_receipt_v1` capability.
+  - `system/init` reports `apiKeySource: "none"`, the `lil` server connected with its expected tools, and the `interrupt_receipt_v1` capability.
 - **AI-062** [M1b] (invariant) Profile verification and launch locking (per profile, §4.6a):
   - when the profile has **no active suite session**, `claude auth status` runs with Engine A's exact environment and settings and must report exit code 0, `authMethod: "claude.ai"` and `configDirectory` equal to the profile's folder;
   - when the profile is busy, a launch goes ahead only if a verification younger than 30 minutes exists **and** the stream's control-protocol `initialize` response reports an `account` (token source / subscription type) matching that verification — a per-launch check that triggers no extra token refresh (M0 confirms the field in headless runs). `apiKeySource: "none"` alone can't tell a claude.ai login from a bearer token, hence the account match;
   - if neither holds, the launch waits until the profile is idle.
 - **AI-063** [M1b] (invariant) Engine calls are recognised by the **per-launch engine token** alone (unguessable, issued per process; the core holds the `claude` process handle, so the PID can't be reused) → caller kind `assistant`, `engine: claude_code`, with the conversation's workspace id. The token is invalid once its `claude` process has ended: calls with it are refused, not downgraded to `cli`. Caller kinds are `ui:*`, `assistant`, `mcp` and `cli` (§1).
-- **AI-064** [M1b] (invariant) Interactive Claude Code sessions are caller kind `mcp`: the connecting process must be `ww-mcp.exe` from the install folder or the per-user bin folder, with a best-effort check that a `claude.exe` is its parent or grandparent. This guards against accidents (a stray `ww-mcp` claiming Claude Code already confirmed something), not against malware running as the user — consistent with §1's trust boundary.
-- **AI-065** [M1b] (invariant) For engine connections the core's own confirmations apply (§2): the core marks the suite's tools as not `requiresUserInteraction` for these connections, and `mcp__ww__approve` auto-allows the suite's own tools, so nothing is asked twice.
-- **AI-066** [M1b] (invariant) The plugin's hooks don't run in Engine A (user settings and plugin enablement aren't loaded); if they run in some configuration, they see `WW_ENGINE=1` and do nothing.
+- **AI-064** [M1b] (invariant) Interactive Claude Code sessions are caller kind `mcp`: the connecting process must be `lil-mcp.exe` from the install folder or the per-user bin folder, with a best-effort check that a `claude.exe` is its parent or grandparent. This guards against accidents (a stray `lil-mcp` claiming Claude Code already confirmed something), not against malware running as the user — consistent with §1's trust boundary.
+- **AI-065** [M1b] (invariant) For engine connections the core's own confirmations apply (§2): the core marks the suite's tools as not `requiresUserInteraction` for these connections, and `mcp__lil__approve` auto-allows the suite's own tools, so nothing is asked twice.
+- **AI-066** [M1b] (invariant) The plugin's hooks don't run in Engine A (user settings and plugin enablement aren't loaded); if they run in some configuration, they see `LIL_ENGINE=1` and do nothing.
 - **AI-067** [M1b] (contract) A turn is stopped with the stream's `interrupt` control request (feature-detected from `system/init` capabilities; Windows has no targetable SIGINT). Killing the process and `--resume` is the fallback.
 - **AI-068** [M1b] (invariant) Idempotency keys for suite tool calls from Engine A are `session id + tool-use id` (a retried tool call from Claude Code reuses its tool-use id; M0 confirms). The core's step state tells a resumed run what is already running.
 - **AI-069** [M1b] (invariant) The suite's conversation store is the source of truth. If a Claude Code session can't be resumed (its transcripts are cleaned up after a period), a new session starts, seeded with a summary.
@@ -1309,7 +1309,7 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 #### Both engines
 
 - **AI-086** [M1b] (invariant) External content (model cards, workflow notes, image metadata, web pages, file names) is wrapped and labelled as data in assistant context. This protects against agents being tricked into acting; it has nothing to do with what the user may create.
-- **AI-087** [M1b] (contract) Conversations are stored in the workspace's local data folder, in `assistant\` — normally `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\assistant\`, or `<volume>:\.worldwright-local\<hash>\assistant\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§2, §7) — not in git, and exportable. Each records its engine and, for Engine A, its profile id.
+- **AI-087** [M1b] (contract) Conversations are stored in the workspace's local data folder, in `assistant\` — normally `%LOCALAPPDATA%\LILITH\workspaces\<hash>\assistant\`, or `<volume>:\.lilith-local\<hash>\assistant\` when the workspace is on a different volume from `%LOCALAPPDATA%` (§2, §7) — not in git, and exportable. Each records its engine and, for Engine A, its profile id.
 
 ### 4.6a Claude Code accounts (profiles)
 
@@ -1318,7 +1318,7 @@ The suite supports several Claude Code profiles (separate config directories), s
 - **AI-088** [M1b] (contract) Claude Code keeps each sign-in, with its settings, history and plugins, in a **config folder**: by default `%USERPROFILE%\.claude`; the `CLAUDE_CONFIG_DIR` variable points it elsewhere. A suite profile is `{id, label, config_dir, last_verified}`, stored in the suite's settings in `%APPDATA%`.
 - **AI-089** [M1b] (invariant) The **default profile** uses Claude Code's normal folder with **no variable set**, so it is the account the user already uses in terminals and the desktop app. The suite never sets `CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude`, because with the variable set `.claude.json` (which holds the sign-in state) is looked for inside the folder instead.
   - Engine A's headless sessions in the default profile appear in the user's own `claude --resume` picker (`-c` skips them); the suite labels them.
-- **AI-090** [M1b] (invariant) **Extra profiles** use folders the suite creates under `%LOCALAPPDATA%\Worldwright\claude-profiles\<id>\`, or an existing folder the user points it at. A folder is rejected if it is inside a workspace (committed and possibly pushed), inside a backed-up path, or inside a synced folder (§7's synced-folder detection).
+- **AI-090** [M1b] (invariant) **Extra profiles** use folders the suite creates under `%LOCALAPPDATA%\LILITH\claude-profiles\<id>\`, or an existing folder the user points it at. A folder is rejected if it is inside a workspace (committed and possibly pushed), inside a backed-up path, or inside a synced folder (§7's synced-folder detection).
 - **AI-091** [M1b] (invariant) The suite never opens `.credentials.json` or `.claude.json`, and never copies, moves or backs up a profile folder. It runs `claude` commands there and edits only that profile's `settings.json`, after asking.
 - **AI-092** [M1b] (invariant) Profile labels and any email shown by `auth status` stay in the suite's settings in `%APPDATA%` and are redacted from diagnostics bundles. Usage records store only the opaque profile id.
 - **AI-093** [M1b] Each profile can carry a plan price as a **fixed recurring cost**, so the dashboard's monthly total includes it (§7's fixed-cost mechanism). Caps don't apply to fixed costs.
@@ -1359,25 +1359,25 @@ Use of each Claude account is subject to Anthropic's terms (AI-106 links them).
 
 ### 4.7 Claude Code integration
 
-The Worldwright plugin **1.3** ships with the suite and adds the MCP server and hooks; plugin 1.2.0 is the current file-based plugin it replaces.
+The `worldwright` plugin **1.3** ships with the suite and adds the MCP server and hooks; plugin 1.2.0 is the current file-based plugin it replaces.
 
 #### A. Claude Code drives the suite
 
-- **AI-107** [M1] (contract) The installer places a real copy of `ww-mcp.exe` (not a launcher) at the fixed per-user path `%LOCALAPPDATA%\Worldwright\bin\ww-mcp.exe` and keeps it updated: only the stable channel owns that copy, and Velopack's after-install / after-update hooks copy it there with rename-then-replace (§7). The plugin's `.mcp.json` points there (with `userConfig` as an override), and the install is also recorded under `HKCU\Software\Worldwright`. That folder is one of the allowed image paths for `mcp` callers (§1).
-- **AI-108** [M1] (invariant) On a version mismatch `ww-mcp` still starts and exposes only `ww.status`, reporting the error.
-- **AI-109** [M1] (invariant) Plugin skills detect a running suite with `ww status --no-start`, not by "MCP tools present", so they never write files directly while the core is running.
-- **AI-110** [M1] (contract) The server is named `ww`. Tools appear as `mcp__plugin_worldwright_ww__<tool>` in the user's interactive sessions and as `mcp__ww__<tool>` in Engine A; hooks, permission rules and the approve tool match both forms.
+- **AI-107** [M1] (contract) The installer places a real copy of `lil-mcp.exe` (not a launcher) at the fixed per-user path `%LOCALAPPDATA%\LILITH\bin\lil-mcp.exe` and keeps it updated: only the stable channel owns that copy, and Velopack's after-install / after-update hooks copy it there with rename-then-replace (§7). The plugin's `.mcp.json` points there (with `userConfig` as an override), and the install is also recorded under `HKCU\Software\LILITH`. That folder is one of the allowed image paths for `mcp` callers (§1).
+- **AI-108** [M1] (invariant) On a version mismatch `lil-mcp` still starts and exposes only `lil.status`, reporting the error.
+- **AI-109** [M1] (invariant) Plugin skills detect a running suite with `lil status --no-start`, not by "MCP tools present", so they never write files directly while the core is running.
+- **AI-110** [M1] (contract) The server is named `lil`. Tools appear as `mcp__plugin_worldwright_lil__<tool>` in the user's interactive sessions and as `mcp__lil__<tool>` in Engine A; hooks, permission rules and the approve tool match both forms.
 - **AI-111** [M1] (contract) Tool descriptions are ≤ 2,000 characters; the server has clear `instructions`; a few core tools (status, project context, job wait) are marked `alwaysLoad`.
 - **AI-112** [M1] (contract) Results are JSON text plus file paths. Claude Code doesn't document `structuredContent` or `resource_link`, so they are included only as optional extras.
 - **AI-113** [M1] (contract) Long work returns a job id; `job.wait` waits at most ~90 s per call (Claude Code backgrounds calls longer than ~2 min).
-- **AI-114** [M1] `ww doctor` offers allow rules for the suite's non-destructive tools in the workspace's `.claude/settings.json` and `ask` rules for destructive ones. In interactive sessions, destructive/exec tools also carry `requiresUserInteraction` (decided per connection by the core, §2).
+- **AI-114** [M1] `lil doctor` offers allow rules for the suite's non-destructive tools in the workspace's `.claude/settings.json` and `ask` rules for destructive ones. In interactive sessions, destructive/exec tools also carry `requiresUserInteraction` (decided per connection by the core, §2).
 - **AI-115** [M1] Project context, the style bible, recent assets and job status are exposed as MCP resources; common workflows as MCP prompts (slash commands).
 - **AI-116** [M1] (contract) Plugin hooks:
   - **SessionStart:** reports the active project, open jobs and pending confirmations (and, from M1.5, maps the session to its workspace for the telemetry receiver);
-  - **PostToolUse** on Write/Edit under the workspace: `ww notify --no-start`;
-  - **PreToolUse "ask"** for Bash/PowerShell deletes, installs and scripts; for the comfy MCP's install, update, download and restart tools; and a separate guard on direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json` (warn-only at first; once every plugin skill has a matching suite tool, they become **deny while a core is running** (checked with `ww status --no-start`) and stay allowed when no core runs, so skills can still work on files directly (ARCH-102));
+  - **PostToolUse** on Write/Edit under the workspace: `lil notify --no-start`;
+  - **PreToolUse "ask"** for Bash/PowerShell deletes, installs and scripts; for the comfy MCP's install, update, download and restart tools; and a separate guard on direct writes to `queue/jobs*.jsonl`, `registry/usage*.jsonl` and `*.manifest.json` (warn-only at first; once every plugin skill has a matching suite tool, they become **deny while a core is running** (checked with `lil status --no-start`) and stay allowed when no core runs, so skills can still work on files directly (ARCH-102));
   - **Notification:** forwards Claude Code notices to Windows notifications via the suite.
-- **AI-117** [M1] The plugin is installed **per profile** (per config folder). For each profile, `ww doctor` checks `claude plugin list --json` (run with that profile's folder) and offers to install or update the plugin there (asks first). Every profile's plugin points at the same fixed `ww-mcp.exe`, so every profile connects to the same suite.
+- **AI-117** [M1] The plugin is installed **per profile** (per config folder). For each profile, `lil doctor` checks `claude plugin list --json` (run with that profile's folder) and offers to install or update the plugin there (asks first). Every profile's plugin points at the same fixed `lil-mcp.exe`, so every profile connects to the same suite.
 
 #### B. The suite drives Claude Code
 
@@ -1394,14 +1394,14 @@ Engine A (§4.6, §4.6a).
 
 - **AI-122** [M1b] Engine A runs are recorded from their own stream (usage deltas and `rate_limit_event`s). Plan-limit percentages per profile come from Engine A's rate-limit events and the occasional per-profile `/usage` check, shown with "last seen" times. Summaries keep billing bases apart.
 - **AI-123** [M1.5] (contract) A loopback OpenTelemetry receiver in the core (bound to 127.0.0.1, `http/json`, with an auth header) records the user's **interactive** Claude Code sessions. It is the core's only network listener — an explicit exception to "the core exposes no network port" (§1). It deduplicates by session id (including Engine A session ids), maps sessions to workspaces through the SessionStart hook (others go to "Claude Code — other projects"), attributes sessions to profiles, and stores one row per session per day.
-- **AI-124** [M1.5] `ww doctor` writes the telemetry settings into **each** profile's `settings.json` (asks first): `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_METRICS_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`, the endpoint and header, and `OTEL_RESOURCE_ATTRIBUTES=ww.profile=<id>`.
-- **AI-125** [M1.5] A `ww statusline --profile <id>` helper, configured per profile, chains with any status line the user already has and reports that profile's `rate_limits.five_hour` / `seven_day` percentages and reset times from interactive sessions.
+- **AI-124** [M1.5] `lil doctor` writes the telemetry settings into **each** profile's `settings.json` (asks first): `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_METRICS_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`, the endpoint and header, and `OTEL_RESOURCE_ATTRIBUTES=lil.profile=<id>`.
+- **AI-125** [M1.5] A `lil statusline --profile <id>` helper, configured per profile, chains with any status line the user already has and reports that profile's `rate_limits.five_hour` / `seven_day` percentages and reset times from interactive sessions.
 
 #### E. Live push into an open session
 
 - **AI-126** [Later] Live push into an open interactive session through Claude Code channels (a research preview as of 2026-10-12).
 
-#### F. Setup and health (first run and `ww doctor` → "Claude Code" page)
+#### F. Setup and health (first run and `lil doctor` → "Claude Code" page)
 
 - **AI-127** [M1] Doctor checks:
   - the resolved path to `claude.exe` (the user's CLI install, not the `.cmd` shim or the desktop app's bundled copy);
@@ -1414,7 +1414,7 @@ Engine A (§4.6, §4.6a).
   - usage credits on/off.
 - **AI-128** [M1b] Doctor's Claude Code page lists every profile: signed in or not, its label, plugin state, last-seen limits, and "Sign in again" (opens the terminal for `/login`).
 - **AI-129** [M1] (invariant) The suite never handles the login itself: "Sign in" opens interactive `claude` in a terminal for `/login`.
-- **AI-130** [M1b] Doctor offers install or update hints and a `ww doctor --claude-smoke` headless run against a fixture tool (cheap model, `--max-turns 2`). The smoke run **runs only when the user confirms**, because it uses plan quota; after a Claude Code version change Doctor offers it again (it never runs by itself, and never in CI, §6). It runs under the profile the user picks (default: the default profile) and also checks that `configDirectory` matches that profile.
+- **AI-130** [M1b] Doctor offers install or update hints and a `lil doctor --claude-smoke` headless run against a fixture tool (cheap model, `--max-turns 2`). The smoke run **runs only when the user confirms**, because it uses plan quota; after a Claude Code version change Doctor offers it again (it never runs by itself, and never in CI, §6). It runs under the profile the user picks (default: the default profile) and also checks that `configDirectory` matches that profile.
 - **AI-131** [M1] (contract) A capability table (`claude_code.yaml`) maps tested Claude Code versions to the flags used. The stream parser tolerates unknown events and records them; stream fixtures are recorded per tested version. An untested version is refused for Engine A (AI-061) and shows a banner: "Claude Code X.Y is untested — run the smoke test to add it, or use the API engine". A passing smoke run on the new version (AI-130) records it as tested for this machine.
 - **AI-132** [M1] If Claude Code is unusable, the API engine is offered when an Anthropic API key exists.
 
@@ -1559,7 +1559,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - Claude Code steps are `subscription_quota` (AI-071) and never count toward money caps (CORE-090).
   - Local steps are local work ($0, GPU time and energy, AI-195).
 - **AI-194** [M1b] (contract) **Claude Code interview engine.** A Claude Code interview step runs `claude` under Engine A's rules (AI-047–AI-072): the environment allowlist, the version gate, the sign-in checks, and metering as `subscription_quota`. It uses its own **`interview` launch profile**:
-  - no `--mcp-config`, so no `ww` tools. AI-061's check that the `ww` server connected with its expected tools doesn't apply to this profile;
+  - no `--mcp-config`, so no `lil` tools. AI-061's check that the `lil` server connected with its expected tools doesn't apply to this profile;
   - its own fixed system-prompt file, an exception to AI-050's single file for both modes. Context arrives as wrapped data in the user turn, and the reply is the step object (AI-170);
   - `--max-turns 1`, with web tools disallowed;
   - the profile named by the suite setting `prompt_studio.claude_code_profile`, which the person sets, so the suite never picks one (AI-105). With no profile set, `auto` skips Claude Code.
@@ -1605,7 +1605,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
     - between profiles whose dialects share a `form`, the stored wording is reused when it fits;
     - for a dialect of a different `form`, a deterministic recompile runs at no cost, and **Reword** is offered.
   - A new brief version, a newer `style_version` than the compile used, or a new dialect version never rewrites a prompt in use. Instead, linked prompt boxes are marked "recompile available" (APP-153).
-- **AI-180** [M1a] (contract) **Dialect declaration.** A dialect is versioned data, shipped and updated with the suite in `%APPDATA%\Worldwright\dialects\`, alongside the provider profiles (CORE-076). It declares:
+- **AI-180** [M1a] (contract) **Dialect declaration.** A dialect is versioned data, shipped and updated with the suite in `%APPDATA%\LILITH\dialects\`, alongside the provider profiles (CORE-076). It declares:
   - `id`, `version`, and `form` (`sentences`, `tags` or `instruction`);
   - the slot order, which is also the trim priority;
   - per-slot templates and defaults, and joiners;
@@ -1724,9 +1724,9 @@ Prompt Studio's milestones are set in AI-193 (M1a: v1 for images with the `provi
 
 #### M0 spike — Claude Code headless (pass/fail)
 
-- **AI-133** [M0] With Engine A's profile (`--setting-sources`, `--settings`, `--strict-mcp-config`, `--permission-mode default`): the claude.ai login still works (`claude auth status` and `apiKeySource: "none"`), and `ww-mcp` from `--mcp-config` connects. Decided by the M0 spike: whether `--setting-sources` can be empty rather than `project,local`.
+- **AI-133** [M0] With Engine A's profile (`--setting-sources`, `--settings`, `--strict-mcp-config`, `--permission-mode default`): the claude.ai login still works (`claude auth status` and `apiKeySource: "none"`), and `lil-mcp` from `--mcp-config` connects. Decided by the M0 spike: whether `--setting-sources` can be empty rather than `project,local`.
 - **AI-134** [M0] Decided by the M0 spike: `--restricted` (managed + `--settings` only, file tools confined to the working directories, command tools only if named) and `--safe-mode` behaviour with OAuth and `--mcp-config`, and whether `--restricted` serves as the director profile.
-- **AI-135** [M0] Strict mode drops plugin servers; `ww-mcp.exe` launched by absolute path is a direct child of `claude.exe`.
+- **AI-135** [M0] Strict mode drops plugin servers; `lil-mcp.exe` launched by absolute path is a direct child of `claude.exe`.
 - **AI-136** [M0] The `-p` default permission mode, and that `--permission-mode default` overrides it.
 - **AI-137** [M0] The permission-prompt tool's input/output contract, and whether a long-waiting prompt-tool call gets backgrounded.
 - **AI-138** [M0] The `interrupt` control request, and `interrupt_receipt_v1` in `system/init` capabilities.
@@ -1746,7 +1746,7 @@ Prompt Studio's milestones are set in AI-193 (M1a: v1 for images with the `provi
 - **AI-149** [M1] M1 delivers: provider profiles with `anthropic_messages` and `openai_chat` (OpenRouter, NanoGPT, DeepSeek); the usage/cost engine (per-unit rates, prompt-length tiers, cached-input rates, `effective_from`); account sync (Anthropic headers, OpenRouter, NanoGPT, Claude Code plan usage per profile); assistant co-pilot (including agent edits on the open document) and director on Engine A; Claude Code profiles (sign-in, per-conversation account, manual switching through the account picker and the limit-reached choices, per-account limits from Engine A, Doctor's profile list, plugin per profile); Claude Code integration A, B, C, F and the M1 part of D.
 - **AI-150** [M1b] Engine B in M1 supports co-pilot, and director tasks started by hand-off from Engine A.
 
-- **AI-156** [M1b] (decision) The in-app assistant — the Assistant panel, co-pilot and director modes, both engines, Claude Code profiles and plan-limit display (§4.6, §4.6a) — arrives in **M1b**. M1a already lets Claude Code drive the suite from the user's own sessions through plugin 1.3 and `ww-mcp` (§4.7 A), records all metered usage, and includes Prompt Studio's `provider` engine with the provider adapters it needs (§4.7a, AI-171). Rules elsewhere that exist only for the in-app assistant (`assistant_task` jobs, director decisions in the Assistant panel, engine-contract tests) are needed by the end of M1b, not for M1a.
+- **AI-156** [M1b] (decision) The in-app assistant — the Assistant panel, co-pilot and director modes, both engines, Claude Code profiles and plan-limit display (§4.6, §4.6a) — arrives in **M1b**. M1a already lets Claude Code drive the suite from the user's own sessions through plugin 1.3 and `lil-mcp` (§4.7 A), records all metered usage, and includes Prompt Studio's `provider` engine with the provider adapters it needs (§4.7a, AI-171). Rules elsewhere that exist only for the in-app assistant (`assistant_task` jobs, director decisions in the Assistant panel, engine-contract tests) are needed by the end of M1b, not for M1a.
 #### M1.5
 
 - **AI-151** [M1.5] (decision) Local LLMs: `llama-server` as an owned engine and Ollama as an attached one, both through `openai_chat`, selectable per task (captioning, tagging, prompt expansion, local vision QA) and as the "use a local model" choice at a plan limit; metered as local ($0, GPU time and energy) and scheduled around image jobs for VRAM.
@@ -1762,7 +1762,7 @@ Prompt Studio's milestones are set in AI-193 (M1a: v1 for images with the `provi
 
 ## 5. Image studio
 
-The Image studio (`ww-image`, §1) is the suite's first app: an Invoke-style AI canvas with layers and solid painting basics, a native view of ComfyUI node graphs, and ComfyUI's own web UI embedded. Every operation described here is a core tool (§2.11), so the assistant and Claude Code can do anything the panels can. Research behind this section: `research-image-studio-ux.md`, `research-image-local-models.md`, `research-canvas-engine.md` (Appendix C).
+The Image studio (`lil-image`, §1) is the suite's first app: an Invoke-style AI canvas with layers and solid painting basics, a native view of ComfyUI node graphs, and ComfyUI's own web UI embedded. Every operation described here is a core tool (§2.11), so the assistant and Claude Code can do anything the panels can. Research behind this section: `research-image-studio-ux.md`, `research-image-local-models.md`, `research-canvas-engine.md` (Appendix C).
 
 - **IMG-001** [M1] (decision) The Image studio provides an Invoke-level AI canvas plus solid basics (brush, eraser, selections including AI select object, transform, crop, common adjustments); a native node editor that can **view, tweak and run** ComfyUI workflows in M1 (adding nodes and editing connections in M1.5); and ComfyUI's own web UI embedded. Generation uses local ComfyUI models by default; hosted image providers arrive in M1.5 (§4.4).
 - **IMG-002** [M1] (decision) M1 for the Image studio is delivered in two halves, M1a (first usable studio) and M1b (completes the studio), as listed in §5.11. Rules in this section carry `[M1a]` or `[M1b]` accordingly.
@@ -1779,7 +1779,7 @@ The Image studio (`ww-image`, §1) is the suite's first app: an Invoke-style AI 
 
 ### 5.2 The document model
 
-The canvas is stored as a Worldwright document (§3.5). This section fixes its layer model, pixel formats and on-disk layer format.
+The canvas is stored as a LILITH document (§3.5). This section fixes its layer model, pixel formats and on-disk layer format.
 
 - **IMG-010** [M1a] The canvas is a large coordinate space; the document has a nominal size that can grow (outpainting can extend it in any direction, including left and up).
 - **IMG-011** [M1a] Every layer can be named, shown/hidden, **enabled for generation** (separately from visibility), locked, reordered and grouped.
@@ -2001,10 +2001,10 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
 ### 5.8 ComfyUI tab — embedded web UI
 
 - **IMG-126** [M1a] (invariant) The ComfyUI tab is a QtWebEngine view loading ComfyUI from **its own origin** (`http://127.0.0.1:8188`) in a named persistent profile. Popups are handled, navigation is pinned to that origin, **downloads are blocked** (no file is saved from the page; use the suite's export), and there is no bridge from the page into the suite. The WebEngine is loaded only on first show of the tab.
-- **IMG-127** [M1a] **Open in ComfyUI** loads a workflow by calling the frontend's graph-loading function through `runJavaScript`, passing the graph as base64 decoded inside the page (no script injection), into a new workflow tab where possible (IMG-159). The call is async, so it reports success or failure through a page flag the suite polls. (M0 result, 2026-10-12: with frontend 1.53.10 the call is `await window.app.loadGraphData(graph, true, true, null, {openSource: 'worldwright'})`, which opens a new temporary tab ("Unsaved Workflow (n)") and leaves the open tabs alone. The graph is passed as a base64 string literal and decoded in the page (`atob` + strict UTF-8 `TextDecoder` + `JSON.parse`); every argument spliced into the script must fully match a **strictly anchored allowlist** (`\A[A-Za-z0-9+/=:._-]*\z`; a `^…$` pattern let a trailing newline through). The result goes to a page flag (`pending` → `ok` | `error:<msg>`); readiness is `window.app && app.canvas && app.extensionManager.workflow.activeWorkflow`. These are internal frontend APIs, so the suite pins them to frontend **1.53.10** and checks `window.__COMFYUI_FRONTEND_VERSION__` before scripting. `docs/spikes/06-webengine-comfyui.md` §7.)
-- **IMG-128** [M1a] (contract) Graphs opened this way are stamped `extra.worldwright: {source_ref, base_hash}` so they can be matched when they come back.
-- **IMG-129** [M1a] **Send to Worldwright** reads the current graph synchronously (`JSON.stringify(app.graph.serialize())` via `runJavaScript`) and offers **Update source** (hash check against `base_hash`; on conflict keep both) or **Save as new workflow**. (M0 result, 2026-10-12: `JSON.stringify(window.app.graph.serialize())` confirmed; `app.graph` is the root graph, so subgraph definitions are included even while a subgraph is open. **Update source must compare a normalised graph, not raw text**: the frontend adds `properties.proxyWidgetErrorQuarantine` to some nodes on load (seen on the Z-Image template), so a raw hash changes even when you changed nothing. `docs/spikes/06-webengine-comfyui.md` §8.)
-- **IMG-130** [M1b] Send to Worldwright also offers **Run now** (`image.workflow.run` through the suite's conversion, IMG-123). In M1a, workflows run in the ComfyUI tab itself.
+- **IMG-127** [M1a] **Open in ComfyUI** loads a workflow by calling the frontend's graph-loading function through `runJavaScript`, passing the graph as base64 decoded inside the page (no script injection), into a new workflow tab where possible (IMG-159). The call is async, so it reports success or failure through a page flag the suite polls. (M0 result, 2026-10-12: with frontend 1.53.10 the call is `await window.app.loadGraphData(graph, true, true, null, {openSource: 'lilith'})`, which opens a new temporary tab ("Unsaved Workflow (n)") and leaves the open tabs alone. The graph is passed as a base64 string literal and decoded in the page (`atob` + strict UTF-8 `TextDecoder` + `JSON.parse`); every argument spliced into the script must fully match a **strictly anchored allowlist** (`\A[A-Za-z0-9+/=:._-]*\z`; a `^…$` pattern let a trailing newline through). The result goes to a page flag (`pending` → `ok` | `error:<msg>`); readiness is `window.app && app.canvas && app.extensionManager.workflow.activeWorkflow`. These are internal frontend APIs, so the suite pins them to frontend **1.53.10** and checks `window.__COMFYUI_FRONTEND_VERSION__` before scripting. `docs/spikes/06-webengine-comfyui.md` §7.)
+- **IMG-128** [M1a] (contract) Graphs opened this way are stamped `extra.lilith: {source_ref, base_hash}` so they can be matched when they come back.
+- **IMG-129** [M1a] **Send to LILITH** reads the current graph synchronously (`JSON.stringify(app.graph.serialize())` via `runJavaScript`) and offers **Update source** (hash check against `base_hash`; on conflict keep both) or **Save as new workflow**. (M0 result, 2026-10-12: `JSON.stringify(window.app.graph.serialize())` confirmed; `app.graph` is the root graph, so subgraph definitions are included even while a subgraph is open. **Update source must compare a normalised graph, not raw text**: the frontend adds `properties.proxyWidgetErrorQuarantine` to some nodes on load (seen on the Z-Image template), so a raw hash changes even when you changed nothing. `docs/spikes/06-webengine-comfyui.md` §8.)
+- **IMG-130** [M1b] Send to LILITH also offers **Run now** (`image.workflow.run` through the suite's conversion, IMG-123). In M1a, workflows run in the ComfyUI tab itself.
 - **IMG-131** [M1a] (invariant) A graph read from the page is untrusted input: it gets a size limit and schema validation, and is wrapped as data whenever an agent sees it.
 - **IMG-132** [M1b] Fallback when page scripting fails: ComfyUI's own saved-workflow store (`/userdata/workflows/…`) is listed in the Graph tab.
 - **IMG-133** [M1a] Jobs run from the ComfyUI tab are observed by the core (§2.8) and their outputs can be imported.
@@ -2015,7 +2015,7 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
 - **IMG-135** [M1a] **Save** (the document, §3.5), **Make candidate** (flatten → asset candidate run, §3.5) and **Copy / drag** (§3.4).
 - **IMG-136** [M1a] **Export** to PNG, JPEG and WebP.
 - **IMG-137** [M1b] **Export** to TIFF 16-bit and OpenRaster (ORA, with a loss warning).
-- **IMG-138** [M1] (decision) ORA is import/export only; the Worldwright document is the canvas format.
+- **IMG-138** [M1] (decision) ORA is import/export only; the LILITH document is the canvas format.
 - **IMG-139** [M1a] Embedding the workflow in exports is off by default for documents (a multi-step document's single workflow would misrepresent it) and on by default for direct workflow outputs; an option embeds the document's recipe chain instead.
 - **IMG-140** [M1a] (contract) Every staged result and candidate records its recipe: profile (with content hash), model hashes, LoRAs, seed, prompt, frame and generation size, infill and mask settings, inputs (saved as files) and environment. When the prompt came from Prompt Studio, the recipe also holds the full, immutable compile record, overrides included, with the brief snapshot's content hash (AI-176). A candidate run also lists the sealed brief `brf_…@<version>` among its inputs (AI-160, AI-184), and a proposal records the brief for recall only (IMG-176).
 
@@ -2047,7 +2047,7 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
   - agent tools for all of the above.
 - **IMG-149** [M1b] (decision) **M1b — completes the studio:**
   - Qwen-Image-2.1 and FLUX.2 klein adapters (instruction edit, references, transparent output);
-  - the Graph tab (view, widget tweaks, mute/bypass, slots, run with its own UI → API conversion), plus **Run now** from Send to Worldwright and the saved-workflow fallback list;
+  - the Graph tab (view, widget tweaks, mute/bypass, slots, run with its own UI → API conversion), plus **Run now** from Send to LILITH and the saved-workflow fallback list;
   - workflow-on-layer;
   - LoRA base-family detection;
   - the `edit_instruction` prompt dialect (IMG-179);
@@ -2080,10 +2080,10 @@ AI agents write most of the code, working on your PC in your account; you test m
 - **QA-001** [M1] (contract) Every tool/RPC result is exactly one of `ok`, `pending_confirmation {confirmation_id, retry_token, expires_at, covers: [confirm, cap]}`, or `error`.
   - The name `pending_confirmation` avoids a clash with document holds.
 - **QA-002** [M1] (contract) `pending_confirmation` is not an error. Agents receive it as a normal result:
-  - MCP: a non-error result whose JSON has `"status": "pending_confirmation"`, the retry token, and a plain sentence ("waiting for you to confirm in Worldwright; continue with other steps and check back");
+  - MCP: a non-error result whose JSON has `"status": "pending_confirmation"`, the retry token, and a plain sentence ("waiting for you to confirm in LILITH; continue with other steps and check back");
   - Engine B: a non-error `tool_result` with the same JSON.
   - Directors continue with other steps while a confirmation is pending (§4.6).
-- **QA-003** [M1] (contract) Errors are defined in `ww-protocol` and carry:
+- **QA-003** [M1] (contract) Errors are defined in `lil-protocol` and carry:
   - `code` — stable and namespaced;
   - `category` — one of `user_fixable`, `transient`, `external_down`, `declined` (denied by you or by a preset), `data_conflict`, `cancelled`, `bug`;
   - a short message and optional detail; raw engine/provider text in the detail is wrapped as untrusted data whenever an agent sees it;
@@ -2098,7 +2098,7 @@ AI agents write most of the code, working on your PC in your account; you test m
 - **QA-005** [M1] (contract) Stable error codes include:
   - confirmations and caps: `confirm.denied`, `confirm.expired`, `confirm.unavailable` and `cap.exceeded` (the last two only when no confirmation can be answered, QA-016);
   - documents and workspaces: `doc.held_elsewhere`, `store.hash_conflict`, `workspace.required` (no-workspace mode for sign-off, Make candidate, Add to project);
-  - protocol: `protocol.incompatible` (`ww-mcp` then exposes only `ww.status`);
+  - protocol: `protocol.incompatible` (`lil-mcp` then exposes only `lil.status`);
   - engines: `engine.claude_code.untested_version` (including any version below the minimum 2.1.268), `engine.claude_code.not_signed_in` (retry policy `after_resolve`), `comfyui.unreachable`, `model.missing`;
   - providers: `provider.rate_limited`, `provider.spend_limit` (retry policy `never`). (plan 2 clarification: Appendix D)
   - Prompt Studio (§4.7a):
@@ -2124,33 +2124,33 @@ AI agents write most of the code, working on your PC in your account; you test m
 - **QA-014** [M1] GPU device loss and renderer recreation are handled (§5.3) and tested.
 - **QA-015** [M1] (invariant) QML runtime warnings fail tests.
 - **QA-016** [M1] (contract) When a call needs a confirmation — an agent safety confirmation or a cap confirmation — it returns `pending_confirmation` whenever that confirmation can be answered: an app is connected or the notification path (§3.3) can reach you. Otherwise it returns an error instead (director tasks excepted: they always get `pending_confirmation` and wait, CORE-114, AI-044):
-  - callers that declare themselves non-interactive (`ww --non-interactive`, scheduled tasks) always get the error, never `pending_confirmation`;
+  - callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks) always get the error, never `pending_confirmation`;
   - the error is `cap.exceeded` for a cap and `confirm.unavailable` for a safety confirmation; category `user_fixable`, retry policy `after_resolve` (fix: raise the cap, or run the call where you can confirm it).
 
 ### 6.2 Keeping AI-written code honest
 
 - **QA-017** [M1] Interface first. For each feature:
-  1. the tool/event/file interface (`ww-protocol` descriptors and schemas) is agreed as a spec change;
-  2. for the high-risk modules — `store`, `state`, `jobs`, `confirm`, `meter` and document GC — a test-author agent writes scenario tests (`tests/spec/**`) against that interface and the `ww-testkit` API only, without seeing the implementation; they are merged as expected-to-fail and tracked;
+  1. the tool/event/file interface (`lil-protocol` descriptors and schemas) is agreed as a spec change;
+  2. for the high-risk modules — `store`, `state`, `jobs`, `confirm`, `meter` and document GC — a test-author agent writes scenario tests (`tests/spec/**`) against that interface and the `lil-testkit` API only, without seeing the implementation; they are merged as expected-to-fail and tracked;
   3. the implementation change makes them pass.
-- **QA-018** [M1] (invariant) Spec tests drive only stable surfaces — tool calls, the `ww` CLI, file formats and events — so internal refactors never touch them.
-- **QA-019** [M1] (invariant) (Amendment A, 2026-10-13: the suite repository is public, so server-side rulesets on GitHub also require the guard's CI checks on `main` and block force-pushes and deletion of `main`. Whether a change touches protected files, and whether it carries the reviewer identity's approval, is still decided by the guard, QA-020 and QA-021.) Protected files are: spec tests, golden files, recorded fixtures, committed property-test seeds, and `test-params.toml` — the one file holding image tolerances, property-test case counts and test timeouts. The merge guard's own files are protected too: the git hook scripts, the sources of `ww dev merge` and the test-diff guard, and the committed list of protected path patterns, which every part of the guard (QA-033–QA-037) reads. (plan 1 clarification: the protected files also include the CI workflows that enforce the guard, `.github/workflows/ci-guard.yml` and `.github/workflows/post-merge.yml`. The committed pattern list lives in `dev/protected-paths.txt`, and `dev/merge-guard.toml` is protected too. `.config/nextest.toml` is protected as well: it defines the `spec` profile that `ww dev spec-tests` runs, and a `default-filter`, retry count or timeout there could silently drop a failing spec test.) (plan 1, R18: they control how the hooks run) The files that decide how the hooks' `cargo run` builds and runs `ww` are protected too: `.cargo/**`, the root `Cargo.toml`, `crates/ww-cli/Cargo.toml`, `crates/ww-cli/build.rs`, `crates/ww-cli/src/main.rs`, `rust-toolchain.toml` and `.gitattributes`. (`Cargo.lock` is not: it changes with every dependency update.) (plan 1, R21) Every file under `.github/workflows/` is protected, not just `ci-guard.yml` and `post-merge.yml`: the protected-test check runs on `pull_request`, so a PR could edit a workflow, or add one that posts a check run with the same name. (plan 1, R28) `.claude/**` is protected too: the repo's Claude Code project settings decide which commands agents are denied (QA-036).
-- **QA-020** [M1] (invariant) A change that **modifies or deletes** a protected file may reach `main` only with an approving GitHub review, on the change's exact head commit, from a **separate reviewer identity**: a second GitHub account (a collaborator on the repository) or a GitHub App that implementing agents can't act as. **Adding** tests, new fixture versions or new seeds is always allowed. (plan 1, R26: additions are free only in the test homes, the patterns marked `add-ok:` in `dev/protected-paths.txt`: `crates/ww-spec-tests/**` and `**/proptest-regressions/**`. Adding a file under any other protected pattern, such as a new workflow, hook or `.cargo` config, needs the same approval as modifying one.) (owner decision 2026-10-13: the second-account option is not used; the GitHub App is the reviewer identity. The separate reviewer identity is a **GitHub App** named `worldwright-reviewer`, installed on the repo with *Pull requests: write* and *Contents: read*. (plan 1, R40: and *Actions: write*, so that `ww dev approve` can re-run the protected-test check for the approved commit right after posting the approval; without it the approval still posts, with a warning to re-run the check by hand.) Approvals are posted only by `ww dev approve <PR>`, which needs the owner's passphrase for the App key (`%USERPROFILE%\.worldwright\reviewer\app-key.age`), typed interactively. An approval counts only when it is the App bot's `APPROVED` review on the PR's exact head commit.)
+- **QA-018** [M1] (invariant) Spec tests drive only stable surfaces — tool calls, the `lil` CLI, file formats and events — so internal refactors never touch them.
+- **QA-019** [M1] (invariant) (Amendment A, 2026-10-13: the suite repository is public, so server-side rulesets on GitHub also require the guard's CI checks on `main` and block force-pushes and deletion of `main`. Whether a change touches protected files, and whether it carries the reviewer identity's approval, is still decided by the guard, QA-020 and QA-021.) Protected files are: spec tests, golden files, recorded fixtures, committed property-test seeds, and `test-params.toml` — the one file holding image tolerances, property-test case counts and test timeouts. The merge guard's own files are protected too: the git hook scripts, the sources of `lil dev merge` and the test-diff guard, and the committed list of protected path patterns, which every part of the guard (QA-033–QA-037) reads. (plan 1 clarification: the protected files also include the CI workflows that enforce the guard, `.github/workflows/ci-guard.yml` and `.github/workflows/post-merge.yml`. The committed pattern list lives in `dev/protected-paths.txt`, and `dev/merge-guard.toml` is protected too. `.config/nextest.toml` is protected as well: it defines the `spec` profile that `lil dev spec-tests` runs, and a `default-filter`, retry count or timeout there could silently drop a failing spec test.) (plan 1, R18: they control how the hooks run) The files that decide how the hooks' `cargo run` builds and runs `lil` are protected too: `.cargo/**`, the root `Cargo.toml`, `crates/lil-cli/Cargo.toml`, `crates/lil-cli/build.rs`, `crates/lil-cli/src/main.rs`, `rust-toolchain.toml` and `.gitattributes`. (`Cargo.lock` is not: it changes with every dependency update.) (plan 1, R21) Every file under `.github/workflows/` is protected, not just `ci-guard.yml` and `post-merge.yml`: the protected-test check runs on `pull_request`, so a PR could edit a workflow, or add one that posts a check run with the same name. (plan 1, R28) `.claude/**` is protected too: the repo's Claude Code project settings decide which commands agents are denied (QA-036).
+- **QA-020** [M1] (invariant) A change that **modifies or deletes** a protected file may reach `main` only with an approving GitHub review, on the change's exact head commit, from a **separate reviewer identity**: a second GitHub account (a collaborator on the repository) or a GitHub App that implementing agents can't act as. **Adding** tests, new fixture versions or new seeds is always allowed. (plan 1, R26: additions are free only in the test homes, the patterns marked `add-ok:` in `dev/protected-paths.txt`: `crates/lil-spec-tests/**` and `**/proptest-regressions/**`. Adding a file under any other protected pattern, such as a new workflow, hook or `.cargo` config, needs the same approval as modifying one.) (owner decision 2026-10-13: the second-account option is not used; the GitHub App is the reviewer identity. The separate reviewer identity is a **GitHub App** named `worldwright-reviewer`, installed on the repo with *Pull requests: write* and *Contents: read*. (plan 1, R40: and *Actions: write*, so that `lil dev approve` can re-run the protected-test check for the approved commit right after posting the approval; without it the approval still posts, with a warning to re-run the check by hand.) Approvals are posted only by `lil dev approve <PR>`, which needs the owner's passphrase for the App key (`%USERPROFILE%\.lilith\reviewer\app-key.age`), typed interactively. An approval counts only when it is the App bot's `APPROVED` review on the PR's exact head commit.)
   - (Amendment A, 2026-10-13) The suite repository is public. Server-side rulesets require the guard's CI checks (including the protected-test check, QA-021) on `main` and block force-pushes and deletion of `main`. The approval itself is still decided by the guard: QA-033–QA-036 enforce this rule locally, and in CI before and after the merge.
-- **QA-021** [M1] The **test-diff guard** (a script run by CI, `ww dev merge` and the git hooks) compares a change with `main`. It has two parts:
-  - **Blocking — the protected-test check.** It fails when a protected file is modified or deleted without the QA-020 approval, or when a protected test (spec or golden) fails on that commit, other than the expected-to-fail spec tests tracked under QA-017. CI runs these tests itself; `ww dev merge` and the hooks read CI's results for that exact commit, and a commit with no CI results fails the check.
+- **QA-021** [M1] The **test-diff guard** (a script run by CI, `lil dev merge` and the git hooks) compares a change with `main`. It has two parts:
+  - **Blocking — the protected-test check.** It fails when a protected file is modified or deleted without the QA-020 approval, or when a protected test (spec or golden) fails on that commit, other than the expected-to-fail spec tests tracked under QA-017. CI runs these tests itself; `lil dev merge` and the hooks read CI's results for that exact commit, and a commit with no CI results fails the check.
   - **Warnings** on removed or ignored tests, new sleeps/retries and new lint suppressions, listed in plain language in the milestone report.
-  - (plan 1 clarification: the protected tests are the `ww-spec-tests` crate. Expected-to-fail spec tests are listed in `crates/ww-spec-tests/expected-fail.toml`. A change may remove entries freely. It may add an entry only for a test file the same change adds; any other addition needs the QA-020 approval.)
+  - (plan 1 clarification: the protected tests are the `lil-spec-tests` crate. Expected-to-fail spec tests are listed in `crates/lil-spec-tests/expected-fail.toml`. A change may remove entries freely. It may add an entry only for a test file the same change adds; any other addition needs the QA-020 approval.)
 - **QA-022** [M1] Mutation testing with `cargo-mutants` runs at each milestone on `store`, `state`, `jobs` and `meter`.
 - **QA-023** [M1] Adversarial review by counterexample: for changes to `store`, `state`, `jobs`, the dispatcher, identity/confirmations, caps, the Claude Code engine or document GC, a reviewer with a different model or fresh context (not the implementer) must try to write a failing test, not just comment.
-- **QA-024** [M1] (invariant) `ww-core` has a per-crate `clippy.toml` that disallows file write, rename and remove APIs, with a single allowance inside `store`.
+- **QA-024** [M1] (invariant) `lil-core` has a per-crate `clippy.toml` that disallows file write, rename and remove APIs, with a single allowance inside `store`.
 - **QA-025** [M1] (invariant) Money is a `Money(i64 micro-units)` newtype with no float constructors.
-- **QA-026** [M1] (invariant) The blocking APIs of `ww-client` assert in debug builds that they are not called on the GUI thread.
-- **QA-027** [M1] (invariant) A dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, keeps `ww-schema` and `ww-protocol` free of Qt and Windows dependencies. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test rather than `cargo-deny` bans.)
+- **QA-026** [M1] (invariant) The blocking APIs of `lil-client` assert in debug builds that they are not called on the GUI thread.
+- **QA-027** [M1] (invariant) A dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, keeps `lil-schema` and `lil-protocol` free of Qt and Windows dependencies. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test rather than `cargo-deny` bans.)
 - **QA-028** [M1] Spec ↔ code traceability: this spec is the single source of rules. Each rule ID is classified *test*, *lint*, *manual* or *n/a*; tests cite the rule IDs they check (e.g. `// spec: QA-020`). At each milestone a report lists *test*-classified rules without tests and tests citing rule IDs that no longer exist.
 - **QA-029** [M1] (invariant) Spec changes land in their own change, before the code that depends on them.
 - **QA-030** [M1] Flaky tests: `cargo-nextest` runs each test in its own process with per-test timeouts and one retry, reporting flakes rather than hiding them; Qt/QML suites use CTest's repeat-until-pass with reporting. A test is quarantined only with an issue. The flake rate is in each milestone report.
-- **QA-031** [M1] (invariant) Unit and integration tests use no wall-clock time, randomness or network: they use the injected clock and ids and the fakes in `ww-testkit` (§6.5).
+- **QA-031** [M1] (invariant) Unit and integration tests use no wall-clock time, randomness or network: they use the injected clock and ids and the fakes in `lil-testkit` (§6.5).
 - **QA-032** [M1] (invariant) Secrets canary: fake secrets (a provider key, a Comfy key, an engine token) are injected under the test credential prefix and searched for in:
   - logs, the suite-level and per-workspace `state.db`, `telemetry.db`, `queue/jobs.<machine>.<yyyy-mm>.jsonl`, `registry/usage.<machine>.<yyyy-mm>.jsonl`, `usage-loose.jsonl` and diagnostics bundles;
   - recorded fixtures, the test ComfyUI's history and database, and Claude Code transcripts from fake runs.
@@ -2158,38 +2158,38 @@ AI agents write most of the code, working on your PC in your account; you test m
 
 **Merge guard** (QA-020). On the public repository, server-side rulesets require the guard's CI checks and block force-pushes and deletion of `main`; the protected-file approval is decided by the guard itself, which runs before the merge on your PC and again in CI after it. A local guard can be bypassed (`--no-verify`, a direct API call), which is why the rulesets and the CI check after the merge exist.
 
-- **QA-033** [M1] (contract) **`ww dev merge <PR>`** is the merge command for the suite repo. It merges only when all of these hold for the PR's current head commit:
+- **QA-033** [M1] (contract) **`lil dev merge <PR>`** is the merge command for the suite repo. It merges only when all of these hold for the PR's current head commit:
   1. the every-push and PR-ready CI tiers (QA-070, QA-071) are green on that commit;
   2. the protected-test check (QA-021) passes for that commit against `main` — including the reviewer identity's approval of that exact commit when protected files are modified or deleted;
   3. the merge is made through GitHub's merge API pinned to the checked head commit, so a push after the check makes the merge fail instead of slipping in.
   - On refusal it says which condition failed, in plain language.
-- **QA-034** [M1] (invariant) **Git hooks** in the suite repo — `pre-merge-commit` and `pre-push` — run the protected-test check and refuse a local merge into `main`, or any push to `main` (fast-forwards included), whose changes would fail it. `ww dev merge` refuses to run when the hooks aren't installed.
+- **QA-034** [M1] (invariant) **Git hooks** in the suite repo — `pre-merge-commit` and `pre-push` — run the protected-test check and refuse a local merge into `main`, or any push to `main` (fast-forwards included), whose changes would fail it. `lil dev merge` refuses to run when the hooks aren't installed.
 - **QA-035** [M1] (invariant) **CI after every merge:** every push to `main` re-runs the protected-test check over the pushed range, plus the every-push tier. If anything slipped through — a protected test fails, or a protected file changed without an approved PR — CI opens a revert PR for the offending commits and an issue assigned to you, so GitHub notifies you. The milestone report lists every such event in plain language.
-- **QA-036** [M1] (invariant) **Agents merge only through `ww dev merge`.** The suite repo's Claude Code project settings deny direct pushes to `main`, `--no-verify`, `gh pr merge` and direct merge API calls; these patterns are part of the hook-pattern tests (QA-061). Pattern rules have known gaps; QA-034 and QA-035 back them up.
-- **QA-037** [M1] (decision) **Server-side enforcement:** the repository is public, so the same checks are required status checks in a ruleset on `main`, which also blocks force-pushes and deletion (Amendment A, 2026-10-13). A later option is a `CODEOWNERS` file, generated from the protected path list, naming the reviewer identity as a required reviewer. That is a configuration change, not a redesign; `ww dev merge`, the hooks and the post-merge check stay.
+- **QA-036** [M1] (invariant) **Agents merge only through `lil dev merge`.** The suite repo's Claude Code project settings deny direct pushes to `main`, `--no-verify`, `gh pr merge` and direct merge API calls; these patterns are part of the hook-pattern tests (QA-061). Pattern rules have known gaps; QA-034 and QA-035 back them up.
+- **QA-037** [M1] (decision) **Server-side enforcement:** the repository is public, so the same checks are required status checks in a ruleset on `main`, which also blocks force-pushes and deletion (Amendment A, 2026-10-13). A later option is a `CODEOWNERS` file, generated from the protected path list, naming the reviewer identity as a required reviewer. That is a configuration change, not a redesign; `lil dev merge`, the hooks and the post-merge check stay.
 
 ### 6.3 Test isolation on your machine
 
 Agents build and test on your PC in your account, so tests must never touch your real setup.
 
 - **QA-038** [M1] (contract) One injectable **environment provider**, keyed by channel, supplies everything machine-specific; code never reads `%APPDATA%`, known folders or similar directly. It covers:
-  - paths (data folders, workspaces, logs, per-workspace local data — under `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\`, or `<volume>:\.worldwright-local\<hash>\` when the workspace is on another volume);
-  - the registry root (`HKCU\Software\Worldwright-test-<id>` in tests);
-  - the Credential Manager prefix (`Worldwright-test-<id>/…` in tests);
+  - paths (data folders, workspaces, logs, per-workspace local data — under `%LOCALAPPDATA%\LILITH\workspaces\<hash>\`, or `<volume>:\.lilith-local\<hash>\` when the workspace is on another volume);
+  - the registry root (`HKCU\Software\LILITH-test-<id>` in tests);
+  - the Credential Manager prefix (`LILITH-test-<id>/…` in tests);
   - pipe names and the notification identity;
   - Claude Code profile folders (§4.6a), including the default `%USERPROFILE%\.claude`;
   - backup destinations, rclone configs, Task Scheduler tasks, SSH keys and restic repositories (§7.4).
   - (plan 1 clarification: **naming contract**, which other plans and CI depend on, shared with ARCH-095.)
-    - Channels are `stable`, `dev` or `test-<id>`. The pipe name is `\\.\pipe\worldwright-core-<userSID>-<channel>` (ARCH-024).
-    - Data folders: channel `stable` uses `%APPDATA%\Worldwright` and `%LOCALAPPDATA%\Worldwright`. Every other channel appends `-<channel>`, e.g. `%APPDATA%\Worldwright-dev`.
-    - Registry root: `HKCU\Software\Worldwright` for stable, `HKCU\Software\Worldwright-<channel>` otherwise. Tests use `HKCU\Software\Worldwright-test-<id>`.
-    - Credential prefix: `Worldwright/` for stable, `Worldwright-<channel>/` otherwise.
-    - Notification AUMID: `Worldwright.Suite.<Channel>`.
+    - Channels are `stable`, `dev` or `test-<id>`. The pipe name is `\\.\pipe\lilith-core-<userSID>-<channel>` (ARCH-024).
+    - Data folders: channel `stable` uses `%APPDATA%\LILITH` and `%LOCALAPPDATA%\LILITH`. Every other channel appends `-<channel>`, e.g. `%APPDATA%\LILITH-dev`.
+    - Registry root: `HKCU\Software\LILITH` for stable, `HKCU\Software\LILITH-<channel>` otherwise. Tests use `HKCU\Software\LILITH-test-<id>`.
+    - Credential prefix: `LILITH/` for stable, `LILITH-<channel>/` otherwise.
+    - Notification AUMID: `LILITH.Suite.<Channel>`.
     - Workspace hash `<hash>`: the first **16 lowercase hex chars of SHA-256** over the canonical workspace path. Canonical means: `std::fs::canonicalize`, `\\?\` stripped, ASCII-lowercased, using `\` separators.
 - **QA-039** [M1] (contract) The fake `claude` honours `CLAUDE_CONFIG_DIR`, so profile behaviour is tested against environment-provider folders only.
-- **QA-040** [M1] (invariant) Harness guard: test builds panic if any path, registry key or credential target resolves to your real Worldwright locations (`%APPDATA%\Worldwright`, `%LOCALAPPDATA%\Worldwright`, any `<volume>:\.worldwright-local`, `HKCU\Software\Worldwright`, the real credential prefix), a registered workspace, or a real Claude Code profile folder.
+- **QA-040** [M1] (invariant) Harness guard: test builds panic if any path, registry key or credential target resolves to your real LILITH locations (`%APPDATA%\LILITH`, `%LOCALAPPDATA%\LILITH`, any `<volume>:\.lilith-local`, `HKCU\Software\LILITH`, the real credential prefix), a registered workspace, or a real Claude Code profile folder.
 - **QA-041** [M1] (invariant) Automated tests never reach the real OneDrive, Hetzner, B2 or other destinations, your Task Scheduler, or your real Claude Code profiles. The only exceptions are the on-demand runs you start or confirm (QA-063, QA-065).
-- **QA-042** [M1] (invariant) Desktop-touching tests (clipboard, drag, notifications, file associations, the `ww:` protocol) run as a serialised group **only in CI or Windows Sandbox**, never in your desktop session.
+- **QA-042** [M1] (invariant) Desktop-touching tests (clipboard, drag, notifications, file associations, the `lil:` protocol) run as a serialised group **only in CI or Windows Sandbox**, never in your desktop session.
   - Windows Sandbox is optional: enabling the Windows feature is a one-time admin step. Without it, these tests run in CI only, and the milestone report lists the Sandbox runs (QA-059, QA-060, QA-073) as not run.
 
 ### 6.4 Test layers
@@ -2219,7 +2219,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - stream-json fixtures per tested Claude Code version.
   - (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
 - **QA-049** [M1b] **Golden: ComfyUI UI→API conversion** (every push) compared with the official frontend's conversion, using the pinned `comfyui-frontend-package`; re-run whenever ComfyUI or its frontend changes.
-- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.wwdoc` readers, stream-json, SSE, `ww:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
+- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.wwdoc` readers, stream-json, SSE, `lil:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
 - **QA-051** [M1] (invariant) **Integration — ComfyUI queue ownership** (in-process core with fakes, every push):
   - at most one pending prompt per lane in ComfyUI; priority classes; FIFO within a class;
   - outside jobs are observed and never cancelled;
@@ -2240,32 +2240,32 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
 - **QA-054** [M1] (invariant) **Claude Code profiles** in the engine contract (every push):
   - the `CLAUDE_CONFIG_DIR` allowlist entry (§4.6): set to the profile's folder for extra profiles and absent for the default profile;
   - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_PROFILE` and `CLAUDE_CODE_USE_*` are never passed;
-  - the generated MCP config passes `WW_PROFILE=<id>` to `ww-mcp`, and `ww-mcp` sends that profile id in `core/hello`;
+  - the generated MCP config passes `LIL_PROFILE=<id>` to `lil-mcp`, and `lil-mcp` sends that profile id in `core/hello`;
   - the per-profile lock: `auth status` runs only when the profile has no active suite session; a busy profile launches only with a verification younger than 30 minutes and a matching `initialize` account, otherwise it waits; launches within one profile are serialised;
   - an auth failure (the "Login expired" error, HTTP 401 or `authMethod: "none"`) → `waiting_auth` for director tasks, never retried; a co-pilot call → `engine.claude_code.not_signed_in` (QA-006);
   - the suite never chooses or changes a task's profile by itself; a `waiting_quota` task offers only wait, the API engine or a local model.
 - **QA-055** [M1] **Crash and recovery** (fast subset every push, full suite nightly): fail points at every step of the write order and job submission; corrupt or missing databases (`index.db`, the suite-level and per-workspace `state.db`, `telemetry.db`); torn log lines; disk full; held handles (Defender-style); app abort mid-autosave → recovery offered.
-- **QA-056** [M1] **End-to-end through `ww`** (PR-ready): the real core over the real pipe on the test channel — the `core/hello` handshake for every caller kind, multiple clients, events and resubscribe, confirmations, caps (including `ww --non-interactive` getting `cap.exceeded` / `confirm.unavailable`, QA-016), identity.
-- **QA-057** [M1] **UI** (PR-ready): QtQuickTest for `ww-ui-kit` and the Image studio with the default Direct3D 11 renderer on a software adapter (`QSG_RHI_BACKEND=d3d11`, `QSG_RHI_PREFER_SOFTWARE_RENDERER=1`). The test asserts which adapter it got and logs the session. If hosted runners can't create swap chains, the UI tests fall back to offscreen `QQuickRenderControl`.
+- **QA-056** [M1] **End-to-end through `lil`** (PR-ready): the real core over the real pipe on the test channel — the `core/hello` handshake for every caller kind, multiple clients, events and resubscribe, confirmations, caps (including `lil --non-interactive` getting `cap.exceeded` / `confirm.unavailable`, QA-016), identity.
+- **QA-057** [M1] **UI** (PR-ready): QtQuickTest for `lil-ui-kit` and the Image studio with the default Direct3D 11 renderer on a software adapter (`QSG_RHI_BACKEND=d3d11`, `QSG_RHI_PREFER_SOFTWARE_RENDERER=1`). The test asserts which adapter it got and logs the session. If hosted runners can't create swap chains, the UI tests fall back to offscreen `QQuickRenderControl`.
   - The pure `software` scene-graph adaptation can't run `QQuickRhiItem`; it is used only to test the slow-renderer banner.
 - **QA-058** [M1] (invariant) A static check on compiled shader reflection data verifies that no dispatch reads and writes the same image (passing on WARP doesn't prove the D3D11 rules).
-- **QA-059** [M1] **Web view** (PR-ready, CI only; Windows Sandbox at milestones): navigation off the ComfyUI origin blocked; downloads blocked; no web channel; popups handled; base64 graph load survives hostile graph names (against the pinned frontend served by the fake ComfyUI); "Send to Worldwright" size limit and schema validation; no WebEngine DLLs loaded before the ComfyUI panel is first shown (checked in the process module list).
+- **QA-059** [M1] **Web view** (PR-ready, CI only; Windows Sandbox at milestones): navigation off the ComfyUI origin blocked; downloads blocked; no web channel; popups handled; base64 graph load survives hostile graph names (against the pinned frontend served by the fake ComfyUI); "Send to LILITH" size limit and schema validation; no WebEngine DLLs loaded before the ComfyUI panel is first shown (checked in the process module list).
 - **QA-060** [M1] **Clipboard, drag and first run** (PR-ready, CI only, serialised group; Windows Sandbox at milestones):
   - clipboard: formats offered and exact PNG bytes read back through OLE, no text by default; drop effect Copy only; lazy exports never evicted while on the clipboard;
-  - first run with a fresh profile through the environment provider: no workspace; ComfyUI absent or stopped; models missing → download flow; `claude` missing, older than 2.1.268, or signed out; Git Bash missing; deep-link handler not registered; `ww doctor` is idempotent (a second run changes nothing).
+  - first run with a fresh profile through the environment provider: no workspace; ComfyUI absent or stopped; models missing → download flow; `claude` missing, older than 2.1.268, or signed out; Git Bash missing; deep-link handler not registered; `lil doctor` is idempotent (a second run changes nothing).
 - **QA-061** [M1] **Plugin hook patterns** (every push): PreToolUse JSON fed to the hook scripts, with a table of Bash/PowerShell commands that must and must not trigger "ask" (this also documents the known limits of pattern-based guards).
-- **QA-062** [M1] **Version skew**: handshake/version unit tests every push. At releases, the full matrix against the previous release (kept as GitHub Release assets, not CI artifacts): old app ↔ new core and new app ↔ old core; a stale per-user `ww-mcp.exe` vs a newer core; plugin vs suite version; `state.db` migrations from each earlier release; an older core **refuses** a newer `state.db`. The full suite runs on any Qt or cxx-qt upgrade.
-- **QA-063** [M1] (decision) **Real engines, on demand only**: `ww test --real`, run by you or by an agent in your session before milestones or when a ComfyUI or model change warrants it. Never on a schedule; there is no self-hosted runner.
+- **QA-062** [M1] **Version skew**: handshake/version unit tests every push. At releases, the full matrix against the previous release (kept as GitHub Release assets, not CI artifacts): old app ↔ new core and new app ↔ old core; a stale per-user `lil-mcp.exe` vs a newer core; plugin vs suite version; `state.db` migrations from each earlier release; an older core **refuses** a newer `state.db`. The full suite runs on any Qt or cxx-qt upgrade.
+- **QA-063** [M1] (decision) **Real engines, on demand only**: `lil test --real`, run by you or by an agent in your session before milestones or when a ComfyUI or model change warrants it. Never on a schedule; there is no self-hosted runner.
   - It uses an isolated ComfyUI test instance: port 8189, temporary base and user directories, in-memory database, your models and custom nodes through an extra-model-paths file; started only when your own ComfyUI is idle, so tests never touch its saved state or VRAM while you work.
   - It covers the real GPU canvas and runs the **same scenario suite as the fake ComfyUI**, so the fake can't drift.
 - **QA-064** [M1] **Manual milestone checks**: hardware UI, paste into Explorer/Discord/Chromium, cold start after a reboot and after a Defender first scan, and performance numbers against the absolute targets in other sections (pass/fail in the milestone report).
-- **QA-065** [M1] (invariant) **Real Claude Code smoke** (`ww doctor --claude-smoke`): a cheap model with `--max-turns 2` against a fixture tool checks `authMethod: "claude.ai"`, `apiKeySource: "none"`, no user MCP servers or plugin hooks loaded, and writes to `assets/**` denied.
+- **QA-065** [M1] (invariant) **Real Claude Code smoke** (`lil doctor --claude-smoke`): a cheap model with `--max-turns 2` against a fixture tool checks `authMethod: "claude.ai"`, `apiKeySource: "none"`, no user MCP servers or plugin hooks loaded, and writes to `assets/**` denied.
   - It runs **only when you confirm**, because it uses plan quota; after a Claude Code version change Doctor *offers* it. It never runs in CI or on a schedule.
   - It runs under the profile you pick (default: the default profile).
 
 ### 6.5 Test infrastructure
 
-- **QA-066** [M1] (contract) `ww-testkit` provides:
+- **QA-066** [M1] (contract) `lil-testkit` provides:
   - fixture workspaces (including the real lantern manifest);
   - a scriptable fake ComfyUI (HTTP + websocket: progress, previews, errors, slow jobs, restarts, outside jobs) that also serves the pinned frontend package for web-view tests;
   - fake providers (recorded fixtures, injected failures);
@@ -2277,13 +2277,13 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
   - (plan 2b clarification: Appendix E) Fail points are disabled at compile time in stable builds and armed only on test channels.
 - **QA-067** [M1] Recorded fixtures are captured from real runs by a manual job routed through the suite's own caps (with a per-call maximum), only for providers you use, with secrets scrubbed, and versioned. A drift comparison checks new captures against old ones, including ComfyUI's websocket, `/api/jobs` and `/history` shapes.
-- **QA-068** [M1] Qt-free crates (`ww-schema`, `ww-protocol`, `ww-core`, the parser crate) run under `cargo nextest`; `ww-qt` and QML tests run through CTest.
+- **QA-068** [M1] Qt-free crates (`lil-schema`, `lil-protocol`, `lil-core`, the parser crate) run under `cargo nextest`; `lil-qt` and QML tests run through CTest.
 
 ### 6.6 CI
 
 - **QA-069** [M1] (decision) CI runs on **GitHub-hosted runners only** — Windows, plus Linux for libFuzzer runs. The suite repository is public, so hosted runner minutes are free and there is no minute budget (QA-075; Amendment A, 2026-10-13). There is no self-hosted runner; real-engine and GPU tests run on demand (QA-063), not in CI.
 - **QA-070** [M1] **Every push** (~10–12 min): debug build with `sccache` and cached Qt; `rustfmt`, `clippy -D warnings`, `cargo-deny`; Qt-free `cargo nextest` (unit, property, concurrency, golden, parser targets, integration, engine contract, crash fast subset, hook patterns); the test-diff guard. Workflows use `concurrency: cancel-in-progress`, so superseded pushes stop — except the post-merge check on `main` (QA-035), which runs for every push to `main` and is never cancelled. (Amendment A, 2026-10-13: the repository is public, so every push runs the full tier on GitHub-hosted runners; nothing is trimmed to save minutes.)
-- **QA-071** [M1] **PR ready / merge** (~25–30 min): adds QtQuickTest, the web view / clipboard / drag / first-run serialised group, E2E over the pipe, the real-NTFS reconciler tests, and `cargo-audit`. `ww dev merge` requires this tier green on the PR's head commit (QA-033).
+- **QA-071** [M1] **PR ready / merge** (~25–30 min): adds QtQuickTest, the web view / clipboard / drag / first-run serialised group, E2E over the pipe, the real-NTFS reconciler tests, and `cargo-audit`. `lil dev merge` requires this tier green on the PR's head commit (QA-033).
 - **QA-072** [M1] **Nightly** (main only): release build, coverage, full crash suite.
 - **QA-073** [M1] **Releases and milestones**: version-skew matrix, mutation testing, time-boxed libFuzzer, the spec-rule report (QA-028), and the Windows Sandbox guided test.
 - **QA-074** [M1] (contract) **Release job**: `windeployqt` → copy the Visual C++ runtime DLLs, restic and rclone → `vpk pack` → `vpk upload github`. The runner needs the .NET SDK. Packaging, pack ids and channels are defined in §7.5.
@@ -2292,8 +2292,8 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
 - **QA-077** [M1] (invariant) Qt in CI: Qt 6.12 LTS and the Qt WebEngine release matching it (versioned separately; the exact version is pinned in the M0 Qt-stack spike, §1) are pinned as a pair, cached by the exact pair, and a CI check verifies the installed pair matches. (M0 result, 2026-10-12: the pair is **Qt 6.12.0 + Qt WebEngine 6.140.0** (`win64_msvc2022_64`, MSVC 14.44). The CI check must assert WebEngine 6.140.0, because the installer's default pick is an older build (QA-078). `docs/spikes/01-toolchain.md`.)
 - **QA-078** [M0] Decided by the M0 spike: which installer CI uses for the Qt pair — an `aqtinstall` version that includes the Qt 6.12 fix (PR #1048; earlier releases install the wrong Qt WebEngine for 6.12), `naqt`, or Qt's official installer CLI. (M0 result, 2026-10-12: **`naqt`**, pinned by source commit `43da90f1` (or the release zip's sha256, since the `latest` tag rolls), installing with `--extensions qtwebengine@6.140.0`. Without the explicit version naqt picks the older July 2026 WebEngine build, so CI must assert that the installed WebEngine is 6.140.0. `aqtinstall` is not used: PR #1048 is still unmerged and its latest release (3.3.0) lacks the fix; switching back is optional once it merges. The official installer CLI was not needed. `docs/spikes/01-toolchain.md`.)
 - **QA-079** [M1] (invariant) Agents' GitHub tokens have no permission to change workflow files or repository administration settings, and the repository's default workflow token is read-only. The one exception is the post-merge check's job (QA-035), which alone is granted write access to pull requests, issues and contents so it can open the revert PR and the issue. (Amendment A, 2026-10-13: agents use the restricted agent token of QA-087, supplied by the agent-token mechanism of plan 1 Task 13; the earlier waiver is withdrawn.)
-- **QA-086** [M1] (invariant) **Nothing personal in repository files.** The suite repository is public, so every tracked file, path and commit is public. None may contain a Windows user-profile path (write `%USERPROFILE%`), an e-mail address other than a GitHub no-reply address or the `noreply@anthropic.com` co-author trailer, a running-process list, machine-identifying details beyond what a test or measurement needs, or statements about the maintainer's accounts, habits, plans or preferences. Exempt are reserved test and example domains (`*.invalid`, `*.example`, `*.test`, `example.com`, `example.org`, `example.net`), the `git@github.com` SSH remote form, and the test placeholder user names of plan 1 Task 17 (ruling R30). `ww dev privacy-scan` enforces this in the git hooks and in CI (plan 1 Task 17).
-- **QA-087** [M1] (invariant) **Agent token.** Agents reach GitHub only with a fine-grained token limited to the suite repository, with no Administration and no Workflows permission, and with an expiry. It is stored in Windows Credential Manager under `Worldwright-dev/github/agent-token` (set with `ww dev agent-token set`), served to git by the suite's credential helper and to `gh` only in a child process, and never written to the repository, logs or settings files. The maintainer's full-access login is not stored on the machine where agents run.
+- **QA-086** [M1] (invariant) **Nothing personal in repository files.** The suite repository is public, so every tracked file, path and commit is public. None may contain a Windows user-profile path (write `%USERPROFILE%`), an e-mail address other than a GitHub no-reply address or the `noreply@anthropic.com` co-author trailer, a running-process list, machine-identifying details beyond what a test or measurement needs, or statements about the maintainer's accounts, habits, plans or preferences. Exempt are reserved test and example domains (`*.invalid`, `*.example`, `*.test`, `example.com`, `example.org`, `example.net`), the `git@github.com` SSH remote form, and the test placeholder user names of plan 1 Task 17 (ruling R30). `lil dev privacy-scan` enforces this in the git hooks and in CI (plan 1 Task 17).
+- **QA-087** [M1] (invariant) **Agent token.** Agents reach GitHub only with a fine-grained token limited to the suite repository, with no Administration and no Workflows permission, and with an expiry. It is stored in Windows Credential Manager under `LILITH-dev/github/agent-token` (set with `lil dev agent-token set`), served to git by the suite's credential helper and to `gh` only in a child process, and never written to the repository, logs or settings files. The maintainer's full-access login is not stored on the machine where agents run.
 
 ### 6.7 Milestone builds and your testing
 
@@ -2327,15 +2327,15 @@ Code and, optionally, workspace metadata live in GitHub repositories (free): the
 
 ### 7.1 Repositories
 
-- **OPS-003** [M1] (decision) **`Worldwright-Suite`** (public GitHub repository since Amendment A, 2026-10-13; worked on in a local clone, `<repo>`) holds the suite source, the consolidated spec, tests and small fixtures, the Worldwright Claude Code plugin source (plugin 1.3 ships with the suite) and build scripts. Builds are attached to GitHub Releases (each file < 2 GiB). Server-side rulesets require the CI checks and block force-pushes and deletion of `main`; the protected-file approval is enforced through `ww dev merge`, git hooks and the CI guard, with CI on `main` as the backstop (§6).
-- **OPS-004** [M1] **`Worldwright-Workspace`** (private GitHub, optional) holds workspace metadata (`worldwright.yaml`, manifests, recipes, registries, `progress.md`, logs, small text files), with large files stored as Git LFS pointers.
+- **OPS-003** [M1] (decision) **`Worldwright-Suite`** (public GitHub repository since Amendment A, 2026-10-13; worked on in a local clone, `<repo>`) holds the suite source, the consolidated spec, tests and small fixtures, the source of the `worldwright` plugin for Claude Code (plugin 1.3 ships with the suite) and build scripts. Builds are attached to GitHub Releases (each file < 2 GiB). Server-side rulesets require the CI checks and block force-pushes and deletion of `main`; the protected-file approval is enforced through `lil dev merge`, git hooks and the CI guard, with CI on `main` as the backstop (§6).
+- **OPS-004** [M1] **`LILITH-Workspace`** (private GitHub, optional) holds workspace metadata (`lilith.yaml`, manifests, recipes, registries, `progress.md`, logs, small text files), with large files stored as Git LFS pointers.
 - **OPS-005** [M1] (invariant) The workspace may be pushed to GitHub only when a large-file store other than "This PC only" is configured (§7.2), so GitHub never holds pointers to files that exist nowhere else.
 - **OPS-108** [M1] (decision) The suite's own code is licensed **GPL-3.0-or-later**: `LICENSE` holds the unmodified GPL-3.0 text, the README states the "or (at your option) any later version" grant, every crate inherits `license = "GPL-3.0-or-later"` from `[workspace.package]`, and `NOTICE` lists third-party material in the repository. Every dependency linked into a **distributed binary** (Rust crates, Qt, KDDockWidgets, bundled runtimes) must be under a licence compatible with distributing that binary under GPL-3.0; `cargo-deny`'s licence allow list holds only such licences, and a release ships the dependencies' licence texts and the corresponding source. Closed runtimes are never linked into the GPL binary. (Amendment A, 2026-10-13.)
 
 **Why large files don't go to GitHub** (verified 2026-10-12): GitHub LFS includes 10 GiB storage and 10 GiB/month download, then charges $0.07/GiB-month storage and $0.0875/GiB download (about $64/month at 1 TB). Repositories should stay under 1–5 GB, and files over 100 MiB are blocked.
 
-- **OPS-006** [M1] **Tooling floor:** Git ≥ 2.38 (needed for `git merge-tree --write-tree`) and git-lfs ≥ 3.8. `ww doctor` checks both versions.
-- **OPS-007** [M1] When either version is below the floor, `ww doctor` and first-run setup offer the upgrade and install it only after you confirm. The M0 test machine had Git 2.55.0 and git-lfs 3.7.1 (checked 2026-10-12): Git meets the floor, git-lfs doesn't, so setup on such a machine must offer the git-lfs upgrade. (git-lfs 3.8.0 was released 2026-08-28.) The upgrade source — a newer Git for Windows that bundles git-lfs ≥ 3.8, or the standalone git-lfs installer — is decided by the M0 spike. (M0 result, 2026-10-12: the upgrade source is **Git for Windows ≥ 2.56.0.2**, which bundles git-lfs 3.8.0; the standalone git-lfs installer is not needed. winget's `Git.Git` manifest still lagged at 2.55.0.5, so `ww doctor` needs a fallback to the direct GitHub release installer, with hash and signature checks. The test machine has since been upgraded to Git 2.56.0.windows.2 / git-lfs 3.8.0, so the sentence above about it is out of date. Git 2.56 moved `git.exe` to `C:\Program Files\Git\cmd`; find it through PATH. `docs/spikes/01-toolchain.md`.)
+- **OPS-006** [M1] **Tooling floor:** Git ≥ 2.38 (needed for `git merge-tree --write-tree`) and git-lfs ≥ 3.8. `lil doctor` checks both versions.
+- **OPS-007** [M1] When either version is below the floor, `lil doctor` and first-run setup offer the upgrade and install it only after you confirm. The M0 test machine had Git 2.55.0 and git-lfs 3.7.1 (checked 2026-10-12): Git meets the floor, git-lfs doesn't, so setup on such a machine must offer the git-lfs upgrade. (git-lfs 3.8.0 was released 2026-08-28.) The upgrade source — a newer Git for Windows that bundles git-lfs ≥ 3.8, or the standalone git-lfs installer — is decided by the M0 spike. (M0 result, 2026-10-12: the upgrade source is **Git for Windows ≥ 2.56.0.2**, which bundles git-lfs 3.8.0; the standalone git-lfs installer is not needed. winget's `Git.Git` manifest still lagged at 2.55.0.5, so `lil doctor` needs a fallback to the direct GitHub release installer, with hash and signature checks. The test machine has since been upgraded to Git 2.56.0.windows.2 / git-lfs 3.8.0, so the sentence above about it is out of date. Git 2.56 moved `git.exe` to `C:\Program Files\Git\cmd`; find it through PATH. `docs/spikes/01-toolchain.md`.)
 
 ### 7.2 Large-file store
 
@@ -2352,24 +2352,24 @@ Git LFS keeps every large file in the workspace's `.git/lfs/objects`. The **stor
 **This PC only**
 
 - **OPS-009** [M1] With the "This PC only" store the workspace is a local git repository with **no remotes**. git-lfs needs no endpoint for local clean, smudge and checkout.
-- **OPS-010** [M1] (invariant) The committed dummy `lfs.url` plus the installed pre-push hook make any accidental push fail. `ww doctor` checks that there are no remotes and that the pre-push hook is installed.
+- **OPS-010** [M1] (invariant) The committed dummy `lfs.url` plus the installed pre-push hook make any accidental push fail. `lil doctor` checks that there are no remotes and that the pre-push hook is installed.
 
 **External or second drive**
 
-- **OPS-011** [M1] Setup runs `git init --bare <drive>\Worldwright-Workspace.git`. The clone's own `.git/config` sets `lfs.url = file:///<drive>:/Worldwright-Workspace.git`; local config overrides the committed dummy.
+- **OPS-011** [M1] Setup runs `git init --bare <drive>\LILITH-Workspace.git`. The clone's own `.git/config` sets `lfs.url = file:///<drive>:/LILITH-Workspace.git`; local config overrides the committed dummy.
   - A `file://` endpoint selects git-lfs's built-in local transfer automatically (git-lfs ≥ 2.10; since 3.4 the destination must be a git repository), so no transfer-agent keys are set, and any S3 agent keys from an earlier store are removed.
-  - The local `lfs.url` applies to every remote, so metadata can also go to GitHub while large files go to the drive. Optionally `git remote add drive file:///<drive>:/Worldwright-Workspace.git` mirrors the metadata to the drive too.
+  - The local `lfs.url` applies to every remote, so metadata can also go to GitHub while large files go to the drive. Optionally `git remote add drive file:///<drive>:/LILITH-Workspace.git` mirrors the metadata to the drive too.
 - **OPS-012** [M1] Drive letters change, so before each push the suite rewrites `lfs.url` from the drive's volume GUID or marker file. A missing drive fails the push cleanly.
-- **OPS-013** [M1] `ww doctor` checks that `git lfs env` shows `Endpoint=file:///…` for a drive store.
+- **OPS-013** [M1] `lil doctor` checks that `git lfs env` shows `Endpoint=file:///…` for a drive store.
 - **OPS-014** [M1] Old objects are never deleted from the drive (the local transfer only adds). It is still **one copy in one place**, so backups (§7.4) still run.
 
 **Rules for every store**
 
 - **OPS-015** [M1] (invariant) **The push order never loses content:** objects go to the store and are verified there before any metadata push (`git lfs push` → verify → `git push`).
-- **OPS-016** [M1] (invariant) `lfs.allowincompletepush=false`. `ww doctor` checks the effective value and that the pre-push hook is installed.
+- **OPS-016** [M1] (invariant) `lfs.allowincompletepush=false`. `lil doctor` checks the effective value and that the pre-push hook is installed.
 - **OPS-017** [M1] (invariant) The suite never runs `git lfs prune` while the store is "This PC only". With any other store it prunes only objects the store verifiably holds.
 - **OPS-018** [M1] (contract) The committed `.lfsconfig` contains only a dummy `lfs.url` (so an unconfigured clone can never push to GitHub's paid LFS), `lfs.allowincompletepush=false` and `lfs.locksverify=false`. Store settings go in each clone's own git config, because git-lfs doesn't allow transfer-agent keys in `.lfsconfig`.
-- **OPS-019** [M1] (invariant) A push URL anywhere (`lfs.pushurl`, `remote.*.lfspushurl`) would override `lfs.url` for pushes, so `ww doctor` fails if one exists.
+- **OPS-019** [M1] (invariant) A push URL anywhere (`lfs.pushurl`, `remote.*.lfspushurl`) would override `lfs.url` for pushes, so `lil doctor` fails if one exists.
 
 **Changing stores**
 
@@ -2385,10 +2385,10 @@ Git LFS keeps every large file in the workspace's `.git/lfs/objects`. The **stor
 
 **S3-compatible store**
 
-- **OPS-024** [M1.5] The S3 store uses `lfs-s3` (release 0.2.2, verified 2026-10-12) behind `ww lfs-agent`, with pinned arguments: `--endpoint=<preset endpoint>`, the bucket, a fixed `--root_path`, `--compression=none` (objects stay plain `<root>/<oid>`, readable by other tools) and `--delete_other_versions=false` (so keys don't need delete rights). `lfs-s3` skips objects already present, so re-sends are cheap.
+- **OPS-024** [M1.5] The S3 store uses `lfs-s3` (release 0.2.2, verified 2026-10-12) behind `lil lfs-agent`, with pinned arguments: `--endpoint=<preset endpoint>`, the bucket, a fixed `--root_path`, `--compression=none` (objects stay plain `<root>/<oid>`, readable by other tools) and `--delete_other_versions=false` (so keys don't need delete rights). `lfs-s3` skips objects already present, so re-sends are cheap.
 - **OPS-025** [M1.5] An in-house Rust transfer agent with the same object layout replaces `lfs-s3` (the protocol is small and `lfs-s3` maintenance is thin).
-- **OPS-026** [M1.5] (invariant) **Credentials never go in agent arguments**, because those live in git config. `ww lfs-agent` clears inherited `AWS_*` variables and the AWS config/credentials file variables, then sets `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from Credential Manager for the agent process only.
-- **OPS-027** [M1.5] For providers that reject the newer S3 checksum headers, `ww lfs-agent` sets `AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED` and `AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED`. This is tested per preset with objects > 5 MiB.
+- **OPS-026** [M1.5] (invariant) **Credentials never go in agent arguments**, because those live in git config. `lil lfs-agent` clears inherited `AWS_*` variables and the AWS config/credentials file variables, then sets `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from Credential Manager for the agent process only.
+- **OPS-027** [M1.5] For providers that reject the newer S3 checksum headers, `lil lfs-agent` sets `AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED` and `AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED`. This is tested per preset with objects > 5 MiB.
 - **OPS-028** [M1.5] **Bucket hygiene:** server-side encryption on; a lifecycle rule cancels unfinished multipart uploads after 3 days; everyday keys are bucket-scoped **without delete rights**; no age-based hide or delete rules (content-addressed objects are shared by later versions and checkpoints).
 - **OPS-029** [M1.5] **Working documents across machines:** "Checkpoint document" uploads content-addressed chunks and `doc.json` to a `docs/` prefix in the S3 store; unchanged chunks are never re-uploaded. Cross-machine document checkpoints need this cloud store; they don't use a git side ref.
 - **OPS-030** [M1.5] Checkpoint retention is a suite-side mark-and-sweep that uses a separate delete-capable key, used only by that job. The suite asks before the job's first run.
@@ -2398,8 +2398,8 @@ Git LFS keeps every large file in the workspace's `.git/lfs/objects`. The **stor
 **Disk usage and model weights**
 
 - **OPS-033** [M1] Every checked-out LFS file also sits in `.git/lfs/objects`, which doubles local disk use on NTFS. git-lfs block-clones on ReFS when it writes files itself (`git lfs pull` / `git lfs checkout`), so Sync and store changes check out with `GIT_LFS_SKIP_SMUDGE=1` and then `git lfs checkout <paths>`.
-- **OPS-034** [M1] `ww doctor` recommends a **Dev Drive** for large workspaces (ReFS; ≥ 50 GB; not on C:; not removable). It is optional: creating one needs a one-time admin step in Windows Settings, and the suite works the same without it.
-- **OPS-035** [M1] (contract) **Per-workspace local data** (snapshot store, caches, `index.db`, the per-workspace `state.db`, local proposals storage) normally lives in `%LOCALAPPDATA%\Worldwright\workspaces\<hash>\`. When the workspace is on a different volume from `%LOCALAPPDATA%` (a Dev Drive or any other drive), it lives at `<volume>:\.worldwright-local\<hash>\` instead, so hardlinked snapshots and rename-on-ingest stay on one volume. The workspace's own `<workspace>\.worldwright\staging\` stays inside the workspace (same volume by construction).
+- **OPS-034** [M1] `lil doctor` recommends a **Dev Drive** for large workspaces (ReFS; ≥ 50 GB; not on C:; not removable). It is optional: creating one needs a one-time admin step in Windows Settings, and the suite works the same without it.
+- **OPS-035** [M1] (contract) **Per-workspace local data** (snapshot store, caches, `index.db`, the per-workspace `state.db`, local proposals storage) normally lives in `%LOCALAPPDATA%\LILITH\workspaces\<hash>\`. When the workspace is on a different volume from `%LOCALAPPDATA%` (a Dev Drive or any other drive), it lives at `<volume>:\.lilith-local\<hash>\` instead, so hardlinked snapshots and rename-on-ingest stay on one volume. The workspace's own `<workspace>\.lilith\staging\` stays inside the workspace (same volume by construction).
 - **OPS-036** [M1] Model weights aren't stored in the workspace. `registry/models.yaml` records their sources and hashes, and other machines re-download them by hash.
 
 ### 7.3 Sync between machines
@@ -2424,7 +2424,7 @@ With "This PC only" or a drive store there is one machine: the Sync button commi
 - **OPS-044** [M1.5] You're told about every rename Sync makes.
 - **OPS-045** [M1] (contract) **Logs never need merging:** the jobs log is `queue/jobs.<machine>.<yyyy-mm>.jsonl` and the usage log is `registry/usage.<machine>.<yyyy-mm>.jsonl` (one file per machine per month; no `merge=union`, no rotation moves). Readers deduplicate by `(machine, seq)`. `progress.md` merges by union.
 - **OPS-046** [M1] (invariant) **Machine-local state stays local** and is never committed: `index.db`, `state.db`, `telemetry.db`, caches, recovery files, proposals and snapshots.
-- **OPS-047** [M1] (contract) From M1, every reference — `ww://` refs, `.wwref` links, exports and engine-import records — carries the target version's content hash, and every asset records its creation UUID when it is created, so Sync's renames (OPS-042, OPS-043) need no back-fill when multi-machine sync arrives.
+- **OPS-047** [M1] (contract) From M1, every reference — `lil://` refs, `.wwref` links, exports and engine-import records — carries the target version's content hash, and every asset records its creation UUID when it is created, so Sync's renames (OPS-042, OPS-043) need no back-fill when multi-machine sync arrives.
 - **OPS-048** [M1.5] **Spending across machines:** caps are enforced locally on each machine (cap reservations live in that machine's suite-level `state.db`). The dashboard shows other machines' synced spend as information. Provider-side limits remain the real cross-machine stop (§2.6).
 
 ### 7.4 Backups
@@ -2477,7 +2477,7 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 **OneDrive**
 
 - **OPS-064** [M1] **Connecting:** the suite runs `rclone config` for an `onedrive` remote in a window (browser sign-in on `127.0.0.1:53682`, no admin rights).
-  - The rclone config is encrypted. Its password is supplied by `RCLONE_PASSWORD_COMMAND` (`ww secret get …`, read from Credential Manager), never by `RCLONE_CONFIG_PASS` holding the password itself. The variable is set in restic's environment, since restic starts rclone; its value is a space-separated command, so a `ww` path containing spaces is quoted.
+  - The rclone config is encrypted. Its password is supplied by `RCLONE_PASSWORD_COMMAND` (`lil secret get …`, read from Credential Manager), never by `RCLONE_CONFIG_PASS` holding the password itself. The variable is set in restic's environment, since restic starts rclone; its value is a space-separated command, so a `lil` path containing spaces is quoted.
   - rclone refreshes tokens itself. If the remote goes **90 days unused** the token expires; the Backups panel then shows "OneDrive needs reconnecting" and runs `rclone config reconnect`.
 - **OPS-065** [M1] (contract) **Settings for OneDrive repositories:**
   - `-o rclone.args="serve restic --stdio --tpslimit 8 --bwlimit <your limit>"` — setting `rclone.args` replaces the default, so it must start with `serve restic --stdio`;
@@ -2499,16 +2499,16 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 **What's backed up**
 
 - **OPS-071** [M1] (contract) Backed up:
-  - the whole workspace folder including `.git` (so LFS objects are covered even with the "This PC only" store), `work/`, `candidates/` and proposals — excluding `.worldwright/core.lock`, `.worldwright/staging/` and `.git/*.lock`;
-  - `%APPDATA%\Worldwright` (settings, personal resources, providers and prices, the encrypted rclone config);
-  - from the local data folders (`%LOCALAPPDATA%\Worldwright`, and `<volume>:\.worldwright-local\<hash>\` for a workspace on another volume, OPS-035): rolling document snapshots, local proposals storage, `usage-loose.jsonl`, assistant conversations, and consistent copies of the per-workspace and suite-level `state.db` (made with SQLite online backup).
+  - the whole workspace folder including `.git` (so LFS objects are covered even with the "This PC only" store), `work/`, `candidates/` and proposals — excluding `.lilith/core.lock`, `.lilith/staging/` and `.git/*.lock`;
+  - `%APPDATA%\LILITH` (settings, personal resources, providers and prices, the encrypted rclone config);
+  - from the local data folders (`%LOCALAPPDATA%\LILITH`, and `<volume>:\.lilith-local\<hash>\` for a workspace on another volume, OPS-035): rolling document snapshots, local proposals storage, `usage-loose.jsonl`, assistant conversations, and consistent copies of the per-workspace and suite-level `state.db` (made with SQLite online backup).
 - **OPS-072** [M1] (invariant) Not backed up: `index.db`, `telemetry.db`, caches, recovery files, model files (re-downloadable), and **Claude Code profile folders** (they hold sign-ins; §4.6a). A setting can also exclude proposals and rejected candidates.
 - **OPS-073** [M1.5] With a shared cloud store and several machines, one **full-backup machine** runs `git lfs fetch --all` (after a disk-space check) so every machine's versions are covered; the other machines back up what they have.
 
 **Consistency without admin rights (two phases)**
 
 - **OPS-074** [M1] (invariant) Each backup run has two phases:
-  1. pause suite writes for **seconds**; copy the small mutable set (manifests, logs, YAML, `progress.md`, the `state.db` backups) into `%LOCALAPPDATA%\Worldwright\backup-stage\`, with `stage-map.json` mapping each staged file to its original path; resume writes;
+  1. pause suite writes for **seconds**; copy the small mutable set (manifests, logs, YAML, `progress.md`, the `state.db` backups) into `%LOCALAPPDATA%\LILITH\backup-stage\`, with `stage-map.json` mapping each staged file to its original path; resume writes;
   2. `restic backup` everything else live, excluding the staged originals. Files whose modification time changed during the run are picked up by a second `restic backup --parent <first>` over the **same full path set** with the same tags. The second snapshot is the one shown and kept; the first is forgotten only after the second is saved, so retention never keeps a partial snapshot.
 - **OPS-075** [M1] **Restore** overlays staged copies onto their original paths using `stage-map.json`.
 - **OPS-076** [M1] restic exit code 3 is shown as a **partial** backup, with the list of files it couldn't read.
@@ -2516,7 +2516,7 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 
 **Scheduling and retention**
 
-- **OPS-078** [M1] A per-user Task Scheduler task ("run only when user is logged on", `StartWhenAvailable`; no admin rights, no stored password) runs `ww backup --scheduled` through a **windowless launcher**, which starts the core so it can pause writes. Defaults: the local drive daily (when connected); each cloud destination nightly, after the local backup. (M0 result, 2026-10-12: the windowless launcher is **confirmed necessary**: the owner saw a console window flash when the task ran `pwsh -NoProfile -WindowStyle Hidden`. The task action must be the launcher's **absolute path**: a bare `pwsh` (a Store execution alias) failed with 0x80070002, and the Store `pwsh.exe` path changes on upgrade. `docs/spikes/09-scheduled-task.md`.)
+- **OPS-078** [M1] A per-user Task Scheduler task ("run only when user is logged on", `StartWhenAvailable`; no admin rights, no stored password) runs `lil backup --scheduled` through a **windowless launcher**, which starts the core so it can pause writes. Defaults: the local drive daily (when connected); each cloud destination nightly, after the local backup. (M0 result, 2026-10-12: the windowless launcher is **confirmed necessary**: the owner saw a console window flash when the task ran `pwsh -NoProfile -WindowStyle Hidden`. The task action must be the launcher's **absolute path**: a bare `pwsh` (a Store execution alias) failed with 0x80070002, and the Store `pwsh.exe` path changes on upgrade. `docs/spikes/09-scheduled-task.md`.)
 - **OPS-079** [M0] The M0 spike confirms that a standard (non-admin) account can register that task. (M0 result, 2026-10-12: a non-elevated (Medium-integrity) shell registered, ran, read back and removed the task with `-LogonType Interactive -RunLevel Limited`, `StartWhenAvailable` and no stored password. It was tested from a non-elevated token of an admin-group account; a separate standard account was not tested. `docs/spikes/09-scheduled-task.md`.)
 - **OPS-080** [M1] (contract) **Retention** uses a fixed `--host <machine-id>` and groups by host and tags:
   - `restic forget --group-by host,tags --tag scheduled --keep-daily 7 --keep-weekly 4 --keep-monthly 12`;
@@ -2527,7 +2527,7 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 
 **Before risky changes**
 
-- **OPS-082** [M1] Before risky changes the suite makes a fast metadata-only backup: tagged `pre-migration` before any schema migration, and `pre-risky` before cascades and bulk deletes. It goes to the primary drive if it's connected, otherwise a local copy in `%LOCALAPPDATA%\Worldwright\pre-migration\<timestamp>\`, kept 90 days.
+- **OPS-082** [M1] Before risky changes the suite makes a fast metadata-only backup: tagged `pre-migration` before any schema migration, and `pre-risky` before cascades and bulk deletes. It goes to the primary drive if it's connected, otherwise a local copy in `%LOCALAPPDATA%\LILITH\pre-migration\<timestamp>\`, kept 90 days.
 - **OPS-083** [M1] (invariant) A migration never starts unless one of those two pre-migration copies succeeded.
 
 **Backups panel**
@@ -2548,10 +2548,10 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 **Installer**
 
 - **OPS-091** [M1] (decision) The installer is **Velopack**, per-user (no admin rights), installing into `%LOCALAPPDATA%\<packId>`. Velopack behaviour that shapes the rules below (verified 2026-10-12): a fresh install over an existing folder, or an uninstall, deletes that whole folder; an update replaces its `current\` subfolder and force-stops processes running from it.
-- **OPS-092** [M1] (contract) Pack ids are `WorldwrightSuite` (stable) and `WorldwrightSuite.Dev` (dev), each mapped to its pipe channel (`stable` / `dev`, §1.2).
-- **OPS-093** [M1] (invariant) **No suite data ever lives in the install folders.** Data stays in `%APPDATA%\Worldwright`, `%LOCALAPPDATA%\Worldwright` and, for a workspace on another volume, `<volume>:\.worldwright-local\` (OPS-035).
-- **OPS-094** [M1] **Contents:** the core, the apps, `ww`, the windowless launcher, `ww-mcp`, restic and rclone (pinned, hash-checked), Qt plus the matching Qt WebEngine pair (§6.6), shaders, and the **Visual C++ runtime DLLs shipped app-local** (Microsoft permits this; no admin rights or redistributable installer needed; runtime fixes arrive with suite updates).
-- **OPS-095** [M1] (contract) **`ww-mcp` for Claude Code:** only the stable channel owns the fixed copy at `%LOCALAPPDATA%\Worldwright\bin\ww-mcp.exe`. Velopack's after-install and after-update hooks copy it there with rename-then-replace.
+- **OPS-092** [M1] (contract) Pack ids are `LILITHSuite` (stable) and `LILITHSuite.Dev` (dev), each mapped to its pipe channel (`stable` / `dev`, §1.2).
+- **OPS-093** [M1] (invariant) **No suite data ever lives in the install folders.** Data stays in `%APPDATA%\LILITH`, `%LOCALAPPDATA%\LILITH` and, for a workspace on another volume, `<volume>:\.lilith-local\` (OPS-035).
+- **OPS-094** [M1] **Contents:** the core, the apps, `lil`, the windowless launcher, `lil-mcp`, restic and rclone (pinned, hash-checked), Qt plus the matching Qt WebEngine pair (§6.6), shaders, and the **Visual C++ runtime DLLs shipped app-local** (Microsoft permits this; no admin rights or redistributable installer needed; runtime fixes arrive with suite updates).
+- **OPS-095** [M1] (contract) **`lil-mcp` for Claude Code:** only the stable channel owns the fixed copy at `%LOCALAPPDATA%\LILITH\bin\lil-mcp.exe`. Velopack's after-install and after-update hooks copy it there with rename-then-replace.
 
 **Updates**
 
@@ -2567,8 +2567,8 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 
 **First run on a machine**
 
-- **OPS-102** [M1] First run proceeds: install → (optional) sign in to GitHub → create a workspace or open one (from a drive or, with a cloud store, from GitHub) → provider keys → `ww doctor`.
-- **OPS-103** [M1] `ww doctor` at first run covers: Git and git-lfs versions (OPS-006/OPS-007, offering the upgrade); the Dev Drive recommendation; ComfyUI (guided install — asks first) and its recorded custom nodes; models re-downloaded by hash; Claude Code (you install it and sign in; minimum version per §4.6, AI-061) and its profiles (§4.6a); the Worldwright plugin registered with Claude Code (asks first); backups (pick the primary drive, optionally add destinations, reconnect existing ones from the recovery sheet); and the Smart App Control state.
+- **OPS-102** [M1] First run proceeds: install → (optional) sign in to GitHub → create a workspace or open one (from a drive or, with a cloud store, from GitHub) → provider keys → `lil doctor`.
+- **OPS-103** [M1] `lil doctor` at first run covers: Git and git-lfs versions (OPS-006/OPS-007, offering the upgrade); the Dev Drive recommendation; ComfyUI (guided install — asks first) and its recorded custom nodes; models re-downloaded by hash; Claude Code (you install it and sign in; minimum version per §4.6, AI-061) and its profiles (§4.6a); the `worldwright` plugin registered with Claude Code (asks first); backups (pick the primary drive, optionally add destinations, reconnect existing ones from the recovery sheet); and the Smart App Control state.
 
 **Signing**
 
@@ -2582,7 +2582,7 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 
 ### 7.7 Milestone scope
 
-- **M1:** the suite repository and CI; the workspace as a local git repository with LFS; large-file store "This PC only" or "External drive", and the one store change "This PC only → External drive" with copy-and-verify; optional workspace push to GitHub with a drive store; single-machine Sync (commit and push); content hashes in every reference and creation UUIDs on every asset; per-machine monthly job and usage logs; per-workspace local data on the workspace's volume; restic backups to the local drive (two-phase consistency with stage map, scheduled task, tagged retention, `pre-migration`/`pre-risky` backups with local fallback); the **OneDrive destination** via rclone; synced-folder detection; the Backups panel in Diagnostics with add-destination, costs, warnings and restore-to-side-folder; the Velopack installer with stable/dev pack ids, app-local runtime, updates and release pipeline; `ww doctor` tooling checks including the git-lfs upgrade offer.
+- **M1:** the suite repository and CI; the workspace as a local git repository with LFS; large-file store "This PC only" or "External drive", and the one store change "This PC only → External drive" with copy-and-verify; optional workspace push to GitHub with a drive store; single-machine Sync (commit and push); content hashes in every reference and creation UUIDs on every asset; per-machine monthly job and usage logs; per-workspace local data on the workspace's volume; restic backups to the local drive (two-phase consistency with stage map, scheduled task, tagged retention, `pre-migration`/`pre-risky` backups with local fallback); the **OneDrive destination** via rclone; synced-folder detection; the Backups panel in Diagnostics with add-destination, costs, warnings and restore-to-side-folder; the Velopack installer with stable/dev pack ids, app-local runtime, updates and release pipeline; `lil doctor` tooling checks including the git-lfs upgrade offer.
 - **M1.5:** the S3-compatible large-file store (B2 and other presets) and every other store change; Sync between machines (collision renames resolved through `renamed_from`, conflict-pick UI, cross-machine spend view, full-backup machine); document checkpoints across machines with mark-and-sweep GC; Hetzner, BorgBase, IDrive e2, Custom S3 and Custom SFTP/REST destinations; S3 Object Lock as an advanced option; the in-house LFS transfer agent.
 - **Later:** Custom rclone destinations (other consumer drives); a models mirror; server-side store → backup copy; code signing if needed; other platforms.
 
@@ -2615,9 +2615,9 @@ The M0 results (2026-10-12) are recorded in the rules themselves, as "(M0 result
 
 - **ARCH-115** The stack spike must pass before M1 app work: cxx-qt 0.10 + KDDockWidgets 2.4.1 (Qt Quick) + a `QQuickRhiItem` shim + QtWebEngine + `windeployqt` on Qt 6.12 LTS with MSVC. If it fails on 6.12, fall back to Qt 6.11; the result fixe…
 - **APP-071** Pasting into Discord and Chromium is tested in the M0 spike (and again in the manual milestone checks, §6.4).
-- **AI-133** With Engine A's profile (`--setting-sources`, `--settings`, `--strict-mcp-config`, `--permission-mode default`): the claude.ai login still works (`claude auth status` and `apiKeySource: "none"`), and `ww-mcp` from `--mcp-config` c…
+- **AI-133** With Engine A's profile (`--setting-sources`, `--settings`, `--strict-mcp-config`, `--permission-mode default`): the claude.ai login still works (`claude auth status` and `apiKeySource: "none"`), and `lil-mcp` from `--mcp-config` c…
 - **AI-134** Decided by the M0 spike: `--restricted` (managed + `--settings` only, file tools confined to the working directories, command tools only if named) and `--safe-mode` behaviour with OAuth and `--mcp-config`, and whether `--restricte…
-- **AI-135** Strict mode drops plugin servers; `ww-mcp.exe` launched by absolute path is a direct child of `claude.exe`.
+- **AI-135** Strict mode drops plugin servers; `lil-mcp.exe` launched by absolute path is a direct child of `claude.exe`.
 - **AI-136** The `-p` default permission mode, and that `--permission-mode default` overrides it.
 - **AI-137** The permission-prompt tool's input/output contract, and whether a long-waiting prompt-tool call gets backgrounded.
 - **AI-138** The `interrupt` control request, and `interrupt_receipt_v1` in `system/init` capabilities.
@@ -2661,7 +2661,7 @@ The M0 results (2026-10-12) are recorded in the rules themselves, as "(M0 result
 - **IMG-127** Open in ComfyUI loads a workflow by calling the frontend's graph-loading function through `runJavaScript`, passing the graph as base64 decoded inside the page (no script injection), into a new workflo…
 - **IMG-149** M1b — completes the studio:
 - **QA-077** Qt in CI: Qt 6.12 LTS and the Qt WebEngine release matching it (versioned separately; the exact version is pinned in the M0 Qt-stack spike, §1) are pinned as a pair, cached by the exact pair, and a CI check verifies the installed …
-- **OPS-007** When either version is below the floor, `ww doctor` and first-run setup offer the upgrade and install it only after you confirm. The M0 test machine had Git 2.55.0 and git-lfs 3.7.1 (checked 2026-10-12): Git meets the floor, git-lfs…
+- **OPS-007** When either version is below the floor, `lil doctor` and first-run setup offer the upgrade and install it only after you confirm. The M0 test machine had Git 2.55.0 and git-lfs 3.7.1 (checked 2026-10-12): Git meets the floor, git-lfs…
 
 ### B.3 External facts the plan depends on (verified 2026-10-12)
 
@@ -2673,7 +2673,7 @@ Re-check these against their primary sources when the plan task that depends on 
 - Claude Code truncates tool descriptions at 2,048 characters — source: Claude Code docs (verified 2026-10-12).
 - Claude Code honours `_meta["anthropic/requiresUserInteraction"]: true` by always prompting, and hooks can't auto-allow it.
 - Claude Code doesn't document `structuredContent` / `resource_link`.
-- MCP tool names `mcp__plugin_worldwright_ww__<tool>` (plugin) vs `mcp__ww__<tool>` (own config).
+- MCP tool names `mcp__plugin_worldwright_lil__<tool>` (plugin) vs `mcp__lil__<tool>` (own config).
 - `keyring` 4.x with `windows-native-keyring-store`.
 - Qt 6.12 LTS + the separately versioned Qt WebEngine release matching it (exact version pinned by the M0 spike, not stated as fact); cxx-qt 0.10 and `cxx_qt_import_crate` CMake integration via Corrosion; KDDockWidgets 2.4.1 (2.5 pending); QtWebEngine install-size cost ~150 MB.
 - Licences: Qt LGPLv3; KDDockWidgets, Qt Quick 3D, Qt Graphs and the QML compiler GPL (§1.8 licences paragraph).
@@ -2783,17 +2783,17 @@ The research behind each section is kept in [`docs/research/`](../../research/).
 
 This appendix records the protocol names, tables and exit codes that plan 2 implements. They are contracts. It adds no rule IDs; it clarifies ARCH-021, ARCH-023, ARCH-024, ARCH-029, ARCH-031, ARCH-036, CORE-014 and QA-005.
 
-- **Pipe:** `\\.\pipe\worldwright-core-<userSID>-<channel>` (ARCH-024). Test channels (`test-<id>`) use the fixed SID `S-1-5-21-1000-2000-3000-1001` in the *name*, so test processes agree on it without querying the token. The pipe's DACL always grants the real user SID and SYSTEM (ARCH-026).
+- **Pipe:** `\\.\pipe\lilith-core-<userSID>-<channel>` (ARCH-024). Test channels (`test-<id>`) use the fixed SID `S-1-5-21-1000-2000-3000-1001` in the *name*, so test processes agree on it without querying the token. The pipe's DACL always grants the real user SID and SYSTEM (ARCH-026).
 - **Process environment:**
 
   | Variable | Meaning |
   |---|---|
-  | `WW_BUILD_CHANNEL` (compile time) | `stable` only in release packaging; default `dev` |
-  | `WW_BUILD_ID` (compile time) | build id suffix; `build_id` is `<CARGO_PKG_VERSION>+<WW_BUILD_ID or "local">` |
-  | `WW_CHANNEL` | a dev build accepts `dev` or `test-<id>`; a stable build refuses any value but `stable` |
-  | `WW_TEST_ROOT` | test channels only: `<root>\{roaming,local,profile}` |
-  | `WW_TEST_PARENT_PID` | test channels only |
-  | `WW_TEST_IDLE_SECS` | test channels only |
+  | `LIL_BUILD_CHANNEL` (compile time) | `stable` only in release packaging; default `dev` |
+  | `LIL_BUILD_ID` (compile time) | build id suffix; `build_id` is `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">` |
+  | `LIL_CHANNEL` | a dev build accepts `dev` or `test-<id>`; a stable build refuses any value but `stable` |
+  | `LIL_TEST_ROOT` | test channels only: `<root>\{roaming,local,profile}` |
+  | `LIL_TEST_PARENT_PID` | test channels only |
+  | `LIL_TEST_IDLE_SECS` | test channels only |
 
 - **Framing** (ARCH-025): one JSON-RPC 2.0 object per line (`\n`), UTF-8, **at most 4 MiB** per line, in both directions. Batches aren't supported. The core never writes a longer line: a tool outcome that would not fit becomes the error `core.bug` (stored as the call's outcome, so a retry with the same key gets the same error), an event that would not fit is replaced by `resync_required` for its topic, and any other response that would not fit becomes -32603.
 - **Methods and results** (ARCH-031). Every method's JSON-RPC `result` is an `Outcome<T>`. Tool failures are `Outcome` errors, never JSON-RPC errors (QA-010).
@@ -2804,10 +2804,10 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | `core/drain` | `DrainParams {}` | `Outcome<DrainResult>` | after a successful hello; on a refused connection only when the client's major > the core's |
   | `tools/list` | `ToolsListParams {}` | `Outcome<ToolsListResult>` | after hello |
   | `tools/call` | `ToolCallParams` | `Outcome<ToolOutput>` | after hello |
-  | `ww/subscribe` | `SubscribeParams` | `Outcome<SubscribeResult>` | after hello |
-  | `ww/unsubscribe` | `UnsubscribeParams` | `Outcome<UnsubscribeResult>` | after hello |
+  | `lil/subscribe` | `SubscribeParams` | `Outcome<SubscribeResult>` | after hello |
+  | `lil/unsubscribe` | `UnsubscribeParams` | `Outcome<UnsubscribeResult>` | after hello |
   | `app/*` | per method | `Outcome<per method>` | verified `ui:*` only; anyone else gets `caller.not_allowed`; plan 2 defines no `app/*` method |
-  | `ww/event` (notification, core → client) | `EventParams` | — | subscribed clients |
+  | `lil/event` (notification, core → client) | `EventParams` | — | subscribed clients |
 
 - **`Outcome` envelope** (ARCH-036, QA-001, QA-002), tagged by `status`:
   - `{"status":"ok", …T's fields}`;
@@ -2901,13 +2901,13 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | `trash.restore_conflict` | `data_conflict` | `after_resolve` | plan 2b |
 
 - **Events** (ARCH-032).
-  - `ww/subscribe` params: `{"topics":[…], "since_seq":{"<topic>": <seq>, …}}`. The map is per topic; a topic missing from it means live events only.
-  - `ww/subscribe` result: `{"topics":[{"topic","seq"}]}`, where `seq` is the topic's current sequence number.
-  - `ww/unsubscribe`: params `{"topics":[…]}`, result `{"topics":[…]}` (the topics removed).
-  - `ww/event` params: `{"topic","seq","kind":"event"|"snapshot"|"resync_required","data"}`.
+  - `lil/subscribe` params: `{"topics":[…], "since_seq":{"<topic>": <seq>, …}}`. The map is per topic; a topic missing from it means live events only.
+  - `lil/subscribe` result: `{"topics":[{"topic","seq"}]}`, where `seq` is the topic's current sequence number.
+  - `lil/unsubscribe`: params `{"topics":[…]}`, result `{"topics":[…]}` (the topics removed).
+  - `lil/event` params: `{"topic","seq","kind":"event"|"snapshot"|"resync_required","data"}`.
   - Topic names match `^[a-z][a-z0-9_]*(:.+)?$`.
   - History: 600 s per topic, by monotonic time and at most 1024 events. Per-client queue: 1024 events.
-- **Exit codes of `ww-core`:**
+- **Exit codes of `lil-core`:**
 
   | Code | Meaning |
   |---|---|
@@ -2919,26 +2919,26 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
   | 6 | the suite `state.db` is from a newer version; nothing was changed |
   | 7 | the suite `state.db` has a hot rollback journal (a crash mid-write); nothing was changed |
 
-- **The `ww` user commands.** Global flags, accepted before or after the subcommand: `--workspace <PATH>`, `--non-interactive`, `--no-start`.
+- **The `lil` user commands.** Global flags, accepted before or after the subcommand: `--workspace <PATH>`, `--non-interactive`, `--no-start`.
 
   | Command | Output |
   |---|---|
-  | `ww status [--json]` | human lines `core: running (pid <pid>, channel <channel>)`, `pipe: <pipe>`, `protocol: <protocol> (build <build_id>)`, `workspace: <path or none>`, `caller: <caller_kind>`; `--json` prints `{"running":true,"hello":<HelloResult>}` or `{"running":false}` |
-  | `ww call <tool> [<JSON object> \| -] [--idempotency-key <k>]` | the `Outcome` as pretty JSON on stdout. Arguments default to `{}`, and `-` reads them from stdin |
-  | `ww events --follow --topic <t>… [--since <topic>=<seq>]…` | one `EventParams` JSON per line, flushed per line, until the core goes away |
-  | `ww core stop [--timeout-secs <n>]` (default 60) | `core stopped` or `core not running`; never starts a core |
+  | `lil status [--json]` | human lines `core: running (pid <pid>, channel <channel>)`, `pipe: <pipe>`, `protocol: <protocol> (build <build_id>)`, `workspace: <path or none>`, `caller: <caller_kind>`; `--json` prints `{"running":true,"hello":<HelloResult>}` or `{"running":false}` |
+  | `lil call <tool> [<JSON object> \| -] [--idempotency-key <k>]` | the `Outcome` as pretty JSON on stdout. Arguments default to `{}`, and `-` reads them from stdin |
+  | `lil events --follow --topic <t>… [--since <topic>=<seq>]…` | one `EventParams` JSON per line, flushed per line, until the core goes away |
+  | `lil core stop [--timeout-secs <n>]` (default 60) | `core stopped` or `core not running`; never starts a core |
 
-  **Exit codes of `ww`:**
+  **Exit codes of `lil`:**
 
   | Code | Meaning |
   |---|---|
   | 0 | ok |
   | 1 | the call returned an `error` result |
   | 2 | couldn't run (usage, connection, untrusted core, start failure), with a plain message on stderr |
-  | 3 | `ww status` with `--no-start` found no core |
+  | 3 | `lil status` with `--no-start` found no core |
   | 4 | `pending_confirmation` |
 
-  With `--no-start`, every command except `status` is a silent no-op that exits 0 when no core runs (ARCH-018). Core exit codes 5 and 6 become the plain messages "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` can set it aside." and "… is from a newer version of Worldwright. Nothing was changed." Exit code 7 becomes "The core can't start: its state database at <path> was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery."
+  With `--no-start`, every command except `status` is a silent no-op that exits 0 when no core runs (ARCH-018). Core exit codes 5 and 6 become the plain messages "The core can't start: its state database at <path> is damaged. Nothing was changed. `lil doctor` can set it aside." and "… is from a newer version of LILITH. Nothing was changed." Exit code 7 becomes "The core can't start: its state database at <path> was left mid-write by a crash. Nothing was changed. `lil doctor` can finish the recovery."
 - **Workspace id:** the 16-hex workspace hash of the canonical path (plan 1 contract), or `"none"`.
 - **`suite.toml`** keys read in this plan: `default_workspace = '<path>'` and `[[workspaces]] path = '<path>'`. Unknown keys are preserved by the type.
 - **Per-workspace `state.db`:** `Env::workspace_local_dir(ws)\state.db`. **Suite `state.db`:** `Env::local_dir()\state.db` (CORE-005).
@@ -2946,7 +2946,7 @@ This appendix records the protocol names, tables and exit codes that plan 2 impl
 - **Clarifications recorded in Appendix D** (no new rule IDs):
   - ARCH-021 clarification: a *requested* drain (`core/drain`, "exit when safe") waits for running work without a timeout. The timeout of step 1 applies to session-end and fatal shutdowns.
   - ARCH-024 clarification: the fixed test SID in pipe names, as stated above.
-  - CORE-014 clarification: `config`, `server`, `rpc`, `identity`, `workspace`, `session`, `events` and `lifecycle` are infrastructure inside `ww-core`, not CORE-014 modules. The registry and dispatcher are the `tools` module. The core's own log file (the `tracing` sink) is exempt from the single-file-write-home rule (ARCH-112), as SQLite's own database files are. Creating its folder still goes through the store's `ensure_dir`.
+  - CORE-014 clarification: `config`, `server`, `rpc`, `identity`, `workspace`, `session`, `events` and `lifecycle` are infrastructure inside `lil-core`, not CORE-014 modules. The registry and dispatcher are the `tools` module. The core's own log file (the `tracing` sink) is exempt from the single-file-write-home rule (ARCH-112), as SQLite's own database files are. Creating its folder still goes through the store's `ensure_dir`.
 
 ## Appendix E. Workspace data (plan 2b clarification)
 
@@ -2966,13 +2966,13 @@ This appendix records the workspace-data names, algorithms and tables that plan 
      - for a manifest or YAML edit, the hash read at the start of the edit;
      - LFS pointers compare by `oid`;
      - a cloud-only placeholder target is never read, since reading would download it: the write fails with `store.hash_conflict`, and the message says to make the file available offline first. The same check comes first in every store operation that reads a file's data (`Store::read`, `edit_manifest`, `edit_yaml`, `edit_text`): the attribute-only `probe.identity` runs before any byte is read, so the store never triggers a download. Edits of a placeholder fail with `store.hash_conflict`, and `Store::read` of one fails with `store.io`, with the same message.
-  4. Write `<dir>\.<name>.ww-tmp-<pid>-<n>` in the same folder, and flush it with `FlushFileBuffers` before closing it. The first backup name of step 6 uses the same `<pid>-<n>`.
+  4. Write `<dir>\.<name>.lil-tmp-<pid>-<n>` in the same folder, and flush it with `FlushFileBuffers` before closing it. The first backup name of step 6 uses the same `<pid>-<n>`.
   5. Record the pending replace: a `generated_pending(path, old_sha256, new_sha256)` row in the workspace `state.db`. `old_sha256` is the hash checked in step 3, or null for a new target.
   6. Replace the target. The fail point `store.replace` comes just before this step, and `store.after_replace` just after it.
-     - For an existing target, call `ReplaceFileW(REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS)` with a backup name `<dir>\.<name>.ww-bak-<pid>-<n>`. `REPLACEFILE_WRITE_THROUGH` is never passed: it is documented as not supported.
+     - For an existing target, call `ReplaceFileW(REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS)` with a backup name `<dir>\.<name>.lil-bak-<pid>-<n>`. `REPLACEFILE_WRITE_THROUGH` is never passed: it is documented as not supported.
      - For a new target, call `MoveFileExW(MOVEFILE_WRITE_THROUGH)` without `MOVEFILE_REPLACE_EXISTING`. Errors 80 and 183 mean an outside writer created the file after step 3: the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
   7. Hash the backup. If it equals the hash checked in step 3, the backup is removed. Otherwise an outside edit landed between steps 3 and 6, and the outside version is put back:
-     - with `ReplaceFileW` (target = the core's new bytes, replacement = the backup, and a second backup name `<dir>\.<name>.ww-bak-<pid>-<n+1>`, which then holds the core's new bytes and is removed), or, where `ReplaceFileW` is unsupported, with the fallback's two `move_new` renames (target → the second backup name, then the first backup → target);
+     - with `ReplaceFileW` (target = the core's new bytes, replacement = the backup, and a second backup name `<dir>\.<name>.lil-bak-<pid>-<n+1>`, which then holds the core's new bytes and is removed), or, where `ReplaceFileW` is unsupported, with the fallback's two `move_new` renames (target → the second backup name, then the first backup → target);
      - the fail point `store.put_back` comes after the first half of the put-back (the `ReplaceFileW`, or the fallback's first rename) and before the rest, so a crash in the middle of a put-back can be tested;
      - the put-back retries sharing violations under the same 10 s budget. If it still fails, the call ends with `store.hash_conflict` whose `data.backup` names the backup's workspace-relative path, and the pending row stays, so the next open's recovery puts the outside version back;
      - the core's own new content is discarded (the call failed, so nothing of yours is lost), the pending row is cleared, and the call fails with `store.hash_conflict`.
@@ -2983,7 +2983,7 @@ This appendix records the workspace-data names, algorithms and tables that plan 
   - A folder move (`move_new` of a folder: moving to the trash, restoring from it, sealing) also retries error 5 (`ERROR_ACCESS_DENIED`) the same way: a folder rename fails with 5 while any handle is open anywhere in its subtree, whatever that handle's share mode (MS-FSA 2.1.5.15.12), and the index, Defender, Search or Explorer can hold one. A file operation never retries 5.
   - Errors 1175 and 1176 leave both files under their own names (a backup name was given), so they are retried the same way. Error 1177 leaves the old target under the backup name and the replacement under its temp name: the store moves the replacement onto the freed target name with `move_new`, then runs step 7.
   - Where `ReplaceFileW` is unsupported (errors 1 and 50, for example on some network volumes), the store makes two renames, both with `move_new` (`MoveFileExW(MOVEFILE_WRITE_THROUGH)`, no `MOVEFILE_REPLACE_EXISTING`): target → backup, then temp → target. The fail point `store.between_renames` comes between the two. Step 7 follows. If a crash leaves only the backup, the next workspace open restores it.
-  - On the fallback's second rename and on the move after 1177, the target name was just freed, so errors 80 and 183 mean an outside writer created a file there in the gap. That file is kept; the backup is moved aside with `move_new` to `<dir>\<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>`, the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
+  - On the fallback's second rename and on the move after 1177, the target name was just freed, so errors 80 and 183 mean an outside writer created a file there in the gap. That file is kept; the backup is moved aside with `move_new` to `<dir>\<name>.lil-conflict-<YYYYMMDDTHHMMSSZ>`, the temp file is removed, the pending row is cleared, and the call fails with `store.hash_conflict`.
   - Disk full (errors 112 and 39) fails at once with `store.disk_full`; the temp file is removed and the pending row cleared.
 
   Durability: the temp file is flushed before the swap (step 4). Renames are atomic (journaled) but may be lost on power failure: `MOVEFILE_WRITE_THROUGH` is documented only to flush a move done as a copy and delete, so it adds no documented durability to a same-volume rename, and `ReplaceFileW` has no write-through option at all. A power cut can therefore leave either version. The temp flush makes both complete, and the pending row (step 5) makes either one acceptable as the core's own. `ReplaceFileW` needs the target, temp and backup files on one volume, which is why all three names are in the target's folder. The resulting file has the replacement's file ID, not the old target's, so the index records the identity the store reports after each write.
@@ -2992,38 +2992,44 @@ This appendix records the workspace-data names, algorithms and tables that plan 
     - `candidates/<run>/` folders missing from their manifest;
     - `v<semver>/` folders that hold a `manifest.snapshot.json` but whose version is neither the manifest's `approved_version` nor a run's `signed_off.version` (a crash between sealing and the manifest edit);
     - non-empty staging handles and `seal-*` folders left by a dead core (at open under `core.lock`, every existing handle belongs to a dead core);
-    - `*.ww-conflict-*` files.
-  - Stale `*.ww-tmp-*` files of processes that are no longer running, and empty staging handles, are removed.
+    - `*.lil-conflict-*` files.
+  - Stale `*.lil-tmp-*` files of processes that are no longer running, and empty staging handles, are removed.
   - **Pending replaces** are resolved, one row at a time, in this order:
     1. a backup whose hash equals the row's `new_sha256` holds the core's own new bytes (the second backup of a put-back cut short) and is removed;
     2. target missing and a backup left (a crash between the fallback's renames, or between the fallback put-back's renames): the remaining backup, which is the old content or the outside edit and never the core's new bytes, is moved back with `move_new`;
     3. backup and target both present, and the backup's hash equals the row's `old_sha256` (or the generated hash): the backup is removed;
-    4. backup and target both present, and the backup's hash is anything else: the backup holds an outside edit. The target (the core's bytes) is moved aside with `move_new` to `<name>.ww-conflict-<YYYYMMDDTHHMMSSZ>` and the backup is moved back with `move_new`, so the outside edit is never left only in a dot-file;
+    4. backup and target both present, and the backup's hash is anything else: the backup holds an outside edit. The target (the core's bytes) is moved aside with `move_new` to `<name>.lil-conflict-<YYYYMMDDTHHMMSSZ>` and the backup is moved back with `move_new`, so the outside edit is never left only in a dot-file;
     5. then, if the target's hash equals `new_sha256`, it becomes the generated hash. The row is cleared in every case.
-  - A `*.ww-bak-*` file whose target is missing is restored the same way, with or without a pending row.
+  - A `*.lil-bak-*` file whose target is missing is restored the same way, with or without a pending row.
 - **Append logs** (ARCH-081, CORE-009):
   - one JSON object per line, ending in `\n`, with `"machine"` and `"seq"` (from 1 per file) first, then the record;
-  - each line is one write under `LockFileEx` on the byte range starting at offset 2⁶⁴−2 with length 1 of the log file itself, which `ww` can take too. The lock is requested with `LOCKFILE_FAIL_IMMEDIATELY` and retried by the caller, under the store's retry budget (10 ms doubling to 500 ms, 10 s in all, then `store.busy`);
+  - each line is one write under `LockFileEx` on the byte range starting at offset 2⁶⁴−2 with length 1 of the log file itself, which `lil` can take too. The lock is requested with `LOCKFILE_FAIL_IMMEDIATELY` and retried by the caller, under the store's retry budget (10 ms doubling to 500 ms, 10 s in all, then `store.busy`);
   - while the lock is held, the file is read, a last line without `\n` is closed with `\n`, and the line's `seq` is computed from that text, so two appenders never write the same `(machine, seq)`;
   - readers skip lines that don't parse and dedupe by `(machine, seq)`.
 
   `<machine>` is the computer name, lowercased, with every character outside `[a-z0-9-]` replaced by `-`. On test channels it is `testmachine`. `<yyyy-mm>` is the UTC month of the line.
 - **Workspace areas** (ARCH-080, CORE-003, ARCH-028, ARCH-058, CORE-037, ARCH-088):
-  - staging handles: `<ws>\.worldwright\staging\<sh_16hex>\`; ingest is a rename onto the same volume;
-  - `<ws>\.worldwright\core.lock`, held with `LockFileEx` while the core serves the workspace;
-  - `<ws>\.worldwright\state.json` `{"active_project":"<slug>"}`, the untracked last-used hint;
+  - staging handles: `<ws>\.lilith\staging\<sh_16hex>\`; ingest is a rename onto the same volume;
+  - `<ws>\.lilith\core.lock`, held with `LockFileEx` while the core serves the workspace;
+  - `<ws>\.lilith\state.json` `{"active_project":"<slug>"}`, the untracked last-used hint;
   - trash entries: `<ws>\.trash\<YYYY-MM-DD>\<te_16hex>\payload\<original name>`, with `restore.json` beside it: `{"entry_id","original_path","moved_utc","purge_after","reason","sha256"?}`.
 - **`core.lock`** (ARCH-028): the lock gates both read-write access to the workspace's `state.db` and the release of stale `running` idempotency rows. A core that finds it held serves the workspace read-only:
   - read tools work;
   - write tools get `workspace.read_only`;
   - its `state.db` is opened read-only and its rows are never released. When that `state.db` doesn't exist yet (for example on another channel, whose local folder differs), an in-memory database with the migrations applied stands in, and nothing is created on disk;
   - it uses an in-memory index (the same code over SQLite `:memory:`), rebuilt at open, and never opens the shared `index.db`.
-- **Local data** (ARCH-097, CORE-005): `index.db` sits next to the workspace `state.db`, in `Env::workspace_local_dir(ws)`. It uses WAL, and `PRAGMA user_version` is `1`. A different version, or a failed `quick_check`, means the file is deleted and rebuilt. Only the core holding `core.lock` opens it: on a non-system volume both channels share `<volume>\.worldwright-local\<hash>\`, so a read-only core must never write it.
-- **`.gitignore` entries** added by `workspace.create` and `ww doctor` (CORE-040, ARCH-096): `.worldwright/`, `.trash/`, `inbox/*`, `projects/*/assets/*/candidates/`, `projects/*/assets/*/work/` (the root-relative form of CORE-040's `assets/*/work/`). All of `candidates/` is ignored, not only rejected runs (CORE-032 clarification), so open runs don't sync between machines.
-- **`.gitattributes` entry** added by `workspace.create` and `ww doctor` (CORE-040 clarification): `projects/** -text`, so git never converts line endings inside asset trees and recorded SHA-256 values hold on every clone. An existing file is appended to, never rewritten; the plan 7+ series (roadmap) adds its LFS patterns to the same file (ARCH-086).
+- **Local data** (ARCH-097, CORE-005): `index.db` sits next to the workspace `state.db`, in `Env::workspace_local_dir(ws)`. It uses WAL, and `PRAGMA user_version` is `1`. A different version, or a failed `quick_check`, means the file is deleted and rebuilt. Only the core holding `core.lock` opens it: on a non-system volume both channels share `<volume>\.lilith-local\<hash>\`, so a read-only core must never write it.
+- **Workspaces from before the rename** (ARCH-028, ARCH-088, ARCH-097; the LILITH rename plan's R4, D3 and D4, for one release). A workspace made with the `worldwright` plugin is found by `worldwright.yaml` when it has no `lilith.yaml`. The core serves it and never renames or rewrites a file of the person's:
+  - new state goes to `.lilith\`; the legacy `.worldwright\state.json` is read only while `.lilith\state.json` is missing, and leftovers in the legacy `staging\` folder are listed as orphans;
+  - the core also creates and locks the legacy `.worldwright\core.lock` when `.worldwright\` exists, and serves read-write only while it holds both locks. It never creates that folder;
+  - a read-write open copies the legacy workspace-local `state.db` forward when the new one is missing (`VACUUM INTO` a temp file, then a rename that replaces nothing). The legacy database is never written;
+  - **read-only limit (ruling RN9):** a read-only open of a legacy WAL `state.db` that has no `-wal` may create an empty `-wal` and a `-shm` beside it. No row and no database byte changes. Avoiding it would need `immutable=1`, which is unsafe while the lock holder may be writing;
+  - **accepted risk (D4):** a fresh clone of a plugin-era workspace, or one cleaned with `git clean -fdX` where `.worldwright/` is gitignored, has `worldwright.yaml` but no `.worldwright\`. The new core then holds only `.lilith\core.lock`, so an old core started after it could also write. No pre-rename core runs on a real workspace, so this risk is accepted.
+- **`.gitignore` entries** added by `workspace.create` and `lil doctor` (CORE-040, ARCH-096): `.lilith/`, `.trash/`, `inbox/*`, `projects/*/assets/*/candidates/`, `projects/*/assets/*/work/` (the root-relative form of CORE-040's `assets/*/work/`). All of `candidates/` is ignored, not only rejected runs (CORE-032 clarification), so open runs don't sync between machines.
+- **`.gitattributes` entry** added by `workspace.create` and `lil doctor` (CORE-040 clarification): `projects/** -text`, so git never converts line endings inside asset trees and recorded SHA-256 values hold on every clone. An existing file is appended to, never rewritten; the plan 7+ series (roadmap) adds its LFS patterns to the same file (ARCH-086).
 - **Refs** (ARCH-042, CORE-031, CORE-047):
-  - a sealed version: `ww://<workspace id>/<project>/<asset_id>@<major.minor.patch>`, optionally followed by `#sha256=<64 hex>`;
-  - a candidate: `ww://<workspace id>/<project>/<asset_id>@candidate/<run_id>/<file>`;
+  - a sealed version: `lil://<workspace id>/<project>/<asset_id>@<major.minor.patch>`, optionally followed by `#sha256=<64 hex>`;
+  - a candidate: `lil://<workspace id>/<project>/<asset_id>@candidate/<run_id>/<file>`;
   - manifest link forms (I6 of `docs/reference/workspace-format.md`): `<asset_id>@<v>`, `proj:<slug>/<asset_id>@<v>`, `lib:<item>@<v>` and `style@<n>`;
   - every new reference to a sealed version carries the hash, and manifest `inputs` entries gain `"sha256"`.
 
@@ -3040,7 +3046,7 @@ This appendix records the workspace-data names, algorithms and tables that plan 
   - `version` (I5 of `docs/reference/workspace-format.md`): when new work starts on an asset that has an `approved_version`, the first candidate run after it sets `version` to `approved_version` bumped by `minor`, and the run's `target_version` to the same value ("set it by the bump rules"); a sign-off with a confirmed `bump` replaces it.
 
   Unknown fields are kept in place (CORE-148). Edits never reorder existing keys: a removed key (`external` after `asset.collect`, `status_before_stale` after a restore) is removed by shifting the keys after it, never by moving the last key into its slot. Edits never add `schema_version` to a manifest that lacks it (a legacy manifest stays a minimal diff), and a file keeps the line ending (`\n` or `\r\n`) it was read with.
-- **Product tools.** Every one declares the Worldwright module `workspace`, which is always available and never filtered by `modules` (CORE-058). Inputs reject unknown fields. A tool with a `project` argument uses the session's active project when it's omitted, else `sketchbook` (ARCH-088, ARCH-098). The one exception is `assets.query`, whose `project` is a filter: omitted means every project.
+- **Product tools.** Every one declares the LILITH module `workspace`, which is always available and never filtered by `modules` (CORE-058). Inputs reject unknown fields. A tool with a `project` argument uses the session's active project when it's omitted, else `sketchbook` (ARCH-088, ARCH-098). The one exception is `assets.query`, whose `project` is a filter: omitted means every project.
 
   | Tool | Effect | Arguments | `structured` result |
   |---|---|---|---|
@@ -3078,29 +3084,29 @@ This appendix records the workspace-data names, algorithms and tables that plan 
   - `asset.pin_input` needs a ref that parses (`ref.invalid` otherwise). Its target doesn't have to exist on this machine, because a `proj:` or `lib:` source may be archived or not yet synced; the pin and the `links` entry are recorded either way (CORE-019).
   - Every write result that records an operation carries `handoff: {unlocks: [ref], made_stale: [ref], refs: [ref]}` (CORE-020).
   - `asset.import`'s `ref` is the candidate ref of its first file (for `link_external`, the asset's ref without a version); `handoff.refs` lists the ref of every file. `files` names each imported or collected file, tagged untrusted (ARCH-060).
-- **Settings cascade** (CORE-057, I2 and I4 of `docs/reference/workspace-format.md`): workspace `worldwright.yaml` `defaults:` → `project.yaml` → the request layer, a plain override chain over dotted leaf keys. The project layer is `project.yaml`'s own top-level keys, as I4 of `docs/reference/workspace-format.md` says ("a project can override any of them"); there is no `overrides:` key. The cascade keys are `models`, `providers`, `qa_profile`, `modules`, `auto_candidate_on_save`, and `skip_stages` and `auto_approve`, which both layers write under `pipeline:` as in I4 of `docs/reference/workspace-format.md` (`pipeline.skip_stages`, `pipeline.auto_approve`). So `models: {image_generate: b}` at the top of `project.yaml` overrides `defaults: {models: {image_generate: a}}`, and both are the key `models.image_generate`.
+- **Settings cascade** (CORE-057, I2 and I4 of `docs/reference/workspace-format.md`): workspace `lilith.yaml` `defaults:` → `project.yaml` → the request layer, a plain override chain over dotted leaf keys. The project layer is `project.yaml`'s own top-level keys, as I4 of `docs/reference/workspace-format.md` says ("a project can override any of them"); there is no `overrides:` key. The cascade keys are `models`, `providers`, `qa_profile`, `modules`, `auto_candidate_on_save`, and `skip_stages` and `auto_approve`, which both layers write under `pipeline:` as in I4 of `docs/reference/workspace-format.md` (`pipeline.skip_stages`, `pipeline.auto_approve`). So `models: {image_generate: b}` at the top of `project.yaml` overrides `defaults: {models: {image_generate: a}}`, and both are the key `models.image_generate`.
 - **`progress.md` entries** (CORE-039): a new entry `- YYYY-MM-DD: <text>` (UTC) goes on the line directly after `## Done`, newest first; the blank line before the next heading and every other section stay byte for byte. A file without `## Done` gets `## Done` and the entry appended at the end. A CRLF file stays CRLF. A new project's `project.yaml` holds `status: active`, `links: []` and one comment line, so status changes and new links edit existing keys.
 - **Topics** (ARCH-044, ARCH-032):
-  - `asset:ww://<workspace id>/<project>/<asset_id>` (the ref without `@<version>` and hash, so one topic covers every version) carries `{kind: "manifest"|"candidate_run"|"version_sealed"|"human_edit"|"needs_repair"|"missing"|"status", …}`; its snapshot is the `asset.get` result;
+  - `asset:lil://<workspace id>/<project>/<asset_id>` (the ref without `@<version>` and hash, so one topic covers every version) carries `{kind: "manifest"|"candidate_run"|"version_sealed"|"human_edit"|"needs_repair"|"missing"|"status", …}`; its snapshot is the `asset.get` result;
   - `project:<slug>` carries `{kind: "status"|"progress"|"asset"}`; its snapshot is the `project.status` result;
   - `workspace` carries `{kind: "orphans"|"git_paused"|"git_resumed"|"rescan"|"default_changed"|"watcher_unavailable"}`.
 
   History is kept per topic for 600 s and at most 1024 events (ARCH-032 clarification).
-- **The `ww` commands this plan adds.** Exit codes are as in Appendix D. `ww doctor` exits 0 when no problem remains, 1 when one does, and 2 when it couldn't run.
+- **The `lil` commands this plan adds.** Exit codes are as in Appendix D. `lil doctor` exits 0 when no problem remains, 1 when one does, and 2 when it couldn't run.
 
   | Command | Output |
   |---|---|
-  | `ww workspace init <path> [--name <n>] [--default]` | `workspace created at <path>` or `workspace registered at <path>`; then `default workspace: <path>` when it is the default |
-  | `ww workspace use <path>` | `default workspace: <path>`; it connects with workspace `"none"`, so a stale default never blocks it |
-  | `ww notify <path>…` | nothing on success; with `--no-start` and no core running, a silent no-op exiting 0 (ARCH-018) |
-  | `ww doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y`; an inherited `core.autocrlf=true` is a `problem`, set to `false` for the repository only after you type `y` (never with `--non-interactive`); with no `suite.toml` or no default workspace it prints `ok: no default workspace; workspace checks skipped` |
+  | `lil workspace init <path> [--name <n>] [--default]` | `workspace created at <path>` or `workspace registered at <path>`; then `default workspace: <path>` when it is the default |
+  | `lil workspace use <path>` | `default workspace: <path>`; it connects with workspace `"none"`, so a stale default never blocks it |
+  | `lil notify <path>…` | nothing on success; with `--no-start` and no core running, a silent no-op exiting 0 (ARCH-018) |
+  | `lil doctor` | one line per check, `ok: …`, `fixed: …` or `problem: … — <what to do>`; a damaged, newer or hot-journal suite `state.db` is explained, and is set aside (or recovered) only after you type `y`; an inherited `core.autocrlf=true` is a `problem`, set to `false` for the repository only after you type `y` (never with `--non-interactive`); with no `suite.toml` or no default workspace it prints `ok: no default workspace; workspace checks skipped` |
 
   The core-start messages become:
-  - "The core can't start: its state database at <path> is damaged. Nothing was changed. `ww doctor` can set it aside." (as in Appendix D)
-  - "The core can't start: its state database at <path> was left mid-write by a crash. Nothing was changed. `ww doctor` can finish the recovery." (as in Appendix D)
+  - "The core can't start: its state database at <path> is damaged. Nothing was changed. `lil doctor` can set it aside." (as in Appendix D)
+  - "The core can't start: its state database at <path> was left mid-write by a crash. Nothing was changed. `lil doctor` can finish the recovery." (as in Appendix D)
 
-  The `workspace.unsupported` and unregistered-workspace hints quote the path (`ww workspace use "<path>"`). A workspace named by `--workspace` is never told to become the default; it is told which workspace the core serves.
-- **Fail points** (QA-066, QA-055): `WW_TEST_FAILPOINTS=<name>=<action>[,…]`. They are read only on test channels, and disabled at compile time in builds whose `WW_BUILD_CHANNEL` is `stable` (a compile-time constant, so a stable build's checks are constant-false).
+  The `workspace.unsupported` and unregistered-workspace hints quote the path (`lil workspace use "<path>"`). A workspace named by `--workspace` is never told to become the default; it is told which workspace the core serves.
+- **Fail points** (QA-066, QA-055): `LIL_TEST_FAILPOINTS=<name>=<action>[,…]`. They are read only on test channels, and disabled at compile time in builds whose `LIL_BUILD_CHANNEL` is `stable` (a compile-time constant, so a stable build's checks are constant-false).
   - Actions: `abort` (the process ends at once, as a crash would: `TerminateProcess` on the current process, so no destructor runs and Windows Error Reporting is not involved), `disk_full`, `busy`, `unsupported` and `io`.
   - Names: `store.write_temp`, `store.replace`, `store.after_replace`, `store.between_renames`, `store.put_back`, `store.suite_toml`, `store.after_output`, `store.after_manifest`, `store.after_jobs_log`, `store.after_progress`, `store.after_index`, `store.after_seal`, `watch.start`.
 - **Dates:** `YYYY-MM-DD` and RFC 3339 `…Z`, in UTC. The set-aside suffix is `YYYYMMDDTHHMMSSZ`.
