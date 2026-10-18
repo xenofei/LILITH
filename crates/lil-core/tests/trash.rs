@@ -499,6 +499,57 @@ fn entry_by_hand(ws: &Ws, entry_id: &str, original: &str, files: &[(&str, &[u8])
     );
 }
 
+/// A `restore.json` edited by hand can name a path the trash never takes: the restore refuses
+/// it like a write, before anything moves, and the entry stays exactly as it was.
+#[tokio::test(start_paused = true)] // spec: ARCH-058
+async fn restore_refuses_reserved_targets() {
+    use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+    let ws = workspace();
+    let store = ws.store();
+    write_file(&ws.file("registry/ledger.csv"), b"user's");
+    for (n, target) in [
+        format!("{LEGACY_WORKSPACE_DIR}/x.txt"),
+        format!("{}/x.txt", LEGACY_WORKSPACE_DIR.to_uppercase()),
+        format!("{WORKSPACE_DIR}/x.txt"),
+        ".git/hooks/x".to_string(),
+        ".trash/x.txt".to_string(),
+        "registry/ledger.csv".to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("te_00000000000000c{n}");
+        entry_by_hand(&ws, &id, target, &[("", b"payload")]);
+        let dir = ws.file(&format!(
+            ".trash/{}/{id}",
+            &lil_schema::time::rfc3339(ws.now())[..10]
+        ));
+        let name = target.rsplit('/').next().unwrap();
+        let record = std::fs::read(dir.join("restore.json")).unwrap();
+
+        let refused = store.trash_restore(&id).await;
+        assert!(
+            matches!(&refused, Err(StoreError::PathInvalid { .. })),
+            "{target}: {refused:?}"
+        );
+        assert_eq!(
+            refused.unwrap_err().to_error("t").code,
+            "store.path_invalid"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("payload").join(name)).unwrap(),
+            b"payload",
+            "{target}"
+        );
+        assert_eq!(std::fs::read(dir.join("restore.json")).unwrap(), record);
+    }
+    assert!(!ws.exists(&format!("{LEGACY_WORKSPACE_DIR}/x.txt")));
+    assert!(!ws.exists(&format!("{WORKSPACE_DIR}/x.txt")));
+    assert!(!ws.exists(".git/hooks/x"));
+    assert_eq!(ws.read("registry/ledger.csv"), b"user's");
+    assert_eq!(store.trash_list().await.unwrap().len(), 6);
+}
+
 #[tokio::test(start_paused = true)] // spec: CORE-026
 async fn restore_under_a_version_folder_reapplies_read_only() {
     let ws = workspace();

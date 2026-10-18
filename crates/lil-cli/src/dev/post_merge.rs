@@ -1056,9 +1056,15 @@ mod tests {
             vec![]
         );
 
-        // People named like the slug and other Apps: all flagged.
+        // People named like the slug, the App's slug before its rename and other Apps: all
+        // flagged.
+        let old_bot = format!(
+            "{}-reviewer[bot]",
+            lil_platform::names::LEGACY_APP_NAME.to_lowercase()
+        );
         for login in [
             "lilith-reviewer",
+            old_bot.as_str(),
             "github-actions[bot]",
             "lilith-reviewer-next[bot]",
         ] {

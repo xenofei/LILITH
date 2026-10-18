@@ -1980,11 +1980,17 @@ mod tests {
     #[test] // spec: QA-020
     fn approval_from_another_login_or_a_person_does_not_count() {
         let fake = green();
+        // The App's login before its rename no longer counts either.
+        let old_bot = format!(
+            "{}-reviewer[bot]",
+            lil_platform::names::LEGACY_APP_NAME.to_lowercase()
+        );
         for login in [
             // People: an account may be named like the slug, but never ends in `[bot]`.
             "octocat",
             "lilith-reviewer",
-            // Other Apps, lookalikes and other spellings.
+            // Other Apps, the old slug, lookalikes and other spellings.
+            old_bot.as_str(),
             "github-actions[bot]",
             "lilith-reviewer-next[bot]",
             "lilith[bot]",

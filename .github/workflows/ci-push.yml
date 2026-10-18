@@ -18,9 +18,10 @@
 # So privacy-check follows ci-guard's pattern (R21): it checks out main, builds the CLI from main
 # without sccache (the Actions cache is written by jobs that run unreviewed code), fetches the
 # pushed commit as git data only, and never builds or runs it. The step "Pick the CLI crate"
-# finds main's CLI crate (crates/lil-cli), and fails if main has none. The build is its own step, so main's build scripts never see the secret either; only
-# the built CLI does. The workflow file itself comes from the pushed commit, which is why
-# `.github/workflows/**` is protected (QA-019).
+# finds main's CLI crate (crates/lil-cli), and fails if main has none. The build is its own
+# step, so main's build scripts never see the secret either; only the built CLI does. The
+# workflow file itself comes from the pushed commit, which is why `.github/workflows/**` is
+# protected (QA-019).
 #
 # aws-lc-sys (the rustls crypto provider) builds with the MSVC toolchain on windows-2025; CMake
 # is preinstalled on that image if a future aws-lc-sys needs it. No NASM is needed for

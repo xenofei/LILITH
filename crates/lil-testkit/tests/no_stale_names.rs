@@ -9,8 +9,7 @@
 //! **Matching.** A row allows a line when the file's path matches one of the row's globs and
 //! the line contains one of the row's `lines_with` substrings. A row with no substrings allows
 //! the whole file. A path hit is checked the same way, with the path itself as the line.
-//! Substrings match case-sensitively, so the D9 row's `worldwright-reviewer` never allows
-//! `Worldwright-Reviewer`, and no row allows the old spec path
+//! Substrings match case-sensitively, so no row allows the old spec path
 //! `2026-10-12-worldwright-suite-design.md`. Globs are case-sensitive too: `*` matches within
 //! one path segment and `**` matches any number of whole segments.
 //!
