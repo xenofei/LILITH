@@ -16,8 +16,8 @@ use lil_core::session::Session;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::tools::{
-    CallCtx, Dispatcher, MeterStage, PipelineHooks, RecordStage, TestGates, WorkspaceRecord,
-    core_registry,
+    CallCtx, Dispatcher, MeterStage, PipelineHooks, RecordStage, SettleInput, TestGates,
+    WorkspaceRecord, core_registry,
 };
 use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, SystemProbe};
@@ -283,7 +283,7 @@ struct LoggingMeter {
 }
 
 impl MeterStage for LoggingMeter {
-    fn settle(&self, _s: &Session, _out: &Outcome<ToolOutput>) {
+    fn settle<'a>(&'a self, _i: SettleInput<'a>) -> futures_util::future::BoxFuture<'a, ()> {
         let ws = self.ws.lock().unwrap().clone();
         let manifest = file(&ws, &format!("{KITE_DIR}/{KITE}.manifest.json"));
         let staging = file(&ws, ".lilith/staging");
@@ -294,6 +294,7 @@ impl MeterStage for LoggingMeter {
             "meter manifest={} staged={staged}",
             manifest.exists()
         ));
+        Box::pin(std::future::ready(()))
     }
 }
 

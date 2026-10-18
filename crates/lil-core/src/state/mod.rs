@@ -604,8 +604,8 @@ impl StateDb {
             .await;
     }
 
-    /// Runs `f` on the actor's connection.
-    async fn call<T, F>(&self, f: F) -> Result<T, StateError>
+    /// Runs `f` on the actor's connection (the `jobs` module keeps its rows through it).
+    pub(crate) async fn call<T, F>(&self, f: F) -> Result<T, StateError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StateError> + Send + 'static,
@@ -837,7 +837,7 @@ fn idem_begin(
 pub struct StateRegistry {
     env: Env,
     on_fatal: OnFatal,
-    suite: StateDb,
+    suite: Arc<StateDb>,
     /// The workspace databases and the closed flag, under one lock.
     workspaces: Arc<Mutex<Workspaces>>,
     /// Held shared by each blocking workspace open from its closed check until its database
@@ -877,7 +877,7 @@ impl StateRegistry {
         Ok(StateRegistry {
             env: env.clone(),
             on_fatal,
-            suite,
+            suite: Arc::new(suite),
             workspaces: Arc::new(Mutex::new(Workspaces::default())),
             opening: Arc::new(RwLock::new(())),
         })
@@ -909,6 +909,11 @@ impl StateRegistry {
     /// The suite database.
     pub fn suite(&self) -> &StateDb {
         &self.suite
+    }
+
+    /// The suite database, shared: a job without a workspace holds it (`JobCtx::state`).
+    pub fn suite_db(&self) -> Arc<StateDb> {
+        self.suite.clone()
     }
 
     /// The database of `ws` at `Env::workspace_local_dir(ws)\state.db` (CORE-005), opened on

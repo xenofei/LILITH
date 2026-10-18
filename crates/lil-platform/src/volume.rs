@@ -1,4 +1,5 @@
-//! Volume lookup behind a trait so tests can inject a fake (`GetVolumePathNameW` in production).
+//! Volume lookup behind a trait so tests can inject a fake (`GetVolumePathNameW` in production),
+//! and the free space of a volume (`GetDiskFreeSpaceExW`).
 
 use std::ffi::OsString;
 use std::fmt::Debug;
@@ -6,7 +7,7 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW};
 use windows::core::PCWSTR;
 
 /// Finds the root of the volume a path lives on (`C:\`, `\server\share\`, or a mount point).
@@ -36,6 +37,19 @@ impl VolumeResolver for SystemVolumeResolver {
 /// Volume root of `path` using the real Windows resolver.
 pub fn volume_root(path: &Path) -> io::Result<PathBuf> {
     SystemVolumeResolver.volume_root(path)
+}
+
+/// The bytes free to the caller on the volume that holds `path` (or would hold it: a missing
+/// path is resolved through its ancestors, as [`volume_root`] does). The jobs' disk preflight
+/// reads it (CORE-128).
+pub fn free_bytes(path: &Path) -> io::Result<u64> {
+    let root = volume_root(path)?;
+    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `free` is a valid u64 to write.
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&raw mut free), None, None) }
+        .map_err(|e| io::Error::from_raw_os_error(win32_code(&e)))?;
+    Ok(free)
 }
 
 fn query(path: &Path) -> io::Result<PathBuf> {
@@ -71,5 +85,14 @@ mod tests {
         assert!(root.to_string_lossy().ends_with('\\'), "{root:?}");
         let missing = tmp.join("lil-platform-no-such-dir").join("child");
         assert_eq!(volume_root(&missing).unwrap(), root);
+    }
+
+    /// Read-only: the temp directory's volume has some free space, and a missing child of it
+    /// reports the same volume's figure.
+    #[test] // spec: CORE-128
+    fn free_bytes_reads_the_volume_of_a_missing_path() {
+        let tmp = std::env::temp_dir();
+        assert!(free_bytes(&tmp).unwrap() > 0);
+        assert!(free_bytes(&tmp.join("lil-platform-no-such-dir").join("child")).unwrap() > 0);
     }
 }

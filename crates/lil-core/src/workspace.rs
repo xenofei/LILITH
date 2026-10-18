@@ -427,6 +427,16 @@ impl WorkspaceHub {
         hub
     }
 
+    /// The core's paths.
+    pub fn env(&self) -> &Env {
+        &self.env
+    }
+
+    /// The core's databases.
+    pub fn states(&self) -> &Arc<StateRegistry> {
+        &self.states
+    }
+
     /// The fail points of the workspace stores and of `suite.toml` writes.
     pub fn failpoints(&self) -> &Arc<FailPoints> {
         &self.failpoints

@@ -1,14 +1,19 @@
 //! The replaceable stages of the CORE-015 pipeline: one trait per stage that plan 3 replaces
 //! (settings cascade, cost estimates, confirmations and caps, reservations, metering,
-//! recording). [`PipelineHooks::plan2`] holds the plan-2 versions: [`CascadeSettings`]
-//! resolves the settings cascade (CORE-057), [`ConfirmStage`] fails closed (QA-016: an
-//! agent's `destructive` or `exec` call has no way to ask you yet, so it gets
-//! `confirm.unavailable` and never runs), [`WorkspaceRecord`] runs the Record stage (CORE-020),
-//! and the others do nothing.
+//! recording), in their plan-3 signatures. [`PipelineHooks::plan2`] holds the plan-2
+//! behaviour: [`CascadeSettings`] resolves the settings cascade (CORE-057), the estimate is
+//! [`Estimate::Zero`], [`ConfirmStage`] fails closed (QA-016: an agent's `destructive` or
+//! `exec` call has no way to ask you yet, so it gets `confirm.unavailable` and never runs),
+//! nothing is reserved or settled, and [`WorkspaceRecord`] runs the Record stage (CORE-020).
+//!
+//! [`BillingBasis`], [`ConfirmedVia`] and [`CapHit`] are the shapes the stage signatures need;
+//! Tasks 14–16 give them their behaviour.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use futures_util::future::BoxFuture;
 
 use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
 use lil_protocol::codes::PARAMS_INVALID;
@@ -16,6 +21,7 @@ use lil_protocol::{ErrorBody, Outcome, PendingConfirmation, ToolDescriptor, Tool
 use lil_schema::workspace_yaml::{
     ProjectYaml, WorkspaceYaml, read_project_yaml, read_workspace_yaml,
 };
+use lil_schema::{Currency, Money};
 use serde_json::{Map, Value};
 
 use super::record_stage::WorkspaceRecord;
@@ -27,22 +33,147 @@ pub use crate::settings::{SettingSource, Settings};
 use crate::store::{Store, WsPath};
 use crate::workspace::OpenWorkspace;
 
-/// What a call is expected to cost. Plan 3 adds external estimates.
+/// How an external service bills a call (CORE-069, Appendix F `billing_basis`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BillingBasis {
+    Payg,
+    PrepaidCredits,
+    SubscriptionQuota,
+    FreeTier,
+    Byok,
+    Local,
+}
+
+impl BillingBasis {
+    /// `payg`, `prepaid_credits`, `subscription_quota`, `free_tier`, `byok`, `local`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            BillingBasis::Payg => "payg",
+            BillingBasis::PrepaidCredits => "prepaid_credits",
+            BillingBasis::SubscriptionQuota => "subscription_quota",
+            BillingBasis::FreeTier => "free_tier",
+            BillingBasis::Byok => "byok",
+            BillingBasis::Local => "local",
+        }
+    }
+}
+
+/// Who confirmed a call (Appendix F, Confirmations): wire `app`, `claude_code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfirmedVia {
+    App,
+    ClaudeCode,
+}
+
+impl ConfirmedVia {
+    pub fn wire(self) -> &'static str {
+        match self {
+            ConfirmedVia::App => "app",
+            ConfirmedVia::ClaudeCode => "claude_code",
+        }
+    }
+}
+
+/// A cap a call would pass (Task 16): `cap` is `monthly`, `per_call_max` or
+/// `provider:<id>`; the amounts are in the display currency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapHit {
+    pub cap: String,
+    pub limit: Money,
+    pub settled: Money,
+    pub held: Money,
+    pub estimate: Money,
+}
+
+/// What a call is expected to cost (CORE-015 stage 4): nothing, local work, or an external
+/// call's upper bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Estimate {
     Zero,
+    Local {
+        gpu: bool,
+    },
+    External {
+        provider: String,
+        amount: Money,
+        currency: Currency,
+        basis: BillingBasis,
+    },
+}
+
+/// The call's idempotency row: its scope (caller kind + workspace), key and arguments hash.
+#[derive(Debug, Clone, Copy)]
+pub struct IdemRef<'a> {
+    pub scope: &'a str,
+    pub key: &'a str,
+    pub args_hash: &'a str,
+}
+
+/// What the confirm-and-caps stage decides from.
+#[derive(Clone, Copy)]
+pub struct ConfirmInput<'a> {
+    pub session: &'a Session,
+    pub descriptor: &'a ToolDescriptor,
+    pub estimate: &'a Estimate,
+    pub args: &'a Value,
+    /// `None` for a `read` tool (no key).
+    pub idem: Option<IdemRef<'a>>,
+    pub workspace: Option<&'a OpenWorkspace>,
 }
 
 /// What the confirm-and-caps stage decided (CORE-017).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the plan's signature: CapExceeded holds the wire ErrorBody, as the crate's Results do"
+)]
 pub enum ConfirmDecision {
-    /// Run the call.
-    Proceed,
+    /// Run the call; `confirmed_via` records who confirmed it, `cap_override` is the cap a
+    /// confirmation allowed once (handed to the reserve stage as `allow_once`).
+    Proceed {
+        confirmed_via: Option<ConfirmedVia>,
+        cap_override: Option<String>,
+    },
     /// The call waits for you; the caller gets `pending_confirmation`.
     Pending(PendingConfirmation),
     /// The call needs your confirmation and this session has no way to ask:
     /// `confirm.unavailable` (QA-016).
     Unavailable,
+    /// A cap would be passed and nobody can be asked: the error (`cap.exceeded`).
+    CapExceeded(ErrorBody),
+}
+
+/// What the reserve stage did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// Nothing to reserve.
+    None,
+    /// Reserved: `rv_<16 hex>`.
+    Reserved(String),
+    /// The caps it would pass, found at reservation time.
+    NeedsCap(Vec<CapHit>),
+}
+
+/// What the reserve stage reserves for.
+#[derive(Debug, Clone, Copy)]
+pub struct ReserveInput<'a> {
+    pub session: &'a Session,
+    pub estimate: &'a Estimate,
+    pub workspace_id: &'a str,
+    /// The call's id, `c_<16 hex>`; a job takes the reservation over (`JobCtx::reservation`).
+    pub call_id: &'a str,
+    /// The cap a confirmation allowed once.
+    pub allow_once: Option<&'a str>,
+}
+
+/// What the meter stage settles (inline calls only: a call that submitted a job leaves it
+/// to the job's completion).
+#[derive(Debug, Clone, Copy)]
+pub struct SettleInput<'a> {
+    pub session: &'a Session,
+    pub reservation: Option<&'a str>,
+    pub call_id: &'a str,
+    pub outcome: &'a Outcome<ToolOutput>,
 }
 
 /// What the settings stage resolves a call's settings from.
@@ -69,26 +200,28 @@ pub trait SettingsStage: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Settings, ErrorBody>> + Send + 'a>>;
 }
 
-/// Stage 4: the cost estimate.
+/// Stage 4: the cost estimate, from the tool, its valid arguments and the call's settings.
 pub trait EstimateStage: Send + Sync {
-    fn estimate(&self, d: &ToolDescriptor) -> Estimate;
+    fn estimate(&self, d: &ToolDescriptor, args: &Value, s: &Settings) -> Estimate;
 }
 
 /// Stage 5: confirmations and caps.
 pub trait ConfirmStage: Send + Sync {
-    fn check(&self, s: &Session, d: &ToolDescriptor, e: &Estimate) -> ConfirmDecision;
+    fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision>;
 }
 
 /// Stage 6: reserves budget for the estimate.
 pub trait ReserveStage: Send + Sync {
-    /// # Errors
-    /// The error result the call ends with (plan 3: `cap.exceeded`).
-    fn reserve(&self, s: &Session, e: &Estimate) -> Result<(), ErrorBody>;
+    /// `Err` is the error result the call ends with.
+    fn reserve<'a>(
+        &'a self,
+        i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, ErrorBody>>;
 }
 
-/// Stage 8: settles the reservation against what the call used.
+/// Stage 8: settles the reservation against what an inline call used.
 pub trait MeterStage: Send + Sync {
-    fn settle(&self, s: &Session, out: &Outcome<ToolOutput>);
+    fn settle<'a>(&'a self, i: SettleInput<'a>) -> BoxFuture<'a, ()>;
 }
 
 /// Stage 9: records the call (plan 2b, CORE-020) and may change its outcome: `plan` is what
@@ -250,7 +383,7 @@ impl SettingsStage for CascadeSettings {
 }
 
 impl EstimateStage for Plan2 {
-    fn estimate(&self, _d: &ToolDescriptor) -> Estimate {
+    fn estimate(&self, _d: &ToolDescriptor, _args: &Value, _s: &Settings) -> Estimate {
         Estimate::Zero
     }
 }
@@ -259,21 +392,31 @@ impl ConfirmStage for Plan2 {
     /// An agent (`assistant`, `mcp`, `cli`) calling a `destructive` or `exec` tool needs your
     /// confirmation (ARCH-052), and plan 2 has no way to ask: [`ConfirmDecision::Unavailable`],
     /// interactive session or not (QA-016). Your own actions in an app never ask (CORE-109).
-    fn check(&self, s: &Session, d: &ToolDescriptor, _e: &Estimate) -> ConfirmDecision {
-        if s.caller.is_agent() && d.effect.needs_agent_confirmation() {
-            ConfirmDecision::Unavailable
-        } else {
-            ConfirmDecision::Proceed
-        }
+    fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
+        let decision =
+            if i.session.caller.is_agent() && i.descriptor.effect.needs_agent_confirmation() {
+                ConfirmDecision::Unavailable
+            } else {
+                ConfirmDecision::Proceed {
+                    confirmed_via: None,
+                    cap_override: None,
+                }
+            };
+        Box::pin(std::future::ready(decision))
     }
 }
 
 impl ReserveStage for Plan2 {
-    fn reserve(&self, _s: &Session, _e: &Estimate) -> Result<(), ErrorBody> {
-        Ok(())
+    fn reserve<'a>(
+        &'a self,
+        _i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, ErrorBody>> {
+        Box::pin(std::future::ready(Ok(ReserveOutcome::None)))
     }
 }
 
 impl MeterStage for Plan2 {
-    fn settle(&self, _s: &Session, _out: &Outcome<ToolOutput>) {}
+    fn settle<'a>(&'a self, _i: SettleInput<'a>) -> BoxFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
 }

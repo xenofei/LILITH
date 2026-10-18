@@ -23,6 +23,9 @@ pub const NAMES: &[&str] = &[
     "store.after_index",
     "store.after_seal",
     "watch.start",
+    "jobs.after_submitting",
+    "jobs.after_post",
+    "jobs.after_outputs",
 ];
 
 /// Every fail point action, a closed list.
@@ -69,7 +72,7 @@ mod tests {
             "store.between_renames=abort,watch.start=unsupported,store.write_temp=disk_full"
         );
         // Every name and action of the closed lists is accepted.
-        assert_eq!((NAMES.len(), ACTIONS.len()), (13, 5));
+        assert_eq!((NAMES.len(), ACTIONS.len()), (16, 5));
         for name in NAMES {
             for action in ACTIONS {
                 assert_eq!(spec(&[(name, action)]), format!("{name}={action}"));

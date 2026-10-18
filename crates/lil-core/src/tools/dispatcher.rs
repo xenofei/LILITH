@@ -14,12 +14,13 @@
 //!    workspace, under the scope `"<caller kind>|<workspace id or none>"`: a finished call
 //!    with the same arguments is replayed byte for byte, another hash is
 //!    `idempotency.conflict`, a running one `idempotency.in_progress`.
-//! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`, or a
-//!    `pending_confirmation` result), 6. **reserve**: the [`PipelineHooks`]. Before the
-//!    settings, the Resolve stage's project part runs on the valid arguments (ARCH-088,
-//!    ARCH-098): with a session workspace, `CallCtx::project` is the `project` argument of a
-//!    tool that declares one, else the session's active project, else the workspace's
-//!    `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
+//! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`,
+//!    `cap.exceeded`, or a `pending_confirmation` result), 6. **reserve** (under a fresh
+//!    call id `c_<16 hex>`; caps it finds passed are `cap.exceeded`): the
+//!    [`PipelineHooks`]. Before the settings, the Resolve stage's project part runs on the
+//!    valid arguments (ARCH-088, ARCH-098): with a session workspace, `CallCtx::project` is
+//!    the `project` argument of a tool that declares one, else the session's active project,
+//!    else the workspace's `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
 //!    never the call's project. The settings stage gets that project and, as the request
 //!    layer, the `settings` argument of a tool that declares one (only `test.settings` in
 //!    plan 2b, CORE-057); its error (`params.invalid`) is the call's.
@@ -29,7 +30,9 @@
 //!    (a hint that can't be written is logged, never the call's error).
 //! 8. **Meter** and 9. **record**: the hooks again. The record hook gets the plan the tool
 //!    left in `CallCtx::record` (CORE-020); the plan-2b stage writes it only for an `ok`
-//!    outcome, and its error (a failed commit) becomes the call's.
+//!    outcome, and its error (a failed commit) becomes the call's. A call whose tool
+//!    submitted a job (`CallCtx::submitted`) skips both: the job's completion runs them when
+//!    the job ends, with the call's reservation (CORE-015 step 7).
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
 //! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
@@ -71,8 +74,12 @@ use tokio::task::JoinError;
 use tracing::Instrument as _;
 
 use super::registry::{CallCtx, Registry, Tool};
-use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
+use super::stages::{
+    ConfirmDecision, ConfirmInput, IdemRef, PipelineHooks, ReserveInput, ReserveOutcome,
+    SettingsInput, SettleInput,
+};
 use crate::events::EventBus;
+use crate::jobs::{Jobs, SubmittedSlot};
 use crate::lifecycle::{CallGuard, FollowUp, Lifecycle};
 use crate::pipeline::RecordSlot;
 use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
@@ -98,6 +105,8 @@ struct Inner {
     lifecycle: Arc<Lifecycle>,
     /// Each session's active project (ARCH-088).
     active: Arc<ActiveProjects>,
+    /// The core's jobs (`CallCtx::jobs`).
+    jobs: Arc<Jobs>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -123,6 +132,15 @@ impl Dispatcher {
         clock: Arc<dyn Clock>,
         lifecycle: Arc<Lifecycle>,
     ) -> Dispatcher {
+        // The core's jobs live with its dispatcher: every call's context carries them.
+        let jobs = Jobs::new(
+            states.clone(),
+            hub.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            hub.failpoints().clone(),
+        );
         Dispatcher {
             inner: Arc::new(Inner {
                 reg,
@@ -134,8 +152,14 @@ impl Dispatcher {
                 clock,
                 lifecycle,
                 active: Arc::new(ActiveProjects::new()),
+                jobs,
             }),
         }
+    }
+
+    /// The core's jobs: the server registers their handlers, blocker and shutdown step.
+    pub fn jobs(&self) -> &Arc<Jobs> {
+        &self.inner.jobs
     }
 
     /// Each session's active project: the router forgets a session's when its connection
@@ -291,12 +315,19 @@ impl Inner {
                 format!("Invalid arguments for {}: {why}", p.name),
             );
         }
-        let claim = match key {
+        let hash = args_hash(&json!({"name": p.name, "arguments": args}));
+        let claim = match &key {
             None => None,
             Some(key) => {
-                let hash = args_hash(&json!({"name": p.name, "arguments": args}));
                 match self
-                    .begin(in_flight, workspace.as_ref(), scope, key, &hash, trace_id)
+                    .begin(
+                        in_flight,
+                        workspace.as_ref(),
+                        scope.clone(),
+                        key.clone(),
+                        &hash,
+                        trace_id,
+                    )
                     .await
                 {
                     Ok(Begun::Fresh(claim)) => Some(claim),
@@ -307,7 +338,14 @@ impl Inner {
         };
 
         // 3–9.
-        let outcome = self.run(session, workspace, &tool, args, trace_id).await;
+        let idem = key.as_deref().map(|key| IdemRef {
+            scope: &scope,
+            key,
+            args_hash: &hash,
+        });
+        let outcome = self
+            .run(session, workspace, &tool, args, idem, trace_id)
+            .await;
 
         // The line cap (ARCH-025), decided once, before anything is stored: an outcome too
         // large to send becomes `core.bug`, and that error is what the row keeps, so every
@@ -420,6 +458,7 @@ impl Inner {
         workspace: Option<Arc<OpenWorkspace>>,
         tool: &Arc<dyn Tool>,
         args: Value,
+        idem: Option<IdemRef<'_>>,
         trace_id: &str,
     ) -> Outcome<ToolOutput> {
         let hooks = &self.hooks;
@@ -451,10 +490,24 @@ impl Inner {
                 return Outcome::Error { error };
             }
         };
-        let estimate = hooks.estimate.estimate(d);
+        let estimate = hooks.estimate.estimate(d, &args, &settings);
         // 5. Confirm and caps.
-        match hooks.confirm.check(session, d, &estimate) {
-            ConfirmDecision::Proceed => {}
+        let decision = hooks
+            .confirm
+            .check(ConfirmInput {
+                session,
+                descriptor: d,
+                estimate: &estimate,
+                args: &args,
+                idem,
+                workspace: workspace.as_deref(),
+            })
+            .await;
+        let (confirmed_via, cap_override) = match decision {
+            ConfirmDecision::Proceed {
+                confirmed_via,
+                cap_override,
+            } => (confirmed_via, cap_override),
             ConfirmDecision::Pending(pending) => return Outcome::PendingConfirmation(pending),
             ConfirmDecision::Unavailable => {
                 return Outcome::Error {
@@ -468,12 +521,41 @@ impl Inner {
                     ),
                 };
             }
-        }
+            ConfirmDecision::CapExceeded(mut error) => {
+                error.trace_id = trace_id.to_string();
+                return Outcome::Error { error };
+            }
+        };
         // 6. Reserve.
-        if let Err(mut error) = hooks.reserve.reserve(session, &estimate) {
-            error.trace_id = trace_id.to_string();
-            return Outcome::Error { error };
-        }
+        let call_id = self.ids.id("c");
+        let reserved = hooks
+            .reserve
+            .reserve(ReserveInput {
+                session,
+                estimate: &estimate,
+                workspace_id: session.workspace_id(),
+                call_id: &call_id,
+                allow_once: cap_override.as_deref(),
+            })
+            .await;
+        let reservation = match reserved {
+            Ok(ReserveOutcome::None) => None,
+            Ok(ReserveOutcome::Reserved(id)) => Some(id),
+            Ok(ReserveOutcome::NeedsCap(hits)) => {
+                let caps: Vec<&str> = hits.iter().map(|h| h.cap.as_str()).collect();
+                return Outcome::Error {
+                    error: ErrorBody::new(
+                        &codes::CAP_EXCEEDED,
+                        format!("{} would pass the cap {}.", d.name, caps.join(", ")),
+                        trace_id,
+                    ),
+                };
+            }
+            Err(mut error) => {
+                error.trace_id = trace_id.to_string();
+                return Outcome::Error { error };
+            }
+        };
         // 7. Execute, in its own task: a panic stays in it.
         let open = workspace.clone();
         let ctx = CallCtx {
@@ -484,6 +566,11 @@ impl Inner {
             workspace,
             project,
             record: Arc::new(RecordSlot::new()),
+            jobs: self.jobs.clone(),
+            submitted: Arc::new(SubmittedSlot::new()),
+            reservation,
+            confirmed_via,
+            idem_key: idem.map(|i| i.key.to_string()),
         };
         let running = tool.clone();
         let run_ctx = ctx.clone();
@@ -512,8 +599,23 @@ impl Inner {
         {
             tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
         }
+        // A call that submitted a job leaves 8 and 9 to the job's completion (CORE-015 step 7).
+        if let Some(job) = ctx.submitted.get() {
+            if ctx.record.take().is_some() {
+                tracing::error!(tool = %d.name, job_id = %job, "a tool that submitted a job also left a record plan; it is dropped");
+            }
+            return outcome;
+        }
         // 8. Meter; 9. record (CORE-020): what the tool left in its record slot.
-        hooks.meter.settle(session, &outcome);
+        hooks
+            .meter
+            .settle(SettleInput {
+                session,
+                reservation: ctx.reservation.as_deref(),
+                call_id: &call_id,
+                outcome: &outcome,
+            })
+            .await;
         let plan = ctx.record.take();
         hooks.record.record(&ctx, d, plan, &mut outcome).await;
         outcome

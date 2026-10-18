@@ -12,6 +12,11 @@
 //! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
 //!   wait and steps, then the open workspaces close (their `state.db` first, then
 //!   `core.lock`), then the state databases close, then the pipe.
+//! - The jobs ([`crate::jobs`]) are the dispatcher's: before it serves, the core registers
+//!   their handlers (the test channels' `test.job`), reads `[jobs] preempt_agent_batches`,
+//!   recovers the suite scope's jobs (ARCH-022), and adds the `jobs` idle blocker (ARCH-020)
+//!   and the `PersistInterrupted` shutdown step (ARCH-021). The default workspace's jobs are
+//!   recovered once it opens.
 
 mod conn;
 
@@ -36,7 +41,7 @@ use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
-use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
+use crate::tools::{Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry};
 use crate::workspace::WorkspaceHub;
 
 /// Per-connection writer queue (responses and events).
@@ -413,6 +418,23 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         lifecycle.clone(),
     );
     let active_projects = dispatcher.active_projects().clone();
+    let jobs = dispatcher.jobs().clone();
+    if cfg.test_tools {
+        jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
+    }
+    jobs.set_preempt_agent_batches(preempt_agent_batches(&cfg.env));
+    match jobs.recover(state.suite()).await {
+        Ok(marked) if !marked.is_empty() => tracing::warn!(
+            count = marked.len(),
+            "suite jobs of an earlier core run are interrupted; none runs again"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the suite jobs could not be recovered; the first job call tries again")
+        }
+    }
+    lifecycle.add_blocker(jobs.clone());
+    lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
@@ -425,10 +447,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     ));
 
     if let Some(ws) = hub.default_ref() {
-        let hub = hub.clone();
+        let (hub, jobs) = (hub.clone(), jobs.clone());
         tokio::spawn(async move {
-            if let Err(e) = hub.open(&ws).await {
-                tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
+            match hub.open(&ws).await {
+                Err(e) => {
+                    tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
+                }
+                Ok(open) => {
+                    if let Err(e) = jobs.recover_workspace(&open).await {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
+                    }
+                }
             }
         });
     }
@@ -547,6 +576,15 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         "core stopped"
     );
     report
+}
+
+/// `[jobs] preempt_agent_batches` of `suite.toml` (CORE-125): `false` for no file, a file that
+/// doesn't parse, or no such key. Read once, at start.
+fn preempt_agent_batches(env: &Env) -> bool {
+    std::fs::read_to_string(env.suite_toml_to_read())
+        .ok()
+        .and_then(|text| lil_schema::SuiteToml::parse(&text).ok())
+        .is_some_and(|suite| suite.preempt_agent_batches())
 }
 
 /// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6, 7 or 2),

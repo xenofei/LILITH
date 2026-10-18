@@ -18,8 +18,9 @@ use schemars::generate::SchemaSettings;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::stages::Settings;
+use super::stages::{ConfirmedVia, Settings};
 use crate::events::EventBus;
+use crate::jobs::{Jobs, SubmittedSlot};
 use crate::pipeline::RecordSlot;
 use crate::session::Session;
 use crate::workspace::OpenWorkspace;
@@ -44,6 +45,18 @@ pub struct CallCtx {
     /// Where the tool leaves what the Record stage writes (CORE-020): a tool that records an
     /// operation sets its [`RecordPlan`](crate::pipeline::RecordPlan) here during Execute.
     pub record: Arc<RecordSlot>,
+    /// The core's jobs: a tool whose work runs long submits a job and returns at once
+    /// (ARCH-034).
+    pub jobs: Arc<Jobs>,
+    /// Set by [`Jobs::submit`]: the dispatcher then leaves Meter and Record to the job.
+    pub submitted: Arc<SubmittedSlot>,
+    /// The cap reservation the reserve stage made for the call (`rv_<16 hex>`); a job the
+    /// call submits takes it over.
+    pub reservation: Option<String>,
+    /// Who confirmed the call, when a confirmation let it run.
+    pub confirmed_via: Option<ConfirmedVia>,
+    /// The call's idempotency key; `None` for a `read` tool.
+    pub idem_key: Option<String>,
 }
 
 impl CallCtx {

@@ -1,5 +1,5 @@
-//! Fail points (QA-066, QA-055): named places in the store where a test makes the next file
-//! call fail, or ends the process as a crash would.
+//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run)
+//! where a test makes the next file call fail, or ends the process as a crash would.
 //!
 //! `LIL_TEST_FAILPOINTS=<name>=<action>[,…]` arms them, read only on test channels
 //! ([`armed`]); a build whose `LIL_BUILD_CHANNEL` is `stable` compiles every check to a constant
@@ -35,6 +35,9 @@ pub const NAMES: &[&str] = &[
     "store.after_index",
     "store.after_seal",
     "watch.start",
+    "jobs.after_submitting",
+    "jobs.after_post",
+    "jobs.after_outputs",
 ];
 
 /// The exit code of the `abort` action.

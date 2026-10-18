@@ -9,11 +9,13 @@
 //! - [`status`]: the status machine (CORE-048);
 //! - [`paths`]: workspace-relative path rules (CORE-040);
 //! - [`yaml_edit`], [`workspace_yaml`], [`suite_edit`]: comment-preserving YAML and TOML edits;
-//! - [`logs`]: append-log lines (ARCH-081); [`time`]: UTC dates.
+//! - [`logs`]: append-log lines (ARCH-081); [`time`]: UTC dates;
+//! - [`money`]: integer micro-unit amounts and currencies (CORE-013).
 
 pub mod content_hash;
 pub mod logs;
 pub mod manifest;
+pub mod money;
 pub mod paths;
 pub mod refs;
 pub mod status;
@@ -29,6 +31,7 @@ pub use manifest::{
     CandidateFile, CandidateRun, EditError, ExternalFile, HumanEdit, Input, Manifest, ManifestView,
     PinnedInput, SchemaWarning, SignedOff, bare_sha256, hash_value, remove_key,
 };
+pub use money::{Currency, Money};
 pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};
 pub use refs::{AssetRef, LEGACY_SCHEME, LinkRef, SCHEME, is_asset_id, is_run_id, is_slug};
 pub use status::{Status, StatusEvent, Transition, transition};

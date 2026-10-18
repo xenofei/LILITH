@@ -18,6 +18,7 @@ pub mod events;
 pub mod graph;
 pub mod identity;
 pub mod index;
+pub mod jobs;
 pub mod lifecycle;
 pub mod pipeline;
 pub mod projects;

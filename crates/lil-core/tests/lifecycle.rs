@@ -432,9 +432,18 @@ fn drain_closes_state_before_releasing_the_pipe() {
     assert_eq!(drain["result"]["status"], "ok", "{drain}");
 
     let report = core.wait_stopped(DEADLINE).expect("the core stops");
-    // The steps ran with the database open; then it was closed; then the pipe.
+    // The steps ran with the database open; then it was closed; then the pipe. The jobs'
+    // `PersistInterrupted` step (plan 3) runs in its phase, before the probe's `StopEngines`.
     assert_eq!(*answered.lock().unwrap(), Some(true));
-    assert_eq!(report.steps, ["probe state", "state.close", "pipe.close"]);
+    assert_eq!(
+        report.steps,
+        [
+            "jobs.persist_interrupted",
+            "probe state",
+            "state.close",
+            "pipe.close"
+        ]
+    );
     assert!(state.suite().is_closed());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

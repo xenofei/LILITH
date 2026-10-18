@@ -51,7 +51,8 @@ use ErrorCategory as C;
 use RetryPolicy as R;
 
 pub const CONFIRM_DENIED: CodeSpec = spec("confirm.denied", C::Declined, R::Never, false);
-pub const CONFIRM_EXPIRED: CodeSpec = spec("confirm.expired", C::Cancelled, R::AfterResolve, true);
+/// Confirmed by plan 3.
+pub const CONFIRM_EXPIRED: CodeSpec = spec("confirm.expired", C::Cancelled, R::AfterResolve, false);
 pub const CONFIRM_UNAVAILABLE: CodeSpec = spec(
     "confirm.unavailable",
     C::UserFixable,
@@ -59,8 +60,13 @@ pub const CONFIRM_UNAVAILABLE: CodeSpec = spec(
     false,
 );
 pub const CAP_EXCEEDED: CodeSpec = spec("cap.exceeded", C::UserFixable, R::AfterResolve, false);
-pub const DOC_HELD_ELSEWHERE: CodeSpec =
-    spec("doc.held_elsewhere", C::DataConflict, R::AfterResolve, true);
+/// Confirmed by plan 3.
+pub const DOC_HELD_ELSEWHERE: CodeSpec = spec(
+    "doc.held_elsewhere",
+    C::DataConflict,
+    R::AfterResolve,
+    false,
+);
 /// Confirmed by plan 2b. `data.backup` names the backup's workspace-relative path when a
 /// put-back couldn't finish.
 pub const STORE_HASH_CONFLICT: CodeSpec = spec(
@@ -91,8 +97,9 @@ pub const ENGINE_CLAUDE_CODE_NOT_SIGNED_IN: CodeSpec = spec(
     R::AfterResolve,
     false,
 );
+/// Confirmed by plan 3.
 pub const COMFYUI_UNREACHABLE: CodeSpec =
-    spec("comfyui.unreachable", C::ExternalDown, R::Auto, true);
+    spec("comfyui.unreachable", C::ExternalDown, R::Auto, false);
 pub const MODEL_MISSING: CodeSpec = spec("model.missing", C::UserFixable, R::AfterResolve, true);
 pub const PROVIDER_RATE_LIMITED: CodeSpec =
     spec("provider.rate_limited", C::Transient, R::Auto, true);
@@ -209,6 +216,60 @@ pub const TRASH_RESTORE_CONFLICT: CodeSpec = spec(
     false,
 );
 
+// Plan 3 (Appendix D), in table order.
+
+pub const JOB_UNKNOWN: CodeSpec = spec("job.unknown", C::UserFixable, R::AfterResolve, false);
+pub const JOB_NOT_RETRYABLE: CodeSpec = spec("job.not_retryable", C::UserFixable, R::Never, false);
+pub const ENGINE_UNKNOWN: CodeSpec = spec("engine.unknown", C::UserFixable, R::Never, false);
+pub const ENGINE_ATTACHED: CodeSpec = spec("engine.attached", C::Declined, R::Never, false);
+pub const ENGINE_NOT_CONFIGURED: CodeSpec = spec(
+    "engine.not_configured",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const COMFYUI_NOT_LOOPBACK: CodeSpec = spec(
+    "comfyui.not_loopback",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const COMFYUI_START_FAILED: CodeSpec = spec(
+    "comfyui.start_failed",
+    C::ExternalDown,
+    R::AfterResolve,
+    false,
+);
+pub const COMFYUI_OUT_OF_MEMORY: CodeSpec =
+    spec("comfyui.out_of_memory", C::Transient, R::Auto, false);
+pub const COMFYUI_EXECUTION_FAILED: CodeSpec = spec(
+    "comfyui.execution_failed",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const COMFYUI_NODE_INSTALL_FAILED: CodeSpec = spec(
+    "comfyui.node_install_failed",
+    C::ExternalDown,
+    R::AfterResolve,
+    false,
+);
+pub const COMFYUI_PARTNER_NODES: CodeSpec = spec(
+    "comfyui.partner_nodes",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+pub const RESOURCE_UNKNOWN: CodeSpec =
+    spec("resource.unknown", C::UserFixable, R::AfterResolve, false);
+pub const RESOURCE_KIND_UNKNOWN: CodeSpec =
+    spec("resource.kind_unknown", C::UserFixable, R::Never, false);
+pub const HANDLER_NONE: CodeSpec = spec("handler.none", C::UserFixable, R::AfterResolve, false);
+pub const CONFIRM_UNKNOWN: CodeSpec = spec("confirm.unknown", C::UserFixable, R::Never, false);
+pub const CONFIRM_ALREADY_ANSWERED: CodeSpec =
+    spec("confirm.already_answered", C::DataConflict, R::Never, false);
+pub const CAPS_INVALID: CodeSpec = spec("caps.invalid", C::UserFixable, R::AfterResolve, false);
+
 /// Every code, in table order.
 pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_DENIED,
@@ -258,6 +319,23 @@ pub const ALL: &[&CodeSpec] = &[
     &REF_HASH_MISMATCH,
     &TRASH_UNKNOWN,
     &TRASH_RESTORE_CONFLICT,
+    &JOB_UNKNOWN,
+    &JOB_NOT_RETRYABLE,
+    &ENGINE_UNKNOWN,
+    &ENGINE_ATTACHED,
+    &ENGINE_NOT_CONFIGURED,
+    &COMFYUI_NOT_LOOPBACK,
+    &COMFYUI_START_FAILED,
+    &COMFYUI_OUT_OF_MEMORY,
+    &COMFYUI_EXECUTION_FAILED,
+    &COMFYUI_NODE_INSTALL_FAILED,
+    &COMFYUI_PARTNER_NODES,
+    &RESOURCE_UNKNOWN,
+    &RESOURCE_KIND_UNKNOWN,
+    &HANDLER_NONE,
+    &CONFIRM_UNKNOWN,
+    &CONFIRM_ALREADY_ANSWERED,
+    &CAPS_INVALID,
 ];
 
 #[cfg(test)]
@@ -269,7 +347,7 @@ mod tests {
     /// The Global Constraints / spec Appendix D error-code table, row by row.
     const TABLE: &[(&str, C, R, bool)] = &[
         ("confirm.denied", C::Declined, R::Never, false),
-        ("confirm.expired", C::Cancelled, R::AfterResolve, true),
+        ("confirm.expired", C::Cancelled, R::AfterResolve, false),
         (
             "confirm.unavailable",
             C::UserFixable,
@@ -277,7 +355,12 @@ mod tests {
             false,
         ),
         ("cap.exceeded", C::UserFixable, R::AfterResolve, false),
-        ("doc.held_elsewhere", C::DataConflict, R::AfterResolve, true),
+        (
+            "doc.held_elsewhere",
+            C::DataConflict,
+            R::AfterResolve,
+            false,
+        ),
         (
             "store.hash_conflict",
             C::DataConflict,
@@ -303,7 +386,7 @@ mod tests {
             R::AfterResolve,
             false,
         ),
-        ("comfyui.unreachable", C::ExternalDown, R::Auto, true),
+        ("comfyui.unreachable", C::ExternalDown, R::Auto, false),
         ("model.missing", C::UserFixable, R::AfterResolve, true),
         ("provider.rate_limited", C::Transient, R::Auto, true),
         ("provider.spend_limit", C::ExternalDown, R::Never, false),
@@ -395,6 +478,53 @@ mod tests {
             R::AfterResolve,
             false,
         ),
+        ("job.unknown", C::UserFixable, R::AfterResolve, false),
+        ("job.not_retryable", C::UserFixable, R::Never, false),
+        ("engine.unknown", C::UserFixable, R::Never, false),
+        ("engine.attached", C::Declined, R::Never, false),
+        (
+            "engine.not_configured",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "comfyui.not_loopback",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "comfyui.start_failed",
+            C::ExternalDown,
+            R::AfterResolve,
+            false,
+        ),
+        ("comfyui.out_of_memory", C::Transient, R::Auto, false),
+        (
+            "comfyui.execution_failed",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "comfyui.node_install_failed",
+            C::ExternalDown,
+            R::AfterResolve,
+            false,
+        ),
+        (
+            "comfyui.partner_nodes",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
+        ("resource.unknown", C::UserFixable, R::AfterResolve, false),
+        ("resource.kind_unknown", C::UserFixable, R::Never, false),
+        ("handler.none", C::UserFixable, R::AfterResolve, false),
+        ("confirm.unknown", C::UserFixable, R::Never, false),
+        ("confirm.already_answered", C::DataConflict, R::Never, false),
+        ("caps.invalid", C::UserFixable, R::AfterResolve, false),
     ];
 
     /// `^[a-z_]+(\.[a-z_]+)+$`
@@ -408,7 +538,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 47);
+        assert_eq!(TABLE.len(), 64);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);

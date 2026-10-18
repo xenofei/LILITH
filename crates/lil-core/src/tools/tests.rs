@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::BoxFuture;
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{
     CallerKind, EffectClass, ErrorCategory, FileRef, Outcome, RetryPolicy, ToolCallParams,
@@ -69,30 +70,33 @@ impl SettingsStage for Recording {
 }
 
 impl EstimateStage for Recording {
-    fn estimate(&self, d: &ToolDescriptor) -> Estimate {
+    fn estimate(&self, d: &ToolDescriptor, args: &Value, s: &Settings) -> Estimate {
         self.log.push("estimate");
-        self.plan2.estimate.estimate(d)
+        self.plan2.estimate.estimate(d, args, s)
     }
 }
 
 impl ConfirmStage for Recording {
-    fn check(&self, s: &Session, d: &ToolDescriptor, e: &Estimate) -> ConfirmDecision {
+    fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
         self.log.push("confirm");
-        self.plan2.confirm.check(s, d, e)
+        self.plan2.confirm.check(i)
     }
 }
 
 impl ReserveStage for Recording {
-    fn reserve(&self, s: &Session, e: &Estimate) -> Result<(), lil_protocol::ErrorBody> {
+    fn reserve<'a>(
+        &'a self,
+        i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, lil_protocol::ErrorBody>> {
         self.log.push("reserve");
-        self.plan2.reserve.reserve(s, e)
+        self.plan2.reserve.reserve(i)
     }
 }
 
 impl MeterStage for Recording {
-    fn settle(&self, s: &Session, out: &Outcome<ToolOutput>) {
+    fn settle<'a>(&'a self, i: SettleInput<'a>) -> BoxFuture<'a, ()> {
         self.log.push("meter");
-        self.plan2.meter.settle(s, out);
+        self.plan2.meter.settle(i)
     }
 }
 
@@ -412,6 +416,99 @@ async fn stages_run_in_core_015_order() {
     assert_eq!(read.executions(), 1);
 }
 
+/// The plan-2 behaviour through the plan-3 stage signatures (`PipelineHooks::plan2()`).
+#[tokio::test] // spec: CORE-015, QA-016, CORE-109
+async fn plan2_stage_defaults_still_hold() {
+    let fx = fixture(&[]);
+    let hooks = PipelineHooks::plan2();
+    let settings = Settings::default();
+    let reg = fx.dispatcher.registry();
+    for d in reg.descriptors() {
+        assert_eq!(
+            hooks.estimate.estimate(&d, &json!({}), &settings),
+            Estimate::Zero,
+            "{}",
+            d.name
+        );
+    }
+    let destructive = reg.get("test.destructive").unwrap().descriptor().clone();
+    let read = reg.get("test.echo").unwrap().descriptor().clone();
+    let ui = session(CallerKind::Ui("test".into()), false);
+    let check = |s: Arc<Session>, d: ToolDescriptor| {
+        let hooks = hooks.clone();
+        async move {
+            hooks
+                .confirm
+                .check(ConfirmInput {
+                    session: &s,
+                    descriptor: &d,
+                    estimate: &Estimate::Zero,
+                    args: &json!({}),
+                    idem: None,
+                    workspace: None,
+                })
+                .await
+        }
+    };
+    let proceed = ConfirmDecision::Proceed {
+        confirmed_via: None,
+        cap_override: None,
+    };
+    assert_eq!(
+        check(cli(), destructive.clone()).await,
+        ConfirmDecision::Unavailable
+    );
+    assert_eq!(check(ui.clone(), destructive).await, proceed);
+    assert_eq!(check(cli(), read).await, proceed);
+    let reserved = hooks
+        .reserve
+        .reserve(ReserveInput {
+            session: &cli(),
+            estimate: &Estimate::Zero,
+            workspace_id: "none",
+            call_id: "c_0000000000000001",
+            allow_once: None,
+        })
+        .await;
+    assert_eq!(reserved, Ok(ReserveOutcome::None));
+
+    // `settle` writes nothing: the suite state.db and the workspace logs keep their bytes.
+    let ws = fx.env.copy_fixture_workspace("record");
+    let snapshot = || {
+        let db = fx.env.env.suite_state_db();
+        let mut files = vec![std::fs::read(&db).unwrap()];
+        let wal = db.with_extension("db-wal");
+        if wal.exists() {
+            files.push(std::fs::read(&wal).unwrap());
+        }
+        for log in ["queue", "registry"] {
+            let dir = ws.join(log);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut names: Vec<_> = entries.map(|e| e.unwrap().path()).collect();
+                names.sort();
+                files.extend(names.iter().map(|p| std::fs::read(p).unwrap()));
+            }
+        }
+        files
+    };
+    let before = snapshot();
+    let outcome = Outcome::Ok(ToolOutput {
+        structured: json!({}),
+        artifacts: Vec::new(),
+        summary_text: String::new(),
+    });
+    hooks
+        .meter
+        .settle(SettleInput {
+            session: &ui,
+            reservation: None,
+            call_id: "c_0000000000000001",
+            outcome: &outcome,
+        })
+        .await;
+    assert_eq!(snapshot(), before);
+}
+
 #[tokio::test] // spec: CORE-015
 async fn unknown_tool_is_tool_unknown() {
     let fx = fixture(&[]);
@@ -728,6 +825,8 @@ fn every_tool_declares_a_module() {
     for d in tools {
         let want = if d.name.starts_with("test.") {
             TEST_MODULE
+        } else if d.name.starts_with("job.") || d.name.starts_with("jobs.") {
+            crate::jobs::JOBS_MODULE
         } else {
             WORKSPACE_MODULE
         };
@@ -779,6 +878,8 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.echo",
             "test.emit",
             "test.ingest_run",
+            "test.job",
+            "test.job_release",
             "test.panic",
             "test.settings",
             "test.state_panic",
@@ -883,7 +984,10 @@ async fn a_cancelled_caller_still_finishes_the_row() {
 struct PanickingReserve;
 
 impl ReserveStage for PanickingReserve {
-    fn reserve(&self, _s: &Session, _e: &Estimate) -> Result<(), lil_protocol::ErrorBody> {
+    fn reserve<'a>(
+        &'a self,
+        _i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, lil_protocol::ErrorBody>> {
         panic!("the reserve stage has a bug")
     }
 }
