@@ -452,6 +452,15 @@ impl WorkspaceHub {
         lock(&self.default).as_ref().map(|w| w.id.clone())
     }
 
+    /// The workspaces open now (never opens one).
+    pub fn opened(&self) -> Vec<Arc<OpenWorkspace>> {
+        lock(&self.opens)
+            .cells
+            .values()
+            .filter_map(|c| c.get().cloned())
+            .collect()
+    }
+
     /// The default workspace, as last read from `suite.toml`.
     pub fn default_ref(&self) -> Option<WorkspaceRef> {
         lock(&self.default).clone()

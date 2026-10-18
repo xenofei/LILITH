@@ -25,20 +25,46 @@
 //!   attempts in all, with a `retrying` event per retry; anything else is final (CORE-128).
 //!   When a job ends, its [`JobCompletion`]s run in registration order (Meter before Caps),
 //!   and then its [`JobDone::record`] is applied in its workspace (CORE-015 steps 8–9).
-//! - **Recovery** (ARCH-022). [`Jobs::recover`] marks every job of a scope that this core is not
-//!   running and that has no final state `interrupted`, or `interrupted_unknown` when it was
-//!   `submitting` with external side effects; nothing re-runs. The core recovers the suite
-//!   scope before it serves, and a workspace scope before its first job operation. The
-//!   `PersistInterrupted` shutdown step does the same for the jobs still running when a drain
-//!   ends (ARCH-021).
+//! - **Recovery** (ARCH-022). [`Jobs::recover_suite`] and [`Jobs::recover_workspace`] mark every
+//!   job of a scope that this core is not running and that has no final state `interrupted`,
+//!   or `interrupted_unknown` when it was `submitting` with external side effects; nothing
+//!   re-runs. The core recovers the suite scope before it serves, and a workspace scope before
+//!   its first job operation, once per scope. The `PersistInterrupted` shutdown step does the
+//!   same for the jobs still queued or running when a drain ends (ARCH-021).
 //!
 //! Handlers register with [`Jobs::register`] (CORE-010: `jobs` defines [`JobHandler`], tool
-//! modules register with it).
+//! modules register with it). `jobs` depends on no `tools` type: a tool hands
+//! [`Jobs::submit`] a [`JobCaller`], built from its call context, and the job tools live in
+//! `tools`.
+//!
+//! **Reservations** (CORE-088, for Tasks 15 and 16). A job takes over the cap reservation of the
+//! call that submitted it: the row and [`JobCtx::reservation`] carry it, and
+//! [`Reservations::hand_over`] tells its owner (from the call id to the job id) once the row is
+//! in. Who resolves it:
+//! - the job's completions, when it ends (succeeded, failed, cancelled, `interrupted` by its
+//!   engine);
+//! - a call whose idempotency key gave back an existing job submitted nothing new: its own
+//!   reservation is [`Reservations::release`]d, with no usage line;
+//! - an interrupted `agent` job re-run automatically (local work only, CORE-128) hands its
+//!   reservation to the re-run: its completions get `reservation: None`, the re-run's settle
+//!   it;
+//! - a job that never started (`waiting`, `waiting_for_vram`) when a core stopped gets its
+//!   completions at recovery or at `PersistInterrupted`, with an outcome for which
+//!   [`never_started`] holds: nothing was used;
+//! - a job that was running when a core stopped keeps its reservation (Appendix F's pending
+//!   usage rule): Task 16's startup repair owns it;
+//! - an `interrupted_unknown` job keeps it until you resolve it: `job.cancel` from the app
+//!   makes it `cancelled` and runs its completions (CORE-088, AI-029).
+//!
+//! **Crash windows.** A job that worked is written `running`/`ingesting` with its result before
+//! its completions run, so a core that dies during the completions or its Record step leaves
+//! a row that recovery marks `interrupted` with that result kept as salvaged artifacts; a
+//! retry is then an informed choice. The `PersistInterrupted` step waits a short while
+//! ([`COMPLETION_GRACE`]) for jobs in their completions, and marks the rest the same way.
 
 pub mod queue;
 pub mod record;
 pub mod runner;
-pub mod tools;
 
 use std::fmt;
 use std::future::Future;
@@ -56,8 +82,7 @@ use crate::pipeline::RecordPlan;
 use crate::state::StateDb;
 use crate::workspace::OpenWorkspace;
 
-pub use runner::Jobs;
-pub use tools::register_job_tools;
+pub use runner::{Jobs, cancelled_error};
 
 /// The module the job tools declare.
 pub const JOBS_MODULE: &str = "jobs";
@@ -71,6 +96,27 @@ pub const MAX_WAIT: Duration = Duration::from_secs(90);
 pub const MAX_OVERTAKES: u32 = 8;
 /// The staging room a job needs on top of twice its expected output (CORE-128).
 pub const DISK_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+/// How long the `PersistInterrupted` step waits for jobs that are in their completions.
+pub const COMPLETION_GRACE: Duration = Duration::from_secs(2);
+
+/// The internal code of a cancelled job's outcome (its completions see it). It never reaches
+/// the wire: a cancelled job's summary has no `error`, and its jobs log line writes `null`.
+/// Not in Appendix D, so not in `codes::ALL`.
+pub const JOB_CANCELLED: &str = "job.cancelled";
+/// The internal code of the outcome a job's completions get when it never started (a core
+/// stopped while it was `waiting`): nothing was used. Never on the wire either.
+pub const JOB_NOT_STARTED: &str = "job.not_started";
+
+/// Whether `outcome` is a cancelled job's (Task 15 writes `status: "cancelled"` for it).
+pub fn is_cancelled(outcome: &Outcome<ToolOutput>) -> bool {
+    matches!(outcome, Outcome::Error { error } if error.code == JOB_CANCELLED)
+}
+
+/// Whether `outcome` is the one of a job that never started: Meter writes no usage line for
+/// it, and Caps releases its reservation.
+pub fn never_started(outcome: &Outcome<ToolOutput>) -> bool {
+    matches!(outcome, Outcome::Error { error } if error.code == JOB_NOT_STARTED)
+}
 
 /// The pause before retry `n` (1-based): 1 s, doubling, at most [`MAX_BACKOFF`].
 pub fn backoff(n: u32) -> Duration {
@@ -438,7 +484,9 @@ pub struct JobCtx {
     pub cancel: tokio::sync::watch::Receiver<bool>,
     /// The `state.db` the job lives in.
     pub state: Arc<StateDb>,
-    /// The cap reservation the job's call made (Task 16 settles it on completion).
+    /// The cap reservation the job holds (module docs, "Reservations"): the one its call made,
+    /// or its interrupted original's. `None` in the completions of a job that handed it to its
+    /// re-run.
     pub reservation: Option<String>,
     pub(crate) jobs: Arc<runner::Shared>,
 }
@@ -515,7 +563,8 @@ pub enum Admit {
 }
 
 /// Set by [`Jobs::submit`]: the dispatcher reads it after Execute, and a call that submitted a
-/// job leaves Meter and Record to the job's completion.
+/// job leaves Meter and Record to the job's completion. One call submits at most one job, so
+/// the job can take over the call's one reservation.
 #[derive(Debug, Default)]
 pub struct SubmittedSlot(Mutex<Option<JobId>>);
 
@@ -533,6 +582,71 @@ impl SubmittedSlot {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+}
+
+/// The tool call that submitted a job: `job.retry` dispatches it again (with the retry's
+/// caller and key), so its confirm, estimate and reserve stages run again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobOrigin {
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Who submits a job or asks about one, for which call (CORE-010: `tools` builds it from its
+/// call context, so `jobs` takes no `tools` type).
+#[derive(Debug, Clone)]
+pub struct JobCaller {
+    pub caller: CallerKind,
+    /// `<caller kind>|<workspace id or none>`: the idempotency scope (CORE-016).
+    pub idem_scope: String,
+    /// The call's workspace: the job's scope (ARCH-099); `None` is the suite's.
+    pub workspace: Option<Arc<OpenWorkspace>>,
+    pub trace_id: String,
+    /// `None` for a call without one.
+    pub idem_key: Option<String>,
+    /// The call's id (`c_<16 hex>`), whose reservation a job takes over.
+    pub call_id: String,
+    pub reservation: Option<String>,
+    pub submitted: Arc<SubmittedSlot>,
+    /// The tool call, kept with the job for `job.retry`; `None` outside a tool call.
+    pub origin: Option<JobOrigin>,
+    /// Set when the call is a retry of that job: the new job's `retry_of`, and its class is
+    /// the retrying caller's (Appendix F).
+    pub retry_of: Option<JobId>,
+}
+
+/// What happens to cap reservations as jobs take them over (module docs, "Reservations"):
+/// Task 16 implements it; [`NoReservations`] does nothing.
+pub trait Reservations: Send + Sync {
+    /// `reservation`, made for `from` (a call id `c_…`, or the job a re-run replaces), now
+    /// belongs to job `to` (CORE-088: a reservation records its job or call id).
+    fn hand_over<'a>(
+        &'a self,
+        reservation: &'a str,
+        from: &'a str,
+        to: &'a JobId,
+    ) -> JobFuture<'a, ()>;
+    /// `reservation`, made for `owner`, is released unused: nothing ran for it.
+    fn release<'a>(&'a self, reservation: &'a str, owner: &'a str) -> JobFuture<'a, ()>;
+}
+
+/// No caps: nothing to hand over or release.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoReservations;
+
+impl Reservations for NoReservations {
+    fn hand_over<'a>(
+        &'a self,
+        _reservation: &'a str,
+        _from: &'a str,
+        _to: &'a JobId,
+    ) -> JobFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn release<'a>(&'a self, _reservation: &'a str, _owner: &'a str) -> JobFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
     }
 }
 

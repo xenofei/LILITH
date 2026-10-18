@@ -14,8 +14,9 @@
 //!   `core.lock`), then the state databases close, then the pipe.
 //! - The jobs ([`crate::jobs`]) are the dispatcher's: before it serves, the core registers
 //!   their handlers (the test channels' `test.job`), reads `[jobs] preempt_agent_batches`,
-//!   recovers the suite scope's jobs (ARCH-022), and adds the `jobs` idle blocker (ARCH-020)
-//!   and the `PersistInterrupted` shutdown step (ARCH-021). The default workspace's jobs are
+//!   stops them starting queued jobs once a drain begins, recovers the suite scope's jobs
+//!   (ARCH-022), and adds the `jobs` idle blocker (ARCH-020) and the `PersistInterrupted`
+//!   shutdown step (ARCH-021). The default workspace's jobs are
 //!   recovered once it opens.
 
 mod conn;
@@ -423,7 +424,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
     }
     jobs.set_preempt_agent_batches(preempt_agent_batches(&cfg.env));
-    match jobs.recover(state.suite()).await {
+    jobs.stop_on_drain(lifecycle.drain_token());
+    // Completions (Tasks 15–16) are added before this: it runs them for jobs that never
+    // started.
+    match jobs.recover_suite().await {
         Ok(marked) if !marked.is_empty() => tracing::warn!(
             count = marked.len(),
             "suite jobs of an earlier core run are interrupted; none runs again"

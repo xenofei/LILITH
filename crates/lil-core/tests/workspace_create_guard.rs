@@ -114,6 +114,11 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         reservation: None,
         confirmed_via: None,
         idem_key: None,
+        call_id: String::new(),
+        tool: String::new(),
+        arguments: serde_json::Value::Null,
+        retry_of: None,
+        redispatch: None,
     };
 
     // 4. Creating a new subfolder of that workspace trips the guard before the folder exists.

@@ -4,8 +4,8 @@
 //! `user` > `agent`); within it a job requeued at the head (a preempted one, CORE-125) comes
 //! first, then submission order. When the lane last ran a job of a `group` (a model profile),
 //! the oldest job of the class with that group may go first, overtaking the older jobs of its
-//! class, unless one of them has been overtaken [`MAX_OVERTAKES`] times already; then the
-//! class's first job goes.
+//! class, unless one of them has been overtaken [`MAX_OVERTAKES`] times already or was
+//! requeued at the head; then the class's first job goes.
 
 use super::{MAX_OVERTAKES, Priority};
 
@@ -46,7 +46,8 @@ pub fn pick<'a>(candidates: &[Candidate<'a>], lane_group: Option<&str>) -> Optio
         return Some(first);
     };
     let older = &class[..at];
-    if older.iter().any(|c| c.overtaken >= MAX_OVERTAKES) {
+    // A job requeued at the head of its class (CORE-125) is never overtaken by grouping.
+    if older.iter().any(|c| c.head || c.overtaken >= MAX_OVERTAKES) {
         return Some(first);
     }
     Some(Pick {
@@ -112,5 +113,20 @@ mod tests {
         jobs[1].overtaken = MAX_OVERTAKES;
         let p = pick(&jobs, Some("a")).unwrap();
         assert_eq!((p.id, p.overtakes.len()), ("x", 0));
+    }
+
+    /// A preempted job requeued at the head of its class (CORE-125) goes first, even when a
+    /// job of the lane's group waits behind it.
+    #[test] // spec: CORE-124, CORE-125
+    fn grouping_never_overtakes_a_job_requeued_at_the_head() {
+        let mut preempted = c("p", Priority::Agent, 5, Some("b"));
+        preempted.head = true;
+        let jobs = [
+            preempted,
+            c("x", Priority::Agent, 1, None),
+            c("g", Priority::Agent, 3, Some("a")),
+        ];
+        let p = pick(&jobs, Some("a")).unwrap();
+        assert_eq!((p.id, p.overtakes.len()), ("p", 0));
     }
 }

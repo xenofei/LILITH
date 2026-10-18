@@ -7,16 +7,25 @@
 //! | `job.cancel` | write | `{job_id}` | `{job}`; a finished job as it is |
 //! | `job.retry` | write | `{job_id}` | `{job, retry_of}`; only `failed` or `cancelled` |
 //!
-//! Each works in the call's scope: the session's workspace, or the suite without one.
+//! Each works in the call's scope: the session's workspace, or the suite without one. They live
+//! in `tools`, not in `jobs`, so that `jobs` depends on no `tools` type (CORE-010): they build
+//! the jobs module's [`JobCaller`](crate::jobs::JobCaller) from their call's context.
+//!
+//! `job.retry` re-dispatches the tool call that made the job, with the retry's caller and
+//! idempotency key: the confirm, estimate and reserve stages run for it as for a fresh call
+//! ([`Redispatch`](super::Redispatch)), so a retry is never a way around a confirmation or a cap.
 
 use std::time::Duration;
 
-use lil_protocol::EffectClass;
+use lil_protocol::{EffectClass, ErrorBody, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{JOBS_MODULE, JobFilter, JobId, JobSummary, MAX_WAIT};
-use crate::tools::{Registry, typed_tool};
+use super::registry::{Registry, typed_tool};
+use crate::jobs::{JOBS_MODULE, JobFilter, JobId, JobSummary, MAX_WAIT};
+
+/// The retry tool's name: the dispatcher re-dispatches the call it retries.
+pub const JOB_RETRY: &str = "job.retry";
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct ListResult {
@@ -68,7 +77,7 @@ pub fn register_job_tools(reg: &mut Registry) {
         JOBS_MODULE,
         |ctx, f: JobFilter| {
             Box::pin(async move {
-                let (jobs, next_cursor) = ctx.jobs.list(ctx, f).await?;
+                let (jobs, next_cursor) = ctx.jobs.list(&ctx.job_caller(), f).await?;
                 let summary = format!("{} job(s)", jobs.len());
                 Ok((ListResult { jobs, next_cursor }, summary))
             })
@@ -85,7 +94,10 @@ pub fn register_job_tools(reg: &mut Registry) {
                 let timeout = args
                     .timeout_s
                     .map_or(MAX_WAIT, Duration::from_secs);
-                let (job, done) = ctx.jobs.wait(ctx, &JobId(args.job_id), timeout).await?;
+                let (job, done) = ctx
+                    .jobs
+                    .wait(&ctx.job_caller(), &JobId(args.job_id), timeout)
+                    .await?;
                 let summary = format!("job {} is {}", job.job_id, job.status.wire());
                 Ok((WaitResult { job, done }, summary))
             })
@@ -99,7 +111,10 @@ pub fn register_job_tools(reg: &mut Registry) {
         JOBS_MODULE,
         |ctx, args: JobArgs| {
             Box::pin(async move {
-                let job = ctx.jobs.cancel(ctx, &JobId(args.job_id)).await?;
+                let job = ctx
+                    .jobs
+                    .cancel(&ctx.job_caller(), &JobId(args.job_id))
+                    .await?;
                 let summary = format!("job {} is {}", job.job_id, job.status.wire());
                 Ok((JobResultOut { job }, summary))
             })
@@ -107,13 +122,21 @@ pub fn register_job_tools(reg: &mut Registry) {
     ));
 
     reg.register(typed_tool(
-        "job.retry",
-        "Runs a failed or cancelled job again as a new job, whose `retry_of` is the old one.",
+        JOB_RETRY,
+        "Runs a failed or cancelled job again as a new job, whose `retry_of` is the old one. The tool call that made the job runs again for you, so it asks for the same confirmations and counts against the same caps.",
         EffectClass::Write,
         JOBS_MODULE,
         |ctx, args: JobArgs| {
             Box::pin(async move {
-                let job = ctx.jobs.retry(ctx, &JobId(args.job_id.clone())).await?;
+                let id = JobId(args.job_id.clone());
+                let Some(redispatch) = &ctx.redispatch else {
+                    return Err(ErrorBody::new(
+                        &codes::CORE_BUG,
+                        "job.retry ran outside the dispatcher. This is a bug in LILITH.",
+                        ctx.trace_id.clone(),
+                    ));
+                };
+                let job = redispatch.retry(ctx, &id).await?;
                 let summary = format!("job {} retries {}", job.job_id, args.job_id);
                 Ok((
                     RetryResult {

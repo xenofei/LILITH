@@ -425,6 +425,11 @@ fn ctx(open: &Arc<OpenWorkspace>, hub: &Arc<WorkspaceHub>) -> CallCtx {
         reservation: None,
         confirmed_via: None,
         idem_key: None,
+        call_id: String::new(),
+        tool: String::new(),
+        arguments: serde_json::Value::Null,
+        retry_of: None,
+        redispatch: None,
     }
 }
 

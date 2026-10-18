@@ -15,7 +15,7 @@
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
-//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui"}` | `{job}`: a job of kind `test.job` |
+//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?}` | `{job}`: a job of kind `test.job` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //!
 //! `test.job` submits a job that [`TestJobHandler`] runs (the core registers it on test
@@ -23,7 +23,8 @@
 //! its first two attempts with a retryable `store.io`, `final` fails once with
 //! `params.invalid`, `disk_full` once with `store.disk_full`. Its priority is the argument,
 //! else the caller's class (CORE-124). A job with `engine` passes through `submitting` and the
-//! fail points `jobs.after_post` and `jobs.after_outputs`, as an engine job would.
+//! fail points `jobs.after_post` and `jobs.after_outputs`, as an engine job would;
+//! `external_side_effects` marks it as hosted or paid work would be (CORE-128).
 //!
 //! `test.settings`'s `settings` argument (dotted keys, or nested mappings) is plan 2b's only
 //! source of the settings cascade's request layer (CORE-057 clarification): the dispatcher's
@@ -234,6 +235,8 @@ struct TestJobArgs {
     expected_secs: Option<u32>,
     #[serde(default)]
     engine: Option<EngineKind>,
+    #[serde(default)]
+    external_side_effects: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -266,9 +269,9 @@ async fn test_job(ctx: &CallCtx, args: TestJobArgs) -> Result<(TestJobResult, St
         vram_need_mib: args.vram_need_mib,
         engine: args.engine,
         group: None,
-        external_side_effects: false,
+        external_side_effects: args.external_side_effects,
     };
-    let job = ctx.jobs.submit(ctx, spec).await?;
+    let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
     let summary = format!("job {} is {}", job.job_id, job.status.wire());
     Ok((TestJobResult { job }, summary))
 }

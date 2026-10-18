@@ -1,12 +1,13 @@
 //! The `tools` module (CORE-014): the tool registry and the dispatcher pipeline every
 //! `tools/call` runs through (CORE-015–017), with the stages plan 3 replaces, the Record stage
-//! (CORE-020), the product tools, the live topics' snapshot providers and the test-channel
-//! tools.
+//! (CORE-020), the product tools (the job tools among them), the live topics' snapshot
+//! providers and the test-channel tools.
 
 pub mod asset_read_tools;
 pub mod asset_tools;
 pub mod dispatcher;
 pub mod doctor_tools;
+pub mod job_tools;
 pub mod project_tools;
 pub mod record_stage;
 pub mod registry;
@@ -25,8 +26,9 @@ use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
 pub use asset_tools::register_asset_tools;
-pub use dispatcher::Dispatcher;
+pub use dispatcher::{Dispatcher, Redispatch};
 pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
+pub use job_tools::{JOB_RETRY, register_job_tools};
 pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
@@ -67,7 +69,7 @@ pub fn core_registry(
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg);
     register_watch_tools(&mut reg);
-    crate::jobs::register_job_tools(&mut reg);
+    register_job_tools(&mut reg);
     let all_tools = Arc::new(OnceLock::new());
     register_project_tools(&mut reg, all_tools.clone());
     if test_tools {

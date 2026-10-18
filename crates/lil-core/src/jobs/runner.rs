@@ -1,15 +1,21 @@
-//! [`Jobs`]: submit, the lanes' dispatch, a job's run, cancel, retry, recovery and the
-//! shutdown step (module docs of [`crate::jobs`]).
+//! [`Jobs`]: submit, the lanes' dispatch, a job's run, cancel, the retry check, recovery and
+//! the shutdown step (module docs of [`crate::jobs`]).
 //!
 //! **Locks.** One `std` mutex guards the in-memory queue (the jobs this core runs, the lanes);
 //! it is never held across an `await`. Each job's state changes are serialised by its own
 //! async lock, held across the row update, the jobs log line and the events, so the log and the
-//! topics see a job's changes in the order the row took them.
+//! topics see a job's changes in the order the row took them. A guarded change looks at the
+//! queue under that lock (job lock, then queue mutex; never the other way round).
 //!
 //! **Which jobs a recovery touches.** Only rows that this core isn't running: a submit writes
 //! its row and then adds the job to the queue, and the recovery of a scope runs once, before
 //! the first job operation in it (or before the core serves, for the suite scope), so it never
 //! meets a row of this core's own run.
+//!
+//! **Draining** (ARCH-021 step 1). Once the lifecycle drains ([`Jobs::stop_on_drain`]), no
+//! queued job starts and no interrupted job is re-run; the `jobs` blocker then counts only the
+//! jobs that are running or in their completions, so a drain waits for those alone, and the
+//! `PersistInterrupted` step marks the queued rest.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -22,27 +28,35 @@ use lil_protocol::codes::{self, CodeSpec};
 use lil_protocol::{ErrorBody, ErrorCategory, Outcome, RetryPolicy, ToolOutput, args_hash};
 use serde_json::{Value, json};
 use tokio::sync::{OnceCell, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use super::queue::{self, Candidate};
 use super::record::{self, Change, Inserted, JobRow};
 use super::{
-    Admission, Admit, AlwaysAdmit, DISK_MARGIN_BYTES, JobCompletion, JobCtx, JobDone, JobFailure,
-    JobFilter, JobHandler, JobId, JobResult, JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS,
-    MAX_WAIT, Priority, Progress, Substatus, backoff,
+    Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, DISK_MARGIN_BYTES, JOB_CANCELLED,
+    JOB_NOT_STARTED, JobCaller, JobCompletion, JobCtx, JobDone, JobFailure, JobFilter, JobHandler,
+    JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS, MAX_WAIT,
+    NoReservations, Priority, Progress, Reservations, Substatus, backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
 use crate::pipeline::apply_record;
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::{FailPoints, LogKind};
-use crate::tools::CallCtx;
 use crate::workspace::{Access, OpenWorkspace, WorkspaceHub};
 
-/// The error a cancelled job's completions get as its outcome. Appendix D has no code for a
-/// cancellation, so it never reaches the wire: a cancelled job's summary has no `error`.
+/// The error a cancelled job's completions get as its outcome ([`super::is_cancelled`]).
 const CANCELLED: CodeSpec = CodeSpec {
-    code: "job.cancelled",
+    code: JOB_CANCELLED,
+    category: ErrorCategory::Cancelled,
+    retry: RetryPolicy::AfterResolve,
+    provisional: true,
+};
+
+/// The error the completions of a job that never started get ([`super::never_started`]).
+const NOT_STARTED: CodeSpec = CodeSpec {
+    code: JOB_NOT_STARTED,
     category: ErrorCategory::Cancelled,
     retry: RetryPolicy::AfterResolve,
     provisional: true,
@@ -52,6 +66,16 @@ const CANCELLED: CodeSpec = CodeSpec {
 /// they stop on `JobCtx::cancel`.
 pub fn cancelled_error(trace_id: &str) -> ErrorBody {
     ErrorBody::new(&CANCELLED, "The job was cancelled.", trace_id)
+}
+
+fn not_started(trace_id: &str) -> Outcome<ToolOutput> {
+    Outcome::Error {
+        error: ErrorBody::new(
+            &NOT_STARTED,
+            "The job never started: the core stopped first.",
+            trace_id,
+        ),
+    }
 }
 
 /// The jobs of this core (module docs).
@@ -114,6 +138,7 @@ struct Info {
     trace_id: String,
     reservation: Option<String>,
     retry_of: Option<String>,
+    origin: Option<JobOrigin>,
 }
 
 /// A job this core runs.
@@ -125,6 +150,8 @@ struct Active {
     head: bool,
     overtaken: u32,
     running: bool,
+    /// Its end is being recorded: the completions, the Record step, the final state.
+    completing: bool,
     cancel: watch::Sender<bool>,
     cancelling: bool,
     preempted: bool,
@@ -152,6 +179,9 @@ struct Queue {
     closed: bool,
 }
 
+/// A state change applies only while the job, as the queue holds it, passes this check.
+type Guard = fn(&Active) -> bool;
+
 /// The state behind [`Jobs`], shared with its tasks and each [`JobCtx`].
 pub(crate) struct Shared {
     states: Arc<StateRegistry>,
@@ -163,9 +193,13 @@ pub(crate) struct Shared {
     handlers: RwLock<HashMap<&'static str, Arc<dyn JobHandler>>>,
     admission: RwLock<Arc<dyn Admission>>,
     completions: RwLock<Vec<Arc<dyn JobCompletion>>>,
+    reservations: RwLock<Arc<dyn Reservations>>,
+    /// The lifecycle's drain token ([`Jobs::stop_on_drain`]).
+    drain: RwLock<Option<CancellationToken>>,
     preempt: AtomicBool,
     queue: Mutex<Queue>,
-    /// Bumped on every state change (`job.wait`).
+    /// Bumped on every state change and whenever a job leaves the queue (`job.wait`, the
+    /// shutdown step's wait).
     changed: watch::Sender<u64>,
     recovered: Mutex<HashMap<String, Arc<OnceCell<()>>>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -212,6 +246,19 @@ enum End {
     Unknown(ErrorBody),
 }
 
+/// A new job for [`Shared::submit_new`].
+struct NewJob {
+    spec: JobSpec,
+    trace_id: String,
+    /// The idempotency scope and key.
+    idem: Option<(String, String)>,
+    reservation: Option<String>,
+    /// Whose reservation it is: the call id, or the job a re-run replaces.
+    owner: String,
+    retry_of: Option<String>,
+    origin: Option<JobOrigin>,
+}
+
 impl Shared {
     fn queue(&self) -> MutexGuard<'_, Queue> {
         lock(&self.queue)
@@ -236,12 +283,43 @@ impl Shared {
             .cloned()
     }
 
+    /// The registered name of `kind` (a [`JobSpec`] holds a `&'static str`).
+    fn static_kind(&self, kind: &str) -> Option<&'static str> {
+        self.handlers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_key_value(kind)
+            .map(|(k, _)| *k)
+    }
+
+    fn reservations(&self) -> Arc<dyn Reservations> {
+        read(&self.reservations)
+    }
+
+    /// Whether the lifecycle drains (module docs, "Draining").
+    fn draining(&self) -> bool {
+        self.drain
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+
     fn job_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         lock(&self.locks).entry(id.to_string()).or_default().clone()
     }
 
-    fn scope_of(&self, ctx: &CallCtx) -> Scope {
-        match &ctx.workspace {
+    /// Returns once a state change of the job that is being announced is done (its jobs log
+    /// line and events): they happen under the job's lock, after the row's update.
+    async fn announced(&self, id: &str) {
+        let held = lock(&self.locks).get(id).cloned();
+        if let Some(held) = held {
+            drop(held.lock().await);
+        }
+    }
+
+    fn scope_of(&self, caller: &JobCaller) -> Scope {
+        match &caller.workspace {
             Some(open) => Scope::Workspace(open.clone()),
             None => Scope::Suite(self.states.suite_db()),
         }
@@ -273,40 +351,47 @@ impl Shared {
     }
 
     /// Applies `c` to the job (a guarded update: never out of a final status), then
-    /// announces it. `when` limits it to a job in that status. `jobs.after_submitting` fires
-    /// when the substatus becomes `submitting`.
+    /// announces it: the row after it, `None` when nothing changed (the row is final or gone,
+    /// or `guard` refused it; a guard refuses a job this core doesn't run).
+    /// `jobs.after_submitting` fires when the substatus becomes `submitting`.
+    async fn apply_checked(
+        &self,
+        id: &str,
+        scope: &Scope,
+        c: Change,
+        guard: Option<Guard>,
+    ) -> Result<Option<JobRow>, StateError> {
+        let lock = self.job_lock(id);
+        let _serial = lock.lock().await;
+        if let Some(guard) = guard
+            && !self.queue().jobs.get(id).is_some_and(guard)
+        {
+            return Ok(None);
+        }
+        let submitting = c.substatus == Some(Some(Substatus::Submitting));
+        let Some((before, row)) = record::update(scope.db(), id, c, self.now()).await? else {
+            return Ok(None);
+        };
+        self.announce(scope.workspace(), &row).await;
+        if submitting
+            && before != Some(Substatus::Submitting)
+            && let Err(e) = self.failpoints.hit("jobs.after_submitting")
+        {
+            tracing::warn!(job_id = id, error = %e, "fail point jobs.after_submitting");
+        }
+        Ok(Some(row))
+    }
+
+    /// [`Shared::apply_checked`], with a write error logged.
     async fn apply(
         &self,
         id: &str,
         scope: &Scope,
         c: Change,
-        when: Option<JobStatus>,
+        guard: Option<Guard>,
     ) -> Option<JobRow> {
-        let lock = self.job_lock(id);
-        let _serial = lock.lock().await;
-        if let Some(when) = when {
-            match record::get(scope.db(), id).await {
-                Ok(Some(row)) if row.status == when => {}
-                Ok(_) => return None,
-                Err(e) => {
-                    tracing::error!(job_id = id, error = %e, "a job's state could not be read");
-                    return None;
-                }
-            }
-        }
-        let submitting = c.substatus == Some(Some(Substatus::Submitting));
-        match record::update(scope.db(), id, c, self.now()).await {
-            Ok(Some((before, row))) => {
-                self.announce(scope.workspace(), &row).await;
-                if submitting
-                    && before != Some(Substatus::Submitting)
-                    && let Err(e) = self.failpoints.hit("jobs.after_submitting")
-                {
-                    tracing::warn!(job_id = id, error = %e, "fail point jobs.after_submitting");
-                }
-                Some(row)
-            }
-            Ok(None) => None,
+        match self.apply_checked(id, scope, c, guard).await {
+            Ok(row) => row,
             Err(e) => {
                 tracing::error!(job_id = id, error = %e, "a job's state change could not be written");
                 None
@@ -314,15 +399,47 @@ impl Shared {
         }
     }
 
+    /// The context a job's completions get for `row`, outside a run (recovery, the shutdown
+    /// step, resolving an `interrupted_unknown` job). `None` (logged) when no handler runs its
+    /// kind any more.
+    fn ctx_from_row(self: &Arc<Self>, row: &JobRow, scope: &Scope) -> Option<JobCtx> {
+        let Some(kind) = self.static_kind(&row.kind) else {
+            tracing::error!(job_id = %row.job_id, kind = %row.kind, "no handler runs this kind any more; the job's completions can't run");
+            return None;
+        };
+        Some(JobCtx {
+            id: JobId(row.job_id.clone()),
+            spec: row.spec(kind),
+            attempt: row.attempt,
+            trace_id: row.trace_id.clone(),
+            workspace: scope.workspace().cloned(),
+            events: self.events.clone(),
+            cancel: watch::Sender::new(false).subscribe(),
+            state: scope.db_arc(),
+            reservation: row.reservation.clone(),
+            jobs: self.clone(),
+        })
+    }
+
+    /// Runs the completions, in registration order.
+    async fn run_completions(
+        &self,
+        ctx: &JobCtx,
+        outcome: &Outcome<ToolOutput>,
+        done: Option<&JobDone>,
+    ) {
+        for c in read(&self.completions) {
+            c.completed(ctx, outcome, done).await;
+        }
+    }
+
     /// The recovery of one scope (ARCH-022): every row without a final status that this core
     /// isn't running becomes `interrupted`, or `interrupted_unknown` when it was `submitting`
-    /// with external side effects. A row already `interrupted_unknown` stays as it is.
-    async fn recover_rows(
-        &self,
-        db: &StateDb,
-        open: Option<&Arc<OpenWorkspace>>,
-    ) -> Result<Vec<JobId>, StateError> {
-        let rows = record::open_rows(db).await?;
+    /// with external side effects. A row already `interrupted_unknown` stays as it is. The
+    /// completions of a job that never started run with a [`super::never_started`] outcome
+    /// (its reservation is released); one that had started keeps its reservation.
+    async fn recover_rows(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
+        let rows = record::open_rows(scope.db()).await?;
         let mine: HashSet<String> = self.queue().jobs.keys().cloned().collect();
         let mut marked = Vec::new();
         for row in rows {
@@ -330,47 +447,59 @@ impl Shared {
                 continue;
             }
             let c = interrupt_change(&row, self.now());
-            if let Some((_, row)) = record::update(db, &row.job_id, c, self.now()).await? {
-                tracing::warn!(job_id = %row.job_id, substatus = ?row.substatus, "a job of an earlier core run is interrupted; it doesn't run again");
-                self.announce(open, &row).await;
-                marked.push(JobId(row.job_id));
+            if let Some((before, after)) =
+                record::update(scope.db(), &row.job_id, c, self.now()).await?
+            {
+                tracing::warn!(job_id = %after.job_id, substatus = ?after.substatus, "a job of an earlier core run is interrupted; it doesn't run again");
+                self.announce(scope.workspace(), &after).await;
+                if never_ran(before)
+                    && let Some(ctx) = self.ctx_from_row(&after, scope)
+                {
+                    self.run_completions(&ctx, &not_started(&after.trace_id), None)
+                        .await;
+                }
+                marked.push(JobId(after.job_id));
             }
         }
         Ok(marked)
     }
 
-    /// Recovers `scope` once (module docs). A read-only workspace is left as it is.
-    async fn ensure_recovered(&self, scope: &Scope) -> Result<(), StateError> {
+    /// Recovers `scope` once (module docs): the jobs it marked, empty on every later call. A
+    /// read-only workspace is left as it is.
+    async fn ensure_recovered(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
         if let Scope::Workspace(open) = scope
             && open.access == Access::ReadOnly
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let cell = lock(&self.recovered)
             .entry(scope.key())
             .or_default()
             .clone();
+        let mut marked = Vec::new();
         cell.get_or_try_init(|| async {
-            self.recover_rows(scope.db(), scope.workspace())
-                .await
-                .map(drop)
+            marked = self.recover_rows(scope).await?;
+            Ok::<(), StateError>(())
         })
-        .await
-        .map(drop)
+        .await?;
+        Ok(marked)
     }
 
-    /// A new job row for `spec`, queued (ARCH-034): written and logged before the job can
-    /// start. A job that holds `idem` already is returned instead when its arguments match,
+    /// A new job row, queued (ARCH-034): written and logged before the job can start, and its
+    /// reservation handed over to it. A job that holds `idem` already is returned instead when
+    /// its arguments match (and the new call's reservation is released: it submitted nothing),
     /// else `idempotency.conflict` (CORE-016).
-    async fn submit_new(
-        self: &Arc<Self>,
-        scope: &Scope,
-        spec: JobSpec,
-        trace_id: &str,
-        idem: Option<(String, String)>,
-        reservation: Option<String>,
-        retry_of: Option<String>,
-    ) -> Result<JobRow, ErrorBody> {
+    async fn submit_new(self: &Arc<Self>, scope: &Scope, new: NewJob) -> Result<JobRow, ErrorBody> {
+        let NewJob {
+            spec,
+            trace_id,
+            idem,
+            reservation,
+            owner,
+            retry_of,
+            origin,
+        } = new;
+        let trace_id = trace_id.as_str();
         if self.queue().closed {
             return Err(ErrorBody::new(
                 &codes::CORE_DRAINING,
@@ -426,6 +555,7 @@ impl Shared {
             group: spec.group.clone(),
             external_side_effects: spec.external_side_effects,
             reservation: reservation.clone(),
+            origin: origin.clone(),
         };
         let serial = self.job_lock(&id);
         let guard = serial.lock().await;
@@ -439,32 +569,41 @@ impl Shared {
             Ok(Inserted::Existing(existing)) => {
                 drop(guard);
                 lock(&self.locks).remove(&id);
-                if existing.args_hash == hash {
-                    return Ok(existing);
+                if existing.args_hash != hash {
+                    return Err(ErrorBody::new(
+                        &codes::IDEMPOTENCY_CONFLICT,
+                        "The idempotency key was used before for another job.",
+                        trace_id,
+                    ));
                 }
-                return Err(ErrorBody::new(
-                    &codes::IDEMPOTENCY_CONFLICT,
-                    "The idempotency key was used before for another job.",
-                    trace_id,
-                ));
+                if let Some(rv) = &reservation {
+                    tracing::info!(job_id = %existing.job_id, reservation = %rv, "the key's job exists; the call's own reservation is released");
+                    self.reservations().release(rv, &owner).await;
+                }
+                return Ok(existing);
             }
             Ok(Inserted::New(row)) => row,
         };
         self.announce(scope.workspace(), &row).await;
+        let job_id = JobId(id.clone());
+        if let Some(rv) = &reservation {
+            self.reservations().hand_over(rv, &owner, &job_id).await;
+        }
         drop(guard);
         let info = Info {
-            id: JobId(id.clone()),
+            id: job_id,
             spec,
             scope: scope.clone(),
             trace_id: trace_id.to_string(),
             reservation,
             retry_of,
+            origin,
         };
         let preempt = {
             let mut q = self.queue();
             if q.closed {
                 // The shutdown step has run: the row stays queued, and the next start
-                // recovers it as interrupted.
+                // recovers it as interrupted (and releases its reservation).
                 lock(&self.locks).remove(&id);
                 return Ok(row);
             }
@@ -479,6 +618,7 @@ impl Shared {
                     head: false,
                     overtaken: 0,
                     running: false,
+                    completing: false,
                     cancel: watch::Sender::new(false),
                     cancelling: false,
                     preempted: false,
@@ -499,7 +639,8 @@ impl Shared {
 
     /// CORE-125: with `preempt_agent_batches`, an `interactive` job cancels the running
     /// `agent` engine job of its lane; that job goes back to the head of its class when its
-    /// run ends. A `user` job is never touched. Returns the engine cancel to run.
+    /// run ends. A `user` job is never touched, nor a job with external side effects (it is
+    /// never re-run automatically, CORE-128, ARCH-022). Returns the engine cancel to run.
     fn preemption(
         &self,
         q: &mut Queue,
@@ -512,8 +653,10 @@ impl Shared {
         let a = q.jobs.get_mut(&running)?;
         if a.info.spec.priority != Priority::Agent
             || a.info.spec.engine.is_none()
+            || a.info.spec.external_side_effects
             || a.cancelling
             || a.preempted
+            || a.completing
         {
             return None;
         }
@@ -528,8 +671,12 @@ impl Shared {
         Some((ctx, self.handler(a.info.spec.kind)?))
     }
 
-    /// Starts the next job of each free lane (CORE-121, CORE-123, CORE-124).
+    /// Starts the next job of each free lane (CORE-121, CORE-123, CORE-124); none while the
+    /// core drains.
     fn pump(self: &Arc<Self>) {
+        if self.draining() {
+            return;
+        }
         let admission = read(&self.admission);
         let mut start = Vec::new();
         let mut wait = Vec::new();
@@ -547,7 +694,7 @@ impl Shared {
                     let candidates: Vec<Candidate<'_>> = q
                         .jobs
                         .iter()
-                        .filter(|(_, a)| !a.running && a.info.spec.lane == lane)
+                        .filter(|(_, a)| !a.running && !a.completing && a.info.spec.lane == lane)
                         .map(|(id, a)| Candidate {
                             id,
                             priority: a.info.spec.priority,
@@ -597,12 +744,14 @@ impl Shared {
         for (id, scope) in wait {
             let shared = self.clone();
             tokio::spawn(async move {
+                // Only while it still waits: a job admitted meanwhile is `submitting` already.
+                let still_waiting: Guard = |a| a.waiting_for_vram && !a.running && !a.completing;
                 shared
                     .apply(
                         &id,
                         &scope,
                         Change::to(Substatus::WaitingForVram),
-                        Some(JobStatus::Queued),
+                        Some(still_waiting),
                     )
                     .await;
             });
@@ -713,7 +862,28 @@ impl Shared {
                 if first_attempt {
                     c.vram_unchecked = Some(unchecked);
                 }
-                self.apply(&id, &info.scope, c, None).await;
+                // CORE-120: the attempt's state (`submitting` for an engine job) is persisted
+                // before the handler runs; a job being cancelled keeps `cancelling`.
+                let live: Guard = |a| !a.cancelling && !a.preempted;
+                match self.apply_checked(&id, &info.scope, c, Some(live)).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let (cancelling, preempted) = self.flags(&id);
+                        if cancelling {
+                            return self.complete(&info, attempt, End::Cancelled).await;
+                        }
+                        if preempted {
+                            return self.requeue(&info).await;
+                        }
+                        tracing::warn!("a job's row is final or gone before its attempt; it doesn't run");
+                        self.leave(&info);
+                        return self.pump();
+                    }
+                    Err(e) => {
+                        let error = state_unavailable(&e, &info.trace_id);
+                        return self.fail_unstarted(&info, error).await;
+                    }
+                }
                 let ctx = Arc::new(self.ctx_for(&info, attempt, cancel.clone()));
                 let proceed = {
                     let mut q = self.queue();
@@ -746,9 +916,18 @@ impl Shared {
                     a.ctx = None;
                 }
                 let (cancelling, preempted) = self.flags(&id);
+                // An unknown outcome stays unknown, and an engine that lost the job is an
+                // interruption, whatever cancel or preemption came meanwhile: a cancel never
+                // hides a charge that may have happened, and neither is ever requeued.
                 let failure = match result {
                     Ok(done) => return self.complete(&info, attempt, End::Succeeded(done)).await,
+                    Err(JobFailure::Unknown(error)) => {
+                        return self.complete(&info, attempt, End::Unknown(error)).await;
+                    }
                     Err(_) if cancelling => return self.complete(&info, attempt, End::Cancelled).await,
+                    Err(JobFailure::Interrupted { error, salvaged }) => {
+                        return self.complete(&info, attempt, End::Interrupted { error, salvaged }).await;
+                    }
                     Err(_) if preempted => return self.requeue(&info).await,
                     Err(failure) => failure,
                 };
@@ -759,7 +938,7 @@ impl Shared {
                             of: MAX_ATTEMPTS,
                         });
                         c.error = Some(Some(error));
-                        self.apply(&id, &info.scope, c, None).await;
+                        self.apply(&id, &info.scope, c, Some(live)).await;
                         self.events.publish(
                             &format!("job:{id}"),
                             json!({"kind": "retrying", "attempt": attempt, "of": MAX_ATTEMPTS}),
@@ -790,6 +969,27 @@ impl Shared {
         .await;
     }
 
+    /// A job whose attempt couldn't be persisted (I8, CORE-120): its handler never ran. It is
+    /// written `failed` with `error`, and only once that write is in do its completions run
+    /// (with a [`super::never_started`] outcome); when the database refuses that too, the row
+    /// is left for the next start's recovery, which runs them.
+    async fn fail_unstarted(self: &Arc<Self>, info: &Info, error: ErrorBody) {
+        if let Some(a) = self.queue().jobs.get_mut(info.id.as_str()) {
+            a.completing = true;
+        }
+        let mut c = Change::finished(JobStatus::Failed);
+        c.error = Some(Some(error));
+        c.finished_utc = Some(self.now());
+        if let Some(row) = self.apply(info.id.as_str(), &info.scope, c, None).await
+            && let Some(ctx) = self.ctx_from_row(&row, &info.scope)
+        {
+            self.run_completions(&ctx, &not_started(&info.trace_id), None)
+                .await;
+        }
+        self.leave(info);
+        self.pump();
+    }
+
     /// A preempted job goes back to the head of its class (CORE-125); its attempt stays.
     async fn requeue(self: &Arc<Self>, info: &Info) {
         self.apply(
@@ -816,15 +1016,48 @@ impl Shared {
         self.pump();
     }
 
-    /// A job ends: its completions in registration order (none for `interrupted_unknown`),
-    /// then the Record step of a job that worked, then its final state; it leaves the queue
-    /// and the lane's next job starts. After the shutdown step nothing more is written.
+    /// Whether the job is still in its completions in this core: the shutdown step gives up on
+    /// a job that took longer than [`COMPLETION_GRACE`], and then nothing more is written.
+    fn still_completing(&self, id: &str) -> bool {
+        self.queue().jobs.get(id).is_some_and(|a| a.completing)
+    }
+
+    /// A job ends: a job that worked is written `ingesting` with its result first (module
+    /// docs, "Crash windows"); then its completions in registration order (none for
+    /// `interrupted_unknown`), then the Record step of a job that worked, then its final
+    /// state; it leaves the queue and the lane's next job starts. A job that ends after the
+    /// shutdown step records nothing.
     async fn complete(self: &Arc<Self>, info: &Info, attempt: u32, end: End) {
-        if self.queue().closed {
-            tracing::info!(job_id = %info.id, "a job ended after the shutdown step; its end is not recorded");
-            return;
+        {
+            let mut q = self.queue();
+            if q.closed {
+                tracing::info!(job_id = %info.id, "a job ended after the shutdown step; its end is not recorded");
+                return;
+            }
+            if let Some(a) = q.jobs.get_mut(info.id.as_str()) {
+                a.completing = true;
+            }
         }
-        let ctx = self.ctx_for(info, attempt, watch::Sender::new(true).subscribe());
+        let id = info.id.as_str();
+        // CORE-128, ARCH-022: only local work is re-run automatically, and never while the
+        // core drains. The re-run takes the reservation over.
+        let rerun = matches!(end, End::Interrupted { .. })
+            && info.spec.priority == Priority::Agent
+            && info.retry_of.is_none()
+            && !info.spec.external_side_effects
+            && !self.draining();
+        if let End::Succeeded(done) = &end {
+            let mut c = Change::to(Substatus::Ingesting);
+            c.result = Some(JobResult {
+                structured: done.structured.clone(),
+                artifacts: done.artifacts.clone(),
+            });
+            self.apply(id, &info.scope, c, None).await;
+        }
+        let mut ctx = self.ctx_for(info, attempt, watch::Sender::new(false).subscribe());
+        if rerun {
+            ctx.reservation = None;
+        }
         let outcome = match &end {
             End::Succeeded(done) => Outcome::Ok(ToolOutput {
                 structured: done.structured.clone(),
@@ -841,17 +1074,20 @@ impl Shared {
             },
         };
         if !matches!(end, End::Unknown(_)) {
-            let completions = read(&self.completions);
             let done = match &end {
                 End::Succeeded(done) => Some(done),
                 _ => None,
             };
-            for c in completions {
-                c.completed(&ctx, &outcome, done).await;
-            }
+            self.run_completions(&ctx, &outcome, done).await;
+        }
+        if !self.still_completing(id) {
+            tracing::warn!(
+                job_id = id,
+                "the shutdown step marked the job interrupted during its completions; its end is not recorded"
+            );
+            return;
         }
         let now = self.now();
-        let mut rerun = false;
         let c = match end {
             End::Succeeded(done) => self.recorded(info, done, now).await,
             End::Failed(error) => {
@@ -867,7 +1103,6 @@ impl Shared {
                 c
             }
             End::Interrupted { error, salvaged } => {
-                rerun = info.spec.priority == Priority::Agent && info.retry_of.is_none();
                 let mut c = Change::to(Substatus::Interrupted);
                 c.error = Some(Some(error));
                 c.result = Some(JobResult {
@@ -883,22 +1118,27 @@ impl Shared {
                 c
             }
         };
-        self.apply(info.id.as_str(), &info.scope, c, None).await;
+        self.apply(id, &info.scope, c, None).await;
         self.leave(info);
         if rerun {
-            tracing::info!(job_id = %info.id, "an interrupted agent job runs once more as a new job");
-            if let Err(e) = self
-                .submit_new(
-                    &info.scope,
-                    info.spec.clone(),
-                    &info.trace_id,
-                    None,
-                    None,
-                    Some(info.id.to_string()),
-                )
-                .await
-            {
-                tracing::warn!(job_id = %info.id, code = %e.code, "the re-run of an interrupted agent job could not be queued");
+            tracing::info!(
+                job_id = id,
+                "an interrupted agent job runs once more as a new job"
+            );
+            let new = NewJob {
+                spec: info.spec.clone(),
+                trace_id: info.trace_id.clone(),
+                idem: None,
+                reservation: info.reservation.clone(),
+                owner: id.to_string(),
+                retry_of: Some(id.to_string()),
+                origin: info.origin.clone(),
+            };
+            if let Err(e) = self.submit_new(&info.scope, new).await {
+                tracing::warn!(job_id = id, code = %e.code, "the re-run of an interrupted agent job could not be queued");
+                if let Some(rv) = &info.reservation {
+                    self.reservations().release(rv, id).await;
+                }
             }
         }
         self.pump();
@@ -965,13 +1205,16 @@ impl Shared {
 
     /// The job leaves the queue and its lane.
     fn leave(&self, info: &Info) {
-        let mut q = self.queue();
-        let lane = info.spec.lane.index();
-        if q.lanes[lane].running.as_deref() == Some(info.id.as_str()) {
-            q.lanes[lane].running = None;
+        {
+            let mut q = self.queue();
+            let lane = info.spec.lane.index();
+            if q.lanes[lane].running.as_deref() == Some(info.id.as_str()) {
+                q.lanes[lane].running = None;
+            }
+            q.jobs.remove(info.id.as_str());
         }
-        q.jobs.remove(info.id.as_str());
         lock(&self.locks).remove(info.id.as_str());
+        self.changed.send_modify(|n| *n += 1);
     }
 
     /// `JobCtx::set_substatus`.
@@ -979,11 +1222,13 @@ impl Shared {
         let scope = {
             let q = self.queue();
             match q.jobs.get(id.as_str()) {
-                Some(a) if a.running && !a.cancelling => a.info.scope.clone(),
+                Some(a) if a.running => a.info.scope.clone(),
                 _ => return,
             }
         };
-        self.apply(id.as_str(), &scope, Change::to(s), None).await;
+        let live: Guard = |a| a.running && !a.cancelling && !a.completing;
+        self.apply(id.as_str(), &scope, Change::to(s), Some(live))
+            .await;
     }
 
     /// `JobCtx::progress`.
@@ -1003,34 +1248,79 @@ impl Shared {
         self.events.publish(&format!("job:{id}"), data);
     }
 
-    /// The `PersistInterrupted` shutdown step (ARCH-021 step 3): the jobs still queued or
-    /// running are marked as a recovery would mark them, and nothing starts or ends any more.
-    async fn persist_interrupted(&self) {
-        let left: Vec<Info> = {
+    /// Marks a job of this core that a shutdown leaves behind, as a recovery would; the
+    /// completions of one that never started run (module docs, "Reservations").
+    async fn persist_one(self: &Arc<Self>, info: &Info, started: bool) {
+        let row = match record::get(info.scope.db(), info.id.as_str()).await {
+            Ok(Some(row)) if !row.status.is_final() => row,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::error!(job_id = %info.id, error = %e, "a running job could not be marked interrupted");
+                return;
+            }
+        };
+        let never = !started && never_ran(row.substatus);
+        let c = interrupt_change(&row, self.now());
+        if let Some(after) = self.apply(info.id.as_str(), &info.scope, c, None).await
+            && never
+            && let Some(ctx) = self.ctx_from_row(&after, &info.scope)
+        {
+            self.run_completions(&ctx, &not_started(&info.trace_id), None)
+                .await;
+        }
+    }
+
+    /// The `PersistInterrupted` shutdown step (ARCH-021 step 3): nothing starts or ends any
+    /// more; the jobs still queued or running are marked as a recovery would mark them; a job
+    /// in its completions gets [`COMPLETION_GRACE`] to finish, and is then marked the same
+    /// way (its result, written before its completions, is kept as salvaged artifacts).
+    async fn persist_interrupted(self: &Arc<Self>) {
+        let left: Vec<(Info, bool)> = {
             let mut q = self.queue();
             q.closed = true;
             q.lanes = Default::default();
-            q.jobs
-                .drain()
-                .map(|(_, a)| {
+            let ids: Vec<String> = q
+                .jobs
+                .iter()
+                .filter(|(_, a)| !a.completing)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| q.jobs.remove(&id))
+                .map(|a| {
                     a.cancel.send_replace(true);
-                    a.info
+                    (a.info, a.running)
                 })
                 .collect()
         };
-        for info in left {
-            let row = match record::get(info.scope.db(), info.id.as_str()).await {
-                Ok(Some(row)) if !row.status.is_final() => row,
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::error!(job_id = %info.id, error = %e, "a running job could not be marked interrupted");
-                    continue;
-                }
-            };
-            let c = interrupt_change(&row, self.now());
-            self.apply(info.id.as_str(), &info.scope, c, None).await;
+        for (info, started) in &left {
+            self.persist_one(info, *started).await;
+        }
+        let deadline = tokio::time::Instant::now() + COMPLETION_GRACE;
+        loop {
+            let mut changed = self.changed.subscribe();
+            if !self.queue().jobs.values().any(|a| a.completing) {
+                return;
+            }
+            tokio::select! {
+                _ = changed.changed() => {}
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        let late: Vec<Info> = self.queue().jobs.drain().map(|(_, a)| a.info).collect();
+        for info in &late {
+            tracing::warn!(job_id = %info.id, "a job's completions did not finish before the shutdown; it is marked interrupted");
+            self.persist_one(info, true).await;
         }
     }
+}
+
+/// Whether a job in `substatus` never started (it was waiting for its turn or for VRAM).
+fn never_ran(substatus: Option<Substatus>) -> bool {
+    matches!(
+        substatus,
+        Some(Substatus::Waiting | Substatus::WaitingForVram)
+    )
 }
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
@@ -1064,6 +1354,8 @@ impl Jobs {
             handlers: RwLock::new(HashMap::new()),
             admission: RwLock::new(Arc::new(AlwaysAdmit)),
             completions: RwLock::new(Vec::new()),
+            reservations: RwLock::new(Arc::new(NoReservations)),
+            drain: RwLock::new(None),
             preempt: AtomicBool::new(false),
             queue: Mutex::new(Queue::default()),
             changed: watch::Sender::new(0),
@@ -1092,13 +1384,33 @@ impl Jobs {
             .unwrap_or_else(PoisonError::into_inner) = a;
     }
 
-    /// Adds a completion; they run in the order they were added (Meter before Caps).
+    /// Adds a completion; they run in the order they were added (Meter before Caps). Add them
+    /// before the core's first recovery, which runs them for jobs that never started.
     pub fn add_completion(&self, c: Arc<dyn JobCompletion>) {
         self.shared
             .completions
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(c);
+    }
+
+    /// Replaces the reservation hand-over (Task 16; [`NoReservations`] until then).
+    pub fn set_reservations(&self, r: Arc<dyn Reservations>) {
+        *self
+            .shared
+            .reservations
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = r;
+    }
+
+    /// From the moment `drain` is cancelled (the lifecycle's drain token), no queued job
+    /// starts and no interrupted job is re-run (module docs, "Draining").
+    pub fn stop_on_drain(&self, drain: CancellationToken) {
+        *self
+            .shared
+            .drain
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(drain);
     }
 
     /// `[jobs] preempt_agent_batches` (CORE-125; default `false`).
@@ -1112,40 +1424,73 @@ impl Jobs {
         self.shared.pump();
     }
 
-    /// Submits `spec` in the scope of `ctx` and returns it `queued` (ARCH-034): its row and
-    /// its jobs log line are written first. With an idempotency key, the job that key made
-    /// before is returned (CORE-016). Sets `ctx.submitted`.
+    /// Submits `spec` in `caller`'s scope and returns it `queued` (ARCH-034): its row and its
+    /// jobs log line are written first, and the call's reservation passes to it. With an
+    /// idempotency key, the job that key made before is returned (CORE-016). A retry's job
+    /// (`caller.retry_of`) is in the retrying caller's class (Appendix F). Sets
+    /// `caller.submitted`.
     ///
     /// # Errors
     /// `idempotency.conflict`, `core.draining` after the shutdown step, `state.unavailable`,
-    /// `core.bug` for a kind no handler runs.
-    pub async fn submit(&self, ctx: &CallCtx, spec: JobSpec) -> Result<JobSummary, ErrorBody> {
+    /// `core.bug` for a kind no handler runs or a second job from one call.
+    pub async fn submit(
+        &self,
+        caller: &JobCaller,
+        mut spec: JobSpec,
+    ) -> Result<JobSummary, ErrorBody> {
         let s = &self.shared;
-        let scope = s.scope_of(ctx);
+        if let Some(first) = caller.submitted.get() {
+            return Err(ErrorBody::new(
+                &codes::CORE_BUG,
+                format!(
+                    "A tool call submitted a second job after {first}; one call submits at most one. This is a bug in LILITH."
+                ),
+                caller.trace_id.clone(),
+            ));
+        }
+        let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
-        let idem = ctx.idem_key.as_ref().map(|key| {
-            (
-                format!("{}|{}", ctx.session.caller, ctx.session.workspace_id()),
-                key.clone(),
-            )
-        });
-        let row = s
-            .submit_new(
-                &scope,
-                spec,
-                &ctx.trace_id,
-                idem,
-                ctx.reservation.clone(),
-                None,
-            )
-            .await?;
-        ctx.submitted.set(JobId(row.job_id.clone()));
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
+        if caller.retry_of.is_some() {
+            spec.priority =
+                Priority::for_caller(&caller.caller, spec.priority == Priority::Interactive);
+        }
+        let new = NewJob {
+            spec,
+            trace_id: caller.trace_id.clone(),
+            idem: caller
+                .idem_key
+                .as_ref()
+                .map(|key| (caller.idem_scope.clone(), key.clone())),
+            reservation: caller.reservation.clone(),
+            owner: caller.call_id.clone(),
+            retry_of: caller.retry_of.as_ref().map(|j| j.0.clone()),
+            origin: caller.origin.clone(),
+        };
+        let row = s.submit_new(&scope, new).await?;
+        caller.submitted.set(JobId(row.job_id.clone()));
         Ok(s.summary(&row))
     }
 
-    /// The jobs of `ctx`'s scope that `f` selects, newest first, and the cursor of the next
+    /// Job `id` of `caller`'s scope.
+    ///
+    /// # Errors
+    /// `job.unknown`; `state.unavailable`.
+    pub async fn get(&self, caller: &JobCaller, id: &JobId) -> Result<JobSummary, ErrorBody> {
+        let s = &self.shared;
+        let scope = s.scope_of(caller);
+        s.ensure_recovered(&scope)
+            .await
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
+        let row = record::get(scope.db(), id.as_str())
+            .await
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?
+            .ok_or_else(|| job_unknown(id.as_str(), &caller.trace_id))?;
+        Ok(s.summary(&row))
+    }
+
+    /// The jobs of `caller`'s scope that `f` selects, newest first, and the cursor of the next
     /// page (`None` on the last).
     ///
     /// # Errors
@@ -1153,47 +1498,52 @@ impl Jobs {
     /// `state.unavailable`.
     pub async fn list(
         &self,
-        ctx: &CallCtx,
+        caller: &JobCaller,
         f: JobFilter,
     ) -> Result<(Vec<JobSummary>, Option<String>), ErrorBody> {
         let s = &self.shared;
+        let trace_id = &caller.trace_id;
         let limit = f.limit.unwrap_or(100);
         if !(1..=500).contains(&limit) {
             return Err(params_invalid(
                 format!("limit must be 1–500, not {limit}"),
-                &ctx.trace_id,
+                trace_id,
             ));
         }
         let before = match &f.cursor {
             None => None,
             Some(c) => Some(c.parse::<i64>().map_err(|_| {
-                params_invalid(format!("{c:?} is not a jobs.list cursor"), &ctx.trace_id)
+                params_invalid(format!("{c:?} is not a jobs.list cursor"), trace_id)
             })?),
         };
-        let scope = s.scope_of(ctx);
+        let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
-        let rows = record::list(scope.db(), &f, limit, before)
+            .map_err(|e| state_unavailable(&e, trace_id))?;
+        // One row more than the page: there is a next page only when it exists.
+        let mut rows = record::list(scope.db(), &f, limit + 1, before)
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
-        let next = (rows.len() == limit as usize)
+            .map_err(|e| state_unavailable(&e, trace_id))?;
+        let more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next = more
             .then(|| rows.last().map(|r| r.seq.to_string()))
             .flatten();
         Ok((rows.iter().map(|r| s.summary(r)).collect(), next))
     }
 
-    /// Waits until job `id` of `ctx`'s scope is final, or for `timeout`: the job, and whether
-    /// it is final (AI-113).
+    /// Waits until job `id` of `caller`'s scope is final, or for `timeout`: the job, and
+    /// whether it is final (AI-113).
     ///
     /// # Errors
     /// `params.invalid` for a timeout outside 1–90 s; `job.unknown`; `state.unavailable`.
     pub async fn wait(
         &self,
-        ctx: &CallCtx,
+        caller: &JobCaller,
         id: &JobId,
         timeout: Duration,
     ) -> Result<(JobSummary, bool), ErrorBody> {
+        let trace_id = &caller.trace_id;
         if timeout < Duration::from_secs(1) || timeout > MAX_WAIT {
             return Err(params_invalid(
                 format!(
@@ -1201,23 +1551,25 @@ impl Jobs {
                     MAX_WAIT.as_secs(),
                     timeout.as_secs()
                 ),
-                &ctx.trace_id,
+                trace_id,
             ));
         }
         let s = &self.shared;
-        let scope = s.scope_of(ctx);
+        let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
+            .map_err(|e| state_unavailable(&e, trace_id))?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Subscribed before the read, so a change in between wakes the wait.
             let mut changed = s.changed.subscribe();
             let row = record::get(scope.db(), id.as_str())
                 .await
-                .map_err(|e| state_unavailable(&e, &ctx.trace_id))?
-                .ok_or_else(|| job_unknown(id.as_str(), &ctx.trace_id))?;
+                .map_err(|e| state_unavailable(&e, trace_id))?
+                .ok_or_else(|| job_unknown(id.as_str(), trace_id))?;
             if row.status.is_final() {
+                // Its final jobs log line is written once `job.wait` says it is done.
+                s.announced(id.as_str()).await;
                 return Ok((s.summary(&row), true));
             }
             tokio::select! {
@@ -1227,31 +1579,38 @@ impl Jobs {
         }
     }
 
-    /// Cancels job `id` of `ctx`'s scope (CORE-146): a queued job is `cancelled` at once; a
+    /// Cancels job `id` of `caller`'s scope (CORE-146): a queued job is `cancelled` at once; a
     /// running one becomes `cancelling`, its handler is told, and its engine work is
-    /// cancelled once; it is `cancelled` when its run ends. A finished job is returned as it
-    /// is.
+    /// cancelled once; it is `cancelled` when its run ends. A job in its completions, or
+    /// finished, is returned as it is. An `interrupted_unknown` job is yours to resolve
+    /// (CORE-088, AI-029): from the app this makes it `cancelled` and runs its completions,
+    /// with its reservation; an agent gets `confirm.unavailable`.
     ///
     /// # Errors
-    /// `job.unknown`; `state.unavailable`.
-    pub async fn cancel(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
+    /// `job.unknown`; `confirm.unavailable`; `state.unavailable`.
+    pub async fn cancel(&self, caller: &JobCaller, id: &JobId) -> Result<JobSummary, ErrorBody> {
         let s = &self.shared;
-        let scope = s.scope_of(ctx);
+        let trace_id = &caller.trace_id;
+        let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
+            .map_err(|e| state_unavailable(&e, trace_id))?;
         let current = |row: Option<JobRow>| {
             row.map(|r| s.summary(&r))
-                .ok_or_else(|| job_unknown(id.as_str(), &ctx.trace_id))
+                .ok_or_else(|| job_unknown(id.as_str(), trace_id))
         };
         let row = record::get(scope.db(), id.as_str())
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
+            .map_err(|e| state_unavailable(&e, trace_id))?;
         let Some(row) = row else {
             return current(None);
         };
         if row.status.is_final() {
             return current(Some(row));
+        }
+        let mine = s.queue().jobs.contains_key(id.as_str());
+        if !mine && row.substatus == Some(Substatus::InterruptedUnknown) {
+            return self.resolve_unknown(caller, &scope, row).await;
         }
         enum Act {
             Nothing,
@@ -1262,11 +1621,13 @@ impl Jobs {
             let mut q = s.queue();
             match q.jobs.get_mut(id.as_str()) {
                 None => Act::Nothing,
+                Some(a) if a.completing || a.cancelling => Act::Nothing,
                 Some(a) if !a.running => {
-                    let a = q.jobs.remove(id.as_str()).expect("the job is queued");
-                    Act::Queued(Box::new(a.info))
+                    // Its end begins now, so it never starts; its completions release
+                    // whatever its call reserved.
+                    a.completing = true;
+                    Act::Queued(Box::new(a.info.clone()))
                 }
-                Some(a) if a.cancelling => Act::Nothing,
                 Some(a) => {
                     a.cancelling = true;
                     a.cancel.send_replace(true);
@@ -1285,13 +1646,17 @@ impl Jobs {
         match act {
             Act::Nothing => {}
             Act::Queued(info) => {
-                // Out of the queue already, so it never starts; its completions release
-                // whatever its call reserved.
                 s.complete(&info, row.attempt, End::Cancelled).await;
             }
             Act::Running(engine) => {
-                s.apply(id.as_str(), &scope, Change::to(Substatus::Cancelling), None)
-                    .await;
+                let not_ending: Guard = |a| !a.completing;
+                s.apply(
+                    id.as_str(),
+                    &scope,
+                    Change::to(Substatus::Cancelling),
+                    Some(not_ending),
+                )
+                .await;
                 if let Some((ctx, handler)) = engine {
                     handler.cancel_in_engine(&ctx).await;
                 }
@@ -1299,28 +1664,77 @@ impl Jobs {
         }
         let row = record::get(scope.db(), id.as_str())
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
+            .map_err(|e| state_unavailable(&e, trace_id))?;
         current(row)
     }
 
-    /// Runs failed or cancelled job `id` of `ctx`'s scope again as a new job whose
-    /// `retry_of` is `id` (CORE-146). Never an `interrupted_unknown` one.
+    /// `job.cancel` of an `interrupted_unknown` job ([`Jobs::cancel`]): the final state is
+    /// written first, so of two cancels only one runs the completions.
+    async fn resolve_unknown(
+        &self,
+        caller: &JobCaller,
+        scope: &Scope,
+        row: JobRow,
+    ) -> Result<JobSummary, ErrorBody> {
+        let s = &self.shared;
+        if caller.caller.is_agent() {
+            return Err(ErrorBody::new(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "Job {} may or may not have run (interrupted_unknown); only you can resolve it. Cancel it from the LILITH app.",
+                    row.job_id
+                ),
+                caller.trace_id.clone(),
+            ));
+        }
+        let mut c = Change::finished(JobStatus::Cancelled);
+        c.error = Some(None);
+        c.finished_utc = Some(s.now());
+        let resolved = s.apply(&row.job_id, scope, c, None).await;
+        if resolved.is_some()
+            && let Some(ctx) = s.ctx_from_row(&row, scope)
+        {
+            tracing::info!(job_id = %row.job_id, "an interrupted_unknown job is resolved: cancelled");
+            s.run_completions(
+                &ctx,
+                &Outcome::Error {
+                    error: cancelled_error(&row.trace_id),
+                },
+                None,
+            )
+            .await;
+        }
+        let after = record::get(scope.db(), &row.job_id)
+            .await
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
+        after
+            .map(|r| s.summary(&r))
+            .ok_or_else(|| job_unknown(&row.job_id, &caller.trace_id))
+    }
+
+    /// The tool call that made failed or cancelled job `id` of `caller`'s scope, for
+    /// `job.retry` to dispatch again (CORE-146). Never an `interrupted_unknown` job.
     ///
     /// # Errors
-    /// `job.unknown`; `job.not_retryable` for any other state, or a kind no handler runs;
-    /// as [`Jobs::submit`].
-    pub async fn retry(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
+    /// `job.unknown`; `job.not_retryable` for any other state, or a job no tool call made;
+    /// `state.unavailable`.
+    pub async fn retry_origin(
+        &self,
+        caller: &JobCaller,
+        id: &JobId,
+    ) -> Result<JobOrigin, ErrorBody> {
         let s = &self.shared;
-        let scope = s.scope_of(ctx);
+        let trace_id = &caller.trace_id;
+        let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?;
+            .map_err(|e| state_unavailable(&e, trace_id))?;
         let row = record::get(scope.db(), id.as_str())
             .await
-            .map_err(|e| state_unavailable(&e, &ctx.trace_id))?
-            .ok_or_else(|| job_unknown(id.as_str(), &ctx.trace_id))?;
+            .map_err(|e| state_unavailable(&e, trace_id))?
+            .ok_or_else(|| job_unknown(id.as_str(), trace_id))?;
         let not_retryable =
-            |why: String| ErrorBody::new(&codes::JOB_NOT_RETRYABLE, why, ctx.trace_id.clone());
+            |why: String| ErrorBody::new(&codes::JOB_NOT_RETRYABLE, why, trace_id.clone());
         if !matches!(row.status, JobStatus::Failed | JobStatus::Cancelled) {
             return Err(not_retryable(format!(
                 "Job {id} is {}; only a failed or cancelled job can be retried.",
@@ -1328,49 +1742,30 @@ impl Jobs {
                     .map_or_else(|| row.status.wire().to_string(), |s| s.wire())
             )));
         }
-        let Some(handler) = s.handler(&row.kind) else {
-            return Err(not_retryable(format!(
-                "No handler runs jobs of kind {:?} any more.",
-                row.kind
-            )));
-        };
-        let idem = ctx.idem_key.as_ref().map(|key| {
-            (
-                format!("{}|{}", ctx.session.caller, ctx.session.workspace_id()),
-                key.clone(),
-            )
-        });
-        let new = s
-            .submit_new(
-                &scope,
-                row.spec(handler.kind()),
-                &ctx.trace_id,
-                idem,
-                ctx.reservation.clone(),
-                Some(row.job_id.clone()),
-            )
-            .await?;
-        ctx.submitted.set(JobId(new.job_id.clone()));
-        Ok(s.summary(&new))
+        row.origin.ok_or_else(|| {
+            not_retryable(format!(
+                "Job {id} was not started by a tool call, so there is nothing to run again."
+            ))
+        })
     }
 
-    /// The startup recovery of `scope` (ARCH-022): the jobs it marked. Every job of the scope
-    /// without a final state that this core isn't running becomes `interrupted` (or
-    /// `interrupted_unknown`, CORE-128); nothing re-runs. Writes no log line: the core calls it
-    /// for the suite `state.db`, whose jobs have none; a workspace is recovered with
-    /// [`Jobs::recover_workspace`].
+    /// The startup recovery of the suite scope (ARCH-022), once per core: the jobs it marked
+    /// (none on a later call). Every job of the scope without a final state that this core
+    /// isn't running becomes `interrupted` (or `interrupted_unknown`, CORE-128); nothing
+    /// re-runs.
     ///
     /// # Errors
     /// `state.unavailable`.
-    pub async fn recover(&self, scope: &StateDb) -> Result<Vec<JobId>, ErrorBody> {
+    pub async fn recover_suite(&self) -> Result<Vec<JobId>, ErrorBody> {
+        let scope = Scope::Suite(self.shared.states.suite_db());
         self.shared
-            .recover_rows(scope, None)
+            .ensure_recovered(&scope)
             .await
             .map_err(|e| state_unavailable(&e, ""))
     }
 
-    /// Recovers the workspace `open` once per core (as [`Jobs::recover`], with its jobs log
-    /// lines); later calls do nothing. Every job operation in a workspace runs it first.
+    /// Recovers the workspace `open` once per core (as [`Jobs::recover_suite`], with its jobs
+    /// log lines); later calls do nothing. Every job operation in a workspace runs it first.
     ///
     /// # Errors
     /// `state.unavailable`.
@@ -1378,12 +1773,20 @@ impl Jobs {
         self.shared
             .ensure_recovered(&Scope::Workspace(open.clone()))
             .await
+            .map(drop)
             .map_err(|e| state_unavailable(&e, ""))
     }
 
-    /// Whether a job is queued or running in this core (ARCH-020: the core isn't idle).
+    /// Whether the core isn't idle for its jobs (ARCH-020): a job is queued, running or in its
+    /// completions; once the core drains, only running jobs and completions count (ARCH-021).
     pub fn busy(&self) -> bool {
-        !self.shared.queue().jobs.is_empty()
+        let draining = self.shared.draining();
+        let q = self.shared.queue();
+        if draining {
+            q.jobs.values().any(|a| a.running || a.completing)
+        } else {
+            !q.jobs.is_empty()
+        }
     }
 
     /// The `PersistInterrupted` shutdown step (ARCH-021 step 3).
@@ -1420,7 +1823,8 @@ impl ShutdownStep for PersistInterrupted {
 }
 
 /// The `job:<id>` snapshot: the job's summary, from the scope that holds it (a job this core
-/// runs, else the suite `state.db`, else the default workspace's), or `{"error": …}`.
+/// runs, else the suite `state.db`, else a workspace the hub has open; a snapshot never opens
+/// one), or `{"error": …}`.
 struct JobSnapshots(Weak<Shared>);
 
 impl SnapshotProvider for JobSnapshots {
@@ -1440,11 +1844,7 @@ impl SnapshotProvider for JobSnapshots {
                 scopes.push(scope);
             }
             scopes.push(Scope::Suite(s.states.suite_db()));
-            if let Some(ws) = s.hub.default_ref()
-                && let Ok(open) = s.hub.open(&ws).await
-            {
-                scopes.push(Scope::Workspace(open));
-            }
+            scopes.extend(s.hub.opened().into_iter().map(Scope::Workspace));
             for scope in scopes {
                 if let Ok(Some(row)) = record::get(scope.db(), id).await {
                     return serde_json::to_value(s.summary(&row))

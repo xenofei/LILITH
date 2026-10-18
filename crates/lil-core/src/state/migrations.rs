@@ -40,7 +40,8 @@ CREATE TABLE generated_pending (
 /// A job lives in the `state.db` of its call's scope (ARCH-099). `seq` is the submission order.
 /// `idem_scope`/`idem_key` (caller kind + workspace, and the call's idempotency key) make one
 /// key one job (CORE-016). `external_id` is the engine's id for the job (ComfyUI's
-/// `prompt_id`, CORE-120), written by the engine's handler.
+/// `prompt_id`, CORE-120), written by the engine's handler. `tool`/`tool_args` are the tool
+/// call that submitted the job, which `job.retry` dispatches again.
 const JOBS: &str = "CREATE TABLE jobs (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL UNIQUE,
@@ -76,7 +77,9 @@ const JOBS: &str = "CREATE TABLE jobs (
     grp TEXT,
     external_side_effects INTEGER NOT NULL,
     external_id TEXT,
-    reservation TEXT
+    reservation TEXT,
+    tool TEXT,
+    tool_args TEXT
 );
 CREATE UNIQUE INDEX jobs_idem ON jobs(idem_scope, idem_key) WHERE idem_key IS NOT NULL;
 CREATE INDEX jobs_open ON jobs(status) WHERE status IN ('queued','running');";

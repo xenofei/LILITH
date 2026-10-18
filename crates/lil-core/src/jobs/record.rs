@@ -7,7 +7,9 @@ use lil_protocol::ErrorBody;
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde_json::{Map, Value, json};
 
-use super::{EngineKind, JobFilter, JobResult, JobSpec, JobStatus, JobSummary, Lane, Priority};
+use super::{
+    EngineKind, JobFilter, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane, Priority,
+};
 use super::{Progress, Substatus};
 use crate::state::{StateDb, StateError};
 
@@ -47,6 +49,8 @@ pub struct JobRow {
     pub group: Option<String>,
     pub external_side_effects: bool,
     pub reservation: Option<String>,
+    /// The tool call that submitted the job (`job.retry` dispatches it again).
+    pub origin: Option<JobOrigin>,
 }
 
 impl JobRow {
@@ -181,7 +185,7 @@ const COLUMNS: &str = "seq, job_id, kind, lane, priority, module, args, project,
     doc_id, status, substatus, attempt, created_utc, updated_utc, started_utc, finished_utc, \
     watchdog, vram_unchecked, error, result, retry_of, trace_id, idem_scope, idem_key, \
     args_hash, expected_secs, expected_output_bytes, vram_need_mib, engine, grp, \
-    external_side_effects, reservation";
+    external_side_effects, reservation, tool, tool_args";
 
 /// A JSON column, `None` when it is NULL or doesn't parse (logged).
 fn json_col<T: serde::de::DeserializeOwned>(r: &Row<'_>, i: usize) -> rusqlite::Result<Option<T>> {
@@ -256,6 +260,13 @@ fn row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
         group: r.get(30)?,
         external_side_effects: r.get::<_, i64>(31)? != 0,
         reservation: r.get(32)?,
+        origin: match r.get::<_, Option<String>>(33)? {
+            None => None,
+            Some(tool) => Some(JobOrigin {
+                tool,
+                arguments: json_col(r, 34)?.unwrap_or(Value::Null),
+            }),
+        },
     })
 }
 
@@ -319,10 +330,11 @@ pub async fn insert(db: &StateDb, r: JobRow) -> Result<Inserted, StateError> {
                      doc_id, status, substatus, attempt, created_utc, updated_utc, started_utc,
                      finished_utc, watchdog, vram_unchecked, error, result, retry_of, trace_id,
                      idem_scope, idem_key, args_hash, expected_secs, expected_output_bytes,
-                     vram_need_mib, engine, grp, external_side_effects, reservation)
+                     vram_need_mib, engine, grp, external_side_effects, reservation, tool,
+                     tool_args)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                      ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-                     ?32)",
+                     ?32, ?33, ?34)",
                 params![
                     r.job_id,
                     r.kind,
@@ -356,6 +368,8 @@ pub async fn insert(db: &StateDb, r: JobRow) -> Result<Inserted, StateError> {
                     r.group,
                     i64::from(r.external_side_effects),
                     r.reservation,
+                    r.origin.as_ref().map(|o| o.tool.as_str()),
+                    r.origin.as_ref().map(|o| to_text(&o.arguments)),
                 ],
             )?;
             let inserted = get_in(&tx, &r.job_id)?.expect("the row was just inserted");
@@ -549,6 +563,7 @@ mod tests {
             group: None,
             external_side_effects: false,
             reservation: None,
+            origin: None,
         }
     }
 

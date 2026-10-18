@@ -6,27 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 8
-    # ARCH-034
-    { name = "lil-spec-tests::jobs_queue::job_tool_returns_a_job_id_at_once", rule = "ARCH-034", file = "tests/jobs_queue.rs" },
-    # AI-113
-    { name = "lil-spec-tests::jobs_queue::job_wait_is_at_most_90_seconds", rule = "AI-113", file = "tests/jobs_queue.rs" },
-    # CORE-016, ARCH-035
-    { name = "lil-spec-tests::jobs_queue::same_key_returns_the_same_job", rule = "CORE-016", file = "tests/jobs_queue.rs" },
-    # CORE-009, CORE-117
-    { name = "lil-spec-tests::jobs_queue::jobs_log_follows_state_changes", rule = "CORE-009", file = "tests/jobs_queue.rs" },
-    # ARCH-022, QA-055
-    { name = "lil-spec-tests::jobs_queue::core_restart_interrupts_unfinished_jobs_and_never_reruns", rule = "ARCH-022", file = "tests/jobs_queue.rs" },
-    # ARCH-020
-    { name = "lil-spec-tests::jobs_queue::core_stays_up_while_a_job_runs", rule = "ARCH-020", file = "tests/jobs_queue.rs" },
-    # ARCH-071, CORE-121
-    { name = "lil-spec-tests::jobs_queue::one_heavy_job_at_a_time", rule = "ARCH-071", file = "tests/jobs_queue.rs" },
-    # CORE-124
-    { name = "lil-spec-tests::jobs_queue::interactive_goes_after_the_running_job_and_before_agent_batches", rule = "CORE-124", file = "tests/jobs_queue.rs" },
-    # CORE-124
-    { name = "lil-spec-tests::jobs_queue::fifo_within_a_class", rule = "CORE-124", file = "tests/jobs_queue.rs" },
-    # CORE-128, QA-004
-    { name = "lil-spec-tests::jobs_queue::transient_failures_retry_with_events_and_disk_full_does_not", rule = "CORE-128", file = "tests/jobs_queue.rs" },
     # Task 9
     # CORE-059, CORE-060, CORE-064
     { name = "lil-spec-tests::telemetry::snapshot_labels_measured_and_estimated_parts", rule = "CORE-059", file = "tests/telemetry.rs" },
