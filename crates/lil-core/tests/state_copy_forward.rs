@@ -586,74 +586,97 @@ fn suite_toml_registration_refuses_an_unreadable_legacy_file() {
     assert_eq!(sha256_file(&legacy), before);
 }
 
-/// Ruling RN10 (review probe P4): SQLite files left beside a missing new `state.db` would be
-/// applied to the copy (an orphan `-wal`'s frames turn into rows). The copy-forward refuses,
-/// naming them and `lil doctor`; it moves and deletes nothing, leaves no temp file and no new
+/// Rulings RN10 and RN10b (review probe P4): SQLite files left beside a missing new `state.db`
+/// would be applied to the copy (an orphan `-wal`'s frames turn into rows). The copy-forward
+/// refuses with a message that names every orphan by its full path and asks the person to move
+/// them aside themselves; it moves and deletes nothing, leaves no temp file and no new
 /// `state.db`, and the legacy files stay as they were.
 #[test] // spec: CORE-005, CORE-004
 fn copy_forward_refuses_beside_orphan_sqlite_files() {
-    for suffix in ["-wal", "-shm", "-journal"] {
+    let cases: [&[&str]; 4] = [
+        &["-wal"],
+        &["-shm"],
+        &["-journal"],
+        &["-wal", "-shm", "-journal"],
+    ];
+    for suffixes in cases {
         let env = TestEnv::new();
         let ws_dir = env.make_workspace("orphan");
         let ws = workspace_ref(&ws_dir);
         let legacy = legacy_db(&env.legacy_workspace_local_dir(&ws_dir), &["legacy.png"]);
         let before = legacy_hashes(&legacy);
         let new_dir = env.workspace_local_dir(&ws_dir);
-        let orphan = new_dir.join(format!("state.db{suffix}"));
-        if suffix == "-wal" {
-            // An earlier copy written to in WAL, then only its `state.db` deleted: the `-wal`
-            // holds a phantom row.
-            let earlier = env.root().join("earlier").join("state.db");
-            fsops::ensure_dir(earlier.parent().unwrap()).unwrap();
-            {
-                let src =
-                    Connection::open_with_flags(&legacy, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-                src.execute("VACUUM INTO ?1", [earlier.to_str().unwrap()])
-                    .unwrap();
+        let mut orphans = Vec::new();
+        for suffix in suffixes {
+            let orphan = new_dir.join(format!("state.db{suffix}"));
+            if *suffix == "-wal" {
+                write_file(&orphan, &phantom_wal(&env, &legacy));
+            } else {
+                write_file(&orphan, b"left by an earlier database");
             }
-            let conn = Connection::open(&earlier).unwrap();
-            let mode: String = conn
-                .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
-                .unwrap();
-            assert_eq!(mode.to_ascii_lowercase(), "wal");
-            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-            conn.execute(
-                "INSERT INTO generated (key, path, sha256, written_utc)
-                 VALUES (?1, 'phantom.png', 'sha-ph', 9)",
-                [path_key("phantom.png")],
-            )
-            .unwrap();
-            write_file(&orphan, &std::fs::read(beside(&earlier, "-wal")).unwrap());
-            drop(conn);
-        } else {
-            write_file(&orphan, b"left by an earlier database");
+            let hash = sha256_file(&orphan);
+            orphans.push((orphan, hash));
         }
-        let orphan_before = sha256_file(&orphan);
 
         let reg = StateRegistry::open(&env.env, no_fatal()).unwrap();
         let rt = runtime();
         let got = rt.block_on(reg.for_workspace(&ws, Access::ReadWrite));
         reg.close();
-        let err = got.expect_err(&format!("{suffix}: the copy went in beside an orphan"));
+        let err = got.expect_err(&format!("{suffixes:?}: the copy went in beside an orphan"));
         let text = err.to_string();
+        for (orphan, _) in &orphans {
+            assert!(
+                text.contains(&orphan.display().to_string()),
+                "{suffixes:?}: the message doesn't name {}: {text}",
+                orphan.display()
+            );
+        }
+        assert!(text.contains(".set-aside"), "{suffixes:?}: {text}");
+        assert!(!text.contains("doctor"), "{suffixes:?}: {text}");
         assert!(
-            text.contains(&format!("state.db{suffix}")),
-            "{suffix}: {text}"
+            !text.contains("  "),
+            "{suffixes:?}: a run of spaces: {text:?}"
         );
-        assert!(text.contains("lil doctor"), "{suffix}: {text}");
         assert!(
             !new_dir.join("state.db").exists(),
-            "{suffix}: a state.db was made"
+            "{suffixes:?}: a state.db was made"
         );
-        assert_eq!(
-            sha256_file(&orphan),
-            orphan_before,
-            "{suffix}: the orphan changed"
-        );
-        let left = names_in(&new_dir);
-        assert_eq!(left, [format!("state.db{suffix}")], "{suffix}: {left:?}");
+        for (orphan, hash) in &orphans {
+            assert_eq!(&sha256_file(orphan), hash, "{}", orphan.display());
+        }
+        let mut want: Vec<String> = suffixes.iter().map(|s| format!("state.db{s}")).collect();
+        want.sort();
+        assert_eq!(names_in(&new_dir), want, "{suffixes:?}");
         assert_legacy_untouched(&legacy, &before);
     }
+}
+
+/// A `-wal` from an earlier copy of `legacy` that was written to in WAL and then lost its
+/// `state.db`: it holds a phantom row.
+fn phantom_wal(env: &TestEnv, legacy: &Path) -> Vec<u8> {
+    let earlier = env.root().join("earlier").join("state.db");
+    fsops::ensure_dir(earlier.parent().unwrap()).unwrap();
+    {
+        let src = Connection::open_with_flags(legacy, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        src.execute("VACUUM INTO ?1", [earlier.to_str().unwrap()])
+            .unwrap();
+    }
+    let conn = Connection::open(&earlier).unwrap();
+    let mode: String = conn
+        .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.execute(
+        "INSERT INTO generated (key, path, sha256, written_utc)
+         VALUES (?1, 'phantom.png', 'sha-ph', 9)",
+        [path_key("phantom.png")],
+    )
+    .unwrap();
+    let bytes = std::fs::read(beside(&earlier, "-wal")).unwrap();
+    assert!(!bytes.is_empty(), "the WAL holds the phantom row");
+    drop(conn);
+    bytes
 }
 
 /// Review probe P7: a copy killed after its rename (so `state.db` is the copy) can leave an

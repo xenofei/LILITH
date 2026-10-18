@@ -47,8 +47,11 @@
 //! `user_version`); a read-only connection on it runs `VACUUM INTO` a fresh
 //! `.state.db.lil-tmp-<pid>-<n>` beside the new path (the name is a bound parameter); the fail
 //! point `state.copy_forward` comes next; the temp file is flushed to disk; SQLite files left
-//! beside the missing `state.db` (`-wal`, `-shm`, `-journal`) refuse the copy (ruling RN10,
-//! [`refuse_orphans`]); the temp file is moved to `state.db` without replacing anything. The
+//! beside the missing `state.db` (`-wal`, `-shm`, `-journal`) refuse the copy (rulings RN10
+//! and RN10b, [`refuse_orphans`]: the message names each by its full path and asks the person
+//! to move them aside, for example by renaming each to end in `.set-aside`, and reopen; nothing
+//! is lost, and the suite never moves them); the temp file is moved to `state.db` without
+//! replacing anything. The
 //! normal open then checks and migrates the copy. `VACUUM INTO` writes one self-contained file,
 //! so the legacy `-wal` is read (its committed rows are in the copy) and no `-wal` or `-shm` is
 //! ever copied. The legacy database and its `-wal` are never written, moved or deleted. The one
@@ -1224,11 +1227,13 @@ fn copy_forward(path: &Path, legacy: &Path, known: i64, fp: &FailPoints) -> Resu
     Ok(())
 }
 
-/// Ruling RN10: SQLite files left beside a missing `state.db` (`-wal`, `-shm`, `-journal`, from
-/// a database whose main file is gone) would be applied to the copy once it is moved in: an
-/// orphan `-wal`'s frames would show up as rows. Their presence refuses the copy-forward with
-/// an error that names them and points to `lil doctor`, whose leftover set-aside moves them
-/// behind a confirmation. They are never moved or deleted here (owner decision 5).
+/// Rulings RN10 and RN10b: SQLite files left beside a missing `state.db` (`-wal`, `-shm`,
+/// `-journal`, from a database whose main file is gone) would be applied to the copy once it is
+/// moved in: an orphan `-wal`'s frames would show up as rows. Their presence refuses the
+/// copy-forward with an error that names each one by its full path and asks the person to move
+/// them aside themselves (for example by renaming each to end in `.set-aside`) and reopen;
+/// nothing is lost, since the legacy database was not touched. The suite never moves or deletes
+/// them (owner decision 5).
 fn refuse_orphans(path: &Path) -> Result<(), StateError> {
     let mut found = Vec::new();
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -1242,7 +1247,11 @@ fn refuse_orphans(path: &Path) -> Result<(), StateError> {
     }
     tracing::error!(files = ?found, "SQLite files without their state.db lie where the copy-forward would go; refused");
     Err(StateError::Io(format!(
-        "the workspace database {} is missing, but {} from an earlier database lie beside it, so          the legacy database was not copied forward (they would be applied to the copy); run          `lil doctor`, which sets them aside, then retry",
+        "the workspace database {} is missing, but files from an earlier database lie beside \
+         it: {}. The legacy database was not copied forward, because SQLite would apply those \
+         files to the copy. Move them aside yourself (for example, rename each one to end in \
+         .set-aside), then open the workspace again. Nothing is lost: the legacy database was \
+         not touched.",
         path.display(),
         found.join(", ")
     )))
