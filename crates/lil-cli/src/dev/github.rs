@@ -14,6 +14,7 @@
 //! | `commit_pulls` | `GET /repos/{o}/{r}/commits/{sha}/pulls?per_page=100`, following `Link: rel="next"` |
 //! | `workflow_runs_as_app` | `GET /repos/{o}/{r}/actions/workflows/{file}/runs?event={event}&head_sha={sha}&per_page=100` with the installation token |
 //! | `rerun_as_app` | `POST /repos/{o}/{r}/actions/runs/{id}/rerun` with the installation token |
+//! | `app_slug` | `GET /app` with the reviewer App's JWT |
 //!
 //! The owner and repo always come from the committed `dev/merge-guard.toml` (ruling R12); there
 //! are no hard-coded defaults here.
@@ -138,6 +139,13 @@ pub trait GitHubApi {
         let _ = (run_id, installation_token);
         bail!("this GitHub client can't re-run workflow runs")
     }
+    /// The live slug of the App whose JWT `jwt` is (`GET /app`; plan 2026-10-17, D6). Only the
+    /// real client and the fake answer; other test doubles keep this default error, so a
+    /// caller never assumes a slug.
+    fn app_slug(&self, jwt: &str) -> Result<String> {
+        let _ = jwt;
+        bail!("this GitHub client can't ask for the App's slug")
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -238,6 +246,11 @@ pub fn build_workflow_runs_request(
     )
 }
 
+/// `GET /app`, authenticated with an App JWT: the App the JWT belongs to.
+pub fn build_app_request() -> (Method, String) {
+    (Method::GET, "/app".to_owned())
+}
+
 pub fn build_rerun_request(owner: &str, repo: &str, run_id: u64) -> (Method, String) {
     (
         Method::POST,
@@ -298,6 +311,15 @@ pub fn parse_check_state(v: &Value) -> Result<CheckState> {
         Some(other) => CheckState::Failure(other.to_owned()),
         None => CheckState::Failure("none".to_owned()),
     })
+}
+
+/// The `slug` of a `GET /app` response. Fails closed: a missing, empty or non-string slug is an
+/// error, never a default.
+pub fn parse_app_slug(v: &Value) -> Result<String> {
+    match v.get("slug").and_then(Value::as_str) {
+        Some(slug) if !slug.is_empty() => Ok(slug.to_owned()),
+        _ => bail!("GitHub's answer to GET /app has no App slug"),
+    }
 }
 
 pub fn parse_reviews(v: &Value) -> Result<Vec<Review>> {
@@ -636,6 +658,14 @@ impl GitHubApi for RestClient {
         let (status, _, body) = self.send(m.clone(), &url, None, installation_token)?;
         Self::expect_ok(&m, &url, status, &body)
     }
+
+    fn app_slug(&self, jwt: &str) -> Result<String> {
+        let (m, path) = build_app_request();
+        let url = self.abs(&path);
+        let (status, _, body) = self.send(m.clone(), &url, None, jwt)?;
+        Self::expect_ok(&m, &url, status, &body)?;
+        parse_app_slug(&body).with_context(|| format!("{m} {url} (HTTP {status})"))
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -645,9 +675,9 @@ mod tests {
 
     #[test]
     fn merge_request_pins_sha() {
-        let (method, path, body) = build_merge_request("xenofei", "Worldwright-Suite", 7, "abc123");
+        let (method, path, body) = build_merge_request("xenofei", "LILITH", 7, "abc123");
         assert_eq!(method, Method::PUT);
-        assert_eq!(path, "/repos/xenofei/Worldwright-Suite/pulls/7/merge");
+        assert_eq!(path, "/repos/xenofei/LILITH/pulls/7/merge");
         assert_eq!(body["sha"], "abc123");
         assert_eq!(body["merge_method"], "merge");
         let text = body.to_string();
@@ -684,21 +714,20 @@ mod tests {
 
     #[test]
     fn token_never_in_debug_output() {
-        let client = RestClient::new("xenofei", "Worldwright-Suite", "ghp_SECRETTOKEN123").unwrap();
+        let client = RestClient::new("xenofei", "LILITH", "ghp_SECRETTOKEN123").unwrap();
         let shown = format!("{client:?}");
         assert!(!shown.contains("ghp_SECRETTOKEN123"), "{shown}");
         assert!(shown.contains("redacted"), "{shown}");
-        assert!(shown.contains("Worldwright-Suite"), "{shown}");
+        assert!(shown.contains("LILITH"), "{shown}");
     }
 
     #[test]
     fn check_runs_request_encodes_name() {
-        let (m, p) =
-            build_check_runs_request("xenofei", "Worldwright-Suite", "abc", "lil guard/pr");
+        let (m, p) = build_check_runs_request("xenofei", "LILITH", "abc", "lil guard/pr");
         assert_eq!(m, Method::GET);
         assert_eq!(
             p,
-            "/repos/xenofei/Worldwright-Suite/commits/abc/check-runs?check_name=lil%20guard%2Fpr&filter=latest"
+            "/repos/xenofei/LILITH/commits/abc/check-runs?check_name=lil%20guard%2Fpr&filter=latest"
         );
     }
 
@@ -724,6 +753,49 @@ mod tests {
         let (m, p) = build_pr_request("o", "r", 3);
         assert_eq!(m, Method::GET);
         assert_eq!(p, "/repos/o/r/pulls/3");
+    }
+
+    #[test] // spec: QA-020
+    fn app_slug_request_is_get_app() {
+        let (m, p) = build_app_request();
+        assert_eq!(m, Method::GET);
+        assert_eq!(p, "/app");
+    }
+
+    #[test] // spec: QA-020
+    fn app_slug_parsing_fails_closed() {
+        let body =
+            serde_json::json!({"id": 1, "slug": "lilith-reviewer", "name": "LILITH reviewer"});
+        assert_eq!(parse_app_slug(&body).unwrap(), "lilith-reviewer");
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"slug": null}),
+            serde_json::json!({"slug": ""}),
+            serde_json::json!({"slug": 7}),
+            serde_json::json!({"name": "lilith-reviewer"}),
+            serde_json::json!([{"slug": "lilith-reviewer"}]),
+            serde_json::Value::Null,
+        ] {
+            assert!(parse_app_slug(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test] // spec: QA-020
+    fn fake_serves_the_app_slug() {
+        let fake = FakeGitHub::new();
+        fake.add_pr(7, "sha1", "main");
+        // By default the App has its current slug, and posts as it.
+        assert_eq!(fake.app_slug("jwt-1").unwrap(), "worldwright-reviewer");
+        fake.set_app_slug("lilith-reviewer");
+        assert_eq!(fake.app_slug("jwt-2").unwrap(), "lilith-reviewer");
+        fake.post_review_as_app(7, "sha1", "ok", "inst-token")
+            .unwrap();
+        let reviews = fake.reviews(7).unwrap();
+        assert_eq!(reviews.last().unwrap().login, "lilith-reviewer[bot]");
+        // The JWTs it was asked with are recorded, in order.
+        assert_eq!(fake.app_jwts(), ["jwt-1", "jwt-2"]);
+        fake.fail_app_slug("HTTP 401: A JSON web token could not be decoded");
+        assert!(fake.app_slug("jwt-3").is_err());
     }
 
     fn run(status: &str, conclusion: Option<&str>, id: u64, started: &str) -> serde_json::Value {

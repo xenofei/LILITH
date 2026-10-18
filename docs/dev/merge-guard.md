@@ -2,7 +2,7 @@
 
 This guide is for the repository owner. It explains what the merge guard does, how to set it up once, how to use it day to day, and what to do when it refuses something or when CI opens a revert PR. It is written for someone who knows GitHub's settings pages but doesn't want to read the code.
 
-- The public repository is `xenofei/Worldwright-Suite`.
+- The public repository is `<owner>/LILITH`. `<owner>` is the `owner` in `dev/merge-guard.toml`.
 - The earlier private repository is renamed to an archive and stays private. Nothing in this guide touches it after the rename.
 - The design is in the spec: rules QA-019, QA-020, QA-033 to QA-036, QA-079, QA-086 and QA-087 in `docs/superpowers/specs/2026-10-12-lilith-design.md`. The settings the tools read are in `dev/merge-guard.toml`, and the protected path patterns are in `dev/protected-paths.txt`.
 
@@ -107,7 +107,7 @@ Do these in order. Steps marked **browser** are done on github.com. The tools ne
    ```
 
    One entry per line: your real e-mail addresses, your real name in the forms it might appear, and your username forms. Matching is case-insensitive and finds the entry anywhere inside a line or path. Blank lines and lines starting with `#` are ignored. Entries shorter than 5 characters work but produce a warning, because they can match random data. The `pre-push` hook refuses every push until this file exists, and the privacy scan refuses to run without it.
-5. **Rename the earlier private repository** (Settings → General → Repository name) to an archive name, so the public repository can use the name `Worldwright-Suite`. Keep it private. Don't use clones of the archive for the new repository: `lil` checks that `origin` points to `github.com/xenofei/Worldwright-Suite` and refuses otherwise.
+5. **Rename the earlier private repository** (Settings → General → Repository name) to an archive name, so the public repository can use the name `LILITH`. Keep it private. Don't use clones of the archive for the new repository: `lil` checks that `origin` points to `github.com/<owner>/LILITH` and refuses otherwise.
 
 ### 2.2 Building the initial commit (PowerShell)
 
@@ -145,7 +145,7 @@ Notes:
 
 Next:
 
-1. If you chose a repository name other than `Worldwright-Suite`, change `repo` in `dev/merge-guard.toml` and `git add` it. With the name `Worldwright-Suite`, nothing changes.
+1. If you chose a repository name other than `LILITH`, change `repo` in `dev/merge-guard.toml` and `git add` it. With the name `LILITH`, nothing changes.
 2. Compare the file lists, modes and object ids with the source. Nothing should be printed (only the `dev/merge-guard.toml` line if you edited it):
 
    ```powershell
@@ -170,11 +170,11 @@ Next:
 
 ### 2.3 Creating and pushing the repository (browser, then PowerShell)
 
-1. **Browser:** create the repository `Worldwright-Suite` under your account (New repository). Make it **Public**, and add no README, licence or `.gitignore`: it must start empty. (If you prefer the command line, `gh repo create xenofei/Worldwright-Suite --public` does the same with your own login.)
+1. **Browser:** create the repository `LILITH` under your account (New repository). Make it **Public**, and add no README, licence or `.gitignore`: it must start empty. (If you prefer the command line, `gh repo create <owner>/LILITH --public` does the same with your own login.)
 2. Push from the export:
 
    ```powershell
-   git remote add origin https://github.com/xenofei/Worldwright-Suite.git
+   git remote add origin https://github.com/<owner>/LILITH.git
    git push -u origin main
    ```
 
@@ -206,14 +206,14 @@ If the check picker offers only checks that have already run in the repository, 
 5. **Allow GitHub Actions to create pull requests: on.** It is the checkbox just below the previous setting. GitHub labels it "Allow GitHub Actions to create and approve pull requests". It is needed so the post-merge check can open a revert PR. A workflow's approval never counts toward the guard, because only the reviewer App's approval does. With it off, the post-merge check still opens the issue, and says it couldn't open the PR. You can set 4 and 5 together with your own login:
 
    ```powershell
-   gh api -X PUT repos/xenofei/Worldwright-Suite/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+   gh api -X PUT repos/<owner>/LILITH/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
    ```
 
    (The `can_approve_pull_request_reviews` field is the same setting as the checkbox. Setting it to `false` would stop revert PRs.)
 6. **The denylist secret.** Settings → Secrets and variables → Actions → **New repository secret**, named `LIL_PRIVACY_DENYLIST`, with the **whole contents** of the denylist file as its value. It must be a repository secret, not an environment secret. From the command line with your own login:
 
    ```powershell
-   Get-Content -Raw "$env:USERPROFILE\.lilith\privacy-denylist.txt" | gh secret set LIL_PRIVACY_DENYLIST --repo xenofei/Worldwright-Suite
+   Get-Content -Raw "$env:USERPROFILE\.lilith\privacy-denylist.txt" | gh secret set LIL_PRIVACY_DENYLIST --repo <owner>/LILITH
    ```
 
    Secrets can't be read back, so keep the file as the master copy. A missing or empty secret makes `privacy-check` and `privacy-check-pr` fail. Pull requests from forks never receive secrets, so they fail those checks by design.
@@ -228,14 +228,14 @@ If the check picker offers only checks that have already run in the repository, 
 The reviewer App is the second identity that approves protected changes. Agents can't act as it.
 
 1. **Browser:** Settings → Developer settings → GitHub Apps → **New GitHub App**.
-   - **Name:** `worldwright-reviewer`. (App names are unique across GitHub. If it's taken, pick another and set `reviewer_app_slug` in `dev/merge-guard.toml` to match, which is a protected change.)
+   - **Name:** `lilith-reviewer`. (App names are unique across GitHub. If it's taken, pick another and set `reviewer_app_slug` in `dev/merge-guard.toml` to match, which is a protected change.)
    - **Homepage URL:** any URL, for example the repository's.
    - **Webhook:** turn **Active** off.
    - **Repository permissions:** **Pull requests: Read and write**, **Contents: Read-only**, **Actions: Read and write**. (Metadata read-only is added automatically.) Nothing else. Actions write is there so that an approval re-runs the guard check: `protected-test-check` runs only on pull request events, so its run for a commit happened before your approval and failed. Right after posting the approval, `lil dev approve` asks GitHub to re-run that run; the re-run reads the reviews again and passes. The App uses this permission for nothing else.
    - **Where can this GitHub App be installed?** **Only on this account**.
    - Create the App.
 2. On the App's settings page, note the **App id** (a number). Under Private keys, **Generate a private key**. A `.pem` file downloads.
-3. **Install the App** (the App's Install App page): choose your account, **Only select repositories**, and pick `Worldwright-Suite`. After installing, the address of the installation's page ends in the **installation id** (a number, `.../settings/installations/<number>`). Note it.
+3. **Install the App** (the App's Install App page): choose your account, **Only select repositories**, and pick `LILITH`. After installing, the address of the installation's page ends in the **installation id** (a number, `.../settings/installations/<number>`). Note it.
 4. **Run `lil dev reviewer-setup`** from **PowerShell or Windows Terminal**, not from mintty (Git Bash's default terminal), where the hidden passphrase input can hang. Run it in a checkout where `lil` was built (the export, or the fresh clone from 2.6):
 
    ```powershell
@@ -247,16 +247,24 @@ The reviewer App is the second identity that approves protected changes. Agents 
 
 **If the App was created before it needed Actions write** (it then has only Pull requests and Contents), add the permission once. Nothing on your PC changes: the key, the App id and the installation id stay the same.
 
-1. **Browser, the App's settings:** Settings → Developer settings → GitHub Apps → `worldwright-reviewer` → **Edit** (or the equivalent current location) → **Permissions & events** → **Repository permissions** → **Actions** → **Read and write** → **Save changes** at the bottom of the page.
-2. **Browser, the installation:** the installation must accept the new permission before it applies. Open the installation's page (Settings → Applications → Installed GitHub Apps → `worldwright-reviewer` → **Configure**; its address ends in the installation id). A **Review request** banner at the top says the App asks for new permissions. Click it, check that the only addition is Actions read and write, and **Accept new permissions**.
+1. **Browser, the App's settings:** Settings → Developer settings → GitHub Apps → `lilith-reviewer` → **Edit** (or the equivalent current location) → **Permissions & events** → **Repository permissions** → **Actions** → **Read and write** → **Save changes** at the bottom of the page.
+2. **Browser, the installation:** the installation must accept the new permission before it applies. Open the installation's page (Settings → Applications → Installed GitHub Apps → `lilith-reviewer` → **Configure**; its address ends in the installation id). A **Review request** banner at the top says the App asks for new permissions. Click it, check that the only addition is Actions read and write, and **Accept new permissions**.
 
 Until the installation accepts, `lil dev approve` still posts approvals, then prints the warning described in section 3 ("the reviewer app's installation hasn't granted Actions: Read and write") and you re-run the check by hand.
+
+**Renaming the App.** `dev/merge-guard.toml` can name the App twice: `reviewer_app_slug`, the slug it has now, and the optional `reviewer_app_slug_next`, the slug it gets after a rename (`lilith-reviewer`). While both are set:
+
+- An approval counts from either App login (`<slug>[bot]`) and from no other account, a person's included. The latest review on the commit under either login decides, so a later dismissal under one login cancels an approval under the other.
+- `lil dev approve` asks GitHub which App the key belongs to (`GET /app`, signed with the App's own key) before it asks for a token. It prints `reviewer App slug: <slug>` and refuses, approving nothing, when that slug is neither of the two.
+- Settings without `reviewer_app_slug_next` still work. A `lil` built before the key existed refuses settings that have it, so update every checkout to the new `main` before its next push.
+
+Once the rename is done and `lil dev approve` has printed the live slug, set `reviewer_app_slug` to it and remove `reviewer_app_slug_next` (a protected change).
 
 ### 2.6 Creating the agent token (browser, then PowerShell)
 
 1. **Browser:** Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token.
    - **Resource owner:** your account.
-   - **Repository access:** only select repositories → `Worldwright-Suite` only.
+   - **Repository access:** only select repositories → `LILITH` only.
    - **Repository permissions:**
 
      | Permission | Access |
@@ -273,7 +281,7 @@ Until the installation accepts, `lil dev approve` still posts approvals, then pr
 2. Make a **fresh clone** of the public repository. It becomes the agents' working folder:
 
    ```powershell
-   git clone https://github.com/xenofei/Worldwright-Suite.git <work folder>
+   git clone https://github.com/<owner>/LILITH.git <work folder>
    Set-Location <work folder>
    git config user.email "<id>+<login>@users.noreply.github.com"
    ```
@@ -351,7 +359,7 @@ You only act when an agent asks for approval of a protected change:
    cargo run -q -p lil-cli -- dev approve <PR>
    ```
 
-   It prints the commit and the protected changes, then asks `(y/N)`. If you answer `y`, it asks for the reviewer key's passphrase, then posts one approving review from the App, pinned to that exact commit. It needs a GitHub token to read the PR, so run it where the agent token is stored (`lil dev agent-token status`), and the key file from 2.5 has to be on that PC.
+   It prints the commit and the protected changes, then asks `(y/N)`. If you answer `y`, it asks for the reviewer key's passphrase, prints the App's live slug (`reviewer App slug: ...`; see "Renaming the App" in section 2.5), then posts one approving review from the App, pinned to that exact commit. It needs a GitHub token to read the PR, so run it where the agent token is stored (`lil dev agent-token status`), and the key file from 2.5 has to be on that PC.
 3. Right after posting, `lil dev approve` asks GitHub to re-run every red `protected-test-check` run of this PR for that commit and says so ("Asked GitHub to re-run protected-test-check (workflow runs ...)"). It only touches this PR's runs from this repository, never a fork's, and never runs waiting for a maintainer's approval (`action_required`). If a run is still going, it first waits for it to finish, for up to a minute. The re-runs see your approval and turn green within a few minutes. If the check had already passed, it says so and re-runs nothing. The agent then runs `lil dev merge <PR>`.
 
    If it prints **"Approval posted, but the guard check is still running; it will most likely read your approval when it finishes. If it ends red, re-run it: ..."**, a run was still going after the minute. GitHub re-runs only finished runs, so `lil` leaves it alone. Usually it reads your approval and ends green. If it ends red, re-run it as below.
@@ -498,11 +506,11 @@ The dry runs, each with the expected outcome:
 
 | Date | Check | URL | Outcome |
 | --- | --- | --- | --- |
-| 2026-10-15 | 1. Protected change refused, approved, merged | https://github.com/xenofei/Worldwright-Suite/pull/1 | `lil dev merge` refused until the App approved the exact head; merged after approval. Merge commit author is the no-reply address. |
+| 2026-10-15 | 1. Protected change refused, approved, merged | https://github.com/<owner>/LILITH/pull/1 | `lil dev merge` refused until the App approved the exact head; merged after approval. Merge commit author is the no-reply address. |
 | 2026-10-15 | 1. (draft variant) | — | Not run yet. |
-| 2026-10-15 | 2. Stale approval refused | https://github.com/xenofei/Worldwright-Suite/pull/1 | A push after the approval made `lil dev merge` refuse ("hasn't approved this exact commit"); re-approved and merged. |
+| 2026-10-15 | 2. Stale approval refused | https://github.com/<owner>/LILITH/pull/1 | A push after the approval made `lil dev merge` refuse ("hasn't approved this exact commit"); re-approved and merged. |
 | 2026-10-15 | 3. Privacy dry run | — (nothing reached GitHub) | `pre-push` refused a commit with a non-placeholder profile path; the finding was masked. Run against the first instance of this repository, before it was recreated. |
 | 2026-10-15 | 4. Agent-token workflow push | — | GitHub rejected a workflow-file push made with the agent token ("without `workflow` scope"). Workflow changes are pushed by the owner. |
-| 2026-10-15 | 5. Post-merge check | https://github.com/xenofei/Worldwright-Suite/actions/workflows/post-merge.yml | Green on `main` after each merge, including the identity check. |
-| 2026-10-15 | Found and fixed | https://github.com/xenofei/Worldwright-Suite/pull/2 | The ruleset refused a merge because an approval-triggered run cancelled the original `protected-test-check`, leaving a cancelled result next to a passing one. Fixed by one guard run per head and `lil dev approve` re-running it; confirmed on https://github.com/xenofei/Worldwright-Suite/pull/3, where the approval re-ran the check automatically. |
+| 2026-10-15 | 5. Post-merge check | https://github.com/<owner>/LILITH/actions/workflows/post-merge.yml | Green on `main` after each merge, including the identity check. |
+| 2026-10-15 | Found and fixed | https://github.com/<owner>/LILITH/pull/2 | The ruleset refused a merge because an approval-triggered run cancelled the original `protected-test-check`, leaving a cancelled result next to a passing one. Fixed by one guard run per head and `lil dev approve` re-running it; confirmed on https://github.com/<owner>/LILITH/pull/3, where the approval re-ran the check automatically. |
 | 2026-10-15 | Found and fixed | — | A GitHub-created merge commit used the account's web e-mail before "Keep my email addresses private" was in effect. The repository was recreated from a clean commit, and the post-merge identity check was added so this is flagged automatically. |

@@ -1,7 +1,8 @@
 //! `lil dev reviewer-setup` and `lil dev approve` (QA-020 as amended).
 //!
 //! Changes to protected files merge only with an APPROVED review from the reviewer GitHub App
-//! (`worldwright-reviewer`) on the PR's exact head commit. This module is the only thing that
+//! (`reviewer_app_slug` in `dev/merge-guard.toml`, or `reviewer_app_slug_next` while the App is
+//! being renamed) on the PR's exact head commit. This module is the only thing that
 //! posts that review, and it does so only for the owner, at a real terminal, after the owner has
 //! read the guard's summary, said yes, and typed the passphrase that unlocks the App's key.
 //! Agents have no terminal, so they can never approve.
@@ -19,7 +20,10 @@
 //! **Approving** ([`approve`]): refuse unless at a terminal; refuse when nothing protected
 //! changed; show the summary and ask "(y/N)"; read the passphrase; decrypt the key (a wrong
 //! passphrase stops here, before any network call); mint a 9-minute RS256 App JWT
-//! ([`app_jwt`]); exchange it for an installation token; re-read the PR and refuse unless it is
+//! ([`app_jwt`]); ask GitHub for the App's live slug with it (`GET /app`), print it, and refuse
+//! unless it is `reviewer_app_slug` or `reviewer_app_slug_next` (plan 2026-10-17, D6), so a key
+//! for any other App approves nothing; exchange the JWT for an installation token; re-read the
+//! PR and refuse unless it is
 //! still open, not a draft, into the base branch and at the exact head the summary was computed
 //! for; then post exactly one `APPROVE` review pinned to that head; then re-run the guard check.
 //!
@@ -584,6 +588,10 @@ pub trait Prompt {
     fn confirm(&self, question: &str) -> bool;
     /// Reads one line of ordinary (echoed) input, trimmed.
     fn line(&self, question: &str) -> String;
+    /// Tells the person something (stderr at a terminal).
+    fn say(&self, text: &str) {
+        eprintln!("{text}");
+    }
 }
 
 /// The real terminal: questions go to stderr, answers come from stdin, passphrases are read
@@ -735,6 +743,28 @@ pub fn approve(
     drop(passphrase);
     let jwt = Zeroizing::new(app_jwt(key_file.app_id, &pem, now_unix)?);
     drop(pem);
+    // Which App the key belongs to, as GitHub sees it now (D6): only the two configured slugs
+    // may approve. Asked before any installation token exists.
+    let live = gh.app_slug(&jwt).context(
+        "asking GitHub for the reviewer App's slug (GET /app) failed; nothing was approved",
+    )?;
+    prompt.say(&format!(
+        "reviewer App slug: {}",
+        guard::escape_controls(&live)
+    ));
+    if !cfg.reviewer_slugs().contains(&live.as_str()) {
+        let known = cfg
+            .reviewer_slugs()
+            .iter()
+            .map(|s| format!("`{s}`"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        bail!(
+            "GitHub says the reviewer key belongs to the App `{}`, but {} names {known}; nothing was approved",
+            guard::escape_controls(&live),
+            merge::CONFIG_PATH
+        );
+    }
     let exchange = |scope| {
         tokens
             .exchange(&jwt, key_file.installation_id, &cfg.repo, scope)
@@ -1271,9 +1301,8 @@ pub fn run_approve(pr: u64) -> i32 {
     ) {
         Ok(rerun) => {
             println!(
-                "Approved PR #{pr} at {} as {}.",
-                short(&prepared.head),
-                prepared.cfg.reviewer_login()
+                "Approved PR #{pr} at {} as the reviewer App.",
+                short(&prepared.head)
             );
             let ids = |ids: &[u64]| {
                 ids.iter()
@@ -1423,6 +1452,7 @@ mod tests {
         passphrases: RefCell<VecDeque<String>>,
         confirms: RefCell<VecDeque<bool>>,
         asked: RefCell<Vec<String>>,
+        said: RefCell<Vec<String>>,
     }
 
     impl FakePrompt {
@@ -1433,6 +1463,7 @@ mod tests {
                 passphrases: RefCell::default(),
                 confirms: RefCell::default(),
                 asked: RefCell::default(),
+                said: RefCell::default(),
             }
         }
         fn not_a_terminal() -> Self {
@@ -1460,6 +1491,9 @@ mod tests {
         fn asked(&self) -> Vec<String> {
             self.asked.borrow().clone()
         }
+        fn said(&self) -> Vec<String> {
+            self.said.borrow().clone()
+        }
     }
 
     impl Prompt for FakePrompt {
@@ -1486,6 +1520,9 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .expect("unexpected line prompt")
+        }
+        fn say(&self, text: &str) {
+            self.said.borrow_mut().push(text.to_string());
         }
     }
 
@@ -1608,7 +1645,7 @@ mod tests {
             status: status.into(),
             conclusion: conclusion.map(str::to_owned),
             path: GUARD_WORKFLOW_PATH.into(),
-            head_repo: "xenofei/Worldwright-Suite".into(),
+            head_repo: "xenofei/LILITH".into(),
             pr_numbers: vec![PR],
         }
     }
@@ -1635,8 +1672,8 @@ mod tests {
         }
     }
 
-    const CHECKS_URL: &str = "https://github.com/xenofei/Worldwright-Suite/pull/42/checks";
-    const RUN_12_URL: &str = "https://github.com/xenofei/Worldwright-Suite/actions/runs/12";
+    const CHECKS_URL: &str = "https://github.com/xenofei/LILITH/pull/42/checks";
+    const RUN_12_URL: &str = "https://github.com/xenofei/LILITH/actions/runs/12";
     const WARNING_START: &str =
         "Approval posted, but the guard check couldn't be re-run automatically (";
 
@@ -1771,15 +1808,12 @@ mod tests {
         assert_eq!(calls[0].1, 456);
         assert_eq!(claims(&calls[0].0).1["iss"], "123");
         // Scoped to the configured repo, and revoked after the post.
-        assert_eq!(
-            *exchange.repos.borrow(),
-            vec!["Worldwright-Suite".to_string()]
-        );
+        assert_eq!(*exchange.repos.borrow(), vec!["LILITH".to_string()]);
         assert_eq!(*exchange.revoked.borrow(), vec![TOKEN.to_string()]);
 
         // The merge guard now counts it.
         let reviews = fake.reviews(PR).unwrap();
-        assert!(app_approved(&reviews, &cfg().reviewer_login(), HEAD));
+        assert!(app_approved(&reviews, &cfg().reviewer_logins(), HEAD));
     }
 
     #[test]
@@ -1982,7 +2016,7 @@ mod tests {
     // ---- reviewer-setup ------------------------------------------------------------------------
 
     fn write_pem(dir: &Path, pem: &[u8]) -> PathBuf {
-        let p = dir.join("worldwright-reviewer.2026-10-13.private-key.pem");
+        let p = dir.join("lilith-reviewer.2026-10-13.private-key.pem");
         std::fs::write(&p, pem).unwrap();
         p
     }
@@ -2199,23 +2233,22 @@ mod tests {
     #[test]
     fn token_exchange_request_and_response() {
         // R40: the token can post the review and re-run the guard check, in this repo only.
-        let (m, path, body) =
-            build_token_request(456, "Worldwright-Suite", TokenScope::ReviewAndRerun);
+        let (m, path, body) = build_token_request(456, "LILITH", TokenScope::ReviewAndRerun);
         assert_eq!(m, reqwest::Method::POST);
         assert_eq!(path, "/app/installations/456/access_tokens");
         assert_eq!(
             body,
             serde_json::json!({
-                "repositories": ["Worldwright-Suite"],
+                "repositories": ["LILITH"],
                 "permissions": {"pull_requests": "write", "actions": "write"}
             })
         );
         // The fallback for an installation that hasn't granted Actions write yet.
-        let (_, _, body) = build_token_request(456, "Worldwright-Suite", TokenScope::ReviewOnly);
+        let (_, _, body) = build_token_request(456, "LILITH", TokenScope::ReviewOnly);
         assert_eq!(
             body,
             serde_json::json!({
-                "repositories": ["Worldwright-Suite"],
+                "repositories": ["LILITH"],
                 "permissions": {"pull_requests": "write"}
             })
         );
@@ -2391,7 +2424,7 @@ mod tests {
             &fake,
             WorkflowRun {
                 pr_numbers: vec![],
-                head_repo: "someone/Worldwright-Suite".into(),
+                head_repo: "someone/LILITH".into(),
                 ..guard_run(14, HEAD, "completed", Some("failure"))
             },
         );
@@ -2449,7 +2482,7 @@ mod tests {
             },
             WorkflowRun {
                 pr_numbers: vec![],
-                head_repo: "someone/Worldwright-Suite".into(),
+                head_repo: "someone/LILITH".into(),
                 ..guard_run(4, HEAD, "completed", Some("failure"))
             },
             WorkflowRun {
@@ -2457,7 +2490,7 @@ mod tests {
                 ..guard_run(6, HEAD, "completed", Some("failure"))
             },
             WorkflowRun {
-                head_repo: "XENOFEI/worldwright-suite".into(),
+                head_repo: "XENOFEI/lilith".into(),
                 pr_numbers: vec![3, PR],
                 ..guard_run(8, HEAD, "in_progress", None)
             },
@@ -2479,14 +2512,109 @@ mod tests {
         let exchange = Exchange::default();
         run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap();
         assert_eq!(*exchange.scopes.borrow(), vec![TokenScope::ReviewAndRerun]);
-        assert_eq!(
-            *exchange.repos.borrow(),
-            vec!["Worldwright-Suite".to_string()]
-        );
+        assert_eq!(*exchange.repos.borrow(), vec!["LILITH".to_string()]);
         assert_eq!(
             TokenScope::ReviewAndRerun.permissions(),
             serde_json::json!({"pull_requests": "write", "actions": "write"})
         );
+    }
+
+    // ---- PR-C: the App's live slug (plan 2026-10-17, D6) ----------------------------------------
+
+    #[test] // spec: QA-020
+    fn approve_prints_the_live_slug() {
+        for live in ["worldwright-reviewer", "lilith-reviewer"] {
+            let fake = pr_with_guard_run();
+            fake.set_app_slug(live);
+            let exchange = Exchange {
+                on_exchange: Some(Box::new(|| fake.log_event("exchange"))),
+                ..Exchange::default()
+            };
+            let prompt = approved();
+            run(&fake, &prompt, &exchange, SUMMARY, HEAD).unwrap();
+            let said = prompt.said();
+            assert!(
+                said.contains(&format!("reviewer App slug: {live}")),
+                "{said:?}"
+            );
+            // Asked once, with the App's JWT, before the token exchange.
+            let jwts = fake.app_jwts();
+            assert_eq!(jwts.len(), 1, "{jwts:?}");
+            assert_eq!(claims(&jwts[0]).1["iss"], "123");
+            assert_eq!(fake.events()[..2], ["app", "exchange"]);
+            // The approval is posted under the live slug, and the merge guard counts it.
+            let reviews = fake.reviews(PR).unwrap();
+            assert_eq!(reviews.last().unwrap().login, format!("{live}[bot]"));
+            assert!(app_approved(&reviews, &cfg().reviewer_logins(), HEAD));
+        }
+    }
+
+    #[test] // spec: QA-020
+    fn approve_refuses_a_live_slug_that_is_neither() {
+        for live in [
+            "github-actions",
+            "lilith-reviewer-next",
+            "Lilith-Reviewer",
+            "worldwright-reviewer[bot]",
+            "lilith-reviewer\u{1b}[2J",
+        ] {
+            let fake = pr_with_guard_run();
+            fake.set_app_slug(live);
+            let exchange = Exchange::default();
+            let prompt = approved();
+            let e = err_text(run(&fake, &prompt, &exchange, SUMMARY, HEAD));
+            assert!(e.contains("nothing was approved"), "{e}");
+            assert!(e.contains("`worldwright-reviewer`"), "{e}");
+            assert!(e.contains("`lilith-reviewer`"), "{e}");
+            assert!(!e.contains('\u{1b}'), "{e}");
+            // The slug GitHub reported is still shown, escaped.
+            let said = prompt.said();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(said[0].starts_with("reviewer App slug: "), "{said:?}");
+            assert!(!said[0].contains('\u{1b}'), "{said:?}");
+            // Nothing past the question: no token, no review, no re-run.
+            assert!(exchange.calls.borrow().is_empty(), "token exchange ran");
+            assert!(fake.posted_reviews().is_empty());
+            assert!(fake.reruns().is_empty());
+        }
+
+        // Settings without the next slug refuse the next slug.
+        let only_current = MergeGuardConfig {
+            reviewer_app_slug_next: None,
+            ..cfg()
+        };
+        let fake = pr_with_guard_run();
+        fake.set_app_slug("lilith-reviewer");
+        let exchange = Exchange::default();
+        let e = format!(
+            "{:#}",
+            approve(
+                PR,
+                &only_current,
+                &fake,
+                &approved(),
+                &key_file(),
+                &exchange,
+                SUMMARY,
+                NOW,
+                HEAD,
+                &|_| panic!("approve paused")
+            )
+            .expect_err("the next slug isn't in these settings")
+        );
+        assert!(e.contains("nothing was approved"), "{e}");
+        assert!(exchange.calls.borrow().is_empty());
+        assert!(fake.posted_reviews().is_empty());
+
+        // GitHub not answering GET /app refuses too: the slug is never assumed.
+        let fake = pr_with_guard_run();
+        fake.fail_app_slug("HTTP 401: A JSON web token could not be decoded");
+        let exchange = Exchange::default();
+        let e = err_text(run(&fake, &approved(), &exchange, SUMMARY, HEAD));
+        assert!(e.contains("nothing was approved"), "{e}");
+        assert!(e.contains("401"), "{e}");
+        assert!(exchange.calls.borrow().is_empty());
+        assert!(fake.posted_reviews().is_empty());
     }
 
     #[test] // spec: QA-020
@@ -2499,7 +2627,7 @@ mod tests {
         run(&fake, &approved(), &exchange, SUMMARY, HEAD).unwrap();
         assert_eq!(
             fake.events(),
-            ["post_review", "workflow_runs", "rerun 12", "revoke"]
+            ["app", "post_review", "workflow_runs", "rerun 12", "revoke"]
         );
     }
 
@@ -2518,7 +2646,7 @@ mod tests {
             &fake,
             WorkflowRun {
                 pr_numbers: vec![],
-                head_repo: "someone/Worldwright-Suite".into(),
+                head_repo: "someone/LILITH".into(),
                 ..guard_run(14, HEAD, "completed", Some("failure"))
             },
         );
@@ -2914,6 +3042,9 @@ mod tests {
             }
             self.fake.rerun_as_app(run_id, token)
         }
+        fn app_slug(&self, jwt: &str) -> Result<String> {
+            self.fake.app_slug(jwt)
+        }
     }
 
     #[test] // spec: QA-020
@@ -3087,6 +3218,9 @@ mod tests {
         }
         fn rerun_as_app(&self, run_id: u64, token: &str) -> Result<()> {
             self.0.rerun_as_app(run_id, token)
+        }
+        fn app_slug(&self, jwt: &str) -> Result<String> {
+            self.0.app_slug(jwt)
         }
     }
 

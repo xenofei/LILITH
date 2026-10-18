@@ -445,8 +445,8 @@ const PRIVATE_PATHS: &[&str] = &[
 
 /// Paths no Read or Edit deny rule may cover.
 const ORDINARY_PATHS: &[&str] = &[
-    r"C:\Users\Fake\Desktop\Worldwright-Suite\README.md",
-    r"C:\Users\Fake\Desktop\Worldwright-Suite\docs\dev\merge-guard.md",
+    r"C:\Users\Fake\Desktop\LILITH\docs\dev\merge-guard.md",
+    r"C:\Users\Fake\Desktop\LILITH\dev\merge-guard.toml",
     r"C:\Users\Fake\notes\worldwright.txt",
     r"C:\Users\Fake\.worldwright-old\notes.txt",
     r"C:\Users\Fake\Desktop\LILITH\README.md",

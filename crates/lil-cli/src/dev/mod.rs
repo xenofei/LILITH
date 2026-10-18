@@ -99,7 +99,7 @@ pub enum DevCommand {
     ///      have all passed on that exact commit. A check that is missing, still
     ///      running or failed means no merge.
     ///   2. Protected files are approved: if the PR changes any protected file, the
-    ///      reviewer app (worldwright-reviewer) has approved that exact commit. A human
+    ///      reviewer app (named in dev/merge-guard.toml) has approved that exact commit. A human
     ///      approval, or an approval of an older commit, doesn't count.
     ///   3. The merge is pinned: GitHub is asked to merge only that checked commit, so
     ///      a push after the checks makes the merge fail instead of slipping in.
