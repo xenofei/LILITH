@@ -783,6 +783,38 @@ fn remove_empty_outside(path: &Path) {
     std::fs::remove_dir(path).unwrap();
 }
 
+/// The long form doesn't see through a junction, so the trash checks every folder on the way
+/// for links, as a write does: a junction to a sealed version folder, to `.lilith\` or to
+/// `.git\` never lets a file there be moved, and nothing moves (Task 3 review fix round 1).
+#[tokio::test(start_paused = true)] // spec: ARCH-002, ARCH-058, CORE-026
+async fn trash_refuses_a_path_through_a_linked_folder() {
+    let ws = workspace();
+    let store = ws.store();
+    sealed_version(&ws, &store).await;
+    write_file(&ws.file("notes/other.txt"), b"o");
+    write_file(&ws.file(".lilith/keep.txt"), b"keep");
+    write_file(&ws.file(".git/config"), b"[core]\n");
+    let sealed = format!("{ASSET}/v1.0.0/a.png");
+    junction(&ws.file("notes/j"), &ws.file(&format!("{ASSET}/v1.0.0")));
+    junction(&ws.file("notes/k"), &ws.file(".lilith"));
+    junction(&ws.file("notes/g"), &ws.file(".git"));
+    for (rel, target) in [
+        ("notes/j/a.png", sealed.as_str()),
+        ("notes/k/keep.txt", ".lilith/keep.txt"),
+        ("notes/g/config", ".git/config"),
+    ] {
+        let bytes = ws.read(target);
+        let refused = store.trash(&p(rel), "test").await;
+        assert!(
+            matches!(&refused, Err(StoreError::PathInvalid { why, .. }) if why.contains("link")),
+            "{rel}: {refused:?}"
+        );
+        assert_eq!(ws.read(target), bytes, "{rel} moved {target}");
+    }
+    assert!(read_only(&ws.file(&sealed)));
+    assert!(store.trash_list().await.unwrap().is_empty());
+}
+
 #[tokio::test(start_paused = true)] // spec: ARCH-002, ARCH-058
 async fn restore_refuses_a_linked_folder_on_the_way() {
     let ws = workspace();

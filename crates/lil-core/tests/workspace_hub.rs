@@ -556,7 +556,7 @@ fn core_lock_cannot_be_deleted_or_renamed_while_held() {
     let env = TestEnv::new();
     let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
     fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
-    let held = take_core_locks(&ws.path)
+    let held = take_core_locks(&ws.path, &SystemProbe)
         .expect("the locks open")
         .expect("both locks are free");
 
@@ -581,11 +581,103 @@ fn core_lock_cannot_be_deleted_or_renamed_while_held() {
     }
     // A second core opens both files and finds the lock held.
     assert!(
-        take_core_locks(&ws.path).expect("the locks open").is_none(),
+        take_core_locks(&ws.path, &SystemProbe)
+            .expect("the locks open")
+            .is_none(),
         "a second core took the locks"
     );
     drop(held);
-    assert!(take_core_locks(&ws.path).unwrap().is_some());
+    assert!(take_core_locks(&ws.path, &SystemProbe).unwrap().is_some());
+}
+
+/// Opens `path` the way another program can: with `DELETE` access and every share mode.
+#[allow(clippy::disallowed_methods)]
+fn open_with_delete_access(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(0x7) // read, write and delete
+        .open(path)
+        .expect("the outside handle")
+}
+
+/// A handle elsewhere with delete access makes the lock open fail with error 32 (the lock is
+/// opened without delete sharing). That counts as held elsewhere: the workspace opens
+/// read-only, never `store.io`, and the other lock isn't kept.
+#[test] // spec: ARCH-028
+fn delete_access_held_elsewhere_makes_the_open_read_only() {
+    use lil_core::workspace::take_core_locks;
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    // Both lock files exist (an earlier open made them).
+    drop(take_core_locks(&ws.path, &SystemProbe).unwrap().unwrap());
+    let rt = runtime();
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+    for path in [core_lock(&ws), legacy_lock(&ws)] {
+        let outside = open_with_delete_access(&path);
+        assert!(
+            take_core_locks(&ws.path, &SystemProbe)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()))
+                .is_none(),
+            "{}",
+            path.display()
+        );
+        let open = rt
+            .block_on(hub.open(&ws))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
+        assert_eq!(open.access, Access::ReadOnly, "{}", path.display());
+        drop(open);
+        rt.block_on(hub.close(&ws.id));
+        drop(outside);
+    }
+    assert!(take_core_locks(&ws.path, &SystemProbe).unwrap().is_some());
+}
+
+/// The real probe, except that `identity` of `fail_at` is access denied (error 5).
+#[derive(Debug)]
+struct FailingAt {
+    fail_at: PathBuf,
+}
+
+impl lil_platform::fs::Probe for FailingAt {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        if path == self.fail_at {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+}
+
+/// D4 fails closed: when whether the legacy folder exists can't be read (here access
+/// denied), the open is never read-write, and the new lock isn't kept.
+#[test] // spec: ARCH-028
+fn unreadable_legacy_folder_makes_the_open_read_only() {
+    use lil_core::workspace::take_core_locks;
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let probe = FailingAt {
+        fail_at: ws.path.join(LEGACY_WORKSPACE_DIR),
+    };
+    let taken = take_core_locks(&ws.path, &probe).expect("not an open error");
+    assert!(
+        taken.is_none(),
+        "an unreadable legacy folder gave read-write"
+    );
+    assert!(lock_is_free(&ws), "the new lock was kept");
+    assert!(take_core_locks(&ws.path, &SystemProbe).unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1688,12 +1688,13 @@ impl Store {
 
     /// The trash's reserved-path check ([`reserved_on_disk`]) on `rel` and on its long form
     /// through `probe.long_form`: the trash itself, either workspace data folder, `.git` and
-    /// the ledger are refused by any name, 8.3 short names included (fail closed).
+    /// the ledger are refused by any name, 8.3 short names included (fail closed). Returns the
+    /// long form, so the caller checks it with [`writable`] without resolving it again.
     pub(super) async fn reserved_on_disk(
         &self,
         rel: &WsPath,
         what: &'static str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<WsPath, StoreError> {
         let (root, owned, probe) = (self.root.clone(), rel.clone(), self.probe.clone());
         blocking(move || {
             Ok(reserved_on_disk(&root, &owned, what, &|p| {

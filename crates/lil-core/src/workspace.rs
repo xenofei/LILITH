@@ -262,6 +262,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The lock file's name in a workspace data folder (ARCH-028).
 pub const CORE_LOCK: &str = "core.lock";
 
+/// `FILE_ATTRIBUTE_DIRECTORY`.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
 /// The workspace locks a read-write core holds (D4): `.lilith\core.lock`, and the legacy
 /// folder's `core.lock` when that folder exists. Dropping it releases both.
 #[derive(Debug)]
@@ -279,19 +282,22 @@ pub struct LockError {
 
 /// Takes the workspace's locks for a read-write open (D4), in this order:
 /// 1. creates `.lilith\` if needed and takes `.lilith\core.lock`; held elsewhere → `None`;
-/// 2. when the legacy workspace data folder exists, takes its `core.lock`, the one a core from
-///    before the rename takes. Held elsewhere → `None`, and the new lock is released at once,
-///    so it doesn't keep a later core from serving once the other holder is gone.
+/// 2. when the legacy workspace data folder exists (`probe.identity`), takes its `core.lock`,
+///    the one a core from before the rename takes. Held elsewhere → `None`, and the new lock is
+///    released at once, so it doesn't keep a later core from serving once the other holder is
+///    gone. When whether that folder exists can't be read (any error but a missing path), also
+///    `None`: never read-write without knowing (fail closed).
 ///
 /// `Some` only when every lock is held: only then may the core write. The legacy folder is
 /// never created; its lock file is created if missing, the one write under the old name
 /// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other. Each
 /// lock file is held open without delete sharing (`try_lock_exclusive`), so while it is held
-/// it can't be deleted or renamed away and a second core always finds the held lock.
+/// it can't be deleted or renamed away and a second core always finds the held lock. A lock
+/// file another program holds open with delete access (error 32) counts as held elsewhere.
 ///
 /// # Errors
 /// A lock file that can't be opened, with its workspace-relative path.
-pub fn take_core_locks(root: &Path) -> Result<Option<CoreLocks>, LockError> {
+pub fn take_core_locks(root: &Path, probe: &dyn Probe) -> Result<Option<CoreLocks>, LockError> {
     let take = |dir: &str| {
         let fail = |error| LockError {
             file: Path::new(dir).join(CORE_LOCK),
@@ -306,7 +312,26 @@ pub fn take_core_locks(root: &Path) -> Result<Option<CoreLocks>, LockError> {
     let Some(new) = take(WORKSPACE_DIR)? else {
         return Ok(None);
     };
-    let legacy = if root.join(LEGACY_WORKSPACE_DIR).is_dir() {
+    // Whether the legacy folder is there, by `probe.identity` (attributes only). Only a missing
+    // one means no legacy lock; any other error is never read-write (fail closed), and the new
+    // lock goes as it does when the legacy one is held.
+    let legacy_dir = root.join(LEGACY_WORKSPACE_DIR);
+    let legacy_is_folder = match probe.identity(&legacy_dir) {
+        Ok(id) => id.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            false
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %root.display(), error = %e, "whether the legacy workspace data folder exists can't be read; the workspace is served read-only");
+            return Ok(None);
+        }
+    };
+    let legacy = if legacy_is_folder {
         match take(LEGACY_WORKSPACE_DIR)? {
             Some(held) => Some(held),
             None => return Ok(None),
@@ -503,7 +528,8 @@ impl WorkspaceHub {
         check_workspace(&ws.path);
         // 2. Both locks (D4) before anything else: the access follows from holding both.
         let root = ws.path.clone();
-        let taken = tokio::task::spawn_blocking(move || take_core_locks(&root))
+        let probe = self.probe.clone();
+        let taken = tokio::task::spawn_blocking(move || take_core_locks(&root, probe.as_ref()))
             .await
             .unwrap_or_else(|e| {
                 Err(LockError {

@@ -22,7 +22,8 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{
-    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION, HANDLE,
+    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION,
+    ERROR_SHARING_VIOLATION, HANDLE,
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_SYNC_ROOT_BASIC_INFO, CF_SYNC_ROOT_INFO_BASIC, CfGetSyncRootInfoByPath,
@@ -258,15 +259,17 @@ pub fn long_name(path: &Path) -> io::Result<PathBuf> {
 
 /// `path` with every 8.3 short component of its longest existing prefix expanded by
 /// `long_name` ([`long_name`], or a [`Probe`]'s), and the rest appended as given: a name that
-/// doesn't exist has no short form. Only a missing component (`NotFound`, or `NotADirectory`
-/// below a file) moves the walk up a level; any other error is returned, so a check built on
-/// this fails closed.
+/// doesn't exist has no short form. The walk up finds that prefix through `identity`
+/// ([`identity`], or a [`Probe`]'s, so a fake can inject errors). Only a missing component
+/// (`NotFound`, or `NotADirectory` below a file) moves the walk up a level; any other error is
+/// returned, so a check built on this fails closed.
 pub fn long_form(
     path: &Path,
+    identity: &dyn Fn(&Path) -> io::Result<FileIdentity>,
     long_name: &dyn Fn(&Path) -> io::Result<PathBuf>,
 ) -> io::Result<PathBuf> {
     for existing in path.ancestors() {
-        match attributes(existing) {
+        match identity(existing) {
             Ok(_) => {
                 let long = long_name(existing)?;
                 let tail = path.strip_prefix(existing).unwrap_or(Path::new(""));
@@ -668,15 +671,22 @@ impl Drop for LockedFile {
 /// The handle shares read and write but not delete, so while it is open the file can't be
 /// deleted or renamed (error 32): a second core always opens this same file and finds the
 /// lock held, instead of creating a fresh one beside an orphaned handle. That second open
-/// still succeeds, since neither handle asks for delete access.
+/// still succeeds, since neither handle asks for delete access. An open that fails with
+/// error 32 (another program holds the file with delete access, or with no sharing) is
+/// `None` too: someone else has it, so the caller serves read-only.
 pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<LockedFile>> {
-    let file = OpenOptions::new()
+    let opened = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
-        .open(long_path(path))?;
+        .open(long_path(path));
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     Ok(lock_byte(&file, 0)?.then_some(LockedFile { file }))
 }
 
@@ -899,10 +909,10 @@ pub trait Probe: Send + Sync + std::fmt::Debug {
     fn long_name(&self, path: &Path) -> io::Result<PathBuf> {
         long_name(path)
     }
-    /// [`long_form`] with [`Probe::long_name`]: the long form of a path that may not exist
-    /// yet, failing closed on any error but a missing component.
+    /// [`long_form`] with [`Probe::identity`] and [`Probe::long_name`]: the long form of a
+    /// path that may not exist yet, failing closed on any error but a missing component.
     fn long_form(&self, path: &Path) -> io::Result<PathBuf> {
-        long_form(path, &|p| self.long_name(p))
+        long_form(path, &|p| self.identity(p), &|p| self.long_name(p))
     }
     /// [`reparse_tag`]: the reparse tag of a reparse point, read without following it.
     fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {
@@ -1020,6 +1030,60 @@ mod tests {
 
     fn units(p: &Path) -> usize {
         p.as_os_str().encode_wide().count()
+    }
+
+    /// The walk up to the longest existing prefix goes through the `identity` it is given, so a
+    /// probe can inject errors: a missing part (or one below a file) moves the walk up, any
+    /// other error ends it with that error (fail closed) before `long_name` runs.
+    #[test] // spec: CORE-040
+    fn long_form_fails_closed_on_an_error_mid_walk() {
+        let folder = FileIdentity {
+            volume_serial: 1,
+            file_id: None,
+            size: 0,
+            last_write: 0,
+            change_time: None,
+            attributes: 0x10,
+        };
+        let base = Path::new(r"C:\ws");
+        let target = base.join(r"NOTES~1\new\x.txt");
+        let long_name = |p: &Path| -> io::Result<PathBuf> {
+            Ok(PathBuf::from(
+                p.to_string_lossy().replace("NOTES~1", "notes.long"),
+            ))
+        };
+        let with = |missing: &[&str], below_file: &[&str], denied: &[&str]| {
+            let (missing, below_file, denied): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = (
+                missing.iter().map(|m| base.join(m)).collect(),
+                below_file.iter().map(|m| base.join(m)).collect(),
+                denied.iter().map(|m| base.join(m)).collect(),
+            );
+            long_form(
+                &target,
+                &|p: &Path| {
+                    if missing.iter().any(|m| m == p) {
+                        Err(io::Error::from(io::ErrorKind::NotFound))
+                    } else if below_file.iter().any(|m| m == p) {
+                        Err(io::Error::from(io::ErrorKind::NotADirectory))
+                    } else if denied.iter().any(|m| m == p) {
+                        Err(io::Error::from_raw_os_error(5))
+                    } else {
+                        Ok(folder)
+                    }
+                },
+                &long_name,
+            )
+        };
+        let expanded = base.join(r"notes.long\new\x.txt");
+        assert_eq!(with(&[r"NOTES~1\new\x.txt"], &[], &[]).unwrap(), expanded);
+        assert_eq!(
+            with(&[r"NOTES~1\new\x.txt"], &[r"NOTES~1\new"], &[]).unwrap(),
+            expanded
+        );
+        let denied = with(&[r"NOTES~1\new\x.txt"], &[], &[r"NOTES~1\new"]).unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(5), "{denied}");
+        let denied = with(&[r"NOTES~1\new\x.txt", r"NOTES~1\new"], &[], &["NOTES~1"]).unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(5), "{denied}");
     }
 
     #[test] // spec: CORE-040

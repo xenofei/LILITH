@@ -251,16 +251,20 @@ impl Store {
     /// # Errors
     /// `workspace.read_only`; `store.path_invalid` for the trash itself, either workspace data
     /// folder, `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, by any
-    /// name (an 8.3 short name too, or a long form that can't be read), or a link;
+    /// name (an 8.3 short name too, or a long form that can't be read), or a link (also a
+    /// linked folder on the way);
     /// `store.locked` for a path in its manifest's `locks`; `store.git_busy` when git is still
     /// working after 60 s; `store.io` when there is nothing at `rel` or a file call fails
     /// (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
-        self.reserved_on_disk(rel, "moved to the trash").await?;
+        let long = self.reserved_on_disk(rel, "moved to the trash").await?;
         writable(rel)?;
-        self.writable_on_disk(rel).await?;
+        writable(&long)?;
         self.check_locks(rel).await?;
+        // The long form doesn't see through a junction: a linked folder on the way could reach
+        // a sealed folder, `.lilith\` or `.git\`. Attributes only.
+        self.refuse_links(rel).await?;
         self.git_gate().wait_clear(GIT_WAIT).await?;
         self.trash_now(rel, reason).await
     }
@@ -418,10 +422,10 @@ impl Store {
         // The trash's own refusals (by the long name too, so an 8.3 short name is refused like
         // the long one), then a write's, before anything moves; the entry stays as it is. A
         // sealed path is the one exception: it restores, read-only again (CORE-026).
-        self.reserved_on_disk(&rel, "restored to").await?;
+        let long = self.reserved_on_disk(&rel, "restored to").await?;
         if !in_version_folder(&rel) {
             writable(&rel)?;
-            self.writable_on_disk(&rel).await?;
+            writable(&long)?;
         }
         let payload = {
             let dir = entry.dir.join(PAYLOAD);

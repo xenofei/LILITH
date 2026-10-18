@@ -187,21 +187,24 @@ fn refuse_reserved(rel: &WsPath, what: &str) -> Result<(), StoreError> {
 
 /// The trash's reserved-path check ([`refuse_reserved`]) on `rel` as given and on its long form
 /// ([`long_rel`] with `resolve`), so an 8.3 short name (`LILITH~1`, `GIT~1`) is refused like
-/// the long name. A resolver error refuses the path (fail closed).
+/// the long name. A resolver error refuses the path (fail closed). Returns the long form, for
+/// the caller's other checks.
 pub(crate) fn reserved_on_disk(
     root: &Path,
     rel: &WsPath,
     what: &str,
     resolve: &dyn Fn(&Path) -> io::Result<PathBuf>,
-) -> Result<(), StoreError> {
+) -> Result<WsPath, StoreError> {
     refuse_reserved(rel, what)?;
-    refuse_reserved(&long_rel(root, rel, resolve)?, what).map_err(|e| match e {
+    let long = long_rel(root, rel, resolve)?;
+    refuse_reserved(&long, what).map_err(|e| match e {
         StoreError::PathInvalid { why, .. } => StoreError::PathInvalid {
             path: rel.as_str().to_string(),
             why,
         },
         other => other,
-    })
+    })?;
+    Ok(long)
 }
 
 #[cfg(test)]
@@ -318,7 +321,10 @@ mod tests {
             );
         }
         let notes = reserved_on_disk(ws, &WsPath::parse("NOTES~1/x").unwrap(), "moved", &resolve);
-        assert_eq!(notes, Ok(()));
+        assert_eq!(
+            notes.map(|long| long.as_str().to_string()),
+            Ok("notes.lilith/x".to_string())
+        );
         let failing = |_: &Path| -> io::Result<PathBuf> { Err(io::Error::from_raw_os_error(5)) };
         let closed = reserved_on_disk(ws, &WsPath::parse("notes/x").unwrap(), "moved", &failing);
         assert!(
