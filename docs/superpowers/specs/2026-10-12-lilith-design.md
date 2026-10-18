@@ -58,7 +58,7 @@ Every requirement a plan task or test would point at is a bullet with a **stable
 | Workspace | A folder holding projects, assets, registries and logs; versioned with git (+ LFS). |
 | Asset / version / candidate | An asset has sealed, immutable versions (`v<semver>/`). Generation runs produce candidates; signing off seals one as a version. |
 | Proposal | A staged change to a working document (e.g. an inpaint result) that you accept or discard. |
-| Document | A hand-edited working file (e.g. an Image studio canvas) in the LILITH document format: a folder or `.wwdoc`, with content-addressed tiles. |
+| Document | A hand-edited working file (e.g. an Image studio canvas) in the LILITH document format: a folder or `.lildoc`, with content-addressed tiles. |
 | Tool | A typed operation in the core (e.g. `image.generate`) callable by apps, the CLI, MCP clients and the assistant through one dispatcher. |
 | Caller kind | Who is calling a tool — exactly one of `ui:<app>`, `assistant`, `mcp`, `cli` (§1.3); it decides confirmations and permissions. |
 | Effect class | `read`, `write`, `destructive`, `exec`: decides whether an agent's call needs your confirmation. |
@@ -303,7 +303,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 
 **Standalone apps**
 - **ARCH-098** [M1] An app opened from the Start menu or Explorer uses the default workspace from `suite.toml`; with no project chosen, work lands in the `sketchbook` project.
-- **ARCH-099** [M1] No-workspace mode: loose files outside any workspace are read and written by the app itself (documents as `.wwdoc`, §3.5). The core still offers providers and engines but writes no workspace files. Metered calls are allowed, logged to `usage-loose.jsonl` and counted against caps.
+- **ARCH-099** [M1] No-workspace mode: loose files outside any workspace are read and written by the app itself (documents as `.lildoc`, §3.5). The core still offers providers and engines but writes no workspace files. Metered calls are allowed, logged to `usage-loose.jsonl` and counted against caps.
 - **ARCH-100** [M1] If the core is unavailable or the wrong version, the app keeps the open document, keeps autosaving to its recovery file, and disables AI and workspace features with a clear banner. When the core is back, the app re-acquires its document holds, resubscribes from its last `seq` (or reloads snapshots), and saves working documents changed meanwhile with a hash check against the last saved hash (conflict → keep both).
 
 **The `worldwright` plugin for Claude Code**
@@ -416,7 +416,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 | `projects` | Project lifecycle, status views, shared context | M1 |
 | `pipeline` | Asset status machine, sign-off, stage profiles | M1 |
 | `settings` | Settings cascade (workspace → project → request) | M1 |
-| `docs` | LILITH document bundles, `.wwdoc`, holds, document saves, snapshots, garbage collection; checkpoints (M1.5) | M1 |
+| `docs` | LILITH document bundles, `.lildoc`, holds, document saves, snapshots, garbage collection; checkpoints (M1.5) | M1 |
 | `resources` | Libraries (shared typed resources, §3.4) | M1 |
 | `interchange` | App handler registry, `open_in`, `ui.show`, `.lilref` files, Windows notifications, thumbnails | M1 |
 | `meter` | Usage and cost records for every external call; spend summaries; optional caps | M1 |
@@ -489,7 +489,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 - **CORE-041** [M1] (contract) **Index reconcile** compares path + size + mtime + NTFS FileId + ChangeTime. A cold rebuild trusts manifest hashes and verifies them in the background. Hashes are SHA-256 only. (plan 2b clarification: Appendix E) FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders.
 - **CORE-042** [M1] Index rebuild times are benchmarked, and the benchmark is a CI gate. (plan 2b clarification: Appendix E) The budgets (a cold rebuild of 2,000 assets, a warm reconcile of 10,000) are recorded in `test-params.toml`.
 - **CORE-043** [M1] (contract) **Proposal runs** are kept separate from asset candidate runs. They live in `assets/<id>/work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with their recipe and saved inputs. They create no asset version, don't change the asset's status and don't run the QA chain.
-- **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.wwdoc`, open proposals move with the document.
+- **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.lildoc`, open proposals move with the document.
 - **CORE-045** [M1] (contract) Document layers are stored as content-addressed chunks of 8×8 tiles (1024×1024 px) on a signed grid, each with a tile-presence/uniform bitmap header and a hash over the canonical uncompressed bytes (format in §5.2). `docs` garbage collection and snapshot hardlinking work at chunk level.
 - **CORE-046** [M1.5] (contract) Every asset carries a creation UUID (recorded from M1, CORE-047); a sealed version renumbered during multi-machine sync records `renamed_from: {version, machine, content_hash}` in its manifest; references resolve through `renamed_from` (using the content hash they carry, CORE-047), with a warning on a mismatch (§7.3).
 - **CORE-047** [M1] (contract) References to a sealed version — `lil://` refs, `.lilref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill. (plan 2b clarification: Appendix E) The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
@@ -700,7 +700,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 
 ### 2.10 Convert
 
-- **CORE-137** [M1] (decision) The LILITH document (folder or `.wwdoc`, §3.5) is the native layered format. OpenRaster (`.ora`) is import (best effort) and export (lossy, with a warning listing what is lost) only.
+- **CORE-137** [M1] (decision) The LILITH document (folder or `.lildoc`, §3.5) is the native layered format. OpenRaster (`.ora`) is import (best effort) and export (lossy, with a warning listing what is lost) only.
 - **CORE-138** [M1a] PNG, JPEG and WebP (lossless via `image`, lossy via libwebp), with ICC handling via `moxcms`.
 - **CORE-139** [M1b] TIFF (8- and 16-bit) and OpenRaster import/export (hand-rolled on `zip`).
 - **CORE-140** [Later] EXR (`exr`), PSD import out of process (`psd-tools` in the QA venv), KRA, glTF/USD/FBX, WAV/FLAC/OGG.
@@ -773,7 +773,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 
 This section covers what every app is made of, how apps talk to the core, how apps and outside programs exchange work, the LILITH document (the suite's native editable format), and the dashboards. In M1 the dashboards are panels inside the Image studio; a separate Hub app comes later. Usage tracking, optional caps, account info, hardware telemetry and agent safety confirmations are all shown here; nothing in this section filters content or gates work on business rules.
 
-The core modules behind this section are `docs` (document bundles, `.wwdoc`, holds, save handles, snapshots, GC, checkpoints), `resources` (Libraries) and `interchange` (handler registry, `open_in`, `ui.show`, `.lilref`, notifications, thumbnails); see §2.1.
+The core modules behind this section are `docs` (document bundles, `.lildoc`, holds, save handles, snapshots, GC, checkpoints), `resources` (Libraries) and `interchange` (handler registry, `open_in`, `ui.show`, `.lilref`, notifications, thumbnails); see §2.1.
 
 ### 3.1 What every app is made of
 
@@ -805,13 +805,13 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Windows integration**
 
-- **APP-017** [M1a] **Per-user file associations** and "Open with LILITH Image" for PNG, JPEG, WebP and `.wwdoc`, registered under `HKCU\Software\Classes` (no admin). The suite never sets itself as the default; you choose defaults yourself.
+- **APP-017** [M1a] **Per-user file associations** and "Open with LILITH Image" for PNG, JPEG, WebP and `.lildoc`, registered under `HKCU\Software\Classes` (no admin). The suite never sets itself as the default; you choose defaults yourself.
 - **APP-018** [M1b] TIFF and ORA join the file associations when their import and export land (§2.10, §5.11); before that the suite registers no association for a format it can't read.
 - **APP-019** [M1] A file opened from Explorer that lives inside a workspace opens as that asset. Sealed files open read-only, with "Edit → new working document".
 - **APP-020** [M1] (contract) **`lil:` URL protocol:** `lil:open/<ref>`, `lil:confirm/<id>` and `lil:task/<job_id>` (opens a director task in the Assistant panel, APP-050). Arguments are validated as untrusted input. It's used for notification clicks and for links in browsers and Markdown.
 - **APP-021** [M1] **`.lilref` pointer files:** links printed in Claude Code output point to a small `.lilref` file (associated with the suite) in the cache, because Windows Terminal only opens `http`, `https` and `file` links (verified 2026-10-12).
 - **APP-022** [M1] **Notifications:** the suite has a Start-menu identity (AppUserModelID) used for Windows notifications. The core posts notifications through it: job finished, confirmation waiting, cap confirmation waiting, cap alerts, and director-task decisions (APP-050). A notification is drawn by Windows, not by the core, and clicking it is your own input, so the app it launches comes to the front.
-- **APP-023** [Later] Jump Lists; Explorer thumbnails for `.wwdoc` (a small Rust COM thumbnail provider, out of process); an Explorer "Add to LILITH project" context-menu entry.
+- **APP-023** [Later] Jump Lists; Explorer thumbnails for `.lildoc` (a small Rust COM thumbnail provider, out of process); an Explorer "Add to LILITH project" context-menu entry.
 
 ### 3.2 How an app talks to the core
 
@@ -964,7 +964,7 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
   - `thumbnail.png`;
   - `proposals/` — the document's proposal runs (APP-095).
 - **APP-084** [M1] (invariant) Chunk files are immutable: they're written once under their content hash and never modified in place (snapshots hardlink them).
-- **APP-085** [M1] (contract) **Outside a workspace** (loose files, no-workspace mode), the same layout (`doc.json`, `chunks/`, `thumbnail.png`, `proposals/`) is stored as a single uncompressed-zip file, **`.wwdoc`**, which is what file associations and Explorer thumbnails use. "Add to project" unpacks a `.wwdoc` into a workspace folder, and its open proposals move with it.
+- **APP-085** [M1] (contract) **Outside a workspace** (loose files, no-workspace mode), the same layout (`doc.json`, `chunks/`, `thumbnail.png`, `proposals/`) is stored as a single uncompressed-zip file, **`.lildoc`**, which is what file associations and Explorer thumbnails use. "Add to project" unpacks a `.lildoc` into a workspace folder, and its open proposals move with it.
 
 **Three kinds of "staging"** — these names are used consistently across the spec:
 - **store staging handles** — temporary areas `store` issues to engines and converters (`.lilith/staging/`, §2.0);
@@ -991,11 +991,11 @@ The core modules behind this section are `docs` (document bundles, `.wwdoc`, hol
 
 **Proposals**
 
-- **APP-095** [M1] (invariant) **Proposal runs** live in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved and loose documents) and are separate from asset candidate runs: they create no asset versions, change no status and don't run the QA chain. They're kept until accepted or discarded, then for 14 days, and they move with a `.wwdoc` on "Add to project". Anchoring, the staging bar and destinations are in §5.5.
+- **APP-095** [M1] (invariant) **Proposal runs** live in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved and loose documents) and are separate from asset candidate runs: they create no asset versions, change no status and don't run the QA chain. They're kept until accepted or discarded, then for 14 days, and they move with a `.lildoc` on "Add to project". Anchoring, the staging bar and destinations are in §5.5.
 
 **New and existing documents**
 
-- **APP-096** [M1] **New documents** are unsaved (recovery file only) until the first Save, which opens "Save to project" (default `sketchbook`) and creates the asset with status `in_progress`. In no-workspace mode the first Save writes a `.wwdoc`.
+- **APP-096** [M1] **New documents** are unsaved (recovery file only) until the first Save, which opens "Save to project" (default `sketchbook`) and creates the asset with status `in_progress`. In no-workspace mode the first Save writes a `.lildoc`.
 - **APP-097** [M1] **Which document opens:** one primary document per asset per kind; others are listed and can be renamed or discarded (discard = trash).
 - **APP-098** [M1] Editing a candidate seeds a new document from that candidate; editing an approved asset seeds one from its sealed `source/` (APP-100).
 
@@ -1111,8 +1111,8 @@ These are verified in the M0 and M1 benchmarks and reported pass/fail in each mi
 ### 3.8 Milestone scope
 
 - **M0 spike:** frame times and GUI-thread stalls under ComfyUI load (APP-135); pasting into Discord and Chromium (APP-071).
-- **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.wwdoc`; "Add to project"; the `lil:` protocol (including `lil:task/<job_id>`), `.lilref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
-- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.wwdoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
+- **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.lildoc`; "Add to project"; the `lil:` protocol (including `lil:task/<job_id>`), `.lilref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
+- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.lildoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b.
 - **M1.5:** named layout presets; document checkpoints and cross-machine restore (with the S3-compatible store); resolving references through `renamed_from`; the interactive Claude Code token panel.
 - **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; a standalone Prompt Studio app; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
 
@@ -1448,7 +1448,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
 
 - **AI-159** [M1a] (contract) **A brief is a project asset** of type `prompt_brief` (module `direction`, asset ids `brf_<slug>`), with the normal manifest, versions and sign-off (§2.3–2.4). Its primary file is `brief.json`, and `transcript.jsonl` is a declared companion (AI-165). A brief's working copy is a **draft**, which lives in one of three places:
   - **asset draft:** in the brief asset's `work/` folder (`work/draft/brief.json`), written by `store`. Like documents, it is machine-local and gitignored (APP-088);
-  - **document-held draft:** "Improve this prompt → Use this" on a box that isn't linked to a brief yet (APP-152) keeps the draft with the document: in `work/<doc_id>/briefs/<draft_id>.json`, or inside the `.wwdoc`. It is not an asset. It becomes a `prompt_brief` asset on "Save as brief", or the first time it becomes a recipe input (AI-160);
+  - **document-held draft:** "Improve this prompt → Use this" on a box that isn't linked to a brief yet (APP-152) keeps the draft with the document: in `work/<doc_id>/briefs/<draft_id>.json`, or inside the `.lildoc`. It is not an asset. It becomes a `prompt_brief` asset on "Save as brief", or the first time it becomes a recipe input (AI-160);
   - **session draft:** during an interview, before `brief.create` or "Use this", the draft lives in the interview session (AI-165).
   - `brief.update` carries the draft's expected hash. When two surfaces, or a surface and an agent, edit at once, the later write gets `store.hash_conflict` instead of overwriting the other.
   - In no-workspace mode a brief stays a document-held or session draft, and recipes record only its content hash.
@@ -1806,7 +1806,7 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 - **IMG-021** [M1a] Tools act on the selected layer's kind (painting on a mask paints the mask).
 - **IMG-022** [M1a] The **selection** is an 8-bit mask, not a layer. Operations: rectangle, ellipse, lasso, polygon, select object (AI), add/subtract/intersect, feather, grow/shrink, invert, **refine edge** (BiRefNet within the selection's bounding box, for crisp AI masks at high resolution), and conversion selection ↔ inpaint mask / layer mask.
 - **IMG-023** [M1a] (contract) Raster layers are stored as 8-bit sRGB + alpha and masks as 8-bit. The tile type is designed so 16-bit half-float linear can be added later without a format change.
-- **IMG-024** [M1a] (contract) On disk (inside the document folder or `.wwdoc`), layers are stored as **content-addressed chunks of 8×8 tiles (1024×1024 px)** on a signed grid, so outpainting can grow left and up. Each chunk has a header with a tile-presence/uniform bitmap (empty and single-colour tiles aren't stored) followed by zstd-compressed raw RGBA8 (raster) or R8 (mask) data. Chunk files are named by their content hash in the document's layer chunk store (§3.5), and `doc.json` maps each layer's chunk coordinates to chunk hashes.
+- **IMG-024** [M1a] (contract) On disk (inside the document folder or `.lildoc`), layers are stored as **content-addressed chunks of 8×8 tiles (1024×1024 px)** on a signed grid, so outpainting can grow left and up. Each chunk has a header with a tile-presence/uniform bitmap (empty and single-colour tiles aren't stored) followed by zstd-compressed raw RGBA8 (raster) or R8 (mask) data. Chunk files are named by their content hash in the document's layer chunk store (§3.5), and `doc.json` maps each layer's chunk coordinates to chunk hashes.
   - A brush dab rewrites one chunk (≤ 4 MiB raw, ~1 MB compressed). An 8K (7680×4320) layer is ~40 chunks instead of ~2,000 tile files.
 - **IMG-025** [M1a] (invariant) A chunk's content hash is computed over its **canonical uncompressed** bytes, so recompressing (or a zstd version change) never changes its identity.
 - **IMG-026** [M1a] (invariant) Chunk files are never modified in place; a changed chunk is a new file. Snapshots (§3.5) hardlink chunks, so this keeps snapshots intact and dedupes them at chunk level.
@@ -1908,7 +1908,7 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 - **IMG-081** [M1a] **Anchoring:** a run records its frame rectangle and the version of every tile under that rectangle at submit time — enough to warn "this area changed since you generated" on accept, with the choice *accept on top*, *accept into a new layer group* or *discard*. No snapshot is written at submit time.
 - **IMG-082** [M1a] Runs stay until accepted or discarded, then for 14 days; "Discard all" clears them.
 - **IMG-083** [M1a] (invariant) Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots, and discarding a proposal after accepting it never loses the accepted pixels.
-- **IMG-084** [M1a] On "Add to project" from a `.wwdoc` (§3.5), open proposals move with the document.
+- **IMG-084** [M1a] On "Add to project" from a `.lildoc` (§3.5), open proposals move with the document.
 - **IMG-085** [M1a] The Generate panel has a **destination**: *Proposals* (default), *Asset* or *Both*. Asset candidate runs (§2.3, with QA and sign-off) are created only by "Make candidate" or when the destination is *Asset* or *Both*; choosing *Asset* on an unsaved document opens "Save to project" first.
 - **IMG-086** [M1a] The **staging bar** has a thumbnail strip, ← / →, an A/B toggle against the canvas, auto-switch (newest / in progress / off), **Accept** (adds a layer; one undo step), **Keep as hidden layer**, **Discard**, **Discard all**, **Cancel** a running job (via `job.cancel`), **Recall settings** and **Open in Review**.
 - **IMG-087** [M1a] You can keep editing while results arrive. Runs from several frames or callers stack, each labelled with who started it (e.g. "Claude Code").
@@ -2209,7 +2209,7 @@ Agents build and test on your PC in your account, so tests must never touch your
 Each layer states what it covers and when it runs. "Every push", "PR-ready", "nightly" and "milestones/releases" are the CI tiers in §6.6.
 
 - **QA-043** [M1] **Unit** (every push): graph/staleness, settings cascade, price rules, version allocation, mode detection, infill, paste-back, mask math, chunk encoding, quirk mapping, idempotency, error lowering, handshake/version rules.
-- **QA-044** [M1] **Property / model-based** (every push; `proptest`, `proptest-state-machine`): round-trips of manifests, workflows, documents and `.wwdoc`. (plan 2b clarification: Appendix E) Plain `proptest` strategies over operation sequences are an acceptable reading of `proptest-state-machine`.
+- **QA-044** [M1] **Property / model-based** (every push; `proptest`, `proptest-state-machine`): round-trips of manifests, workflows, documents and `.lildoc`. (plan 2b clarification: Appendix E) Plain `proptest` strategies over operation sequences are an acceptable reading of `proptest-state-machine`.
 - **QA-045** [M1] (invariant) **Document GC** property tests (every push): random saves, snapshots, open save handles and copies interleaved with GC. Must hold:
   - nothing reachable from a root is ever deleted;
   - the 24 h grace period holds;
@@ -2231,7 +2231,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - stream-json fixtures per tested Claude Code version.
   - (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
 - **QA-049** [M1b] **Golden: ComfyUI UI→API conversion** (every push) compared with the official frontend's conversion, using the pinned `comfyui-frontend-package`; re-run whenever ComfyUI or its frontend changes.
-- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.wwdoc` readers, stream-json, SSE, `lil:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
+- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.lildoc` readers, stream-json, SSE, `lil:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
 - **QA-051** [M1] (invariant) **Integration — ComfyUI queue ownership** (in-process core with fakes, every push):
   - at most one pending prompt per lane in ComfyUI; priority classes; FIFO within a class;
   - outside jobs are observed and never cancelled;
@@ -2239,7 +2239,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - ComfyUI restart mid-job → `interrupted` with salvage (QA-009);
   - no duplicate prompt ids;
   - hash-named uploads are reference-counted.
-- **QA-052** [M1] (invariant) **Integration — documents** (every push): `.wwdoc` round-trip; Add to project moving proposals; save conflict → keep both; holds re-acquired after a core restart; proposal anchoring warning; director proposals written into a closed document; `git clean -X` on `work/` → restore from snapshots.
+- **QA-052** [M1] (invariant) **Integration — documents** (every push): `.lildoc` round-trip; Add to project moving proposals; save conflict → keep both; holds re-acquired after a core restart; proposal anchoring warning; director proposals written into a closed document; `git clean -X` on `work/` → restore from snapshots.
 - **QA-053** [M1] (invariant) **Claude Code engine contract** (every push), using the fake `claude`, which records its arguments and environment. Fails if:
   - the environment is not a subset of the §4.6 allowlist;
   - the engine token appears in `claude`'s environment;

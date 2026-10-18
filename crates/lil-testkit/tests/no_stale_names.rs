@@ -166,9 +166,9 @@ const ALLOW: &[Allow] = &[
 
 /// Case-insensitive `worldwright`; `ww` in any case with no ASCII letter or digit on either
 /// side; or a PascalCase identifier `Ww` + uppercase letter with no ASCII letter or digit
-/// before it (`WwOutput`, `WwChild`; ruling RN8); or `wwref` (any case) at the start of a word,
-/// which covers the old `.wwref` file extension, `*.wwref` and a bare `wwref` (the `ww` there
-/// has a letter after it, so the bare-`ww` rule above misses it).
+/// before it (`WwOutput`, `WwChild`; ruling RN8); or lowercase `ww` at the start of a word
+/// followed by two or more lowercase letters, the first not `w` (`wwref`, `wwdoc`, `wwbundle`:
+/// the old file extensions and names the bare-`ww` rule above misses). `www…` is not a hit.
 fn is_stale(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if lower.contains("worldwright") {
@@ -186,9 +186,16 @@ fn is_stale(text: &str) -> bool {
     let pascal = (0..o.len().saturating_sub(2)).any(|i| {
         o[i] == b'W' && o[i + 1] == b'w' && o[i + 2].is_ascii_uppercase() && starts_word(o, i)
     });
-    let wwref = (0..l.len().saturating_sub(4))
-        .any(|i| l[i..].starts_with(b"wwref") && starts_word(l, i));
-    bare || pascal || wwref
+    let low = |c: u8| c.is_ascii_lowercase();
+    let ww_word = (0..o.len().saturating_sub(3)).any(|i| {
+        o[i] == b'w'
+            && o[i + 1] == b'w'
+            && low(o[i + 2])
+            && o[i + 2] != b'w'
+            && low(o[i + 3])
+            && starts_word(o, i)
+    });
+    bare || pascal || ww_word
 }
 
 /// Whether `pattern` (`*` within a segment, `**` across whole segments) matches `path`.
@@ -365,9 +372,13 @@ fn is_stale_finds_old_names_and_ignores_lookalikes() {
         ".wwref",
         "a.wwref",
         "*.wwref",
-        "`.WWREF` pointer files",
         "wwref files",
         "(`lil://` refs, `.wwref` files)",
+        "wwdoc",
+        ".wwdoc",
+        "a.wwdoc",
+        "`.wwdoc` readers",
+        "wwbundle",
     ] {
         assert!(is_stale(hit), "{hit:?} should be a hit");
     }
@@ -399,6 +410,14 @@ fn is_stale_finds_old_names_and_ignores_lookalikes() {
         "lilref",
         ".lilref",
         "*.lilref",
+        ".lildoc",
+        // `www…` and words where `ww` does not start the word.
+        "www",
+        "wwwauth",
+        "awwdoc",
+        "newwdoc",
+        "wwx",
+        "wwdOc",
     ] {
         assert!(!is_stale(miss), "{miss:?} should not be a hit");
     }
