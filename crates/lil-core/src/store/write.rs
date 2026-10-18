@@ -1674,8 +1674,8 @@ impl Store {
     /// `probe.long_form`), so an 8.3 short name (`PROJEC~1`, or one set with
     /// `SetFileShortName`) never reaches a sealed folder, the ledger or the legacy workspace
     /// data folder. A lookup that fails, or a long form that isn't under the workspace root,
-    /// refuses the write (fail closed).
-    pub(super) async fn writable_on_disk(&self, rel: &WsPath) -> Result<(), StoreError> {
+    /// refuses the write (fail closed). Returns the long form, for [`Store::check_long_locks`].
+    pub(super) async fn writable_on_disk(&self, rel: &WsPath) -> Result<WsPath, StoreError> {
         let (root, owned, probe) = (self.root.clone(), rel.clone(), self.probe.clone());
         let long = blocking(move || Ok(long_rel(&root, &owned, &|p| probe.long_form(p))))
             .await
@@ -1683,7 +1683,26 @@ impl Store {
                 path: rel.as_str().to_string(),
                 why: format!("its long form can't be read: {e}"),
             })??;
-        writable(&long)
+        writable(&long)?;
+        Ok(long)
+    }
+
+    /// [`Store::check_locks`] on `long`, the long form of `rel` (from
+    /// [`Store::writable_on_disk`] or [`Store::reserved_on_disk`]), when it differs from `rel`:
+    /// an 8.3 short name of a locked path, or of a folder on the way to it, is `store.locked`
+    /// too, naming `rel`. The caller has checked `rel` itself.
+    pub(super) async fn check_long_locks(
+        &self,
+        rel: &WsPath,
+        long: &WsPath,
+    ) -> Result<(), StoreError> {
+        if long.key() == rel.key() {
+            return Ok(());
+        }
+        self.check_locks(long).await.map_err(|e| match e {
+            StoreError::Locked(_) => StoreError::Locked(rel.clone()),
+            other => other,
+        })
     }
 
     /// The trash's reserved-path check ([`reserved_on_disk`]) on `rel` and on its long form
@@ -1792,7 +1811,8 @@ impl Store {
         // Step 1.
         writable(rel)?;
         self.check_locks(rel).await?;
-        self.writable_on_disk(rel).await?;
+        let long = self.writable_on_disk(rel).await?;
+        self.check_long_locks(rel, &long).await?;
         // A linked folder on the way would let the write land outside the workspace (the
         // target itself is checked again at step 3). Attributes only, once per call.
         self.refuse_links(rel).await?;

@@ -815,6 +815,83 @@ async fn trash_refuses_a_path_through_a_linked_folder() {
     assert!(store.trash_list().await.unwrap().is_empty());
 }
 
+/// Manifest `locks` are matched against the long form too: a locked file named by an 8.3
+/// short name (its own, or one of a folder on the way) is `store.locked` for a write, a trash
+/// and a restore, and nothing changes on disk.
+#[tokio::test(start_paused = true)] // spec: CORE-035, ARCH-058
+async fn locked_files_by_short_name_are_refused() {
+    use lil_core::store::Expect;
+    let ws = workspace();
+    let store = ws.store();
+    let locked = format!("{ASSET}/prompts/crane_prompt.txt");
+    let mut m = Manifest::new(
+        "sketchbook",
+        "crane",
+        "image",
+        "00000000-0000-4000-8000-0000000000aa",
+    );
+    m.set("locks", json!(["prompts/crane_prompt.txt", "held_folder/"]));
+    write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
+    write_file(&ws.file(&locked), b"a crane");
+
+    let short_file = lil_platform::fs::short_name(&ws.file(&locked)).unwrap();
+    let short_projects = lil_platform::fs::short_name(&ws.file("projects")).unwrap();
+    if short_file == ws.file(&locked) || short_projects == ws.file("projects") {
+        println!("8.3 names are off on this volume: the short-name cases are skipped");
+        return;
+    }
+    let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+    let aliases = [
+        format!("{ASSET}/prompts/{}", name(&short_file)),
+        format!(
+            "{}/sketchbook/assets/crane/prompts/crane_prompt.txt",
+            name(&short_projects)
+        ),
+    ];
+    for rel in &aliases {
+        let written = store
+            .write(
+                &p(rel),
+                b"over".to_vec(),
+                Expect::Hash(sha256_bytes(b"a crane")),
+            )
+            .await;
+        assert!(
+            matches!(&written, Err(StoreError::Locked(_))),
+            "write {rel}: {written:?}"
+        );
+        let trashed = store.trash(&p(rel), "test").await;
+        assert!(
+            matches!(&trashed, Err(StoreError::Locked(_))),
+            "trash {rel}: {trashed:?}"
+        );
+        assert_eq!(ws.read(&locked), b"a crane", "{rel}");
+    }
+    // A restore into a locked folder through a short name on the way: the entry stays as it
+    // was, and nothing lands there.
+    let target = format!(
+        "{}/sketchbook/assets/crane/held_folder/x.txt",
+        name(&short_projects)
+    );
+    entry_by_hand(&ws, "te_00000000000000e1", &target, &[("", b"payload")]);
+    let restored = store.trash_restore("te_00000000000000e1").await;
+    assert!(
+        matches!(&restored, Err(StoreError::Locked(_))),
+        "restore {target}: {restored:?}"
+    );
+    let dir = ws.file(&format!(
+        ".trash/{}/te_00000000000000e1",
+        &lil_schema::time::rfc3339(ws.now())[..10]
+    ));
+    assert_eq!(
+        std::fs::read(dir.join("payload/x.txt")).unwrap(),
+        b"payload"
+    );
+    assert!(dir.join("restore.json").is_file());
+    assert!(!ws.exists(&format!("{ASSET}/held_folder/x.txt")));
+    assert_eq!(ws.read(&locked), b"a crane");
+}
+
 #[tokio::test(start_paused = true)] // spec: ARCH-002, ARCH-058
 async fn restore_refuses_a_linked_folder_on_the_way() {
     let ws = workspace();

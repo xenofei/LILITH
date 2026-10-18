@@ -264,6 +264,8 @@ pub const CORE_LOCK: &str = "core.lock";
 
 /// `FILE_ATTRIBUTE_DIRECTORY`.
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+/// `ERROR_SHARING_VIOLATION`: a lock file another program holds with delete access.
+const ERROR_SHARING_VIOLATION: i32 = 32;
 
 /// The workspace locks a read-write core holds (D4): `.lilith\core.lock`, and the legacy
 /// folder's `core.lock` when that folder exists. Dropping it releases both.
@@ -293,17 +295,24 @@ pub struct LockError {
 /// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other. Each
 /// lock file is held open without delete sharing (`try_lock_exclusive`), so while it is held
 /// it can't be deleted or renamed away and a second core always finds the held lock. A lock
-/// file another program holds open with delete access (error 32) counts as held elsewhere.
+/// file another program holds open with delete access (error 32) counts as held elsewhere,
+/// with a warning naming the file.
 ///
 /// # Errors
 /// A lock file that can't be opened, with its workspace-relative path.
 pub fn take_core_locks(root: &Path, probe: &dyn Probe) -> Result<Option<CoreLocks>, LockError> {
     let take = |dir: &str| {
-        let fail = |error| LockError {
-            file: Path::new(dir).join(CORE_LOCK),
-            error,
-        };
-        fsops::lock_exclusive(&root.join(dir).join(CORE_LOCK)).map_err(fail)
+        let file = Path::new(dir).join(CORE_LOCK);
+        match fsops::lock_exclusive(&root.join(&file)) {
+            Ok(taken) => Ok(taken),
+            // Another program holds the file with delete access (or with no sharing): held
+            // elsewhere, never an open error.
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                tracing::warn!(workspace = %root.display(), file = %file.display(), error = %e, "the workspace is served read-only: another program has its lock file open with delete access; close it to serve the workspace read-write");
+                Ok(None)
+            }
+            Err(error) => Err(LockError { file, error }),
+        }
     };
     fsops::ensure_dir(&root.join(WORKSPACE_DIR)).map_err(|error| LockError {
         file: Path::new(WORKSPACE_DIR).join(CORE_LOCK),
@@ -327,7 +336,8 @@ pub fn take_core_locks(root: &Path, probe: &dyn Probe) -> Result<Option<CoreLock
             false
         }
         Err(e) => {
-            tracing::warn!(workspace = %root.display(), error = %e, "whether the legacy workspace data folder exists can't be read; the workspace is served read-only");
+            let file = Path::new(LEGACY_WORKSPACE_DIR).join(CORE_LOCK);
+            tracing::warn!(workspace = %root.display(), file = %file.display(), error = %e, "the workspace is served read-only: whether the legacy workspace data folder exists can't be read, so its lock file can't be taken");
             return Ok(None);
         }
     };

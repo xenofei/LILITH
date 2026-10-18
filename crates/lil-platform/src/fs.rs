@@ -22,8 +22,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{
-    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION,
-    ERROR_SHARING_VIOLATION, HANDLE,
+    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION, HANDLE,
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_SYNC_ROOT_BASIC_INFO, CF_SYNC_ROOT_INFO_BASIC, CfGetSyncRootInfoByPath,
@@ -671,22 +670,17 @@ impl Drop for LockedFile {
 /// The handle shares read and write but not delete, so while it is open the file can't be
 /// deleted or renamed (error 32): a second core always opens this same file and finds the
 /// lock held, instead of creating a fresh one beside an orphaned handle. That second open
-/// still succeeds, since neither handle asks for delete access. An open that fails with
-/// error 32 (another program holds the file with delete access, or with no sharing) is
-/// `None` too: someone else has it, so the caller serves read-only.
+/// still succeeds, since neither handle asks for delete access. An open that fails because
+/// another program holds the file with delete access (or with no sharing) is that error,
+/// 32: the caller decides what it means (the core serves read-only, `take_core_locks`).
 pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<LockedFile>> {
-    let opened = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
-        .open(long_path(path));
-    let file = match opened {
-        Ok(file) => file,
-        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+        .open(long_path(path))?;
     Ok(lock_byte(&file, 0)?.then_some(LockedFile { file }))
 }
 

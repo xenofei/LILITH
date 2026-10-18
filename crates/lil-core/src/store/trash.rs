@@ -253,15 +253,16 @@ impl Store {
     /// folder, `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, by any
     /// name (an 8.3 short name too, or a long form that can't be read), or a link (also a
     /// linked folder on the way);
-    /// `store.locked` for a path in its manifest's `locks`; `store.git_busy` when git is still
-    /// working after 60 s; `store.io` when there is nothing at `rel` or a file call fails
-    /// (`store.busy` when it stays held).
+    /// `store.locked` for a path in its manifest's `locks`, by any name; `store.git_busy` when
+    /// git is still working after 60 s; `store.io` when there is nothing at `rel` or a file
+    /// call fails (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
         let long = self.reserved_on_disk(rel, "moved to the trash").await?;
         writable(rel)?;
         writable(&long)?;
         self.check_locks(rel).await?;
+        self.check_long_locks(rel, &long).await?;
         // The long form doesn't see through a junction: a linked folder on the way could reach
         // a sealed folder, `.lilith\` or `.git\`. Attributes only.
         self.refuse_links(rel).await?;
@@ -393,6 +394,7 @@ impl Store {
     /// # Errors
     /// `workspace.read_only`; `trash.unknown` for no such entry; `trash.restore_conflict`
     /// (naming the original path) when something is at the original path now;
+    /// `store.locked` when the original path (by any name) is in its manifest's `locks`;
     /// `store.path_invalid` when the original path is the trash, either workspace data folder,
     /// `.git`, the ledger, or any other path a write refuses (also through an 8.3 name); a
     /// `restore.json` edited by hand can name any of them. A path in a sealed version folder is
@@ -427,6 +429,9 @@ impl Store {
             writable(&rel)?;
             writable(&long)?;
         }
+        // Manifest `locks` (CORE-035), by the path as recorded and by its long form.
+        self.check_locks(&rel).await?;
+        self.check_long_locks(&rel, &long).await?;
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
             let items = blocking(move || list(&dir))
