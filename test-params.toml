@@ -1,17 +1,17 @@
 # Owner-facing test parameters (QA-019). PROTECTED: changes require owner approval.
-# ww_testkit::params reads [proptest] and [budgets]; .config/nextest.toml still carries the
+# lil_testkit::params reads [proptest] and [budgets]; .config/nextest.toml still carries the
 # timeout values directly and points back here as the record.
 
 [timeouts]
 unit_s = 30
 integration_s = 120
-# The ww-cli package's tests (real git repositories), an override in .config/nextest.toml.
-ww_cli_s = 300
+# The lil-cli package's tests (real git repositories), an override in .config/nextest.toml.
+lil_cli_s = 300
 spec_s = 300
-# The E2E tests (real ww and ww-core over a real pipe, QA-056): ww-spec-tests, ww-core and every
-# package that uses ww-testkit. An override in .config/nextest.toml.
+# The E2E tests (real lil and lil-core over a real pipe, QA-056): lil-spec-tests, lil-core and every
+# package that uses lil-testkit. An override in .config/nextest.toml.
 e2e_s = 300
-# The setup script build-testbins in .config/nextest.toml builds ww and ww-core into
+# The setup script build-testbins in .config/nextest.toml builds lil and lil-core into
 # target/testbins once per run (120 s x 5).
 testbins_build_s = 600
 
@@ -23,7 +23,7 @@ cases = 256
 max_channel_diff = 1
 
 [budgets]
-# CORE-042: the index budgets, in seconds, checked by crates/ww-core/tests/index_bench.rs.
+# CORE-042: the index budgets, in seconds, checked by crates/lil-core/tests/index_bench.rs.
 # A cold rebuild of 2,000 assets (3 files each) must fit in 30 s.
 index_rebuild_2000_assets_s = 30
 # A warm reconcile of 10,000 assets (3 files each, nothing changed). The value is twice this

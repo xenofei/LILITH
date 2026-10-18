@@ -1,0 +1,38 @@
+[package]
+name = "lil-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "lil"
+path = "src/main.rs"
+
+[dependencies]
+age.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+globset.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+roxmltree.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+lil-client = { path = "../lil-client" }
+lil-platform = { path = "../lil-platform" }
+lil-protocol = { path = "../lil-protocol" }
+zeroize.workspace = true
+
+[dev-dependencies]
+aws-lc-rs.workspace = true
+tempfile.workspace = true
+lil-testkit = { path = "../lil-testkit" }
+yaml-rust2.workspace = true
+
+[lints]
+workspace = true

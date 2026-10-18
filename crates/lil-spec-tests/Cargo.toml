@@ -1,0 +1,16 @@
+[package]
+name = "lil-spec-tests"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Spec tests drive only stable surfaces (QA-018): the test kit, the protocol types and JSON.
+[dev-dependencies]
+serde_json.workspace = true
+lil-protocol = { path = "../lil-protocol" }
+lil-testkit = { path = "../lil-testkit" }
+
+[lints]
+workspace = true

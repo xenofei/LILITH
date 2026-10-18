@@ -7,19 +7,19 @@
 experimental = ["setup-scripts"]
 
 # Where nextest keeps its run data, relative to the workspace root. nextest uses this directory
-# even when CARGO_TARGET_DIR points elsewhere; `ww dev spec-tests` reads this key (and
+# even when CARGO_TARGET_DIR points elsewhere; `lil dev spec-tests` reads this key (and
 # [profile.spec.junit] path below) to find the JUnit file. This is nextest's default, written out.
 [store]
 dir = "target/nextest"
 
-# The E2E tests run the real `ww` and `ww-core` binaries (QA-056). This script builds them once
+# The E2E tests run the real `lil` and `lil-core` binaries (QA-056). This script builds them once
 # per run, before any test that may use them starts, into their own target directory. A running
 # test core then never locks a binary the main build wants to relink, and feature unification
-# never rebuilds one under a running test. `ww_testkit::bins::ensure_built` runs the same build
+# never rebuilds one under a running test. `lil_testkit::bins::ensure_built` runs the same build
 # itself when this script did not run (plain `cargo test`).
 # 120 s x 5 = 10 minutes for a cold build (test-params.toml: testbins_build_s).
 [scripts.setup.build-testbins]
-command = "cargo build --locked --offline --bins -p ww-cli -p ww-core --target-dir target/testbins"
+command = "cargo build --locked --offline --bins -p lil-cli -p lil-core --target-dir target/testbins"
 slow-timeout = { period = "120s", terminate-after = 5 }
 
 [profile.default]
@@ -27,34 +27,34 @@ retries = 1
 slow-timeout = { period = "30s", terminate-after = 4 }
 fail-fast = false
 
-# Which tests may use the binaries. `rdeps(ww-testkit)` covers every package whose tests
-# (dev-dependencies included) use the test kit, and the kit itself: `ww-client` among them, and
+# Which tests may use the binaries. `rdeps(lil-testkit)` covers every package whose tests
+# (dev-dependencies included) use the test kit, and the kit itself: `lil-client` among them, and
 # any package added later, without a `package()` that nextest would refuse while it matches
 # nothing.
 [[profile.default.scripts]]
-filter = 'package(ww-spec-tests) | package(ww-core) | package(ww-cli) | rdeps(ww-testkit)'
+filter = 'package(lil-spec-tests) | package(lil-core) | package(lil-cli) | rdeps(lil-testkit)'
 setup = "build-testbins"
 
-# The ww-cli tests build real git repositories; the slowest take about a minute. They get 5
+# The lil-cli tests build real git repositories; the slowest take about a minute. They get 5
 # minutes before nextest stops them. Retries stay at 1 (QA-030): an override never changes them.
 [[profile.default.overrides]]
-filter = 'package(ww-cli)'
+filter = 'package(lil-cli)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 # The E2E tests start real processes over a real pipe (QA-056): 5 minutes each
 # (test-params.toml: e2e_s). The setup script has already built the binaries.
 [[profile.default.overrides]]
-filter = 'package(ww-spec-tests) | package(ww-core) | rdeps(ww-testkit)'
+filter = 'package(lil-spec-tests) | package(lil-core) | rdeps(lil-testkit)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.spec]
 # Inherits retries = 1 from default (QA-030). A test that passes on retry is not hidden:
-# `ww dev spec-tests` prints it as "flaky: <name> (passed on retry)".
+# `lil dev spec-tests` prints it as "flaky: <name> (passed on retry)".
 slow-timeout = { period = "60s", terminate-after = 5 }
 fail-fast = false
 
 [[profile.spec.scripts]]
-filter = 'package(ww-spec-tests) | package(ww-core) | package(ww-cli) | rdeps(ww-testkit)'
+filter = 'package(lil-spec-tests) | package(lil-core) | package(lil-cli) | rdeps(lil-testkit)'
 setup = "build-testbins"
 
 # Written to <store dir>/spec/junit.xml: target/nextest/spec/junit.xml in the workspace.

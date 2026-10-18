@@ -1,9 +1,9 @@
-add-ok:crates/ww-spec-tests/**
+add-ok:crates/lil-spec-tests/**
 add-ok:**/proptest-regressions/**
 test-params.toml
 tools/git-hooks/**
-crates/ww-cli/src/dev/**
-crates/ww-dev-guard/**
+crates/lil-cli/src/dev/**
+crates/lil-dev-guard/**
 dev/protected-paths.txt
 dev/merge-guard.toml
 .github/workflows/ci-guard.yml
@@ -12,9 +12,9 @@ dev/merge-guard.toml
 .config/nextest.toml
 .cargo/**
 /Cargo.toml
-crates/ww-cli/Cargo.toml
-crates/ww-cli/build.rs
-crates/ww-cli/src/main.rs
+crates/lil-cli/Cargo.toml
+crates/lil-cli/build.rs
+crates/lil-cli/src/main.rs
 rust-toolchain.toml
 .gitattributes
 .claude/**

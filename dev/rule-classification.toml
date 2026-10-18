@@ -1,4 +1,4 @@
-# How each spec rule is checked (QA-028). `ww dev spec-report` reads this file.
+# How each spec rule is checked (QA-028). `lil dev spec-report` reads this file.
 #
 # Classes: "test" (a Rust test cites the rule with `// spec: <ID>`), "lint" (a lint or CI
 # check enforces it), "manual" (a person checks it) and "n/a" (nothing to check).
@@ -162,7 +162,7 @@ QA-038 = "test"
 QA-079 = "test"
 QA-086 = "test"
 
-# Enforced by clippy: every ww-core file write goes through store::fsops (clippy.toml).
+# Enforced by clippy: every lil-core file write goes through store::fsops (clippy.toml).
 ARCH-112 = "lint"
 QA-024 = "lint"
 

@@ -1,9 +1,9 @@
 #!/bin/sh
 # Guards main (QA-034, rulings R15 and R17) and runs the privacy scan on every pushed ref
-# (QA-086, ruling R32): see crates/ww-cli/src/dev/hooks.rs. Installed by `ww dev install-hooks`.
+# (QA-086, ruling R32): see crates/lil-cli/src/dev/hooks.rs. Installed by `lil dev install-hooks`.
 #
 # The privacy scan applies to every branch and tag, so any push that names a ref is handed off
-# to `ww` (R32 updates R17's cheap filter). Only an empty push list passes without a build.
+# to `lil` (R32 updates R17's cheap filter). Only an empty push list passes without a build.
 # Rust stays authoritative. If this script can't tell, it hands off.
 
 # git sends "<local ref> <local sha> <remote ref> <remote sha>" per line on stdin.
@@ -22,11 +22,11 @@ if ! command -v cargo >/dev/null 2>&1; then
     PATH="$HOME/.cargo/bin:$PATH"
     export PATH
     if ! command -v cargo >/dev/null 2>&1; then
-        echo "This push needs the privacy scan (and pushes to main go through \`ww dev merge <PR>\`), but cargo wasn't found on PATH or in \$HOME/.cargo/bin, so it is refused." >&2
+        echo "This push needs the privacy scan (and pushes to main go through \`lil dev merge <PR>\`), but cargo wasn't found on PATH or in \$HOME/.cargo/bin, so it is refused." >&2
         exit 1
     fi
 fi
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
-printf '%s\n' "$input" | cargo run --quiet --locked -p ww-cli --bin ww -- dev hook pre-push "$@"
+printf '%s\n' "$input" | cargo run --quiet --locked -p lil-cli --bin lil -- dev hook pre-push "$@"
 exit $?
