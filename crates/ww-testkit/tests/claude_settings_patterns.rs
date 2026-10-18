@@ -103,9 +103,23 @@
 //! on `main` (no bypass) still blocks a push to `main` or a merge without checks, for anyone.
 //!
 //! **The credential helper.** `* dev git-credential*` denies running `ww dev git-credential`
-//! by hand, which would print the agent token. Pushes still work: git runs the helper itself
-//! (from `credential.helper`, as a child of `git`), never through Claude Code's Bash or
-//! PowerShell tool, so these rules never see that call.
+//! (or `lil dev git-credential`) by hand, which would print the agent token. The committed
+//! script `tools/git-hooks/credential-helper` runs that command, so `*credential-helper*`
+//! (RN6) denies any command line that names it: `sh`, `bash`, `./`, a full path to `sh.exe`,
+//! a path built with `$(git rev-parse --show-toplevel)`, in a pipe or after `cd`. And
+//! `git * credential fill*` adds the spelling with options before `credential`
+//! (`git -C . credential fill`) to `git credential fill*`. Pushes still work: git runs the
+//! helper itself (from `credential.helper`, as a child of `git`), never through Claude Code's
+//! Bash or PowerShell tool, so these rules never see that call.
+//!
+//! Limits of the credential-helper rules:
+//!
+//! - they match the helper's name anywhere in the command, so they also deny staging it by its
+//!   exact path (`git add` naming the file). Stage it by its folder instead:
+//!   `git add tools/git-hooks/`;
+//! - they don't cover a glob spelling of the name (`sh tools/git-hooks/cred*`), `sh -c '...'`
+//!   (or `bash -c`, `pwsh -c`) with the command inside the script, or git's own tracing
+//!   (`GIT_TRACE_CURL`) on a push.
 //!
 //! The git hooks (QA-034), `ww dev merge`'s own checks and the post-merge CI check (QA-035)
 //! back these patterns up, and the agent token (QA-079) limits what a bypass can reach.
@@ -562,6 +576,17 @@ const MUST_MATCH: &[&str] = &[
     "git status; gh pr merge 3",
     "echo y | gh pr merge 3",
     "git fetch || gh auth token",
+    // RN6: the committed credential helper prints the agent token too, however it is started.
+    "sh tools/git-hooks/credential-helper get",
+    "bash tools/git-hooks/credential-helper get",
+    "./tools/git-hooks/credential-helper get",
+    "sh ./tools/git-hooks/credential-helper",
+    "sh \"$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper\" get",
+    "echo host=github.com | sh tools/git-hooks/credential-helper get",
+    "cd x && sh tools/git-hooks/credential-helper get",
+    "git -C . credential fill",
+    "cargo run -q --locked -p lil-cli --bin lil -- dev git-credential get",
+    "target/debug/lil.exe dev git-credential get",
 ];
 
 /// Denied in Bash only: wrappers, assignments and substitutions are Bash syntax.
@@ -581,6 +606,9 @@ const MUST_MATCH_BASH: &[&str] = &[
     "(git push origin main)",
     "git status & git push origin main",
     "git push origin main 2>&1",
+    // RN6.
+    "FOO=1 sh tools/git-hooks/credential-helper get",
+    "timeout 30 sh tools/git-hooks/credential-helper get",
 ];
 
 /// Denied in PowerShell only: matching ignores case there.
@@ -594,6 +622,9 @@ const MUST_MATCH_POWERSHELL: &[&str] = &[
     "& 'C:\\Program Files\\GitHub CLI\\gh.exe' pr list",
     "& \"C:\\Program Files\\GitHub CLI\\GH.EXE\" pr list",
     "Set-Location repo; git push origin main",
+    // RN6.
+    "& 'C:\\Program Files\\Git\\bin\\sh.exe' tools/git-hooks/credential-helper get",
+    "SH .\\TOOLS\\GIT-HOOKS\\CREDENTIAL-HELPER GET",
 ];
 
 /// Allowed in both shells.
@@ -646,6 +677,11 @@ const MUST_NOT_MATCH: &[&str] = &[
     // A denied command only as text.
     "echo gh auth token",
     "git commit -m 'gh pr merge is denied'",
+    // RN6: the helper's name only in other words, or its folder (stage the helper this way).
+    "cargo nextest run -p ww-cli -E 'binary(credential_helper)'",
+    "git add tools/git-hooks/",
+    "git commit -m 'credential helper is a committed script'",
+    "sh tools/git-hooks/pre-push",
 ];
 
 #[test] // spec: QA-036
@@ -702,6 +738,8 @@ fn brief_rules_are_present_in_both_shells() {
         "gh auth status*--show-token*",
         "gh auth login*",
         "git credential fill*",
+        "git * credential fill*",
+        "*credential-helper*",
         "git credential-manager*",
         "cmdkey*",
         "git config*credential*",

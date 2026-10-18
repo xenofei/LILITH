@@ -13,6 +13,7 @@ pub mod fs;
 pub mod guard;
 pub mod ids;
 pub mod known_folders;
+pub mod names;
 pub mod paths;
 pub mod pipe;
 pub mod process;
@@ -25,7 +26,8 @@ pub mod watcher;
 
 pub use clock::{Clock, SystemClock};
 pub use credentials::{
-    Credential, CredentialError, CredentialStore, MemoryCredentialStore, WindowsCredentialStore,
+    Credential, CredentialError, CredentialStore, MemoryCredentialStore, TargetUse,
+    WindowsCredentialStore,
 };
 pub use env::{Channel, Env, EnvError, Roots, TEST_MACHINE_ID, machine_id_from};
 pub use fs::{FileIdentity, Probe, SystemProbe, VolumeInfo};

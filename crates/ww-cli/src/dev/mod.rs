@@ -125,7 +125,10 @@ pub enum DevCommand {
     /// Approve a PR's protected changes as the reviewer app (owner only, at a real terminal).
     ///
     /// Shows what the test-diff guard says needs approval on the PR's current head commit (judged
-    /// against origin/main), asks "(y/N)", then asks for the reviewer key's passphrase. Only then
+    /// against origin/main), asks "(y/N)", then asks for the reviewer key's passphrase. The key
+    /// is read from %USERPROFILE%\.lilith\reviewer\app-key.age, or from the legacy
+    /// %USERPROFILE%\.worldwright\reviewer\app-key.age when the new one isn't there, and the
+    /// path used is printed. Only then
     /// does it contact GitHub as the app and post one APPROVE review pinned to that exact commit.
     /// It refuses when stdin or stderr isn't a terminal, when nothing protected changed, when the
     /// PR is closed, a draft or not into main, and when the head moved after the summary.
@@ -151,7 +154,8 @@ pub enum DevCommand {
     /// Also removes local URL-specific credential.<url>.helper entries and writes two
     /// repository-local credential.helper entries, in this order: an empty
     /// one, which drops inherited helpers such as Git Credential Manager, and then
-    /// `!cargo run -q --locked -p ww-cli --bin ww -- dev git-credential`. So git in this
+    /// `!sh "$(git rev-parse --show-toplevel)/tools/git-hooks/credential-helper"`,
+    /// which runs `dev git-credential` from the checkout's CLI crate. So git in this
     /// repository authenticates to github.com only with the agent token.
     #[command(verbatim_doc_comment)]
     InstallHooks,
@@ -159,9 +163,12 @@ pub enum DevCommand {
     /// Store, show or remove the GitHub token agents use (in Windows Credential Manager).
     ///
     /// The agent token is a fine-grained personal access token limited to this repository,
-    /// without administration or workflow permissions. It is stored at the Credential
-    /// Manager target Worldwright-dev/github/agent-token. Every ww dev GitHub call uses
-    /// GITHUB_TOKEN when it is set (CI), and this token otherwise.
+    /// without administration or workflow permissions. `set` stores it at the Credential
+    /// Manager target LILITH-dev/github/agent-token. A token stored before the rename, at
+    /// Worldwright-dev/github/agent-token, is still read when the new target has none;
+    /// `status` says which one answered. `clear` removes both, `clear --legacy` only the old
+    /// one. Every ww dev GitHub call uses GITHUB_TOKEN when it is set (CI), and this token
+    /// otherwise.
     #[command(subcommand, verbatim_doc_comment)]
     AgentToken(AgentTokenCommand),
 
@@ -197,9 +204,12 @@ pub enum DevCommand {
     /// isn't a placeholder; write %USERPROFILE% instead), e-mail addresses other than
     /// GitHub no-reply, noreply@anthropic.com, git@github.com and reserved test domains,
     /// commit identities that aren't GitHub no-reply addresses, and the entries of the
-    /// private denylist. The denylist comes from WW_PRIVACY_DENYLIST when that is set (CI),
-    /// otherwise from %USERPROFILE%\.worldwright\privacy-denylist.txt; without one it
-    /// refuses. A denylist finding names only the entry's number and the place.
+    /// private denylist. The denylist comes from the first of these that is there:
+    /// LIL_PRIVACY_DENYLIST (CI), the legacy WW_PRIVACY_DENYLIST,
+    /// %USERPROFILE%\.lilith\privacy-denylist.txt, and the legacy
+    /// %USERPROFILE%\.worldwright\privacy-denylist.txt. A blank variable is skipped. Without
+    /// a denylist, or when the first one found has no entries, it refuses. A denylist finding
+    /// names only the entry's number and the place.
     ///
     ///   --range <base>..<head>  every commit's added lines, paths, message and identities
     ///   --tree <rev>            every tracked file's content and path at <rev>
@@ -240,8 +250,13 @@ pub enum AgentTokenCommand {
     Set,
     /// Say whether a token is stored, with its first four characters and the expiry entered.
     Status,
-    /// Remove the stored agent token (at a real terminal).
-    Clear,
+    /// Remove the stored agent token, under the new and the legacy name (at a real terminal).
+    Clear {
+        /// Remove only the token stored under the legacy name
+        /// (Worldwright-dev/github/agent-token), once `status` shows the new one.
+        #[arg(long)]
+        legacy: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -295,7 +310,7 @@ pub fn run(cmd: DevCommand) -> i32 {
         DevCommand::AgentToken(cmd) => match cmd {
             AgentTokenCommand::Set => agent_access::run_set(),
             AgentTokenCommand::Status => agent_access::run_status(),
-            AgentTokenCommand::Clear => agent_access::run_clear(),
+            AgentTokenCommand::Clear { legacy } => agent_access::run_clear(legacy),
         },
         DevCommand::GitCredential { action } => agent_access::run_git_credential(&action),
         DevCommand::Gh { args } => agent_access::run_gh(&args),
@@ -397,6 +412,26 @@ mod tests {
         ));
     }
 
+    /// `install-hooks --help` quotes the helper entry the command actually writes.
+    #[test]
+    fn install_hooks_help_quotes_the_written_helper() {
+        use clap::CommandFactory;
+        let mut cmd = T::command();
+        let help = cmd
+            .find_subcommand_mut("install-hooks")
+            .expect("install-hooks subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains(agent_access::GIT_CREDENTIAL_HELPER),
+            "install-hooks help doesn't quote the helper entry:\n{help}"
+        );
+        assert!(
+            !help.contains("cargo run"),
+            "install-hooks help still quotes the old entry:\n{help}"
+        );
+    }
+
     #[test]
     fn agent_access_cli() {
         assert!(matches!(
@@ -409,7 +444,7 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["agent-token", "clear"]).unwrap(),
-            DevCommand::AgentToken(AgentTokenCommand::Clear)
+            DevCommand::AgentToken(AgentTokenCommand::Clear { legacy: false })
         ));
         assert!(parse(&["agent-token"]).is_err());
         assert!(matches!(
@@ -422,6 +457,23 @@ mod tests {
         );
         // gh's arguments only after `--`.
         assert!(parse(&["gh", "pr", "view"]).is_err());
+    }
+
+    #[test] // spec: QA-079
+    fn agent_token_clear_legacy_parses() {
+        assert!(matches!(
+            parse(&["agent-token", "clear", "--legacy"]).unwrap(),
+            DevCommand::AgentToken(AgentTokenCommand::Clear { legacy: true })
+        ));
+        // `--legacy` belongs to `clear` only, and takes no value.
+        for bad in [
+            &["agent-token", "set", "--legacy"][..],
+            &["agent-token", "status", "--legacy"],
+            &["agent-token", "--legacy", "clear"],
+            &["agent-token", "clear", "--legacy=yes"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test] // spec: QA-086
