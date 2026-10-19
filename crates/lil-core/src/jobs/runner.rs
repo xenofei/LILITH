@@ -2203,10 +2203,19 @@ mod tests {
         while !shared.queue().closed {
             tokio::task::yield_now().await;
         }
-        // ... and the cancel goes on.
+        // ... and the cancel goes on. The state database is a real thread, so while this task
+        // waits on it the runtime would idle, and a paused clock auto-advances when it idles:
+        // the step's 2 s grace would then expire at once. A task that never idles keeps the
+        // clock where it is, so `begun.elapsed()` below can only move if the step really waits.
+        let keep_clock = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
         let begun = tokio::time::Instant::now();
         shared.complete(&info, 1, End::Cancelled).await;
         step.await.unwrap();
+        keep_clock.abort();
         assert_eq!(
             begun.elapsed(),
             Duration::ZERO,
