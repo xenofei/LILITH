@@ -103,8 +103,21 @@ impl ComfyConfig {
     /// # Errors
     /// `comfyui.not_loopback` when `extra_args` holds `--listen` (or a prefix of it that
     /// Python's argparse would take for it, `--listen=…` included): ComfyUI takes the last one.
+    /// `engine.not_configured` for `--port` in the same forms: the port is `port`, which the
+    /// suite also talks to, so another one would only make the start time out.
     pub fn launch_args(&self) -> Result<Vec<OsString>, ErrorBody> {
-        if let Some(bad) = self.extra_args.iter().find(|a| is_listen_flag(a)) {
+        if let Some(bad) = self.extra_args.iter().find(|a| is_flag(a, "--port")) {
+            return Err(ErrorBody::new(
+                &codes::ENGINE_NOT_CONFIGURED,
+                format!(
+                    "[engines.comfyui] extra_args holds {bad:?}: the suite sets --port itself \
+                     from [engines.comfyui] port. Set the port there and remove it from \
+                     extra_args."
+                ),
+                "",
+            ));
+        }
+        if let Some(bad) = self.extra_args.iter().find(|a| is_flag(a, "--listen")) {
             return Err(ErrorBody::new(
                 &codes::COMFYUI_NOT_LOOPBACK,
                 format!(
@@ -125,21 +138,24 @@ impl ComfyConfig {
     }
 }
 
-/// `--listen`, `--listen=…`, or an abbreviation of it (`--lis`): argparse accepts any unique
-/// prefix of a long option.
-fn is_listen_flag(arg: &str) -> bool {
+/// `flag` (`--listen`), `flag=…`, or an abbreviation of it (`--lis`): argparse accepts any
+/// unique prefix of a long option.
+fn is_flag(arg: &str, flag: &str) -> bool {
     let name = arg.split_once('=').map_or(arg, |(name, _)| name);
-    name.len() >= 3 && name.starts_with("--") && "--listen".starts_with(name)
+    name.len() >= 3 && name.starts_with("--") && flag.starts_with(name)
 }
 
-/// Names that contain one of these (upper-cased) are secrets (ARCH-063).
-const SECRET_PARTS: [&str; 6] = [
-    "API_KEY",
-    "APIKEY",
-    "_TOKEN",
+/// Names that contain one of these (upper-cased) are secrets (ARCH-063): Appendix F's list
+/// (`API_KEY`, `APIKEY`, `_TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), widened by ruling
+/// P3-R19 to `KEY`, `TOKEN`, `PASSWD` and `AUTH`, which cover the first list.
+const SECRET_PARTS: [&str; 7] = [
+    "KEY",
+    "TOKEN",
     "SECRET",
     "PASSWORD",
+    "PASSWD",
     "CREDENTIAL",
+    "AUTH",
 ];
 
 /// Names that start with one of these (upper-cased) are provider or suite settings.
@@ -195,10 +211,13 @@ mod tests {
     #[test] // spec: ARCH-068
     fn listen_abbreviations_count_as_listen() {
         for arg in ["--listen", "--listen=0.0.0.0", "--lis", "--liste", "--l"] {
-            assert!(is_listen_flag(arg), "{arg}");
+            assert!(is_flag(arg, "--listen"), "{arg}");
         }
         for arg in ["--lowvram", "--port", "--", "-l", "listen", "--listening"] {
-            assert!(!is_listen_flag(arg), "{arg}");
+            assert!(!is_flag(arg, "--listen"), "{arg}");
+        }
+        for arg in ["--port", "--port=8189", "--po"] {
+            assert!(is_flag(arg, "--port"), "{arg}");
         }
     }
 

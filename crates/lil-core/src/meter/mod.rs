@@ -7,4 +7,4 @@
 
 pub mod sink;
 
-pub use sink::{Attribution, LogSink, UsageCtx, UsageDraft, UsageSink};
+pub use sink::{Attribution, LogSink, UsageCtx, UsageDraft, UsageSink, UsageStatus};

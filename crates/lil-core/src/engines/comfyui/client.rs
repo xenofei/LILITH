@@ -3,7 +3,9 @@
 //! and readiness) and `POST /free` (the idle free and the scheduler's unload); Task 12 adds the
 //! rest.
 //!
-//! The client never uses a proxy: every request goes straight to the loopback address.
+//! The client never uses a proxy and never follows a redirect (a 3xx is
+//! [`ComfyError::Protocol`]): every request goes straight to the loopback address, and only
+//! there. A URL with a user name or password is refused.
 
 use std::time::Duration;
 
@@ -70,7 +72,8 @@ impl ComfyClient {
         // The URL parser normalises the host: IPv4 to dotted decimal, IPv6 to its short
         // bracketed form, names to lower case.
         let loopback = matches!(base.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
-        if !loopback {
+        // A URL with a user name or password is refused too: it would end up in logs.
+        if !loopback || !base.username().is_empty() || base.password().is_some() {
             return Err(ErrorBody::new(
                 &codes::COMFYUI_NOT_LOOPBACK,
                 format!(
@@ -80,7 +83,9 @@ impl ComfyClient {
                 "",
             ));
         }
+        // Never a redirect: it could send a request (and its body) off loopback.
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -157,6 +162,12 @@ async fn checked(response: reqwest::Response) -> Result<reqwest::Response, Comfy
     let status = response.status();
     if status.is_success() {
         return Ok(response);
+    }
+    if status.is_redirection() {
+        return Err(ComfyError::Protocol(format!(
+            "ComfyUI answered HTTP {} (a redirect); the suite never follows one",
+            status.as_u16()
+        )));
     }
     let mut body = response.text().await.unwrap_or_default();
     if body.len() > MAX_ERROR_BODY {

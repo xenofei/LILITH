@@ -29,6 +29,28 @@ impl Attribution {
     }
 }
 
+/// How the call ended (Appendix F usage `status`). `Pending` is the write-ahead state of a
+/// call not yet answered (CORE-071; Task 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl UsageStatus {
+    /// `pending`, `succeeded`, `failed` or `cancelled`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            UsageStatus::Pending => "pending",
+            UsageStatus::Succeeded => "succeeded",
+            UsageStatus::Failed => "failed",
+            UsageStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// What one external call used.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageDraft {
@@ -46,6 +68,10 @@ pub struct UsageDraft {
     /// The provider's own usage report, as it came (untrusted).
     pub raw_usage: Option<serde_json::Value>,
     pub attribution: Attribution,
+    /// How the call ended (CORE-069).
+    pub status: UsageStatus,
+    /// From the request to its answer, when it was timed (CORE-069).
+    pub latency_ms: Option<u64>,
 }
 
 /// The job or call a draft belongs to.
@@ -81,6 +107,8 @@ impl UsageSink for LogSink {
             basis = u.basis.wire(),
             units = %serde_json::Value::Object(u.units),
             attribution = u.attribution.wire(),
+            status = u.status.wire(),
+            latency_ms = u.latency_ms,
             job_id = ctx.job_id.as_deref().unwrap_or(""),
             call_id = %ctx.call_id,
             caller_kind = %ctx.caller_kind,

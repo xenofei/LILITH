@@ -13,20 +13,21 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 use lil_core::config::ScriptedSockets;
-use lil_core::engines::comfyui::ComfyClient;
 use lil_core::engines::comfyui::install::{self, ExactVersion, INSTALL_TOOL, NodeId};
+use lil_core::engines::comfyui::{ComfyClient, ComfyError};
 use lil_core::engines::tools::{EnginesSlot, register_engine_tools};
 use lil_core::engines::{ComfyConfig, EngineClass, EngineState, Engines, Listen, scrubbed_env};
 use lil_core::events::EventBus;
 use lil_core::jobs::{
     EngineKind, JobCaller, JobId, JobStatus, JobSummary, Jobs, Priority, SubmittedSlot,
 };
-use lil_core::meter::{UsageCtx, UsageDraft, UsageSink};
+use lil_core::meter::{UsageCtx, UsageDraft, UsageSink, UsageStatus};
 use lil_core::state::StateRegistry;
 use lil_core::store::{FailPoints, fsops};
 use lil_core::telemetry::{HwSources, PowerSettings, Telemetry, TickMode};
@@ -179,7 +180,7 @@ struct Recorded {
     real: Arc<dyn SocketTable>,
     asked: Mutex<Vec<u32>>,
     /// Every socket is reported on `0.0.0.0` instead of its own address.
-    wildcard: bool,
+    wildcard: AtomicBool,
 }
 
 impl Recorded {
@@ -187,7 +188,7 @@ impl Recorded {
         Arc::new(Recorded {
             real,
             asked: Mutex::default(),
-            wildcard,
+            wildcard: AtomicBool::new(wildcard),
         })
     }
 
@@ -200,7 +201,7 @@ impl SocketTable for Recorded {
     fn listening(&self, pid: u32) -> std::io::Result<Vec<SocketAddr>> {
         self.asked.lock().unwrap().push(pid);
         let addrs = self.real.listening(pid)?;
-        Ok(if self.wildcard {
+        Ok(if self.wildcard.load(Ordering::SeqCst) {
             addrs
                 .into_iter()
                 .map(|a| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), a.port()))
@@ -428,6 +429,16 @@ fn launch_args_pin_loopback_and_refuse_listen_in_extra_args() {
         let refused = config.launch_args().unwrap_err();
         assert_eq!(refused.code, "comfyui.not_loopback", "{extra}");
     }
+    // The port is the suite's too: another one in extra_args is refused before any start.
+    for extra in [
+        r#"["--port", "8191"]"#,
+        r#"["--port=8191"]"#,
+        r#"["--po", "8191"]"#,
+    ] {
+        let config = ComfyConfig::from_suite_toml(&text(extra)).unwrap().unwrap();
+        let refused = config.launch_args().unwrap_err();
+        assert_eq!(refused.code, "engine.not_configured", "{extra}");
+    }
 }
 
 #[test] // spec: ARCH-063, QA-032
@@ -460,6 +471,13 @@ fn scrubbed_env_removes_every_key_pattern_and_keeps_path_and_hf_home() {
         "claude_code_x",
         "HF_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
+        // Ruling P3-R19: any name holding KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL or
+        // AUTH.
+        "AZURE_OPENAI_KEY",
+        "KAGGLE_KEY",
+        "NGROK_AUTHTOKEN",
+        "SMTP_PASSWD",
+        "TOKENIZERS_PARALLELISM",
     ];
     let kept = [
         "PATH",
@@ -467,7 +485,7 @@ fn scrubbed_env_removes_every_key_pattern_and_keeps_path_and_hf_home() {
         "SystemRoot",
         "TEMP",
         "COMFY_HOME",
-        "TOKENIZERS_PARALLELISM",
+        "CUDA_VISIBLE_DEVICES",
     ];
     let vars = dropped
         .iter()
@@ -491,10 +509,53 @@ fn client_refuses_non_loopback_urls() {
         assert_eq!(client.url(), url);
     }
     // No request can be sent: there is no client.
-    for url in ["http://192.168.1.5:8188", "http://example.com:8188"] {
+    for url in [
+        "http://192.168.1.5:8188",
+        "http://example.com:8188",
+        "http://evil.com@127.0.0.1:8188",
+        "http://user:pw@127.0.0.1:8188",
+    ] {
         let refused = ComfyClient::new(url).unwrap_err();
         assert_eq!(refused.code, "comfyui.not_loopback", "{url}");
     }
+}
+
+/// A "ComfyUI" on 127.0.0.1 that answers every request with a 307 to a listener on
+/// 127.0.0.2: the client must not follow it (I1), so nothing reaches the second listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-068
+async fn client_never_follows_a_redirect() {
+    use std::io::{Read as _, Write as _};
+    let elsewhere = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+    elsewhere.set_nonblocking(true).unwrap();
+    let target = elsewhere.local_addr().unwrap();
+    let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = redirector.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in redirector.incoming() {
+            let Ok(mut conn) = conn else { break };
+            let mut buf = [0_u8; 4096];
+            let _ = conn.read(&mut buf);
+            let answer = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/system_stats\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = conn.write_all(answer.as_bytes());
+        }
+    });
+    let client = ComfyClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
+    for answer in [
+        client.system_stats().await.map(drop),
+        client.free(true, true).await,
+    ] {
+        assert!(
+            matches!(answer, Err(ComfyError::Protocol(_))),
+            "a redirect is a protocol error: {answer:?}"
+        );
+    }
+    let reached = elsewhere.accept();
+    assert!(
+        matches!(&reached, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the redirect was followed: {reached:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-068
@@ -518,6 +579,37 @@ async fn owned_start_verifies_every_listening_socket_is_loopback() {
     );
     assert!(engines.engine_pids(EngineKind::ComfyUi).is_empty());
     assert!(rig.tracked().is_empty(), "{:?}", rig.tracked());
+}
+
+/// An owned engine that starts listening off loopback after its start (a custom node opening a
+/// server) is found by the supervisor's re-check and stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-068
+async fn owned_engine_listening_off_loopback_later_is_stopped() {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-later", false, false);
+    own(&env, &root, "");
+    let rig = Rig::new(env);
+    let sockets = Recorded::new(Arc::new(OsSockets), false);
+    let engines = rig.engines(sockets.clone());
+    let started = engines.start(EngineKind::ComfyUi).await.unwrap();
+    assert_eq!(started.listen, Listen::Loopback);
+    let launcher = started.pid.unwrap();
+
+    sockets.wildcard.store(true, Ordering::SeqCst);
+    // The re-check runs at least every SOCKET_CHECK_EVERY (5) passes.
+    for _ in 0..6 {
+        engines.tick().await;
+        if engines.status().await[0].state == EngineState::Stopped {
+            break;
+        }
+    }
+    let status = engines.status().await.remove(0);
+    assert_eq!(
+        (status.class, status.state),
+        (EngineClass::None, EngineState::Stopped),
+        "the exposed engine still runs"
+    );
+    gone_async(launcher).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-064, ARCH-068, ARCH-071
@@ -965,6 +1057,36 @@ async fn install_requires_an_exact_version_and_records_usage_and_restart_needed(
     assert_eq!(ctx.job_id.as_deref(), Some(job.job_id.as_str()));
     assert_eq!(ctx.call_id, job.job_id);
     assert_eq!(ctx.caller_kind, "cli");
+    // How it ended and how long it took (CORE-069).
+    assert_eq!(draft.status, UsageStatus::Succeeded);
+    assert!(draft.latency_ms.is_some(), "{draft:?}");
+
+    // ComfyUI's Python goes first on PATH, and the environment is the scrubbed one.
+    let started = read_json(&fake.root().join("fake-comfy-cli.env.json")).unwrap();
+    let python_dir = ensure_built().fake_comfyui.parent().unwrap().to_path_buf();
+    assert_eq!(
+        started["path_first"].as_str().map(PathBuf::from),
+        Some(python_dir),
+        "{started}"
+    );
+    let names: Vec<String> = started["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect();
+    let kept: Vec<String> = scrubbed_env(names.iter().map(|n| (n.into(), "v".into())))
+        .into_iter()
+        .map(|(n, _)| n.into_string().unwrap())
+        .collect();
+    assert_eq!(kept, names, "a secret reached comfy-cli");
+
+    // The attached ComfyUI goes away (its owner restarts it): no restart is needed any more.
+    engines.tick().await;
+    assert_eq!(engines.status().await[0].class, EngineClass::Attached);
+    drop(fake);
+    engines.tick().await;
+    assert!(!engines.status().await[0].restart_needed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-060, CORE-131
@@ -987,11 +1109,9 @@ async fn install_failure_is_comfyui_node_install_failed_with_untrusted_detail() 
         "{detail:?}"
     );
     assert!(!engines.status().await[0].restart_needed);
-    assert_eq!(
-        rig.usage.0.lock().unwrap().len(),
-        1,
-        "the registry was asked"
-    );
+    let drafts = rig.usage.0.lock().unwrap().clone();
+    assert_eq!(drafts.len(), 1, "the registry was asked");
+    assert_eq!(drafts[0].0.status, UsageStatus::Failed);
 }
 
 #[test] // spec: CORE-131, ARCH-052, ARCH-059
@@ -999,7 +1119,9 @@ fn install_tool_runs_as_a_job_and_agents_need_a_confirmation() {
     let fake = FakeComfy::start();
     let env = TestEnv::new();
     attach(&env, fake.port(), &fake.root());
-    let _core = CoreFixture::start(&env);
+    // A secret in the core's environment never reaches comfy-cli (ARCH-063).
+    let canary = ("MY_SERVICE_TOKEN", "engines-canary-token");
+    let _core = CoreFixture::start_with_env(&env, &[canary]);
     let args = json!({"id": "comfyui-test-node", "version": "1.2.3"});
 
     let mut pipe = session(&env);
@@ -1027,6 +1149,22 @@ fn install_tool_runs_as_a_job_and_agents_need_a_confirmation() {
         "{waited}"
     );
     until_engine(&mut pipe, "restart_needed", |e| e["restart_needed"] == true);
+    let started = read_json(&fake.root().join("fake-comfy-cli.env.json")).unwrap();
+    let python_dir = ensure_built().fake_comfyui.parent().unwrap().to_path_buf();
+    assert_eq!(
+        started["path_first"].as_str().map(PathBuf::from),
+        Some(python_dir),
+        "{started}"
+    );
+    let names = started["names"].as_array().unwrap();
+    assert!(!names.is_empty(), "{started}");
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.as_str().is_some_and(|n| n.eq_ignore_ascii_case(canary.0))),
+        "{} reached comfy-cli",
+        canary.0
+    );
 }
 
 #[test] // spec: CORE-130, ARCH-112
@@ -1110,4 +1248,34 @@ async fn an_unload_that_never_answers_ends_as_failed() {
             break;
         }
     }
+}
+
+/// The Task 9 carry: ComfyUI's models folder is measured with the workspace, and both sizes
+/// appear together.
+#[test] // spec: CORE-059, CORE-061
+fn models_folder_size_reaches_the_snapshot() {
+    let env = TestEnv::new();
+    let root = env.root().join("comfy-models");
+    lil_testkit::files::write_file(
+        &root.join("models").join("m.safetensors"),
+        &vec![1_u8; 2 << 20],
+    );
+    attach(&env, lil_testkit::free_loopback_port(), &root);
+    let _core = core_with(&env, None);
+    let mut pipe = session(&env);
+    let sizes = poll("models_mib in the snapshot", || {
+        let tick = pipe.tool("test.hw_tick", json!({"samples": 1}), Some(&key()));
+        let sizes = tick["structured"]["sizes"].clone();
+        sizes.get("models_mib").is_some().then_some(sizes)
+    });
+    assert_eq!(sizes["models_mib"], 2, "{sizes}");
+
+    let ws = env.root().join("ws");
+    lil_testkit::files::write_file(&ws.join("a.bin"), &vec![1_u8; 1 << 20]);
+    let mut probe = lil_core::telemetry::sizes_probe(Some(ws), Some(root.join("models")));
+    let both = poll("both sizes", || {
+        let s = probe();
+        (s != lil_core::telemetry::Sizes::default()).then_some(s)
+    });
+    assert_eq!((both.workspace_mib, both.models_mib), (Some(1), Some(2)));
 }

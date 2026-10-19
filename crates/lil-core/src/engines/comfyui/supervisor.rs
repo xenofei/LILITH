@@ -2,17 +2,18 @@
 //! attached engine, the cached engine processes, the idle free and the shutdown stop.
 //!
 //! **Locks.** `ops` (async) serialises start, stop and restart and holds the owned engine; the
-//! supervisor pass only `try_lock`s it, so a start in progress owns the engine's state until it
-//! ends. `view`, `pids` and `idle` are plain mutexes held only to copy or set a value, never
-//! across an await or a call into another module, so [`Comfy::pids`] (read under the jobs
-//! queue's lock) never waits for slow work.
+//! supervisor pass only `try_lock`s it, never across a request, so a start in progress owns the
+//! engine's state until it ends and nothing waits behind a slow engine. `view`, `pids` and
+//! `idle` are plain mutexes held only to copy or set a value, never across an await; `pids` is
+//! also held while the telemetry's tracking is updated (the telemetry takes only its own lock),
+//! so [`Comfy::pids`] (read under the jobs queue's lock) never waits for slow work.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use lil_platform::engine_spawn::{EngineSpawn, OnLine, pid_listening_on, spawn_engine};
@@ -39,7 +40,11 @@ const MONITOR_EVERY: Duration = Duration::from_secs(1);
 /// How often a start asks whether the engine answers yet.
 const READY_POLL: Duration = Duration::from_millis(100);
 /// How long an owned engine may take to answer after it was started.
-const START_TIMEOUT: Duration = Duration::from_secs(180);
+/// A first start after a node install may pip-install requirements (ruling P3-R20).
+const START_TIMEOUT: Duration = Duration::from_secs(600);
+/// The socket checks (an owned engine's loopback re-check, an attached engine's processes and
+/// listeners) run on every this many supervisor passes, and on a change of class.
+const SOCKET_CHECK_EVERY: u64 = 5;
 /// How long a stop waits for the engine's processes to be gone.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The output lines a failed start shows.
@@ -109,11 +114,14 @@ pub(crate) struct Comfy {
     /// Why `[engines.comfyui]` was not read, when it wasn't.
     config_error: Option<String>,
     client: Option<ComfyClient>,
-    jobs: Arc<Jobs>,
+    /// Weak: the jobs hold the GPU scheduler, which holds the engines.
+    jobs: Weak<Jobs>,
     telemetry: Arc<Telemetry>,
     events: Arc<EventBus>,
-    clock: Arc<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) usage: Arc<dyn UsageSink>,
+    /// Supervisor passes so far.
+    passes: AtomicU64,
     sockets: Arc<dyn SocketTable>,
     view: Mutex<View>,
     pids: Mutex<Vec<u32>>,
@@ -150,11 +158,12 @@ impl Comfy {
             config,
             config_error,
             client,
-            jobs,
+            jobs: Arc::downgrade(&jobs),
             telemetry,
             events,
             clock,
             usage,
+            passes: AtomicU64::new(0),
             sockets,
             view: Mutex::new(STOPPED),
             pids: Mutex::new(Vec::new()),
@@ -241,10 +250,18 @@ impl Comfy {
     }
 
     /// Sets what `engines.status` shows; a change is published.
+    ///
+    /// An attached engine that stops answering or answers from another listener was restarted
+    /// by whoever runs it, so a node install no longer needs a restart.
     fn set_view(&self, v: View) {
         let changed = {
             let mut view = lock(&self.view);
             let changed = *view != v;
+            if view.class == EngineClass::Attached
+                && (v.class != EngineClass::Attached || v.pid != view.pid)
+            {
+                self.restart_needed.store(false, Ordering::SeqCst);
+            }
             *view = v;
             changed
         };
@@ -254,15 +271,18 @@ impl Comfy {
     }
 
     /// Replaces the cached engine processes; the telemetry tracks the new ones and forgets the
-    /// gone ones.
+    /// gone ones. The diff is applied while the cache is locked, so concurrent calls leave the
+    /// telemetry and the cache in step (the telemetry takes only its own lock and never calls
+    /// back).
     fn set_pids(&self, new: Vec<u32>) {
-        let old = std::mem::replace(&mut *lock(&self.pids), new.clone());
-        for pid in old.iter().filter(|p| !new.contains(p)) {
+        let mut pids = lock(&self.pids);
+        for pid in pids.iter().filter(|p| !new.contains(p)) {
             self.telemetry.untrack(*pid);
         }
-        for pid in new.iter().filter(|p| !old.contains(p)) {
+        for pid in new.iter().filter(|p| !pids.contains(p)) {
             self.telemetry.track(*pid, COMFYUI_ROLE);
         }
+        *pids = new;
     }
 
     pub(crate) fn set_restart_needed(&self) {
@@ -295,26 +315,56 @@ impl Comfy {
         let (Some(config), Some(client)) = (&self.config, &self.client) else {
             return;
         };
-        // A start, stop or restart in progress owns the state.
-        let Ok(mut ops) = self.ops.try_lock() else {
-            return;
+        let checks = self
+            .passes
+            .fetch_add(1, Ordering::SeqCst)
+            .is_multiple_of(SOCKET_CHECK_EVERY);
+        // What the pass needs of the owned engine, copied: `ops` is never held across a
+        // request, so a start, stop or `StopEngines` never waits behind a slow engine. A start,
+        // stop or restart in progress owns the state, and the pass leaves it alone.
+        let owned = {
+            let Ok(ops) = self.ops.try_lock() else {
+                return;
+            };
+            ops.as_ref().map(|o| (o.launcher.pid(), o.job.pids().ok()))
         };
         let answer = client.system_stats().await;
-        match (ops.as_ref(), answer) {
-            (Some(owned), Ok(stats)) => {
-                if let Ok(pids) = owned.job.pids() {
-                    self.set_pids(pids);
+        match (owned, answer) {
+            (Some((launcher, pids)), Ok(stats)) => {
+                if checks
+                    && let Some(pids) = &pids
+                    && let Err(e) = self.check_still_loopback(pids).await
+                {
+                    self.stop_exposed(launcher, e).await;
+                    return;
                 }
-                self.set_view(View {
-                    class: EngineClass::Owned,
-                    state: EngineState::Ready,
-                    pid: Some(owned.launcher.pid()),
-                    listen: Listen::Loopback,
-                    version: version_of(&stats),
-                });
+                {
+                    let Ok(ops) = self.ops.try_lock() else {
+                        return;
+                    };
+                    if ops.as_ref().map(|o| o.launcher.pid()) != Some(launcher) {
+                        return;
+                    }
+                    if let Some(pids) = pids {
+                        self.set_pids(pids);
+                    }
+                    self.set_view(View {
+                        class: EngineClass::Owned,
+                        state: EngineState::Ready,
+                        pid: Some(launcher),
+                        listen: Listen::Loopback,
+                        version: version_of(&stats),
+                    });
+                }
                 self.idle_free(config, client).await;
             }
-            (Some(owned), Err(e)) => {
+            (Some((launcher, _)), Err(e)) => {
+                let Ok(mut ops) = self.ops.try_lock() else {
+                    return;
+                };
+                let Some(owned) = ops.as_ref().filter(|o| o.launcher.pid() == launcher) else {
+                    return;
+                };
                 if owned.running() {
                     if let Ok(pids) = owned.job.pids() {
                         self.set_pids(pids);
@@ -332,20 +382,88 @@ impl Comfy {
                 }
             }
             (None, Ok(stats)) => {
-                drop(ops);
-                self.observe_attached(config.port, &stats).await;
+                let known = lock(&self.view).class == EngineClass::Attached;
+                let found = if checks || !known {
+                    Some(self.discover_attached(config.port).await)
+                } else {
+                    None
+                };
+                let Ok(ops) = self.ops.try_lock() else {
+                    return;
+                };
+                if ops.is_some() {
+                    return;
+                }
+                match found {
+                    Some(found) => self.apply_attached(found, &stats),
+                    None => {
+                        let mut v = lock(&self.view).clone();
+                        v.version = version_of(&stats);
+                        self.set_view(v);
+                    }
+                }
             }
             (None, Err(_)) => {
-                self.set_pids(Vec::new());
-                self.set_view(STOPPED);
+                let Ok(ops) = self.ops.try_lock() else {
+                    return;
+                };
+                if ops.is_none() {
+                    self.set_pids(Vec::new());
+                    self.set_view(STOPPED);
+                }
             }
         }
+    }
+
+    /// Re-checks a running owned engine's listening sockets (ARCH-068): a custom node can open
+    /// a server long after the start.
+    async fn check_still_loopback(&self, pids: &[u32]) -> Result<(), ErrorBody> {
+        let sockets = self.sockets.clone();
+        let listed = pids.to_vec();
+        let exposed =
+            tokio::task::spawn_blocking(move || exposed_sockets(&listed, sockets.as_ref()))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+        match exposed {
+            Ok(exposed) if exposed.is_empty() => Ok(()),
+            Ok(exposed) => Err(not_loopback(format!(
+                "ComfyUI began listening on {}: it must listen on loopback only (ARCH-068), so \
+                 the core stopped it. Check the custom nodes that open a server.",
+                list_sockets(&exposed)
+            ))),
+            // A table that can't be read once isn't a finding; the next check reads it again.
+            Err(why) => {
+                tracing::warn!(error = %why, "ComfyUI's sockets could not be re-checked");
+                Ok(())
+            }
+        }
+    }
+
+    /// Stops the owned engine `launcher` found listening off loopback, and says why on the
+    /// `engines` topic.
+    async fn stop_exposed(&self, launcher: u32, error: ErrorBody) {
+        let mut ops = self.ops.lock().await;
+        if ops.as_ref().map(|o| o.launcher.pid()) != Some(launcher) {
+            return;
+        }
+        tracing::error!(error = %error.message, "the owned ComfyUI listens off loopback; it is stopped");
+        if let Some(owned) = ops.take() {
+            end(owned).await;
+        }
+        self.set_pids(Vec::new());
+        lock(&self.view).clone_from(&STOPPED);
+        let status = serde_json::to_value(self.status()).unwrap_or(Value::Null);
+        self.events.publish(
+            TOPIC,
+            json!({"kind": "status", "engine": status, "error": error}),
+        );
     }
 
     /// An owned engine with no suite job for `idle_free_after_s` is asked to free its models
     /// and memory, once until a job uses it again.
     async fn idle_free(&self, config: &ComfyConfig, client: &ComfyClient) {
-        let busy = self.jobs.busy();
+        let busy = self.jobs.upgrade().is_some_and(|jobs| jobs.busy());
         let now = self.clock.monotonic();
         let due = {
             let mut idle = lock(&self.idle);
@@ -379,11 +497,21 @@ impl Comfy {
     /// Records the engine answering on `port` as attached: its processes and where they
     /// listen.
     async fn observe_attached(&self, port: u16, stats: &Value) {
+        let found = self.discover_attached(port).await;
+        self.apply_attached(found, stats);
+    }
+
+    /// The process listening on `port`, it and its descendants, and where they listen (read
+    /// off the runtime's threads).
+    async fn discover_attached(&self, port: u16) -> (Option<u32>, Vec<u32>, Listen) {
         let sockets = self.sockets.clone();
-        let (listener, pids, listen) =
-            tokio::task::spawn_blocking(move || attached_processes(port, sockets.as_ref()))
-                .await
-                .unwrap_or((None, Vec::new(), Listen::Unknown));
+        tokio::task::spawn_blocking(move || attached_processes(port, sockets.as_ref()))
+            .await
+            .unwrap_or((None, Vec::new(), Listen::Unknown))
+    }
+
+    fn apply_attached(&self, found: (Option<u32>, Vec<u32>, Listen), stats: &Value) {
+        let (listener, pids, listen) = found;
         self.set_pids(pids);
         self.set_view(View {
             class: EngineClass::Attached,
@@ -575,17 +703,11 @@ impl Comfy {
                 self.output_tail(),
             )),
             (_, Err(why)) => Err(not_loopback(why)),
-            (_, Ok(exposed)) if !exposed.is_empty() => {
-                let list: Vec<String> = exposed
-                    .iter()
-                    .map(|(pid, addr)| format!("{addr} (process {pid})"))
-                    .collect();
-                Err(not_loopback(format!(
-                    "ComfyUI listened on {}: it must listen on loopback only (ARCH-068), so the \
+            (_, Ok(exposed)) if !exposed.is_empty() => Err(not_loopback(format!(
+                "ComfyUI listened on {}: it must listen on loopback only (ARCH-068), so the \
                      core stopped it. Check extra_args and any custom node that opens a server.",
-                    list.join(", ")
-                )))
-            }
+                list_sockets(&exposed)
+            ))),
             _ => Ok(pids),
         }
     }
@@ -785,19 +907,22 @@ fn exposed_sockets(
     pids: &[u32],
     sockets: &dyn SocketTable,
 ) -> Result<Vec<(u32, SocketAddr)>, String> {
-    let mut exposed = Vec::new();
-    for &pid in pids {
-        let addrs = sockets
-            .listening(pid)
-            .map_err(|e| format!("the listening sockets of process {pid} can't be read: {e}"))?;
-        exposed.extend(
-            addrs
-                .into_iter()
-                .filter(|a| !a.ip().is_loopback())
-                .map(|a| (pid, a)),
-        );
-    }
-    Ok(exposed)
+    let rows = sockets
+        .listening_of(pids)
+        .map_err(|e| format!("the listening sockets of ComfyUI's processes can't be read: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, a)| !a.ip().is_loopback())
+        .collect())
+}
+
+/// `<address> (process <pid>), …`.
+fn list_sockets(exposed: &[(u32, SocketAddr)]) -> String {
+    exposed
+        .iter()
+        .map(|(pid, addr)| format!("{addr} (process {pid})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn not_configured(message: String) -> ErrorBody {

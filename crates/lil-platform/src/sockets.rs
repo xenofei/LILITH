@@ -142,6 +142,16 @@ pub fn sockets_of(pid: u32) -> io::Result<Vec<SocketKind>> {
 pub trait SocketTable: Send + Sync {
     /// The local address of every listening TCP socket (IPv4 and IPv6) that `pid` owns.
     fn listening(&self, pid: u32) -> io::Result<Vec<SocketAddr>>;
+
+    /// [`SocketTable::listening`] of each of `pids`, as `(pid, address)`, in `pids`' order. An
+    /// implementation may read its tables once for all of them.
+    fn listening_of(&self, pids: &[u32]) -> io::Result<Vec<(u32, SocketAddr)>> {
+        let mut found = Vec::new();
+        for &pid in pids {
+            found.extend(self.listening(pid)?.into_iter().map(|a| (pid, a)));
+        }
+        Ok(found)
+    }
 }
 
 /// The system's TCP tables ([`listening_sockets`]).
@@ -151,6 +161,19 @@ pub struct OsSockets;
 impl SocketTable for OsSockets {
     fn listening(&self, pid: u32) -> io::Result<Vec<SocketAddr>> {
         listening_sockets(pid)
+    }
+
+    /// One read of the IPv4 and IPv6 tables for all of `pids`.
+    fn listening_of(&self, pids: &[u32]) -> io::Result<Vec<(u32, SocketAddr)>> {
+        let rows = tcp_listeners()?;
+        Ok(pids
+            .iter()
+            .flat_map(|&pid| {
+                rows.iter()
+                    .filter(move |(_, owner)| *owner == pid)
+                    .map(move |(addr, _)| (pid, *addr))
+            })
+            .collect())
     }
 }
 

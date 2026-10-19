@@ -14,7 +14,7 @@
 //! The listening-socket reads for the loopback check are here too.
 
 use std::ffi::{OsString, c_void};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, Read as _};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,24 +142,65 @@ pub fn spawn_engine(
     Ok(child)
 }
 
-/// Reads `pipe` line by line on its own thread until it ends.
-fn read_lines(stream: &'static str, pipe: std::io::PipeReader, on_line: Arc<OnLine>) {
+/// The longest line handed on: a longer one is cut here and goes on as the next line, so an
+/// engine that never ends a line can't grow one without bound.
+pub const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// Reads `pipe` line by line ([`Lines`]) on its own thread until it ends.
+fn read_lines(stream: &'static str, mut pipe: std::io::PipeReader, on_line: Arc<OnLine>) {
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut line = Vec::new();
+        let mut lines = Lines::default();
+        let mut emit = |line: &[u8]| on_line(stream, &String::from_utf8_lossy(line));
+        let mut chunk = [0_u8; 8192];
         loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
+            match pipe.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    while line.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
-                        line.pop();
+                Ok(n) => lines.push(&chunk[..n], &mut emit),
+            }
+        }
+        lines.finish(&mut emit);
+    });
+}
+
+/// Splits output into lines: a line ends at `\n`, `\r` or `\r\n` (a progress bar that redraws
+/// with `\r` gives one line per redraw), and is cut at [`MAX_LINE_BYTES`]. The endings are not
+/// part of a line.
+#[derive(Debug, Default)]
+struct Lines {
+    line: Vec<u8>,
+    /// The last byte was `\r`: a `\n` right after it ends nothing more.
+    after_cr: bool,
+}
+
+impl Lines {
+    fn push(&mut self, bytes: &[u8], out: &mut impl FnMut(&[u8])) {
+        for &b in bytes {
+            let after_cr = std::mem::take(&mut self.after_cr);
+            match b {
+                b'\n' if after_cr => {}
+                b'\n' | b'\r' => {
+                    out(&self.line);
+                    self.line.clear();
+                    self.after_cr = b == b'\r';
+                }
+                _ => {
+                    self.line.push(b);
+                    if self.line.len() == MAX_LINE_BYTES {
+                        out(&self.line);
+                        self.line.clear();
                     }
-                    on_line(stream, &String::from_utf8_lossy(&line));
                 }
             }
         }
-    });
+    }
+
+    /// The last line, when the output ended without a line ending.
+    fn finish(&mut self, out: &mut impl FnMut(&[u8])) {
+        if !self.line.is_empty() {
+            out(&self.line);
+            self.line.clear();
+        }
+    }
 }
 
 /// A `PROC_THREAD_ATTRIBUTE_LIST` with one attribute, `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. It
@@ -208,5 +249,35 @@ impl Drop for AttributeList {
     fn drop(&mut self) {
         // SAFETY: an `AttributeList` exists only once its list is initialised; deleted once.
         unsafe { DeleteProcThreadAttributeList(self.list()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(chunks: &[&[u8]]) -> Vec<String> {
+        let mut lines = Lines::default();
+        let mut out = Vec::new();
+        let mut emit = |l: &[u8]| out.push(String::from_utf8_lossy(l).into_owned());
+        for chunk in chunks {
+            lines.push(chunk, &mut emit);
+        }
+        lines.finish(&mut emit);
+        out
+    }
+
+    #[test] // spec: ARCH-119
+    fn lines_end_at_lf_cr_or_crlf_and_are_capped() {
+        let (cr, lf) = (13_u8, 10_u8);
+        let first = [b'a', cr, lf, b'b', lf];
+        let bar = [b'1', b'%', cr, b'2', b'%', cr];
+        let rest = [lf, b'e', b'n', b'd'];
+        assert_eq!(split(&[&first, &bar, &rest]), ["a", "b", "1%", "2%", "end"]);
+        // A CR LF split across two reads is still one ending.
+        assert_eq!(split(&[&[b'x', cr], &[lf, b'y', lf]]), ["x", "y"]);
+        let long = vec![b'z'; MAX_LINE_BYTES + 5];
+        let cut: Vec<usize> = split(&[&long]).iter().map(String::len).collect();
+        assert_eq!(cut, [MAX_LINE_BYTES, 5]);
     }
 }

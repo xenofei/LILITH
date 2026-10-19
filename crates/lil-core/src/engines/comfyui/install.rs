@@ -7,7 +7,8 @@
 //! The version must be an exact `major.minor.patch` and the id a registry id (never a URL or
 //! anything that starts with `-`). comfy-cli asks the comfy registry, so every run that started
 //! records one usage draft (provider `comfy-registry`, basis `free_tier`, `requests: 1`;
-//! CORE-069), whatever its outcome. A success sets the engine's `restart_needed`; a failure is
+//! CORE-069), with its outcome (`succeeded`, `failed` or `cancelled`) and its latency. The
+//! write-ahead `pending` record before the spawn (CORE-071) comes with Task 15's meter. A success sets the engine's `restart_needed`; a failure is
 //! `comfyui.node_install_failed` with comfy-cli's output as untrusted detail (ARCH-060).
 
 use std::collections::VecDeque;
@@ -29,7 +30,7 @@ use crate::jobs::{
     EngineKind, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec, Lane, Priority,
     cancelled_error,
 };
-use crate::meter::{Attribution, UsageCtx, UsageDraft};
+use crate::meter::{Attribution, UsageCtx, UsageDraft, UsageStatus};
 use crate::tools::stages::BillingBasis;
 
 /// The job kind.
@@ -292,6 +293,7 @@ impl NodeInstallHandler {
                 &[],
             )))
         })?;
+        let spawned = engines.comfy().clock.monotonic();
         tracing::info!(id, version, pid = cli.pid(), "a node install runs");
         let mut cancel = job.cancel.clone();
         let ended = tokio::select! {
@@ -302,6 +304,7 @@ impl NodeInstallHandler {
             _ = cancel.wait_for(|c| *c) => Ended::Cancelled,
             () = tokio::time::sleep(INSTALL_TIMEOUT) => Ended::TimedOut,
         };
+        let latency = engines.comfy().clock.monotonic().saturating_sub(spawned);
         // Whatever comfy-cli started ends with it; then its output is read to the end.
         let _ = kill_on_close.terminate();
         drop(kill_on_close);
@@ -315,11 +318,18 @@ impl NodeInstallHandler {
         }
         let lines: Vec<String> = tail.into();
 
-        // comfy-cli ran, so the registry was asked (CORE-069).
+        // comfy-cli ran, so the registry was asked (CORE-069): how it ended, and how long it
+        // took. (Task 15 carry: the write-ahead `pending` record before the spawn, CORE-071.)
+        let status = match ended {
+            Ended::Exited(0) => UsageStatus::Succeeded,
+            Ended::Cancelled => UsageStatus::Cancelled,
+            Ended::Exited(_) | Ended::TimedOut => UsageStatus::Failed,
+        };
+        let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
         engines
             .comfy()
             .usage
-            .record(draft(), usage_ctx(job, &args))
+            .record(draft(status, latency_ms), usage_ctx(job, &args))
             .await;
 
         match ended {
@@ -354,8 +364,8 @@ impl NodeInstallHandler {
     }
 }
 
-/// The usage draft of one registry install.
-fn draft() -> UsageDraft {
+/// The usage draft of one registry install that ended with `status` after `latency_ms`.
+fn draft(status: UsageStatus, latency_ms: u64) -> UsageDraft {
     let mut units = serde_json::Map::new();
     units.insert("requests".to_string(), json!(1));
     UsageDraft {
@@ -369,6 +379,8 @@ fn draft() -> UsageDraft {
         account: None,
         raw_usage: None,
         attribution: Attribution::Suite,
+        status,
+        latency_ms: Some(latency_ms),
     }
 }
 
