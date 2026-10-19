@@ -41,7 +41,7 @@ struct Fx {
     clock: Arc<FakeClock>,
     dispatcher: Dispatcher,
     /// Last: the dispatcher holds the suite `state.db`, which must close before the folder goes.
-    _env: TestEnv,
+    env: TestEnv,
 }
 
 /// An `exec` tool that counts its runs.
@@ -131,7 +131,7 @@ fn fixture(mcp: McpConfirmation) -> Fx {
         confirm,
         clock,
         dispatcher,
-        _env: env,
+        env,
     }
 }
 
@@ -307,6 +307,20 @@ async fn non_interactive_never_gets_pending() {
     assert!(fx.pending().await.is_empty());
     assert!(fx.history().await.is_empty());
     assert_eq!(fx.destructive_runs().await, 0);
+
+    // I2: a non-interactive retry of an interactive call's pending token gets the error too,
+    // and the key stays for the interactive retry.
+    let k = next_key();
+    let p = pending(&fx.call(&cli(), "test.destructive", json!({}), &k).await);
+    let script = session(CallerKind::Cli, "s_script", true);
+    let out = fx.call(&script, "test.destructive", json!({}), &k).await;
+    assert_eq!(code(&out), "confirm.unavailable");
+    let again = pending(&fx.call(&cli(), "test.destructive", json!({}), &k).await);
+    assert_eq!(again, p, "the key was kept");
+    // Once you approved it, the call is yours to let run, from wherever it is retried.
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&script, "test.destructive", json!({}), &k).await;
+    assert_eq!(ok(&ran)["count"], 2, "after the probe above");
 }
 
 #[tokio::test] // spec: CORE-111
@@ -480,6 +494,112 @@ async fn deny_and_expiry_return_their_codes_and_release_the_key() {
     assert_eq!(fx.destructive_runs().await, 0, "nothing ran");
 }
 
+/// I1: an approval holds for the lifetime from its answer; a retry after that needs a fresh
+/// confirmation.
+#[tokio::test] // spec: CORE-115, CORE-091
+async fn an_approval_expires_unused() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let k = next_key();
+    let p = pending(&fx.call(&cli(), "test.destructive", json!({}), &k).await);
+    fx.clock.advance(LIFETIME - Duration::from_secs(1));
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    // Still within the lifetime from the answer (though past the prompt's own).
+    fx.clock.advance(LIFETIME - Duration::from_secs(1));
+    let k2 = next_key();
+    let q = pending(&fx.call(&cli(), "test.destructive", json!({}), &k2).await);
+    fx.answer(&q.confirmation_id, Answer::Approve).await;
+    fx.clock.advance(LIFETIME);
+    let expired = fx.call(&cli(), "test.destructive", json!({}), &k2).await;
+    assert_eq!(code(&expired), "confirm.expired");
+    let fresh = pending(&fx.call(&cli(), "test.destructive", json!({}), &k2).await);
+    assert_ne!(
+        fresh.confirmation_id, q.confirmation_id,
+        "a fresh confirmation"
+    );
+    assert_eq!(
+        fx.destructive_runs().await,
+        0,
+        "the stale approval ran nothing"
+    );
+    // 29 days later (the reviewer's probe): still expired, never run.
+    fx.clock.advance(Duration::from_secs(29 * 24 * 3600));
+    let stale = fx.call(&cli(), "test.destructive", json!({}), &k).await;
+    assert_eq!(code(&stale), "confirm.expired");
+    assert_eq!(fx.destructive_runs().await, 1, "only the probe ran");
+}
+
+/// M6: answered, expired and cancelled confirmations go with the idempotency rows after 30
+/// days; pending and recent ones stay.
+#[tokio::test] // spec: CORE-016, APP-046
+async fn old_confirmations_are_pruned() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let old = pending(&fx.call(&cli(), "x.exec", json!({}), &next_key()).await);
+    fx.answer(&old.confirmation_id, Answer::Deny).await;
+    fx.clock.advance(Duration::from_secs(29 * 24 * 3600));
+    let recent = pending(&fx.call(&cli(), "x.exec", json!({}), &next_key()).await);
+    fx.answer(&recent.confirmation_id, Answer::Deny).await;
+    fx.clock.advance(Duration::from_secs(2 * 24 * 3600));
+    // Any call with a key runs the prune.
+    let waiting = pending(&fx.call(&cli(), "x.exec", json!({}), &next_key()).await);
+    let history: Vec<String> = fx.history().await.into_iter().map(|r| r.id).collect();
+    assert_eq!(history, [recent.confirmation_id]);
+    let pending_now: Vec<String> = fx.pending().await.into_iter().map(|r| r.id).collect();
+    assert_eq!(pending_now, [waiting.confirmation_id]);
+}
+
+/// M5, M2: in a workspace (the usual case) the confirmation lives in the workspace's
+/// `state.db`, and the approval is for the call's resolved project: one that now resolves to
+/// another project asks again.
+#[tokio::test] // spec: ARCH-099, ARCH-088, CORE-091
+async fn workspace_confirmations_live_there_and_bind_the_project() {
+    let fx = fixture(McpConfirmation::Core);
+    let folder = fx.env.make_workspace("ws");
+    fx.env.register_workspace(&folder, true);
+    fx.dispatcher.hub().refresh_default();
+    let canonical = std::fs::canonicalize(&folder).unwrap();
+    let text = canonical.to_string_lossy().into_owned();
+    let ws = lil_core::workspace::WorkspaceRef {
+        id: lil_platform::Env::workspace_hash(&canonical),
+        path: std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)),
+    };
+    let agent = Arc::new(Session {
+        workspace: Some(ws.clone()),
+        ..(*cli()).clone()
+    });
+    fx.confirm.presence().opened();
+    let k = next_key();
+    let p = pending(&fx.call(&agent, "test.destructive", json!({}), &k).await);
+    let listed = fx.pending().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].scope, format!("cli|{}", ws.id));
+    assert_eq!(listed[0].project.as_deref(), Some("sketchbook"));
+    assert!(fx.confirm.busy());
+    let suite_rows: i64 = rusqlite::Connection::open_with_flags(
+        fx.env.env.suite_state_db(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row("SELECT count(*) FROM confirmations", [], |r| r.get(0))
+    .unwrap();
+    assert_eq!(suite_rows, 0, "not in the suite state.db");
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+
+    // The call would now run in another project: the approval doesn't cover it.
+    fx.dispatcher.active_projects().set(&agent.id, "other");
+    let q = pending(&fx.call(&agent, "test.destructive", json!({}), &k).await);
+    assert_ne!(q.confirmation_id, p.confirmation_id);
+    let listed = fx.pending().await;
+    assert_eq!(listed[0].project.as_deref(), Some("other"));
+    fx.answer(&q.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&agent, "test.destructive", json!({}), &k).await;
+    assert_eq!(ok(&ran)["count"], 1);
+    let replay = fx.call(&agent, "test.destructive", json!({}), &k).await;
+    assert_eq!(ok(&replay)["count"], 1, "once");
+    assert!(!fx.confirm.busy());
+}
+
 #[tokio::test] // spec: CORE-016, CORE-091, ARCH-053
 async fn retry_with_other_arguments_is_a_conflict() {
     let fx = fixture(McpConfirmation::Core);
@@ -629,6 +749,13 @@ async fn mcp_sessions_get_no_marker_and_core_confirmations() {
     assert_eq!(view.state, "approved");
     assert_eq!(view.confirmed_via.as_deref(), Some("claude_code"));
     assert_eq!(view.caller_kind, "mcp");
+    // A non-interactive mcp call (no person saw a prompt) fails closed (M1).
+    let script = session(CallerKind::Mcp, "s_mcp_script", true);
+    let out = cc
+        .call(&script, "test.destructive", json!({}), &next_key())
+        .await;
+    assert_eq!(code(&out), "confirm.unavailable");
+    assert_eq!(cc.history().await.len(), 1, "nothing recorded for it");
     // A cli call still gets the core's confirmation.
     let out = cc
         .call(&cli(), "test.destructive", json!({}), &next_key())
@@ -647,6 +774,7 @@ async fn ui_cap_prompts_are_cancelled_when_the_app_closes() {
         arguments: json!({}),
         caller_kind: caller.into(),
         session_id: session.into(),
+        project: None,
         covers,
         cap: None,
     };

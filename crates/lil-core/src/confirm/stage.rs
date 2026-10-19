@@ -14,11 +14,11 @@ use crate::tools::{
 /// Agent safety confirmations (ARCH-052–055, CORE-109–113, QA-016):
 /// - only an agent's (`assistant`, `mcp`, `cli`) call of a `destructive` or `exec` tool asks
 ///   (or a retry that must, [`ConfirmInput::always_confirm`]); your own actions never do;
-/// - an `mcp` call with `mcp_confirmation = "claude_code"` was confirmed by Claude Code's own
-///   prompt (its tool carries the marker): it proceeds and is recorded `approved`,
+/// - a non-interactive caller always gets `confirm.unavailable` (QA-016), whatever the mode;
+/// - an interactive `mcp` call with `mcp_confirmation = "claude_code"` was confirmed by Claude
+///   Code's own prompt (its tool carries the marker): it proceeds and is recorded `approved`,
 ///   `confirmed_via: claude_code`. Not for a `job.retry`, whose tool carries no marker;
-/// - a non-interactive caller, or any call while no confirmation can be answered, gets
-///   `confirm.unavailable`;
+/// - any call while no confirmation can be answered gets `confirm.unavailable`;
 /// - otherwise the call gets `pending_confirmation`, one per idempotency key.
 pub struct AgentConfirm {
     confirm: Arc<Confirm>,
@@ -60,9 +60,15 @@ impl ConfirmStage for AgentConfirm {
                 arguments: i.args.clone(),
                 caller_kind: i.session.caller.to_string(),
                 session_id: i.session.id.clone(),
+                project: i.project.map(str::to_string),
                 covers: vec![Cover::Confirm],
                 cap: None,
             };
+            // A non-interactive caller is never asked, nor counted as asked (QA-016): no
+            // person may have seen a prompt (`claude -p`, an SDK host), so it fails closed.
+            if i.session.non_interactive {
+                return ConfirmDecision::Unavailable;
+            }
             let claude_code_asked = i.session.caller == CallerKind::Mcp
                 && self.confirm.mcp() == McpConfirmation::ClaudeCode
                 && i.descriptor.effect.needs_agent_confirmation()
@@ -80,7 +86,7 @@ impl ConfirmStage for AgentConfirm {
                     Err(e) => ConfirmDecision::Failed(state_unavailable(&e)),
                 };
             }
-            if i.session.non_interactive || !self.confirm.answerable() {
+            if !self.confirm.answerable() {
                 return ConfirmDecision::Unavailable;
             }
             match self.confirm.request(request).await {
@@ -101,6 +107,7 @@ impl ConfirmStage for AgentConfirm {
                     confirmation_id: row.id,
                     tool: row.tool,
                     arguments: row.arguments,
+                    project: row.project,
                     confirmed_via: row.confirmed_via.unwrap_or(ConfirmedVia::App),
                     cap_action: row.cap_action,
                 }),

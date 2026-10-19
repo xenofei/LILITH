@@ -14,9 +14,13 @@
 //!   minutes; `LIL_TEST_CONFIRM_LIFETIME_SECS` on a test channel).
 //! - **The retry token is the idempotency key.** The dispatcher stores the
 //!   `pending_confirmation` as the call's outcome; a retry with the key finds it and asks
-//!   [`Confirm::on_replay`]: approved runs the call once (the row is taken back with
-//!   `StateDb::idem_reclaim`, so of racing retries exactly one runs it), denied and expired
-//!   release the key, still pending replays the same `pending_confirmation`.
+//!   [`Confirm::on_replay`]: approved runs the call once, for the tool, arguments and project
+//!   you saw, if the retry comes within the lifetime from your answer (the row is taken back
+//!   with `StateDb::idem_reclaim`, so of racing retries exactly one runs it; later the approval
+//!   has expired); denied and expired release the key; still pending replays the same
+//!   `pending_confirmation` (a non-interactive caller gets `confirm.unavailable` instead, and
+//!   the key stays). Answered, expired and cancelled rows older than 30 days are pruned with
+//!   the idempotency rows.
 //! - **Who answers.** Only a verified `ui:*` session ([`Confirm::answer`]; the router lets
 //!   nobody else reach `app/confirmation.answer`), after a real input event in the shared
 //!   dialog, which the core cannot see: it verifies the connection, not the click (APP-044).
@@ -135,6 +139,8 @@ pub struct ConfirmationRow {
     pub cap_action: Option<String>,
     /// The session that made the call.
     pub session_id: String,
+    /// The call's resolved project (none without a workspace): the approval is for it.
+    pub project: Option<String>,
 }
 
 impl ConfirmationRow {
@@ -151,6 +157,7 @@ impl ConfirmationRow {
             tool: self.tool.clone(),
             arguments: self.arguments.clone(),
             caller_kind: self.caller_kind.clone(),
+            project: self.project.clone(),
             covers: self.covers.clone(),
             cap: self.cap.clone(),
             state: self.state.wire().to_string(),
@@ -271,6 +278,8 @@ pub struct ConfirmRequest {
     pub arguments: Value,
     pub caller_kind: String,
     pub session_id: String,
+    /// The call's resolved project (none without a workspace).
+    pub project: Option<String>,
     pub covers: Vec<Cover>,
     /// The caps the call would pass (Task 16).
     pub cap: Option<Vec<CapHit>>,
@@ -435,6 +444,7 @@ impl Confirm {
             answered_utc: answered.then_some(now),
             cap_action: None,
             session_id: r.session_id,
+            project: r.project,
         }
     }
 
@@ -488,6 +498,18 @@ impl Confirm {
                 self.track(&row);
                 Replay::StillPending(row.pending())
             }
+            // An approval holds for the lifetime from its answer (Appendix F: a confirmation
+            // expires after 30 minutes); after that the call needs a fresh one.
+            ConfState::Approved
+                if row
+                    .answered_utc
+                    .unwrap_or(row.created_utc)
+                    .saturating_add(self.lifetime_secs())
+                    <= self.now() =>
+            {
+                tracing::info!(confirmation = %row.id, "an approval expired before its call ran");
+                Replay::Expired
+            }
             ConfState::Approved => Replay::Run(Box::new(row)),
             ConfState::Denied => Replay::Denied,
             ConfState::Expired | ConfState::Cancelled => Replay::Expired,
@@ -498,7 +520,7 @@ impl Confirm {
     /// ended it.
     async fn expire(&self, db: &StateDb, id: &str) -> Result<(), StateError> {
         self.untrack(id);
-        if let Some(row) = store::end(db, id, ConfState::Expired, None, None, None).await? {
+        if let Some(row) = store::end(db, id, ConfState::Expired, None, None, None, None).await? {
             tracing::info!(confirmation = %row.id, "a confirmation expired unanswered");
             self.publish("expired", &row);
         }
@@ -599,32 +621,35 @@ impl Confirm {
         if row.state != ConfState::Pending {
             return Err(ended(&row));
         }
-        if row.expires_utc <= self.now() {
-            self.expire(&db, &id).await.map_err(|e| state_error(&e))?;
-            return Err(expired());
-        }
         let state = match p.answer {
             Answer::Approve => ConfState::Approved,
             Answer::Deny => ConfState::Denied,
         };
         let cap_action = p.cap.map(|c| c.action.wire().to_string());
+        // Only while it has not expired: checked in the same statement as the answer.
+        let now = self.now();
         let answered = store::end(
             &db,
             &id,
             state,
             Some(ConfirmedVia::App),
-            Some(self.now()),
+            Some(now),
             cap_action,
+            Some(now),
         )
         .await
         .map_err(|e| state_error(&e))?;
         let Some(answered) = answered else {
-            // Another answer, or the expiry, came first.
-            let now = store::get(&db, &id)
+            // Another answer, the expiry, or its time came first.
+            let row = store::get(&db, &id)
                 .await
                 .map_err(|e| state_error(&e))?
                 .unwrap_or(row);
-            return Err(ended(&now));
+            if row.state == ConfState::Pending {
+                self.expire(&db, &id).await.map_err(|e| state_error(&e))?;
+                return Err(expired());
+            }
+            return Err(ended(&row));
         };
         self.untrack(&id);
         tracing::info!(confirmation = %id, answer = answered.state.wire(), by = %by.caller, "a confirmation was answered");
@@ -693,7 +718,7 @@ impl Confirm {
             let Some(db) = self.db_of(&workspace) else {
                 continue;
             };
-            match store::end(&db, &id, ConfState::Cancelled, None, None, None).await {
+            match store::end(&db, &id, ConfState::Cancelled, None, None, None, None).await {
                 Ok(Some(row)) => {
                     tracing::info!(confirmation = %id, "a cap confirmation is cancelled: its app closed");
                     self.publish("cancelled", &row);

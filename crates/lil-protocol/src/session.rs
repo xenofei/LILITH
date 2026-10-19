@@ -579,8 +579,8 @@ mod tests {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
         assert_eq!(h, schema_hash());
-        // Protocol 1.1 added the `app/*` confirmation types.
-        assert_eq!(h, "01c21605fe831eef");
+        // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation).
+        assert_eq!(h, "bd5c5bac6bf5c159");
     }
 
     #[test] // spec: ARCH-029

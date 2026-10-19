@@ -11,7 +11,7 @@ use crate::tools::ConfirmedVia;
 
 const COLUMNS: &str = "id, scope, idem_key, tool, args_hash, arguments, caller_kind, covers, \
                        cap, state, confirmed_via, created_utc, expires_utc, answered_utc, \
-                       cap_action, session_id";
+                       cap_action, session_id, project";
 
 fn sql(e: &rusqlite::Error) -> StateError {
     match e.sqlite_error_code() {
@@ -62,6 +62,7 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<ConfirmationRow> {
         answered_utc: r.get(13)?,
         cap_action: r.get(14)?,
         session_id: r.get(15)?,
+        project: r.get(16)?,
     })
 }
 
@@ -70,7 +71,7 @@ fn insert(conn: &rusqlite::Connection, row: &ConfirmationRow) -> rusqlite::Resul
     conn.execute(
         &format!(
             "INSERT INTO confirmations ({COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         ),
         params![
             row.id,
@@ -89,6 +90,7 @@ fn insert(conn: &rusqlite::Connection, row: &ConfirmationRow) -> rusqlite::Resul
             row.answered_utc,
             row.cap_action,
             row.session_id,
+            row.project,
         ],
     )
     .map(drop)
@@ -243,7 +245,8 @@ pub(super) async fn list(
 }
 
 /// Ends the pending confirmation `id` as `state` (with how and when it was answered): the row
-/// after the change, or `None` when it was not pending (any more).
+/// after the change, or `None` when it was not pending (any more), or, with `unexpired_at`,
+/// when it had expired by then (checked in the same statement, so a late answer never lands).
 pub(super) async fn end(
     db: &StateDb,
     id: &str,
@@ -251,6 +254,7 @@ pub(super) async fn end(
     via: Option<ConfirmedVia>,
     answered_utc: Option<i64>,
     cap_action: Option<String>,
+    unexpired_at: Option<i64>,
 ) -> Result<Option<ConfirmationRow>, StateError> {
     let id = id.to_string();
     db.call(move |conn| {
@@ -259,13 +263,14 @@ pub(super) async fn end(
             let changed = tx.execute(
                 "UPDATE confirmations
                  SET state = ?2, confirmed_via = ?3, answered_utc = ?4, cap_action = ?5
-                 WHERE id = ?1 AND state = 'pending'",
+                 WHERE id = ?1 AND state = 'pending' AND (?6 IS NULL OR expires_utc > ?6)",
                 params![
                     id,
                     state.wire(),
                     via.map(ConfirmedVia::wire),
                     answered_utc,
-                    cap_action
+                    cap_action,
+                    unexpired_at
                 ],
             )?;
             let row = if changed == 1 {

@@ -154,6 +154,11 @@ fn sql_error(e: &rusqlite::Error) -> StateError {
 pub const PRUNE_DONE_SQL: &str =
     "DELETE FROM idempotency WHERE state = 'done' AND created_utc < ?1";
 
+/// The confirmations' part of that prune: answered, expired and cancelled confirmations
+/// created before `?1` (the `confirmations_state` index serves it).
+pub const PRUNE_CONFIRMATIONS_SQL: &str =
+    "DELETE FROM confirmations WHERE state <> 'pending' AND created_utc < ?1";
+
 /// A pending replace of the store (write step 5, ARCH-074): the hash the target had when it was
 /// checked (`None` for a new target) and the hash of the bytes going in. While the row exists
 /// either version is the core's own.
@@ -416,7 +421,8 @@ impl StateDb {
     /// [`IdemBegin::InProgress`]; another hash → [`IdemBegin::Conflict`].
     ///
     /// First, in the same transaction, `done` rows created more than 30 days before
-    /// `now_utc_secs` are pruned, so rows and pruning use the caller's clock.
+    /// `now_utc_secs` are pruned, so rows and pruning use the caller's clock, and so are the
+    /// confirmations of that age that are no longer pending (their history).
     pub async fn idem_begin(
         &self,
         scope_key: &str,
@@ -838,6 +844,14 @@ fn idem_begin(
     )?;
     if pruned > 0 {
         tracing::info!(pruned, "idempotency rows older than 30 days pruned");
+    }
+    // The confirmations' history goes with them; a pending one is kept (it expires first).
+    let pruned = tx.execute(
+        PRUNE_CONFIRMATIONS_SQL,
+        params![now_utc_secs.saturating_sub(DONE_KEPT_SECS)],
+    )?;
+    if pruned > 0 {
+        tracing::info!(pruned, "confirmations older than 30 days pruned");
     }
     let row: Option<(String, String, Option<String>)> = tx
         .query_row(

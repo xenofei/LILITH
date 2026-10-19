@@ -68,6 +68,9 @@ pub struct ConfirmationView {
     /// The call's arguments (untrusted).
     pub arguments: serde_json::Value,
     pub caller_kind: String,
+    /// The project the call runs in (none without a workspace): an approval is for it only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// `confirm` before `cap`.
     pub covers: Vec<Cover>,
     /// The caps the call would pass (Task 16).

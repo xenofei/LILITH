@@ -123,6 +123,9 @@ pub struct ConfirmInput<'a> {
     /// `None` for a `read` tool (no key).
     pub idem: Option<IdemRef<'a>>,
     pub workspace: Option<&'a OpenWorkspace>,
+    /// The call's resolved project (ARCH-088); `None` without a workspace. A confirmation is
+    /// for the call in this project.
+    pub project: Option<&'a str>,
     /// The call runs again for a `job.retry` (CORE-146): its own tool was not what the caller
     /// called, so no prompt of the caller's (Claude Code's) was about it.
     pub retry: bool,
@@ -143,23 +146,26 @@ impl ConfirmInput<'_> {
 }
 
 /// A confirmation you approved, as a retry with its token runs it (CORE-091, Appendix F): the
-/// tool and the arguments you saw. The call runs with stage 5 satisfied only when it is that
-/// tool with those arguments; anything else asks again.
+/// tool, the arguments and the project you saw. The call runs with stage 5 satisfied only when
+/// it is that tool with those arguments in that project; anything else asks again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Approval {
     /// `cf_<16 hex>`.
     pub confirmation_id: String,
     pub tool: String,
     pub arguments: Value,
+    /// The call's resolved project when you approved it (`None` without a workspace).
+    pub project: Option<String>,
     pub confirmed_via: ConfirmedVia,
     /// The cap action of the answer (`allow_once`, `raise`), for the cap half (Task 16).
     pub cap_action: Option<String>,
 }
 
 impl Approval {
-    /// Whether this approval is for a call of `tool` with `args`.
-    pub fn covers_call(&self, tool: &str, args: &Value) -> bool {
+    /// Whether this approval is for a call of `tool` with `args` in `project`.
+    pub fn covers_call(&self, tool: &str, args: &Value, project: Option<&str>) -> bool {
         self.tool == tool
+            && self.project.as_deref() == project
             && lil_protocol::args_hash(&self.arguments) == lil_protocol::args_hash(args)
     }
 }

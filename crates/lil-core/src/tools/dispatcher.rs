@@ -96,7 +96,6 @@ use serde_json::{Value, json};
 use tokio::task::JoinError;
 use tracing::Instrument as _;
 
-use super::job_tools::JOB_RETRY;
 use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{
     Approval, ConfirmDecision, ConfirmInput, IdemRef, PipelineHooks, ReplayDecision, ReserveInput,
@@ -366,7 +365,7 @@ impl Inner {
                             args_hash: &hash,
                         };
                         match self
-                            .resume(in_flight, db, idem, *stored, &p.name, trace_id)
+                            .resume(in_flight, session, db, idem, *stored, &p.name, trace_id)
                             .await
                         {
                             Resumed::Run(run) => {
@@ -509,10 +508,16 @@ impl Inner {
     /// runs with the approval; when a concurrent retry took it first, this one is
     /// `idempotency.in_progress`. Denied or expired: the key is released and the call ends
     /// with `confirm.denied` or `confirm.expired`. Still pending: the same
-    /// `pending_confirmation`.
+    /// `pending_confirmation`, except for a non-interactive caller, which never gets one
+    /// (QA-016): `confirm.unavailable`, and the key is kept for an interactive retry.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's parts, each from a different stage"
+    )]
     async fn resume(
         &self,
         in_flight: &CallGuard,
+        session: &Session,
         db: DbHandle,
         idem: IdemRef<'_>,
         stored: Outcome<ToolOutput>,
@@ -529,8 +534,18 @@ impl Inner {
             Ok(decision) => decision,
             Err(e) => return done(state_unavailable(&e, trace_id)),
         };
+        let unavailable = || {
+            fail(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "{tool} waits for your confirmation, and this session is non-interactive, so it can't wait. Answer it in the LILITH app, then retry with the same idempotency key from a session that can."
+                ),
+            )
+        };
         match decision {
+            None if session.non_interactive => unavailable(),
             None => done(stored),
+            Some(ReplayDecision::StillPending(_)) if session.non_interactive => unavailable(),
             Some(ReplayDecision::StillPending(pending)) => {
                 done(Outcome::PendingConfirmation(pending))
             }
@@ -656,7 +671,7 @@ impl Inner {
         // satisfies it; one for another call (the call a `job.retry` runs again) goes on to
         // that call.
         let (decision, passed_on) = match approved {
-            Some(a) if a.covers_call(&d.name, &args) => (
+            Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => (
                 ConfirmDecision::Proceed {
                     confirmed_via: Some(a.confirmed_via),
                     cap_override: None,
@@ -673,6 +688,7 @@ impl Inner {
                         args: &args,
                         idem,
                         workspace: workspace.as_deref(),
+                        project: project.as_deref(),
                         retry: is_retry,
                         always_confirm,
                     })
@@ -758,6 +774,11 @@ impl Inner {
                 inner: self.me.clone(),
                 approved: passed_on,
                 pending: pending.clone(),
+                idem: idem.map(|i| IdemRow {
+                    scope: i.scope.to_string(),
+                    key: i.key.to_string(),
+                    args_hash: i.args_hash.to_string(),
+                }),
             }),
         };
         let running = tool.clone();
@@ -821,6 +842,7 @@ impl Inner {
         id: &JobId,
         approved: Option<Approval>,
         pending: &PendingSlot,
+        row: Option<&IdemRow>,
     ) -> Result<JobSummary, ErrorBody> {
         let caller = ctx.job_caller();
         // Its preconditions are checked again on every run, an approved one's too: the job
@@ -849,13 +871,11 @@ impl Inner {
                 origin.tool
             ))
         })?;
-        // The retry call's own idempotency row (stage 2 made it): scope, key and hash.
-        let scope = format!("{}|{}", session.caller, session.workspace_id());
-        let hash = call_hash(JOB_RETRY, &json!({"job_id": id.as_str()}));
-        let idem = ctx.idem_key.as_deref().map(|key| IdemRef {
-            scope: &scope,
-            key,
-            args_hash: &hash,
+        // The retry call's own idempotency row, as stage 2 made it: scope, key and hash.
+        let idem = row.map(|r| IdemRef {
+            scope: &r.scope,
+            key: &r.key,
+            args_hash: &r.args_hash,
         });
         let (outcome, submitted) = Box::pin(self.run(
             session,
@@ -926,6 +946,16 @@ pub struct Redispatch {
     inner: Weak<Inner>,
     approved: Option<Approval>,
     pending: Arc<PendingSlot>,
+    /// The `job.retry` call's own idempotency row: a confirmation it asks for is keyed by it.
+    idem: Option<IdemRow>,
+}
+
+/// An idempotency row's scope, key and arguments hash, owned.
+#[derive(Debug, Clone)]
+struct IdemRow {
+    scope: String,
+    key: String,
+    args_hash: String,
 }
 
 /// Where a `job.retry` leaves the `pending_confirmation` of the call it ran again.
@@ -971,7 +1001,13 @@ impl Redispatch {
             ));
         };
         inner
-            .retry(ctx, id, self.approved.clone(), &self.pending)
+            .retry(
+                ctx,
+                id,
+                self.approved.clone(),
+                &self.pending,
+                self.idem.as_ref(),
+            )
             .await
     }
 }

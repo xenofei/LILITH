@@ -124,7 +124,8 @@ CREATE INDEX outside_paid_open ON outside_paid(prompt_id) WHERE recorded_utc IS 
 /// arguments' hash. At most one per key is `pending` (`confirmations_pending`); the answered,
 /// expired and cancelled ones stay as the history, so a key whose earlier confirmation was
 /// denied can be asked about again. `covers` is the JSON array (`confirm` before `cap`), `cap`
-/// the JSON of the caps the call would pass. Times are Unix seconds.
+/// the JSON of the caps the call would pass; `project` is the call's resolved project (none
+/// without a workspace), which an approval is bound to. Times are Unix seconds.
 const CONFIRMATIONS: &str = "CREATE TABLE confirmations (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -143,7 +144,8 @@ const CONFIRMATIONS: &str = "CREATE TABLE confirmations (
     expires_utc INTEGER NOT NULL,
     answered_utc INTEGER,
     cap_action TEXT,
-    session_id TEXT NOT NULL
+    session_id TEXT NOT NULL,
+    project TEXT
 );
 CREATE UNIQUE INDEX confirmations_pending ON confirmations(scope, idem_key)
     WHERE state = 'pending';
