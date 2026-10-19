@@ -160,18 +160,23 @@ pub(super) fn is_entry_id(id: &str) -> bool {
 /// or mount point): the trash would be somewhere the suite doesn't own, so nothing is listed,
 /// restored, purged or moved into it (CORE-110). A trash that doesn't exist is fine.
 pub(super) fn refuse_linked_trash(root: &Path, probe: &dyn Probe) -> io::Result<()> {
-    let trash = root.join(TRASH_DIR);
-    let id = match probe.identity(&trash) {
+    refuse_link_at(&root.join(TRASH_DIR), probe)
+}
+
+/// Fails closed (`PermissionDenied`) when `trash`, a folder in the trash path (`.trash`, a day
+/// folder, an entry folder or its `payload`), is a link; one that doesn't exist is fine.
+pub(super) fn refuse_link_at(trash: &Path, probe: &dyn Probe) -> io::Result<()> {
+    let id = match probe.identity(trash) {
         Ok(id) => id,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     if id.attributes & 0x400 != 0
         && probe
-            .reparse_tag(&trash)?
+            .reparse_tag(trash)?
             .is_some_and(lil_platform::fs::is_name_surrogate)
     {
-        tracing::warn!(trash = %trash.display(), "the trash folder is a link, so the trash is not used; remove the link");
+        tracing::warn!(trash = %trash.display(), "a folder in the trash path is a link, so the trash is not used; remove the link");
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -280,7 +285,18 @@ pub(super) fn drop_empty_entry(dir: &Path, day: &Path) -> io::Result<()> {
 }
 
 /// The purge of one entry: its whole folder, then the day's when that is empty (CORE-110).
-pub(super) fn purge_entry(dir: &Path, day: &Path) -> io::Result<()> {
+///
+/// The trash path is checked for links again right before the delete (`.trash`, the day and the
+/// entry folder), so a link made since the entries were listed is never followed.
+pub(super) fn purge_entry(
+    root: &Path,
+    probe: &dyn Probe,
+    dir: &Path,
+    day: &Path,
+) -> io::Result<()> {
+    refuse_linked_trash(root, probe)?;
+    refuse_link_at(day, probe)?;
+    refuse_link_at(dir, probe)?;
     fsops::remove_dir_all(dir)?;
     remove_if_empty(day);
     Ok(())
@@ -463,8 +479,10 @@ impl Store {
                 why: format!("the restore record can't be written: {e}"),
             })? + "\n";
             let (day_dir, dir, fp) = (day.clone(), day.join(&entry_id), self.failpoints().clone());
+            let probe = self.probe().clone();
             let created = blocking(move || {
                 fsops::ensure_dir(&day_dir)?;
+                refuse_link_at(&day_dir, probe.as_ref())?;
                 fsops::create_dir_new(&dir)?;
                 fsops::ensure_dir(&dir.join(PAYLOAD))?;
                 fsops::write_temp(&dir, RECORD, text.as_bytes(), &fp)?;
@@ -587,9 +605,13 @@ impl Store {
         self.check_long_locks(&rel, &long).await?;
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
-            let items = blocking(move || list(&dir))
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?;
+            let probe = self.probe().clone();
+            let items = blocking(move || {
+                refuse_link_at(&dir, probe.as_ref())?;
+                list(&dir)
+            })
+            .await
+            .map_err(|e| StoreError::io(&rel, &e))?;
             let wanted = path_key(rel.file_name());
             let named = items.iter().position(|i| path_key(&i.name) == wanted);
             match (named, items.len()) {
@@ -719,13 +741,8 @@ impl Store {
                 continue;
             }
             let (dir, day) = (entry.dir.clone(), entry.day.clone());
-            match blocking(move || {
-                fsops::remove_dir_all(&dir)?;
-                remove_if_empty(&day);
-                Ok(())
-            })
-            .await
-            {
+            let (root, probe) = (root.clone(), self.probe().clone());
+            match blocking(move || purge_entry(&root, probe.as_ref(), &dir, &day)).await {
                 Ok(()) => {
                     tracing::info!(entry = %entry.record.entry_id, "trash entry purged");
                     report.purged.push(entry.record.entry_id.clone());

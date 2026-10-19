@@ -22,7 +22,7 @@ use super::order::list_with;
 use super::paths::{WsPath, path_key};
 use super::trash::{
     DAY, PAYLOAD, RECORD, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord, drop_empty_entry, entries,
-    is_entry_id, parse_rfc3339, purge_entry, refuse_linked_trash, remove_if_empty,
+    is_entry_id, parse_rfc3339, purge_entry, refuse_link_at, refuse_linked_trash, remove_if_empty,
 };
 use super::write::{Seen, StoreError, blocking, link_refused, read_all, see};
 
@@ -232,8 +232,10 @@ impl Personal {
                 why: format!("the restore record can't be written: {e}"),
             })? + "\n";
             let (day_dir, dir) = (day.clone(), day.join(&entry_id));
+            let probe = self.probe.clone();
             let created = blocking(move || {
                 fsops::ensure_dir(&day_dir)?;
+                refuse_link_at(&day_dir, probe.as_ref())?;
                 fsops::create_dir_new(&dir)?;
                 fsops::ensure_dir(&dir.join(PAYLOAD))?;
                 fsops::write_temp(&dir, RECORD, text.as_bytes(), &FailPoints::none())?;
@@ -319,9 +321,12 @@ impl Personal {
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
             let probe = self.probe.clone();
-            let items = blocking(move || list_with(probe.as_ref(), &dir))
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?;
+            let items = blocking(move || {
+                refuse_link_at(&dir, probe.as_ref())?;
+                list_with(probe.as_ref(), &dir)
+            })
+            .await
+            .map_err(|e| StoreError::io(&rel, &e))?;
             let wanted = path_key(rel.file_name());
             match items.iter().find(|i| path_key(&i.name) == wanted) {
                 Some(item) => item.path.clone(),
@@ -379,7 +384,8 @@ impl Personal {
                 continue;
             }
             let (dir, day) = (entry.dir.clone(), entry.day.clone());
-            match blocking(move || purge_entry(&dir, &day)).await {
+            let (root, probe) = (self.root.clone(), self.probe.clone());
+            match blocking(move || purge_entry(&root, probe.as_ref(), &dir, &day)).await {
                 Ok(()) => {
                     tracing::info!(entry = %entry.record.entry_id, "personal trash entry purged");
                     purged.push(entry.record.entry_id.clone());

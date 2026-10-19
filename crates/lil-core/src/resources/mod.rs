@@ -195,7 +195,7 @@ impl Place {
             Place::Personal(personal) => (personal.probe().clone(), Some(personal.clone())),
         };
         if let Some(personal) = kind_dir {
-            return Ok(ids_of(personal.list(kind).await?));
+            return Ok(ids_of(kind, personal.list(kind).await?));
         }
         let names = tokio::task::spawn_blocking(move || list_files(probe.as_ref(), &dir))
             .await
@@ -204,16 +204,19 @@ impl Place {
                 path: rel.as_str().to_string(),
                 why: e.to_string(),
             })?;
-        Ok(ids_of(names))
+        Ok(ids_of(kind, names))
     }
 }
 
-/// The resource ids among the file names of a kind's folder.
-fn ids_of(names: Vec<String>) -> Vec<String> {
+/// The resource ids among the file names of a kind's folder: those `get` accepts, so a file
+/// with a device name (`con.json`) that came in from outside isn't listed.
+fn ids_of(kind: &str, names: Vec<String>) -> Vec<String> {
     names
         .into_iter()
         .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
-        .filter(|id| valid_id(id))
+        .filter(|id| {
+            valid_id(id) && lil_schema::check_rel_path(&format!("{kind}/{id}.json")).is_ok()
+        })
         .collect()
 }
 

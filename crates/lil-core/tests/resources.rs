@@ -887,3 +887,181 @@ async fn oversized_names_and_data_are_refused() {
         .await;
     fx.shutdown().await;
 }
+
+/// Writes `bytes` to `path` as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn write_outside(path: &Path, bytes: &[u8]) {
+    lil_testkit::files::write_file(path, bytes);
+}
+
+/// The date folder the fake clock's trash entries go in.
+fn today(fx: &Fx) -> String {
+    let secs = fx
+        .clock
+        .utc_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    lil_schema::time::date(i64::try_from(secs).unwrap())
+}
+
+/// The trash folder of `scope`.
+fn trash_dir(fx: &Fx, scope: &str) -> PathBuf {
+    match scope {
+        "workspace" => fx.ws.join(".trash"),
+        _ => fx.personal.root().join(".trash"),
+    }
+}
+
+#[tokio::test] // spec: CORE-110
+async fn a_linked_trash_day_folder_is_refused_when_an_entry_is_made() {
+    for scope in ["workspace", "personal"] {
+        let fx = Fx::new();
+        fx.save(scope, "sunset", 1).await;
+        let outside = fx.env.root().join("outside");
+        write_outside(&outside.join("keep.txt"), b"keep");
+        let trash = trash_dir(&fx, scope);
+        write_outside(&trash.join("placeholder"), b"");
+        junction(&trash.join(today(&fx)), &outside);
+
+        let target = json!({"kind": "palette", "id": "sunset", "scope": scope});
+        fx.err("resource.delete", target).await;
+        let file = match scope {
+            "workspace" => fx.workspace_file("palette", "sunset"),
+            _ => fx.personal_file("palette", "sunset"),
+        };
+        assert!(file.is_file(), "{scope}: the file moved out");
+        let names: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            names.len(),
+            1,
+            "{scope}: an entry was made outside: {names:?}"
+        );
+        fx.shutdown().await;
+    }
+}
+
+#[tokio::test] // spec: CORE-110
+async fn a_linked_payload_never_restores_an_outside_file() {
+    for scope in ["workspace", "personal"] {
+        let fx = Fx::new();
+        fx.save(scope, "sunset", 1).await;
+        let outside = fx.env.root().join("outside");
+        write_outside(&outside.join("old.json"), b"{}");
+        let original = match scope {
+            "workspace" => "library/resources/palette/old.json",
+            _ => "palette/old.json",
+        };
+        let entry = trash_dir(&fx, scope)
+            .join("2020-01-01")
+            .join("te_00000000000000bb");
+        let record = json!({
+            "entry_id": "te_00000000000000bb",
+            "original_path": original,
+            "moved_utc": "2020-01-01T00:00:00Z",
+            "purge_after": "2099-01-01T00:00:00Z",
+            "reason": "test",
+        });
+        write_outside(&entry.join("restore.json"), record.to_string().as_bytes());
+        junction(&entry.join("payload"), &outside);
+
+        let args = json!({"entry_id": "te_00000000000000bb", "scope": scope});
+        fx.err("trash.restore", args).await;
+        assert!(outside.join("old.json").is_file(), "{scope}: moved out");
+        let landed = match scope {
+            "workspace" => fx.workspace_file("palette", "old"),
+            _ => fx.personal_file("palette", "old"),
+        };
+        assert!(!landed.exists(), "{scope}: an outside file was restored");
+        fx.shutdown().await;
+    }
+}
+
+#[tokio::test] // spec: CORE-110
+async fn an_unscoped_trash_list_shows_the_trash_that_works_and_warns_about_the_other() {
+    let fx = Fx::new();
+    fx.save("workspace", "sunset", 1).await;
+    fx.ok(
+        "resource.delete",
+        json!({"kind": "palette", "id": "sunset", "scope": "workspace"}),
+    )
+    .await;
+    let outside = fx.env.root().join("outside");
+    write_outside(&fx.personal.root().join("placeholder"), b"");
+    junction(&fx.personal.root().join(".trash"), &outside);
+
+    let list = fx.ok("trash.list", json!({})).await;
+    assert_eq!(list["entries"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["entries"][0]["scope"], "workspace", "{list}");
+    let warnings = list["warnings"].as_array().expect("a warning");
+    assert!(warnings[0].as_str().unwrap().contains("personal"), "{list}");
+    // Asking for the refused one by name fails.
+    fx.err("trash.list", json!({"scope": "personal"})).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-078, CORE-040
+async fn resource_list_hides_ids_that_get_refuses() {
+    let fx = Fx::new();
+    fx.save("workspace", "sunset", 1).await;
+    let file = json!({"schema_version": 1, "kind": "palette", "id": "con", "name": "Con",
+                      "created": "2020-01-01T00:00:00Z", "updated": "2020-01-01T00:00:00Z",
+                      "data": {}});
+    write_outside(
+        &fx.workspace_file("palette", "con"),
+        file.to_string().as_bytes(),
+    );
+    write_outside(
+        &fx.personal_file("palette", "lpt1"),
+        file.to_string().as_bytes(),
+    );
+    let list = fx.ok("resource.list", json!({})).await;
+    let ids: Vec<&str> = list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["sunset"], "{list}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-110
+async fn a_restore_record_naming_the_trash_by_its_short_name_is_refused() {
+    let fx = Fx::new();
+    fx.save("personal", "sunset", 1).await;
+    let deleted = fx
+        .ok(
+            "resource.delete",
+            json!({"kind": "palette", "id": "sunset", "scope": "personal"}),
+        )
+        .await;
+    let entry_id = deleted["entry_id"].as_str().unwrap().to_string();
+    if !fx.personal.root().join("TRASH~1").exists() {
+        eprintln!("skipped: this volume has no 8.3 name for .trash");
+        fx.shutdown().await;
+        return;
+    }
+    let record = trash_dir(&fx, "personal")
+        .join(today(&fx))
+        .join(&entry_id)
+        .join("restore.json");
+    let mut text: Value = serde_json::from_str(&read_text(&record)).unwrap();
+    text["original_path"] = json!("TRASH~1/pwn.json");
+    write_outside_overwrite(&record, text.to_string().as_bytes());
+
+    let args = json!({"entry_id": entry_id, "scope": "personal"});
+    fx.err("trash.restore", args).await;
+    assert!(!trash_dir(&fx, "personal").join("pwn.json").exists());
+    fx.shutdown().await;
+}
+
+/// Overwrites `path` as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn write_outside_overwrite(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+}

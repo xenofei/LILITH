@@ -77,6 +77,10 @@ struct ListArgs {
 #[derive(Debug, Serialize, JsonSchema)]
 struct ListResult {
     entries: Vec<TrashRow>,
+    /// A trash that couldn't be listed (a link in its path, say) when no scope was given and
+    /// another could be.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -114,14 +118,35 @@ async fn list(
         None if ctx.workspace.is_some() => vec![TrashScope::Workspace, TrashScope::Personal],
         None => vec![TrashScope::Personal],
     };
+    let several = scopes.len() > 1;
     let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    let mut failed = None;
     for scope in scopes {
         let records = match scope {
             TrashScope::Workspace => ctx.workspace()?.store.trash_list().await,
             TrashScope::Personal => personal.trash_list().await,
+        };
+        match records {
+            Ok(records) => {
+                entries.extend(records.into_iter().map(|record| TrashRow { record, scope }));
+            }
+            // With no scope given, the trash that works is listed and the other is named.
+            Err(e @ StoreError::Io { .. }) if several => {
+                warnings.push(format!(
+                    "the {} trash couldn't be listed: {e}",
+                    scope.as_str()
+                ));
+                failed.get_or_insert(e);
+            }
+            Err(e) => return Err(e.to_error(&ctx.trace_id)),
         }
-        .map_err(|e: StoreError| e.to_error(&ctx.trace_id))?;
-        entries.extend(records.into_iter().map(|record| TrashRow { record, scope }));
+    }
+    if let Some(e) = failed
+        && entries.is_empty()
+        && warnings.len() > 1
+    {
+        return Err(e.to_error(&ctx.trace_id));
     }
     entries.sort_by(|a, b| {
         (&a.record.moved_utc, &a.record.entry_id).cmp(&(&b.record.moved_utc, &b.record.entry_id))
@@ -131,7 +156,7 @@ async fn list(
         entries.len(),
         if entries.len() == 1 { "y" } else { "ies" }
     );
-    Ok((ListResult { entries }, summary))
+    Ok((ListResult { entries, warnings }, summary))
 }
 
 async fn restore(
