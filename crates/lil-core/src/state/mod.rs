@@ -181,6 +181,8 @@ pub struct HoldMarker {
     /// The app (`ui:<app>`) or `core`.
     pub holder: String,
     pub since_utc: i64,
+    /// Tells this hold's row from a later hold's on the same document.
+    pub token: u64,
 }
 
 fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
@@ -647,9 +649,15 @@ impl StateDb {
         let m = m.clone();
         self.call(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO hold_markers (doc_id, path, holder, since_utc)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![m.doc_id, m.path, m.holder, m.since_utc],
+                "INSERT OR REPLACE INTO hold_markers (doc_id, path, holder, since_utc, token)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    m.doc_id,
+                    m.path,
+                    m.holder,
+                    m.since_utc,
+                    i64::try_from(m.token).unwrap_or(i64::MAX)
+                ],
             )
             .map(drop)
             .map_err(|e| sql_error(&e))
@@ -657,13 +665,15 @@ impl StateDb {
         .await
     }
 
-    /// Removes the marker of `doc_id`, if there is one.
-    pub async fn clear_hold_marker(&self, doc_id: &str) -> Result<(), StateError> {
+    /// Removes the marker of `doc_id` if it is hold `token`'s: the marker of a later hold on
+    /// the same document stays.
+    pub async fn clear_hold_marker(&self, doc_id: &str, token: u64) -> Result<(), StateError> {
         let doc_id = doc_id.to_string();
+        let token = i64::try_from(token).unwrap_or(i64::MAX);
         self.call(move |conn| {
             conn.execute(
-                "DELETE FROM hold_markers WHERE doc_id = ?1",
-                params![doc_id],
+                "DELETE FROM hold_markers WHERE doc_id = ?1 AND token = ?2",
+                params![doc_id, token],
             )
             .map(drop)
             .map_err(|e| sql_error(&e))
@@ -676,7 +686,7 @@ impl StateDb {
         self.call(|conn| {
             let read = || -> rusqlite::Result<Vec<HoldMarker>> {
                 conn.prepare(
-                    "SELECT doc_id, path, holder, since_utc FROM hold_markers ORDER BY doc_id",
+                    "SELECT doc_id, path, holder, since_utc, token FROM hold_markers ORDER BY doc_id",
                 )?
                 .query_map([], |r| {
                     Ok(HoldMarker {
@@ -684,6 +694,7 @@ impl StateDb {
                         path: r.get(1)?,
                         holder: r.get(2)?,
                         since_utc: r.get(3)?,
+                        token: u64::try_from(r.get::<_, i64>(4)?).unwrap_or_default(),
                     })
                 })?
                 .collect()

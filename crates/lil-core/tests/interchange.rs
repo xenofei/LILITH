@@ -334,3 +334,35 @@ async fn intents_are_closed() {
         .unwrap_err();
     assert_eq!(refused.code, "params.invalid");
 }
+
+#[tokio::test] // spec: APP-061
+async fn a_target_of_unknown_type_has_no_handler() {
+    let r = rig();
+    register(
+        &r.core_dir,
+        "test",
+        "test.exe",
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    // An app that opens anything still isn't offered a target nothing is known about.
+    register(&r.core_dir, "any", "any.exe", "", "", r#""open""#);
+    let agent = r.ctx(CallerKind::Cli);
+    // A sealed ref outside any open workspace: no type, no format.
+    let target = "lil://0123456789abcdef/sketchbook/a@1.0.0";
+    let none = common::call(&r.reg, &agent, "handlers.for", json!({ "target": target }))
+        .await
+        .unwrap();
+    assert_eq!(none, json!({"handlers": []}));
+    let open = json!({"app": "any", "target": target, "intent": "open"});
+    let refused = common::call(&r.reg, &agent, "open_in", open)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "handler.none");
+    // A known format still reaches the app that opens anything.
+    let png = common::call(&r.reg, &agent, "handlers.for", json!({"target": "a.png"}))
+        .await
+        .unwrap();
+    assert_eq!(png["handlers"].as_array().unwrap().len(), 2, "{png}");
+}

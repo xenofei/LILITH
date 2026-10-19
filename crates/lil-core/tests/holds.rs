@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use lil_core::docs::{HoldOwner, Holds, register_doc_tools};
 use lil_core::events::EventBus;
+use lil_core::session::Session;
 use lil_core::state::{HoldMarker, StateDb, StateScope};
 use lil_core::tools::Registry;
+use lil_core::workspace::WorkspaceRef;
 use lil_protocol::CallerKind;
-use lil_testkit::{FakeClock, TestEnv};
+use lil_testkit::{CoreFixture, FakeClock, RawPipe, TestApp, TestEnv, ensure_built};
 use serde_json::json;
 
 /// A failure deadline only, never a measurement (QA-031).
@@ -101,7 +103,7 @@ async fn holds_end_with_the_connection_and_markers_clear_at_startup() {
     let holds = Holds::new(FakeClock::new());
 
     let guard = holds
-        .acquire_marked(&state, "d_1", doc_path(), app(7, "image"))
+        .acquire_marked(&state, "ws_a", "d_1", doc_path(), app(7, "image"))
         .await
         .unwrap();
     let rows = state.hold_markers().await.unwrap();
@@ -132,6 +134,7 @@ async fn holds_end_with_the_connection_and_markers_clear_at_startup() {
             path: r"C:\scratch\left.lildoc".into(),
             holder: "ui:image".into(),
             since_utc: 1_700_000_000,
+            token: 99,
         })
         .await
         .unwrap();
@@ -185,4 +188,148 @@ async fn doc_list_open_lists_holds() {
         .await
         .unwrap_err();
     assert_eq!(refused.code, "params.invalid");
+}
+
+/// A hold's marker is cleared by a task spawned when its guard drops. That task must not delete
+/// the marker of the next holder of the same document, whichever of the two writes lands first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: APP-104
+async fn a_dropped_holds_marker_clear_never_deletes_the_next_holders_marker() {
+    let env = TestEnv::new();
+    let state = open_state(&env);
+    let holds = Holds::new(FakeClock::new());
+    for round in 0..100 {
+        let first = holds
+            .acquire_marked(&state, "ws_a", "d_1", doc_path(), app(1, "image"))
+            .await
+            .unwrap();
+        drop(first);
+        let second = holds
+            .acquire_marked(&state, "ws_a", "d_1", doc_path(), app(2, "audio"))
+            .await
+            .unwrap();
+        // The state actor runs jobs in order: these round trips let the first hold's clear,
+        // however late it was spawned, run before the check.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            state.hold_markers().await.unwrap();
+        }
+        let rows = state.hold_markers().await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "round {round}: the live hold has no marker: {rows:?}"
+        );
+        assert_eq!(rows[0].holder, "ui:audio", "round {round}");
+        drop(second);
+        markers_become(&state, &[]).await;
+    }
+}
+
+fn workspace(id: &str) -> WorkspaceRef {
+    WorkspaceRef {
+        id: id.to_string(),
+        path: std::path::PathBuf::from(r"C:\scratch\ws"),
+    }
+}
+
+#[tokio::test] // spec: APP-103
+async fn doc_list_open_is_scoped_to_the_sessions_workspace() {
+    let env = TestEnv::new();
+    let state = open_state(&env);
+    let holds = Holds::new(FakeClock::new());
+    let a = "aaaaaaaaaaaaaaaa";
+    let b = "bbbbbbbbbbbbbbbb";
+    let _in_a = holds
+        .acquire_marked(
+            &state,
+            a,
+            "d_a",
+            Path::new(r"C:\ws_a\x.lildoc"),
+            app(1, "image"),
+        )
+        .await
+        .unwrap();
+    let _in_b = holds
+        .acquire_marked(
+            &state,
+            b,
+            "d_b",
+            Path::new(r"C:\ws_b\y.lildoc"),
+            app(2, "image"),
+        )
+        .await
+        .unwrap();
+    let _loose = holds
+        .acquire("d_loose", Path::new(r"C:\loose\z.lildoc"), app(3, "image"))
+        .unwrap();
+    let ids = |views: Vec<lil_core::docs::HoldView>| -> Vec<String> {
+        views.into_iter().map(|v| v.doc_id).collect()
+    };
+    assert_eq!(ids(holds.list_for(Some(a))), ["d_a", "d_loose"]);
+    assert_eq!(ids(holds.list_for(Some(b))), ["d_b", "d_loose"]);
+    assert_eq!(ids(holds.list_for(None)), ["d_loose"]);
+    assert_eq!(ids(holds.list()).len(), 3);
+
+    // The tool lists by the session's workspace.
+    let mut reg = Registry::new();
+    register_doc_tools(&mut reg, &holds);
+    let events = Arc::new(EventBus::new(FakeClock::new()));
+    let mut ctx = common::ctx(&env, CallerKind::Cli, &events);
+    ctx.session = Arc::new(Session {
+        workspace: Some(workspace(a)),
+        ..(*ctx.session).clone()
+    });
+    let listed = common::call(&reg, &ctx, "doc.list_open", json!({}))
+        .await
+        .unwrap();
+    let seen: Vec<&str> = listed["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["doc_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(seen, ["d_a", "d_loose"], "{listed}");
+    assert!(!listed.to_string().contains("ws_b"), "{listed}");
+}
+
+/// An app that holds a document, then dies: through a real connection, the hold is gone and
+/// the app no longer counts as running.
+#[test] // spec: APP-104, APP-063
+fn a_killed_app_releases_its_holds_and_stops_running() {
+    let env = TestEnv::new();
+    let registration = format!(
+        "app = \"test\"\nexe = '{}'\n[[opens]]\ntypes = [\"image\"]\nformats = [\"png\"]\nintents = [\"open\"]\n",
+        ensure_built().test_app.display()
+    );
+    lil_testkit::files::write_file(
+        &env.env.data_dir().join("apps").join("test.toml"),
+        registration.as_bytes(),
+    );
+    let _core = CoreFixture::start(&env);
+    let mut pipe = RawPipe::connect(&env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    let mut app = TestApp::start(&env, None, &[]);
+
+    let doc = json!({"doc_id": "d_1", "path": r"C:\scratch\a.lildoc"});
+    let held = app.tool("test.hold", doc, Some("k1"));
+    assert_eq!(held["status"], "ok", "{held}");
+    let listed = pipe.tool_ok("doc.list_open", json!({}), None);
+    assert_eq!(listed["documents"][0]["held_by"], "test", "{listed}");
+    let open = json!({"app": "test", "target": "a.png", "intent": "open"});
+    assert_eq!(pipe.tool_ok("open_in", open.clone(), None)["running"], true);
+
+    drop(app);
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let listed = pipe.tool_ok("doc.list_open", json!({}), None);
+        let running = pipe.tool_ok("open_in", open.clone(), None)["running"].clone();
+        if listed["documents"] == json!([]) && running == false {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the killed app still holds or runs: {listed} {running}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

@@ -9,8 +9,8 @@
 //!
 //! A [`Target`] is what is to be opened: a file path, a `lil://` ref, a candidate
 //! (`@candidate/<run>/<file>`, APP-057) or a document (`doc:<doc_id>/…`). Its type and format
-//! decide which registrations handle it; a part that can't be told (a ref's file format) is not
-//! held against an app.
+//! decide which registrations handle it. A part that can't be told (a ref's file format) is not
+//! held against an app, but a target of which neither is known has no handler.
 
 use std::path::{Path, PathBuf};
 
@@ -234,6 +234,11 @@ impl OpensEntry {
 impl AppRegistration {
     /// The intents `self` handles for `target`, in the order of [`Intent`].
     pub fn intents_for(&self, target: &Target) -> Vec<Intent> {
+        // Nothing is known of the target (a ref of a workspace that isn't open): no app is
+        // offered, rather than every app.
+        if target.kind.is_none() && target.format.is_none() {
+            return Vec::new();
+        }
         let mut intents: Vec<Intent> = self
             .opens
             .iter()

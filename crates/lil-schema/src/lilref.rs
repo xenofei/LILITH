@@ -5,7 +5,8 @@
 //! Code output points to a small `.lilref` file, which the suite is associated with. The file
 //! names a sealed version, so its ref carries the version's content hash (CORE-047): a ref
 //! without `#sha256=` is refused, as is a candidate ref (viewing only, APP-057) and any
-//! `lilref` version but 1. [`write_lilref`] writes the form the spec shows, one line with a
+//! `lilref` version but 1, and a `title` that is longer than [`MAX_TITLE`] characters or holds a
+//! control or bidirectional-formatting character (it is shown in notifications and the UI). [`write_lilref`] writes the form the spec shows, one line with a
 //! space after each colon and comma and no trailing newline, so a file this module wrote
 //! reads back and writes again byte for byte.
 
@@ -15,6 +16,9 @@ use crate::refs::{AssetRef, SCHEME};
 
 /// The one `lilref` version.
 pub const LILREF_VERSION: u64 = 1;
+
+/// The longest title, in characters.
+pub const MAX_TITLE: usize = 200;
 
 /// A parsed `.lilref` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +53,9 @@ pub fn parse_lilref(text: &str) -> Result<LilRef, String> {
         ));
     }
     check_ref(&raw.r#ref)?;
+    if let Some(title) = &raw.title {
+        check_title(title)?;
+    }
     Ok(LilRef {
         r#ref: raw.r#ref,
         title: raw.title,
@@ -60,10 +67,14 @@ pub fn parse_lilref(text: &str) -> Result<LilRef, String> {
 ///
 /// # Panics
 /// If `r.ref` is not a sealed `lil://` ref carrying `#sha256=` (the ref must carry its hash,
-/// CORE-047); check a ref you didn't build with [`parse_lilref`].
+/// CORE-047) or `r.title` is not an acceptable title; check a value you didn't build with
+/// [`parse_lilref`].
 pub fn write_lilref(r: &LilRef) -> String {
     if let Err(e) = check_ref(&r.r#ref) {
         panic!("a .lilref names a sealed ref with its hash: {e}");
+    }
+    if let Some(Err(e)) = r.title.as_deref().map(check_title) {
+        panic!("a .lilref title is plain text of at most {MAX_TITLE} characters: {e}");
     }
     let mut out = format!(
         "{{\"lilref\": {LILREF_VERSION}, \"ref\": {}",
@@ -97,4 +108,20 @@ fn check_ref(r: &str) -> Result<(), String> {
             "`{r}` is a candidate ref: candidates are for viewing only, a .lilref names a sealed version"
         )),
     }
+}
+
+/// A title is at most [`MAX_TITLE`] characters and has no control character and no
+/// bidirectional-formatting character (they can make text read as something else).
+fn check_title(title: &str) -> Result<(), String> {
+    if title.chars().count() > MAX_TITLE {
+        return Err(format!("the title is longer than {MAX_TITLE} characters"));
+    }
+    let bad = |c: char| {
+        c.is_control()
+            || matches!(u32::from(c), 0x200E | 0x200F | 0x061C | 0x202A..=0x202E | 0x2066..=0x2069)
+    };
+    if title.chars().any(bad) {
+        return Err("the title holds a control or text-direction character".to_string());
+    }
+    Ok(())
 }

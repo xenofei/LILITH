@@ -9,7 +9,7 @@ pub mod holds;
 pub mod tools;
 
 pub use holds::{HoldGuard, HoldOwner, HoldView, Holds};
-pub use tools::register_doc_tools;
+pub use tools::{TestHolds, register_doc_tools, register_test_hold};
 
 /// The `module` of this module's tools (CORE-058).
 pub const DOCS_MODULE: &str = "docs";

@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
 use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NoNotificationPath, UiPresence};
-use crate::docs::{Holds, register_doc_tools};
+use crate::docs::{Holds, TestHolds, register_doc_tools, register_test_hold};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
@@ -474,6 +474,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     // The holds and the handler registry follow the connections (see `ConnObserver`).
     let holds = Holds::new(cfg.clock.clone());
     register_doc_tools(&mut registry, &holds);
+    let test_holds = Arc::new(TestHolds::default());
+    if cfg.test_tools {
+        register_test_hold(&mut registry, &holds, &test_holds);
+    }
     let interchange = Interchange::new(core_dir(), cfg.env.data_dir());
     register_interchange_tools(&mut registry, &interchange);
     if cfg.test_tools {
@@ -589,11 +593,13 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
-    let router: Arc<dyn Router> = Arc::new(
-        RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
-            .with_observer(holds)
-            .with_observer(interchange),
-    );
+    let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
+        .with_observer(holds)
+        .with_observer(interchange);
+    if cfg.test_tools {
+        router = router.with_observer(test_holds);
+    }
+    let router: Arc<dyn Router> = Arc::new(router);
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
     let serving = tokio::spawn(serve_with(

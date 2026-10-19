@@ -159,7 +159,8 @@ const HOLDS: &str = "CREATE TABLE hold_markers (
     doc_id TEXT PRIMARY KEY,
     path TEXT NOT NULL,
     holder TEXT NOT NULL,
-    since_utc INTEGER NOT NULL
+    since_utc INTEGER NOT NULL,
+    token INTEGER NOT NULL
 );";
 
 /// The suite `state.db` (`Env::local_dir()\state.db`).

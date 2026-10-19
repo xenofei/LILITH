@@ -59,6 +59,8 @@ pub struct HoldView {
 struct Entry {
     path: PathBuf,
     owner: HoldOwner,
+    /// The id of the workspace the document belongs to; `None` for a loose document.
+    workspace: Option<String>,
     /// Tells this hold from a later one on the same document, so a stale guard never ends it.
     token: u64,
     /// Guards alive for the hold (more than 1 only for one connection's repeated takes).
@@ -73,11 +75,13 @@ struct Marker {
 }
 
 impl Marker {
-    /// Removes the row in the background; if the runtime is gone the next start clears it.
-    fn clear(self, doc_id: String) {
+    /// Removes the row of hold `token` in the background; if the runtime is gone the next
+    /// start clears it. The row goes only if it is still this hold's: a later hold on the
+    /// same document, whose row may already be written, keeps its own.
+    fn clear(self, doc_id: String, token: u64) {
         let Marker { state, runtime } = self;
         runtime.spawn(async move {
-            if let Err(e) = state.clear_hold_marker(&doc_id).await {
+            if let Err(e) = state.clear_hold_marker(&doc_id, token).await {
                 tracing::warn!(doc_id, error = ?e, "a hold marker could not be removed");
             }
         });
@@ -138,7 +142,7 @@ impl Drop for HoldGuard {
             inner.held.remove(&self.doc_id)
         };
         if let Some(marker) = ended.and_then(|e| e.marker) {
-            marker.clear(self.doc_id.clone());
+            marker.clear(self.doc_id.clone(), self.token);
         }
     }
 }
@@ -162,18 +166,20 @@ impl Holds {
         path: &Path,
         holder: HoldOwner,
     ) -> Result<HoldGuard, ErrorBody> {
-        self.take(doc_id, path, holder, None)
+        self.take(doc_id, path, holder, None, None)
     }
 
-    /// [`Holds::acquire`], and a marker row in `state`, the document's workspace database,
-    /// for as long as the hold lasts. Call it inside the runtime: the row is removed from a
-    /// task on it.
+    /// [`Holds::acquire`] for a document of workspace `workspace` (its id), and a marker row
+    /// in `state`, that workspace's database, for as long as the hold lasts. The hold is
+    /// listed only to sessions of that workspace ([`Holds::list_for`]). Call it inside the
+    /// runtime: the row is removed from a task on it.
     ///
     /// # Errors
     /// As [`Holds::acquire`]; a marker that can't be written is only logged.
     pub async fn acquire_marked(
         &self,
         state: &Arc<StateDb>,
+        workspace: &str,
         doc_id: &str,
         path: &Path,
         holder: HoldOwner,
@@ -182,24 +188,40 @@ impl Holds {
             state: state.clone(),
             runtime: tokio::runtime::Handle::current(),
         };
+        let holder_label = match &holder {
+            HoldOwner::Connection(_, app) => format!("ui:{app}"),
+            HoldOwner::Core => "core".to_string(),
+        };
+        let guard = self.take(doc_id, path, holder, Some(workspace), Some(marker))?;
         let row = HoldMarker {
             doc_id: doc_id.to_string(),
             path: path.to_string_lossy().into_owned(),
-            holder: match &holder {
-                HoldOwner::Connection(_, app) => format!("ui:{app}"),
-                HoldOwner::Core => "core".to_string(),
-            },
+            holder: holder_label,
             since_utc: self
                 .clock
                 .utc_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            token: guard.token,
         };
-        let guard = self.take(doc_id, path, holder, Some(marker))?;
         if let Err(e) = state.set_hold_marker(&row).await {
             tracing::warn!(doc_id, error = ?e, "a hold marker could not be written");
+        } else if !self.is_current(doc_id, guard.token) {
+            // The hold ended while the row was being written, and its clear may have run
+            // first: take the row away (only this hold's row goes).
+            if let Err(e) = state.clear_hold_marker(doc_id, guard.token).await {
+                tracing::warn!(doc_id, error = ?e, "a hold marker could not be removed");
+            }
         }
         Ok(guard)
+    }
+
+    /// Whether hold `token` is still the hold of `doc_id`.
+    fn is_current(&self, doc_id: &str, token: u64) -> bool {
+        lock(&self.inner)
+            .held
+            .get(doc_id)
+            .is_some_and(|e| e.token == token)
     }
 
     fn take(
@@ -207,6 +229,7 @@ impl Holds {
         doc_id: &str,
         path: &Path,
         holder: HoldOwner,
+        workspace: Option<&str>,
         marker: Option<Marker>,
     ) -> Result<HoldGuard, ErrorBody> {
         let mut inner = lock(&self.inner);
@@ -232,6 +255,7 @@ impl Holds {
             Entry {
                 path: path.to_path_buf(),
                 owner: holder,
+                workspace: workspace.map(str::to_string),
                 token,
                 count: 1,
                 marker,
@@ -261,17 +285,29 @@ impl Holds {
         };
         for (doc_id, entry) in ended {
             if let Some(marker) = entry.marker {
-                marker.clear(doc_id);
+                marker.clear(doc_id, entry.token);
             }
         }
     }
 
-    /// The held documents, by id.
+    /// Every held document, by id.
     pub fn list(&self) -> Vec<HoldView> {
+        self.views(|_| true)
+    }
+
+    /// The held documents a session of workspace `workspace` (its id; `None` for a session
+    /// without one) may see: those of its own workspace and loose ones, which belong to no
+    /// workspace. A document of another workspace is not listed, nor is its path.
+    pub fn list_for(&self, workspace: Option<&str>) -> Vec<HoldView> {
+        self.views(|e| e.workspace.is_none() || e.workspace.as_deref() == workspace)
+    }
+
+    fn views(&self, keep: impl Fn(&Entry) -> bool) -> Vec<HoldView> {
         let inner = lock(&self.inner);
         let mut views: Vec<HoldView> = inner
             .held
             .iter()
+            .filter(|(_, e)| keep(e))
             .map(|(doc_id, e)| HoldView {
                 doc_id: doc_id.clone(),
                 path: e.path.to_string_lossy().into_owned(),

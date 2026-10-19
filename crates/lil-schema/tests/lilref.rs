@@ -58,3 +58,39 @@ fn writing_a_ref_without_its_hash_is_a_bug() {
         title: None,
     });
 }
+
+#[test] // spec: CORE-047, APP-021
+fn lilref_titles_are_plain_and_short() {
+    let with_title = |title: &str| {
+        let title = serde_json::Value::String(title.to_string());
+        format!(
+            r#"{{"lilref": 1, "ref": "{}", "title": {title}}}"#,
+            sealed()
+        )
+    };
+    assert!(parse_lilref(&with_title(&"a".repeat(200))).is_ok());
+    assert!(
+        parse_lilref(&with_title(&"a".repeat(201))).is_err(),
+        "too long"
+    );
+    for bad in [
+        "two\nlines",
+        "bell\u{7}",
+        "nul\u{0}",
+        "rtl \u{202E}gnp.exe",
+        "iso \u{2066}x",
+        "mark\u{200F}",
+    ] {
+        assert!(parse_lilref(&with_title(bad)).is_err(), "{bad:?}");
+    }
+    assert!(parse_lilref(&with_title("Knight, final (v2) é")).is_ok());
+}
+
+#[test]
+#[should_panic(expected = "title")]
+fn writing_a_bad_title_is_a_bug() {
+    let _ = write_lilref(&LilRef {
+        r#ref: sealed(),
+        title: Some("a\nb".into()),
+    });
+}
