@@ -529,6 +529,21 @@ async fn an_approval_expires_unused() {
     assert_eq!(fx.destructive_runs().await, 1, "only the probe ran");
 }
 
+/// N1: moving the wall clock back never stretches an approval: an answer dated after now
+/// counts as expired.
+#[tokio::test] // spec: CORE-115, CORE-012
+async fn a_clock_moved_back_expires_an_approval() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let k = next_key();
+    let p = pending(&fx.call(&cli(), "test.destructive", json!({}), &k).await);
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    fx.clock.shift_utc(-3 * 3600);
+    let out = fx.call(&cli(), "test.destructive", json!({}), &k).await;
+    assert_eq!(code(&out), "confirm.expired");
+    assert_eq!(fx.destructive_runs().await, 0, "it never ran");
+}
+
 /// M6: answered, expired and cancelled confirmations go with the idempotency rows after 30
 /// days; pending and recent ones stay.
 #[tokio::test] // spec: CORE-016, APP-046

@@ -129,7 +129,10 @@ pub(super) async fn request(
                 .optional()?;
             let mut ended = None;
             if let Some(mut row) = found {
-                if row.args_hash == new.args_hash && row.expires_utc > now {
+                if row.args_hash == new.args_hash
+                    && row.project == new.project
+                    && row.expires_utc > now
+                {
                     tx.commit()?;
                     return Ok(Requested {
                         row,

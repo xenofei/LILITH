@@ -499,13 +499,14 @@ impl Confirm {
                 Replay::StillPending(row.pending())
             }
             // An approval holds for the lifetime from its answer (Appendix F: a confirmation
-            // expires after 30 minutes); after that the call needs a fresh one.
+            // expires after 30 minutes); after that the call needs a fresh one. An answer dated
+            // after now (the wall clock moved back) counts as expired too, so moving the clock
+            // can never stretch an approval.
             ConfState::Approved
-                if row
-                    .answered_utc
-                    .unwrap_or(row.created_utc)
-                    .saturating_add(self.lifetime_secs())
-                    <= self.now() =>
+                if {
+                    let (answered, now) = (row.answered_utc.unwrap_or(row.created_utc), self.now());
+                    answered > now || answered.saturating_add(self.lifetime_secs()) <= now
+                } =>
             {
                 tracing::info!(confirmation = %row.id, "an approval expired before its call ran");
                 Replay::Expired
