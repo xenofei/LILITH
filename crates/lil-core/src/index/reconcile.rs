@@ -333,20 +333,26 @@ fn skipped_path(rel: &str) -> bool {
         || parts.last().is_some_and(|name| skip_file(name))
 }
 
+/// What a walk lists folders through, and the index's closed flag, which stops it.
+struct Walker<'a> {
+    probe: &'a dyn Probe,
+    closed: &'a AtomicBool,
+}
+
 /// Every file under `dir` (`rel` is its workspace-relative path, empty at the root).
 fn walk_dir(
     root: &Path,
     dir: &Path,
     rel: &str,
-    closed: &AtomicBool,
+    walker: &Walker<'_>,
     out: &mut Vec<Walked>,
 ) -> io::Result<()> {
     let mut folders = vec![(dir.to_path_buf(), rel.to_string())];
     while let Some((dir, rel)) = folders.pop() {
-        if closed.load(Ordering::Relaxed) {
+        if walker.closed.load(Ordering::Relaxed) {
             return Err(io::Error::other("the index closed"));
         }
-        let entries = match std::fs::read_dir(lil_platform::fs::long_path(&dir)) {
+        let entries = match walker.probe.read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if rel.is_empty() || e.kind() == io::ErrorKind::NotFound => {
                 if rel.is_empty() && e.kind() != io::ErrorKind::NotFound {
@@ -389,16 +395,18 @@ fn walk_dir(
 }
 
 /// The files of `scope`, and the key prefixes inside which a row the walk didn't see is gone
-/// (`None`: every row).
+/// (`None`: every row). Folders are listed through `probe`.
 fn walk(
     root: &Path,
     scope: &Scope,
+    probe: &dyn Probe,
     closed: &AtomicBool,
 ) -> io::Result<(Vec<Walked>, Option<Vec<String>>)> {
     let mut out = Vec::new();
+    let walker = Walker { probe, closed };
     match scope {
         Scope::All => {
-            walk_dir(root, root, "", closed, &mut out)?;
+            walk_dir(root, root, "", &walker, &mut out)?;
             Ok((out, None))
         }
         Scope::Paths(paths) => {
@@ -413,7 +421,7 @@ fn walk(
                 match std::fs::symlink_metadata(lil_platform::fs::long_path(&abs)) {
                     Ok(meta) if meta.file_type().is_symlink() => {}
                     Ok(meta) if meta.is_dir() => {
-                        walk_dir(root, &abs, path.as_str(), closed, &mut out)?;
+                        walk_dir(root, &abs, path.as_str(), &walker, &mut out)?;
                     }
                     Ok(_) => out.push(walked(root, path.as_str().to_string())),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1277,7 +1285,8 @@ pub(super) async fn run(
 
     let (files, prefixes) = {
         let (root, scope, closed) = (index.root.clone(), scope.clone(), index.closed.clone());
-        blocking(move || walk(&root, &scope, &closed))
+        let probe = index.probe.clone();
+        blocking(move || walk(&root, &scope, probe.as_ref(), &closed))
             .await?
             .map_err(|e| IndexError::Io(format!("the workspace can't be listed: {e}")))?
     };

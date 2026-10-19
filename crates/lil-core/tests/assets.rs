@@ -80,6 +80,25 @@ struct Fx {
 }
 
 impl Fx {
+    /// Closes the hub (each open workspace's watcher, index, `state.db` and `core.lock`) and
+    /// joins the state actors, then removes the test's folder, which nothing holds open any
+    /// more, and fails the test if anything in it was left behind.
+    async fn shutdown(self) {
+        let Fx {
+            dispatcher,
+            hub,
+            _states: states,
+            env,
+            ..
+        } = self;
+        hub.close_all().await;
+        states.close();
+        drop((dispatcher, hub, states));
+        if let Err(left) = env.close() {
+            panic!("the test's folder was left behind: {left:?}");
+        }
+    }
+
     fn new() -> Fx {
         Fx::with(|_| {})
     }
@@ -324,6 +343,7 @@ async fn import_copy_creates_asset_with_uuid_and_candidate_run() {
         )
         .await;
     assert_eq!(detail["status"], "candidate", "{detail}");
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-029
@@ -348,6 +368,7 @@ async fn import_link_external_records_path_and_hash_without_copying() {
     assert_eq!(m["status"], "in_progress", "{m}");
     assert_eq!(m["candidate_runs"], json!([]), "{m}");
     assert!(!fx.path(&format!("{KITE_DIR}/candidates")).exists());
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-029
@@ -390,6 +411,7 @@ async fn signoff_refuses_link_external_until_collected() {
         std::fs::read(fx.path(&format!("{KITE_DIR}/v1.0.0/kite_ext.png"))).unwrap(),
         b"external kite"
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-029
@@ -413,6 +435,7 @@ async fn collect_refuses_a_changed_external_file() {
     let m = fx.manifest(KITE);
     assert!(m["external"].is_array(), "{m}");
     assert_eq!(m["candidate_runs"], json!([]), "{m}");
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: QA-005
@@ -431,6 +454,7 @@ async fn signoff_without_a_workspace_is_workspace_required() {
         Outcome::Error { error } => assert_eq!(error.code, "workspace.required"),
         other => panic!("{other:?}"),
     }
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-032
@@ -455,6 +479,7 @@ async fn signoff_rejects_open_runs_unless_kept() {
         fx.path(&format!("{KITE_DIR}/candidates/{r2}/b.png"))
             .exists()
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-051
@@ -484,6 +509,7 @@ async fn signed_off_by_follows_the_caller() {
         assert_eq!(run_of(&m, &run)["signed_off"]["by"], by, "{m}");
         assert!(m.get("approved_by").is_none(), "{m}");
     }
+    fx.shutdown().await;
 }
 
 #[test] // spec: CORE-052
@@ -562,6 +588,7 @@ async fn signoff_bump_is_proposed_then_confirmed() {
             .is_file()
     );
     assert!(!fx.path(&format!("{KITE_DIR}/v1.1.0")).exists());
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-027
@@ -587,6 +614,7 @@ async fn new_work_after_approval_sets_version_by_the_bump_rules() {
         fx.path(&format!("{KITE_DIR}/v1.1.0/kite_two.png"))
             .is_file()
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-031, CORE-020
@@ -608,6 +636,7 @@ async fn import_ref_is_the_first_file_and_handoff_lists_every_file() {
         json!([candidate("kite_a.png"), candidate("kite_b.png")])
     );
     assert_handoff(&r);
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-020, CORE-039
@@ -632,6 +661,7 @@ async fn progress_entry_is_written_once_from_the_plan() {
     )
     .await;
     assert_eq!(done_entries(&read_text(&progress)).len(), before.len() + 1);
+    fx.shutdown().await;
 }
 
 /// A plan whose operation carries its own `progress.md` edit is a bug: the stage is the only
@@ -667,6 +697,7 @@ async fn a_plan_with_its_own_progress_edit_is_a_bug() {
         plan,
     )
     .await;
+    fx.shutdown().await;
 }
 
 /// Forwards to the index and keeps every batch of paths the store reported.
@@ -734,6 +765,7 @@ async fn signoff_writes_prefixed_hashes_and_sealed_files_reach_the_index_after_t
             .iter()
             .any(|e| e.path.as_str() == format!("{KITE_DIR}/v1.0.0/manifest.snapshot.json"))
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-028, CORE-031, ARCH-042
@@ -763,6 +795,7 @@ async fn refs_exclude_source_and_carry_the_content_hash() {
         format!("sha256:{}", sha256_bytes(b"layered source")),
         "{m}"
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-019
@@ -801,6 +834,7 @@ async fn pin_input_records_proj_and_lib_links_keeping_comments() {
     assert_eq!(parsed.links, ["proj:harbor", "lib:brick_wall"]);
     assert_eq!(after.lines().next(), before.lines().next(), "{after}");
     assert!(after.starts_with('#'), "{after}");
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-019
@@ -831,6 +865,7 @@ async fn pin_input_accepts_a_target_that_does_not_exist_yet() {
             .await;
         assert_eq!(e.code, "ref.invalid", "{bad}: {e:?}");
     }
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-023
@@ -864,6 +899,7 @@ async fn import_copy_never_overwrites_and_hashes_the_staged_copy() {
             .is_err()
     );
     assert!(!handle.dir.join("dir.png").exists());
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-029, ARCH-076
@@ -910,6 +946,7 @@ async fn collect_removes_external_without_reordering_keys() {
         .unwrap(),
         source_bytes
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-053
@@ -943,6 +980,7 @@ async fn request_signoff_moves_to_in_review() {
         )
         .await;
     assert_eq!(e.code, "asset.unknown");
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: ARCH-060
@@ -972,6 +1010,7 @@ async fn imported_file_names_are_untrusted_in_results() {
         )
         .await;
     assert_eq!(e.code, "params.invalid");
+    fx.shutdown().await;
 }
 
 /// A junction at `link` to the folder `target` (no privilege needed).
@@ -1006,6 +1045,7 @@ async fn import_refuses_a_linked_asset_folder() {
         )
         .await;
     assert_eq!(e.code, "project.unknown");
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-026, ARCH-079
@@ -1041,6 +1081,7 @@ async fn a_human_edited_candidate_is_refused_before_anything_moves() {
         std::fs::read(fx.path(&format!("{KITE_DIR}/v1.0.0/kite.png"))).unwrap(),
         b"edited outside"
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-032, CORE-053, CORE-048
@@ -1065,6 +1106,7 @@ async fn a_kept_run_is_signable_once_the_asset_is_approved() {
     let m = fx.manifest(KITE);
     assert_eq!(m["approved_version"], "1.1.0");
     assert_eq!(run_of(&m, &kept)["status"], "selected");
+    fx.shutdown().await;
 }
 
 /// The real probe, except that one path reports the cloud placeholder attributes.
@@ -1135,6 +1177,7 @@ async fn import_refuses_link_and_cloud_only_sources() {
         }
     }
     assert!(!fx.path(KITE_DIR).exists());
+    fx.shutdown().await;
 }
 
 /// The real probe, recording every file whose data it opens.
@@ -1202,6 +1245,7 @@ async fn asset_get_opens_no_sealed_file() {
         sealed.is_empty(),
         "asset.get opened sealed files: {sealed:?}"
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-033, ARCH-079 (ruling Q32)
@@ -1276,6 +1320,7 @@ async fn a_cloud_only_legacy_file_leaves_its_version_without_a_content_hash() {
         }]),
         "{detail}"
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: ARCH-075, CORE-026
@@ -1336,4 +1381,5 @@ async fn the_seal_reports_the_run_files_it_moved_as_removals() {
             .any(|p| p.starts_with(&format!("candidates/{run}/"))),
         "{detail}"
     );
+    fx.shutdown().await;
 }

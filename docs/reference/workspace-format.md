@@ -272,6 +272,16 @@ One JSON object per line; append a new line for every state change, and read the
 
 Status values: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `downloaded`. The optional `substatus` is free text that adds detail without changing the status, for example `waiting_for_gpu`, `rendering`, `polling`, `downloading` or `retry_2`. Before resubmitting a job, check its status with the provider using `external_id`. Download outputs into the job's run folder as soon as it succeeds, since many hosts expire output URLs. Every paid job also gets a line in the usage log (I10) with the same `job_id`.
 
+**Lines the suite writes** (plan 3 clarification: spec Appendix F). The suite's core writes one line per job state change to `queue/jobs.<machine>.<yyyy-mm>.jsonl`, with `machine` and `seq` first, then `job_id`, `kind`, `lane`, `priority`, `project`, `asset_id`, `module`, `run_id`, `doc_id`, `status`, `substatus`, `attempt`, `submitted`, `updated`, `outputs`, `error`, `idempotency_key`, `trace_id`, `usage` and `hardware`. Its job ids are `j_<16 hex>`, its lanes `gpu-heavy` and `cpu`, and its priorities `interactive`, `user` and `agent`. Its `status` is one of `queued`, `running`, `succeeded`, `failed` and `cancelled`, and each `substatus` belongs to one status:
+
+| `substatus` | `status` |
+|---|---|
+| `waiting`, `waiting_for_vram`, `submitting`, `queued_in_engine` | `queued` |
+| `executing`, `ingesting`, `retrying_<n>_of_<m>`, `cancelling`, `interrupted_unknown` | `running` |
+| `interrupted` | `failed` |
+
+Jobs that run without a workspace write no line.
+
 ## I9. Registry entries
 
 `registry/models.yaml`:
@@ -334,6 +344,14 @@ Examples:
 {"ts": "2026-10-12T15:20:42Z", "workspace": "LILITH", "project": "sketchbook", "asset": "vid_lighthouse", "job_id": "j_20261012_0007", "tool": "curl", "provider": "fal", "model": "bytedance/seedance-2.5/text-to-video", "route": "direct", "billing_basis": "prepaid_credits", "seconds": 15, "est_cost": 1.80, "cost": 1.80, "cost_source": "computed_from_usage", "currency": "USD", "latency_ms": 184000, "status": "succeeded"}
 ```
 
+**Lines the suite writes** (plan 3 clarification: spec Appendix F). The suite's core writes one line per call to `registry/usage.<machine>.<yyyy-mm>.jsonl` (or to its own `usage-loose.jsonl` for a call without a workspace), with `machine` and `seq` first, then:
+- context: `ts`, `workspace` (the workspace id, or `"loose"`), `project`, `asset`, `job_id`, `tool`, `caller_kind`, `account` (an opaque id, never a label or an e-mail address);
+- `provider`, `model`, `route`, `service_tier`, `region` and `billing_basis` (`payg`, `prepaid_credits`, `subscription_quota`, `free_tier`, `byok` or `local`);
+- the usage units that apply: `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cache_ttl`, `output_tokens`, `reasoning_tokens`, `images`, `seconds`, `characters`, `requests`, `gpu_seconds`, `energy_wh_gross`, `energy_wh_above_idle`, and `idle_unknown: true` when no idle baseline existed;
+- `raw_usage`, `est_cost`, `cost`, `energy_cost`, `cost_source`, `price_version`, `currency`, `latency_ms`, `status` (`pending`, `succeeded`, `failed` or `cancelled`) and `attribution` (`suite` or `unattributed`).
+
+In these lines money (`est_cost`, `cost`, `energy_cost`) is a **decimal string** of the exact value, such as `"0.0087"`, never a JSON number. Local work has `billing_basis: "local"` and `cost: "0"`, with its energy cost in `energy_cost`.
+
 **Month-to-date spend** = the sum of `cost` (or `est_cost` where `cost` is `null`) over the latest line per `job_id` with a `ts` in the current calendar month, grouped by project and provider as needed.
 
 **Spending caps (`%APPDATA%\LILITH\suite.toml`).** Optional and set by the user only. Agents read the file and never create, edit or work around it. No file, or no `[caps]` table, means no caps. Format:
@@ -349,3 +367,31 @@ fal = 15
 ```
 
 Before a paid call or batch: if month-to-date plus the estimate would exceed `monthly_usd` or that provider's monthly cap, or a single call's estimate exceeds `per_call_max_usd`, stop and ask the user. Their yes covers that call or batch only and doesn't change the file.
+
+**Keys the suite reads** (plan 3 clarification: spec Appendix F). The suite sets caps in a display currency and reads these keys; amounts are decimal strings or integers:
+
+```toml
+[money]
+display_currency = "USD"
+
+[[money.rates]]               # 1 unit of `currency` = `in_display` display units
+currency = "EUR"
+in_display = "1.08"
+date = "2026-10-18"           # the day the rate was taken, YYYY-MM-DD
+
+[caps]
+monthly = "50"                # all providers together, per local calendar month
+per_call_max = "2"            # optional: any single call or job
+
+[caps.provider_monthly]       # optional per-provider monthly caps
+openrouter = "20"
+
+[[fixed_costs]]               # shown beside usage, never counted against caps
+name = "…"
+amount = "20"
+currency = "USD"
+period = "monthly"
+account = "…"                 # optional, an opaque id
+```
+
+The `*_usd` keys above are read only when `display_currency` is `USD` and the matching new key is absent. A cap value that doesn't parse counts as exceeded, so calls stop and ask, naming the bad key. Caps count only `payg`, `prepaid_credits` and `byok` money.

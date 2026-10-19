@@ -55,6 +55,18 @@ getrandom = "0.4.3"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 # suite.toml edits that keep comments and unknown keys (CORE-007).
 toml_edit = "0.22.27"
+# Plan 3 (core platform II), pinned to the crates.io releases current on 2026-10-18.
+# GPU telemetry through the driver's nvml.dll, loaded at run time (CORE-059): lil-platform only.
+nvml-wrapper = "0.13.0"
+# CPU, RAM, per-process CPU time, network and disks (CORE-059): lil-platform only.
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
+# ComfyUI's websocket: the client in lil-core, the server in the test kit's fake.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
+# The stdio MCP server (ARCH-012): lil-mcp only.
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
+# The fake ComfyUI's HTTP server: lil-testkit only.
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http1"] }
 
 # The reviewer key's scrypt (N = 2^18) takes minutes unoptimised; optimise just the KDF so
 # `lil dev reviewer-setup` / `approve` and their tests stay quick in dev and test builds.

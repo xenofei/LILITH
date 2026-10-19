@@ -388,6 +388,88 @@ fn open_lists_orphans_once_on_the_workspace_topic() {
     );
 }
 
+/// The real probe, counting the listings of `root` itself: every whole-tree walk (the
+/// store's recovery and orphan scans, the index's reconcile) starts by listing the root.
+#[derive(Debug)]
+struct CountingWalks {
+    root: PathBuf,
+    walks: std::sync::atomic::AtomicUsize,
+}
+
+impl lil_platform::fs::Probe for CountingWalks {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+
+    fn read_dir(&self, dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+        if dir == self.root {
+            self.walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        SystemProbe.read_dir(dir)
+    }
+}
+
+/// Plan-2b Minor 9: a read-write open walks the tree once (recovery's leftover scan, which
+/// also finds the conflict copies the orphan list needs) before the index's own walk.
+#[test] // spec: CORE-038, CORE-041
+fn workspace_open_walks_the_tree_once() {
+    let env = TestEnv::new();
+    let ws_path = env.make_workspace("alpha");
+    let conflict = "notes/a.txt.lil-conflict-20261016T120000Z";
+    write_file(
+        &ws_path
+            .join("notes")
+            .join(conflict.rsplit('/').next().unwrap()),
+        b"outside",
+    );
+    // A conflict copy in the workspace data folder is no orphan.
+    write_file(
+        &ws_path
+            .join(".lilith")
+            .join("x.lil-conflict-20261016T120000Z"),
+        b"core's own",
+    );
+    let ws = workspace_ref(&ws_path);
+    let probe = Arc::new(CountingWalks {
+        root: ws.path.clone(),
+        walks: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let states = registry(&env.env);
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let hub = WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        Arc::new(EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+        probe.clone(),
+        lil_core::watch::WatchConfig::default(),
+    );
+    let rt = runtime();
+
+    let open = rt.block_on(hub.open(&ws)).expect("the workspace opens");
+    assert_eq!(open.access, Access::ReadWrite);
+    rt.block_on(open.index.ready());
+    assert_eq!(open.orphans, [WsPath::parse(conflict).unwrap()]);
+    assert_eq!(
+        probe.walks.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one walk before the index's own"
+    );
+    drop(open);
+    rt.block_on(hub.close_all());
+    states.close();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Both locks (plan decision D4, Review Focus 2).
 // ---------------------------------------------------------------------------------------------
@@ -535,6 +617,151 @@ fn either_lock_held_elsewhere_makes_the_open_read_only() {
     assert_eq!(open.access, Access::ReadWrite);
 }
 
+/// Deletes `path` as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn delete_outside(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// Renames `from` to `to` as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn rename_outside(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// A held `core.lock` is opened without `FILE_SHARE_DELETE`: while it is held its name can't
+/// be deleted or renamed away (error 32), so a second core always finds the held lock and
+/// serves read-only. Opening it again for the lock check still works.
+#[test] // spec: ARCH-028
+fn core_lock_cannot_be_deleted_or_renamed_while_held() {
+    use lil_core::workspace::take_core_locks;
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let held = take_core_locks(&ws.path, &SystemProbe)
+        .expect("the locks open")
+        .expect("both locks are free");
+
+    for (label, path) in [
+        (".lilith\\core.lock", core_lock(&ws)),
+        (".worldwright\\core.lock", legacy_lock(&ws)),
+    ] {
+        let deleted = delete_outside(&path);
+        assert_eq!(
+            deleted.as_ref().map_err(std::io::Error::raw_os_error),
+            Err(Some(32)),
+            "deleting {label}: {deleted:?}"
+        );
+        let renamed = rename_outside(&path, &path.with_file_name("core.lock.moved"));
+        assert_eq!(
+            renamed.as_ref().map_err(std::io::Error::raw_os_error),
+            Err(Some(32)),
+            "renaming {label}: {renamed:?}"
+        );
+        assert!(path.is_file(), "{label} is gone");
+        assert!(!path.with_file_name("core.lock.moved").exists(), "{label}");
+    }
+    // A second core opens both files and finds the lock held.
+    assert!(
+        take_core_locks(&ws.path, &SystemProbe)
+            .expect("the locks open")
+            .is_none(),
+        "a second core took the locks"
+    );
+    drop(held);
+    assert!(take_core_locks(&ws.path, &SystemProbe).unwrap().is_some());
+}
+
+/// Opens `path` the way another program can: with `DELETE` access and every share mode.
+#[allow(clippy::disallowed_methods)]
+fn open_with_delete_access(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(0x7) // read, write and delete
+        .open(path)
+        .expect("the outside handle")
+}
+
+/// A handle elsewhere with delete access makes the lock open fail with error 32 (the lock is
+/// opened without delete sharing). That counts as held elsewhere: the workspace opens
+/// read-only, never `store.io`, and the other lock isn't kept.
+#[test] // spec: ARCH-028
+fn delete_access_held_elsewhere_makes_the_open_read_only() {
+    use lil_core::workspace::take_core_locks;
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    // Both lock files exist (an earlier open made them).
+    drop(take_core_locks(&ws.path, &SystemProbe).unwrap().unwrap());
+    let rt = runtime();
+    let states = registry(&env.env);
+    let (hub, _) = hub(&env.env, &states);
+    for path in [core_lock(&ws), legacy_lock(&ws)] {
+        let outside = open_with_delete_access(&path);
+        assert!(
+            take_core_locks(&ws.path, &SystemProbe)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()))
+                .is_none(),
+            "{}",
+            path.display()
+        );
+        let open = rt
+            .block_on(hub.open(&ws))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
+        assert_eq!(open.access, Access::ReadOnly, "{}", path.display());
+        drop(open);
+        rt.block_on(hub.close(&ws.id));
+        drop(outside);
+    }
+    assert!(take_core_locks(&ws.path, &SystemProbe).unwrap().is_some());
+}
+
+/// The real probe, except that `identity` of `fail_at` is access denied (error 5).
+#[derive(Debug)]
+struct FailingAt {
+    fail_at: PathBuf,
+}
+
+impl lil_platform::fs::Probe for FailingAt {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        if path == self.fail_at {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+}
+
+/// D4 fails closed: when whether the legacy folder exists can't be read (here access
+/// denied), the open is never read-write, and the new lock isn't kept.
+#[test] // spec: ARCH-028
+fn unreadable_legacy_folder_makes_the_open_read_only() {
+    use lil_core::workspace::take_core_locks;
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.make_legacy_workspace("plugin era"));
+    fsops::ensure_dir(&ws.path.join(LEGACY_WORKSPACE_DIR)).unwrap();
+    let probe = FailingAt {
+        fail_at: ws.path.join(LEGACY_WORKSPACE_DIR),
+    };
+    let taken = take_core_locks(&ws.path, &probe).expect("not an open error");
+    assert!(
+        taken.is_none(),
+        "an unreadable legacy folder gave read-write"
+    );
+    assert!(lock_is_free(&ws), "the new lock was kept");
+    assert!(take_core_locks(&ws.path, &SystemProbe).unwrap().is_some());
+}
+
 // ---------------------------------------------------------------------------------------------
 // A dispatcher over a hub.
 // ---------------------------------------------------------------------------------------------
@@ -590,4 +817,49 @@ fn params(name: &str, args: Value, key: Option<&str>) -> lil_protocol::ToolCallP
         idempotency_key: key.map(str::to_string),
         trace_id: None,
     }
+}
+
+/// `workspace.doctor`'s offers run only for the person (owner question 1): a verified `mcp`
+/// session (Claude Code) and an engine's `assistant` session get `caller.not_allowed`, and the
+/// legacy workspace file stays where it is.
+#[test] // spec: ARCH-047, ARCH-052 (owner question 1)
+fn an_agent_caller_cannot_run_a_doctor_offer() {
+    use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
+    let env = TestEnv::new();
+    let ws_path = env.make_legacy_workspace("plugin era");
+    env.register_workspace(&ws_path, true);
+    let ws = workspace_ref(&ws_path);
+    let states = registry(&env.env);
+    let (hub, events) = hub(&env.env, &states);
+    let dispatcher = dispatcher(&env.env, &states, &events, &hub);
+    let rt = runtime();
+    for (n, caller) in [
+        lil_protocol::CallerKind::Mcp,
+        lil_protocol::CallerKind::Assistant,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = Arc::new(lil_core::session::Session {
+            caller: caller.clone(),
+            ..(*session(Some(ws.clone()))).clone()
+        });
+        let out = rt.block_on(dispatcher.call(
+            session,
+            params(
+                "workspace.doctor",
+                json!({"fix": true, "offers": ["legacy_names"]}),
+                Some(&format!("agent-offer-{n}")),
+            ),
+        ));
+        let lil_protocol::Outcome::Error { error } = &out else {
+            panic!("{caller:?} ran the offer: {out:?}");
+        };
+        assert_eq!(error.code, "caller.not_allowed", "{caller:?}: {error:?}");
+        assert!(ws_path.join(LEGACY_WORKSPACE_FILE).is_file(), "{caller:?}");
+        assert!(!ws_path.join(WORKSPACE_FILE).exists(), "{caller:?}");
+    }
+    drop(dispatcher);
+    rt.block_on(hub.close_all());
+    states.close();
 }

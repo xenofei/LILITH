@@ -14,11 +14,14 @@
 )]
 
 pub mod config;
+pub mod engines;
 pub mod events;
 pub mod graph;
 pub mod identity;
 pub mod index;
+pub mod jobs;
 pub mod lifecycle;
+pub mod meter;
 pub mod pipeline;
 pub mod projects;
 pub mod rpc;
@@ -27,6 +30,7 @@ pub mod session;
 pub mod settings;
 pub mod state;
 pub mod store;
+pub mod telemetry;
 pub mod tools;
 pub mod watch;
 pub mod workspace;

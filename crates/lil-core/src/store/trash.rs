@@ -41,13 +41,12 @@ use serde_json::Value;
 use super::fsops;
 use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
-use super::paths::{WsPath, path_key, writable};
+use super::paths::{WsPath, long_rel, path_key, writable};
 use super::versions::{files_under, set_readonly_all};
 use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
 };
 use lil_platform::fs::Probe;
-use lil_platform::names::is_workspace_dir;
 
 /// Days a trash entry is kept before it is purged (ARCH-058, CORE-037).
 pub const TRASH_KEEP_DAYS: i64 = 30;
@@ -242,27 +241,6 @@ fn remove_if_empty(path: &Path) {
     let _ = fsops::remove_empty_dir(path);
 }
 
-/// `store.path_invalid` for the paths the trash never touches, compared without regard to case:
-/// the trash itself, either workspace data folder ([`is_workspace_dir`]), `.git` and the ledger.
-/// `what` finishes the reason ("moved to the trash", "restored to").
-fn refuse_reserved(rel: &WsPath, what: &str) -> Result<(), StoreError> {
-    let first = rel.as_str().split('/').next().unwrap_or_default();
-    let refused = is_workspace_dir(first)
-        || [TRASH_DIR, ".git"]
-            .iter()
-            .any(|area| first.eq_ignore_ascii_case(area))
-        || path_key(rel.as_str()) == path_key("registry/ledger.csv");
-    if refused {
-        return Err(StoreError::PathInvalid {
-            path: rel.as_str().to_string(),
-            why: format!(
-                "the trash, the suite's own folders, .git and the ledger are never {what}"
-            ),
-        });
-    }
-    Ok(())
-}
-
 impl Store {
     /// Moves `rel` (a file or a folder) to the trash with `reason` (module docs). A sealed
     /// version folder, or anything in one, is never moved (CORE-026; it is refused as every
@@ -272,19 +250,128 @@ impl Store {
     ///
     /// # Errors
     /// `workspace.read_only`; `store.path_invalid` for the trash itself, either workspace data
-    /// folder ([`is_workspace_dir`]), `.git`, `registry/ledger.csv`, a sealed version folder or a
-    /// path in one, or a link;
-    /// `store.locked` for a path in its manifest's `locks`; `store.git_busy` when git is still
-    /// working after 60 s; `store.io` when there is nothing at `rel` or a file call fails
-    /// (`store.busy` when it stays held).
+    /// folder, `.git`, `registry/ledger.csv`, a sealed version folder or a path in one, by any
+    /// name (an 8.3 short name too, or a long form that can't be read), or a link (also a
+    /// linked folder on the way);
+    /// `store.locked` for a path in its manifest's `locks`, by any name, or a folder holding one
+    /// (ruling P3-R7: a whole asset or project too); `store.git_busy` when
+    /// git is still working after 60 s; `store.io` when there is nothing at `rel` or a file
+    /// call fails (`store.busy` when it stays held).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
-        refuse_reserved(rel, "moved to the trash")?;
+        let long = self.reserved_on_disk(rel, "moved to the trash").await?;
         writable(rel)?;
-        self.writable_on_disk(rel).await?;
+        writable(&long)?;
         self.check_locks(rel).await?;
+        self.check_long_locks(rel, &long).await?;
+        // A folder holding a locked path is never moved either (ruling P3-R7).
+        self.refuse_locks_within(rel, &long).await?;
+        // The long form doesn't see through a junction: a linked folder on the way could reach
+        // a sealed folder, `.lilith\` or `.git\`. Attributes only.
+        self.refuse_links(rel).await?;
         self.git_gate().wait_clear(GIT_WAIT).await?;
         self.trash_now(rel, reason).await
+    }
+
+    /// Ruling P3-R7: `store.locked` when a manifest `locks` entry (CORE-035) and `long`, the
+    /// long form of `rel`, overlap: the entry is `long` or under it (a folder holding a locked
+    /// path, a whole asset or project too), or `long` is under the entry. Both sides are long
+    /// forms: each entry is resolved under its asset folder with `probe.long_form`, so one
+    /// written as an 8.3 alias still counts. The error names the locked path (`rel` when it is
+    /// under the entry). The manifest is never locked by its own list, and an entry that isn't
+    /// a valid path is skipped with a warning; a manifest, a listing or a long form that can't
+    /// be read refuses the trash (fail closed).
+    async fn refuse_locks_within(&self, rel: &WsPath, long: &WsPath) -> Result<(), StoreError> {
+        let parts: Vec<&str> = long.as_str().split('/').collect();
+        if !parts[0].eq_ignore_ascii_case("projects")
+            || (parts.len() >= 3 && !parts[2].eq_ignore_ascii_case("assets"))
+        {
+            return Ok(());
+        }
+        let assets = if parts.len() >= 4 {
+            vec![parts[..4].join("/")]
+        } else {
+            self.assets_under(&parts).await?
+        };
+        let target = long.key();
+        for asset in assets {
+            let asset_id = asset.rsplit('/').next().unwrap_or_default().to_string();
+            let manifest = WsPath::from_disk(format!("{asset}/{asset_id}.manifest.json"));
+            let Some(bytes) = self.read(&manifest).await? else {
+                continue;
+            };
+            let Some((m, _)) = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|t| Manifest::parse(t).ok())
+            else {
+                tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
+                continue;
+            };
+            let mut entries = Vec::new();
+            for entry in m.view().locks {
+                let trimmed = entry.trim_end_matches('/');
+                match WsPath::parse(&format!("{asset}/{trimmed}")) {
+                    Ok(path) if !trimmed.is_empty() && path.key() != manifest.key() => {
+                        entries.push(path);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(manifest = %manifest, entry = %entry, "a locks entry that isn't a workspace path is skipped");
+                    }
+                }
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
+            let longs = blocking(move || {
+                Ok(entries
+                    .iter()
+                    .map(|e| long_rel(&root, e, &|p| probe.long_form(p)))
+                    .collect::<Result<Vec<_>, _>>())
+            })
+            .await
+            .map_err(|e| StoreError::io(&manifest, &e))??;
+            for entry in longs {
+                let key = entry.key();
+                if key == target || key.starts_with(&format!("{target}/")) {
+                    return Err(StoreError::Locked(entry));
+                }
+                if target.starts_with(&format!("{key}/")) {
+                    return Err(StoreError::Locked(rel.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The asset folders, workspace-relative, under `parts`: `projects`, `projects/<p>` or
+    /// `projects/<p>/assets` (links are never followed).
+    async fn assets_under(&self, parts: &[&str]) -> Result<Vec<String>, StoreError> {
+        let root = self.root().to_path_buf();
+        let at = WsPath::from_disk(parts.join("/"));
+        let parts: Vec<String> = parts.iter().map(|p| (*p).to_string()).collect();
+        blocking(move || {
+            let projects = if parts.len() == 1 {
+                list(&root.join(&parts[0]))?
+                    .into_iter()
+                    .filter(|e| e.folder)
+                    .map(|e| format!("{}/{}", parts[0], e.name))
+                    .collect()
+            } else {
+                vec![format!("{}/{}", parts[0], parts[1])]
+            };
+            let mut assets = Vec::new();
+            for project in projects {
+                let dir = WsPath::from_disk(format!("{project}/assets")).abs(&root);
+                for e in list(&dir)?.into_iter().filter(|e| e.folder) {
+                    assets.push(format!("{project}/assets/{}", e.name));
+                }
+            }
+            Ok(assets)
+        })
+        .await
+        .map_err(|e| StoreError::io(&at, &e))
     }
 
     /// [`Store::trash`] after its checks.
@@ -411,6 +498,7 @@ impl Store {
     /// # Errors
     /// `workspace.read_only`; `trash.unknown` for no such entry; `trash.restore_conflict`
     /// (naming the original path) when something is at the original path now;
+    /// `store.locked` when the original path (by any name) is in its manifest's `locks`;
     /// `store.path_invalid` when the original path is the trash, either workspace data folder,
     /// `.git`, the ledger, or any other path a write refuses (also through an 8.3 name); a
     /// `restore.json` edited by hand can name any of them. A path in a sealed version folder is
@@ -437,13 +525,17 @@ impl Store {
             })
             .ok_or_else(unknown)?;
         let rel = WsPath::parse(&entry.record.original_path)?;
-        // The trash's own refusals, then a write's, before anything moves; the entry stays as it
-        // is. A sealed path is the one exception: it restores, read-only again (CORE-026).
-        refuse_reserved(&rel, "restored to")?;
+        // The trash's own refusals (by the long name too, so an 8.3 short name is refused like
+        // the long one), then a write's, before anything moves; the entry stays as it is. A
+        // sealed path is the one exception: it restores, read-only again (CORE-026).
+        let long = self.reserved_on_disk(&rel, "restored to").await?;
         if !in_version_folder(&rel) {
             writable(&rel)?;
-            self.writable_on_disk(&rel).await?;
+            writable(&long)?;
         }
+        // Manifest `locks` (CORE-035), by the path as recorded and by its long form.
+        self.check_locks(&rel).await?;
+        self.check_long_locks(&rel, &long).await?;
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
             let items = blocking(move || list(&dir))
@@ -679,7 +771,11 @@ impl Store {
                 .await
                 .unwrap_or(false);
             let stamp = if present {
-                if let Err(e) = self.check_locks(&folder).await {
+                let locked = match self.check_locks(&folder).await {
+                    Ok(()) => self.refuse_locks_within(&folder, &folder).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = locked {
                     tracing::warn!(run = %folder, error = %e, "a locked rejected run stays");
                     continue;
                 }

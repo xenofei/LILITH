@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::BoxFuture;
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{
     CallerKind, EffectClass, ErrorCategory, FileRef, Outcome, RetryPolicy, ToolCallParams,
@@ -69,30 +70,33 @@ impl SettingsStage for Recording {
 }
 
 impl EstimateStage for Recording {
-    fn estimate(&self, d: &ToolDescriptor) -> Estimate {
+    fn estimate(&self, d: &ToolDescriptor, args: &Value, s: &Settings) -> Estimate {
         self.log.push("estimate");
-        self.plan2.estimate.estimate(d)
+        self.plan2.estimate.estimate(d, args, s)
     }
 }
 
 impl ConfirmStage for Recording {
-    fn check(&self, s: &Session, d: &ToolDescriptor, e: &Estimate) -> ConfirmDecision {
+    fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
         self.log.push("confirm");
-        self.plan2.confirm.check(s, d, e)
+        self.plan2.confirm.check(i)
     }
 }
 
 impl ReserveStage for Recording {
-    fn reserve(&self, s: &Session, e: &Estimate) -> Result<(), lil_protocol::ErrorBody> {
+    fn reserve<'a>(
+        &'a self,
+        i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, lil_protocol::ErrorBody>> {
         self.log.push("reserve");
-        self.plan2.reserve.reserve(s, e)
+        self.plan2.reserve.reserve(i)
     }
 }
 
 impl MeterStage for Recording {
-    fn settle(&self, s: &Session, out: &Outcome<ToolOutput>) {
+    fn settle<'a>(&'a self, i: SettleInput<'a>) -> BoxFuture<'a, ()> {
         self.log.push("meter");
-        self.plan2.meter.settle(s, out);
+        self.plan2.meter.settle(i)
     }
 }
 
@@ -412,6 +416,99 @@ async fn stages_run_in_core_015_order() {
     assert_eq!(read.executions(), 1);
 }
 
+/// The plan-2 behaviour through the plan-3 stage signatures (`PipelineHooks::plan2()`).
+#[tokio::test] // spec: CORE-015, QA-016, CORE-109
+async fn plan2_stage_defaults_still_hold() {
+    let fx = fixture(&[]);
+    let hooks = PipelineHooks::plan2();
+    let settings = Settings::default();
+    let reg = fx.dispatcher.registry();
+    for d in reg.descriptors() {
+        assert_eq!(
+            hooks.estimate.estimate(&d, &json!({}), &settings),
+            Estimate::Zero,
+            "{}",
+            d.name
+        );
+    }
+    let destructive = reg.get("test.destructive").unwrap().descriptor().clone();
+    let read = reg.get("test.echo").unwrap().descriptor().clone();
+    let ui = session(CallerKind::Ui("test".into()), false);
+    let check = |s: Arc<Session>, d: ToolDescriptor| {
+        let hooks = hooks.clone();
+        async move {
+            hooks
+                .confirm
+                .check(ConfirmInput {
+                    session: &s,
+                    descriptor: &d,
+                    estimate: &Estimate::Zero,
+                    args: &json!({}),
+                    idem: None,
+                    workspace: None,
+                })
+                .await
+        }
+    };
+    let proceed = ConfirmDecision::Proceed {
+        confirmed_via: None,
+        cap_override: None,
+    };
+    assert_eq!(
+        check(cli(), destructive.clone()).await,
+        ConfirmDecision::Unavailable
+    );
+    assert_eq!(check(ui.clone(), destructive).await, proceed);
+    assert_eq!(check(cli(), read).await, proceed);
+    let reserved = hooks
+        .reserve
+        .reserve(ReserveInput {
+            session: &cli(),
+            estimate: &Estimate::Zero,
+            workspace_id: "none",
+            call_id: "c_0000000000000001",
+            allow_once: None,
+        })
+        .await;
+    assert_eq!(reserved, Ok(ReserveOutcome::None));
+
+    // `settle` writes nothing: the suite state.db and the workspace logs keep their bytes.
+    let ws = fx.env.copy_fixture_workspace("record");
+    let snapshot = || {
+        let db = fx.env.env.suite_state_db();
+        let mut files = vec![std::fs::read(&db).unwrap()];
+        let wal = db.with_extension("db-wal");
+        if wal.exists() {
+            files.push(std::fs::read(&wal).unwrap());
+        }
+        for log in ["queue", "registry"] {
+            let dir = ws.join(log);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut names: Vec<_> = entries.map(|e| e.unwrap().path()).collect();
+                names.sort();
+                files.extend(names.iter().map(|p| std::fs::read(p).unwrap()));
+            }
+        }
+        files
+    };
+    let before = snapshot();
+    let outcome = Outcome::Ok(ToolOutput {
+        structured: json!({}),
+        artifacts: Vec::new(),
+        summary_text: String::new(),
+    });
+    hooks
+        .meter
+        .settle(SettleInput {
+            session: &ui,
+            reservation: None,
+            call_id: "c_0000000000000001",
+            outcome: &outcome,
+        })
+        .await;
+    assert_eq!(snapshot(), before);
+}
+
 #[tokio::test] // spec: CORE-015
 async fn unknown_tool_is_tool_unknown() {
     let fx = fixture(&[]);
@@ -587,7 +684,35 @@ async fn ui_destructive_proceeds() {
     let out = fx
         .call(&ui, "test.destructive", json!({}), Some("k2"))
         .await;
-    assert_eq!(ok(&out).structured, json!({"executed": true}));
+    assert_eq!(ok(&out).structured, json!({"count": 1}));
+}
+
+/// `test.destructive {cost?}` counts its runs in this core; `cost` is a decimal string, and a
+/// refused call doesn't count.
+#[tokio::test] // spec: CORE-109, QA-066
+async fn test_destructive_counts_runs_and_takes_a_cost() {
+    let fx = fixture(&[]);
+    let ui = session(CallerKind::Ui("image".into()), false);
+    let out = fx
+        .call(&ui, "test.destructive", json!({}), Some("k1"))
+        .await;
+    assert_eq!(ok(&out).structured, json!({"count": 1}));
+    let out = fx
+        .call(&ui, "test.destructive", json!({"cost": "2"}), Some("k2"))
+        .await;
+    assert_eq!(ok(&out).structured, json!({"count": 2}));
+    for (key, bad) in [("k3", json!({"cost": 2})), ("k4", json!({"other": 1}))] {
+        let out = fx.call(&ui, "test.destructive", bad, Some(key)).await;
+        assert_eq!(error(&out).code, "params.invalid", "{key}");
+    }
+    let out = fx
+        .call(&ui, "test.destructive", json!({}), Some("k5"))
+        .await;
+    assert_eq!(
+        ok(&out).structured,
+        json!({"count": 3}),
+        "the refusals did not count"
+    );
 }
 
 #[tokio::test] // spec: QA-012, ARCH-060
@@ -700,6 +825,8 @@ fn every_tool_declares_a_module() {
     for d in tools {
         let want = if d.name.starts_with("test.") {
             TEST_MODULE
+        } else if d.name.starts_with("job.") || d.name.starts_with("jobs.") {
+            crate::jobs::JOBS_MODULE
         } else {
             WORKSPACE_MODULE
         };
@@ -751,6 +878,8 @@ async fn test_tools_exist_only_on_test_channels() {
             "test.echo",
             "test.emit",
             "test.ingest_run",
+            "test.job",
+            "test.job_release",
             "test.panic",
             "test.settings",
             "test.state_panic",
@@ -855,7 +984,10 @@ async fn a_cancelled_caller_still_finishes_the_row() {
 struct PanickingReserve;
 
 impl ReserveStage for PanickingReserve {
-    fn reserve(&self, _s: &Session, _e: &Estimate) -> Result<(), lil_protocol::ErrorBody> {
+    fn reserve<'a>(
+        &'a self,
+        _i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, lil_protocol::ErrorBody>> {
         panic!("the reserve stage has a bug")
     }
 }
@@ -1030,4 +1162,280 @@ async fn idem_finish_failure_says_what_happens() {
             "{name}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `job.retry` dispatches the call that made the job again (ARCH-052, CORE-146).
+// ---------------------------------------------------------------------------------------------
+
+/// A tool of effect `effect` that submits a `test.job` job with its arguments (`test.job`'s:
+/// `{lane: "cpu", fail?}`), in the caller's class.
+struct JobTool {
+    descriptor: ToolDescriptor,
+}
+
+fn job_tool(name: &str, effect: EffectClass) -> Arc<dyn Tool> {
+    Arc::new(JobTool {
+        descriptor: ToolDescriptor {
+            name: name.to_string(),
+            description: "Submits a test.job job.".into(),
+            effect,
+            module: "test".into(),
+            input_schema: schema_2020_12::<RecArgs>(),
+            output_schema: schema_2020_12::<RecResult>(),
+            annotations: BTreeMap::new(),
+        },
+    })
+}
+
+impl Tool for JobTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, _args: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn run<'a>(&'a self, ctx: &'a CallCtx, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let spec = crate::jobs::JobSpec {
+                kind: TEST_JOB_KIND,
+                lane: crate::jobs::Lane::Cpu,
+                priority: crate::jobs::Priority::for_caller(&ctx.session.caller, false),
+                module: "test".into(),
+                args,
+                project: None,
+                asset_id: None,
+                doc_id: None,
+                expected_secs: 10,
+                expected_output_bytes: 0,
+                vram_need_mib: None,
+                engine: None,
+                group: None,
+                external_side_effects: false,
+            };
+            let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
+            Ok(ToolOutput {
+                structured: json!({ "job": job }),
+                artifacts: Vec::new(),
+                summary_text: String::new(),
+            })
+        })
+    }
+}
+
+impl Fixture {
+    /// Runs `test.job` jobs (the core registers the handler on test channels).
+    fn with_job_handler(self) -> Fixture {
+        self.dispatcher
+            .jobs()
+            .register(Arc::new(TestJobHandler::new(self.gates.clone())));
+        self
+    }
+
+    /// Waits (failure deadline 30 s) until job `id` ends: its summary.
+    async fn job_done(&self, id: &str) -> Value {
+        let out = self
+            .call(
+                &cli(),
+                "job.wait",
+                json!({"job_id": id, "timeout_s": 30}),
+                None,
+            )
+            .await;
+        let waited = ok(&out).structured.clone();
+        assert_eq!(waited["done"], true, "{waited}");
+        waited["job"].clone()
+    }
+
+    async fn job_count(&self) -> usize {
+        let out = self.call(&cli(), "jobs.list", json!({}), None).await;
+        ok(&out).structured["jobs"].as_array().unwrap().len()
+    }
+}
+
+/// C1: a retry is never a way around a confirmation. An agent retrying the job of a
+/// `destructive` or `exec` tool gets `confirm.unavailable` and nothing runs; your retry from the
+/// app runs the tool again.
+#[tokio::test] // spec: ARCH-052, CORE-116, QA-016, CORE-146
+async fn an_agent_retry_of_a_destructive_or_exec_job_is_confirm_unavailable() {
+    let fx = fixture(&[
+        job_tool("x.exec_job", EffectClass::Exec),
+        job_tool("x.destructive_job", EffectClass::Destructive),
+    ])
+    .with_job_handler();
+    let ui = session(CallerKind::Ui("image".into()), false);
+    for (n, name) in ["x.exec_job", "x.destructive_job"].into_iter().enumerate() {
+        let made = fx
+            .call(
+                &ui,
+                name,
+                json!({"lane": "cpu", "fail": "final"}),
+                Some(&format!("make-{n}")),
+            )
+            .await;
+        let id = ok(&made).structured["job"]["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(fx.job_done(&id).await["status"], "failed");
+        let jobs = fx.job_count().await;
+        for caller in [CallerKind::Cli, CallerKind::Mcp, CallerKind::Assistant] {
+            let out = fx
+                .call(
+                    &session(caller.clone(), false),
+                    "job.retry",
+                    json!({"job_id": id}),
+                    Some(&format!("retry-{n}-{caller}")),
+                )
+                .await;
+            assert_eq!(error(&out).code, "confirm.unavailable", "{caller} {name}");
+        }
+        assert_eq!(fx.job_count().await, jobs, "no job was submitted");
+        // From the app it runs again, as a new job with `retry_of`.
+        let out = fx
+            .call(
+                &ui,
+                "job.retry",
+                json!({"job_id": id}),
+                Some(&format!("yours-{n}")),
+            )
+            .await;
+        let retried = ok(&out).structured.clone();
+        assert_eq!(retried["retry_of"], id.as_str(), "{retried}");
+        assert_eq!(retried["job"]["retry_of"], id.as_str(), "{retried}");
+        let again = retried["job"]["job_id"].as_str().unwrap();
+        assert_eq!(fx.job_done(again).await["status"], "failed");
+    }
+}
+
+/// Estimates `x.paid_job` as paid and reserves for it, logging each stage with the call id.
+struct Paid {
+    log: Arc<Mutex<Vec<String>>>,
+    next: AtomicU64,
+}
+
+impl EstimateStage for Paid {
+    fn estimate(&self, d: &ToolDescriptor, _args: &Value, _s: &Settings) -> Estimate {
+        if d.name != "x.paid_job" {
+            return Estimate::Zero;
+        }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("estimate {}", d.name));
+        Estimate::External {
+            provider: "test".into(),
+            amount: lil_schema::Money::from_micros(1_000_000),
+            currency: lil_schema::Currency::parse("USD").unwrap(),
+            basis: BillingBasis::Payg,
+        }
+    }
+}
+
+impl ReserveStage for Paid {
+    fn reserve<'a>(
+        &'a self,
+        i: ReserveInput<'a>,
+    ) -> BoxFuture<'a, Result<ReserveOutcome, lil_protocol::ErrorBody>> {
+        let out = if *i.estimate == Estimate::Zero {
+            ReserveOutcome::None
+        } else {
+            let n = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+            let rv = format!("rv_{n:016x}");
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("reserve {rv} {}", i.call_id));
+            ReserveOutcome::Reserved(rv)
+        };
+        Box::pin(std::future::ready(Ok(out)))
+    }
+}
+
+impl crate::jobs::Reservations for Paid {
+    fn hand_over<'a>(
+        &'a self,
+        reservation: &'a str,
+        from: &'a str,
+        to: &'a crate::jobs::JobId,
+    ) -> crate::jobs::JobFuture<'a, ()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("hand_over {reservation} {from} {to}"));
+        Box::pin(std::future::ready(()))
+    }
+
+    fn release<'a>(
+        &'a self,
+        reservation: &'a str,
+        owner: &'a str,
+    ) -> crate::jobs::JobFuture<'a, ()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("release {reservation} {owner}"));
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// C1, I3, ruling 3: a retry of a paid job runs the estimate and reserve stages again under a
+/// call id of its own; the new job takes the new reservation over; and an agent's retry of your
+/// job runs in the `agent` class.
+#[tokio::test] // spec: CORE-015, CORE-088, CORE-124, CORE-146
+async fn a_retry_estimates_and_reserves_again() {
+    let paid = Arc::new(Paid {
+        log: Arc::default(),
+        next: AtomicU64::new(0),
+    });
+    let hooks = PipelineHooks {
+        estimate: paid.clone(),
+        reserve: paid.clone(),
+        ..PipelineHooks::plan2()
+    };
+    let fx = fixture_with(
+        hooks,
+        &Log::default(),
+        &[job_tool("x.paid_job", EffectClass::Write)],
+    )
+    .with_job_handler();
+    fx.dispatcher.jobs().set_reservations(paid.clone());
+    let ui = session(CallerKind::Ui("image".into()), false);
+    let made = fx
+        .call(
+            &ui,
+            "x.paid_job",
+            json!({"lane": "cpu", "fail": "final"}),
+            Some("make"),
+        )
+        .await;
+    let first = ok(&made).structured["job"].clone();
+    let id = first["job_id"].as_str().unwrap().to_string();
+    assert_eq!(first["priority"], "user");
+    fx.job_done(&id).await;
+    let out = fx
+        .call(&cli(), "job.retry", json!({"job_id": id}), Some("again"))
+        .await;
+    let job = ok(&out).structured["job"].clone();
+    let second = job["job_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        job["priority"], "agent",
+        "the retrying caller's class: {job}"
+    );
+    fx.job_done(&second).await;
+    let log = paid.log.lock().unwrap().clone();
+    assert_eq!(log.len(), 6, "{log:?}");
+    assert_eq!(log[0], "estimate x.paid_job");
+    assert_eq!(log[3], "estimate x.paid_job", "{log:?}");
+    let (rv1, rv2) = ("rv_0000000000000001", "rv_0000000000000002");
+    for (at, rv, job) in [(1, rv1, &id), (4, rv2, &second)] {
+        let call = log[at]
+            .strip_prefix(&format!("reserve {rv} "))
+            .unwrap_or_else(|| panic!("{log:?}"));
+        assert!(call.starts_with("c_"), "{log:?}");
+        assert_eq!(log[at + 1], format!("hand_over {rv} {call} {job}"));
+    }
+    assert_ne!(log[1], log[4], "a call id of its own");
 }

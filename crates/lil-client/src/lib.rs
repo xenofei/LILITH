@@ -52,6 +52,24 @@ pub(crate) const WRONG_FOLDER: &str = "its executable is not in the folder this 
 /// The core executable's file name, next to the client's own executable.
 pub const CORE_EXE: &str = "lil-core.exe";
 
+/// Test channels only: the protocol `core/hello` says instead of this build's (`"M.m"`), to
+/// test how a client meets an incompatible core (QA-066).
+pub const ENV_TEST_CLIENT_PROTOCOL: &str = "LIL_TEST_CLIENT_PROTOCOL";
+
+/// This build's protocol, or on a test channel the one `LIL_TEST_CLIENT_PROTOCOL` names (a
+/// value that is not `"M.m"` is ignored).
+fn protocol_for(
+    channel: &lil_platform::Channel,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> ProtocolVersion {
+    match channel {
+        lil_platform::Channel::Test(_) => var(ENV_TEST_CLIENT_PROTOCOL)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(PROTOCOL),
+        _ => PROTOCOL,
+    }
+}
+
 /// Whether [`Client::connect`] may start a core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartPolicy {
@@ -95,7 +113,8 @@ impl ClientConfig {
     /// - `core_exe` is `lil-core.exe` in this executable's folder;
     /// - `server_dirs` is the install folder on the stable channel, else this executable's
     ///   folder (ARCH-027);
-    /// - `protocol` and `build_id` are this build's; no workspace (`"none"`), interactive,
+    /// - `protocol` and `build_id` are this build's (on a test channel `protocol` may come
+    ///   from `LIL_TEST_CLIENT_PROTOCOL`); no workspace (`"none"`), interactive,
     ///   [`StartPolicy::StartIfNeeded`], 10 s to start (60 s at most), nothing added to the
     ///   core's environment.
     ///
@@ -107,6 +126,7 @@ impl ClientConfig {
             Some(install_dir) => vec![install_dir],
             None => vec![own_dir.clone()],
         };
+        let protocol = protocol_for(env.channel(), &|name| std::env::var(name).ok());
         Ok(ClientConfig {
             env,
             caller_kind,
@@ -116,7 +136,7 @@ impl ClientConfig {
             start: StartPolicy::StartIfNeeded,
             core_exe: own_dir.join(CORE_EXE),
             server_dirs,
-            protocol: PROTOCOL,
+            protocol,
             start_timeout: Duration::from_secs(10),
             start_hard_cap: Duration::from_secs(60),
             build_id: BUILD_ID.to_string(),
@@ -365,6 +385,21 @@ mod tests {
         assert_eq!(cfg.start_timeout, Duration::from_secs(10));
         assert_eq!(cfg.start_hard_cap, Duration::from_secs(60));
         assert!(cfg.spawn_env.is_empty());
+    }
+
+    /// `LIL_TEST_CLIENT_PROTOCOL` replaces the protocol said in `core/hello` on test channels
+    /// only; a value that is not `"M.m"` is ignored.
+    #[test] // spec: ARCH-014, QA-066
+    fn client_protocol_override_is_test_channels_only() {
+        let test = lil_platform::Channel::Test("ab12cd34".into());
+        let set = |name: &str| (name == ENV_TEST_CLIENT_PROTOCOL).then(|| "0.9".to_string());
+        let older = ProtocolVersion { major: 0, minor: 9 };
+        assert_eq!(protocol_for(&test, &set), older);
+        for channel in [lil_platform::Channel::Dev, lil_platform::Channel::Stable] {
+            assert_eq!(protocol_for(&channel, &set), PROTOCOL, "{channel}");
+        }
+        let garbage = |name: &str| (name == ENV_TEST_CLIENT_PROTOCOL).then(|| "one".to_string());
+        assert_eq!(protocol_for(&test, &garbage), PROTOCOL);
     }
 
     #[test] // spec: CORE-004

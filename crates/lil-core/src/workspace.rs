@@ -262,6 +262,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The lock file's name in a workspace data folder (ARCH-028).
 pub const CORE_LOCK: &str = "core.lock";
 
+/// `FILE_ATTRIBUTE_DIRECTORY`.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+/// `ERROR_SHARING_VIOLATION`: a lock file another program holds with delete access.
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
 /// The workspace locks a read-write core holds (D4): `.lilith\core.lock`, and the legacy
 /// folder's `core.lock` when that folder exists. Dropping it releases both.
 #[derive(Debug)]
@@ -279,23 +284,35 @@ pub struct LockError {
 
 /// Takes the workspace's locks for a read-write open (D4), in this order:
 /// 1. creates `.lilith\` if needed and takes `.lilith\core.lock`; held elsewhere → `None`;
-/// 2. when the legacy workspace data folder exists, takes its `core.lock`, the one a core from
-///    before the rename takes. Held elsewhere → `None`, and the new lock is released at once,
-///    so it doesn't keep a later core from serving once the other holder is gone.
+/// 2. when the legacy workspace data folder exists (`probe.identity`), takes its `core.lock`,
+///    the one a core from before the rename takes. Held elsewhere → `None`, and the new lock is
+///    released at once, so it doesn't keep a later core from serving once the other holder is
+///    gone. When whether that folder exists can't be read (any error but a missing path), also
+///    `None`: never read-write without knowing (fail closed).
 ///
 /// `Some` only when every lock is held: only then may the core write. The legacy folder is
 /// never created; its lock file is created if missing, the one write under the old name
-/// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other.
+/// (the R4 carve-out). Both locks are try-locks, so two cores never wait on each other. Each
+/// lock file is held open without delete sharing (`try_lock_exclusive`), so while it is held
+/// it can't be deleted or renamed away and a second core always finds the held lock. A lock
+/// file another program holds open with delete access (error 32) counts as held elsewhere,
+/// with a warning naming the file.
 ///
 /// # Errors
 /// A lock file that can't be opened, with its workspace-relative path.
-pub fn take_core_locks(root: &Path) -> Result<Option<CoreLocks>, LockError> {
+pub fn take_core_locks(root: &Path, probe: &dyn Probe) -> Result<Option<CoreLocks>, LockError> {
     let take = |dir: &str| {
-        let fail = |error| LockError {
-            file: Path::new(dir).join(CORE_LOCK),
-            error,
-        };
-        fsops::lock_exclusive(&root.join(dir).join(CORE_LOCK)).map_err(fail)
+        let file = Path::new(dir).join(CORE_LOCK);
+        match fsops::lock_exclusive(&root.join(&file)) {
+            Ok(taken) => Ok(taken),
+            // Another program holds the file with delete access (or with no sharing): held
+            // elsewhere, never an open error.
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                tracing::warn!(workspace = %root.display(), file = %file.display(), error = %e, "the workspace is served read-only: another program has its lock file open with delete access; close it to serve the workspace read-write");
+                Ok(None)
+            }
+            Err(error) => Err(LockError { file, error }),
+        }
     };
     fsops::ensure_dir(&root.join(WORKSPACE_DIR)).map_err(|error| LockError {
         file: Path::new(WORKSPACE_DIR).join(CORE_LOCK),
@@ -304,7 +321,27 @@ pub fn take_core_locks(root: &Path) -> Result<Option<CoreLocks>, LockError> {
     let Some(new) = take(WORKSPACE_DIR)? else {
         return Ok(None);
     };
-    let legacy = if root.join(LEGACY_WORKSPACE_DIR).is_dir() {
+    // Whether the legacy folder is there, by `probe.identity` (attributes only). Only a missing
+    // one means no legacy lock; any other error is never read-write (fail closed), and the new
+    // lock goes as it does when the legacy one is held.
+    let legacy_dir = root.join(LEGACY_WORKSPACE_DIR);
+    let legacy_is_folder = match probe.identity(&legacy_dir) {
+        Ok(id) => id.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            false
+        }
+        Err(e) => {
+            let file = Path::new(LEGACY_WORKSPACE_DIR).join(CORE_LOCK);
+            tracing::warn!(workspace = %root.display(), file = %file.display(), error = %e, "the workspace is served read-only: whether the legacy workspace data folder exists can't be read, so its lock file can't be taken");
+            return Ok(None);
+        }
+    };
+    let legacy = if legacy_is_folder {
         match take(LEGACY_WORKSPACE_DIR)? {
             Some(held) => Some(held),
             None => return Ok(None),
@@ -390,6 +427,16 @@ impl WorkspaceHub {
         hub
     }
 
+    /// The core's paths.
+    pub fn env(&self) -> &Env {
+        &self.env
+    }
+
+    /// The core's databases.
+    pub fn states(&self) -> &Arc<StateRegistry> {
+        &self.states
+    }
+
     /// The fail points of the workspace stores and of `suite.toml` writes.
     pub fn failpoints(&self) -> &Arc<FailPoints> {
         &self.failpoints
@@ -403,6 +450,15 @@ impl WorkspaceHub {
     /// The id of the default workspace, as last read from `suite.toml`.
     pub fn default_id(&self) -> Option<String> {
         lock(&self.default).as_ref().map(|w| w.id.clone())
+    }
+
+    /// The workspaces open now (never opens one).
+    pub fn opened(&self) -> Vec<Arc<OpenWorkspace>> {
+        lock(&self.opens)
+            .cells
+            .values()
+            .filter_map(|c| c.get().cloned())
+            .collect()
     }
 
     /// The default workspace, as last read from `suite.toml`.
@@ -442,8 +498,10 @@ impl WorkspaceHub {
     ///    lock, copies a legacy `state.db` forward (D3);
     /// 4. the store, and its `recover()` (read-write only); its `maintenance()` then starts in
     ///    the background and runs every [`MAINTENANCE_PERIOD`] while the workspace stays open;
-    /// 5. `orphans()`, published once on the `workspace` topic as
-    ///    `{kind: "orphans", paths}` when there are any;
+    /// 5. the orphans, published once on the `workspace` topic as
+    ///    `{kind: "orphans", paths}` when there are any. Read-write, the conflict copies come
+    ///    from recovery's walk, so the open walks the tree once before the index's own walk
+    ///    (plan-2b Minor 9); read-only, `orphans()` walks it;
     /// 6. the index (`index.db` read-write, in memory read-only), set as the store's change
     ///    sink;
     /// 7. the watcher (read-write only): the fail point `watch.start` comes just before it.
@@ -501,7 +559,8 @@ impl WorkspaceHub {
         check_workspace(&ws.path);
         // 2. Both locks (D4) before anything else: the access follows from holding both.
         let root = ws.path.clone();
-        let taken = tokio::task::spawn_blocking(move || take_core_locks(&root))
+        let probe = self.probe.clone();
+        let taken = tokio::task::spawn_blocking(move || take_core_locks(&root, probe.as_ref()))
             .await
             .unwrap_or_else(|e| {
                 Err(LockError {
@@ -545,18 +604,25 @@ impl WorkspaceHub {
             .with_access(access)
             .with_machine(&self.env.machine_id()),
         );
+        let mut conflicts = None;
         if access == Access::ReadWrite {
             match store.recover().await {
                 Ok(report) => {
-                    tracing::info!(workspace = %ws.path.display(), ?report, "workspace recovered")
+                    tracing::info!(workspace = %ws.path.display(), ?report, "workspace recovered");
+                    conflicts = Some(report.conflict_copies);
                 }
                 Err(e) => {
                     tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace recovery stopped; it runs again at the next open")
                 }
             }
         }
-        // 5.
-        let orphans = store.orphans().await.unwrap_or_else(|e| {
+        // 5. The conflict copies come from recovery's walk (plan-2b Minor 9); only without one
+        // (read-only, or a recovery that stopped) does the orphan scan walk the tree itself.
+        let orphans = match conflicts {
+            Some(conflicts) => store.orphans_with_conflicts(conflicts).await,
+            None => store.orphans().await,
+        };
+        let orphans = orphans.unwrap_or_else(|e| {
             tracing::warn!(workspace = %ws.path.display(), error = %e, "the orphans can't be listed");
             Vec::new()
         });
@@ -834,7 +900,7 @@ fn spawn_verify_ticks(open: &Arc<OpenWorkspace>) {
 
 /// The default workspace of `env`'s `suite.toml`, resolved; `None` for no file, a file that
 /// doesn't parse, no default, or a default whose folder is gone.
-fn default_of(env: &Env) -> Option<WorkspaceRef> {
+pub(crate) fn default_of(env: &Env) -> Option<WorkspaceRef> {
     let text = std::fs::read_to_string(env.suite_toml_to_read()).ok()?;
     let suite = SuiteToml::parse(&text).ok()?;
     let default = suite.default_workspace.filter(|p| !p.is_empty())?;
@@ -842,14 +908,21 @@ fn default_of(env: &Env) -> Option<WorkspaceRef> {
     Some(WorkspaceRef { id, path })
 }
 
-/// `state.unavailable` for a workspace `state.db` that can't be opened.
+/// `state.unavailable` for a workspace `state.db` that can't be opened. A damaged, newer or
+/// mid-write file needs the person: a retry can't help, and `lil doctor` offers the repair.
 fn state_unavailable(ws: &WorkspaceRef, e: &StateError) -> ErrorBody {
     tracing::error!(workspace = %ws.path.display(), error = %e, "the workspace state.db can't be opened");
+    let next = match e {
+        StateError::TooNew { .. } | StateError::Corrupt(_) | StateError::HotJournal => {
+            "this needs you: run `lil doctor` in a terminal; it explains what it found and asks \
+             before it sets the database aside"
+        }
+        _ => "retry with the same idempotency key",
+    };
     ErrorBody::new(
         &STATE_UNAVAILABLE,
         format!(
-            "The state database of the workspace {} is not available ({e}); retry with the same \
-             idempotency key.",
+            "The state database of the workspace {} is not available ({e}); {next}.",
             ws.path.display()
         ),
         "",

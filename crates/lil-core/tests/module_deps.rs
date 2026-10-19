@@ -1,7 +1,14 @@
 //! The CORE-014 module boundaries (CORE-010, CORE-014): the modules of `lil-core` depend on each
 //! other without a cycle, the store depends on none of its consumers, the index on none of the
-//! modules above it, and `pipeline` takes no `tools` types (only `tools` → `pipeline`), so the
-//! snapshot providers in `tools/` can call `pipeline::asset_detail`.
+//! modules above it, `pipeline` takes no `tools` types (only `tools` → `pipeline`), so the
+//! snapshot providers in `tools/` can call `pipeline::asset_detail`, and `jobs` takes no `tools`
+//! types (only `tools` → `jobs`: tools submit jobs; `jobs` defines the `JobHandler` trait they
+//! register with, CORE-010), and `telemetry` takes none either (only `tools` → `telemetry`: the
+//! telemetry tools and `test.hw_tick` live in `tools`); `engines` uses `jobs` and `telemetry`, and
+//! neither uses it (`EngineControl` is how `jobs` reaches an engine). `meter` uses `tools` (its
+//! stage traits and `BillingBasis`), so `tools` never uses `meter`: a meter tool is registered
+//! from `meter` (as the engine tools are from `engines`), and `jobs` and `telemetry` use no
+//! `meter` item either (`JobCompletion` is how `meter` hears of a job).
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
 //! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
@@ -9,9 +16,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// The CORE-014 modules.
-const MODULES: [&str; 8] = [
-    "store", "index", "watch", "graph", "pipeline", "projects", "settings", "tools",
+/// The CORE-014 modules (each plan-3 module is added as it lands).
+const MODULES: [&str; 12] = [
+    "store",
+    "index",
+    "watch",
+    "graph",
+    "pipeline",
+    "projects",
+    "settings",
+    "tools",
+    "jobs",
+    "telemetry",
+    "engines",
+    "meter",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -162,7 +180,16 @@ fn cycle(graph: &BTreeMap<String, BTreeSet<String>>) -> Option<Vec<String>> {
 fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let graph = graph(&src);
-    for module in ["store", "index", "pipeline", "tools"] {
+    for module in [
+        "store",
+        "index",
+        "pipeline",
+        "tools",
+        "jobs",
+        "telemetry",
+        "engines",
+        "meter",
+    ] {
         assert!(
             graph.contains_key(module),
             "no {module} module found: {graph:?}"
@@ -177,16 +204,24 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     forbidden(
         "store",
         &[
-            "index", "watch", "graph", "pipeline", "projects", "settings", "tools",
+            "index", "watch", "graph", "pipeline", "projects", "settings", "tools", "jobs",
         ],
     );
     forbidden(
         "index",
-        &["watch", "pipeline", "projects", "settings", "tools"],
+        &["watch", "pipeline", "projects", "settings", "tools", "jobs"],
     );
-    forbidden("pipeline", &["tools"]);
-    // The direction that exists: tools → pipeline → index → store.
+    forbidden("pipeline", &["tools", "jobs"]);
+    forbidden("jobs", &["tools", "engines", "meter"]);
+    forbidden("telemetry", &["tools", "jobs", "engines", "meter"]);
+    forbidden("tools", &["engines", "meter"]);
+    // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
+    assert!(graph["tools"].contains("jobs"), "{graph:?}");
+    assert!(graph["jobs"].contains("pipeline"), "{graph:?}");
     assert!(graph["tools"].contains("pipeline"), "{graph:?}");
+    assert!(graph["tools"].contains("telemetry"), "{graph:?}");
+    assert!(graph["engines"].contains("jobs"), "{graph:?}");
+    assert!(graph["meter"].contains("tools"), "{graph:?}");
     assert!(graph["pipeline"].contains("index"), "{graph:?}");
     assert!(graph["index"].contains("store"), "{graph:?}");
 }

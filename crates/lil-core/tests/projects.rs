@@ -144,7 +144,23 @@ fn workspace(env: &TestEnv, setup: impl FnOnce(&Path)) -> PathBuf {
     ws
 }
 
+/// Removes the test's folder once its fixtures have shut down, failing the test if anything
+/// in it was left behind.
+fn assert_removed(env: TestEnv) {
+    if let Err(left) = env.close() {
+        panic!("the test's folder was left behind: {left:?}");
+    }
+}
+
 impl Fx {
+    /// Closes the hub (each open workspace's watcher, index, `state.db` and `core.lock`) and
+    /// joins the state actors, so nothing holds a file in the test's folder when its
+    /// `TestEnv` drops.
+    async fn shutdown(self) {
+        self.hub.close_all().await;
+        self._states.close();
+    }
+
     async fn call(&self, session: &str, name: &str, args: Value) -> Outcome<ToolOutput> {
         let Value::Object(arguments) = args else {
             panic!("arguments must be an object");
@@ -281,6 +297,8 @@ async fn resolve_explicit_then_session_then_hint_then_sketchbook() {
         .await;
     let hint: Value = serde_json::from_str(&read_text(&file(&ws, ".lilith/state.json"))).unwrap();
     assert_eq!(hint, json!({"active_project": "harbor"}));
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[test] // spec: ARCH-088
@@ -388,6 +406,9 @@ async fn hint_is_written_only_on_read_write_workspaces() {
         ["active_project", "panel", "zoom"],
         "the key order is kept"
     );
+    first.shutdown().await;
+    second.shutdown().await;
+    assert_removed(env);
 }
 
 /// The lines of `text`, each with its line ending.
@@ -454,6 +475,8 @@ async fn progress_entry_goes_first_under_done_and_other_sections_are_untouched()
         two.contains("## Done\r\n- 2027-01-16: harbour wall\r\n- 2027-01-15: project created\r\n")
     );
     assert!(!two.replace("\r\n", "").contains('\n'));
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-055
@@ -544,6 +567,8 @@ async fn project_create_refuses_existing_and_bad_slugs() {
         .await,
         "params.invalid"
     );
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 /// An approved sketchbook manifest (made up; I5 shape) with `inputs` and `pinned_inputs`.
@@ -800,6 +825,8 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
         .await,
         "params.invalid"
     );
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 /// Fail points whose `store.replace` fails once, after `skip` more replaces, from when the
@@ -931,6 +958,8 @@ async fn a_restore_that_failed_midway_is_finished_by_the_retry() {
         paused["stale"],
         json!([format!("lil://{ws_id}/sketchbook/chr_late@1.0.0")])
     );
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-055, CORE-039
@@ -980,6 +1009,8 @@ async fn a_create_that_stopped_before_progress_is_finished_by_the_retry() {
         fx.code("s_1", "project.create", create).await,
         "project.exists"
     );
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-055, I6
@@ -1059,6 +1090,8 @@ async fn archived_projects_are_skipped_in_dependents() {
         .await
         .unwrap();
     assert_eq!(again, all);
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 /// A tool of module `module` that does nothing.
@@ -1160,6 +1193,8 @@ async fn project_context_suggests_tools_of_enabled_modules() {
             .await,
         "project.unknown"
     );
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[tokio::test] // spec: CORE-038, CORE-055, ARCH-079
@@ -1295,6 +1330,8 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
             .await,
         "params.invalid"
     );
+    fx.shutdown().await;
+    assert_removed(env);
 }
 
 #[test] // spec: CORE-048, I6

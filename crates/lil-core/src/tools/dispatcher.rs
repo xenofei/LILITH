@@ -14,12 +14,13 @@
 //!    workspace, under the scope `"<caller kind>|<workspace id or none>"`: a finished call
 //!    with the same arguments is replayed byte for byte, another hash is
 //!    `idempotency.conflict`, a running one `idempotency.in_progress`.
-//! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`, or a
-//!    `pending_confirmation` result), 6. **reserve**: the [`PipelineHooks`]. Before the
-//!    settings, the Resolve stage's project part runs on the valid arguments (ARCH-088,
-//!    ARCH-098): with a session workspace, `CallCtx::project` is the `project` argument of a
-//!    tool that declares one, else the session's active project, else the workspace's
-//!    `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
+//! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`,
+//!    `cap.exceeded`, or a `pending_confirmation` result), 6. **reserve** (under a fresh
+//!    call id `c_<16 hex>`; caps it finds passed are `cap.exceeded`): the
+//!    [`PipelineHooks`]. Before the settings, the Resolve stage's project part runs on the
+//!    valid arguments (ARCH-088, ARCH-098): with a session workspace, `CallCtx::project` is
+//!    the `project` argument of a tool that declares one, else the session's active project,
+//!    else the workspace's `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
 //!    never the call's project. The settings stage gets that project and, as the request
 //!    layer, the `settings` argument of a tool that declares one (only `test.settings` in
 //!    plan 2b, CORE-057); its error (`params.invalid`) is the call's.
@@ -29,7 +30,18 @@
 //!    (a hint that can't be written is logged, never the call's error).
 //! 8. **Meter** and 9. **record**: the hooks again. The record hook gets the plan the tool
 //!    left in `CallCtx::record` (CORE-020); the plan-2b stage writes it only for an `ok`
-//!    outcome, and its error (a failed commit) becomes the call's.
+//!    outcome, and its error (a failed commit) becomes the call's. A call whose tool
+//!    submitted a job (`CallCtx::submitted`) skips both: the job's completion runs them when
+//!    the job ends, with the call's reservation, which the job takes over (CORE-015 step 7;
+//!    `crate::jobs`, "Reservations").
+//!
+//! **Retries** (`job.retry`, ARCH-052, CORE-146). The retry tool asks the jobs module for the
+//! tool call that made the job, and [`Redispatch`] runs stages 3–9 of that tool again with
+//! those arguments, under the retrying session and the retry's idempotency key: its confirm,
+//! estimate and reserve stages run as for a fresh call (an agent retrying a `destructive` or
+//! `exec` tool's job gets `confirm.unavailable`; a paid one reserves again), and the job it
+//! submits has `retry_of`. The call's project is the retried job's, not the one the retrying
+//! session would resolve.
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
 //! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
@@ -58,7 +70,7 @@
 //! anyway (a bug in a stage) releases its row from its `Drop`, in a task that counts as in
 //! flight, so a drain waits for the release too.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::UNIX_EPOCH;
 
 use lil_platform::{Clock, IdSource};
@@ -70,9 +82,14 @@ use serde_json::{Value, json};
 use tokio::task::JoinError;
 use tracing::Instrument as _;
 
+use super::job_tools::JOB_RETRY;
 use super::registry::{CallCtx, Registry, Tool};
-use super::stages::{ConfirmDecision, PipelineHooks, SettingsInput};
+use super::stages::{
+    ConfirmDecision, ConfirmInput, IdemRef, PipelineHooks, ReserveInput, ReserveOutcome,
+    SettingsInput, SettleInput,
+};
 use crate::events::EventBus;
+use crate::jobs::{JobId, JobSummary, Jobs, RetryPlan, SubmittedSlot};
 use crate::lifecycle::{CallGuard, FollowUp, Lifecycle};
 use crate::pipeline::RecordSlot;
 use crate::projects::{ActiveProjects, read_hint, remember_project, resolve_project};
@@ -88,6 +105,8 @@ pub struct Dispatcher {
 }
 
 struct Inner {
+    /// Itself, for [`Redispatch`].
+    me: Weak<Inner>,
     reg: Registry,
     hooks: PipelineHooks,
     states: Arc<StateRegistry>,
@@ -98,6 +117,8 @@ struct Inner {
     lifecycle: Arc<Lifecycle>,
     /// Each session's active project (ARCH-088).
     active: Arc<ActiveProjects>,
+    /// The core's jobs (`CallCtx::jobs`).
+    jobs: Arc<Jobs>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -123,8 +144,18 @@ impl Dispatcher {
         clock: Arc<dyn Clock>,
         lifecycle: Arc<Lifecycle>,
     ) -> Dispatcher {
+        // The core's jobs live with its dispatcher: every call's context carries them.
+        let jobs = Jobs::new(
+            states.clone(),
+            hub.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            hub.failpoints().clone(),
+        );
         Dispatcher {
-            inner: Arc::new(Inner {
+            inner: Arc::new_cyclic(|me| Inner {
+                me: me.clone(),
                 reg,
                 hooks,
                 states,
@@ -134,8 +165,14 @@ impl Dispatcher {
                 clock,
                 lifecycle,
                 active: Arc::new(ActiveProjects::new()),
+                jobs,
             }),
         }
+    }
+
+    /// The core's jobs: the server registers their handlers, blocker and shutdown step.
+    pub fn jobs(&self) -> &Arc<Jobs> {
+        &self.inner.jobs
     }
 
     /// Each session's active project: the router forgets a session's when its connection
@@ -291,12 +328,19 @@ impl Inner {
                 format!("Invalid arguments for {}: {why}", p.name),
             );
         }
-        let claim = match key {
+        let hash = call_hash(&p.name, &args);
+        let claim = match &key {
             None => None,
             Some(key) => {
-                let hash = args_hash(&json!({"name": p.name, "arguments": args}));
                 match self
-                    .begin(in_flight, workspace.as_ref(), scope, key, &hash, trace_id)
+                    .begin(
+                        in_flight,
+                        workspace.as_ref(),
+                        scope.clone(),
+                        key.clone(),
+                        &hash,
+                        trace_id,
+                    )
                     .await
                 {
                     Ok(Begun::Fresh(claim)) => Some(claim),
@@ -307,7 +351,14 @@ impl Inner {
         };
 
         // 3–9.
-        let outcome = self.run(session, workspace, &tool, args, trace_id).await;
+        let idem = key.as_deref().map(|key| IdemRef {
+            scope: &scope,
+            key,
+            args_hash: &hash,
+        });
+        let (outcome, _) = self
+            .run(session, workspace, &tool, args, idem, trace_id, None)
+            .await;
 
         // The line cap (ARCH-025), decided once, before anything is stored: an outcome too
         // large to send becomes `core.bug`, and that error is what the row keeps, so every
@@ -413,22 +464,34 @@ impl Inner {
         })
     }
 
-    /// Stages 3–9.
+    /// Stages 3–9: the outcome, and the job the call submitted. `retry`: the call is a retry
+    /// of that job, in that project.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's parts, each from a different stage"
+    )]
     async fn run(
         &self,
         session: &Arc<Session>,
         workspace: Option<Arc<OpenWorkspace>>,
         tool: &Arc<dyn Tool>,
         args: Value,
+        idem: Option<IdemRef<'_>>,
         trace_id: &str,
-    ) -> Outcome<ToolOutput> {
+        retry: Option<Retrying>,
+    ) -> (Outcome<ToolOutput>, Option<JobId>) {
         let hooks = &self.hooks;
         let d = tool.descriptor();
-        // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid.
+        // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid. A
+        // retry runs in the retried job's project.
         let named = named_project(d, &args);
+        let (retry_of, retry_project) = retry.map_or((None, None), |r| (Some(r.of), r.project));
         let project = match &workspace {
             None => None,
-            Some(open) => Some(self.project_of(session, open, named.as_deref()).await),
+            Some(open) => Some(match retry_project {
+                Some(p) => p,
+                None => self.project_of(session, open, named.as_deref()).await,
+            }),
         };
         // 3. Settings; 4. estimate.
         let request = declares(d, "settings")
@@ -448,34 +511,78 @@ impl Inner {
             Ok(settings) => settings,
             Err(mut error) => {
                 error.trace_id = trace_id.to_string();
-                return Outcome::Error { error };
+                return (Outcome::Error { error }, None);
             }
         };
-        let estimate = hooks.estimate.estimate(d);
+        let estimate = hooks.estimate.estimate(d, &args, &settings);
         // 5. Confirm and caps.
-        match hooks.confirm.check(session, d, &estimate) {
-            ConfirmDecision::Proceed => {}
-            ConfirmDecision::Pending(pending) => return Outcome::PendingConfirmation(pending),
-            ConfirmDecision::Unavailable => {
-                return Outcome::Error {
-                    error: ErrorBody::new(
-                        &codes::CONFIRM_UNAVAILABLE,
-                        format!(
-                            "{} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app.",
-                            d.name
-                        ),
-                        trace_id,
-                    ),
-                };
+        let decision = hooks
+            .confirm
+            .check(ConfirmInput {
+                session,
+                descriptor: d,
+                estimate: &estimate,
+                args: &args,
+                idem,
+                workspace: workspace.as_deref(),
+            })
+            .await;
+        let (confirmed_via, cap_override) = match decision {
+            ConfirmDecision::Proceed {
+                confirmed_via,
+                cap_override,
+            } => (confirmed_via, cap_override),
+            ConfirmDecision::Pending(pending) => {
+                return (Outcome::PendingConfirmation(pending), None);
             }
-        }
+            ConfirmDecision::Unavailable => {
+                let error = ErrorBody::new(
+                    &codes::CONFIRM_UNAVAILABLE,
+                    format!(
+                        "{} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app.",
+                        d.name
+                    ),
+                    trace_id,
+                );
+                return (Outcome::Error { error }, None);
+            }
+            ConfirmDecision::CapExceeded(mut error) => {
+                error.trace_id = trace_id.to_string();
+                return (Outcome::Error { error }, None);
+            }
+        };
         // 6. Reserve.
-        if let Err(mut error) = hooks.reserve.reserve(session, &estimate) {
-            error.trace_id = trace_id.to_string();
-            return Outcome::Error { error };
-        }
+        let call_id = self.ids.id("c");
+        let reserved = hooks
+            .reserve
+            .reserve(ReserveInput {
+                session,
+                estimate: &estimate,
+                workspace_id: session.workspace_id(),
+                call_id: &call_id,
+                allow_once: cap_override.as_deref(),
+            })
+            .await;
+        let reservation = match reserved {
+            Ok(ReserveOutcome::None) => None,
+            Ok(ReserveOutcome::Reserved(id)) => Some(id),
+            Ok(ReserveOutcome::NeedsCap(hits)) => {
+                let caps: Vec<&str> = hits.iter().map(|h| h.cap.as_str()).collect();
+                let error = ErrorBody::new(
+                    &codes::CAP_EXCEEDED,
+                    format!("{} would pass the cap {}.", d.name, caps.join(", ")),
+                    trace_id,
+                );
+                return (Outcome::Error { error }, None);
+            }
+            Err(mut error) => {
+                error.trace_id = trace_id.to_string();
+                return (Outcome::Error { error }, None);
+            }
+        };
         // 7. Execute, in its own task: a panic stays in it.
         let open = workspace.clone();
+        let arguments = args.clone();
         let ctx = CallCtx {
             session: session.clone(),
             trace_id: trace_id.to_string(),
@@ -484,6 +591,16 @@ impl Inner {
             workspace,
             project,
             record: Arc::new(RecordSlot::new()),
+            jobs: self.jobs.clone(),
+            submitted: Arc::new(SubmittedSlot::new()),
+            reservation,
+            confirmed_via,
+            idem_key: idem.map(|i| i.key.to_string()),
+            call_id: call_id.clone(),
+            tool: d.name.clone(),
+            arguments,
+            retry_of,
+            redispatch: Some(Redispatch(self.me.clone())),
         };
         let running = tool.clone();
         let run_ctx = ctx.clone();
@@ -512,11 +629,94 @@ impl Inner {
         {
             tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
         }
+        // A call that submitted a job leaves 8 and 9 to the job's completion (CORE-015 step 7).
+        if let Some(job) = ctx.submitted.get() {
+            if ctx.record.take().is_some() {
+                tracing::error!(tool = %d.name, job_id = %job, "a tool that submitted a job also left a record plan; it is dropped");
+            }
+            return (outcome, Some(job));
+        }
         // 8. Meter; 9. record (CORE-020): what the tool left in its record slot.
-        hooks.meter.settle(session, &outcome);
+        hooks
+            .meter
+            .settle(SettleInput {
+                session,
+                reservation: ctx.reservation.as_deref(),
+                call_id: &call_id,
+                outcome: &outcome,
+            })
+            .await;
         let plan = ctx.record.take();
         hooks.record.record(&ctx, d, plan, &mut outcome).await;
-        outcome
+        (outcome, None)
+    }
+
+    /// `job.retry` (module docs, "Retries"): the job its call submitted.
+    async fn retry(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
+        let caller = ctx.job_caller();
+        let RetryPlan { origin, project } = ctx.jobs.retry_origin(&caller, id).await?;
+        let not_retryable =
+            |why: String| ErrorBody::new(&codes::JOB_NOT_RETRYABLE, why, ctx.trace_id.clone());
+        let session = &ctx.session;
+        let tool = self
+            .reg
+            .get(&origin.tool)
+            .filter(|t| t.visible_to(&session.caller))
+            .ok_or_else(|| {
+                not_retryable(format!(
+                    "The tool {} that made job {id} is not there any more.",
+                    origin.tool
+                ))
+            })?;
+        tool.validate(&origin.arguments).map_err(|why| {
+            not_retryable(format!(
+                "Job {id}'s arguments no longer fit {}: {why}",
+                origin.tool
+            ))
+        })?;
+        // The retry call's own idempotency row (stage 2 made it): scope, key and hash.
+        let scope = format!("{}|{}", session.caller, session.workspace_id());
+        let hash = call_hash(JOB_RETRY, &json!({"job_id": id.as_str()}));
+        let idem = ctx.idem_key.as_deref().map(|key| IdemRef {
+            scope: &scope,
+            key,
+            args_hash: &hash,
+        });
+        let (outcome, submitted) = Box::pin(self.run(
+            session,
+            ctx.workspace.clone(),
+            &tool,
+            origin.arguments,
+            idem,
+            &ctx.trace_id,
+            Some(Retrying {
+                of: id.clone(),
+                project,
+            }),
+        ))
+        .await;
+        match outcome {
+            Outcome::Ok(_) => match submitted {
+                Some(job) => ctx.jobs.get(&caller, &job).await,
+                None => Err(ErrorBody::new(
+                    &codes::CORE_BUG,
+                    format!(
+                        "{} ran again for job {id} but submitted no job. This is a bug in LILITH.",
+                        origin.tool
+                    ),
+                    ctx.trace_id.clone(),
+                )),
+            },
+            Outcome::Error { error } => Err(error),
+            // Task 14: the retry call itself then waits for the confirmation.
+            Outcome::PendingConfirmation(_) => Err(ErrorBody::new(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "Retrying job {id} needs your confirmation, and a retry can't ask for one yet. Retry it from the LILITH app."
+                ),
+                ctx.trace_id.clone(),
+            )),
+        }
     }
 
     /// The call's project in `open`: `named`, else the session's active project, else the
@@ -537,6 +737,48 @@ impl Inner {
         };
         resolve_project(None, active, hint)
     }
+}
+
+/// The dispatcher, as a call's context holds it (`CallCtx::redispatch`): `job.retry` runs the
+/// call that made a job again through it (module docs, "Retries").
+#[derive(Clone)]
+pub struct Redispatch(Weak<Inner>);
+
+impl std::fmt::Debug for Redispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redispatch").finish_non_exhaustive()
+    }
+}
+
+impl Redispatch {
+    /// Runs the tool call that made failed or cancelled job `id` again, for the caller of
+    /// `ctx` (a `job.retry` call): the new job.
+    ///
+    /// # Errors
+    /// `job.unknown`, `job.not_retryable` (also when the tool is gone or its arguments no
+    /// longer fit), and whatever the stages or the tool give (`confirm.unavailable`,
+    /// `cap.exceeded`, …).
+    pub(crate) async fn retry(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
+        let Some(inner) = self.0.upgrade() else {
+            return Err(ErrorBody::new(
+                &codes::CORE_DRAINING,
+                "The core is shutting down. Retry with the same idempotency key once it runs again.",
+                ctx.trace_id.clone(),
+            ));
+        };
+        inner.retry(ctx, id).await
+    }
+}
+
+/// A call that retries job `of`, in the job's project.
+struct Retrying {
+    of: JobId,
+    project: Option<String>,
+}
+
+/// The idempotency hash of a call of `name` with `args`.
+fn call_hash(name: &str, args: &Value) -> String {
+    args_hash(&json!({"name": name, "arguments": args}))
 }
 
 /// Tools whose `project` argument is a filter (omitted means every project), so it is never

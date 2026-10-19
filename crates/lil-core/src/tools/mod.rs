@@ -1,16 +1,18 @@
 //! The `tools` module (CORE-014): the tool registry and the dispatcher pipeline every
 //! `tools/call` runs through (CORE-015–017), with the stages plan 3 replaces, the Record stage
-//! (CORE-020), the product tools, the live topics' snapshot providers and the test-channel
-//! tools.
+//! (CORE-020), the product tools (the job tools among them), the live topics' snapshot
+//! providers and the test-channel tools.
 
 pub mod asset_read_tools;
 pub mod asset_tools;
 pub mod dispatcher;
 pub mod doctor_tools;
+pub mod job_tools;
 pub mod project_tools;
 pub mod record_stage;
 pub mod registry;
 pub mod stages;
+pub mod telemetry_tools;
 pub mod test_tools;
 pub mod topics;
 pub mod trash_tools;
@@ -25,17 +27,22 @@ use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
 pub use asset_tools::register_asset_tools;
-pub use dispatcher::Dispatcher;
+pub use dispatcher::{Dispatcher, Redispatch};
 pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
+pub use job_tools::{JOB_RETRY, register_job_tools};
 pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
 pub use stages::{
-    CascadeSettings, ConfirmDecision, ConfirmStage, Estimate, EstimateStage, MeterStage,
-    PipelineHooks, RecordStage, ReserveStage, SettingSource, Settings, SettingsInput,
-    SettingsStage,
+    BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput, ConfirmStage,
+    ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks, RecordStage,
+    ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings, SettingsInput,
+    SettingsStage, SettleInput,
 };
-pub use test_tools::{TEST_MODULE, TestGates, register_test_tools};
+pub use telemetry_tools::register_telemetry_tools;
+pub use test_tools::{
+    TEST_JOB_KIND, TEST_MODULE, TestGates, TestJobHandler, register_hw_tick, register_test_tools,
+};
 pub use topics::{AssetSnapshots, ProjectSnapshots, register_snapshots};
 pub use trash_tools::register_trash_tools;
 pub use watch_tools::register_watch_tools;
@@ -66,6 +73,7 @@ pub fn core_registry(
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg);
     register_watch_tools(&mut reg);
+    register_job_tools(&mut reg);
     let all_tools = Arc::new(OnceLock::new());
     register_project_tools(&mut reg, all_tools.clone());
     if test_tools {

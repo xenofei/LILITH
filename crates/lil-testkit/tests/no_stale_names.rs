@@ -120,13 +120,68 @@ const ALLOW: &[Allow] = &[
         until: "kept: `.worldwright\\` stays reserved and `ww://` still parses for sealed \
                 snapshots (no planned end)",
     },
-    // Plan 3, Global Constraints "Old names", rows 1 and 3. Task 3 adds
-    // `crates/lil-platform/tests/fs_lock.rs` and its `core.lock` substring.
+    // Plan 3, Global Constraints "Old names", the Task 1 `trash.rs` row and the Task 3 row.
     Allow {
         globs: &["crates/lil-core/tests/trash.rs"],
         lines_with: &["\".worldwright\""],
         why: "tests that `.worldwright\\` stays reserved, by its literal name",
         until: "kept: `.worldwright\\` stays reserved (no planned end)",
+    },
+    Allow {
+        globs: &["crates/lil-core/tests/workspace_hub.rs"],
+        lines_with: &[".worldwright\\\\core.lock"],
+        why: "`core_lock_cannot_be_deleted_or_renamed_while_held`: the legacy lock keeps out an \
+              old core",
+        until: "kept: `.worldwright\\` stays reserved (no planned end)",
+    },
+    // Plan 3, Global Constraints "Old names", the Task 4 row.
+    Allow {
+        globs: &[
+            "crates/lil-cli/tests/doctor_workspace.rs",
+            "crates/lil-core/tests/workspace_tools.rs",
+        ],
+        lines_with: &["worldwright.yaml", ".worldwright\\\\state.json", "\"ww://"],
+        why: "the legacy-name rename test builds a plugin-era workspace",
+        until: "the legacy workspace readers go",
+    },
+    // Plan 3, Global Constraints "Old names", the Task 2 spec row: Appendix F's legacy-name
+    // contract (`lil doctor`'s legacy-name rename) and its plugin contract (plugin 1.3 keeps
+    // the id, R1), one row per end condition.
+    Allow {
+        globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
+        lines_with: &[
+            "a workspace using `worldwright.yaml`, `.worldwright\\state.json` or `ww://` refs",
+            "rename `worldwright.yaml` to `lilith.yaml`",
+            "rewrite `ww://` to `lil://` in asset manifests",
+            "(so `ww://` parsing stays for sealed versions)",
+            "`.worldwright\\` itself is left in place",
+        ],
+        why: "Appendix F: `lil doctor` offers the legacy-name rename of a workspace from before \
+              the rename (owner question 1)",
+        until: "the legacy workspace readers go",
+    },
+    Allow {
+        globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
+        lines_with: &["`plugin/worldwright/.claude-plugin/plugin.json` (`name: \"worldwright\"`"],
+        why: "Appendix F: plugin 1.3 keeps the id `worldwright`, so its folder and name do (R1)",
+        until: "plugin rename",
+    },
+    // Plan 3, Global Constraints "Old names", the Task 7/19/20 row: Task 7's spec-test globs.
+    // `mcp_server.rs` names none of the row's substrings, so it is left out (an honest row
+    // allows something through every glob).
+    Allow {
+        globs: &[
+            "crates/lil-spec-tests/tests/plugin_hooks.rs",
+            "crates/lil-spec-tests/tests/doctor_claude.rs",
+        ],
+        lines_with: &[
+            "worldwright@lilith",
+            "mcp__plugin_worldwright_",
+            "plugin/worldwright/",
+            "name: \"worldwright\"",
+        ],
+        why: "Claude Code's names for the plugin's tools and the install target (AI-110, D5)",
+        until: "plugin rename",
     },
     Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
@@ -138,7 +193,9 @@ const ALLOW: &[Allow] = &[
 
 /// Case-insensitive `worldwright`; `ww` in any case with no ASCII letter or digit on either
 /// side; or a PascalCase identifier `Ww` + uppercase letter with no ASCII letter or digit
-/// before it (`WwOutput`, `WwChild`; ruling RN8).
+/// before it (`WwOutput`, `WwChild`; ruling RN8); or lowercase `ww` at the start of a word
+/// followed by two or more lowercase letters, the first not `w` (`wwref`, `wwdoc`, `wwbundle`:
+/// the old file extensions and names the bare-`ww` rule above misses). `www…` is not a hit.
 fn is_stale(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if lower.contains("worldwright") {
@@ -156,7 +213,16 @@ fn is_stale(text: &str) -> bool {
     let pascal = (0..o.len().saturating_sub(2)).any(|i| {
         o[i] == b'W' && o[i + 1] == b'w' && o[i + 2].is_ascii_uppercase() && starts_word(o, i)
     });
-    bare || pascal
+    let low = |c: u8| c.is_ascii_lowercase();
+    let ww_word = (0..o.len().saturating_sub(3)).any(|i| {
+        o[i] == b'w'
+            && o[i + 1] == b'w'
+            && low(o[i + 2])
+            && o[i + 2] != b'w'
+            && low(o[i + 3])
+            && starts_word(o, i)
+    });
+    bare || pascal || ww_word
 }
 
 /// Whether `pattern` (`*` within a segment, `**` across whole segments) matches `path`.
@@ -329,6 +395,17 @@ fn is_stale_finds_old_names_and_ignores_lookalikes() {
         "let c: WwChild = x;",
         "WwQtRoot",
         "(WwW)",
+        // The old reference-file extension.
+        ".wwref",
+        "a.wwref",
+        "*.wwref",
+        "wwref files",
+        "(`lil://` refs, `.wwref` files)",
+        "wwdoc",
+        ".wwdoc",
+        "a.wwdoc",
+        "`.wwdoc` readers",
+        "wwbundle",
     ] {
         assert!(is_stale(hit), "{hit:?} should be a hit");
     }
@@ -354,6 +431,20 @@ fn is_stale_finds_old_names_and_ignores_lookalikes() {
         "WWOutput",
         // camelCase is not covered by RN8 (`_wwFlags` exists only in spike history).
         "wwOutput",
+        // `wwref` inside a longer word, and the new extension.
+        "awwref",
+        "newwref",
+        "lilref",
+        ".lilref",
+        "*.lilref",
+        ".lildoc",
+        // `www…` and words where `ww` does not start the word.
+        "www",
+        "wwwauth",
+        "awwdoc",
+        "newwdoc",
+        "wwx",
+        "wwdOc",
     ] {
         assert!(!is_stale(miss), "{miss:?} should not be a hit");
     }

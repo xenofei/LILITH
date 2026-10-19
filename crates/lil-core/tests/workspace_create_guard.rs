@@ -82,6 +82,14 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         probe.clone(),
         lil_core::watch::WatchConfig::default(),
     );
+    let jobs = lil_core::jobs::Jobs::new(
+        states.clone(),
+        hub.clone(),
+        events.clone(),
+        FakeClock::new(),
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+    );
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub, env.env.clone(), probe);
     let tool = reg.get("workspace.create").expect("workspace.create");
@@ -101,6 +109,16 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         workspace: None,
         project: None,
         record: Arc::new(lil_core::pipeline::RecordSlot::new()),
+        jobs,
+        submitted: Arc::new(lil_core::jobs::SubmittedSlot::new()),
+        reservation: None,
+        confirmed_via: None,
+        idem_key: None,
+        call_id: String::new(),
+        tool: String::new(),
+        arguments: serde_json::Value::Null,
+        retry_of: None,
+        redispatch: None,
     };
 
     // 4. Creating a new subfolder of that workspace trips the guard before the folder exists.

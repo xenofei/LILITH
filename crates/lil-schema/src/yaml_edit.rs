@@ -29,6 +29,24 @@ pub enum YamlEdit {
     /// Appends the string `item` to a block or flow list (`[]` included). A key whose value is
     /// null (empty, `~` or `null`) becomes `key: [item]`.
     AppendToList { path: Vec<String>, item: String },
+    /// Replaces the value of the key (whatever it was) with a block mapping of these scalar
+    /// entries, in this order. The key's block is rewritten whole, so comments inside it go; the
+    /// comments and blank lines after it stay. A missing top-level key is appended at the end
+    /// of the document. The machine-detected `hardware:` block (CORE-067) is written this way,
+    /// because its values are numbers, which a scalar edit refuses to retype.
+    SetMapping {
+        path: Vec<String>,
+        entries: Vec<(String, YamlValue)>,
+    },
+}
+
+/// A scalar [`YamlEdit::SetMapping`] writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YamlValue {
+    /// A string, written plain when that reads back as the same string and double-quoted
+    /// otherwise.
+    Str(String),
+    Int(i64),
 }
 
 /// Why an edit was refused.
@@ -130,7 +148,9 @@ fn plain_ok(value: &str) -> bool {
 
 fn unsupported(edit: &YamlEdit, why: String) -> YamlEditError {
     let path = match edit {
-        YamlEdit::SetScalar { path, .. } | YamlEdit::AppendToList { path, .. } => path.join("."),
+        YamlEdit::SetScalar { path, .. }
+        | YamlEdit::AppendToList { path, .. }
+        | YamlEdit::SetMapping { path, .. } => path.join("."),
     };
     YamlEditError::Unsupported(format!("`{path}`: {why}"))
 }
@@ -156,6 +176,17 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
     let (path, new) = match edit {
         YamlEdit::SetScalar { path, value } => (path, Yaml::String(value.clone())),
         YamlEdit::AppendToList { path, item } => (path, Yaml::String(item.clone())),
+        YamlEdit::SetMapping { path, entries } => {
+            let mut mapping = yaml_rust2::yaml::Hash::new();
+            for (key, value) in entries {
+                let value = match value {
+                    YamlValue::Str(s) => Yaml::String(s.clone()),
+                    YamlValue::Int(n) => Yaml::Integer(*n),
+                };
+                mapping.insert(Yaml::String(key.clone()), value);
+            }
+            (path, Yaml::Hash(mapping))
+        }
     };
     let Some((last, parents)) = path.split_last() else {
         return Err(unsupported(edit, "an empty path".into()));
@@ -180,13 +211,13 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
                 "the value is a number or a boolean; a scalar edit writes strings only".into(),
             ));
         }
-        (YamlEdit::SetScalar { .. }, Some(v)) => *v = new,
+        (YamlEdit::SetScalar { .. } | YamlEdit::SetMapping { .. }, Some(v)) => *v = new,
         (YamlEdit::AppendToList { .. }, Some(Yaml::Array(a))) => a.push(new),
         (YamlEdit::AppendToList { .. }, Some(v @ Yaml::Null)) => *v = Yaml::Array(vec![new]),
         (YamlEdit::AppendToList { .. }, Some(_)) => {
             return Err(unsupported(edit, "the value is not a list".into()));
         }
-        (YamlEdit::SetScalar { .. }, None) => {
+        (YamlEdit::SetScalar { .. } | YamlEdit::SetMapping { .. }, None) => {
             // `replace` keeps an existing key in place; here the key is new and goes last.
             h.replace(key, new);
         }
@@ -384,21 +415,17 @@ fn refuse_value(c: char) -> Option<&'static str> {
     }
 }
 
-/// The text with `edit` applied as a line edit.
-fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
-    let (path, new) = match edit {
-        YamlEdit::SetScalar { path, value } => (path, scalar(value)),
-        YamlEdit::AppendToList { path, item } => (path, scalar(item)),
-    };
-    let fail = |why: &str| unsupported(edit, why.to_string());
-    let Some((last, parents)) = path.split_last() else {
-        return Err(fail("an empty path"));
-    };
-    let lines = lines_of(text);
-    let eol = eol_of(text);
+/// Walks down the block mappings named by `parents` and returns the line range of the last
+/// one's entries.
+fn descend(
+    text: &str,
+    lines: &[Line],
+    parents: &[String],
+    fail: &dyn Fn(&str) -> YamlEditError,
+) -> Result<(usize, usize), YamlEditError> {
     let (mut from, mut to) = (0, lines.len());
     for k in parents {
-        let Some(hit) = find_key(text, &lines, from, to, k) else {
+        let Some(hit) = find_key(text, lines, from, to, k) else {
             return Err(fail(&format!("no key `{k}` (a missing nested key)")));
         };
         if !hit.empty {
@@ -407,7 +434,7 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
                 refuse_value(c).unwrap_or("a parent is not a block mapping"),
             ));
         }
-        let end = block_end(text, &lines, hit);
+        let end = block_end(text, lines, hit);
         let first = (hit.line + 1..end).find(|&i| is_content(text, lines[i]));
         match first {
             Some(i) if !is_seq_item(text, lines[i]) => {}
@@ -416,6 +443,30 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
         }
         (from, to) = (hit.line + 1, end);
     }
+    Ok((from, to))
+}
+
+/// Which line edit [`edit_text`] makes.
+#[derive(Clone, Copy)]
+enum Kind {
+    Scalar,
+    Append,
+}
+
+/// The text with `edit` applied as a line edit.
+fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
+    let (path, new, kind) = match edit {
+        YamlEdit::SetScalar { path, value } => (path, scalar(value), Kind::Scalar),
+        YamlEdit::AppendToList { path, item } => (path, scalar(item), Kind::Append),
+        YamlEdit::SetMapping { path, entries } => return edit_mapping(text, edit, path, entries),
+    };
+    let fail = |why: &str| unsupported(edit, why.to_string());
+    let Some((last, parents)) = path.split_last() else {
+        return Err(fail("an empty path"));
+    };
+    let lines = lines_of(text);
+    let eol = eol_of(text);
+    let (from, to) = descend(text, &lines, parents, &fail)?;
 
     let Some(hit) = find_key(text, &lines, from, to, last) else {
         if !parents.is_empty() {
@@ -426,9 +477,9 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push_str(eol);
         }
-        let value = match edit {
-            YamlEdit::SetScalar { .. } => new,
-            YamlEdit::AppendToList { .. } => format!("[{new}]"),
+        let value = match kind {
+            Kind::Scalar => new,
+            Kind::Append => format!("[{new}]"),
         };
         out.push_str(&format!("{}: {value}{eol}", scalar(last)));
         return Ok(out);
@@ -444,9 +495,9 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
 
     if hit.empty {
         if below || same_indent_seq {
-            return match edit {
-                YamlEdit::SetScalar { .. } => Err(fail("the value is a mapping or a list")),
-                YamlEdit::AppendToList { .. } => {
+            return match kind {
+                Kind::Scalar => Err(fail("the value is a mapping or a list")),
+                Kind::Append => {
                     let first = if below {
                         (hit.line + 1..end)
                             .find(|&i| is_content(text, lines[i]))
@@ -462,9 +513,9 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
             };
         }
         // A null value: write it on the key's line, before any comment.
-        let value = match edit {
-            YamlEdit::SetScalar { .. } => new,
-            YamlEdit::AppendToList { .. } => format!("[{new}]"),
+        let value = match kind {
+            Kind::Scalar => new,
+            Kind::Append => format!("[{new}]"),
         };
         let rest = &text[hit.colon..line.end];
         let mut out = String::with_capacity(text.len() + value.len() + 2);
@@ -482,8 +533,8 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
     if let Some(why) = refuse_value(first) {
         return Err(fail(why));
     }
-    match edit {
-        YamlEdit::SetScalar { .. } => {
+    match kind {
+        Kind::Scalar => {
             if first == '[' {
                 return Err(fail("the value is a list"));
             }
@@ -492,7 +543,7 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
             })?;
             Ok(replace_keeping_comment(text, line, hit.value, vend, &new))
         }
-        YamlEdit::AppendToList { .. } => {
+        Kind::Append => {
             if first != '[' {
                 // A plain null becomes a one-item flow list. yaml-rust2 reads only `~` and
                 // `null` as null (`Null` and `NULL` are strings to it).
@@ -508,6 +559,67 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
                 .ok_or_else(|| fail("a flow list it can't follow"))
         }
     }
+}
+
+/// [`YamlEdit::SetMapping`] as a line edit: the key's whole block (its line and the lines
+/// indented below it, not the comments and blank lines that trail it) is replaced by the new
+/// block mapping; a missing top-level key is appended at the end of the document.
+fn edit_mapping(
+    text: &str,
+    edit: &YamlEdit,
+    path: &[String],
+    entries: &[(String, YamlValue)],
+) -> Result<String, YamlEditError> {
+    let fail = |why: &str| unsupported(edit, why.to_string());
+    let Some((last, parents)) = path.split_last() else {
+        return Err(fail("an empty path"));
+    };
+    let lines = lines_of(text);
+    let eol = eol_of(text);
+    let (from, to) = descend(text, &lines, parents, &fail)?;
+    let block = |pad: usize| {
+        let mut out = format!("{}{}:{eol}", " ".repeat(pad), scalar(last));
+        for (key, value) in entries {
+            let value = match value {
+                YamlValue::Str(s) => scalar(s),
+                YamlValue::Int(n) => n.to_string(),
+            };
+            out.push_str(&format!(
+                "{}{}: {value}{eol}",
+                " ".repeat(pad + 2),
+                scalar(key)
+            ));
+        }
+        out
+    };
+    let Some(hit) = find_key(text, &lines, from, to, last) else {
+        if !parents.is_empty() {
+            return Err(fail("a missing nested key"));
+        }
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&block(0));
+        return Ok(out);
+    };
+    if !hit.empty {
+        let first = text[hit.value..].chars().next().unwrap_or(' ');
+        // A flow mapping on the key's own line (`hardware: {gpu: none}`) is replaced whole.
+        if let Some(why) = refuse_value(first).filter(|_| first != '{') {
+            return Err(fail(why));
+        }
+    }
+    let mut end = block_end(text, &lines, hit);
+    while end > hit.line + 1 && !is_content(text, lines[end - 1]) {
+        end -= 1;
+    }
+    let (start, stop) = (lines[hit.line].start, lines[end - 1].next);
+    let mut out = String::with_capacity(text.len() + 64);
+    out.push_str(&text[..start]);
+    out.push_str(&block(hit.indent));
+    out.push_str(&text[stop..]);
+    Ok(out)
 }
 
 /// The end of the scalar at `start` on its line (before spaces and a comment), or `None` when a
@@ -1052,6 +1164,108 @@ created: 2026-10-12
             ("[x]", "\"[x]\""),
         ] {
             assert_eq!(scalar(value), quoted, "{value:?}");
+        }
+    }
+
+    fn mapping(path: &[&str], entries: &[(&str, YamlValue)]) -> YamlEdit {
+        YamlEdit::SetMapping {
+            path: path.iter().map(|s| s.to_string()).collect(),
+            entries: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    fn hardware(gpu: &str, vram: i64) -> YamlEdit {
+        mapping(
+            &["hardware"],
+            &[
+                ("gpu", YamlValue::Str(gpu.into())),
+                ("vram_gb", YamlValue::Int(vram)),
+                ("detected", YamlValue::Str("2026-10-18".into())),
+            ],
+        )
+    }
+
+    /// A mapping edit rewrites the key's block (numbers included) and nothing around it; the
+    /// comments and blank lines after the block stay; a flow mapping or a scalar value is
+    /// replaced; a missing top-level key goes last; a missing nested key is refused.
+    #[test] // spec: ARCH-076, CORE-067
+    fn set_mapping_rewrites_the_block_and_only_the_block() {
+        let text = "\
+# top comment
+name: Sample
+hardware:           # detected
+  gpu: Old GPU
+  vram_gb: 8
+  # inner comment
+  ram_gb: 16
+
+# before tools
+tools: {}
+";
+        let out = apply(text, &[hardware("New GPU", 24)]).unwrap();
+        assert_eq!(
+            out,
+            "\
+# top comment
+name: Sample
+hardware:
+  gpu: New GPU
+  vram_gb: 24
+  detected: 2026-10-18
+
+# before tools
+tools: {}
+"
+        );
+
+        // Flow mapping, scalar value, CRLF files and the end of a file without a newline.
+        for (old, new) in [
+            (
+                "a: 1\nhardware: {gpu: none}\nb: 2\n",
+                "a: 1\nhardware:\n  gpu: X\n  vram_gb: 4\n  detected: 2026-10-18\nb: 2\n",
+            ),
+            (
+                "hardware: none\n",
+                "hardware:\n  gpu: X\n  vram_gb: 4\n  detected: 2026-10-18\n",
+            ),
+            (
+                "a: 1\r\nhardware:\r\n  gpu: Y\r\n",
+                "a: 1\r\nhardware:\r\n  gpu: X\r\n  vram_gb: 4\r\n  detected: 2026-10-18\r\n",
+            ),
+            (
+                "a: 1\nhardware:\n  gpu: Y",
+                "a: 1\nhardware:\n  gpu: X\n  vram_gb: 4\n  detected: 2026-10-18\n",
+            ),
+            // Missing: appended, after a final line without a newline too.
+            (
+                "a: 1",
+                "a: 1\nhardware:\n  gpu: X\n  vram_gb: 4\n  detected: 2026-10-18\n",
+            ),
+        ] {
+            assert_eq!(apply(old, &[hardware("X", 4)]).unwrap(), new, "{old:?}");
+        }
+
+        // A nested key that is missing, and a value the line editor won't touch.
+        for refused in [
+            "defaults:\n  vcs: git\n",
+            "hardware: &h {gpu: none}\n",
+            "hardware: |\n  text\n",
+        ] {
+            let edit = if refused.starts_with("defaults") {
+                mapping(
+                    &["defaults", "hardware"],
+                    &[("gpu", YamlValue::Str("x".into()))],
+                )
+            } else {
+                hardware("X", 4)
+            };
+            assert!(
+                matches!(apply(refused, &[edit]), Err(YamlEditError::Unsupported(_))),
+                "{refused:?}"
+            );
         }
     }
 }

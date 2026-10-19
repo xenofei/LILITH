@@ -20,8 +20,9 @@ use lil_testkit::files::{sha256_bytes, sha256_file, write_file};
 use lil_testkit::{RawPipe, TestEnv};
 use serde_json::{Value, json};
 
-/// The checks, in the order the tool reports them.
-const CHECK_IDS: [&str; 12] = [
+/// The checks, in the order the tool reports them (`legacy.sealed_refs` follows
+/// `legacy.names` only when a sealed snapshot holds a legacy ref).
+const CHECK_IDS: [&str; 13] = [
     "git.repository",
     "git.core_longpaths",
     "git.lfs_setlockablereadonly",
@@ -34,6 +35,7 @@ const CHECK_IDS: [&str; 12] = [
     "workspace.orphans",
     "workspace.needs_repair",
     "workspace.missing",
+    "legacy.names",
 ];
 
 /// The five `.gitignore` entries (Global Constraints, CORE-040).
@@ -114,6 +116,7 @@ fn core_with_probe(env: &TestEnv, fp: FailPoints, probe: Arc<dyn Probe>) -> Core
         trusted: TrustedDirs {
             app_dirs: base.trusted.app_dirs.clone(),
             mcp_dirs: vec![mcp_dir],
+            test_app: base.trusted.test_app,
         },
         ..base
     })

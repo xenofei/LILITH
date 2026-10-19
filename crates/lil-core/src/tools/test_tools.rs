@@ -8,13 +8,27 @@
 //! | `test.block` | write | `{gate}` | `{gate, executions}` once a test opens the gate |
 //! | `test.panic` | read | `{}` | panics |
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
-//! | `test.destructive` | destructive | `{}` | `{executed: true}` |
+//! | `test.destructive` | destructive | `{cost?}` (a decimal string) | `{count}`: its runs in this core |
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
 //! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
+//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?}` | `{job}`: a job of kind `test.job` |
+//! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
+//! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
+//!
+//! `test.job` submits a job that [`TestJobHandler`] runs (the core registers it on test
+//! channels): a gated one waits until `test.job_release` (or a cancel), `transient_2` fails
+//! its first two attempts with a retryable `store.io`, `final` fails once with
+//! `params.invalid`, `disk_full` once with `store.disk_full`. Its priority is the argument,
+//! else the caller's class (CORE-124). A job with `engine` passes through `submitting` and the
+//! fail points `jobs.after_post` and `jobs.after_outputs`, as an engine job would;
+//! `external_side_effects` marks it as hosted or paid work would be (CORE-128).
+//!
+//! `test.comfy_submit` (a `comfy.prompt` job) lives with the engines (`engines::tools`), which
+//! the server registers on test channels.
 //!
 //! `test.settings`'s `settings` argument (dotted keys, or nested mappings) is plan 2b's only
 //! source of the settings cascade's request layer (CORE-057 clarification): the dispatcher's
@@ -39,8 +53,10 @@
 //! `pad` exists for the line-cap tests (ARCH-025): a result too large to send.
 //!
 //! `executions` counts the runs of that tool with that label or gate in this core, failed runs
-//! included. `test.emit` is `read`: it changes no state, only publishes an event (so it needs
-//! no idempotency key); a topic that makes no valid name is `params.invalid`.
+//! included; `count` counts `test.destructive`'s runs in this core. Its `cost` is read by the
+//! estimate stage once caps exist (plan 3 Task 16) and is otherwise unused. `test.emit` is
+//! `read`: it changes no state, only publishes an event (so it needs no idempotency key); a
+//! topic that makes no valid name is `params.invalid`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -54,8 +70,13 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::registry::{CallCtx, Registry, typed_tool};
+use crate::jobs::{
+    EngineKind, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec, JobSummary, Lane,
+    Priority, Substatus, runner::cancelled_error,
+};
 use crate::state::StateRegistry;
 use crate::store::{CommitOp, Expect, ManifestEdit, OutputMove, StoreError, WsPath, fsops};
+use crate::telemetry::Telemetry;
 
 /// The module every test tool declares.
 pub const TEST_MODULE: &str = "test";
@@ -92,6 +113,172 @@ impl TestGates {
         // The sender lives as long as `self`, so this cannot fail while we borrow it.
         let _ = rx.wait_for(|open| open.contains(gate)).await;
     }
+}
+
+/// The kind of the jobs `test.job` submits.
+pub const TEST_JOB_KIND: &str = "test.job";
+
+/// The gate a gated `test.job` waits on.
+fn job_gate(job_id: &str) -> String {
+    format!("job:{job_id}")
+}
+
+/// Runs `test.job`'s jobs (module docs). Its engine cancel does nothing: the job has no
+/// engine work.
+#[derive(Debug)]
+pub struct TestJobHandler {
+    gates: Arc<TestGates>,
+}
+
+impl TestJobHandler {
+    pub fn new(gates: Arc<TestGates>) -> TestJobHandler {
+        TestJobHandler { gates }
+    }
+
+    async fn attempt(&self, job: &JobCtx) -> Result<JobDone, JobFailure> {
+        let args: TestJobArgs = serde_json::from_value(job.spec.args.clone()).map_err(|e| {
+            JobFailure::Final(ErrorBody::new(
+                &codes::PARAMS_INVALID,
+                format!("test.job arguments: {e}"),
+                job.trace_id.clone(),
+            ))
+        })?;
+        let io = |e: std::io::Error| {
+            JobFailure::Final(ErrorBody::new(
+                &codes::STORE_IO,
+                format!("a fail point stopped the job: {e}"),
+                job.trace_id.clone(),
+            ))
+        };
+        if args.engine.is_some() {
+            job.failpoint("jobs.after_post").map_err(io)?;
+            job.set_substatus(Substatus::Executing).await;
+        }
+        if args.gated {
+            let mut cancel = job.cancel.clone();
+            let gate = job_gate(job.id.as_str());
+            tokio::select! {
+                () = self.gates.wait(&gate) => {}
+                _ = cancel.wait_for(|c| *c) => {
+                    return Err(JobFailure::Final(cancelled_error(&job.trace_id)));
+                }
+            }
+        }
+        let fail = |spec: &lil_protocol::CodeSpec, message: &str| {
+            ErrorBody::new(spec, message, job.trace_id.clone())
+        };
+        match args.fail {
+            Some(TestJobFail::Transient2) if job.attempt <= 2 => {
+                return Err(JobFailure::Retryable(fail(
+                    &codes::STORE_IO,
+                    "test.job failed transiently on purpose",
+                )));
+            }
+            Some(TestJobFail::Final) => {
+                return Err(JobFailure::Final(fail(
+                    &codes::PARAMS_INVALID,
+                    "test.job was asked to fail",
+                )));
+            }
+            Some(TestJobFail::DiskFull) => {
+                return Err(JobFailure::Final(fail(
+                    &codes::STORE_DISK_FULL,
+                    "test.job was asked to fail as if the disk were full",
+                )));
+            }
+            _ => {}
+        }
+        if args.engine.is_some() {
+            job.failpoint("jobs.after_outputs").map_err(io)?;
+        }
+        Ok(JobDone {
+            structured: json!({"attempt": job.attempt}),
+            artifacts: Vec::new(),
+            record: None,
+            windows: Vec::new(),
+        })
+    }
+}
+
+impl JobHandler for TestJobHandler {
+    fn kind(&self) -> &'static str {
+        TEST_JOB_KIND
+    }
+
+    fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
+        Box::pin(self.attempt(job))
+    }
+
+    fn cancel_in_engine<'a>(&'a self, _job: &'a JobCtx) -> JobFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TestJobFail {
+    #[serde(rename = "transient_2")]
+    Transient2,
+    Final,
+    DiskFull,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TestJobArgs {
+    lane: Lane,
+    #[serde(default)]
+    priority: Option<Priority>,
+    /// Runs until `test.job_release`.
+    #[serde(default)]
+    gated: bool,
+    #[serde(default)]
+    fail: Option<TestJobFail>,
+    #[serde(default)]
+    vram_need_mib: Option<u64>,
+    #[serde(default)]
+    expected_secs: Option<u32>,
+    #[serde(default)]
+    engine: Option<EngineKind>,
+    #[serde(default)]
+    external_side_effects: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TestJobResult {
+    job: JobSummary,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobReleaseArgs {
+    job_id: String,
+}
+
+/// `test.job`'s body: the handler reads `args` back from the job's spec.
+async fn test_job(ctx: &CallCtx, args: TestJobArgs) -> Result<(TestJobResult, String), ErrorBody> {
+    let raw = serde_json::to_value(&args).expect("test.job arguments serialise");
+    let spec = JobSpec {
+        kind: TEST_JOB_KIND,
+        lane: args.lane,
+        priority: args
+            .priority
+            .unwrap_or_else(|| Priority::for_caller(&ctx.session.caller, false)),
+        module: TEST_MODULE.to_string(),
+        args: raw,
+        project: ctx.project.clone(),
+        asset_id: None,
+        doc_id: None,
+        expected_secs: args.expected_secs.unwrap_or(10),
+        expected_output_bytes: 0,
+        vram_need_mib: args.vram_need_mib,
+        engine: args.engine,
+        group: None,
+        external_side_effects: args.external_side_effects,
+    };
+    let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
+    let summary = format!("job {} is {}", job.job_id, job.status.wire());
+    Ok((TestJobResult { job }, summary))
 }
 
 /// Run counters per tool and label.
@@ -250,9 +437,18 @@ struct StatePanicResult {
     requested: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DestructiveArgs {
+    /// What the call would cost, a decimal string in the display currency.
+    #[serde(default)]
+    #[expect(dead_code, reason = "the estimate stage reads it (plan 3 Task 16)")]
+    cost: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct DestructiveResult {
-    executed: bool,
+    count: u64,
 }
 
 /// `test.panic`'s body.
@@ -486,10 +682,47 @@ async fn ingest_run(ctx: &CallCtx, args: IngestArgs) -> Result<(IngestResult, St
     ))
 }
 
+/// The most samples one `test.hw_tick` takes.
+const MAX_TICK_SAMPLES: u32 = 3600;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HwTickArgs {
+    /// 1–3600.
+    samples: u32,
+}
+
+/// Registers `test.hw_tick` on `reg`: it advances `telemetry`, which a test channel runs in
+/// manual mode, by `samples` samples (each one nominal second) and returns the snapshot after
+/// them. Tests never wait for the 1 Hz sampler.
+pub fn register_hw_tick(reg: &mut Registry, telemetry: Arc<Telemetry>) {
+    reg.register(typed_tool(
+        "test.hw_tick",
+        "Test channels only: takes `samples` hardware samples now (1-3600; each stands for one second of the fake hardware's script) and returns the Snapshot after them.",
+        EffectClass::Write,
+        TEST_MODULE,
+        move |ctx, args: HwTickArgs| {
+            let telemetry = telemetry.clone();
+            Box::pin(async move {
+                if !(1..=MAX_TICK_SAMPLES).contains(&args.samples) {
+                    return Err(ErrorBody::new(
+                        &codes::PARAMS_INVALID,
+                        format!("samples must be between 1 and {MAX_TICK_SAMPLES}"),
+                        ctx.trace_id.clone(),
+                    ));
+                }
+                let snapshot = telemetry.tick(args.samples).await;
+                Ok((snapshot, format!("{} sample(s) taken", args.samples)))
+            })
+        },
+    ));
+}
+
 /// Registers the test-channel tools on `reg`. `test.block` waits on `gates`;
 /// `test.state_panic` panics the actor of `states`' suite database.
 pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Arc<StateRegistry>) {
     let counters = Arc::new(Counters::default());
+    let release_gates = gates.clone();
 
     reg.register(typed_tool(
         "test.echo",
@@ -533,7 +766,7 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         },
     ));
 
-    let block_counters = counters;
+    let block_counters = counters.clone();
     reg.register(typed_tool(
         "test.block",
         "Test channels only: a write that waits until an in-process test opens its gate.",
@@ -581,13 +814,15 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         },
     ));
 
+    let destructive_counters = counters;
     reg.register(typed_tool(
         "test.destructive",
-        "Test channels only: a destructive tool that does nothing.",
+        "Test channels only: a destructive tool that only counts its runs. `cost` is a decimal string.",
         EffectClass::Destructive,
         TEST_MODULE,
-        |_ctx, _args: NoArgs| {
-            Box::pin(async move { Ok((DestructiveResult { executed: true }, "executed".into())) })
+        move |_ctx, _args: DestructiveArgs| {
+            let count = destructive_counters.bump("test.destructive", "");
+            Box::pin(async move { Ok((DestructiveResult { count }, format!("run {count}"))) })
         },
     ));
 
@@ -642,6 +877,25 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
                 let summary = format!("{} settings", ctx.settings.values.len());
                 Ok((ctx.settings.clone(), summary))
             })
+        },
+    ));
+
+    reg.register(typed_tool(
+        "test.job",
+        "Test channels only: submits a test.job job in `lane`. `gated` holds it until test.job_release; `fail` makes it fail (transient_2, final or disk_full).",
+        EffectClass::Write,
+        TEST_MODULE,
+        |ctx, args: TestJobArgs| Box::pin(test_job(ctx, args)),
+    ));
+
+    reg.register(typed_tool(
+        "test.job_release",
+        "Test channels only: lets the gated test.job `job_id` go on.",
+        EffectClass::Write,
+        TEST_MODULE,
+        move |_ctx, args: JobReleaseArgs| {
+            release_gates.open(&job_gate(&args.job_id));
+            Box::pin(async move { Ok((Nothing {}, format!("released {}", args.job_id))) })
         },
     ));
 

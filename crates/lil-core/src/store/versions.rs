@@ -359,7 +359,7 @@ impl Store {
             .unwrap_or_default();
         let want = expected_hashes(&req, &records);
         // 1.
-        if self.exists_now(&version_abs).await {
+        if self.exists_now(&version_abs).await? {
             let found = Found {
                 asset: &asset,
                 version: &version_rel,
@@ -542,10 +542,25 @@ impl Store {
         Ok(())
     }
 
-    /// Whether `path` exists, by its attributes.
-    async fn exists_now(&self, path: &Path) -> bool {
-        let path = path.to_path_buf();
-        blocking(move || Ok(exists(&path))).await.unwrap_or(false)
+    /// Whether `path` exists, by `probe.identity` (attribute-only, never reads data). Only a
+    /// missing path (`NotFound`, or `NotADirectory` below a file) is `false`; any other error
+    /// is `store.io`, so a check built on it fails closed (ruling Q34 carry).
+    async fn exists_now(&self, path: &Path) -> Result<bool, StoreError> {
+        let (probe, at) = (self.probe().clone(), path.to_path_buf());
+        blocking(move || match probe.identity(&at) {
+            Ok(_) => Ok(true),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| StoreError::io(&self.rel_of(path), &e))
     }
 
     /// A new, empty `seal-<sh_…>` folder in the staging folder, live (never swept) until
@@ -760,8 +775,14 @@ impl Store {
         let mut gone = Vec::new();
         for top in tops {
             let rel = WsPath::from_disk(format!("{run}/{top}"));
-            if !self.exists_now(&rel.abs(self.root())).await {
-                gone.push(rel);
+            match self.exists_now(&rel.abs(self.root())).await {
+                Ok(true) => {}
+                Ok(false) => gone.push(rel),
+                // Not reported as gone: the index keeps it until the watcher or the next
+                // reconcile looks again.
+                Err(e) => {
+                    tracing::warn!(path = %rel, error = %e, "whether a sealed run file left the run can't be checked");
+                }
             }
         }
         gone
@@ -902,7 +923,7 @@ impl Store {
         // (a derived file put back, say) but the folder lacks is a mismatch.
         let run_abs = found.run.abs(self.root());
         for (name, _) in plan_names(chosen, records) {
-            if !present.contains(&path_key(&name)) && self.exists_now(&run_abs.join(&name)).await {
+            if !present.contains(&path_key(&name)) && self.exists_now(&run_abs.join(&name)).await? {
                 return refuse("a file the seal would have sealed is in the run, not in it");
             }
         }

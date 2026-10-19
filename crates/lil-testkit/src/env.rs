@@ -43,9 +43,11 @@ pub struct TestEnv {
     /// core ([`crate::CoreFixture`]): the drop then gives a pipe that is not there yet a short
     /// retry, since such a process may still be starting.
     pub(crate) launched: AtomicBool,
-    /// The temporary directory. Removed by this type's drop, not by `tempfile`, whose removal
-    /// stops at the first locked file and discards the error.
+    /// The temporary directory. Removed by this type's drop (or [`TestEnv::close`]), not by
+    /// `tempfile`, whose removal stops at the first locked file and discards the error.
     root: PathBuf,
+    /// Set by [`TestEnv::close`]: the drop then has nothing left to do.
+    closed: bool,
 }
 
 /// What a finished `lil` run printed and returned.
@@ -100,6 +102,7 @@ impl TestEnv {
             drain_counts: Arc::default(),
             launched: AtomicBool::new(false),
             root,
+            closed: false,
         }
     }
 
@@ -334,6 +337,50 @@ impl TestEnv {
             .unwrap_or_else(|e| panic!("cannot write {}: {e}", file.display()));
     }
 
+    /// Merges `toml_fragment` into this channel's `suite.toml` (created when missing): tables
+    /// merge key by key, at any depth, and every other value in the fragment replaces the one
+    /// in the file. Comments in the file are not kept.
+    ///
+    /// # Panics
+    /// If the fragment or the file is not TOML, or the file cannot be written.
+    pub fn suite_toml_set(&self, toml_fragment: &str) {
+        fn merge(into: &mut toml::Table, from: toml::Table) {
+            for (key, value) in from {
+                match (into.get_mut(&key), value) {
+                    (Some(toml::Value::Table(old)), toml::Value::Table(new)) => merge(old, new),
+                    (_, value) => {
+                        into.insert(key, value);
+                    }
+                }
+            }
+        }
+        let fragment: toml::Table = toml_fragment
+            .parse()
+            .unwrap_or_else(|e| panic!("the suite.toml fragment is not TOML: {e}"));
+        let file = self.env.suite_toml();
+        let mut table: toml::Table = match std::fs::read_to_string(&file) {
+            Ok(text) => text
+                .parse()
+                .unwrap_or_else(|e| panic!("{} is not TOML: {e}", file.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => panic!("cannot read {}: {e}", file.display()),
+        };
+        merge(&mut table, fragment);
+        let text = toml::to_string(&table).expect("a TOML table serialises");
+        crate::files::write_file(&file, text.as_bytes());
+    }
+
+    /// This process's `PATH` with the test binaries' folder first, for a child that must find
+    /// the fake `claude.exe` (or another test binary) by name. The real `PATH` is never changed.
+    ///
+    /// # Panics
+    /// If a `PATH` entry holds a `;`.
+    pub fn path_with_testbins(&self) -> OsString {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(ensure_built().dir.clone()).chain(std::env::split_paths(&path));
+        std::env::join_paths(dirs).expect("PATH entries without ';'")
+    }
+
     /// Creates or opens the SQLite database at `path` (creating its parent folders, ruling
     /// P13) and sets its `user_version` and its journal mode: `wal` when `wal` is true, else
     /// `delete`. No tables are created. Used to fake a newer or an older state
@@ -424,20 +471,45 @@ impl Default for TestEnv {
     }
 }
 
-impl Drop for TestEnv {
-    /// Drains any core still serving this channel, for example one that `lil` started and this
-    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Then removes the
-    /// temporary directory with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
-    /// another handle still holds a file, and reports what it had to leave on stderr and in
-    /// [`crate::cleanup::leftovers_log`]. Never panics.
-    fn drop(&mut self) {
+impl TestEnv {
+    /// What the drop does, now, for a fixture that has closed everything that held files in
+    /// the folder (its hub and state databases) and wants to know the folder went: drains any
+    /// core still on the channel, removes the folder (retrying for up to 2 s while another
+    /// handle holds a file), and returns what it had to leave, each entry as `<path>: <error>`.
+    /// Leftovers are also reported as the drop reports them.
+    ///
+    /// # Errors
+    /// The entries left behind.
+    pub fn close(mut self) -> Result<(), Vec<String>> {
+        self.closed = true;
+        self.clean_up()
+    }
+
+    /// The drop's work; `Err` lists what was left (already reported).
+    fn clean_up(&self) -> Result<(), Vec<String>> {
         crate::core::drain_channel(
             &self.env.pipe_name(),
             self.launched.load(Ordering::Relaxed),
             Arc::clone(&self.drain_counts),
         );
-        if let Err(left) = crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR) {
+        crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR).map_err(|left| {
             crate::cleanup::report_leftovers(&self.root, &left);
+            left.iter()
+                .map(|(path, e)| format!("{}: {e}", path.display()))
+                .collect()
+        })
+    }
+}
+
+impl Drop for TestEnv {
+    /// Drains any core still serving this channel, for example one that `lil` started and this
+    /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Then removes the
+    /// temporary directory with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
+    /// another handle still holds a file, and reports what it had to leave on stderr and in
+    /// [`crate::cleanup::leftovers_log`]. Never panics. After [`TestEnv::close`] it does nothing.
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.clean_up();
         }
     }
 }

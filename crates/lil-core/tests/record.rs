@@ -16,8 +16,8 @@ use lil_core::session::Session;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::tools::{
-    CallCtx, Dispatcher, MeterStage, PipelineHooks, RecordStage, TestGates, WorkspaceRecord,
-    core_registry,
+    CallCtx, Dispatcher, MeterStage, PipelineHooks, RecordStage, SettleInput, TestGates,
+    WorkspaceRecord, core_registry,
 };
 use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, SystemProbe};
@@ -85,6 +85,25 @@ struct Fx {
 }
 
 impl Fx {
+    /// Closes the hub (each open workspace's watcher, index, `state.db` and `core.lock`) and
+    /// joins the state actors, then removes the test's folder, which nothing holds open any
+    /// more, and fails the test if anything in it was left behind.
+    async fn shutdown(self) {
+        let Fx {
+            dispatcher,
+            hub,
+            _states: states,
+            env,
+            ..
+        } = self;
+        hub.close_all().await;
+        states.close();
+        drop((dispatcher, hub, states));
+        if let Err(left) = env.close() {
+            panic!("the test's folder was left behind: {left:?}");
+        }
+    }
+
     fn new(
         setup: impl FnOnce(&Path),
         hooks: impl FnOnce(PipelineHooks) -> PipelineHooks,
@@ -264,7 +283,7 @@ struct LoggingMeter {
 }
 
 impl MeterStage for LoggingMeter {
-    fn settle(&self, _s: &Session, _out: &Outcome<ToolOutput>) {
+    fn settle<'a>(&'a self, _i: SettleInput<'a>) -> futures_util::future::BoxFuture<'a, ()> {
         let ws = self.ws.lock().unwrap().clone();
         let manifest = file(&ws, &format!("{KITE_DIR}/{KITE}.manifest.json"));
         let staging = file(&ws, ".lilith/staging");
@@ -275,6 +294,7 @@ impl MeterStage for LoggingMeter {
             "meter manifest={} staged={staged}",
             manifest.exists()
         ));
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -397,6 +417,7 @@ async fn record_runs_after_meter_and_applies_the_plan_in_write_order() {
             "record done"
         ]
     );
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-026
@@ -471,6 +492,7 @@ async fn signoff_holds_the_version_lock_through_record() {
     }
     assert_eq!(fx.manifest(KITE)["approved_version"], "1.1.0");
     assert!(lock.try_lock().is_ok());
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-020, ARCH-075, CORE-038
@@ -508,6 +530,7 @@ async fn record_failure_turns_ok_into_the_store_error_and_lists_orphans() {
             .contains(&json!(format!("{KITE_DIR}/candidates/{}", runs[0]))),
         "{status}"
     );
+    fx.shutdown().await;
 }
 
 /// A made-up manifest of a dependent of `prop_kite` (I5 shape).
@@ -653,6 +676,7 @@ async fn signoff_marks_unpinned_dependents_stale_and_reports_them() {
     ))
     .unwrap();
     assert_eq!(archived["status"], "approved");
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-020
@@ -693,6 +717,7 @@ async fn handoff_is_in_every_recorded_result() {
         .await;
     check(&collected);
     assert_eq!(collected["handoff"]["refs"].as_array().unwrap().len(), 1);
+    fx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-023, CORE-047
@@ -732,6 +757,7 @@ async fn concurrent_imports_get_distinct_runs() {
             assert_eq!(names, [name], "{asset}/{run}");
         }
     }
+    fx.shutdown().await;
 }
 
 /// Fail points whose `store.after_seal` runs `edit` once on the asset's manifest JSON, as an
@@ -869,6 +895,7 @@ async fn a_candidate_edited_during_the_seal_is_put_back_and_refused() {
         )
         .await;
     assert_eq!(r["version"], "1.0.0", "{r}");
+    fx.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1027,6 +1054,7 @@ async fn a_version_folder_that_differs_is_never_adopted() {
     let m = fx.manifest(KITE);
     assert_eq!(m["approved_version"], Value::Null, "{m}");
     assert_eq!(version_folders(&fx), ["v1.0.0"]);
+    fx.shutdown().await;
 }
 
 /// The real probe, except that one path reports the cloud placeholder attributes and its data
@@ -1158,6 +1186,7 @@ async fn a_cloud_only_progress_md_is_a_warning_and_the_operation_is_recorded() {
     );
     // The placeholder itself was never read or written.
     assert_eq!(std::fs::read(&progress).unwrap(), progress_before);
+    fx.shutdown().await;
 }
 
 #[tokio::test] // spec: CORE-026, CORE-051 (ruling Q34)
@@ -1196,4 +1225,5 @@ async fn an_adopted_signoff_keeps_the_snapshots_date() {
         m["candidate_runs"][0]["signed_off"], snapshot["candidate_runs"][0]["signed_off"],
         "{m}"
     );
+    fx.shutdown().await;
 }

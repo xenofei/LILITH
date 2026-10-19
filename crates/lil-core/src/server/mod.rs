@@ -12,6 +12,27 @@
 //! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
 //!   wait and steps, then the open workspaces close (their `state.db` first, then
 //!   `core.lock`), then the state databases close, then the pipe.
+//! - The jobs ([`crate::jobs`]) are the dispatcher's: before it serves, the core registers
+//!   their handlers (the test channels' `test.job`), reads `[jobs] preempt_agent_batches`,
+//!   stops them starting queued jobs once a drain begins, recovers the suite scope's jobs
+//!   (ARCH-022), and adds the `jobs` idle blocker (ARCH-020) and the `PersistInterrupted`
+//!   shutdown step (ARCH-021). The default workspace's jobs are
+//!   recovered once it opens. The GPU scheduler ([`crate::jobs::scheduler`]) is their
+//!   admission, and every telemetry sample kicks them: a job waiting for VRAM is asked about
+//!   again, and the watchdog looks at the running ones.
+//! - The hardware telemetry ([`crate::telemetry`]) starts before the dispatcher is built: this
+//!   machine's hardware sampled once a second, or on a test channel the fake hardware script
+//!   (`LIL_TEST_FAKE_HW`) advanced only by `test.hw_tick`. Its tools and its topic's snapshot
+//!   are registered, the default workspace's hardware profile is checked once the workspace is
+//!   open and the first sample is in (CORE-067), and sampling stops right after the shutdown
+//!   steps.
+//! - The engines ([`crate::engines`]) are built once the dispatcher's jobs exist (their tools
+//!   find them through a slot filled before the core serves). They register the node-install
+//!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
+//!   measured with the workspace, and stop an owned ComfyUI in the `StopEngines` shutdown step.
+//!   Their outside-jobs watch is an idle blocker (it holds no drain), and their observation
+//!   ([`Engines::observe`]: the outside-jobs poll every 2 s while ComfyUI is ready, the model
+//!   inventory each time it becomes ready) starts with the suite's jobs recovered.
 
 mod conn;
 
@@ -31,12 +52,20 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
+use crate::engines::Engines;
+use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
+use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
+use crate::meter::LogSink;
 use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
-use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
+use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
+use crate::tools::{
+    Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry, register_hw_tick,
+    register_telemetry_tools,
+};
 use crate::workspace::WorkspaceHub;
 
 /// Per-connection writer queue (responses and events).
@@ -262,6 +291,8 @@ pub struct RunningCore {
     hub: Arc<WorkspaceHub>,
     /// The event bus (ARCH-032).
     events: Arc<EventBus>,
+    /// The hardware telemetry (CORE-059).
+    telemetry: Arc<Telemetry>,
     /// The gates `test.block` waits on (test channels).
     test_gates: Arc<TestGates>,
     /// Each session's active project (ARCH-088), shared with the dispatcher.
@@ -286,6 +317,11 @@ impl RunningCore {
     /// The event bus.
     pub fn events(&self) -> &Arc<EventBus> {
         &self.events
+    }
+
+    /// The hardware telemetry.
+    pub fn telemetry(&self) -> &Arc<Telemetry> {
+        &self.telemetry
     }
 
     /// The workspace hub.
@@ -394,16 +430,29 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     );
     // The live topics' snapshots (ARCH-044): `asset:` and `project:`.
     crate::tools::register_snapshots(&events, &hub);
+    let telemetry = start_telemetry(&cfg, &events).await;
+    telemetry::register_snapshot(&events, &telemetry);
+    let mut registry = core_registry(
+        cfg.test_tools,
+        &test_gates,
+        &state,
+        &hub,
+        &cfg.env,
+        &cfg.probe,
+        Arc::new(cfg.git_env.clone()),
+    );
+    register_telemetry_tools(&mut registry, &telemetry);
+    if cfg.test_tools {
+        register_hw_tick(&mut registry, telemetry.clone());
+    }
+    // The engines need the jobs, which the dispatcher builds: their tools find them here.
+    let engine_slot = EnginesSlot::default();
+    register_engine_tools(&mut registry, &engine_slot);
+    if cfg.test_tools {
+        register_engine_test_tools(&mut registry);
+    }
     let dispatcher = Dispatcher::new(
-        core_registry(
-            cfg.test_tools,
-            &test_gates,
-            &state,
-            &hub,
-            &cfg.env,
-            &cfg.probe,
-            Arc::new(cfg.git_env.clone()),
-        ),
+        registry,
         PipelineHooks::plan2(),
         state.clone(),
         events.clone(),
@@ -413,6 +462,63 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         lifecycle.clone(),
     );
     let active_projects = dispatcher.active_projects().clone();
+    let jobs = dispatcher.jobs().clone();
+    if cfg.test_tools {
+        jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
+    }
+    jobs.set_preempt_agent_batches(preempt_agent_batches(&cfg.env));
+    // The engines (ARCH-064): they register the node-install handler, and are the scheduler's
+    // engine processes and unload (ARCH-071).
+    let engines = Engines::new(
+        cfg.env.clone(),
+        jobs.clone(),
+        telemetry.clone(),
+        events.clone(),
+        cfg.clock.clone(),
+        cfg.failpoints.clone(),
+        Arc::new(LogSink),
+        cfg.sockets.clone(),
+    );
+    let _ = engine_slot.set(engines.clone());
+    engines.startup().await;
+    jobs.set_admission(GpuScheduler::new(telemetry.clone(), engines.clone()));
+    // ComfyUI's models folder is measured with the workspace (CORE-061).
+    let models = engines
+        .comfy_config()
+        .and_then(|c| c.root.as_ref())
+        .map(|root| root.join("models"));
+    if models.is_some() {
+        telemetry.set_sizes_probe(telemetry::sizes_probe(None, models.clone()));
+    }
+    let kicked = Arc::downgrade(&jobs);
+    telemetry.on_sample(Box::new(move || {
+        if let Some(jobs) = kicked.upgrade() {
+            jobs.kick();
+        }
+    }));
+    jobs.stop_on_drain(lifecycle.drain_token());
+    // Completions (Tasks 15–16) are added before this: it runs them for jobs that never
+    // started.
+    match jobs.recover_suite().await {
+        Ok(marked) if !marked.is_empty() => tracing::warn!(
+            count = marked.len(),
+            "suite jobs of an earlier core run are interrupted; none runs again"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the suite jobs could not be recovered; the first job call tries again")
+        }
+    }
+    lifecycle.add_blocker(jobs.clone());
+    // Outside ComfyUI jobs keep the core up but hold no drain (ARCH-020, ARCH-069); the poller
+    // runs while the engine is ready.
+    let outside = engines.outside_watch();
+    outside.stop_on_drain(lifecycle.drain_token());
+    lifecycle.add_blocker(outside);
+    engines.observe();
+    lifecycle.add_shutdown_step(engines.cancel_prompts_step());
+    lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
+    lifecycle.add_shutdown_step(engines.stop_engines_step());
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
@@ -425,10 +531,23 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     ));
 
     if let Some(ws) = hub.default_ref() {
-        let hub = hub.clone();
+        let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
+        let models = models.clone();
         tokio::spawn(async move {
-            if let Err(e) = hub.open(&ws).await {
-                tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
+            match hub.open(&ws).await {
+                Err(e) => {
+                    tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
+                }
+                Ok(open) => {
+                    if let Err(e) = jobs.recover_workspace(&open).await {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
+                    }
+                    telemetry.set_sizes_probe(telemetry::sizes_probe(
+                        Some(open.ws.path.clone()),
+                        models,
+                    ));
+                    telemetry::profile::spawn_check(telemetry, &open);
+                }
             }
         });
     }
@@ -457,6 +576,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         stop,
         serving,
         helpers,
+        telemetry: telemetry.clone(),
         session_end: session_end.clone(),
     }));
     tracing::info!(pipe = %pipe, channel = %cfg.env.channel(), "core serving");
@@ -466,6 +586,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         state,
         hub,
         events,
+        telemetry,
         test_gates,
         active_projects,
         session_end,
@@ -481,6 +602,7 @@ struct Supervised {
     stop: CancellationToken,
     serving: JoinHandle<io::Result<()>>,
     helpers: Vec<JoinHandle<()>>,
+    telemetry: Arc<Telemetry>,
     session_end: Option<Arc<SessionEndWatcher>>,
 }
 
@@ -494,6 +616,7 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         stop,
         mut serving,
         helpers,
+        telemetry,
         session_end,
     } = s;
     let drain = lifecycle.drain_token();
@@ -511,6 +634,9 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         lifecycle.begin_drain(DrainReason::Fatal(why));
     }
     let mut report = lifecycle.run_shutdown().await;
+
+    // Sampling stops and telemetry.db is flushed; it is disposable, so nothing waits on it.
+    telemetry.shutdown().await;
 
     // The open workspaces close before the state databases (module docs). It is part of the
     // state step, so the report's steps stay as plan 2 named them.
@@ -547,6 +673,78 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         "core stopped"
     );
     report
+}
+
+/// `suite.toml` for a reader of `section` at start: `None` for no file, and for a file that
+/// can't be read or doesn't parse, which is logged (QA1 M11: a malformed file never turns a
+/// setting off silently; the engine supervisor logs its own `[engines.comfyui]` the same way).
+fn read_suite_toml(env: &Env, section: &str) -> Option<lil_schema::SuiteToml> {
+    let path = env.suite_toml_to_read();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, section, "suite.toml can't be read; the section's defaults apply");
+            return None;
+        }
+    };
+    match lil_schema::SuiteToml::parse(&text) {
+        Ok(suite) => Some(suite),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, section, "suite.toml doesn't parse; the section's defaults apply");
+            None
+        }
+    }
+}
+
+/// `[jobs] preempt_agent_batches` of `suite.toml` (CORE-125): `false` for no file, a file that
+/// doesn't parse (logged), or no such key. Read once, at start.
+fn preempt_agent_batches(env: &Env) -> bool {
+    read_suite_toml(env, "[jobs]").is_some_and(|suite| suite.preempt_agent_batches())
+}
+
+/// The `[power]` settings of `suite.toml` (CORE-064); the defaults where there are none.
+fn power_settings(env: &Env) -> PowerSettings {
+    read_suite_toml(env, "[power]").map_or_else(PowerSettings::default, |suite| {
+        PowerSettings::from_toml(&suite.power())
+    })
+}
+
+/// Starts the hardware telemetry (CORE-059): this machine's hardware sampled once a second, or,
+/// on a test channel, the fake hardware script `LIL_TEST_FAKE_HW` names (none: no hardware at
+/// all) advanced only by `test.hw_tick`. A test never reads real hardware counters (QA-038).
+async fn start_telemetry(cfg: &CoreConfig, events: &Arc<EventBus>) -> Arc<Telemetry> {
+    let (env, clock, events) = (cfg.env.clone(), cfg.clock.clone(), events.clone());
+    let (test, fake) = (cfg.test_tools, cfg.fake_hw.clone());
+    // The sources block (NVML, DXGI, PDH), and so does opening `telemetry.db`.
+    tokio::task::spawn_blocking(move || {
+        let (src, mode) = if test {
+            let fake = fake.and_then(|path| match lil_platform::hw_fake::sources_from_file(&path) {
+                Ok(sources) => Some(HwSources::from_fake(sources)),
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "the fake hardware script can't be read; the core samples no hardware");
+                    None
+                }
+            });
+            (fake.unwrap_or_else(HwSources::none), TickMode::Manual)
+        } else {
+            (HwSources::real(), TickMode::Real)
+        };
+        let telemetry = Telemetry::start(
+            src,
+            env.local_dir().join("telemetry.db"),
+            clock,
+            power_settings(&env),
+            events,
+            mode,
+        );
+        if mode == TickMode::Real {
+            telemetry.set_gpu_opener(Box::new(lil_platform::hw::nvml_gpu));
+        }
+        telemetry
+    })
+    .await
+    .expect("starting the telemetry does not panic")
 }
 
 /// Opens the suite `state.db` and maps its failures to the core's exit codes (5, 6, 7 or 2),
