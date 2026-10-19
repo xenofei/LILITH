@@ -20,6 +20,7 @@ use lil_core::jobs::scheduler::{
 use lil_core::jobs::{
     Admission, Admit, EngineKind, JobCaller, JobCtx, JobDone, JobFailure, JobFuture, JobHandler,
     JobId, JobSpec, JobStatus, JobSummary, Jobs, Lane, Priority, SubmittedSlot, Substatus,
+    cancelled_error,
 };
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
@@ -83,7 +84,9 @@ impl JobHandler for Gates {
                 let mut cancel = job.cancel.clone();
                 tokio::select! {
                     _ = open.wait_for(|s| s.contains(gate)) => {}
-                    _ = cancel.wait_for(|c| *c) => {}
+                    _ = cancel.wait_for(|c| *c) => {
+                        return Err(JobFailure::Final(cancelled_error(&job.trace_id)));
+                    }
                 }
             }
             if job.attempt == 1 && args.get("fail_first") == Some(&json!(true)) {
@@ -114,6 +117,10 @@ struct Engines {
     unloads: watch::Sender<Vec<EngineKind>>,
     /// An unload that never finishes.
     stuck: bool,
+    /// Unloads finish only once this is `true`.
+    gate: Option<watch::Sender<bool>>,
+    /// How many unloads finished.
+    finished: watch::Sender<u32>,
 }
 
 impl EngineControl for Engines {
@@ -126,7 +133,12 @@ impl EngineControl for Engines {
         if self.stuck {
             return Box::pin(std::future::pending());
         }
-        Box::pin(std::future::ready(()))
+        Box::pin(async move {
+            if let Some(gate) = &self.gate {
+                let _ = gate.subscribe().wait_for(|open| *open).await;
+            }
+            self.finished.send_modify(|n| *n += 1);
+        })
     }
 }
 
@@ -1039,6 +1051,210 @@ async fn free_vram_drift_does_not_restart_the_flat_count() {
         first_go,
         Some(4),
         "baseline at sample 1, then 3 samples of drift"
+    );
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 4.
+// ---------------------------------------------------------------------------------------------
+
+/// The samples at which the jobs' admission let a job needing `need` MiB go.
+fn go_samples(rig: &Rig, need: u64) -> Vec<u64> {
+    rig.recording
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(n, _, a)| *n == Some(need) && *a == Admit::Go)
+        .map(|(_, sample, _)| *sample)
+        .collect()
+}
+
+/// N1, ruling P3-R16b: free VRAM wobbling by 100 MiB (12000, 12100, 12000, …) rises only once,
+/// to its first high, so the oversized job runs (the reviewer's probe: before, it waited for
+/// all 30 samples).
+#[tokio::test] // spec: ARCH-071
+async fn free_vram_wobble_does_not_keep_an_oversized_job_waiting() {
+    // free = min(16384 − 600, nvml_free) − 512.
+    let nvml: Vec<Value> = (0..30)
+        .map(|i| gpu(if i % 2 == 0 { 12512 } else { 12612 }))
+        .collect();
+    let rig = Rig::new(
+        Some(script(nvml, vec![mem(&[(100, 600)])])),
+        Arc::new(NoEngines),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let big = rig.submit(heavy(20000, None)).await;
+    rig.in_substatus(&big.job_id, "waiting_for_vram").await;
+    rig.telemetry.tick(29).await;
+    assert_eq!(rig.finished(&big.job_id).await["status"], "succeeded");
+    // Sample 1 is the baseline (12000), sample 2 the one rise (12100), then 3 flat samples.
+    assert_eq!(go_samples(&rig, 20000).first(), Some(&5));
+    rig.shutdown().await;
+}
+
+/// N2, ruling P3-R16b: the flat count starts only with the first sample after the needed
+/// unload finished, so samples taken while the other engine still held its memory don't count.
+#[tokio::test] // spec: ARCH-071
+async fn the_flat_count_starts_after_the_unloads_finish() {
+    let engines = Arc::new(Engines {
+        pids: HashMap::from([(EngineKind::ComfyUi, vec![200])]),
+        gate: Some(watch::Sender::new(false)),
+        ..Engines::default()
+    });
+    let rig = Rig::new(
+        Some(script(
+            vec![gpu(12000)],
+            vec![mem(&[(100, 600), (200, 2000)])],
+        )),
+        engines.clone(),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let big = rig.submit(heavy(20000, None)).await;
+    rig.in_substatus(&big.job_id, "waiting_for_vram").await;
+    // Samples 2–5, flat, while ComfyUI's unload is under way.
+    rig.telemetry.tick(4).await;
+    assert!(go_samples(&rig, 20000).is_empty());
+    engines.gate.as_ref().unwrap().send_replace(true);
+    tokio::time::timeout(DEADLINE, engines.finished.subscribe().wait_for(|n| *n == 1))
+        .await
+        .expect("the unload never finished")
+        .unwrap();
+    // Sample 6 is the first after it: the baseline; 7, 8 and 9 are flat.
+    rig.telemetry.tick(4).await;
+    assert_eq!(rig.finished(&big.job_id).await["status"], "succeeded");
+    assert_eq!(go_samples(&rig, 20000).first(), Some(&9));
+    rig.shutdown().await;
+}
+
+/// N3: when the lease changes hands, the unload state of the previous holder goes with it. A
+/// lease that goes back and forth while the unloads are slow sends each switch's unload, and an
+/// old unload that finishes late doesn't mark an engine that took the lease back as unloaded.
+#[tokio::test] // spec: ARCH-071
+async fn a_lease_ping_pong_carries_no_stale_unload_state() {
+    let engines = Arc::new(Engines {
+        pids: HashMap::from([(EngineKind::ComfyUi, vec![200])]),
+        gate: Some(watch::Sender::new(false)),
+        ..Engines::default()
+    });
+    let rig = Rig::new(
+        Some(script(vec![gpu(15000)], vec![mem(&[(200, 2000)])])),
+        engines.clone(),
+    )
+    .await;
+    rig.telemetry.tick(1).await;
+    let (c, t) = (EngineKind::ComfyUi, EngineKind::Test);
+    for e in [c, t, c, t, c] {
+        assert_eq!(rig.scheduler.admit(&heavy(100, Some(e))), Admit::Go);
+    }
+    // Each switch asks the previous holder, even while its earlier unload is still under way.
+    tokio::time::timeout(
+        DEADLINE,
+        engines.unloads.subscribe().wait_for(|u| u.len() == 4),
+    )
+    .await
+    .expect("a switch's unload was swallowed by an earlier one still under way")
+    .unwrap();
+    assert_eq!(*engines.unloads.borrow(), [c, t, c, t]);
+    engines.gate.as_ref().unwrap().send_replace(true);
+    tokio::time::timeout(DEADLINE, engines.finished.subscribe().wait_for(|n| *n == 4))
+        .await
+        .expect("the unloads never finished")
+        .unwrap();
+    // ComfyUI holds the lease (and 2000 MiB) again: its old unloads finishing don't count, so
+    // an oversized job asks it again.
+    assert!(matches!(
+        rig.scheduler.admit(&heavy(20000, None)),
+        Admit::WaitForVram { .. }
+    ));
+    tokio::time::timeout(
+        DEADLINE,
+        engines.unloads.subscribe().wait_for(|u| u.len() == 5),
+    )
+    .await
+    .expect("a stale unload marked ComfyUI unloaded")
+    .unwrap();
+    assert_eq!(engines.unloads.borrow().last(), Some(&c));
+    rig.shutdown().await;
+}
+
+/// M3: input names only real engines; the row column reads the test kind back.
+#[test] // spec: ARCH-064
+fn the_test_engine_kind_is_not_input() {
+    assert_eq!(EngineKind::parse("comfyui"), Some(EngineKind::ComfyUi));
+    assert_eq!(EngineKind::parse("test"), None);
+    assert_eq!(EngineKind::from_column("test"), Some(EngineKind::Test));
+    assert_eq!(
+        EngineKind::from_column("comfyui"),
+        Some(EngineKind::ComfyUi)
+    );
+}
+
+/// M5: a job that ran unchecked stays marked after it is preempted and runs again checked.
+#[tokio::test] // spec: ARCH-071, CORE-125
+async fn a_job_that_ran_unchecked_stays_marked_after_a_preemption() {
+    let rig = Rig::new(
+        Some(
+            json!({"gpu": [gpu(15000)], "gpu_mem": null, "cpu_energy": null,
+                    "sys": [{"cpu_permille": 100}]}),
+        ),
+        Arc::new(Engines::default()),
+    )
+    .await;
+    rig.jobs.set_preempt_agent_batches(true);
+    rig.telemetry.tick(1).await;
+    // ComfyUI takes the lease, checked.
+    let first = rig.submit(heavy(100, Some(EngineKind::ComfyUi))).await;
+    assert!(
+        rig.finished(&first.job_id)
+            .await
+            .get("vram_unchecked")
+            .is_none()
+    );
+    // With no per-process figures, its next job runs unchecked (P3-R17) ...
+    let batch = rig
+        .submit(JobSpec {
+            engine: Some(EngineKind::ComfyUi),
+            vram_need_mib: Some(100),
+            ..spec(Lane::GpuHeavy, json!({"gate": "batch"}))
+        })
+        .await;
+    rig.gates.until_started(&batch.job_id).await;
+    // ... an interactive job of another engine preempts it ...
+    let quick = rig
+        .submit(JobSpec {
+            priority: Priority::Interactive,
+            engine: Some(EngineKind::Test),
+            vram_need_mib: Some(100),
+            ..spec(Lane::GpuHeavy, json!({}))
+        })
+        .await;
+    assert_eq!(rig.finished(&quick.job_id).await["status"], "succeeded");
+    // ... and it runs again, checked this time: the lease comes back to ComfyUI.
+    let mut started = rig.gates.started.subscribe();
+    tokio::time::timeout(
+        DEADLINE,
+        started.wait_for(|s| s.iter().filter(|j| **j == batch.job_id).count() == 2),
+    )
+    .await
+    .expect("the preempted job never ran again")
+    .unwrap();
+    rig.gates.open("batch");
+    let done = rig.finished(&batch.job_id).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["vram_unchecked"], true, "{done}");
+    let asked = rig.recording.asked.lock().unwrap().clone();
+    let batch_answers: Vec<Admit> = asked
+        .iter()
+        .filter(|(need, _, _)| *need == Some(100))
+        .map(|(_, _, a)| *a)
+        .collect();
+    assert!(
+        batch_answers.contains(&Admit::GoUnchecked) && batch_answers.last() == Some(&Admit::Go),
+        "{asked:?}"
     );
     rig.shutdown().await;
 }

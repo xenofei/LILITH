@@ -12,8 +12,11 @@
 //!   `total − 512 MiB` and never refused for its size. Such a job runs once the card is as
 //!   free as it can be (the driver and the desktop always hold some): the `gpu-heavy` lane is
 //!   idle (it is only asked about then), every other engine holding VRAM has been unloaded (the
-//!   scheduler asks it) or holds none, and its free VRAM has not risen (by more than
-//!   [`RISE_MIB`] from one sample to the next) for [`FLAT_SAMPLES`] consecutive samples. The engine then offloads; out of memory is retried.
+//!   scheduler asks it) or holds none, and, counting from the first sample after those
+//!   unloads finished, its free VRAM has not risen for [`FLAT_SAMPLES`] consecutive samples. A
+//!   rise is free VRAM above the highest seen during the wait by more than [`RISE_MIB`]
+//!   (ruling P3-R16b), so the count always ends. The engine then offloads; out of memory is
+//!   retried.
 //! - **Without a check.** On a machine with no GPU source at all ([`Telemetry::has_gpu`] is
 //!   `false`, so no NVML) the job runs unchecked, marked `vram_unchecked`. With NVML but no
 //!   live reading yet (before the first sample, or while the GPU is lost) it waits for the next
@@ -50,8 +53,8 @@ pub const VRAM_MARGIN_MIB: u64 = 512;
 /// consecutive samples (ruling P3-R16).
 pub const FLAT_SAMPLES: u32 = 3;
 
-/// Free VRAM "rises" (restarting that count) only when it grows by more than this since the
-/// previous sample: small drift doesn't.
+/// Free VRAM "rises" (restarting that count) only when it goes above the highest value seen
+/// during the wait by more than this (ruling P3-R16b): drift and wobble don't.
 pub const RISE_MIB: u64 = 64;
 
 /// A job's watchdog flags it once it runs longer than this many times its expected time.
@@ -109,20 +112,31 @@ impl EngineControl for NoEngines {
     }
 }
 
-/// The engines asked to unload: in flight, and done since they last took the lease.
+/// The engines asked to unload. Every change of the lease's holder starts a new generation and
+/// forgets the old one's state: an unload of the old generation that finishes later is
+/// dropped, so it can neither mark an engine that took the lease back as unloaded nor keep a
+/// new request from being sent.
 #[derive(Debug, Default)]
 struct Unloads {
+    generation: u64,
+    /// In flight.
     asked: HashSet<EngineKind>,
+    /// Finished.
     done: HashSet<EngineKind>,
+    /// The telemetry sample count when an unload last finished: the flat count of an
+    /// oversized job starts only after it (ruling P3-R16b).
+    finished_at: u64,
 }
 
-/// The free VRAM of an oversized job's engine over consecutive samples (ruling P3-R16).
+/// The free VRAM of an oversized job's engine over consecutive samples (rulings P3-R16 and
+/// P3-R16b).
 #[derive(Debug, Clone, Copy)]
 struct Flat {
-    /// The telemetry sample it was read at.
+    /// The telemetry sample it was last read at.
     sample: u64,
     engine: Option<EngineKind>,
-    free_mib: u64,
+    /// The highest free VRAM seen during this wait.
+    high_mib: u64,
     /// The consecutive samples since it last rose.
     flat: u32,
 }
@@ -160,18 +174,29 @@ impl GpuScheduler {
         })
     }
 
-    /// Asks `e` to unload, unless that is under way already; once it is done, `e` counts as
-    /// unloaded until it takes the lease again.
+    /// Asks `e` to unload, unless that is under way already in this generation; once it is
+    /// done, `e` counts as unloaded until the lease changes hands.
     fn unload(&self, e: EngineKind) {
-        if !lock(&self.unloads).asked.insert(e) {
-            return;
-        }
-        let (engines, unloads) = (self.engines.clone(), self.unloads.clone());
+        let generation = {
+            let mut u = lock(&self.unloads);
+            if !u.asked.insert(e) {
+                return;
+            }
+            u.generation
+        };
+        let (engines, unloads, telemetry) = (
+            self.engines.clone(),
+            self.unloads.clone(),
+            self.telemetry.clone(),
+        );
         tokio::spawn(async move {
             engines.unload(e).await;
             let mut u = lock(&unloads);
-            u.asked.remove(&e);
-            u.done.insert(e);
+            if u.generation == generation {
+                u.asked.remove(&e);
+                u.done.insert(e);
+                u.finished_at = telemetry.sample_count();
+            }
         });
     }
 
@@ -198,20 +223,22 @@ impl GpuScheduler {
     }
 
     /// The consecutive samples, up to this one, over which the free VRAM `free_mib` of a job
-    /// of `engine` has not risen by more than [`RISE_MIB`] a sample. Asked again within a sample, it answers the same; a sample
-    /// missed, or another engine, starts the count again.
+    /// of `engine` has not risen: gone above the highest value seen during this wait by more
+    /// than [`RISE_MIB`] (ruling P3-R16b). Free VRAM can't rise past the card, so the count
+    /// always gets there. Asked again within a sample, it answers the same; a sample missed,
+    /// or another engine, starts the count again.
     fn flat_samples(&self, engine: Option<EngineKind>, free_mib: u64) -> u32 {
         let sample = self.telemetry.sample_count();
         let mut flat = lock(&self.flat);
         match flat.as_mut() {
             Some(f) if f.engine == engine && f.sample == sample => f.flat,
             Some(f) if f.engine == engine && f.sample + 1 == sample => {
-                f.flat = if free_mib > f.free_mib.saturating_add(RISE_MIB) {
+                f.flat = if free_mib > f.high_mib.saturating_add(RISE_MIB) {
                     0
                 } else {
                     f.flat + 1
                 };
-                f.free_mib = free_mib;
+                f.high_mib = f.high_mib.max(free_mib);
                 f.sample = sample;
                 f.flat
             }
@@ -219,7 +246,7 @@ impl GpuScheduler {
                 *flat = Some(Flat {
                     sample,
                     engine,
-                    free_mib,
+                    high_mib: free_mib,
                     flat: 0,
                 });
                 0
@@ -238,11 +265,17 @@ impl GpuScheduler {
             return false;
         };
         let previous = lock(&self.lease).replace(to);
-        // The engine that takes the lease loads again.
-        lock(&self.unloads).done.remove(&to);
-        if let Some(previous) = previous
-            && previous != to
+        if previous == Some(to) {
+            return true;
+        }
+        // The lease changes hands: a new generation of unloads (see `Unloads`).
         {
+            let mut u = lock(&self.unloads);
+            u.generation += 1;
+            u.asked.clear();
+            u.done.clear();
+        }
+        if let Some(previous) = previous {
             tracing::info!(
                 from = previous.wire(),
                 to = to.wire(),
@@ -250,7 +283,7 @@ impl GpuScheduler {
             );
             self.unload(previous);
         }
-        previous == Some(to)
+        false
     }
 }
 
@@ -281,10 +314,13 @@ impl Admission for GpuScheduler {
         let free_mib = free_vram_mib(&view, &pids);
         let card = view.total_mib.saturating_sub(VRAM_MARGIN_MIB);
         if need_mib > card {
-            // As free as it can be (module docs). Both are evaluated: the other engines are
-            // asked to unload while the samples are counted.
+            // As free as it can be (module docs): the other engines are asked to unload, and
+            // the samples are counted only from the first one after every unload finished.
             let clear = self.others_clear(spec.engine, &view);
-            if self.flat_samples(spec.engine, free_mib) >= FLAT_SAMPLES && clear {
+            let after_unloads = self.telemetry.sample_count() > lock(&self.unloads).finished_at;
+            if !clear || !after_unloads {
+                *lock(&self.flat) = None;
+            } else if self.flat_samples(spec.engine, free_mib) >= FLAT_SAMPLES {
                 *lock(&self.flat) = None;
                 return Admit::Go;
             }
