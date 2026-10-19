@@ -1143,15 +1143,23 @@ async fn execution_windows_feed_telemetry_and_the_watchdog_starts_at_execution_s
         .map(|(_, w)| w.clone())
         .unwrap();
     assert_eq!(windows.len(), 1, "{windows:?}");
-    let w = windows[0];
+    let w = &windows[0];
     assert!(w.ok);
     assert_eq!(
         w.end - w.start,
         Duration::from_secs(4),
         "from execution_start to success"
     );
+    // Every engine process, never a lone pid 0 (QA1 I4).
+    let pids = rig.engines.engine_pids(EngineKind::ComfyUi);
     let pid = rig.engines.status().await[0].pid;
-    assert_eq!(Some(w.engine_pid), pid, "the engine's pid");
+    let want = if pids.is_empty() {
+        pid.into_iter().collect()
+    } else {
+        pids
+    };
+    assert!(!want.is_empty() && !want.contains(&0), "{want:?}");
+    assert_eq!(w.engine_pids, want, "the engine's processes");
 }
 
 // ---------------------------------------------------------------------------------------------

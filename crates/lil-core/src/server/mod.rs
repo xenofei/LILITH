@@ -663,23 +663,39 @@ async fn supervise(s: Supervised) -> ShutdownReport {
     report
 }
 
+/// `suite.toml` for a reader of `section` at start: `None` for no file, and for a file that
+/// can't be read or doesn't parse, which is logged (QA1 M11: a malformed file never turns a
+/// setting off silently; the engine supervisor logs its own `[engines.comfyui]` the same way).
+fn read_suite_toml(env: &Env, section: &str) -> Option<lil_schema::SuiteToml> {
+    let path = env.suite_toml_to_read();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, section, "suite.toml can't be read; the section's defaults apply");
+            return None;
+        }
+    };
+    match lil_schema::SuiteToml::parse(&text) {
+        Ok(suite) => Some(suite),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, section, "suite.toml doesn't parse; the section's defaults apply");
+            None
+        }
+    }
+}
+
 /// `[jobs] preempt_agent_batches` of `suite.toml` (CORE-125): `false` for no file, a file that
-/// doesn't parse, or no such key. Read once, at start.
+/// doesn't parse (logged), or no such key. Read once, at start.
 fn preempt_agent_batches(env: &Env) -> bool {
-    std::fs::read_to_string(env.suite_toml_to_read())
-        .ok()
-        .and_then(|text| lil_schema::SuiteToml::parse(&text).ok())
-        .is_some_and(|suite| suite.preempt_agent_batches())
+    read_suite_toml(env, "[jobs]").is_some_and(|suite| suite.preempt_agent_batches())
 }
 
 /// The `[power]` settings of `suite.toml` (CORE-064); the defaults where there are none.
 fn power_settings(env: &Env) -> PowerSettings {
-    std::fs::read_to_string(env.suite_toml_to_read())
-        .ok()
-        .and_then(|text| lil_schema::SuiteToml::parse(&text).ok())
-        .map_or_else(PowerSettings::default, |suite| {
-            PowerSettings::from_toml(&suite.power())
-        })
+    read_suite_toml(env, "[power]").map_or_else(PowerSettings::default, |suite| {
+        PowerSettings::from_toml(&suite.power())
+    })
 }
 
 /// Starts the hardware telemetry (CORE-059): this machine's hardware sampled once a second, or,

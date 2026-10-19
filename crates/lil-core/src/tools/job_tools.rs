@@ -47,7 +47,8 @@ struct WaitArgs {
 #[derive(Debug, Serialize, JsonSchema)]
 struct WaitResult {
     job: JobSummary,
-    /// The job is `succeeded`, `failed` or `cancelled`.
+    /// The job is `succeeded`, `failed` or `cancelled`, or `interrupted_unknown` (it waits for
+    /// you to resolve it).
     done: bool,
 }
 
@@ -86,7 +87,7 @@ pub fn register_job_tools(reg: &mut Registry) {
 
     reg.register(typed_tool(
         "job.wait",
-        "Waits until a job is succeeded, failed or cancelled, or for `timeout_s` seconds (1–90, default 90), and returns it with `done`. Call it again while `done` is false.",
+        "Waits until a job is succeeded, failed or cancelled (or interrupted_unknown, which only the person can resolve), or for `timeout_s` seconds (1–90, default 90), and returns it with `done`. Call it again while `done` is false.",
         EffectClass::Read,
         JOBS_MODULE,
         |ctx, args: WaitArgs| {

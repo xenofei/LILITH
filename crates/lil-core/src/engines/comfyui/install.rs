@@ -19,11 +19,12 @@ use std::time::Duration;
 
 use lil_platform::engine_spawn::{EngineSpawn, spawn_engine};
 use lil_platform::job_object::KillOnCloseJob;
-use lil_protocol::{Detail, ErrorBody, codes};
+use lil_protocol::{ErrorBody, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::handler::output_tail_detail;
 use crate::engines::config::scrubbed_env;
 use crate::engines::{ENGINES_MODULE, Engines};
 use crate::jobs::{
@@ -406,12 +407,7 @@ fn usage_ctx(job: &JobCtx, args: &InstallArgs) -> UsageCtx {
 /// `comfyui.node_install_failed`, with comfy-cli's output as untrusted detail.
 fn failed(message: String, lines: &[String]) -> ErrorBody {
     let mut error = ErrorBody::new(&codes::COMFYUI_NODE_INSTALL_FAILED, message, "");
-    if !lines.is_empty() {
-        error.detail = Some(Detail {
-            text: lines.join("\n"),
-            untrusted: true,
-        });
-    }
+    error.detail = output_tail_detail(lines);
     error
 }
 

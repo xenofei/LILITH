@@ -2308,3 +2308,180 @@ fn a_retry_runs_in_the_retried_jobs_project() {
     let retried = other.tool_ok("job.retry", json!({"job_id": id}), Some("again"));
     assert_eq!(retried["job"]["project"], "castle", "{retried}");
 }
+
+/// QA1 I1, QA-004, QA-007: a finished job's `error.retry` is about the job, never about sending
+/// its call again (the call's idempotency key gives back the same job): `after_resolve` with a
+/// `job.retry` hint for a failed job, `auto` only for the one automatic re-run, and
+/// `after_resolve` without a hint for `interrupted_unknown`. A recovered row's stale transient
+/// error is replaced by the core's own.
+#[tokio::test(start_paused = true)] // spec: QA-004, QA-007, CORE-128
+async fn a_finished_jobs_error_says_how_to_retry_the_job() {
+    use lil_protocol::RetryPolicy;
+    let fx = Fx::suite().await;
+    let hint = |e: &ErrorBody| {
+        e.fix
+            .as_ref()
+            .and_then(|f| f.agent_hint.as_ref())
+            .map(|h| (h.tool.clone(), h.arguments.clone()))
+    };
+    // `store.io` says `same_idempotency_key` for a call; the job that failed with it says
+    // `job.retry`.
+    let failed = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Agent,
+            json!({"fail": "retryable_always"}),
+        ))
+        .await;
+    let end = fx.finished(&failed.job_id).await;
+    let error = end.error.unwrap();
+    assert_eq!(error.code, "store.io");
+    assert_eq!(error.retry, RetryPolicy::AfterResolve);
+    assert_eq!(
+        hint(&error),
+        Some(("job.retry".to_string(), json!({"job_id": failed.job_id})))
+    );
+
+    // An interrupted agent job is re-run once by the core: `auto` there, and only there.
+    let rerun = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Agent,
+            json!({"fail": "interrupted"}),
+        ))
+        .await;
+    let end = fx.finished(&rerun.job_id).await;
+    assert_eq!(end.error.unwrap().retry, RetryPolicy::Auto);
+    let mut external = spec(Lane::Cpu, Priority::Agent, json!({"fail": "interrupted"}));
+    external.external_side_effects = true;
+    let external = fx.submit(external).await;
+    let error = fx.finished(&external.job_id).await.error.unwrap();
+    assert_eq!(
+        error.retry,
+        RetryPolicy::AfterResolve,
+        "not re-run (P3-R21)"
+    );
+    assert_eq!(hint(&error), None, "only you can retry it");
+
+    let unknown = fx
+        .submit(spec(Lane::Cpu, Priority::Agent, json!({"fail": "unknown"})))
+        .await;
+    fx.event_until(|d| {
+        d["job"]["job_id"] == unknown.job_id.as_str()
+            && d["job"]["substatus"] == "interrupted_unknown"
+    })
+    .await;
+    let error = fx.row(&unknown.job_id).await.error.unwrap();
+    assert_eq!(error.retry, RetryPolicy::AfterResolve);
+    assert_eq!(hint(&error), None);
+
+    // An earlier core: a job that kept an earlier attempt's transient error, and an engine job
+    // with external side effects stuck in `submitting`.
+    let retrying = fx.submit(gated(Lane::Cpu, Priority::Agent, "never")).await;
+    fx.handler.until_started(&retrying.job_id).await;
+    let stale = record::Change {
+        error: Some(Some(ErrorBody::new(
+            &codes::STORE_IO,
+            "an earlier attempt",
+            "t",
+        ))),
+        ..record::Change::default()
+    };
+    record::update(&fx.states.suite_db(), &retrying.job_id, stale, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stuck = gated(Lane::GpuHeavy, Priority::Agent, "never");
+    stuck.engine = Some(EngineKind::ComfyUi);
+    stuck.external_side_effects = true;
+    let stuck = fx.submit(stuck).await;
+    fx.handler.until_started(&stuck.job_id).await;
+    let restarted = Jobs::new(
+        fx.states.clone(),
+        fx.hub.clone(),
+        fx.events.clone(),
+        fx.clock.clone(),
+        Arc::new(SeqIds::new()),
+        fx.failpoints.clone(),
+    );
+    restarted.register(Arc::new(TestHandler::default()));
+    restarted.recover_suite().await.unwrap();
+    let row = fx.row(&retrying.job_id).await;
+    assert_eq!(row.substatus, Some(Substatus::Interrupted));
+    let error = row.error.unwrap();
+    assert_eq!(
+        (error.code.as_str(), error.retry),
+        ("core.draining", RetryPolicy::AfterResolve)
+    );
+    assert_eq!(
+        hint(&error),
+        Some(("job.retry".to_string(), json!({"job_id": retrying.job_id})))
+    );
+    let row = fx.row(&stuck.job_id).await;
+    assert_eq!(row.substatus, Some(Substatus::InterruptedUnknown));
+    let error = row.error.unwrap();
+    assert_eq!(
+        (error.code.as_str(), error.retry),
+        ("core.draining", RetryPolicy::AfterResolve)
+    );
+    assert_eq!(hint(&error), None);
+    fx.shutdown().await;
+}
+
+/// QA1 I2: `job.wait` on an `interrupted_unknown` job returns at once with `done`: only you can
+/// resolve it, so a wait loop on it would never end.
+#[tokio::test(start_paused = true)] // spec: AI-113, QA-007
+async fn job_wait_is_done_for_an_interrupted_unknown_job() {
+    let fx = Fx::suite().await;
+    let job = fx
+        .submit(spec(Lane::Cpu, Priority::Agent, json!({"fail": "unknown"})))
+        .await;
+    fx.event_until(|d| {
+        d["job"]["job_id"] == job.job_id.as_str() && d["job"]["substatus"] == "interrupted_unknown"
+    })
+    .await;
+    let started = tokio::time::Instant::now();
+    let (summary, done) = fx
+        .jobs
+        .wait(
+            &fx.ctx(),
+            &JobId(job.job_id.clone()),
+            Duration::from_secs(90),
+        )
+        .await
+        .unwrap();
+    assert!(done, "{summary:?}");
+    assert_eq!(summary.substatus.as_deref(), Some("interrupted_unknown"));
+    assert_eq!(tokio::time::Instant::now(), started, "it did not wait");
+    fx.shutdown().await;
+}
+
+/// QA1 M2: an engine that loses a job while you cancel it ends the job `interrupted`, with the
+/// outputs it salvaged, and it is not run again.
+#[tokio::test(start_paused = true)] // spec: CORE-128, QA-009
+async fn an_engine_loss_during_a_cancel_is_an_interruption_that_is_not_rerun() {
+    let fx = Fx::suite().await;
+    let job = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Agent,
+            json!({"gate": "c", "on_cancel": "interrupted"}),
+        ))
+        .await;
+    fx.handler.until_started(&job.job_id).await;
+    fx.jobs
+        .cancel(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    let end = fx.finished(&job.job_id).await;
+    assert_eq!(
+        (end.status, end.substatus.as_deref()),
+        (JobStatus::Failed, Some("interrupted"))
+    );
+    while fx.jobs.busy() {
+        tokio::task::yield_now().await;
+    }
+    let (all, _) = fx.jobs.list(&fx.ctx(), JobFilter::default()).await.unwrap();
+    assert_eq!(all.len(), 1, "no re-run: {all:?}");
+    fx.shutdown().await;
+}

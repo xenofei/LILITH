@@ -256,6 +256,80 @@ fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
     ErrorBody::new(&codes::PARAMS_INVALID, message, trace_id)
 }
 
+/// The tool an agent retries a finished job with (CORE-146; `jobs` names no `tools` item).
+const JOB_RETRY_TOOL: &str = "job.retry";
+
+/// How a finished job's error is retried ([`job_error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryHow {
+    /// The core re-runs it itself (an interrupted `agent` job's one re-run).
+    Rerun,
+    /// After the fix, with `job.retry`.
+    ByJobRetry,
+    /// After you resolve it (or only you can retry it): no `job.retry` hint.
+    Resolve,
+}
+
+/// The error a finished job keeps (Appendix F "Retries and recovery"; QA-004, QA-007). Its
+/// `retry` is about the job, never about sending the call that made it again: that call's
+/// idempotency key gives back this same job (CORE-016). `auto` only while the core re-runs it
+/// itself; `never` stays `never`; anything else is `after_resolve`, and with
+/// [`RetryHow::ByJobRetry`] `fix.agent_hint` is `job.retry {job_id}` unless the error names a
+/// fix of its own.
+fn job_error(mut error: ErrorBody, job_id: &str, how: RetryHow) -> ErrorBody {
+    if error.retry == RetryPolicy::Never {
+        return error;
+    }
+    if how == RetryHow::Rerun {
+        error.retry = RetryPolicy::Auto;
+        return error;
+    }
+    error.retry = RetryPolicy::AfterResolve;
+    if how == RetryHow::ByJobRetry {
+        let hint = lil_protocol::AgentHint {
+            tool: JOB_RETRY_TOOL.to_string(),
+            arguments: json!({ "job_id": job_id }),
+        };
+        match &mut error.fix {
+            Some(fix) => {
+                fix.agent_hint.get_or_insert(hint);
+            }
+            None => {
+                error.fix = Some(lil_protocol::Fix {
+                    ui_action: lil_protocol::UiAction {
+                        id: "retry_job".to_string(),
+                        label: "Retry the job".to_string(),
+                    },
+                    agent_hint: Some(hint),
+                });
+            }
+        }
+    }
+    error
+}
+
+/// How the error of a job that ends `failed` or `interrupted` is retried: by `job.retry` when
+/// a tool call made it and an agent may retry it (ruling P3-R21: never one with external
+/// side effects that was interrupted), else only after you resolve it.
+fn retry_of_end(origin: bool, external_side_effects: bool, interrupted: bool) -> RetryHow {
+    if origin && !(interrupted && external_side_effects) {
+        RetryHow::ByJobRetry
+    } else {
+        RetryHow::Resolve
+    }
+}
+
+/// The error a recovery or the shutdown step gives a job it marks `interrupted` or
+/// `interrupted_unknown` (Appendix F): any earlier attempt's transient error is replaced.
+fn stopped_error(row: &JobRow, how: RetryHow) -> ErrorBody {
+    let error = ErrorBody::new(
+        &codes::CORE_DRAINING,
+        "The core stopped while this job ran.",
+        &row.trace_id,
+    );
+    job_error(error, &row.job_id, how)
+}
+
 /// How a run ends.
 enum End {
     Succeeded(JobDone),
@@ -1044,16 +1118,17 @@ impl Shared {
                 let (cancelling, preempted) = self.flags(&id);
                 // An unknown outcome stays unknown, and an engine that lost the job is an
                 // interruption, whatever cancel or preemption came meanwhile: a cancel never
-                // hides a charge that may have happened, and neither is ever requeued.
+                // hides a charge that may have happened, the outputs salvaged are kept, and
+                // neither is ever requeued (nor re-run, when it was being cancelled).
                 let failure = match result {
                     Ok(done) => return self.complete(&info, attempt, End::Succeeded(done)).await,
                     Err(JobFailure::Unknown(error)) => {
                         return self.complete(&info, attempt, End::Unknown(error)).await;
                     }
-                    Err(_) if cancelling => return self.complete(&info, attempt, End::Cancelled).await,
                     Err(JobFailure::Interrupted { error, salvaged }) => {
                         return self.complete(&info, attempt, End::Interrupted { error, salvaged }).await;
                     }
+                    Err(_) if cancelling => return self.complete(&info, attempt, End::Cancelled).await,
                     Err(_) if preempted => return self.requeue(&info).await,
                     Err(failure) => failure,
                 };
@@ -1103,7 +1178,12 @@ impl Shared {
             a.completing = true;
         }
         let mut c = Change::finished(JobStatus::Failed);
-        c.error = Some(Some(error));
+        let how = retry_of_end(
+            info.origin.is_some(),
+            info.spec.external_side_effects,
+            false,
+        );
+        c.error = Some(Some(job_error(error, info.id.as_str(), how)));
         c.finished_utc = Some(self.now());
         if let Some(row) = self.apply(info.id.as_str(), &info.scope, c, None).await
             && let Some(ctx) = self.ctx_from_row(&row, &info.scope)
@@ -1171,13 +1251,15 @@ impl Shared {
         let id = info.id.as_str();
         // CORE-128, ARCH-022: only local work is re-run automatically, and never while the
         // core drains. The re-run takes the reservation over.
+        // A job you were cancelling when its engine lost it is not run again.
         let rerun = matches!(end, End::Interrupted { .. })
+            && !self.flags(id).0
             && info.spec.priority == Priority::Agent
             && info.retry_of.is_none()
             && !info.spec.external_side_effects
             && !self.draining();
         if let End::Succeeded(done) = &end {
-            lock(&info.windows).extend(done.windows.iter().copied());
+            lock(&info.windows).extend(done.windows.iter().cloned());
             let mut c = Change::to(Substatus::Ingesting);
             c.result = Some(JobResult {
                 structured: done.structured.clone(),
@@ -1232,7 +1314,12 @@ impl Shared {
             },
             End::Failed(error) => {
                 let mut c = Change::finished(JobStatus::Failed);
-                c.error = Some(Some(error));
+                let how = retry_of_end(
+                    info.origin.is_some(),
+                    info.spec.external_side_effects,
+                    false,
+                );
+                c.error = Some(Some(job_error(error, id, how)));
                 c.finished_utc = Some(now);
                 c
             }
@@ -1244,7 +1331,12 @@ impl Shared {
             }
             End::Interrupted { error, salvaged } => {
                 let mut c = Change::to(Substatus::Interrupted);
-                c.error = Some(Some(error));
+                let how = if rerun {
+                    RetryHow::Rerun
+                } else {
+                    retry_of_end(info.origin.is_some(), info.spec.external_side_effects, true)
+                };
+                c.error = Some(Some(job_error(error, id, how)));
                 c.result = Some(JobResult {
                     structured: json!({}),
                     artifacts: salvaged,
@@ -1253,8 +1345,9 @@ impl Shared {
                 c
             }
             End::Unknown(error) => {
+                // QA-007: `after_resolve`; it is retried by no one until you resolve it.
                 let mut c = Change::to(Substatus::InterruptedUnknown);
-                c.error = Some(Some(error));
+                c.error = Some(Some(job_error(error, id, RetryHow::Resolve)));
                 c
             }
         };
@@ -1568,11 +1661,16 @@ fn never_ran(substatus: Option<Substatus>) -> bool {
 }
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
+/// Either way the row gets [`stopped_error`] in place of any earlier attempt's error.
 fn interrupt_change(row: &JobRow, now: i64) -> Change {
     if row.substatus == Some(Substatus::Submitting) && row.external_side_effects {
-        Change::to(Substatus::InterruptedUnknown)
+        let mut c = Change::to(Substatus::InterruptedUnknown);
+        c.error = Some(Some(stopped_error(row, RetryHow::Resolve)));
+        c
     } else {
         let mut c = Change::to(Substatus::Interrupted);
+        let how = retry_of_end(row.origin.is_some(), row.external_side_effects, true);
+        c.error = Some(Some(stopped_error(row, how)));
         c.finished_utc = Some(now);
         c
     }
@@ -1777,8 +1875,9 @@ impl Jobs {
         Ok((rows.iter().map(|r| s.summary(r)).collect(), next))
     }
 
-    /// Waits until job `id` of `caller`'s scope is final, or for `timeout`: the job, and
-    /// whether it is final (AI-113).
+    /// Waits until job `id` of `caller`'s scope is done, or for `timeout`: the job, and whether
+    /// it is done (AI-113). Done is final, or `interrupted_unknown`: such a job changes only
+    /// when you resolve it, so waiting on it would never end (Appendix F, `job.wait`).
     ///
     /// # Errors
     /// `params.invalid` for a timeout outside 1–90 s; `job.unknown`; `state.unavailable`.
@@ -1812,8 +1911,8 @@ impl Jobs {
                 .await
                 .map_err(|e| state_unavailable(&e, trace_id))?
                 .ok_or_else(|| job_unknown(id.as_str(), trace_id))?;
-            if row.status.is_final() {
-                // Its final jobs log line is written once `job.wait` says it is done.
+            if row.status.is_final() || row.substatus == Some(Substatus::InterruptedUnknown) {
+                // Its jobs log line is written once `job.wait` says it is done.
                 s.announced(id.as_str()).await;
                 return Ok((s.summary(&row), true));
             }

@@ -472,9 +472,12 @@ pub struct JobSummary {
 }
 
 /// One stretch of engine execution, in monotonic time (telemetry attribution, Task 15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecWindow {
-    pub engine_pid: u32,
+    /// Every process of the engine when the window closed (an owned engine's Job Object, an
+    /// attached one's listener and its descendants): never empty, and never the telemetry's
+    /// pid 0 (every untracked process); a window without a known process is not reported.
+    pub engine_pids: Vec<u32>,
     pub start: Duration,
     pub end: Duration,
     pub ok: bool,

@@ -33,7 +33,7 @@
 //!    ([`super::salvage::Staging`]), each verified (size, and the staged file's SHA-256 equal to
 //!    the stream's); only then, with `root` known, each ComfyUI-side copy **with the job's
 //!    prefix** is removed. The executed graph comes from `/history`. Every attempt that
-//!    executed reports its window (from `execution_start`, with the engine's pid) through
+//!    executed reports its window (from `execution_start`, with the engine's processes) through
 //!    [`JobCtx::add_window`], whatever its outcome (CORE-065); a success's is also in
 //!    [`JobDone::windows`]. An `execution_error` is `comfyui.execution_failed` with ComfyUI's
 //!    text as untrusted detail (ARCH-060); CUDA out of memory ([`is_oom`]) posts `/free`,
@@ -487,6 +487,38 @@ fn error(spec: &CodeSpec, message: impl Into<String>, job: &JobCtx) -> ErrorBody
     ErrorBody::new(spec, message, job.trace_id.clone())
 }
 
+/// Untrusted detail from a process's last output lines (ComfyUI's at a failed start, comfy-cli's
+/// at a failed install; ARCH-060), held to the same [`MAX_DETAIL_BYTES`] as every other engine
+/// text, since it lands in the jobs row, its log line and every `job:` event: the newest whole
+/// lines that fit, joined by `\n` (the error is usually last), or the end of the last line when
+/// that alone is longer. `None` for no output.
+pub(crate) fn output_tail_detail(lines: &[String]) -> Option<Detail> {
+    let last = lines.last()?;
+    let mut used = 0;
+    let mut first = lines.len();
+    for (i, line) in lines.iter().enumerate().rev() {
+        let len = line.len() + usize::from(i + 1 < lines.len());
+        if used + len > MAX_DETAIL_BYTES {
+            break;
+        }
+        used += len;
+        first = i;
+    }
+    let text = if first == lines.len() {
+        let mut start = last.len() - MAX_DETAIL_BYTES;
+        while !last.is_char_boundary(start) {
+            start += 1;
+        }
+        last[start..].to_string()
+    } else {
+        lines[first..].join("\n")
+    };
+    Some(Detail {
+        text,
+        untrusted: true,
+    })
+}
+
 /// `e` with `text` (an engine's or the outside world's, ARCH-060) as untrusted detail.
 fn untrusted(mut e: ErrorBody, text: &str) -> ErrorBody {
     e.detail = Some(Detail {
@@ -577,7 +609,6 @@ impl JobHandler for ComfyPromptHandler {
                 comfy: &comfy,
                 client,
                 uploads: Uploads::new(comfy.suite_state(), comfy.clock.clone()),
-                pid: endpoint.pid.unwrap_or(0),
                 endpoint,
                 live: guard.live.clone(),
                 external,
@@ -630,7 +661,6 @@ struct Attempt<'a> {
     client: ComfyClient,
     uploads: Uploads,
     endpoint: ComfyEndpoint,
-    pid: u32,
     live: Arc<Live>,
     /// The job has external side effects (paid or hosted work, CORE-128).
     external: bool,
@@ -1093,10 +1123,22 @@ impl Attempt<'_> {
         Err(JobFailure::Final(cancelled_error(&self.job.trace_id)))
     }
 
-    /// The window from `execution_start` to now, if the prompt started.
+    /// The window from `execution_start` to now, if the prompt started: with the engine's
+    /// processes as they are now (the interpreter a venv launcher started included, ARCH-064),
+    /// else the endpoint's own process; none when neither is known, so no window ever names a
+    /// pid that isn't the engine's.
     fn window(&self, ok: bool) -> Option<ExecWindow> {
-        self.started.map(|start| ExecWindow {
-            engine_pid: self.pid,
+        let start = self.started?;
+        let mut engine_pids = self.comfy.pids();
+        if engine_pids.is_empty() {
+            engine_pids.extend(self.endpoint.pid.filter(|p| *p != 0));
+        }
+        if engine_pids.is_empty() {
+            tracing::warn!(job_id = %self.job.id, "the engine's processes are unknown; the job's execution window is not reported");
+            return None;
+        }
+        Some(ExecWindow {
+            engine_pids,
             start,
             end: self.comfy.clock.monotonic(),
             ok,
@@ -1438,6 +1480,34 @@ fn output_files(history: &Value) -> Vec<OutputFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// QA1 M3: a failed start's or install's output tail is held to the same 2,048 bytes as
+    /// every other engine text: the newest whole lines, or the end of a longer last line.
+    #[test] // spec: ARCH-060
+    fn output_tails_keep_the_newest_lines_within_2048_bytes() {
+        assert_eq!(output_tail_detail(&[]), None);
+        let lines: Vec<String> = (0..60)
+            .map(|i| format!("{i:02}{}", "x".repeat(98)))
+            .collect();
+        let detail = output_tail_detail(&lines).unwrap();
+        assert!(detail.untrusted);
+        assert!(
+            detail.text.len() <= MAX_DETAIL_BYTES,
+            "{}",
+            detail.text.len()
+        );
+        assert_eq!(
+            detail.text,
+            lines[40..].join("\n"),
+            "the newest 20 whole lines"
+        );
+        let long = vec![
+            "first".to_string(),
+            format!("é{}end", "y".repeat(16 * 1024)),
+        ];
+        let detail = output_tail_detail(&long).unwrap();
+        assert!(detail.text.len() <= MAX_DETAIL_BYTES && detail.text.ends_with("end"));
+    }
 
     #[test] // spec: CORE-130
     fn every_save_node_gets_the_job_prefix() {

@@ -13,11 +13,14 @@
 //!   sum is the exact energy of the bucket.
 //! - **Estimates.** A sample's `est` bits say which of its figures were estimated, not measured
 //!   (a lost source's gap, an integrated power, a TDP estimate).
-//! - **Open.** `PRAGMA user_version` must be 1 and `quick_check` must say `ok`; anything else (a
-//!   file that isn't a database included) means the old file and its side files are renamed to
-//!   `telemetry.db.damaged-<utc>` through the store's one door (`fsops::set_aside_db`) and a new
-//!   one is created. Nothing is deleted. If even that fails, the telemetry runs on an in-memory
-//!   database, so a broken disk never stops the core.
+//! - **Open.** `quick_check` must say `ok` and `PRAGMA user_version` must be one this core
+//!   knows: the current [`USER_VERSION`], or an older one, which is migrated forward in place
+//!   ([`MIGRATIONS`], one transaction per step), so an upgrade keeps the history. Anything else
+//!   (a newer version, version 0, a failed migration, a file that isn't a database) means the
+//!   old file and its side files are renamed to `telemetry.db.damaged-<utc>` through the
+//!   store's one door (`fsops::set_aside_db`) and a new one is created. Nothing is deleted. If
+//!   even that fails, the telemetry runs on an in-memory database, so a broken disk never stops
+//!   the core.
 //! - **Access.** One connection behind a mutex; every call is blocking and runs on a blocking
 //!   thread.
 
@@ -33,6 +36,26 @@ use super::{EnergySlice, JobEnergy, JobEnergyQuery, Measured};
 
 /// `PRAGMA user_version` of `telemetry.db`.
 pub(crate) const USER_VERSION: i64 = 1;
+
+/// The forward migrations: entry `i` takes a file from version `i + 1` to `i + 2`, so a file of
+/// any older version reaches [`USER_VERSION`]. A schema change appends its step here, edits
+/// [`SCHEMA`] (what a new file gets) to match, and bumps [`USER_VERSION`].
+const MIGRATIONS: &[&str] = &[];
+
+/// What [`open_file`] expects: the schema of a new file, its version, and the steps that bring
+/// an older file to it (production: [`SCHEMA`], [`USER_VERSION`], [`MIGRATIONS`]).
+#[derive(Clone, Copy)]
+struct Layout<'a> {
+    schema: &'a str,
+    version: i64,
+    migrations: &'a [&'a str],
+}
+
+const LAYOUT: Layout<'static> = Layout {
+    schema: SCHEMA,
+    version: USER_VERSION,
+    migrations: MIGRATIONS,
+};
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
 const MINUTE_MS: i64 = 60_000;
@@ -257,23 +280,33 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "synchronous", "NORMAL")
 }
 
-fn create(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)?;
-    conn.pragma_update(None, "user_version", USER_VERSION)
+fn create(conn: &Connection, layout: Layout<'_>) -> rusqlite::Result<()> {
+    conn.execute_batch(layout.schema)?;
+    conn.pragma_update(None, "user_version", layout.version)
 }
 
-/// Reads an existing file without touching it: the schema version, `quick_check` and the
-/// tables. The connection is read-only (`sqlite_files::open_untouched`), so it never
-/// checkpoints a `-wal` into the file, rolls a `-journal` back, or deletes a side file when it
-/// closes; a file that is then set aside keeps every byte it had (CORE-004).
-fn verify_existing(path: &Path) -> Result<(), String> {
+/// Reads an existing file without touching it: its schema version (returned), which must be
+/// the layout's or an older one it migrates from, and `quick_check`. The connection is
+/// read-only (`sqlite_files::open_untouched`), so it never checkpoints a `-wal` into the file,
+/// rolls a `-journal` back, or deletes a side file when it closes; a file that is then set
+/// aside keeps every byte it had (CORE-004).
+fn verify_existing(path: &Path, layout: Layout<'_>) -> Result<i64, String> {
     let conn =
         lil_platform::sqlite_files::open_untouched(path, false).map_err(|e| e.to_string())?;
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version != USER_VERSION {
-        return Err(format!("user_version {version}, not {USER_VERSION}"));
+    let steps = i64::try_from(layout.migrations.len()).unwrap_or(i64::MAX);
+    if version > layout.version {
+        return Err(format!(
+            "user_version {version} is newer than this core's {}",
+            layout.version
+        ));
+    }
+    if version < 1 || version < layout.version - steps {
+        return Err(format!(
+            "user_version {version} is not a telemetry.db version"
+        ));
     }
     let report = conn
         .prepare("PRAGMA quick_check")
@@ -285,27 +318,47 @@ fn verify_existing(path: &Path) -> Result<(), String> {
     if report != ["ok"] {
         return Err(format!("quick_check: {}", report.join("; ")));
     }
-    for table in TABLES {
-        conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
-            .map_err(|e| format!("table {table}: {e}"))?;
+    Ok(version)
+}
+
+/// Brings `conn`, at version `from`, to the layout's version: each step and its new
+/// `user_version` in one transaction, so a step that fails leaves the file at the version
+/// before it.
+fn migrate(conn: &mut Connection, from: i64, layout: Layout<'_>) -> Result<(), String> {
+    let steps = i64::try_from(layout.migrations.len()).unwrap_or(i64::MAX);
+    for version in from..layout.version {
+        // Entry `steps - (version_now - version)` takes `version` to `version + 1`.
+        let step = usize::try_from(steps - (layout.version - version))
+            .map_err(|_| format!("no migration from user_version {version}"))?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch(layout.migrations[step])
+            .and_then(|()| tx.pragma_update(None, "user_version", version + 1))
+            .and_then(|()| tx.commit())
+            .map_err(|e| format!("the migration from user_version {version} failed: {e}"))?;
+        tracing::info!(from = version, to = version + 1, "telemetry.db migrated");
     }
     Ok(())
 }
 
-/// An existing file, checked ([`verify_existing`]) and then opened for writing. `Err` says why
-/// the file is not usable.
-fn check_existing(path: &Path) -> Result<Connection, String> {
-    verify_existing(path)?;
-    let conn = Connection::open_with_flags(
+/// An existing file, checked ([`verify_existing`]), opened for writing, migrated to the
+/// layout's version, and checked for every table. `Err` says why the file is not usable.
+fn check_existing(path: &Path, layout: Layout<'_>) -> Result<Connection, String> {
+    let version = verify_existing(path, layout)?;
+    let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| e.to_string())?;
     configure(&conn).map_err(|e| e.to_string())?;
+    migrate(&mut conn, version, layout)?;
+    for table in TABLES {
+        conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+            .map_err(|e| format!("table {table}: {e}"))?;
+    }
     Ok(conn)
 }
 
-fn open_file(path: &Path, now_utc_secs: i64) -> Result<Connection, String> {
+fn open_file(path: &Path, now_utc_secs: i64, layout: Layout<'_>) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fsops::ensure_dir(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -321,7 +374,7 @@ fn open_file(path: &Path, now_utc_secs: i64) -> Result<Connection, String> {
             .is_empty();
     if exists || orphans {
         let verdict = if exists {
-            check_existing(path).map(Some)
+            check_existing(path, layout).map(Some)
         } else {
             Err("side files without a database".to_string())
         };
@@ -348,7 +401,7 @@ fn open_file(path: &Path, now_utc_secs: i64) -> Result<Connection, String> {
     )
     .map_err(|e| e.to_string())?;
     configure(&conn).map_err(|e| e.to_string())?;
-    create(&conn).map_err(|e| e.to_string())?;
+    create(&conn, layout).map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -356,10 +409,10 @@ impl Db {
     /// Opens (or sets aside and recreates) the database at `path` (module docs). Never fails:
     /// a database that can't be had on disk is an in-memory one.
     pub(crate) fn open(path: &Path, now_utc_secs: i64) -> Db {
-        let conn = open_file(path, now_utc_secs).unwrap_or_else(|why| {
+        let conn = open_file(path, now_utc_secs, LAYOUT).unwrap_or_else(|why| {
             tracing::error!(path = %path.display(), why, "telemetry.db can't be opened; the telemetry is kept in memory only");
             let conn = Connection::open_in_memory().expect("SQLite opens in memory");
-            create(&conn).expect("the schema creates in memory");
+            create(&conn, LAYOUT).expect("the schema creates in memory");
             conn
         });
         Db {
@@ -855,7 +908,81 @@ mod tests {
         assert_eq!(count("h1"), 3, "hourly rows are forever");
     }
 
-    /// A file that isn't a database, and one of another schema version, are set aside whole
+    /// An older file is migrated forward in place and keeps its history; only a newer version,
+    /// version 0 or a migration that fails sets a file aside, and nothing is deleted (CORE-004,
+    /// CORE-062). The layout stands in for a later schema (a version 2 with one more table).
+    #[test] // spec: CORE-004
+    fn an_older_version_migrates_in_place_and_only_a_newer_or_broken_one_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let v2_schema = format!("{SCHEMA}CREATE TABLE later (x INTEGER);");
+        let v2 = Layout {
+            schema: &v2_schema,
+            version: 2,
+            migrations: &["CREATE TABLE later (x INTEGER);"],
+        };
+        let names = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("telemetry.db.damaged-"))
+                .collect();
+            names.sort();
+            names
+        };
+        let db = Db::open(&path, 1_800_000_000);
+        db.write(&row(1, &[(Metric::RamUsed, 7)])).unwrap();
+        drop(db);
+
+        // Version 1 under a core that knows version 2: migrated, every row kept.
+        let conn = open_file(&path, 1_800_000_060, v2).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let kept: i64 = conn
+            .query_row("SELECT ram_used FROM s1 WHERE ts = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 7, "the history survives the upgrade");
+        conn.prepare("SELECT x FROM later").unwrap();
+        drop(conn);
+        assert!(names().is_empty(), "{:?}", names());
+
+        // The same file (now version 2) under this core's version 1: newer, so set aside.
+        let db = Db::open(&path, 1_800_000_120);
+        drop(db);
+        assert_eq!(names(), ["telemetry.db.damaged-20270115T080200Z"]);
+
+        // Version 0 (not a telemetry.db) is set aside; so is a file whose migration fails,
+        // and the failed step leaves it at its old version.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        drop(open_file(&path, 1_800_000_180, LAYOUT).unwrap());
+        let broken = Layout {
+            schema: &v2_schema,
+            version: 2,
+            migrations: &["CREATE TABLE s1 (x INTEGER);"],
+        };
+        drop(open_file(&path, 1_800_000_240, broken).unwrap());
+        assert_eq!(
+            names(),
+            [
+                "telemetry.db.damaged-20270115T080200Z",
+                "telemetry.db.damaged-20270115T080300Z",
+                "telemetry.db.damaged-20270115T080400Z",
+            ]
+        );
+        let aside =
+            Connection::open(dir.path().join("telemetry.db.damaged-20270115T080400Z")).unwrap();
+        let version: i64 = aside
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "a failed step is rolled back");
+    }
+
+    /// A file that isn't a database, and one of a newer schema version, are set aside whole
     /// and replaced (CORE-004).
     #[test] // spec: CORE-004
     fn a_damaged_or_other_version_file_is_set_aside_not_deleted() {

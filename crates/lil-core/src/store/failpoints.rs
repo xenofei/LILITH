@@ -236,6 +236,31 @@ pub fn armed(channel: &Channel, build_channel: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// QA1 M1: the test kit's list (what the spec tests arm) and the core's (what `parse`
+    /// accepts) agree: every core name is the test kit's, and the test kit's extra names are
+    /// only the plan-3b points whose tasks add them here (Task 14 `confirm.*`, Task 15
+    /// `meter.*`, Task 16 `caps.*`; once Task 16 lands, the lists are equal). A spec that names
+    /// a point the core lacks arms nothing at all, so a drift would silently test nothing.
+    #[test] // spec: QA-066
+    fn the_core_and_test_kit_fail_point_lists_agree() {
+        const LATER: &[&str] = &[
+            "confirm.after_answer",
+            "meter.after_pending",
+            "meter.after_usage_line",
+            "caps.after_reserve",
+        ];
+        let kit = lil_testkit::failpoints::NAMES;
+        for name in NAMES {
+            assert!(kit.contains(name), "{name} is not in the test kit's list");
+        }
+        for name in kit {
+            assert!(
+                NAMES.contains(name) || LATER.contains(name),
+                "{name} is in the test kit's list but no task adds it to the core's"
+            );
+        }
+    }
+
     #[test] // spec: QA-066
     fn parse_accepts_the_closed_lists_only() {
         let points = FailPoints::parse("store.replace=io, store.write_temp=disk_full").unwrap();

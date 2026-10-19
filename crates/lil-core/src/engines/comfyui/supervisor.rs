@@ -21,12 +21,12 @@ use lil_platform::job_object::{KillOnCloseJob, descendants};
 use lil_platform::process::ProcessHandle;
 use lil_platform::sockets::SocketTable;
 use lil_platform::{Clock, Env};
-use lil_protocol::{Detail, ErrorBody, codes};
+use lil_protocol::{ErrorBody, codes};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::client::ComfyClient;
-use super::handler::SuitePrompts;
+use super::handler::{SuitePrompts, output_tail_detail};
 use super::uploads::Uploads;
 use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK, scrubbed_env};
 use crate::engines::{
@@ -1111,11 +1111,6 @@ fn not_loopback(message: String) -> ErrorBody {
 /// `comfyui.start_failed`; the engine's last output lines are untrusted detail (ARCH-060).
 fn start_failed(message: String, tail: Vec<String>) -> ErrorBody {
     let mut error = ErrorBody::new(&codes::COMFYUI_START_FAILED, message, "");
-    if !tail.is_empty() {
-        error.detail = Some(Detail {
-            text: tail.join("\n"),
-            untrusted: true,
-        });
-    }
+    error.detail = output_tail_detail(&tail);
     error
 }

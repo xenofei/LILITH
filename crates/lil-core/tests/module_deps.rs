@@ -5,7 +5,10 @@
 //! types (only `tools` → `jobs`: tools submit jobs; `jobs` defines the `JobHandler` trait they
 //! register with, CORE-010), and `telemetry` takes none either (only `tools` → `telemetry`: the
 //! telemetry tools and `test.hw_tick` live in `tools`); `engines` uses `jobs` and `telemetry`, and
-//! neither uses it (`EngineControl` is how `jobs` reaches an engine).
+//! neither uses it (`EngineControl` is how `jobs` reaches an engine). `meter` uses `tools` (its
+//! stage traits and `BillingBasis`), so `tools` never uses `meter`: a meter tool is registered
+//! from `meter` (as the engine tools are from `engines`), and `jobs` and `telemetry` use no
+//! `meter` item either (`JobCompletion` is how `meter` hears of a job).
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
 //! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
@@ -14,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The CORE-014 modules (each plan-3 module is added as it lands).
-const MODULES: [&str; 11] = [
+const MODULES: [&str; 12] = [
     "store",
     "index",
     "watch",
@@ -26,6 +29,7 @@ const MODULES: [&str; 11] = [
     "jobs",
     "telemetry",
     "engines",
+    "meter",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -184,6 +188,7 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
         "jobs",
         "telemetry",
         "engines",
+        "meter",
     ] {
         assert!(
             graph.contains_key(module),
@@ -207,14 +212,16 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
         &["watch", "pipeline", "projects", "settings", "tools", "jobs"],
     );
     forbidden("pipeline", &["tools", "jobs"]);
-    forbidden("jobs", &["tools", "engines"]);
-    forbidden("telemetry", &["tools", "jobs", "engines"]);
+    forbidden("jobs", &["tools", "engines", "meter"]);
+    forbidden("telemetry", &["tools", "jobs", "engines", "meter"]);
+    forbidden("tools", &["engines", "meter"]);
     // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
     assert!(graph["tools"].contains("jobs"), "{graph:?}");
     assert!(graph["jobs"].contains("pipeline"), "{graph:?}");
     assert!(graph["tools"].contains("pipeline"), "{graph:?}");
     assert!(graph["tools"].contains("telemetry"), "{graph:?}");
     assert!(graph["engines"].contains("jobs"), "{graph:?}");
+    assert!(graph["meter"].contains("tools"), "{graph:?}");
     assert!(graph["pipeline"].contains("index"), "{graph:?}");
     assert!(graph["index"].contains("store"), "{graph:?}");
 }
