@@ -1350,7 +1350,7 @@ git commit -m "confirm: agent safety confirmations, app answers, retry by idempo
 
 **Files:**
 - Create: `crates/lil-core/src/meter/{record.rs, attribution.rs, summary.rs, stage.rs, tools.rs}`. Modify: `crates/lil-schema/src/money.rs` (completed), `crates/lil-core/src/meter/{mod.rs, sink.rs}` (the stand-in goes).
-- Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 6), `crates/lil-core/src/tools/telemetry_tools.rs` (`telemetry.jobs`), `crates/lil-core/src/server/mod.rs` (registers `meter/tools.rs`'s tools: `usage.summary`, and `test.meter_external` without caps on test channels), `crates/lil-core/src/store/failpoints.rs` (`meter.after_pending`, fired after the pending row commits; `meter.after_usage_line`, fired after the log line and before any settle).
+- Modify: `crates/lil-core/src/state/migrations.rs` (append `USAGE_PENDING`: suite migration 6, workspace migration 7), `crates/lil-core/src/tools/telemetry_tools.rs` (`telemetry.jobs`), `crates/lil-core/src/server/mod.rs` (registers `meter/tools.rs`'s tools: `usage.summary`, and `test.meter_external` without caps on test channels), `crates/lil-core/src/store/failpoints.rs` (`meter.after_pending`, fired after the pending row commits; `meter.after_usage_line`, fired after the log line and before any settle).
 - Carry from Task 11's review (I2, CORE-071): every external call opens its `pending` usage record before the request is sent, then settles it. The node install (`engines/comfyui/install.rs`) records one draft after comfy-cli ends, with `status` and `latency_ms`; Task 15 adds the write-ahead step (for example `UsageSink::begin(draft, ctx)` before `spawn_engine`, settled with the outcome), so a core that dies mid-install leaves a `pending` record.
 - Carry from Task 9 (review ruling 5): `EnergySlice.cpu_ms_by_pid` holds every untracked process together under pid 0, so the CPU share is the engine pids' `cpu_ms` divided by the map's sum, pid 0 included, never by the sum over tracked pids only. `energy_between` takes samples in `(from, to]` (open at the start). `cpu_measured: false` covers both estimated and unknown CPU.
 - Usage lines go through the existing append-log home, `crates/lil-core/src/store/logs.rs`: `Store::append_log(LogKind::Usage, …)` with a workspace, `logs::append_loose_usage(env, record)` without one (Global Constraints, "File writes in `lil-core`"). Nothing in `meter` writes a file itself.
@@ -1546,7 +1546,7 @@ git commit -m "resources: typed Libraries in workspace and personal scopes, soft
 
 **Files:**
 - Create: `crates/lil-core/src/interchange/{mod.rs, handlers.rs, tools.rs}`, `crates/lil-core/src/docs/{mod.rs, holds.rs, tools.rs}`, `crates/lil-schema/src/lilref.rs`.
-- Modify: `crates/lil-core/src/server/conn.rs` (holds and `open_requests` per connection), `crates/lil-core/src/state/{mod.rs, migrations.rs}` (append `HOLDS` to the workspace scope, migration 7: `hold_markers(doc_id PRIMARY KEY, path, holder, since_utc)`, emptied at startup).
+- Modify: `crates/lil-core/src/server/conn.rs` (holds and `open_requests` per connection), `crates/lil-core/src/state/{mod.rs, migrations.rs}` (append `HOLDS` to the workspace scope, migration 6: `hold_markers(doc_id PRIMARY KEY, path, holder, since_utc, token)`, emptied at startup).
 - Test: `crates/lil-core/tests/interchange.rs`, `crates/lil-core/tests/holds.rs`, `crates/lil-schema/tests/lilref.rs`.
 
 **Interfaces:**
