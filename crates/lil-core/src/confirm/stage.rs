@@ -5,13 +5,15 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use lil_protocol::{CallerKind, Cover, ErrorBody, codes};
+use lil_schema::money::Money;
+use serde_json::Value;
 
 use super::{Confirm, ConfirmRequest, McpConfirmation, Replay};
 use crate::meter::CapCheck;
 use crate::state::{StateDb, StateError};
 use crate::tools::{
-    Approval, CapHit, ConfirmDecision, ConfirmInput, ConfirmStage, ConfirmedVia, IdemRef,
-    ReplayDecision, cap_exceeded,
+    AllowOnce, Approval, CapHit, ConfirmDecision, ConfirmInput, ConfirmStage, ConfirmedVia,
+    IdemRef, ReplayDecision, cap_exceeded,
 };
 
 /// Agent safety confirmations and cap confirmations (ARCH-052–056, CORE-091, CORE-109–113,
@@ -111,6 +113,27 @@ impl AgentConfirm {
     }
 }
 
+/// What an `allow_once` answer allowed: the caps the confirmation's `cap` names and the
+/// largest estimate it showed. `None` for another action, or a row without caps.
+fn allowed_once(id: &str, action: Option<&str>, cap: Option<&Value>) -> Option<AllowOnce> {
+    if action != Some("allow_once") {
+        return None;
+    }
+    let hits = cap?.as_array()?;
+    let mut caps = Vec::new();
+    let mut estimate = Money::ZERO;
+    for h in hits {
+        caps.push(h.get("cap")?.as_str()?.to_string());
+        let e = Money::parse_decimal(h.get("estimate")?.as_str()?).ok()?;
+        estimate = estimate.max(e);
+    }
+    (!caps.is_empty()).then(|| AllowOnce {
+        confirmation_id: id.to_string(),
+        caps,
+        estimate,
+    })
+}
+
 fn state_unavailable(e: &StateError) -> ErrorBody {
     tracing::error!(error = %e, "state.db failed in the confirm stage");
     ErrorBody::new(
@@ -158,6 +181,7 @@ impl ConfirmStage for AgentConfirm {
         Box::pin(async move {
             Ok(Some(match self.confirm.on_replay(db, idem).await? {
                 Replay::Run(row) => ReplayDecision::Run(Approval {
+                    allowed: allowed_once(&row.id, row.cap_action.as_deref(), row.cap.as_ref()),
                     confirmation_id: row.id,
                     tool: row.tool,
                     arguments: row.arguments,

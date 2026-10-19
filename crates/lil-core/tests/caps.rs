@@ -39,8 +39,8 @@ use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::telemetry::{HwSources, PowerSettings, Telemetry, TickMode};
 use lil_core::tools::{
-    BillingBasis, Dispatcher, Estimate, PipelineHooks, ReserveOutcome, TestGates, ToolEstimates,
-    core_registry,
+    AllowOnce, BillingBasis, Dispatcher, Estimate, MeterStage, PipelineHooks, ReserveOutcome,
+    SettleInput, TestGates, ToolEstimates, core_registry,
 };
 use lil_core::workspace::WorkspaceHub;
 use lil_core::{CoreConfig, CoreThread, start_in_thread};
@@ -66,8 +66,8 @@ const START: u64 = 1_800_000_000;
 // ---------------------------------------------------------------------------------------------
 
 /// Runs `caps.test_job` jobs, ending as `end` says: `ok` (the default), `fail`, `unknown`,
-/// `cancel` (waits for its cancel), or `interrupt_once` (interrupted on its first run, ok on the
-/// re-run).
+/// `cancel` (waits for its cancel), `interrupt`, or `interrupt_once` (interrupted on the
+/// handler's first run, ok after).
 #[derive(Default)]
 struct PaidHandler {
     runs: AtomicU64,
@@ -91,6 +91,10 @@ impl PaidHandler {
                 let _ = cancel.wait_for(|c| *c).await;
                 Err(JobFailure::Final(cancelled_error(&job.trace_id)))
             }
+            "interrupt" => Err(JobFailure::Interrupted {
+                error: error(&codes::COMFYUI_UNREACHABLE),
+                salvaged: Vec::new(),
+            }),
             "interrupt_once" if run == 0 => Err(JobFailure::Interrupted {
                 error: error(&codes::COMFYUI_UNREACHABLE),
                 salvaged: Vec::new(),
@@ -985,7 +989,11 @@ async fn alerts_once_per_level_per_period() {
                     owner: "c_a",
                     workspace: "none",
                 },
-                Some("cf_x"),
+                Some(&AllowOnce {
+                    confirmation_id: "cf_x".into(),
+                    caps: vec!["monthly".into()],
+                    estimate: money("1"),
+                }),
             )
             .await
             .unwrap()
@@ -1660,4 +1668,433 @@ fn ui_cap_prompt_is_cancelled_when_its_app_closes() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1: allow-once is bound to what you saw (I1), and the review's Minors.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-091, CORE-087
+async fn allow_once_covers_only_the_caps_the_prompt_named() {
+    // P1: the call passes only the provider's cap when you allow it; meanwhile other spend
+    // fills the month, so the retry asks again about the monthly cap.
+    let rig = Rig::new(
+        "[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"10\"\n\
+         [caps.provider_monthly]\nfakeprov = \"3\"\n",
+    );
+    rig.confirm.presence().opened();
+    let args = json!({"provider": "fakeprov", "amount": "4"});
+    let k = next_key();
+    let p = pending(
+        &rig.call(&cli(), "test.meter_external", args.clone(), &k)
+            .await,
+    );
+    let shown = rig
+        .confirm
+        .list(lil_core::confirm::ListState::Pending, 10)
+        .await
+        .unwrap();
+    let caps: Vec<&str> = shown[0]
+        .cap
+        .as_ref()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["cap"].as_str().unwrap())
+        .collect();
+    assert_eq!(caps, ["provider:fakeprov"], "monthly is within");
+    rig.confirm
+        .answer(
+            &app(),
+            answer(&p.confirmation_id, Answer::Approve, allow_once()),
+        )
+        .await
+        .unwrap();
+    let other = external("otherprov", "8", "USD", BillingBasis::Payg);
+    rig.caps
+        .reserve(
+            &other,
+            ReserveFor {
+                owner: "c_other",
+                workspace: "none",
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let again = pending(
+        &rig.call(&cli(), "test.meter_external", args.clone(), &k)
+            .await,
+    );
+    assert_eq!(again.covers, [Cover::Cap], "the monthly cap is asked about");
+    assert_ne!(again.confirmation_id, p.confirmation_id);
+    assert_eq!(
+        rig.monthly().await,
+        ("0".into(), "8".into()),
+        "nothing ran over the cap"
+    );
+    rig.confirm
+        .answer(
+            &app(),
+            answer(&again.confirmation_id, Answer::Approve, allow_once()),
+        )
+        .await
+        .unwrap();
+    ok(&rig.call(&cli(), "test.meter_external", args, &k).await);
+    assert_eq!(
+        rig.monthly().await,
+        ("4".into(), "8".into()),
+        "you said yes to 12 of 10"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-091, CORE-085
+async fn allow_once_covers_only_the_estimate_the_prompt_showed() {
+    // P2: a dated rate changes between the prompt (2 EUR shown as 2.2) and the retry (10).
+    let rig = Rig::new(
+        "[money]\ndisplay_currency = \"USD\"\n\
+         [[money.rates]]\ncurrency = \"EUR\"\nin_display = \"1.1\"\ndate = \"2026-01-01\"\n\
+         [[money.rates]]\ncurrency = \"EUR\"\nin_display = \"5\"\ndate = \"2027-01-16\"\n\
+         [caps]\nmonthly = \"1\"\n",
+    );
+    rig.confirm.presence().opened();
+    // 23:50 on 15 January (UTC is the local time here).
+    rig.clock.shift_utc(15 * 3600 + 50 * 60);
+    let args = json!({"provider": "fakeprov", "amount": "2", "currency": "EUR"});
+    let k = next_key();
+    let p = pending(
+        &rig.call(&cli(), "test.meter_external", args.clone(), &k)
+            .await,
+    );
+    let shown = rig
+        .confirm
+        .list(lil_core::confirm::ListState::Pending, 10)
+        .await
+        .unwrap();
+    assert_eq!(shown[0].cap.as_ref().unwrap()[0]["estimate"], "2.2");
+    rig.confirm
+        .answer(
+            &app(),
+            answer(&p.confirmation_id, Answer::Approve, allow_once()),
+        )
+        .await
+        .unwrap();
+    // 00:10 on the 16th, within the approval's lifetime: the new day's rate is 5.
+    rig.clock.advance(Duration::from_secs(20 * 60));
+    let again = pending(
+        &rig.call(&cli(), "test.meter_external", args.clone(), &k)
+            .await,
+    );
+    assert_eq!(again.covers, [Cover::Cap], "10 is more than you saw");
+    assert_eq!(rig.monthly().await, ("0".into(), "0".into()));
+    let shown = rig
+        .confirm
+        .list(lil_core::confirm::ListState::Pending, 10)
+        .await
+        .unwrap();
+    assert_eq!(shown[0].cap.as_ref().unwrap()[0]["estimate"], "10");
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-013, ARCH-056
+async fn negative_amounts_never_credit_the_caps() {
+    let rig = Rig::new(MONTHLY_10);
+    let s = session(CallerKind::Cli, "s_cli", true);
+    for (tool, args) in [
+        (
+            "test.meter_external",
+            json!({"provider": "fakeprov", "amount": "-5"}),
+        ),
+        ("test.destructive", json!({"cost": "-3"})),
+    ] {
+        let out = rig.call(&app(), tool, args.clone(), &next_key()).await;
+        assert!(
+            matches!(code(&out).as_str(), "caps.invalid" | "params.invalid"),
+            "{tool}: {out:?}"
+        );
+        let out = rig.call(&s, tool, args, &next_key()).await;
+        code(&out);
+    }
+    let err = rig.caps.check(&usd("-1")).await.unwrap_err();
+    assert_eq!(err.code, "caps.invalid");
+    let caps_off = Rig::new("");
+    let err = caps_off
+        .caps
+        .reserve(
+            &usd("-1"),
+            ReserveFor {
+                owner: "c_1",
+                workspace: "none",
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "caps.invalid", "refused with caps off too");
+    // A negative actual settles at the reserved amount.
+    let rv = rig.reserved("2", "c_2").await;
+    rig.caps.settle(&rv, Some(money("-5")), true).await.unwrap();
+    assert_eq!(rig.monthly().await, ("2".into(), "0".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-085, ARCH-056
+async fn a_caps_that_is_not_a_table_fails_closed() {
+    for text in ["caps = 5\n", "caps = \"20\"\n"] {
+        let rig = Rig::new(text);
+        let CapCheck::Exceeds(hits) = rig.caps.check(&usd("0.01")).await.unwrap() else {
+            panic!("{text}: the caps can't be read, so they count as exceeded");
+        };
+        assert_eq!(hits[0].cap, "monthly");
+        assert_eq!(rig.row("monthly").await.invalid, Some(true));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-081, CORE-085, CORE-086
+async fn a_month_keeps_its_spend_across_currencies() {
+    // M3: 9 USD settled, then the display currency becomes EUR with a monthly cap of 10.
+    let rig = Rig::new(MONTHLY_10);
+    let rv = rig.reserved("9", "c_usd").await;
+    rig.caps.settle(&rv, None, true).await.unwrap();
+    let eur_cap = "[money]\ndisplay_currency = \"EUR\"\n[caps]\nmonthly = \"10\"\n";
+    lil_testkit::files::write_file(&rig.env.env.suite_toml(), eur_cap.as_bytes());
+    let nine = external("fakeprov", "9", "EUR", BillingBasis::Payg);
+    assert!(
+        matches!(rig.caps.check(&nine).await.unwrap(), CapCheck::Exceeds(_)),
+        "USD spend without a rate counts as exceeded"
+    );
+    assert_eq!(rig.row("monthly").await.invalid, Some(true));
+    let with_rate = format!(
+        "{eur_cap}[[money.rates]]\ncurrency = \"USD\"\nin_display = \"0.9\"\ndate = \"2026-01-01\"\n"
+    );
+    lil_testkit::files::write_file(&rig.env.env.suite_toml(), with_rate.as_bytes());
+    assert!(
+        matches!(rig.caps.check(&nine).await.unwrap(), CapCheck::Exceeds(_)),
+        "8.1 + 9 > 10"
+    );
+    let one = external("fakeprov", "1", "EUR", BillingBasis::Payg);
+    assert_eq!(rig.caps.check(&one).await.unwrap(), CapCheck::Within);
+    assert_eq!(rig.row("monthly").await.settled, "8.1");
+
+    // M4: with caps off and no rate, a foreign-currency call is still reserved, in its own
+    // currency; a cap set later counts it, converted, or as exceeded without a rate.
+    let off = Rig::new("");
+    let eur = external("fakeprov", "4", "EUR", BillingBasis::Payg);
+    let ReserveOutcome::Reserved(rv) = off
+        .caps
+        .reserve(
+            &eur,
+            ReserveFor {
+                owner: "c_eur",
+                workspace: "none",
+            },
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("every call reserves (CORE-086)");
+    };
+    let r = off.caps.reservation(&rv).await.unwrap().unwrap();
+    assert_eq!(
+        (r.display_currency.as_str(), r.display),
+        ("EUR", money("4"))
+    );
+    off.caps.settle(&rv, None, true).await.unwrap();
+    lil_testkit::files::write_file(&off.env.env.suite_toml(), MONTHLY_10.as_bytes());
+    assert!(matches!(
+        off.caps.check(&usd("1")).await.unwrap(),
+        CapCheck::Exceeds(_)
+    ));
+    let rated = format!(
+        "{MONTHLY_10}[[money.rates]]\ncurrency = \"EUR\"\nin_display = \"2\"\ndate = \"2026-01-01\"\n"
+    );
+    lil_testkit::files::write_file(&off.env.env.suite_toml(), rated.as_bytes());
+    assert_eq!(
+        off.caps.check(&usd("2")).await.unwrap(),
+        CapCheck::Within,
+        "8 + 2 = 10"
+    );
+    assert!(matches!(
+        off.caps.check(&usd("2.01")).await.unwrap(),
+        CapCheck::Exceeds(_)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-088, AI-029
+async fn a_dead_runs_job_reservations_are_repaired_from_their_jobs() {
+    let rig = Rig::new(MONTHLY_10);
+    // Jobs that ended without their reservation (as a core that died in their completions).
+    let mut ids = Vec::new();
+    for end in ["ok", "fail", "unknown"] {
+        let job = rig
+            .jobs
+            .submit(
+                &rig.caller(CallerKind::Cli, "c_j", None),
+                spec(json!({"end": end})),
+            )
+            .await
+            .unwrap();
+        rig.wait(&job.job_id).await;
+        ids.push(job.job_id);
+    }
+    let mut paid = spec(json!({"end": "interrupt"}));
+    paid.external_side_effects = true;
+    let interrupted = rig
+        .jobs
+        .submit(&rig.caller(CallerKind::Cli, "c_j", None), paid)
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.wait(&interrupted.job_id).await.status,
+        JobStatus::Failed
+    );
+    ids.push(interrupted.job_id);
+    ids.push("j_0000000000999999".to_string());
+    let mut rvs = Vec::new();
+    for (n, job) in ids.iter().enumerate() {
+        let owner = format!("c_{n:016}");
+        let rv = rig.reserved("1", &owner).await;
+        rig.caps.hand_over(&rv, &owner, &JobId(job.clone())).await;
+        rvs.push(rv);
+    }
+    assert_eq!(rig.monthly().await, ("0".into(), "5".into()));
+    let caps = Caps::new(
+        rig.states.clone(),
+        rig.env.env.clone(),
+        rig.clock.clone(),
+        rig.events.clone(),
+        FailPoints::none(),
+        rig.ids.clone(),
+    );
+    assert_eq!(
+        caps.repair_jobs().await.unwrap(),
+        4,
+        "the unknown one waits for you"
+    );
+    let state = |n: usize| {
+        let (caps, rv) = (caps.clone(), rvs[n].clone());
+        async move {
+            let r = caps.reservation(&rv).await.unwrap().unwrap();
+            (r.state, r.kept)
+        }
+    };
+    assert_eq!(
+        state(0).await,
+        (ReservationState::Settled, false),
+        "succeeded"
+    );
+    assert_eq!(
+        state(1).await,
+        (ReservationState::Released, false),
+        "failed"
+    );
+    assert_eq!(
+        state(2).await,
+        (ReservationState::Held, false),
+        "interrupted_unknown"
+    );
+    assert_eq!(
+        state(3).await,
+        (ReservationState::Held, true),
+        "may have been charged"
+    );
+    assert_eq!(
+        state(4).await,
+        (ReservationState::Released, false),
+        "no such job"
+    );
+    assert_eq!(
+        caps.repair_jobs().await.unwrap(),
+        0,
+        "the kept one is left alone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-088, CORE-071
+async fn a_line_the_tool_finished_itself_settles_at_its_cost() {
+    let rig = Rig::new(MONTHLY_10);
+    let ctx = |call: &str, rv: &str| UsageCtx {
+        workspace: None,
+        project: None,
+        asset: None,
+        job_id: None,
+        call_id: call.into(),
+        caller_kind: "cli".into(),
+        reservation: Some(rv.into()),
+    };
+    let draft = UsageDraft {
+        tool: "x.reports_cost".into(),
+        provider: "fakeprov".into(),
+        model: None,
+        route: "test".into(),
+        basis: BillingBasis::Payg,
+        units: serde_json::Map::new(),
+        est_cost: Some((money("5"), Currency::parse("USD").unwrap())),
+        account: None,
+        raw_usage: None,
+        attribution: Attribution::Suite,
+        status: UsageStatus::Pending,
+        latency_ms: None,
+    };
+    let usd_ = Currency::parse("USD").unwrap();
+    // Stage 8 settles at the line's reported cost.
+    let rv = rig.reserved("5", "c_0000000000000101").await;
+    let id = rig
+        .meter
+        .begin(&ctx("c_0000000000000101", &rv), draft.clone())
+        .await
+        .unwrap();
+    rig.meter
+        .finish(
+            &id,
+            Some((money("3"), usd_.clone())),
+            "provider_reported",
+            "succeeded",
+            10,
+        )
+        .await
+        .unwrap();
+    let stage = MeterSettle::new(rig.meter.clone()).with_caps(rig.caps.clone());
+    let outcome = Outcome::Ok(ToolOutput {
+        structured: json!({}),
+        artifacts: Vec::new(),
+        summary_text: String::new(),
+    });
+    stage
+        .settle(SettleInput {
+            session: &cli(),
+            reservation: Some(&rv),
+            call_id: "c_0000000000000101",
+            outcome: &outcome,
+        })
+        .await;
+    assert_eq!(rig.monthly().await, ("3".into(), "0".into()));
+    // A crash before stage 8: the next start settles it from the line, never releases it.
+    let rv = rig.reserved("5", "c_0000000000000102").await;
+    let id = rig
+        .meter
+        .begin(&ctx("c_0000000000000102", &rv), draft)
+        .await
+        .unwrap();
+    rig.meter
+        .finish(
+            &id,
+            Some((money("4"), usd_)),
+            "provider_reported",
+            "succeeded",
+            10,
+        )
+        .await
+        .unwrap();
+    let caps = Caps::new(
+        rig.states.clone(),
+        rig.env.env.clone(),
+        rig.clock.clone(),
+        rig.events.clone(),
+        FailPoints::none(),
+        rig.ids.clone(),
+    );
+    assert_eq!(caps.repair().await.unwrap(), 1);
+    assert_eq!(rig.monthly().await, ("7".into(), "0".into()));
+    assert_eq!(lines(&rig.loose()).len(), 2, "one line each");
 }

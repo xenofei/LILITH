@@ -42,8 +42,9 @@
 //! row is taken back (`StateDb::idem_reclaim`: of concurrent retries exactly one gets it, the
 //! others are `idempotency.in_progress`) and stages 3–9 run with stage 5 satisfied for exactly
 //! the tool and arguments you approved (an approval with the cap action `allow_once` lets the
-//! reservation pass the caps this once: the reserve stage gets the confirmation's id as
-//! `allow_once`), and the outcome is stored as usual; denied or expired,
+//! reservation pass the caps the prompt named, up to the estimate it showed, this once: the
+//! reserve stage gets them as `allow_once` and asks again for anything else), and the outcome
+//! is stored as usual; denied or expired,
 //! the key is released and the call is `confirm.denied` or `confirm.expired`; still pending,
 //! the same `pending_confirmation`.
 //!
@@ -688,8 +689,7 @@ impl Inner {
             Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => (
                 ConfirmDecision::Proceed {
                     confirmed_via: Some(a.confirmed_via),
-                    cap_override: (a.cap_action.as_deref() == Some(ALLOW_ONCE))
-                        .then(|| a.confirmation_id.clone()),
+                    cap_override: a.allowed.clone(),
                 },
                 None,
             ),
@@ -714,7 +714,7 @@ impl Inner {
                 estimate: &estimate,
                 workspace_id: session.workspace_id(),
                 call_id: &call_id,
-                allow_once: cap_override.as_deref(),
+                allow_once: cap_override.as_ref(),
             })
             .await;
         let reservation = match reserved {
@@ -1008,9 +1008,6 @@ enum Resumed {
     /// It is answered already. Boxed, as [`Begun::Done`].
     Done(Box<Outcome<ToolOutput>>),
 }
-
-/// The cap action that lets a call pass the caps once.
-const ALLOW_ONCE: &str = "allow_once";
 
 /// The outcome of a call stage 5 did not let run (a `Proceed` here is a stage's bug: the call
 /// is refused, failing closed).

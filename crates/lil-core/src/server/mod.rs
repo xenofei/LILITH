@@ -648,6 +648,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             tracing::error!(code = %e.code, error = %e.message, "the suite jobs could not be recovered; the first job call tries again")
         }
     }
+    // A dead core's held job reservations, decided by their jobs once those are recovered.
+    match caps.repair_jobs().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            count = n,
+            "job cap reservations of an earlier core run were repaired"
+        ),
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the job cap reservations could not be repaired; they stay held until the next start")
+        }
+    }
     lifecycle.add_blocker(jobs.clone());
     // Outside ComfyUI jobs keep the core up but hold no drain (ARCH-020, ARCH-069); the poller
     // runs while the engine is ready.

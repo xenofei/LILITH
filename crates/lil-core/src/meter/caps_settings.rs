@@ -23,6 +23,16 @@ pub const MONTHLY: &str = "monthly";
 /// The cap of one call.
 pub const PER_CALL_MAX: &str = "per_call_max";
 
+/// The keys `[caps]` may hold, new and legacy.
+const KNOWN_KEYS: [&str; 6] = [
+    "monthly",
+    "per_call_max",
+    "provider_monthly",
+    "monthly_usd",
+    "per_call_max_usd",
+    "provider_monthly_usd",
+];
+
 /// `provider:<id>`, the name of a provider's monthly cap.
 pub fn provider_cap(provider: &str) -> String {
     format!("provider:{provider}")
@@ -92,6 +102,18 @@ impl CapsSettings {
         let Some(caps) = suite.other.get("caps") else {
             return out;
         };
+        // A `caps` that isn't a table can't be read: what it meant is unknown, so the caps
+        // fail closed rather than read as none.
+        let Some(table) = caps.as_table() else {
+            tracing::warn!("suite.toml: `caps` is not a table; the caps fail closed");
+            out.invalid = vec![MONTHLY.to_string(), PER_CALL_MAX.to_string()];
+            return out;
+        };
+        for key in table.keys() {
+            if !KNOWN_KEYS.contains(&key.as_str()) {
+                tracing::warn!(key = %key, "suite.toml: [caps] has a key that is not a cap; it is ignored");
+            }
+        }
         let usd = out.display.as_str() == "USD";
         let invalid = |name: String, out: &mut CapsSettings| {
             tracing::warn!(cap = %name, "a cap in suite.toml doesn't parse; it counts as exceeded");
@@ -234,6 +256,15 @@ mod tests {
         let s = CapsSettings::from_suite_toml("[caps]\nmonthly = \"1\"\nmonthly_usd = 9\n");
         assert_eq!(s.monthly, Some(usd("1")));
 
+        for not_a_table in [
+            "caps = 5
+",
+            "caps = \"20\"
+",
+        ] {
+            let s = CapsSettings::from_suite_toml(not_a_table);
+            assert_eq!(s.invalid, ["monthly", "per_call_max"], "{not_a_table}");
+        }
         let broken = CapsSettings::from_suite_toml("this is = = not toml");
         assert_eq!(broken.invalid, ["monthly", "per_call_max"]);
         let bad_display = CapsSettings::from_suite_toml(

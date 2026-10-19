@@ -176,6 +176,32 @@ pub struct Approval {
     pub confirmed_via: ConfirmedVia,
     /// The cap action of the answer (`allow_once`, `raise`), for the cap half (Task 16).
     pub cap_action: Option<String>,
+    /// With `allow_once`: the caps and the estimate the prompt showed, which the reserve
+    /// stage may pass this once.
+    pub allowed: Option<AllowOnce>,
+}
+
+/// What a cap confirmation's `allow_once` allowed (CORE-091: bound to what you saw): the caps
+/// the prompt named and the estimate it showed, in the display currency. The reserve stage
+/// lets the call pass only those caps and only up to that estimate; a cap the prompt didn't
+/// name, or a larger estimate (a rate that changed meanwhile), asks again
+/// ([`ConfirmStage::cap_needed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowOnce {
+    /// The confirmation, `cf_<16 hex>` (the reservation's `allowed_by`).
+    pub confirmation_id: String,
+    /// `monthly`, `per_call_max`, `provider:<id>`.
+    pub caps: Vec<String>,
+    /// The estimate the prompt showed, display currency.
+    pub estimate: Money,
+}
+
+impl AllowOnce {
+    /// Whether this lets a call whose estimate is `estimate` pass `hits`: each is a cap the
+    /// prompt named, and the estimate is no larger than the one it showed.
+    pub fn covers(&self, hits: &[CapHit], estimate: Money) -> bool {
+        estimate <= self.estimate && hits.iter().all(|h| self.caps.contains(&h.cap))
+    }
 }
 
 impl Approval {
@@ -208,11 +234,11 @@ pub enum ReplayDecision {
     reason = "the plan's signature: CapExceeded holds the wire ErrorBody, as the crate's Results do"
 )]
 pub enum ConfirmDecision {
-    /// Run the call; `confirmed_via` records who confirmed it, `cap_override` is the cap a
+    /// Run the call; `confirmed_via` records who confirmed it, `cap_override` is what a
     /// confirmation allowed once (handed to the reserve stage as `allow_once`).
     Proceed {
         confirmed_via: Option<ConfirmedVia>,
-        cap_override: Option<String>,
+        cap_override: Option<AllowOnce>,
     },
     /// The call waits for you; the caller gets `pending_confirmation`.
     Pending(PendingConfirmation),
@@ -278,8 +304,8 @@ pub struct ReserveInput<'a> {
     pub workspace_id: &'a str,
     /// The call's id, `c_<16 hex>`; a job takes the reservation over (`JobCtx::reservation`).
     pub call_id: &'a str,
-    /// The cap a confirmation allowed once.
-    pub allow_once: Option<&'a str>,
+    /// What a confirmation allowed once: those caps, up to that estimate.
+    pub allow_once: Option<&'a AllowOnce>,
 }
 
 /// What the meter stage settles (inline calls only: a call that submitted a job leaves it

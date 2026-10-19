@@ -129,6 +129,9 @@ pub fn register_meter_tools(reg: &mut Registry, meter: &Arc<Meter>, test_tools: 
                 let invalid =
                     |why: String| ErrorBody::new(&codes::PARAMS_INVALID, why, ctx.trace_id.clone());
                 let amount = Money::parse_decimal(&args.amount).map_err(invalid)?;
+                if amount < Money::ZERO {
+                    return Err(invalid(format!("amount {:?} is negative", args.amount)));
+                }
                 let currency = match &args.currency {
                     Some(c) => Currency::parse(c).map_err(invalid)?,
                     None => m.money_settings().await.display,

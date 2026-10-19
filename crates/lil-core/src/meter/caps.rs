@@ -6,12 +6,17 @@
 //!   [`Estimate::External`] of another basis, local work and fixed costs never reserve.
 //! - **Reserve** ([`Caps::reserve`], stage 6). In one `BEGIN IMMEDIATE` of the suite
 //!   `state.db`, which holds every reservation of any workspace or none (CORE-087): the caps
-//!   the call would pass ("settled + held + this estimate > cap") are found, and with none (or a
-//!   cap a confirmation allowed once) the reservation is written, so two calls can never take the
-//!   same room. It records the call (its owner `c_…`), the workspace (or `none`), the estimate
+//!   the call would pass ("settled + held + this estimate > cap") are found, and with none (or
+//!   only caps a confirmation's `allow_once` named, at no more than the estimate it showed) the
+//!   reservation is written, so two calls can never take the same room and nothing passes a cap
+//!   you weren't shown. It records the call (its owner `c_…`), the workspace (or `none`), the estimate
 //!   in its own currency, the exchange rate used, the amount in the display currency and the
 //!   local month. `caps.after_reserve` fires once it is committed. Caps are optional: with none
-//!   set, a reservation is still made, so a cap set later in the month sees the month's spend.
+//!   set, a reservation is still made (in its own currency when there is no rate), so a cap set
+//!   later in the month sees the month's spend. A negative estimate is refused.
+//! - **Currencies.** Totals are kept per currency; a part in another currency than the display
+//!   one (a former display currency, or a reservation made without a rate) is converted at its
+//!   newest rate dated on or before today, and without one the cap counts as exceeded.
 //! - **Who owns it.** The call, until a job takes it over ([`Caps::hand_over`] to `j_…`, or to
 //!   an automatic re-run's id). A call whose idempotency key gave back an existing job releases
 //!   its own ([`Caps::release`]).
@@ -29,8 +34,13 @@
 //!   write-ahead usage rows (CORE-071, CORE-088): a `logging` row means its line was written,
 //!   so it is settled as the line says (a crash between the line and the settle); a `pending`
 //!   row means the request may have been sent, so it stays held (marked `kept`, so a later
-//!   start leaves it too); no row means nothing was sent, so it is released. A job's
-//!   reservation is its completion's.
+//!   start leaves it too); no row means nothing was sent, so it is released. A dead run's *job*
+//!   reservation ([`Caps::repair_jobs`], once the scope's jobs are recovered) is decided by its
+//!   job: succeeded settles, gone, cancelled or failed releases, `interrupted` with external
+//!   side effects stays held (`kept`; it may have been charged), and an unfinished
+//!   (`interrupted_unknown`) one waits for you. A tool that finishes its own usage line under a
+//!   reservation keeps the row until stage 8 settles at that line's cost, so a crash before it
+//!   settles from the line, never releasing a spent reservation.
 //! - **Periods** are local calendar months ([`Caps::period`], CORE-012). A reservation counts
 //!   in the month it was made: held ones of earlier months don't count against this month.
 //! - **Alerts** at 50 %, 80 % and 100 % of the settled amount, once per level, cap and month
@@ -59,14 +69,14 @@ use super::caps_settings::{CapsSettings, MONTHLY, PER_CALL_MAX, provider_cap};
 use super::record;
 use crate::events::EventBus;
 use crate::jobs::{
-    JobCompletion, JobCtx, JobDone, JobFuture, JobId, Reservations, is_cancelled, never_started,
-    resolved_unknown,
+    JobCompletion, JobCtx, JobDone, JobFuture, JobId, JobStatus, Reservations, Substatus,
+    is_cancelled, never_started, resolved_unknown,
 };
 use crate::session::Session;
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::FailPoints;
 use crate::tools::stages::{
-    BillingBasis, CapHit, Estimate, ReserveInput, ReserveOutcome, ReserveStage,
+    AllowOnce, BillingBasis, CapHit, Estimate, ReserveInput, ReserveOutcome, ReserveStage,
 };
 use crate::workspace::{Access, OpenWorkspace};
 
@@ -237,61 +247,99 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> {
     })
 }
 
-/// This machine's settled total of `cap` in `period`, in `currency`.
+/// An amount in the display currency, and whether every part of it could be converted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Total {
+    amount: Money,
+    /// `false`: a part in another currency has no rate, so the cap counts as exceeded.
+    complete: bool,
+}
+
+/// `(currency, micros)` parts as one amount in `s`'s display currency (module docs,
+/// "Currencies"): a part in another currency (a former display currency, or a reservation made
+/// with no rate) is converted at its newest rate dated on or before the local `date`.
+fn in_display(parts: Vec<(String, i64)>, s: &CapsSettings, date: &str) -> Total {
+    let mut total = Total {
+        amount: Money::ZERO,
+        complete: true,
+    };
+    for (currency, micros) in parts {
+        let m = Money::from_micros(micros);
+        let converted = if currency == s.display.as_str() {
+            Some(m)
+        } else {
+            Currency::parse(&currency)
+                .ok()
+                .and_then(|c| s.rate(&c, date))
+                .map(|r| m.convert(&r))
+        };
+        match converted.and_then(|c| total.amount.checked_add(c)) {
+            Some(sum) => total.amount = sum,
+            None => total.complete = false,
+        }
+    }
+    total
+}
+
+/// This machine's settled total of `cap` in `period`, in the display currency.
 fn settled_total(
     conn: &Connection,
+    s: &CapsSettings,
+    date: &str,
     period: &str,
     cap: &str,
-    currency: &str,
-) -> rusqlite::Result<Money> {
-    conn.query_row(
-        "SELECT settled_micros FROM cap_settled WHERE period = ?1 AND cap = ?2 AND currency = ?3",
-        params![period, cap, currency],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .map(|m| Money::from_micros(m.unwrap_or(0)))
+) -> rusqlite::Result<Total> {
+    let parts = conn
+        .prepare("SELECT currency, settled_micros FROM cap_settled WHERE period = ?1 AND cap = ?2")?
+        .query_map(params![period, cap], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, i64)>>>()?;
+    Ok(in_display(parts, s, date))
 }
 
-/// The amount held in `period` (in `currency`), of `provider` only when given.
+/// The amount held in `period`, in the display currency, of `provider` only when given.
 fn held_total(
     conn: &Connection,
+    s: &CapsSettings,
+    date: &str,
     period: &str,
-    currency: &str,
     provider: Option<&str>,
-) -> rusqlite::Result<Money> {
-    conn.query_row(
-        "SELECT COALESCE(SUM(display_micros), 0) FROM cap_reservations
-         WHERE state = 'held' AND period = ?1 AND display_currency = ?2
-           AND (?3 IS NULL OR provider = ?3)",
-        params![period, currency, provider],
-        |r| r.get::<_, i64>(0),
-    )
-    .map(Money::from_micros)
+) -> rusqlite::Result<Total> {
+    let parts = conn
+        .prepare(
+            "SELECT display_currency, SUM(display_micros) FROM cap_reservations
+             WHERE state = 'held' AND period = ?1 AND (?2 IS NULL OR provider = ?2)
+             GROUP BY display_currency",
+        )?
+        .query_map(params![period, provider], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, i64)>>>()?;
+    Ok(in_display(parts, s, date))
 }
 
-/// `a + b + c > limit`, an overflow counting as over.
-fn over(a: Money, b: Money, c: Money, limit: Money) -> bool {
-    a.checked_add(b)
-        .and_then(|s| s.checked_add(c))
-        .is_none_or(|sum| sum > limit)
+/// `a + b + c > limit`, an overflow (or a part without a rate) counting as over.
+fn over(a: Total, b: Total, c: Money, limit: Money) -> bool {
+    !a.complete
+        || !b.complete
+        || a.amount
+            .checked_add(b.amount)
+            .and_then(|s| s.checked_add(c))
+            .is_none_or(|sum| sum > limit)
 }
 
-/// The caps an estimate of `est` (display currency) for `provider` would pass in `period`:
-/// `monthly`, `per_call_max`, then the provider's, each with its limit (0 for an invalid one),
-/// settled and held amounts.
+/// The caps an estimate of `est` (display currency) for `provider` would pass in `period` on
+/// the local `date`: `monthly`, `per_call_max`, then the provider's, each with its limit (0 for
+/// an invalid one), settled and held amounts.
 fn hits(
     conn: &Connection,
     s: &CapsSettings,
+    date: &str,
     period: &str,
     provider: &str,
     est: Money,
 ) -> rusqlite::Result<Vec<CapHit>> {
-    let display = s.display.as_str();
     let mut out = Vec::new();
     if s.monthly.is_some() || s.is_invalid(MONTHLY) {
-        let settled = settled_total(conn, period, MONTHLY, display)?;
-        let held = held_total(conn, period, display, None)?;
+        let settled = settled_total(conn, s, date, period, MONTHLY)?;
+        let held = held_total(conn, s, date, period, None)?;
         let limit = if s.is_invalid(MONTHLY) {
             None
         } else {
@@ -301,8 +349,8 @@ fn hits(
             out.push(CapHit {
                 cap: MONTHLY.to_string(),
                 limit: limit.unwrap_or(Money::ZERO),
-                settled,
-                held,
+                settled: settled.amount,
+                held: held.amount,
                 estimate: est,
             });
         }
@@ -326,15 +374,15 @@ fn hits(
     let name = provider_cap(provider);
     let limit = s.provider_monthly.get(provider).copied();
     if limit.is_some() || s.is_invalid(&name) {
-        let settled = settled_total(conn, period, &name, display)?;
-        let held = held_total(conn, period, display, Some(provider))?;
+        let settled = settled_total(conn, s, date, period, &name)?;
+        let held = held_total(conn, s, date, period, Some(provider))?;
         let limit = if s.is_invalid(&name) { None } else { limit };
         if limit.is_none_or(|l| over(settled, held, est, l)) {
             out.push(CapHit {
                 cap: name,
                 limit: limit.unwrap_or(Money::ZERO),
-                settled,
-                held,
+                settled: settled.amount,
+                held: held.amount,
                 estimate: est,
             });
         }
@@ -467,13 +515,30 @@ impl Caps {
                 rate_date: None,
             });
         }
-        let date = lil_schema::time::date(self.local_secs(self.clock.utc_now()));
-        let rate = s.rate(c.currency, &date)?;
+        let rate = s.rate(c.currency, &self.today())?;
         Some(Priced {
             display: c.amount.convert(&rate),
             rate_micros: rate.in_display_micros,
             rate_date: Some(rate.date),
         })
+    }
+
+    /// Today's local date, `YYYY-MM-DD`: the day whose rates convert.
+    fn today(&self) -> String {
+        lil_schema::time::date(self.local_secs(self.clock.utc_now()))
+    }
+
+    /// `caps.invalid` for a negative estimate (M1): it would credit the caps, so it fails
+    /// closed.
+    fn negative(c: &Counted<'_>) -> ErrorBody {
+        ErrorBody::new(
+            &codes::CAPS_INVALID,
+            format!(
+                "The call's estimate {} {} is negative, so the caps can't count it.",
+                c.amount, c.currency
+            ),
+            "",
+        )
     }
 
     fn no_rate(s: &CapsSettings, c: &Counted<'_>) -> ErrorBody {
@@ -496,17 +561,20 @@ impl Caps {
         let Some(c) = counted(est) else {
             return Ok(CapCheck::Within);
         };
+        if c.amount < Money::ZERO {
+            return Err(Caps::negative(&c));
+        }
         let s = self.settings();
         if !s.applies_to(c.provider) {
             return Ok(CapCheck::Within);
         }
         let priced = self.price(&s, &c).ok_or_else(|| Caps::no_rate(&s, &c))?;
         let period = self.period(self.clock.utc_now());
-        let provider = c.provider.to_string();
+        let (provider, date) = (c.provider.to_string(), self.today());
         let found = self
             .db()
             .call(move |conn| {
-                hits(conn, &s, &period, &provider, priced.display).map_err(|e| sql(&e))
+                hits(conn, &s, &date, &period, &provider, priced.display).map_err(|e| sql(&e))
             })
             .await
             .map_err(|e| state_unavailable(&e))?;
@@ -518,29 +586,42 @@ impl Caps {
     }
 
     /// Reserves `est` for `who` (module docs, "Reserve"): one `BEGIN IMMEDIATE`. `allow_once`
-    /// (the confirmation that allowed it) lets it pass the caps this once; it still counts.
+    /// lets it pass the caps that confirmation named, up to the estimate it showed, this once
+    /// (it still counts); any other cap passed is `NeedsCap`, so the call asks again.
     ///
     /// # Errors
-    /// `caps.invalid` when the estimate can't be converted while a cap applies;
+    /// `caps.invalid` for a negative estimate, or one that can't be converted while a cap
+    /// applies;
     /// `state.unavailable`; `store.io` from the `caps.after_reserve` fail point (as a crash
     /// there: the reservation stays for the next start).
     pub async fn reserve(
         &self,
         est: &Estimate,
         who: ReserveFor<'_>,
-        allow_once: Option<&str>,
+        allow_once: Option<&AllowOnce>,
     ) -> Result<ReserveOutcome, ErrorBody> {
         let Some(c) = counted(est) else {
             return Ok(ReserveOutcome::None);
         };
+        if c.amount < Money::ZERO {
+            return Err(Caps::negative(&c));
+        }
         let s = self.settings();
         let applies = s.applies_to(c.provider);
-        let Some(priced) = self.price(&s, &c) else {
-            if applies {
-                return Err(Caps::no_rate(&s, &c));
-            }
-            tracing::warn!(currency = %c.currency, "no rate to the display currency and no cap applies; nothing is reserved");
-            return Ok(ReserveOutcome::None);
+        // With no rate and no cap that applies, the reservation is kept in the estimate's own
+        // currency (CORE-086: every call reserves); a cap set later converts it, or counts as
+        // exceeded without a rate.
+        let (priced, display_currency) = match self.price(&s, &c) {
+            Some(p) => (p, s.display.as_str().to_string()),
+            None if applies => return Err(Caps::no_rate(&s, &c)),
+            None => (
+                Priced {
+                    display: c.amount,
+                    rate_micros: ONE,
+                    rate_date: None,
+                },
+                c.currency.as_str().to_string(),
+            ),
         };
         let now = self.clock.utc_now();
         let row = Reservation {
@@ -555,24 +636,30 @@ impl Caps {
             amount: c.amount,
             rate_micros: priced.rate_micros,
             rate_date: priced.rate_date.clone(),
-            display_currency: s.display.as_str().to_string(),
+            display_currency,
             display: priced.display,
-            allowed_by: allow_once.map(str::to_string),
+            allowed_by: allow_once.map(|a| a.confirmation_id.clone()),
             state: ReservationState::Held,
             settled: None,
             kept: false,
         };
         let created = self.now_ms();
-        let check = applies && allow_once.is_none();
+        let allowed = allow_once.cloned();
+        let date = self.today();
         let id = row.id.clone();
         let done = self
             .db()
             .call(move |conn| {
                 let mut run = || -> rusqlite::Result<Result<(), Vec<CapHit>>> {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    if check {
-                        let found = hits(&tx, &s, &row.period, &row.provider, row.display)?;
-                        if !found.is_empty() {
+                    if applies {
+                        let found = hits(&tx, &s, &date, &row.period, &row.provider, row.display)?;
+                        // A confirmation's allow-once passes only the caps it named, up to
+                        // the estimate it showed (CORE-091); anything else asks again.
+                        let passes = allowed
+                            .as_ref()
+                            .is_some_and(|a| a.covers(&found, row.display));
+                        if !found.is_empty() && !passes {
                             return Ok(Err(found));
                         }
                     }
@@ -664,9 +751,9 @@ impl Caps {
     }
 
     /// Settles reservation `reservation` once (module docs, "Settle"): `billed` adds `actual`
-    /// (in the reservation's own currency, converted at its recorded rate; `None` is the
-    /// reserved amount, ruling P3-R15) to the month's totals; unbilled releases it. A
-    /// reservation that is settled or released already is left as it is.
+    /// (in the reservation's own currency, converted at its recorded rate; `None`, or a
+    /// negative amount, is the reserved amount, ruling P3-R15) to the month's totals; unbilled
+    /// releases it. A reservation that is settled or released already is left as it is.
     ///
     /// # Errors
     /// `state.unavailable`.
@@ -701,7 +788,7 @@ impl Caps {
                         tx.commit()?;
                         return Ok(None);
                     }
-                    let amount = actual.map_or(row.display, |a| {
+                    let amount = actual.filter(|a| *a >= Money::ZERO).map_or(row.display, |a| {
                         a.convert(&Rate {
                             in_display_micros: row.rate_micros,
                             date: row.rate_date.clone().unwrap_or_default(),
@@ -774,11 +861,7 @@ impl Caps {
             return;
         }
         let named = period.to_string();
-        let (period, display, now) = (
-            period.to_string(),
-            s.display.as_str().to_string(),
-            self.now_ms(),
-        );
+        let (period, date, now) = (period.to_string(), self.today(), self.now_ms());
         let raised = self
             .db()
             .call(move |conn| {
@@ -786,7 +869,13 @@ impl Caps {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let mut raised = Vec::new();
                     for (cap, limit) in &caps {
-                        let settled = settled_total(&tx, &period, cap, &display)?;
+                        let total = settled_total(&tx, &s, &date, &period, cap)?;
+                        // A part without a rate can't be measured: no alert is guessed.
+                        let settled = if total.complete {
+                            total.amount
+                        } else {
+                            Money::ZERO
+                        };
                         for level in ALERT_LEVELS {
                             let reached = settled > Money::ZERO
                                 && i128::from(settled.micros()) * 100
@@ -884,8 +973,18 @@ impl Caps {
             .await
     }
 
-    /// [`Caps::repair`] for the calls of workspace `open` (read-write only), before its usage
-    /// rows are recovered.
+    /// The suite scope's job reservations at start, once its jobs are recovered (module docs,
+    /// "Repair").
+    ///
+    /// # Errors
+    /// `state.unavailable`.
+    pub async fn repair_jobs(&self) -> Result<u32, ErrorBody> {
+        self.repair_job_scope(NO_WORKSPACE, &self.states.suite_db())
+            .await
+    }
+
+    /// [`Caps::repair`] and [`Caps::repair_jobs`] for workspace `open` (read-write only), once
+    /// its jobs are recovered and before its usage rows are.
     ///
     /// # Errors
     /// As [`Caps::repair`].
@@ -893,28 +992,71 @@ impl Caps {
         if open.access != Access::ReadWrite {
             return Ok(0);
         }
-        self.repair_scope(&open.ws.id, &open.state).await
+        let calls = self.repair_scope(&open.ws.id, &open.state).await?;
+        Ok(calls + self.repair_job_scope(&open.ws.id, &open.state).await?)
     }
 
-    async fn repair_scope(&self, workspace: &str, usage: &StateDb) -> Result<u32, ErrorBody> {
-        let (run, ws) = (self.run.clone(), workspace.to_string());
-        let held = self
-            .db()
+    /// The held reservations of a dead run whose owner starts with `prefix`, in `workspace`.
+    async fn left_held(
+        &self,
+        workspace: &str,
+        prefix: &str,
+    ) -> Result<Vec<Reservation>, ErrorBody> {
+        let (run, ws, like) = (
+            self.run.clone(),
+            workspace.to_string(),
+            format!("{prefix}\\_%"),
+        );
+        self.db()
             .call(move |conn| {
                 let read = || -> rusqlite::Result<Vec<Reservation>> {
                     conn.prepare(&format!(
                         "SELECT {COLUMNS} FROM cap_reservations
                          WHERE state = 'held' AND kept = 0 AND run <> ?1 AND workspace = ?2
-                           AND owner LIKE 'c\\_%' ESCAPE '\\'
+                           AND owner LIKE ?3 ESCAPE '\\'
                          ORDER BY created_ms, id"
                     ))?
-                    .query_map(params![run, ws], read_row)?
+                    .query_map(params![run, ws, like], read_row)?
                     .collect()
                 };
                 read().map_err(|e| sql(&e))
             })
             .await
-            .map_err(|e| state_unavailable(&e))?;
+            .map_err(|e| state_unavailable(&e))
+    }
+
+    /// A dead run's held job reservations (`j_…`), decided by the job's row in `jobs` once the
+    /// scope's jobs are recovered: a job that is gone, cancelled or failed releases it, unless it
+    /// was `interrupted` with external side effects (it may have been charged, so it stays held,
+    /// `kept`); one that succeeded settles it at the reserved amount; one still unfinished (an
+    /// `interrupted_unknown` job) keeps it until you resolve it.
+    async fn repair_job_scope(&self, workspace: &str, jobs: &StateDb) -> Result<u32, ErrorBody> {
+        let mut repaired = 0;
+        for r in self.left_held(workspace, "j").await? {
+            let row = crate::jobs::record::get(jobs, &r.owner)
+                .await
+                .map_err(|e| state_unavailable(&e))?;
+            match row {
+                Some(job) if !job.status.is_final() => continue,
+                Some(job) if job.status == JobStatus::Succeeded => {
+                    self.settle(&r.id, None, true).await?;
+                }
+                Some(job)
+                    if job.external_side_effects
+                        && job.substatus == Some(Substatus::Interrupted) =>
+                {
+                    tracing::warn!(reservation = %r.id, job_id = %job.job_id, "an interrupted job with external side effects may have been charged; its reservation stays held");
+                    self.keep(&r.id).await?;
+                }
+                _ => self.settle(&r.id, None, false).await?,
+            }
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    async fn repair_scope(&self, workspace: &str, usage: &StateDb) -> Result<u32, ErrorBody> {
+        let held = self.left_held(workspace, "c").await?;
         let mut repaired = 0;
         for r in held {
             let rows = record::of_reservation(usage, &r.id)
@@ -986,18 +1128,23 @@ impl Caps {
                 Some(p),
             ));
         }
-        let (display, at) = (s.display.as_str().to_string(), period.clone());
+        let (settings, date, at) = (s.clone(), self.today(), period.clone());
         let rows = self
             .db()
             .call(move |conn| {
                 let mut out = Vec::new();
+                let zero = Total {
+                    amount: Money::ZERO,
+                    complete: true,
+                };
                 for (cap, limit, provider) in caps {
                     let (settled, held) = if cap == PER_CALL_MAX {
-                        (Money::ZERO, Money::ZERO)
+                        (zero, zero)
                     } else {
                         (
-                            settled_total(conn, &at, &cap, &display).map_err(|e| sql(&e))?,
-                            held_total(conn, &at, &display, provider.as_deref())
+                            settled_total(conn, &settings, &date, &at, &cap)
+                                .map_err(|e| sql(&e))?,
+                            held_total(conn, &settings, &date, &at, provider.as_deref())
                                 .map_err(|e| sql(&e))?,
                         )
                     };
@@ -1010,7 +1157,9 @@ impl Caps {
         let caps = rows
             .into_iter()
             .map(|(cap, limit, settled, held)| {
-                let invalid = s.is_invalid(&cap);
+                // A part kept in another currency without a rate counts as exceeded too.
+                let invalid = s.is_invalid(&cap) || !settled.complete || !held.complete;
+                let (settled, held) = (settled.amount, held.amount);
                 let limit = if invalid {
                     Money::ZERO
                 } else {

@@ -118,11 +118,16 @@ struct Open {
     scope: Option<Arc<OpenWorkspace>>,
     call_id: String,
     record: Map<String, Value>,
+    /// A call's row under a cap reservation: once its line is in, the row stays (`logging`)
+    /// until stage 8 has settled the reservation from it.
+    settles_later: bool,
 }
 
 /// A usage line written whose row is still there (`logging`).
 pub(crate) struct Logged {
     id: String,
+    call_id: String,
+    settles_later: bool,
     db: Arc<StateDb>,
     seq: u64,
     /// The finished record, as the line has it.
@@ -155,6 +160,8 @@ pub struct Meter {
     failpoints: Arc<FailPoints>,
     run: String,
     open: Mutex<HashMap<String, Open>>,
+    /// Lines a call's tool finished itself under a reservation, waiting for stage 8.
+    awaiting: Mutex<HashMap<String, Vec<Logged>>>,
     /// Jobs whose handler recorded a draft of its own (they own their usage line).
     own: Mutex<HashSet<String>>,
 }
@@ -202,6 +209,7 @@ impl Meter {
             failpoints,
             run,
             open: Mutex::new(HashMap::new()),
+            awaiting: Mutex::new(HashMap::new()),
             own: Mutex::new(HashSet::new()),
         })
     }
@@ -262,6 +270,7 @@ impl Meter {
                 scope: ctx.workspace.clone(),
                 call_id: ctx.call_id.clone(),
                 record,
+                settles_later: ctx.reservation.is_some() && ctx.job_id.is_none(),
             },
         );
         Ok(id)
@@ -298,10 +307,22 @@ impl Meter {
         let logged = self
             .log_one(id, cost, cost_source, status, latency_ms)
             .await?;
-        if !logged.cut {
+        let seq = logged.seq;
+        if logged.cut {
+            return Ok(seq);
+        }
+        if logged.settles_later {
+            // A tool that finished its own line under a reservation: stage 8 settles at this
+            // line's cost, then removes the row; a crash first leaves the `logging` row, from
+            // which the next start settles it (never releases it).
+            lock(&self.awaiting)
+                .entry(logged.call_id.clone())
+                .or_default()
+                .push(logged);
+        } else {
             self.drop_row(&logged).await;
         }
-        Ok(logged.seq)
+        Ok(seq)
     }
 
     /// Row `id`'s line, with the outcome: the row becomes `logging`, the line is appended, and
@@ -317,6 +338,7 @@ impl Meter {
         let open = lock(&self.open)
             .remove(id)
             .ok_or_else(|| params_invalid(format!("{id} is not an open usage record")))?;
+        let (call_id, settles_later) = (open.call_id.clone(), open.settles_later);
         let mut r = open.record;
         record::finish(&mut r, cost, cost_source, status, latency_ms);
         let db = self.db(open.scope.as_ref());
@@ -333,6 +355,8 @@ impl Meter {
         };
         Ok(Logged {
             id: id.to_string(),
+            call_id,
+            settles_later,
             db,
             seq,
             record: r,
@@ -363,7 +387,10 @@ impl Meter {
             .map(|(id, o)| (id.clone(), record::est_cost(&o.record)))
             .collect();
         ids.sort();
-        let mut lines = CallLines::default();
+        let mut lines = CallLines {
+            logged: lock(&self.awaiting).remove(call_id).unwrap_or_default(),
+            cut: false,
+        };
         for (id, est) in ids {
             let logged = self.log_one(&id, est, "estimated", status, None).await?;
             lines.cut |= logged.cut;
