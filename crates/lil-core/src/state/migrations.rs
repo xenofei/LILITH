@@ -183,6 +183,58 @@ const USAGE_PENDING: &str = "CREATE TABLE usage_pending (
 );
 CREATE INDEX usage_pending_run ON usage_pending(run);";
 
+/// Suite migration 8: the caps (CORE-085–092, Appendix F "Caps and money in `suite.toml`").
+/// Only the suite `state.db` has them: it holds every reservation, from any workspace or none
+/// (CORE-087).
+/// - `cap_reservations`: one row per reservation `rv_<16 hex>`, made by core run `run` for
+///   `owner` (the call id `c_…`, then the job id `j_…` that took it over) in `workspace` (an id
+///   or `none`), in the local calendar month `period`. `amount_micros` is the estimate in its
+///   own `currency`; `rate_micros`/`rate_date` the exchange rate used (1 unit of `currency` is
+///   `rate_micros` display micro-units; `rate_date` is null for the display currency itself),
+///   and `display_micros` the reserved amount in `display_currency`. `allowed_by` is the
+///   confirmation that let it pass a cap once. `state` is `held` until it is `settled` (at
+///   `settled_micros`, display) or `released`; `kept` marks a held reservation whose call left a
+///   pending usage line at a crash (it stays held).
+/// - `cap_settled`: this machine's settled totals per period, cap (`monthly` for all money,
+///   `provider:<id>` per provider) and display currency.
+/// - `cap_alerts`: the alert levels already raised per period and cap (CORE-089).
+const CAPS: &str = "CREATE TABLE cap_reservations (
+    id TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    period TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    rate_micros INTEGER NOT NULL,
+    rate_date TEXT,
+    display_currency TEXT NOT NULL,
+    display_micros INTEGER NOT NULL,
+    allowed_by TEXT,
+    state TEXT NOT NULL CHECK (state IN ('held','settled','released')),
+    settled_micros INTEGER,
+    kept INTEGER NOT NULL DEFAULT 0,
+    created_ms INTEGER NOT NULL,
+    ended_ms INTEGER
+);
+CREATE INDEX cap_reservations_held ON cap_reservations(state, period);
+CREATE TABLE cap_settled (
+    period TEXT NOT NULL,
+    cap TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    settled_micros INTEGER NOT NULL,
+    PRIMARY KEY (period, cap, currency)
+);
+CREATE TABLE cap_alerts (
+    period TEXT NOT NULL,
+    cap TEXT NOT NULL,
+    threshold_pct INTEGER NOT NULL,
+    alerted_ms INTEGER NOT NULL,
+    PRIMARY KEY (period, cap, threshold_pct)
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -192,6 +244,7 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     OUTSIDE_PAID,
     CONFIRMATIONS,
     USAGE_PENDING,
+    CAPS,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
@@ -275,7 +328,7 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 7);
+        assert_eq!(SUITE_MIGRATIONS.len(), 8);
         assert_eq!(WORKSPACE_MIGRATIONS.len(), 7);
         assert_eq!(WORKSPACE_MIGRATIONS[5], HOLDS, "appended, never inserted");
         assert_eq!(
@@ -286,6 +339,7 @@ mod tests {
             WORKSPACE_MIGRATIONS[6], USAGE_PENDING,
             "appended, never inserted"
         );
+        assert_eq!(SUITE_MIGRATIONS[7], CAPS, "appended, never inserted");
     }
 
     #[test] // spec: CORE-115, ARCH-053

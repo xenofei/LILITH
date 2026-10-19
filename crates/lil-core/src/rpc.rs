@@ -22,7 +22,8 @@
 //!   (ARCH-031, APP-040), except `app/confirmations.list`, which `cli` may call too; protocol
 //!   1.1's `app/confirmations.list` and `app/confirmation.answer` go to the [`Confirm`]
 //!   (they need `confirmations.v1` or `caps.v1` in the shared capabilities, else
-//!   `caller.not_allowed`), and any other `app/*` method is -32601 for an app. `tools/list`
+//!   `caller.not_allowed`), `app/caps.set` goes to the [`Caps`] (it needs `caps.v1`, else
+//!   `caller.not_allowed`; CORE-008), and any other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   A verified `ui:*` session that can answer confirmations counts in the
 //!   [`crate::confirm::UiPresence`] while its connection is open; when it closes, its pending
@@ -88,6 +89,7 @@ use crate::confirm::{
 use crate::events::EventBus;
 use crate::identity::{EngineSession, EngineTokens, TrustedDirs, resolve_caller};
 use crate::lifecycle::{DrainReason, Lifecycle};
+use crate::meter::Caps;
 use crate::server::{ConnCtx, ConnObserver, Router};
 use crate::session::Session;
 use crate::tools::Dispatcher;
@@ -136,6 +138,8 @@ pub struct RpcRouter {
     /// The confirmations: the `app/*` methods, the apps that can answer, and the
     /// `tools/list` marker (`mcp_confirmation`).
     confirm: Arc<Confirm>,
+    /// The caps `app/caps.set` changes; `None`: the method is -32601.
+    caps: Option<Arc<Caps>>,
     /// Told when a session is established and when its connection ends.
     observers: Vec<Arc<dyn ConnObserver>>,
     /// Unit tests only: requests with this method panic (`CoreConfig::panic_on_method`).
@@ -173,10 +177,18 @@ impl RpcRouter {
             events,
             lifecycle,
             confirm,
+            caps: None,
             observers: Vec::new(),
             #[cfg(test)]
             panic_on_method: cfg.panic_on_method,
         }
+    }
+
+    /// Serves `app/caps.set` with `caps`.
+    #[must_use]
+    pub fn with_caps(mut self, caps: Arc<Caps>) -> RpcRouter {
+        self.caps = Some(caps);
+        self
     }
 
     /// Also tells `observer` about each session and each connection's end.
@@ -323,8 +335,9 @@ impl RpcRouter {
 
     /// An `app/*` method (module docs). A verified `ui:*` caller may call each; `cli` only
     /// `app/confirmations.list`; anyone else gets `caller.not_allowed`. Each needs
-    /// `confirmations.v1` or `caps.v1` in the session's shared capabilities, else
-    /// `caller.not_allowed`. One this core does not define is -32601 for an app.
+    /// `confirmations.v1` or `caps.v1` in the session's shared capabilities (`app/caps.set`:
+    /// `caps.v1`), else `caller.not_allowed`. One this core does not define is -32601 for an
+    /// app.
     async fn app(
         &self,
         conn: &ConnCtx,
@@ -350,6 +363,30 @@ impl RpcRouter {
             is_app || (m == app::CONFIRMATIONS_LIST && session.caller == CallerKind::Cli);
         if !may_call {
             return refuse(format!("{m} is for LILITH apps only."));
+        }
+        if m == app::CAPS_SET {
+            let Some(caps) = &self.caps else {
+                return not_found(id);
+            };
+            if !session
+                .capabilities
+                .iter()
+                .any(|c| c == app::CAPS_CAPABILITY)
+            {
+                return refuse(format!(
+                    "{m} needs the caps.v1 capability, and this session's core/hello did not offer it."
+                ));
+            }
+            let p: app::CapsSetParams = match parse_params(params) {
+                Ok(p) => p,
+                Err(error) => {
+                    return Response::Error {
+                        id: Some(id),
+                        error,
+                    };
+                }
+            };
+            return outcome(id, into_outcome(caps.set(session, p).await));
         }
         if !matches!(m, app::CONFIRMATIONS_LIST | app::CONFIRMATION_ANSWER) {
             return not_found(id);

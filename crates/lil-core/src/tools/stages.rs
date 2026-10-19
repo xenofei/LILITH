@@ -7,10 +7,12 @@
 //! nothing is reserved or settled, and [`WorkspaceRecord`] runs the Record stage (CORE-020).
 //! The core replaces the confirm stage with `crate::confirm::AgentConfirm` (plan 3, Task 14),
 //! which makes such a call `pending_confirmation` while it can be answered and decides what a
-//! retry with its token gets ([`ConfirmStage::on_replay`]).
+//! retry with its token gets ([`ConfirmStage::on_replay`]); it also asks when a cap would be
+//! passed, at stage 5 or when the reserve stage finds one passed after it
+//! ([`ConfirmStage::cap_needed`]). The estimate stage is [`ToolEstimates`] and the reserve stage
+//! the caps' (Task 16).
 //!
-//! [`BillingBasis`], [`ConfirmedVia`] and [`CapHit`] are the shapes the stage signatures need;
-//! Tasks 14–16 give them their behaviour.
+//! [`BillingBasis`], [`ConfirmedVia`] and [`CapHit`] are the shapes the stage signatures need.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -49,6 +51,21 @@ pub enum BillingBasis {
 }
 
 impl BillingBasis {
+    /// Every basis.
+    pub const ALL: [BillingBasis; 6] = [
+        BillingBasis::Payg,
+        BillingBasis::PrepaidCredits,
+        BillingBasis::SubscriptionQuota,
+        BillingBasis::FreeTier,
+        BillingBasis::Byok,
+        BillingBasis::Local,
+    ];
+
+    /// The basis of its wire name.
+    pub fn parse(s: &str) -> Option<BillingBasis> {
+        BillingBasis::ALL.into_iter().find(|b| b.wire() == s)
+    }
+
     /// `payg`, `prepaid_credits`, `subscription_quota`, `free_tier`, `byok`, `local`.
     pub fn wire(self) -> &'static str {
         match self {
@@ -208,6 +225,40 @@ pub enum ConfirmDecision {
     Failed(ErrorBody),
 }
 
+/// `cap.exceeded` (QA-016) for a call of `tool` that would pass `hits`: the caps, and the
+/// amounts as decimal strings in `data.caps`.
+pub fn cap_exceeded(tool: &str, hits: &[CapHit]) -> ErrorBody {
+    let names: Vec<&str> = hits.iter().map(|h| h.cap.as_str()).collect();
+    let mut error = ErrorBody::new(
+        &lil_protocol::codes::CAP_EXCEEDED,
+        format!(
+            "{tool} would pass the cap {}. Raise the cap or allow the call once in the LILITH app, or run the call where you can confirm it.",
+            names.join(", ")
+        ),
+        "",
+    );
+    error.data = Some(serde_json::json!({ "caps": cap_hits_json(hits) }));
+    error
+}
+
+/// `[{cap, limit, settled, held, estimate}]`, amounts as decimal strings in the display
+/// currency.
+pub fn cap_hits_json(hits: &[CapHit]) -> Value {
+    Value::Array(
+        hits.iter()
+            .map(|h| {
+                serde_json::json!({
+                    "cap": h.cap,
+                    "limit": h.limit.to_decimal_string(),
+                    "settled": h.settled.to_decimal_string(),
+                    "held": h.held.to_decimal_string(),
+                    "estimate": h.estimate.to_decimal_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// What the reserve stage did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReserveOutcome {
@@ -273,6 +324,20 @@ pub trait EstimateStage: Send + Sync {
 /// Stage 5: confirmations and caps.
 pub trait ConfirmStage: Send + Sync {
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision>;
+
+    /// The reserve stage found caps `hits` passed after this stage let the call through (another
+    /// call took the room meanwhile): what the call gets. A stage that can ask returns a
+    /// `pending_confirmation` covering the cap only (the call's safety confirmation, if any,
+    /// was already given); the default is `cap.exceeded`.
+    fn cap_needed<'a>(
+        &'a self,
+        i: ConfirmInput<'a>,
+        hits: Vec<CapHit>,
+    ) -> BoxFuture<'a, ConfirmDecision> {
+        Box::pin(std::future::ready(ConfirmDecision::CapExceeded(
+            cap_exceeded(&i.descriptor.name, &hits),
+        )))
+    }
 
     /// A retry found its idempotency row `idem` (in `db`) holding a stored
     /// `pending_confirmation`: what it gets ([`ReplayDecision`]). `None` replays the stored
@@ -456,6 +521,71 @@ impl SettingsStage for CascadeSettings {
             }
             Ok(settings)
         })
+    }
+}
+
+/// The plan-3 estimate stage (CORE-015 step 4, CORE-086). No plan-3 product tool calls a paid
+/// service (partner nodes are refused, the node install is free), so every tool is
+/// [`Estimate::Zero`] except the test channels' two paid ones:
+/// - `test.destructive {cost}`: `External {provider: "test", amount: cost, currency: <display>,
+///   basis: payg}`;
+/// - `test.meter_external {provider, amount, currency?, basis?}`: that external estimate, the
+///   currency defaulting to the display currency and the basis to `payg`.
+///
+/// Arguments that don't read give `Zero` (the tool refuses them). `display` gives the display
+/// currency of `suite.toml` now.
+pub struct ToolEstimates {
+    display: Arc<dyn Fn() -> Currency + Send + Sync>,
+}
+
+impl std::fmt::Debug for ToolEstimates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolEstimates").finish_non_exhaustive()
+    }
+}
+
+impl ToolEstimates {
+    pub fn new(display: Arc<dyn Fn() -> Currency + Send + Sync>) -> ToolEstimates {
+        ToolEstimates { display }
+    }
+}
+
+impl EstimateStage for ToolEstimates {
+    fn estimate(&self, d: &ToolDescriptor, args: &Value, _s: &Settings) -> Estimate {
+        let text = |k: &str| args.get(k).and_then(Value::as_str);
+        let money = |k: &str| text(k).and_then(|t| Money::parse_decimal(t).ok());
+        let (provider, amount, currency, basis) = match d.name.as_str() {
+            "test.destructive" => match money("cost") {
+                Some(amount) => ("test", amount, None, Some(BillingBasis::Payg)),
+                None => return Estimate::Zero,
+            },
+            "test.meter_external" => match (text("provider"), money("amount")) {
+                (Some(p), Some(amount)) => (
+                    p,
+                    amount,
+                    text("currency"),
+                    text("basis").map_or(Some(BillingBasis::Payg), BillingBasis::parse),
+                ),
+                _ => return Estimate::Zero,
+            },
+            _ => return Estimate::Zero,
+        };
+        let currency = match currency {
+            None => (self.display)(),
+            Some(c) => match Currency::parse(c) {
+                Ok(c) => c,
+                Err(_) => return Estimate::Zero,
+            },
+        };
+        match basis {
+            Some(basis) => Estimate::External {
+                provider: provider.to_string(),
+                amount,
+                currency,
+                basis,
+            },
+            None => Estimate::Zero,
+        }
     }
 }
 

@@ -16,8 +16,9 @@
 //!    `idempotency.conflict`, a running one `idempotency.in_progress`.
 //! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`,
 //!    `cap.exceeded`, or a `pending_confirmation` result), 6. **reserve** (under a fresh
-//!    call id `c_<16 hex>`; caps it finds passed are `cap.exceeded`): the
-//!    [`PipelineHooks`]. Before the settings, the Resolve stage's project part runs on the
+//!    call id `c_<16 hex>`; caps it finds passed after stage 5, because another call took the
+//!    room meanwhile, go back to the confirm stage, which asks for the cap only or answers
+//!    `cap.exceeded`, `ConfirmStage::cap_needed`): the [`PipelineHooks`]. Before the settings, the Resolve stage's project part runs on the
 //!    valid arguments (ARCH-088, ARCH-098): with a session workspace, `CallCtx::project` is
 //!    the `project` argument of a tool that declares one, else the session's active project,
 //!    else the workspace's `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
@@ -40,7 +41,9 @@
 //! retry whose row holds one asks the confirm stage ([`ConfirmStage::on_replay`]): approved, the
 //! row is taken back (`StateDb::idem_reclaim`: of concurrent retries exactly one gets it, the
 //! others are `idempotency.in_progress`) and stages 3–9 run with stage 5 satisfied for exactly
-//! the tool and arguments you approved, and the outcome is stored as usual; denied or expired,
+//! the tool and arguments you approved (an approval with the cap action `allow_once` lets the
+//! reservation pass the caps this once: the reserve stage gets the confirmation's id as
+//! `allow_once`), and the outcome is stored as usual; denied or expired,
 //! the key is released and the call is `confirm.denied` or `confirm.expired`; still pending,
 //! the same `pending_confirmation`.
 //!
@@ -668,31 +671,30 @@ impl Inner {
         };
         let estimate = hooks.estimate.estimate(d, &args, &settings);
         // 5. Confirm and caps. A confirmation you approved for this tool and these arguments
-        // satisfies it; one for another call (the call a `job.retry` runs again) goes on to
-        // that call.
+        // satisfies it (its `allow_once` lets the reservation pass the caps once); one for
+        // another call (the call a `job.retry` runs again) goes on to that call.
+        let confirm_input = ConfirmInput {
+            session,
+            descriptor: d,
+            estimate: &estimate,
+            args: &args,
+            idem,
+            workspace: workspace.as_deref(),
+            project: project.as_deref(),
+            retry: is_retry,
+            always_confirm,
+        };
         let (decision, passed_on) = match approved {
             Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => (
                 ConfirmDecision::Proceed {
                     confirmed_via: Some(a.confirmed_via),
-                    cap_override: None,
+                    cap_override: (a.cap_action.as_deref() == Some(ALLOW_ONCE))
+                        .then(|| a.confirmation_id.clone()),
                 },
                 None,
             ),
             other => {
-                let decision = hooks
-                    .confirm
-                    .check(ConfirmInput {
-                        session,
-                        descriptor: d,
-                        estimate: &estimate,
-                        args: &args,
-                        idem,
-                        workspace: workspace.as_deref(),
-                        project: project.as_deref(),
-                        retry: is_retry,
-                        always_confirm,
-                    })
-                    .await;
+                let decision = hooks.confirm.check(confirm_input).await;
                 (decision, other)
             }
         };
@@ -701,24 +703,7 @@ impl Inner {
                 confirmed_via,
                 cap_override,
             } => (confirmed_via, cap_override),
-            ConfirmDecision::Pending(pending) => {
-                return (Outcome::PendingConfirmation(pending), None);
-            }
-            ConfirmDecision::Unavailable => {
-                let error = ErrorBody::new(
-                    &codes::CONFIRM_UNAVAILABLE,
-                    format!(
-                        "{} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app.",
-                        d.name
-                    ),
-                    trace_id,
-                );
-                return (Outcome::Error { error }, None);
-            }
-            ConfirmDecision::CapExceeded(mut error) | ConfirmDecision::Failed(mut error) => {
-                error.trace_id = trace_id.to_string();
-                return (Outcome::Error { error }, None);
-            }
+            other => return (refused(other, &d.name, trace_id), None),
         };
         // 6. Reserve.
         let call_id = self.ids.id("c");
@@ -735,14 +720,10 @@ impl Inner {
         let reservation = match reserved {
             Ok(ReserveOutcome::None) => None,
             Ok(ReserveOutcome::Reserved(id)) => Some(id),
+            // Another call took the room after stage 5: the confirm stage asks for the cap only.
             Ok(ReserveOutcome::NeedsCap(hits)) => {
-                let caps: Vec<&str> = hits.iter().map(|h| h.cap.as_str()).collect();
-                let error = ErrorBody::new(
-                    &codes::CAP_EXCEEDED,
-                    format!("{} would pass the cap {}.", d.name, caps.join(", ")),
-                    trace_id,
-                );
-                return (Outcome::Error { error }, None);
+                let decision = hooks.confirm.cap_needed(confirm_input, hits).await;
+                return (refused(decision, &d.name, trace_id), None);
             }
             Err(mut error) => {
                 error.trace_id = trace_id.to_string();
@@ -1026,6 +1007,39 @@ enum Resumed {
     Run(Box<(Claim, Approval)>),
     /// It is answered already. Boxed, as [`Begun::Done`].
     Done(Box<Outcome<ToolOutput>>),
+}
+
+/// The cap action that lets a call pass the caps once.
+const ALLOW_ONCE: &str = "allow_once";
+
+/// The outcome of a call stage 5 did not let run (a `Proceed` here is a stage's bug: the call
+/// is refused, failing closed).
+fn refused(decision: ConfirmDecision, tool: &str, trace_id: &str) -> Outcome<ToolOutput> {
+    match decision {
+        ConfirmDecision::Pending(pending) => Outcome::PendingConfirmation(pending),
+        ConfirmDecision::Unavailable => Outcome::Error {
+            error: ErrorBody::new(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "{tool} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app."
+                ),
+                trace_id,
+            ),
+        },
+        ConfirmDecision::CapExceeded(mut error) | ConfirmDecision::Failed(mut error) => {
+            error.trace_id = trace_id.to_string();
+            Outcome::Error { error }
+        }
+        ConfirmDecision::Proceed { .. } => Outcome::Error {
+            error: ErrorBody::new(
+                &codes::CORE_BUG,
+                format!(
+                    "The confirm stage let {tool} run after a cap was passed. This is a bug in LILITH."
+                ),
+                trace_id,
+            ),
+        },
+    }
 }
 
 /// The idempotency hash of a call of `name` with `args`.

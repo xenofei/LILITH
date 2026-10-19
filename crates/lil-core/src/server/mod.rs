@@ -34,6 +34,11 @@
 //!   jobs' first completion; it registers `usage.summary` (and `test.meter_external` on test
 //!   channels), and turns the usage rows a dead core left into `pending` lines: the suite's
 //!   before the core serves, the default workspace's once it opens.
+//! - The caps ([`crate::meter::Caps`]) are stage 5's cap half (through [`Confirm`]), the reserve
+//!   stage, the settle after stage 8's usage lines, the jobs' second completion and their
+//!   reservation hand-over, `caps.get` and the router's `app/caps.set`. A dead core's held
+//!   reservations are repaired before the meter's recovery of the same scope: the suite's
+//!   before the core serves, the default workspace's once it opens.
 //! - The engines ([`crate::engines`]) are built once the dispatcher's jobs exist (their tools
 //!   find them through a slot filled before the core serves). They register the node-install
 //!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
@@ -68,7 +73,7 @@ use crate::events::EventBus;
 use crate::interchange::{Interchange, register_interchange_tools};
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
-use crate::meter::{Meter, MeterSettle, register_meter_tools};
+use crate::meter::{Caps, Meter, MeterSettle, register_caps_tools, register_meter_tools};
 use crate::projects::ActiveProjects;
 use crate::resources::{Resources, register_resource_tools, spawn_personal_maintenance};
 use crate::rpc::RpcRouter;
@@ -77,8 +82,8 @@ use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
-    Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry, register_hw_tick,
-    register_telemetry_tools,
+    Dispatcher, PipelineHooks, TestGates, TestJobHandler, ToolEstimates, core_registry,
+    register_hw_tick, register_telemetry_tools,
 };
 use crate::workspace::WorkspaceHub;
 
@@ -487,6 +492,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.failpoints.clone(),
     );
     register_meter_tools(&mut registry, &meter, cfg.test_tools);
+    // The caps (CORE-085–092): stage 5's cap half, the reserve stage, the settles, `caps.get`
+    // and `app/caps.set`.
+    let caps = Caps::new(
+        state.clone(),
+        cfg.env.clone(),
+        cfg.clock.clone(),
+        events.clone(),
+        cfg.failpoints.clone(),
+        cfg.ids.clone(),
+    );
+    register_caps_tools(&mut registry, &caps);
     // The holds and the handler registry follow the connections (see `ConnObserver`).
     let holds = Holds::new(cfg.clock.clone());
     register_doc_tools(&mut registry, &holds);
@@ -517,6 +533,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         MCP_CONFIRMATION,
         cfg.failpoints.clone(),
     );
+    confirm.set_caps(caps.clone());
     match confirm.load(state.suite()).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "pending confirmations of an earlier core run"),
@@ -524,9 +541,15 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             tracing::error!(error = %e, "the pending confirmations could not be read; a retry with its token finds each")
         }
     }
+    let display = {
+        let caps = caps.clone();
+        Arc::new(move || caps.display_currency())
+    };
     let hooks = PipelineHooks {
+        estimate: Arc::new(ToolEstimates::new(display)),
         confirm: AgentConfirm::new(confirm.clone()),
-        meter: Arc::new(MeterSettle::new(meter.clone())),
+        reserve: caps.clone(),
+        meter: Arc::new(MeterSettle::new(meter.clone()).with_caps(caps.clone())),
         ..PipelineHooks::plan2()
     };
     // The Libraries: the personal scope's folder and its trash, purged in the background.
@@ -587,9 +610,23 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }));
     jobs.stop_on_drain(lifecycle.drain_token());
-    // Completions (Meter, then Task 16's Caps) are added before the recovery: it runs them for
-    // jobs that never started.
+    // Completions (Meter, then Caps) and the reservation hand-over are set before the recovery:
+    // it runs the completions of jobs that never started.
     jobs.add_completion(meter.clone());
+    jobs.add_completion(caps.clone());
+    jobs.set_reservations(caps.clone());
+    // A dead core's held reservations, decided by its calls' usage rows before the meter's
+    // recovery removes them (CORE-088).
+    match caps.repair().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            count = n,
+            "cap reservations of an earlier core run were repaired"
+        ),
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the cap reservations could not be repaired; they stay held until the next start")
+        }
+    }
     // Usage rows a dead core left become `pending` lines (CORE-071).
     match meter.recover().await {
         Ok(0) => {}
@@ -623,6 +660,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
     let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
+        .with_caps(caps.clone())
         .with_observer(holds)
         .with_observer(interchange);
     if cfg.test_tools {
@@ -644,6 +682,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         let confirm = confirm.clone();
         let models = models.clone();
         let meter = meter.clone();
+        let caps = caps.clone();
         tokio::spawn(async move {
             match hub.open(&ws).await {
                 Err(e) => {
@@ -652,6 +691,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                 Ok(open) => {
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
+                    }
+                    if let Err(e) = caps.repair_workspace(&open).await {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's cap reservations could not be repaired; they stay held");
                     }
                     if let Err(e) = meter.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's pending usage rows could not be recovered; the next start tries again");

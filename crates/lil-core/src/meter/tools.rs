@@ -1,7 +1,7 @@
 //! The meter's tools (Appendix F "Product tools"; QA1 I3: they live here, not in `tools`, which
-//! never names a `meter` item): `usage.summary` (module `meter`), and on test channels
-//! `test.meter_external` (module `test`), an external call to a fake provider through the
-//! pipeline's estimate, caps (Task 16), write-ahead and settle.
+//! never names a `meter` item): `usage.summary` and `caps.get` (module `meter`; no tool changes
+//! the caps, CORE-008), and on test channels `test.meter_external` (module `test`), an external
+//! call to a fake provider through the pipeline's estimate, caps, write-ahead and settle.
 //!
 //! `test.meter_external` begins its write-ahead row and leaves it pending; stage 8 finishes it
 //! at its estimate with the call's status (`failed` with `fail: true`). Its result is the row's
@@ -15,6 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::caps::Caps;
 use super::{Attribution, METER_MODULE, Meter, SummaryQuery, UsageCtx, UsageDraft, UsageStatus};
 use crate::tools::stages::BillingBasis;
 use crate::tools::{Registry, TEST_MODULE, typed_tool};
@@ -33,6 +34,38 @@ const EXTERNAL_DESCRIPTION: &str = "Test channels: an external call to a fake pr
     `provider` costing `amount` (a decimal string) in `currency` (default: the display \
     currency) on `basis` (default payg). It writes its pending usage record before the call and \
     leaves it for the meter stage to settle; `fail` makes the call fail.";
+
+const CAPS_DESCRIPTION: &str = "The spending caps of this machine for the current local     calendar month (`period`, YYYY-MM), in the display currency: each cap set (`monthly`,     `per_call_max`, `provider:<id>`) with its `limit`, the money `settled` and `held` by calls     still running this month, and `ratio_permille` of the limit used. A cap marked `invalid`     doesn't parse in suite.toml and counts as exceeded. Caps are optional and only you change     them, in the LILITH app; no tool can.";
+
+/// `caps.get`'s arguments: none.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
+/// Registers `caps.get` (module `meter`).
+pub fn register_caps_tools(reg: &mut Registry, caps: &Arc<Caps>) {
+    let caps = caps.clone();
+    reg.register(typed_tool(
+        "caps.get",
+        CAPS_DESCRIPTION,
+        EffectClass::Read,
+        METER_MODULE,
+        move |ctx, _args: NoArgs| {
+            let caps = caps.clone();
+            Box::pin(async move {
+                let view = caps.view().await.map_err(|mut e| {
+                    e.trace_id.clone_from(&ctx.trace_id);
+                    e
+                })?;
+                let text = match view.caps.len() {
+                    0 => "no caps are set".to_string(),
+                    n => format!("{n} caps for {}", view.period),
+                };
+                Ok((view, text))
+            })
+        },
+    ));
+}
 
 /// `test.meter_external`'s arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -53,19 +86,6 @@ struct ExternalArgs {
 #[derive(Debug, Serialize, JsonSchema)]
 struct ExternalResult {
     usage_id: String,
-}
-
-fn basis(s: &str) -> Option<BillingBasis> {
-    [
-        BillingBasis::Payg,
-        BillingBasis::PrepaidCredits,
-        BillingBasis::SubscriptionQuota,
-        BillingBasis::FreeTier,
-        BillingBasis::Byok,
-        BillingBasis::Local,
-    ]
-    .into_iter()
-    .find(|b| b.wire() == s)
 }
 
 /// Registers `usage.summary`, and `test.meter_external` when `test_tools`.
@@ -115,9 +135,8 @@ pub fn register_meter_tools(reg: &mut Registry, meter: &Arc<Meter>, test_tools: 
                 };
                 let basis = match args.basis.as_deref() {
                     None => BillingBasis::Payg,
-                    Some(b) => {
-                        basis(b).ok_or_else(|| invalid(format!("{b:?} is not a billing basis")))?
-                    }
+                    Some(b) => BillingBasis::parse(b)
+                        .ok_or_else(|| invalid(format!("{b:?} is not a billing basis")))?,
                 };
                 let text = format!("{} {} from {}", args.amount, currency, args.provider);
                 let mut units = serde_json::Map::new();

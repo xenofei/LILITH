@@ -37,7 +37,7 @@ pub use stages::{
     Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput, ConfirmStage,
     ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks, RecordStage,
     ReplayDecision, ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings,
-    SettingsInput, SettingsStage, SettleInput,
+    SettingsInput, SettingsStage, SettleInput, ToolEstimates, cap_exceeded, cap_hits_json,
 };
 pub use telemetry_tools::register_telemetry_tools;
 pub use test_tools::{

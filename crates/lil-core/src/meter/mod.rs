@@ -12,10 +12,13 @@
 //!   ([`Meter::recover`] for the suite scope, [`Meter::recover_workspace`] when a workspace
 //!   opens) a `pending` row becomes a `status: "pending"` line; a `logging` row's line is looked
 //!   for in the log first, and written only if it is not there, so a crash between the line and
-//!   the row's removal never gives two lines. Reservations are Caps' (Task 16): the meter
-//!   neither keeps nor releases one.
+//!   the row's removal never gives two lines. Reservations are [`caps::Caps`']: the meter
+//!   neither keeps nor releases one, and the caps' repair reads a dead call's rows before the
+//!   meter's recovery removes them.
 //! - **Inline calls** (stage 8, [`stage::MeterSettle`]). A tool that leaves its row pending
-//!   gets it finished by [`Meter::finish_call`] at its estimate, with the call's status.
+//!   gets it finished at its estimate, with the call's status: its line first, then the call's
+//!   reservation is settled, and only then is the row removed, so a crash in between leaves a
+//!   `logging` row from which the next start settles the reservation once.
 //! - **Jobs** ([`JobCompletion`]). A job that reported execution windows gets its energy
 //!   attributed ([`attribution::attribute`]) and written with `Telemetry::put_job_energy`, and
 //!   one local-work line (`billing_basis: "local"`, `cost: "0"`, its energy, and its energy
@@ -24,12 +27,14 @@
 //!   own draft through [`UsageSink`] (the node install) owns its usage line, so it gets none
 //!   from here (QA1 I5). An `interrupted_unknown` engine job you resolved gets a `cancelled`
 //!   line, with its energy when this core run saw its windows, else without. A job that never
-//!   started gets neither. The completion never settles a reservation: only Caps' does
-//!   (Task 16). The set of jobs that own their line is in memory: an entry goes at the job's
+//!   started gets neither. The completion never settles a reservation: only Caps' does.
+//!   The set of jobs that own their line is in memory: an entry goes at the job's
 //!   completion (for an `interrupted_unknown` job, when you resolve it), and with the core.
 //! - **Summaries** ([`summary`], `usage.summary`).
 
 pub mod attribution;
+pub mod caps;
+pub mod caps_settings;
 pub mod record;
 pub mod sink;
 pub mod stage;
@@ -49,10 +54,12 @@ use lil_schema::money::{Currency, Money};
 use serde_json::{Map, Value, json};
 
 pub use attribution::attribute;
+pub use caps::{CapCheck, Caps, Reservation, ReservationState, ReserveFor};
+pub use caps_settings::CapsSettings;
 pub use sink::{Attribution, PendingUsage, UsageCtx, UsageDraft, UsageSink, UsageStatus};
 pub use stage::MeterSettle;
 pub use summary::{MoneySettings, SummaryQuery};
-pub use tools::register_meter_tools;
+pub use tools::{register_caps_tools, register_meter_tools};
 
 use self::record::PendingRow;
 use self::summary::{Period, Range};
@@ -111,6 +118,26 @@ struct Open {
     scope: Option<Arc<OpenWorkspace>>,
     call_id: String,
     record: Map<String, Value>,
+}
+
+/// A usage line written whose row is still there (`logging`).
+pub(crate) struct Logged {
+    id: String,
+    db: Arc<StateDb>,
+    seq: u64,
+    /// The finished record, as the line has it.
+    pub(crate) record: Map<String, Value>,
+    /// `meter.after_usage_line` fired: as a crash right after the line, nothing more happens
+    /// (no settle, the row stays for the next start).
+    cut: bool,
+}
+
+/// The lines [`Meter::log_call`] wrote for one call.
+#[derive(Default)]
+pub(crate) struct CallLines {
+    pub(crate) logged: Vec<Logged>,
+    /// A fail point cut the settle short (as a crash would).
+    pub(crate) cut: bool,
 }
 
 /// Every core run's own id: rows of another run were left by a dead core.
@@ -268,6 +295,25 @@ impl Meter {
         status: &str,
         latency_ms: Option<u64>,
     ) -> Result<u64, ErrorBody> {
+        let logged = self
+            .log_one(id, cost, cost_source, status, latency_ms)
+            .await?;
+        if !logged.cut {
+            self.drop_row(&logged).await;
+        }
+        Ok(logged.seq)
+    }
+
+    /// Row `id`'s line, with the outcome: the row becomes `logging`, the line is appended, and
+    /// `meter.after_usage_line` fires. The row stays (see [`Logged::cut`]).
+    async fn log_one(
+        &self,
+        id: &str,
+        cost: Option<(Money, Currency)>,
+        cost_source: &str,
+        status: &str,
+        latency_ms: Option<u64>,
+    ) -> Result<Logged, ErrorBody> {
         let open = lock(&self.open)
             .remove(id)
             .ok_or_else(|| params_invalid(format!("{id} is not an open usage record")))?;
@@ -277,15 +323,60 @@ impl Meter {
         record::mark_logging(&db, id, &r, self.now_ms())
             .await
             .map_err(|e| state_error(&e))?;
-        let seq = self.append(open.scope.as_ref(), r).await?;
-        if let Err(e) = self.failpoints.hit("meter.after_usage_line") {
-            tracing::warn!(usage_id = id, error = %e, "meter.after_usage_line: the row stays for the next start");
-            return Ok(seq);
+        let seq = self.append(open.scope.as_ref(), r.clone()).await?;
+        let cut = match self.failpoints.hit("meter.after_usage_line") {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!(usage_id = id, error = %e, "meter.after_usage_line: the row stays for the next start");
+                true
+            }
+        };
+        Ok(Logged {
+            id: id.to_string(),
+            db,
+            seq,
+            record: r,
+            cut,
+        })
+    }
+
+    /// Removes a logged row: its line is in.
+    async fn drop_row(&self, logged: &Logged) {
+        if let Err(e) = record::delete(&logged.db, &logged.id).await {
+            tracing::warn!(usage_id = %logged.id, error = %e, "a settled usage row could not be removed; the next start finds its line");
         }
-        if let Err(e) = record::delete(&db, id).await {
-            tracing::warn!(usage_id = id, error = %e, "a settled usage row could not be removed; the next start finds its line");
+    }
+
+    /// The lines of call `call_id`'s still-pending rows, at their estimates with `status`
+    /// (stage 8); the rows stay until [`Meter::drop_logged`].
+    ///
+    /// # Errors
+    /// As [`Meter::finish`]; rows logged before the error stay for the next start.
+    pub(crate) async fn log_call(
+        &self,
+        call_id: &str,
+        status: &str,
+    ) -> Result<CallLines, ErrorBody> {
+        let mut ids: Vec<(String, Option<(Money, Currency)>)> = lock(&self.open)
+            .iter()
+            .filter(|(_, o)| o.call_id == call_id)
+            .map(|(id, o)| (id.clone(), record::est_cost(&o.record)))
+            .collect();
+        ids.sort();
+        let mut lines = CallLines::default();
+        for (id, est) in ids {
+            let logged = self.log_one(&id, est, "estimated", status, None).await?;
+            lines.cut |= logged.cut;
+            lines.logged.push(logged);
         }
-        Ok(seq)
+        Ok(lines)
+    }
+
+    /// Removes the rows of `lines`: their lines are in and their reservation is settled.
+    pub(crate) async fn drop_logged(&self, lines: &CallLines) {
+        for logged in &lines.logged {
+            self.drop_row(logged).await;
+        }
     }
 
     /// Finishes call `call_id`'s still-pending rows at their estimates (`cost_source:
@@ -295,20 +386,11 @@ impl Meter {
     /// # Errors
     /// As [`Meter::finish`].
     pub async fn finish_call(&self, call_id: &str, status: &str) -> Result<Option<u64>, ErrorBody> {
-        let mut ids: Vec<(String, Option<(Money, Currency)>)> = lock(&self.open)
-            .iter()
-            .filter(|(_, o)| o.call_id == call_id)
-            .map(|(id, o)| (id.clone(), record::est_cost(&o.record)))
-            .collect();
-        ids.sort();
-        let mut last = None;
-        for (id, est) in ids {
-            last = Some(
-                self.finish_with(&id, est, "estimated", status, None)
-                    .await?,
-            );
+        let lines = self.log_call(call_id, status).await?;
+        if !lines.cut {
+            self.drop_logged(&lines).await;
         }
-        Ok(last)
+        Ok(lines.logged.last().map(|l| l.seq))
     }
 
     /// Drops row `id` (begun by this core) whose request was never sent: no line.

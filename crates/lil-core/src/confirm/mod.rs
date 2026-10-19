@@ -3,7 +3,14 @@
 //! that run an approved call.
 //!
 //! - **Who is asked.** An agent's (`assistant`, `mcp`, `cli`) call of a `destructive` or `exec`
-//!   tool ([`AgentConfirm`], stage 5). Your own actions in an app never ask (CORE-109).
+//!   tool ([`AgentConfirm`], stage 5). Your own actions in an app never ask (CORE-109), except
+//!   when a cap would be passed: any caller's call that would pass a cap asks about the cap
+//!   (CORE-091, APP-054), and one call that needs both gets one confirmation covering
+//!   `["confirm", "cap"]` (CORE-015 step 5, APP-045).
+//! - **Cap answers** ([`Confirm::answer`]). Approving a confirmation that covers a cap takes a
+//!   cap action: `allow_once` lets that one call (or `job.retry`) pass the caps once, and never
+//!   changes them; `raise` sets the cap `raise_to` names through [`Caps::set`] first (your
+//!   verified app's own caps change, CORE-008). Denying it is the cancel.
 //! - **When it can be answered** ([`Confirm::answerable`]): while a verified `ui:*` connection
 //!   whose shared capabilities hold `confirmations.v1` or `caps.v1` is open ([`UiPresence`]),
 //!   or the notification path can reach you (plan 4; [`NoNotificationPath`] until then).
@@ -52,7 +59,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use lil_platform::{Clock, IdSource};
 use lil_protocol::app::{
-    Answer, CONFIRMATION_CAPABILITIES, ConfirmationAnswerParams, ConfirmationView,
+    Answer, CONFIRMATION_CAPABILITIES, CapAction, CapsSetParams, ConfirmationAnswerParams,
+    ConfirmationView, RaiseTo,
 };
 use lil_protocol::{
     CallerKind, CodeSpec, Cover, EffectClass, ErrorBody, NO_WORKSPACE, PendingConfirmation,
@@ -62,11 +70,12 @@ use serde_json::{Value, json};
 
 use crate::events::EventBus;
 use crate::lifecycle::IdleBlocker;
+use crate::meter::Caps;
 use crate::session::Session;
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::FailPoints;
 pub use crate::tools::ConfirmedVia;
-use crate::tools::{CapHit, IdemRef};
+use crate::tools::{CapHit, IdemRef, cap_hits_json};
 
 /// The event topic of the confirmations.
 pub const CONFIRMATIONS_TOPIC: &str = "confirmations";
@@ -314,6 +323,8 @@ pub struct Confirm {
     mcp: McpConfirmation,
     failpoints: Arc<FailPoints>,
     pending: Mutex<HashMap<String, Tracked>>,
+    /// The caps: stage 5's cap half and a cap answer's `raise`.
+    caps: std::sync::OnceLock<Arc<Caps>>,
 }
 
 impl std::fmt::Debug for Confirm {
@@ -352,7 +363,19 @@ impl Confirm {
             mcp,
             failpoints,
             pending: Mutex::new(HashMap::new()),
+            caps: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The caps the confirm stage checks and a cap answer raises (once; a second call is
+    /// ignored).
+    pub fn set_caps(&self, caps: Arc<Caps>) {
+        let _ = self.caps.set(caps);
+    }
+
+    /// The caps, once set.
+    pub fn caps(&self) -> Option<&Arc<Caps>> {
+        self.caps.get()
     }
 
     /// `mcp_confirmation`.
@@ -436,7 +459,7 @@ impl Confirm {
             arguments: r.arguments,
             caller_kind: r.caller_kind,
             covers: ordered(r.covers),
-            cap: r.cap.as_deref().map(caps_json),
+            cap: r.cap.as_deref().map(cap_hits_json),
             state,
             confirmed_via: answered.then_some(ConfirmedVia::ClaudeCode),
             created_utc: now,
@@ -565,10 +588,15 @@ impl Confirm {
     /// answer ([`can_answer`]): the row after the answer, published as `answered` (after the
     /// `confirm.after_answer` fail point).
     ///
+    /// An approval of a confirmation that covers a cap needs a cap action (module docs, "Cap
+    /// answers"); `raise` changes the cap before the answer is recorded.
+    ///
     /// # Errors
     /// `caller.not_allowed` for any other session; `confirm.unknown`; `confirm.expired` for one
     /// that expired or was cancelled; `confirm.already_answered`; `params.invalid` for a cap
-    /// action on a confirmation that covers no cap; `state.unavailable`.
+    /// action on a confirmation that covers no cap, an approval of a cap without one, or a
+    /// `raise` without a valid `raise_to`; the caps' errors for a `raise` (`caps.invalid`, the
+    /// store's); `state.unavailable`.
     pub async fn answer(
         &self,
         by: &Session,
@@ -621,6 +649,40 @@ impl Confirm {
         };
         if row.state != ConfState::Pending {
             return Err(ended(&row));
+        }
+        if p.answer == Answer::Approve && row.covers.contains(&Cover::Cap) {
+            let Some(cap) = &p.cap else {
+                return Err(fail(
+                    &codes::PARAMS_INVALID,
+                    format!(
+                        "Confirmation {id} is about a cap: approve it with cap.action allow_once or raise, or deny it."
+                    ),
+                ));
+            };
+            if cap.action == CapAction::Raise {
+                let raise = cap
+                    .raise_to
+                    .as_ref()
+                    .and_then(raise_params)
+                    .ok_or_else(|| {
+                        fail(
+                            &codes::PARAMS_INVALID,
+                            format!(
+                                "Raising a cap of confirmation {id} needs raise_to {{cap, amount}}, with cap monthly, per_call_max or provider:<id>."
+                            ),
+                        )
+                    })?;
+                let Some(caps) = self.caps() else {
+                    return Err(fail(
+                        &codes::CORE_BUG,
+                        "The caps are not set up in this core. This is a bug in LILITH.".into(),
+                    ));
+                };
+                caps.set(by, raise).await.map_err(|mut e| {
+                    e.trace_id.clone_from(&trace_id);
+                    e
+                })?;
+            }
         }
         let state = match p.answer {
             Answer::Approve => ConfState::Approved,
@@ -831,20 +893,29 @@ fn ordered(covers: Vec<Cover>) -> Vec<Cover> {
         .collect()
 }
 
-/// The JSON of the caps a call would pass: `[{cap, limit, settled, held, estimate}]`, amounts
-/// as decimal strings in the display currency.
-fn caps_json(hits: &[CapHit]) -> Value {
-    Value::Array(
-        hits.iter()
-            .map(|h| {
-                json!({
-                    "cap": h.cap,
-                    "limit": h.limit.to_decimal_string(),
-                    "settled": h.settled.to_decimal_string(),
-                    "held": h.held.to_decimal_string(),
-                    "estimate": h.estimate.to_decimal_string(),
-                })
-            })
-            .collect(),
-    )
+/// The `app/caps.set` change a cap answer's `raise_to` stands for, or `None` for a cap name
+/// that isn't `monthly`, `per_call_max` or `provider:<id>`.
+fn raise_params(to: &RaiseTo) -> Option<CapsSetParams> {
+    let amount = Some(Some(to.amount.clone()));
+    Some(match to.cap.as_str() {
+        "monthly" => CapsSetParams {
+            monthly: amount,
+            ..CapsSetParams::default()
+        },
+        "per_call_max" => CapsSetParams {
+            per_call_max: amount,
+            ..CapsSetParams::default()
+        },
+        other => {
+            let provider = other.strip_prefix("provider:").filter(|p| !p.is_empty())?;
+            CapsSetParams {
+                provider_monthly: Some(
+                    [(provider.to_string(), Some(to.amount.clone()))]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..CapsSetParams::default()
+            }
+        }
+    })
 }

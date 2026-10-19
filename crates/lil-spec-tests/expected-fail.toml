@@ -6,25 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 16
-    # CORE-091, APP-045
-    { name = "lil-spec-tests::caps_meter::cap_prompt_covers_the_cap_and_allow_once_runs_it", rule = "CORE-091", file = "tests/caps_meter.rs" },
-    # CORE-015, ARCH-056
-    { name = "lil-spec-tests::caps_meter::destructive_and_over_cap_share_one_prompt", rule = "CORE-015", file = "tests/caps_meter.rs" },
-    # QA-016, CORE-091
-    { name = "lil-spec-tests::caps_meter::non_interactive_over_cap_is_cap_exceeded", rule = "QA-016", file = "tests/caps_meter.rs" },
-    # CORE-008, ARCH-056
-    { name = "lil-spec-tests::caps_meter::only_the_app_changes_caps", rule = "CORE-008", file = "tests/caps_meter.rs" },
-    # CORE-087, QA-047, QA-056
-    { name = "lil-spec-tests::caps_meter::concurrent_calls_never_overshoot_a_cap", rule = "CORE-087", file = "tests/caps_meter.rs" },
-    # CORE-089
-    { name = "lil-spec-tests::caps_meter::cap_alerts_fire_once_per_level", rule = "CORE-089", file = "tests/caps_meter.rs" },
-    # CORE-090
-    { name = "lil-spec-tests::caps_meter::subscription_quota_never_counts_against_money_caps", rule = "CORE-090", file = "tests/caps_meter.rs" },
-    # CORE-071, CORE-088
-    { name = "lil-spec-tests::caps_meter::usage_is_written_ahead_and_survives_a_crash", rule = "CORE-071", file = "tests/caps_meter.rs" },
-    # ARCH-081, ARCH-099
-    { name = "lil-spec-tests::caps_meter::loose_calls_log_to_usage_loose_and_count_against_caps", rule = "ARCH-081", file = "tests/caps_meter.rs" },
     # Task 19
     # QA-002, CORE-091. Stays after Task 19: it calls test.meter_external (Task 15) over a
     # cap (Task 16); the MCP pending path itself is green in

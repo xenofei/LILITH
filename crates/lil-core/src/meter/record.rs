@@ -125,6 +125,16 @@ pub fn est_cost(r: &Map<String, Value>) -> Option<(Money, Currency)> {
     Some((m, c))
 }
 
+/// What a finished record cost: its `cost`, else its `est_cost`, in its `currency`.
+pub fn amount(r: &Map<String, Value>) -> Option<(Money, Currency)> {
+    let c = Currency::parse(r.get("currency")?.as_str()?).ok()?;
+    let text = r
+        .get("cost")
+        .and_then(Value::as_str)
+        .or_else(|| r.get("est_cost").and_then(Value::as_str))?;
+    Some((Money::parse_decimal(text).ok()?, c))
+}
+
 /// One `usage_pending` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingRow {
@@ -231,6 +241,25 @@ pub async fn left_by_others(db: &StateDb, run: &str) -> Result<Vec<PendingRow>, 
                  FROM usage_pending WHERE run <> ?1 ORDER BY created_ms, id",
             )?
             .query_map(params![run], read_row)?
+            .collect()
+        };
+        read().map_err(|e| sql(&e))
+    })
+    .await
+}
+
+/// The rows of calls (not jobs) made under cap reservation `rv`, oldest first.
+pub async fn of_reservation(db: &StateDb, rv: &str) -> Result<Vec<PendingRow>, StateError> {
+    let rv = rv.to_string();
+    db.call(move |conn| {
+        let read = || -> rusqlite::Result<Vec<PendingRow>> {
+            conn.prepare(
+                "SELECT id, run, call_id, job_id, reservation, record, state, created_ms,
+                     logging_ms
+                 FROM usage_pending WHERE reservation = ?1 AND job_id IS NULL
+                 ORDER BY created_ms, id",
+            )?
+            .query_map(params![rv], read_row)?
             .collect()
         };
         read().map_err(|e| sql(&e))

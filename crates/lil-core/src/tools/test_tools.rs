@@ -54,7 +54,7 @@
 //!
 //! `executions` counts the runs of that tool with that label or gate in this core, failed runs
 //! included; `count` counts `test.destructive`'s runs in this core. Its `cost` is read by the
-//! estimate stage once caps exist (plan 3 Task 16) and is otherwise unused. `test.emit` is
+//! estimate stage (`ToolEstimates`), so the call is reserved against the caps. `test.emit` is
 //! `read`: it changes no state, only publishes an event (so it needs no idempotency key); a
 //! topic that makes no valid name is `params.invalid`.
 
@@ -442,7 +442,7 @@ struct StatePanicResult {
 struct DestructiveArgs {
     /// What the call would cost, a decimal string in the display currency.
     #[serde(default)]
-    #[expect(dead_code, reason = "the estimate stage reads it (plan 3 Task 16)")]
+    #[expect(dead_code, reason = "the estimate stage reads it from the arguments")]
     cost: Option<String>,
 }
 

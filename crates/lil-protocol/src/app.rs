@@ -1,10 +1,11 @@
 //! The `app/*` methods of protocol 1.1 (APP-043; Appendix F "`app/*` methods"): the
-//! confirmation list and answer. `app/caps.set` (also 1.1) is defined with the caps (plan 3,
-//! Task 16).
+//! confirmation list and answer, and `app/caps.set` (CORE-008), whose result is the
+//! [`CapsView`] `caps.get` returns too.
 //!
 //! Every `app/*` method is for verified `ui:*` connections only, except the read-only
-//! `app/confirmations.list`, which `cli` may call too; each needs `confirmations.v1` or
-//! `caps.v1` in the session's shared capabilities. Params are parsed strictly: an unknown field
+//! `app/confirmations.list`, which `cli` may call too; the confirmation methods need
+//! `confirmations.v1` or `caps.v1` in the session's shared capabilities, and `app/caps.set`
+//! needs `caps.v1`. Params are parsed strictly: an unknown field
 //! is -32602 (a caller-supplied `confirm: true` is never accepted anywhere, CORE-111).
 
 use schemars::JsonSchema;
@@ -17,8 +18,14 @@ pub const CONFIRMATIONS_LIST: &str = "app/confirmations.list";
 /// `app/confirmation.answer`.
 pub const CONFIRMATION_ANSWER: &str = "app/confirmation.answer";
 
+/// `app/caps.set`.
+pub const CAPS_SET: &str = "app/caps.set";
+
 /// The capabilities an `app/*` confirmation method needs, any one of them.
 pub const CONFIRMATION_CAPABILITIES: &[&str] = &["confirmations.v1", "caps.v1"];
+
+/// The capability `app/caps.set` needs.
+pub const CAPS_CAPABILITY: &str = "caps.v1";
 
 /// The most confirmations one `app/confirmations.list` returns, and its default.
 pub const LIST_LIMIT_MAX: u32 = 500;
@@ -153,6 +160,63 @@ pub struct ConfirmationAnswerResult {
     pub confirmation: ConfirmationView,
 }
 
+/// A present field, `null` included: `Some(None)` for `null`, `Some(Some(v))` for a value (an
+/// absent field is `None` through `#[serde(default)]`).
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// `app/caps.set` params: `{monthly?, per_call_max?, provider_monthly?: {<provider>: amount |
+/// null}}`. Each amount is a decimal string in the display currency; an absent field is left
+/// as it is and `null` clears the cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapsSetParams {
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub monthly: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub per_call_max: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_monthly: Option<std::collections::BTreeMap<String, Option<String>>>,
+}
+
+/// One cap as `caps.get` and `app/caps.set` show it. Amounts are decimal strings in the
+/// display currency; `settled` and `held` are this period's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapRow {
+    /// `monthly`, `per_call_max` or `provider:<id>`.
+    pub cap: String,
+    pub limit: String,
+    pub settled: String,
+    pub held: String,
+    /// `(settled + held) × 1000 / limit`, rounded down.
+    pub ratio_permille: u64,
+    /// The value in `suite.toml` doesn't parse: the cap counts as exceeded (it fails closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid: Option<bool>,
+}
+
+/// `CapsView {display_currency, caps, period}` (Appendix F `caps.get`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapsView {
+    pub display_currency: String,
+    pub caps: Vec<CapRow>,
+    /// The local calendar month, `YYYY-MM`.
+    pub period: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +245,16 @@ mod tests {
         assert_eq!(answer.answer, Answer::Approve);
         assert_eq!(answer.cap.unwrap().action.wire(), "raise");
         // A caller-supplied `confirm: true` is an unknown field, never accepted (CORE-111).
+        let set: CapsSetParams = serde_json::from_value(
+            json!({"monthly": "5", "per_call_max": null, "provider_monthly": {"a": "1", "b": null}}),
+        )
+        .unwrap();
+        assert_eq!(set.monthly, Some(Some("5".into())));
+        assert_eq!(set.per_call_max, Some(None), "null clears");
+        assert_eq!(set.provider_monthly.unwrap()["b"], None);
+        let empty: CapsSetParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, CapsSetParams::default(), "absent leaves it as it is");
+        assert!(serde_json::from_value::<CapsSetParams>(json!({"monthly_usd": "5"})).is_err());
         for bad in [
             json!({"confirmation_id": "cf_1", "answer": "approve", "confirm": true}),
             json!({"confirmation_id": "cf_1", "answer": "yes"}),

@@ -158,6 +158,8 @@ pub fn schema_hash() -> String {
             schemars::schema_for!(crate::app::ConfirmationsListResult),
             schemars::schema_for!(crate::app::ConfirmationAnswerParams),
             schemars::schema_for!(crate::app::ConfirmationAnswerResult),
+            schemars::schema_for!(crate::app::CapsSetParams),
+            schemars::schema_for!(crate::app::CapsView),
         ];
         let all = serde_json::Value::Array(
             schemas
@@ -579,8 +581,9 @@ mod tests {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
         assert_eq!(h, schema_hash());
-        // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation).
-        assert_eq!(h, "bd5c5bac6bf5c159");
+        // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation)
+        // and `app/caps.set`'s params and `CapsView`.
+        assert_eq!(h, "99caa63ddb3964d5");
     }
 
     #[test] // spec: ARCH-029

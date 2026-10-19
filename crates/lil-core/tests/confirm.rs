@@ -1026,8 +1026,8 @@ fn app_methods_need_the_capability() {
     let mut app = TestApp::start(&env, None, &[]);
     let listed = app.call("app/confirmations.list", json!({"state": "history"}));
     assert_eq!(listed["result"]["status"], "ok", "{listed}");
-    let unknown = app.call("app/caps.set", json!({}));
-    assert_eq!(unknown["error"]["code"], -32601, "Task 16's: {unknown}");
+    let unknown = app.call("app/not.a.method", json!({}));
+    assert_eq!(unknown["error"]["code"], -32601, "{unknown}");
     let bad = app.call(
         "app/confirmations.list",
         json!({"state": "pending", "limit": 0}),
