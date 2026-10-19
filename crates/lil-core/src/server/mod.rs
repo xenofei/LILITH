@@ -64,8 +64,10 @@ use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::meter::LogSink;
 use crate::projects::ActiveProjects;
+use crate::resources::{Resources, register_resource_tools, spawn_personal_maintenance};
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
+use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
     Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry, register_hw_tick,
@@ -486,6 +488,18 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         confirm: AgentConfirm::new(confirm.clone()),
         ..PipelineHooks::plan2()
     };
+    // The Libraries: the personal scope's folder and its trash, purged in the background.
+    let personal = Arc::new(Personal::new(
+        cfg.env.data_dir().join("resources"),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        cfg.probe.clone(),
+    ));
+    register_resource_tools(
+        &mut registry,
+        &Arc::new(Resources::new(personal.clone(), cfg.clock.clone())),
+    );
+    spawn_personal_maintenance(personal);
     let dispatcher = Dispatcher::new(
         registry,
         hooks,

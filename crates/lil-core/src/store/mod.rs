@@ -7,6 +7,7 @@
 //! - [`versions`]: the per-asset version lock, sealed read-only versions and legacy folders;
 //! - [`trash`]: trash entries with restore records, the 30-day purge and rejected-run
 //!   retention;
+//! - [`personal`]: the personal resource folder and its own trash (`resources`);
 //! - [`logs`]: the locked per-machine monthly append logs;
 //! - [`staging`]: staging handles;
 //! - [`suite_toml`]: `suite.toml` writes (the core is the file's only writer, CORE-007);
@@ -27,6 +28,7 @@ pub mod git_gate;
 pub mod logs;
 pub mod order;
 pub mod paths;
+pub mod personal;
 pub mod staging;
 pub mod suite_toml;
 pub mod trash;
@@ -39,6 +41,7 @@ pub use git_gate::{GIT_WAIT, GitGate};
 pub use logs::{LogKind, append_loose_usage};
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
 pub use paths::{WsPath, path_key, writable};
+pub use personal::{Personal, list_files};
 pub use staging::{STAGING_DIR, StagingHandle};
 pub use suite_toml::register_workspace;
 pub use trash::{MaintenanceReport, REJECTED_KEEP_DAYS, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord};

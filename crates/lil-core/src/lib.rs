@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod meter;
 pub mod pipeline;
 pub mod projects;
+pub mod resources;
 pub mod rpc;
 pub mod server;
 pub mod session;

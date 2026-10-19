@@ -447,6 +447,11 @@ impl WorkspaceHub {
         &self.clock
     }
 
+    /// The core's id source.
+    pub fn ids(&self) -> &Arc<dyn IdSource> {
+        &self.ids
+    }
+
     /// The id of the default workspace, as last read from `suite.toml`.
     pub fn default_id(&self) -> Option<String> {
         lock(&self.default).as_ref().map(|w| w.id.clone())

@@ -55,9 +55,9 @@ pub const REJECTED_KEEP_DAYS: i64 = 90;
 /// The trash folder, workspace-relative.
 pub const TRASH_DIR: &str = ".trash";
 /// The record beside each entry's payload.
-const RECORD: &str = "restore.json";
-const PAYLOAD: &str = "payload";
-const DAY: i64 = 86_400;
+pub(super) const RECORD: &str = "restore.json";
+pub(super) const PAYLOAD: &str = "payload";
+pub(super) const DAY: i64 = 86_400;
 
 /// A trash entry's `restore.json` (Appendix E "Workspace areas").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -87,10 +87,10 @@ pub struct MaintenanceReport {
 
 /// A trash entry found on disk.
 #[derive(Debug, Clone)]
-struct Entry {
-    dir: PathBuf,
-    day: PathBuf,
-    record: TrashRecord,
+pub(super) struct Entry {
+    pub(super) dir: PathBuf,
+    pub(super) day: PathBuf,
+    pub(super) record: TrashRecord,
 }
 
 /// Unix seconds of a `YYYY-MM-DD` date (the first ten characters of `s`), at 00:00 UTC.
@@ -127,7 +127,7 @@ fn parse_date(s: &str) -> Option<i64> {
 }
 
 /// Unix seconds of an RFC 3339 UTC time `YYYY-MM-DDTHH:MM:SS[.fraction]Z`.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub(super) fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b.last() != Some(&b'Z') {
         return None;
@@ -151,7 +151,7 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 }
 
 /// Whether `id` has the shape of an entry id, `te_<16 hex>`.
-fn is_entry_id(id: &str) -> bool {
+pub(super) fn is_entry_id(id: &str) -> bool {
     id.strip_prefix("te_")
         .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
@@ -159,7 +159,7 @@ fn is_entry_id(id: &str) -> bool {
 /// Every entry under `<root>\.trash` whose `restore.json` parses. Links are never followed,
 /// and each `restore.json` goes through `probe.identity` first: a cloud-only placeholder (or a
 /// link) is skipped, never read, so listing the trash never downloads anything.
-fn entries(root: &Path, probe: &dyn Probe) -> io::Result<Vec<Entry>> {
+pub(super) fn entries(root: &Path, probe: &dyn Probe) -> io::Result<Vec<Entry>> {
     let mut found = Vec::new();
     for day in list(&root.join(TRASH_DIR))?
         .into_iter()
@@ -237,8 +237,25 @@ fn signoff_date(view: &ManifestView, run: &CandidateRun) -> Option<i64> {
 
 /// Removes `path` if it is an empty folder; anything else (a folder that isn't empty, one
 /// that is gone) is left as it is.
-fn remove_if_empty(path: &Path) {
+pub(super) fn remove_if_empty(path: &Path) {
     let _ = fsops::remove_empty_dir(path);
+}
+
+/// Takes an entry that holds no payload out of the trash again: its record, then its empty
+/// folders (and the day's, when that is empty too).
+pub(super) fn drop_empty_entry(dir: &Path, day: &Path) -> io::Result<()> {
+    fsops::remove_file(&dir.join(RECORD))?;
+    remove_if_empty(&dir.join(PAYLOAD));
+    remove_if_empty(dir);
+    remove_if_empty(day);
+    Ok(())
+}
+
+/// The purge of one entry: its whole folder, then the day's when that is empty (CORE-110).
+pub(super) fn purge_entry(dir: &Path, day: &Path) -> io::Result<()> {
+    fsops::remove_dir_all(dir)?;
+    remove_if_empty(day);
+    Ok(())
 }
 
 impl Store {

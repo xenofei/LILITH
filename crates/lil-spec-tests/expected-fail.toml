@@ -32,17 +32,6 @@ tests = [
     { name = "lil-spec-tests::caps_meter::usage_is_written_ahead_and_survives_a_crash", rule = "CORE-071", file = "tests/caps_meter.rs" },
     # ARCH-081, ARCH-099
     { name = "lil-spec-tests::caps_meter::loose_calls_log_to_usage_loose_and_count_against_caps", rule = "ARCH-081", file = "tests/caps_meter.rs" },
-    # Task 17
-    # APP-078, APP-079
-    { name = "lil-spec-tests::resources_interchange::resources_round_trip_in_workspace_and_personal_scopes", rule = "APP-078", file = "tests/resources_interchange.rs" },
-    # APP-078, CORE-110
-    { name = "lil-spec-tests::resources_interchange::resource_save_over_an_existing_one_keeps_the_old_in_the_trash", rule = "APP-078", file = "tests/resources_interchange.rs" },
-    # APP-082, CORE-110
-    { name = "lil-spec-tests::resources_interchange::resource_delete_is_soft_and_asks_agents", rule = "APP-082", file = "tests/resources_interchange.rs" },
-    # APP-079
-    { name = "lil-spec-tests::resources_interchange::unknown_resource_kind_is_refused", rule = "APP-079", file = "tests/resources_interchange.rs" },
-    # APP-078
-    { name = "lil-spec-tests::resources_interchange::resource_changes_are_published", rule = "APP-078", file = "tests/resources_interchange.rs" },
     # Task 18
     # APP-061
     { name = "lil-spec-tests::resources_interchange::handlers_for_lists_registered_apps", rule = "APP-061", file = "tests/resources_interchange.rs" },
