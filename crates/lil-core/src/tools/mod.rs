@@ -34,10 +34,10 @@ pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
 pub use stages::{
-    BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput, ConfirmStage,
+    Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput, ConfirmStage,
     ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks, RecordStage,
-    ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings, SettingsInput,
-    SettingsStage, SettleInput,
+    ReplayDecision, ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings,
+    SettingsInput, SettingsStage, SettleInput,
 };
 pub use telemetry_tools::register_telemetry_tools;
 pub use test_tools::{

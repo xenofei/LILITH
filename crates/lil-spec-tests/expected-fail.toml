@@ -6,21 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 14
-    # CORE-131, ARCH-052, ARCH-059
-    { name = "lil-spec-tests::comfy_engine::node_install_needs_confirmation_and_a_pinned_version", rule = "CORE-131", file = "tests/comfy_engine.rs" },
-    # ARCH-052, ARCH-053, ARCH-055, CORE-017, CORE-109, CORE-111, APP-044, APP-046
-    { name = "lil-spec-tests::confirmations::agent_destructive_call_waits_for_the_app_and_runs_once", rule = "ARCH-052", file = "tests/confirmations.rs" },
-    # CORE-115
-    { name = "lil-spec-tests::confirmations::denied_confirmation_is_confirm_denied", rule = "CORE-115", file = "tests/confirmations.rs" },
-    # CORE-115
-    { name = "lil-spec-tests::confirmations::expired_confirmation_is_confirm_expired", rule = "CORE-115", file = "tests/confirmations.rs" },
-    # ARCH-055, QA-016
-    { name = "lil-spec-tests::confirmations::non_interactive_agents_never_get_pending", rule = "ARCH-055", file = "tests/confirmations.rs" },
-    # CORE-016
-    { name = "lil-spec-tests::confirmations::retry_with_other_arguments_is_refused", rule = "CORE-016", file = "tests/confirmations.rs" },
-    # ARCH-020
-    { name = "lil-spec-tests::confirmations::pending_confirmation_keeps_the_core_up", rule = "ARCH-020", file = "tests/confirmations.rs" },
     # Task 15
     # CORE-081, CORE-082, CORE-083
     { name = "lil-spec-tests::caps_meter::summary_keeps_bases_and_currencies_apart_and_adds_fixed_costs", rule = "CORE-081", file = "tests/caps_meter.rs" },

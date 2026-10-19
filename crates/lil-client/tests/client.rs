@@ -232,9 +232,9 @@ fn incompatible_older_core_is_drained_and_replaced() {
 
     let mut newer = cfg.clone();
     newer.protocol = ProtocolVersion { major: 2, minor: 0 };
-    let err = connect_async(&newer).expect_err("a 2.0 client connected to a 1.0 core");
+    let err = connect_async(&newer).expect_err("a 2.0 client connected to a 1.1 core");
     match &err {
-        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.0"),
+        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.1"),
         other => panic!("expected Incompatible, got {other:?}"),
     }
 
@@ -260,13 +260,13 @@ fn newer_client_with_no_start_never_drains_the_core() {
     let mut core = CoreFixture::start(&env);
 
     // A 2.0 client that may not start a core must not stop the one that runs either: it
-    // reports itself incompatible and leaves the 1.0 core serving.
+    // reports itself incompatible and leaves the 1.1 core serving.
     let mut newer = cfg.clone();
     newer.protocol = ProtocolVersion { major: 2, minor: 0 };
     newer.start = StartPolicy::NoStart;
-    let err = connect_async(&newer).expect_err("a 2.0 client connected to a 1.0 core");
+    let err = connect_async(&newer).expect_err("a 2.0 client connected to a 1.1 core");
     match &err {
-        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.0"),
+        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.1"),
         other => panic!("expected Incompatible, got {other:?}"),
     }
     assert!(
@@ -291,12 +291,12 @@ fn newer_core_is_never_drained_by_older_client() {
 
     let mut older = cfg.clone();
     older.protocol = ProtocolVersion { major: 0, minor: 9 };
-    let err = connect_async(&older).expect_err("a 0.9 client connected to a 1.0 core");
+    let err = connect_async(&older).expect_err("a 0.9 client connected to a 1.1 core");
     match &err {
-        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.0"),
+        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.1"),
         other => panic!("expected Incompatible, got {other:?}"),
     }
-    assert!(err.to_string().contains("1.0"), "{err}");
+    assert!(err.to_string().contains("1.1"), "{err}");
     // The client never asked: the core logs every drain it refuses, and has logged none.
     assert!(
         !core_log(&env).contains("core/drain refused"),
@@ -333,7 +333,7 @@ fn older_client_drain_and_wait_is_incompatible() {
         .block_on(drain_and_wait(&older, DEADLINE))
         .expect_err("an older client drained a newer core");
     match &err {
-        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.0"),
+        ClientError::Incompatible { core_protocol } => assert_eq!(core_protocol, "1.1"),
         other => panic!("expected Incompatible, got {other:?}"),
     }
     let mut same = cfg.clone();

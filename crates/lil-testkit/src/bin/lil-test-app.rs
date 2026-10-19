@@ -1,8 +1,10 @@
-//! `lil-test-app [--workspace <id>]`: the `ui:test` app of the test channels (QA-066).
+//! `lil-test-app [--workspace <id>] [--capabilities <a,b,…>]`: the `ui:test` app of the test
+//! channels (QA-066).
 //!
 //! It connects to its channel's core (from the `LIL_*` variables, as `lil` does; it waits up
-//! to 30 s for the pipe), says `core/hello` as `ui:test` with protocol 1.1's capabilities and
-//! the workspace (`none` by default), prints the hello's response as its first stdout line, and
+//! to 30 s for the pipe), says `core/hello` as `ui:test` with protocol 1.1's capabilities (or
+//! the comma-separated `--capabilities`; empty for none) and the workspace (`none` by
+//! default), prints the hello's response as its first stdout line, and
 //! then relays lines both ways: each stdin line goes to the core, each line from the core goes
 //! to stdout. It exits when either side closes (1 when it cannot connect).
 
@@ -19,22 +21,40 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
+fn usage() -> ! {
+    fail("usage: lil-test-app [--workspace <id>] [--capabilities <a,b,…>]")
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let workspace = match args.as_slice() {
-        [] => lil_protocol::NO_WORKSPACE.to_string(),
-        [flag, id] if flag == "--workspace" => id.clone(),
-        _ => fail("usage: lil-test-app [--workspace <id>]"),
-    };
+    let mut workspace = lil_protocol::NO_WORKSPACE.to_string();
+    let mut capabilities: Vec<String> = TEST_APP_CAPABILITIES
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect();
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args.next().unwrap_or_else(|| usage());
+        match flag.as_str() {
+            "--workspace" => workspace = value,
+            "--capabilities" => {
+                capabilities = value
+                    .split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            _ => usage(),
+        }
+    }
     let env = Env::from_process().unwrap_or_else(|e| fail(&e.to_string()));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap_or_else(|e| fail(&e.to_string()));
-    rt.block_on(relay(&env.pipe_name(), &workspace));
+    rt.block_on(relay(&env.pipe_name(), &workspace, &capabilities));
 }
 
-async fn relay(pipe: &str, workspace: &str) {
+async fn relay(pipe: &str, workspace: &str, capabilities: &[String]) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let client = loop {
         match open_client(pipe) {
@@ -52,7 +72,7 @@ async fn relay(pipe: &str, workspace: &str) {
         "protocol": lil_protocol::PROTOCOL.to_string(),
         "build_id": "lil-test-app",
         "schema_hash": lil_protocol::schema_hash(),
-        "capabilities": TEST_APP_CAPABILITIES,
+        "capabilities": capabilities,
         "caller_kind": "ui:test",
         "non_interactive": false,
         "workspace": workspace,

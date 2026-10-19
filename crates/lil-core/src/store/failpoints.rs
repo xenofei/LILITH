@@ -1,5 +1,6 @@
-//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run)
-//! where a test makes the next file call fail, or ends the process as a crash would.
+//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run;
+//! for `confirm.after_answer`, in a confirmation's answer) where a test makes the next file call
+//! fail, or ends the process as a crash would.
 //!
 //! `LIL_TEST_FAILPOINTS=<name>=<action>[,…]` arms them, read only on test channels
 //! ([`armed`]); a build whose `LIL_BUILD_CHANNEL` is `stable` compiles every check to a constant
@@ -38,6 +39,8 @@ pub const NAMES: &[&str] = &[
     "jobs.after_submitting",
     "jobs.after_post",
     "jobs.after_outputs",
+    // After `Confirm::answer` commits the answer, before the `answered` event (Task 14).
+    "confirm.after_answer",
 ];
 
 /// The exit code of the `abort` action.

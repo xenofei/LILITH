@@ -702,6 +702,9 @@ pub struct JobOrigin {
 pub struct RetryPlan {
     pub origin: JobOrigin,
     pub project: Option<String>,
+    /// The job had external side effects and was `interrupted`: it may have run, so an
+    /// agent's retry needs your confirmation whatever its tool (ruling P3-R21).
+    pub interrupted_with_side_effects: bool,
 }
 
 /// Who submits a job or asks about one, for which call (CORE-010: `tools` builds it from its

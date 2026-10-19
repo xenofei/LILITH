@@ -8,7 +8,8 @@
 //! neither uses it (`EngineControl` is how `jobs` reaches an engine). `meter` uses `tools` (its
 //! stage traits and `BillingBasis`), so `tools` never uses `meter`: a meter tool is registered
 //! from `meter` (as the engine tools are from `engines`), and `jobs` and `telemetry` use no
-//! `meter` item either (`JobCompletion` is how `meter` hears of a job).
+//! `meter` item either (`JobCompletion` is how `meter` hears of a job). `confirm` uses `tools`
+//! (it is the confirm stage), and neither `tools` nor `jobs` uses it.
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
 //! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
@@ -17,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The CORE-014 modules (each plan-3 module is added as it lands).
-const MODULES: [&str; 12] = [
+const MODULES: [&str; 13] = [
     "store",
     "index",
     "watch",
@@ -30,6 +31,7 @@ const MODULES: [&str; 12] = [
     "telemetry",
     "engines",
     "meter",
+    "confirm",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -215,6 +217,11 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     forbidden("jobs", &["tools", "engines", "meter"]);
     forbidden("telemetry", &["tools", "jobs", "engines", "meter"]);
     forbidden("tools", &["engines", "meter"]);
+    // `confirm` implements the `tools` confirm stage; the dispatcher reaches it only through
+    // that trait (`ConfirmStage::on_replay`).
+    forbidden("tools", &["confirm"]);
+    forbidden("jobs", &["confirm"]);
+    assert!(graph["confirm"].contains("tools"), "{graph:?}");
     // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
     assert!(graph["tools"].contains("jobs"), "{graph:?}");
     assert!(graph["jobs"].contains("pipeline"), "{graph:?}");

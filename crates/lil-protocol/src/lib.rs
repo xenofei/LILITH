@@ -4,6 +4,7 @@
 //!
 //! Platform-neutral: this crate has no Qt or Windows dependencies (ARCH-111, QA-027).
 
+pub mod app;
 pub mod canonical;
 pub mod codes;
 pub mod events;

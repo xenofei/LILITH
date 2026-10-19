@@ -2141,6 +2141,8 @@ impl Jobs {
         Ok(RetryPlan {
             origin,
             project: row.project,
+            interrupted_with_side_effects: row.external_side_effects
+                && row.substatus == Some(Substatus::Interrupted),
         })
     }
 

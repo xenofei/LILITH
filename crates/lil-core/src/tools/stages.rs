@@ -5,6 +5,9 @@
 //! [`Estimate::Zero`], [`ConfirmStage`] fails closed (QA-016: an agent's `destructive` or
 //! `exec` call has no way to ask you yet, so it gets `confirm.unavailable` and never runs),
 //! nothing is reserved or settled, and [`WorkspaceRecord`] runs the Record stage (CORE-020).
+//! The core replaces the confirm stage with `crate::confirm::AgentConfirm` (plan 3, Task 14),
+//! which makes such a call `pending_confirmation` while it can be answered and decides what a
+//! retry with its token gets ([`ConfirmStage::on_replay`]).
 //!
 //! [`BillingBasis`], [`ConfirmedVia`] and [`CapHit`] are the shapes the stage signatures need;
 //! Tasks 14–16 give them their behaviour.
@@ -30,6 +33,7 @@ use crate::pipeline::RecordPlan;
 use crate::session::Session;
 use crate::settings::cascade;
 pub use crate::settings::{SettingSource, Settings};
+use crate::state::{StateDb, StateError};
 use crate::store::{Store, WsPath};
 use crate::workspace::OpenWorkspace;
 
@@ -119,6 +123,59 @@ pub struct ConfirmInput<'a> {
     /// `None` for a `read` tool (no key).
     pub idem: Option<IdemRef<'a>>,
     pub workspace: Option<&'a OpenWorkspace>,
+    /// The call runs again for a `job.retry` (CORE-146): its own tool was not what the caller
+    /// called, so no prompt of the caller's (Claude Code's) was about it.
+    pub retry: bool,
+    /// An agent's call needs your confirmation whatever the tool's effect: a `job.retry` of a
+    /// job with external side effects that was `interrupted` (ruling P3-R21: it may have run,
+    /// so paid work could be paid twice).
+    pub always_confirm: bool,
+}
+
+impl ConfirmInput<'_> {
+    /// Whether an agent's confirmation is needed (ARCH-052, CORE-109): an agent caller and a
+    /// `destructive` or `exec` tool, or [`ConfirmInput::always_confirm`]. Your own actions in
+    /// an app never ask.
+    pub fn needs_agent_confirmation(&self) -> bool {
+        self.session.caller.is_agent()
+            && (self.descriptor.effect.needs_agent_confirmation() || self.always_confirm)
+    }
+}
+
+/// A confirmation you approved, as a retry with its token runs it (CORE-091, Appendix F): the
+/// tool and the arguments you saw. The call runs with stage 5 satisfied only when it is that
+/// tool with those arguments; anything else asks again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Approval {
+    /// `cf_<16 hex>`.
+    pub confirmation_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    pub confirmed_via: ConfirmedVia,
+    /// The cap action of the answer (`allow_once`, `raise`), for the cap half (Task 16).
+    pub cap_action: Option<String>,
+}
+
+impl Approval {
+    /// Whether this approval is for a call of `tool` with `args`.
+    pub fn covers_call(&self, tool: &str, args: &Value) -> bool {
+        self.tool == tool
+            && lil_protocol::args_hash(&self.arguments) == lil_protocol::args_hash(args)
+    }
+}
+
+/// What a retry with the token of a stored `pending_confirmation` gets (Appendix F
+/// "Confirmations"): run the call once, the same pending confirmation, or the end of it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayDecision {
+    /// Approved: the call runs (once) with stage 5 satisfied for what was approved.
+    Run(Approval),
+    /// Not answered yet: the same `pending_confirmation`.
+    StillPending(PendingConfirmation),
+    /// `confirm.denied`; the key is released.
+    Denied,
+    /// `confirm.expired` (also a prompt cancelled unanswered); the key is released.
+    Expired,
 }
 
 /// What the confirm-and-caps stage decided (CORE-017).
@@ -141,6 +198,8 @@ pub enum ConfirmDecision {
     Unavailable,
     /// A cap would be passed and nobody can be asked: the error (`cap.exceeded`).
     CapExceeded(ErrorBody),
+    /// The stage could not decide (its `state.db` failed): the error the call ends with.
+    Failed(ErrorBody),
 }
 
 /// What the reserve stage did.
@@ -208,6 +267,18 @@ pub trait EstimateStage: Send + Sync {
 /// Stage 5: confirmations and caps.
 pub trait ConfirmStage: Send + Sync {
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision>;
+
+    /// A retry found its idempotency row `idem` (in `db`) holding a stored
+    /// `pending_confirmation`: what it gets ([`ReplayDecision`]). `None` replays the stored
+    /// outcome as it is (a stage that never makes one pending).
+    fn on_replay<'a>(
+        &'a self,
+        db: &'a StateDb,
+        idem: IdemRef<'a>,
+    ) -> BoxFuture<'a, Result<Option<ReplayDecision>, StateError>> {
+        let _ = (db, idem);
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 /// Stage 6: reserves budget for the estimate.
@@ -393,15 +464,14 @@ impl ConfirmStage for Plan2 {
     /// confirmation (ARCH-052), and plan 2 has no way to ask: [`ConfirmDecision::Unavailable`],
     /// interactive session or not (QA-016). Your own actions in an app never ask (CORE-109).
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
-        let decision =
-            if i.session.caller.is_agent() && i.descriptor.effect.needs_agent_confirmation() {
-                ConfirmDecision::Unavailable
-            } else {
-                ConfirmDecision::Proceed {
-                    confirmed_via: None,
-                    cap_override: None,
-                }
-            };
+        let decision = if i.needs_agent_confirmation() {
+            ConfirmDecision::Unavailable
+        } else {
+            ConfirmDecision::Proceed {
+                confirmed_via: None,
+                cap_override: None,
+            }
+        };
         Box::pin(std::future::ready(decision))
     }
 }

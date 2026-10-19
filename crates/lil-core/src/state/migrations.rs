@@ -118,6 +118,38 @@ const OUTSIDE_PAID: &str = "CREATE TABLE outside_paid (
 );
 CREATE INDEX outside_paid_open ON outside_paid(prompt_id) WHERE recorded_utc IS NULL;";
 
+/// Suite migration 6 and workspace migration 5: the confirmations (ARCH-052–055, CORE-109–115;
+/// Appendix F "Confirmations"). A confirmation lives in the `state.db` of its call's scope and
+/// belongs to the call's idempotency row `(scope, idem_key)`, bound to the tool and the
+/// arguments' hash. At most one per key is `pending` (`confirmations_pending`); the answered,
+/// expired and cancelled ones stay as the history, so a key whose earlier confirmation was
+/// denied can be asked about again. `covers` is the JSON array (`confirm` before `cap`), `cap`
+/// the JSON of the caps the call would pass. Times are Unix seconds.
+const CONFIRMATIONS: &str = "CREATE TABLE confirmations (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL,
+    idem_key TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    args_hash TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    caller_kind TEXT NOT NULL,
+    covers TEXT NOT NULL,
+    cap TEXT,
+    state TEXT NOT NULL
+        CHECK (state IN ('pending','approved','denied','expired','cancelled')),
+    confirmed_via TEXT CHECK (confirmed_via IN ('app','claude_code')),
+    created_utc INTEGER NOT NULL,
+    expires_utc INTEGER NOT NULL,
+    answered_utc INTEGER,
+    cap_action TEXT,
+    session_id TEXT NOT NULL
+);
+CREATE UNIQUE INDEX confirmations_pending ON confirmations(scope, idem_key)
+    WHERE state = 'pending';
+CREATE INDEX confirmations_key ON confirmations(scope, idem_key);
+CREATE INDEX confirmations_state ON confirmations(state, created_utc);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -125,11 +157,17 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     JOBS,
     COMFY_CACHE,
     OUTSIDE_PAID,
+    CONFIRMATIONS,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
-pub const WORKSPACE_MIGRATIONS: &[&str] =
-    &[IDEMPOTENCY_V1, IDEMPOTENCY_PRUNE_V2, GENERATED_V3, JOBS];
+pub const WORKSPACE_MIGRATIONS: &[&str] = &[
+    IDEMPOTENCY_V1,
+    IDEMPOTENCY_PRUNE_V2,
+    GENERATED_V3,
+    JOBS,
+    CONFIRMATIONS,
+];
 
 #[cfg(test)]
 mod tests {
@@ -201,8 +239,33 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 5);
-        assert_eq!(WORKSPACE_MIGRATIONS.len(), 4);
+        assert_eq!(SUITE_MIGRATIONS.len(), 6);
+        assert_eq!(WORKSPACE_MIGRATIONS.len(), 5);
+    }
+
+    #[test] // spec: CORE-115, ARCH-053
+    fn both_scopes_hold_confirmations_with_one_pending_per_key() {
+        for (list, at) in [(SUITE_MIGRATIONS, 5), (WORKSPACE_MIGRATIONS, 4)] {
+            assert_eq!(list[at], CONFIRMATIONS, "appended, never inserted");
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            for m in list {
+                db.execute_batch(m).unwrap();
+            }
+            let insert = |id: &str, state: &str| {
+                db.execute(
+                    "INSERT INTO confirmations (id, scope, idem_key, tool, args_hash, arguments,
+                         caller_kind, covers, state, created_utc, expires_utc, session_id)
+                     VALUES (?1, 'cli|none', 'k', 't', 'h', '{}', 'cli', '[\"confirm\"]', ?2,
+                         0, 1800, 's_1')",
+                    rusqlite::params![id, state],
+                )
+            };
+            insert("cf_1", "pending").unwrap();
+            assert!(insert("cf_2", "pending").is_err(), "one pending per key");
+            insert("cf_3", "denied").unwrap();
+            insert("cf_4", "expired").unwrap();
+            assert!(insert("cf_5", "maybe").is_err(), "the state CHECK");
+        }
     }
 
     #[test] // spec: CORE-117, ARCH-099

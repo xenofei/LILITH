@@ -52,7 +52,7 @@ fn hello_returns_session_and_shared_capabilities() {
     let instance = result["instance_id"].as_str().expect("instance_id");
     assert!(session.starts_with("s_"), "{response}");
     assert!(instance.starts_with("c_"), "{response}");
-    assert_eq!(result["protocol"], "1.0", "{response}");
+    assert_eq!(result["protocol"], "1.1", "{response}");
     assert_eq!(result["build_id"], lil_protocol::BUILD_ID, "{response}");
     assert_eq!(
         result["schema_hash"],
@@ -69,12 +69,29 @@ fn hello_returns_session_and_shared_capabilities() {
     assert_eq!(second["result"]["status"], "ok", "{second}");
     assert_eq!(second["result"]["instance_id"], instance, "{second}");
     assert_ne!(second["result"]["session_id"], session, "{second}");
-    // The session runs at the lower minor.
-    assert_eq!(second["result"]["protocol"], "1.0", "{second}");
+    // The session runs at the lower minor, and shares protocol 1.1's five capabilities.
+    assert_eq!(second["result"]["protocol"], "1.1", "{second}");
     assert_eq!(
         second["result"]["capabilities"],
-        json!(["events.v1", "tools.v1"]),
+        json!([
+            "events.v1",
+            "tools.v1",
+            "jobs.v1",
+            "confirmations.v1",
+            "caps.v1"
+        ]),
         "{second}"
+    );
+
+    // A 1.0 client keeps working: its session runs at 1.0 with what it offers.
+    let mut old = RawPipe::connect(&env);
+    let third = old.hello(json!({"protocol": "1.0", "capabilities": ["events.v1", "tools.v1"]}));
+    assert_eq!(third["result"]["status"], "ok", "{third}");
+    assert_eq!(third["result"]["protocol"], "1.0", "{third}");
+    assert_eq!(
+        third["result"]["capabilities"],
+        json!(["events.v1", "tools.v1"]),
+        "{third}"
     );
 }
 
@@ -127,7 +144,7 @@ fn major_mismatch_with_unknown_params_is_incompatible_not_invalid_params() {
             "{response}"
         );
         assert_eq!(
-            result["error"]["data"]["core_protocol"], "1.0",
+            result["error"]["data"]["core_protocol"], "1.1",
             "{response}"
         );
         assert!(

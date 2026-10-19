@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 /// The suite `state.db` schema this build knows: its `PRAGMA user_version` after every suite
 /// migration (CORE-004, QA-062). `lil-core` applies the migrations and checks its own count
 /// against this; `lil doctor` reads it to tell a database from a newer version apart.
-pub const SUITE_STATE_SCHEMA: i64 = 5;
+pub const SUITE_STATE_SCHEMA: i64 = 6;
 
 /// The same for a workspace `state.db` (in the workspace's local folder): its `user_version`
 /// after every workspace migration. `lil doctor` reads it when it checks the default
 /// workspace's database.
-pub const WORKSPACE_STATE_SCHEMA: i64 = 4;
+pub const WORKSPACE_STATE_SCHEMA: i64 = 5;
 
 /// The whole file. Unknown keys are preserved in `other`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

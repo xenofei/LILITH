@@ -473,6 +473,38 @@ impl StateDb {
         .await
     }
 
+    /// Takes the `done` row `(scope_key, key)` back for another run (CORE-091, Appendix F: a
+    /// retry with the token of an answered confirmation): when its arguments hash is
+    /// `args_hash` and its stored outcome is a `pending_confirmation`, the row becomes
+    /// `running` again, with no outcome, and this returns `true`. Anything else (no such row,
+    /// another hash, a row already taken back by a concurrent retry, any other outcome) changes
+    /// nothing and returns `false`. One statement, so of two concurrent retries exactly one
+    /// gets the row. The caller then finishes it like a fresh claim (`idem_finish`).
+    pub async fn idem_reclaim(
+        &self,
+        scope_key: &str,
+        key: &str,
+        args_hash: &str,
+    ) -> Result<bool, StateError> {
+        let (scope_key, key, args_hash) = (
+            scope_key.to_string(),
+            key.to_string(),
+            args_hash.to_string(),
+        );
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE idempotency SET state = 'running', outcome = NULL
+                 WHERE scope = ?1 AND key = ?2 AND args_hash = ?3 AND state = 'done'
+                   AND json_valid(outcome)
+                   AND json_extract(outcome, '$.status') = 'pending_confirmation'",
+                params![scope_key, key, args_hash],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
     /// The last hash the store wrote to `path` (workspace databases; ARCH-078).
     pub async fn generated(&self, path: &str) -> Result<Option<String>, StateError> {
         let path = path.to_string();
@@ -972,6 +1004,37 @@ impl StateRegistry {
             return Err(StateError::ActorGone);
         }
         Ok(db.clone())
+    }
+
+    /// The read-write database of the workspace `id`, if it is open (a call in the workspace
+    /// opened it): the confirmations of that scope live there.
+    pub fn workspace_db(&self, id: &str) -> Option<Arc<StateDb>> {
+        let workspaces = lock(&self.workspaces);
+        if workspaces.closed {
+            return None;
+        }
+        workspaces
+            .cells
+            .get(&(id.to_string(), Access::ReadWrite))
+            .and_then(|cell| cell.get().cloned())
+    }
+
+    /// The writable databases open now: the suite one and each read-write workspace one,
+    /// with the workspace id (`"none"` for the suite).
+    pub fn writable_dbs(&self) -> Vec<(String, Arc<StateDb>)> {
+        let mut dbs = vec![(lil_protocol::NO_WORKSPACE.to_string(), self.suite.clone())];
+        let workspaces = lock(&self.workspaces);
+        if workspaces.closed {
+            return dbs;
+        }
+        for ((id, access), cell) in &workspaces.cells {
+            if *access == Access::ReadWrite
+                && let Some(db) = cell.get()
+            {
+                dbs.push((id.clone(), db.clone()));
+            }
+        }
+        dbs
     }
 
     /// Closes the databases of the workspace `id` (each access), after their queued jobs, and

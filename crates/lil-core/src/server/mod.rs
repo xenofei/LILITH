@@ -26,6 +26,10 @@
 //!   are registered, the default workspace's hardware profile is checked once the workspace is
 //!   open and the first sample is in (CORE-067), and sampling stops right after the shutdown
 //!   steps.
+//! - The confirmations ([`crate::confirm`]) are stage 5's confirm half ([`AgentConfirm`]), the
+//!   router's `app/*` methods and an idle blocker (ARCH-020; never a drain's). The suite
+//!   database's pending ones are loaded at start, the default workspace's once it opens, and
+//!   expired ones are marked every second.
 //! - The engines ([`crate::engines`]) are built once the dispatcher's jobs exist (their tools
 //!   find them through a slot filled before the core serves). They register the node-install
 //!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
@@ -52,6 +56,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
+use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NoNotificationPath, UiPresence};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
@@ -297,6 +302,8 @@ pub struct RunningCore {
     test_gates: Arc<TestGates>,
     /// Each session's active project (ARCH-088), shared with the dispatcher.
     active_projects: Arc<ActiveProjects>,
+    /// The confirmations (ARCH-052–055).
+    confirm: Arc<Confirm>,
     /// The hidden session-end window; `None` if it could not be created.
     session_end: Option<Arc<SessionEndWatcher>>,
     /// The supervisor: ends with the shutdown's report.
@@ -338,6 +345,11 @@ impl RunningCore {
     /// when the session's connection closes.
     pub fn active_projects(&self) -> &Arc<ActiveProjects> {
         &self.active_projects
+    }
+
+    /// The confirmations: pending ones, answers, the apps that can answer.
+    pub fn confirm(&self) -> &Arc<Confirm> {
+        &self.confirm
     }
 
     /// Idle accounting, drains and shutdown steps.
@@ -451,9 +463,32 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     if cfg.test_tools {
         register_engine_test_tools(&mut registry);
     }
+    // The confirmations (ARCH-052–055): stage 5's confirm half, answered by the apps.
+    let confirm = Confirm::new(
+        state.clone(),
+        events.clone(),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        UiPresence::new(),
+        Arc::new(NoNotificationPath),
+        cfg.confirm_lifetime,
+        MCP_CONFIRMATION,
+        cfg.failpoints.clone(),
+    );
+    match confirm.load(state.suite()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "pending confirmations of an earlier core run"),
+        Err(e) => {
+            tracing::error!(error = %e, "the pending confirmations could not be read; a retry with its token finds each")
+        }
+    }
+    let hooks = PipelineHooks {
+        confirm: AgentConfirm::new(confirm.clone()),
+        ..PipelineHooks::plan2()
+    };
     let dispatcher = Dispatcher::new(
         registry,
-        PipelineHooks::plan2(),
+        hooks,
         state.clone(),
         events.clone(),
         hub.clone(),
@@ -516,10 +551,12 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     outside.stop_on_drain(lifecycle.drain_token());
     lifecycle.add_blocker(outside);
     engines.observe();
+    lifecycle.add_blocker(confirm.clone());
     lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
-    let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
+    let router: Arc<dyn Router> =
+        Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone()));
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
     let serving = tokio::spawn(serve_with(
@@ -532,6 +569,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
 
     if let Some(ws) = hub.default_ref() {
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
+        let confirm = confirm.clone();
         let models = models.clone();
         tokio::spawn(async move {
             match hub.open(&ws).await {
@@ -542,6 +580,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
+                    if let Err(e) = confirm.load(&open.state).await {
+                        tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace's pending confirmations could not be read");
+                    }
                     telemetry.set_sizes_probe(telemetry::sizes_probe(
                         Some(open.ws.path.clone()),
                         models,
@@ -551,7 +592,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             }
         });
     }
-    let mut helpers = vec![tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after))];
+    let mut helpers = vec![
+        tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after)),
+        tokio::spawn(sweep_confirmations(confirm.clone())),
+    ];
     if let Some(pid) = cfg.test_parent_pid.filter(|_| cfg.test_tools) {
         helpers.push(tokio::spawn(watch_test_parent(
             pid,
@@ -589,6 +633,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         telemetry,
         test_gates,
         active_projects,
+        confirm,
         session_end,
         shutdown,
     })
@@ -798,6 +843,14 @@ async fn tick_idle(lifecycle: Arc<Lifecycle>, idle_after: Duration) {
         if lifecycle.drain_if_idle() {
             return;
         }
+    }
+}
+
+/// Marks expired confirmations every second ([`Confirm::sweep`]) until the core stops.
+async fn sweep_confirmations(confirm: Arc<Confirm>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        confirm.sweep().await;
     }
 }
 

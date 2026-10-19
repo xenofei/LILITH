@@ -18,8 +18,15 @@
 //!   `{"status":"ok","draining":true}` and begins a requested drain. `tools/list` and
 //!   `tools/call` go to the [`Dispatcher`] (the `tools` module; a draining core answers new
 //!   calls with `core.draining`); `lil/subscribe` and `lil/unsubscribe` go to the [`EventBus`];
-//!   `app/*` is refused with `caller.not_allowed` for anyone but a verified `ui:*` caller, and
-//!   is -32601 for one, since plan 2 defines no `app/*` method (ARCH-031, APP-040).
+//!   `app/*` is refused with `caller.not_allowed` for anyone but a verified `ui:*` caller
+//!   (ARCH-031, APP-040), except `app/confirmations.list`, which `cli` may call too; protocol
+//!   1.1's `app/confirmations.list` and `app/confirmation.answer` go to the [`Confirm`]
+//!   (they need `confirmations.v1` or `caps.v1` in the shared capabilities, else
+//!   `caller.not_allowed`), and any other `app/*` method is -32601 for an app. `tools/list`
+//!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
+//!   A verified `ui:*` session that can answer confirmations counts in the
+//!   [`crate::confirm::UiPresence`] while its connection is open; when it closes, its pending
+//!   cap confirmations are cancelled.
 //!   `core/drain` and `lil/*` run on the connection's reader ([`Router::runs_inline`]): they
 //!   are cheap and take no in-flight permit, so they are not refused or delayed for want of
 //!   one. Reading stays in order, though: one read after a request that waits for a permit
@@ -61,6 +68,7 @@ use std::time::Duration;
 
 use lil_platform::process::{ProcessInfo, ProcessInspector};
 use lil_platform::{Env, IdSource};
+use lil_protocol::app;
 use lil_protocol::{
     BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, DrainParams, DrainResult, ErrorBody, HelloParams,
     HelloResult, Id, Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError,
@@ -74,6 +82,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CoreConfig;
+use crate::confirm::{
+    Confirm, ConfirmationRow, ListState, can_answer, has_confirmation_capability,
+};
 use crate::events::EventBus;
 use crate::identity::{EngineSession, EngineTokens, TrustedDirs, claude_ancestor, resolve_caller};
 use crate::lifecycle::{DrainReason, Lifecycle};
@@ -122,6 +133,9 @@ pub struct RpcRouter {
     events: Arc<EventBus>,
     /// The dispatcher's lifecycle.
     lifecycle: Arc<Lifecycle>,
+    /// The confirmations: the `app/*` methods, the apps that can answer, and the
+    /// `tools/list` marker (`mcp_confirmation`).
+    confirm: Arc<Confirm>,
     /// Unit tests only: requests with this method panic (`CoreConfig::panic_on_method`).
     #[cfg(test)]
     panic_on_method: Option<&'static str>,
@@ -129,8 +143,14 @@ pub struct RpcRouter {
 
 impl RpcRouter {
     /// A router for the core configured by `cfg`, serving the pipe `pipe`, whose tool calls go
-    /// to `dispatcher` and whose subscriptions to the dispatcher's event bus.
-    pub fn new(cfg: &CoreConfig, pipe: &str, dispatcher: Dispatcher) -> RpcRouter {
+    /// to `dispatcher`, whose subscriptions to the dispatcher's event bus, and whose
+    /// confirmation methods to `confirm`.
+    pub fn new(
+        cfg: &CoreConfig,
+        pipe: &str,
+        dispatcher: Dispatcher,
+        confirm: Arc<Confirm>,
+    ) -> RpcRouter {
         let events = dispatcher.events().clone();
         let lifecycle = dispatcher.lifecycle().clone();
         RpcRouter {
@@ -150,6 +170,7 @@ impl RpcRouter {
             dispatcher,
             events,
             lifecycle,
+            confirm,
             #[cfg(test)]
             panic_on_method: cfg.panic_on_method,
         }
@@ -165,10 +186,17 @@ impl RpcRouter {
         self.conns.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Moves `conn_id` out of `AwaitingHello` and stops its hello timeout.
-    fn settle(&self, conn_id: u64, state: ConnState) {
-        if let Some(conn) = self.conns().get_mut(&conn_id) {
-            conn.state = state;
+    /// Moves `conn_id` out of `AwaitingHello` into `Ready` with its session and stops its
+    /// hello timeout. An app that can answer confirmations makes them
+    /// answerable (APP-051) from now until [`Router::closed`]: both under the map lock, so a
+    /// connection that closes meanwhile is never counted.
+    fn settle_ready(&self, conn_id: u64, session: Arc<Session>) {
+        let mut conns = self.conns();
+        if let Some(conn) = conns.get_mut(&conn_id) {
+            if can_answer(&session) {
+                self.confirm.presence().opened();
+            }
+            conn.state = ConnState::Ready(session);
             conn.hello_settled.cancel();
         }
     }
@@ -248,7 +276,8 @@ impl RpcRouter {
             (ConnState::Ready(session), method::TOOLS_LIST) => {
                 match parse_params::<ToolsListParams>(req.params) {
                     Ok(ToolsListParams {}) => {
-                        let tools = self.dispatcher.registry().list_for(&session.caller);
+                        let listed = self.dispatcher.registry().list_for(&session.caller);
+                        let tools = self.confirm.annotate(&session.caller, listed);
                         outcome(id, Outcome::Ok(ToolsListResult { tools }))
                     }
                     Err(error) => Response::Error {
@@ -270,30 +299,95 @@ impl RpcRouter {
             (ConnState::Ready(_), method::SUBSCRIBE) => self.subscribe(conn, id, req.params).await,
             (ConnState::Ready(_), method::UNSUBSCRIBE) => self.unsubscribe(conn, id, req.params),
             (ConnState::Ready(session), m) if m.starts_with(method::APP_PREFIX) => {
-                match session.caller {
-                    // Plan 2 defines no `app/*` method.
-                    CallerKind::Ui(_) => not_found(id),
-                    _ => {
-                        let trace_id = self.ids.id("t");
-                        tracing::info!(
-                            conn_id = conn.conn_id,
-                            method = m,
-                            caller = %session.caller,
-                            trace_id,
-                            "app/* refused: the caller is not an app"
-                        );
-                        let error = ErrorBody::new(
-                            &codes::CALLER_NOT_ALLOWED,
-                            format!("{m} is for LILITH apps only."),
-                            trace_id,
-                        );
-                        outcome::<ToolOutput>(id, Outcome::Error { error })
-                    }
-                }
+                self.app(conn, id, &session, m, req.params).await
             }
             (ConnState::Ready(_), _) => not_found(id),
         };
         Some(response)
+    }
+
+    /// An `app/*` method (module docs). A verified `ui:*` caller may call each; `cli` only
+    /// `app/confirmations.list`; anyone else gets `caller.not_allowed`. Each needs
+    /// `confirmations.v1` or `caps.v1` in the session's shared capabilities, else
+    /// `caller.not_allowed`. One this core does not define is -32601 for an app.
+    async fn app(
+        &self,
+        conn: &ConnCtx,
+        id: Id,
+        session: &Session,
+        m: &str,
+        params: Option<Value>,
+    ) -> Response {
+        let refuse = |message: String| {
+            let trace_id = self.ids.id("t");
+            tracing::info!(
+                conn_id = conn.conn_id,
+                method = m,
+                caller = %session.caller,
+                trace_id,
+                "app/* refused: {message}"
+            );
+            let error = ErrorBody::new(&codes::CALLER_NOT_ALLOWED, message, trace_id);
+            outcome::<ToolOutput>(id.clone(), Outcome::Error { error })
+        };
+        let is_app = matches!(session.caller, CallerKind::Ui(_));
+        let may_call =
+            is_app || (m == app::CONFIRMATIONS_LIST && session.caller == CallerKind::Cli);
+        if !may_call {
+            return refuse(format!("{m} is for LILITH apps only."));
+        }
+        if !matches!(m, app::CONFIRMATIONS_LIST | app::CONFIRMATION_ANSWER) {
+            return not_found(id);
+        }
+        if !has_confirmation_capability(session) {
+            return refuse(format!(
+                "{m} needs the confirmations.v1 or caps.v1 capability, and this session's \
+                 core/hello did not offer either."
+            ));
+        }
+        let invalid = |error: RpcError| Response::Error {
+            id: Some(id.clone()),
+            error,
+        };
+        if m == app::CONFIRMATIONS_LIST {
+            let p: app::ConfirmationsListParams = match parse_params(params) {
+                Ok(p) => p,
+                Err(error) => return invalid(error),
+            };
+            let limit = match p.limit() {
+                Ok(limit) => limit,
+                Err(why) => {
+                    return invalid(RpcError::new(
+                        rpc_code::INVALID_PARAMS,
+                        format!("invalid params: {why}"),
+                    ));
+                }
+            };
+            let which = match p.state {
+                app::ListWhich::Pending => ListState::Pending,
+                app::ListWhich::History => ListState::History,
+            };
+            let listed =
+                self.confirm
+                    .list(which, limit)
+                    .await
+                    .map(|rows| app::ConfirmationsListResult {
+                        confirmations: rows.iter().map(ConfirmationRow::view).collect(),
+                    });
+            return outcome(id, into_outcome(listed));
+        }
+        let p: app::ConfirmationAnswerParams = match parse_params(params) {
+            Ok(p) => p,
+            Err(error) => return invalid(error),
+        };
+        let answered =
+            self.confirm
+                .answer(session, p)
+                .await
+                .map(|row| app::ConfirmationAnswerResult {
+                    confirmation: row.view(),
+                });
+        outcome(id, into_outcome(answered))
     }
 
     /// `core/hello`, in the order of the module docs. `None`: the reply is already queued
@@ -437,7 +531,7 @@ impl RpcRouter {
             }),
             core: self.core.clone(),
         };
-        self.settle(conn.conn_id, ConnState::Ready(session));
+        self.settle_ready(conn.conn_id, session);
         // Events can reach the connection from now on.
         self.events.attach(conn.conn_id, conn.outbound.clone());
         // 9. The reply.
@@ -697,6 +791,14 @@ impl Router for RpcRouter {
                 // The session's active project lives as long as its connection (ARCH-088).
                 if let ConnState::Ready(session) = &gone.state {
                     self.dispatcher.active_projects().forget(&session.id);
+                    if can_answer(session) {
+                        self.confirm.presence().closed();
+                    }
+                    // An app's pending cap confirmations end with it (Appendix F).
+                    if matches!(session.caller, CallerKind::Ui(_)) {
+                        let (confirm, id) = (self.confirm.clone(), session.id.clone());
+                        tokio::spawn(async move { confirm.cancel_for_session(&id).await });
+                    }
                 }
                 gone.counted
             });
@@ -738,6 +840,13 @@ fn fault(id: Id, code: i64, message: &str) -> Response {
 
 fn not_found(id: Id) -> Response {
     fault(id, rpc_code::METHOD_NOT_FOUND, "method not found")
+}
+
+fn into_outcome<T>(result: Result<T, ErrorBody>) -> Outcome<T> {
+    match result {
+        Ok(value) => Outcome::Ok(value),
+        Err(error) => Outcome::Error { error },
+    }
 }
 
 fn outcome<T: Serialize>(id: Id, outcome: Outcome<T>) -> Response {

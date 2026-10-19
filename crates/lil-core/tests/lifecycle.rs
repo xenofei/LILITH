@@ -175,7 +175,7 @@ fn older_client_cannot_drain_after_incompatible_hello() {
     let result = &drain["result"];
     assert_eq!(result["status"], "error", "{drain}");
     assert_eq!(result["error"]["code"], "protocol.incompatible", "{drain}");
-    assert_eq!(result["error"]["data"]["core_protocol"], "1.0", "{drain}");
+    assert_eq!(result["error"]["data"]["core_protocol"], "1.1", "{drain}");
     assert!(!core.core().lifecycle().is_draining());
 
     // The core still serves.

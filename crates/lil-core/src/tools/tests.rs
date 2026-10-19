@@ -446,6 +446,8 @@ async fn plan2_stage_defaults_still_hold() {
                     args: &json!({}),
                     idem: None,
                     workspace: None,
+                    retry: false,
+                    always_confirm: false,
                 })
                 .await
         }

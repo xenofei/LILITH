@@ -14,6 +14,7 @@
 )]
 
 pub mod config;
+pub mod confirm;
 pub mod engines;
 pub mod events;
 pub mod graph;
