@@ -288,6 +288,12 @@ impl Engines {
         self.comfy.tick().await;
     }
 
+    /// At the core's start, before any job runs: drops the ComfyUI upload references a dead
+    /// core left behind (they would keep those uploads forever).
+    pub async fn startup(&self) {
+        self.comfy.reset_uploads().await;
+    }
+
     /// The `CancelEnginePrompts` shutdown step (ARCH-021 step 2): every suite prompt in an
     /// engine gets its per-job cancel (never `/interrupt`); prompts from outside the suite are
     /// never touched.

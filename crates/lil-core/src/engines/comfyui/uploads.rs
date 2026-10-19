@@ -19,6 +19,8 @@ use crate::store::fsops;
 
 /// How long an upload no job references stays in `<root>\input`.
 pub const UPLOAD_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
+/// The largest input file a job uploads.
+pub const MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The upload name of a file with `sha256` and the extension of `src` (lower case; `png`
 /// when it has none): `lil_<first 16 hex>.<ext>`.
@@ -59,12 +61,14 @@ impl Uploads {
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
     }
 
-    /// Takes a reference to the file `src` in ComfyUI and returns its upload name. It is
+    /// Takes a reference to the file `src` in ComfyUI and returns its upload name. It is read
+    /// once (at most [`MAX_UPLOAD_BYTES`]); the bytes hashed are the bytes sent. It is
     /// uploaded only when no row has it yet, or (with `root` known) when it is missing from
-    /// `<root>\input`.
+    /// `<root>\input`. `src` is checked by the caller (the handler confines it).
     ///
     /// # Errors
-    /// [`ComfyError`] of the hash or the upload; no reference is taken then.
+    /// [`ComfyError`] of the read or the upload ([`ComfyError::Io`] for a file that can't be
+    /// read or is too large); no reference is taken then.
     pub async fn acquire(
         &self,
         client: &ComfyClient,
@@ -72,10 +76,21 @@ impl Uploads {
         root: Option<&Path>,
     ) -> Result<String, ComfyError> {
         let path = src.to_path_buf();
-        let sha256 = tokio::task::spawn_blocking(move || {
-            std::fs::read(&path)
-                .map(|bytes| hex(&Sha256::digest(&bytes)))
-                .map_err(|e| ComfyError::Io(format!("{}: {e}", path.display())))
+        let (bytes, sha256) = tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let file = std::fs::File::open(lil_platform::fs::long_path(&path))
+                .map_err(|e| ComfyError::Io(format!("the input can't be read: {e}")))?;
+            let mut bytes = Vec::new();
+            file.take(MAX_UPLOAD_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| ComfyError::Io(format!("the input can't be read: {e}")))?;
+            if bytes.len() as u64 > MAX_UPLOAD_BYTES {
+                return Err(ComfyError::Io(format!(
+                    "the input is larger than {MAX_UPLOAD_BYTES} bytes"
+                )));
+            }
+            let sha256 = hex(&Sha256::digest(&bytes));
+            Ok((bytes, sha256))
         })
         .await
         .map_err(|e| ComfyError::Io(e.to_string()))??;
@@ -98,7 +113,7 @@ impl Uploads {
         if taken && present {
             return Ok(name);
         }
-        if let Err(e) = client.upload_image(&name, src).await {
+        if let Err(e) = client.upload_bytes(&name, &bytes).await {
             if taken {
                 self.release(&name).await;
             }
@@ -121,6 +136,26 @@ impl Uploads {
                 .map_err(|e| io(&e))?;
         }
         Ok(name)
+    }
+
+    /// At the core's start, before any job runs: the references an earlier core took and never
+    /// gave back (it stopped first) are dropped, and the 24 h start now (review M3).
+    pub async fn reset(&self) {
+        let now = self.now();
+        let done = self
+            .db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE comfy_uploads SET refs = 0, last_used_utc = ?1 WHERE refs > 0",
+                    params![now],
+                )
+                .map(drop)
+                .map_err(|e| state_err(&e))
+            })
+            .await;
+        if let Err(e) = done {
+            tracing::warn!(error = %e, "the uploads' references could not be reset");
+        }
     }
 
     /// Gives a reference back (never below 0); the 24 h start when the count reaches 0.

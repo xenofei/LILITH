@@ -60,12 +60,19 @@ pub enum FakeFailure {
     /// "node_errors": <node_errors>}` (no `node_errors` key when it is `null`) and queues
     /// nothing.
     Reject400 { node_errors: Value },
+    /// `POST /prompt` drops the connection before answering, with nothing queued yet; the
+    /// prompt is queued 1.5 s later, as a ComfyUI still validating a prompt whose client gave
+    /// up would.
+    AcceptLate,
 }
 
 impl FakeFailure {
     /// Whether it answers the `POST /prompt` itself instead of failing the run.
     fn at_post(&self) -> bool {
-        matches!(self, FakeFailure::Refuse503 | FakeFailure::Reject400 { .. })
+        matches!(
+            self,
+            FakeFailure::Refuse503 | FakeFailure::Reject400 { .. } | FakeFailure::AcceptLate
+        )
     }
 }
 
@@ -249,6 +256,22 @@ impl FakeComfy {
     /// up: each `POST /prompt` takes the oldest one.
     pub fn fail_next(&self, kind: FakeFailure) {
         self.shared.lock().fail_next.push_back(kind);
+    }
+
+    /// The next suite prompt that runs also reports an output named `filename` (under a node
+    /// `extra<n>`), as a custom save node might; with `write` the fake writes that file into
+    /// `<root>\output` first, otherwise it only reports it.
+    pub fn report_extra_output(&self, filename: &str, write: bool) {
+        self.shared
+            .lock()
+            .extra_outputs
+            .push((filename.to_string(), write));
+    }
+
+    /// While on, every HTTP request but the websocket's is answered 503 (ComfyUI busy or
+    /// stalled); the websocket stays connected.
+    pub fn refuse_http(&self, on: bool) {
+        self.shared.lock().refuse_http = on;
     }
 
     /// Calls `hook` with the body of each `POST /prompt` when it arrives, before the fake
@@ -517,6 +540,8 @@ struct State {
     hold: bool,
     fail_next: std::collections::VecDeque<FakeFailure>,
     on_prompt: Option<PromptHook>,
+    extra_outputs: Vec<(String, bool)>,
+    refuse_http: bool,
     drop_after_accept: bool,
     restart_after: Option<u32>,
     outputs_since_armed: u32,
@@ -663,7 +688,7 @@ impl State {
                 "Allocation on device 0 would exceed allowed memory. CUDA out of memory. Tried to allocate 2.00 GiB".to_string(),
             ),
             FakeFailure::Execution { message } => ("RuntimeError", message.clone()),
-            FakeFailure::Refuse503 | FakeFailure::Reject400 { .. } => {
+            FakeFailure::Refuse503 | FakeFailure::Reject400 { .. } | FakeFailure::AcceptLate => {
                 ("RuntimeError", "refused".to_string())
             }
         };
@@ -793,6 +818,19 @@ async fn run(shared: &Shared, job: Job) {
     let mut st = shared.lock();
     if !still_running(&mut st, &job) {
         return;
+    }
+    let extra = std::mem::take(&mut st.extra_outputs);
+    for (n, (filename, write)) in extra.into_iter().enumerate() {
+        if write {
+            let path = shared.root.join("output").join(&filename);
+            std::fs::write(&path, PNG)
+                .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+        }
+        let image = json!({"filename": filename, "subfolder": "", "type": "output"});
+        if let Some(p) = st.prompt_mut(&job.id) {
+            p.outputs
+                .insert(format!("extra{n}"), json!({"images": [image]}));
+        }
     }
     let data = json!({"prompt_id": job.id, "timestamp": now_ms()});
     st.event(&job.id, "execution_success", data);
@@ -959,6 +997,12 @@ async fn handle(
         _ => path.as_str(),
     };
     let segments: Vec<&str> = route.trim_start_matches('/').split('/').collect();
+    if shared.lock().refuse_http && segments.as_slice() != ["ws"] {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "the fake ComfyUI is not answering"}),
+        ));
+    }
     let response = match (&method, segments.as_slice()) {
         (&Method::GET, ["ws"]) => upgrade_ws(&shared, &mut req, &query),
         (&Method::GET, ["system_stats"]) => json_response(StatusCode::OK, &system_stats()),
@@ -1045,7 +1089,7 @@ fn is_canonical_uuid(s: &str) -> bool {
         })
 }
 
-fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, io::Error> {
+fn post_prompt(shared: &Arc<Shared>, body: Option<Value>) -> Result<Response<Full>, io::Error> {
     let Some(body) = body else {
         return Ok(bad_request("invalid_json", "The body is not JSON"));
     };
@@ -1070,20 +1114,52 @@ fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, i
             st.fail_next.pop_front();
             return Ok(json_response(StatusCode::BAD_REQUEST, &answer));
         }
+        Some(FakeFailure::AcceptLate) => {
+            st.fail_next.pop_front();
+            drop(st);
+            let late = Arc::clone(shared);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let _ = accept(&late, &body);
+            });
+            return Err(io::Error::other(
+                "the fake ComfyUI drops the connection before it accepts the prompt",
+            ));
+        }
         _ => {}
     }
+    drop(st);
+    let (id, number) = match accept(shared, &body) {
+        Ok(accepted) => accepted,
+        Err(refused) => return Ok(*refused),
+    };
+    let dropped = shared.lock().drop_after_accept;
+    if dropped {
+        return Err(io::Error::other(
+            "the fake ComfyUI drops the connection after accepting the prompt",
+        ));
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({"prompt_id": id, "number": number, "node_errors": {}}),
+    ))
+}
+
+/// Queues the prompt of a `POST /prompt` body: `(prompt id, number)`, or the 400 answer.
+fn accept(shared: &Shared, body: &Value) -> Result<(String, u64), Box<Response<Full>>> {
+    let mut st = shared.lock();
     let graph = match body.get("prompt") {
         Some(g @ Value::Object(_)) => g.clone(),
-        _ => return Ok(bad_request("no_prompt", "No prompt provided")),
+        _ => return Err(Box::new(bad_request("no_prompt", "No prompt provided"))),
     };
     let id = match body.get("prompt_id") {
         None | Some(Value::Null) => st.mint_id(),
         Some(Value::String(id)) if is_canonical_uuid(id) => id.clone(),
         Some(_) => {
-            return Ok(bad_request(
+            return Err(Box::new(bad_request(
                 "invalid_prompt_id",
                 "prompt_id must be a canonical lowercase UUID",
-            ));
+            )));
         }
     };
     let client_id = body
@@ -1105,18 +1181,9 @@ fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, i
         st.queue.push(id.clone());
     }
     st.broadcast_status();
-    let dropped = st.drop_after_accept;
     drop(st);
     shared.wake.notify_one();
-    if dropped {
-        return Err(io::Error::other(
-            "the fake ComfyUI drops the connection after accepting the prompt",
-        ));
-    }
-    Ok(json_response(
-        StatusCode::OK,
-        &json!({"prompt_id": id, "number": number, "node_errors": {}}),
-    ))
+    Ok((id, number))
 }
 
 /// `POST /api/jobs/{id}/cancel`: a pending prompt is dequeued and forgotten (it never reaches

@@ -35,7 +35,7 @@ use super::queue::{self, Candidate};
 use super::record::{self, Change, Inserted, JobRow};
 use super::scheduler::watchdog_slow;
 use super::{
-    Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, DISK_MARGIN_BYTES, JOB_CANCELLED,
+    Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, DISK_MARGIN_BYTES, ExecWindow, JOB_CANCELLED,
     JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion, JobCtx, JobDone, JobFailure,
     JobFilter, JobHandler, JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane,
     MAX_ATTEMPTS, MAX_WAIT, NoReservations, Priority, Progress, Reservations, RetryPlan, Substatus,
@@ -150,6 +150,9 @@ struct Info {
     reservation: Option<String>,
     retry_of: Option<String>,
     origin: Option<JobOrigin>,
+    /// The execution windows its attempts reported (`JobCtx::add_window`), shared by every
+    /// attempt and its completions.
+    windows: Arc<Mutex<Vec<ExecWindow>>>,
 }
 
 /// A job this core runs.
@@ -455,6 +458,7 @@ impl Shared {
             cancel: watch::Sender::new(false).subscribe(),
             state: scope.db_arc(),
             reservation: row.reservation.clone(),
+            windows: Arc::default(),
             jobs: self.clone(),
         })
     }
@@ -484,6 +488,9 @@ impl Shared {
             if mine.contains(&row.job_id) || row.substatus == Some(Substatus::InterruptedUnknown) {
                 continue;
             }
+            if self.adopt(&row, scope) {
+                continue;
+            }
             let c = interrupt_change(&row, self.now());
             if let Some((before, after)) =
                 record::update(scope.db(), &row.job_id, c, self.now()).await?
@@ -504,6 +511,41 @@ impl Shared {
 
     /// Recovers `scope` once (module docs): the jobs it marked, empty on every later call. A
     /// read-only workspace is left as it is.
+    /// Ruling P3-R21: a job with external side effects that an earlier core left in its
+    /// engine (`queued_in_engine`, `executing` or `ingesting`, with an `external_id`) is
+    /// taken up again rather than marked: its handler asks the engine about that id first
+    /// (CORE-120), follows a prompt that is still there, ingests one that finished, and ends
+    /// any other `interrupted_unknown`; it never posts it again. `true` when it was queued.
+    fn adopt(self: &Arc<Self>, row: &JobRow, scope: &Scope) -> bool {
+        let in_engine = matches!(
+            row.substatus,
+            Some(Substatus::QueuedInEngine | Substatus::Executing | Substatus::Ingesting)
+        );
+        if !(row.external_side_effects
+            && in_engine
+            && row.external_id.is_some()
+            && row.engine.is_some()
+            && !self.draining())
+        {
+            return false;
+        }
+        let Some(kind) = self.static_kind(&row.kind) else {
+            return false;
+        };
+        tracing::warn!(job_id = %row.job_id, external_id = ?row.external_id, "a job with external side effects of an earlier core run is taken up again in its engine");
+        let info = Info {
+            id: JobId(row.job_id.clone()),
+            spec: row.spec(kind),
+            scope: scope.clone(),
+            trace_id: row.trace_id.clone(),
+            reservation: row.reservation.clone(),
+            retry_of: row.retry_of.clone(),
+            origin: row.origin.clone(),
+            windows: Arc::default(),
+        };
+        self.enqueue(info, false)
+    }
+
     async fn ensure_recovered(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
         if let Scope::Workspace(open) = scope
             && open.access == Access::ReadOnly
@@ -637,18 +679,32 @@ impl Shared {
             reservation,
             retry_of,
             origin,
+            windows: Arc::default(),
         };
+        self.enqueue(info, true);
+        Ok(row)
+    }
+
+    /// Adds `info`'s job to the queue (with the CORE-125 preemption when `preempt` allows it)
+    /// and starts what can start. After the shutdown step nothing is added: the row stays
+    /// queued, and the next start recovers it. `false` then.
+    fn enqueue(self: &Arc<Self>, info: Info, preempt: bool) -> bool {
+        let id = info.id.to_string();
         let preempt = {
             let mut q = self.queue();
             if q.closed {
                 // The shutdown step has run: the row stays queued, and the next start
                 // recovers it as interrupted (and releases its reservation).
                 lock(&self.locks).remove(&id);
-                return Ok(row);
+                return false;
             }
             q.next_order += 1;
             let order = q.next_order;
-            let preempt = self.preemption(&mut q, &info.spec);
+            let preempt = if preempt {
+                self.preemption(&mut q, &info.spec)
+            } else {
+                None
+            };
             q.jobs.insert(
                 id,
                 Active {
@@ -676,7 +732,7 @@ impl Shared {
             tokio::spawn(async move { handler.cancel_in_engine(&ctx).await });
         }
         self.pump();
-        Ok(row)
+        true
     }
 
     /// CORE-125: with `preempt_agent_batches`, an `interactive` job cancels the running
@@ -878,6 +934,7 @@ impl Shared {
             cancel,
             state: info.scope.db_arc(),
             reservation: info.reservation.clone(),
+            windows: info.windows.clone(),
             jobs: self.clone(),
         }
     }
@@ -1120,6 +1177,7 @@ impl Shared {
             && !info.spec.external_side_effects
             && !self.draining();
         if let End::Succeeded(done) = &end {
+            lock(&info.windows).extend(done.windows.iter().copied());
             let mut c = Change::to(Substatus::Ingesting);
             c.result = Some(JobResult {
                 structured: done.structured.clone(),
@@ -1329,7 +1387,7 @@ impl Shared {
     pub(crate) async fn handler_external_id(
         &self,
         id: &JobId,
-        external_id: &str,
+        external_id: Option<&str>,
         trace_id: &str,
     ) -> Result<(), ErrorBody> {
         let scope = {
@@ -1342,7 +1400,7 @@ impl Shared {
         let lock = self.job_lock(id.as_str());
         let _serial = lock.lock().await;
         let c = Change {
-            external_id: Some(external_id.to_string()),
+            external_id: Some(external_id.map(str::to_string)),
             ..Change::default()
         };
         match record::update(scope.db(), id.as_str(), c, self.now()).await {
@@ -1929,6 +1987,22 @@ impl Jobs {
                 row.substatus
                     .map_or_else(|| row.status.wire().to_string(), |s| s.wire())
             )));
+        }
+        // Ruling P3-R21: paid or hosted work that may have run is never retried by an agent on
+        // its own (Task 14 turns this into a confirmation). An `interrupted_unknown` job is retried
+        // by no one (above): it is resolved first.
+        if caller.caller.is_agent()
+            && row.external_side_effects
+            && row.substatus == Some(Substatus::Interrupted)
+        {
+            return Err(ErrorBody::new(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "Job {id} has external side effects and may have run (and been charged); \
+                     only you can retry it, from the app."
+                ),
+                trace_id.clone(),
+            ));
         }
         if caller.caller.is_agent()
             && let Some(rerun) = record::auto_rerun_of(scope.db(), id.as_str())

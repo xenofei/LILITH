@@ -15,8 +15,9 @@ pub use client::{
     ComfyClient, ComfyError, OutputFile, QueueEntry, QueueView, RemoteJob, RemoteState,
 };
 pub use handler::{
-    ComfyPromptHandler, DEFAULT_EXPECTED_SECS, DEFAULT_PREVIEW_METHOD, OOM_RETRIES, PROMPT_KIND,
-    PromptArgs, PromptInput, is_oom, prefix_outputs, prompt_spec, rejection_detail,
+    ComfyPromptHandler, DEFAULT_EXPECTED_OUTPUT_BYTES, DEFAULT_EXPECTED_SECS,
+    DEFAULT_PREVIEW_METHOD, OOM_RETRIES, PROMPT_KIND, PromptArgs, PromptInput, confine_input,
+    is_oom, prefix_outputs, prompt_spec, rejection_detail, safe_name,
 };
 pub use install::{INSTALL_KIND, NodeInstallHandler};
 pub use supervisor::ComfyEndpoint;

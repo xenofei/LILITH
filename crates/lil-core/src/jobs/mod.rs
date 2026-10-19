@@ -526,6 +526,8 @@ pub struct JobCtx {
     /// or its interrupted original's. `None` in the completions of a job that handed it to its
     /// re-run.
     pub reservation: Option<String>,
+    /// The execution windows the job's attempts reported ([`JobCtx::add_window`]).
+    pub(crate) windows: Arc<Mutex<Vec<ExecWindow>>>,
     pub(crate) jobs: Arc<runner::Shared>,
 }
 
@@ -557,8 +559,39 @@ impl JobCtx {
     /// longer runs the job or its row is final. The handler sends nothing then.
     pub async fn set_external_id(&self, external_id: &str) -> Result<(), ErrorBody> {
         self.jobs
-            .handler_external_id(&self.id, external_id, &self.trace_id)
+            .handler_external_id(&self.id, Some(external_id), &self.trace_id)
             .await
+    }
+
+    /// Clears the row's `external_id`: what it named provably never reached the engine (no
+    /// connection was made, or the engine refused it with 429 or 503), so a later attempt may
+    /// send a new one (CORE-128).
+    ///
+    /// # Errors
+    /// As [`JobCtx::set_external_id`].
+    pub async fn clear_external_id(&self) -> Result<(), ErrorBody> {
+        self.jobs
+            .handler_external_id(&self.id, None, &self.trace_id)
+            .await
+    }
+
+    /// Reports an execution window of the job's engine work, whatever the attempt's outcome
+    /// (CORE-065: a run that fails used the GPU too). A success's [`JobDone::windows`] are
+    /// added by the runner.
+    pub fn add_window(&self, w: ExecWindow) {
+        self.windows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(w);
+    }
+
+    /// Every execution window the job's attempts reported so far, a success's included: what
+    /// the completions (Task 15's meter) attribute energy to.
+    pub fn windows(&self) -> Vec<ExecWindow> {
+        self.windows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// A new UUID version 4 from the core's id source (an engine id the core mints, such as

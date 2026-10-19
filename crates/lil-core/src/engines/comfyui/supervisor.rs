@@ -38,6 +38,8 @@ use crate::meter::UsageSink;
 use crate::state::StateDb;
 use crate::telemetry::Telemetry;
 
+/// How often the supervisor sweeps the unused uploads.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// How often the supervisor asks `/system_stats`.
 const MONITOR_EVERY: Duration = Duration::from_secs(1);
 /// How often a start asks whether the engine answers yet.
@@ -157,6 +159,8 @@ pub(crate) struct Comfy {
     prompts: Arc<SuitePrompts>,
     /// The channel's `client_id`, read (or minted) once.
     client_id: tokio::sync::OnceCell<String>,
+    /// When the unused uploads were last swept (the core's monotonic clock).
+    swept: Mutex<Option<Duration>>,
 }
 
 impl Comfy {
@@ -208,7 +212,22 @@ impl Comfy {
             local_dir: env.local_dir(),
             prompts: Arc::default(),
             client_id: tokio::sync::OnceCell::new(),
+            swept: Mutex::new(None),
         })
+    }
+
+    /// At the core's start: the upload references a dead core left are dropped (review M3).
+    pub(crate) async fn reset_uploads(&self) {
+        Uploads::new(self.suite.clone(), self.clock.clone())
+            .reset()
+            .await;
+    }
+
+    /// Whether the owned engine whose launcher was `pid` has stopped: its prompts went with
+    /// it (an attached engine that stops answering may only be busy, so it never counts).
+    pub(crate) fn owned_gone(&self, pid: Option<u32>) -> bool {
+        let v = lock(&self.view).clone();
+        !(v.class == EngineClass::Owned && v.pid == pid) && matches!(v.state, EngineState::Stopped)
     }
 
     /// The HTTP client, when ComfyUI is configured.
@@ -421,11 +440,23 @@ impl Comfy {
             return;
         };
         let _pass = self.pass_gate.lock().await;
-        // Uploads no job has used for 24 h leave `<root>\input` (CORE-130).
+        // Uploads no job has used for 24 h leave `<root>\input` (CORE-130), looked at once a
+        // minute.
         if let Some(root) = &config.root {
-            Uploads::new(self.suite.clone(), self.clock.clone())
-                .sweep(root)
-                .await;
+            let now = self.clock.monotonic();
+            let due = {
+                let mut swept = lock(&self.swept);
+                let due = swept.is_none_or(|at| now.saturating_sub(at) >= SWEEP_EVERY);
+                if due {
+                    *swept = Some(now);
+                }
+                due
+            };
+            if due {
+                Uploads::new(self.suite.clone(), self.clock.clone())
+                    .sweep(root)
+                    .await;
+            }
         }
         let checks = self
             .passes

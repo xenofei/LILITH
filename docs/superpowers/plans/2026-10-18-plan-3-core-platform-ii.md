@@ -175,9 +175,9 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
   - **Retries and recovery** (CORE-128, QA-004, QA-007, QA-009, ARCH-022):
     - transient failures retry after 1 s, doubling to at most 30 s, at most 5 attempts, publishing `{kind: "retrying", attempt, of}` on `job:<id>`; disk full is final;
     - a disk preflight needs free space of 2 × `expected_output_bytes` + 64 MiB on the staging volume, else `store.disk_full` before submitting;
-    - CUDA out of memory (`execution_error` whose `exception_type` contains `OutOfMemoryError` or whose message contains `CUDA out of memory`) posts `/free` and retries, at most 2 times;
+    - CUDA out of memory (`execution_error` whose `exception_type` contains `OutOfMemoryError` or whose message contains `CUDA out of memory`) posts `/free` and retries, at most 2 times; a job with `external_side_effects` is never retried or posted again automatically: its out of memory is final, and a `POST /prompt` that may have reached the engine (anything but a failed connection or a 429/503 answer) is `interrupted_unknown`;
     - a ComfyUI restart that loses a known `prompt_id` (absent from `/queue`, `/api/jobs` and `/history`) makes the job `interrupted`; outputs already written are salvaged by the job's filename prefix; an `agent` job is re-run once automatically as a new job with `retry_of`;
-    - at startup every job without a final state becomes `interrupted`, or `interrupted_unknown` when it was `submitting` with `external_side_effects`; nothing re-runs;
+    - at startup every job without a final state becomes `interrupted`, or `interrupted_unknown` when it was `submitting` with `external_side_effects`; nothing re-runs. Exception (ruling P3-R21): a job with `external_side_effects` found in `queued_in_engine`, `executing` or `ingesting` is checked in its engine by its `external_id`: outputs of a prompt that finished are ingested, a prompt still queued or running is taken up again and followed, and any other becomes `interrupted_unknown` (never plain `interrupted`); it is never posted again. An agent's `job.retry` of an `interrupted` job with `external_side_effects` is refused with `confirm.unavailable` (plan 3a; Task 14 makes it a confirmation); an `interrupted_unknown` job is retried by no one until it is resolved (`job.not_retryable`);
     - shutdown: phase `CancelEnginePrompts` cancels the suite's own prompts through the per-job endpoint, `PersistInterrupted` marks the rest `interrupted`, `StopEngines` stops owned engines.
   - **Jobs log lines** (CORE-009, CORE-117, workspace format I8): one line per state change in `queue/jobs.<machine>.<yyyy-mm>.jsonl`, after `machine` and `seq`: `job_id, kind, lane, priority, project, asset_id, module, run_id, doc_id, status, substatus, attempt, submitted, updated, outputs, error, idempotency_key, trace_id, usage, hardware`. Jobs without a workspace write no log line.
   - **ComfyUI engine** (ARCH-064, ARCH-065, ARCH-068, ARCH-069, CORE-131):
@@ -193,7 +193,7 @@ Decisions made in this plan. Each stands unless the owner says otherwise; the qu
   - **ComfyUI client** (CORE-018, CORE-120, CORE-130, ARCH-057):
     - one `client_id` per channel, kept in the suite `state.db`; `POST /prompt {prompt, client_id, prompt_id, extra_data: {preview_method, lil_trace_id}}` with a core-minted canonical lowercase UUID, persisted as `submitting` before it is sent; before any resubmission within a core run, the core checks `/api/jobs/{id}` and `/history/{id}`;
     - every `SaveImage`-type node's `filename_prefix` is set to `lil_<first 16 hex of the job id>_`; outputs come from `/history` and `/view` into a staging handle (or `%LOCALAPPDATA%\LILITH\cache\jobs\<job_id>\` without a workspace), then, when `root` is known, each ComfyUI-side copy with that prefix is removed only after its staged copy has been verified (same size, and SHA-256 equal to the hash taken while streaming `/view`);
-    - inputs are uploaded once through `/upload/image` as `lil_<first 16 hex of sha256>.<ext>`, reference-counted in the suite `state.db`, and removed from `<root>\input` 24 h after their count reaches 0;
+    - inputs are uploaded once through `/upload/image` as `lil_<first 16 hex of sha256>.<ext>`, reference-counted in the suite `state.db`, and removed from `<root>\input` 24 h after their count reaches 0; a `comfy.prompt` job's arguments are `{graph, preview_method?, inputs?: [{node, input, path}]}`, where `path` is an absolute path of a file inside the job's workspace (a valid workspace path, not under `.lilith\`, the legacy data folder or `.git\`) or directly in its cache folder, reached through no link or junction, at most 256 MiB; anything else is `params.invalid`, checked with the node before any upload;
     - websocket `/ws?clientId=<id>`: `execution_start`, `executing`, `progress`, `executed`, `execution_success`, `execution_error`, `execution_interrupted`, and binary preview frames (4-byte event type 1, 4-byte image type 1 = JPEG or 2 = PNG), which ComfyUI sends only to a client that hasn't announced the `supports_preview_metadata` feature flag, so the core never announces it; a preview of at most 1 MB is published on `preview:<job_id>` as `{format, data_b64}`;
     - the executed graph is recorded from `/history`; `/free` is followed by a VRAM re-read;
     - a `POST /prompt` answered `400` fails the job at once with `comfyui.execution_failed`: no retry, no `/free`, no resubmission. When the body has `node_errors`, the error's detail is `untrusted` and is compact JSON text of up to 20 entries `{node_id, class_type, input, message}`, one per error (`node_id` is the key in `node_errors`; `class_type`, `input` (`extra_info.input_name`) and `message` come from the reply; a missing field is `""`), whole entries only, at most 2,048 bytes; a `400` without `node_errors` has the body text, cut at 2,048 bytes, as its detail;
@@ -1170,7 +1170,7 @@ pub const MAX_PREVIEW_BYTES: usize = 1_048_576;          // ARCH-033
 pub const OOM_RETRIES: u32 = 2;
 pub fn prefix_outputs(graph: &mut serde_json::Value, job: &JobId) -> String;   // returns "lil_<16 hex>_"
 pub fn is_oom(exception_type: &str, message: &str) -> bool;
-pub struct ComfyPromptHandler;  // JobHandler kind "comfy.prompt"; args {graph, preview_method?}
+pub struct ComfyPromptHandler;  // JobHandler kind "comfy.prompt"; args {graph, preview_method?, inputs?: [{node, input, path}]}
 ```
 
 - [ ] **Step 1: Write the failing tests:**
@@ -1212,7 +1212,7 @@ git commit -m "engines: ComfyUI client and comfy.prompt jobs, exactly-once submi
 - Test: `crates/lil-core/tests/comfy_observe.rs`; unit tests in `graph.rs`.
 
 **Interfaces:**
-- Consumes: Task 11's `UsageSink`, `UsageDraft`, `UsageCtx`; Task 12's `ComfyClient`.
+- Consumes: Task 11's `UsageSink`, `UsageDraft`, `UsageCtx`; Task 12's `ComfyClient`. A tool that submits `comfy.prompt` jobs passes inputs as `inputs: [{node, input, path}]` (Appendix F "ComfyUI client"; the handler confines `path` to the job's workspace or cache folder).
   - Carry from Task 11's review (I2): `UsageDraft` has `status: UsageStatus` (`Pending`, `Succeeded`, `Failed`, `Cancelled`) and `latency_ms: Option<u64>`; an unattributed outside-prompt draft sets them from what was observed. The write-ahead `pending` record is Task 15's (below).
   - From `jobs` (Task 8, final): `Admission::admit(&self, spec: &JobSpec) -> Admit` with `Admit::{Go, GoUnchecked, WaitForVram { need_mib, free_mib }}`. `Admit` has no plain wait, and `WaitForVram` would show `waiting_for_vram`, so this task adds `Admit::Wait` (substatus stays `waiting`);
   - `Jobs::kick()` after each poll, so a held job is looked at again;

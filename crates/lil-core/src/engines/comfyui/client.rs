@@ -31,13 +31,19 @@ const MAX_ERROR_BODY: usize = 4096;
 /// The most of a `POST /prompt` rejection's body an error keeps: its `node_errors` are read
 /// from it.
 const MAX_PROMPT_ERROR_BODY: usize = 1024 * 1024;
+/// The largest output a `/view` download takes (a larger one fails, and its file is removed).
+pub const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// How long a `/view` download or an `/upload/image` may take: outputs can be large.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Why a request to ComfyUI failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComfyError {
-    /// Nothing answered (refused, reset, timed out).
+    /// No connection was made, so nothing was sent (CORE-128: the request provably wasn't
+    /// processed).
+    Refused(String),
+    /// Nothing answered after the connection was made (reset, timed out): a request may have
+    /// arrived.
     Unreachable(String),
     /// It answered with this status; the body is ComfyUI's text, untrusted (ARCH-060).
     Http(u16, String),
@@ -50,6 +56,9 @@ pub enum ComfyError {
 impl std::fmt::Display for ComfyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ComfyError::Refused(why) => {
+                write!(f, "ComfyUI is not answering (no connection): {why}")
+            }
             ComfyError::Unreachable(why) => write!(f, "ComfyUI is not answering: {why}"),
             ComfyError::Http(status, _) => write!(f, "ComfyUI answered HTTP {status}"),
             ComfyError::Protocol(why) => write!(f, "ComfyUI's answer was not understood: {why}"),
@@ -66,6 +75,8 @@ pub enum RemoteState {
     Running,
     /// Ended (whatever way): its `/history` entry.
     Done(Value),
+    /// `/api/jobs/{id}` says `cancelled`, with no history entry: someone cancelled it.
+    Cancelled,
     /// Absent from `/api/jobs`, `/history` and `/queue`: ComfyUI never had it, or lost it in a
     /// restart (CORE-128).
     Gone,
@@ -323,6 +334,12 @@ impl ComfyClient {
             match job.get("status").and_then(Value::as_str) {
                 Some("pending") => return Ok(RemoteState::Queued),
                 Some("in_progress") => return Ok(RemoteState::Running),
+                Some("cancelled") => {
+                    return Ok(match self.history(prompt_id).await? {
+                        Some(history) => RemoteState::Done(history),
+                        None => RemoteState::Cancelled,
+                    });
+                }
                 _ => {}
             }
         }
@@ -355,8 +372,8 @@ impl ComfyClient {
     }
 
     /// `GET /view` of `file`, streamed into the new file `dest` (never an existing one), with
-    /// the SHA-256 of the stream taken on the way: `(bytes, sha256)`. A failed download leaves
-    /// no file.
+    /// the SHA-256 of the stream taken on the way: `(bytes, sha256)`. A failed download, or one
+    /// over [`MAX_OUTPUT_BYTES`], leaves no file.
     ///
     /// # Errors
     /// [`ComfyError`]; [`ComfyError::Io`] when `dest` can't be created or written.
@@ -385,6 +402,11 @@ impl ComfyClient {
         while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
             hash.update(&chunk);
             size += chunk.len() as u64;
+            if size > MAX_OUTPUT_BYTES {
+                return Err(ComfyError::Protocol(format!(
+                    "the output is larger than {MAX_OUTPUT_BYTES} bytes"
+                )));
+            }
             out.write(&chunk).map_err(io)?;
         }
         out.finish().map_err(io)?;
@@ -398,14 +420,23 @@ impl ComfyClient {
     /// [`ComfyError`]; [`ComfyError::Io`] when `src` can't be read; an answer that kept the
     /// file under another name is [`ComfyError::Protocol`].
     pub async fn upload_image(&self, name: &str, src: &Path) -> Result<(), ComfyError> {
+        let bytes =
+            std::fs::read(src).map_err(|e| ComfyError::Io(format!("{}: {e}", src.display())))?;
+        self.upload_bytes(name, &bytes).await
+    }
+
+    /// [`ComfyClient::upload_image`] of `bytes` already read (so what is sent is what was
+    /// hashed).
+    ///
+    /// # Errors
+    /// As [`ComfyClient::upload_image`].
+    pub async fn upload_bytes(&self, name: &str, bytes: &[u8]) -> Result<(), ComfyError> {
         if name.is_empty() || name.contains(['"', '\\', '/', '\r', '\n']) {
             return Err(ComfyError::Protocol(format!(
                 "{name:?} is not an upload name"
             )));
         }
-        let bytes =
-            std::fs::read(src).map_err(|e| ComfyError::Io(format!("{}: {e}", src.display())))?;
-        let boundary = format!("lil-upload-{}", &hex(&Sha256::digest(&bytes))[..24]);
+        let boundary = format!("lil-upload-{}", &hex(&Sha256::digest(bytes))[..24]);
         let mut body = Vec::with_capacity(bytes.len() + 512);
         body.extend_from_slice(
             format!(
@@ -414,7 +445,7 @@ impl ComfyClient {
             )
             .as_bytes(),
         );
-        body.extend_from_slice(&bytes);
+        body.extend_from_slice(bytes);
         body.extend_from_slice(
             format!(
                 "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\n\
@@ -514,7 +545,11 @@ impl ComfyClient {
 }
 
 fn unreachable(e: reqwest::Error) -> ComfyError {
-    ComfyError::Unreachable(e.to_string())
+    if e.is_connect() {
+        ComfyError::Refused(e.to_string())
+    } else {
+        ComfyError::Unreachable(e.to_string())
+    }
 }
 
 /// Lowercase hex.

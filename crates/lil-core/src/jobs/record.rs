@@ -164,8 +164,8 @@ pub struct Change {
     pub vram_unchecked: Option<bool>,
     /// Sets the watchdog flag (`"slow"`); it is never cleared.
     pub watchdog: Option<String>,
-    /// Sets the engine's id for the job (CORE-120).
-    pub external_id: Option<String>,
+    /// Sets (or, `Some(None)`, clears) the engine's id for the job (CORE-120).
+    pub external_id: Option<Option<String>>,
 }
 
 impl Change {
@@ -444,7 +444,7 @@ pub async fn update(
                 r.watchdog = Some(watchdog);
             }
             if let Some(external_id) = c.external_id {
-                r.external_id = Some(external_id);
+                r.external_id = external_id;
             }
             r.updated_utc = now_utc;
             tx.execute(

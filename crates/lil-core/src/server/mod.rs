@@ -474,6 +474,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.sockets.clone(),
     );
     let _ = engine_slot.set(engines.clone());
+    engines.startup().await;
     jobs.set_admission(GpuScheduler::new(telemetry.clone(), engines.clone()));
     // ComfyUI's models folder is measured with the workspace (CORE-061).
     let models = engines

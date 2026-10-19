@@ -23,19 +23,20 @@ use std::time::{Duration, Instant};
 
 use lil_core::engines::Engines;
 use lil_core::engines::comfyui::{
-    DEFAULT_EXPECTED_SECS, PROMPT_KIND, Uploads, prompt_spec, upload_name,
+    ComfyClient, DEFAULT_EXPECTED_SECS, PROMPT_KIND, Uploads, prefix_outputs, prompt_spec,
+    upload_name,
 };
 use lil_core::events::EventBus;
 use lil_core::jobs::record::{self, JobRow};
 use lil_core::jobs::{
-    ExecWindow, JobCaller, JobCompletion, JobCtx, JobDone, JobFilter, JobFuture, JobId, JobStatus,
-    JobSummary, Jobs, Priority, SubmittedSlot,
+    EngineKind, ExecWindow, JobCaller, JobCompletion, JobCtx, JobDone, JobFilter, JobFuture, JobId,
+    JobOrigin, JobStatus, JobSummary, Jobs, Lane, Priority, SubmittedSlot, Substatus,
 };
 use lil_core::lifecycle::ShutdownPhase;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::telemetry::{HwSources, PowerSettings, Telemetry, TickMode};
-use lil_core::workspace::WorkspaceHub;
+use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::SystemProbe;
 use lil_platform::sockets::OsSockets;
 use lil_platform::{Clock, IdSource};
@@ -54,7 +55,7 @@ const POLL: Duration = Duration::from_millis(20);
 // The rig.
 // ---------------------------------------------------------------------------------------------
 
-/// Keeps every finished job's execution windows.
+/// Keeps every finished job's execution windows (`JobCtx::windows`: every attempt's).
 #[derive(Default)]
 struct Windows(Mutex<Vec<(String, Vec<ExecWindow>)>>);
 
@@ -65,8 +66,18 @@ impl JobCompletion for Windows {
         _outcome: &'a Outcome<ToolOutput>,
         done: Option<&'a JobDone>,
     ) -> JobFuture<'a, ()> {
-        let windows = done.map(|d| d.windows.clone()).unwrap_or_default();
-        self.0.lock().unwrap().push((job.id.to_string(), windows));
+        if let Some(done) = done {
+            for w in &done.windows {
+                assert!(
+                    job.windows().contains(w),
+                    "a success's window is in the job's"
+                );
+            }
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .push((job.id.to_string(), job.windows()));
         Box::pin(std::future::ready(()))
     }
 }
@@ -80,7 +91,20 @@ struct Rig {
     failpoints: Arc<FailPoints>,
     windows: Arc<Windows>,
     states: Arc<StateRegistry>,
+    hub: Arc<WorkspaceHub>,
+    /// The workspace the rig's jobs run in ([`Rig::in_workspace`]); `None`: the suite's.
+    open: Option<Arc<OpenWorkspace>>,
     _telemetry: Arc<Telemetry>,
+}
+
+/// The `WorkspaceRef` of the folder `ws`.
+fn ws_ref(ws: &Path) -> WorkspaceRef {
+    let canonical = std::fs::canonicalize(ws).expect("canonicalize");
+    let text = canonical.to_string_lossy().into_owned();
+    WorkspaceRef {
+        id: lil_platform::Env::workspace_hash(&canonical),
+        path: std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)),
+    }
 }
 
 /// `[engines.comfyui]` for the attached `fake`, with its `root`.
@@ -120,7 +144,7 @@ impl Rig {
         );
         let jobs = Jobs::new(
             states.clone(),
-            hub,
+            hub.clone(),
             events.clone(),
             dyn_clock.clone(),
             ids,
@@ -154,15 +178,34 @@ impl Rig {
             failpoints,
             windows,
             states,
+            hub,
+            open: None,
             _telemetry: telemetry,
         }
     }
 
+    /// [`Rig::new`] whose jobs run in a new workspace `ws-comfy` (registered and opened).
+    async fn in_workspace(env: &TestEnv) -> Rig {
+        let ws = env.make_workspace("comfy");
+        env.register_workspace(&ws, true);
+        let mut rig = Rig::new(env);
+        rig.open = Some(rig.hub.open(&ws_ref(&ws)).await.unwrap());
+        rig
+    }
+
     fn caller(&self) -> JobCaller {
+        self.caller_as(CallerKind::Cli)
+    }
+
+    fn caller_as(&self, caller: CallerKind) -> JobCaller {
+        let ws = self
+            .open
+            .as_ref()
+            .map_or("none".to_string(), |o| o.ws.id.clone());
         JobCaller {
-            caller: CallerKind::Cli,
-            idem_scope: "cli|none".into(),
-            workspace: None,
+            idem_scope: format!("{caller}|{ws}"),
+            caller,
+            workspace: self.open.clone(),
             trace_id: "t_comfy".into(),
             idem_key: None,
             call_id: "c_0000000000000001".into(),
@@ -204,7 +247,18 @@ impl Rig {
     }
 
     async fn row(&self, id: &str) -> JobRow {
-        record::get(self.states.suite(), id).await.unwrap().unwrap()
+        let db = match &self.open {
+            Some(open) => &*open.state,
+            None => self.states.suite(),
+        };
+        record::get(db, id).await.unwrap().unwrap()
+    }
+
+    /// Submits `args` as a job with external side effects (paid or hosted work).
+    async fn submit_external(&self, args: Value, priority: Priority) -> String {
+        let mut spec = prompt_spec(args, priority, "test", None, DEFAULT_EXPECTED_SECS);
+        spec.external_side_effects = true;
+        self.jobs.submit(&self.caller(), spec).await.unwrap().job_id
     }
 
     /// Polls until the job's summary satisfies `pred`; returns it.
@@ -239,8 +293,11 @@ impl Rig {
     }
 
     /// Closes the rig's databases (as a core's shutdown does), so another rig can open them.
-    async fn close(self) {
+    async fn close(mut self) {
         let states = self.states.clone();
+        if let Some(open) = self.open.take() {
+            drop(open);
+        }
         drop(self);
         tokio::task::spawn_blocking(move || states.close())
             .await
@@ -670,8 +727,16 @@ async fn outputs_are_fetched_into_staging_with_the_prefix_and_engine_copies_remo
     let id = rig.submit(tiny_args(1), Priority::Agent).await;
     let failed = rig.done(&id).await;
     assert_eq!(failed.status, JobStatus::Failed, "{failed:?}");
-    assert_eq!(failed.error.unwrap().code, "store.io");
+    let error = failed.error.unwrap();
+    assert_eq!(error.code, "store.io");
     let prefix = format!("lil_{}_", &id[2..]);
+    // ComfyUI's file name is untrusted detail, never in the message (M1).
+    assert!(!error.message.contains(&prefix), "{error:?}");
+    let detail = error.detail.unwrap();
+    assert!(
+        detail.untrusted && detail.text.contains(&prefix),
+        "{detail:?}"
+    );
     assert_eq!(
         files_with_prefix(&output, &prefix).len(),
         1,
@@ -689,8 +754,9 @@ async fn uploads_are_hash_named_once_and_reference_counted() {
     let env = TestEnv::new();
     let fake = FakeComfy::start();
     attach(&env, &fake);
-    let rig = Rig::new(&env);
-    let input = env.root().join("source.PNG");
+    let rig = Rig::in_workspace(&env).await;
+    let ws_root = rig.open.as_ref().unwrap().store.root().to_path_buf();
+    let input = ws_root.join("source.PNG");
     let bytes = b"not really a png, but the fake doesn't look";
     lil_testkit::files::write_file(&input, bytes);
     let name = format!("lil_{}.png", &sha256(bytes)[..16]);
@@ -708,6 +774,40 @@ async fn uploads_are_hash_named_once_and_reference_counted() {
     }
     let in_comfy = fake.root().join("input").join(&name);
     assert_eq!(std::fs::read(&in_comfy).unwrap(), bytes);
+
+    // Inputs outside the job's workspace and cache folder are refused before any upload (I3).
+    let outside = env.root().join("outside.png");
+    lil_testkit::files::write_file(&outside, b"elsewhere");
+    lil_testkit::files::write_file(&ws_root.join(".lilith").join("private.png"), b"data");
+    for path in [
+        json!("Cargo.toml"),
+        json!(outside),
+        json!(ws_root.join("sub").join("..").join("source.PNG")),
+        json!(ws_root.join(".lilith").join("private.png")),
+    ] {
+        let mut graph = tiny(1);
+        graph["9"] = json!({"class_type": "LoadImage", "inputs": {"image": "placeholder"}});
+        let args =
+            json!({"graph": graph, "inputs": [{"node": "9", "input": "image", "path": path}]});
+        let id = rig.submit(args, Priority::Agent).await;
+        let failed = rig.done(&id).await;
+        assert_eq!(
+            failed.error.as_ref().map(|e| e.code.as_str()),
+            Some("params.invalid"),
+            "{path}: {failed:?}"
+        );
+    }
+    // An input naming a node the graph doesn't have is refused before the upload too.
+    let args =
+        json!({"graph": tiny(1), "inputs": [{"node": "9", "input": "image", "path": input}]});
+    let id = rig.submit(args, Priority::Agent).await;
+    assert_eq!(rig.done(&id).await.error.unwrap().code, "params.invalid");
+    assert_eq!(
+        count(&fake, "POST", "/upload/image"),
+        1,
+        "no refused input was uploaded"
+    );
+    assert_eq!(posted(&fake).len(), 2);
 
     let uploads = Uploads::new(rig.jobs.suite_state(), rig.clock.clone());
     assert_eq!(
@@ -729,6 +829,14 @@ async fn uploads_are_hash_named_once_and_reference_counted() {
     assert_eq!(count(&fake, "POST", "/upload/image"), 1, "still once");
     uploads.release(&name).await;
     uploads.release(&name).await;
+    assert_eq!(uploads.refs(&name).await, Some(0));
+    // A reference a dead core never gave back is dropped at the next start (M3).
+    uploads
+        .acquire(&client, &input, Some(&fake.root()))
+        .await
+        .unwrap();
+    assert_eq!(uploads.refs(&name).await, Some(1));
+    rig.engines.startup().await;
     assert_eq!(uploads.refs(&name).await, Some(0));
 
     // Removed 24 h after the count reached 0, not before.
@@ -911,6 +1019,10 @@ async fn oom_frees_then_retries_at_most_twice() {
         2,
         "a /free before each retry only"
     );
+    // Each failed run reports its execution window (CORE-065, I6).
+    let windows = job_windows(&rig, &id);
+    assert_eq!(windows.len(), 3, "{windows:?}");
+    assert!(windows.iter().all(|w| !w.ok), "{windows:?}");
 
     for _ in 0..2 {
         fake.fail_next(FakeFailure::Oom);
@@ -1163,4 +1275,473 @@ async fn outside_cancel_of_a_suite_prompt_fails_the_job_without_resubmitting() {
             .any(|r| r.path.ends_with("/interrupt"))
     );
     assert!(rig.all_jobs().await.iter().all(|j| j.retry_of.is_none()));
+}
+
+/// The windows the completions saw for `id`.
+fn job_windows(rig: &Rig, id: &str) -> Vec<ExecWindow> {
+    rig.windows
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(job, _)| job == id)
+        .map(|(_, w)| w.clone())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1: external side effects (C1, P3-R21), outside cancels (I1), the shutdown gate
+// (I2), silence (I4), prefixes and names (I5, I7), previews (M2).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-128, ARCH-072
+async fn external_side_effects_oom_is_never_retried() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.fail_next(FakeFailure::Oom);
+    let rig = Rig::new(&env);
+    let id = rig.submit_external(tiny_args(1), Priority::Agent).await;
+    let failed = rig.done(&id).await;
+    assert_eq!(
+        (failed.status, failed.attempt),
+        (JobStatus::Failed, 1),
+        "{failed:?}"
+    );
+    assert_eq!(failed.error.unwrap().code, "comfyui.out_of_memory");
+    assert_eq!(posted(&fake).len(), 1, "paid work is never re-posted");
+    assert_eq!(count(&fake, "POST", "/free"), 1, "still freed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-128, CORE-120
+async fn an_external_post_that_may_have_landed_is_unknown_and_never_reposted() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    // ComfyUI drops the connection, then queues the prompt a moment after the core looked.
+    fake.fail_next(FakeFailure::AcceptLate);
+    let rig = Rig::new(&env);
+    let id = rig.submit_external(tiny_args(1), Priority::Agent).await;
+    let unknown = rig
+        .until(&id, "interrupted_unknown", |j| {
+            j.substatus.as_deref() == Some("interrupted_unknown")
+        })
+        .await;
+    assert_eq!(unknown.attempt, 1, "{unknown:?}");
+    let prompt_id = rig.row(&id).await.external_id.unwrap();
+    assert_eq!(
+        posted(&fake).len(),
+        1,
+        "never re-posted, whatever the look says"
+    );
+    assert_eq!(
+        count(&fake, "POST", &format!("/jobs/{prompt_id}/cancel")),
+        1,
+        "the abandoned prompt is cancelled (M4)"
+    );
+}
+
+/// The `jobs` row an earlier core left for `job_id`: a `comfy.prompt` job in `substatus`
+/// whose prompt is `prompt_id`.
+fn earlier_row(job_id: &str, prompt_id: &str, substatus: Substatus, external: bool) -> JobRow {
+    let mut graph = tiny(1);
+    prefix_outputs(&mut graph, &JobId(job_id.into()));
+    JobRow {
+        seq: 0,
+        job_id: job_id.into(),
+        kind: PROMPT_KIND.into(),
+        lane: Lane::GpuHeavy,
+        priority: Priority::Agent,
+        module: "test".into(),
+        args: json!({"graph": graph}),
+        project: None,
+        asset_id: None,
+        doc_id: None,
+        status: substatus.status(),
+        substatus: Some(substatus),
+        attempt: 1,
+        created_utc: 0,
+        updated_utc: 0,
+        started_utc: Some(0),
+        finished_utc: None,
+        watchdog: None,
+        vram_unchecked: false,
+        error: None,
+        result: None,
+        retry_of: None,
+        trace_id: "t_earlier".into(),
+        idem_scope: None,
+        idem_key: None,
+        args_hash: "h".into(),
+        expected_secs: DEFAULT_EXPECTED_SECS,
+        expected_output_bytes: 0,
+        vram_need_mib: None,
+        engine: Some(EngineKind::ComfyUi),
+        group: None,
+        external_side_effects: external,
+        reservation: None,
+        origin: Some(JobOrigin {
+            tool: "test.comfy_submit".into(),
+            arguments: json!({}),
+        }),
+        external_id: Some(prompt_id.into()),
+    }
+}
+
+/// Posts `row`'s graph to the fake as the earlier core did.
+async fn post_as_earlier_core(fake: &FakeComfy, row: &JobRow) {
+    let client = ComfyClient::new(&fake.url())
+        .unwrap()
+        .with_client_id("earlier-core".into());
+    client
+        .submit(
+            row.external_id.as_deref().unwrap(),
+            &row.args["graph"],
+            "taesd",
+            "t_earlier",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-128, ARCH-022
+async fn recovery_takes_up_external_jobs_still_in_comfyui() {
+    // Ruling P3-R21: a job with external side effects an earlier core left in ComfyUI is
+    // followed (still running), ingested (finished) or interrupted_unknown (gone); never
+    // posted again. A local job is interrupted as before.
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let running = earlier_row(
+        "j_00000000000000a1",
+        "00000000-0000-4000-8000-0000000000a1",
+        Substatus::Executing,
+        true,
+    );
+    let finished = earlier_row(
+        "j_00000000000000a2",
+        "00000000-0000-4000-8000-0000000000a2",
+        Substatus::Ingesting,
+        true,
+    );
+    let gone = earlier_row(
+        "j_00000000000000a3",
+        "00000000-0000-4000-8000-0000000000a3",
+        Substatus::QueuedInEngine,
+        true,
+    );
+    let local = earlier_row(
+        "j_00000000000000a4",
+        "00000000-0000-4000-8000-0000000000a4",
+        Substatus::Executing,
+        false,
+    );
+    // The finished one ran to its end while no core was there; the running one is held.
+    post_as_earlier_core(&fake, &finished).await;
+    let client = ComfyClient::new(&fake.url()).unwrap();
+    let deadline = Instant::now() + DEADLINE;
+    while client
+        .history(finished.external_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the earlier prompt did not finish"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    fake.hold_prompts(true);
+    post_as_earlier_core(&fake, &running).await;
+    let posts_before = posted(&fake).len();
+
+    let rig = Rig::new(&env);
+    for row in [&running, &finished, &gone, &local] {
+        record::insert(rig.states.suite(), row.clone())
+            .await
+            .unwrap();
+    }
+    rig.jobs.recover_suite().await.unwrap();
+
+    let local_done = rig.row(&local.job_id).await;
+    assert_eq!(
+        (local_done.status, local_done.substatus),
+        (JobStatus::Failed, Some(Substatus::Interrupted))
+    );
+    // One lane: the running one is taken up first, then the others.
+    rig.executing(&running.job_id).await;
+    fake.release(running.external_id.as_deref().unwrap());
+    let followed = rig.done(&running.job_id).await;
+    assert_eq!(followed.status, JobStatus::Succeeded, "{followed:?}");
+    let ingested = rig.done(&finished.job_id).await;
+    assert_eq!(ingested.status, JobStatus::Succeeded, "{ingested:?}");
+    assert_eq!(ingested.result.unwrap().artifacts.len(), 1);
+    let gone_done = rig
+        .until(&gone.job_id, "interrupted_unknown", |j| {
+            j.substatus.as_deref() == Some("interrupted_unknown")
+        })
+        .await;
+    assert_eq!(gone_done.status, JobStatus::Running);
+    assert_eq!(
+        posted(&fake).len(),
+        posts_before,
+        "nothing was posted again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-128, ARCH-052
+async fn agents_never_retry_interrupted_external_jobs() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let rig = Rig::new(&env);
+    let mut paid = earlier_row(
+        "j_00000000000000b1",
+        "00000000-0000-4000-8000-0000000000b1",
+        Substatus::Interrupted,
+        true,
+    );
+    paid.finished_utc = Some(0);
+    let mut local = paid.clone();
+    local.job_id = "j_00000000000000b2".into();
+    local.external_side_effects = false;
+    let mut unknown = paid.clone();
+    unknown.job_id = "j_00000000000000b3".into();
+    unknown.status = JobStatus::Running;
+    unknown.substatus = Some(Substatus::InterruptedUnknown);
+    for row in [&paid, &local, &unknown] {
+        record::insert(rig.states.suite(), row.clone())
+            .await
+            .unwrap();
+    }
+    for (id, code) in [
+        (&paid.job_id, "confirm.unavailable"),
+        // Retried by no one until it is resolved.
+        (&unknown.job_id, "job.not_retryable"),
+    ] {
+        let refused = rig
+            .jobs
+            .retry_origin(&rig.caller(), &JobId(id.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, code, "{id}: {refused:?}");
+    }
+    assert!(
+        rig.jobs
+            .retry_origin(&rig.caller(), &JobId(local.job_id.clone()))
+            .await
+            .is_ok()
+    );
+    // You may retry it from the app.
+    let app = rig.caller_as(CallerKind::Ui("image".into()));
+    assert!(
+        rig.jobs
+            .retry_origin(&app, &JobId(paid.job_id.clone()))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-069, CORE-120
+async fn outside_cancel_of_a_queued_suite_prompt_fails_the_job_without_a_rerun() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "queued in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let prompt_id = rig.row(&id).await.external_id.unwrap();
+    assert_eq!(
+        post_raw(fake.port(), &format!("/api/jobs/{prompt_id}/cancel")),
+        200
+    );
+    let failed = rig.done(&id).await;
+    assert_eq!(
+        (failed.status, failed.attempt),
+        (JobStatus::Failed, 1),
+        "{failed:?}"
+    );
+    assert_eq!(
+        failed.substatus, None,
+        "failed, not interrupted: {failed:?}"
+    );
+    let error = failed.error.unwrap();
+    assert_eq!(error.code, "comfyui.execution_failed");
+    assert!(
+        error.message.contains("cancelled from outside the suite"),
+        "{error:?}"
+    );
+    assert!(
+        rig.all_jobs().await.iter().all(|j| j.retry_of.is_none()),
+        "no re-run"
+    );
+    assert_eq!(posted(&fake).len(), 1);
+    fake.release(&outside);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-021
+async fn no_prompt_is_posted_once_the_shutdown_step_ran() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let rig = Rig::new(&env);
+    // The job is `submitting` (its handler not yet in ComfyUI's prompts) when the step runs.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, go_rx) = (Mutex::new(entered_tx), Mutex::new(go_rx));
+    rig.failpoints.on(
+        "jobs.after_submitting",
+        Box::new(move || {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = go_rx.lock().unwrap().recv();
+            Ok(())
+        }),
+    );
+    let id = rig.submit(tiny_args(1), Priority::User).await;
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+    rig.engines.cancel_prompts_step().run().await;
+    go_tx.send(()).unwrap();
+    let done = rig.done(&id).await;
+    assert_eq!(
+        (done.status, done.substatus.as_deref()),
+        (JobStatus::Failed, Some("interrupted")),
+        "{done:?}"
+    );
+    assert!(
+        posted(&fake).is_empty(),
+        "nothing was posted after the step"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-128, CORE-123
+async fn silence_is_not_a_lost_prompt() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.hold_prompts(true);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.executing(&id).await;
+    let prompt_id = rig.row(&id).await.external_id.unwrap();
+    // ComfyUI stops answering HTTP for three of the job's looks; its websocket stays.
+    fake.refuse_http(true);
+    let looks = |fake: &FakeComfy| count(fake, "GET", &format!("/jobs/{prompt_id}"));
+    let before = looks(&fake);
+    rig.until(&id, "three refused looks", |_| looks(&fake) >= before + 3)
+        .await;
+    assert_eq!(
+        rig.summary(&id).await.status,
+        JobStatus::Running,
+        "still followed"
+    );
+    fake.refuse_http(false);
+    fake.release(&prompt_id);
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert_eq!(posted(&fake).len(), 1);
+    assert!(rig.all_jobs().await.iter().all(|j| j.retry_of.is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130, ARCH-060
+async fn only_prefixed_engine_copies_are_removed_and_unsafe_names_are_never_staged() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    // A custom save node reports a file of its own, and one whose name would leave staging.
+    fake.report_extra_output("custom_00001_.png", true);
+    fake.report_extra_output("C:evil.png", false);
+    let rig = Rig::new(&env);
+    let mut graph = tiny(1);
+    graph["2"]["inputs"]["filename_prefix"] = json!(["3", 0]);
+    graph["3"] = json!({"class_type": "PrimitiveString", "inputs": {"value": "mine"}});
+    let id = rig.submit(json!({"graph": graph}), Priority::Agent).await;
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    let prefix = format!("lil_{}_", &id[2..]);
+    assert_eq!(
+        posted(&fake)[0]["prompt"]["2"]["inputs"]["filename_prefix"],
+        prefix.as_str(),
+        "a linked prefix is replaced too"
+    );
+    let names: Vec<String> = done
+        .result
+        .unwrap()
+        .artifacts
+        .iter()
+        .map(|a| {
+            Path::new(&a.path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names[0].starts_with(&prefix) && names[1] == "custom_00001_.png",
+        "{names:?}"
+    );
+    let output = fake.output_dir();
+    assert!(
+        files_with_prefix(&output, &prefix).is_empty(),
+        "the job's copy is removed"
+    );
+    assert!(
+        output.join("custom_00001_.png").is_file(),
+        "a copy without the prefix stays"
+    );
+    let cache = env.env.local_dir().join("cache").join("jobs").join(&id);
+    assert_eq!(
+        std::fs::read_dir(&cache).unwrap().count(),
+        2,
+        "nothing else was staged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-033
+async fn previews_before_the_jobs_own_execution_are_dropped() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.hold_prompts(true);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "queued in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    rig.events.attach(1, tx);
+    rig.events
+        .subscribe(1, &[format!("preview:{id}")], &BTreeMap::new())
+        .await;
+    // The outside prompt's preview, while the job's prompt waits.
+    fake.send_preview(2, 10);
+    fake.release(&outside);
+    rig.executing(&id).await;
+    fake.send_preview(1, 20);
+    let first = loop {
+        let line = tokio::time::timeout(DEADLINE, rx.recv())
+            .await
+            .expect("a preview event")
+            .unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["params"]["kind"] == "event" {
+            break v["params"]["data"].clone();
+        }
+    };
+    assert_eq!(
+        first["format"], "jpeg",
+        "the earlier preview was dropped: {first}"
+    );
+    fake.hold_prompts(false);
+    rig.done(&id).await;
 }
