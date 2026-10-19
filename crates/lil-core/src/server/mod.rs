@@ -30,6 +30,10 @@
 //!   router's `app/*` methods and an idle blocker (ARCH-020; never a drain's). The suite
 //!   database's pending ones are loaded at start, the default workspace's once it opens, and
 //!   expired ones are marked every second.
+//! - The meter ([`crate::meter`]) is stage 8 ([`MeterSettle`]), the engines' usage sink, and the
+//!   jobs' first completion; it registers `usage.summary` (and `test.meter_external` on test
+//!   channels), and turns the usage rows a dead core left into `pending` lines: the suite's
+//!   before the core serves, the default workspace's once it opens.
 //! - The engines ([`crate::engines`]) are built once the dispatcher's jobs exist (their tools
 //!   find them through a slot filled before the core serves). They register the node-install
 //!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
@@ -64,7 +68,7 @@ use crate::events::EventBus;
 use crate::interchange::{Interchange, register_interchange_tools};
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
-use crate::meter::LogSink;
+use crate::meter::{Meter, MeterSettle, register_meter_tools};
 use crate::projects::ActiveProjects;
 use crate::resources::{Resources, register_resource_tools, spawn_personal_maintenance};
 use crate::rpc::RpcRouter;
@@ -471,6 +475,18 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         Arc::new(cfg.git_env.clone()),
     );
     register_telemetry_tools(&mut registry, &telemetry);
+    // The meter (CORE-069): usage records, stage 8, the jobs' energy and local work.
+    let meter = Meter::new(
+        state.clone(),
+        cfg.env.clone(),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        events.clone(),
+        telemetry.clone(),
+        power_settings(&cfg.env),
+        cfg.failpoints.clone(),
+    );
+    register_meter_tools(&mut registry, &meter, cfg.test_tools);
     // The holds and the handler registry follow the connections (see `ConnObserver`).
     let holds = Holds::new(cfg.clock.clone());
     register_doc_tools(&mut registry, &holds);
@@ -510,6 +526,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     }
     let hooks = PipelineHooks {
         confirm: AgentConfirm::new(confirm.clone()),
+        meter: Arc::new(MeterSettle::new(meter.clone())),
         ..PipelineHooks::plan2()
     };
     // The Libraries: the personal scope's folder and its trash, purged in the background.
@@ -549,7 +566,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         events.clone(),
         cfg.clock.clone(),
         cfg.failpoints.clone(),
-        Arc::new(LogSink),
+        meter.clone(),
         cfg.sockets.clone(),
     );
     let _ = engine_slot.set(engines.clone());
@@ -570,8 +587,20 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }));
     jobs.stop_on_drain(lifecycle.drain_token());
-    // Completions (Tasks 15–16) are added before this: it runs them for jobs that never
-    // started.
+    // Completions (Meter, then Task 16's Caps) are added before the recovery: it runs them for
+    // jobs that never started.
+    jobs.add_completion(meter.clone());
+    // Usage rows a dead core left become `pending` lines (CORE-071).
+    match meter.recover().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            count = n,
+            "usage records of an earlier core run were written"
+        ),
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the suite's pending usage rows could not be recovered; the next start tries again")
+        }
+    }
     match jobs.recover_suite().await {
         Ok(marked) if !marked.is_empty() => tracing::warn!(
             count = marked.len(),
@@ -614,6 +643,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
         let confirm = confirm.clone();
         let models = models.clone();
+        let meter = meter.clone();
         tokio::spawn(async move {
             match hub.open(&ws).await {
                 Err(e) => {
@@ -622,6 +652,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                 Ok(open) => {
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
+                    }
+                    if let Err(e) = meter.recover_workspace(&open).await {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's pending usage rows could not be recovered; the next start tries again");
                     }
                     if let Err(e) = confirm.load(&open.state).await {
                         tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace's pending confirmations could not be read");

@@ -20,7 +20,8 @@
 //!   [`Telemetry::set_busy`], and re-checks on every [`Telemetry::on_sample`] callback (the
 //!   core kicks the jobs there); the engines [`Telemetry::track`] their
 //!   processes; `meter` takes a job's [`EnergySlice`] with [`Telemetry::energy_between`] and
-//!   writes its [`JobEnergy`] with [`Telemetry::put_job_energy`], the only writer (Task 15).
+//!   writes its [`JobEnergy`] with [`Telemetry::put_job_energy`], the only writer; the
+//!   `telemetry.jobs` tool reads them back with [`Telemetry::job_energy`].
 //!   The hardware profile of a workspace is checked once, at start ([`profile`]).
 //! - **Times** are RFC 3339 UTC with milliseconds (`2026-10-18T12:00:00.123Z`) wherever a
 //!   caller sees one.
@@ -770,14 +771,16 @@ impl Telemetry {
         events: Arc<EventBus>,
         mode: TickMode,
     ) -> Arc<Telemetry> {
-        let started = clock.utc_now();
+        // Both clocks at one instant: `run` and `run_mono_ms` map monotonic times to wall
+        // times, so they must not straddle the open below.
+        let (started, started_mono) = (clock.utc_now(), clock.monotonic());
         let db = Db::open(
             &db_path,
             started
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
         );
-        let (run, run_mono_ms) = (unix_ms(started), mono_ms(clock.monotonic()));
+        let (run, run_mono_ms) = (unix_ms(started), mono_ms(started_mono));
         let mut sampler = Sampler::new(src, power, mode == TickMode::Real);
         if let Some(newest) = db.max_ts() {
             // A newer row than a day ahead of the clock is a wrong clock that was corrected:
@@ -1015,6 +1018,12 @@ impl Telemetry {
                 EnergySlice::default()
             }
         }
+    }
+
+    /// The wall time (Unix ms) of a monotonic time of this core run, as the samples' times are
+    /// mapped: a job's execution window as `JobEnergy`'s `from` and `to`.
+    pub fn wall_ms(&self, mono: Duration) -> i64 {
+        self.inner.run + (mono_ms(mono) - self.inner.run_mono_ms)
     }
 
     /// Stores a job's energy. The caller is `meter`, the only writer; a second write for the

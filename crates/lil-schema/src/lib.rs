@@ -36,7 +36,7 @@ pub use manifest::{
     CandidateFile, CandidateRun, EditError, ExternalFile, HumanEdit, Input, Manifest, ManifestView,
     PinnedInput, SchemaWarning, SignedOff, bare_sha256, hash_value, remove_key,
 };
-pub use money::{Currency, Money};
+pub use money::{Currency, Money, Rate};
 pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};
 pub use refs::{AssetRef, LEGACY_SCHEME, LinkRef, SCHEME, is_asset_id, is_run_id, is_slug};
 pub use status::{Status, StatusEvent, Transition, transition};

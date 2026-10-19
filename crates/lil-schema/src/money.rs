@@ -2,8 +2,9 @@
 //! currency. There is no float constructor: money is parsed from and written as a decimal
 //! string of the exact micro-unit value (`"0.0087"`), never a JSON float.
 //!
-//! Plan 3 Task 8 starts the type with what the pipeline stages need ([`Money::from_micros`],
-//! [`Money::parse_decimal`], [`Money::to_decimal_string`]); Task 15 completes it.
+//! Sums are checked ([`Money::checked_add`], [`Money::checked_sub`]): an overflow is refused,
+//! never wrapped. A conversion to the display currency ([`Money::convert`]) uses a dated
+//! [`Rate`] and rounds half to even (CORE-081).
 
 use std::fmt;
 
@@ -80,6 +81,41 @@ impl Money {
         let frac = format!("{frac:06}");
         format!("{sign}{whole}.{}", frac.trim_end_matches('0'))
     }
+
+    /// `self + o`, or `None` past the `i64` micro-unit range.
+    pub fn checked_add(self, o: Money) -> Option<Money> {
+        self.0.checked_add(o.0).map(Money)
+    }
+
+    /// `self - o`, or `None` past the `i64` micro-unit range.
+    pub fn checked_sub(self, o: Money) -> Option<Money> {
+        self.0.checked_sub(o.0).map(Money)
+    }
+
+    /// This amount in the display currency at `r` (1 unit of this amount's currency is
+    /// `r.in_display_micros` display micro-units), rounded half to even to a micro-unit. A
+    /// result past the `i64` range saturates.
+    pub fn convert(self, r: &Rate) -> Money {
+        let product = i128::from(self.0) * i128::from(r.in_display_micros);
+        let unit = i128::from(MICROS_PER_UNIT);
+        let (q, rem) = (product.div_euclid(unit), product.rem_euclid(unit));
+        // `q` is the floor; round up when the rest is past half, or exactly half and `q` odd.
+        let up = match (2 * rem).cmp(&unit) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => q % 2 != 0,
+            std::cmp::Ordering::Less => false,
+        };
+        let rounded = if up { q + 1 } else { q };
+        Money(i64::try_from(rounded).unwrap_or(if rounded < 0 { i64::MIN } else { i64::MAX }))
+    }
+}
+
+/// A dated exchange rate (`suite.toml` `[[money.rates]]`, CORE-081): 1 unit of its currency is
+/// `in_display_micros` micro-units of the display currency, as of `date` (`YYYY-MM-DD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rate {
+    pub in_display_micros: i64,
+    pub date: String,
 }
 
 impl fmt::Display for Money {

@@ -163,6 +163,26 @@ const HOLDS: &str = "CREATE TABLE hold_markers (
     token INTEGER NOT NULL
 );";
 
+/// Suite migration 7 and workspace migration 7: the write-ahead usage rows (CORE-071;
+/// Appendix F "Usage records"). A row is written to the `state.db` of its call's scope before
+/// the external request is sent, and removed once its usage line is in the log. `record` is
+/// the usage line's JSON record (`status: "pending"` while `state` is `pending`; the finished
+/// record once `state` is `logging`, the step just before the line is appended). `run` is the
+/// core run that wrote it: a row of another run was left by a dead core, and startup turns it
+/// into a `status: "pending"` line. Times are Unix milliseconds.
+const USAGE_PENDING: &str = "CREATE TABLE usage_pending (
+    id TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    job_id TEXT,
+    reservation TEXT,
+    record TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','logging')),
+    created_ms INTEGER NOT NULL,
+    logging_ms INTEGER
+);
+CREATE INDEX usage_pending_run ON usage_pending(run);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -171,6 +191,7 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     COMFY_CACHE,
     OUTSIDE_PAID,
     CONFIRMATIONS,
+    USAGE_PENDING,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
@@ -181,6 +202,7 @@ pub const WORKSPACE_MIGRATIONS: &[&str] = &[
     JOBS,
     CONFIRMATIONS,
     HOLDS,
+    USAGE_PENDING,
 ];
 
 #[cfg(test)]
@@ -253,9 +275,17 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 6);
-        assert_eq!(WORKSPACE_MIGRATIONS.len(), 6);
+        assert_eq!(SUITE_MIGRATIONS.len(), 7);
+        assert_eq!(WORKSPACE_MIGRATIONS.len(), 7);
         assert_eq!(WORKSPACE_MIGRATIONS[5], HOLDS, "appended, never inserted");
+        assert_eq!(
+            SUITE_MIGRATIONS[6], USAGE_PENDING,
+            "appended, never inserted"
+        );
+        assert_eq!(
+            WORKSPACE_MIGRATIONS[6], USAGE_PENDING,
+            "appended, never inserted"
+        );
     }
 
     #[test] // spec: CORE-115, ARCH-053

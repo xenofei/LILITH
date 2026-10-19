@@ -41,6 +41,10 @@ pub const NAMES: &[&str] = &[
     "jobs.after_outputs",
     // After `Confirm::answer` commits the answer, before the `answered` event (Task 14).
     "confirm.after_answer",
+    // After a write-ahead usage row commits, before the call is sent; after a usage line is
+    // appended, before its row is removed and anything is settled (Task 15).
+    "meter.after_pending",
+    "meter.after_usage_line",
 ];
 
 /// The exit code of the `abort` action.
@@ -246,12 +250,7 @@ mod tests {
     /// a point the core lacks arms nothing at all, so a drift would silently test nothing.
     #[test] // spec: QA-066
     fn the_core_and_test_kit_fail_point_lists_agree() {
-        const LATER: &[&str] = &[
-            "confirm.after_answer",
-            "meter.after_pending",
-            "meter.after_usage_line",
-            "caps.after_reserve",
-        ];
+        const LATER: &[&str] = &["caps.after_reserve"];
         let kit = lil_testkit::failpoints::NAMES;
         for name in NAMES {
             assert!(kit.contains(name), "{name} is not in the test kit's list");
