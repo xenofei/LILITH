@@ -88,7 +88,7 @@ use crate::confirm::{
 use crate::events::EventBus;
 use crate::identity::{EngineSession, EngineTokens, TrustedDirs, claude_ancestor, resolve_caller};
 use crate::lifecycle::{DrainReason, Lifecycle};
-use crate::server::{ConnCtx, Router};
+use crate::server::{ConnCtx, ConnObserver, Router};
 use crate::session::Session;
 use crate::tools::Dispatcher;
 use crate::workspace::{WorkspaceRef, resolve_workspace};
@@ -136,6 +136,8 @@ pub struct RpcRouter {
     /// The confirmations: the `app/*` methods, the apps that can answer, and the
     /// `tools/list` marker (`mcp_confirmation`).
     confirm: Arc<Confirm>,
+    /// Told when a session is established and when its connection ends.
+    observers: Vec<Arc<dyn ConnObserver>>,
     /// Unit tests only: requests with this method panic (`CoreConfig::panic_on_method`).
     #[cfg(test)]
     panic_on_method: Option<&'static str>,
@@ -171,9 +173,17 @@ impl RpcRouter {
             events,
             lifecycle,
             confirm,
+            observers: Vec::new(),
             #[cfg(test)]
             panic_on_method: cfg.panic_on_method,
         }
+    }
+
+    /// Also tells `observer` about each session and each connection's end.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn ConnObserver>) -> RpcRouter {
+        self.observers.push(observer);
+        self
     }
 
     /// The state of connection `conn_id`; `None` once it has closed.
@@ -188,13 +198,18 @@ impl RpcRouter {
 
     /// Moves `conn_id` out of `AwaitingHello` into `Ready` with its session and stops its
     /// hello timeout. An app that can answer confirmations makes them
-    /// answerable (APP-051) from now until [`Router::closed`]: both under the map lock, so a
-    /// connection that closes meanwhile is never counted.
+    /// answerable (APP-051) from now until [`Router::closed`], and the observers are told of the
+    /// session: all under the map lock, so a connection that closes meanwhile is never counted.
     fn settle_ready(&self, conn_id: u64, session: Arc<Session>) {
         let mut conns = self.conns();
         if let Some(conn) = conns.get_mut(&conn_id) {
             if can_answer(&session) {
                 self.confirm.presence().opened();
+            }
+            // Under the map lock too: a connection that closed meanwhile is never registered
+            // as running or holding.
+            for observer in &self.observers {
+                observer.ready(conn_id, &session);
             }
             conn.state = ConnState::Ready(session);
             conn.hello_settled.cancel();
@@ -808,6 +823,9 @@ impl Router for RpcRouter {
         };
         if counted {
             self.lifecycle.connection_closed();
+        }
+        for observer in &self.observers {
+            observer.closed(conn.conn_id);
         }
     }
 }

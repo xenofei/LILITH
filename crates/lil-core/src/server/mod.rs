@@ -57,15 +57,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
 use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NoNotificationPath, UiPresence};
+use crate::docs::{Holds, register_doc_tools};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
+use crate::interchange::{Interchange, register_interchange_tools};
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::meter::LogSink;
 use crate::projects::ActiveProjects;
 use crate::resources::{Resources, register_resource_tools, spawn_personal_maintenance};
 use crate::rpc::RpcRouter;
+use crate::session::Session;
 use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
@@ -145,6 +148,18 @@ pub trait Router: Send + Sync + 'static {
     fn panicked(&self, conn: &ConnCtx, id: Id) -> Response;
     /// The connection ended; runs exactly once, also when a handler on the reader panicked.
     fn closed(&self, conn: &ConnCtx);
+}
+
+/// Follows the connections that said hello, for modules that tie state to a connection: the
+/// document holds (APP-104) and the running apps `open_in` finds (APP-063). The production
+/// router calls its observers when a session is established and when its connection ends.
+pub trait ConnObserver: Send + Sync + 'static {
+    /// Connection `conn_id` said hello and has `session`.
+    fn ready(&self, conn_id: u64, session: &Session) {
+        let _ = (conn_id, session);
+    }
+    /// Connection `conn_id` ended (also one that never said hello).
+    fn closed(&self, conn_id: u64);
 }
 
 /// Counters the transport keeps. The running core counts its connections in the
@@ -456,6 +471,11 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         Arc::new(cfg.git_env.clone()),
     );
     register_telemetry_tools(&mut registry, &telemetry);
+    // The holds and the handler registry follow the connections (see `ConnObserver`).
+    let holds = Holds::new(cfg.clock.clone());
+    register_doc_tools(&mut registry, &holds);
+    let interchange = Interchange::new(core_dir(), cfg.env.data_dir());
+    register_interchange_tools(&mut registry, &interchange);
     if cfg.test_tools {
         register_hw_tick(&mut registry, telemetry.clone());
     }
@@ -569,8 +589,11 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
-    let router: Arc<dyn Router> =
-        Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone()));
+    let router: Arc<dyn Router> = Arc::new(
+        RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
+            .with_observer(holds)
+            .with_observer(interchange),
+    );
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
     let serving = tokio::spawn(serve_with(
@@ -754,6 +777,14 @@ fn read_suite_toml(env: &Env, section: &str) -> Option<lil_schema::SuiteToml> {
             None
         }
     }
+}
+
+/// The folder of the core executable, where installed apps' `apps\` folder is (APP-061).
+fn core_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_default()
 }
 
 /// `[jobs] preempt_agent_batches` of `suite.toml` (CORE-125): `false` for no file, a file that

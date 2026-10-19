@@ -32,11 +32,6 @@ tests = [
     { name = "lil-spec-tests::caps_meter::usage_is_written_ahead_and_survives_a_crash", rule = "CORE-071", file = "tests/caps_meter.rs" },
     # ARCH-081, ARCH-099
     { name = "lil-spec-tests::caps_meter::loose_calls_log_to_usage_loose_and_count_against_caps", rule = "ARCH-081", file = "tests/caps_meter.rs" },
-    # Task 18
-    # APP-061
-    { name = "lil-spec-tests::resources_interchange::handlers_for_lists_registered_apps", rule = "APP-061", file = "tests/resources_interchange.rs" },
-    # APP-063, APP-064, APP-065
-    { name = "lil-spec-tests::resources_interchange::open_in_returns_a_launch_command_and_never_launches", rule = "APP-063", file = "tests/resources_interchange.rs" },
     # Task 19
     # ARCH-012, AI-110, AI-111
     { name = "lil-spec-tests::mcp_server::initialize_names_the_server_lil", rule = "ARCH-012", file = "tests/mcp_server.rs" },

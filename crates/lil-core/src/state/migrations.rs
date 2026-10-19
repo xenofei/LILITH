@@ -152,6 +152,16 @@ CREATE UNIQUE INDEX confirmations_pending ON confirmations(scope, idem_key)
 CREATE INDEX confirmations_key ON confirmations(scope, idem_key);
 CREATE INDEX confirmations_state ON confirmations(state, created_utc);";
 
+/// Workspace migration 6: the hold markers (APP-104). A hold lives in the core's memory, tied
+/// to its connection; this row only records that a document was held, so one left by a killed
+/// core is visible until the next start empties the table.
+const HOLDS: &str = "CREATE TABLE hold_markers (
+    doc_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    since_utc INTEGER NOT NULL
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -169,6 +179,7 @@ pub const WORKSPACE_MIGRATIONS: &[&str] = &[
     GENERATED_V3,
     JOBS,
     CONFIRMATIONS,
+    HOLDS,
 ];
 
 #[cfg(test)]
@@ -242,7 +253,8 @@ mod tests {
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
         assert_eq!(SUITE_MIGRATIONS.len(), 6);
-        assert_eq!(WORKSPACE_MIGRATIONS.len(), 5);
+        assert_eq!(WORKSPACE_MIGRATIONS.len(), 6);
+        assert_eq!(WORKSPACE_MIGRATIONS[5], HOLDS, "appended, never inserted");
     }
 
     #[test] // spec: CORE-115, ARCH-053

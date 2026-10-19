@@ -35,6 +35,8 @@
 //! connection that never migrates the file or releases a row. When there is no `state.db` on
 //! disk yet (another channel's local folder), a read-only open gets an in-memory database with
 //! the migrations applied, and nothing is created on disk.
+//! A workspace database also empties its `hold_markers` on that open (APP-104: holds live in
+//! memory, so none outlives its core).
 //! `done` rows older than 30 days are pruned by `idem_begin`, against the caller's `now`: the
 //! same clock that stamped the rows.
 //!
@@ -171,6 +173,16 @@ pub struct Pending {
     pub started_utc: i64,
 }
 
+/// A row of `hold_markers` (APP-104): `doc_id` was held by `holder` since `since_utc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldMarker {
+    pub doc_id: String,
+    pub path: String,
+    /// The app (`ui:<app>`) or `core`.
+    pub holder: String,
+    pub since_utc: i64,
+}
+
 fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
     Ok(Pending {
         path: r.get(0)?,
@@ -261,7 +273,7 @@ impl StateDb {
         }
         let mut conn = open_read_write(path)?;
         let schema_version = migrate(&mut conn, migrations).map_err(Migrate::into_state)?;
-        release_running(&mut conn).map_err(|e| sql_error(&e))?;
+        release_running(&mut conn, scope).map_err(|e| sql_error(&e))?;
         StateDb::start(
             conn,
             path.to_path_buf(),
@@ -630,6 +642,57 @@ impl StateDb {
         .await
     }
 
+    /// Records that `m.doc_id` is held (replacing an earlier marker of the document).
+    pub async fn set_hold_marker(&self, m: &HoldMarker) -> Result<(), StateError> {
+        let m = m.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO hold_markers (doc_id, path, holder, since_utc)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![m.doc_id, m.path, m.holder, m.since_utc],
+            )
+            .map(drop)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Removes the marker of `doc_id`, if there is one.
+    pub async fn clear_hold_marker(&self, doc_id: &str) -> Result<(), StateError> {
+        let doc_id = doc_id.to_string();
+        self.call(move |conn| {
+            conn.execute(
+                "DELETE FROM hold_markers WHERE doc_id = ?1",
+                params![doc_id],
+            )
+            .map(drop)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Every hold marker, by document id.
+    pub async fn hold_markers(&self) -> Result<Vec<HoldMarker>, StateError> {
+        self.call(|conn| {
+            let read = || -> rusqlite::Result<Vec<HoldMarker>> {
+                conn.prepare(
+                    "SELECT doc_id, path, holder, since_utc FROM hold_markers ORDER BY doc_id",
+                )?
+                .query_map([], |r| {
+                    Ok(HoldMarker {
+                        doc_id: r.get(0)?,
+                        path: r.get(1)?,
+                        holder: r.get(2)?,
+                        since_utc: r.get(3)?,
+                    })
+                })?
+                .collect()
+            };
+            read().map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
     /// Makes the actor panic. Used only by the test-channel tool `test.state_panic` (QA-012).
     pub async fn panic_actor(&self) {
         let Some(jobs) = lock(&self.jobs).clone() else {
@@ -818,14 +881,22 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<i64, Migrate> {
     }
 }
 
-/// Deletes the `running` rows of calls that died with an earlier core.
-fn release_running(conn: &mut Connection) -> rusqlite::Result<()> {
+/// Deletes the `running` rows of calls that died with an earlier core and, in a workspace
+/// database, the hold markers of its holds (APP-104: holds live in memory, so none outlives
+/// its core).
+fn release_running(conn: &mut Connection, scope: StateScope) -> rusqlite::Result<()> {
     let released = conn.execute("DELETE FROM idempotency WHERE state = 'running'", [])?;
     if released > 0 {
         tracing::info!(
             released,
             "running idempotency rows of an earlier core released"
         );
+    }
+    if scope == StateScope::Workspace {
+        let cleared = conn.execute("DELETE FROM hold_markers", [])?;
+        if cleared > 0 {
+            tracing::info!(cleared, "hold markers of an earlier core cleared");
+        }
     }
     Ok(())
 }

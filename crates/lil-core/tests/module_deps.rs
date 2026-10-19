@@ -10,6 +10,7 @@
 //! from `meter` (as the engine tools are from `engines`), and `jobs` and `telemetry` use no
 //! `meter` item either (`JobCompletion` is how `meter` hears of a job). `confirm` uses `tools`
 //! (it is the confirm stage), and neither `tools` nor `jobs` uses it.
+//! `interchange` and `docs` (the handler registry and the holds) are used by no other module.
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
 //! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
@@ -18,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The CORE-014 modules (each plan-3 module is added as it lands).
-const MODULES: [&str; 14] = [
+const MODULES: [&str; 16] = [
     "store",
     "index",
     "watch",
@@ -33,6 +34,8 @@ const MODULES: [&str; 14] = [
     "meter",
     "confirm",
     "resources",
+    "interchange",
+    "docs",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -193,6 +196,8 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
         "engines",
         "meter",
         "resources",
+        "interchange",
+        "docs",
     ] {
         assert!(
             graph.contains_key(module),
@@ -228,6 +233,16 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     // `tools` (the call context and the registry) and the store.
     for module in graph.keys().filter(|m| *m != "resources") {
         forbidden(module, &["resources"]);
+    }
+    // The holds and the handler registry are leaves of the module graph: the server wires them
+    // to the tools, and no other module names them.
+    for leaf in ["interchange", "docs"] {
+        let users: Vec<&String> = graph
+            .iter()
+            .filter(|(m, uses)| m.as_str() != leaf && uses.contains(leaf))
+            .map(|(m, _)| m)
+            .collect();
+        assert!(users.is_empty(), "{users:?} use {leaf}");
     }
     // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
     assert!(graph["tools"].contains("jobs"), "{graph:?}");

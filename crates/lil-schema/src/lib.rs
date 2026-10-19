@@ -6,6 +6,7 @@
 //! - [`manifest`]: asset manifests as an ordered map with typed views (ARCH-076, CORE-148);
 //! - [`refs`], [`version`], [`content_hash`]: links, `lil://` refs and content hashes (ARCH-042,
 //!   CORE-031, CORE-047);
+//! - [`lilref`]: `.lilref` pointer files (APP-021, CORE-047);
 //! - [`status`]: the status machine (CORE-048);
 //! - [`paths`]: workspace-relative path rules (CORE-040);
 //! - [`yaml_edit`], [`workspace_yaml`], [`suite_edit`]: comment-preserving YAML and TOML edits;
@@ -15,6 +16,7 @@
 
 pub mod content_hash;
 pub mod engine_files;
+pub mod lilref;
 pub mod logs;
 pub mod manifest;
 pub mod money;
@@ -29,6 +31,7 @@ pub mod workspace_yaml;
 pub mod yaml_edit;
 
 pub use content_hash::{is_os_metadata, sha256_hex, version_content_hash};
+pub use lilref::{LilRef, parse_lilref, write_lilref};
 pub use manifest::{
     CandidateFile, CandidateRun, EditError, ExternalFile, HumanEdit, Input, Manifest, ManifestView,
     PinnedInput, SchemaWarning, SignedOff, bare_sha256, hash_value, remove_key,

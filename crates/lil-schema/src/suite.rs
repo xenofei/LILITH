@@ -14,7 +14,7 @@ pub const SUITE_STATE_SCHEMA: i64 = 6;
 /// The same for a workspace `state.db` (in the workspace's local folder): its `user_version`
 /// after every workspace migration. `lil doctor` reads it when it checks the default
 /// workspace's database.
-pub const WORKSPACE_STATE_SCHEMA: i64 = 5;
+pub const WORKSPACE_STATE_SCHEMA: i64 = 6;
 
 /// The whole file. Unknown keys are preserved in `other`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

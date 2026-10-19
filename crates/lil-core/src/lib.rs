@@ -15,11 +15,13 @@
 
 pub mod config;
 pub mod confirm;
+pub mod docs;
 pub mod engines;
 pub mod events;
 pub mod graph;
 pub mod identity;
 pub mod index;
+pub mod interchange;
 pub mod jobs;
 pub mod lifecycle;
 pub mod meter;
