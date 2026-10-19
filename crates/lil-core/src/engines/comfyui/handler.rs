@@ -375,6 +375,9 @@ struct Prompts {
     jobs: HashMap<String, Arc<Live>>,
     /// Set by the `CancelEnginePrompts` step: no attempt enters, none posts.
     closed: bool,
+    /// Every prompt id the suite's attempts took up or minted in this core run, claimed
+    /// before the POST: the outside-jobs poll tells the suite's prompts apart by id only.
+    ids: HashSet<String>,
 }
 
 /// One running `comfy.prompt` attempt.
@@ -422,13 +425,14 @@ impl SuitePrompts {
         self.lock().jobs.keys().next().cloned()
     }
 
-    /// The prompt ids of the suite's attempts now, as far as they can be read without waiting
-    /// (one being posted is skipped: its `client_id` tells it apart anyway).
+    /// Claims `prompt_id` as the suite's, before it is posted or followed.
+    pub(crate) fn claim(&self, prompt_id: &str) {
+        self.lock().ids.insert(prompt_id.to_string());
+    }
+
+    /// Every prompt id the suite claimed in this core run ([`SuitePrompts::claim`]).
     pub(crate) fn prompt_ids(&self) -> HashSet<String> {
-        let live: Vec<Arc<Live>> = self.lock().jobs.values().cloned().collect();
-        live.iter()
-            .filter_map(|l| l.posted.try_lock().ok().and_then(|p| p.prompt_id.clone()))
-            .collect()
+        self.lock().ids.clone()
     }
 
     /// The `CancelEnginePrompts` step: the gate closes (no attempt enters or posts any more),
@@ -802,6 +806,7 @@ impl Attempt<'_> {
             // shutdown check: a step that ran meanwhile missed it, so it is cancelled here
             // (`run` cancels an unknown or abandoned attempt's prompt), and paid work that may
             // be running is unknown, never plain interrupted (re-review N4c, P3-R21).
+            self.comfy.prompts().claim(&prompt_id);
             self.live.posted.lock().await.prompt_id = Some(prompt_id.clone());
             if self.shut() {
                 if self.external {
@@ -873,6 +878,7 @@ impl Attempt<'_> {
             .await
             .map_err(|e| unreachable(&e, self.job))?;
         let prompt_id = self.job.uuid();
+        self.comfy.prompts().claim(&prompt_id);
         // Persisted before it is sent (CORE-120).
         self.job
             .set_external_id(&prompt_id)
@@ -914,7 +920,12 @@ impl Attempt<'_> {
             .as_object()
             .into_iter()
             .flatten()
+            // As ComfyUI: only for a class it doesn't have, and only to one it has (review M9).
             .filter(|(class, _)| info.object_info.get(class.as_str()).is_none())
+            .filter(|(_, entry)| {
+                graph::replacement_class(entry)
+                    .is_some_and(|new| info.object_info.get(new).is_some())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let mut checked = graph.clone();
@@ -942,14 +953,35 @@ impl Attempt<'_> {
         let Some(inventory) = self.comfy.current_inventory() else {
             return Ok(());
         };
-        if root.join("extra_model_paths.yaml").exists() {
+        // Models may live elsewhere then (review I2).
+        let extra_args = self
+            .comfy
+            .config()
+            .map(|c| c.extra_args.clone())
+            .unwrap_or_default();
+        if root.join("extra_model_paths.yaml").exists()
+            || graph::names_other_model_paths(&extra_args)
+            || graph::names_other_model_paths(&inventory.argv)
+        {
             return Ok(());
         }
-        let missing = graph::missing_models(&graph::model_refs(&checked), &inventory.paths());
+        let refs = graph::model_refs(&checked);
+        let mut missing = graph::missing_models(&refs, &inventory.paths());
+        if !missing.is_empty() {
+            // A model added since the inventory (review I2): the folder is looked at again,
+            // names only, before anything is refused.
+            let models = root.join("models");
+            let now = tokio::task::spawn_blocking(move || {
+                super::inventory::list_paths(&models, &lil_platform::fs::SystemProbe)
+            })
+            .await
+            .unwrap_or_default();
+            missing = graph::missing_models(&refs, &now);
+        }
         if missing.is_empty() {
             return Ok(());
         }
-        let shown: Vec<&str> = missing.iter().take(20).map(String::as_str).collect();
+        let shown = graph::lines_within(&missing, MAX_NODE_ERRORS, MAX_DETAIL_BYTES);
         let mut e = untrusted(
             error(
                 &codes::COMFYUI_EXECUTION_FAILED,
@@ -961,7 +993,7 @@ impl Attempt<'_> {
                 ),
                 self.job,
             ),
-            &shown.join("\n"),
+            &shown,
         );
         e.fix = Some(lil_protocol::Fix {
             ui_action: lil_protocol::UiAction {

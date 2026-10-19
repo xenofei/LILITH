@@ -348,6 +348,11 @@ impl FakeComfy {
     pub fn set_object_info(&self, v: Value) {
         self.shared.lock().object_info = v;
     }
+
+    /// The `system.argv` `GET /system_stats` reports (default: `["main.py"]`).
+    pub fn set_argv(&self, argv: &[&str]) {
+        self.shared.lock().argv = Some(argv.iter().map(|a| (*a).to_string()).collect());
+    }
 }
 
 impl Drop for FakeComfy {
@@ -560,6 +565,8 @@ struct State {
     generation: u64,
     requests: Vec<FakeRequest>,
     object_info: Value,
+    /// `system.argv` (`None`: `["main.py"]`).
+    argv: Option<Vec<String>>,
     clients: Vec<Client>,
     next_number: u64,
     next_id: u64,
@@ -1016,7 +1023,14 @@ async fn handle(
     }
     let response = match (&method, segments.as_slice()) {
         (&Method::GET, ["ws"]) => upgrade_ws(&shared, &mut req, &query),
-        (&Method::GET, ["system_stats"]) => json_response(StatusCode::OK, &system_stats()),
+        (&Method::GET, ["system_stats"]) => {
+            let argv = shared
+                .lock()
+                .argv
+                .clone()
+                .unwrap_or_else(|| vec!["main.py".to_string()]);
+            json_response(StatusCode::OK, &system_stats(&argv))
+        }
         (&Method::POST, ["prompt"]) => return post_prompt(&shared, body),
         (&Method::GET, ["queue"]) => {
             let st = shared.lock();
@@ -1470,7 +1484,7 @@ fn upgrade_ws(shared: &Arc<Shared>, req: &mut Request<Incoming>, query: &str) ->
         .expect("a valid response")
 }
 
-fn system_stats() -> Value {
+fn system_stats(argv: &[String]) -> Value {
     json!({
         "system": {
             "os": "nt",
@@ -1481,7 +1495,7 @@ fn system_stats() -> Value {
             "python_version": "3.12.0 (fake)",
             "pytorch_version": "2.11.0+cu130",
             "embedded_python": false,
-            "argv": ["main.py"],
+            "argv": argv,
         },
         "devices": [{
             "name": "cuda:0 Fake GPU : cudaMallocAsync",

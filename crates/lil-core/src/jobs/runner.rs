@@ -225,6 +225,9 @@ pub(crate) struct Shared {
     changed: watch::Sender<u64>,
     recovered: Mutex<HashMap<String, Arc<OnceCell<()>>>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The engine ids of the jobs taken up again from an earlier core run (ruling P3-R21):
+    /// their prompts are the suite's, not outside ones.
+    adopted: Mutex<HashSet<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -607,6 +610,9 @@ impl Shared {
             return false;
         };
         tracing::warn!(job_id = %row.job_id, external_id = ?row.external_id, "a job with external side effects of an earlier core run is taken up again in its engine");
+        if let Some(id) = &row.external_id {
+            lock(&self.adopted).insert(id.clone());
+        }
         let info = Info {
             id: JobId(row.job_id.clone()),
             spec: row.spec(kind),
@@ -1715,6 +1721,7 @@ impl Jobs {
             changed: watch::Sender::new(0),
             recovered: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            adopted: Mutex::new(HashSet::new()),
         });
         events.register_snapshot("job:", Arc::new(JobSnapshots(Arc::downgrade(&shared))));
         Arc::new(Jobs { shared })
@@ -2181,6 +2188,12 @@ impl Jobs {
     /// its uploads and model hashes, Appendix F).
     pub fn suite_state(&self) -> Arc<StateDb> {
         self.shared.states.suite_db()
+    }
+
+    /// The engine ids of the jobs taken up again from an earlier core run (ruling P3-R21): the
+    /// engines count their prompts as the suite's.
+    pub fn adopted_engine_ids(&self) -> HashSet<String> {
+        lock(&self.shared.adopted).clone()
     }
 
     /// A new id `<prefix>_<16 hex>` from the core's id source: the call and trace ids of a job

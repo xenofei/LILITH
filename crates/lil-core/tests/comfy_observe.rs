@@ -77,7 +77,7 @@ struct Rig {
     jobs: Arc<Jobs>,
     engines: Arc<Engines>,
     drafts: Arc<Drafts>,
-    _states: Arc<StateRegistry>,
+    states: Arc<StateRegistry>,
     _telemetry: Arc<Telemetry>,
 }
 
@@ -96,6 +96,11 @@ fn attach(env: &TestEnv, fake: &FakeComfy, root: bool) {
 
 impl Rig {
     fn new(env: &TestEnv) -> Rig {
+        Rig::with_drafts(env, Arc::default())
+    }
+
+    /// A rig whose usage drafts go to `drafts` (a later "core" on the same state shares them).
+    fn with_drafts(env: &TestEnv, drafts: Arc<Drafts>) -> Rig {
         let states = Arc::new(
             StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap(),
         );
@@ -129,7 +134,6 @@ impl Rig {
             events.clone(),
             TickMode::Manual,
         );
-        let drafts = Arc::new(Drafts::default());
         let engines = Engines::new(
             env.env.clone(),
             jobs.clone(),
@@ -145,9 +149,18 @@ impl Rig {
             jobs,
             engines,
             drafts,
-            _states: states,
+            states,
             _telemetry: telemetry,
         }
+    }
+
+    /// Closes the rig's databases (as a core's end does), so another rig can open them.
+    async fn close(self) {
+        let states = self.states.clone();
+        drop(self);
+        tokio::task::spawn_blocking(move || states.close())
+            .await
+            .unwrap();
     }
 
     fn caller(&self) -> JobCaller {
@@ -551,7 +564,7 @@ async fn model_hashes_are_cached_by_path_size_mtime_and_file_id() {
     let probe = Arc::new(CountingProbe::default());
     let scan = |p: &Arc<CountingProbe>| {
         let p: Arc<dyn Probe> = p.clone();
-        inventory::scan(&models, p, states.suite_db(), || false)
+        inventory::scan(&models, p, states.suite_db(), Arc::new(|| false))
     };
 
     let first = scan(&probe).await.unwrap();
@@ -835,4 +848,288 @@ async fn network_nodes_are_not_refused() {
     let done = rig.done(&id).await;
     assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
     assert_eq!(posted(&fake).len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1 (task-13-review.md): I1, I2, M1-M4.
+// ---------------------------------------------------------------------------------------------
+
+/// A graph with one partner node, and object info that marks it.
+fn paid_outside(fake: &FakeComfy) -> String {
+    fake.set_object_info(object_info(json!({"OpenAIImageNode": {"api_node": true}})));
+    let graph = json!({"1": {"class_type": "OpenAIImageNode", "inputs": {"prompt": "x"}}});
+    fake.add_outside_prompt(true, Some(graph))
+}
+
+/// Polls until `drafts` holds `n` drafts.
+async fn drafts_reach(rig: &Rig, n: usize) {
+    let deadline = Instant::now() + DEADLINE;
+    while rig.drafts.all().len() < n {
+        assert!(
+            Instant::now() < deadline,
+            "not {n} drafts: {:?}",
+            rig.drafts.all()
+        );
+        rig.engines.poll_outside().await;
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-057, CORE-093
+async fn outside_paid_prompt_is_recorded_once_across_a_core_restart() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    let outside = paid_outside(&fake);
+    let drafts = Arc::new(Drafts::default());
+    let first = Rig::with_drafts(&env, drafts.clone());
+    first.ready().await;
+    first.engines.poll_outside().await;
+    // The core stops while it runs: nothing is recorded yet (ruling P3-R27).
+    first.engines.stop_engines_step().run().await;
+    assert!(drafts.all().is_empty(), "{:?}", drafts.all());
+    first.close().await;
+
+    let second = Rig::with_drafts(&env, drafts.clone());
+    second.ready().await;
+    second.engines.poll_outside().await;
+    assert!(drafts.all().is_empty(), "still running");
+    fake.release(&outside);
+    drafts_reach(&second, 1).await;
+    for _ in 0..3 {
+        second.engines.poll_outside().await;
+    }
+    let all = drafts.all();
+    assert_eq!(all.len(), 1, "one line per prompt: {all:?}");
+    assert_eq!(all[0].status, UsageStatus::Succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-057, CORE-093
+async fn outside_paid_prompt_seen_before_a_crash_is_recorded_after_it() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    let outside = paid_outside(&fake);
+    let drafts = Arc::new(Drafts::default());
+    let first = Rig::with_drafts(&env, drafts.clone());
+    first.ready().await;
+    first.engines.poll_outside().await;
+    // A crash: no shutdown step runs.
+    first.close().await;
+    // It ends before the next core first looks.
+    fake.release(&outside);
+    let client = lil_core::engines::comfyui::ComfyClient::new(&fake.url()).unwrap();
+    let deadline = Instant::now() + DEADLINE;
+    while client.history(&outside).await.unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the outside prompt never ended");
+        tokio::time::sleep(POLL).await;
+    }
+
+    let second = Rig::with_drafts(&env, drafts.clone());
+    second.ready().await;
+    second.engines.poll_outside().await;
+    let all = drafts.all();
+    assert_eq!(
+        all.len(),
+        1,
+        "recorded by the next core's first poll: {all:?}"
+    );
+    assert_eq!(
+        all[0].status,
+        UsageStatus::Succeeded,
+        "from what it reports"
+    );
+    for _ in 0..3 {
+        second.engines.poll_outside().await;
+    }
+    assert_eq!(drafts.all().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-069, ARCH-057
+async fn outside_prompts_with_the_suites_client_id_are_still_outside() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    fake.set_object_info(object_info(json!({"OpenAIImageNode": {"api_node": true}})));
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    let id = rig.submit(graph_with(json!({}))).await;
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    let client_id = posted(&fake)[0]["client_id"].as_str().unwrap().to_string();
+
+    // Anyone can read the client id from /queue and post with it.
+    fake.hold_prompts(true);
+    let spoof = "00000000-0000-4000-8000-00000000abcd";
+    lil_core::engines::comfyui::ComfyClient::new(&fake.url())
+        .unwrap()
+        .with_client_id(client_id)
+        .submit(
+            spoof,
+            &json!({"1": {"class_type": "OpenAIImageNode", "inputs": {}}}),
+            "taesd",
+            "t_spoof",
+        )
+        .await
+        .unwrap();
+    rig.engines.poll_outside().await;
+    assert_eq!(
+        rig.engines.outside_watch().running(),
+        1,
+        "counted as outside"
+    );
+    fake.release(spoof);
+    drafts_reach(&rig, 1).await;
+    assert_eq!(
+        rig.drafts.all()[0].raw_usage.as_ref().unwrap()["prompt_id"],
+        spoof
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-069
+async fn deeply_nested_outside_json_is_still_counted() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    // 140 levels: past serde's limit of 128, well within what ComfyUI accepts.
+    let mut deep = json!(1);
+    for _ in 0..140 {
+        deep = json!([deep]);
+    }
+    let graph = json!({"1": {"class_type": "EmptyImage", "inputs": {"x": deep}}});
+    let outside = fake.add_outside_prompt(true, Some(graph));
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    rig.engines.poll_outside().await;
+    assert_eq!(
+        rig.engines.outside_watch().running(),
+        1,
+        "the deep prompt is seen"
+    );
+    let id = rig.submit(graph_with(json!({}))).await;
+    rig.engines.poll_outside().await;
+    assert_eq!(rig.summary(&id).await.substatus.as_deref(), Some("waiting"));
+    fake.release(&outside);
+    let deadline = Instant::now() + DEADLINE;
+    while !rig.summary(&id).await.status.is_final() {
+        assert!(Instant::now() < deadline, "the suite job never ran");
+        rig.engines.poll_outside().await;
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130
+async fn a_model_hash_is_cancelled_between_chunks() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let models = env.root().join("comfy").join("models");
+    lil_testkit::files::write_file(&models.join("big.safetensors"), &vec![7u8; 3 << 20]);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    // Asked once before the file, then before each 1 MiB chunk: cancelled in the second.
+    let cancelled: inventory::Cancelled =
+        Arc::new(move || counter.fetch_add(1, Ordering::SeqCst) >= 2);
+    let probe: Arc<dyn Probe> = Arc::new(CountingProbe::default());
+    let got = inventory::scan(&models, probe.clone(), states.suite_db(), cancelled).await;
+    assert_eq!(got, Err(inventory::ScanError::Cancelled));
+    assert_eq!(asked.load(Ordering::SeqCst), 3, "stopped inside the file");
+    // Nothing half-hashed was kept: the next scan hashes it.
+    let counting = Arc::new(CountingProbe::default());
+    let p: Arc<dyn Probe> = counting.clone();
+    let files = inventory::scan(&models, p, states.suite_db(), Arc::new(|| false))
+        .await
+        .unwrap();
+    assert_eq!(counting.0.load(Ordering::SeqCst), 1);
+    assert!(files[0].sha256.is_some());
+}
+
+/// A junction at `link` to the folder `target` (no privilege needed).
+#[allow(clippy::disallowed_methods)]
+fn junction(link: &Path, target: &Path) {
+    lil_platform::fs::create_junction(link, target)
+        .unwrap_or_else(|e| panic!("cannot create a junction at {}: {e}", link.display()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130
+async fn a_linked_folder_that_loops_lists_each_model_once() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let models = env.root().join("comfy").join("models");
+    lil_testkit::files::write_file(&models.join(r"checkpoints\a.safetensors"), b"a");
+    junction(&models.join("loop"), &models);
+    let counting = Arc::new(CountingProbe::default());
+    let p: Arc<dyn Probe> = counting.clone();
+    let files = inventory::scan(&models, p, states.suite_db(), Arc::new(|| false))
+        .await
+        .unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, [r"checkpoints\a.safetensors"]);
+    assert_eq!(counting.0.load(Ordering::SeqCst), 1, "hashed once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-018
+async fn a_model_added_after_the_inventory_is_found() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    rig.observed().await;
+    // Downloaded while ComfyUI runs: ComfyUI finds it without a restart, and so does the check.
+    lil_testkit::files::write_file(&fake.root().join(r"models\loras\new.safetensors"), b"n");
+    let id = rig
+        .submit(graph_with(json!({
+            "3": {"class_type": "LoraLoader", "inputs": {"lora_name": "new.safetensors"}},
+        })))
+        .await;
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    assert_eq!(posted(&fake).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-018
+async fn model_check_is_skipped_when_comfyui_runs_with_other_model_paths() {
+    // On ComfyUI's own command line (ComfyUI Desktop starts with `--base-directory`).
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    fake.set_argv(&["main.py", "--base-directory", "D:\\elsewhere"]);
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    rig.observed().await;
+    let id = rig.submit(gone_graph()).await;
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    assert_eq!(posted(&fake).len(), 1, "argv: posted");
+    drop(rig);
+
+    // In `extra_args`.
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    env.suite_toml_set("[engines.comfyui]\nextra_args = ['--extra-model-paths-config=x.yaml']\n");
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    rig.observed().await;
+    let id = rig.submit(gone_graph()).await;
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    assert_eq!(posted(&fake).len(), 1, "extra_args: posted");
+}
+
+#[test] // spec: ARCH-060
+fn secret_looking_command_line_values_are_blanked() {
+    let stats = json!({"system": {"argv": ["main.py", "--api-key", "s3cr3t",
+        "--auth-token=t0k", "--disable-auth", "--port", "8188"]}});
+    let captured = environment::capture(stats, None, None, "2026-10-19T00:00:00Z".into());
+    assert_eq!(
+        captured.system_stats["system"]["argv"],
+        json!([
+            "main.py",
+            "--api-key",
+            "…",
+            "--auth-token=…",
+            "--disable-auth",
+            "--port",
+            "8188"
+        ])
+    );
 }
