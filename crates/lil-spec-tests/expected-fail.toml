@@ -6,15 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 11
-    # ARCH-071
-    { name = "lil-spec-tests::jobs_queue::an_engines_own_vram_counts_as_available", rule = "ARCH-071", file = "tests/jobs_queue.rs" },
-    # ARCH-068
-    { name = "lil-spec-tests::comfy_engine::owned_comfyui_is_loopback_only", rule = "ARCH-068", file = "tests/comfy_engine.rs" },
-    # ARCH-063, QA-032
-    { name = "lil-spec-tests::comfy_engine::owned_comfyui_environment_has_no_keys", rule = "ARCH-063", file = "tests/comfy_engine.rs" },
-    # ARCH-064
-    { name = "lil-spec-tests::comfy_engine::attached_comfyui_is_never_stopped", rule = "ARCH-064", file = "tests/comfy_engine.rs" },
     # Task 12
     # CORE-120, CORE-123, QA-051
     { name = "lil-spec-tests::comfy_engine::comfy_jobs_keep_one_prompt_in_comfyui_with_core_minted_ids", rule = "CORE-120", file = "tests/comfy_engine.rs" },

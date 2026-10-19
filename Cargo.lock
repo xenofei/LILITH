@@ -1612,6 +1612,7 @@ dependencies = [
  "lil-schema",
  "lil-testkit",
  "proptest",
+ "reqwest",
  "rusqlite",
  "schemars",
  "serde",

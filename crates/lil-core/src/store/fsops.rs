@@ -112,6 +112,63 @@ pub fn remove_file(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(long_path(path))
 }
 
+/// Deletes `file`, a ComfyUI-side copy of an output or an upload (Appendix F "ComfyUI
+/// client"), through [`remove_file`]. It is refused (`PermissionDenied`) unless `file` is a
+/// file (or a link, which is removed, never followed) below `<root>\output` or `<root>\input`,
+/// named without `.` or `..` and reached through no link or junction below that folder, so a
+/// clean-up can never delete anything else. Names compare case-insensitively, as Windows does.
+pub fn remove_engine_file(root: &Path, file: &Path) -> std::io::Result<()> {
+    check_engine_file(root, file)?;
+    remove_file(file)
+}
+
+/// Why `file` is not one [`remove_engine_file`] may delete.
+fn check_engine_file(root: &Path, file: &Path) -> std::io::Result<()> {
+    use std::path::Component;
+    let refuse = |why: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a ComfyUI output or upload under {}: {why}",
+                file.display(),
+                root.display()
+            ),
+        ))
+    };
+    let key = |c: Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+    let mut base = root.components();
+    let mut rest = file.components();
+    for want in base.by_ref() {
+        match rest.next() {
+            Some(got) if key(got) == key(want) => {}
+            _ => return refuse("it is outside the ComfyUI folder"),
+        }
+    }
+    let rest: Vec<Component<'_>> = rest.collect();
+    if rest.iter().any(|c| !matches!(c, Component::Normal(_))) {
+        return refuse("its name holds `.` or `..`");
+    }
+    let Some((first, below)) = rest.split_first() else {
+        return refuse("it is the ComfyUI folder itself");
+    };
+    if !matches!(key(*first).as_str(), "output" | "input") || below.is_empty() {
+        return refuse(r"only files below output\ and input\ are removed");
+    }
+    let mut at = root.join(first.as_os_str());
+    for (i, part) in below.iter().enumerate() {
+        at.push(part.as_os_str());
+        let meta = std::fs::symlink_metadata(long_path(&at))?;
+        let last = i + 1 == below.len();
+        if !last && (meta.file_type().is_symlink() || !meta.is_dir()) {
+            return refuse("a folder on its way is a link or not a folder");
+        }
+        if last && meta.is_dir() {
+            return refuse("it is a folder");
+        }
+    }
+    Ok(())
+}
+
 /// Deletes a folder tree, clearing `FILE_ATTRIBUTE_READONLY` on every file and folder in it
 /// first. Links (symbolic links, junctions) are removed, never followed.
 #[allow(clippy::disallowed_methods)]

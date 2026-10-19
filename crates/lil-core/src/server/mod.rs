@@ -26,6 +26,10 @@
 //!   are registered, the default workspace's hardware profile is checked once the workspace is
 //!   open and the first sample is in (CORE-067), and sampling stops right after the shutdown
 //!   steps.
+//! - The engines ([`crate::engines`]) are built once the dispatcher's jobs exist (their tools
+//!   find them through a slot filled before the core serves). They register the node-install
+//!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
+//!   measured with the workspace, and stop an owned ComfyUI in the `StopEngines` shutdown step.
 
 mod conn;
 
@@ -45,9 +49,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
+use crate::engines::Engines;
+use crate::engines::tools::{EnginesSlot, register_engine_tools};
 use crate::events::EventBus;
-use crate::jobs::scheduler::{GpuScheduler, NoEngines};
+use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
+use crate::meter::LogSink;
 use crate::projects::ActiveProjects;
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
@@ -435,6 +442,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     if cfg.test_tools {
         register_hw_tick(&mut registry, telemetry.clone());
     }
+    // The engines need the jobs, which the dispatcher builds: their tools find them here.
+    let engine_slot = EnginesSlot::default();
+    register_engine_tools(&mut registry, &engine_slot);
     let dispatcher = Dispatcher::new(
         registry,
         PipelineHooks::plan2(),
@@ -451,8 +461,28 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
     }
     jobs.set_preempt_agent_batches(preempt_agent_batches(&cfg.env));
-    // ARCH-071: the engines' processes and unload come with Task 11.
-    jobs.set_admission(GpuScheduler::new(telemetry.clone(), Arc::new(NoEngines)));
+    // The engines (ARCH-064): they register the node-install handler, and are the scheduler's
+    // engine processes and unload (ARCH-071).
+    let engines = Engines::new(
+        cfg.env.clone(),
+        jobs.clone(),
+        telemetry.clone(),
+        events.clone(),
+        cfg.clock.clone(),
+        cfg.failpoints.clone(),
+        Arc::new(LogSink),
+        cfg.sockets.clone(),
+    );
+    let _ = engine_slot.set(engines.clone());
+    jobs.set_admission(GpuScheduler::new(telemetry.clone(), engines.clone()));
+    // ComfyUI's models folder is measured with the workspace (CORE-061).
+    let models = engines
+        .comfy_config()
+        .and_then(|c| c.root.as_ref())
+        .map(|root| root.join("models"));
+    if models.is_some() {
+        telemetry.set_sizes_probe(telemetry::sizes_probe(None, models.clone()));
+    }
     let kicked = Arc::downgrade(&jobs);
     telemetry.on_sample(Box::new(move || {
         if let Some(jobs) = kicked.upgrade() {
@@ -474,6 +504,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     }
     lifecycle.add_blocker(jobs.clone());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
+    lifecycle.add_shutdown_step(engines.stop_engines_step());
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
@@ -487,6 +518,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
 
     if let Some(ws) = hub.default_ref() {
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
+        let models = models.clone();
         tokio::spawn(async move {
             match hub.open(&ws).await {
                 Err(e) => {
@@ -496,7 +528,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
-                    telemetry.set_sizes_probe(telemetry::folder_size_probe(open.ws.path.clone()));
+                    telemetry.set_sizes_probe(telemetry::sizes_probe(
+                        Some(open.ws.path.clone()),
+                        models,
+                    ));
                     telemetry::profile::spawn_check(telemetry, &open);
                 }
             }

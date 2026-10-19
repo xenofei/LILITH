@@ -16,8 +16,14 @@
 //!
 //! With a `fake-child-any` file as well, the child (still on `127.0.0.1`) appends the row
 //! `{"pid": <its pid>, "port": <port>, "as": "0.0.0.0"}` to `<cwd>\fake-sockets.json`, one JSON
-//! object per line. A test core started with `LIL_TEST_FAKE_SOCKETS` naming that file then sees
-//! that listener on `0.0.0.0` (`lil_core::config::ScriptedSockets`).
+//! object per line, once its socket is bound and before it serves. A test core started with
+//! `LIL_TEST_FAKE_SOCKETS` naming that file then sees that listener on `0.0.0.0`
+//! (`lil_core::config::ScriptedSockets`).
+//!
+//! Once listening, the listening process prints `To see the GUI go to: http://<ip>:<port>` on
+//! stdout, as ComfyUI does, and keeps the requests it received in
+//! `<cwd>\fake-comfyui-requests.json`: a JSON array of `{method, path, body}`, rewritten whole
+//! (through a rename) whenever a request arrives.
 
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -118,7 +124,8 @@ fn main() {
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let listener = TcpListener::bind(SocketAddr::new(ip, port))
         .unwrap_or_else(|e| fail(&format!("cannot listen on {ip}:{port}: {e}")));
-    let _fake = lil_testkit::FakeComfy::serve(listener, &cwd);
+    // The row is in place before anything can be asked, so a socket check made after the first
+    // answer always sees it.
     if is_child && cwd.join("fake-child-any").exists() {
         let row = json!({"pid": std::process::id(), "port": port, "as": "0.0.0.0"});
         let rows = cwd.join("fake-sockets.json");
@@ -131,6 +138,8 @@ fn main() {
             fail(&format!("cannot append to {}: {e}", rows.display()));
         }
     }
+    let fake = lil_testkit::FakeComfy::serve(listener, &cwd);
+    println!("To see the GUI go to: http://{ip}:{port}");
     let file = if is_child {
         "fake-comfyui-child.json"
     } else {
@@ -140,7 +149,27 @@ fn main() {
         &cwd.join(file),
         &[("listen", json!(ip.to_string())), ("port", json!(port))],
     );
+    keep_requests(&fake, &cwd.join("fake-comfyui-requests.json"));
+}
+
+/// Rewrites `file` with every request `fake` received whenever one arrives; never returns.
+fn keep_requests(fake: &lil_testkit::FakeComfy, file: &Path) -> ! {
+    let tmp = file.with_extension("json.tmp");
+    let mut written = 0;
     loop {
-        std::thread::park();
+        let requests = fake.requests();
+        if requests.len() != written {
+            let rows: Vec<Value> = requests
+                .iter()
+                .map(|r| json!({"method": r.method, "path": r.path, "body": r.body}))
+                .collect();
+            let saved = std::fs::write(&tmp, Value::from(rows).to_string())
+                .and_then(|()| std::fs::rename(&tmp, file));
+            if let Err(e) = saved {
+                fail(&format!("cannot write {}: {e}", file.display()));
+            }
+            written = requests.len();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }

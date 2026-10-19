@@ -861,6 +861,14 @@ impl Telemetry {
         lock(&self.inner.tracked).remove(&pid);
     }
 
+    /// The processes [`Telemetry::track`] follows, with their roles, by pid.
+    pub fn tracked(&self) -> Vec<(u32, &'static str)> {
+        lock(&self.inner.tracked)
+            .iter()
+            .map(|(pid, role)| (*pid, *role))
+            .collect()
+    }
+
     /// Per-process GPU memory is read every second while jobs run, else every 5 s.
     pub fn set_busy(&self, busy: bool) {
         self.inner.busy.store(busy, Ordering::Relaxed);
@@ -1092,32 +1100,68 @@ async fn run_real(inner: Arc<Inner>, cancel: CancellationToken) {
 /// How long a measured folder size is kept before the folder is walked again.
 const SIZE_REFRESH: Duration = Duration::from_secs(270);
 
-/// A [`SizesProbe`] for the workspace folder (CORE-059): `workspace_mib` is the total size of the
-/// files under `root`, links not followed. A walk of a big workspace takes seconds, so the probe
-/// never walks on the sampler's thread: the first call starts a walk on a thread of its own and
-/// answers with nothing, and later calls answer with the last result and start a new walk when
-/// it is older than 4.5 minutes. `models_mib` is left for the engine that knows its models
-/// folder (plan 3 Task 11).
+/// A [`SizesProbe`] for the workspace folder (CORE-059): [`sizes_probe`] of `root` alone.
 pub fn folder_size_probe(root: PathBuf) -> SizesProbe {
-    // The newest total in MiB plus one; 0 is "not measured yet".
-    let total = Arc::new(AtomicU64::new(0));
-    let walking = Arc::new(AtomicBool::new(false));
-    let mut started: Option<std::time::Instant> = None;
+    sizes_probe(Some(root), None)
+}
+
+/// A [`SizesProbe`] for the workspace folder and ComfyUI's models folder (CORE-059):
+/// `workspace_mib` and `models_mib` are the total size of the files under each, links not
+/// followed (a folder not given stays missing). A walk of a big folder takes seconds, so the
+/// probe never walks on the sampler's thread: each folder is walked on a thread of its own,
+/// started by the first call and again when its last result is older than 4.5 minutes, and the
+/// probe answers with the last results. Its first answer waits until every folder given has
+/// been measured (until then it answers nothing, and the sampler asks again at its next step),
+/// so both sizes appear together.
+pub fn sizes_probe(workspace: Option<PathBuf>, models: Option<PathBuf>) -> SizesProbe {
+    let mut workspace = workspace.map(FolderWalk::new);
+    let mut models = models.map(FolderWalk::new);
     Box::new(move || {
-        let stale = started.is_none_or(|at| at.elapsed() >= SIZE_REFRESH);
-        if stale && !walking.swap(true, Ordering::SeqCst) {
-            started = Some(std::time::Instant::now());
-            let (root, total, walking) = (root.clone(), total.clone(), walking.clone());
+        let workspace_mib = workspace.as_mut().map(FolderWalk::poll);
+        let models_mib = models.as_mut().map(FolderWalk::poll);
+        if workspace_mib.is_some_and(|m| m.is_none()) || models_mib.is_some_and(|m| m.is_none()) {
+            return Sizes::default();
+        }
+        Sizes {
+            workspace_mib: workspace_mib.flatten(),
+            models_mib: models_mib.flatten(),
+        }
+    })
+}
+
+/// One folder of a [`sizes_probe`], walked off the caller's thread.
+struct FolderWalk {
+    root: PathBuf,
+    /// The newest total in MiB plus one; 0 is "not measured yet".
+    total: Arc<AtomicU64>,
+    walking: Arc<AtomicBool>,
+    started: Option<std::time::Instant>,
+}
+
+impl FolderWalk {
+    fn new(root: PathBuf) -> FolderWalk {
+        FolderWalk {
+            root,
+            total: Arc::new(AtomicU64::new(0)),
+            walking: Arc::new(AtomicBool::new(false)),
+            started: None,
+        }
+    }
+
+    /// The last total, if any; starts a walk when there is none yet or it is stale.
+    fn poll(&mut self) -> Option<u64> {
+        let stale = self.started.is_none_or(|at| at.elapsed() >= SIZE_REFRESH);
+        if stale && !self.walking.swap(true, Ordering::SeqCst) {
+            self.started = Some(std::time::Instant::now());
+            let (root, total, walking) =
+                (self.root.clone(), self.total.clone(), self.walking.clone());
             std::thread::spawn(move || {
                 total.store(folder_mib(&root) + 1, Ordering::SeqCst);
                 walking.store(false, Ordering::SeqCst);
             });
         }
-        Sizes {
-            workspace_mib: total.load(Ordering::SeqCst).checked_sub(1),
-            models_mib: None,
-        }
-    })
+        self.total.load(Ordering::SeqCst).checked_sub(1)
+    }
 }
 
 /// The size of the files under `root` in MiB (rounded down); links are not followed, and what

@@ -14,12 +14,14 @@
 )]
 
 pub mod config;
+pub mod engines;
 pub mod events;
 pub mod graph;
 pub mod identity;
 pub mod index;
 pub mod jobs;
 pub mod lifecycle;
+pub mod meter;
 pub mod pipeline;
 pub mod projects;
 pub mod rpc;

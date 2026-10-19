@@ -19,7 +19,7 @@ use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -65,6 +65,14 @@ impl KillOnCloseJob {
     pub fn assign(&self, p: &ProcessHandle) -> io::Result<()> {
         // SAFETY: both handles are open for the duration of the call.
         unsafe { AssignProcessToJobObject(self.raw(), p.raw()) }.map_err(|e| io_error(&e))
+    }
+
+    /// Ends every process in the job now (exit code 1), as dropping it would, but keeps the
+    /// job: [`KillOnCloseJob::pids`] then shows when they are all gone. An owned engine's normal
+    /// stop (ARCH-064).
+    pub fn terminate(&self) -> io::Result<()> {
+        // SAFETY: the job handle is open for as long as `self` lives.
+        unsafe { TerminateJobObject(self.raw(), 1) }.map_err(|e| io_error(&e))
     }
 
     /// Every process now in the job: the launcher and each of its children, a `conhost.exe`

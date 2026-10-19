@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 futures-util.workspace = true
+# The ComfyUI client (loopback HTTP only, ARCH-068), through its async API.
+reqwest.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
