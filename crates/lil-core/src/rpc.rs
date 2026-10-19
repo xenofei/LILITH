@@ -86,7 +86,7 @@ use crate::confirm::{
     Confirm, ConfirmationRow, ListState, can_answer, has_confirmation_capability,
 };
 use crate::events::EventBus;
-use crate::identity::{EngineSession, EngineTokens, TrustedDirs, claude_ancestor, resolve_caller};
+use crate::identity::{EngineSession, EngineTokens, TrustedDirs, resolve_caller};
 use crate::lifecycle::{DrainReason, Lifecycle};
 use crate::server::{ConnCtx, ConnObserver, Router};
 use crate::session::Session;
@@ -692,24 +692,17 @@ impl Identify {
             workspace,
             trace_id,
         } = self;
-        // 5. Who is calling.
+        // 5. Who is calling. A declared `mcp` whose parent is not `claude.exe` is `cli`.
         let client = client_process(inspector.as_ref(), conn_id, client_pid);
         let (caller, engine) = resolve_caller(
             &declared,
             engine_token.as_deref(),
             &client,
+            inspector.as_ref(),
             &trusted,
             engine_tokens.as_ref(),
             &trace_id,
         )?;
-        if caller == CallerKind::Mcp && !claude_ancestor(inspector.as_ref(), &client) {
-            tracing::warn!(
-                conn_id,
-                client_pid = client.pid,
-                trace_id,
-                "the MCP server's parent or grandparent is not claude.exe; it stays mcp"
-            );
-        }
         // 6. The workspace: an engine session's own, else the requested one.
         let requested = engine
             .as_ref()

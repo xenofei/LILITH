@@ -132,6 +132,12 @@ impl Client {
         &self.hello
     }
 
+    /// Whether the connection has closed: every later call is [`ClientError::Closed`], and a
+    /// new [`Client::connect`] is needed (it starts a core if none runs).
+    pub fn is_closed(&self) -> bool {
+        self.conn.is_closed()
+    }
+
     /// `tools/call`. Without `key`, a fresh idempotency key `ik_<16 hex>` is minted
     /// (ARCH-110: `lil-client` owns idempotency keys), so the call runs once; pass the same key
     /// again to retry it. A tool's failure is an error [`Outcome`], not a [`ClientError`].

@@ -130,6 +130,11 @@ impl Conn {
         }
     }
 
+    /// Whether the connection has closed (the core went away, or a read or write failed).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.shared.lock().closed
+    }
+
     /// Registers a stream for `topics`; `None` when the connection is closed.
     pub(crate) fn add_sink(
         &self,
