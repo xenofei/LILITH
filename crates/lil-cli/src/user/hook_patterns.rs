@@ -118,17 +118,31 @@ pub fn unknown_core(tool_name: &str) -> Decision {
     ))
 }
 
-/// The decision for a tool call. `tool_input.action` decides the comfy MCP's `job` and
-/// `download`: `cancel` (any case, spaces ignored) or none asks, any other gets no decision.
+/// The decision for a tool call: never `allow` (ruling P3-R28). `tool_input.action` decides the
+/// comfy MCP's `job` and `download`: `cancel` (any case, spaces ignored) or none asks, any other
+/// gets no decision. A shell call without a `command` string, or a write without a
+/// `file_path` string, is malformed and asks.
 pub fn classify_tool(tool_name: &str, tool_input: &Value, core_running: bool) -> Decision {
-    let command = || tool_input["command"].as_str().unwrap_or_default();
+    let missing = |field: &str| {
+        Decision::Ask(format!(
+            "LILITH: this {tool_name} call has no {field} the hook can read. Allow it?"
+        ))
+    };
     match tool_name {
-        "Bash" => return classify_command(Shell::Bash, command()),
-        "PowerShell" => return classify_command(Shell::PowerShell, command()),
+        "Bash" | "PowerShell" => {
+            let shell = if tool_name == "Bash" {
+                Shell::Bash
+            } else {
+                Shell::PowerShell
+            };
+            return tool_input["command"]
+                .as_str()
+                .map_or_else(|| missing("command"), |c| classify_command(shell, c));
+        }
         "Write" | "Edit" | "MultiEdit" => {
             return tool_input["file_path"]
                 .as_str()
-                .map_or(Decision::None, classify_file_write);
+                .map_or_else(|| missing("file_path"), classify_file_write);
         }
         _ => {}
     }

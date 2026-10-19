@@ -1,7 +1,10 @@
 //! `lil hook <session-start | pre-tool-use | post-tool-use>` (spec ARCH-018, ARCH-103–107,
 //! AI-116; Appendix F "Plugin 1.3" and "The `lil` commands this plan adds"): the plugin's
 //! hooks. It reads the hook JSON on stdin, prints the hook output JSON or nothing, and always
-//! exits 0; a malformed input prints nothing.
+//! exits 0. It never answers `allow` (ruling P3-R28): only `ask`, `deny` or no decision, so a
+//! command it doesn't flag is left to Claude Code's own permission mode. A malformed input
+//! (not a JSON object, or missing the fields its tool needs) asks on PreToolUse and prints
+//! nothing for the other events.
 //!
 //! - **PreToolUse:** [`classify_tool`] decides. Only for the comfy MCP's tools that are denied
 //!   while a core runs does it look whether one runs (the pipe, as `lil status --no-start`
@@ -82,6 +85,17 @@ fn failed(event: HookEvent) -> String {
     .to_string()
 }
 
+/// What a hook given malformed input prints: `ask` for PreToolUse, nothing for the others.
+fn malformed(event: HookEvent) -> String {
+    if event != HookEvent::PreToolUse {
+        return String::new();
+    }
+    ask_output(MALFORMED.to_string()).to_string()
+}
+
+const MALFORMED: &str = "LILITH: the hook input isn't the JSON Claude Code sends, so the suite's \
+    hook can't check this tool call. Allow it?";
+
 /// A PreToolUse `ask` with `reason`.
 fn ask_output(reason: String) -> Value {
     json!({"hookSpecificOutput": {
@@ -96,12 +110,10 @@ pub fn run_hook(event: HookEvent, stdin: &str, global: &GlobalArgs) -> (String, 
     if std::env::var(ENGINE_MARKER).is_ok_and(|v| v == "1") {
         return (String::new(), 0);
     }
-    let Ok(input) = serde_json::from_str::<Value>(stdin) else {
-        return (String::new(), 0);
+    let input = match serde_json::from_str::<Value>(stdin) {
+        Ok(input) if input.is_object() => input,
+        _ => return (malformed(event), 0),
     };
-    if !input.is_object() {
-        return (String::new(), 0);
-    }
     let output = match event {
         HookEvent::PreToolUse => pre_tool_use(&input),
         HookEvent::PostToolUse => {
@@ -114,7 +126,9 @@ pub fn run_hook(event: HookEvent, stdin: &str, global: &GlobalArgs) -> (String, 
 }
 
 fn pre_tool_use(input: &Value) -> Option<Value> {
-    let tool_name = input["tool_name"].as_str()?;
+    let Some(tool_name) = input["tool_name"].as_str() else {
+        return Some(ask_output(MALFORMED.to_string()));
+    };
     let empty = json!({});
     let tool_input = input.get("tool_input").unwrap_or(&empty);
     let running = if depends_on_core(tool_name) {

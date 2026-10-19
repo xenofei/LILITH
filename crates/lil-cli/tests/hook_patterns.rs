@@ -582,9 +582,102 @@ fn engine_a_marker_silences_every_hook() {
             .stdout
             .contains("\"ask\"")
     );
-    // A malformed input prints nothing, and still exits 0.
-    let out = env.lil_in_with(&ws, &["hook", "pre-tool-use"], &[], Some("{not json"));
-    assert_eq!((out.code, out.stdout.as_str()), (0, ""), "{out:?}");
+}
+
+/// The `permissionDecision` `lil hook pre-tool-use` prints for `stdin`, if any.
+fn decision_for(env: &TestEnv, stdin: &str) -> Option<String> {
+    let out = env.lil_in_with(env.root(), &["hook", "pre-tool-use"], &[], Some(stdin));
+    assert_eq!(out.code, 0, "{out:?}");
+    let text = out.stdout.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    v["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .map(str::to_string)
+}
+
+#[test] // spec: QA-061; ruling P3-R28
+fn malformed_hook_input_asks() {
+    let env = TestEnv::new();
+    for stdin in [
+        "{not json",
+        "",
+        "[]",
+        "\"text\"",
+        r#"{"hook_event_name": "PreToolUse"}"#,
+        r#"{"tool_name": 7, "tool_input": {}}"#,
+        r#"{"tool_name": "Bash", "tool_input": {}}"#,
+        r#"{"tool_name": "Bash"}"#,
+        r#"{"tool_name": "PowerShell", "tool_input": {"command": 5}}"#,
+        r#"{"tool_name": "Write", "tool_input": {"content": "x"}}"#,
+        r#"{"tool_name": "Edit", "tool_input": {"file_path": null}}"#,
+    ] {
+        assert_eq!(
+            decision_for(&env, stdin).as_deref(),
+            Some("ask"),
+            "{stdin:?}"
+        );
+    }
+    // The other events print nothing for a malformed input.
+    for event in ["session-start", "post-tool-use"] {
+        let out = env.lil_in_with(env.root(), &["hook", event], &[], Some("{not json"));
+        assert_eq!((out.code, out.stdout.as_str()), (0, ""), "{event}: {out:?}");
+    }
+}
+
+#[test] // spec: QA-061; ruling P3-R28
+fn no_code_path_answers_allow() {
+    // The sources never name the decision.
+    for file in ["hook.rs", "hook_patterns.rs"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("user")
+            .join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("\"allow\""),
+            "{file} names the allow decision"
+        );
+    }
+    // And the answers the hook gives, over a spread of inputs, are ask, deny or none.
+    let env = TestEnv::new();
+    let _core = CoreFixture::start(&env);
+    let tool =
+        |name: &str, input: Value| json!({"tool_name": name, "tool_input": input}).to_string();
+    let mut seen = std::collections::BTreeSet::new();
+    for stdin in [
+        tool("Bash", json!({"command": "git status"})),
+        tool("Bash", json!({"command": "rm -rf x"})),
+        tool("PowerShell", json!({"command": "Get-ChildItem"})),
+        tool(
+            "Write",
+            json!({"file_path": "C:/x/notes.txt", "content": "x"}),
+        ),
+        tool(
+            "Write",
+            json!({"file_path": "C:/x/LILITH/suite.toml", "content": "x"}),
+        ),
+        tool("Edit", json!({"file_path": "C:/ws/queue/jobs.x.jsonl"})),
+        tool("mcp__comfyui__launch_comfyui", json!({})),
+        tool("mcp__comfyui__job", json!({"action": "status"})),
+        tool("mcp__comfyui__install_node", json!({})),
+        tool("Read", json!({"file_path": "C:/x"})),
+        "{not json".to_string(),
+    ] {
+        seen.insert(decision_for(&env, &stdin));
+    }
+    for d in &seen {
+        assert!(
+            matches!(d.as_deref(), None | Some("ask" | "deny")),
+            "the hook answered {d:?}"
+        );
+    }
+    assert!(
+        seen.contains(&None) && seen.contains(&Some("deny".to_string())),
+        "{seen:?}"
+    );
 }
 
 #[test] // spec: ARCH-018, ARCH-103
