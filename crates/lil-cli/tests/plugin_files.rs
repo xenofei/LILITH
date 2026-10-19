@@ -217,7 +217,6 @@ fn carried() -> Vec<(String, String)> {
 }
 
 #[test] // spec: ARCH-101
-#[ignore = "waits for the plugin 1.2.0 source folder the owner names (Task 20 report)"]
 fn plugin_carries_1_2_0_content() {
     let listed = carried();
     assert!(

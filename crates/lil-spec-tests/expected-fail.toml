@@ -6,9 +6,4 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 20
-    # ARCH-013, AI-107, ARCH-101. Stays after Task 20: plugin 1.2.0's civitai and huggingface
-    # server entries are carried into .mcp.json from the 1.2.0 source folder the owner names,
-    # which this round did not have; everything else in the test passes.
-    { name = "lil-spec-tests::plugin_hooks::plugin_uses_the_user_config_paths", rule = "ARCH-013", file = "tests/plugin_hooks.rs" },
 ]

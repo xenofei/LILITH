@@ -188,8 +188,8 @@ const ALLOW: &[Allow] = &[
         why: "Claude Code's names for the plugin's tools and the install target (AI-110, D5)",
         until: "plugin rename",
     },
-    // Plan 3, Global Constraints "Old names", the Task 20 rows. The copied 1.2.0 folders and
-    // server lines get their rows when they are carried (none yet), and
+    // Plan 3, Global Constraints "Old names", the Task 20 rows. The carried 1.2.0 server
+    // entries name no old name, so `.mcp.json` needs no row, and
     // `crates/lil-cli/tests/plugin_files.rs` names the legacy workspace file only through
     // `LEGACY_WORKSPACE_FILE`, so it needs no `worldwright.yaml` row.
     Allow {
@@ -206,6 +206,23 @@ const ALLOW: &[Allow] = &[
         lines_with: &["\"name\": \"worldwright\"", "\"source\": \"./worldwright\""],
         why: "the plugin and marketplace entries (R1)",
         until: "plugin rename",
+    },
+    Allow {
+        globs: &[
+            "plugin/worldwright/skills/engines/**",
+            "plugin/worldwright/skills/hubs/**",
+            "plugin/worldwright/skills/manifest/**",
+            "plugin/worldwright/skills/models/**",
+            "plugin/worldwright/skills/production/**",
+            "plugin/worldwright/skills/repair/**",
+            "plugin/worldwright/skills/routing/**",
+            "plugin/worldwright/skills/toolmap/**",
+            "plugin/worldwright/skills/vtuber/**",
+            "plugin/worldwright/agents/**",
+        ],
+        lines_with: &[],
+        why: "plugin 1.2.0's skills and subagents, carried as they are (owner question 2)",
+        until: "the skills port",
     },
     Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],
