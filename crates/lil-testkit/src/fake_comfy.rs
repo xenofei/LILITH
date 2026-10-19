@@ -56,7 +56,21 @@ pub enum FakeFailure {
     Execution { message: String },
     /// `POST /prompt` answers 503 and queues nothing.
     Refuse503,
+    /// `POST /prompt` answers 400 with `{"error": {"type": "prompt_outputs_failed_validation"},
+    /// "node_errors": <node_errors>}` (no `node_errors` key when it is `null`) and queues
+    /// nothing.
+    Reject400 { node_errors: Value },
 }
+
+impl FakeFailure {
+    /// Whether it answers the `POST /prompt` itself instead of failing the run.
+    fn at_post(&self) -> bool {
+        matches!(self, FakeFailure::Refuse503 | FakeFailure::Reject400 { .. })
+    }
+}
+
+/// What [`FakeComfy::on_prompt`] calls with each `POST /prompt` body.
+type PromptHook = Arc<dyn Fn(&Value) + Send + Sync>;
 
 /// One HTTP request the fake received.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,9 +245,16 @@ impl FakeComfy {
         id
     }
 
-    /// The next prompt the suite submits fails as `kind` says ([`FakeFailure`]).
+    /// The next prompt the suite submits fails as `kind` says ([`FakeFailure`]). Calls queue
+    /// up: each `POST /prompt` takes the oldest one.
     pub fn fail_next(&self, kind: FakeFailure) {
-        self.shared.lock().fail_next = Some(kind);
+        self.shared.lock().fail_next.push_back(kind);
+    }
+
+    /// Calls `hook` with the body of each `POST /prompt` when it arrives, before the fake
+    /// does anything with it (on the fake's thread: keep it short).
+    pub fn on_prompt(&self, hook: impl Fn(&Value) + Send + Sync + 'static) {
+        self.shared.lock().on_prompt = Some(Arc::new(hook));
     }
 
     /// While on, each `POST /prompt` is queued as usual, then the connection is closed before
@@ -494,7 +515,8 @@ struct State {
     /// Never `None` while `queue` holds anything.
     running: Option<String>,
     hold: bool,
-    fail_next: Option<FakeFailure>,
+    fail_next: std::collections::VecDeque<FakeFailure>,
+    on_prompt: Option<PromptHook>,
     drop_after_accept: bool,
     restart_after: Option<u32>,
     outputs_since_armed: u32,
@@ -641,7 +663,9 @@ impl State {
                 "Allocation on device 0 would exceed allowed memory. CUDA out of memory. Tried to allocate 2.00 GiB".to_string(),
             ),
             FakeFailure::Execution { message } => ("RuntimeError", message.clone()),
-            FakeFailure::Refuse503 => ("RuntimeError", "refused".to_string()),
+            FakeFailure::Refuse503 | FakeFailure::Reject400 { .. } => {
+                ("RuntimeError", "refused".to_string())
+            }
         };
         let data = json!({
             "prompt_id": id, "node_id": node.0, "node_type": node.1, "executed": [],
@@ -1025,13 +1049,28 @@ fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, i
     let Some(body) = body else {
         return Ok(bad_request("invalid_json", "The body is not JSON"));
     };
+    let hook = shared.lock().on_prompt.clone();
+    if let Some(hook) = hook {
+        hook(&body);
+    }
     let mut st = shared.lock();
-    if st.fail_next == Some(FakeFailure::Refuse503) {
-        st.fail_next = None;
-        return Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": "the fake ComfyUI refused the prompt"}),
-        ));
+    match st.fail_next.front() {
+        Some(FakeFailure::Refuse503) => {
+            st.fail_next.pop_front();
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "the fake ComfyUI refused the prompt"}),
+            ));
+        }
+        Some(FakeFailure::Reject400 { node_errors }) => {
+            let mut answer = json!({"error": {"type": "prompt_outputs_failed_validation"}});
+            if !node_errors.is_null() {
+                answer["node_errors"] = node_errors.clone();
+            }
+            st.fail_next.pop_front();
+            return Ok(json_response(StatusCode::BAD_REQUEST, &answer));
+        }
+        _ => {}
     }
     let graph = match body.get("prompt") {
         Some(g @ Value::Object(_)) => g.clone(),
@@ -1054,9 +1093,9 @@ fn post_prompt(shared: &Shared, body: Option<Value>) -> Result<Response<Full>, i
     let extra = body.get("extra_data").cloned().unwrap_or(json!({}));
     let mut prompt = Prompt::new(&mut st, id.clone(), graph, client_id, extra);
     prompt.held = st.hold;
-    prompt.fail = match st.fail_next.take() {
-        Some(FakeFailure::Refuse503) | None => None,
-        other => other,
+    prompt.fail = match st.fail_next.front() {
+        Some(f) if !f.at_post() => st.fail_next.pop_front(),
+        _ => None,
     };
     let number = prompt.number;
     st.prompts.push(prompt);

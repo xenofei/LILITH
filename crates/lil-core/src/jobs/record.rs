@@ -51,6 +51,9 @@ pub struct JobRow {
     pub reservation: Option<String>,
     /// The tool call that submitted the job (`job.retry` dispatches it again).
     pub origin: Option<JobOrigin>,
+    /// The engine's id for the job (ComfyUI's `prompt_id`, CORE-120), written by its handler
+    /// before it is sent ([`super::JobCtx::set_external_id`]).
+    pub external_id: Option<String>,
 }
 
 impl JobRow {
@@ -161,6 +164,8 @@ pub struct Change {
     pub vram_unchecked: Option<bool>,
     /// Sets the watchdog flag (`"slow"`); it is never cleared.
     pub watchdog: Option<String>,
+    /// Sets the engine's id for the job (CORE-120).
+    pub external_id: Option<String>,
 }
 
 impl Change {
@@ -187,7 +192,7 @@ const COLUMNS: &str = "seq, job_id, kind, lane, priority, module, args, project,
     doc_id, status, substatus, attempt, created_utc, updated_utc, started_utc, finished_utc, \
     watchdog, vram_unchecked, error, result, retry_of, trace_id, idem_scope, idem_key, \
     args_hash, expected_secs, expected_output_bytes, vram_need_mib, engine, grp, \
-    external_side_effects, reservation, tool, tool_args";
+    external_side_effects, reservation, tool, tool_args, external_id";
 
 /// A JSON column, `None` when it is NULL or doesn't parse (logged).
 fn json_col<T: serde::de::DeserializeOwned>(r: &Row<'_>, i: usize) -> rusqlite::Result<Option<T>> {
@@ -269,6 +274,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
                 arguments: json_col(r, 34)?.unwrap_or(Value::Null),
             }),
         },
+        external_id: r.get(35)?,
     })
 }
 
@@ -333,10 +339,10 @@ pub async fn insert(db: &StateDb, r: JobRow) -> Result<Inserted, StateError> {
                      finished_utc, watchdog, vram_unchecked, error, result, retry_of, trace_id,
                      idem_scope, idem_key, args_hash, expected_secs, expected_output_bytes,
                      vram_need_mib, engine, grp, external_side_effects, reservation, tool,
-                     tool_args)
+                     tool_args, external_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                      ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-                     ?32, ?33, ?34)",
+                     ?32, ?33, ?34, ?35)",
                 params![
                     r.job_id,
                     r.kind,
@@ -372,6 +378,7 @@ pub async fn insert(db: &StateDb, r: JobRow) -> Result<Inserted, StateError> {
                     r.reservation,
                     r.origin.as_ref().map(|o| o.tool.as_str()),
                     r.origin.as_ref().map(|o| to_text(&o.arguments)),
+                    r.external_id,
                 ],
             )?;
             let inserted = get_in(&tx, &r.job_id)?.expect("the row was just inserted");
@@ -436,11 +443,14 @@ pub async fn update(
             if let Some(watchdog) = c.watchdog {
                 r.watchdog = Some(watchdog);
             }
+            if let Some(external_id) = c.external_id {
+                r.external_id = Some(external_id);
+            }
             r.updated_utc = now_utc;
             tx.execute(
                 "UPDATE jobs SET status = ?2, substatus = ?3, attempt = ?4, updated_utc = ?5,
                      started_utc = ?6, finished_utc = ?7, error = ?8, result = ?9,
-                     vram_unchecked = ?10, watchdog = ?11
+                     vram_unchecked = ?10, watchdog = ?11, external_id = ?12
                  WHERE job_id = ?1",
                 params![
                     job_id,
@@ -454,6 +464,7 @@ pub async fn update(
                     r.result.as_ref().map(to_text),
                     i64::from(r.vram_unchecked),
                     r.watchdog,
+                    r.external_id,
                 ],
             )?;
             tx.commit()?;
@@ -586,6 +597,7 @@ mod tests {
             external_side_effects: false,
             reservation: None,
             origin: None,
+            external_id: None,
         }
     }
 

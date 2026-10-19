@@ -594,6 +594,7 @@ impl Shared {
             external_side_effects: spec.external_side_effects,
             reservation: reservation.clone(),
             origin: origin.clone(),
+            external_id: None,
         };
         let serial = self.job_lock(&id);
         let guard = serial.lock().await;
@@ -1323,6 +1324,39 @@ impl Shared {
             .await;
     }
 
+    /// `JobCtx::set_external_id`: a guarded update of the running job's row (never a final
+    /// one), without an announcement.
+    pub(crate) async fn handler_external_id(
+        &self,
+        id: &JobId,
+        external_id: &str,
+        trace_id: &str,
+    ) -> Result<(), ErrorBody> {
+        let scope = {
+            let q = self.queue();
+            match q.jobs.get(id.as_str()) {
+                Some(a) if a.running && !a.completing => a.info.scope.clone(),
+                _ => return Err(job_unknown(id.as_str(), trace_id)),
+            }
+        };
+        let lock = self.job_lock(id.as_str());
+        let _serial = lock.lock().await;
+        let c = Change {
+            external_id: Some(external_id.to_string()),
+            ..Change::default()
+        };
+        match record::update(scope.db(), id.as_str(), c, self.now()).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(job_unknown(id.as_str(), trace_id)),
+            Err(e) => Err(state_unavailable(&e, trace_id)),
+        }
+    }
+
+    /// `JobCtx::uuid`.
+    pub(crate) fn uuid(&self) -> String {
+        self.ids.uuid()
+    }
+
     /// `JobCtx::progress`.
     pub(crate) fn progress(&self, id: &JobId, value: u64, max: u64, node: Option<&str>) {
         let progress = Progress {
@@ -1956,6 +1990,12 @@ impl Jobs {
         } else {
             !q.jobs.is_empty()
         }
+    }
+
+    /// The suite `state.db`: the engines keep their caches in it (the ComfyUI client's id,
+    /// its uploads and model hashes, Appendix F).
+    pub fn suite_state(&self) -> Arc<StateDb> {
+        self.shared.states.suite_db()
     }
 
     /// The `PersistInterrupted` shutdown step (ARCH-021 step 3).

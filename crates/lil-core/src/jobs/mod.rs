@@ -547,6 +547,26 @@ impl JobCtx {
         self.jobs.handler_substatus(&self.id, s).await;
     }
 
+    /// Persists the engine's id for the job (the `jobs` row's `external_id`: ComfyUI's
+    /// `prompt_id`, CORE-120) before the handler sends it, so a later attempt reads it back
+    /// with [`record::get`] and asks the engine about it first. Nothing is shown or logged: it
+    /// is no state change.
+    ///
+    /// # Errors
+    /// `state.unavailable` when it could not be written; `job.unknown` when this core no
+    /// longer runs the job or its row is final. The handler sends nothing then.
+    pub async fn set_external_id(&self, external_id: &str) -> Result<(), ErrorBody> {
+        self.jobs
+            .handler_external_id(&self.id, external_id, &self.trace_id)
+            .await
+    }
+
+    /// A new UUID version 4 from the core's id source (an engine id the core mints, such as
+    /// ComfyUI's `prompt_id`).
+    pub fn uuid(&self) -> String {
+        self.jobs.uuid()
+    }
+
     /// Publishes progress on `job:<id>`; job summaries show the latest.
     pub fn progress(&self, value: u64, max: u64, node: Option<&str>) {
         self.jobs.progress(&self.id, value, max, node);

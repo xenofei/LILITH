@@ -84,8 +84,30 @@ const JOBS: &str = "CREATE TABLE jobs (
 CREATE UNIQUE INDEX jobs_idem ON jobs(idem_scope, idem_key) WHERE idem_key IS NOT NULL;
 CREATE INDEX jobs_open ON jobs(status) WHERE status IN ('queued','running');";
 
+/// Suite migration 4: the ComfyUI client's caches (Appendix F "ComfyUI client", CORE-130). The
+/// one `client_id` of the channel (one row); the hash-named uploads in `<root>\input` with
+/// their reference counts (`last_used_utc` is when the count last changed: an upload whose
+/// count is 0 is removed 24 h after it); and the model hashes, cached by path, size, mtime
+/// and FileId.
+const COMFY_CACHE: &str = "CREATE TABLE comfy_client (
+    id TEXT PRIMARY KEY
+);
+CREATE TABLE comfy_uploads (
+    name TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    refs INTEGER NOT NULL CHECK (refs >= 0),
+    last_used_utc INTEGER NOT NULL
+);
+CREATE TABLE model_hashes (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    file_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
-pub const SUITE_MIGRATIONS: &[&str] = &[IDEMPOTENCY_V1, IDEMPOTENCY_PRUNE_V2, JOBS];
+pub const SUITE_MIGRATIONS: &[&str] = &[IDEMPOTENCY_V1, IDEMPOTENCY_PRUNE_V2, JOBS, COMFY_CACHE];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
 pub const WORKSPACE_MIGRATIONS: &[&str] =
@@ -161,7 +183,7 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 3);
+        assert_eq!(SUITE_MIGRATIONS.len(), 4);
         assert_eq!(WORKSPACE_MIGRATIONS.len(), 4);
     }
 

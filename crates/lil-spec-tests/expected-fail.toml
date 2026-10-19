@@ -6,23 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 12
-    # CORE-120, CORE-123, QA-051
-    { name = "lil-spec-tests::comfy_engine::comfy_jobs_keep_one_prompt_in_comfyui_with_core_minted_ids", rule = "CORE-120", file = "tests/comfy_engine.rs" },
-    # CORE-130, ARCH-080
-    { name = "lil-spec-tests::comfy_engine::outputs_land_in_staging_with_the_job_prefix", rule = "CORE-130", file = "tests/comfy_engine.rs" },
-    # ARCH-021, CORE-130, QA-051
-    { name = "lil-spec-tests::comfy_engine::cancel_uses_the_per_job_endpoint_only", rule = "ARCH-021", file = "tests/comfy_engine.rs" },
-    # QA-009, CORE-128
-    { name = "lil-spec-tests::comfy_engine::comfyui_restart_mid_job_interrupts_and_salvages", rule = "QA-009", file = "tests/comfy_engine.rs" },
-    # CORE-120, QA-055
-    { name = "lil-spec-tests::comfy_engine::core_abort_after_submitting_never_duplicates_a_prompt", rule = "CORE-120", file = "tests/comfy_engine.rs" },
-    # ARCH-072
-    { name = "lil-spec-tests::comfy_engine::out_of_memory_is_retried_after_free", rule = "ARCH-072", file = "tests/comfy_engine.rs" },
-    # ARCH-060
-    { name = "lil-spec-tests::comfy_engine::engine_error_text_is_untrusted", rule = "ARCH-060", file = "tests/comfy_engine.rs" },
-    # ARCH-021, ARCH-064
-    { name = "lil-spec-tests::comfy_engine::owned_comfyui_stops_with_the_core_and_dies_with_it", rule = "ARCH-021", file = "tests/comfy_engine.rs" },
     # Task 13
     # ARCH-069, QA-051
     { name = "lil-spec-tests::comfy_engine::outside_jobs_are_observed_waited_for_and_never_cancelled", rule = "ARCH-069", file = "tests/comfy_engine.rs" },

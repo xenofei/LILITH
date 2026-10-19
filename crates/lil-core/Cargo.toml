@@ -10,6 +10,8 @@ publish.workspace = true
 # console window (ARCH-005).
 
 [dependencies]
+# Previews ride the `preview:<job_id>` topic as base64 (ARCH-033).
+base64.workspace = true
 futures-util.workspace = true
 # The ComfyUI client (loopback HTTP only, ARCH-068), through its async API.
 reqwest.workspace = true
@@ -22,6 +24,8 @@ sha2.workspace = true
 # `fs` only so clippy.toml can name the `tokio::fs` paths it forbids (ARCH-112).
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs"] }
 tokio-util.workspace = true
+# ComfyUI's websocket (loopback only, ARCH-068): its events and previews.
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true

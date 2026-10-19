@@ -432,13 +432,15 @@ fn drain_closes_state_before_releasing_the_pipe() {
     assert_eq!(drain["result"]["status"], "ok", "{drain}");
 
     let report = core.wait_stopped(DEADLINE).expect("the core stops");
-    // The steps ran with the database open; then it was closed; then the pipe. The jobs'
-    // `PersistInterrupted` step (plan 3) runs in its phase, then the engines' `StopEngines` step
-    // (registered first in that phase), then the probe's.
+    // The steps ran with the database open; then it was closed; then the pipe. The engines'
+    // `CancelEnginePrompts` step and the jobs' `PersistInterrupted` step (plan 3) run in their
+    // phases, then the engines' `StopEngines` step (registered first in that phase), then the
+    // probe's.
     assert_eq!(*answered.lock().unwrap(), Some(true));
     assert_eq!(
         report.steps,
         [
+            "engines.cancel_prompts",
             "jobs.persist_interrupted",
             "engines.stop",
             "probe state",

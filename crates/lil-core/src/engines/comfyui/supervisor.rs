@@ -11,7 +11,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::client::ComfyClient;
+use super::handler::SuitePrompts;
+use super::uploads::Uploads;
 use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK, scrubbed_env};
 use crate::engines::{
     COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, Listen, OutsideJobs, TOPIC,
@@ -33,6 +35,7 @@ use crate::engines::{
 use crate::events::EventBus;
 use crate::jobs::{EngineKind, Jobs};
 use crate::meter::UsageSink;
+use crate::state::StateDb;
 use crate::telemetry::Telemetry;
 
 /// How often the supervisor asks `/system_stats`.
@@ -146,6 +149,14 @@ pub(crate) struct Comfy {
     output: Arc<Mutex<VecDeque<String>>>,
     /// Cancelled by the `StopEngines` step: the supervisor task ends, a start gives up.
     stopped: CancellationToken,
+    /// The suite `state.db`: the client id, the uploads.
+    suite: Arc<StateDb>,
+    /// `Env::local_dir()`: the job caches of jobs without a workspace.
+    local_dir: PathBuf,
+    /// The suite's prompts in ComfyUI now.
+    prompts: Arc<SuitePrompts>,
+    /// The channel's `client_id`, read (or minted) once.
+    client_id: tokio::sync::OnceCell<String>,
 }
 
 impl Comfy {
@@ -169,6 +180,7 @@ impl Comfy {
             .as_ref()
             .and_then(|c| ComfyClient::new(&c.url()).ok());
         let now = clock.monotonic();
+        let suite = jobs.suite_state();
         Arc::new(Comfy {
             config,
             config_error,
@@ -192,7 +204,91 @@ impl Comfy {
             }),
             output: Arc::default(),
             stopped: CancellationToken::new(),
+            suite,
+            local_dir: env.local_dir(),
+            prompts: Arc::default(),
+            client_id: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// The HTTP client, when ComfyUI is configured.
+    pub(crate) fn client(&self) -> Option<&ComfyClient> {
+        self.client.as_ref()
+    }
+
+    pub(crate) fn prompts(&self) -> &Arc<SuitePrompts> {
+        &self.prompts
+    }
+
+    pub(crate) fn suite_state(&self) -> Arc<StateDb> {
+        self.suite.clone()
+    }
+
+    pub(crate) fn local_dir(&self) -> &Path {
+        &self.local_dir
+    }
+
+    /// The client of the `comfy.prompt` jobs: with the channel's stable `client_id`, kept in
+    /// the suite `state.db` (`comfy_client`), minted with `mint` the first time.
+    ///
+    /// # Errors
+    /// `engine.not_configured`; `state.unavailable` when the id can't be read or kept.
+    pub(crate) async fn prompt_client(
+        &self,
+        mint: impl FnOnce() -> String,
+    ) -> Result<ComfyClient, ErrorBody> {
+        let (_, client) = self.configured()?;
+        let suite = self.suite.clone();
+        let id = self
+            .client_id
+            .get_or_try_init(|| async move {
+                let minted = mint();
+                suite
+                    .call(move |conn| {
+                        let run = || -> rusqlite::Result<String> {
+                            let tx = conn.transaction_with_behavior(
+                                rusqlite::TransactionBehavior::Immediate,
+                            )?;
+                            let kept: Option<String> = tx
+                                .query_row("SELECT id FROM comfy_client LIMIT 1", [], |r| r.get(0))
+                                .map(Some)
+                                .or_else(|e| match e {
+                                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                                    e => Err(e),
+                                })?;
+                            let id = match kept {
+                                Some(id) => id,
+                                None => {
+                                    tx.execute(
+                                        "INSERT INTO comfy_client (id) VALUES (?1)",
+                                        [&minted],
+                                    )?;
+                                    minted
+                                }
+                            };
+                            tx.commit()?;
+                            Ok(id)
+                        };
+                        run().map_err(|e| crate::state::StateError::Io(e.to_string()))
+                    })
+                    .await
+                    .map_err(|e| {
+                        ErrorBody::new(
+                            &codes::STATE_UNAVAILABLE,
+                            format!("ComfyUI's client id can't be read or kept: {e}"),
+                            "",
+                        )
+                    })
+            })
+            .await?;
+        Ok(client.clone().with_client_id(id.clone()))
+    }
+
+    /// The `CancelEnginePrompts` step: the suite's own prompts get their per-job cancel.
+    pub(crate) async fn cancel_prompts(&self) {
+        if let Some(client) = &self.client {
+            self.prompts.cancel_all(client).await;
+        }
     }
 
     /// Starts the supervisor task (when ComfyUI is configured): a pass now, then one every
@@ -245,7 +341,7 @@ impl Comfy {
             version: v.version,
             listen: v.listen,
             outside_jobs: OutsideJobs::default(),
-            suite_job: None,
+            suite_job: self.prompts.current(),
             restart_needed: self.restart_needed.load(Ordering::SeqCst),
         }
     }
@@ -325,6 +421,12 @@ impl Comfy {
             return;
         };
         let _pass = self.pass_gate.lock().await;
+        // Uploads no job has used for 24 h leave `<root>\input` (CORE-130).
+        if let Some(root) = &config.root {
+            Uploads::new(self.suite.clone(), self.clock.clone())
+                .sweep(root)
+                .await;
+        }
         let checks = self
             .passes
             .fetch_add(1, Ordering::SeqCst)

@@ -23,6 +23,10 @@
 //!   never blocks or does I/O. Every one is tracked by the telemetry (role `comfyui`).
 //! - **Node installs** ([`comfyui::install`]) run comfy-cli as a `cpu`-lane job; a success sets
 //!   `restart_needed` and records one usage draft for the registry call (CORE-069).
+//! - **Prompts** ([`comfyui::handler`]): `comfy.prompt` jobs in the `gpu-heavy` lane, one
+//!   suite prompt in ComfyUI at a time; `engines.status`'s `suite_job` is the one there now.
+//!   The `CancelEnginePrompts` shutdown step ([`Engines::cancel_prompts_step`]) cancels them
+//!   through the per-job endpoint (ARCH-021).
 //!
 //! The engine tools are in [`tools`] (registered by the server, since they need the running
 //! engines). The `engines` topic carries `{kind: "status", engine}` and
@@ -53,6 +57,7 @@ use crate::meter::UsageSink;
 use crate::store::FailPoints;
 use crate::telemetry::Telemetry;
 
+pub use comfyui::handler::ComfyPromptHandler;
 pub use comfyui::install::NodeInstallHandler;
 pub use comfyui::supervisor::ComfyEndpoint;
 pub use config::{ComfyConfig, scrubbed_env};
@@ -183,6 +188,7 @@ impl Engines {
         );
         let engines = Arc::new_cyclic(|weak: &Weak<Engines>| {
             jobs.register(Arc::new(NodeInstallHandler::new(weak.clone())));
+            jobs.register(Arc::new(ComfyPromptHandler::new(weak.clone())));
             Engines { comfy }
         });
         comfyui::supervisor::Comfy::spawn_monitor(&engines.comfy);
@@ -282,6 +288,13 @@ impl Engines {
         self.comfy.tick().await;
     }
 
+    /// The `CancelEnginePrompts` shutdown step (ARCH-021 step 2): every suite prompt in an
+    /// engine gets its per-job cancel (never `/interrupt`); prompts from outside the suite are
+    /// never touched.
+    pub fn cancel_prompts_step(self: &Arc<Self>) -> Arc<dyn ShutdownStep> {
+        Arc::new(CancelEnginePrompts(self.clone()))
+    }
+
     /// The `StopEngines` shutdown step (ARCH-021 step 4): stops the supervisor and an owned
     /// engine; an attached one is left alone.
     pub fn stop_engines_step(self: &Arc<Self>) -> Arc<dyn ShutdownStep> {
@@ -307,6 +320,23 @@ impl EngineControl for Engines {
         Box::pin(async move {
             Engines::unload(self, e).await;
         })
+    }
+}
+
+/// The `CancelEnginePrompts` step.
+struct CancelEnginePrompts(Arc<Engines>);
+
+impl ShutdownStep for CancelEnginePrompts {
+    fn phase(&self) -> ShutdownPhase {
+        ShutdownPhase::CancelEnginePrompts
+    }
+
+    fn name(&self) -> &'static str {
+        "engines.cancel_prompts"
+    }
+
+    fn run(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { self.0.comfy.cancel_prompts().await })
     }
 }
 

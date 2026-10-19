@@ -91,6 +91,88 @@ pub fn write_temp(
     Ok(path)
 }
 
+/// A new file written in pieces (an engine output streamed into a staging handle or a job
+/// cache, Appendix F "ComfyUI client"): [`create_streamed`] creates it (never an existing
+/// file), [`StreamedFile::write`] appends, [`StreamedFile::finish`] flushes it with
+/// `FlushFileBuffers` and closes it. One dropped before it is finished is removed again.
+#[derive(Debug)]
+pub struct StreamedFile {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+}
+
+/// Creates `path` for [`StreamedFile`]; an existing file there is an error (`AlreadyExists`).
+#[allow(clippy::disallowed_methods)]
+pub fn create_streamed(path: &Path) -> std::io::Result<StreamedFile> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(long_path(path))?;
+    Ok(StreamedFile {
+        file: Some(file),
+        path: path.to_path_buf(),
+    })
+}
+
+impl StreamedFile {
+    /// Appends `bytes`.
+    ///
+    /// # Errors
+    /// The write's.
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.write_all(bytes),
+            None => Err(std::io::Error::other("the file is finished")),
+        }
+    }
+
+    /// Flushes the file to disk and closes it; it stays.
+    ///
+    /// # Errors
+    /// The flush's (the file is then removed).
+    #[allow(clippy::disallowed_methods)]
+    pub fn finish(mut self) -> std::io::Result<PathBuf> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| std::io::Error::other("the file is finished"))?;
+        let flushed = lil_platform::fs::flush(&file);
+        drop(file);
+        if let Err(e) = flushed {
+            let _ = std::fs::remove_file(long_path(&self.path));
+            return Err(e);
+        }
+        Ok(std::mem::take(&mut self.path))
+    }
+}
+
+impl Drop for StreamedFile {
+    #[allow(clippy::disallowed_methods)]
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            drop(file);
+            let _ = std::fs::remove_file(long_path(&self.path));
+        }
+    }
+}
+
+/// Removes `file`, a copy the core itself just staged directly in `dir` (an engine output
+/// streamed or copied there) that failed its check, so no unverified copy is left: a temp
+/// clean-up (CORE-110). Anything not directly in `dir` is refused (`PermissionDenied`).
+pub fn discard_unverified(dir: &Path, file: &Path) -> std::io::Result<()> {
+    if file.parent() != Some(dir) || file.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a staged copy in {}",
+                file.display(),
+                dir.display()
+            ),
+        ));
+    }
+    remove_file(file)
+}
+
 /// `ReplaceFileW(target, temp, backup)` without a write-through flag (see `lil_platform::fs`).
 #[allow(clippy::disallowed_methods)]
 pub fn replace(target: &Path, temp: &Path, backup: &Path) -> std::io::Result<()> {

@@ -503,6 +503,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }
     lifecycle.add_blocker(jobs.clone());
+    lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
     let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
