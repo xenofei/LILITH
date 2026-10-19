@@ -216,10 +216,9 @@ fn doctor_lists_skills_writing_directly() {
     let inventory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../plugin/worldwright/skills-inventory.toml");
     let table: toml::Table = std::fs::read_to_string(inventory).unwrap().parse().unwrap();
-    let direct: Vec<String> = table["skill"]
-        .as_array()
-        .unwrap()
+    let direct: Vec<String> = ["skill", "agent"]
         .iter()
+        .flat_map(|kind| table[*kind].as_array().cloned().unwrap_or_default())
         .filter(|s| s["writes_directly"].as_bool() == Some(true))
         .map(|s| s["name"].as_str().unwrap().to_string())
         .collect();
@@ -269,5 +268,96 @@ fn another_copy_of_the_plugin_is_named_with_its_removal_steps_and_never_removed(
             .flatten()
             .any(|w| w == "uninstall" || w == "remove" || w == "disable"),
         "{log:?}"
+    );
+}
+
+#[test] // spec: ARCH-108; ruling P3-R28 (I7)
+fn piped_answers_are_refused_outside_tests() {
+    let env = TestEnv::new();
+    // `LIL_TEST_DOCTOR_STDIN` other than `1`: the doctor reads answers only from a terminal.
+    let extra = [
+        ("PATH", env.path_with_testbins()),
+        ("CLAUDE_CONFIG_DIR", OsString::from(profile(&env))),
+        ("LIL_TEST_DOCTOR_STDIN", OsString::from("0")),
+    ];
+    let out = env.lil_in_with(env.root(), &["doctor"], &extra, Some(&"y\n".repeat(20)));
+    assert!(
+        claude_log(&env).is_empty(),
+        "a piped y installed: {:?}",
+        claude_log(&env)
+    );
+    assert!(
+        out.stderr.contains("only from a person at a terminal"),
+        "{out:?}"
+    );
+    assert!(
+        lines(&out)
+            .iter()
+            .any(|l| l.starts_with("problem:") && l.contains("isn't installed")),
+        "{out:?}"
+    );
+}
+
+#[test] // spec: AI-117; review M3
+fn a_lilith_marketplace_from_another_folder_is_a_problem_and_left_alone() {
+    let env = TestEnv::new();
+    let markets = json!([{"name": "lilith", "source": "directory",
+                          "path": "D:/old-checkout/plugin", "installLocation": "x"}]);
+    std::fs::write(
+        profile(&env).join("fake-marketplaces.json"),
+        markets.to_string(),
+    )
+    .unwrap();
+    let out = doctor(&env, env.root(), "y");
+    let line = lines(&out)
+        .into_iter()
+        .find(|l| l.contains("D:/old-checkout/plugin"))
+        .unwrap_or_else(|| panic!("the other marketplace isn't named: {out:?}"));
+    assert!(line.starts_with("problem:"), "{line}");
+    assert!(
+        line.contains("claude plugin marketplace remove lilith"),
+        "{line}"
+    );
+    assert!(claude_log(&env).is_empty(), "{:?}", claude_log(&env));
+}
+
+#[test] // spec: AI-117; ruling P3-R28 (I6)
+fn the_hooks_are_checked_to_run() {
+    let env = TestEnv::new();
+    let folder = ensure_built().dir.display().to_string();
+    plugin_options(
+        &env,
+        json!({"lil_mcp_path": format!("{folder}\\lil-mcp.exe"),
+               "lil_path": format!("{folder}\\lil.exe")}),
+    );
+    // Claude Code loads the plugin from a folder without hooks/hooks.json.
+    let install = env.root().join("installed-plugin");
+    std::fs::create_dir_all(&install).unwrap();
+    let list = json!([{"id": PLUGIN, "version": "1.3.0", "scope": "user", "enabled": true,
+                       "installPath": install.to_str().unwrap()}]);
+    std::fs::write(profile(&env).join("fake-plugins.json"), list.to_string()).unwrap();
+    let out = doctor(&env, env.root(), "n");
+    let printed = lines(&out);
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("problem:") && l.contains("hooks.json")),
+        "{out:?}"
+    );
+    // The trusted lil.exe answers `ask` for an `rm`, so its option is ok.
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("ok:") && l.contains("option lil_path")),
+        "{out:?}"
+    );
+    std::fs::create_dir_all(install.join("hooks")).unwrap();
+    std::fs::write(install.join("hooks").join("hooks.json"), "{}").unwrap();
+    let again = doctor(&env, env.root(), "n");
+    assert!(
+        !lines(&again)
+            .iter()
+            .any(|l| l.contains("hooks.json") && l.starts_with("problem:")),
+        "{again:?}"
     );
 }

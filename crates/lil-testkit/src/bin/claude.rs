@@ -2,7 +2,8 @@
 //! never reads a real profile: the plugin commands need `CLAUDE_CONFIG_DIR`.
 //!
 //! - `claude --version` prints `9.9.9 (Claude Code)`;
-//! - `claude plugin list --json` prints `<config>\fake-plugins.json` (`[]` when missing);
+//! - `claude plugin list --json` prints `<config>\fake-plugins.json` (`[]` when missing), and
+//!   `claude plugin marketplace list --json` prints `<config>\fake-marketplaces.json` (the same);
 //! - `claude plugin marketplace add …`, `claude plugin install …` and `claude plugin update …`
 //!   append their arguments, as one JSON array per line, to `<config>\fake-claude.log`;
 //! - `claude --spawn-stdio <exe> [args…]` starts `<exe>` as its direct child with stdin, stdout
@@ -44,6 +45,14 @@ fn main() {
                 .status()
                 .unwrap_or_else(|e| usage(&format!("cannot start {exe}: {e}")));
             std::process::exit(status.code().unwrap_or(1));
+        }
+        ["plugin", "marketplace", "list", "--json"] => {
+            let file = config_dir().join("fake-marketplaces.json");
+            match std::fs::read_to_string(&file) {
+                Ok(text) => println!("{}", text.trim_end()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("[]"),
+                Err(e) => usage(&format!("cannot read {}: {e}", file.display())),
+            }
         }
         ["plugin", "list", "--json"] => {
             let file = config_dir().join("fake-plugins.json");

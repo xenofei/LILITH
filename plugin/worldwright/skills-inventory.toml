@@ -1,6 +1,7 @@
-# Every skill in this plugin, and whether its text tells Claude Code to write workspace files
-# directly instead of calling the suite's tools (spec ARCH-104). `lil doctor` lists the skills
-# that still do. The skills carried unchanged from plugin 1.2.0 are listed as their text shows.
+# Every skill and subagent in this plugin, and whether its text tells Claude Code to write
+# workspace files directly instead of calling the suite's tools (spec ARCH-104). `lil doctor`
+# lists those that still do. The skills and agents carried from plugin 1.2.0 are listed as their
+# text shows: the agents append to registry/usage.jsonl and write manifests themselves.
 
 [[skill]]
 name = "lilith"
@@ -51,3 +52,28 @@ writes_directly = false
 name = "vtuber"
 path = "skills/vtuber/SKILL.md"
 writes_directly = false
+
+[[agent]]
+name = "asset-qa"
+path = "agents/asset-qa.md"
+writes_directly = true
+
+[[agent]]
+name = "audio-engineer"
+path = "agents/audio-engineer.md"
+writes_directly = true
+
+[[agent]]
+name = "avatar-rigger"
+path = "agents/avatar-rigger.md"
+writes_directly = true
+
+[[agent]]
+name = "model-scout"
+path = "agents/model-scout.md"
+writes_directly = true
+
+[[agent]]
+name = "pipeline-engineer"
+path = "agents/pipeline-engineer.md"
+writes_directly = true

@@ -1,8 +1,7 @@
 # The files carried from plugin 1.2.0 (owner question 2), one entry per file, with the
-# SHA-256 of the copy committed here (LF line ends, as .gitattributes keeps *.md). Each
-# copy is its 1.2.0 source with CRLF line ends read as LF, except
-# skills/manifest/SKILL.md, whose example hardware and author were replaced by
-# placeholders before publishing (the Task 20 copy list records each change).
+# SHA-256 of the copy committed here. The 1.2.0 sources had LF line ends, and each copy is byte
+# for byte its source, except skills/manifest/SKILL.md, whose example hardware and author were
+# replaced by placeholders before publishing (the Task 20 copy list records each change).
 
 [[file]]
 path = "skills/engines/SKILL.md"

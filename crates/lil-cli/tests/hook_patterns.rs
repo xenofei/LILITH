@@ -155,6 +155,85 @@ fn hook_patterns_table() {
         ("lil doctor < answers.txt", BASH),
         ("Get-Content answers.txt | lil doctor", PWSH),
         ("yes | lil doctor", BASH),
+        // Ruling P3-R28: interpreters, comments, call operators, unreadable text.
+        ("python", BOTH),
+        ("python -m http.server", BOTH),
+        ("# rm x", BOTH),
+        ("ls # comment", BOTH),
+        ("$x = \"rm\"; & $x f", PWSH),
+        ("echo 'unclosed", BOTH),
+        ("echo $(rm x", BOTH),
+        // I1: comments, typographic quotes, here-strings, ANSI-C quoting.
+        ("<#c#> Remove-Item -Recurse X", PWSH),
+        ("<#x#> echo y | lil doctor", PWSH),
+        ("<#x#> pip install evil", PWSH),
+        ("Write-Output \u{201c}it's\u{201d}; Remove-Item X", PWSH),
+        ("Write-Output \u{2018}a\u{2019}; Remove-Item X", PWSH),
+        ("$s = @'\nit's\n'@; Remove-Item X", PWSH),
+        ("$s = @\"\nx\n\"@; Remove-Item X", PWSH),
+        ("echo $'a\\'b'; rm -rf X", BASH),
+        // I2: assignments, hashtables and script blocks.
+        ("$x=Remove-Item X", PWSH),
+        ("$x= Remove-Item X", PWSH),
+        ("$x = Remove-Item X", PWSH),
+        ("[string]$x = Remove-Item X", PWSH),
+        ("$a, $b = Remove-Item X", PWSH),
+        ("$x += Remove-Item X", PWSH),
+        ("@{a = Remove-Item X}", PWSH),
+        (".{Remove-Item X}", PWSH),
+        ("1|%{Remove-Item X}", PWSH),
+        ("gci | ForEach-Object{Remove-Item $_}", PWSH),
+        ("Invoke-Command -ScriptBlock{Remove-Item X}", PWSH),
+        // I3: cmd, stdin and eval.
+        ("cmd /c\"del x\"", BOTH),
+        ("cmd /cdel x", BOTH),
+        ("cmd /r del x", BOTH),
+        ("cmd /s/c del x", BOTH),
+        ("echo y | cmd /c\"lil doctor\"", BOTH),
+        ("bash < evil.sh", BASH),
+        ("sh <<< 'rm -rf x'", BASH),
+        ("python < evil.py", BASH),
+        ("python - < evil.py", BASH),
+        ("echo x | cmd", BOTH),
+        ("echo x | pwsh -", BOTH),
+        ("echo x | powershell -NoProfile -", BOTH),
+        ("cat x.js | node", BOTH),
+        ("eval rm -rf x", BASH),
+        // I4: a flag before the install subcommand.
+        (
+            "pip --index-url https://example.invalid/simple install evil",
+            BOTH,
+        ),
+        ("pip --proxy h install evil", BOTH),
+        ("npm --prefix d install evil", BOTH),
+        ("pnpm -C d add evil", BOTH),
+        ("cargo +nightly install x", BOTH),
+        // M7: more script runs, deletes and installs.
+        ("Start-Process notepad", PWSH),
+        ("saps x.exe", PWSH),
+        ("start x.bat", PWSH),
+        ("Invoke-Item x.lnk", PWSH),
+        ("ii x.lnk", PWSH),
+        ("cscript x.vbs", BOTH),
+        ("wscript x.js", BOTH),
+        ("perl -e 'unlink q(x)'", BOTH),
+        ("wsl rm -rf x", BOTH),
+        ("C:\\tools\\x.bat", BOTH),
+        ("/c/tools/x.sh", BASH),
+        ("& (Get-Command Remove-Item) x", PWSH),
+        ("find . -name x -delete", BASH),
+        ("find . -exec rm {} ;", BASH),
+        ("git -c alias.x='!rm -rf y' x", BASH),
+        ("[IO.File]::Delete('x')", PWSH),
+        ("uv tool install ruff", BOTH),
+        ("uv run x.py", BOTH),
+        ("pipx install x", BOTH),
+        ("pipx run x", BOTH),
+        ("conda install x", BOTH),
+        ("winget add Git.Git", BOTH),
+        ("Install-PSResource x", PWSH),
+        ("source x.sh", BASH),
+        (". ./x.sh", BASH),
         // Documented limit: `bash -c` is asked about, its script isn't read.
         ("bash -c \"ls\"", BOTH),
     ];
@@ -168,8 +247,6 @@ fn hook_patterns_table() {
         ("type notes.md", PWSH),
         ("python --version", BOTH),
         ("python -V", BOTH),
-        ("python", BOTH),
-        ("python -m http.server", BOTH),
         ("node --version", BOTH),
         ("bash --version", BOTH),
         ("pip list", BOTH),
@@ -186,7 +263,6 @@ fn hook_patterns_table() {
         ("grep -r \"pip install\" .", BASH),
         ("Select-String -Pattern 'Remove-Item' -Path x.ps1", PWSH),
         ("git commit -m \"rm the old file\"", BOTH),
-        ("# rm x", BOTH),
         ("lil doctor --non-interactive", BOTH),
         ("lil --non-interactive doctor", BOTH),
         ("lil status", BOTH),
@@ -200,8 +276,28 @@ fn hook_patterns_table() {
         ("pwsh -Version", BOTH),
         ("2>&1 echo ok", BASH),
         ("echo ok 2>&1", BOTH),
-        // Documented limit: a command word held in a variable is not seen.
-        ("$x = \"rm\"; & $x f", PWSH),
+        // Ordinary commands still pass (ruling P3-R28 asks only for what it can't read or
+        // what is on its lists).
+        ("git diff --stat", BOTH),
+        ("git add -A && git commit -m \"fix: hooks\"", BOTH),
+        ("cargo test -p lil-cli -- --nocapture", BOTH),
+        (
+            "cargo clippy --workspace --all-targets -- -D warnings",
+            BOTH,
+        ),
+        ("ls | grep x", BASH),
+        ("echo a && echo b", BOTH),
+        ("wc -l < notes.txt", BASH),
+        ("Get-ChildItem | Select-Object Name", PWSH),
+        ("Get-Content x | Select-String y", PWSH),
+        ("gci | ForEach-Object { $_.Name }", PWSH),
+        ("$d = Get-Date", PWSH),
+        ("$x = \"rm\"", PWSH),
+        ("cd crates; ls", BASH),
+        ("Set-Location crates; Get-ChildItem", PWSH),
+        ("mkdir -p build/out", BASH),
+        ("echo $HOME", BASH),
+        ("git log --format=%H -1", BOTH),
     ];
     check(must_ask, true);
     check(must_not_ask, false);
@@ -217,7 +313,22 @@ fn suite_toml_guard() {
     let stable = r"D:\data\Roaming\LILITH\suite.toml";
     let dev = r"D:\data\Roaming\LILITH-dev\suite.toml";
     let test = "C:/t/roaming/LILITH-test-0a1b2c3d/suite.toml";
-    for path in [stable, dev, test] {
+    // I5: the forms Windows reads as the same file (`.`, `..`, trailing dots and spaces, an
+    // alternate data stream, 8.3 short names, case).
+    let variants = [
+        r"D:\data\Roaming\LILITH\.\suite.toml",
+        r"D:\data\Roaming\LILITH\x\..\suite.toml",
+        r"D:\data\Roaming\LILITH\suite.toml.",
+        r"D:\data\Roaming\LILITH\suite.toml . ",
+        r"D:\data\Roaming\LILITH\suite.toml::$DATA",
+        r"D:\data\Roaming\LILITH\suite.toml:x",
+        r"D:\data\Roaming\LILITH\SUITE~1.TOM",
+        r"D:\data\Roaming\LILITH~1\suite.toml",
+        r"D:\data\Roaming\LILITH.\suite.toml",
+        r"D:\data\Roaming\lilith\Suite.TOML",
+        r"D:\data\Roaming\LILITH\suit*.toml",
+    ];
+    for path in [stable, dev, test].into_iter().chain(variants) {
         for tool in ["Write", "Edit", "MultiEdit"] {
             assert!(asks(&write_of(tool, path)), "{tool} {path}");
         }
@@ -227,6 +338,9 @@ fn suite_toml_guard() {
         r"C:\x\LILITHS\suite.toml",
         r"C:\x\LILITH\other.toml",
         r"C:\x\LILITH\sub\suite.toml",
+        r"C:\x\LILITH\..\suite.toml",
+        r"C:\x\LILITH~1\notes.txt",
+        r"C:\x\PROGRA~1\x\suite.toml",
     ] {
         assert_eq!(write_of("Write", path), Decision::None, "{path}");
     }
@@ -254,6 +368,22 @@ fn suite_toml_guard() {
         ("sed -i.bak 's/a/b/' \"$APPDATA/LILITH/suite.toml\"", BASH),
         ("rm \"$APPDATA/LILITH/suite.toml\"", BASH),
         ("Remove-Item $env:APPDATA\\LILITH\\suite.toml", PWSH),
+        // I5: path variants and write-like verbs.
+        ("Set-Content $env:APPDATA\\LILITH\\suit*.toml x", PWSH),
+        ("sed -i 's/a/b/' \"$APPDATA/LILITH/suit?.toml\"", BASH),
+        ("sc $env:APPDATA\\LILITH\\suite.toml x", PWSH),
+        ("'x' | Tee-Object $env:APPDATA\\LILITH\\suite.toml", PWSH),
+        ("cd $env:APPDATA\\LILITH; Set-Content suite.toml x", PWSH),
+        ("cd \"$APPDATA/LILITH\" && echo x > suite.toml", BASH),
+        ("robocopy C:\\x $env:APPDATA\\LILITH suite.toml", PWSH),
+        (
+            "Invoke-WebRequest u -OutFile $env:APPDATA\\LILITH\\suite.toml",
+            PWSH,
+        ),
+        ("dd if=x of=\"$APPDATA/LILITH/suite.toml\"", BASH),
+        ("truncate -s 0 \"$APPDATA/LILITH/suite.toml\"", BASH),
+        ("ln -sf x \"$APPDATA/LILITH/suite.toml\"", BASH),
+        ("Set-Content -Path:$env:APPDATA\\LILITH\\suite.toml x", PWSH),
     ];
     let pass: &[(&str, &[Shell])] = &[
         ("Get-Content $env:APPDATA\\LILITH\\suite.toml", PWSH),
@@ -469,4 +599,25 @@ fn session_start_and_post_tool_use_use_no_start() {
     }
     let status = env.lil(&["--no-start", "status"]);
     assert_eq!(status.code, 3, "a hook started a core: {status:?}");
+}
+
+#[test] // spec: ARCH-106; ruling P3-R28 (I6)
+fn the_hook_fails_closed_when_it_cant_tell_whether_a_core_runs() {
+    let env = TestEnv::new();
+    let input = json!({"session_id": "s", "hook_event_name": "PreToolUse",
+                       "cwd": path_str(env.root()), "tool_name": "mcp__comfyui__launch_comfyui",
+                       "tool_input": {}});
+    // A channel this build refuses: `lil` can't find its folders, so it can't probe a core.
+    let broken = [("LIL_CHANNEL", OsString::from("not a channel"))];
+    let out = hook(&env, env.root(), "pre-tool-use", &input, &broken);
+    let v: Value = serde_json::from_str(out.stdout.trim()).expect("an answer");
+    assert_eq!(
+        v["hookSpecificOutput"]["permissionDecision"], "ask",
+        "{out:?}"
+    );
+    // With its folders found and no core running, the same tool gets no decision.
+    assert_eq!(
+        hook(&env, env.root(), "pre-tool-use", &input, &[]).stdout,
+        ""
+    );
 }

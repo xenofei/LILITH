@@ -1,41 +1,62 @@
 //! The plugin hooks' PreToolUse patterns (spec ARCH-047, ARCH-056, ARCH-104, ARCH-105,
-//! ARCH-106, CORE-008, CORE-116, QA-061; Appendix F "Plugin 1.3"). Pure: std and `serde_json`
-//! only, so `tests/hook_patterns.rs` compiles this file in and checks the QA-061 table.
+//! ARCH-106, CORE-008, CORE-116, QA-061; Appendix F "Plugin 1.3"; ruling P3-R28). Pure: std
+//! and `serde_json` only, so `tests/hook_patterns.rs` compiles this file in and checks the
+//! QA-061 table.
 //!
-//! **Commands.** A Bash or PowerShell command line is split into commands at `;`, `&&`, `||`,
-//! `|`, a line end, `(`, `)`, `{` and `}` (Bash also at `&` and `|&`; in PowerShell `&` is the
-//! call operator). Quotes are read as each shell reads them: Bash `'…'` and `"…"` with `\`
-//! escapes, PowerShell `'…'` and `"…"` with backtick escapes; a Bash `\` outside quotes escapes
-//! only a character the shell treats specially, so `C:\x\lil-mcp.exe` stays a path. The text of
-//! every `$(…)` (and Bash `` `…` ``), quoted or not, is checked as a command line of its own.
-//! `#` at a word start begins a comment. Redirections (`>`, `>>`, `2>`, `*>`, `<`) are not words:
-//! their write targets are kept for the `suite.toml` rule, `2>&1` and `<` input are dropped.
+//! **Conservative** (ruling P3-R28). Pattern matching is never complete, so a command line
+//! gets no decision only when it is read to its end as the plain grammar below and nothing in
+//! it is on the ask lists. Anything else asks, never allows:
+//! - text the hook can't read to its end (an open quote, `$(`, here-string or comment);
+//! - comments (`#`, PowerShell `<# … #>`), here-strings (`@'…'@`, `@"…"@`, Bash `<<` and
+//!   `<<<`), Bash `$'…'` and typographic quotes (U+2018–U+201F, which PowerShell reads as
+//!   quotes);
+//! - a PowerShell hashtable (`@{`), a call operator (`&`, `.`) or a static .NET call
+//!   (`[IO.File]::Delete(…)`);
+//! - interpreter re-entry: `cmd`, `pwsh`, `powershell`, `bash`, `sh`, `zsh`, `python*`, `py`,
+//!   `node`, `perl`, `ruby`, `wsl`, `cscript`, `wscript`, `eval`, `Invoke-Expression`/`iex`,
+//!   `Invoke-Command`, `Start-Process`/`saps`/`start`, `Invoke-Item`/`ii`, `source`, … (only a
+//!   lone version or help flag such as `python --version` passes), also when text is piped or
+//!   redirected into them;
+//! - a program run by its path (`./x.sh`, `.\x.ps1`, `C:\tools\x.bat`, `/c/tools/x.sh`);
+//! - an installer with a flag before its subcommand, or whose arguments name an install verb
+//!   anywhere (`pip --index-url u install x`);
+//! - the Appendix F lists: `lil-mcp`, `lil doctor` without `--non-interactive`, deletes,
+//!   installs, script runs, and write-like commands that name a guarded `suite.toml`.
 //!
-//! **The command word** of each command is its first word after Bash `NAME=value` assignments,
-//! Bash keywords (`if`, `then`, `do`, `!`, …) and the wrappers `sudo`, `env`, `nohup`, `time`,
-//! `exec`, `nice`, `xargs`, `command`, `builtin`, `timeout`, `stdbuf` and `noglob` (with their
-//! flags). It is compared by its file name, case-insensitively, without `.exe`, `.cmd`, `.bat`
-//! or `.com`, so `C:\b\lil.exe` is `lil`. A PowerShell command whose first word is a quoted
-//! string is an expression (`"y" | …`), not a command; `$x = …` is an assignment.
+//! **Commands.** A line is split at `;`, `&&`, `||`, `|`, a line end, `(` and `)`, `{` and `}`
+//! (Bash also at `&` and `|&`; in PowerShell `&` is the call operator, and an assignment's `=`
+//! starts the command on its right). Quotes are read as each shell reads them: Bash `'…'` and
+//! `"…"` with `\` escapes, PowerShell `'…'` and `"…"` with backtick escapes; a Bash `\` outside
+//! quotes escapes only a character the shell treats specially, so `C:\x\lil-mcp.exe` stays a
+//! path. The text of every `$(…)` (and Bash `` `…` ``), quoted or not, is checked as a command
+//! line of its own. Redirection targets are not words: write targets go to the `suite.toml`
+//! rule, and an input redirection is remembered.
 //!
-//! **What asks** (Appendix F): `lil-mcp`; `lil doctor` without `--non-interactive`, however its
-//! input arrives (`echo y | lil doctor`, `lil doctor < answers.txt`); deletes; installs; script
-//! runs; and any write-like command that names a `suite.toml` in a `LILITH` or
-//! `LILITH-<channel>` folder. Reads of that file get no decision from these rules (the repo's
-//! deny rules cover private paths).
+//! **The command word** of each command is its first word after Bash `NAME=value`
+//! assignments, keywords (`if`, `then`, `do`, `!`, …) and wrappers (`sudo`, `env`, `nohup`,
+//! `exec`, `xargs`, …, with their flags). It is compared by its file name, case-insensitively,
+//! without `.exe`, `.cmd`, `.bat` or `.com`. A PowerShell command whose first word is a quoted
+//! string is an expression (`"y" | …`), not a command.
+//!
+//! **`suite.toml`** (ARCH-056, CORE-008). A path is guarded when, read as Windows reads it, it
+//! is a `suite.toml` directly in a folder named `LILITH` or `LILITH-<channel>`: `.` and `..`
+//! are resolved, trailing dots and spaces dropped, an alternate data stream (`::$DATA`)
+//! dropped, case ignored. An 8.3 short name (`SUITE~1.TOM`, `LILITH~1`) or a wildcard in the
+//! last two segments is resolved through the file system when the file is there (the long
+//! name decides), and otherwise asks when it could name such a file. A `cd` into a guarded
+//! folder makes a later relative `suite.toml` on the same line guarded too.
 //!
 //! **Known limits** (QA-061), stated plainly: a pattern guard reads the text, not the program.
-//! It doesn't see a command word held in a variable (`$x = "rm"; & $x f`), inside a script it
-//! runs (`bash -c "…"` asks as a script run, but its text isn't read), behind an alias or
-//! function, built from pieces (`r''m`), in a file a program reads, or a write made by a
-//! program itself (`python -c "open(…, 'w')"` asks only as a script run; `[IO.File]::
-//! WriteAllText(…)` on `suite.toml` passes). `cargo run -p lil-cli -- doctor` is not `lil
-//! doctor` to it. A heredoc's body is read as commands.
+//! It doesn't see a command behind an alias or a function the session defined, a path built
+//! at run time (`Join-Path`, a variable holding `suite.toml`), a `cd` on an earlier command
+//! line, or what a program it allows does by itself. `cargo run -p lil-cli -- doctor` is not
+//! `lil doctor` to it. If `lil` can't start at all, Claude Code runs the tool anyway (a hook
+//! that fails to start is a non-blocking error); `lil doctor` checks that the hook runs.
 
 use serde_json::Value;
 
 /// Which shell a command is for: from the hook's `tool_name`. The token rules differ (quoting,
-/// `\`, `&`).
+/// `\`, `&`, `{`, `=`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     Bash,
@@ -88,8 +109,17 @@ pub fn depends_on_core(tool_name: &str) -> bool {
         .is_some_and(|t| COMFY_DENIED_WITH_CORE.contains(&t))
 }
 
+/// The answer for a core-dependent tool when the hook can't tell whether a core runs: ask
+/// (fail closed, ruling P3-R28).
+pub fn unknown_core(tool_name: &str) -> Decision {
+    Decision::Ask(format!(
+        "LILITH: the hook can't tell whether a LILITH core is running, so it can't tell whether \
+         {tool_name} is turned off. Allow it?"
+    ))
+}
+
 /// The decision for a tool call. `tool_input.action` decides the comfy MCP's `job` and
-/// `download`: `cancel` or none asks, any other gets no decision.
+/// `download`: `cancel` (any case, spaces ignored) or none asks, any other gets no decision.
 pub fn classify_tool(tool_name: &str, tool_input: &Value, core_running: bool) -> Decision {
     let command = || tool_input["command"].as_str().unwrap_or_default();
     match tool_name {
@@ -128,7 +158,7 @@ pub fn classify_tool(tool_name: &str, tool_input: &Value, core_running: bool) ->
     }
     if matches!(tool, "job" | "download") {
         let action = tool_input["action"].as_str();
-        if action.is_none_or(|a| a == "cancel") {
+        if action.is_none_or(|a| a.trim().eq_ignore_ascii_case("cancel")) {
             return Decision::Ask(format!(
                 "LILITH: the comfy MCP's {tool} call cancels work (its action is {}). Allow it?",
                 action.unwrap_or("not given")
@@ -143,15 +173,12 @@ fn classify_file_write(path: &str) -> Decision {
     if is_guarded_suite_toml(path) {
         return Decision::Ask(SUITE_TOML_REASON.to_string());
     }
-    let segments = segments(path);
-    let name = segments
-        .last()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
+    let segments = normalized(path);
+    let name = segments.last().cloned().unwrap_or_default();
     let parent = segments
         .len()
         .checked_sub(2)
-        .map(|i| segments[i].to_ascii_lowercase())
+        .map(|i| segments[i].clone())
         .unwrap_or_default();
     let log = name.ends_with(".jsonl")
         && ((parent == "queue" && name.starts_with("jobs"))
@@ -170,23 +197,117 @@ fn classify_file_write(path: &str) -> Decision {
 const SUITE_TOML_REASON: &str = "LILITH: this changes a LILITH suite.toml, which holds your \
     spending caps and settings that only you may change. Allow it?";
 
-/// The path's segments, split at `/` and `\`.
-fn segments(path: &str) -> Vec<&str> {
-    path.split(['/', '\\']).filter(|s| !s.is_empty()).collect()
+// ---------------------------------------------------------------------------------------------
+// suite.toml paths.
+// ---------------------------------------------------------------------------------------------
+
+/// `path`'s segments as Windows reads them, lower-cased: split at `/` and `\`, `.` and `..`
+/// resolved, trailing dots and spaces dropped, and a `:stream` suffix dropped (not from a drive
+/// such as `c:`).
+fn normalized(path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in path.trim().split(['/', '\\']) {
+        match raw {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let mut seg = raw.to_ascii_lowercase();
+        let drive = seg.len() == 2 && seg.ends_with(':');
+        if !drive && let Some(at) = seg.find(':') {
+            seg.truncate(at);
+        }
+        let seg = seg.trim_end_matches(['.', ' ']).to_string();
+        if !seg.is_empty() {
+            out.push(seg);
+        }
+    }
+    out
 }
 
-/// A `suite.toml` directly in a folder named `LILITH` or `LILITH-<channel>` (any case).
+/// A folder named `LILITH` or `LILITH-<channel>` (lower-cased).
+fn is_lilith_folder(seg: &str) -> bool {
+    seg == "lilith" || seg.strip_prefix("lilith-").is_some_and(|c| !c.is_empty())
+}
+
+/// The segment may be an 8.3 short name or holds a wildcard: only the file system can tell.
+fn uncertain(seg: &str) -> bool {
+    seg.contains(['*', '?', '['])
+        || seg
+            .char_indices()
+            .any(|(i, c)| c == '~' && seg[i + 1..].starts_with(|d: char| d.is_ascii_digit()))
+}
+
+/// Whether the wildcard pattern `pattern` (`*`, `?`, `[…]`) matches `text`.
+fn glob(pattern: &[char], text: &[char]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some(('*', rest)) => (0..=text.len()).any(|i| glob(rest, &text[i..])),
+        Some(('?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
+        Some(('[', rest)) => {
+            let Some(end) = rest.iter().position(|&c| c == ']') else {
+                return text.first() == Some(&'[') && glob(rest, &text[1..]);
+            };
+            let Some(&c) = text.first() else {
+                return false;
+            };
+            let set = &rest[..end];
+            let hit = set
+                .windows(3)
+                .any(|w| w[1] == '-' && w[0] <= c && c <= w[2])
+                || set.contains(&c);
+            hit && glob(&rest[end + 1..], &text[1..])
+        }
+        Some((c, rest)) => text.first() == Some(c) && glob(rest, &text[1..]),
+    }
+}
+
+/// An uncertain segment could be `names`' one: a short name could be anything, a wildcard is
+/// matched.
+fn could_be(seg: &str, names: &[&str]) -> bool {
+    if seg.contains('~') && !seg.contains(['*', '?', '[']) {
+        return true;
+    }
+    let pattern: Vec<char> = seg.chars().collect();
+    names
+        .iter()
+        .any(|n| glob(&pattern, &n.chars().collect::<Vec<_>>()))
+}
+
+/// The lexical rule on normalized segments.
+fn names_guarded(segs: &[String]) -> bool {
+    matches!(segs, [.., folder, file] if file == "suite.toml" && is_lilith_folder(folder))
+}
+
+/// A `suite.toml` directly in a `LILITH` or `LILITH-<channel>` folder, read as Windows reads
+/// the path (module docs).
 fn is_guarded_suite_toml(path: &str) -> bool {
-    let s = segments(path.trim());
-    let [.., folder, file] = s.as_slice() else {
+    let segs = normalized(path);
+    if names_guarded(&segs) {
+        return true;
+    }
+    let [.., folder, file] = segs.as_slice() else {
         return false;
     };
-    let folder = folder.to_ascii_lowercase();
-    file.eq_ignore_ascii_case("suite.toml")
-        && (folder == "lilith"
-            || folder
-                .strip_prefix("lilith-")
-                .is_some_and(|c| !c.is_empty()))
+    if !uncertain(folder) && !uncertain(file) {
+        return false;
+    }
+    // The long name decides when the file is there.
+    if let Ok(long) = std::fs::canonicalize(path.trim()) {
+        return names_guarded(&normalized(&long.to_string_lossy()));
+    }
+    let folder_ok = is_lilith_folder(folder)
+        || (uncertain(folder) && could_be(folder, &["lilith", "lilith-dev", "lilith-test-0"]));
+    let file_ok = file == "suite.toml" || (uncertain(file) && could_be(file, &["suite.toml"]));
+    folder_ok && file_ok
+}
+
+/// A bare `suite.toml` (relative, one segment): guarded after a `cd` into a guarded folder.
+fn is_bare_suite_toml(path: &str) -> bool {
+    matches!(normalized(path).as_slice(), [file] if file == "suite.toml" || (uncertain(file) && could_be(file, &["suite.toml"])))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -202,24 +323,55 @@ pub fn classify_command(shell: Shell, command: &str) -> Decision {
     }
 }
 
-/// How deep `$(…)` substitutions are followed.
+/// How deep `$(…)` substitutions are followed; deeper asks.
 const MAX_DEPTH: usize = 8;
+
+/// The quote characters PowerShell reads like `'` and `"`.
+fn typographic_quote(c: char) -> bool {
+    ('\u{2018}'..='\u{201F}').contains(&c)
+}
 
 fn first_reason(shell: Shell, line: &str, depth: usize) -> Option<String> {
     if depth > MAX_DEPTH {
-        return None;
+        return Some("this nests command substitutions too deeply to read".to_string());
+    }
+    if line.chars().any(typographic_quote) {
+        return Some("this uses typographic quotes, which PowerShell reads as quotes".to_string());
     }
     let parsed = lex(shell, line);
+    if let Some(problem) = parsed.problem {
+        return Some(problem);
+    }
+    let mut in_lilith = false;
+    for cmd in &parsed.commands {
+        if let Some(reason) = command_reason(shell, cmd, in_lilith) {
+            return Some(reason);
+        }
+        if let Some(dir) = cd_target(cmd) {
+            in_lilith = normalized(dir).last().is_some_and(|f| is_lilith_folder(f));
+        }
+    }
     parsed
-        .commands
+        .subs
         .iter()
-        .find_map(|c| command_reason(shell, c))
-        .or_else(|| {
-            parsed
-                .subs
-                .iter()
-                .find_map(|s| first_reason(shell, s, depth + 1))
-        })
+        .find_map(|s| first_reason(shell, s, depth + 1))
+}
+
+/// The folder a `cd`-like command changes to.
+fn cd_target(cmd: &Command) -> Option<&str> {
+    let first = cmd.words.first()?;
+    let name = command_name(&first.text);
+    matches!(
+        name.as_str(),
+        "cd" | "chdir" | "pushd" | "set-location" | "sl" | "push-location"
+    )
+    .then(|| {
+        cmd.words[1..]
+            .iter()
+            .map(|w| w.text.as_str())
+            .find(|a| !a.starts_with('-'))
+    })
+    .flatten()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -236,6 +388,8 @@ struct Command {
     words: Vec<Word>,
     /// The targets of its `>` and `>>` redirections.
     writes: Vec<String>,
+    /// It has an input redirection (`<`).
+    stdin: bool,
     /// It follows a `|`.
     piped: bool,
 }
@@ -245,6 +399,8 @@ struct Parsed {
     commands: Vec<Command>,
     /// The text of each `$(…)` and Bash `` `…` ``.
     subs: Vec<String>,
+    /// Why the line can't be read as the plain grammar: it then asks.
+    problem: Option<String>,
 }
 
 /// The lexer's state while it reads one line.
@@ -253,7 +409,7 @@ struct Lexer {
     cmd: Command,
     word: Word,
     started: bool,
-    /// The next word is a redirection target: `Some(true)` for a write.
+    /// The next word is a redirection target: `Some(true)` for a write, `Some(false)` input.
     redirect: Option<bool>,
 }
 
@@ -280,7 +436,7 @@ impl Lexer {
         self.finish_word();
         self.redirect = None;
         let cmd = std::mem::take(&mut self.cmd);
-        if !cmd.words.is_empty() || !cmd.writes.is_empty() {
+        if !cmd.words.is_empty() || !cmd.writes.is_empty() || cmd.stdin {
             self.parsed.commands.push(cmd);
         }
         self.cmd.piped = next_piped;
@@ -294,11 +450,21 @@ impl Lexer {
             self.started = true;
         }
     }
+
+    /// The first problem found is kept.
+    fn problem(&mut self, why: &str) {
+        if self.parsed.problem.is_none() {
+            self.parsed.problem = Some(why.to_string());
+        }
+    }
 }
 
 /// Characters a Bash `\` escapes outside quotes; before any other, the `\` is kept (a Windows
 /// path).
 const BASH_SPECIAL: &str = " \t\n\\'\"$`;&|<>()*?![]{}#~=%";
+
+const UNREADABLE: &str = "this command line can't be read to its end (an open quote or \
+    substitution)";
 
 fn lex(shell: Shell, line: &str) -> Parsed {
     let chars: Vec<char> = line.chars().collect();
@@ -318,10 +484,20 @@ fn lex(shell: Shell, line: &str) -> Parsed {
             ' ' | '\t' => lx.finish_word(),
             '\n' | '\r' | ';' => lx.finish_command(false),
             '#' if !lx.started => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-                continue;
+                lx.problem("this has a comment, which the hook doesn't read past");
+                break;
+            }
+            '<' if !bash && next == Some('#') => {
+                lx.problem("this has a PowerShell block comment, which the hook doesn't read");
+                break;
+            }
+            '@' if !bash && !lx.started && matches!(next, Some('\'' | '"')) => {
+                lx.problem("this has a PowerShell here-string, which the hook doesn't read");
+                break;
+            }
+            '@' if !bash && !lx.started && next == Some('{') => {
+                lx.problem("this has a PowerShell hashtable, which can hide a command");
+                break;
             }
             '|' => {
                 if next == Some('|') {
@@ -353,8 +529,18 @@ fn lex(shell: Shell, line: &str) -> Parsed {
                 }
             }
             '(' | ')' | '}' => lx.finish_command(false),
-            '{' if !lx.started => lx.finish_command(false),
+            // A PowerShell script block starts a command, glued to a word or not.
+            '{' if !bash || !lx.started => lx.finish_command(false),
+            '=' if !bash && !lx.started_with_assignee() => lx.push_char('='),
+            '=' if !bash => {
+                // `$x = …`, `$x=…`, `[t]$x = …`, `$a, $b = …`: the right side is a command.
+                lx.finish_command(false);
+            }
             '>' | '<' => {
+                if bash && c == '<' && next == Some('<') {
+                    lx.problem("this feeds a here-document or here-string to a command");
+                    break;
+                }
                 // A word of digits (or PowerShell's `*`) right before it is the stream number.
                 let fd = lx.started
                     && !lx.word.quoted
@@ -371,6 +557,7 @@ fn lex(shell: Shell, line: &str) -> Parsed {
             '\'' => {
                 lx.mark_start(true, false);
                 i += 1;
+                let mut closed = false;
                 while i < chars.len() {
                     if chars[i] == '\'' {
                         if !bash && chars.get(i + 1) == Some(&'\'') {
@@ -378,32 +565,48 @@ fn lex(shell: Shell, line: &str) -> Parsed {
                             i += 2;
                             continue;
                         }
+                        closed = true;
                         break;
                     }
                     lx.word.text.push(chars[i]);
                     i += 1;
                 }
+                if !closed {
+                    lx.problem(UNREADABLE);
+                    break;
+                }
             }
             '"' => {
                 lx.mark_start(true, false);
                 i += 1;
-                while i < chars.len() && chars[i] != '"' {
+                let escape = if bash { '\\' } else { '`' };
+                let mut closed = false;
+                while i < chars.len() {
                     let d = chars[i];
-                    let escape = if bash { '\\' } else { '`' };
+                    if d == '"' {
+                        closed = true;
+                        break;
+                    }
                     if d == escape && i + 1 < chars.len() {
                         lx.word.text.push(chars[i + 1]);
                         i += 2;
                         continue;
                     }
                     if d == '$' && chars.get(i + 1) == Some(&'(') {
-                        let (sub, end) = capture_parens(&chars, i + 2);
+                        let Some((sub, end)) = capture_parens(&chars, i + 2) else {
+                            lx.problem(UNREADABLE);
+                            break;
+                        };
                         lx.word.text.push_str(&format!("$({sub})"));
                         lx.parsed.subs.push(sub);
                         i = end;
                         continue;
                     }
                     if bash && d == '`' {
-                        let (sub, end) = capture_backticks(&chars, i + 1);
+                        let Some((sub, end)) = capture_backticks(&chars, i + 1) else {
+                            lx.problem(UNREADABLE);
+                            break;
+                        };
                         lx.parsed.subs.push(sub);
                         i = end;
                         continue;
@@ -411,21 +614,26 @@ fn lex(shell: Shell, line: &str) -> Parsed {
                     lx.word.text.push(d);
                     i += 1;
                 }
-            }
-            '\\' if bash => {
-                match next {
-                    // A line continuation.
-                    Some('\n') => i += 1,
-                    Some(n) if BASH_SPECIAL.contains(n) => {
-                        lx.push_char(n);
-                        i += 1;
-                    }
-                    _ => lx.push_char('\\'),
+                if !closed {
+                    lx.problem(UNREADABLE);
+                    break;
                 }
             }
+            '\\' if bash => match next {
+                // A line continuation.
+                Some('\n') => i += 1,
+                Some(n) if BASH_SPECIAL.contains(n) => {
+                    lx.push_char(n);
+                    i += 1;
+                }
+                _ => lx.push_char('\\'),
+            },
             '`' if bash => {
                 lx.mark_start(false, true);
-                let (sub, end) = capture_backticks(&chars, i + 1);
+                let Some((sub, end)) = capture_backticks(&chars, i + 1) else {
+                    lx.problem(UNREADABLE);
+                    break;
+                };
                 lx.parsed.subs.push(sub);
                 i = end;
                 continue;
@@ -440,22 +648,29 @@ fn lex(shell: Shell, line: &str) -> Parsed {
                 }
             }
             '$' => {
+                if bash && next == Some('\'') {
+                    lx.problem("this uses Bash $'…' quoting, which the hook doesn't read");
+                    break;
+                }
                 lx.mark_start(false, true);
                 match next {
                     Some('(') => {
-                        let (sub, end) = capture_parens(&chars, i + 2);
+                        let Some((sub, end)) = capture_parens(&chars, i + 2) else {
+                            lx.problem(UNREADABLE);
+                            break;
+                        };
                         lx.word.text.push_str(&format!("$({sub})"));
                         lx.parsed.subs.push(sub);
                         i = end;
                         continue;
                     }
                     Some('{') => {
-                        let end = chars[i..]
-                            .iter()
-                            .position(|&c| c == '}')
-                            .map_or(chars.len(), |p| i + p + 1);
-                        lx.word.text.extend(&chars[i..end]);
-                        i = end;
+                        let Some(p) = chars[i..].iter().position(|&c| c == '}') else {
+                            lx.problem(UNREADABLE);
+                            break;
+                        };
+                        lx.word.text.extend(&chars[i..=i + p]);
+                        i += p + 1;
                         continue;
                     }
                     _ => lx.word.text.push('$'),
@@ -469,12 +684,30 @@ fn lex(shell: Shell, line: &str) -> Parsed {
     lx.parsed
 }
 
-/// Reads the redirection at `chars[i]` (`>`, `>>`, `>|`, `>&2`, `<`, `<<`) and marks the next
-/// word as its target; returns where reading goes on.
+impl Lexer {
+    /// PowerShell: the command so far is the left side of an assignment (`$x`, `[t]$x`,
+    /// `$a,$b`), so an `=` here ends it.
+    fn started_with_assignee(&self) -> bool {
+        let first = self
+            .cmd
+            .words
+            .first()
+            .map(|w| (w.text.as_str(), w.var, w.quoted));
+        let current = (self.word.text.as_str(), self.word.var, self.word.quoted);
+        let (text, var, quoted) = first.unwrap_or(current);
+        !quoted && (var || text.starts_with('['))
+    }
+}
+
+/// Reads the redirection at `chars[i]` (`>`, `>>`, `>|`, `>&2`, `<`) and marks the next word
+/// as its target; returns where reading goes on.
 fn redirect(lx: &mut Lexer, chars: &[char], mut i: usize) -> usize {
     let write = chars[i] == '>';
+    if !write {
+        lx.cmd.stdin = true;
+    }
     i += 1;
-    while i < chars.len() && (chars[i] == '>' || chars[i] == '<' || chars[i] == '|') {
+    while i < chars.len() && (chars[i] == '>' || chars[i] == '|') {
         i += 1;
     }
     if chars.get(i) == Some(&'&') {
@@ -494,8 +727,9 @@ fn redirect(lx: &mut Lexer, chars: &[char], mut i: usize) -> usize {
     i
 }
 
-/// The text up to the `)` that closes a `(` just before `start`, and the index after it.
-fn capture_parens(chars: &[char], start: usize) -> (String, usize) {
+/// The text up to the `)` that closes a `(` just before `start`, and the index after it;
+/// `None` when it never closes.
+fn capture_parens(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut depth = 1;
     let mut i = start;
     let mut quote: Option<char> = None;
@@ -510,7 +744,7 @@ fn capture_parens(chars: &[char], start: usize) -> (String, usize) {
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
-                        return (chars[start..i].iter().collect(), i + 1);
+                        return Some((chars[start..i].iter().collect(), i + 1));
                     }
                 }
                 _ => {}
@@ -518,11 +752,12 @@ fn capture_parens(chars: &[char], start: usize) -> (String, usize) {
         }
         i += 1;
     }
-    (chars[start..].iter().collect(), chars.len())
+    None
 }
 
-/// The text up to the next unescaped `` ` ``, and the index after it.
-fn capture_backticks(chars: &[char], start: usize) -> (String, usize) {
+/// The text up to the next unescaped `` ` ``, and the index after it; `None` when it never
+/// closes.
+fn capture_backticks(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut i = start;
     while i < chars.len() {
         if chars[i] == '\\' {
@@ -530,11 +765,11 @@ fn capture_backticks(chars: &[char], start: usize) -> (String, usize) {
             continue;
         }
         if chars[i] == '`' {
-            return (chars[start..i].iter().collect(), i + 1);
+            return Some((chars[start..i].iter().collect(), i + 1));
         }
         i += 1;
     }
-    (chars[start..].iter().collect(), chars.len())
+    None
 }
 
 /// Bash keywords before a command word.
@@ -546,6 +781,59 @@ const KEYWORDS: [&str; 9] = [
 const WRAPPERS: [&str; 11] = [
     "sudo", "env", "nohup", "exec", "nice", "xargs", "command", "builtin", "timeout", "stdbuf",
     "noglob",
+];
+
+/// Interpreters and launchers: they run code or another program, so they always ask unless
+/// their only argument is a version or help flag (ruling P3-R28).
+const INTERPRETERS: &[&str] = &[
+    "cmd",
+    "pwsh",
+    "powershell",
+    "powershell_ise",
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "py",
+    "node",
+    "deno",
+    "bun",
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "wsl",
+    "cscript",
+    "wscript",
+    "mshta",
+    "rundll32",
+    "eval",
+    "source",
+    "invoke-expression",
+    "iex",
+    "invoke-command",
+    "icm",
+    "start-process",
+    "saps",
+    "start",
+    "invoke-item",
+    "ii",
+    ".",
+];
+
+/// The flags that only print a version or help.
+const VERSION_FLAGS: &[&str] = &[
+    "--version",
+    "-version",
+    "-v",
+    "--help",
+    "-h",
+    "/?",
+    "-?",
+    "-help",
+    "--help-all",
 ];
 
 /// The command word's comparable name: its file name, lower-cased, without `.exe`, `.cmd`,
@@ -561,11 +849,6 @@ fn command_name(word: &str) -> String {
     lower
 }
 
-/// Whether `w` names a file by a path (it has a separator or a drive colon).
-fn is_path(w: &str) -> bool {
-    w.contains(['/', '\\', ':'])
-}
-
 fn is_python(name: &str) -> bool {
     name == "py"
         || name.strip_prefix("python").is_some_and(|rest| {
@@ -574,28 +857,22 @@ fn is_python(name: &str) -> bool {
         })
 }
 
-/// The arguments that don't start with `-`.
-fn positionals<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    args.iter()
-        .copied()
-        .filter(|a| !a.starts_with('-'))
-        .collect()
+/// A flag of an installer: `-…`, `/…` on Windows tools, or cargo's `+toolchain`.
+fn is_flag(a: &str) -> bool {
+    a.starts_with('-') || a.starts_with('+')
 }
 
-fn command_reason(shell: Shell, cmd: &Command) -> Option<String> {
-    if cmd.writes.iter().any(|t| is_guarded_suite_toml(t)) {
+/// The arguments that aren't flags.
+fn positionals<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    args.iter().copied().filter(|a| !is_flag(a)).collect()
+}
+
+fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String> {
+    let guarded = |t: &str| is_guarded_suite_toml(t) || (in_lilith && is_bare_suite_toml(t));
+    if cmd.writes.iter().any(|t| guarded(t)) {
         return Some("this writes to a LILITH suite.toml (your caps and settings)".to_string());
     }
     let mut words: &[Word] = &cmd.words;
-    // PowerShell: `$x = …` assigns; what follows is an expression or a command.
-    if shell == Shell::PowerShell
-        && words.len() >= 2
-        && words[0].var
-        && words[1].text.ends_with('=')
-        && !words[1].quoted
-    {
-        words = &words[2..];
-    }
     loop {
         let first = words.first()?;
         let t = first.text.as_str();
@@ -633,47 +910,60 @@ fn command_reason(shell: Shell, cmd: &Command) -> Option<String> {
     }
     let first = &words[0];
     let args: Vec<&str> = words[1..].iter().map(|w| w.text.as_str()).collect();
-    if shell == Shell::PowerShell && (first.text == "&" || (first.text == "." && !args.is_empty()))
-    {
-        // `& <path>` and `. <path>` run a program or a script by path.
-        let operand = words.get(1)?;
-        if operand.var {
-            return None;
+    if shell == Shell::PowerShell {
+        if first.text == "&" || first.text == "." {
+            return Some(format!(
+                "this uses PowerShell's call operator {}, which runs whatever follows",
+                first.text
+            ));
         }
-        if is_path(&operand.text) || operand.quoted {
-            return Some(format!("this runs {} by its path", operand.text));
+        if words
+            .iter()
+            .any(|w| !w.quoted && w.text.starts_with('[') && w.text.contains("]::"))
+        {
+            return Some("this calls a .NET method directly".to_string());
         }
-        let rest = Command {
-            words: words[1..].to_vec(),
-            writes: Vec::new(),
-            piped: cmd.piped,
-        };
-        return command_reason(shell, &rest);
     }
-    if first.var || (shell == Shell::PowerShell && first.quoted) {
-        // A variable's value isn't known; a quoted PowerShell string is an expression.
+    if first.var {
+        // A variable or a PowerShell assignee alone: what it holds isn't run here.
+        return None;
+    }
+    if shell == Shell::PowerShell && first.quoted {
+        // A quoted PowerShell string is an expression.
         return None;
     }
     let raw = first.text.as_str();
     let name = command_name(raw);
-    if let Some(reason) = write_like_suite_toml(&name, &args) {
+    if let Some(reason) = write_like_suite_toml(&name, &args, &guarded) {
         return Some(reason);
     }
-    if cmd.piped && (is_python(&name) || matches!(name.as_str(), "sh" | "bash" | "iex")) {
-        return Some(format!("this pipes text into {name}, which runs it"));
+    if INTERPRETERS.contains(&name.as_str()) || is_python(&name) {
+        let only_version = args.len() == 1
+            && VERSION_FLAGS.contains(&args[0].to_ascii_lowercase().as_str())
+            && !cmd.stdin
+            && !cmd.piped;
+        if !only_version {
+            return Some(format!(
+                "`{name}` runs code or another program (an interpreter or launcher)"
+            ));
+        }
+        return None;
     }
-    if ["./", ".\\", "../", "..\\"]
-        .iter()
-        .any(|p| raw.starts_with(p))
-    {
-        return Some(format!("this runs the script or program {raw}"));
+    if raw.contains(['/', '\\']) {
+        return Some(format!("this runs the program or script {raw} by its path"));
     }
     named_reason(&name, &args)
 }
 
-/// The rule for write-like commands that name a guarded `suite.toml`.
-fn write_like_suite_toml(name: &str, args: &[&str]) -> Option<String> {
-    const WRITE_LIKE: [&str; 23] = [
+/// The rule for write-like commands that name a guarded `suite.toml`: in an argument, after an
+/// argument's `=` (`of=…`) or a PowerShell parameter's `:` (`-Path:…`), or as a folder argument
+/// beside a `suite.toml` argument (`robocopy src <LILITH folder> suite.toml`).
+fn write_like_suite_toml(
+    name: &str,
+    args: &[&str],
+    guarded: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    const WRITE_LIKE: &[&str] = &[
         "set-content",
         "add-content",
         "out-file",
@@ -683,38 +973,113 @@ fn write_like_suite_toml(name: &str, args: &[&str]) -> Option<String> {
         "move-item",
         "rename-item",
         "copy-item",
+        "tee-object",
         "rm",
         "del",
+        "erase",
         "mv",
         "cp",
         "tee",
+        "dd",
+        "truncate",
+        "ln",
+        "install",
+        "robocopy",
+        "xcopy",
+        "copy",
+        "move",
+        "ren",
+        "rename",
+        "invoke-webrequest",
+        "iwr",
+        "invoke-restmethod",
+        "irm",
+        "curl",
+        "wget",
         // PowerShell's aliases of the above.
+        "sc",
         "ac",
         "clc",
         "ni",
         "ri",
         "mi",
-        "move",
         "rni",
-        "ren",
         "cpi",
+        "mklink",
     ];
     let sed_in_place = name == "sed"
         && args
             .iter()
             .any(|a| a.starts_with("-i") || a.starts_with("--in-place"));
-    let write_like = sed_in_place || WRITE_LIKE.contains(&name) || name == "copy";
-    (write_like && args.iter().any(|a| is_guarded_suite_toml(a)))
+    if !(sed_in_place || WRITE_LIKE.contains(&name)) {
+        return None;
+    }
+    let parts = |a: &str| -> Vec<String> {
+        let mut v = vec![a.to_string()];
+        if let Some((_, rest)) = a.split_once('=') {
+            v.push(rest.to_string());
+        }
+        if a.starts_with('-')
+            && let Some((_, rest)) = a.split_once(':')
+        {
+            v.push(rest.to_string());
+        }
+        v
+    };
+    let named = args.iter().flat_map(|a| parts(a)).any(|p| guarded(&p));
+    let split = args
+        .iter()
+        .any(|a| normalized(a).last().is_some_and(|f| is_lilith_folder(f)))
+        && args.iter().any(|a| is_bare_suite_toml(a));
+    (named || split)
         .then(|| "this changes a LILITH suite.toml (your caps and settings)".to_string())
+}
+
+/// An installer's install verbs (and the verbs that run a package): any one among its
+/// arguments asks, and so does a flag before its subcommand (ruling P3-R28).
+fn install_verbs(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "pip" | "pip3" => &["install", "download"],
+        n if n.starts_with("pip3.") => &["install", "download"],
+        "uv" => &["add", "install", "run", "sync"],
+        "pipx" => &["install", "run", "inject", "upgrade"],
+        "conda" | "mamba" | "micromamba" => &["install", "create", "update", "run"],
+        "npm" => &[
+            "install",
+            "i",
+            "in",
+            "ci",
+            "add",
+            "run",
+            "run-script",
+            "exec",
+            "x",
+            "update",
+        ],
+        "pnpm" => &["add", "install", "i", "dlx", "exec", "run", "update"],
+        "yarn" => &["add", "install", "dlx", "run"],
+        "cargo" => &["install"],
+        "gem" | "go" => &["install"],
+        "winget" => &["install", "add", "upgrade"],
+        "choco" | "scoop" => &["install", "upgrade", "update"],
+        "comfy" => &["install", "registry-install", "reinstall", "update"],
+        _ => return None,
+    })
 }
 
 /// The command-word rules (Appendix F, "Plugin 1.3").
 fn named_reason(name: &str, args: &[&str]) -> Option<String> {
-    let pos = positionals(args);
-    let first = pos.first().copied().unwrap_or_default();
     let reason = |what: &str| Some(format!("`{name}` {what}"));
     let lower: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
     let has = |flag: &str| lower.iter().any(|a| a == flag);
+    if let Some(verbs) = install_verbs(name) {
+        let pos = positionals(args);
+        let flag_first = args.first().is_some_and(|a| is_flag(a)) && !pos.is_empty();
+        if pos.iter().any(|p| verbs.contains(p)) || flag_first {
+            return reason("installs software or runs a package (ask before installs)");
+        }
+        return None;
+    }
     match name {
         "lil-mcp" => {
             Some("this starts lil-mcp, the suite's MCP server, outside Claude Code".to_string())
@@ -727,48 +1092,39 @@ fn named_reason(name: &str, args: &[&str]) -> Option<String> {
                     .to_string()
             })
         }
-        "rm" | "del" | "erase" | "rd" | "rmdir" | "remove-item" | "ri" => reason("deletes files"),
-        "git" => match git_subcommand(args) {
-            Some("clean") => reason("clean deletes untracked files"),
-            Some("reset") if has("--hard") => reason("reset --hard throws away changes"),
-            _ => None,
-        },
-        "pip" | "pip3" if first == "install" => reason("installs packages"),
-        n if n.starts_with("pip3.") && first == "install" => reason("installs packages"),
-        "uv" if (first == "pip" && pos.get(1) == Some(&"install")) || first == "add" => {
-            reason("installs packages")
+        "rm" | "del" | "erase" | "rd" | "rmdir" | "remove-item" | "ri" | "unlink" | "shred" => {
+            reason("deletes files")
         }
-        "npm" if matches!(first, "install" | "i" | "ci" | "add") => reason("installs packages"),
-        "npm" if matches!(first, "run" | "run-script") => reason("runs a package script"),
-        "pnpm" if matches!(first, "add" | "install" | "i") => reason("installs packages"),
-        "yarn" if first == "add" => reason("installs packages"),
-        "cargo" | "winget" | "choco" | "scoop" if first == "install" => reason("installs software"),
-        "install-module" | "install-package" => reason("installs software"),
-        "comfy"
-            if pos
+        "find"
+            if lower.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+                )
+            }) =>
+        {
+            reason("deletes or runs commands on the files it finds")
+        }
+        "git" => {
+            if args
                 .windows(2)
-                .any(|w| w[0] == "node" && matches!(w[1], "install" | "registry-install")) =>
-        {
-            reason("installs a ComfyUI custom node")
+                .any(|w| w[0] == "-c" && w[1].contains("alias."))
+            {
+                return reason("defines an alias on the fly, which can run any command");
+            }
+            match git_subcommand(args) {
+                Some("clean") => reason("clean deletes untracked files"),
+                Some("reset") if has("--hard") => reason("reset --hard throws away changes"),
+                _ => None,
+            }
         }
-        n if is_python(n) => python_reason(name, args),
-        "node" if !first.is_empty() || has("-e") || has("--eval") => reason("runs a script"),
-        "bash" | "sh" | "zsh"
-            if !first.is_empty()
-                || args
-                    .iter()
-                    .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c')) =>
-        {
-            reason("runs a script")
+        "install-module" | "install-package" | "install-script" | "install-psresource" => {
+            reason("installs software")
         }
-        "cmd" if has("/c") || has("/k") => reason("runs a command line"),
-        "pwsh" | "powershell" if pwsh_runs_script(&lower) => reason("runs a script"),
         "blender" if args.iter().any(|a| *a == "-P" || a.starts_with("--python")) => {
             reason("runs a Python script inside Blender")
         }
-        "invoke-expression" | "iex" => reason("runs text as code"),
-        "source" | "." if !first.is_empty() => reason("runs a script"),
-        "npx" | "uvx" => reason("downloads and runs a package"),
+        "npx" | "uvx" | "pnpx" | "bunx" => reason("downloads and runs a package"),
         _ => None,
     }
 }
@@ -805,68 +1161,4 @@ fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
         i += 1;
     }
     None
-}
-
-/// Python: a file or `-c` runs a script; `-m pip install` installs; `-m <other>` and flags
-/// alone (`--version`) get no decision.
-fn python_reason(name: &str, args: &[&str]) -> Option<String> {
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
-        match a {
-            "-c" => return Some(format!("`{name} -c` runs a script")),
-            "-m" => {
-                let module = args.get(i + 1).copied().unwrap_or_default();
-                let rest = positionals(args.get(i + 2..).unwrap_or_default());
-                return (module == "pip" && rest.first() == Some(&"install"))
-                    .then(|| format!("`{name} -m pip install` installs packages"));
-            }
-            "-X" | "-W" | "-Q" => i += 2,
-            a if a.starts_with('-') => i += 1,
-            _ => return Some(format!("`{name}` runs the script {a}")),
-        }
-    }
-    None
-}
-
-/// PowerShell with `-Command`, `-File`, `-EncodedCommand` (or their short forms), or a script
-/// as its first positional argument.
-fn pwsh_runs_script(lower: &[String]) -> bool {
-    const SCRIPT: [&str; 9] = [
-        "-c",
-        "-command",
-        "-f",
-        "-file",
-        "-e",
-        "-ec",
-        "-encodedcommand",
-        "-commandwithargs",
-        "-cwa",
-    ];
-    const VALUED: [&str; 8] = [
-        "-executionpolicy",
-        "-ex",
-        "-workingdirectory",
-        "-wd",
-        "-windowstyle",
-        "-w",
-        "-configurationname",
-        "-settingsfile",
-    ];
-    let mut i = 0;
-    while i < lower.len() {
-        let a = lower[i].as_str();
-        if SCRIPT.contains(&a) || a.starts_with("-command:") || a.starts_with("-file:") {
-            return true;
-        }
-        if VALUED.contains(&a) {
-            i += 2;
-            continue;
-        }
-        if !a.starts_with('-') {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }

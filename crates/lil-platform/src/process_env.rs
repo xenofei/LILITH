@@ -8,6 +8,7 @@
 //! | `LIL_TEST_ROOT` | test channels only: `<root>\{roaming,local,profile}` |
 //! | `LIL_TEST_PARENT_PID` | test channels only |
 //! | `LIL_TEST_IDLE_SECS` | test channels only |
+//! | `LIL_TEST_DOCTOR_STDIN` | test channels only: `1` lets `lil doctor` read answers from a pipe |
 
 /// Runtime channel request.
 pub const ENV_CHANNEL: &str = "LIL_CHANNEL";
@@ -17,6 +18,8 @@ pub const ENV_TEST_ROOT: &str = "LIL_TEST_ROOT";
 pub const ENV_TEST_PARENT_PID: &str = "LIL_TEST_PARENT_PID";
 /// Test channels only: the idle timeout in seconds.
 pub const ENV_TEST_IDLE_SECS: &str = "LIL_TEST_IDLE_SECS";
+/// Test channels only: `1` lets `lil doctor` take its answers from a pipe (ruling P3-R28).
+pub const ENV_TEST_DOCTOR_STDIN: &str = "LIL_TEST_DOCTOR_STDIN";
 
 /// The channel this binary was built for: `stable` in release packaging, else `dev`.
 pub const BUILD_CHANNEL: &str = match option_env!("LIL_BUILD_CHANNEL") {

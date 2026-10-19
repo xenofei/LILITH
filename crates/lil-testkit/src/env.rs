@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use lil_platform::{
-    Channel, ENV_CHANNEL, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env, RealLocations, Roots,
-    TEST_PIPE_SID, arm_test_guard, names,
+    Channel, ENV_CHANNEL, ENV_TEST_DOCTOR_STDIN, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env,
+    RealLocations, Roots, TEST_PIPE_SID, arm_test_guard, names,
 };
 
 use crate::bins::ensure_built;
@@ -130,6 +130,9 @@ impl TestEnv {
                 OsString::from(ENV_TEST_PARENT_PID),
                 OsString::from(std::process::id().to_string()),
             ),
+            // Tests answer `lil doctor` through a pipe (a person's `lil doctor` takes answers
+            // only from a terminal).
+            (OsString::from(ENV_TEST_DOCTOR_STDIN), OsString::from("1")),
         ];
         vars.extend(self.git_env());
         vars
@@ -846,9 +849,11 @@ mod tests {
             get("LIL_TEST_PARENT_PID"),
             OsString::from(std::process::id().to_string())
         );
-        // The three channel variables come first; the git isolation follows them.
-        assert_eq!(vars.len(), 3 + t.git_env().len(), "{vars:?}");
-        assert_eq!(&vars[3..], t.git_env().as_slice(), "{vars:?}");
+        assert_eq!(get("LIL_TEST_DOCTOR_STDIN"), OsString::from("1"));
+        // The three channel variables and the doctor's test override come first; the git
+        // isolation follows them.
+        assert_eq!(vars.len(), 4 + t.git_env().len(), "{vars:?}");
+        assert_eq!(&vars[4..], t.git_env().as_slice(), "{vars:?}");
 
         // A child given these variables resolves the same isolated folders.
         let child = Env::from_vars("dev", &|name| {

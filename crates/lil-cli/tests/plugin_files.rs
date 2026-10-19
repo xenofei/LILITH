@@ -287,6 +287,20 @@ fn every_skill_is_in_the_inventory() {
             "skills/{name} is not in skills-inventory.toml"
         );
     }
+    let agents: Vec<String> = table["agent"]
+        .as_array()
+        .expect("[[agent]] entries")
+        .iter()
+        .map(|a| a["name"].as_str().expect("name").to_string())
+        .collect();
+    for agent in std::fs::read_dir(plugin_dir().join("agents")).unwrap() {
+        let name = agent.unwrap().path();
+        let name = name.file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(
+            agents.contains(&name),
+            "agents/{name}.md is not in skills-inventory.toml"
+        );
+    }
 }
 
 /// The fixture workspace, as a workspace from before the rename: its workspace file has the

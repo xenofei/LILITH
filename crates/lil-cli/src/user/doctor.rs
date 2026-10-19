@@ -38,7 +38,7 @@
 //!    files directly, from its `skills-inventory.toml`.
 
 use std::ffi::OsStr;
-use std::io::{self, BufRead as _, Write as _};
+use std::io::{self, BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +54,7 @@ use lil_platform::names::{
 };
 use lil_platform::paths::folder_key;
 use lil_platform::process::{current_exe_dir, find_on_path, run_hidden};
-use lil_platform::{Channel, Env};
+use lil_platform::{Channel, ENV_CHANNEL, ENV_TEST_DOCTOR_STDIN, Env};
 use lil_protocol::Outcome;
 use serde_json::{Map, Value};
 
@@ -564,6 +564,12 @@ fn capitalised(text: &str) -> String {
     }
 }
 
+/// On a test channel only, `LIL_TEST_DOCTOR_STDIN=1` lets a test answer through a pipe.
+fn piped_answers_allowed() -> bool {
+    std::env::var(ENV_CHANNEL).is_ok_and(|c| c.starts_with("test-"))
+        && std::env::var(ENV_TEST_DOCTOR_STDIN).is_ok_and(|v| v == "1")
+}
+
 /// Writes `text` and a line end to stderr.
 fn say(text: &str) {
     let mut err = io::stderr().lock();
@@ -572,12 +578,22 @@ fn say(text: &str) {
 }
 
 /// Asks `question` on stderr and reads one line from stdin: `true` only for `y` or `yes` (any
-/// case). An empty answer, end of input or a read error is no.
+/// case). An empty answer, end of input or a read error is no. When stdin is not a terminal
+/// the answer is no without reading it, so a `y` piped in by a program (an agent's
+/// `echo y | lil doctor`) never answers (ruling P3-R28); only on a test channel does
+/// `LIL_TEST_DOCTOR_STDIN=1` let tests answer through a pipe.
 fn ask(question: &str) -> bool {
     {
         let mut err = io::stderr().lock();
         let _ = write!(err, "{question}");
         let _ = err.flush();
+    }
+    if !io::stdin().is_terminal() && !piped_answers_allowed() {
+        say(
+            "no — lil doctor takes its answers only from a person at a terminal, and its input \
+             isn't one. Run lil doctor yourself in a terminal to answer.",
+        );
+        return false;
     }
     let mut answer = String::new();
     if io::stdin().lock().read_line(&mut answer).is_err() {
@@ -594,6 +610,8 @@ fn ask(question: &str) -> bool {
 /// The plugin as Claude Code names it, `worldwright@lilith`: the plugin's name, then its
 /// marketplace's.
 const PLUGIN: &str = "worldwright@lilith";
+/// The plugin's marketplace, as `plugin/.claude-plugin/marketplace.json` names it.
+const MARKETPLACE: &str = "lilith";
 /// The plugin version this suite ships.
 const PLUGIN_VERSION: &str = "1.3.0";
 /// How long one `claude` command may take.
@@ -667,6 +685,20 @@ fn plugin_name() -> &'static str {
     PLUGIN.split_once('@').map_or(PLUGIN, |(name, _)| name)
 }
 
+/// The folder an already added marketplace [`MARKETPLACE`] comes from, when it isn't `source`
+/// (`claude plugin marketplace list --json`). A list that can't be read counts as none.
+fn marketplace_elsewhere(claude: &Path, source: &Path) -> Option<String> {
+    let listed = run_claude(claude, &["plugin", "marketplace", "list", "--json"]).ok()?;
+    let markets: Vec<Value> = serde_json::from_str(listed.trim()).ok()?;
+    let ours = markets.iter().find(|m| m["name"] == MARKETPLACE)?;
+    let from = ours["path"]
+        .as_str()
+        .or_else(|| ours["url"].as_str())
+        .or_else(|| ours["repo"].as_str())
+        .unwrap_or("another source");
+    (folder_key(Path::new(from)) != folder_key(source)).then(|| from.to_string())
+}
+
 /// `a` is an older version than `b` (dotted numbers; anything else counts as older).
 fn older(a: &str, b: &str) -> bool {
     let parse = |v: &str| -> Option<Vec<u64>> { v.split('.').map(|p| p.parse().ok()).collect() };
@@ -684,6 +716,7 @@ fn claude_code(env: &Env, claude: Option<&Path>, interactive: bool, report: &mut
     };
     report.ok(&format!("Claude Code: {}", claude.display()));
     if plugin(claude, interactive, report) {
+        hooks_file(claude, report);
         plugin_options(env, report);
     }
     skills_inventory(report);
@@ -775,6 +808,16 @@ fn plugin(claude: &Path, interactive: bool, report: &mut Report) -> bool {
         ));
         return false;
     }
+    if let Some(other) = marketplace_elsewhere(claude, &source) {
+        report.problem(&format!(
+            "{what}, and the marketplace {MARKETPLACE} is already added from {other}, not from \
+             {} — lil doctor doesn't change it; to use this suite's, run claude plugin \
+             marketplace remove {MARKETPLACE} (that also uninstalls {PLUGIN} and its options), \
+             then lil doctor again",
+            source.display()
+        ));
+        return false;
+    }
     let verb = if update { "Update" } else { "Install" };
     say(&format!(
         "{}. Nothing has been changed. lil doctor can add the plugin's marketplace ({}) to the \
@@ -855,14 +898,96 @@ fn plugin_options(env: &Env, report: &mut Report) {
         let named = path
             .file_name()
             .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(exe));
-        if in_trusted && named {
-            report.ok(&format!("the plugin's option {key} is {value}"));
-        } else {
+        if !(in_trusted && named) {
             report.problem(&format!(
                 "the plugin's option {key} is {value}, which is not {exe} in a folder this \
                  channel trusts — {enter}"
             ));
+        } else if !path.is_file() {
+            report.problem(&format!(
+                "the plugin's option {key} is {value}, which doesn't exist — build or install \
+                 LILITH there, or {enter}"
+            ));
+        } else if key == "lil_path" && !hook_answers(path) {
+            report.problem(&format!(
+                "the plugin's option {key} is {value}, but `{value} hook pre-tool-use` doesn't \
+                 answer ask for an `rm`, so the plugin's hooks don't guard tool calls — check \
+                 that it is this channel's lil.exe, or {enter}"
+            ));
+        } else {
+            report.ok(&format!("the plugin's option {key} is {value}"));
         }
+    }
+}
+
+/// How long the hook check may take.
+const HOOK_LIMIT: Duration = Duration::from_secs(30);
+
+/// Whether `<lil> hook pre-tool-use` answers `ask` for a Bash `rm` (the hooks run, ruling
+/// P3-R28).
+fn hook_answers(lil: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    let input = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf build"}}"#;
+    let Ok(mut child) = Command::new(lil)
+        .args(["hook", "pre-tool-use"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    // The answer is a few hundred bytes, so the pipe never fills while it runs.
+    let deadline = std::time::Instant::now() + HOOK_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+    let mut text = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = io::Read::read_to_string(&mut out, &mut text);
+    }
+    serde_json::from_str::<Value>(text.trim())
+        .is_ok_and(|v| v["hookSpecificOutput"]["permissionDecision"] == "ask")
+}
+
+/// The installed plugin's `hooks/hooks.json`, when Claude Code reports where the plugin loads
+/// from (`installPath`): a missing file means the hooks don't run.
+fn hooks_file(claude: &Path, report: &mut Report) {
+    let Ok(listed) = run_claude(claude, &["plugin", "list", "--json"]) else {
+        return;
+    };
+    let plugins: Vec<Value> = serde_json::from_str(listed.trim()).unwrap_or_default();
+    let Some(dir) = plugins
+        .iter()
+        .find(|p| p["id"] == PLUGIN)
+        .and_then(|p| p["installPath"].as_str())
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+    else {
+        return;
+    };
+    let hooks = dir.join("hooks").join("hooks.json");
+    if hooks.is_file() {
+        report.ok(&format!("the plugin's hooks are at {}", hooks.display()));
+    } else {
+        report.problem(&format!(
+            "the installed plugin has no {}, so its hooks don't run — run lil doctor again and \
+             answer y to update the plugin, or reinstall it in Claude Code (/plugin)",
+            hooks.display()
+        ));
     }
 }
 
@@ -886,27 +1011,37 @@ fn skills_inventory(report: &mut Report) {
         );
         return;
     };
-    let direct: Vec<&str> = table
-        .get("skill")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|s| s.get("writes_directly").and_then(toml::Value::as_bool) == Some(true))
-        .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
-        .collect();
-    if direct.is_empty() {
-        report.ok("no plugin skill writes workspace files directly");
-    } else {
-        report.line(
-            "info",
-            &format!(
-                "plugin skills that still write workspace files directly: {} — while a core \
-                 runs, the suite's tools are the only writers; these skills move to them in \
-                 the skills port",
-                direct.join(", ")
-            ),
-        );
+    let direct = |kind: &str| -> Vec<&str> {
+        table
+            .get(kind)
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|s| s.get("writes_directly").and_then(toml::Value::as_bool) == Some(true))
+            .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
+            .collect()
+    };
+    let (skills, agents) = (direct("skill"), direct("agent"));
+    if skills.is_empty() && agents.is_empty() {
+        report.ok("no plugin skill or agent writes workspace files directly");
+        return;
     }
+    let mut named = Vec::new();
+    if !skills.is_empty() {
+        named.push(format!("skills {}", skills.join(", ")));
+    }
+    if !agents.is_empty() {
+        named.push(format!("agents {}", agents.join(", ")));
+    }
+    report.line(
+        "info",
+        &format!(
+            "plugin skills and agents that still write workspace files directly: {} — while a \
+             core runs, the suite's tools are the only writers; these move to them in the \
+             skills port",
+            named.join("; ")
+        ),
+    );
 }
 
 /// The Claude Code rules question (AI-114): only a `y` lists the offer, and the core then

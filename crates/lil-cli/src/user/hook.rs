@@ -14,7 +14,10 @@
 //!   chain finds from the session's folder; nothing otherwise.
 //! - With `LIL_ENGINE=1` (Engine A) every hook prints nothing (ARCH-107).
 //!
-//! The hooks never start a core and never wait for a person (ARCH-018).
+//! The hooks never start a core and never wait for a person (ARCH-018). PreToolUse fails
+//! closed (ruling P3-R28): a hook that panics, can't read its input, or can't tell whether a
+//! core runs for a core-dependent tool answers `ask`. The core check probes the pipe of this
+//! `lil.exe`'s channel, so `lil_path` should name the channel that drives ComfyUI.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -31,7 +34,7 @@ use lil_protocol::{CallerKind, NO_WORKSPACE, Outcome};
 use serde_json::{Map, Value, json};
 
 use super::GlobalArgs;
-use super::hook_patterns::{Decision, classify_tool, depends_on_core};
+use super::hook_patterns::{Decision, classify_tool, depends_on_core, unknown_core};
 
 /// The hook event, as `hooks.json` passes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -49,16 +52,43 @@ const ENGINE_MARKER: &str = "LIL_ENGINE";
 const LISTED: usize = 20;
 
 /// `lil hook <event>`: reads stdin and prints the output.
+///
+/// PreToolUse fails closed (ruling P3-R28): when stdin can't be read or the hook panics, it
+/// answers `ask`.
 pub(super) fn run(event: HookEvent, global: &GlobalArgs) -> i32 {
     let mut stdin = String::new();
-    if std::io::stdin().read_to_string(&mut stdin).is_err() {
-        return 0;
-    }
-    let (stdout, code) = run_hook(event, &stdin, global);
+    let stdout = if std::io::stdin().read_to_string(&mut stdin).is_err() {
+        failed(event)
+    } else {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_hook(event, &stdin, global).0
+        }))
+        .unwrap_or_else(|_| failed(event))
+    };
     if !stdout.is_empty() {
         let _ = super::print_line(&stdout);
     }
-    code
+    0
+}
+
+/// What a hook that failed prints: `ask` for PreToolUse, nothing for the others.
+fn failed(event: HookEvent) -> String {
+    if event != HookEvent::PreToolUse {
+        return String::new();
+    }
+    ask_output(
+        "LILITH: the suite's hook failed, so it can't check this tool call. Allow it?".to_string(),
+    )
+    .to_string()
+}
+
+/// A PreToolUse `ask` with `reason`.
+fn ask_output(reason: String) -> Value {
+    json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason,
+    }})
 }
 
 /// What `lil hook <event>` prints for the hook JSON `stdin`, and its exit code (always 0).
@@ -87,9 +117,21 @@ fn pre_tool_use(input: &Value) -> Option<Value> {
     let tool_name = input["tool_name"].as_str()?;
     let empty = json!({});
     let tool_input = input.get("tool_input").unwrap_or(&empty);
-    let running =
-        depends_on_core(tool_name) && Env::from_process().is_ok_and(|env| core_running(&env));
-    let (decision, reason) = match classify_tool(tool_name, tool_input, running) {
+    let running = if depends_on_core(tool_name) {
+        match Env::from_process() {
+            Ok(env) => core_running(&env),
+            // It can't tell whether a core runs: ask (fail closed, ruling P3-R28).
+            Err(_) => return pre_output(unknown_core(tool_name)),
+        }
+    } else {
+        false
+    };
+    pre_output(classify_tool(tool_name, tool_input, running))
+}
+
+/// The PreToolUse output for `decision`.
+fn pre_output(decision: Decision) -> Option<Value> {
+    let (decision, reason) = match decision {
         Decision::Ask(reason) => ("ask", reason),
         Decision::Deny(reason) => ("deny", reason),
         Decision::Warn(message) => return Some(json!({ "systemMessage": message })),
