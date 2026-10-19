@@ -39,7 +39,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
     FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx, FileIdInfo,
     FileStandardInfo, FlushFileBuffers, GetDriveTypeW, GetFileAttributesW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW, GetShortPathNameW,
     GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK,
     LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS,
     REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
@@ -254,6 +254,66 @@ pub fn long_name(path: &Path) -> io::Result<PathBuf> {
     } else {
         strip_verbatim(&long)
     })
+}
+
+/// `path` with every 8.3 short component of its longest existing prefix expanded by
+/// `long_name` ([`long_name`], or a [`Probe`]'s), and the rest appended as given: a name that
+/// doesn't exist has no short form. The walk up finds that prefix through `identity`
+/// ([`identity`], or a [`Probe`]'s, so a fake can inject errors). Only a missing component
+/// (`NotFound`, or `NotADirectory` below a file) moves the walk up a level; any other error is
+/// returned, so a check built on this fails closed.
+pub fn long_form(
+    path: &Path,
+    identity: &dyn Fn(&Path) -> io::Result<FileIdentity>,
+    long_name: &dyn Fn(&Path) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    for existing in path.ancestors() {
+        match identity(existing) {
+            Ok(_) => {
+                let long = long_name(existing)?;
+                let tail = path.strip_prefix(existing).unwrap_or(Path::new(""));
+                return Ok(if tail.as_os_str().is_empty() {
+                    long
+                } else {
+                    long.join(tail)
+                });
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no part of the path exists",
+    ))
+}
+
+/// `GetShortPathNameW`: `path` with each component that has an 8.3 short name in that form. A
+/// component without one (8.3 names off on the volume) keeps its long name. A `\\?\` prefix
+/// that [`long_path`] added is removed again. Test support for the store's short-name checks.
+pub fn short_name(path: &Path) -> io::Result<PathBuf> {
+    let input = wide(path)?;
+    let mut buf = vec![0u16; 260];
+    loop {
+        // SAFETY: `input` is NUL-terminated; `buf` is a writable slice of the length passed.
+        let len = unsafe { GetShortPathNameW(PCWSTR(input.as_ptr()), Some(&mut buf)) } as usize;
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len < buf.len() {
+            buf.truncate(len);
+            break;
+        }
+        // Too small: `len` is the size needed, terminating NUL included.
+        buf = vec![0u16; len];
+    }
+    Ok(strip_verbatim(&PathBuf::from(
+        std::ffi::OsString::from_wide(&buf),
+    )))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -606,13 +666,20 @@ impl Drop for LockedFile {
 
 /// Opens or creates the lock file at `path` and takes `LockFileEx(EXCLUSIVE |
 /// FAIL_IMMEDIATELY)` on `[0, 1)`. `None` at once when another handle holds it.
+///
+/// The handle shares read and write but not delete, so while it is open the file can't be
+/// deleted or renamed (error 32): a second core always opens this same file and finds the
+/// lock held, instead of creating a fresh one beside an orphaned handle. That second open
+/// still succeeds, since neither handle asks for delete access. An open that fails because
+/// another program holds the file with delete access (or with no sharing) is that error,
+/// 32: the caller decides what it means (the core serves read-only, `take_core_locks`).
 pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<LockedFile>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .open(long_path(path))?;
     Ok(lock_byte(&file, 0)?.then_some(LockedFile { file }))
 }
@@ -836,9 +903,19 @@ pub trait Probe: Send + Sync + std::fmt::Debug {
     fn long_name(&self, path: &Path) -> io::Result<PathBuf> {
         long_name(path)
     }
+    /// [`long_form`] with [`Probe::identity`] and [`Probe::long_name`]: the long form of a
+    /// path that may not exist yet, failing closed on any error but a missing component.
+    fn long_form(&self, path: &Path) -> io::Result<PathBuf> {
+        long_form(path, &|p| self.identity(p), &|p| self.long_name(p))
+    }
     /// [`reparse_tag`]: the reparse tag of a reparse point, read without following it.
     fn reparse_tag(&self, path: &Path) -> io::Result<Option<u32>> {
         reparse_tag(path)
+    }
+    /// The entries of the folder `dir` (`std::fs::read_dir` of its [`long_path`]). The store's
+    /// and the index's walks of the workspace list their folders through it.
+    fn read_dir(&self, dir: &Path) -> io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(long_path(dir))
     }
 }
 
@@ -952,6 +1029,60 @@ mod tests {
 
     fn units(p: &Path) -> usize {
         p.as_os_str().encode_wide().count()
+    }
+
+    /// The walk up to the longest existing prefix goes through the `identity` it is given, so a
+    /// probe can inject errors: a missing part (or one below a file) moves the walk up, any
+    /// other error ends it with that error (fail closed) before `long_name` runs.
+    #[test] // spec: CORE-040
+    fn long_form_fails_closed_on_an_error_mid_walk() {
+        let folder = FileIdentity {
+            volume_serial: 1,
+            file_id: None,
+            size: 0,
+            last_write: 0,
+            change_time: None,
+            attributes: 0x10,
+        };
+        let base = Path::new(r"C:\ws");
+        let target = base.join(r"NOTES~1\new\x.txt");
+        let long_name = |p: &Path| -> io::Result<PathBuf> {
+            Ok(PathBuf::from(
+                p.to_string_lossy().replace("NOTES~1", "notes.long"),
+            ))
+        };
+        let with = |missing: &[&str], below_file: &[&str], denied: &[&str]| {
+            let (missing, below_file, denied): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = (
+                missing.iter().map(|m| base.join(m)).collect(),
+                below_file.iter().map(|m| base.join(m)).collect(),
+                denied.iter().map(|m| base.join(m)).collect(),
+            );
+            long_form(
+                &target,
+                &|p: &Path| {
+                    if missing.iter().any(|m| m == p) {
+                        Err(io::Error::from(io::ErrorKind::NotFound))
+                    } else if below_file.iter().any(|m| m == p) {
+                        Err(io::Error::from(io::ErrorKind::NotADirectory))
+                    } else if denied.iter().any(|m| m == p) {
+                        Err(io::Error::from_raw_os_error(5))
+                    } else {
+                        Ok(folder)
+                    }
+                },
+                &long_name,
+            )
+        };
+        let expanded = base.join(r"notes.long\new\x.txt");
+        assert_eq!(with(&[r"NOTES~1\new\x.txt"], &[], &[]).unwrap(), expanded);
+        assert_eq!(
+            with(&[r"NOTES~1\new\x.txt"], &[r"NOTES~1\new"], &[]).unwrap(),
+            expanded
+        );
+        let denied = with(&[r"NOTES~1\new\x.txt"], &[], &[r"NOTES~1\new"]).unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(5), "{denied}");
+        let denied = with(&[r"NOTES~1\new\x.txt", r"NOTES~1\new"], &[], &["NOTES~1"]).unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(5), "{denied}");
     }
 
     #[test] // spec: CORE-040

@@ -19,13 +19,17 @@ dir = "target/nextest"
 # itself when this script did not run (plain `cargo test`).
 # 120 s x 5 = 10 minutes for a cold build (test-params.toml: testbins_build_s).
 [scripts.setup.build-testbins]
-command = "cargo build --locked --offline --bins -p lil-cli -p lil-core --target-dir target/testbins"
+command = "cargo build --locked --offline --bins -p lil-cli -p lil-core -p lil-mcp -p lil-testkit --target-dir target/testbins"
 slow-timeout = { period = "120s", terminate-after = 5 }
 
 [profile.default]
 retries = 1
 slow-timeout = { period = "30s", terminate-after = 4 }
 fail-fast = false
+# Spec tests are merged expected-to-fail (QA-017), so the plain workspace run leaves them to
+# `lil dev spec-tests`, which runs them under the `spec` profile with `--ignore-default-filter`
+# and applies expected-fail.toml.
+default-filter = 'not package(lil-spec-tests)'
 
 # Which tests may use the binaries. `rdeps(lil-testkit)` covers every package whose tests
 # (dev-dependencies included) use the test kit, and the kit itself: `lil-client` among them, and

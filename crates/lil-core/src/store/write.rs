@@ -34,7 +34,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use lil_platform::fs::{FileIdentity, Probe, RetryClass, classify};
 use lil_platform::names::{
     BAK_MARKER, CONFLICT_MARKER, LEGACY_BAK_MARKER, LEGACY_TMP_MARKER, LEGACY_WORKSPACE_DIR,
-    TMP_MARKER,
+    TMP_MARKER, is_workspace_dir,
 };
 use lil_platform::{Clock, IdSource};
 use lil_protocol::ErrorBody;
@@ -50,7 +50,7 @@ use sha2::{Digest as _, Sha256};
 use super::failpoints::FailPoints;
 use super::fsops;
 use super::git_gate::{GIT_WAIT, GitGate};
-use super::paths::{WsPath, writable};
+use super::paths::{WsPath, long_rel, reserved_on_disk, writable};
 use crate::state::{Pending, StateDb, StateError};
 use crate::workspace::Access;
 
@@ -386,6 +386,10 @@ pub struct RecoveryReport {
     pub staging_removed: Vec<WsPath>,
     /// Non-empty staging handles and `seal-*` folders of a dead core: kept, and orphans.
     pub staging_kept: Vec<WsPath>,
+    /// Every conflict copy in the workspace after recovery (those its walk found and those it
+    /// made), for [`Store::orphans_with_conflicts`]: the open lists its orphans without walking
+    /// the tree again.
+    pub conflict_copies: Vec<WsPath>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -746,14 +750,27 @@ fn in_legacy_workspace_dir(rel: &WsPath) -> bool {
         .is_some_and(|first| first.eq_ignore_ascii_case(LEGACY_WORKSPACE_DIR))
 }
 
+/// What the open-time walk found: the temp and backup files, and the conflict copies.
+struct Scanned {
+    leftovers: Vec<Leftover>,
+    /// `*.lil-conflict-*` and legacy conflict copies, outside both workspace data folders: the
+    /// orphan list's conflict files ([`Store::orphans`]), so the open walks the tree once
+    /// (plan-2b Minor 9).
+    conflicts: Vec<PathBuf>,
+}
+
 /// Every temp and backup file under `root`, skipping `.git`, the root's `.trash` and legacy
-/// workspace data folder (R4: nothing in it is moved or deleted), and links.
-/// A folder that can't be listed is logged and skipped.
-fn scan_leftovers(root: &Path) -> io::Result<Vec<Leftover>> {
+/// workspace data folder (R4: nothing in it is moved or deleted), and links; and in the same
+/// walk every conflict copy outside the root's workspace data folders (a link with such a name
+/// counts, as in the orphan scan). Folders are listed through `probe`. A folder that can't be
+/// listed is logged and skipped.
+fn scan_leftovers(root: &Path, probe: &dyn Probe) -> io::Result<Scanned> {
     let mut found = Vec::new();
-    let mut folders = vec![root.to_path_buf()];
-    while let Some(dir) = folders.pop() {
-        let entries = match std::fs::read_dir(lil_platform::fs::long_path(&dir)) {
+    let mut conflicts = Vec::new();
+    // Each folder, and whether it is in the root's workspace data folder (no orphans there).
+    let mut folders = vec![(root.to_path_buf(), false)];
+    while let Some((dir, in_data_dir)) = folders.pop() {
+        let entries = match probe.read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if dir == root => return Err(e),
             Err(e) => {
@@ -767,16 +784,21 @@ fn scan_leftovers(root: &Path) -> io::Result<Vec<Leftover>> {
             };
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = dir.join(&name);
+            let folder = kind.is_dir() && !kind.is_symlink();
+            if !folder && !in_data_dir && super::order::is_conflict_copy(&name) {
+                conflicts.push(path.clone());
+            }
             if kind.is_symlink() {
                 continue;
             }
             if kind.is_dir() {
+                let at_root = dir == root;
                 let skip = name.eq_ignore_ascii_case(".git")
-                    || (dir == root
+                    || (at_root
                         && (name.eq_ignore_ascii_case(".trash")
                             || name.eq_ignore_ascii_case(LEGACY_WORKSPACE_DIR)));
                 if !skip {
-                    folders.push(path);
+                    folders.push((path, in_data_dir || (at_root && is_workspace_dir(&name))));
                 }
             } else if let Some((kind, target, pid, n)) = parse_leftover(&name) {
                 found.push(Leftover {
@@ -790,7 +812,10 @@ fn scan_leftovers(root: &Path) -> io::Result<Vec<Leftover>> {
         }
     }
     found.sort_by(|a, b| (&a.path, a.pid, a.n).cmp(&(&b.path, b.pid, b.n)));
-    Ok(found)
+    Ok(Scanned {
+        leftovers: found,
+        conflicts,
+    })
 }
 
 /// The backups beside `dir\name`, oldest `<pid>-<n>` first.
@@ -1544,6 +1569,94 @@ impl Store {
         Ok(written)
     }
 
+    /// Moves the file `from` to `to`, a name with no file yet, as a write: the bytes move as
+    /// they are, nothing is replaced (`move_new`) and nothing is deleted. Both paths are checked
+    /// as a write's target is (the paths the store never writes, the legacy workspace data
+    /// folder among them, a linked folder on the way, a manifest lock), and the move waits at
+    /// the git gate. The index hears `from` removed and `to` written. The legacy workspace
+    /// file's rename to [`names::WORKSPACE_FILE`](lil_platform::names::WORKSPACE_FILE) uses it
+    /// (owner question 1).
+    ///
+    /// # Errors
+    /// `workspace.read_only`; `store.path_invalid` (also for a folder or a link at `from`);
+    /// `store.locked`; `store.git_busy`; `store.hash_conflict` when a file is already at `to`
+    /// or `from` is cloud-only; `store.io` when there is no file at `from` or the move fails.
+    pub async fn rename_new(&self, from: &WsPath, to: &WsPath) -> Result<Written, StoreError> {
+        self.writable_store()?;
+        for rel in [from, to] {
+            writable(rel)?;
+            self.check_locks(rel).await?;
+            let long = self.writable_on_disk(rel).await?;
+            self.check_long_locks(rel, &long).await?;
+            self.refuse_links(rel).await?;
+        }
+        self.git_gate.wait_clear(GIT_WAIT).await?;
+        // Both path locks, in one order, so two moves never wait on each other.
+        let (first, second) = if from.key() <= to.key() {
+            (from, to)
+        } else {
+            (to, from)
+        };
+        let _first = self.lock_path(first).await;
+        let _second = self.lock_path(second).await;
+        let (src, dst) = (from.abs(&self.root), to.abs(&self.root));
+        match self.see_hash(&src).await {
+            Ok(Seen::Found(_)) => {}
+            Ok(Seen::Missing) => {
+                return Err(StoreError::Io {
+                    path: from.as_str().to_string(),
+                    why: "there is no file to move".to_string(),
+                });
+            }
+            Ok(Seen::Placeholder) => return Err(StoreError::cloud_only(from)),
+            Ok(Seen::Link) => return Err(link_refused(from)),
+            Ok(Seen::Folder) => {
+                return Err(StoreError::PathInvalid {
+                    path: from.as_str().to_string(),
+                    why: "it is a folder".to_string(),
+                });
+            }
+            Err(e) => return Err(StoreError::io(from, &e)),
+        }
+        let (a, b) = (src.clone(), dst.clone());
+        self.fs_retry_move(Some("store.replace"), &src, move || fsops::move_new(&a, &b))
+            .await
+            .map_err(|e| {
+                if classify(&e) == RetryClass::TargetExists {
+                    StoreError::conflict(to)
+                } else {
+                    StoreError::io(to, &e)
+                }
+            })?;
+        let sha256 = match self.see_hash(&dst).await {
+            Ok(Seen::Found(h)) => h.sha256,
+            Ok(_) => {
+                return Err(StoreError::Io {
+                    path: to.as_str().to_string(),
+                    why: "the moved file can't be read back".to_string(),
+                });
+            }
+            Err(e) => return Err(StoreError::io(to, &e)),
+        };
+        let written = Written {
+            path: to.clone(),
+            sha256,
+            identity: self.identity(to).await?,
+        };
+        tracing::info!(from = %from, to = %to, "file moved to its new name");
+        self.emit(vec![
+            StoreEvent {
+                path: from.clone(),
+                kind: ChangeKind::Removed,
+                sha256: None,
+                identity: None,
+            },
+            event(&written, ChangeKind::Written),
+        ])
+        .await;
+        Ok(written)
+    }
+
     /// [`Store::edit_manifest`] without telling the sink (for an operation that reports its
     /// changes itself, in the ARCH-075 order). `None` kind: nothing changed, nothing written.
     pub(crate) async fn edit_manifest_quiet(
@@ -1670,63 +1783,61 @@ impl Store {
             .map_err(|e| StoreError::io(rel, &e))
     }
 
-    /// Step 1's check against the long form of the path: the deepest existing part of it goes
-    /// through `probe.long_name`, so an 8.3 short name (`PROJEC~1`, or one set with
-    /// `SetFileShortName`) never reaches a sealed folder or the ledger. A lookup that fails, or
-    /// a long form that isn't under the workspace root, refuses the write (fail closed).
-    pub(super) async fn writable_on_disk(&self, rel: &WsPath) -> Result<(), StoreError> {
-        let refuse = |why: String| StoreError::PathInvalid {
-            path: rel.as_str().to_string(),
-            why,
-        };
-        let (root, abs, probe) = (self.root.clone(), rel.abs(&self.root), self.probe.clone());
-        let long = blocking(move || {
-            let existing = abs
-                .ancestors()
-                .take_while(|p| p.starts_with(&root))
-                .find(|p| exists(p))
-                .map(Path::to_path_buf)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "the workspace is missing")
-                })?;
-            let tail = abs
-                .strip_prefix(&existing)
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            let long_root = probe.long_name(&root)?;
-            let long_existing = probe.long_name(&existing)?;
-            let (lr, le) = (
-                long_root
-                    .to_string_lossy()
-                    .trim_end_matches('\\')
-                    .to_string(),
-                long_existing.to_string_lossy().into_owned(),
-            );
-            let inside_root = le.len() >= lr.len()
-                && le.is_char_boundary(lr.len())
-                && le[..lr.len()].to_lowercase() == lr.to_lowercase()
-                && (le.len() == lr.len() || le[lr.len()..].starts_with('\\'));
-            if !inside_root {
-                return Ok(None);
-            }
-            let inside = PathBuf::from(&le[lr.len()..]).join(tail);
-            let parts: Vec<String> = inside
-                .components()
-                .filter_map(|c| match c {
-                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Some(parts.join("/")))
-        })
-        .await;
-        match long {
-            Ok(Some(long)) => writable(&WsPath::from_disk(long)),
-            Ok(None) => Err(refuse(
-                "its long form is not under the workspace folder".to_string(),
-            )),
-            Err(e) => Err(refuse(format!("its long form can't be read: {e}"))),
+    /// Step 1's check against the long form of the path ([`long_rel`] through
+    /// `probe.long_form`), so an 8.3 short name (`PROJEC~1`, or one set with
+    /// `SetFileShortName`) never reaches a sealed folder, the ledger or the legacy workspace
+    /// data folder. A lookup that fails, or a long form that isn't under the workspace root,
+    /// refuses the write (fail closed). Returns the long form, for [`Store::check_long_locks`].
+    pub(super) async fn writable_on_disk(&self, rel: &WsPath) -> Result<WsPath, StoreError> {
+        let (root, owned, probe) = (self.root.clone(), rel.clone(), self.probe.clone());
+        let long = blocking(move || Ok(long_rel(&root, &owned, &|p| probe.long_form(p))))
+            .await
+            .map_err(|e| StoreError::PathInvalid {
+                path: rel.as_str().to_string(),
+                why: format!("its long form can't be read: {e}"),
+            })??;
+        writable(&long)?;
+        Ok(long)
+    }
+
+    /// [`Store::check_locks`] on `long`, the long form of `rel` (from
+    /// [`Store::writable_on_disk`] or [`Store::reserved_on_disk`]), when it differs from `rel`:
+    /// an 8.3 short name of a locked path, or of a folder on the way to it, is `store.locked`
+    /// too, naming `rel`. The caller has checked `rel` itself.
+    pub(super) async fn check_long_locks(
+        &self,
+        rel: &WsPath,
+        long: &WsPath,
+    ) -> Result<(), StoreError> {
+        if long.key() == rel.key() {
+            return Ok(());
         }
+        self.check_locks(long).await.map_err(|e| match e {
+            StoreError::Locked(_) => StoreError::Locked(rel.clone()),
+            other => other,
+        })
+    }
+
+    /// The trash's reserved-path check ([`reserved_on_disk`]) on `rel` and on its long form
+    /// through `probe.long_form`: the trash itself, either workspace data folder, `.git` and
+    /// the ledger are refused by any name, 8.3 short names included (fail closed). Returns the
+    /// long form, so the caller checks it with [`writable`] without resolving it again.
+    pub(super) async fn reserved_on_disk(
+        &self,
+        rel: &WsPath,
+        what: &'static str,
+    ) -> Result<WsPath, StoreError> {
+        let (root, owned, probe) = (self.root.clone(), rel.clone(), self.probe.clone());
+        blocking(move || {
+            Ok(reserved_on_disk(&root, &owned, what, &|p| {
+                probe.long_form(p)
+            }))
+        })
+        .await
+        .map_err(|e| StoreError::PathInvalid {
+            path: rel.as_str().to_string(),
+            why: format!("its long form can't be read: {e}"),
+        })?
     }
 
     /// CORE-035: `store.locked` for a path under an asset folder,
@@ -1813,7 +1924,8 @@ impl Store {
         // Step 1.
         writable(rel)?;
         self.check_locks(rel).await?;
-        self.writable_on_disk(rel).await?;
+        let long = self.writable_on_disk(rel).await?;
+        self.check_long_locks(rel, &long).await?;
         // A linked folder on the way would let the write land outside the workspace (the
         // target itself is checked again at step 3). Attributes only, once per call.
         self.refuse_links(rel).await?;
@@ -2343,8 +2455,11 @@ impl Store {
         self.writable_store()?;
         let mut report = RecoveryReport::default();
         let root_rel = WsPath::from_disk(String::new());
-        let root = self.root.clone();
-        let leftovers = blocking(move || scan_leftovers(&root))
+        let (root, probe) = (self.root.clone(), self.probe.clone());
+        let Scanned {
+            leftovers,
+            conflicts,
+        } = blocking(move || scan_leftovers(&root, probe.as_ref()))
             .await
             .map_err(|e| StoreError::io(&root_rel, &e))?;
 
@@ -2431,6 +2546,13 @@ impl Store {
         let (removed, kept) = self.sweep().await?;
         report.staging_removed = removed;
         report.staging_kept = kept;
+        // The conflict copies the walk found and those recovery just made: the orphan list's,
+        // without a second walk.
+        let mut copies: Vec<WsPath> = conflicts.iter().map(|p| self.rel_of(p)).collect();
+        copies.extend(report.conflicts_kept.iter().cloned());
+        copies.sort();
+        copies.dedup();
+        report.conflict_copies = copies;
         Ok(report)
     }
 

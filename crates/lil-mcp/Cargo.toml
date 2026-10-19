@@ -1,0 +1,15 @@
+[package]
+name = "lil-mcp"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The stdio MCP server Claude Code starts (ARCH-012, ARCH-110). A stub until plan 3 Task 19,
+# which adds its dependencies: lil-client, lil-protocol, rmcp, tokio, serde_json and tracing
+# only.
+[dependencies]
+
+[lints]
+workspace = true

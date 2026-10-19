@@ -4,6 +4,7 @@
 //! The declared `caller_kind` is a claim. The core keeps it only when the client process backs
 //! it up:
 //! - `ui:<app>`: the image is that app's executable ([`APP_EXES`]) in a trusted app folder;
+//!   on a test channel also `ui:test` from [`TEST_APP_EXE`] (QA-066), never elsewhere;
 //! - `mcp`: the image is [`MCP_EXE`] in a trusted MCP folder;
 //! - `assistant`: the client presented an engine token that validates. A token that does not
 //!   validate is refused, never downgraded (ARCH-048, ARCH-050).
@@ -14,14 +15,18 @@
 
 use std::path::{Path, PathBuf};
 
-use lil_platform::Env;
 use lil_platform::paths::folder_key;
 use lil_platform::process::{ProcessInfo, ProcessInspector};
+use lil_platform::{Channel, Env};
 use lil_protocol::codes::{CALLER_ENGINE_TOKEN_INVALID, PARAMS_INVALID};
 use lil_protocol::{CallerKind, ErrorBody};
 
 /// The executables of the suite's apps: (file name, app). A `ui:<app>` claim needs that file.
 pub const APP_EXES: &[(&str, &str)] = &[("lil-image.exe", "image")];
+
+/// The test app (file name, app): `ui:test`, accepted only by a core on a test channel
+/// ([`TrustedDirs::test_app`]).
+pub const TEST_APP_EXE: (&str, &str) = ("lil-test-app.exe", "test");
 
 /// The MCP server's executable. An `mcp` claim needs it.
 pub const MCP_EXE: &str = "lil-mcp.exe";
@@ -34,16 +39,29 @@ const CLAUDE_EXE: &str = "claude.exe";
 pub struct TrustedDirs {
     pub app_dirs: Vec<PathBuf>,
     pub mcp_dirs: Vec<PathBuf>,
+    /// [`TEST_APP_EXE`] in an app folder is `ui:test`: set by [`TrustedDirs::for_env`] on test
+    /// channels only.
+    pub test_app: bool,
+}
+
+/// Whether a core on `channel` accepts the test app: test channels only.
+pub fn trusts_test_app(channel: &Channel) -> bool {
+    matches!(channel, Channel::Test(_))
 }
 
 impl TrustedDirs {
     /// Stable (installed): apps from the install folder; the MCP server from the install
-    /// folder or `local_dir\bin`. Dev and test: both from the folder of the running core.
+    /// folder or `local_dir\bin`. Dev and test: both from the folder of the running core. The
+    /// test app is trusted on test channels only.
     pub fn for_env(env: &Env, own_exe_dir: &Path) -> TrustedDirs {
         // Only the stable channel has an install folder (`Env::install_dir`).
-        match env.install_dir() {
+        let dirs = match env.install_dir() {
             Some(install_dir) => TrustedDirs::installed(&install_dir, &env.local_dir()),
             None => TrustedDirs::own_dir(own_exe_dir),
+        };
+        TrustedDirs {
+            test_app: trusts_test_app(env.channel()),
+            ..dirs
         }
     }
 
@@ -52,6 +70,7 @@ impl TrustedDirs {
         TrustedDirs {
             app_dirs: vec![install_dir.to_path_buf()],
             mcp_dirs: vec![install_dir.to_path_buf(), local_dir.join("bin")],
+            test_app: false,
         }
     }
 
@@ -60,6 +79,7 @@ impl TrustedDirs {
         TrustedDirs {
             app_dirs: vec![own_exe_dir.to_path_buf()],
             mcp_dirs: vec![own_exe_dir.to_path_buf()],
+            test_app: false,
         }
     }
 }
@@ -122,9 +142,14 @@ pub fn resolve_caller(
         };
     }
     let verified = match declared {
-        CallerKind::Ui(app) => APP_EXES
-            .iter()
-            .any(|(exe, a)| a == app && runs(client, exe, &trusted.app_dirs)),
+        CallerKind::Ui(app) => {
+            let test_app = trusted.test_app.then_some(TEST_APP_EXE);
+            APP_EXES
+                .iter()
+                .copied()
+                .chain(test_app)
+                .any(|(exe, a)| a == app && runs(client, exe, &trusted.app_dirs))
+        }
         CallerKind::Mcp => runs(client, MCP_EXE, &trusted.mcp_dirs),
         CallerKind::Assistant | CallerKind::Cli => false,
     };
@@ -186,6 +211,7 @@ mod tests {
         TrustedDirs {
             app_dirs: vec![PathBuf::from(TRUSTED)],
             mcp_dirs: vec![PathBuf::from(TRUSTED)],
+            test_app: false,
         }
     }
 
@@ -346,6 +372,7 @@ mod tests {
         let dirs = TrustedDirs {
             app_dirs: vec![PathBuf::from(format!(r"\\?\{TRUSTED}\"))],
             mcp_dirs: Vec::new(),
+            test_app: false,
         };
         let client = process(&format!(r"{TRUSTED}\lil-image.exe"), None);
         let ui: CallerKind = "ui:image".parse().unwrap();
@@ -371,8 +398,49 @@ mod tests {
         let dirs = TrustedDirs::for_env(&env.env, &own);
         assert_eq!(dirs.app_dirs, vec![own.clone()]);
         assert_eq!(dirs.mcp_dirs, vec![own.clone()]);
-        // The dev channel has no install folder either, so it takes the same branch.
-        assert_eq!(TrustedDirs::own_dir(&own), dirs);
+        // The dev channel has no install folder either, so it takes the same branch (where
+        // only a test channel trusts the test app).
+        assert_eq!(
+            TrustedDirs {
+                test_app: true,
+                ..TrustedDirs::own_dir(&own)
+            },
+            dirs
+        );
+    }
+
+    /// `lil-test-app.exe` in a trusted app folder is `ui:test`, only where the test app is
+    /// trusted, which is a test channel's core only.
+    #[test] // spec: ARCH-045, ARCH-046, QA-066
+    fn test_app_is_ui_test_only_on_test_channels() {
+        let ui_test: CallerKind = "ui:test".parse().unwrap();
+        let ui_image: CallerKind = "ui:image".parse().unwrap();
+        let app = process(&format!(r"{TRUSTED}\lil-test-app.exe"), None);
+        let with = TrustedDirs {
+            test_app: true,
+            ..trusted()
+        };
+        let kind = |dirs: &TrustedDirs, declared: &CallerKind, client: &ProcessInfo| {
+            resolve_caller(declared, None, client, dirs, &NoEngineTokens, "t")
+                .unwrap()
+                .0
+        };
+        assert_eq!(kind(&with, &ui_test, &app), ui_test);
+        assert_eq!(kind(&trusted(), &ui_test, &app), CallerKind::Cli);
+        // Only that executable, only as `ui:test`, only from a trusted folder.
+        assert_eq!(kind(&with, &ui_image, &app), CallerKind::Cli);
+        let image_exe = process(&format!(r"{TRUSTED}\lil-image.exe"), None);
+        assert_eq!(kind(&with, &ui_test, &image_exe), CallerKind::Cli);
+        let elsewhere = process(r"C:\Temp\lil-test-app.exe", None);
+        assert_eq!(kind(&with, &ui_test, &elsewhere), CallerKind::Cli);
+
+        assert!(trusts_test_app(&Channel::Test("ab12cd34".into())));
+        assert!(!trusts_test_app(&Channel::Dev));
+        assert!(!trusts_test_app(&Channel::Stable));
+        let own = PathBuf::from(r"C:\build\debug");
+        assert!(TrustedDirs::for_env(&TestEnv::new().env, &own).test_app);
+        assert!(!TrustedDirs::own_dir(&own).test_app);
+        assert!(!TrustedDirs::installed(&own, &own).test_app);
     }
 
     /// A process table for [`claude_ancestor`].

@@ -2,7 +2,7 @@
 //! CORE-038): a real `lil-core` killed at every write-order step and between a seal and its
 //! manifest edit, a full disk in the middle of a commit, a manifest held open during a commit,
 //! a damaged or missing `index.db`, a damaged workspace `state.db`, and suite databases a core
-//! must refuse without changing anything.
+//! must refuse without changing anything, and a job whose core died in `submitting`.
 //!
 //! Crashes use the fail point action `abort` (`TerminateProcess` on the core itself), and a
 //! fresh core is started only after the dead one has been seen to exit. Every workspace and
@@ -887,4 +887,65 @@ fn legacy_conflict_copies_are_left_alone_and_not_indexed() {
         hash,
         "the copy changed after the core stopped"
     );
+}
+
+/// A real core killed right after an engine job's `submitting` is persisted (fail point
+/// `jobs.after_submitting`, CORE-120): the next core marks the job `interrupted`, or
+/// `interrupted_unknown` when it has external side effects, and its handler never runs again
+/// (ARCH-022, QA-007, M8 of the Task 8 review).
+#[test] // spec: ARCH-022, QA-007, QA-055, CORE-120
+fn crash_after_submitting_interrupts_the_job_and_never_reruns_it() {
+    for (external, status, substatus) in [
+        (false, "failed", "interrupted"),
+        (true, "running", "interrupted_unknown"),
+    ] {
+        let env = TestEnv::new();
+        let k = key();
+        {
+            let spec = failpoints::spec(&[("jobs.after_submitting", "abort")]);
+            let mut core = CoreFixture::start_with_env(&env, &[(failpoints::ENV, &spec)]);
+            let mut pipe = RawPipe::connect(&env);
+            assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 9_000_002,
+                "method": "tools/call",
+                "params": {
+                    "name": "test.job",
+                    "arguments": {
+                        "lane": "gpu-heavy",
+                        "engine": "comfyui",
+                        "external_side_effects": external,
+                    },
+                    "idempotency_key": k,
+                },
+            });
+            pipe.send_line(&request.to_string());
+            // The call may be answered before the job reaches the fail point; the core dies
+            // either way.
+            let _ = pipe.read_line(DEADLINE);
+            assert_eq!(
+                core.wait_exit(DEADLINE),
+                Some(ABORT_EXIT),
+                "the core didn't end at jobs.after_submitting"
+            );
+        }
+        let _core = CoreFixture::start(&env);
+        let mut pipe = RawPipe::connect(&env);
+        assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+        let listed = pipe.tool_ok("jobs.list", json!({}), None);
+        let jobs = listed["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1, "nothing ran again as a new job: {listed}");
+        let job = &jobs[0];
+        assert_eq!(
+            (job["status"].as_str(), job["substatus"].as_str()),
+            (Some(status), Some(substatus)),
+            "external {external}: {job}"
+        );
+        assert_eq!(job["attempt"], 1, "{job}");
+        assert!(
+            job.get("result").is_none(),
+            "the handler never finished: {job}"
+        );
+    }
 }

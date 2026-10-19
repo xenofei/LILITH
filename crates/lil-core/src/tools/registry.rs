@@ -18,8 +18,10 @@ use schemars::generate::SchemaSettings;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::stages::Settings;
+use super::dispatcher::Redispatch;
+use super::stages::{ConfirmedVia, Settings};
 use crate::events::EventBus;
+use crate::jobs::{JobCaller, JobId, JobOrigin, Jobs, SubmittedSlot};
 use crate::pipeline::RecordSlot;
 use crate::session::Session;
 use crate::workspace::OpenWorkspace;
@@ -44,6 +46,28 @@ pub struct CallCtx {
     /// Where the tool leaves what the Record stage writes (CORE-020): a tool that records an
     /// operation sets its [`RecordPlan`](crate::pipeline::RecordPlan) here during Execute.
     pub record: Arc<RecordSlot>,
+    /// The core's jobs: a tool whose work runs long submits a job and returns at once
+    /// (ARCH-034).
+    pub jobs: Arc<Jobs>,
+    /// Set by [`Jobs::submit`]: the dispatcher then leaves Meter and Record to the job.
+    pub submitted: Arc<SubmittedSlot>,
+    /// The cap reservation the reserve stage made for the call (`rv_<16 hex>`); a job the
+    /// call submits takes it over.
+    pub reservation: Option<String>,
+    /// Who confirmed the call, when a confirmation let it run.
+    pub confirmed_via: Option<ConfirmedVia>,
+    /// The call's idempotency key; `None` for a `read` tool.
+    pub idem_key: Option<String>,
+    /// The call's id (`c_<16 hex>`), under which the reserve stage reserved.
+    pub call_id: String,
+    /// The tool called and its (valid) arguments: a job the call submits keeps them, for
+    /// `job.retry` to dispatch them again.
+    pub tool: String,
+    pub arguments: serde_json::Value,
+    /// Set when the call runs as a retry of that job (`job.retry`).
+    pub retry_of: Option<JobId>,
+    /// The dispatcher, for `job.retry`; `None` outside one.
+    pub redispatch: Option<Redispatch>,
 }
 
 impl CallCtx {
@@ -52,6 +76,25 @@ impl CallCtx {
         self.project
             .clone()
             .unwrap_or_else(|| crate::projects::DEFAULT_PROJECT.to_string())
+    }
+
+    /// The jobs module's view of the call (CORE-010: `jobs` takes no `tools` type).
+    pub fn job_caller(&self) -> JobCaller {
+        JobCaller {
+            caller: self.session.caller.clone(),
+            idem_scope: format!("{}|{}", self.session.caller, self.session.workspace_id()),
+            workspace: self.workspace.clone(),
+            trace_id: self.trace_id.clone(),
+            idem_key: self.idem_key.clone(),
+            call_id: self.call_id.clone(),
+            reservation: self.reservation.clone(),
+            submitted: self.submitted.clone(),
+            origin: (!self.tool.is_empty()).then(|| JobOrigin {
+                tool: self.tool.clone(),
+                arguments: self.arguments.clone(),
+            }),
+            retry_of: self.retry_of.clone(),
+        }
     }
 
     /// The session's open workspace.

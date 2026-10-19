@@ -56,6 +56,17 @@ fn workspace() -> Ws {
 }
 
 impl Ws {
+    /// Joins the `state.db` actor, then removes the test's folder, which nothing holds open
+    /// any more, and fails the test if anything in it was left behind.
+    async fn shutdown(self) {
+        let Ws { state, env, .. } = self;
+        state.close();
+        drop(state);
+        if let Err(left) = env.close() {
+            panic!("the test's folder was left behind: {left:?}");
+        }
+    }
+
     fn at(env: TestEnv, root: PathBuf) -> Ws {
         let root = std::fs::canonicalize(root).unwrap();
         let text = root.to_string_lossy().into_owned();
@@ -313,6 +324,7 @@ async fn seal_moves_files_and_writes_a_read_only_snapshot() {
         orphans.iter().map(WsPath::as_str).collect::<Vec<_>>(),
         [format!("{ASSET}/v1.0.0").as_str()]
     );
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026
@@ -355,6 +367,7 @@ async fn derived_from_files_are_copied_not_moved() {
         ws.read(&format!("{ASSET}/v1.0.0/c.png")),
         ws.read(&format!("{ASSET}/candidates/r_1/c.png"))
     );
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-028
@@ -409,6 +422,7 @@ async fn source_moves_with_the_version_and_is_outside_the_content_hash() {
             "v1.0.0/source/sub/notes.txt"
         ]
     );
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026
@@ -466,6 +480,7 @@ async fn seals_of_one_asset_are_serialised() {
     assert_eq!(again.unwrap_err().to_error("t").code, "version.exists");
     assert_eq!(ws.tree(&format!("{ASSET}/candidates/r_3")), ["z.png"]);
     assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026, ARCH-074
@@ -506,6 +521,7 @@ async fn held_file_during_seal_is_retried() {
     assert!(start.elapsed() < Duration::from_secs(10));
     assert_eq!(sealed.files.len(), 1);
     assert!(ws.read_only(&format!("{ASSET}/v1.0.0/a.png")));
+    ws.shutdown().await;
 }
 
 /// Where each name of `names` is now: the number of copies in the run folder and in any
@@ -617,6 +633,7 @@ async fn seal_reports_post_move_identities() {
         assert_eq!(*identity, fresh, "{path}");
         assert_ne!(identity.attributes & FILE_ATTRIBUTE_READONLY, 0, "{path}");
     }
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026
@@ -655,6 +672,7 @@ async fn writes_into_sealed_folders_are_refused() {
         ws.tree(&format!("{ASSET}/v1.0.0")),
         ["a.png", "manifest.snapshot.json"]
     );
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-035
@@ -717,6 +735,7 @@ async fn locked_paths_are_refused_with_store_locked() {
         })
         .await
         .expect("the manifest edit");
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-033
@@ -757,6 +776,7 @@ async fn legacy_folder_is_listed_as_legacy() {
             .is_empty()
     );
     assert!(ws.env.root().exists());
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026
@@ -784,6 +804,7 @@ async fn seal_refuses_a_guard_that_isnt_the_assets_version_lock() {
         .seal(&own, request("r_1", "1.0.0", &["a.png"], m))
         .await
         .expect("the seal under the asset's lock");
+    ws.shutdown().await;
 }
 
 /// The real probe, except that it reports the files named `link_name` as symbolic links and
@@ -910,6 +931,7 @@ async fn crash_after_seal_leaves_the_version_as_an_orphan() {
         [format!("{ASSET}/v1.0.0").as_str()]
     );
     assert!(ws.exists(&format!("{ASSET}/v1.0.0/a.png")));
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: ARCH-083, CORE-026
@@ -938,6 +960,7 @@ async fn seal_waits_at_the_git_gate_before_its_final_move() {
     );
     assert!(!ws.read_only(&format!("{ASSET}/candidates/r_1/a.png")));
     assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026, ARCH-079
@@ -974,6 +997,7 @@ async fn a_derived_file_edited_outside_is_never_sealed() {
     // During the seal: the derived file is saved just before its move into the sealing
     // folder (the second `store.replace`; the first copies a.png), so the check there finds
     // it and the seal is undone.
+    ws.shutdown().await;
     let ws = workspace();
     let m = ws.run(
         "r_1",
@@ -1004,6 +1028,7 @@ async fn a_derived_file_edited_outside_is_never_sealed() {
     assert_eq!(ws.read(&cut), b"saved outside mid-seal");
     assert!(!ws.read_only(&cut));
     assert!(ws.seal_folders().is_empty(), "{:?}", ws.seal_folders());
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-047, CORE-026 (ruling Q32)
@@ -1031,6 +1056,7 @@ async fn version_content_hashes_come_from_the_manifest() {
     assert_eq!(versions[0].content_hash, Some(sealed.content_hash.clone()));
     assert!(!versions[0].cloud_only);
     assert!(!versions[0].legacy);
+    ws.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1118,6 +1144,7 @@ async fn a_linked_version_folder_is_never_adopted_or_followed() {
         Some(lil_platform::fs::IO_REPARSE_TAG_MOUNT_POINT),
         "the junction is still there"
     );
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
@@ -1144,6 +1171,7 @@ async fn a_file_named_like_the_version_folder_is_version_exists() {
         ws.read(&format!("{ASSET}/candidates/r_1/a.png")),
         bytes_of("r_1", "a.png")
     );
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
@@ -1173,6 +1201,7 @@ async fn a_version_without_a_derived_file_still_in_the_run_is_not_adopted() {
         ["a.png", "manifest.snapshot.json"]
     );
     assert!(ws.exists(&format!("{ASSET}/candidates/r_1/a_cut.png")));
+    ws.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
@@ -1192,4 +1221,93 @@ async fn adoption_makes_writable_sealed_files_read_only_again() {
     }
     assert_eq!(ws.read(&a), bytes_of("r_1", "a.png"));
     assert_eq!(sealed.signed_off_date.as_deref(), Some("2027-01-15"));
+    ws.shutdown().await;
+}
+
+/// The real probe, except that `identity` of the path `fail_at` is access denied (error 5).
+#[derive(Debug)]
+struct FailingAt {
+    fail_at: PathBuf,
+}
+
+impl Probe for FailingAt {
+    fn identity(&self, path: &Path) -> io::Result<lil_platform::fs::FileIdentity> {
+        if path == self.fail_at {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+}
+
+/// Ledger Q34 carry: when the probe can't tell whether a path the seal checks is there, the
+/// seal fails with `store.io` instead of taking it as absent, and nothing moves. Both checks:
+/// step 1's version folder, and adoption's "a file the seal would have sealed is still in the
+/// run".
+#[tokio::test(start_paused = true)] // spec: CORE-026 (ruling Q34)
+async fn exists_now_fails_closed_on_a_probe_error() {
+    let store_failing_at = |ws: &Ws, rel: &str| {
+        Arc::new(
+            Store::new(
+                ws.root.clone(),
+                ws.state.clone(),
+                FailPoints::none(),
+                ws.clock.clone(),
+                Arc::new(SeqIds::new()),
+                Arc::new(FailingAt {
+                    fail_at: ws.file(rel),
+                }),
+            )
+            .with_machine("testmachine"),
+        )
+    };
+
+    // Step 1: the version folder can't be checked.
+    let ws = workspace();
+    let m = ws.run("r_1", &[("a.png", "candidate", None)]);
+    let req = request(
+        "r_1",
+        "1.0.0",
+        &["a.png"],
+        signed(m, "r_1", "1.0.0", &["a.png"]),
+    );
+    let store = store_failing_at(&ws, &format!("{ASSET}/v1.0.0"));
+    let result = seal(&store, req).await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+    assert!(!ws.exists(&format!("{ASSET}/v1.0.0")));
+    assert_eq!(
+        ws.read(&format!("{ASSET}/candidates/r_1/a.png")),
+        bytes_of("r_1", "a.png")
+    );
+
+    // Adoption: the version folder lacks a derived file, and whether the run still holds it
+    // can't be checked.
+    ws.shutdown().await;
+    let ws = workspace();
+    let req = unrecorded_seal(
+        &ws,
+        &[
+            ("a.png", "candidate", None),
+            ("a_cut.png", "derived", Some("a.png")),
+        ],
+        &["a.png"],
+    )
+    .await;
+    move_outside(
+        &ws.file(&format!("{ASSET}/v1.0.0/a_cut.png")),
+        &ws.env.root().join("away").join("a_cut.png"),
+    );
+    let before = ws.tree(&format!("{ASSET}/v1.0.0"));
+    let store = store_failing_at(&ws, &format!("{ASSET}/candidates/r_1/a_cut.png"));
+    let result = seal(&store, req).await;
+    assert!(matches!(result, Err(StoreError::Io { .. })), "{result:?}");
+    assert_eq!(ws.tree(&format!("{ASSET}/v1.0.0")), before);
+    ws.shutdown().await;
 }

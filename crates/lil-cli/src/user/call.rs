@@ -20,6 +20,13 @@ pub(super) fn run(
 ) -> Result<i32, Exit> {
     // Checked before any core is involved: a usage error never starts one.
     let args = arguments(args)?;
+    if tool == "workspace.doctor" && args.contains_key("offers") {
+        // An offer runs only after the person's own `y` (owner question 1).
+        return Err(cannot_run(
+            "workspace.doctor's offers run only through lil doctor, which asks first; run lil \
+             doctor in a terminal.",
+        ));
+    }
     let Some(client) = connect(global, UnknownCwdWorkspace::Fail)? else {
         return Ok(EXIT_OK);
     };

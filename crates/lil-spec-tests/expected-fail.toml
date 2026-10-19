@@ -2,4 +2,109 @@
 # e.g. name = "lil-spec-tests::smoke::spec_harness_runs" (the JUnit classname::name).
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
-tests = []
+#
+# Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
+# removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
+tests = [
+    # Task 14
+    # CORE-131, ARCH-052, ARCH-059
+    { name = "lil-spec-tests::comfy_engine::node_install_needs_confirmation_and_a_pinned_version", rule = "CORE-131", file = "tests/comfy_engine.rs" },
+    # ARCH-052, ARCH-053, ARCH-055, CORE-017, CORE-109, CORE-111, APP-044, APP-046
+    { name = "lil-spec-tests::confirmations::agent_destructive_call_waits_for_the_app_and_runs_once", rule = "ARCH-052", file = "tests/confirmations.rs" },
+    # CORE-115
+    { name = "lil-spec-tests::confirmations::denied_confirmation_is_confirm_denied", rule = "CORE-115", file = "tests/confirmations.rs" },
+    # CORE-115
+    { name = "lil-spec-tests::confirmations::expired_confirmation_is_confirm_expired", rule = "CORE-115", file = "tests/confirmations.rs" },
+    # ARCH-055, QA-016
+    { name = "lil-spec-tests::confirmations::non_interactive_agents_never_get_pending", rule = "ARCH-055", file = "tests/confirmations.rs" },
+    # CORE-016
+    { name = "lil-spec-tests::confirmations::retry_with_other_arguments_is_refused", rule = "CORE-016", file = "tests/confirmations.rs" },
+    # ARCH-020
+    { name = "lil-spec-tests::confirmations::pending_confirmation_keeps_the_core_up", rule = "ARCH-020", file = "tests/confirmations.rs" },
+    # Task 15
+    # CORE-081, CORE-082, CORE-083
+    { name = "lil-spec-tests::caps_meter::summary_keeps_bases_and_currencies_apart_and_adds_fixed_costs", rule = "CORE-081", file = "tests/caps_meter.rs" },
+    # CORE-064, CORE-065, CORE-069
+    { name = "lil-spec-tests::caps_meter::local_job_usage_has_energy_and_no_money", rule = "CORE-064", file = "tests/caps_meter.rs" },
+    # CORE-065
+    { name = "lil-spec-tests::telemetry::job_energy_is_split_by_sm_share", rule = "CORE-065", file = "tests/telemetry.rs" },
+    # Task 16
+    # CORE-091, APP-045
+    { name = "lil-spec-tests::caps_meter::cap_prompt_covers_the_cap_and_allow_once_runs_it", rule = "CORE-091", file = "tests/caps_meter.rs" },
+    # CORE-015, ARCH-056
+    { name = "lil-spec-tests::caps_meter::destructive_and_over_cap_share_one_prompt", rule = "CORE-015", file = "tests/caps_meter.rs" },
+    # QA-016, CORE-091
+    { name = "lil-spec-tests::caps_meter::non_interactive_over_cap_is_cap_exceeded", rule = "QA-016", file = "tests/caps_meter.rs" },
+    # CORE-008, ARCH-056
+    { name = "lil-spec-tests::caps_meter::only_the_app_changes_caps", rule = "CORE-008", file = "tests/caps_meter.rs" },
+    # CORE-087, QA-047, QA-056
+    { name = "lil-spec-tests::caps_meter::concurrent_calls_never_overshoot_a_cap", rule = "CORE-087", file = "tests/caps_meter.rs" },
+    # CORE-089
+    { name = "lil-spec-tests::caps_meter::cap_alerts_fire_once_per_level", rule = "CORE-089", file = "tests/caps_meter.rs" },
+    # CORE-090
+    { name = "lil-spec-tests::caps_meter::subscription_quota_never_counts_against_money_caps", rule = "CORE-090", file = "tests/caps_meter.rs" },
+    # CORE-071, CORE-088
+    { name = "lil-spec-tests::caps_meter::usage_is_written_ahead_and_survives_a_crash", rule = "CORE-071", file = "tests/caps_meter.rs" },
+    # ARCH-081, ARCH-099
+    { name = "lil-spec-tests::caps_meter::loose_calls_log_to_usage_loose_and_count_against_caps", rule = "ARCH-081", file = "tests/caps_meter.rs" },
+    # Task 17
+    # APP-078, APP-079
+    { name = "lil-spec-tests::resources_interchange::resources_round_trip_in_workspace_and_personal_scopes", rule = "APP-078", file = "tests/resources_interchange.rs" },
+    # APP-078, CORE-110
+    { name = "lil-spec-tests::resources_interchange::resource_save_over_an_existing_one_keeps_the_old_in_the_trash", rule = "APP-078", file = "tests/resources_interchange.rs" },
+    # APP-082, CORE-110
+    { name = "lil-spec-tests::resources_interchange::resource_delete_is_soft_and_asks_agents", rule = "APP-082", file = "tests/resources_interchange.rs" },
+    # APP-079
+    { name = "lil-spec-tests::resources_interchange::unknown_resource_kind_is_refused", rule = "APP-079", file = "tests/resources_interchange.rs" },
+    # APP-078
+    { name = "lil-spec-tests::resources_interchange::resource_changes_are_published", rule = "APP-078", file = "tests/resources_interchange.rs" },
+    # Task 18
+    # APP-061
+    { name = "lil-spec-tests::resources_interchange::handlers_for_lists_registered_apps", rule = "APP-061", file = "tests/resources_interchange.rs" },
+    # APP-063, APP-064, APP-065
+    { name = "lil-spec-tests::resources_interchange::open_in_returns_a_launch_command_and_never_launches", rule = "APP-063", file = "tests/resources_interchange.rs" },
+    # Task 19
+    # ARCH-012, AI-110, AI-111
+    { name = "lil-spec-tests::mcp_server::initialize_names_the_server_lil", rule = "ARCH-012", file = "tests/mcp_server.rs" },
+    # AI-110, AI-111, ARCH-054, CORE-112
+    { name = "lil-spec-tests::mcp_server::tools_are_lowered_with_markers_and_retry_token", rule = "AI-110", file = "tests/mcp_server.rs" },
+    # ARCH-054, CORE-112, APP-046
+    { name = "lil-spec-tests::mcp_server::mcp_destructive_call_follows_mcp_confirmation", rule = "ARCH-054", file = "tests/mcp_server.rs" },
+    # ARCH-047, ARCH-052
+    { name = "lil-spec-tests::mcp_server::mcp_spawned_from_a_shell_is_cli", rule = "ARCH-047", file = "tests/mcp_server.rs" },
+    # QA-002, CORE-091
+    { name = "lil-spec-tests::mcp_server::pending_is_a_normal_result_and_retry_token_continues", rule = "QA-002", file = "tests/mcp_server.rs" },
+    # ARCH-039, QA-010
+    { name = "lil-spec-tests::mcp_server::tool_errors_are_is_error_results", rule = "ARCH-039", file = "tests/mcp_server.rs" },
+    # ARCH-014, AI-108, QA-062
+    { name = "lil-spec-tests::mcp_server::incompatible_core_exposes_only_lil_status", rule = "ARCH-014", file = "tests/mcp_server.rs" },
+    # ARCH-018
+    { name = "lil-spec-tests::mcp_server::mcp_server_starts_the_core", rule = "ARCH-018", file = "tests/mcp_server.rs" },
+    # ARCH-045, ARCH-047, ARCH-052
+    { name = "lil-spec-tests::mcp_server::mcp_calls_stay_mcp_while_an_app_is_connected", rule = "ARCH-045", file = "tests/mcp_server.rs" },
+    # Task 20
+    # ARCH-105, CORE-116, QA-061
+    { name = "lil-spec-tests::plugin_hooks::delete_install_and_script_commands_ask", rule = "ARCH-105", file = "tests/plugin_hooks.rs" },
+    # ARCH-056, CORE-008
+    { name = "lil-spec-tests::plugin_hooks::suite_toml_writes_ask", rule = "ARCH-056", file = "tests/plugin_hooks.rs" },
+    # QA-061
+    { name = "lil-spec-tests::plugin_hooks::harmless_commands_pass", rule = "QA-061", file = "tests/plugin_hooks.rs" },
+    # ARCH-105, CORE-116
+    { name = "lil-spec-tests::plugin_hooks::comfy_mcp_install_update_download_restart_ask", rule = "ARCH-105", file = "tests/plugin_hooks.rs" },
+    # ARCH-106
+    { name = "lil-spec-tests::plugin_hooks::comfy_mcp_launch_and_stop_are_denied_while_a_core_runs", rule = "ARCH-106", file = "tests/plugin_hooks.rs" },
+    # ARCH-104, AI-116
+    { name = "lil-spec-tests::plugin_hooks::direct_log_and_manifest_writes_only_warn", rule = "ARCH-104", file = "tests/plugin_hooks.rs" },
+    # ARCH-107
+    { name = "lil-spec-tests::plugin_hooks::hooks_do_nothing_in_engine_a", rule = "ARCH-107", file = "tests/plugin_hooks.rs" },
+    # ARCH-103, AI-116
+    { name = "lil-spec-tests::plugin_hooks::session_start_reports_jobs_and_confirmations", rule = "ARCH-103", file = "tests/plugin_hooks.rs" },
+    # ARCH-103
+    { name = "lil-spec-tests::plugin_hooks::post_tool_use_tells_the_core", rule = "ARCH-103", file = "tests/plugin_hooks.rs" },
+    # ARCH-013, AI-107, ARCH-101
+    { name = "lil-spec-tests::plugin_hooks::plugin_uses_the_user_config_paths", rule = "ARCH-013", file = "tests/plugin_hooks.rs" },
+    # AI-117, ARCH-108
+    { name = "lil-spec-tests::doctor_claude::doctor_installs_the_plugin_only_after_yes", rule = "AI-117", file = "tests/doctor_claude.rs" },
+    # AI-114
+    { name = "lil-spec-tests::doctor_claude::doctor_writes_claude_rules_only_after_yes", rule = "AI-114", file = "tests/doctor_claude.rs" },
+]

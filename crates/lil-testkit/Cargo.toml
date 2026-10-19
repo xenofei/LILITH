@@ -7,13 +7,21 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The fake ComfyUI's websocket frames are split into a sink and a stream.
+futures-util.workspace = true
+# The fake ComfyUI's HTTP server (QA-066).
+hyper.workspace = true
+hyper-util.workspace = true
 lil-platform = { path = "../lil-platform" }
 lil-protocol = { path = "../lil-protocol" }
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "time"] }
+# io-std: lil-test-app relays its stdin and stdout; sync: the fake ComfyUI's queue and clients.
+tokio = { workspace = true, features = ["rt", "net", "io-util", "io-std", "sync", "time"] }
+# The fake ComfyUI's websocket (server) and the tests' websocket client.
+tokio-tungstenite.workspace = true
 toml.workspace = true
 
 [lints]

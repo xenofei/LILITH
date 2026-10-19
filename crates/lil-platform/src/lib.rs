@@ -4,14 +4,21 @@
 //! asks [`Env`] for data folders, per-workspace local data, the registry root, the credential
 //! prefix, the core pipe name, the notification identity and the Claude Code profile folders.
 //! It also owns the process environment variables, the clock and id traits, the harness
-//! guard, and the file layer (`fs`, `paths`) every file write goes through.
+//! guard, the file layer (`fs`, `paths`) every file write goes through, and the hardware and
+//! engine-process layer (`hw`, `job_object`, `engine_spawn`).
 
 pub mod clock;
 pub mod credentials;
+pub mod engine_spawn;
 pub mod env;
 pub mod fs;
 pub mod guard;
+pub mod hw;
+pub mod hw_fake;
+mod hw_nvml;
+mod hw_pdh;
 pub mod ids;
+pub mod job_object;
 pub mod known_folders;
 pub mod names;
 pub mod paths;
@@ -21,6 +28,7 @@ pub mod process_env;
 pub mod session_end;
 pub mod sid;
 pub mod sockets;
+pub mod sqlite_files;
 pub mod volume;
 pub mod watcher;
 

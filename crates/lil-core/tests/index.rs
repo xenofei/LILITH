@@ -393,8 +393,17 @@ fn hub(env: &TestEnv, probe: Arc<dyn Probe>) -> Arc<WorkspaceHub> {
     )
 }
 
-fn ctx(open: &Arc<OpenWorkspace>) -> CallCtx {
+fn ctx(open: &Arc<OpenWorkspace>, hub: &Arc<WorkspaceHub>) -> CallCtx {
     let clock: Arc<dyn Clock> = FakeClock::new();
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let jobs = lil_core::jobs::Jobs::new(
+        hub.states().clone(),
+        hub.clone(),
+        events.clone(),
+        clock,
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+    );
     CallCtx {
         session: Arc::new(Session {
             id: "s_0000000000000001".into(),
@@ -407,10 +416,20 @@ fn ctx(open: &Arc<OpenWorkspace>) -> CallCtx {
         }),
         trace_id: "t_index".into(),
         settings: Settings::default(),
-        events: Arc::new(EventBus::new(clock)),
+        events,
         workspace: Some(open.clone()),
         project: None,
         record: Arc::new(lil_core::pipeline::RecordSlot::new()),
+        jobs,
+        submitted: Arc::new(lil_core::jobs::SubmittedSlot::new()),
+        reservation: None,
+        confirmed_via: None,
+        idem_key: None,
+        call_id: String::new(),
+        tool: String::new(),
+        arguments: serde_json::Value::Null,
+        retry_of: None,
+        redispatch: None,
     }
 }
 
@@ -975,7 +994,7 @@ async fn read_only_workspace_uses_an_in_memory_index_and_leaves_index_db_alone()
     let ro_hub = hub(&env, Arc::new(SystemProbe));
     let ro = ro_hub.open(&ws).await.unwrap();
     assert_eq!(ro.access, Access::ReadOnly);
-    let page = call_ok(&ctx(&ro), "assets.query", json!({})).await;
+    let page = call_ok(&ctx(&ro, &ro_hub), "assets.query", json!({})).await;
     assert_eq!(page["total"], 2, "{page}");
     assert_eq!(
         ids(&page),
@@ -1168,7 +1187,7 @@ async fn read_tools_wait_for_the_first_reconcile() {
         "the first reconcile never started"
     );
 
-    let call_ctx = ctx(&open);
+    let call_ctx = ctx(&open, &hub);
     let pending = tokio::spawn(async move { call(&call_ctx, "assets.query", json!({})).await });
     // The index itself answers meanwhile; the tool waits.
     let direct = open.index.assets(query()).await.unwrap();
@@ -1367,7 +1386,7 @@ async fn asset_get_reports_legacy_versions_and_next_versions() {
     let ws = workspace_ref(&env.copy_fixture_workspace("get"));
     let hub = hub(&env, Arc::new(SystemProbe));
     let open = hub.open(&ws).await.unwrap();
-    let c = ctx(&open);
+    let c = ctx(&open, &hub);
 
     let lamp = call_ok(
         &c,
@@ -1513,7 +1532,7 @@ async fn assets_query_filters_by_project_status_type_and_text() {
     );
     let hub = hub(&env, Arc::new(SystemProbe));
     let open = hub.open(&ws).await.unwrap();
-    let c = ctx(&open);
+    let c = ctx(&open, &hub);
     let q = |args: Value| {
         let c = c.clone();
         async move { ids(&call_ok(&c, "assets.query", args).await) }
@@ -1728,7 +1747,7 @@ async fn assets_query_cursor_allows_a_new_limit() {
     let ws = small_workspace(&env, &specs);
     let hub = hub(&env, Arc::new(SystemProbe));
     let open = hub.open(&ws).await.unwrap();
-    let c = ctx(&open);
+    let c = ctx(&open, &hub);
     let first = call_ok(&c, "assets.query", json!({"limit": 97})).await;
     assert_eq!(ids(&first).len(), 97);
     assert_eq!(first["total"], 300);
@@ -1763,7 +1782,7 @@ async fn assets_query_cursor_survives_an_unrelated_write() {
     let ws = small_workspace(&env, &specs);
     let hub = hub(&env, Arc::new(SystemProbe));
     let open = hub.open(&ws).await.unwrap();
-    let c = ctx(&open);
+    let c = ctx(&open, &hub);
     let all = call_ok(&c, "assets.query", json!({"limit": 8})).await;
     let want: Vec<String> = ids(&all)[4..8].to_vec();
     let first = call_ok(&c, "assets.query", json!({"limit": 4})).await;
@@ -1800,7 +1819,7 @@ async fn assets_query_cursor_of_another_query_is_params_invalid() {
     let ws = workspace_ref(&env.copy_fixture_workspace("cursor"));
     let hub = hub(&env, Arc::new(SystemProbe));
     let open = hub.open(&ws).await.unwrap();
-    let c = ctx(&open);
+    let c = ctx(&open, &hub);
     let first = call_ok(
         &c,
         "assets.query",
@@ -2007,7 +2026,7 @@ async fn read_tools_answer_store_io_until_a_whole_reconcile_succeeds() {
     let probe = FakeProbe::with(|b| b.volume = Volume::Panics);
     let hub = hub(&env, probe.clone());
     let open = hub.open(&ws).await.unwrap();
-    let c = ctx(&open);
+    let c = ctx(&open, &hub);
     let refused = tokio::time::timeout(DEADLINE, call(&c, "assets.query", json!({})))
         .await
         .expect("the query answered")

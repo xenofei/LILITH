@@ -7,16 +7,19 @@ use lil_platform::Clock;
 
 /// A clock that stands still until [`FakeClock::advance`] or [`FakeClock::shift_utc`] moves
 /// it. Monotonic time starts at zero; UTC starts at a fixed instant (2027-01-15T08:00:00Z), so
-/// runs are reproducible.
+/// runs are reproducible. The local offset is 0 (UTC) until [`FakeClock::set_offsets`] scripts
+/// it.
 #[derive(Debug)]
 pub struct FakeClock {
     state: Mutex<State>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct State {
     monotonic: Duration,
     utc: SystemTime,
+    /// `(from, offset)`, sorted by `from`.
+    offsets: Vec<(SystemTime, i32)>,
 }
 
 /// The fixed UTC start: 2027-01-15T08:00:00Z.
@@ -28,6 +31,7 @@ impl FakeClock {
             state: Mutex::new(State {
                 monotonic: Duration::ZERO,
                 utc: UNIX_EPOCH + Duration::from_secs(UTC_START_SECS),
+                offsets: Vec::new(),
             }),
         })
     }
@@ -47,6 +51,15 @@ impl FakeClock {
         s.utc = if by >= 0 { s.utc + d } else { s.utc - d };
     }
 
+    /// Scripts the local offset: each `(from, offset)` holds from `from` until the next entry;
+    /// before the first entry, the first entry's offset holds. Replaces any earlier script; the
+    /// entries may come in any order.
+    pub fn set_offsets(&self, offsets: &[(SystemTime, i32)]) {
+        let mut offsets = offsets.to_vec();
+        offsets.sort_by_key(|&(from, _)| from);
+        self.lock().offsets = offsets;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         // A test that panicked while holding the lock leaves a usable value.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -60,6 +73,18 @@ impl Clock for FakeClock {
 
     fn utc_now(&self) -> SystemTime {
         self.lock().utc
+    }
+
+    fn local_offset_secs(&self, utc: SystemTime) -> i32 {
+        let s = self.lock();
+        let Some(&(_, first)) = s.offsets.first() else {
+            return 0;
+        };
+        s.offsets
+            .iter()
+            .take_while(|&&(from, _)| from <= utc)
+            .last()
+            .map_or(first, |&(_, offset)| offset)
     }
 }
 
