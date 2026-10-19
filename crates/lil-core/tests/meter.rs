@@ -860,11 +860,15 @@ async fn local_job_record_has_energy_and_cost_zero_with_energy_cost_apart() {
     assert!(e.measured.gpu && e.measured.cpu, "{e:?}");
     assert!(e.cpu_mj_gross > 0, "{e:?}");
     assert_eq!(e.workspace, "loose");
-    let span = lil_core::telemetry::parse_ts(&e.to).unwrap()
-        - lil_core::telemetry::parse_ts(&e.from).unwrap();
+    // The window (10 s, 20 s] holds the samples of seconds 11 to 20: from and to are theirs.
+    let t0 = 1_800_000_000_000;
     assert_eq!(
-        span, 10_000,
-        "from and to are the window's wall times: {e:?}"
+        (e.from.clone(), e.to.clone()),
+        (
+            lil_core::telemetry::format_ts(t0 + 11_000),
+            lil_core::telemetry::format_ts(t0 + 20_000)
+        ),
+        "{e:?}"
     );
 
     let found = lines_of(&rig.loose(), "job_id", &job.job_id);

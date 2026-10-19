@@ -6,13 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 15
-    # CORE-081, CORE-082, CORE-083
-    { name = "lil-spec-tests::caps_meter::summary_keeps_bases_and_currencies_apart_and_adds_fixed_costs", rule = "CORE-081", file = "tests/caps_meter.rs" },
-    # CORE-064, CORE-065, CORE-069
-    { name = "lil-spec-tests::caps_meter::local_job_usage_has_energy_and_no_money", rule = "CORE-064", file = "tests/caps_meter.rs" },
-    # CORE-065
-    { name = "lil-spec-tests::telemetry::job_energy_is_split_by_sm_share", rule = "CORE-065", file = "tests/telemetry.rs" },
     # Task 16
     # CORE-091, APP-045
     { name = "lil-spec-tests::caps_meter::cap_prompt_covers_the_cap_and_allow_once_runs_it", rule = "CORE-091", file = "tests/caps_meter.rs" },

@@ -44,8 +44,8 @@ fn mw_for(mw: u32, ms: u64) -> u64 {
 
 /// A job's energy over its execution windows (module docs). `slices[i]` is the telemetry of
 /// `windows[i]` (a missing slice counts as an empty one). `from` and `to` are left empty: they
-/// are wall times, which the caller maps from the first window's start and the last one's end
-/// (`Telemetry::wall_ms`).
+/// are wall times, which the caller takes from the windows' samples (`Telemetry::sample_span`,
+/// else `Telemetry::wall_ms` of a window's ends).
 pub fn attribute(
     job_id: &str,
     workspace: &str,

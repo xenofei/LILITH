@@ -1021,9 +1021,25 @@ impl Telemetry {
     }
 
     /// The wall time (Unix ms) of a monotonic time of this core run, as the samples' times are
-    /// mapped: a job's execution window as `JobEnergy`'s `from` and `to`.
+    /// mapped: a window's ends as `JobEnergy`'s `from` and `to` when it holds no sample.
     pub fn wall_ms(&self, mono: Duration) -> i64 {
         self.inner.run + (mono_ms(mono) - self.inner.run_mono_ms)
+    }
+
+    /// The times (Unix ms) of the first and the last sample [`Telemetry::energy_between`] takes
+    /// for the same stretch, so a `telemetry.series` over them (both bounds included) holds
+    /// exactly those samples; `None` when it holds none, or the database can't be read.
+    pub async fn sample_span(&self, from: Duration, to: Duration) -> Option<(i64, i64)> {
+        let inner = self.inner.clone();
+        let (from_ms, to_ms) = (mono_ms(from), mono_ms(to));
+        tokio::task::spawn_blocking(move || inner.db.sample_span(inner.run, from_ms, to_ms))
+            .await
+            .ok()
+            .and_then(|r| {
+                r.map_err(|e| tracing::warn!(error = %e, "a job's sample times could not be read"))
+                    .ok()
+                    .flatten()
+            })
     }
 
     /// Stores a job's energy. The caller is `meter`, the only writer; a second write for the

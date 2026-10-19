@@ -605,10 +605,22 @@ impl Meter {
                 .as_ref()
                 .map_or_else(|| record::LOOSE.to_string(), |w| w.ws.id.clone());
             let mut e = attribute(job.id.as_str(), &workspace, &windows, &slices, &self.power);
-            let start = windows.iter().map(|w| w.start).min().unwrap_or_default();
-            let end = windows.iter().map(|w| w.end).max().unwrap_or_default();
-            e.from = format_ts(self.telemetry.wall_ms(start));
-            e.to = format_ts(self.telemetry.wall_ms(end));
+            // `from` and `to` are the times of the windows' first and last samples, so a series
+            // over them holds exactly the samples the energy came from; a window without a
+            // sample counts with its own ends, mapped to wall times.
+            let (mut from, mut to) = (i64::MAX, i64::MIN);
+            for w in &windows {
+                let (first, last) = match self.telemetry.sample_span(w.start, w.end).await {
+                    Some(span) => span,
+                    None => (
+                        self.telemetry.wall_ms(w.start),
+                        self.telemetry.wall_ms(w.end),
+                    ),
+                };
+                (from, to) = (from.min(first), to.max(last));
+            }
+            e.from = format_ts(from);
+            e.to = format_ts(to);
             if let Err(err) = self.telemetry.put_job_energy(&e).await {
                 tracing::warn!(job_id = %job.id, error = %err.message, "a job's energy could not be stored");
             }
