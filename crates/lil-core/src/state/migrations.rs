@@ -106,8 +106,26 @@ CREATE TABLE model_hashes (
     sha256 TEXT NOT NULL
 );";
 
+/// Suite migration 5 (ruling P3-R27): the paid outside ComfyUI prompts the suite has seen
+/// (ARCH-057, CORE-093), by prompt id, so each gets exactly one usage line across restarts and
+/// crashes. `classes` is the JSON list of partner classes; `first_seen_utc` is when the suite
+/// first saw it; `recorded_utc` is when its usage line was written (`NULL`: still open).
+const OUTSIDE_PAID: &str = "CREATE TABLE outside_paid (
+    prompt_id TEXT PRIMARY KEY,
+    classes TEXT NOT NULL,
+    first_seen_utc INTEGER NOT NULL,
+    recorded_utc INTEGER
+);
+CREATE INDEX outside_paid_open ON outside_paid(prompt_id) WHERE recorded_utc IS NULL;";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
-pub const SUITE_MIGRATIONS: &[&str] = &[IDEMPOTENCY_V1, IDEMPOTENCY_PRUNE_V2, JOBS, COMFY_CACHE];
+pub const SUITE_MIGRATIONS: &[&str] = &[
+    IDEMPOTENCY_V1,
+    IDEMPOTENCY_PRUNE_V2,
+    JOBS,
+    COMFY_CACHE,
+    OUTSIDE_PAID,
+];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
 pub const WORKSPACE_MIGRATIONS: &[&str] =
@@ -183,7 +201,7 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 4);
+        assert_eq!(SUITE_MIGRATIONS.len(), 5);
         assert_eq!(WORKSPACE_MIGRATIONS.len(), 4);
     }
 

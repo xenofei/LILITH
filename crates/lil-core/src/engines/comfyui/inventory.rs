@@ -59,6 +59,8 @@ pub struct Inventory {
     pub files: Vec<ModelFile>,
     /// RFC 3339 UTC.
     pub refreshed: String,
+    /// ComfyUI's command line (`system_stats.system.argv`): where it looks for models.
+    pub argv: Vec<String>,
 }
 
 impl Inventory {
@@ -104,10 +106,26 @@ struct Found {
     id: FileIdentity,
 }
 
+/// What a walk found: the model files, and the folders it could not read (their cached rows
+/// are kept: the folder may be back next time).
+#[derive(Default)]
+struct Walked {
+    files: Vec<Found>,
+    unreadable: Vec<String>,
+}
+
+/// Asked between files and between the chunks of a file being hashed.
+pub type Cancelled = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// A cached row: size, mtime, FileId and SHA-256.
+type Row = (u64, i64, String, String);
+
 /// The model files below `models_dir`, with their hashes (module docs): a file whose path,
-/// size, mtime and FileId match its cached row is not read; the others are hashed through
-/// `probe` and the cache is updated (rows of files gone from `models_dir` are dropped).
-/// `cancelled` is asked between files. A missing `models_dir` has no files.
+/// size, mtime and FileId match its cached row is not read, nor one whose volume and FileId, size and
+/// mtime match another row (the same file reached through another link); the others are
+/// hashed through `probe` and the cache is updated. Rows of files gone from `models_dir` are
+/// dropped, but not those below a folder that could not be read. `cancelled` is asked
+/// between files and every chunk of a hash. A missing `models_dir` has no files.
 ///
 /// # Errors
 /// [`ScanError`].
@@ -115,17 +133,17 @@ pub async fn scan(
     models_dir: &Path,
     probe: Arc<dyn Probe>,
     db: Arc<StateDb>,
-    cancelled: impl Fn() -> bool,
+    cancelled: Cancelled,
 ) -> Result<Vec<ModelFile>, ScanError> {
     let dir = models_dir.to_path_buf();
     let walk_probe = probe.clone();
-    let found = tokio::task::spawn_blocking(move || walk(&dir, walk_probe.as_ref()))
+    let walked = tokio::task::spawn_blocking(move || walk(&dir, walk_probe.as_ref()))
         .await
         .unwrap_or_default();
     let prefix = format!("{}\\", models_dir.display()).to_lowercase();
-    let cached: HashMap<String, (u64, i64, String, String)> = db
+    let cached: HashMap<String, Row> = db
         .call(move |conn| {
-            let run = || -> rusqlite::Result<HashMap<String, (u64, i64, String, String)>> {
+            let run = || -> rusqlite::Result<HashMap<String, Row>> {
                 let mut st =
                     conn.prepare("SELECT path, size, mtime, file_id, sha256 FROM model_hashes")?;
                 let rows = st.query_map([], |r| {
@@ -145,45 +163,68 @@ pub async fn scan(
         })
         .await
         .map_err(|e| ScanError::State(e.to_string()))?;
-    let mut files = Vec::with_capacity(found.len());
+    let by_identity: HashMap<(String, u64, i64), String> = cached
+        .values()
+        .filter(|(_, _, id, _)| !id.is_empty())
+        .map(|(size, mtime, id, sha)| ((id.clone(), *size, *mtime), sha.clone()))
+        .collect();
+    let mut files = Vec::with_capacity(walked.files.len());
     let mut fresh: Vec<(String, u64, i64, String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for f in found {
+    for f in walked.files {
         if cancelled() {
             return Err(ScanError::Cancelled);
         }
         let key = f.abs.display().to_string();
         seen.insert(key.clone());
-        let file_id = f.id.file_id.map(|b| hex(&b)).unwrap_or_default();
+        let file_id = identity_key(&f.id).unwrap_or_default();
+        let known = match cached.get(&key) {
+            Some((size, mtime, id, sha))
+                if *size == f.id.size && *mtime == f.id.last_write && *id == file_id =>
+            {
+                Some(sha.clone())
+            }
+            _ if !file_id.is_empty() => by_identity
+                .get(&(file_id.clone(), f.id.size, f.id.last_write))
+                .cloned(),
+            _ => None,
+        };
         let sha256 = if f.id.is_cloud_placeholder() {
             None
+        } else if let Some(sha) = known {
+            if !cached.contains_key(&key) {
+                fresh.push((
+                    key.clone(),
+                    f.id.size,
+                    f.id.last_write,
+                    file_id,
+                    sha.clone(),
+                ));
+            }
+            Some(sha)
         } else {
-            match cached.get(&key) {
-                Some((size, mtime, id, sha))
-                    if *size == f.id.size && *mtime == f.id.last_write && *id == file_id =>
-                {
-                    Some(sha.clone())
+            let (abs, p, stop) = (f.abs.clone(), probe.clone(), cancelled.clone());
+            match tokio::task::spawn_blocking(move || hash_file(p.as_ref(), &abs, stop.as_ref()))
+                .await
+            {
+                Ok(Ok(sha)) => {
+                    fresh.push((
+                        key.clone(),
+                        f.id.size,
+                        f.id.last_write,
+                        file_id,
+                        sha.clone(),
+                    ));
+                    Some(sha)
                 }
-                _ => {
-                    let (abs, p) = (f.abs.clone(), probe.clone());
-                    match tokio::task::spawn_blocking(move || hash_file(p.as_ref(), &abs)).await {
-                        Ok(Ok(sha)) => {
-                            fresh.push((
-                                key.clone(),
-                                f.id.size,
-                                f.id.last_write,
-                                file_id,
-                                sha.clone(),
-                            ));
-                            Some(sha)
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(file = %f.abs.display(), error = %e, "a model file could not be hashed");
-                            None
-                        }
-                        Err(_) => None,
-                    }
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    return Err(ScanError::Cancelled);
                 }
+                Ok(Err(e)) => {
+                    tracing::warn!(file = %f.abs.display(), error = %e, "a model file could not be hashed");
+                    None
+                }
+                Err(_) => None,
             }
         };
         files.push(ModelFile {
@@ -192,9 +233,15 @@ pub async fn scan(
             sha256,
         });
     }
+    let kept: Vec<String> = walked.unreadable.iter().map(|d| d.to_lowercase()).collect();
     let gone: Vec<String> = cached
         .keys()
-        .filter(|k| k.to_lowercase().starts_with(&prefix) && !seen.contains(*k))
+        .filter(|k| {
+            let lower = k.to_lowercase();
+            lower.starts_with(&prefix)
+                && !seen.contains(*k)
+                && !kept.iter().any(|d| lower.starts_with(&format!("{d}\\")))
+        })
         .cloned()
         .collect();
     if !fresh.is_empty() || !gone.is_empty() {
@@ -223,13 +270,42 @@ pub async fn scan(
     Ok(files)
 }
 
+/// The paths below `models_dir` of its model files (as [`ModelFile::path`]), found by walking
+/// it again with no hashing: the model check looks here before it refuses a reference the
+/// inventory doesn't hold (a model added while ComfyUI runs). Reads folders only: call it off
+/// the runtime's threads.
+pub fn list_paths(models_dir: &Path, probe: &dyn Probe) -> Vec<String> {
+    walk(models_dir, probe)
+        .files
+        .into_iter()
+        .map(|f| f.rel)
+        .collect()
+}
+
 /// Every model file below `dir` (module docs), with its identity; unreadable entries are
-/// logged and left out.
-fn walk(dir: &Path, probe: &dyn Probe) -> Vec<Found> {
-    let mut out = Vec::new();
+/// logged and left out. Each folder is walked once, by its volume and FileId (else its resolved
+/// path), so a linked folder
+/// that loops, or two links to one folder, list each file once.
+fn walk(dir: &Path, probe: &dyn Probe) -> Walked {
+    let mut out = Walked::default();
+    let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<(PathBuf, String, usize)> = vec![(dir.to_path_buf(), String::new(), 0)];
     while let Some((at, rel, depth)) = stack.pop() {
+        // The folder itself, past any link: its volume and FileId (re-review N3), else its
+        // resolved path.
+        let resolved = std::fs::canonicalize(&at).unwrap_or_else(|_| at.clone());
+        let key = probe
+            .identity(&resolved)
+            .ok()
+            .and_then(|id| identity_key(&id))
+            .unwrap_or_else(|| resolved.display().to_string().to_lowercase());
+        if !visited.insert(key) {
+            continue;
+        }
         let Ok(entries) = probe.read_dir(&at) else {
+            if depth > 0 {
+                out.unreadable.push(at.display().to_string());
+            }
             continue;
         };
         for entry in entries.filter_map(Result::ok) {
@@ -251,7 +327,7 @@ fn walk(dir: &Path, probe: &dyn Probe) -> Vec<Found> {
                 continue;
             }
             match probe.identity(&path) {
-                Ok(id) => out.push(Found {
+                Ok(id) => out.files.push(Found {
                     abs: path,
                     rel: rel_path,
                     id,
@@ -265,12 +341,30 @@ fn walk(dir: &Path, probe: &dyn Probe) -> Vec<Found> {
     out
 }
 
-/// The SHA-256 of `path`'s data, read through `probe`.
-fn hash_file(probe: &dyn Probe, path: &Path) -> std::io::Result<String> {
+/// `<volume serial>-<FileId>` (hex): what identifies a file or folder across links, `None`
+/// without a FileId.
+fn identity_key(id: &FileIdentity) -> Option<String> {
+    id.file_id
+        .map(|f| format!("{:016x}-{}", id.volume_serial, hex(&f)))
+}
+
+/// The SHA-256 of `path`'s data, read through `probe`; `cancelled` is asked before each
+/// chunk, and ends it with [`std::io::ErrorKind::Interrupted`].
+fn hash_file(
+    probe: &dyn Probe,
+    path: &Path,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> std::io::Result<String> {
     let mut file = probe.open_read(path)?;
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     loop {
+        if cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "the hash was cancelled",
+            ));
+        }
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -279,7 +373,6 @@ fn hash_file(probe: &dyn Probe, path: &Path) -> std::io::Result<String> {
     }
     Ok(hex(&hash.finalize()))
 }
-
 /// The `structured.models` entries of `files`, named from `registry` where the hash matches
 /// (module docs).
 pub fn model_entries(
@@ -362,7 +455,9 @@ impl InventoryHandler {
             ))));
         };
         let comfy = engines.comfy().clone();
-        let epoch = job.spec.args["epoch"].as_u64().unwrap_or(0);
+        // The readiness epoch it inventories is the one when it starts (review M5): one that
+        // waited in the queue across a reconnect still counts for the engine now.
+        let epoch = comfy.ready_epoch();
         let Some(client) = comfy.client().cloned() else {
             return Err(JobFailure::Final(trace(ErrorBody::new(
                 &codes::ENGINE_NOT_CONFIGURED,
@@ -377,6 +472,13 @@ impl InventoryHandler {
                 "",
             )))
         })?;
+        let argv: Vec<String> = stats["system"]["argv"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
         let root = comfy.config().and_then(|c| c.root.clone());
         let driver = comfy.driver();
         let captured = comfy.now_rfc3339();
@@ -403,7 +505,7 @@ impl InventoryHandler {
                     &root.join("models"),
                     self.probe.clone(),
                     comfy.suite_state(),
-                    move || *cancel.borrow(),
+                    Arc::new(move || *cancel.borrow()),
                 )
                 .await
                 .map_err(|e| match e {
@@ -424,6 +526,7 @@ impl InventoryHandler {
                 Inventory {
                     files,
                     refreshed: captured,
+                    argv,
                 },
             );
         }

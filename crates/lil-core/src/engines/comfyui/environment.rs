@@ -46,11 +46,18 @@ fn nodes_as_objects<S: serde::Serializer>(
 /// The capture for an engine whose folder is `root` (none known: no revisions). Reads files
 /// only: call it off the runtime's threads.
 pub fn capture(
-    system_stats: Value,
+    mut system_stats: Value,
     driver: Option<String>,
     root: Option<&Path>,
     captured: String,
 ) -> EnvCapture {
+    if let Some(argv) = system_stats
+        .get_mut("system")
+        .and_then(|s| s.get_mut("argv"))
+        .and_then(Value::as_array_mut)
+    {
+        blank_secret_args(argv);
+    }
     let comfyui = root.and_then(|r| {
         let (rev, version) = revision(r);
         rev.or(version)
@@ -75,6 +82,45 @@ pub fn capture(
         comfyui,
         nodes,
         captured,
+    }
+}
+
+/// The value of every flag whose name looks like a secret's (the scrubbed environment's
+/// words, ruling P3-R19: `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`,
+/// `AUTH`) becomes `"…"`, in either form (`--api-key x`, `--api-key=x`): a launcher may pass
+/// one, and the capture lands in a job's result.
+pub fn blank_secret_args(argv: &mut [Value]) {
+    const WORDS: [&str; 7] = [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ];
+    let secret = |flag: &str| {
+        let name = flag.trim_start_matches('-').to_ascii_uppercase();
+        flag.starts_with('-') && WORDS.iter().any(|w| name.contains(w))
+    };
+    let mut blank_next = false;
+    for arg in argv.iter_mut() {
+        let Some(text) = arg.as_str().map(str::to_string) else {
+            blank_next = false;
+            continue;
+        };
+        // A flag that takes no value is followed by another flag, which is kept.
+        if blank_next && !text.starts_with('-') {
+            *arg = Value::from("…");
+            blank_next = false;
+            continue;
+        }
+        blank_next = false;
+        match text.split_once('=') {
+            Some((flag, _)) if secret(flag) => *arg = Value::from(format!("{flag}=…")),
+            None if secret(&text) => blank_next = true,
+            _ => {}
+        }
     }
 }
 

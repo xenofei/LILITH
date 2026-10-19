@@ -234,6 +234,21 @@ impl ComfyClient {
             .map_err(|e| ComfyError::Protocol(format!("/{path}: {e}")))
     }
 
+    /// `GET <path>` as JSON whose parts may come from an outside client (its `extra_data`,
+    /// its workflow): anything nested deeper than [`MAX_OUTSIDE_DEPTH`] is read as `null`
+    /// ([`cap_depth`]), so a deep value can't fail the whole answer.
+    async fn get_outside_json(&self, path: &str) -> Result<Value, ComfyError> {
+        let response = self
+            .http
+            .get(self.endpoint(path)?)
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let text = checked(response).await?.text().await.map_err(unreachable)?;
+        serde_json::from_str(&cap_depth(&text, MAX_OUTSIDE_DEPTH))
+            .map_err(|e| ComfyError::Protocol(format!("/{path}: {e}")))
+    }
+
     /// `GET /system_stats`: ComfyUI's version, Python, devices.
     ///
     /// # Errors
@@ -494,27 +509,38 @@ impl ComfyClient {
     /// # Errors
     /// [`ComfyError`].
     pub async fn outside_queue(&self) -> Result<QueueView, ComfyError> {
-        Ok(queue_view(&self.get_json("api/queue").await?))
+        Ok(queue_view(&self.get_outside_json("api/queue").await?))
     }
 
-    /// `GET /api/jobs/{id}`: the entry, or `None` when ComfyUI doesn't know it (404).
+    /// `GET /api/jobs/{id}`: the entry, or `None` when ComfyUI doesn't know it (404). The id
+    /// may be an outside client's text, so it is percent-encoded as one path segment.
     ///
     /// # Errors
     /// [`ComfyError`].
     pub async fn job_detail(&self, prompt_id: &str) -> Result<Option<Value>, ComfyError> {
-        match self.get_json(&format!("api/jobs/{prompt_id}")).await {
+        // `.` and `..` stay dot segments even percent-encoded: no such id is looked up.
+        if prompt_id.is_empty() || prompt_id.bytes().all(|b| b == b'.') {
+            return Ok(None);
+        }
+        match self
+            .get_outside_json(&format!("api/jobs/{}", path_segment(prompt_id)))
+            .await
+        {
             Ok(v) => Ok(Some(v)),
             Err(ComfyError::Http(404, _)) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// `GET /api/jobs` (its first page).
+    /// `GET /api/jobs?limit=<limit>&sort_order=desc`: the newest `limit` prompts (ComfyUI keeps
+    /// up to 10,000 and has no default limit).
     ///
     /// # Errors
     /// [`ComfyError`].
-    pub async fn jobs(&self) -> Result<Vec<RemoteJob>, ComfyError> {
-        let page = self.get_json("api/jobs").await?;
+    pub async fn jobs(&self, limit: u32) -> Result<Vec<RemoteJob>, ComfyError> {
+        let page = self
+            .get_outside_json(&format!("api/jobs?limit={limit}&sort_order=desc"))
+            .await?;
         Ok(page
             .get("jobs")
             .and_then(Value::as_array)
@@ -545,6 +571,84 @@ impl ComfyClient {
     pub async fn node_replacements(&self) -> Result<Value, ComfyError> {
         self.get_json("node_replacements").await
     }
+}
+
+/// How deep an outside answer is read ([`ComfyClient::get_outside_json`]): far below serde's
+/// limit of 128, far above where the suite reads anything (a graph's class is at depth 5).
+pub const MAX_OUTSIDE_DEPTH: usize = 64;
+
+/// `text` (JSON) with every array or object nested deeper than `max` replaced by `null`.
+/// Strings are skipped whole (with their escapes), so brackets inside them don't count. Text
+/// that isn't JSON stays as broken as it was.
+pub fn cap_depth(text: &str, max: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut i = 0;
+    let mut kept = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'[' | b'{' if depth == max => {
+                // Skip the whole value, strings included.
+                out.push_str(&text[kept..i]);
+                out.push_str("null");
+                let mut inner = 0usize;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'"' => {
+                            i += 1;
+                            while i < bytes.len() && bytes[i] != b'"' {
+                                i += if bytes[i] == b'\\' { 2 } else { 1 };
+                            }
+                        }
+                        b'[' | b'{' => inner += 1,
+                        b']' | b'}' => {
+                            inner -= 1;
+                            if inner == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                kept = i.min(bytes.len());
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&text[kept.min(text.len())..]);
+    out
+}
+
+/// `s` percent-encoded as one URL path segment (everything but unreserved characters).
+fn path_segment(s: &str) -> String {
+    use std::fmt::Write as _;
+    s.bytes()
+        .fold(String::with_capacity(s.len()), |mut out, b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                out.push(char::from(b));
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+            out
+        })
 }
 
 /// The running and pending entries of a `/queue` answer.
@@ -619,4 +723,30 @@ async fn checked_up_to(
         body.truncate(end);
     }
     Err(ComfyError::Http(status.as_u16(), body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] // spec: ARCH-060
+    fn outside_ids_are_one_encoded_path_segment() {
+        assert_eq!(
+            path_segment("00000000-0000-4000-8000-000000000001"),
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(path_segment("a/b?c#d e%"), "a%2Fb%3Fc%23d%20e%25");
+        assert_eq!(path_segment("..\\x"), "..%5Cx");
+    }
+
+    #[test] // spec: ARCH-069
+    fn deep_values_are_read_as_null_and_strings_are_skipped() {
+        let deep = format!(
+            "{{\"a\": {}1{}, \"b\": \"]]{{\", \"c\": 2}}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let v: Value = serde_json::from_str(&cap_depth(&deep, 64)).unwrap();
+        assert_eq!((v["b"].as_str(), v["c"].as_u64()), (Some("]]{"), Some(2)));
+    }
 }

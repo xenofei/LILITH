@@ -225,6 +225,9 @@ pub(crate) struct Shared {
     changed: watch::Sender<u64>,
     recovered: Mutex<HashMap<String, Arc<OnceCell<()>>>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The engine ids of the jobs taken up again from an earlier core run (ruling P3-R21):
+    /// their prompts are the suite's, not outside ones.
+    adopted: Mutex<HashSet<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -607,6 +610,9 @@ impl Shared {
             return false;
         };
         tracing::warn!(job_id = %row.job_id, external_id = ?row.external_id, "a job with external side effects of an earlier core run is taken up again in its engine");
+        if let Some(id) = &row.external_id {
+            lock(&self.adopted).insert(id.clone());
+        }
         let info = Info {
             id: JobId(row.job_id.clone()),
             spec: row.spec(kind),
@@ -1715,6 +1721,7 @@ impl Jobs {
             changed: watch::Sender::new(0),
             recovered: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            adopted: Mutex::new(HashSet::new()),
         });
         events.register_snapshot("job:", Arc::new(JobSnapshots(Arc::downgrade(&shared))));
         Arc::new(Jobs { shared })
@@ -2181,6 +2188,44 @@ impl Jobs {
     /// its uploads and model hashes, Appendix F).
     pub fn suite_state(&self) -> Arc<StateDb> {
         self.shared.states.suite_db()
+    }
+
+    /// The engine ids of the jobs taken up again from an earlier core run (ruling P3-R21): the
+    /// engines count their prompts as the suite's.
+    pub fn adopted_engine_ids(&self) -> HashSet<String> {
+        lock(&self.shared.adopted).clone()
+    }
+
+    /// Whether `engine_id` is the `external_id` of a job not yet final, in the suite's scope
+    /// or an open workspace's: a prompt of an earlier core run that no recovery has taken up
+    /// yet is still the suite's. A database that can't be read answers `false`.
+    pub async fn is_open_job_engine_id(&self, engine_id: &str) -> bool {
+        let mut dbs = vec![self.shared.states.suite_db()];
+        dbs.extend(
+            self.shared
+                .hub
+                .opened()
+                .into_iter()
+                .map(|w| w.state.clone()),
+        );
+        for db in dbs {
+            let id = engine_id.to_string();
+            let found = db
+                .call(move |conn| {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM jobs WHERE external_id = ?1 \
+                         AND status IN ('queued', 'running'))",
+                        [&id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(|e| StateError::Io(e.to_string()))
+                })
+                .await;
+            if found.unwrap_or(false) {
+                return true;
+            }
+        }
+        false
     }
 
     /// A new id `<prefix>_<16 hex>` from the core's id source: the call and trace ids of a job

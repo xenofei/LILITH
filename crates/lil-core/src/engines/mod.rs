@@ -369,15 +369,23 @@ impl Engines {
         let stopped = self.comfy.stopped();
         tokio::spawn(async move {
             let mut inventoried = 0u64;
+            let mut open: Option<String> = None;
             loop {
                 let (epoch, is_ready) = *ready.borrow_and_update();
                 if is_ready {
                     let Some(engines) = weak.upgrade() else {
                         return;
                     };
-                    if epoch != inventoried {
+                    // One inventory at a time (review M5): an engine that came back while one
+                    // waits or runs gets its own once that one has ended (it inventories the
+                    // epoch it starts in).
+                    let waiting = match &open {
+                        Some(id) => !engines.job_ended(id).await,
+                        None => false,
+                    };
+                    if !waiting && epoch != inventoried {
                         inventoried = epoch;
-                        engines.submit_inventory(epoch).await;
+                        open = engines.submit_inventory(epoch).await;
                     }
                     engines.poll_outside().await;
                 }
@@ -399,33 +407,51 @@ impl Engines {
 
     /// Submits the `comfy.inventory` job of readiness `epoch`: the core's own job, with no
     /// tool call, so `cli` (`agent`) in the suite's scope (Appendix F "Jobs").
-    async fn submit_inventory(&self, epoch: u64) {
-        let Some(jobs) = self.comfy.jobs() else {
-            return;
-        };
-        let caller = JobCaller {
-            caller: lil_protocol::CallerKind::Cli,
-            idem_scope: "cli|none".to_string(),
-            workspace: None,
-            trace_id: jobs.mint_id("t"),
-            idem_key: None,
-            call_id: jobs.mint_id("c"),
-            reservation: None,
-            submitted: Arc::new(SubmittedSlot::new()),
-            origin: None,
-            retry_of: None,
-        };
+    async fn submit_inventory(&self, epoch: u64) -> Option<String> {
+        let jobs = self.comfy.jobs()?;
         match jobs
-            .submit(&caller, comfyui::inventory::inventory_spec(epoch))
+            .submit(
+                &core_caller(&jobs),
+                comfyui::inventory::inventory_spec(epoch),
+            )
             .await
         {
             Ok(job) => {
-                tracing::info!(job_id = %job.job_id, "ComfyUI is ready; its model inventory is refreshed")
+                tracing::info!(job_id = %job.job_id, "ComfyUI is ready; its model inventory is refreshed");
+                Some(job.job_id)
             }
             Err(e) => {
-                tracing::warn!(code = %e.code, error = %e.message, "the model inventory job could not be submitted")
+                tracing::warn!(code = %e.code, error = %e.message, "the model inventory job could not be submitted");
+                None
             }
         }
+    }
+
+    /// Whether the core's job `id` has ended (or can't be read any more).
+    async fn job_ended(&self, id: &str) -> bool {
+        let Some(jobs) = self.comfy.jobs() else {
+            return true;
+        };
+        jobs.get(&core_caller(&jobs), &crate::jobs::JobId(id.to_string()))
+            .await
+            .map_or(true, |j| j.status.is_final())
+    }
+}
+
+/// The [`JobCaller`] of a job the core submits itself, with no tool call: `cli` (so `agent`)
+/// in the suite's scope, with fresh call and trace ids (Appendix F "Jobs").
+fn core_caller(jobs: &Jobs) -> JobCaller {
+    JobCaller {
+        caller: lil_protocol::CallerKind::Cli,
+        idem_scope: "cli|none".to_string(),
+        workspace: None,
+        trace_id: jobs.mint_id("t"),
+        idem_key: None,
+        call_id: jobs.mint_id("c"),
+        reservation: None,
+        submitted: Arc::new(SubmittedSlot::new()),
+        origin: None,
+        retry_of: None,
     }
 }
 
