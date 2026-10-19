@@ -239,6 +239,9 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 - **ARCH-064** [M1] (invariant) Owned engines run in a kill-on-close Job Object for crash cleanup only; normal exits stop them explicitly. Attached engines are never stopped by the suite.
 - **ARCH-065** [M1] (decision) In M1 the core manages ComfyUI only, as owned or attached depending on who started it.
 - **ARCH-066** [M1.5] (decision) Local LLM runtimes: `llama-server` as an owned engine (started with `--api-key`, bound to 127.0.0.1) and Ollama as an attached one (§4). Their chat-only use in ORACLE arrives early, in M1b with plan 7a (AI-204); everything else stays M1.5.
+  - The owned `llama-server` build is pinned by build number, asset name and SHA-256 (ARCH-059): b11721 `win-cuda-13.4-x64` with its matching cudart zip, or the build the plan 7a spike passes on (AI-230). Builds move about 19 a day, so "latest" is never a pin. A new build is installed only on the user's click.
+  - The flags used come from `llama_server.yaml`, one entry per pinned build, like `claude_code.yaml` (AI-131). Long flag names only: no short aliases, no `LLAMA_ARG_*` environment forms, no deprecated load flags. An unknown build is refused with "build X is untested".
+  - A model's `arch` (`dense` or `moe`, AI-034) decides which launch arguments the core may use. Placement is per machine and measured (AI-225).
 - **ARCH-067** [Later] Headless Blender as an owned engine; Blender UI, Godot editor and Krita as user-interactive engines.
 
 **ComfyUI**
@@ -248,6 +251,8 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 
 **GPU scheduler**
 - **ARCH-071** [M1] One heavy GPU job runs at a time, holding the GPU lease of the `gpu-heavy` lane. Before dispatch the scheduler reads VRAM from `telemetry` (§2.5): total and free via NVML, and per-process dedicated usage via the Windows PDH counter `GPU Process Memory`, because NVML can't report per-process VRAM on GeForce/WDDM. An engine's own resident VRAM counts as available to it. If memory is short the job waits (`waiting_for_vram`). Engines are asked to unload when workloads switch, with one exception: an `llm.generate` job (AI-204) never asks ComfyUI to `/free`; it waits for VRAM, or for the user's click on "Free ComfyUI's memory" (AI-205). This is cooperative, not a hard guarantee. (M0 result, 2026-10-12: PDH `GPU Process Memory\Dedicated Usage` overstates usage for some processes: webengine.exe and dwm.exe grew past the card's size (23 GB and 22 GB on the 16 GB card), so per-process budgets should read `Local Usage` / `Total Committed` instead. Under ComfyUI's dynamic VRAM (on by default in 0.39.2) ComfyUI fills the card to its own headroom while it runs, which affects the free-VRAM wait (`waiting_for_vram`). `docs/spikes/08-comfy-measurements.md` §5.2, follow-ups 1 and 8.)
+  - **No local LLM shares the GPU with a `gpu-heavy` job** (from plan 7a). A local model on the GPU is stopped before any render dispatches; during a render, local LLM work runs only on the CPU, and only under `allow_cpu` (AI-228).
+  - **RAM admission** (from plan 7a). A local model loads only if available RAM, minus the file sizes of the image profiles in use (running, queued or resident in ComfyUI), minus the canvas's current tile use (IMG-041), is at least the model's RAM need (AI-225) plus 4 GiB. Otherwise the job waits (`waiting_for_ram`). Available RAM includes the standby list, which is ComfyUI's model cache (IMG-115), so admitting on raw available RAM would evict image weights.
 - **ARCH-072** [M1] CUDA out-of-memory errors are retryable. A watchdog from `execution_start` flags jobs running more than 3× their expected time (the symptom of Windows' system-memory fallback). Setup asks you to set "Prefer no sysmem fallback" for ComfyUI's Python in the NVIDIA Control Panel.
 
 ### 1.5 Workspace writes, outside writers and git
@@ -653,19 +658,20 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 ### 2.8 Jobs and the ComfyUI engine
 
 - **CORE-117** [M1] (contract) **Job record:** the workspace format's job fields plus `seq`, `kind`, `substatus`, idempotency key, `doc_id` (for proposal runs), usage, and hardware/energy attribution. Substatus maps onto status as follows:
-  - `submitting`, `waiting_for_vram`, `queued_in_engine` → `queued`;
+  - `submitting`, `waiting_for_vram`, `waiting_for_ram` (ARCH-071), `queued_in_engine` → `queued`;
   - `interrupted` → `failed`;
   - `interrupted_unknown` → `running` until you resolve it.
 - **CORE-118** [M1] (contract) **Director tasks** are jobs of kind `assistant_task` (§4) with substatuses `planning`, `running`, `waiting_confirmation`, `waiting_quota`, `waiting_auth`, `paused`, `interrupted`. After a core restart a running task becomes `interrupted` and resumes only when you choose. `waiting_auth` (the Claude Code sign-in for that profile has expired) is distinct from `waiting_quota` and is never retried automatically; TETHER and ORACLE calls in the same situation fail with `engine.claude_code.not_signed_in` (retry policy `after_resolve`, §6). M1 allows one director task per workspace; others queue.
 - **CORE-119** [M1] (contract) Proposal runs are jobs too, with `doc_id` and full hardware/energy attribution. When a director's proposal run finishes while the document is closed, the core writes it into the document's proposals under its own hold.
 - **CORE-120** [M1] (invariant) **Exactly once:** the core mints the ComfyUI `prompt_id` (canonical lowercase UUID) or the provider's idempotency key, persists `submitting` before sending, and checks status before any resubmission.
-- **CORE-121** [M1] (contract) **Lanes:** `gpu-heavy` (holds the GPU lease) and `cpu`.
+- **CORE-121** [M1] (contract) **Lanes:** `gpu-heavy` (holds the GPU lease) and `cpu`. A `gpu-light` lane that would let local chat run beside a `gpu-heavy` job was considered on 2026-10-18 and rejected: it could slow images (AI-228).
 - **CORE-122** [M1.5] (contract) A `network` lane runs hosted asynchronous jobs.
 - **CORE-123** [M1] (contract) **Suite-held queue:** the suite keeps its own queue and keeps **at most one prompt per lane pending in ComfyUI**, submitting the next when the running one finishes. ComfyUI's own queue can't be reordered usefully (its "front" option is last-in-first-out among front items, and nothing pre-empts a running prompt).
 - **CORE-124** [M1] (contract) **Priority classes:** interactive operations (select object, preprocessors, Prompt Studio previews, AI-181) > your generations > agent and director batches. Within a class, first in, first out; batches may be grouped by model profile within their class, with a limit so nothing waits forever. Interactive operations still wait for the prompt already running, and the status bar says so.
+  - From plan 7a, `llm.generate` (AI-204) ranks below every other class, whenever it was submitted, and a render pre-empts a running one (AI-228). The "nothing waits forever" limit doesn't apply to it.
 - **CORE-125** [M1] An optional setting cancels and resubmits a running **agent batch** prompt when an interactive operation arrives. It never does this to your own jobs.
-- **CORE-126** [M1] **GPU scheduler:** checks free VRAM via `telemetry`; an engine's own resident VRAM counts as available to that engine; the watchdog starts at `execution_start`.
-- **CORE-127** [M1.5] Local LLM engines (`llama-server` owned, Ollama attached) are scheduled around image jobs for VRAM and metered as local work ($0, GPU time and energy). ORACLE's chat-only use arrives earlier, in M1b, on the same scheduler (AI-204, AI-205).
+- **CORE-126** [M1] **GPU scheduler:** checks free VRAM via `telemetry`; an engine's own resident VRAM counts as available to that engine; the watchdog starts at `execution_start`. From plan 7a it also checks RAM before a local model loads, and the job waits as `waiting_for_ram` when the check fails (ARCH-071).
+- **CORE-127** [M1.5] Local LLM engines (`llama-server` owned, Ollama attached) are scheduled around image jobs for VRAM and metered as local work ($0, GPU time and energy). ORACLE's chat-only use arrives earlier, in M1b, on the same scheduler (AI-204, AI-205). Each local run records its placement, its tokens per second and its peak VRAM and RAM (AI-227).
 - **CORE-128** [M1] (contract) **Retries:**
   - transient failures retry with backoff; disk-full is non-retryable;
   - a disk preflight checks space for the expected output plus staging; batches checkpoint their progress;
@@ -1225,6 +1231,8 @@ Landscape notes (verified 2026-10-12): OpenAI has no video API since 2026-09-24;
 ### 4.5 Model registry and routing
 
 - **AI-034** [M1] (contract) Entries in the workspace's `registry/models.yaml` carry `routes[]` (provider profile + model id per route, e.g. DeepSeek direct vs OpenRouter vs NanoGPT), capabilities (tools, vision, structured output, context, max output), a price reference, recommended settings, fallbacks and `last_verified`. `models.yaml` also registers local model files by hash. Each route also carries its tool-probe state and capability tier (AI-208, AI-209).
+  - From plan 7a each local file entry also carries, read from the GGUF where possible and otherwise from the catalogue entry: `arch` (`dense | moe`); `params_total_b` and `params_active_b` (display and sorting only; admission never uses them); for `moe`, `experts: {count, used, shared}`; `quant` and `size_bytes`; for a vision model, `mmproj: {hash, size_bytes}`; `chat: {template: embedded | file:<sha256>, reasoning: auto | on | off, template_kwargs}`; and the model card's sampling values.
+  - A `dense` entry has no `experts` field. Measured figures (VRAM, RAM, speed) depend on the machine, so they live in a machine-local file, not here (AI-225).
 - **AI-035** [M1] (contract) Personal `model_profile` Library resources (§5) refer to registered model files by hash.
 - **AI-036** [M1] (contract) Defaults per task live in the settings cascade (`defaults.models` in `lilith.yaml`, overridable per project and per request): `assistant`, `assistant_fast`, `vision_qa`, `bulk_text`, `translate`, `image_generate`, `image_edit`, and others as apps add tasks. `defaults.models.image_generate` names a model profile (§5). The assistant surfaces' defaults, ORACLE's chat route included, are not in this cascade: they live in one place, `suite.toml` (AI-046). A hosted `chat` route named in a workspace or project file is asked about once before it is used.
 - **AI-037** [M1] There is no automatic cheapest-route selection in M1: the user chooses defaults and routes, and fallbacks apply on errors.
@@ -1382,7 +1390,7 @@ Use of each Claude account is subject to Anthropic's terms (AI-106 links them).
 
 ORACLE is the place to talk: the person can discuss anything with any model they have set up, and the suite makes sure the model knows what LILITH is. It arrives in **plan 7a**, the first M1b plan, which also brings a chat-only local engine. It doesn't need the Claude Code headless spikes, so it can run alongside them.
 
-- **AI-200** [M1b] (decision) **ORACLE** is a general chat in which the person can discuss anything. It never acts on its own. **ORACLE makes no tool calls, in every plan and on every engine:** it starts no tasks, changes no settings or files, and spends only on its own turns, from the shared allowance (AI-216). Its knowledge of the suite comes only from the suite card and the retrieval the core does before each turn (AI-203). On Claude Code its launch profile has no tools at all (AI-207), and its tier ceiling is `chat` (AI-208).
+- **AI-200** [M1b] (decision) **ORACLE** is a general chat in which the person can discuss anything. It never acts on its own. **ORACLE makes no tool calls, in every plan and on every engine:** it starts no tasks, changes no settings or files, and spends only on its own turns, from the shared allowance (AI-216). Its knowledge of the suite comes only from the suite card and the retrieval the core does before each turn (AI-203). On Claude Code its launch profile has no tools at all (AI-207), and its tier ceiling is `chat` (AI-208). Its requests on Engines B and C carry no `tools` field, and tool-call markup in a local reply is shown as text, never parsed.
 - **AI-201** [M1b] (contract) **Where it lives.**
   - ORACLE has a small window of its own, the `lil-oracle` app on the shared shell (caller kind `ui:oracle`, ARCH-046), usable with no studio open. It shows the active workspace's conversations, or the suite scope's when no workspace is open (AI-087).
   - The same conversations are reachable inside each studio's **Assistant panel** (APP-008, APP-050), where ORACLE is a clearly labelled **level**. From the TETHER plan the Assistant panel also offers the TETHER level (AI-039). The ORACLE window has only the ORACLE level.
@@ -1395,28 +1403,48 @@ ORACLE is the place to talk: the person can discuss anything with any model they
   - local models (AI-204);
   - Claude Code (Engine A), from the later M1b plan that brings Engine A to chat (AI-207).
 
-  **A new chat starts on the local model**: ORACLE's default route, kept in `suite.toml` (AI-046). When no local model is installed, the first-run card asks first (AI-206). Until the user picks a route, that chat has none: the suite never picks a hosted model on its own. Changing a conversation's route forks it (AI-079).
+  **A new chat starts on the local model**: ORACLE's default route, kept in `suite.toml` (AI-046). When no local model is installed, the first-run card asks first (AI-206). Until the user picks a route, that chat has none: the suite never picks a hosted model on its own. Changing a conversation's route forks it (AI-079). A render never changes a conversation's route, a new chat's included: the composer shows the wait and AI-205's choices (AI-228).
 - **AI-203** [M1b] (contract) **Suite knowledge.**
   - A **suite card** of at most 1.5K tokens is in the fixed system prompt: the build id and the apps and modules in this build. Its hash is recorded with the conversation (AI-087).
   - Before each turn the core runs **`suite.help`** on the user's message: SQLite FTS5 search (CORE-004) over a reference built per release from the tool descriptors, the error codes (QA-005), the settings schema and the user docs, filtered to shipped milestones. The best passages, with their citations, go into the newest user turn as wrapped data (AI-079). This needs no tool call, so it works on every model.
   - `suite.help` is also registered as a `read` tool, so TETHER and Claude Code use the same search.
 - **AI-204** [M1b] (contract) **Local chat engine (plan 7a).** Chat only, with no AI tool use:
-  - `llama-server` as an owned engine (`--api-key`, bound to 127.0.0.1, ARCH-066) or Ollama as an attached one, both through `openai_chat` (Engine C). An attached Ollama counts as local only at a loopback address; at any other address it is treated as a hosted route. The suggested model is Qwen3.5-9B at Q4_K_M; plan 7a confirms the pick on the target machine.
-  - Each local turn is an `llm.generate` job in the `gpu-heavy` lane under plan 3's GPU scheduler (ARCH-071, CORE-121, CORE-126), in the "your generations" class (CORE-124). Hosted turns stay inline metered calls (CORE-128).
-  - It **never evicts ComfyUI on its own**: it loads its model only when free VRAM fits, never pre-empts a prompt, and never asks ComfyUI to unload (`/free`) except on the user's click (AI-205; the exception in ARCH-071). Before an image job dispatches, the scheduler unloads the owned `llama-server` model. Attached Ollama keeps its VRAM under its own `keep_alive`, which the suite can't schedule: ORACLE warns about this once, and its requests carry `keep_alive: 0` while an image job waits.
+  - `llama-server` as an owned engine (`--api-key`, bound to 127.0.0.1, ARCH-066) or Ollama as an attached one, both through `openai_chat` (Engine C). An attached Ollama counts as local only at a loopback address; at any other address it is treated as a hosted route.
+  - **The suggested model** is Qwen3.6-35B-A3B at UD-Q4_K_XL with its vision projector (mmproj-F16): a mixture-of-experts (MoE) model, 35B parameters with 3B active. The runner-up, for fiction, is Gemma 4 26B-A4B at UD-Q4_K_XL. The default is picked after the owner's blind test in the plan 7a spike (AI-230). If the spike fails, plan 7a ships the dense Qwen3.5-9B at Q4_K_M instead, and the MoE fields stay unused.
+  - Each local turn is an `llm.generate` job under plan 3's GPU scheduler (ARCH-071, CORE-121, CORE-126). On the GPU it runs in the `gpu-heavy` lane, ranked below every other class (CORE-124); the `cpu` placement runs in the `cpu` lane. Hosted turns stay inline metered calls (CORE-128).
+  - **Placement**, chosen by the scheduler at each load. Changing it restarts the process.
+    - `fit`, when ComfyUI holds no model: `--fit on`, `--fit-target 1536`, the default `--ubatch-size`. Never `--ubatch-size` 2048 or above with `--fit on`: it ran out of memory on an RTX 5080.
+    - `lean`, when ComfyUI is idle but holds a model, for `moe` models only: `--gpu-layers all --cpu-moe --fit off --no-mmproj-offload`, so every expert stays in RAM. Used only if spike bars B1 and B2 pass, and admitted only on a measured figure (AI-225).
+    - `cpu`, during a render under `allow_cpu` (AI-228) or for AI-205's "Run on CPU": `--device none`. (`--gpu-layers 0` still creates a CUDA context.) While a render is running or queued, `--threads 8` at BelowNormal priority.
+    - Otherwise the turn waits. A `dense` model uses `fit` or `cpu` only and never gets `--cpu-moe`.
+  - **Launch line.** The core builds it from the profile and `llama_server.yaml` (ARCH-066), never from model text:
+    - `--host 127.0.0.1`, a free port, a per-launch `--api-key`, `--no-webui`;
+    - an explicit `--ctx-size` and `--parallel 1`; `--flash-attn on`;
+    - `--load-mode auto` (mmap). Never `--mlock`, and never a no-mmap load: about 22 GB of private memory would push ComfyUI's cached weights out of RAM;
+    - multi-token prediction off, and `--moe-cache-mib 0`;
+    - thinking off by default (`enable_thinking: false` in the chat-template kwargs), with the model card's non-thinking sampling.
+  - **Unloading means stopping the process**, which frees its VRAM for certain. An owned model with no turn for about 2 minutes is stopped, so a render rarely has to stop one.
+  - It **never evicts ComfyUI on its own**: it loads its model only when free VRAM fits its placement, never pre-empts a ComfyUI prompt, and never asks ComfyUI to unload (`/free`) except on the user's click (AI-205; the exception in ARCH-071). A render stops a local turn, never the other way round (AI-228). Before a render dispatches, the scheduler stops the owned `llama-server`. Plan 7a measures the delay from that stop until NVML shows the memory free (AI-230, bar B4).
+  - **Ollama models get no special handling, MoE models included.** The suite passes no placement or expert arguments, so a model runs as Ollama places it. Attached Ollama keeps its VRAM under its own `keep_alive`, which the suite can't schedule: ORACLE warns about this once. Before a render dispatches, the core asks Ollama to unload the model ORACLE used (an empty request with `keep_alive: 0`), and its requests carry `keep_alive: 0` while a render waits. If the unload can't be confirmed, the route is labelled "can't promise no slowdown".
   - The core sends an explicit context size (Ollama's `num_ctx`) and refuses a turn that doesn't fit, rather than letting the runtime truncate it.
   - Local turns are metered as local work ($0, GPU time and energy, CORE-127).
-- **AI-205** [M1b] (invariant) **When the GPU is busy.** The level chip shows "Local · waiting for GPU" with the reason: an image job running or queued (with its estimated time left), or not enough free VRAM. The choices are:
-  - **Wait** (the default): until the image job ahead of the turn finishes, or until enough VRAM is free, whichever the reason names;
-  - **Free ComfyUI's memory (the next image reloads its model)**: the user's click asks ComfyUI to `/free`; it is offered only while no ComfyUI job is running;
-  - **Run on CPU** (slower);
-  - **use an API model for this turn**, which the user picks, with its estimated cost shown first. It is asked each time, with no "remember" option.
+- **AI-205** [M1b] (invariant) **When the GPU is busy.** The level chip shows "Local · waiting for GPU" with the reason: a render running or queued (AI-228, with its estimated time left), not enough free VRAM, or not enough free RAM (`waiting_for_ram`, ARCH-071). The choices are:
+  - **Wait** (the default): until the render ahead of the turn finishes, or until enough VRAM or RAM is free, whichever the reason names;
+  - **Free ComfyUI's memory (the next image reloads its model)**: the user's click asks ComfyUI to `/free`; it is offered only while no render is running or queued;
+  - **Run on CPU**: shown only when `local_llm.during_renders` is `allow_cpu` (AI-228), with this PC's measured image slowdown beside it (AI-225), or "not measured yet". Under `wait` it is hidden;
+  - **Send this turn with \<route\> · about $X**: one button for one turn. \<route\> is the hosted route last picked for this choice; "Other model…" opens the picker, and before any pick the button opens it. The estimate is on the button, and the click is the decision. Each turn needs its own click. Nothing is remembered, and there is no "for the rest of the queue" option. A route with an unknown or zero price needs its ceiling first (AI-217). The first such turn in a conversation adds one line: "sends this conversation's history to \<provider\>". Engine A routes aren't offered for it.
 
-  The suite never switches to a paid model on its own (AI-010, AI-037). The one-turn choice doesn't fork the conversation: the conversation stays on its local route, and only that turn records the route it ran on.
+  The suite never switches to a paid model on its own (AI-010, AI-037). The one-turn choice doesn't fork the conversation: the conversation stays on its local route, and only that turn records the route it ran on. The one-turn choice is ORACLE's alone: TETHER and MAGI Core turns on local routes wait, or run on the CPU under `allow_cpu`.
 - **AI-206** [M1b] (invariant) **First run of local chat.** Nothing downloads without the user's click.
-  - The suite first detects what is there: VRAM, free disk space, an Ollama install and its models, and suitable GGUF files already present. If a suitable model exists, it offers that and downloads nothing.
-  - If Ollama is installed but has no suitable model, the card says so and names the model to pull in Ollama; the suite doesn't pull into Ollama itself (it is an attached engine). The `llama-server` download below is offered as well.
-  - Otherwise a card lists each file and its size (about 7 GB in total: the model weights, its vision projector, the `llama-server` build and the CUDA runtime; sizes verified 2026-10-18), the install path, and that chatting uses about 9 GB of GPU memory and waits while images render. When the GPU has less than 9 GB of VRAM, the card says that chat will run partly on the CPU and be much slower; Download stays available. The buttons are **Download** and **Cancel**.
+  - The suite first detects what is there: VRAM, free RAM, free disk space, an Ollama install and its models, and suitable GGUF files already present, matched by hash. If a suitable model exists, it offers that and downloads nothing.
+  - If Ollama is installed but has no suitable model, the card says so and names the model to pull in Ollama (`qwen3.6:35b`), adding that Ollama places the model itself (AI-204); the suite doesn't pull into Ollama itself (it is an attached engine). The `llama-server` download below is offered as well.
+  - Otherwise a card lists each file and its size, the install path and the total: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (22.4 GB) and `mmproj-F16.gguf` (0.9 GB), about 23.3 GB together, plus the `llama-server` build and the CUDA runtime, sized from the pinned manifest (model sizes verified 2026-10-18).
+    - One line: "Chat uses about 3 GB of GPU memory and 24 GB of RAM, and stops before an image starts." Each figure is marked estimated, or measured with its date once this PC has a measurement (AI-225).
+    - "Speed on this PC: not measured yet" until then, with a **Measure** button (a `gpu-heavy` job that runs only on the click).
+    - Below 32 GB of free RAM or 26 GB of free disk, the card says so and points to the smaller model. Download stays available; CORE-131's disk-space check still applies.
+    - Two links change the file list: "For fiction and roleplay: Gemma 4 26B-A4B (18.2 GB)" and "Smaller download: Qwen3.5-9B (6.6 GB). It waits whenever ComfyUI holds the GPU."
+    - The buttons are **Download** and **Cancel**.
+  - If the plan 7a spike fails (AI-230), the card offers Qwen3.5-9B instead: about 7 GB of files, and a line that chatting uses about 9 GB of GPU memory and waits while images render. When the GPU has less than 9 GB of VRAM, the card says that chat will run partly on the CPU and be much slower.
   - The download is a resumable, SHA-256-checked core job with pinned versions (CORE-131, ARCH-059), shown in Jobs and cancellable.
   - After a cancel the card doesn't come back on its own; Settings offers it again. New chats have no model until the user picks one (AI-202).
 - **AI-207** [M1b] (contract) **ORACLE on Claude Code** (Engine A) arrives with the later M1b plan that brings Engine A to chat, after the M1b headless spikes (AI-133–148). It runs under Engine A's rules (AI-047–072) with its own **`chat` launch profile**:
@@ -1506,6 +1534,46 @@ These rules hold for ORACLE, TETHER and MAGI Core on every engine.
   - a detector that stops the turn when the same call, with the same arguments, is repeated N times, whether or not it fails (N set in the TETHER plan);
   - a burst breaker that pauses a turn after about 5 confirmation prompts and asks the user whether to continue.
   - When the guard trips on a director task, the task is set to `paused` and the user is notified (APP-022).
+- **AI-225** [M1b] (contract) **Measured profile, per machine.** Placement, VRAM, RAM and speed depend on the hardware, so they aren't in the workspace's `models.yaml` (AI-034, which OPS-036 syncs by hash).
+  - They live in a machine-local file, `%LOCALAPPDATA%\LILITH\llm\measured.yaml`, one entry per model file hash, `llama-server` build, placement and context size: `vram_resident_mib`, `ram_needed_mib`, `prompt_tps`, `gen_tps`, `measured_at`. A `cpu` entry also holds `image_slowdown_pct`, the image cost measured with that chat generating during a render (AI-230, bar B5).
+  - Entries come from the plan 7a spike, a **Measure** run (a `gpu-heavy` job, started only by the user's click, AI-206) or a completed load (AI-227).
+  - A figure is shown as "measured" with its date, or as "estimated" when this PC has no run. **An estimate never admits a `lean` load** (AI-204). Until a model is measured, its RAM need is its model and projector file sizes plus 2 GiB.
+  - Tuned placement (`--n-cpu-moe`) and the GPU expert cache (`--moe-cache-mib`) arrive with local tool use in M1.5 (AI-211).
+- **AI-226** [M1b] (invariant) **Byte-stable prefix on local routes.** The system prompt and suite card (AI-203) of a conversation on a local route keep their order and content for the conversation's life: no clock, ids, counters or per-turn text before the newest user turn. `suite.help` passages go in the newest user turn (AI-203). Otherwise Qwen3.5 and Qwen3.6 reprocess the whole prompt on every turn.
+- **AI-227** [M1b] (contract) **`llm_runs` telemetry.** One row per local request in `telemetry.db`, with CORE-062's retention, and no prompt text:
+  - model hash, `arch`, placement, context size and build;
+  - prompt and generated tokens, `ttft_ms`, `prompt_tps` and `gen_tps` (from the `timings` field `llama-server` returns);
+  - the process's peak VRAM and peak RAM;
+  - `prompt_cache_miss`: true when the server logged "forcing full prompt re-processing";
+  - `stopped_by_render`, and for a stopped run the milliseconds from the stop until NVML showed the memory free;
+  - energy and GPU-seconds (CORE-065).
+
+  While a local model is loaded, `telemetry` also samples at 1 Hz the system's available RAM, its standby size and its hard faults (`Memory\Pages Input/sec`).
+- **AI-228** [M1b] (invariant) **Local AI during renders.**
+  - The setting is `[local_llm] during_renders = "wait" | "allow_cpu"` in `suite.toml`, default `wait`. It is changed only from Settings > AI > Local models, by a verified UI action, as for caps (ARCH-056). No agent or model can change it. The labels: "While images render, local AI: **Waits** (never slows images) / **May run on the CPU**", the second with this PC's measured image slowdown beside it (AI-225), "no measured slowdown" under 1%, or "not measured yet".
+  - It covers every local AI caller: ORACLE, TETHER, MAGI Core, Prompt Studio's local engine (AI-195) and local helper jobs (AI-151).
+  - A **render** is any GPU job running or queued in the suite's queue, of any class or engine (images, Prompt Studio previews, agent batches, and later video and headless Blender), or any ComfyUI prompt the core sees running or pending from outside (ARCH-069, IMG-133). The gap between two queued jobs counts. ComfyUI idle but holding a model is not a render: that is AI-205's "not enough free VRAM".
+  - Under `wait`, no local LLM work runs during a render, in any placement, and "Run on CPU" is hidden (AI-205). No image slowdown from local AI is accepted.
+  - Under `allow_cpu`, local LLM work may run during a render only in the `cpu` placement (AI-204). It never shares the GPU (ARCH-071).
+  - **A render stops local work on the GPU.** When a render is submitted, the core stops the running local turn or model load, keeps the partial reply marked "Stopped: a render started", stops the owned `llama-server`, then dispatches. The image may start up to about 0.3 s later (AI-230, bar B4). The stopped turn offers "Continue after renders", AI-205's one-turn choice (ORACLE only), and under `allow_cpu`, "Run on CPU". A `cpu` turn under `allow_cpu` keeps running.
+  - Hosted turns ignore this setting (AI-229).
+- **AI-229** [M1b] (invariant) **Hosted chat beside renders.** A render never stops, blocks or reroutes a turn on a hosted route (Engines B and C, and Engine A from AI-207): API and flagship chat stays fully usable while images render.
+  - While a render runs, streamed text repaints at 20 Hz or less. The suite never raises its own process priority and never changes ComfyUI's.
+  - Pass bar, in the plan 7a spike (AI-230, bar B3b): Z-Image wall time and s/it with a hosted turn streaming, against none, n = 10, medians within 1%. If it fails, the result goes to the owner before plan 7a continues.
+- **AI-230** [M1b] (contract) **Plan 7a spike: local MoE.** The first task of plan 7a measures the MoE engine (AI-204) before anything is built on it, against these pass bars, fixed before the run.
+  - Rig: the reference machine (RTX 5080 16 GB; 125 GB RAM, 4 × 32 GB at 3600 MT/s; Ryzen 9 9950X3D, 16 cores), ComfyUI 0.39.2, Z-Image int8, the canvas open with a large document, and the pinned `llama-server` build (ARCH-066). Its files download only on the owner's click (AI-206). Results go in a spike report under `docs/spikes/` and seed `measured.yaml` (AI-225).
+  - **B1 VRAM:** the `lean` NVML delta at 32K context is at most the measured free VRAM minus 512 MiB. If not, retry at 16K context and `--ubatch-size 256`.
+  - **B2 No eviction:** ComfyUI's PDH `Local Usage` stays within ±128 MiB through the load and 10 turns, and its `Shared Usage` stays flat.
+  - **B3 No slowdown:** Z-Image wall time and s/it, n = 10, medians within 1% of a warm solo run, in two cases: (a) chat loaded and idle, then stopped at dispatch; (b) a hosted turn streaming during the render (AI-229).
+  - **B4 Dispatch delay:** from the stop until NVML shows the memory free, 300 ms or less at p95.
+  - **B5 CPU cost:** a `cpu` chat generating during a render. The image slowdown is reported in %; under 1% counts as "no measured slowdown" (AI-228).
+  - **B6 CPU-only:** the `--device none` NVML delta is 0.
+  - **B7 Speed:** `lean` generates at least 20 tokens/s at 8K context, with prompt processing at least 300 tokens/s. `fit` and `cpu` are recorded too.
+  - **B8 RAM:** no burst of hard faults (`Pages Input/sec`) in the image run after a chat session, comparing `--load-mode auto` with `none`.
+  - **B9 Template and cache:** with thinking off there is no `<think>` and `reasoning_content` is empty, and there is no "forcing full prompt re-processing" across 10 turns (AI-226).
+  - **B10 Warm reload:** 10 s or less.
+  - **Blind test:** the owner's own prompts, fiction and roleplay included, under the suite's system prompt, Qwen3.6-35B-A3B against Gemma 4 26B-A4B, unlabelled. The owner's verdict picks the default (AI-204).
+  - **If a bar fails:** B1 and B2 gate `lean`. If either fails, `lean` is dropped, and the MoE stays the default only if `fit` beats Qwen3.5-9B in the owner's blind test. B6 gates `cpu`, which isn't offered until it passes. B3b goes to the owner (AI-229). B5 is reported, not passed or failed. If B3a, B4, B7, B8, B9 or B10 fails, plan 7a ships the dense Qwen3.5-9B at Q4_K_M in the `fit` and `cpu` placements, with AI-206's fallback card, and the MoE fields stay unused.
 
 ### 4.7 Claude Code integration
 
@@ -1715,7 +1783,7 @@ The section sits in the AI layer because its engines, metering and agent tools a
   - the profile named by the suite setting `prompt_studio.claude_code_profile`, which the person sets, so the suite never picks one (AI-105). With no profile set, `auto` skips Claude Code.
   - If the per-profile lock (AI-062) makes a launch wait more than 10 s, that step falls back to the provider engine, or else the question bank, with a notice.
   - At a plan limit the step fails with `quota.plan_limit` (QA-006), and the interview offers another engine or the question bank.
-- **AI-195** [M1.5] (contract) **Local engine.** `local` uses `llama-server` or Ollama through `openai_chat` (AI-151). It is metered as local work ($0, GPU time and energy) and scheduled around image jobs for VRAM (CORE-127). In `auto` it comes after the provider model (AI-171).
+- **AI-195** [M1.5] (contract) **Local engine.** `local` uses `llama-server` or Ollama through `openai_chat` (AI-151). It is metered as local work ($0, GPU time and energy) and scheduled around image jobs for VRAM (CORE-127). In `auto` it comes after the provider model (AI-171). Local steps follow AI-228: a waiting step offers the question bank (AI-170), and a render never changes which engine `auto` picks.
 
 #### The compiler
 
@@ -1904,7 +1972,7 @@ Prompt Studio's milestones are set in AI-193 (M1a: v1 for images with the `provi
   M1a already lets Claude Code drive the suite from the user's own sessions through plugin 1.3 and `lil-mcp` (§4.7 A), records all metered usage, and includes Prompt Studio's `provider` engine with the provider adapters it needs (§4.7a, AI-171). Rules elsewhere that exist only for the in-app assistant (`assistant_task` jobs, director decisions in the Assistant panel, engine-contract tests) are needed by the end of M1b, not for M1a.
 #### M1.5
 
-- **AI-151** [M1.5] (decision) Local LLMs: `llama-server` as an owned engine and Ollama as an attached one, both through `openai_chat`, selectable per task (captioning, tagging, prompt expansion, local vision QA) and as the "use a local model" choice at a plan limit; metered as local ($0, GPU time and energy) and scheduled around image jobs for VRAM. They also become a TETHER engine here, once a route passes the tool probe (AI-211). ORACLE's chat-only use of them comes earlier, in M1b (AI-204).
+- **AI-151** [M1.5] (decision) Local LLMs: `llama-server` as an owned engine and Ollama as an attached one, both through `openai_chat`, selectable per task (captioning, tagging, prompt expansion, local vision QA) and as the "use a local model" choice at a plan limit; metered as local ($0, GPU time and energy) and scheduled around image jobs for VRAM. They also become a TETHER engine here, once a route passes the tool probe (AI-211). ORACLE's chat-only use of them comes earlier, in M1b (AI-204). Local helper jobs follow AI-228: they run only when no render is running or queued, or on the CPU under `allow_cpu`.
 - **AI-152** [M1.5] Director tasks started directly on Engine B.
 - **AI-153** [M1.5] Hosted media through `media_job`: fal and OpenRouter images (§4.4).
 - **AI-154** [M1.5] The OpenTelemetry receiver and status-line helper for interactive sessions, per profile (§4.7 D).
@@ -1979,7 +2047,7 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 
 **Memory, undo and colour**
 
-- **IMG-041** [M1a] The RAM tile budget is ~50% of physical memory, with disk spill. (An 8K × 20-layer fully covered document is ~2.65 GB at 8-bit.)
+- **IMG-041** [M1a] The RAM tile budget is ~50% of physical memory, with disk spill. (An 8K × 20-layer fully covered document is ~2.65 GB at 8-bit.) From plan 7a the canvas's current tile use counts in the local-LLM RAM admission (ARCH-071); the budget value is unchanged.
 - **IMG-042** [M1a] Undo uses tile-map snapshots that share unchanged tiles, with a ~2 GB budget; older steps are compressed and spilled to disk. The History panel shows the steps.
 - **IMG-043** [M1a] The document profile is sRGB. The display transform is a 33³ lookup table sampled from a `moxcms` transform (document → monitor ICC profile) and applied in the canvas shader. The monitor profile is read in the C++ shim with the same Windows calls Qt uses internally.
 - **IMG-044** [M1a] (invariant) When Windows Advanced Color, auto colour management or HDR is active, Windows' compositor already colour-manages, so the lookup table is bypassed (otherwise colours would be corrected twice).
@@ -2101,7 +2169,7 @@ ComfyUI's own queue can't be reordered usefully: its "front" option is last-in-f
 - **IMG-112** [M1b] The **Qwen-Image 2.1** profile as in the table, with the w4a8 text encoder by default.
 - **IMG-113** [M1b] The **FLUX.2 klein 4B** profile as in the table.
 - **IMG-114** [M1a] The utilities as in the table needed by M1a operations (SAM 3.1, Depth Anything 3, `comfyui_controlnet_aux`, BiRefNet, Real-ESRGAN, tiny preview decoders); SeedVR2 comes with the M1b upscaling operations (IMG-074).
-- **IMG-115** [M1b] Model switching: ComfyUI keeps models cached in system RAM (the reference machine has well over 64 GB) and swaps them into VRAM; Z-Image and Qwen can't both stay resident, so switching between them costs a swap (measured in IMG-156). LoRA key mapping is confirmed in the ComfyUI 0.39.2 source for both Z-Image (Lumina2 architecture) and Qwen-Image-2.1.
+- **IMG-115** [M1b] Model switching: ComfyUI keeps models cached in system RAM (the reference machine has 125 GB) and swaps them into VRAM. Under DynamicVRAM (on by default in 0.39.2) that cache is the OS's file-backed page cache plus pinned buffers, not private memory, and a local LLM's RAM competes with it (ARCH-071's RAM admission). Z-Image and Qwen can't both stay resident, so switching between them costs a swap (measured in IMG-156). LoRA key mapping is confirmed in the ComfyUI 0.39.2 source for both Z-Image (Lumina2 architecture) and Qwen-Image-2.1.
 - **IMG-116** [M1a] Doctor checks ComfyUI's PyTorch/CUDA build from `/system_stats` (Qwen-Image 2.1 runs 3–4× slower on the CUDA 12.8 build). (M0 result, 2026-10-12: the test machine's ComfyUI was moved to PyTorch 2.11.0+cu130 during M0; the int8 Z-Image default (IMG-111) also needs the CUDA 13 build, as ComfyUI's optimised CUDA ops are disabled on cu128. `docs/spikes/08-comfy-measurements.md` §5.7.)
 
 ### 5.6a Prompt dialects and image targets (Prompt Studio)
@@ -2756,11 +2824,11 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 | §1 Processes, connections, trust and repo layout | 1 | 112 | 1 | 0 | 4 | 6 | 124 |
 | §2 Core modules | 0 | 140 | 1 | 1 | 5 | 4 | 151 |
 | §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 11 | 3 | 3 | 11 | 146 |
-| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 38 | 101 | 18 | 5 | 224 |
+| §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 38 | 107 | 18 | 5 | 230 |
 | §5 Image studio | 8 | 3 | 113 | 30 | 9 | 4 | 167 |
 | §6 Errors, testing and quality | 1 | 84 | 0 | 1 | 0 | 1 | 87 |
 | §7 Sync, backup and builds | 2 | 83 | 0 | 0 | 20 | 3 | 108 |
-| **All** | **29** | **585** | **164** | **136** | **59** | **34** | **1007** |
+| **All** | **29** | **585** | **164** | **142** | **59** | **34** | **1013** |
 
 ## Appendix B. M0 spike checklist and facts to re-verify
 
