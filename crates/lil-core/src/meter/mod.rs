@@ -368,7 +368,56 @@ impl Meter {
     async fn logged(&self, scope: Option<&Arc<OpenWorkspace>>, row: &PendingRow) -> bool {
         let want = Value::Object(row.record.clone());
         let secs = row.logging_ms.unwrap_or(row.created_ms).div_euclid(1000);
-        let texts: Vec<String> = match scope {
+        let machine = self.machine(scope);
+        self.log_texts(scope, secs).await.iter().any(|text| {
+            lil_schema::logs::read_lines(text)
+                .iter()
+                .any(|l| l.machine == machine && l.record == want)
+        })
+    }
+
+    /// [`UsageSink::record_outside`]: the line of paid outside prompt `prompt_id`, unless this
+    /// machine's log has a line of `u.tool` for it already (`raw_usage.prompt_id`).
+    async fn outside_line(
+        &self,
+        prompt_id: &str,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> Result<(), ErrorBody> {
+        let scope = ctx.workspace.as_ref();
+        let now = self.now_ms();
+        let machine = self.machine(scope);
+        let seen = self
+            .log_texts(scope, now.div_euclid(1000))
+            .await
+            .iter()
+            .any(|text| {
+                lil_schema::logs::read_lines(text).iter().any(|l| {
+                    l.machine == machine
+                        && l.record.get("tool").and_then(Value::as_str) == Some(u.tool.as_str())
+                        && l.record
+                            .get("raw_usage")
+                            .and_then(|r| r.get("prompt_id"))
+                            .and_then(Value::as_str)
+                            == Some(prompt_id)
+                })
+            });
+        if seen {
+            tracing::info!(
+                prompt_id,
+                "a paid outside prompt's usage line was already in the log"
+            );
+            return Ok(());
+        }
+        let mut r = record::draft_record(&format_ts(now), &ctx, &u);
+        record::finish(&mut r, None, "", u.status.wire(), u.latency_ms);
+        self.append(scope, r).await.map(|_| ())
+    }
+
+    /// The usage log texts of `scope` around `secs`: `usage-loose.jsonl`, or the workspace's
+    /// logs of this machine for the month of `secs` and of a minute later.
+    async fn log_texts(&self, scope: Option<&Arc<OpenWorkspace>>, secs: i64) -> Vec<String> {
+        match scope {
             None => {
                 let path = self.env.local_dir().join("usage-loose.jsonl");
                 tokio::task::spawn_blocking(move || std::fs::read_to_string(path).ok())
@@ -394,13 +443,7 @@ impl Meter {
                 }
                 texts
             }
-        };
-        let machine = self.machine(scope);
-        texts.iter().any(|text| {
-            lil_schema::logs::read_lines(text)
-                .iter()
-                .any(|l| l.machine == machine && l.record == want)
-        })
+        }
     }
 
     fn machine(&self, scope: Option<&Arc<OpenWorkspace>>) -> String {
@@ -824,6 +867,15 @@ impl UsageSink for Meter {
                 Meter::abandon(self, id).await;
             }
         })
+    }
+
+    fn record_outside<'a>(
+        &'a self,
+        prompt_id: &'a str,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> BoxFuture<'a, Result<(), ErrorBody>> {
+        Box::pin(self.outside_line(prompt_id, u, ctx))
     }
 }
 

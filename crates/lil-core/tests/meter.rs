@@ -544,6 +544,60 @@ async fn meter_after_pending_abort_leaves_a_pending_line_after_restart() {
     assert_eq!(all[1]["status"], "succeeded");
 }
 
+/// Ruling P3-R27: a paid outside prompt's `outside_paid` row is its write-ahead record, so the
+/// meter writes no row of its own, and a core that stopped between the line and the row's mark
+/// writes no second line when it sees the prompt's end again.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-071, CORE-093
+async fn an_outside_prompt_has_one_line_and_no_row_of_the_meters_own() {
+    let rig = Rig::new(&busy());
+    let outside = |prompt_id: &str| {
+        let mut d = draft("comfy-org", BillingBasis::PrepaidCredits, None);
+        d.tool = "comfyui.outside_prompt".into();
+        d.route = "comfy-partner".into();
+        d.raw_usage = Some(json!({"prompt_id": prompt_id, "partner_nodes": ["PaidNode"]}));
+        d.attribution = Attribution::Unattributed;
+        d.status = UsageStatus::Succeeded;
+        d.latency_ms = Some(40);
+        d
+    };
+    // A begun row would fail here, and its call would get no line.
+    rig.fp.on(
+        "meter.after_pending",
+        Box::new(|| {
+            Err(std::io::Error::other(
+                "no usage_pending row for an outside prompt",
+            ))
+        }),
+    );
+    lil_core::meter::UsageSink::record_outside(
+        &*rig.meter,
+        "p-1",
+        outside("p-1"),
+        uctx(None, "c_1"),
+    )
+    .await
+    .unwrap();
+    // The next core sees the same end again (its row was never marked).
+    let next = rig.restarted_meter();
+    lil_core::meter::UsageSink::record_outside(&*next, "p-1", outside("p-1"), uctx(None, "c_2"))
+        .await
+        .unwrap();
+    lil_core::meter::UsageSink::record_outside(&*next, "p-2", outside("p-2"), uctx(None, "c_3"))
+        .await
+        .unwrap();
+    let all = lines(&rig.loose());
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[0]["raw_usage"]["prompt_id"], "p-1");
+    assert_eq!(all[0]["status"], "succeeded");
+    assert_eq!(all[0]["attribution"], "unattributed");
+    assert_eq!(all[1]["raw_usage"]["prompt_id"], "p-2");
+    assert_eq!(
+        rig.restarted_meter().recover().await.unwrap(),
+        0,
+        "no row was left"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The record (CORE-069).
 // ---------------------------------------------------------------------------------------------

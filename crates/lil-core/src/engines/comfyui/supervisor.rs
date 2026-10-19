@@ -601,12 +601,25 @@ impl Comfy {
         if changed {
             self.publish("outside_job");
         }
-        // Handed over, then marked: a core that stops in between records it once more rather
-        // than never (ruling P3-R27).
+        // The open `outside_paid` row is the write-ahead record (ruling P3-R27): the line, then
+        // the mark. A core that stops in between finds the line in the log and writes no
+        // second one; a line that can't be written leaves the row open for the next core.
         for u in drafts {
-            self.usage.record(u.draft, u.ctx).await;
-            if let Err(e) = super::outside::mark_recorded(&self.suite, &u.prompt_id, now).await {
-                tracing::warn!(error = %e, "a paid outside prompt's usage can't be marked recorded");
+            match self
+                .usage
+                .record_outside(&u.prompt_id, u.draft, u.ctx)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(e) =
+                        super::outside::mark_recorded(&self.suite, &u.prompt_id, now).await
+                    {
+                        tracing::warn!(error = %e, "a paid outside prompt's usage can't be marked recorded");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(code = %e.code, error = %e.message, "a paid outside prompt's usage line could not be written; the next core writes it");
+                }
             }
         }
     }

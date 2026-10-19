@@ -143,4 +143,25 @@ pub trait UsageSink: Send + Sync {
         let _ = p;
         Box::pin(std::future::ready(()))
     }
+
+    /// The usage of a paid outside prompt `prompt_id`, whose write-ahead record is its
+    /// `outside_paid` row (ruling P3-R27): one line and no row of the sink's own, and no line
+    /// when the log already has this prompt's (a core that stopped between the line and the
+    /// row's mark). The caller marks its row recorded only on `Ok`. The default records the
+    /// draft.
+    ///
+    /// # Errors
+    /// Why the line could not be written: the row stays open for the next core.
+    fn record_outside<'a>(
+        &'a self,
+        prompt_id: &'a str,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> BoxFuture<'a, Result<(), ErrorBody>> {
+        let _ = prompt_id;
+        Box::pin(async move {
+            self.record(u, ctx).await;
+            Ok(())
+        })
+    }
 }
