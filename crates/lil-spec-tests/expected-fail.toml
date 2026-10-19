@@ -6,11 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 19
-    # QA-002, CORE-091. Stays after Task 19: it calls test.meter_external (Task 15) over a
-    # cap (Task 16); the MCP pending path itself is green in
-    # mcp_destructive_call_follows_mcp_confirmation.
-    { name = "lil-spec-tests::mcp_server::pending_is_a_normal_result_and_retry_token_continues", rule = "QA-002", file = "tests/mcp_server.rs" },
     # Task 20
     # ARCH-105, CORE-116, QA-061
     { name = "lil-spec-tests::plugin_hooks::delete_install_and_script_commands_ask", rule = "ARCH-105", file = "tests/plugin_hooks.rs" },
