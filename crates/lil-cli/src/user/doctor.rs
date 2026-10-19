@@ -703,16 +703,31 @@ fn plugin(claude: &Path, interactive: bool, report: &mut Report) -> bool {
     };
     let plugins: Vec<Value> = serde_json::from_str(listed.trim()).unwrap_or_default();
     let ours = plugins.iter().find(|p| p["id"] == PLUGIN);
-    for other in plugins.iter().filter_map(|p| p["id"].as_str()) {
-        if other != PLUGIN && other.split('@').next() == Some(plugin_name()) {
-            report.line(
-                "info",
-                &format!(
-                    "another copy of the plugin, {other}, is installed in the default Claude \
-                     Code profile; lil doctor never removes a plugin: turn it off or remove it \
-                     yourself once {PLUGIN} works"
-                ),
-            );
+    for p in &plugins {
+        let Some(other) = p["id"].as_str() else {
+            continue;
+        };
+        if other == PLUGIN || other.split('@').next() != Some(plugin_name()) {
+            continue;
+        }
+        // Two enabled copies clash (the same skills and server names); the doctor never
+        // removes a plugin, so it names the commands that do.
+        let scope = p["scope"].as_str().unwrap_or("user");
+        let place = p["projectPath"]
+            .as_str()
+            .map(|dir| format!(" in {dir}"))
+            .unwrap_or_default();
+        let detail = format!(
+            "another copy of the plugin, {other} {}, is installed in the default Claude Code \
+             profile ({scope} scope) and clashes with {PLUGIN} — lil doctor never removes a \
+             plugin; remove it yourself{place} with claude plugin uninstall {other} --scope \
+             {scope} (or turn it off with claude plugin disable {other} --scope {scope})",
+            p["version"].as_str().unwrap_or("unknown")
+        );
+        if p["enabled"] == false {
+            report.line("info", &detail);
+        } else {
+            report.problem(&detail);
         }
     }
     let update = match ours {

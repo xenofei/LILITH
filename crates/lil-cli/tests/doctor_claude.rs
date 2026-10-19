@@ -241,3 +241,33 @@ fn doctor_lists_skills_writing_directly() {
         "{line}"
     );
 }
+
+#[test] // spec: AI-117, ARCH-108
+fn another_copy_of_the_plugin_is_named_with_its_removal_steps_and_never_removed() {
+    let env = TestEnv::new();
+    // The same plugin name from another marketplace.
+    let other = format!("{}@old-market", PLUGIN.split('@').next().unwrap());
+    let list = json!([
+        {"id": PLUGIN, "version": "1.3.0", "scope": "user", "enabled": true, "installPath": "x"},
+        {"id": other, "version": "1.2.0", "scope": "local",
+         "projectPath": "D:/projects/ws", "enabled": true, "installPath": "y"}
+    ]);
+    std::fs::write(profile(&env).join("fake-plugins.json"), list.to_string()).unwrap();
+    let out = doctor(&env, env.root(), "y");
+    let line = lines(&out)
+        .into_iter()
+        .find(|l| l.contains(&other))
+        .unwrap_or_else(|| panic!("the other copy isn't named: {out:?}"));
+    assert!(line.starts_with("problem:"), "{line}");
+    assert!(
+        line.contains(&format!("claude plugin uninstall {other} --scope local")),
+        "{line}"
+    );
+    let log = claude_log(&env);
+    assert!(
+        !log.iter()
+            .flatten()
+            .any(|w| w == "uninstall" || w == "remove" || w == "disable"),
+        "{log:?}"
+    );
+}
