@@ -140,6 +140,10 @@ impl EngineControl for Engines {
             self.finished.send_modify(|n| *n += 1);
         })
     }
+
+    fn outside_busy(&self, _e: EngineKind) -> bool {
+        false
+    }
 }
 
 type ReadEvent = (String, Value);

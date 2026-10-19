@@ -17,7 +17,6 @@
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
 //! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?}` | `{job}`: a job of kind `test.job` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
-//! | `test.comfy_submit` | write | `{graph?: "tiny" \| object, priority?, outputs? (default 1), vram_need_mib?, external_side_effects?}` | `{job}`: a job of kind `comfy.prompt` |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
 //!
 //! `test.job` submits a job that [`TestJobHandler`] runs (the core registers it on test
@@ -28,9 +27,8 @@
 //! fail points `jobs.after_post` and `jobs.after_outputs`, as an engine job would;
 //! `external_side_effects` marks it as hosted or paid work would be (CORE-128).
 //!
-//! `test.comfy_submit` submits a `comfy.prompt` job (the `engines` module runs it) with the
-//! caller's `JobCaller`: `"tiny"` (the default) is an `EmptyImage` node and `outputs`
-//! `SaveImage` nodes; an object is sent as it is.
+//! `test.comfy_submit` (a `comfy.prompt` job) lives with the engines (`engines::tools`), which
+//! the server registers on test channels.
 //!
 //! `test.settings`'s `settings` argument (dotted keys, or nested mappings) is plan 2b's only
 //! source of the settings cascade's request layer (CORE-057 clarification): the dispatcher's
@@ -275,85 +273,6 @@ async fn test_job(ctx: &CallCtx, args: TestJobArgs) -> Result<(TestJobResult, St
         expected_output_bytes: 0,
         vram_need_mib: args.vram_need_mib,
         engine: args.engine,
-        group: None,
-        external_side_effects: args.external_side_effects,
-    };
-    let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
-    let summary = format!("job {} is {}", job.job_id, job.status.wire());
-    Ok((TestJobResult { job }, summary))
-}
-
-/// The kind of the jobs `test.comfy_submit` submits (`engines::comfyui::PROMPT_KIND`; named
-/// here, since `tools` never depends on `engines`).
-const COMFY_PROMPT_KIND: &str = "comfy.prompt";
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ComfySubmitArgs {
-    /// `"tiny"` (the default) or an API-format graph.
-    #[serde(default)]
-    graph: Option<Value>,
-    #[serde(default)]
-    priority: Option<Priority>,
-    /// The `SaveImage` nodes of the tiny graph (default 1).
-    #[serde(default)]
-    outputs: Option<u32>,
-    #[serde(default)]
-    vram_need_mib: Option<u64>,
-    #[serde(default)]
-    external_side_effects: bool,
-}
-
-/// The tiny graph: one `EmptyImage` node and `outputs` `SaveImage` nodes.
-fn tiny_graph(outputs: u32) -> Value {
-    let mut graph = serde_json::Map::new();
-    graph.insert(
-        "1".into(),
-        json!({"class_type": "EmptyImage",
-               "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}}),
-    );
-    for n in 0..outputs {
-        graph.insert(
-            (n + 2).to_string(),
-            json!({"class_type": "SaveImage",
-                   "inputs": {"images": ["1", 0], "filename_prefix": "ComfyUI"}}),
-        );
-    }
-    Value::Object(graph)
-}
-
-/// `test.comfy_submit`'s body.
-async fn comfy_submit(
-    ctx: &CallCtx,
-    args: ComfySubmitArgs,
-) -> Result<(TestJobResult, String), ErrorBody> {
-    let graph = match args.graph {
-        None => tiny_graph(args.outputs.unwrap_or(1)),
-        Some(Value::String(s)) if s == "tiny" => tiny_graph(args.outputs.unwrap_or(1)),
-        Some(g @ Value::Object(_)) => g,
-        Some(_) => {
-            return Err(ErrorBody::new(
-                &codes::PARAMS_INVALID,
-                "graph is \"tiny\" or an API-format graph object",
-                ctx.trace_id.clone(),
-            ));
-        }
-    };
-    let spec = JobSpec {
-        kind: COMFY_PROMPT_KIND,
-        lane: Lane::GpuHeavy,
-        priority: args
-            .priority
-            .unwrap_or_else(|| Priority::for_caller(&ctx.session.caller, false)),
-        module: TEST_MODULE.to_string(),
-        args: json!({ "graph": graph }),
-        project: ctx.project.clone(),
-        asset_id: None,
-        doc_id: None,
-        expected_secs: 60,
-        expected_output_bytes: 0,
-        vram_need_mib: args.vram_need_mib,
-        engine: Some(EngineKind::ComfyUi),
         group: None,
         external_side_effects: args.external_side_effects,
     };
@@ -967,14 +886,6 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         EffectClass::Write,
         TEST_MODULE,
         |ctx, args: TestJobArgs| Box::pin(test_job(ctx, args)),
-    ));
-
-    reg.register(typed_tool(
-        "test.comfy_submit",
-        "Test channels only: submits a comfy.prompt job: the tiny graph (an EmptyImage and `outputs` SaveImage nodes) or `graph`.",
-        EffectClass::Write,
-        TEST_MODULE,
-        |ctx, args: ComfySubmitArgs| Box::pin(comfy_submit(ctx, args)),
     ));
 
     reg.register(typed_tool(

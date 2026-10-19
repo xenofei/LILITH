@@ -154,7 +154,7 @@ fn root_map(text: &str, file: &str) -> Result<Map<String, Value>, String> {
 }
 
 /// A YAML value as JSON. Mapping keys that aren't strings are written as YAML would show them.
-fn to_json(y: &Yaml) -> Value {
+pub(crate) fn to_json(y: &Yaml) -> Value {
     match y {
         Yaml::Real(s) => s
             .parse::<f64>()

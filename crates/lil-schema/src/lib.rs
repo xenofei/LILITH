@@ -10,9 +10,11 @@
 //! - [`paths`]: workspace-relative path rules (CORE-040);
 //! - [`yaml_edit`], [`workspace_yaml`], [`suite_edit`]: comment-preserving YAML and TOML edits;
 //! - [`logs`]: append-log lines (ARCH-081); [`time`]: UTC dates;
-//! - [`money`]: integer micro-unit amounts and currencies (CORE-013).
+//! - [`money`]: integer micro-unit amounts and currencies (CORE-013);
+//! - [`engine_files`]: `registry/models.yaml` and a node pack's `pyproject.toml` version.
 
 pub mod content_hash;
+pub mod engine_files;
 pub mod logs;
 pub mod manifest;
 pub mod money;

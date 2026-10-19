@@ -874,7 +874,6 @@ async fn test_tools_exist_only_on_test_channels() {
         names,
         [
             "test.block",
-            "test.comfy_submit",
             "test.destructive",
             "test.echo",
             "test.emit",

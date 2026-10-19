@@ -20,10 +20,13 @@ use lil_protocol::{EffectClass, ErrorBody, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use serde_json::{Value, json};
+
 use super::comfyui::install::{self, ExactVersion, NodeId};
+use super::comfyui::prompt_spec;
 use super::{ENGINES_MODULE, EngineStatus, Engines, unknown_engine};
 use crate::jobs::{EngineKind, JobSummary, Priority};
-use crate::tools::{CallCtx, Registry, typed_tool};
+use crate::tools::{CallCtx, Registry, TEST_MODULE, typed_tool};
 
 /// Where the engine tools find the engines, filled by the server before it serves.
 pub type EnginesSlot = Arc<OnceLock<Arc<Engines>>>;
@@ -58,14 +61,16 @@ struct InstallParams {
     version: ExactVersion,
 }
 
+/// `{job}`: the result of a tool that submits a job.
 #[derive(Debug, Serialize, JsonSchema)]
-struct InstallResult {
+struct SubmitResult {
     job: JobSummary,
 }
 
 const STATUS_DESCRIPTION: &str = "Returns each engine the core manages (ComfyUI): whether the core \
     started it (owned) or someone else did (attached), its state, URL, process, version, where it \
-    listens, prompts from outside the suite, and whether a node install needs a restart.";
+    listens, prompts from outside the suite (suite jobs wait for them), whether a node install \
+    needs a restart, and how many model files its inventory holds.";
 const START_DESCRIPTION: &str = "Starts ComfyUI as an owned engine, from [engines.comfyui] in \
     suite.toml, listening on 127.0.0.1 only. A ComfyUI that already runs (started by the suite or \
     by you) is returned as it is.";
@@ -149,6 +154,94 @@ fn register_act(
     ));
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ComfySubmitArgs {
+    /// `"tiny"` (the default) or an API-format graph.
+    #[serde(default)]
+    graph: Option<Value>,
+    #[serde(default)]
+    priority: Option<Priority>,
+    /// The `SaveImage` nodes of the tiny graph (default 1).
+    #[serde(default)]
+    outputs: Option<u32>,
+    #[serde(default)]
+    vram_need_mib: Option<u64>,
+    #[serde(default)]
+    external_side_effects: bool,
+}
+
+/// The tiny graph: one `EmptyImage` node and `outputs` `SaveImage` nodes.
+fn tiny_graph(outputs: u32) -> Value {
+    let mut graph = serde_json::Map::new();
+    graph.insert(
+        "1".into(),
+        json!({"class_type": "EmptyImage",
+               "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}}),
+    );
+    for n in 0..outputs {
+        graph.insert(
+            (n + 2).to_string(),
+            json!({"class_type": "SaveImage",
+                   "inputs": {"images": ["1", 0], "filename_prefix": "ComfyUI"}}),
+        );
+    }
+    Value::Object(graph)
+}
+
+/// The expected time of a `test.comfy_submit` job (the watchdog's yardstick).
+const TEST_PROMPT_SECS: u32 = 60;
+
+/// Registers the engines' test-channel tool (the server does, on `test-*` channels only):
+///
+/// | Tool | Effect | Arguments | `structured` |
+/// |---|---|---|---|
+/// | `test.comfy_submit` | write | `{graph?: "tiny" \| object, priority?, outputs? (default 1), vram_need_mib?, external_side_effects?}` | `{job}`: a job of kind `comfy.prompt` |
+///
+/// `"tiny"` (the default) is an `EmptyImage` node and `outputs` `SaveImage` nodes; an object
+/// is sent as it is. The spec is [`prompt_spec`]'s, in the caller's class unless `priority`
+/// says otherwise.
+pub fn register_engine_test_tools(reg: &mut Registry) {
+    reg.register(typed_tool(
+        "test.comfy_submit",
+        "Test channels only: submits a comfy.prompt job: the tiny graph (an EmptyImage and \
+         `outputs` SaveImage nodes) or `graph`.",
+        EffectClass::Write,
+        TEST_MODULE,
+        |ctx, args: ComfySubmitArgs| {
+            Box::pin(async move {
+                let graph = match args.graph {
+                    None => tiny_graph(args.outputs.unwrap_or(1)),
+                    Some(Value::String(s)) if s == "tiny" => tiny_graph(args.outputs.unwrap_or(1)),
+                    Some(g @ Value::Object(_)) => g,
+                    Some(_) => {
+                        return Err(ErrorBody::new(
+                            &codes::PARAMS_INVALID,
+                            "graph is \"tiny\" or an API-format graph object",
+                            ctx.trace_id.clone(),
+                        ));
+                    }
+                };
+                let priority = args
+                    .priority
+                    .unwrap_or_else(|| Priority::for_caller(&ctx.session.caller, false));
+                let mut spec = prompt_spec(
+                    json!({ "graph": graph }),
+                    priority,
+                    TEST_MODULE,
+                    ctx.project.clone(),
+                    TEST_PROMPT_SECS,
+                );
+                spec.vram_need_mib = args.vram_need_mib;
+                spec.external_side_effects = args.external_side_effects;
+                let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
+                let summary = format!("job {} is {}", job.job_id, job.status.wire());
+                Ok((SubmitResult { job }, summary))
+            })
+        },
+    ));
+}
+
 /// Registers `engines.status`, `engines.start`, `engines.stop`, `engines.restart` and
 /// `engines.comfyui.install_node` on `reg`.
 pub fn register_engine_tools(reg: &mut Registry, slot: &EnginesSlot) {
@@ -215,7 +308,7 @@ pub fn register_engine_tools(reg: &mut Registry, slot: &EnginesSlot) {
                     "installing {} {} as job {}",
                     args.id.0, args.version.0, job.job_id
                 );
-                Ok((InstallResult { job }, summary))
+                Ok((SubmitResult { job }, summary))
             })
         },
     ));

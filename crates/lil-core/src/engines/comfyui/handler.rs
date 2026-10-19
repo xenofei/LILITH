@@ -12,7 +12,10 @@
 //!    that succeeded is ingested from `/history`. Any other is replaced by a new prompt for a
 //!    local job; a job with **external side effects** (paid or hosted work) ends `Unknown`
 //!    (`interrupted_unknown`) instead and is never posted again (CORE-128, ruling P3-R21).
-//! 2. **A new prompt.** Every `SaveImage`-type node's `filename_prefix` (linked or not) becomes
+//! 2. **A new prompt.** The graph is checked first ([`super::graph`]): partner nodes are
+//!    `comfyui.partner_nodes` (until plan 6b), model files missing from the refreshed
+//!    inventory `comfyui.execution_failed`, both before anything is uploaded or posted. Every
+//!    `SaveImage`-type node's `filename_prefix` (linked or not) becomes
 //!    `lil_<first 16 hex of the job id>_` ([`prefix_outputs`]); the inputs are checked, then
 //!    uploaded; the websocket is opened; a UUID is minted and persisted as the row's
 //!    `external_id` (the row is `submitting` already) before `POST /prompt` with the channel's
@@ -67,6 +70,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::client::{ComfyClient, ComfyError, OutputFile, RemoteState};
+use super::graph;
 use super::salvage::{self, Staging, sha256_file};
 use super::supervisor::{Comfy, ComfyEndpoint};
 use super::uploads::Uploads;
@@ -416,6 +420,15 @@ impl SuitePrompts {
     /// The job whose prompt is in ComfyUI now, if any.
     pub(crate) fn current(&self) -> Option<String> {
         self.lock().jobs.keys().next().cloned()
+    }
+
+    /// The prompt ids of the suite's attempts now, as far as they can be read without waiting
+    /// (one being posted is skipped: its `client_id` tells it apart anyway).
+    pub(crate) fn prompt_ids(&self) -> HashSet<String> {
+        let live: Vec<Arc<Live>> = self.lock().jobs.values().cloned().collect();
+        live.iter()
+            .filter_map(|l| l.posted.try_lock().ok().and_then(|p| p.prompt_id.clone()))
+            .collect()
     }
 
     /// The `CancelEnginePrompts` step: the gate closes (no attempt enters or posts any more),
@@ -850,6 +863,7 @@ impl Attempt<'_> {
                 self.job,
             )));
         }
+        self.check_graph(&graph).await?;
         self.prefix = prefix_outputs(&mut graph, &self.job.id);
         self.upload_inputs(&mut graph, &args.inputs).await?;
         // Open before the POST, so no event of the prompt is missed.
@@ -879,6 +893,87 @@ impl Attempt<'_> {
         }
         self.job.set_substatus(Substatus::QueuedInEngine).await;
         self.follow(&prompt_id, Some(socket)).await
+    }
+
+    /// The graph checks before anything is uploaded or posted (CORE-018, ARCH-057; module
+    /// docs of [`super::graph`]), on a copy with ComfyUI's node replacements applied (for the
+    /// classes ComfyUI doesn't have, as it applies them; the graph is posted as it came):
+    /// partner nodes fail with `comfyui.partner_nodes` (until plan 6b), their classes as
+    /// untrusted detail; model references the inventory doesn't hold fail with
+    /// `comfyui.execution_failed`, checked only when `root` is known, the inventory was
+    /// refreshed since the engine became ready, and `<root>\extra_model_paths.yaml` doesn't
+    /// exist (models may live elsewhere then).
+    async fn check_graph(&self, graph: &Value) -> Result<(), JobFailure> {
+        let info = self
+            .comfy
+            .graph_info(&self.client)
+            .await
+            .map_err(|e| unreachable(&e, self.job))?;
+        let missing_classes: serde_json::Map<String, Value> = info
+            .replacements
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(class, _)| info.object_info.get(class.as_str()).is_none())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut checked = graph.clone();
+        for (old, new) in
+            graph::apply_node_replacements(&mut checked, &Value::Object(missing_classes))
+        {
+            tracing::info!(job_id = %self.job.id, old, new, "a node of the graph is replaced as ComfyUI will replace it");
+        }
+        let partners = graph::partner_nodes(&checked, &info.object_info);
+        if !partners.is_empty() {
+            return Err(JobFailure::Final(untrusted(
+                error(
+                    &codes::COMFYUI_PARTNER_NODES,
+                    "The graph has partner (paid API) nodes, listed in the detail; the suite \
+                     doesn't run them yet (plan 6b). Remove them, or run the graph in \
+                     ComfyUI itself.",
+                    self.job,
+                ),
+                &partners.join(", "),
+            )));
+        }
+        let Some(root) = &self.endpoint.root else {
+            return Ok(());
+        };
+        let Some(inventory) = self.comfy.current_inventory() else {
+            return Ok(());
+        };
+        if root.join("extra_model_paths.yaml").exists() {
+            return Ok(());
+        }
+        let missing = graph::missing_models(&graph::model_refs(&checked), &inventory.paths());
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let shown: Vec<&str> = missing.iter().take(20).map(String::as_str).collect();
+        let mut e = untrusted(
+            error(
+                &codes::COMFYUI_EXECUTION_FAILED,
+                format!(
+                    "The graph names {} model file(s) that ComfyUI's models folder doesn't \
+                     hold (listed in the detail); nothing was sent. engines.status shows the \
+                     inventory.",
+                    missing.len()
+                ),
+                self.job,
+            ),
+            &shown.join("\n"),
+        );
+        e.fix = Some(lil_protocol::Fix {
+            ui_action: lil_protocol::UiAction {
+                id: "engines.status".to_string(),
+                label: "Show ComfyUI's models".to_string(),
+            },
+            agent_hint: Some(lil_protocol::AgentHint {
+                tool: "engines.status".to_string(),
+                arguments: json!({}),
+            }),
+        });
+        Err(JobFailure::Final(e))
     }
 
     /// Checks every input (its node and its path) before anything is uploaded, then uploads

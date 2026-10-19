@@ -25,12 +25,15 @@ use lil_protocol::{ErrorBody, codes};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::client::ComfyClient;
+use super::client::{ComfyClient, ComfyError};
 use super::handler::{SuitePrompts, output_tail_detail};
+use super::inventory::Inventory;
+use super::outside::{OutsideWatch, Suite};
 use super::uploads::Uploads;
 use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK, scrubbed_env};
 use crate::engines::{
-    COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, Listen, OutsideJobs, TOPIC,
+    COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, InventoryStatus, Listen, OutsideJobs,
+    TOPIC,
 };
 use crate::events::EventBus;
 use crate::jobs::{EngineKind, Jobs};
@@ -161,6 +164,25 @@ pub(crate) struct Comfy {
     client_id: tokio::sync::OnceCell<String>,
     /// When the unused uploads were last swept (the core's monotonic clock).
     swept: Mutex<Option<Duration>>,
+    env: Env,
+    /// Outside jobs ([`super::outside`]).
+    outside: Arc<OutsideWatch>,
+    /// (readiness epoch, ready): the epoch counts the times the engine became ready (0:
+    /// never), so what was learnt of one engine run ([`GraphInfo`], the inventory) is dropped
+    /// with it.
+    ready: tokio::sync::watch::Sender<(u64, bool)>,
+    /// /object_info and /node_replacements, read once per readiness epoch.
+    graph_info: tokio::sync::Mutex<Option<(u64, Arc<GraphInfo>)>>,
+    /// The model inventory refreshed in a readiness epoch.
+    inventory: Mutex<Option<(u64, Arc<Inventory>)>>,
+}
+
+/// What the graph checks need of one engine run: /object_info and /node_replacements
+/// ({} for a ComfyUI without that route).
+#[derive(Debug)]
+pub(crate) struct GraphInfo {
+    pub object_info: Arc<Value>,
+    pub replacements: Value,
 }
 
 impl Comfy {
@@ -213,6 +235,11 @@ impl Comfy {
             prompts: Arc::default(),
             client_id: tokio::sync::OnceCell::new(),
             swept: Mutex::new(None),
+            env: env.clone(),
+            outside: Arc::default(),
+            ready: tokio::sync::watch::Sender::new((0, false)),
+            graph_info: tokio::sync::Mutex::new(None),
+            inventory: Mutex::new(None),
         })
     }
 
@@ -359,9 +386,16 @@ impl Comfy {
             pid: v.pid,
             version: v.version,
             listen: v.listen,
-            outside_jobs: OutsideJobs::default(),
+            outside_jobs: OutsideJobs {
+                running: self.outside.running(),
+                queued: self.outside.queued(),
+            },
             suite_job: self.prompts.current(),
             restart_needed: self.restart_needed.load(Ordering::SeqCst),
+            inventory: self.current_inventory().map(|inv| InventoryStatus {
+                models: u32::try_from(inv.files.len()).unwrap_or(u32::MAX),
+                refreshed: inv.refreshed.clone(),
+            }),
         }
     }
 
@@ -383,14 +417,185 @@ impl Comfy {
 
     /// Sets what `engines.status` shows; a change is published.
     fn set_view(&self, v: View) {
-        let changed = {
-            let mut view = lock(&self.view);
-            let changed = *view != v;
-            *view = v;
-            changed
-        };
-        if changed {
+        if self.store_view(v) {
             self.publish("status");
+        }
+    }
+
+    /// Stores ; whether it changed. Becoming ready (from another state, or as another class)
+    /// starts a new readiness epoch; a stopped engine runs no outside job any more.
+    fn store_view(&self, v: View) -> bool {
+        let old = {
+            let mut view = lock(&self.view);
+            std::mem::replace(&mut *view, v.clone())
+        };
+        let ready = v.state == EngineState::Ready;
+        let new_run = ready && (old.state != EngineState::Ready || old.class != v.class);
+        self.ready.send_if_modified(|(epoch, was)| {
+            let before = (*epoch, *was);
+            if new_run {
+                *epoch += 1;
+            }
+            *was = ready;
+            before != (*epoch, *was)
+        });
+        if v.state == EngineState::Stopped && self.outside.clear() {
+            self.publish("outside_job");
+        }
+        old != v
+    }
+
+    /// The readiness epoch now (see the `ready` field).
+    pub(crate) fn ready_epoch(&self) -> u64 {
+        self.ready.borrow().0
+    }
+
+    /// (readiness epoch, ready), as it changes.
+    pub(crate) fn ready_rx(&self) -> tokio::sync::watch::Receiver<(u64, bool)> {
+        self.ready.subscribe()
+    }
+
+    /// Cancelled by the StopEngines step.
+    pub(crate) fn stopped(&self) -> CancellationToken {
+        self.stopped.clone()
+    }
+
+    pub(crate) fn outside(&self) -> &Arc<OutsideWatch> {
+        &self.outside
+    }
+
+    /// The jobs, while the core has them.
+    pub(crate) fn jobs(&self) -> Option<Arc<Jobs>> {
+        self.jobs.upgrade()
+    }
+
+    /// The NVML driver version of the latest GPU reading.
+    pub(crate) fn driver(&self) -> Option<String> {
+        self.telemetry.snapshot().gpu.map(|g| g.driver)
+    }
+
+    /// Now, RFC 3339 UTC, by the core's clock.
+    pub(crate) fn now_rfc3339(&self) -> String {
+        let secs = self
+            .clock
+            .utc_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        lil_schema::time::rfc3339(secs)
+    }
+
+    /// The default workspace's folder (its `registry/models.yaml` names model files).
+    pub(crate) fn default_workspace(&self) -> Option<PathBuf> {
+        crate::workspace::default_of(&self.env).map(|w| w.path)
+    }
+
+    /// Keeps the inventory a job refreshed in readiness poch, unless the engine became ready
+    /// again since.
+    pub(crate) fn set_inventory(&self, epoch: u64, inventory: Inventory) {
+        if epoch == self.ready_epoch() {
+            *lock(&self.inventory) = Some((epoch, Arc::new(inventory)));
+        }
+    }
+
+    /// The inventory refreshed since the engine last became ready, if any.
+    pub(crate) fn current_inventory(&self) -> Option<Arc<Inventory>> {
+        let epoch = self.ready_epoch();
+        lock(&self.inventory)
+            .as_ref()
+            .filter(|(e, _)| *e == epoch)
+            .map(|(_, inv)| inv.clone())
+    }
+
+    /// `/object_info` and `/node_replacements` of this engine run, read once per readiness
+    /// epoch. A ComfyUI that doesn't serve `/node_replacements` (404) has none.
+    ///
+    /// # Errors
+    /// [`ComfyError`] of `/object_info` or `/node_replacements`.
+    pub(crate) async fn graph_info(
+        &self,
+        client: &ComfyClient,
+    ) -> Result<Arc<GraphInfo>, ComfyError> {
+        let epoch = self.ready_epoch();
+        let mut cached = self.graph_info.lock().await;
+        if let Some((e, info)) = cached.as_ref()
+            && *e == epoch
+        {
+            return Ok(info.clone());
+        }
+        let object_info = client.object_info().await?;
+        let replacements = match client.node_replacements().await {
+            Ok(r) => r,
+            Err(ComfyError::Http(404, _)) => json!({}),
+            Err(e) => return Err(e),
+        };
+        let info = Arc::new(GraphInfo {
+            object_info: Arc::new(object_info),
+            replacements,
+        });
+        *cached = Some((epoch, info.clone()));
+        Ok(info)
+    }
+
+    /// The channel's `client_id` when one was ever kept (none minted here).
+    async fn known_client_id(&self) -> Option<String> {
+        if let Some(id) = self.client_id.get() {
+            return Some(id.clone());
+        }
+        let found = self
+            .suite
+            .call(|conn| {
+                conn.query_row("SELECT id FROM comfy_client LIMIT 1", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(crate::state::StateError::Io(e.to_string())),
+                })
+            })
+            .await
+            .ok()
+            .flatten()?;
+        let _ = self.client_id.set(found.clone());
+        Some(found)
+    }
+
+    /// A new call id (`c_<16 hex>`) for a usage draft no tool call made.
+    fn call_id(&self) -> String {
+        self.jobs
+            .upgrade()
+            .map_or_else(|| "c_0000000000000000".to_string(), |j| j.mint_id("c"))
+    }
+
+    /// One poll of outside jobs ([`super::outside`]): the counts (a change is published on the
+    /// `engines` topic as `outside_job`) and the usage of paid outside prompts.
+    pub(crate) async fn poll_outside(&self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let suite = Suite {
+            client_id: self.known_client_id().await,
+            prompt_ids: self.prompts.prompt_ids(),
+        };
+        let object_info = || async {
+            match self.graph_info(client).await {
+                Ok(info) => Some(info.object_info.clone()),
+                Err(e) => {
+                    tracing::debug!(error = %e, "ComfyUI's object info could not be read for an outside prompt");
+                    None
+                }
+            }
+        };
+        let mut call_id = || self.call_id();
+        let (changed, drafts) = self
+            .outside
+            .poll(client, &suite, object_info, &mut call_id)
+            .await;
+        if changed {
+            self.publish("outside_job");
+        }
+        for (draft, ctx) in drafts {
+            self.usage.record(draft, ctx).await;
         }
     }
 
@@ -613,7 +818,7 @@ impl Comfy {
             end(owned).await;
         }
         self.set_pids(Vec::new());
-        lock(&self.view).clone_from(&STOPPED);
+        self.store_view(STOPPED);
         let status = serde_json::to_value(self.status()).unwrap_or(Value::Null);
         self.events.publish(
             TOPIC,
@@ -624,7 +829,8 @@ impl Comfy {
     /// An owned engine with no suite job for `idle_free_after_s` is asked to free its models
     /// and memory, once until a job uses it again.
     async fn idle_free(&self, config: &ComfyConfig, client: &ComfyClient) {
-        let busy = self.jobs.upgrade().is_some_and(|jobs| jobs.busy());
+        // An outside prompt uses the engine too: it is never freed under one.
+        let busy = self.jobs.upgrade().is_some_and(|jobs| jobs.busy()) || self.outside.any();
         let now = self.clock.monotonic();
         let due = {
             let mut idle = lock(&self.idle);
@@ -993,6 +1199,11 @@ impl Comfy {
     /// The `StopEngines` step: the supervisor ends and an owned engine is stopped.
     pub(crate) async fn shutdown(&self) {
         self.stopped.cancel();
+        // Paid outside prompts still open: their end will not be seen (recorded `pending`).
+        let mut call_id = || self.call_id();
+        for (draft, ctx) in self.outside.flush(&mut call_id) {
+            self.usage.record(draft, ctx).await;
+        }
         let mut ops = self.ops.lock().await;
         if let Some(owned) = ops.take() {
             end(owned).await;

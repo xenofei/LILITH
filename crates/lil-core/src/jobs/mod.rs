@@ -19,7 +19,8 @@
 //!   `[jobs] preempt_agent_batches = true` an `interactive` job cancels the running `agent`
 //!   engine job of its lane, which goes back to the head of its class (CORE-125). Before a job
 //!   starts, the [`Admission`] (the GPU scheduler, [`scheduler`]; [`AlwaysAdmit`] by default)
-//!   may hold it in `waiting_for_vram`, and it is told whether jobs run or wait for VRAM.
+//!   may hold it in `waiting_for_vram`, or in `waiting` while its engine runs outside prompts
+//!   ([`Admit::Wait`]), and it is told whether jobs run or wait for VRAM.
 //!   [`Jobs::kick`] (on every telemetry sample) asks again, and runs the watchdog: a running job
 //!   more than 3× its `expected_secs` past the moment its attempt became `executing` gets
 //!   `watchdog: "slow"` (a `watchdog` event on `job:<id>`); it keeps running (ARCH-072).
@@ -659,6 +660,9 @@ pub enum Admit {
         need_mib: u64,
         free_mib: u64,
     },
+    /// Not now, for another reason (its engine runs prompts from outside the suite, ARCH-069):
+    /// the job stays `waiting` and is asked again on every [`Jobs::kick`].
+    Wait,
 }
 
 /// Set by [`Jobs::submit`]: the dispatcher reads it after Execute, and a call that submitted a

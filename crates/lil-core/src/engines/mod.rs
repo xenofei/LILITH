@@ -28,8 +28,14 @@
 //!   The `CancelEnginePrompts` shutdown step ([`Engines::cancel_prompts_step`]) cancels them
 //!   through the per-job endpoint (ARCH-021).
 //!
+//! - **Observation** ([`Engines::observe`]): outside jobs ([`comfyui::outside`]) keep the core
+//!   up and are waited for, never cancelled; each time ComfyUI becomes ready a `comfy.inventory`
+//!   job ([`comfyui::inventory`]) captures the environment and the model files; before the
+//!   POST, a prompt's graph is checked ([`comfyui::graph`]).
+//!
 //! The engine tools are in [`tools`] (registered by the server, since they need the running
-//! engines). The `engines` topic carries `{kind: "status", engine}` and
+//! engines). The `engines` topic carries `{kind: "status", engine}`,
+//! `{kind: "outside_job", engine}` (the outside counts changed) and
 //! `{kind: "restart_needed", engine}`; its snapshot is `engines.status`'s result.
 //!
 //! `jobs` and `telemetry` never use this module: the scheduler reaches the engines through
@@ -42,6 +48,7 @@ pub mod tools;
 use std::sync::{Arc, Weak};
 
 use futures_util::future::BoxFuture;
+use lil_platform::fs::SystemProbe;
 use lil_platform::sockets::SocketTable;
 use lil_platform::{Clock, Env};
 use lil_protocol::{ErrorBody, codes};
@@ -51,7 +58,7 @@ use serde_json::{Value, json};
 
 use crate::events::{EventBus, SnapshotProvider};
 use crate::jobs::scheduler::EngineControl;
-use crate::jobs::{EngineKind, Jobs};
+use crate::jobs::{EngineKind, JobCaller, Jobs, SubmittedSlot};
 use crate::lifecycle::{ShutdownPhase, ShutdownStep};
 use crate::meter::UsageSink;
 use crate::store::FailPoints;
@@ -59,6 +66,8 @@ use crate::telemetry::Telemetry;
 
 pub use comfyui::handler::ComfyPromptHandler;
 pub use comfyui::install::NodeInstallHandler;
+pub use comfyui::inventory::InventoryHandler;
+pub use comfyui::outside::OutsideWatch;
 pub use comfyui::supervisor::ComfyEndpoint;
 pub use config::{ComfyConfig, scrubbed_env};
 
@@ -102,7 +111,8 @@ pub enum Listen {
     Unknown,
 }
 
-/// Prompts in ComfyUI that the suite didn't submit (Task 13 fills them in).
+/// Prompts in ComfyUI that the suite didn't submit, as the last poll saw them
+/// ([`comfyui::outside`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, JsonSchema)]
 pub struct OutsideJobs {
     pub running: u32,
@@ -130,6 +140,16 @@ pub struct EngineStatus {
     pub suite_job: Option<String>,
     /// A node pack was installed since the engine started.
     pub restart_needed: bool,
+    /// The model inventory refreshed since the engine became ready ([`comfyui::inventory`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<InventoryStatus>,
+}
+
+/// `engines.status`'s `inventory`: how many model files, refreshed when (RFC 3339 UTC).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct InventoryStatus {
+    pub models: u32,
+    pub refreshed: String,
 }
 
 /// `engine.unknown` for an engine the core doesn't manage (no input reaches
@@ -189,6 +209,10 @@ impl Engines {
         let engines = Arc::new_cyclic(|weak: &Weak<Engines>| {
             jobs.register(Arc::new(NodeInstallHandler::new(weak.clone())));
             jobs.register(Arc::new(ComfyPromptHandler::new(weak.clone())));
+            jobs.register(Arc::new(InventoryHandler::new(
+                weak.clone(),
+                Arc::new(SystemProbe),
+            )));
             Engines { comfy }
         });
         comfyui::supervisor::Comfy::spawn_monitor(&engines.comfy);
@@ -288,6 +312,16 @@ impl Engines {
         self.comfy.tick().await;
     }
 
+    /// One poll of outside jobs now, as [`Engines::observe`] makes every
+    /// [`comfyui::outside::POLL_EVERY`] while ComfyUI is ready, then a kick of the jobs.
+    #[doc(hidden)]
+    pub async fn poll_outside(&self) {
+        self.comfy.poll_outside().await;
+        if let Some(jobs) = self.comfy.jobs() {
+            jobs.kick();
+        }
+    }
+
     /// At the core's start, before any job runs: drops the ComfyUI upload references a dead
     /// core left behind (they would keep those uploads forever).
     pub async fn startup(&self) {
@@ -315,6 +349,84 @@ impl Engines {
     pub(crate) fn comfy(&self) -> &Arc<comfyui::supervisor::Comfy> {
         &self.comfy
     }
+
+    /// The outside jobs: the core's idle blocker for them (ARCH-020).
+    pub fn outside_watch(&self) -> Arc<OutsideWatch> {
+        self.comfy.outside().clone()
+    }
+
+    /// Starts observing ComfyUI (ARCH-069; [`comfyui::outside`]): each time it becomes ready, a
+    /// `comfy.inventory` job is submitted; while it stays ready, outside jobs are polled every
+    /// [`comfyui::outside::POLL_EVERY`] and the jobs are kicked after each poll, so a job that
+    /// waits for them is looked at again. Ends with the engines or the `StopEngines` step.
+    /// The core calls it once it serves; call it inside a tokio runtime.
+    pub fn observe(self: &Arc<Self>) {
+        if self.comfy.client().is_none() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let mut ready = self.comfy.ready_rx();
+        let stopped = self.comfy.stopped();
+        tokio::spawn(async move {
+            let mut inventoried = 0u64;
+            loop {
+                let (epoch, is_ready) = *ready.borrow_and_update();
+                if is_ready {
+                    let Some(engines) = weak.upgrade() else {
+                        return;
+                    };
+                    if epoch != inventoried {
+                        inventoried = epoch;
+                        engines.submit_inventory(epoch).await;
+                    }
+                    engines.poll_outside().await;
+                }
+                let pause = async {
+                    if is_ready {
+                        tokio::time::sleep(comfyui::outside::POLL_EVERY).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    () = pause => {}
+                    changed = ready.changed() => if changed.is_err() { return },
+                    () = stopped.cancelled() => return,
+                }
+            }
+        });
+    }
+
+    /// Submits the `comfy.inventory` job of readiness `epoch`: the core's own job, with no
+    /// tool call, so `cli` (`agent`) in the suite's scope (Appendix F "Jobs").
+    async fn submit_inventory(&self, epoch: u64) {
+        let Some(jobs) = self.comfy.jobs() else {
+            return;
+        };
+        let caller = JobCaller {
+            caller: lil_protocol::CallerKind::Cli,
+            idem_scope: "cli|none".to_string(),
+            workspace: None,
+            trace_id: jobs.mint_id("t"),
+            idem_key: None,
+            call_id: jobs.mint_id("c"),
+            reservation: None,
+            submitted: Arc::new(SubmittedSlot::new()),
+            origin: None,
+            retry_of: None,
+        };
+        match jobs
+            .submit(&caller, comfyui::inventory::inventory_spec(epoch))
+            .await
+        {
+            Ok(job) => {
+                tracing::info!(job_id = %job.job_id, "ComfyUI is ready; its model inventory is refreshed")
+            }
+            Err(e) => {
+                tracing::warn!(code = %e.code, error = %e.message, "the model inventory job could not be submitted")
+            }
+        }
+    }
 }
 
 impl EngineControl for Engines {
@@ -326,6 +438,10 @@ impl EngineControl for Engines {
         Box::pin(async move {
             Engines::unload(self, e).await;
         })
+    }
+
+    fn outside_busy(&self, e: EngineKind) -> bool {
+        e == EngineKind::ComfyUi && self.comfy.outside().any()
     }
 }
 

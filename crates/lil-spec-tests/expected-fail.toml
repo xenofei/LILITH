@@ -6,11 +6,6 @@
 # Plan 3 (Task 7): the scenario tests that Tasks 8-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 13
-    # ARCH-069, QA-051
-    { name = "lil-spec-tests::comfy_engine::outside_jobs_are_observed_waited_for_and_never_cancelled", rule = "ARCH-069", file = "tests/comfy_engine.rs" },
-    # ARCH-020
-    { name = "lil-spec-tests::comfy_engine::outside_jobs_keep_the_core_up", rule = "ARCH-020", file = "tests/comfy_engine.rs" },
     # Task 14
     # CORE-131, ARCH-052, ARCH-059
     { name = "lil-spec-tests::comfy_engine::node_install_needs_confirmation_and_a_pinned_version", rule = "CORE-131", file = "tests/comfy_engine.rs" },

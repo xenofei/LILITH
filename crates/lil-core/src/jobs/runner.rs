@@ -896,6 +896,13 @@ impl Shared {
                 }
                 let a = q.jobs.get_mut(&id).expect("a picked job is queued");
                 match admission.admit(&a.info.spec) {
+                    Admit::Wait => {
+                        // It waits for its engine, not for VRAM: `waiting` again.
+                        if a.waiting_for_vram {
+                            a.waiting_for_vram = false;
+                            rewait.push((id, a.info.scope.clone()));
+                        }
+                    }
                     Admit::WaitForVram { need_mib, free_mib } => {
                         if !a.waiting_for_vram {
                             a.waiting_for_vram = true;
@@ -2174,6 +2181,12 @@ impl Jobs {
     /// its uploads and model hashes, Appendix F).
     pub fn suite_state(&self) -> Arc<StateDb> {
         self.shared.states.suite_db()
+    }
+
+    /// A new id `<prefix>_<16 hex>` from the core's id source: the call and trace ids of a job
+    /// the core submits itself (`comfy.inventory`), with no tool call.
+    pub fn mint_id(&self, prefix: &str) -> String {
+        self.shared.ids.id(prefix)
     }
 
     /// The `PersistInterrupted` shutdown step (ARCH-021 step 3).

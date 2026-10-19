@@ -30,6 +30,9 @@
 //!   find them through a slot filled before the core serves). They register the node-install
 //!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
 //!   measured with the workspace, and stop an owned ComfyUI in the `StopEngines` shutdown step.
+//!   Their outside-jobs watch is an idle blocker (it holds no drain), and their observation
+//!   ([`Engines::observe`]: the outside-jobs poll every 2 s while ComfyUI is ready, the model
+//!   inventory each time it becomes ready) starts with the suite's jobs recovered.
 
 mod conn;
 
@@ -50,7 +53,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
 use crate::engines::Engines;
-use crate::engines::tools::{EnginesSlot, register_engine_tools};
+use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
@@ -445,6 +448,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     // The engines need the jobs, which the dispatcher builds: their tools find them here.
     let engine_slot = EnginesSlot::default();
     register_engine_tools(&mut registry, &engine_slot);
+    if cfg.test_tools {
+        register_engine_test_tools(&mut registry);
+    }
     let dispatcher = Dispatcher::new(
         registry,
         PipelineHooks::plan2(),
@@ -504,6 +510,12 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }
     lifecycle.add_blocker(jobs.clone());
+    // Outside ComfyUI jobs keep the core up but hold no drain (ARCH-020, ARCH-069); the poller
+    // runs while the engine is ready.
+    let outside = engines.outside_watch();
+    outside.stop_on_drain(lifecycle.drain_token());
+    lifecycle.add_blocker(outside);
+    engines.observe();
     lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());

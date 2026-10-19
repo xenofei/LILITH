@@ -30,6 +30,10 @@
 //!   `/free` for ComfyUI); a job of no engine leaves it where it is.
 //! - **Busy.** While jobs run or wait for VRAM, per-process GPU memory is read every second
 //!   ([`Telemetry::set_busy`], CORE-061), so each re-check sees fresh figures.
+//! - **Outside jobs.** A job of an engine that runs or queues prompts from outside the suite
+//!   waits (`waiting`, [`Admit::Wait`]) until the engine's poll sees none
+//!   ([`EngineControl::outside_busy`], ARCH-069, CORE-123); the engine kicks the jobs after
+//!   each poll.
 //! - **The watchdog** ([`watchdog_slow`]): a job running more than 3× its expected time since
 //!   `execution_start` is flagged `watchdog: "slow"` and never cancelled. The runner keeps the
 //!   time its attempt became `executing` (for a ComfyUI job, the engine's `execution_start`)
@@ -96,6 +100,10 @@ pub trait EngineControl: Send + Sync {
     fn pids(&self, e: EngineKind) -> Vec<u32>;
     /// Asks the engine to free its VRAM (`/free` for ComfyUI); best effort.
     fn unload<'a>(&'a self, e: EngineKind) -> BoxFuture<'a, ()>;
+    /// Whether prompts from outside the suite run or wait in the engine (ARCH-069), as the
+    /// engine's last poll saw them. Never blocks and never asks the engine: it is called under
+    /// the queue's lock.
+    fn outside_busy(&self, e: EngineKind) -> bool;
 }
 
 /// No engines (until Task 11): no processes, nothing to unload.
@@ -109,6 +117,10 @@ impl EngineControl for NoEngines {
 
     fn unload<'a>(&'a self, _e: EngineKind) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
+    }
+
+    fn outside_busy(&self, _e: EngineKind) -> bool {
+        false
     }
 }
 
@@ -291,6 +303,11 @@ impl Admission for GpuScheduler {
     fn admit(&self, spec: &JobSpec) -> Admit {
         if spec.lane != Lane::GpuHeavy {
             return Admit::Go;
+        }
+        // Prompts from outside the suite go first (ARCH-069): asked before the lease moves
+        // and before any VRAM check.
+        if spec.engine.is_some_and(|e| self.engines.outside_busy(e)) {
+            return Admit::Wait;
         }
         let held = self.pass_lease(spec.engine);
         let need_mib = spec.vram_need_mib.unwrap_or(0);

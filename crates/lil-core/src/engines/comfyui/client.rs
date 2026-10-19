@@ -5,7 +5,8 @@
 //! `POST /api/jobs/{id}/cancel` (never a bare `/interrupt`, ARCH-021), where a prompt is
 //! ([`ComfyClient::state`]: `/api/jobs/{id}`, `/history/{id}`, `/queue`), `/view` streamed into
 //! a new file with its SHA-256 taken on the way, `/upload/image`, `/queue`, `/api/jobs`,
-//! `/object_info` and `/node_replacements`. The websocket is in [`super::ws`].
+//! `/object_info` and `/node_replacements`; for the outside-jobs poll, `/api/queue` and
+//! `/api/jobs/{id}`. The websocket is in [`super::ws`].
 //!
 //! The client never uses a proxy and never follows a redirect (a 3xx is
 //! [`ComfyError::Protocol`]): every request goes straight to the loopback address, and only
@@ -483,27 +484,29 @@ impl ComfyClient {
     /// # Errors
     /// [`ComfyError`].
     pub async fn queue(&self) -> Result<QueueView, ComfyError> {
-        let queue = self.get_json("queue").await?;
-        let entries = |key: &str| -> Vec<QueueEntry> {
-            queue
-                .get(key)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| {
-                    Some(QueueEntry {
-                        number: e.get(0).and_then(Value::as_u64).unwrap_or(0),
-                        prompt_id: e.get(1)?.as_str()?.to_string(),
-                        graph: e.get(2).cloned().unwrap_or(Value::Null),
-                        extra_data: e.get(3).cloned().unwrap_or(Value::Null),
-                    })
-                })
-                .collect()
-        };
-        Ok(QueueView {
-            running: entries("queue_running"),
-            pending: entries("queue_pending"),
-        })
+        Ok(queue_view(&self.get_json("queue").await?))
+    }
+
+    /// `GET /api/queue`: the same as [`ComfyClient::queue`], under the `/api` prefix that
+    /// ComfyUI serves every route under too. The outside-jobs poll uses it, so its requests
+    /// are told apart from a prompt's own look at `/queue`.
+    ///
+    /// # Errors
+    /// [`ComfyError`].
+    pub async fn outside_queue(&self) -> Result<QueueView, ComfyError> {
+        Ok(queue_view(&self.get_json("api/queue").await?))
+    }
+
+    /// `GET /api/jobs/{id}`: the entry, or `None` when ComfyUI doesn't know it (404).
+    ///
+    /// # Errors
+    /// [`ComfyError`].
+    pub async fn job_detail(&self, prompt_id: &str) -> Result<Option<Value>, ComfyError> {
+        match self.get_json(&format!("api/jobs/{prompt_id}")).await {
+            Ok(v) => Ok(Some(v)),
+            Err(ComfyError::Http(404, _)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// `GET /api/jobs` (its first page).
@@ -544,6 +547,29 @@ impl ComfyClient {
     }
 }
 
+/// The running and pending entries of a `/queue` answer.
+fn queue_view(queue: &Value) -> QueueView {
+    let entries = |key: &str| -> Vec<QueueEntry> {
+        queue
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                Some(QueueEntry {
+                    number: e.get(0).and_then(Value::as_u64).unwrap_or(0),
+                    prompt_id: e.get(1)?.as_str()?.to_string(),
+                    graph: e.get(2).cloned().unwrap_or(Value::Null),
+                    extra_data: e.get(3).cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect()
+    };
+    QueueView {
+        running: entries("queue_running"),
+        pending: entries("queue_pending"),
+    }
+}
 fn unreachable(e: reqwest::Error) -> ComfyError {
     if e.is_connect() {
         ComfyError::Refused(e.to_string())
