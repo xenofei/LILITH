@@ -14,7 +14,8 @@ use reqwest::Url;
 
 /// How long one request may take, connection included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a connection may take: on loopback a refused one is immediate.
+/// How long a connection may take. A refused connection on Windows loopback isn't immediate (the
+/// stack retries it), so a probe of a stopped engine takes about this long, 2 s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most of a failed response's body an error keeps.
 const MAX_ERROR_BODY: usize = 4096;

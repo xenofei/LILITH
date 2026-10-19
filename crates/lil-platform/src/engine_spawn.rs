@@ -162,32 +162,39 @@ fn read_lines(stream: &'static str, mut pipe: std::io::PipeReader, on_line: Arc<
     });
 }
 
-/// Splits output into lines: a line ends at `\n`, `\r` or `\r\n` (a progress bar that redraws
-/// with `\r` gives one line per redraw), and is cut at [`MAX_LINE_BYTES`]. The endings are not
-/// part of a line.
+/// Splits output into lines: a line ends at `\n` or `\r\n`, and is cut at [`MAX_LINE_BYTES`].
+/// A run of `\r` redraws (a progress bar) becomes one line, its last segment: `10%\r20%\r\n`
+/// is `20%`. The endings are not part of a line.
 #[derive(Debug, Default)]
 struct Lines {
     line: Vec<u8>,
-    /// The last byte was `\r`: a `\n` right after it ends nothing more.
-    after_cr: bool,
+    /// The last non-empty segment ended by `\r` since the last line.
+    redraw: Option<Vec<u8>>,
 }
 
 impl Lines {
     fn push(&mut self, bytes: &[u8], out: &mut impl FnMut(&[u8])) {
         for &b in bytes {
-            let after_cr = std::mem::take(&mut self.after_cr);
             match b {
-                b'\n' if after_cr => {}
-                b'\n' | b'\r' => {
-                    out(&self.line);
+                b'\r' => {
+                    if !self.line.is_empty() {
+                        self.redraw = Some(std::mem::take(&mut self.line));
+                    }
+                }
+                b'\n' => {
+                    let redraw = self.redraw.take();
+                    match redraw {
+                        Some(last) if self.line.is_empty() => out(&last),
+                        _ => out(&self.line),
+                    }
                     self.line.clear();
-                    self.after_cr = b == b'\r';
                 }
                 _ => {
                     self.line.push(b);
                     if self.line.len() == MAX_LINE_BYTES {
                         out(&self.line);
                         self.line.clear();
+                        self.redraw = None;
                     }
                 }
             }
@@ -196,10 +203,13 @@ impl Lines {
 
     /// The last line, when the output ended without a line ending.
     fn finish(&mut self, out: &mut impl FnMut(&[u8])) {
+        let redraw = self.redraw.take();
         if !self.line.is_empty() {
             out(&self.line);
-            self.line.clear();
+        } else if let Some(last) = redraw {
+            out(&last);
         }
+        self.line.clear();
     }
 }
 
@@ -268,12 +278,15 @@ mod tests {
     }
 
     #[test] // spec: ARCH-119
-    fn lines_end_at_lf_cr_or_crlf_and_are_capped() {
+    fn lines_end_at_lf_or_crlf_redraws_coalesce_and_lines_are_capped() {
         let (cr, lf) = (13_u8, 10_u8);
         let first = [b'a', cr, lf, b'b', lf];
         let bar = [b'1', b'%', cr, b'2', b'%', cr];
         let rest = [lf, b'e', b'n', b'd'];
-        assert_eq!(split(&[&first, &bar, &rest]), ["a", "b", "1%", "2%", "end"]);
+        // The redraws `1%`, `2%` are one line, the last one.
+        assert_eq!(split(&[&first, &bar, &rest]), ["a", "b", "2%", "end"]);
+        // A run of redraws the output ends on gives its last segment.
+        assert_eq!(split(&[&[b'5', cr, b'9', cr]]), ["9"]);
         // A CR LF split across two reads is still one ending.
         assert_eq!(split(&[&[b'x', cr], &[lf, b'y', lf]]), ["x", "y"]);
         let long = vec![b'z'; MAX_LINE_BYTES + 5];

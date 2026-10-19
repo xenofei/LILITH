@@ -293,7 +293,9 @@ impl NodeInstallHandler {
                 &[],
             )))
         })?;
-        let spawned = engines.comfy().clock.monotonic();
+        // Latency is a measurement of the call itself, so it is wall time, not the core's
+        // scheduling clock.
+        let spawned = std::time::Instant::now();
         tracing::info!(id, version, pid = cli.pid(), "a node install runs");
         let mut cancel = job.cancel.clone();
         let ended = tokio::select! {
@@ -304,7 +306,7 @@ impl NodeInstallHandler {
             _ = cancel.wait_for(|c| *c) => Ended::Cancelled,
             () = tokio::time::sleep(INSTALL_TIMEOUT) => Ended::TimedOut,
         };
-        let latency = engines.comfy().clock.monotonic().saturating_sub(spawned);
+        let latency = spawned.elapsed();
         // Whatever comfy-cli started ends with it; then its output is read to the end.
         let _ = kill_on_close.terminate();
         drop(kill_on_close);
@@ -320,11 +322,7 @@ impl NodeInstallHandler {
 
         // comfy-cli ran, so the registry was asked (CORE-069): how it ended, and how long it
         // took. (Task 15 carry: the write-ahead `pending` record before the spawn, CORE-071.)
-        let status = match ended {
-            Ended::Exited(0) => UsageStatus::Succeeded,
-            Ended::Cancelled => UsageStatus::Cancelled,
-            Ended::Exited(_) | Ended::TimedOut => UsageStatus::Failed,
-        };
+        let status = usage_status(&ended);
         let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
         engines
             .comfy()
@@ -361,6 +359,15 @@ impl NodeInstallHandler {
                 &lines,
             )))),
         }
+    }
+}
+
+/// The usage `status` of an install that ended so (CORE-069).
+fn usage_status(ended: &Ended) -> UsageStatus {
+    match ended {
+        Ended::Exited(0) => UsageStatus::Succeeded,
+        Ended::Cancelled => UsageStatus::Cancelled,
+        Ended::Exited(_) | Ended::TimedOut => UsageStatus::Failed,
     }
 }
 
@@ -426,6 +433,15 @@ impl JobHandler for NodeInstallHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: CORE-069
+    fn every_way_an_install_ends_has_its_usage_status() {
+        assert_eq!(usage_status(&Ended::Exited(0)), UsageStatus::Succeeded);
+        assert_eq!(usage_status(&Ended::Exited(1)), UsageStatus::Failed);
+        assert_eq!(usage_status(&Ended::Exited(u32::MAX)), UsageStatus::Failed);
+        assert_eq!(usage_status(&Ended::Cancelled), UsageStatus::Cancelled);
+        assert_eq!(usage_status(&Ended::TimedOut), UsageStatus::Failed);
+    }
 
     #[test] // spec: ARCH-059
     fn only_exact_versions_and_registry_ids_pass() {

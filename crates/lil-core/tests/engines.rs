@@ -1059,7 +1059,7 @@ async fn install_requires_an_exact_version_and_records_usage_and_restart_needed(
     assert_eq!(ctx.caller_kind, "cli");
     // How it ended and how long it took (CORE-069).
     assert_eq!(draft.status, UsageStatus::Succeeded);
-    assert!(draft.latency_ms.is_some(), "{draft:?}");
+    assert!(draft.latency_ms.is_some_and(|ms| ms > 0), "{draft:?}");
 
     // ComfyUI's Python goes first on PATH, and the environment is the scrubbed one.
     let started = read_json(&fake.root().join("fake-comfy-cli.env.json")).unwrap();
@@ -1081,12 +1081,147 @@ async fn install_requires_an_exact_version_and_records_usage_and_restart_needed(
         .collect();
     assert_eq!(kept, names, "a secret reached comfy-cli");
 
-    // The attached ComfyUI goes away (its owner restarts it): no restart is needed any more.
+    // The attached ComfyUI goes away: one failed request clears nothing; 30 s without an
+    // answer (the core's clock) means its owner stopped or restarted it.
     engines.tick().await;
     assert_eq!(engines.status().await[0].class, EngineClass::Attached);
     drop(fake);
     engines.tick().await;
+    assert!(
+        engines.status().await[0].restart_needed,
+        "cleared by one failed request"
+    );
+    rig.clock.advance(Duration::from_secs(29));
+    engines.tick().await;
+    assert!(
+        engines.status().await[0].restart_needed,
+        "cleared before 30 s"
+    );
+    rig.clock.advance(Duration::from_secs(1));
+    engines.tick().await;
     assert!(!engines.status().await[0].restart_needed);
+}
+
+/// A cancelled install is a `cancelled` usage record, timed in wall time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-069, CORE-131
+async fn a_cancelled_install_records_cancelled_usage() {
+    let fake = FakeComfy::start();
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    lil_testkit::files::write_file(&fake.root().join("HANG"), b"");
+    let rig = Rig::new(env);
+    let _engines = rig.engines(Arc::new(OsSockets));
+    let spec = install::job_spec(
+        &NodeId("comfyui-test-node".into()),
+        &ExactVersion("1.2.3".into()),
+        "cli",
+        Priority::Agent,
+        None,
+    );
+    let caller = rig.caller();
+    let job = rig.jobs.submit(&caller, spec).await.unwrap();
+    let log = fake.root().join("fake-comfy-cli.env.json");
+    until("comfy-cli runs", || log.exists()).await;
+    rig.jobs
+        .cancel(&caller, &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    let (job, done) = rig
+        .jobs
+        .wait(&caller, &JobId(job.job_id), DEADLINE)
+        .await
+        .unwrap();
+    assert!(done && job.status == JobStatus::Cancelled, "{job:?}");
+    let drafts = rig.usage.0.lock().unwrap().clone();
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert_eq!(drafts[0].0.status, UsageStatus::Cancelled);
+    assert!(
+        drafts[0].0.latency_ms.is_some_and(|ms| ms > 0),
+        "{drafts:?}"
+    );
+}
+
+/// An attached ComfyUI that a new process serves was restarted: `restart_needed` clears. A
+/// failed request on the way clears nothing (ruling on N2 of the Task 11 re-review).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-131, ARCH-064
+async fn restart_needed_clears_when_another_process_serves_the_attached_engine() {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-restarted", false, false);
+    let port = lil_testkit::free_loopback_port();
+    let serve = |root: &Path| {
+        let child = std::process::Command::new(&ensure_built().fake_comfyui)
+            .args(["main.py", "--port", &port.to_string()])
+            .current_dir(root)
+            .spawn()
+            .unwrap();
+        poll("the outside fake listens", || {
+            read_json(&root.join("fake-comfyui.json"))
+                .filter(|v| v["pid"] == child.id() && v.get("listen").is_some())
+        });
+        child
+    };
+    let mut first = serve(&root);
+    attach(&env, port, &root);
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    engines.tick().await;
+    assert_eq!(engines.status().await[0].pid, Some(first.id()));
+    engines.set_restart_needed(EngineKind::ComfyUi);
+
+    first.kill().unwrap();
+    first.wait().unwrap();
+    engines.tick().await;
+    assert!(
+        engines.status().await[0].restart_needed,
+        "cleared by one failed request"
+    );
+
+    let mut second = serve(&root);
+    until("the new listener is seen", || {
+        futures_util::FutureExt::now_or_never(engines.status())
+            .is_some_and(|s| s[0].pid == Some(second.id()))
+    })
+    .await;
+    assert!(!engines.status().await[0].restart_needed);
+    second.kill().unwrap();
+    second.wait().unwrap();
+}
+
+/// The jobs hold the GPU scheduler, which holds the engines; the engines hold the jobs only
+/// weakly, so dropping the core's handles ends an owned engine (review M4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-064
+async fn engines_and_jobs_form_no_cycle() {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-cycle", false, false);
+    own(&env, &root, "");
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    rig.jobs
+        .set_admission(lil_core::jobs::scheduler::GpuScheduler::new(
+            rig.telemetry.clone(),
+            engines.clone(),
+        ));
+    let launcher = engines
+        .start(EngineKind::ComfyUi)
+        .await
+        .unwrap()
+        .pid
+        .unwrap();
+    let jobs = Arc::downgrade(&rig.jobs);
+    drop(engines);
+    // Everything but the folder goes.
+    let Rig {
+        jobs: strong,
+        telemetry,
+        events,
+        clock,
+        usage,
+        _states,
+        env: _env,
+    } = rig;
+    drop((strong, telemetry, events, clock, usage, _states));
+    until("the jobs are gone", || jobs.upgrade().is_none()).await;
+    gone_async(launcher).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-060, CORE-131

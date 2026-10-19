@@ -1,8 +1,8 @@
 //! `lil-fake-comfy-cli`: a stand-in for comfy-cli's `comfy.exe` (QA-066). It appends its
 //! arguments, as one JSON array per line, to `<--workspace>\fake-comfy-cli.log`, writes
 //! `{path_first, names}` (its first `PATH` entry and its variables' names) to
-//! `<--workspace>\fake-comfy-cli.env.json`, then exits 1
-//! when `<--workspace>\FAIL` exists and 0 otherwise. Without `--workspace <dir>` it exits 2.
+//! `<--workspace>\fake-comfy-cli.env.json`, then runs until it is killed when
+//! `<--workspace>\HANG` exists, else exits 1 when `<--workspace>\FAIL` exists and 0 otherwise. Without `--workspace <dir>` it exits 2.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -46,6 +46,11 @@ fn main() {
     ) {
         eprintln!("lil-fake-comfy-cli: cannot write its environment: {e}");
         std::process::exit(2);
+    }
+    if workspace.join("HANG").exists() {
+        loop {
+            std::thread::park();
+        }
     }
     if workspace.join("FAIL").exists() {
         eprintln!("lil-fake-comfy-cli: failing because FAIL exists");

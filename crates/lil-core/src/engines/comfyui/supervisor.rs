@@ -45,6 +45,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(600);
 /// The socket checks (an owned engine's loopback re-check, an attached engine's processes and
 /// listeners) run on every this many supervisor passes, and on a change of class.
 const SOCKET_CHECK_EVERY: u64 = 5;
+/// An attached ComfyUI that hasn't answered for this long (the core's clock) was stopped or
+/// restarted by whoever runs it: a node install no longer needs a restart.
+const RESTART_CLEARS_AFTER: Duration = Duration::from_secs(30);
 /// How long a stop waits for the engine's processes to be gone.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The output lines a failed start shows.
@@ -97,6 +100,14 @@ const STOPPED: View = View {
     version: None,
 };
 
+/// What the supervisor saw of an attached engine, for `restart_needed`: the last listener it
+/// found, and since when (the core's clock) the engine hasn't answered.
+#[derive(Debug, Clone, Copy, Default)]
+struct AttachedSeen {
+    listener: Option<u32>,
+    unreachable_since: Option<Duration>,
+}
+
 /// When a suite job last used the engine, and whether it was freed since.
 #[derive(Debug, Clone, Copy)]
 struct Idle {
@@ -122,6 +133,10 @@ pub(crate) struct Comfy {
     pub(crate) usage: Arc<dyn UsageSink>,
     /// Supervisor passes so far.
     passes: AtomicU64,
+    /// Held for a whole pass: passes (the supervisor's, a test's) run one at a time. Not
+    /// `ops`, so a start, stop or `StopEngines` never waits for a pass.
+    pass_gate: tokio::sync::Mutex<()>,
+    attached: Mutex<AttachedSeen>,
     sockets: Arc<dyn SocketTable>,
     view: Mutex<View>,
     pids: Mutex<Vec<u32>>,
@@ -164,6 +179,8 @@ impl Comfy {
             clock,
             usage,
             passes: AtomicU64::new(0),
+            pass_gate: tokio::sync::Mutex::new(()),
+            attached: Mutex::default(),
             sockets,
             view: Mutex::new(STOPPED),
             pids: Mutex::new(Vec::new()),
@@ -250,18 +267,10 @@ impl Comfy {
     }
 
     /// Sets what `engines.status` shows; a change is published.
-    ///
-    /// An attached engine that stops answering or answers from another listener was restarted
-    /// by whoever runs it, so a node install no longer needs a restart.
     fn set_view(&self, v: View) {
         let changed = {
             let mut view = lock(&self.view);
             let changed = *view != v;
-            if view.class == EngineClass::Attached
-                && (v.class != EngineClass::Attached || v.pid != view.pid)
-            {
-                self.restart_needed.store(false, Ordering::SeqCst);
-            }
             *view = v;
             changed
         };
@@ -315,6 +324,7 @@ impl Comfy {
         let (Some(config), Some(client)) = (&self.config, &self.client) else {
             return;
         };
+        let _pass = self.pass_gate.lock().await;
         let checks = self
             .passes
             .fetch_add(1, Ordering::SeqCst)
@@ -394,6 +404,7 @@ impl Comfy {
                 if ops.is_some() {
                     return;
                 }
+                lock(&self.attached).unreachable_since = None;
                 match found {
                     Some(found) => self.apply_attached(found, &stats),
                     None => {
@@ -410,8 +421,25 @@ impl Comfy {
                 if ops.is_none() {
                     self.set_pids(Vec::new());
                     self.set_view(STOPPED);
+                    self.attached_unreachable();
                 }
             }
+        }
+    }
+
+    /// An attached engine that once answered doesn't now: after [`RESTART_CLEARS_AFTER`] of
+    /// that, it was stopped or restarted, so `restart_needed` clears. One failed request alone
+    /// clears nothing.
+    fn attached_unreachable(&self) {
+        let now = self.clock.monotonic();
+        let mut seen = lock(&self.attached);
+        if seen.listener.is_none() {
+            return;
+        }
+        let since = *seen.unreachable_since.get_or_insert(now);
+        if now.saturating_sub(since) >= RESTART_CLEARS_AFTER {
+            *seen = AttachedSeen::default();
+            self.restart_needed.store(false, Ordering::SeqCst);
         }
     }
 
@@ -510,8 +538,21 @@ impl Comfy {
             .unwrap_or((None, Vec::new(), Listen::Unknown))
     }
 
+    /// Records a discovered attached engine. When its listener is another process than the one
+    /// seen before, whoever runs it restarted it: `restart_needed` clears. A lookup that found
+    /// no listener changes nothing there.
     fn apply_attached(&self, found: (Option<u32>, Vec<u32>, Listen), stats: &Value) {
         let (listener, pids, listen) = found;
+        if let Some(now) = listener {
+            let mut seen = lock(&self.attached);
+            if seen.listener.is_some_and(|before| before != now) {
+                self.restart_needed.store(false, Ordering::SeqCst);
+            }
+            *seen = AttachedSeen {
+                listener: Some(now),
+                unreachable_since: None,
+            };
+        }
         self.set_pids(pids);
         self.set_view(View {
             class: EngineClass::Attached,
@@ -588,6 +629,7 @@ impl Comfy {
         };
         self.set_pids(pids);
         self.restart_needed.store(false, Ordering::SeqCst);
+        *lock(&self.attached) = AttachedSeen::default();
         self.touch();
         self.set_view(View {
             class: EngineClass::Owned,
