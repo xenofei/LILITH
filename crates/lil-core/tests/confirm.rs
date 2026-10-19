@@ -1072,3 +1072,45 @@ fn pending_survives_core_restart_and_runs_once() {
     assert_eq!(agent.tool("test.destructive", json!({}), Some(&k)), ran);
     assert!(!core.core().confirm().busy());
 }
+
+/// Review I1: the marker the core sets (`annotations["_meta"]`) reaches the top level of the
+/// MCP `_meta` that Claude Code reads, never a nested `_meta`.
+#[tokio::test] // spec: ARCH-054, CORE-112, AI-111
+async fn claude_code_marker_lowers_to_the_top_level_of_mcp_meta() {
+    const MARKER: &str = "anthropic/requiresUserInteraction";
+    let cc = fixture(McpConfirmation::ClaudeCode);
+    let reg = cc.dispatcher.registry();
+    let listed = cc
+        .confirm
+        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp));
+    assert!(listed.iter().any(|t| t.effect.needs_agent_confirmation()));
+    for t in &listed {
+        let meta = lil_protocol::lowering::mcp_meta(t);
+        assert!(
+            !meta.contains_key("_meta"),
+            "{}: nested _meta {meta:?}",
+            t.name
+        );
+        let marked = meta.get(MARKER) == Some(&json!(true));
+        assert_eq!(
+            marked,
+            t.effect.needs_agent_confirmation(),
+            "{}: {meta:?}",
+            t.name
+        );
+    }
+    // With "core" no lowered tool carries it.
+    let core = fixture(McpConfirmation::Core);
+    let reg = core.dispatcher.registry();
+    for t in core
+        .confirm
+        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp))
+    {
+        let meta = lil_protocol::lowering::mcp_meta(&t);
+        assert!(
+            !meta.contains_key(MARKER) && !meta.contains_key("_meta"),
+            "{}",
+            t.name
+        );
+    }
+}

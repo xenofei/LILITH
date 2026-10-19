@@ -231,6 +231,49 @@ fn incompatible_core_lists_only_lil_status() {
     let other = call(&mut mcp, "test_echo", json!({"text": "x"}));
     assert!(other.is_error, "{:?}", other.texts);
     assert_eq!(other.json["error"]["code"], "protocol.incompatible");
+    // No resources either (review M3).
+    let resources = mcp.request("resources/list", json!({}));
+    assert_eq!(
+        resources["result"]["resources"],
+        json!([]),
+        "only lil_status is exposed: {resources}"
+    );
+}
+
+/// Review M5: a workspace found from Claude Code's folder that `suite.toml` does not list is
+/// left out, and `lil_status` says so instead of a bare `workspace: null`.
+#[test] // spec: ARCH-030
+fn an_unregistered_workspace_is_reported() {
+    let env = TestEnv::new();
+    let ws = env.make_workspace("loose");
+    let _core = CoreFixture::start(&env);
+    // `cmd` changes to the workspace folder, then the fake `claude` starts lil-mcp there.
+    let exe = ensure_built().lil_mcp.clone();
+    let mut mcp = env.spawn_stdio(&[
+        OsStr::new("cmd.exe"),
+        OsStr::new("/d"),
+        OsStr::new("/c"),
+        OsStr::new("cd"),
+        OsStr::new("/d"),
+        ws.as_os_str(),
+        OsStr::new("&&"),
+        OsStr::new("claude.exe"),
+        OsStr::new("--spawn-stdio"),
+        exe.as_os_str(),
+    ]);
+    initialize(&mut mcp);
+    let status = call(&mut mcp, "lil_status", json!({}));
+    assert_eq!(
+        status.json["structured"]["status"], "connected",
+        "{:?}",
+        status.texts
+    );
+    assert_eq!(status.json["structured"]["workspace"], Value::Null);
+    let summary = status.json["summary_text"].as_str().unwrap();
+    assert!(
+        summary.contains("not registered") && summary.contains("ws-loose"),
+        "{summary}"
+    );
 }
 
 #[test] // spec: ARCH-018
@@ -279,12 +322,27 @@ fn job_wait_never_waits_past_90_seconds() {
     ok(&mut mcp, "test_job_release", json!({"job_id": job_id}));
 }
 
-/// `count` more copies of the fixture's `prop_signal_lamp`, as `prop_lamp_<nn>`, whose
-/// manifests were last written one second apart, oldest first.
+/// A manifest's last-write time, set explicitly.
+fn set_mtime(manifest: &Path, at: SystemTime) {
+    let file = std::fs::File::options().write(true).open(manifest).unwrap();
+    file.set_modified(at).unwrap();
+}
+
+/// `count` more copies of the fixture's `prop_signal_lamp`, as `prop_lamp_<nn>`. Every
+/// manifest's time is set explicitly (review I3: a copy keeps the checkout's times): the
+/// fixture's own on 2026-01-01, the copies one second apart from 2026-01-02, oldest first.
 fn add_assets(ws: &Path, count: usize) -> Vec<String> {
     let assets = ws.join("projects").join("sketchbook").join("assets");
     let source = assets.join("prop_signal_lamp");
-    let base = SystemTime::now() - Duration::from_secs(3600);
+    let day = Duration::from_secs(86_400);
+    // 2026-01-01T00:00:00Z.
+    let fixture_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600);
+    for entry in std::fs::read_dir(&assets).unwrap() {
+        let dir = entry.unwrap().path();
+        let id = dir.file_name().unwrap().to_string_lossy().into_owned();
+        set_mtime(&dir.join(format!("{id}.manifest.json")), fixture_time);
+    }
+    let base = fixture_time + day;
     (0..count)
         .map(|i| {
             let id = format!("prop_lamp_{i:02}");
@@ -296,12 +354,7 @@ fn add_assets(ws: &Path, count: usize) -> Vec<String> {
                 .replace("\"prop_signal_lamp\"", &format!("\"{id}\""));
             let manifest = dir.join(format!("{id}.manifest.json"));
             std::fs::write(&manifest, text).unwrap();
-            let file = std::fs::File::options()
-                .write(true)
-                .open(&manifest)
-                .unwrap();
-            file.set_modified(base + Duration::from_secs(i as u64))
-                .unwrap();
+            set_mtime(&manifest, base + Duration::from_secs(i as u64));
             id
         })
         .collect()

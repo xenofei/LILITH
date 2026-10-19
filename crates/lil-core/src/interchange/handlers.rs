@@ -180,7 +180,9 @@ impl Target {
         } else if let Some(candidate) = text.strip_prefix("@candidate/") {
             let format = extension(candidate);
             (kind_of_format(format.as_deref()), format)
-        } else if text.starts_with("lil://") || text.starts_with("ww://") {
+        } else if text.starts_with(lil_schema::SCHEME)
+            || text.starts_with(lil_schema::LEGACY_SCHEME)
+        {
             match text.parse::<AssetRef>()? {
                 AssetRef::Candidate { file, .. } => {
                     let format = extension(&file);

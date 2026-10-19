@@ -137,6 +137,13 @@ pub const CALLER_ENGINE_TOKEN_INVALID: CodeSpec =
     spec("caller.engine_token_invalid", C::Declined, R::Never, false);
 pub const CORE_DRAINING: CodeSpec =
     spec("core.draining", C::Transient, R::SameIdempotencyKey, false);
+/// No core could be reached or started (ruling P3-R25): wait, then retry with the same key.
+pub const CORE_UNREACHABLE: CodeSpec = spec(
+    "core.unreachable",
+    C::Transient,
+    R::SameIdempotencyKey,
+    false,
+);
 pub const CORE_BUG: CodeSpec = spec("core.bug", C::Bug, R::Never, false);
 pub const STATE_UNAVAILABLE: CodeSpec = spec(
     "state.unavailable",
@@ -299,6 +306,7 @@ pub const ALL: &[&CodeSpec] = &[
     &CALLER_NOT_ALLOWED,
     &CALLER_ENGINE_TOKEN_INVALID,
     &CORE_DRAINING,
+    &CORE_UNREACHABLE,
     &CORE_BUG,
     &STATE_UNAVAILABLE,
     &STORE_BUSY,
@@ -419,6 +427,12 @@ mod tests {
         ("caller.not_allowed", C::Declined, R::Never, false),
         ("caller.engine_token_invalid", C::Declined, R::Never, false),
         ("core.draining", C::Transient, R::SameIdempotencyKey, false),
+        (
+            "core.unreachable",
+            C::Transient,
+            R::SameIdempotencyKey,
+            false,
+        ),
         ("core.bug", C::Bug, R::Never, false),
         (
             "state.unavailable",
@@ -542,7 +556,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 65);
+        assert_eq!(TABLE.len(), 66);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);

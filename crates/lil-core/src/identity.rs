@@ -179,18 +179,29 @@ fn runs(client: &ProcessInfo, exe: &str, dirs: &[PathBuf]) -> bool {
 }
 
 /// Whether the MCP server `client` was started by Claude Code itself (ARCH-047, Appendix F):
-/// its direct parent's image is `claude.exe`. A grandparent never counts, so a shell between
-/// them makes this `false`, as does a parent that is gone or cannot be inspected.
+/// its direct parent's image is `claude.exe`, and that parent started before `client`, so a
+/// process that took the pid of an exited parent does not count (review M1). A grandparent
+/// never counts, so a shell between them makes this `false`, as does a parent that is gone or
+/// cannot be inspected, or a start time that cannot be read.
+///
+/// The parent is recognised by its file name only: a program renamed `claude.exe` passes.
+/// That is the documented limit (Appendix F), and the reason `mcp_confirmation` stays
+/// `"core"` until there is a stronger parent check.
 pub fn claude_is_direct_parent(inspector: &dyn ProcessInspector, client: &ProcessInfo) -> bool {
     let Some(pid) = client.parent_pid else {
         return false;
     };
-    inspector.inspect(pid).is_ok_and(|parent| {
+    let named_claude = inspector.inspect(pid).is_ok_and(|parent| {
         parent
             .image
             .file_name()
             .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(CLAUDE_EXE))
-    })
+    });
+    let started_first = match (inspector.started(pid), inspector.started(client.pid)) {
+        (Ok(parent), Ok(child)) => parent < child,
+        _ => false,
+    };
+    named_claude && started_first
 }
 
 #[cfg(test)]
@@ -222,9 +233,9 @@ mod tests {
         }
     }
 
-    /// A process table for the parent check.
+    /// A process table for the parent check, with each process's start time.
     #[derive(Debug)]
-    struct Table(HashMap<u32, ProcessInfo>);
+    struct Table(HashMap<u32, ProcessInfo>, HashMap<u32, u64>);
 
     impl ProcessInspector for Table {
         fn inspect(&self, pid: u32) -> io::Result<ProcessInfo> {
@@ -233,37 +244,53 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "gone"))
         }
+
+        fn started(&self, pid: u32) -> io::Result<u64> {
+            self.1
+                .get(&pid)
+                .copied()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no start time"))
+        }
     }
 
     /// `claude.exe` in the process table.
     const CLAUDE_PID: u32 = 10;
 
     /// Claude Code (10) and, under it, the shells an agent's shell tool could run: `cmd.exe`
-    /// (11), `bash.exe` (12) and `pwsh.exe` (13).
+    /// (11), `bash.exe` (12) and `pwsh.exe` (13), each started before the client (4242).
     fn table() -> Table {
         let row = |pid, image: &str, parent| ProcessInfo {
             pid,
             ..process(image, parent)
         };
-        Table(HashMap::from([
-            (CLAUDE_PID, row(CLAUDE_PID, r"C:\tools\Claude.exe", None)),
-            (
-                11,
-                row(11, r"C:\Windows\System32\cmd.exe", Some(CLAUDE_PID)),
-            ),
-            (
-                12,
-                row(12, r"C:\Program Files\Git\bin\bash.exe", Some(CLAUDE_PID)),
-            ),
-            (
-                13,
-                row(
-                    13,
-                    r"C:\Program Files\PowerShell\7\pwsh.exe",
-                    Some(CLAUDE_PID),
+        Table(
+            HashMap::from([
+                (CLAUDE_PID, row(CLAUDE_PID, r"C:\tools\Claude.exe", None)),
+                (
+                    11,
+                    row(11, r"C:\Windows\System32\cmd.exe", Some(CLAUDE_PID)),
                 ),
-            ),
-        ]))
+                (
+                    12,
+                    row(12, r"C:\Program Files\Git\bin\bash.exe", Some(CLAUDE_PID)),
+                ),
+                (
+                    13,
+                    row(
+                        13,
+                        r"C:\Program Files\PowerShell\7\pwsh.exe",
+                        Some(CLAUDE_PID),
+                    ),
+                ),
+            ]),
+            HashMap::from([
+                (CLAUDE_PID, 100),
+                (11, 200),
+                (12, 200),
+                (13, 200),
+                (4242, 1000),
+            ]),
+        )
     }
 
     fn resolve(
@@ -518,5 +545,31 @@ mod tests {
         }
         assert!(!claude_is_direct_parent(&table, &mcp(Some(99))));
         assert!(!claude_is_direct_parent(&table, &mcp(None)));
+    }
+
+    /// Review M1: a `claude.exe` whose pid the real parent left behind is not the parent. The
+    /// parent must have started before the client, and both start times must be known.
+    #[test] // spec: ARCH-047
+    fn a_reused_parent_pid_does_not_count() {
+        let mcp = process(r"C:\x\lil-mcp.exe", Some(CLAUDE_PID));
+        let mut later = table();
+        later.1.insert(CLAUDE_PID, 5000);
+        assert!(
+            !claude_is_direct_parent(&later, &mcp),
+            "started after its child"
+        );
+        let mut unknown = table();
+        unknown.1.remove(&CLAUDE_PID);
+        assert!(
+            !claude_is_direct_parent(&unknown, &mcp),
+            "parent start unknown"
+        );
+        let mut client_unknown = table();
+        client_unknown.1.remove(&4242);
+        assert!(
+            !claude_is_direct_parent(&client_unknown, &mcp),
+            "client start unknown"
+        );
+        assert!(claude_is_direct_parent(&table(), &mcp));
     }
 }

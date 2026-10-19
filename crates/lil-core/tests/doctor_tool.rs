@@ -50,8 +50,9 @@ const GITIGNORE: [&str; 5] = [
 /// The fixture asset with a sealed `v1.0.0/`.
 const CRANE: &str = "projects/sketchbook/assets/chr_paper_crane";
 
-/// Says this test process is `lil-mcp.exe` in a trusted MCP folder, so a hello that declares
-/// `mcp` is granted it (ARCH-046); everything else is the real process.
+/// Says this test process is `lil-mcp.exe` in a trusted MCP folder and its parent (the test
+/// runner) is `claude.exe`, so a hello that declares `mcp` is granted it (ARCH-046,
+/// ARCH-047); everything else, start times included, is the real process.
 #[derive(Debug)]
 struct McpHere {
     dir: PathBuf,
@@ -60,10 +61,17 @@ struct McpHere {
 impl ProcessInspector for McpHere {
     fn inspect(&self, pid: u32) -> io::Result<ProcessInfo> {
         let mut info = SystemInspector.inspect(pid)?;
-        if pid == std::process::id() {
+        let me = SystemInspector.inspect(std::process::id())?;
+        if pid == me.pid {
             info.image = self.dir.join(MCP_EXE);
+        } else if Some(pid) == me.parent_pid {
+            info.image = self.dir.join("claude.exe");
         }
         Ok(info)
+    }
+
+    fn started(&self, pid: u32) -> io::Result<u64> {
+        SystemInspector.started(pid)
     }
 }
 

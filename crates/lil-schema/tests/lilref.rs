@@ -1,6 +1,6 @@
 //! `.lilref` files (CORE-047, APP-021, APP-055): a sealed ref with its content hash.
 
-use lil_schema::{LilRef, parse_lilref, write_lilref};
+use lil_schema::{LEGACY_SCHEME, LilRef, parse_lilref, write_lilref};
 
 const HASH: &str = "5a9db589b4907d4cfb2fb9a3a1da4efe5b2fa01d1b2aef2fed24ce2124a5a2a2";
 
@@ -42,10 +42,13 @@ fn lilref_refuses_what_is_not_a_sealed_ref() {
         r#"{"ref": "x"}"#,
         r#"{"lilref": 1}"#,
         r#"{"lilref": "1", "ref": "x"}"#,
-        r#"{"lilref": 1, "ref": "ww://0123456789abcdef/sketchbook/a@1.0.0"}"#,
     ] {
         assert!(parse_lilref(text).is_err(), "{text}");
     }
+    // A legacy-scheme ref is not a `.lilref` target either.
+    let legacy =
+        format!(r#"{{"lilref": 1, "ref": "{LEGACY_SCHEME}0123456789abcdef/sketchbook/a@1.0.0"}}"#);
+    assert!(parse_lilref(&legacy).is_err(), "{legacy}");
     let extra = format!(r#"{{"lilref": 1, "ref": "{}", "note": "x"}}"#, sealed());
     assert!(parse_lilref(&extra).is_err(), "unknown fields are refused");
 }

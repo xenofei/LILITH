@@ -5,11 +5,11 @@
 //!   registry ([`assert_injective`]).
 //! - Every input schema gains an optional `retry_token` ([`mcp_input_schema`]), the call's
 //!   idempotency key.
-//! - `_meta` is the descriptor's per-connection annotations, plus `anthropic/alwaysLoad` on
-//!   [`ALWAYS_LOAD`] ([`mcp_meta`]).
+//! - `_meta` is the object at the descriptor's per-connection `annotations["_meta"]`, plus
+//!   `anthropic/alwaysLoad` on [`ALWAYS_LOAD`] ([`mcp_meta`]).
 //! - A result is JSON text plus file paths ([`lower_outcome`]); `structuredContent` is an extra.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
@@ -77,14 +77,17 @@ pub fn mcp_input_schema(input: &Value) -> Value {
 /// The tools Claude Code loads up front (AI-111): `"anthropic/alwaysLoad": true`.
 pub const ALWAYS_LOAD: &[&str] = &["lil.status", "project.context", "job.wait"];
 
-/// A tool's MCP `_meta`: the core's per-connection annotations, plus
+/// A tool's MCP `_meta`: the object the core put at `annotations["_meta"]` for this
+/// connection (its keys, such as `anthropic/requiresUserInteraction`, land at the top level,
+/// where Claude Code reads them; other annotation keys are not `_meta`), plus
 /// `"anthropic/alwaysLoad": true` for [`ALWAYS_LOAD`].
 pub fn mcp_meta(d: &ToolDescriptor) -> Map<String, Value> {
     let mut meta: Map<String, Value> = d
         .annotations
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+        .get("_meta")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     if ALWAYS_LOAD.contains(&d.name.as_str()) {
         meta.insert("anthropic/alwaysLoad".into(), Value::Bool(true));
     }
@@ -99,12 +102,15 @@ pub struct McpResult {
     pub structured: Option<Value>,
 }
 
-/// What the lowering needs from the connection: the registered (dotted) tool names, and the
-/// workspace folder the core reported for it.
+/// What the lowering needs from the connection: the registered (dotted) tool names, the
+/// workspace folder the core reported for it, and the folders an absolute artifact path may
+/// be in (the suite's job cache, `%LOCALAPPDATA%\LILITH\cache\jobs\`, for jobs without a
+/// workspace).
 #[derive(Debug, Clone, Copy)]
 pub struct LowerCtx<'a> {
     pub tool_names: &'a [String],
     pub workspace: Option<&'a Path>,
+    pub roots: &'a [PathBuf],
 }
 
 /// The line before untrusted detail (ARCH-060).
@@ -123,7 +129,8 @@ pub fn pending_sentence(retry_token: &str) -> String {
 /// - `ok`: the JSON `{status: "ok", structured, artifacts, summary_text}`, then one line per
 ///   artifact path: the tool's `artifacts`, then a job's `structured.job.result.artifacts`
 ///   (`job.wait`), each once, as `<workspace>\<path with backslashes>`, or as given without a
-///   workspace or for a path that is already absolute;
+///   workspace or for an absolute path inside the context's `roots`; a path that could point
+///   anywhere else gets no line (`artifact_line`);
 /// - `pending_confirmation`: not an error; its JSON, then [`pending_sentence`];
 /// - `error`: `is_error`; [`UNTRUSTED_PREFACE`] first when the detail is untrusted, then the
 ///   JSON.
@@ -143,7 +150,7 @@ pub fn lower_outcome(o: &Outcome<ToolOutput>, ctx: &LowerCtx) -> McpResult {
             text.extend(
                 artifact_paths(out)
                     .into_iter()
-                    .map(|p| absolute_path(p, ctx.workspace)),
+                    .filter_map(|p| artifact_line(p, ctx.workspace, ctx.roots)),
             );
             McpResult {
                 is_error: false,
@@ -205,20 +212,46 @@ fn artifact_paths(out: &ToolOutput) -> Vec<&str> {
     paths
 }
 
-/// `path` as an absolute path: `<workspace>\<path with backslashes>`. Without a workspace, or
-/// when `path` is absolute already, `path` as given.
-fn absolute_path(path: &str, workspace: Option<&Path>) -> String {
-    match workspace {
-        Some(ws) if !Path::new(path).is_absolute() => {
-            let ws = ws.to_string_lossy();
-            format!(
+/// The line for an artifact `path` (review M2), or `None` when the path could point
+/// anywhere else:
+/// - a clean relative path (segments split on `/` or `\`, none empty, `.` or `..`, and no `:`)
+///   is `<workspace>\<path with backslashes>`, or as given without a workspace;
+/// - an absolute drive path (`X:\…`) with clean segments inside one of `roots` is as given;
+/// - anything else (`..`, a rooted, drive-relative, UNC or `\\?\` path, or an absolute path
+///   outside `roots`) gets no line. The JSON keeps every path.
+fn artifact_line(path: &str, workspace: Option<&Path>, roots: &[PathBuf]) -> Option<String> {
+    let clean = |segments: &str| {
+        !segments.is_empty()
+            && segments
+                .split(['/', '\\'])
+                .all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains(':'))
+    };
+    if clean(path) {
+        return Some(match workspace {
+            Some(ws) => format!(
                 "{}\\{}",
-                ws.trim_end_matches(['\\', '/']),
-                path.trim_start_matches(['\\', '/']).replace('/', "\\")
-            )
-        }
-        _ => path.to_string(),
+                ws.to_string_lossy().trim_end_matches(['\\', '/']),
+                path.replace('/', "\\")
+            ),
+            None => path.to_string(),
+        });
     }
+    // `X:\rest`: a drive letter, a colon, a separator, then clean segments.
+    let bytes = path.as_bytes();
+    let drive = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    if !drive || !clean(&path[3..]) {
+        return None;
+    }
+    let key = |p: &str| p.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let at = key(path);
+    roots
+        .iter()
+        .map(|r| key(&r.to_string_lossy()))
+        .any(|root| !root.is_empty() && at.starts_with(&format!("{root}\\")))
+        .then(|| path.to_string())
 }
 
 /// Whether `c` continues a tool name, so a name followed by it is another word.
@@ -265,8 +298,9 @@ pub const INSTRUCTIONS: &str = "\
 LILITH's tools work on its workspaces, projects, assets and jobs. Work in this order:
 1. Call lil_status first. It says whether the suite's core is connected, which workspace this \
 session uses, and what is wrong when the core is incompatible or unreachable.
-2. Call the tool you need. On every write call, pass a retry_token: any unique string. Reuse \
-the same token only to retry that same call.
+2. Call the tool you need. On every write call, pass a retry_token: a fresh random string, \
+such as a new UUID, for each new call, never a short or reused one, because every conversation \
+in the workspace shares the tokens. Reuse a token only to retry that same call.
 3. When a result holds a job, call job_wait with its job_id until done is true. Each job_wait \
 call waits at most 90 seconds. A job that is done with substatus interrupted_unknown waits for \
 the person: only they can resolve it, so do not call job_wait for it again.

@@ -33,6 +33,7 @@ fn ctx<'a>(names: &'a [String], workspace: Option<&'a Path>) -> LowerCtx<'a> {
     LowerCtx {
         tool_names: names,
         workspace,
+        roots: &[],
     }
 }
 
@@ -202,13 +203,34 @@ fn descriptor(name: &str, annotations: BTreeMap<String, Value>) -> ToolDescripto
 
 #[test] // spec: AI-111, ARCH-054
 fn meta_markers_come_from_the_core_and_always_load_is_added() {
-    let marker = BTreeMap::from([("anthropic/requiresUserInteraction".to_string(), json!(true))]);
-    let marked = mcp_meta(&descriptor("asset.trash", marker));
+    // The core's shape (`Confirm::annotate`): the marker sits under `annotations["_meta"]`,
+    // and it lands at the top level of the MCP `_meta`. Other annotation keys are not `_meta`.
+    let annotations = BTreeMap::from([
+        (
+            "_meta".to_string(),
+            json!({"anthropic/requiresUserInteraction": true}),
+        ),
+        ("other".to_string(), json!(1)),
+    ]);
+    let marked = mcp_meta(&descriptor("asset.trash", annotations));
     assert_eq!(
-        marked.get("anthropic/requiresUserInteraction"),
+        marked,
+        json!({"anthropic/requiresUserInteraction": true})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    let both = BTreeMap::from([(
+        "_meta".to_string(),
+        json!({"anthropic/requiresUserInteraction": true}),
+    )]);
+    let meta = mcp_meta(&descriptor("job.wait", both));
+    assert_eq!(
+        meta.get("anthropic/requiresUserInteraction"),
         Some(&json!(true))
     );
-    assert!(!marked.contains_key("anthropic/alwaysLoad"));
+    assert_eq!(meta.get("anthropic/alwaysLoad"), Some(&json!(true)));
+    assert!(!meta.contains_key("_meta"));
 
     assert_eq!(ALWAYS_LOAD, ["lil.status", "project.context", "job.wait"]);
     for name in ["lil.status", "project.context", "job.wait"] {
@@ -311,5 +333,61 @@ fn artifact_text_lines_are_absolute_paths() {
     assert_eq!(
         structured["structured"]["job"]["result"]["artifacts"][1]["path"],
         "a/b.png"
+    );
+}
+
+/// Review M2: a line is written only for a path that stays inside the workspace, or an
+/// absolute path inside one of the context's roots (the suite's job cache); the JSON keeps
+/// every path as it is.
+#[test] // spec: AI-112, ARCH-060
+fn artifact_lines_stay_inside_the_workspace_and_the_job_cache() {
+    let names = names();
+    let ws = PathBuf::from(r"C:\ws");
+    let cache = [PathBuf::from(r"C:\L\LILITH\cache\jobs")];
+    let lines = |path: &str, workspace: Option<&Path>| {
+        let o = Outcome::Ok(ToolOutput {
+            structured: json!({}),
+            artifacts: vec![FileRef {
+                path: path.into(),
+                sha256: None,
+            }],
+            summary_text: String::new(),
+        });
+        let ctx = LowerCtx {
+            tool_names: &names,
+            workspace,
+            roots: &cache,
+        };
+        let lowered = lower_outcome(&o, &ctx);
+        let json: Value = serde_json::from_str(&lowered.text[0]).unwrap();
+        assert_eq!(json["artifacts"][0]["path"], path, "the JSON keeps {path}");
+        lowered.text[1..].to_vec()
+    };
+    let none: Vec<String> = Vec::new();
+    for bad in [
+        "../../Users/x/secret.txt",
+        "a/../../b.png",
+        "./a.png",
+        "a//b.png",
+        "/rooted.png",
+        r"\rooted.png",
+        "C:x.png",
+        r"C:\Windows\System32\drivers\etc\hosts",
+        r"\\server\share\x.png",
+        r"\\?\C:\ws\a.png",
+        r"C:\L\LILITH\cache\jobs\..\..\secret.txt",
+        r"C:\L\LILITH\cache\jobsx\a.png",
+        "",
+    ] {
+        assert_eq!(lines(bad, Some(&ws)), none, "{bad} with a workspace");
+        assert_eq!(lines(bad, None), none, "{bad} without one");
+    }
+    assert_eq!(lines("a/b.png", Some(&ws)), [r"C:\ws\a\b.png"]);
+    assert_eq!(lines("a/b.png", None), ["a/b.png"]);
+    let cached = r"C:\L\LILITH\cache\jobs\j_0123456789abcdef\x.png";
+    assert_eq!(lines(cached, None), [cached]);
+    assert_eq!(
+        lines(&cached.to_lowercase(), Some(&ws)),
+        [cached.to_lowercase()]
     );
 }

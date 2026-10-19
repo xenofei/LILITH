@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lil_client::{Client, ClientConfig, ClientError, ResolvedWorkspace};
-use lil_protocol::codes::{CORE_BUG, CORE_DRAINING, PROTOCOL_INCOMPATIBLE};
+use lil_protocol::codes::{CORE_BUG, CORE_UNREACHABLE, PROTOCOL_INCOMPATIBLE};
 use lil_protocol::lowering::assert_injective;
 use lil_protocol::{ErrorBody, HelloResult, NO_WORKSPACE, Outcome, ToolDescriptor, ToolOutput};
 use serde_json::{Map, Value, json};
@@ -27,6 +27,11 @@ pub struct Linked {
     pub tools: Vec<ToolDescriptor>,
     /// The registered names: the core's tools and [`LIL_STATUS`].
     pub names: Vec<String>,
+    /// Why the session has no workspace when the `mcp` chain found one it could not use (review
+    /// M5): shown in `lil_status`'s summary.
+    pub workspace_note: Option<String>,
+    /// The folders an absolute artifact path may be in: the suite's job cache.
+    pub roots: Vec<PathBuf>,
 }
 
 impl Linked {
@@ -119,18 +124,22 @@ impl CoreLink {
 
 /// Finds or starts the core and opens a session as `mcp`.
 async fn connect(cwd: &std::path::Path) -> Link {
-    let mut cfg = match ClientConfig::for_mcp(cwd) {
-        Ok(cfg) => cfg,
+    let (mut cfg, mut workspace_note) = match ClientConfig::for_mcp(cwd) {
+        Ok((cfg, chain_failed)) => (
+            cfg,
+            chain_failed.map(|e| format!("This session has no workspace: {e}")),
+        ),
         Err(e) => return Link::Unreachable(error_body(&e)),
     };
     let client = match Client::connect(&cfg).await {
-        // A workspace found from the folder that the suite does not know: no workspace, as
-        // `lil status` does.
+        // A workspace that the suite does not know: no workspace, as `lil status` does, and
+        // `lil_status` says why.
         Err(ClientError::UnknownWorkspace { origin, .. }) => {
-            tracing::warn!(
-                workspace = %origin.path.display(),
-                "the workspace is not registered in suite.toml; continuing without one"
-            );
+            workspace_note = Some(format!(
+                "This session has no workspace: {} ({}) is not registered in suite.toml.",
+                origin.path.display(),
+                origin.source
+            ));
             cfg.set_workspace(ResolvedWorkspace {
                 id: NO_WORKSPACE.to_string(),
                 origin: None,
@@ -167,10 +176,13 @@ async fn connect(cwd: &std::path::Path) -> Link {
         );
         return Link::Unreachable(error);
     }
+    let roots = vec![cfg.env.local_dir().join("cache").join("jobs")];
     Link::Connected(Arc::new(Linked {
         client,
         tools,
         names,
+        workspace_note,
+        roots,
     }))
 }
 
@@ -189,12 +201,53 @@ fn incompatible(core_protocol: &str) -> ErrorBody {
 }
 
 /// The error result for a client failure. The core's own error results keep their code; a
-/// core that cannot be reached or started is `core.draining` (transient: retry the call with
-/// the same `retry_token`), with the client's plain-language message.
+/// core that cannot be reached or started is `core.unreachable` (ruling P3-R25; transient: wait,
+/// then retry the call with the same `retry_token`), with the client's plain-language message.
 fn error_body(e: &ClientError) -> ErrorBody {
     match e {
         ClientError::Refused(error) | ClientError::UnknownWorkspace { error, .. } => error.clone(),
         ClientError::Incompatible { core_protocol } => incompatible(core_protocol),
-        other => ErrorBody::new(&CORE_DRAINING, other.to_string(), lil_client::mint_id("t")),
+        other => ErrorBody::new(
+            &CORE_UNREACHABLE,
+            other.to_string(),
+            lil_client::mint_id("t"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lil_protocol::codes::CORE_DRAINING;
+
+    /// Review I2, ruling P3-R25: a core that cannot be reached or started is
+    /// `core.unreachable`; the core's own errors, `core.draining` included, keep their code.
+    #[test] // spec: ARCH-014, ARCH-018, QA-003
+    fn an_unreachable_core_is_core_unreachable() {
+        let failures = [
+            ClientError::NotRunning,
+            ClientError::Timeout,
+            ClientError::Closed,
+            ClientError::Io(std::io::Error::other("pipe broke")),
+            ClientError::Untrusted {
+                pid: 7,
+                image: PathBuf::from(r"C:\x\lil-core.exe"),
+                reason: "not this user's".into(),
+            },
+        ];
+        for e in &failures {
+            let body = error_body(e);
+            assert_eq!(body.code, "core.unreachable", "{e:?}");
+            assert_eq!(body.retry, lil_protocol::RetryPolicy::SameIdempotencyKey);
+            assert_eq!(body.message, e.to_string());
+        }
+        let draining = ErrorBody::new(&CORE_DRAINING, "The core is stopping.", "t_1");
+        let kept = error_body(&ClientError::Refused(draining.clone()));
+        assert_eq!(kept, draining);
+        let refused = error_body(&ClientError::Incompatible {
+            core_protocol: "2.0".into(),
+        });
+        assert_eq!(refused.code, "protocol.incompatible");
+        assert_eq!(refused.data, Some(json!({"core_protocol": "2.0"})));
     }
 }

@@ -30,8 +30,9 @@ use crate::resources;
 const LIL_STATUS_DESCRIPTION: &str = "Whether LILITH's core is connected (status connected, \
 incompatible or unreachable), the caller kind the core gave this session (mcp, or cli when \
 this server was not started by Claude Code itself), the protocol and build, the session's \
-workspace and the core's process, and, when it is not connected, the error saying what to do. \
-Call it first. Takes no arguments.";
+workspace and the core's process, and, when it is not connected, the error saying what to do: \
+protocol.incompatible (update the older of the two) or core.unreachable (no core could be \
+reached or started: wait, then call again). Call it first. Takes no arguments.";
 
 pub struct LilServer {
     link: CoreLink,
@@ -56,7 +57,11 @@ impl LilServer {
                     "core": {"pid": hello.core.pid, "channel": hello.core.channel},
                     "error": null,
                 });
-                let summary = format!("Connected to the core as {}.", hello.caller_kind);
+                let mut summary = format!("Connected to the core as {}.", hello.caller_kind);
+                if let Some(note) = &linked.workspace_note {
+                    summary.push(' ');
+                    summary.push_str(note);
+                }
                 (structured, summary, Some(linked))
             }
             Link::Incompatible {
@@ -211,6 +216,11 @@ impl ServerHandler for LilServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
+        // On an incompatible or unreachable core only `lil_status` is exposed (ARCH-014,
+        // AI-108; review M3).
+        if !matches!(self.link.link().await, Link::Connected(_)) {
+            return Ok(ListResourcesResult::with_all_items(Vec::new()));
+        }
         let listed = resources::RESOURCES
             .iter()
             .map(|(uri, name, description)| {
@@ -253,6 +263,7 @@ fn lower(outcome: &Outcome<ToolOutput>, linked: Option<&Linked>) -> CallToolResu
     let ctx = LowerCtx {
         tool_names: names,
         workspace: workspace.as_deref(),
+        roots: linked.map_or(&[], |l| &l.roots),
     };
     call_result(lower_outcome(outcome, &ctx))
 }
