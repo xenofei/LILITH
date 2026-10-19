@@ -557,11 +557,24 @@ impl Comfy {
         let Some(client) = &self.client else {
             return;
         };
-        let mut prompt_ids = self.prompts.prompt_ids();
-        if let Some(jobs) = self.jobs.upgrade() {
-            prompt_ids.extend(jobs.adopted_engine_ids());
-        }
-        let suite = Suite { prompt_ids };
+        let jobs = self.jobs.upgrade();
+        // Taken once ComfyUI's answers are in (re-review N2).
+        let suite = || {
+            let mut prompt_ids = self.prompts.prompt_ids();
+            if let Some(jobs) = &jobs {
+                prompt_ids.extend(jobs.adopted_engine_ids());
+            }
+            Suite { prompt_ids }
+        };
+        let open_job = |id: String| {
+            let jobs = jobs.clone();
+            async move {
+                match jobs {
+                    Some(jobs) => jobs.is_open_job_engine_id(&id).await,
+                    None => false,
+                }
+            }
+        };
         let now = self.now_secs();
         let object_info = || async {
             match self.graph_info(client).await {
@@ -575,7 +588,15 @@ impl Comfy {
         let mut call_id = || self.call_id();
         let (changed, drafts) = self
             .outside
-            .poll(client, &suite, &self.suite, now, object_info, &mut call_id)
+            .poll(
+                client,
+                suite,
+                open_job,
+                &self.suite,
+                now,
+                object_info,
+                &mut call_id,
+            )
             .await;
         if changed {
             self.publish("outside_job");

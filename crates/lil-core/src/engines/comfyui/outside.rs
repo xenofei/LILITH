@@ -63,6 +63,9 @@ struct WatchState {
     /// Paid outside prompts not yet recorded (the open rows of `outside_paid`), by id: their
     /// partner classes.
     paid: HashMap<String, Vec<String>>,
+    /// Prompts of an earlier core run that an open job's row names (`external_id`): the
+    /// suite's, though no recovery has taken them up yet (re-review N1). Kept as `known` is.
+    earlier: HashSet<String>,
     /// The open rows were read from the table.
     loaded: bool,
     polled: bool,
@@ -139,20 +142,39 @@ impl OutsideWatch {
         changed
     }
 
-    /// One poll (module docs). `object_info` is fetched only when a new outside graph needs a
-    /// look; `db` is the suite `state.db`; `now_utc` is seconds since 1970. Returns whether the
-    /// counts changed and the usage drafts to record; the caller marks each one recorded
-    /// ([`mark_recorded`]) once it has handed it over. A request that fails changes nothing.
-    pub(crate) async fn poll<F, Fut>(
+    /// The number of prompt ids the watch remembers as classified (they are forgotten once
+    /// ComfyUI no longer lists them).
+    #[doc(hidden)]
+    pub fn known_count(&self) -> usize {
+        self.lock().known.len()
+    }
+
+    /// One poll (module docs). `suite` gives the suite's prompt ids, asked once ComfyUI's
+    /// answers are in (re-review N2: a prompt is claimed before its POST, so any suite prompt
+    /// they show is in it). `open_job` says whether a prompt id is the `external_id` of a job
+    /// not yet final (re-review N1), asked once per new prompt. `object_info` is fetched only
+    /// when a new outside graph needs a look; `db` is the suite `state.db`; `now_utc` is
+    /// seconds since 1970. Returns whether the counts changed and the usage drafts to record;
+    /// the caller marks each one recorded ([`mark_recorded`]) once it has handed it over. A
+    /// request that fails changes nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the poll's inputs, each a different source"
+    )]
+    pub(crate) async fn poll<S, G, FutG, F, Fut>(
         &self,
         client: &ComfyClient,
-        suite: &Suite,
+        suite: S,
+        open_job: G,
         db: &StateDb,
         now_utc: i64,
         object_info: F,
         call_id: &mut (dyn FnMut() -> String + Send),
     ) -> (bool, Vec<Usage>)
     where
+        S: FnOnce() -> Suite,
+        G: Fn(String) -> FutG,
+        FutG: std::future::Future<Output = bool>,
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Option<Arc<Value>>>,
     {
@@ -182,6 +204,7 @@ impl OutsideWatch {
                 return (false, Vec::new());
             }
         };
+        let suite = suite();
         let in_queue: HashSet<&str> = queue
             .running
             .iter()
@@ -189,13 +212,13 @@ impl OutsideWatch {
             .map(|e| e.prompt_id.as_str())
             .collect();
         let mut info: Option<Arc<Value>> = None;
-        let mut new_outside: Vec<&QueueEntry> = Vec::new();
+        let mut new_outside: Vec<(&QueueEntry, bool)> = Vec::new();
         let (mut running, mut queued) = (0u32, 0u32);
         {
             let mut s = self.lock();
             for (entries, is_running) in [(&queue.running, true), (&queue.pending, false)] {
                 for e in entries {
-                    if suite.owns(&e.prompt_id) {
+                    if suite.owns(&e.prompt_id) || s.earlier.contains(&e.prompt_id) {
                         s.known.insert(e.prompt_id.clone());
                         continue;
                     }
@@ -205,14 +228,30 @@ impl OutsideWatch {
                         queued += 1;
                     }
                     if !s.known.contains(&e.prompt_id) && !s.paid.contains_key(&e.prompt_id) {
-                        new_outside.push(e);
+                        new_outside.push((e, is_running));
                     }
                 }
             }
         }
+        // A new prompt an open job names is an earlier core run's: the suite's (N1).
+        let mut fresh: Vec<&QueueEntry> = Vec::new();
+        for (e, is_running) in new_outside {
+            if open_job(e.prompt_id.clone()).await {
+                let mut s = self.lock();
+                s.earlier.insert(e.prompt_id.clone());
+                s.known.insert(e.prompt_id.clone());
+                if is_running {
+                    running -= 1;
+                } else {
+                    queued -= 1;
+                }
+            } else {
+                fresh.push(e);
+            }
+        }
         // New outside graphs: are they paid? Without object info they are looked at again
         // next time.
-        for e in new_outside {
+        for e in fresh {
             if info.is_none() {
                 info = object_info().await;
             }
@@ -260,7 +299,7 @@ impl OutsideWatch {
                     let (status, latency) = ended(&j.status, &j.raw);
                     drafts.push(usage(&j.id, &classes, status, latency, call_id()));
                     s.known.insert(j.id.clone());
-                } else if first || suite.owns(&j.id) {
+                } else if first || suite.owns(&j.id) || s.earlier.contains(&j.id) {
                     s.known.insert(j.id.clone());
                 } else if !s.known.contains(&j.id) {
                     lookups.push(j);
@@ -275,6 +314,8 @@ impl OutsideWatch {
             // `known` keeps only what ComfyUI still lists.
             let listed: HashSet<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
             s.known
+                .retain(|id| listed.contains(id.as_str()) || in_queue.contains(id.as_str()));
+            s.earlier
                 .retain(|id| listed.contains(id.as_str()) || in_queue.contains(id.as_str()));
             changed = (s.running, s.queued) != (running, queued);
             s.running = running;
@@ -314,7 +355,7 @@ impl OutsideWatch {
                 continue;
             };
             let classes = partner_nodes(&detail["workflow"]["prompt"], i);
-            if !classes.is_empty() {
+            if !classes.is_empty() && !open_job(j.id.clone()).await {
                 match claim(db, &j.id, &classes, now_utc).await {
                     Ok(false) => {
                         let (status, latency) = ended(&j.status, &j.raw);

@@ -1133,3 +1133,101 @@ fn secret_looking_command_line_values_are_blanked() {
         ])
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 2 (task-13-rereview.md): T1, N1.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-057, CORE-093
+async fn outside_paid_prompt_unknown_to_comfyui_is_recorded_pending() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    paid_outside(&fake);
+    let drafts = Arc::new(Drafts::default());
+    let first = Rig::with_drafts(&env, drafts.clone());
+    first.ready().await;
+    first.engines.poll_outside().await;
+    first.close().await;
+    // ComfyUI restarts and forgets it: its outcome is never seen.
+    fake.restart(0);
+    let second = Rig::with_drafts(&env, drafts.clone());
+    second.ready().await;
+    for _ in 0..4 {
+        second.engines.poll_outside().await;
+    }
+    let all = drafts.all();
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(all[0].status, UsageStatus::Pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-069
+async fn the_poll_reads_the_newest_jobs_and_forgets_what_comfyui_forgot() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    rig.engines.poll_outside().await;
+    let listed: Vec<String> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "GET" && r.path == "/api/jobs")
+        .map(|r| r.query)
+        .collect();
+    assert!(
+        listed
+            .iter()
+            .all(|q| q.contains("limit=100") && q.contains("sort_order=desc")),
+        "{listed:?}"
+    );
+    let watch = rig.engines.outside_watch();
+    assert!(watch.known_count() > 0);
+    fake.restart(0);
+    rig.engines.poll_outside().await;
+    assert_eq!(watch.known_count(), 0, "pruned to what ComfyUI still lists");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-069, CORE-120
+async fn an_earlier_runs_prompt_named_by_an_open_job_is_never_outside() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    fake.hold_prompts(true);
+    let first = Rig::new(&env);
+    first.ready().await;
+    let id = first.submit(graph_with(json!({}))).await;
+    let deadline = Instant::now() + DEADLINE;
+    while posted(&fake).is_empty() {
+        assert!(Instant::now() < deadline, "never posted");
+        tokio::time::sleep(POLL).await;
+    }
+    // The core dies with its prompt in ComfyUI and its row open; no recovery has run.
+    first.close().await;
+    let second = Rig::new(&env);
+    second.ready().await;
+    second.engines.poll_outside().await;
+    assert_eq!(
+        second.engines.outside_watch().running(),
+        0,
+        "job {id}'s own prompt is the suite's"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-060
+async fn an_outside_prompt_id_stays_one_path_segment() {
+    let fake = FakeComfy::start();
+    let client = lil_core::engines::comfyui::ComfyClient::new(&fake.url()).unwrap();
+    // ComfyUI takes any prompt id from an outside client; asked about, it can't change the
+    // request.
+    assert_eq!(client.job_detail("x/../system_stats?y#z").await, Ok(None));
+    assert_eq!(client.job_detail("..").await, Ok(None));
+    let paths: Vec<String> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.starts_with("/api/jobs/"))
+        .map(|r| format!("{}?{}", r.path, r.query))
+        .collect();
+    assert_eq!(paths, ["/api/jobs/x%2F..%2Fsystem_stats%3Fy%23z?"]);
+}

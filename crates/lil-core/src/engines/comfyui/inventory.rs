@@ -121,7 +121,7 @@ pub type Cancelled = Arc<dyn Fn() -> bool + Send + Sync>;
 type Row = (u64, i64, String, String);
 
 /// The model files below `models_dir`, with their hashes (module docs): a file whose path,
-/// size, mtime and FileId match its cached row is not read, nor one whose FileId, size and
+/// size, mtime and FileId match its cached row is not read, nor one whose volume and FileId, size and
 /// mtime match another row (the same file reached through another link); the others are
 /// hashed through `probe` and the cache is updated. Rows of files gone from `models_dir` are
 /// dropped, but not those below a folder that could not be read. `cancelled` is asked
@@ -177,7 +177,7 @@ pub async fn scan(
         }
         let key = f.abs.display().to_string();
         seen.insert(key.clone());
-        let file_id = f.id.file_id.map(|b| hex(&b)).unwrap_or_default();
+        let file_id = identity_key(&f.id).unwrap_or_default();
         let known = match cached.get(&key) {
             Some((size, mtime, id, sha))
                 if *size == f.id.size && *mtime == f.id.last_write && *id == file_id =>
@@ -283,18 +283,23 @@ pub fn list_paths(models_dir: &Path, probe: &dyn Probe) -> Vec<String> {
 }
 
 /// Every model file below `dir` (module docs), with its identity; unreadable entries are
-/// logged and left out. Each folder is walked once, by its resolved path, so a linked folder
+/// logged and left out. Each folder is walked once, by its volume and FileId (else its resolved
+/// path), so a linked folder
 /// that loops, or two links to one folder, list each file once.
 fn walk(dir: &Path, probe: &dyn Probe) -> Walked {
     let mut out = Walked::default();
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<(PathBuf, String, usize)> = vec![(dir.to_path_buf(), String::new(), 0)];
     while let Some((at, rel, depth)) = stack.pop() {
-        let resolved = std::fs::canonicalize(&at).map_or_else(
-            |_| at.display().to_string().to_lowercase(),
-            |p| p.display().to_string().to_lowercase(),
-        );
-        if !visited.insert(resolved) {
+        // The folder itself, past any link: its volume and FileId (re-review N3), else its
+        // resolved path.
+        let resolved = std::fs::canonicalize(&at).unwrap_or_else(|_| at.clone());
+        let key = probe
+            .identity(&resolved)
+            .ok()
+            .and_then(|id| identity_key(&id))
+            .unwrap_or_else(|| resolved.display().to_string().to_lowercase());
+        if !visited.insert(key) {
             continue;
         }
         let Ok(entries) = probe.read_dir(&at) else {
@@ -334,6 +339,13 @@ fn walk(dir: &Path, probe: &dyn Probe) -> Walked {
         }
     }
     out
+}
+
+/// `<volume serial>-<FileId>` (hex): what identifies a file or folder across links, `None`
+/// without a FileId.
+fn identity_key(id: &FileIdentity) -> Option<String> {
+    id.file_id
+        .map(|f| format!("{:016x}-{}", id.volume_serial, hex(&f)))
 }
 
 /// The SHA-256 of `path`'s data, read through `probe`; `cancelled` is asked before each

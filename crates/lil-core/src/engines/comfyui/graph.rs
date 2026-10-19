@@ -123,13 +123,19 @@ pub const OTHER_MODEL_PATH_FLAGS: [&str; 3] = [
     "--base-directory",
 ];
 
-/// Whether the command line `args` holds one of [`OTHER_MODEL_PATH_FLAGS`] (`--flag value` or
-/// `--flag=value`).
+/// The shortest abbreviation of each of [`OTHER_MODEL_PATH_FLAGS`] that the check takes:
+/// ComfyUI's argparse accepts any unambiguous prefix (re-review N4).
+const OTHER_MODEL_PATH_STEMS: [&str; 3] = ["--extra-model", "--models", "--base"];
+
+/// Whether the command line `args` holds one of [`OTHER_MODEL_PATH_FLAGS`], whole or
+/// abbreviated as argparse allows (`--base-dir`), as `--flag value` or `--flag=value`.
 pub fn names_other_model_paths(args: &[String]) -> bool {
     args.iter().any(|a| {
+        let name = a.split_once('=').map_or(a.as_str(), |(n, _)| n);
         OTHER_MODEL_PATH_FLAGS
             .iter()
-            .any(|f| a == f || a.strip_prefix(f).is_some_and(|rest| rest.starts_with('=')))
+            .zip(OTHER_MODEL_PATH_STEMS)
+            .any(|(flag, stem)| name.starts_with(stem) && flag.starts_with(name))
     })
 }
 
@@ -306,6 +312,16 @@ mod tests {
             "--base-directoryx",
             "--port",
             "8188"
+        ])));
+        // Abbreviated, as argparse accepts (re-review N4).
+        for abbreviated in ["--base-dir", "--models-dir=m", "--extra-model", "--base"] {
+            assert!(
+                names_other_model_paths(&args(&[abbreviated])),
+                "{abbreviated}"
+            );
+        }
+        assert!(!names_other_model_paths(&args(&[
+            "--ba", "--model", "--extra"
         ])));
     }
 

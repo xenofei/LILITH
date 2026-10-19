@@ -724,3 +724,29 @@ async fn checked_up_to(
     }
     Err(ComfyError::Http(status.as_u16(), body))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] // spec: ARCH-060
+    fn outside_ids_are_one_encoded_path_segment() {
+        assert_eq!(
+            path_segment("00000000-0000-4000-8000-000000000001"),
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(path_segment("a/b?c#d e%"), "a%2Fb%3Fc%23d%20e%25");
+        assert_eq!(path_segment("..\\x"), "..%5Cx");
+    }
+
+    #[test] // spec: ARCH-069
+    fn deep_values_are_read_as_null_and_strings_are_skipped() {
+        let deep = format!(
+            "{{\"a\": {}1{}, \"b\": \"]]{{\", \"c\": 2}}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let v: Value = serde_json::from_str(&cap_depth(&deep, 64)).unwrap();
+        assert_eq!((v["b"].as_str(), v["c"].as_u64()), (Some("]]{"), Some(2)));
+    }
+}
