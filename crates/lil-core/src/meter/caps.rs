@@ -197,6 +197,16 @@ struct Priced {
     rate_date: Option<String>,
 }
 
+impl Priced {
+    /// The rate used, `None` for the display currency itself.
+    fn rate(&self) -> Option<Rate> {
+        self.rate_date.as_ref().map(|d| Rate {
+            in_display_micros: self.rate_micros,
+            date: d.clone(),
+        })
+    }
+}
+
 fn sql(e: &rusqlite::Error) -> StateError {
     match e.sqlite_error_code() {
         Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) => {
@@ -352,6 +362,8 @@ fn hits(
                 settled: settled.amount,
                 held: held.amount,
                 estimate: est,
+                currency: s.display.as_str().to_string(),
+                rate: None,
             });
         }
     }
@@ -368,6 +380,8 @@ fn hits(
                 settled: Money::ZERO,
                 held: Money::ZERO,
                 estimate: est,
+                currency: s.display.as_str().to_string(),
+                rate: None,
             });
         }
     }
@@ -384,6 +398,8 @@ fn hits(
                 settled: settled.amount,
                 held: held.amount,
                 estimate: est,
+                currency: s.display.as_str().to_string(),
+                rate: None,
             });
         }
     }
@@ -571,10 +587,16 @@ impl Caps {
         let priced = self.price(&s, &c).ok_or_else(|| Caps::no_rate(&s, &c))?;
         let period = self.period(self.clock.utc_now());
         let (provider, date) = (c.provider.to_string(), self.today());
+        let rate = priced.rate();
         let found = self
             .db()
             .call(move |conn| {
-                hits(conn, &s, &date, &period, &provider, priced.display).map_err(|e| sql(&e))
+                let mut found = hits(conn, &s, &date, &period, &provider, priced.display)
+                    .map_err(|e| sql(&e))?;
+                for h in &mut found {
+                    h.rate.clone_from(&rate);
+                }
+                Ok(found)
             })
             .await
             .map_err(|e| state_unavailable(&e))?;
@@ -646,6 +668,7 @@ impl Caps {
         let created = self.now_ms();
         let allowed = allow_once.cloned();
         let date = self.today();
+        let rate = priced.rate();
         let id = row.id.clone();
         let done = self
             .db()
@@ -653,7 +676,11 @@ impl Caps {
                 let mut run = || -> rusqlite::Result<Result<(), Vec<CapHit>>> {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     if applies {
-                        let found = hits(&tx, &s, &date, &row.period, &row.provider, row.display)?;
+                        let mut found =
+                            hits(&tx, &s, &date, &row.period, &row.provider, row.display)?;
+                        for h in &mut found {
+                            h.rate.clone_from(&rate);
+                        }
                         // A confirmation's allow-once passes only the caps it named, up to
                         // the estimate it showed (CORE-091); anything else asks again.
                         let passes = allowed
@@ -1242,6 +1269,18 @@ impl Caps {
         }
         {
             let _one_at_a_time = self.setting.lock().await;
+            // A `suite.toml` whose `caps` the editor can't change is your config to fix by
+            // hand: a clear error, not the store's.
+            let text = std::fs::read_to_string(self.env.suite_toml_to_read()).unwrap_or_default();
+            if let Some(why) = super::caps_settings::shape_problem(&text) {
+                return Err(ErrorBody::new(
+                    &codes::CAPS_INVALID,
+                    format!(
+                        "The caps can't be changed: {why}. Fix that line in suite.toml, then set the caps again."
+                    ),
+                    trace_id,
+                ));
+            }
             edit.carry_legacy = self.settings().display.as_str() == "USD";
             crate::store::set_caps(&self.env, &edit, &self.failpoints)
                 .await

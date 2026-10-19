@@ -23,6 +23,7 @@ use futures_util::future::BoxFuture;
 use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
 use lil_protocol::codes::PARAMS_INVALID;
 use lil_protocol::{ErrorBody, Outcome, PendingConfirmation, ToolDescriptor, ToolOutput};
+use lil_schema::money::Rate;
 use lil_schema::workspace_yaml::{
     ProjectYaml, WorkspaceYaml, read_project_yaml, read_workspace_yaml,
 };
@@ -96,7 +97,8 @@ impl ConfirmedVia {
 }
 
 /// A cap a call would pass (Task 16): `cap` is `monthly`, `per_call_max` or
-/// `provider:<id>`; the amounts are in the display currency.
+/// `provider:<id>`; the amounts are in the display currency `currency`, and `rate` is the
+/// exchange rate the estimate was converted at (`None` when it was already in that currency).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapHit {
     pub cap: String,
@@ -104,6 +106,8 @@ pub struct CapHit {
     pub settled: Money,
     pub held: Money,
     pub estimate: Money,
+    pub currency: String,
+    pub rate: Option<Rate>,
 }
 
 /// What a call is expected to cost (CORE-015 stage 4): nothing, local work, or an external
@@ -192,15 +196,22 @@ pub struct AllowOnce {
     pub confirmation_id: String,
     /// `monthly`, `per_call_max`, `provider:<id>`.
     pub caps: Vec<String>,
-    /// The estimate the prompt showed, display currency.
+    /// The estimate the prompt showed, in `currency` (the display currency then).
     pub estimate: Money,
+    pub currency: String,
+    /// The exchange rate the shown estimate was converted at (`None`: none was needed).
+    pub rate: Option<Rate>,
 }
 
 impl AllowOnce {
     /// Whether this lets a call whose estimate is `estimate` pass `hits`: each is a cap the
-    /// prompt named, and the estimate is no larger than the one it showed.
+    /// prompt named, in the same display currency and at the same rate, and the estimate is no
+    /// larger than the one it showed. A changed currency or rate asks again.
     pub fn covers(&self, hits: &[CapHit], estimate: Money) -> bool {
-        estimate <= self.estimate && hits.iter().all(|h| self.caps.contains(&h.cap))
+        estimate <= self.estimate
+            && hits.iter().all(|h| {
+                self.caps.contains(&h.cap) && h.currency == self.currency && h.rate == self.rate
+            })
     }
 }
 
@@ -267,8 +278,8 @@ pub fn cap_exceeded(tool: &str, hits: &[CapHit]) -> ErrorBody {
     error
 }
 
-/// `[{cap, limit, settled, held, estimate}]`, amounts as decimal strings in the display
-/// currency.
+/// `[{cap, limit, settled, held, estimate, currency, rate}]`, amounts as decimal strings in
+/// the display currency `currency`; `rate` is `{in_display, date}` or `null`.
 pub fn cap_hits_json(hits: &[CapHit]) -> Value {
     Value::Array(
         hits.iter()
@@ -279,6 +290,11 @@ pub fn cap_hits_json(hits: &[CapHit]) -> Value {
                     "settled": h.settled.to_decimal_string(),
                     "held": h.held.to_decimal_string(),
                     "estimate": h.estimate.to_decimal_string(),
+                    "currency": h.currency,
+                    "rate": h.rate.as_ref().map(|r| serde_json::json!({
+                        "in_display": Money::from_micros(r.in_display_micros).to_decimal_string(),
+                        "date": r.date,
+                    })),
                 })
             })
             .collect(),

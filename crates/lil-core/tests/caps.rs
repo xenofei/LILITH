@@ -993,6 +993,8 @@ async fn alerts_once_per_level_per_period() {
                     confirmation_id: "cf_x".into(),
                     caps: vec!["monthly".into()],
                     estimate: money("1"),
+                    currency: "USD".into(),
+                    rate: None,
                 }),
             )
             .await
@@ -2097,4 +2099,57 @@ async fn a_line_the_tool_finished_itself_settles_at_its_cost() {
     assert_eq!(caps.repair().await.unwrap(), 1);
     assert_eq!(rig.monthly().await, ("7".into(), "0".into()));
     assert_eq!(lines(&rig.loose()).len(), 2, "one line each");
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-091, CORE-081
+async fn allow_once_is_bound_to_the_currency_it_was_shown_in() {
+    // RR5: 2 USD shown over a 1 USD cap; before the retry you switch the display to EUR.
+    let rig = Rig::new(MONTHLY_1);
+    rig.confirm.presence().opened();
+    let args = json!({"provider": "fakeprov", "amount": "2"});
+    let k = next_key();
+    let p = pending(
+        &rig.call(&cli(), "test.meter_external", args.clone(), &k)
+            .await,
+    );
+    let shown = rig
+        .confirm
+        .list(lil_core::confirm::ListState::Pending, 10)
+        .await
+        .unwrap();
+    let hit = &shown[0].cap.as_ref().unwrap()[0];
+    assert_eq!(
+        (hit["currency"].as_str(), hit["rate"].is_null()),
+        (Some("USD"), true)
+    );
+    rig.confirm
+        .answer(
+            &app(),
+            answer(&p.confirmation_id, Answer::Approve, allow_once()),
+        )
+        .await
+        .unwrap();
+    let eur = "[money]\ndisplay_currency = \"EUR\"\n\
+               [[money.rates]]\ncurrency = \"USD\"\nin_display = \"0.5\"\ndate = \"2026-01-01\"\n\
+               [caps]\nmonthly = \"0.5\"\n";
+    lil_testkit::files::write_file(&rig.env.env.suite_toml(), eur.as_bytes());
+    let again = pending(&rig.call(&cli(), "test.meter_external", args, &k).await);
+    assert_eq!(again.covers, [Cover::Cap], "another currency asks again");
+    assert_eq!(rig.monthly().await, ("0".into(), "0".into()), "nothing ran");
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-008, CORE-085
+async fn caps_set_over_a_caps_that_is_not_a_table_is_a_clear_error() {
+    let rig = Rig::new("caps = 5\n");
+    let set = CapsSetParams {
+        monthly: Some(Some("5".into())),
+        ..CapsSetParams::default()
+    };
+    let err = rig.caps.set(&app(), set).await.unwrap_err();
+    assert_eq!(err.code, "caps.invalid", "{err:?}");
+    assert!(err.message.contains("[caps]"), "{}", err.message);
+    assert_eq!(
+        std::fs::read_to_string(rig.env.env.suite_toml()).unwrap(),
+        "caps = 5\n"
+    );
 }

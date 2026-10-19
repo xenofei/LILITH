@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use lil_protocol::{CallerKind, Cover, ErrorBody, codes};
-use lil_schema::money::Money;
+use lil_schema::money::{Money, Rate};
 use serde_json::Value;
 
 use super::{Confirm, ConfirmRequest, McpConfirmation, Replay};
@@ -113,8 +113,9 @@ impl AgentConfirm {
     }
 }
 
-/// What an `allow_once` answer allowed: the caps the confirmation's `cap` names and the
-/// largest estimate it showed. `None` for another action, or a row without caps.
+/// What an `allow_once` answer allowed: the caps the confirmation's `cap` names, the largest
+/// estimate it showed, its currency and the rate it was converted at. `None` for another
+/// action, or a row whose caps don't read (it fails closed: the call asks again).
 fn allowed_once(id: &str, action: Option<&str>, cap: Option<&Value>) -> Option<AllowOnce> {
     if action != Some("allow_once") {
         return None;
@@ -122,15 +123,34 @@ fn allowed_once(id: &str, action: Option<&str>, cap: Option<&Value>) -> Option<A
     let hits = cap?.as_array()?;
     let mut caps = Vec::new();
     let mut estimate = Money::ZERO;
+    let mut shown: Option<(String, Option<Rate>)> = None;
     for h in hits {
         caps.push(h.get("cap")?.as_str()?.to_string());
         let e = Money::parse_decimal(h.get("estimate")?.as_str()?).ok()?;
         estimate = estimate.max(e);
+        let currency = h.get("currency")?.as_str()?.to_string();
+        let rate = match h.get("rate")? {
+            Value::Null => None,
+            r => Some(Rate {
+                in_display_micros: Money::parse_decimal(r.get("in_display")?.as_str()?)
+                    .ok()?
+                    .micros(),
+                date: r.get("date")?.as_str()?.to_string(),
+            }),
+        };
+        // Every hit of one prompt shows one estimate: a mix reads as nothing allowed.
+        match &shown {
+            Some(s) if *s != (currency.clone(), rate.clone()) => return None,
+            _ => shown = Some((currency, rate)),
+        }
     }
-    (!caps.is_empty()).then(|| AllowOnce {
+    let (currency, rate) = shown?;
+    Some(AllowOnce {
         confirmation_id: id.to_string(),
         caps,
         estimate,
+        currency,
+        rate,
     })
 }
 

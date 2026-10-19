@@ -33,6 +33,23 @@ const KNOWN_KEYS: [&str; 6] = [
     "provider_monthly_usd",
 ];
 
+/// Why `app/caps.set` can't edit a `suite.toml` text's caps: it isn't TOML, `caps` isn't a
+/// table, or `caps.provider_monthly` (or its legacy twin) isn't one. `None` when it can.
+pub fn shape_problem(text: &str) -> Option<String> {
+    let suite = match SuiteToml::parse(text) {
+        Ok(suite) => suite,
+        Err(e) => return Some(format!("suite.toml is not valid TOML ({e})")),
+    };
+    let caps = suite.other.get("caps")?;
+    let Some(table) = caps.as_table() else {
+        return Some("suite.toml's `caps` is not a table (write it as a [caps] section)".into());
+    };
+    ["provider_monthly", "provider_monthly_usd"]
+        .into_iter()
+        .find(|k| table.get(*k).is_some_and(|v| !v.is_table()))
+        .map(|k| format!("suite.toml's `caps.{k}` is not a table"))
+}
+
 /// `provider:<id>`, the name of a provider's monthly cap.
 pub fn provider_cap(provider: &str) -> String {
     format!("provider:{provider}")
