@@ -71,6 +71,9 @@
       "Bash(type *.lilith*)",
       "Bash(Get-Content *.lilith*)",
       "Bash(gc *.lilith*)",
+      "Bash(*>*LILITH*suite.toml*)",
+      "Bash(*Set-Content*LILITH*suite.toml*)",
+      "Bash(*Add-Content*LILITH*suite.toml*)",
       "PowerShell(git push origin main:*)",
       "PowerShell(git push * main:*)",
       "PowerShell(git push * main)",
@@ -141,6 +144,9 @@
       "PowerShell(type *.lilith*)",
       "PowerShell(Get-Content *.lilith*)",
       "PowerShell(gc *.lilith*)",
+      "PowerShell(*>*LILITH*suite.toml*)",
+      "PowerShell(*Set-Content*LILITH*suite.toml*)",
+      "PowerShell(*Add-Content*LILITH*suite.toml*)",
       "Read(~/.worldwright/**)",
       "Edit(~/.worldwright/**)",
       "Read(//**/.worldwright/**)",
@@ -148,7 +154,8 @@
       "Read(~/.lilith/**)",
       "Edit(~/.lilith/**)",
       "Read(//**/.lilith/**)",
-      "Edit(//**/.lilith/**)"
+      "Edit(//**/.lilith/**)",
+      "Edit(//**/LILITH*/suite.toml)"
     ]
   }
 }

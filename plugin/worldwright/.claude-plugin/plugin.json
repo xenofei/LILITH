@@ -1,0 +1,23 @@
+{
+  "name": "worldwright",
+  "version": "1.3.0",
+  "description": "LILITH's Claude Code plugin: the suite's MCP server lil, the hooks that ask before deletes, installs and script runs, and the skills carried from plugin 1.2.0.",
+  "author": {
+    "name": "LILITH"
+  },
+  "license": "GPL-3.0-or-later",
+  "userConfig": {
+    "lil_mcp_path": {
+      "type": "file",
+      "title": "lil-mcp.exe",
+      "description": "The suite's MCP server. Normally %LOCALAPPDATA%\\LILITH\\bin\\lil-mcp.exe; for a dev build, lil-mcp.exe in its build folder. lil doctor names the path for your channel.",
+      "required": true
+    },
+    "lil_path": {
+      "type": "file",
+      "title": "lil.exe",
+      "description": "The suite's command line, which runs the plugin's hooks. Normally %LOCALAPPDATA%\\LILITH\\bin\\lil.exe, beside lil-mcp.exe; for a dev build, lil.exe in its build folder. lil doctor names the path for your channel.",
+      "required": true
+    }
+  }
+}

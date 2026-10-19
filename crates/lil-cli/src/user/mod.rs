@@ -1,7 +1,7 @@
 //! The `lil` user commands over `lil-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
 //! `events --follow`, `core stop`, `workspace init|use`, `notify` and `doctor`. Spec Appendix D, "The `lil` user
-//! commands", and Appendix E, "The `lil` commands this plan adds", are the contract for their
-//! flags, output and exit codes.
+//! commands", and Appendices E and F, "The `lil` commands this plan adds", are the contract for
+//! their flags, output and exit codes. `hook` runs the Claude Code plugin's hooks.
 //!
 //! Every command builds its [`ClientConfig`] for the process's channel as a `cli` caller
 //! ([`config`]). `status`, `call` and `events` name the workspace the `cli` chain resolves
@@ -19,6 +19,8 @@ mod call;
 mod core;
 mod doctor;
 mod events;
+mod hook;
+mod hook_patterns;
 mod notify;
 mod status;
 mod workspace;
@@ -116,6 +118,13 @@ pub enum UserCommand {
     /// repair what is safe to repair. Anything persistent beyond that is done only after you
     /// type y.
     Doctor,
+    /// Run a Claude Code plugin hook: reads the hook JSON on stdin, prints the hook's answer
+    /// (or nothing) and exits 0. Never starts the core.
+    Hook {
+        /// The hook event.
+        #[arg(value_enum)]
+        event: hook::HookEvent,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -173,6 +182,7 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
         }
         UserCommand::Notify { paths } => notify::run(global, &paths),
         UserCommand::Doctor => doctor::run(global),
+        UserCommand::Hook { event } => Ok(hook::run(event, global)),
     };
     match result {
         Ok(code) | Err(Exit(code)) => code,

@@ -3,8 +3,8 @@
 //!
 //! - `claude --version` prints `9.9.9 (Claude Code)`;
 //! - `claude plugin list --json` prints `<config>\fake-plugins.json` (`[]` when missing);
-//! - `claude plugin marketplace add …` and `claude plugin install …` append their arguments, as
-//!   one JSON array per line, to `<config>\fake-claude.log`;
+//! - `claude plugin marketplace add …`, `claude plugin install …` and `claude plugin update …`
+//!   append their arguments, as one JSON array per line, to `<config>\fake-claude.log`;
 //! - `claude --spawn-stdio <exe> [args…]` starts `<exe>` as its direct child with stdin, stdout
 //!   and stderr passed through, waits for it and exits with its exit code.
 //!
@@ -53,7 +53,9 @@ fn main() {
                 Err(e) => usage(&format!("cannot read {}: {e}", file.display())),
             }
         }
-        ["plugin", "marketplace", "add", ..] | ["plugin", "install", ..] => {
+        ["plugin", "marketplace", "add", ..]
+        | ["plugin", "install", ..]
+        | ["plugin", "update", ..] => {
             let log = config_dir().join("fake-claude.log");
             let line = serde_json::Value::from(args.clone()).to_string();
             let written = std::fs::OpenOptions::new()

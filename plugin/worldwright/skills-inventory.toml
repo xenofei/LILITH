@@ -1,0 +1,8 @@
+# Every skill in this plugin, and whether its text tells Claude Code to write workspace files
+# directly instead of calling the suite's tools (spec ARCH-104). `lil doctor` lists the skills
+# that still do. The skills carried unchanged from plugin 1.2.0 are listed as their text shows.
+
+[[skill]]
+name = "lilith"
+path = "skills/lilith/SKILL.md"
+writes_directly = false

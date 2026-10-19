@@ -40,19 +40,29 @@
 //!   checked and never edited; the rest of the rename goes on. `legacy.stray_file` (`info`):
 //!   both workspace files are there; the legacy one is never touched. Only the ref fields
 //!   (`inputs[].ref`, `pinned_inputs[].ref`) are rewritten, never other text.
+//! - `claude.rules` (AI-110, AI-114): whether the workspace's `.claude/settings.json` has a
+//!   Claude Code permission rule for every tool the core registers, in both of Claude
+//!   Code's names for it (`mcp__plugin_worldwright_lil__<tool>` in your sessions,
+//!   `mcp__lil__<tool>` in Engine A; `<tool>` lowered, `.` as `_`), plus `lil-mcp`'s own
+//!   `lil_status`: `allow` for `read` and `write` tools, `ask` for `destructive` and `exec`
+//!   ones. A rule you placed yourself, in `allow`, `ask` or `deny`, counts as there and is never
+//!   moved. Missing rules are `info`; only the offer `claude_rules` adds them, keeping
+//!   everything else in the file, and `lil doctor` lists it after you answer y. A file that is
+//!   not a JSON object is a `problem` and is left as it is.
 //!
 //! Git runs go through [`Store::git`](crate::store::Store::git) with the core's git
 //! environment. A second run changes nothing (QA-060).
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lil_platform::fs::Probe;
 use lil_platform::names::{
     LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_DIR, WORKSPACE_FILE,
 };
-use lil_protocol::{CallerKind, EffectClass, ErrorBody, codes};
+use lil_protocol::lowering::mcp_name;
+use lil_protocol::{CallerKind, EffectClass, ErrorBody, ToolDescriptor, codes};
 use lil_schema::{AssetRef, LEGACY_SCHEME, Manifest, SCHEME, Version, bare_sha256};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -75,7 +85,8 @@ const DOCTOR_DESCRIPTION: &str = "Check the session's workspace and repair what 
     attribute of sealed files whose bytes still match their manifest. It also reports, without \
     changing anything, an inherited core.autocrlf, sealed files edited outside the suite, a \
     network, cloud or ID-less volume, a missing folder watch, orphans, manifests that need \
-    repair and missing files. With fix false nothing is changed. Running it twice changes \
+    repair, missing files and missing Claude Code permission rules for the suite's tools in \
+    .claude/settings.json. With fix false nothing is changed. Running it twice changes \
     nothing the second time.";
 
 /// The `ok` state.
@@ -108,6 +119,9 @@ pub struct DoctorArgs {
 pub enum DoctorOffer {
     /// Rename the workspace's names from before the rename ([`rename_legacy`]).
     LegacyNames,
+    /// Add the missing Claude Code permission rules to `.claude/settings.json`
+    /// ([`claude_rules_check`]).
+    ClaudeRules,
 }
 
 /// One check's outcome.
@@ -136,10 +150,12 @@ struct DoctorResult {
     checks: Vec<DoctorCheck>,
 }
 
-/// What the tool keeps: the core's probe and git environment.
+/// What the tool keeps: the core's probe and git environment, and every registered tool's
+/// descriptor (set once every tool is registered).
 struct Doctor {
     probe: Arc<dyn Probe>,
     git_env: Arc<Vec<(OsString, OsString)>>,
+    tools: Arc<OnceLock<Vec<ToolDescriptor>>>,
 }
 
 /// Registers `workspace.doctor` on `reg`. `git_env` is added to every `git` it runs.
@@ -148,7 +164,11 @@ pub fn register_doctor_tools(
     probe: Arc<dyn Probe>,
     git_env: Arc<Vec<(OsString, OsString)>>,
 ) {
-    let doctor = Arc::new(Doctor { probe, git_env });
+    let doctor = Arc::new(Doctor {
+        probe,
+        git_env,
+        tools: reg.all_tools(),
+    });
     reg.register(typed_tool(
         "workspace.doctor",
         DOCTOR_DESCRIPTION,
@@ -169,6 +189,7 @@ async fn run(
     let open = ctx.workspace()?.clone();
     let fix = args.fix;
     let rename = args.offers.contains(&DoctorOffer::LegacyNames);
+    let rules = args.offers.contains(&DoctorOffer::ClaudeRules);
     if !args.offers.is_empty() {
         refuse_offers(ctx)?;
     }
@@ -198,6 +219,8 @@ async fn run(
     checks.push(watcher_check(&open));
     checks.extend(listed_checks(&open).await);
     checks.extend(legacy_checks(&open, rename).await);
+    let tools = d.tools.get().map_or(&[][..], Vec::as_slice);
+    checks.push(claude_rules_check(&open.store, tools, rules).await);
     let count = |state: &str| checks.iter().filter(|c| c.state == state).count();
     let summary = format!(
         "{} ok, {} fixed, {} problem(s)",
@@ -1168,4 +1191,167 @@ async fn legacy_checks(open: &OpenWorkspace, rename: bool) -> Vec<DoctorCheck> {
         ));
     }
     checks
+}
+
+// ---------------------------------------------------------------------------------------------
+// Claude Code permission rules (AI-110, AI-114).
+// ---------------------------------------------------------------------------------------------
+
+/// The workspace's Claude Code project settings.
+const CLAUDE_SETTINGS: &str = ".claude/settings.json";
+
+/// Claude Code's two names for the plugin's `lil` server's tools: in your sessions, and in
+/// Engine A (AI-110).
+const CLAUDE_TOOL_PREFIXES: [&str; 2] = ["mcp__plugin_worldwright_lil__", "mcp__lil__"];
+
+/// `lil-mcp`'s own tool, which the core doesn't register (Appendix F).
+const LIL_STATUS: &str = "lil_status";
+
+/// The `allow` rules (for `read` and `write` tools and `lil_status`) and the `ask` rules (for
+/// `destructive` and `exec` tools), each in both of Claude Code's names, sorted.
+pub fn claude_rules(tools: &[ToolDescriptor]) -> (Vec<String>, Vec<String>) {
+    let mut allow = Vec::new();
+    let mut ask = Vec::new();
+    let add = |list: &mut Vec<String>, tool: &str| {
+        for prefix in CLAUDE_TOOL_PREFIXES {
+            list.push(format!("{prefix}{tool}"));
+        }
+    };
+    add(&mut allow, LIL_STATUS);
+    for t in tools {
+        let name = mcp_name(&t.name);
+        if matches!(t.effect, EffectClass::Destructive | EffectClass::Exec) {
+            add(&mut ask, &name);
+        } else {
+            add(&mut allow, &name);
+        }
+    }
+    allow.sort();
+    ask.sort();
+    (allow, ask)
+}
+
+/// `settings` with every rule of `allow` and `ask` that none of its `permissions.allow`, `ask`
+/// or `deny` lists holds appended to its list, everything else kept, and how many were missing
+/// from each list. Empty text is an empty object. `None` when `settings` is not a JSON object,
+/// or its `permissions` or one of those lists has another type.
+fn with_rules(settings: &str, allow: &[String], ask: &[String]) -> Option<(String, usize, usize)> {
+    let mut root: Value = if settings.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(settings).ok()?
+    };
+    let permissions = root
+        .as_object_mut()?
+        .entry("permissions")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()?;
+    let mut placed: Vec<String> = Vec::new();
+    for list in ["allow", "ask", "deny"] {
+        match permissions.get(list) {
+            None => {}
+            Some(Value::Array(rules)) => {
+                placed.extend(rules.iter().filter_map(Value::as_str).map(str::to_string));
+            }
+            Some(_) => return None,
+        }
+    }
+    let mut counts = [0usize; 2];
+    for (count, (list, wanted)) in counts.iter_mut().zip([("allow", allow), ("ask", ask)]) {
+        let missing: Vec<Value> = wanted
+            .iter()
+            .filter(|r| !placed.contains(r))
+            .map(|r| Value::from(r.as_str()))
+            .collect();
+        *count = missing.len();
+        if missing.is_empty() {
+            continue;
+        }
+        permissions
+            .entry(list)
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()?
+            .extend(missing);
+    }
+    let mut text = serde_json::to_string_pretty(&root).ok()?;
+    text.push('\n');
+    Some((text, counts[0], counts[1]))
+}
+
+/// `claude.rules`: reports the missing rules, and adds them when `write` (the offer).
+async fn claude_rules_check(store: &Store, tools: &[ToolDescriptor], write: bool) -> DoctorCheck {
+    const ID: &str = "claude.rules";
+    let rel = WsPath::parse(CLAUDE_SETTINGS).expect("the doctor's file names are valid");
+    let text = match store.read(&rel).await {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                return DoctorCheck::new(
+                    ID,
+                    PROBLEM,
+                    format!(
+                        "{CLAUDE_SETTINGS} is not UTF-8 text — save it as UTF-8, then run lil \
+                         doctor"
+                    ),
+                );
+            }
+        },
+        Ok(None) => String::new(),
+        Err(e) => {
+            return DoctorCheck::new(
+                ID,
+                PROBLEM,
+                format!("{CLAUDE_SETTINGS} can't be read: {e} — check the file"),
+            );
+        }
+    };
+    let (allow, ask) = claude_rules(tools);
+    let Some((_, missing_allow, missing_ask)) = with_rules(&text, &allow, &ask) else {
+        return DoctorCheck::new(
+            ID,
+            PROBLEM,
+            format!(
+                "{CLAUDE_SETTINGS} is not a JSON object with permissions lists, so its Claude \
+                 Code rules for the suite's tools can't be checked — fix the file, then run lil \
+                 doctor again"
+            ),
+        );
+    };
+    if missing_allow + missing_ask == 0 {
+        return DoctorCheck::new(
+            ID,
+            OK,
+            format!("{CLAUDE_SETTINGS} has the Claude Code rules for the suite's tools"),
+        );
+    }
+    let counted = format!(
+        "{missing_allow} allow rule(s) for the suite's reading and writing tools and \
+         {missing_ask} ask rule(s) for its destructive and exec tools"
+    );
+    if !write {
+        return DoctorCheck::new(
+            ID,
+            INFO,
+            format!(
+                "{CLAUDE_SETTINGS} lacks {counted}; lil doctor in a terminal adds them after you \
+                 answer y"
+            ),
+        );
+    }
+    let edit = move |current: &str| -> Result<String, StoreError> {
+        with_rules(current, &allow, &ask)
+            .map(|(text, _, _)| text)
+            .ok_or_else(|| StoreError::Io {
+                path: CLAUDE_SETTINGS.to_string(),
+                why: "it is not a JSON object with permissions lists".to_string(),
+            })
+    };
+    match store.edit_text(&rel, &edit).await {
+        Ok(_) => DoctorCheck::new(ID, FIXED, format!("added to {CLAUDE_SETTINGS}: {counted}")),
+        Err(e) => DoctorCheck::new(
+            ID,
+            PROBLEM,
+            format!("{CLAUDE_SETTINGS} can't be written: {e} — run lil doctor again"),
+        ),
+    }
 }

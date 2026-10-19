@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 /// The checks, in the order the tool reports them (`legacy.sealed_refs` follows
 /// `legacy.names` only when a sealed snapshot holds a legacy ref).
-const CHECK_IDS: [&str; 13] = [
+const CHECK_IDS: [&str; 14] = [
     "git.repository",
     "git.core_longpaths",
     "git.lfs_setlockablereadonly",
@@ -36,6 +36,7 @@ const CHECK_IDS: [&str; 13] = [
     "workspace.needs_repair",
     "workspace.missing",
     "legacy.names",
+    "claude.rules",
 ];
 
 /// The five `.gitignore` entries (Global Constraints, CORE-040).
@@ -263,7 +264,9 @@ fn doctor_sets_git_config_and_gitignore_then_changes_nothing() {
     let hashes: Vec<String> = watched.iter().map(|p| sha256_file(p)).collect();
     let second = doctor(&mut pipe, true);
     for (id, state, detail) in &second {
-        assert_eq!(state, "ok", "{id}: {detail}");
+        // `fix` never adds the Claude Code rules: only the `claude_rules` offer does.
+        let want = if id == "claude.rules" { "info" } else { "ok" };
+        assert_eq!(state, want, "{id}: {detail}");
     }
     for (path, before) in watched.iter().zip(&hashes) {
         assert_eq!(&sha256_file(path), before, "{} changed", path.display());

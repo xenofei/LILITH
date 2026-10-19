@@ -159,6 +159,20 @@ impl TestEnv {
         self.run_lil(self.root(), args, Some(stdin))
     }
 
+    /// [`TestEnv::lil`] run in `dir`, with the variables in `extra` added after
+    /// [`TestEnv::child_env`] (each replaces one of the same name) and `stdin`, if any, written
+    /// to `lil`'s standard input: for `lil hook` and `lil doctor` runs that need the fake
+    /// `claude` on `PATH` or `LIL_ENGINE`.
+    pub fn lil_in_with(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        extra: &[(&str, OsString)],
+        stdin: Option<&str>,
+    ) -> LilOutput {
+        self.run_lil_with(dir, args, extra, stdin)
+    }
+
     /// Starts `lil` like [`TestEnv::lil`] but does not wait: for long-running commands such as
     /// `lil events --follow`. Stdin is empty; stdout is read line by line through
     /// [`LilChild::stdout_lines`], and stderr is drained on a thread of its own
@@ -189,11 +203,24 @@ impl TestEnv {
     }
 
     fn run_lil(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> LilOutput {
+        self.run_lil_with(dir, args, &[], stdin)
+    }
+
+    fn run_lil_with(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        extra: &[(&str, OsString)],
+        stdin: Option<&str>,
+    ) -> LilOutput {
         let lil = &ensure_built().lil;
         let start = Instant::now();
         let deadline = start + LIL_DEADLINE;
-        let mut child = self
-            .lil_command(dir, args)
+        let mut command = self.lil_command(dir, args);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {

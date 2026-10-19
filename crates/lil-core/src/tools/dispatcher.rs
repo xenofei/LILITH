@@ -161,6 +161,7 @@ impl Dispatcher {
         clock: Arc<dyn Clock>,
         lifecycle: Arc<Lifecycle>,
     ) -> Dispatcher {
+        reg.seal();
         // The core's jobs live with its dispatcher: every call's context carries them.
         let jobs = Jobs::new(
             states.clone(),

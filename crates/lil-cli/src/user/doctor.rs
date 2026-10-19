@@ -23,11 +23,24 @@
 //!    When `legacy.names` is a problem (a workspace from before the rename), `lil` explains and
 //!    asks, and only a `y` calls `workspace.doctor {fix: true, offers: ["legacy_names"]}`, so the
 //!    core renames them through its store; never with `--non-interactive`. Lines may also be
-//!    `info: …` and `skipped: …`.
+//!    `info: …` and `skipped: …`. The `claude.*` checks are shown only when Claude Code is
+//!    here (step 4); when `claude.rules` reports missing rules, `lil` asks, and only a `y` calls
+//!    `workspace.doctor {fix: true, offers: ["claude_rules"]}`, so the core adds them to the
+//!    workspace's `.claude/settings.json` through its store; never with `--non-interactive`.
+//! 4. Claude Code (AI-114, AI-117, ARCH-104, ARCH-108): `claude.exe` on `PATH` (on a test channel
+//!    only the test kit's, in this executable's folder); the plugin `worldwright@lilith` at
+//!    1.3.0 in the default profile (the folder `CLAUDE_CONFIG_DIR` names, else Claude Code's
+//!    own; the doctor never sets it), installed or updated in place with Claude Code's own
+//!    commands only after the person types `y`, never removed; the plugin's options
+//!    `lil_mcp_path` and `lil_path` (read from the profile's `settings.json`, never written)
+//!    set to `lil-mcp.exe` and `lil.exe` in a folder the running channel trusts, else a
+//!    `problem:` naming the path to enter; and the plugin's skills that still write workspace
+//!    files directly, from its `skills-inventory.toml`.
 
+use std::ffi::OsStr;
 use std::io::{self, BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lil_client::blocking::BlockingClient;
 use lil_client::doctor::{
@@ -36,10 +49,12 @@ use lil_client::doctor::{
     set_repo_autocrlf_false, workspace_state_db,
 };
 use lil_client::{ClientError, StartPolicy, WorkspaceOrigin, WorkspaceSource};
-use lil_platform::Env;
 use lil_platform::names::{
     LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_DIR, WORKSPACE_FILE,
 };
+use lil_platform::paths::folder_key;
+use lil_platform::process::{current_exe_dir, find_on_path, run_hidden};
+use lil_platform::{Channel, Env};
 use lil_protocol::Outcome;
 use serde_json::{Map, Value};
 
@@ -85,6 +100,7 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
         .map_err(|e| cannot_run(format!("Cannot tell which LILITH folders to use: {e}")))?;
     let interactive = !global.non_interactive;
     let mut report = Report::default();
+    let claude = find_claude(&env);
 
     // 1.
     let blocked = state_db(&env, &Db::suite(&env), interactive, &mut report);
@@ -141,8 +157,12 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
 
     // 3.
     if let Some((default, id)) = workspace {
-        workspace_checks(global, interactive, &default, id, &mut report)?;
+        let claude_here = claude.is_some();
+        workspace_checks(global, interactive, &default, id, claude_here, &mut report)?;
     }
+
+    // 4.
+    claude_code(&env, claude.as_deref(), interactive, &mut report);
     Ok(if report.problems == 0 {
         EXIT_OK
     } else {
@@ -390,13 +410,15 @@ const WORKSPACE_SET_ASIDE_EXPLAINED: &str = "The core can't open the workspace w
 const STOP_THE_CORE: &str = "a LILITH core is running and holds it open; stop it first \
     (lil core stop), then run lil doctor again";
 
-/// Step 3: `workspace.doctor {fix: true}` in the default workspace, then the `core.autocrlf`
-/// question.
+/// Step 3: `workspace.doctor {fix: true}` in the default workspace, then the `core.autocrlf`,
+/// legacy-name and Claude Code rules questions. The `claude.*` checks are left out when
+/// Claude Code isn't here (`claude_here`).
 fn workspace_checks(
     global: &GlobalArgs,
     interactive: bool,
     default: &Path,
     id: String,
+    claude_here: bool,
     report: &mut Report,
 ) -> Result<(), Exit> {
     let mut cfg = config(global, StartPolicy::StartIfNeeded)?;
@@ -430,9 +452,17 @@ fn workspace_checks(
     };
     let mut autocrlf_problem = false;
     let mut legacy_problem = false;
+    let mut rules_missing = false;
     for check in output.structured["checks"].as_array().into_iter().flatten() {
         let state = check["state"].as_str().unwrap_or("problem");
         let detail = check["detail"].as_str().unwrap_or_default();
+        let id = check["id"].as_str().unwrap_or_default();
+        if id.starts_with(CLAUDE_CHECKS) && !claude_here {
+            continue;
+        }
+        if id == CLAUDE_RULES_CHECK && state == "info" {
+            rules_missing = true;
+        }
         if check["id"] == AUTOCRLF_CHECK && state == "problem" {
             autocrlf_problem = true;
         }
@@ -464,6 +494,9 @@ fn workspace_checks(
     }
     if legacy_problem && interactive {
         legacy_names(&client, report)?;
+    }
+    if rules_missing && interactive {
+        claude_rules(&client, report)?;
     }
     Ok(())
 }
@@ -552,4 +585,356 @@ fn ask(question: &str) -> bool {
     }
     let answer = answer.trim().to_ascii_lowercase();
     answer == "y" || answer == "yes"
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 4: Claude Code (AI-114, AI-117, ARCH-104, ARCH-108; Appendix F).
+// ---------------------------------------------------------------------------------------------
+
+/// The plugin as Claude Code names it, `worldwright@lilith`: the plugin's name, then its
+/// marketplace's.
+const PLUGIN: &str = "worldwright@lilith";
+/// The plugin version this suite ships.
+const PLUGIN_VERSION: &str = "1.3.0";
+/// How long one `claude` command may take.
+const CLAUDE_LIMIT: Duration = Duration::from_secs(120);
+/// The workspace check whose rules only the person may add.
+const CLAUDE_RULES_CHECK: &str = "claude.rules";
+/// The workspace checks only shown when Claude Code is here.
+const CLAUDE_CHECKS: &str = "claude.";
+
+/// `claude.exe` on `PATH`, when Claude Code is installed. On a test channel only one in this
+/// executable's own folder (the test kit's fake) counts, so a test never runs a real Claude
+/// Code (QA-040).
+fn find_claude(env: &Env) -> Option<PathBuf> {
+    let claude = find_on_path("claude.exe")?;
+    if matches!(env.channel(), Channel::Test(_)) {
+        let own = current_exe_dir().ok()?;
+        let dir = claude.parent()?;
+        if folder_key(dir) != folder_key(&own) {
+            return None;
+        }
+    }
+    Some(claude)
+}
+
+/// The folders the running channel trusts for `lil-mcp.exe` and `lil.exe` (ARCH-047), and the
+/// one whose paths the doctor names: `%LOCALAPPDATA%\LILITH\bin\` (or the install folder) on
+/// stable, the build folder otherwise.
+fn trusted_folders(env: &Env) -> Option<(Vec<PathBuf>, PathBuf)> {
+    match env.install_dir() {
+        Some(install) => {
+            let bin = env.local_dir().join("bin");
+            Some((vec![bin.clone(), install], bin))
+        }
+        None => {
+            let own = current_exe_dir().ok()?;
+            Some((vec![own.clone()], own))
+        }
+    }
+}
+
+/// The plugin's marketplace folder in the checkout this `lil` was built from.
+fn marketplace_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("plugin")
+}
+
+/// Runs `claude <args>` (the profile is the one `CLAUDE_CONFIG_DIR` names, or the default
+/// folder when it isn't set: the doctor never sets it, AI-089). `Err` says what went wrong.
+fn run_claude(claude: &Path, args: &[&str]) -> Result<String, String> {
+    let os: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let cwd = claude.parent().unwrap_or(Path::new("."));
+    let shown = format!("claude {}", args.join(" "));
+    match run_hidden(claude, &os, cwd, &[], CLAUDE_LIMIT) {
+        Ok(out) if out.code == Some(0) => Ok(out.stdout),
+        Ok(out) => Err(format!(
+            "`{shown}` failed ({}): {}",
+            out.code.map_or_else(
+                || "it ran too long".to_string(),
+                |c| format!("exit code {c}")
+            ),
+            out.stderr.trim()
+        )),
+        Err(e) => Err(format!("`{shown}` couldn't run: {e}")),
+    }
+}
+
+/// The plugin's name (before the `@`), which another marketplace's copy shares.
+fn plugin_name() -> &'static str {
+    PLUGIN.split_once('@').map_or(PLUGIN, |(name, _)| name)
+}
+
+/// `a` is an older version than `b` (dotted numbers; anything else counts as older).
+fn older(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Option<Vec<u64>> { v.split('.').map(|p| p.parse().ok()).collect() };
+    match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => true,
+    }
+}
+
+/// Step 4.
+fn claude_code(env: &Env, claude: Option<&Path>, interactive: bool, report: &mut Report) {
+    let Some(claude) = claude else {
+        report.ok("Claude Code (claude.exe) isn't on PATH; Claude Code checks skipped");
+        return;
+    };
+    report.ok(&format!("Claude Code: {}", claude.display()));
+    if plugin(claude, interactive, report) {
+        plugin_options(env, report);
+    }
+    skills_inventory(report);
+}
+
+/// The plugin in the default profile: installed or updated in place only after `y`, never
+/// removed. Whether it is (now) installed at this suite's version.
+fn plugin(claude: &Path, interactive: bool, report: &mut Report) -> bool {
+    let listed = match run_claude(claude, &["plugin", "list", "--json"]) {
+        Ok(text) => text,
+        Err(e) => {
+            report.problem(&format!(
+                "the Claude Code plugins can't be listed: {e} — check that Claude Code works"
+            ));
+            return false;
+        }
+    };
+    let plugins: Vec<Value> = serde_json::from_str(listed.trim()).unwrap_or_default();
+    let ours = plugins.iter().find(|p| p["id"] == PLUGIN);
+    for other in plugins.iter().filter_map(|p| p["id"].as_str()) {
+        if other != PLUGIN && other.split('@').next() == Some(plugin_name()) {
+            report.line(
+                "info",
+                &format!(
+                    "another copy of the plugin, {other}, is installed in the default Claude \
+                     Code profile; lil doctor never removes a plugin: turn it off or remove it \
+                     yourself once {PLUGIN} works"
+                ),
+            );
+        }
+    }
+    let update = match ours {
+        None => false,
+        Some(p) => {
+            let version = p["version"].as_str().unwrap_or("unknown");
+            if !older(version, PLUGIN_VERSION) {
+                report.ok(&format!(
+                    "the plugin {PLUGIN} {version} is installed in the default Claude Code profile"
+                ));
+                if p["enabled"] == false {
+                    report.problem(&format!(
+                        "the plugin {PLUGIN} is turned off in the default Claude Code profile — \
+                         turn it on in Claude Code (/plugin)"
+                    ));
+                }
+                return true;
+            }
+            true
+        }
+    };
+    let what = match ours {
+        None => format!("the plugin {PLUGIN} isn't installed in the default Claude Code profile"),
+        Some(p) => format!(
+            "the plugin {PLUGIN} in the default Claude Code profile is at {}; this suite's is \
+             {PLUGIN_VERSION}",
+            p["version"].as_str().unwrap_or("unknown")
+        ),
+    };
+    if !interactive {
+        report.problem(&format!(
+            "{what} — run lil doctor in a terminal; it asks before it installs or updates it"
+        ));
+        return false;
+    }
+    let source = marketplace_dir();
+    if !source
+        .join(".claude-plugin")
+        .join("marketplace.json")
+        .is_file()
+    {
+        report.problem(&format!(
+            "{what} — the plugin's files aren't at {}, so lil doctor can't install it",
+            source.display()
+        ));
+        return false;
+    }
+    let verb = if update { "Update" } else { "Install" };
+    say(&format!(
+        "{}. Nothing has been changed. lil doctor can add the plugin's marketplace ({}) to the \
+         default Claude Code profile and {} {PLUGIN} {PLUGIN_VERSION} there with Claude Code's \
+         own commands. It never removes a plugin, and it doesn't fill in the plugin's options: \
+         you enter them in Claude Code.",
+        capitalised(&what),
+        source.display(),
+        verb.to_lowercase()
+    ));
+    if !ask(&format!(
+        "{verb} the plugin {PLUGIN} {PLUGIN_VERSION} in the default Claude Code profile? [y/N] "
+    )) {
+        report.problem(&format!(
+            "{what} — run lil doctor again and answer y to {} it",
+            verb.to_lowercase()
+        ));
+        return false;
+    }
+    let source = source.display().to_string();
+    let mut steps: Vec<Vec<&str>> = vec![
+        vec!["plugin", "marketplace", "add", &source],
+        vec!["plugin", "install", PLUGIN],
+    ];
+    if update {
+        // An install leaves an installed plugin as it is; the update brings it to this version.
+        steps.push(vec!["plugin", "update", PLUGIN]);
+    }
+    for step in steps {
+        if let Err(e) = run_claude(claude, &step) {
+            report.problem(&format!("{what}, and {e} — run lil doctor again"));
+            return false;
+        }
+    }
+    report.fixed(&format!(
+        "the plugin {PLUGIN} {PLUGIN_VERSION} is {} in the default Claude Code profile; it \
+         loads in the next Claude Code session",
+        if update { "updated" } else { "installed" }
+    ));
+    true
+}
+
+/// The plugin's options `lil_mcp_path` and `lil_path`, from the default profile's
+/// `settings.json` (`pluginConfigs`): set, and pointing into a folder the running channel
+/// trusts. The doctor only reads them; the person enters them in Claude Code (owner question 9,
+/// ruling P3-R6).
+fn plugin_options(env: &Env, report: &mut Report) {
+    let Some((trusted, folder)) = trusted_folders(env) else {
+        report.problem(
+            "the folder lil runs from can't be found, so the plugin's options can't be checked",
+        );
+        return;
+    };
+    let profile = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| env.claude_default_profile_dir(), PathBuf::from);
+    let settings: Value = std::fs::read_to_string(profile.join("settings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    let options = &settings["pluginConfigs"][PLUGIN]["options"];
+    let trusted: Vec<String> = trusted.iter().map(|d| folder_key(d)).collect();
+    for (key, exe) in [("lil_mcp_path", "lil-mcp.exe"), ("lil_path", "lil.exe")] {
+        let wanted = folder.join(exe);
+        let enter = format!(
+            "enter {} in that field (in Claude Code: /plugin, {}, its options)",
+            wanted.display(),
+            plugin_name()
+        );
+        let Some(value) = options[key].as_str().filter(|v| !v.trim().is_empty()) else {
+            report.problem(&format!("the plugin's option {key} isn't set — {enter}"));
+            continue;
+        };
+        let path = Path::new(value.trim());
+        let in_trusted = path
+            .parent()
+            .is_some_and(|d| trusted.contains(&folder_key(d)));
+        let named = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(exe));
+        if in_trusted && named {
+            report.ok(&format!("the plugin's option {key} is {value}"));
+        } else {
+            report.problem(&format!(
+                "the plugin's option {key} is {value}, which is not {exe} in a folder this \
+                 channel trusts — {enter}"
+            ));
+        }
+    }
+}
+
+/// The plugin's skills that still write workspace files directly (ARCH-104), from its
+/// `skills-inventory.toml`.
+fn skills_inventory(report: &mut Report) {
+    let file = marketplace_dir()
+        .join(plugin_name())
+        .join("skills-inventory.toml");
+    let Some(table) = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok())
+    else {
+        report.line(
+            "info",
+            &format!(
+                "the plugin's skills inventory ({}) can't be read; the check of skills writing \
+                 workspace files directly is skipped",
+                file.display()
+            ),
+        );
+        return;
+    };
+    let direct: Vec<&str> = table
+        .get("skill")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("writes_directly").and_then(toml::Value::as_bool) == Some(true))
+        .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
+        .collect();
+    if direct.is_empty() {
+        report.ok("no plugin skill writes workspace files directly");
+    } else {
+        report.line(
+            "info",
+            &format!(
+                "plugin skills that still write workspace files directly: {} — while a core \
+                 runs, the suite's tools are the only writers; these skills move to them in \
+                 the skills port",
+                direct.join(", ")
+            ),
+        );
+    }
+}
+
+/// The Claude Code rules question (AI-114): only a `y` lists the offer, and the core then
+/// writes the missing rules into the workspace's `.claude/settings.json` through its store.
+fn claude_rules(client: &BlockingClient, report: &mut Report) -> Result<(), Exit> {
+    say(
+        "The workspace's .claude/settings.json lacks Claude Code permission rules for the \
+         suite's tools. Nothing has been changed. The core can add them: allow rules for the \
+         tools that read and write, ask rules for the destructive and exec ones, in both names \
+         Claude Code gives them. Rules already there, yours included, stay as they are.",
+    );
+    if !ask("Add the rules to .claude/settings.json? [y/N] ") {
+        return Ok(());
+    }
+    let mut args = Map::new();
+    args.insert("fix".into(), Value::Bool(true));
+    args.insert(
+        "offers".into(),
+        Value::Array(vec![Value::from("claude_rules")]),
+    );
+    let output = match client
+        .call_tool("workspace.doctor", args, None)
+        .map_err(cannot_run)?
+    {
+        Outcome::Ok(output) => output,
+        Outcome::Error { error } => {
+            report.problem(&format!(
+                "the Claude Code rules couldn't be added: {} — run lil doctor again",
+                error.message
+            ));
+            return Ok(());
+        }
+        Outcome::PendingConfirmation(_) => {
+            return Err(cannot_run(
+                "workspace.doctor is waiting for a confirmation in the LILITH app.",
+            ));
+        }
+    };
+    for check in output.structured["checks"].as_array().into_iter().flatten() {
+        if check["id"] == CLAUDE_RULES_CHECK {
+            let state = check["state"].as_str().unwrap_or("problem");
+            report.line(state, check["detail"].as_str().unwrap_or_default());
+        }
+    }
+    Ok(())
 }

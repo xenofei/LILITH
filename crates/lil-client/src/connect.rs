@@ -160,6 +160,19 @@ impl Client {
         decode(result, method::TOOLS_CALL)
     }
 
+    /// `app/confirmations.list` (APP-043): the confirmations in `state`, newest first. A `cli`
+    /// session may call it too (read-only); it needs `confirmations.v1` in the shared
+    /// capabilities, which this client offers.
+    pub async fn confirmations(
+        &self,
+        state: lil_protocol::app::ListWhich,
+    ) -> Result<Outcome<lil_protocol::app::ConfirmationsListResult>, ClientError> {
+        let params = lil_protocol::app::ConfirmationsListParams { state, limit: None };
+        let method = lil_protocol::app::CONFIRMATIONS_LIST;
+        let result = self.conn.call(method, to_value(&params)).await?;
+        decode(result, method)
+    }
+
     /// `tools/list`: the tools this session may see.
     pub async fn list_tools(&self) -> Result<Vec<ToolDescriptor>, ClientError> {
         let result = self.conn.call(method::TOOLS_LIST, json!({})).await?;

@@ -7,28 +7,8 @@
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
     # Task 20
-    # ARCH-105, CORE-116, QA-061
-    { name = "lil-spec-tests::plugin_hooks::delete_install_and_script_commands_ask", rule = "ARCH-105", file = "tests/plugin_hooks.rs" },
-    # ARCH-056, CORE-008
-    { name = "lil-spec-tests::plugin_hooks::suite_toml_writes_ask", rule = "ARCH-056", file = "tests/plugin_hooks.rs" },
-    # QA-061
-    { name = "lil-spec-tests::plugin_hooks::harmless_commands_pass", rule = "QA-061", file = "tests/plugin_hooks.rs" },
-    # ARCH-105, CORE-116
-    { name = "lil-spec-tests::plugin_hooks::comfy_mcp_install_update_download_restart_ask", rule = "ARCH-105", file = "tests/plugin_hooks.rs" },
-    # ARCH-106
-    { name = "lil-spec-tests::plugin_hooks::comfy_mcp_launch_and_stop_are_denied_while_a_core_runs", rule = "ARCH-106", file = "tests/plugin_hooks.rs" },
-    # ARCH-104, AI-116
-    { name = "lil-spec-tests::plugin_hooks::direct_log_and_manifest_writes_only_warn", rule = "ARCH-104", file = "tests/plugin_hooks.rs" },
-    # ARCH-107
-    { name = "lil-spec-tests::plugin_hooks::hooks_do_nothing_in_engine_a", rule = "ARCH-107", file = "tests/plugin_hooks.rs" },
-    # ARCH-103, AI-116
-    { name = "lil-spec-tests::plugin_hooks::session_start_reports_jobs_and_confirmations", rule = "ARCH-103", file = "tests/plugin_hooks.rs" },
-    # ARCH-103
-    { name = "lil-spec-tests::plugin_hooks::post_tool_use_tells_the_core", rule = "ARCH-103", file = "tests/plugin_hooks.rs" },
-    # ARCH-013, AI-107, ARCH-101
+    # ARCH-013, AI-107, ARCH-101. Stays after Task 20: plugin 1.2.0's civitai and huggingface
+    # server entries are carried into .mcp.json from the 1.2.0 source folder the owner names,
+    # which this round did not have; everything else in the test passes.
     { name = "lil-spec-tests::plugin_hooks::plugin_uses_the_user_config_paths", rule = "ARCH-013", file = "tests/plugin_hooks.rs" },
-    # AI-117, ARCH-108
-    { name = "lil-spec-tests::doctor_claude::doctor_installs_the_plugin_only_after_yes", rule = "AI-117", file = "tests/doctor_claude.rs" },
-    # AI-114
-    { name = "lil-spec-tests::doctor_claude::doctor_writes_claude_rules_only_after_yes", rule = "AI-114", file = "tests/doctor_claude.rs" },
 ]
