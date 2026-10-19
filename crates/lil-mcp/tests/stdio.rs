@@ -276,6 +276,29 @@ fn an_unregistered_workspace_is_reported() {
     );
 }
 
+/// Ruling P3-R25: when no core can be started (here a suite `state.db` from a newer version,
+/// so the core refuses to start), `lil_status` says `unreachable` with `core.unreachable`,
+/// only `lil_status` is listed, and another tool's result carries the same error.
+#[test] // spec: ARCH-014, ARCH-018, QA-003
+fn an_unreachable_core_reports_core_unreachable() {
+    let env = TestEnv::new();
+    env.write_state_db_version(&env.env.local_dir().join("state.db"), 999, true);
+    let mut mcp = mcp(&env);
+
+    let status = ok(&mut mcp, "lil_status", json!({}));
+    assert_eq!(status["status"], "unreachable", "{status}");
+    assert_eq!(status["error"]["code"], "core.unreachable", "{status}");
+    assert_eq!(status["error"]["retry"], "same_idempotency_key", "{status}");
+    let names: Vec<String> = tools(&mut mcp)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["lil_status"]);
+    let other = call(&mut mcp, "test_echo", json!({"text": "x"}));
+    assert!(other.is_error, "{:?}", other.texts);
+    assert_eq!(other.json["error"]["code"], "core.unreachable");
+}
+
 #[test] // spec: ARCH-018
 fn server_starts_the_core_and_reconnects() {
     let env = TestEnv::new();
