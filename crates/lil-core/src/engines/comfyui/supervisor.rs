@@ -30,7 +30,7 @@ use super::handler::{SuitePrompts, output_tail_detail};
 use super::inventory::Inventory;
 use super::outside::{OutsideWatch, Suite};
 use super::uploads::Uploads;
-use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK, scrubbed_env};
+use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK};
 use crate::engines::{
     COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, InventoryStatus, Listen, OutsideJobs,
     TOPIC,
@@ -979,7 +979,7 @@ impl Comfy {
                 )
             })?;
         lock(&self.output).clear();
-        let owned = self.launch(python, args, root)?;
+        let owned = self.launch(python, args, root, config.engine_env())?;
         let pid = owned.launcher.pid();
         tracing::info!(pid, port = config.port, "the owned ComfyUI is starting");
         self.set_pids(vec![pid]);
@@ -1023,12 +1023,14 @@ impl Comfy {
     }
 
     /// Starts `<python> <args>` in `root`, in a new kill-on-close Job Object, with the
-    /// scrubbed environment; its output goes to the log and the start's tail.
+    /// scrubbed environment `env` ([`ComfyConfig::engine_env`]); its output goes to the log and
+    /// the start's tail.
     fn launch(
         &self,
         python: PathBuf,
         args: Vec<OsString>,
         root: PathBuf,
+        env: Vec<(OsString, OsString)>,
     ) -> Result<Owned, ErrorBody> {
         let job = KillOnCloseJob::new()
             .map_err(|e| start_failed(format!("no Job Object for ComfyUI: {e}"), Vec::new()))?;
@@ -1036,7 +1038,7 @@ impl Comfy {
             exe: python,
             args,
             cwd: root,
-            env: scrubbed_env(std::env::vars_os()),
+            env,
         };
         let launcher = spawn_engine(&request, &job, self.output_sink()).map_err(|e| {
             start_failed(

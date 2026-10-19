@@ -28,6 +28,10 @@ pub struct ComfyConfig {
     pub idle_free_after_s: u64,
     /// The `comfy.exe` node installs run.
     pub comfy_cli: Option<PathBuf>,
+    /// Environment variables the scrub lets through to the owned ComfyUI and comfy-cli (owner
+    /// decision 2026-10-19): exact names, compared case-insensitively. Only you set it, in
+    /// `suite.toml`; no tool writes it.
+    pub pass_env: Vec<String>,
 }
 
 /// The table as written; unknown keys are left alone.
@@ -40,6 +44,7 @@ struct RawComfy {
     autostart: Option<bool>,
     idle_free_after_s: Option<u64>,
     comfy_cli: Option<PathBuf>,
+    pass_env: Option<Vec<String>>,
 }
 
 impl ComfyConfig {
@@ -70,7 +75,14 @@ impl ComfyConfig {
             autostart: raw.autostart.unwrap_or(true),
             idle_free_after_s: raw.idle_free_after_s.unwrap_or(DEFAULT_IDLE_FREE_AFTER_S),
             comfy_cli: raw.comfy_cli,
+            pass_env: raw.pass_env.unwrap_or_default(),
         }))
+    }
+
+    /// The environment of an engine process this core starts (the owned ComfyUI, comfy-cli):
+    /// this process's, scrubbed, with `pass_env` let through ([`scrubbed_env`]).
+    pub fn engine_env(&self) -> Vec<(OsString, OsString)> {
+        scrubbed_env(std::env::vars_os(), &self.pass_env)
     }
 
     /// `python`, else the first of `<root>\..\.venv\Scripts\python.exe`,
@@ -194,13 +206,18 @@ fn is_secret(name: &str) -> bool {
         || SECRET_NAMES.contains(&name.as_str())
 }
 
-/// `vars` without every provider key, secret and suite setting (Appendix F's list, ARCH-063);
-/// everything else (`PATH`, `HF_HOME`, `SystemRoot`, …) is kept in order.
+/// `vars` without every provider key, secret and suite setting (Appendix F's list, ARCH-063),
+/// except the names in `pass` (`[engines.comfyui] pass_env`: exact names, compared
+/// case-insensitively); everything else (`PATH`, `HF_HOME`, `SystemRoot`, …) is kept in order.
 pub fn scrubbed_env(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
+    pass: &[String],
 ) -> Vec<(OsString, OsString)> {
     vars.into_iter()
-        .filter(|(name, _)| !is_secret(&name.to_string_lossy()))
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            !is_secret(&name) || pass.iter().any(|p| p.eq_ignore_ascii_case(&name))
+        })
         .collect()
 }
 
@@ -236,6 +253,7 @@ mod tests {
                 autostart: true,
                 idle_free_after_s: 300,
                 comfy_cli: None,
+                pass_env: Vec::new(),
             }
         );
         assert_eq!(ComfyConfig::from_suite_toml("theme = 'dark'\n"), Ok(None));

@@ -491,11 +491,133 @@ fn scrubbed_env_removes_every_key_pattern_and_keeps_path_and_hf_home() {
         .iter()
         .chain(kept.iter())
         .map(|name| (name.into(), "v".into()));
-    let names: Vec<String> = scrubbed_env(vars)
+    let names: Vec<String> = scrubbed_env(vars, &[])
         .into_iter()
         .map(|(name, _)| name.into_string().unwrap())
         .collect();
     assert_eq!(names, kept);
+}
+
+#[test] // spec: ARCH-063
+fn pass_env_lets_exactly_the_named_variables_through() {
+    let names = [
+        "CIVITAI_API_TOKEN",
+        "HF_TOKEN",
+        "OPENAI_API_KEY",
+        "CIVITAI_API_TOKEN_2",
+        "MY_HF_TOKEN",
+        "PATH",
+    ];
+    let kept = |pass: &[&str]| -> Vec<String> {
+        let pass: Vec<String> = pass.iter().map(|p| (*p).to_string()).collect();
+        scrubbed_env(names.iter().map(|n| (n.into(), "v".into())), &pass)
+            .into_iter()
+            .map(|(n, _)| n.into_string().unwrap())
+            .collect()
+    };
+    // An empty or missing list is the scrub as it was.
+    assert_eq!(kept(&[]), ["PATH"]);
+    // A listed name passes, in any case; every other secret stays out.
+    assert_eq!(
+        kept(&["civitai_api_token", "Hf_Token"]),
+        ["CIVITAI_API_TOKEN", "HF_TOKEN", "PATH"]
+    );
+    // Names only, never a prefix, a part or a pattern.
+    assert_eq!(
+        kept(&["CIVITAI_", "CIVITAI_*", "TOKEN", "HF_TOKEN ", ""]),
+        ["PATH"]
+    );
+
+    let config = |table: &str| ComfyConfig::from_suite_toml(table).unwrap().unwrap();
+    assert_eq!(
+        config(
+            "[engines.comfyui]
+pass_env = ['HF_TOKEN']
+"
+        )
+        .pass_env,
+        ["HF_TOKEN"]
+    );
+    assert!(
+        config(
+            "[engines.comfyui]
+port = 8190
+"
+        )
+        .pass_env
+        .is_empty()
+    );
+}
+
+/// Only you set `pass_env`: `suite.toml`'s two writers in the core (registering a workspace
+/// and `app/caps.set`) leave `[engines.comfyui]` as it was, comment and all.
+#[test] // spec: CORE-008, ARCH-063
+fn the_cores_suite_toml_writes_never_change_pass_env() {
+    use lil_schema::suite_edit::{CapsEdit, register, set_caps};
+    let line = "pass_env = ['HF_TOKEN'] # mine";
+    let text = format!(
+        "[engines.comfyui]
+port = 8190
+{line}
+
+[caps]
+monthly = '5'
+"
+    );
+    let registered = register(&text, r"C:\ws", true, &|p: &str| p.to_lowercase()).unwrap();
+    let capped = set_caps(
+        &registered,
+        &CapsEdit {
+            monthly: Some(None),
+            per_call_max: Some(Some("1".into())),
+            provider_monthly: vec![("fal".into(), Some("2".into()))],
+            carry_legacy: true,
+        },
+    )
+    .unwrap();
+    for out in [&registered, &capped] {
+        assert!(out.contains(line), "{out}");
+        let config = ComfyConfig::from_suite_toml(out).unwrap().unwrap();
+        assert_eq!(config.pass_env, ["HF_TOKEN"], "{out}");
+    }
+    assert_ne!(capped, registered, "the caps edit did change [caps]");
+}
+
+/// The owned ComfyUI gets the variables `pass_env` names, and no other secret.
+#[test] // spec: ARCH-063
+fn owned_comfyui_gets_the_pass_env_variables_and_no_other_secret() {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-pass-env", false, false);
+    own(
+        &env,
+        &root,
+        "pass_env = ['lil_pass_test_token']
+",
+    );
+    let vars = [
+        ("LIL_PASS_TEST_TOKEN", "canary-passed"),
+        ("LIL_HELD_TEST_TOKEN", "canary-held"),
+        ("CIVITAI_API_TOKEN", "canary-civitai"),
+    ];
+    let _core = CoreFixture::start_with_env(&env, &vars);
+    let mut pipe = session(&env);
+    let started = pipe.tool("engines.start", json!({"engine": "comfyui"}), Some(&key()));
+    assert_eq!(started["status"], "ok", "{started}");
+    let launched = recorded(&root.join("fake-comfyui.json"), "listen");
+    let got = launched["env"].as_object().cloned().unwrap_or_default();
+    let value = |name: &str| {
+        got.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(value("LIL_PASS_TEST_TOKEN"), Some(json!("canary-passed")));
+    for (name, canary) in &vars[1..] {
+        assert_eq!(value(name), None, "{name} reached the engine");
+        assert!(
+            !got.values().any(|v| v == canary),
+            "{name}'s value reached the engine"
+        );
+    }
 }
 
 #[test] // spec: ARCH-068
@@ -1075,7 +1197,7 @@ async fn install_requires_an_exact_version_and_records_usage_and_restart_needed(
         .iter()
         .map(|n| n.as_str().unwrap().to_string())
         .collect();
-    let kept: Vec<String> = scrubbed_env(names.iter().map(|n| (n.into(), "v".into())))
+    let kept: Vec<String> = scrubbed_env(names.iter().map(|n| (n.into(), "v".into())), &[])
         .into_iter()
         .map(|(n, _)| n.into_string().unwrap())
         .collect();

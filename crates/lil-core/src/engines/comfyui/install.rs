@@ -160,6 +160,8 @@ pub struct InstallPlan {
     pub comfy_cli: PathBuf,
     pub root: PathBuf,
     pub python: PathBuf,
+    /// `[engines.comfyui] pass_env`: the variables the scrub lets through to comfy-cli.
+    pub pass_env: Vec<String>,
 }
 
 /// The [`InstallPlan`] of `engines`' configuration.
@@ -198,13 +200,14 @@ pub fn install_plan(engines: &Engines) -> Result<InstallPlan, ErrorBody> {
         comfy_cli,
         root,
         python,
+        pass_env: config.pass_env.clone(),
     })
 }
 
-/// The scrubbed environment of the current process with the folder of `python` first on
-/// `PATH`.
-fn install_env(python: &Path) -> Vec<(OsString, OsString)> {
-    let mut env = scrubbed_env(std::env::vars_os());
+/// The scrubbed environment of the current process (with `pass_env` let through) and the
+/// folder of `python` first on `PATH`.
+fn install_env(python: &Path, pass_env: &[String]) -> Vec<(OsString, OsString)> {
+    let mut env = scrubbed_env(std::env::vars_os(), pass_env);
     let dir = python.parent().map(Path::to_path_buf).unwrap_or_default();
     let at = env
         .iter()
@@ -290,7 +293,7 @@ impl NodeInstallHandler {
                 version.into(),
             ],
             cwd: plan.root.clone(),
-            env: install_env(&plan.python),
+            env: install_env(&plan.python, &plan.pass_env),
         };
         // Write-ahead (CORE-071): the record is pending before comfy-cli asks the registry.
         let usage = engines.comfy().usage.clone();
