@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The CORE-014 modules (each plan-3 module is added as it lands).
-const MODULES: [&str; 13] = [
+const MODULES: [&str; 14] = [
     "store",
     "index",
     "watch",
@@ -32,6 +32,7 @@ const MODULES: [&str; 13] = [
     "engines",
     "meter",
     "confirm",
+    "resources",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -191,6 +192,7 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
         "telemetry",
         "engines",
         "meter",
+        "resources",
     ] {
         assert!(
             graph.contains_key(module),
@@ -222,6 +224,11 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     forbidden("tools", &["confirm"]);
     forbidden("jobs", &["confirm"]);
     assert!(graph["confirm"].contains("tools"), "{graph:?}");
+    // `resources` is registered by the server like `engines`: no module names it, and it uses
+    // `tools` (the call context and the registry) and the store.
+    for module in graph.keys().filter(|m| *m != "resources") {
+        forbidden(module, &["resources"]);
+    }
     // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
     assert!(graph["tools"].contains("jobs"), "{graph:?}");
     assert!(graph["jobs"].contains("pipeline"), "{graph:?}");
@@ -229,6 +236,8 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     assert!(graph["tools"].contains("telemetry"), "{graph:?}");
     assert!(graph["engines"].contains("jobs"), "{graph:?}");
     assert!(graph["meter"].contains("tools"), "{graph:?}");
+    assert!(graph["resources"].contains("store"), "{graph:?}");
+    assert!(graph["resources"].contains("tools"), "{graph:?}");
     assert!(graph["pipeline"].contains("index"), "{graph:?}");
     assert!(graph["index"].contains("store"), "{graph:?}");
 }

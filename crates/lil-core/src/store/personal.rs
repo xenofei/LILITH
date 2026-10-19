@@ -22,7 +22,7 @@ use super::order::list_with;
 use super::paths::{WsPath, path_key};
 use super::trash::{
     DAY, PAYLOAD, RECORD, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord, drop_empty_entry, entries,
-    is_entry_id, parse_rfc3339, purge_entry, remove_if_empty,
+    is_entry_id, parse_rfc3339, purge_entry, refuse_linked_trash, remove_if_empty,
 };
 use super::write::{Seen, StoreError, blocking, link_refused, read_all, see};
 
@@ -88,12 +88,17 @@ impl Personal {
     /// Why `rel` can't be written or moved to, or `None`: it is in the trash, or a folder on
     /// its way is a link (which could lead outside the root).
     async fn refusal(&self, rel: &WsPath) -> Result<(), StoreError> {
-        if rel
-            .as_str()
-            .split('/')
-            .next()
-            .is_some_and(|first| path_key(first) == path_key(TRASH_DIR))
-        {
+        let first = rel.as_str().split('/').next().unwrap_or_default();
+        // The name as written, and its long form (an 8.3 short name of `.trash`).
+        let (at, probe) = (self.root.join(first), self.probe.clone());
+        let long = blocking(move || probe.long_form(&at))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))?;
+        let long_first = long
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if path_key(first) == path_key(TRASH_DIR) || path_key(&long_first) == path_key(TRASH_DIR) {
             return Err(StoreError::PathInvalid {
                 path: rel.as_str().to_string(),
                 why: "the personal trash is the suite's own folder".to_string(),
@@ -134,6 +139,7 @@ impl Personal {
     /// `store.path_invalid` for a link or a folder, `store.hash_conflict` (`cloud_only`) for a
     /// cloud-only placeholder (never read), `store.io` otherwise.
     pub async fn read(&self, rel: &WsPath) -> Result<Option<Vec<u8>>, StoreError> {
+        self.refusal(rel).await?;
         let (path, probe) = (rel.abs(&self.root), self.probe.clone());
         match blocking(move || see(probe.as_ref(), &path, read_all))
             .await
@@ -149,8 +155,10 @@ impl Personal {
     /// The names of the files directly in the folder `rel` (relative to the root).
     ///
     /// # Errors
+    /// `store.path_invalid` for the trash or a link on the way (the folder itself too);
     /// `store.io` when the folder can't be listed.
     pub async fn list(&self, rel: &str) -> Result<Vec<String>, StoreError> {
+        self.refusal(&WsPath::from_disk(format!("{rel}/x"))).await?;
         let (dir, probe) = (
             rel.split('/').fold(self.root.clone(), |p, c| p.join(c)),
             self.probe.clone(),
@@ -184,6 +192,10 @@ impl Personal {
     /// at `rel` or a file call fails.
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.refusal(rel).await?;
+        let (root, probe) = (self.root.clone(), self.probe.clone());
+        blocking(move || refuse_linked_trash(&root, probe.as_ref()))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))?;
         let abs = rel.abs(&self.root);
         let sha256 = {
             let (path, probe) = (abs.clone(), self.probe.clone());

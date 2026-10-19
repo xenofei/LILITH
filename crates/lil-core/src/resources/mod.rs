@@ -10,8 +10,9 @@
 //! **Scope.** A save without a scope goes to the workspace when the session has one, except a
 //! `model_profile`, which is machine-level and goes to the personal scope, as does everything
 //! in a session without a workspace ([`default_scope`]). A `get`, `delete` or `list` without a
-//! scope looks in the workspace first (when the session has one), then in the personal scope,
-//! so a workspace resource overrides a personal one of the same kind and id.
+//! scope looks in every scope the session can see; one that exists in both is refused with
+//! `resource.ambiguous_scope` (P3-R23), so a call never acts on a resource other than the one
+//! meant. Every `get`, `delete` and `list` result names the scope.
 //!
 //! **Nothing is lost** (CORE-110). A save over an existing resource first moves the old file to
 //! the scope's trash with the reason `"resource.save"` (the workspace's `.trash\`, or the
@@ -54,6 +55,10 @@ pub const RESOURCE_KINDS: &[&str] = &[
 ];
 /// The `schema_version` of the resource file.
 pub const RESOURCE_SCHEMA_VERSION: u32 = 1;
+/// The longest `name` a resource has, in characters.
+pub const MAX_NAME_CHARS: usize = 200;
+/// The largest resource file, in bytes.
+pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 /// Why a save moves the old file to the trash.
 pub const SAVE_REASON: &str = "resource.save";
 /// Why a delete moves the file to the trash.
@@ -174,17 +179,24 @@ impl Place {
         }
     }
 
-    /// The ids of the resources of `kind` here.
+    /// The ids of the resources of `kind` here. A link on the way to the folder is refused
+    /// (`store.path_invalid`).
     async fn ids(&self, kind: &str) -> Result<Vec<String>, StoreError> {
         let rel = self.rel(kind, "x");
+        if let Place::Workspace(store) = self {
+            store.refuse_links(&rel).await?;
+        }
         let file = self.abs(&rel);
         let dir = file
             .parent()
             .map_or_else(|| file.clone(), std::path::Path::to_path_buf);
-        let probe = match self {
-            Place::Workspace(store) => store.probe().clone(),
-            Place::Personal(personal) => personal.probe().clone(),
+        let (probe, kind_dir) = match self {
+            Place::Workspace(store) => (store.probe().clone(), None),
+            Place::Personal(personal) => (personal.probe().clone(), Some(personal.clone())),
         };
+        if let Some(personal) = kind_dir {
+            return Ok(ids_of(personal.list(kind).await?));
+        }
         let names = tokio::task::spawn_blocking(move || list_files(probe.as_ref(), &dir))
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
@@ -192,12 +204,17 @@ impl Place {
                 path: rel.as_str().to_string(),
                 why: e.to_string(),
             })?;
-        Ok(names
-            .into_iter()
-            .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
-            .filter(|id| valid_id(id))
-            .collect())
+        Ok(ids_of(names))
     }
+}
+
+/// The resource ids among the file names of a kind's folder.
+fn ids_of(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
+        .filter(|id| valid_id(id))
+        .collect()
 }
 
 /// Whether `id` matches `^[a-z][a-z0-9_-]{0,62}$`.
@@ -212,9 +229,17 @@ fn invalid(ctx: &CallCtx, message: String) -> ErrorBody {
     ErrorBody::new(&codes::PARAMS_INVALID, message, ctx.trace_id.clone())
 }
 
-/// `resource.kind_unknown` or `params.invalid` for a kind and id that aren't acceptable.
+/// `resource.kind_unknown` or `params.invalid` for a kind and id that aren't acceptable. An id
+/// that makes a path the store refuses (a Windows device name such as `con` or `lpt1`,
+/// CORE-040) is refused too (P3-R22).
 fn check(ctx: &CallCtx, kind: &str, id: &str) -> Result<(), ErrorBody> {
     check_kind(ctx, kind)?;
+    if let Err(problem) = lil_schema::check_rel_path(&format!("{kind}/{id}.json")) {
+        return Err(invalid(
+            ctx,
+            format!("`{id}` is not a resource id: {problem}"),
+        ));
+    }
     if !valid_id(id) {
         return Err(invalid(
             ctx,
@@ -309,6 +334,14 @@ impl Resources {
         r: Resource,
     ) -> Result<(Resource, PathBuf, Option<String>), ErrorBody> {
         check(ctx, &r.kind, &r.id)?;
+        if r.name.chars().count() > MAX_NAME_CHARS || r.name.chars().any(char::is_control) {
+            return Err(invalid(
+                ctx,
+                format!(
+                    "a resource name has at most {MAX_NAME_CHARS} characters and no control characters"
+                ),
+            ));
+        }
         let place = self.place(ctx, scope)?;
         let rel = place.rel(&r.kind, &r.id);
         let _one_at_a_time = self.gate.lock().await;
@@ -332,6 +365,12 @@ impl Resources {
             )
         })?;
         text.push('\n');
+        if text.len() > MAX_FILE_BYTES {
+            return Err(invalid(
+                ctx,
+                format!("a resource file is at most {MAX_FILE_BYTES} bytes"),
+            ));
+        }
         let replaced = match old {
             Some(_) => Some(
                 place
@@ -387,7 +426,15 @@ impl Resources {
                 .iter()
                 .filter(|k| kind.is_none_or(|want| want == **k))
             {
-                for id in place.ids(kind).await.map_err(|e| store_error(ctx, &e))? {
+                let ids = match place.ids(kind).await {
+                    Ok(ids) => ids,
+                    Err(e @ StoreError::PathInvalid { .. }) => {
+                        tracing::warn!(error = %e, "a linked resource folder is left out of the list");
+                        continue;
+                    }
+                    Err(e) => return Err(store_error(ctx, &e)),
+                };
+                for id in ids {
                     let rel = place.rel(kind, &id);
                     let Some(bytes) = place.read(&rel).await.map_err(|e| store_error(ctx, &e))?
                     else {
@@ -413,12 +460,13 @@ impl Resources {
         Ok(found)
     }
 
-    /// The resource `kind`/`id` and its absolute path, from `scope` or the first scope that has
-    /// it (module docs).
+    /// The resource `kind`/`id` and its absolute path, from `scope`, or from the one scope that
+    /// has it when there is none (module docs).
     ///
     /// # Errors
     /// `resource.kind_unknown`; `params.invalid`; `resource.unknown` when there is none;
-    /// `workspace.required`; the store's errors (`store.io` for a file that isn't a resource).
+    /// `resource.ambiguous_scope` without a scope when both scopes have it; `workspace.required`;
+    /// the store's errors (`store.io` for a file that isn't a resource).
     pub async fn get(
         &self,
         ctx: &CallCtx,
@@ -431,7 +479,10 @@ impl Resources {
     }
 
     /// [`Resources::get`] with the scope it was found in.
-    async fn find(
+    ///
+    /// # Errors
+    /// As [`Resources::get`].
+    pub async fn find(
         &self,
         ctx: &CallCtx,
         kind: &str,
@@ -439,26 +490,47 @@ impl Resources {
         scope: Option<ResourceScope>,
     ) -> Result<(Resource, ResourceScope, PathBuf), ErrorBody> {
         check(ctx, kind, id)?;
+        let mut found = Vec::new();
         for scope in Self::scopes(ctx, scope) {
             let place = self.place(ctx, scope)?;
             let rel = place.rel(kind, id);
             if let Some(bytes) = place.read(&rel).await.map_err(|e| store_error(ctx, &e))? {
                 let resource = parse(&rel, &bytes).map_err(|e| store_error(ctx, &e))?;
-                return Ok((resource, scope, place.abs(&rel)));
+                found.push((resource, scope, place.abs(&rel)));
             }
         }
-        let mut body = ErrorBody::new(
-            &codes::RESOURCE_UNKNOWN,
-            format!("there is no {kind} resource `{id}`; resource.list lists the ones there are"),
-            ctx.trace_id.clone(),
-        );
-        body.data = Some(json!({ "kind": kind, "id": id }));
-        Err(body)
+        match found.len() {
+            1 => Ok(found.remove(0)),
+            0 => {
+                let mut body = ErrorBody::new(
+                    &codes::RESOURCE_UNKNOWN,
+                    format!(
+                        "there is no {kind} resource `{id}`; resource.list lists the ones there are"
+                    ),
+                    ctx.trace_id.clone(),
+                );
+                body.data = Some(json!({ "kind": kind, "id": id }));
+                Err(body)
+            }
+            _ => {
+                let mut body = ErrorBody::new(
+                    &codes::RESOURCE_AMBIGUOUS_SCOPE,
+                    format!(
+                        "the {kind} resource `{id}` exists in the workspace and in the personal \
+                         scope; pass scope"
+                    ),
+                    ctx.trace_id.clone(),
+                );
+                body.data =
+                    Some(json!({ "kind": kind, "id": id, "scopes": ["workspace", "personal"] }));
+                Err(body)
+            }
+        }
     }
 
-    /// Moves the resource `kind`/`id` to the trash of the scope it is in (`scope`, or the first
-    /// that has it) and returns the trash entry's id (APP-082: a soft delete; `trash.restore`
-    /// brings it back).
+    /// Moves the resource `kind`/`id` to the trash of the scope it is in (`scope`, or the one
+    /// scope that has it) and returns the trash entry's id (APP-082: a soft delete;
+    /// `trash.restore` brings it back).
     ///
     /// # Errors
     /// As [`Resources::get`], and the store's errors.
@@ -469,6 +541,22 @@ impl Resources {
         id: &str,
         scope: Option<ResourceScope>,
     ) -> Result<String, ErrorBody> {
+        self.remove(ctx, kind, id, scope)
+            .await
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`Resources::delete`] with the scope the resource was in.
+    ///
+    /// # Errors
+    /// As [`Resources::delete`].
+    pub async fn remove(
+        &self,
+        ctx: &CallCtx,
+        kind: &str,
+        id: &str,
+        scope: Option<ResourceScope>,
+    ) -> Result<(String, ResourceScope), ErrorBody> {
         check(ctx, kind, id)?;
         let _one_at_a_time = self.gate.lock().await;
         let (_, found_in, _) = self.find(ctx, kind, id, scope).await?;
@@ -487,7 +575,7 @@ impl Resources {
                 "entry_id": entry,
             }),
         );
-        Ok(entry)
+        Ok((entry, found_in))
     }
 }
 

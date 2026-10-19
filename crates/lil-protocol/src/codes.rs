@@ -264,6 +264,8 @@ pub const RESOURCE_UNKNOWN: CodeSpec =
     spec("resource.unknown", C::UserFixable, R::AfterResolve, false);
 pub const RESOURCE_KIND_UNKNOWN: CodeSpec =
     spec("resource.kind_unknown", C::UserFixable, R::Never, false);
+pub const RESOURCE_AMBIGUOUS_SCOPE: CodeSpec =
+    spec("resource.ambiguous_scope", C::UserFixable, R::Never, false);
 pub const HANDLER_NONE: CodeSpec = spec("handler.none", C::UserFixable, R::AfterResolve, false);
 pub const CONFIRM_UNKNOWN: CodeSpec = spec("confirm.unknown", C::UserFixable, R::Never, false);
 pub const CONFIRM_ALREADY_ANSWERED: CodeSpec =
@@ -332,6 +334,7 @@ pub const ALL: &[&CodeSpec] = &[
     &COMFYUI_PARTNER_NODES,
     &RESOURCE_UNKNOWN,
     &RESOURCE_KIND_UNKNOWN,
+    &RESOURCE_AMBIGUOUS_SCOPE,
     &HANDLER_NONE,
     &CONFIRM_UNKNOWN,
     &CONFIRM_ALREADY_ANSWERED,
@@ -521,6 +524,7 @@ mod tests {
         ),
         ("resource.unknown", C::UserFixable, R::AfterResolve, false),
         ("resource.kind_unknown", C::UserFixable, R::Never, false),
+        ("resource.ambiguous_scope", C::UserFixable, R::Never, false),
         ("handler.none", C::UserFixable, R::AfterResolve, false),
         ("confirm.unknown", C::UserFixable, R::Never, false),
         ("confirm.already_answered", C::DataConflict, R::Never, false),
@@ -538,7 +542,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 64);
+        assert_eq!(TABLE.len(), 65);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);

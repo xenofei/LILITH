@@ -4,8 +4,8 @@
 //! |---|---|---|---|
 //! | `resource.save` | write | `{kind, id, name, data, scope?}` | `{resource, path, replaced_entry_id?}` |
 //! | `resource.list` | read | `{kind?, scope?}` | `{resources: [{kind, id, name, scope, updated}]}` |
-//! | `resource.get` | read | `{kind, id, scope?}` | `{resource, path}` |
-//! | `resource.delete` | destructive | `{kind, id, scope?}` | `{entry_id}` |
+//! | `resource.get` | read | `{kind, id, scope?}` | `{resource, path, scope}` |
+//! | `resource.delete` | destructive | `{kind, id, scope?}` | `{entry_id, scope}` |
 //!
 //! `path` is relative to the scope's resources folder, `<kind>/<id>.json` with a forward slash
 //! (ruling P3-R13). `replaced_entry_id` is the trash entry of the version a save replaced.
@@ -31,14 +31,15 @@ const SAVE_DESCRIPTION: &str = "Save a Library resource: a swatch, palette, prom
 const LIST_DESCRIPTION: &str = "List Library resources: kind, id, name, scope and last update, \
     for one kind or all, in the workspace, the personal scope or (without scope) both.";
 
-const GET_DESCRIPTION: &str = "Read one Library resource by kind and id. Without scope the \
-    workspace is searched first, then the personal scope. path is relative to the scope's \
-    resources folder.";
+const GET_DESCRIPTION: &str = "Read one Library resource by kind and id. Without scope \
+    both scopes are searched; an id that exists in both needs scope \
+    (resource.ambiguous_scope). scope in the result names where it was found. path is \
+    relative to the scope's resources folder.";
 
 const DELETE_DESCRIPTION: &str = "Delete a Library resource. It is moved to the trash, never \
     destroyed: entry_id names the trash entry, and trash.restore brings it back for 30 days. \
-    Without scope the workspace is searched first, then the personal scope. Asks the person \
-    to confirm when an agent calls it.";
+    An id that exists in both scopes needs scope (resource.ambiguous_scope); scope in the \
+    result names where it was. Asks the person to confirm when an agent calls it.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -87,12 +88,16 @@ struct GetResult {
     resource: Resource,
     /// Relative to the scope's resources folder: `<kind>/<id>.json`.
     path: String,
+    /// Where it was found.
+    scope: ResourceScope,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct DeleteResult {
     /// The trash entry (`te_<16 hex>`).
     entry_id: String,
+    /// The scope the resource was in.
+    scope: ResourceScope,
 }
 
 fn relative(kind: &str, id: &str) -> String {
@@ -164,12 +169,14 @@ pub fn register_resource_tools(reg: &mut Registry, resources: &Arc<Resources>) {
         move |ctx, args: TargetArgs| {
             let r = r.clone();
             Box::pin(async move {
-                let (resource, _file) = r.get(ctx, &args.kind, &args.id, args.scope).await?;
+                let (resource, scope, _file) =
+                    r.find(ctx, &args.kind, &args.id, args.scope).await?;
                 let summary = format!("{} {}", resource.kind, resource.id);
                 Ok((
                     GetResult {
                         path: relative(&resource.kind, &resource.id),
                         resource,
+                        scope,
                     },
                     summary,
                 ))
@@ -185,9 +192,9 @@ pub fn register_resource_tools(reg: &mut Registry, resources: &Arc<Resources>) {
         move |ctx, args: TargetArgs| {
             let r = r.clone();
             Box::pin(async move {
-                let entry_id = r.delete(ctx, &args.kind, &args.id, args.scope).await?;
+                let (entry_id, scope) = r.remove(ctx, &args.kind, &args.id, args.scope).await?;
                 let summary = format!("moved {} {} to the trash", args.kind, args.id);
-                Ok((DeleteResult { entry_id }, summary))
+                Ok((DeleteResult { entry_id, scope }, summary))
             })
         },
     ));

@@ -3,16 +3,18 @@
 //!
 //! | Tool | Effect | Arguments | `structured` result |
 //! |---|---|---|---|
-//! | `trash.list` | read | `{scope?}` | `{entries: [restore record]}` |
+//! | `trash.list` | read | `{scope?}` | `{entries: [restore record + scope]}` |
 //! | `trash.restore` | write | `{entry_id, scope?}` | `{path}` |
 //!
 //! A restore record is the entry's `restore.json` (`entry_id`, `original_path`, `moved_utc`,
 //! `purge_after`, `reason`, `sha256`?); `original_path` and the restored `path` are relative
 //! to the scope's root with `/` separators: the workspace, or `%APPDATA%\LILITH\resources\`
-//! for `personal`. `scope` defaults to `workspace` when the session has one, else `personal`
-//! (`workspace.required` for an explicit `workspace` without one); a `trash.restore` without a
-//! scope that finds no such entry in the workspace also looks in the personal trash, where
-//! `resource.delete` puts a personal resource. A restore never replaces what is at the
+//! for `personal`. Without a `scope`, `trash.list` lists every trash the session can see (the
+//! workspace's, then the personal one), each row naming its `scope`, and `trash.restore` tries the
+//! workspace trash (when the session has one) and then the personal trash, where
+//! `resource.delete` puts a personal resource (`workspace.required` for an explicit `workspace`
+//! without one). Restoring a resource file publishes it on the `resources` topic as `saved`
+//! with `restored_entry_id`. A restore never replaces what is at the
 //! original path now: that is `trash.restore_conflict`, and an unknown `entry_id` is
 //! `trash.unknown`.
 
@@ -28,8 +30,8 @@ use crate::store::{Personal, StoreError, TrashRecord};
 
 const LIST_DESCRIPTION: &str = "List the entries in the trash, oldest first: each with its \
     entry_id, the path it came from, when it was moved, when it is purged (30 days later) and \
-    why it was moved. scope is workspace (the workspace's trash) or personal (the trash of \
-    personal resources); without it the workspace is used when the session has one.";
+    why it was moved, and which trash it is in (scope: workspace, or personal for personal \
+    resources). Pass scope to list one trash; without it every trash is listed.";
 
 const RESTORE_DESCRIPTION: &str = "Move a trash entry back to the path it came from. Nothing \
     is ever replaced: when that path is taken now, the call fails with trash.restore_conflict \
@@ -38,11 +40,32 @@ const RESTORE_DESCRIPTION: &str = "Move a trash entry back to the path it came f
     (when the session has one), then the personal trash.";
 
 /// Whose trash a call works in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TrashScope {
     Workspace,
     Personal,
+}
+
+impl TrashScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            TrashScope::Workspace => "workspace",
+            TrashScope::Personal => "personal",
+        }
+    }
+}
+
+/// The topic `resources` publishes its changes on (APP-078); named here, not imported, so that
+/// `tools` names no `resources` item.
+const RESOURCES_TOPIC: &str = "resources";
+
+/// A trash entry and the trash it is in.
+#[derive(Debug, Serialize, JsonSchema)]
+struct TrashRow {
+    #[serde(flatten)]
+    record: TrashRecord,
+    scope: TrashScope,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -53,7 +76,7 @@ struct ListArgs {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct ListResult {
-    entries: Vec<TrashRecord>,
+    entries: Vec<TrashRow>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -84,11 +107,25 @@ async fn list(
     personal: &Personal,
     args: ListArgs,
 ) -> Result<(ListResult, String), ErrorBody> {
-    let entries = match scope_of(ctx, args.scope) {
-        TrashScope::Workspace => ctx.workspace()?.store.trash_list().await,
-        TrashScope::Personal => personal.trash_list().await,
+    // Without a scope, every trash the session can see: a `model_profile` delete lands in the
+    // personal one even in a workspace session.
+    let scopes = match args.scope {
+        Some(scope) => vec![scope],
+        None if ctx.workspace.is_some() => vec![TrashScope::Workspace, TrashScope::Personal],
+        None => vec![TrashScope::Personal],
+    };
+    let mut entries = Vec::new();
+    for scope in scopes {
+        let records = match scope {
+            TrashScope::Workspace => ctx.workspace()?.store.trash_list().await,
+            TrashScope::Personal => personal.trash_list().await,
+        }
+        .map_err(|e: StoreError| e.to_error(&ctx.trace_id))?;
+        entries.extend(records.into_iter().map(|record| TrashRow { record, scope }));
     }
-    .map_err(|e: StoreError| e.to_error(&ctx.trace_id))?;
+    entries.sort_by(|a, b| {
+        (&a.record.moved_utc, &a.record.entry_id).cmp(&(&b.record.moved_utc, &b.record.entry_id))
+    });
     let summary = format!(
         "{} trash entr{}",
         entries.len(),
@@ -102,20 +139,37 @@ async fn restore(
     personal: &Personal,
     args: RestoreArgs,
 ) -> Result<(RestoreResult, String), ErrorBody> {
-    let restored = match scope_of(ctx, args.scope) {
+    let (restored, scope) = match scope_of(ctx, args.scope) {
         TrashScope::Workspace => {
             let found = ctx.workspace()?.store.trash_restore(&args.entry_id).await;
             match found {
                 // Without a scope, a personal resource's entry is found too.
-                Err(StoreError::TrashUnknown(_)) if args.scope.is_none() => {
-                    personal.trash_restore(&args.entry_id).await
-                }
-                found => found,
+                Err(StoreError::TrashUnknown(_)) if args.scope.is_none() => (
+                    personal.trash_restore(&args.entry_id).await,
+                    TrashScope::Personal,
+                ),
+                found => (found, TrashScope::Workspace),
             }
         }
-        TrashScope::Personal => personal.trash_restore(&args.entry_id).await,
+        TrashScope::Personal => (
+            personal.trash_restore(&args.entry_id).await,
+            TrashScope::Personal,
+        ),
     };
     let path = restored.map_err(|e| e.to_error(&ctx.trace_id))?;
+    if let Some((kind, id)) = resource_of(scope, path.as_str()) {
+        // The Libraries panel hears a restored resource as a save (APP-078).
+        ctx.events.publish(
+            RESOURCES_TOPIC,
+            serde_json::json!({
+                "kind": "saved",
+                "resource_kind": kind,
+                "id": id,
+                "scope": scope.as_str(),
+                "restored_entry_id": args.entry_id,
+            }),
+        );
+    }
     let summary = format!("restored {path}");
     Ok((
         RestoreResult {
@@ -123,6 +177,18 @@ async fn restore(
         },
         summary,
     ))
+}
+
+/// The kind and id of the resource file at `path` in `scope`'s root (`<kind>/<id>.json`, under
+/// `library/resources/` in a workspace), if it is one.
+fn resource_of(scope: TrashScope, path: &str) -> Option<(&str, &str)> {
+    let tail = match scope {
+        TrashScope::Workspace => path.strip_prefix("library/resources/")?,
+        TrashScope::Personal => path,
+    };
+    let (kind, file) = tail.split_once('/')?;
+    let id = file.strip_suffix(".json")?;
+    (!kind.is_empty() && !id.is_empty() && !id.contains('/')).then_some((kind, id))
 }
 
 /// Registers `trash.list` and `trash.restore` (module `workspace`); `personal` is the personal

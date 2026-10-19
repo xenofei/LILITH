@@ -156,10 +156,38 @@ pub(super) fn is_entry_id(id: &str) -> bool {
         .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Fails closed (`PermissionDenied`) when `<root>\.trash` is a link (a symbolic link, junction
+/// or mount point): the trash would be somewhere the suite doesn't own, so nothing is listed,
+/// restored, purged or moved into it (CORE-110). A trash that doesn't exist is fine.
+pub(super) fn refuse_linked_trash(root: &Path, probe: &dyn Probe) -> io::Result<()> {
+    let trash = root.join(TRASH_DIR);
+    let id = match probe.identity(&trash) {
+        Ok(id) => id,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if id.attributes & 0x400 != 0
+        && probe
+            .reparse_tag(&trash)?
+            .is_some_and(lil_platform::fs::is_name_surrogate)
+    {
+        tracing::warn!(trash = %trash.display(), "the trash folder is a link, so the trash is not used; remove the link");
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is a link, so the trash is not used; remove the link",
+                trash.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Every entry under `<root>\.trash` whose `restore.json` parses. Links are never followed,
 /// and each `restore.json` goes through `probe.identity` first: a cloud-only placeholder (or a
 /// link) is skipped, never read, so listing the trash never downloads anything.
 pub(super) fn entries(root: &Path, probe: &dyn Probe) -> io::Result<Vec<Entry>> {
+    refuse_linked_trash(root, probe)?;
     let mut found = Vec::new();
     for day in list(&root.join(TRASH_DIR))?
         .into_iter()
@@ -395,6 +423,10 @@ impl Store {
     async fn trash_now(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         let abs = rel.abs(self.root());
         let _held = self.lock_path(rel).await;
+        let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
+        blocking(move || refuse_linked_trash(&root, probe.as_ref()))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))?;
         let sha256 = match self
             .see_hash(&abs)
             .await

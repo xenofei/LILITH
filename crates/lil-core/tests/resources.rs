@@ -332,9 +332,26 @@ async fn unknown_kind_and_bad_id_are_refused() {
     let save = |kind: &str, id: &str| json!({"kind": kind, "id": id, "name": "N", "data": 1});
     let refused = fx.err("resource.save", save("brush", "round")).await;
     assert_eq!(refused.code, "resource.kind_unknown");
-    for id in ["Sunset", "1sunset", &"a".repeat(64), "", "a b", "a/b"] {
+    let reserved = ["con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9"];
+    for id in ["Sunset", "1sunset", &"a".repeat(64), "", "a b", "a/b"]
+        .into_iter()
+        .chain(reserved)
+    {
         let refused = fx.err("resource.save", save("palette", id)).await;
         assert_eq!(refused.code, "params.invalid", "{id:?}");
+    }
+    for id in reserved {
+        // Windows device names are refused in both scopes (P3-R22), and nothing is written.
+        for scope in ["workspace", "personal"] {
+            let args = json!({"kind": "palette", "id": id, "name": "N", "data": 1, "scope": scope});
+            assert_eq!(
+                fx.err("resource.save", args).await.code,
+                "params.invalid",
+                "{id} {scope}"
+            );
+        }
+        assert!(!fx.workspace_file("palette", id).exists(), "{id}");
+        assert!(!fx.personal_file("palette", id).exists(), "{id}");
     }
     let longest = "a".repeat(63);
     fx.ok("resource.save", save("palette", &longest)).await;
@@ -545,14 +562,24 @@ async fn list_and_get_see_both_scopes_and_the_workspace_wins() {
     );
     let only = fx.ok("resource.list", json!({"scope": "personal"})).await;
     assert_eq!(only["resources"].as_array().unwrap().len(), 1, "{only}");
-    let got = fx
-        .ok("resource.get", json!({"kind": "palette", "id": "sunset"}))
+    // The id exists in both scopes: an unscoped get is refused (P3-R23).
+    let refused = fx
+        .err("resource.get", json!({"kind": "palette", "id": "sunset"}))
         .await;
-    assert_eq!(
-        got["resource"]["data"],
-        json!({"a": 2}),
-        "the workspace wins"
-    );
+    assert_eq!(refused.code, "resource.ambiguous_scope", "{refused:?}");
+    // One that exists in one scope only is found without a scope, and the result names it.
+    let got = fx
+        .ok("resource.get", json!({"kind": "palette", "id": "dawn"}))
+        .await;
+    assert_eq!(got["scope"], "workspace", "{got}");
+    let got = fx
+        .ok(
+            "resource.get",
+            json!({"kind": "palette", "id": "sunset", "scope": "workspace"}),
+        )
+        .await;
+    assert_eq!(got["resource"]["data"], json!({"a": 2}));
+    assert_eq!(got["scope"], "workspace", "{got}");
     let got = fx
         .ok(
             "resource.get",
@@ -596,5 +623,267 @@ async fn changes_publish_on_resources() {
     assert!(seen[1]["replaced_entry_id"].is_string(), "{:?}", seen[1]);
     assert_eq!(seen[1]["resource_kind"], "palette");
     assert_eq!(seen[2]["entry_id"], deleted["entry_id"]);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-078, APP-082
+async fn an_unscoped_get_or_delete_that_could_mean_either_scope_is_refused() {
+    let fx = Fx::new();
+    // A model profile saved without a scope is personal; a workspace override is saved too.
+    let profile = |scope: Option<&str>| {
+        let mut args = json!({"kind": "model_profile", "id": "m", "name": "M", "data": {}});
+        if let Some(scope) = scope {
+            args["scope"] = json!(scope);
+        }
+        args
+    };
+    fx.ok("resource.save", profile(None)).await;
+    fx.ok("resource.save", profile(Some("workspace"))).await;
+    let target = json!({"kind": "model_profile", "id": "m"});
+    for tool in ["resource.get", "resource.delete"] {
+        let refused = fx.err(tool, target.clone()).await;
+        assert_eq!(refused.code, "resource.ambiguous_scope", "{tool}");
+    }
+    assert!(fx.workspace_file("model_profile", "m").is_file());
+    assert!(fx.personal_file("model_profile", "m").is_file());
+
+    let mut personal = target.clone();
+    personal["scope"] = json!("personal");
+    let deleted = fx.ok("resource.delete", personal).await;
+    assert_eq!(deleted["scope"], "personal", "{deleted}");
+    assert!(!fx.personal_file("model_profile", "m").exists());
+    // Now only the workspace one is left, so no scope is needed, and the result names it.
+    let got = fx.ok("resource.get", target.clone()).await;
+    assert_eq!(got["scope"], "workspace", "{got}");
+    let deleted = fx.ok("resource.delete", target).await;
+    assert_eq!(deleted["scope"], "workspace", "{deleted}");
+    fx.shutdown().await;
+}
+
+/// A junction at `link` to the folder `target` (no privilege needed).
+#[allow(clippy::disallowed_methods)]
+fn junction(link: &Path, target: &Path) {
+    lil_platform::fs::create_junction(link, target)
+        .unwrap_or_else(|e| panic!("cannot create a junction at {}: {e}", link.display()));
+}
+
+/// An expired trash entry holding `precious.txt`, in `outside` (a folder the suite doesn't
+/// own), shaped as the trash writes one.
+fn expired_entry_outside(outside: &Path) -> PathBuf {
+    let entry = outside.join("2020-01-01").join("te_00000000000000aa");
+    let record = json!({
+        "entry_id": "te_00000000000000aa",
+        "original_path": "palette/old.json",
+        "moved_utc": "2020-01-01T00:00:00Z",
+        "purge_after": "2020-01-31T00:00:00Z",
+        "reason": "test",
+    });
+    lil_testkit::files::write_file(&entry.join("restore.json"), record.to_string().as_bytes());
+    let precious = entry.join("payload").join("precious.txt");
+    lil_testkit::files::write_file(&precious, b"precious");
+    precious
+}
+
+#[tokio::test] // spec: CORE-110
+async fn a_linked_personal_trash_is_never_used_or_purged() {
+    let fx = Fx::new();
+    fx.save("personal", "sunset", 1).await;
+    let outside = fx.env.root().join("outside");
+    let precious = expired_entry_outside(&outside);
+    junction(&fx.personal.root().join(".trash"), &outside);
+
+    // A delete would move the resource through the link: it is refused, and the file stays.
+    let target = json!({"kind": "palette", "id": "sunset", "scope": "personal"});
+    fx.err("resource.delete", target).await;
+    assert!(fx.personal_file("palette", "sunset").is_file());
+    assert!(
+        !outside.join("2027-01-15").exists(),
+        "an entry was made outside"
+    );
+    // The listing and the purge refuse too, and nothing outside is deleted.
+    assert!(fx.personal.trash_list().await.is_err());
+    assert!(fx.personal.maintain().await.is_err());
+    assert!(precious.is_file(), "the purge deleted outside the trash");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-110
+async fn a_linked_workspace_trash_is_never_used_or_purged() {
+    let fx = Fx::new();
+    fx.save("workspace", "sunset", 1).await;
+    let outside = fx.env.root().join("outside");
+    let precious = expired_entry_outside(&outside);
+    junction(&fx.ws.join(".trash"), &outside);
+
+    let target = json!({"kind": "palette", "id": "sunset", "scope": "workspace"});
+    fx.err("resource.delete", target).await;
+    assert!(fx.workspace_file("palette", "sunset").is_file());
+    fx.err("trash.list", json!({"scope": "workspace"})).await;
+    let store = fx.hub.open(&fx.ws_ref).await.expect("opens").store.clone();
+    let now = fx
+        .clock
+        .utc_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        store
+            .maintenance(i64::try_from(now).unwrap())
+            .await
+            .is_err()
+    );
+    assert!(precious.is_file(), "the purge deleted outside the trash");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-078
+async fn a_linked_personal_kind_folder_is_not_read_through() {
+    let fx = Fx::new();
+    fx.save("personal", "sunset", 1).await;
+    let outside = fx.env.root().join("outside").join("palette");
+    let leak = json!({"schema_version": 1, "kind": "swatch", "id": "leak", "name": "Leak",
+                      "created": "2020-01-01T00:00:00Z", "updated": "2020-01-01T00:00:00Z",
+                      "data": {}});
+    lil_testkit::files::write_file(&outside.join("leak.json"), leak.to_string().as_bytes());
+    junction(&fx.personal.root().join("swatch"), &outside);
+    let leaked = json!({"kind": "swatch", "id": "leak", "scope": "personal"});
+    fx.err("resource.get", leaked).await;
+    let list = fx
+        .ok(
+            "resource.list",
+            json!({"kind": "swatch", "scope": "personal"}),
+        )
+        .await;
+    assert_eq!(list["resources"], json!([]), "{list}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-078
+async fn a_restored_resource_is_published() {
+    let fx = Fx::new();
+    let (tx, mut rx) = mpsc::channel(64);
+    fx.events.attach(1, tx);
+    fx.events
+        .subscribe(1, &["resources".to_string()], &Default::default())
+        .await;
+    for scope in ["workspace", "personal"] {
+        fx.save(scope, "sunset", 1).await;
+        let deleted = fx
+            .ok(
+                "resource.delete",
+                json!({"kind": "palette", "id": "sunset", "scope": scope}),
+            )
+            .await;
+        let entry = deleted["entry_id"].as_str().unwrap().to_string();
+        fx.ok("trash.restore", json!({"entry_id": entry})).await;
+        let mut restored = None;
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            let data = &event["params"]["data"];
+            if data["restored_entry_id"] == entry.as_str() {
+                restored = Some(data.clone());
+                break;
+            }
+        }
+        let restored = restored.unwrap_or_else(|| panic!("{scope}: the restore wasn't published"));
+        assert_eq!(restored["kind"], "saved", "{restored}");
+        assert_eq!(restored["resource_kind"], "palette", "{restored}");
+        assert_eq!(restored["id"], "sunset", "{restored}");
+        assert_eq!(restored["scope"], scope, "{restored}");
+        fx.ok(
+            "resource.delete",
+            json!({"kind": "palette", "id": "sunset", "scope": scope}),
+        )
+        .await;
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-078, CORE-110
+async fn an_unscoped_trash_list_shows_both_trashes_with_their_scope() {
+    let fx = Fx::new();
+    fx.save("workspace", "sunset", 1).await;
+    fx.save("personal", "dawn", 1).await;
+    for (id, scope) in [("sunset", "workspace"), ("dawn", "personal")] {
+        fx.ok(
+            "resource.delete",
+            json!({"kind": "palette", "id": id, "scope": scope}),
+        )
+        .await;
+    }
+    let list = fx.ok("trash.list", json!({})).await;
+    let mut rows: Vec<(String, String)> = list["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["scope"].as_str().unwrap().to_string(),
+                e["original_path"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            ("personal", "palette/dawn.json"),
+            ("workspace", "library/resources/palette/sunset.json")
+        ]
+        .map(|(a, b)| (a.to_string(), b.to_string())),
+        "{list}"
+    );
+    let only = fx.ok("trash.list", json!({"scope": "personal"})).await;
+    assert_eq!(only["entries"].as_array().unwrap().len(), 1, "{only}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-037
+async fn the_core_purges_the_personal_trash_in_the_background() {
+    let fx = Fx::new();
+    fx.save("personal", "sunset", 1).await;
+    fx.ok(
+        "resource.delete",
+        json!({"kind": "palette", "id": "sunset", "scope": "personal"}),
+    )
+    .await;
+    fx.after(31 * DAY);
+    lil_core::resources::spawn_personal_maintenance(fx.personal.clone());
+    // The first pass runs at once; this only waits for it, with a deadline.
+    for _ in 0..1_000 {
+        if fx.personal.trash_list().await.unwrap().is_empty() {
+            fx.shutdown().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the background pass never purged the entry");
+}
+
+#[tokio::test] // spec: APP-078
+async fn oversized_names_and_data_are_refused() {
+    let fx = Fx::new();
+    let save = |name: String, data: Value| json!({"kind": "palette", "id": "big", "name": name, "data": data});
+    let long_name = "n".repeat(201);
+    assert_eq!(
+        fx.err("resource.save", save(long_name, json!({})))
+            .await
+            .code,
+        "params.invalid"
+    );
+    assert_eq!(
+        fx.err("resource.save", save("a\nb".into(), json!({})))
+            .await
+            .code,
+        "params.invalid"
+    );
+    let big = json!({"blob": "x".repeat(1024 * 1024)});
+    assert_eq!(
+        fx.err("resource.save", save("Big".into(), big)).await.code,
+        "params.invalid"
+    );
+    assert!(!fx.workspace_file("palette", "big").exists());
+    fx.ok("resource.save", save("n".repeat(200), json!({"ok": true})))
+        .await;
     fx.shutdown().await;
 }
