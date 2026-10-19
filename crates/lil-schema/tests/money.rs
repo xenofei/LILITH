@@ -36,7 +36,12 @@ proptest! {
 
     #[test] // spec: CORE-013, QA-025
     fn money_parses_exactly_and_round_trips(
-        micros in prop_oneof![any::<i64>(), -10_000_000_i64..10_000_000],
+        micros in prop_oneof![
+            any::<i64>(),
+            -10_000_000_i64..10_000_000,
+            Just(i64::MIN),
+            Just(i64::MAX),
+        ],
         zeros in 0_usize..3,
     ) {
         let m = Money::from_micros(micros);

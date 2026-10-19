@@ -11,6 +11,8 @@
 //! - above idle is the window's energy less its idle baseline (idle power × the window's
 //!   length, never below 0), split by the same share; without a baseline the above-idle figure
 //!   is the gross one and the result says `idle_unknown`;
+//! - a window whose GPU used energy while no process's SM share was reported gives the job
+//!   none of it, and the job's GPU figure is then not `measured`;
 //! - GPU-seconds are SM-weighted: the engine's SM permille-seconds, which are milli-GPU-seconds;
 //! - the whole system is (GPU + CPU + `[power] rest_of_system_w` × the window's length) /
 //!   `psu_efficiency` (CORE-064), with a CPU that can't be measured left out (it is 0).
@@ -97,7 +99,9 @@ pub fn attribute(
         e.cpu_mj_gross += share(s.cpu_mj, cpu_engine, cpu_all);
         e.cpu_mj_above_idle += share(cpu_above, cpu_engine, cpu_all);
 
-        e.measured.gpu &= s.gpu_measured;
+        // No process's SM share was reported while the GPU used energy: the job's part of it
+        // is unknown (0 here, never guessed), so it is not a measured figure.
+        e.measured.gpu &= s.gpu_measured && !(sm_all == 0 && s.gpu_mj > 0);
         e.measured.cpu &= s.cpu_measured;
         e.idle_unknown |=
             (s.idle_gpu_mw.is_none() && s.gpu_mj > 0) || (s.idle_cpu_mw.is_none() && s.cpu_mj > 0);
@@ -120,6 +124,32 @@ mod tests {
         assert_eq!(share(10, 1, 4), 2, "2.5 → 2");
         assert_eq!(share(14, 1, 4), 4, "3.5 → 4");
         assert_eq!(share(7, 0, 0), 0, "no denominator, no share");
+    }
+
+    #[test] // spec: CORE-065, CORE-063
+    fn no_sm_share_is_not_a_measured_zero() {
+        let w = ExecWindow {
+            engine_pids: vec![7],
+            start: Duration::from_secs(0),
+            end: Duration::from_secs(1),
+            ok: true,
+        };
+        let s = EnergySlice {
+            gpu_mj: 900,
+            gpu_measured: true,
+            cpu_measured: true,
+            ..EnergySlice::default()
+        };
+        let e = attribute(
+            "j",
+            "w",
+            std::slice::from_ref(&w),
+            &[s],
+            &PowerSettings::default(),
+        );
+        assert_eq!(e.gpu_mj_gross, 0);
+        assert!(!e.measured.gpu, "{e:?}");
+        assert!(e.measured.cpu);
     }
 
     #[test] // spec: CORE-064

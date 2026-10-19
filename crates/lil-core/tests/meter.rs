@@ -934,6 +934,9 @@ async fn job_outcomes_map_to_usage_status() {
         .unwrap();
     assert_eq!(rig.wait(&job.job_id).await.status, JobStatus::Cancelled);
     assert_eq!(status_of(&job.job_id), [json!("cancelled")]);
+    // Submitted without an idempotency key, its caller is still known (CORE-069).
+    let cancelled = lines_of(&rig.loose(), "job_id", &job.job_id).remove(0);
+    assert_eq!(cancelled["caller_kind"], "cli", "{cancelled}");
 
     // An interrupted_unknown job you resolve from the app.
     let unknown = rig.job(json!({"windows": window, "end": "unknown"})).await;
@@ -948,6 +951,10 @@ async fn job_outcomes_map_to_usage_status() {
         .await
         .unwrap();
     assert_eq!(status_of(&unknown.job_id), [json!("cancelled")]);
+    // This core run saw its windows: the line and the job's energy have them.
+    let resolved = lines_of(&rig.loose(), "job_id", &unknown.job_id).remove(0);
+    assert!(resolved.get("gpu_seconds").is_some(), "{resolved}");
+    assert!(rig.energy(&unknown.job_id).await.is_some());
 
     // A job with no execution window used no engine time: no line.
     let plain = rig.job(json!({})).await;
@@ -1137,6 +1144,11 @@ async fn meter_stage_finishes_inline_calls_once() {
     let all = lines(&rig.loose());
     assert_eq!(all.len(), 2);
     assert_eq!(all[1]["status"], "failed");
+    // Settled at their estimates, both count as estimated (CORE-082).
+    let q: SummaryQuery = serde_json::from_value(json!({"period": "month"})).unwrap();
+    let s = rig.meter.summary(q, None).await.unwrap();
+    assert_eq!(s["bases"]["money"]["records"], 2, "{s}");
+    assert_eq!(s["bases"]["money"]["estimated"], 2, "{s}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1279,4 +1291,268 @@ async fn fixed_costs_are_in_month_totals() {
         .await
         .unwrap_err();
     assert_eq!(backwards.code, "params.invalid");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1.
+// ---------------------------------------------------------------------------------------------
+
+/// I1 (CORE-071): when the write-ahead row can't be written, the install fails before comfy-cli
+/// is started, and nothing is recorded after the fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-071, CORE-069
+async fn an_install_without_its_usage_row_never_starts_comfy_cli() {
+    let fake = FakeComfy::start();
+    let env = TestEnv::new();
+    let path = |p: &Path| p.to_str().unwrap().to_string();
+    env.suite_toml_set(&format!(
+        "[engines.comfyui]\nport = {}\nroot = '{}'\nautostart = false\ncomfy_cli = '{}'\npython = '{}'\n",
+        fake.port(),
+        path(&fake.root()),
+        path(&ensure_built().fake_comfy_cli),
+        path(&ensure_built().fake_comfyui),
+    ));
+    let rig = Rig::with(env, &busy(), PowerSettings::default());
+    let db = rusqlite::Connection::open(rig.env.env.suite_state_db()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_usage BEFORE INSERT ON usage_pending
+         BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+    )
+    .unwrap();
+    drop(db);
+    let _engines = Engines::new(
+        rig.env.env.clone(),
+        rig.jobs.clone(),
+        rig.telemetry.clone(),
+        rig.events.clone(),
+        rig.clock.clone(),
+        FailPoints::none(),
+        rig.meter.clone(),
+        Arc::new(OsSockets),
+    );
+    let spec = install::job_spec(
+        &NodeId("comfyui-test-node".into()),
+        &ExactVersion("1.2.3".into()),
+        "cli",
+        Priority::Agent,
+        None,
+    );
+    let caller = rig.caller(CallerKind::Cli);
+    let job = rig.jobs.submit(&caller, spec).await.unwrap();
+    let job = rig.wait(&job.job_id).await;
+    assert_eq!(job.status, JobStatus::Failed, "{job:?}");
+    assert_eq!(
+        job.error.as_ref().unwrap().code,
+        "state.unavailable",
+        "{job:?}"
+    );
+    assert!(
+        !fake.root().join("fake-comfy-cli.log").exists(),
+        "comfy-cli ran without its usage row"
+    );
+    assert!(lines(&rig.loose()).is_empty());
+}
+
+/// I1: a `begin` whose next step fails (`meter.after_pending` as an error) sends nothing and
+/// leaves no row, so no later start writes a line for it.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-071
+async fn a_failed_begin_leaves_no_row() {
+    let rig = Rig::new(&busy());
+    rig.fp.on(
+        "meter.after_pending",
+        Box::new(|| Err(std::io::Error::other("the step after the row"))),
+    );
+    let failed = rig
+        .meter
+        .begin(
+            &uctx(None, "c_1"),
+            draft("p", BillingBasis::Payg, Some(usd("1"))),
+        )
+        .await;
+    assert!(failed.is_err());
+    let conn = rusqlite::Connection::open(rig.env.env.suite_state_db()).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM usage_pending", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(rig.restarted_meter().recover().await.unwrap(), 0);
+    assert!(lines(&rig.loose()).is_empty());
+}
+
+/// M1 and M10: a `logging` row whose line went to the next month's log (the append began just
+/// before a month's end) is found there and not written again; a `logging` row without a line
+/// (a local-work line a dead core never appended) is written once.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-071, CORE-069
+async fn a_logging_row_is_written_once_across_a_month_end() {
+    let env = TestEnv::new();
+    let ws = env.copy_fixture_workspace("meter");
+    env.register_workspace(&ws, true);
+    let rig = Rig::with(env, &busy(), PowerSettings::default());
+    let open = rig.hub.open(&ws_ref(&ws)).await.unwrap();
+    // 2027-01-31T23:59:59.999Z, then the clock moves to 1 February.
+    let jan_31_last_ms = 1_801_439_999_999;
+    rig.clock.advance(Duration::from_secs(1_440_000));
+    let row = |id: &str, ts: &str| usage_record::PendingRow {
+        id: id.into(),
+        run: "a dead core".into(),
+        call_id: "c_1".into(),
+        job_id: None,
+        reservation: None,
+        record: {
+            let mut r = usage_record::draft_record(
+                ts,
+                &uctx(Some(open.clone()), "c_1"),
+                &draft("p", BillingBasis::Payg, Some(usd("1"))),
+            );
+            usage_record::finish(
+                &mut r,
+                Some(usd("1")),
+                "provider_reported",
+                "succeeded",
+                Some(3),
+            );
+            r
+        },
+        logging: true,
+        created_ms: jan_31_last_ms,
+        logging_ms: Some(jan_31_last_ms),
+    };
+    let logged = row("us_0000000000000001", "2027-01-31T23:59:59.990Z");
+    usage_record::insert(&open.state, &logged).await.unwrap();
+    open.store
+        .append_log(lil_core::store::LogKind::Usage, logged.record.clone())
+        .await
+        .unwrap();
+    let lost = row("us_0000000000000002", "2027-01-31T23:59:59.995Z");
+    usage_record::insert(&open.state, &lost).await.unwrap();
+
+    let next = rig.restarted_meter();
+    assert_eq!(
+        next.recover_workspace(&open).await.unwrap(),
+        1,
+        "only the lost line"
+    );
+    let feb = lines(&ws.join("registry/usage.testmachine.2027-02.jsonl"));
+    assert_eq!(feb.len(), 2, "{feb:?}");
+    assert_eq!(feb[0]["ts"], "2027-01-31T23:59:59.990Z");
+    assert_eq!(feb[1]["ts"], "2027-01-31T23:59:59.995Z");
+    assert!(
+        usage_record::get(&open.state, &logged.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        usage_record::get(&open.state, &lost.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        rig.restarted_meter()
+            .recover_workspace(&open)
+            .await
+            .unwrap(),
+        0
+    );
+    drop(open);
+}
+
+/// M5: a sum past the micro-unit range is never shown as exact.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-013, CORE-081
+async fn summary_totals_report_overflow() {
+    let rig = Rig::new(&busy());
+    let huge = "9223372036854";
+    spend(
+        &rig,
+        draft("p", BillingBasis::Payg, None),
+        Some((huge, "USD")),
+    )
+    .await;
+    spend(
+        &rig,
+        draft("p", BillingBasis::Payg, None),
+        Some((huge, "USD")),
+    )
+    .await;
+    let s = summary(&rig, json!({"period": "month"})).await;
+    assert_eq!(s["overflow"], true, "{s}");
+    let none = summary(
+        &rig,
+        json!({"period": "month", "from": "2030-01-01T00:00:00Z", "to": "2030-01-02T00:00:00Z"}),
+    )
+    .await;
+    assert!(none.get("overflow").is_none(), "{none}");
+}
+
+/// M11: with a workspace session the summary reads that workspace's logs of every machine (for
+/// the months of its range) as well as the loose log.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-082, ARCH-081
+async fn summary_reads_the_workspace_logs_of_every_machine() {
+    let env = TestEnv::new();
+    let ws = env.copy_fixture_workspace("meter");
+    env.register_workspace(&ws, true);
+    let rig = Rig::with(env, &busy(), PowerSettings::default());
+    let open = rig.hub.open(&ws_ref(&ws)).await.unwrap();
+    let id = rig
+        .meter
+        .begin(
+            &uctx(Some(open.clone()), "c_1"),
+            draft("p", BillingBasis::Payg, None),
+        )
+        .await
+        .unwrap();
+    rig.meter
+        .finish(&id, Some(usd("2")), "provider_reported", "succeeded", 1)
+        .await
+        .unwrap();
+    spend(
+        &rig,
+        draft("p", BillingBasis::Payg, None),
+        Some(("1", "USD")),
+    )
+    .await;
+    // Another machine's line in this month's log, and one in the log of a month the range
+    // doesn't touch.
+    let theirs = |ts: &str| {
+        let mut r = usage_record::draft_record(
+            ts,
+            &uctx(None, "c_9"),
+            &draft("p", BillingBasis::Payg, None),
+        );
+        usage_record::finish(
+            &mut r,
+            Some(usd("4")),
+            "provider_reported",
+            "succeeded",
+            Some(1),
+        );
+        let mut line = Map::new();
+        line.insert("machine".into(), json!("othermachine"));
+        line.insert("seq".into(), json!(1));
+        line.extend(r);
+        format!("{}\n", Value::Object(line))
+    };
+    lil_testkit::files::write_file(
+        &ws.join("registry/usage.othermachine.2027-01.jsonl"),
+        theirs("2027-01-15T07:00:00.000Z").as_bytes(),
+    );
+    lil_testkit::files::write_file(
+        &ws.join("registry/usage.othermachine.2026-06.jsonl"),
+        theirs("2027-01-15T07:30:00.000Z").as_bytes(),
+    );
+    let q = |v: Value| serde_json::from_value::<SummaryQuery>(v).unwrap();
+    let with = rig
+        .meter
+        .summary(q(json!({"period": "month"})), Some(&open))
+        .await
+        .unwrap();
+    assert_eq!(with["bases"]["money"]["records"], 3, "{with}");
+    assert_eq!(with["by_currency"], json!({"USD": "7"}), "{with}");
+    let without = rig
+        .meter
+        .summary(q(json!({"period": "month"})), None)
+        .await
+        .unwrap();
+    assert_eq!(without["by_currency"], json!({"USD": "1"}), "{without}");
+    drop(open);
 }

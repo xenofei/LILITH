@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
+use lil_protocol::ErrorBody;
 use lil_schema::money::{Currency, Money};
 
 use crate::tools::stages::BillingBasis;
@@ -106,15 +107,24 @@ pub struct PendingUsage {
 /// dies in between leaves a `pending` record. [`UsageSink::abandon`] drops a begun record
 /// whose request was never sent. The defaults keep no rows: `settle` records the draft with
 /// its outcome, so a sink that only implements `record` sees one draft per call.
+///
+/// A `begin` that fails is the caller's error: the request must not be sent (CORE-071), so
+/// the call or job fails with it, and nothing is recorded after the fact.
 pub trait UsageSink: Send + Sync {
     fn record<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, ()>;
 
-    fn begin<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, PendingUsage> {
-        Box::pin(std::future::ready(PendingUsage {
+    /// # Errors
+    /// Why the write-ahead record could not be written (`state.unavailable`).
+    fn begin<'a>(
+        &'a self,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> BoxFuture<'a, Result<PendingUsage, ErrorBody>> {
+        Box::pin(std::future::ready(Ok(PendingUsage {
             id: None,
             draft: u,
             ctx,
-        }))
+        })))
     }
 
     fn settle<'a>(

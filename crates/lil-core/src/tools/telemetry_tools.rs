@@ -40,7 +40,13 @@ const SERIES_DESCRIPTION: &str = "Returns hardware metrics over time: gpu.util, 
     to its energy. 1-second samples are kept 24 hours, 1-minute rows 30 days, hourly rows \
     forever.";
 
-const JOBS_DESCRIPTION: &str = "Returns the energy of finished jobs, newest first: for each,     the job id, its workspace (or loose), from and to (RFC 3339 UTC), GPU and CPU energy gross     and above idle in mJ, the whole-system energy, SM-weighted GPU-seconds (milli), whether the     GPU and CPU parts were measured, and idle_unknown when no idle baseline existed. `job_ids`     picks jobs; `from` and `to` (RFC 3339 UTC) keep jobs that ended at or after `from` and began     at or before `to`; `limit` is 1-500 (default 100).";
+const JOBS_DESCRIPTION: &str = "Returns the energy of finished jobs, newest first: for each, \
+    the job id, its workspace (or loose), from and to (RFC 3339 UTC: its first and last \
+    telemetry samples), GPU and CPU energy gross and above idle in mJ, the whole-system energy, \
+    SM-weighted GPU-seconds (milli), whether the GPU and CPU parts were measured, and \
+    idle_unknown when no idle baseline existed. Jobs of every workspace and loose ones are \
+    listed. `job_ids` picks jobs; `from` and `to` (RFC 3339 UTC) keep jobs that ended at or \
+    after `from` and began at or before `to`; `limit` is 1-500 (default 100).";
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct JobsResult {

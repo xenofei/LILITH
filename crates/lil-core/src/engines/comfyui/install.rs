@@ -8,7 +8,8 @@
 //! anything that starts with `-`). comfy-cli asks the comfy registry, so every run records one
 //! usage draft (provider `comfy-registry`, basis `free_tier`, `requests: 1`; CORE-069): begun
 //! write-ahead before comfy-cli is spawned (CORE-071; a core that dies mid-install leaves a
-//! `pending` record), and settled with the outcome (`succeeded`, `failed` or `cancelled`) and
+//! `pending` record; when that record can't be written, the job fails with its error and
+//! comfy-cli is never started), and settled with the outcome (`succeeded`, `failed` or `cancelled`) and
 //! the latency once it ends. A comfy-cli that can't be started asked nothing: its record is
 //! abandoned. The draft carries the job id, so it is the job's one usage line (QA1 I5). A
 //! success sets the engine's `restart_needed`; a failure is
@@ -293,7 +294,11 @@ impl NodeInstallHandler {
         };
         // Write-ahead (CORE-071): the record is pending before comfy-cli asks the registry.
         let usage = engines.comfy().usage.clone();
-        let pending = usage.begin(draft(), usage_ctx(job, &args)).await;
+        // Without its record the registry is never asked: the job fails before the spawn.
+        let pending = usage
+            .begin(draft(), usage_ctx(job, &args))
+            .await
+            .map_err(|e| JobFailure::Final(trace(e)))?;
         let cli = match spawn_engine(&request, &kill_on_close, on_line) {
             Ok(cli) => cli,
             Err(e) => {

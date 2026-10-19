@@ -148,13 +148,13 @@ fn text(r: &Map<String, Value>) -> String {
     serde_json::to_string(r).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Writes `row` (committed when this returns).
+/// Writes `row` (committed when this returns), `pending` or `logging` as it says.
 pub async fn insert(db: &StateDb, row: &PendingRow) -> Result<(), StateError> {
     let row = row.clone();
     db.call(move |conn| {
         conn.execute(
             "INSERT INTO usage_pending (id, run, call_id, job_id, reservation, record, state,
-                 created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                 created_ms, logging_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 row.id,
                 row.run,
@@ -162,7 +162,9 @@ pub async fn insert(db: &StateDb, row: &PendingRow) -> Result<(), StateError> {
                 row.job_id,
                 row.reservation,
                 text(&row.record),
-                row.created_ms
+                if row.logging { "logging" } else { "pending" },
+                row.created_ms,
+                row.logging_ms
             ],
         )
         .map(drop)

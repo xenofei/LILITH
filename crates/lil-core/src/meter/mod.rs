@@ -19,11 +19,14 @@
 //! - **Jobs** ([`JobCompletion`]). A job that reported execution windows gets its energy
 //!   attributed ([`attribution::attribute`]) and written with `Telemetry::put_job_energy`, and
 //!   one local-work line (`billing_basis: "local"`, `cost: "0"`, its energy, and its energy
-//!   cost at `[power] electricity` when set). A job whose handler recorded its own draft
-//!   through [`UsageSink`] (the node install) owns its usage line, so it gets none from here
-//!   (QA1 I5). An `interrupted_unknown` engine job you resolved gets a `cancelled` line even
-//!   though its windows went with the run that left it unknown. A job that never started gets
-//!   neither. The completion never settles a reservation: only Caps' does (Task 16).
+//!   cost at `[power] electricity` when set), written behind a `logging` row so a core that
+//!   dies before the line is in writes it at the next start. A job whose handler recorded its
+//!   own draft through [`UsageSink`] (the node install) owns its usage line, so it gets none
+//!   from here (QA1 I5). An `interrupted_unknown` engine job you resolved gets a `cancelled`
+//!   line, with its energy when this core run saw its windows, else without. A job that never
+//!   started gets neither. The completion never settles a reservation: only Caps' does
+//!   (Task 16). The set of jobs that own their line is in memory: an entry goes at the job's
+//!   completion (for an `interrupted_unknown` job, when you resolve it), and with the core.
 //! - **Summaries** ([`summary`], `usage.summary`).
 
 pub mod attribution;
@@ -212,7 +215,11 @@ impl Meter {
             .await
             .map_err(|e| state_error(&e))?;
         if let Err(e) = self.failpoints.hit("meter.after_pending") {
-            // As a crash there: the row stays for the next start.
+            // The step after the row failed: the request is not sent, so the row goes (an
+            // `abort` there never returns, and leaves the row as a crash would).
+            if let Err(gone) = record::delete(&db, &id).await {
+                tracing::warn!(usage_id = %id, error = %gone, "an unsent call's usage row could not be removed; the next start writes it as pending");
+            }
             return Err(ErrorBody::new(
                 &codes::STORE_IO,
                 format!("meter.after_pending: {e}"),
@@ -357,7 +364,7 @@ impl Meter {
     }
 
     /// Whether `row`'s finished record is a line of this machine in the log it was appended
-    /// to (the month it went `logging`, or the next one).
+    /// to (the month it went `logging`, or the next one when that is a minute away).
     async fn logged(&self, scope: Option<&Arc<OpenWorkspace>>, row: &PendingRow) -> bool {
         let want = Value::Object(row.record.clone());
         let secs = row.logging_ms.unwrap_or(row.created_ms).div_euclid(1000);
@@ -373,7 +380,10 @@ impl Meter {
             }
             Some(open) => {
                 let mut texts = Vec::new();
-                for at in [secs, secs + 32 * 86_400] {
+                // The month it went `logging`, and the month a minute later: an append that
+                // began just before a month's end may land in the next (its lock budget is
+                // 10 s).
+                for at in [secs, secs + 60] {
                     let month = lil_schema::time::year_month(at);
                     let rel = LogKind::Usage.rel(open.store.machine(), &month);
                     if let Ok(rel) = WsPath::parse(&rel)
@@ -458,7 +468,7 @@ impl Meter {
         }
         let mut lines = self.loose_lines().await;
         if let Some(open) = workspace {
-            lines.extend(workspace_lines(open).await);
+            lines.extend(workspace_lines(open, from_ms, to_ms).await);
         }
         let settings = self.money_settings().await;
         let range = Range {
@@ -583,8 +593,37 @@ impl Meter {
             r.insert("energy_cost".into(), record::money_value(m));
             r.insert("currency".into(), json!(c.as_str()));
         }
-        if let Err(err) = self.append(job.workspace.as_ref(), r).await {
-            tracing::error!(job_id = %job.id, code = %err.code, error = %err.message, "a job's local-work usage line could not be written");
+        // A `logging` row first, so a core that dies before the line is in writes it at the
+        // next start (the record is already final; no request is made).
+        let db = self.db(job.workspace.as_ref());
+        let now = self.now_ms();
+        let row = PendingRow {
+            id: self.ids.id("us"),
+            run: self.run.clone(),
+            call_id: job.id.to_string(),
+            job_id: Some(job.id.to_string()),
+            reservation: job.reservation.clone(),
+            record: r.clone(),
+            logging: true,
+            created_ms: now,
+            logging_ms: Some(now),
+        };
+        let kept = match record::insert(&db, &row).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = %e, "a job's local-work row could not be written; its line is written without one");
+                false
+            }
+        };
+        match self.append(job.workspace.as_ref(), r).await {
+            Ok(_) => {
+                if kept && let Err(e) = record::delete(&db, &row.id).await {
+                    tracing::warn!(usage_id = %row.id, error = %e, "a written local-work row could not be removed; the next start finds its line");
+                }
+            }
+            Err(err) => {
+                tracing::error!(job_id = %job.id, code = %err.code, error = %err.message, "a job's local-work usage line could not be written; the next start writes it");
+            }
         }
     }
 
@@ -637,7 +676,8 @@ impl Meter {
     }
 }
 
-/// The start (Unix ms) of the local day or month that holds `ms`.
+/// The start (Unix ms) of the local day or month that holds `ms` (CORE-012), daylight saving
+/// time included.
 fn period_start(ms: i64, period: Period, offset: &dyn Fn(i64) -> i32) -> i64 {
     let off = i64::from(offset(ms));
     let local = ms.div_euclid(1000) + off;
@@ -650,7 +690,10 @@ fn period_start(ms: i64, period: Period, offset: &dyn Fn(i64) -> i32) -> i64 {
             day_start - (day - 1) * 86_400
         }
     };
-    (start - off) * 1000
+    // The local start in UTC with the offset that holds at the start itself, not the one of
+    // `ms`: a month or day that began before a daylight-saving change began an hour apart.
+    let at_start = i64::from(offset((start - off) * 1000));
+    (start - at_start) * 1000
 }
 
 /// The records of a usage log's text (`machine` and `seq` removed).
@@ -664,8 +707,21 @@ fn records(text: &str) -> Vec<Map<String, Value>> {
         .collect()
 }
 
-/// Every usage line of `open`'s `registry/usage.*.jsonl` logs, of every machine.
-async fn workspace_lines(open: &Arc<OpenWorkspace>) -> Vec<Map<String, Value>> {
+/// The usage lines of `open`'s `registry/usage.<machine>.<yyyy-mm>.jsonl` logs of every machine,
+/// for the UTC months a range of `from_ms` to `to_ms` touches (a line is in the log of the
+/// month it was appended, at most a minute after its `ts`).
+async fn workspace_lines(
+    open: &Arc<OpenWorkspace>,
+    from_ms: i64,
+    to_ms: i64,
+) -> Vec<Map<String, Value>> {
+    let lo = lil_schema::time::year_month(from_ms.div_euclid(1000));
+    let hi = lil_schema::time::year_month(to_ms.div_euclid(1000).saturating_add(60));
+    let in_range = move |name: &str| {
+        name.strip_suffix(".jsonl")
+            .and_then(|n| n.rsplit_once('.'))
+            .is_some_and(|(_, month)| month >= lo.as_str() && month <= hi.as_str())
+    };
     let dir = open.store.root().join("registry");
     let names = tokio::task::spawn_blocking(move || {
         let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -673,7 +729,7 @@ async fn workspace_lines(open: &Arc<OpenWorkspace>) -> Vec<Map<String, Value>> {
             .flatten()
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.starts_with("usage.") && n.ends_with(".jsonl"))
+            .filter(|n| n.starts_with("usage.") && in_range(n))
             .collect();
         names.sort();
         names
@@ -715,16 +771,24 @@ impl UsageSink for Meter {
         })
     }
 
-    fn begin<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, PendingUsage> {
+    /// The row, or the error the call fails with (the request must not be sent).
+    fn begin<'a>(
+        &'a self,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> BoxFuture<'a, Result<PendingUsage, ErrorBody>> {
         Box::pin(async move {
-            let id = match Meter::begin(self, &ctx, u.clone()).await {
-                Ok(id) => Some(id),
+            match Meter::begin(self, &ctx, u.clone()).await {
+                Ok(id) => Ok(PendingUsage {
+                    id: Some(id),
+                    draft: u,
+                    ctx,
+                }),
                 Err(e) => {
-                    tracing::error!(call_id = %ctx.call_id, code = %e.code, error = %e.message, "a write-ahead usage row could not be written");
-                    None
+                    tracing::error!(call_id = %ctx.call_id, code = %e.code, error = %e.message, "a write-ahead usage row could not be written; the call is not sent");
+                    Err(e)
                 }
-            };
-            PendingUsage { id, draft: u, ctx }
+            }
         })
     }
 
@@ -796,6 +860,25 @@ mod tests {
         assert_eq!(
             format_ts(period_start(ms, Period::Day, &behind)),
             "2026-10-18T07:00:00.000Z"
+        );
+    }
+
+    #[test] // spec: CORE-012
+    fn a_month_that_began_before_a_dst_change_starts_at_its_own_midnight() {
+        // US Pacific: PDT (-7 h) until 2026-11-01T09:00Z, then PST (-8 h).
+        let change = 1_793_523_600_000; // 2026-11-01T09:00:00Z
+        assert_eq!(format_ts(change), "2026-11-01T09:00:00.000Z");
+        let pacific = move |at: i64| if at < change { -7 * 3600 } else { -8 * 3600 };
+        let nov_5 = 1_793_880_000_000; // 2026-11-05T12:00:00Z
+        assert_eq!(format_ts(nov_5), "2026-11-05T12:00:00.000Z");
+        assert_eq!(
+            format_ts(period_start(nov_5, Period::Month, &pacific)),
+            "2026-11-01T07:00:00.000Z",
+            "local midnight of 1 November, in PDT"
+        );
+        assert_eq!(
+            format_ts(period_start(nov_5, Period::Day, &pacific)),
+            "2026-11-05T08:00:00.000Z"
         );
     }
 

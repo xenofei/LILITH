@@ -39,7 +39,7 @@ CREATE TABLE generated_pending (
 /// Suite migration 3 and workspace migration 4: the job records (ARCH-022, ARCH-034, CORE-117).
 /// A job lives in the `state.db` of its call's scope (ARCH-099). `seq` is the submission order.
 /// `idem_scope`/`idem_key` (caller kind + workspace, and the call's idempotency key) make one
-/// key one job (CORE-016). `external_id` is the engine's id for the job (ComfyUI's
+/// key one job (CORE-016); `idem_scope` is kept without a key too (the submitting caller). `external_id` is the engine's id for the job (ComfyUI's
 /// `prompt_id`, CORE-120), written by the engine's handler. `tool`/`tool_args` are the tool
 /// call that submitted the job, which `job.retry` dispatches again.
 const JOBS: &str = "CREATE TABLE jobs (

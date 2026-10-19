@@ -50,23 +50,25 @@ impl Money {
         if !digits(whole) || frac.is_some_and(|f| !digits(f) || f.len() > DECIMALS) {
             return Err(bad());
         }
-        let mut micros: i64 = 0;
+        // The magnitude in 128 bits, so the most negative amount (whose magnitude is one past
+        // `i64::MAX`) parses as exactly as it prints.
+        let mut micros: i128 = 0;
         for b in whole.bytes() {
             micros = micros
                 .checked_mul(10)
-                .and_then(|m| m.checked_add(i64::from(b - b'0')))
+                .and_then(|m| m.checked_add(i128::from(b - b'0')))
+                .filter(|m| *m <= i128::from(u64::MAX))
                 .ok_or_else(bad)?;
         }
-        micros = micros.checked_mul(MICROS_PER_UNIT).ok_or_else(bad)?;
+        micros *= i128::from(MICROS_PER_UNIT);
         let frac = frac.unwrap_or("");
-        let mut scale = MICROS_PER_UNIT;
+        let mut scale = i128::from(MICROS_PER_UNIT);
         for b in frac.bytes() {
             scale /= 10;
-            micros = micros
-                .checked_add(i64::from(b - b'0') * scale)
-                .ok_or_else(bad)?;
+            micros += i128::from(b - b'0') * scale;
         }
-        Ok(Money(if negative { -micros } else { micros }))
+        let signed = if negative { -micros } else { micros };
+        i64::try_from(signed).map(Money).map_err(|_| bad())
     }
 
     /// The shortest exact decimal form: `"0.0087"`, `"2"`, `"-1.5"`, `"0"`.
@@ -167,6 +169,7 @@ mod tests {
             ("-1.5", -1_500_000),
             ("0.000001", 1),
             ("9223372036854.775807", i64::MAX),
+            ("-9223372036854.775808", i64::MIN),
         ] {
             let m = Money::parse_decimal(text).unwrap();
             assert_eq!(m.micros(), micros, "{text}");
@@ -203,6 +206,9 @@ mod tests {
             "1,5",
             "--1",
             "9223372036855",
+            "9223372036854.775808",
+            "-9223372036854.775809",
+            "99999999999999999999999999",
             "NaN",
         ] {
             assert!(Money::parse_decimal(bad).is_err(), "{bad:?}");

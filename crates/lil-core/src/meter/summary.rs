@@ -10,7 +10,9 @@
 //!   currency (CORE-081). `display_total` converts each record at the newest
 //!   `[[money.rates]]` entry dated on or before the record's day (a currency with no such rate
 //!   is listed in `unconverted` and left out), and adds the fixed costs of each month of the
-//!   range when `period` is `month` (CORE-083).
+//!   range when `period` is `month` (CORE-083). A record settled at its estimate
+//!   (`cost_source: "estimated"`) counts as estimated too. A sum that would pass the `i64`
+//!   micro-unit range leaves that addend out, and the summary says `overflow: true`.
 //! - **Periods** are local calendar days or months (CORE-012). Without `from`, the range starts
 //!   at the start of the current period; without `to`, it ends now.
 //! - **Rows** group the records by period, basis and the `group_by` fields.
@@ -251,6 +253,8 @@ struct Sum {
     micros: i64,
     /// A decimal string was added: the sum is written as one too.
     text: bool,
+    /// An addend would have passed the `i64` micro-unit range; it was left out.
+    overflow: bool,
 }
 
 impl Sum {
@@ -264,7 +268,10 @@ impl Sum {
             _ => None,
         };
         if let Some(m) = m {
-            self.micros = self.micros.saturating_add(m.micros());
+            match self.micros.checked_add(m.micros()) {
+                Some(v) => self.micros = v,
+                None => self.overflow = true,
+            }
         }
     }
 
@@ -277,19 +284,39 @@ impl Sum {
     }
 }
 
-/// Money per currency.
+/// Money per currency. An addend that would pass the `i64` micro-unit range is left out and
+/// marks the sum (`overflow`), so a wrong total is never shown as exact.
 #[derive(Debug, Default, Clone)]
-struct ByCurrency(BTreeMap<String, Money>);
+struct ByCurrency {
+    totals: BTreeMap<String, Money>,
+    overflow: bool,
+}
+
+/// `*total += m`, or `false` (`total` unchanged) past the `i64` micro-unit range.
+fn add_to(total: &mut Money, m: Money) -> bool {
+    match total.checked_add(m) {
+        Some(sum) => {
+            *total = sum;
+            true
+        }
+        None => false,
+    }
+}
 
 impl ByCurrency {
     fn add(&mut self, currency: &str, m: Money) {
-        let total = self.0.entry(currency.to_string()).or_insert(Money::ZERO);
-        *total = total.checked_add(m).unwrap_or(*total);
+        let total = self
+            .totals
+            .entry(currency.to_string())
+            .or_insert(Money::ZERO);
+        if !add_to(total, m) {
+            self.overflow = true;
+        }
     }
 
     fn value(&self) -> Value {
         Value::Object(
-            self.0
+            self.totals
                 .iter()
                 .map(|(c, m)| (c.clone(), Value::String(m.to_decimal_string())))
                 .collect(),
@@ -309,6 +336,11 @@ struct Tally {
 }
 
 impl Tally {
+    /// Whether one of its sums passed the micro-unit range.
+    fn overflowed(&self) -> bool {
+        self.money.overflow || self.energy_cost.overflow || self.units.values().any(|s| s.overflow)
+    }
+
     fn value(&self, basis: &str) -> Value {
         let mut v = Map::new();
         v.insert("records".into(), json!(self.records));
@@ -350,7 +382,8 @@ fn basis_of(line: &Map<String, Value>) -> &'static str {
 }
 
 /// The amount of a money record and its currency: its `cost`, else its `est_cost`, and whether
-/// that is an estimate.
+/// that is an estimate: a record without a cost, or one settled at its estimate
+/// (`cost_source: "estimated"`, as stage 8 settles an inline call).
 fn amount_of(line: &Map<String, Value>) -> Option<(Money, String, bool)> {
     let currency = line.get("currency").and_then(Value::as_str)?.to_string();
     let parse = |k: &str| {
@@ -358,8 +391,9 @@ fn amount_of(line: &Map<String, Value>) -> Option<(Money, String, bool)> {
             .and_then(Value::as_str)
             .and_then(|s| Money::parse_decimal(s).ok())
     };
+    let estimated = line.get("cost_source").and_then(Value::as_str) == Some("estimated");
     match parse("cost") {
-        Some(m) => Some((m, currency, false)),
+        Some(m) => Some((m, currency, estimated)),
         None => parse("est_cost").map(|m| (m, currency, true)),
     }
 }
@@ -378,6 +412,7 @@ pub fn summarize(
     }
     let mut rows: BTreeMap<Vec<String>, (Map<String, Value>, Tally)> = BTreeMap::new();
     let mut display = Money::ZERO;
+    let mut overflow = false;
     let mut unconverted: Vec<String> = Vec::new();
     for line in lines {
         let Some(ms) = line
@@ -447,7 +482,7 @@ pub fn summarize(
         {
             let (day, _) = range.local(ms);
             match settings.to_display(m, &currency, &day) {
-                Some(d) => display = display.checked_add(d).unwrap_or(display),
+                Some(d) => overflow |= !add_to(&mut display, d),
                 None => {
                     if !unconverted.contains(&currency) {
                         unconverted.push(currency);
@@ -466,7 +501,7 @@ pub fn summarize(
             match shown {
                 Some(d) => {
                     for _ in 0..months {
-                        display = display.checked_add(d).unwrap_or(display);
+                        overflow |= !add_to(&mut display, d);
                     }
                 }
                 None => {
@@ -484,6 +519,7 @@ pub fn summarize(
             }));
         }
     }
+    overflow |= bases.values().any(Tally::overflowed) || rows.values().any(|(_, t)| t.overflowed());
     let money = &bases["money"];
     let mut out = Map::new();
     out.insert(
@@ -502,6 +538,10 @@ pub fn summarize(
         "unattributed".into(),
         bases["unattributed"].value("unattributed"),
     );
+    if overflow {
+        // A total passed the micro-unit range: the totals shown leave those addends out.
+        out.insert("overflow".into(), Value::Bool(true));
+    }
     if !unconverted.is_empty() {
         unconverted.sort();
         out.insert("unconverted".into(), json!(unconverted));
