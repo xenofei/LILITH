@@ -433,12 +433,14 @@ fn drain_closes_state_before_releasing_the_pipe() {
 
     let report = core.wait_stopped(DEADLINE).expect("the core stops");
     // The steps ran with the database open; then it was closed; then the pipe. The jobs'
-    // `PersistInterrupted` step (plan 3) runs in its phase, before the probe's `StopEngines`.
+    // `PersistInterrupted` step (plan 3) runs in its phase, then the engines' `StopEngines` step
+    // (registered first in that phase), then the probe's.
     assert_eq!(*answered.lock().unwrap(), Some(true));
     assert_eq!(
         report.steps,
         [
             "jobs.persist_interrupted",
+            "engines.stop",
             "probe state",
             "state.close",
             "pipe.close"
