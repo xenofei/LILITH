@@ -62,7 +62,6 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use base64::Engine as _;
-use lil_platform::names::is_workspace_dir;
 use lil_protocol::{CodeSpec, Detail, ErrorBody, FileRef, codes};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -295,8 +294,8 @@ fn below<'p>(path: &'p Path, root: &Path) -> Option<Vec<Component<'p>>> {
 }
 
 /// Checks a job input's path (review I3): an absolute path, without `.` or `..`, of a regular
-/// file inside the job's workspace (a valid workspace path, not in the workspace's data
-/// folders or `.git`) or directly in the job's cache folder (`cache_dir`), reached through no
+/// file inside the job's workspace (a valid workspace path, not in a root the store keeps to
+/// itself, by its long name: either data folder, `.git`, `.trash` or the ledger) or directly in the job's cache folder (`cache_dir`), reached through no
 /// link or junction. Returns the reason it is refused.
 pub fn confine_input(
     path: &Path,
@@ -321,13 +320,22 @@ pub fn confine_input(
             .iter()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        WsPath::parse(&names.join("/")).map_err(|e| format!("not a workspace path: {e:?}"))?;
-        if names
-            .first()
-            .is_some_and(|n| is_workspace_dir(n) || n.eq_ignore_ascii_case(".git"))
-        {
-            return Err("it is in the workspace's own data or git folder".to_string());
-        }
+        let rel =
+            WsPath::parse(&names.join("/")).map_err(|e| format!("not a workspace path: {e:?}"))?;
+        // Decided on the long form too, as the store decides (Task 12 re-review N1): an 8.3
+        // short name (`LILITH~1`, `GIT~1`, `TRASH~1`) is refused like the long name, and so
+        // is every root the store keeps to itself (either data folder, `.git`, `.trash`, the
+        // ledger). A long form that can't be read refuses the path.
+        crate::store::paths::reserved_on_disk(
+            root,
+            &rel,
+            "uploaded to ComfyUI",
+            &lil_platform::fs::long_name,
+        )
+        .map_err(|e| match e {
+            crate::store::StoreError::PathInvalid { why, .. } => why,
+            other => other.to_string(),
+        })?;
         (root, rest)
     } else {
         return Err("it is not inside the job's workspace or its cache folder".to_string());
@@ -451,6 +459,40 @@ async fn send_cancel(live: &Live, client: &ComfyClient, job: &str) {
     }
 }
 
+/// How often, and how many times, an abandoned prompt is looked at after its cancel
+/// ([`cancel_if_it_lands_late`]).
+const LATE_LOOK_EVERY: Duration = Duration::from_secs(2);
+const LATE_LOOKS: u32 = 5;
+
+/// Task 12 re-review N2: a prompt ComfyUI was still validating when its per-job cancel came
+/// (the cancel found nothing) can still land and run. For about 10 s it is looked at every
+/// 2 s, and cancelled once if it shows up queued or running; a prompt that is done or
+/// cancelled ends the watch. It runs on its own, after the job has ended.
+fn cancel_if_it_lands_late(client: ComfyClient, prompt_id: String, job: String) {
+    tokio::spawn(async move {
+        for _ in 0..LATE_LOOKS {
+            tokio::time::sleep(LATE_LOOK_EVERY).await;
+            match client.state(&prompt_id).await {
+                Ok(RemoteState::Queued | RemoteState::Running) => {
+                    match client.cancel(&prompt_id).await {
+                        Ok(()) => tracing::info!(
+                            job_id = job,
+                            prompt_id,
+                            "an abandoned prompt that landed late was cancelled in ComfyUI"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(job_id = job, prompt_id, error = %e, "the late cancel of an abandoned prompt failed")
+                        }
+                    }
+                    return;
+                }
+                Ok(RemoteState::Done(_) | RemoteState::Cancelled) => return,
+                Ok(RemoteState::Gone) | Err(_) => {}
+            }
+        }
+    });
+}
+
 /// Removes the attempt from [`SuitePrompts`] when it ends.
 struct LiveGuard {
     prompts: Arc<SuitePrompts>,
@@ -541,6 +583,30 @@ fn unreachable(e: &ComfyError, job: &JobCtx) -> JobFailure {
     ))
 }
 
+/// The prompt id an earlier attempt persisted (CORE-120), read from the job's row. A row that
+/// can't be read is no answer (Task 12 re-review N3): a job with external side effects ends
+/// `Unknown`, since an earlier prompt may have been sent and paid for; any other job is retried
+/// later. Never "no earlier prompt", which would post a new one.
+async fn earlier_prompt(job: &JobCtx) -> Result<Option<String>, JobFailure> {
+    match record::get(&job.state, job.id.as_str()).await {
+        Ok(row) => Ok(row.and_then(|r| r.external_id)),
+        Err(e) => {
+            tracing::error!(job_id = %job.id, error = %e, "the job's row can't be read before its attempt");
+            let e = error(
+                &codes::STATE_UNAVAILABLE,
+                "The job's state can't be read, so whether an earlier attempt sent its prompt \
+                 is unknown.",
+                job,
+            );
+            Err(if job.spec.external_side_effects {
+                JobFailure::Unknown(e)
+            } else {
+                JobFailure::Retryable(e)
+            })
+        }
+    }
+}
+
 /// The job stops because the core is stopping (the shutdown step ran): interrupted.
 fn stopping(job: &JobCtx) -> JobFailure {
     JobFailure::Interrupted {
@@ -584,14 +650,14 @@ impl JobHandler for ComfyPromptHandler {
                 Ok(endpoint) => endpoint,
                 Err(mut e) => {
                     e.trace_id.clone_from(&job.trace_id);
-                    let earlier = record::get(&job.state, job.id.as_str())
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|r| r.external_id);
                     // An earlier prompt with external side effects that can't be looked at is
-                    // unknown (fail closed, CORE-128).
-                    return Err(if external && earlier.is_some() {
+                    // unknown (fail closed, CORE-128); so is a row that can't be read.
+                    let earlier = match earlier_prompt(job).await {
+                        Ok(earlier) => earlier.is_some(),
+                        Err(failure) if external => return Err(failure),
+                        Err(_) => false,
+                    };
+                    return Err(if external && earlier {
                         JobFailure::Unknown(e)
                     } else if e.code == codes::COMFYUI_UNREACHABLE.code {
                         JobFailure::Retryable(e)
@@ -631,6 +697,10 @@ impl JobHandler for ComfyPromptHandler {
             // A prompt the attempt abandons doesn't run on behind the suite's back (M4).
             if matches!(result, Err(JobFailure::Unknown(_))) || attempt.abandoned {
                 send_cancel(&attempt.live, &attempt.client, job.id.as_str()).await;
+                let prompt_id = attempt.live.posted.lock().await.prompt_id.clone();
+                if let Some(prompt_id) = prompt_id {
+                    cancel_if_it_lands_late(attempt.client.clone(), prompt_id, job.id.to_string());
+                }
             }
             for name in &attempt.uploaded {
                 attempt.uploads.release(name).await;
@@ -710,20 +780,27 @@ impl Attempt<'_> {
     }
 
     async fn run(&mut self, args: PromptArgs) -> Result<JobDone, JobFailure> {
-        // CORE-120: an earlier attempt's prompt is asked about before anything is posted.
-        let earlier = record::get(&self.job.state, self.job.id.as_str())
-            .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.external_id);
+        // CORE-120: an earlier attempt's prompt is asked about before anything is posted. A
+        // row that can't be read says nothing about one, so nothing is posted (re-review N3:
+        // fail closed; paid work may have been sent).
+        let earlier = earlier_prompt(self.job).await?;
         if let Some(prompt_id) = earlier {
-            // Known to the shutdown step and to a cancel at once (I2).
-            {
-                let mut posted = self.live.posted.lock().await;
-                if self.shut() {
-                    return Err(stopping(self.job));
+            // Known to the shutdown step and to a cancel at once (I2), registered before the
+            // shutdown check: a step that ran meanwhile missed it, so it is cancelled here
+            // (`run` cancels an unknown or abandoned attempt's prompt), and paid work that may
+            // be running is unknown, never plain interrupted (re-review N4c, P3-R21).
+            self.live.posted.lock().await.prompt_id = Some(prompt_id.clone());
+            if self.shut() {
+                if self.external {
+                    return Err(self.unknown(
+                        &codes::COMFYUI_UNREACHABLE,
+                        "The core stopped while it took up the job's earlier prompt, which has \
+                         external side effects: whether it ran (and was charged) is unknown.",
+                        None,
+                    ));
                 }
-                posted.prompt_id = Some(prompt_id.clone());
+                self.abandoned = true;
+                return Err(stopping(self.job));
             }
             match self.client.state(&prompt_id).await {
                 Ok(state @ (RemoteState::Queued | RemoteState::Running)) => {
@@ -1145,6 +1222,17 @@ impl Attempt<'_> {
         })
     }
 
+    /// Reports the windows of a run whose prompt succeeded but whose outputs could not be
+    /// taken, as not `ok`: the GPU time was spent whatever the outcome (CORE-065, re-review N7).
+    fn report_failed_windows(&self, windows: &[ExecWindow]) {
+        for w in windows {
+            self.job.add_window(ExecWindow {
+                ok: false,
+                ..w.clone()
+            });
+        }
+    }
+
     /// Reports the window of a run that didn't succeed (CORE-065).
     fn report_window(&mut self, ok: bool) {
         if let Some(w) = self.window(ok) {
@@ -1260,11 +1348,21 @@ impl Attempt<'_> {
         self.job.set_substatus(Substatus::Ingesting).await;
         let history = match history {
             Some(history) => history,
-            None => self.wait_history(prompt_id).await?,
+            None => match self.wait_history(prompt_id).await {
+                Ok(history) => history,
+                Err(failure) => {
+                    self.report_failed_windows(&windows);
+                    return Err(failure);
+                }
+            },
         };
-        let staging = Staging::for_job(self.job, self.comfy.local_dir())
-            .await
-            .map_err(JobFailure::Final)?;
+        let staging = match Staging::for_job(self.job, self.comfy.local_dir()).await {
+            Ok(staging) => staging,
+            Err(e) => {
+                self.report_failed_windows(&windows);
+                return Err(JobFailure::Final(e));
+            }
+        };
         let mut staged: Vec<(OutputFile, PathBuf, String)> = Vec::new();
         let mut taken: HashSet<String> = HashSet::new();
         let mut bad: Option<String> = None;
@@ -1305,6 +1403,7 @@ impl Attempt<'_> {
             for (_, dest, _) in &staged {
                 let _ = fsops::discard_unverified(&staging.dir, dest);
             }
+            self.report_failed_windows(&windows);
             return Err(JobFailure::Final(untrusted(
                 error(
                     &codes::STORE_IO,
@@ -1480,6 +1579,52 @@ fn output_files(history: &Value) -> Vec<OutputFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 12 re-review N1: an input inside a root the store keeps to itself is refused by its
+    /// long name and by its 8.3 short name (`LILITH~1`, `GIT~1`, `TRASH~1`), as the store
+    /// refuses it; a plain workspace file is accepted. On a volume with 8.3 names off the
+    /// short-name half is skipped.
+    #[test] // spec: CORE-130, ARCH-060
+    fn inputs_in_reserved_roots_are_refused_by_long_and_short_name() {
+        use lil_platform::names::{LEGACY_WORKSPACE_DIR, WORKSPACE_DIR};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let cache = dir.path().join("cache");
+        let reserved = [
+            format!("{WORKSPACE_DIR}/private.png"),
+            format!("{LEGACY_WORKSPACE_DIR}/private.png"),
+            ".git/config".to_string(),
+            ".trash/t.png".to_string(),
+            "registry/ledger.csv".to_string(),
+        ];
+        for rel in reserved
+            .iter()
+            .chain(std::iter::once(&"art/ok.png".to_string()))
+        {
+            lil_testkit::files::write_file(&ws.join(rel), b"x");
+        }
+        assert_eq!(
+            confine_input(&ws.join(r"art\ok.png"), Some(&ws), &cache),
+            Ok(())
+        );
+        let mut shorts = 0;
+        for rel in &reserved {
+            let long = ws.join(rel.replace('/', "\\"));
+            assert!(confine_input(&long, Some(&ws), &cache).is_err(), "{rel}");
+            let first = ws.join(rel.split('/').next().unwrap());
+            let short = lil_platform::fs::short_name(&first).unwrap();
+            if short != first {
+                shorts += 1;
+                let rest = long.strip_prefix(&first).unwrap();
+                let by_short = short.join(rest);
+                let refused = confine_input(&by_short, Some(&ws), &cache);
+                assert!(refused.is_err(), "{}: {refused:?}", by_short.display());
+            }
+        }
+        if shorts == 0 {
+            println!("8.3 names are off on this volume: the short-name half is skipped");
+        }
+    }
 
     /// QA1 M3: a failed start's or install's output tail is held to the same 2,048 bytes as
     /// every other engine text: the newest whole lines, or the end of a longer last line.

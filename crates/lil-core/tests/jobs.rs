@@ -2485,3 +2485,50 @@ async fn an_engine_loss_during_a_cancel_is_an_interruption_that_is_not_rerun() {
     assert_eq!(all.len(), 1, "no re-run: {all:?}");
     fx.shutdown().await;
 }
+
+/// Task 12 re-review N4 (ruling P3-R21): a job with external side effects whose row holds an
+/// engine id is never plain `interrupted`, even when the recovery can't take it up (here: the
+/// core is draining) or it was waiting for its turn after an earlier take-up.
+#[tokio::test(start_paused = true)] // spec: CORE-128, QA-007, ARCH-022
+async fn an_external_job_with_an_engine_id_is_never_plain_interrupted() {
+    let fx = Fx::suite().await;
+    let mut paid = gated(Lane::GpuHeavy, Priority::Agent, "never");
+    paid.engine = Some(EngineKind::ComfyUi);
+    paid.external_side_effects = true;
+    let in_engine = fx.submit(paid.clone()).await;
+    let waiting = fx.submit(paid).await;
+    fx.handler.until_started(&in_engine.job_id).await;
+    let db = fx.states.suite_db();
+    for (id, substatus) in [
+        (&in_engine.job_id, Substatus::Executing),
+        (&waiting.job_id, Substatus::Waiting),
+    ] {
+        let c = record::Change {
+            external_id: Some(Some(format!("prompt-of-{id}"))),
+            ..record::Change::to(substatus)
+        };
+        record::update(&db, id, c, 0).await.unwrap().unwrap();
+    }
+    let restarted = Jobs::new(
+        fx.states.clone(),
+        fx.hub.clone(),
+        fx.events.clone(),
+        fx.clock.clone(),
+        Arc::new(SeqIds::new()),
+        fx.failpoints.clone(),
+    );
+    restarted.register(Arc::new(TestHandler::default()));
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    restarted.stop_on_drain(drain);
+    restarted.recover_suite().await.unwrap();
+    for id in [&in_engine.job_id, &waiting.job_id] {
+        let row = fx.row(id).await;
+        assert_eq!(
+            (row.status, row.substatus),
+            (JobStatus::Running, Some(Substatus::InterruptedUnknown)),
+            "{id}"
+        );
+    }
+    fx.shutdown().await;
+}

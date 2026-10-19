@@ -137,6 +137,7 @@ impl FakeComfy {
                 ..State::default()
             }),
             wake: Notify::new(),
+            uploads: Notify::new(),
             root: root.to_path_buf(),
             addr,
         });
@@ -274,6 +275,13 @@ impl FakeComfy {
         self.shared.lock().refuse_http = on;
     }
 
+    /// While on, each `POST /upload/image` is recorded and then left unanswered until it is
+    /// turned off (a test holds an attempt between its start and its `POST /prompt`).
+    pub fn hold_uploads(&self, on: bool) {
+        self.shared.lock().hold_uploads = on;
+        self.shared.uploads.notify_waiters();
+    }
+
     /// Calls `hook` with the body of each `POST /prompt` when it arrives, before the fake
     /// does anything with it (on the fake's thread: keep it short).
     pub fn on_prompt(&self, hook: impl Fn(&Value) + Send + Sync + 'static) {
@@ -358,6 +366,8 @@ struct Shared {
     state: Mutex<State>,
     /// Wakes the executor: a prompt arrived, was released, cancelled or forgotten.
     wake: Notify,
+    /// Wakes the uploads [`FakeComfy::hold_uploads`] holds.
+    uploads: Notify,
     root: PathBuf,
     addr: SocketAddr,
 }
@@ -542,6 +552,7 @@ struct State {
     on_prompt: Option<PromptHook>,
     extra_outputs: Vec<(String, bool)>,
     refuse_http: bool,
+    hold_uploads: bool,
     drop_after_accept: bool,
     restart_after: Option<u32>,
     outputs_since_armed: u32,
@@ -1049,7 +1060,16 @@ async fn handle(
             json_response(StatusCode::OK, &Value::Object(one))
         }
         (&Method::GET, ["view"]) => view(&shared.root, &query),
-        (&Method::POST, ["upload", "image"]) => upload(&shared.root, &req, &bytes),
+        (&Method::POST, ["upload", "image"]) => {
+            loop {
+                let released = shared.uploads.notified();
+                if !shared.lock().hold_uploads {
+                    break;
+                }
+                released.await;
+            }
+            upload(&shared.root, &req, &bytes)
+        }
         (&Method::POST, ["interrupt"]) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": "the fake ComfyUI refuses a bare /interrupt"}),

@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use lil_core::engines::Engines;
 use lil_core::engines::comfyui::{
-    ComfyClient, DEFAULT_EXPECTED_SECS, PROMPT_KIND, Uploads, prefix_outputs, prompt_spec,
-    upload_name,
+    ComfyClient, DEFAULT_EXPECTED_SECS, PROMPT_KIND, RemoteState, Uploads, prefix_outputs,
+    prompt_spec, upload_name,
 };
 use lil_core::events::EventBus;
 use lil_core::jobs::record::{self, JobRow};
@@ -742,6 +742,11 @@ async fn outputs_are_fetched_into_staging_with_the_prefix_and_engine_copies_remo
         1,
         "the engine copy stays"
     );
+    // The GPU time of a prompt that ran is attributed even though its outputs weren't taken
+    // (CORE-065, Task 12 re-review N7).
+    let windows = job_windows(&rig, &id);
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert!(!windows[0].ok, "{windows:?}");
     let cache = env.env.local_dir().join("cache").join("jobs").join(&id);
     assert!(
         files_with_prefix(&cache, &prefix).is_empty(),
@@ -1752,4 +1757,122 @@ async fn previews_before_the_jobs_own_execution_are_dropped() {
     );
     fake.hold_prompts(false);
     rig.done(&id).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 2 (Task 12 re-review N2, N4, N5, N6).
+// ---------------------------------------------------------------------------------------------
+
+/// N2: a "may have landed" prompt that ComfyUI queues only after the precautionary cancel is
+/// cancelled when it shows up, so it never runs on behind the suite's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-128, CORE-123
+async fn an_abandoned_prompt_that_lands_late_is_cancelled_when_it_shows_up() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.hold_prompts(true);
+    fake.fail_next(FakeFailure::AcceptLate);
+    let rig = Rig::new(&env);
+    let id = rig.submit_external(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "interrupted_unknown", |j| {
+        j.substatus.as_deref() == Some("interrupted_unknown")
+    })
+    .await;
+    let prompt_id = rig.row(&id).await.external_id.unwrap();
+    let cancels = |fake: &FakeComfy| count(fake, "POST", &format!("/jobs/{prompt_id}/cancel"));
+    rig.until(&id, "the late cancel", |_| cancels(&fake) >= 2)
+        .await;
+    let look = ComfyClient::new(&fake.url()).unwrap();
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match look.state(&prompt_id).await.unwrap() {
+            RemoteState::Cancelled | RemoteState::Gone => break,
+            // A running prompt that is cancelled ends in the history, interrupted, with no
+            // outputs, as in ComfyUI.
+            RemoteState::Done(history) => {
+                assert_eq!(history["outputs"], json!({}), "{history}");
+                assert!(
+                    history.to_string().contains("execution_interrupted"),
+                    "{history}"
+                );
+                break;
+            }
+            other => assert!(Instant::now() < deadline, "still {other:?}"),
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    assert_eq!(posted(&fake).len(), 1, "never re-posted");
+}
+
+/// N5: the shutdown step that runs after an attempt began, while it is still uploading its
+/// inputs, stops it at the `POST /prompt` itself: nothing is posted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-021, CORE-120
+async fn the_post_itself_checks_the_shutdown_step() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let rig = Rig::in_workspace(&env).await;
+    let input = rig.open.as_ref().unwrap().store.root().join("held.png");
+    lil_testkit::files::write_file(&input, b"an input whose upload is held");
+    let mut graph = tiny(1);
+    graph["9"] = json!({"class_type": "LoadImage", "inputs": {"image": "placeholder"}});
+    let args = json!({"graph": graph, "inputs": [{"node": "9", "input": "image", "path": input}]});
+    fake.hold_uploads(true);
+    let id = rig.submit(args, Priority::User).await;
+    rig.until(&id, "the upload is held", |_| {
+        count(&fake, "POST", "/upload/image") == 1
+    })
+    .await;
+    rig.engines.cancel_prompts_step().run().await;
+    fake.hold_uploads(false);
+    let done = rig.done(&id).await;
+    assert_eq!(
+        (done.status, done.substatus.as_deref()),
+        (JobStatus::Failed, Some("interrupted")),
+        "{done:?}"
+    );
+    assert!(
+        posted(&fake).is_empty(),
+        "nothing was posted after the step"
+    );
+}
+
+/// N6: more than 30 s without an HTTP answer (the paused clock jumps while the job waits) is
+/// still not a lost prompt: the job follows it through to its end, and nothing is posted again.
+#[tokio::test(flavor = "current_thread")] // spec: CORE-128, CORE-123
+async fn a_silence_past_30_seconds_is_not_a_lost_prompt() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.hold_prompts(true);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.executing(&id).await;
+    let prompt_id = rig.row(&id).await.external_id.unwrap();
+    let looks = |fake: &FakeComfy| count(fake, "GET", &format!("/jobs/{prompt_id}"));
+    let before = looks(&fake);
+    fake.refuse_http(true);
+    tokio::time::pause();
+    let silent_from = tokio::time::Instant::now();
+    let deadline = Instant::now() + DEADLINE;
+    while silent_from.elapsed() < Duration::from_secs(40) || looks(&fake) < before + 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the paused clock did not move on"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tokio::time::resume();
+    let still = rig.summary(&id).await;
+    assert_eq!(
+        (still.status, still.substatus.as_deref()),
+        (JobStatus::Running, Some("executing")),
+        "still followed after 40 s of silence"
+    );
+    fake.refuse_http(false);
+    fake.release(&prompt_id);
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert_eq!(posted(&fake).len(), 1);
+    assert!(rig.all_jobs().await.iter().all(|j| j.retry_of.is_none()));
 }
