@@ -1528,24 +1528,27 @@ async fn agents_never_retry_interrupted_external_jobs() {
             .await
             .unwrap();
     }
-    for (id, code) in [
-        (&paid.job_id, "confirm.unavailable"),
-        // Retried by no one until it is resolved.
-        (&unknown.job_id, "job.not_retryable"),
-    ] {
-        let refused = rig
-            .jobs
-            .retry_origin(&rig.caller(), &JobId(id.clone()))
-            .await
-            .unwrap_err();
-        assert_eq!(refused.code, code, "{id}: {refused:?}");
-    }
-    assert!(
-        rig.jobs
-            .retry_origin(&rig.caller(), &JobId(local.job_id.clone()))
-            .await
-            .is_ok()
-    );
+    // Retried by no one until it is resolved.
+    let refused = rig
+        .jobs
+        .retry_origin(&rig.caller(), &JobId(unknown.job_id.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "job.not_retryable", "{refused:?}");
+    // An agent's retry of paid work that may have run is flagged, so the dispatcher makes it
+    // `pending_confirmation` (Task 14); a local job's is not.
+    let flagged = rig
+        .jobs
+        .retry_origin(&rig.caller(), &JobId(paid.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(flagged.interrupted_with_side_effects);
+    let plain = rig
+        .jobs
+        .retry_origin(&rig.caller(), &JobId(local.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(!plain.interrupted_with_side_effects);
     // You may retry it from the app.
     let app = rig.caller_as(CallerKind::Ui("image".into()));
     assert!(

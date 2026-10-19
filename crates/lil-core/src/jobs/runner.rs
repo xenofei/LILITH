@@ -2106,22 +2106,10 @@ impl Jobs {
                     .map_or_else(|| row.status.wire().to_string(), |s| s.wire())
             )));
         }
-        // Ruling P3-R21: paid or hosted work that may have run is never retried by an agent on
-        // its own (Task 14 turns this into a confirmation). An `interrupted_unknown` job is retried
-        // by no one (above): it is resolved first.
-        if caller.caller.is_agent()
-            && row.external_side_effects
-            && row.substatus == Some(Substatus::Interrupted)
-        {
-            return Err(ErrorBody::new(
-                &codes::CONFIRM_UNAVAILABLE,
-                format!(
-                    "Job {id} has external side effects and may have run (and been charged); \
-                     only you can retry it, from the app."
-                ),
-                trace_id.clone(),
-            ));
-        }
+        // Ruling P3-R21: an agent's retry of paid or hosted work that may have run
+        // (`interrupted_with_side_effects` below) needs your confirmation; the dispatcher makes
+        // it `pending_confirmation`. An `interrupted_unknown` job is retried by no one (above):
+        // it is resolved first.
         if caller.caller.is_agent()
             && let Some(rerun) = record::auto_rerun_of(scope.db(), id.as_str())
                 .await
