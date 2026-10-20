@@ -183,8 +183,14 @@ The suite is one headless Rust core service per user plus Qt 6 / QML apps that a
 **Interchange primitives** (used by later sections)
 - **ARCH-042** [M1] (contract) The canonical asset reference is `lil://<workspace>/<project>/<asset>@<version>`, mapping 1:1 to the manifest link syntax. Candidates are referenced as `lil://<workspace>/<project>/<asset>@candidate/<run>/<file>` for viewing and provenance only — never as live links or recipe inputs.
   - From M1, every reference to a version — `lil://` refs, `.lilref` files, exports and engine-import records — also carries the target version's SHA-256 content hash (field defined with the schema, §2). Resolving a reference through `renamed_from` comes with multi-machine Sync (ARCH-087).
+  - (owner decision 2026-10-20) After an asset is renamed or moved (CORE-153), refs to its old place keep resolving through `registry/redirects.yaml` (ARCH-125). Refs and recipe inputs carry no creation UUID: dependents are fixed by path when the rename happens.
 - **ARCH-043** [M1] (contract) Clipboard and drag-and-drop carry refs under the MIME type `application/x-lilith-ref`.
 - **ARCH-044** [M1] (contract) Live links subscribe to the event topic `asset:<ref>`. (plan 2b clarification: Appendix E) The topic of a ref is `asset:` plus the ref without its `@<version>` and hash, so one subscription sees every version.
+- **ARCH-125** [M1] (contract) **Redirects** (owner decision 2026-10-20). Renaming or moving an asset (CORE-153) records a redirect in the tracked workspace file `registry/redirects.yaml`, one entry per move: `{from: "<project>/<asset_id>", to: "<project>/<asset_id>", moved_utc, by}`, with `by` as in a sign-off's `signed_off.by` (Appendix E). The file is changed with targeted YAML edits (ARCH-076).
+  - Refs, recipe inputs and `.lilref` files that name the old place resolve through the redirect, and the result names the new ref. Chains are followed to their end; a cycle is `needs_repair`.
+  - A live asset folder always wins over a redirect from the same name.
+  - A redirect never blocks anything: trashing the target, or removing the redirect, is never refused because of it. A redirect whose target is gone resolves to an error that names where the asset went.
+  - A version's content hash covers only the paths inside `v<version>/` (Appendix E), so a move never changes it, and a ref resolved through a redirect still checks its `#sha256`.
 
 Defined elsewhere: proposal references `doc:<doc_id>/proposal/<run_id>/<n>` (§5.5); the app handler registry, `open_in` and `ui.show` (§3.4); converters as tools (§2.10); checkout/checkin with the first interactive engine (*later*).
 
@@ -238,7 +244,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 | **User-interactive** (later) | Blender UI, Godot editor, Krita (via an in-house pykrita bridge plugin) | connect via add-on/bridge, observe, check in saved work; never restart or idle down |
 
 - **ARCH-064** [M1] (invariant) Owned engines run in a kill-on-close Job Object for crash cleanup only; normal exits stop them explicitly. Attached engines are never stopped by the suite. (plan 3 clarification: Appendix F) The engine is every process in its Job Object (`JobObjectBasicProcessIdList`): a venv's `python.exe` is a launcher, and the interpreter runs as its child. For an attached engine it is the process listening on the port and its descendants. The loopback check, the scheduler's engine processes, telemetry tracking and the SM-share split all use the full set.
-- **ARCH-065** [M1] (decision) In M1 the core manages ComfyUI only, as owned or attached depending on who started it.
+- **ARCH-065** [M1] (decision) In M1 the core manages ComfyUI only, as owned or attached depending on who started it. (owner decision 2026-10-20) The ComfyUI version the suite is tested against moves forward only after the workflow-conversion checks are re-run against the new release: the frontend scripting checks of IMG-127 and IMG-129 now, and the conversion golden test (QA-049) from M1b. The suite never adds `--enable-assets` to an owned launch, so an engine it starts keeps ComfyUI's own asset catalogue off and doesn't scan the model folders in the background. An attached engine is left as it is.
 - **ARCH-066** [M1.5] (decision) Local LLM runtimes: `llama-server` as an owned engine (started with `--api-key`, bound to 127.0.0.1) and Ollama as an attached one (§4). Their chat-only use in ORACLE arrives early, in M1b with plan 7a (AI-204); everything else stays M1.5.
   - From plan 7a (M1b): the owned `llama-server` build is pinned by build number, asset name and SHA-256 (ARCH-059): b11721 `win-cuda-13.4-x64` with its matching cudart zip, or the build the plan 7a spike passes on (AI-230). Builds move about 19 a day, so "latest" is never a pin. A new build is installed only on the user's click.
   - From plan 7a (M1b): the SHA-256 and sizes of the `llama-server` build and cudart, the exact asset and file names, and the Gemma 4, Qwen3.8-27B and Qwen3.8-Flash-Next file lists (AI-231) are recorded by the plan 7a spike in the pinned manifest. Until the manifest has them, the first-run card's Download button is disabled, and the card shows no size it hasn't verified (AI-206).
@@ -269,7 +275,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 - **ARCH-075** [M1] (invariant) Each operation writes in a fixed order: output file → manifest → jobs log line → index. On startup, outputs with no manifest entry (a crash mid-sequence) are listed as orphans for review and never deleted. (plan 2b clarification: Appendix E) The `progress.md` entry (CORE-020) comes between the jobs log line and the index; events go out last.
 - **ARCH-076** [M1] (invariant) Manifests round-trip losslessly: JSON is parsed with key order preserved (`serde_json` `preserve_order`) into typed structs that keep unknown fields in a flattened extras map, and written back with minimal diffs. Manifests carry `schema_version`; schema violations are warnings, not failures. YAML files (`lilith.yaml`, `registry/*.yaml`) are changed with targeted edits that keep comments and order. (plan 2b clarification: Appendix E) The typed structs are views over the ordered map, which keeps unknown fields in their original place.
 - **ARCH-077** [M1] Golden round-trip tests use real workspace files, including the lantern manifest. (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
-- **ARCH-078** [M1] The core records the SHA-256 of every file it writes as that file's last generated hash; human-edit detection compares against it (LFS pointers by `oid`). SHA-256 is the only content hash.
+- **ARCH-078** [M1] The core records the SHA-256 of every file it writes as that file's last generated hash; human-edit detection compares against it (LFS pointers by `oid`). SHA-256 is the only content hash. (owner decision 2026-10-20) No second digest is stored, not even a blake3 field for lookups in other tools' records.
 - **ARCH-079** [M1] The file watcher uses `ReadDirectoryChangesW` and does a full rescan on buffer overflow. An outside edit to a candidate or sealed file is recorded as a human edit and offered as a new version. `work/` (working documents) is excluded from human-edit tracking, and `.lilith\staging\` is excluded from the watcher. An invalid manifest is marked "needs repair" and never rewritten. (plan 2b clarification: Appendix E) A hash counts only when the file's identity is the same before and after the read; an unstable or locked file is parked and re-checked, never recorded as a human edit or a removal. A directory event reconciles the folder's subtree. A human edit already recorded with the same SHA-256 isn't recorded again. A file the suite still expects on disk (listed in `hashes`, a file of an open run, or a manifest) that disappears is `missing` until the same content reappears (with CORE-038); the suite's own moves (sign-off, trash, maintenance) never make a file `missing`.
 - **ARCH-080** [M1] (invariant) Engines never write into versioned folders. Headless jobs write into staging handles issued by `store` (`<workspace>\.lilith\staging\`, gitignored, same volume), and the core ingests their outputs as candidate runs (§2.3).
 - **ARCH-081** [M1] (contract) The append-only logs are per machine and per month: `queue/jobs.<machine>.<yyyy-mm>.jsonl` and `registry/usage.<machine>.<yyyy-mm>.jsonl`. Calls made with no workspace open go to `%LOCALAPPDATA%\LILITH\usage-loose.jsonl`.
@@ -348,7 +354,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 - **ARCH-111** [M1] (invariant) `lil-schema` and `lil-protocol` have no Qt or Windows dependencies (checked by a dependency-boundary test over `cargo metadata`, alongside `cargo-deny`'s advisory, licence and duplicate checks, §6.2). Formats and the protocol are platform-neutral; Windows API calls live only in the platform crate. (owner decision 2026-10-13: transitive Windows dependencies of common crates make `cargo-deny` wrappers brittle, so the boundary is enforced by the `cargo metadata` test.)
 - **ARCH-112** [M1] (invariant) Within `lil-core`, file write, rename and remove APIs are disallowed by a per-crate `clippy.toml`, with a single allowance inside `store` (§6.2).
 - **ARCH-113** [M1] (invariant) The C++ shim only extracts raw clipboard and drag MIME bytes; all parsing happens in Rust, in the parser crate.
-- **ARCH-114** [M1] (decision) The build is CMake at the top level, using cxx-qt's documented CMake integration (`cxx_qt_import_crate`, built on Corrosion) for the Rust crates, plus KDDockWidgets, the C++ shim and `windeployqt`. Pinned: Qt 6.12 LTS with the Qt WebEngine release matching Qt 6.12 LTS (versioned separately; pinned in the M0 Qt-stack spike, ARCH-115, §6.6), cxx-qt 0.10, KDDockWidgets 2.4.1 (verified 2026-10-12). One planned upgrade per cxx-qt minor release; KDDockWidgets 2.5 when it ships (§3.1). (M0 result, 2026-10-12: Qt **6.12.0** (`msvc2022_64`) + Qt WebEngine **6.140.0** (Chromium 140 base), cxx-qt 0.10.0 with cxx-qt-cmake 0.10.0 (Corrosion v0.5.2), KDDockWidgets 2.4.1 (Qt Quick frontend). The stack passed on 6.12, so the Qt 6.11 fallback is not used. `docs/spikes/01-toolchain.md`, `02-qt-stack.md`.)
+- **ARCH-114** [M1] (decision) The build is CMake at the top level, using cxx-qt's documented CMake integration (`cxx_qt_import_crate`, built on Corrosion) for the Rust crates, plus KDDockWidgets, the C++ shim and `windeployqt`. Pinned: Qt 6.12 LTS with the Qt WebEngine release matching Qt 6.12 LTS (versioned separately; pinned in the M0 Qt-stack spike, ARCH-115, §6.6), cxx-qt 0.10, KDDockWidgets 2.4.1 (verified 2026-10-12). One planned upgrade per cxx-qt minor release; KDDockWidgets 2.5 when it ships (§3.1). (owner decision 2026-10-20) 2.5.0 has shipped: it replaces 2.4.1 if plan 4a's build check passes (APP-005). (M0 result, 2026-10-12: Qt **6.12.0** (`msvc2022_64`) + Qt WebEngine **6.140.0** (Chromium 140 base), cxx-qt 0.10.0 with cxx-qt-cmake 0.10.0 (Corrosion v0.5.2), KDDockWidgets 2.4.1 (Qt Quick frontend). The stack passed on 6.12, so the Qt 6.11 fallback is not used. `docs/spikes/01-toolchain.md`, `02-qt-stack.md`.)
 - **ARCH-115** [M0] The stack spike must pass before M1 app work: cxx-qt 0.10 + KDDockWidgets 2.4.1 (Qt Quick) + a `QQuickRhiItem` shim + QtWebEngine + `windeployqt` on Qt 6.12 LTS with MSVC. If it fails on 6.12, fall back to Qt 6.11; the result fixes the Qt version for M1. (M0 result, 2026-10-12: PASS on Qt 6.12.0 + Qt WebEngine 6.140.0: all seven criteria in one scripted from-scratch run, zero build warnings at default settings, and the `windeployqt` output ran with Qt and MSVC off PATH. The Qt 6.11 fallback was not needed, so M1 is pinned to Qt 6.12.0 / WebEngine 6.140.0. `docs/spikes/02-qt-stack.md`.)
 - **ARCH-116** [M1] Floating docks are separate top-level windows; GPU canvases must survive their renderer being destroyed and recreated when moved between windows (§5.3). (M0 result, 2026-10-12: confirmed for a `QQuickRhiItem` shim that rebuilds its GPU resources in `initialize()`: floating and re-docking recreated the renderer against a new QRhi each time, with no crash. `docs/spikes/02-qt-stack.md`.)
 
@@ -361,7 +367,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 - **ARCH-119** [M1] Engine stdout/stderr is captured into the logs. Every process installs a panic hook.
 - **ARCH-120** [Later] Minidumps on crashes.
 - **ARCH-121** [M1] The Diagnostics panel shows component versions, engine health, VRAM, the queue, recent errors, the event log, a telemetry summary and a backup status line, with "Export diagnostics bundle". The bundle redacts secrets and Claude Code profile labels and emails.
-- **ARCH-122** [M1] (invariant) Nothing is sent anywhere automatically; a diagnostics bundle leaves the machine only when you hand it on.
+- **ARCH-122** [M1] (invariant) Nothing is sent anywhere automatically; a diagnostics bundle leaves the machine only when you hand it on. (owner decision 2026-10-20) Optional outbound reads are off by default, each a separate opt-in: the Comfy account balance read (CORE-098) and thumbnails fetched from model hubs. Model covers otherwise come from your own outputs.
 
 ### 1.10 Milestone scope
 
@@ -491,25 +497,48 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 - **CORE-034** [M1] (invariant) **Human edits:** when a candidate or sealed file's hash differs from the recorded hash (LFS pointers are compared by `oid`), the change is recorded in `human_edits` and the file is never overwritten. The merge options are a new version that regenerates only unlocked layers or regions, or a sibling variant. Document folders (`work/`) are excluded from human-edit tracking.
 - **CORE-035** [M1] Locks use the workspace format's path list.
 - **CORE-036** [Later] Leases go in a `leases` extension field.
-- **CORE-037** [M1] (contract) **Trash:** deletes move files to `.trash/<date>/` with restore records and `purge_after` (30 days).
+- **CORE-037** [M1] (contract) **Trash:** deletes move files to `.trash/<date>/` with restore records and `purge_after` (30 days). (owner decision 2026-10-20) `trash.restore {entry_id, to?}`: when the original path is taken, `to` names a free path in the same folder, and the entry is restored there ("restore as…"). Without `to`, a taken path still fails with `trash.restore_conflict`. A restored resource takes its new id inside the file too, with a targeted edit. A restore never replaces anything. This adds the optional `to` to Appendix E's `trash.restore`.
 - **CORE-038** [M1] (invariant) Orphans are listed for review and never deleted automatically. (plan 2b clarification: Appendix E) A file the suite still expects on disk that disappears outside the suite is listed as `missing`, never forgotten (ARCH-079 clarification).
 - **CORE-039** [M1] (contract) `progress.md` entries go under `## Done` as `- YYYY-MM-DD: …`; other sections are edited section by section. (plan 2b clarification: Appendix E) A new entry goes on the line directly after `## Done`, newest first; the blank line before the next heading is kept.
 - **CORE-040** [M1] (contract) **Paths:** a budget of about 180 characters per relative path; reserved Windows names are rejected. `lil doctor` sets `core.longpaths=true` and `lfs.setlockablereadonly=false`, and adds the `.gitignore` entries, including `assets/*/work/`. (plan 2b clarification: Appendix E) The budget is exactly 180 characters. In the workspace's root `.gitignore`, `assets/*/work/` is written `projects/*/assets/*/work/`. The workspace `.gitattributes` holds `projects/** -text`, and edits keep the line ending a file was read with.
 - **CORE-041** [M1] (contract) **Index reconcile** compares path + size + mtime + NTFS FileId + ChangeTime. A cold rebuild trusts manifest hashes and verifies them in the background. Hashes are SHA-256 only. (plan 2b clarification: Appendix E) FileId and ChangeTime are compared only on local NTFS or ReFS volumes outside a cloud-files sync root. Elsewhere size and mtime are compared, and a file whose mtime is within 2 s of the previous scan is hashed. A volume whose facts can't be read counts as having no stable IDs. File IDs detect changes in place only: ReFS IDs change on a move across folders.
 - **CORE-042** [M1] Index rebuild times are benchmarked, and the benchmark is a CI gate. (plan 2b clarification: Appendix E) The budgets (a cold rebuild of 2,000 assets, a warm reconcile of 10,000) are recorded in `test-params.toml`.
 - **CORE-043** [M1] (contract) **Proposal runs** are kept separate from asset candidate runs. They live in `assets/<id>/work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with their recipe and saved inputs. They create no asset version, don't change the asset's status and don't run the QA chain.
-- **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.lildoc`, open proposals move with the document.
+- **CORE-044** [M1] (contract) Proposal runs are kept until accepted or discarded, then for 14 days. Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots. On "Add to project" from a `.lildoc`, open proposals move with the document. (owner decision 2026-10-20) A run that a layer records as its origin is kept longer (IMG-082); it is still never a chunk garbage-collection root.
 - **CORE-045** [M1] (contract) Document layers are stored as content-addressed chunks of 8×8 tiles (1024×1024 px) on a signed grid, each with a tile-presence/uniform bitmap header and a hash over the canonical uncompressed bytes (format in §5.2). `docs` garbage collection and snapshot hardlinking work at chunk level.
 - **CORE-046** [M1.5] (contract) Every asset carries a creation UUID (recorded from M1, CORE-047); a sealed version renumbered during multi-machine sync records `renamed_from: {version, machine, content_hash}` in its manifest; references resolve through `renamed_from` (using the content hash they carry, CORE-047), with a warning on a mismatch (§7.3).
-- **CORE-047** [M1] (contract) References to a sealed version — `lil://` refs, `.lilref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill. (plan 2b clarification: Appendix E) The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`.
+- **CORE-047** [M1] (contract) References to a sealed version — `lil://` refs, `.lilref` files, exports and engine-import records — carry that version's content hash (SHA-256) alongside `id@version`, so a later renumbering can be detected and resolved (CORE-046). Every asset also records its creation UUID when it is created, so multi-machine sync needs no back-fill. (plan 2b clarification: Appendix E) The asset folder name is authoritative; the index stores `creation_uuid`, and a manifest whose `asset_id` or `project` disagrees with its folder is `needs_repair`. (owner decision 2026-10-20) Asset folders moved or copied outside the suite: CORE-154.
+
+**Organising, renaming and repair** (owner decisions 2026-10-20). Organising data lives in manifests or tracked YAML, never only in `index.db` (Appendix E's decision).
+
+- **CORE-152** [M1] (contract) **Organising marks.** The asset manifest gains `tags` (free-text strings, compared case-insensitively), `rating` (0–5; 0 means unrated) and `label` (one colour label of `red`, `yellow`, `green`, `blue` and `purple`, or none). Each candidate file (`candidate_runs[].files[]`) gains `flag` (`pick`, `reject` or none) and `rating`. The index mirrors them for search and filters.
+  - `asset.mark {project?, asset_id, run_id?, file?, tags?, rating?, label?, flag?}` (`write`) sets them. It writes the manifest, then the index, then events: no jobs log line, no `progress.md` entry and no status change. A run's marks change only while the run is open, since runs are not edited after sign-off. Review's pick and reject (APP-112) set `flag`; sign-off still takes the files you choose (CORE-026).
+  - `assets.query` gains the optional filters `tags`, `rating_min`, `label`, `flag` (assets with a candidate so flagged) and `collection` (CORE-155). A list-valued filter matches any of its values, and different filters combine with AND.
+  - `assets.query {facets: true}` also returns, for the filtered set, the count of assets per value of `status`, `type`, `tags`, `rating`, `label` and `flag`, counted in the same read transaction as the page (APP-157).
+  - These are new optional keys, as Appendix E's paging contract allows.
+- **CORE-153** [M1] (contract) **Rename and move.** `asset.rename {project?, asset_id, new_asset_id}` and `asset.move {project?, asset_id, to_project, new_asset_id?}` (`write`) move the asset folder through `store`, set the manifest's `asset_id` and `project` to match (the folder name stays authoritative, Appendix E), and record a redirect (ARCH-125).
+  - Dependents are fixed by path at rename time: the manifest `inputs` of every dependent the index knows, and the project `links` that name the old place, are rewritten with targeted edits. Sealed `manifest.snapshot.json` files are never rewritten; they, working documents' linked refs (APP-075) and dependents on other clones resolve through the redirect.
+  - The call is refused, with nothing moved, while a job, a sign-off or a document hold uses the asset, or when the new name is taken.
+  - It writes in the order of ARCH-075, with a `progress.md` entry, and the result's hand-off lists the dependents it rewrote.
+- **CORE-154** [M1] (contract) **Moved and copied asset folders** (outside the suite; extends CORE-047's folder check):
+  - when an asset's creation UUID appears at a new folder while its old folder is gone, the asset is reported as `moved` (from and to) in `project.status` and `asset.get`, and you can record a redirect for it (ARCH-125);
+  - a second live asset folder with the same creation UUID is `needs_repair`. The copy is the folder whose manifest disagrees with its folder; when both agree, both are `needs_repair` and you choose which one to change;
+  - **Make independent copy** (`asset.make_independent {project?, asset_id}`, `write`) gives that copy a new creation UUID and sets its manifest's `asset_id` and `project` to its folder. It runs only when you choose it in the app or an agent calls it, never automatically, so a copy stays `needs_repair` until then.
+- **CORE-155** [M1] (contract) **Saved searches and collections** live in one tracked workspace file, `registry/collections.yaml`, changed with targeted YAML edits (ARCH-076). There are no new resource kinds.
+  - Each entry has an `id` (UUID), a `name`, and either a `rule` (a saved `assets.query` filter set: a saved search) or `refs` (a hand-picked collection, resolved through redirects, ARCH-125).
+  - One built-in entry, the quick collection, is what the B key adds to and removes from (APP-143).
+  - Tools: `collections.list` (`read`), `collection.save` (`write`) and `collection.delete` (`destructive`, as `resource.delete` is). A deleted entry goes to the trash as a file, so `trash.restore` brings it back.
+  - `assets.query {collection: <id>}` filters by either kind. Collections cover one workspace; they don't span workspaces.
+- **CORE-156** [M1] (contract) **Status log.** Each asset manifest keeps `status_log`, its newest 50 status changes as `{from, to, by, utc}`, where `by` is as in `signed_off.by` (Appendix E), or `core` for a change the core makes itself (such as `stale`). Every status change (CORE-048) appends to it in the same manifest edit, and beyond 50 the oldest entry drops out. The Inspector shows it as a timeline (APP-145).
+- **CORE-168** [M1] **Duplicate files.** The index keeps an SQL index on the files' SHA-256. `assets.query {duplicates: true}` returns the assets holding a file whose bytes another asset also holds. `asset.import` warns when an imported file has the same bytes as a file already in the workspace, naming it (for example "same bytes as `chr_knight@1.2.0`"); the warning never blocks the import.
 
 ### 2.4 Pipeline, projects and settings
 
-- **CORE-048** [M1] (contract) **Status machine:** `planned → in_progress → candidate → in_review → approved → exported → released`, with side states `stale`, `blocked` (a reason is required) and `deprecated`. `status_before_stale` is kept so a restore can return to it.
+- **CORE-048** [M1] (contract) **Status machine:** `planned → in_progress → candidate → in_review → approved → exported → released`, with side states `stale`, `blocked` (a reason is required) and `deprecated`. `status_before_stale` is kept so a restore can return to it. (owner decision 2026-10-20) Every change is recorded in the asset's status log (CORE-156).
 - **CORE-049** [M1] (contract) Assets with a working document carry a `has_working_doc` flag. Opening, editing or saving a document never changes the asset's status. The only save that changes status is one with `auto_candidate_on_save` (a project option, off by default), and it does so by creating a candidate run.
 - **CORE-050** [M1] A new document's first Save creates its asset with status `in_progress`.
 - **CORE-051** [M1] (decision) **Sign-off isn't gated.** It can be done by you in any app, by the assistant or Claude Code when you ask them to, or automatically for asset types listed in `auto_approve` once QA passes. It is recorded with `approved_by`. Versions are immutable, so nothing is lost. (plan 2b clarification: Appendix E) `approved_by` is the sign-off run's `signed_off.by` field of the workspace format.
-- **CORE-052** [M1] Automatic sign-off picks the candidate with the best vision-review score if a vision review ran; otherwise, among candidates passing every technical gate, the lowest seed.
+- **CORE-052** [M1] Automatic sign-off picks the candidate with the best vision-review score if a vision review ran; otherwise, among candidates passing every technical gate, the lowest seed. (owner decision 2026-10-20) The pick records why: each candidate's gate results, and the vision score with the review's reason, or "lowest seed" when no review ran. Review shows them (APP-112), and one click signs off a different candidate instead, as the next version; that sign-off is recorded as an override of the automatic pick.
 - **CORE-053** [M1] `asset.request_signoff` is a "flag this for me" marker: it sets the status to `in_review`.
 - **CORE-054** [M1] **Stage profiles:** `skip_stages` can skip stages, except check and record, which carry QA and the recipe.
 - **CORE-055** [M1] **Projects:** `project.create`, `project.set_status` (pause or archive; a staleness check runs on restore), `project.status`, `project.context`.
@@ -526,6 +555,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - **CPU and RAM** via `sysinfo` 0.39: total and per-core load, memory, and per-process CPU and RAM for tracked engine processes only.
   - **Network throughput** per adapter via `sysinfo`.
   - **Disk:** free space per volume; workspace and model-folder sizes.
+  - (owner decision 2026-10-20) **Shared GPU memory and GPU engines:** the GPU's dedicated and shared memory in use, and utilisation per GPU engine (3D, copy, video, compute), with the busiest engine as the headline utilisation, as Task Manager shows them. They come from Windows PDH GPU counters if plan 4b confirms that those counters report them without admin rights; otherwise these figures are left out.
 - **CORE-060** [M1] CPU temperature is not sampled: Windows doesn't expose it without admin rights or a kernel driver.
 - **CORE-061** [M1] (contract) **Sampling rates:** 1 Hz for NVML, Energy Meter and CPU/RAM; per-process VRAM at 1 Hz while jobs run, otherwise every 5 s; disk sizes every 5 minutes.
 - **CORE-062** [M1] (contract) **Retention in `telemetry.db`:** 1-second samples for 24 h, 1-minute rows for 30 days, hourly rows forever. Downsampled rows keep min, average and max plus summed energy, so energy totals stay exact.
@@ -560,7 +590,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 - **CORE-072** [M1] (contract) Streaming usage arrives at the end of the stream: OpenRouter's last chunk includes `usage.cost`; Anthropic's `message_delta` carries cumulative output usage; OpenAI needs `stream_options.include_usage`. On cancel or disconnect the record uses what was seen and is flagged `estimated`. (verified 2026-10-12)
 - **CORE-073** [M1] Billed refusals (Anthropic bills refusals in some categories) are metered like any other call.
 - **CORE-074** [M1] (contract) **Cost sources, in order of preference:**
-  1. reported in the response (`provider_reported`): OpenRouter `usage.cost`, xAI `cost_in_usd_ticks` (1e10 ticks = $1), NanoGPT media `cost`, Kling `billing[]`;
+  1. reported in the response (`provider_reported`): OpenRouter `usage.cost`, xAI `cost_in_usd_ticks` (1e10 ticks = $1), NanoGPT media `cost`, Kling `billing[]`, and (owner decision 2026-10-20) the credits ComfyUI reports for a partner-node run (CORE-093);
   2. looked up after the call (`reconciled`): OpenRouter `/api/v1/generation?id=`, NanoGPT `/api/v1/usage/requests/{X-Request-ID}` (within 24 h), fal `/v1/models/billing-events?request_id=` (billing-scoped key);
   3. computed as usage × price table (`computed_from_usage`).
 - **CORE-075** [M1] **Reconciliation:** a daily job back-fills actual costs for `estimated` records where the provider allows it, and compares tracked spend with what providers report.
@@ -596,7 +626,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - Callers that declare themselves non-interactive (`lil --non-interactive`, scheduled tasks) get the error `cap.exceeded` instead (§6), as does any other call when no confirmation can be answered — except director tasks, which always get `pending_confirmation` and wait in `waiting_confirmation` (CORE-114).
   - (plan 3 clarification: Appendix F) The retry token is the call's idempotency key. A retry with that key re-evaluates the stored `pending_confirmation`: approved runs the call (once), denied returns `confirm.denied`, expired returns `confirm.expired` (both release the key), and still pending returns the same `pending_confirmation`.
 - **CORE-092** [M1] Caps are enforced on each machine. Spend synced from other machines is shown for information only; provider-side limits are the real cross-machine stop.
-- **CORE-093** [M1] (contract) **ComfyUI partner (paid API) nodes** are detected from the workflow graph. Their cost comes from a price table and is always flagged `estimated` (Comfy reports costs only after execution and has no balance API). Paid jobs submitted to ComfyUI from outside the suite are recorded as unattributed spend.
+- **CORE-093** [M1] (contract) **ComfyUI partner (paid API) nodes** are detected from the workflow graph. Their cost comes from a price table and is always flagged `estimated` (Comfy reports costs only after execution and has no balance API). Paid jobs submitted to ComfyUI from outside the suite are recorded as unattributed spend. (owner decision 2026-10-20) The pre-run estimate keeps the hand-maintained price table; the suite doesn't evaluate ComfyUI's per-node price expressions. After a run, when ComfyUI reports the credits the run used, the record settles at that figure with `cost_source: provider_reported`, converted at a dated credits-per-USD entry in `prices.yaml`; otherwise it stays `estimated`. Where the suite can read that figure is settled by plan 6b.
 - **CORE-094** [M1] (invariant) The Comfy account key is injected into the single request that needs it, never into ComfyUI's environment or configuration.
 - **CORE-095** [M1] (contract) Provider errors that mean "your provider-side limit is reached" (for example Anthropic `enforced_spend_limit_reached`, Gemini `RESOURCE_EXHAUSTED` from spend limits, "balance exhausted") are non-retryable and shown as such (`provider.spend_limit`).
 
@@ -623,6 +653,8 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 | Kling, Tripo, Meshy, Rodin | balances | Later |
 | Gemini, Xiaomi MiMo, Z.ai, MiniMax, Replicate, Hugging Face personal accounts, Comfy | none — tracked spend only | — |
 
+  (owner decision 2026-10-20) Comfy may later get an optional balance read: an outbound call, off by default and a separate opt-in (ARCH-122), offered only if plan 6b finds that Comfy's balance endpoint accepts the account's API key.
+
 - **CORE-099** [M1] Provider-side limits (OpenRouter key limits and budgets, the Anthropic Console spend limit, Gemini project caps) are shown, and the dashboard recommends setting them: they're the only hard stops for spend made outside the suite.
 - **CORE-100** [M1] (invariant) Admin and management keys are separate, optional Credential Manager entries, labelled as powerful, and never used for model calls.
 - **CORE-101** [M1] (decision) Providers in use: Anthropic API, OpenRouter, NanoGPT, OpenAI, Google, fal and others, plus the major Chinese flagship providers (DeepSeek, Alibaba/Qwen, Moonshot/Kimi, Z.ai/GLM, MiniMax, ByteDance/Seed via OpenRouter or fal, Tencent, Xiaomi MiMo, StepFun). Usage tracking covers every provider from M1 through the provider layer (§4).
@@ -643,7 +675,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - `exec`: install nodes or packages, run scripts or arbitrary code, download executable formats (pickled `.ckpt`/`.pt`/`.bin`, custom-node packs, wheels).
   - Plain `write`: downloading `.safetensors` or `.gguf` files; the scheduler's own engine start and idle-down; document edits by agents, including layer deletion and discarding proposals, which are undoable inside the document (§5.10).
   - (plan 3 clarification: Appendix F) Effect classes are static. `engines.start` is `write` (the scheduler's own start); `engines.stop` and `engines.restart` are always `destructive`, because they can kill outside jobs; `engines.comfyui.install_node` is `exec`.
-- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (every engine and surface, §4.6), Claude Code via MCP, and scripts via `lil` — are asked to confirm, and only for `destructive` and `exec` tools, plus the egress confirmations for assistant sessions (AI-219, M1b). Your own actions in the apps never ask. A model's tool calls are never your own actions: they always run under a core-built agent session, never an app's `ui:*` session (AI-215; plan-3 ruling P3-R9).
+- **CORE-109** [M1] (decision) Only agent callers — the built-in assistant (every engine and surface, §4.6), Claude Code via MCP, and scripts via `lil` — are asked to confirm, and only for `destructive` and `exec` tools, plus the egress confirmations for assistant sessions (AI-219, M1b) and (owner decision 2026-10-20) a prompt expansion of more than 64 prompts (IMG-162, M1b). Your own actions in the apps never ask. A model's tool calls are never your own actions: they always run under a core-built agent session, never an app's `ui:*` session (AI-215; plan-3 ruling P3-R9).
 - **CORE-110** [M1] (invariant) Deletes are always soft (to `.trash/`), whoever makes them.
 - **CORE-111** [M1] (invariant) A caller-supplied `confirm: true` is never accepted. A confirmation is answered only by a verified `ui:*` connection after a real input event in the shared dialog, or by Claude Code's own prompt (below). Every answer records how it was given (`confirmed_via: app | claude_code`).
 - **CORE-112** [M1] (contract) The core decides per connection whether a tool carries `_meta["anthropic/requiresUserInteraction"]`:
@@ -677,7 +709,16 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 - **CORE-123** [M1] (contract) **Suite-held queue:** the suite keeps its own queue and keeps **at most one prompt per lane pending in ComfyUI**, submitting the next when the running one finishes. ComfyUI's own queue can't be reordered usefully (its "front" option is last-in-first-out among front items, and nothing pre-empts a running prompt).
 - **CORE-124** [M1] (contract) **Priority classes:** interactive operations (select object, preprocessors, Prompt Studio previews, AI-181) > your generations > agent and director batches. Within a class, first in, first out; batches may be grouped by model profile within their class, with a limit so nothing waits forever. Interactive operations still wait for the prompt already running, and the status bar says so.
   - From plan 7a, `llm.generate` (AI-204) ranks below every other class, whenever it was submitted, and a render pre-empts a running one (AI-228). The "nothing waits forever" limit doesn't apply to it.
+  - (owner decision 2026-10-20) The live class and the queue controls are in CORE-160.
 - **CORE-125** [M1] An optional setting cancels and resubmits a running **agent batch** prompt when an interactive operation arrives. It never does this to your own jobs.
+- **CORE-160** [M1] (contract) **Queue order and queue control** (owner decision 2026-10-20). One rule for the image queue, refining CORE-124 and IMG-092:
+  - **Class order:** interactive (select object, preprocessors, Prompt Studio previews, the Remove brush, IMG-165) > your generations > live (IMG-161: at most one pending, a newer request replaces it, and it never pre-empts your work) > agent and director batches. From plan 7a, `llm.generate` stays below every class (CORE-124).
+  - **Batches:** the jobs one call submits share a `batch_id`, and each records its `index` in the batch.
+  - `job.move {job_id, to: "next" | "last"}` (`write`) moves a queued job to the front or the back of its own class. It never moves a job ahead of a higher class and never stops the running prompt.
+  - `job.cancel` also takes `{ids}`, `{batch_id}` or `{all_mine: true}` (every unfinished job submitted under the caller's own caller kind; for a `ui:*` caller, your jobs).
+  - **Pause GPU work:** `app/queue.pause {lane?}` and `app/queue.resume {lane?}` (verified `ui:*` only, so only you can pause; the lane defaults to `gpu-heavy`) hold every queued job in the lane, yours, agents' and director tasks' alike, as substatus `queue_paused` (→ `queued`). The running prompt is never interrupted.
+  - **Fullscreen auto-pause** is a setting, off by default. When it is on, the pause applies while Windows reports a fullscreen app or presentation mode through `SHQueryUserNotificationState`, which the core polls because Windows sends no event. It never inspects the process list.
+  - **Generate modes:** a generation queues at the back of its class (the default), `next` (the front of its class), or `replace` (it cancels your own queued, not yet running jobs from the same panel and takes their place).
 - **CORE-126** [M1] **GPU scheduler:** checks free VRAM via `telemetry`; an engine's own resident VRAM counts as available to that engine; the watchdog starts at `execution_start`. From plan 7a it also checks RAM before a local model loads, and the job waits as `waiting_for_ram` when the check fails (ARCH-071).
 - **CORE-127** [M1.5] Local LLM engines (`llama-server` owned, Ollama attached) are scheduled around image jobs for VRAM and metered as local work ($0, GPU time and energy). ORACLE's chat-only use arrives earlier, in M1b, on the same scheduler (AI-204, AI-205). From plan 7a (M1b), each local run records its placement, its tokens per second and its peak VRAM and RAM (AI-227).
 - **CORE-128** [M1] (contract) **Retries:**
@@ -698,7 +739,9 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
   - environment capture: `/system_stats`, the NVML driver version, git/pyproject of ComfyUI and each custom node, and model hashes (cached by path + size + mtime + FileId);
   - the model inventory matched to the registry by hash; operation capability states (§5.6) are computed from this inventory.
   - (plan 3 clarification: Appendix F) The `clientId` is one per channel, kept in the suite `state.db`. Every `SaveImage`-type node's `filename_prefix` is `lil_<first 16 hex of the job id>_`. Inputs are uploaded as `lil_<first 16 hex of sha256>.<ext>` and removed from `<root>\input` 24 h after their reference count reaches 0.
+  - (owner decision 2026-10-20) Engine environments are recorded, never restored by the suite. `lil doctor` compares the running ComfyUI and its custom nodes with the last capture and, when they changed, says what changed and how to roll back with ComfyUI's own tools. A suite-driven restore is CORE-166 (Later).
 - **CORE-131** [M1] Model downloads are core jobs with a disk-space check. Custom-node pack installs are `exec` and need a ComfyUI restart, with a warning about running jobs.
+- **CORE-166** [Later] (contract) **Engine snapshot restore** (owner decision 2026-10-20: not before Later). The suite lists the recorded engine environments (CORE-130) and restores one through ComfyUI's own tools (ComfyUI-Manager snapshots, comfy-cli's version switch). A restore is `exec`, and the suite asks you before each one, whoever starts it.
 
 ### 2.9 QA and repair
 
@@ -711,11 +754,11 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 ### 2.10 Convert
 
 - **CORE-137** [M1] (decision) The LILITH document (folder or `.lildoc`, §3.5) is the native layered format. OpenRaster (`.ora`) is import (best effort) and export (lossy, with a warning listing what is lost) only.
-- **CORE-138** [M1a] PNG, JPEG and WebP (lossless via `image`, lossy via libwebp), with ICC handling via `moxcms`.
-- **CORE-139** [M1b] TIFF (8- and 16-bit) and OpenRaster import/export (hand-rolled on `zip`).
-- **CORE-140** [Later] EXR (`exr`), PSD import out of process (`psd-tools` in the QA venv), KRA, glTF/USD/FBX, WAV/FLAC/OGG.
+- **CORE-138** [M1a] PNG, JPEG and WebP (lossless via `image`, lossy via libwebp), with ICC handling via `moxcms`. (owner decision 2026-10-20) Imported images follow the colour policy of IMG-169.
+- **CORE-139** [M1b] TIFF (8- and 16-bit) and OpenRaster import/export (hand-rolled on `zip`). (owner decision 2026-10-20) Also layered PSD export (IMG-137), for handing work to Krita or Photopea; ORA stays.
+- **CORE-140** [Later] EXR (`exr`), PSD import out of process (`psd-tools` in the QA venv), KRA, glTF/USD/FBX, WAV/FLAC/OGG. (owner decision 2026-10-20) PSD export moves to M1b (CORE-139); PSD import stays here. HEIC and AVIF decoders are added here too, behind the untrusted-decoder isolation (CORE-141).
 - **CORE-141** [M1] (invariant) Decoders for untrusted files run with size limits and panic isolation, or out of process.
-- **CORE-142** [M1] ComfyUI's PNGs embed the prompt and workflow in text chunks; export offers to keep or strip them.
+- **CORE-142** [M1] ComfyUI's PNGs embed the prompt and workflow in text chunks; export offers to keep or strip them. (owner decision 2026-10-20) Export also strips GPS position and camera serial numbers by default; you opt in to keep camera data (IMG-136).
 
 ### 2.11 Tools
 
@@ -732,20 +775,26 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 | `image.select_object` | write | M1a | SAM through ComfyUI |
 | `image.preprocess` | write | M1a | control-layer preprocessors |
 | `image.cutout` | write | M1a | BiRefNet: remove background; select subject / select background return a selection instead of a cut-out layer (§5.5) |
+| `image.remove` | write | M1a | the Remove brush, an interactive job (IMG-165, CORE-160) |
 | `image.edit` | write | M1b | instruction edit (Qwen-Image, FLUX.2 klein) |
 | `image.upscale` | write | M1b | upscale image, enhance layer, upscale document; Real-ESRGAN, SeedVR2 (§5.5) |
 | `image.workflow.run` | write | M1b | runs a saved, sent or layer workflow (any graph); labelled a full regeneration (§5.5, §5.7) |
 | `doc.layer.*` (add, properties, reorder, merge, delete), `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.references.*`, `doc.proposals.accept`, `doc.proposals.discard`, `doc.export`, `doc.make_candidate` | write | M1a | applied to the open document as one undoable step (agent calls are forwarded to the app holding it, §3.5), or by the core on closed documents under its own hold |
 | `doc.get_snapshot`, `doc.list_open`, `doc.proposals.list` | read | M1a | |
 | `asset.signoff`, `asset.request_signoff`, `asset.pin_input`, `asset.transfer`, `asset.import` | write | M1 | `asset.import` copies or links external |
-| `assets.query`, `asset.get` | read | M1 | |
+| `assets.query`, `asset.get` | read | M1 | `assets.query` filters, facets and duplicates: CORE-152, CORE-155, CORE-168 |
+| `asset.mark`, `asset.rename`, `asset.move`, `asset.make_independent` | write | M1 | marks (CORE-152); rename and move with a redirect (CORE-153, ARCH-125); independent copy (CORE-154) |
+| `collections.list` | read | M1 | saved searches and collections (CORE-155) |
+| `collection.save` | write | M1 | |
+| `collection.delete` | destructive | M1 | soft delete (CORE-155) |
 | `project.create`, `project.set_status` | write | M1 | |
 | `project.status`, `project.context` | read | M1 | |
 | `resource.save` | write | M1 | |
 | `resource.list`, `resource.get` | read | M1 | |
 | `resource.delete` | destructive | M1 | soft delete |
 | `qa.run`, `convert.export` | write | M1 | |
-| `job.cancel`, `job.retry`, `diagnostics.bundle` | write | M1 | |
+| `job.cancel`, `job.retry`, `diagnostics.bundle` | write | M1 | `job.cancel` by ids, batch or all of the caller's (CORE-160) |
+| `job.move` | write | M1 | next or last within the job's class (CORE-160) |
 | `jobs.list`, `job.wait`, `engines.status` | read | M1 | `job.wait` waits ≤ ~90 s per call (§4) |
 | `engines.start` | write | M1 | |
 | `engines.stop`, `engines.restart` | destructive | M1 | can kill outside jobs; refused for an attached engine |
@@ -773,9 +822,9 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 
 ### 2.13 Milestone scope
 
-- **M1:** every module in §2.1 except `imports` and multi-machine `sync`, with: the dispatcher; assets, candidates, sign-off, trash and proposals; content hashes in references; cap reservations in the suite-level `state.db`; creation UUIDs on every asset; the status machine and settings cascade; telemetry with per-job energy; usage records for every provider, cost sources, M1 price rules and the reprice job; optional caps; fixed recurring costs; account sync for Anthropic (headers), OpenRouter, NanoGPT and Claude Code plan usage per profile; agent safety confirmations; the suite-held ComfyUI queue; QA and repair; the converters and tools tagged M1, M1a or M1b in §2.10–§2.11 (M1a/M1b follow §5's split).
+- **M1:** every module in §2.1 except `imports` and multi-machine `sync`, with: the dispatcher; assets, candidates, sign-off, trash and proposals; content hashes in references; cap reservations in the suite-level `state.db`; creation UUIDs on every asset; the status machine and settings cascade; telemetry with per-job energy; usage records for every provider, cost sources, M1 price rules and the reprice job; optional caps; fixed recurring costs; account sync for Anthropic (headers), OpenRouter, NanoGPT and Claude Code plan usage per profile; agent safety confirmations; the suite-held ComfyUI queue with its class order, batches, run next/last and Pause GPU work (CORE-160); QA and repair; organising marks, saved searches and collections, the status log, rename and move with redirects, moved and copied folder repair, and the duplicate finder (CORE-152–156, CORE-168, ARCH-125); the converters and tools tagged M1, M1a or M1b in §2.10–§2.11 (M1a/M1b follow §5's split).
 - **M1.5:** the `network` lane and hosted media jobs (fal account sync with them); local LLM engines beyond ORACLE's chat-only use (which is M1b, AI-204); the loopback OpenTelemetry receiver for interactive Claude Code sessions; document checkpoints (cloud store `docs/` prefix); large-file store changes involving a cloud store; destinations other than the local drive and OneDrive; multi-machine sync with UUID-based collision renames and resolution through `renamed_from`.
-- **Later:** leases; `project.clone`, `project.delete`, `portfolio.status`; `imports`; `lib:` links and promote; further price-rule kinds; account sync for further providers and admin-key reports; the later converters.
+- **Later:** leases; `project.clone`, `project.delete`, `portfolio.status`; `imports`; `lib:` links and promote; further price-rule kinds; account sync for further providers and admin-key reports; the later converters; engine snapshot restore (CORE-166).
 
 ---
 
@@ -787,11 +836,11 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 
 ### 3.1 What every app is made of
 
-- **APP-001** [M1] (decision) **One app = one process, one QML engine, one or more windows.** Windows use KDDockWidgets 2.4.1 (Qt Quick) for dockable, floatable and tabbable panels, themed through its ViewFactory QML (verified 2026-10-12).
+- **APP-001** [M1] (decision) **One app = one process, one QML engine, one or more windows.** Windows use KDDockWidgets 2.4.1 (Qt Quick) for dockable, floatable and tabbable panels, themed through its ViewFactory QML (verified 2026-10-12). (owner decision 2026-10-20) 2.5.0 if its build check passes (APP-005).
 - **APP-002** [M1] (contract) **Layout preset format:** an app-level JSON file holding the list of main windows (unique name, normal geometry, screen name and scale) plus the KDDockWidgets layout blob.
 - **APP-003** [M1] (invariant) **Layout restore order:** create the windows → register the dock factory → restore → clamp every window to the current screen's available area. The clamp works around known mixed-DPI and maximized-restore bugs.
 - **APP-004** [M1] M1 keeps the "Default" layout plus the last state. Named layout presets arrive in M1.5.
-- **APP-005** [Later] Upgrade to KDDockWidgets 2.5 (per-window save, Qt Quick dark mode) when it ships.
+- **APP-005** [M1] (decision) Upgrade to KDDockWidgets 2.5 (per-window save, Qt Quick dark mode) when it ships. (owner decision 2026-10-20: was [Later]; 2.5.0 has shipped, so the trigger has fired.) **KDDockWidgets 2.5.0** replaces 2.4.1 if a half-day build check early in plan 4a passes: the shim, the dock factory and layout save and restore (APP-002, APP-003) build and run against Qt 6.12.0. Whether 2.5.0 supports Qt 6.12.0 is unverified until that check. If it fails, the suite stays on 2.4.1.
 
 **Shared shell** (`lil-ui-kit`), identical in every app:
 
@@ -803,8 +852,13 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
   - "Open from LILITH": search, type filter, version or candidate, and "Loose file…" which opens the native file dialog;
   - "Place / use as input": linked or embedded;
   - "Save to project": project (default `sketchbook`), asset name and type.
-- **APP-011** [M1] **One shortcut map** for the whole suite. App-specific hotkeys (§5.1) are checked against it for conflicts.
+- **APP-011** [M1] **One shortcut map** for the whole suite. App-specific hotkeys (§5.1) are checked against it for conflicts. (owner decision 2026-10-20) The map is scoped by the focused panel (APP-143).
+- **APP-143** [M1] (contract) **Scoped shortcuts** (owner decision 2026-10-20). The shortcut map has global keys plus one scope per kind of panel, and the focused panel picks the scope, so a letter can mean different things in different panels:
+  - **browser and Review scope:** G grid, E loupe, C compare (APP-141), N survey (APP-142), Space quick look; P pick, X reject, U unflag, with Shift+P and Shift+X setting the flag and moving to the next item; 1–5 rate and 0 clears; 6–9 set the labels red, yellow, green and blue; B adds to or removes from the quick collection (CORE-155);
+  - **canvas scope:** IMG-008's keys, with Q kept for a quick-mask mode;
+  - the conflict check covers each scope together with the global keys.
 - **APP-012** [M1] **Theme:** dark, built from design tokens. A light theme comes later.
+- **APP-156** [M1] **Accessibility, minimal** (owner decision 2026-10-20). Every `lil-ui-kit` control has an accessible role and name, and can be reached and used from the keyboard. Custom delegates (grid tiles, gauges, in-app notification cards) set their role and name themselves. A Narrator smoke check is on each milestone's manual check list (QA-064). There is no formal accessibility audit. Whether Narrator reads KDDockWidgets' title bars and tabs is unverified; plan 4a's first smoke check records it, and any gap goes to the owner.
 
 **Single instance and standalone launch**
 
@@ -818,9 +872,20 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 - **APP-017** [M1a] **Per-user file associations** and "Open with LILITH Image" for PNG, JPEG, WebP and `.lildoc`, registered under `HKCU\Software\Classes` (no admin). The suite never sets itself as the default; you choose defaults yourself.
 - **APP-018** [M1b] TIFF and ORA join the file associations when their import and export land (§2.10, §5.11); before that the suite registers no association for a format it can't read.
 - **APP-019** [M1] A file opened from Explorer that lives inside a workspace opens as that asset. Sealed files open read-only, with "Edit → new working document".
-- **APP-020** [M1] (contract) **`lil:` URL protocol:** `lil:open/<ref>`, `lil:confirm/<id>` and `lil:task/<job_id>` (opens a director task in the Assistant panel, APP-050). Arguments are validated as untrusted input. It's used for notification clicks and for links in browsers and Markdown.
+- **APP-020** [M1] (contract) **`lil:` URL protocol:** `lil:open/<ref>`, `lil:confirm/<id>` and `lil:task/<job_id>` (opens a director task in the Assistant panel, APP-050). Arguments are validated as untrusted input. It's used for notification clicks and for links in browsers and Markdown. (owner decision 2026-10-20) Asset refs (`lil://…`, ARCH-042) share the scheme, so a browser that opens one launches the same handler. The handler classifies every argument explicitly as `lil:open/<ref>`, `lil:confirm/<id>`, `lil:task/<job_id>` or a `lil://` asset ref, which it opens as `lil:open/<ref>` would. Anything else is refused with a message, never guessed. An activation never performs an irreversible action by itself (APP-022).
 - **APP-021** [M1] **`.lilref` pointer files:** links printed in Claude Code output point to a small `.lilref` file (associated with the suite) in the cache, because Windows Terminal only opens `http`, `https` and `file` links (verified 2026-10-12).
 - **APP-022** [M1] **Notifications:** the suite has a Start-menu identity (AppUserModelID) used for Windows notifications. The core posts notifications through it: job finished, confirmation waiting, cap confirmation waiting, cap alerts, and director-task decisions (APP-050). A notification is drawn by Windows, not by the core, and clicking it is your own input, so the app it launches comes to the front.
+  - (owner decision 2026-10-20) **Mechanism:** classic WinRT toasts (`ToastNotificationManager`) from the unpackaged suite, with no Windows App SDK runtime and no COM activator.
+  - A per-user Start-menu shortcut carries the channel's AUMID (`System.AppUserModel.ID`, QA-038), because Windows shows no toast from an unpackaged sender without one. `lil doctor` checks the shortcut and, after you type `y`, creates or repairs it.
+  - A click on the toast or one of its buttons activates by protocol (`activationType="protocol"`) into a `lil:` URL, such as `lil:confirm/<id>`.
+  - A URI activation carries no caller identity, so it never performs an irreversible action by itself: it opens a window where a real input event decides (APP-044).
+  - Progress toasts update in place by Tag and Group, and are replaced when the job ends (APP-146).
+  - Plan 4a's notification spike confirms that the core, a windowless process, can post under the shortcut's AUMID, and that the `windows` crate exposes the toast API. If either fails, the result goes to the owner before plan 4a continues.
+  - Categories, defaults, progress toasts and the fullscreen quiet mode: APP-146.
+- **APP-146** [M1] **Notification behaviour** (owner decision 2026-10-20):
+  - **Categories,** each with its own toggle: job finished, job failed, confirmation waiting (agent safety and cap), cap alerts, director-task decisions, and job progress. Defaults: progress off, every other category on.
+  - **Progress toasts** (when on): one per job expected to run longer than about 30 s while no suite window is in front, updated at most once a second. Windows never pops an update and drops one sent after the toast was dismissed, so the toast is replaced when the job ends, and the end still pops.
+  - **Quiet while fullscreen** (on by default): while `SHQueryUserNotificationState` reports a fullscreen app, a busy state or presentation mode, toasts go to the notification centre silently, never dropped. Windows sends no event when this changes, so the core polls it; it never inspects the process list. Confirmations are made silent like the rest, never suppressed.
 - **APP-023** [Later] Jump Lists; Explorer thumbnails for `.lildoc` (a small Rust COM thumbnail provider, out of process); an Explorer "Add to LILITH project" context-menu entry.
 
 ### 3.2 How an app talks to the core
@@ -852,11 +917,11 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 **Images**
 
 - **APP-037** [M1] (invariant) **Images never travel over the pipe.** Models carry file paths; QML loads images asynchronously.
-- **APP-038** [M1] **Thumbnails** come from the core's thumbnail cache in the per-workspace local data folder (`%LOCALAPPDATA%\LILITH\workspaces\<hash>\thumbs\`, or `<volume>:\.lilith-local\<hash>\thumbs\` when the workspace is on a different volume from `%LOCALAPPDATA%`, §1, §7.2) at the exact display size × screen scale (two sizes on mixed-DPI setups), because only JPEG decodes cheaply at reduced size. Grids reuse delegates and load asynchronously.
+- **APP-038** [M1] **Thumbnails** come from the core's thumbnail cache in the per-workspace local data folder (`%LOCALAPPDATA%\LILITH\workspaces\<hash>\thumbs\`, or `<volume>:\.lilith-local\<hash>\thumbs\` when the workspace is on a different volume from `%LOCALAPPDATA%`, §1, §7.2) at the exact display size × screen scale (two sizes on mixed-DPI setups), because only JPEG decodes cheaply at reduced size. Grids reuse delegates and load asynchronously. (owner decision 2026-10-20; replaces "at the exact display size × screen scale") The cache is keyed by the image's content SHA-256, not its path, so a rename or move (CORE-153) costs nothing, and clean-up removes the entries whose hash the index no longer holds. Thumbnails come in fixed tiers of 96, 160, 256, 384 and 512 px × screen scale, and the GPU scales between tiers. Above 512 px, a Speed / Quality setting chooses between scaling the 512 tier and rendering a larger image on demand.
 
 ### 3.3 The app interface
 
-- **APP-039** [M1] (invariant) **`app/*` contains only what's specific to a running app:** session, subscriptions, document hold/save, activation and open requests, confirmation answers and `caps.set`. Everything else is a normal `tools/*` call made with caller kind `ui:<app>`, so anything an app can do, an agent can do too (§1.1).
+- **APP-039** [M1] (invariant) **`app/*` contains only what's specific to a running app:** session, subscriptions, document hold/save, activation and open requests, confirmation answers and `caps.set`, and (owner decision 2026-10-20) Pause GPU work (`app/queue.pause`, `app/queue.resume`, CORE-160). Everything else is a normal `tools/*` call made with caller kind `ui:<app>`, so anything an app can do, an agent can do too (§1.1).
 - **APP-040** [M1] (invariant) `app/*` accepts only verified `ui:*` connections, plus a read-only subset for `cli` callers (`lil`) and tests. The handshake `core/hello` is not an `app/*` method; every caller kind calls it (§1.2).
 - **APP-041** [M1] `app/*` methods run the dispatcher's resolve and validate stages (§2.2).
 - **APP-042** [M1] (invariant) Document saves (`app/doc.commit`) record only index edges and events: no manifest or `progress.md` writes and no status change. The project's `links` change only when the set of inputs changes.
@@ -866,10 +931,10 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 |---|---|---|---|
 | Session | `app/set_context` (the handshake before it is `core/hello`, §1.2) | — | `session` |
 | Subscriptions | `lil/subscribe`, `lil/unsubscribe` (events arrive as `lil/event`, §1.2) | — | — |
-| Assets | `app/thumbs.request` | `assets.query`, `asset.get`, `asset.import` (copy or link-external), `convert.export`, `asset.signoff`, `asset.request_signoff` | `project:<slug>`, `asset:<ref>` |
+| Assets | `app/thumbs.request` | `assets.query`, `asset.get`, `asset.import` (copy or link-external), `convert.export`, `asset.signoff`, `asset.request_signoff`, `asset.mark`, `asset.rename`, `asset.move`, `asset.make_independent`, `collections.list`, `collection.save`, `collection.delete`, `trash.restore` | `project:<slug>`, `asset:<ref>` |
 | Documents | `app/doc.open`, `app/doc.stage`, `app/doc.commit`, `app/doc.recover`, `app/doc.close` | `doc.list_open`, `doc.get_snapshot`, `doc.make_candidate`, and the document tools of §5.10 (`doc.layer.*` such as `doc.layer.add`, `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.references.*`, `doc.proposals.*`, `doc.export`) | `doc:<id>` |
 | Resources | — | `resource.list`, `resource.get`, `resource.save`, `resource.delete` | `resources` |
-| Jobs | — | `jobs.list`, `job.cancel`, `job.retry` | `jobs`, `job:<id>`, `preview:<job>` |
+| Jobs | `app/queue.pause`, `app/queue.resume` (CORE-160) | `jobs.list`, `job.cancel`, `job.retry`, `job.move` | `jobs`, `job:<id>`, `preview:<job>` |
 | Confirmations (agent safety and cap) | `app/confirmations.list`, `app/confirmation.answer` | — | `confirmations` |
 | Usage, caps, accounts | `app/caps.set` | `usage.summary`, `caps.get`, `accounts.list`, `accounts.refresh` | `usage`, `caps`, `accounts` |
 | Local AI settings (from plan 7a) | `app/local_llm.set` (verified `ui:*` connection only, AI-228) | — | — |
@@ -960,7 +1025,7 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 **Libraries (shared resources)**
 
 - **APP-078** [M1] (contract) Libraries are typed resources usable in every app and by agents. Workspace resources live in `library/resources/<kind>/`; personal resources live in `%APPDATA%\LILITH\resources\` and are available in no-workspace mode. One shared Libraries panel; changes are published on the `resources` topic.
-- **APP-079** [M1a] Resource kinds in M1a: `swatch`, `palette`, `prompt_preset`, `style_preset` (prompt + LoRAs + settings for a compatible model-profile family, §5.6), `model_profile` (§5.6; personal by default, since models are machine-level, with workspace overrides), and `prompt_brief` (a promoted Prompt Studio brief, AI-183).
+- **APP-079** [M1a] Resource kinds in M1a: `swatch`, `palette`, `prompt_preset`, `style_preset` (prompt + LoRAs + settings for a compatible model-profile family, §5.6), `model_profile` (§5.6; personal by default, since models are machine-level, with workspace overrides), and `prompt_brief` (a promoted Prompt Studio brief, AI-183). (owner decision 2026-10-20) The `wildcard` kind follows in M1b (IMG-162).
 - **APP-080** [M1a] Resource kind `workflow`: a ComfyUI workflow with marked slots (§5.6, §5.7). It's saved from the ComfyUI tab (M1a) and opened by the Graph tab and workflow-on-layer (M1b).
 - **APP-081** [Later] Resource kinds `gradient`, `export_preset`, `brush` and `text_style` (the last two with the matching Image studio features, §5.11).
 - **APP-082** [M1] (invariant) `resource.delete` is soft (to trash) and is `destructive`, so it needs confirmation when an agent asks.
@@ -998,11 +1063,11 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 **Garbage collection**
 
 - **APP-093** [M1] (invariant) `store` runs a mark-and-sweep over a document's chunks while holding the document. Roots: the current `doc.json`, every snapshot's `doc.json`, open document save handles, and copies in progress. New chunks get a 24 h grace period.
-- **APP-094** [M1] (invariant) Proposal runs are not GC roots: accepting a proposal copies its pixels into new layer chunks. Sealed and candidate `source/` folders are independent copies and never part of a document's GC.
+- **APP-094** [M1] (invariant) Proposal runs are not GC roots: accepting a proposal copies its pixels into new layer chunks. Sealed and candidate `source/` folders are independent copies and never part of a document's GC. (owner decision 2026-10-20) A layer's proposal origin (IMG-083) keeps its run on disk longer (IMG-082), but it is not a GC root: the layer's pixels are its own chunks.
 
 **Proposals**
 
-- **APP-095** [M1] (invariant) **Proposal runs** live in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved and loose documents) and are separate from asset candidate runs: they create no asset versions, change no status and don't run the QA chain. They're kept until accepted or discarded, then for 14 days, and they move with a `.lildoc` on "Add to project". Anchoring, the staging bar and destinations are in §5.5.
+- **APP-095** [M1] (invariant) **Proposal runs** live in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved and loose documents) and are separate from asset candidate runs: they create no asset versions, change no status and don't run the QA chain. They're kept until accepted or discarded, then for 14 days, and they move with a `.lildoc` on "Add to project". Anchoring, the staging bar and destinations are in §5.5. (owner decision 2026-10-20) A run that a layer records as its origin is kept longer (IMG-082).
 
 **New and existing documents**
 
@@ -1032,16 +1097,25 @@ The core modules behind this section are `docs` (document bundles, `.lildoc`, ho
 
 - **APP-108** [M1] (invariant) `work/` is excluded from human-edit tracking; human-edit tracking applies to candidate and sealed files only.
 - **APP-109** [M1] If a document changes on disk while open, the app offers "reload" or "keep mine and save as a copy".
-- **APP-110** [Later] **"Edit in external app":** exports a flattened copy and opens it in your chosen program; when you save there, the watcher offers "bring back as a new layer" or "make candidate".
+- **APP-110** [Later] **"Edit in external app":** exports a flattened copy and opens it in your chosen program; when you save there, the watcher offers "bring back as a new layer" or "make candidate". (owner decision 2026-10-20) The external editors the suite plans for are Krita and Photopea. Layered work goes to them as PSD from M1b (IMG-137), and ORA stays.
 
 ### 3.6 Dashboards
 
 In M1 these are panels inside the Image studio; a separate Hub app hosts them later.
 
 - **APP-111** [M1] **Home** (minimal in M1): workspace and projects, recent assets and loose files, assets by status (candidate / in review / stale / blocked), open jobs.
-- **APP-112** [M1] **Review:** candidate grid, QA results, pick / reject / pin, choose the version bump, sign off. Version history in the Inspector.
-- **APP-113** [Later] Review's A/B compare with synced zoom; version compare and "restore as new version" in the Inspector.
+- **APP-112** [M1] **Review:** candidate grid, QA results, pick / reject / pin, choose the version bump, sign off. Version history in the Inspector. (owner decision 2026-10-20) Review also has Compare (APP-141) and Survey (APP-142), the scoped culling keys (APP-143), flags and ratings on candidates (CORE-152), and the reasons behind an automatic pick, with a one-click override (CORE-052).
+- **APP-113** [Later] Review's A/B compare with synced zoom; version compare and "restore as new version" in the Inspector. (owner decision 2026-10-20) Review's compare moves to M1 as APP-141; version compare and "restore as new version" stay Later.
+- **APP-141** [M1] **Compare** (owner decision 2026-10-20): two candidates or versions side by side, with linked zoom and pan (unlink to move one alone), swap, and "next candidate" into the second slot. The culling keys (APP-143) and sign-off work from it as from the grid.
+- **APP-142** [M1] **Survey** (owner decision 2026-10-20): up to 9 candidates at once. X flags the active one rejected and drops it from the view, until the ones you want are left. Sign-off works from it as from the grid.
+- **APP-145** [M1] **Inspector with several items selected** (owner decision 2026-10-20). Fields the selected items share show their value, and fields that differ show "‹mixed›". An edit made in the grid applies to every selected item; an edit made in Loupe, Compare or Survey applies to the active item only, and a scope chip says which. Every value shown is also a filter link for the Asset browser (APP-157). Field presets (Generation, File, QA, Usage) choose which fields show. The Inspector also shows the status log as a timeline (CORE-156) and Uses / Used by (APP-148).
+- **APP-147** [M1] **One tile per asset** in the Asset browser (owner decision 2026-10-20), with badges for status, approved version, candidate runs waiting for review, a working document, stale or blocked, and a linked outside file. A tile expands into a stack of its latest run's candidates.
+- **APP-148** [M1] **Uses / Used by** (owner decision 2026-10-20): the Inspector lists an asset's direct inputs and direct dependents (depth 1) from the index's graph edges, including working documents' `local` edges (APP-075). A graph view comes later.
+- **APP-157** [M1] **Asset browser filters** (owner decision 2026-10-20): a facet panel with live counts (CORE-152), in which values within one facet combine with OR and facets combine with AND; filters on tags, rating, label and flag; sort; saved searches and collections (CORE-155) as sources; and filters kept per source, so each project, collection or saved search keeps its own.
 - **APP-114** [M1] **Jobs:** queue with live previews and progress, ETA, GPU lane state (including waiting for VRAM and outside ComfyUI jobs), cancel/retry. Director tasks appear here as jobs with their substatus.
+  - (owner decision 2026-10-20) Each job also shows its phase (the running node or step, from its progress), elapsed and remaining time, and an "unresponsive" badge when it is running and has reported no progress for 30 s. The badge is a display flag only; the watchdog stays as ARCH-072. A batch's jobs are grouped under it (CORE-160).
+  - Filters (status, kind, who started it), and "Clear inactive", which hides finished jobs from the panel without deleting their records.
+  - Queue controls (CORE-160): run next or last, cancel a batch or all of yours, and Pause GPU work.
 - **APP-115** [M1] **Confirmations:** pending agent requests (who asked, the exact action, the files/packages/scripts involved), approve/deny, history; pending cap confirmations.
 
 **Usage & spend**
@@ -1060,12 +1134,12 @@ In M1 these are panels inside the Image studio; a separate Hub app hosts them la
 
 **Hardware**
 
-- **APP-127** [M1] **Live view:** GPU (utilisation, VRAM, temperature, power, clocks, fan, throttle reasons); "who's using the GPU" (per-process VRAM and utilisation); CPU (total, a per-core **load** strip, package power); RAM; disks (free space, workspace and model-folder sizes); network throughput.
+- **APP-127** [M1] **Live view:** GPU (utilisation, VRAM, temperature, power, clocks, fan, throttle reasons); "who's using the GPU" (per-process VRAM and utilisation); CPU (total, a per-core **load** strip, package power); RAM; disks (free space, workspace and model-folder sizes); network throughput. (owner decision 2026-10-20) GPU memory shows dedicated and shared use, and the headline GPU load is the busiest GPU engine's (CORE-059).
 - **APP-128** [M1] CPU temperature is not shown: it isn't available on Windows without admin rights or a kernel driver.
 - **APP-129** [M1] **History:** storage follows §2.5 (1 s for 24 h, 1 min for 30 days, hourly forever). The panel opens on a 15-minute live window and zooms out to 24 h.
 - **APP-130** [Later] 30-day charts.
 - **APP-131** [M1] **Energy** per job, session, day, month and year, with optional cost.
-- **APP-132** [M1] Thermal and throttling alerts.
+- **APP-132** [M1] Thermal and throttling alerts. (owner decision 2026-10-20) Also a "spilling to system RAM" alert while a job runs, when its engine's shared GPU memory rises above its idle level (ARCH-071's fit signal).
 
 **Backups and diagnostics**
 
@@ -1122,10 +1196,10 @@ These are verified in the M0 and M1 benchmarks and reported pass/fail in each mi
 ### 3.8 Milestone scope
 
 - **M0 spike:** frame times and GUI-thread stalls under ComfyUI load (APP-135); pasting into Discord and Chromium (APP-071).
-- **M1:** the shared shell and top bar; Home (minimal), Asset browser, Inspector with versions, Review (candidate grid, pick/reject/pin, bump, sign off), Libraries, Jobs, Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.lildoc`; "Add to project"; the `lil:` protocol (including `lil:task/<job_id>`), `.lilref` links and notifications; references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
-- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.lildoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export and the TIFF/ORA file associations land in M1b, as do the ORACLE window (`lil-oracle`) and the Assistant panel's labelled levels (§4.6b).
+- **M1:** the shared shell and top bar, on KDDockWidgets 2.5.0 if its build check passes; scoped shortcuts; minimal accessibility (role, name and keyboard reach, with a Narrator smoke check); Home (minimal), Asset browser (one tile per asset, facets and filters, saved searches and collections), Inspector with versions (multi-select, status log, Uses / Used by), Review (candidate grid, pick/reject/pin, bump, sign off, Compare and Survey, flags and ratings, explained automatic picks), Libraries, Jobs (phases, unresponsive badge, Clear inactive, queue controls), Confirmations (with history), Usage & spend (all providers tracked; account sync for Anthropic, OpenRouter, NanoGPT; Claude Code limits and Engine A usage per profile; billing bases kept apart; fixed recurring costs; per-currency totals with one display currency), Hardware (live + 24 h + per-job energy, shared GPU memory), Backups, Diagnostics; the three shared dialogs; clipboard and drag in/out; loose files and `.lildoc`; "Add to project"; the `lil:` protocol (including `lil:task/<job_id>` and the explicit `lil://` classification), `.lilref` links and notifications (classic toasts with category toggles and the fullscreen quiet mode); references carrying content hashes; automatic retry with the retry token after a confirmation; director-task decisions in the Assistant panel; `cap.exceeded` / `confirm.unavailable` errors for non-interactive callers; documents with staged saves, recovery and rolling snapshots; proposals stored with the document; Make candidate with sealed `source/`; agent `doc.*` on closed documents and forwarded to open ones; `ui.show`/`open_in` with the no-focus-steal rule; the ComfyUI web view.
+- **M1a / M1b** (per §5.11): per-user file associations for PNG, JPEG, WebP and `.lildoc`, the `swatch`, `palette`, `prompt_preset`, `style_preset`, `model_profile`, `workflow` and `prompt_brief` resource kinds, the ComfyUI web view, and the Prompt Studio tab, "Improve this prompt" pop-over, recall chips and staged cards (§3.6a) land in M1a; ORA import and export, the TIFF/ORA file associations and the `wildcard` resource kind land in M1b, as do the ORACLE window (`lil-oracle`) and the Assistant panel's labelled levels (§4.6b).
 - **M1.5:** named layout presets; document checkpoints and cross-machine restore (with the S3-compatible store); resolving references through `renamed_from`; the interactive Claude Code token panel.
-- **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; Review's A/B synced compare and version restore; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; a standalone Prompt Studio app; multi-app holds with external-tool leases; light theme; 30-day hardware charts; KDDockWidgets 2.5; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
+- **Later:** the separate Hub app; time-of-day pricing windows; command palette; Jump Lists; Explorer thumbnails and context menu; virtual-file drops; the `gradient`, `export_preset`, `brush` and `text_style` resource kinds; version compare and restore in the Inspector; "Edit in external app" and Krita/Blender/Godot bridges; cross-app send-to beyond the Image studio; a standalone Prompt Studio app; multi-app holds with external-tool leases; light theme; 30-day hardware charts; GitHub Actions minutes in Usage & spend. The protocol shapes for these are defined now.
 
 ---
 
@@ -2028,7 +2102,7 @@ The Image studio (`lil-image`, §1) is the suite's first app: an Invoke-style AI
 - **IMG-005** [M1a] Panels: the studio's own Generate, Layers, Layer properties, Tool options, Staging and History panels, plus the shared suite panels (§3.1, §3.6): Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend, Hardware, Assistant and Diagnostics. The Assistant panel arrives in M1b with the in-app assistant (§4.6). Diagnostics carries the event log and a backup status line, and in M1 it is where the Backups panel is reached (§3.6, §7.4); the separate Hub app is Later.
 - **IMG-006** [M1a] Layer properties is its own panel and is never placed under tool settings (a known Invoke pain point).
 - **IMG-007** [M1a] The status bar shows zoom, cursor position and colour, document size and profile, the active model profile, GPU/VRAM, and queue state such as "waiting for GPU: Qwen edit, ~40 s" or "loading models…".
-- **IMG-008** [M1a] (contract) Hotkeys come from the one suite-wide map, checked for conflicts with §3: B brush, E eraser, V move, C crop, L lasso, U rectangle, Space pan, `[` / `]` brush size, Ctrl+Enter generate, ← / → cycle staging, Enter accept, Shift+Enter keep as hidden layer, Del discard, Ctrl+J duplicate layer, Ctrl+E merge down, Ctrl+G group, Ctrl+Shift+N new raster layer, Shift+N fit frame to layers, Shift+B fit frame to masks.
+- **IMG-008** [M1a] (contract) Hotkeys come from the one suite-wide map, checked for conflicts with §3: B brush, E eraser, V move, C crop, L lasso, U rectangle, Space pan, `[` / `]` brush size, Ctrl+Enter generate, ← / → cycle staging, Enter accept, Shift+Enter keep as hidden layer, Del discard, Ctrl+J duplicate layer, Ctrl+E merge down, Ctrl+G group, Ctrl+Shift+N new raster layer, Shift+N fit frame to layers, Shift+B fit frame to masks. (owner decision 2026-10-20) These are the canvas scope of the scoped map (APP-143), with Q kept for a quick-mask mode.
 - **IMG-009** [M1a] (invariant) Hotkey precedence: an active transform or crop first, then a visible staging bar, then the current tool. So Enter commits a transform before it accepts a result, and Del deletes selected pixels unless the staging bar has focus.
 
 ### 5.2 The document model
@@ -2053,7 +2127,7 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
   - A brush dab rewrites one chunk (≤ 4 MiB raw, ~1 MB compressed). An 8K (7680×4320) layer is ~40 chunks instead of ~2,000 tile files.
 - **IMG-025** [M1a] (invariant) A chunk's content hash is computed over its **canonical uncompressed** bytes, so recompressing (or a zstd version change) never changes its identity.
 - **IMG-026** [M1a] (invariant) Chunk files are never modified in place; a changed chunk is a new file. Snapshots (§3.5) hardlink chunks, so this keeps snapshots intact and dedupes them at chunk level.
-- **IMG-027** [M1a] Layer and document commands: merge down, merge visible, flatten, duplicate, convert raster ↔ control, selection ↔ mask, save frame or layer as an asset, and recall prompt/seed/settings from any staged result or candidate.
+- **IMG-027** [M1a] Layer and document commands: merge down, merge visible, flatten, duplicate, convert raster ↔ control, selection ↔ mask, save frame or layer as an asset, and recall prompt/seed/settings from any staged result or candidate. (owner decision 2026-10-20) The image metadata the suite reads for recall is its own recipes and ComfyUI's embedded workflows; A1111 infotext and InvokeAI metadata are not imported in M1 (later, if ever).
 
 ### 5.3 Canvas engine
 
@@ -2080,8 +2154,9 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 
 - **IMG-041** [M1a] The RAM tile budget is ~50% of physical memory, with disk spill. (An 8K × 20-layer fully covered document is ~2.65 GB at 8-bit.) From plan 7a the canvas's current tile use, read as the studio app's working set from `telemetry`, counts in the local-LLM RAM admission (ARCH-071); the budget value is unchanged.
 - **IMG-042** [M1a] Undo uses tile-map snapshots that share unchanged tiles, with a ~2 GB budget; older steps are compressed and spilled to disk. The History panel shows the steps.
-- **IMG-043** [M1a] The document profile is sRGB. The display transform is a 33³ lookup table sampled from a `moxcms` transform (document → monitor ICC profile) and applied in the canvas shader. The monitor profile is read in the C++ shim with the same Windows calls Qt uses internally.
+- **IMG-043** [M1a] The document profile is sRGB. The display transform is a 33³ lookup table sampled from a `moxcms` transform (document → monitor ICC profile) and applied in the canvas shader. The monitor profile is read in the C++ shim with the same Windows calls Qt uses internally. (owner decision 2026-10-20) Imported images reach the sRGB document through IMG-169.
 - **IMG-044** [M1a] (invariant) When Windows Advanced Color, auto colour management or HDR is active, Windows' compositor already colour-manages, so the lookup table is bypassed (otherwise colours would be corrected twice).
+- **IMG-169** [M1a] **Import colour policy** (owner decision 2026-10-20; plan 5). An imported image with an embedded non-sRGB ICC profile (a phone photo in Display P3, for example) is converted to sRGB with relative colorimetric intent and black-point compensation (`moxcms`, CORE-138). The import records the source profile and the share of pixels that were clipped, and warns when that share is above a threshold that plan 5 sets. An untagged image is read as sRGB. HEIC and AVIF decoding is Later (CORE-140).
 
 **Previews and pen input**
 
@@ -2095,6 +2170,7 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 - **IMG-049** [M1a] Brush and eraser: an in-house round stamp engine with hardness, spacing, size/opacity/flow (pressure-driven curves wait for pen input, IMG-046), smoothing, and a stroke buffer.
 - **IMG-050** [M1.5] Textured brush tips.
 - **IMG-051** [M1a] Fill: paint bucket with tolerance and contiguous options.
+- **IMG-166** [M1a] **Clone stamp and spot heal** (owner decision 2026-10-20; plan 5): CPU brush tools on the round stamp engine (IMG-049) that paint on the selected raster layer. Clone stamp copies from a source point you set; spot heal blends a patch sampled from around the stroke into its surroundings.
 - **IMG-052** [M1.5] Gradient fill.
 - **IMG-053** [M1a] Selection tools: rectangle, ellipse, lasso, polygon, **select object**, select subject / select background (BiRefNet), refine edge.
 - **IMG-054** [M1a] Select object uses SAM 3.1 (native in ComfyUI) with click points or a text description. SAM 3.1 takes text, boxes and positive/negative points in the pixel coordinates of the uploaded image, which the suite maps from document coordinates. The flow is "add points → Process → Apply", so one click isn't one job.
@@ -2135,9 +2211,17 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 
 - **IMG-071** [M1b] **Instruction edit** on a layer, frame or selection, with references.
 - **IMG-072** [M1b] (contract) On Qwen-Image-2.1 the mask is *guidance* only: it is fed as an annotated reference, because the edit node has no hard-mask input (the Fun ControlNet inpaint path is also conditioning, not a hard mask), so **only paste-back (IMG-067) makes the edit exact**. The adapter passes the frame image as the first reference and sets the node's `resolution` from the generation size (the node sizes its output to the first reference's aspect at that resolution). The node has 16 reference slots, of which the model's authors validated 10.
-- **IMG-073** [M1a] Remove background (BiRefNet, tool `image.cutout`), alongside select object and refine edge (§5.4). Select subject / select background (IMG-053) use the same tool and return a selection instead of a cut-out layer.
+- **IMG-073** [M1a] Remove background (BiRefNet, tool `image.cutout`), alongside select object and refine edge (§5.4). Select subject / select background (IMG-053) use the same tool and return a selection instead of a cut-out layer. (owner decision 2026-10-20; plan 6a) By default Remove background adds a layer mask to the source layer; "New layer with mask" and "Bake" (a cut-out layer) stay as options.
+- **IMG-168** [M1a] **Defringe** (owner decision 2026-10-20; plan 5): a local command on a layer with a mask or transparency that replaces the colour of its edge pixels, over a width you set, with colour from inside the shape, so the halo a background removal leaves goes away.
+- **IMG-165** [M1a] **Remove brush** (owner decision 2026-10-20; plan 6a). You paint a mask over a spot, a wire or a small object; on release, the suite runs a fast local inpainting model (LaMa by default) through ComfyUI as an interactive job (`image.remove`, CORE-160), and the result goes on a new layer by default.
+  - Plan 6a settles the model file and the ComfyUI node it needs; a custom-node pack is an `exec` install (CORE-131).
+  - Until they are installed, the brush falls back to the Rust Telea-style fill (IMG-064) and says so.
 - **IMG-074** [M1b] Upscaling operations: **upscale image** (flatten → new document or candidate at N×); **enhance layer** (re-render one layer at its displayed size with an upscaler, e.g. a pasted low-resolution image, without touching other layers); **upscale document** (resizes every layer, with a warning that the other layers are resampled). Upscalers: Real-ESRGAN (fast) and SeedVR2 (tiled for large inputs).
 - **IMG-075** [M1a] **Variations**: re-run a staged result's or candidate's recipe with new seeds, optionally with only the prompt changed (tool `image.regenerate`).
+- **IMG-161** [M1a] **Live mode** (owner decision 2026-10-20; plan 6a). With live mode on, an edit inside the frame (a stroke, a layer change, a prompt change) queues a `live` job after a debounce of 250–500 ms (a setting).
+  - At most one live job is pending: a newer request replaces it, and the pending one is cancelled by its id. Live jobs rank below your own generations and never pre-empt them (CORE-160).
+  - Results go to a live slot, not the staging strip, with **Apply** (into the active layer, one undo step), **Apply as layer** and **Record**, which keeps the result as a proposal run. Nothing else is recorded as a run.
+- **IMG-162** [M1b] **Prompt matrix and wildcards** (owner decision 2026-10-20: M1b). A generation can expand `axes[]`, each a list of prompt fragments, combined by zip or by product and multiplied by the batch count, and wildcards drawn from a `wildcard` Library resource kind (§3.4). An expansion of more than 64 prompts from an agent caller waits for your confirmation (CORE-109), with one prompt covering it and any cap.
 - **IMG-076** [M1b] **Transparent output** directly where the model supports it; otherwise a BiRefNet cut-out of the result.
 - **IMG-077** [M1b] **Run a workflow on a layer:** recipes with image and mask slots appear as layer "filters" with a destination (staging / replace layer / new layer / asset); they run through `image.workflow.run`.
 - **IMG-078** [M1.5] Regional prompts use ComfyUI's mask conditioning: it works with any model but averages per-region predictions (cost ≈ (regions + 1) × a normal step) and needs a full-coverage base prompt.
@@ -2149,8 +2233,8 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 - **IMG-079** [M1a] (contract) Each generation on a document creates a **proposal run** stored in `work/<doc_id>/proposals/<run_id>/` (or the app cache for unsaved or loose documents) with its recipe and saved inputs.
 - **IMG-080** [M1a] (invariant) A proposal run creates no asset version, doesn't change the asset's status and doesn't run the QA chain. When recorded (§2.2 "Record" step) it writes no manifest, `progress.md` or candidate; its hand-off block lists proposal refs and PNG paths.
 - **IMG-081** [M1a] **Anchoring:** a run records its frame rectangle and the version of every tile under that rectangle at submit time — enough to warn "this area changed since you generated" on accept, with the choice *accept on top*, *accept into a new layer group* or *discard*. No snapshot is written at submit time.
-- **IMG-082** [M1a] Runs stay until accepted or discarded, then for 14 days; "Discard all" clears them.
-- **IMG-083** [M1a] (invariant) Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots, and discarding a proposal after accepting it never loses the accepted pixels.
+- **IMG-082** [M1a] Runs stay until accepted or discarded, then for 14 days; "Discard all" clears them. (owner decision 2026-10-20; plan 6a) A run that a layer of the document records as its origin (IMG-083) is kept while any layer refers to it, and for 14 days after the last reference goes. "Release variants" on a layer drops its reference.
+- **IMG-083** [M1a] (invariant) Accepting copies pixels into new layer chunks, so proposal folders are never garbage-collection roots, and discarding a proposal after accepting it never loses the accepted pixels. (owner decision 2026-10-20; plan 6a) The new layer records its proposal origin (`doc:<doc_id>/proposal/<run_id>/<n>`). Layer properties show the run's other results, with **Swap variant** (one undo step) and **More like this** (variations of that result, IMG-075). Pixels are still copied, so the origin only keeps the run on disk (IMG-082); it is never a chunk garbage-collection root.
 - **IMG-084** [M1a] On "Add to project" from a `.lildoc` (§3.5), open proposals move with the document.
 - **IMG-085** [M1a] The Generate panel has a **destination**: *Proposals* (default), *Asset* or *Both*. Asset candidate runs (§2.3, with QA and sign-off) are created only by "Make candidate" or when the destination is *Asset* or *Both*; choosing *Asset* on an unsaved document opens "Save to project" first.
 - **IMG-086** [M1a] The **staging bar** has a thumbnail strip, ← / →, an A/B toggle against the canvas, auto-switch (newest / in progress / off), **Accept** (adds a layer; one undo step), **Keep as hidden layer**, **Discard**, **Discard all**, **Cancel** a running job (via `job.cancel`), **Recall settings** and **Open in Review**.
@@ -2164,7 +2248,7 @@ The canvas is stored as a LILITH document (§3.5). This section fixes its layer 
 ComfyUI's own queue can't be reordered usefully: its "front" option is last-in-first-out among front items, and nothing pre-empts a running prompt. So the suite holds the queue itself.
 
 - **IMG-091** [M1a] (invariant) The suite keeps its own queue and keeps **at most one prompt per lane pending in ComfyUI**; the next prompt is submitted when the running one finishes, so a multi-candidate run's prompts reach ComfyUI one after another (§2.8).
-- **IMG-092** [M1a] (invariant) The suite's queue orders by class — interactive (select object, preprocessors, Prompt Studio previews) > your generations > agent/director batches — first-in-first-out within a class. Batches may be grouped by model profile within their class, with a limit so nothing waits forever.
+- **IMG-092** [M1a] (invariant) The suite's queue orders by class — interactive (select object, preprocessors, Prompt Studio previews) > your generations > agent/director batches — first-in-first-out within a class. Batches may be grouped by model profile within their class, with a limit so nothing waits forever. (owner decision 2026-10-20) The live class, the Remove brush's place in the interactive class, run next/last and Pause GPU work: CORE-160.
 - **IMG-093** [M1a] Interactive operations, Prompt Studio previews included, still wait for the prompt already running (up to ~40 s on a Qwen edit), and the status bar says so (IMG-007).
 - **IMG-094** [M1a] An optional setting cancels and resubmits a running *agent batch* prompt when an interactive one arrives. It never cancels your own jobs.
 - **IMG-095** [M1a] Source images are uploaded to ComfyUI once, named by content hash, with reference-counted cleanup.
@@ -2277,8 +2361,8 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
 ### 5.9 Outputs
 
 - **IMG-135** [M1a] **Save** (the document, §3.5), **Make candidate** (flatten → asset candidate run, §3.5) and **Copy / drag** (§3.4).
-- **IMG-136** [M1a] **Export** to PNG, JPEG and WebP.
-- **IMG-137** [M1b] **Export** to TIFF 16-bit and OpenRaster (ORA, with a loss warning).
+- **IMG-136** [M1a] **Export** to PNG, JPEG and WebP. (owner decision 2026-10-20; plan 5) The Export dialog exports the document, the frame, the selection or each layer; scales from 25 to 400 %; sets quality; strips GPS position and camera serial numbers by default, with an opt-in to keep camera data; and keeps or strips the workflow chunks (CORE-142, IMG-139).
+- **IMG-137** [M1b] **Export** to TIFF 16-bit and OpenRaster (ORA, with a loss warning). (owner decision 2026-10-20) Also **layered PSD**, for Krita and Photopea (APP-110): a clean-room writer from Adobe's published file-format specification covering 8-bit RGB, groups, layer masks, opacity, blend modes and a merged composite, written as PSB above 30,000 px. Each milestone checks the files by opening them in Krita and Photopea (QA-064).
 - **IMG-138** [M1] (decision) ORA is import/export only; the LILITH document is the canvas format.
 - **IMG-139** [M1a] Embedding the workflow in exports is off by default for documents (a multi-step document's single workflow would misrepresent it) and on by default for direct workflow outputs; an option embeds the document's recipe chain instead.
 - **IMG-140** [M1a] (contract) Every staged result and candidate records its recipe: profile (with content hash), model hashes, LoRAs, seed, prompt, frame and generation size, infill and mask settings, inputs (saved as files) and environment. When the prompt came from Prompt Studio, the recipe also holds the full, immutable compile record, overrides included, with the brief snapshot's content hash (AI-176). A candidate run also lists the sealed brief `brf_…@<version>` among its inputs (AI-160, AI-184), and a proposal records the brief for recall only (IMG-176).
@@ -2286,7 +2370,7 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
 ### 5.10 Agents in the Image studio
 
 - **IMG-141** [M1a] Everything above is a core tool (§2.11), so the assistant and Claude Code can do it. Agent `doc.*` calls on a document open in the Image studio are forwarded to the app and applied there from M1 (§3.5, §4).
-- **IMG-142** [M1a] (contract) Generation tools `image.generate`, `image.regenerate` (variations, IMG-075), `image.inpaint`, `image.outpaint`, `image.select_object`, `image.preprocess` and `image.cutout` (IMG-073) take a **`target`** (`doc:<id>` + frame, or an asset) and a **`destination`** (proposals / asset / both), plus the settings the Generate panel has: generation size, references, LoRAs, infill, mask grow/blur, edge-coherence, edit compositing mode, profile; and an optional `compile_id` with `overrides` (IMG-176).
+- **IMG-142** [M1a] (contract) Generation tools `image.generate`, `image.regenerate` (variations, IMG-075), `image.inpaint`, `image.outpaint`, `image.select_object`, `image.preprocess` and `image.cutout` (IMG-073) take a **`target`** (`doc:<id>` + frame, or an asset) and a **`destination`** (proposals / asset / both), plus the settings the Generate panel has: generation size, references, LoRAs, infill, mask grow/blur, edge-coherence, edit compositing mode, profile; and an optional `compile_id` with `overrides` (IMG-176). (owner decision 2026-10-20) Also `seed_mode` (`random`, `fixed` or `increment`) and `batch_count`, on the tools and in the Generate panel.
 - **IMG-143** [M1b] (contract) `image.edit` (instruction edit, IMG-071), `image.upscale` (IMG-074) and `image.workflow.run` (a saved, sent or layer workflow: IMG-077, IMG-125, IMG-130) take the same `target` / `destination` / settings shape; they arrive with their operations.
 - **IMG-144** [M1a] (contract) Document tools: `doc.frame.set`, `doc.selection.*`, `doc.mask.from_selection`, `doc.layer.*` (add, properties, reorder, merge, delete — `doc.layer.add` is the only layer-adding tool), `doc.references.*`, `doc.proposals.list / accept / discard`, `doc.export`, `doc.make_candidate`; and the read tools `doc.list_open` and `doc.get_snapshot`.
 - **IMG-145** [M1a] (invariant) Each document tool call is applied to an open document as one undoable step, or by the core on a closed document under the core's own hold.
@@ -2296,18 +2380,18 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
 ### 5.11 Milestone scope
 
 - **IMG-148** [M1a] (decision) **M1a — first usable studio:**
-  - canvas core: GPU tiled canvas on D3D11 with the store-only rules, CPU reference compositor, undo/history, colour-managed display, round brush/eraser, fill, transform, crop, picker, destructive blur/sharpen/noise, canvas resize;
+  - canvas core: GPU tiled canvas on D3D11 with the store-only rules, CPU reference compositor, undo/history, colour-managed display, round brush/eraser, fill, transform, crop, picker, destructive blur/sharpen/noise, canvas resize, clone stamp and spot heal (IMG-166), defringe (IMG-168), the import colour policy (IMG-169);
   - layers: raster, group, adjustment (levels, curves, hue/saturation, brightness/contrast), control, inpaint mask, the generation-enabled flag;
-  - selections including select object, select subject/background and refine edge; remove background;
+  - selections including select object, select subject/background and refine edge; remove background, as a mask on the source layer by default; the Remove brush (IMG-165);
   - swatches/palettes and prompt/style presets;
   - the **Z-Image adapter** (t2i, img2img, inpaint, outpaint, control once the ControlNet is installed);
   - the **SDXL adapter** with the SDXL / Illustrious profile (t2i, img2img, inpaint, outpaint; IMG-180);
   - frame with generation-size scaling, automatic mode selection, infill, paste-back with mask blur and edge-coherence;
-  - proposals with the full staging bar, destination routing and variations;
-  - the suite-held priority queue;
+  - proposals with the full staging bar, destination routing and variations; variants kept reachable after Accept (IMG-082, IMG-083); seed mode and batch count; live mode (IMG-161);
+  - the suite-held priority queue, with the live class and the queue controls (CORE-160);
   - model profiles with capability states, the download/relink flow and basic LoRAs;
   - the ComfyUI tab;
-  - PNG/JPEG/WebP export;
+  - PNG/JPEG/WebP export, with the Export dialog and its metadata defaults (IMG-136);
   - Prompt Studio's image target: the `natural_sentences` and `tag_list` dialects, previews, the Generate panel link and staging (§5.6a, §4.7a);
   - agent tools for all of the above.
 - **IMG-149** [M1b] (decision) **M1b — completes the studio:**
@@ -2317,10 +2401,11 @@ Until the Graph tab lands in M1b, workflows are run through the ComfyUI tab (§5
   - LoRA base-family detection;
   - the `edit_instruction` prompt dialect (IMG-179);
   - enhance layer / upscale image / upscale document with SeedVR2;
-  - TIFF 16-bit and ORA export;
+  - TIFF 16-bit, ORA and layered PSD export;
+  - prompt matrices and wildcards (IMG-162);
   - ~~the D3D12 path, if M0 favours it~~ (dropped: M0 did not favour it, so IMG-033 is withdrawn; M0 result, 2026-10-12).
 - **IMG-150** [M1.5] (decision) **M1.5:** regional prompts; adding nodes and editing connections in the Graph tab; magic wand, textured tips, rotate view, gradient; colour balance, invert, threshold adjustments; named layout presets (§3); hosted image providers (§4.4).
-- **IMG-151** [Later] **Later:** layer decomposition, text and vector layers, MyPaint-style brushes, 16-bit/float documents, HDR documents, LaMa infill, virtual-file drops.
+- **IMG-151** [Later] **Later:** layer decomposition, text and vector layers, MyPaint-style brushes, 16-bit/float documents, HDR documents, LaMa infill, virtual-file drops. (owner decision 2026-10-20) LaMa as the Remove brush's model is M1a (IMG-165); LaMa as an outpaint infill stays Later. HEIC and AVIF import is Later too (CORE-140).
 
 **M0 spike items for the Image studio** (each must be measured or proven before the M1 work that depends on it):
 
@@ -2403,6 +2488,7 @@ AI agents write most of the code, working on your PC in your account; you test m
 - **QA-019** [M1] (invariant) (Amendment A, 2026-10-13: the suite repository is public, so server-side rulesets on GitHub also require the guard's CI checks on `main` and block force-pushes and deletion of `main`. Whether a change touches protected files, and whether it carries the reviewer identity's approval, is still decided by the guard, QA-020 and QA-021.) Protected files are: spec tests, golden files, recorded fixtures, committed property-test seeds, and `test-params.toml` — the one file holding image tolerances, property-test case counts and test timeouts. The merge guard's own files are protected too: the git hook scripts, the sources of `lil dev merge` and the test-diff guard, and the committed list of protected path patterns, which every part of the guard (QA-033–QA-037) reads. (plan 1 clarification: the protected files also include the CI workflows that enforce the guard, `.github/workflows/ci-guard.yml` and `.github/workflows/post-merge.yml`. The committed pattern list lives in `dev/protected-paths.txt`, and `dev/merge-guard.toml` is protected too. `.config/nextest.toml` is protected as well: it defines the `spec` profile that `lil dev spec-tests` runs, and a `default-filter`, retry count or timeout there could silently drop a failing spec test.) (plan 1, R18: they control how the hooks run) The files that decide how the hooks' `cargo run` builds and runs `lil` are protected too: `.cargo/**`, the root `Cargo.toml`, `crates/lil-cli/Cargo.toml`, `crates/lil-cli/build.rs`, `crates/lil-cli/src/main.rs`, `rust-toolchain.toml` and `.gitattributes`. (`Cargo.lock` is not: it changes with every dependency update.) (plan 1, R21) Every file under `.github/workflows/` is protected, not just `ci-guard.yml` and `post-merge.yml`: the protected-test check runs on `pull_request`, so a PR could edit a workflow, or add one that posts a check run with the same name. (plan 1, R28) `.claude/**` is protected too: the repo's Claude Code project settings decide which commands agents are denied (QA-036).
 - **QA-020** [M1] (invariant) A change that **modifies or deletes** a protected file may reach `main` only with an approving GitHub review, on the change's exact head commit, from a **separate reviewer identity**: a second GitHub account (a collaborator on the repository) or a GitHub App that implementing agents can't act as. **Adding** tests, new fixture versions or new seeds is always allowed. (plan 1, R26: additions are free only in the test homes, the patterns marked `add-ok:` in `dev/protected-paths.txt`: `crates/lil-spec-tests/**` and `**/proptest-regressions/**`. Adding a file under any other protected pattern, such as a new workflow, hook or `.cargo` config, needs the same approval as modifying one.) (owner decision 2026-10-13: the second-account option is not used; the GitHub App is the reviewer identity. The separate reviewer identity is a **GitHub App** named `lilith-reviewer`, installed on the repo with *Pull requests: write* and *Contents: read*. (plan 1, R40: and *Actions: write*, so that `lil dev approve` can re-run the protected-test check for the approved commit right after posting the approval; without it the approval still posts, with a warning to re-run the check by hand.) Approvals are posted only by `lil dev approve <PR>`, which needs the owner's passphrase for the App key (`%USERPROFILE%\.lilith\reviewer\app-key.age`), typed interactively. An approval counts only when it is the App bot's `APPROVED` review on the PR's exact head commit. (plan 2026-10-17, D6: while the App was renamed, approvals counted under its slug before and after the rename; since the rename's cleanup, `dev/merge-guard.toml` names only the live slug, `reviewer_app_slug`. `lil dev approve` asks GitHub for the App's live slug with the App's key, prints it, and refuses when it isn't that slug.))
   - (Amendment A, 2026-10-13) The suite repository is public. Server-side rulesets require the guard's CI checks (including the protected-test check, QA-021) on `main` and block force-pushes and deletion of `main`. The approval itself is still decided by the guard: QA-033–QA-036 enforce this rule locally, and in CI before and after the merge.
+  - (owner decision 2026-10-20) Windows Hello can unlock the App key in place of the passphrase (QA-088); the passphrase file stays as the fallback.
 - **QA-021** [M1] The **test-diff guard** (a script run by CI, `lil dev merge` and the git hooks) compares a change with `main`. It has two parts:
   - **Blocking — the protected-test check.** It fails when a protected file is modified or deleted without the QA-020 approval, or when a protected test (spec or golden) fails on that commit, other than the expected-to-fail spec tests tracked under QA-017. CI runs these tests itself; `lil dev merge` and the hooks read CI's results for that exact commit, and a commit with no CI results fails the check.
   - **Warnings** on removed or ignored tests, new sleeps/retries and new lint suppressions, listed in plain language in the milestone report.
@@ -2432,6 +2518,10 @@ AI agents write most of the code, working on your PC in your account; you test m
 - **QA-034** [M1] (invariant) **Git hooks** in the suite repo — `pre-merge-commit` and `pre-push` — run the protected-test check and refuse a local merge into `main`, or any push to `main` (fast-forwards included), whose changes would fail it. `lil dev merge` refuses to run when the hooks aren't installed.
 - **QA-035** [M1] (invariant) **CI after every merge:** every push to `main` re-runs the protected-test check over the pushed range, plus the every-push tier. If anything slipped through — a protected test fails, or a protected file changed without an approved PR — CI opens a revert PR for the offending commits and an issue assigned to you, so GitHub notifies you. The milestone report lists every such event in plain language.
 - **QA-036** [M1] (invariant) **Agents merge only through `lil dev merge`.** The suite repo's Claude Code project settings deny direct pushes to `main`, `--no-verify`, `gh pr merge` and direct merge API calls; these patterns are part of the hook-pattern tests (QA-061). Pattern rules have known gaps; QA-034 and QA-035 back them up.
+- **QA-088** [M1] **Windows Hello for reviewer approvals** (owner decision 2026-10-20; a plan 4a spike, then one small task in the protected `lil dev` code, QA-019). `lil dev approve` (QA-020) can unlock the reviewer App key with Windows Hello instead of the passphrase:
+  - **if the spike passes:** the key is wrapped with a key-encryption key derived from a TPM-held Windows Hello key credential's signature over a fixed challenge (`KeyCredentialManager`; each signature prompts Hello). This needs every signature over the same challenge to be identical, which is unverified and is the spike's first check;
+  - **otherwise:** the key is protected with DPAPI for the current user, and Windows Hello's consent prompt gates its use. That gate is a check in the UI, not encryption, so it is the weaker option;
+  - either way the passphrase file stays as the fallback, and an approval still needs your own input at the machine.
 - **QA-037** [M1] (decision) **Server-side enforcement:** the repository is public, so the same checks are required status checks in a ruleset on `main`, which also blocks force-pushes and deletion (Amendment A, 2026-10-13). A later option is a `CODEOWNERS` file, generated from the protected path list, naming the reviewer identity as a required reviewer. That is a configuration change, not a redesign; `lil dev merge`, the hooks and the post-merge check stay.
 
 ### 6.3 Test isolation on your machine
@@ -2485,7 +2575,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
   - stream-json fixtures per tested Claude Code version.
   - (plan 2b clarification: Appendix E) (owner decision 2026-10-15) The golden round-trip uses a synthetic manifest with the lantern manifest's structure. Fixture workspaces are synthetic; nothing is copied from a real workspace.
 - **QA-049** [M1b] **Golden: ComfyUI UI→API conversion** (every push) compared with the official frontend's conversion, using the pinned `comfyui-frontend-package`; re-run whenever ComfyUI or its frontend changes.
-- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.lildoc` readers, stream-json, SSE, `lil:` URLs, clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
+- **QA-050** [M1] **Parser hardening**: all untrusted parsers (workflow JSON, safetensors headers, image and `.lildoc` readers, stream-json, SSE, `lil:` URLs (including `lil://` refs that reach the `lil:` handler, APP-020), clipboard and drag payloads) live in one platform-neutral crate. `bolero`/proptest targets run in `cargo test` on every push; time-boxed libFuzzer runs (Linux or WSL2) at milestones.
 - **QA-051** [M1] (invariant) **Integration — ComfyUI queue ownership** (in-process core with fakes, every push):
   - at most one pending prompt per lane in ComfyUI; priority classes; FIFO within a class;
   - outside jobs are observed and never cancelled;
@@ -2524,7 +2614,7 @@ Each layer states what it covers and when it runs. "Every push", "PR-ready", "ni
 - **QA-063** [M1] (decision) **Real engines, on demand only**: `lil test --real`, run by you or by an agent in your session before milestones or when a ComfyUI or model change warrants it. Never on a schedule; there is no self-hosted runner.
   - It uses an isolated ComfyUI test instance: port 8189, temporary base and user directories, in-memory database, your models and custom nodes through an extra-model-paths file; started only when your own ComfyUI is idle, so tests never touch its saved state or VRAM while you work.
   - It covers the real GPU canvas and runs the **same scenario suite as the fake ComfyUI**, so the fake can't drift.
-- **QA-064** [M1] **Manual milestone checks**: hardware UI, paste into Explorer/Discord/Chromium, cold start after a reboot and after a Defender first scan, and performance numbers against the absolute targets in other sections (pass/fail in the milestone report).
+- **QA-064** [M1] **Manual milestone checks**: hardware UI, paste into Explorer/Discord/Chromium, cold start after a reboot and after a Defender first scan, and performance numbers against the absolute targets in other sections (pass/fail in the milestone report). (owner decision 2026-10-20) Also a Narrator smoke check (APP-156) and, from M1b, opening the PSD exports in Krita and Photopea (IMG-137).
 - **QA-065** [M1] (invariant) **Real Claude Code smoke** (`lil doctor --claude-smoke`): a cheap model with `--max-turns 2` against a fixture tool checks `authMethod: "claude.ai"`, `apiKeySource: "none"`, no user MCP servers or plugin hooks loaded, and writes to `assets/**` denied.
   - It runs **only when you confirm**, because it uses plan quota; after a Claude Code version change Doctor *offers* it. It never runs in CI or on a schedule.
   - It runs under the profile you pick (default: the default profile).
@@ -2864,14 +2954,14 @@ Destination presets (prices as of 2026-10-12, refreshed in `providers.yaml`):
 
 | Section | M0 | M1 | M1a | M1b | M1.5 | Later | Total |
 |---|---|---|---|---|---|---|---|
-| §1 Processes, connections, trust and repo layout | 1 | 112 | 1 | 0 | 4 | 6 | 124 |
-| §2 Core modules | 0 | 140 | 1 | 1 | 5 | 4 | 151 |
-| §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 117 | 11 | 3 | 3 | 11 | 146 |
+| §1 Processes, connections, trust and repo layout | 1 | 113 | 1 | 0 | 4 | 6 | 125 |
+| §2 Core modules | 0 | 147 | 1 | 1 | 5 | 5 | 159 |
+| §3 Core ↔ app interface, interchange, documents and dashboards | 1 | 127 | 11 | 3 | 3 | 10 | 155 |
 | §4 AI layer: providers, metering, assistant, Claude Code | 16 | 46 | 38 | 108 | 18 | 5 | 231 |
-| §5 Image studio | 8 | 3 | 114 | 31 | 9 | 4 | 169 |
-| §6 Errors, testing and quality | 1 | 84 | 0 | 1 | 0 | 1 | 87 |
+| §5 Image studio | 8 | 3 | 119 | 32 | 9 | 4 | 175 |
+| §6 Errors, testing and quality | 1 | 85 | 0 | 1 | 0 | 1 | 88 |
 | §7 Sync, backup and builds | 2 | 83 | 0 | 0 | 20 | 3 | 108 |
-| **All** | **29** | **585** | **165** | **144** | **59** | **34** | **1016** |
+| **All** | **29** | **604** | **170** | **145** | **59** | **34** | **1041** |
 
 ## Appendix B. M0 spike checklist and facts to re-verify
 
