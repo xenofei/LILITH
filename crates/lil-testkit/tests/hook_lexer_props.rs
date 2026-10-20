@@ -172,6 +172,111 @@ fn bash_marker() -> impl Strategy<Value = String> {
     ]
 }
 
+/// A wrapper with one of its value options (ruling P3-R32), as a shell would read it: the
+/// option, its value, and (for `timeout`) the duration.
+fn wrapper_with_value() -> impl Strategy<Value = &'static str> {
+    prop::sample::select(vec![
+        "xargs -n 1",
+        "xargs -n1",
+        "xargs -L 2",
+        "xargs -P 4",
+        "xargs -I {}",
+        "xargs -d x",
+        "xargs -s 100",
+        "xargs -E end",
+        "xargs -a list.txt",
+        "env -u HOME",
+        "env -C sub",
+        "timeout -s KILL 5",
+        "timeout -k 1 5",
+        "nice -n 5",
+        "sudo -u root",
+        "sudo -g wheel",
+        "sudo -h host",
+        "sudo -p prompt",
+        "sudo -C 3",
+        "time -p",
+        "time -f %e",
+        "time -o t.txt",
+        "stdbuf -o L",
+    ])
+}
+
+/// Bash forms ruling P3-R32 asks about: brace expansion, a wrapper's value options before a
+/// payload, `trap`/`alias`/`unalias`, the awk family, `sed` with `e`, `git -c core.*` and the
+/// hook keys, `git --config-env`, and tar's program options.
+fn p3_r32_bash_marker() -> impl Strategy<Value = String> {
+    prop_oneof![
+        ("[a-z]{1,6}", "[a-z]{1,6}").prop_map(|(a, b)| format!("{{rm,-rf,{a}}} {b}")),
+        (word(), "[a-z]{1,6}", "[a-z]{1,6}").prop_map(|(w, a, b)| format!("echo {w} {{{a},{b}}}")),
+        (wrapper_with_value(), payload()).prop_map(|(w, p)| format!("{w} {p}")),
+        payload().prop_map(|p| format!("trap '{p}' EXIT")),
+        word().prop_map(|w| format!("alias r={w}")),
+        word().prop_map(|w| format!("unalias {w}")),
+        (
+            prop::sample::select(vec!["awk", "gawk", "mawk", "nawk"]),
+            word()
+        )
+            .prop_map(|(a, w)| format!("{a} {w}")),
+        payload().prop_map(|p| format!("sed -n '1e {p}' x")),
+        "[a-z0-9 _.-]{0,8}".prop_map(|w| format!("sed 's/a/{w}/e' x")),
+        (
+            prop::sample::select(vec![
+                "core.pager",
+                "core.editor",
+                "core.fsmonitor",
+                "sequence.editor",
+                "core.sshCommand",
+                "credential.askpass",
+                "pager.log",
+            ]),
+            word()
+        )
+            .prop_map(|(k, w)| format!("git -c {k}={w} log")),
+        word().prop_map(|w| format!("git --config-env=core.pager={w} log")),
+        (
+            prop::sample::select(vec![
+                "--to-command=",
+                "--checkpoint-action=exec=",
+                "--use-compress-program=",
+                "--rsh-command=",
+                "-I ",
+            ]),
+            word()
+        )
+            .prop_map(|(o, w)| format!("tar -xf x.tar {o}{w}")),
+    ]
+}
+
+/// PowerShell forms ruling P3-R32 asks about: a method or static call on a `$` expression,
+/// member invocation through `ForEach-Object`/`%`/`foreach`, and the job, module and type
+/// commands.
+fn p3_r32_powershell_marker() -> impl Strategy<Value = String> {
+    let ident = "[a-z][a-z0-9_]{0,6}";
+    prop_oneof![
+        (ident, ident).prop_map(|(v, m)| format!("${v}.{m}()")),
+        (ident, ident, word()).prop_map(|(v, m, w)| format!("${v}.{m}({w})")),
+        (ident, ident).prop_map(|(v, m)| format!("${v}::{m}('y')")),
+        (ident, ident).prop_map(|(v, m)| format!("${v}[0].{m}()")),
+        (
+            prop::sample::select(vec!["%", "ForEach-Object", "foreach"]),
+            ident
+        )
+            .prop_map(|(f, m)| format!("gci | {f} {m}")),
+        ident.prop_map(|m| format!("gci | ForEach-Object -MemberName {m}")),
+        (
+            prop::sample::select(vec![
+                "Start-Job",
+                "Start-ThreadJob",
+                "Import-Module",
+                "Add-Type"
+            ]),
+            word()
+        )
+            .prop_map(|(c, w)| format!("{c} {w}")),
+    ]
+}
+
 /// A short PowerShell command name an alias may stand for.
 fn ps_alias_target() -> impl Strategy<Value = &'static str> {
     prop::sample::select(vec!["Remove-Item", "ri", "python", "Out-File"])
@@ -246,8 +351,10 @@ fn marked_line() -> impl Strategy<Value = (Shell, String)> {
         if shell == Shell::PowerShell {
             markers.push(call_operator().boxed());
             markers.push(powershell_marker().boxed());
+            markers.push(p3_r32_powershell_marker().boxed());
         } else {
             markers.push(bash_marker().boxed());
+            markers.push(p3_r32_bash_marker().boxed());
         }
         let marker = prop::strategy::Union::new(markers);
         (Just(shell), commands(), marker, commands()).prop_map(|(shell, before, marker, after)| {

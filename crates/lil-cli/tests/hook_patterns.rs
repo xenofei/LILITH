@@ -267,6 +267,76 @@ fn hook_patterns_table() {
         ),
         ("(Get-Command python).Invoke()", PWSH),
         ("(Get-Item $env:APPDATA\\LILITH\\suite.toml).Delete()", PWSH),
+        // Final review I1 (ruling P3-R32): the reviewer's probe lines.
+        // Bash: brace expansion.
+        ("{rm,-rf,foo}", BASH),
+        ("{rm,-rf,'fo o'}", BASH),
+        ("echo {a,b}", BASH),
+        // Bash: a wrapper's value options, and a command word after a wrapper that isn't a
+        // plain command name.
+        ("find . | xargs -n 1 rm", BASH),
+        ("xargs -I {} rm {}", BASH),
+        ("xargs -n1 rm", BASH),
+        ("xargs --max-procs 4 rm", BASH),
+        ("env -u HOME rm -rf foo", BASH),
+        ("env -S 'rm -rf foo'", BASH),
+        ("timeout -s KILL 5 rm -rf foo", BASH),
+        ("timeout -k 1 5 rm -rf foo", BASH),
+        ("nice -n 5 rm -rf foo", BASH),
+        ("time -p rm -rf foo", BASH),
+        ("time -o t.txt rm -rf foo", BASH),
+        ("sudo -u root rm -rf foo", BASH),
+        ("stdbuf -o L rm -rf foo", BASH),
+        ("xargs 'rm' x", BASH),
+        // Bash: trap, alias, unalias.
+        ("trap 'rm -rf foo' EXIT", BASH),
+        ("alias r='rm -rf'", BASH),
+        ("unalias ls", BASH),
+        // Interpreter re-entry through awk, sed, git and tar.
+        ("awk 'BEGIN{system(\"rm -rf foo\")}'", BOTH),
+        ("gawk '{print}' x", BOTH),
+        ("mawk 1 x", BOTH),
+        ("nawk 1 x", BOTH),
+        ("sed -n '1e rm -rf foo' x", BOTH),
+        ("sed 's/a/rm -rf foo/e' x", BOTH),
+        ("sed -e 's/a/b/' -e '1e rm x' y", BOTH),
+        ("sed -f script.sed x", BOTH),
+        ("git -c core.pager='rm -rf foo' log", BOTH),
+        ("git -c Core.Editor=x commit", BOTH),
+        ("git -c sequence.editor=x rebase -i HEAD~2", BOTH),
+        ("git -c core.sshCommand=x fetch", BOTH),
+        ("git -c credential.askpass=x fetch", BOTH),
+        ("git -c pager.log='rm -rf foo' log", BOTH),
+        ("git -c diff.x.textconv=evil diff", BOTH),
+        ("git -c filter.x.smudge=evil checkout .", BOTH),
+        ("git -c credential.helper='!evil' fetch", BOTH),
+        ("git --config-env=core.pager=EVIL log", BOTH),
+        (
+            "tar -cf x.tar --checkpoint=1 --checkpoint-action=exec='rm -rf foo' .",
+            BOTH,
+        ),
+        ("tar -xf x.tar --to-command='sh -c x'", BOTH),
+        ("tar --use-compress-program=evil -xf x.tar", BOTH),
+        ("tar -I evil -xf x.tar", BOTH),
+        ("tar --rsh-command=evil -xf h:x.tar", BOTH),
+        // PowerShell: a method or static call on a `$` expression.
+        ("$f = Get-Item C:\\x\\a.txt; $f.Delete()", PWSH),
+        ("foreach ($f in gci C:\\x) { $f.Delete() }", PWSH),
+        ("$fso.DeleteFile('C:\\x\\a')", PWSH),
+        ("$t = [IO.File]; $t::Delete('C:\\x\\a')", PWSH),
+        ("$x[0].Delete()", PWSH),
+        ("(gci C:\\x)[0].Delete()", PWSH),
+        // PowerShell: member invocation through ForEach-Object.
+        ("gci C:\\x | % Delete", PWSH),
+        ("gci C:\\x | ForEach-Object Delete", PWSH),
+        ("gci C:\\x | foreach Delete", PWSH),
+        ("gci C:\\x | ForEach-Object -MemberName Delete", PWSH),
+        // PowerShell: jobs, modules and compiled types.
+        ("Start-Job -FilePath C:\\x\\evil.ps1", PWSH),
+        ("Start-ThreadJob { Remove-Item X }", PWSH),
+        ("Import-Module C:\\x\\evil.psm1", PWSH),
+        ("ipmo C:\\x\\evil.psm1", PWSH),
+        ("Add-Type -Path C:\\x\\evil.dll", PWSH),
     ];
     let must_not_ask: &[(&str, &[Shell])] = &[
         ("git status", BOTH),
@@ -329,6 +399,24 @@ fn hook_patterns_table() {
         ("mkdir -p build/out", BASH),
         ("echo $HOME", BASH),
         ("git log --format=%H -1", BOTH),
+        // Ruling P3-R32 leaves the plain forms of the newly read commands alone.
+        ("ls | xargs -n 1 echo", BASH),
+        ("ls | xargs grep x", BASH),
+        ("nice -n 5 cargo build", BASH),
+        ("timeout 5 git status", BASH),
+        ("timeout -s KILL 5 git status", BASH),
+        ("env -u HOME git status", BASH),
+        ("time cargo build", BASH),
+        ("time -p cargo build", BASH),
+        ("git -c user.name=x commit -m y", BOTH),
+        ("tar -xf x.tar", BOTH),
+        ("tar -czf x.tgz src", BOTH),
+        ("sed 's/a/b/g' x", BOTH),
+        ("sed -n 1,5p x", BOTH),
+        ("echo {1..3}", BASH),
+        ("echo a}", BASH),
+        ("$d = Get-Date; $d.Year", PWSH),
+        ("gci | ForEach-Object -Process { $_.Name }", PWSH),
     ];
     check(must_ask, true);
     check(must_not_ask, false);
@@ -361,6 +449,11 @@ fn suite_toml_guard() {
         r"D:\data\Roaming\LILITH.\suite.toml",
         r"D:\data\Roaming\lilith\Suite.TOML",
         r"D:\data\Roaming\LILITH\suit*.toml",
+        // Ruling P3-R32: `[` or `{` in the last two segments asks unless the path resolves.
+        r"D:\data\Roaming\LILITH\suit[!x].toml",
+        r"D:\data\Roaming\[!x]ILITH\suite.toml",
+        r"D:\data\Roaming\LILITH\suite.{toml,zz}",
+        r"D:\data\Roaming\LILITH\{a}",
     ];
     for path in [stable, dev, test, legacy, legacy_dev]
         .into_iter()
@@ -424,6 +517,15 @@ fn suite_toml_guard() {
         // The legacy folder is guarded too (M2).
         ("Set-Content $env:APPDATA\\Worldwright\\suite.toml x", PWSH),
         ("echo x > \"$APPDATA/Worldwright-dev/suite.toml\"", BASH),
+        // Final review I2 (ruling P3-R32): brace and negated-bracket globs.
+        ("echo x | tee /c/x/Roaming/LILITH/suite.{toml,zz}", BASH),
+        ("echo x | tee /c/x/Roaming/{LILITH,zz}/suite.toml", BASH),
+        ("cp evil /c/x/Roaming/[!x]ILITH/suite.toml", BASH),
+        ("cp evil /c/x/Roaming/LILITH/[!x]uite.toml", BASH),
+        ("echo x | tee /c/x/Roaming/LILITH/suit[!x].toml", BASH),
+        ("echo x | tee /c/x/Roaming/LILITH/suit[^x].toml", BASH),
+        ("echo x > /c/x/Roaming/LILITH/suit[!x].toml", BASH),
+        ("Set-Content C:\\x\\Roaming\\LILITH\\suit[!x].toml x", PWSH),
     ];
     let pass: &[(&str, &[Shell])] = &[
         ("Get-Content $env:APPDATA\\LILITH\\suite.toml", PWSH),
@@ -438,6 +540,32 @@ fn suite_toml_guard() {
     ];
     check(ask, true);
     check(pass, false);
+}
+
+#[test] // spec: ARCH-056, CORE-008; ruling P3-R32 (final review M1)
+fn suite_toml_wildcards_are_matched_in_linear_time() {
+    // A run of `*` used to take exponential time (47 s at 18). 64 must finish well within 1 s.
+    let stars = "*".repeat(64);
+    for path in [
+        format!(r"C:\x\{stars}q\suite.toml"),
+        format!(r"C:\x\LILITH\{stars}q"),
+        format!(r"C:\x\{}q\suite.toml", "*?".repeat(32)),
+    ] {
+        let start = std::time::Instant::now();
+        let got = write_of("Write", &path);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "{path}: {took:?}");
+        assert_eq!(got, Decision::None, "{path} can't name suite.toml");
+    }
+    // And a wildcard that does match still asks.
+    assert!(asks(&write_of(
+        "Write",
+        &format!(r"C:\x\{stars}LILITH\suite.toml")
+    )));
+    assert!(asks(&write_of(
+        "Write",
+        &format!(r"C:\x\LILITH\{stars}.toml")
+    )));
 }
 
 /// The comfy MCP's tool `name` with `input`, with and without a core.

@@ -1,7 +1,7 @@
 //! The plugin hooks' PreToolUse patterns (spec ARCH-047, ARCH-056, ARCH-104, ARCH-105,
-//! ARCH-106, CORE-008, CORE-116, QA-061; Appendix F "Plugin 1.3"; ruling P3-R28). Pure: std
-//! and `serde_json` only, so `tests/hook_patterns.rs` compiles this file in and checks the
-//! QA-061 table.
+//! ARCH-106, CORE-008, CORE-116, QA-061; Appendix F "Plugin 1.3"; rulings P3-R28, P3-R32).
+//! Pure: std and `serde_json` only, so `tests/hook_patterns.rs` compiles this file in and
+//! checks the QA-061 table.
 //!
 //! **Conservative** (ruling P3-R28). Pattern matching is never complete, so a command line
 //! gets no decision only when it is read to its end as the plain grammar below and nothing in
@@ -13,9 +13,22 @@
 //! - a PowerShell hashtable (`@{`), a call operator (`&`, `.`), a static .NET call
 //!   (`[IO.File]::Delete(…)`), an alias or function definition (`Set-Alias`/`sal`/`New-Alias`/
 //!   `nal`, or `Set-Item`/`New-Item` on the `alias:`/`function:` drive), any `$ExecutionContext`
-//!   use, or a method call on an expression (`(Get-Item x).Delete()`);
+//!   use, or a method call on an expression (`(Get-Item x).Delete()`, `(gci)[0].Delete()`);
+//! - PowerShell (ruling P3-R32): a method or static call on a `$` expression (`$f.Delete()`,
+//!   `$x[0].Delete()`, `$t::Delete(…)`), member invocation through `ForEach-Object`, `%` or
+//!   `foreach` (a bare member name or `-MemberName`), and `Start-Job`, `Start-ThreadJob`,
+//!   `Import-Module`/`ipmo` and `Add-Type`;
 //! - Bash: a command word that is a shell expansion (`$x`, `${x}`), a `${…}` holding a command
-//!   substitution, and `coproc`;
+//!   substitution, and `coproc`; and (ruling P3-R32) any unquoted word holding a brace
+//!   expansion `{…,…}`, a command word after a wrapper that isn't a plain command name, `env
+//!   -S`, and `trap`, `alias` and `unalias`;
+//! - programs that re-enter an interpreter through their arguments (ruling P3-R32): `awk`,
+//!   `gawk`, `mawk`, `nawk`; `sed` with a script file, an `e` flag on a plain `s///`, or any
+//!   other script holding an `e`; `git -c` with a `core.*` key or a key ending in `pager`,
+//!   `editor`, `sshCommand` or `askpass` (and the other keys git runs as a program, see
+//!   `git_key_runs_a_program`), and `git --config-env`; `tar` with
+//!   `--to-command`, `--checkpoint-action`, `--use-compress-program`/`-I`, `--rsh-command` or
+//!   a volume script (`--info-script`, `--new-volume-script`/`-F`);
 //! - interpreter re-entry: `cmd`, `pwsh`, `powershell`, `bash`, `sh`, `zsh`, `python*`, `py`,
 //!   `node`, `perl`, `ruby`, `wsl`, `cscript`, `wscript`, `eval`, `Invoke-Expression`/`iex`,
 //!   `Invoke-Command`, `Start-Process`/`saps`/`start`, `Invoke-Item`/`ii`, `source`, … (only a
@@ -28,17 +41,21 @@
 //!   installs, script runs, and write-like commands that name a guarded `suite.toml`.
 //!
 //! **Commands.** A line is split at `;`, `&&`, `||`, `|`, a line end, `(` and `)`, `{` and `}`
-//! (Bash also at `&` and `|&`; in PowerShell `&` is the call operator, and an assignment's `=`
-//! starts the command on its right). Quotes are read as each shell reads them: Bash `'…'` and
-//! `"…"` with `\` escapes, PowerShell `'…'` and `"…"` with backtick escapes; a Bash `\` outside
-//! quotes escapes only a character the shell treats specially, so `C:\x\lil-mcp.exe` stays a
-//! path. The text of every `$(…)` (and Bash `` `…` ``), quoted or not, is checked as a command
-//! line of its own. Redirection targets are not words: write targets go to the `suite.toml`
-//! rule, and an input redirection is remembered.
+//! (Bash also at `&` and `|&`, and there `{` and `}` split only at the start of a word:
+//! inside one they are part of it; in PowerShell `&` is the call operator, and an
+//! assignment's `=` starts the command on its right). Quotes are read as each shell reads
+//! them: Bash `'…'` and `"…"` with `\` escapes, PowerShell `'…'` and `"…"` with backtick
+//! escapes; a Bash `\` outside quotes escapes only a character the shell treats specially, so
+//! `C:\x\lil-mcp.exe` stays a path. The text of every `$(…)` (and Bash `` `…` ``), quoted or
+//! not, is checked as a command line of its own. Redirection targets are not words: write
+//! targets go to the `suite.toml` rule, and an input redirection is remembered.
 //!
 //! **The command word** of each command is its first word after Bash `NAME=value`
 //! assignments, keywords (`if`, `then`, `do`, `!`, …) and wrappers (`sudo`, `env`, `nohup`,
-//! `exec`, `xargs`, …, with their flags). It is compared by its file name, case-insensitively,
+//! `exec`, `xargs`, `time`, …, with their flags; a wrapper's value options such as `xargs -n 1`,
+//! `env -u NAME`, `timeout -s KILL` and `nice -n 5` take their value along, and `timeout` its
+//! duration). After a wrapper it must be a plain command name, else the line asks (ruling
+//! P3-R32: when unsure, ask). It is compared by its file name, case-insensitively,
 //! without `.exe`, `.cmd`, `.bat` or `.com`. A PowerShell command whose first word is a quoted
 //! string is an expression (`"y" | …`), not a command.
 //!
@@ -48,16 +65,22 @@
 //! are resolved, trailing dots and spaces dropped, an alternate data stream (`::$DATA`)
 //! dropped, case ignored. An 8.3 short name (`SUITE~1.TOM`, `LILITH~1`) or a wildcard in the
 //! last two segments is resolved through the file system when the file is there (the long
-//! name decides), and otherwise asks when it could name such a file. A `cd` into a guarded
-//! folder makes a later relative `suite.toml` on the same line guarded too.
+//! name decides), and otherwise asks when it could name such a file (`*`, `?`, `[…]` and the
+//! negated `[!…]`/`[^…]` are matched in linear time). A `[` or `{` in the last two segments
+//! that the file system can't resolve asks whatever it holds (ruling P3-R32: Bash's
+//! `suite.{toml,x}` and `[!x]uite.toml`). A `cd` into a guarded folder makes a later relative
+//! `suite.toml` on the same line guarded too.
 //!
 //! **Known limits** (QA-061), stated plainly: a pattern guard reads the text, not the program.
-//! It doesn't see a command behind an alias or a function defined in an earlier session (a
-//! definition on the same line asks), a path built
-//! at run time (`Join-Path`, a variable holding `suite.toml`), a `cd` on an earlier command
-//! line, or what a program it allows does by itself. `cargo run -p lil-cli -- doctor` is not
-//! `lil doctor` to it. If `lil` can't start at all, Claude Code runs the tool anyway (a hook
-//! that fails to start is a non-blocking error); `lil doctor` checks that the hook runs.
+//! It doesn't see a command behind an alias or a function defined in an earlier session or an
+//! earlier command line. A definition on the same line asks: in PowerShell `Set-Alias`/`sal`/
+//! `New-Alias`/`nal` and the `alias:`/`function:` drive, in Bash `alias` and `unalias` (a Bash
+//! function definition `f() { …; }` is read as its commands). It doesn't see a path built at
+//! run time (`Join-Path`, a variable holding `suite.toml`), a `cd` on an earlier command line,
+//! or what a program it allows does by itself. `cargo run -p lil-cli -- doctor` is not
+//! `lil doctor` to it. If `lil` can't start at all, the hook's `"onFailure": "block"` (ruling
+//! P3-R30) makes Claude Code block the tool call, so it fails closed; `lil doctor` checks that
+//! the hook runs and that Claude Code is new enough to honour `onFailure`.
 
 use serde_json::Value;
 
@@ -267,36 +290,65 @@ fn is_guarded_folder(seg: &str) -> bool {
     false
 }
 
-/// The segment may be an 8.3 short name or holds a wildcard: only the file system can tell.
+/// The segment may be an 8.3 short name, holds a wildcard, or holds a Bash brace expansion:
+/// only the file system can tell.
 fn uncertain(seg: &str) -> bool {
-    seg.contains(['*', '?', '['])
+    seg.contains(['*', '?', '[', '{'])
         || seg
             .char_indices()
             .any(|(i, c)| c == '~' && seg[i + 1..].starts_with(|d: char| d.is_ascii_digit()))
 }
 
-/// Whether the wildcard pattern `pattern` (`*`, `?`, `[…]`) matches `text`.
-fn glob(pattern: &[char], text: &[char]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some(('*', rest)) => (0..=text.len()).any(|i| glob(rest, &text[i..])),
-        Some(('?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
-        Some(('[', rest)) => {
-            let Some(end) = rest.iter().position(|&c| c == ']') else {
-                return text.first() == Some(&'[') && glob(rest, &text[1..]);
+/// How much of `pattern` its first item takes when it matches the one character `c`: `?`, a
+/// set `[…]` (negated by a leading `!` or `^`), or a literal (an unclosed `[` is one). `None`
+/// when it doesn't match. `pattern` doesn't start with `*`.
+fn single(pattern: &[char], c: char) -> Option<usize> {
+    match pattern.first()? {
+        '?' => Some(1),
+        '[' => {
+            let negated = matches!(pattern.get(1), Some('!' | '^'));
+            let from = if negated { 2 } else { 1 };
+            let Some(end) = pattern[from..].iter().position(|&d| d == ']') else {
+                return (c == '[').then_some(1);
             };
-            let Some(&c) = text.first() else {
-                return false;
-            };
-            let set = &rest[..end];
+            let set = &pattern[from..from + end];
             let hit = set
                 .windows(3)
                 .any(|w| w[1] == '-' && w[0] <= c && c <= w[2])
                 || set.contains(&c);
-            hit && glob(&rest[end + 1..], &text[1..])
+            (hit != negated).then_some(from + end + 1)
         }
-        Some((c, rest)) => text.first() == Some(c) && glob(rest, &text[1..]),
+        &p => (p == c).then_some(1),
     }
+}
+
+/// Whether the wildcard pattern `pattern` (`*`, `?`, `[…]`, `[!…]`, `[^…]`) matches `text`.
+/// Iterative, with one backtrack point for the last `*`, so it takes time linear in the
+/// pattern times the text (final review M1), never exponential.
+fn glob(pattern: &[char], text: &[char]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    // Where to go on after the last `*`: the pattern after it, and the text it took up to.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if pattern.get(p) == Some(&'*') {
+            p += 1;
+            star = Some((p, t));
+            continue;
+        }
+        if let Some(len) = pattern.get(p).and_then(|_| single(&pattern[p..], text[t])) {
+            p += len;
+            t += 1;
+            continue;
+        }
+        let Some((after, took)) = star else {
+            return false;
+        };
+        // The last `*` takes one more character.
+        p = after;
+        t = took + 1;
+        star = Some((after, took + 1));
+    }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 /// An uncertain segment could be `names`' one: a short name could be anything, a wildcard is
@@ -332,6 +384,11 @@ fn is_guarded_suite_toml(path: &str) -> bool {
     // The long name decides when the file is there.
     if let Ok(long) = std::fs::canonicalize(path.trim()) {
         return names_guarded(&normalized(&long.to_string_lossy()));
+    }
+    // A bracket set or a Bash brace expansion the path can't be resolved past asks (ruling
+    // P3-R32): Bash's `[!x]`, `{a,b}` and the like name files the pattern can't be read for.
+    if folder.contains(['[', '{']) || file.contains(['[', '{']) {
+        return true;
     }
     let folder_ok = is_guarded_folder(folder)
         || (uncertain(folder)
@@ -385,8 +442,12 @@ fn powershell_expression_reason(line: &str) -> Option<String> {
         );
     }
     let chars: Vec<char> = line.chars().collect();
+    if let Some(reason) = variable_call_reason(&chars) {
+        return Some(reason);
+    }
     for (i, &c) in chars.iter().enumerate() {
-        if c != ')' {
+        // `(…).Name(` and, after an index, `(…)[0].Name(`.
+        if c != ')' && c != ']' {
             continue;
         }
         let mut j = i + 1;
@@ -419,6 +480,71 @@ fn powershell_expression_reason(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A PowerShell `$` expression that calls a method or a static member (ruling P3-R32): a `$`
+/// variable (`$f`, `${f}`, `$env:x`), then members and indexes (`.Name`, `[0]`), then `(`
+/// after a member (`$f.Delete()`, `$x[0].Delete()`), or `::` anywhere in it (`$t::Delete`).
+fn variable_call_reason(chars: &[char]) -> Option<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '$' {
+            continue;
+        }
+        let mut j = i + 1;
+        if chars.get(j) == Some(&'{') {
+            let Some(close) = chars[j..].iter().position(|&c| c == '}') else {
+                continue;
+            };
+            j += close + 1;
+        } else {
+            // The name, with a drive or scope (`env:`, `script:`).
+            while chars
+                .get(j)
+                .is_some_and(|&c| ident(c) || c == '?' || c == ':')
+            {
+                if chars[j] == ':' && chars.get(j + 1) == Some(&':') {
+                    return Some(static_call());
+                }
+                j += 1;
+            }
+        }
+        let mut member = false;
+        loop {
+            match chars.get(j) {
+                Some('.') => {
+                    j += 1;
+                    let start = j;
+                    while chars.get(j).is_some_and(|&c| ident(c)) {
+                        j += 1;
+                    }
+                    member = j > start;
+                }
+                Some('[') => {
+                    j += chars[j..]
+                        .iter()
+                        .position(|&c| c == ']')
+                        .unwrap_or(chars.len() - j)
+                        + 1;
+                    member = false;
+                }
+                Some(':') if chars.get(j + 1) == Some(&':') => return Some(static_call()),
+                _ => break,
+            }
+        }
+        if member && chars.get(j) == Some(&'(') {
+            return Some(
+                "this calls a method on a variable, which can run any command the hook can't see"
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn static_call() -> String {
+    "this calls a static member through a variable, which can run any command the hook can't see"
+        .to_string()
 }
 
 fn first_reason(shell: Shell, line: &str, depth: usize) -> Option<String> {
@@ -623,6 +749,13 @@ fn lex(shell: Shell, line: &str) -> Parsed {
                     lx.finish_word();
                 }
             }
+            '{' if bash && brace_expansion(&chars, i) => {
+                lx.problem("this uses Bash brace expansion ({a,b}), which the hook doesn't read");
+                break;
+            }
+            // In Bash a `}` inside a word is part of it (`a}`, `suite.{toml,zz}`); only one
+            // that starts a word closes a group.
+            '}' if bash && lx.started => lx.push_char('}'),
             '(' | ')' | '}' => lx.finish_command(false),
             // A PowerShell script block starts a command, glued to a word or not.
             '{' if !bash || !lx.started => lx.finish_command(false),
@@ -804,6 +937,36 @@ impl Lexer {
     }
 }
 
+/// Whether the unquoted Bash `{` at `chars[i]` starts a brace expansion `{…,…}` (ruling
+/// P3-R32): a `}` closes it within the same word and a `,` sits between them. Quotes and `\`
+/// escapes inside are stepped over; whitespace or an operator ends the word.
+fn brace_expansion(chars: &[char], i: usize) -> bool {
+    let (mut j, mut depth, mut comma) = (i + 1, 1, false);
+    while j < chars.len() {
+        match chars[j] {
+            q @ ('\'' | '"') => {
+                let Some(close) = chars[j + 1..].iter().position(|&c| c == q) else {
+                    return false;
+                };
+                j += close + 1;
+            }
+            '\\' => j += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return comma;
+                }
+            }
+            ',' => comma = true,
+            c if c.is_whitespace() || ";|&<>()".contains(c) => return false,
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
 /// Reads the redirection at `chars[i]` (`>`, `>>`, `>|`, `>&2`, `<`) and marks the next word
 /// as its target; returns where reading goes on.
 fn redirect(lx: &mut Lexer, chars: &[char], mut i: usize) -> usize {
@@ -878,15 +1041,68 @@ fn capture_backticks(chars: &[char], start: usize) -> Option<(String, usize)> {
 }
 
 /// Bash keywords before a command word.
-const KEYWORDS: [&str; 9] = [
-    "if", "then", "else", "elif", "do", "while", "until", "!", "time",
-];
+const KEYWORDS: [&str; 8] = ["if", "then", "else", "elif", "do", "while", "until", "!"];
 
 /// Wrappers that run the command after them.
-const WRAPPERS: [&str; 11] = [
+const WRAPPERS: [&str; 12] = [
     "sudo", "env", "nohup", "exec", "nice", "xargs", "command", "builtin", "timeout", "stdbuf",
-    "noglob",
+    "noglob", "time",
 ];
+
+/// A wrapper's options whose value is the next word (ruling P3-R32), so that word isn't read
+/// as the command. An attached value (`-n1`, `--max-args=1`) is part of its option's word.
+/// `time -p` takes no value: it is GNU time's and Bash's portable-format flag.
+fn wrapper_value_options(wrapper: &str) -> &'static [&'static str] {
+    match wrapper {
+        "xargs" => &[
+            "-n",
+            "-L",
+            "-P",
+            "-I",
+            "-d",
+            "-s",
+            "-E",
+            "-a",
+            "--max-args",
+            "--max-lines",
+            "--max-procs",
+            "--delimiter",
+            "--max-chars",
+            "--arg-file",
+        ],
+        "env" => &["-u", "-C", "--unset", "--chdir"],
+        "timeout" => &["-s", "-k", "--signal", "--kill-after"],
+        "nice" => &["-n", "--adjustment"],
+        "sudo" => &[
+            "-u",
+            "-g",
+            "-h",
+            "-p",
+            "-C",
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--close-from",
+        ],
+        "time" => &["-f", "-o", "--format", "--output"],
+        "stdbuf" => &["-i", "-o", "-e", "--input", "--output", "--error"],
+        "exec" => &["-a"],
+        _ => &[],
+    }
+}
+
+/// A plain command name (ruling P3-R32): letters, digits and `_ . + -`, starting with a letter
+/// or `_`. Anything else after a wrapper (a number, a quoted or expanded word, a path) asks.
+fn is_plain_command_name(w: &Word) -> bool {
+    let mut chars = w.text.chars();
+    !w.quoted
+        && !w.var
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+}
 
 /// Interpreters and launchers: they run code or another program, so they always ask unless
 /// their only argument is a version or help flag (ruling P3-R28).
@@ -978,6 +1194,8 @@ fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String
         return Some("this writes to a LILITH suite.toml (your caps and settings)".to_string());
     }
     let mut words: &[Word] = &cmd.words;
+    // The wrapper the command word follows, if any.
+    let mut wrapper: Option<String> = None;
     loop {
         let first = words.first()?;
         let t = first.text.as_str();
@@ -999,21 +1217,50 @@ fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String
             {
                 return None;
             }
+            let values = wrapper_value_options(&name);
             words = &words[1..];
-            while words
-                .first()
-                .is_some_and(|w| w.text.starts_with('-') || (name == "env" && w.text.contains('=')))
-            {
+            while let Some(w) = words.first() {
+                let a = w.text.as_str();
+                if name == "env" && !a.starts_with('-') && a.contains('=') {
+                    words = &words[1..];
+                    continue;
+                }
+                if !a.starts_with('-') {
+                    break;
+                }
+                // `env -S` splits its value into a whole command line.
+                if name == "env"
+                    && (a.starts_with("--sp") || (!a.starts_with("--") && a[1..].contains('S')))
+                {
+                    return Some("`env -S` runs a command line the hook doesn't read".to_string());
+                }
                 words = &words[1..];
+                if a == "--" {
+                    break;
+                }
+                if values.contains(&a) && !words.is_empty() {
+                    words = &words[1..];
+                }
             }
             if name == "timeout" && !words.is_empty() {
                 words = &words[1..];
             }
+            wrapper = Some(name);
             continue;
         }
         break;
     }
     let first = &words[0];
+    if let Some(wrapper) = wrapper
+        && !is_plain_command_name(first)
+    {
+        // Ruling P3-R32: when unsure what a wrapper runs, ask.
+        return Some(format!(
+            "the command after `{wrapper}` ({}) isn't a plain command name, so the hook can't \
+             tell what runs",
+            first.text
+        ));
+    }
     let args: Vec<&str> = words[1..].iter().map(|w| w.text.as_str()).collect();
     if shell == Shell::PowerShell {
         if first.text == "&" || first.text == "." {
@@ -1052,8 +1299,19 @@ fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String
             "`coproc` runs a command in the background, which the hook doesn't read".into(),
         );
     }
+    if shell == Shell::Bash && matches!(name.as_str(), "trap" | "alias" | "unalias") {
+        return Some(format!(
+            "`{name}` sets a command to run later or changes what a name runs, which the hook \
+             can't see"
+        ));
+    }
     if shell == Shell::PowerShell
         && let Some(reason) = powershell_alias_reason(&name, &args)
+    {
+        return Some(reason);
+    }
+    if shell == Shell::PowerShell
+        && let Some(reason) = powershell_command_reason(&name, &args)
     {
         return Some(reason);
     }
@@ -1097,6 +1355,31 @@ fn powershell_alias_reason(name: &str, args: &[&str]) -> Option<String> {
         return Some(format!(
             "`{name}` writes to the alias: or function: drive, which defines a command the hook \
              can't see"
+        ));
+    }
+    None
+}
+
+/// PowerShell commands that run code the hook doesn't read (ruling P3-R32): member invocation
+/// through `ForEach-Object`/`%`/`foreach` (a bare member name, or `-MemberName`), and
+/// `Start-Job`, `Start-ThreadJob`, `Import-Module` and `Add-Type`.
+fn powershell_command_reason(name: &str, args: &[&str]) -> Option<String> {
+    if matches!(name, "foreach-object" | "%" | "foreach")
+        && args
+            .iter()
+            .any(|a| !a.starts_with('-') || a.to_ascii_lowercase().starts_with("-m"))
+    {
+        return Some(format!(
+            "`{name}` with a member name calls that method on every input, which the hook can't \
+             see"
+        ));
+    }
+    if matches!(
+        name,
+        "start-job" | "sajb" | "start-threadjob" | "import-module" | "ipmo" | "add-type"
+    ) {
+        return Some(format!(
+            "`{name}` runs a script, a module or compiled code the hook doesn't read"
         ));
     }
     None
@@ -1252,12 +1535,32 @@ fn named_reason(name: &str, args: &[&str]) -> Option<String> {
         {
             reason("deletes or runs commands on the files it finds")
         }
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            reason("runs an awk program, which can run commands (system, pipes)")
+        }
+        "sed" if sed_runs_commands(args) => {
+            reason("runs a sed script with an `e` command or flag, which runs commands")
+        }
+        "tar" if tar_runs_programs(args) => reason(
+            "runs another program for its files (--to-command, --checkpoint-action, \
+             --use-compress-program, --rsh-command, ...)",
+        ),
         "git" => {
             if args
                 .windows(2)
                 .any(|w| w[0] == "-c" && w[1].contains("alias."))
             {
                 return reason("defines an alias on the fly, which can run any command");
+            }
+            if args
+                .windows(2)
+                .any(|w| w[0] == "-c" && git_key_runs_a_program(w[1]))
+                || args.iter().any(|a| a.starts_with("--config-env"))
+            {
+                return reason(
+                    "sets a config key on the fly that runs a program (core.*, a pager, editor, \
+                     sshCommand or askpass)",
+                );
             }
             match git_subcommand(args) {
                 Some("clean") => reason("clean deletes untracked files"),
@@ -1274,6 +1577,161 @@ fn named_reason(name: &str, args: &[&str]) -> Option<String> {
         "npx" | "uvx" | "pnpx" | "bunx" => reason("downloads and runs a package"),
         _ => None,
     }
+}
+
+/// A `git -c <key>=<value>` whose key can run a program (ruling P3-R32, case-insensitive): any
+/// `core.*`, or a key ending in `pager`, `editor`, `sshCommand` or `askpass`; and, as
+/// conservatively, the other keys git runs as a program: `pager.<command>`, `filter.*`, and a
+/// key ending in `command`, `textconv`, `driver`, `external`, `program` or `helper`
+/// (`diff.<driver>.textconv`, `merge.<driver>.driver`, `gpg.program`, `credential.helper`, …).
+fn git_key_runs_a_program(setting: &str) -> bool {
+    let key = setting
+        .split_once('=')
+        .map_or(setting, |(k, _)| k)
+        .to_ascii_lowercase();
+    ["core.", "pager.", "filter."]
+        .iter()
+        .any(|p| key.starts_with(p))
+        || [
+            "pager",
+            "editor",
+            "sshcommand",
+            "askpass",
+            "command",
+            "textconv",
+            "driver",
+            "external",
+            "program",
+            "helper",
+        ]
+        .iter()
+        .any(|end| key.ends_with(end))
+}
+
+/// Whether `sed`'s script can run a command (ruling P3-R32): a script file (`-f`, which the
+/// hook doesn't read); a plain `s///` whose flags hold `e`; or any other script that holds an
+/// `e` at all (conservative: the `e` command). The scripts are each `-e`/`--expression` value,
+/// or else the first argument that isn't an option.
+fn sed_runs_commands(args: &[&str]) -> bool {
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut first_positional = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        i += 1;
+        if a == "--" {
+            if first_positional.is_none() {
+                first_positional = args.get(i).copied();
+            }
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            if name.len() >= 2 && "file".starts_with(name) {
+                return true;
+            }
+            let takes = |full: &str| !name.is_empty() && full.starts_with(name);
+            if takes("expression") || takes("line-length") {
+                let v = value.or_else(|| {
+                    i += 1;
+                    args.get(i - 1).copied()
+                });
+                if takes("expression") {
+                    scripts.extend(v);
+                }
+            }
+            continue;
+        }
+        if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            for (at, c) in cluster.char_indices() {
+                let rest = &cluster[at + 1..];
+                match c {
+                    'f' => return true,
+                    'e' | 'l' => {
+                        let v = if rest.is_empty() {
+                            i += 1;
+                            args.get(i - 1).copied()
+                        } else {
+                            Some(rest)
+                        };
+                        if c == 'e' {
+                            scripts.extend(v);
+                        }
+                        break;
+                    }
+                    // `-i[SUFFIX]`: the rest is the backup suffix.
+                    'i' => break,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        first_positional.get_or_insert(a);
+    }
+    if scripts.is_empty() {
+        scripts.extend(first_positional);
+    }
+    scripts.iter().any(|s| match plain_substitution_flags(s) {
+        Some(flags) => flags.contains('e'),
+        None => s.contains('e'),
+    })
+}
+
+/// The flags of a script that is exactly one `s<d>…<d>…<d><flags>` command, if it is one.
+fn plain_substitution_flags(script: &str) -> Option<&str> {
+    let mut chars = script.char_indices();
+    if chars.next()?.1 != 's' {
+        return None;
+    }
+    let (_, d) = chars.next()?;
+    if d.is_alphanumeric() || d == '\\' || d.is_whitespace() {
+        return None;
+    }
+    let mut seen = 0;
+    while let Some((at, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == d {
+            seen += 1;
+            if seen == 2 {
+                let flags = &script[at + c.len_utf8()..];
+                return flags
+                    .chars()
+                    .all(|f| "gpiImMe".contains(f) || f.is_ascii_digit())
+                    .then_some(flags);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `tar`'s arguments name an option that runs another program (ruling P3-R32):
+/// `--to-command`, `--checkpoint-action`, `--use-compress-program` (`-I`), `--rsh-command`,
+/// and the volume scripts `--info-script`/`--new-volume-script` (`-F`), long options also by a
+/// prefix tar accepts; a short `-I` or `-F` also in a cluster, or in a first argument of
+/// bundled old-style options (`tar xIf …`).
+fn tar_runs_programs(args: &[&str]) -> bool {
+    const LONG: [(&str, usize); 6] = [
+        ("to-command", 4),
+        ("checkpoint-action", 11),
+        ("use-compress-program", 3),
+        ("rsh-command", 3),
+        ("info-script", 3),
+        ("new-volume-script", 4),
+    ];
+    args.iter().enumerate().any(|(at, a)| {
+        if let Some(long) = a.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            LONG.iter()
+                .any(|(full, min)| name.len() >= *min && full.starts_with(name))
+        } else if let Some(cluster) = a.strip_prefix('-') {
+            cluster.contains(['I', 'F'])
+        } else {
+            at == 0 && a.contains(['I', 'F'])
+        }
+    })
 }
 
 /// `lil`'s subcommand: the first argument that isn't a global flag (or `--workspace`'s value).
