@@ -24,5 +24,9 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "io-std", "sync"
 tokio-tungstenite.workspace = true
 toml.workspace = true
 
+[dev-dependencies]
+# The hook lexer's property test (tests/hook_lexer_props.rs).
+proptest.workspace = true
+
 [lints]
 workspace = true
