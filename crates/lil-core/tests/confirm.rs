@@ -911,10 +911,21 @@ fn next_confirmation_event(app: &mut TestApp) -> Value {
     }
 }
 
-#[test] // spec: ARCH-053, APP-044, CORE-111
+#[test] // spec: ARCH-053, APP-044, CORE-111, CORE-113, APP-051
 fn only_a_verified_ui_session_can_answer() {
     let env = TestEnv::new();
     let _core = core(&env);
+
+    // CORE-113 (plan 3): a confirmation can be answered only while a verified `ui:*` connection
+    // is open. A connection that merely *claims* `ui:test` resolves to `cli` here (this process
+    // is no app), so with only that open an agent's destructive call is `confirm.unavailable`.
+    {
+        let _claims = connect(&env, json!({"caller_kind": "ui:test"}));
+        let mut lonely = connect(&env, json!({}));
+        let out = lonely.tool("test.destructive", json!({}), Some(&next_key()));
+        assert_eq!(out["error"]["code"], "confirm.unavailable", "{out}");
+    }
+
     let mut app = TestApp::start(&env, None, &[]);
     assert_eq!(app.hello()["caller_kind"], "ui:test");
     let mut agent = connect(&env, json!({}));
