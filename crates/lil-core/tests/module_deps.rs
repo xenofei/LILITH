@@ -159,58 +159,48 @@ fn strip_cfg_test_mods(text: &str) -> String {
     let mut at = 0;
     while let Some(i) = text[at..].find("#[cfg(test)]") {
         let marker = at + i;
-        // What follows the attribute, skipping whitespace and further attributes.
-        let mut j = marker + "#[cfg(test)]".len();
-        loop {
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            // A visibility before `mod`.
-            let head = &text[j..];
-            let after_vis = head.strip_prefix("pub").map_or(head, |r| {
-                let r = r.trim_start();
-                r.strip_prefix('(')
-                    .and_then(|a| a.split_once(')'))
-                    .map_or(r, |(_, t)| t.trim_start())
+        // What follows the attribute, past whitespace, then an optional visibility, then `mod`.
+        let after_attr = marker + "#[cfg(test)]".len();
+        let rest = text[after_attr..].trim_start();
+        let after_vis = rest.strip_prefix("pub").map_or(rest, |r| {
+            let r = r.trim_start();
+            r.strip_prefix('(')
+                .and_then(|a| a.split_once(')'))
+                .map_or(r, |(_, t)| t.trim_start())
+        });
+        // The `{` that opens the module body, if this is `#[cfg(test)] … mod <name> { … }`.
+        let open = after_vis
+            .strip_prefix("mod ")
+            .and_then(|after_mod| after_mod.find('{').map(|rel| (after_mod, rel)))
+            .map(|(after_mod, rel)| {
+                let base = text.len() - after_mod.len();
+                base + rel
             });
-            if let Some(after_mod) = after_vis.strip_prefix("mod ") {
-                // Find the `{` that opens the module body and its matching `}`.
-                let body_rel = after_mod.find('{');
-                let Some(body_rel) = body_rel else { break };
-                let open = (j + (after_vis.as_ptr() as usize - head.as_ptr() as usize))
-                    + "mod ".len()
-                    + body_rel;
-                // Keep everything up to the attribute, then skip to after the matching brace.
-                out.push_str(&text[at..marker]);
-                let mut depth = 0i32;
-                let mut k = open;
-                while k < bytes.len() {
-                    match bytes[k] {
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                k += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
+        let Some(open) = open else {
+            // Not a test module: keep the text through the attribute and move on.
+            out.push_str(&text[at..after_attr]);
+            at = after_attr;
+            continue;
+        };
+        // Drop the whole block: keep up to the attribute, skip past the matching `}`.
+        out.push_str(&text[at..marker]);
+        let mut depth = 0i32;
+        let mut k = open;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        k += 1;
+                        break;
                     }
-                    k += 1;
                 }
-                at = k;
-                break;
+                _ => {}
             }
-            // Not a module: leave the attribute in place and move past it.
-            out.push_str(&text[at..j]);
-            at = j;
-            break;
+            k += 1;
         }
-        if at <= marker {
-            // Safety: never loop without progress.
-            out.push_str(&text[at..=marker]);
-            at = marker + 1;
-        }
+        at = k;
     }
     out.push_str(&text[at..]);
     out
