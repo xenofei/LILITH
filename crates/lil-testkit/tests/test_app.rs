@@ -108,7 +108,7 @@ fn claude(env: &TestEnv, config: Option<&Path>, args: &[&str]) -> (i32, String) 
     claude_with(&vars, args)
 }
 
-#[test] // spec: QA-066, QA-041
+#[test] // spec: QA-039, QA-066, QA-041
 fn fake_claude_honours_claude_config_dir() {
     let env = TestEnv::new();
     let config = tempfile::Builder::new()

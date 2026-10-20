@@ -28,8 +28,8 @@ use lil_core::jobs::{
 };
 use lil_core::meter::record::{self as usage_record};
 use lil_core::meter::{
-    Attribution, Meter, MeterSettle, SummaryQuery, UsageCtx, UsageDraft, UsageStatus, attribute,
-    register_meter_tools,
+    Attribution, CapCheck, Caps, Meter, MeterSettle, SummaryQuery, UsageCtx, UsageDraft,
+    UsageStatus, attribute, register_meter_tools,
 };
 use lil_core::session::Session;
 use lil_core::state::StateRegistry;
@@ -38,7 +38,7 @@ use lil_core::telemetry::{
     EnergySlice, HwSources, JobEnergy, JobEnergyQuery, PowerSettings, Telemetry, TickMode,
 };
 use lil_core::tools::{
-    BillingBasis, CallCtx, MeterStage, Registry, SettleInput, register_telemetry_tools,
+    BillingBasis, CallCtx, Estimate, MeterStage, Registry, SettleInput, register_telemetry_tools,
 };
 use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::SystemProbe;
@@ -1608,5 +1608,89 @@ async fn summary_reads_the_workspace_logs_of_every_machine() {
         .await
         .unwrap();
     assert_eq!(without["by_currency"], json!({"USD": "1"}), "{without}");
+    drop(open);
+}
+
+/// Caps are enforced on each machine (CORE-092): spend synced from another machine shows in
+/// `usage.summary`, for information, but never counts against this machine's caps.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-092, CORE-082
+async fn spend_synced_from_another_machine_never_counts_against_the_caps() {
+    let env = TestEnv::new();
+    let ws = env.make_workspace("synced");
+    env.register_workspace(&ws, true);
+    let suite = env.env.suite_toml();
+    let text = std::fs::read_to_string(&suite).unwrap();
+    let caps_toml = "[money]
+display_currency = \"USD\"
+[caps]
+monthly = \"5\"
+";
+    lil_testkit::files::write_file(
+        &suite,
+        format!(
+            "{text}
+{caps_toml}"
+        )
+        .as_bytes(),
+    );
+    let rig = Rig::with(env, &busy(), PowerSettings::default());
+    let caps = Caps::new(
+        rig.states.clone(),
+        rig.env.env.clone(),
+        rig.clock.clone(),
+        rig.events.clone(),
+        rig.fp.clone(),
+        rig.ids.clone(),
+    );
+    let open = rig.hub.open(&ws_ref(&ws)).await.unwrap();
+    // Another machine's 4 USD, synced into this month's log of the workspace.
+    let period = caps.period(rig.clock.utc_now());
+    let mut record = usage_record::draft_record(
+        &format!("{period}-15T07:00:00.000Z"),
+        &uctx(None, "c_9"),
+        &draft("p", BillingBasis::Payg, None),
+    );
+    usage_record::finish(
+        &mut record,
+        Some(usd("4")),
+        "provider_reported",
+        "succeeded",
+        Some(1),
+    );
+    let mut line = Map::new();
+    line.insert("machine".into(), json!("othermachine"));
+    line.insert("seq".into(), json!(1));
+    line.extend(record);
+    lil_testkit::files::write_file(
+        &ws.join(format!("registry/usage.othermachine.{period}.jsonl")),
+        format!(
+            "{}
+",
+            Value::Object(line)
+        )
+        .as_bytes(),
+    );
+
+    let q = serde_json::from_value::<SummaryQuery>(json!({"period": "month"})).unwrap();
+    let shown = rig.meter.summary(q, Some(&open)).await.unwrap();
+    assert_eq!(shown["by_currency"], json!({"USD": "4"}), "{shown}");
+    let view = caps.view().await.unwrap();
+    let monthly = view.caps.iter().find(|c| c.cap == "monthly").unwrap();
+    assert_eq!(
+        (monthly.settled.as_str(), monthly.held.as_str()),
+        ("0", "0")
+    );
+    let estimate = |amount: &str| Estimate::External {
+        provider: "p".into(),
+        amount: Money::parse_decimal(amount).unwrap(),
+        currency: Currency::parse("USD").unwrap(),
+        basis: BillingBasis::Payg,
+    };
+    // 3 more passes this machine's cap of 5 (4 + 3 would not); 6 doesn't, so the cap is live.
+    assert_eq!(caps.check(&estimate("3")).await.unwrap(), CapCheck::Within);
+    assert!(matches!(
+        caps.check(&estimate("6")).await.unwrap(),
+        CapCheck::Exceeds(_)
+    ));
     drop(open);
 }

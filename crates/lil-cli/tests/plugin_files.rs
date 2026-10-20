@@ -303,6 +303,83 @@ fn every_skill_is_in_the_inventory() {
     }
 }
 
+/// Plugin 1.3 replaces 1.2.0 (CORE-151): none of 1.2.0's retired parts is carried, neither the
+/// `licenses` and `compliance` skills nor the `license-auditor` agent, in the files or in the
+/// inventory.
+#[test] // spec: CORE-151
+fn plugin_1_3_carries_none_of_the_retired_parts() {
+    let dir = plugin_dir();
+    assert_eq!(
+        read_json(&dir.join(".claude-plugin/plugin.json"))["version"],
+        "1.3.0"
+    );
+    let retired = ["licenses", "compliance", "license-auditor"];
+    let mut files = Vec::new();
+    files_under(&dir, &mut files);
+    for file in &files {
+        let rel = file
+            .strip_prefix(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        let parts: Vec<&str> = rel
+            .split(['/', '\\'])
+            .map(|p| p.trim_end_matches(".md"))
+            .collect();
+        assert!(
+            !parts.iter().any(|p| retired.contains(p)),
+            "{rel} is a retired part of plugin 1.2.0"
+        );
+    }
+    let inventory: toml::Table = std::fs::read_to_string(dir.join("skills-inventory.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    for kind in ["skill", "agent"] {
+        for entry in inventory
+            .get(kind)
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = entry["name"].as_str().unwrap_or_default();
+            assert!(
+                !retired.contains(&name),
+                "the inventory lists {kind} {name}"
+            );
+        }
+    }
+}
+
+/// Skills tell whether a suite runs by `lil status --no-start` (ARCH-102): the `lilith` skill
+/// gives its exit codes, and they are the codes `lil` returns, without starting a core.
+#[test] // spec: ARCH-102, ARCH-018
+fn the_lilith_skill_detects_a_core_the_way_lil_status_reports_it() {
+    let skill = std::fs::read_to_string(plugin_dir().join("skills/lilith/SKILL.md")).unwrap();
+    assert!(skill.contains("lil status --no-start"), "{skill}");
+    let code_for = |state: &str| -> i32 {
+        skill
+            .lines()
+            .find_map(|l| {
+                let rest = l.trim().strip_prefix("- Exit code ")?;
+                let (code, said) = rest.split_once(": ")?;
+                said.starts_with(state).then(|| code.parse().unwrap())
+            })
+            .unwrap_or_else(|| panic!("the skill gives no exit code for {state:?}"))
+    };
+    let env = TestEnv::new();
+    let none = env.lil(&["--no-start", "status"]);
+    assert_eq!(none.code, code_for("no core is running"), "{none:?}");
+    assert!(
+        RawPipe::try_connect(&env, std::time::Duration::from_secs(1)).is_none(),
+        "the probe started a core"
+    );
+    let core = CoreFixture::start(&env);
+    let running = env.lil(&["--no-start", "status"]);
+    assert_eq!(running.code, code_for("a core is running"), "{running:?}");
+    drop(core);
+}
+
 /// The fixture workspace, as a workspace from before the rename: its workspace file has the
 /// legacy name. Registered as the default.
 fn plugin_era_workspace(env: &TestEnv) -> PathBuf {

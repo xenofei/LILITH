@@ -291,6 +291,45 @@ async fn paths_and_format_follow_appendix_f() {
     fx.shutdown().await;
 }
 
+/// A `workflow` resource keeps a ComfyUI graph and its marked slots as its data, in the
+/// workspace library by default.
+#[tokio::test] // spec: APP-080, APP-079
+async fn a_workflow_resource_holds_a_comfyui_graph_and_its_slots() {
+    let fx = Fx::new();
+    let data = json!({
+        "graph": {
+            "3": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 20}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}}
+        },
+        "slots": [
+            {"name": "prompt", "node": "6", "input": "text"},
+            {"name": "seed", "node": "3", "input": "seed"}
+        ]
+    });
+    let saved = fx
+        .ok(
+            "resource.save",
+            json!({"kind": "workflow", "id": "txt2img", "name": "Text to image", "data": data}),
+        )
+        .await;
+    assert_eq!(saved["path"], "workflow/txt2img.json", "{saved}");
+    assert_eq!(
+        read_json(&fx.workspace_file("workflow", "txt2img"))["data"],
+        data
+    );
+    let got = fx
+        .ok("resource.get", json!({"kind": "workflow", "id": "txt2img"}))
+        .await;
+    assert_eq!(
+        (&got["resource"]["data"], got["scope"].as_str()),
+        (&data, Some("workspace")),
+        "{got}"
+    );
+    let listed = fx.ok("resource.list", json!({"kind": "workflow"})).await;
+    assert_eq!(listed["resources"][0]["id"], "txt2img", "{listed}");
+    fx.shutdown().await;
+}
+
 #[tokio::test] // spec: APP-078, APP-079
 async fn default_scope_rules() {
     let fx = Fx::new();

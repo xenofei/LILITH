@@ -240,7 +240,7 @@ fn pending(outcome: &Outcome<ToolOutput>) -> lil_protocol::PendingConfirmation {
     }
 }
 
-#[tokio::test] // spec: ARCH-052, ARCH-055, APP-051, QA-016, CORE-017
+#[tokio::test] // spec: ARCH-052, ARCH-055, APP-051, QA-016, CORE-017, CORE-113
 async fn agent_destructive_or_exec_is_pending_when_an_app_is_connected_else_unavailable() {
     let fx = fixture(McpConfirmation::Core);
     let agents = [CallerKind::Cli, CallerKind::Mcp, CallerKind::Assistant];
@@ -293,7 +293,7 @@ async fn own_actions_never_ask() {
     ok(&out);
 }
 
-#[tokio::test] // spec: QA-016, ARCH-055, APP-051
+#[tokio::test] // spec: QA-016, ARCH-055, APP-051, CORE-113
 async fn non_interactive_never_gets_pending() {
     let fx = fixture(McpConfirmation::Core);
     fx.confirm.presence().opened();

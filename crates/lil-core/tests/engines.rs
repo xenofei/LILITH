@@ -813,7 +813,7 @@ async fn owned_launcher_child_is_tracked_checked_and_killed() {
 // Attached engines (ARCH-064).
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-064
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-064, ARCH-065
 async fn attached_when_something_already_answers() {
     let fake = FakeComfy::start();
     let env = TestEnv::new();
@@ -822,6 +822,13 @@ async fn attached_when_something_already_answers() {
     let engines = rig.engines(Arc::new(OsSockets));
     engines.tick().await;
 
+    // In M1 the core manages ComfyUI only (ARCH-065): one engine, and no other name.
+    let all = engines.status().await;
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(all[0].engine, EngineKind::ComfyUi);
+    for other in ["llama-server", "ollama", "engine-a"] {
+        assert_eq!(EngineKind::parse(other), None, "{other}");
+    }
     let status = engines.status().await.remove(0);
     assert_eq!(
         (status.class, status.state, status.listen),
