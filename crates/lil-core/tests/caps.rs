@@ -2153,3 +2153,269 @@ async fn caps_set_over_a_caps_that_is_not_a_table_is_a_clear_error() {
         "caps = 5\n"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ruling P3-R33: cap repair fails closed (final review I3, M5).
+// ---------------------------------------------------------------------------------------------
+
+impl Rig {
+    /// The caps and the meter of the next core run, on the same state.
+    fn restart(&self) -> (Arc<Caps>, Arc<Meter>) {
+        let caps = Caps::new(
+            self.states.clone(),
+            self.env.env.clone(),
+            self.clock.clone(),
+            self.events.clone(),
+            FailPoints::none(),
+            self.ids.clone(),
+        );
+        let meter = Meter::new(
+            self.states.clone(),
+            self.env.env.clone(),
+            self.clock.clone(),
+            self.ids.clone(),
+            self.events.clone(),
+            self.telemetry.clone(),
+            PowerSettings::default(),
+            FailPoints::none(),
+        );
+        (caps, meter)
+    }
+
+    /// A reservation of `amount` USD for call `call`, whose write-ahead usage row is still
+    /// `pending` (its request may have been sent).
+    async fn pending_call(&self, amount: &str, call: &str) -> String {
+        let rv = self.reserved(amount, call).await;
+        let ctx = UsageCtx {
+            workspace: None,
+            project: None,
+            asset: None,
+            job_id: None,
+            call_id: call.into(),
+            caller_kind: "cli".into(),
+            reservation: Some(rv.clone()),
+        };
+        let draft = UsageDraft {
+            tool: "test.meter_external".into(),
+            provider: "fakeprov".into(),
+            model: None,
+            route: "test".into(),
+            basis: BillingBasis::Payg,
+            units: serde_json::Map::new(),
+            est_cost: Some((money(amount), Currency::parse("USD").unwrap())),
+            account: None,
+            raw_usage: None,
+            attribution: Attribution::Suite,
+            status: UsageStatus::Pending,
+            latency_ms: None,
+        };
+        self.meter.begin(&ctx, draft).await.unwrap();
+        rv
+    }
+
+    /// Runs `sql` on the suite `state.db` through a connection of its own, to inject a failure
+    /// the core's connection then meets.
+    fn suite_sql(&self, sql: &str) {
+        rusqlite::Connection::open(self.env.env.suite_state_db())
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    async fn state_of(caps: &Caps, rv: &str) -> (ReservationState, bool) {
+        let r = caps.reservation(rv).await.unwrap().unwrap();
+        (r.state, r.kept)
+    }
+}
+
+/// A trigger that makes an update of `cap_reservations` fail (`when` narrows which).
+fn failing_updates(when: &str) -> String {
+    format!(
+        "CREATE TRIGGER inject_failure BEFORE UPDATE ON cap_reservations {when}
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+    )
+}
+
+const NO_FAILURE: &str = "DROP TRIGGER inject_failure;";
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-088, CORE-071; ruling P3-R33
+async fn a_failed_repair_skips_the_meter_recovery_and_the_hold_survives_a_restart() {
+    let rig = Rig::new(MONTHLY_10);
+    let rv = rig.pending_call("3", "c_00000000000000a1").await;
+    // The next start's repair fails (the suite state.db refuses its writes).
+    rig.suite_sql(&failing_updates(""));
+    let (caps, meter) = rig.restart();
+    let start = caps.repair_then_recover(&meter).await;
+    assert!(start.repaired.is_err(), "{start:?}");
+    assert!(start.recovered.is_none(), "the meter's recovery is skipped");
+    assert!(
+        lines(&rig.loose()).is_empty(),
+        "no line yet: the row stays for the next start"
+    );
+    rig.suite_sql(NO_FAILURE);
+    // The start after: the row is still there, so the hold is kept, not released.
+    let (caps, meter) = rig.restart();
+    let start = caps.repair_then_recover(&meter).await;
+    assert_eq!(start.repaired.unwrap(), 1);
+    assert_eq!(start.recovered.unwrap().unwrap(), 1, "its pending line");
+    assert_eq!(
+        Rig::state_of(&caps, &rv).await,
+        (ReservationState::Held, true)
+    );
+    assert_eq!(rig.monthly().await, ("0".into(), "3".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-088; ruling P3-R33
+async fn the_repair_goes_on_past_a_reservation_it_cant_repair() {
+    let rig = Rig::new(MONTHLY_10);
+    let first = rig.pending_call("1", "c_00000000000000b1").await;
+    let second = rig.pending_call("2", "c_00000000000000b2").await;
+    rig.suite_sql(&failing_updates(&format!("WHEN OLD.id = '{first}'")));
+    let (caps, meter) = rig.restart();
+    let start = caps.repair_then_recover(&meter).await;
+    assert!(start.repaired.is_err(), "{start:?}");
+    assert!(start.recovered.is_none());
+    assert_eq!(
+        Rig::state_of(&caps, &second).await,
+        (ReservationState::Held, true),
+        "the reservation after the failing one is still decided"
+    );
+    assert_eq!(
+        Rig::state_of(&caps, &first).await,
+        (ReservationState::Held, false),
+        "the failing one stays held for the next start"
+    );
+    rig.suite_sql(NO_FAILURE);
+    let (caps, meter) = rig.restart();
+    let start = caps.repair_then_recover(&meter).await;
+    assert_eq!(start.repaired.unwrap(), 1);
+    assert_eq!(start.recovered.unwrap().unwrap(), 2);
+    assert_eq!(
+        Rig::state_of(&caps, &first).await,
+        (ReservationState::Held, true)
+    );
+    assert_eq!(rig.monthly().await, ("0".into(), "3".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-088, CORE-071; ruling P3-R33
+async fn the_meter_never_removes_the_row_of_a_reservation_the_repair_hasnt_decided() {
+    // A pending row: even with the meter's recovery run first, the hold is kept.
+    let rig = Rig::new(MONTHLY_10);
+    let rv = rig.pending_call("3", "c_00000000000000c1").await;
+    let (caps, meter) = rig.restart();
+    assert_eq!(
+        meter.recover().await.unwrap(),
+        0,
+        "left for the caps' repair"
+    );
+    assert!(lines(&rig.loose()).is_empty());
+    assert_eq!(caps.repair().await.unwrap(), 1);
+    assert_eq!(
+        Rig::state_of(&caps, &rv).await,
+        (ReservationState::Held, true),
+        "kept, never released"
+    );
+    assert_eq!(meter.recover().await.unwrap(), 1, "now its line is written");
+
+    // A logging row (the line is in, the settle didn't happen): settled from the line.
+    let rig = Rig::new(MONTHLY_10);
+    rig.fp.on(
+        "meter.after_usage_line",
+        Box::new(|| Err(std::io::Error::other("crash after the usage line"))),
+    );
+    let out = rig
+        .call(
+            &session(CallerKind::Cli, "s_cli", true),
+            "test.meter_external",
+            json!({"provider": "fakeprov", "amount": "1"}),
+            &next_key(),
+        )
+        .await;
+    ok(&out);
+    let (caps, meter) = rig.restart();
+    assert_eq!(meter.recover().await.unwrap(), 0);
+    assert_eq!(caps.repair().await.unwrap(), 1);
+    assert_eq!(
+        rig.monthly().await,
+        ("1".into(), "0".into()),
+        "settled from its line, never released"
+    );
+    assert_eq!(meter.recover().await.unwrap(), 0, "the line was in already");
+    assert_eq!(lines(&rig.loose()).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-088, AI-029; ruling P3-R33
+async fn a_failed_hand_over_leaves_the_reservation_to_the_jobs_repair() {
+    let rig = Rig::new(MONTHLY_10);
+    // The hand-over to the job fails: the reservation stays the call's.
+    rig.suite_sql(
+        "CREATE TRIGGER inject_failure BEFORE UPDATE OF owner ON cap_reservations
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    );
+    let done_rv = rig.reserved("3", "c_00000000000000d2").await;
+    let done = rig
+        .jobs
+        .submit(
+            &rig.caller(CallerKind::Cli, "c_00000000000000d2", Some(done_rv.clone())),
+            spec(json!({})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rig.wait(&done.job_id).await.status, JobStatus::Succeeded);
+    // One lane: this one runs (and waits for its cancel) once the first is done.
+    let running_rv = rig.reserved("2", "c_00000000000000d1").await;
+    let running = rig
+        .jobs
+        .submit(
+            &rig.caller(
+                CallerKind::Cli,
+                "c_00000000000000d1",
+                Some(running_rv.clone()),
+            ),
+            spec(json!({"end": "cancel"})),
+        )
+        .await
+        .unwrap();
+    rig.suite_sql(NO_FAILURE);
+    for rv in [&running_rv, &done_rv] {
+        let r = rig.caps.reservation(rv).await.unwrap().unwrap();
+        assert!(r.owner.starts_with("c_"), "the hand-over failed: {r:?}");
+    }
+    // As a core that died before the finished job's completion settled it.
+    rig.suite_sql(&format!(
+        "UPDATE cap_reservations SET state = 'held', settled_micros = NULL, ended_ms = NULL
+         WHERE id = '{done_rv}'; DELETE FROM cap_settled;"
+    ));
+    let (caps, meter) = rig.restart();
+    let start = caps.repair_then_recover(&meter).await;
+    assert_eq!(start.repaired.unwrap(), 0, "both are the jobs'");
+    for rv in [&running_rv, &done_rv] {
+        assert_eq!(
+            Rig::state_of(&caps, rv).await,
+            (ReservationState::Held, false),
+            "not released by the calls' repair"
+        );
+    }
+    assert_eq!(
+        caps.repair_jobs().await.unwrap(),
+        1,
+        "the running job waits"
+    );
+    assert_eq!(
+        Rig::state_of(&caps, &done_rv).await.0,
+        ReservationState::Settled,
+        "decided by its job"
+    );
+    assert_eq!(
+        Rig::state_of(&caps, &running_rv).await,
+        (ReservationState::Held, false)
+    );
+    assert_eq!(rig.monthly().await, ("3".into(), "2".into()));
+    let _ = rig
+        .jobs
+        .cancel(
+            &rig.caller(CallerKind::Cli, "c_cancel", None),
+            &JobId(running.job_id),
+        )
+        .await;
+}

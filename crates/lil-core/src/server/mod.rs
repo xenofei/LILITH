@@ -386,25 +386,27 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     jobs.add_completion(caps.clone());
     jobs.set_reservations(caps.clone());
     // A dead core's held reservations, decided by its calls' usage rows before the meter's
-    // recovery removes them (CORE-088).
-    match caps.repair().await {
+    // recovery removes them (CORE-088); then the usage rows a dead core left become `pending`
+    // lines (CORE-071), but only after a successful repair, so a failed repair finds the rows
+    // again at the next start (ruling P3-R33).
+    let start = caps.repair_then_recover(&meter).await;
+    match start.repaired {
         Ok(0) => {}
         Ok(n) => tracing::warn!(
             count = n,
             "cap reservations of an earlier core run were repaired"
         ),
         Err(e) => {
-            tracing::error!(code = %e.code, error = %e.message, "the cap reservations could not be repaired; they stay held until the next start")
+            tracing::error!(code = %e.code, error = %e.message, "the cap reservations could not be repaired; they stay held, and the suite's usage rows stay, until the next start")
         }
     }
-    // Usage rows a dead core left become `pending` lines (CORE-071).
-    match meter.recover().await {
-        Ok(0) => {}
-        Ok(n) => tracing::warn!(
+    match start.recovered {
+        None | Some(Ok(0)) => {}
+        Some(Ok(n)) => tracing::warn!(
             count = n,
             "usage records of an earlier core run were written"
         ),
-        Err(e) => {
+        Some(Err(e)) => {
             tracing::error!(code = %e.code, error = %e.message, "the suite's pending usage rows could not be recovered; the next start tries again")
         }
     }
@@ -473,10 +475,12 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
-                    if let Err(e) = caps.repair_workspace(&open).await {
-                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's cap reservations could not be repaired; they stay held");
+                    // The meter's recovery only after a successful repair (ruling P3-R33).
+                    let start = caps.repair_then_recover_workspace(&meter, &open).await;
+                    if let Err(e) = start.repaired {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's cap reservations could not be repaired; they stay held, and its usage rows stay, until the next start");
                     }
-                    if let Err(e) = meter.recover_workspace(&open).await {
+                    if let Some(Err(e)) = start.recovered {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's pending usage rows could not be recovered; the next start tries again");
                     }
                     if let Err(e) = confirm.load(&open.state).await {

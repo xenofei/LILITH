@@ -14,7 +14,9 @@
 //!   for in the log first, and written only if it is not there, so a crash between the line and
 //!   the row's removal never gives two lines. Reservations are [`caps::Caps`']: the meter
 //!   neither keeps nor releases one, and the caps' repair reads a dead call's rows before the
-//!   meter's recovery removes them.
+//!   meter's recovery removes them. A call's row whose reservation is still held and not
+//!   `kept` (the repair hasn't decided it) is left as it is, neither written nor removed, and
+//!   a scope whose repair failed isn't recovered at all (ruling P3-R33).
 //! - **Inline calls** (stage 8, [`stage::MeterSettle`]). A tool that leaves its row pending
 //!   gets it finished at its estimate, with the call's status: its line first, then the call's
 //!   reservation is settled, and only then is the row removed, so a crash in between leaves a
@@ -458,6 +460,15 @@ impl Meter {
             .map_err(|e| state_error(&e))?;
         let mut written = 0;
         for row in rows {
+            // A call's row stays until the caps' repair has decided its reservation, so a
+            // reservation is never released after its line was written (ruling P3-R33).
+            if row.job_id.is_none()
+                && let Some(rv) = &row.reservation
+                && caps::undecided(&self.states.suite_db(), rv).await
+            {
+                tracing::warn!(usage_id = %row.id, reservation = %rv, "a usage row of an earlier core run waits for its cap reservation's repair");
+                continue;
+            }
             if row.logging && self.logged(scope, &row).await {
                 tracing::info!(usage_id = %row.id, "a usage line of an earlier core run was already in the log");
             } else {

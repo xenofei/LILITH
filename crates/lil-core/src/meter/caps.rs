@@ -41,6 +41,14 @@
 //!   (`interrupted_unknown`) one waits for you. A tool that finishes its own usage line under a
 //!   reservation keeps the row until stage 8 settles at that line's cost, so a crash before it
 //!   settles from the line, never releasing a spent reservation.
+//! - **Repair fails closed** (ruling P3-R33). The repair of a scope goes on past a reservation
+//!   it can't decide (logged; that one stays held) and then fails, and a scope whose repair
+//!   failed skips the meter's recovery ([`Caps::repair_then_recover`],
+//!   [`Caps::repair_then_recover_workspace`]), so its rows are still there at the next start.
+//!   The meter's recovery never removes a call's row while its reservation is held and not
+//!   `kept`, so "no row" always means no line was written. A call's reservation that a job
+//!   holds (`jobs.reservation`: its hand-over failed) is left to the job repair, which decides
+//!   it by that job.
 //! - **Periods** are local calendar months ([`Caps::period`], CORE-012). A reservation counts
 //!   in the month it was made: held ones of earlier months don't count against this month.
 //! - **Alerts** at 50 %, 80 % and 100 % of the settled amount, once per level, cap and month
@@ -155,6 +163,36 @@ pub struct Reservation {
     pub settled: Option<Money>,
     /// It stays held: its call left a pending usage line at a crash.
     pub kept: bool,
+}
+
+/// Whether reservation `id` in the suite `state.db` `suite` is still held and not `kept`: the
+/// caps' repair hasn't decided it, so the meter's recovery leaves its call's rows (ruling
+/// P3-R33). An error counts as undecided (fail closed).
+pub(crate) async fn undecided(suite: &StateDb, id: &str) -> bool {
+    let id = id.to_string();
+    let row = suite
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT state, kept FROM cap_reservations WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|e| sql(&e))
+        })
+        .await;
+    match row {
+        Ok(Some((state, kept))) => state == "held" && kept == 0,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// What a scope's start did: the caps' repair, then the meter's recovery.
+#[derive(Debug)]
+pub struct ScopeStart {
+    pub repaired: Result<u32, ErrorBody>,
+    pub recovered: Option<Result<u32, ErrorBody>>,
 }
 
 /// Who a reservation is for: its owner (the call id `c_…`) and workspace (an id or `none`).
@@ -1000,6 +1038,39 @@ impl Caps {
             .await
     }
 
+    /// The suite scope's start (ruling P3-R33): [`Caps::repair`], then the meter's recovery
+    /// ([`super::Meter::recover`]) only when the repair succeeded. After a failed repair the
+    /// scope's usage rows stay, so the next start decides their reservations from them.
+    pub async fn repair_then_recover(&self, meter: &super::Meter) -> ScopeStart {
+        let repaired = self.repair().await;
+        let recovered = match repaired {
+            Ok(_) => Some(meter.recover().await),
+            Err(_) => None,
+        };
+        ScopeStart {
+            repaired,
+            recovered,
+        }
+    }
+
+    /// [`Caps::repair_then_recover`] for workspace `open`: [`Caps::repair_workspace`], then
+    /// [`super::Meter::recover_workspace`] only when it succeeded.
+    pub async fn repair_then_recover_workspace(
+        &self,
+        meter: &super::Meter,
+        open: &Arc<OpenWorkspace>,
+    ) -> ScopeStart {
+        let repaired = self.repair_workspace(open).await;
+        let recovered = match repaired {
+            Ok(_) => Some(meter.recover_workspace(open).await),
+            Err(_) => None,
+        };
+        ScopeStart {
+            repaired,
+            recovered,
+        }
+    }
+
     /// The suite scope's job reservations at start, once its jobs are recovered (module docs,
     /// "Repair").
     ///
@@ -1057,12 +1128,24 @@ impl Caps {
     /// was `interrupted` with external side effects (it may have been charged, so it stays held,
     /// `kept`); one that succeeded settles it at the reserved amount; one still unfinished (an
     /// `interrupted_unknown` job) keeps it until you resolve it.
+    ///
+    /// A call's reservation (`c_…`) whose job holds it (`jobs.reservation`, a hand-over that
+    /// failed) is decided here the same way, by that job (ruling P3-R33).
     async fn repair_job_scope(&self, workspace: &str, jobs: &StateDb) -> Result<u32, ErrorBody> {
         let mut repaired = 0;
-        for r in self.left_held(workspace, "j").await? {
-            let row = crate::jobs::record::get(jobs, &r.owner)
-                .await
-                .map_err(|e| state_unavailable(&e))?;
+        let mut held = self.left_held(workspace, "j").await?;
+        held.extend(self.left_held(workspace, "c").await?);
+        for r in held {
+            let row = if r.owner.starts_with("j_") {
+                crate::jobs::record::get(jobs, &r.owner).await
+            } else {
+                crate::jobs::record::holding(jobs, &r.id).await
+            }
+            .map_err(|e| state_unavailable(&e))?;
+            if row.is_none() && !r.owner.starts_with("j_") {
+                // No job took this call's reservation: the calls' repair decides it.
+                continue;
+            }
             match row {
                 Some(job) if !job.status.is_final() => continue,
                 Some(job) if job.status == JobStatus::Succeeded => {
@@ -1082,31 +1165,56 @@ impl Caps {
         Ok(repaired)
     }
 
+    /// A dead run's held call reservations (`c_…`) in `workspace`, decided by their calls'
+    /// usage rows in `usage` (module docs, "Repair"). It goes on past a reservation it can't
+    /// decide (that one stays held and is logged) and then returns the first error, so the
+    /// caller skips the meter's recovery of the scope (ruling P3-R33).
     async fn repair_scope(&self, workspace: &str, usage: &StateDb) -> Result<u32, ErrorBody> {
         let held = self.left_held(workspace, "c").await?;
         let mut repaired = 0;
+        let mut first_error = None;
         for r in held {
-            let rows = record::of_reservation(usage, &r.id)
-                .await
-                .map_err(|e| state_unavailable(&e))?;
-            if rows.iter().any(|row| !row.logging) {
-                tracing::warn!(reservation = %r.id, "a dead call's usage was pending; its reservation stays held");
-                self.keep(&r.id).await?;
-            } else if rows.is_empty() {
-                tracing::info!(reservation = %r.id, "a dead call sent nothing; its reservation is released");
-                self.settle(&r.id, None, false).await?;
-            } else {
-                let records: Vec<Map<String, Value>> =
-                    rows.into_iter().map(|row| row.record).collect();
-                let billed = records
-                    .iter()
-                    .all(|rec| rec.get("status").and_then(Value::as_str) == Some("succeeded"));
-                tracing::warn!(reservation = %r.id, billed, "a dead call's usage line was written; its reservation is settled");
-                self.settle_from_records(&r.id, &records, billed).await?;
+            match self.repair_call(&r, usage).await {
+                Ok(true) => repaired += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(reservation = %r.id, code = %e.code, error = %e.message, "a dead call's cap reservation could not be repaired; it stays held until the next start");
+                    first_error.get_or_insert(e);
+                }
             }
-            repaired += 1;
         }
-        Ok(repaired)
+        first_error.map_or(Ok(repaired), Err)
+    }
+
+    /// Decides one dead call's reservation `r`; `false` when it is left alone (a job holds it).
+    async fn repair_call(&self, r: &Reservation, usage: &StateDb) -> Result<bool, ErrorBody> {
+        let job = crate::jobs::record::holding(usage, &r.id)
+            .await
+            .map_err(|e| state_unavailable(&e))?;
+        if let Some(job) = job {
+            tracing::warn!(reservation = %r.id, job_id = %job.job_id, "a dead call's reservation was never handed over to its job; the jobs' repair decides it");
+            return Ok(false);
+        }
+        let rows = record::of_reservation(usage, &r.id)
+            .await
+            .map_err(|e| state_unavailable(&e))?;
+        if rows.iter().any(|row| !row.logging) {
+            tracing::warn!(reservation = %r.id, "a dead call's usage was pending; its reservation stays held");
+            self.keep(&r.id).await?;
+        } else if rows.is_empty() {
+            // The meter never removes a call's row while its reservation is undecided
+            // (`Meter::recover`), so no row means no line: nothing was sent.
+            tracing::info!(reservation = %r.id, "a dead call sent nothing; its reservation is released");
+            self.settle(&r.id, None, false).await?;
+        } else {
+            let records: Vec<Map<String, Value>> = rows.into_iter().map(|row| row.record).collect();
+            let billed = records
+                .iter()
+                .all(|rec| rec.get("status").and_then(Value::as_str) == Some("succeeded"));
+            tracing::warn!(reservation = %r.id, billed, "a dead call's usage line was written; its reservation is settled");
+            self.settle_from_records(&r.id, &records, billed).await?;
+        }
+        Ok(true)
     }
 
     async fn keep(&self, id: &str) -> Result<(), ErrorBody> {
