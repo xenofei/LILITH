@@ -36,6 +36,10 @@
 //!    set to `lil-mcp.exe` and `lil.exe` in a folder the running channel trusts, else a
 //!    `problem:` naming the path to enter; and the plugin's skills that still write workspace
 //!    files directly, from its `skills-inventory.toml`.
+//! 5. ComfyUI's `pass_env` (ruling P3-R31): a `[engines.comfyui] pass_env` name the engine
+//!    environment scrub still refuses (the suite's own or a paid-provider prefix), or one that
+//!    can never name a variable, is a `problem:` naming the entry; nothing is written. Healthy
+//!    or empty `pass_env` prints nothing.
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead as _, IsTerminal as _, Write as _};
@@ -44,9 +48,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lil_client::blocking::BlockingClient;
 use lil_client::doctor::{
-    SUITE_STATE_SCHEMA, StateFileState, SuiteTomlState, WORKSPACE_STATE_SCHEMA, core_running,
-    finish_recovery_at, inspect_state_db, inspect_suite_toml, set_aside_db, set_aside_suffix,
-    set_repo_autocrlf_false, workspace_state_db,
+    SUITE_STATE_SCHEMA, StateFileState, SuiteTomlState, WORKSPACE_STATE_SCHEMA,
+    comfy_pass_env_problems, core_running, finish_recovery_at, inspect_state_db,
+    inspect_suite_toml, set_aside_db, set_aside_suffix, set_repo_autocrlf_false,
+    workspace_state_db,
 };
 use lil_client::{ClientError, StartPolicy, WorkspaceOrigin, WorkspaceSource};
 use lil_platform::names::{
@@ -163,6 +168,11 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
 
     // 4.
     claude_code(&env, claude.as_deref(), interactive, &mut report);
+
+    // 5. ComfyUI's `pass_env` (ruling P3-R31): a listed name the scrub still refuses, or one
+    // that can never match, is reported here, never let through silently.
+    comfy_pass_env(&env, &mut report);
+
     Ok(if report.problems == 0 {
         EXIT_OK
     } else {
@@ -627,6 +637,18 @@ const CLAUDE_CHECKS: &str = "claude.";
 /// `claude.exe` on `PATH`, when Claude Code is installed. On a test channel only one in this
 /// executable's own folder (the test kit's fake) counts, so a test never runs a real Claude
 /// Code (QA-040).
+/// Step 5: the ComfyUI `pass_env` entries the engine scrub refuses or that can never match
+/// (ruling P3-R31). Each is a `problem:` naming the entry and why; nothing is written. When
+/// there are none (or no table), nothing is printed, so the check is silent on a healthy config.
+fn comfy_pass_env(env: &Env, report: &mut Report) {
+    for (entry, why) in comfy_pass_env_problems(env) {
+        report.problem(&format!(
+            "[engines.comfyui] pass_env entry {entry:?} is not let through: {why} — remove it \
+             from pass_env in suite.toml"
+        ));
+    }
+}
+
 fn find_claude(env: &Env) -> Option<PathBuf> {
     let claude = find_on_path("claude.exe")?;
     if matches!(env.channel(), Channel::Test(_)) {

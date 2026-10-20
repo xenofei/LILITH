@@ -20,6 +20,7 @@ pub mod lilref;
 pub mod logs;
 pub mod manifest;
 pub mod money;
+pub mod pass_env;
 pub mod paths;
 pub mod refs;
 pub mod status;

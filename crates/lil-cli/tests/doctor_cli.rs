@@ -236,6 +236,31 @@ fn doctor_without_a_default_workspace_skips_the_workspace_checks() {
     assert_eq!(probe.code, 3, "no core was started: {probe:?}");
 }
 
+#[test] // spec: ARCH-063
+fn doctor_reports_pass_env_entries_the_scrub_refuses() {
+    let env = TestEnv::new();
+    env.suite_toml_set(
+        "[engines.comfyui]\npass_env = ['HF_TOKEN', 'ANTHROPIC_API_KEY', 'LIL_ENGINE', 'HF_*']\n",
+    );
+    let out = env.lil(&["doctor"]);
+    assert_eq!(out.code, 1, "a refused entry is a problem: {out:?}");
+    let lines = printed(&out);
+    // The refused and malformed entries are each reported, by name.
+    for entry in ["\"ANTHROPIC_API_KEY\"", "\"LIL_ENGINE\"", "\"HF_*\""] {
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("problem: [engines.comfyui] pass_env entry") && l.contains(entry)
+            ),
+            "{entry} not reported: {out:?}"
+        );
+    }
+    // The allowed hub token is not reported.
+    assert!(
+        !lines.iter().any(|l| l.contains("\"HF_TOKEN\"")),
+        "HF_TOKEN should pass: {out:?}"
+    );
+}
+
 /// `path` with `suffix` added to its file name.
 fn beside(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();

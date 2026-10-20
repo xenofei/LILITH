@@ -230,6 +230,20 @@ pub fn inspect_suite_toml(env: &Env) -> SuiteTomlState {
     }
 }
 
+/// The `[engines.comfyui] pass_env` entries this channel's `suite.toml` lists that the engine
+/// scrub refuses even though they are listed, or that can never name a variable (ruling P3-R31):
+/// `(entry, why)`. Empty when the file is missing, unreadable, has no such table, or every entry
+/// is let through. `lil doctor` reports each one, so a refused name is never dropped silently.
+pub fn comfy_pass_env_problems(env: &Env) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(env.suite_toml_to_read()) else {
+        return Vec::new();
+    };
+    let Ok(suite) = SuiteToml::parse(&text) else {
+        return Vec::new();
+    };
+    lil_schema::pass_env::split(&suite).1
+}
+
 /// Whether a core serves this channel's pipe now (it holds the suite `state.db` open). Any
 /// answer but "no such pipe" counts as running, so a set-aside is never offered while one may
 /// be using the files.

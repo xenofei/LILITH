@@ -547,6 +547,44 @@ port = 8190
         .pass_env
         .is_empty()
     );
+
+    // Refused and malformed entries are kept out of pass_env and reported separately
+    // (P3-R31): the suite's own variables, paid-provider keys, and names that can't match. Hub
+    // tokens still pass.
+    let refused = config(
+        "[engines.comfyui]
+pass_env = ['LIL_ENGINE', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'FAL_KEY', \
+'COMFY_API_KEY', 'HF_*', '', 'HF_TOKEN', 'CIVITAI_API_TOKEN']
+",
+    );
+    assert_eq!(refused.pass_env, ["HF_TOKEN", "CIVITAI_API_TOKEN"]);
+    let rejected: Vec<&str> = refused
+        .pass_env_rejected
+        .iter()
+        .map(|(e, _)| e.as_str())
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            "LIL_ENGINE",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "FAL_KEY",
+            "COMFY_API_KEY",
+            "HF_*",
+            "",
+        ]
+    );
+    // A refused name never reaches an engine, even though it is listed.
+    let secrets = ["LIL_ENGINE", "ANTHROPIC_API_KEY", "FAL_KEY", "HF_TOKEN"];
+    let through: Vec<String> = scrubbed_env(
+        secrets.iter().map(|n| (n.into(), "v".into())),
+        &refused.pass_env,
+    )
+    .into_iter()
+    .map(|(n, _)| n.into_string().unwrap())
+    .collect();
+    assert_eq!(through, ["HF_TOKEN"]);
 }
 
 /// Only you set `pass_env`: `suite.toml`'s two writers in the core (registering a workspace
@@ -591,12 +629,12 @@ fn owned_comfyui_gets_the_pass_env_variables_and_no_other_secret() {
     own(
         &env,
         &root,
-        "pass_env = ['lil_pass_test_token']
+        "pass_env = ['pass_test_token']
 ",
     );
     let vars = [
-        ("LIL_PASS_TEST_TOKEN", "canary-passed"),
-        ("LIL_HELD_TEST_TOKEN", "canary-held"),
+        ("PASS_TEST_TOKEN", "canary-passed"),
+        ("HELD_TEST_TOKEN", "canary-held"),
         ("CIVITAI_API_TOKEN", "canary-civitai"),
     ];
     let _core = CoreFixture::start_with_env(&env, &vars);
@@ -610,7 +648,7 @@ fn owned_comfyui_gets_the_pass_env_variables_and_no_other_secret() {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.clone())
     };
-    assert_eq!(value("LIL_PASS_TEST_TOKEN"), Some(json!("canary-passed")));
+    assert_eq!(value("PASS_TEST_TOKEN"), Some(json!("canary-passed")));
     for (name, canary) in &vars[1..] {
         assert_eq!(value(name), None, "{name} reached the engine");
         assert!(
