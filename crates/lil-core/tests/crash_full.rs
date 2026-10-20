@@ -202,8 +202,9 @@ impl Kind {
 /// the one job of the run that died and never makes a new job of it, never posts a prompt
 /// twice, and ends it (ARCH-022, CORE-120, CORE-128, QA-007, ruling P3-R21):
 /// - without external side effects: `interrupted`, never run again;
-/// - with them, while still `submitting` (before or just after the post): `interrupted_unknown`,
-///   for only the person can tell whether the engine has it;
+/// - with them, while `submitting` (before or just after the post) or `executing` (an engine
+///   job or not, ruling P3-R29): `interrupted_unknown`, for only the person can tell whether
+///   the work happened;
 /// - a prompt with them that ComfyUI finished (the core died while staging its outputs): taken
 ///   up by its prompt id and its outputs ingested, so it succeeds, in the suite's cache folder
 ///   (where the dead run's copy stays beside the new one) as in a workspace's staging.
@@ -244,15 +245,6 @@ fn crash_full_every_job_fail_point_for_each_job_kind_in_both_scopes() {
                         assert_eq!(state, (Some("succeeded"), None), "{what}: {job}");
                         let artifacts = job["result"]["artifacts"].as_array();
                         assert_eq!(artifacts.map(Vec::len), Some(1), "{what}: {job}");
-                    }
-                    // A `test.job` has no engine id to look for; with no post in flight it
-                    // ends plain `interrupted` or `interrupted_unknown` (reported to the
-                    // owner as a P3-R21 reading).
-                    Kind::TestJob { external: true } if outputs => {
-                        assert!(
-                            matches!(state.1, Some("interrupted" | "interrupted_unknown")),
-                            "{what}: {job}"
-                        );
                     }
                     Kind::TestJob { external: true } | Kind::Prompt { external: true } => {
                         assert_eq!(

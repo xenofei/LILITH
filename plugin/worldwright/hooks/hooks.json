@@ -6,7 +6,8 @@
           {
             "type": "command",
             "command": "${user_config.lil_path}",
-            "args": ["hook", "session-start"]
+            "args": ["hook", "session-start"],
+            "onFailure": "block"
           }
         ]
       }
@@ -18,7 +19,8 @@
           {
             "type": "command",
             "command": "${user_config.lil_path}",
-            "args": ["hook", "pre-tool-use"]
+            "args": ["hook", "pre-tool-use"],
+            "onFailure": "block"
           }
         ]
       }
@@ -30,7 +32,8 @@
           {
             "type": "command",
             "command": "${user_config.lil_path}",
-            "args": ["hook", "post-tool-use"]
+            "args": ["hook", "post-tool-use"],
+            "onFailure": "block"
           }
         ]
       }

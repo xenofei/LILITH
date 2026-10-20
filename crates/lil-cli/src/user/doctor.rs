@@ -614,6 +614,9 @@ const PLUGIN: &str = "worldwright@lilith";
 const MARKETPLACE: &str = "lilith";
 /// The plugin version this suite ships.
 const PLUGIN_VERSION: &str = "1.3.0";
+/// The oldest Claude Code that honours the plugin hooks' `"onFailure": "block"` (ruling
+/// P3-R30): an older one runs them as if a failure let the action through.
+const MIN_CLAUDE_CODE: &str = "2.1.295";
 /// How long one `claude` command may take.
 const CLAUDE_LIMIT: Duration = Duration::from_secs(120);
 /// The workspace check whose rules only the person may add.
@@ -715,11 +718,40 @@ fn claude_code(env: &Env, claude: Option<&Path>, interactive: bool, report: &mut
         return;
     };
     report.ok(&format!("Claude Code: {}", claude.display()));
+    claude_version(claude, report);
     if plugin(claude, interactive, report) {
         hooks_file(claude, report);
         plugin_options(env, report);
     }
     skills_inventory(report);
+}
+
+/// `claude --version` (`2.1.296 (Claude Code)`): one older than [`MIN_CLAUDE_CODE`], or one
+/// that can't be read, is a problem naming the update step (ruling P3-R30).
+fn claude_version(claude: &Path, report: &mut Report) {
+    let version = match run_claude(claude, &["--version"]) {
+        Ok(out) => out
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        Err(e) => {
+            report.problem(&format!(
+                "the Claude Code version can't be read: {e} — the plugin's hooks need Claude \
+                 Code {MIN_CLAUDE_CODE} or later; update it with claude update"
+            ));
+            return;
+        }
+    };
+    if older(&version, MIN_CLAUDE_CODE) {
+        report.problem(&format!(
+            "Claude Code {version} is older than {MIN_CLAUDE_CODE}, so a plugin hook that fails \
+             doesn't block its action (\"onFailure\": \"block\") — update it with claude update, \
+             then restart Claude Code"
+        ));
+    } else {
+        report.ok(&format!("Claude Code {version}"));
+    }
 }
 
 /// The plugin in the default profile: installed or updated in place only after `y`, never

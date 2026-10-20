@@ -1689,13 +1689,16 @@ fn never_ran(substatus: Option<Substatus>) -> bool {
 }
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
-/// A job with external side effects whose prompt may be in its engine (it was `submitting`,
-/// or its row holds an engine id: a recovery that couldn't take it up, an adopted job waiting
-/// for its turn) is `interrupted_unknown`, never plain `interrupted` (ruling P3-R21, Task 12
-/// re-review N4). Either way the row gets [`stopped_error`] in place of any earlier attempt's
-/// error.
+/// A job with external side effects whose work may have happened is `interrupted_unknown`,
+/// never plain `interrupted`: it was `submitting`, `executing` or `ingesting` (an engine job or
+/// not, ruling P3-R29), or its row holds an engine id (a recovery that couldn't take it up, an
+/// adopted job waiting for its turn; ruling P3-R21, Task 12 re-review N4). Either way the row
+/// gets [`stopped_error`] in place of any earlier attempt's error.
 fn interrupt_change(row: &JobRow, now: i64) -> Change {
-    let maybe_sent = row.substatus == Some(Substatus::Submitting) || row.external_id.is_some();
+    let maybe_sent = matches!(
+        row.substatus,
+        Some(Substatus::Submitting | Substatus::Executing | Substatus::Ingesting)
+    ) || row.external_id.is_some();
     if row.external_side_effects && maybe_sent {
         let mut c = Change::to(Substatus::InterruptedUnknown);
         c.error = Some(Some(stopped_error(row, RetryHow::Resolve)));

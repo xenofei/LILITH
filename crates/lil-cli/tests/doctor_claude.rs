@@ -361,3 +361,35 @@ fn the_hooks_are_checked_to_run() {
         "{again:?}"
     );
 }
+
+/// Ruling P3-R30: the plugin's hooks carry `"onFailure": "block"`, which Claude Code honours
+/// from 2.1.295. An older Claude Code is a problem naming the update step; 2.1.295 and later
+/// are fine.
+#[test] // spec: AI-117, ARCH-108; ruling P3-R30
+fn a_claude_code_older_than_2_1_295_is_a_problem_with_the_update_step() {
+    let env = TestEnv::new();
+    installed(&env, "1.3.0");
+    for (version, problem) in [
+        ("2.1.294", true),
+        ("2.0.999", true),
+        ("2.1.295", false),
+        ("2.1.296", false),
+    ] {
+        std::fs::write(profile(&env).join("fake-version"), version).unwrap();
+        let out = doctor(&env, env.root(), "n");
+        let flagged = lines(&out).iter().any(|l| {
+            l.starts_with("problem:")
+                && l.contains(&format!("Claude Code {version} is older than 2.1.295"))
+                && l.contains("claude update")
+        });
+        assert_eq!(flagged, problem, "{version}: {out:?}");
+        if !problem {
+            assert!(
+                lines(&out)
+                    .iter()
+                    .any(|l| l.starts_with("ok:") && l.contains(&format!("Claude Code {version}"))),
+                "{version}: {out:?}"
+            );
+        }
+    }
+}

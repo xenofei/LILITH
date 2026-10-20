@@ -156,8 +156,8 @@ fn plugin_files_are_valid_and_use_the_user_config_paths() {
                 assert_eq!(
                     h,
                     &json!({"type": "command", "command": "${user_config.lil_path}",
-                            "args": ["hook", arg]}),
-                    "{event}: exec form, the event as `lil hook` takes it"
+                            "args": ["hook", arg], "onFailure": "block"}),
+                    "{event}: exec form, the event as `lil hook` takes it, failing closed"
                 );
             }
         }
