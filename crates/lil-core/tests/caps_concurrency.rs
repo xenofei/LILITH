@@ -12,11 +12,35 @@ use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::tools::{BillingBasis, Estimate, ReserveOutcome};
 use lil_platform::{Clock, IdSource};
+use lil_protocol::{ErrorBody, codes};
 use lil_schema::money::{Currency, Money};
 use lil_testkit::{FakeClock, SeqIds, TestEnv};
 
 const THREADS: u64 = 16;
 const PER_THREAD: u64 = 100;
+/// Tries per call in [`retried`].
+const TRIES: u32 = 20;
+
+/// `call`, tried again while it returns `state.unavailable`, which the error table makes
+/// `transient` with retry `same_idempotency_key`: its caller retries it. Here it is SQLite's
+/// `SQLITE_BUSY` ("database is locked"). The two connections contend for `BEGIN IMMEDIATE`, and
+/// SQLite's busy handler is not fair: on a slow disk (a CI runner) one connection can wait past
+/// the 5 s busy timeout while the other commits back to back. The core itself has one
+/// connection per database (CORE-004), and its actor queues the calls, so the core's callers
+/// never contend like this. Any other error fails the test. A refused `BEGIN IMMEDIATE` wrote
+/// nothing, so a retry can't count twice, and the totals below would show it if it did.
+async fn retried<T, F>(mut call: impl FnMut() -> F) -> T
+where
+    F: Future<Output = Result<T, ErrorBody>>,
+{
+    for _ in 1..TRIES {
+        match call().await {
+            Err(e) if e.code == codes::STATE_UNAVAILABLE.code => {}
+            done => return done.unwrap(),
+        }
+    }
+    call().await.unwrap()
+}
 
 fn caps_on(env: &TestEnv, clock: &Arc<FakeClock>, ids: &Arc<dyn IdSource>) -> Arc<Caps> {
     let states = Arc::new(
@@ -70,7 +94,7 @@ fn concurrent_reserves_never_overshoot() {
                             owner: &owner,
                             workspace,
                         };
-                        match caps.reserve(&est, who, None).await.unwrap() {
+                        match retried(|| caps.reserve(&est, who, None)).await {
                             ReserveOutcome::Reserved(rv) => {
                                 reserved.fetch_add(1, Ordering::SeqCst);
                                 if provider == "p1" {
@@ -78,7 +102,7 @@ fn concurrent_reserves_never_overshoot() {
                                 }
                                 // Half are settled at once; the rest stay held.
                                 if i % 2 == 0 {
-                                    caps.settle(&rv, None, true).await.unwrap();
+                                    retried(|| caps.settle(&rv, None, true)).await;
                                 }
                             }
                             ReserveOutcome::NeedsCap(hits) => assert!(!hits.is_empty()),
