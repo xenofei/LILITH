@@ -49,8 +49,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lil_client::blocking::BlockingClient;
 use lil_client::doctor::{
     SUITE_STATE_SCHEMA, StateFileState, SuiteTomlState, WORKSPACE_STATE_SCHEMA,
-    comfy_pass_env_problems, core_running, finish_recovery_at, inspect_state_db,
-    inspect_suite_toml, set_aside_db, set_aside_suffix, set_repo_autocrlf_false,
+    comfy_pass_env_problems, comfy_pass_env_warnings, core_running, finish_recovery_at,
+    inspect_state_db, inspect_suite_toml, set_aside_db, set_aside_suffix, set_repo_autocrlf_false,
     workspace_state_db,
 };
 use lil_client::{ClientError, StartPolicy, WorkspaceOrigin, WorkspaceSource};
@@ -96,6 +96,11 @@ impl Report {
 
     fn problem(&mut self, detail: &str) {
         self.line("problem", detail);
+    }
+
+    /// Worth knowing, but not a problem: the exit code is unchanged.
+    fn warning(&mut self, detail: &str) {
+        self.line("warning", detail);
     }
 }
 
@@ -638,13 +643,20 @@ const CLAUDE_CHECKS: &str = "claude.";
 /// executable's own folder (the test kit's fake) counts, so a test never runs a real Claude
 /// Code (QA-040).
 /// Step 5: the ComfyUI `pass_env` entries the engine scrub refuses or that can never match
-/// (ruling P3-R31). Each is a `problem:` naming the entry and why; nothing is written. When
-/// there are none (or no table), nothing is printed, so the check is silent on a healthy config.
+/// (ruling P3-R31). Each is a `problem:` naming the entry and why; nothing is written. An entry
+/// that is let through but looks like a key or token that isn't a hub token is a `warning:`
+/// (ruling P3-R31b). When there are none (or no table), nothing is printed, so the check is
+/// silent on a healthy config.
 fn comfy_pass_env(env: &Env, report: &mut Report) {
     for (entry, why) in comfy_pass_env_problems(env) {
         report.problem(&format!(
             "[engines.comfyui] pass_env entry {entry:?} is not let through: {why} — remove it \
              from pass_env in suite.toml"
+        ));
+    }
+    for (entry, why) in comfy_pass_env_warnings(env) {
+        report.warning(&format!(
+            "[engines.comfyui] pass_env entry {entry:?} is let through, but {why} — keep it only              if a node needs it"
         ));
     }
 }

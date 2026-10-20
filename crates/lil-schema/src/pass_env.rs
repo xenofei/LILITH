@@ -4,9 +4,11 @@
 //! `lil doctor` report), so both agree on one list.
 //!
 //! Refused even when listed: the suite's own variables (`LIL_*`, `CLAUDE_*`) and the paid-provider
-//! keys (`ANTHROPIC_*` and the rest of the P3-R19 prefix list). Allowed: the hub tokens
-//! (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `CIVITAI_*`) and names caught only by the generic parts
-//! (`GITHUB_TOKEN`, …) — this is what `pass_env` is for.
+//! keys (`ANTHROPIC_*` and the rest of the P3-R19 prefix list, and the named keys of ruling
+//! P3-R31b such as `GOOGLE_API_KEY`). Allowed: the hub tokens (`HF_TOKEN`,
+//! `HUGGING_FACE_HUB_TOKEN`, `CIVITAI_*`) — this is what `pass_env` is for — and names caught
+//! only by the generic parts (`GITHUB_TOKEN`, …), which `lil doctor` warns about when they hold
+//! `API_KEY`, `SECRET` or `TOKEN` ([`warning`]).
 
 /// The prefixes a `pass_env` entry may not start with, even when listed (ruling P3-R31). It is
 /// the P3-R19 provider prefix list, with `CIVITAI_` left out so the Civitai hub token stays
@@ -32,9 +34,24 @@ pub const REFUSED_PREFIXES: [&str; 18] = [
     "CLAUDE_",
 ];
 
+/// Paid-provider keys outside the prefix list that a `pass_env` entry may not name, even when
+/// listed (ruling P3-R31b): whole names, compared case-insensitively.
+pub const REFUSED_NAMES: [&str; 9] = [
+    "GOOGLE_API_KEY",
+    "STABILITY_API_KEY",
+    "BFL_API_KEY",
+    "GROQ_API_KEY",
+    "TOGETHER_API_KEY",
+    "RUNWAYML_API_SECRET",
+    "LUMAAI_API_KEY",
+    "IDEOGRAM_API_KEY",
+    "RECRAFT_API_TOKEN",
+];
+
 /// `Ok` when a `pass_env` entry may be let through, `Err(why)` when the scrub refuses it even
-/// though it is listed (a suite or paid-provider prefix) or it can never name an environment
-/// variable (empty, holding whitespace, or holding `=`, `*`, `?` or `%`).
+/// though it is listed (a suite or paid-provider prefix, or a [`REFUSED_NAMES`] name) or it can
+/// never name an environment variable (empty, holding whitespace, or holding `=`, `*`, `?` or
+/// `%`).
 pub fn classify(entry: &str) -> Result<(), String> {
     if entry.trim().is_empty() {
         return Err("it is empty".to_string());
@@ -63,7 +80,31 @@ pub fn classify(entry: &str) -> Result<(), String> {
              outside the meter and the caps"
         ));
     }
+    if REFUSED_NAMES.contains(&upper.as_str()) {
+        return Err(format!(
+            "{upper} is a provider key; a node could spend through it outside the meter and the \
+             caps"
+        ));
+    }
     Ok(())
+}
+
+/// Why `lil doctor` warns about an entry [`classify`] lets through (ruling P3-R31b): its name
+/// holds `API_KEY`, `SECRET` or `TOKEN` and it isn't a hub token (`HF_TOKEN`,
+/// `HUGGING_FACE_HUB_TOKEN`, `CIVITAI_*`). It is still let through; `None` when there is
+/// nothing to say.
+pub fn warning(entry: &str) -> Option<String> {
+    let upper = entry.to_ascii_uppercase();
+    let hub = matches!(upper.as_str(), "HF_TOKEN" | "HUGGING_FACE_HUB_TOKEN")
+        || upper.starts_with("CIVITAI_");
+    let key_like = ["API_KEY", "SECRET", "TOKEN"]
+        .iter()
+        .any(|part| upper.contains(part));
+    (key_like && !hub).then(|| {
+        "it looks like a key or token and isn't a hub token; it is let through, so a node can \
+         use it outside the meter and the caps"
+            .to_string()
+    })
 }
 
 /// The `[engines.comfyui] pass_env` entries of a parsed `suite.toml`, split into the ones the
@@ -126,6 +167,38 @@ mod tests {
         }
         for impossible in ["", "  ", "HF_*", "A=B", "X?", "pct%"] {
             assert!(classify(impossible).is_err(), "{impossible:?}");
+        }
+    }
+
+    #[test]
+    fn the_named_provider_keys_are_refused_and_other_key_like_names_warn() {
+        // Ruling P3-R31b: provider keys outside the P3-R19 prefix list are refused by name.
+        for bad in REFUSED_NAMES {
+            assert!(classify(bad).is_err(), "{bad}");
+            assert!(classify(&bad.to_ascii_lowercase()).is_err(), "{bad}");
+        }
+        // A name only like one of them is not refused by it.
+        assert!(classify("GOOGLE_API_KEY_FILE").is_ok());
+        // Any other listed name holding API_KEY, SECRET or TOKEN warns, without refusing.
+        for warned in [
+            "MY_API_KEY",
+            "some_secret",
+            "GITHUB_TOKEN",
+            "GOOGLE_API_KEY_FILE",
+        ] {
+            assert!(classify(warned).is_ok(), "{warned}");
+            assert!(warning(warned).is_some(), "{warned}");
+        }
+        // The hub tokens, and names without those parts, stay silent.
+        for silent in [
+            "HF_TOKEN",
+            "hf_token",
+            "HUGGING_FACE_HUB_TOKEN",
+            "CIVITAI_API_TOKEN",
+            "HF_HOME",
+        ] {
+            assert!(classify(silent).is_ok(), "{silent}");
+            assert_eq!(warning(silent), None, "{silent}");
         }
     }
 

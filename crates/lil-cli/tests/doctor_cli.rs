@@ -279,7 +279,10 @@ fn doctor_names_pass_env_entries_that_are_not_strings() {
         let env = TestEnv::new();
         env.suite_toml_set(toml);
         let out = env.lil(&["doctor"]);
-        assert_eq!(out.code, 1, "{toml}: a rejected entry is a problem: {out:?}");
+        assert_eq!(
+            out.code, 1,
+            "{toml}: a rejected entry is a problem: {out:?}"
+        );
         assert!(
             printed(&out).iter().any(|l| l
                 .starts_with("problem: [engines.comfyui] pass_env entry")
@@ -288,6 +291,54 @@ fn doctor_names_pass_env_entries_that_are_not_strings() {
             "{toml}: {entry} not reported: {out:?}"
         );
     }
+}
+
+#[test] // spec: ARCH-063
+fn doctor_refuses_named_provider_keys_and_warns_on_other_key_like_names() {
+    // Ruling P3-R31b: a named provider key is a problem, another key-like name a warning, and
+    // a hub token says nothing.
+    let env = TestEnv::new();
+    env.suite_toml_set(
+        "[engines.comfyui]\npass_env = ['HF_TOKEN', 'GROQ_API_KEY', 'MY_TOOL_API_KEY']\n",
+    );
+    let out = env.lil(&["doctor"]);
+    assert_eq!(out.code, 1, "a refused entry is a problem: {out:?}");
+    let lines = printed(&out);
+    assert!(
+        lines.iter().any(
+            |l| l.starts_with("problem: [engines.comfyui] pass_env entry")
+                && l.contains("\"GROQ_API_KEY\"")
+        ),
+        "GROQ_API_KEY not refused: {out:?}"
+    );
+    assert!(
+        lines.iter().any(
+            |l| l.starts_with("warning: [engines.comfyui] pass_env entry")
+                && l.contains("\"MY_TOOL_API_KEY\"")
+        ),
+        "MY_TOOL_API_KEY not warned: {out:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("\"HF_TOKEN\"")),
+        "HF_TOKEN should stay silent: {out:?}"
+    );
+    // A warning alone is not a problem.
+    let env = TestEnv::new();
+    env.suite_toml_set("[engines.comfyui]\npass_env = ['HF_TOKEN', 'MY_TOOL_API_KEY']\n");
+    let out = env.lil(&["doctor"]);
+    let lines = printed(&out);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("warning: ") && l.contains("\"MY_TOOL_API_KEY\"")),
+        "{out:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("problem: ") && l.contains("pass_env")),
+        "a warned entry is not a problem: {out:?}"
+    );
 }
 
 /// `path` with `suffix` added to its file name.
