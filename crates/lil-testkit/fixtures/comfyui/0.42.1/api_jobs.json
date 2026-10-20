@@ -1,0 +1,157 @@
+{
+  "post_prompt": {
+    "status": 200,
+    "body": {
+      "prompt_id": "<string>",
+      "number": 2,
+      "node_errors": {}
+    }
+  },
+  "item": {
+    "status": 200,
+    "body": {
+      "id": "<string>",
+      "status": "<string>",
+      "priority": 2,
+      "create_time": 1792455613965,
+      "execution_start_time": 1792455615244,
+      "execution_end_time": 1792455615269,
+      "outputs_count": 1,
+      "previewable_outputs_count": 1,
+      "preview_output": {
+        "filename": "<string>",
+        "subfolder": "<string>",
+        "type": "<string>",
+        "metadata": {
+          "kind": "<string>",
+          "width": 8,
+          "height": 8
+        },
+        "nodeId": "<string>",
+        "mediaType": "<string>"
+      },
+      "outputs": {
+        "2": {
+          "images": [
+            {
+              "filename": "<string>",
+              "subfolder": "<string>",
+              "type": "<string>",
+              "metadata": {
+                "kind": "<string>",
+                "width": 8,
+                "height": 8
+              }
+            }
+          ]
+        }
+      },
+      "execution_status": {
+        "status_str": "<string>",
+        "completed": true,
+        "messages": [
+          [
+            "<string>",
+            {
+              "prompt_id": "<string>",
+              "timestamp": 1792455615244
+            }
+          ],
+          [
+            "<string>",
+            {
+              "nodes": [],
+              "prompt_id": "<string>",
+              "timestamp": 1792455615245
+            }
+          ],
+          [
+            "<string>",
+            {
+              "prompt_id": "<string>",
+              "timestamp": 1792455615269
+            }
+          ]
+        ]
+      },
+      "workflow": {
+        "prompt": {
+          "1": {
+            "class_type": "<string>",
+            "inputs": {
+              "width": 8,
+              "height": 8,
+              "batch_size": 1,
+              "color": 0
+            }
+          },
+          "2": {
+            "class_type": "<string>",
+            "inputs": {
+              "images": [
+                "<string>",
+                0
+              ],
+              "filename_prefix": "<string>"
+            }
+          }
+        },
+        "extra_data": {
+          "preview_method": "<string>",
+          "client_id": "<string>",
+          "create_time": 1792455613965
+        }
+      }
+    }
+  },
+  "list": {
+    "jobs": [
+      {
+        "id": "<string>",
+        "status": "<string>",
+        "priority": 2,
+        "create_time": 1792455613965,
+        "execution_start_time": 1792455615244,
+        "execution_end_time": 1792455615269,
+        "outputs_count": 1,
+        "previewable_outputs_count": 1,
+        "preview_output": {
+          "filename": "<string>",
+          "subfolder": "<string>",
+          "type": "<string>",
+          "metadata": {
+            "kind": "<string>",
+            "width": 8,
+            "height": 8
+          },
+          "nodeId": "<string>",
+          "mediaType": "<string>"
+        }
+      }
+    ],
+    "pagination": {
+      "offset": 0,
+      "limit": 100,
+      "total": 2,
+      "has_more": false
+    }
+  },
+  "bad_status": {
+    "status": 400,
+    "body": {
+      "error": "<string>"
+    }
+  },
+  "cancel_one": {
+    "status": 200,
+    "body": {
+      "cancelled": false
+    }
+  },
+  "cancel_batch": {
+    "status": 200,
+    "body": {
+      "cancelled": false
+    }
+  }
+}

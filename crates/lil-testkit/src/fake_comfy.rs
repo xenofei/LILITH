@@ -425,8 +425,10 @@ struct Prompt {
     fail: Option<FakeFailure>,
     /// Node id → `{images: [{filename, subfolder, type}]}`.
     outputs: Map<String, Value>,
-    /// `[event, data]` pairs, as `/history` reports them.
+    /// `[event, data]` pairs, as `/history` reports them: the `execution_*` events only.
     messages: Vec<Value>,
+    /// Node id -> its `progress_state` entry, for the nodes that are no longer pending.
+    node_states: Map<String, Value>,
     create_time: u64,
     start_time: Option<u64>,
     end_time: Option<u64>,
@@ -464,6 +466,7 @@ impl Prompt {
             fail: None,
             outputs: Map::new(),
             messages: Vec::new(),
+            node_states: Map::new(),
             create_time,
             start_time: None,
             end_time: None,
@@ -495,6 +498,20 @@ impl Prompt {
             .sum()
     }
 
+    /// The first saved image with its node id and media type, as ComfyUI 0.42.1's job items
+    /// show it (`null`, so pruned, without one).
+    fn preview_output(&self) -> Value {
+        self.outputs
+            .iter()
+            .find_map(|(node, o)| {
+                let mut image = o["images"].as_array()?.first()?.clone();
+                image["nodeId"] = json!(node);
+                image["mediaType"] = json!("images");
+                Some(image)
+            })
+            .unwrap_or(Value::Null)
+    }
+
     fn job(&self, detail: bool) -> Value {
         let mut job = json!({
             "id": self.id,
@@ -504,6 +521,8 @@ impl Prompt {
             "execution_start_time": self.start_time,
             "execution_end_time": self.end_time,
             "outputs_count": self.outputs_count(),
+            "previewable_outputs_count": self.outputs_count(),
+            "preview_output": self.preview_output(),
             "workflow_id": Value::Null,
         });
         if let Some(error) = &self.error {
@@ -537,8 +556,22 @@ impl Prompt {
             "prompt": self.queue_entry(),
             "outputs": self.outputs,
             "status": self.status(),
-            "meta": {},
+            "meta": self.meta(),
         })
+    }
+
+    /// The history `meta`: one entry per output node (ComfyUI 0.42.1).
+    fn meta(&self) -> Value {
+        let meta: Map<String, Value> = self
+            .outputs
+            .keys()
+            .map(|node| {
+                let entry = json!({"node_id": node, "display_node": node,
+                                   "parent_node": null, "real_node_id": node});
+                (node.clone(), entry)
+            })
+            .collect();
+        Value::Object(meta)
     }
 }
 
@@ -619,13 +652,33 @@ impl State {
         self.send(None, "status", data);
     }
 
-    /// Sends `kind` to the prompt's client and keeps it in the prompt's history messages.
+    /// Sends `kind` to the prompt's client; an `execution_*` event is also kept in the
+    /// prompt's history messages, as ComfyUI keeps only those.
     fn event(&mut self, id: &str, kind: &str, data: Value) {
         let to = self.prompt(id).and_then(|p| p.client_id.clone());
         self.send(to.as_deref(), kind, data.clone());
-        if let Some(p) = self.prompt_mut(id) {
+        if kind.starts_with("execution_")
+            && let Some(p) = self.prompt_mut(id)
+        {
             p.messages.push(json!([kind, data]));
         }
+    }
+
+    /// Node `node` of prompt `id` is `running` or `finished`: a `progress_state` with every
+    /// node that is no longer pending, as ComfyUI 0.42.1 sends it.
+    fn node_state(&mut self, id: &str, node: &str, state: &str) {
+        let Some(p) = self.prompt_mut(id) else {
+            return;
+        };
+        let value = if state == "finished" { 1.0 } else { 0.0 };
+        p.node_states.insert(
+            node.to_string(),
+            json!({"value": value, "max": 1.0, "state": state, "node_id": node,
+                   "prompt_id": id, "display_node_id": node, "parent_node_id": null,
+                   "real_node_id": node}),
+        );
+        let data = json!({"prompt_id": id, "nodes": p.node_states});
+        self.event(id, "progress_state", data);
     }
 
     /// The running prompt, if the executor has not started it yet: starts it.
@@ -660,16 +713,15 @@ impl State {
             if saving.contains(&node) {
                 continue;
             }
+            // ComfyUI sends `progress` only from nodes that report steps (samplers); these
+            // report their state.
+            self.node_state(&id, &node, "running");
             self.event(
                 &id,
                 "executing",
                 json!({"node": node, "display_node": node, "prompt_id": id}),
             );
-            self.event(
-                &id,
-                "progress",
-                json!({"value": 1, "max": 1, "prompt_id": id, "node": node}),
-            );
+            self.node_state(&id, &node, "finished");
         }
         Some(job)
     }
@@ -806,6 +858,12 @@ async fn run(shared: &Shared, job: Job) {
         if !still_running(&mut shared.lock(), &job) {
             return;
         }
+        {
+            let mut st = shared.lock();
+            st.node_state(&job.id, &node, "running");
+            let data = json!({"node": node, "display_node": node, "prompt_id": job.id});
+            st.event(&job.id, "executing", data);
+        }
         let (subfolder, file) = write_output(&shared.root.join("output"), &prefix);
         // In a block, so the guard is gone before the await.
         let go_on = {
@@ -813,7 +871,9 @@ async fn run(shared: &Shared, job: Job) {
             if st.generation != job.generation {
                 return;
             }
-            let image = json!({"filename": file, "subfolder": subfolder, "type": "output"});
+            // The fake's PNG is 1x1; ComfyUI 0.42.1 adds the file's media metadata.
+            let image = json!({"filename": file, "subfolder": subfolder, "type": "output",
+                               "metadata": {"kind": "image", "width": 1, "height": 1}});
             if let Some(p) = st.prompt_mut(&job.id) {
                 p.outputs
                     .insert(node.clone(), json!({"images": [image.clone()]}));
@@ -821,6 +881,7 @@ async fn run(shared: &Shared, job: Job) {
             let data = json!({"node": node, "display_node": node,
                               "output": {"images": [image]}, "prompt_id": job.id});
             st.event(&job.id, "executed", data);
+            st.node_state(&job.id, &node, "finished");
             match st.restart_after {
                 Some(after) => {
                     st.outputs_since_armed += 1;
@@ -1593,7 +1654,7 @@ fn server_features() -> Value {
         "supports_preview_metadata": true,
         "supports_model_type_tags": true,
         "max_upload_size": 100 * 1024 * 1024,
-        "extension": {"manager": {"supports_v4": true}},
+        "extension": {"manager": {"supports_v4": true, "supports_csrf_post": true}},
         "node_replacements": true,
         "assets": true,
     })

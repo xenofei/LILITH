@@ -6,7 +6,9 @@
 //! (default 8188). With `--record <dir>` it also sets `LIL_REAL_RECORD` to that folder (read
 //! from the current directory), where `real_comfyui_behaviours_match_the_fake` records the
 //! ComfyUI shape fixtures (QA-067). The `real_*` tests attach to the ComfyUI that is running;
-//! nothing here starts, stops or installs anything.
+//! nothing here starts, stops or installs anything. The run builds into its own target folder,
+//! `target\real` (`CARGO_TARGET_DIR`), because Windows can't replace the `lil.exe` that runs it
+//! (`cargo run -p lil-cli -- test --real` runs `target\debug\lil.exe`).
 //!
 //! Outside the checkout (or in another repository) it says so and exits 2. Otherwise its exit
 //! code is 0 when every test passed, 1 when a test failed, and 2 when nextest couldn't run.
@@ -24,6 +26,9 @@ pub const ENV_REAL_COMFYUI: &str = "LIL_REAL_COMFYUI";
 pub const ENV_REAL_RECORD: &str = "LIL_REAL_RECORD";
 /// ComfyUI's default port (ARCH-070).
 const DEFAULT_PORT: u16 = 8188;
+
+/// The target folder of the run, under the checkout's `target`.
+const TARGET_DIR: [&str; 2] = ["target", "real"];
 
 /// The nextest filter of the real tests.
 const FILTER: &str = "test(/^real_/)";
@@ -108,6 +113,10 @@ fn command(root: &Path, url: &str, record: Option<&Path>) -> Command {
         FILTER,
     ])
     .current_dir(root)
+    .env(
+        "CARGO_TARGET_DIR",
+        TARGET_DIR.iter().fold(root.to_path_buf(), |p, c| p.join(c)),
+    )
     .env(ENV_REAL_COMFYUI, url)
     .env_remove(ENV_REAL_RECORD);
     if let Some(dir) = record {
@@ -180,6 +189,13 @@ mod tests {
             Some("http://127.0.0.1:8190".into())
         )));
         assert!(envs.contains(&(ENV_REAL_RECORD.into(), Some(r"C:\rec".into()))));
+        assert!(
+            envs.contains(&(
+                "CARGO_TARGET_DIR".into(),
+                Some(r"C:\src\target\real".into())
+            )),
+            "never the target folder of the running lil.exe: {envs:?}"
+        );
         let plain = command(Path::new(r"C:\src"), "http://127.0.0.1:8188", None);
         assert!(
             plain
