@@ -95,6 +95,20 @@ const ALLOW: &[Allow] = &[
         why: "R1, D5",
         until: "plugin rename",
     },
+    // Extras fix round 1 (M2): the plugin hook guards the legacy `Worldwright[-<channel>]`
+    // suite.toml folder, which the suite still reads when the new file is missing (R4).
+    Allow {
+        globs: &["crates/lil-cli/src/user/hook_patterns.rs"],
+        lines_with: &["Worldwright", "\"worldwright"],
+        why: "the hook guards the legacy Worldwright suite.toml folder the suite still reads (M2)",
+        until: "the legacy workspace readers go",
+    },
+    Allow {
+        globs: &["crates/lil-cli/tests/hook_patterns.rs"],
+        lines_with: &["Worldwright"],
+        why: "tests that the hook guards the legacy Worldwright suite.toml folder (M2)",
+        until: "the legacy workspace readers go",
+    },
     // Rows Task B6 adds.
     Allow {
         globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
