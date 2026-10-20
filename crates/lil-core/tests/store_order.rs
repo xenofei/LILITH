@@ -1012,3 +1012,39 @@ async fn orphans_include_unrecorded_sealed_versions_and_conflict_files() {
         ]
     );
 }
+
+/// The commit-output step refuses a target that a manifest `locks` entry covers (the file, or
+/// a folder above it), as a write does: `store.locked`, before any output moves, so the staged
+/// file stays where it is and the manifest records nothing.
+#[tokio::test(start_paused = true)] // spec: CORE-035, ARCH-075
+async fn commit_output_checks_locks() {
+    let ws = workspace();
+    let store = ws.plain();
+    for locks in [json!(["candidates/r_1/a.png"]), json!(["candidates/"])] {
+        let mut m = Manifest::new(
+            "sketchbook",
+            "crane",
+            "image",
+            "00000000-0000-4000-8000-0000000000aa",
+        );
+        m.set("locks", locks.clone());
+        write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
+        let from = staged(&store, "a.png", b"held").await;
+        let err = store
+            .commit(ingest_op(from.clone(), "r_1", "a.png"))
+            .await
+            .expect_err("a locked target is refused");
+        assert_eq!(err.to_error("t").code, "store.locked", "{locks}: {err}");
+        assert_eq!(std::fs::read(&from).unwrap(), b"held", "{locks}");
+        assert!(
+            !ws.exists(&format!("{ASSET}/candidates/r_1/a.png")),
+            "{locks}"
+        );
+        assert!(!ws.text(MANIFEST).contains("\"r_1\""), "{locks}");
+    }
+    // Without the lock the same commit goes through.
+    ws.write_manifest();
+    let from = staged(&store, "a.png", b"free").await;
+    store.commit(ingest_op(from, "r_1", "a.png")).await.unwrap();
+    assert_eq!(ws.read(&format!("{ASSET}/candidates/r_1/a.png")), b"free");
+}

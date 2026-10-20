@@ -2230,3 +2230,79 @@ async fn a_linked_folder_above_the_target_is_refused_for_every_write() {
     assert!(!outside.join("new.txt").exists());
     assert!(!outside.join("assets").exists());
 }
+
+/// A manifest `locks` entry recorded with an 8.3 short alias still locks the file a write names
+/// by its long name (a file entry, or a folder entry above a new file), and an entry recorded
+/// by the long name locks the file written by its alias: both sides are compared by their long
+/// forms. An unlocked sibling is written as before.
+#[tokio::test(start_paused = true)] // spec: CORE-035
+async fn writes_resolve_short_alias_lock_entries() {
+    use serde_json::json;
+    const ASSET: &str = "projects/sketchbook/assets/crane";
+    let ws = workspace();
+    let store = ws.plain();
+    let manifest = |locks: serde_json::Value| {
+        let mut m = Manifest::new(
+            "sketchbook",
+            "crane",
+            "image",
+            "00000000-0000-4000-8000-0000000000aa",
+        );
+        m.set("locks", locks);
+        write_file(
+            &ws.file(&format!("{ASSET}/crane.manifest.json")),
+            m.to_text().as_bytes(),
+        );
+    };
+    let file = format!("{ASSET}/prompts/crane_prompt.txt");
+    write_file(&ws.file(&file), b"a crane");
+    let folder = format!("{ASSET}/promptsfolder");
+    write_file(&ws.file(&format!("{folder}/old.txt")), b"old");
+    let short_file = lil_platform::fs::short_name(&ws.file(&file)).unwrap();
+    let short_folder = lil_platform::fs::short_name(&ws.file(&folder)).unwrap();
+    if short_file == ws.file(&file) || short_folder == ws.file(&folder) {
+        println!("8.3 names are off on this volume: the short-alias cases are skipped");
+        return;
+    }
+    let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+    let over = || Expect::Hash(sha256_bytes(b"a crane"));
+
+    // A file entry by its alias, written by the long name.
+    manifest(json!([format!("prompts/{}", name(&short_file))]));
+    let written = store.write(&p(&file), b"over".to_vec(), over()).await;
+    assert!(
+        matches!(&written, Err(StoreError::Locked(_))),
+        "{written:?}"
+    );
+    assert_eq!(ws.read(&file), b"a crane");
+
+    // A folder entry by its alias, and a new file beneath it by the long name.
+    manifest(json!([format!("{}/", name(&short_folder))]));
+    let new = format!("{folder}/new.txt");
+    let written = store.write(&p(&new), b"new".to_vec(), Expect::New).await;
+    assert!(
+        matches!(&written, Err(StoreError::Locked(_))),
+        "{written:?}"
+    );
+    assert!(!ws.file(&new).exists());
+
+    // The reverse: a long-name entry, written by the alias.
+    manifest(json!(["prompts/crane_prompt.txt"]));
+    let alias = format!("{ASSET}/prompts/{}", name(&short_file));
+    let written = store.write(&p(&alias), b"over".to_vec(), over()).await;
+    assert!(
+        matches!(&written, Err(StoreError::Locked(_))),
+        "{written:?}"
+    );
+    assert_eq!(ws.read(&file), b"a crane");
+
+    // A sibling no entry covers.
+    store
+        .write(
+            &p(&format!("{ASSET}/prompts/other.txt")),
+            b"free".to_vec(),
+            Expect::New,
+        )
+        .await
+        .unwrap();
+}

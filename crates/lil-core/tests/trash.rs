@@ -1602,3 +1602,52 @@ async fn folder_moves_retry_access_denied_and_file_moves_do_not() {
     assert!(matches!(refused, StoreError::Io { .. }), "{refused:?}");
     assert!(ws.exists("notes/b.txt"));
 }
+
+/// Ruling P3-R7 for restores: a folder whose manifest now has a `locks` entry beneath it (set
+/// after the folder went to the trash) is not restored, as it could not be trashed, with
+/// `store.locked`; the entry stays in the trash untouched. Once the lock goes, the restore
+/// works.
+#[tokio::test(start_paused = true)] // spec: CORE-035, ARCH-058
+async fn folder_restore_with_a_locked_entry_beneath_is_refused() {
+    let ws = workspace();
+    let store = ws.store();
+    let manifest = |locks: Value| {
+        let mut m = Manifest::new(
+            "sketchbook",
+            "crane",
+            "image",
+            "00000000-0000-4000-8000-0000000000aa",
+        );
+        m.set("locks", locks);
+        write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
+    };
+    manifest(json!([]));
+    let inside = format!("{ASSET}/prompts/crane_prompt.txt");
+    write_file(&ws.file(&inside), b"a crane");
+    let record = store
+        .trash(&p(&format!("{ASSET}/prompts")), "test")
+        .await
+        .unwrap();
+    assert!(!ws.exists(&inside));
+
+    for lock in [json!(["prompts/crane_prompt.txt"]), json!(["PROMPTS/"])] {
+        manifest(lock.clone());
+        let refused = store.trash_restore(&record.entry_id).await;
+        assert!(
+            matches!(&refused, Err(StoreError::Locked(_))),
+            "{lock}: {refused:?}"
+        );
+        assert!(!ws.exists(&inside), "{lock}");
+        assert_eq!(
+            std::fs::read(entry_dir(&ws, &record).join("payload/prompts/crane_prompt.txt"))
+                .unwrap(),
+            b"a crane",
+            "{lock}"
+        );
+        assert!(entry_dir(&ws, &record).join("restore.json").is_file());
+    }
+
+    manifest(json!([]));
+    store.trash_restore(&record.entry_id).await.unwrap();
+    assert_eq!(ws.read(&inside), b"a crane");
+}

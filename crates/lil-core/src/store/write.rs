@@ -861,6 +861,12 @@ pub(super) type PathLock = tokio::sync::Mutex<()>;
 /// An edit: the current bytes (`None`: no file) → the new bytes and a value for the caller.
 type EditFn<'a, T> = dyn Fn(Option<&[u8]>) -> Result<(Vec<u8>, T), StoreError> + Send + Sync + 'a;
 
+/// Whether the `locks` entry `entry` covers `path` (both [`path_key`](super::paths::path_key)
+/// forms): the path itself, or a path under it.
+fn covers(entry: &str, path: &str) -> bool {
+    path == entry || (path.starts_with(entry) && path[entry.len()..].starts_with('/'))
+}
+
 pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1843,9 +1849,12 @@ impl Store {
     /// CORE-035: `store.locked` for a path under an asset folder,
     /// `projects/<p>/assets/<a>/<rest>`, whose manifest lists `<rest>` (or a folder above it)
     /// in `locks`. Entries are relative to the asset folder (I5) and compare without regard to
-    /// case. The manifest itself is never locked by its own list, an asset without a manifest
-    /// locks nothing, and one whose manifest doesn't parse is logged and locks nothing; a
-    /// manifest that can't be read refuses the write with that read's error (fail closed).
+    /// case, as written and by their long forms ([`Store::long_lock_entries`]), so an entry
+    /// recorded as an 8.3 alias locks the long name too (the callers check the long form of
+    /// `rel` as well). The manifest itself is never locked by its own list, an asset without a
+    /// manifest locks nothing, and one whose manifest doesn't parse is logged and locks
+    /// nothing; a manifest, or an entry's long form, that can't be read refuses the write with
+    /// that read's error (fail closed).
     pub(super) async fn check_locks(&self, rel: &WsPath) -> Result<(), StoreError> {
         let parts: Vec<&str> = rel.as_str().split('/').collect();
         if parts.len() < 5
@@ -1873,16 +1882,63 @@ impl Store {
             tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
             return Ok(());
         };
-        let locked = m.view().locks.iter().any(|entry| {
+        let locks = m.view().locks;
+        let locked = locks.iter().any(|entry| {
             let entry = super::paths::path_key(entry.trim_end_matches('/'));
-            !entry.is_empty()
-                && (inside == entry
-                    || (inside.starts_with(&entry) && inside[entry.len()..].starts_with('/')))
+            !entry.is_empty() && covers(&entry, &inside)
         });
         if locked {
             return Err(StoreError::Locked(rel.clone()));
         }
+        let asset = parts[..4].join("/");
+        let target = rel.key();
+        for entry in self.long_lock_entries(&asset, &manifest, &locks).await? {
+            if covers(&entry.key(), &target) {
+                return Err(StoreError::Locked(rel.clone()));
+            }
+        }
         Ok(())
+    }
+
+    /// The `locks` entries of the manifest `manifest` of the asset folder `asset`
+    /// (workspace-relative), each as the long form of its path under that folder
+    /// (`probe.long_form`), so an entry recorded as an 8.3 alias comes back by its long name.
+    /// An empty entry and the manifest itself are left out, and an entry that isn't a valid
+    /// path is skipped with a warning.
+    ///
+    /// # Errors
+    /// `store.io` (naming the manifest) or `store.path_invalid` when a long form can't be read.
+    pub(super) async fn long_lock_entries(
+        &self,
+        asset: &str,
+        manifest: &WsPath,
+        locks: &[String],
+    ) -> Result<Vec<WsPath>, StoreError> {
+        let mut entries = Vec::new();
+        for entry in locks {
+            let trimmed = entry.trim_end_matches('/');
+            match WsPath::parse(&format!("{asset}/{trimmed}")) {
+                Ok(path) if !trimmed.is_empty() && path.key() != manifest.key() => {
+                    entries.push(path);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::warn!(manifest = %manifest, entry = %entry, "a locks entry that isn't a workspace path is skipped");
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Ok(entries);
+        }
+        let (root, probe) = (self.root.clone(), self.probe.clone());
+        blocking(move || {
+            Ok(entries
+                .iter()
+                .map(|e| long_rel(&root, e, &|p| probe.long_form(p)))
+                .collect::<Result<Vec<_>, _>>())
+        })
+        .await
+        .map_err(|e| StoreError::io(manifest, &e))?
     }
 
     /// What step 3 needs for `expect`: for [`Expect::Generated`], the generated hash and the

@@ -41,7 +41,7 @@ use serde_json::Value;
 use super::fsops;
 use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
-use super::paths::{WsPath, long_rel, path_key, writable};
+use super::paths::{WsPath, path_key, writable};
 use super::versions::{files_under, set_readonly_all};
 use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
@@ -368,31 +368,9 @@ impl Store {
                 tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
                 continue;
             };
-            let mut entries = Vec::new();
-            for entry in m.view().locks {
-                let trimmed = entry.trim_end_matches('/');
-                match WsPath::parse(&format!("{asset}/{trimmed}")) {
-                    Ok(path) if !trimmed.is_empty() && path.key() != manifest.key() => {
-                        entries.push(path);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        tracing::warn!(manifest = %manifest, entry = %entry, "a locks entry that isn't a workspace path is skipped");
-                    }
-                }
-            }
-            if entries.is_empty() {
-                continue;
-            }
-            let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
-            let longs = blocking(move || {
-                Ok(entries
-                    .iter()
-                    .map(|e| long_rel(&root, e, &|p| probe.long_form(p)))
-                    .collect::<Result<Vec<_>, _>>())
-            })
-            .await
-            .map_err(|e| StoreError::io(&manifest, &e))??;
+            let longs = self
+                .long_lock_entries(&asset, &manifest, &m.view().locks)
+                .await?;
             for entry in longs {
                 let key = entry.key();
                 if key == target || key.starts_with(&format!("{target}/")) {
@@ -600,9 +578,11 @@ impl Store {
             writable(&rel)?;
             writable(&long)?;
         }
-        // Manifest `locks` (CORE-035), by the path as recorded and by its long form.
+        // Manifest `locks` (CORE-035), by the path as recorded and by its long form; a folder
+        // with a locked entry beneath it now is never restored either (ruling P3-R7).
         self.check_locks(&rel).await?;
         self.check_long_locks(&rel, &long).await?;
+        self.refuse_locks_within(&rel, &long).await?;
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
             let probe = self.probe().clone();

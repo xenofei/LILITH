@@ -1,5 +1,5 @@
 //! The `lil` user commands over `lil-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
-//! `events --follow`, `core stop`, `workspace init|use`, `notify` and `doctor`. Spec Appendix D, "The `lil` user
+//! `events --follow`, `core stop`, `workspace init|use`, `notify`, `doctor` and `test --real`. Spec Appendix D, "The `lil` user
 //! commands", and Appendices E and F, "The `lil` commands this plan adds", are the contract for
 //! their flags, output and exit codes. `hook` runs the Claude Code plugin's hooks.
 //!
@@ -23,6 +23,7 @@ mod hook;
 mod hook_patterns;
 mod notify;
 mod status;
+mod test_real;
 mod workspace;
 
 use std::fmt::Display;
@@ -125,6 +126,18 @@ pub enum UserCommand {
         #[arg(value_enum)]
         event: hook::HookEvent,
     },
+    /// Run the tests that need real engines and hardware, from the source checkout: the
+    /// `real_*` tests, attached to the ComfyUI on the configured port. Exits 2 outside the
+    /// checkout.
+    Test {
+        /// Run the real-engine tests (required: the only kind this command runs).
+        #[arg(long, required = true)]
+        real: bool,
+        /// Also record the ComfyUI shape fixtures into this folder (one subfolder per
+        /// ComfyUI version).
+        #[arg(long, value_name = "DIR")]
+        record: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -183,6 +196,7 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
         UserCommand::Notify { paths } => notify::run(global, &paths),
         UserCommand::Doctor => doctor::run(global),
         UserCommand::Hook { event } => Ok(hook::run(event, global)),
+        UserCommand::Test { real: _, record } => test_real::run(record.as_deref()),
     };
     match result {
         Ok(code) | Err(Exit(code)) => code,

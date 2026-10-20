@@ -4,11 +4,16 @@
 //!
 //! It answers the endpoints the core uses, in ComfyUI 0.41.0's shapes as far as the core reads
 //! them (spec Appendix B.3): `GET /system_stats`, `POST /prompt`, `GET /queue`, `GET /api/jobs`,
-//! `GET /api/jobs/{id}`, `POST /api/jobs/{id}/cancel`, `GET /history[/{id}]`, `GET /view`,
+//! `GET /api/jobs/{id}`, `POST /api/jobs/{id}/cancel`, `POST /api/jobs/cancel` (the batch
+//! cancel), `GET /history[/{id}]`, `GET /view`,
 //! `POST /upload/image`, `POST /free`, `GET /object_info[/{class}]`, `GET /node_replacements`
 //! and the websocket `/ws?clientId=<id>`. Every route also answers under `/api` (except the
 //! jobs routes, which live there), as ComfyUI's do. `POST /interrupt` answers 500, so a suite
 //! that posts it fails visibly (ARCH-021). Every request is recorded ([`FakeComfy::requests`]).
+//! As ComfyUI 0.42.1 does, `/api/jobs` answers 400 to a bad `status`, `sort_by`, `sort_order`,
+//! `limit` or `offset`, and a websocket client whose first message is `feature_flags` gets the
+//! server's own `feature_flags` back. The drift check against recorded ComfyUI shapes is
+//! [`crate::comfy_shapes`].
 //!
 //! **Execution.** One prompt runs at a time, in the order accepted. Which prompt runs is decided
 //! when a prompt is accepted or one ends, so `/queue` is exact as soon as a call returns. A run
@@ -1042,9 +1047,11 @@ async fn handle(
                 &json!({"queue_running": running, "queue_pending": pending}),
             )
         }
-        (&Method::GET, ["api", "jobs"]) => {
-            json_response(StatusCode::OK, &list_jobs(&shared, &query))
-        }
+        (&Method::GET, ["api", "jobs"]) => match list_jobs(&shared, &query) {
+            Ok(list) => json_response(StatusCode::OK, &list),
+            Err(why) => json_response(StatusCode::BAD_REQUEST, &json!({"error": why})),
+        },
+        (&Method::POST, ["api", "jobs", "cancel"]) => cancel_batch(&shared, &bytes),
         (&Method::GET, ["api", "jobs", id]) => match shared.lock().prompt(id) {
             Some(p) => json_response(StatusCode::OK, &p.job(true)),
             None => json_response(StatusCode::NOT_FOUND, &json!({"error": "Job not found"})),
@@ -1247,10 +1254,95 @@ fn cancel(shared: &Shared, id: &str) -> bool {
     cancelled
 }
 
-fn list_jobs(shared: &Shared, query: &str) -> Value {
+/// `POST /api/jobs/cancel {"job_ids": [...]}`: every id must be a canonical lowercase UUID
+/// (else 400 naming them); each running or pending one is cancelled as by the per-job cancel,
+/// and `{"cancelled": true}` says at least one was (ComfyUI 0.42.1).
+fn cancel_batch(shared: &Shared, bytes: &[u8]) -> Response<Full> {
+    let Ok(body) = serde_json::from_slice::<Value>(bytes) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Request body must be valid JSON"}),
+        );
+    };
+    let Some(ids) = body.get("job_ids").and_then(Value::as_array) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "job_ids must be a list"}),
+        );
+    };
+    let invalid: Vec<Value> = ids
+        .iter()
+        .filter(|id| !id.as_str().is_some_and(is_canonical_uuid))
+        .map(|id| match id {
+            Value::String(s) => Value::from(s.as_str()),
+            other => Value::from(other.to_string()),
+        })
+        .collect();
+    if !invalid.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "job_ids contains invalid id(s)", "invalid_ids": invalid}),
+        );
+    }
+    let mut cancelled = false;
+    for id in ids.iter().filter_map(Value::as_str) {
+        cancelled |= cancel(shared, id);
+    }
+    json_response(StatusCode::OK, &json!({"cancelled": cancelled}))
+}
+
+/// The `/api/jobs` statuses.
+const JOB_STATUSES: [&str; 5] = ["pending", "in_progress", "completed", "failed", "cancelled"];
+
+/// `GET /api/jobs`, or why its parameters are refused (a 400, as ComfyUI 0.42.1 answers a bad
+/// `status`, `sort_by`, `sort_order`, `limit` or `offset`).
+fn list_jobs(shared: &Shared, query: &str) -> Result<Value, String> {
+    let statuses: Option<Vec<String>> = query_param(query, "status").map(|s| {
+        s.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let bad: Vec<String> = statuses
+        .iter()
+        .flatten()
+        .filter(|s| !JOB_STATUSES.contains(&s.as_str()))
+        .cloned()
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "Invalid status value(s): {}. Valid values: {}",
+            bad.join(", "),
+            JOB_STATUSES.join(", ")
+        ));
+    }
+    let lower = |key: &str, default: &str| {
+        query_param(query, key).map_or_else(|| default.to_string(), |s| s.to_lowercase())
+    };
+    let sort_by = lower("sort_by", "created_at");
+    if !matches!(sort_by.as_str(), "created_at" | "execution_duration") {
+        return Err("sort_by must be 'created_at' or 'execution_duration'".into());
+    }
+    let sort_order = lower("sort_order", "desc");
+    if !matches!(sort_order.as_str(), "asc" | "desc") {
+        return Err("sort_order must be 'asc' or 'desc'".into());
+    }
+    let limit = match query_param(query, "limit") {
+        None => None,
+        Some(l) => match l.trim().parse::<i64>() {
+            Ok(n) if n > 0 => Some(usize::try_from(n).unwrap_or(usize::MAX)),
+            Ok(_) => return Err("limit must be a positive integer".into()),
+            Err(_) => return Err("limit must be an integer".into()),
+        },
+    };
+    let offset = match query_param(query, "offset") {
+        None => 0,
+        Some(o) => match o.trim().parse::<i64>() {
+            Ok(n) => usize::try_from(n).unwrap_or(0),
+            Err(_) => return Err("offset must be an integer".into()),
+        },
+    };
     let st = shared.lock();
-    let statuses: Option<Vec<String>> =
-        query_param(query, "status").map(|s| s.split(',').map(str::to_string).collect());
     let mut jobs: Vec<Value> = st
         .prompts
         .iter()
@@ -1261,22 +1353,20 @@ fn list_jobs(shared: &Shared, query: &str) -> Value {
         })
         .map(|p| p.job(false))
         .collect();
-    if query_param(query, "sort_order").as_deref() != Some("asc") {
+    if sort_order != "asc" {
         jobs.reverse();
     }
     let total = jobs.len();
-    let offset: usize = query_param(query, "offset")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let limit: Option<usize> = query_param(query, "limit").and_then(|s| s.parse().ok());
     let page: Vec<Value> = jobs
         .into_iter()
         .skip(offset)
         .take(limit.unwrap_or(usize::MAX))
         .collect();
     let has_more = offset + page.len() < total;
-    json!({"jobs": page, "pagination": {"offset": offset, "limit": limit, "total": total,
-                                        "has_more": has_more}})
+    Ok(
+        json!({"jobs": page, "pagination": {"offset": offset, "limit": limit, "total": total,
+                                        "has_more": has_more}}),
+    )
 }
 
 /// A query parameter, percent-decoded.
@@ -1419,6 +1509,7 @@ fn upgrade_ws(shared: &Arc<Shared>, req: &mut Request<Incoming>, query: &str) ->
         );
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let reply_tx;
     let preview_metadata = Arc::new(AtomicBool::new(false));
     let serial = {
         let mut st = shared.lock();
@@ -1432,6 +1523,8 @@ fn upgrade_ws(shared: &Arc<Shared>, req: &mut Request<Incoming>, query: &str) ->
             "sid": client_id}});
         let _ = tx.send(Message::text(status.to_string()));
         st.clients.retain(|c| c.client_id != client_id);
+        // Weak: a restart drops the client's sender, which must close its socket.
+        reply_tx = tx.downgrade();
         st.clients.push(Client {
             serial,
             client_id,
@@ -1448,15 +1541,24 @@ fn upgrade_ws(shared: &Arc<Shared>, req: &mut Request<Incoming>, query: &str) ->
                 WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
             let (mut sink, mut stream) = ws.split();
             let reader = async {
+                let mut first = true;
                 while let Some(Ok(message)) = stream.next().await {
                     match message {
                         Message::Text(text) => {
                             let flags: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                            if flags["type"] == "feature_flags"
-                                && flags["data"]["supports_preview_metadata"] == true
-                            {
-                                preview_metadata.store(true, Ordering::SeqCst);
+                            // Only a first message announces flags, and the server answers
+                            // with its own (ComfyUI 0.42.1).
+                            if first && flags["type"] == "feature_flags" {
+                                if flags["data"]["supports_preview_metadata"] == true {
+                                    preview_metadata.store(true, Ordering::SeqCst);
+                                }
+                                let reply =
+                                    json!({"type": "feature_flags", "data": server_features()});
+                                if let Some(tx) = reply_tx.upgrade() {
+                                    let _ = tx.send(Message::text(reply.to_string()));
+                                }
                             }
+                            first = false;
                         }
                         Message::Close(_) => break,
                         _ => {}
@@ -1482,6 +1584,19 @@ fn upgrade_ws(shared: &Arc<Shared>, req: &mut Request<Incoming>, query: &str) ->
         .header("sec-websocket-accept", derive_accept_key(&key))
         .body(Full(None))
         .expect("a valid response")
+}
+
+/// The server's `feature_flags` reply: ComfyUI 0.42.1's core flags, with its default 100 MB
+/// upload size.
+fn server_features() -> Value {
+    json!({
+        "supports_preview_metadata": true,
+        "supports_model_type_tags": true,
+        "max_upload_size": 100 * 1024 * 1024,
+        "extension": {"manager": {"supports_v4": true}},
+        "node_replacements": true,
+        "assets": true,
+    })
 }
 
 fn system_stats(argv: &[String]) -> Value {

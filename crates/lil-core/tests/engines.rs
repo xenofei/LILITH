@@ -1414,3 +1414,87 @@ fn models_folder_size_reaches_the_snapshot() {
     });
     assert_eq!((both.workspace_mib, both.models_mib), (Some(1), Some(2)));
 }
+
+/// An owned start that hangs (the fake with a `fake-silent` file never listens, as a ComfyUI
+/// stuck while it starts), under way: the rig, the engines, the root and the launcher's pid,
+/// with the start's own result to come on the handle.
+type Start =
+    tokio::task::JoinHandle<Result<lil_core::engines::EngineStatus, lil_protocol::ErrorBody>>;
+async fn a_hanging_start(name: &str) -> (Rig, Arc<Engines>, PathBuf, u32, Start) {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, name, false, false);
+    lil_testkit::files::write_file(&root.join("fake-silent"), b"");
+    own(&env, &root, "");
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let start = {
+        let engines = engines.clone();
+        tokio::spawn(async move { engines.start(EngineKind::ComfyUi).await })
+    };
+    let begun = Instant::now();
+    let pid = loop {
+        let status = engines.status().await.remove(0);
+        // The fake has read its `fake-silent` switch once it wrote its record.
+        if let (EngineState::Starting, Some(pid), true) = (
+            status.state,
+            status.pid,
+            root.join("fake-comfyui.json").is_file(),
+        ) {
+            break pid;
+        }
+        assert!(
+            begun.elapsed() < DEADLINE,
+            "the start never began: {status:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    };
+    (rig, engines, root, pid, start)
+}
+
+/// QA1 M12: `engines.stop` during an owned start that hangs cancels the start instead of
+/// waiting up to its 600 s timeout. The start fails with `comfyui.start_failed`, its process
+/// is gone, and the engine is stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-064
+async fn stop_cancels_a_start_in_progress() {
+    let (_rig, engines, _root, pid, start) = a_hanging_start("comfy-hang-stop").await;
+    let stopped = tokio::time::timeout(DEADLINE, engines.stop(EngineKind::ComfyUi))
+        .await
+        .expect("the stop waited behind the start")
+        .unwrap();
+    assert_eq!(
+        (stopped.class, stopped.state),
+        (EngineClass::None, EngineState::Stopped)
+    );
+    let started = tokio::time::timeout(DEADLINE, start)
+        .await
+        .expect("the start did not end")
+        .unwrap();
+    let refused = started.expect_err("a stopped start fails");
+    assert_eq!(refused.code, "comfyui.start_failed", "{refused:?}");
+    gone_async(pid).await;
+    assert!(engines.engine_pids(EngineKind::ComfyUi).is_empty());
+}
+
+/// QA1 M12 for `engines.restart`: it cancels a start that hangs, then starts the engine again
+/// (here one that answers), without waiting for the first start's timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-064
+async fn restart_cancels_a_start_in_progress() {
+    let (_rig, engines, root, pid, start) = a_hanging_start("comfy-hang-restart").await;
+    fsops::remove_file(&root.join("fake-silent")).unwrap();
+    let restarted = tokio::time::timeout(DEADLINE, engines.restart(EngineKind::ComfyUi))
+        .await
+        .expect("the restart waited behind the start")
+        .unwrap();
+    assert_eq!(
+        (restarted.class, restarted.state),
+        (EngineClass::Owned, EngineState::Ready)
+    );
+    assert_ne!(restarted.pid, Some(pid));
+    let first = tokio::time::timeout(DEADLINE, start)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.unwrap_err().code, "comfyui.start_failed");
+    gone_async(pid).await;
+    engines.stop(EngineKind::ComfyUi).await.unwrap();
+}
