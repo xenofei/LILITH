@@ -561,8 +561,9 @@ impl Shared {
     }
 
     /// The recovery of one scope (ARCH-022): every row without a final status that this core
-    /// isn't running becomes `interrupted`, or `interrupted_unknown` when it was `submitting`
-    /// with external side effects. A row already `interrupted_unknown` stays as it is. The
+    /// isn't running becomes `interrupted`, or `interrupted_unknown` when it has external side
+    /// effects and its work may have happened ([`interrupt_change`], rulings P3-R21 and
+    /// P3-R29). A row already `interrupted_unknown` stays as it is. The
     /// completions of a job that never started run with a [`super::never_started`] outcome
     /// (its reservation is released); one that had started keeps its reservation.
     async fn recover_rows(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
@@ -1690,14 +1691,19 @@ fn never_ran(substatus: Option<Substatus>) -> bool {
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
 /// A job with external side effects whose work may have happened is `interrupted_unknown`,
-/// never plain `interrupted`: it was `submitting`, `executing` or `ingesting` (an engine job or
-/// not, ruling P3-R29), or its row holds an engine id (a recovery that couldn't take it up, an
+/// never plain `interrupted`: it was `submitting`, `executing`, `ingesting` or `cancelling` (an
+/// engine job or not, ruling P3-R29), or its row holds an engine id (a recovery that couldn't take it up, an
 /// adopted job waiting for its turn; ruling P3-R21, Task 12 re-review N4). Either way the row
 /// gets [`stopped_error`] in place of any earlier attempt's error.
 fn interrupt_change(row: &JobRow, now: i64) -> Change {
     let maybe_sent = matches!(
         row.substatus,
-        Some(Substatus::Submitting | Substatus::Executing | Substatus::Ingesting)
+        Some(
+            Substatus::Submitting
+                | Substatus::Executing
+                | Substatus::Ingesting
+                | Substatus::Cancelling
+        )
     ) || row.external_id.is_some();
     if row.external_side_effects && maybe_sent {
         let mut c = Change::to(Substatus::InterruptedUnknown);

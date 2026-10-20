@@ -10,15 +10,21 @@
 //!   the per-job and the batch cancel of its own, finished prompt, `/queue` and
 //!   `/history/{id}`.
 //!
-//! It never cancels, frees or interrupts any other prompt, and it reads no model. The tiny
-//! prompt leaves one 8×8 PNG named `lil_shape_probe_*` in ComfyUI's `output\` folder.
+//! It never cancels, frees or interrupts any other prompt, and it reads no model. It keeps
+//! only what is its own: the websocket messages of its prompt (and those naming no prompt,
+//! such as `status`), its own row of `/api/jobs` and of `/queue`. It reads on past the end of
+//! its prompt until the `executing` with `node: null` (or [`TAIL`]). The tiny prompt leaves
+//! one 8×8 PNG named `lil_shape_probe_*` in ComfyUI's `output\` folder.
 //!
 //! A recording is the [`Capture::scrubbed`] probe of one ComfyUI version, in
 //! `crates/lil-testkit/fixtures/comfyui/<version>/`: `ws_messages.jsonl` (one message per
 //! line), `api_jobs.json`, `queue.json` and `history.json`. Scrubbing replaces every string
 //! with `"<string>"` (prompts, file names, paths and ids), except each websocket message's
-//! `type`; numbers, booleans and every key stay, and the probe's prompt id as a key of
-//! `/history` becomes `"<prompt_id>"`. The drift check compares key sets and JSON types
+//! `type`, and every number with `0` (or `0.0`, so integers and floats stay apart): only
+//! the HTTP status of each answer in `api_jobs.json` is kept. Booleans and every key stay, and
+//! the probe's prompt id as a key of `/history` becomes `"<prompt_id>"`. A recording without
+//! the messages after its prompt's end (made before the probe read on, as 0.42.1's was) is
+//! compared without the fake's either. The drift check compares key sets and JSON types
 //! ([`shape`], [`shape_drift`]); the behaviour check compares the answers' status codes and
 //! the values that aren't strings.
 
@@ -50,6 +56,8 @@ pub const FILES: [&str; 4] = [
 
 /// How long the probe waits for its prompt, or for any one answer.
 const WAIT: Duration = Duration::from_secs(120);
+/// How long the probe reads on after its prompt ended, at most.
+pub const TAIL: Duration = Duration::from_secs(3);
 
 /// One probe of one ComfyUI (module docs).
 #[derive(Debug, Clone, PartialEq)]
@@ -112,10 +120,26 @@ impl Capture {
                     out
                 })
                 .collect(),
-            api_jobs: scrub(&self.api_jobs),
+            api_jobs: scrub_answers(&self.api_jobs),
             queue: scrub(&self.queue),
             history: scrub(&self.history),
         }
+    }
+
+    /// The websocket messages up to and including the end of the probe's prompt.
+    fn until_end(&self) -> &[Value] {
+        let end = self.ws_messages.iter().position(|m| {
+            matches!(
+                m["type"].as_str(),
+                Some("execution_success" | "execution_error" | "execution_interrupted")
+            )
+        });
+        end.map_or(&self.ws_messages[..], |at| &self.ws_messages[..=at])
+    }
+
+    /// Whether the capture holds messages after its prompt's end.
+    fn has_tail(&self) -> bool {
+        self.until_end().len() < self.ws_messages.len()
     }
 
     /// Writes the [`Capture::scrubbed`] capture to `<dir>/<version>/`, replacing a recording
@@ -210,10 +234,33 @@ impl Capture {
     }
 }
 
-/// `v` with every string replaced by [`SCRUBBED`]; keys stay.
+/// `api_jobs`, each answer `{status, body}` with its `status` kept and the rest [`scrub`]bed.
+fn scrub_answers(api_jobs: &Value) -> Value {
+    let Some(map) = api_jobs.as_object() else {
+        return scrub(api_jobs);
+    };
+    let out: Map<String, Value> = map
+        .iter()
+        .map(|(k, v)| {
+            let mut clean = scrub(v);
+            if let (Some(status), Some(o)) = (v.get("status"), clean.as_object_mut())
+                && v.get("body").is_some()
+            {
+                o.insert("status".into(), status.clone());
+            }
+            (k.clone(), clean)
+        })
+        .collect();
+    Value::Object(out)
+}
+
+/// `v` with every string replaced by [`SCRUBBED`] and every number by `0` (`0.0` for a
+/// float); keys stay.
 pub fn scrub(v: &Value) -> Value {
     match v {
         Value::String(_) => Value::from(SCRUBBED),
+        Value::Number(n) if n.is_f64() => json!(0.0),
+        Value::Number(_) => json!(0),
         Value::Array(items) => Value::Array(items.iter().map(scrub).collect()),
         Value::Object(map) => Value::Object(
             map.iter()
@@ -290,6 +337,16 @@ pub fn shape_drift(at: &str, want: &Value, got: &Value) -> Vec<String> {
 /// not: only shapes are compared).
 pub fn capture_drift(recorded: &Capture, fake: &Capture) -> Vec<String> {
     let mut out = Vec::new();
+    let fake_window;
+    let fake = if recorded.has_tail() {
+        fake
+    } else {
+        fake_window = Capture {
+            ws_messages: fake.until_end().to_vec(),
+            ..fake.clone()
+        };
+        &fake_window
+    };
     let (want, got) = (recorded.ws_shapes(), fake.ws_shapes());
     for (kind, shapes) in &want {
         match got.get(kind) {
@@ -340,7 +397,8 @@ pub fn behaviour_drift(recorded: &Capture, fake: &Capture) -> Vec<String> {
         ));
     }
     for k in ["cancel_one", "cancel_batch"] {
-        let (w, g) = (scrub(&recorded.api_jobs[k]), scrub(&fake.api_jobs[k]));
+        let answer = |c: &Capture| scrub_answers(&json!({k: c.api_jobs[k]}))[k].clone();
+        let (w, g) = (answer(recorded), answer(fake));
         if w != g {
             out.push(format!("{k}: recorded {w}, the fake answers {g}"));
         }
@@ -412,7 +470,12 @@ pub fn capture(base: &str) -> Result<Capture, String> {
         "/api/jobs/cancel",
         Some(&json!({"job_ids": [prompt_id]})),
     )?;
-    let queue = answer(port, "GET", "/queue", None)?.1;
+    let mut queue = answer(port, "GET", "/queue", None)?.1;
+    for side in ["queue_running", "queue_pending"] {
+        if let Some(rows) = queue.get_mut(side).and_then(Value::as_array_mut) {
+            rows.retain(|r| r[1] == prompt_id.as_str());
+        }
+    }
     let mut history = answer(port, "GET", &format!("/history/{prompt_id}"), None)?.1;
     if let Some(map) = history.as_object_mut()
         && let Some(entry) = map.remove(&prompt_id)
@@ -527,11 +590,40 @@ fn ws_messages(
             let Ok(value) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
+            // Another prompt's messages (a broadcast) are not the probe's to keep.
+            if value["data"]
+                .get("prompt_id")
+                .is_some_and(|p| *p != prompt_id)
+            {
+                continue;
+            }
             let ended = matches!(
                 value["type"].as_str(),
                 Some("execution_success" | "execution_error" | "execution_interrupted")
             ) && value["data"]["prompt_id"] == prompt_id;
-            if tx.send(Ok(value)).is_err() || ended {
+            if tx.send(Ok(value)).is_err() {
+                return;
+            }
+            if ended {
+                // Read on to the prompt's last message, `executing` with `node: null`.
+                let tail_end = tokio::time::Instant::now() + TAIL;
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    tokio::time::timeout_at(tail_end, socket.next()).await
+                {
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let mine = value["data"]
+                        .get("prompt_id")
+                        .is_none_or(|p| *p == prompt_id);
+                    if !mine {
+                        continue;
+                    }
+                    let last = value["type"] == "executing" && value["data"]["node"].is_null();
+                    if tx.send(Ok(value)).is_err() || last {
+                        break;
+                    }
+                }
                 let _ = socket.close(None).await;
                 return;
             }
@@ -622,14 +714,15 @@ mod tests {
     }
 
     #[test] // spec: QA-067, QA-086
-    fn scrubbing_keeps_keys_numbers_and_message_types_only() {
+    fn scrubbing_keeps_keys_types_and_answer_statuses_only() {
         let c = Capture {
             version: "0.42.1".into(),
             ws_messages: vec![json!({"type": "executed", "data": {
                 "prompt_id": "p", "output": {"images": [{"filename": r"C:\x.png"}]}}})],
             api_jobs: json!({"bad_status": {"status": 400, "body": {"error": "bad"}}}),
             queue: json!({"queue_running": [], "queue_pending": []}),
-            history: json!({PROMPT_ID_KEY: {"prompt": [1, "a prompt"]}}),
+            history: json!({PROMPT_ID_KEY: {"prompt": [7, "a prompt", {"seed": 123_456},
+                                                       {"cfg": 7.5}]}}),
         };
         let s = c.scrubbed();
         let text = format!("{:?}", s);
@@ -640,6 +733,11 @@ mod tests {
         assert_eq!(s.ws_messages[0]["type"], "executed");
         assert_eq!(s.api_jobs["bad_status"]["status"], 400);
         assert_eq!(shape(&s.history), shape(&c.history));
+        // Numbers that could tell the machine or the work apart are zeroed, by kind.
+        let prompt = &s.history[PROMPT_ID_KEY]["prompt"];
+        assert_eq!(prompt[0], json!(0));
+        assert_eq!(prompt[2]["seed"], json!(0));
+        assert!(prompt[3]["cfg"].is_f64() && prompt[3]["cfg"] == json!(0.0));
     }
 
     #[test] // spec: QA-067

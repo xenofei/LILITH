@@ -1,15 +1,15 @@
 {
   "<prompt_id>": {
     "prompt": [
-      2,
+      0,
       "<string>",
       {
         "1": {
           "class_type": "<string>",
           "inputs": {
-            "width": 8,
-            "height": 8,
-            "batch_size": 1,
+            "width": 0,
+            "height": 0,
+            "batch_size": 0,
             "color": 0
           }
         },
@@ -27,7 +27,7 @@
       {
         "preview_method": "<string>",
         "client_id": "<string>",
-        "create_time": 1792455613965
+        "create_time": 0
       },
       [
         "<string>"
@@ -42,8 +42,8 @@
             "type": "<string>",
             "metadata": {
               "kind": "<string>",
-              "width": 8,
-              "height": 8
+              "width": 0,
+              "height": 0
             }
           }
         ]
@@ -57,7 +57,7 @@
           "<string>",
           {
             "prompt_id": "<string>",
-            "timestamp": 1792455615244
+            "timestamp": 0
           }
         ],
         [
@@ -65,14 +65,14 @@
           {
             "nodes": [],
             "prompt_id": "<string>",
-            "timestamp": 1792455615245
+            "timestamp": 0
           }
         ],
         [
           "<string>",
           {
             "prompt_id": "<string>",
-            "timestamp": 1792455615269
+            "timestamp": 0
           }
         ]
       ]

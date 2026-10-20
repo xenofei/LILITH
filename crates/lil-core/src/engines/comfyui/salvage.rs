@@ -5,6 +5,7 @@
 //! `<root>\output`) only once its staged copy has been verified: the same size, and a SHA-256
 //! read back from the staged file equal to the one taken from the source.
 
+use std::collections::HashSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -111,6 +112,32 @@ pub(crate) async fn salvage(root: &Path, prefix: &str, staging: &Staging) -> Vec
         .collect()
 }
 
+/// The names (lower-cased) already in the staging folder `dir`: a job's cache folder is
+/// reused when a later core run takes the job up (ruling P3-R21), and a copy a dead run left
+/// there keeps its name. None when it can't be listed.
+pub(crate) fn names_in(dir: &Path) -> HashSet<String> {
+    std::fs::read_dir(lil_platform::fs::long_path(dir))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `name`, or `<n>_<name>` with the first `n` from 2 that `taken` doesn't hold (names compare
+/// without case, as Windows does); the name returned is added to `taken`.
+pub(crate) fn free_name(taken: &mut HashSet<String>, name: &str) -> String {
+    let mut chosen = name.to_string();
+    let mut n = 1;
+    while !taken.insert(chosen.to_ascii_lowercase()) {
+        n += 1;
+        chosen = format!("{n}_{name}");
+    }
+    chosen
+}
+
 fn salvage_blocking(root: &Path, prefix: &str, dir: &Path) -> Vec<(String, String)> {
     let output = root.join("output");
     let Ok(entries) = std::fs::read_dir(lil_platform::fs::long_path(&output)) else {
@@ -123,9 +150,12 @@ fn salvage_blocking(root: &Path, prefix: &str, dir: &Path) -> Vec<(String, Strin
         .filter(|n| n.starts_with(prefix))
         .collect();
     names.sort();
+    // A dead run's copy in a reused cache folder stays; the salvaged one goes beside it.
+    let mut taken = names_in(dir);
     let mut salvaged = Vec::new();
     for name in names {
-        let (src, dst) = (output.join(&name), dir.join(&name));
+        let staged = free_name(&mut taken, &name);
+        let (src, dst) = (output.join(&name), dir.join(&staged));
         if let Err(e) = fsops::copy_new(&src, &dst) {
             tracing::warn!(file = %src.display(), error = %e, "an output could not be salvaged");
             continue;
@@ -135,7 +165,7 @@ fn salvage_blocking(root: &Path, prefix: &str, dir: &Path) -> Vec<(String, Strin
                 if let Err(e) = fsops::remove_engine_file(root, &src) {
                     tracing::warn!(file = %src.display(), error = %e, "a salvaged output's ComfyUI copy could not be removed");
                 }
-                salvaged.push((name, to.1));
+                salvaged.push((staged, to.1));
             }
             _ => {
                 tracing::warn!(file = %src.display(), "a salvaged output's copy doesn't match; it stays in ComfyUI's folder");
@@ -144,4 +174,35 @@ fn salvage_blocking(root: &Path, prefix: &str, dir: &Path) -> Vec<(String, Strin
         }
     }
     salvaged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A salvage into a reused job cache folder (a P3-R21 take-up) puts the copy beside the
+    /// dead run's (`2_<name>`), leaves that copy as it was, and removes ComfyUI's verified
+    /// source.
+    #[test] // spec: QA-009, CORE-128
+    fn salvage_goes_beside_a_dead_runs_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, dir) = (tmp.path().join("comfy"), tmp.path().join("cache"));
+        let name = "lil_0123456789abcdef_00001_.png";
+        for (at, bytes) in [
+            (root.join("output").join(name), b"engine".as_slice()),
+            (dir.join(name), b"dead run".as_slice()),
+        ] {
+            fsops::ensure_dir(at.parent().unwrap()).unwrap();
+            fsops::write_file_atomic(&at, bytes).unwrap();
+        }
+        let got = salvage_blocking(&root, "lil_0123456789abcdef_", &dir);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, format!("2_{name}"));
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"dead run");
+        assert_eq!(
+            std::fs::read(dir.join(format!("2_{name}"))).unwrap(),
+            b"engine"
+        );
+        assert!(!root.join("output").join(name).exists());
+    }
 }

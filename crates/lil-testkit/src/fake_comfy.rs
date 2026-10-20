@@ -17,11 +17,16 @@
 //!
 //! **Execution.** One prompt runs at a time, in the order accepted. Which prompt runs is decided
 //! when a prompt is accepted or one ends, so `/queue` is exact as soon as a call returns. A run
-//! sends `execution_start`, `execution_cached`, `executing` and `progress` for each node that
-//! saves nothing, then (unless it is held, [`FakeComfy::hold_prompts`]) writes one PNG per
-//! `Save*` node with a `filename_prefix` input into [`FakeComfy::output_dir`] as ComfyUI names
-//! them (`<prefix>_00001_.png`), sending `executed` for each, then `execution_success` and
-//! `executing` with `node: null`. Events go to the websocket clients whose `clientId` is the
+//! sends `execution_start` and `execution_cached`, then for each node that saves nothing a
+//! `progress_state` (`running`), `executing`, and for a node that reports steps (a class type
+//! starting `KSampler`, or a numeric `steps` input) one `progress` and one `progress_state` per
+//! step, then a `progress_state` (`finished`). Then (unless it is held,
+//! [`FakeComfy::hold_prompts`]) it writes one PNG per `Save*` node with a `filename_prefix`
+//! input into [`FakeComfy::output_dir`] as ComfyUI names them (`<prefix>_00001_.png`), with
+//! `progress_state`, `executing` and `executed` for each, then `execution_success` and
+//! `executing` with `node: null`. As ComfyUI 0.42.1 does, `/history` keeps only the
+//! `execution_*` messages and a `meta` entry per output node, output images carry media
+//! `metadata`, and job items carry `previewable_outputs_count` and `preview_output`. Events go to the websocket clients whose `clientId` is the
 //! prompt's `client_id` (every client when it has none); `status` goes to every client.
 //!
 //! Prompts are never real work: no time passes in the fake except what the scheduling of its
@@ -192,8 +197,15 @@ impl FakeComfy {
         self.shared.root.join("output")
     }
 
-    /// While on, every prompt the suite submits stays running (after its `progress` events,
-    /// before any output) until [`FakeComfy::release`]. Turning it off releases them all.
+    /// Step-reporting nodes send only `progress_state` and no `progress`, as a ComfyUI that has
+    /// dropped the older event would.
+    pub fn only_progress_state(&self, on: bool) {
+        self.shared.lock().only_progress_state = on;
+    }
+
+    /// While on, every prompt the suite submits stays running (after the events of its nodes
+    /// that save nothing, before any output) until [`FakeComfy::release`]. Turning it off
+    /// releases them all.
     pub fn hold_prompts(&self, on: bool) {
         let mut st = self.shared.lock();
         st.hold = on;
@@ -591,6 +603,9 @@ struct State {
     /// Never `None` while `queue` holds anything.
     running: Option<String>,
     hold: bool,
+    /// Step-reporting nodes send no `progress`, only `progress_state`
+    /// ([`FakeComfy::only_progress_state`]).
+    only_progress_state: bool,
     fail_next: std::collections::VecDeque<FakeFailure>,
     on_prompt: Option<PromptHook>,
     extra_outputs: Vec<(String, bool)>,
@@ -666,14 +681,16 @@ impl State {
 
     /// Node `node` of prompt `id` is `running` or `finished`: a `progress_state` with every
     /// node that is no longer pending, as ComfyUI 0.42.1 sends it.
-    fn node_state(&mut self, id: &str, node: &str, state: &str) {
+    /// `value` of `max` (steps; 1 for a node without steps).
+    fn node_state(&mut self, id: &str, node: &str, state: &str, value: u64, max: u64) {
         let Some(p) = self.prompt_mut(id) else {
             return;
         };
-        let value = if state == "finished" { 1.0 } else { 0.0 };
+        #[allow(clippy::cast_precision_loss)]
+        let (value, max) = (value as f64, max as f64);
         p.node_states.insert(
             node.to_string(),
-            json!({"value": value, "max": 1.0, "state": state, "node_id": node,
+            json!({"value": value, "max": max, "state": state, "node_id": node,
                    "prompt_id": id, "display_node_id": node, "parent_node_id": null,
                    "real_node_id": node}),
         );
@@ -713,15 +730,27 @@ impl State {
             if saving.contains(&node) {
                 continue;
             }
-            // ComfyUI sends `progress` only from nodes that report steps (samplers); these
-            // report their state.
-            self.node_state(&id, &node, "running");
+            // ComfyUI sends `progress` only from nodes that report steps (samplers), each step
+            // with a `progress_state`; every node reports its state.
+            let steps = node_steps(&job.graph[&node]);
+            self.node_state(&id, &node, "running", 0, steps.unwrap_or(1));
             self.event(
                 &id,
                 "executing",
                 json!({"node": node, "display_node": node, "prompt_id": id}),
             );
-            self.node_state(&id, &node, "finished");
+            if let Some(steps) = steps {
+                for value in 1..=steps {
+                    if !self.only_progress_state {
+                        let data = json!({"value": value, "max": steps, "prompt_id": id,
+                                          "node": node});
+                        self.event(&id, "progress", data);
+                    }
+                    self.node_state(&id, &node, "running", value, steps);
+                }
+            }
+            let max = steps.unwrap_or(1);
+            self.node_state(&id, &node, "finished", max, max);
         }
         Some(job)
     }
@@ -735,7 +764,8 @@ impl State {
         self.event(
             id,
             "executing",
-            json!({"node": Value::Null, "display_node": Value::Null, "prompt_id": id}),
+            // ComfyUI's last message of a prompt has no `display_node`.
+            json!({"node": Value::Null, "prompt_id": id}),
         );
         if self.running.as_deref() == Some(id) {
             self.running = None;
@@ -860,7 +890,7 @@ async fn run(shared: &Shared, job: Job) {
         }
         {
             let mut st = shared.lock();
-            st.node_state(&job.id, &node, "running");
+            st.node_state(&job.id, &node, "running", 0, 1);
             let data = json!({"node": node, "display_node": node, "prompt_id": job.id});
             st.event(&job.id, "executing", data);
         }
@@ -881,7 +911,7 @@ async fn run(shared: &Shared, job: Job) {
             let data = json!({"node": node, "display_node": node,
                               "output": {"images": [image]}, "prompt_id": job.id});
             st.event(&job.id, "executed", data);
-            st.node_state(&job.id, &node, "finished");
+            st.node_state(&job.id, &node, "finished", 1, 1);
             match st.restart_after {
                 Some(after) => {
                     st.outputs_since_armed += 1;
@@ -960,6 +990,16 @@ fn write_output(output: &Path, prefix: &str) -> (String, String) {
 }
 
 /// The graph's node ids, numeric ones in numeric order.
+/// The steps a node reports (`progress`): a class type starting `KSampler` (20 steps unless its
+/// `steps` input says otherwise), or any node with a numeric `steps` input; at most 1,000.
+fn node_steps(node: &Value) -> Option<u64> {
+    let steps = node["inputs"]["steps"].as_u64();
+    let sampler = node["class_type"]
+        .as_str()
+        .is_some_and(|c| c.starts_with("KSampler"));
+    steps.or(sampler.then_some(20)).map(|s| s.clamp(1, 1000))
+}
+
 fn node_ids(graph: &Value) -> Vec<String> {
     let mut ids: Vec<String> = graph
         .as_object()

@@ -392,4 +392,17 @@ fn a_claude_code_older_than_2_1_295_is_a_problem_with_the_update_step() {
             );
         }
     }
+    // A version that can't be read is a problem that says so, with the same step.
+    std::fs::write(profile(&env).join("fake-version"), "x").unwrap();
+    let out = doctor(&env, env.root(), "n");
+    assert!(
+        lines(&out).iter().any(|l| l.starts_with("problem:")
+            && l.contains("version can't be read")
+            && l.contains("claude update")),
+        "{out:?}"
+    );
+    assert!(
+        !lines(&out).iter().any(|l| l.contains("is older than")),
+        "{out:?}"
+    );
 }

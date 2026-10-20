@@ -23,7 +23,15 @@ fn recording() -> Option<Capture> {
         );
         return None;
     };
-    Some(Capture::load(&folder).unwrap_or_else(|e| panic!("the {version} recording: {e}")))
+    let recorded =
+        Capture::load(&folder).unwrap_or_else(|e| panic!("the {version} recording: {e}"));
+    // QA-067: a recording holds nothing the scrub would still change.
+    assert_eq!(
+        recorded,
+        recorded.scrubbed(),
+        "the {version} recording is not scrubbed"
+    );
+    Some(recorded)
 }
 
 #[test] // spec: QA-067, QA-066

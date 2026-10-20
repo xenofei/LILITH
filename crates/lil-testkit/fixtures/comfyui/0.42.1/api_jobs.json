@@ -3,7 +3,7 @@
     "status": 200,
     "body": {
       "prompt_id": "<string>",
-      "number": 2,
+      "number": 0,
       "node_errors": {}
     }
   },
@@ -12,20 +12,20 @@
     "body": {
       "id": "<string>",
       "status": "<string>",
-      "priority": 2,
-      "create_time": 1792455613965,
-      "execution_start_time": 1792455615244,
-      "execution_end_time": 1792455615269,
-      "outputs_count": 1,
-      "previewable_outputs_count": 1,
+      "priority": 0,
+      "create_time": 0,
+      "execution_start_time": 0,
+      "execution_end_time": 0,
+      "outputs_count": 0,
+      "previewable_outputs_count": 0,
       "preview_output": {
         "filename": "<string>",
         "subfolder": "<string>",
         "type": "<string>",
         "metadata": {
           "kind": "<string>",
-          "width": 8,
-          "height": 8
+          "width": 0,
+          "height": 0
         },
         "nodeId": "<string>",
         "mediaType": "<string>"
@@ -39,8 +39,8 @@
               "type": "<string>",
               "metadata": {
                 "kind": "<string>",
-                "width": 8,
-                "height": 8
+                "width": 0,
+                "height": 0
               }
             }
           ]
@@ -54,7 +54,7 @@
             "<string>",
             {
               "prompt_id": "<string>",
-              "timestamp": 1792455615244
+              "timestamp": 0
             }
           ],
           [
@@ -62,14 +62,14 @@
             {
               "nodes": [],
               "prompt_id": "<string>",
-              "timestamp": 1792455615245
+              "timestamp": 0
             }
           ],
           [
             "<string>",
             {
               "prompt_id": "<string>",
-              "timestamp": 1792455615269
+              "timestamp": 0
             }
           ]
         ]
@@ -79,9 +79,9 @@
           "1": {
             "class_type": "<string>",
             "inputs": {
-              "width": 8,
-              "height": 8,
-              "batch_size": 1,
+              "width": 0,
+              "height": 0,
+              "batch_size": 0,
               "color": 0
             }
           },
@@ -99,7 +99,7 @@
         "extra_data": {
           "preview_method": "<string>",
           "client_id": "<string>",
-          "create_time": 1792455613965
+          "create_time": 0
         }
       }
     }
@@ -109,20 +109,20 @@
       {
         "id": "<string>",
         "status": "<string>",
-        "priority": 2,
-        "create_time": 1792455613965,
-        "execution_start_time": 1792455615244,
-        "execution_end_time": 1792455615269,
-        "outputs_count": 1,
-        "previewable_outputs_count": 1,
+        "priority": 0,
+        "create_time": 0,
+        "execution_start_time": 0,
+        "execution_end_time": 0,
+        "outputs_count": 0,
+        "previewable_outputs_count": 0,
         "preview_output": {
           "filename": "<string>",
           "subfolder": "<string>",
           "type": "<string>",
           "metadata": {
             "kind": "<string>",
-            "width": 8,
-            "height": 8
+            "width": 0,
+            "height": 0
           },
           "nodeId": "<string>",
           "mediaType": "<string>"
@@ -131,8 +131,8 @@
     ],
     "pagination": {
       "offset": 0,
-      "limit": 100,
-      "total": 2,
+      "limit": 0,
+      "total": 0,
       "has_more": false
     }
   },

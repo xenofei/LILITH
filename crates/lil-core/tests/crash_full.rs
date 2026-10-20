@@ -512,3 +512,150 @@ fn crash_full_damaged_state_db_in_each_scope() {
         "the damaged workspace state.db changed"
     );
 }
+
+/// `[engines.comfyui]` for an attached `fake` with `lil-fake-comfy-cli` as comfy-cli and the
+/// fake ComfyUI as its Python (node installs).
+fn attach_for_installs(env: &TestEnv, fake: &FakeComfy) {
+    let bins = lil_testkit::ensure_built();
+    env.suite_toml_set(&format!(
+        "[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"10\"\n\
+         [engines.comfyui]\nport = {}\nroot = '{}'\nautostart = false\ncomfy_cli = '{}'\n\
+         python = '{}'\n",
+        fake.port(),
+        fake.root().to_str().unwrap(),
+        bins.fake_comfy_cli.to_str().unwrap(),
+        bins.fake_comfyui.to_str().unwrap(),
+    ));
+}
+
+/// What a node install left: (install jobs, comfy-cli runs, usage lines, monthly cap row).
+fn install_trace(
+    env: &TestEnv,
+    fake: &FakeComfy,
+    pipe: &mut RawPipe,
+) -> (Vec<Value>, usize, Vec<Value>, (String, String)) {
+    let jobs: Vec<Value> = all_jobs(pipe)
+        .into_iter()
+        .filter(|j| j["kind"] == "comfy.install_node")
+        .collect();
+    let runs = std::fs::read_to_string(fake.root().join("fake-comfy-cli.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let lines: Vec<Value> = std::fs::read_to_string(env.env.local_dir().join("usage-loose.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|l| l["tool"] == "engines.comfyui.install_node")
+        .collect();
+    (jobs, runs, lines, monthly(pipe))
+}
+
+/// A node install (`comfy.install_node`, an `exec` call the app approves) killed at each fail
+/// point it passes, the meter's two. After the restart, and again after a second one:
+/// at most one install job, never run again (comfy-cli ran at most once, and only when the
+/// core died after it), at most one usage line (QA1 I5), and nothing left held under the cap
+/// (a registry request is `free_tier`). `comfy.inventory` is exempt: the core submits it
+/// itself when the engine becomes ready, it only reads, and it runs again harmlessly at the
+/// next readiness.
+#[test]
+#[ignore = "nightly"] // spec: QA-055, CORE-131, CORE-069, CORE-071, QA-047
+fn crash_full_node_install_at_its_meter_fail_points() {
+    // The other plan-3 points are never passed by an install: it is a `cpu`-lane job with no
+    // engine post, so it never becomes `submitting` (`jobs.after_submitting`; `jobs.after_post`
+    // and `jobs.after_outputs` are the `comfy.prompt` handler's), and a registry request is
+    // `free_tier`, which reserves nothing under the caps (`caps.after_reserve`).
+    for point in ["meter.after_pending", "meter.after_usage_line"] {
+        let env = TestEnv::new();
+        let fake = FakeComfy::start();
+        attach_for_installs(&env, &fake);
+        let token = key();
+        let args = json!({"id": "comfyui-test-node", "version": "1.2.3"});
+        let core = aborting_core(&env, point);
+        let fired = {
+            let mut app = TestApp::start(&env, None, &[]);
+            let mut pipe = session(&env, None);
+            let pending = pipe.tool("engines.comfyui.install_node", args.clone(), Some(&token));
+            match pending["status"].as_str() {
+                Some("pending_confirmation") => {
+                    let id = pending["confirmation_id"].as_str().unwrap().to_string();
+                    let answered = app.call(
+                        "app/confirmation.answer",
+                        json!({"confirmation_id": id, "answer": "approve"}),
+                    );
+                    assert_eq!(answered["result"]["status"], "ok", "{point}: {answered}");
+                    call_into_abort_with(&mut pipe, "engines.comfyui.install_node", args, &token);
+                    true
+                }
+                // The core died while asking (a point before the confirmation).
+                _ => false,
+            }
+        };
+        let exit = core.wait_exit(DEADLINE);
+        assert!(
+            fired || exit.is_some(),
+            "{point}: neither a prompt nor a crash"
+        );
+        assert_eq!(
+            exit,
+            Some(lil_core::store::failpoints::ABORT_EXIT_CODE),
+            "{point}: the core did not end there"
+        );
+        drop(core);
+
+        let mut traces = Vec::new();
+        for _ in 0..2 {
+            let _core = CoreFixture::start(&env);
+            let mut pipe = session(&env, None);
+            let (jobs, ..) = install_trace(&env, &fake, &mut pipe);
+            for job in &jobs {
+                wait_done(&mut pipe, job["job_id"].as_str().unwrap());
+            }
+            let (jobs, runs, lines, cap) = install_trace(&env, &fake, &mut pipe);
+            assert!(jobs.len() <= 1, "{point}: {jobs:?}");
+            assert!(runs <= 1, "{point}: comfy-cli ran {runs} times");
+            if point == "meter.after_pending" {
+                assert_eq!(runs, 0, "{point}: comfy-cli never started");
+            }
+            assert!(lines.len() <= 1, "{point}: {lines:?}");
+            assert_eq!(cap.1, "0", "{point}: nothing stays held");
+            let states: Vec<(Value, Value)> = jobs
+                .iter()
+                .map(|j| (j["status"].clone(), j["substatus"].clone()))
+                .collect();
+            traces.push((states, runs, lines.len(), cap));
+        }
+        assert_eq!(
+            traces[0], traces[1],
+            "{point}: a second restart changes nothing"
+        );
+    }
+}
+
+/// [`call_into_abort`] with the idempotency key `key` (a retry of a confirmed call).
+fn call_into_abort_with(pipe: &mut RawPipe, name: &str, args: Value, key: &str) {
+    let request = json!({"jsonrpc": "2.0", "id": 9_100_002, "method": "tools/call",
+        "params": {"name": name, "arguments": args, "idempotency_key": key}});
+    pipe.send_line(&request.to_string());
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "the core neither answered {name} nor closed"
+        );
+        let Some(line) = pipe.read_line(left) else {
+            return;
+        };
+        if let Ok(message) = serde_json::from_str::<Value>(&line)
+            && message["id"] == 9_100_002
+        {
+            assert_eq!(
+                message["result"]["status"], "ok",
+                "{name} failed before the fail point: {message}"
+            );
+        }
+    }
+}

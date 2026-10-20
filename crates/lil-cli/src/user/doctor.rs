@@ -729,12 +729,24 @@ fn claude_code(env: &Env, claude: Option<&Path>, interactive: bool, report: &mut
 /// `claude --version` (`2.1.296 (Claude Code)`): one older than [`MIN_CLAUDE_CODE`], or one
 /// that can't be read, is a problem naming the update step (ruling P3-R30).
 fn claude_version(claude: &Path, report: &mut Report) {
-    let version = match run_claude(claude, &["--version"]) {
-        Ok(out) => out
+    let read = run_claude(claude, &["--version"]).and_then(|out| {
+        let version = out
             .split_whitespace()
             .next()
             .unwrap_or_default()
-            .to_string(),
+            .to_string();
+        let dotted = !version.is_empty()
+            && version
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        if dotted {
+            Ok(version)
+        } else {
+            Err(format!("`claude --version` printed {:?}", out.trim()))
+        }
+    });
+    let version = match read {
+        Ok(version) => version,
         Err(e) => {
             report.problem(&format!(
                 "the Claude Code version can't be read: {e} — the plugin's hooks need Claude \
