@@ -22,7 +22,17 @@
 //! `server` builds the router.
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
-//! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
+//! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments. It also
+//! resolves the two forms a bare `crate::<module>` scan used to miss (I3): a crate-root
+//! re-export reached by its item name (`crate::RunningCore` → `server`, from `src/lib.rs`'s
+//! `pub use`), and a `super::…` / `super::super::…` path (resolved against the file's module
+//! depth, so `super::super::state` from `src/store/write.rs` names `state`). `declared()` matches
+//! a `mod` at any visibility, so a `pub(crate) mod` can't slip past the list check.
+//!
+//! `#[cfg(test)]` modules are **not** counted: they don't ship, so they aren't part of the
+//! crate's production dependency graph (CORE-010). That is why a store unit test may build a
+//! `state` database, and the `rpc` panic tests may spin a core (`crate::CoreThread`), without
+//! those test-only uses being read as production edges.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -58,19 +68,209 @@ const MODULES: [&str; 26] = [
     "session",
 ];
 
-/// The modules `src/lib.rs` declares.
+/// The modules `src/lib.rs` declares, at any visibility: `mod`, `pub mod`, `pub(crate) mod`,
+/// `pub(super) mod`, … (a `pub(crate) mod` would otherwise slip past the scan).
 fn declared(src: &Path) -> BTreeSet<String> {
     std::fs::read_to_string(src.join("lib.rs"))
         .unwrap()
         .lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("pub mod ")
-                .or_else(|| l.strip_prefix("mod "))
-                .and_then(|rest| rest.strip_suffix(';'))
-                .map(str::to_string)
-        })
+        .filter_map(|l| mod_name(l.trim()))
         .collect()
+}
+
+/// The module a `… mod <name>;` line declares, whatever its visibility; `None` for any other
+/// line. `pub`, `pub(crate)`, `pub(super)` and `pub(in …)` all count.
+fn mod_name(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("pub").map_or(line, |r| {
+        let r = r.trim_start();
+        // Skip a `(…)` visibility restriction.
+        match r.strip_prefix('(') {
+            Some(after) => after.split_once(')').map_or("", |(_, t)| t).trim_start(),
+            None => r,
+        }
+    });
+    rest.strip_prefix("mod ")
+        .and_then(|r| r.trim().strip_suffix(';'))
+        .map(|name| name.trim().to_string())
+}
+
+/// `src/lib.rs`'s crate-root re-exports: each item name a `pub use <module>::…;` lifts to the
+/// crate root, mapped to its `<module>` (only when `<module>` is one of [`MODULES`]). So a
+/// `crate::RunningCore` elsewhere is read as an edge to `server`, not missed because its first
+/// segment isn't a module name.
+fn reexports(src: &Path) -> BTreeMap<String, String> {
+    let text = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+    let text = strip_line_comments(&text);
+    let mut map = BTreeMap::new();
+    let mut at = 0;
+    while let Some(i) = text[at..].find("pub use ") {
+        let start = at + i + "pub use ".len();
+        // The module the items come from: the first path segment.
+        let seg_end = text[start..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(text.len(), |k| start + k);
+        let module = text[start..seg_end].to_string();
+        // The statement runs to its `;`.
+        let stmt_end = text[start..].find(';').map_or(text.len(), |k| start + k);
+        let rest = &text[seg_end..stmt_end];
+        at = stmt_end;
+        if !MODULES.contains(&module.as_str()) {
+            continue;
+        }
+        // `pub use module::Item;` or `pub use module::{A, B, C};` or `pub use module::*;`.
+        let items = rest.trim_start_matches("::");
+        if let Some(group) = items.trim().strip_prefix('{') {
+            let group = group.trim_end().trim_end_matches('}');
+            for item in group.split(',') {
+                // The last segment of each item (`a::b::C` re-exports `C`).
+                let name = item.trim().rsplit("::").next().unwrap_or("").trim();
+                if !name.is_empty() && name != "*" {
+                    map.insert(name.to_string(), module.clone());
+                }
+            }
+        } else {
+            let name = items.trim().rsplit("::").next().unwrap_or("").trim();
+            if !name.is_empty() && name != "*" {
+                map.insert(name.to_string(), module.clone());
+            }
+        }
+    }
+    map
+}
+
+/// `//`-comment-stripped text (line comments only; enough for the `use`/`pub use` lines the
+/// scan reads).
+fn strip_line_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `text` with every `#[cfg(test)]`-attributed inline `mod … { … }` block removed: those tests
+/// don't ship, so they are not part of the crate's production dependency graph (CORE-010). Only
+/// whole test modules are cut; a `#[cfg(test)]` on a field or a statement is left.
+fn strip_cfg_test_mods(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(i) = text[at..].find("#[cfg(test)]") {
+        let marker = at + i;
+        // What follows the attribute, skipping whitespace and further attributes.
+        let mut j = marker + "#[cfg(test)]".len();
+        loop {
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            // A visibility before `mod`.
+            let head = &text[j..];
+            let after_vis = head.strip_prefix("pub").map_or(head, |r| {
+                let r = r.trim_start();
+                r.strip_prefix('(')
+                    .and_then(|a| a.split_once(')'))
+                    .map_or(r, |(_, t)| t.trim_start())
+            });
+            if let Some(after_mod) = after_vis.strip_prefix("mod ") {
+                // Find the `{` that opens the module body and its matching `}`.
+                let body_rel = after_mod.find('{');
+                let Some(body_rel) = body_rel else { break };
+                let open = (j + (after_vis.as_ptr() as usize - head.as_ptr() as usize))
+                    + "mod ".len()
+                    + body_rel;
+                // Keep everything up to the attribute, then skip to after the matching brace.
+                out.push_str(&text[at..marker]);
+                let mut depth = 0i32;
+                let mut k = open;
+                while k < bytes.len() {
+                    match bytes[k] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                k += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                at = k;
+                break;
+            }
+            // Not a module: leave the attribute in place and move past it.
+            out.push_str(&text[at..j]);
+            at = j;
+            break;
+        }
+        if at <= marker {
+            // Safety: never loop without progress.
+            out.push_str(&text[at..=marker]);
+            at = marker + 1;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// The module chain of a source file relative to `src`: `src/store/write.rs` → `["store",
+/// "write"]`, `src/store.rs` and `src/store/mod.rs` → `["store"]`.
+fn module_chain(path: &Path, src: &Path) -> Vec<String> {
+    let rel = path.strip_prefix(src).unwrap_or(path);
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(last) = parts.last_mut() {
+        if last == "mod.rs" {
+            parts.pop();
+        } else if let Some(stem) = last.strip_suffix(".rs") {
+            *last = stem.to_string();
+        }
+    }
+    parts
+}
+
+/// The targets of `super::…` paths in `code`, each as `(supers, first_segment)` (`super::x` →
+/// `(1, "x")`, `super::super::state::T` → `(2, "state")`), outside `//` comments and `crate::`.
+fn super_targets(code: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = code[at..].find("super::") {
+        let pos = at + i;
+        let before = code[..pos].chars().next_back();
+        at = pos + "super::".len();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut supers = 1;
+        let mut j = at;
+        while code[j..].starts_with("super::") {
+            supers += 1;
+            j += "super::".len();
+        }
+        let end = code[j..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(code.len(), |k| j + k);
+        if end > j {
+            out.push((supers, code[j..end].to_string()));
+        }
+        at = j;
+    }
+    out
+}
+
+/// The top-level module `name` names, directly ([`MODULES`]) or through a crate-root re-export
+/// (`reexports`); `None` for anything else.
+fn resolve(name: &str, reexports: &BTreeMap<String, String>) -> Option<String> {
+    if MODULES.contains(&name) {
+        Some(name.to_string())
+    } else {
+        reexports.get(name).cloned()
+    }
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -155,8 +355,37 @@ fn crate_refs(text: &str) -> BTreeSet<String> {
     found
 }
 
+/// The modules a file depends on (resolved to top-level [`MODULES`] names), from both `crate::`
+/// paths — including crate-root re-exports (`reexports`) — and `super::` chains resolved against
+/// the file's module `chain`. `#[cfg(test)]` modules are not counted (they don't ship).
+fn file_edges(
+    text: &str,
+    chain: &[String],
+    reexports: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let code = strip_cfg_test_mods(text);
+    let mut uses = BTreeSet::new();
+    for name in crate_refs(&code) {
+        if let Some(m) = resolve(&name, reexports) {
+            uses.insert(m);
+        }
+    }
+    for (supers, name) in super_targets(&strip_line_comments(&code)) {
+        // `super` from inside a file points at its parent module; `supers` of them climb that
+        // many levels. Only when they reach the crate root does the next segment name another
+        // top-level module; a shallower `super::` stays inside this module (a self-reference).
+        if supers >= chain.len()
+            && let Some(m) = resolve(&name, reexports)
+        {
+            uses.insert(m);
+        }
+    }
+    uses
+}
+
 /// Module → the CORE-014 modules its files name.
 fn graph(src: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let reexports = reexports(src);
     let mut graph = BTreeMap::new();
     for module in MODULES {
         let mut files = Vec::new();
@@ -171,10 +400,11 @@ fn graph(src: &Path) -> BTreeMap<String, BTreeSet<String>> {
         let mut uses = BTreeSet::new();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
+            let chain = module_chain(&file, src);
             uses.extend(
-                crate_refs(&text)
+                file_edges(&text, &chain, &reexports)
                     .into_iter()
-                    .filter(|m| MODULES.contains(&m.as_str()) && m != module),
+                    .filter(|m| m != module),
             );
         }
         graph.insert(module.to_string(), uses);
@@ -353,4 +583,78 @@ fn the_check_detects_a_cycle_and_every_use_form() {
         "{found:?}"
     );
     assert_eq!(found.first(), found.last());
+}
+
+/// The three forms the reviewer's probes slipped past before (extras fix round 1, I3): a
+/// `super::super::` path, a crate-root re-export reached by its item name, and a `pub(crate) mod`
+/// declaration. Each must now be seen.
+#[test] // spec: CORE-010
+fn the_scan_sees_super_reexports_and_restricted_mods() {
+    // 1. `super::super::state` from `src/store/write.rs` climbs to the crate root, so it names
+    // the `state` module — a real store → state edge. A single `super::` stays inside `store`.
+    let reexports: BTreeMap<String, String> = [
+        ("RunningCore", "server"),
+        ("CoreThread", "server"),
+        ("start_in_thread", "server"),
+        ("CoreConfig", "config"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    let chain = ["store".to_string(), "write".to_string()];
+    let edges = file_edges(
+        "use super::super::state::StateDb as _;\nuse super::fsops;\n",
+        &chain,
+        &reexports,
+    );
+    assert!(
+        edges.contains("state"),
+        "super::super::state missed: {edges:?}"
+    );
+    assert!(
+        !edges.contains("store"),
+        "super::fsops is a self-reference: {edges:?}"
+    );
+
+    // 2. A crate-root re-export reached by its item name is an edge to the module it comes from.
+    let edges = file_edges(
+        "use crate::RunningCore as _;\n",
+        &["transport".into()],
+        &reexports,
+    );
+    assert!(
+        edges.contains("server"),
+        "crate::RunningCore missed: {edges:?}"
+    );
+    let edges = file_edges(
+        "use crate::{CoreThread, start_in_thread};\n",
+        &["rpc".into()],
+        &reexports,
+    );
+    assert!(
+        edges.contains("server"),
+        "crate::{{CoreThread, …}} missed: {edges:?}"
+    );
+
+    // 3. `pub(crate) mod` (and `pub(super) mod`) are declarations the list check must see.
+    assert_eq!(
+        mod_name("pub(crate) mod zzprobe;"),
+        Some("zzprobe".to_string())
+    );
+    assert_eq!(mod_name("pub(super) mod inner;"), Some("inner".to_string()));
+    assert_eq!(mod_name("pub mod server;"), Some("server".to_string()));
+    assert_eq!(mod_name("mod conn;"), Some("conn".to_string()));
+    assert_eq!(mod_name("    let mod_x = 1;"), None);
+
+    // A `#[cfg(test)]` module doesn't ship, so its uses aren't production edges.
+    let edges = file_edges(
+        "use crate::store::Store;\n#[cfg(test)]\nmod tests {\n    use crate::server::RunningCore;\n}\n",
+        &["rpc".into()],
+        &reexports,
+    );
+    assert!(edges.contains("store"), "{edges:?}");
+    assert!(
+        !edges.contains("server"),
+        "a cfg(test) module is not a production edge: {edges:?}"
+    );
 }
