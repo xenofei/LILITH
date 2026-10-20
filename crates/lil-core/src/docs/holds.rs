@@ -25,8 +25,8 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::events::ClientId;
-use crate::server::ConnObserver;
 use crate::state::{HoldMarker, StateDb};
+use crate::transport::ConnObserver;
 
 /// Who holds a document.
 #[derive(Debug, Clone, PartialEq, Eq)]

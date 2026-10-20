@@ -47,6 +47,7 @@ pub use suite_toml::{register_workspace, set_caps};
 pub use trash::{MaintenanceReport, REJECTED_KEEP_DAYS, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord};
 pub use versions::{SNAPSHOT, SealRequest, Sealed, VersionDir};
 pub use write::{
-    ChangeKind, ChangeSink, Expect, Phase, RecoveryReport, Step, Store, StoreError, StoreEvent,
-    WriteDecision, Written, decide_write, lfs_pointer_oid, next_step,
+    Access, ChangeKind, ChangeSink, Expect, Pending, Phase, RecoveryReport, RowsFuture, Step,
+    Store, StoreError, StoreEvent, StoreRows, WriteDecision, Written, decide_write,
+    lfs_pointer_oid, next_step,
 };

@@ -43,21 +43,14 @@ use tokio::sync::{OnceCell, watch};
 
 use crate::events::EventBus;
 use crate::index::{Index, IndexError};
+pub use crate::state::WorkspaceRef;
 use crate::state::{StateDb, StateError, StateRegistry};
+pub use crate::store::Access;
 use crate::store::{FailPoints, Store, WsPath, fsops};
 use crate::watch::{WatchConfig, Watcher};
 
 /// The UI action and the tool that make another workspace the default (`lil workspace use`).
 pub const SET_DEFAULT_ACTION: &str = "workspace.set_default";
-
-/// A resolved workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceRef {
-    /// 16 lowercase hex: the hash of the canonical path.
-    pub id: String,
-    /// The canonical path, without a `\\?\` prefix.
-    pub path: PathBuf,
-}
 
 /// Resolves the `workspace` of a hello: `"none"` is `None`; the id of the default workspace
 /// is that workspace.
@@ -180,15 +173,6 @@ fn id_of(path: &Path) -> Option<(String, PathBuf)> {
 // ---------------------------------------------------------------------------------------------
 // Open workspaces (ARCH-028).
 // ---------------------------------------------------------------------------------------------
-
-/// How this core serves a workspace (ARCH-028).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Access {
-    /// This core holds the workspace's `core.lock`.
-    ReadWrite,
-    /// Another core holds it: reads only, and the `state.db` is never written.
-    ReadOnly,
-}
 
 /// A workspace this core serves: what [`WorkspaceHub::open`] set up, shared by every call.
 /// `core.lock` (read-write only) is held until the hub closes it, or until the last reference

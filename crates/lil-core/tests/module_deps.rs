@@ -10,7 +10,16 @@
 //! from `meter` (as the engine tools are from `engines`), and `jobs` and `telemetry` use no
 //! `meter` item either (`JobCompletion` is how `meter` hears of a job). `confirm` uses `tools`
 //! (it is the confirm stage), and neither `tools` nor `jobs` uses it.
-//! `interchange` and `docs` (the handler registry and the holds) are used by no other module.
+//! `interchange` and `docs` (the handler registry and the holds) are used by no other module but
+//! `server`, which builds every module and wires them together.
+//!
+//! Every module of the crate is scanned, the infrastructure ones too (`state`, `workspace`,
+//! `server`, `transport`, `rpc`, `config`, `events`, `identity`, `lifecycle`, `session`), and
+//! the list is checked against `src/lib.rs`, so a new module can't be missed. The store names
+//! none of them: it defines `StoreRows`, which `state` implements, and `Access`, which
+//! `workspace` re-exports; `state` holds `WorkspaceRef`. The connection types (`ConnCtx`,
+//! `Router`, `ConnObserver`) live in `transport`, below `rpc`, `docs` and `interchange`; only
+//! `server` builds the router.
 //!
 //! The scan reads every `crate::<module>` path in a module's files (`src/<module>.rs` and
 //! `src/<module>/**.rs`), `use crate::{a::…, b::…}` groups included, outside comments.
@@ -18,8 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// The CORE-014 modules (each plan-3 module is added as it lands).
-const MODULES: [&str; 16] = [
+/// Every module of the crate (`pub mod` in `src/lib.rs`): the CORE-014 modules and the
+/// infrastructure.
+const MODULES: [&str; 26] = [
     "store",
     "index",
     "watch",
@@ -36,7 +46,32 @@ const MODULES: [&str; 16] = [
     "resources",
     "interchange",
     "docs",
+    "state",
+    "workspace",
+    "server",
+    "transport",
+    "rpc",
+    "config",
+    "events",
+    "identity",
+    "lifecycle",
+    "session",
 ];
+
+/// The modules `src/lib.rs` declares.
+fn declared(src: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(src.join("lib.rs"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("pub mod ")
+                .or_else(|| l.strip_prefix("mod "))
+                .and_then(|rest| rest.strip_suffix(';'))
+                .map(str::to_string)
+        })
+        .collect()
+}
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -185,20 +220,10 @@ fn cycle(graph: &BTreeMap<String, BTreeSet<String>>) -> Option<Vec<String>> {
 #[test] // spec: CORE-010, CORE-014
 fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let listed: BTreeSet<String> = MODULES.iter().map(|m| (*m).to_string()).collect();
+    assert_eq!(declared(&src), listed, "scan every module of src/lib.rs");
     let graph = graph(&src);
-    for module in [
-        "store",
-        "index",
-        "pipeline",
-        "tools",
-        "jobs",
-        "telemetry",
-        "engines",
-        "meter",
-        "resources",
-        "interchange",
-        "docs",
-    ] {
+    for module in MODULES {
         assert!(
             graph.contains_key(module),
             "no {module} module found: {graph:?}"
@@ -213,13 +238,46 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     forbidden(
         "store",
         &[
-            "index", "watch", "graph", "pipeline", "projects", "settings", "tools", "jobs",
+            "index",
+            "watch",
+            "graph",
+            "pipeline",
+            "projects",
+            "settings",
+            "tools",
+            "jobs",
+            "state",
+            "workspace",
+            "session",
+            "config",
+            "server",
+            "transport",
+            "rpc",
         ],
     );
     forbidden(
         "index",
-        &["watch", "pipeline", "projects", "settings", "tools", "jobs"],
+        &[
+            "watch",
+            "pipeline",
+            "projects",
+            "settings",
+            "tools",
+            "jobs",
+            "workspace",
+        ],
     );
+    // The state databases sit on the store (their folders are made through `fsops`) and below
+    // the workspaces that open them.
+    forbidden("state", &["workspace", "index", "watch", "session"]);
+    // The running core builds everything, and nothing names it; only it builds the router.
+    for module in graph.keys().filter(|m| *m != "server") {
+        forbidden(module, &["server"]);
+    }
+    for module in graph.keys().filter(|m| *m != "server" && *m != "rpc") {
+        forbidden(module, &["rpc"]);
+    }
+    forbidden("transport", &["rpc", "docs", "interchange", "tools"]);
     forbidden("pipeline", &["tools", "jobs"]);
     forbidden("jobs", &["tools", "engines", "meter"]);
     forbidden("telemetry", &["tools", "jobs", "engines", "meter"]);
@@ -229,9 +287,9 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     forbidden("tools", &["confirm"]);
     forbidden("jobs", &["confirm"]);
     assert!(graph["confirm"].contains("tools"), "{graph:?}");
-    // `resources` is registered by the server like `engines`: no module names it, and it uses
-    // `tools` (the call context and the registry) and the store.
-    for module in graph.keys().filter(|m| *m != "resources") {
+    // `resources` is registered by the server like `engines`: no other module names it, and it
+    // uses `tools` (the call context and the registry) and the store.
+    for module in graph.keys().filter(|m| *m != "resources" && *m != "server") {
         forbidden(module, &["resources"]);
     }
     // The holds and the handler registry are leaves of the module graph: the server wires them
@@ -242,7 +300,7 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
             .filter(|(m, uses)| m.as_str() != leaf && uses.contains(leaf))
             .map(|(m, _)| m)
             .collect();
-        assert!(users.is_empty(), "{users:?} use {leaf}");
+        assert_eq!(users, ["server"], "{users:?} use {leaf}");
     }
     // The directions that exist: tools → jobs → pipeline, tools → pipeline → index → store.
     assert!(graph["tools"].contains("jobs"), "{graph:?}");
@@ -255,6 +313,11 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     assert!(graph["resources"].contains("tools"), "{graph:?}");
     assert!(graph["pipeline"].contains("index"), "{graph:?}");
     assert!(graph["index"].contains("store"), "{graph:?}");
+    assert!(graph["state"].contains("store"), "{graph:?}");
+    assert!(graph["workspace"].contains("state"), "{graph:?}");
+    assert!(graph["workspace"].contains("store"), "{graph:?}");
+    assert!(graph["server"].contains("rpc"), "{graph:?}");
+    assert!(graph["rpc"].contains("transport"), "{graph:?}");
 }
 
 /// The scan and the cycle check catch what they are there for: a `pipeline` file that names a

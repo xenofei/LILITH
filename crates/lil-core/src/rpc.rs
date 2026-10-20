@@ -90,9 +90,9 @@ use crate::events::EventBus;
 use crate::identity::{EngineSession, EngineTokens, TrustedDirs, resolve_caller};
 use crate::lifecycle::{DrainReason, Lifecycle};
 use crate::meter::Caps;
-use crate::server::{ConnCtx, ConnObserver, Router};
 use crate::session::Session;
 use crate::tools::Dispatcher;
+use crate::transport::{ConnCtx, ConnObserver, Router};
 use crate::workspace::{WorkspaceRef, resolve_workspace};
 
 /// Where a connection stands in the handshake.
@@ -521,7 +521,7 @@ impl RpcRouter {
         };
         let identified = match tokio::task::spawn_blocking(move || identify.run()).await {
             Ok(identified) => identified,
-            // A panic there is this handler's panic (see `server::conn`).
+            // A panic there is this handler's panic (see `transport::conn`).
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
             Err(e) => {
                 tracing::error!(conn_id = conn.conn_id, error = %e, trace_id, "core/hello stopped");

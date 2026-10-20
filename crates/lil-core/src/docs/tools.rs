@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::DOCS_MODULE;
 use super::holds::{HoldGuard, HoldOwner, HoldView, Holds};
-use crate::server::ConnObserver;
 use crate::session::Session;
 use crate::tools::{Registry, TEST_MODULE, typed_tool};
+use crate::transport::ConnObserver;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

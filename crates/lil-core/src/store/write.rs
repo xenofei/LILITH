@@ -51,8 +51,6 @@ use super::failpoints::FailPoints;
 use super::fsops;
 use super::git_gate::{GIT_WAIT, GitGate};
 use super::paths::{WsPath, long_rel, reserved_on_disk, writable};
-use crate::state::{Pending, StateDb, StateError};
-use crate::workspace::Access;
 
 /// The first pause of a retry.
 pub const RETRY_FIRST: Duration = Duration::from_millis(10);
@@ -152,7 +150,7 @@ impl StoreError {
         }
     }
 
-    pub(super) fn state(path: &WsPath, e: &StateError) -> StoreError {
+    pub(super) fn state(path: &WsPath, e: &dyn std::fmt::Display) -> StoreError {
         StoreError::Io {
             path: path.as_str().to_string(),
             why: format!("the workspace state database failed: {e}"),
@@ -343,6 +341,53 @@ pub struct StoreEvent {
     pub kind: ChangeKind,
     pub sha256: Option<String>,
     pub identity: Option<FileIdentity>,
+}
+
+/// How this core serves a workspace (ARCH-028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// This core holds the workspace's `core.lock`.
+    ReadWrite,
+    /// Another core holds it: reads only, and the `state.db` is never written.
+    ReadOnly,
+}
+
+/// A pending replace of the store (write step 5, ARCH-074): the hash the target had when it was
+/// checked (`None` for a new target) and the hash of the bytes going in. While the row exists
+/// either version is the core's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// Workspace-relative, `/` separators.
+    pub path: String,
+    pub old_sha256: Option<String>,
+    pub new_sha256: String,
+    pub started_utc: i64,
+}
+
+/// What a [`StoreRows`] call gives back; an error is the database's own message.
+pub type RowsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
+/// The rows the store keeps in the workspace `state.db` (write steps 5 and 8, ARCH-074,
+/// ARCH-078): each path's pending replace and the last hash the store wrote to it. The state
+/// module's `StateDb` implements it, so the store names no type of its consumers (CORE-010).
+pub trait StoreRows: Send + Sync + std::fmt::Debug {
+    /// The pending replace of `path`, if one is recorded.
+    fn pending<'a>(&'a self, path: &'a str) -> RowsFuture<'a, Option<Pending>>;
+    /// Every pending replace, by path.
+    fn pendings(&self) -> RowsFuture<'_, Vec<Pending>>;
+    /// Records (or replaces) the pending replace of `p.path` (write step 5).
+    fn set_pending<'a>(&'a self, p: &'a Pending) -> RowsFuture<'a, ()>;
+    /// Write step 8, in one transaction: clears the pending row of `path` and, when
+    /// `generated` is given, records `(sha256, utc)` as its last generated hash.
+    fn finish_pending<'a>(
+        &'a self,
+        path: &'a str,
+        generated: Option<(&'a str, i64)>,
+    ) -> RowsFuture<'a, ()>;
+    /// The last hash the store wrote to `path`.
+    fn generated<'a>(&'a self, path: &'a str) -> RowsFuture<'a, Option<String>>;
+    /// Records `sha256` as the last hash the store wrote to `path`, at `utc` (Unix seconds).
+    fn set_generated<'a>(&'a self, path: &'a str, sha256: &'a str, utc: i64) -> RowsFuture<'a, ()>;
 }
 
 /// The index step (Task 10): the store emits, the index consumes (CORE-010).
@@ -958,7 +1003,7 @@ impl Want {
 /// algorithm above.
 pub struct Store {
     root: PathBuf,
-    state: Arc<StateDb>,
+    state: Arc<dyn StoreRows>,
     fp: Arc<FailPoints>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdSource>,
@@ -994,7 +1039,7 @@ impl Store {
     /// `unknown` until [`Store::with_machine`].
     pub fn new(
         root: PathBuf,
-        state: Arc<StateDb>,
+        state: Arc<dyn StoreRows>,
         failpoints: Arc<FailPoints>,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdSource>,
@@ -1045,7 +1090,7 @@ impl Store {
     }
 
     /// The workspace `state.db`.
-    pub fn state(&self) -> &Arc<StateDb> {
+    pub fn state(&self) -> &Arc<dyn StoreRows> {
         &self.state
     }
 

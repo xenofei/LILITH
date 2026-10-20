@@ -37,9 +37,9 @@ pub use handlers::{
 };
 pub use tools::register_interchange_tools;
 
-use crate::server::ConnObserver;
 use crate::session::Session;
 use crate::tools::CallCtx;
+use crate::transport::ConnObserver;
 
 /// The `module` of this module's tools (CORE-058).
 pub const INTERCHANGE_MODULE: &str = "interchange";

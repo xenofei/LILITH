@@ -65,7 +65,8 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::store::fsops;
 use crate::store::paths::path_key;
-use crate::workspace::{Access, WorkspaceRef};
+pub use crate::store::{Access, Pending};
+use crate::store::{RowsFuture, StoreRows};
 
 /// Called once when a database actor dies, with `"state"`.
 pub type OnFatal = Arc<dyn Fn(&str) + Send + Sync>;
@@ -161,16 +162,65 @@ pub const PRUNE_DONE_SQL: &str =
 pub const PRUNE_CONFIRMATIONS_SQL: &str =
     "DELETE FROM confirmations WHERE state <> 'pending' AND created_utc < ?1";
 
-/// A pending replace of the store (write step 5, ARCH-074): the hash the target had when it was
-/// checked (`None` for a new target) and the hash of the bytes going in. While the row exists
-/// either version is the core's own.
+/// A resolved workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pending {
-    /// Workspace-relative, `/` separators.
-    pub path: String,
-    pub old_sha256: Option<String>,
-    pub new_sha256: String,
-    pub started_utc: i64,
+pub struct WorkspaceRef {
+    /// 16 lowercase hex: the hash of the canonical path.
+    pub id: String,
+    /// The canonical path, without a `\\?\` prefix.
+    pub path: PathBuf,
+}
+
+/// The store's rows in a workspace `state.db` (the store defines the trait, so it names no
+/// `state` type: CORE-010).
+impl StoreRows for StateDb {
+    fn pending<'a>(&'a self, path: &'a str) -> RowsFuture<'a, Option<Pending>> {
+        Box::pin(async move {
+            StateDb::pending(self, path)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn pendings(&self) -> RowsFuture<'_, Vec<Pending>> {
+        Box::pin(async move { StateDb::pendings(self).await.map_err(|e| e.to_string()) })
+    }
+
+    fn set_pending<'a>(&'a self, p: &'a Pending) -> RowsFuture<'a, ()> {
+        Box::pin(async move {
+            StateDb::set_pending(self, p)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn finish_pending<'a>(
+        &'a self,
+        path: &'a str,
+        generated: Option<(&'a str, i64)>,
+    ) -> RowsFuture<'a, ()> {
+        Box::pin(async move {
+            StateDb::finish_pending(self, path, generated)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn generated<'a>(&'a self, path: &'a str) -> RowsFuture<'a, Option<String>> {
+        Box::pin(async move {
+            StateDb::generated(self, path)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn set_generated<'a>(&'a self, path: &'a str, sha256: &'a str, utc: i64) -> RowsFuture<'a, ()> {
+        Box::pin(async move {
+            StateDb::set_generated(self, path, sha256, utc)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
 }
 
 /// A row of `hold_markers` (APP-104): `doc_id` was held by `holder` since `since_utc`.
