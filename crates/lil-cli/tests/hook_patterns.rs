@@ -236,6 +236,37 @@ fn hook_patterns_table() {
         (". ./x.sh", BASH),
         // Documented limit: `bash -c` is asked about, its script isn't read.
         ("bash -c \"ls\"", BOTH),
+        // Extras fix round 1, I1 (ruling P3-R28 extended): the reviewer's fixed-probe cases.
+        // Bash: a command substitution hidden in a ${…} expansion.
+        ("echo ${x:-$(rm -rf y)}", BASH),
+        ("echo ${x:-`rm -rf y`}", BASH),
+        ("echo ${x:=$(python x.py)}", BASH),
+        ("echo ${x:-$(echo a > $APPDATA/LILITH/suite.toml)}", BASH),
+        // Bash: the command word is an expansion.
+        ("x=rm; $x -rf y", BASH),
+        ("x=python; $x y.py", BASH),
+        ("${x} y.py", BASH),
+        // Bash: coproc.
+        ("coproc rm -rf y", BASH),
+        ("coproc tee $APPDATA/LILITH/suite.toml", BASH),
+        // PowerShell: an alias or function defined on the same line.
+        ("Set-Alias p Remove-Item; p y", PWSH),
+        ("sal p ri; p y", PWSH),
+        ("nal p python; p x.py", PWSH),
+        ("Set-Item alias:p python; p x.py", PWSH),
+        ("New-Item -Path function:p -Value 'python x.py'; p", PWSH),
+        (
+            "sal w Out-File; 'x' | w $env:APPDATA\\LILITH\\suite.toml",
+            PWSH,
+        ),
+        // PowerShell: $ExecutionContext and method calls on an expression.
+        ("$ExecutionContext.InvokeCommand.InvokeScript('rm y')", PWSH),
+        (
+            "$ExecutionContext.InvokeCommand.NewScriptBlock('rm y').Invoke()",
+            PWSH,
+        ),
+        ("(Get-Command python).Invoke()", PWSH),
+        ("(Get-Item $env:APPDATA\\LILITH\\suite.toml).Delete()", PWSH),
     ];
     let must_not_ask: &[(&str, &[Shell])] = &[
         ("git status", BOTH),
@@ -313,6 +344,9 @@ fn suite_toml_guard() {
     let stable = r"D:\data\Roaming\LILITH\suite.toml";
     let dev = r"D:\data\Roaming\LILITH-dev\suite.toml";
     let test = "C:/t/roaming/LILITH-test-0a1b2c3d/suite.toml";
+    // The legacy folder the suite still reads is guarded the same way (M2).
+    let legacy = r"D:\data\Roaming\Worldwright\suite.toml";
+    let legacy_dev = r"D:\data\Roaming\Worldwright-dev\suite.toml";
     // I5: the forms Windows reads as the same file (`.`, `..`, trailing dots and spaces, an
     // alternate data stream, 8.3 short names, case).
     let variants = [
@@ -328,7 +362,10 @@ fn suite_toml_guard() {
         r"D:\data\Roaming\lilith\Suite.TOML",
         r"D:\data\Roaming\LILITH\suit*.toml",
     ];
-    for path in [stable, dev, test].into_iter().chain(variants) {
+    for path in [stable, dev, test, legacy, legacy_dev]
+        .into_iter()
+        .chain(variants)
+    {
         for tool in ["Write", "Edit", "MultiEdit"] {
             assert!(asks(&write_of(tool, path)), "{tool} {path}");
         }
@@ -384,6 +421,9 @@ fn suite_toml_guard() {
         ("truncate -s 0 \"$APPDATA/LILITH/suite.toml\"", BASH),
         ("ln -sf x \"$APPDATA/LILITH/suite.toml\"", BASH),
         ("Set-Content -Path:$env:APPDATA\\LILITH\\suite.toml x", PWSH),
+        // The legacy folder is guarded too (M2).
+        ("Set-Content $env:APPDATA\\Worldwright\\suite.toml x", PWSH),
+        ("echo x > \"$APPDATA/Worldwright-dev/suite.toml\"", BASH),
     ];
     let pass: &[(&str, &[Shell])] = &[
         ("Get-Content $env:APPDATA\\LILITH\\suite.toml", PWSH),

@@ -19,10 +19,16 @@ mod hook_patterns;
 
 use hook_patterns::{Decision, Shell, classify_command, classify_tool};
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 use serde_json::json;
 
 fn config() -> ProptestConfig {
-    ProptestConfig::with_cases(lil_testkit::params::proptest_cases())
+    ProptestConfig {
+        // A failing case is saved beside this file (the default `SourceParallel` can't find the
+        // crate root from a `#[path]` module, N1).
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("regressions"))),
+        ..ProptestConfig::with_cases(lil_testkit::params::proptest_cases())
+    }
 }
 
 fn shell() -> impl Strategy<Value = Shell> {
@@ -142,6 +148,52 @@ fn call_operator() -> impl Strategy<Value = String> {
     (prop::sample::select(vec!["&", "."]), word()).prop_map(|(op, w)| format!("{op} {w}"))
 }
 
+/// A short payload an expansion or a `coproc` might hide: a delete, an interpreter run, or a
+/// write to a guarded `suite.toml`. The ask is triggered by the form, not by this word.
+fn payload() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "rm -rf y".to_string(),
+        "python x.py".to_string(),
+        "echo a > $APPDATA/LILITH/suite.toml".to_string(),
+        "tee $APPDATA/LILITH/suite.toml".to_string(),
+    ])
+}
+
+/// Bash forms the hook must ask about (ruling P3-R28 extended): a command substitution hidden in
+/// a `${…}` expansion, a command word that is itself an expansion, and `coproc`.
+fn bash_marker() -> impl Strategy<Value = String> {
+    prop_oneof![
+        (word(), payload()).prop_map(|(w, p)| format!("echo {w} ${{x:-$({p})}}")),
+        (word(), payload()).prop_map(|(w, p)| format!("echo {w} ${{x:=`{p}`}}")),
+        // The command word is an expansion (`$x …`, `${x} …`), after an optional assignment.
+        prop::sample::select(vec!["$x y.py", "${x} y.py", "x=rm; $x -rf y"])
+            .prop_map(str::to_string),
+        payload().prop_map(|p| format!("coproc {p}")),
+    ]
+}
+
+/// A short PowerShell command name an alias may stand for.
+fn ps_alias_target() -> impl Strategy<Value = &'static str> {
+    prop::sample::select(vec!["Remove-Item", "ri", "python", "Out-File"])
+}
+
+/// PowerShell forms the hook must ask about (ruling P3-R28 extended): an alias or function
+/// defined on the same line, any `$ExecutionContext` use, and a method call on an expression.
+fn powershell_marker() -> impl Strategy<Value = String> {
+    prop_oneof![
+        (
+            prop::sample::select(vec!["Set-Alias", "sal", "New-Alias", "nal"]),
+            ps_alias_target(),
+        )
+            .prop_map(|(def, target)| format!("{def} p {target}; p y")),
+        ps_alias_target().prop_map(|t| format!("Set-Item alias:p {t}; p y")),
+        ps_alias_target().prop_map(|t| format!("New-Item -Path function:p -Value '{t} x'; p")),
+        payload().prop_map(|p| format!("$ExecutionContext.InvokeCommand.InvokeScript('{p}')")),
+        word().prop_map(|w| format!("(Get-Command {w}).Invoke()")),
+        word().prop_map(|w| format!("(Get-Item {w}).Delete()")),
+    ]
+}
+
 /// Printable ASCII text: what may follow a comment or fill a here-string.
 fn text() -> impl Strategy<Value = String> {
     "[ -~]{0,16}"
@@ -193,6 +245,9 @@ fn marked_line() -> impl Strategy<Value = (Shell, String)> {
         ];
         if shell == Shell::PowerShell {
             markers.push(call_operator().boxed());
+            markers.push(powershell_marker().boxed());
+        } else {
+            markers.push(bash_marker().boxed());
         }
         let marker = prop::strategy::Union::new(markers);
         (Just(shell), commands(), marker, commands()).prop_map(|(shell, before, marker, after)| {
@@ -257,11 +312,23 @@ fn asks_or_denies(d: &Decision) -> bool {
     matches!(d, Decision::Ask(_) | Decision::Deny(_))
 }
 
+/// The `permissionDecision` the classifier's answer becomes in the hook's JSON (mirrors
+/// `pre_output` in `hook.rs`): `None`/`Warn` print no decision. `"allow"` is never produced.
+fn wire_decision(d: &Decision) -> Option<&'static str> {
+    match d {
+        Decision::Ask(_) => Some("ask"),
+        Decision::Deny(_) => Some("deny"),
+        Decision::Warn(_) | Decision::None => None,
+    }
+}
+
 proptest! {
     #![proptest_config(config())]
 
-    /// No command line gets `allow`: every answer is one of these four, none of which grants
-    /// anything, through the command classifier and through the tool classifier alike.
+    /// No command line is ever allowed: the classifiers don't panic on any input, and the
+    /// `permissionDecision` their answer becomes (through the command and the tool classifier
+    /// alike) is only `ask`, `deny` or nothing — never `allow`. The runtime check means a
+    /// future mapping that produced `allow` would fail here, not only a panic.
     #[test] // spec: QA-061, ARCH-105, CORE-116
     fn no_command_line_is_allowed((shell, line) in any_line(), core in any::<bool>()) {
         let tool = if shell == Shell::Bash { "Bash" } else { "PowerShell" };
@@ -269,14 +336,12 @@ proptest! {
             classify_command(shell, &line),
             classify_tool(tool, &json!({"command": line}), core),
         ] {
-            match decision {
-                Decision::Ask(_) | Decision::Deny(_) | Decision::Warn(_) | Decision::None => {}
-            }
+            prop_assert_ne!(wire_decision(&decision), Some("allow"), "{:?} {:?}", shell, line);
         }
     }
 
-    /// A line holding an interpreter word, a comment, a here-string or a call operator where
-    /// the shell reads one asks.
+    /// A line holding an interpreter word, a comment, a here-string, a call operator or one of
+    /// the ruling-P3-R28-extended forms where the shell reads one asks.
     #[test] // spec: QA-061, ARCH-105, CORE-116
     fn a_line_with_a_marker_asks((shell, line) in marked_line()) {
         let got = classify_command(shell, &line);
@@ -291,4 +356,45 @@ proptest! {
         let got = classify_command(Shell::Bash, &ansi);
         prop_assert!(asks_or_denies(&got), "Bash {ansi:?}: {got:?}");
     }
+}
+
+/// End to end: the built `lil hook pre-tool-use` reads a generated command line on stdin and its
+/// JSON never carries `permissionDecision: "allow"` — the one place an allow could actually be
+/// printed (the classifier's type can't express one). A smaller case count: each case spawns
+/// `lil`.
+#[test] // spec: QA-061, ARCH-105, CORE-116
+fn lil_hook_pre_tool_use_never_prints_allow() {
+    use proptest::test_runner::{Config, TestRunner};
+
+    let env = lil_testkit::TestEnv::new();
+    let mut runner = TestRunner::new(Config {
+        cases: 48,
+        failure_persistence: None,
+        ..Config::default()
+    });
+    runner
+        .run(&any_line(), |(shell, line)| {
+            let tool = if shell == Shell::Bash {
+                "Bash"
+            } else {
+                "PowerShell"
+            };
+            let input = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": {"command": line},
+            })
+            .to_string();
+            let out = env.lil_with_stdin(&["hook", "pre-tool-use"], &input);
+            prop_assert_eq!(out.code, 0, "{} {:?}: {:?}", tool, line, out);
+            let text = out.stdout.trim();
+            if !text.is_empty() {
+                let v: serde_json::Value =
+                    serde_json::from_str(text).expect("the hook prints JSON or nothing");
+                let decision = v["hookSpecificOutput"]["permissionDecision"].as_str();
+                prop_assert_ne!(decision, Some("allow"), "{} {:?}", tool, line);
+            }
+            Ok(())
+        })
+        .unwrap();
 }

@@ -10,8 +10,12 @@
 //! - comments (`#`, PowerShell `<# … #>`), here-strings (`@'…'@`, `@"…"@`, Bash `<<` and
 //!   `<<<`), Bash `$'…'` and typographic quotes (U+2018–U+201F, which PowerShell reads as
 //!   quotes);
-//! - a PowerShell hashtable (`@{`), a call operator (`&`, `.`) or a static .NET call
-//!   (`[IO.File]::Delete(…)`);
+//! - a PowerShell hashtable (`@{`), a call operator (`&`, `.`), a static .NET call
+//!   (`[IO.File]::Delete(…)`), an alias or function definition (`Set-Alias`/`sal`/`New-Alias`/
+//!   `nal`, or `Set-Item`/`New-Item` on the `alias:`/`function:` drive), any `$ExecutionContext`
+//!   use, or a method call on an expression (`(Get-Item x).Delete()`);
+//! - Bash: a command word that is a shell expansion (`$x`, `${x}`), a `${…}` holding a command
+//!   substitution, and `coproc`;
 //! - interpreter re-entry: `cmd`, `pwsh`, `powershell`, `bash`, `sh`, `zsh`, `python*`, `py`,
 //!   `node`, `perl`, `ruby`, `wsl`, `cscript`, `wscript`, `eval`, `Invoke-Expression`/`iex`,
 //!   `Invoke-Command`, `Start-Process`/`saps`/`start`, `Invoke-Item`/`ii`, `source`, … (only a
@@ -39,7 +43,8 @@
 //! string is an expression (`"y" | …`), not a command.
 //!
 //! **`suite.toml`** (ARCH-056, CORE-008). A path is guarded when, read as Windows reads it, it
-//! is a `suite.toml` directly in a folder named `LILITH` or `LILITH-<channel>`: `.` and `..`
+//! is a `suite.toml` directly in a folder named `LILITH` or `LILITH-<channel>` (or the legacy
+//! `Worldwright`/`Worldwright-<channel>` the suite still reads, M2): `.` and `..`
 //! are resolved, trailing dots and spaces dropped, an alternate data stream (`::$DATA`)
 //! dropped, case ignored. An 8.3 short name (`SUITE~1.TOM`, `LILITH~1`) or a wildcard in the
 //! last two segments is resolved through the file system when the file is there (the long
@@ -47,7 +52,8 @@
 //! folder makes a later relative `suite.toml` on the same line guarded too.
 //!
 //! **Known limits** (QA-061), stated plainly: a pattern guard reads the text, not the program.
-//! It doesn't see a command behind an alias or a function the session defined, a path built
+//! It doesn't see a command behind an alias or a function defined in an earlier session (a
+//! definition on the same line asks), a path built
 //! at run time (`Join-Path`, a variable holding `suite.toml`), a `cd` on an earlier command
 //! line, or what a program it allows does by itself. `cargo run -p lil-cli -- doctor` is not
 //! `lil doctor` to it. If `lil` can't start at all, Claude Code runs the tool anyway (a hook
@@ -242,9 +248,23 @@ fn normalized(path: &str) -> Vec<String> {
     out
 }
 
-/// A folder named `LILITH` or `LILITH-<channel>` (lower-cased).
-fn is_lilith_folder(seg: &str) -> bool {
-    seg == "lilith" || seg.strip_prefix("lilith-").is_some_and(|c| !c.is_empty())
+/// A folder a guarded `suite.toml` sits directly in (lower-cased): `LILITH` or
+/// `LILITH-<channel>`, and the legacy `Worldwright` or `Worldwright-<channel>` the suite still
+/// reads when the new file is missing (M2, R4), so a write to the legacy `suite.toml` is guarded
+/// the same way.
+fn is_guarded_folder(seg: &str) -> bool {
+    for base in ["lilith", "worldwright"] {
+        if seg == base {
+            return true;
+        }
+        if let Some(rest) = seg.strip_prefix(base)
+            && let Some(chan) = rest.strip_prefix('-')
+            && !chan.is_empty()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The segment may be an 8.3 short name or holds a wildcard: only the file system can tell.
@@ -293,7 +313,7 @@ fn could_be(seg: &str, names: &[&str]) -> bool {
 
 /// The lexical rule on normalized segments.
 fn names_guarded(segs: &[String]) -> bool {
-    matches!(segs, [.., folder, file] if file == "suite.toml" && is_lilith_folder(folder))
+    matches!(segs, [.., folder, file] if file == "suite.toml" && is_guarded_folder(folder))
 }
 
 /// A `suite.toml` directly in a `LILITH` or `LILITH-<channel>` folder, read as Windows reads
@@ -313,8 +333,18 @@ fn is_guarded_suite_toml(path: &str) -> bool {
     if let Ok(long) = std::fs::canonicalize(path.trim()) {
         return names_guarded(&normalized(&long.to_string_lossy()));
     }
-    let folder_ok = is_lilith_folder(folder)
-        || (uncertain(folder) && could_be(folder, &["lilith", "lilith-dev", "lilith-test-0"]));
+    let folder_ok = is_guarded_folder(folder)
+        || (uncertain(folder)
+            && could_be(
+                folder,
+                &[
+                    "lilith",
+                    "lilith-dev",
+                    "lilith-test-0",
+                    "worldwright",
+                    "worldwright-dev",
+                ],
+            ));
     let file_ok = file == "suite.toml" || (uncertain(file) && could_be(file, &["suite.toml"]));
     folder_ok && file_ok
 }
@@ -345,12 +375,63 @@ fn typographic_quote(c: char) -> bool {
     ('\u{2018}'..='\u{201F}').contains(&c)
 }
 
+/// A PowerShell line that runs code through an expression the lexer doesn't model (ruling
+/// P3-R28 extended): any `$ExecutionContext` use, and any method call on an expression — a `)`
+/// followed by `.<name>(`, as in `(Get-Command x).Invoke()` or `(Get-Item y).Delete()`.
+fn powershell_expression_reason(line: &str) -> Option<String> {
+    if line.to_ascii_lowercase().contains("$executioncontext") {
+        return Some(
+            "this uses $ExecutionContext, which can run any command the hook can't see".to_string(),
+        );
+    }
+    let chars: Vec<char> = line.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != ')' {
+            continue;
+        }
+        let mut j = i + 1;
+        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'.') {
+            continue;
+        }
+        j += 1;
+        let start = j;
+        while chars
+            .get(j)
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+        {
+            j += 1;
+        }
+        if j == start {
+            continue;
+        }
+        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'(') {
+            return Some(
+                "this calls a method on an expression, which can run any command the hook can't \
+                 see"
+                .to_string(),
+            );
+        }
+    }
+    None
+}
+
 fn first_reason(shell: Shell, line: &str, depth: usize) -> Option<String> {
     if depth > MAX_DEPTH {
         return Some("this nests command substitutions too deeply to read".to_string());
     }
     if line.chars().any(typographic_quote) {
         return Some("this uses typographic quotes, which PowerShell reads as quotes".to_string());
+    }
+    if shell == Shell::PowerShell
+        && let Some(reason) = powershell_expression_reason(line)
+    {
+        return Some(reason);
     }
     let parsed = lex(shell, line);
     if let Some(problem) = parsed.problem {
@@ -362,7 +443,7 @@ fn first_reason(shell: Shell, line: &str, depth: usize) -> Option<String> {
             return Some(reason);
         }
         if let Some(dir) = cd_target(cmd) {
-            in_lilith = normalized(dir).last().is_some_and(|f| is_lilith_folder(f));
+            in_lilith = normalized(dir).last().is_some_and(|f| is_guarded_folder(f));
         }
     }
     parsed
@@ -683,7 +764,17 @@ fn lex(shell: Shell, line: &str) -> Parsed {
                             lx.problem(UNREADABLE);
                             break;
                         };
-                        lx.word.text.extend(&chars[i..=i + p]);
+                        let body: String = chars[i..=i + p].iter().collect();
+                        // A `${…}` that hides a command substitution isn't read inside: ask
+                        // (ruling P3-R28 extended).
+                        if body.contains("$(") || body.contains('`') {
+                            lx.problem(
+                                "this nests a command substitution inside a ${…} expansion, which \
+                                 the hook doesn't read",
+                            );
+                            break;
+                        }
+                        lx.word.text.push_str(&body);
                         i += p + 1;
                         continue;
                     }
@@ -939,7 +1030,15 @@ fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String
         }
     }
     if first.var {
-        // A variable or a PowerShell assignee alone: what it holds isn't run here.
+        // Bash: the command word is an expansion (`$x`, `${x}`), so the hook can't tell what
+        // runs — ask (ruling P3-R28 extended). PowerShell: a bare `$x` only outputs the
+        // variable; what it holds isn't run here.
+        if shell == Shell::Bash {
+            return Some(
+                "the command word is a shell expansion, so the hook can't tell what runs"
+                    .to_string(),
+            );
+        }
         return None;
     }
     if shell == Shell::PowerShell && first.quoted {
@@ -948,6 +1047,16 @@ fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String
     }
     let raw = first.text.as_str();
     let name = command_name(raw);
+    if shell == Shell::Bash && name == "coproc" {
+        return Some(
+            "`coproc` runs a command in the background, which the hook doesn't read".into(),
+        );
+    }
+    if shell == Shell::PowerShell
+        && let Some(reason) = powershell_alias_reason(&name, &args)
+    {
+        return Some(reason);
+    }
     if let Some(reason) = write_like_suite_toml(&name, &args, &guarded) {
         return Some(reason);
     }
@@ -967,6 +1076,30 @@ fn command_reason(shell: Shell, cmd: &Command, in_lilith: bool) -> Option<String
         return Some(format!("this runs the program or script {raw} by its path"));
     }
     named_reason(&name, &args)
+}
+
+/// A PowerShell command that defines an alias or a function, which hides the command it runs
+/// (ruling P3-R28 extended): `Set-Alias`/`sal`/`New-Alias`/`nal`, or `Set-Item`/`New-Item`
+/// pointed at the `alias:` or `function:` provider.
+fn powershell_alias_reason(name: &str, args: &[&str]) -> Option<String> {
+    if matches!(name, "set-alias" | "sal" | "new-alias" | "nal") {
+        return Some(format!(
+            "`{name}` defines an alias, which can stand for any command the hook can't see"
+        ));
+    }
+    if matches!(name, "set-item" | "si" | "new-item" | "ni")
+        && args.iter().any(|a| {
+            let lower = a.to_ascii_lowercase();
+            let bare = lower.strip_prefix('-').is_none();
+            bare && (lower.starts_with("alias:") || lower.starts_with("function:"))
+        })
+    {
+        return Some(format!(
+            "`{name}` writes to the alias: or function: drive, which defines a command the hook \
+             can't see"
+        ));
+    }
+    None
 }
 
 /// The rule for write-like commands that name a guarded `suite.toml`: in an argument, after an
@@ -1043,7 +1176,7 @@ fn write_like_suite_toml(
     let named = args.iter().flat_map(|a| parts(a)).any(|p| guarded(&p));
     let split = args
         .iter()
-        .any(|a| normalized(a).last().is_some_and(|f| is_lilith_folder(f)))
+        .any(|a| normalized(a).last().is_some_and(|f| is_guarded_folder(f)))
         && args.iter().any(|a| is_bare_suite_toml(a));
     (named || split)
         .then(|| "this changes a LILITH suite.toml (your caps and settings)".to_string())
