@@ -261,6 +261,35 @@ fn doctor_reports_pass_env_entries_the_scrub_refuses() {
     );
 }
 
+#[test] // spec: ARCH-063
+fn doctor_names_pass_env_entries_that_are_not_strings() {
+    // M3: an entry that isn't a string, and a pass_env that isn't a list, are named too.
+    for (toml, entry, why) in [
+        (
+            "[engines.comfyui]\npass_env = ['HF_TOKEN', 1]\n",
+            "\"1\"",
+            "not a string",
+        ),
+        (
+            "[engines.comfyui]\npass_env = 'HF_TOKEN'\n",
+            "\"HF_TOKEN\"",
+            "pass_env is not a list",
+        ),
+    ] {
+        let env = TestEnv::new();
+        env.suite_toml_set(toml);
+        let out = env.lil(&["doctor"]);
+        assert_eq!(out.code, 1, "{toml}: a rejected entry is a problem: {out:?}");
+        assert!(
+            printed(&out).iter().any(|l| l
+                .starts_with("problem: [engines.comfyui] pass_env entry")
+                && l.contains(entry)
+                && l.contains(why)),
+            "{toml}: {entry} not reported: {out:?}"
+        );
+    }
+}
+
 /// `path` with `suffix` added to its file name.
 fn beside(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();

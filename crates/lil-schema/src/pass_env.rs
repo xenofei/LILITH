@@ -67,22 +67,34 @@ pub fn classify(entry: &str) -> Result<(), String> {
 }
 
 /// The `[engines.comfyui] pass_env` entries of a parsed `suite.toml`, split into the ones the
-/// scrub lets through and the ones it rejects (`(entry, why)`, ruling P3-R31). A missing or
-/// non-array `pass_env`, or no `[engines.comfyui]` table, gives two empty lists.
+/// scrub lets through and the ones it rejects (`(entry, why)`, ruling P3-R31). An entry that
+/// isn't a string is rejected as "not a string", and a `pass_env` that isn't an array as
+/// "pass_env is not a list" (M3), so `lil doctor` names it. A missing `pass_env`, or no
+/// `[engines.comfyui]` table, gives two empty lists.
 pub fn split(suite: &crate::SuiteToml) -> (Vec<String>, Vec<(String, String)>) {
-    let entries = suite
+    let text = |v: &toml::Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
+    let mut pass = Vec::new();
+    let mut rejected = Vec::new();
+    let Some(value) = suite
         .other
         .get("engines")
         .and_then(|e| e.get("comfyui"))
         .and_then(|c| c.get("pass_env"))
-        .and_then(toml::Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string));
-    let mut pass = Vec::new();
-    let mut rejected = Vec::new();
-    for entry in entries.into_iter().flatten() {
-        match classify(&entry) {
-            Ok(()) => pass.push(entry),
-            Err(why) => rejected.push((entry, why)),
+    else {
+        return (pass, rejected);
+    };
+    let Some(entries) = value.as_array() else {
+        rejected.push((text(value), "pass_env is not a list".to_string()));
+        return (pass, rejected);
+    };
+    for v in entries {
+        let Some(entry) = v.as_str() else {
+            rejected.push((text(v), "not a string".to_string()));
+            continue;
+        };
+        match classify(entry) {
+            Ok(()) => pass.push(entry.to_string()),
+            Err(why) => rejected.push((entry.to_string(), why)),
         }
     }
     (pass, rejected)
@@ -115,5 +127,37 @@ mod tests {
         for impossible in ["", "  ", "HF_*", "A=B", "X?", "pct%"] {
             assert!(classify(impossible).is_err(), "{impossible:?}");
         }
+    }
+
+    fn split_of(text: &str) -> (Vec<String>, Vec<(String, String)>) {
+        split(&crate::SuiteToml::parse(text).unwrap())
+    }
+
+    #[test]
+    fn entries_that_are_not_strings_and_a_pass_env_that_is_not_a_list_are_rejected() {
+        let (pass, rejected) =
+            split_of("[engines.comfyui]\npass_env = ['HF_TOKEN', 1, true, ['X']]\n");
+        assert_eq!(pass, ["HF_TOKEN"]);
+        let named: Vec<(&str, &str)> = rejected
+            .iter()
+            .map(|(e, w)| (e.as_str(), w.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("1", "not a string"),
+                ("true", "not a string"),
+                ("[\"X\"]", "not a string")
+            ]
+        );
+        let (pass, rejected) = split_of("[engines.comfyui]\npass_env = 'HF_TOKEN'\n");
+        assert!(pass.is_empty());
+        assert_eq!(
+            rejected,
+            [("HF_TOKEN".to_string(), "pass_env is not a list".to_string())]
+        );
+        // No table, or no pass_env, is nothing to report.
+        assert_eq!(split_of(""), (vec![], vec![]));
+        assert_eq!(split_of("[engines.comfyui]\n"), (vec![], vec![]));
     }
 }
