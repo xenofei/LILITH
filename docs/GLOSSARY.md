@@ -2,7 +2,7 @@
 
 The one home for the suite's settled terms. Each row gives a term one meaning and points to the rules that define the behaviour; it never restates the behaviour. Rule ids are the spec's (`docs/superpowers/specs/2026-10-12-lilith-design.md`).
 
-- **Avoid** lists names that must not be used for the term, usually because they mean something else here. When the spec uses a word in two senses, each sense has its own row and a qualified name.
+- **Avoid** lists names that new text must not use for the term, usually because they mean something else here. When the spec uses a word in two senses, each sense has its own row and a qualified name. Older spec text still uses some Avoid names (`run`, `store`, `profile`, `lease` alone); fix them when you edit that rule for another reason, not as a change of their own.
 - **Same change (QA-089):** a new term enters this file in the same change that introduces it, and a renamed term keeps its old name under Avoid.
 - Terms only, no decisions or implementation detail: decisions are `(decision)` rules in the spec, with context in `docs/decisions/`.
 
@@ -14,7 +14,7 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | App | A Qt/QML process that is a client of the core and is usable on its own (for example `lil-image`). | module (a core part), plugin | APP-001, ARCH-003 |
 | Studio | An app that is an asset generator: you describe an asset, get candidates and revise them (the Image studio first, the 2D module next). | Prompt Studio (a tab, not a studio), app (when the asset loop is meant) | APP-161, IMG-001 |
 | Image studio | The first studio, `lil-image`: canvas, ComfyUI graph and embedded ComfyUI web UI. | image app, image editor | IMG-001, IMG-002 |
-| Prompt Studio | A main-area tab of the Image studio, backed by the core module `prompt`, that turns a request into a brief and compiles it. | studio (it is not one), app | APP-149, AI-157 |
+| Prompt Studio | In M1, a main-area tab of the Image studio, backed by the core module `prompt`, that turns a request into a brief and compiles it; a standalone app is Later. | studio (it is not one) | APP-149, AI-157 |
 | Hub | The later `lil-hub` app that takes the shared panels over from the Image studio once a second app exists. Also the H in the suite's name, which is not a component. | Home panel, core | ARCH-011, ARCH-010 |
 | Shared panels | The suite-wide panels (Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend and others) that the Image studio hosts in M1. | studio panels | ARCH-010, APP-008 |
 | Module (core) | One part of `lil-core` with one job, such as `store`, `jobs` or `meter`. | app, service | CORE-014 |
@@ -26,16 +26,16 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 
 | Term | Meaning | Avoid | Defined in |
 |---|---|---|---|
-| Workspace | A folder holding projects, assets, registries and logs, versioned with git and LFS; one core serves one default workspace. | project (one level down), repo | ARCH-090, CORE-007 |
+| Workspace | A folder holding projects, assets, registries and logs, versioned with git and LFS; `suite.toml` lists the known ones, and in M1 the core serves one. | project (one level down), repo | Appendix E (workspace format I1), ARCH-090, ARCH-123 |
 | Project | A folder of assets inside a workspace, with its own `project.yaml` settings; the active project is per client session. | workspace | ARCH-088, CORE-057 |
-| Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records, with lossless JSON/YAML round-trip; its reference text is `docs/reference/workspace-format.md`. | manifest format (only one part) | CORE-178, CORE-148, Appendix E |
+| Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records. | manifest format (only one part) | CORE-178, CORE-148, Appendix E |
 | Asset | A tracked deliverable in a project, with a manifest, a status and sealed versions. | file, item (a library item is different) | CORE-023, CORE-048 |
 | Version (sealed version) | An immutable `v<semver>/` folder of an asset, made by sign-off. | revision, snapshot (a snapshot is an autosave) | CORE-026, ARCH-087 |
 | Candidate | One output of a candidate run, waiting for review. | draft, proposal (a proposal belongs to a document) | CORE-023, APP-057 |
 | Candidate run | One generation for an asset, writing its outputs to `candidates/<run_id>/` and going through QA and repair. | job (the work that makes it), run (alone) | CORE-023, CORE-025 |
 | Sign-off | Choosing a candidate and sealing it as a new version; ungated for you, gated for agents by failed technical QA. | approve, accept, publish | CORE-026, CORE-051, CORE-132 |
 | Seal | The step of sign-off that moves the chosen files into a read-only version folder with a frozen manifest snapshot. | lock, freeze, commit | CORE-026 |
-| Human edit | An outside change to a candidate or sealed file, recorded and offered as a new version. | manual edit, drift | ARCH-079 |
+| Human edit | An outside change to a candidate or sealed file, recorded and offered as a new version. | manual edit, drift | CORE-034, ARCH-079 |
 | Redirect | The record a renamed or moved asset leaves, so old references still resolve. | alias, symlink | ARCH-125, CORE-153 |
 | Recipe | What a candidate records about how it was made: profile, model hashes, seed, prompt and settings. | provenance (the dropped C2PA sense), workflow | IMG-140, CORE-018 |
 | QA gate | A technical, data-driven check per asset type; it blocks only automatic and agent sign-off. | licence gate, content filter (neither exists) | CORE-132, CORE-172 |
@@ -56,7 +56,7 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Effect class | A tool's `read`, `write`, `destructive` or `exec` class, which decides whether an agent's call needs your confirmation. | permission level, risk level | ARCH-051 |
 | Egress class | A tool's `none`, `own_provider`, `allowlisted_host` or `arbitrary` class: where its data may go. | effect class | AI-219 |
 | Confirmation | Your yes or no to an agent's `destructive` or `exec` call (or an egress or large-expansion call), answered only in an app or Claude Code's own prompt. | approval, permission prompt (Claude Code's own), sign-off | ARCH-052, ARCH-053, ARCH-055, CORE-109 |
-| Cap confirmation | A confirmation that lets a call go over a spending cap. | cap override | ARCH-053, ARCH-055, CORE-088 |
+| Cap confirmation | A confirmation that lets a call go over a spending cap. | cap override | ARCH-053, ARCH-055, APP-054 |
 | Retry token | The token a `pending_confirmation` result carries; a retry with it re-evaluates the stored confirmation, and it is the call's idempotency key. | confirmation id | CORE-017, CORE-016 |
 | Idempotency key | The key that makes the same call with the same arguments give the same job, result or confirmation. | request id | CORE-016 |
 
@@ -71,7 +71,7 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Priority class | The order across lanes: interactive operations, then your generations, then agent and director batches. | priority (alone) | CORE-124 |
 | GPU lease | What a `gpu-heavy` job holds while it runs: one heavy GPU job at a time. | lease (alone), lock | ARCH-071, CORE-121 |
 | Checkout lease | A later record (holder, purpose, expiry) that checks a file out to an editor or tool, persisted in the manifest's `leases` field. | lease (alone), lock, hold | ARCH-092, CORE-036, ARCH-020 |
-| Engine | An external program the core drives, such as ComfyUI, the Claude Code CLI or a local LLM server. | provider (a hosted API), backend | §1.4, ARCH-008 |
+| Engine | An external program the core drives (ComfyUI, the Claude Code CLI, a local LLM server); for the assistant, also Engines B and C, the core's own turn loop over a provider's API. | backend | §1.4, ARCH-008, AI-199 |
 | Owned engine | An engine the core started, and may health-check, restart and idle down. | managed engine | ARCH-064, ARCH-065, ARCH-126 |
 | Attached engine | An engine someone else started; the core uses and observes it but never stops it. | external engine | ARCH-064, ARCH-065 |
 | Engine A / B / C | The assistant's engines: A is the unmodified `claude` CLI on your own sign-in, B is Claude through the Anthropic API, C is any `openai_chat` route, hosted or local. | backend, model | AI-003, AI-047, AI-199 |
@@ -83,7 +83,7 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Provider | A hosted service the suite calls and meters, described by a provider profile. | engine, vendor | AI-007, CORE-101 |
 | Route | One way to reach a model: a provider profile plus a model id (direct, OpenRouter, NanoGPT, or local). | provider (one provider has many routes), path | AI-034 |
 | Included route | A route that costs nothing per call: Claude Code on a Pro/Max sign-in, or models a NanoGPT subscription covers. | free route | CORE-171 |
-| Capability tier | A route's tool level: `chat`, `safe_tools` and above, which decides which surfaces it can serve. | tier (alone; service tiers and CI tiers differ) | AI-208 |
+| Capability tier | A route's tool level, `chat`, `safe_tools` or `planner`, which decides which surfaces it can serve. | tier (alone; service tiers and CI tiers differ) | AI-208 |
 | Account | Your account with a provider: key, billing basis, balances and quotas. | profile | APP-122, §4.3 |
 | Usage record | One metered call or job's line in the usage logs: tokens, cost, caller, route and energy. | ledger entry, billing line | CORE-069, CORE-071 |
 | Spending cap | An optional suite-level limit on spend, per month, per provider or per call, that agents can't change. | budget, quota, limit (provider-side limits differ) | ARCH-056, CORE-085 |
@@ -112,6 +112,8 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Style preset / prompt preset | Library resources holding a reusable style (prompt, LoRAs and settings) or prompt. | preset (alone), template | APP-079 |
 | Layout preset | An app-level file holding a window and dock layout. | preset (alone), workspace | APP-002, APP-004 |
 | Permission preset | The Claude Code allow and deny rules an Engine A run gets (director or TETHER). | preset (alone), mode | AI-058, AI-059, AI-060 |
+| Destination preset | A ready-made backup or S3 destination entry (endpoint and defaults) offered by "Add destination". | preset (alone), template | OPS-058, OPS-086 |
+| Export preset | A Later Library resource kind holding export settings. | preset (alone) | APP-081 |
 
 ## Storage and backup
 
@@ -131,5 +133,5 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Milestone | A delivery stage: `[M0]` spikes, then `[M1]` (with `[M1a]` and `[M1b]`), `[M1.5]` and `[Later]`. | release, phase | §0.3, Appendix A |
 | M0 spike | A pass/fail experiment that must pass before the M1 work that depends on it. | prototype, POC | Appendix B |
 | Plan | A numbered implementation plan in `docs/superpowers/plans/`, written only when it is next. | sprint, milestone | roadmap |
-| Ruling | A decision made while a plan runs; one that public text cites is recorded with its reason in that plan's decisions section. | decision (a `(decision)` rule is binding spec text) | QA-090 |
-| Decision record | A short file in `docs/decisions/` giving a cross-cutting decision's context and rejected options; it links the binding rules. | decision log, ledger | §0.3 |
+| Ruling | A decision made while a plan runs. | decision (a `(decision)` rule is binding spec text) | QA-090 |
+| Decision record | A short file in `docs/decisions/` about one cross-cutting decision. | decision log, ledger | §0.3, `docs/decisions/README.md` |

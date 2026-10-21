@@ -6,12 +6,13 @@ LILITH is a personal creative suite: a Rust core service (`lil-core`) and Qt app
 
 Run `lil` through cargo from this checkout: a `lil` built in another checkout refuses this one.
 
-- **Tests: targeted only.** Run the tests that cover the files you touched, by crate and filter, for example `cargo nextest run -p lil-cli --retries 0 -E 'test(/spec_report/)'`. Never run the full workspace suite; CI runs it on every PR.
+- **Work on a branch, never `main`.** Reach GitHub only through `lil dev gh`; running `gh` directly is denied.
+- **Tests: targeted only.** Run the tests that cover the files you touched, by crate and filter, for example `cargo nextest run -p lil-cli --retries 0 -E 'test(/spec_report/)'`. Run the full workspace suite only when the owner asks; CI runs it on every PR.
 - `cargo run -q -p lil-cli -- dev spec-tests`: the protected spec tests and the expected-fail list.
 - `cargo run -q -p lil-cli -- dev spec-report`: rule counts, dangling rule citations and private ruling citations. It must report 0 of each.
 - `cargo run -q -p lil-cli -- dev privacy-scan --tree HEAD`: nothing personal in tracked files. Run it before every commit you push.
 - `cargo clippy -p <crate> --all-targets -- -D warnings` and `cargo fmt -p <crate>` for each crate you changed.
-- **Never run `lil dev approve` or `lil dev merge`.** You push and open PRs; the owner approves and merges.
+- **Never run `lil dev approve` or `lil dev merge`** (QA-036). You push and open PRs; the owner approves and merges.
 - Files listed in `dev/protected-paths.txt` need the owner's approval at the PR. Say in the PR which ones you changed.
 
 ## Rule ids
@@ -24,9 +25,9 @@ Run `lil` through cargo from this checkout: a `lil` built in another checkout re
 
 ## Terms and decisions
 
-- **Terms** live only in `docs/GLOSSARY.md`. Use the term its row names, never a name in its Avoid column. A new term enters the glossary in the same change that introduces it (QA-089).
+- **Terms** live only in `docs/GLOSSARY.md`. In new text, use the term its row names, never a name in its Avoid column. A new term enters the glossary in the same change that introduces it (QA-089).
 - **Decisions** are spec rules tagged `(decision)`; they are binding. `docs/decisions/` holds short records for the few cross-cutting ones, with the options that were rejected.
-- **Rulings** made while a plan runs are recorded with their reasons in that plan's "Decisions recorded" section. Text may cite a ruling id such as `P3-R9` only when that section records it (QA-090; `dev spec-report` checks).
+- **Rulings** made while a plan runs are recorded with their reasons in that plan (plans 2b and 3: "Execution rulings cited in public text"; plan 1: "Rulings cited in public text"). Text may cite a ruling id such as `P3-R9` only when that section records it (QA-090; `dev spec-report` checks).
 - **Stop and ask the owner** when a task conflicts with a `(decision)` rule, a decision record or a recorded ruling. Propose the change; never build around the decision.
 
 ## Nothing personal in the repo

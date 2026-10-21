@@ -6,7 +6,7 @@ governs: AI-003, AI-046, AI-047, AI-096, AI-104, AI-105, AI-199, ARCH-008, ARCH-
 # 0005 Claude Code on your own sign-in as the default assistant engine
 
 ## Context
-The assistant needs a strong tool-using model. You already use Claude Code on a Claude Pro/Max subscription, which covers its use at no extra cost per call. Anthropic's terms allow signing in to the unmodified Claude Code binary with your own subscription, and forbid third-party apps from using or relaying subscription credentials (checked 2026-10-12, AI-047).
+The assistant needs a strong tool-using model. A user who already has a Claude Pro/Max subscription can use Claude Code with it at no extra cost per call. Anthropic's terms allow signing in to the unmodified Claude Code binary with your own subscription, and forbid third-party apps from using or relaying subscription credentials (checked 2026-10-12, AI-047).
 
 ## Options considered
 - **Use the subscription sign-in directly from the suite.** Rejected: the terms forbid it, and the suite would hold your credentials.

@@ -1,22 +1,22 @@
 ---
 status: accepted
 date: 2026-10-20
-governs: QA-028, QA-029
+governs: roadmap "Backlog (frozen until its plan is next)"; QA-028, QA-029 as context
 ---
 # 0006 The spec is written only for the next two plans
 
 ## Context
-The spec was written in full before the first plan and has grown past a thousand rules. Research and owner direction keep changing what the later apps should be, and a rule written long before its plan has to be rewritten when the plan comes, while tests and plans cite rule ids that must stay stable.
+The spec was written in full before the first plan and has grown past a thousand rules. Research and owner direction keep changing what the later apps should be, while tests and plans cite rule ids that must stay stable (QA-028).
 
-## Options considered
-- **Keep specifying every later app now.** Rejected: those rules go stale before any code needs them, and each rewrite churns the spec.
-- **No spec beyond the plans.** Rejected: protected tests, reviews and the traceability report need one stable source of rule ids (QA-028).
+## Alternatives considered (agent summary)
+- **Keep specifying every later app now.** Those rules would go stale before any code needs them.
+- **No spec beyond the plans.** Protected tests, reviews and the traceability report need one stable source of rule ids (QA-028).
 - **Freeze the spec beyond the next two plans**, and keep later work as notes. Chosen.
 
 ## Decision
-The spec is frozen beyond the next two plans, 4a and 4b (owner decision 2026-10-20). Work for later plans is kept in the roadmap's backlog, and a note becomes spec rules only when its plan is next. The 2D module, the next studio, gets its rules then.
+The roadmap's "Backlog" section (owner decision 2026-10-20) is the binding text.
 
 ## Consequences
-- The roadmap backlog is where later ideas live, each with a verdict and a target plan.
+- Later ideas live in the roadmap backlog, each with a verdict and a target plan.
 - Writing a plan starts with a spec change for its rules, which lands first (QA-029).
-- Rules for frozen areas stay as they are; they are revised when their plan is next, not before.
+- Rules for frozen areas are revised when their plan is next, not before.

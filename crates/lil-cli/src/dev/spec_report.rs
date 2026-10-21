@@ -151,8 +151,9 @@ fn ledger_id_len(s: &str) -> Option<usize> {
     )
 }
 
-/// A plan-numbered ruling id at the start of `s`: `P<digits>-R<digits>`, each number with an
-/// optional lowercase suffix (`P3-R16b`). Returns the id's length.
+/// A plan-numbered ruling id at the start of `s`: `P<digits>-R<digits>`. The plan number may
+/// carry one lowercase letter (`P2b-R4`, plan 2b) and the ruling number any (`P3-R16b`, an
+/// amendment of P3-R16). Returns the id's length.
 fn plan_ruling_len(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     let count = |from: usize, f: fn(&u8) -> bool| b[from..].iter().take_while(|c| f(c)).count();
@@ -170,15 +171,17 @@ fn plan_ruling_len(s: &str) -> Option<usize> {
             return None;
         }
         at += digits;
-        let suffix = count(at, u8::is_ascii_lowercase);
-        at += if i == 0 { suffix.min(1) } else { suffix };
+        let letters = count(at, u8::is_ascii_lowercase);
+        // The plan number takes at most one letter; the ruling number takes them all.
+        at += if i == 0 { letters.min(1) } else { letters };
     }
     (!b.get(at).is_some_and(u8::is_ascii_alphanumeric)).then_some(at)
 }
 
 /// The ruling ids a line cites: every plan-numbered id (`P3-R9`), and the `Q`/`R` ids listed
 /// right after the word "ruling", "rulings" or "ledger" (`rulings Q31, Q34`, `ledger ruling
-/// R-T`, `rulings R15–R17`). A bare `R2` is not counted: it may be a product name.
+/// R-T`, `rulings R15–R17`) or after a plan name and a comma (`(plan 1, R18: ...)`). A bare
+/// `R2` is not counted: it may be a product name.
 pub fn ruling_citations(line: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let bytes = line.as_bytes();
@@ -192,7 +195,9 @@ pub fn ruling_citations(line: &str) -> BTreeSet<String> {
             out.insert(at[..len].to_string());
             continue;
         }
-        let Some(mut rest) = strip_keyword(at, &["rulings ", "ruling ", "ledger "]) else {
+        let Some(mut rest) =
+            strip_keyword(at, &["rulings ", "ruling ", "ledger "]).or_else(|| strip_plan_name(at))
+        else {
             continue;
         };
         rest = strip_keyword(rest, &["rulings ", "ruling "]).unwrap_or(rest);
@@ -209,6 +214,21 @@ pub fn ruling_citations(line: &str) -> BTreeSet<String> {
         }
     }
     out
+}
+
+/// `text` without a leading plan name and comma: `plan 1, ` or `plan 2b, `.
+fn strip_plan_name(text: &str) -> Option<&str> {
+    let rest = strip_keyword(text, &["plan "])?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let letter = usize::from(
+        rest.as_bytes()
+            .get(digits)
+            .is_some_and(u8::is_ascii_lowercase),
+    );
+    rest[digits + letter..].strip_prefix(", ")
 }
 
 /// `text` without the first of `keywords` it starts with, compared without regard to case.
@@ -526,10 +546,15 @@ mod tests {
             at(&["R15", "R17", "R30"])
         );
         assert_eq!(found("ledger Q34 carry"), at(&["Q34"]));
+        assert_eq!(
+            found("(plan 1, R18: they control how the hooks run) and (plan 2b, Q32)"),
+            at(&["Q32", "R18"])
+        );
         // Not citations: a bare R2 (Cloudflare R2), a plain number after "ruling", an id inside
         // a longer word, a rule id.
         assert!(found("R2 and B2 prices; review ruling 5; XP3-R9; QR12; QA-090").is_empty());
         assert!(found("the rulings' reasons, ruling Q3X").is_empty());
+        assert!(found("plan 1 R18, plan x, R2, the plan, R3").is_empty());
     }
 
     #[test] // spec: QA-090
@@ -564,6 +589,7 @@ mod tests {
             vec![("Q32".to_string(), "docs/plan.md:2".to_string())]
         );
     }
+
     #[test] // spec: QA-028
     fn classification_file_parses_and_validates() {
         let text = std::fs::read_to_string(

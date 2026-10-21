@@ -8,7 +8,7 @@ governs: ARCH-064, ARCH-065, ARCH-066, ARCH-068, ARCH-069, ARCH-071, ARCH-126
 ## Context
 Image generation needs a model runtime with a large, fast-moving ecosystem of nodes and models. ComfyUI is strong and maintained, and you may already run your own copy, started by a script or by an MCP server, with jobs of your own in its queue. Later engines (local LLM servers, Blender) raise the same question.
 
-## Options considered
+## Alternatives considered (agent summary)
 - **Build the inference stack in-house.** Rejected: it would chase an ecosystem that ComfyUI already tracks.
 - **Wrap ComfyUI, and run only the copy the suite starts.** Rejected: your own ComfyUI and its outside jobs would conflict with the suite over the GPU.
 - **Wrap it in two classes: owned (the core started it) and attached (someone else did).** Chosen.

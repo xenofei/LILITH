@@ -110,7 +110,7 @@ pub enum ErrorCategory {
     UserFixable,
     Transient,
     ExternalDown,
-    /// Denied by you or by a preset.
+    /// Denied by you or by a permission preset.
     Declined,
     DataConflict,
     Cancelled,

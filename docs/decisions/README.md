@@ -7,18 +7,8 @@ Short records of the few cross-cutting decisions that are hard to reverse and ha
 - **Rulings** made while a plan runs are recorded in that plan's decisions section, not here (QA-090).
 - **Numbering:** four digits, in order, never reused. A record is superseded by a new one rather than rewritten; a dated addition at its end is fine.
 - **Agents:** a task that conflicts with an accepted record or its rules stops and asks the owner (`AGENTS.md`).
-
-## Records
-
-| No. | Decision | Status |
-|---|---|---|
-| [0001](0001-licence-agpl.md) | The suite's code is AGPL-3.0-or-later | accepted 2026-10-20 |
-| [0002](0002-public-repo-private-records.md) | A public repository, with the working records kept private | accepted 2026-10-13 |
-| [0003](0003-hosted-first-routing.md) | Hosted models first for non-adult work | accepted 2026-10-20 |
-| [0004](0004-wrapped-engines.md) | Wrap engines such as ComfyUI, owned or attached | accepted 2026-10-12 |
-| [0005](0005-assistant-engines.md) | Claude Code on your own sign-in as the default assistant engine | accepted 2026-10-12 |
-| [0006](0006-spec-freeze.md) | The spec is written only for the next two plans | accepted 2026-10-20 |
-| [0007](0007-agent-built-workflow.md) | Plans are built by agents, task by task, under protected tests | accepted 2026-10-12 |
+- **Sources:** a section headed "(agent summary)" is an agent's reading of the sources, not the owner's words; the owner confirms or corrects it.
+- **Index:** list this folder; each file's number and title are the index. There is no hand-kept table.
 
 ## Template
 
@@ -34,7 +24,7 @@ governs: RULE-ID, RULE-ID
 What forced a choice, in a few sentences.
 
 ## Options considered
-- Option, with why it was rejected (or chosen).
+- Option, with why it was rejected (or chosen). Head the section "Alternatives considered (agent summary)" when the sources don't state the reasons.
 
 ## Decision
 One or two sentences. The rules above are the binding text.

@@ -8,7 +8,7 @@ governs: OPS-003, ARCH-109, QA-086, QA-087, QA-037, QA-069, QA-090
 ## Context
 The suite began in a private repository. Agents write most of its code, and their working records (plan ledgers, task briefs and reports, review diffs, research notes, owner Q&A) are full of machine paths, account details and personal context. A public repository gets GitHub-hosted CI minutes for free and server-side rulesets that hold the merge guard's checks, but every tracked file, path and commit in it is public for good.
 
-## Options considered
+## Alternatives considered (agent summary)
 - **Keep the repository private.** Rejected: CI would need a minute budget, and the guard would rest on local hooks without server-side rulesets.
 - **Publish everything, records included.** Rejected: the records hold personal context and are large, and they can't be cleaned after the fact.
 - **Publish the product, keep the records private.** Chosen.
