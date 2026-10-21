@@ -46,8 +46,10 @@ Run `lil` from the checkout it was built in (`cargo run` there): a `lil` built i
 
 Copyright (C) 2026 the LILITH contributors.
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
-This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+Releases published before the relicensing commit were published under GPL-3.0-or-later, and those copies stay under that licence; from that commit onward, the code is AGPL-3.0-or-later.
 
 The full licence text is in [LICENSE](LICENSE). Third-party material in this repository is listed in [NOTICE](NOTICE).
