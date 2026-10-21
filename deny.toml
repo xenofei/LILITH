@@ -16,7 +16,7 @@ reason = "basic-toml is unmaintained; transitive via age's i18n-embed; no mainta
 
 [licenses]
 # Third-party crates: permissive licences only, all compatible with distributing the
-# suite's binaries under GPL-3.0-or-later (the suite's own licence; see LICENSE).
+# suite's binaries under AGPL-3.0-or-later (the suite's own licence; see LICENSE).
 allow = [
     "MIT",
     "Apache-2.0",
@@ -32,7 +32,7 @@ confidence-threshold = 0.9
 unused-allowed-license = "allow"
 
 [licenses.private]
-# Workspace crates are the suite's own code: GPL-3.0-or-later (inherited from
+# Workspace crates are the suite's own code: AGPL-3.0-or-later (inherited from
 # [workspace.package]) and `publish = false`, so the allow list above doesn't apply to them.
 ignore = true
 

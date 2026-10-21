@@ -1,7 +1,7 @@
 LILITH (Latent Image & Likeness Instrumentality Toolchain Hub)
 Copyright (C) 2026 the LILITH contributors.
-Licensed under the GNU General Public License, version 3 or (at your option) any later
-version. See LICENSE.
+Licensed under the GNU Affero General Public License, version 3 or (at your option) any
+later version. See LICENSE.
 
 This file lists third-party material that is included in this repository. Rust
 dependencies are not vendored: Cargo downloads them, and each keeps its own licence
@@ -79,10 +79,10 @@ SAM 3.1 (SAM License), BiRefNet (MIT), the TAEF1 preview decoder (MIT) and the L
 08-comfy-measurements.md lists the sources. The images show no real person.
 
 ------------------------------------------------------------------------------------
-4. GNU General Public License text
+4. GNU Affero General Public License text
 ------------------------------------------------------------------------------------
 
-LICENSE is the unmodified text of the GNU General Public License, version 3,
+LICENSE is the unmodified text of the GNU Affero General Public License, version 3,
 Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>. Everyone is
 permitted to copy and distribute verbatim copies of that licence document, but changing
 it is not allowed.
