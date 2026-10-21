@@ -284,3 +284,9 @@ QA-024 = "lint"
 # Architecture decisions (Architecture A; one job per module): nothing to check.
 ARCH-001 = "n/a"
 CORE-001 = "n/a"
+
+# Terms and decisions (2026-10-20): the public-ruling check is a spec-report test; the glossary
+# rule and the workspace-format precedence rule are checked in review.
+QA-090 = "test"
+QA-089 = "manual"
+CORE-178 = "manual"
