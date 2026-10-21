@@ -91,6 +91,28 @@ pub fn write_temp(
     Ok(path)
 }
 
+/// Writes `bytes` to the new file `path`, whose parent folders are made: the data goes to
+/// `<parent>\<temp_name>` (flushed to disk, never an existing file) and is moved to `path`
+/// without replacing anything (errors 80 and 183 when a file is there). The temp file is
+/// removed again when the move fails.
+pub fn write_new_file(
+    path: &Path,
+    temp_name: &str,
+    bytes: &[u8],
+    fp: &FailPoints,
+) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the file has no folder"))?;
+    ensure_dir(dir)?;
+    let temp = write_temp(dir, temp_name, bytes, fp)?;
+    if let Err(e) = move_new(&temp, path) {
+        let _ = remove_file(&temp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// A new file written in pieces (an engine output streamed into a staging handle or a job
 /// cache, Appendix F "ComfyUI client"): [`create_streamed`] creates it (never an existing
 /// file), [`StreamedFile::write`] appends, [`StreamedFile::finish`] flushes it with

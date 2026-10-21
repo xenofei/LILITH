@@ -102,7 +102,12 @@ fn tools_are_lowered_with_markers_and_retry_token() {
             !required.contains(&json!("retry_token")),
             "{name}: retry_token is required"
         );
-        // P3-R10: the core's confirmation is the only prompt.
+        // P3-R10: the core's confirmation is the only prompt. The marker would sit at the top
+        // level of `_meta`, where Claude Code reads it, so no `_meta` may nest another.
+        assert!(
+            t["_meta"].get("_meta").is_none(),
+            "{name}: a nested _meta hides its markers: {t}"
+        );
         assert!(
             t["_meta"]
                 .get("anthropic/requiresUserInteraction")

@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -29,11 +29,11 @@ use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmen
 use windows::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW,
-    RegisterWaitForSingleObject, STARTUPINFOW, TerminateProcess, UnregisterWaitEx,
-    WT_EXECUTEONLYONCE, WaitForSingleObject,
+    GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, RegisterWaitForSingleObject, STARTUPINFOW, TerminateProcess,
+    UnregisterWaitEx, WT_EXECUTEONLYONCE, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -73,6 +73,16 @@ pub struct ProcessInfo {
 /// Reads [`ProcessInfo`]; a trait so tests can stand in for the system.
 pub trait ProcessInspector: Send + Sync + std::fmt::Debug {
     fn inspect(&self, pid: u32) -> io::Result<ProcessInfo>;
+
+    /// When `pid` was created, in 100 ns ticks since 1601 (a `FILETIME`). A parent started
+    /// before its child, so this tells a real parent from a process that took the parent's pid
+    /// after it exited. The default is `Unsupported`: unknown.
+    fn started(&self, pid: u32) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("the start time of process {pid} is not known"),
+        ))
+    }
 }
 
 /// The real inspector.
@@ -93,6 +103,28 @@ impl ProcessInspector for SystemInspector {
             user_sid,
             parent_pid,
         })
+    }
+
+    fn started(&self, pid: u32) -> io::Result<u64> {
+        let process = open_raw(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: the handle is open for the call, and the four out-pointers are valid locals.
+        unsafe {
+            GetProcessTimes(
+                HANDLE(process.as_raw_handle()),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .map_err(|e| io_error(&e))?;
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
     }
 }
 
@@ -804,6 +836,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.code, Some(0xDEAD), "{out:?}");
+    }
+
+    /// The parent check of ARCH-047 compares start times: this process started after its
+    /// parent (the test runner), and a pid that runs nothing has no start time.
+    #[test] // spec: ARCH-047
+    fn a_process_started_after_its_parent() {
+        let me = SystemInspector.inspect(std::process::id()).unwrap();
+        let mine = SystemInspector.started(me.pid).unwrap();
+        let parent = SystemInspector.started(me.parent_pid.unwrap()).unwrap();
+        assert!(parent < mine, "parent {parent}, child {mine}");
+        // Process ids are multiples of 4, so 3 is never one.
+        assert!(SystemInspector.started(3).is_err());
     }
 
     #[test] // spec: ARCH-005

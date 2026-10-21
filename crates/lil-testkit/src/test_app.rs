@@ -204,12 +204,27 @@ impl TestApp {
     /// If the app cannot start, its hello or the subscription is refused, or no answer comes
     /// within 30 s.
     pub fn start(env: &TestEnv, ws: Option<&Path>, topics: &[&str]) -> TestApp {
+        TestApp::start_with_capabilities(env, ws, topics, TEST_APP_CAPABILITIES)
+    }
+
+    /// [`TestApp::start`], offering `capabilities` in the hello instead of
+    /// [`TEST_APP_CAPABILITIES`] (an app of an older protocol, or one that lacks a capability).
+    ///
+    /// # Panics
+    /// As [`TestApp::start`].
+    pub fn start_with_capabilities(
+        env: &TestEnv,
+        ws: Option<&Path>,
+        topics: &[&str],
+        capabilities: &[&str],
+    ) -> TestApp {
         let workspace = ws.map_or_else(
             || lil_protocol::NO_WORKSPACE.to_string(),
             |ws| env.workspace_id(ws),
         );
         let mut cmd = Command::new(&ensure_built().test_app);
         cmd.args(["--workspace", &workspace])
+            .args(["--capabilities", &capabilities.join(",")])
             .current_dir(env.root());
         env.apply_child_env(&mut cmd);
         let mut io = LineChild::spawn(&mut cmd, "lil-test-app".to_string());

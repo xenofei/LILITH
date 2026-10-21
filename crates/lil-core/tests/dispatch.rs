@@ -670,3 +670,285 @@ async fn no_workspace_tool_gets_workspace_required() {
     assert_eq!(output.structured["path"], ws.path.display().to_string());
     assert_eq!(output.structured["read_only"], false);
 }
+
+// ---------------------------------------------------------------------------------------------
+// `job.retry` and confirmations (CORE-146, ARCH-052, ruling P3-R21).
+// ---------------------------------------------------------------------------------------------
+
+/// A `destructive` tool that submits a `test.job` job with its arguments
+/// (`{lane: "cpu", fail?}`).
+fn destructive_job_tool() -> Arc<dyn lil_core::tools::Tool> {
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct JobArgs {
+        lane: String,
+        #[serde(default)]
+        fail: Option<String>,
+    }
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Submitted {
+        job: lil_core::jobs::JobSummary,
+    }
+    lil_core::tools::typed_tool(
+        "x.destructive_job",
+        "A destructive tool that submits a test.job job.",
+        lil_protocol::EffectClass::Destructive,
+        "test",
+        |ctx, args: JobArgs| {
+            Box::pin(async move {
+                let spec = lil_core::jobs::JobSpec {
+                    kind: lil_core::tools::TEST_JOB_KIND,
+                    lane: lil_core::jobs::Lane::Cpu,
+                    priority: lil_core::jobs::Priority::for_caller(&ctx.session.caller, false),
+                    module: "test".into(),
+                    args: serde_json::to_value(&args).unwrap(),
+                    project: None,
+                    asset_id: None,
+                    doc_id: None,
+                    expected_secs: 10,
+                    expected_output_bytes: 0,
+                    vram_need_mib: None,
+                    engine: None,
+                    group: None,
+                    external_side_effects: false,
+                };
+                let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
+                Ok((Submitted { job }, "submitted".to_string()))
+            })
+        },
+    )
+}
+
+/// A dispatcher over `env` with the test tools, `x.destructive_job`, the `test.job` handler
+/// and the confirm stage of a [`lil_core::confirm::Confirm`] (no app connected yet).
+fn confirming(env: &TestEnv) -> (lil_core::tools::Dispatcher, Arc<lil_core::confirm::Confirm>) {
+    use lil_core::confirm::{
+        AgentConfirm, Confirm, McpConfirmation, NoNotificationPath, UiPresence,
+    };
+    use lil_core::tools::{PipelineHooks, TestGates, TestJobHandler, core_registry};
+    let states = Arc::new(
+        lil_core::state::StateRegistry::open(
+            &env.env,
+            Arc::new(|what: &str| panic!("unexpected fatal report: {what}")),
+        )
+        .expect("the suite state.db"),
+    );
+    let gates = Arc::new(TestGates::new());
+    let clock: Arc<dyn lil_platform::Clock> = FakeClock::new();
+    let events = Arc::new(lil_core::events::EventBus::new(clock.clone()));
+    let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
+    let probe: Arc<dyn lil_platform::fs::Probe> = Arc::new(lil_platform::fs::SystemProbe);
+    let hub = lil_core::workspace::WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        events.clone(),
+        clock.clone(),
+        ids.clone(),
+        lil_core::store::FailPoints::none(),
+        probe.clone(),
+        lil_core::watch::WatchConfig::default(),
+    );
+    let mut reg = core_registry(
+        true,
+        &gates,
+        &states,
+        &hub,
+        &env.env,
+        &probe,
+        Arc::default(),
+    );
+    reg.register(destructive_job_tool());
+    let confirm = Confirm::new(
+        states.clone(),
+        events.clone(),
+        clock.clone(),
+        ids.clone(),
+        UiPresence::new(),
+        Arc::new(NoNotificationPath),
+        Duration::from_secs(30 * 60),
+        McpConfirmation::Core,
+        lil_core::store::FailPoints::none(),
+    );
+    let hooks = PipelineHooks {
+        confirm: AgentConfirm::new(confirm.clone()),
+        ..PipelineHooks::plan2()
+    };
+    let lifecycle = lil_core::Lifecycle::new(clock.clone(), lil_core::lifecycle::IDLE_EXIT_AFTER);
+    let dispatcher =
+        lil_core::tools::Dispatcher::new(reg, hooks, states, events, hub, ids, clock, lifecycle);
+    dispatcher
+        .jobs()
+        .register(Arc::new(TestJobHandler::new(gates)));
+    (dispatcher, confirm)
+}
+
+fn ui_session() -> Arc<lil_core::session::Session> {
+    Arc::new(lil_core::session::Session {
+        id: "s_app".into(),
+        caller: lil_protocol::CallerKind::Ui("test".into()),
+        non_interactive: false,
+        workspace: None,
+        capabilities: lil_protocol::CAPABILITIES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+        client_pid: 1,
+        profile_id: None,
+    })
+}
+
+/// The structured result of an `ok` outcome.
+fn ok_of(outcome: &lil_protocol::Outcome<lil_protocol::ToolOutput>) -> Value {
+    match outcome {
+        lil_protocol::Outcome::Ok(out) => out.structured.clone(),
+        other => panic!("expected ok, got {other:?}"),
+    }
+}
+
+/// The pending confirmation of an outcome.
+fn pending_of(
+    outcome: &lil_protocol::Outcome<lil_protocol::ToolOutput>,
+) -> lil_protocol::PendingConfirmation {
+    match outcome {
+        lil_protocol::Outcome::PendingConfirmation(p) => p.clone(),
+        other => panic!("expected pending_confirmation, got {other:?}"),
+    }
+}
+
+async fn approve(confirm: &lil_core::confirm::Confirm, id: &str) {
+    confirm
+        .answer(
+            &ui_session(),
+            lil_protocol::app::ConfirmationAnswerParams {
+                confirmation_id: id.into(),
+                answer: lil_protocol::app::Answer::Approve,
+                cap: None,
+            },
+        )
+        .await
+        .expect("the app approves");
+}
+
+/// Waits (failure deadline 30 s) until job `id` ends: its summary.
+async fn job_done(d: &lil_core::tools::Dispatcher, id: &str) -> Value {
+    let out = d
+        .call(
+            direct_session(None),
+            call_params("job.wait", json!({"job_id": id, "timeout_s": 30}), None),
+        )
+        .await;
+    let waited = ok_of(&out);
+    assert_eq!(waited["done"], true, "{waited}");
+    waited["job"].clone()
+}
+
+async fn job_count(d: &lil_core::tools::Dispatcher) -> usize {
+    let out = d
+        .call(
+            direct_session(None),
+            call_params("jobs.list", json!({}), None),
+        )
+        .await;
+    ok_of(&out)["jobs"].as_array().unwrap().len()
+}
+
+#[tokio::test] // spec: CORE-146, ARCH-052, ARCH-055, QA-016
+async fn job_retry_of_a_confirm_tool_is_pending_and_runs_once() {
+    let env = TestEnv::new();
+    let (d, confirm) = confirming(&env);
+    let made = d
+        .call(
+            ui_session(),
+            call_params(
+                "x.destructive_job",
+                json!({"lane": "cpu", "fail": "final"}),
+                Some("make"),
+            ),
+        )
+        .await;
+    let id = ok_of(&made)["job"]["job_id"].as_str().unwrap().to_string();
+    assert_eq!(job_done(&d, &id).await["status"], "failed");
+    let jobs = job_count(&d).await;
+    let retry = |key: &str| call_params("job.retry", json!({"job_id": id}), Some(key));
+
+    // No app: the agent's retry can't be confirmed.
+    let out = d.call(direct_session(None), retry("no-app")).await;
+    assert_eq!(code_of(&out), "confirm.unavailable");
+
+    // With an app, the retry call itself waits; again with its token, the same.
+    confirm.presence().opened();
+    let p = pending_of(&d.call(direct_session(None), retry("r")).await);
+    assert_eq!(p.retry_token, "r");
+    assert_eq!(
+        pending_of(&d.call(direct_session(None), retry("r")).await),
+        p
+    );
+    let shown = confirm
+        .list(lil_core::confirm::ListState::Pending, 10)
+        .await
+        .unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tool, "x.destructive_job", "you see the job's tool");
+    assert_eq!(shown[0].arguments, json!({"lane": "cpu", "fail": "final"}));
+    assert_eq!(job_count(&d).await, jobs, "nothing ran yet");
+
+    // Approved: the same call submits exactly one new job, with `retry_of`.
+    approve(&confirm, &p.confirmation_id).await;
+    let out = d.call(direct_session(None), retry("r")).await;
+    let retried = ok_of(&out);
+    assert_eq!(retried["retry_of"], id.as_str(), "{retried}");
+    assert_eq!(retried["job"]["retry_of"], id.as_str(), "{retried}");
+    let replay = d.call(direct_session(None), retry("r")).await;
+    assert_eq!(replay, out, "the stored outcome");
+    assert_eq!(job_count(&d).await, jobs + 1, "exactly one new job");
+    let again = retried["job"]["job_id"].as_str().unwrap();
+    assert_eq!(job_done(&d, again).await["status"], "failed");
+}
+
+#[tokio::test] // spec: CORE-128, CORE-146, ARCH-052
+async fn job_retry_of_an_interrupted_job_with_side_effects_needs_a_confirmation() {
+    let env = TestEnv::new();
+    let (d, confirm) = confirming(&env);
+    let mut ids = Vec::new();
+    for (n, external) in [false, true].into_iter().enumerate() {
+        let made = d
+            .call(
+                ui_session(),
+                call_params(
+                    "test.job",
+                    json!({"lane": "cpu", "fail": "final", "external_side_effects": external}),
+                    Some(&format!("make-{n}")),
+                ),
+            )
+            .await;
+        let id = ok_of(&made)["job"]["job_id"].as_str().unwrap().to_string();
+        assert_eq!(job_done(&d, &id).await["status"], "failed");
+        ids.push(id);
+    }
+    // Both as an interrupted job is left (CORE-128): failed, substatus `interrupted`.
+    let db = Connection::open(env.env.suite_state_db()).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    for id in &ids {
+        db.execute(
+            "UPDATE jobs SET substatus = 'interrupted' WHERE job_id = ?1",
+            [id],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let retry = |id: &str, key: &str| call_params("job.retry", json!({"job_id": id}), Some(key));
+    // A local job's retry is an agent's write: it runs.
+    let plain = d.call(direct_session(None), retry(&ids[0], "plain")).await;
+    assert_eq!(ok_of(&plain)["retry_of"], ids[0].as_str());
+    // One that may have run elsewhere (P3-R21) waits for you, or can't be confirmed.
+    let out = d.call(direct_session(None), retry(&ids[1], "no-app")).await;
+    assert_eq!(code_of(&out), "confirm.unavailable");
+    confirm.presence().opened();
+    let p = pending_of(&d.call(direct_session(None), retry(&ids[1], "r")).await);
+    approve(&confirm, &p.confirmation_id).await;
+    let out = d.call(direct_session(None), retry(&ids[1], "r")).await;
+    assert_eq!(ok_of(&out)["retry_of"], ids[1].as_str());
+    // Yours never asks.
+    let yours = d.call(ui_session(), retry(&ids[1], "yours")).await;
+    assert_eq!(ok_of(&yours)["retry_of"], ids[1].as_str());
+}

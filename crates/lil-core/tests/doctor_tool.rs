@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 /// The checks, in the order the tool reports them (`legacy.sealed_refs` follows
 /// `legacy.names` only when a sealed snapshot holds a legacy ref).
-const CHECK_IDS: [&str; 13] = [
+const CHECK_IDS: [&str; 14] = [
     "git.repository",
     "git.core_longpaths",
     "git.lfs_setlockablereadonly",
@@ -36,6 +36,7 @@ const CHECK_IDS: [&str; 13] = [
     "workspace.needs_repair",
     "workspace.missing",
     "legacy.names",
+    "claude.rules",
 ];
 
 /// The five `.gitignore` entries (Global Constraints, CORE-040).
@@ -50,8 +51,9 @@ const GITIGNORE: [&str; 5] = [
 /// The fixture asset with a sealed `v1.0.0/`.
 const CRANE: &str = "projects/sketchbook/assets/chr_paper_crane";
 
-/// Says this test process is `lil-mcp.exe` in a trusted MCP folder, so a hello that declares
-/// `mcp` is granted it (ARCH-046); everything else is the real process.
+/// Says this test process is `lil-mcp.exe` in a trusted MCP folder and its parent (the test
+/// runner) is `claude.exe`, so a hello that declares `mcp` is granted it (ARCH-046,
+/// ARCH-047); everything else, start times included, is the real process.
 #[derive(Debug)]
 struct McpHere {
     dir: PathBuf,
@@ -60,10 +62,17 @@ struct McpHere {
 impl ProcessInspector for McpHere {
     fn inspect(&self, pid: u32) -> io::Result<ProcessInfo> {
         let mut info = SystemInspector.inspect(pid)?;
-        if pid == std::process::id() {
+        let me = SystemInspector.inspect(std::process::id())?;
+        if pid == me.pid {
             info.image = self.dir.join(MCP_EXE);
+        } else if Some(pid) == me.parent_pid {
+            info.image = self.dir.join("claude.exe");
         }
         Ok(info)
+    }
+
+    fn started(&self, pid: u32) -> io::Result<u64> {
+        SystemInspector.started(pid)
     }
 }
 
@@ -255,7 +264,9 @@ fn doctor_sets_git_config_and_gitignore_then_changes_nothing() {
     let hashes: Vec<String> = watched.iter().map(|p| sha256_file(p)).collect();
     let second = doctor(&mut pipe, true);
     for (id, state, detail) in &second {
-        assert_eq!(state, "ok", "{id}: {detail}");
+        // `fix` never adds the Claude Code rules: only the `claude_rules` offer does.
+        let want = if id == "claude.rules" { "info" } else { "ok" };
+        assert_eq!(state, want, "{id}: {detail}");
     }
     for (path, before) in watched.iter().zip(&hashes) {
         assert_eq!(&sha256_file(path), before, "{} changed", path.display());

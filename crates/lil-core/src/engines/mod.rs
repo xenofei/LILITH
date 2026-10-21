@@ -69,7 +69,7 @@ pub use comfyui::install::NodeInstallHandler;
 pub use comfyui::inventory::InventoryHandler;
 pub use comfyui::outside::OutsideWatch;
 pub use comfyui::supervisor::ComfyEndpoint;
-pub use config::{ComfyConfig, scrubbed_env};
+pub use config::{ComfyConfig, classify_pass_env, scrubbed_env};
 
 /// The module the engine tools declare.
 pub const ENGINES_MODULE: &str = "engines";

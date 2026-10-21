@@ -1,11 +1,11 @@
 //! What a caller hands the meter for one external call (CORE-069; Appendix F "Usage records"):
-//! a [`UsageDraft`] and its [`UsageCtx`]. Tasks 11 and 13 record through a [`UsageSink`];
-//! Task 15's `Meter` implements it and turns each draft into a usage line. Until then
-//! [`LogSink`] only logs the draft.
+//! a [`UsageDraft`] and its [`UsageCtx`], given to a [`UsageSink`]. The core's sink is
+//! [`crate::meter::Meter`], which turns each draft into a usage line.
 
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
+use lil_protocol::ErrorBody;
 use lil_schema::money::{Currency, Money};
 
 use crate::tools::stages::BillingBasis;
@@ -89,31 +89,79 @@ pub struct UsageCtx {
     pub reservation: Option<String>,
 }
 
-/// Takes usage drafts (Task 15's `Meter`).
-pub trait UsageSink: Send + Sync {
-    fn record<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, ()>;
+/// A write-ahead usage record that was begun ([`UsageSink::begin`]) and is not settled yet:
+/// its row's id (`us_<16 hex>`, `None` when the sink keeps no rows or the row could not be
+/// written), and the draft and context it was begun with.
+#[derive(Debug, Clone)]
+pub struct PendingUsage {
+    pub id: Option<String>,
+    pub draft: UsageDraft,
+    pub ctx: UsageCtx,
 }
 
-/// Logs each draft and keeps nothing: the stand-in until Task 15.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LogSink;
+/// Takes usage drafts (the core's is [`crate::meter::Meter`]).
+///
+/// An external call records its usage in one of two ways: [`UsageSink::record`] once it is
+/// over (a draft with its outcome), or, write-ahead (CORE-071), [`UsageSink::begin`] before
+/// the request is sent and [`UsageSink::settle`] with the outcome after it, so a core that
+/// dies in between leaves a `pending` record. [`UsageSink::abandon`] drops a begun record
+/// whose request was never sent. The defaults keep no rows: `settle` records the draft with
+/// its outcome, so a sink that only implements `record` sees one draft per call.
+///
+/// A `begin` that fails is the caller's error: the request must not be sent (CORE-071), so
+/// the call or job fails with it, and nothing is recorded after the fact.
+pub trait UsageSink: Send + Sync {
+    fn record<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, ()>;
 
-impl UsageSink for LogSink {
-    fn record<'a>(&'a self, u: UsageDraft, ctx: UsageCtx) -> BoxFuture<'a, ()> {
-        tracing::info!(
-            tool = %u.tool,
-            provider = %u.provider,
-            route = %u.route,
-            basis = u.basis.wire(),
-            units = %serde_json::Value::Object(u.units),
-            attribution = u.attribution.wire(),
-            status = u.status.wire(),
-            latency_ms = u.latency_ms,
-            job_id = ctx.job_id.as_deref().unwrap_or(""),
-            call_id = %ctx.call_id,
-            caller_kind = %ctx.caller_kind,
-            "usage (not yet recorded: the meter comes with plan 3 Task 15)"
-        );
+    /// # Errors
+    /// Why the write-ahead record could not be written (`state.unavailable`).
+    fn begin<'a>(
+        &'a self,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> BoxFuture<'a, Result<PendingUsage, ErrorBody>> {
+        Box::pin(std::future::ready(Ok(PendingUsage {
+            id: None,
+            draft: u,
+            ctx,
+        })))
+    }
+
+    fn settle<'a>(
+        &'a self,
+        p: PendingUsage,
+        status: UsageStatus,
+        latency_ms: Option<u64>,
+    ) -> BoxFuture<'a, ()> {
+        let mut draft = p.draft;
+        draft.status = status;
+        draft.latency_ms = latency_ms;
+        self.record(draft, p.ctx)
+    }
+
+    fn abandon<'a>(&'a self, p: PendingUsage) -> BoxFuture<'a, ()> {
+        let _ = p;
         Box::pin(std::future::ready(()))
+    }
+
+    /// The usage of a paid outside prompt `prompt_id`, whose write-ahead record is its
+    /// `outside_paid` row (ruling P3-R27): one line and no row of the sink's own, and no line
+    /// when the log already has this prompt's (a core that stopped between the line and the
+    /// row's mark). The caller marks its row recorded only on `Ok`. The default records the
+    /// draft.
+    ///
+    /// # Errors
+    /// Why the line could not be written: the row stays open for the next core.
+    fn record_outside<'a>(
+        &'a self,
+        prompt_id: &'a str,
+        u: UsageDraft,
+        ctx: UsageCtx,
+    ) -> BoxFuture<'a, Result<(), ErrorBody>> {
+        let _ = prompt_id;
+        Box::pin(async move {
+            self.record(u, ctx).await;
+            Ok(())
+        })
     }
 }

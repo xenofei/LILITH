@@ -949,3 +949,122 @@ fn crash_after_submitting_interrupts_the_job_and_never_reruns_it() {
         );
     }
 }
+
+/// `[engines.comfyui]` for an attached `fake`, with its folder as `root`.
+fn attach_fake(env: &TestEnv, fake: &lil_testkit::FakeComfy) {
+    env.suite_toml_set(&format!(
+        "[engines.comfyui]\nport = {}\nroot = '{}'\nautostart = false\n",
+        fake.port(),
+        fake.root().to_str().unwrap()
+    ));
+}
+
+/// Submits `name args` on a core that aborts at `point`, waits for it to end there, and
+/// returns a fresh core with a connection and the one job of `kind` it finds, once done.
+fn crash_at(
+    env: &TestEnv,
+    point: &str,
+    name: &str,
+    args: Value,
+    kind: &str,
+) -> (CoreFixture, Value) {
+    {
+        let spec = failpoints::spec(&[(point, "abort")]);
+        let mut core = CoreFixture::start_with_env(env, &[(failpoints::ENV, &spec)]);
+        let mut pipe = RawPipe::connect(env);
+        assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+        let request = json!({"jsonrpc": "2.0", "id": 9_000_003, "method": "tools/call",
+            "params": {"name": name, "arguments": args, "idempotency_key": key()}});
+        pipe.send_line(&request.to_string());
+        let _ = pipe.read_line(DEADLINE);
+        assert_eq!(core.wait_exit(DEADLINE), Some(ABORT_EXIT), "not at {point}");
+    }
+    let core = CoreFixture::start(env);
+    let mut pipe = RawPipe::connect(env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    let listed = pipe.tool_ok("jobs.list", json!({}), None);
+    let jobs: Vec<&Value> = listed["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["kind"] == kind)
+        .collect();
+    assert_eq!(jobs.len(), 1, "{listed}");
+    let id = jobs[0]["job_id"].as_str().unwrap();
+    let waited = pipe.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    assert_eq!(waited["done"], true, "{waited}");
+    (core, waited["job"].clone())
+}
+
+/// Ruling P3-R29: a job with external side effects that the core died running (`executing`,
+/// with no engine id to look for) is `interrupted_unknown`, never plain `interrupted`.
+#[test] // spec: QA-007, ARCH-022, QA-055
+fn an_external_job_that_died_executing_is_unknown() {
+    let env = TestEnv::new();
+    let (_core, job) = crash_at(
+        &env,
+        "jobs.after_outputs",
+        "test.job",
+        json!({"lane": "gpu-heavy", "engine": "comfyui", "external_side_effects": true}),
+        "test.job",
+    );
+    assert_eq!(
+        (job["status"].as_str(), job["substatus"].as_str()),
+        (Some("running"), Some("interrupted_unknown")),
+        "{job}"
+    );
+}
+
+/// A prompt with external side effects whose core died staging its outputs into the job's
+/// cache folder (no workspace) is taken up by the next core (P3-R21), which stages its own
+/// copy beside the dead run's (`2_<name>`) instead of failing on it. (Salvage into such a
+/// folder is `salvage.rs`'s unit test.)
+#[test] // spec: CORE-128, QA-009, QA-055
+fn a_taken_up_job_stages_beside_a_dead_runs_copy() {
+    let env = TestEnv::new();
+    let fake = lil_testkit::FakeComfy::start();
+    attach_fake(&env, &fake);
+    let spec = failpoints::spec(&[("jobs.after_outputs", "abort")]);
+    let id = {
+        let mut core = CoreFixture::start_with_env(&env, &[(failpoints::ENV, &spec)]);
+        let mut pipe = RawPipe::connect(&env);
+        assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+        let request = json!({"jsonrpc": "2.0", "id": 9_000_004, "method": "tools/call",
+            "params": {"name": "test.comfy_submit",
+                       "arguments": {"graph": "tiny", "external_side_effects": true},
+                       "idempotency_key": key()}});
+        pipe.send_line(&request.to_string());
+        let answer: Value = serde_json::from_str(&pipe.read_line(DEADLINE).unwrap()).unwrap();
+        assert_eq!(core.wait_exit(DEADLINE), Some(ABORT_EXIT));
+        answer["result"]["structured"]["job"]["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let cache = env.env.local_dir().join("cache").join("jobs").join(&id);
+    let left: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left.len(), 1, "the dead run's copy: {left:?}");
+    let _core = CoreFixture::start(&env);
+    let mut pipe = RawPipe::connect(&env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    let waited = pipe.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    let job = &waited["job"];
+    assert_eq!(waited["done"], true, "{waited}");
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let artifacts = job["result"]["artifacts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(artifacts.len(), 1, "{job}");
+    let name = artifacts[0]["path"]
+        .as_str()
+        .unwrap()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap();
+    assert_eq!(name, format!("2_{}", left[0]), "{job}");
+    assert!(cache.join(&left[0]).is_file(), "the dead run's copy stays");
+}

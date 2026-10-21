@@ -1,5 +1,5 @@
-# Nightly tier (QA-072), main only: a release build and test coverage (lcov, uploaded as an
-# artifact). Later plans add the full crash suite here.
+# Nightly tier (QA-072), main only: a release build, test coverage (lcov, uploaded as an
+# artifact) and the full crash suite (QA-055, the `crash_full_*` tests).
 #
 # Every nightly runs everything (ruling R25): the repo is public, so GitHub-hosted minutes are
 # free. A newer nightly cancels one still running (QA-070's cancel-in-progress).
@@ -58,6 +58,9 @@ jobs:
 
       - name: Coverage
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+
+      - name: Full crash suite
+        run: cargo nextest run --workspace --run-ignored only -E 'test(/^crash_full_/)'
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

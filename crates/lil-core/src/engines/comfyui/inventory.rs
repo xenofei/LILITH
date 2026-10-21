@@ -552,3 +552,34 @@ impl JobHandler for InventoryHandler {
         Box::pin(std::future::ready(()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(volume_serial: u64, file_id: Option<[u8; 16]>) -> FileIdentity {
+        FileIdentity {
+            volume_serial,
+            file_id,
+            size: 1,
+            last_write: 1,
+            change_time: None,
+            attributes: 0,
+        }
+    }
+
+    /// The cached-hash and folder identity is the volume serial plus the FileId (final-3a M1):
+    /// one FileId on two volumes is two files, so a hash is never reused across volumes, and
+    /// a file without a FileId has no identity.
+    #[test] // spec: CORE-130
+    fn identity_is_the_volume_serial_and_the_file_id() {
+        let f = Some([7u8; 16]);
+        assert_eq!(identity_key(&id(1, f)), identity_key(&id(1, f)));
+        assert_ne!(identity_key(&id(1, f)), identity_key(&id(2, f)));
+        assert_ne!(
+            identity_key(&id(1, f)),
+            identity_key(&id(1, Some([8u8; 16])))
+        );
+        assert_eq!(identity_key(&id(1, None)), None);
+    }
+}

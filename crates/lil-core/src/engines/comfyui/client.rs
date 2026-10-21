@@ -412,9 +412,15 @@ impl ComfyClient {
             .map_err(unreachable)?;
         let mut response = checked(response).await?;
         let io = |e: std::io::Error| ComfyError::Io(format!("{}: {e}", dest.display()));
-        let mut out = fsops::create_streamed(dest).map_err(io)?;
+        // The file calls run on blocking threads, never a runtime worker (QA1 M4); the bytes
+        // are written in batches of up to WRITE_BATCH. A file dropped unfinished is removed.
+        let path = dest.to_path_buf();
+        let mut out = off_runtime(move || fsops::create_streamed(&path))
+            .await
+            .map_err(io)?;
         let mut hash = Sha256::new();
         let mut size = 0u64;
+        let mut batch: Vec<u8> = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
             hash.update(&chunk);
             size += chunk.len() as u64;
@@ -423,9 +429,15 @@ impl ComfyClient {
                     "the output is larger than {MAX_OUTPUT_BYTES} bytes"
                 )));
             }
-            out.write(&chunk).map_err(io)?;
+            batch.extend_from_slice(&chunk);
+            if batch.len() >= WRITE_BATCH {
+                out = write_batch(out, std::mem::take(&mut batch))
+                    .await
+                    .map_err(io)?;
+            }
         }
-        out.finish().map_err(io)?;
+        out = write_batch(out, batch).await.map_err(io)?;
+        off_runtime(move || out.finish()).await.map_err(io)?;
         Ok((size, hex(&hash.finalize())))
     }
 
@@ -436,8 +448,10 @@ impl ComfyClient {
     /// [`ComfyError`]; [`ComfyError::Io`] when `src` can't be read; an answer that kept the
     /// file under another name is [`ComfyError::Protocol`].
     pub async fn upload_image(&self, name: &str, src: &Path) -> Result<(), ComfyError> {
-        let bytes =
-            std::fs::read(src).map_err(|e| ComfyError::Io(format!("{}: {e}", src.display())))?;
+        let path = src.to_path_buf();
+        let bytes = off_runtime(move || std::fs::read(&path))
+            .await
+            .map_err(|e| ComfyError::Io(format!("{}: {e}", src.display())))?;
         self.upload_bytes(name, &bytes).await
     }
 
@@ -638,6 +652,35 @@ pub fn cap_depth(text: &str, max: usize) -> String {
 }
 
 /// `s` percent-encoded as one URL path segment (everything but unreserved characters).
+/// How many bytes of a `/view` download [`ComfyClient::view_to`] writes per blocking call.
+const WRITE_BATCH: usize = 1024 * 1024;
+
+/// `f` on tokio's blocking threads (QA1 M4): file calls never stall a runtime worker. A
+/// blocking task that panicked is an error.
+pub(crate) async fn off_runtime<T, F>(f: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
+        Err(std::io::Error::other(format!(
+            "a file call did not run: {e}"
+        )))
+    })
+}
+
+/// Appends `bytes` to `out` on a blocking thread and hands it back; on an error `out` is
+/// dropped there, which removes the unfinished file.
+async fn write_batch(
+    mut out: fsops::StreamedFile,
+    bytes: Vec<u8>,
+) -> std::io::Result<fsops::StreamedFile> {
+    if bytes.is_empty() {
+        return Ok(out);
+    }
+    off_runtime(move || out.write(&bytes).map(|()| out)).await
+}
+
 fn path_segment(s: &str) -> String {
     use std::fmt::Write as _;
     s.bytes()

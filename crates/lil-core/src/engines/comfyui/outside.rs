@@ -20,11 +20,14 @@
 //!   first seen, so a restart or a crash neither repeats nor loses it: the core that sees its
 //!   end records it, with the status and latency `/api/jobs` reports (`completed` →
 //!   `succeeded`, `failed`, `cancelled`; latency from its execution times), and one that
-//!   ComfyUI no longer knows is recorded `pending` (its outcome was not seen). The engines
-//!   stopping records nothing: the row stays open for the next core. `/api/jobs` also shows
-//!   prompts that came and went between two polls: each finished one never seen before is
-//!   looked up once (`/api/jobs/{id}`, for its graph); the first poll's finished prompts are
-//!   taken as already known (apart from the open rows of the table).
+//!   ComfyUI no longer knows is recorded `pending` (its outcome was not seen). The open row
+//!   is the usage's write-ahead record (`UsageSink::record_outside`): the meter keeps no
+//!   `usage_pending` row for it, and writes no second line for a prompt whose line is
+//!   already in the log, so a stop between the line and the row's mark repeats nothing. The
+//!   engines stopping records nothing: the row stays open for the next core. `/api/jobs` also
+//!   shows prompts that came and went between two polls: each finished one never seen before
+//!   is looked up once (`/api/jobs/{id}`, for its graph); the first poll's finished prompts
+//!   are taken as already known (apart from the open rows of the table).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

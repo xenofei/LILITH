@@ -5,7 +5,9 @@
 //! it up:
 //! - `ui:<app>`: the image is that app's executable ([`APP_EXES`]) in a trusted app folder;
 //!   on a test channel also `ui:test` from [`TEST_APP_EXE`] (QA-066), never elsewhere;
-//! - `mcp`: the image is [`MCP_EXE`] in a trusted MCP folder;
+//! - `mcp`: the image is [`MCP_EXE`] in a trusted MCP folder and its direct parent process is
+//!   `claude.exe`, with no shell in between ([`claude_is_direct_parent`]; ARCH-047 as Appendix
+//!   F clarifies it);
 //! - `assistant`: the client presented an engine token that validates. A token that does not
 //!   validate is refused, never downgraded (ARCH-048, ARCH-050).
 //!
@@ -31,7 +33,7 @@ pub const TEST_APP_EXE: (&str, &str) = ("lil-test-app.exe", "test");
 /// The MCP server's executable. An `mcp` claim needs it.
 pub const MCP_EXE: &str = "lil-mcp.exe";
 
-/// The Claude Code executable, expected as the MCP server's parent or grandparent.
+/// The Claude Code executable, required as the MCP server's direct parent.
 const CLAUDE_EXE: &str = "claude.exe";
 
 /// The folders whose executables are trusted (ARCH-046, ARCH-047).
@@ -109,6 +111,7 @@ impl EngineTokens for NoEngineTokens {
 }
 
 /// The caller kind the core grants, and the engine session behind an `assistant` caller.
+/// `inspector` reads the client's parent for an `mcp` claim.
 ///
 /// # Errors
 /// - `params.invalid`: an engine token with a declared kind other than `assistant`;
@@ -117,6 +120,7 @@ pub fn resolve_caller(
     declared: &CallerKind,
     engine_token: Option<&str>,
     client: &ProcessInfo,
+    inspector: &dyn ProcessInspector,
     trusted: &TrustedDirs,
     tokens: &dyn EngineTokens,
     trace_id: &str,
@@ -150,7 +154,9 @@ pub fn resolve_caller(
                 .chain(test_app)
                 .any(|(exe, a)| a == app && runs(client, exe, &trusted.app_dirs))
         }
-        CallerKind::Mcp => runs(client, MCP_EXE, &trusted.mcp_dirs),
+        CallerKind::Mcp => {
+            runs(client, MCP_EXE, &trusted.mcp_dirs) && claude_is_direct_parent(inspector, client)
+        }
         CallerKind::Assistant | CallerKind::Cli => false,
     };
     let kind = if verified {
@@ -172,27 +178,30 @@ fn runs(client: &ProcessInfo, exe: &str, dirs: &[PathBuf]) -> bool {
         && dirs.iter().any(|d| folder_key(d) == dir)
 }
 
-/// Best effort (ARCH-047): whether the MCP server `client` runs under Claude Code, that is,
-/// its parent or grandparent is `claude.exe`. `false` when that cannot be told.
-pub fn claude_ancestor(inspector: &dyn ProcessInspector, client: &ProcessInfo) -> bool {
-    let mut next = client.parent_pid;
-    for _ in 0..2 {
-        let Some(pid) = next else {
-            return false;
-        };
-        let Ok(parent) = inspector.inspect(pid) else {
-            return false;
-        };
-        let is_claude = parent
+/// Whether the MCP server `client` was started by Claude Code itself (ARCH-047, Appendix F):
+/// its direct parent's image is `claude.exe`, and that parent started before `client`, so a
+/// process that took the pid of an exited parent does not count (review M1). A grandparent
+/// never counts, so a shell between them makes this `false`, as does a parent that is gone or
+/// cannot be inspected, or a start time that cannot be read.
+///
+/// The parent is recognised by its file name only: a program renamed `claude.exe` passes.
+/// That is the documented limit (Appendix F), and the reason `mcp_confirmation` stays
+/// `"core"` until there is a stronger parent check.
+pub fn claude_is_direct_parent(inspector: &dyn ProcessInspector, client: &ProcessInfo) -> bool {
+    let Some(pid) = client.parent_pid else {
+        return false;
+    };
+    let named_claude = inspector.inspect(pid).is_ok_and(|parent| {
+        parent
             .image
             .file_name()
-            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(CLAUDE_EXE));
-        if is_claude {
-            return true;
-        }
-        next = parent.parent_pid;
-    }
-    false
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(CLAUDE_EXE))
+    });
+    let started_first = match (inspector.started(pid), inspector.started(client.pid)) {
+        (Ok(parent), Ok(child)) => parent < child,
+        _ => false,
+    };
+    named_claude && started_first
 }
 
 #[cfg(test)]
@@ -224,6 +233,66 @@ mod tests {
         }
     }
 
+    /// A process table for the parent check, with each process's start time.
+    #[derive(Debug)]
+    struct Table(HashMap<u32, ProcessInfo>, HashMap<u32, u64>);
+
+    impl ProcessInspector for Table {
+        fn inspect(&self, pid: u32) -> io::Result<ProcessInfo> {
+            self.0
+                .get(&pid)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "gone"))
+        }
+
+        fn started(&self, pid: u32) -> io::Result<u64> {
+            self.1
+                .get(&pid)
+                .copied()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no start time"))
+        }
+    }
+
+    /// `claude.exe` in the process table.
+    const CLAUDE_PID: u32 = 10;
+
+    /// Claude Code (10) and, under it, the shells an agent's shell tool could run: `cmd.exe`
+    /// (11), `bash.exe` (12) and `pwsh.exe` (13), each started before the client (4242).
+    fn table() -> Table {
+        let row = |pid, image: &str, parent| ProcessInfo {
+            pid,
+            ..process(image, parent)
+        };
+        Table(
+            HashMap::from([
+                (CLAUDE_PID, row(CLAUDE_PID, r"C:\tools\Claude.exe", None)),
+                (
+                    11,
+                    row(11, r"C:\Windows\System32\cmd.exe", Some(CLAUDE_PID)),
+                ),
+                (
+                    12,
+                    row(12, r"C:\Program Files\Git\bin\bash.exe", Some(CLAUDE_PID)),
+                ),
+                (
+                    13,
+                    row(
+                        13,
+                        r"C:\Program Files\PowerShell\7\pwsh.exe",
+                        Some(CLAUDE_PID),
+                    ),
+                ),
+            ]),
+            HashMap::from([
+                (CLAUDE_PID, 100),
+                (11, 200),
+                (12, 200),
+                (13, 200),
+                (4242, 1000),
+            ]),
+        )
+    }
+
     fn resolve(
         declared: &str,
         token: Option<&str>,
@@ -233,14 +302,18 @@ mod tests {
             &declared.parse().unwrap(),
             token,
             client,
+            &table(),
             &trusted(),
             &NoEngineTokens,
             "t_1",
         )
     }
 
+    /// The kind `image` gets for `declared`, started by Claude Code.
     fn kind(declared: &str, image: &str) -> CallerKind {
-        resolve(declared, None, &process(image, None)).unwrap().0
+        resolve(declared, None, &process(image, Some(CLAUDE_PID)))
+            .unwrap()
+            .0
     }
 
     #[test] // spec: ARCH-045, ARCH-046
@@ -275,13 +348,18 @@ mod tests {
         assert_eq!(kind("ui:image", ""), CallerKind::Cli);
     }
 
-    #[test] // spec: ARCH-047
-    fn mcp_from_trusted_dir_is_mcp_without_claude_parent() {
-        // No parent at all: still `mcp` (the Claude Code check is best effort).
+    #[test] // spec: ARCH-047, ARCH-052
+    fn mcp_without_claude_as_direct_parent_is_cli() {
         let image = format!(r"{TRUSTED}\lil-mcp.exe");
-        assert_eq!(kind("mcp", &image), CallerKind::Mcp);
-        let client = process(&image, Some(7));
-        assert_eq!(resolve("mcp", None, &client).unwrap().0, CallerKind::Mcp);
+        let under = |parent| resolve("mcp", None, &process(&image, parent)).unwrap().0;
+        assert_eq!(under(Some(CLAUDE_PID)), CallerKind::Mcp);
+        // A shell between Claude Code and the server: cmd.exe, bash.exe, pwsh.exe.
+        for shell in [11, 12, 13] {
+            assert_eq!(under(Some(shell)), CallerKind::Cli, "shell {shell}");
+        }
+        // No parent, or one that is gone.
+        assert_eq!(under(None), CallerKind::Cli);
+        assert_eq!(under(Some(99)), CallerKind::Cli);
     }
 
     #[test] // spec: ARCH-047
@@ -323,6 +401,7 @@ mod tests {
             &CallerKind::Assistant,
             Some("good"),
             &client,
+            &table(),
             &trusted(),
             &OneToken,
             "t",
@@ -335,6 +414,7 @@ mod tests {
             &CallerKind::Assistant,
             Some("good"),
             &other_pid,
+            &table(),
             &trusted(),
             &OneToken,
             "t",
@@ -376,9 +456,17 @@ mod tests {
         };
         let client = process(&format!(r"{TRUSTED}\lil-image.exe"), None);
         let ui: CallerKind = "ui:image".parse().unwrap();
-        let resolved = resolve_caller(&ui, None, &client, &dirs, &NoEngineTokens, "t");
+        let resolved = resolve_caller(&ui, None, &client, &table(), &dirs, &NoEngineTokens, "t");
         assert_eq!(resolved.unwrap().0, CallerKind::Ui("image".into()));
-        let mcp = resolve_caller(&CallerKind::Mcp, None, &client, &dirs, &NoEngineTokens, "t");
+        let mcp = resolve_caller(
+            &CallerKind::Mcp,
+            None,
+            &client,
+            &table(),
+            &dirs,
+            &NoEngineTokens,
+            "t",
+        );
         assert_eq!(mcp.unwrap().0, CallerKind::Cli);
     }
 
@@ -421,7 +509,7 @@ mod tests {
             ..trusted()
         };
         let kind = |dirs: &TrustedDirs, declared: &CallerKind, client: &ProcessInfo| {
-            resolve_caller(declared, None, client, dirs, &NoEngineTokens, "t")
+            resolve_caller(declared, None, client, &table(), dirs, &NoEngineTokens, "t")
                 .unwrap()
                 .0
         };
@@ -443,35 +531,45 @@ mod tests {
         assert!(!TrustedDirs::installed(&own, &own).test_app);
     }
 
-    /// A process table for [`claude_ancestor`].
-    #[derive(Debug)]
-    struct Table(HashMap<u32, ProcessInfo>);
-
-    impl ProcessInspector for Table {
-        fn inspect(&self, pid: u32) -> io::Result<ProcessInfo> {
-            self.0
-                .get(&pid)
-                .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "gone"))
+    #[test] // spec: ARCH-047
+    fn only_a_direct_claude_parent_counts() {
+        let table = table();
+        let mcp = |parent| process(r"C:\x\lil-mcp.exe", parent);
+        assert!(claude_is_direct_parent(&table, &mcp(Some(CLAUDE_PID))));
+        // Claude Code as the grandparent, through any shell, does not count.
+        for shell in [11, 12, 13] {
+            assert!(
+                !claude_is_direct_parent(&table, &mcp(Some(shell))),
+                "{shell}"
+            );
         }
+        assert!(!claude_is_direct_parent(&table, &mcp(Some(99))));
+        assert!(!claude_is_direct_parent(&table, &mcp(None)));
     }
 
+    /// Review M1: a `claude.exe` whose pid the real parent left behind is not the parent. The
+    /// parent must have started before the client, and both start times must be known.
     #[test] // spec: ARCH-047
-    fn claude_parent_or_grandparent_is_found() {
-        let row = |pid, image: &str, parent| ProcessInfo {
-            pid,
-            ..process(image, parent)
-        };
-        let table = Table(HashMap::from([
-            (10, row(10, r"C:\tools\Claude.exe", None)),
-            (11, row(11, r"C:\Windows\cmd.exe", Some(10))),
-            (12, row(12, r"C:\Windows\cmd.exe", Some(11))),
-        ]));
-        let mcp = |parent| process(r"C:\x\lil-mcp.exe", parent);
-        assert!(claude_ancestor(&table, &mcp(Some(10))));
-        assert!(claude_ancestor(&table, &mcp(Some(11))));
-        assert!(!claude_ancestor(&table, &mcp(Some(12))));
-        assert!(!claude_ancestor(&table, &mcp(Some(99))));
-        assert!(!claude_ancestor(&table, &mcp(None)));
+    fn a_reused_parent_pid_does_not_count() {
+        let mcp = process(r"C:\x\lil-mcp.exe", Some(CLAUDE_PID));
+        let mut later = table();
+        later.1.insert(CLAUDE_PID, 5000);
+        assert!(
+            !claude_is_direct_parent(&later, &mcp),
+            "started after its child"
+        );
+        let mut unknown = table();
+        unknown.1.remove(&CLAUDE_PID);
+        assert!(
+            !claude_is_direct_parent(&unknown, &mcp),
+            "parent start unknown"
+        );
+        let mut client_unknown = table();
+        client_unknown.1.remove(&4242);
+        assert!(
+            !claude_is_direct_parent(&client_unknown, &mcp),
+            "client start unknown"
+        );
+        assert!(claude_is_direct_parent(&table(), &mcp));
     }
 }

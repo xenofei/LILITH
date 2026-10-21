@@ -29,11 +29,19 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
-/// The protocol this build speaks.
-pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+/// The protocol this build speaks: 1.1 (plan 3, Appendix D). 1.0 clients keep working.
+pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
-/// The capabilities this build offers. A minor version adds features only as new strings.
-pub const CAPABILITIES: &[&str] = &["events.v1", "tools.v1"];
+/// The capabilities this build offers. A minor version adds features only as new strings:
+/// 1.0 had `events.v1` and `tools.v1`; 1.1 adds `jobs.v1`, `confirmations.v1` and `caps.v1`
+/// (the `app/*` methods need `confirmations.v1` or `caps.v1` in the shared capabilities).
+pub const CAPABILITIES: &[&str] = &[
+    "events.v1",
+    "tools.v1",
+    "jobs.v1",
+    "confirmations.v1",
+    "caps.v1",
+];
 
 /// `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">`; the suffix is fixed at compile time by
 /// this crate's build script.
@@ -145,6 +153,13 @@ pub fn schema_hash() -> String {
             schemars::schema_for!(UnsubscribeParams),
             schemars::schema_for!(UnsubscribeResult),
             schemars::schema_for!(EventParams),
+            // Protocol 1.1.
+            schemars::schema_for!(crate::app::ConfirmationsListParams),
+            schemars::schema_for!(crate::app::ConfirmationsListResult),
+            schemars::schema_for!(crate::app::ConfirmationAnswerParams),
+            schemars::schema_for!(crate::app::ConfirmationAnswerResult),
+            schemars::schema_for!(crate::app::CapsSetParams),
+            schemars::schema_for!(crate::app::CapsView),
         ];
         let all = serde_json::Value::Array(
             schemas
@@ -392,7 +407,7 @@ mod tests {
 
     #[test] // spec: ARCH-029, QA-005
     fn incompatible_refusal_has_the_frozen_shape() {
-        let body = incompatible_refusal(PROTOCOL, "t1");
+        let body = incompatible_refusal(v(1, 0), "t1");
         assert_eq!(body.code, "protocol.incompatible");
         assert_eq!(body.data, Some(json!({"core_protocol": "1.0"})));
         assert_eq!(body.trace_id, "t1");
@@ -402,6 +417,10 @@ mod tests {
         assert_eq!(wire["status"], "error");
         assert_eq!(wire["error"]["code"], "protocol.incompatible");
         assert_eq!(wire["error"]["data"], json!({"core_protocol": "1.0"}));
+        assert_eq!(
+            incompatible_refusal(PROTOCOL, "t").data,
+            Some(json!({"core_protocol": PROTOCOL.to_string()}))
+        );
         assert_eq!(
             incompatible_refusal(v(3, 7), "t").data,
             Some(json!({"core_protocol": "3.7"}))
@@ -441,10 +460,46 @@ mod tests {
         assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
     }
 
+    /// Protocol 1.1 (Appendix D): five capabilities, shared in the core's order.
+    #[test] // spec: ARCH-029, APP-043
+    fn protocol_is_1_1_with_five_capabilities() {
+        assert_eq!(PROTOCOL.to_string(), "1.1");
+        let all = [
+            "events.v1",
+            "tools.v1",
+            "jobs.v1",
+            "confirmations.v1",
+            "caps.v1",
+        ];
+        assert_eq!(CAPABILITIES, &all);
+        // A client offering all five, in another order and with an unknown one, gets all five
+        // in the core's order.
+        let client: Vec<String> = [
+            "caps.v1",
+            "future.v9",
+            "confirmations.v1",
+            "tools.v1",
+            "jobs.v1",
+            "events.v1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(shared_capabilities(&client, CAPABILITIES), all);
+        // A 1.0 client keeps working: it shares what it offers.
+        let old: Vec<String> = vec!["events.v1".into(), "tools.v1".into()];
+        assert_eq!(
+            shared_capabilities(&old, CAPABILITIES),
+            ["events.v1", "tools.v1"]
+        );
+    }
+
     #[test] // spec: ARCH-029
     fn version_negotiation() {
-        assert_eq!(PROTOCOL, v(1, 0));
-        assert_eq!(PROTOCOL.to_string(), "1.0");
+        assert_eq!(
+            negotiate(v(1, 0), PROTOCOL),
+            Negotiation::Compatible { minor: 0 }
+        );
         assert_eq!(
             negotiate(v(1, 0), v(1, 3)),
             Negotiation::Compatible { minor: 0 }
@@ -479,7 +534,6 @@ mod tests {
             shared_capabilities(&client, CAPABILITIES),
             vec!["events.v1".to_string(), "tools.v1".to_string()]
         );
-        assert_eq!(CAPABILITIES, &["events.v1", "tools.v1"]);
         assert!(shared_capabilities(&[], CAPABILITIES).is_empty());
         assert_eq!(
             shared_capabilities(&["tools.v1".to_string()], CAPABILITIES),
@@ -527,7 +581,9 @@ mod tests {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
         assert_eq!(h, schema_hash());
-        assert_eq!(h, "32310da4736fd670");
+        // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation)
+        // and `app/caps.set`'s params and `CapsView`.
+        assert_eq!(h, "99caa63ddb3964d5");
     }
 
     #[test] // spec: ARCH-029

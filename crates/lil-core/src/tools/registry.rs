@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lil_protocol::{
     CallerKind, EffectClass, ErrorBody, MAX_DESCRIPTION_CHARS, ToolDescriptor, ToolOutput, codes,
@@ -238,6 +238,8 @@ where
 #[derive(Default)]
 pub struct Registry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Every tool's descriptor, set once by [`Registry::seal`].
+    all_tools: Arc<OnceLock<Vec<ToolDescriptor>>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -286,6 +288,19 @@ impl Registry {
             "tool {name} is registered twice"
         );
         self.tools.insert(name, t);
+    }
+
+    /// A handle to every tool's descriptor, filled by [`Registry::seal`] once every tool is
+    /// registered: for a tool that describes the others (`workspace.doctor`'s Claude Code
+    /// rules, AI-114).
+    pub fn all_tools(&self) -> Arc<OnceLock<Vec<ToolDescriptor>>> {
+        self.all_tools.clone()
+    }
+
+    /// Fills [`Registry::all_tools`] with [`Registry::descriptors`]; the dispatcher calls it
+    /// when it takes the registry. Only the first call counts.
+    pub fn seal(&self) {
+        let _ = self.all_tools.set(self.descriptors());
     }
 
     /// The tool called `name`, whoever may see it.

@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use lil_core::state::{PRUNE_DONE_SQL, StateDb, StateScope};
 use lil_core::store::{
-    Expect, FailPoints, Phase, Step, Store, StoreError, WsPath, armed, lfs_pointer_oid, next_step,
+    Expect, FailPoints, Phase, Step, Store, StoreError, WsPath, armed, fsops, lfs_pointer_oid,
+    next_step,
 };
 use lil_platform::fs::{
     FileIdentity, PLACEHOLDER_ATTRIBUTES, Probe, RetryClass, Share, SystemProbe, VolumeInfo,
@@ -2229,4 +2230,127 @@ async fn a_linked_folder_above_the_target_is_refused_for_every_write() {
     );
     assert!(!outside.join("new.txt").exists());
     assert!(!outside.join("assets").exists());
+}
+
+/// A manifest `locks` entry recorded with an 8.3 short alias still locks the file a write names
+/// by its long name (a file entry, or a folder entry above a new file), and an entry recorded
+/// by the long name locks the file written by its alias: both sides are compared by their long
+/// forms. An unlocked sibling is written as before.
+#[tokio::test(start_paused = true)] // spec: CORE-035
+async fn writes_resolve_short_alias_lock_entries() {
+    use serde_json::json;
+    const ASSET: &str = "projects/sketchbook/assets/crane";
+    let ws = workspace();
+    let store = ws.plain();
+    let manifest = |locks: serde_json::Value| {
+        let mut m = Manifest::new(
+            "sketchbook",
+            "crane",
+            "image",
+            "00000000-0000-4000-8000-0000000000aa",
+        );
+        m.set("locks", locks);
+        write_file(
+            &ws.file(&format!("{ASSET}/crane.manifest.json")),
+            m.to_text().as_bytes(),
+        );
+    };
+    let file = format!("{ASSET}/prompts/crane_prompt.txt");
+    write_file(&ws.file(&file), b"a crane");
+    let folder = format!("{ASSET}/promptsfolder");
+    write_file(&ws.file(&format!("{folder}/old.txt")), b"old");
+    let short_file = lil_platform::fs::short_name(&ws.file(&file)).unwrap();
+    let short_folder = lil_platform::fs::short_name(&ws.file(&folder)).unwrap();
+    if short_file == ws.file(&file) || short_folder == ws.file(&folder) {
+        println!("8.3 names are off on this volume: the short-alias cases are skipped");
+        return;
+    }
+    let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+    let over = || Expect::Hash(sha256_bytes(b"a crane"));
+
+    // A file entry by its alias, written by the long name.
+    manifest(json!([format!("prompts/{}", name(&short_file))]));
+    let written = store.write(&p(&file), b"over".to_vec(), over()).await;
+    assert!(
+        matches!(&written, Err(StoreError::Locked(_))),
+        "{written:?}"
+    );
+    assert_eq!(ws.read(&file), b"a crane");
+
+    // A folder entry by its alias, and a new file beneath it by the long name.
+    manifest(json!([format!("{}/", name(&short_folder))]));
+    let new = format!("{folder}/new.txt");
+    let written = store.write(&p(&new), b"new".to_vec(), Expect::New).await;
+    assert!(
+        matches!(&written, Err(StoreError::Locked(_))),
+        "{written:?}"
+    );
+    assert!(!ws.file(&new).exists());
+
+    // The reverse: a long-name entry, written by the alias.
+    manifest(json!(["prompts/crane_prompt.txt"]));
+    let alias = format!("{ASSET}/prompts/{}", name(&short_file));
+    let written = store.write(&p(&alias), b"over".to_vec(), over()).await;
+    assert!(
+        matches!(&written, Err(StoreError::Locked(_))),
+        "{written:?}"
+    );
+    assert_eq!(ws.read(&file), b"a crane");
+
+    // A sibling no entry covers.
+    store
+        .write(
+            &p(&format!("{ASSET}/prompts/other.txt")),
+            b"free".to_vec(),
+            Expect::New,
+        )
+        .await
+        .unwrap();
+}
+
+/// Moved here from the store's unit tests, which name no `state` type (CORE-010).
+#[tokio::test(start_paused = true)] // spec: ARCH-083
+async fn git_gate_sees_index_lock_without_the_watcher() {
+    let env = TestEnv::new();
+    let root = env.make_workspace("gate");
+    let state = Arc::new(
+        StateDb::open(
+            &env.root().join("local").join("state.db"),
+            StateScope::Workspace,
+            Arc::new(|what: &str| panic!("unexpected fatal report: {what}")),
+        )
+        .unwrap(),
+    );
+    let store = Arc::new(Store::new(
+        root.clone(),
+        state,
+        FailPoints::none(),
+        FakeClock::new(),
+        Arc::new(SeqIds::new()),
+        Arc::new(SystemProbe),
+    ));
+    let lock = root.join(".git").join("index.lock");
+    write_file(&lock, b"");
+    // No watcher sets the flag: the file alone holds writes back.
+    assert!(store.git_gate().is_busy());
+    let rel = WsPath::parse("notes/after.txt").unwrap();
+    let waiting = {
+        let (store, rel) = (store.clone(), rel.clone());
+        tokio::spawn(async move { store.write(&rel, b"after".to_vec(), Expect::New).await })
+    };
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a write waits while index.lock exists"
+    );
+    assert!(!rel.abs(&root).exists(), "nothing is written meanwhile");
+    // Git ends a command by renaming `index.lock` onto `index`.
+    fsops::move_new(&lock, &root.join(".git").join("index")).unwrap();
+    assert!(!store.git_gate().is_busy());
+    let written = waiting
+        .await
+        .unwrap()
+        .expect("the write goes on once the lock is gone");
+    assert_eq!(written.path, rel);
+    assert_eq!(std::fs::read(rel.abs(&root)).unwrap(), b"after");
 }

@@ -659,6 +659,23 @@ impl Db {
         Ok(slice)
     }
 
+    /// The times (Unix ms) of the first and the last sample of core run `run` whose monotonic
+    /// time is in `(from, to]`, as [`Db::slice`] selects them; `None` when there is none.
+    pub(crate) fn sample_span(
+        &self,
+        run: i64,
+        from_mono: i64,
+        to_mono: i64,
+    ) -> rusqlite::Result<Option<(i64, i64)>> {
+        let conn = self.lock();
+        let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT MIN(ts), MAX(ts) FROM s1 WHERE run = ?1 AND mono > ?2 AND mono <= ?3",
+            params![run, from_mono, to_mono],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(first.zip(last))
+    }
+
     /// Writes (or replaces) the energy row of a job.
     pub(crate) fn put_job_energy(
         &self,

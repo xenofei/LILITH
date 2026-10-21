@@ -1,0 +1,3 @@
+is_error: true
+--- text 1
+{"status":"error","error":{"code":"comfyui.execution_failed","category":"user_fixable","message":"The engine refused the prompt.","detail":{"text":"node 3: missing input","untrusted":false},"fix":{"ui_action":{"id":"open_jobs","label":"Open jobs"},"agent_hint":{"tool":"job_wait","arguments":{"job_id":"j_0123456789abcdef"}}},"trace_id":"t_0123456789abcdef","retry":"after_resolve"}}
