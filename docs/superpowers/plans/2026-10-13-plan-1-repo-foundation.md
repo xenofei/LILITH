@@ -1119,3 +1119,17 @@ The owner guide `docs/dev/merge-guard.md` is still written first (original Step 
    - a privacy dry run: a branch adding a fake user path is refused by the hook and by `privacy-check`;
    - an agent-token check: pushing a change to `.github/workflows/` with the agent token is rejected by GitHub.
 8. **Record.** Write the outcomes into the guide's "First run" section through a PR merged with `ww dev merge`.
+
+## Rulings cited in public text
+
+These plan-1 rulings were made while the plan ran and lived only in its private ledger. This plan, plan 2a, the rename plan and the spec cite them by id, so each is recorded here with its reason (QA-090), as the public text and the code it produced state it. The rest stay in the ledger; the code comments that cite them describe what each one changed.
+
+- **R17** The git hook scripts filter cheaply in the shell before handing off to `lil`; from Amendment A, `pre-push` hands off every push that names a ref, because the privacy scan covers every branch, not only `main`. Why: a push that doesn't touch `main` must work offline and without a build.
+- **R22** Every CI job is time-boxed (`timeout-minutes` between 1 and 120). Its minute-saving trims for a private repository were dropped by R25.
+- **R25** Every push runs every CI job. Why: the repository is public, so GitHub-hosted minutes are free, and a skipped run could report green on untested code.
+- **R26** A protected-paths line that starts `add-ok:` lets new files under its pattern in without approval; changing or deleting files there still needs it. Only the test homes carry it. Why: adding a test must not need the reviewer, while weakening an existing one must.
+- **R27** The post-merge check judges and reverts nothing on a push that creates `main` (its `before` is all zeros), and logs "repository creation push". Why: there is no earlier `main` to compare it with.
+- **R30** The privacy scan's allowlisted profile-path placeholders are `%USERPROFILE%`, `<user>`, `<name>`, `Fake`, `runneradmin`, `Public` and `Default`, compared without regard to case. Why: these name no real person, and docs and tests need them.
+- **R36** The privacy scan also checks every file, path and commit against the owner's private denylist of real names and addresses, which is never printed or committed; `pre-push` refuses every push until the denylist exists. Why: the pattern rules can't know a person's real names.
+- **R38** The Task 15 review fixes: the owner guide covers every publish step and checklist item; a `lil` built in one checkout refuses to judge, scan or merge another; CI judges build the CLI from `main` (or the push's `before`), never from the pushed commit; a changed path holding a control, bidi or invisible character is refused. Why: each closes a way the guard could judge the wrong tree or show something other than what it checked.
+- **R40** The guard check starts only on `opened`, `synchronize` and `reopened`, its concurrency is per head without cancelling, and `lil dev approve` re-runs a red guard run after approving. Why: every workflow run is its own check suite, and the ruleset refuses a merge while any suite on the head holds a cancelled or failed guard check.
