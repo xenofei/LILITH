@@ -1,5 +1,6 @@
-//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run)
-//! where a test makes the next file call fail, or ends the process as a crash would.
+//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run;
+//! for `confirm.after_answer`, in a confirmation's answer) where a test makes the next file call
+//! fail, or ends the process as a crash would.
 //!
 //! `LIL_TEST_FAILPOINTS=<name>=<action>[,…]` arms them, read only on test channels
 //! ([`armed`]); a build whose `LIL_BUILD_CHANNEL` is `stable` compiles every check to a constant
@@ -38,6 +39,14 @@ pub const NAMES: &[&str] = &[
     "jobs.after_submitting",
     "jobs.after_post",
     "jobs.after_outputs",
+    // After `Confirm::answer` commits the answer, before the `answered` event (Task 14).
+    "confirm.after_answer",
+    // After a write-ahead usage row commits, before the call is sent; after a usage line is
+    // appended, before its row is removed and anything is settled (Task 15).
+    "meter.after_pending",
+    "meter.after_usage_line",
+    // After a cap reservation commits, before the call runs (Task 16).
+    "caps.after_reserve",
 ];
 
 /// The exit code of the `abort` action.
@@ -237,26 +246,18 @@ mod tests {
     use super::*;
 
     /// QA1 M1: the test kit's list (what the spec tests arm) and the core's (what `parse`
-    /// accepts) agree: every core name is the test kit's, and the test kit's extra names are
-    /// only the plan-3b points whose tasks add them here (Task 14 `confirm.*`, Task 15
-    /// `meter.*`, Task 16 `caps.*`; once Task 16 lands, the lists are equal). A spec that names
-    /// a point the core lacks arms nothing at all, so a drift would silently test nothing.
+    /// accepts) are equal, now that Task 16 added `caps.after_reserve`. A spec that names a
+    /// point the core lacks arms nothing at all, so a drift would silently test nothing.
     #[test] // spec: QA-066
     fn the_core_and_test_kit_fail_point_lists_agree() {
-        const LATER: &[&str] = &[
-            "confirm.after_answer",
-            "meter.after_pending",
-            "meter.after_usage_line",
-            "caps.after_reserve",
-        ];
         let kit = lil_testkit::failpoints::NAMES;
         for name in NAMES {
             assert!(kit.contains(name), "{name} is not in the test kit's list");
         }
         for name in kit {
             assert!(
-                NAMES.contains(name) || LATER.contains(name),
-                "{name} is in the test kit's list but no task adds it to the core's"
+                NAMES.contains(name),
+                "{name} is in the test kit's list but not in the core's"
             );
         }
     }

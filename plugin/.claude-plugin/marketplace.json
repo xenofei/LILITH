@@ -1,0 +1,14 @@
+{
+  "name": "lilith",
+  "owner": {
+    "name": "LILITH"
+  },
+  "description": "LILITH's own Claude Code marketplace: the suite's plugin, shipped with the suite.",
+  "plugins": [
+    {
+      "name": "worldwright",
+      "source": "./worldwright",
+      "description": "LILITH's MCP server lil, its hooks, and the skills carried from plugin 1.2.0."
+    }
+  ]
+}

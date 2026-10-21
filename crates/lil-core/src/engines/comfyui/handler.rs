@@ -69,7 +69,7 @@ use lil_protocol::{CodeSpec, Detail, ErrorBody, FileRef, codes};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::client::{ComfyClient, ComfyError, OutputFile, RemoteState};
+use super::client::{ComfyClient, ComfyError, OutputFile, RemoteState, off_runtime};
 use super::graph;
 use super::salvage::{self, Staging, sha256_file};
 use super::supervisor::{Comfy, ComfyEndpoint};
@@ -698,6 +698,7 @@ impl JobHandler for ComfyPromptHandler {
                 prefix: job_prefix(&job.id),
                 uploaded: Vec::new(),
                 node: None,
+                last_progress: None,
                 started: None,
                 accepted: false,
                 abandoned: false,
@@ -757,6 +758,9 @@ struct Attempt<'a> {
     uploaded: Vec<String>,
     /// The node `executing` names (progress events carry it).
     node: Option<String>,
+    /// The progress last reported, so `progress` and `progress_state` of one step report it
+    /// once.
+    last_progress: Option<(u64, u64, Option<String>)>,
     /// When the prompt's `execution_start` came (the core's monotonic clock).
     started: Option<Duration>,
     /// ComfyUI has (or had) the attempt's prompt.
@@ -1039,7 +1043,12 @@ impl Attempt<'_> {
                     input.node
                 )));
             }
-            confine_input(&input.path, workspace.as_deref(), &cache).map_err(|why| {
+            // File-system lookups: on a blocking thread (QA1 M4).
+            let (path, ws, dir) = (input.path.clone(), workspace.clone(), cache.clone());
+            let confined = off_runtime(move || Ok(confine_input(&path, ws.as_deref(), &dir)))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            confined.map_err(|why| {
                 JobFailure::Final(untrusted(
                     error(
                         &codes::PARAMS_INVALID,
@@ -1238,6 +1247,18 @@ impl Attempt<'_> {
         self.ended(prompt_id, ended).await
     }
 
+    /// The job's progress (CORE-117), unless it is the one last reported.
+    fn report_progress(&mut self, value: u64, max: u64, node: Option<String>) {
+        let now = Some((value, max, node));
+        if self.last_progress == now {
+            return;
+        }
+        if let Some((value, max, node)) = &now {
+            self.job.progress(*value, *max, node.as_deref());
+        }
+        self.last_progress = now;
+    }
+
     /// One websocket event of the followed prompt; `Some` once it ended.
     async fn on_event(&mut self, prompt_id: &str, event: ComfyEvent) -> Option<Ended> {
         if event.prompt_id().is_some_and(|p| p != prompt_id) {
@@ -1250,8 +1271,12 @@ impl Attempt<'_> {
             }
             ComfyEvent::Executing { node, .. } => self.node = node,
             ComfyEvent::Progress { value, max, .. } => {
-                self.job.progress(value, max, self.node.as_deref());
+                let node = self.node.clone();
+                self.report_progress(value, max, node);
             }
+            ComfyEvent::ProgressState {
+                node, value, max, ..
+            } => self.report_progress(value, max, Some(node)),
             ComfyEvent::Executed { .. } => {}
             ComfyEvent::Success { .. } => return Some(Ended::Success(None)),
             ComfyEvent::Error {
@@ -1491,7 +1516,12 @@ impl Attempt<'_> {
             }
         };
         let mut staged: Vec<(OutputFile, PathBuf, String)> = Vec::new();
-        let mut taken: HashSet<String> = HashSet::new();
+        // A job's cache folder is reused when a later core run takes the job up (ruling
+        // P3-R21): a copy a dead run left there keeps its name, and this run's goes beside it.
+        let dir = staging.dir.clone();
+        let mut taken: HashSet<String> = off_runtime(move || Ok(salvage::names_in(&dir)))
+            .await
+            .unwrap_or_default();
         let mut bad: Option<String> = None;
         for file in output_files(&history) {
             // Untrusted names (ARCH-060): checked before anything is joined (I7).
@@ -1500,19 +1530,15 @@ impl Attempt<'_> {
                 continue;
             }
             // Two outputs of one name (in two subfolders) are staged side by side.
-            let mut name = file.filename.clone();
-            let mut n = 1;
-            while !taken.insert(name.to_ascii_lowercase()) {
-                n += 1;
-                name = format!("{n}_{}", file.filename);
-            }
+            let name = salvage::free_name(&mut taken, &file.filename);
             let dest = staging.dir.join(&name);
             if dest.parent() != Some(staging.dir.as_path()) {
                 continue;
             }
             match self.client.view_to(&file, &dest).await {
                 Ok((size, sha256)) => {
-                    let read_back = sha256_file(&dest).ok();
+                    let at = dest.clone();
+                    let read_back = off_runtime(move || sha256_file(&at)).await.ok();
                     let checked = self.job.failpoint("jobs.after_outputs");
                     staged.push((file.clone(), dest, sha256.clone()));
                     if checked.is_err() || read_back != Some((size, sha256)) {
@@ -1527,9 +1553,17 @@ impl Attempt<'_> {
             }
         }
         if let Some(why) = bad {
-            for (_, dest, _) in &staged {
-                let _ = fsops::discard_unverified(&staging.dir, dest);
-            }
+            let (dir, dests): (PathBuf, Vec<PathBuf>) = (
+                staging.dir.clone(),
+                staged.iter().map(|(_, dest, _)| dest.clone()).collect(),
+            );
+            let _ = off_runtime(move || {
+                for dest in &dests {
+                    let _ = fsops::discard_unverified(&dir, dest);
+                }
+                Ok(())
+            })
+            .await;
             self.report_failed_windows(&windows);
             return Err(JobFailure::Final(untrusted(
                 error(
@@ -1543,6 +1577,7 @@ impl Attempt<'_> {
         }
         // Verified: now the ComfyUI-side copies with the job's prefix go (I5); the others stay.
         if let Some(root) = &self.endpoint.root {
+            let mut copies = Vec::new();
             for (file, _, _) in &staged {
                 if !file.filename.starts_with(&self.prefix) {
                     tracing::info!(name = ?file.filename, "an output without the job's prefix is left in ComfyUI's folder");
@@ -1553,10 +1588,18 @@ impl Attempt<'_> {
                     at.push(part);
                 }
                 at.push(&file.filename);
-                if let Err(e) = fsops::remove_engine_file(root, &at) {
-                    tracing::warn!(file = %at.display(), error = %e, "an output's ComfyUI copy could not be removed");
-                }
+                copies.push(at);
             }
+            let root = root.clone();
+            let _ = off_runtime(move || {
+                for at in &copies {
+                    if let Err(e) = fsops::remove_engine_file(&root, at) {
+                        tracing::warn!(file = %at.display(), error = %e, "an output's ComfyUI copy could not be removed");
+                    }
+                }
+                Ok(())
+            })
+            .await;
         }
         let artifacts: Vec<FileRef> = staged
             .iter()

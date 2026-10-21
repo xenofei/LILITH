@@ -46,6 +46,14 @@ impl BlockingClient {
         self.rt.block_on(self.client.call_tool(name, args, key))
     }
 
+    /// [`Client::confirmations`].
+    pub fn confirmations(
+        &self,
+        state: lil_protocol::app::ListWhich,
+    ) -> Result<Outcome<lil_protocol::app::ConfirmationsListResult>, ClientError> {
+        self.rt.block_on(self.client.confirmations(state))
+    }
+
     /// [`Client::list_tools`].
     pub fn list_tools(&self) -> Result<Vec<ToolDescriptor>, ClientError> {
         self.rt.block_on(self.client.list_tools())

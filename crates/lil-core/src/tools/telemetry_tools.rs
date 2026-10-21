@@ -4,20 +4,22 @@
 //! |---|---|---|---|
 //! | `telemetry.snapshot` | read | `{}` | the [`Snapshot`](crate::telemetry::Snapshot) |
 //! | `telemetry.series` | read | `{metrics, from, to, resolution?}` | `{series: [{metric, points: [[ts, min, avg, max]]}]}` |
+//! | `telemetry.jobs` | read | `{job_ids?, from?, to?, limit?}` | `{jobs: [JobEnergy]}` (newest first) |
 //!
 //! They live in `tools`, not in `telemetry`, so that `telemetry` depends on no `tools` type
-//! (CORE-010); `telemetry.jobs` is `meter`'s (plan 3 Task 15) and goes here too:
-//! [`Telemetry::job_energy`] is ready for it.
+//! (CORE-010). `meter` writes the `JobEnergy` rows `telemetry.jobs` reads.
 
 use std::sync::Arc;
 
 use lil_protocol::EffectClass;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::registry::{Registry, typed_tool};
 
-use crate::telemetry::{Series, SeriesQuery, Snapshot, TELEMETRY_MODULE, Telemetry};
+use crate::telemetry::{
+    JobEnergy, JobEnergyQuery, Series, SeriesQuery, Snapshot, TELEMETRY_MODULE, Telemetry,
+};
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
@@ -38,7 +40,20 @@ const SERIES_DESCRIPTION: &str = "Returns hardware metrics over time: gpu.util, 
     to its energy. 1-second samples are kept 24 hours, 1-minute rows 30 days, hourly rows \
     forever.";
 
-/// Registers `telemetry.snapshot` and `telemetry.series` on `reg`.
+const JOBS_DESCRIPTION: &str = "Returns the energy of finished jobs, newest first: for each, \
+    the job id, its workspace (or loose), from and to (RFC 3339 UTC: its first and last \
+    telemetry samples), GPU and CPU energy gross and above idle in mJ, the whole-system energy, \
+    SM-weighted GPU-seconds (milli), whether the GPU and CPU parts were measured, and \
+    idle_unknown when no idle baseline existed. Jobs of every workspace and loose ones are \
+    listed. `job_ids` picks jobs; `from` and `to` (RFC 3339 UTC) keep jobs that ended at or \
+    after `from` and began at or before `to`; `limit` is 1-500 (default 100).";
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct JobsResult {
+    jobs: Vec<JobEnergy>,
+}
+
+/// Registers `telemetry.snapshot`, `telemetry.series` and `telemetry.jobs` on `reg`.
 pub fn register_telemetry_tools(reg: &mut Registry, telemetry: &Arc<Telemetry>) {
     let t = telemetry.clone();
     reg.register(typed_tool(
@@ -70,6 +85,24 @@ pub fn register_telemetry_tools(reg: &mut Registry, telemetry: &Arc<Telemetry>) 
                 })?;
                 let points: usize = series.series.iter().map(|s| s.points.len()).sum();
                 Ok((series, format!("{points} point(s)")))
+            })
+        },
+    ));
+    let t = telemetry.clone();
+    reg.register(typed_tool(
+        "telemetry.jobs",
+        JOBS_DESCRIPTION,
+        EffectClass::Read,
+        TELEMETRY_MODULE,
+        move |ctx, args: JobEnergyQuery| {
+            let t = t.clone();
+            Box::pin(async move {
+                let jobs = t.job_energy(args).await.map_err(|mut e| {
+                    e.trace_id.clone_from(&ctx.trace_id);
+                    e
+                })?;
+                let summary = format!("{} job(s)", jobs.len());
+                Ok((JobsResult { jobs }, summary))
             })
         },
     ));

@@ -95,6 +95,20 @@ const ALLOW: &[Allow] = &[
         why: "R1, D5",
         until: "plugin rename",
     },
+    // Extras fix round 1 (M2): the plugin hook guards the legacy `Worldwright[-<channel>]`
+    // suite.toml folder, which the suite still reads when the new file is missing (R4).
+    Allow {
+        globs: &["crates/lil-cli/src/user/hook_patterns.rs"],
+        lines_with: &["Worldwright", "\"worldwright"],
+        why: "the hook guards the legacy Worldwright suite.toml folder the suite still reads (M2)",
+        until: "the legacy workspace readers go",
+    },
+    Allow {
+        globs: &["crates/lil-cli/tests/hook_patterns.rs"],
+        lines_with: &["Worldwright"],
+        why: "tests that the hook guards the legacy Worldwright suite.toml folder (M2)",
+        until: "the legacy workspace readers go",
+    },
     // Rows Task B6 adds.
     Allow {
         globs: &["docs/superpowers/specs/2026-10-12-lilith-design.md"],
@@ -169,10 +183,15 @@ const ALLOW: &[Allow] = &[
     // Plan 3, Global Constraints "Old names", the Task 7/19/20 row: Task 7's spec-test globs.
     // `mcp_server.rs` names none of the row's substrings, so it is left out (an honest row
     // allows something through every glob).
+    // Task 20 adds the doctor and plugin globs in the commit that writes those names.
     Allow {
         globs: &[
             "crates/lil-spec-tests/tests/plugin_hooks.rs",
             "crates/lil-spec-tests/tests/doctor_claude.rs",
+            "crates/lil-core/src/tools/doctor_tools.rs",
+            "crates/lil-cli/src/user/doctor.rs",
+            "crates/lil-cli/tests/doctor_claude.rs",
+            "crates/lil-cli/tests/plugin_files.rs",
         ],
         lines_with: &[
             "worldwright@lilith",
@@ -182,6 +201,42 @@ const ALLOW: &[Allow] = &[
         ],
         why: "Claude Code's names for the plugin's tools and the install target (AI-110, D5)",
         until: "plugin rename",
+    },
+    // Plan 3, Global Constraints "Old names", the Task 20 rows. The carried 1.2.0 server
+    // entries name no old name, so `.mcp.json` needs no row, and
+    // `crates/lil-cli/tests/plugin_files.rs` names the legacy workspace file only through
+    // `LEGACY_WORKSPACE_FILE`, so it needs no `worldwright.yaml` row.
+    Allow {
+        globs: &["plugin/**"],
+        lines_with: &["plugin/worldwright/"],
+        why: "the plugin id stays `worldwright` (R1), so its folder does",
+        until: "plugin rename",
+    },
+    Allow {
+        globs: &[
+            "plugin/worldwright/.claude-plugin/plugin.json",
+            "plugin/.claude-plugin/marketplace.json",
+        ],
+        lines_with: &["\"name\": \"worldwright\"", "\"source\": \"./worldwright\""],
+        why: "the plugin and marketplace entries (R1)",
+        until: "plugin rename",
+    },
+    Allow {
+        globs: &[
+            "plugin/worldwright/skills/engines/**",
+            "plugin/worldwright/skills/hubs/**",
+            "plugin/worldwright/skills/manifest/**",
+            "plugin/worldwright/skills/models/**",
+            "plugin/worldwright/skills/production/**",
+            "plugin/worldwright/skills/repair/**",
+            "plugin/worldwright/skills/routing/**",
+            "plugin/worldwright/skills/toolmap/**",
+            "plugin/worldwright/skills/vtuber/**",
+            "plugin/worldwright/agents/**",
+        ],
+        lines_with: &[],
+        why: "plugin 1.2.0's skills and subagents, carried as they are (owner question 2)",
+        until: "the skills port",
     },
     Allow {
         globs: &["crates/lil-testkit/tests/no_stale_names.rs"],

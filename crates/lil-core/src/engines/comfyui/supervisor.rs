@@ -30,7 +30,7 @@ use super::handler::{SuitePrompts, output_tail_detail};
 use super::inventory::Inventory;
 use super::outside::{OutsideWatch, Suite};
 use super::uploads::Uploads;
-use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK, scrubbed_env};
+use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK};
 use crate::engines::{
     COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, InventoryStatus, Listen, OutsideJobs,
     TOPIC,
@@ -154,6 +154,10 @@ pub(crate) struct Comfy {
     output: Arc<Mutex<VecDeque<String>>>,
     /// Cancelled by the `StopEngines` step: the supervisor task ends, a start gives up.
     stopped: CancellationToken,
+    /// Cancelled (and replaced) by `stop` and `restart`: every start begun before gives up,
+    /// so neither waits behind a start that hangs for its 600 s (QA1 M12). A child of
+    /// `stopped`.
+    start_cancel: Mutex<CancellationToken>,
     /// The suite `state.db`: the client id, the uploads.
     suite: Arc<StateDb>,
     /// `Env::local_dir()`: the job caches of jobs without a workspace.
@@ -207,6 +211,7 @@ impl Comfy {
             .and_then(|c| ComfyClient::new(&c.url()).ok());
         let now = clock.monotonic();
         let suite = jobs.suite_state();
+        let stopped = CancellationToken::new();
         Arc::new(Comfy {
             config,
             config_error,
@@ -229,7 +234,8 @@ impl Comfy {
                 freed: false,
             }),
             output: Arc::default(),
-            stopped: CancellationToken::new(),
+            start_cancel: Mutex::new(stopped.child_token()),
+            stopped,
             suite,
             local_dir: env.local_dir(),
             prompts: Arc::default(),
@@ -601,12 +607,25 @@ impl Comfy {
         if changed {
             self.publish("outside_job");
         }
-        // Handed over, then marked: a core that stops in between records it once more rather
-        // than never (ruling P3-R27).
+        // The open `outside_paid` row is the write-ahead record (ruling P3-R27): the line, then
+        // the mark. A core that stops in between finds the line in the log and writes no
+        // second one; a line that can't be written leaves the row open for the next core.
         for u in drafts {
-            self.usage.record(u.draft, u.ctx).await;
-            if let Err(e) = super::outside::mark_recorded(&self.suite, &u.prompt_id, now).await {
-                tracing::warn!(error = %e, "a paid outside prompt's usage can't be marked recorded");
+            match self
+                .usage
+                .record_outside(&u.prompt_id, u.draft, u.ctx)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(e) =
+                        super::outside::mark_recorded(&self.suite, &u.prompt_id, now).await
+                    {
+                        tracing::warn!(error = %e, "a paid outside prompt's usage can't be marked recorded");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(code = %e.code, error = %e.message, "a paid outside prompt's usage line could not be written; the next core writes it");
+                }
             }
         }
     }
@@ -923,9 +942,13 @@ impl Comfy {
         let (config, client) = self.configured()?;
         // Refused before anything starts (ARCH-068).
         let args = config.launch_args()?;
+        let cancel = lock(&self.start_cancel).clone();
         let mut ops = self.ops.lock().await;
         if ops.as_ref().is_some_and(Owned::running) {
             return Ok(self.status());
+        }
+        if cancel.is_cancelled() {
+            return Err(start_cancelled());
         }
         if let Some(stale) = ops.take() {
             end(stale).await;
@@ -956,7 +979,7 @@ impl Comfy {
                 )
             })?;
         lock(&self.output).clear();
-        let owned = self.launch(python, args, root)?;
+        let owned = self.launch(python, args, root, config.engine_env())?;
         let pid = owned.launcher.pid();
         tracing::info!(pid, port = config.port, "the owned ComfyUI is starting");
         self.set_pids(vec![pid]);
@@ -967,7 +990,7 @@ impl Comfy {
             listen: Listen::Unknown,
             version: None,
         });
-        let checked = match self.wait_ready(&owned, client).await {
+        let checked = match self.wait_ready(&owned, client, &cancel).await {
             Ok(stats) => self
                 .check_loopback(&owned, config.port)
                 .await
@@ -1000,12 +1023,14 @@ impl Comfy {
     }
 
     /// Starts `<python> <args>` in `root`, in a new kill-on-close Job Object, with the
-    /// scrubbed environment; its output goes to the log and the start's tail.
+    /// scrubbed environment `env` ([`ComfyConfig::engine_env`]); its output goes to the log and
+    /// the start's tail.
     fn launch(
         &self,
         python: PathBuf,
         args: Vec<OsString>,
         root: PathBuf,
+        env: Vec<(OsString, OsString)>,
     ) -> Result<Owned, ErrorBody> {
         let job = KillOnCloseJob::new()
             .map_err(|e| start_failed(format!("no Job Object for ComfyUI: {e}"), Vec::new()))?;
@@ -1013,7 +1038,7 @@ impl Comfy {
             exe: python,
             args,
             cwd: root,
-            env: scrubbed_env(std::env::vars_os()),
+            env,
         };
         let launcher = spawn_engine(&request, &job, self.output_sink()).map_err(|e| {
             start_failed(
@@ -1043,17 +1068,30 @@ impl Comfy {
     }
 
     /// Waits until the engine answers `/system_stats`; fails when it exits first, takes longer
-    /// than [`START_TIMEOUT`], or the core stops.
-    async fn wait_ready(&self, owned: &Owned, client: &ComfyClient) -> Result<Value, ErrorBody> {
+    /// than [`START_TIMEOUT`], or `cancel` fires (a stop or restart, or the core stopping).
+    async fn wait_ready(
+        &self,
+        owned: &Owned,
+        client: &ComfyClient,
+        cancel: &CancellationToken,
+    ) -> Result<Value, ErrorBody> {
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
+            if cancel.is_cancelled() {
+                return Err(start_cancelled());
+            }
             if let Ok(Some(code)) = owned.launcher.exit_code() {
                 return Err(start_failed(
                     format!("ComfyUI exited with code {code} before it answered."),
                     self.output_tail(),
                 ));
             }
-            if let Ok(stats) = client.system_stats().await {
+            // A refused connection can take seconds on Windows: the cancel doesn't wait for it.
+            let answered = tokio::select! {
+                () = cancel.cancelled() => return Err(start_cancelled()),
+                answered = client.system_stats() => answered,
+            };
+            if let Ok(stats) = answered {
                 return Ok(stats);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1066,9 +1104,7 @@ impl Comfy {
                 ));
             }
             tokio::select! {
-                () = self.stopped.cancelled() => {
-                    return Err(start_failed("The core is stopping.".to_string(), Vec::new()));
-                }
+                () = cancel.cancelled() => return Err(start_cancelled()),
                 () = tokio::time::sleep(READY_POLL) => {}
             }
         }
@@ -1110,7 +1146,14 @@ impl Comfy {
         }
     }
 
+    /// Cancels every start begun so far (QA1 M12): the next start gets a fresh token.
+    fn cancel_starts(&self) {
+        let fresh = self.stopped.child_token();
+        std::mem::replace(&mut *lock(&self.start_cancel), fresh).cancel();
+    }
+
     pub(crate) async fn stop(&self) -> Result<EngineStatus, ErrorBody> {
+        self.cancel_starts();
         let mut ops = self.ops.lock().await;
         if let Some(owned) = ops.take() {
             end(owned).await;
@@ -1142,6 +1185,7 @@ impl Comfy {
     }
 
     pub(crate) async fn restart(&self) -> Result<EngineStatus, ErrorBody> {
+        self.cancel_starts();
         {
             let mut ops = self.ops.lock().await;
             match ops.take() {
@@ -1331,6 +1375,16 @@ fn not_configured(message: String) -> ErrorBody {
 
 fn not_loopback(message: String) -> ErrorBody {
     ErrorBody::new(&codes::COMFYUI_NOT_LOOPBACK, message, "")
+}
+
+/// A start that a stop, a restart or the core's stop ended before the engine answered.
+fn start_cancelled() -> ErrorBody {
+    start_failed(
+        "The start was cancelled: the engine was stopped or restarted, or the core is \
+         stopping, before it answered."
+            .to_string(),
+        Vec::new(),
+    )
 }
 
 /// `comfyui.start_failed`; the engine's last output lines are untrusted detail (ARCH-060).

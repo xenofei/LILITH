@@ -1,6 +1,7 @@
 //! `suite.toml` writes (CORE-007, ARCH-090; owner decision 1): the core is the file's only
 //! writer. `lil workspace init|use` reach it through the tools `workspace.create` and
-//! `workspace.set_default`.
+//! `workspace.set_default`; the caps change only through `app/caps.set` ([`set_caps`],
+//! CORE-008).
 //!
 //! An edit is targeted (`lil_schema::suite_edit::register`, through `toml_edit`), so comments,
 //! key order and unknown keys and tables survive. The write is the store's swap, applied to a
@@ -79,12 +80,51 @@ pub async fn register_workspace(
     make_default: bool,
     fp: &FailPoints,
 ) -> Result<bool, StoreError> {
-    let file = env.suite_toml();
     let spelling = path.to_str().ok_or_else(|| StoreError::PathInvalid {
         path: path.display().to_string(),
         why: "a workspace path must be valid Unicode".to_string(),
     })?;
     let key = |p: &str| folder_key(Path::new(p));
+    let written = edit(env, fp, &|text| {
+        suite_edit::register(text, spelling, make_default, &key)
+    })
+    .await?;
+    if written {
+        tracing::info!(
+            workspace = spelling,
+            make_default,
+            "suite.toml: a workspace registered"
+        );
+    }
+    Ok(written)
+}
+
+/// Applies `caps` to `[caps]` (`app/caps.set`, CORE-008; `lil_schema::suite_edit::set_caps`):
+/// the new keys are written and the legacy ones removed, keeping comments. Returns whether the
+/// file was written.
+///
+/// # Errors
+/// As [`register_workspace`], `store.path_invalid` aside.
+pub async fn set_caps(
+    env: &Env,
+    caps: &suite_edit::CapsEdit,
+    fp: &FailPoints,
+) -> Result<bool, StoreError> {
+    let written = edit(env, fp, &|text| suite_edit::set_caps(text, caps)).await?;
+    if written {
+        tracing::info!("suite.toml: the caps changed");
+    }
+    Ok(written)
+}
+
+/// The targeted edit `change` of `suite.toml` (module docs, steps 1–6). Returns whether the
+/// file was written.
+async fn edit(
+    env: &Env,
+    fp: &FailPoints,
+    change: &(dyn Fn(&str) -> Result<String, String> + Sync),
+) -> Result<bool, StoreError> {
+    let file = env.suite_toml();
     let mut changed_once = false;
     loop {
         let read = match std::fs::read(&file) {
@@ -109,11 +149,9 @@ pub async fn register_workspace(
                 why: "suite.toml isn't UTF-8 text, so it was left as it is".to_string(),
             })?,
         };
-        let new = suite_edit::register(text, spelling, make_default, &key).map_err(|why| {
-            StoreError::Io {
-                path: source.display().to_string(),
-                why: format!("{why}; it was left as it is"),
-            }
+        let new = change(text).map_err(|why| StoreError::Io {
+            path: source.display().to_string(),
+            why: format!("{why}; it was left as it is"),
         })?;
         if read.is_some() && new == text {
             return Ok(false);
@@ -122,7 +160,7 @@ pub async fn register_workspace(
         let expected = read.as_deref().map(sha256_hex);
         match swap(&file, expected.as_deref(), new.as_bytes(), fp).await? {
             Swap::Done => {
-                tracing::info!(file = %file.display(), workspace = spelling, make_default, "suite.toml written");
+                tracing::info!(file = %file.display(), "suite.toml written");
                 return Ok(true);
             }
             Swap::Changed if !changed_once => {

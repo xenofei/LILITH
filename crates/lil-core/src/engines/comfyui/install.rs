@@ -5,10 +5,14 @@
 //! in a kill-on-close Job Object (a cancel ends it).
 //!
 //! The version must be an exact `major.minor.patch` and the id a registry id (never a URL or
-//! anything that starts with `-`). comfy-cli asks the comfy registry, so every run that started
-//! records one usage draft (provider `comfy-registry`, basis `free_tier`, `requests: 1`;
-//! CORE-069), with its outcome (`succeeded`, `failed` or `cancelled`) and its latency. The
-//! write-ahead `pending` record before the spawn (CORE-071) comes with Task 15's meter. A success sets the engine's `restart_needed`; a failure is
+//! anything that starts with `-`). comfy-cli asks the comfy registry, so every run records one
+//! usage draft (provider `comfy-registry`, basis `free_tier`, `requests: 1`; CORE-069): begun
+//! write-ahead before comfy-cli is spawned (CORE-071; a core that dies mid-install leaves a
+//! `pending` record; when that record can't be written, the job fails with its error and
+//! comfy-cli is never started), and settled with the outcome (`succeeded`, `failed` or `cancelled`) and
+//! the latency once it ends. A comfy-cli that can't be started asked nothing: its record is
+//! abandoned. The draft carries the job id, so it is the job's one usage line (QA1 I5). A
+//! success sets the engine's `restart_needed`; a failure is
 //! `comfyui.node_install_failed` with comfy-cli's output as untrusted detail (ARCH-060).
 
 use std::collections::VecDeque;
@@ -156,6 +160,8 @@ pub struct InstallPlan {
     pub comfy_cli: PathBuf,
     pub root: PathBuf,
     pub python: PathBuf,
+    /// `[engines.comfyui] pass_env`: the variables the scrub lets through to comfy-cli.
+    pub pass_env: Vec<String>,
 }
 
 /// The [`InstallPlan`] of `engines`' configuration.
@@ -194,13 +200,14 @@ pub fn install_plan(engines: &Engines) -> Result<InstallPlan, ErrorBody> {
         comfy_cli,
         root,
         python,
+        pass_env: config.pass_env.clone(),
     })
 }
 
-/// The scrubbed environment of the current process with the folder of `python` first on
-/// `PATH`.
-fn install_env(python: &Path) -> Vec<(OsString, OsString)> {
-    let mut env = scrubbed_env(std::env::vars_os());
+/// The scrubbed environment of the current process (with `pass_env` let through) and the
+/// folder of `python` first on `PATH`.
+fn install_env(python: &Path, pass_env: &[String]) -> Vec<(OsString, OsString)> {
+    let mut env = scrubbed_env(std::env::vars_os(), pass_env);
     let dir = python.parent().map(Path::to_path_buf).unwrap_or_default();
     let at = env
         .iter()
@@ -286,14 +293,25 @@ impl NodeInstallHandler {
                 version.into(),
             ],
             cwd: plan.root.clone(),
-            env: install_env(&plan.python),
+            env: install_env(&plan.python, &plan.pass_env),
         };
-        let cli = spawn_engine(&request, &kill_on_close, on_line).map_err(|e| {
-            JobFailure::Final(trace(failed(
-                format!("{} could not be started: {e}", plan.comfy_cli.display()),
-                &[],
-            )))
-        })?;
+        // Write-ahead (CORE-071): the record is pending before comfy-cli asks the registry.
+        let usage = engines.comfy().usage.clone();
+        // Without its record the registry is never asked: the job fails before the spawn.
+        let pending = usage
+            .begin(draft(), usage_ctx(job, &args))
+            .await
+            .map_err(|e| JobFailure::Final(trace(e)))?;
+        let cli = match spawn_engine(&request, &kill_on_close, on_line) {
+            Ok(cli) => cli,
+            Err(e) => {
+                usage.abandon(pending).await;
+                return Err(JobFailure::Final(trace(failed(
+                    format!("{} could not be started: {e}", plan.comfy_cli.display()),
+                    &[],
+                ))));
+            }
+        };
         // Latency is a measurement of the call itself, so it is wall time, not the core's
         // scheduling clock.
         let spawned = std::time::Instant::now();
@@ -322,13 +340,10 @@ impl NodeInstallHandler {
         let lines: Vec<String> = tail.into();
 
         // comfy-cli ran, so the registry was asked (CORE-069): how it ended, and how long it
-        // took. (Task 15 carry: the write-ahead `pending` record before the spawn, CORE-071.)
-        let status = usage_status(&ended);
+        // took.
         let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
-        engines
-            .comfy()
-            .usage
-            .record(draft(status, latency_ms), usage_ctx(job, &args))
+        usage
+            .settle(pending, usage_status(&ended), Some(latency_ms))
             .await;
 
         match ended {
@@ -372,8 +387,8 @@ fn usage_status(ended: &Ended) -> UsageStatus {
     }
 }
 
-/// The usage draft of one registry install that ended with `status` after `latency_ms`.
-fn draft(status: UsageStatus, latency_ms: u64) -> UsageDraft {
+/// The usage draft of one registry install, before it is sent (`pending`, not timed yet).
+fn draft() -> UsageDraft {
     let mut units = serde_json::Map::new();
     units.insert("requests".to_string(), json!(1));
     UsageDraft {
@@ -387,8 +402,8 @@ fn draft(status: UsageStatus, latency_ms: u64) -> UsageDraft {
         account: None,
         raw_usage: None,
         attribution: Attribution::Suite,
-        status,
-        latency_ms: Some(latency_ms),
+        status: UsageStatus::Pending,
+        latency_ms: None,
     }
 }
 

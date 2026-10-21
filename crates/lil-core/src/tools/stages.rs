@@ -5,9 +5,14 @@
 //! [`Estimate::Zero`], [`ConfirmStage`] fails closed (QA-016: an agent's `destructive` or
 //! `exec` call has no way to ask you yet, so it gets `confirm.unavailable` and never runs),
 //! nothing is reserved or settled, and [`WorkspaceRecord`] runs the Record stage (CORE-020).
+//! The core replaces the confirm stage with `crate::confirm::AgentConfirm` (plan 3, Task 14),
+//! which makes such a call `pending_confirmation` while it can be answered and decides what a
+//! retry with its token gets ([`ConfirmStage::on_replay`]); it also asks when a cap would be
+//! passed, at stage 5 or when the reserve stage finds one passed after it
+//! ([`ConfirmStage::cap_needed`]). The estimate stage is [`ToolEstimates`] and the reserve stage
+//! the caps' (Task 16).
 //!
-//! [`BillingBasis`], [`ConfirmedVia`] and [`CapHit`] are the shapes the stage signatures need;
-//! Tasks 14–16 give them their behaviour.
+//! [`BillingBasis`], [`ConfirmedVia`] and [`CapHit`] are the shapes the stage signatures need.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -18,6 +23,7 @@ use futures_util::future::BoxFuture;
 use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
 use lil_protocol::codes::PARAMS_INVALID;
 use lil_protocol::{ErrorBody, Outcome, PendingConfirmation, ToolDescriptor, ToolOutput};
+use lil_schema::money::Rate;
 use lil_schema::workspace_yaml::{
     ProjectYaml, WorkspaceYaml, read_project_yaml, read_workspace_yaml,
 };
@@ -30,6 +36,7 @@ use crate::pipeline::RecordPlan;
 use crate::session::Session;
 use crate::settings::cascade;
 pub use crate::settings::{SettingSource, Settings};
+use crate::state::{StateDb, StateError};
 use crate::store::{Store, WsPath};
 use crate::workspace::OpenWorkspace;
 
@@ -45,6 +52,21 @@ pub enum BillingBasis {
 }
 
 impl BillingBasis {
+    /// Every basis.
+    pub const ALL: [BillingBasis; 6] = [
+        BillingBasis::Payg,
+        BillingBasis::PrepaidCredits,
+        BillingBasis::SubscriptionQuota,
+        BillingBasis::FreeTier,
+        BillingBasis::Byok,
+        BillingBasis::Local,
+    ];
+
+    /// The basis of its wire name.
+    pub fn parse(s: &str) -> Option<BillingBasis> {
+        BillingBasis::ALL.into_iter().find(|b| b.wire() == s)
+    }
+
     /// `payg`, `prepaid_credits`, `subscription_quota`, `free_tier`, `byok`, `local`.
     pub fn wire(self) -> &'static str {
         match self {
@@ -75,7 +97,8 @@ impl ConfirmedVia {
 }
 
 /// A cap a call would pass (Task 16): `cap` is `monthly`, `per_call_max` or
-/// `provider:<id>`; the amounts are in the display currency.
+/// `provider:<id>`; the amounts are in the display currency `currency`, and `rate` is the
+/// exchange rate the estimate was converted at (`None` when it was already in that currency).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapHit {
     pub cap: String,
@@ -83,6 +106,8 @@ pub struct CapHit {
     pub settled: Money,
     pub held: Money,
     pub estimate: Money,
+    pub currency: String,
+    pub rate: Option<Rate>,
 }
 
 /// What a call is expected to cost (CORE-015 stage 4): nothing, local work, or an external
@@ -119,6 +144,98 @@ pub struct ConfirmInput<'a> {
     /// `None` for a `read` tool (no key).
     pub idem: Option<IdemRef<'a>>,
     pub workspace: Option<&'a OpenWorkspace>,
+    /// The call's resolved project (ARCH-088); `None` without a workspace. A confirmation is
+    /// for the call in this project.
+    pub project: Option<&'a str>,
+    /// The call runs again for a `job.retry` (CORE-146): its own tool was not what the caller
+    /// called, so no prompt of the caller's (Claude Code's) was about it.
+    pub retry: bool,
+    /// An agent's call needs your confirmation whatever the tool's effect: a `job.retry` of a
+    /// job with external side effects that was `interrupted` (ruling P3-R21: it may have run,
+    /// so paid work could be paid twice).
+    pub always_confirm: bool,
+}
+
+impl ConfirmInput<'_> {
+    /// Whether an agent's confirmation is needed (ARCH-052, CORE-109): an agent caller and a
+    /// `destructive` or `exec` tool, or [`ConfirmInput::always_confirm`]. Your own actions in
+    /// an app never ask.
+    pub fn needs_agent_confirmation(&self) -> bool {
+        self.session.caller.is_agent()
+            && (self.descriptor.effect.needs_agent_confirmation() || self.always_confirm)
+    }
+}
+
+/// A confirmation you approved, as a retry with its token runs it (CORE-091, Appendix F): the
+/// tool, the arguments and the project you saw. The call runs with stage 5 satisfied only when
+/// it is that tool with those arguments in that project; anything else asks again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Approval {
+    /// `cf_<16 hex>`.
+    pub confirmation_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    /// The call's resolved project when you approved it (`None` without a workspace).
+    pub project: Option<String>,
+    pub confirmed_via: ConfirmedVia,
+    /// The cap action of the answer (`allow_once`, `raise`), for the cap half (Task 16).
+    pub cap_action: Option<String>,
+    /// With `allow_once`: the caps and the estimate the prompt showed, which the reserve
+    /// stage may pass this once.
+    pub allowed: Option<AllowOnce>,
+}
+
+/// What a cap confirmation's `allow_once` allowed (CORE-091: bound to what you saw): the caps
+/// the prompt named and the estimate it showed, in the display currency. The reserve stage
+/// lets the call pass only those caps and only up to that estimate; a cap the prompt didn't
+/// name, or a larger estimate (a rate that changed meanwhile), asks again
+/// ([`ConfirmStage::cap_needed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowOnce {
+    /// The confirmation, `cf_<16 hex>` (the reservation's `allowed_by`).
+    pub confirmation_id: String,
+    /// `monthly`, `per_call_max`, `provider:<id>`.
+    pub caps: Vec<String>,
+    /// The estimate the prompt showed, in `currency` (the display currency then).
+    pub estimate: Money,
+    pub currency: String,
+    /// The exchange rate the shown estimate was converted at (`None`: none was needed).
+    pub rate: Option<Rate>,
+}
+
+impl AllowOnce {
+    /// Whether this lets a call whose estimate is `estimate` pass `hits`: each is a cap the
+    /// prompt named, in the same display currency and at the same rate, and the estimate is no
+    /// larger than the one it showed. A changed currency or rate asks again.
+    pub fn covers(&self, hits: &[CapHit], estimate: Money) -> bool {
+        estimate <= self.estimate
+            && hits.iter().all(|h| {
+                self.caps.contains(&h.cap) && h.currency == self.currency && h.rate == self.rate
+            })
+    }
+}
+
+impl Approval {
+    /// Whether this approval is for a call of `tool` with `args` in `project`.
+    pub fn covers_call(&self, tool: &str, args: &Value, project: Option<&str>) -> bool {
+        self.tool == tool
+            && self.project.as_deref() == project
+            && lil_protocol::args_hash(&self.arguments) == lil_protocol::args_hash(args)
+    }
+}
+
+/// What a retry with the token of a stored `pending_confirmation` gets (Appendix F
+/// "Confirmations"): run the call once, the same pending confirmation, or the end of it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayDecision {
+    /// Approved: the call runs (once) with stage 5 satisfied for what was approved.
+    Run(Approval),
+    /// Not answered yet: the same `pending_confirmation`.
+    StillPending(PendingConfirmation),
+    /// `confirm.denied`; the key is released.
+    Denied,
+    /// `confirm.expired` (also a prompt cancelled unanswered); the key is released.
+    Expired,
 }
 
 /// What the confirm-and-caps stage decided (CORE-017).
@@ -128,11 +245,11 @@ pub struct ConfirmInput<'a> {
     reason = "the plan's signature: CapExceeded holds the wire ErrorBody, as the crate's Results do"
 )]
 pub enum ConfirmDecision {
-    /// Run the call; `confirmed_via` records who confirmed it, `cap_override` is the cap a
+    /// Run the call; `confirmed_via` records who confirmed it, `cap_override` is what a
     /// confirmation allowed once (handed to the reserve stage as `allow_once`).
     Proceed {
         confirmed_via: Option<ConfirmedVia>,
-        cap_override: Option<String>,
+        cap_override: Option<AllowOnce>,
     },
     /// The call waits for you; the caller gets `pending_confirmation`.
     Pending(PendingConfirmation),
@@ -141,6 +258,47 @@ pub enum ConfirmDecision {
     Unavailable,
     /// A cap would be passed and nobody can be asked: the error (`cap.exceeded`).
     CapExceeded(ErrorBody),
+    /// The stage could not decide (its `state.db` failed): the error the call ends with.
+    Failed(ErrorBody),
+}
+
+/// `cap.exceeded` (QA-016) for a call of `tool` that would pass `hits`: the caps, and the
+/// amounts as decimal strings in `data.caps`.
+pub fn cap_exceeded(tool: &str, hits: &[CapHit]) -> ErrorBody {
+    let names: Vec<&str> = hits.iter().map(|h| h.cap.as_str()).collect();
+    let mut error = ErrorBody::new(
+        &lil_protocol::codes::CAP_EXCEEDED,
+        format!(
+            "{tool} would pass the cap {}. Raise the cap or allow the call once in the LILITH app, or run the call where you can confirm it.",
+            names.join(", ")
+        ),
+        "",
+    );
+    error.data = Some(serde_json::json!({ "caps": cap_hits_json(hits) }));
+    error
+}
+
+/// `[{cap, limit, settled, held, estimate, currency, rate}]`, amounts as decimal strings in
+/// the display currency `currency`; `rate` is `{in_display, date}` or `null`.
+pub fn cap_hits_json(hits: &[CapHit]) -> Value {
+    Value::Array(
+        hits.iter()
+            .map(|h| {
+                serde_json::json!({
+                    "cap": h.cap,
+                    "limit": h.limit.to_decimal_string(),
+                    "settled": h.settled.to_decimal_string(),
+                    "held": h.held.to_decimal_string(),
+                    "estimate": h.estimate.to_decimal_string(),
+                    "currency": h.currency,
+                    "rate": h.rate.as_ref().map(|r| serde_json::json!({
+                        "in_display": Money::from_micros(r.in_display_micros).to_decimal_string(),
+                        "date": r.date,
+                    })),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// What the reserve stage did.
@@ -162,8 +320,8 @@ pub struct ReserveInput<'a> {
     pub workspace_id: &'a str,
     /// The call's id, `c_<16 hex>`; a job takes the reservation over (`JobCtx::reservation`).
     pub call_id: &'a str,
-    /// The cap a confirmation allowed once.
-    pub allow_once: Option<&'a str>,
+    /// What a confirmation allowed once: those caps, up to that estimate.
+    pub allow_once: Option<&'a AllowOnce>,
 }
 
 /// What the meter stage settles (inline calls only: a call that submitted a job leaves it
@@ -208,6 +366,32 @@ pub trait EstimateStage: Send + Sync {
 /// Stage 5: confirmations and caps.
 pub trait ConfirmStage: Send + Sync {
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision>;
+
+    /// The reserve stage found caps `hits` passed after this stage let the call through (another
+    /// call took the room meanwhile): what the call gets. A stage that can ask returns a
+    /// `pending_confirmation` covering the cap only (the call's safety confirmation, if any,
+    /// was already given); the default is `cap.exceeded`.
+    fn cap_needed<'a>(
+        &'a self,
+        i: ConfirmInput<'a>,
+        hits: Vec<CapHit>,
+    ) -> BoxFuture<'a, ConfirmDecision> {
+        Box::pin(std::future::ready(ConfirmDecision::CapExceeded(
+            cap_exceeded(&i.descriptor.name, &hits),
+        )))
+    }
+
+    /// A retry found its idempotency row `idem` (in `db`) holding a stored
+    /// `pending_confirmation`: what it gets ([`ReplayDecision`]). `None` replays the stored
+    /// outcome as it is (a stage that never makes one pending).
+    fn on_replay<'a>(
+        &'a self,
+        db: &'a StateDb,
+        idem: IdemRef<'a>,
+    ) -> BoxFuture<'a, Result<Option<ReplayDecision>, StateError>> {
+        let _ = (db, idem);
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 /// Stage 6: reserves budget for the estimate.
@@ -382,6 +566,71 @@ impl SettingsStage for CascadeSettings {
     }
 }
 
+/// The plan-3 estimate stage (CORE-015 step 4, CORE-086). No plan-3 product tool calls a paid
+/// service (partner nodes are refused, the node install is free), so every tool is
+/// [`Estimate::Zero`] except the test channels' two paid ones:
+/// - `test.destructive {cost}`: `External {provider: "test", amount: cost, currency: <display>,
+///   basis: payg}`;
+/// - `test.meter_external {provider, amount, currency?, basis?}`: that external estimate, the
+///   currency defaulting to the display currency and the basis to `payg`.
+///
+/// Arguments that don't read give `Zero` (the tool refuses them). `display` gives the display
+/// currency of `suite.toml` now.
+pub struct ToolEstimates {
+    display: Arc<dyn Fn() -> Currency + Send + Sync>,
+}
+
+impl std::fmt::Debug for ToolEstimates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolEstimates").finish_non_exhaustive()
+    }
+}
+
+impl ToolEstimates {
+    pub fn new(display: Arc<dyn Fn() -> Currency + Send + Sync>) -> ToolEstimates {
+        ToolEstimates { display }
+    }
+}
+
+impl EstimateStage for ToolEstimates {
+    fn estimate(&self, d: &ToolDescriptor, args: &Value, _s: &Settings) -> Estimate {
+        let text = |k: &str| args.get(k).and_then(Value::as_str);
+        let money = |k: &str| text(k).and_then(|t| Money::parse_decimal(t).ok());
+        let (provider, amount, currency, basis) = match d.name.as_str() {
+            "test.destructive" => match money("cost") {
+                Some(amount) => ("test", amount, None, Some(BillingBasis::Payg)),
+                None => return Estimate::Zero,
+            },
+            "test.meter_external" => match (text("provider"), money("amount")) {
+                (Some(p), Some(amount)) => (
+                    p,
+                    amount,
+                    text("currency"),
+                    text("basis").map_or(Some(BillingBasis::Payg), BillingBasis::parse),
+                ),
+                _ => return Estimate::Zero,
+            },
+            _ => return Estimate::Zero,
+        };
+        let currency = match currency {
+            None => (self.display)(),
+            Some(c) => match Currency::parse(c) {
+                Ok(c) => c,
+                Err(_) => return Estimate::Zero,
+            },
+        };
+        match basis {
+            Some(basis) => Estimate::External {
+                provider: provider.to_string(),
+                amount,
+                currency,
+                basis,
+            },
+            None => Estimate::Zero,
+        }
+    }
+}
+
 impl EstimateStage for Plan2 {
     fn estimate(&self, _d: &ToolDescriptor, _args: &Value, _s: &Settings) -> Estimate {
         Estimate::Zero
@@ -393,15 +642,14 @@ impl ConfirmStage for Plan2 {
     /// confirmation (ARCH-052), and plan 2 has no way to ask: [`ConfirmDecision::Unavailable`],
     /// interactive session or not (QA-016). Your own actions in an app never ask (CORE-109).
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
-        let decision =
-            if i.session.caller.is_agent() && i.descriptor.effect.needs_agent_confirmation() {
-                ConfirmDecision::Unavailable
-            } else {
-                ConfirmDecision::Proceed {
-                    confirmed_via: None,
-                    cap_override: None,
-                }
-            };
+        let decision = if i.needs_agent_confirmation() {
+            ConfirmDecision::Unavailable
+        } else {
+            ConfirmDecision::Proceed {
+                confirmed_via: None,
+                cap_override: None,
+            }
+        };
         Box::pin(std::future::ready(decision))
     }
 }

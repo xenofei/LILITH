@@ -1,0 +1,89 @@
+{
+  "<prompt_id>": {
+    "prompt": [
+      0,
+      "<string>",
+      {
+        "1": {
+          "class_type": "<string>",
+          "inputs": {
+            "width": 0,
+            "height": 0,
+            "batch_size": 0,
+            "color": 0
+          }
+        },
+        "2": {
+          "class_type": "<string>",
+          "inputs": {
+            "images": [
+              "<string>",
+              0
+            ],
+            "filename_prefix": "<string>"
+          }
+        }
+      },
+      {
+        "preview_method": "<string>",
+        "client_id": "<string>",
+        "create_time": 0
+      },
+      [
+        "<string>"
+      ]
+    ],
+    "outputs": {
+      "2": {
+        "images": [
+          {
+            "filename": "<string>",
+            "subfolder": "<string>",
+            "type": "<string>",
+            "metadata": {
+              "kind": "<string>",
+              "width": 0,
+              "height": 0
+            }
+          }
+        ]
+      }
+    },
+    "status": {
+      "status_str": "<string>",
+      "completed": true,
+      "messages": [
+        [
+          "<string>",
+          {
+            "prompt_id": "<string>",
+            "timestamp": 0
+          }
+        ],
+        [
+          "<string>",
+          {
+            "nodes": [],
+            "prompt_id": "<string>",
+            "timestamp": 0
+          }
+        ],
+        [
+          "<string>",
+          {
+            "prompt_id": "<string>",
+            "timestamp": 0
+          }
+        ]
+      ]
+    },
+    "meta": {
+      "2": {
+        "node_id": "<string>",
+        "display_node": "<string>",
+        "parent_node": null,
+        "real_node_id": "<string>"
+      }
+    }
+  }
+}

@@ -1167,6 +1167,64 @@ fn timestamps_are_rfc_3339_utc_with_milliseconds() {
 // A damaged telemetry.db (CORE-004).
 // ---------------------------------------------------------------------------------------------
 
+/// A clock that runs 1000 times faster than real time, so the real milliseconds the start
+/// spends opening `telemetry.db` are seconds of it.
+#[derive(Debug)]
+struct FastClock {
+    start: std::time::Instant,
+    utc0: std::time::SystemTime,
+}
+
+impl Clock for FastClock {
+    fn monotonic(&self) -> Duration {
+        self.start.elapsed() * 1000
+    }
+
+    fn utc_now(&self) -> std::time::SystemTime {
+        self.utc0 + self.start.elapsed() * 1000
+    }
+
+    fn local_offset_secs(&self, _utc: std::time::SystemTime) -> i32 {
+        0
+    }
+}
+
+/// The start reads the wall and monotonic clocks at one instant, so a monotonic time maps to
+/// the wall time it was (`Telemetry::wall_ms`, a job's `from` and `to`), however long the
+/// database took to open: reading them on either side of the open shifted every mapped time by
+/// the open's length.
+#[tokio::test] // spec: CORE-065
+async fn monotonic_times_map_to_their_wall_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FastClock {
+        start: std::time::Instant::now(),
+        utc0: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+    });
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let before = clock.monotonic();
+    let telemetry = Telemetry::start(
+        HwSources::none(),
+        dir.path().join("telemetry.db"),
+        clock.clone(),
+        PowerSettings::default(),
+        events,
+        TickMode::Manual,
+    );
+    let took = i64::try_from((clock.monotonic() - before).as_millis()).unwrap();
+    let (utc, mono) = (clock.utc_now(), clock.monotonic());
+    let utc_ms = i64::try_from(
+        utc.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let off = (telemetry.wall_ms(mono) - utc_ms).abs();
+    assert!(
+        off < took / 4,
+        "a monotonic time maps {off} ms away from its wall time (the start took {took} ms)"
+    );
+}
+
 /// 4 KiB of 0xAB is not a database: it is renamed to `telemetry.db.damaged-<utc>` with its
 /// bytes intact, and a new database answers. Nothing is deleted.
 #[tokio::test] // spec: CORE-004, QA-055

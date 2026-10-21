@@ -26,6 +26,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sy
 tokio-util.workspace = true
 # ComfyUI's websocket (loopback only, ARCH-068): its events and previews.
 tokio-tungstenite.workspace = true
+# App registrations (`apps\<app>.toml`, APP-061).
+toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true

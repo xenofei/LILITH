@@ -1,0 +1,5 @@
+is_error: false
+--- text 1
+{"status":"pending_confirmation","confirmation_id":"cf_0123456789abcdef","retry_token":"K","expires_at":"2026-10-19T12:30:00Z","covers":["confirm"]}
+--- text 2
+Waiting for you to confirm in LILITH; continue with other steps, then call this tool again with the same arguments and retry_token K.

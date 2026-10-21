@@ -41,7 +41,7 @@ pub use fs::{FileIdentity, Probe, SystemProbe, VolumeInfo};
 pub use guard::{RealLocations, arm_test_guard, check_workspace, parse_registered_workspaces};
 pub use ids::{IdSource, RandomIds};
 pub use process_env::{
-    BUILD_CHANNEL, ENV_CHANNEL, ENV_TEST_IDLE_SECS, ENV_TEST_PARENT_PID, ENV_TEST_ROOT,
-    TEST_PIPE_SID, TestOverrides,
+    BUILD_CHANNEL, ENV_CHANNEL, ENV_TEST_DOCTOR_STDIN, ENV_TEST_IDLE_SECS, ENV_TEST_PARENT_PID,
+    ENV_TEST_ROOT, TEST_PIPE_SID, TestOverrides,
 };
 pub use volume::{SystemVolumeResolver, VolumeResolver, volume_root};

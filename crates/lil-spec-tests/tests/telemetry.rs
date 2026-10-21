@@ -340,6 +340,9 @@ fn job_energy_is_split_by_sm_share() {
     let mut pipe = session(&env, None);
 
     fake.hold_prompts(true);
+    // A first sample, so the GPU job is admitted (ruling P3-R26; P3-R18 holds a job submitted
+    // before any sample in waiting_for_vram).
+    tick(&mut pipe, 1);
     let id = submit(&mut pipe, "test.comfy_submit", json!({"graph": "tiny"}));
     let body = poll("the prompt in ComfyUI", || {
         posted_prompts(&fake).into_iter().next()

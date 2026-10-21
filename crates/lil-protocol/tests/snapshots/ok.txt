@@ -1,0 +1,5 @@
+is_error: false
+--- text 1
+{"status":"ok","structured":{"job":{"job_id":"j_0123456789abcdef","status":"succeeded"}},"artifacts":[{"path":".lilith/staging/h/lil_0123456789abcdef__00001_.png"}],"summary_text":"Call job_wait, then asset_get; see notes.md."}
+--- text 2
+C:\ws\.lilith\staging\h\lil_0123456789abcdef__00001_.png

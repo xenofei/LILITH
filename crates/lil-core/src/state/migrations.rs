@@ -39,7 +39,7 @@ CREATE TABLE generated_pending (
 /// Suite migration 3 and workspace migration 4: the job records (ARCH-022, ARCH-034, CORE-117).
 /// A job lives in the `state.db` of its call's scope (ARCH-099). `seq` is the submission order.
 /// `idem_scope`/`idem_key` (caller kind + workspace, and the call's idempotency key) make one
-/// key one job (CORE-016). `external_id` is the engine's id for the job (ComfyUI's
+/// key one job (CORE-016); `idem_scope` is kept without a key too (the submitting caller). `external_id` is the engine's id for the job (ComfyUI's
 /// `prompt_id`, CORE-120), written by the engine's handler. `tool`/`tool_args` are the tool
 /// call that submitted the job, which `job.retry` dispatches again.
 const JOBS: &str = "CREATE TABLE jobs (
@@ -118,6 +118,123 @@ const OUTSIDE_PAID: &str = "CREATE TABLE outside_paid (
 );
 CREATE INDEX outside_paid_open ON outside_paid(prompt_id) WHERE recorded_utc IS NULL;";
 
+/// Suite migration 6 and workspace migration 5: the confirmations (ARCH-052–055, CORE-109–115;
+/// Appendix F "Confirmations"). A confirmation lives in the `state.db` of its call's scope and
+/// belongs to the call's idempotency row `(scope, idem_key)`, bound to the tool and the
+/// arguments' hash. At most one per key is `pending` (`confirmations_pending`); the answered,
+/// expired and cancelled ones stay as the history, so a key whose earlier confirmation was
+/// denied can be asked about again. `covers` is the JSON array (`confirm` before `cap`), `cap`
+/// the JSON of the caps the call would pass; `project` is the call's resolved project (none
+/// without a workspace), which an approval is bound to. Times are Unix seconds.
+const CONFIRMATIONS: &str = "CREATE TABLE confirmations (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL,
+    idem_key TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    args_hash TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    caller_kind TEXT NOT NULL,
+    covers TEXT NOT NULL,
+    cap TEXT,
+    state TEXT NOT NULL
+        CHECK (state IN ('pending','approved','denied','expired','cancelled')),
+    confirmed_via TEXT CHECK (confirmed_via IN ('app','claude_code')),
+    created_utc INTEGER NOT NULL,
+    expires_utc INTEGER NOT NULL,
+    answered_utc INTEGER,
+    cap_action TEXT,
+    session_id TEXT NOT NULL,
+    project TEXT
+);
+CREATE UNIQUE INDEX confirmations_pending ON confirmations(scope, idem_key)
+    WHERE state = 'pending';
+CREATE INDEX confirmations_key ON confirmations(scope, idem_key);
+CREATE INDEX confirmations_state ON confirmations(state, created_utc);";
+
+/// Workspace migration 6: the hold markers (APP-104). A hold lives in the core's memory, tied
+/// to its connection; this row only records that a document was held, so one left by a killed
+/// core is visible until the next start empties the table.
+const HOLDS: &str = "CREATE TABLE hold_markers (
+    doc_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    since_utc INTEGER NOT NULL,
+    token INTEGER NOT NULL
+);";
+
+/// Suite migration 7 and workspace migration 7: the write-ahead usage rows (CORE-071;
+/// Appendix F "Usage records"). A row is written to the `state.db` of its call's scope before
+/// the external request is sent, and removed once its usage line is in the log. `record` is
+/// the usage line's JSON record (`status: "pending"` while `state` is `pending`; the finished
+/// record once `state` is `logging`, the step just before the line is appended). `run` is the
+/// core run that wrote it: a row of another run was left by a dead core, and startup turns it
+/// into a `status: "pending"` line. Times are Unix milliseconds.
+const USAGE_PENDING: &str = "CREATE TABLE usage_pending (
+    id TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    job_id TEXT,
+    reservation TEXT,
+    record TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','logging')),
+    created_ms INTEGER NOT NULL,
+    logging_ms INTEGER
+);
+CREATE INDEX usage_pending_run ON usage_pending(run);";
+
+/// Suite migration 8: the caps (CORE-085–092, Appendix F "Caps and money in `suite.toml`").
+/// Only the suite `state.db` has them: it holds every reservation, from any workspace or none
+/// (CORE-087).
+/// - `cap_reservations`: one row per reservation `rv_<16 hex>`, made by core run `run` for
+///   `owner` (the call id `c_…`, then the job id `j_…` that took it over) in `workspace` (an id
+///   or `none`), in the local calendar month `period`. `amount_micros` is the estimate in its
+///   own `currency`; `rate_micros`/`rate_date` the exchange rate used (1 unit of `currency` is
+///   `rate_micros` display micro-units; `rate_date` is null for the display currency itself),
+///   and `display_micros` the reserved amount in `display_currency`. `allowed_by` is the
+///   confirmation that let it pass a cap once. `state` is `held` until it is `settled` (at
+///   `settled_micros`, display) or `released`; `kept` marks a held reservation whose call left a
+///   pending usage line at a crash (it stays held).
+/// - `cap_settled`: this machine's settled totals per period, cap (`monthly` for all money,
+///   `provider:<id>` per provider) and display currency.
+/// - `cap_alerts`: the alert levels already raised per period and cap (CORE-089).
+const CAPS: &str = "CREATE TABLE cap_reservations (
+    id TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    period TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    rate_micros INTEGER NOT NULL,
+    rate_date TEXT,
+    display_currency TEXT NOT NULL,
+    display_micros INTEGER NOT NULL,
+    allowed_by TEXT,
+    state TEXT NOT NULL CHECK (state IN ('held','settled','released')),
+    settled_micros INTEGER,
+    kept INTEGER NOT NULL DEFAULT 0,
+    created_ms INTEGER NOT NULL,
+    ended_ms INTEGER
+);
+CREATE INDEX cap_reservations_held ON cap_reservations(state, period);
+CREATE TABLE cap_settled (
+    period TEXT NOT NULL,
+    cap TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    settled_micros INTEGER NOT NULL,
+    PRIMARY KEY (period, cap, currency)
+);
+CREATE TABLE cap_alerts (
+    period TEXT NOT NULL,
+    cap TEXT NOT NULL,
+    threshold_pct INTEGER NOT NULL,
+    alerted_ms INTEGER NOT NULL,
+    PRIMARY KEY (period, cap, threshold_pct)
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -125,11 +242,21 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     JOBS,
     COMFY_CACHE,
     OUTSIDE_PAID,
+    CONFIRMATIONS,
+    USAGE_PENDING,
+    CAPS,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
-pub const WORKSPACE_MIGRATIONS: &[&str] =
-    &[IDEMPOTENCY_V1, IDEMPOTENCY_PRUNE_V2, GENERATED_V3, JOBS];
+pub const WORKSPACE_MIGRATIONS: &[&str] = &[
+    IDEMPOTENCY_V1,
+    IDEMPOTENCY_PRUNE_V2,
+    GENERATED_V3,
+    JOBS,
+    CONFIRMATIONS,
+    HOLDS,
+    USAGE_PENDING,
+];
 
 #[cfg(test)]
 mod tests {
@@ -201,8 +328,43 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 5);
-        assert_eq!(WORKSPACE_MIGRATIONS.len(), 4);
+        assert_eq!(SUITE_MIGRATIONS.len(), 8);
+        assert_eq!(WORKSPACE_MIGRATIONS.len(), 7);
+        assert_eq!(WORKSPACE_MIGRATIONS[5], HOLDS, "appended, never inserted");
+        assert_eq!(
+            SUITE_MIGRATIONS[6], USAGE_PENDING,
+            "appended, never inserted"
+        );
+        assert_eq!(
+            WORKSPACE_MIGRATIONS[6], USAGE_PENDING,
+            "appended, never inserted"
+        );
+        assert_eq!(SUITE_MIGRATIONS[7], CAPS, "appended, never inserted");
+    }
+
+    #[test] // spec: CORE-115, ARCH-053
+    fn both_scopes_hold_confirmations_with_one_pending_per_key() {
+        for (list, at) in [(SUITE_MIGRATIONS, 5), (WORKSPACE_MIGRATIONS, 4)] {
+            assert_eq!(list[at], CONFIRMATIONS, "appended, never inserted");
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            for m in list {
+                db.execute_batch(m).unwrap();
+            }
+            let insert = |id: &str, state: &str| {
+                db.execute(
+                    "INSERT INTO confirmations (id, scope, idem_key, tool, args_hash, arguments,
+                         caller_kind, covers, state, created_utc, expires_utc, session_id)
+                     VALUES (?1, 'cli|none', 'k', 't', 'h', '{}', 'cli', '[\"confirm\"]', ?2,
+                         0, 1800, 's_1')",
+                    rusqlite::params![id, state],
+                )
+            };
+            insert("cf_1", "pending").unwrap();
+            assert!(insert("cf_2", "pending").is_err(), "one pending per key");
+            insert("cf_3", "denied").unwrap();
+            insert("cf_4", "expired").unwrap();
+            assert!(insert("cf_5", "maybe").is_err(), "the state CHECK");
+        }
     }
 
     #[test] // spec: CORE-117, ARCH-099

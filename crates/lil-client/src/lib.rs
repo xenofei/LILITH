@@ -149,6 +149,42 @@ impl ClientConfig {
         self.workspace = ws.id;
         self.workspace_origin = ws.origin;
     }
+
+    /// `lil-mcp`'s configuration: [`ClientConfig::for_env`] for this process's channel
+    /// (`Env::from_process`) as an `mcp` caller, naming the workspace the `mcp` chain finds
+    /// from `cwd`, the folder Claude Code started the server in (ARCH-030): the workspace
+    /// containing it, else the default workspace in `suite.toml`. When that chain fails (an
+    /// unreadable `suite.toml`, a default workspace whose folder is gone), the session has no
+    /// workspace, and the second value says why, for the caller to report. On a test channel,
+    /// `protocol` may come from `LIL_TEST_CLIENT_PROTOCOL`.
+    ///
+    /// # Errors
+    /// [`ClientError::Io`] when this process's channel folders or executable folder cannot be
+    /// found.
+    pub fn for_mcp(
+        cwd: &std::path::Path,
+    ) -> Result<(ClientConfig, Option<ClientError>), ClientError> {
+        let env = Env::from_process().map_err(|e| {
+            ClientError::Io(io::Error::other(format!(
+                "Cannot tell which LILITH folders to use: {e}"
+            )))
+        })?;
+        let mut cfg = ClientConfig::for_env(env, CallerKind::Mcp).map_err(ClientError::Io)?;
+        match resolve_workspace(&cfg.env, None, cwd) {
+            Ok(ws) => {
+                cfg.set_workspace(ws);
+                Ok((cfg, None))
+            }
+            Err(e) => Ok((cfg, Some(e))),
+        }
+    }
+}
+
+/// A fresh id `<prefix>_<16 hex>`: `ik` for an idempotency key, `t` for a trace id. The keys
+/// [`Client::call_tool`] mints are these.
+pub fn mint_id(prefix: &str) -> String {
+    use lil_platform::IdSource as _;
+    lil_platform::RandomIds.id(prefix)
 }
 
 /// Why a core this client started could not start, from its exit code.

@@ -1528,24 +1528,27 @@ async fn agents_never_retry_interrupted_external_jobs() {
             .await
             .unwrap();
     }
-    for (id, code) in [
-        (&paid.job_id, "confirm.unavailable"),
-        // Retried by no one until it is resolved.
-        (&unknown.job_id, "job.not_retryable"),
-    ] {
-        let refused = rig
-            .jobs
-            .retry_origin(&rig.caller(), &JobId(id.clone()))
-            .await
-            .unwrap_err();
-        assert_eq!(refused.code, code, "{id}: {refused:?}");
-    }
-    assert!(
-        rig.jobs
-            .retry_origin(&rig.caller(), &JobId(local.job_id.clone()))
-            .await
-            .is_ok()
-    );
+    // Retried by no one until it is resolved.
+    let refused = rig
+        .jobs
+        .retry_origin(&rig.caller(), &JobId(unknown.job_id.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "job.not_retryable", "{refused:?}");
+    // An agent's retry of paid work that may have run is flagged, so the dispatcher makes it
+    // `pending_confirmation` (Task 14); a local job's is not.
+    let flagged = rig
+        .jobs
+        .retry_origin(&rig.caller(), &JobId(paid.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(flagged.interrupted_with_side_effects);
+    let plain = rig
+        .jobs
+        .retry_origin(&rig.caller(), &JobId(local.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(!plain.interrupted_with_side_effects);
     // You may retry it from the app.
     let app = rig.caller_as(CallerKind::Ui("image".into()));
     assert!(
@@ -1875,4 +1878,67 @@ async fn a_silence_past_30_seconds_is_not_a_lost_prompt() {
     assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
     assert_eq!(posted(&fake).len(), 1);
     assert!(rig.all_jobs().await.iter().all(|j| j.retry_of.is_none()));
+}
+
+/// Job progress (CORE-117) from a node that reports steps: from ComfyUI's `progress` events,
+/// and, for a ComfyUI that sends only its newer `progress_state` aggregate, from the
+/// `running` node there. Either way the summary ends at the sampler's last step and the
+/// `job:<id>` topic carries each step once, never the same progress twice in a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-117, CORE-130
+async fn job_progress_comes_from_progress_or_progress_state() {
+    for only_state in [false, true] {
+        let env = TestEnv::new();
+        let fake = FakeComfy::start();
+        attach(&env, &fake);
+        fake.only_progress_state(only_state);
+        fake.hold_prompts(true);
+        let rig = Rig::new(&env);
+        let mut graph = tiny(1);
+        graph["3"] = json!({"class_type": "KSampler", "inputs": {"steps": 3, "seed": 1}});
+        let id = rig.submit(json!({"graph": graph}), Priority::Agent).await;
+        let held = rig
+            .until(&id, "the sampler's last step", |j| {
+                j.progress
+                    .as_ref()
+                    .is_some_and(|p| p.node.as_deref() == Some("3") && p.value == 3)
+            })
+            .await;
+        let progress = held.progress.unwrap();
+        assert_eq!(
+            (progress.value, progress.max),
+            (3, 3),
+            "{only_state}: {progress:?}"
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        rig.events.attach(1, tx);
+        let since = BTreeMap::from([(format!("job:{id}"), 0)]);
+        rig.events
+            .subscribe(1, &[format!("job:{id}")], &since)
+            .await;
+        let mut steps: Vec<(u64, u64, String)> = Vec::new();
+        while steps.last().is_none_or(|s| *s != (3, 3, "3".to_string())) {
+            let line = tokio::time::timeout(DEADLINE, rx.recv())
+                .await
+                .expect("the progress events")
+                .unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            let d = &v["params"]["data"];
+            if v["params"]["kind"] == "event" && d["kind"] == "progress" {
+                steps.push((
+                    d["value"].as_u64().unwrap(),
+                    d["max"].as_u64().unwrap(),
+                    d["node"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+        let sampler: Vec<u64> = steps.iter().filter(|s| s.2 == "3").map(|s| s.0).collect();
+        assert_eq!(sampler, [0, 1, 2, 3], "{only_state}: {steps:?}");
+        assert!(
+            steps.windows(2).all(|w| w[0] != w[1]),
+            "{only_state}: a step reported twice: {steps:?}"
+        );
+        fake.hold_prompts(false);
+        assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    }
 }

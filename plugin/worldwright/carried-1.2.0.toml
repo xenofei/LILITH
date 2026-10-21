@@ -1,0 +1,60 @@
+# The files carried from plugin 1.2.0 (owner question 2), one entry per file, with the
+# SHA-256 of the copy committed here. The 1.2.0 sources had LF line ends, and each copy is byte
+# for byte its source, except skills/manifest/SKILL.md, whose example hardware and author were
+# replaced by placeholders before publishing (the Task 20 copy list records each change).
+
+[[file]]
+path = "skills/engines/SKILL.md"
+sha256 = "0864a2268bb3e9c4ad1fbcfd971018bac990215d73a4c4e09c8aca7498dbfe06"
+
+[[file]]
+path = "skills/hubs/SKILL.md"
+sha256 = "5cfb841dae476a7c770b0375b14dbc7d0a76f9c58b803dfb0ecfd6f083765f88"
+
+[[file]]
+path = "skills/manifest/SKILL.md"
+sha256 = "a9d30aec696c3370ff654edde106cef6b250cd136092ecb4f49c708119e61958"
+
+[[file]]
+path = "skills/models/SKILL.md"
+sha256 = "72788bb1969378845bfed97d68ea247e1c05b2f948b89fab87c58eeb6d945e39"
+
+[[file]]
+path = "skills/production/SKILL.md"
+sha256 = "2319815aee0a833f53ef5b58cbc56fa8457517ad56efe75dc77b6a8cbd1b7318"
+
+[[file]]
+path = "skills/repair/SKILL.md"
+sha256 = "9123478d1bc73aeee895ea7575de5d50e6ade5b2957209601ba65a74c9219832"
+
+[[file]]
+path = "skills/routing/SKILL.md"
+sha256 = "53ac15f09e6fbf3acd72a495c9910e826023c57354d39c93d86d60676ffa2875"
+
+[[file]]
+path = "skills/toolmap/SKILL.md"
+sha256 = "11768cd0552d4a2ac5befb68b05f4fc7e5a2620aa64fc019cbbc6aad506bdb83"
+
+[[file]]
+path = "skills/vtuber/SKILL.md"
+sha256 = "ec9e9039a2237cc0510d3045dec6dcf2f3534428f6a078249852d1abafc47511"
+
+[[file]]
+path = "agents/asset-qa.md"
+sha256 = "108caa2f5a7abbc9dba14d34c79940a9181cdab1385e583cc4a35266fe28c7b8"
+
+[[file]]
+path = "agents/audio-engineer.md"
+sha256 = "ad6ac5d4c2c84546a46ad1d959df251d1fd6b535119f072b150d67b426f3da3c"
+
+[[file]]
+path = "agents/avatar-rigger.md"
+sha256 = "707f777b762f63a7d98d0965ec7a3f5649973855bc94041d2b1fef6d6da2ec02"
+
+[[file]]
+path = "agents/model-scout.md"
+sha256 = "479b8ac82e68808bd1f708c517c9406384aa0e6f990ec506b238034f06ef8e51"
+
+[[file]]
+path = "agents/pipeline-engineer.md"
+sha256 = "012f409e416b329cc925ca70749449556c15b5e439e00317b714fbee7a2bbfc5"

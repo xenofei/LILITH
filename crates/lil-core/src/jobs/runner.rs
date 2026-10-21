@@ -150,6 +150,8 @@ struct Info {
     reservation: Option<String>,
     retry_of: Option<String>,
     origin: Option<JobOrigin>,
+    /// The row's `idem_scope` (an automatic re-run keeps it).
+    idem_scope: Option<String>,
     /// The execution windows its attempts reported (`JobCtx::add_window`), shared by every
     /// attempt and its completions.
     windows: Arc<Mutex<Vec<ExecWindow>>>,
@@ -215,6 +217,9 @@ pub(crate) struct Shared {
     handlers: RwLock<HashMap<&'static str, Arc<dyn JobHandler>>>,
     admission: RwLock<Arc<dyn Admission>>,
     completions: RwLock<Vec<Arc<dyn JobCompletion>>>,
+    /// The execution windows of the jobs that ended `interrupted_unknown` in this core run,
+    /// for their completions when you resolve them (after a restart they are gone).
+    unknown_windows: Mutex<HashMap<String, Arc<Mutex<Vec<ExecWindow>>>>>,
     reservations: RwLock<Arc<dyn Reservations>>,
     /// The lifecycle's drain token ([`Jobs::stop_on_drain`]).
     drain: RwLock<Option<CancellationToken>>,
@@ -351,6 +356,9 @@ struct NewJob {
     trace_id: String,
     /// The idempotency scope and key.
     idem: Option<(String, String)>,
+    /// The submitting caller's `<caller kind>|<workspace id or none>`, kept on the row even
+    /// without a key (the meter's `caller_kind`, CORE-069).
+    caller_scope: Option<String>,
     reservation: Option<String>,
     /// Whose reservation it is: the call id, or the job a re-run replaces.
     owner: String,
@@ -553,8 +561,9 @@ impl Shared {
     }
 
     /// The recovery of one scope (ARCH-022): every row without a final status that this core
-    /// isn't running becomes `interrupted`, or `interrupted_unknown` when it was `submitting`
-    /// with external side effects. A row already `interrupted_unknown` stays as it is. The
+    /// isn't running becomes `interrupted`, or `interrupted_unknown` when it has external side
+    /// effects and its work may have happened ([`interrupt_change`], rulings P3-R21 and
+    /// P3-R29). A row already `interrupted_unknown` stays as it is. The
     /// completions of a job that never started run with a [`super::never_started`] outcome
     /// (its reservation is released); one that had started keeps its reservation.
     async fn recover_rows(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
@@ -621,6 +630,7 @@ impl Shared {
             reservation: row.reservation.clone(),
             retry_of: row.retry_of.clone(),
             origin: row.origin.clone(),
+            idem_scope: row.idem_scope.clone(),
             windows: Arc::default(),
         };
         self.enqueue(info, false)
@@ -654,6 +664,7 @@ impl Shared {
             spec,
             trace_id,
             idem,
+            caller_scope,
             reservation,
             owner,
             retry_of,
@@ -680,7 +691,8 @@ impl Shared {
         let hash = args_hash(&json!({"kind": spec.kind, "args": spec.args}));
         let now = self.now();
         let id = self.ids.id("j");
-        let (idem_scope, idem_key) = idem.unzip();
+        let (key_scope, idem_key) = idem.unzip();
+        let idem_scope = key_scope.or(caller_scope);
         let row = JobRow {
             seq: 0,
             job_id: id.clone(),
@@ -759,6 +771,7 @@ impl Shared {
             reservation,
             retry_of,
             origin,
+            idem_scope: row.idem_scope.clone(),
             windows: Arc::default(),
         };
         self.enqueue(info, true);
@@ -1299,7 +1312,9 @@ impl Shared {
                 error: cancelled_error(&info.trace_id),
             },
         };
-        if !matches!(end, End::Unknown(_)) {
+        if matches!(end, End::Unknown(_)) {
+            lock(&self.unknown_windows).insert(id.to_string(), info.windows.clone());
+        } else {
             let done = match &end {
                 End::Succeeded(done) => Some(done),
                 _ => None,
@@ -1375,6 +1390,7 @@ impl Shared {
                 spec: info.spec.clone(),
                 trace_id: info.trace_id.clone(),
                 idem: None,
+                caller_scope: info.idem_scope.clone(),
                 reservation: info.reservation.clone(),
                 owner: id.to_string(),
                 retry_of: Some(id.to_string()),
@@ -1674,13 +1690,21 @@ fn never_ran(substatus: Option<Substatus>) -> bool {
 }
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
-/// A job with external side effects whose prompt may be in its engine (it was `submitting`,
-/// or its row holds an engine id: a recovery that couldn't take it up, an adopted job waiting
-/// for its turn) is `interrupted_unknown`, never plain `interrupted` (ruling P3-R21, Task 12
-/// re-review N4). Either way the row gets [`stopped_error`] in place of any earlier attempt's
-/// error.
+/// A job with external side effects whose work may have happened is `interrupted_unknown`,
+/// never plain `interrupted`: it was `submitting`, `executing`, `ingesting` or `cancelling` (an
+/// engine job or not, ruling P3-R29), or its row holds an engine id (a recovery that couldn't take it up, an
+/// adopted job waiting for its turn; ruling P3-R21, Task 12 re-review N4). Either way the row
+/// gets [`stopped_error`] in place of any earlier attempt's error.
 fn interrupt_change(row: &JobRow, now: i64) -> Change {
-    let maybe_sent = row.substatus == Some(Substatus::Submitting) || row.external_id.is_some();
+    let maybe_sent = matches!(
+        row.substatus,
+        Some(
+            Substatus::Submitting
+                | Substatus::Executing
+                | Substatus::Ingesting
+                | Substatus::Cancelling
+        )
+    ) || row.external_id.is_some();
     if row.external_side_effects && maybe_sent {
         let mut c = Change::to(Substatus::InterruptedUnknown);
         c.error = Some(Some(stopped_error(row, RetryHow::Resolve)));
@@ -1714,6 +1738,7 @@ impl Jobs {
             handlers: RwLock::new(HashMap::new()),
             admission: RwLock::new(Arc::new(AlwaysAdmit)),
             completions: RwLock::new(Vec::new()),
+            unknown_windows: Mutex::new(HashMap::new()),
             reservations: RwLock::new(Arc::new(NoReservations)),
             drain: RwLock::new(None),
             preempt: AtomicBool::new(false),
@@ -1825,6 +1850,7 @@ impl Jobs {
                 .idem_key
                 .as_ref()
                 .map(|key| (caller.idem_scope.clone(), key.clone())),
+            caller_scope: Some(caller.idem_scope.clone()),
             reservation: caller.reservation.clone(),
             owner: caller.call_id.clone(),
             retry_of: caller.retry_of.as_ref().map(|j| j.0.clone()),
@@ -2055,9 +2081,13 @@ impl Jobs {
         c.finished_utc = Some(s.now());
         let resolved = s.apply(&row.job_id, scope, c, None).await;
         if resolved.is_some()
-            && let Some(ctx) = s.ctx_from_row(&row, scope)
+            && let Some(mut ctx) = s.ctx_from_row(&row, scope)
         {
             tracing::info!(job_id = %row.job_id, "an interrupted_unknown job is resolved: cancelled");
+            // The windows it reported, when this core run saw them.
+            if let Some(windows) = lock(&s.unknown_windows).remove(&row.job_id) {
+                ctx.windows = windows;
+            }
             let error = ErrorBody::new(
                 &RESOLVED_UNKNOWN,
                 "You resolved the job, which may or may not have run.",
@@ -2106,22 +2136,10 @@ impl Jobs {
                     .map_or_else(|| row.status.wire().to_string(), |s| s.wire())
             )));
         }
-        // Ruling P3-R21: paid or hosted work that may have run is never retried by an agent on
-        // its own (Task 14 turns this into a confirmation). An `interrupted_unknown` job is retried
-        // by no one (above): it is resolved first.
-        if caller.caller.is_agent()
-            && row.external_side_effects
-            && row.substatus == Some(Substatus::Interrupted)
-        {
-            return Err(ErrorBody::new(
-                &codes::CONFIRM_UNAVAILABLE,
-                format!(
-                    "Job {id} has external side effects and may have run (and been charged); \
-                     only you can retry it, from the app."
-                ),
-                trace_id.clone(),
-            ));
-        }
+        // Ruling P3-R21: an agent's retry of paid or hosted work that may have run
+        // (`interrupted_with_side_effects` below) needs your confirmation; the dispatcher makes
+        // it `pending_confirmation`. An `interrupted_unknown` job is retried by no one (above):
+        // it is resolved first.
         if caller.caller.is_agent()
             && let Some(rerun) = record::auto_rerun_of(scope.db(), id.as_str())
                 .await
@@ -2141,6 +2159,8 @@ impl Jobs {
         Ok(RetryPlan {
             origin,
             project: row.project,
+            interrupted_with_side_effects: row.external_side_effects
+                && row.substatus == Some(Substatus::Interrupted),
         })
     }
 

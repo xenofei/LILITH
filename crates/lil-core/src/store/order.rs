@@ -190,7 +190,8 @@ impl Store {
     /// # Errors
     /// `workspace.read_only` on a read-only store; `store.git_busy` when git is still working
     /// after 60 s; `store.path_invalid` for an output that isn't in a staging handle, a target
-    /// the store never writes, or one under a linked folder; `store.hash_conflict` when a file
+    /// the store never writes, or one under a linked folder; `store.locked` for a target a
+    /// manifest `locks` entry covers (nothing has moved then); `store.hash_conflict` when a file
     /// is already at an output's target; any error of steps 1 and 2. An error after step 1
     /// leaves the outputs in place (orphans until the manifest records them).
     pub async fn commit(&self, op: CommitOp) -> Result<CommitReport, StoreError> {
@@ -209,7 +210,8 @@ impl Store {
             self.git_gate().wait_clear(GIT_WAIT).await?;
         }
         let staging = self.staging_root();
-        let mut outputs = Vec::with_capacity(op.outputs.len());
+        // Every target is checked before any output moves: a manifest lock (CORE-035) refuses
+        // the commit as it refuses a write, by the path and by its long form.
         for out in &op.outputs {
             if !out.from.starts_with(&staging) || out.from == staging {
                 return Err(StoreError::PathInvalid {
@@ -218,7 +220,12 @@ impl Store {
                 });
             }
             writable(&out.to)?;
-            self.writable_on_disk(&out.to).await?;
+            self.check_locks(&out.to).await?;
+            let long = self.writable_on_disk(&out.to).await?;
+            self.check_long_locks(&out.to, &long).await?;
+        }
+        let mut outputs = Vec::with_capacity(op.outputs.len());
+        for out in &op.outputs {
             // The move checks only its target: a linked folder above it is refused here.
             self.refuse_links(&out.to).await?;
             let _held = self.lock_path(&out.to).await;

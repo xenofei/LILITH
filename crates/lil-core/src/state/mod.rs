@@ -35,6 +35,8 @@
 //! connection that never migrates the file or releases a row. When there is no `state.db` on
 //! disk yet (another channel's local folder), a read-only open gets an in-memory database with
 //! the migrations applied, and nothing is created on disk.
+//! A workspace database also empties its `hold_markers` on that open (APP-104: holds live in
+//! memory, so none outlives its core).
 //! `done` rows older than 30 days are pruned by `idem_begin`, against the caller's `now`: the
 //! same clock that stamped the rows.
 //!
@@ -63,7 +65,8 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::store::fsops;
 use crate::store::paths::path_key;
-use crate::workspace::{Access, WorkspaceRef};
+pub use crate::store::{Access, Pending};
+use crate::store::{RowsFuture, StoreRows};
 
 /// Called once when a database actor dies, with `"state"`.
 pub type OnFatal = Arc<dyn Fn(&str) + Send + Sync>;
@@ -154,16 +157,82 @@ fn sql_error(e: &rusqlite::Error) -> StateError {
 pub const PRUNE_DONE_SQL: &str =
     "DELETE FROM idempotency WHERE state = 'done' AND created_utc < ?1";
 
-/// A pending replace of the store (write step 5, ARCH-074): the hash the target had when it was
-/// checked (`None` for a new target) and the hash of the bytes going in. While the row exists
-/// either version is the core's own.
+/// The confirmations' part of that prune: answered, expired and cancelled confirmations
+/// created before `?1` (the `confirmations_state` index serves it).
+pub const PRUNE_CONFIRMATIONS_SQL: &str =
+    "DELETE FROM confirmations WHERE state <> 'pending' AND created_utc < ?1";
+
+/// A resolved workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pending {
-    /// Workspace-relative, `/` separators.
+pub struct WorkspaceRef {
+    /// 16 lowercase hex: the hash of the canonical path.
+    pub id: String,
+    /// The canonical path, without a `\\?\` prefix.
+    pub path: PathBuf,
+}
+
+/// The store's rows in a workspace `state.db` (the store defines the trait, so it names no
+/// `state` type: CORE-010).
+impl StoreRows for StateDb {
+    fn pending<'a>(&'a self, path: &'a str) -> RowsFuture<'a, Option<Pending>> {
+        Box::pin(async move {
+            StateDb::pending(self, path)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn pendings(&self) -> RowsFuture<'_, Vec<Pending>> {
+        Box::pin(async move { StateDb::pendings(self).await.map_err(|e| e.to_string()) })
+    }
+
+    fn set_pending<'a>(&'a self, p: &'a Pending) -> RowsFuture<'a, ()> {
+        Box::pin(async move {
+            StateDb::set_pending(self, p)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn finish_pending<'a>(
+        &'a self,
+        path: &'a str,
+        generated: Option<(&'a str, i64)>,
+    ) -> RowsFuture<'a, ()> {
+        Box::pin(async move {
+            StateDb::finish_pending(self, path, generated)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn generated<'a>(&'a self, path: &'a str) -> RowsFuture<'a, Option<String>> {
+        Box::pin(async move {
+            StateDb::generated(self, path)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn set_generated<'a>(&'a self, path: &'a str, sha256: &'a str, utc: i64) -> RowsFuture<'a, ()> {
+        Box::pin(async move {
+            StateDb::set_generated(self, path, sha256, utc)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// A row of `hold_markers` (APP-104): `doc_id` was held by `holder` since `since_utc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldMarker {
+    pub doc_id: String,
     pub path: String,
-    pub old_sha256: Option<String>,
-    pub new_sha256: String,
-    pub started_utc: i64,
+    /// The app (`ui:<app>`) or `core`.
+    pub holder: String,
+    pub since_utc: i64,
+    /// Tells this hold's row from a later hold's on the same document.
+    pub token: u64,
 }
 
 fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
@@ -256,7 +325,7 @@ impl StateDb {
         }
         let mut conn = open_read_write(path)?;
         let schema_version = migrate(&mut conn, migrations).map_err(Migrate::into_state)?;
-        release_running(&mut conn).map_err(|e| sql_error(&e))?;
+        release_running(&mut conn, scope).map_err(|e| sql_error(&e))?;
         StateDb::start(
             conn,
             path.to_path_buf(),
@@ -416,7 +485,8 @@ impl StateDb {
     /// [`IdemBegin::InProgress`]; another hash → [`IdemBegin::Conflict`].
     ///
     /// First, in the same transaction, `done` rows created more than 30 days before
-    /// `now_utc_secs` are pruned, so rows and pruning use the caller's clock.
+    /// `now_utc_secs` are pruned, so rows and pruning use the caller's clock, and so are the
+    /// confirmations of that age that are no longer pending (their history).
     pub async fn idem_begin(
         &self,
         scope_key: &str,
@@ -469,6 +539,38 @@ impl StateDb {
                 }
                 _ => Ok(()),
             }
+        })
+        .await
+    }
+
+    /// Takes the `done` row `(scope_key, key)` back for another run (CORE-091, Appendix F: a
+    /// retry with the token of an answered confirmation): when its arguments hash is
+    /// `args_hash` and its stored outcome is a `pending_confirmation`, the row becomes
+    /// `running` again, with no outcome, and this returns `true`. Anything else (no such row,
+    /// another hash, a row already taken back by a concurrent retry, any other outcome) changes
+    /// nothing and returns `false`. One statement, so of two concurrent retries exactly one
+    /// gets the row. The caller then finishes it like a fresh claim (`idem_finish`).
+    pub async fn idem_reclaim(
+        &self,
+        scope_key: &str,
+        key: &str,
+        args_hash: &str,
+    ) -> Result<bool, StateError> {
+        let (scope_key, key, args_hash) = (
+            scope_key.to_string(),
+            key.to_string(),
+            args_hash.to_string(),
+        );
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE idempotency SET state = 'running', outcome = NULL
+                 WHERE scope = ?1 AND key = ?2 AND args_hash = ?3 AND state = 'done'
+                   AND json_valid(outcome)
+                   AND json_extract(outcome, '$.status') = 'pending_confirmation'",
+                params![scope_key, key, args_hash],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|e| sql_error(&e))
         })
         .await
     }
@@ -588,6 +690,66 @@ impl StateDb {
                 tx.commit()
             };
             run().map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Records that `m.doc_id` is held (replacing an earlier marker of the document).
+    pub async fn set_hold_marker(&self, m: &HoldMarker) -> Result<(), StateError> {
+        let m = m.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO hold_markers (doc_id, path, holder, since_utc, token)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    m.doc_id,
+                    m.path,
+                    m.holder,
+                    m.since_utc,
+                    i64::try_from(m.token).unwrap_or(i64::MAX)
+                ],
+            )
+            .map(drop)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Removes the marker of `doc_id` if it is hold `token`'s: the marker of a later hold on
+    /// the same document stays.
+    pub async fn clear_hold_marker(&self, doc_id: &str, token: u64) -> Result<(), StateError> {
+        let doc_id = doc_id.to_string();
+        let token = i64::try_from(token).unwrap_or(i64::MAX);
+        self.call(move |conn| {
+            conn.execute(
+                "DELETE FROM hold_markers WHERE doc_id = ?1 AND token = ?2",
+                params![doc_id, token],
+            )
+            .map(drop)
+            .map_err(|e| sql_error(&e))
+        })
+        .await
+    }
+
+    /// Every hold marker, by document id.
+    pub async fn hold_markers(&self) -> Result<Vec<HoldMarker>, StateError> {
+        self.call(|conn| {
+            let read = || -> rusqlite::Result<Vec<HoldMarker>> {
+                conn.prepare(
+                    "SELECT doc_id, path, holder, since_utc, token FROM hold_markers ORDER BY doc_id",
+                )?
+                .query_map([], |r| {
+                    Ok(HoldMarker {
+                        doc_id: r.get(0)?,
+                        path: r.get(1)?,
+                        holder: r.get(2)?,
+                        since_utc: r.get(3)?,
+                        token: u64::try_from(r.get::<_, i64>(4)?).unwrap_or_default(),
+                    })
+                })?
+                .collect()
+            };
+            read().map_err(|e| sql_error(&e))
         })
         .await
     }
@@ -780,14 +942,22 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<i64, Migrate> {
     }
 }
 
-/// Deletes the `running` rows of calls that died with an earlier core.
-fn release_running(conn: &mut Connection) -> rusqlite::Result<()> {
+/// Deletes the `running` rows of calls that died with an earlier core and, in a workspace
+/// database, the hold markers of its holds (APP-104: holds live in memory, so none outlives
+/// its core).
+fn release_running(conn: &mut Connection, scope: StateScope) -> rusqlite::Result<()> {
     let released = conn.execute("DELETE FROM idempotency WHERE state = 'running'", [])?;
     if released > 0 {
         tracing::info!(
             released,
             "running idempotency rows of an earlier core released"
         );
+    }
+    if scope == StateScope::Workspace {
+        let cleared = conn.execute("DELETE FROM hold_markers", [])?;
+        if cleared > 0 {
+            tracing::info!(cleared, "hold markers of an earlier core cleared");
+        }
     }
     Ok(())
 }
@@ -806,6 +976,14 @@ fn idem_begin(
     )?;
     if pruned > 0 {
         tracing::info!(pruned, "idempotency rows older than 30 days pruned");
+    }
+    // The confirmations' history goes with them; a pending one is kept (it expires first).
+    let pruned = tx.execute(
+        PRUNE_CONFIRMATIONS_SQL,
+        params![now_utc_secs.saturating_sub(DONE_KEPT_SECS)],
+    )?;
+    if pruned > 0 {
+        tracing::info!(pruned, "confirmations older than 30 days pruned");
     }
     let row: Option<(String, String, Option<String>)> = tx
         .query_row(
@@ -972,6 +1150,37 @@ impl StateRegistry {
             return Err(StateError::ActorGone);
         }
         Ok(db.clone())
+    }
+
+    /// The read-write database of the workspace `id`, if it is open (a call in the workspace
+    /// opened it): the confirmations of that scope live there.
+    pub fn workspace_db(&self, id: &str) -> Option<Arc<StateDb>> {
+        let workspaces = lock(&self.workspaces);
+        if workspaces.closed {
+            return None;
+        }
+        workspaces
+            .cells
+            .get(&(id.to_string(), Access::ReadWrite))
+            .and_then(|cell| cell.get().cloned())
+    }
+
+    /// The writable databases open now: the suite one and each read-write workspace one,
+    /// with the workspace id (`"none"` for the suite).
+    pub fn writable_dbs(&self) -> Vec<(String, Arc<StateDb>)> {
+        let mut dbs = vec![(lil_protocol::NO_WORKSPACE.to_string(), self.suite.clone())];
+        let workspaces = lock(&self.workspaces);
+        if workspaces.closed {
+            return dbs;
+        }
+        for ((id, access), cell) in &workspaces.cells {
+            if *access == Access::ReadWrite
+                && let Some(db) = cell.get()
+            {
+                dbs.push((id.clone(), db.clone()));
+            }
+        }
+        dbs
     }
 
     /// Closes the databases of the workspace `id` (each access), after their queued jobs, and
