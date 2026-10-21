@@ -5,7 +5,7 @@
   "author": {
     "name": "LILITH"
   },
-  "license": "GPL-3.0-or-later",
+  "license": "AGPL-3.0-or-later",
   "userConfig": {
     "lil_mcp_path": {
       "type": "file",
