@@ -491,6 +491,22 @@ pub async fn auto_rerun_of(db: &StateDb, job_id: &str) -> Result<Option<String>,
     .await
 }
 
+/// The newest row whose `reservation` is `rv` (a job that holds a call's cap reservation, also
+/// when the hand-over to it failed; an automatic re-run is newer than the job it re-runs).
+pub async fn holding(db: &StateDb, rv: &str) -> Result<Option<JobRow>, StateError> {
+    let rv = rv.to_string();
+    db.call(move |conn| {
+        conn.query_row(
+            &format!("SELECT {COLUMNS} FROM jobs WHERE reservation = ?1 ORDER BY seq DESC LIMIT 1"),
+            params![rv],
+            row,
+        )
+        .optional()
+        .map_err(|e| sql(&e))
+    })
+    .await
+}
+
 /// The rows without a final status (recovery), by `seq`.
 pub async fn open_rows(db: &StateDb) -> Result<Vec<JobRow>, StateError> {
     db.call(|conn| {

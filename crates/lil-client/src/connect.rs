@@ -132,6 +132,12 @@ impl Client {
         &self.hello
     }
 
+    /// Whether the connection has closed: every later call is [`ClientError::Closed`], and a
+    /// new [`Client::connect`] is needed (it starts a core if none runs).
+    pub fn is_closed(&self) -> bool {
+        self.conn.is_closed()
+    }
+
     /// `tools/call`. Without `key`, a fresh idempotency key `ik_<16 hex>` is minted
     /// (ARCH-110: `lil-client` owns idempotency keys), so the call runs once; pass the same key
     /// again to retry it. A tool's failure is an error [`Outcome`], not a [`ClientError`].
@@ -152,6 +158,19 @@ impl Client {
             .call(method::TOOLS_CALL, to_value(&params))
             .await?;
         decode(result, method::TOOLS_CALL)
+    }
+
+    /// `app/confirmations.list` (APP-043): the confirmations in `state`, newest first. A `cli`
+    /// session may call it too (read-only); it needs `confirmations.v1` in the shared
+    /// capabilities, which this client offers.
+    pub async fn confirmations(
+        &self,
+        state: lil_protocol::app::ListWhich,
+    ) -> Result<Outcome<lil_protocol::app::ConfirmationsListResult>, ClientError> {
+        let params = lil_protocol::app::ConfirmationsListParams { state, limit: None };
+        let method = lil_protocol::app::CONFIRMATIONS_LIST;
+        let result = self.conn.call(method, to_value(&params)).await?;
+        decode(result, method)
     }
 
     /// `tools/list`: the tools this session may see.

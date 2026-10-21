@@ -20,6 +20,9 @@
 //! `LIL_TEST_FAKE_SOCKETS` naming that file then sees that listener on `0.0.0.0`
 //! (`lil_core::config::ScriptedSockets`).
 //!
+//! With a `fake-silent` file in the working folder it writes `<cwd>ake-comfyui.json` and then
+//! waits forever without listening, as a ComfyUI that hangs while it starts.
+//!
 //! Once listening, the listening process prints `To see the GUI go to: http://<ip>:<port>` on
 //! stdout, as ComfyUI does, and keeps the requests it received in
 //! `<cwd>\fake-comfyui-requests.json`: a JSON array of `{method, path, body}`, rewritten whole
@@ -119,6 +122,13 @@ fn main() {
             .status()
             .unwrap_or_else(|e| fail(&format!("cannot start the child: {e}")));
         std::process::exit(status.code().unwrap_or(1));
+    }
+
+    if cwd.join("fake-silent").exists() {
+        record(&cwd.join("fake-comfyui.json"), &[]);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
     }
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);

@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use lil_platform::{
-    Channel, ENV_CHANNEL, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env, RealLocations, Roots,
-    TEST_PIPE_SID, arm_test_guard, names,
+    Channel, ENV_CHANNEL, ENV_TEST_DOCTOR_STDIN, ENV_TEST_PARENT_PID, ENV_TEST_ROOT, Env,
+    RealLocations, Roots, TEST_PIPE_SID, arm_test_guard, names,
 };
 
 use crate::bins::ensure_built;
@@ -130,6 +130,9 @@ impl TestEnv {
                 OsString::from(ENV_TEST_PARENT_PID),
                 OsString::from(std::process::id().to_string()),
             ),
+            // Tests answer `lil doctor` through a pipe (a person's `lil doctor` takes answers
+            // only from a terminal).
+            (OsString::from(ENV_TEST_DOCTOR_STDIN), OsString::from("1")),
         ];
         vars.extend(self.git_env());
         vars
@@ -157,6 +160,20 @@ impl TestEnv {
     /// [`TestEnv::lil`] with `stdin` written to `lil`'s standard input, which is then closed.
     pub fn lil_with_stdin(&self, args: &[&str], stdin: &str) -> LilOutput {
         self.run_lil(self.root(), args, Some(stdin))
+    }
+
+    /// [`TestEnv::lil`] run in `dir`, with the variables in `extra` added after
+    /// [`TestEnv::child_env`] (each replaces one of the same name) and `stdin`, if any, written
+    /// to `lil`'s standard input: for `lil hook` and `lil doctor` runs that need the fake
+    /// `claude` on `PATH` or `LIL_ENGINE`.
+    pub fn lil_in_with(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        extra: &[(&str, OsString)],
+        stdin: Option<&str>,
+    ) -> LilOutput {
+        self.run_lil_with(dir, args, extra, stdin)
     }
 
     /// Starts `lil` like [`TestEnv::lil`] but does not wait: for long-running commands such as
@@ -189,11 +206,24 @@ impl TestEnv {
     }
 
     fn run_lil(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> LilOutput {
+        self.run_lil_with(dir, args, &[], stdin)
+    }
+
+    fn run_lil_with(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        extra: &[(&str, OsString)],
+        stdin: Option<&str>,
+    ) -> LilOutput {
         let lil = &ensure_built().lil;
         let start = Instant::now();
         let deadline = start + LIL_DEADLINE;
-        let mut child = self
-            .lil_command(dir, args)
+        let mut command = self.lil_command(dir, args);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -819,9 +849,11 @@ mod tests {
             get("LIL_TEST_PARENT_PID"),
             OsString::from(std::process::id().to_string())
         );
-        // The three channel variables come first; the git isolation follows them.
-        assert_eq!(vars.len(), 3 + t.git_env().len(), "{vars:?}");
-        assert_eq!(&vars[3..], t.git_env().as_slice(), "{vars:?}");
+        assert_eq!(get("LIL_TEST_DOCTOR_STDIN"), OsString::from("1"));
+        // The three channel variables and the doctor's test override come first; the git
+        // isolation follows them.
+        assert_eq!(vars.len(), 4 + t.git_env().len(), "{vars:?}");
+        assert_eq!(&vars[4..], t.git_env().as_slice(), "{vars:?}");
 
         // A child given these variables resolves the same isolated folders.
         let child = Env::from_vars("dev", &|name| {

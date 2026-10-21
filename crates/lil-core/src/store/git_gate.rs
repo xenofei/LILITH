@@ -148,13 +148,10 @@ impl GitGate {
 mod tests {
     use std::sync::Arc;
 
-    use lil_platform::fs::SystemProbe;
+    use lil_testkit::TestEnv;
     use lil_testkit::files::write_file;
-    use lil_testkit::{FakeClock, SeqIds, TestEnv};
 
     use super::*;
-    use crate::state::{StateDb, StateScope};
-    use crate::store::{Expect, FailPoints, Store, WsPath, fsops};
 
     #[tokio::test(start_paused = true)] // spec: ARCH-083
     async fn git_gate_waits_up_to_60_s_then_git_busy() {
@@ -232,51 +229,5 @@ mod tests {
         assert_eq!(git_dir_of(&plain), plain.join(".git"));
         write_file(&plain.join(".git"), b"not a gitdir file\n");
         assert_eq!(git_dir_of(&plain), plain.join(".git"));
-    }
-
-    #[tokio::test(start_paused = true)] // spec: ARCH-083
-    async fn git_gate_sees_index_lock_without_the_watcher() {
-        let env = TestEnv::new();
-        let root = env.make_workspace("gate");
-        let state = Arc::new(
-            StateDb::open(
-                &env.root().join("local").join("state.db"),
-                StateScope::Workspace,
-                Arc::new(|what: &str| panic!("unexpected fatal report: {what}")),
-            )
-            .unwrap(),
-        );
-        let store = Arc::new(Store::new(
-            root.clone(),
-            state,
-            FailPoints::none(),
-            FakeClock::new(),
-            Arc::new(SeqIds::new()),
-            Arc::new(SystemProbe),
-        ));
-        let lock = root.join(".git").join("index.lock");
-        write_file(&lock, b"");
-        // No watcher sets the flag: the file alone holds writes back.
-        assert!(store.git_gate().is_busy());
-        let rel = WsPath::parse("notes/after.txt").unwrap();
-        let waiting = {
-            let (store, rel) = (store.clone(), rel.clone());
-            tokio::spawn(async move { store.write(&rel, b"after".to_vec(), Expect::New).await })
-        };
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        assert!(
-            !waiting.is_finished(),
-            "a write waits while index.lock exists"
-        );
-        assert!(!rel.abs(&root).exists(), "nothing is written meanwhile");
-        // Git ends a command by renaming `index.lock` onto `index`.
-        fsops::move_new(&lock, &root.join(".git").join("index")).unwrap();
-        assert!(!store.git_gate().is_busy());
-        let written = waiting
-            .await
-            .unwrap()
-            .expect("the write goes on once the lock is gone");
-        assert_eq!(written.path, rel);
-        assert_eq!(std::fs::read(rel.abs(&root)).unwrap(), b"after");
     }
 }

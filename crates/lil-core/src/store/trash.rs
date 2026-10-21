@@ -41,7 +41,7 @@ use serde_json::Value;
 use super::fsops;
 use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
-use super::paths::{WsPath, long_rel, path_key, writable};
+use super::paths::{WsPath, path_key, writable};
 use super::versions::{files_under, set_readonly_all};
 use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
@@ -55,9 +55,9 @@ pub const REJECTED_KEEP_DAYS: i64 = 90;
 /// The trash folder, workspace-relative.
 pub const TRASH_DIR: &str = ".trash";
 /// The record beside each entry's payload.
-const RECORD: &str = "restore.json";
-const PAYLOAD: &str = "payload";
-const DAY: i64 = 86_400;
+pub(super) const RECORD: &str = "restore.json";
+pub(super) const PAYLOAD: &str = "payload";
+pub(super) const DAY: i64 = 86_400;
 
 /// A trash entry's `restore.json` (Appendix E "Workspace areas").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -87,10 +87,10 @@ pub struct MaintenanceReport {
 
 /// A trash entry found on disk.
 #[derive(Debug, Clone)]
-struct Entry {
-    dir: PathBuf,
-    day: PathBuf,
-    record: TrashRecord,
+pub(super) struct Entry {
+    pub(super) dir: PathBuf,
+    pub(super) day: PathBuf,
+    pub(super) record: TrashRecord,
 }
 
 /// Unix seconds of a `YYYY-MM-DD` date (the first ten characters of `s`), at 00:00 UTC.
@@ -127,7 +127,7 @@ fn parse_date(s: &str) -> Option<i64> {
 }
 
 /// Unix seconds of an RFC 3339 UTC time `YYYY-MM-DDTHH:MM:SS[.fraction]Z`.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub(super) fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b.last() != Some(&b'Z') {
         return None;
@@ -151,15 +151,48 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 }
 
 /// Whether `id` has the shape of an entry id, `te_<16 hex>`.
-fn is_entry_id(id: &str) -> bool {
+pub(super) fn is_entry_id(id: &str) -> bool {
     id.strip_prefix("te_")
         .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Fails closed (`PermissionDenied`) when `<root>\.trash` is a link (a symbolic link, junction
+/// or mount point): the trash would be somewhere the suite doesn't own, so nothing is listed,
+/// restored, purged or moved into it (CORE-110). A trash that doesn't exist is fine.
+pub(super) fn refuse_linked_trash(root: &Path, probe: &dyn Probe) -> io::Result<()> {
+    refuse_link_at(&root.join(TRASH_DIR), probe)
+}
+
+/// Fails closed (`PermissionDenied`) when `trash`, a folder in the trash path (`.trash`, a day
+/// folder, an entry folder or its `payload`), is a link; one that doesn't exist is fine.
+pub(super) fn refuse_link_at(trash: &Path, probe: &dyn Probe) -> io::Result<()> {
+    let id = match probe.identity(trash) {
+        Ok(id) => id,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if id.attributes & 0x400 != 0
+        && probe
+            .reparse_tag(trash)?
+            .is_some_and(lil_platform::fs::is_name_surrogate)
+    {
+        tracing::warn!(trash = %trash.display(), "a folder in the trash path is a link, so the trash is not used; remove the link");
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is a link, so the trash is not used; remove the link",
+                trash.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Every entry under `<root>\.trash` whose `restore.json` parses. Links are never followed,
 /// and each `restore.json` goes through `probe.identity` first: a cloud-only placeholder (or a
 /// link) is skipped, never read, so listing the trash never downloads anything.
-fn entries(root: &Path, probe: &dyn Probe) -> io::Result<Vec<Entry>> {
+pub(super) fn entries(root: &Path, probe: &dyn Probe) -> io::Result<Vec<Entry>> {
+    refuse_linked_trash(root, probe)?;
     let mut found = Vec::new();
     for day in list(&root.join(TRASH_DIR))?
         .into_iter()
@@ -237,8 +270,36 @@ fn signoff_date(view: &ManifestView, run: &CandidateRun) -> Option<i64> {
 
 /// Removes `path` if it is an empty folder; anything else (a folder that isn't empty, one
 /// that is gone) is left as it is.
-fn remove_if_empty(path: &Path) {
+pub(super) fn remove_if_empty(path: &Path) {
     let _ = fsops::remove_empty_dir(path);
+}
+
+/// Takes an entry that holds no payload out of the trash again: its record, then its empty
+/// folders (and the day's, when that is empty too).
+pub(super) fn drop_empty_entry(dir: &Path, day: &Path) -> io::Result<()> {
+    fsops::remove_file(&dir.join(RECORD))?;
+    remove_if_empty(&dir.join(PAYLOAD));
+    remove_if_empty(dir);
+    remove_if_empty(day);
+    Ok(())
+}
+
+/// The purge of one entry: its whole folder, then the day's when that is empty (CORE-110).
+///
+/// The trash path is checked for links again right before the delete (`.trash`, the day and the
+/// entry folder), so a link made since the entries were listed is never followed.
+pub(super) fn purge_entry(
+    root: &Path,
+    probe: &dyn Probe,
+    dir: &Path,
+    day: &Path,
+) -> io::Result<()> {
+    refuse_linked_trash(root, probe)?;
+    refuse_link_at(day, probe)?;
+    refuse_link_at(dir, probe)?;
+    fsops::remove_dir_all(dir)?;
+    remove_if_empty(day);
+    Ok(())
 }
 
 impl Store {
@@ -307,31 +368,9 @@ impl Store {
                 tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
                 continue;
             };
-            let mut entries = Vec::new();
-            for entry in m.view().locks {
-                let trimmed = entry.trim_end_matches('/');
-                match WsPath::parse(&format!("{asset}/{trimmed}")) {
-                    Ok(path) if !trimmed.is_empty() && path.key() != manifest.key() => {
-                        entries.push(path);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        tracing::warn!(manifest = %manifest, entry = %entry, "a locks entry that isn't a workspace path is skipped");
-                    }
-                }
-            }
-            if entries.is_empty() {
-                continue;
-            }
-            let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
-            let longs = blocking(move || {
-                Ok(entries
-                    .iter()
-                    .map(|e| long_rel(&root, e, &|p| probe.long_form(p)))
-                    .collect::<Result<Vec<_>, _>>())
-            })
-            .await
-            .map_err(|e| StoreError::io(&manifest, &e))??;
+            let longs = self
+                .long_lock_entries(&asset, &manifest, &m.view().locks)
+                .await?;
             for entry in longs {
                 let key = entry.key();
                 if key == target || key.starts_with(&format!("{target}/")) {
@@ -378,6 +417,10 @@ impl Store {
     async fn trash_now(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         let abs = rel.abs(self.root());
         let _held = self.lock_path(rel).await;
+        let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
+        blocking(move || refuse_linked_trash(&root, probe.as_ref()))
+            .await
+            .map_err(|e| StoreError::io(rel, &e))?;
         let sha256 = match self
             .see_hash(&abs)
             .await
@@ -414,8 +457,10 @@ impl Store {
                 why: format!("the restore record can't be written: {e}"),
             })? + "\n";
             let (day_dir, dir, fp) = (day.clone(), day.join(&entry_id), self.failpoints().clone());
+            let probe = self.probe().clone();
             let created = blocking(move || {
                 fsops::ensure_dir(&day_dir)?;
+                refuse_link_at(&day_dir, probe.as_ref())?;
                 fsops::create_dir_new(&dir)?;
                 fsops::ensure_dir(&dir.join(PAYLOAD))?;
                 fsops::write_temp(&dir, RECORD, text.as_bytes(), &fp)?;
@@ -533,14 +578,20 @@ impl Store {
             writable(&rel)?;
             writable(&long)?;
         }
-        // Manifest `locks` (CORE-035), by the path as recorded and by its long form.
+        // Manifest `locks` (CORE-035), by the path as recorded and by its long form; a folder
+        // with a locked entry beneath it now is never restored either (ruling P3-R7).
         self.check_locks(&rel).await?;
         self.check_long_locks(&rel, &long).await?;
+        self.refuse_locks_within(&rel, &long).await?;
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
-            let items = blocking(move || list(&dir))
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?;
+            let probe = self.probe().clone();
+            let items = blocking(move || {
+                refuse_link_at(&dir, probe.as_ref())?;
+                list(&dir)
+            })
+            .await
+            .map_err(|e| StoreError::io(&rel, &e))?;
             let wanted = path_key(rel.file_name());
             let named = items.iter().position(|i| path_key(&i.name) == wanted);
             match (named, items.len()) {
@@ -670,13 +721,8 @@ impl Store {
                 continue;
             }
             let (dir, day) = (entry.dir.clone(), entry.day.clone());
-            match blocking(move || {
-                fsops::remove_dir_all(&dir)?;
-                remove_if_empty(&day);
-                Ok(())
-            })
-            .await
-            {
+            let (root, probe) = (root.clone(), self.probe().clone());
+            match blocking(move || purge_entry(&root, probe.as_ref(), &dir, &day)).await {
                 Ok(()) => {
                     tracing::info!(entry = %entry.record.entry_id, "trash entry purged");
                     report.purged.push(entry.record.entry_id.clone());

@@ -236,6 +236,111 @@ fn doctor_without_a_default_workspace_skips_the_workspace_checks() {
     assert_eq!(probe.code, 3, "no core was started: {probe:?}");
 }
 
+#[test] // spec: ARCH-063
+fn doctor_reports_pass_env_entries_the_scrub_refuses() {
+    let env = TestEnv::new();
+    env.suite_toml_set(
+        "[engines.comfyui]\npass_env = ['HF_TOKEN', 'ANTHROPIC_API_KEY', 'LIL_ENGINE', 'HF_*']\n",
+    );
+    let out = env.lil(&["doctor"]);
+    assert_eq!(out.code, 1, "a refused entry is a problem: {out:?}");
+    let lines = printed(&out);
+    // The refused and malformed entries are each reported, by name.
+    for entry in ["\"ANTHROPIC_API_KEY\"", "\"LIL_ENGINE\"", "\"HF_*\""] {
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("problem: [engines.comfyui] pass_env entry") && l.contains(entry)
+            ),
+            "{entry} not reported: {out:?}"
+        );
+    }
+    // The allowed hub token is not reported.
+    assert!(
+        !lines.iter().any(|l| l.contains("\"HF_TOKEN\"")),
+        "HF_TOKEN should pass: {out:?}"
+    );
+}
+
+#[test] // spec: ARCH-063
+fn doctor_names_pass_env_entries_that_are_not_strings() {
+    // M3: an entry that isn't a string, and a pass_env that isn't a list, are named too.
+    for (toml, entry, why) in [
+        (
+            "[engines.comfyui]\npass_env = ['HF_TOKEN', 1]\n",
+            "\"1\"",
+            "not a string",
+        ),
+        (
+            "[engines.comfyui]\npass_env = 'HF_TOKEN'\n",
+            "\"HF_TOKEN\"",
+            "pass_env is not a list",
+        ),
+    ] {
+        let env = TestEnv::new();
+        env.suite_toml_set(toml);
+        let out = env.lil(&["doctor"]);
+        assert_eq!(
+            out.code, 1,
+            "{toml}: a rejected entry is a problem: {out:?}"
+        );
+        assert!(
+            printed(&out).iter().any(|l| l
+                .starts_with("problem: [engines.comfyui] pass_env entry")
+                && l.contains(entry)
+                && l.contains(why)),
+            "{toml}: {entry} not reported: {out:?}"
+        );
+    }
+}
+
+#[test] // spec: ARCH-063
+fn doctor_refuses_named_provider_keys_and_warns_on_other_key_like_names() {
+    // Ruling P3-R31b: a named provider key is a problem, another key-like name a warning, and
+    // a hub token says nothing.
+    let env = TestEnv::new();
+    env.suite_toml_set(
+        "[engines.comfyui]\npass_env = ['HF_TOKEN', 'GROQ_API_KEY', 'MY_TOOL_API_KEY']\n",
+    );
+    let out = env.lil(&["doctor"]);
+    assert_eq!(out.code, 1, "a refused entry is a problem: {out:?}");
+    let lines = printed(&out);
+    assert!(
+        lines.iter().any(
+            |l| l.starts_with("problem: [engines.comfyui] pass_env entry")
+                && l.contains("\"GROQ_API_KEY\"")
+        ),
+        "GROQ_API_KEY not refused: {out:?}"
+    );
+    assert!(
+        lines.iter().any(
+            |l| l.starts_with("warning: [engines.comfyui] pass_env entry")
+                && l.contains("\"MY_TOOL_API_KEY\"")
+        ),
+        "MY_TOOL_API_KEY not warned: {out:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("\"HF_TOKEN\"")),
+        "HF_TOKEN should stay silent: {out:?}"
+    );
+    // A warning alone is not a problem.
+    let env = TestEnv::new();
+    env.suite_toml_set("[engines.comfyui]\npass_env = ['HF_TOKEN', 'MY_TOOL_API_KEY']\n");
+    let out = env.lil(&["doctor"]);
+    let lines = printed(&out);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("warning: ") && l.contains("\"MY_TOOL_API_KEY\"")),
+        "{out:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("problem: ") && l.contains("pass_env")),
+        "a warned entry is not a problem: {out:?}"
+    );
+}
+
 /// `path` with `suffix` added to its file name.
 fn beside(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();

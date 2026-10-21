@@ -1,7 +1,9 @@
 //! ComfyUI's websocket, `/ws?clientId=<id>` (Appendix F "ComfyUI client"): the events of the
 //! channel's prompts and its binary preview frames.
 //!
-//! Text frames are `{type, data}`: `execution_start`, `executing`, `progress`, `executed`,
+//! Text frames are `{type, data}`: `execution_start`, `executing`, `progress`,
+//! `progress_state` (ComfyUI's per-node aggregate: the node it names `running` is read as
+//! progress, so a ComfyUI that sends only these still reports it), `executed`,
 //! `execution_success`, `execution_error` and `execution_interrupted` become [`ComfyEvent`]s;
 //! the others (`status`, `execution_cached`, …) are skipped. A binary frame whose first 4 bytes
 //! (big-endian) are event type 1 is a preview: 4 more bytes of image type (1 JPEG, 2 PNG), then
@@ -54,6 +56,13 @@ pub enum ComfyEvent {
         value: u64,
         max: u64,
     },
+    /// The `running` node of a `progress_state`, its value and max made whole (down and up).
+    ProgressState {
+        prompt_id: String,
+        node: String,
+        value: u64,
+        max: u64,
+    },
     Executed {
         prompt_id: String,
         node: String,
@@ -83,6 +92,7 @@ impl ComfyEvent {
             ComfyEvent::ExecutionStart { prompt_id }
             | ComfyEvent::Executing { prompt_id, .. }
             | ComfyEvent::Progress { prompt_id, .. }
+            | ComfyEvent::ProgressState { prompt_id, .. }
             | ComfyEvent::Executed { prompt_id, .. }
             | ComfyEvent::Success { prompt_id }
             | ComfyEvent::Error { prompt_id, .. }
@@ -120,6 +130,24 @@ pub fn parse_text(text: &str) -> Option<ComfyEvent> {
             value: data.get("value").and_then(Value::as_u64).unwrap_or(0),
             max: data.get("max").and_then(Value::as_u64).unwrap_or(0),
         },
+        "progress_state" => {
+            let nodes = data.get("nodes")?.as_object()?;
+            let (node, entry) = nodes
+                .iter()
+                .find(|(_, e)| e.get("state").and_then(Value::as_str) == Some("running"))?;
+            let number = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+            };
+            ComfyEvent::ProgressState {
+                prompt_id: prompt_id()?,
+                node: node.clone(),
+                value: whole(number("value")?.floor()),
+                max: whole(number("max")?.ceil()),
+            }
+        }
         "executed" => ComfyEvent::Executed {
             prompt_id: prompt_id()?,
             node: data.get("node").and_then(Value::as_str)?.to_string(),
@@ -138,6 +166,12 @@ pub fn parse_text(text: &str) -> Option<ComfyEvent> {
         },
         _ => return None,
     })
+}
+
+/// A finite, non-negative whole `f64` as a `u64` (saturating at `u64::MAX`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn whole(f: f64) -> u64 {
+    f as u64
 }
 
 /// The event of a binary frame: a preview (event type 1), else `None`.
@@ -210,6 +244,48 @@ impl ComfyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ComfyUI 0.42.1's `progress_state`: the `running` node is the progress; one with no
+    /// running node (all finished or pending) says nothing.
+    #[test] // spec: CORE-130, CORE-117
+    fn progress_state_reads_the_running_node() {
+        let frame = |nodes: serde_json::Value| {
+            serde_json::json!({"type": "progress_state", "data": {"prompt_id": "p", "nodes": nodes}})
+                .to_string()
+        };
+        assert_eq!(
+            parse_text(&frame(serde_json::json!({
+                "1": {"value": 1.0, "max": 1.0, "state": "finished"},
+                "3": {"value": 7.0, "max": 20.0, "state": "running"},
+            }))),
+            Some(ComfyEvent::ProgressState {
+                prompt_id: "p".into(),
+                node: "3".into(),
+                value: 7,
+                max: 20
+            })
+        );
+        assert_eq!(
+            parse_text(&frame(serde_json::json!({
+                "1": {"value": 0.5, "max": 2.5, "state": "running"}}))),
+            Some(ComfyEvent::ProgressState {
+                prompt_id: "p".into(),
+                node: "1".into(),
+                value: 0,
+                max: 3
+            })
+        );
+        assert_eq!(
+            parse_text(&frame(serde_json::json!({
+                "1": {"value": 1.0, "max": 1.0, "state": "finished"}}))),
+            None
+        );
+        assert_eq!(
+            parse_text(&frame(serde_json::json!({
+                "1": {"value": -1.0, "max": 1.0, "state": "running"}}))),
+            None
+        );
+    }
 
     #[test] // spec: ARCH-033, CORE-130
     fn preview_frames_are_event_type_1_with_an_image_type() {

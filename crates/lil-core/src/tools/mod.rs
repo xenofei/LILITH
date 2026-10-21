@@ -34,10 +34,11 @@ pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
 pub use stages::{
-    BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput, ConfirmStage,
-    ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks, RecordStage,
-    ReserveInput, ReserveOutcome, ReserveStage, SettingSource, Settings, SettingsInput,
-    SettingsStage, SettleInput,
+    AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
+    ConfirmStage, ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks,
+    RecordStage, ReplayDecision, ReserveInput, ReserveOutcome, ReserveStage, SettingSource,
+    Settings, SettingsInput, SettingsStage, SettleInput, ToolEstimates, cap_exceeded,
+    cap_hits_json,
 };
 pub use telemetry_tools::register_telemetry_tools;
 pub use test_tools::{
@@ -52,6 +53,7 @@ use lil_platform::Env;
 use lil_platform::fs::Probe;
 
 use crate::state::StateRegistry;
+use crate::store::Personal;
 use crate::workspace::WorkspaceHub;
 
 /// The registry a core serves: the product tools on every channel and, on a test channel
@@ -69,7 +71,13 @@ pub fn core_registry(
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub.clone(), env.clone(), probe.clone());
     register_doctor_tools(&mut reg, probe.clone(), git_env);
-    register_trash_tools(&mut reg);
+    let personal = Arc::new(Personal::new(
+        env.data_dir().join("resources"),
+        hub.clock().clone(),
+        hub.ids().clone(),
+        probe.clone(),
+    ));
+    register_trash_tools(&mut reg, &personal);
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg);
     register_watch_tools(&mut reg);

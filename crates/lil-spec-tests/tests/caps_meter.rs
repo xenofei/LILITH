@@ -349,6 +349,9 @@ fn busy_gpu(env: &TestEnv, pid: u32) -> String {
 /// its id once it succeeded.
 fn local_job(pipe: &mut lil_testkit::RawPipe, fake: &FakeComfy) -> String {
     fake.hold_prompts(true);
+    // A first sample, so the GPU job is admitted (ruling P3-R26; P3-R18 holds a job submitted
+    // before any sample in waiting_for_vram).
+    write_ok(pipe, "test.hw_tick", json!({"samples": 1}));
     let id = submit(pipe, "test.comfy_submit", json!({"graph": "tiny"}));
     let body = poll("the prompt in ComfyUI", || {
         posted_prompts(fake).into_iter().next()

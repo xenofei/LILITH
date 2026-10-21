@@ -1,14 +1,7 @@
-//! The core's transport (ARCH-024–026, ARCH-033): the named-pipe listener, the single instance
-//! per channel, and the running core (infrastructure, not a CORE-014 module).
+//! The running core (infrastructure, not a CORE-014 module): it builds every module, serves
+//! them through the [`crate::transport`] (the named-pipe listener, ARCH-024–026, ARCH-033, whose
+//! items are re-exported here), and shuts down.
 //!
-//! - [`claim_pipe`] creates the pipe's *first* instance. If the pipe already exists, another
-//!   core owns the channel and this one exits with code 3 before it touches anything else.
-//! - [`serve`] accepts connections. A new instance is always created before a connected one is
-//!   handed to its task, so the pipe name never disappears while the core runs. If one cannot
-//!   be created, `serve` fails, and the running core stops as after a fatal error (exit 4).
-//! - Each connection runs in [`conn`]: NDJSON framing and the order rules of the [`Router`].
-//!   After the handshake at most [`MAX_IN_FLIGHT_PER_CONN`] requests of one connection run at
-//!   once; the next line is read only when one of them has ended (backpressure on the pipe).
 //! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
 //!   wait and steps, then the open workspaces close (their `state.db` first, then
 //!   `core.lock`), then the state databases close, then the pipe.
@@ -26,6 +19,19 @@
 //!   are registered, the default workspace's hardware profile is checked once the workspace is
 //!   open and the first sample is in (CORE-067), and sampling stops right after the shutdown
 //!   steps.
+//! - The confirmations ([`crate::confirm`]) are stage 5's confirm half ([`AgentConfirm`]), the
+//!   router's `app/*` methods and an idle blocker (ARCH-020; never a drain's). The suite
+//!   database's pending ones are loaded at start, the default workspace's once it opens, and
+//!   expired ones are marked every second.
+//! - The meter ([`crate::meter`]) is stage 8 ([`MeterSettle`]), the engines' usage sink, and the
+//!   jobs' first completion; it registers `usage.summary` (and `test.meter_external` on test
+//!   channels), and turns the usage rows a dead core left into `pending` lines: the suite's
+//!   before the core serves, the default workspace's once it opens.
+//! - The caps ([`crate::meter::Caps`]) are stage 5's cap half (through [`Confirm`]), the reserve
+//!   stage, the settle after stage 8's usage lines, the jobs' second completion and their
+//!   reservation hand-over, `caps.get` and the router's `app/caps.set`. A dead core's held
+//!   reservations are repaired before the meter's recovery of the same scope: the suite's
+//!   before the core serves, the default workspace's once it opens.
 //! - The engines ([`crate::engines`]) are built once the dispatcher's jobs exist (their tools
 //!   find them through a slot filled before the core serves). They register the node-install
 //!   handler, are the GPU scheduler's engine processes and unload, have ComfyUI's models folder
@@ -34,246 +40,41 @@
 //!   ([`Engines::observe`]: the outside-jobs poll every 2 s while ComfyUI is ready, the model
 //!   inventory each time it becomes ready) starts with the suite's jobs recovered.
 
-mod conn;
-
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lil_platform::pipe::{CreateError, client_pid, create_instance};
 use lil_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
 use lil_platform::{Env, process};
-use lil_protocol::{Id, Request, Response, encode_response_capped};
-use tokio::net::windows::named_pipe::NamedPipeServer;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep, PipeInstanceFault};
+use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep};
+use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NoNotificationPath, UiPresence};
+use crate::docs::{Holds, TestHolds, register_doc_tools, register_test_hold};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
+use crate::interchange::{Interchange, register_interchange_tools};
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
-use crate::meter::LogSink;
+use crate::meter::{Caps, Meter, MeterSettle, register_caps_tools, register_meter_tools};
 use crate::projects::ActiveProjects;
+use crate::resources::{Resources, register_resource_tools, spawn_personal_maintenance};
 use crate::rpc::RpcRouter;
 use crate::state::{OnFatal, StateError, StateRegistry};
+use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
-    Dispatcher, PipelineHooks, TestGates, TestJobHandler, core_registry, register_hw_tick,
-    register_telemetry_tools,
+    Dispatcher, PipelineHooks, TestGates, TestJobHandler, ToolEstimates, core_registry,
+    register_hw_tick, register_telemetry_tools,
+};
+use crate::transport::serve_with;
+pub use crate::transport::{
+    ConnCtx, ConnObserver, Listener, MAX_IN_FLIGHT_PER_CONN, OUTBOUND_CAPACITY, Router,
+    ServerStats, claim_pipe, serve,
 };
 use crate::workspace::WorkspaceHub;
-
-/// Per-connection writer queue (responses and events).
-pub const OUTBOUND_CAPACITY: usize = 256;
-
-/// The requests one connection may have running in their own tasks at once. Requests that
-/// run on the reader ([`Router::runs_inline`], and everything before the handshake) do not
-/// count.
-pub const MAX_IN_FLIGHT_PER_CONN: usize = 64;
-
-/// What a [`Router`] knows about one connection.
-#[derive(Debug)]
-pub struct ConnCtx {
-    /// Unique within this core, counting from 1.
-    pub conn_id: u64,
-    /// From `GetNamedPipeClientProcessId` (ARCH-045); 0 if Windows did not report it.
-    pub client_pid: u32,
-    /// Lines to send to the client, without their `\n`.
-    pub outbound: tokio::sync::mpsc::Sender<String>,
-    /// Cancelling it ends the connection.
-    pub close: CancellationToken,
-}
-
-impl ConnCtx {
-    /// The line for `response`, within the 4 MiB cap (ARCH-025): one that would be longer is
-    /// never sent; it becomes a -32603 error for the same id, and is logged.
-    pub fn response_line(&self, response: &Response) -> String {
-        let (line, oversized) = encode_response_capped(response);
-        if let Some(bytes) = oversized {
-            tracing::error!(
-                conn_id = self.conn_id,
-                bytes,
-                "a response was too large to send; the caller gets -32603 instead"
-            );
-        }
-        line
-    }
-
-    /// Queues `response` ([`ConnCtx::response_line`]). A connection whose writer has stopped
-    /// drops it.
-    pub async fn send_response(&self, response: &Response) {
-        let _ = self.outbound.send(self.response_line(response)).await;
-    }
-}
-
-/// Decides what each request on a connection gets.
-pub trait Router: Send + Sync + 'static {
-    /// The connection was accepted; runs before any line is read (e.g. starts the hello
-    /// timeout).
-    fn opened(&self, conn: &ConnCtx);
-    /// `false`: each request is handled inline, in order, before the next line is read, so a
-    /// request pipelined right behind `core/hello` sees the session. `true`: each request
-    /// runs in its own task (unless [`Router::runs_inline`]), holding one of the connection's
-    /// [`MAX_IN_FLIGHT_PER_CONN`] permits.
-    fn handshake_done(&self, conn: &ConnCtx) -> bool;
-    /// After the handshake: `true` if `req` is still handled on the reader, in order and
-    /// without a permit (cheap requests that must not wait behind a full connection).
-    fn runs_inline(&self, req: &Request) -> bool {
-        let _ = req;
-        false
-    }
-    /// Handles one request (never a notification). `None` sends nothing.
-    fn handle<'a>(
-        &'a self,
-        conn: &'a ConnCtx,
-        req: Request,
-    ) -> Pin<Box<dyn Future<Output = Option<Response>> + Send + 'a>>;
-    /// The response to request `id`, whose handler panicked in its own task (a request run
-    /// on the reader that panics ends the connection instead).
-    fn panicked(&self, conn: &ConnCtx, id: Id) -> Response;
-    /// The connection ended; runs exactly once, also when a handler on the reader panicked.
-    fn closed(&self, conn: &ConnCtx);
-}
-
-/// Counters the transport keeps. The running core counts its connections in the
-/// [`Lifecycle`] (through its router); this count is the transport's own, whatever the
-/// router, and is what the transport tests (`tests/transport.rs`, with a fake [`Router`])
-/// watch to see a connection task end.
-#[derive(Debug, Default)]
-pub struct ServerStats {
-    /// Open connections.
-    pub connections: AtomicUsize,
-}
-
-/// The claimed pipe: its first, not yet connected, instance.
-#[derive(Debug)]
-pub struct Listener {
-    name: String,
-    first: NamedPipeServer,
-}
-
-impl Listener {
-    /// The full pipe name, `\\.\pipe\...`.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-/// Creates the first instance of `pipe` (a full `\\.\pipe\...` name). If the pipe exists,
-/// another core owns the channel: [`CoreExit::AlreadyRunning`]. Must be called inside a tokio
-/// runtime.
-pub fn claim_pipe(pipe: &str) -> Result<Listener, CoreExit> {
-    match create_instance(pipe, true) {
-        Ok(first) => Ok(Listener {
-            name: pipe.to_string(),
-            first,
-        }),
-        Err(CreateError::AlreadyOwned) => Err(CoreExit::AlreadyRunning),
-        Err(CreateError::Io(e)) => Err(CoreExit::Startup(format!(
-            "cannot create the pipe {pipe}: {e}"
-        ))),
-    }
-}
-
-/// Accepts connections on `listener` until `stop` is cancelled, then closes the pipe, ends
-/// every connection and waits for their tasks. Fails only if a new pipe instance cannot be
-/// created.
-pub async fn serve(
-    listener: Listener,
-    router: Arc<dyn Router>,
-    stats: Arc<ServerStats>,
-    stop: CancellationToken,
-) -> io::Result<()> {
-    serve_with(listener, router, stats, stop, None).await
-}
-
-/// [`serve`], with the in-process tests' fault ([`CoreConfig::pipe_instance_fault`]) run
-/// before each new instance.
-async fn serve_with(
-    listener: Listener,
-    router: Arc<dyn Router>,
-    stats: Arc<ServerStats>,
-    stop: CancellationToken,
-    fault: Option<PipeInstanceFault>,
-) -> io::Result<()> {
-    let Listener { name, first } = listener;
-    let mut waiting = first;
-    let mut connections = JoinSet::new();
-    let next_id = AtomicU64::new(1);
-    let result = loop {
-        tokio::select! {
-            biased;
-            () = stop.cancelled() => break Ok(()),
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            connected = waiting.connect() => {
-                // A fresh instance first, so the name never disappears (another core could
-                // otherwise claim it).
-                let fresh = match new_instance(&name, fault.as_ref()) {
-                    Ok(fresh) => fresh,
-                    Err(e) => {
-                        tracing::error!(pipe = %name, error = %e, "cannot create a new pipe instance");
-                        break Err(e);
-                    }
-                };
-                let server = std::mem::replace(&mut waiting, fresh);
-                if let Err(e) = connected {
-                    // The client left before the connection completed.
-                    tracing::debug!(error = %e, "a pipe connection failed");
-                    continue;
-                }
-                let client_pid = client_pid(&server).unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "the client's process id is unknown");
-                    0
-                });
-                let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
-                stats.connections.fetch_add(1, Ordering::SeqCst);
-                let counted = Counted(stats.clone());
-                let router = router.clone();
-                let close = stop.child_token();
-                connections.spawn(async move {
-                    let _counted = counted;
-                    conn::run(server, conn_id, client_pid, router, close).await;
-                });
-            }
-        }
-    };
-    // Close the pipe to new clients, then end and wait for every connection (their `close`
-    // tokens are children of `stop`).
-    drop(waiting);
-    stop.cancel();
-    while connections.join_next().await.is_some() {}
-    result
-}
-
-/// A further instance of the pipe `name`; `fault` (in-process tests) runs first, and its
-/// `Err` is the creation's.
-fn new_instance(name: &str, fault: Option<&PipeInstanceFault>) -> io::Result<NamedPipeServer> {
-    if let Some(fault) = fault {
-        fault()?;
-    }
-    create_instance(name, false).map_err(create_error)
-}
-
-fn create_error(e: CreateError) -> io::Error {
-    match e {
-        CreateError::Io(e) => e,
-        other => io::Error::other(other.to_string()),
-    }
-}
-
-/// Decrements the connection count when a connection task ends, however it ends.
-struct Counted(Arc<ServerStats>);
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        self.0.connections.fetch_sub(1, Ordering::SeqCst);
-    }
-}
 
 /// A core that is serving.
 ///
@@ -297,6 +98,8 @@ pub struct RunningCore {
     test_gates: Arc<TestGates>,
     /// Each session's active project (ARCH-088), shared with the dispatcher.
     active_projects: Arc<ActiveProjects>,
+    /// The confirmations (ARCH-052–055).
+    confirm: Arc<Confirm>,
     /// The hidden session-end window; `None` if it could not be created.
     session_end: Option<Arc<SessionEndWatcher>>,
     /// The supervisor: ends with the shutdown's report.
@@ -338,6 +141,11 @@ impl RunningCore {
     /// when the session's connection closes.
     pub fn active_projects(&self) -> &Arc<ActiveProjects> {
         &self.active_projects
+    }
+
+    /// The confirmations: pending ones, answers, the apps that can answer.
+    pub fn confirm(&self) -> &Arc<Confirm> {
+        &self.confirm
     }
 
     /// Idle accounting, drains and shutdown steps.
@@ -442,6 +250,38 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         Arc::new(cfg.git_env.clone()),
     );
     register_telemetry_tools(&mut registry, &telemetry);
+    // The meter (CORE-069): usage records, stage 8, the jobs' energy and local work.
+    let meter = Meter::new(
+        state.clone(),
+        cfg.env.clone(),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        events.clone(),
+        telemetry.clone(),
+        power_settings(&cfg.env),
+        cfg.failpoints.clone(),
+    );
+    register_meter_tools(&mut registry, &meter, cfg.test_tools);
+    // The caps (CORE-085–092): stage 5's cap half, the reserve stage, the settles, `caps.get`
+    // and `app/caps.set`.
+    let caps = Caps::new(
+        state.clone(),
+        cfg.env.clone(),
+        cfg.clock.clone(),
+        events.clone(),
+        cfg.failpoints.clone(),
+        cfg.ids.clone(),
+    );
+    register_caps_tools(&mut registry, &caps);
+    // The holds and the handler registry follow the connections (see `ConnObserver`).
+    let holds = Holds::new(cfg.clock.clone());
+    register_doc_tools(&mut registry, &holds);
+    let test_holds = Arc::new(TestHolds::default());
+    if cfg.test_tools {
+        register_test_hold(&mut registry, &holds, &test_holds);
+    }
+    let interchange = Interchange::new(core_dir(), cfg.env.data_dir());
+    register_interchange_tools(&mut registry, &interchange);
     if cfg.test_tools {
         register_hw_tick(&mut registry, telemetry.clone());
     }
@@ -451,9 +291,52 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     if cfg.test_tools {
         register_engine_test_tools(&mut registry);
     }
+    // The confirmations (ARCH-052–055): stage 5's confirm half, answered by the apps.
+    let confirm = Confirm::new(
+        state.clone(),
+        events.clone(),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        UiPresence::new(),
+        Arc::new(NoNotificationPath),
+        cfg.confirm_lifetime,
+        MCP_CONFIRMATION,
+        cfg.failpoints.clone(),
+    );
+    confirm.set_caps(caps.clone());
+    match confirm.load(state.suite()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "pending confirmations of an earlier core run"),
+        Err(e) => {
+            tracing::error!(error = %e, "the pending confirmations could not be read; a retry with its token finds each")
+        }
+    }
+    let display = {
+        let caps = caps.clone();
+        Arc::new(move || caps.display_currency())
+    };
+    let hooks = PipelineHooks {
+        estimate: Arc::new(ToolEstimates::new(display)),
+        confirm: AgentConfirm::new(confirm.clone()),
+        reserve: caps.clone(),
+        meter: Arc::new(MeterSettle::new(meter.clone()).with_caps(caps.clone())),
+        ..PipelineHooks::plan2()
+    };
+    // The Libraries: the personal scope's folder and its trash, purged in the background.
+    let personal = Arc::new(Personal::new(
+        cfg.env.data_dir().join("resources"),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        cfg.probe.clone(),
+    ));
+    register_resource_tools(
+        &mut registry,
+        &Arc::new(Resources::new(personal.clone(), cfg.clock.clone())),
+    );
+    spawn_personal_maintenance(personal);
     let dispatcher = Dispatcher::new(
         registry,
-        PipelineHooks::plan2(),
+        hooks,
         state.clone(),
         events.clone(),
         hub.clone(),
@@ -476,7 +359,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         events.clone(),
         cfg.clock.clone(),
         cfg.failpoints.clone(),
-        Arc::new(LogSink),
+        meter.clone(),
         cfg.sockets.clone(),
     );
     let _ = engine_slot.set(engines.clone());
@@ -497,8 +380,36 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }));
     jobs.stop_on_drain(lifecycle.drain_token());
-    // Completions (Tasks 15–16) are added before this: it runs them for jobs that never
-    // started.
+    // Completions (Meter, then Caps) and the reservation hand-over are set before the recovery:
+    // it runs the completions of jobs that never started.
+    jobs.add_completion(meter.clone());
+    jobs.add_completion(caps.clone());
+    jobs.set_reservations(caps.clone());
+    // A dead core's held reservations, decided by its calls' usage rows before the meter's
+    // recovery removes them (CORE-088); then the usage rows a dead core left become `pending`
+    // lines (CORE-071), but only after a successful repair, so a failed repair finds the rows
+    // again at the next start (ruling P3-R33).
+    let start = caps.repair_then_recover(&meter).await;
+    match start.repaired {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            count = n,
+            "cap reservations of an earlier core run were repaired"
+        ),
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the cap reservations could not be repaired; they stay held, and the suite's usage rows stay, until the next start")
+        }
+    }
+    match start.recovered {
+        None | Some(Ok(0)) => {}
+        Some(Ok(n)) => tracing::warn!(
+            count = n,
+            "usage records of an earlier core run were written"
+        ),
+        Some(Err(e)) => {
+            tracing::error!(code = %e.code, error = %e.message, "the suite's pending usage rows could not be recovered; the next start tries again")
+        }
+    }
     match jobs.recover_suite().await {
         Ok(marked) if !marked.is_empty() => tracing::warn!(
             count = marked.len(),
@@ -509,6 +420,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             tracing::error!(code = %e.code, error = %e.message, "the suite jobs could not be recovered; the first job call tries again")
         }
     }
+    // A dead core's held job reservations, decided by their jobs once those are recovered.
+    match caps.repair_jobs().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            count = n,
+            "job cap reservations of an earlier core run were repaired"
+        ),
+        Err(e) => {
+            tracing::error!(code = %e.code, error = %e.message, "the job cap reservations could not be repaired; they stay held until the next start")
+        }
+    }
     lifecycle.add_blocker(jobs.clone());
     // Outside ComfyUI jobs keep the core up but hold no drain (ARCH-020, ARCH-069); the poller
     // runs while the engine is ready.
@@ -516,10 +438,18 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     outside.stop_on_drain(lifecycle.drain_token());
     lifecycle.add_blocker(outside);
     engines.observe();
+    lifecycle.add_blocker(confirm.clone());
     lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
-    let router: Arc<dyn Router> = Arc::new(RpcRouter::new(&cfg, &pipe, dispatcher));
+    let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
+        .with_caps(caps.clone())
+        .with_observer(holds)
+        .with_observer(interchange);
+    if cfg.test_tools {
+        router = router.with_observer(test_holds);
+    }
+    let router: Arc<dyn Router> = Arc::new(router);
     let stats = Arc::new(ServerStats::default());
     let stop = CancellationToken::new();
     let serving = tokio::spawn(serve_with(
@@ -532,7 +462,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
 
     if let Some(ws) = hub.default_ref() {
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
+        let confirm = confirm.clone();
         let models = models.clone();
+        let meter = meter.clone();
+        let caps = caps.clone();
         tokio::spawn(async move {
             match hub.open(&ws).await {
                 Err(e) => {
@@ -541,6 +474,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                 Ok(open) => {
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
+                    }
+                    // The meter's recovery only after a successful repair (ruling P3-R33).
+                    let start = caps.repair_then_recover_workspace(&meter, &open).await;
+                    if let Err(e) = start.repaired {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's cap reservations could not be repaired; they stay held, and its usage rows stay, until the next start");
+                    }
+                    if let Some(Err(e)) = start.recovered {
+                        tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's pending usage rows could not be recovered; the next start tries again");
+                    }
+                    if let Err(e) = confirm.load(&open.state).await {
+                        tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace's pending confirmations could not be read");
                     }
                     telemetry.set_sizes_probe(telemetry::sizes_probe(
                         Some(open.ws.path.clone()),
@@ -551,7 +495,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             }
         });
     }
-    let mut helpers = vec![tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after))];
+    let mut helpers = vec![
+        tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after)),
+        tokio::spawn(sweep_confirmations(confirm.clone())),
+    ];
     if let Some(pid) = cfg.test_parent_pid.filter(|_| cfg.test_tools) {
         helpers.push(tokio::spawn(watch_test_parent(
             pid,
@@ -589,6 +536,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         telemetry,
         test_gates,
         active_projects,
+        confirm,
         session_end,
         shutdown,
     })
@@ -697,6 +645,14 @@ fn read_suite_toml(env: &Env, section: &str) -> Option<lil_schema::SuiteToml> {
     }
 }
 
+/// The folder of the core executable, where installed apps' `apps\` folder is (APP-061).
+fn core_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_default()
+}
+
 /// `[jobs] preempt_agent_batches` of `suite.toml` (CORE-125): `false` for no file, a file that
 /// doesn't parse (logged), or no such key. Read once, at start.
 fn preempt_agent_batches(env: &Env) -> bool {
@@ -798,6 +754,14 @@ async fn tick_idle(lifecycle: Arc<Lifecycle>, idle_after: Duration) {
         if lifecycle.drain_if_idle() {
             return;
         }
+    }
+}
+
+/// Marks expired confirmations every second ([`Confirm::sweep`]) until the core stops.
+async fn sweep_confirmations(confirm: Arc<Confirm>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        confirm.sweep().await;
     }
 }
 

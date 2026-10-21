@@ -515,10 +515,11 @@ fn plugin_uses_the_user_config_paths() {
     for (event, groups) in events {
         for group in groups.as_array().into_iter().flatten() {
             let matcher = group["matcher"].as_str().unwrap_or_default().to_string();
-            // Every hook is the exec-form lil hook (plugin 1.2.0 had no `hooks.json`).
+            // Every hook is the exec-form lil hook (plugin 1.2.0 had no `hooks.json`), and a
+            // hook that fails blocks its action (ruling P3-R30).
             for h in group["hooks"].as_array().into_iter().flatten() {
                 let exec = json!({"type": "command", "command": "${user_config.lil_path}",
-                                  "args": hook_args(event)});
+                                  "args": hook_args(event), "onFailure": "block"});
                 assert_eq!(h, &exec, "{event}: every hook is exec form");
                 lil_hooks.push((event.clone(), matcher.clone()));
             }

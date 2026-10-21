@@ -10,6 +10,10 @@ targets = ["x86_64-pc-windows-msvc"]
 unmaintained = "all"
 yanked = "deny"
 
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0374"
+reason = "basic-toml is unmaintained; transitive via age's i18n-embed; no maintained upgrade path; revisit when age drops i18n-embed"
+
 [licenses]
 # Third-party crates: permissive licences only, all compatible with distributing the
 # suite's binaries under GPL-3.0-or-later (the suite's own licence; see LICENSE).

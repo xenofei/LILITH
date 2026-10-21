@@ -11,7 +11,9 @@
 //!
 //! **Draining** (ARCH-021 step 1). [`Lifecycle::begin_drain`] records the reason; from then
 //! on no new call is admitted ([`Lifecycle::try_call_started`]). [`Lifecycle::run_shutdown`]
-//! waits until no call is in flight and no blocker is busy, until the drain's deadline:
+//! waits until no call is in flight and no blocker that holds drains
+//! ([`IdleBlocker::holds_drain`]; pending confirmations don't) is busy, until the drain's
+//! deadline:
 //!
 //! | Reason | Wait |
 //! |---|---|
@@ -58,6 +60,12 @@ const BLOCKER_POLL: Duration = Duration::from_millis(250);
 pub trait IdleBlocker: Send + Sync {
     fn name(&self) -> &'static str;
     fn busy(&self) -> bool;
+    /// Whether a busy blocker also holds a drain (it does unless it says otherwise). Pending
+    /// confirmations don't: they live in `state.db` and are answered just as well after the
+    /// restart, so they only keep the core from going idle.
+    fn holds_drain(&self) -> bool {
+        true
+    }
 }
 
 /// The phases of ARCH-021's shutdown, in their order.
@@ -473,7 +481,7 @@ impl Lifecycle {
             let Some(reason) = reason else {
                 return;
             };
-            let blocked = blockers.iter().any(|b| b.busy());
+            let blocked = blockers.iter().any(|b| b.holds_drain() && b.busy());
             if in_flight == 0 && !blocked {
                 return;
             }

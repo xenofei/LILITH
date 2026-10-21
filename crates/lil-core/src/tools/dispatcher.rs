@@ -16,8 +16,9 @@
 //!    `idempotency.conflict`, a running one `idempotency.in_progress`.
 //! 3. **Settings**, 4. **estimate**, 5. **confirm and caps** (`confirm.unavailable`,
 //!    `cap.exceeded`, or a `pending_confirmation` result), 6. **reserve** (under a fresh
-//!    call id `c_<16 hex>`; caps it finds passed are `cap.exceeded`): the
-//!    [`PipelineHooks`]. Before the settings, the Resolve stage's project part runs on the
+//!    call id `c_<16 hex>`; caps it finds passed after stage 5, because another call took the
+//!    room meanwhile, go back to the confirm stage, which asks for the cap only or answers
+//!    `cap.exceeded`, `ConfirmStage::cap_needed`): the [`PipelineHooks`]. Before the settings, the Resolve stage's project part runs on the
 //!    valid arguments (ARCH-088, ARCH-098): with a session workspace, `CallCtx::project` is
 //!    the `project` argument of a tool that declares one, else the session's active project,
 //!    else the workspace's `state.json` hint, else `sketchbook`. `assets.query`'s `project` is a filter, so it is
@@ -35,13 +36,30 @@
 //!    the job ends, with the call's reservation, which the job takes over (CORE-015 step 7;
 //!    `crate::jobs`, "Reservations").
 //!
+//! **Confirmations** (CORE-091, CORE-115; Appendix F "Confirmations"). A `pending_confirmation`
+//! outcome is stored like an `ok` one, and its `retry_token` is the call's idempotency key. A
+//! retry whose row holds one asks the confirm stage ([`ConfirmStage::on_replay`]): approved, the
+//! row is taken back (`StateDb::idem_reclaim`: of concurrent retries exactly one gets it, the
+//! others are `idempotency.in_progress`) and stages 3–9 run with stage 5 satisfied for exactly
+//! the tool and arguments you approved (an approval with the cap action `allow_once` lets the
+//! reservation pass the caps the prompt named, up to the estimate it showed, this once: the
+//! reserve stage gets them as `allow_once` and asks again for anything else), and the outcome
+//! is stored as usual; denied or expired,
+//! the key is released and the call is `confirm.denied` or `confirm.expired`; still pending,
+//! the same `pending_confirmation`.
+//!
 //! **Retries** (`job.retry`, ARCH-052, CORE-146). The retry tool asks the jobs module for the
 //! tool call that made the job, and [`Redispatch`] runs stages 3–9 of that tool again with
 //! those arguments, under the retrying session and the retry's idempotency key: its confirm,
-//! estimate and reserve stages run as for a fresh call (an agent retrying a `destructive` or
-//! `exec` tool's job gets `confirm.unavailable`; a paid one reserves again), and the job it
-//! submits has `retry_of`. The call's project is the retried job's, not the one the retrying
-//! session would resolve.
+//! estimate and reserve stages run as for a fresh call (a paid one reserves again), and the job
+//! it submits has `retry_of`. An agent retrying a `destructive` or `exec` tool's job, or one
+//! with external side effects that was interrupted (ruling P3-R21), needs your confirmation:
+//! the `job.retry` call itself is then `pending_confirmation`, keyed by its own idempotency
+//! row, and a retry of it once you approved runs the job's call once, after checking again that
+//! the job is still retryable. The call's project is the retried job's, not the one the
+//! retrying session would resolve.
+//!
+//! [`ConfirmStage::on_replay`]: super::stages::ConfirmStage::on_replay
 //!
 //! Then the line cap (ARCH-025): an outcome too large to send in one line (with room for its
 //! response envelope) becomes `core.bug`. Then the idempotency row is finished: `ok` and
@@ -75,18 +93,17 @@ use std::time::UNIX_EPOCH;
 
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{
-    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolDescriptor, ToolOutput,
-    args_hash, codes, fits_response_result,
+    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, PendingConfirmation, ToolCallParams,
+    ToolDescriptor, ToolOutput, args_hash, codes, fits_response_result,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinError;
 use tracing::Instrument as _;
 
-use super::job_tools::JOB_RETRY;
 use super::registry::{CallCtx, Registry, Tool};
 use super::stages::{
-    ConfirmDecision, ConfirmInput, IdemRef, PipelineHooks, ReserveInput, ReserveOutcome,
-    SettingsInput, SettleInput,
+    Approval, ConfirmDecision, ConfirmInput, IdemRef, PipelineHooks, ReplayDecision, ReserveInput,
+    ReserveOutcome, SettingsInput, SettleInput,
 };
 use crate::events::EventBus;
 use crate::jobs::{JobId, JobSummary, Jobs, RetryPlan, SubmittedSlot};
@@ -144,6 +161,7 @@ impl Dispatcher {
         clock: Arc<dyn Clock>,
         lifecycle: Arc<Lifecycle>,
     ) -> Dispatcher {
+        reg.seal();
         // The core's jobs live with its dispatcher: every call's context carries them.
         let jobs = Jobs::new(
             states.clone(),
@@ -329,8 +347,8 @@ impl Inner {
             );
         }
         let hash = call_hash(&p.name, &args);
-        let claim = match &key {
-            None => None,
+        let (claim, approved) = match &key {
+            None => (None, None),
             Some(key) => {
                 match self
                     .begin(
@@ -343,8 +361,25 @@ impl Inner {
                     )
                     .await
                 {
-                    Ok(Begun::Fresh(claim)) => Some(claim),
+                    Ok(Begun::Fresh(claim)) => (Some(claim), None),
                     Ok(Begun::Done(outcome)) => return *outcome,
+                    Ok(Begun::Pending { db, stored }) => {
+                        let idem = IdemRef {
+                            scope: &scope,
+                            key,
+                            args_hash: &hash,
+                        };
+                        match self
+                            .resume(in_flight, session, db, idem, *stored, &p.name, trace_id)
+                            .await
+                        {
+                            Resumed::Run(run) => {
+                                let (claim, approval) = *run;
+                                (Some(claim), Some(approval))
+                            }
+                            Resumed::Done(outcome) => return *outcome,
+                        }
+                    }
                     Err(e) => return state_unavailable(&e, trace_id),
                 }
             }
@@ -357,7 +392,9 @@ impl Inner {
             args_hash: &hash,
         });
         let (outcome, _) = self
-            .run(session, workspace, &tool, args, idem, trace_id, None)
+            .run(
+                session, workspace, &tool, args, idem, trace_id, None, approved,
+            )
             .await;
 
         // The line cap (ARCH-025), decided once, before anything is stored: an outcome too
@@ -444,7 +481,14 @@ impl Inner {
                 follow_up: Some(in_flight.follow_up()),
                 finished: false,
             }),
-            IdemBegin::Replay(stored) => Begun::Done(Box::new(replay(&stored, &key, trace_id))),
+            IdemBegin::Replay(stored) => match replay(&stored, &key, trace_id) {
+                // The retry token of a confirmation (module docs, "Confirmations").
+                pending @ Outcome::PendingConfirmation(_) => Begun::Pending {
+                    db,
+                    stored: Box::new(pending),
+                },
+                outcome => Begun::Done(Box::new(outcome)),
+            },
             IdemBegin::Conflict => Begun::Done(Box::new(Outcome::Error {
                 error: ErrorBody::new(
                     &codes::IDEMPOTENCY_CONFLICT,
@@ -464,8 +508,117 @@ impl Inner {
         })
     }
 
+    /// A retry whose row holds a stored `pending_confirmation` (module docs, "Confirmations"):
+    /// the confirm stage decides. Approved: the row is taken back (`idem_reclaim`) and the call
+    /// runs with the approval; when a concurrent retry took it first, this one is
+    /// `idempotency.in_progress`. Denied or expired: the key is released and the call ends
+    /// with `confirm.denied` or `confirm.expired`. Still pending: the same
+    /// `pending_confirmation`, except for a non-interactive caller, which never gets one
+    /// (QA-016): `confirm.unavailable`, and the key is kept for an interactive retry.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's parts, each from a different stage"
+    )]
+    async fn resume(
+        &self,
+        in_flight: &CallGuard,
+        session: &Session,
+        db: DbHandle,
+        idem: IdemRef<'_>,
+        stored: Outcome<ToolOutput>,
+        tool: &str,
+        trace_id: &str,
+    ) -> Resumed {
+        let done = |outcome: Outcome<ToolOutput>| Resumed::Done(Box::new(outcome));
+        let fail = |spec: &CodeSpec, message: String| {
+            done(Outcome::Error {
+                error: ErrorBody::new(spec, message, trace_id),
+            })
+        };
+        let decision = match self.hooks.confirm.on_replay(db.get(), idem).await {
+            Ok(decision) => decision,
+            Err(e) => return done(state_unavailable(&e, trace_id)),
+        };
+        let unavailable = || {
+            fail(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "{tool} waits for your confirmation, and this session is non-interactive, so it can't wait. Answer it in the LILITH app, then retry with the same idempotency key from a session that can."
+                ),
+            )
+        };
+        match decision {
+            None if session.non_interactive => unavailable(),
+            None => done(stored),
+            Some(ReplayDecision::StillPending(_)) if session.non_interactive => unavailable(),
+            Some(ReplayDecision::StillPending(pending)) => {
+                done(Outcome::PendingConfirmation(pending))
+            }
+            Some(ReplayDecision::Denied) => {
+                self.release(&db, idem).await;
+                fail(
+                    &codes::CONFIRM_DENIED,
+                    format!("You denied {tool}, so it did not run."),
+                )
+            }
+            Some(ReplayDecision::Expired) => {
+                self.release(&db, idem).await;
+                fail(
+                    &codes::CONFIRM_EXPIRED,
+                    format!(
+                        "The confirmation for {tool} expired before you answered it, so it did not run. Call it again to ask again."
+                    ),
+                )
+            }
+            Some(ReplayDecision::Run(approval)) => {
+                match db
+                    .get()
+                    .idem_reclaim(idem.scope, idem.key, idem.args_hash)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(confirmation = %approval.confirmation_id, tool, "an approved call runs");
+                        Resumed::Run(Box::new((
+                            Claim {
+                                db,
+                                scope: idem.scope.to_string(),
+                                key: idem.key.to_string(),
+                                follow_up: Some(in_flight.follow_up()),
+                                finished: false,
+                            },
+                            approval,
+                        )))
+                    }
+                    Ok(false) => fail(
+                        &codes::IDEMPOTENCY_IN_PROGRESS,
+                        format!(
+                            "A call with the idempotency key {:?} is already running; retry with the same key.",
+                            idem.key
+                        ),
+                    ),
+                    Err(e) => done(state_unavailable(&e, trace_id)),
+                }
+            }
+        }
+    }
+
+    /// Releases the key of a stored `pending_confirmation` whose confirmation was denied or
+    /// expired: the row is taken back and deleted (a concurrent retry may have done it first).
+    async fn release(&self, db: &DbHandle, idem: IdemRef<'_>) {
+        let db = db.get();
+        let released = match db.idem_reclaim(idem.scope, idem.key, idem.args_hash).await {
+            Ok(true) => db.idem_finish(idem.scope, idem.key, None).await,
+            Ok(false) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = released {
+            tracing::warn!(key = idem.key, error = %e, "the key of an ended confirmation could not be released");
+        }
+    }
+
     /// Stages 3–9: the outcome, and the job the call submitted. `retry`: the call is a retry
-    /// of that job, in that project.
+    /// of that job, in that project. `approved`: a confirmation you approved, for this call
+    /// or, through `job.retry`, for the call it runs again.
     #[allow(
         clippy::too_many_arguments,
         reason = "the call's parts, each from a different stage"
@@ -479,12 +632,16 @@ impl Inner {
         idem: Option<IdemRef<'_>>,
         trace_id: &str,
         retry: Option<Retrying>,
+        approved: Option<Approval>,
     ) -> (Outcome<ToolOutput>, Option<JobId>) {
         let hooks = &self.hooks;
         let d = tool.descriptor();
         // Resolve, the project part (ARCH-088, ARCH-098), now that the arguments are valid. A
         // retry runs in the retried job's project.
         let named = named_project(d, &args);
+        let (is_retry, always_confirm) = retry
+            .as_ref()
+            .map_or((false, false), |r| (true, r.always_confirm));
         let (retry_of, retry_project) = retry.map_or((None, None), |r| (Some(r.of), r.project));
         let project = match &workspace {
             None => None,
@@ -515,41 +672,39 @@ impl Inner {
             }
         };
         let estimate = hooks.estimate.estimate(d, &args, &settings);
-        // 5. Confirm and caps.
-        let decision = hooks
-            .confirm
-            .check(ConfirmInput {
-                session,
-                descriptor: d,
-                estimate: &estimate,
-                args: &args,
-                idem,
-                workspace: workspace.as_deref(),
-            })
-            .await;
+        // 5. Confirm and caps. A confirmation you approved for this tool and these arguments
+        // satisfies it (its `allow_once` lets the reservation pass the caps once); one for
+        // another call (the call a `job.retry` runs again) goes on to that call.
+        let confirm_input = ConfirmInput {
+            session,
+            descriptor: d,
+            estimate: &estimate,
+            args: &args,
+            idem,
+            workspace: workspace.as_deref(),
+            project: project.as_deref(),
+            retry: is_retry,
+            always_confirm,
+        };
+        let (decision, passed_on) = match approved {
+            Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => (
+                ConfirmDecision::Proceed {
+                    confirmed_via: Some(a.confirmed_via),
+                    cap_override: a.allowed.clone(),
+                },
+                None,
+            ),
+            other => {
+                let decision = hooks.confirm.check(confirm_input).await;
+                (decision, other)
+            }
+        };
         let (confirmed_via, cap_override) = match decision {
             ConfirmDecision::Proceed {
                 confirmed_via,
                 cap_override,
             } => (confirmed_via, cap_override),
-            ConfirmDecision::Pending(pending) => {
-                return (Outcome::PendingConfirmation(pending), None);
-            }
-            ConfirmDecision::Unavailable => {
-                let error = ErrorBody::new(
-                    &codes::CONFIRM_UNAVAILABLE,
-                    format!(
-                        "{} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app.",
-                        d.name
-                    ),
-                    trace_id,
-                );
-                return (Outcome::Error { error }, None);
-            }
-            ConfirmDecision::CapExceeded(mut error) => {
-                error.trace_id = trace_id.to_string();
-                return (Outcome::Error { error }, None);
-            }
+            other => return (refused(other, &d.name, trace_id), None),
         };
         // 6. Reserve.
         let call_id = self.ids.id("c");
@@ -560,20 +715,16 @@ impl Inner {
                 estimate: &estimate,
                 workspace_id: session.workspace_id(),
                 call_id: &call_id,
-                allow_once: cap_override.as_deref(),
+                allow_once: cap_override.as_ref(),
             })
             .await;
         let reservation = match reserved {
             Ok(ReserveOutcome::None) => None,
             Ok(ReserveOutcome::Reserved(id)) => Some(id),
+            // Another call took the room after stage 5: the confirm stage asks for the cap only.
             Ok(ReserveOutcome::NeedsCap(hits)) => {
-                let caps: Vec<&str> = hits.iter().map(|h| h.cap.as_str()).collect();
-                let error = ErrorBody::new(
-                    &codes::CAP_EXCEEDED,
-                    format!("{} would pass the cap {}.", d.name, caps.join(", ")),
-                    trace_id,
-                );
-                return (Outcome::Error { error }, None);
+                let decision = hooks.confirm.cap_needed(confirm_input, hits).await;
+                return (refused(decision, &d.name, trace_id), None);
             }
             Err(mut error) => {
                 error.trace_id = trace_id.to_string();
@@ -583,6 +734,7 @@ impl Inner {
         // 7. Execute, in its own task: a panic stays in it.
         let open = workspace.clone();
         let arguments = args.clone();
+        let pending = Arc::new(PendingSlot::default());
         let ctx = CallCtx {
             session: session.clone(),
             trace_id: trace_id.to_string(),
@@ -600,7 +752,16 @@ impl Inner {
             tool: d.name.clone(),
             arguments,
             retry_of,
-            redispatch: Some(Redispatch(self.me.clone())),
+            redispatch: Some(Redispatch {
+                inner: self.me.clone(),
+                approved: passed_on,
+                pending: pending.clone(),
+                idem: idem.map(|i| IdemRow {
+                    scope: i.scope.to_string(),
+                    key: i.key.to_string(),
+                    args_hash: i.args_hash.to_string(),
+                }),
+            }),
         };
         let running = tool.clone();
         let run_ctx = ctx.clone();
@@ -621,6 +782,10 @@ impl Inner {
                 }
             }
         };
+        // A `job.retry` whose call waits for your confirmation: the retry call itself waits.
+        if let Some(waiting) = pending.take() {
+            outcome = Outcome::PendingConfirmation(waiting);
+        }
         // A call that named a project and ended `ok` makes it the session's active project
         // and, on a read-write workspace, the workspace's hint (ARCH-088).
         if let (Outcome::Ok(_), Some(open), Some(slug)) = (&outcome, &open, &named)
@@ -651,10 +816,24 @@ impl Inner {
         (outcome, None)
     }
 
-    /// `job.retry` (module docs, "Retries"): the job its call submitted.
-    async fn retry(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
+    /// `job.retry` (module docs, "Retries"): the job its call submitted. A call that waits for
+    /// your confirmation leaves it in `pending`, and the retry call itself waits.
+    async fn retry(
+        &self,
+        ctx: &CallCtx,
+        id: &JobId,
+        approved: Option<Approval>,
+        pending: &PendingSlot,
+        row: Option<&IdemRow>,
+    ) -> Result<JobSummary, ErrorBody> {
         let caller = ctx.job_caller();
-        let RetryPlan { origin, project } = ctx.jobs.retry_origin(&caller, id).await?;
+        // Its preconditions are checked again on every run, an approved one's too: the job
+        // must still be retryable.
+        let RetryPlan {
+            origin,
+            project,
+            interrupted_with_side_effects,
+        } = ctx.jobs.retry_origin(&caller, id).await?;
         let not_retryable =
             |why: String| ErrorBody::new(&codes::JOB_NOT_RETRYABLE, why, ctx.trace_id.clone());
         let session = &ctx.session;
@@ -674,13 +853,11 @@ impl Inner {
                 origin.tool
             ))
         })?;
-        // The retry call's own idempotency row (stage 2 made it): scope, key and hash.
-        let scope = format!("{}|{}", session.caller, session.workspace_id());
-        let hash = call_hash(JOB_RETRY, &json!({"job_id": id.as_str()}));
-        let idem = ctx.idem_key.as_deref().map(|key| IdemRef {
-            scope: &scope,
-            key,
-            args_hash: &hash,
+        // The retry call's own idempotency row, as stage 2 made it: scope, key and hash.
+        let idem = row.map(|r| IdemRef {
+            scope: &r.scope,
+            key: &r.key,
+            args_hash: &r.args_hash,
         });
         let (outcome, submitted) = Box::pin(self.run(
             session,
@@ -692,7 +869,9 @@ impl Inner {
             Some(Retrying {
                 of: id.clone(),
                 project,
+                always_confirm: interrupted_with_side_effects,
             }),
+            approved,
         ))
         .await;
         match outcome {
@@ -708,14 +887,16 @@ impl Inner {
                 )),
             },
             Outcome::Error { error } => Err(error),
-            // Task 14: the retry call itself then waits for the confirmation.
-            Outcome::PendingConfirmation(_) => Err(ErrorBody::new(
-                &codes::CONFIRM_UNAVAILABLE,
-                format!(
-                    "Retrying job {id} needs your confirmation, and a retry can't ask for one yet. Retry it from the LILITH app."
-                ),
-                ctx.trace_id.clone(),
-            )),
+            // The retry call itself waits for the confirmation: the dispatcher makes its
+            // outcome this `pending_confirmation` (this error is never seen).
+            Outcome::PendingConfirmation(waiting) => {
+                pending.set(waiting);
+                Err(ErrorBody::new(
+                    &codes::CONFIRM_UNAVAILABLE,
+                    format!("Retrying job {id} waits for your confirmation."),
+                    ctx.trace_id.clone(),
+                ))
+            }
         }
     }
 
@@ -740,9 +921,44 @@ impl Inner {
 }
 
 /// The dispatcher, as a call's context holds it (`CallCtx::redispatch`): `job.retry` runs the
-/// call that made a job again through it (module docs, "Retries").
+/// call that made a job again through it (module docs, "Retries"), with the confirmation you
+/// approved for that call, if any, and a slot for the `pending_confirmation` it may get.
 #[derive(Clone)]
-pub struct Redispatch(Weak<Inner>);
+pub struct Redispatch {
+    inner: Weak<Inner>,
+    approved: Option<Approval>,
+    pending: Arc<PendingSlot>,
+    /// The `job.retry` call's own idempotency row: a confirmation it asks for is keyed by it.
+    idem: Option<IdemRow>,
+}
+
+/// An idempotency row's scope, key and arguments hash, owned.
+#[derive(Debug, Clone)]
+struct IdemRow {
+    scope: String,
+    key: String,
+    args_hash: String,
+}
+
+/// Where a `job.retry` leaves the `pending_confirmation` of the call it ran again.
+#[derive(Debug, Default)]
+struct PendingSlot(std::sync::Mutex<Option<PendingConfirmation>>);
+
+impl PendingSlot {
+    fn set(&self, p: PendingConfirmation) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(p);
+    }
+
+    fn take(&self) -> Option<PendingConfirmation> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
 
 impl std::fmt::Debug for Redispatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -759,21 +975,69 @@ impl Redispatch {
     /// longer fit), and whatever the stages or the tool give (`confirm.unavailable`,
     /// `cap.exceeded`, …).
     pub(crate) async fn retry(&self, ctx: &CallCtx, id: &JobId) -> Result<JobSummary, ErrorBody> {
-        let Some(inner) = self.0.upgrade() else {
+        let Some(inner) = self.inner.upgrade() else {
             return Err(ErrorBody::new(
                 &codes::CORE_DRAINING,
                 "The core is shutting down. Retry with the same idempotency key once it runs again.",
                 ctx.trace_id.clone(),
             ));
         };
-        inner.retry(ctx, id).await
+        inner
+            .retry(
+                ctx,
+                id,
+                self.approved.clone(),
+                &self.pending,
+                self.idem.as_ref(),
+            )
+            .await
     }
 }
 
-/// A call that retries job `of`, in the job's project.
+/// A call that retries job `of`, in the job's project. `always_confirm`: the job had
+/// external side effects and was interrupted (P3-R21).
 struct Retrying {
     of: JobId,
     project: Option<String>,
+    always_confirm: bool,
+}
+
+/// What a retry of a stored `pending_confirmation` does next.
+enum Resumed {
+    /// Run the call with the approval; the claim finishes the row. Boxed, as `Done`.
+    Run(Box<(Claim, Approval)>),
+    /// It is answered already. Boxed, as [`Begun::Done`].
+    Done(Box<Outcome<ToolOutput>>),
+}
+
+/// The outcome of a call stage 5 did not let run (a `Proceed` here is a stage's bug: the call
+/// is refused, failing closed).
+fn refused(decision: ConfirmDecision, tool: &str, trace_id: &str) -> Outcome<ToolOutput> {
+    match decision {
+        ConfirmDecision::Pending(pending) => Outcome::PendingConfirmation(pending),
+        ConfirmDecision::Unavailable => Outcome::Error {
+            error: ErrorBody::new(
+                &codes::CONFIRM_UNAVAILABLE,
+                format!(
+                    "{tool} needs your confirmation, and this session has no way to ask you. Run it from the LILITH app."
+                ),
+                trace_id,
+            ),
+        },
+        ConfirmDecision::CapExceeded(mut error) | ConfirmDecision::Failed(mut error) => {
+            error.trace_id = trace_id.to_string();
+            Outcome::Error { error }
+        }
+        ConfirmDecision::Proceed { .. } => Outcome::Error {
+            error: ErrorBody::new(
+                &codes::CORE_BUG,
+                format!(
+                    "The confirm stage let {tool} run after a cap was passed. This is a bug in LILITH."
+                ),
+                trace_id,
+            ),
+        },
+    }
 }
 
 /// The idempotency hash of a call of `name` with `args`.
@@ -812,6 +1076,12 @@ enum Begun {
     /// It is answered already: a replay or an idempotency error. Boxed: an `Outcome` holds
     /// `serde_json::Value`s, which `preserve_order` (ARCH-076) makes ordered maps.
     Done(Box<Outcome<ToolOutput>>),
+    /// The stored outcome is a `pending_confirmation`: the confirm stage decides what the
+    /// retry gets ([`Inner::resume`]).
+    Pending {
+        db: DbHandle,
+        stored: Box<Outcome<ToolOutput>>,
+    },
 }
 
 /// A database the dispatcher holds across the call. A workspace one holds the whole open

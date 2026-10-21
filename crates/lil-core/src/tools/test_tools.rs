@@ -54,7 +54,7 @@
 //!
 //! `executions` counts the runs of that tool with that label or gate in this core, failed runs
 //! included; `count` counts `test.destructive`'s runs in this core. Its `cost` is read by the
-//! estimate stage once caps exist (plan 3 Task 16) and is otherwise unused. `test.emit` is
+//! estimate stage (`ToolEstimates`), so the call is reserved against the caps. `test.emit` is
 //! `read`: it changes no state, only publishes an event (so it needs no idempotency key); a
 //! topic that makes no valid name is `params.invalid`.
 
@@ -442,7 +442,6 @@ struct StatePanicResult {
 struct DestructiveArgs {
     /// What the call would cost, a decimal string in the display currency.
     #[serde(default)]
-    #[expect(dead_code, reason = "the estimate stage reads it (plan 3 Task 16)")]
     cost: Option<String>,
 }
 
@@ -820,7 +819,21 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         "Test channels only: a destructive tool that only counts its runs. `cost` is a decimal string.",
         EffectClass::Destructive,
         TEST_MODULE,
-        move |_ctx, _args: DestructiveArgs| {
+        move |ctx, args: DestructiveArgs| {
+            // A cost that isn't a non-negative decimal is refused before anything runs (it
+            // would credit the caps).
+            let bad = args.cost.as_deref().is_some_and(|c| {
+                lil_schema::money::Money::parse_decimal(c)
+                    .map_or(true, |m| m < lil_schema::money::Money::ZERO)
+            });
+            if bad {
+                let error = ErrorBody::new(
+                    &codes::PARAMS_INVALID,
+                    "cost must be a non-negative decimal string",
+                    ctx.trace_id.clone(),
+                );
+                return Box::pin(std::future::ready(Err(error)));
+            }
             let count = destructive_counters.bump("test.destructive", "");
             Box::pin(async move { Ok((DestructiveResult { count }, format!("run {count}"))) })
         },
