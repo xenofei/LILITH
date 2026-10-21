@@ -290,3 +290,7 @@ CORE-001 = "n/a"
 QA-090 = "test"
 QA-089 = "manual"
 CORE-178 = "manual"
+# Owner decisions 2026-10-21 (plan 4b): checked when plan 4b lands its tests.
+CORE-179 = "manual"
+APP-163 = "manual"
+APP-164 = "manual"

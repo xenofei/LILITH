@@ -12,8 +12,9 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 |---|---|---|---|
 | Core (`lil-core`) | The per-user headless Rust service that owns all workspace state and engines; the only writer of workspace files. | server, daemon, backend | ARCH-001, ARCH-002, ARCH-004 |
 | App | A Qt/QML process that is a client of the core and is usable on its own (for example `lil-image`). | module (a core part), plugin | APP-001, ARCH-003 |
-| Studio | An app that is an asset generator: you describe an asset, get candidates and revise them (the Image studio first, the 2D module next). | Prompt Studio (a tab, not a studio), app (when the asset loop is meant) | APP-161, IMG-001 |
-| Image studio | The first studio, `lil-image`: canvas, ComfyUI graph and embedded ComfyUI web UI. | image app, image editor | IMG-001, IMG-002 |
+| Studio | An app that is an asset generator: you describe an asset, get takes and revise them. Each has a proper name: ATHANOR, the Image studio; ALEMBIC, the 2D studio; CRUCIBLE, the 3D studio; AETHER, the Audio studio; MERCURIUS, the Animation studio; TERRA, the World studio; GRIMOIRE, the Narrative studio; SPECULUM, the Video studio; HOMUNCULUS, the Avatar studio. Window titles and splashes use the proper name; launchers and menus lead with the plain name. | Prompt Studio (a tab, not a studio), module (for a studio), app (when the asset loop is meant) | APP-161, APP-164, IMG-001 |
+| Image studio (ATHANOR) | The first studio, `lil-image`: canvas, ComfyUI graph and embedded ComfyUI web UI. | image app, image editor | IMG-001, IMG-002, APP-164 |
+| LILITH (the shell) | The shared shell every studio runs in; it has no other name, and the Asset browser and Review are panels in it. | Hub (the later app), studio | APP-164 |
 | Prompt Studio | In M1, a main-area tab of the Image studio, backed by the core module `prompt`, that turns a request into a brief and compiles it; a standalone app is Later. | studio (it is not one) | APP-149, AI-157 |
 | Hub | The later `lil-hub` app that takes the shared panels over from the Image studio once a second app exists. Also the H in the suite's name, which is not a component. | Home panel, core | ARCH-011, ARCH-010 |
 | Shared panels | The suite-wide panels (Home, Asset browser, Inspector, Review, Libraries, Jobs, Confirmations, Usage & spend and others) that the Image studio hosts in M1. | studio panels | ARCH-010, APP-008 |
@@ -30,8 +31,9 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Project | A folder of assets inside a workspace, with its own `project.yaml` settings; the active project is per client session. | workspace | ARCH-088, CORE-057 |
 | Workspace format | The on-disk schemas for workspace, project, asset manifests, registries and job records. | manifest format (only one part) | CORE-178, CORE-148, Appendix E |
 | Asset | A tracked deliverable in a project, with a manifest, a status and sealed versions. | file, item (a library item is different) | CORE-023, CORE-048 |
-| Version (sealed version) | An immutable `v<semver>/` folder of an asset, made by sign-off. | revision, snapshot (a snapshot is an autosave) | CORE-026, ARCH-087 |
-| Candidate | One output of a candidate run, waiting for review. | draft, proposal (a proposal belongs to a document) | CORE-023, APP-057 |
+| Version (sealed version) | An immutable `v<semver>/` folder of an asset, made by sign-off; in copy, "version" means only this. | revision, take, snapshot (a snapshot is an autosave) | CORE-026, ARCH-087, APP-163 |
+| Candidate | The spec's and the code's word for one output of a candidate run, waiting for review; user-facing copy calls it a take. | draft, proposal (a proposal belongs to a document) | CORE-023, APP-057 |
+| Take | The user-facing name for one candidate: Take 1, Take 2 and so on, grouped by revision round. | version (only a sealed result), candidate (in copy) | APP-163 |
 | Candidate run | One generation for an asset, writing its outputs to `candidates/<run_id>/` and going through QA and repair. | job (the work that makes it), run (alone) | CORE-023, CORE-025 |
 | Sign-off | Choosing a candidate and sealing it as a new version; ungated for you, gated for agents by failed technical QA. | approve, accept, publish | CORE-026, CORE-051, CORE-132 |
 | Seal | The step of sign-off that moves the chosen files into a read-only version folder with a frozen manifest snapshot. | lock, freeze, commit | CORE-026 |
@@ -45,6 +47,7 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Proposal run | One generation for a document, kept under the document's `proposals/<run_id>/`, separate from candidate runs. | candidate run | CORE-043 |
 | Library resource | A typed reusable resource (swatch, palette, preset, model profile, workflow) in the workspace or personal scope. | library item, asset | APP-078, APP-079, APP-080 |
 | Library item | A promoted asset in `library/<kind>/`, referenced with `lib:` links (Later). | library resource | Appendix E, workspace format I7 |
+| Inbox | The workspace's `inbox/` quarantine where outside files wait for review; from plan 4b it receives the owned ComfyUI's new images. Nothing in it is an asset until you keep it. | staging, candidates | CORE-179, workspace format I1 |
 
 ## Tools, callers and safety
 
