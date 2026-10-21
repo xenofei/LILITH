@@ -234,7 +234,7 @@ mod tests {
 
     /// The number of tagged rule definitions in the spec. Update this one number when the
     /// spec gains or loses rules (the project's ID check prints the same count).
-    const EXPECTED_RULE_COUNT: usize = 1062;
+    const EXPECTED_RULE_COUNT: usize = 1073;
 
     /// The citation marker, built in two pieces so these fixtures are not themselves
     /// citations when `lil dev spec-report` scans this file.
