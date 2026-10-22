@@ -5,6 +5,11 @@
 //! It prints how many rules there are per classification and how many a test cites, and it
 //! fails when a citation names an ID that the spec does not define (a dangling citation).
 //! Rules classified `test` that no test cites are listed for information only.
+//!
+//! It also fails when a tracked Markdown file under `docs/` or at the root cites a ruling id
+//! from a private ledger (`P3-R9`, `ruling Q32`, `ledger ruling R-T`) that no such file
+//! records as a bullet starting `- **<id>**` (QA-090), so a reason never lives only in a
+//! private ledger.
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +23,8 @@ const CLASSIFICATION_PATH: &str = "dev/rule-classification.toml";
 const CLASSES: [&str; 5] = ["test", "lint", "manual", "n/a", "unclassified"];
 /// ID prefixes of the spec's rule definitions.
 const PREFIXES: [&str; 7] = ["ARCH", "CORE", "APP", "AI", "IMG", "QA", "OPS"];
+/// The Markdown files whose ruling citations are checked (QA-090): `docs/` and the root.
+const PUBLIC_MARKDOWN: &[&str] = &["docs", ":(glob)*.md"];
 /// What introduces a citation in a Rust source line. Built with `concat!` so this constant is
 /// not itself a citation when this file is scanned.
 const CITATION_MARKER: &str = concat!("// ", "spec:");
@@ -120,6 +127,150 @@ fn looks_like_id(token: &str) -> bool {
     }
 }
 
+/// A ruling id at the start of `s`: `R-T`, or `Q`/`R` then digits and an optional lowercase
+/// suffix (`Q32`, `R16b`). Returns the id's length.
+fn ledger_id_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let ends_at = |len: usize| (!b.get(len).is_some_and(u8::is_ascii_alphanumeric)).then_some(len);
+    if s.starts_with("R-T") {
+        return ends_at(3);
+    }
+    if !matches!(b.first(), Some(b'Q' | b'R')) {
+        return None;
+    }
+    let digits = b[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let len = 1 + digits;
+    ends_at(
+        len + b[len..]
+            .iter()
+            .take_while(|c| c.is_ascii_lowercase())
+            .count(),
+    )
+}
+
+/// A plan-numbered ruling id at the start of `s`: `P<digits>-R<digits>`. The plan number may
+/// carry one lowercase letter (`P2b-R4`, plan 2b) and the ruling number any (`P3-R16b`, an
+/// amendment of P3-R16). Returns the id's length.
+fn plan_ruling_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let count = |from: usize, f: fn(&u8) -> bool| b[from..].iter().take_while(|c| f(c)).count();
+    if b.first() != Some(&b'P') {
+        return None;
+    }
+    let mut at = 1;
+    for (i, sep) in ["", "-R"].into_iter().enumerate() {
+        if !s[at..].starts_with(sep) {
+            return None;
+        }
+        at += sep.len();
+        let digits = count(at, u8::is_ascii_digit);
+        if digits == 0 {
+            return None;
+        }
+        at += digits;
+        let letters = count(at, u8::is_ascii_lowercase);
+        // The plan number takes at most one letter; the ruling number takes them all.
+        at += if i == 0 { letters.min(1) } else { letters };
+    }
+    (!b.get(at).is_some_and(u8::is_ascii_alphanumeric)).then_some(at)
+}
+
+/// The ruling ids a line cites: every plan-numbered id (`P3-R9`), and the `Q`/`R` ids listed
+/// right after the word "ruling", "rulings" or "ledger" (`rulings Q31, Q34`, `ledger ruling
+/// R-T`, `rulings R15–R17`) or after a plan name and a comma (`(plan 1, R18: ...)`). A bare
+/// `R2` is not counted: it may be a product name.
+pub fn ruling_citations(line: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes = line.as_bytes();
+    let word_starts = line
+        .char_indices()
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
+    for i in word_starts {
+        let at = &line[i..];
+        if let Some(len) = plan_ruling_len(at) {
+            out.insert(at[..len].to_string());
+            continue;
+        }
+        let Some(mut rest) =
+            strip_keyword(at, &["rulings ", "ruling ", "ledger "]).or_else(|| strip_plan_name(at))
+        else {
+            continue;
+        };
+        rest = strip_keyword(rest, &["rulings ", "ruling "]).unwrap_or(rest);
+        while let Some(len) = ledger_id_len(rest) {
+            out.insert(rest[..len].to_string());
+            rest = &rest[len..];
+            match [", and ", ", ", " and ", "–", "-"]
+                .into_iter()
+                .find(|sep| rest.starts_with(sep))
+            {
+                Some(sep) => rest = &rest[sep.len()..],
+                None => break,
+            }
+        }
+    }
+    out
+}
+
+/// `text` without a leading plan name and comma: `plan 1, ` or `plan 2b, `.
+fn strip_plan_name(text: &str) -> Option<&str> {
+    let rest = strip_keyword(text, &["plan "])?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let letter = usize::from(
+        rest.as_bytes()
+            .get(digits)
+            .is_some_and(u8::is_ascii_lowercase),
+    );
+    rest[digits + letter..].strip_prefix(", ")
+}
+
+/// `text` without the first of `keywords` it starts with, compared without regard to case.
+fn strip_keyword<'a>(text: &'a str, keywords: &[&str]) -> Option<&'a str> {
+    keywords.iter().find_map(|k| {
+        let head = text.get(..k.len())?;
+        head.eq_ignore_ascii_case(k).then(|| &text[k.len()..])
+    })
+}
+
+/// The ruling ids a public file records, each as a bullet that starts with the id in bold:
+/// `- **P3-R9** …`, `- **R1:** …` or `- **Q32.** …`.
+pub fn ruling_records(markdown: &str) -> BTreeSet<String> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("- **")?;
+            let len = plan_ruling_len(rest).or_else(|| ledger_id_len(rest))?;
+            ["**", ":**", ".**"]
+                .iter()
+                .any(|end| rest[len..].starts_with(end))
+                .then(|| rest[..len].to_string())
+        })
+        .collect()
+}
+
+/// `(ruling id, "path:line")` for every ruling citation in `files` that no file records.
+pub fn unrecorded_rulings(files: &[(String, String)]) -> Vec<(String, String)> {
+    let recorded: BTreeSet<String> = files.iter().flat_map(|(_, t)| ruling_records(t)).collect();
+    let mut out = Vec::new();
+    for (path, text) in files {
+        for (n, line) in text.lines().enumerate() {
+            for id in ruling_citations(line) {
+                if !recorded.contains(&id) {
+                    out.push((id, format!("{path}:{}", n + 1)));
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn report(
     ids: &BTreeSet<String>,
     cited: &BTreeMap<String, Vec<String>>,
@@ -146,11 +297,16 @@ pub fn report(
     }
 }
 
-/// Tracked `.rs` files under `crates/` (never `target/`), read from the working tree.
-/// Tracked files deleted from the working tree are skipped.
-fn rust_sources(root: &Path) -> Result<Vec<(String, String)>, String> {
+/// Tracked files under `pathspecs` whose names end in `ext` (never `target/`), read from the
+/// working tree. Tracked files deleted from the working tree are skipped.
+fn tracked_files(
+    root: &Path,
+    pathspecs: &[&str],
+    ext: &str,
+) -> Result<Vec<(String, String)>, String> {
     let out = super::root::git_command()
-        .args(["ls-files", "-z", "--", "crates"])
+        .args(["ls-files", "-z", "--"])
+        .args(pathspecs)
         .current_dir(root)
         .output()
         .map_err(|e| format!("could not run git: {e}"))?;
@@ -162,7 +318,7 @@ fn rust_sources(root: &Path) -> Result<Vec<(String, String)>, String> {
     }
     let listing = String::from_utf8_lossy(&out.stdout);
     let mut sources = Vec::new();
-    for path in listing.split('\0').filter(|p| p.ends_with(".rs")) {
+    for path in listing.split('\0').filter(|p| p.ends_with(ext)) {
         if path.split('/').any(|part| part == "target") {
             continue;
         }
@@ -175,8 +331,8 @@ fn rust_sources(root: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(sources)
 }
 
-/// Prints the report. Exit 1 when a citation is dangling, 2 when the report can't be made,
-/// otherwise 0.
+/// Prints the report. Exit 1 when a citation is dangling or a private ruling citation has no
+/// public record, 2 when the report can't be made, otherwise 0.
 pub fn run() -> i32 {
     let root = match super::root::source_root() {
         Ok(r) => r,
@@ -192,9 +348,15 @@ pub fn run() -> i32 {
         let classification = read(CLASSIFICATION_PATH).and_then(|t| {
             Classification::parse(&t).map_err(|e| format!("{CLASSIFICATION_PATH}: {e}"))
         })?;
-        Ok((spec, classification, rust_sources(&root)?))
+        let sources = tracked_files(&root, &["crates"], ".rs")?;
+        Ok((
+            spec,
+            classification,
+            sources,
+            tracked_files(&root, PUBLIC_MARKDOWN, ".md")?,
+        ))
     });
-    let (spec, classification, sources) = match inputs {
+    let (spec, classification, sources, markdown) = match inputs {
         Ok(v) => v,
         Err(e) => {
             eprintln!("spec report: {e}");
@@ -225,7 +387,12 @@ pub fn run() -> i32 {
     for (id, place) in &r.dangling {
         eprintln!("dangling citation: {id} at {place} (the spec defines no such rule)");
     }
-    i32::from(!r.dangling.is_empty())
+    let unrecorded = unrecorded_rulings(&markdown);
+    println!("private ruling citations: {}", unrecorded.len());
+    for (id, place) in &unrecorded {
+        eprintln!("private ruling citation: {id} at {place} (no public `- **{id}**` record)");
+    }
+    i32::from(!r.dangling.is_empty() || !unrecorded.is_empty())
 }
 
 #[cfg(test)]
@@ -234,7 +401,7 @@ mod tests {
 
     /// The number of tagged rule definitions in the spec. Update this one number when the
     /// spec gains or loses rules (the project's ID check prints the same count).
-    const EXPECTED_RULE_COUNT: usize = 1073;
+    const EXPECTED_RULE_COUNT: usize = 1079;
 
     /// The citation marker, built in two pieces so these fixtures are not themselves
     /// citations when `lil dev spec-report` scans this file.
@@ -358,6 +525,69 @@ mod tests {
         assert_eq!(r.counts["n/a"], 1);
         assert_eq!(r.counts["unclassified"], 1);
         assert_eq!(r.counts["manual"], 0);
+    }
+
+    #[test] // spec: QA-090
+    fn ruling_citations_finds_plan_ids_and_keyword_lists() {
+        let found = |line: &str| ruling_citations(line).into_iter().collect::<Vec<_>>();
+        let at = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(found("(plan-3 ruling P3-R9)."), at(&["P3-R9"]));
+        assert_eq!(
+            found("rulings P3-R16, P3-R16b and P3-R17"),
+            at(&["P3-R16", "P3-R16b", "P3-R17"])
+        );
+        assert_eq!(found("(rulings Q31, Q34): once"), at(&["Q31", "Q34"]));
+        assert_eq!(
+            found("Ruling R22 and (ledger ruling R-T: targeted)"),
+            at(&["R-T", "R22"])
+        );
+        assert_eq!(
+            found("rulings R15–R17, and R30, then prose R2"),
+            at(&["R15", "R17", "R30"])
+        );
+        assert_eq!(found("ledger Q34 carry"), at(&["Q34"]));
+        assert_eq!(
+            found("(plan 1, R18: they control how the hooks run) and (plan 2b, Q32)"),
+            at(&["Q32", "R18"])
+        );
+        // Not citations: a bare R2 (Cloudflare R2), a plain number after "ruling", an id inside
+        // a longer word, a rule id.
+        assert!(found("R2 and B2 prices; review ruling 5; XP3-R9; QR12; QA-090").is_empty());
+        assert!(found("the rulings' reasons, ruling Q3X").is_empty());
+        assert!(found("plan 1 R18, plan x, R2, the plan, R3").is_empty());
+    }
+
+    #[test] // spec: QA-090
+    fn ruling_records_reads_bold_bullets_only() {
+        let md = [
+            "- **P3-R9** A model's calls run under an agent session. Why: …",
+            "  - **Q31** indented records count too",
+            "- **R1:** the plugin keeps its name.",
+            "- **P3-R16b.** dotted",
+            "- **R38 and more** bold text that is not an id alone",
+            "A line naming **P3-R10** is not a record",
+            "- **CORE-109** [M1] a rule, not a ruling",
+        ]
+        .join("\n");
+        assert_eq!(ruling_records(&md), ids(&["P3-R16b", "P3-R9", "Q31", "R1"]));
+    }
+
+    #[test] // spec: QA-090
+    fn unrecorded_ruling_citation_reported() {
+        let files = [
+            src(
+                "docs/plan.md",
+                "- **P3-R9** recorded with its reason\nsee ruling P3-R9 and ruling Q32\n",
+            ),
+            src(
+                "docs/spec.md",
+                "x\n(rulings Q31, P3-R9)\n- **Q31** recorded here\n",
+            ),
+        ];
+        assert_eq!(
+            unrecorded_rulings(&files),
+            vec![("Q32".to_string(), "docs/plan.md:2".to_string())]
+        );
     }
 
     #[test] // spec: QA-028

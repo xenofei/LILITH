@@ -25,7 +25,7 @@ Contents:
 Agents write most of the code here. The guard makes sure two things stay true however an agent behaves:
 
 - A change to a **protected file** reaches `main` only after the reviewer App has approved that exact commit, and the App can approve only when you type its passphrase at a terminal.
-- Agents merge **only** with `lil dev merge <PR>`, which checks everything first.
+- Every merge goes through `lil dev merge <PR>`, which checks everything first. You run it, never an agent (owner decision; standing rule since the rename, recorded 2026-10-21).
 
 Protected files are the ones that decide whether the tests and the guard itself can be trusted: spec tests, golden files, recorded fixtures, committed property-test seeds, `test-params.toml`, the hook scripts, the sources of `lil dev merge` and the guard, the settings in `dev/`, every workflow under `.github/workflows/`, `.claude/**`, `.cargo/**`, and a few build files (QA-019). The authoritative list is `dev/protected-paths.txt`. Only **adding** a file under the test homes (`crates/lil-spec-tests/**` and `**/proptest-regressions/**`) is free. Modifying or deleting any protected file, or adding one anywhere else, needs approval (QA-020).
 
@@ -325,19 +325,21 @@ Choose one of these if the gap above is not acceptable.
 
 1. Work in the fresh clone, on a branch (never `main`).
 2. Push the branch (the hooks run the privacy scan on every push) and open a pull request, as a draft or ready.
-3. Mark it ready, wait for the four checks, then run:
+3. Mark it ready, wait for the four checks, then tell the owner the PR is ready to merge.
 
-   ```powershell
-   cargo run -q -p lil-cli -- dev merge <PR>
-   ```
-
-   It merges only when CI is green for the PR's current head commit, any protected changes are approved, and the merge can be pinned to that commit.
-
-Agents never run `lil dev approve`, never run `gh` directly (they use `lil dev gh`), never push to `main` and never use `--no-verify`. The project's Claude Code settings deny those, and the hooks, the ruleset and the post-merge check back that up.
+Agents never run `lil dev approve` or `lil dev merge`: the owner runs both, from a separate clean checkout of `main` (owner decision; standing rule since the rename, recorded 2026-10-21). Agents also never run `gh` directly (they use `lil dev gh`), never push to `main` and never use `--no-verify`. The project's Claude Code settings deny those, and the hooks, the ruleset and the post-merge check back that up.
 
 ### What the owner does
 
-You only act when an agent asks for approval of a protected change:
+You run every merge, and approve protected changes first when a PR has them (owner decision; standing rule since the rename, recorded 2026-10-21). To merge, in the same clean checkout described in step 2 below:
+
+```powershell
+cargo run -q -p lil-cli -- dev merge <PR>
+```
+
+It merges only when CI is green for the PR's current head commit, any protected changes are approved, and the merge can be pinned to that commit.
+
+To approve a protected change:
 
 1. Read what changed. `lil dev approve` lists the protected files, but not their contents, so look at the diff of those files in the PR on GitHub first.
 2. In **PowerShell or Windows Terminal** (not mintty), run it in a clean checkout of `main` that agents can't write to. A separate clone used only for this works well. Update it first:
@@ -349,7 +351,7 @@ You only act when an agent asks for approval of a protected change:
    ```
 
    It prints the commit and the protected changes, then asks `(y/N)`. If you answer `y`, it asks for the reviewer key's passphrase, prints the App's live slug (`reviewer App slug: ...`; see "Renaming the App" in section 2.5), then posts one approving review from the App, pinned to that exact commit. It needs a GitHub token to read the PR, so run it where the agent token is stored (`lil dev agent-token status`), and the key file from 2.5 has to be on that PC.
-3. Right after posting, `lil dev approve` asks GitHub to re-run every red `protected-test-check` run of this PR for that commit and says so ("Asked GitHub to re-run protected-test-check (workflow runs ...)"). It only touches this PR's runs from this repository, never a fork's, and never runs waiting for a maintainer's approval (`action_required`). If a run is still going, it first waits for it to finish, for up to a minute. The re-runs see your approval and turn green within a few minutes. If the check had already passed, it says so and re-runs nothing. The agent then runs `lil dev merge <PR>`.
+3. Right after posting, `lil dev approve` asks GitHub to re-run every red `protected-test-check` run of this PR for that commit and says so ("Asked GitHub to re-run protected-test-check (workflow runs ...)"). It only touches this PR's runs from this repository, never a fork's, and never runs waiting for a maintainer's approval (`action_required`). If a run is still going, it first waits for it to finish, for up to a minute. The re-runs see your approval and turn green within a few minutes. If the check had already passed, it says so and re-runs nothing. Then run `lil dev merge <PR>`.
 
    If it prints **"Approval posted, but the guard check is still running; it will most likely read your approval when it finishes. If it ends red, re-run it: ..."**, a run was still going after the minute. GitHub re-runs only finished runs, so `lil` leaves it alone. Usually it reads your approval and ends green. If it ends red, re-run it as below.
 
