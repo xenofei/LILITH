@@ -1,0 +1,20 @@
+[package]
+name = "spike_shell_bridge"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# CMake (cxx_qt_import_crate / Corrosion) links this static library into the app.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1.0.176"
+cxx-qt = "=0.10.0"
+cxx-qt-lib = "=0.10.0"
+# The fake job feed's 512x512 JPEG frames (pure Rust, no system library).
+jpeg-encoder = "0.6"
+
+[build-dependencies]
+cxx-qt-build = "=0.10.0"
