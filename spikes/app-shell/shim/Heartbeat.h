@@ -1,7 +1,7 @@
 #pragma once
 // GUI-thread responsiveness (S0.6). A Qt::PreciseTimer heartbeat on the GUI thread records each
 // beat's lateness (measured interval minus the nominal interval, in ms); every attached window's
-// frameSwapped (render thread) records the frame interval. report() logs n, p50, p95, p99 and max
+// frameSwapped (render thread) records that window's frame intervals, kept per window. report() logs n, p50, p95, p99 and max
 // of both series and the raw samples, then clears them.
 
 #include "spike_shim_global.h"
@@ -42,5 +42,5 @@ private:
     mutable QMutex m_frameMutex;
     QHash<QObject *, qint64> m_lastFrameNs;
     QList<QObject *> m_windows; // attached windows, for the screen and refresh rate in report()
-    QVector<float> m_frames;
+    QHash<QObject *, QVector<float>> m_frames; // per window; S0.6 judges main-a's alone
 };

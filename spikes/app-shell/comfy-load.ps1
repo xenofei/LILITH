@@ -25,12 +25,14 @@
   Verdict (lib/SpikeMeasure.psm1, Get-S06Verdict):
     - FAIL if the app hung, crashed or logged no measured report (with any stack file named);
     - INVALID if the GPU samples don't cover the measured 60 s (>= 48 samples, no gap over 2 s),
-      the GPU dipped under 95 %, the refresh rate is unknown, or the list was hidden;
+      fewer than 90 % of them are >= 95 % (brief dips between prompts are allowed and recorded),
+      the refresh rate is unknown, or the list was hidden;
     - else PASS if heartbeat lateness p99 < 16 ms and frame interval p99 < the frame threshold:
-      16 ms, or 1.5 vsync periods on a screen whose period is >= 16 ms (60 Hz and below).
+      max(16 ms, 1.5 vsync periods of the primary display), on main-a's frames alone (75 Hz gives
+      20 ms, 60 Hz 25 ms, 144 Hz and up 16 ms). Frames over 1.5 vsync periods are counted too.
 
-  Before running: the 240 Hz monitor must be on and primary (main-a opens at (40, 40) on the
-  primary screen). The spike window stays on top during the 65 s run (an occluded window's
+  Run it on whichever display is primary: the result records its refresh rate, and the frame
+  threshold follows from it. The spike window stays on top during the 65 s run (an occluded window's
   timers are throttled, spike 04); don't use the mouse or keyboard while it runs.
 
   -SamplersOnly -ProcessId <pid> runs just the two samplers against another process for
@@ -153,15 +155,16 @@ try {
     $webShown = $ev | Where-Object { $_.event -eq 'web_dock_shown' } | Select-Object -First 1
     $hb = if ($measured) { Get-NearestRankStats @($measured.heartbeat_lateness_ms.raw) } else { $null }
     $fr = if ($measured) { Get-NearestRankStats @($measured.frame_interval_ms.raw) } else { $null }
-    $screenA = if ($measured) { @($measured.screens) | Where-Object { $_.window -eq 'main-a' } | Select-Object -First 1 } else { $null }
-    $refresh = if ($screenA) { [double]$screenA.refresh_hz } else { 0 }
+    $refresh = if ($measured) { [double]$measured.primary_refresh_hz } else { 0 }
     $endEpoch = if ($measured) { $appStart + [long]$measured.t_ms } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
     $cov = Test-GpuCoverage -Samples (Read-GpuSamples $gpuFile) -StartMs ($endEpoch - $MeasureSeconds * 1000) -EndMs $endEpoch
     $vram = @(Read-JsonLines $vramFile)
     $vWeb = @($vram | Where-Object { $webShown -and $_.t -ge ($appStart + [long]$webShown.t_ms + 3000) })
 
-    $res.screen = $screenA
+    $res.primary_refresh_hz = $refresh
+    $res.windows = if ($measured) { $measured.windows } else { $null }   # refresh rate and on_primary per window, no names
     $res.frame_threshold_ms = Get-FrameThresholdMs $refresh
+    $res.dropped_frames = if ($measured) { Get-DroppedFrames @($measured.frame_interval_ms.raw) $refresh } else { $null }
     $res.heartbeat_lateness_ms = $hb
     $res.frame_interval_ms = $fr
     $res.warmup = [ordered]@{ heartbeat = $warm.heartbeat_lateness_ms | Select-Object n, p50, p99, max; frames = $warm.frame_interval_ms | Select-Object n, p50, p99, max }

@@ -227,34 +227,9 @@ if (-not $NoBuild) {
     }
     $buildInfo.clean = [bool]$Clean
 }
-# Each warning is kept with its block: for a `CMake Warning`, every line up to the next blank
-# line after its text, including the call stack; for a compiler or cargo warning, the line and
-# the 3 after it. A CMake warning whose call stack names any of our files counts as ours, even
-# when it is raised inside Qt's or CMake's own modules.
-function Split-Warnings([string[]]$lines) {
-    $own = @(); $kddw = @(); $toolchain = @()
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $l = $lines[$i]
-        if ($l -notmatch '(?i)\bwarning\b') { continue }
-        if ($l -match '(?i)warning(s)? (generated|emitted)|0 warning') { continue }
-        $endIdx = [math]::Min($i + 3, $lines.Count - 1)
-        if ($l -match '^\s*CMake Warning') {
-            # A CMake message's body is indented or blank; it ends at the next unindented line.
-            $j = $i + 1
-            while ($j -lt $lines.Count -and ($lines[$j] -match '^\s' -or -not $lines[$j].Trim())) { $j++ }
-            $endIdx = [math]::Max($i, $j - 1)
-        }
-        $block = ($lines[$i..$endIdx] -join "`n").TrimEnd()
-        $ours = $block -match '(?i)spikes[\\/]app-shell[\\/](CMakeLists\.txt|shim|web|qml|tests|rust|main\.cpp)'
-        if ($l -match '(?i)_deps[\\/]kddockwidgets') { $kddw += $block }
-        elseif ($l -match '^\s*CMake Warning' -and -not $ours -and $block -match '(?i)C:[\\/]Qt[\\/]|Program Files') { $toolchain += $block }
-        elseif ($l -notmatch '^\s*CMake Warning' -and $l -match '(?i)C:[\\/]Qt[\\/]|Program Files|cmake-4|_deps[\\/](cxxqt|corrosion)') { $toolchain += $block }
-        else { $own += $block }
-    }
-    [ordered]@{ own = @($own | Select-Object -Unique); kddw = @($kddw | Select-Object -Unique); toolchain = @($toolchain | Select-Object -Unique) }
-}
-$confW = Split-Warnings @(if (Test-Path $confLog) { Get-Content $confLog })
-$buildW = Split-Warnings @(if (Test-Path $buildLog) { Get-Content $buildLog })
+# Warning blocks, split by where each is raised (lib/SpikeMeasure.psm1, Split-BuildWarnings).
+$confW = Split-BuildWarnings @(if (Test-Path $confLog) { Get-Content $confLog })
+$buildW = Split-BuildWarnings @(if (Test-Path $buildLog) { Get-Content $buildLog })
 $ownFiles = @(Join-Path $Root 'CMakeLists.txt') + @(Get-ChildItem (Join-Path $Root 'rust') -Recurse -Include Cargo.toml, build.rs | Where-Object { $_.FullName -notmatch '\\target\\' } | ForEach-Object FullName)
 $suppress = @(Select-String -Path $ownFiles -Pattern '/W[0-4]\b|/WX|-w\b|-Wno-|/wd\d|KDDockWidgets_WERROR|COMPILE_WARNING_AS_ERROR|allow\(warnings\)|RUSTFLAGS|cap-lints' | ForEach-Object { "$($_.Filename):$($_.LineNumber): $($_.Line.Trim())" })
 # Sources too: no #pragma warning and no Rust allow() of warnings in our own files.
@@ -558,7 +533,7 @@ if (Want 'S0.9') {
 
 # ==========================================================================================
 # S0.6 smoke (not a verdict): the S0.6 app run without ComfyUI, short, to check its plumbing:
-# the measured report, the screen and refresh rate, the list visible throughout, the Web dock
+# the measured report, the primary display's refresh rate, the list visible throughout, the Web dock
 # shown beside it. comfy-load.ps1 makes the real run.
 # ==========================================================================================
 if (Want 'S0.6smoke') {
@@ -566,14 +541,15 @@ if (Want 'S0.6smoke') {
     $ev = $r.events
     $m = Get-Events $ev 'stall_report' | Where-Object { $_.label -eq 'measured' } | Select-Object -Last 1
     $counts = Get-Events $ev 'load_counts' | Select-Object -Last 1
-    $scr = @($m.screens) | Where-Object { $_.window -eq 'main-a' } | Select-Object -First 1
+    $refresh = if ($m) { [double]$m.primary_refresh_hz } else { 0 }
     $hb = if ($m) { Get-NearestRankStats @($m.heartbeat_lateness_ms.raw) } else { $null }
     $fr = if ($m) { Get-NearestRankStats @($m.frame_interval_ms.raw) } else { $null }
-    $ok = ($r.run.exit_code -eq 0) -and $m -and $scr -and ($scr.refresh_hz -gt 0) -and $counts -and
+    $ok = ($r.run.exit_code -eq 0) -and $m -and ($refresh -gt 0) -and $counts -and
           ($counts.grid_visible_seconds -ge 9) -and ($counts.grid_hidden_seconds -eq 0) -and $counts.web_shown -and
           ($counts.feed_ticks -gt 0) -and ($counts.decoded -gt 0) -and ($counts.chart_points -gt 0)
     Set-Check 'S0.6smoke' ($(if ($ok) { 'OK (plumbing; not a verdict)' } else { 'BROKEN (plumbing)' })) ([ordered]@{
-        exit_code = $r.run.exit_code; screen = $scr; frame_threshold_ms = (Get-FrameThresholdMs ([double]$scr.refresh_hz))
+        exit_code = $r.run.exit_code; primary_refresh_hz = $refresh; windows = $m.windows; frame_threshold_ms = (Get-FrameThresholdMs $refresh)
+        dropped_frames = (Get-DroppedFrames @($m.frame_interval_ms.raw) $refresh)
         heartbeat_lateness_ms = $hb; frame_interval_ms = $fr; load_counts = $counts
         cpu_percent = (Get-CpuPercent); focus_taken = ($r.run.foreground_was_ours -gt 0); log = $r.log })
     Save-Results

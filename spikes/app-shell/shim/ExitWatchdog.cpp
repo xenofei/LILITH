@@ -5,7 +5,6 @@
 #include <QTimer>
 
 #include <algorithm>
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>

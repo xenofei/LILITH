@@ -49,7 +49,7 @@ You run this script yourself, when you're ready; no agent starts it. It:
 - runs the spike for 5 s of warm-up plus 60 s measured, then stops ComfyUI.
 
 Before you start it:
-- **The 240 Hz monitor must be on and primary.** `main-a` opens at (40, 40) on the primary screen, and the result records that screen's refresh rate.
+- Run it on whichever display is primary. The result records that display's refresh rate, and the frame threshold follows from it.
 - The spike window stays on top for that minute. Don't touch the mouse or keyboard while it runs.
 - Under this load, the Web dock sits below Jobs and Grid, so the scrolled list stays visible throughout.
 
@@ -58,9 +58,9 @@ pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1
 ```
 
 Result: `results/s06.json`.
-- **PASS** = heartbeat lateness p99 < 16 ms, and frame interval p99 under the frame threshold. The threshold is 16 ms, or 1.5 vsync periods on a 60 Hz screen.
+- **PASS** = heartbeat lateness p99 < 16 ms, and `main-a`'s frame-interval p99 under the frame threshold. The threshold is the larger of 16 ms and 1.5 vsync periods of the primary display: 16 ms at 144 Hz and above, 20 ms at 75 Hz, 25 ms at 60 Hz. The result also counts frames slower than 1.5 vsync periods (dropped frames).
 - **FAIL** = a crash, a hang, a missing report, or a slower result; the stack files are named in the result.
-- **INVALID** = the measurement conditions weren't met: GPU samples too sparse, the GPU under 95 %, the list hidden, or no refresh rate. Fix the condition and run it again.
+- **INVALID** = the measurement conditions weren't met: GPU samples too sparse, fewer than 90 % of the GPU samples at ≥ 95 %, the list hidden, or no refresh rate. Fix the condition and run it again. Brief GPU dips between prompts are allowed; each one is listed in the result.
 - It also records the spike's dedicated VRAM (`Local Usage`) with the web dock shown, for P4a-R15.
 
 If it FAILs, run the fallback once:
