@@ -82,7 +82,8 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP 'naqt.zip'
           Invoke-WebRequest https://github.com/jdpurcell/naqt/releases/download/latest/naqt.zip -OutFile $zip
           $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($sha -ne $env:NAQT_ZIP_SHA256) { Write-Host "::warning::naqt.zip sha256 is $sha, not the pinned $env:NAQT_ZIP_SHA256 (the 'latest' tag is rolling); continuing for this scratch timing run" }
+          # The 'latest' tag is rolling: run only the build whose hash spike 01 pinned.
+          if ($sha -ne $env:NAQT_ZIP_SHA256) { Write-Host "::error::naqt.zip sha256 is $sha, not the pinned $env:NAQT_ZIP_SHA256; not running it"; exit 1 }
           Expand-Archive $zip (Join-Path $env:RUNNER_TEMP 'naqt')
           $dll = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'naqt') -Recurse -Filter naqt.dll | Select-Object -First 1
           dotnet $dll.FullName install-qt windows desktop 6.12.0 win64_msvc2022_64 --outputdir C:\Qt `

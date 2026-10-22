@@ -26,7 +26,12 @@ pub mod qobject {
     unsafe extern "RustQt" {
         #[inherit]
         #[cxx_name = "beginInsertRows"]
-        fn begin_insert_rows(self: Pin<&mut GridModel>, parent: &QModelIndex, first: i32, last: i32);
+        fn begin_insert_rows(
+            self: Pin<&mut GridModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
 
         #[inherit]
         #[cxx_name = "endInsertRows"]
@@ -88,7 +93,9 @@ impl qobject::GridModel {
         match role {
             ROLE_LABEL => QVariant::from(&QString::from(&format!("asset {row:05}"))),
             ROLE_VALUE => QVariant::from(&((row * 7919) % 1000)),
-            ROLE_STATUS => QVariant::from(&QString::from(["queued", "running", "done", "failed"][(row % 4) as usize])),
+            ROLE_STATUS => QVariant::from(&QString::from(
+                ["queued", "running", "done", "failed"][(row % 4) as usize],
+            )),
             _ => QVariant::default(),
         }
     }

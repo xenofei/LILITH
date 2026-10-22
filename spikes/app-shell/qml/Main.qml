@@ -204,8 +204,14 @@ ApplicationWindow {
         Component.onCompleted: {
             addDockWidget(jobsDock, KDDW.KDDockWidgets.Location_OnLeft)
             addDockWidget(gridDock, KDDW.KDDockWidgets.Location_OnRight, null, Qt.size(520, 700))
-            gridDock.addDockWidgetAsTab(webDock)
-            gridDock.setAsCurrentTab()
+            if (mainA.loadOn) {
+                // S0.6: the Web dock gets its own place, so the scrolled list stays visible
+                // for the whole measurement (as a tab it would hide the Grid).
+                addDockWidget(webDock, KDDW.KDDockWidgets.Location_OnBottom, null, Qt.size(900, 160))
+            } else {
+                gridDock.addDockWidgetAsTab(webDock)
+                gridDock.setAsCurrentTab()
+            }
         }
     }
 
@@ -326,12 +332,16 @@ ApplicationWindow {
             if (mainA.measureSeconds > 0) {
                 Heartbeat.start(4)
                 runSteps([
-                    [5000, () => Heartbeat.report("warmup")],
+                    [5000, () => { Heartbeat.report("warmup"); gridContent.resetVisibility() }],
                     [mainA.measureSeconds * 1000, () => {
                         Heartbeat.report("measured")
                         SpikeLog.log("load_counts", { feed_ticks: Feed.ticks, decoded: Previews.decodedCount(),
                                                       grid_loaded: gridContent.loadedRows, grid_fetches: gridContent.fetches,
                                                       grid_rows_scrolled: gridContent.rowsScrolled,
+                                                      grid_visible_seconds: gridContent.visibleSeconds,
+                                                      grid_hidden_seconds: gridContent.hiddenSeconds,
+                                                      grid_visible_rows: gridContent.visibleRange(),
+                                                      web_shown: mainA.webShown,
                                                       chart_points: chartsContent.pointsReceived })
                     }],
                     [200, () => quitNow("measure")]

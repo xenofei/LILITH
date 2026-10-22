@@ -11,6 +11,24 @@ Rectangle {
     readonly property int loadedRows: gridModel.loaded
     readonly property int fetches: gridModel.fetches
     property real rowsScrolled: 0
+    // S0.6: how many 1 s samples saw the list on screen (its dock current and laid out).
+    property int visibleSeconds: 0
+    property int hiddenSeconds: 0
+    function resetVisibility() { visibleSeconds = 0; hiddenSeconds = 0 }
+    function visibleRange() {
+        return [list.indexAt(10, list.contentY + 1), list.indexAt(10, list.contentY + list.height - 2)]
+    }
+    Timer {
+        interval: 1000
+        repeat: true
+        running: root.scrolling
+        onTriggered: {
+            if (root.visible && list.visible && root.width > 0 && root.height > 0 && root.Window.window)
+                root.visibleSeconds++
+            else
+                root.hiddenSeconds++
+        }
+    }
 
     GridModel { id: gridModel }
 

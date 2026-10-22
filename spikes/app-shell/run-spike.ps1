@@ -32,7 +32,7 @@ param(
     [string]$KddwTag = 'v2.5.0',
     [string[]]$Only = @(),
     [int]$WarmStarts = 10,
-    [int]$BusyCpuPercent = 35
+    [int]$IdleCpuPercent = 35   # S0.5 (a) waits (up to 3 min) for the CPU to drop under this
 )
 $ErrorActionPreference = 'Stop'
 # -Only S0.1,S0.3 arrives as one string through pwsh -File.
@@ -44,7 +44,8 @@ $Build   = Join-Path $Root 'build'
 $CmakeDir = Join-Path $Build 'cmake'
 $BinDir  = Join-Path $CmakeDir 'bin'
 $Deploy  = Join-Path $Build 'deploy'
-$Runs    = Join-Path $Build 'runs'
+# Every harness run keeps its own logs: build/runs/<yyyyMMdd-HHmmss>/ (never overwritten).
+$Runs    = Join-Path $Build ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $Results = Join-Path $Root 'results'
 $ExeName = 'app_shell_spike.exe'
 $LocalSpike = Join-Path $env:LOCALAPPDATA 'LILITH-spike'
@@ -87,10 +88,7 @@ function Read-Log([string]$path) {
 }
 function Get-Events($log, [string]$name) { @($log | Where-Object { $_.event -eq $name }) }
 
-function Get-CpuPercent {
-    try { [math]::Round((Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).CounterSamples[0].CookedValue, 1) }
-    catch { -1 }
-}
+Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force   # Get-CpuPercent and the S0.6 helpers
 
 # The DLLs a launch needs. Build tree: Qt from QTDIR\bin (first on PATH), ours from bin\.
 # Deploy folder: everything in the folder itself, including the VC++ runtime.
@@ -148,8 +146,7 @@ function Invoke-App([string]$exe, [string[]]$appArgs, [hashtable]$envSet = @{}, 
 
 function Invoke-Spike([string]$exe, [string]$tag, [string[]]$extra, [hashtable]$envSet = @{}, [string[]]$envUnset = @(),
                       [int]$TimeoutSec = 60, [bool]$Deployed = $false) {
-    $log = Join-Path $Runs "$tag.jsonl"
-    Remove-Item $log -ErrorAction SilentlyContinue
+    $log = Join-Path $Runs "$tag.jsonl"   # $Runs is this harness run's own folder
     $run = Invoke-App $exe (@('--log', $log, '--no-activate') + $extra) $envSet $envUnset $TimeoutSec $Deployed
     [ordered]@{ tag = $tag; log = $log; run = $run; events = (Read-Log $log) }
 }
@@ -230,24 +227,39 @@ if (-not $NoBuild) {
     }
     $buildInfo.clean = [bool]$Clean
 }
+# Each warning is kept with its block: for a `CMake Warning`, every line up to the next blank
+# line after its text, including the call stack; for a compiler or cargo warning, the line and
+# the 3 after it. A CMake warning whose call stack names any of our files counts as ours, even
+# when it is raised inside Qt's or CMake's own modules.
 function Split-Warnings([string[]]$lines) {
     $own = @(); $kddw = @(); $toolchain = @()
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $l = $lines[$i]
         if ($l -notmatch '(?i)\bwarning\b') { continue }
         if ($l -match '(?i)warning(s)? (generated|emitted)|0 warning') { continue }
-        $ctx = ($lines[$i..([math]::Min($i + 3, $lines.Count - 1))] -join ' ')
-        if ($l -match '(?i)_deps[\\/]kddockwidgets') { $kddw += $l }
-        elseif ($l -match '(?i)C:[\\/]Qt[\\/]|Program Files|cmake-4|QmlAssetDownloader|_deps[\\/](cxxqt|corrosion)') { $toolchain += $l }
-        elseif ($l -match '^\s*CMake Warning' -and $ctx -match '(?i)C:[\\/]Qt[\\/]|Program Files') { $toolchain += $l }
-        else { $own += $l }
+        $endIdx = [math]::Min($i + 3, $lines.Count - 1)
+        if ($l -match '^\s*CMake Warning') {
+            # A CMake message's body is indented or blank; it ends at the next unindented line.
+            $j = $i + 1
+            while ($j -lt $lines.Count -and ($lines[$j] -match '^\s' -or -not $lines[$j].Trim())) { $j++ }
+            $endIdx = [math]::Max($i, $j - 1)
+        }
+        $block = ($lines[$i..$endIdx] -join "`n").TrimEnd()
+        $ours = $block -match '(?i)spikes[\\/]app-shell[\\/](CMakeLists\.txt|shim|web|qml|tests|rust|main\.cpp)'
+        if ($l -match '(?i)_deps[\\/]kddockwidgets') { $kddw += $block }
+        elseif ($l -match '^\s*CMake Warning' -and -not $ours -and $block -match '(?i)C:[\\/]Qt[\\/]|Program Files') { $toolchain += $block }
+        elseif ($l -notmatch '^\s*CMake Warning' -and $l -match '(?i)C:[\\/]Qt[\\/]|Program Files|cmake-4|_deps[\\/](cxxqt|corrosion)') { $toolchain += $block }
+        else { $own += $block }
     }
     [ordered]@{ own = @($own | Select-Object -Unique); kddw = @($kddw | Select-Object -Unique); toolchain = @($toolchain | Select-Object -Unique) }
 }
 $confW = Split-Warnings @(if (Test-Path $confLog) { Get-Content $confLog })
 $buildW = Split-Warnings @(if (Test-Path $buildLog) { Get-Content $buildLog })
-$ownFiles = @(Join-Path $Root 'CMakeLists.txt') + @(Get-ChildItem (Join-Path $Root 'rust') -Recurse -Include Cargo.toml, build.rs | ForEach-Object FullName)
+$ownFiles = @(Join-Path $Root 'CMakeLists.txt') + @(Get-ChildItem (Join-Path $Root 'rust') -Recurse -Include Cargo.toml, build.rs | Where-Object { $_.FullName -notmatch '\\target\\' } | ForEach-Object FullName)
 $suppress = @(Select-String -Path $ownFiles -Pattern '/W[0-4]\b|/WX|-w\b|-Wno-|/wd\d|KDDockWidgets_WERROR|COMPILE_WARNING_AS_ERROR|allow\(warnings\)|RUSTFLAGS|cap-lints' | ForEach-Object { "$($_.Filename):$($_.LineNumber): $($_.Line.Trim())" })
+# Sources too: no #pragma warning and no Rust allow() of warnings in our own files.
+$ownSources = @(Get-ChildItem (Join-Path $Root 'shim'), (Join-Path $Root 'web'), (Join-Path $Root 'tests'), (Join-Path $Root 'rust\src') -Recurse -File -Include *.cpp, *.h, *.rs -ErrorAction SilentlyContinue) + @(Get-Item (Join-Path $Root 'main.cpp'))
+$suppress += @(Select-String -Path $ownSources.FullName -Pattern '#\s*pragma\s+warning|#!?\[allow\(' | ForEach-Object { "$($_.Filename):$($_.LineNumber): $($_.Line.Trim())" })
 $buildOk = ($NoBuild -or (($buildInfo.configure_exit -eq 0) -and ($buildInfo.build_exit -eq 0))) -and (Test-Path $exePath)
 $buildInfo.warning_lines_own = @($confW.own + $buildW.own)
 $buildInfo.warning_lines_kddw = @($confW.kddw + $buildW.kddw)
@@ -454,11 +466,12 @@ if (Want 'S0.5a') {
     $starts = @()
     $cpu = @()
     for ($i = 0; $i -le $WarmStarts; $i++) {
-        # Measurement condition: wait (up to 3 minutes) for the machine to be idle, so other
-        # people's work doesn't decide the start time; the CPU load is recorded either way.
+        # Measurement condition (a deviation from the bar, recorded in §5): wait up to 3 minutes
+        # for the CPU to drop under -IdleCpuPercent. The load is recorded beside every start;
+        # it never changes the verdict: a start over 2,000 ms is FAIL whatever the load.
         $waitStart = Get-Date
         $cpuNow = Get-CpuPercent
-        while ($cpuNow -ge $BusyCpuPercent -and ((Get-Date) - $waitStart).TotalSeconds -lt 180) { Start-Sleep -Seconds 5; $cpuNow = Get-CpuPercent }
+        while ($cpuNow -ge $IdleCpuPercent -and ((Get-Date) - $waitStart).TotalSeconds -lt 180) { Start-Sleep -Seconds 5; $cpuNow = Get-CpuPercent }
         $r = Invoke-Spike $dExe "s05a-start$i" @('--quit-after', '2000') $StripSet $StripUnset 120 $true
         $fi = Get-Events $r.events 'first_frame' | Select-Object -First 1
         $it = Get-Events $r.events 'interactive' | Select-Object -First 1
@@ -477,12 +490,12 @@ if (Want 'S0.5a') {
     $avgCpu = [math]::Round(($cpu | Measure-Object -Average).Average, 1)
     $allLogged = @($timed | Where-Object { $null -eq $_.interactive_ms -or $_.exit_code -ne 0 }).Count -eq 0
     $under = $allLogged -and (@($timed | Where-Object { [double]$_.interactive_ms -ge 2000 }).Count -eq 0)
-    $verdict = if ($under) { 'PASS' } elseif ($avgCpu -ge $BusyCpuPercent) { 'INCONCLUSIVE' } else { 'FAIL' }
+    $verdict = if ($under) { 'PASS' } else { 'FAIL' }
     Set-Check 'S0.5a' $verdict ([ordered]@{
         interactive_ms = [ordered]@{ n = $iv.Count; p50 = (& $p50 $iv); max = ($iv | Select-Object -Last 1) }
         first_frame_ms = [ordered]@{ n = $fv.Count; p50 = (& $p50 $fv); max = ($fv | Select-Object -Last 1) }
-        machine_cpu_percent_avg = $avgCpu; busy_threshold_percent = $BusyCpuPercent
-        note = if ($verdict -eq 'INCONCLUSIVE') { 'over 2,000 ms while the machine was busy with other work; rerun when idle (OWNER-STEPS.md)' } else { $null }
+        machine_cpu_percent_avg = $avgCpu; machine_cpu_percent_max = ($cpu | Measure-Object -Maximum).Maximum
+        idle_wait_threshold_percent = $IdleCpuPercent
         starts = $starts })
     Save-Results
 }
@@ -544,6 +557,29 @@ if (Want 'S0.9') {
 }
 
 # ==========================================================================================
+# S0.6 smoke (not a verdict): the S0.6 app run without ComfyUI, short, to check its plumbing:
+# the measured report, the screen and refresh rate, the list visible throughout, the Web dock
+# shown beside it. comfy-load.ps1 makes the real run.
+# ==========================================================================================
+if (Want 'S0.6smoke') {
+    $r = Invoke-Spike $dExe 's06-smoke' @('--load', '--show-web', '2000', '--measure', '10') $StripSet $StripUnset 90 $true
+    $ev = $r.events
+    $m = Get-Events $ev 'stall_report' | Where-Object { $_.label -eq 'measured' } | Select-Object -Last 1
+    $counts = Get-Events $ev 'load_counts' | Select-Object -Last 1
+    $scr = @($m.screens) | Where-Object { $_.window -eq 'main-a' } | Select-Object -First 1
+    $hb = if ($m) { Get-NearestRankStats @($m.heartbeat_lateness_ms.raw) } else { $null }
+    $fr = if ($m) { Get-NearestRankStats @($m.frame_interval_ms.raw) } else { $null }
+    $ok = ($r.run.exit_code -eq 0) -and $m -and $scr -and ($scr.refresh_hz -gt 0) -and $counts -and
+          ($counts.grid_visible_seconds -ge 9) -and ($counts.grid_hidden_seconds -eq 0) -and $counts.web_shown -and
+          ($counts.feed_ticks -gt 0) -and ($counts.decoded -gt 0) -and ($counts.chart_points -gt 0)
+    Set-Check 'S0.6smoke' ($(if ($ok) { 'OK (plumbing; not a verdict)' } else { 'BROKEN (plumbing)' })) ([ordered]@{
+        exit_code = $r.run.exit_code; screen = $scr; frame_threshold_ms = (Get-FrameThresholdMs ([double]$scr.refresh_hz))
+        heartbeat_lateness_ms = $hb; frame_interval_ms = $fr; load_counts = $counts
+        cpu_percent = (Get-CpuPercent); focus_taken = ($r.run.foreground_was_ours -gt 0); log = $r.log })
+    Save-Results
+}
+
+# ==========================================================================================
 # S0.2: s02-lil-qt-route.ps1, run in a scratch worktree twice: with a dashed package name (the
 # workspace's convention, `lil-qt-probe`) and with an underscore one (`lil_qt_probe`), because
 # cxx-qt-cmake 0.10.0 and cxx-qt-build disagree on dashed names. Existing results are reused.
@@ -556,6 +592,10 @@ if (Want 'S0.2') {
         if (-not (Test-Path $f)) { & pwsh -NoProfile -File (Join-Path $Root 's02-lil-qt-route.ps1') -Pkg $variants[$k] -Out $f }
         $r02[$k] = Get-Content $f -Raw | ConvertFrom-Json
     }
+    # Reused, not rerun, when the files already exist: their write times say which run they're from.
+    $r02.result_files_written = [ordered]@{
+        dashed = (Get-Item (Join-Path $Results 's02-dashed.json')).LastWriteTime.ToString('o')
+        underscore = (Get-Item (Join-Path $Results 's02-underscore.json')).LastWriteTime.ToString('o') }
     $verdict = if ($r02.dashed.verdict -eq 'PASS') { 'PASS' }
                elseif ($r02.underscore.verdict -eq 'PASS') { 'PASS (with an underscore package name; a dashed one fails to link)' }
                else { 'FAIL' }
@@ -564,5 +604,9 @@ if (Want 'S0.2') {
 }
 
 Save-Results
-$failed = @($checks.Values | Where-Object { $_.verdict -notmatch '^PASS' })
+# This run's folder also keeps the build logs and the results as written.
+foreach ($f in @($confLog, $buildLog, (Join-Path $Build 'windeployqt.log'), (Join-Path $Results 'checks.json'))) {
+    if (Test-Path $f) { Copy-Item $f $Runs }
+}
+$failed = @($checks.Values | Where-Object { $_.verdict -notmatch '^(PASS|OK)' })
 Write-Host ("done in {0:N1} min; not passing: {1}" -f ((Get-Date) - $started).TotalMinutes, (($failed | ForEach-Object check) -join ', '))

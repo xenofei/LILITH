@@ -8,6 +8,7 @@
 
 #include <QElapsedTimer>
 #include <QHash>
+#include <QList>
 #include <QMutex>
 #include <QObject>
 #include <QTimer>
@@ -40,5 +41,6 @@ private:
 
     mutable QMutex m_frameMutex;
     QHash<QObject *, qint64> m_lastFrameNs;
+    QList<QObject *> m_windows; // attached windows, for the screen and refresh rate in report()
     QVector<float> m_frames;
 };

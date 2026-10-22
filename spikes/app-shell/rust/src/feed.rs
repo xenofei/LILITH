@@ -88,7 +88,7 @@ impl qobject::JobsFeed {
                         (job as i32, bytes, progress)
                     })
                     .collect();
-                let points: Vec<(i32, f64)> = if tick % rate == 0 {
+                let points: Vec<(i32, f64)> = if tick.is_multiple_of(rate) {
                     let t = (tick / rate) as f64;
                     (0..SERIES).map(|s| (s, telemetry_value(s, t))).collect()
                 } else {
@@ -96,7 +96,8 @@ impl qobject::JobsFeed {
                 };
                 let queued = thread.queue(move |mut feed| {
                     for (job, bytes, progress) in frames {
-                        feed.as_mut().frame(job, QByteArray::from(bytes.as_slice()), progress);
+                        feed.as_mut()
+                            .frame(job, QByteArray::from(bytes.as_slice()), progress);
                     }
                     for (series, value) in points {
                         feed.as_mut().telemetry(series, value);

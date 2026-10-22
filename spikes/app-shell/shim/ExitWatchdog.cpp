@@ -4,6 +4,8 @@
 #include <QElapsedTimer>
 #include <QTimer>
 
+#include <algorithm>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -75,33 +77,65 @@ std::vector<DWORD> threadIds()
     return out;
 }
 
-// Pass 1, safe while another thread holds the loader or heap lock: RIP plus a scan of the top
-// of the stack for addresses inside loaded modules (likely return addresses). No dbghelp, no
-// allocation while the thread is suspended.
-void quickDump(FILE *f, const std::vector<Module> &mods, DWORD tid, bool gui)
+// A thread's registers and the top of its stack, copied while it is suspended. The thread is
+// suspended only for GetThreadContext and ReadProcessMemory (kernel calls that take no user-mode
+// lock), and is resumed on every path before anything else runs, so a dump can never leave a
+// thread suspended. Everything after that (formatting, dbghelp) works on the copy.
+struct Snapshot {
+    DWORD tid = 0;
+    bool ok = false;
+    CONTEXT ctx = {};
+    DWORD64 stackBase = 0;           // = Rsp at the time of the copy
+    std::vector<unsigned char> stack; // up to kStackCopy bytes from Rsp
+};
+constexpr SIZE_T kStackCopy = 64 * 1024;
+
+Snapshot snapshot(DWORD tid)
 {
+    Snapshot s;
+    s.tid = tid;
+    s.stack.resize(kStackCopy); // allocate before suspending
     HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
     if (!th)
-        return;
-    DWORD64 rip = 0, rsp = 0;
-    DWORD64 words[256] = {};
-    SIZE_T got = 0;
+        return s;
+    SIZE_T copied = 0;
     if (SuspendThread(th) != DWORD(-1)) {
-        CONTEXT ctx = {};
-        ctx.ContextFlags = CONTEXT_CONTROL;
-        if (GetThreadContext(th, &ctx)) {
-            rip = ctx.Rip;
-            rsp = ctx.Rsp;
-            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rsp), words, sizeof(words), &got);
+        s.ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(th, &s.ctx)) {
+            s.ok = true;
+            s.stackBase = s.ctx.Rsp;
+            // Page by page, so the copy stops cleanly at the end of the committed stack.
+            const SIZE_T page = 4096;
+            const DWORD64 first = s.stackBase & ~DWORD64(page - 1);
+            SIZE_T head = SIZE_T(s.stackBase - first);
+            for (DWORD64 a = first; copied < kStackCopy; a += page) {
+                const SIZE_T skip = (a == first) ? head : 0;
+                const SIZE_T want = std::min<SIZE_T>(page - skip, kStackCopy - copied);
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(a + skip), s.stack.data() + copied, want, &got) || got == 0)
+                    break;
+                copied += got;
+            }
         }
         ResumeThread(th);
     }
     CloseHandle(th);
+    s.stack.resize(copied);
+    return s;
+}
+
+// Pass 1: RIP plus a scan of the copied stack for addresses inside loaded modules (likely return
+// addresses). No dbghelp.
+void quickDump(FILE *f, const std::vector<Module> &mods, const Snapshot &s, bool gui)
+{
+    const DWORD64 rip = s.ok ? s.ctx.Rip : 0;
     const Module *m = moduleOf(mods, rip);
-    std::fprintf(f, "--- thread %lu%s rip %s+0x%llx\n", tid, gui ? " (GUI)" : "", m ? m->name : "?",
+    std::fprintf(f, "--- thread %lu%s rip %s+0x%llx\n", s.tid, gui ? " (GUI)" : "", m ? m->name : "?",
                  (unsigned long long)(m ? rip - m->base : rip));
     int shown = 0;
-    for (SIZE_T i = 0; i < got / sizeof(DWORD64) && shown < (gui ? 40 : 12); ++i) {
+    const auto *words = reinterpret_cast<const DWORD64 *>(s.stack.data());
+    const SIZE_T n = std::min<SIZE_T>(s.stack.size() / sizeof(DWORD64), 256);
+    for (SIZE_T i = 0; i < n && shown < (gui ? 40 : 12); ++i) {
         if (const Module *r = moduleOf(mods, words[i])) {
             std::fprintf(f, "    ? %s+0x%llx\n", r->name, (unsigned long long)(words[i] - r->base));
             ++shown;
@@ -110,53 +144,64 @@ void quickDump(FILE *f, const std::vector<Module> &mods, DWORD tid, bool gui)
     std::fflush(f);
 }
 
-// Pass 2: symbolised stacks (dbghelp). Can block if a suspended thread holds a lock dbghelp
-// needs; pass 1 is already on disk by then.
-void fullDump(FILE *f, HANDLE process, DWORD tid)
+// StackWalk64 reads the stack from the copy (the live stack has moved on), anything else (code,
+// unwind data) from the process.
+thread_local const Snapshot *t_walking = nullptr;
+BOOL CALLBACK readFromSnapshot(HANDLE process, DWORD64 addr, PVOID buf, DWORD size, LPDWORD read)
 {
-    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!th)
-        return;
-    if (SuspendThread(th) == DWORD(-1)) {
-        CloseHandle(th);
-        return;
+    const Snapshot *s = t_walking;
+    if (s && addr >= s->stackBase && addr + size <= s->stackBase + s->stack.size()) {
+        std::memcpy(buf, s->stack.data() + (addr - s->stackBase), size);
+        if (read)
+            *read = size;
+        return TRUE;
     }
-    CONTEXT ctx = {};
-    ctx.ContextFlags = CONTEXT_FULL;
-    if (GetThreadContext(th, &ctx)) {
-        std::fprintf(f, "=== thread %lu\n", tid);
-        STACKFRAME64 frame = {};
-        frame.AddrPC.Offset = ctx.Rip;
-        frame.AddrPC.Mode = AddrModeFlat;
-        frame.AddrFrame.Offset = ctx.Rbp;
-        frame.AddrFrame.Mode = AddrModeFlat;
-        frame.AddrStack.Offset = ctx.Rsp;
-        frame.AddrStack.Mode = AddrModeFlat;
-        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 512];
-        for (int i = 0; i < 48; ++i) {
-            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, th, &frame, &ctx, nullptr,
-                             SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
-                break;
-            const DWORD64 pc = frame.AddrPC.Offset;
-            if (!pc)
-                break;
-            auto *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
-            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-            sym->MaxNameLen = 511;
-            DWORD64 disp = 0;
-            char module[MAX_PATH] = "?";
-            const DWORD64 base = SymGetModuleBase64(process, pc);
-            if (base)
-                GetModuleFileNameA(reinterpret_cast<HMODULE>(base), module, MAX_PATH);
-            const char *mn = std::strrchr(module, '\\');
-            if (SymFromAddr(process, pc, &disp, sym))
-                std::fprintf(f, "  %s!%s+0x%llx\n", mn ? mn + 1 : module, sym->Name, (unsigned long long)disp);
-            else
-                std::fprintf(f, "  %s+0x%llx\n", mn ? mn + 1 : module, (unsigned long long)(pc - base));
-        }
+    SIZE_T got = 0;
+    const BOOL ok = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(addr), buf, size, &got);
+    if (read)
+        *read = DWORD(got);
+    return ok;
+}
+
+// Pass 2: symbolised stacks (dbghelp), walked over the copy; no thread is suspended here, so if
+// dbghelp blocks on a lock a stalled thread holds, only this watchdog thread waits.
+void fullDump(FILE *f, HANDLE process, const Snapshot &s)
+{
+    if (!s.ok)
+        return;
+    std::fprintf(f, "=== thread %lu\n", s.tid);
+    CONTEXT ctx = s.ctx;
+    STACKFRAME64 frame = {};
+    frame.AddrPC.Offset = ctx.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = ctx.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = ctx.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 512];
+    t_walking = &s;
+    for (int i = 0; i < 48; ++i) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, nullptr, &frame, &ctx, readFromSnapshot,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+            break;
+        const DWORD64 pc = frame.AddrPC.Offset;
+        if (!pc)
+            break;
+        auto *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 disp = 0;
+        char module[MAX_PATH] = "?";
+        const DWORD64 base = SymGetModuleBase64(process, pc);
+        if (base)
+            GetModuleFileNameA(reinterpret_cast<HMODULE>(base), module, MAX_PATH);
+        const char *mn = std::strrchr(module, '\\');
+        if (SymFromAddr(process, pc, &disp, sym))
+            std::fprintf(f, "  %s!%s+0x%llx\n", mn ? mn + 1 : module, sym->Name, (unsigned long long)disp);
+        else
+            std::fprintf(f, "  %s+0x%llx\n", mn ? mn + 1 : module, (unsigned long long)(pc - base));
     }
-    ResumeThread(th);
-    CloseHandle(th);
+    t_walking = nullptr;
     std::fflush(f);
 }
 
@@ -168,15 +213,20 @@ void dumpAll(const std::wstring &wpath, const char *why, std::vector<Module> mod
     const std::vector<DWORD> tids = threadIds();
     std::fprintf(f, "%s; %zu other threads. Pass 1 (RIP and a stack scan), GUI thread first:\n", why, tids.size());
     std::fflush(f);
+    // One snapshot per thread, each suspended only while it is copied.
+    std::vector<Snapshot> snaps;
+    snaps.reserve(tids.size());
     for (DWORD tid : tids)
-        quickDump(f, mods, tid, tid == g_guiTid.load());
-    std::fprintf(f, "Pass 2 (dbghelp):\n");
+        snaps.push_back(snapshot(tid));
+    for (const Snapshot &s : snaps)
+        quickDump(f, mods, s, s.tid == g_guiTid.load());
+    std::fprintf(f, "Pass 2 (dbghelp, over the copies):\n");
     std::fflush(f);
     HANDLE process = GetCurrentProcess();
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     SymInitialize(process, nullptr, TRUE);
-    for (DWORD tid : tids)
-        fullDump(f, process, tid);
+    for (const Snapshot &s : snaps)
+        fullDump(f, process, s);
     std::fprintf(f, "end\n");
     std::fclose(f);
     SymCleanup(process);

@@ -4,7 +4,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMutexLocker>
+#include <QGuiApplication>
 #include <QQuickWindow>
+#include <QScreen>
 
 #include <algorithm>
 #include <cmath>
@@ -72,6 +74,7 @@ void Heartbeat::attach(QObject *window)
         return;
     if (!m_clock.isValid())
         m_clock.start();
+    m_windows.append(w);
     // frameSwapped is emitted on the render thread: record it there, under the mutex.
     connect(w, &QQuickWindow::frameSwapped, this, [this, w] {
         const qint64 now = m_clock.nsecsElapsed();
@@ -99,8 +102,20 @@ void Heartbeat::report(const QString &label)
         QMutexLocker lock(&m_frameMutex);
         frames = m_frames;
     }
+    // The frame interval can't be shorter than the vsync period, so the screen and its refresh
+    // rate go with every report (S0.6 judges the frame bar against it).
+    QJsonArray screens;
+    for (QObject *o : m_windows) {
+        auto *w = qobject_cast<QQuickWindow *>(o);
+        QScreen *s = w ? w->screen() : nullptr;
+        screens.append(QJsonObject{{"window", o->objectName()},
+                                   {"screen", s ? s->name() : QString()},
+                                   {"refresh_hz", s ? s->refreshRate() : 0.0},
+                                   {"primary", s && s == QGuiApplication::primaryScreen()}});
+    }
     SpikeLog::write(QStringLiteral("stall_report"),
                     {{"label", label},
+                     {"screens", screens},
                      {"heartbeat_interval_ms", m_intervalMs},
                      {"heartbeat_lateness_ms", stats(m_lateness)},
                      {"frame_interval_ms", stats(frames)}});
