@@ -95,9 +95,35 @@ function Tool {
     ($out | Out-String) | ConvertFrom-Json
 }
 
+# A field of a recorded result, or $null when the result or the field is absent: strict mode
+# would otherwise end the run on a field an errored command didn't write (fix round 1, M10).
+function P($Obj, [string]$Name) {
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [System.Collections.IDictionary]) { return $Obj[$Name] }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { $p.Value } else { $null }
+}
+
+# winshell-hello's one JSON line; a missing exe or unreadable output becomes a result with
+# status "unknown" or "error" instead of a throw (I1, M9).
 function HelloCmd {
+    if (-not (Test-Path -LiteralPath $Hello)) {
+        return [pscustomobject]@{ status = 'unknown'; error = 'winshell-hello.exe is not built' }
+    }
     $out = & $Hello @args
-    ($out | Out-String) | ConvertFrom-Json
+    try {
+        $r = ($out | Out-String) | ConvertFrom-Json
+        if ($null -ne $r) { return $r }
+    } catch { }
+    [pscustomobject]@{ status = 'error'; error = "unreadable output: $($out | Out-String)" }
+}
+
+# FOLDERID_Programs through winshell-tool, or .NET's Programs folder when the exe isn't built.
+function Get-ProgramsDir {
+    if (Test-Path -LiteralPath $ToolExe) {
+        try { $d = P (Tool programs-dir) 'programs'; if ($d) { return $d } } catch { }
+    }
+    [Environment]::GetFolderPath('Programs')
 }
 
 # Starts winshell-core detached (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) through
@@ -178,51 +204,102 @@ function Register-Scheme {
 
 # ---------------------------------------------------------------- cleanup
 
-function Get-CleanupState {
+# Whether HKCU\Software\Classes\AppUserModelId existed before S1.2 created its child; $null
+# while unknown (then it is never removed) (fix round 1, M8).
+$script:AumidParentExisted = $null
+$AumidParent = 'HKCU:\Software\Classes\AppUserModelId'
+
+# The credential counts as gone only when OpenAsync says NotFound, or Hello isn't supported
+# at all; any other answer (an error, no output) is "unknown", which fails the cleanup (I1).
+function Get-CredentialState {
     $cred = HelloCmd exists
+    $status = P $cred 'status'
+    if ($status -eq 'NotFound') { return 'gone' }
+    if ($status -eq 'Success') { return 'present' }
+    $sup = HelloCmd supported
+    if ((P $sup 'supported') -eq $false -and -not (P $sup 'error')) { return 'gone (Hello not supported)' }
+    "unknown ($status)"
+}
+
+function Get-SpikeCores {
+    @(Get-Process -Name 'winshell-core' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($Bin, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+function Get-CleanupState {
+    $cred = Get-CredentialState
     [ordered]@{
-        shortcut_present     = [bool](Test-Path -LiteralPath $Lnk)
+        shortcut_present     = [bool]($Lnk -and (Test-Path -LiteralPath $Lnk))
         scheme_key_present   = [bool](Test-Path $SchemeKey)
         aumid_key_present    = [bool](Test-Path $AumidKey)
-        credential_status    = $cred.status
-        credential_present   = [bool]($cred.PSObject.Properties['exists'] -and $cred.exists)
+        credential           = $cred
+        credential_gone      = $cred.StartsWith('gone')
+        core_running         = (Get-SpikeCores).Count -gt 0
         notify_settings_key  = [bool](Test-Path $NotifySettingsKey)
         log_dir_present      = [bool](Test-Path $LogDir)
     }
 }
 
+# Every step runs even when an earlier one fails; failures are recorded (I1).
 function Invoke-Cleanup([switch]$Final) {
-    Stop-SpikeProcesses
-    try { [void](Tool history-clear) } catch { }
-    if ($Lnk) { Remove-Item -LiteralPath $Lnk -Force -ErrorAction SilentlyContinue }
-    Remove-Item -Path $SchemeKey -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $AumidKey -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $NotifySettingsKey -Recurse -Force -ErrorAction SilentlyContinue
-    $assoc = Get-Item -Path $AssocToastsKey -ErrorAction SilentlyContinue
+    $errors = [ordered]@{}
     $assocRemoved = @()
-    if ($assoc) {
-        foreach ($v in $assoc.GetValueNames() | Where-Object { $_ -match $Scheme }) {
-            Remove-ItemProperty -Path $AssocToastsKey -Name $v -ErrorAction SilentlyContinue
-            $assocRemoved += $v
+    $deleted = $null
+    $steps = [ordered]@{
+        'stop processes'        = {
+            Stop-SpikeProcesses
+            $until = (Get-Date).AddSeconds(5)
+            while ((Get-SpikeCores).Count -gt 0 -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 200 }
+        }
+        'clear history'         = { if (Test-Path -LiteralPath $ToolExe) { [void](Tool history-clear) } }
+        'shortcut'              = { if ($Lnk -and (Test-Path -LiteralPath $Lnk)) { Remove-Item -LiteralPath $Lnk -Force -ErrorAction Stop } }
+        'scheme key'            = { if (Test-Path $SchemeKey) { Remove-Item -Path $SchemeKey -Recurse -Force -ErrorAction Stop } }
+        'AUMID key'             = { if (Test-Path $AumidKey) { Remove-Item -Path $AumidKey -Recurse -Force -ErrorAction Stop } }
+        'AUMID parent'          = {
+            if ($script:AumidParentExisted -eq $false -and (Test-Path $AumidParent)) {
+                $k = Get-Item $AumidParent
+                if ($k.SubKeyCount -eq 0 -and $k.ValueCount -eq 0) { Remove-Item -Path $AumidParent -Force -ErrorAction Stop }
+            }
+        }
+        'notification settings' = { if (Test-Path $NotifySettingsKey) { Remove-Item -Path $NotifySettingsKey -Recurse -Force -ErrorAction Stop } }
+        'association toasts'    = {
+            $assoc = Get-Item -Path $AssocToastsKey -ErrorAction SilentlyContinue
+            if ($assoc) {
+                foreach ($v in $assoc.GetValueNames() | Where-Object { $_ -match $Scheme }) {
+                    Remove-ItemProperty -Path $AssocToastsKey -Name $v -ErrorAction Stop
+                    $script:assocRemovedNow += $v
+                }
+            }
+        }
+        'credential'            = { if ((Get-CredentialState) -eq 'present') { $script:credDeletedNow = HelloCmd delete } }
+        'keep the event log'    = {
+            if ($Final -and (Test-Path $Events)) {
+                New-Item -ItemType Directory -Force -Path $Raw | Out-Null
+                Copy-Item $Events (Join-Path $Raw 'events.jsonl') -Force
+            }
+        }
+        'log folder'            = {
+            if (Test-Path $LogDir) { Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction Stop }
+            $parent = Split-Path $LogDir
+            if ((Test-Path $parent) -and -not (Get-ChildItem $parent -Force)) { Remove-Item $parent -Force -ErrorAction Stop }
         }
     }
-    $cred = HelloCmd exists
-    $deleted = $null
-    if ($cred.PSObject.Properties['exists'] -and $cred.exists) { $deleted = HelloCmd delete }
-    if ($Final -and (Test-Path $Events)) {
-        New-Item -ItemType Directory -Force -Path $Raw | Out-Null
-        Copy-Item $Events (Join-Path $Raw 'events.jsonl') -Force
+    $script:assocRemovedNow = @()
+    $script:credDeletedNow = $null
+    foreach ($name in $steps.Keys) {
+        try { & $steps[$name] } catch { $errors[$name] = $_.Exception.Message }
     }
-    Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue
-    $parent = Split-Path $LogDir
-    if ((Test-Path $parent) -and -not (Get-ChildItem $parent -Force)) { Remove-Item $parent -Force }
-    $state = Get-CleanupState
+    $assocRemoved = $script:assocRemovedNow
+    $deleted = $script:credDeletedNow
+    $state = $null
+    try { $state = Get-CleanupState } catch { $errors['state'] = $_.Exception.Message }
     [ordered]@{
-        state                = $state
-        association_toasts   = $assocRemoved
-        credential_deleted   = $deleted
-        pass                 = -not ($state.shortcut_present -or $state.scheme_key_present -or
-                                     $state.aumid_key_present -or $state.credential_present)
+        state              = $state
+        errors             = $errors
+        association_toasts = $assocRemoved
+        credential_deleted = $deleted
+        pass               = [bool]($state -and -not ($state.shortcut_present -or $state.scheme_key_present -or
+                                     $state.aumid_key_present -or $state.core_running) -and $state.credential_gone)
     }
 }
 
@@ -257,12 +334,13 @@ function Check-S12 {
         $r = Post-Toast "s12-$i" @('--tag', "s12-$i", '--title', 'LILITH spike', '--body', "Toast $i of 3 (S1.2)")
         $seen = Ask "Did toast $i of 3 pop?"
         $hist = Tool history --tag "s12-$i"
-        $trials += [ordered]@{ trial = $i; posted = $r.posted; setting = $r.setting; error = $r.error; seen = $seen; in_history = $hist.has_tag }
+        $trials += [ordered]@{ trial = $i; posted = (P $r 'posted'); setting = (P $r 'setting'); error = (P $r 'error'); seen = $seen; in_history = (P $hist 'has_tag') }
     }
     $pass = @($trials | Where-Object { $_.posted -and $_.seen -and $_.setting -eq 'Enabled' }).Count -eq 3
 
     Say 'Recorded, not a bar: the shortcut removed, only HKCU\Software\Classes\AppUserModelId present.'
     Remove-Item -LiteralPath $Lnk -Force
+    $script:AumidParentExisted = [bool](Test-Path $AumidParent)
     New-Item -Path $AumidKey -Force | Out-Null
     New-ItemProperty -Path $AumidKey -Name 'DisplayName' -Value 'LILITH Spike' -PropertyType String -Force | Out-Null
     Start-Sleep -Seconds 3
@@ -274,7 +352,7 @@ function Check-S12 {
 
     Set-Check 'S1.2' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
         trials = $trials
-        recorded_registry_only = [ordered]@{ posted = $r.posted; setting = $r.setting; error = $r.error; seen = $seenRegOnly }
+        recorded_registry_only = [ordered]@{ posted = (P $r 'posted'); setting = (P $r 'setting'); error = (P $r 'error'); seen = $seenRegOnly }
     })
     if (-not $pass) { throw 'S1.2 failed: stop, the result goes to the owner before Task 2 (APP-022).' }
 }
@@ -292,7 +370,7 @@ function Check-S13 {
                 '--title', 'LILITH spike', '--body', "Click the $(if ($where -eq 'body') { 'BODY of this toast' } else { 'Open button' }) (S1.3, $($i + 1) of 6)"))
         Say "Click the toast's $(if ($where -eq 'body') { 'BODY (not the button)' } else { 'Open BUTTON' }). If it has gone, open the notification centre (Win+N) and click it there."
         $ev = Wait-SpikeEvent 'start' $n 120
-        $cmd = if ($ev) { $ev.cmdline } else { $null }
+        $cmd = P $ev 'cmdline'
         $trials += [ordered]@{ trial = $i + 1; clicked = $where; cmdline = $cmd; exact = ($cmd -ceq $expected) }
         Start-Sleep -Seconds 2
     }
@@ -317,6 +395,9 @@ function Check-S13 {
     # Recorded: the Run dialog with lilspike:open/<base64url>, plain and with a trailing '/'.
     $target = 'lil://0123456789abcdef/sketchbook/lantern@1.0.0?~é'
     $b64 = (Tool b64url $target).b64url
+    # The owner's clipboard is put back after the Run-dialog checks (fix round 1, M7).
+    $savedClipboard = $null
+    try { $savedClipboard = Get-Clipboard -Raw } catch { }
     foreach ($suffix in '', '/') {
         $url = "lilspike:open/$b64$suffix"
         if (Ask "Recorded check: the Run dialog with $url ? (it is copied to the clipboard)") {
@@ -329,42 +410,66 @@ function Check-S13 {
             Stop-SpikeProcesses
         }
     }
+    if ($null -ne $savedClipboard) { try { Set-Clipboard -Value $savedClipboard } catch { } }
     Set-Check 'S1.3' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
         expected = $expected; trials = $trials; recorded = $recorded; base64url_target = $target
     })
 }
 
+# Each trial first checks its precondition: the blocker window must hold the front (its own
+# check, is_foreground) before the toast is posted. If it doesn't, the attempt is invalid and is
+# retried, up to 3 times; a trial with no valid attempt never passes (fix round 1, I4).
 function Trial-WithA([int]$I, [string]$Recipe) {
+    $attempts = @()
+    for ($try = 1; $try -le 3; $try++) {
+        Stop-SpikeProcesses
+        $n = @(Get-Events).Count
+        $a = Start-Process -FilePath $App -ArgumentList '--recipe', $Recipe, '--exit-after-secs', '300' -PassThru
+        [void](Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $a.Id })
+        $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
+        $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
+        if (-not (P $blk 'is_foreground')) {
+            Say "The blocker window did not take the front (attempt $try): this attempt is invalid and runs again." 'Red'
+            $attempts += [ordered]@{ attempt = $try; valid = $false; blocker_front = $blk }
+            continue
+        }
+        $m = @(Get-Events).Count
+        [void](Post-Toast "s14-a-$Recipe-$I-$try" @('--tag', "s14-a-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
+                '--body', "Click this toast's body (S1.4 with A, $I of 5)"))
+        Say "Click the toast's BODY (S1.4, A running behind the blocker window, $I of 5)."
+        $chk = Wait-SpikeEvent 'front_check' $m 120 { param($e) $e.pid -eq $a.Id -and $e.phase -eq 'activate' }
+        $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' } | Select-Object -Last 1
+        $ok = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        Stop-SpikeProcesses
+        return [ordered]@{ trial = $I; recipe = $Recipe; valid = $true; a_pid = $a.Id; blocker_pid = $b.Id; blocker_front = $blk; handoff = $hand; check = $chk; pass = $ok; invalid_attempts = $attempts }
+    }
     Stop-SpikeProcesses
-    $n = @(Get-Events).Count
-    $a = Start-Process -FilePath $App -ArgumentList '--recipe', $Recipe, '--exit-after-secs', '300' -PassThru
-    [void](Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $a.Id })
-    $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
-    $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
-    $m = @(Get-Events).Count
-    [void](Post-Toast "s14-a-$Recipe-$I" @('--tag', "s14-a-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
-            '--body', "Click this toast's body (S1.4 with A, $I of 5)"))
-    Say "Click the toast's BODY (S1.4, A running behind the blocker window, $I of 5)."
-    $chk = Wait-SpikeEvent 'front_check' $m 120 { param($e) $e.pid -eq $a.Id -and $e.phase -eq 'activate' }
-    $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' } | Select-Object -Last 1
-    $ok = [bool]($chk -and $chk.is_foreground -and $chk.has_focus)
-    Stop-SpikeProcesses
-    [ordered]@{ trial = $I; recipe = $Recipe; a_pid = $a.Id; blocker_pid = $b.Id; blocker_front = $blk; handoff = $hand; check = $chk; pass = $ok }
+    [ordered]@{ trial = $I; recipe = $Recipe; valid = $false; pass = $false; invalid_attempts = $attempts }
 }
 
 function Trial-NoA([int]$I) {
+    $attempts = @()
+    for ($try = 1; $try -le 3; $try++) {
+        Stop-SpikeProcesses
+        $n = @(Get-Events).Count
+        $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
+        $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
+        if (-not (P $blk 'is_foreground')) {
+            Say "The blocker window did not take the front (attempt $try): this attempt is invalid and runs again." 'Red'
+            $attempts += [ordered]@{ attempt = $try; valid = $false; blocker_front = $blk }
+            continue
+        }
+        $m = @(Get-Events).Count
+        [void](Post-Toast "s14-noa-$I-$try" @('--tag', "s14-noa-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
+                '--body', "Click this toast's body (S1.4 no A, $I of 5)"))
+        Say "Click the toast's BODY (S1.4, no A running, $I of 5)."
+        $chk = Wait-SpikeEvent 'front_check' $m 120 { param($e) $e.pid -ne $b.Id -and $e.phase -eq 'start' }
+        $ok = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        Stop-SpikeProcesses
+        return [ordered]@{ trial = $I; valid = $true; blocker_pid = $b.Id; blocker_front = $blk; check = $chk; pass = $ok; invalid_attempts = $attempts }
+    }
     Stop-SpikeProcesses
-    $n = @(Get-Events).Count
-    $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
-    [void](Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id })
-    $m = @(Get-Events).Count
-    [void](Post-Toast "s14-noa-$I" @('--tag', "s14-noa-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
-            '--body', "Click this toast's body (S1.4 no A, $I of 5)"))
-    Say "Click the toast's BODY (S1.4, no A running, $I of 5)."
-    $chk = Wait-SpikeEvent 'front_check' $m 120 { param($e) $e.pid -ne $b.Id -and $e.phase -eq 'start' }
-    $ok = [bool]($chk -and $chk.is_foreground -and $chk.has_focus)
-    Stop-SpikeProcesses
-    [ordered]@{ trial = $I; blocker_pid = $b.Id; check = $chk; pass = $ok }
+    [ordered]@{ trial = $I; valid = $false; pass = $false; invalid_attempts = $attempts }
 }
 
 function Check-S14 {
@@ -380,8 +485,9 @@ function Check-S14 {
     $fallbackPass = $fallback.Count -gt 0 -and @($fallback | Where-Object { $_.pass }).Count -eq 5
     $noA = @(); for ($i = 1; $i -le 5; $i++) { $noA += Trial-NoA $i }
     $noAPass = @($noA | Where-Object { $_.pass }).Count -eq 5
+    $invalid = @($withA + $fallback + $noA | Where-Object { -not $_.valid }).Count
     $verdict = if ($withAPass -and $noAPass) { 'PASS' } elseif ($fallbackPass -and $noAPass) { 'PASS (fallback recipe)' } else { 'FAIL' }
-    Set-Check 'S1.4' $verdict ([ordered]@{ with_a = $withA; with_a_fallback = $fallback; no_a = $noA })
+    Set-Check 'S1.4' $verdict ([ordered]@{ invalid_trials = $invalid; with_a = $withA; with_a_fallback = $fallback; no_a = $noA })
 }
 
 function Check-S15 {
@@ -399,12 +505,12 @@ function Check-S15 {
     $q = Post-Toast 's15-quiet' @('--tag', 's15-quiet', '--suppress', '--title', 'Quiet toast', '--body', 'SuppressPopup = true (S1.5)')
     $quietNoPop = Ask 'Did the quiet toast stay hidden (no pop)?'
     $quietInCentre = Ask 'Open the notification centre (Win+N): is "Quiet toast" there?'
-    $pass = $p.posted -and $p.all_succeeded -and $noRepop -and $u.result -eq 'NotificationNotFound' -and
-        $rr.removed -and $rr.posted -and $repostPopped -and $q.posted -and $quietNoPop -and $quietInCentre
+    $pass = (P $p 'posted') -and (P $p 'all_succeeded') -and $noRepop -and (P $u 'result') -eq 'NotificationNotFound' -and
+        (P $rr 'removed') -and (P $rr 'posted') -and $repostPopped -and (P $q 'posted') -and $quietNoPop -and $quietInCentre
     Set-Check 'S1.5' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
-        progress = $p; no_second_pop = $noRepop; update_after_dismiss = $u.result
+        progress = $p; no_second_pop = $noRepop; update_after_dismiss = (P $u 'result')
         remove_repost = $rr; repost_popped = $repostPopped
-        quiet = [ordered]@{ posted = $q.posted; no_pop = $quietNoPop; in_centre = $quietInCentre }
+        quiet = [ordered]@{ posted = (P $q 'posted'); no_pop = $quietNoPop; in_centre = $quietInCentre }
     })
 }
 
@@ -425,13 +531,16 @@ function Check-S16 {
     Step 'S1.6 fullscreen poll (SHQueryUserNotificationState every 2 s, from the detached core)'
     Wait-Owner '(a) Stay at the desktop with ordinary windows for 30 s: nothing fullscreen. Ready?'
     $a = Wait-Core (Start-Core 's16-a-desktop' @('fullscreen', '--secs', '30', '--timing', '100')) 90
-    $aPass = @($a.samples).Count -gt 0 -and @($a.samples | Where-Object { $_.state -ne 'QUNS_ACCEPTS_NOTIFICATIONS' }).Count -eq 0
-    $p99 = $a.call_ms.p99
+    $aSamples = @(P $a 'samples')
+    $aPass = $aSamples.Count -gt 0 -and @($aSamples | Where-Object { $_.state -ne 'QUNS_ACCEPTS_NOTIFICATIONS' }).Count -eq 0
+    $p99 = P (P $a 'call_ms') 'p99'
     Wait-Owner '(b) Next: start a fullscreen Direct3D game or program. You have 20 s to get it fullscreen; keep it there until you hear a beep (60 s). Ready?'
     $b = Wait-Core (Start-Core 's16-b-d3d' @('fullscreen', '--secs', '60')) 120
     [console]::Beep(880, 400)
     # PASS for (b): at least 5 polls in a row (10 s) read D3D fullscreen or busy.
-    $bRun = Longest-Run $b.samples @('QUNS_RUNNING_D3D_FULL_SCREEN', 'QUNS_BUSY')
+    $bSamples = @(P $b 'samples')
+    $bRun = Longest-Run $bSamples @('QUNS_RUNNING_D3D_FULL_SCREEN', 'QUNS_BUSY')
+    $bFirst = @($bSamples | Where-Object { $_.state -in 'QUNS_RUNNING_D3D_FULL_SCREEN', 'QUNS_BUSY' } | Select-Object -First 1)
     $c = $null; $d = $null
     if (Ask '(c) Recorded: play a video fullscreen in a browser next (20 s to set it up, 60 s total, until the beep)?') {
         $c = Wait-Core (Start-Core 's16-c-video' @('fullscreen', '--secs', '60')) 120
@@ -443,9 +552,9 @@ function Check-S16 {
     }
     $pass = $aPass -and $bRun -ge 5 -and $null -ne $p99 -and $p99 -lt 1.0
     Set-Check 'S1.6' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
-        a_desktop = [ordered]@{ pass = $aPass; states = Count-States $a.samples; samples = $a.samples }
-        call_ms = $a.call_ms
-        b_d3d = [ordered]@{ longest_run = $bRun; states = Count-States $b.samples; samples = $b.samples }
+        a_desktop = [ordered]@{ pass = $aPass; states = Count-States $aSamples; samples = $aSamples }
+        call_ms = (P $a 'call_ms')
+        b_d3d = [ordered]@{ longest_run = $bRun; first_fullscreen_s = $(if ($bFirst) { $bFirst[0].t_s } else { $null }); states = Count-States $bSamples; samples = $bSamples }
         c_video = $(if ($c) { [ordered]@{ states = Count-States $c.samples; samples = $c.samples } } else { 'skipped' })
         d_presentation = $(if ($d) { [ordered]@{ states = Count-States $d.samples; samples = $d.samples } } else { 'skipped' })
     })
@@ -491,17 +600,23 @@ function Power-Listing([string]$Api) {
     $c = Start-Core "s17-$Api-listing" @('power', '--api', $Api, '--max-secs', '3600')
     $set = Wait-PowerEvent $c 'set' 20
     Say "Open an ELEVATED terminal (Win+X, then Terminal (Admin)) and run:  powercfg /requests"
-    $listed = Ask "Is '$PowerReason' (winshell-core.exe) listed under SYSTEM?"
+    # SetThreadExecutionState carries no reason string: it shows as the process alone (M4).
+    $what = if ($Api -eq 'ste') { "[PROCESS] ...\winshell-core.exe (no reason text)" } else { "'$PowerReason' (winshell-core.exe)" }
+    $listed = Ask "Is $what listed under SYSTEM?"
+    # Other requesters could keep the PC awake by themselves during the stay-awake check (M6).
+    $others = Read-Host 'Is anything ELSE listed under SYSTEM? Type what it is, or press Enter for nothing'
+
     New-Item -ItemType File -Force -Path (Join-Path $LogDir 'power-clear.flag') | Out-Null
     $cleared = Wait-PowerEvent $c 'cleared' 20
     Say 'The request is cleared. Run  powercfg /requests  again in the elevated terminal.'
     $gone = Ask 'Is it gone from the list now?'
     $doc = Stop-Power $c
-    [ordered]@{ api = $Api; set = $set; listed_while_held = $listed; cleared = $cleared; gone_after_clear = $gone; core = $doc }
+    [ordered]@{ api = $Api; set = $set; listed_while_held = $listed; other_system_requests = $others; cleared = $cleared; gone_after_clear = $gone; core = $doc }
 }
 
 function Power-StayAwake([string]$Api, $Timeout) {
-    if (-not $Timeout.used_s -or $Timeout.used_s -eq 0) { return [ordered]@{ api = $Api; result = 'skipped'; why = 'sleep timeout is never' } }
+    if ($null -eq $Timeout.used_s) { return [ordered]@{ api = $Api; result = 'skipped'; why = 'timeout unknown (powercfg output not parsed)' } }
+    if ($Timeout.used_s -eq 0) { return [ordered]@{ api = $Api; result = 'skipped'; why = 'sleep timeout is never' } }
     $waitS = [int]$Timeout.used_s + 300
     $until = (Get-Date).AddSeconds($waitS + 30)
     Wait-Owner ("Stay-awake check: after Enter, leave the PC alone (no mouse, no keys) until {0:HH:mm} ({1} min). The display may turn off; that is fine" -f $until, [math]::Ceiling(($waitS + 30) / 60))
@@ -511,8 +626,23 @@ function Power-StayAwake([string]$Api, $Timeout) {
     Start-Sleep -Seconds ($waitS + 30)
     $elapsed = ((Get-Date) - $t0).TotalSeconds
     $doc = Stop-Power $c
-    $slept = @($doc.events | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' })
-    [ordered]@{ api = $Api; timeout_s = $Timeout.used_s; waited_s = [int]$elapsed; slept_events = $slept; pass = ($slept.Count -eq 0); core = $doc }
+    $slept = @(P $doc 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' })
+    # An independent witness: the System log's Kernel-Power sleep, resume and Modern Standby
+    # entries since the request was set (42 sleep, 107 resume, 506/507 standby enter/exit) (M6).
+    $kernel = @()
+    try {
+        $kernel = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 107, 506, 507; StartTime = $t0 } -ErrorAction Stop |
+            ForEach-Object { [ordered]@{ id = $_.Id; at = $_.TimeCreated.ToUniversalTime().ToString('o') } })
+    } catch [Exception] {
+        if ($_.Exception.Message -notmatch 'No events were found') { $kernel = @([ordered]@{ error = $_.Exception.Message }) }
+    }
+    $kernelSlept = @($kernel | Where-Object { (P $_ 'id') -in 42, 506 })
+    [ordered]@{
+        api = $Api; timeout_s = $Timeout.used_s; waited_s = [int]$elapsed; slept_events = $slept
+        kernel_power_events = $kernel
+        pass = ($slept.Count -eq 0 -and $kernelSlept.Count -eq 0 -and @($kernel | Where-Object { P $_ 'error' }).Count -eq 0)
+        core = $doc
+    }
 }
 
 function Check-S17 {
@@ -521,7 +651,7 @@ function Check-S17 {
     $availablePart = ($a -split 'The following sleep states are not available')[0]
     $modernStandby = $availablePart -match 'S0 Low Power Idle'
     $timeout = Get-SleepTimeoutSec
-    Say ("Sleep timeout in use: {0}" -f $(if ($timeout.used_s) { "$($timeout.used_s) s" } else { 'never' }))
+    Say ("Sleep timeout in use: {0}" -f $(if ($null -eq $timeout.used_s) { 'unknown (powercfg output not parsed)' } elseif ($timeout.used_s) { "$($timeout.used_s) s" } else { 'never' }))
 
     $listing = Power-Listing 'request'
     $stay = Power-StayAwake 'request' $timeout
@@ -538,7 +668,7 @@ function Check-S17 {
     $resumed = Wait-PowerEvent $c 'power_broadcast' 900 { param($e) $e.pbt -eq 'PBT_APMRESUMEAUTOMATIC' }
     Start-Sleep -Seconds 35   # one more 30 s clock tick after the wake
     $doc = Stop-Power $c
-    $pbts = @($doc.events | Where-Object { $_.kind -eq 'power_broadcast' } | ForEach-Object { $_.pbt })
+    $pbts = @(P $doc 'events' | Where-Object { $_.kind -eq 'power_broadcast' } | ForEach-Object { $_.pbt })
     $sleepPass = ($pbts -contains 'PBT_APMSUSPEND') -and ($pbts -contains 'PBT_APMRESUMEAUTOMATIC')
 
     $steOk = $ste -and $ste.listing.listed_while_held -and $ste.listing.gone_after_clear -and
@@ -558,9 +688,9 @@ function Check-S18 {
     $a = HelloCmd supported
     $d = HelloCmd tpm
     $dp = HelloCmd dpapi
-    Say "(a) supported: $($a.supported); (d) TPM: $($d.tpm_version); DPAPI round trip: $($dp.round_trip)"
+    Say "(a) supported: $(P $a 'supported'); (d) TPM: $(P $d 'tpm_version'); DPAPI round trip: $(P $dp 'round_trip')"
     $b = $null; $bFront = $false; $c1 = $null; $c2 = $null
-    if ($a.supported) {
+    if (P $a 'supported') {
         Wait-Owner '(b) Next, Windows Hello asks you to create the spike credential. Watch whether its prompt is IN FRONT of this terminal, then complete it. Ready?'
         $b = HelloCmd create
         $bFront = Ask 'Was the Hello prompt in front of the terminal?'
@@ -572,17 +702,17 @@ function Check-S18 {
     $e = HelloCmd verify
     $eFront = Ask 'Was the verification prompt in front of the terminal?'
     $f = $null; $fGone = $null
-    if ($a.supported) { $f = HelloCmd delete; $fGone = HelloCmd exists }
+    if (P $a 'supported') { $f = HelloCmd delete; $fGone = HelloCmd exists }
 
     $sigs = @()
-    foreach ($run in @($c1, $c2)) { if ($run -and $run.PSObject.Properties['signatures']) { $sigs += @($run.signatures) } }
-    $hexes = @($sigs | Where-Object { $_.status -eq 'Success' } | ForEach-Object { $_.signature_hex })
+    foreach ($run in @($c1, $c2)) { $sigs += @(P $run 'signatures' | Where-Object { $_ }) }
+    $hexes = @($sigs | Where-Object { (P $_ 'status') -eq 'Success' } | ForEach-Object { P $_ 'signature_hex' })
     $cPass = $hexes.Count -eq 10 -and @($hexes | Select-Object -Unique).Count -eq 1
-    $bPass = $b -and $b.status -eq 'Success' -and $bFront
-    $fPass = $f -and $f.deleted -and $fGone -and $fGone.status -eq 'NotFound'
-    $ePass = $e.result -eq 'Verified' -and $eFront
-    $route = if ($a.supported -and $bPass -and $cPass -and $d.tpm_2_0 -and $fPass) { 'KEK' }
-             elseif ($ePass -and $dp.round_trip) { 'DPAPI with the Hello gate' }
+    $bPass = (P $b 'status') -eq 'Success' -and $bFront
+    $fPass = (P $f 'deleted') -eq $true -and (P $fGone 'status') -eq 'NotFound'
+    $ePass = (P $e 'result') -eq 'Verified' -and $eFront
+    $route = if ((P $a 'supported') -and $bPass -and $cPass -and (P $d 'tpm_2_0') -and $fPass) { 'KEK' }
+             elseif ($ePass -and (P $dp 'round_trip')) { 'DPAPI with the Hello gate' }
              else { 'passphrase only' }
     $verdict = if ($route -eq 'passphrase only') { 'FAIL (passphrase only: report to the owner)' } else { 'PASS' }
     Set-Check 'S1.8' $verdict ([ordered]@{
@@ -603,7 +733,7 @@ if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 
 New-Item -ItemType Directory -Force -Path $Raw | Out-Null
 
 if ($CleanupOnly) {
-    $Lnk = Join-Path (Tool programs-dir).programs 'LILITH Spike.lnk'
+    $Lnk = Join-Path (Get-ProgramsDir) 'LILITH Spike.lnk'
     $c = Invoke-Cleanup
     $c | ConvertTo-Json -Depth 6
     Say ("Cleanup -> {0}" -f $(if ($c.pass) { 'PASS' } else { 'FAIL' })) $(if ($c.pass) { 'Green' } else { 'Red' })
@@ -623,7 +753,7 @@ $Report.setup = [ordered]@{
     pwsh       = $PSVersionTable.PSVersion.ToString()
     token      = (Tool token)
 }
-$Lnk = Join-Path (Tool programs-dir).programs 'LILITH Spike.lnk'
+$Lnk = Join-Path (Get-ProgramsDir) 'LILITH Spike.lnk'
 
 try {
     Step 'Setup: clearing anything left from an earlier run, then registering'

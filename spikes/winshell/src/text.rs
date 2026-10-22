@@ -99,9 +99,20 @@ pub struct Mapped<'a> {
     pub read_only: bool,
 }
 
-/// A Windows Sandbox configuration: networking off, the mapped folders, one logon command.
+/// A Windows Sandbox configuration: networking, clipboard, audio and video input and printers
+/// off, the mapped folders, one logon command.
 pub fn wsb_xml(mapped: &[Mapped], logon_command: &str) -> String {
-    let mut x = String::from("<Configuration>\r\n  <Networking>Disable</Networking>\r\n");
+    let mut x = String::from("<Configuration>\r\n");
+    // Nothing reaches the host but the mapped folders (fix round 1, M2).
+    for setting in [
+        "Networking",
+        "ClipboardRedirection",
+        "AudioInput",
+        "VideoInput",
+        "PrinterRedirection",
+    ] {
+        x.push_str(&format!("  <{setting}>Disable</{setting}>\r\n"));
+    }
     x.push_str("  <MappedFolders>\r\n");
     for m in mapped {
         x.push_str(&format!(
@@ -159,6 +170,45 @@ pub fn base64url(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// One argument quoted so that `CommandLineToArgvW` (and the MSVC CRT) read it back
+/// unchanged: as is when it is non-empty with no space, tab, newline or `"`; otherwise in `"`,
+/// with each `"` and the backslashes before it (or before the closing `"`) escaped.
+pub fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// The command line `CreateProcessW` gets for `exe args`.
+pub fn command_line(exe: &str, args: &[String]) -> String {
+    let mut line = quote_arg(exe);
+    for a in args {
+        line.push(' ');
+        line.push_str(&quote_arg(a));
+    }
+    line
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -244,7 +294,15 @@ mod tests {
             ],
             r"powershell.exe -ExecutionPolicy Bypass -File C:\lil\in\inside.ps1",
         );
-        assert!(x.starts_with("<Configuration>\r\n  <Networking>Disable</Networking>"));
+        assert!(x.starts_with("<Configuration>\r\n  <Networking>Disable</Networking>\r\n"));
+        for off in [
+            "<ClipboardRedirection>Disable</ClipboardRedirection>",
+            "<AudioInput>Disable</AudioInput>",
+            "<VideoInput>Disable</VideoInput>",
+            "<PrinterRedirection>Disable</PrinterRedirection>",
+        ] {
+            assert!(x.contains(off), "{off}");
+        }
         assert!(x.contains(r"<HostFolder>C:\b&amp;b</HostFolder>"));
         assert!(x.contains(
             "<SandboxFolder>C:\\lil\\in</SandboxFolder>\r\n      <ReadOnly>true</ReadOnly>"
@@ -256,6 +314,30 @@ mod tests {
             r"<Command>powershell.exe -ExecutionPolicy Bypass -File C:\lil\in\inside.ps1</Command>"
         ));
         assert!(x.ends_with("</Configuration>\r\n"));
+    }
+
+    #[test]
+    fn quote_arg_follows_the_argv_rules() {
+        assert_eq!(quote_arg("plain"), "plain");
+        assert_eq!(quote_arg(""), r#""""#);
+        assert_eq!(quote_arg(r"C:\x y\a.exe"), r#""C:\x y\a.exe""#);
+        assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote_arg(r"C:\dir with space\"), r#""C:\dir with space\\""#);
+        assert_eq!(quote_arg(r"a\\b"), r"a\\b");
+    }
+
+    #[test]
+    fn command_line_joins_quoted_arguments() {
+        let args = vec![
+            "toast".to_string(),
+            "--out".to_string(),
+            r"C:\r s\o.json".to_string(),
+        ];
+        assert_eq!(
+            command_line(r"C:\b in\winshell-core.exe", &args),
+            r#""C:\b in\winshell-core.exe" toast --out "C:\r s\o.json""#
+        );
     }
 
     #[test]

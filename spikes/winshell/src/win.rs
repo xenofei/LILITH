@@ -4,9 +4,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -27,8 +25,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Environment::GetCommandLineW;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, OpenProcess,
+    OpenProcessToken, PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW, STARTUPINFOW,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
@@ -217,19 +216,43 @@ pub fn read_shortcut(lnk: &Path) -> Result<(String, String)> {
     }
 }
 
-/// Starts `exe args` with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and no handles, as
-/// `lil-client` starts the core; returns the pid.
+/// Starts `exe args` with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, as `lil-client`
+/// starts the core; returns the pid.
+///
+/// `CreateProcessW` is called directly with `bInheritHandles = FALSE`. `std::process::Command`
+/// passes TRUE, and then the child inherits every inheritable handle of this process,
+/// including a stdout pipe its caller reads to EOF: the caller would wait for the child to
+/// exit (fix round 1, C1; `tests/spawn_detached.rs`).
 pub fn spawn_detached(exe: &str, args: &[String]) -> std::io::Result<u32> {
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    let child = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn()?;
-    Ok(child.id())
+    let mut line: Vec<u16> = crate::text::command_line(exe, args)
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: `line` is NUL-terminated and mutable as CreateProcessW requires; `startup` and
+    // `info` are valid for the call; both returned handles are closed here.
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut info,
+        )
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
+        let _ = CloseHandle(info.hThread);
+        let _ = CloseHandle(info.hProcess);
+    }
+    Ok(info.dwProcessId)
 }
 
 /// `ShellExecuteW(NULL, "open", url, ...)`; the return value (> 32 is success).

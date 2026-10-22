@@ -13,12 +13,26 @@ then the Sandbox shuts itself down.
 With -Items a,b -Suffix x it runs only those items and names their files <item>-x.json: the
 de-elevated relaunch uses that (-Suffix limited). With config.observe it runs the toast,
 foreground and Qt items twice more (-r2, -r3), each after the host writes go-2.flag / go-3.flag into C:\lil\out.
+
+It refuses to run anywhere but inside Windows Sandbox (it writes HKCU keys and ends with
+shutdown /s /t 0): the user must be WDAGUtilityAccount, the Sandbox's account, and the
+bundle's marker file C:\lil\in\in-sandbox.marker must be mapped in. Otherwise it exits 2
+before doing anything. -GuardOnly runs only that check (exit 0 inside, 2 elsewhere): the
+crate's test tests/inside_guard.rs runs it on the host.
 #>
 param(
     [string[]]$Items = @('elevation', 'toast', 'protocol', 'foreground', 'power', 'rust', 'qt'),
     [string]$Suffix = '',
-    [switch]$NoShutdown
+    [switch]$NoShutdown,
+    [switch]$GuardOnly
 )
+
+# The guard comes first: nothing above it has any effect.
+if ($env:USERNAME -ne 'WDAGUtilityAccount' -or -not (Test-Path -LiteralPath 'C:\lil\in\in-sandbox.marker')) {
+    [Console]::Error.WriteLine('inside.ps1 runs only inside Windows Sandbox (user WDAGUtilityAccount and C:\lil\in\in-sandbox.marker); nothing was done.')
+    exit 2
+}
+if ($GuardOnly) { exit 0 }
 
 $ErrorActionPreference = 'Continue'
 $In = 'C:\lil\in'
@@ -203,9 +217,11 @@ function Item-Protocol {
     })
 }
 
-function Item-Foreground([string]$Name) {
+# One foreground attempt. It counts only when the second window really held the front before
+# the hand-off (its own check: is_foreground); otherwise it is invalid and is retried, never
+# passed (fix round 1, I4).
+function Foreground-Attempt([int]$Attempt) {
     Stop-Spike
-    Register-Scheme
     $n = @(Get-Events).Count
     $a = Start-Process -FilePath $App -ArgumentList '--recipe', 'basic', '--exit-after-secs', '120' -PassThru
     $aWin = Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $a.Id }
@@ -213,18 +229,37 @@ function Item-Foreground([string]$Name) {
     # itself (ShellExecuteW of the URL), as the toast host does after a click.
     $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--launch-url', $ConfirmUrl, '--launch-after-ms', '3000', '--exit-after-secs', '120' -PassThru
     $bFront = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
+    $valid = [bool]($bFront -and $bFront.is_foreground)
     $chk = Wait-SpikeEvent 'front_check' $n 30 { param($e) $e.pid -eq $a.Id -and $e.phase -eq 'activate' }
     $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' } | Select-Object -Last 1
     $launched = @(Get-Events) | Where-Object { $_.kind -eq 'blocker_launched' } | Select-Object -Last 1
     $after = Tool foreground
     Stop-Spike
-    $fgPid = $(if ($chk) { $chk.foreground.fg_pid } else { $after.fg_pid })
-    Write-Result $Name ([ordered]@{
+    # Judged on A's own check only: no later snapshot stands in for it.
+    $fgPid = $(if ($chk) { $chk.foreground.fg_pid } else { $null })
+    [ordered]@{
+        attempt = $Attempt; precondition_met = $valid
         a_pid = $a.Id; a_window = $aWin; second_window_pid = $b.Id; second_window_front = $bFront
         blocker_launched = $launched; handoff = $hand; a_check = $chk
         foreground_pid_after_handoff = $fgPid; foreground_now = $after
-        pass = ($fgPid -eq $a.Id)
-    })
+    }
+}
+
+function Item-Foreground([string]$Name) {
+    Register-Scheme
+    $attempts = @()
+    $used = $null
+    for ($i = 1; $i -le 3 -and -not $used; $i++) {
+        $r = Foreground-Attempt $i
+        $attempts += $r
+        if ($r.precondition_met) { $used = $r }
+    }
+    if (-not $used) { $used = $attempts[-1] }
+    $result = [ordered]@{}
+    foreach ($k in $used.Keys) { $result[$k] = $used[$k] }
+    $result.attempts = $attempts
+    $result.pass = [bool]($used.precondition_met -and $null -ne $used.foreground_pid_after_handoff -and $used.foreground_pid_after_handoff -eq $used.a_pid)
+    Write-Result $Name $result
 }
 
 function Item-Power {

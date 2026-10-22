@@ -92,15 +92,45 @@ function Get-SandboxProcesses {
     @(Get-Process | Where-Object { $_.Name -match 'Sandbox|vmmem' } | ForEach-Object { $_.Name } | Sort-Object -Unique)
 }
 
-function Test-SandboxRunning([string]$Id) {
-    if ($Id -and (Get-Command wsb -ErrorAction SilentlyContinue)) {
-        $list = (& wsb list 2>&1 | Out-String)
-        return $list -match [regex]::Escape($Id)
+# The pids of WindowsSandbox* processes. The ones that exist before this script starts a
+# Sandbox are never touched (fix round 1, I2).
+function Get-SandboxPids {
+    @(Get-Process | Where-Object { $_.Name -match '^WindowsSandbox' } | ForEach-Object { $_.Id })
+}
+
+function Get-WsbIds {
+    if (-not (Get-Command wsb -ErrorAction SilentlyContinue)) { return @() }
+    $list = (& wsb list 2>&1 | Out-String)
+    @([regex]::Matches($list, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') | ForEach-Object { $_.Value })
+}
+
+# Refuses to start while any Sandbox runs: the stop steps below must only ever meet ours.
+function Assert-NoSandboxRunning {
+    if (Get-Command wsb -ErrorAction SilentlyContinue) {
+        $ids = @(Get-WsbIds)
+        if ($ids.Count -gt 0) { throw "A Windows Sandbox is already running ($($ids -join ', ')). Close it, then run this again." }
+    } else {
+        $open = @(Get-Process | Where-Object { $_.Name -in 'WindowsSandbox', 'WindowsSandboxClient', 'WindowsSandboxRemoteSession' })
+        if ($open.Count -gt 0) { throw 'A Windows Sandbox is already running. Close it, then run this again.' }
     }
-    @(Get-Process | Where-Object { $_.Name -match '^WindowsSandbox' }).Count -gt 0
+}
+
+# The WindowsSandbox* pids that appeared after this run started its Sandbox: its own.
+function Get-OwnPids($Started) {
+    $now = @(Get-SandboxPids)
+    $fresh = @($now | Where-Object { $_ -notin $Started.pids_before })
+    foreach ($p in $fresh) { if ($Started.own_pids -notcontains $p) { $Started.own_pids += $p } }
+    $fresh
+}
+
+# With the CLI and an id: that id only. Otherwise: the run's own pids.
+function Test-SandboxRunning($Started) {
+    if ($Started.id) { return @(Get-WsbIds) -contains $Started.id }
+    @(Get-OwnPids $Started).Count -gt 0
 }
 
 function Start-Sandbox([string]$WsbFile) {
+    $before = @(Get-SandboxPids)
     if (Get-Command wsb -ErrorAction SilentlyContinue) {
         # One line: the configuration is passed as a single command-line argument.
         $xml = (Get-Content -Raw $WsbFile) -replace '\r?\n\s*', ''
@@ -108,31 +138,32 @@ function Start-Sandbox([string]$WsbFile) {
         $id = [regex]::Match($out, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}').Value
         # The logon command needs a user session: connect opens the Sandbox window.
         if ($id) { Start-Process -FilePath wsb -ArgumentList 'connect', '--id', $id | Out-Null }
-        return [ordered]@{ via = 'wsb start + wsb connect'; id = $id; start_output = $out.Trim(); process = $null }
+        return [ordered]@{ via = 'wsb start + wsb connect'; id = $id; start_output = $out.Trim(); process = $null; pids_before = $before; own_pids = @() }
     }
     $p = Start-Process -FilePath (Join-Path $env:windir 'System32\WindowsSandbox.exe') -ArgumentList "`"$WsbFile`"" -PassThru
-    [ordered]@{ via = 'WindowsSandbox.exe <file.wsb>'; id = $null; start_output = $null; process = $p.Id }
+    [ordered]@{ via = 'WindowsSandbox.exe <file.wsb>'; id = $null; start_output = $null; process = $p.Id; pids_before = $before; own_pids = @() }
 }
 
 # Waits for the Sandbox to close by itself (inside.ps1 ends with shutdown /s /t 0), then tries
-# wsb stop, then ends the processes this script started and the Sandbox client.
-function Stop-Sandbox($Started) {
-    $id = $Started.id
+# wsb stop --id with the id this run started, then ends only the WindowsSandbox* processes that
+# appeared after this run started (the Sandbox it started and its client).
+function Stop-Sandbox($Started, [switch]$Now) {
     $tries = @()
-    $deadline = (Get-Date).AddSeconds(90)
-    while ((Get-Date) -lt $deadline -and (Test-SandboxRunning $id)) { Start-Sleep -Seconds 2 }
-    if (-not (Test-SandboxRunning $id)) { return [ordered]@{ method = 'shutdown /s /t 0 inside'; tries = $tries } }
-    if ($id) {
-        & wsb stop --id $id *> $null
-        $tries += "wsb stop --id: exit $LASTEXITCODE"
+    $deadline = (Get-Date).AddSeconds($(if ($Now) { 0 } else { 90 }))
+    while ((Get-Date) -lt $deadline -and (Test-SandboxRunning $Started)) { Start-Sleep -Seconds 2 }
+    if (-not (Test-SandboxRunning $Started)) { return [ordered]@{ method = 'shutdown /s /t 0 inside'; tries = $tries } }
+    if ($Started.id) {
+        & wsb stop --id $Started.id *> $null
+        $tries += "wsb stop --id $($Started.id): exit $LASTEXITCODE"
         Start-Sleep -Seconds 15
-        if (-not (Test-SandboxRunning $id)) { return [ordered]@{ method = 'wsb stop --id'; tries = $tries } }
+        if (-not (Test-SandboxRunning $Started)) { return [ordered]@{ method = 'wsb stop --id'; tries = $tries } }
     }
-    $procs = @(Get-Process | Where-Object { $_.Name -match '^WindowsSandbox' -or ($Started.process -and $_.Id -eq $Started.process) })
-    $tries += "Stop-Process: $(($procs | ForEach-Object { $_.Name }) -join ', ')"
+    $procs = @(Get-OwnPids $Started | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    $tries += "Stop-Process (own pids): $(($procs | ForEach-Object { "$($_.Name) $($_.Id)" }) -join ', ')"
     $procs | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 10
-    [ordered]@{ method = $(if (Test-SandboxRunning $id) { 'none worked' } else { 'Stop-Process (WindowsSandbox* processes)' }); tries = $tries }
+    $still = if ($Started.id) { Test-SandboxRunning $Started } else { @(Get-OwnPids $Started).Count -gt 0 }
+    [ordered]@{ method = $(if ($still) { 'none worked' } else { 'Stop-Process (the run''s own WindowsSandbox* pids)' }); tries = $tries }
 }
 
 # ---------------------------------------------------------------- the bundle
@@ -168,8 +199,18 @@ function Build-Spike {
     } finally { Pop-Location }
 }
 
+# An empty folder, or a throw: a run is never judged on files an earlier run left (M3).
+function New-EmptyDir([string]$Dir) {
+    Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    if (Get-ChildItem -LiteralPath $Dir -Force) { throw "could not empty $Dir (is a file in it open?)" }
+}
+
 function New-Bundle([string]$Dir, [string]$TestExe, [string[]]$Dlls, [int]$Run, [string]$DeploySandboxPath, [string]$Exe) {
-    Remove-Item $Dir -Recurse -Force -ErrorAction SilentlyContinue
+    New-EmptyDir $Dir
+    # The marker inside.ps1's guard needs (fix round 1, I3). It exists only in the bundle,
+    # which only the Sandbox sees at C:\lil\in.
+    Set-Content -Encoding ascii -Path (Join-Path $Dir 'in-sandbox.marker') -Value 'LILITH spike 11 Sandbox bundle'
     foreach ($sub in 'bin', 'vcrt', 'rusttest') { New-Item -ItemType Directory -Force -Path (Join-Path $Dir $sub) | Out-Null }
     Copy-Item (Join-Path $Spike 'inside.ps1') $Dir
     foreach ($name in 'winshell-core', 'winshell-app', 'winshell-hello', 'winshell-tool') {
@@ -187,8 +228,7 @@ function New-Bundle([string]$Dir, [string]$TestExe, [string[]]$Dlls, [int]$Run, 
 
 # The results folder must be writable through the Sandbox's share, which runs as SYSTEM.
 function New-ResultsFolder([string]$Dir) {
-    Remove-Item $Dir -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    New-EmptyDir $Dir
     $hasSystem = @((Get-Acl $Dir).Access | Where-Object { $_.IdentityReference -match 'SYSTEM' }).Count -gt 0
     if (-not $hasSystem) {
         & icacls $Dir /grant '*S-1-5-18:(OI)(CI)M' | Out-Null
@@ -198,26 +238,37 @@ function New-ResultsFolder([string]$Dir) {
 
 # ---------------------------------------------------------------- judging
 
+# Each item is judged here from the raw fields inside.ps1 recorded, as the bar says; the
+# `pass` inside.ps1 wrote is kept beside it as `inside_pass` only (fix round 1, M11).
+$ExpectedArgument = '"lilspike:confirm/cf_0123456789abcdef"'
+$Judges = [ordered]@{
+    toast      = { param($d) (P $d 'setting') -eq 'Enabled' -and (P $d 'history_has_tag') -eq $true }
+    protocol   = { param($d) (P $d 'command_key_present') -eq $true -and [string](P $d 'argument') -ceq $ExpectedArgument }
+    foreground = { param($d) (P $d 'precondition_met') -eq $true -and $null -ne (P $d 'a_pid') -and (P $d 'foreground_pid_after_handoff') -eq (P $d 'a_pid') }
+    power      = { param($d) (P $d 'listed') -eq $true }
+    rust       = { param($d) $e = P $d 'exit_with_dlls'; $e -is [ValueType] -and $e -eq 0 }
+    qt         = { param($d) (P (P $d 'offscreen') 'nonflat') -eq $true -and (P (P $d 'onscreen') 'nonflat') -eq $true }
+}
+
 function Judge-Run([string]$Res, [string]$Sfx = '') {
     $elev = Read-Json (Join-Path $Res 'elevation.json')
-    $limited = $false
-    if ($elev -and (P (P $elev 'token') 'elevated')) {
-        $limited = [bool](P (P $elev 'deelevated') 'worked')
-    }
-    $pick = {
-        param([string]$Item)
+    $elevated = [bool](P (P $elev 'token') 'elevated')
+    $limited = $elevated -and [bool](P (P $elev 'deelevated') 'worked')
+    $items = [ordered]@{}
+    foreach ($item in $Judges.Keys) {
         # The toast and foreground items are judged on the de-elevated run when the logon
         # process is elevated; with no non-elevated token they fail.
-        if ($elev -and (P (P $elev 'token') 'elevated') -and $Item -in 'toast', 'foreground') {
-            if (-not $limited) { return [ordered]@{ pass = $false; why = 'elevated, and no de-elevated launch worked' } }
-            return Read-Json (Join-Path $Res "$Item-limited.json")
+        if ($elevated -and $item -in 'toast', 'foreground') {
+            if (-not $limited) {
+                $items[$item] = [ordered]@{ pass = $false; why = 'elevated, and no de-elevated launch worked'; file = $null }
+                continue
+            }
+            $doc = Read-Json (Join-Path $Res "$item-limited.json")
+        } else {
+            $doc = Read-Json (Join-Path $Res "$item$Sfx.json")
         }
-        Read-Json (Join-Path $Res "$Item$Sfx.json")
-    }
-    $items = [ordered]@{}
-    foreach ($item in 'toast', 'protocol', 'foreground', 'power', 'rust', 'qt') {
-        $doc = & $pick $item
-        $items[$item] = [ordered]@{ pass = [bool](P $doc 'pass'); file = $doc }
+        $pass = [bool]($doc -and (& $Judges[$item] $doc))
+        $items[$item] = [ordered]@{ pass = $pass; inside_pass = (P $doc 'pass'); file = $doc }
     }
     $items['elevation'] = [ordered]@{ recorded = $elev }
     $items
@@ -240,9 +291,10 @@ $dlls = Find-VcRedist
 
 # The deploy copy, mapped read-only at its own host path inside the Sandbox.
 $deployCopy = Join-Path $Build 'deploy-copy'
-Remove-Item $deployCopy -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $deployCopy | Out-Null
+New-EmptyDir $deployCopy
 Copy-Item (Join-Path $DeployDir '*') $deployCopy -Recurse -Force
+
+Assert-NoSandboxRunning
 
 $label = if ($Observe) { 'observe' } else { 'run' }
 $summary = [ordered]@{ spike = 11; item = 'S1.9'; observe = [bool]$Observe; sandbox = $info; runs = @() }
@@ -260,36 +312,50 @@ for ($run = 1; $run -le $runCount; $run++) {
     if (-not (P $w 'written')) { throw "wsb not written: $(P $w 'error')" }
 
     $t0 = Get-Date
-    $started = Start-Sandbox $wsbFile
+    $started = $null
+    $stop = $null
     $procs = @()
     $startedAt = $null
-    while (((Get-Date) - $t0).TotalSeconds -lt 120 -and -not $startedAt) {
-        if (Test-Path (Join-Path $res 'started.json')) { $startedAt = ((Get-Date) - $t0).TotalSeconds }
-        $procs += Get-SandboxProcesses
-        Start-Sleep -Seconds 2
-    }
-    if ($startedAt) { Say ("started.json after {0:N0} s" -f $startedAt) } else { Say 'no started.json within 120 s' 'Red' }
-
-    if ($Observe -and $startedAt) {
-        Say 'Host-state observation: watch the Sandbox window. A toast should pop inside it within a minute or two.'
-        $toastSeen = (Read-Host 'Did the toast pop inside the Sandbox window? [y/n]') -match '^y'
-        Wait-Owner 'Wait until the Sandbox has finished its first round (the console in it goes quiet), then put other windows OVER the Sandbox window'
-        New-Item -ItemType File -Force -Path (Join-Path $res 'go-2.flag') | Out-Null
-        $deadline = (Get-Date).AddSeconds(600)
-        while ((Get-Date) -lt $deadline -and -not (Test-Path (Join-Path $res 'round-2.json'))) { Start-Sleep -Seconds 2 }
-        Wait-Owner 'Round 2 done. Next: after Enter, lock the PC (Win+L) within 30 s, stay locked for 4 minutes, then sign in again'
-        New-Item -ItemType File -Force -Path (Join-Path $res 'go-3.flag') | Out-Null
-        $summary.observation = [ordered]@{ toast_seen_in_sandbox_window = $toastSeen }
-    }
-
-    $limit = if ($Observe) { 2400 } else { $RunLimitSec }
     $doneAt = $null
-    while (((Get-Date) - $t0).TotalSeconds -lt $limit -and -not $doneAt) {
-        if (Test-Path (Join-Path $res 'done.json')) { $doneAt = ((Get-Date) - $t0).TotalSeconds }
-        $procs += Get-SandboxProcesses
-        Start-Sleep -Seconds 3
+    # Ctrl+C or a throw still stops this run's Sandbox (fix round 1, M1).
+    try {
+        Assert-NoSandboxRunning
+        $started = Start-Sandbox $wsbFile
+        while (((Get-Date) - $t0).TotalSeconds -lt 120 -and -not $startedAt) {
+            if (Test-Path (Join-Path $res 'started.json')) { $startedAt = ((Get-Date) - $t0).TotalSeconds }
+            $procs += Get-SandboxProcesses
+            [void](Get-OwnPids $started)
+            Start-Sleep -Seconds 2
+        }
+        if ($startedAt) { Say ("started.json after {0:N0} s" -f $startedAt) } else { Say 'no started.json within 120 s' 'Red' }
+
+        if ($Observe -and $startedAt) {
+            Say 'Host-state observation: watch the Sandbox window. A toast should pop inside it within a minute or two.'
+            $toastSeen = (Read-Host 'Did the toast pop inside the Sandbox window? [y/n]') -match '^y'
+            Wait-Owner 'Wait until the Sandbox has finished its first round (the console in it goes quiet), then put other windows OVER the Sandbox window'
+            New-Item -ItemType File -Force -Path (Join-Path $res 'go-2.flag') | Out-Null
+            $deadline = (Get-Date).AddSeconds(600)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path (Join-Path $res 'round-2.json'))) { Start-Sleep -Seconds 2 }
+            Wait-Owner 'Round 2 done. Next: after Enter, lock the PC (Win+L) within 30 s, stay locked for 4 minutes, then sign in again'
+            New-Item -ItemType File -Force -Path (Join-Path $res 'go-3.flag') | Out-Null
+            $summary.observation = [ordered]@{ toast_seen_in_sandbox_window = $toastSeen }
+        }
+
+        $limit = if ($Observe) { 2400 } else { $RunLimitSec }
+        while (((Get-Date) - $t0).TotalSeconds -lt $limit -and -not $doneAt) {
+            if (Test-Path (Join-Path $res 'done.json')) { $doneAt = ((Get-Date) - $t0).TotalSeconds }
+            $procs += Get-SandboxProcesses
+            [void](Get-OwnPids $started)
+            Start-Sleep -Seconds 3
+        }
+        $stop = Stop-Sandbox $started
     }
-    $stop = Stop-Sandbox $started
+    finally {
+        if ($started -and -not $stop) {
+            Say 'Interrupted: stopping the Sandbox this run started.' 'Red'
+            $stop = Stop-Sandbox $started -Now
+        }
+    }
     $closedAt = ((Get-Date) - $t0).TotalSeconds
 
     $lifecycle = [ordered]@{
@@ -326,8 +392,7 @@ for ($run = 1; $run -le $runCount; $run++) {
     $summary.runs += [ordered]@{ run = $run; pass = $runPass; items = $items }
 
     $keep = Join-Path $ResultsRoot "sandbox\$label-$run"
-    Remove-Item $keep -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $keep | Out-Null
+    New-EmptyDir $keep
     Copy-Item (Join-Path $res '*') $keep -Recurse -Force
     foreach ($k in $items.Keys) {
         $v = $items[$k]
