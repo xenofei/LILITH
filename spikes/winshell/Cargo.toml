@@ -1,0 +1,52 @@
+[package]
+name = "winshell"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Spike 11 (plan 4a Task 1): toasts, protocol activation, foreground, the fullscreen poll,
+# keep-awake and Windows Hello. Standalone: not a workspace member (the root excludes `spikes`).
+
+[dependencies]
+serde_json = "1"
+# `IAsyncOperation<T>` named as a type (the consent verifier's interop call is generic over it).
+windows-future = "0.3.2"
+
+# The feature list recorded for Task 5 (S1.1). One line per feature, with what needs it.
+[dependencies.windows]
+version = "=0.62.2"
+features = [
+    "Foundation",                         # IAsyncOperation, IAsyncAction (join)
+    "Data_Xml_Dom",                       # XmlDocument
+    "UI_Notifications",                   # ToastNotificationManager, ToastNotification, NotificationData
+    "Security_Credentials",               # KeyCredentialManager
+    "Security_Credentials_UI",            # UserConsentVerifier, UserConsentVerificationResult
+    "Security_Cryptography",              # CryptographicBuffer (IBuffer <-> bytes)
+    "Storage_Streams",                    # IBuffer
+    "Win32_Foundation",                   # HWND, HANDLE, PROPERTYKEY, LocalFree
+    "Win32_Security",                     # token elevation and integrity level
+    "Win32_Security_Cryptography",        # CryptProtectData, CryptUnprotectData
+    "Win32_Storage_EnhancedStorage",      # PKEY_AppUserModel_ID
+    "Win32_Storage_FileSystem",           # PIPE_ACCESS_DUPLEX, FILE_FLAG_FIRST_PIPE_INSTANCE
+    "Win32_System_Com",                   # CoCreateInstance, IPersistFile, CoTaskMemFree
+    "Win32_System_Com_StructuredStorage", # PROPVARIANT
+    "Win32_System_Console",               # GetConsoleWindow
+    "Win32_System_Environment",           # GetCommandLineW
+    "Win32_System_IO",                    # ConnectNamedPipe's OVERLAPPED parameter
+    "Win32_System_LibraryLoader",         # GetModuleHandleW
+    "Win32_System_Pipes",                 # the single-instance pipe
+    "Win32_System_Power",                 # PowerCreateRequest, PowerSetRequest, PowerClearRequest
+    "Win32_System_Threading",             # REASON_CONTEXT, OpenProcess, QueryFullProcessImageNameW
+    "Win32_System_TpmBaseServices",       # Tbsi_GetDeviceInfo
+    "Win32_System_Variant",               # VT_LPWSTR
+    "Win32_System_WinRT",                 # RoInitialize, IUserConsentVerifierInterop
+    "Win32_System_WindowsProgramming",    # QueryUnbiasedInterruptTime
+    "Win32_Graphics_Gdi",                 # the window class brush
+    "Win32_UI_Shell",                     # SHQueryUserNotificationState, IShellLinkW, ShellExecuteW
+    "Win32_UI_Shell_PropertiesSystem",    # IPropertyStore
+    "Win32_UI_WindowsAndMessaging",       # windows, foreground, WM_POWERBROADCAST
+]
+
+[profile.release]
+debug = "line-tables-only"
