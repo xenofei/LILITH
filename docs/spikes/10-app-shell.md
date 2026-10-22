@@ -9,7 +9,7 @@ GPU: NVIDIA GeForce RTX 5080 16 GB, driver 617.42. Qt 6.12.0 + Qt WebEngine 6.14
 Plan 4a, Task 0. Before the shell is built (Tasks 15–29), does the Qt stack it will use hold up?
 
 - **APP-005:** does KDDockWidgets **2.5.0** build cleanly on Qt 6.12.0 and save and restore a layout of several windows, including one window alone (`LayoutSaver::addWindowToSave()`)? Otherwise 2.4.1 stays.
-- **P4a-R1:** can `lil-qt` be a cargo workspace member with its Qt parts behind a `qt` feature, built by CMake through `cxx_qt_import_crate(... FEATURES qt LOCKED)` against the workspace `Cargo.lock`, while the workspace still builds and lints with no Qt?
+- **The `lil-qt` route (P4a-R1):** can `lil-qt` be a cargo workspace member with its Qt parts behind a `qt` feature, built by CMake through `cxx_qt_import_crate(... FEATURES qt LOCKED)` against the workspace `Cargo.lock`, while the workspace still builds and lints with no Qt?
 - **APP-137, IMG-126:** does WebEngine stay out of the process until its dock is shown when it lives in its own QML plugin DLL, with a named persistent profile from `WebEngineProfilePrototype` stored under the app's own local folder?
 - **ARCH-114, OPS-094:** what do the `windeployqt` flags and the `--skip-plugin-types` list leave in the deploy folder, does the trimmed folder run with no Qt or MSVC on PATH, and how big is it?
 - **APP-136:** is the deployed app interactive in under 2 s from process start, warm, after a reboot and after a Defender scan?
