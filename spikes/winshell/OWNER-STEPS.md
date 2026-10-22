@@ -1,99 +1,234 @@
-# Spike 11: the owner-present steps
+# Spike 11: what you run, and what you do
 
-Plan 4a, Task 1. The agent built the spike and ran only its unit tests: nothing below has run yet. Each step changes something on this PC (listed under "What it writes"), so each waits for your go.
+Plan 4a, Task 1. The agent built this spike and ran only its own tests; nothing below has run on this PC yet. Each part changes something on the PC for a while (the lists under "What it changes" say what, and how it is undone), so nothing starts until you decide to start it.
 
-Run everything from the repository root, in a **normal (not elevated) Windows Terminal** with PowerShell 7. Keep that terminal in front unless a step asks otherwise: the scripts ask you yes-or-no questions in it.
+There are three parts:
 
-## Before you start
+- **Part A: before you start** (5 minutes): a short checklist.
+- **Part B: the main run on this PC** (about 1 hour, plus your PC's sleep timeout): toasts, links, windows, fullscreen, sleep and Windows Hello.
+- **Part C: the runs inside Windows Sandbox** (about 1 hour 15 minutes, plus 10 minutes once to turn the Sandbox on). Do this part only after Task 0's run has finished.
 
-- The **Rust toolchain** on `PATH` (`cargo`, the repository's `rust-toolchain.toml` picks 1.99.0), as for any build in this repository.
-- For Step 2b: **Visual Studio Build Tools** with the C++ workload, so `vswhere.exe` finds the VC++ runtime DLLs under `VC\Redist\MSVC` (the bundle copies them).
-- **Windows Hello** is set up for your account (a PIN at least), for S1.8.
-- For S1.6: a **fullscreen Direct3D game or program** you can start quickly (any game in exclusive or borderless fullscreen), a **video** you can play fullscreen in a browser, and, if you have one, a **presentation** to run as a slide show (optional).
-- For S1.7: the PC may be put to **sleep** once, and left **untouched** for the sleep timeout plus about 6 minutes. The script reads the sleep timeout and Modern Standby from `powercfg` output in **English**; on another display language the stay-awake check is reported as skipped ("timeout unknown"), not run.
-- For Step 2b: Task 0's Step 2 has finished, so `spikes/app-shell/build/deploy` exists.
+You answer the scripts' questions by typing `y` or `n` and pressing Enter, or just Enter when they say "press Enter". Nothing is ever typed for you.
 
-## Step 2: the host run (about 1 hour, plus the sleep timeout)
+## Part A: before you start
 
-```powershell
-pwsh -NoProfile -File spikes/winshell/run-spike.ps1
-```
+1. **Rust is installed.** Open Windows Terminal and type `cargo --version`. You should see a version number. If you see "not recognized", install Rust first (rustup), then open a new terminal.
+2. **Windows Hello is set up.** Settings, Accounts, Sign-in options: a PIN (or a fingerprint or face) is set. Part B's last check uses it.
+3. **Have these ready for the fullscreen check** (Part B, check 6):
+   - a game or 3D program you can start quickly and switch to fullscreen;
+   - a video you can play fullscreen in a web browser (optional);
+   - a presentation you can start as a slide show (optional).
+4. **Plan for one sleep.** Part B puts the PC to sleep once, and asks you to leave it untouched for your sleep timeout plus about 6 minutes. Save your work in other programs first.
+5. **The display language.** The keep-awake check reads Windows' `powercfg` output in English. If Windows is in another language, that one part is reported as "skipped" rather than run; everything else still works.
+6. **For Part C only:** Visual Studio Build Tools with the "Desktop development with C++" workload (the script copies three Microsoft runtime files from it), and Task 0's run must have produced the folder `spikes\app-shell\build\deploy`.
 
-It builds the spike (`cargo build --release --locked`, about 2 minutes the first time), registers the shortcut and the `lilspike` scheme, runs S1.1–S1.8 in order and removes everything at the end. Results: `spikes/winshell/results/checks.json`. To repeat single checks later: `-Only S1.5,S1.6` (setup and cleanup still run).
+## Part B: the main run on this PC (about 1 hour, plus the sleep timeout)
 
-| Check | Time | What you see and do |
+### Start it
+
+1. Open **Windows Terminal normally**: Start, type `Terminal`, press Enter. Don't choose "Run as administrator": the script refuses to run elevated, because Windows doesn't show toasts from elevated programs.
+2. Go to the folder where this repository is checked out: type `cd ` followed by that folder's path, then press Enter.
+3. Type this and press Enter:
+
+   ```powershell
+   pwsh -NoProfile -File spikes/winshell/run-spike.ps1
+   ```
+
+4. Keep this terminal window where you can see it. It prints a heading for each check (`==== S1.2 ...`) and asks its questions there. After each check it prints a line such as `S1.2 -> PASS` in green or `-> FAIL` in red.
+
+### The checks, in order
+
+Each heading gives the time the check takes.
+
+**Check 1: the build (2–3 minutes).**
+
+1. Nothing to do. The script compiles the spike and counts warnings.
+2. If it prints `S1.1 -> FAIL`, the script stops there. Tell the agent; the result is in `spikes\winshell\results\checks.json`.
+
+**Setup (under a minute).** The script adds a Start-menu shortcut "LILITH Spike" and registers the link type `lilspike:`. Nothing to do.
+
+**Check 2: toasts from a background program (3 minutes).**
+
+1. The script says "Ready for toast 1 of 3?". Press Enter.
+2. A notification ("LILITH spike / Toast 1 of 3") should slide in at the bottom right. **Don't click it.**
+3. Answer `y` if you saw it, `n` if you didn't.
+4. The same again for toasts 2 and 3.
+5. Then one extra toast with the shortcut removed (this one is only recorded). Press Enter, watch, and answer whether it appeared.
+6. If any of the three answers is `n`, the script stops with `S1.2 -> FAIL` and cleans up. Tell the agent.
+
+**Check 3: clicking toasts (about 8 minutes, plus 4 for the optional extras).**
+
+1. Six toasts come, one at a time, each with an "Open" button. Each toast's text says what to click.
+2. For the first three, click the **toast itself** (its text), not the button.
+3. For the last three, click the **Open button**.
+4. Each click opens a small window titled "winshell-app"; the script closes it a moment later.
+5. If a toast disappears before you click it, press **Win+N** to open the notification centre and click it there.
+6. Optional extra 1, Edge: if you answer `y`, Edge opens a small local page.
+   1. Click the link "Open the spike ref".
+   2. Edge asks whether to open the app: click **Open**. Leave the "Always allow" box **unticked**.
+7. Optional extra 2, the Run box (twice, once for each link): if you answer `y`, the script puts a link on the clipboard.
+   1. Press **Win+R**.
+   2. Press **Ctrl+V**, then Enter.
+   3. Your earlier clipboard text is put back afterwards.
+
+**Check 4: which window comes to the front (about 12 minutes).**
+
+1. In each trial two small windows open: "winshell-app" and then "winshell blocker" on top of it. Leave them alone.
+2. A toast comes: click the **toast itself**.
+3. There are ten trials: five with both windows, five with only the blocker.
+4. If the script says "The blocker window did not take the front", that trial simply repeats (up to 3 times). You don't need to do anything different.
+5. If the first five trials don't all pass, the script runs five more with a different method. Same steps.
+
+**Check 5: progress toasts (about 4 minutes).**
+
+1. Press Enter when asked. A toast "Spike job running" appears and its progress bar fills over 20 seconds.
+2. Watch: it should slide in **once** and then just update. Answer `y` if it appeared only once.
+3. Press **Win+N**, find "Spike job running", and close it with its **X**. Press Enter in the terminal.
+4. Press Enter again: a toast "Spike job finished" should appear. Answer whether it did.
+5. Press Enter again: a "Quiet toast" is sent, and this one should **not** slide in. Answer `y` if nothing appeared.
+6. Press **Win+N** and look for "Quiet toast" in the list. Answer whether it is there.
+
+**Check 6: fullscreen (about 5 minutes).**
+
+1. (a) Press Enter, then leave the desktop as it is for 30 seconds: ordinary windows, nothing fullscreen.
+2. (b) Press Enter, then within 20 seconds start your game or 3D program and make it fullscreen. Stay in it until you hear a **beep** (60 seconds in all), then come back to the terminal.
+3. (c) Optional: answer `y`, then do the same with a browser video in fullscreen until the beep.
+4. (d) Optional: answer `y` if you have a presentation, then do the same with the slide show until the beep.
+
+**Check 7: keeping the PC awake (about 15 minutes, plus your sleep timeout).**
+
+1. The script prints your sleep timeout (or "never").
+2. When it asks, open a **second** terminal **as administrator**: right-click Start, choose "Terminal (Admin)", and say Yes.
+3. In that admin terminal, type `powercfg /requests` and press Enter.
+4. Look under the heading **SYSTEM**. You should see a line containing "LILITH spike 11 keep-awake check" (with `winshell-core.exe`). Answer in the first terminal.
+5. The script then asks whether anything **else** is listed under SYSTEM. Type what it is (for example a program's name), or just press Enter if nothing else is there.
+6. The script releases the request. Run `powercfg /requests` again in the admin terminal and answer whether the LILITH line is gone.
+7. If your sleep timeout isn't "never": press Enter, then **don't touch the mouse or keyboard** until the time the script shows (your timeout plus about 5.5 minutes). The screen may turn off; that is fine. The PC should **not** go to sleep. The script carries on by itself afterwards.
+8. If the script says "PowerSetRequest failed a check", it repeats steps 3 to 7 with a second method. This time, look under SYSTEM for a line `[PROCESS] ...\winshell-core.exe`, which has no description text.
+9. Sleep and wake:
+   1. Press Enter.
+   2. Put the PC to sleep: Start, Power, **Sleep**.
+   3. Wait about a minute, then wake it and sign in.
+   4. The script notices the wake and carries on by itself. It waits up to 15 minutes.
+
+**Check 8: Windows Hello (about 5 minutes).** Keep the terminal in front for this check.
+
+1. The script prints three short results: whether Hello is supported, the security chip (TPM) version, and a data-protection test.
+2. (b) Press Enter. A Windows Hello prompt appears to create a key called "LILITH-spike-kek".
+   1. Notice whether the prompt appeared **in front of** the terminal.
+   2. Complete it (PIN, finger or face).
+   3. Answer the question.
+3. (c) Press Enter. Up to ten Hello prompts follow, five and then five. Complete each one.
+4. (e) Press Enter. One more Hello prompt, to confirm it's you.
+   1. Notice whether it appeared in front of the terminal.
+   2. Complete it.
+   3. Answer the question.
+5. The key is then deleted without a prompt.
+
+**Cleanup (about 1 minute).**
+
+1. Nothing to do.
+2. The script removes everything listed below and checks that it is gone.
+3. The run ends with `Cleanup -> PASS` in green. If it says `FAIL` in red, see "If something looks wrong" below.
+
+### What Part B changes, and how it is undone
+
+All of it is removed by the cleanup at the end, and the cleanup checks each item.
+
+| What | When | How it is undone |
 |---|---|---|
-| S1.1 | 2–3 min | Nothing: a clean release build, warnings counted. If it fails, the script stops. |
-| S1.2 | 3 min | Three toasts "LILITH spike / Toast n of 3" pop bottom right. **Don't click them.** Answer `y` or `n` for each. Then one more toast with the shortcut removed (recorded only): answer whether it popped. If S1.2 fails, the script stops. |
-| S1.3 | 8 min, +4 for the recorded checks | Six toasts with an "Open" button. Click the **body** of the first three and the **Open button** of the last three (each toast says which). If a toast has already gone, open the notification centre (Win+N) and click it there. Each click opens a small "winshell-app" window; the script closes it. Then, if you agree: Edge opens a local page; click the link and choose **Open** in Edge's prompt, **without ticking "Always allow"**. Then the Run dialog twice: the script copies a `lilspike:open/…` link to the clipboard; press Win+R, Ctrl+V, Enter. |
-| S1.4 | 12 min | Ten toasts. Five times: a "winshell-app" window opens, then a "winshell blocker" window in front of it, then a toast; **click the toast's body** and leave the windows alone. Five more times with only the blocker window. Each trial first checks that the blocker window really took the front; if it didn't, the script says so and repeats that trial (up to 3 times) before any toast. If the first five don't all pass, five more run with the fallback recipe. |
-| S1.5 | 4 min | A progress toast "Spike job running" pops and fills for 20 s: watch whether it **pops a second time** (it should not), then answer. Open the notification centre (Win+N) and **dismiss it with its X**. Then a "Spike job finished" toast should pop: answer. Then a "Quiet toast" should **not** pop: answer, then look in the notification centre (Win+N) for it: answer. |
-| S1.6 | 5 min | (a) 30 s at the desktop: change nothing. (b) When asked, **start a fullscreen Direct3D game or program**; you have 20 s to get it fullscreen; stay in it until you hear a beep (60 s), then come back. (c) Optional: the same with a **browser video in fullscreen**. (d) Optional: the same with a **slide show**. |
-| S1.7 | 15 min plus the sleep timeout | The script reads `powercfg /a` and the sleep timeout itself. When asked, open an **elevated** terminal (Win+X, then Terminal (Admin)) and run `powercfg /requests`: answer whether "LILITH spike 11 keep-awake check" is listed under SYSTEM, and type anything **else** listed under SYSTEM (another program's request could keep the PC awake by itself); the script clears the request; run `powercfg /requests` again and answer whether it is gone. Then, if the sleep timeout isn't "never", **leave the PC untouched** until the time the script shows (the timeout plus about 5.5 minutes; the display may turn off). Then **put the PC to sleep** (Start, Power, Sleep), wait about a minute, wake it and sign in; the script waits up to 15 minutes. If the first checks fail, they repeat with `SetThreadExecutionState`; that request carries no reason text, so look for `[PROCESS] ...\winshell-core.exe` under SYSTEM instead. Besides the spike's own log, the stay-awake verdict reads the System event log's Kernel-Power sleep and standby entries. |
-| S1.8 | 5 min | Windows Hello prompts, each announced first: (b) create the credential "LILITH-spike-kek"; (c) up to ten signing prompts, five from each of two processes; (e) one verification prompt. For (b) and (e), answer whether the prompt was **in front of the terminal**; complete every prompt. (f) deletes the credential without a prompt. |
-| Cleanup | 1 min | Nothing: it removes everything listed below and checks it is gone. `Cleanup -> PASS` ends the run. |
+| A Start-menu shortcut "LILITH Spike" (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\LILITH Spike.lnk`) | setup | deleted, then checked |
+| The link type `lilspike:` (registry key `HKCU\Software\Classes\lilspike`) | setup | deleted with everything under it, then checked |
+| The key `HKCU\Software\Classes\AppUserModelId\LILITH.Spike.Notify` | check 2's extra toast only | deleted straight after that toast, and again at cleanup, then checked. Its parent `AppUserModelId` is removed too if the script created it and it is empty |
+| The Windows Hello key "LILITH-spike-kek" | check 8 | deleted at the end of check 8, and again at cleanup if still there. The cleanup passes only when Windows Hello confirms the key is "not found" |
+| Windows' own notification setting for "LILITH Spike" (`HKCU\...\Notifications\Settings\LILITH.Spike.Notify`) | added by Windows on the first toast | deleted |
+| Any `lilspike` entries Windows adds under `HKCU\...\ApplicationAssociationToasts` | added by Windows | deleted |
+| The spike's toasts in the notification centre | checks 2–5 | cleared |
+| The folder `%LOCALAPPDATA%\LILITH-spike\winshell` (a log, the Edge test page) | throughout | the log is copied into the results first; then the folder is deleted (and `LILITH-spike` too, if empty) |
+| Your clipboard | check 3, Run-box extra | your text is put back afterwards. An image, or an empty clipboard, is not restored: the link stays on it |
+| The power request "LILITH spike 11 keep-awake check" | check 7 | released by the script; the cleanup also checks that no `winshell-core` program is still running |
+| `spikes\winshell\target\` (the built programs) and `spikes\winshell\results\` (the results) | throughout | kept for the agent to read. Git ignores both. Delete them whenever you like |
 
-### What Step 2 writes, and how cleanup removes it
+### If something looks wrong in Part B
 
-| Written | When | Removed by |
-|---|---|---|
-| `%APPDATA%\Microsoft\Windows\Start Menu\Programs\LILITH Spike.lnk` (target `winshell-app.exe`, AUMID `LILITH.Spike.Notify`) | setup | deleted; checked |
-| `HKCU\Software\Classes\lilspike` (`URL:LILITH (Spike)`, `URL Protocol`, `DefaultIcon`, `shell\open\command`) | setup | deleted with its subkeys; checked |
-| `HKCU\Software\Classes\AppUserModelId\LILITH.Spike.Notify` (`DisplayName`) | S1.2's recorded check only | deleted at once after that check, and again at cleanup; checked. Its parent `AppUserModelId` is removed too when the script created it and it is empty |
-| The Windows Hello credential `LILITH-spike-kek` | S1.8 (b) | deleted by S1.8 (f); cleanup deletes it if still there; checked: the cleanup passes only when Windows Hello answers "not found" (or Hello isn't supported at all), never on an error |
-| `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\LILITH.Spike.Notify` | by Windows, on the first toast | deleted |
-| `lilspike` values under `HKCU\Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts`, if Windows adds any | by Windows, after registration | deleted |
-| The spike's toasts in the notification centre | S1.2–S1.5 | cleared |
-| `%LOCALAPPDATA%\LILITH-spike\winshell\` (activation log, Edge test page, power flags) | throughout | copied to `results\raw\events.jsonl`, then deleted (and `LILITH-spike\` if empty) |
-| The clipboard (a `lilspike:open/…` link) | S1.3's Run-dialog check | your text clipboard is saved first and put back after the check (an image, or an empty clipboard, isn't restored: the link stays) |
-| `spikes/winshell/target/` and `spikes/winshell/results/` | build, every check | kept; both are ignored by git (only images in `results/` would be committed) |
+- **A toast didn't appear or a window didn't come up:** just answer `n` (or wait: the script gives each click up to 2 minutes). Don't try to fix it. A failure is a result too.
+- **You want to stop:** press **Ctrl+C**. The cleanup still runs and prints `Cleanup -> PASS` or `FAIL`.
+- **The terminal was closed, or the PC restarted, in the middle:** open a normal terminal in the repository folder and type:
 
-The cleanup runs in a `finally` block, so it also runs after an error or Ctrl+C. Each of its steps runs even when an earlier one fails, and it also checks that no `winshell-core` is left running (so no power request is left held). If the terminal itself was closed mid-run, run `pwsh -NoProfile -File spikes/winshell/run-spike.ps1 -CleanupOnly`, which registers nothing, removes what is left and reports what remains. It works without the built exes too, but then it can't ask Windows Hello and reports the credential as "unknown".
+  ```powershell
+  pwsh -NoProfile -File spikes/winshell/run-spike.ps1 -CleanupOnly
+  ```
 
-## Step 2b: Windows Sandbox (about 1 hour 15 minutes, after the feature is on)
+  It adds nothing, removes whatever is left and prints what remains.
+- **`Cleanup -> FAIL`:** the line above it lists what is still there. Run the `-CleanupOnly` command once more. If it still fails, tell the agent; the details are in `spikes\winshell\results\checks.json`.
+- **To repeat only some checks later**, name them, for example:
 
-### Turn on Windows Sandbox (once, about 10 minutes with the restart)
+  ```powershell
+  pwsh -NoProfile -File spikes/winshell/run-spike.ps1 -Only S1.5,S1.6
+  ```
 
-The agent changes no system setting; this one is yours.
+  The setup and the cleanup run each time.
 
-1. Check that virtualization is on: Task Manager, Performance, CPU: "Virtualization: Enabled". If it says Disabled, turn on Intel VT-x or AMD-V (SVM) in the firmware setup first.
-2. Settings, System, Optional features, "More Windows features" (at the bottom). This opens "Turn Windows features on or off".
-3. Tick **Windows Sandbox**, press OK, and restart when asked.
+## Part C: the runs inside Windows Sandbox
 
-The same from an elevated PowerShell, if you prefer: `Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All`, then restart.
+Windows Sandbox is a throwaway Windows that runs in a window and is wiped when it closes. The agent changes no system setting itself, so turning the Sandbox on is your step.
 
-To turn it off again later: untick it in the same dialog (or `Disable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM`), then restart.
+### C1. Turn on Windows Sandbox (once, about 10 minutes including a restart)
 
-### The three unattended runs (about 30 minutes)
+1. Check that virtualization is on.
+   1. Press Ctrl+Shift+Esc to open Task Manager, then open the Performance tab and select CPU.
+   2. Look for "Virtualization: Enabled".
+   3. If it says Disabled, it has to be turned on in the PC's firmware (BIOS/UEFI) setup first, where it is called Intel VT-x or AMD-V/SVM. Stop here if you're unsure, and ask.
+2. Open Settings, System, Optional features. At the bottom, click **More Windows features**. A list called "Turn Windows features on or off" opens.
+3. Tick **Windows Sandbox**, click OK, and restart the PC when Windows asks.
+4. After the restart, type `Windows Sandbox` in Start. If it is listed, the feature is on. You don't need to open it.
 
-```powershell
-pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1 -Runs 3
-```
+To turn it off again later: untick it in the same list and restart.
 
-**Close any Windows Sandbox of your own first**: the script refuses to start while one runs, and it only ever stops the Sandbox it started itself (by its id with the `wsb` CLI, otherwise by the processes that appeared when it started it). Ctrl+C stops that Sandbox too.
+### C2. Three unattended runs (about 30 minutes)
 
-Each run opens the Windows Sandbox window, which works by itself for 3–8 minutes (a console, a toast, small windows, the Qt spike app) and then closes itself. **Don't type or click inside the Sandbox window**, and leave it where it is. The host terminal prints each item's PASS or FAIL per run. Results: `spikes/winshell/results/sandbox-checks.json` and `results/sandbox/run-<n>/`.
+1. **Close any Windows Sandbox window you have open yourself.** The script refuses to start while one is running, so that it never touches yours.
+2. In a normal terminal in the repository folder, type:
 
-If Task 0's app takes a different command line for its offscreen grab than `--grab <png>`, pass it as `-QtGrabArgs '<args with {png}>'`; if the deploy folder holds more than one exe, name the app with `-QtExe <name>.exe`.
+   ```powershell
+   pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1 -Runs 3
+   ```
 
-### The host-state observation (about 15 minutes, owner present)
+3. The script builds and prepares its files (a few minutes the first time), then opens a Windows Sandbox window.
+4. Inside that window things happen by themselves for 3–8 minutes: a blue console, a toast, small windows, and the Qt test app from Task 0. **Don't click or type inside the Sandbox window**, and leave it where it is.
+5. The Sandbox window closes by itself. The terminal prints each item with PASS or FAIL, and then the next run starts. There are three runs in all.
+6. At the end the terminal prints `S1.9 run: PASS` or `FAIL`.
 
-```powershell
-pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1 -Observe
-```
+### C3. Watching one run (about 15 minutes, you present)
 
-1. Watch the Sandbox window: a toast should pop **inside it** within a minute or two. Answer in the host terminal.
-2. When the Sandbox console goes quiet, press Enter, then **put other windows over the Sandbox window** (don't minimise it). The toast, foreground and Qt items run again.
-3. When the terminal says round 2 is done, press Enter, then **lock the PC (Win+L) within 30 s**, stay locked about 4 minutes, and sign in again. The items run a third time; then the Sandbox closes itself.
+1. Type:
 
-Results: `spikes/winshell/results/sandbox-observe.json`. These are recorded, not bars.
+   ```powershell
+   pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1 -Observe
+   ```
 
-### What Step 2b writes
+2. Watch the Sandbox window: within a minute or two a toast should slide in **inside the Sandbox window**. Answer `y` or `n` in your terminal.
+3. Wait until the console inside the Sandbox stops changing (its first round is done), then press Enter in your terminal.
+4. Now drag other windows **over** the Sandbox window so that it is covered (don't minimise it). The script repeats some items. Wait.
+5. When the terminal says "Round 2 done", press Enter, then **lock the PC** with Win+L within 30 seconds.
+6. Stay locked for about 4 minutes, then sign in again.
+7. The Sandbox finishes and closes by itself. The terminal prints the results.
 
-On the host: only `spikes/winshell/build/sandbox/` (the bundles, a copy of Task 0's deploy folder, the `.wsb` files and the results folders, each results folder granted SYSTEM modify when SYSTEM isn't already on its access list). The `.wsb` turns off networking, clipboard sharing, audio and video input and printer sharing and `spikes/winshell/results/sandbox*`. Both are ignored by git. Delete `spikes/winshell/build/` when you like.
+### What Part C changes
 
-`inside.ps1` runs only inside the Sandbox: it checks for the Sandbox's own account (`WDAGUtilityAccount`) and for a marker file that only the mapped bundle holds, and otherwise exits before doing anything (so starting it by mistake on this PC changes nothing and never shuts it down).
+- **On this PC**, only two folders inside the repository, both ignored by git. Delete them whenever you like.
+  - `spikes\winshell\build\sandbox\`: the files handed to the Sandbox, a copy of Task 0's app folder, the Sandbox settings files, and the folders the Sandbox writes its results to. If a results folder doesn't already give Windows' SYSTEM account write access, the script adds it, because the Sandbox writes through that account.
+  - `spikes\winshell\results\sandbox*`: the copied results.
+- **The Sandbox's settings** turn off its network, clipboard sharing, microphone, camera and printer sharing. Only those two folders connect it to this PC.
+- **Inside the Sandbox:** a shortcut, the `lilspike:` link type, a scheduled task (only if needed) and logs. All of it disappears when the Sandbox closes.
+- **The script inside the Sandbox** (`inside.ps1`) checks first that it is really inside the Sandbox. If it were started on this PC by mistake, it stops at once and changes nothing.
+- **The Windows Sandbox feature itself** stays on until you turn it off (C1).
 
-Inside the Sandbox: the shortcut, the `lilspike` key, a scheduled task `LilSpikeLimited` (only when the logon is elevated) and the logs. All of it is discarded when the Sandbox closes.
+### If something looks wrong in Part C
 
-The Windows Sandbox feature itself stays on until you turn it off.
+- **"A Windows Sandbox is already running":** close your own Sandbox window, then run the command again.
+- **"Windows Sandbox is not turned on":** do C1 first.
+- **"Task 0's deploy folder is missing":** Task 0's run hasn't happened yet. Wait for it.
+- **The script asks for `-QtExe` or `-QtGrabArgs`:** Task 0's app folder isn't what the script expected. Tell the agent, who will give you the exact command.
+- **You want to stop:** press **Ctrl+C**. The script closes the Sandbox it started, and only that one.
+- **The Sandbox window stays open for more than 10 minutes:** wait. The script closes it within a few minutes after its time limit, and records that run as a failure.
