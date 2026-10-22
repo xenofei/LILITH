@@ -24,6 +24,8 @@ You answer the scripts' questions by typing `y` or `n` and pressing Enter, or ju
 
 ## Part B: the main run on this PC (about 1 hour, plus the sleep timeout)
 
+> **Rerun after run 1 (2026-10-22).** Checks 1 and 2 passed in run 1, so the rerun starts at the new check 2b. Use the command under "Rerunning after run 1" at the end of Part B instead of the one in step 3 below. Everything else in Part B is the same.
+
 ### Start it
 
 1. Open **Windows Terminal normally**: Start, type `Terminal`, press Enter. Don't choose "Run as administrator": the script refuses to run elevated, because Windows doesn't show toasts from elevated programs.
@@ -56,28 +58,43 @@ Each heading gives the time the check takes.
 5. Then one extra toast with the shortcut removed (this one is only recorded). Press Enter, watch, and answer whether it appeared.
 6. If any of the three answers is `n`, the script stops with `S1.2 -> FAIL` and cleans up. Tell the agent.
 
+**Check 2b: does a missed toast stay in the notification centre? (about 3 minutes, recorded only)**
+
+Run 1 showed that a toast you missed could not be found in Win+N afterwards. This check measures that.
+
+1. Two toasts come, one at a time, each saying "Persistence check (...): leave this toast alone". Press Enter for each when asked.
+2. **Don't click it and don't close it.** Let it slide away by itself.
+3. The script waits about 20 seconds, then asks you to press **Win+N** and say whether that toast is listed.
+4. Close the notification centre again (press Esc) before the next one.
+
 **Check 3: clicking toasts (about 8 minutes, plus 4 for the optional extras).**
 
 1. Six toasts come, one at a time, each with an "Open" button. Each toast's text says what to click.
 2. For the first three, click the **toast itself** (its text), not the button.
 3. For the last three, click the **Open button**.
 4. Each click opens a small window titled "winshell-app"; the script closes it a moment later.
-5. If a toast disappears before you click it, press **Win+N** to open the notification centre and click it there.
-6. Optional extra 1, Edge: if you answer `y`, Edge opens a small local page.
+5. If a toast disappears before you click it, press **Win+N** and click it there if it is listed.
+6. **If you missed a toast and can't find it**, just wait. After 60 seconds the script asks "Did you miss the toast?":
+   1. Answer `y`.
+   2. The same toast is sent again (up to 3 times); click it this time.
+   3. A missed toast is recorded but doesn't count as a failure.
+7. Optional extra 1, Edge: if you answer `y`, Edge opens a small local page.
    1. Click the link "Open the spike ref".
    2. Edge asks whether to open the app: click **Open**. Leave the "Always allow" box **unticked**.
-7. Optional extra 2, the Run box (twice, once for each link): if you answer `y`, the script puts a link on the clipboard.
-   1. Press **Win+R**.
-   2. Press **Ctrl+V**, then Enter.
-   3. Your earlier clipboard text is put back afterwards.
+8. Optional extra 2, the Run box (twice, once for each link): if you answer `y`, the script puts a link on the clipboard.
+   1. **Close the Edge tab with the test page first.** In run 1 its link was clicked again by mistake, and the Run box's link never arrived.
+   2. Press **Win+R**.
+   3. Press **Ctrl+V**, then Enter.
+   4. If what arrives isn't the Run box's link, the script says so and asks once more.
+   5. Your earlier clipboard text is put back afterwards.
 
 **Check 4: which window comes to the front (about 12 minutes).**
 
-1. In each trial two small windows open: "winshell-app" and then "winshell blocker" on top of it. Leave them alone.
-2. A toast comes: click the **toast itself**.
-3. There are ten trials: five with both windows, five with only the blocker.
-4. If the script says "The blocker window did not take the front", that trial simply repeats (up to 3 times). You don't need to do anything different.
-5. If the first five trials don't all pass, the script runs five more with a different method. Same steps.
+1. In each trial two small windows open: "winshell-app" and then "winshell blocker" on top of it.
+2. **If the script says "Click once on the title bar of the window 'winshell blocker'"**, do that: click the blocker's title bar, not "winshell-app". In run 1 the blocker often couldn't come to the front by itself, and the trial needs it in front.
+3. A toast comes: click the **toast itself**. A missed toast works as in check 3: wait, answer `y`, and it comes again.
+4. There are ten trials: five with both windows, five with only the blocker.
+5. If a trial with both windows fails, the script runs five more with a different method. Same steps.
 
 **Check 5: progress toasts (about 4 minutes).**
 
@@ -139,6 +156,7 @@ All of it is removed by the cleanup at the end, and the cleanup checks each item
 |---|---|---|
 | A Start-menu shortcut "LILITH Spike" (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\LILITH Spike.lnk`) | setup | deleted, then checked |
 | The link type `lilspike:` (registry key `HKCU\Software\Classes\lilspike`) | setup | deleted with everything under it, then checked |
+| The spike's toast activator `HKCU\Software\Classes\CLSID\{6F1A0C52-3B7E-4E0D-9A11-5C2B8D7E4F31}` (it names `winshell-app.exe`), and the same ID on the shortcut | check 2b on | deleted, then checked |
 | The key `HKCU\Software\Classes\AppUserModelId\LILITH.Spike.Notify` | check 2's extra toast only | deleted straight after that toast, and again at cleanup, then checked. Its parent `AppUserModelId` is removed too if the script created it and it is empty |
 | The Windows Hello key "LILITH-spike-kek" | check 8 | deleted at the end of check 8, and again at cleanup if still there. The cleanup passes only when Windows Hello confirms the key is "not found" |
 | Windows' own notification setting for "LILITH Spike" (`HKCU\...\Notifications\Settings\LILITH.Spike.Notify`) | added by Windows on the first toast | deleted |
@@ -151,6 +169,7 @@ All of it is removed by the cleanup at the end, and the cleanup checks each item
 
 ### If something looks wrong in Part B
 
+- **A check stops with an error** (a red line such as "S1.4 stopped with an error ... Going on to the next check"): nothing to do. The script records the error for that check and carries on with the next one.
 - **A toast didn't appear or a window didn't come up:** just answer `n` (or wait: the script gives each click up to 2 minutes). Don't try to fix it. A failure is a result too.
 - **You want to stop:** press **Ctrl+C**. The cleanup still runs and prints `Cleanup -> PASS` or `FAIL`.
 - **The terminal was closed, or the PC restarted, in the middle:** open a normal terminal in the repository folder and type:
@@ -168,6 +187,20 @@ All of it is removed by the cleanup at the end, and the cleanup checks each item
   ```
 
   The setup and the cleanup run each time.
+- **Earlier results are kept.** Each run moves the previous run's `checks.json` and `raw\` into `spikes\winshell\results\run-<date and time>\` before it starts. The whole console, with your answers, is kept in `results\raw\console.log`.
+
+### Rerunning after run 1
+
+Run 1 (2026-10-22) passed checks 1 and 2 and stopped during check 4. The rerun skips checks 1 and 2 and starts with the new check 2b:
+
+1. Open Windows Terminal normally and go to the repository folder (steps 1 and 2 under "Start it").
+2. Type this and press Enter:
+
+   ```powershell
+   pwsh -NoProfile -File spikes/winshell/run-spike.ps1 -Only S1.2p,S1.3,S1.4,S1.5,S1.6,S1.7,S1.8
+   ```
+
+3. Then follow check 2b and checks 3 to 8 and the cleanup as above. It takes about 50 minutes, plus your sleep timeout.
 
 ## Part C: the runs inside Windows Sandbox
 

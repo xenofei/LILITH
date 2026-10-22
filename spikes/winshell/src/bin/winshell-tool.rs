@@ -3,7 +3,8 @@
 //! - `spawn -- <exe> [args...]`: start a process detached (`DETACHED_PROCESS |
 //!   CREATE_NEW_PROCESS_GROUP`), as `lil-client` starts the core; prints `{pid}`
 //! - `programs-dir`: `FOLDERID_Programs`
-//! - `shortcut-write --path <lnk> --target <exe> --aumid <id>` / `shortcut-read --path <lnk>`
+//! - `shortcut-write --path <lnk> --target <exe> --aumid <id> [--toast-clsid]` /
+//!   `shortcut-read --path <lnk>` (`--toast-clsid` also sets the spike's ToastActivatorCLSID)
 //! - `setting`: `ToastNotifier::Setting()` for the spike's AUMID
 //! - `history [--tag T]`: the Tags of the spike's toasts in the notification centre
 //! - `history-clear`: removes them
@@ -41,6 +42,8 @@ fn main() {
                 Path::new(args.get_or("path", "")),
                 Path::new(args.get_or("target", "")),
                 args.get_or("aumid", winshell::AUMID),
+                args.has("toast-clsid")
+                    .then(|| windows::core::GUID::from_u128(winshell::TOAST_CLSID_U128)),
             );
             json!({ "written": r.is_ok(), "error": r.err().map(|e| e.to_string()) })
         }
@@ -50,9 +53,9 @@ fn main() {
                 json!({ "exists": false })
             } else {
                 match read_shortcut(path) {
-                    Ok((target, aumid)) => {
-                        json!({ "exists": true, "target": target, "aumid": aumid })
-                    }
+                    Ok((target, aumid, clsid)) => json!({
+                        "exists": true, "target": target, "aumid": aumid, "toast_clsid": clsid,
+                    }),
                     Err(e) => json!({ "exists": true, "error": e.to_string() }),
                 }
             }

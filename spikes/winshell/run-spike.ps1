@@ -9,6 +9,8 @@ Writes, and removes again at the end (also after an error or Ctrl+C):
   - the shortcut <Programs>\LILITH Spike.lnk (System.AppUserModel.ID = LILITH.Spike.Notify)
   - HKCU\Software\Classes\lilspike (the protocol handler, Appendix G's shape)
   - HKCU\Software\Classes\AppUserModelId\LILITH.Spike.Notify (only during S1.2's recorded check)
+  - HKCU\Software\Classes\CLSID\{6F1A0C52-3B7E-4E0D-9A11-5C2B8D7E4F31} (the spike's toast
+    activator, from the toast-persistence check S1.2p on)
   - the Windows Hello credential LILITH-spike-kek (S1.8)
   - %LOCALAPPDATA%\LILITH-spike\winshell (the activation log and the power flags)
 Windows itself adds HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\
@@ -17,7 +19,14 @@ LILITH.Spike.Notify on the first toast; the cleanup removes that too.
 Run it from a normal (not elevated) Windows Terminal. See OWNER-STEPS.md.
 
 .PARAMETER Only
-Runs only these checks (for example S1.5,S1.6). Setup and cleanup always run.
+Runs only these checks, for example the rerun after run 1:
+  -Only S1.2p,S1.3,S1.4,S1.5,S1.6,S1.7,S1.8
+Setup and cleanup always run. An earlier checks.json and raw\ are moved into
+results\run-<UTC time>\ first, never overwritten.
+
+.PARAMETER LibraryOnly
+Defines the functions and returns, doing nothing else (the strict-mode cleanup test
+tests/cleanup-strict.ps1 dot-sources the script this way).
 
 .PARAMETER CleanupOnly
 Registers nothing and runs no check: removes whatever an interrupted run left and reports
@@ -26,7 +35,8 @@ what is still there.
 param(
     [string[]]$Only = @(),
     [switch]$SkipBuild,
-    [switch]$CleanupOnly
+    [switch]$CleanupOnly,
+    [switch]$LibraryOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,6 +61,8 @@ $AumidKey = "HKCU:\Software\Classes\AppUserModelId\$Aumid"
 $NotifySettingsKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\$Aumid"
 $AssocToastsKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts'
 $PowerReason = 'LILITH spike 11 keep-awake check'
+$ToastClsid = '{6F1A0C52-3B7E-4E0D-9A11-5C2B8D7E4F31}'
+$ClsidKey = "HKCU:\Software\Classes\CLSID\$ToastClsid"
 
 $Report = [ordered]@{
     spike   = 11
@@ -150,9 +162,16 @@ function Read-CoreNow($C) {
     $null
 }
 
+# A line caught while winshell-app is still writing it would fail to parse; it is skipped and
+# read whole on the next poll, never a terminating error (Part B run 1 analysis).
 function Get-Events {
     if (-not (Test-Path $Events)) { return @() }
-    @(Get-Content $Events | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+    $lines = @(Get-Content $Events -ErrorAction SilentlyContinue | Where-Object { $_ })
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($l in $lines) {
+        try { $out.Add(($l | ConvertFrom-Json)) } catch { break }
+    }
+    $out.ToArray()   # callers wrap it in @()
 }
 
 # Waits for the first event after index $After that matches $Kind and $Filter.
@@ -186,12 +205,25 @@ function Post-Toast([string]$Name, [string[]]$ToastArgs) {
 
 $Lnk = $null
 
-function Write-Shortcut {
-    $w = Tool shortcut-write --path $Lnk --target $App --aumid $Aumid
-    if (-not $w.written) { throw "shortcut not written: $($w.error)" }
+# The shortcut: plain (the AUMID only), or with the spike's ToastActivatorCLSID and its COM
+# registration, whose LocalServer32 is winshell-app.exe (S1.2p and everything after it).
+$script:ShortcutForm = 'plain'
+
+function Write-Shortcut([switch]$ToastClsid) {
+    $extra = @()
+    if ($ToastClsid) {
+        New-Item -Path "$ClsidKey\LocalServer32" -Value "`"$App`"" -Force | Out-Null
+        $extra = @('--toast-clsid')
+    } elseif (Test-Path $ClsidKey) {
+        Remove-Item -Path $ClsidKey -Recurse -Force
+    }
+    $w = Tool shortcut-write --path $Lnk --target $App --aumid $Aumid @extra
+    if (-not (P $w 'written')) { throw "shortcut not written: $(P $w 'error')" }
     $r = Tool shortcut-read --path $Lnk
-    if ($r.aumid -ne $Aumid) { throw "shortcut AUMID reads back as '$($r.aumid)'" }
-    Start-Sleep -Seconds 3   # let the Start menu index it before the first toast
+    if ((P $r 'aumid') -ne $Aumid) { throw "shortcut AUMID reads back as '$(P $r 'aumid')'" }
+    if ($ToastClsid -and (P $r 'toast_clsid') -ne $ToastClsid) { throw "shortcut ToastActivatorCLSID reads back as '$(P $r 'toast_clsid')'" }
+    $script:ShortcutForm = $(if ($ToastClsid) { 'toast_clsid' } else { 'plain' })
+    Start-Sleep -Seconds 3   # let the Start menu index it before the next toast
 }
 
 # Appendix G's registration, with scheme lilspike and winshell-app.exe as <exe>.
@@ -234,7 +266,8 @@ function Get-CleanupState {
         aumid_key_present    = [bool](Test-Path $AumidKey)
         credential           = $cred
         credential_gone      = $cred.StartsWith('gone')
-        core_running         = (Get-SpikeCores).Count -gt 0
+        core_running         = @(Get-SpikeCores).Count -gt 0
+        clsid_key_present    = [bool](Test-Path $ClsidKey)
         notify_settings_key  = [bool](Test-Path $NotifySettingsKey)
         log_dir_present      = [bool](Test-Path $LogDir)
     }
@@ -249,12 +282,13 @@ function Invoke-Cleanup([switch]$Final) {
         'stop processes'        = {
             Stop-SpikeProcesses
             $until = (Get-Date).AddSeconds(5)
-            while ((Get-SpikeCores).Count -gt 0 -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 200 }
+            while (@(Get-SpikeCores).Count -gt 0 -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 200 }
         }
         'clear history'         = { if (Test-Path -LiteralPath $ToolExe) { [void](Tool history-clear) } }
         'shortcut'              = { if ($Lnk -and (Test-Path -LiteralPath $Lnk)) { Remove-Item -LiteralPath $Lnk -Force -ErrorAction Stop } }
         'scheme key'            = { if (Test-Path $SchemeKey) { Remove-Item -Path $SchemeKey -Recurse -Force -ErrorAction Stop } }
         'AUMID key'             = { if (Test-Path $AumidKey) { Remove-Item -Path $AumidKey -Recurse -Force -ErrorAction Stop } }
+        'toast activator key'   = { if (Test-Path $ClsidKey) { Remove-Item -Path $ClsidKey -Recurse -Force -ErrorAction Stop } }
         'AUMID parent'          = {
             if ($script:AumidParentExisted -eq $false -and (Test-Path $AumidParent)) {
                 $k = Get-Item $AumidParent
@@ -299,7 +333,8 @@ function Invoke-Cleanup([switch]$Final) {
         association_toasts = $assocRemoved
         credential_deleted = $deleted
         pass               = [bool]($state -and -not ($state.shortcut_present -or $state.scheme_key_present -or
-                                     $state.aumid_key_present -or $state.core_running) -and $state.credential_gone)
+                                     $state.aumid_key_present -or $state.clsid_key_present -or $state.core_running) -and
+                                     $state.credential_gone -and $errors.Count -eq 0)
     }
 }
 
@@ -322,7 +357,7 @@ function Check-S11 {
         cargo_exit = $exit; warnings = $warnings.Count; warning_lines = $warnings
         windows_crate = '0.62.2'; features = $features
     })
-    if ($verdict -ne 'PASS') { throw 'S1.1 failed: stop, the result goes to the owner before Task 2 (APP-022).' }
+    if ($verdict -ne 'PASS') { throw 'STOP: S1.1 failed: the result goes to the owner before Task 2 (APP-022).' }
 }
 
 function Check-S12 {
@@ -354,24 +389,98 @@ function Check-S12 {
         trials = $trials
         recorded_registry_only = [ordered]@{ posted = (P $r 'posted'); setting = (P $r 'setting'); error = (P $r 'error'); seen = $seenRegOnly }
     })
-    if (-not $pass) { throw 'S1.2 failed: stop, the result goes to the owner before Task 2 (APP-022).' }
+    if (-not $pass) { throw 'STOP: S1.2 failed: the result goes to the owner before Task 2 (APP-022).' }
+}
+
+# How long Windows shows a toast banner (Settings, Accessibility, Visual effects, "Dismiss
+# notifications after this amount of time"); 5 s by default.
+function Get-BannerSeconds {
+    $v = (Get-ItemProperty 'HKCU:\Control Panel\Accessibility' -Name MessageDuration -ErrorAction SilentlyContinue)
+    if ($v -and $v.MessageDuration) { [int]$v.MessageDuration } else { 5 }
+}
+
+# The AUMID's notification settings as Windows keeps them (read only).
+function Get-NotifySettings {
+    $k = Get-ItemProperty -Path $NotifySettingsKey -ErrorAction SilentlyContinue
+    if (-not $k) { return $null }
+    $h = [ordered]@{}
+    foreach ($p in $k.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' }) { $h[$p.Name] = $p.Value }
+    $h
+}
+
+# S1.2p (recorded, Part B run 1 analysis): does a toast nobody clicks stay in the notification
+# centre after its banner times out? Once with the plain shortcut (the AUMID only), once with
+# the spike's ToastActivatorCLSID on the shortcut and registered. Measured from History some
+# time after the banner has gone, and by the owner opening the notification centre.
+function Check-S12p {
+    Step 'S1.2p recorded: does a missed toast stay in the notification centre?'
+    $banner = Get-BannerSeconds
+    $wait = [math]::Max(20, $banner + 15)
+    Say "Two toasts follow, one at a time. Do NOT click them and do NOT close them: let each one slide away by itself (about $banner s)."
+    $forms = [ordered]@{}
+    foreach ($form in 'plain', 'toast_clsid') {
+        if ($form -eq 'toast_clsid') { Write-Shortcut -ToastClsid } else { Write-Shortcut }
+        Wait-Owner "Ready for the '$form' toast?"
+        $tag = "persist-$form"
+        $r = Post-Toast "s12p-$form" @('--tag', $tag, '--launch', 'lilspike:task/j_0123456789abcdef',
+                '--title', 'LILITH spike', '--body', "Persistence check ($form): leave this toast alone")
+        $h0 = Tool history --tag $tag
+        Say "Waiting $wait s for the banner to go..."
+        Start-Sleep -Seconds $wait
+        $h1 = Tool history --tag $tag
+        $seen = Ask "Now press Win+N. Is 'Persistence check ($form)' listed in the notification centre?"
+        $forms[$form] = [ordered]@{
+            posted = (P $r 'posted'); setting = (P $r 'setting')
+            in_history_at_once = (P $h0 'has_tag'); in_history_after_banner = (P $h1 'has_tag')
+            owner_sees_it_in_win_n = $seen; waited_s = $wait; notify_settings = (Get-NotifySettings)
+        }
+    }
+    Set-Check 'S1.2p' 'RECORDED' ([ordered]@{ banner_seconds = $banner; forms = $forms; shortcut_used_from_now = $script:ShortcutForm })
+}
+
+# One click trial: posts the toast and waits for winshell-app to start. When no click arrives
+# within 60 s the owner is asked whether the toast was missed; a missed toast is posted again
+# (up to 3 posts) instead of failing the trial (Part B run 1: a missed toast couldn't be found).
+function Click-Trial([string]$Name, [string[]]$ToastArgs, [string]$Instruction, [scriptblock]$Prepare, [scriptblock]$Await) {
+    $posts = @()
+    for ($post = 1; $post -le 3; $post++) {
+        $ctx = & $Prepare
+        if ($ctx -is [System.Collections.IDictionary] -and $ctx.Contains('invalid')) { return $ctx }
+        $n = @(Get-Events).Count
+        $r = Post-Toast "$Name-$post" $ToastArgs
+        Say $Instruction
+        $result = & $Await $n $ctx 60
+        if ($null -ne $result) {
+            return [ordered]@{ result = $result; context = $ctx; posts = $post; missed_before = $posts }
+        }
+        $missed = Ask 'No click arrived within 60 s. Did you miss the toast (or not find it)? Answer y to get it again'
+        $posts += [ordered]@{ post = $post; toast = $r; owner_says_missed = $missed; shortcut = $script:ShortcutForm }
+        if (-not $missed) {
+            $late = & $Await $n $ctx 60
+            if ($null -ne $late) { return [ordered]@{ result = $late; context = $ctx; posts = $post; missed_before = $posts } }
+            break
+        }
+        Stop-SpikeProcesses
+    }
+    [ordered]@{ result = $null; context = $null; posts = $posts.Count; missed_before = $posts }
 }
 
 function Check-S13 {
     Step 'S1.3 protocol activation: the raw command line'
+    if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -ToastClsid }
     $expected = "`"$App`" `"$ConfirmUrl`""
     $trials = @()
     $targets = @('body', 'body', 'body', 'button', 'button', 'button')
     for ($i = 0; $i -lt $targets.Count; $i++) {
-        Stop-SpikeProcesses
         $where = $targets[$i]
-        $n = @(Get-Events).Count
-        [void](Post-Toast "s13-$($i + 1)" @('--tag', "s13-$($i + 1)", '--launch', $ConfirmUrl, '--button', $ConfirmUrl,
-                '--title', 'LILITH spike', '--body', "Click the $(if ($where -eq 'body') { 'BODY of this toast' } else { 'Open button' }) (S1.3, $($i + 1) of 6)"))
-        Say "Click the toast's $(if ($where -eq 'body') { 'BODY (not the button)' } else { 'Open BUTTON' }). If it has gone, open the notification centre (Win+N) and click it there."
-        $ev = Wait-SpikeEvent 'start' $n 120
-        $cmd = P $ev 'cmdline'
-        $trials += [ordered]@{ trial = $i + 1; clicked = $where; cmdline = $cmd; exact = ($cmd -ceq $expected) }
+        $what = $(if ($where -eq 'body') { 'BODY of this toast' } else { 'Open button' })
+        $t = Click-Trial "s13-$($i + 1)" @('--tag', "s13-$($i + 1)", '--launch', $ConfirmUrl, '--button', $ConfirmUrl,
+                '--title', 'LILITH spike', '--body', "Click the $what (S1.3, $($i + 1) of 6)") `
+            "Click the toast's $(if ($where -eq 'body') { 'BODY (not the button)' } else { 'Open BUTTON' }). If it has gone, open the notification centre (Win+N) and click it there." `
+            { Stop-SpikeProcesses; [ordered]@{} } `
+            { param($n, $ctx, $timeout) Wait-SpikeEvent 'start' $n $timeout }
+        $cmd = P $t.result 'cmdline'
+        $trials += [ordered]@{ trial = $i + 1; clicked = $where; cmdline = $cmd; exact = ($cmd -ceq $expected); posts = $t.posts; missed = $t.missed_before }
         Start-Sleep -Seconds 2
     }
     Stop-SpikeProcesses
@@ -401,93 +510,124 @@ function Check-S13 {
     foreach ($suffix in '', '/') {
         $url = "lilspike:open/$b64$suffix"
         if (Ask "Recorded check: the Run dialog with $url ? (it is copied to the clipboard)") {
-            Set-Clipboard -Value $url
-            $n = @(Get-Events).Count
-            Say 'Press Win+R, paste with Ctrl+V, press Enter.'
-            $ev = Wait-SpikeEvent 'start' $n 180
-            $recorded["run$(if ($suffix) { '_trailing_slash' } else { '' })"] = [ordered]@{ sent = $url; cmdline = $(if ($ev) { $ev.cmdline } else { $null }) }
-            Start-Sleep -Seconds 2
-            Stop-SpikeProcesses
+            # Run 1: both "Run dialog" arrivals carried the Edge page's link instead, so what
+            # arrives is now checked, and the owner gets up to 3 tries (Part B run 1 analysis).
+            $tries = @()
+            for ($try = 1; $try -le 3; $try++) {
+                Set-Clipboard -Value $url
+                $n = @(Get-Events).Count
+                Say 'Close the Edge tab with the test page if it is still open. Then press Win+R, paste with Ctrl+V, press Enter.'
+                $ev = Wait-SpikeEvent 'start' $n 180
+                $cmd = P $ev 'cmdline'
+                $fromRun = [bool]($cmd -and $cmd.Contains("open/$b64"))
+                $tries += [ordered]@{ try = $try; cmdline = $cmd; came_from_the_run_box = $fromRun }
+                Start-Sleep -Seconds 2
+                Stop-SpikeProcesses
+                if ($fromRun -or -not $cmd) { break }
+                Say 'That start did not carry the Run box link (it came from somewhere else, perhaps the Edge page). Once more, please.' 'Yellow'
+            }
+            $last = $tries[-1]
+            $recorded["run$(if ($suffix) { '_trailing_slash' } else { '' })"] = [ordered]@{ sent = $url; cmdline = $(if ($last.came_from_the_run_box) { $last.cmdline } else { $null }); tries = $tries }
         }
     }
     if ($null -ne $savedClipboard) { try { Set-Clipboard -Value $savedClipboard } catch { } }
     Set-Check 'S1.3' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
-        expected = $expected; trials = $trials; recorded = $recorded; base64url_target = $target
+        expected = $expected; shortcut = $script:ShortcutForm; trials = $trials; recorded = $recorded; base64url_target = $target
     })
 }
 
-# Each trial first checks its precondition: the blocker window must hold the front (its own
-# check, is_foreground) before the toast is posted. If it doesn't, the attempt is invalid and is
-# retried, up to 3 times; a trial with no valid attempt never passes (fix round 1, I4).
-function Trial-WithA([int]$I, [string]$Recipe) {
-    $attempts = @()
-    for ($try = 1; $try -le 3; $try++) {
-        Stop-SpikeProcesses
-        $n = @(Get-Events).Count
-        $a = Start-Process -FilePath $App -ArgumentList '--recipe', $Recipe, '--exit-after-secs', '300' -PassThru
-        [void](Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $a.Id })
-        $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
-        $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
-        if (-not (P $blk 'is_foreground')) {
-            Say "The blocker window did not take the front (attempt $try): this attempt is invalid and runs again." 'Red'
-            $attempts += [ordered]@{ attempt = $try; valid = $false; blocker_front = $blk }
-            continue
-        }
-        $m = @(Get-Events).Count
-        [void](Post-Toast "s14-a-$Recipe-$I-$try" @('--tag', "s14-a-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
-                '--body', "Click this toast's body (S1.4 with A, $I of 5)"))
-        Say "Click the toast's BODY (S1.4, A running behind the blocker window, $I of 5)."
-        $chk = Wait-SpikeEvent 'front_check' $m 120 { param($e) $e.pid -eq $a.Id -and $e.phase -eq 'activate' }
-        $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' } | Select-Object -Last 1
-        $ok = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
-        Stop-SpikeProcesses
-        return [ordered]@{ trial = $I; recipe = $Recipe; valid = $true; a_pid = $a.Id; blocker_pid = $b.Id; blocker_front = $blk; handoff = $hand; check = $chk; pass = $ok; invalid_attempts = $attempts }
+# The precondition of every S1.4 trial: the blocker window holds the front before the toast is
+# posted. Run 1 showed that a blocker started by the script often can't take the front once A
+# has it (SetForegroundWindow false: the script's terminal is no longer the foreground process).
+# Then the owner clicks the blocker's title bar once, which gives it the front as a person
+# would; the script checks the foreground window itself (Part B run 1 analysis).
+function Ensure-BlockerFront($Blocker, $Check) {
+    if (P $Check 'is_foreground') { return [ordered]@{ how = 'blocker took it'; ok = $true } }
+    Say "Click once on the title bar of the window 'winshell blocker' (not on 'winshell-app'), then wait." 'Yellow'
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        $fg = Tool foreground
+        if ((P $fg 'fg_pid') -eq $Blocker.Id) { return [ordered]@{ how = 'owner clicked it'; ok = $true; foreground = $fg } }
+        Start-Sleep -Milliseconds 300
     }
+    [ordered]@{ how = 'not in front after 60 s'; ok = $false }
+}
+
+function Trial-WithA([int]$I, [string]$Recipe) {
+    $t = Click-Trial "s14-a-$Recipe-$I" @('--tag', "s14-a-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
+            '--body', "Click this toast's body (S1.4 with A, $I of 5)") `
+        "Click the toast's BODY (S1.4, A running behind the blocker window, $I of 5)." `
+        {
+            Stop-SpikeProcesses
+            $n = @(Get-Events).Count
+            $a = Start-Process -FilePath $App -ArgumentList '--recipe', $Recipe, '--exit-after-secs', '300' -PassThru
+            [void](Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $a.Id })
+            $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
+            $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
+            $front = Ensure-BlockerFront $b $blk
+            if (-not $front.ok) { return [ordered]@{ invalid = $true; blocker_front = $blk; precondition = $front } }
+            [ordered]@{ a_pid = $a.Id; blocker_pid = $b.Id; blocker_front = $blk; precondition = $front }
+        } `
+        { param($n, $ctx, $timeout) Wait-SpikeEvent 'front_check' $n $timeout { param($e) $e.pid -eq $ctx.a_pid -and $e.phase -eq 'activate' } }
     Stop-SpikeProcesses
-    [ordered]@{ trial = $I; recipe = $Recipe; valid = $false; pass = $false; invalid_attempts = $attempts }
+    if ($t.Contains('invalid')) { return [ordered]@{ trial = $I; recipe = $Recipe; valid = $false; pass = $false; detail = $t } }
+    $chk = $t.result
+    $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' } | Select-Object -Last 1
+    $clicked = $null -ne $chk
+    [ordered]@{
+        trial = $I; recipe = $Recipe; valid = $clicked; clicked = $clicked
+        pass = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        a_pid = (P $t.context 'a_pid'); precondition = (P $t.context 'precondition'); handoff = $hand; check = $chk
+        posts = $t.posts; missed = $t.missed_before
+    }
 }
 
 function Trial-NoA([int]$I) {
-    $attempts = @()
-    for ($try = 1; $try -le 3; $try++) {
-        Stop-SpikeProcesses
-        $n = @(Get-Events).Count
-        $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
-        $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
-        if (-not (P $blk 'is_foreground')) {
-            Say "The blocker window did not take the front (attempt $try): this attempt is invalid and runs again." 'Red'
-            $attempts += [ordered]@{ attempt = $try; valid = $false; blocker_front = $blk }
-            continue
-        }
-        $m = @(Get-Events).Count
-        [void](Post-Toast "s14-noa-$I-$try" @('--tag', "s14-noa-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
-                '--body', "Click this toast's body (S1.4 no A, $I of 5)"))
-        Say "Click the toast's BODY (S1.4, no A running, $I of 5)."
-        $chk = Wait-SpikeEvent 'front_check' $m 120 { param($e) $e.pid -ne $b.Id -and $e.phase -eq 'start' }
-        $ok = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
-        Stop-SpikeProcesses
-        return [ordered]@{ trial = $I; valid = $true; blocker_pid = $b.Id; blocker_front = $blk; check = $chk; pass = $ok; invalid_attempts = $attempts }
-    }
+    $t = Click-Trial "s14-noa-$I" @('--tag', "s14-noa-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
+            '--body', "Click this toast's body (S1.4 no A, $I of 5)") `
+        "Click the toast's BODY (S1.4, no A running, $I of 5)." `
+        {
+            Stop-SpikeProcesses
+            $n = @(Get-Events).Count
+            $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--exit-after-secs', '300' -PassThru
+            $blk = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
+            $front = Ensure-BlockerFront $b $blk
+            if (-not $front.ok) { return [ordered]@{ invalid = $true; blocker_front = $blk; precondition = $front } }
+            [ordered]@{ blocker_pid = $b.Id; blocker_front = $blk; precondition = $front }
+        } `
+        { param($n, $ctx, $timeout) Wait-SpikeEvent 'front_check' $n $timeout { param($e) $e.pid -ne $ctx.blocker_pid -and $e.phase -eq 'start' } }
     Stop-SpikeProcesses
-    [ordered]@{ trial = $I; valid = $false; pass = $false; invalid_attempts = $attempts }
+    if ($t.Contains('invalid')) { return [ordered]@{ trial = $I; valid = $false; pass = $false; detail = $t } }
+    $chk = $t.result
+    $clicked = $null -ne $chk
+    [ordered]@{
+        trial = $I; valid = $clicked; clicked = $clicked
+        pass = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        precondition = (P $t.context 'precondition'); check = $chk; posts = $t.posts; missed = $t.missed_before
+    }
 }
 
 function Check-S14 {
     Step 'S1.4 foreground: a toast click hands off to the running instance'
-    Say 'Each trial opens two small windows (A, then a "winshell blocker" in front). Leave them; click only the toast.'
+    if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -ToastClsid }
+    Say 'Each trial opens two small windows (A, then a "winshell blocker" in front). Leave them; click only the toast, or the blocker when asked.'
     $withA = @(); for ($i = 1; $i -le 5; $i++) { $withA += Trial-WithA $i 'basic' }
     $withAPass = @($withA | Where-Object { $_.pass }).Count -eq 5
+    # The fallback recipe is the FAIL path of a recipe that failed a valid trial, not of a trial
+    # whose precondition or click never happened.
+    $validFailed = @($withA | Where-Object { $_.valid -and -not $_.pass }).Count
     $fallback = @()
-    if (-not $withAPass) {
-        Say 'The basic recipe failed at least once: the FAIL path runs the same 5 trials with the fallback recipe.' 'Red'
+    if ($validFailed -gt 0) {
+        Say 'The basic recipe failed a valid trial: the FAIL path runs the same 5 trials with the fallback recipe.' 'Red'
         for ($i = 1; $i -le 5; $i++) { $fallback += Trial-WithA $i 'fallback' }
     }
     $fallbackPass = $fallback.Count -gt 0 -and @($fallback | Where-Object { $_.pass }).Count -eq 5
     $noA = @(); for ($i = 1; $i -le 5; $i++) { $noA += Trial-NoA $i }
     $noAPass = @($noA | Where-Object { $_.pass }).Count -eq 5
-    $invalid = @($withA + $fallback + $noA | Where-Object { -not $_.valid }).Count
+    $invalid = @(@($withA) + @($fallback) + @($noA) | Where-Object { -not $_.valid }).Count
     $verdict = if ($withAPass -and $noAPass) { 'PASS' } elseif ($fallbackPass -and $noAPass) { 'PASS (fallback recipe)' } else { 'FAIL' }
-    Set-Check 'S1.4' $verdict ([ordered]@{ invalid_trials = $invalid; with_a = $withA; with_a_fallback = $fallback; no_a = $noA })
+    if ($verdict -eq 'FAIL' -and $invalid -gt 0) { $verdict = 'INCOMPLETE (invalid trials: rerun S1.4)' }
+    Set-Check 'S1.4' $verdict ([ordered]@{ invalid_trials = $invalid; shortcut = $script:ShortcutForm; with_a = $withA; with_a_fallback = $fallback; no_a = $noA })
 }
 
 function Check-S15 {
@@ -726,12 +866,32 @@ function Check-S18 {
 
 # ---------------------------------------------------------------- main
 
+# Runs one check. An error inside it is recorded as that check's ERROR verdict, with the
+# message and line, and the run goes on to the next check; only the S1.1 and S1.2 stop rule
+# (an error starting "STOP:") ends the run (Part B run 1 analysis).
+function Invoke-Check([string]$Id, [scriptblock]$Body) {
+    if (-not (Want $Id)) { return }
+    try { & $Body }
+    catch {
+        if ($_.Exception.Message -like 'STOP:*') { throw }
+        $err = [ordered]@{
+            message = $_.Exception.Message
+            line = $_.InvocationInfo.ScriptLineNumber
+            statement = "$($_.InvocationInfo.Line)".Trim()
+            stack = "$($_.ScriptStackTrace)"
+        }
+        Say "$Id stopped with an error: $($err.message) (line $($err.line)). Going on to the next check." 'Red'
+        Set-Check $Id 'ERROR' $err
+        try { Stop-SpikeProcesses } catch { }
+    }
+}
+
+if ($LibraryOnly) { return }
+
 $identity = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this from a normal (not elevated) terminal: an elevated sender''s toasts do not show.'
 }
-New-Item -ItemType Directory -Force -Path $Raw | Out-Null
-
 if ($CleanupOnly) {
     $Lnk = Join-Path (Get-ProgramsDir) 'LILITH Spike.lnk'
     $c = Invoke-Cleanup
@@ -740,11 +900,25 @@ if ($CleanupOnly) {
     return
 }
 
+# A rerun never overwrites an earlier run's results: they move to results\run-<UTC time>\.
+if (Test-Path (Join-Path $Results 'checks.json')) {
+    $old = Get-Content -Raw (Join-Path $Results 'checks.json') | ConvertFrom-Json
+    $stamp = ([datetime](P $old 'started')).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $keep = Join-Path $Results "run-$stamp"
+    New-Item -ItemType Directory -Force -Path $keep | Out-Null
+    Move-Item (Join-Path $Results 'checks.json') $keep -Force
+    if (Test-Path $Raw) { Move-Item $Raw (Join-Path $keep 'raw') -Force }
+    Say "The earlier run's results were moved to $keep"
+}
+New-Item -ItemType Directory -Force -Path $Raw | Out-Null
+# The console, with every question and answer, kept beside the results (git ignores it).
+Start-Transcript -Path (Join-Path $Raw 'console.log') -IncludeInvocationHeader | Out-Null
+
 if (-not $SkipBuild -and -not (Want 'S1.1')) {
     Push-Location $Spike
     try { & cargo build --release --locked; if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' } } finally { Pop-Location }
 }
-if ((Want 'S1.1') -and -not $SkipBuild) { Check-S11 }
+if (-not $SkipBuild) { Invoke-Check 'S1.1' { Check-S11 } }
 
 $Report.setup = [ordered]@{
     os_build   = [Environment]::OSVersion.Version.ToString()
@@ -766,13 +940,14 @@ try {
     $Report.setup.setting = (Tool setting).setting
     Save-Report
 
-    if (Want 'S1.2') { Check-S12 }
-    if (Want 'S1.3') { Check-S13 }
-    if (Want 'S1.4') { Check-S14 }
-    if (Want 'S1.5') { Check-S15 }
-    if (Want 'S1.6') { Check-S16 }
-    if (Want 'S1.7') { Check-S17 }
-    if (Want 'S1.8') { Check-S18 }
+    Invoke-Check 'S1.2' { Check-S12 }
+    Invoke-Check 'S1.2p' { Check-S12p }
+    Invoke-Check 'S1.3' { Check-S13 }
+    Invoke-Check 'S1.4' { Check-S14 }
+    Invoke-Check 'S1.5' { Check-S15 }
+    Invoke-Check 'S1.6' { Check-S16 }
+    Invoke-Check 'S1.7' { Check-S17 }
+    Invoke-Check 'S1.8' { Check-S18 }
 }
 finally {
     Step 'Cleanup'
@@ -781,4 +956,5 @@ finally {
     Save-Report
     Say ("Cleanup -> {0}" -f $(if ($Report.cleanup.pass) { 'PASS' } else { 'FAIL' })) $(if ($Report.cleanup.pass) { 'Green' } else { 'Red' })
     Say "Results: $(Join-Path $Results 'checks.json')"
+    try { Stop-Transcript | Out-Null } catch { }
 }

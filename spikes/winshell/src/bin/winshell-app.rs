@@ -64,6 +64,14 @@ fn main() {
     let rest = rest.to_string();
     log_event("start", json!({ "cmdline": cmdline, "rest": rest }));
 
+    // The toast-persistence check registers winshell-app.exe as the toast activator's
+    // LocalServer32. The spike's toasts all use protocol activation, so a COM start
+    // (`-Embedding`) is only logged.
+    if rest.eq_ignore_ascii_case("-Embedding") || rest.starts_with("-ToastActivated") {
+        log_event("com_activation", json!({ "rest": rest }));
+        return;
+    }
+
     // A URL argument (anything not starting with `--`) is a hand-off candidate.
     let url = if rest.is_empty() || rest.starts_with("--") {
         None

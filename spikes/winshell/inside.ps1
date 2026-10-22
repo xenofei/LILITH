@@ -68,9 +68,14 @@ function Tool {
     ($o | Out-String) | ConvertFrom-Json
 }
 
+# A line caught while winshell-app is still writing it is skipped and read whole next time.
 function Get-Events {
     if (-not (Test-Path $Events)) { return @() }
-    @(Get-Content $Events | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+    $out = New-Object System.Collections.ArrayList
+    foreach ($l in @(Get-Content $Events -ErrorAction SilentlyContinue | Where-Object { $_ })) {
+        try { [void]$out.Add(($l | ConvertFrom-Json)) } catch { break }
+    }
+    $out.ToArray()   # callers wrap it in @()
 }
 
 function Wait-SpikeEvent([string]$Kind, [int]$After, [int]$TimeoutSec, [scriptblock]$Filter) {

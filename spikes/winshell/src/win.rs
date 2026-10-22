@@ -17,8 +17,12 @@ use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_ELEVATION,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel,
 };
-use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::Storage::EnhancedStorage::{
+    PKEY_AppUserModel_ID, PKEY_AppUserModel_ToastActivatorCLSID,
+};
+use windows::Win32::System::Com::StructuredStorage::{
+    InitPropVariantFromCLSID, PROPVARIANT, PropVariantToGUID,
+};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemFree, IPersistFile, STGM_READ,
@@ -39,7 +43,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, SW_SHOWNORMAL,
 };
-use windows::core::{BSTR, HSTRING, Interface, PCWSTR, PWSTR, Result, w};
+use windows::core::{BSTR, GUID, HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
 use crate::AUMID;
 
@@ -172,7 +176,14 @@ fn init_sta() {
 }
 
 /// Writes a shortcut at `lnk` to `target` whose `System.AppUserModel.ID` is `aumid`.
-pub fn write_shortcut(lnk: &Path, target: &Path, aumid: &str) -> Result<()> {
+/// With `toast_clsid`, the shortcut also carries `System.AppUserModel.ToastActivatorCLSID`
+/// (Part B run 1 analysis: whether a missed toast stays in the notification centre).
+pub fn write_shortcut(
+    lnk: &Path,
+    target: &Path,
+    aumid: &str,
+    toast_clsid: Option<GUID>,
+) -> Result<()> {
     init_sta();
     // SAFETY: COM calls on interfaces we own; the PROPVARIANT owns its CoTaskMem string and
     // frees it on drop (PropVariantClear).
@@ -188,6 +199,10 @@ pub fn write_shortcut(lnk: &Path, target: &Path, aumid: &str) -> Result<()> {
         (*value.Anonymous.Anonymous).vt = VT_LPWSTR;
         (*value.Anonymous.Anonymous).Anonymous.pwszVal = text;
         store.SetValue(&PKEY_AppUserModel_ID, &value)?;
+        if let Some(clsid) = toast_clsid {
+            let v = InitPropVariantFromCLSID(&clsid)?;
+            store.SetValue(&PKEY_AppUserModel_ToastActivatorCLSID, &v)?;
+        }
         store.Commit()?;
         let file: IPersistFile = link.cast()?;
         file.Save(&HSTRING::from(lnk.as_os_str()), true)?;
@@ -195,8 +210,8 @@ pub fn write_shortcut(lnk: &Path, target: &Path, aumid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reads a shortcut back: `(target, AUMID)`.
-pub fn read_shortcut(lnk: &Path) -> Result<(String, String)> {
+/// Reads a shortcut back: `(target, AUMID, ToastActivatorCLSID if set)`.
+pub fn read_shortcut(lnk: &Path) -> Result<(String, String, Option<String>)> {
     init_sta();
     // SAFETY: COM calls on interfaces we own; buffers are sized as the calls require.
     unsafe {
@@ -212,7 +227,12 @@ pub fn read_shortcut(lnk: &Path) -> Result<(String, String)> {
         let aumid = BSTR::try_from(&value)
             .map(|b| b.to_string())
             .unwrap_or_default();
-        Ok((target, aumid))
+        let clsid = store
+            .GetValue(&PKEY_AppUserModel_ToastActivatorCLSID)
+            .ok()
+            .and_then(|v| PropVariantToGUID(&v).ok())
+            .map(|g| format!("{{{g:?}}}"));
+        Ok((target, aumid, clsid))
     }
 }
 
