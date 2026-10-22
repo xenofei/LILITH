@@ -25,6 +25,7 @@ $AumidParent = "$nowhere\AppUserModelId"
 $NotifySettingsKey = "$nowhere\notify"
 $AssocToastsKey = "$nowhere\assoc"
 $ClsidKey = "$nowhere\clsid"
+$ClsidParent = "$nowhere\CLSID"
 $ToolExe = Join-Path $tmp 'winshell-tool-not-built.exe'   # so 'clear history' is skipped
 
 # Fakes. Get-SpikeCores emits its objects one by one, as the real one does once unrolled:

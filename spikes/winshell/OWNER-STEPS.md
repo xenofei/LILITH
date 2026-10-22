@@ -77,7 +77,7 @@ Run 1 showed that a toast you missed could not be found in Win+N afterwards. Thi
 6. **If you missed a toast and can't find it**, just wait. After 60 seconds the script asks "Did you miss the toast?":
    1. Answer `y`.
    2. The same toast is sent again (up to 3 times); click it this time.
-   3. A missed toast is recorded but doesn't count as a failure.
+   3. A missed toast that you then click counts as a normal trial. If a trial never gets a click at all, check 3 ends as **INCOMPLETE** rather than FAIL; tell the agent, who will give you a command to repeat just that check.
 7. Optional extra 1, Edge: if you answer `y`, Edge opens a small local page.
    1. Click the link "Open the spike ref".
    2. Edge asks whether to open the app: click **Open**. Leave the "Always allow" box **unticked**.
@@ -91,7 +91,7 @@ Run 1 showed that a toast you missed could not be found in Win+N afterwards. Thi
 **Check 4: which window comes to the front (about 12 minutes).**
 
 1. In each trial two small windows open: "winshell-app" and then "winshell blocker" on top of it.
-2. **If the script says "Click once on the title bar of the window 'winshell blocker'"**, do that: click the blocker's title bar, not "winshell-app". In run 1 the blocker often couldn't come to the front by itself, and the trial needs it in front.
+2. **If the script says "Click once on the title bar of the window 'winshell blocker'"**, do that within 60 seconds: click the blocker's title bar, not "winshell-app". If the blocker is hidden behind other windows, click its button on the **taskbar** instead. In run 1 the blocker often couldn't come to the front by itself, and the trial needs it in front.
 3. A toast comes: click the **toast itself**. A missed toast works as in check 3: wait, answer `y`, and it comes again.
 4. There are ten trials: five with both windows, five with only the blocker.
 5. If a trial with both windows fails, the script runs five more with a different method. Same steps.
@@ -169,6 +169,7 @@ All of it is removed by the cleanup at the end, and the cleanup checks each item
 
 ### If something looks wrong in Part B
 
+- **A check ends as INCOMPLETE** (for example `S1.4 -> INCOMPLETE`): some trials couldn't be done (a click that never came, or a blocker window that never got to the front), and they could still change the result. Nothing is wrong with the PC. Tell the agent, who will give you a command to repeat just that check (for example `-Only S1.4`).
 - **A check stops with an error** (a red line such as "S1.4 stopped with an error ... Going on to the next check"): nothing to do. The script records the error for that check and carries on with the next one.
 - **A toast didn't appear or a window didn't come up:** just answer `n` (or wait: the script gives each click up to 2 minutes). Don't try to fix it. A failure is a result too.
 - **You want to stop:** press **Ctrl+C**. The cleanup still runs and prints `Cleanup -> PASS` or `FAIL`.
@@ -200,7 +201,8 @@ Run 1 (2026-10-22) passed checks 1 and 2 and stopped during check 4. The rerun s
    pwsh -NoProfile -File spikes/winshell/run-spike.ps1 -Only S1.2p,S1.3,S1.4,S1.5,S1.6,S1.7,S1.8
    ```
 
-3. Then follow check 2b and checks 3 to 8 and the cleanup as above. It takes about 50 minutes, plus your sleep timeout.
+3. The list after `-Only` is typed exactly as shown, with commas and no spaces. A misspelt name makes the script stop at once with "Unknown check name", before it does anything.
+4. Then follow check 2b and checks 3 to 8 and the cleanup as above. It takes about 50 minutes, plus your sleep timeout.
 
 ## Part C: the runs inside Windows Sandbox
 

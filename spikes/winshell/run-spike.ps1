@@ -24,6 +24,9 @@ Runs only these checks, for example the rerun after run 1:
 Setup and cleanup always run. An earlier checks.json and raw\ are moved into
 results\run-<UTC time>\ first, never overwritten.
 
+.PARAMETER DryRun
+Prints the parsed -Only list as JSON and stops, doing nothing else (tests/only_parse.rs).
+
 .PARAMETER LibraryOnly
 Defines the functions and returns, doing nothing else (the strict-mode cleanup test
 tests/cleanup-strict.ps1 dot-sources the script this way).
@@ -36,11 +39,27 @@ param(
     [string[]]$Only = @(),
     [switch]$SkipBuild,
     [switch]$CleanupOnly,
-    [switch]$LibraryOnly
+    [switch]$LibraryOnly,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# -Only: `pwsh -File` hands "S1.2p,S1.3,..." over as one string (a comma is an array only in
+# PowerShell's own parser), so the names are split on commas and trimmed here, and an unknown
+# name stops the script before anything at all runs (rerun review C1).
+$KnownChecks = @('S1.1', 'S1.2', 'S1.2p', 'S1.3', 'S1.4', 'S1.5', 'S1.6', 'S1.7', 'S1.8')
+$Only = @($Only | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+    ForEach-Object { $n = $_; $k = @($KnownChecks | Where-Object { $_ -eq $n }); if ($k.Count -gt 0) { $k[0] } else { $n } })
+$unknownChecks = @($Only | Where-Object { $_ -notin $KnownChecks })
+if ($unknownChecks.Count -gt 0) {
+    throw "Unknown check name in -Only: $($unknownChecks -join ', '). The names are: $($KnownChecks -join ', '). Nothing was done."
+}
+if ($DryRun) {
+    [ordered]@{ only = $Only; runs = @($KnownChecks | Where-Object { $Only.Count -eq 0 -or $_ -in $Only }) } | ConvertTo-Json -Compress
+    return
+}
 
 $Spike = $PSScriptRoot
 $Bin = Join-Path $Spike 'target\release'
@@ -63,6 +82,7 @@ $AssocToastsKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ApplicationAs
 $PowerReason = 'LILITH spike 11 keep-awake check'
 $ToastClsid = '{6F1A0C52-3B7E-4E0D-9A11-5C2B8D7E4F31}'
 $ClsidKey = "HKCU:\Software\Classes\CLSID\$ToastClsid"
+$ClsidParent = 'HKCU:\Software\Classes\CLSID'
 
 $Report = [ordered]@{
     spike   = 11
@@ -92,6 +112,13 @@ function Want([string]$Id) { $Only.Count -eq 0 -or $Only -contains $Id }
 function Save-Report {
     New-Item -ItemType Directory -Force -Path $Results | Out-Null
     $Report | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8 (Join-Path $Results 'checks.json')
+}
+
+# A check's results so far, saved while it runs: an error later in the check keeps them
+# (rerun review M5).
+function Save-Partial([string]$Id, $Details) {
+    $Report.checks[$Id] = [ordered]@{ verdict = 'IN PROGRESS'; details = $Details }
+    Save-Report
 }
 
 function Set-Check([string]$Id, [string]$Verdict, $Details) {
@@ -212,6 +239,9 @@ $script:ShortcutForm = 'plain'
 function Write-Shortcut([switch]$ToastClsid) {
     $extra = @()
     if ($ToastClsid) {
+        # Whether ...\Classes\CLSID existed before: the cleanup removes it only if the script
+        # created it and it is empty (rerun review M8).
+        if ($null -eq $script:ClsidParentExisted) { $script:ClsidParentExisted = [bool](Test-Path $ClsidParent) }
         New-Item -Path "$ClsidKey\LocalServer32" -Value "`"$App`"" -Force | Out-Null
         $extra = @('--toast-clsid')
     } elseif (Test-Path $ClsidKey) {
@@ -239,6 +269,7 @@ function Register-Scheme {
 # Whether HKCU\Software\Classes\AppUserModelId existed before S1.2 created its child; $null
 # while unknown (then it is never removed) (fix round 1, M8).
 $script:AumidParentExisted = $null
+$script:ClsidParentExisted = $null
 $AumidParent = 'HKCU:\Software\Classes\AppUserModelId'
 
 # The credential counts as gone only when OpenAsync says NotFound, or Hello isn't supported
@@ -293,6 +324,12 @@ function Invoke-Cleanup([switch]$Final) {
             if ($script:AumidParentExisted -eq $false -and (Test-Path $AumidParent)) {
                 $k = Get-Item $AumidParent
                 if ($k.SubKeyCount -eq 0 -and $k.ValueCount -eq 0) { Remove-Item -Path $AumidParent -Force -ErrorAction Stop }
+            }
+        }
+        'toast activator parent' = {
+            if ($script:ClsidParentExisted -eq $false -and (Test-Path $ClsidParent)) {
+                $k = Get-Item $ClsidParent
+                if ($k.SubKeyCount -eq 0 -and $k.ValueCount -eq 0) { Remove-Item -Path $ClsidParent -Force -ErrorAction Stop }
             }
         }
         'notification settings' = { if (Test-Path $NotifySettingsKey) { Remove-Item -Path $NotifySettingsKey -Recurse -Force -ErrorAction Stop } }
@@ -435,7 +472,15 @@ function Check-S12p {
             owner_sees_it_in_win_n = $seen; waited_s = $wait; notify_settings = (Get-NotifySettings)
         }
     }
-    Set-Check 'S1.2p' 'RECORDED' ([ordered]@{ banner_seconds = $banner; forms = $forms; shortcut_used_from_now = $script:ShortcutForm })
+    # Its two toasts would otherwise wait in the notification centre while S1.3 asks for clicks
+    # there (rerun review M2).
+    $cleared = $true
+    try { [void](Tool history-clear) } catch { $cleared = $false }
+    Set-Check 'S1.2p' 'RECORDED' ([ordered]@{
+        banner_seconds = $banner; forms = $forms; shortcut_used_from_now = $script:ShortcutForm
+        history_cleared_after = $cleared
+        caveat = 'Both forms share one AUMID and one .lnk path, rewritten in place; "only the CLSID form persists" is informative, "neither persists" may be the shell keeping the earlier registration.'
+    })
 }
 
 # One click trial: posts the toast and waits for winshell-app to start. When no click arrives
@@ -465,6 +510,18 @@ function Click-Trial([string]$Name, [string[]]$ToastArgs, [string]$Instruction, 
     [ordered]@{ result = $null; context = $null; posts = $posts.Count; missed_before = $posts }
 }
 
+# S1.3's verdict: FAIL when a click that arrived was not exact; INCOMPLETE when every click
+# that arrived was exact but some trial never got one (rerun review M4); else PASS.
+function Get-S13Verdict($Trials) {
+    $all = @($Trials)
+    $clicked = @($all | Where-Object { $_.got_click })
+    $inexact = @($clicked | Where-Object { -not $_.exact }).Count
+    $never = $all.Count - $clicked.Count
+    if ($inexact -gt 0) { return 'FAIL' }
+    if ($never -gt 0) { return "INCOMPLETE ($never trial(s) never got a click: rerun S1.3)" }
+    'PASS'
+}
+
 function Check-S13 {
     Step 'S1.3 protocol activation: the raw command line'
     if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -ToastClsid }
@@ -478,13 +535,14 @@ function Check-S13 {
                 '--title', 'LILITH spike', '--body', "Click the $what (S1.3, $($i + 1) of 6)") `
             "Click the toast's $(if ($where -eq 'body') { 'BODY (not the button)' } else { 'Open BUTTON' }). If it has gone, open the notification centre (Win+N) and click it there." `
             { Stop-SpikeProcesses; [ordered]@{} } `
-            { param($n, $ctx, $timeout) Wait-SpikeEvent 'start' $n $timeout }
+            { param($n, $ctx, $timeout) Wait-SpikeEvent 'start' $n $timeout { param($e) -not "$($e.cmdline)".Contains('lilspike:task/') } }
         $cmd = P $t.result 'cmdline'
-        $trials += [ordered]@{ trial = $i + 1; clicked = $where; cmdline = $cmd; exact = ($cmd -ceq $expected); posts = $t.posts; missed = $t.missed_before }
+        $trials += [ordered]@{ trial = $i + 1; clicked = $where; got_click = ($null -ne $cmd); cmdline = $cmd; exact = ($cmd -ceq $expected); posts = $t.posts; missed = $t.missed_before }
+        Save-Partial 'S1.3' ([ordered]@{ expected = $expected; trials = $trials })
         Start-Sleep -Seconds 2
     }
     Stop-SpikeProcesses
-    $pass = @($trials | Where-Object { $_.exact }).Count -eq 6
+    $verdict = Get-S13Verdict $trials
 
     # Recorded: Edge opening a raw ref from a local HTML file.
     $hex = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
@@ -531,7 +589,7 @@ function Check-S13 {
         }
     }
     if ($null -ne $savedClipboard) { try { Set-Clipboard -Value $savedClipboard } catch { } }
-    Set-Check 'S1.3' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
+    Set-Check 'S1.3' $verdict ([ordered]@{
         expected = $expected; shortcut = $script:ShortcutForm; trials = $trials; recorded = $recorded; base64url_target = $target
     })
 }
@@ -546,13 +604,18 @@ function Ensure-BlockerFront($Blocker, $Check) {
     Say "Click once on the title bar of the window 'winshell blocker' (not on 'winshell-app'), then wait." 'Yellow'
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
-        $fg = Tool foreground
+        # One failed poll is just retried: it must not end S1.4 (rerun review M5).
+        $fg = $null
+        try { $fg = Tool foreground } catch { }
         if ((P $fg 'fg_pid') -eq $Blocker.Id) { return [ordered]@{ how = 'owner clicked it'; ok = $true; foreground = $fg } }
         Start-Sleep -Milliseconds 300
     }
     [ordered]@{ how = 'not in front after 60 s'; ok = $false }
 }
 
+# A click counts as soon as the second launch (B) starts, whatever happens next: the trial is
+# then valid, and passes only on A's own check after the hand-off. A B that starts while A
+# never logs an activation is a FAIL of the recipe, so the FAIL path can run (rerun review I2).
 function Trial-WithA([int]$I, [string]$Recipe) {
     $t = Click-Trial "s14-a-$Recipe-$I" @('--tag', "s14-a-$I", '--launch', $ConfirmUrl, '--title', 'LILITH spike',
             '--body', "Click this toast's body (S1.4 with A, $I of 5)") `
@@ -568,15 +631,24 @@ function Trial-WithA([int]$I, [string]$Recipe) {
             if (-not $front.ok) { return [ordered]@{ invalid = $true; blocker_front = $blk; precondition = $front } }
             [ordered]@{ a_pid = $a.Id; blocker_pid = $b.Id; blocker_front = $blk; precondition = $front }
         } `
-        { param($n, $ctx, $timeout) Wait-SpikeEvent 'front_check' $n $timeout { param($e) $e.pid -eq $ctx.a_pid -and $e.phase -eq 'activate' } }
+        {
+            param($n, $ctx, $timeout)
+            $bs = Wait-SpikeEvent 'start' $n $timeout { param($e) $e.pid -ne $ctx.a_pid -and $e.pid -ne $ctx.blocker_pid }
+            if ($null -eq $bs) { return $null }
+            $chk = Wait-SpikeEvent 'front_check' $n 10 { param($e) $e.pid -eq $ctx.a_pid -and $e.phase -eq 'activate' }
+            [ordered]@{ b_start = $bs; check = $chk }
+        }
     Stop-SpikeProcesses
     if ($t.Contains('invalid')) { return [ordered]@{ trial = $I; recipe = $Recipe; valid = $false; pass = $false; detail = $t } }
-    $chk = $t.result
-    $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' } | Select-Object -Last 1
-    $clicked = $null -ne $chk
+    $bs = P $t.result 'b_start'
+    $chk = P $t.result 'check'
+    $bPid = P $bs 'pid'
+    $hand = @(Get-Events) | Where-Object { $_.kind -eq 'handoff' -and $_.pid -eq $bPid } | Select-Object -Last 1
+    $clicked = $null -ne $bs
     [ordered]@{
         trial = $I; recipe = $Recipe; valid = $clicked; clicked = $clicked
-        pass = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        pass = [bool]($clicked -and (P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        b_started = $clicked; b_cmdline = (P $bs 'cmdline'); a_activated = ($null -ne $chk)
         a_pid = (P $t.context 'a_pid'); precondition = (P $t.context 'precondition'); handoff = $hand; check = $chk
         posts = $t.posts; missed = $t.missed_before
     }
@@ -595,38 +667,59 @@ function Trial-NoA([int]$I) {
             if (-not $front.ok) { return [ordered]@{ invalid = $true; blocker_front = $blk; precondition = $front } }
             [ordered]@{ blocker_pid = $b.Id; blocker_front = $blk; precondition = $front }
         } `
-        { param($n, $ctx, $timeout) Wait-SpikeEvent 'front_check' $n $timeout { param($e) $e.pid -ne $ctx.blocker_pid -and $e.phase -eq 'start' } }
+        {
+            param($n, $ctx, $timeout)
+            $bs = Wait-SpikeEvent 'start' $n $timeout { param($e) $e.pid -ne $ctx.blocker_pid }
+            if ($null -eq $bs) { return $null }
+            $chk = Wait-SpikeEvent 'front_check' $n 10 { param($e) $e.pid -eq $bs.pid -and $e.phase -eq 'start' }
+            [ordered]@{ b_start = $bs; check = $chk }
+        }
     Stop-SpikeProcesses
     if ($t.Contains('invalid')) { return [ordered]@{ trial = $I; valid = $false; pass = $false; detail = $t } }
-    $chk = $t.result
-    $clicked = $null -ne $chk
+    $bs = P $t.result 'b_start'
+    $chk = P $t.result 'check'
+    $clicked = $null -ne $bs
     [ordered]@{
         trial = $I; valid = $clicked; clicked = $clicked
-        pass = [bool]((P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        pass = [bool]($clicked -and (P $chk 'is_foreground') -and (P $chk 'has_focus'))
+        b_started = $clicked; b_cmdline = (P $bs 'cmdline')
         precondition = (P $t.context 'precondition'); check = $chk; posts = $t.posts; missed = $t.missed_before
     }
+}
+
+# S1.4's verdict from its trials (rerun review M1). FAIL is decided by a valid failure: of a
+# no-A trial, or of the with-A trials once the fallback recipe also failed a valid trial.
+# PASS needs 5 passes without A and 5 passes with A (basic, or else fallback). Anything else
+# is INCOMPLETE: invalid trials that could still change the verdict.
+function Get-S14Verdict($WithA, $Fallback, $NoA) {
+    $basic = @($WithA); $fb = @($Fallback); $none = @($NoA)
+    $validFail = { param($set) @(@($set) | Where-Object { $_.valid -and -not $_.pass }).Count -gt 0 }
+    $allPass = { param($set) @(@($set) | Where-Object { $_.pass }).Count -eq 5 }
+    $withAFailed = (& $validFail $basic) -and ($fb.Count -eq 0 -or (& $validFail $fb))
+    if ((& $validFail $none) -or $withAFailed) { return 'FAIL' }
+    $noAPass = & $allPass $none
+    if ($noAPass -and (& $allPass $basic)) { return 'PASS' }
+    if ($noAPass -and (& $allPass $fb)) { return 'PASS (fallback recipe)' }
+    'INCOMPLETE (invalid trials: rerun S1.4)'
 }
 
 function Check-S14 {
     Step 'S1.4 foreground: a toast click hands off to the running instance'
     if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -ToastClsid }
     Say 'Each trial opens two small windows (A, then a "winshell blocker" in front). Leave them; click only the toast, or the blocker when asked.'
-    $withA = @(); for ($i = 1; $i -le 5; $i++) { $withA += Trial-WithA $i 'basic' }
-    $withAPass = @($withA | Where-Object { $_.pass }).Count -eq 5
+    $withA = @(); $fallback = @(); $noA = @()
+    $partial = { Save-Partial 'S1.4' ([ordered]@{ shortcut = $script:ShortcutForm; with_a = $withA; with_a_fallback = $fallback; no_a = $noA }) }
+    for ($i = 1; $i -le 5; $i++) { $withA += Trial-WithA $i 'basic'; & $partial }
     # The fallback recipe is the FAIL path of a recipe that failed a valid trial, not of a trial
     # whose precondition or click never happened.
     $validFailed = @($withA | Where-Object { $_.valid -and -not $_.pass }).Count
-    $fallback = @()
     if ($validFailed -gt 0) {
         Say 'The basic recipe failed a valid trial: the FAIL path runs the same 5 trials with the fallback recipe.' 'Red'
-        for ($i = 1; $i -le 5; $i++) { $fallback += Trial-WithA $i 'fallback' }
+        for ($i = 1; $i -le 5; $i++) { $fallback += Trial-WithA $i 'fallback'; & $partial }
     }
-    $fallbackPass = $fallback.Count -gt 0 -and @($fallback | Where-Object { $_.pass }).Count -eq 5
-    $noA = @(); for ($i = 1; $i -le 5; $i++) { $noA += Trial-NoA $i }
-    $noAPass = @($noA | Where-Object { $_.pass }).Count -eq 5
+    for ($i = 1; $i -le 5; $i++) { $noA += Trial-NoA $i; & $partial }
     $invalid = @(@($withA) + @($fallback) + @($noA) | Where-Object { -not $_.valid }).Count
-    $verdict = if ($withAPass -and $noAPass) { 'PASS' } elseif ($fallbackPass -and $noAPass) { 'PASS (fallback recipe)' } else { 'FAIL' }
-    if ($verdict -eq 'FAIL' -and $invalid -gt 0) { $verdict = 'INCOMPLETE (invalid trials: rerun S1.4)' }
+    $verdict = Get-S14Verdict $withA $fallback $noA
     Set-Check 'S1.4' $verdict ([ordered]@{ invalid_trials = $invalid; shortcut = $script:ShortcutForm; with_a = $withA; with_a_fallback = $fallback; no_a = $noA })
 }
 
@@ -695,8 +788,8 @@ function Check-S16 {
         a_desktop = [ordered]@{ pass = $aPass; states = Count-States $aSamples; samples = $aSamples }
         call_ms = (P $a 'call_ms')
         b_d3d = [ordered]@{ longest_run = $bRun; first_fullscreen_s = $(if ($bFirst) { $bFirst[0].t_s } else { $null }); states = Count-States $bSamples; samples = $bSamples }
-        c_video = $(if ($c) { [ordered]@{ states = Count-States $c.samples; samples = $c.samples } } else { 'skipped' })
-        d_presentation = $(if ($d) { [ordered]@{ states = Count-States $d.samples; samples = $d.samples } } else { 'skipped' })
+        c_video = $(if ($c) { [ordered]@{ states = Count-States @(P $c 'samples'); samples = (P $c 'samples') } } else { 'skipped' })
+        d_presentation = $(if ($d) { [ordered]@{ states = Count-States @(P $d 'samples'); samples = (P $d 'samples') } } else { 'skipped' })
     })
 }
 
@@ -785,6 +878,25 @@ function Power-StayAwake([string]$Api, $Timeout) {
     }
 }
 
+# Whether one power API passed its checks: listed while held, gone after the clear, and the
+# stay-awake wait passed or was skipped. Every field is read through P: Power-StayAwake's
+# result has `result` only when skipped and `pass` only when run, and strict mode throws on a
+# missing dictionary key (rerun review I1; tests/strict-results.ps1).
+function Test-PowerApiOk($Listing, $Stay) {
+    [bool]((P $Listing 'listed_while_held') -eq $true -and (P $Listing 'gone_after_clear') -eq $true -and
+        ((P $Stay 'result') -eq 'skipped' -or (P $Stay 'pass') -eq $true))
+}
+
+function Get-S17Verdict($Listing, $Stay, $Ste, [bool]$SleepPass) {
+    $requestOk = Test-PowerApiOk $Listing $Stay
+    $steOk = [bool]($null -ne $Ste -and (Test-PowerApiOk (P $Ste 'listing') (P $Ste 'stay_awake')))
+    [ordered]@{
+        request_ok = $requestOk; ste_ok = $steOk
+        api = $(if ($requestOk) { 'PowerSetRequest' } elseif ($steOk) { 'SetThreadExecutionState' } else { 'none' })
+        verdict = $(if ($requestOk -and $SleepPass) { 'PASS' } elseif ($steOk -and $SleepPass) { 'PASS (SetThreadExecutionState)' } else { 'FAIL' })
+    }
+}
+
 function Check-S17 {
     Step 'S1.7 keep-awake'
     $a = (& powercfg /a) -join "`n"
@@ -793,13 +905,18 @@ function Check-S17 {
     $timeout = Get-SleepTimeoutSec
     Say ("Sleep timeout in use: {0}" -f $(if ($null -eq $timeout.used_s) { 'unknown (powercfg output not parsed)' } elseif ($timeout.used_s) { "$($timeout.used_s) s" } else { 'never' }))
 
+    $base = [ordered]@{ modern_standby = $modernStandby; powercfg_a = $a; sleep_timeout = $timeout }
     $listing = Power-Listing 'request'
+    $base.listing = $listing; Save-Partial 'S1.7' $base
     $stay = Power-StayAwake 'request' $timeout
+    $base.stay_awake = $stay; Save-Partial 'S1.7' $base
     $ste = $null
-    $requestOk = $listing.listed_while_held -and $listing.gone_after_clear -and ($stay.result -eq 'skipped' -or $stay.pass)
-    if (-not $requestOk) {
+    if (-not (Test-PowerApiOk $listing $stay)) {
         Say 'PowerSetRequest failed a check: the FAIL path repeats them with SetThreadExecutionState.' 'Red'
-        $ste = [ordered]@{ listing = Power-Listing 'ste'; stay_awake = Power-StayAwake 'ste' $timeout }
+        $steListing = Power-Listing 'ste'
+        $base.ste = [ordered]@{ listing = $steListing }; Save-Partial 'S1.7' $base
+        $ste = [ordered]@{ listing = $steListing; stay_awake = Power-StayAwake 'ste' $timeout }
+        $base.ste = $ste; Save-Partial 'S1.7' $base
     }
 
     Wait-Owner 'Sleep-and-wake check: after Enter, put the PC to sleep (Start, Power, Sleep), wait about a minute, wake it and sign in. The script waits up to 15 minutes'
@@ -811,12 +928,9 @@ function Check-S17 {
     $pbts = @(P $doc 'events' | Where-Object { $_.kind -eq 'power_broadcast' } | ForEach-Object { $_.pbt })
     $sleepPass = ($pbts -contains 'PBT_APMSUSPEND') -and ($pbts -contains 'PBT_APMRESUMEAUTOMATIC')
 
-    $steOk = $ste -and $ste.listing.listed_while_held -and $ste.listing.gone_after_clear -and
-        ($ste.stay_awake.result -eq 'skipped' -or $ste.stay_awake.pass)
-    $api = if ($requestOk) { 'PowerSetRequest' } elseif ($steOk) { 'SetThreadExecutionState' } else { 'none' }
-    $verdict = if ($requestOk -and $sleepPass) { 'PASS' } elseif ($steOk -and $sleepPass) { 'PASS (SetThreadExecutionState)' } else { 'FAIL' }
-    Set-Check 'S1.7' $verdict ([ordered]@{
-        api = $api; listing = $listing; stay_awake = $stay; ste = $ste
+    $v = Get-S17Verdict $listing $stay $ste $sleepPass
+    Set-Check 'S1.7' $v.verdict ([ordered]@{
+        api = $v.api; listing = $listing; stay_awake = $stay; ste = $ste
         sleep_wake = [ordered]@{ pass = $sleepPass; broadcasts = $pbts; resumed = $resumed; core = $doc }
         sleep_gap_fallback_needed = -not $sleepPass
         modern_standby = $modernStandby; powercfg_a = $a; sleep_timeout = $timeout
@@ -881,6 +995,7 @@ function Invoke-Check([string]$Id, [scriptblock]$Body) {
             stack = "$($_.ScriptStackTrace)"
         }
         Say "$Id stopped with an error: $($err.message) (line $($err.line)). Going on to the next check." 'Red'
+        if ($Report.checks.Contains($Id)) { $err.partial = $Report.checks[$Id]['details'] }
         Set-Check $Id 'ERROR' $err
         try { Stop-SpikeProcesses } catch { }
     }
@@ -901,13 +1016,25 @@ if ($CleanupOnly) {
 }
 
 # A rerun never overwrites an earlier run's results: they move to results\run-<UTC time>\.
-if (Test-Path (Join-Path $Results 'checks.json')) {
-    $old = Get-Content -Raw (Join-Path $Results 'checks.json') | ConvertFrom-Json
-    $stamp = ([datetime](P $old 'started')).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+# raw\ moves first, then checks.json; if either move fails the script stops here, before
+# anything is registered, so the next run never writes into the old raw\ (rerun review M7).
+$prevChecks = Join-Path $Results 'checks.json'
+if (Test-Path $prevChecks) {
+    $stamp = $null
+    try {
+        $old = Get-Content -Raw $prevChecks | ConvertFrom-Json
+        $stamp = ([datetime](P $old 'started')).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    } catch { }
+    if (-not $stamp) { $stamp = (Get-Item -LiteralPath $prevChecks).LastWriteTimeUtc.ToString('yyyyMMddTHHmmssZ') }
     $keep = Join-Path $Results "run-$stamp"
-    New-Item -ItemType Directory -Force -Path $keep | Out-Null
-    Move-Item (Join-Path $Results 'checks.json') $keep -Force
-    if (Test-Path $Raw) { Move-Item $Raw (Join-Path $keep 'raw') -Force }
+    if (Test-Path $keep) { $keep = "$keep-moved-" + (Get-Date).ToUniversalTime().ToString('HHmmss') }
+    try {
+        New-Item -ItemType Directory -Force -Path $keep | Out-Null
+        if (Test-Path $Raw) { Move-Item -LiteralPath $Raw -Destination (Join-Path $keep 'raw') -ErrorAction Stop }
+        Move-Item -LiteralPath $prevChecks -Destination $keep -ErrorAction Stop
+    } catch {
+        throw "Could not move the earlier results into $keep ($($_.Exception.Message)). Close anything that has a file in spikes\winshell\results open, then run the command again. Nothing was registered."
+    }
     Say "The earlier run's results were moved to $keep"
 }
 New-Item -ItemType Directory -Force -Path $Raw | Out-Null
