@@ -20,6 +20,12 @@
 .PARAMETER Only
   Run only these checks (S0.1, S0.2, S0.3, S0.4, S0.5a, S0.7, S0.8, S0.9, S0.6smoke). S0.1's build always runs
   unless -NoBuild.
+.PARAMETER DeployName
+  The deploy folder, build/<name>: "deploy" (the owner's) or "deploy-<letters and digits>".
+.PARAMETER ResultsDir
+  Where checks.json and s07.json go. By default results/ for -DeployName deploy, and
+  results/agent-runs/<stamp>/ for any other deploy folder, so an agent's rerun never replaces the
+  owner's result files.
 .PARAMETER WarmStarts
   S0.5 (a): number of timed starts (default 10).
 
@@ -33,7 +39,8 @@ param(
     [string[]]$Only = @(),
     [int]$WarmStarts = 10,
     [int]$IdleCpuPercent = 35,  # S0.5 (a) waits (up to 3 min) for the CPU to drop under this
-    [string]$DeployName = 'deploy'   # build/<name>; another name leaves the owner's deploy folder alone
+    [string]$DeployName = 'deploy',  # build/<name>; another name leaves the owner's deploy folder alone
+    [string]$ResultsDir = ''         # default: results/ with -DeployName deploy, else results/agent-runs/<stamp>/
 )
 $ErrorActionPreference = 'Stop'
 # -Only S0.1,S0.3 arrives as one string through pwsh -File.
@@ -46,8 +53,14 @@ $CmakeDir = Join-Path $Build 'cmake'
 $BinDir  = Join-Path $CmakeDir 'bin'
 $Deploy  = Join-Path $Build $DeployName
 # Every harness run keeps its own logs: build/runs/<yyyyMMdd-HHmmss>/ (never overwritten).
-$Runs    = Join-Path $Build ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-$Results = Join-Path $Root 'results'
+$RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$Runs    = Join-Path $Build ('runs\' + $RunStamp)
+# The owner's result files (results/) are written only by a run on the owner's deploy folder; any
+# other -DeployName writes results/agent-runs/<stamp>/ (Get-ResultsDir).
+Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force   # Get-CpuPercent, the S0.6 helpers, the guards
+$Results = Get-ResultsDir $Root $ResultsDir ($DeployName -eq 'deploy') $RunStamp
+# S0.2's two results are reused from results/ (they come from scratch-worktree runs, not the owner).
+$S02Results = Join-Path $Root 'results'
 $ExeName = 'app_shell_spike.exe'
 $LocalSpike = Join-Path $env:LOCALAPPDATA 'LILITH-spike'
 
@@ -89,7 +102,6 @@ function Read-Log([string]$path) {
 }
 function Get-Events($log, [string]$name) { @($log | Where-Object { $_.event -eq $name }) }
 
-Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force   # Get-CpuPercent, the S0.6 helpers, the guards
 
 # ---- preflight: nothing this run deletes or overwrites may be in use -------------------------
 # Checked once, here, before any delete: the build tree (-Clean deletes it, a build overwrites
@@ -620,7 +632,7 @@ if (Want 'S0.7') {
     $detail.exit_code = $r.run.exit_code
     $detail.deploy_stale_files = $stale
     # Qt activates the window when UIA invokes its button (S0.7 needs no focus); the client then
-    # closes the app at once, so this is a fraction of a second: samples every 250 ms.
+    # closes the app at once: about 0.1-0.2 s, at most about 2 s (samples every 250 ms).
     $detail.focus_taken = ($r.run.foreground_was_ours -gt 0)
     $detail.foreground_samples_ours = $r.run.foreground_was_ours
     $detail.foreground_samples = $r.run.foreground_samples
@@ -684,14 +696,14 @@ if (Want 'S0.2') {
     $variants = [ordered]@{ dashed = 'lil-qt-probe'; underscore = 'lil_qt_probe' }
     $r02 = [ordered]@{}
     foreach ($k in $variants.Keys) {
-        $f = Join-Path $Results "s02-$k.json"
+        $f = Join-Path $S02Results "s02-$k.json"
         if (-not (Test-Path $f)) { & pwsh -NoProfile -File (Join-Path $Root 's02-lil-qt-route.ps1') -Pkg $variants[$k] -Out $f }
         $r02[$k] = Get-Content $f -Raw | ConvertFrom-Json
     }
     # Reused, not rerun, when the files already exist: their write times say which run they're from.
     $r02.result_files_written = [ordered]@{
-        dashed = (Get-Item (Join-Path $Results 's02-dashed.json')).LastWriteTime.ToString('o')
-        underscore = (Get-Item (Join-Path $Results 's02-underscore.json')).LastWriteTime.ToString('o') }
+        dashed = (Get-Item (Join-Path $S02Results 's02-dashed.json')).LastWriteTime.ToString('o')
+        underscore = (Get-Item (Join-Path $S02Results 's02-underscore.json')).LastWriteTime.ToString('o') }
     $verdict = if ($r02.dashed.verdict -eq 'PASS') { 'PASS' }
                elseif ($r02.underscore.verdict -eq 'PASS') { 'PASS (with an underscore package name; a dashed one fails to link)' }
                else { 'FAIL' }
@@ -705,4 +717,4 @@ foreach ($f in @($confLog, $buildLog, (Join-Path $Build 'windeployqt.log'), (Joi
     if (Test-Path $f) { Copy-Item $f $Runs }
 }
 $failed = @($checks.Values | Where-Object { $_.verdict -notmatch '^(PASS|OK)' })
-Write-Host ("done in {0:N1} min; not passing: {1}" -f ((Get-Date) - $started).TotalMinutes, (($failed | ForEach-Object check) -join ', '))
+Write-Host ("done in {0:N1} min; not passing: {1}; results in {2}" -f ((Get-Date) - $started).TotalMinutes, (($failed | ForEach-Object check) -join ', '), $Results)

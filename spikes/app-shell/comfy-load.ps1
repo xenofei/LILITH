@@ -60,19 +60,21 @@ param(
     [string]$ComfyMain   = (Join-Path $env:USERPROFILE 'ComfyUI\ComfyUI\main.py'),
     [switch]$SamplersOnly,
     [int]$ProcessId = 0,
-    [int]$SamplerSeconds = 60
+    [int]$SamplerSeconds = 60,
+    [string]$ResultsDir = ''   # default: results/, or results/agent-runs/<stamp>/ with -SamplersOnly
 )
 $ErrorActionPreference = 'Stop'
 $Root    = $PSScriptRoot
 $Repo    = (Resolve-Path (Join-Path $Root '..\..')).Path
-$Results = Join-Path $Root 'results'
 $Deploy  = Join-Path $Root 'build\deploy'
 $Exe     = Join-Path $Deploy 'app_shell_spike.exe'
 $Url     = "http://127.0.0.1:$Port"
 $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Runs    = Join-Path $Root "build\runs\$stamp-s06"
-New-Item -ItemType Directory -Force $Runs, $Results | Out-Null
 Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force
+# The owner's S0.6 writes results/; -SamplersOnly (a check of the sampling) writes agent-runs/.
+$Results = Get-ResultsDir $Root $ResultsDir (-not $SamplersOnly) $stamp
+New-Item -ItemType Directory -Force $Runs, $Results | Out-Null
 
 # Everything this script starts (ComfyUI and its children, nvidia-smi, keep_busy, the VRAM
 # sampler, the app) must die with it, even if its console window is closed: an orphaned ComfyUI
@@ -147,8 +149,13 @@ try {
     # an elevated process's path and command line), so the GPU's compute processes are recorded.
     $blockers = @(Get-OwnerRunBlockers (Join-Path $Root 'build') $ComfyMain)
     if ($blockers.Count) { throw "not starting ComfyUI: $($blockers -join '; ')" }
+    # Another GPU user would load the GPU too: its compute processes are recorded before ComfyUI
+    # starts (pid and exe name, raw result only; reports give the count). Windows' list also holds
+    # desktop graphics apps, so it can't be a refusal, and an elevated process is listed by
+    # nvidia-smi but invisible to the path checks above.
     $res.gpu_compute_apps_before = @(& nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>$null | Where-Object { "$_".Trim() } |
         ForEach-Object { $f = "$_" -split '\s*,\s*', 2; "$($f[0]) $(Split-Path -Leaf "$($f[1])")" })   # pid and exe name, no path
+    $res.gpu_compute_apps_before_count = $res.gpu_compute_apps_before.Count   # the only part a report quotes
     Write-Host "starting ComfyUI on $Url ..."
     $comfy = Start-ProcessInJob $job $ComfyPython -ArgumentList @($ComfyMain, '--listen', '127.0.0.1', '--port', "$Port") `
         -WorkingDirectory (Split-Path $ComfyMain) `
@@ -262,7 +269,7 @@ try {
     $res.web = [ordered]@{ problems = @(Test-S06Web $ev)
                            loads = @($ev | Where-Object { $_.event -eq 'web_load' } | ForEach-Object { "$($_.status) $("$($_.url)".Substring(0, [math]::Min(40, "$($_.url)".Length)))" })
                            titles = @($ev | Where-Object { $_.event -eq 'web_title' } | ForEach-Object { $_.title })
-                           page = 'data: page (Get-S06WebUrl): coloured body, script-drawn canvas, script-set title' }
+                           page = 'data: page (Get-S06WebUrl): coloured body, script-drawn canvas, title set after two animation frames' }
     # A web view that didn't load counts with the workload: the run is then INVALID, with the reason.
     $res.workload_problems = @(Test-S06Workload $counts $MeasureSeconds $RateHz) + @($res.web.problems)
     $verdict = Get-S06Verdict -HasMeasuredReport ([bool]$measured) -ExitCode $res.app_exit_code -TimedOut $res.app_timed_out `

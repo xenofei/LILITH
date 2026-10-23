@@ -304,6 +304,16 @@ function Get-OwnerRunBlockers([string]$BuildDir, [string]$ComfyMain, [object[]]$
     $why
 }
 
+# Where a harness run writes its results. The owner's runs (run-owner.ps1, or the scripts with
+# their defaults) write results/; every other run (another -DeployName, comfy-load -SamplersOnly)
+# writes results/agent-runs/<stamp>/, so an agent's or a test's rerun never replaces the owner's
+# checks.json, s07.json or s06*.json. An explicit -ResultsDir wins.
+function Get-ResultsDir([string]$SpikeRoot, [string]$Requested, [bool]$OwnerRun, [string]$Stamp) {
+    if ($Requested) { return $Requested }
+    if ($OwnerRun) { return (Join-Path $SpikeRoot 'results') }
+    Join-Path $SpikeRoot "results\agent-runs\$Stamp"
+}
+
 # ---- S0.6 workload and refresh-rate checks ----------------------------------------------------
 
 # Did the bar's workload actually run? load_counts is logged at the end of the measured window,
@@ -327,14 +337,16 @@ function Test-S06Workload($Counts, [int]$MeasureSeconds = 60, [int]$RateHz = 10)
 }
 
 # The page S0.6's Web dock loads (--web-url): local, no network. Its body is coloured, a canvas is
-# drawn by script, and the script sets the title, so a logged web_title proves that Blink and V8
-# ran the page inside the job (about:blank has no content, no script and nothing to raster). `#`
-# is %23 (else it starts a fragment), and the HTML uses single quotes only. S0.3 and S0.9 keep
-# about:blank, which their bars name.
+# drawn by script, and the script sets the title only after two requestAnimationFrame callbacks,
+# which run only when the compositor asks the visible view for frames. So a logged web_title shows
+# that the page loaded, ran its script and reached a painted frame inside the job (it doesn't
+# prove GPU raster). about:blank has no content, no script and nothing to raster. `#` is %23 (else
+# it starts a fragment), and the HTML uses single quotes only. S0.3 and S0.9 keep about:blank,
+# which their bars name.
 $script:S06WebTitle = 's06-rendered-42'
 $script:S06WebUrl = "data:text/html;charset=utf-8,<!doctype html><title>pending</title><body style='margin:0;background:%2320a060'>" +
     "<canvas id=c width=512 height=512></canvas><script>var g=c.getContext('2d');g.fillStyle='%23f0c000';g.fillRect(64,64,384,384);" +
-    "document.title='s06-rendered-'+(6*7)</script>"
+    "requestAnimationFrame(function(){requestAnimationFrame(function(){document.title='s06-rendered-'+(6*7)})})</script>"
 function Get-S06WebUrl { $script:S06WebUrl }
 
 # Did the Web dock's page really load and run (S0.6 runs the app inside the kill-on-close job, and
@@ -618,6 +630,6 @@ function Get-CpuPercent {
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
-    Get-OwnerRunBlockers, Get-S06WebUrl, Test-S06Web, Get-S07Items, Get-S07Problems, Get-S07Verdict,
+    Get-OwnerRunBlockers, Get-ResultsDir, Get-S06WebUrl, Test-S06Web, Get-S07Items, Get-S07Problems, Get-S07Verdict,
     New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

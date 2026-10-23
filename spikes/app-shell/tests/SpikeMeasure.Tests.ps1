@@ -340,6 +340,39 @@ Describe 'S0.7 UI Automation items' {
     }
 }
 
+Describe 'Results folder (agent and test runs never write the owner''s results)' {
+    It 'writes results/ only for the owner''s runs, else results/agent-runs/(stamp)/, and an explicit folder wins' {
+        Get-ResultsDir 'C:\x' '' $true '20261023-1' | Should -Be 'C:\x\results'
+        Get-ResultsDir 'C:\x' '' $false '20261023-1' | Should -Be 'C:\x\results\agent-runs\20261023-1'
+        Get-ResultsDir 'C:\x' 'D:\elsewhere' $true '20261023-1' | Should -Be 'D:\elsewhere'
+    }
+    It 'leaves results/checks.json and results/s07.json untouched in a harness run on another deploy folder' {
+        # A real run-spike.ps1 that checks and launches nothing (-NoBuild, -Only none) but still
+        # writes its checks.json; the folders it creates are removed afterwards (found by name, new).
+        $spike = Join-Path $PSScriptRoot '..'
+        $res = Join-Path $spike 'results'
+        $files = 'checks.json', 's07.json'
+        $before = @{}; foreach ($f in $files) { $p = Join-Path $res $f; $before[$f] = if (Test-Path $p) { (Get-FileHash $p).Hash + (Get-Item $p).LastWriteTimeUtc.Ticks } else { 'absent' } }
+        $agentDir = Join-Path $res 'agent-runs'; $runsDir = Join-Path $spike 'build\runs'
+        $oldAgent = @(Get-ChildItem $agentDir -Directory -ErrorAction SilentlyContinue | ForEach-Object Name)
+        $oldRuns = @(Get-ChildItem $runsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object Name)
+        & pwsh -NoProfile -File (Join-Path $spike 'run-spike.ps1') -NoBuild -DeployName deploy-pester -Only none *> $null
+        $newAgent = @(Get-ChildItem $agentDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $oldAgent })
+        $newRuns = @(Get-ChildItem $runsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $oldRuns })
+        try {
+            foreach ($f in $files) {
+                $p = Join-Path $res $f
+                $now = if (Test-Path $p) { (Get-FileHash $p).Hash + (Get-Item $p).LastWriteTimeUtc.Ticks } else { 'absent' }
+                $now | Should -Be $before[$f]
+            }
+            $newAgent.Count | Should -Be 1
+            Test-Path (Join-Path $newAgent[0].FullName 'checks.json') | Should -BeTrue
+        } finally {
+            foreach ($d in @($newAgent) + @($newRuns)) { Remove-Item -Recurse -Force $d.FullName -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
 Describe 'run-owner.ps1 refusal (by path, never by name)' {
     BeforeAll {
         $main = 'C:\work\ComfyUI\ComfyUI\main.py'; $build = 'C:\work\spikes\app-shell\build'
@@ -372,7 +405,7 @@ Describe 'S0.6 web view check' {
     It 'loads a local page whose script sets that title (no network, no about:blank)' {
         $u = Get-S06WebUrl
         $u | Should -Match '^data:text/html'
-        $u | Should -Match "document\.title='s06-rendered-'\+\(6\*7\)"
+        $u | Should -Match "fillRect\(.*requestAnimationFrame\(function\(\)\{requestAnimationFrame\(function\(\)\{document\.title='s06-rendered-'\+\(6\*7\)\}\)\}\)"
         $u | Should -Not -Match '#'      # a bare # would start a fragment
         $u | Should -Not -Match '"'      # no inner double quotes to escape on the command line
     }

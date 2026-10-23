@@ -17,7 +17,7 @@
   Times are recorded in ms since the app's start (read_app_ms, subscribed_app_ms,
   invoked_app_ms). It judges nothing: Get-S07Items in lib/SpikeMeasure.psm1 does.
 #>
-param([int]$AppPid, [string]$Out, [int]$TreeTimeoutSeconds = 15, [int]$AnnounceTimeoutSeconds = 5, [int]$MinWindows = 2)
+param([int]$AppPid, [string]$Out, [int]$TreeTimeoutSeconds = 15, [int]$AnnounceTimeoutSeconds = 2, [int]$MinWindows = 2)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
 Add-Type -ReferencedAssemblies UIAutomationClient, UIAutomationTypes, WindowsBase -TypeDefinition @'
@@ -150,10 +150,17 @@ try {
     # Qt activates the window whose button UIA invoked, although S0.7 itself needs no focus, and
     # UIA can't hand the focus back. So the client closes the app's windows (WindowPattern) as soon
     # as it is done: the app quits, and the focus goes back, within a fraction of a second.
-    foreach ($w in $wins) {
-        try { $w.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close() } catch { $res.close_error = "$($_.Exception.GetType().Name)" }
+    # This runs whether or not the announcement came (the wait is 2 s). If WindowPattern.Close
+    # fails, the app's main window is asked to close through its pinned Process (WM_CLOSE to the
+    # same pid); either way the app quits normally. Only if both fail does it keep running, and
+    # with it the focus, until its --quit-after.
+    if ($res.invoked) {
+        foreach ($w in $wins) {
+            try { $w.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close() } catch { $res.close_error = "$($_.Exception.GetType().Name)" }
+        }
+        if ($res.close_error -and -not $app.WaitForExit(1000)) { $res.close_fallback = $app.CloseMainWindow() }
+        $res.closed_app_ms = & $appMs
     }
-    $res.closed_app_ms = & $appMs
 } catch {
     $res.error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
 } finally {

@@ -16,7 +16,7 @@ pwsh -NoProfile -File spikes/app-shell/run-owner.ps1
   5. It runs S0.6 under ComfyUI load (section 3 below) whenever the deploy matches the build, even if S0.4 failed for another reason, and the 5 Hz fallback only if S0.6 FAILs.
   6. It prints one line per check at the end.
 - **During the run:**
-  - Spike windows open without taking focus (S0.7's takes it for a fraction of a second when it clicks the counter). The ones S0.4 and S0.7 open close by themselves within a minute.
+  - Spike windows open without taking focus. S0.7's takes it when it clicks the counter: about 0.1–0.2 s normally, at most about 2 s if something goes wrong. The ones S0.4 and S0.7 open close by themselves within a minute.
   - During S0.6, the spike window stays on top for about a minute, so don't use the mouse or keyboard then.
   - Ctrl+C or closing the window stops everything, ComfyUI included.
 - **Afterwards:** hand `spikes/app-shell/results/` (`checks.json`, `s07.json`, `s06*.json`) back to the agent.
@@ -25,7 +25,7 @@ The sections below are for reruns and for the checks the one command doesn't cov
 
 - Run them in a PowerShell 7 window from the repository root of the task worktree, in the order below.
 - Close heavy work first: every result records the machine's CPU load beside its timing.
-- Each script writes its result under `spikes/app-shell/results/`, and its logs to a new timestamped folder under `spikes/app-shell/build/runs/` (both git-ignored).
+- Each script writes its result under `spikes/app-shell/results/`, and its logs to a new timestamped folder under `spikes/app-shell/build/runs/` (both git-ignored). Runs on another deploy folder (`-DeployName deploy-<name>`) and `comfy-load.ps1 -SamplersOnly` write to `results/agent-runs/<stamp>/` instead, so they never replace your result files; `-ResultsDir` picks a folder.
 
 Before any of them, `spikes/app-shell/build/deploy/` must exist and match the build. If it doesn't, close every spike window, then rebuild and redeploy (about 5 minutes on an idle machine; spike windows open and close without taking focus). The harness, `start-once.ps1 -ColdCache` and `comfy-load.ps1` refuse to run while a spike window is open, and say which one:
 
@@ -99,7 +99,7 @@ pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1 -RateHz 5 -ChartsBatched
 
 ## 4. S0.7: the accessibility check (automated; about 1 minute)
 
-No Narrator and nothing to do: it reads the spike's windows through UI Automation, the same data a screen reader gets, then clicks the counter through UI Automation and closes the spike. The spike window may take the focus for a fraction of a second at that click, which Qt does when a button is invoked. `run-owner.ps1` runs it, and so does the harness on its own:
+No Narrator and nothing to do: it reads the spike's windows through UI Automation, the same data a screen reader gets, then clicks the counter through UI Automation and closes the spike. The spike window takes the focus at that click, which Qt does when a button is invoked: about 0.1–0.2 s normally, at most about 2 s if the announcement is missed (and, only if closing the spike fails twice, until it quits by itself at 25 s). `run-owner.ps1` runs it, and so does the harness on its own:
 
 ```powershell
 pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.7

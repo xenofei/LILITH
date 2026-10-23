@@ -42,8 +42,8 @@ Spike 10 owner run. Expected time on an idle machine:
         (ComfyUI's start and the GPU gate are each capped at 5 min)
         the 5 Hz fallback, only if S0.6 FAILs ..... the same again
   Total: about 10-16 min; at most about 30 min with the fallback.
-Spike windows open without taking focus (S0.7's takes it for a fraction of a second when it clicks
-the counter), and those S0.4 and S0.7 open close by themselves within a minute. During S0.6 the spike stays on top for about a minute: don't use the mouse or
+Spike windows open without taking focus; S0.7's takes it when it clicks the counter (about
+0.1-0.2 s, at most about 2 s). Those S0.4 and S0.7 open close by themselves within a minute. During S0.6 the spike stays on top for about a minute: don't use the mouse or
 keyboard then. Ctrl+C or closing this window stops everything.
 '@
 
@@ -63,14 +63,19 @@ foreach ($id in 'S0.4', 'S0.7') {
 }
 
 # ---- S0.6, and its fallback only on FAIL ----------------------------------------------------
-# S0.6 needs a deploy that matches the build, and S0.7 not to have broken down; an S0.4 FAIL for
-# another reason (a size or a restore off by a few px) doesn't stop it. comfy-load.ps1 refuses an
-# incomplete or stale deploy itself as well.
+# S0.6 needs this round's build deployed. It is skipped when the build failed or S0.4 didn't run
+# (an old deploy would match the old binaries) and when the deploy doesn't match the build. An
+# S0.4 FAIL for another reason (a size, or a restore off by a few px) and an S0.7 result don't stop
+# it. comfy-load.ps1 refuses an incomplete or stale deploy itself as well.
+$build = if ($fresh) { @($checks.checks) | Where-Object { $_.check -eq 'S0.1' } | Select-Object -First 1 } else { $null }
 $stale = @(Test-DeployCurrent (Join-Path $Root 'build\deploy') (Join-Path $Root 'build\cmake\bin'))
-if ($stale.Count) {
-    $lines['S0.6'] = "NOT RUN (the deploy folder doesn't match the build: $($stale -join ', '))"
-} elseif ($lines['S0.7'] -match '^ERROR') {
-    $lines['S0.6'] = 'NOT RUN (S0.7 broke down with ERROR; see the output above)'
+$skip = if ($build -and $build.verdict -match '^FAIL') { "the build failed ($($build.verdict)); the deploy would be the previous build's" }
+        elseif ($lines['S0.4'] -match '^NOT RUN') { "S0.4 didn't run, so this round's build isn't deployed: $($lines['S0.4'])" }
+        elseif ($stale.Count) { "the deploy folder doesn't match the build: $($stale -join ', ')" }
+        else { $null }
+if ($skip) {
+    $lines['S0.6'] = "NOT RUN ($skip)"
+    Write-Host "Skipping S0.6: $skip"
 } else {
     $s06 = Join-Path $Results 's06.json'
     $before = Get-Date
