@@ -39,9 +39,10 @@
 
   Everything it starts is in a kill-on-close Windows job object held by this script's own pwsh,
   so closing its console window also ends ComfyUI, nvidia-smi, the load, the VRAM sampler and the
-  app; Ctrl+C and errors still clean up explicitly. Each of them is created suspended, put in the
-  job, and only then resumed, so its own children are in the job from their start too. Run it
-  only as pwsh -NoProfile -File, without -NoExit (an in-process run is refused).
+  app; Ctrl+C and errors still clean up explicitly, and closing the job's handle at the end ends
+  whatever is left of them. Each of them is created suspended, put in the job, and only then
+  resumed, so its own children are in the job from their start too. The script's own pwsh is not
+  in the job.
 
   -SamplersOnly -ProcessId <pid> runs just the two samplers against another process for
   -SamplerSeconds and reports their coverage (no ComfyUI, no app); it checks the sampling.
@@ -76,20 +77,16 @@ Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force
 # Everything this script starts (ComfyUI and its children, nvidia-smi, keep_busy, the VRAM
 # sampler, the app) must die with it, even if its console window is closed: an orphaned ComfyUI
 # holds the GPU and port 8188, and the next run then refuses. So this pwsh creates a kill-on-close
-# job, holding the only handle, before it starts anything (and puts itself in it).
-# Children don't join it by themselves: the Store pwsh is an MSIX-packaged app, and Windows
-# creates its out-of-package children (python, nvidia-smi, the app) outside every job it is in
-# (fix round 4 measured this: cmd escaped, an in-package pwsh didn't). So each process is started
-# with Start-ProcessInJob: created suspended, assigned, then resumed. Its own children, which
-# aren't packaged, then inherit the job from their first instruction. Nothing started before or
-# elsewhere is ever put in the job. This pwsh is in the job too, so it must run this script and
-# nothing else: an in-process run (from an interactive shell) and -NoExit are refused.
-$selfCmd = "$((Get-CimInstance Win32_Process -Filter "ProcessId=$PID").CommandLine)"
-if ($selfCmd -notmatch '(?i)\s-f(ile)?\s' -or $selfCmd -notmatch [regex]::Escape((Split-Path -Leaf $PSCommandPath)) -or
-    $selfCmd -match '(?i)\s-noe(xit)?\b') {
-    throw "run this script in its own pwsh, without -NoExit: pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1"
-}
-$job = Enable-KillOnCloseForSelf
+# job before it starts anything and holds its only handle; when this pwsh ends, however it ends,
+# Windows closes the handle and everything in the job dies. `finally` closes it too, after the
+# explicit stops. This pwsh itself is not in the job.
+# Children don't join a job by themselves here: the Store pwsh is an MSIX-packaged app, and
+# Windows creates its out-of-package children (python, nvidia-smi, the app) outside every job it
+# is in (fix round 4 measured this: cmd escaped, an in-package pwsh didn't). So each process is
+# started with Start-ProcessInJob: created suspended, assigned, then resumed. Its own children,
+# which aren't packaged, then inherit the job from their first instruction. Nothing started
+# before or elsewhere is ever put in the job.
+$job = New-KillOnCloseJob
 
 Add-Type -Namespace AppShellComfy -Name Win -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
 [void][AppShellComfy.Win]::SetErrorMode(0x0001 -bor 0x8000)
@@ -120,6 +117,7 @@ if ($SamplersOnly) {
                        os_primary_refresh_hz = (Get-OsPrimaryRefreshHz); files = $Runs }
     $out | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $Results 's06-samplers-check.json')
     $out | ConvertTo-Json -Depth 4
+    $job.Dispose()
     return
 }
 
@@ -196,8 +194,11 @@ try {
     $res.in_kill_on_close_job = [ordered]@{ comfy = (Test-ProcessInJob $job $comfy); load = (Test-ProcessInJob $job $load)
                                            gpu_sampler = (Test-ProcessInJob $job $gpuProc); vram_sampler = (Test-ProcessInJob $job $vramProc)
                                            app = (Test-ProcessInJob $job $app) }
-    # Start-ProcessInJob ends a process it couldn't assign before it runs, so a false here would
-    # mean the check itself is wrong; say so rather than record it silently.
+    # These are the processes the script started itself: for ComfyUI and keep_busy that is the
+    # venv's python.exe launcher, not the interpreter it starts (which inherits the job from the
+    # launcher, but isn't checked here). Start-ProcessInJob ends a process it couldn't assign
+    # before it runs, so a false here would mean the check itself is wrong; say so rather than
+    # record it silently.
     $notIn = @($res.in_kill_on_close_job.Keys | Where-Object { -not $res.in_kill_on_close_job[$_] })
     if ($notIn.Count) { Write-Warning "not in the kill-on-close job: $($notIn -join ', '); closing this window would leave them running" }
     # Short waits in a loop, so Ctrl+C reaches `finally` (and stops ComfyUI) at once.
@@ -263,8 +264,15 @@ try {
     if ($app -and -not $app.HasExited) { try { $app.Kill($true) } catch {} }
     if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue }
     if ($vramProc -and -not $vramProc.HasExited) { try { $vramProc.Kill() } catch {} }
-    if ($load -and -not $load.HasExited) { & taskkill /PID $load.Id /T /F *>&1 | Out-Null }
-    if ($comfy -and -not $comfy.HasExited) { & taskkill /PID $comfy.Id /T /F *>&1 | Out-Null; Write-Host 'stopped the ComfyUI process this script started' }
+    # .NET's tree kill takes a child only if it started after its parent, so a reused parent pid
+    # can't pull in an unrelated process (taskkill /T doesn't check that).
+    if ($load -and -not $load.HasExited) { try { $load.Kill($true) } catch {} }
+    if ($comfy -and -not $comfy.HasExited) {
+        try { $comfy.Kill($true) } catch {}; [void]$comfy.WaitForExit(10000)
+        Write-Host 'stopped the ComfyUI process this script started'
+    }
+    # Then whatever is left in the job (exactly what this script put there) ends with its handle.
+    $job.Dispose()
     $res.comfy_stopped = -not (Test-Comfy)
     $suffix = if ($RateHz -ne 10 -or $ChartsBatched) { '-fallback' } else { '' }
     $res | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 (Join-Path $Results "s06$suffix.json")

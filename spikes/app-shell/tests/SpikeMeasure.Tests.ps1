@@ -438,12 +438,14 @@ Describe 'Kill-on-close job (comfy-load.ps1 never leaves ComfyUI or nvidia-smi b
         Wait-Gone $grandchild.Id | Should -BeTrue
         Get-Process -Id $bystander.Id -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
     }
-    It 'kills what the script started (cmd and its grandchild) when the script''s pwsh is killed (a closed console)' {
+    It 'kills what the script started (cmd and its grandchild) when the script''s pwsh is killed (a closed console), the pwsh itself not being in the job' {
         $pidFile = Join-Path $TestDrive 'cmd.pid'
+        $selfFile = Join-Path $TestDrive 'self-in-job.txt'
         $helperScript = Join-Path $TestDrive 'helper.ps1'
         Set-Content $helperScript @"
 Import-Module '$module'
-`$job = Enable-KillOnCloseForSelf
+`$job = New-KillOnCloseJob
+Set-Content '$selfFile' (Test-ProcessInJob `$job (Get-Process -Id `$PID))
 `$c = Start-ProcessInJob `$job `$env:ComSpec -ArgumentList '/c', 'timeout /t 60 /nobreak'
 Set-Content '$pidFile' `$c.Id
 Start-Sleep 60
@@ -456,9 +458,62 @@ Start-Sleep 60
         $script:ours.Add($cmd.Id)
         $grandchild = Wait-TimeoutChild $cmd
         $grandchild | Should -Not -BeNullOrEmpty
+        Get-Content $selfFile | Should -Be 'False'
         Stop-Process -Id $helper.Id -Force   # what closing the console window does to the script
         Wait-Gone $cmd.Id | Should -BeTrue
         Wait-Gone $grandchild.Id | Should -BeTrue
+    }
+    It 'holds the child suspended and already in the job until it is resumed (it runs no code before)' {
+        $job = New-KillOnCloseJob
+        $marker = Join-Path $TestDrive 'ran.txt'
+        $marker | Should -Not -Match '\s'   # cmd /c doesn't read CRT-escaped quotes, so the path goes unquoted
+        $obs = @{}
+        $p = Start-ProcessInJob $job $env:ComSpec -ArgumentList '/c', "echo ran>$marker" -BeforeResume {
+            param($proc)
+            $script:ours.Add($proc.Id)
+            $obs.in_job = Test-ProcessInJob $job $proc
+            $proc.Refresh()
+            $obs.all_suspended = @($proc.Threads | Where-Object { -not ($_.ThreadState -eq 'Wait' -and $_.WaitReason -eq 'Suspended') }).Count -eq 0
+            Start-Sleep -Milliseconds 500   # cmd writes the marker in a few ms once it runs
+            $obs.marker_before_resume = Test-Path $marker
+        }
+        $obs.in_job | Should -BeTrue
+        $obs.all_suspended | Should -BeTrue
+        $obs.marker_before_resume | Should -BeFalse
+        $p.WaitForExit(10000) | Should -BeTrue
+        Test-Path $marker | Should -BeTrue   # and it does run once resumed
+        $job.Dispose()
+    }
+    It 'ends a child it cannot put in the job before the child runs, and throws' {
+        $dead = New-KillOnCloseJob
+        $dead.Dispose()
+        $tag = [guid]::NewGuid().ToString('N')
+        $marker = Join-Path $TestDrive "never-$tag.txt"
+        $marker | Should -Not -Match '\s'
+        { Start-ProcessInJob $dead $env:ComSpec -ArgumentList '/c', "echo ran>$marker" } | Should -Throw
+        Start-Sleep -Milliseconds 500
+        Test-Path $marker | Should -BeFalse
+        @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($tag) }).Count | Should -Be 0
+    }
+    It 'refuses to use a closed job (IsProcessInJob with no job would mean "in any job")' {
+        $dead = New-KillOnCloseJob
+        $dead.Dispose()
+        $me = Get-Process -Id $PID
+        { Test-ProcessInJob $dead $me } | Should -Throw
+        { Add-ProcessToJob $dead $me } | Should -Throw
+    }
+    It 'puts the VRAM sampler in a job that already holds an out-of-package process (as comfy-load does)' {
+        # A pwsh sampler failed here under the Store pwsh: it is born in the package's job and
+        # can't then join ours (fix round 5).
+        $job = New-KillOnCloseJob
+        $cmd = Start-ProcessInJob $job $env:ComSpec -ArgumentList '/c', 'timeout /t 60 /nobreak'
+        $script:ours.Add($cmd.Id)
+        $sampler = Start-VramSampler 999999 (Join-Path $TestDrive 'vram-job.jsonl') -Job $job
+        $script:ours.Add($sampler.Id)
+        Test-ProcessInJob $job $sampler | Should -BeTrue
+        $job.Dispose()
+        Wait-Gone $sampler.Id | Should -BeTrue
+        Wait-Gone $cmd.Id | Should -BeTrue
     }
     It 'redirects stdout and stderr to files and reports the exit code' {
         $job = New-KillOnCloseJob

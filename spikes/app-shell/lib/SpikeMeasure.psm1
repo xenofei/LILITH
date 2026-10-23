@@ -111,9 +111,13 @@ function Read-GpuSamples([string]$File) {
 # the process has a D3D device, so each sample is its own Get-Counter call and a missing instance
 # is retried, not fatal (a -Continuous Get-Counter on a not-yet-existing instance ends at once:
 # the owner's first S0.6 run got 0 samples). Retries are written as {"t":..,"missing":true}
-# lines. The sampler is a hidden pwsh started inside $Job (Start-ProcessInJob; none if $Job is
-# $null), so it is in the job from its start rather than relying on Start-Job's child inheriting.
-# It also stops by itself once the pwsh that started it is gone (run-spike.ps1 has no job).
+# lines. The sampler is a hidden Windows PowerShell 5.1 started inside $Job (Start-ProcessInJob;
+# none if $Job is $null), so it is in the job from its start. Not pwsh: a pwsh child of the Store
+# pwsh stays in the package, so it is born inside the package's job, and a process already in a
+# job can't be assigned to our job once that holds processes from outside the package
+# (AssignProcessToJobObject: access denied; fix round 5 hit exactly this). powershell.exe is
+# outside the package like python and nvidia-smi. It also stops by itself once the pwsh that
+# started it is gone (run-spike.ps1 has no job).
 function Start-VramSampler([int]$ProcessId, [string]$Out, $Job = $null) {
     $body = {
         param($procId, $out, $parentPid)
@@ -137,7 +141,8 @@ function Start-VramSampler([int]$ProcessId, [string]$Out, $Job = $null) {
     }
     $cmd = "& { $body } $ProcessId '$($Out -replace "'", "''")' $PID"
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
-    Start-ProcessInJob $Job ([Environment]::ProcessPath) @('-NoProfile', '-NonInteractive', '-EncodedCommand', $enc)
+    $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Start-ProcessInJob $Job $ps51 @('-NoProfile', '-NonInteractive', '-EncodedCommand', $enc)
 }
 
 # VRAM samples that hold values (the "missing" retries left out).
@@ -325,8 +330,9 @@ function Test-PlausibleRefresh([double]$Hz) { $Hz -ge 24 -and $Hz -le 1000 }
 
 # ---- a kill-on-close job object (comfy-load.ps1) -----------------------------------------------
 # Every process in the job dies when the last handle to the job closes. comfy-load.ps1 creates
-# one and holds its only handle, so if the owner closes its console window, everything the script
-# started dies with it.
+# one and holds its only handle (never inheritable), so if the owner closes its console window,
+# everything the script started dies with it, and closing the handle in `finally` ends exactly
+# the processes it put in the job. The script's own pwsh is not in the job.
 #
 # Children do NOT reliably join their parent's job by themselves here. The Store pwsh is an
 # MSIX-packaged app, and Windows creates a packaged app's out-of-package children (cmd, python,
@@ -371,9 +377,7 @@ public sealed class KillOnCloseJob : IDisposable {
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
     const uint CREATE_SUSPENDED = 0x4, CREATE_NO_WINDOW = 0x08000000;
     const int STARTF_USESTDHANDLES = 0x100;
-    // The job this process created for itself: kept here so the handle lives as long as the process.
-    public static KillOnCloseJob Self;
-    IntPtr handle;
+    IntPtr handle;   // no finaliser: only Dispose() or the process's exit closes it
     public KillOnCloseJob() {
         handle = CreateJobObjectW(IntPtr.Zero, null);
         if (handle == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
@@ -384,10 +388,13 @@ public sealed class KillOnCloseJob : IDisposable {
             throw new System.ComponentModel.Win32Exception(e);
         }
     }
+    // A closed job must fail loudly: IsProcessInJob with a NULL job means "in any job".
+    void ThrowIfDisposed() { if (handle == IntPtr.Zero) throw new ObjectDisposedException("KillOnCloseJob"); }
     public void Assign(IntPtr process) {
+        ThrowIfDisposed();
         if (!AssignProcessToJobObject(handle, process)) throw new System.ComponentModel.Win32Exception();
     }
-    public bool Contains(IntPtr process) { bool r; return IsProcessInJob(process, handle, out r) && r; }
+    public bool Contains(IntPtr process) { ThrowIfDisposed(); bool r; return IsProcessInJob(process, handle, out r) && r; }
     public void Dispose() { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } }
 
     // One argument quoted the way CommandLineToArgvW and the C runtime read it back.
@@ -420,7 +427,9 @@ public sealed class KillOnCloseJob : IDisposable {
     // inherited (bInheritHandles must be TRUE for the redirect), otherwise nothing is. If the
     // process can't be put in the job it is ended before it ran. The returned Process holds its
     // own handle, opened while ours still pinned the pid, so its Id can't be reused under it.
-    public static Process Start(KillOnCloseJob job, string app, string commandLine, string cwd, string stdOut, string stdErr) {
+    // beforeResume (tests only; null otherwise) sees the assigned, still suspended process.
+    public static Process Start(KillOnCloseJob job, string app, string commandLine, string cwd, string stdOut, string stdErr,
+                                Action<Process> beforeResume) {
         var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
         bool redirect = !string.IsNullOrEmpty(stdOut) || !string.IsNullOrEmpty(stdErr);
         var opened = new System.Collections.Generic.List<IntPtr>();
@@ -438,14 +447,17 @@ public sealed class KillOnCloseJob : IDisposable {
         } finally {
             foreach (var h in opened) CloseHandle(h);   // the child has its own copies
         }
+        Process p = null;
         try {
             if (job != null && !job.Contains(pi.hProcess)) job.Assign(pi.hProcess);
-            var p = Process.GetProcessById(pi.dwProcessId);
+            p = Process.GetProcessById(pi.dwProcessId);
             var pinned = p.Handle;   // Process opens and keeps its own handle now
+            if (beforeResume != null) beforeResume(p);
             if (ResumeThread(pi.hThread) == 0xFFFFFFFF) throw new System.ComponentModel.Win32Exception();
             return p;
         } catch {
             TerminateProcess(pi.hProcess, 1);   // never let it run outside the job
+            if (p != null) p.Dispose();
             throw;
         } finally {
             CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
@@ -474,24 +486,14 @@ function ConvertTo-CommandLine([string[]]$Arguments) {
 # Starts $FilePath (a full path) with $ArgumentList inside $Job (or in no job if $Job is $null):
 # created suspended, assigned, then resumed, so it and all its descendants are in the job from
 # their first instruction. No console window. -StdOut/-StdErr redirect to files (stdin is then
-# NUL); without them nothing is redirected. Returns a System.Diagnostics.Process.
+# NUL); without them nothing is redirected. Returns a System.Diagnostics.Process. -BeforeResume
+# is for the tests: it gets the Process while it is assigned and still suspended.
 function Start-ProcessInJob {
-    param($Job, [string]$FilePath, [string[]]$ArgumentList = @(), [string]$WorkingDirectory, [string]$StdOut, [string]$StdErr)
+    param($Job, [string]$FilePath, [string[]]$ArgumentList = @(), [string]$WorkingDirectory, [string]$StdOut, [string]$StdErr,
+          [scriptblock]$BeforeResume)
     Initialize-JobType
-    [KillOnCloseJob]::Start($Job, $FilePath, (ConvertTo-CommandLine (@($FilePath) + @($ArgumentList))), $WorkingDirectory, $StdOut, $StdErr)
-}
-
-# Creates the script's kill-on-close job, holding its only handle, and puts the current process
-# in it too, so its in-package children (pwsh) are covered as well. Call it only from a process
-# that runs nothing but this script (pwsh -File, without -NoExit), never from an interactive shell.
-function Enable-KillOnCloseForSelf {
-    Initialize-JobType
-    if (-not [KillOnCloseJob]::Self) {
-        $j = [KillOnCloseJob]::new()
-        $j.Assign([System.Diagnostics.Process]::GetCurrentProcess().Handle)
-        [KillOnCloseJob]::Self = $j
-    }
-    [KillOnCloseJob]::Self
+    $hook = if ($BeforeResume) { [Action[System.Diagnostics.Process]]$BeforeResume } else { $null }
+    [KillOnCloseJob]::Start($Job, $FilePath, (ConvertTo-CommandLine (@($FilePath) + @($ArgumentList))), $WorkingDirectory, $StdOut, $StdErr, $hook)
 }
 
 # The machine's CPU load (%), averaged over one second; recorded beside every timing.
@@ -503,5 +505,5 @@ function Get-CpuPercent {
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
-    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob, Enable-KillOnCloseForSelf,
+    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

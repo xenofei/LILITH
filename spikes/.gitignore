@@ -13,3 +13,5 @@
 */results/**/*.txt
 */results/**/*.csv
 */results/**/*.md
+# Python bytecode (it embeds the absolute source path)
+__pycache__/
