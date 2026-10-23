@@ -1,6 +1,6 @@
 # Local image models for a 16 GB canvas studio (October 2026)
 
-**Target machine:** RTX 5080 (16 GB, Blackwell, so it supports NVFP4), large system RAM (well over 64 GB), Windows 11, ComfyUI 0.39.2 (released 2026-10-08, the newest stable release).
+**Target machine:** a 16 GB GPU that supports NVFP4, large system RAM (well over 64 GB), Windows 11, ComfyUI 0.39.2 (released 2026-10-08, the newest stable release).
 **Already installed:** Z-Image-Turbo bf16 (12.3 GB file, about 12.6 GB VRAM in use), BiRefNet, Real-ESRGAN.
 **Research date:** 2026-10-12.
 **Sizes:** taken from Hugging Face file listings, in decimal GB.
@@ -37,9 +37,9 @@
 
 ## 1. Text-to-image
 
-| Model | Params / files | ComfyUI | Fits 16 GB? | Speed (4090/5080 class) | Notes |
+| Model | Params / files | ComfyUI | Fits 16 GB? | Speed (4090 class / test machine) | Notes |
 |---|---|---|---|---|---|
-| **Z-Image-Turbo** (installed) | 6B. bf16 12.3 GB, **int8_convrot 6.2 GB**, **nvfp4 4.5 GB**; TE qwen_3_4b 8.0 GB (fp8_mixed 5.6 / fp4_mixed 3.5). Also a 0.16 GB distill-patch LoRA | Native | Yes. bf16 fits, and int8 or nvfp4 frees about 6–8 GB for a ControlNet | about 2.3 s at 1024², 8 steps on a 4090 [secondary, one repeated claim]. No 5080 figure found | Photoreal and strong for its size. Apache-2.0. NVFP4 is the fast path on Blackwell; its quality loss is [unverified] |
+| **Z-Image-Turbo** (installed) | 6B. bf16 12.3 GB, **int8_convrot 6.2 GB**, **nvfp4 4.5 GB**; TE qwen_3_4b 8.0 GB (fp8_mixed 5.6 / fp4_mixed 3.5). Also a 0.16 GB distill-patch LoRA | Native | Yes. bf16 fits, and int8 or nvfp4 frees about 6–8 GB for a ControlNet | about 2.3 s at 1024², 8 steps on a 4090 [secondary, one repeated claim]. No figure for the test machine's GPU found | Photoreal and strong for its size. Apache-2.0. NVFP4 is the fast path on GPUs that support it; its quality loss is [unverified] |
 | **Qwen-Image-2.1 / 2.1-Turbo** | 7B DiT. bf16 14.2 GB, **int8 7.26 GB**; GGUF Q4_K_M 4.2 GB, Q8_0 7.6 GB (unsloth). TE Qwen3-VL-8B: bf16 17.5 / int8 9.35 / w4a8 6.31 GB. VAE 0.68 GB (RGBA, 64 ch) | Native (v0.37.0) | Yes (int8 DiT and int8 or w4a8 TE) | 4060 Ti 16 GB: about 20 s at 1024² and 25 steps [secondary]. Turbo uses 8 steps, so expect about 3× faster [unverified]. Native output is 2048² | Best typography and editing in this tier. RGBA output. Qwen Research License (non-commercial). **int8 needs PyTorch cu130.** On cu128 one user measured int8 at 4× slower than the Q8 GGUF; it was fixed after updating (GitHub #16470) [verified issue] |
 | **FLUX.2 [klein] 4B** (distilled and base) | 4B. bf16 7.75 GB, **fp8 4.07 GB**; TE qwen_3_4b; VAE flux2-vae 0.34 GB | Native | Easily | About 1.2 s (distilled, 4 steps) and about 17 s (base, 50 steps) on a 5090, with 8.4 / 9.2 GB VRAM [verified: Comfy blog] | Apache-2.0. Generation and editing in one model. Very fast, so good for live previews |
 | **FLUX.2 [klein] 9B** (plus a 9B-KV variant) | 9B. bf16 18.2 GB, **fp8 9.43 GB**, kv-fp8 9.82 GB; TE qwen_3_8b_fp8mixed | Native | fp8 yes. bf16 needs about 19.6 GB [verified] | About 2 s distilled on a 5090 [verified] | FLUX non-commercial license. Better than 4B. The KV variant is faster for multi-reference work [secondary: BFL docs] |
@@ -269,7 +269,7 @@ Use control_context_scale (strength) 0.65–1.0 for Z-Image [verified card] and 
   - The first use of each model loads from NVMe.
   - After that, switching is a RAM→VRAM transfer over PCIe 5.0 of roughly 7–13 GB per model (int8 DiT, plus the TE if it was evicted), which is about 1–3 s.
   - There is no re-read from disk while RAM isn't under pressure.
-  - These timings are estimates [unverified]; no published 5080 measurement was found.
+  - These timings are estimates [unverified]; no published measurement for a 16 GB consumer GPU was found.
 - **Z-Image bf16 at about 12.6 GB and Qwen-2.1 int8 (7.3 + 9.4 GB TE) cannot co-reside.** Expect eviction on every switch.
   - Using **Z-Image int8 (6.2 GB) or nvfp4 (4.5 GB)** with the **Qwen3-VL-8B w4a8 TE (6.3 GB)** reduces thrash.
   - Batching edits by model also helps.
@@ -325,7 +325,7 @@ Everything else is native in 0.39.2.
 | Qwen 2.1 full Turbo (instead of the LoRA) | `qwen_image_2.1_turbo_int8_convrot` | 7.26 GB |
 | Second high-quality T2I / editor | HiDream-O1-Image-Dev fp8 (`hidream_o1_image_dev_fp8_scaled`) | 8.07 GB |
 | Better klein | `flux-2-klein-9b-fp8` + `qwen_3_8b_fp8mixed` | 9.43 GB + TE (size not checked) |
-| Faster Z-Image on Blackwell / less swapping | `z_image_turbo_nvfp4` or `int8_convrot` | 4.5 / 6.2 GB |
+| Faster Z-Image on a GPU that supports NVFP4 / less swapping | `z_image_turbo_nvfp4` or `int8_convrot` | 4.5 / 6.2 GB |
 | Layer decomposition | `qwen-image-layered-Q4_K_M.gguf` + `qwen_image_layered_vae` + `qwen_2.5_vl_7b_fp8_scaled` | 13.2 + 0.25 + 9.4 GB |
 | Qwen-Edit-2511 (if 2.1 is lacking for some edits) | `qwen-image-edit-2511-Q4_K_M.gguf` + Lightning 4-step LoRA | 13.2 + 0.85 GB |
 | Krea 2 aesthetics + regional | `krea2_turbo_nvfp4` + `qwen3vl_4b_fp8_scaled` + `qwen_image_vae` | 7.67 + 5.24 + 0.25 GB |
@@ -335,7 +335,7 @@ Everything else is native in 0.39.2.
 
 ## 13. Open questions and unverified items
 
-- Measured speeds on an RTX 5080 for any of these models. None was found; test locally.
+- Measured speeds on the test machine's 16 GB GPU for any of these models. None was found; test locally.
 - Whether ComfyUI's TAESD preview automatically picks taef1 for Z-Image and taef2 for FLUX.2.
 - How a separate inpaint mask is wired for Qwen-Image-2.1 editing in ComfyUI. The card says masks are supported, but the node wiring wasn't seen because the template JSON fetch failed with a 503.
 - Which node applies the Qwen 2.1 Fun ControlNet: `ZImageFunControlnet` (per the docs) or "Apply Qwen Image DiffSynth ControlNet" (per comfyui-wiki).

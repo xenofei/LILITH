@@ -2,7 +2,7 @@
 
 Date: 2026-10-12
 
-GPU: NVIDIA GeForce RTX 5080 16 GB, driver 610.88 (Windows driver 32.0.16.1088). Qt 6.12.0 + Qt WebEngine 6.140.0. ComfyUI 0.39.2 (frontend 1.53.10, per the plan; the run loaded `*Unsaved Workflow - ComfyUI`).
+GPU: a 16 GB consumer GPU (name and driver version removed). Qt 6.12.0 + Qt WebEngine 6.140.0. ComfyUI 0.39.2 (frontend 1.53.10, per the plan; the run loaded `*Unsaved Workflow - ComfyUI`).
 
 ## 1. Question
 
@@ -15,7 +15,7 @@ GPU: NVIDIA GeForce RTX 5080 16 GB, driver 610.88 (Windows driver 32.0.16.1088).
 | Item | Version |
 |---|---|
 | OS | Windows 11 Pro 10.0.26200 |
-| GPU / driver | NVIDIA GeForce RTX 5080 16 GB, 610.88 (also an AMD Radeon iGPU; Qt picked the RTX 5080) |
+| GPU / driver | 16 GB consumer GPU (also an integrated GPU; Qt picked the 16 GB one) |
 | Rust | rustc / cargo 1.99.0, `stable-x86_64-pc-windows-msvc` |
 | CMake / Ninja | 4.4.4 / 1.13.2 |
 | MSVC | cl 19.44.35227 (VS 2022 Build Tools, toolset 14.44.35207), Windows SDK 10.0.26100 |
@@ -93,7 +93,7 @@ Raw data: (raw output kept privately) (final run 2026-10-12 14:29). The window g
 | Criterion | Result | Evidence (final run) |
 |---|---|---|
 | 1 build | PASS | configure exit 0, build exit 0 (111 Ninja steps, from scratch), **0 warning lines**; no warning flags set in our files |
-| 2 start | PASS | docks open: `canvas`, `counter`, `web`; `{"event":"backend","backend":"D3D11"}`, device "NVIDIA GeForce RTX 5080"; exit 0 |
+| 2 start | PASS | docks open: `canvas`, `counter`, `web`; `{"event":"backend","backend":"D3D11"}`, device "<GPU>" (device name removed); exit 0 |
 | 3 float | PASS | `initialize` ×3 (893×768 → 885×760 floating → 893×768), renderers 1→2→3, each with a new QRhi (`rhi_changed: true`); `float` events show the canvas leave and return to the main window; exit 0, wall 6.4 s |
 | 4 lazy WebEngine | PASS | exe deps: kddockwidgets-qt62, spike_shim, Qt6Quick/Gui/Qml/Core + CRT/system; shim deps: Qt6Quick/Gui/Core + CRT; **no Qt6WebEngine***. Start run: no `webengine_loaded`, `Qt6WebEngineCore.dll` not in process. Web runs: `web_dock_shown` 2294 ms → `webengine_loaded` 2511 ms (down), 2375 → 2597 ms (up); DLL absent at show time in both |
 | 5 ComfyUI down | PASS | `web_load failed net::ERR_CONNECTION_REFUSED` (code -102), `isErrorPage: true`, page `chrome-error://chromewebdata/` "This site can't be reached"; counter 1→2→3 after the failure; 37 heartbeats after it, max gap 281 ms; 0 not-responding polls; exit 0 |

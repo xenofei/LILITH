@@ -14,7 +14,7 @@ Date: 2026-10-12
 | Item | Version |
 |---|---|
 | OS | Windows 11 Pro 10.0.26200, display at 240 Hz (vsync 4.17 ms) |
-| GPU / driver | NVIDIA GeForce RTX 5080 16 GB, 610.88 |
+| GPU / driver | 16 GB consumer GPU |
 | Toolchain | Qt 6.12.0 `msvc2022_64` (threaded render loop, confirmed with `QSG_INFO=1`), Rust 1.99.0, CMake 4.4.4, Ninja 1.13.2, MSVC 19.44.35227, Windows SDK 10.0.26100 |
 | Shader compilers | fxc (SDK 10.0.26100) for DXBC SM 5.0; dxc 1.8.2502.11 with dxil.dll 1.8 (same SDK) for DXIL SM 6.6. Both were already installed; nothing new was installed. |
 | ComfyUI | 0.39.2, frontend 1.53.10, workflow templates 0.11.78, PyTorch 2.11.0+cu128 (venv at `%USERPROFILE%\ComfyUI\.venv`). Started for this spike on `--listen 127.0.0.1 --port 8188` and stopped afterwards. |
@@ -248,7 +248,7 @@ Task 3's benchmark: 60 tiles per frame recomposited, 20 layers, 8K. The table gi
   - Against Task 3's DXBC two-pass it cuts 40.1 %. But single-sm66 vs twopass-sm66 shows that removing the pass is worth about 12 %. The rest is the compiler: dxc DXIL vs fxc DXBC for the same two-pass shaders is 0.754 vs 1.103 ms (−32 %).
   - A one-pass composite with the group in registers (`single`, no read-write) is as fast as the in-place one and stays within ±1. The in-place one is ±2, because it parks the backdrop as RGBA8 in the projection.
 - **fxc accepts the RGBA8 typed UAV load in SM 5.0.** It flags the shader "Typed UAV Load Additional Formats", and `inplace-sm50` runs on D3D11 on this GPU (±2, 0 debug-layer messages).
-  - IMG-030's "D3D11 (SM 5.0) can't read images in place" is therefore a hardware-capability limit, not an API limit. The RTX 5080 reports `TypedUAVLoadAdditionalFormats`.
+  - IMG-030's "D3D11 (SM 5.0) can't read images in place" is therefore a hardware-capability limit, not an API limit. The test machine's GPU reports `TypedUAVLoadAdditionalFormats`.
   - Half-float images were not tested.
 - First rounds after ComfyUI's `/free` were slower (twopass 1.47 ms in round 1, 1.10 ms in rounds 2 and 3), which is why the medians are used.
 
