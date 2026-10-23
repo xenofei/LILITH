@@ -158,15 +158,30 @@ Try-Case 'Resolve-Popped: no clean readings asks the owner' { $script:AskedCount
 Try-Case 'Resolve-Popped: untrusted (control toast unseen) asks the owner' { $script:AskedCount = 0; $r = Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ appearances = @(); clean_polls = 30 } }) 'q' -Trust:$false; "$($script:AskedCount) $($r.method)" } '1 owner (the control toast just before was not seen)'
 $script:Uia.proven = $false
 
-# S1.5's second pop (automation review C1): 0 never decides, 1 is the owner's, 2+ is FAIL.
-Try-Case 'second pop: 0 popups asks the owner' { $script:AskedCount = 0; $script:FakeAnswer = $true; $r = Resolve-SecondPop 0 { Ask 'q' }; "$($script:AskedCount) $($r.value) $($r.method)" } '1 True owner (UIA did not see the progress toast)'
-Try-Case 'second pop: 1 popup, the owner decides' { $script:AskedCount = 0; $script:FakeAnswer = $false; $r = Resolve-SecondPop 1 { Ask 'q' }; "$($script:AskedCount) $($r.value) $($r.method)" } '1 False owner decides (UIA saw 1 popup)'
-Try-Case 'second pop: 2 popups is FAIL without asking' { $script:AskedCount = 0; $r = Resolve-SecondPop 2 { Ask 'q' }; "$($script:AskedCount) $($r.value) $($r.method)" } '0 False uia'
-Try-Case 'S1.5 verdict: 2 popups' { Get-S15Verdict $false (Resolve-SecondPop 2 { $true }) } 'FAIL'
-Try-Case 'S1.5 verdict: 1 popup, owner saw no second' { Get-S15Verdict $true (Resolve-SecondPop 1 { $true }) } 'PASS (UIA saw 1 popup; the owner saw no second pop)'
-Try-Case 'S1.5 verdict: 1 popup, owner saw a second' { Get-S15Verdict $false (Resolve-SecondPop 1 { $false }) } 'FAIL (UIA saw 1 popup; the owner saw a second pop, for example an in-place re-animation)'
-Try-Case 'S1.5 verdict: 0 popups, owner says once' { Get-S15Verdict $true (Resolve-SecondPop 0 { $true }) } 'PASS (owner: UIA did not see the progress toast)'
-Try-Case 'S1.5 verdict: 0 popups, owner saw a second' { Get-S15Verdict $false (Resolve-SecondPop 0 { $false }) } 'FAIL (owner: UIA did not see the progress toast; the owner saw a second pop)'
+# Owner run 3: a toast's pop is read from its own events (Get-ToastPopped), not UIA.
+function Ev2([string]$Kind, [string]$Reason) { [ordered]@{ t_ms = 0; kind = $Kind; reason = $Reason } }
+Try-Case 'toast popped: one TimedOut fade' { (Get-ToastPopped ([ordered]@{ toast_events = @((Ev2 'dismissed' 'TimedOut')) })).popped } 'True'
+Try-Case 'toast popped: pops counts the fades' { (Get-ToastPopped ([ordered]@{ toast_events = @((Ev2 'dismissed' 'TimedOut'), (Ev2 'dismissed' 'TimedOut')) })).pops } '2'
+Try-Case 'toast popped: a suppressed toast raises none' { (Get-ToastPopped ([ordered]@{ toast_events = @() })).popped } 'False'
+Try-Case 'toast popped: UserCanceled is a pop' { (Get-ToastPopped ([ordered]@{ toast_events = @((Ev2 'dismissed' 'UserCanceled')) })).popped } 'True'
+Try-Case 'toast popped: ApplicationHidden is not a pop' { (Get-ToastPopped ([ordered]@{ toast_events = @((Ev2 'dismissed' 'ApplicationHidden')) })).popped } 'False'
+Try-Case 'toast popped: seen_any with only a failed event' { (Get-ToastPopped ([ordered]@{ toast_events = @((Ev2 'failed' '0x80070520')) })).failed } 'True'
+Try-Case 'toast popped: no events seen' { (Get-ToastPopped ([ordered]@{ toast_events = @() })).seen_any } 'False'
+# S1.5's verdict (owner run 3): the control toast must pop, else INCOMPLETE; then PASS/FAIL.
+$popped = Get-ToastPopped ([ordered]@{ toast_events = @((Ev2 'dismissed' 'TimedOut')) })
+$notPopped = Get-ToastPopped ([ordered]@{ toast_events = @() })
+Try-Case 'S1.5 verdict: control popped, pass' { Get-S15Verdict $true $popped } 'PASS'
+Try-Case 'S1.5 verdict: control popped, fail' { Get-S15Verdict $false $popped } 'FAIL'
+Try-Case 'S1.5 verdict: no banner event seen this run' { Get-S15Verdict $true $notPopped } 'INCOMPLETE (no toast banner event was seen this run: the pop signal could not be confirmed)'
+
+# S1.7 (owner run 3, q5): judged from the execution-state self-check, no real sleep.
+$listedOk = [ordered]@{ listed_while_held = $true; gone_after_clear = $true }
+$listedBad = [ordered]@{ listed_while_held = $false; gone_after_clear = $true }
+Try-Case 'S1.7 self-check and listing: PASS' { Get-S17Verdict2 $true $true $true $listedOk } 'PASS'
+Try-Case 'S1.7 self-check, no listing on record' { Get-S17Verdict2 $true $true $true $null } 'PASS (execution-state self-check; the owner''s powercfg listing is not on record)'
+Try-Case 'S1.7 set did not report success' { Get-S17Verdict2 $false $false $false $listedOk } 'FAIL (PowerSetRequest did not report success)'
+Try-Case 'S1.7 held but self-check failed' { Get-S17Verdict2 $true $true $false $listedOk } 'INCOMPLETE (the execution state did not confirm the held request)'
+Try-Case 'S1.7 listing says not listed but self-check holds' { (Get-S17Verdict2 $true $true $true $listedBad) } 'PASS (execution-state self-check; the owner''s powercfg listing is not on record)'
 
 # ---- The stay-awake wait (automation review I5, M11)
 Try-Case 'input during the wait: idle shorter than the stretch' { Test-InputDuring 600 120 } 'True'

@@ -139,6 +139,19 @@ function Get-DeploySuggestions([string]$OwnRepo) {
     @($out)
 }
 
+# A qoffscreen.dll to add to the deploy copy, so the Sandbox can test the offscreen grab. Looked
+# for near the deploy (a sibling of qwindows.dll in its platforms\), then next to a qmake on PATH
+# (a Qt install), then under a QTDIR. No hardcoded path, and nothing is guessed: $null when none
+# is found. Pure but for the file probes.
+function Find-QOffscreen([string]$DeployDir) {
+    $cands = @()
+    $cands += (Join-Path $DeployDir 'platforms\qoffscreen.dll')
+    $qmake = Get-Command qmake -ErrorAction SilentlyContinue
+    if ($qmake) { $cands += (Join-Path (Split-Path (Split-Path $qmake.Source)) 'plugins\platforms\qoffscreen.dll') }
+    if ($env:QTDIR) { $cands += (Join-Path $env:QTDIR 'plugins\platforms\qoffscreen.dll') }
+    @($cands | Where-Object { Test-Path -LiteralPath $_ })
+}
+
 # The spike app's exe in the deploy folder: -QtExe, else app_shell_spike.exe, else the only exe.
 function Resolve-QtExe([string]$Dir, [string]$Given) {
     if ($Given) { return $Given }
@@ -369,7 +382,7 @@ $Judges = [ordered]@{
     foreground = { param($d) (P $d 'precondition_met') -eq $true -and $null -ne (P $d 'a_pid') -and (P $d 'foreground_pid_after_handoff') -eq (P $d 'a_pid') }
     power      = { param($d) (P $d 'listed') -eq $true }
     rust       = { param($d) $e = P $d 'exit_with_dlls'; $e -is [ValueType] -and $e -eq 0 }
-    qt         = { param($d) (P (P $d 'offscreen') 'nonflat') -eq $true -and (P (P $d 'onscreen') 'nonflat') -eq $true }
+    qt         = { param($d) $on = P $d 'onscreen'; $off = P $d 'offscreen'; (P $on 'available') -eq $true -and (P $on 'nonflat') -eq $true -and ((P $off 'available') -eq $false -or (P $off 'nonflat') -eq $true) }
 }
 
 function Judge-Run([string]$Res, [string]$Sfx = '') {
@@ -599,6 +612,17 @@ if ($null -eq $script:HostPower.Process) { Start-HostPowerWatch -Hold:$KeepAwake
 $deployCopy = Join-Path $Build 'deploy-copy'
 New-EmptyDir $deployCopy
 Copy-Item (Join-Path $DeployDir '*') $deployCopy -Recurse -Force
+# The offscreen grab needs qoffscreen.dll; Task 0's trimmed deploy ships only qwindows.dll (owner
+# run 3). If one can be found near the host's Qt, it is copied into the deploy copy so the Sandbox
+# can test offscreen too; if not, the Sandbox records offscreen as not shipped (no dialog, m-Qt).
+$offSrc = @(Find-QOffscreen $DeployDir) | Select-Object -First 1
+if ($offSrc) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $deployCopy 'platforms') | Out-Null
+    Copy-Item -LiteralPath $offSrc -Destination (Join-Path $deployCopy 'platforms\qoffscreen.dll') -Force
+    Say "Added qoffscreen.dll to the deploy copy (from $offSrc)"
+} else {
+    Say 'No qoffscreen.dll found near the deploy; the Sandbox tests the on-screen grab only.' 'Yellow'
+}
 
 Assert-NoSandboxRunning
 

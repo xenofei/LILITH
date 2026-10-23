@@ -19,14 +19,17 @@ use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
-use windows::Win32::System::Console::GetConsoleWindow;
+
+use std::thread;
+use std::time::Duration;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::TpmBaseServices::{TPM_DEVICE_INFO, Tbsi_GetDeviceInfo};
 use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
 use windows::core::{Array, HSTRING};
 use windows_future::IAsyncOperation;
 use winshell::args::Args;
 use winshell::text::hex;
-use winshell::win::init_winrt;
+use winshell::win::{self, init_winrt};
 use winshell::{CHALLENGE, CREDENTIAL_NAME};
 
 fn main() {
@@ -37,7 +40,7 @@ fn main() {
         Some("create") => create(),
         Some("sign") => sign(args.num("count", 5)),
         Some("tpm") => tpm(),
-        Some("verify") => verify(),
+        Some("verify") => verify(&args),
         Some("delete") => delete(),
         Some("exists") => exists(),
         Some("dpapi") => dpapi(),
@@ -156,28 +159,93 @@ fn verification_name(r: UserConsentVerificationResult) -> &'static str {
     }
 }
 
-fn verify() -> Value {
-    // SAFETY: GetConsoleWindow is a plain query; the interop call gets a valid HWND (or null)
-    // and a message HSTRING that outlives it.
-    let r = (|| -> windows::core::Result<UserConsentVerificationResult> {
-        let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
-        let hwnd = unsafe { GetConsoleWindow() };
-        let op: IAsyncOperation<UserConsentVerificationResult> = unsafe {
-            interop.RequestVerificationForWindowAsync(
-                hwnd,
-                &HSTRING::from("LILITH spike 11: confirm it is you (S1.8 e)"),
-            )?
-        };
-        op.join()
-    })();
-    // SAFETY: plain query.
-    let hwnd = unsafe { GetConsoleWindow() }.0 as isize;
-    match r {
-        Ok(v) => json!({ "check": "verify", "console_hwnd": hwnd, "result": verification_name(v) }),
-        Err(err) => {
-            json!({ "check": "verify", "console_hwnd": hwnd, "result": "error", "error": e(err) })
+// The class of the Windows Hello / Windows Security dialog that hosts the consent and PIN prompt.
+const CREDENTIAL_WINDOW_CLASS: &str = "Credential Dialog Xaml Host";
+
+fn verify(args: &Args) -> Value {
+    // S1.8 (owner run 3, q3): the prompt must come to the front of any app, so a desktop app owns
+    // it through a window it foregrounds. The owner window is created and raised with the hand-off
+    // winshell-app proved (AllowSetForegroundWindow + SetForegroundWindow), then passed to
+    // IUserConsentVerifierInterop::RequestVerificationForWindowAsync as the owner HWND. -Owner-hwnd
+    // uses an existing window instead (the console); -Topmost / -Fullscreen shape the owner window
+    // for the placement scenarios.
+    let owner = match args.num("owner-hwnd", 0) as isize {
+        0 => win::create_owner_window(
+            "LILITH spike 11 (S1.8)",
+            args.has("topmost"),
+            args.has("fullscreen"),
+        ),
+        h => {
+            win::raise_window(h);
+            h
         }
+    };
+    let probe = args.has("probe");
+    let blocker = args.num("blocker-hwnd", 0) as isize;
+    let msg = "LILITH spike 11: confirm it is you (S1.8 e)";
+
+    // SAFETY: the interop factory and the owner HWND are valid; the message HSTRING outlives the
+    // call. The returned IAsyncOperation is cancelled below in probe mode.
+    let started: windows::core::Result<IAsyncOperation<UserConsentVerificationResult>> = (|| {
+        let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+        unsafe {
+            interop.RequestVerificationForWindowAsync(HWND(owner as *mut _), &HSTRING::from(msg))
+        }
+    })();
+    let op = match started {
+        Ok(op) => op,
+        Err(err) => {
+            return json!({ "check": "verify", "owner_hwnd": owner, "result": "error", "error": e(err) });
+        }
+    };
+
+    if !probe {
+        // The real gesture: wait for the owner to complete the Hello prompt.
+        return match op.join() {
+            Ok(v) => {
+                json!({ "check": "verify", "owner_hwnd": owner, "result": verification_name(v) })
+            }
+            Err(err) => {
+                json!({ "check": "verify", "owner_hwnd": owner, "result": "error", "error": e(err) })
+            }
+        };
     }
+
+    // Probe mode (no human): wait for the Hello dialog to appear, record where it is in the
+    // z-order relative to the owner and the blocker and whether it is the foreground window, then
+    // cancel the operation so the prompt closes. Verifies placement without a Hello gesture.
+    let mut placement = json!({ "found": false });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let dlg = win::window_of_class(CREDENTIAL_WINDOW_CLASS);
+        if dlg != 0 {
+            let fg = win::foreground_info();
+            let dlg_z = win::window_z_rank(dlg);
+            let blocker_z = if blocker != 0 {
+                win::window_z_rank(blocker)
+            } else {
+                -1
+            };
+            placement = json!({
+                "found": true, "dialog_hwnd": dlg, "dialog_class": CREDENTIAL_WINDOW_CLASS,
+                "is_foreground": fg["fg_hwnd"].as_i64() == Some(dlg as i64),
+                "dialog_z": dlg_z, "blocker_hwnd": blocker, "blocker_z": blocker_z,
+                "above_blocker": blocker == 0 || (dlg_z >= 0 && (blocker_z < 0 || dlg_z < blocker_z)),
+            });
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = op.Cancel();
+    let result = match op.join() {
+        Ok(v) => verification_name(v).to_string(),
+        Err(err) => format!("error: {}", e(err)),
+    };
+    json!({
+        "check": "verify", "mode": "probe", "owner_hwnd": owner,
+        "topmost": args.has("topmost"), "fullscreen": args.has("fullscreen"),
+        "placement": placement, "result_after_cancel": result,
+    })
 }
 
 fn delete() -> Value {

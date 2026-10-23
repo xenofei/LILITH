@@ -37,9 +37,10 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SetForegroundWindow, SetTimer, ShowWindow, SwitchToThisWindow, TranslateMessage, WM_APP,
-    WM_DESTROY, WM_TIMER, WNDCLASSW, WS_EX_LEFT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetMessageW, GetSystemMetrics, HWND_TOPMOST, KillTimer, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, SwitchToThisWindow, TranslateMessage, WM_APP, WM_DESTROY,
+    WM_TIMER, WNDCLASSW, WS_EX_LEFT, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 use winshell::PIPE_NAME;
@@ -54,6 +55,10 @@ const TIMER_LAUNCH: usize = 3;
 
 static MAIN: AtomicIsize = AtomicIsize::new(0);
 static FALLBACK: AtomicBool = AtomicBool::new(false);
+// A blocker window's style, for S1.8's placement scenarios: an ordinary foreground window, a
+// topmost one, or a borderless fullscreen one. The Hello prompt must come in front of each.
+static TOPMOST: AtomicBool = AtomicBool::new(false);
+static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 static PHASE: Mutex<String> = Mutex::new(String::new());
 static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static LAUNCH_URL: Mutex<String> = Mutex::new(String::new());
@@ -86,6 +91,11 @@ fn main() {
 
     if args.has("blocker") {
         *LAUNCH_URL.lock().expect("lock") = args.get_or("launch-url", "").to_string();
+        TOPMOST.store(
+            args.has("topmost") || args.has("fullscreen"),
+            Ordering::SeqCst,
+        );
+        FULLSCREEN.store(args.has("fullscreen"), Ordering::SeqCst);
         run_window(
             "winshell blocker",
             "blocker",
@@ -361,15 +371,39 @@ fn run_window(title: &str, phase: &str, exit_after_secs: u64, launch_after_ms: u
             ..Default::default()
         };
         RegisterClassW(&class);
+        let topmost = TOPMOST.load(Ordering::SeqCst);
+        let fullscreen = FULLSCREEN.load(Ordering::SeqCst);
+        let ex = if topmost {
+            WS_EX_LEFT | WS_EX_TOPMOST
+        } else {
+            WS_EX_LEFT
+        };
+        let (style, x, y, w, h) = if fullscreen {
+            (
+                WS_POPUP | WS_VISIBLE,
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            )
+        } else {
+            (
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                480,
+                240,
+            )
+        };
         let hwnd = match CreateWindowExW(
-            WS_EX_LEFT,
+            ex,
             w!("winshell-app"),
             &HSTRING::from(title),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            480,
-            240,
+            style,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(instance.into()),
@@ -383,6 +417,17 @@ fn run_window(title: &str, phase: &str, exit_after_secs: u64, launch_after_ms: u
         };
         MAIN.store(hwnd.0 as isize, Ordering::SeqCst);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        if topmost || fullscreen {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
         log_event(
             "window",
             json!({ "hwnd": hwnd.0 as isize, "title": title, "role": phase }),

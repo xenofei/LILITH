@@ -71,7 +71,8 @@ namespace SpikeUi {
 }
 '@
 }
-$script:Uia.ready = $true
+# run-spike and run-sandbox dot-source uia.ps1 (so $script:Uia exists); run-all does not.
+if (Get-Variable -Name Uia -Scope Script -ErrorAction SilentlyContinue) { $script:Uia.ready = $true }
 
 # ---------------------------------------------------------------- the clock, the owner, programs
 
@@ -333,6 +334,13 @@ function Invoke-SimTool([string[]]$Argv) {
             return [pscustomobject]@{ written = $true; error = $null }
         }
         'shortcut-read' { return $script:SimShortcut }
+        'shellexec' {
+            # ShellExecute of the lilspike scheme: winshell-app starts with the URL as one quoted
+            # argument, the same a toast click delivers (S1.3's activation grammar).
+            $url = $a[1]
+            Add-SimEvent ([ordered]@{ kind = 'start'; pid = (New-SimPid); cmdline = ('"' + $App + '" "' + $url + '"'); rest = ('"' + $url + '"') })
+            return [pscustomobject]@{ shell_execute = 42 }
+        }
         'programs-dir' { return [pscustomobject]@{ programs = (Join-Path $SimDir 'programs') } }
         'setting' { return [pscustomobject]@{ setting = 'Enabled' } }
         'token' { return [pscustomobject]@{ elevated = $false; integrity_rid = 8192; integrity = 'Medium' } }
@@ -356,25 +364,30 @@ function Invoke-SimSpawn([string[]]$Argv) {
     $out = Get-SimArg $a 'out'
     $name = [IO.Path]::GetFileNameWithoutExtension($out)
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $watch = ($a -contains '--watch-secs')
+    # The toast's own events, as the core returns them with --watch-secs: a popped banner fades out
+    # (dismissed/TimedOut); a SuppressPopup toast raises none.
+    $popEvents = { param($suppress) @(if ($watch) { if (-not $suppress) { , [ordered]@{ t_ms = $now + 6000; kind = 'dismissed'; reason = 'TimedOut' } } }) }
     switch ($cmd) {
         'toast' {
             $tag = Get-SimArg $a 'tag'
+            $suppress = ($a -contains '--suppress')
             $script:SimHistory[$tag] = $true
-            $script:SimLastToast = @{ name = $name; suppress = ($a -contains '--suppress') }
+            $script:SimLastToast = @{ name = $name; suppress = $suppress }
             $script:SimTrial = $name
             if ($SimFor -eq 'run-spike') { [void](Add-SimKey $NotifySettingsKey) }   # Windows adds it on the first toast
-            $doc = [ordered]@{ command = 'toast'; tag = $tag; posted = $true; setting = 'Enabled'; error = $null }
+            $doc = [ordered]@{ command = 'toast'; tag = $tag; posted = $true; setting = 'Enabled'; error = $null; shown_ms = $now; toast_events = (& $popEvents $suppress) }
         }
         'progress' {
             $script:SimHistory['j_spike'] = $true
             $script:SimLastToast = @{ name = $name; suppress = $false }
             $script:SimTrial = $name
-            $doc = [ordered]@{ command = 'progress'; posted = $true; all_succeeded = $true; updates = @(1..20 | ForEach-Object { [ordered]@{ seq = $_; result = 'Succeeded' } }) }
+            $doc = [ordered]@{ command = 'progress'; posted = $true; all_succeeded = $true; updates = @(1..20 | ForEach-Object { [ordered]@{ seq = $_; result = 'Succeeded' } }); toast_events = (& $popEvents $false) }
         }
         'update' { $doc = [ordered]@{ command = 'update'; seq = 100; result = $(if ($script:SimHistory.ContainsKey('j_spike')) { 'Succeeded' } else { 'NotificationNotFound' }) } }
         'remove-repost' {
             $script:SimLastToast = @{ name = $name; suppress = $false }
-            $doc = [ordered]@{ command = 'remove-repost'; removed = $true; posted = $true }
+            $doc = [ordered]@{ command = 'remove-repost'; removed = $true; posted = $true; toast_events = (& $popEvents $false) }
         }
         'power' {
             $api = Get-SimArg $a 'api'
@@ -403,6 +416,17 @@ function HelloCmd {
         'sign' { return [pscustomobject]@{ signatures = @(1..5 | ForEach-Object { [pscustomobject]@{ status = 'Success'; signature_hex = 'ab12' } }) } }
         'delete' { return [pscustomobject]@{ deleted = $true } }
         'exists' { return [pscustomobject]@{ status = 'NotFound' } }
+        'verify' {
+            # The placement probe: the Hello prompt comes to the front over the blocker and is
+            # cancelled (no gesture). The real behaviour is proven by first real use.
+            if ($a -contains '--probe') {
+                $blk = Get-SimArg $a 'blocker-hwnd'
+                return [pscustomobject]@{ check = 'verify'; mode = 'probe'; owner_hwnd = (New-SimPid)
+                    placement = [pscustomobject]@{ found = $true; dialog_hwnd = (New-SimPid); is_foreground = $true; above_blocker = $true; blocker_hwnd = [int64]$blk }
+                    result_after_cancel = 'Canceled' }
+            }
+            return [pscustomobject]@{ check = 'verify'; result = 'Verified' }
+        }
     }
     throw "simulation: unexpected winshell-hello $($a -join ' ')"
 }
@@ -425,7 +449,9 @@ function Start-Process {
         if ($argv -contains '--blocker') {
             $script:SimBlockers++
             $hwnd = 7000 + $script:SimBlockers
-            # The second S1.4 blocker does not take the front by itself: the script clicks it.
+            # A 'window' event (S1.8's placement probe reads the blocker's hwnd from it), and a
+            # 'front_check' (S1.4's old path, kept).
+            Add-SimEvent ([ordered]@{ kind = 'window'; pid = $id; hwnd = $hwnd; role = 'blocker' })
             Add-SimEvent ([ordered]@{ kind = 'front_check'; pid = $id; phase = 'start'; is_foreground = ($script:SimBlockers -ne 2); has_focus = ($script:SimBlockers -ne 2); hwnd = $hwnd })
             $script:SimWindows = @($script:SimWindows) + @(@{ pid = $id; hwnd = $hwnd; class = 'WinshellBlocker'; name = 'winshell blocker' })
             $script:SimTopAtPoint = $hwnd
@@ -605,7 +631,7 @@ function Assert-NoSandboxRunning { if (@(Get-SandboxPids).Count -gt 0) { throw '
 function Write-SimItems([string]$Res, [string]$Sfx) {
     Write-SimJson (Join-Path $Res "toast$Sfx.json") ([ordered]@{ setting = 'Enabled'; history_has_tag = $true; popup = [ordered]@{ method = 'uia'; appearances = @([ordered]@{ from_s = 1; to_s = 5 }) }; popup_seen = $true; pass = $true })
     Write-SimJson (Join-Path $Res "foreground$Sfx.json") ([ordered]@{ precondition_met = $true; a_pid = 4242; foreground_pid_after_handoff = 4242; pass = $true })
-    Write-SimJson (Join-Path $Res "qt$Sfx.json") ([ordered]@{ offscreen = [ordered]@{ nonflat = $true }; onscreen = [ordered]@{ nonflat = $true }; rhi_backend = 'D3D11'; pass = $true })
+    Write-SimJson (Join-Path $Res "qt$Sfx.json") ([ordered]@{ platform_plugins = @('qwindows.dll', 'qoffscreen.dll'); offscreen = [ordered]@{ available = $true; nonflat = $true }; onscreen = [ordered]@{ available = $true; nonflat = $true }; rhi_backend = 'D3D11'; pass = $true })
 }
 
 function Start-SimSandbox([string]$WsbFile, $Launcher) {

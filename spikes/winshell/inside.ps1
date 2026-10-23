@@ -376,16 +376,32 @@ function Get-Backend([string]$Text) {
     if ($m.Success) { $m.Groups[1].Value } else { $null }
 }
 
-function Start-Qt([string]$Exe, [string]$Arguments, [string]$Name) {
+# The Qt platform plugin a launch needs, by name (owner run 3 analysis: Task 0's trimmed deploy
+# ships only platforms\qwindows.dll; an offscreen launch with no qoffscreen.dll made Qt 6.12 show
+# a modal "no Qt platform plugin could be initialized" box and block the unattended run). Qt shows
+# that box when the build is release and no console is attached, whatever QT_FORCE_STDERR_LOGGING
+# is (qguiapplication.cpp init_platform: MessageBox when !isDebugBuild() && !GetConsoleWindow()).
+# So the plugin DLL is checked before the launch: a missing one is recorded and the app is never
+# started, and QT_QPA_PLATFORM is set only for a plugin that is present.
+function Get-QtPlatformDll([string]$Deploy, [string]$Platform) {
+    Join-Path $Deploy "platforms\q$Platform.dll"
+}
+
+# Starts the Qt app with QT_QPA_PLATFORM = $Platform ('' leaves it unset, the default 'windows').
+# QT_FORCE_STDERR_LOGGING = 1 keeps non-fatal Qt logging off the debug channel and on stderr.
+function Start-Qt([string]$Exe, [string]$Arguments, [string]$Name, [string]$Platform) {
     $err = Join-Path $Work "$Name-stderr.txt"
     $env:QSG_INFO = '1'
     $env:QT_FORCE_STDERR_LOGGING = '1'
-    $sp = @{ FilePath = $Exe; PassThru = $true; RedirectStandardError = $err; RedirectStandardOutput = (Join-Path $Work "$Name-stdout.txt") }
-    if ($Arguments) { $sp.ArgumentList = $Arguments }
-    $p = Start-Process @sp
-    # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no handle
-    # until .Handle is read (fix round 4, m3).
-    [void]$p.Handle
+    if ($Platform) { $env:QT_QPA_PLATFORM = $Platform }
+    try {
+        $sp = @{ FilePath = $Exe; PassThru = $true; RedirectStandardError = $err; RedirectStandardOutput = (Join-Path $Work "$Name-stdout.txt") }
+        if ($Arguments) { $sp.ArgumentList = $Arguments }
+        $p = Start-Process @sp
+        # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no handle
+        # until .Handle is read (fix round 4, m3).
+        [void]$p.Handle
+    } finally { if ($Platform) { Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue } }
     [pscustomobject]@{ Process = $p; Stderr = $err }
 }
 
@@ -396,49 +412,70 @@ function Item-Qt([string]$Name) {
         return
     }
     $exe = Join-Path $deploy $Config.qt_exe
-    # Offscreen: the app grabs its own window (QT_QPA_PLATFORM=offscreen).
+    $platforms = Join-Path $deploy 'platforms'
+    $hasWindows = Test-Path -LiteralPath (Get-QtPlatformDll $deploy 'windows')
+    $hasOffscreen = Test-Path -LiteralPath (Get-QtPlatformDll $deploy 'offscreen')
+    $plugins = @(if (Test-Path -LiteralPath $platforms) { Get-ChildItem -LiteralPath $platforms -Filter *.dll -File | ForEach-Object { $_.Name } })
+
+    # Offscreen (QT_QPA_PLATFORM=offscreen): only when qoffscreen.dll is in the deploy; otherwise
+    # recorded as not shipped, and never launched (so no modal error).
     $offPng = Join-Path $Work "$Name-offscreen.png"
-    Remove-Item $offPng -ErrorAction SilentlyContinue
-    $env:QT_QPA_PLATFORM = 'offscreen'
-    $q = Start-Qt $exe ($Config.qt_grab_args -replace '\{png\}', $offPng) "$Name-offscreen"
-    if (-not $q.Process.WaitForExit(60000)) { Stop-PinnedProcess $q.Process }   # pinned in Start-Qt (its handle read at once)
-    Remove-Item Env:\QT_QPA_PLATFORM
-    $offErr = $(if (Test-Path $q.Stderr) { Get-Content -Raw $q.Stderr } else { '' })
-    $off = Get-GrabStats $offPng
-    $off.exit = $(if ($q.Process.HasExited) { $q.Process.ExitCode } else { 'killed' })
-    $off.backend = Get-Backend $offErr
-    # On the Sandbox's own screen: a visible window, captured from the screen.
-    $onPng = Join-Path $Work "$Name-onscreen.png"
-    $q2 = Start-Qt $exe '' "$Name-onscreen"
-    Start-Sleep -Seconds 10
-    $q2.Process.Refresh()
-    $hwnd = $q2.Process.MainWindowHandle
-    $rect = New-Object Spike.Native+RECT
-    $on = [ordered]@{ hwnd = [int64]$hwnd }
-    if ($hwnd -ne [IntPtr]::Zero -and [Spike.Native]::GetWindowRect($hwnd, [ref]$rect)) {
-        Add-Type -AssemblyName System.Drawing
-        $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
-        $bmp = New-Object System.Drawing.Bitmap $w, $h
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
-        $bmp.Save($onPng, [System.Drawing.Imaging.ImageFormat]::Png)
-        $g.Dispose(); $bmp.Dispose()
-        $on = Get-GrabStats $onPng
-        $on.hwnd = [int64]$hwnd
+    $offErr = ''
+    if ($hasOffscreen) {
+        Remove-Item $offPng -ErrorAction SilentlyContinue
+        $q = Start-Qt $exe ($Config.qt_grab_args -replace '\{png\}', $offPng) "$Name-offscreen" 'offscreen'
+        if (-not $q.Process.WaitForExit(60000)) { Stop-PinnedProcess $q.Process }   # pinned in Start-Qt
+        $offErr = $(if (Test-Path $q.Stderr) { Get-Content -Raw $q.Stderr } else { '' })
+        $off = Get-GrabStats $offPng
+        $off.available = $true
+        $off.exit = $(if ($q.Process.HasExited) { $q.Process.ExitCode } else { 'killed' })
+        $off.backend = Get-Backend $offErr
     } else {
-        $on.nonflat = $false
-        $on.error = 'no main window'
+        $off = [ordered]@{ available = $false; nonflat = $false; reason = 'qoffscreen.dll not in the deploy folder''s platforms\; offscreen grab not tested' }
     }
-    Stop-PinnedProcess $q2.Process   # pinned in Start-Qt (its handle read at once)
-    Start-Sleep -Seconds 1
-    $onErr = $(if (Test-Path $q2.Stderr) { Get-Content -Raw $q2.Stderr } else { '' })
-    $on.backend = Get-Backend $onErr
+
+    # On the Sandbox's own screen: a visible window (the default 'windows' plugin), captured with
+    # CopyFromScreen. Only when qwindows.dll is present; otherwise recorded, never launched.
+    $onPng = Join-Path $Work "$Name-onscreen.png"
+    $onErr = ''
+    if ($hasWindows) {
+        $q2 = Start-Qt $exe '' "$Name-onscreen" ''
+        Start-Sleep -Seconds 10
+        $q2.Process.Refresh()
+        $hwnd = $q2.Process.MainWindowHandle
+        $rect = New-Object Spike.Native+RECT
+        $on = [ordered]@{ available = $true; hwnd = [int64]$hwnd }
+        if ($hwnd -ne [IntPtr]::Zero -and [Spike.Native]::GetWindowRect($hwnd, [ref]$rect)) {
+            Add-Type -AssemblyName System.Drawing
+            $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
+            $bmp = New-Object System.Drawing.Bitmap $w, $h
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+            $bmp.Save($onPng, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            $on = Get-GrabStats $onPng
+            $on.available = $true
+            $on.hwnd = [int64]$hwnd
+        } else {
+            $on.nonflat = $false
+            $on.error = 'no main window'
+        }
+        Stop-PinnedProcess $q2.Process   # pinned in Start-Qt
+        Start-Sleep -Seconds 1
+        $onErr = $(if (Test-Path $q2.Stderr) { Get-Content -Raw $q2.Stderr } else { '' })
+        $on.backend = Get-Backend $onErr
+    } else {
+        $on = [ordered]@{ available = $false; nonflat = $false; reason = 'qwindows.dll not in the deploy folder''s platforms\; on-screen grab not tested' }
+    }
+
     foreach ($png in $offPng, $onPng) { if (Test-Path $png) { Copy-Item $png $Out -Force } }
+    # The bar is the on-screen grab (the Sandbox has its own screen); offscreen counts when its
+    # plugin ships. A platform plugin that is absent is recorded, never a dialog.
     Write-Result $Name ([ordered]@{
-        exe = $exe; offscreen = $off; onscreen = $on
+        exe = $exe; platform_plugins = $plugins; offscreen = $off; onscreen = $on
         rhi_backend = $(if ($on.backend) { $on.backend } else { $off.backend })
         stderr_offscreen = $offErr; stderr_onscreen = $onErr
-        pass = ([bool]$off.nonflat -and [bool]$on.nonflat)
+        pass = ([bool]$on.available -and [bool]$on.nonflat -and ($off.available -eq $false -or [bool]$off.nonflat))
     })
 }
 

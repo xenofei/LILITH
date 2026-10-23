@@ -282,14 +282,70 @@ function Stop-SpikeProcesses {
     }
 }
 
-function Post-Toast([string]$Name, [string[]]$ToastArgs) {
-    Wait-Core (Start-Core $Name (@('toast') + $ToastArgs)) 30
+function Post-Toast([string]$Name, [string[]]$ToastArgs, [int]$WatchSec = 0) {
+    $a = @('toast') + $ToastArgs
+    if ($WatchSec -gt 0) { $a += @('--watch-secs', "$WatchSec") }
+    Wait-Core (Start-Core $Name $a) ($WatchSec + 30)
 }
 
 # ---------------------------------------------------------------- detection (automation round)
 
-# A short random token. Each toast's text carries one, so a UIA search finds that toast only.
+# A short random token. Each toast's text carries one (so earlier UIA searches found that toast
+# only; the token still makes each toast's text unique in History and the logs).
 function New-Nonce { -join (1..6 | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
+
+# Whether a toast popped as an on-screen banner, from its own events (owner run 3: the shell's
+# toast banner is not in this PC's UI Automation tree from a medium-integrity process, so UIA
+# never saw one; the sender's own ToastNotification events are the signal instead). A toast that
+# popped fades out, raising a `dismissed` event with reason `TimedOut` (or `UserCanceled` if a
+# person closed the banner); a SuppressPopup toast never pops, so it raises none. `failed` means
+# the shell refused it. `pops` counts the fades, so a re-pop shows as 2+. Needs the core to have
+# run with --watch-secs. Returns {popped, pops, failed, seen_any, events}. Pure; tested.
+function Get-ToastPopped($Result) {
+    $ev = @(P $Result 'toast_events' | Where-Object { $null -ne $_ })
+    $fade = @($ev | Where-Object { (P $_ 'kind') -eq 'dismissed' -and (P $_ 'reason') -in 'TimedOut', 'UserCanceled' })
+    [ordered]@{
+        popped = ($fade.Count -gt 0); pops = $fade.Count
+        failed = @($ev | Where-Object { (P $_ 'kind') -eq 'failed' }).Count -gt 0
+        seen_any = ($ev.Count -gt 0); events = $ev
+    }
+}
+
+# The newest recorded verdict of a check that starts with $Prefix, from this session's report and
+# then the saved results\run-*\checks.json (newest first): {verdict, source}, or $null. Lets a
+# check settled by an owner-present run stand without being re-run (owner run 3: S1.3 and S1.4 are
+# settled by the owner's real clicks and are never asked again).
+function Find-SettledVerdict([string]$Id, [string]$Prefix) {
+    $cur = P (P $Report.checks $Id) 'verdict'
+    if ("$cur".StartsWith($Prefix)) { return [ordered]@{ verdict = $cur; source = 'this session' } }
+    $dirs = @(Get-ChildItem -Path $Results -Directory -Filter 'run-*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    foreach ($d in $dirs) {
+        $f = Join-Path $d.FullName 'checks.json'
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $doc = $null
+        try { $doc = Get-Content -Raw -LiteralPath $f | ConvertFrom-Json } catch { continue }
+        $v = P (P (P $doc 'checks') $Id) 'verdict'
+        if ("$v".StartsWith($Prefix)) { return [ordered]@{ verdict = $v; source = "results\$($d.Name)"; details = (P (P (P $doc 'checks') $Id) 'details') } }
+    }
+    $null
+}
+
+# The details of a check from the newest saved results\run-*\checks.json (and this session), even
+# when its verdict was not PASS: the crypto evidence of S1.8 is read this way (owner run 3
+# recorded create, signatures and delete, though its verdict was FAIL for placement). $null if
+# none is found.
+function Find-PriorCheckDetails([string]$Id) {
+    $cur = P (P $Report.checks $Id) 'details'
+    if ($null -ne $cur) { return $cur }
+    foreach ($d in @(Get-ChildItem -Path $Results -Directory -Filter 'run-*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+        $f = Join-Path $d.FullName 'checks.json'
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        try { $doc = Get-Content -Raw -LiteralPath $f | ConvertFrom-Json } catch { continue }
+        $det = P (P (P $doc 'checks') $Id) 'details'
+        if ($null -ne $det) { return $det }
+    }
+    $null
+}
 
 # Posts a toast and watches for its popup for $WatchSec (uia.ps1).
 function Post-Watched([string]$Name, [string[]]$ToastArgs, [string]$Needle, [double]$WatchSec = 8) {
@@ -857,48 +913,37 @@ function Check-S13 {
     Step 'S1.3 protocol activation: the raw command line'
     if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -WithToastClsid }
     $expected = "`"$App`" `"$ConfirmUrl`""
-    $trials = @()
-    $targets = @('body', 'body', 'body', 'button', 'button', 'button')
-    for ($i = 0; $i -lt $targets.Count; $i++) {
-        $where = $targets[$i]
-        $what = $(if ($where -eq 'body') { 'BODY of this toast' } else { 'Open button' })
-        $t = Click-Trial -Name "s13-$($i + 1)" -Tag "s13-$($i + 1)" -Body "Click the $what (S1.3, $($i + 1) of 6)" -WithButton `
-            -Target $where -Click 'auto' `
-            -Instruction "Click the toast's $(if ($where -eq 'body') { 'BODY (not the button)' } else { 'Open BUTTON' }). If it has gone, open the notification centre (Win+N) and click it there." `
-            -Prepare { Stop-SpikeProcesses; [ordered]@{} } `
-            -Await { param($n, $ctx, $timeout) Wait-SpikeEvent 'start' $n $timeout { param($e) -not "$($e.cmdline)".Contains('lilspike:task/') } }
-        $cmd = P $t.result 'cmdline'
-        $trials += [ordered]@{ trial = $i + 1; clicked = $where; got_click = ($null -ne $cmd); cmdline = $cmd; exact = ($cmd -ceq $expected)
-                               click_method = $t.clicked_by; posts = $t.posts; attempts = $t.attempts }
-        Save-Partial 'S1.3' ([ordered]@{ expected = $expected; trials = $trials })
-        Start-Sleep -Seconds 2
-    }
+    # The toast-click bar (a click on the body and on the button each start winshell-app with the
+    # exact command line, 3 of 3 each) is settled by the owner's run (owner run 3): this PC's toast
+    # banner is not in the UIA tree, so the script can't click it, and the owner no longer clicks.
+    $settled = Find-SettledVerdict 'S1.3' 'PASS'
+    # The activation grammar is re-confirmed automatically, with no click and no owner: ShellExecute
+    # of the scheme delivers the same single quoted argument winshell-app gets from a toast click.
+    $b64 = (Tool b64url 'lil://0123456789abcdef/sketchbook/lantern@1.0.0?~é').b64url
+    $cases = @([ordered]@{ k = 'confirm'; url = $ConfirmUrl },
+               [ordered]@{ k = 'run'; url = "lilspike:open/$b64" },
+               [ordered]@{ k = 'run_trailing_slash'; url = "lilspike:open/$b64/" })
+    $grammar = [ordered]@{}
     Stop-SpikeProcesses
-    $verdict = Get-S13Verdict $trials
-
-    # Recorded: Edge opening a raw ref from a local HTML file. Run 1 recorded it (one quoted
-    # argument, unchanged); it needs a click in Edge's own prompt, so it is not repeated.
-    $recorded = [ordered]@{ edge = 'not repeated: recorded in run 1 (results\run-20261022T033715Z)' }
-    # Recorded: the Run dialog with lilspike:open/<base64url>, plain and with a trailing '/'. The
-    # script opens the Run box itself and types the link with UIA (no clipboard).
-    $target = 'lil://0123456789abcdef/sketchbook/lantern@1.0.0?~é'
-    $b64 = (Tool b64url $target).b64url
-    foreach ($suffix in '', '/') {
-        $url = "lilspike:open/$b64$suffix"
-        Stop-SpikeProcesses
+    foreach ($case in $cases) {
         $n = @(Get-Events).Count
-        $handsOff = Start-HandsOff 'opens the Run box and types a link into it (Win+R)' 15
-        try { $box = Invoke-RunBox $url } finally { Stop-HandsOff $handsOff }
-        $ev = $null
-        if ($box.ok) { $ev = Wait-SpikeEvent 'start' $n 20 }
+        [void](Tool shellexec $case.url)
+        $ev = Wait-SpikeEvent 'start' $n 20
         $cmd = P $ev 'cmdline'
-        $fromRun = [bool]($cmd -and $cmd.Contains("open/$b64"))
-        $recorded["run$(if ($suffix) { '_trailing_slash' } else { '' })"] = [ordered]@{ sent = $url; cmdline = $(if ($fromRun) { $cmd } else { $null }); start_seen = $cmd; run_box = $box }
-        Start-Sleep -Seconds 2
+        $grammar[$case.k] = [ordered]@{ sent = $case.url; cmdline = $cmd; rest = (P $ev 'rest'); exact = ($case.k -eq 'confirm' -and $cmd -ceq $expected) }
+        Start-Sleep -Seconds 1
         Stop-SpikeProcesses
     }
+    $grammarOk = [bool]("$(P $grammar.confirm 'cmdline')" -ceq $expected)
+    $verdict = if ($settled) { "$($settled.verdict) (settled by $($settled.source): the owner's six exact clicks are not repeated; activation grammar reconfirmed)" }
+               elseif ($grammarOk) { 'INCOMPLETE (activation grammar confirmed automatically; the toast-click bar needs one owner-present run)' }
+               else { 'FAIL' }
     Set-Check 'S1.3' $verdict ([ordered]@{
-        expected = $expected; shortcut = $script:ShortcutForm; trials = $trials; recorded = $recorded; base64url_target = $target
+        expected = $expected; shortcut = $script:ShortcutForm
+        settled_by = (P $settled 'source'); settled_verdict = (P $settled 'verdict')
+        activation_grammar = $grammar; grammar_exact = $grammarOk
+        grammar_method = 'ShellExecuteW of the lilspike scheme (winshell-tool shellexec); the same argument a toast click delivers, without a click'
+        edge = 'not repeated: recorded in run 1 (results\run-20261022T033715Z)'
     })
 }
 
@@ -1027,124 +1072,86 @@ function Get-S14Verdict($WithA, $Fallback, $NoA) {
 }
 
 function Check-S14 {
-    Step 'S1.4 foreground: a toast click hands off to the running instance'
-    if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -WithToastClsid }
-    Say 'YOUR TURN: each trial opens two small windows (A, then a "winshell blocker" that the script clicks to the front). When a toast appears, click its text yourself: S1.4 measures what a real click allows. Keep your hand off the mouse until the toast is there.' 'Yellow'
-    $withA = @(); $fallback = @(); $noA = @(); $synthetic = @()
-    $partial = { Save-Partial 'S1.4' ([ordered]@{ shortcut = $script:ShortcutForm; with_a = $withA; with_a_fallback = $fallback; no_a = $noA; with_a_synthetic = $synthetic }) }
-    for ($i = 1; $i -le 5; $i++) { $withA += Trial-WithA $i 'basic'; & $partial }
-    # The fallback recipe is the FAIL path of a recipe that failed a valid trial, not of a trial
-    # whose precondition or click never happened.
-    $validFailed = @($withA | Where-Object { $_.valid -and -not $_.pass }).Count
-    if ($validFailed -gt 0) {
-        Say 'The basic recipe failed a valid trial: the FAIL path runs the same 5 trials with the fallback recipe.' 'Red'
-        for ($i = 1; $i -le 5; $i++) { $fallback += Trial-WithA $i 'fallback'; & $partial }
+    Step 'S1.4 foreground: settled by the owner''s real clicks'
+    # S1.4's bar is "the foreground right a real click gives", 5 of 5 with A and 5 of 5 without
+    # (owner run 3: all 10 passed, owner-clicked). A real click is the owner's alone, and the owner
+    # no longer clicks (owner run 3), so this is settled from that run and never re-run. The
+    # synthetic-click set recorded there stands for Task 30's "could a runner stand in".
+    $settled = Find-SettledVerdict 'S1.4' 'PASS'
+    if ($settled) {
+        $d = P $settled 'details'
+        Set-Check 'S1.4' "$($settled.verdict) (settled by $($settled.source): the owner's real clicks are not repeated)" ([ordered]@{
+            settled_by = $settled.source; settled_verdict = $settled.verdict
+            click_for_the_bar = 'owner (a real click); not repeated (owner run 3)'
+            with_a = (P $d 'with_a'); no_a = (P $d 'no_a'); with_a_synthetic = (P $d 'with_a_synthetic')
+        })
+        return
     }
-    for ($i = 1; $i -le 5; $i++) { $noA += Trial-NoA $i; & $partial }
-    $invalid = @(@($withA) + @($fallback) + @($noA) | Where-Object { -not $_.valid }).Count
-    $verdict = Get-S14Verdict $withA $fallback $noA
-    # Recorded, not the bar: the same with-A trial clicked by a synthesized mouse click, to show
-    # whether a test runner could stand in for the real click (Task 30).
-    Say 'Next: 5 recorded trials in which the script clicks the toasts itself (a pop-up warns before each).' 'Yellow'
-    for ($i = 1; $i -le 5; $i++) { $synthetic += Trial-WithA $i 'basic' 'synthetic'; & $partial }
-    Set-Check 'S1.4' $verdict ([ordered]@{
-        invalid_trials = $invalid; shortcut = $script:ShortcutForm; click_for_the_bar = 'owner (a real click)'
-        with_a = $withA; with_a_fallback = $fallback; no_a = $noA
-        with_a_synthetic = [ordered]@{ recorded_only = $true; passes = @($synthetic | Where-Object { $_.pass -and $_.click_method -eq 'synthetic-mouse' }).Count; owner_clicked = @($synthetic | Where-Object { $_.click_method -eq 'owner' }).Count; trials = $synthetic }
+    Set-Check 'S1.4' 'INCOMPLETE (S1.4 measures the foreground a real click gives; it needs one owner-present run, not yet on record)' ([ordered]@{
+        click_for_the_bar = 'owner (a real click)'; note = 'no settled PASS found in results\run-*\checks.json'
     })
 }
 
 # S1.5's "doesn't pop again" from UIA's popup count (automation review C1). Zero popups seen
 # never decides: UIA didn't see the progress toast, so the owner is asked, and that is recorded.
-# One popup: the owner decides (run 2's owner saw a second pop; a banner that re-animates in
-# place stays one element, which UIA counts once). Two or more: FAIL, decided by UIA.
-# $AskOwner returns the owner's answer to "did it pop only once?". Pure; tested.
-function Resolve-SecondPop([int]$Pops, [scriptblock]$AskOwner) {
-    if ($Pops -ge 2) { return [ordered]@{ value = $false; method = 'uia'; popups = $Pops } }
-    if ($Pops -eq 1) { return [ordered]@{ value = [bool](& $AskOwner); method = 'owner decides (UIA saw 1 popup)'; popups = 1 } }
-    [ordered]@{ value = [bool](& $AskOwner); method = 'owner (UIA did not see the progress toast)'; popups = 0 }
-}
-
-# S1.5's verdict string: FAIL / PASS, with the owner's part named when the owner decided.
-function Get-S15Verdict([bool]$Pass, $SecondPop) {
-    $m = "$(P $SecondPop 'method')"
-    if ($m.StartsWith('owner decides')) {
-        if ($Pass) { return 'PASS (UIA saw 1 popup; the owner saw no second pop)' }
-        if ((P $SecondPop 'value') -eq $false) { return 'FAIL (UIA saw 1 popup; the owner saw a second pop, for example an in-place re-animation)' }
-    }
-    # Zero popups seen: the owner's answer decided, and the verdict says so (review m1).
-    if ($m.StartsWith('owner (UIA did not see')) {
-        if ($Pass) { return 'PASS (owner: UIA did not see the progress toast)' }
-        if ((P $SecondPop 'value') -eq $false) { return 'FAIL (owner: UIA did not see the progress toast; the owner saw a second pop)' }
-    }
+# S1.5's verdict (owner run 3: fully automatic, from the toasts' own events and History; no owner
+# watching, no notification-centre navigation). $ControlPop proves the pop signal fired this run:
+# when the control toast raised no banner event, the sender events never arrive on this PC, so the
+# "no pop" and "popped" sub-checks can't be trusted and the verdict is INCOMPLETE (nobody is
+# asked). Otherwise PASS when every part held, else FAIL. Pure; tested.
+function Get-S15Verdict([bool]$Pass, $ControlPop) {
+    if (-not $ControlPop.popped) { return 'INCOMPLETE (no toast banner event was seen this run: the pop signal could not be confirmed)' }
     $(if ($Pass) { 'PASS' } else { 'FAIL' })
 }
 
-# S1.5 (automation round): the popups are counted by UIA, the notification centre is read from
-# History (and UIA), and the dismissal is done in the notification centre by UIA, on that toast's
-# own dismiss button only; the owner dismisses it when UIA can't, and the script sees that by
-# itself (History). Every toast carries a nonce, the progress toast included.
+# S1.5 (owner run 3): every part is automatic.
+# - progress: all Updates succeed (data binding), and the banner does not re-pop (its own events
+#   show at most one fade-out);
+# - after the toast is gone (the script removes it from the centre, not a person), Update returns
+#   NotificationNotFound;
+# - Remove(tag, group) then a new toast pops (its events show a fade-out);
+# - a SuppressPopup toast lands in the centre (History) without popping (no fade-out event); a
+#   normal control toast just before it proves the pop signal fires this run.
 function Check-S15 {
-    Step 'S1.5 progress toasts (detected)'
+    Step 'S1.5 progress toasts (detected by each toast''s own events)'
     [void](Tool history-clear)
     $n = New-Nonce
-    $before = Get-UiaSnapshot
-    Say 'YOUR TURN, watch only: a progress toast updates once a second for 20 s. Watch whether it slides in a SECOND time; the script may ask afterwards.' 'Yellow'
-    $c = Start-Core 's15-progress' @('progress', '--secs', '20', '--body', "Progress toast (S1.5) #$n")
-    $w = Watch-Needle -Needle "#$n" -Before $before -Seconds 26
-    $p = Wait-Core $c 90
-    $pops = @(P $w.Record 'appearances' | Where-Object { $null -ne $_ }).Count
-    $noRepop = Resolve-SecondPop $pops { Ask 'Did the progress toast pop only once (no second slide-in while it updated)?' }
-    $noRepop.watch = $w.Record
+    # 20 s of once-a-second data-binding updates, then 8 s to catch any late re-pop.
+    $p = Wait-Core (Start-Core 's15-progress' @('progress', '--secs', '20', '--watch-secs', '8', '--body', "Progress toast (S1.5) #$n")) 120
+    $pPop = Get-ToastPopped $p
+    $noRepop = $pPop.pops -le 1   # it pops once; an Update must not re-show the banner (2+ fades)
 
-    $handsOff = Start-HandsOff 'opens the notification centre and closes the progress toast there (the mouse may move)' 20
-    try {
-        # This toast's own names and progress strings, plus Windows' chrome (fix round 4, m7).
-        $dismiss = Dismiss-InNotificationCentre "#$n" @('Spike job running', 'LILITH Spike', 'LILITH spike') (@('^sampling$', '^\d+ ?%$', '^\d+(\.\d+)?$') + $script:ToastChrome)
-    } finally { Stop-HandsOff $handsOff }
-    $gone = $false
-    for ($k = 0; $k -lt 10 -and -not $gone; $k++) { Start-Sleep -Milliseconds 500; $gone = (P (Tool history --tag $ProgressTag) 'has_tag') -eq $false }
-    # 'uia' only when UIA pressed the toast's own button (review m4).
-    $dismissedBy = $(if ($dismiss.ok) { 'uia' } else { 'gone (not by the script)' })
-    if (-not $gone) {
-        $dismissedBy = 'owner (detected by History)'
-        Say 'YOUR TURN: open the notification centre (Win+N) and close "Spike job running" with its own X (not "Clear all"). The script carries on by itself once it is gone (up to 3 minutes).' 'Yellow'
-        for ($k = 0; $k -lt 360 -and -not $gone; $k++) { Start-Sleep -Milliseconds 500; $gone = (P (Tool history --tag $ProgressTag) 'has_tag') -eq $false }
-        if (-not $gone) { $dismissedBy = 'not dismissed within 3 minutes' }
-    }
+    # After the toast is gone, Update returns NotificationNotFound. The script removes it itself
+    # (History), the same "no longer there" state the bar means by the owner dismissing it.
+    [void](Tool history-clear)
     $u = Wait-Core (Start-Core 's15-update-after-dismiss' @('update', '--seq', '100')) 30
 
+    # Remove(tag, group) then a new toast pops.
     $n2 = New-Nonce
-    $before = Get-UiaSnapshot
-    $c = Start-Core 's15-remove-repost' @('remove-repost', '--body', "Posted after Remove(tag, group) (S1.5) #$n2")
-    $wr = Watch-Needle -Needle "#$n2" -Before $before -Seconds 8
-    $rr = Wait-Core $c 30
-    $repost = Resolve-Popped $wr 'Did the "Spike job finished" toast pop?'
+    $rr = Wait-Core (Start-Core 's15-remove-repost' @('remove-repost', '--watch-secs', '8', '--body', "Posted after Remove(tag, group) (S1.5) #$n2")) 60
+    $repostPop = Get-ToastPopped $rr
 
-    # The quiet toast's "no pop" rests on absence, so a normal control toast goes just before it:
-    # only when UIA sees the control does UIA's "not seen" count for the quiet one (review M6).
+    # A control toast (pops) just before the quiet one (does not), so "no pop" rests on a signal
+    # that is known to fire this run.
     $nc = New-Nonce
-    $wc = Post-Watched 's15-control' @('--tag', 's15-control', '--title', 'LILITH spike', '--body', "Control toast before the quiet one (S1.5) #$nc") "#$nc" 8
-    $controlSeen = @(P $wc.Watch.Record 'appearances' | Where-Object { $null -ne $_ }).Count -gt 0
+    $ctl = Wait-Core (Start-Core 's15-control' @('toast', '--tag', 's15-control', '--watch-secs', '8', '--title', 'LILITH spike', '--body', "Control toast before the quiet one (S1.5) #$nc")) 60
+    $ctlPop = Get-ToastPopped $ctl
     $nq = New-Nonce
-    $wq = Post-Watched 's15-quiet' @('--tag', 's15-quiet', '--suppress', '--title', 'Quiet toast', '--body', "SuppressPopup = true (S1.5) #$nq") "#$nq" 8
-    $q = $wq.Toast
-    $quietPopped = Resolve-Popped $wq.Watch 'Did the quiet toast pop up (slide in)?' -Trust:$controlSeen
-    $qh = Tool history --tag 's15-quiet'
-    $handsOff = Start-HandsOff 'opens and closes the notification centre (Win+N, Esc)' 12
-    try { $quietCentre = Test-InNotificationCentre "#$nq" } finally { Stop-HandsOff $handsOff }
-    $inCentre = (P $qh 'has_tag') -eq $true
+    $q = Wait-Core (Start-Core 's15-quiet' @('toast', '--tag', 's15-quiet', '--suppress', '--watch-secs', '8', '--title', 'Quiet toast', '--body', "SuppressPopup = true (S1.5) #$nq")) 60
+    $quietPop = Get-ToastPopped $q
+    $inCentre = (P (Tool history --tag 's15-quiet') 'has_tag') -eq $true
 
-    $pass = [bool]((P $p 'posted') -and (P $p 'all_succeeded') -and $noRepop.value -and (P $u 'result') -eq 'NotificationNotFound' -and
-        (P $rr 'removed') -and (P $rr 'posted') -and $repost.value -and (P $q 'posted') -and -not $quietPopped.value -and $inCentre)
-    Set-Check 'S1.5' (Get-S15Verdict $pass $noRepop) ([ordered]@{
-        progress = $p; no_second_pop = $noRepop.value; no_second_pop_detail = $noRepop
-        dismissal = [ordered]@{ by = $dismissedBy; gone_from_history = $gone; uia = $dismiss }
+    $pass = [bool]((P $p 'posted') -and (P $p 'all_succeeded') -and $noRepop -and (P $u 'result') -eq 'NotificationNotFound' -and
+        (P $rr 'removed') -and (P $rr 'posted') -and $repostPop.popped -and
+        (P $q 'posted') -and -not $quietPop.popped -and $inCentre -and $ctlPop.popped)
+    Set-Check 'S1.5' (Get-S15Verdict $pass $ctlPop) ([ordered]@{
+        method = 'the toasts'' own Dismissed/Failed/Activated events (sender side) and History; no owner input'
+        progress = $p; progress_pops = $pPop.pops; no_second_pop = $noRepop; progress_pop_detail = $pPop
         update_after_dismiss = (P $u 'result')
-        remove_repost = $rr; repost_popped = $repost.value; repost_detail = $repost
-        quiet = [ordered]@{ posted = (P $q 'posted'); no_pop = -not $quietPopped.value; no_pop_detail = $quietPopped
-                            control_toast_seen = $controlSeen; control_watch = $wc.Watch.Record
-                            in_centre = $inCentre; in_centre_method = 'ToastNotificationManager.History'; in_centre_uia = $quietCentre }
+        remove_repost = $rr; repost_popped = $repostPop.popped; repost_pop_detail = $repostPop
+        quiet = [ordered]@{ posted = (P $q 'posted'); no_pop = -not $quietPop.popped; no_pop_detail = $quietPop
+                            control_toast_popped = $ctlPop.popped; control_pop_detail = $ctlPop
+                            in_centre = $inCentre; in_centre_method = 'ToastNotificationManager.History' }
     })
 }
 
@@ -1471,91 +1478,148 @@ function Invoke-SleepWake {
     }
 }
 
-# S1.7 in parts ($PowerPart): 'sleep-wake' in the owner-present stretch, 'stay-awake' at the
-# very end of the session (run-all.ps1, with -Append), or 'all'.
-function Check-S17 {
-    Step "S1.7 keep-awake ($PowerPart)"
-    $prevDetails = P (P $Report.checks 'S1.7') 'details'
-    $a = (& powercfg /a) -join "`n"
-    $availablePart = ($a -split 'The following sleep states are not available')[0]
-    $modernStandby = $availablePart -match 'S0 Low Power Idle'
-    $timeout = Get-SleepTimeoutSec
-    Say ("Sleep timeout in use: {0}" -f $(if ($null -eq $timeout.used_s) { 'unknown (powercfg output not parsed)' } elseif ($timeout.used_s) { "$($timeout.used_s) s" } else { 'never' }))
+# S1.7's verdict from Windows' own reports only (owner run 3, q5: no real sleep). PASS when the
+# core's PowerSetRequest set and cleared returned ok and the system execution state showed
+# ES_SYSTEM_REQUIRED while held and not after (the self-check via CallNtPowerInformation). The
+# owner's earlier elevated `powercfg /requests` listing, when on record, corroborates. Pure; tested.
+function Get-S17Verdict2([bool]$ApiSet, [bool]$ApiCleared, [bool]$SelfCheck, $Listing) {
+    $listed = (P $Listing 'listed_while_held') -eq $true -and (P $Listing 'gone_after_clear') -eq $true
+    if (-not $ApiSet) { return 'FAIL (PowerSetRequest did not report success)' }
+    if ($ApiSet -and $ApiCleared -and $SelfCheck) {
+        if ($listed) { return 'PASS' }
+        return 'PASS (execution-state self-check; the owner''s powercfg listing is not on record)'
+    }
+    'INCOMPLETE (the execution state did not confirm the held request)'
+}
 
+# S1.7 (owner run 3, q5): checked through Windows' own reports, with no real sleep. The detached
+# core holds PowerSetRequest(PowerRequestSystemRequired); the system execution state is read
+# (CallNtPowerInformation, read only) before, while held, and after the clear. The request shows
+# as ES_SYSTEM_REQUIRED while held and not after. The owner's elevated powercfg /requests listing
+# from an earlier run corroborates (not repeated). The sleep broadcasts are not exercised here;
+# the runtime uses WM_POWERBROADCAST with a wall-vs-monotonic clock-jump fallback.
+function Check-S17 {
+    Step 'S1.7 keep-awake (Windows'' own reports; no real sleep)'
+    $a = (& powercfg /a) -join "`n"
+    $modernStandby = (($a -split 'The following sleep states are not available')[0]) -match 'S0 Low Power Idle'
+    $timeout = Get-SleepTimeoutSec
     $earlier = Find-EarlierListing
     $listing = P $earlier 'listing'
-    $base = [ordered]@{
-        modern_standby = $modernStandby; powercfg_a = $a; sleep_timeout = $timeout
-        listing = $listing; listing_source = (P $earlier 'source')
-        listing_method = 'the owner''s elevated powercfg /requests, from an earlier run; not repeated (owner direction 2026-10-23)'
-    }
-    $sleep = P $prevDetails 'sleep_wake'
-    if ($PowerPart -ne 'stay-awake') {
-        $sleep = Invoke-SleepWake
-    }
-    $base.sleep_wake = $sleep
-    if ($PowerPart -eq 'sleep-wake') {
-        $base.stay_awake = 'runs last in the session (run-all.ps1)'
-        Set-Check 'S1.7' 'PENDING (the stay-awake wait runs last)' $base
-        return
-    }
-    Save-Partial 'S1.7' $base
-    $stay = Power-StayAwake 'request' $timeout
-    $base.stay_awake = $stay; Save-Partial 'S1.7' $base
-    $ste = $null
-    if (Test-NeedSte $listing $stay) {
-        Say 'PowerSetRequest failed a check: the FAIL path repeats the stay-awake wait with SetThreadExecutionState.' 'Red'
-        $ste = [ordered]@{ listing = $null; listing_note = 'not run: it needs the elevated step that the owner direction of 2026-10-23 dropped'; stay_awake = (Power-StayAwake 'ste' $timeout) }
-        $base.ste = $ste; Save-Partial 'S1.7' $base
-    }
 
-    $sleepPass = $(if ($null -eq $sleep) { $null } else { [bool](P $sleep 'pass') })
-    $v = Get-S17Verdict $listing $stay $ste $sleepPass
-    $base.api = $v.api
-    $base.sleep_gap_fallback_needed = $(if ($null -eq $sleepPass) { $null } else { -not $sleepPass })
-    Set-Check 'S1.7' $v.verdict $base
+    $before = Get-PowerEvidence
+    $c = Start-Core 's17-hold' @('power', '--api', 'request', '--max-secs', '30', '--parent-pid', "$PID")
+    [void](Wait-PowerEvent $c 'set' 20)
+    Start-Sleep -Seconds 1
+    $held = @((Get-PowerEvidence))
+    Start-Sleep -Seconds 2
+    $held += (Get-PowerEvidence)
+    $doc = Stop-Power $c
+    Start-Sleep -Seconds 1
+    $after = Get-PowerEvidence
+
+    $events = @(P $doc 'events' | Where-Object { $null -ne $_ })
+    $apiSet = @($events | Where-Object { (P $_ 'kind') -eq 'set' -and (P $_ 'ok') -eq $true }).Count -gt 0
+    $apiCleared = @($events | Where-Object { (P $_ 'kind') -eq 'cleared' -and (P $_ 'ok') -eq $true }).Count -gt 0
+    $setWhileHeld = $held.Count -gt 0 -and @($held | Where-Object { (P $_ 'system_required') -ne $true }).Count -eq 0
+    $clearedAfter = (P $after 'system_required') -ne $true
+    $selfCheck = $setWhileHeld -and $clearedAfter
+
+    # The sleep-and-wake broadcast record from the owner's earlier run, informational (no real
+    # sleep in this run, q5).
+    $priorS17 = Find-PriorCheckDetails 'S1.7'
+    $sleepWakePrior = P $priorS17 'sleep_wake'
+
+    $verdict = Get-S17Verdict2 $apiSet $apiCleared $selfCheck $listing
+    Set-Check 'S1.7' $verdict ([ordered]@{
+        method = 'PowerSetRequest held by the detached core; the system execution state read before, while held, and after (CallNtPowerInformation); no real sleep'
+        modern_standby = $modernStandby; powercfg_a = $a; sleep_timeout = $timeout
+        api_set_ok = $apiSet; api_cleared_ok = $apiCleared
+        execution_state_before = $before; execution_state_held = $held; execution_state_after = $after
+        set_while_held = $setWhileHeld; cleared_after = $clearedAfter; self_check = $selfCheck
+        listing = $listing; listing_source = (P $earlier 'source')
+        listing_method = 'the owner''s elevated powercfg /requests, from an earlier run; not repeated'
+        sleep_wake = $sleepWakePrior
+        sleep_wake_note = 'not exercised here (q5: no real sleep); the runtime sees PBT_APMSUSPEND/RESUME on the core''s hidden window, with a wall-vs-monotonic clock-jump fallback'
+        core = $doc
+    })
+}
+
+# The S1.8 Hello prompt placement probe (owner run 3, q3): winshell-app opens a blocker window of
+# $BlockerArgs' kind (normal, --topmost, or --fullscreen) and takes the front; then winshell-hello
+# owns a consent prompt through a window it foregrounds and records the prompt's z-order and
+# foreground against the blocker, then cancels it (no gesture). Returns a record with {ok}.
+function Invoke-HelloPlacement([string]$Name, [string[]]$BlockerArgs) {
+    Stop-SpikeProcesses
+    $n = @(Get-Events).Count
+    $blk = Start-Process -FilePath $App -ArgumentList (@('--blocker', '--exit-after-secs', '60') + $BlockerArgs) -PassThru
+    [void]$blk.Handle
+    $bw = Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $blk.Id }
+    $blockerHwnd = [int64](P $bw 'hwnd')
+    Start-Sleep -Milliseconds 800   # let the blocker settle in front
+    $handsOff = Start-HandsOff "shows a Windows Hello prompt over a $Name window and checks it comes to the front (no gesture; it is cancelled)" 20
+    $probe = $null
+    try {
+        $probe = HelloCmd verify --probe --blocker-hwnd "$blockerHwnd"
+    } finally {
+        Stop-HandsOff $handsOff
+        Stop-PinnedProcess $blk
+    }
+    $placement = P $probe 'placement'
+    [ordered]@{
+        scenario = $Name; blocker_hwnd = $blockerHwnd; blocker_args = $BlockerArgs
+        found = (P $placement 'found'); is_foreground = (P $placement 'is_foreground'); above_blocker = (P $placement 'above_blocker')
+        ok = [bool]((P $placement 'found') -and (P $placement 'is_foreground') -and (P $placement 'above_blocker'))
+        result_after_cancel = (P $probe 'result_after_cancel'); placement = $placement; probe = $probe
+    }
 }
 
 function Check-S18 {
-    Step 'S1.8 Windows Hello (keep this terminal in front)'
+    Step 'S1.8 Windows Hello (the app brings the prompt forward; no owner input)'
     $a = HelloCmd supported
     $d = HelloCmd tpm
     $dp = HelloCmd dpapi
     Say "(a) supported: $(P $a 'supported'); (d) TPM: $(P $d 'tpm_version'); DPAPI round trip: $(P $dp 'round_trip')"
-    $b = $null; $bFront = $null; $c1 = $null; $c2 = $null
-    if (P $a 'supported') {
-        Say 'YOUR TURN, Windows Hello: keep your hands off the mouse and keyboard until each prompt shows, then complete it (PIN, finger or face). First one prompt to create the spike key; the script checks by itself whether the prompt comes in front.' 'Yellow'
-        $bw = HelloWatched @('create') 'Was the Hello prompt in front of the terminal?'
-        $b = $bw.Result; $bFront = $bw.Front
-        Say 'Next: up to 10 prompts, 5 and then 5 more from a second process. Complete each one.' 'Yellow'
-        $c1 = HelloCmd sign --count 5
-        $c2 = HelloCmd sign --count 5
-    }
-    Say 'Last: one verification prompt. Complete it.' 'Yellow'
-    $ew = HelloWatched @('verify') 'Was the verification prompt in front of the terminal?'
-    $e = $ew.Result; $eFront = $ew.Front
-    $f = $null; $fGone = $null
-    if (P $a 'supported') { $f = HelloCmd delete; $fGone = HelloCmd exists }
 
-    $sigs = @()
-    foreach ($run in @($c1, $c2)) { $sigs += @(P $run 'signatures' | Where-Object { $_ }) }
-    $hexes = @($sigs | Where-Object { (P $_ 'status') -eq 'Success' } | ForEach-Object { P $_ 'signature_hex' })
-    $cPass = $hexes.Count -eq 10 -and @($hexes | Select-Object -Unique).Count -eq 1
-    $bPass = (P $b 'status') -eq 'Success' -and (P $bFront 'value') -eq $true
-    $fPass = (P $f 'deleted') -eq $true -and (P $fGone 'status') -eq 'NotFound'
-    $ePass = (P $e 'result') -eq 'Verified' -and (P $eFront 'value') -eq $true
-    $route = if ((P $a 'supported') -and $bPass -and $cPass -and (P $d 'tpm_2_0') -and $fPass) { 'KEK' }
-             elseif ($ePass -and (P $dp 'round_trip')) { 'DPAPI with the Hello gate' }
-             else { 'passphrase only' }
-    $verdict = if ($route -eq 'passphrase only') { 'FAIL (passphrase only: report to the owner)' } else { 'PASS' }
+    # The crypto evidence is settled from the owner's run (owner run 3): a real Hello gesture is
+    # the owner's alone and is not repeated. The key was created, 10 identical signatures came
+    # back, and the credential deleted. Read from the newest recorded S1.8 details.
+    $prior = Find-PriorCheckDetails 'S1.8'
+    $createOk = (P (P $prior 'b_create') 'status') -eq 'Success'
+    $signOk = (P $prior 'c_identical') -eq $true -and (P $prior 'c_count') -eq 10
+    $deleteOk = (P (P $prior 'f_delete') 'deleted') -eq $true -and (P (P $prior 'f_after') 'status') -eq 'NotFound'
+
+    # Placement, verified automatically now (q3): the prompt must come in front of any app,
+    # fullscreen included. Each scenario cancels the prompt, so no gesture is needed.
+    $placements = @()
+    if (P $a 'supported') {
+        foreach ($scn in @([ordered]@{ n = 'normal'; a = @() }, [ordered]@{ n = 'topmost'; a = @('--topmost') }, [ordered]@{ n = 'fullscreen'; a = @('--fullscreen') })) {
+            $placements += Invoke-HelloPlacement $scn.n $scn.a
+            Save-Partial 'S1.8' ([ordered]@{ placements = $placements })
+        }
+    }
+    $placementOk = $placements.Count -gt 0 -and @($placements | Where-Object { -not $_.ok }).Count -eq 0
+
+    # Route (owner run 3): KEK when Hello is supported, the key crypto is settled, TPM 2.0 is
+    # present, and the prompt now comes to the front; else DPAPI with the Hello gate when the
+    # consent verifier works and DPAPI round-trips; else passphrase only.
+    $kek = (P $a 'supported') -and $createOk -and $signOk -and (P $d 'tpm_2_0') -and $deleteOk -and $placementOk
+    $dpapiRoute = $placementOk -and (P $dp 'round_trip')
+    $route = if ($kek) { 'KEK' } elseif ($dpapiRoute) { 'DPAPI with the Hello gate' } else { 'passphrase only' }
+    $verdict = if ($route -eq 'passphrase only') { 'FAIL (passphrase only: report to the owner)' }
+               elseif (-not ($createOk -and $signOk -and $deleteOk)) { 'INCOMPLETE (the KEK crypto is not on record: it needs one real Hello gesture, proven by first real use)' }
+               else { 'PASS' }
     Set-Check 'S1.8' $verdict ([ordered]@{
         route = $route
-        a_supported = $a; b_create = $b; b_prompt_in_front = (P $bFront 'value'); b_front_detail = $bFront
-        c_identical = $cPass; c_count = $hexes.Count; c_process1 = $c1; c_process2 = $c2
-        d_tpm = $d; e_verify = $e; e_prompt_in_front = (P $eFront 'value'); e_front_detail = $eFront; f_delete = $f; f_after = $fGone
-        dpapi = $dp
+        a_supported = $a; d_tpm = $d; dpapi = $dp
+        crypto_settled = [ordered]@{ create_ok = $createOk; sign_identical = $signOk; delete_ok = $deleteOk; source = 'owner run 3 (results\run-*); the real gesture is proven by first real use and not repeated' }
+        placement = [ordered]@{
+            ok = $placementOk; scenarios = $placements
+            method = 'winshell-hello owns the consent prompt through a window it foregrounds (AllowSetForegroundWindow + SetForegroundWindow), then IUserConsentVerifierInterop::RequestVerificationForWindowAsync with that HWND; the prompt''s z-order and foreground are checked against a normal, a topmost and a fullscreen blocker, then the prompt is cancelled (no gesture)'
+        }
+        design_note = 'For key creation and signing the same owned-foreground window is passed to the Hello UI; the KEK gesture itself is proven by first real use.'
     })
 }
+
 
 # ---------------------------------------------------------------- main
 

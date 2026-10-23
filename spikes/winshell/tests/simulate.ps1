@@ -1,24 +1,26 @@
 #requires -Version 7
 <#
-Fix round 4 (coordinator's ruling): run-all.ps1's attended and unattended blocks end to end, with
-every Windows call faked (tests/sim-fakes.ps1), under the scripts' own Set-StrictMode -Version
-Latest and $ErrorActionPreference = 'Stop'.
+Owner run 3 (full automation): run-all.ps1's one unattended command end to end, with every Windows
+call faked (tests/sim-fakes.ps1), under the scripts' own Set-StrictMode -Version Latest and
+$ErrorActionPreference = 'Stop'. It runs Part B (the host checks) then Part C (the Sandbox runs),
+each stage in its own pwsh, and every check's record and result file is written and read back.
 
-Past rounds shipped errors that showed only when the code ran: a strict-mode read of a removed
-variable (S1.8's HelloWatched, review N3-C1), ConvertTo-Json of a live Process object (the
-Sandbox lifecycle record, N3-C2), and the pop-up log reset before the stage record read it
-(N3-I1). Here the owner's two commands run as the owner runs them, through run-all.ps1, each
-stage in its own pwsh, and every stage record and result file is written and read back:
-- the attended block: Part B (S1.2p, S1.3 with every refusal path of its owner fallback, S1.4,
-  S1.5, S1.7's sleep and wake, S1.8 with its foreground loop), its cleanup, and the watched
-  Sandbox run with the cover window and the lock;
-- the unattended block: S1.7's stay-awake wait (with one touch), and 3 Sandbox runs, one of which
-  doesn't close by itself and is ended through its pinned object.
-Nothing on this PC is touched: no toast, shortcut, registry key or Hello credential is written,
-no Sandbox starts, no input is injected, no power request is held, and no pop-up is shown. The
-only real processes are the fakes' windowless pings (sim-fakes.ps1 says which). Everything is
-written to a temp folder that is removed at the end (-Keep keeps it), and the spike's own
-results\ folder is checked to be unchanged.
+It exercises the owner-run-3 redesign:
+- the toast checks (S1.5) decide from each toast's own events, not UI Automation;
+- S1.3 and S1.4 are settled from the owner's recorded runs and not re-run;
+- S1.7 is judged from the execution-state self-check, with no real sleep;
+- S1.8's Hello prompt placement is probed across a normal, a topmost and a fullscreen window and
+  the prompt is cancelled (no gesture); the route comes from the settled crypto evidence;
+- the Sandbox Qt step records both grabs with their platform plugins;
+- no owner input anywhere.
+
+It also still guards the fix-round-4 runtime traps: no strict-mode read of a removed variable, no
+ConvertTo-Json of a live Process object, the pop-up log kept for the stage records.
+
+Nothing on this PC is touched: no toast, shortcut, registry key or Hello credential is written, no
+Sandbox starts, no input is injected, no power request is held, no pop-up is shown. The only real
+processes are the fakes' windowless pings. Everything goes to a temp folder removed at the end
+(-Keep keeps it), and the spike's own results\ folder is checked to be unchanged.
 
 Run by tests/simulate.rs (cargo test). Exit 0 = every case passed.
 #>
@@ -43,18 +45,40 @@ function Read-Doc([string]$Path) { if (Test-Path -LiteralPath $Path) { Get-Conte
 # ---------------------------------------------------------------- the folder the fakes use
 
 $sim = Join-Path ([IO.Path]::GetTempPath()) ('winshell-sim-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
-foreach ($d in 'bin', 'deploy', 'results', 'localappdata', 'programs', 'temp', 'vcredist', 'rusttest', 'build') { New-Item -ItemType Directory -Force -Path (Join-Path $sim $d) | Out-Null }
+foreach ($d in 'bin', 'deploy', 'deploy\platforms', 'results', 'localappdata', 'programs', 'temp', 'vcredist', 'rusttest', 'build') { New-Item -ItemType Directory -Force -Path (Join-Path $sim $d) | Out-Null }
 Set-Content -LiteralPath (Join-Path $sim 'sim.marker') -Value 'spike 11 simulation folder'
-# Empty files where the scripts expect the built exes: they are copied and checked, never run.
+# Empty files where the scripts expect the built exes and the Qt plugins: copied and checked,
+# never run.
 foreach ($f in 'bin\winshell-core.exe', 'bin\winshell-app.exe', 'bin\winshell-hello.exe', 'bin\winshell-tool.exe', 'deploy\app_shell_spike.exe',
-    'vcredist\vcruntime140.dll', 'vcredist\vcruntime140_1.dll', 'vcredist\msvcp140.dll', 'rusttest\winshell-0000.exe') {
+    'deploy\platforms\qwindows.dll', 'vcredist\vcruntime140.dll', 'vcredist\vcruntime140_1.dll', 'vcredist\msvcp140.dll', 'rusttest\winshell-0000.exe') {
     New-Item -ItemType File -Force -Path (Join-Path $sim $f) | Out-Null
 }
-# The owner's elevated listing from an earlier run, in the shape the run of 2026-10-23 left it.
-$earlier = Join-Path $sim 'results\run-20261023T032541Z'
-New-Item -ItemType Directory -Force -Path $earlier | Out-Null
-@{ checks = @{ 'S1.7' = @{ verdict = 'IN PROGRESS'; details = @{ listing = @{ api = 'request'; listed_while_held = $true; gone_after_clear = $true } } } } } |
-    ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $earlier 'checks.json')
+
+# The owner's earlier runs, as Find-SettledVerdict / Find-PriorCheckDetails / Find-EarlierListing
+# read them: S1.3 and S1.4 settled PASS (with details), S1.6 PASS, S1.7's elevated listing and
+# sleep-and-wake record, and S1.8's crypto evidence (create, 10 identical signatures, delete),
+# recorded by the owner's run of 2026-10-23 even though its S1.8 verdict was FAIL for placement.
+$ownerRun = Join-Path $sim 'results\run-20261023T204648Z'
+New-Item -ItemType Directory -Force -Path $ownerRun | Out-Null
+$ownerChecks = @{
+    checks = @{
+        'S1.1' = @{ verdict = 'PASS'; details = @{} }
+        'S1.2' = @{ verdict = 'PASS'; details = @{} }
+        'S1.3' = @{ verdict = 'PASS'; details = @{ expected = 'x'; trials = @(1..6 | ForEach-Object { @{ trial = $_; exact = $true } }) } }
+        'S1.4' = @{ verdict = 'PASS'; details = @{
+                with_a = @(1..5 | ForEach-Object { @{ trial = $_; pass = $true; click_method = 'owner' } })
+                no_a = @(1..5 | ForEach-Object { @{ trial = $_; pass = $true; click_method = 'owner' } })
+                with_a_synthetic = @{ recorded_only = $true; passes = 5; owner_clicked = 0 } } }
+        'S1.6' = @{ verdict = 'PASS'; details = @{} }
+        'S1.7' = @{ verdict = 'IN PROGRESS'; details = @{
+                listing = @{ api = 'request'; listed_while_held = $true; gone_after_clear = $true }
+                sleep_wake = @{ pass = $true; broadcasts = @('PBT_APMSUSPEND', 'PBT_APMRESUMEAUTOMATIC') } } }
+        'S1.8' = @{ verdict = 'FAIL (passphrase only: report to the owner)'; details = @{
+                b_create = @{ status = 'Success' }; c_identical = $true; c_count = 10
+                f_delete = @{ deleted = $true }; f_after = @{ status = 'NotFound' } } }
+    }
+}
+$ownerChecks | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $ownerRun 'checks.json')
 
 function Get-RealResultsState {
     $r = Join-Path $Spike 'results'
@@ -67,106 +91,79 @@ $saved = @{ WINSHELL_SIM_DIR = $env:WINSHELL_SIM_DIR; TEMP = $env:TEMP; TMP = $e
 $env:WINSHELL_SIM_DIR = $sim
 $env:TEMP = Join-Path $sim 'temp'; $env:TMP = $env:TEMP   # the pop-ups' state files go there too
 
-function Invoke-Block([string]$Block) {
-    $t = [Diagnostics.Stopwatch]::StartNew()
-    $out = & pwsh -NoProfile -NonInteractive -File (Join-Path $Spike 'run-all.ps1') -Block $Block -Simulate -DeployDir (Join-Path $sim 'deploy') 2>&1 | Out-String
-    $code = $LASTEXITCODE
-    Set-Content -LiteralPath (Join-Path $sim "console-$Block.txt") -Value $out
-    Write-Host "---- $Block block: exit $code after $([int]$t.Elapsed.TotalSeconds) s"
-    [pscustomobject]@{ Out = $out; Exit = $code }
-}
-
 try {
-    $a = Invoke-Block 'Attended'
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    $out = & pwsh -NoProfile -NonInteractive -File (Join-Path $Spike 'run-all.ps1') -Simulate -DeployDir (Join-Path $sim 'deploy') 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    Set-Content -LiteralPath (Join-Path $sim 'console.txt') -Value $out
+    Write-Host "---- run-all: exit $code after $([int]$t.Elapsed.TotalSeconds) s"
     $res = Join-Path $sim 'results'
-    $checksA = Read-Doc (Join-Path $res 'checks.json')
-    $observe = Read-Doc (Join-Path $res 'sandbox-observe.json')
-    $u = Invoke-Block 'Unattended'
-    $checksU = Read-Doc (Join-Path $res 'checks.json')
+    $checks = Read-Doc (Join-Path $res 'checks.json')
     $runs = Read-Doc (Join-Path $res 'sandbox-checks.json')
 
-    # ---- the blocks ran without an error
-    foreach ($b in @(@('Attended', $a), @('Unattended', $u))) {
-        $o = $b[1].Out
-        Expect "$($b[0]) block" ($b[1].Exit -eq 0) "run-all exit code $($b[1].Exit)"
-        Expect "$($b[0]) block" ($o -notmatch 'ended with exit code') 'every stage exited 0'
-        Expect "$($b[0]) block" ($o -notmatch 'stopped with an error') 'no check stopped with an error'
-        Expect "$($b[0]) block" ($o -notmatch 'simulation: ') 'no fake was asked for something unexpected'
-        Expect "$($b[0]) block" ($o -match 'Cleanup -> PASS') 'the cleanup passed'
-    }
+    # ---- the one command ran without an error, no owner input
+    Expect 'run-all' ($code -eq 0) "exit code $code"
+    Expect 'run-all' ($out -notmatch 'ended with exit code') 'every stage exited 0'
+    Expect 'run-all' ($out -notmatch 'stopped with an error') 'no check stopped with an error'
+    Expect 'run-all' ($out -notmatch 'simulation: ') 'no fake was asked for something unexpected'
+    Expect 'run-all' ($out -notmatch 'YOUR TURN|YOUR CLICK|\[y/n\]') 'no owner turn was asked for'
+    Expect 'run-all' ($out -match 'Cleanup -> PASS') 'the cleanup passed'
 
-    # ---- Part B (the attended block's checks.json)
-    $c = P $checksA 'checks'
-    Expect 'checks.json (attended)' ($null -ne $c) 'written and read back'
-    $verdicts = [ordered]@{ 'S1.2p' = 'RECORDED'; 'S1.3' = 'PASS'; 'S1.4' = 'PASS'; 'S1.5' = 'PASS (UIA saw 1 popup; the owner saw no second pop)'; 'S1.7' = 'PENDING (the stay-awake wait runs last)'; 'S1.8' = 'PASS' }
-    foreach ($id in $verdicts.Keys) { $v = P (P $c $id) 'verdict'; Expect $id ($v -eq $verdicts[$id]) "verdict '$v' (want '$($verdicts[$id])')" }
-    Expect 'S1.8 (N3-C1)' ((P (P (P $c 'S1.8') 'details') 'b_prompt_in_front') -eq $true) 'the foreground loop ran: the create prompt was seen in front'
-    Expect 'S1.8 (N3-C1)' ((P (P (P $c 'S1.8') 'details') 'e_prompt_in_front') -eq $true) 'the verification prompt was seen in front'
+    $c = P $checks 'checks'
+    Expect 'checks.json' ($null -ne $c) 'written and read back'
 
-    $t13 = @(P (P (P $c 'S1.3') 'details') 'trials')
-    $att = { param($i) @(P $t13[$i] 'attempts') }
-    Expect 'S1.3 fallback' ($t13.Count -eq 6) "6 trials ($($t13.Count))"
-    if ($t13.Count -eq 6) {
-        Expect 'S1.3 fallback: invoke' ((P $t13[0] 'click_method') -eq 'uia-invoke') "trial 1 clicked by UIA invoke ($(P $t13[0] 'click_method'))"
-        $f2 = "$(P (& $att 1)[0] 'fallback')"
-        Expect 'S1.3 fallback: every way refused' ($f2.StartsWith('the script refused to act') -and (P $t13[1] 'click_method') -eq 'owner') "trial 2: '$f2', clicked by $(P $t13[1] 'click_method')"
-        $f3 = "$(P (& $att 2)[0] 'fallback')"
-        Expect 'S1.3 fallback: owner active' ($f3.StartsWith('the owner was using the PC') -and (P $t13[2] 'click_method') -eq 'owner') "trial 3: '$f3'"
-        $a4 = (& $att 3)[0]
-        Expect 'S1.3 fallback: button refused' ((P $a4 'button_missing') -eq $true -and "$(P $a4 'fallback')".StartsWith('the script refused to act') -and (P $t13[3] 'click_method') -eq 'owner') "trial 4: '$(P $a4 'fallback')'"
-        $uc = @(P $a4 'unknown_controls')
-        Expect 'S1.3 unknown controls' ($uc.Count -ge 1 -and $null -ne (P $uc[0] 'automation_id') -and $null -eq (P $uc[0] 'name')) 'recorded by AutomationId, type and class, with no Name'
-        Expect 'S1.3 fallback: button invoke' ((P $t13[4] 'click_method') -eq 'uia-invoke') "trial 5 ($(P $t13[4] 'click_method'))"
-        Expect 'S1.3 fallback: a click without a launch is reposted' ((P $t13[5] 'posts') -eq 2) "trial 6 posts: $(P $t13[5] 'posts')"
-    }
-    $d13 = P (P $c 'S1.3') 'details'
-    Expect 'S1.3 Run box' ($null -ne (P (P (P $d13 'recorded') 'run') 'cmdline')) 'the Run box launch was recorded'
-    $s14 = P (P $c 'S1.4') 'details'
-    Expect 'S1.4' ((P (P $s14 'with_a_synthetic') 'passes') -eq 5) "synthetic passes $(P (P $s14 'with_a_synthetic') 'passes')"
-    Expect 'S1.4 blocker clicked to the front' (@(@(P $s14 'with_a') | Where-Object { (P (P $_ 'precondition') 'how') -eq 'synthetic click on the blocker' }).Count -eq 1) 'one blocker was clicked to the front by the script'
-    Expect 'S1.5 dismissal (m7)' ((P (P (P (P $c 'S1.5') 'details') 'dismissal') 'by') -eq 'uia') "dismissed by '$(P (P (P (P $c 'S1.5') 'details') 'dismissal') 'by')' (Windows' own chrome is known in the scope)"
-    Expect 'cleanup (attended)' ((P (P $checksA 'cleanup') 'pass') -eq $true) 'cleanup pass'
+    # ---- the host checks, all automatic
+    Expect 'S1.2p' ((P (P $c 'S1.2p') 'verdict') -eq 'RECORDED') "verdict '$(P (P $c 'S1.2p') 'verdict')'"
 
-    $stA = @(P $checksA 'stages')
-    $hoA = @(P $stA[0] 'hands_off')
-    Expect 'pop-up records (N3-I1)' ($hoA.Count -ge 10) "the attended stage keeps its pop-up records ($($hoA.Count))"
-    Expect 'pop-up records (m2)' (@($hoA | Where-Object { (P $_ 'shown') -eq $true -and $null -ne (P $_ 'shown_after_ms') }).Count -gt 0) 'shown pop-ups record when they showed'
-    Expect 'pop-up records (m2)' (@($hoA | Where-Object { (P $_ 'popup_started') -eq $true -and (P $_ 'shown') -eq $false }).Count -gt 0) 'a pop-up that never showed is recorded as not shown'
+    $v13 = "$(P (P $c 'S1.3') 'verdict')"
+    Expect 'S1.3 settled' ($v13.StartsWith('PASS (settled by')) "verdict '$v13'"
+    Expect 'S1.3 grammar' ((P (P (P $c 'S1.3') 'details') 'grammar_exact') -eq $true) 'the activation grammar matched exactly (ShellExecute, no click)'
 
-    # ---- the watched Sandbox run
-    Expect 'sandbox-observe.json (N3-C2)' ($null -ne $observe) 'written and read back'
-    if ($null -ne $observe) {
-        Expect 'watched run' ((P $observe 'verdict') -eq 'PASS') "verdict '$(P $observe 'verdict')'"
-        $r1 = @(P $observe 'runs')[0]
-        $own = @(P (P (P (P (P $r1 'items') 'lifecycle') 'file') 'started') 'own_procs')
-        Expect 'lifecycle record (N3-C2)' ($own.Count -ge 1 -and @($own | Where-Object { @($_.PSObject.Properties.Name | Where-Object { $_ -notin 'pid', 'name', 'start' }).Count -gt 0 }).Count -eq 0) "own_procs hold pid, name and start only ($($own.Count))"
-        Expect 'watched run: cover' ((P (P (P $observe 'observation') 'round2_cover') 'covered') -eq $true) 'the Sandbox window was covered'
-        Expect 'watched run: lock' ($null -ne (P (P (P $observe 'observation') 'round3_lock') 'unlocked_after_s')) 'the lock and the sign-in were seen'
-        Expect 'watched run: pop-up record (N3-I1)' (@(P $observe 'hands_off').Count -ge 1) 'the cover pop-up is recorded'
-        Expect 'lifecycle.json' (Test-Path -LiteralPath (Join-Path $res 'sandbox\observe-1\lifecycle.json')) 'kept in results\sandbox\observe-1'
-    }
+    $v14 = "$(P (P $c 'S1.4') 'verdict')"
+    Expect 'S1.4 settled' ($v14.StartsWith('PASS (settled by')) "verdict '$v14'"
+    Expect 'S1.4 not re-run' ($out -notmatch 'winshell blocker.*click') 'no owner click was asked for'
 
-    # ---- S1.7's stay-awake wait (the unattended block)
-    $s17 = P (P $checksU 'checks') 'S1.7'
-    Expect 'S1.7 (unattended)' ((P $s17 'verdict') -eq 'PASS') "verdict '$(P $s17 'verdict')'"
-    $stay = P (P $s17 'details') 'stay_awake'
-    Expect 'S1.7 one touch' (@(P $stay 'restarts').Count -eq 1) "restarts $(@(P $stay 'restarts').Count)"
-    Expect 'S1.7 idle reset (N3-I2)' ($null -ne (P (P $stay 'idle_reset') 'at')) 'one idle-timer reset after the after-reads is recorded'
-    $stU = @(P $checksU 'stages')
-    Expect 'stages' ($stU.Count -eq 2) "both stages are on record ($($stU.Count))"
-    if ($stU.Count -eq 2) {
-        $hoU = @(P $stU[1] 'hands_off')
-        Expect 'pop-up records (N3-I1)' ($hoU.Count -ge 2) "the stay-awake stage keeps its pop-up records ($($hoU.Count))"
-        Expect 'pop-up records (m2)' (@($hoU | Where-Object { (P $_ 'popup_started') -eq $true -and $null -eq (P $_ 'shown') }).Count -ge 1) 'the restarted pop-up (no warning wait) is recorded as not checked'
-    }
-    Expect 'cleanup (unattended)' ((P (P $checksU 'cleanup') 'pass') -eq $true) 'cleanup pass'
+    $v15 = "$(P (P $c 'S1.5') 'verdict')"
+    $d15 = P (P $c 'S1.5') 'details'
+    Expect 'S1.5 events' ($v15 -eq 'PASS') "verdict '$v15'"
+    Expect 'S1.5 method' ("$(P $d15 'method')" -match 'events') 'decided by the toasts'' own events'
+    Expect 'S1.5 no re-pop' ((P $d15 'no_second_pop') -eq $true) 'the progress toast did not re-pop'
+    Expect 'S1.5 quiet' ((P (P $d15 'quiet') 'no_pop') -eq $true -and (P (P $d15 'quiet') 'in_centre') -eq $true) 'the quiet toast is in the centre and did not pop'
+    Expect 'S1.5 control' ((P (P $d15 'quiet') 'control_toast_popped') -eq $true) 'the control toast popped (the pop signal fired this run)'
 
-    # ---- the 3 Sandbox runs
-    Expect 'sandbox-checks.json (N3-C2)' ($null -ne $runs) 'written and read back'
+    $s17 = P (P $c 'S1.7') 'details'
+    Expect 'S1.7' ((P (P $c 'S1.7') 'verdict') -eq 'PASS') "verdict '$(P (P $c 'S1.7') 'verdict')'"
+    Expect 'S1.7 self-check' ((P $s17 'self_check') -eq $true -and (P $s17 'api_set_ok') -eq $true -and (P $s17 'api_cleared_ok') -eq $true) 'the execution-state self-check held'
+    Expect 'S1.7 no real sleep' ("$(P $s17 'sleep_wake_note')" -match 'no real sleep') 'no real sleep was done; the broadcast record is from the owner run'
+
+    $s18 = P (P $c 'S1.8') 'details'
+    Expect 'S1.8' ((P (P $c 'S1.8') 'verdict') -eq 'PASS') "verdict '$(P (P $c 'S1.8') 'verdict')'"
+    Expect 'S1.8 route' ((P $s18 'route') -eq 'KEK') "route '$(P $s18 'route')'"
+    $pl = P $s18 'placement'
+    $scn = @(P $pl 'scenarios')
+    Expect 'S1.8 placement' ((P $pl 'ok') -eq $true -and $scn.Count -eq 3) "placement over $($scn.Count) scenarios, ok=$(P $pl 'ok')"
+    Expect 'S1.8 scenarios' (@($scn | ForEach-Object { $_.scenario }) -join ',' -eq 'normal,topmost,fullscreen') "scenarios: $(@($scn | ForEach-Object { $_.scenario }) -join ',')"
+    Expect 'S1.8 cancelled' (@($scn | Where-Object { "$($_.result_after_cancel)" -ne 'Canceled' }).Count -eq 0) 'each prompt was cancelled (no gesture)'
+    Expect 'S1.8 crypto settled' ((P (P $s18 'crypto_settled') 'create_ok') -eq $true -and (P (P $s18 'crypto_settled') 'sign_identical') -eq $true) 'the KEK crypto is settled from the owner run'
+
+    Expect 'cleanup' ((P (P $checks 'cleanup') 'pass') -eq $true) 'cleanup pass'
+
+    # ---- the pop-up records survive to the stage record (N3-I1), and the Hello placement probe
+    # recorded its pop-ups (shown, when, not checked).
+    $stage = @(P $checks 'stages')[0]
+    $ho = @(P $stage 'hands_off')
+    Expect 'pop-up records (N3-I1)' ($ho.Count -ge 3) "the stage keeps its pop-up records ($($ho.Count))"
+    Expect 'pop-up records (m2)' (@($ho | Where-Object { (P $_ 'shown') -eq $true -and $null -ne (P $_ 'shown_after_ms') }).Count -gt 0) 'shown pop-ups record when they showed'
+
+    # ---- the 3 Sandbox runs, unattended (no watched run, no lock)
+    Expect 'sandbox-checks.json' ($null -ne $runs) 'written and read back'
+    Expect 'no watched run' (-not (Test-Path -LiteralPath (Join-Path $res 'sandbox-observe.json'))) 'no sandbox-observe.json (no watched run)'
     if ($null -ne $runs) {
         Expect 'Sandbox runs' ((P $runs 'verdict') -eq 'PASS') "verdict '$(P $runs 'verdict')'"
         $rr = @(P $runs 'runs')
         Expect 'Sandbox runs' ($rr.Count -eq 3) "3 runs ($($rr.Count))"
+        $qt = P (P (P $rr[0] 'items') 'qt') 'file'
+        Expect 'Sandbox Qt' ((P (P $qt 'onscreen') 'available') -eq $true -and (P (P $qt 'offscreen') 'available') -eq $true) 'both Qt grabs recorded with their platform plugins'
         if ($rr.Count -eq 3) {
             $stop2 = "$(P (P (P (P (P $rr[1] 'items') 'lifecycle') 'file') 'stop') 'method')"
             Expect 'Sandbox run 2 ended through its pinned object' ($stop2.StartsWith('Kill')) "stop: '$stop2'"

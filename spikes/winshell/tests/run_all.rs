@@ -1,6 +1,6 @@
-//! Automation round (owner direction 2026-10-23): `run-all.ps1` runs a session in two blocks,
-//! `-Block Attended` and `-Block Unattended`. Its
-//! `-DryRun` prints the stages it would run and stops; nothing else runs. Needs `pwsh`.
+//! Owner run 3 (owner q1/q2): `run-all.ps1` is one unattended command — Part B on the host, then
+//! Part C in Windows Sandbox. Its `-DryRun` prints the stages it would run and stops; nothing else
+//! runs. Needs `pwsh`.
 
 use std::path::Path;
 use std::process::Command;
@@ -41,48 +41,16 @@ fn stages(v: &serde_json::Value) -> Vec<(String, Vec<String>)> {
 }
 
 #[test]
-fn the_attended_block_is_part_b_then_the_watched_sandbox_run() {
+fn the_one_command_is_part_b_then_the_sandbox_runs() {
     let (code, out, err) = dry_run(&[]);
     assert_eq!(code, Some(0), "{out}{err}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    assert_eq!(v["block"], "Attended");
     let s = stages(&v);
     assert_eq!(s.len(), 2, "{out}");
     assert_eq!(s[0].0, "run-spike.ps1");
-    assert_eq!(
-        s[0].1,
-        vec![
-            "-Only",
-            "S1.2p,S1.3,S1.4,S1.5,S1.7,S1.8",
-            "-PowerPart",
-            "sleep-wake"
-        ]
-    );
-    assert_eq!(
-        (s[1].0.as_str(), s[1].1.as_slice()),
-        ("run-sandbox.ps1", &["-Observe".to_string()][..])
-    );
-}
-
-#[test]
-fn the_unattended_block_is_the_stay_awake_wait_first_then_the_sandbox_runs() {
-    let (code, out, err) = dry_run(&["-Block", "Unattended"]);
-    assert_eq!(code, Some(0), "{out}{err}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    let s = stages(&v);
-    assert_eq!(s.len(), 2, "{out}");
-    assert_eq!(s[0].0, "run-spike.ps1");
-    assert_eq!(
-        s[0].1,
-        vec![
-            "-Only",
-            "S1.7",
-            "-Append",
-            "-PowerPart",
-            "stay-awake",
-            "-SkipBuild"
-        ]
-    );
+    // Part B: the host checks, one run, no -PowerPart and no -Append (S1.7 is self-contained now).
+    assert_eq!(s[0].1, vec!["-Only", "S1.2p,S1.3,S1.4,S1.5,S1.7,S1.8"]);
+    // Part C: 3 Sandbox runs, kept awake, no -Observe (no watched run, owner run 3).
     assert_eq!(s[1].0, "run-sandbox.ps1");
     assert_eq!(s[1].1, vec!["-Runs", "3", "-KeepAwake"]);
 }
@@ -95,27 +63,27 @@ fn a_rerun_of_one_check_runs_only_that_part() {
     let s = stages(&v);
     assert_eq!(s.len(), 1, "{out}");
     assert_eq!(s[0].1, vec!["-Only", "S1.4"]);
-    let (_, out, _) = dry_run(&["-Only", "s1.4", "-Block", "Unattended"]);
+    let (_, out, _) = dry_run(&["-Only", "s1.9"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    assert_eq!(stages(&v).len(), 0, "{out}");
+    let s = stages(&v);
+    assert_eq!(s.len(), 1, "{out}");
+    assert_eq!(s[0].0, "run-sandbox.ps1");
 }
 
 #[test]
-fn the_task0_folder_is_passed_to_both_sandbox_stages() {
-    for block in ["Attended", "Unattended"] {
-        let (code, out, err) = dry_run(&["-Block", block, "-Only", "S1.9", "-Task0Repo", r"X:\t0"]);
-        assert_eq!(code, Some(0), "{out}{err}");
-        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-        let s = stages(&v);
-        assert_eq!(s.len(), 1, "{out}");
-        assert_eq!(s[0].0, "run-sandbox.ps1");
-        assert!(
-            s[0].1
-                .ends_with(&["-Task0Repo".to_string(), r"X:\t0".to_string()]),
-            "{:?}",
-            s[0].1
-        );
-    }
+fn the_task0_folder_is_passed_to_the_sandbox_stage() {
+    let (code, out, err) = dry_run(&["-Only", "S1.9", "-Task0Repo", r"X:\t0"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    let s = stages(&v);
+    assert_eq!(s.len(), 1, "{out}");
+    assert_eq!(s[0].0, "run-sandbox.ps1");
+    assert!(
+        s[0].1
+            .ends_with(&["-Task0Repo".to_string(), r"X:\t0".to_string()]),
+        "{:?}",
+        s[0].1
+    );
 }
 
 #[test]

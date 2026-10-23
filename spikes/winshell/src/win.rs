@@ -9,10 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use windows::Data::Xml::Dom::XmlDocument;
+use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{
-    NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier,
+    NotificationSetting, ToastDismissalReason, ToastDismissedEventArgs, ToastFailedEventArgs,
+    ToastNotification, ToastNotificationManager, ToastNotifier,
 };
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM};
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_ELEVATION,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel,
@@ -29,9 +31,10 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Environment::GetCommandLineW;
 use windows::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, GetProcessTimes,
-    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, STARTUPINFOW,
+    CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
+    GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    STARTUPINFOW,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
@@ -41,7 +44,11 @@ use windows::Win32::UI::Shell::{
     ShellExecuteW, ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, SW_SHOWNORMAL,
+    AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, EnumWindows,
+    GUITHREADINFO, GW_HWNDNEXT, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetTopWindow,
+    GetWindow, GetWindowThreadProcessId, HWND_TOPMOST, RegisterClassW, SW_SHOW, SW_SHOWNORMAL,
+    SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, ShowWindow, WNDCLASSW, WS_EX_LEFT,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{BSTR, GUID, HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
@@ -140,6 +147,74 @@ pub fn make_toast(xml: &str, tag: &str, group: &str, suppress: bool) -> Result<T
     toast.SetGroup(&HSTRING::from(group))?;
     toast.SetSuppressPopup(suppress)?;
     Ok(toast)
+}
+
+/// What happened to a shown toast, as the sender sees it (owner run 3 analysis: UI Automation
+/// never saw a banner on the owner's PC, so whether a toast popped is read from the toast's own
+/// events instead). `ToastNotification.Dismissed` "occurs when a toast notification leaves the
+/// screen, either by expiring or being explicitly dismissed by the user"; its reason `TimedOut`
+/// means it "had been shown for the maximum allowed time and was faded out". `Failed` carries the
+/// error code, `Activated` a click. Each event is recorded as `{t_ms, kind, reason}`.
+pub type ToastEvents = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+/// Registers the Dismissed, Failed and Activated handlers on `toast` (before `Show`) and returns
+/// the list they fill. The handlers run on a thread pool thread while this process lives.
+pub fn watch_toast(toast: &ToastNotification) -> Result<ToastEvents> {
+    let events: ToastEvents = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let push = |events: &ToastEvents, v: Value| {
+        if let Ok(mut l) = events.lock() {
+            l.push(v);
+        }
+    };
+    let e = events.clone();
+    toast.Dismissed(&TypedEventHandler::new(
+        move |_: windows::core::Ref<ToastNotification>,
+              args: windows::core::Ref<ToastDismissedEventArgs>| {
+            let reason = match args.as_ref().map(|a| a.Reason()) {
+                Some(Ok(ToastDismissalReason::TimedOut)) => "TimedOut",
+                Some(Ok(ToastDismissalReason::UserCanceled)) => "UserCanceled",
+                Some(Ok(ToastDismissalReason::ApplicationHidden)) => "ApplicationHidden",
+                _ => "Unknown",
+            };
+            push(
+                &e,
+                json!({ "t_ms": now_ms() as u64, "kind": "dismissed", "reason": reason }),
+            );
+            Ok(())
+        },
+    ))?;
+    let e = events.clone();
+    toast.Failed(&TypedEventHandler::new(
+        move |_: windows::core::Ref<ToastNotification>,
+              args: windows::core::Ref<ToastFailedEventArgs>| {
+            let code = args
+                .as_ref()
+                .and_then(|a| a.ErrorCode().ok())
+                .map(|c| format!("0x{:08x}", c.0 as u32));
+            push(
+                &e,
+                json!({ "t_ms": now_ms() as u64, "kind": "failed", "reason": code }),
+            );
+            Ok(())
+        },
+    ))?;
+    let e = events.clone();
+    toast.Activated(&TypedEventHandler::new(
+        move |_: windows::core::Ref<ToastNotification>,
+              _: windows::core::Ref<windows::core::IInspectable>| {
+            push(
+                &e,
+                json!({ "t_ms": now_ms() as u64, "kind": "activated", "reason": null }),
+            );
+            Ok(())
+        },
+    ))?;
+    Ok(events)
+}
+
+/// The events recorded so far.
+pub fn toast_events(events: &ToastEvents) -> Vec<Value> {
+    events.lock().map(|l| l.clone()).unwrap_or_default()
 }
 
 /// The Tags of the spike's toasts in the notification centre.
@@ -383,6 +458,156 @@ pub fn token_info() -> Value {
         };
         json!({ "elevated": elevated, "integrity_rid": rid, "integrity": name })
     }
+}
+
+/// Creates a visible top-level window (a plain class, this module's `DefWindowProcW`) to own a
+/// WinRT prompt in a desktop app (owner run 3, S1.8: a Hello prompt owned by a foregrounded
+/// window comes to the front). `topmost` adds `WS_EX_TOPMOST`, `fullscreen` makes it a borderless
+/// popup over the whole virtual screen (to test the prompt in front of a fullscreen window).
+/// Returns the HWND as isize (0 on failure). The caller pumps no messages; the window is torn
+/// down when the process exits.
+pub fn create_owner_window(title: &str, topmost: bool, fullscreen: bool) -> isize {
+    // SAFETY: standard window creation; the class name and title outlive the call.
+    unsafe {
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(owner_wndproc),
+            lpszClassName: w!("winshell-owner"),
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+        let mut ex = WS_EX_LEFT;
+        if topmost || fullscreen {
+            ex |= WS_EX_TOPMOST;
+        }
+        let style = if fullscreen {
+            WS_POPUP | WS_VISIBLE
+        } else {
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE
+        };
+        let (x, y, w, h) = if fullscreen {
+            (0, 0, screen_metric(78), screen_metric(79))
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT, 480, 240)
+        };
+        let hwnd = match CreateWindowExW(
+            ex,
+            w!("winshell-owner"),
+            &HSTRING::from(title),
+            style,
+            x,
+            y,
+            w,
+            h,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(_) => return 0,
+        };
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        if topmost || fullscreen {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
+        // The same hand-off winshell-app proved in S1.4: let this process set the foreground,
+        // then set it. A console-less child can't otherwise raise its window.
+        let _ = AllowSetForegroundWindow(GetCurrentProcessId());
+        let _ = SetForegroundWindow(hwnd);
+        hwnd.0 as isize
+    }
+}
+
+extern "system" fn owner_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: windows::Win32::Foundation::WPARAM,
+    lp: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    // SAFETY: default handling for every message.
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+fn screen_metric(i: i32) -> i32 {
+    // SAFETY: plain query.
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_METRICS_INDEX(i),
+        )
+    }
+}
+
+/// Brings the foreground to `hwnd` once more (AllowSetForegroundWindow + SetForegroundWindow).
+pub fn raise_window(hwnd: isize) {
+    // SAFETY: `hwnd` is validated by the caller; a stale handle just fails.
+    unsafe {
+        let _ = AllowSetForegroundWindow(GetCurrentProcessId());
+        let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+    }
+}
+
+/// The newest top-level window whose class is `class_name` (read-only, EnumWindows). 0 if none.
+/// Used to find the Windows Hello / Windows Security dialog ("Credential Dialog Xaml Host").
+pub fn window_of_class(class_name: &str) -> isize {
+    let mut ctx = WindowClassCtx {
+        want: class_name.encode_utf16().collect(),
+        found: 0,
+    };
+    // SAFETY: EnumWindows calls the callback with our &mut ctx as lparam for the duration.
+    unsafe {
+        let _ = EnumWindows(Some(enum_class_proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.found
+}
+
+struct WindowClassCtx {
+    want: Vec<u16>,
+    found: isize,
+}
+
+extern "system" fn enum_class_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+    // SAFETY: lparam is the &mut WindowClassCtx from window_of_class, valid for the enumeration.
+    unsafe {
+        let ctx = &mut *(lparam.0 as *mut WindowClassCtx);
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 && buf[..n as usize] == ctx.want[..] {
+            ctx.found = hwnd.0 as isize;
+        }
+        windows::core::BOOL(1)
+    }
+}
+
+/// The z-order rank of `hwnd` among top-level windows: 0 is topmost, higher is further back;
+/// -1 if not found (read-only, GetTopWindow + GW_HWNDNEXT).
+pub fn window_z_rank(hwnd: isize) -> i32 {
+    if hwnd == 0 {
+        return -1;
+    }
+    // SAFETY: plain z-order walk from the desktop's top window.
+    unsafe {
+        let mut cur = GetTopWindow(None).unwrap_or_default();
+        let mut rank = 0;
+        while !cur.is_invalid() {
+            if cur.0 as isize == hwnd {
+                return rank;
+            }
+            cur = GetWindow(cur, GW_HWNDNEXT).unwrap_or_default();
+            rank += 1;
+            if rank > 100_000 {
+                break;
+            }
+        }
+    }
+    -1
 }
 
 /// `{fg_hwnd, fg_pid, focus_hwnd}`: the foreground window, its process and the window that

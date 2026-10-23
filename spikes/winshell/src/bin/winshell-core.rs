@@ -99,13 +99,44 @@ fn toast(args: &Args) -> Value {
         progress: false,
     });
     let suppress = args.has("suppress");
-    let posted =
-        notifier().and_then(|n| make_toast(&xml, tag, "spike", suppress).and_then(|t| n.Show(&t)));
+    let (posted, events) = show_watched(&xml, tag, "spike", suppress);
+    let watch = watch_events(args, events.as_ref());
     json!({
         "command": "toast", "tag": tag, "suppress": suppress, "xml": xml,
         "setting": notifier_setting(),
         "posted": posted.is_ok(), "error": posted.err().map(err),
+        "shown_ms": now_ms() as u64, "toast_events": watch,
     })
+}
+
+/// Makes the toast, registers its event handlers (`win::watch_toast`) and shows it.
+fn show_watched(
+    xml: &str,
+    tag: &str,
+    group: &str,
+    suppress: bool,
+) -> (windows::core::Result<()>, Option<win::ToastEvents>) {
+    match make_toast(xml, tag, group, suppress) {
+        Ok(t) => {
+            let events = win::watch_toast(&t).ok();
+            (notifier().and_then(|n| n.Show(&t)), events)
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// With `--watch-secs N`, stays N s and returns the toast's Dismissed, Failed and Activated
+/// events; without it, `null` (the toast is shown and left).
+fn watch_events(args: &Args, events: Option<&win::ToastEvents>) -> Value {
+    let secs = args.num("watch-secs", 0);
+    let Some(events) = events else {
+        return Value::Null;
+    };
+    if secs == 0 {
+        return Value::Null;
+    }
+    thread::sleep(Duration::from_secs(secs));
+    json!(win::toast_events(events))
 }
 
 fn update_name(r: NotificationUpdateResult) -> &'static str {
@@ -133,16 +164,22 @@ fn progress_data(seq: u32, value: f64) -> windows::core::Result<NotificationData
     Ok(data)
 }
 
-fn post_progress(body: &str) -> windows::core::Result<()> {
+fn post_progress(body: &str) -> (windows::core::Result<()>, Option<win::ToastEvents>) {
     let xml = toast_xml(&ToastSpec {
         title: "Spike job running",
         body,
         progress: true,
         ..Default::default()
     });
-    let toast = make_toast(&xml, PROGRESS_TAG, PROGRESS_GROUP, false)?;
-    toast.SetData(&progress_data(1, 0.0)?)?;
-    notifier()?.Show(&toast)
+    let toast = match make_toast(&xml, PROGRESS_TAG, PROGRESS_GROUP, false) {
+        Ok(t) => t,
+        Err(e) => return (Err(e), None),
+    };
+    let events = win::watch_toast(&toast).ok();
+    let shown = progress_data(1, 0.0)
+        .and_then(|d| toast.SetData(&d))
+        .and_then(|_| notifier()?.Show(&toast));
+    (shown, events)
 }
 
 fn do_update(seq: u32, value: f64) -> String {
@@ -160,7 +197,7 @@ fn do_update(seq: u32, value: f64) -> String {
 
 fn progress(args: &Args) -> Value {
     let secs = args.num("secs", 20) as u32;
-    let posted = post_progress(args.get_or("body", "Progress toast (S1.5)"));
+    let (posted, events) = post_progress(args.get_or("body", "Progress toast (S1.5)"));
     let mut updates = Vec::new();
     if posted.is_ok() {
         for i in 1..=secs {
@@ -170,10 +207,13 @@ fn progress(args: &Args) -> Value {
         }
     }
     let all_succeeded = !updates.is_empty() && updates.iter().all(|u| u["result"] == "Succeeded");
+    // The events since the post: one TimedOut per time the banner faded out. `--watch-secs`
+    // adds a wait after the last update, so a re-pop late in the updates is still seen.
+    let watch = watch_events(args, events.as_ref());
     json!({
         "command": "progress", "setting": notifier_setting(),
         "posted": posted.is_ok(), "error": posted.err().map(err),
-        "updates": updates, "all_succeeded": all_succeeded,
+        "updates": updates, "all_succeeded": all_succeeded, "toast_events": watch,
     })
 }
 
@@ -195,13 +235,13 @@ fn remove_repost(args: &Args) -> Value {
         body: args.get_or("body", "Posted after Remove(tag, group) (S1.5)"),
         ..Default::default()
     });
-    let posted = notifier().and_then(|n| {
-        make_toast(&xml, PROGRESS_TAG, PROGRESS_GROUP, false).and_then(|t| n.Show(&t))
-    });
+    let (posted, events) = show_watched(&xml, PROGRESS_TAG, PROGRESS_GROUP, false);
+    let watch = watch_events(args, events.as_ref());
     json!({
         "command": "remove-repost",
         "removed": removed.is_ok(), "remove_error": removed.err().map(err),
         "posted": posted.is_ok(), "post_error": posted.err().map(err),
+        "toast_events": watch,
     })
 }
 
