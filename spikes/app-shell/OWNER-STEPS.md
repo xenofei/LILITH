@@ -1,10 +1,31 @@
 # Spike 10: the owner's steps (plan 4a, Task 0, Step 3)
 
-You run these checks yourself. Each one needs you present, or has an effect outside the spike: ComfyUI, a reboot, a Defender scan, Narrator or a workflow push. The agent prepared them and stopped.
+## The one command (about 10-16 minutes; up to about 26 with the fallback)
 
-- Run them in a PowerShell 7 window from the repository root of the task worktree (branch `p4a-task0`), in the order below.
+Close every spike window, and don't start ComfyUI yourself. Then, in a PowerShell 7 window at the repository root of the task worktree (branch `p4a-task0`), run:
+
+```powershell
+pwsh -NoProfile -File spikes/app-shell/run-owner.ps1
+```
+
+- **What it does:**
+  1. It refuses at once, with nothing started, if a spike process (anything running from `spikes/app-shell/build`) or ComfyUI is already running.
+  2. It prints a time estimate.
+  3. It rebuilds and redeploys (S0.4).
+  4. It runs the accessibility check (S0.7, with UI Automation, so there's no Narrator and nothing for you to do).
+  5. It runs S0.6 under ComfyUI load (section 3 below), and the 5 Hz fallback only if S0.6 FAILs.
+  6. It prints one line per check at the end.
+- **During the run:**
+  - Spike windows open without taking focus.
+  - During S0.6, the spike window stays on top for about a minute, so don't use the mouse or keyboard then.
+  - Ctrl+C or closing the window stops everything, ComfyUI included.
+- **Afterwards:** hand `spikes/app-shell/results/` (`checks.json`, `s07.json`, `s06*.json`) back to the agent.
+
+The sections below are for reruns and for the checks the one command doesn't cover. S0.5 (b) and (c) passed on 2026-10-22, and S0.9 and S0.10 passed on CI on 2026-10-23.
+
+- Run them in a PowerShell 7 window from the repository root of the task worktree, in the order below.
 - Close heavy work first: every result records the machine's CPU load beside its timing.
-- Each script writes its result under `spikes/app-shell/results/`, and its logs to a new timestamped folder under `spikes/app-shell/build/runs/` (both git-ignored). Hand the result files back to the agent for Step 4.
+- Each script writes its result under `spikes/app-shell/results/`, and its logs to a new timestamped folder under `spikes/app-shell/build/runs/` (both git-ignored).
 
 Before any of them, `spikes/app-shell/build/deploy/` must exist and match the build. If it doesn't, close every spike window, then rebuild and redeploy (about 5 minutes on an idle machine; spike windows open and close without taking focus). The harness, `start-once.ps1 -ColdCache` and `comfy-load.ps1` refuse to run while a spike window is open, and say which one:
 
@@ -49,7 +70,7 @@ You run this script yourself, when you're ready; no agent starts it. It:
 - runs the spike for 5 s of warm-up plus 60 s measured, then stops ComfyUI.
 
 Before you start it:
-- **Close any spike window that's still open** (for example the Narrator one), then redeploy. The script refuses both an open spike window and a deploy folder that is older than the build:
+- **Close any spike window that's still open**, then redeploy. The script refuses both an open spike window and a deploy folder that is older than the build:
 
   ```powershell
   pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4
@@ -76,24 +97,22 @@ If it FAILs, run the fallback once:
 pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1 -RateHz 5 -ChartsBatched
 ```
 
-## 4. S0.7: Narrator smoke check (about 10 minutes)
+## 4. S0.7: the accessibility check (automated; about 1 minute)
 
-1. Start the spike normally. It takes focus this time, which Narrator needs:
+No Narrator and nothing to do: it reads the spike's windows through UI Automation, the same data a screen reader gets, without taking focus. `run-owner.ps1` runs it, and so does the harness on its own:
 
-   ```powershell
-   pwsh -NoProfile -File spikes/app-shell/start-once.ps1 -Label narrator -Interactive
-   ```
+```powershell
+pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.7
+```
 
-2. Turn Narrator on (Ctrl+Win+Enter). Click into the `main-a` window. Then press Tab and Shift+Tab through it, through `main-b`, and through the floating Counter window.
-3. Write yes or no for each item in `spikes/app-shell/results/s07.txt` (or just tell the agent):
-   - Is a KDDockWidgets title bar read (for example "Jobs" or "Grid")?
-   - Is a dock tab read ("Grid" / "Web" in `main-a`)?
-   - Is the counter button read by its accessible name, "Increment the counter"?
-   - Is a chart tile in `main-b` read as a chart with its name (for example "GPU load chart, latest 70.0 %")?
-   - When you press the counter button (Space while it has focus), does Narrator say "Count is now 1" (the `Accessible.announce()` message)?
-4. Turn Narrator off (Ctrl+Win+Enter) and close the spike's windows.
+Result: `results/s07.json`, with PASS or FAIL per item and the UIA values:
+- a dock title bar named "Jobs" or "Grid";
+- the tabs "Grid" and "Web" in `main-a`;
+- the button "Increment the counter";
+- the chart tile "GPU load chart, latest … %", with its control type;
+- the announcement "Count is now 1".
 
-## 5. S0.9 and S0.10: the scratch CI run (about 60–75 minutes, mostly waiting)
+## 5. S0.9 and S0.10: the scratch CI run (done: run 39894748059 passed on 2026-10-23; for a rerun only, about 60–75 minutes, mostly waiting)
 
 Agents' tokens can't change workflow files (P4a-R32), so you push this one. The workflow is ready at `spikes/app-shell/ci/spike10-qt.yml`.
 

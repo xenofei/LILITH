@@ -18,7 +18,7 @@
 .PARAMETER KddwTag
   KDDockWidgets tag (S0.1: v2.5.0; the fallback is v2.4.1).
 .PARAMETER Only
-  Run only these checks (S0.1, S0.2, S0.3, S0.4, S0.5a, S0.8, S0.9). S0.1's build always runs
+  Run only these checks (S0.1, S0.2, S0.3, S0.4, S0.5a, S0.7, S0.8, S0.9, S0.6smoke). S0.1's build always runs
   unless -NoBuild.
 .PARAMETER WarmStarts
   S0.5 (a): number of timed starts (default 10).
@@ -77,7 +77,7 @@ function Save-Results {
         minutes = [math]::Round(((Get-Date) - $started).TotalMinutes, 1)
         qt_version = (& qmake -query QT_VERSION 2>$null)
         kddw_tag = $KddwTag
-        owner_checks = @('S0.5b', 'S0.5c', 'S0.6', 'S0.7', 'S0.9 (CI)', 'S0.10')
+        owner_checks = @('S0.5b', 'S0.5c', 'S0.6', 'S0.9 (CI)', 'S0.10')
         checks = @($checks.Values)
     }
     $doc | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $Results 'checks.json')
@@ -110,7 +110,7 @@ if ($willDeploy) {
 if (Want 'S0.8') { $busy['%LOCALAPPDATA%\LILITH-spike (S0.8 deletes it; every spike instance uses it)'] = @(Get-SpikeAppProcesses) }
 # Every check but S0.2 launches the app, which shares the persistent WebEngine profile and the
 # caches with any open instance, so no launch either while one is open.
-$launches = @('S0.1', 'S0.3', 'S0.4', 'S0.5a', 'S0.8', 'S0.9', 'S0.6smoke' | Where-Object { Want $_ })
+$launches = @('S0.1', 'S0.3', 'S0.4', 'S0.5a', 'S0.7', 'S0.8', 'S0.9', 'S0.6smoke' | Where-Object { Want $_ })
 if ($launches.Count) { $busy["another spike instance (this run launches the app for $($launches -join ', '))"] = @(Get-SpikeAppProcesses) }
 $inUse = @($busy.Keys | Where-Object { $busy[$_].Count })
 if ($inUse.Count) {
@@ -167,12 +167,12 @@ function Invoke-App([string]$exe, [string[]]$appArgs, [hashtable]$envSet = @{}, 
         if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
             try { $p.Kill($true) } catch {}
             $p.WaitForExit()
-            return [ordered]@{ launched = $true; exit_code = $null; timed_out = $true; wall_ms = $sw.ElapsedMilliseconds
+            return [ordered]@{ launched = $true; pid = $p.Id; exit_code = $null; timed_out = $true; wall_ms = $sw.ElapsedMilliseconds
                                foreground_samples = $samples; foreground_was_ours = $fgHits }
         }
     }
     $p.WaitForExit()
-    [ordered]@{ launched = $true; exit_code = $p.ExitCode; timed_out = $false; wall_ms = $sw.ElapsedMilliseconds
+    [ordered]@{ launched = $true; pid = $p.Id; exit_code = $p.ExitCode; timed_out = $false; wall_ms = $sw.ElapsedMilliseconds
                 foreground_samples = $samples; foreground_was_ours = $fgHits }
 }
 
@@ -576,6 +576,48 @@ if (Want 'S0.9') {
 }
 
 # ==========================================================================================
+# S0.7 (APP-156): the accessibility smoke check, automated with UI Automation (no Narrator, no
+# owner). The deployed app runs with --no-activate (UIA needs no focus) and clicks its own
+# counter 3 times from 8 s; s07-uia.ps1 (Windows PowerShell 5.1, the managed UIA client) reads
+# its windows' elements and listens for UIA notification events. Get-S07Items judges each item.
+# ==========================================================================================
+if (Want 'S0.7') {
+    $uiaOut = Join-Path $Runs 's07-uia.json'
+    $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $script:uiaProc = $null
+    $r = Invoke-Spike $dExe 's07' @('--auto-counter', '8000', '--quit-after', '12000') $StripSet $StripUnset 60 $true {
+        param($proc)
+        $script:uiaProc = Start-Process $ps51 -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', (Join-Path $Root 's07-uia.ps1'), '-AppPid', $proc.Id, '-Out', $uiaOut, '-WaitSeconds', '40'
+        $script:s07AppStart = ([DateTimeOffset]$proc.StartTime).ToUnixTimeMilliseconds()
+    }
+    # The client ends when the app does; it is stopped through its own Process object otherwise.
+    if ($script:uiaProc -and -not $script:uiaProc.WaitForExit(30000)) { try { $script:uiaProc.Kill() } catch {} }
+    $uia = if (Test-Path $uiaOut) { Get-Content $uiaOut -Raw | ConvertFrom-Json } else { $null }
+    $click = Get-Events $r.events 'counter' | Select-Object -First 1
+    $firstClickUtc = if ($click -and $script:s07AppStart) { $script:s07AppStart + [long]$click.t_ms } else { $null }
+    if (-not $uia -or $uia.error) {
+        $detail = [ordered]@{ reason = $(if ($uia) { "UIA client error: $($uia.error)" } else { 'the UIA client wrote no result' }) }
+        $verdict = 'ERROR'
+    } else {
+        $items = Get-S07Items $uia $r.run.pid $firstClickUtc
+        $verdict = if ($r.run.exit_code -ne 0) { "FAIL (the app exited with $($r.run.exit_code))" } else { Get-S07Verdict $items }
+        $detail = [ordered]@{ items = $items }
+    }
+    $detail.exit_code = $r.run.exit_code
+    $detail.deploy_stale_files = @(Test-DeployCurrent $Deploy $BinDir)   # empty when the deploy matches the build
+    $detail.focus_taken = ($r.run.foreground_was_ours -gt 0)
+    $detail.counter_clicks_logged = @(Get-Events $r.events 'counter').Count
+    $detail.uia = if ($uia) { [ordered]@{ windows = $uia.windows; windows_found_ms = $uia.windows_found_ms; subscribed_ms = $uia.subscribed_ms
+                                         elements = @($uia.elements).Count; element_errors = $uia.element_errors
+                                         notifications = $uia.notifications } } else { $null }
+    $detail.files = [ordered]@{ log = $r.log; uia = $uiaOut }
+    Set-Check 'S0.7' $verdict $detail
+    $checks['S0.7'] | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 (Join-Path $Results 's07.json')
+    Save-Results
+}
+
+# ==========================================================================================
 # S0.6 smoke (not a verdict): the S0.6 app run without ComfyUI, short, to check its plumbing:
 # the measured report, the primary display's refresh rate, the list visible throughout, the Web dock
 # shown beside it. comfy-load.ps1 makes the real run.
@@ -606,7 +648,7 @@ if (Want 'S0.6smoke') {
         vram_samples = $vram.Count; vram_missing_retries = $vramMissing
         vram_local_usage_max_mib = ($vram | Measure-Object local_usage_mib -Maximum).Maximum; windows = $m.windows; frame_threshold_ms = (Get-FrameThresholdMs $refresh)
         dropped_frames = (Get-DroppedFrames @($m.frame_interval_ms.raw) $refresh)
-        heartbeat_lateness_ms = $hb; frame_interval_ms = $fr; load_counts = $counts
+        heartbeat_lateness_ms = $hb; frame_interval_ms = $fr; load_counts = $counts; web_problems = @(Test-S06Web $ev)
         cpu_percent = (Get-CpuPercent); focus_taken = ($r.run.foreground_was_ours -gt 0); log = $r.log })
     Save-Results
 }

@@ -288,6 +288,22 @@ function Get-SpikeAppProcesses([object[]]$Processes = $null) {
 # a slip can't point the deploy folder's delete at build/, runs/, cmake/ or the sources.
 function Test-DeployName([string]$Name) { [bool]($Name -cmatch '^deploy(-[A-Za-z0-9]+)?\z') }
 
+# run-owner.ps1's refusal, by path only: a process whose executable is under the spike's build
+# folder (a spike window or QtWebEngineProcess from any build or deploy folder), or ComfyUI: an
+# executable under the ComfyUI folder (its venv's python) or a command line naming its main.py.
+function Get-OwnerRunBlockers([string]$BuildDir, [string]$ComfyMain, [object[]]$Processes = $null) {
+    if ($null -eq $Processes) { $Processes = @(Get-CimInstance Win32_Process) }
+    $why = @()
+    $spike = @(Get-ProcessesUnder $BuildDir $Processes)
+    if ($spike.Count) { $why += "a spike process runs from spikes/app-shell/build (pid $(($spike | ForEach-Object ProcessId) -join ', ')); close its windows" }
+    $comfyDir = Split-Path (Split-Path $ComfyMain)   # <ComfyUI folder>\ComfyUI\main.py; the venv is under the folder
+    $main = [IO.Path]::GetFullPath($ComfyMain)
+    $comfy = @(@(Get-ProcessesUnder $comfyDir $Processes) + @($Processes | Where-Object {
+        $_.CommandLine -and $_.CommandLine.IndexOf($main, [StringComparison]::OrdinalIgnoreCase) -ge 0 }) | Sort-Object ProcessId -Unique)
+    if ($comfy.Count) { $why += "ComfyUI is running (pid $(($comfy | ForEach-Object ProcessId) -join ', ')); stop it first" }
+    $why
+}
+
 # ---- S0.6 workload and refresh-rate checks ----------------------------------------------------
 
 # Did the bar's workload actually run? load_counts is logged at the end of the measured window,
@@ -310,6 +326,24 @@ function Test-S06Workload($Counts, [int]$MeasureSeconds = 60, [int]$RateHz = 10)
     $p
 }
 
+# Did the Web dock's view really load (S0.6 runs the app inside the kill-on-close job, and
+# WebEngine's sandboxed renderer must work there)? From the app's own log: the dock shown, then a
+# web_load "succeeded" after it, and no web_render_process_terminated. S0.6 takes no grabs, so
+# this is the evidence. Returns the problems (empty when it loaded).
+function Test-S06Web([object[]]$Events) {
+    $shown = @($Events | Where-Object { $_.event -eq 'web_dock_shown' }) | Select-Object -First 1
+    if (-not $shown) { return @('web dock not shown') }
+    $p = @()
+    $ok = @($Events | Where-Object { $_.event -eq 'web_load' -and $_.status -eq 'succeeded' -and [double]$_.t_ms -ge [double]$shown.t_ms })
+    if (-not $ok.Count) {
+        $last = @($Events | Where-Object { $_.event -eq 'web_load' }) | Select-Object -Last 1
+        $p += if ($last) { "web view did not load (last load event: $($last.status) $($last.url) $($last.error_string))".TrimEnd() } else { 'web view did not load (no web_load event)' }
+    }
+    $dead = @($Events | Where-Object { $_.event -eq 'web_render_process_terminated' })
+    if ($dead.Count) { $p += "web renderer terminated ($($dead[0].status), exit $($dead[0].exit_code))" }
+    $p
+}
+
 # The final S0.6 verdict: a FAIL stays a FAIL; otherwise a missing workload or a refresh rate the
 # app and Windows disagree on makes the run INVALID, because PASS would then rest on missing data.
 # Every cause is kept: an INVALID from the GPU check gets these appended, not replaced.
@@ -327,6 +361,54 @@ function Complete-S06Verdict([string]$Verdict, [string[]]$WorkloadProblems, [boo
 # A refresh rate S0.6 can judge with: 0, 1 ("hardware default") and anything under 24 Hz count as
 # unknown.
 function Test-PlausibleRefresh([double]$Hz) { $Hz -ge 24 -and $Hz -le 1000 }
+
+# ---- S0.7: the UI Automation check (APP-156) ----------------------------------------------------
+
+# S0.7's items, judged from s07-uia.ps1's output (elements of the app's windows and the UIA
+# notifications it received). Each item is PASS or FAIL with the UIA values it matched. Only
+# elements from Qt's own provider count (FrameworkId "Qt"), not Windows' non-client title bars.
+# $FirstClickUtc (epoch ms of the first --auto-counter click, from the app's log) makes a missed
+# announcement INVALID rather than FAIL when the client subscribed after that click.
+function Get-S07Items($Uia, [int]$AppPid, $FirstClickUtc = $null) {
+    $qt = @($Uia.elements | Where-Object { $_.framework_id -eq 'Qt' })
+    $pick = { param($rows) @($rows | ForEach-Object { [ordered]@{ window = $_.window; name = $_.name; control_type = $_.control_type
+                                                                  localized_control_type = $_.localized_control_type } }) }
+    $items = [ordered]@{}
+    $tb = @($qt | Where-Object { $_.control_type -eq 'ControlType.TitleBar' -and $_.name -in 'Jobs', 'Grid' })
+    $items.kddw_title_bar = [ordered]@{ verdict = $(if ($tb.Count) { 'PASS' } else { 'FAIL' }); kddw = $true
+        wanted = 'a dock title bar (ControlType.TitleBar) named "Jobs" or "Grid"'; found = @(& $pick $tb) }
+    $tabs = @($qt | Where-Object { $_.control_type -eq 'ControlType.TabItem' -and $_.name -in 'Grid', 'Web' -and $_.window -match 'main-a' })
+    $both = (@($tabs | Where-Object name -eq 'Grid').Count -gt 0) -and (@($tabs | Where-Object name -eq 'Web').Count -gt 0)
+    $items.kddw_dock_tabs = [ordered]@{ verdict = $(if ($both) { 'PASS' } else { 'FAIL' }); kddw = $true
+        wanted = 'tabs (ControlType.TabItem) "Grid" and "Web" in main-a'; found = @(& $pick $tabs) }
+    $btn = @($qt | Where-Object { $_.control_type -eq 'ControlType.Button' -and $_.name -eq 'Increment the counter' })
+    $items.counter_button = [ordered]@{ verdict = $(if ($btn.Count) { 'PASS' } else { 'FAIL' }); kddw = $false
+        wanted = 'a button named "Increment the counter"'; found = @(& $pick $btn) }
+    $chart = @($qt | Where-Object { $_.name -match '^GPU load chart, latest \d+(\.\d+)? %$' -and $_.window -match 'main-b' })
+    $items.chart_tile = [ordered]@{ verdict = $(if ($chart.Count) { 'PASS' } else { 'FAIL' }); kddw = $false
+        wanted = 'the chart tile in main-b named "GPU load chart, latest <n> %" (its ControlType is recorded)'; found = @(& $pick $chart) }
+    $note = @($Uia.notifications | Where-Object { $_.display_string -eq 'Count is now 1' -and [int]$_.process_id -eq $AppPid })
+    $late = ($null -ne $FirstClickUtc) -and ($null -ne $Uia.subscribed_utc) -and ([long]$Uia.subscribed_utc -gt [long]$FirstClickUtc)
+    $items.announce = [ordered]@{ verdict = $(if ($note.Count) { 'PASS' } elseif ($late) { 'INVALID (the client subscribed after the first click)' } else { 'FAIL' }); kddw = $false
+        wanted = 'a UIA notification event "Count is now 1" from the app (Accessible.announce)'
+        found = @($note | ForEach-Object { [ordered]@{ display_string = $_.display_string; kind = $_.kind; processing = $_.processing
+                                                       source_name = $_.source_name; source_control_type = $_.source_control_type } })
+        notifications_received = @($Uia.notifications).Count }
+    $items
+}
+
+# S0.7's verdict (the brief): PASS when the spike's own controls are read (the counter button,
+# the chart tile, the announcement). The KDDockWidgets items are recorded; a FAIL there doesn't
+# fail the check but is named for the owner (APP-156).
+function Get-S07Verdict($Items) {
+    $own = @($Items.Keys | Where-Object { -not $Items[$_].kddw })
+    $bad = @($own | Where-Object { $Items[$_].verdict -match '^FAIL' })
+    $invalid = @($own | Where-Object { $Items[$_].verdict -match '^INVALID' })
+    $kddwNo = @($Items.Keys | Where-Object { $Items[$_].kddw -and $Items[$_].verdict -ne 'PASS' })
+    $v = if ($bad.Count) { "FAIL ($($bad -join ', '))" } elseif ($invalid.Count) { "INVALID ($($invalid -join ', '))" } else { 'PASS' }
+    if ($kddwNo.Count) { $v += "; KDDockWidgets not read, for the owner: $($kddwNo -join ', ')" }
+    $v
+}
 
 # ---- a kill-on-close job object (comfy-load.ps1) -----------------------------------------------
 # Every process in the job dies when the last handle to the job closes. comfy-load.ps1 creates
@@ -505,5 +587,6 @@ function Get-CpuPercent {
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
+    Get-OwnerRunBlockers, Test-S06Web, Get-S07Items, Get-S07Verdict,
     New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

@@ -99,13 +99,18 @@ $vramFile = Join-Path $Runs 'vram.jsonl'
 # ---- -SamplersOnly: check the sampling against another process ------------------------------
 if ($SamplersOnly) {
     if (-not $ProcessId) { throw '-SamplersOnly needs -ProcessId' }
-    $g = Start-GpuSampler $gpuFile -Job $job
-    $v = Start-VramSampler $ProcessId $vramFile -Job $job
-    $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    Start-Sleep -Seconds ($SamplerSeconds + 2)
-    $t1 = $t0 + $SamplerSeconds * 1000 + 1000
-    Stop-Process -Id $g.Id -Force -ErrorAction SilentlyContinue
-    try { $v.Kill() } catch {}
+    $g = $null; $v = $null
+    try {   # Ctrl+C or a throw still stops both samplers, also in an in-process run
+        $g = Start-GpuSampler $gpuFile -Job $job
+        $v = Start-VramSampler $ProcessId $vramFile -Job $job
+        $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        Start-Sleep -Seconds ($SamplerSeconds + 2)
+        $t1 = $t0 + $SamplerSeconds * 1000 + 1000
+    } finally {
+        if ($g -and -not $g.HasExited) { try { $g.Kill() } catch {} }
+        if ($v -and -not $v.HasExited) { try { $v.Kill() } catch {} }
+        $job.Dispose()
+    }
     $gs = Read-GpuSamples $gpuFile
     $vs = Read-VramSamples $vramFile
     $win = [ordered]@{ start = $t0 + 1000; end = $t1 }
@@ -117,7 +122,6 @@ if ($SamplersOnly) {
                        os_primary_refresh_hz = (Get-OsPrimaryRefreshHz); files = $Runs }
     $out | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $Results 's06-samplers-check.json')
     $out | ConvertTo-Json -Depth 4
-    $job.Dispose()
     return
 }
 
@@ -129,7 +133,7 @@ if ($missing.Count) { throw "the deploy folder is incomplete (run run-spike.ps1 
 $stale = @(Test-DeployCurrent $Deploy (Join-Path $Root 'build\cmake\bin'))
 if ($stale.Count) { throw "the deploy folder is older than the build ($($stale -join ', ')); redeploy first: pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4" }
 # No other spike instance during the measurement: it would share the GPU, the CPU and the
-# persistent WebEngine profile (for example a Narrator window still open from step 4).
+# persistent WebEngine profile (for example a spike window left open from an earlier check).
 $others = @(Get-SpikeAppProcesses)
 if ($others.Count) { throw "another spike app is running (pid $(($others | ForEach-Object ProcessId) -join ', ')); close it first" }
 if (Test-Comfy) { throw "something already answers on $Url; this script only measures with a ComfyUI it starts itself" }
@@ -245,7 +249,10 @@ try {
     $res.load_counts = $counts
     $res.stack_files = @(Get-ChildItem $Runs -Filter 's06.jsonl.*stacks.txt' -ErrorAction SilentlyContinue | ForEach-Object Name)
     $res.refresh_mismatch = $rr.mismatch
-    $res.workload_problems = @(Test-S06Workload $counts $MeasureSeconds $RateHz)
+    $res.web = [ordered]@{ problems = @(Test-S06Web $ev)
+                           loads = @($ev | Where-Object { $_.event -eq 'web_load' } | ForEach-Object { "$($_.status) $($_.url)" }) }
+    # A web view that didn't load counts with the workload: the run is then INVALID, with the reason.
+    $res.workload_problems = @(Test-S06Workload $counts $MeasureSeconds $RateHz) + @($res.web.problems)
     $verdict = Get-S06Verdict -HasMeasuredReport ([bool]$measured) -ExitCode $res.app_exit_code -TimedOut $res.app_timed_out `
         -Heartbeat $hb -Frames $fr -RefreshHz $refresh -Coverage $cov
     # The bar's workload must have run, with the list on screen throughout, and the refresh rate

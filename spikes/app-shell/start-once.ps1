@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   One start of the deployed spike, for the owner's checks (OWNER-STEPS.md): S0.5 (b) after a
-  reboot, S0.5 (c) after a Defender scan, and S0.7 (Narrator, -Interactive).
+  reboot and S0.5 (c) after a Defender scan (-Interactive starts it with focus, for a manual look).
 
 .DESCRIPTION
   Checks that the folder holds the Qt, KDDockWidgets, shim and VC++ DLLs first (it never launches
