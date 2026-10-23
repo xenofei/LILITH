@@ -74,7 +74,11 @@ Per check:
   - **Layout:** under `--load` the Web dock sits below Jobs and Grid instead of behind Grid, so the scrolled list stays on screen. The list logs, once a second, whether it was visible, and the run is INVALID if it was hidden for any second of the measured window.
   - **Sampling:** `nvidia-smi -lms 500` samples GPU utilisation with its own clock. PDH `GPU Process Memory(pid_*)` Local and Dedicated Usage are sampled about once a second, one `Get-Counter` call at a time, retrying while the app has no GPU instance yet. The primary display's refresh rate is read from Windows (`EnumDisplaySettingsW`) as well as from the app; the app's value is used, and Windows' only if the app reported none.
   - **Load and gate:** `comfy/keep_busy.py` keeps 2 prompts outstanding (Z-Image Turbo int8, 1024×1024, batch 2, 20 steps, preview images only) until the script stops it, so the GPU doesn't idle between prompts and the load can't end before the measured minute. The app starts only when the last 20 s of samples meet the GPU condition below; if that doesn't happen within 300 s, the app isn't run and the result is INVALID. The script also refuses a deploy folder whose binaries differ from the build's.
-  - **GPU condition (`≥ 95 % throughout`):** at least 48 samples in the measured 60 s and no gap over 2 s (the window's edges count as gaps), and utilisation ≥ 95 % in at least 90 % of the samples. Brief dips between prompts are allowed, and every dip is recorded with its time and value. Otherwise the run is INVALID.
+  - **GPU condition (the bar's "≥ 95 % throughout"):** at least 48 samples in the measured 60 s and no gap over 2 s (the window's edges count as gaps), and utilisation **≥ 90 %** in at least 90 % of the samples. The gate before the run uses the same condition. Brief dips between prompts are allowed, and every dip is recorded with its time and value. Otherwise the run is INVALID.
+    - **Deviation (owner ruling, 2026-10-23):** the level was 95 % until the owner's third run. Under the real ComfyUI loop with the spike running, the GPU reads 99 % with isolated 92–93 % samples. So 95 % measured the workload's own ceiling, not whether ComfyUI loads the GPU (§5 has the distribution). `rescore-s06.ps1` re-scores a finished result offline from its raw files, keeping the original verdict.
+  - **Hands-off notice:** 10 s before the app starts, a small topmost notice (`hands-off.ps1`) warns the owner not to use the keyboard or mouse, counts down the measured minute, and then says the PC is free.
+    - **No focus or input:** it never takes the focus or the input (no-activate, click-through), sits on a screen other than the primary one when there is one, and redraws a line of text once a second. S0.7 shows it too, before its click.
+    - **Effect, without ComfyUI:** in six alternating S0.6 smoke runs, three with it and three without, it made no difference that showed above the run-to-run spread. It was never the foreground window.
   - **Failures:** a crash, a hang (killed at the timeout) or a missing measured report is FAIL, decided before any validity check.
   - **Web view:** the app runs inside the kill-on-close job, so WebEngine's sandboxed renderer must work there. Under `--load` the Web dock loads a local data: page (`Get-S06WebUrl`): a coloured body, a canvas drawn by script, and a title set to `s06-rendered-42` by script only after two `requestAnimationFrame` callbacks following the draw (they run only when the compositor asks the visible view for frames). The app logs the title (`web_title`). A completed run is INVALID unless the log shows, after the Web dock is shown, a `web_load` that `succeeded` for that data: page and that title, which shows the page loaded, ran its script and reached a painted frame inside the job (not that the GPU rastered it), and no `web_render_process_terminated`. The VRAM figure is therefore taken with that page loaded and painting. S0.3 and S0.9 keep `about:blank`, which their bars name. S0.6 takes no grabs. In a development run inside such a job, the renderer `QtWebEngineProcess` (`--type=renderer`) was the app's only WebEngine child, and it was in the job. No separate GPU process appeared, so the GPU service runs in the app's own process, the one the VRAM sampler reads.
   - **Other GPU users:** right before ComfyUI starts, the script checks again for a ComfyUI or spike process by path, and records the GPU's compute processes from `nvidia-smi --query-compute-apps` (pid and exe name, in the git-ignored raw result only), to check afterwards for another GPU user during the measurement. It can't refuse on that list, because on Windows the list also holds desktop graphics apps. An elevated process shows in it, but not in the path checks, because Windows hides an elevated process's path and command line. §5 reports only the list's count, never the names.
@@ -113,44 +117,232 @@ Copied verbatim from the plan (Task 0) before anything was run:
 
 ## 5. Measurements
 
-The tables are written after the owner's checks (Step 4). Recorded so far:
+Raw data is written to `spikes/app-shell/results/` and the per-run logs to `spikes/app-shell/build/runs/`, both git-ignored (raw output kept privately). The step-2 checks come from the from-scratch harness runs of 2026-10-22, with the machine idle. S0.5 (b) and (c) and S0.6 are the owner's runs. S0.4 and S0.7 are also from the owner's one-command run of 2026-10-23. S0.9 and S0.10 come from the scratch CI run.
 
-- **S0.5 (b), the first start after a reboot:** PASS, `interactive` 452 ms (`first_frame` 416 ms), CPU 4.7 % before the start.
-- **S0.5 (c), the first start of a fresh copy after a Defender scan, with the QML and pipeline caches moved aside:** PASS, `interactive` 566 ms (`first_frame` 529 ms), CPU 1.8 % before the start.
-- **S0.7, the accessibility check: PASS, all 5 items read** (UI Automation, 2026-10-23, a fresh deploy folder with spike 02's stripped environment; re-verified with the client clicking through InvokePattern: items present 1.0 s after the start, subscribed at 1.2 s, clicked at 1.25 s, app closed at 1.4 s). All 5 items are read; the values below are the ones UIA reported:
+| Check | Verdict | Key numbers |
+|---|---|---|
+| S0.1 KDDockWidgets 2.5.0 | PASS | `v2.5.0`; configure 21 s, build 50 s; 0 warning lines from our files |
+| S0.2 the `lil-qt` route | PASS with an underscore package name | the dashed name fails to link |
+| S0.3 lazy WebEngine | PASS | WebEngine DLL absent until the dock is shown, loaded about 0.3 s after |
+| S0.4 deploy | PASS (hard); soft target missed | trimmed 332.1 MiB against the 300 MiB target |
+| S0.5 (a) warm starts | PASS on an idle machine | `interactive` p50 404 ms, max 429 ms (re-measure p50 414, max 426) |
+| S0.5 (b) after a reboot | PASS | `interactive` 452 ms |
+| S0.5 (c) fresh copy after a Defender scan, cold caches | PASS | `interactive` 566 ms |
+| S0.6 stalls under ComfyUI load | INVALID under the plan's ≥ 95 % rule; **PASS re-scored at ≥ 90 %** (a deviation, below) | heartbeat p99 2.835 ms, frame p99 8.466 ms against 16 ms |
+| S0.7 accessibility | PASS, all 5 items (by UI Automation, a deviation) | — |
+| S0.8 caches | PASS | under `%LOCALAPPDATA%\LILITH-spike\image\cache\` |
+| S0.9 offscreen GUI tests | PASS locally and on `windows-2025` | 5 of 5 items in both environments |
+| S0.10 CI time with Qt | PASS | 25 min 56 s against 50 min |
 
-  | Item | Result | UIA values |
-  |---|---|---|
-  | KDDockWidgets title bar | PASS | "Jobs" and "Grid", ControlType.TitleBar, in `main-a` |
-  | Dock tabs | PASS | "Grid" and "Web", ControlType.TabItem, in `main-a` |
-  | Counter button | PASS | "Increment the counter", ControlType.Button (the floating Counter window is owned by `main-b` in the UIA tree) |
-  | Chart tile | PASS | "GPU load chart, latest 44.0 %", **ControlType.Custom** (LocalizedControlType "custom") in `main-b` |
-  | Announcement | PASS | notification "Count is now 1" (then 2 and 3), kind Other, processing All, raised on the button |
+### S0.1 KDDockWidgets 2.5.0: PASS
 
-  - **Deviation from the bar (owner direction, 2026-10-23):** the bar has the owner walk through with Narrator. The check now reads what a screen reader gets through UIA instead, the same provider data Narrator reads, without speech or keyboard navigation. Tab order and what Narrator actually speaks aren't tested.
-  - **Note:** Qt exposes `Accessible.Chart` as UIA's Custom type (UIA has no chart type), so the word "chart" reaches a screen reader only through the name. The tile's name carries it ("… chart, latest …"), and Task 18's pattern should keep it there.
-- **S0.9, offscreen GUI tests on CI: PASS.** The scratch CI run 39894748059 on `windows-2025` (2026-10-23) passed all 5 items under both `offscreen` and `offscreen` with `QT_QUICK_BACKEND=software`: the KDDockWidgets main window and floating window, the `PathPolyline` Shape, the `SpikeWeb` `Loader`, `about:blank`, and a grab that isn't one flat colour.
-- **S0.10, CI time with Qt: PASS.** The same run's job took 25 min 56 s, against the 50-minute limit. Of that, the Qt install took 0.9 min and the spike build 5.3 min.
-- **S0.6, the owner's first run:** INVALID, not measured under load. The load generator submitted one prompt at a time, so only about 75 % of the 500 ms samples were at ≥ 95 %, and the saturation wait never passed. The load ran for a fixed 240 s and ended before the app's measured minute, so that minute ran on an idle GPU. The deploy folder was older than the build, so the refresh rate wasn't found in the app's report. No VRAM samples were taken. Under that light load (ComfyUI up, the GPU at 11–17 %), the app's own numbers were heartbeat lateness p99 1.1 ms (max 334.5 ms) and frame interval p99 8.4 ms (max 341.5 ms); the fallback run gave p99 1.4 ms (max 643.6 ms) and 8.4 ms (max 30.1 ms). They don't count, because the runs were INVALID, but the single stalls of 0.3–0.6 s are worth watching in the rerun. The load, the gate, the refresh-rate reading and the VRAM sampling were fixed before the rerun. The rerun also checks that the workload ran (`load_counts`) before it can PASS.
+- **Version:** `FetchContent` at tag `v2.5.0`, built inside the time box. 2.4.1 wasn't needed.
+- **Build:** configure took 21 s and build 50 s, both exiting 0.
+- **Warnings:** 0 lines from our files and 0 from KDDockWidgets. There was 1 toolchain warning: Qt's `Qt6QmlAssetDownloaderPrivate` wants `Qt6TaskTree`, the same as in spike 02, and reached through our `find_package`. No warning flag was added or removed in our files.
+- **Restore:** 3 of 3 save-and-restore cycles put all 3 windows back at the exact pixel (tolerance 2 px), with every dock in the same window, floating state and rectangle by unique name.
+- **Per-window save:** the round trip saved `main-b` alone, then restored it and its dock, and left `main-a` and the floating window alone.
+- **Exit codes:** all 0.
 
-Recorded during Step 2:
+### S0.2 The `lil-qt` route: PASS with an underscore package name
 
-- **S0.5 (a) deviation from the bar:** the scored warm starts ran on an idle machine. The harness waited for CPU load under 35 % before each start, and recorded it (0.4–5.8 %). The bar names no load condition, so S0.5 (a) is a PASS on an idle machine. Trial starts while other workloads held the CPU near 100 % took about 4–14 s to `interactive`, and one never reached `qml_loaded` within 120 s and was killed.
-- **One slow start on an idle machine (an S0.5 (a) FAIL, then the bar's one re-measure passed).** Three scored runs of 10 warm starts were made in Step 2, with CPU load of 0–8.7 % before each start. 29 of the 30 timed starts reached `interactive` in 397–429 ms. One took 5,786 ms, at 0.3 % CPU: `main` was reached at 643 ms (about 52 ms in the others) and `qml_loaded` at 5,213 ms (about 220 ms). The stack dump, taken 5 s into the stall, shows the GUI thread waiting for the threaded render loop during the first expose event; the earlier part of the delay (before `main`, and loading the QML) has no stacks. Cause not established. The bar's profiling step (`qmlcachegen`, the pipeline cache, deferred panel loading) has not been done. The re-measure gave 10 of 10 under 2 s (p50 414 ms, max 426 ms).
-- **Two long stalls, observed under ~100 % CPU from other workloads; cause not established.** Both were in trial runs before the scored run, with the first version of the stack dumper, which suspended threads while symbolising and may have lengthened or caused hangs (fixed since).
-  - In a build-tree run, the GUI thread made no event-loop progress for about 127 s, between `interactive` (1.9 s) and the end of the scripted layout step (128.8 s). No stacks were captured.
-  - In a deployed warm start, `qml_loaded` was never logged within 120 s. The stack dump came out empty.
-  - Neither recurred in later runs on an idle machine. S0.5 (b) and (c) run with the fixed dumper.
-- **A 10.6 s stall on the first WebEngine show** after a fresh deploy (also during the loaded period, so a fresh deploy and CPU contention can't be told apart). The GUI thread was in `QQuickWebEngineProfilePrototype::componentComplete`, then `QWebEngineSettings`, `QFont::defaultFamily` and DirectWrite font-fallback population, waiting on the font cache service (stack dump at 5.1 s). Later first shows took 0.3–0.6 s.
+- **Both names:**
+  - `cargo build --workspace --locked` (63.5 s) and `cargo clippy -p <member> --all-targets --locked -- -D warnings` pass with no Qt folder on PATH and `QMAKE` unset.
+  - The workspace `Cargo.lock` is unchanged by the CMake build.
+- **`lil_qt_probe`:** builds through the exact `cxx_qt_import_crate(...)` call, and its QML counter round-trips.
+- **`lil-qt-probe`:** fails to link (`LNK1104` on `cxxqt\crates\lil_qt_probe\initializers.o`).
+  - cxx-qt-build 0.10.0 names its export folder after `CARGO_PKG_NAME`, but cxx-qt-cmake 0.10.0 uses Corrosion's target name, which has underscores.
+
+### S0.3 Lazy WebEngine library: PASS
+
+- **Imports:** `dumpbin /dependents` of the exe and the shim DLL lists no `Qt6WebEngine*`. The bridge is a static library, and its directives and symbols mention none either.
+- **Loading:** `GetModuleHandleW(L"Qt6WebEngineCore.dll")` was null in all 33 probes from start until the dock was shown, and non-null after the `Loader`, about 0.3 s later.
+- **Profile:** the named persistent profile `image` keeps its storage and cache under `%LOCALAPPDATA%\LILITH-spike\image\webengine\`.
+- **Page:** there were 0 deprecation messages, and `about:blank` loaded.
+
+### S0.4 Deploy size: PASS (hard); the soft target was missed
+
+| Configuration | Files | MiB |
+|---|---|---|
+| untrimmed | 1,593 | 417.3 |
+| trimmed (the bar's flags) | 1,488 | **332.1** |
+| trimmed, without WebEngine | 1,381 | 106.7 |
+
+- **The soft target:** the trimmed folder misses ≤ 300 MiB by 32 MiB. It is 307.6 MiB without `vc_redist.x64.exe`, which windeployqt copies because the bar's flags don't include `--no-compiler-runtime`.
+- **Biggest files:** `Qt6WebEngineCore.dll` (194.1 MiB), `vc_redist.x64.exe` (24.4), `qtwebengine_devtools_resources.pak` (11.1) and `icudtl.dat` (10.0).
+- **The dry run:** `--dry-run --list source` exits 1 whenever WebEngine is involved, because windeployqt then reads `QtWebEngineProcess.exe` from the target folder, which a dry run never fills. So the sizes come from real deploys.
+- **The hard bar:** with spike 02's stripped environment, the trimmed folder runs S0.1's restore (PASS) and S0.3's lazy load (PASS).
+
+### S0.5 Cold start: PASS
+
+- **(a) 10 warm starts, on an idle machine:**
+  - `interactive` p50 404 ms, max 429 ms; `first_frame` p50 369 ms, max 390 ms.
+  - Of 30 timed starts in three idle runs, 29 took 397–429 ms. One took 5,786 ms (see below), and the bar's one re-measure then gave 10 of 10 under 2 s (p50 414 ms, max 426 ms).
+- **(b) the first start after a reboot:** `interactive` 452 ms (`first_frame` 416 ms), CPU 4.7 % before it.
+- **(c) the first start of a fresh copy after a Defender scan, with the QML and pipeline caches moved aside:** `interactive` 566 ms (`first_frame` 529 ms), CPU 1.8 % before it.
+
+**Deviation:** the scored warm starts ran on an idle machine. The harness waited, at most 3 min, for CPU load under 35 % before each start, and recorded it (0.4–5.8 %). The bar names no load condition. Trial starts while other workloads held the CPU near 100 % took about 4–14 s, and one never reached `qml_loaded` within 120 s.
+
+**The slow start on an idle machine:**
+- The start that took 5,786 ms was at 0.3 % CPU. It reached `main` at 643 ms (about 52 ms otherwise) and `qml_loaded` at 5,213 ms (about 220 ms otherwise).
+- The stack dump shows the GUI thread waiting for the threaded render loop at the first expose. The earlier part of the delay has no stacks.
+- Cause not established. The bar's profiling step was not needed, because the re-measure passed, and it has not been done.
+
+### S0.6 GUI stalls under ComfyUI load: PASS under the amended GPU level
+
+**The owner's runs:**
+1. **Run 1 (2026-10-22): INVALID.** The load kept only one prompt pending and ended before the measured minute.
+2. **Run 2 (2026-10-23): ERROR.** The harness's own command line matched its "ComfyUI already running" check. Both runs' harness faults were fixed.
+3. **Run 3 (2026-10-23):**
+   - **Verdict:** INVALID under the plan's rule ("GPU ≥ 95 % in only 79.7 % of the samples; 90 % needed").
+   - **Re-scored:** PASS under the amended level of ≥ 90 % in at least 90 % of the samples (93.2 %).
+   - **How it was re-scored:** offline from the run's own raw files with `rescore-s06.ps1`, with the original verdict kept in the result.
+   - **The fallback** (5 Hz previews, batched charts) wasn't run, because nothing FAILed.
+
+**Run 3's numbers:**
+
+| Metric | n | p50 | p95 | p99 | max | Unit |
+|---|---|---|---|---|---|---|
+| heartbeat lateness | 14,392 | 0.002 | 0.569 | **2.835** | 419.7 | ms |
+| frame interval (`main-a`) | 13,402 | 4.168 | 5.062 | **8.466** | 425.3 | ms |
+
+- **The bar:** p99 < 16 ms for both. The frame threshold is 16 ms on a primary display at 239.98 Hz. 3.5 % of frames took over 1.5 vsync periods.
+- **The workload ran as the bar says:**
+  - 655 feed ticks and 5,159 decoded previews (8 jobs at 10 Hz);
+  - 396 chart points;
+  - 13,397 rows scrolled;
+  - the list visible 60 of 60 s, the Web dock shown.
+- **The Web page:** the dock's local data: page loaded, ran its script and reached a painted frame, inside the job.
+- **Cleanup:** all 5 processes the script started were in the kill-on-close job.
+- **CPU:** 27.4 % before the app and 24.2 % after.
+- **GPU compute processes before ComfyUI started:** 26, as listed by `nvidia-smi`. On Windows the list includes desktop graphics apps.
+- **VRAM for P4a-R15:** the spike's PDH `Local Usage` with the Web dock shown (the data: page) peaked at **125.8 MiB** (p50 112.6 MiB, 64 samples), while ComfyUI ran the loop. `Dedicated Usage` peaked at 151.0 MiB.
+
+**Deviation: the GPU level** (owner ruling, 2026-10-23):
+- **The plan's rule:** "≥ 95 % throughout", which §3 turned into ≥ 95 % in at least 90 % of the samples.
+- **The amended rule:** ≥ 90 % in at least 90 % of the samples, with the density rule (≥ 48 samples, no gap over 2 s) unchanged. It applies to the gate before the run as well as to the measured window.
+- **Why:** under this real ComfyUI loop on this machine, a 95 % level measures the workload's own ceiling, not whether ComfyUI is loading the GPU. In the 60 s before the app started, with ComfyUI alone, only 84.7 % of the samples were ≥ 95 %, but 95.8 % were ≥ 90 %.
+
+The measured distribution, 500 ms samples:
+
+| Window | n | Mode | ≥ 95 % | ≥ 90 % | Under 90 % |
+|---|---|---|---|---|---|
+| the 60 s before the app (ComfyUI alone) | 118 | 100 (83 samples) | 84.7 % | 95.8 % | 5 |
+| the measured minute (ComfyUI and the spike) | 118 | 99 (about 90 samples) | 79.7 % | 93.2 % | 8, all at prompt boundaries |
+
+**Why utilisation reads lower in the window, as far as the logs show:**
+- **It isn't a plateau at 92–93 %.** In the window the GPU mostly reads 99 %, against 100 % before the app. Isolated single 92–93 % samples come about every 3 s (about 16 in the minute). Before the app, the same 92–94 % values came in runs of 2–5 samples once per prompt.
+- **Prompts took longer.** keep_busy's prompts finished every 11.1–11.6 s before the app, and every 12.3–12.8 s while the app ran, about 10 % slower.
+- **So the spike's own GPU work** (rendering `main-a` at 240 Hz, 8 preview textures, the charts and the Web view) **shares the GPU with ComfyUI's kernels.** It costs ComfyUI about a tenth of its throughput, and nvidia-smi shows it as the 99 % reading and the scattered 92–93 % samples.
+- **The deep dips are prompt boundaries, in both phases:** one or two samples at 1–8 % (or 42–77 %) each time a prompt finishes and the next starts, 5 in the minute.
+- **What the logs can't separate** is how much of the reading is time-slicing between the graphics and compute work, and how much is the app's own load.
+
+**The 420 ms heartbeat and frame maximum:**
+- **When and how big:** the largest stall was about 17 s into the measured minute (about 24.6 s after the app started, give or take 0.8 s from rebuilding the times out of the sample intervals). Heartbeat and frame interval show it together, so the whole GUI thread stopped.
+- **Others:** the minute had 14 heartbeat stalls over 50 ms. The largest were 420, 358, 271, 191, 170 and 160 ms. The 5 s warm-up before it had none over 5 ms.
+- **What else was happening:**
+  - **No prompt boundary.** The largest stall was about 4.5 s after a prompt finished, and the stalls aren't aligned with prompt boundaries.
+  - **No GPU or VRAM event.** The GPU read 99–100 % around it, and the spike's VRAM was flat at 112.6 MiB.
+  - **No Qt warning.** The app logged none during the run.
+  - **No stack.** The watchdog dumps stacks only after a 5 s stall, and no warning block was written.
+- **The machine:** CPU load was 24–27 % from ComfyUI and the other running apps.
+- **Cause not established.** The p99 stays far inside the bar, but stalls of this size recur in every loaded run so far (0.3–0.6 s in owner run 1 too).
+
+### S0.7 Accessibility: PASS, all 5 items, by UI Automation
+
+The owner's one-command run of 2026-10-23 used the fresh deploy and spike 02's stripped environment, and took no focus before the click.
+
+| Item | Result | What UI Automation reported |
+|---|---|---|
+| KDDockWidgets title bar | PASS | "Jobs" and "Grid", ControlType.TitleBar, in `main-a` |
+| Dock tabs | PASS | "Grid" and "Web", ControlType.TabItem, in `main-a` |
+| Counter button | PASS | "Increment the counter", ControlType.Button (the floating Counter window is owned by `main-b` in the UIA tree) |
+| Chart tile | PASS | "GPU load chart, latest 44.0 %", **ControlType.Custom** (LocalizedControlType "custom"), in `main-b` |
+| Announcement | PASS | the notification "Count is now 1", kind Other, processing All, raised on the button |
+
+- **Timing:** the items were present 1.0 s after the start, the client subscribed at 1.2 s, and clicked at 1.23 s.
+- **Focus:** the spike held the focus for about 0.1–0.15 s after the click, 1 sample at 250 ms.
+- **Deviation from the bar (owner direction, 2026-10-23):**
+  - The bar has the owner tab through with Narrator. The check instead reads what a screen reader gets through UI Automation: the same provider data Narrator reads, without speech or keyboard navigation.
+  - So tab order and what Narrator actually speaks aren't tested.
+- **Note:** Qt exposes `Accessible.Chart` as UIA's Custom type, because UIA has no chart type. The word "chart" therefore reaches a screen reader only through the name ("… chart, latest …").
+
+### S0.8 Caches: PASS
+
+- **Where:** Qt's QML cache (`qmlcache`, 18 files) and pipeline cache (`qtpipelinecache-x86_64-little_endian-llp64`) are under `%LOCALAPPDATA%\LILITH-spike\image\cache\`.
+- **Nothing else appeared:** no new `%LOCALAPPDATA%` folder except `LILITH-spike`, none named after the executable, and no new roaming folder.
+- **The pipeline cache folder** stays empty on D3D11, so its PASS rests on its location.
+
+### S0.9 Offscreen GUI tests: PASS (local and CI)
+
+- **The items:** under `QT_QPA_PLATFORM=offscreen`, all 5 pass:
+  - a KDDockWidgets main window and one floating window;
+  - a `PathPolyline` Shape;
+  - a `Loader` of `SpikeWeb`;
+  - `about:blank` in it;
+  - a grab that isn't one flat colour.
+- **Environments:** they pass with no other variable, and again with `QT_QUICK_BACKEND=software`, both locally and in the scratch CI run 39894748059 on `windows-2025`.
+- **Offscreen, Qt Quick picks the software scene graph by itself.**
+
+### S0.10 CI time with Qt: PASS
+
+The scratch CI job took 25 min 56 s, against the 50-minute limit. The Qt install with `naqt` took 0.9 min and the spike build 5.3 min.
+
+### Other observations
+
+- **The two long stalls under ~100 % CPU from other workloads** (step 2 trial runs, before the scored runs):
+  - a 127 s GUI-thread stall in a build-tree run, with no stacks;
+  - a deployed warm start that never reached `qml_loaded` within 120 s, with an empty dump.
+
+  Both ran with the first stack dumper, which may have lengthened them (fixed since). Neither recurred on an idle machine.
+- **A 10.6 s stall on the first WebEngine show after a fresh deploy,** confounded with a loaded period. The GUI thread was in `QQuickWebEngineProfilePrototype::componentComplete`, then `QWebEngineSettings`, then `QFont::defaultFamily`, then DirectWrite's font-fallback population, waiting on the font cache service. Later first shows took 0.3–0.6 s.
 
 ## 6. Verdict
 
-To be filled in after the run (Step 4).
+**PASS, with five recorded deviations.** Every check meets its bar:
+- S0.1, S0.3, S0.8, S0.9 and S0.10 pass as written.
+- **S0.2** passes with an underscore package name; a dashed name fails to link.
+- **S0.4** passes its hard bar and misses the soft 300 MiB target by 32 MiB (reported, not a failure).
+- **S0.5** passes (a), (b) and (c), with (a) measured on an idle machine.
+- **S0.6** meets APP-135's stall bar under ComfyUI load: heartbeat p99 2.8 ms and frame p99 8.5 ms, against 16 ms. Its measurement is valid under the amended GPU level (≥ 90 %), and INVALID under the plan's literal ≥ 95 %.
+- **S0.7** reads the spike's own controls and the KDDockWidgets title bars and tabs through UI Automation, not Narrator.
+
+**The deviations:**
+1. S0.5 (a) was scored on an idle machine.
+2. S0.6's GPU level is 90 %, not 95 %.
+3. S0.7 used UI Automation instead of a Narrator walk-through.
+4. S0.2 needs an underscore crate name.
+5. S0.4's soft size target was missed.
 
 ## 7. Decision
 
-To be filled in after the run (Step 4).
+- **APP-005: KDDockWidgets 2.5.0** (S0.1 passed; 2.4.1 is not needed).
+- **P4a-R1:**
+  - The feature route works, and the fallback isn't needed.
+  - Under cxx-qt-cmake 0.10.0, the Qt crate's package name must have no dash, so it is named `lil_qt`, and every other crate keeps `lil-*`.
+- **APP-137, IMG-126:**
+  - **WebEngine lives in a separate QML plugin** (`SpikeWeb`), imported only by the panel that a `Loader` creates when the dock is first shown.
+  - **The profile pattern:** create `WebEngineProfilePrototype` first, with `persistentStoragePath` and `cachePath` set explicitly to `AppLocalDataLocation` paths, then create the view with `profile: proto.instance()`. Bindings silently give the default off-the-record profile.
+- **ARCH-114, OPS-094: the deploy.**
+  - **The steps:** copy our files first, then run `windeployqt --release --qmldir qml --qmldir web --qmldir shim --qmldir <KDDockWidgets src/qtquick/views/qml> --no-translations --no-opengl-sw --no-system-dxc-compiler --no-ffmpeg --skip-plugin-types designer,generic,help,networkinformation,position,qmllint,qmlls,qmltooling,sqldrivers,webview`, then copy the VC++ runtime DLLs app-local.
+  - **The result:** the trimmed folder is 332.1 MiB.
+  - **Measuring:** measure real deploys, because `--dry-run --list` can't measure a WebEngine deploy.
+- **APP-136: cold start** is about 0.40 s to `interactive` warm, 0.45 s after a reboot, and 0.57 s for a fresh copy with cold caches.
+- **APP-135: GUI stalls under ComfyUI load** are within the bar. Heartbeat lateness p99 is 2.8 ms and `main-a`'s frame interval p99 8.5 ms at 240 Hz, with the full workload of 8 previews at 10 Hz, the paged list, the 6 charts and the Web dock. Isolated maxima reach 0.42 s.
+- **P4a-R15: the shell's dedicated VRAM** (PDH `Local Usage`) with the Web dock showing a page is **125.8 MiB** peak (p50 112.6 MiB) while ComfyUI runs, and `Dedicated Usage` is 151.0 MiB peak.
+- **QA-068, P4a-R35: the offscreen tests** need `QT_QPA_PLATFORM=offscreen` and nothing else; Qt Quick then uses the software scene graph. Every item works on `windows-2025`, so P4a-R35's Sandbox fallback isn't needed for them.
+- **P4a-R32: CI time.** The `pr-ready` job with Qt takes 25 min 56 s, so Qt stays in it, and P4a-R32's split isn't needed.
+- **ARCH-095: caches.** Setting `organizationName` and `applicationName` before the application object puts the QML and pipeline caches under `%LOCALAPPDATA%\<org>\<app>\cache\`. No `QML_DISK_CACHE_PATH` override is needed.
+- **APP-156: accessibility.** The spike's own controls, the KDDockWidgets title bars and the dock tabs are read with their names, and `Accessible.announce()` raises a UIA notification. A chart tile is exposed as Custom, so its accessible name must carry the word "chart".
 
 ## 8. Follow-ups
 
-To be filled in after the run (Step 4).
+1. **Plan 4a, S0.6's rule:** record the amended GPU level (≥ 90 % in at least 90 % of the samples) wherever the plan restates S0.6 or reuses its load gate. Any later stall measurement under ComfyUI should use it too.
+2. **Task 15 / Task 29: deploy size.** Add `--no-compiler-runtime` (−24.4 MiB) and drop `qtwebengine_devtools_resources.pak` (−11.1 MiB) to get under 300 MiB (about 296.5 MiB). Optionally, pin one Qt Quick Controls style and drop the other styles' DLLs (about 13 MiB). Set Task 29's `deploy_folder_mib` from a real deploy, about 330 MiB with the two cuts. Measure deploys for real, not with `--dry-run --list`.
+3. **Task 18: stall telemetry.**
+   - Keep the stall watchdog and stack dumper idea.
+   - Investigate the 0.2–0.4 s GUI-thread stalls under ComfyUI load: 14 over 50 ms in the measured minute, no stacks captured, so they need a lower dump threshold.
+   - Investigate the intermittent 5.8 s start on an idle machine.
+4. **Task 17 / Task 18: WebEngine first show.** Create the WebEngine profile off the critical path, or warm the font database early, because the first show after a fresh deploy once stalled 10.6 s in DirectWrite's font-fallback population.
+5. **Task 18: accessibility pattern.** Keep "chart" in a chart tile's accessible name (Qt maps the role to Custom). Tab order and Narrator's speech were not tested by S0.7's UI Automation check; if APP-156 needs them, that is a manual step.
+6. **cxx-qt:** report the dashed-package-name mismatch between cxx-qt-build and cxx-qt-cmake 0.10.0 upstream, and rename `lil_qt` if it is fixed.
+7. **Owner runs:** keep the hands-off notice (10 s warning, countdown, "done"; no focus or input) for any later check that needs the keyboard and mouse left alone, and the one-command owner run with agent runs writing to `results/agent-runs/`.
