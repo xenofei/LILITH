@@ -58,6 +58,11 @@ $label = [System.Windows.Forms.Label]::new()
 $label.Dock = 'Fill'; $label.ForeColor = [System.Drawing.Color]::White; $label.TextAlign = 'MiddleCenter'
 $label.Font = [System.Drawing.Font]::new('Segoe UI', 13)
 $form.Controls.Add($label)
+# Where it is, in logical px, so an overlap with the spike's windows (layout_snapshot) can be checked:
+# it stays clear of them on a primary working area of at least about 1,380 x 800.
+$script:placement = [ordered]@{
+    primary_working_area = @($area.X, $area.Y, $area.Width, $area.Height)
+    notice = @($form.Location.X, $form.Location.Y, $form.Size.Width, $form.Size.Height) }
 
 $t0 = Get-Date
 $script:handsOffAt = $t0.AddSeconds($LeadSeconds)   # replaced once the window is shown
@@ -68,7 +73,7 @@ $form.Add_Shown({
     $script:shownEpoch = $now
     $script:handsOffEpoch = [math]::Max([long]$HandsOffAtEpochMs, $now + 1000L * $LeadSeconds)
     $script:handsOffAt = [DateTimeOffset]::FromUnixTimeMilliseconds($script:handsOffEpoch).LocalDateTime
-    if ($ReadyFile) { [ordered]@{ shown_epoch_ms = $now; hands_off_epoch_ms = $script:handsOffEpoch } | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 $ReadyFile }
+    if ($ReadyFile) { [ordered]@{ shown_epoch_ms = $now; hands_off_epoch_ms = $script:handsOffEpoch; placement = $script:placement } | ConvertTo-Json -Compress -Depth 4 | Set-Content -Encoding UTF8 $ReadyFile }
 })
 $fgTimer = [System.Windows.Forms.Timer]::new(); $fgTimer.Interval = 50
 $fgTimer.Add_Tick({ $form.CheckForeground() })
@@ -101,10 +106,10 @@ $timer.Add_Tick($tick)
 $timer.Start(); $fgTimer.Start()
 [System.Windows.Forms.Application]::Run($form)   # Show(), which honours ShowWithoutActivation (ShowDialog activates)
 if ($Log) {
-    [ordered]@{ screen = 'primary, bottom-right corner'; screens = $screens.Count
+    [ordered]@{ screen = 'primary, bottom-right corner'; screens = $screens.Count; placement = $script:placement
                 shown_epoch_ms = $script:shownEpoch; hands_off_epoch_ms = $script:handsOffEpoch
                 warning_ms = $(if ($script:shownEpoch) { $script:handsOffEpoch - $script:shownEpoch } else { $null })
                 ever_foreground = $form.EverForeground; foreground_checks_ms = 50
                 end = $script:endReason; seconds_shown = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) } |
-        ConvertTo-Json -Compress | Set-Content -Encoding UTF8 $Log
+        ConvertTo-Json -Compress -Depth 4 | Set-Content -Encoding UTF8 $Log
 }

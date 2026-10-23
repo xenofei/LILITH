@@ -553,6 +553,8 @@ Describe 'Hands-off notice timing' {
             $after = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             $w.shown | Should -BeTrue
             $w.warning_ms | Should -BeGreaterOrEqual 2000
+            @($w.notice_rect).Count | Should -Be 4            # where it was, for an overlap check
+            @($w.primary_working_area).Count | Should -Be 4
             $after | Should -BeGreaterOrEqual $w.hands_off_epoch_ms   # the caller didn't start early
         } finally {
             Set-Content $done 'done'

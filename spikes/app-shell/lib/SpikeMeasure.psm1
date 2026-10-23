@@ -678,7 +678,7 @@ function Wait-HandsOffStart($Notice, [int]$TimeoutSec = 30) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $info = $null
     while (-not $info -and (Get-Date) -lt $deadline -and -not $Notice.Process.HasExited) {
-        if (Test-Path $Notice.ReadyFile) { try { $info = Get-Content $Notice.ReadyFile -Raw | ConvertFrom-Json } catch {} }
+        if (Test-Path $Notice.ReadyFile) { try { $info = Get-Content $Notice.ReadyFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch {} }
         if (-not $info) { Start-Sleep -Milliseconds 100 }
     }
     if ($info) {
@@ -686,7 +686,8 @@ function Wait-HandsOffStart($Notice, [int]$TimeoutSec = 30) {
         if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
         return [ordered]@{ shown = $true; shown_epoch_ms = [long]$info.shown_epoch_ms; hands_off_epoch_ms = [long]$info.hands_off_epoch_ms
                            warning_ms = [long]$info.hands_off_epoch_ms - [long]$info.shown_epoch_ms
-                           startup_ms = [long]$info.shown_epoch_ms - [long]$Notice.StartedEpochMs }
+                           startup_ms = [long]$info.shown_epoch_ms - [long]$Notice.StartedEpochMs
+                           primary_working_area = $info.placement.primary_working_area; notice_rect = $info.placement.notice }
     }
     $left = [long]$Notice.StartedEpochMs + 1000L * $Notice.LeadSeconds - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     if ($left -gt 0) { Start-Sleep -Milliseconds $left }
