@@ -802,7 +802,9 @@ function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithBu
                     $allowed = @('LILITH spike', 'LILITH Spike', 'Open')
                     $chrome = $script:ToastChrome
                     if ($Target -eq 'button') {
-                        $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' } $allowed $chrome
+                        # A UIA throw hands the click to the owner instead of failing S1.3.
+                        try { $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' } $allowed $chrome }
+                        catch { $b = [pscustomobject]@{ Ok = $false; Why = "UIA error: $($_.Exception.Message)"; UnknownControls = @() } }
                         if ($b.Ok) { $el = $b.Button; $attempt.button_depth = $b.Depth }
                         else { $attempt.button_missing = $true; $attempt.button_why = $b.Why; $attempt.unknown_controls = $b.UnknownControls }
                     }
