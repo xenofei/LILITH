@@ -11,8 +11,11 @@ C:\lil\out (writable) receives started.json at once, one JSON file per item, and
 then the Sandbox shuts itself down.
 
 With -Items a,b -Suffix x it runs only those items and names their files <item>-x.json: the
-de-elevated relaunch uses that (-Suffix limited). With config.observe it runs the toast,
-foreground and Qt items twice more (-r2, -r3), each after the host writes go-2.flag / go-3.flag into C:\lil\out.
+de-elevated relaunch uses that (-Suffix limited). With config.observe it writes round-1.json
+after the first round, then runs the toast, foreground and Qt items twice more (-r2, -r3), each
+after the host writes go-2.flag (the Sandbox window covered) / go-3.flag (the host locked) into
+C:\lil\out. The toast item also detects its own popup with UI Automation (uia.ps1, beside this
+script in the bundle); that is recorded, not judged.
 
 It refuses to run anywhere but inside Windows Sandbox (it writes HKCU keys and ends with
 shutdown /s /t 0): the user must be WDAGUtilityAccount, the Sandbox's account, and the
@@ -55,6 +58,7 @@ $RunSuffix = $(if ($Suffix) { "-$Suffix" } else { '' })
 $script:Sfx = $RunSuffix
 
 New-Item -ItemType Directory -Force -Path $LogDir, $Work | Out-Null
+. (Join-Path $In 'uia.ps1')   # defines the detection functions only
 
 function Now { (Get-Date).ToUniversalTime().ToString('o') }
 
@@ -182,17 +186,23 @@ function Item-Toast([string]$Tag) {
     $w = Tool shortcut-write --path $lnk --target $App --aumid $Aumid
     Start-Sleep -Seconds 5
     $attempts = @()
+    $popup = $null
     for ($i = 1; $i -le 3; $i++) {
-        $core = Run-Core "toast-$Tag-$i" @('toast', '--tag', $Tag, '--title', 'LILITH spike', '--body', "Sandbox toast $Tag") 30
-        Start-Sleep -Seconds 3
+        $nonce = -join (1..6 | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+        $before = Get-UiaSnapshot
+        $core = Run-Core "toast-$Tag-$i" @('toast', '--tag', $Tag, '--title', 'LILITH spike', '--body', "Sandbox toast $Tag #$nonce") 30
+        # Recorded: whether the popup showed in the Sandbox's own session (UIA, as on the host).
+        $watch = Watch-Needle -Needle "#$nonce" -Before $before -Seconds 6
+        if ($null -eq $popup) { $popup = $watch.Record }
         $h = Tool history --tag $Tag
-        $attempts += [ordered]@{ attempt = $i; setting = $(if ($core) { $core.setting } else { $null }); posted = $(if ($core) { $core.posted } else { $false }); error = $(if ($core) { $core.error } else { 'no result' }); history = $h }
+        $attempts += [ordered]@{ attempt = $i; setting = $(if ($core) { $core.setting } else { $null }); posted = $(if ($core) { $core.posted } else { $false }); error = $(if ($core) { $core.error } else { 'no result' }); history = $h; popup = $watch.Record }
         if ($h.has_tag) { break }
         Start-Sleep -Seconds 10
     }
     $last = $attempts[-1]
     [ordered]@{
         shortcut = $w; setting = $last.setting; history_has_tag = [bool]$last.history.has_tag
+        popup = $popup; popup_seen = ($null -ne $popup -and @($popup.appearances | Where-Object { $null -ne $_ }).Count -gt 0)
         attempts = $attempts; pass = ($last.setting -eq 'Enabled' -and [bool]$last.history.has_tag)
     }
 }
@@ -428,11 +438,11 @@ function Run-Items([string[]]$List, [string]$Sfx) {
 Run-Items $Items $RunSuffix
 
 if ($RunSuffix -eq '' -and $Config.observe) {
-    # Host-state observation: the host writes go-2.flag (Sandbox window behind other windows),
-    # then go-3.flag (host about to be locked; wait 30 s first).
+    # Host-state observation: round-1.json tells the host round 1 is done; the host then writes
+    # go-2.flag (the Sandbox window covered), then go-3.flag (once it has seen the host locked).
+    Write-Result 'round-1' @{ at = Now }
     foreach ($round in 2, 3) {
         if (Wait-File (Join-Path $Out "go-$round.flag") 1200) {
-            if ($round -eq 3) { Start-Sleep -Seconds 30 }
             Run-Items @('toast', 'foreground', 'qt') "-r$round"
             Write-Result "round-$round" @{ at = Now }
         }

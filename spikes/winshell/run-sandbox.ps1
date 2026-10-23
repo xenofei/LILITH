@@ -18,21 +18,33 @@ spikes/winshell/build and spikes/winshell/results on the host.
 How many runs (the bar is 3 of 3).
 .PARAMETER Observe
 The host-state observation (one run, owner present): the toast, foreground and Qt items run
-again with the Sandbox window behind other windows, then with the host locked.
+again with the Sandbox window covered by another window (the script places one of its own over
+it), then with the host locked (the owner presses Win+L; the script sees the lock itself).
 .PARAMETER DeployDir
-Task 0's deploy folder.
+Task 0's deploy folder. When not given: -Task0Repo's spikes\app-shell\build\deploy, else the
+environment variable LILITH_TASK0_REPO's, else this worktree's own. If none exists, the script
+prints the exact command to use and stops.
+.PARAMETER Task0Repo
+The worktree (or checkout) where Task 0 built its deploy folder.
 .PARAMETER QtExe
-The spike app's exe, relative to DeployDir; empty = the one .exe in it.
+The spike app's exe, relative to DeployDir; empty = app_shell_spike.exe when present, else the
+one .exe in it.
 .PARAMETER QtGrabArgs
-The arguments that make the spike app grab its window offscreen to {png} and exit.
+The arguments that make the spike app grab its window offscreen to {png} and exit (Task 0's
+app: --screenshot grabs only just before an automatic quit, so --quit-after is needed).
+.PARAMETER Preflight
+Starts nothing: prints, as JSON, whether a run could start now (the Sandbox feature, Task 0's
+deploy folder, the Qt exe) and what to type when it couldn't (run-all.ps1, tests/sandbox_paths.rs).
 #>
 param(
     [int]$Runs = 3,
     [switch]$Observe,
     [string]$DeployDir = '',
+    [string]$Task0Repo = '',
     [string]$QtExe = '',
-    [string]$QtGrabArgs = '--grab {png}',
-    [switch]$SkipBuild
+    [string]$QtGrabArgs = '--screenshot {png} --quit-after 5000 --no-activate',
+    [switch]$SkipBuild,
+    [switch]$Preflight
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,15 +52,18 @@ Set-StrictMode -Version Latest
 
 $Spike = $PSScriptRoot
 $Repo = (Resolve-Path (Join-Path $Spike '..\..')).Path
-if (-not $DeployDir) { $DeployDir = Join-Path $Repo 'spikes\app-shell\build\deploy' }
+$DeployRel = 'spikes\app-shell\build\deploy'
+. (Join-Path $Spike 'uia.ps1')
 $Bin = Join-Path $Spike 'target\release'
 $ToolExe = Join-Path $Bin 'winshell-tool.exe'
 $Build = Join-Path $Spike 'build\sandbox'
 $ResultsRoot = Join-Path $Spike 'results'
 $RunLimitSec = 600
+# The blocker window the observation places over the Sandbox window: started by this script and
+# ended by its pid only.
+$script:BlockerProcess = $null
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
-function Wait-Owner([string]$Text) { [void](Read-Host "$Text  (press Enter)") }
 
 function Tool {
     $out = & $ToolExe @args
@@ -65,6 +80,45 @@ function P($Obj, [string]$Name) {
     if ($Obj -is [System.Collections.IDictionary]) { return $Obj[$Name] }
     $p = $Obj.PSObject.Properties[$Name]
     if ($p) { $p.Value } else { $null }
+}
+
+# ---------------------------------------------------------------- Task 0's deploy folder
+
+# Where Task 0's deploy folder is: -DeployDir, else -Task0Repo's, else LILITH_TASK0_REPO's, else
+# this worktree's own. $null when the chosen one (or, with nothing given, this worktree's) is
+# missing. No path is guessed: other worktrees are only suggested (Get-DeploySuggestions).
+function Resolve-DeployDir([string]$Given, [string]$Task0, [string]$EnvRepo, [string]$OwnRepo) {
+    $pick = if ($Given) { [ordered]@{ path = $Given; from = '-DeployDir' } }
+            elseif ($Task0) { [ordered]@{ path = ([IO.Path]::Combine($Task0, $DeployRel)); from = '-Task0Repo' } }
+            elseif ($EnvRepo) { [ordered]@{ path = ([IO.Path]::Combine($EnvRepo, $DeployRel)); from = 'LILITH_TASK0_REPO' } }
+            else { [ordered]@{ path = ([IO.Path]::Combine($OwnRepo, $DeployRel)); from = 'this worktree' } }
+    $pick.exists = [bool](Test-Path -LiteralPath $pick.path -PathType Container)
+    $pick
+}
+
+# The worktrees of this repository (git worktree list) that hold a deploy folder: each becomes
+# an exact command for the owner to run. Nothing is used without being named.
+function Get-DeploySuggestions([string]$OwnRepo) {
+    $out = @()
+    try {
+        $list = & git -C $OwnRepo worktree list --porcelain 2>$null
+        foreach ($l in @($list)) {
+            if ("$l" -match '^worktree (.+)$') {
+                $wt = $Matches[1] -replace '/', '\'
+                if (Test-Path -LiteralPath (Join-Path $wt $DeployRel) -PathType Container) { $out += $wt }
+            }
+        }
+    } catch { }
+    @($out)
+}
+
+# The spike app's exe in the deploy folder: -QtExe, else app_shell_spike.exe, else the only exe.
+function Resolve-QtExe([string]$Dir, [string]$Given) {
+    if ($Given) { return $Given }
+    if (Test-Path -LiteralPath (Join-Path $Dir 'app_shell_spike.exe')) { return 'app_shell_spike.exe' }
+    $exes = @(Get-ChildItem -LiteralPath $Dir -Filter *.exe -File)
+    if ($exes.Count -eq 1) { return $exes[0].Name }
+    throw "pass -QtExe: $Dir holds $($exes.Count) .exe files and no app_shell_spike.exe"
 }
 
 # ---------------------------------------------------------------- the Sandbox itself
@@ -213,6 +267,7 @@ function New-Bundle([string]$Dir, [string]$TestExe, [string[]]$Dlls, [int]$Run, 
     Set-Content -Encoding ascii -Path (Join-Path $Dir 'in-sandbox.marker') -Value 'LILITH spike 11 Sandbox bundle'
     foreach ($sub in 'bin', 'vcrt', 'rusttest') { New-Item -ItemType Directory -Force -Path (Join-Path $Dir $sub) | Out-Null }
     Copy-Item (Join-Path $Spike 'inside.ps1') $Dir
+    Copy-Item (Join-Path $Spike 'uia.ps1') $Dir   # toast detection inside the Sandbox
     foreach ($name in 'winshell-core', 'winshell-app', 'winshell-hello', 'winshell-tool') {
         Copy-Item (Join-Path $Bin "$name.exe") (Join-Path $Dir 'bin')
     }
@@ -274,17 +329,110 @@ function Judge-Run([string]$Res, [string]$Sfx = '') {
     $items
 }
 
+# ---------------------------------------------------------------- the host-state observation
+
+function Wait-ResultFile([string]$Path, [int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) { if (Test-Path -LiteralPath $Path) { return $true }; Start-Sleep -Seconds 2 }
+    $false
+}
+
+# Round 2's host state: one of the spike's own windows (a blocker) placed over the Sandbox
+# window and clicked to the front by the script; UIA then checks the Sandbox window's centre is
+# covered. The blocker logs into build\sandbox, not the user's profile.
+function Cover-SandboxWindow($Started) {
+    $rec = [ordered]@{ method = 'a spike blocker window placed over the Sandbox window (SetWindowPos), clicked to the front (synthetic)'; covered = $false }
+    if (-not (Initialize-SpikeUi)) { $rec.why = "UI Automation not available: $($script:Uia.error)"; return $rec }
+    $own = @(Get-OwnPids $Started) + @($Started.own_pids) | Sort-Object -Unique
+    $win = @(Get-UiaTop | Where-Object { $_.Current.ProcessId -in $own }) | Select-Object -First 1
+    if ($null -eq $win) { $rec.why = 'no visible window of the Sandbox this run started'; return $rec }
+    $sb = Get-TopInfo $win
+    $r = $win.Current.BoundingRectangle
+    $rec.sandbox_window = [ordered]@{ process = $sb.process; class = $sb.class }
+    $env:WINSHELL_LOG_DIR = Join-Path $Build 'host-blocker-log'
+    try { $p = Start-Process -FilePath (Join-Path $Bin 'winshell-app.exe') -ArgumentList '--blocker', '--exit-after-secs', '1200' -PassThru }
+    finally { Remove-Item Env:\WINSHELL_LOG_DIR -ErrorAction SilentlyContinue }
+    $script:BlockerProcess = $p
+    $bw = $null
+    for ($i = 0; $i -lt 40 -and $null -eq $bw; $i++) {
+        Start-Sleep -Milliseconds 250
+        $bw = @(Get-UiaTop | Where-Object { $_.Current.ProcessId -eq $p.Id }) | Select-Object -First 1
+    }
+    if ($null -eq $bw) { $rec.why = 'the blocker window did not appear'; return $rec }
+    $bh = [int64]$bw.Current.NativeWindowHandle
+    $rec.placed = [SpikeUi.Win]::Place($bh, [int]$r.X - 20, [int]$r.Y - 20, [int]$r.Width + 40, [int]$r.Height + 40)
+    Start-Sleep -Milliseconds 500
+    $rec.click = Click-WindowVisible $bh
+    Start-Sleep -Milliseconds 500
+    $cx = [int]($r.X + $r.Width / 2); $cy = [int]($r.Y + $r.Height / 2)
+    $rec.covered = (Get-TopAtPoint $cx $cy) -eq $bh
+    $fg = Get-ForegroundNow
+    $rec.blocker_in_front = ($null -ne $fg -and $fg.pid -eq $p.Id)
+    $rec
+}
+
+# The observation: no question asked. Round 1 runs uncovered (inside.ps1 detects its own toast
+# popup by UIA); round 2 with the Sandbox window covered; round 3 with the host locked, which
+# the owner does (Win+L) and the script detects (WTS session flags).
+function Invoke-Observation([string]$Res, $Started) {
+    $obs = [ordered]@{}
+    $obs.round1_done = Wait-ResultFile (Join-Path $Res 'round-1.json') 900
+    $obs.round2_cover = Cover-SandboxWindow $Started
+    Say ("Round 2: the Sandbox window is {0}." -f $(if ($obs.round2_cover.covered) { 'covered by a spike window' } else { "not covered ($(P $obs.round2_cover 'why'))" }))
+    New-Item -ItemType File -Force -Path (Join-Path $Res 'go-2.flag') | Out-Null
+    $obs.round2_done = Wait-ResultFile (Join-Path $Res 'round-2.json') 600
+    if ($script:BlockerProcess) { Stop-Process -Id $script:BlockerProcess.Id -Force -ErrorAction SilentlyContinue; $script:BlockerProcess = $null }
+
+    [console]::Beep(880, 300)
+    Say 'YOUR TURN: lock the PC now (Win+L). Stay locked for about 4 minutes, then sign in again. The script sees the lock and the sign-in by itself.' 'Yellow'
+    $lock = [ordered]@{ method = 'WTSQuerySessionInformation(WTSSessionInfoEx) SessionFlags, every 2 s'; locked_after_s = $null; locked_throughout = $null; unlocked_after_s = $null }
+    $t0 = Get-Date
+    while (((Get-Date) - $t0).TotalSeconds -lt 300 -and (Get-SessionLocked) -ne $true) { Start-Sleep -Seconds 2 }
+    if ((Get-SessionLocked) -eq $true) { $lock.locked_after_s = [int]((Get-Date) - $t0).TotalSeconds }
+    else { $lock.why = 'not locked within 5 minutes: round 3 runs unlocked' }
+    New-Item -ItemType File -Force -Path (Join-Path $Res 'go-3.flag') | Out-Null
+    $states = @()
+    $deadline = (Get-Date).AddSeconds(600)
+    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath (Join-Path $Res 'round-3.json'))) { $states += (Get-SessionLocked); Start-Sleep -Seconds 2 }
+    $obs.round3_done = Test-Path -LiteralPath (Join-Path $Res 'round-3.json')
+    if ($null -ne $lock.locked_after_s) { $lock.locked_throughout = @($states | Where-Object { $_ -ne $true }).Count -eq 0 }
+    $deadline = (Get-Date).AddSeconds(1200)
+    while ((Get-Date) -lt $deadline -and (Get-SessionLocked) -eq $true) { Start-Sleep -Seconds 2 }
+    if ((Get-SessionLocked) -ne $true) { $lock.unlocked_after_s = [int]((Get-Date) - $t0).TotalSeconds }
+    $obs.round3_lock = $lock
+    $obs
+}
+
+if ($Preflight) {
+    $i = Get-SandboxInfo
+    $d = Resolve-DeployDir $DeployDir $Task0Repo $env:LILITH_TASK0_REPO $Repo
+    $qt = $null
+    $why = @()
+    if ($i.kind -eq 'absent') { $why += 'Windows Sandbox is not turned on (OWNER-STEPS.md, "Turn on Windows Sandbox")' }
+    if (-not $d.exists) { $why += "Task 0's deploy folder is missing: $($d.path) (from $($d.from))" }
+    else { try { $qt = Resolve-QtExe $d.path $QtExe } catch { $why += $_.Exception.Message } }
+    [ordered]@{
+        ready = ($why.Count -eq 0); why = $why; sandbox = $i.kind; deploy = $d; qt_exe = $qt; qt_grab_args = $QtGrabArgs
+        task0_worktrees_with_a_deploy = @(Get-DeploySuggestions $Repo)
+    } | ConvertTo-Json -Depth 5 -Compress
+    return
+}
+
 # ---------------------------------------------------------------- main
 
 $info = Get-SandboxInfo
 Say "Windows Sandbox: $($info.kind) $($info.package) $($info.exe_version)"
 if ($info.kind -eq 'absent') { throw 'Windows Sandbox is not turned on: see spikes/winshell/OWNER-STEPS.md, "Turn on Windows Sandbox".' }
-if (-not (Test-Path $DeployDir)) { throw "Task 0's deploy folder is missing: $DeployDir (S1.9 runs after Task 0's Step 2)" }
-if (-not $QtExe) {
-    $exes = @(Get-ChildItem $DeployDir -Filter *.exe -File)
-    if ($exes.Count -ne 1) { throw "pass -QtExe: $DeployDir holds $($exes.Count) .exe files" }
-    $QtExe = $exes[0].Name
+$deploy = Resolve-DeployDir $DeployDir $Task0Repo $env:LILITH_TASK0_REPO $Repo
+if (-not $deploy.exists) {
+    $cmd = 'pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1'
+    $hint = @(Get-DeploySuggestions $Repo | ForEach-Object { "  $cmd -Task0Repo `"$_`"" })
+    if ($hint.Count -eq 0) { $hint = @("  $cmd -Task0Repo `"<the folder of Task 0's worktree>`"") }
+    throw ("Task 0's deploy folder is missing: $($deploy.path) (from $($deploy.from)). Run this instead (from the repository folder):`n" + ($hint -join "`n"))
 }
+$DeployDir = $deploy.path
+Say "Task 0's deploy folder: $DeployDir (from $($deploy.from))"
+$QtExe = Resolve-QtExe $DeployDir $QtExe
 
 $testExe = if ($SkipBuild) { (Get-ChildItem (Join-Path $Bin 'deps') -Filter 'winshell-*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName } else { Build-Spike }
 $dlls = Find-VcRedist
@@ -330,15 +478,8 @@ for ($run = 1; $run -le $runCount; $run++) {
         if ($startedAt) { Say ("started.json after {0:N0} s" -f $startedAt) } else { Say 'no started.json within 120 s' 'Red' }
 
         if ($Observe -and $startedAt) {
-            Say 'Host-state observation: watch the Sandbox window. A toast should pop inside it within a minute or two.'
-            $toastSeen = (Read-Host 'Did the toast pop inside the Sandbox window? [y/n]') -match '^y'
-            Wait-Owner 'Wait until the Sandbox has finished its first round (the console in it goes quiet), then put other windows OVER the Sandbox window'
-            New-Item -ItemType File -Force -Path (Join-Path $res 'go-2.flag') | Out-Null
-            $deadline = (Get-Date).AddSeconds(600)
-            while ((Get-Date) -lt $deadline -and -not (Test-Path (Join-Path $res 'round-2.json'))) { Start-Sleep -Seconds 2 }
-            Wait-Owner 'Round 2 done. Next: after Enter, lock the PC (Win+L) within 30 s, stay locked for 4 minutes, then sign in again'
-            New-Item -ItemType File -Force -Path (Join-Path $res 'go-3.flag') | Out-Null
-            $summary.observation = [ordered]@{ toast_seen_in_sandbox_window = $toastSeen }
+            Say 'Host-state observation: round 1 runs with the Sandbox window uncovered; hands off until the script asks for the lock.'
+            $summary.observation = Invoke-Observation $res $started
         }
 
         $limit = if ($Observe) { 2400 } else { $RunLimitSec }
@@ -351,6 +492,7 @@ for ($run = 1; $run -le $runCount; $run++) {
         $stop = Stop-Sandbox $started
     }
     finally {
+        if ($script:BlockerProcess) { Stop-Process -Id $script:BlockerProcess.Id -Force -ErrorAction SilentlyContinue; $script:BlockerProcess = $null }
         if ($started -and -not $stop) {
             Say 'Interrupted: stopping the Sandbox this run started.' 'Red'
             $stop = Stop-Sandbox $started -Now
@@ -378,6 +520,8 @@ for ($run = 1; $run -le $runCount; $run++) {
     $items = Judge-Run $res
     $items['lifecycle'] = [ordered]@{ pass = $lifecyclePass; file = $lifecycle }
     if ($Observe) {
+        # Round 1's toast popup, detected inside the Sandbox by UIA (replaces the owner watching).
+        if ($summary.Contains('observation')) { $summary.observation.round1_toast_popup = P (Read-Json (Join-Path $res 'toast.json')) 'popup' }
         foreach ($r in 2, 3) {
             $items["round$r"] = [ordered]@{
                 recorded = [ordered]@{
