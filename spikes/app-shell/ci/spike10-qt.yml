@@ -1,0 +1,145 @@
+# Spike 10 (plan 4a, Task 0), S0.9 and S0.10: a scratch CI run, pushed by the owner on a scratch
+# branch (P4a-R32: agents' tokens can't change workflows). Never merged; the branch is deleted
+# after the run. See spikes/app-shell/OWNER-STEPS.md, step 5.
+#
+# One job, timed as a whole: the pr-ready job's steps (from ci-pr-ready.yml, minus the draft
+# gate) plus the Qt pair installed by naqt, the spike's CMake build, and the offscreen Qt Quick
+# Test (S0.9), item by item, under QT_QPA_PLATFORM=offscreen with and without
+# QT_QUICK_BACKEND=software. Results are printed to the log (no artifact action needed).
+
+name: "spike10-qt (scratch)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [spike10-ci]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  spike10:
+    name: spike10-pr-ready-with-qt
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      NAQT_ZIP_SHA256: 59825326d65895c7f0d57716768e014c5e1f8fb6e1e10244ea1a00acb886cc8f
+    steps:
+      - name: Job start time
+        run: date -u +%s > "$RUNNER_TEMP/job-start"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-nextest@0.9.146,cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      # ---- the pr-ready job's steps ----
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo-deny
+        run: cargo deny check
+
+      - name: Workspace tests
+        run: cargo nextest run --workspace --locked
+
+      - name: Spec tests
+        run: cargo run --locked -p lil-cli -- dev spec-tests
+
+      - name: cargo-audit
+        run: cargo audit
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      # ---- Qt (S0.10) ----
+      - name: Install the Qt pair with naqt (Qt 6.12.0 + Qt WebEngine 6.140.0)
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          $zip = Join-Path $env:RUNNER_TEMP 'naqt.zip'
+          Invoke-WebRequest https://github.com/jdpurcell/naqt/releases/download/latest/naqt.zip -OutFile $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          # The 'latest' tag is rolling: run only the build whose hash spike 01 pinned.
+          if ($sha -ne $env:NAQT_ZIP_SHA256) { Write-Host "::error::naqt.zip sha256 is $sha, not the pinned $env:NAQT_ZIP_SHA256; not running it"; exit 1 }
+          Expand-Archive $zip (Join-Path $env:RUNNER_TEMP 'naqt')
+          $dll = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'naqt') -Recurse -Filter naqt.dll | Select-Object -First 1
+          dotnet $dll.FullName install-qt windows desktop 6.12.0 win64_msvc2022_64 --outputdir C:\Qt `
+            --modules qtwebchannel qtpositioning qtshadertools qtimageformats `
+            --extensions qtwebengine@6.140.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $v = Get-Content C:\Qt\6.12.0\msvc2022_64\lib\cmake\Qt6WebEngineQuick\Qt6WebEngineQuickConfigVersionImpl.cmake | Select-String 'PACKAGE_VERSION "'
+          Write-Host "WebEngine: $v"
+          if ("$v" -notmatch '6\.140\.0') { Write-Host "::error::WebEngine is not 6.140.0"; exit 1 }
+          Write-Host ("Qt install: {0:N1} min" -f ((Get-Date) - $start).TotalMinutes)
+
+      - name: Build the spike (CMake, Ninja, MSVC)
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { Set-Item "Env:$($Matches[1])" $Matches[2] } }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress | Out-Null }
+          $env:PATH = "C:\Qt\6.12.0\msvc2022_64\bin;$env:PATH"
+          $env:CMAKE_PREFIX_PATH = 'C:\Qt\6.12.0\msvc2022_64'
+          Remove-Item Env:RUSTC_WRAPPER
+          cmake -S spikes/app-shell -B spikes/app-shell/build/cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build spikes/app-shell/build/cmake
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Write-Host ("Spike build: {0:N1} min" -f ((Get-Date) - $start).TotalMinutes)
+
+      # ---- S0.9: the offscreen Qt Quick Test, per item and per environment ----
+      - name: Offscreen Qt Quick Test (S0.9)
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Qt\6.12.0\msvc2022_64\bin;$env:PATH"
+          $tst = 'spikes/app-shell/build/cmake/bin/tst_app_shell.exe'
+          $items = 'test_kddw_main_and_floating', 'test_shape_polyline', 'test_web_loader', 'test_web_about_blank', 'test_grab_not_flat'
+          $failedAll = $true
+          foreach ($backend in '', 'software') {
+            $env:QT_QPA_PLATFORM = 'offscreen'
+            if ($backend) { $env:QT_QUICK_BACKEND = $backend } else { Remove-Item Env:QT_QUICK_BACKEND -ErrorAction SilentlyContinue }
+            $label = if ($backend) { "offscreen+$backend" } else { 'offscreen' }
+            $ok = 0
+            foreach ($it in $items) {
+              $out = Join-Path $env:RUNNER_TEMP "s09-$($label -replace '\W','_')-$it.txt"
+              $p = Start-Process $tst -ArgumentList '-input', 'spikes/app-shell/tests', "AppShell::$it", '-o', "$out,txt" -NoNewWindow -PassThru
+              if (-not $p.WaitForExit(180000)) { $p.Kill($true); $res = 'TIMEOUT' }
+              else { $res = if (Select-String -Path $out -Pattern "^PASS\s+:\s+(\S+::)?AppShell::$it\(\)" -Quiet) { 'PASS' } else { 'FAIL' } }
+              if ($res -eq 'PASS' -and $it -ne 'test_web_about_blank') { $ok++ }
+              Write-Host "S0.9 [$label] $it : $res"
+              if ($res -ne 'PASS' -and (Test-Path $out)) { Get-Content $out | Select-Object -First 30 }
+            }
+            if ($ok -eq 4) { $failedAll = $false }
+          }
+          if ($failedAll) { Write-Host '::warning::S0.9: no environment passed all four required items' }
+
+      - name: Total job time (S0.10)
+        if: always()
+        run: |
+          start=$(cat "$RUNNER_TEMP/job-start")
+          now=$(date -u +%s)
+          echo "S0.10 job time so far: $(( (now - start) / 60 )) min $(( (now - start) % 60 )) s (setup before the first step is not included; read the job's total from the run page)"
