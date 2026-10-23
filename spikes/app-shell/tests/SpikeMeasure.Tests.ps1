@@ -392,6 +392,36 @@ Describe 'run-owner.ps1 refusal (by path, never by name)' {
     }
 }
 
+Describe 'Get-OwnerRunBlockers and the harness''s own command lines (owner run 2)' {
+    BeforeAll {
+        $main = 'C:\work\ComfyUI\ComfyUI\main.py'; $build = 'C:\work\spikes\app-shell\build'
+        $t0 = [datetime]'2026-10-23T11:00:00'
+        function Q($id, $parent, $min, $path, $cmd) { [pscustomobject]@{ ProcessId = $id; ParentProcessId = $parent; CreationDate = $t0.AddMinutes($min)
+                                                                           Name = 'x.exe'; ExecutablePath = $path; CommandLine = $cmd } }
+        # The owner's shell (80) ran run-owner (90), which started comfy-load (100) with -ComfyMain.
+        $script:tree = @(
+            (Q 80 1 0 'C:\pwsh\pwsh.exe' 'pwsh'),
+            (Q 90 80 1 'C:\pwsh\pwsh.exe' "pwsh -NoProfile -File run-owner.ps1 -ComfyMain $main"),
+            (Q 100 90 2 'C:\pwsh\pwsh.exe' "pwsh -NoProfile -File comfy-load.ps1 -Port 8188 -ComfyMain $main"))
+    }
+    It 'does not block on the harness''s own pwsh (this process and its ancestors) that carry -ComfyMain' {
+        @(Get-OwnerRunBlockers $build $main $tree 100).Count | Should -Be 0
+        # run-owner's own check runs before comfy-load exists: run-owner (90) with -ComfyMain doesn't block it.
+        @(Get-OwnerRunBlockers $build $main @($tree[0], $tree[1]) 90).Count | Should -Be 0
+    }
+    It 'still blocks a python running main.py, and a pwsh outside the chain that names it' {
+        $py = Q 7 50 0 'C:\uv\python\python.exe' "python.exe $main --listen 127.0.0.1"
+        $other = Q 120 80 3 'C:\pwsh\pwsh.exe' "pwsh -File comfy-load.ps1 -ComfyMain $main"   # a second harness, not an ancestor
+        $why = @(Get-OwnerRunBlockers $build $main (@($tree) + @($py, $other)) 100)
+        $why | Should -Match 'ComfyUI is running \(pid 7, 120\)'
+    }
+    It 'does not take a reused parent pid (a parent newer than its child) for an ancestor' {
+        # 90's pid now belongs to a newer process that names main.py: not this harness's parent.
+        $reused = @((Q 90 80 30 'C:\py\python.exe' "python $main"), (Q 100 90 2 'C:\pwsh\pwsh.exe' 'pwsh -File comfy-load.ps1'))
+        @(Get-OwnerRunBlockers $build $main $reused 100) | Should -Match 'pid 90'
+    }
+}
+
 Describe 'S0.6 web view check' {
     BeforeAll {
         function Ev($e, $t, $more = @{}) { $o = [ordered]@{ event = $e; t_ms = $t }; foreach ($k in $more.Keys) { $o[$k] = $more[$k] }; [pscustomobject]$o }

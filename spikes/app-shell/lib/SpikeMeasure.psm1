@@ -291,14 +291,29 @@ function Test-DeployName([string]$Name) { [bool]($Name -cmatch '^deploy(-[A-Za-z
 # run-owner.ps1's refusal, by path only: a process whose executable is under the spike's build
 # folder (a spike window or QtWebEngineProcess from any build or deploy folder), or ComfyUI: an
 # executable under the ComfyUI folder (its venv's python) or a command line naming its main.py.
-function Get-OwnerRunBlockers([string]$BuildDir, [string]$ComfyMain, [object[]]$Processes = $null) {
+# The command-line rule skips this process and its ancestors: run-owner passes -ComfyMain <that
+# path> to comfy-load, so their own pwsh command lines name main.py (owner run 2 refused itself).
+# An ancestor is a parent created no later than its child, so a reused parent pid isn't one.
+function Get-OwnerRunBlockers([string]$BuildDir, [string]$ComfyMain, [object[]]$Processes = $null, [int]$SelfPid = $PID) {
     if ($null -eq $Processes) { $Processes = @(Get-CimInstance Win32_Process) }
     $why = @()
     $spike = @(Get-ProcessesUnder $BuildDir $Processes)
     if ($spike.Count) { $why += "a spike process runs from spikes/app-shell/build (pid $(($spike | ForEach-Object ProcessId) -join ', ')); close its windows" }
+    $byPid = @{}; foreach ($p in $Processes) { $byPid[[int]$p.ProcessId] = $p }
+    $self = @{}
+    $cur = $byPid[$SelfPid]
+    if ($cur) { $self[$SelfPid] = $true }
+    for ($i = 0; $cur -and $i -lt 64; $i++) {
+        $parent = $byPid[[int]$cur.ParentProcessId]
+        if (-not $parent -or $self.ContainsKey([int]$parent.ProcessId) -or
+            ($parent.CreationDate -and $cur.CreationDate -and $parent.CreationDate -gt $cur.CreationDate)) { break }
+        $self[[int]$parent.ProcessId] = $true
+        $cur = $parent
+    }
     $comfyDir = Split-Path (Split-Path $ComfyMain)   # <ComfyUI folder>\ComfyUI\main.py; the venv is under the folder
     $main = [IO.Path]::GetFullPath($ComfyMain)
     $comfy = @(@(Get-ProcessesUnder $comfyDir $Processes) + @($Processes | Where-Object {
+        -not $self.ContainsKey([int]$_.ProcessId) -and
         $_.CommandLine -and $_.CommandLine.IndexOf($main, [StringComparison]::OrdinalIgnoreCase) -ge 0 }) | Sort-Object ProcessId -Unique)
     if ($comfy.Count) { $why += "ComfyUI is running (pid $(($comfy | ForEach-Object ProcessId) -join ', ')); stop it first" }
     $why
