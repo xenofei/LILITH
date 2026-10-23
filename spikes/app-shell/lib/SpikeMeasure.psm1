@@ -171,18 +171,22 @@ function Get-OsPrimaryRefreshHz {
 
 # Which refresh rate S0.6 judges with, and where it came from: the app's report
 # (`primary_refresh_hz`; builds before fix round 2 logged `screens[].refresh_hz`), else Windows'.
+# Values under 24 Hz count as unknown. `mismatch` is set when the app and Windows both gave a
+# plausible value more than 2 Hz apart (S0.6 then calls the run INVALID).
 function Resolve-RefreshHz($StallReport, [double]$OsHz) {
-    if ($StallReport -and $StallReport.primary_refresh_hz -gt 0) {
-        return [ordered]@{ hz = [double]$StallReport.primary_refresh_hz; source = 'app' }
+    $app = 0.0; $source = $null
+    if ($StallReport -and (Test-PlausibleRefresh ([double]$StallReport.primary_refresh_hz))) {
+        $app = [double]$StallReport.primary_refresh_hz; $source = 'app'
+    } elseif ($StallReport -and $StallReport.screens) {
+        $p = @($StallReport.screens) | Where-Object { $_.primary -and (Test-PlausibleRefresh ([double]$_.refresh_hz)) } | Select-Object -First 1
+        if ($p) { $app = [double]$p.refresh_hz; $source = 'app (older report format)' }
     }
-    if ($StallReport -and $StallReport.screens) {
-        $p = @($StallReport.screens) | Where-Object { $_.primary -and $_.refresh_hz -gt 0 } | Select-Object -First 1
-        if ($p) { return [ordered]@{ hz = [double]$p.refresh_hz; source = 'app (older report format)' } }
-    }
-    if ($OsHz -gt 0) { return [ordered]@{ hz = $OsHz; source = 'windows' } }
-    [ordered]@{ hz = 0.0; source = 'none' }
+    $osOk = Test-PlausibleRefresh $OsHz
+    $mismatch = ($app -gt 0) -and $osOk -and ([math]::Abs($app - $OsHz) -gt 2)
+    if ($app -gt 0) { return [ordered]@{ hz = $app; source = $source; os_hz = $OsHz; mismatch = $mismatch } }
+    if ($osOk) { return [ordered]@{ hz = $OsHz; source = 'windows'; os_hz = $OsHz; mismatch = $false } }
+    [ordered]@{ hz = 0.0; source = 'none'; os_hz = $OsHz; mismatch = $false }
 }
-
 # Is the deploy folder built from the current build? Our binaries in it must match the build
 # tree's byte for byte; the owner's first S0.6 run used a deploy from before fix round 2. Returns
 # the stale or missing files (empty when current).
@@ -246,6 +250,64 @@ function Split-BuildWarnings([string[]]$Lines) {
     }
     $out
 }
+# ---- guards for the owner's PC -----------------------------------------------------------------
+
+# Processes whose executable lives under $Root (any name: QtWebEngineProcess.exe runs from the
+# deploy folder too). Processes whose ExecutablePath can't be read (elevated, or another user's)
+# are skipped; a spike started by the owner is readable.
+function Get-ProcessesUnder([string]$Root, [object[]]$Processes = $null) {
+    # Resolved against PowerShell's location (not .NET's working directory), then normalised, so
+    # 'build\..\x' and relative paths compare like the full ExecutablePath.
+    $abs = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
+    $full = [IO.Path]::GetFullPath($abs).TrimEnd('\') + '\'
+    if ($null -eq $Processes) { $Processes = @(Get-CimInstance Win32_Process) }
+    @($Processes | Where-Object { $_.ExecutablePath -and
+        [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($full, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+# Spike app instances anywhere (they all share %LOCALAPPDATA%\LILITH-spike\image).
+function Get-SpikeAppProcesses([object[]]$Processes = $null) {
+    if ($null -eq $Processes) { $Processes = @(Get-CimInstance Win32_Process) }
+    @($Processes | Where-Object { $_.Name -in 'app_shell_spike.exe', 'tst_app_shell.exe' })
+}
+
+# -DeployName is one folder under build/: "deploy" or "deploy-<letters/digits>", nothing else, so
+# a slip can't point the deploy folder's delete at build/, runs/, cmake/ or the sources.
+function Test-DeployName([string]$Name) { [bool]($Name -cmatch '^deploy(-[A-Za-z0-9]+)?$') }
+
+# ---- S0.6 workload and refresh-rate checks ----------------------------------------------------
+
+# Did the bar's workload actually run? load_counts is logged at the end of the measured window,
+# with cumulative counters from the load's start (5 s of warm-up and the measured window), so
+# each count must be at least half of what the measured window alone should give.
+function Test-S06Workload($Counts, [int]$MeasureSeconds = 60, [int]$RateHz = 10) {
+    if (-not $Counts) { return @('no load_counts logged') }
+    $p = @()
+    $half = 0.5 * $MeasureSeconds
+    if ([double]$Counts.grid_visible_seconds -lt $MeasureSeconds - 1) { $p += "list visible only $($Counts.grid_visible_seconds) s of $MeasureSeconds" }
+    if ([double]$Counts.grid_hidden_seconds -gt 0) { $p += "list hidden $($Counts.grid_hidden_seconds) s" }
+    if ([double]$Counts.feed_ticks -lt $half * $RateHz) { $p += "feed ticks $($Counts.feed_ticks) (expected >= $($half * $RateHz))" }
+    if ([double]$Counts.decoded -lt $half * $RateHz * 8) { $p += "previews decoded $($Counts.decoded) (expected >= $($half * $RateHz * 8))" }
+    if ([double]$Counts.chart_points -lt $half * 6) { $p += "chart points $($Counts.chart_points) (expected >= $($half * 6))" }
+    if ([double]$Counts.grid_rows_scrolled -lt $half * 200) { $p += "rows scrolled $([math]::Round([double]$Counts.grid_rows_scrolled)) (expected >= $($half * 200))" }
+    if (-not $Counts.web_shown) { $p += 'web dock not shown' }
+    $p
+}
+
+# The final S0.6 verdict: a FAIL stays a FAIL; otherwise a missing workload or a refresh rate the
+# app and Windows disagree on makes the run INVALID, because PASS would then rest on missing data.
+function Complete-S06Verdict([string]$Verdict, [string[]]$WorkloadProblems, [bool]$RefreshMismatch) {
+    if ($Verdict -match '^FAIL') { return $Verdict }
+    $problems = @($WorkloadProblems | Where-Object { $_ })
+    if ($problems.Count) { return "INVALID (workload not running as the bar requires: $($problems -join '; '))" }
+    if ($RefreshMismatch) { return 'INVALID (the app and Windows report refresh rates more than 2 Hz apart)' }
+    $Verdict
+}
+
+# A refresh rate S0.6 can judge with: 0, 1 ("hardware default") and anything under 24 Hz count as
+# unknown.
+function Test-PlausibleRefresh([double]$Hz) { $Hz -ge 24 -and $Hz -le 1000 }
+
 # The machine's CPU load (%), averaged over one second; recorded beside every timing.
 function Get-CpuPercent {
     try { [math]::Round((Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).CounterSamples[0].CookedValue, 1) }
@@ -254,4 +316,5 @@ function Get-CpuPercent {
 
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
+    Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

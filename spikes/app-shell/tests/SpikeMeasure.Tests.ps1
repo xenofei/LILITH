@@ -238,10 +238,79 @@ Describe 'Resolve-RefreshHz' {
 }
 
 Describe 'Get-OsPrimaryRefreshHz' {
-    It 'reads a plausible refresh rate for the primary display' {
-        $hz = Get-OsPrimaryRefreshHz
-        $hz | Should -BeGreaterThan 20
-        $hz | Should -BeLessThan 1000
+    # Needs a real desktop: skipped in a service session (session 0) or a non-interactive one.
+    It 'reads a plausible refresh rate for the primary display' -Skip:(-not [Environment]::UserInteractive -or (Get-Process -Id $PID).SessionId -eq 0) {
+        Test-PlausibleRefresh (Get-OsPrimaryRefreshHz) | Should -BeTrue
+    }
+}
+
+Describe 'Refresh-rate sanity' {
+    It 'treats 0, 1 ("hardware default") and anything under 24 Hz as unknown' {
+        foreach ($hz in 0, 1, 23.9) { Test-PlausibleRefresh $hz | Should -BeFalse }
+        foreach ($hz in 24, 60, 240) { Test-PlausibleRefresh $hz | Should -BeTrue }
+        (Resolve-RefreshHz ([pscustomobject]@{ primary_refresh_hz = 1 }) 1).source | Should -Be 'none'
+    }
+    It 'flags the app and Windows disagreeing by more than 2 Hz' {
+        (Resolve-RefreshHz ([pscustomobject]@{ primary_refresh_hz = 239.984 }) 240).mismatch | Should -BeFalse
+        (Resolve-RefreshHz ([pscustomobject]@{ primary_refresh_hz = 60 }) 240).mismatch | Should -BeTrue
+    }
+}
+
+Describe 'Guards' {
+    BeforeAll {
+        $procs = @(
+            [pscustomobject]@{ ProcessId = 1; Name = 'app_shell_spike.exe'; ExecutablePath = 'C:\work\spikes\app-shell\build\deploy\app_shell_spike.exe' },
+            [pscustomobject]@{ ProcessId = 2; Name = 'QtWebEngineProcess.exe'; ExecutablePath = 'C:\work\spikes\app-shell\build\deploy\QtWebEngineProcess.exe' },
+            [pscustomobject]@{ ProcessId = 3; Name = 'tst_app_shell.exe'; ExecutablePath = 'C:\work\spikes\app-shell\build\cmake\bin\tst_app_shell.exe' },
+            [pscustomobject]@{ ProcessId = 4; Name = 'notepad.exe'; ExecutablePath = 'C:\Windows\notepad.exe' },
+            [pscustomobject]@{ ProcessId = 5; Name = 'elevated.exe'; ExecutablePath = $null })
+    }
+    It 'finds every process under a folder whatever its name, by full path' {
+        @(Get-ProcessesUnder 'C:\work\spikes\app-shell\build\deploy' $procs).ProcessId | Should -Be @(1, 2)
+        @(Get-ProcessesUnder 'C:\work\spikes\app-shell\build\cmake\..\deploy' $procs).ProcessId | Should -Be @(1, 2)
+        @(Get-ProcessesUnder 'C:\work\spikes\app-shell\build' $procs).ProcessId | Should -Be @(1, 2, 3)
+    }
+    It 'does not match a sibling folder that shares a prefix' {
+        @(Get-ProcessesUnder 'C:\work\spikes\app-shell\build\dep' $procs).Count | Should -Be 0
+    }
+    It 'finds spike app instances anywhere' {
+        @(Get-SpikeAppProcesses $procs).ProcessId | Should -Be @(1, 3)
+    }
+    It 'accepts only deploy and deploy-NAME (letters and digits) as a deploy folder name' {
+        foreach ($ok in 'deploy', 'deploy-check', 'deploy-2') { Test-DeployName $ok | Should -BeTrue }
+        foreach ($bad in '.', '..', 'runs', 'cmake', 'cargo-lint', 'sizecheck', 'deploy\..', 'deploy-', 'deploy-a/b', 'Deploy', '') {
+            Test-DeployName $bad | Should -BeFalse
+        }
+    }
+}
+
+Describe 'S0.6 workload check' {
+    BeforeAll {
+        $good = [pscustomobject]@{ grid_visible_seconds = 60; grid_hidden_seconds = 0; feed_ticks = 640; decoded = 5100
+                                   chart_points = 390; grid_rows_scrolled = 12900; web_shown = $true }
+    }
+    It 'accepts a full workload' {
+        @(Test-S06Workload $good 60 10).Count | Should -Be 0
+    }
+    It 'rejects a missing load_counts' {
+        Test-S06Workload $null 60 10 | Should -Be @('no load_counts logged')
+    }
+    It 'rejects zero counts (previews not decoding, feed not started, list not visible)' {
+        $zero = [pscustomobject]@{ grid_visible_seconds = 0; grid_hidden_seconds = 0; feed_ticks = 0; decoded = 0
+                                   chart_points = 0; grid_rows_scrolled = 0; web_shown = $false }
+        @(Test-S06Workload $zero 60 10).Count | Should -Be 6   # visible, feed, decoded, charts, rows, web
+    }
+    It 'scales the expected counts with the fallback''s 5 Hz' {
+        $half = [pscustomobject]@{ grid_visible_seconds = 60; grid_hidden_seconds = 0; feed_ticks = 160; decoded = 1300
+                                   chart_points = 390; grid_rows_scrolled = 12900; web_shown = $true }
+        @(Test-S06Workload $half 60 5).Count | Should -Be 0
+        @(Test-S06Workload $half 60 10).Count | Should -BeGreaterThan 0
+    }
+    It 'turns a PASS on missing data into INVALID, and leaves a FAIL alone' {
+        Complete-S06Verdict 'PASS' @('no load_counts logged') $false | Should -Match '^INVALID \(workload'
+        Complete-S06Verdict 'PASS' @() $true | Should -Match '^INVALID \(the app and Windows'
+        Complete-S06Verdict 'FAIL (heartbeat p99 20 ms)' @('no load_counts logged') $true | Should -Match '^FAIL'
+        Complete-S06Verdict 'PASS' @() $false | Should -Be 'PASS'
     }
 }
 
@@ -256,6 +325,10 @@ Describe 'Test-GpuSaturatedRecently (the gate before the measured minute)' {
     }
     It 'stays shut with no samples yet' {
         Test-GpuSaturatedRecently @() 21000 | Should -BeFalse
+    }
+    It 'stays shut when the sampler died (no sample in the last few seconds)' {
+        $s = for ($k = 0; $k -lt 36; $k++) { [pscustomobject]@{ t = 1000 + $k * 500; util = 99 } }   # last at 18.5 s
+        Test-GpuSaturatedRecently $s 21000 | Should -BeFalse
     }
 }
 
@@ -274,6 +347,10 @@ Describe 'Test-DeployCurrent' {
     It 'names a stale file' {
         Set-Content (Join-Path $bin 'spike_shell_shim.dll') 'rebuilt'
         Test-DeployCurrent $dep $bin | Should -Be @('spike_shell_shim.dll')
+    }
+    It 'names a file missing from the deploy folder' {
+        Remove-Item -LiteralPath (Join-Path $dep 'SpikeWeb\spike_web.dll')
+        Test-DeployCurrent $dep $bin | Should -Contain 'SpikeWeb\spike_web.dll'
     }
 }
 

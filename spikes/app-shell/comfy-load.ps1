@@ -106,6 +106,10 @@ if ($missing.Count) { throw "the deploy folder is incomplete (run run-spike.ps1 
 # ...and built from the current build (the owner's first run measured a stale deploy).
 $stale = @(Test-DeployCurrent $Deploy (Join-Path $Root 'build\cmake\bin'))
 if ($stale.Count) { throw "the deploy folder is older than the build ($($stale -join ', ')); redeploy first: pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4" }
+# No other spike instance during the measurement: it would share the GPU, the CPU and the
+# persistent WebEngine profile (for example a Narrator window still open from step 4).
+$others = @(Get-SpikeAppProcesses)
+if ($others.Count) { throw "another spike app is running (pid $(($others | ForEach-Object ProcessId) -join ', ')); close it first" }
 if (Test-Comfy) { throw "something already answers on $Url; this script only measures with a ComfyUI it starts itself" }
 if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "ComfyUI not found at $ComfyMain" }
 
@@ -129,6 +133,7 @@ try {
     $stopFile = Join-Path $Runs 'stop-load'
     $load = Start-Process -FilePath $ComfyPython -WindowStyle Hidden -PassThru -ArgumentList @('-I',
         (Join-Path $Root 'comfy\keep_busy.py'), '--port', "$Port", '--depth', '2', '--seconds', '1800', '--stop-file', $stopFile,
+        '--parent-pid', "$PID",   # it stops by itself if this script's window is closed
         '--workflow', (Join-Path $Root 'comfy\load-workflow.json'), '--summary', (Join-Path $Runs 'keep-busy.json')) `
         -RedirectStandardOutput (Join-Path $Runs 'keep-busy.out.log') -RedirectStandardError (Join-Path $Runs 'keep-busy.err.log')
 
@@ -141,6 +146,14 @@ try {
         $saturated = Test-GpuSaturatedRecently (Read-GpuSamples $gpuFile) ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
     }
     $res.gpu_saturated_before_start = $saturated
+    # How close the load came, either way: the GPU condition over the last 20 s and 60 s, and how
+    # many prompts keep_busy has finished.
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $gs = Read-GpuSamples $gpuFile
+    $res.gate = [ordered]@{
+        last_20_s = (Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 20000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
+        last_60_s = (Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 60000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
+        prompts_finished = @(Get-Content (Join-Path $Runs 'keep-busy.out.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match '^prompt ' }).Count }
     if (-not $saturated) {
         $res.load_exit_code = if ($load.HasExited) { $load.ExitCode } else { $null }
         throw "the GPU never reached the measurement condition before the measured minute (load exited: $($load.HasExited)); see keep-busy.*.log and comfy.err.log in $Runs"
@@ -158,7 +171,10 @@ try {
     $app = [System.Diagnostics.Process]::Start($psi)
     $appStart = ([DateTimeOffset]$app.StartTime).ToUnixTimeMilliseconds()
     $vramJob = Start-VramSampler $app.Id $vramFile
-    $res.app_timed_out = -not $app.WaitForExit(($MeasureSeconds + 90) * 1000)
+    # Short waits in a loop, so Ctrl+C reaches `finally` (and stops ComfyUI) at once.
+    $waitUntil = (Get-Date).AddSeconds($MeasureSeconds + 90)
+    while (-not $app.WaitForExit(250) -and (Get-Date) -lt $waitUntil) { }
+    $res.app_timed_out = -not $app.HasExited
     if ($res.app_timed_out) { try { $app.Kill($true) } catch {}; $app.WaitForExit() }
     $res.app_exit_code = if ($res.app_timed_out) { $null } else { $app.ExitCode }
     $res.cpu_percent_after_app = Get-CpuPercent
@@ -198,12 +214,13 @@ try {
         dedicated_usage_max = ($vWeb | Measure-Object dedicated_usage_mib -Maximum).Maximum; samples = $vWeb.Count }
     $res.load_counts = $counts
     $res.stack_files = @(Get-ChildItem $Runs -Filter 's06.jsonl.*stacks.txt' -ErrorAction SilentlyContinue | ForEach-Object Name)
+    $res.refresh_mismatch = $rr.mismatch
+    $res.workload_problems = @(Test-S06Workload $counts $MeasureSeconds $RateHz)
     $verdict = Get-S06Verdict -HasMeasuredReport ([bool]$measured) -ExitCode $res.app_exit_code -TimedOut $res.app_timed_out `
         -Heartbeat $hb -Frames $fr -RefreshHz $refresh -Coverage $cov
-    # The list must have been on screen for the whole measured window.
-    if ($verdict -notmatch '^FAIL' -and $counts -and $counts.grid_hidden_seconds -gt 0) {
-        $verdict = "INVALID (the scrolled list was hidden for $($counts.grid_hidden_seconds) s)"
-    }
+    # The bar's workload must have run, with the list on screen throughout, and the refresh rate
+    # must be trustworthy; otherwise a completed run is INVALID (a FAIL stays a FAIL).
+    $verdict = Complete-S06Verdict $verdict $res.workload_problems $rr.mismatch
     if ($verdict -match '^FAIL' -and $res.stack_files.Count) { $verdict += "; stacks: $($res.stack_files -join ', ')" }
     $res.verdict = $verdict
     $res.log = $log

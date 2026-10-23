@@ -44,6 +44,10 @@ if ($stale.Count) { throw "not launched: $Folder is older than the build ($($sta
 $cache = Join-Path $env:LOCALAPPDATA 'LILITH-spike\image\cache'
 $cacheAside = "$cache.aside-$(Get-Date -Format 'yyyyMMddHHmmss')"
 $movedCache = $false
+# The cache is shared by every spike instance: never move it from under one that is running.
+if ($ColdCache -and @(Get-SpikeAppProcesses).Count) {
+    throw "not launched: a spike app is running (pid $((Get-SpikeAppProcesses | ForEach-Object ProcessId) -join ', ')); close it before a -ColdCache start"
+}
 if ($ColdCache -and (Test-Path $cache)) { Move-Item $cache $cacheAside; $movedCache = $true }
 try {
     $log = Join-Path $Runs "s05-$Label.jsonl"

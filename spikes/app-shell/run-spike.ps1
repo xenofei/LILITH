@@ -89,7 +89,37 @@ function Read-Log([string]$path) {
 }
 function Get-Events($log, [string]$name) { @($log | Where-Object { $_.event -eq $name }) }
 
-Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force   # Get-CpuPercent and the S0.6 helpers
+Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force   # Get-CpuPercent, the S0.6 helpers, the guards
+
+# ---- preflight: nothing this run deletes or overwrites may be in use -------------------------
+# Checked once, here, before any delete: the build tree (-Clean deletes it, a build overwrites
+# it), the deploy folder and the size-check folder (S0.4 replaces them), and the shared
+# %LOCALAPPDATA%\LILITH-spike (S0.8 deletes it, and every spike instance uses it). The owner may
+# have a spike window open (an earlier run deleted a file from under one); this run then refuses.
+if (-not (Test-DeployName $DeployName)) {
+    Write-Host "NOT RUN: -DeployName must be 'deploy' or 'deploy-<letters and digits>' (a folder under build\), not '$DeployName'"
+    exit 2
+}
+$willDeploy = (Want 'S0.4') -or (Want 'S0.5a') -or (Want 'S0.8')
+$busy = [ordered]@{}
+if (-not $NoBuild) { $busy['build tree (build\cmake)'] = @(Get-ProcessesUnder $CmakeDir) }
+if ($willDeploy) {
+    $busy["deploy folder (build\$DeployName)"] = @(Get-ProcessesUnder $Deploy)
+    $busy['size-check folder (build\sizecheck)'] = @(Get-ProcessesUnder (Join-Path $Build 'sizecheck'))
+}
+if (Want 'S0.8') { $busy['%LOCALAPPDATA%\LILITH-spike (S0.8 deletes it; every spike instance uses it)'] = @(Get-SpikeAppProcesses) }
+# Every check but S0.2 launches the app, which shares the persistent WebEngine profile and the
+# caches with any open instance, so no launch either while one is open.
+$launches = @('S0.1', 'S0.3', 'S0.4', 'S0.5a', 'S0.8', 'S0.9', 'S0.6smoke' | Where-Object { Want $_ })
+if ($launches.Count) { $busy["another spike instance (this run launches the app for $($launches -join ', '))"] = @(Get-SpikeAppProcesses) }
+$inUse = @($busy.Keys | Where-Object { $busy[$_].Count })
+if ($inUse.Count) {
+    $why = ($inUse | ForEach-Object { "$_ is in use by pid $(($busy[$_] | ForEach-Object ProcessId | Select-Object -Unique) -join ', ')" }) -join '; '
+    Write-Host "NOT RUN: $why. Close those spike windows first; nothing was deleted or launched."
+    $checks['preflight'] = [ordered]@{ check = 'preflight'; verdict = 'NOT RUN'; reason = $why }
+    Save-Results
+    exit 1
+}
 
 # The DLLs a launch needs. Build tree: Qt from QTDIR\bin (first on PATH), ours from bin\.
 # Deploy folder: everything in the folder itself, including the VC++ runtime.
@@ -205,6 +235,7 @@ $s08Before = @(Get-ChildItem $env:LOCALAPPDATA -Directory -ErrorAction SilentlyC
 $appDataBefore = @(Get-ChildItem $env:APPDATA -Directory -ErrorAction SilentlyContinue | ForEach-Object Name)
 if (Want 'S0.8') {
     # Start S0.8 from nothing: the spike's own local folder only.
+    if (@(Get-SpikeAppProcesses).Count) { throw "a spike app started after the preflight; not deleting $LocalSpike" }
     if (Test-Path $LocalSpike) { Remove-Item -Recurse -Force $LocalSpike }
     $s08Before = @(Get-ChildItem $env:LOCALAPPDATA -Directory | ForEach-Object Name)
 }
@@ -216,7 +247,10 @@ $confLog = Join-Path $Build 'configure.log'
 $buildLog = Join-Path $Build 'build.log'
 $buildInfo = [ordered]@{}
 if (-not $NoBuild) {
-    if ($Clean -and (Test-Path $CmakeDir)) { Remove-Item -Recurse -Force $CmakeDir }
+    if ($Clean -and (Test-Path $CmakeDir)) {
+        if (@(Get-ProcessesUnder $CmakeDir).Count) { throw "a process started from $CmakeDir after the preflight; not deleting it" }
+        Remove-Item -Recurse -Force $CmakeDir
+    }
     $t = [Diagnostics.Stopwatch]::StartNew()
     & cmake -S $Root -B $CmakeDir -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DSPIKE_KDDW_TAG=$KddwTag" *>&1 | Out-File -Encoding utf8 $confLog
     $buildInfo.configure_exit = $LASTEXITCODE
@@ -395,10 +429,9 @@ if ((Want 'S0.4') -or (Want 'S0.5a') -or (Want 'S0.8')) {
         trimmed = Get-DryRunList $QmlDirs $TrimFlags
         trimmed_without_webengine = Get-DryRunList @($QmlDirs | Where-Object { $_ -notmatch '\\web$' }) $TrimFlags
     }
-    # Never replace a folder a spike process is running from (the owner may have one open; the
-    # first try at this round deleted one file from under the owner's open Narrator window).
-    $running = @(Get-CimInstance Win32_Process -Filter "Name='app_shell_spike.exe'" | Where-Object {
-        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Deploy + '\', [StringComparison]::OrdinalIgnoreCase) })
+    # Checked again right before the delete (the preflight ran minutes ago): any process whose
+    # executable is under the deploy folder, by full path, whatever its name.
+    $running = @(Get-ProcessesUnder $Deploy)
     if ($running.Count) {
         Set-Check 'S0.4' 'NOT RUN' ([ordered]@{ reason = "a spike process (pid $(($running | ForEach-Object ProcessId) -join ', ')) runs from $Deploy; close it, or use -DeployName <other>" })
         Save-Results; exit 1

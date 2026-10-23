@@ -6,7 +6,7 @@ You run these checks yourself. Each one needs you present, or has an effect outs
 - Close heavy work first: every result records the machine's CPU load beside its timing.
 - Each script writes its result under `spikes/app-shell/results/`, and its logs to a new timestamped folder under `spikes/app-shell/build/runs/` (both git-ignored). Hand the result files back to the agent for Step 4.
 
-Before any of them, `spikes/app-shell/build/deploy/` must exist. If it doesn't, rebuild and redeploy (about 5 minutes on an idle machine; spike windows open and close without taking focus):
+Before any of them, `spikes/app-shell/build/deploy/` must exist and match the build. If it doesn't, close every spike window, then rebuild and redeploy (about 5 minutes on an idle machine; spike windows open and close without taking focus). The harness, `start-once.ps1 -ColdCache` and `comfy-load.ps1` refuse to run while a spike window is open, and say which one:
 
 ```powershell
 pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4
@@ -49,7 +49,7 @@ You run this script yourself, when you're ready; no agent starts it. It:
 - runs the spike for 5 s of warm-up plus 60 s measured, then stops ComfyUI.
 
 Before you start it:
-- **Close any spike window that's still open** (for example the Narrator one), then redeploy, because the script refuses a deploy folder that is older than the build:
+- **Close any spike window that's still open** (for example the Narrator one), then redeploy. The script refuses both an open spike window and a deploy folder that is older than the build:
 
   ```powershell
   pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4
