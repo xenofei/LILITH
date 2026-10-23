@@ -110,6 +110,14 @@ Part B and the stay-awake wait write `results/checks.json`; the Sandbox runs wri
 - **Any S1.3 refusal goes to the owner's click,** recorded as such. Windows' own toast chrome (close, "…", settings) is known in the scope and never pressed.
 - **The pop-up is made topmost with `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | …)`.** Its warning runs to an absolute start time that the caller sets only after the pop-up reports itself shown, so it lasts at least 10 s on screen. It is cleared in a `finally` on every path.
 - **Unknown controls in a scope are recorded by AutomationId, control type and class only,** never by their Name.
+
+**Fix round 4.**
+- **A strict-mode simulation of both blocks** (`spikes/winshell/tests/simulate.ps1`, run by `cargo test`). It runs `run-all.ps1 -Block Attended` and `-Block Unattended` end to end with `-Simulate`, every stage in its own `pwsh` under the scripts' own `Set-StrictMode -Version Latest`. Every Windows call is faked (`tests/sim-fakes.ps1`), and every stage record and result file is written and read back. It caught all three runtime errors of fix round 3 on that code: a read of a removed variable in S1.8, `ConvertTo-Json` of a live Process object in the Sandbox record, and the pop-up log reset before the stage record read it. A static test also checks that every `$script:` variable read is assigned somewhere.
+- **The Sandbox record holds `{pid, name, start}` for each of the run's own processes.** The pinned Process objects stay in memory, never in a record.
+- **Pinning by creation time.** `winshell-tool spawn` prints the child's creation time, read from the handle `CreateProcessW` returned. The scripts pin a child by its pid and that exact time, with no time window and no path check. In Windows PowerShell 5.1, `inside.ps1` reads `.Handle` right after each `Start-Process`, since a redirected one holds no handle until then.
+- **No pop-up is ever ended from outside.** At the end, a pop-up never told it was done is told now, through its state file, and it closes itself. A pop-up that shows late still gets 10 s of warning from the moment the wait for it ended.
+- **One idle-timer reset after S1.7's stay-awake wait.** After the evidence reads, a single `SetThreadExecutionState(ES_SYSTEM_REQUIRED)` without `ES_CONTINUOUS` covers the switch to the Sandbox stage. It is outside the judged span and holds nothing.
+- **The host keep-awake runs from a copy of the core,** so that the Sandbox stage's build can replace the release binaries.
 Re-run: the commands above. `spikes/winshell/OWNER-STEPS.md` lists what each step shows, what the owner does, how long it takes, and what it writes and removes.
 
 ## 4. Pass criteria

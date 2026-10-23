@@ -73,14 +73,18 @@ $Build = Join-Path $Spike 'build\sandbox'
 $ResultsRoot = Join-Path $Spike 'results'
 $RunLimitSec = 600
 # The blocker window the observation places over the Sandbox window: started by this script and
-# ended by its pid only.
+# ended only through its own Process object (Start-Process -PassThru, its handle held).
 $script:BlockerProcess = $null
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 function Beep([int]$Frequency, [int]$Ms) { [console]::Beep($Frequency, $Ms) }
 
-function Tool {
-    $out = & $ToolExe @args
+function Tool { Invoke-ToolAt $ToolExe @args }
+
+# One winshell-tool command from the given exe: its one JSON line. A seam: under -Simulate,
+# tests/sim-fakes.ps1 replaces it.
+function Invoke-ToolAt([string]$Exe) {
+    $out = & $Exe @args
     ($out | Out-String) | ConvertFrom-Json
 }
 
@@ -192,6 +196,20 @@ function Assert-NoSandboxRunning {
     }
 }
 
+# This run's own Sandbox processes, pinned (open handles) for Stop-Sandbox. They are kept here and
+# never in a record: ConvertTo-Json throws on a Start-Process object (its StartInfo.Environment),
+# takes seconds on a Get-Process one, and either would carry the whole environment block (fix
+# round 4, N3-C2). The record holds {pid, name, start} for each (Get-ProcRecord).
+$script:SandboxPinned = @()
+
+function Get-ProcRecord($P) {
+    $rec = [ordered]@{ pid = $null; name = $null; start = $null }
+    try { $rec.pid = [int]$P.Id } catch { }
+    try { $rec.name = [string]$P.ProcessName } catch { }
+    try { $rec.start = $P.StartTime.ToUniversalTime().ToString('o') } catch { }
+    $rec
+}
+
 # The WindowsSandbox* pids that appeared after this run started its Sandbox: its own.
 function Get-OwnPids($Started) {
     $now = @(Get-SandboxPids)
@@ -202,7 +220,10 @@ function Get-OwnPids($Started) {
             # Pinned the moment it is first seen (an open handle, so a later stop can only reach
             # this process; fix round 3, N2-C1). Its name is checked again on the pinned object.
             $pp = Get-PinnedProcess $p '' $Started.started_at
-            if ($null -ne $pp -and $pp.ProcessName -match '^WindowsSandbox') { $Started.own_procs += $pp }
+            if ($null -ne $pp -and $pp.ProcessName -match '^WindowsSandbox') {
+                $script:SandboxPinned = @($script:SandboxPinned) + @($pp)
+                $Started.own_procs = @($Started.own_procs) + @(, (Get-ProcRecord $pp))
+            }
         }
     }
     $fresh
@@ -217,6 +238,7 @@ function Test-SandboxRunning($Started) {
 function Start-Sandbox([string]$WsbFile) {
     $startedAt = Get-Date
     $before = @(Get-SandboxPids)
+    $script:SandboxPinned = @()
     if (Get-Command wsb -ErrorAction SilentlyContinue) {
         # One line: the configuration is passed as a single command-line argument.
         $xml = (Get-Content -Raw $WsbFile) -replace '\r?\n\s*', ''
@@ -227,7 +249,9 @@ function Start-Sandbox([string]$WsbFile) {
         return [ordered]@{ via = 'wsb start + wsb connect'; id = $id; start_output = $out.Trim(); process = $null; pids_before = $before; own_pids = @(); own_procs = @(); started_at = $startedAt }
     }
     $p = Start-Process -FilePath (Join-Path $env:windir 'System32\WindowsSandbox.exe') -ArgumentList "`"$WsbFile`"" -PassThru
-    [ordered]@{ via = 'WindowsSandbox.exe <file.wsb>'; id = $null; start_output = $null; process = $p.Id; pids_before = $before; own_pids = @(); own_procs = @($p); started_at = $startedAt }
+    [void]$p.Handle   # pinned: a Start-Process object, its handle held from now on
+    $script:SandboxPinned = @($p)
+    [ordered]@{ via = 'WindowsSandbox.exe <file.wsb>'; id = $null; start_output = $null; process = $p.Id; pids_before = $before; own_pids = @(); own_procs = @(, (Get-ProcRecord $p)); started_at = $startedAt }
 }
 
 # Waits for the Sandbox to close by itself (inside.ps1 ends with shutdown /s /t 0), then tries
@@ -245,11 +269,11 @@ function Stop-Sandbox($Started, [switch]$Now) {
         if (-not (Test-SandboxRunning $Started)) { return [ordered]@{ method = 'wsb stop --id'; tries = $tries } }
     }
     [void](Get-OwnPids $Started)
-    $procs = @($Started.own_procs | Where-Object { $null -ne $_ -and -not $_.HasExited })
+    $procs = @($script:SandboxPinned | Where-Object { $null -ne $_ -and -not $_.HasExited })
     $tries += "Kill (the run's own pinned WindowsSandbox* processes): $(($procs | ForEach-Object { "$($_.ProcessName) $($_.Id)" }) -join ', ')"
     foreach ($pp in $procs) { Stop-PinnedProcess $pp }
     Start-Sleep -Seconds 10
-    $still = if ($Started.id) { Test-SandboxRunning $Started } else { @($Started.own_procs | Where-Object { $null -ne $_ -and -not $_.HasExited }).Count -gt 0 }
+    $still = if ($Started.id) { Test-SandboxRunning $Started } else { @($script:SandboxPinned | Where-Object { $null -ne $_ -and -not $_.HasExited }).Count -gt 0 }
     [ordered]@{ method = $(if ($still) { 'none worked' } else { 'Kill (the run''s own pinned WindowsSandbox* processes)' }); tries = $tries }
 }
 
@@ -267,6 +291,16 @@ function Find-VcRedist {
     $dlls = 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll' | ForEach-Object { Join-Path $crt.FullName $_ }
     foreach ($d in $dlls) { if (-not (Test-Path $d)) { throw "missing $d" } }
     $dlls
+}
+
+# The release build alone (the host keep-awake needs winshell-core and winshell-tool first).
+function Build-Release {
+    Push-Location $Spike
+    $ErrorActionPreference = 'Continue'   # cargo writes its progress to stderr
+    try {
+        & cargo build --release --locked
+        if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+    } finally { Pop-Location }
 }
 
 function Build-Spike {
@@ -368,6 +402,10 @@ function Judge-Run([string]$Res, [string]$Sfx = '') {
 # otherwise it holds nothing (--api none); either way its hidden window logs every suspend and
 # resume and any clock jump, with times. It watches this script's process and stops with it.
 # Its log and flags live under build\sandbox\host-power, not the user's profile.
+# It runs from a copy of winshell-core.exe and winshell-tool.exe in build\sandbox\host-power\bin-*
+# (fix round 4, m4): cargo can't replace target\release\winshell-core.exe while the core runs
+# from it, so Build-Spike would fail on stale binaries. When they aren't built yet, they are
+# built first (only that build runs before the keep-awake).
 $script:HostPower = $null
 function Start-HostPowerWatch([switch]$Hold) {
     $dir = Join-Path $Build 'host-power'
@@ -375,12 +413,20 @@ function Start-HostPowerWatch([switch]$Hold) {
     Remove-Item (Join-Path $dir 'power-*.flag') -ErrorAction SilentlyContinue
     $out = Join-Path $dir 'power.json'
     Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
+    $need = @('winshell-core.exe', 'winshell-tool.exe')
+    if (@($need | Where-Object { -not (Test-Path -LiteralPath (Join-Path $Bin $_)) }).Count -gt 0) { Build-Release }
+    # Earlier copies go when nothing runs from them (a running exe can't be deleted: that copy stays).
+    Get-ChildItem -LiteralPath $dir -Directory -Filter 'bin-*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    $copy = Join-Path $dir ('bin-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $copy | Out-Null
+    foreach ($n in $need) { Copy-Item -LiteralPath (Join-Path $Bin $n) -Destination $copy }
     $env:WINSHELL_LOG_DIR = $dir
-    $spawned = Get-Date
-    try { $r = Tool spawn '--' (Join-Path $Bin 'winshell-core.exe') power --api $(if ($Hold) { 'request' } else { 'none' }) --max-secs 43200 --parent-pid "$PID" --out $out }
+    try { $r = Invoke-ToolAt (Join-Path $copy 'winshell-tool.exe') spawn '--' (Join-Path $copy 'winshell-core.exe') power --api $(if ($Hold) { 'request' } else { 'none' }) --max-secs 43200 --parent-pid "$PID" --out $out }
     finally { Remove-Item Env:\WINSHELL_LOG_DIR -ErrorAction SilentlyContinue }
     $p = $null
-    if ($r -and $r.PSObject.Properties['pid']) { $p = Get-PinnedProcess ([int]$r.pid) (Join-Path $Bin 'winshell-core.exe') $spawned }
+    # Pinned by its pid and creation time (fix round 4, m1).
+    $created = Get-SpawnCreated $r
+    if ($r -and $r.PSObject.Properties['pid'] -and $created -ne 0) { $p = Get-PinnedProcess ([int]$r.pid) '' ([datetime]::MinValue) $created }
     $script:HostPower = [pscustomobject]@{ Process = $p; Out = $out; Dir = $dir; Hold = [bool]$Hold }
     Say $(if ($Hold) { 'The host is kept awake for these runs (a parent-watched power request).' } else { 'The host''s sleep and wake are watched during these runs.' })
 }
@@ -444,6 +490,7 @@ function Cover-SandboxWindow($Started) {
     $env:WINSHELL_LOG_DIR = Join-Path $Build 'host-blocker-log'
     try { $p = Start-Process -FilePath (Join-Path $Bin 'winshell-app.exe') -ArgumentList '--blocker', '--exit-after-secs', '1200' -PassThru }
     finally { Remove-Item Env:\WINSHELL_LOG_DIR -ErrorAction SilentlyContinue }
+    [void]$p.Handle
     $script:BlockerProcess = $p
     $bw = $null
     for ($i = 0; $i -lt 40 -and $null -eq $bw; $i++) {
@@ -667,7 +714,11 @@ $summary.pass = $summary.verdict -eq 'PASS'
 }
 finally {
     $hp = Stop-HostPowerWatch
-    if (Get-Variable -Name summary -ErrorAction SilentlyContinue) { $summary.host_power = $hp; $summary.host_kept_awake = [bool]$KeepAwake }
+    # The cover pop-up's record (whether it showed, and took the foreground), then the pop-ups
+    # are told to close (fix round 4, N3-I1).
+    $handsOff = @($script:HandsOffLog)
+    Stop-AllPopups
+    if (Get-Variable -Name summary -ErrorAction SilentlyContinue) { $summary.host_power = $hp; $summary.host_kept_awake = [bool]$KeepAwake; $summary.hands_off = $handsOff }
 }
 $name = if ($Observe) { 'sandbox-observe.json' } else { 'sandbox-checks.json' }
 $summary | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $ResultsRoot $name)

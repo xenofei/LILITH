@@ -132,7 +132,8 @@ function Get-SimArg($Argv, [string]$Name) {
 function New-SimProc([int]$Id, [int]$Polls, [string]$Name) {
     $p = [pscustomobject]@{ Id = $Id; ProcessName = $Name; Left = $Polls; ExitCode = 0; Handle = [IntPtr]::Zero; MainWindowHandle = [IntPtr]::Zero }
     $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($this.Left -le 0) { return $true }; $this.Left = $this.Left - 1; $false }
-    $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $this.Left = 0; $true }
+    # As .NET: WaitForExit() returns nothing, WaitForExit(ms) a bool.
+    $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $this.Left = 0; if ($args.Count -gt 0) { $true } }
     $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Left = 0 }
     $p | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     $p

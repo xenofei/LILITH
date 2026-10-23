@@ -34,8 +34,15 @@ fn spawn_returns_before_a_30_s_child_exits_with_stdout_piped() {
     let (spawn, text) = run_tool(&["spawn", "--", "ping.exe", "-n", "31", "127.0.0.1"]);
     let reply: serde_json::Value = serde_json::from_str(&text).expect("one JSON line");
     let pid = reply["pid"].as_u64().map(|p| p as u32);
-    let alive = pid.and_then(winshell::win::process_image).is_some();
-    if let Some(pid) = pid {
+    let created = reply["created"].as_u64().unwrap_or(0);
+    let image = pid.and_then(winshell::win::process_image);
+    let alive = image.is_some();
+    // Ended only while it still runs PING.EXE, the child this test started (fix round 4, m5).
+    let is_ping = image
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n.eq_ignore_ascii_case("PING.EXE"));
+    if let (Some(pid), true) = (pid, alive && is_ping) {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .stdout(Stdio::null())
@@ -44,6 +51,7 @@ fn spawn_returns_before_a_30_s_child_exits_with_stdout_piped() {
     }
     eprintln!("plain run {plain:?}, spawn {spawn:?}, child alive at return: {alive}");
     assert!(pid.is_some(), "spawn reported no pid: {text}");
+    assert!(created > 0, "spawn reported no creation time: {text}");
     assert!(
         alive,
         "the child had exited when the spawn returned after {spawn:?}: it held the caller's stdout pipe"

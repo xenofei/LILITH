@@ -200,24 +200,46 @@ function Get-ProgramsDir {
 function Start-Core([string]$Name, [string[]]$CoreArgs) {
     $out = Join-Path $Raw "$Name.json"
     Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
-    $spawned = Get-Date
     $r = Tool spawn '--' $Core @CoreArgs --out $out   # a quoted '--': a bare one is PowerShell's
     if (-not $r.PSObject.Properties['pid']) { throw "spawn failed: $($r | ConvertTo-Json -Compress)" }
-    # Pinned at once (an open handle: its pid can't be reused under it; fix round 3, N2-C1). A core
-    # that has already exited can't be pinned, and is then waited for by its result file only.
-    [pscustomobject]@{ Name = $Name; Pid = [int]$r.pid; Out = $out; Process = (Get-PinnedProcess ([int]$r.pid) $Core $spawned) }
+    # Pinned at once by its pid and creation time (an open handle: its pid can't be reused under
+    # it; fix round 3, N2-C1; fix round 4, m1). A core that has already exited can't be pinned,
+    # and is then waited for by its result file only.
+    $created = Get-SpawnCreated $r
+    $pinned = $(if ($created -ne 0) { Get-PinnedProcess ([int]$r.pid) '' ([datetime]::MinValue) $created } else { $null })
+    [pscustomobject]@{ Name = $Name; Pid = [int]$r.pid; Out = $out; Process = $pinned }
+}
+
+# A core's result once it is complete: a file that parses and, for a power core (which rewrites
+# its file on every event), holds its final "exit" event. $null otherwise. Pure but for the read.
+function Read-CoreFinal([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $doc = $null
+    try { $doc = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $doc) { return $null }
+    if ($doc.PSObject.Properties['events'] -and @(@($doc.events) | Where-Object { $null -ne $_ -and (P $_ 'kind') -eq 'exit' }).Count -eq 0) { return $null }
+    $doc
 }
 
 function Wait-Core($C, [int]$TimeoutSec = 60) {
     if ($null -ne $C.Process) {
+        # Pinned: it has exited, so its file holds what it will ever hold.
         [void]$C.Process.WaitForExit($TimeoutSec * 1000)
         if (-not $C.Process.HasExited) { throw "winshell-core $($C.Name) still running after $TimeoutSec s" }
-    } else {
-        $deadline = (Get-Date).AddSeconds($TimeoutSec)
-        while (-not (Test-Path $C.Out) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+        if (-not (Test-Path $C.Out)) { throw "winshell-core $($C.Name) wrote no result" }
+        return Get-Content -Raw $C.Out | ConvertFrom-Json
+    }
+    # Unpinned, the result file is all there is: only a complete one counts (a power core's holds
+    # its "exit" event), and a read caught mid-write is retried (fix round 4, m9).
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($true) {
+        $doc = Read-CoreFinal $C.Out
+        if ($null -ne $doc) { return $doc }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds 200
     }
     if (-not (Test-Path $C.Out)) { throw "winshell-core $($C.Name) wrote no result" }
-    Get-Content -Raw $C.Out | ConvertFrom-Json
+    throw "winshell-core $($C.Name) wrote no complete result within $TimeoutSec s"
 }
 
 function Read-CoreNow($C) {
@@ -361,19 +383,28 @@ function HelloWatched([string[]]$HelloArgs, [string]$Question) {
     $startInput = $(if ($script:Uia.ready) { [SpikeUi.Win]::LastInputTick() } else { 0 })
     $outFile = Join-Path $Raw ("hello-{0}-{1}.json" -f $HelloArgs[0], (New-Nonce))
     $p = Start-Process -FilePath $Hello -ArgumentList $HelloArgs -NoNewWindow -PassThru -RedirectStandardOutput $outFile
+    [void]$p.Handle   # pinned: a Start-Process object, its handle held from now on
     $seen = [ordered]@{}
     $empty = 0
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    while (-not $p.HasExited) {
-        $f = $null
-        try { $f = Get-ForegroundNow } catch { }
-        if ($null -ne $f -and ([int64]$f.hwnd -eq 0 -or $f.pid -eq 0)) { $empty++ }
-        elseif ($null -ne $f -and $f.pid -notin $script:PopupPids -and -not $seen.Contains("$($f.hwnd)")) {
-            $f.first_s = [math]::Round($sw.Elapsed.TotalSeconds, 2)
-            $f.input_since_start = ([SpikeUi.Win]::LastInputTick() -ne $startInput)
-            $seen["$($f.hwnd)"] = $f
+    # If anything in the loop throws, this call's own winshell-hello is ended, so its prompt can't
+    # outlive the check and create the key after the cleanup (fix round 4, N3-C1).
+    $finished = $false
+    try {
+        while (-not $p.HasExited) {
+            $f = $null
+            try { $f = Get-ForegroundNow } catch { }
+            if ($null -ne $f -and ([int64]$f.hwnd -eq 0 -or $f.pid -eq 0)) { $empty++ }
+            elseif ($null -ne $f -and $f.pid -notin @(Get-PopupPids) -and -not $seen.Contains("$($f.hwnd)")) {
+                $f.first_s = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+                $f.input_since_start = ([SpikeUi.Win]::LastInputTick() -ne $startInput)
+                $seen["$($f.hwnd)"] = $f
+            }
+            Start-Sleep -Milliseconds 150
         }
-        Start-Sleep -Milliseconds 150
+        $finished = $true
+    } finally {
+        if (-not $finished) { Stop-PinnedProcess $p }
     }
     $p.WaitForExit()
     $r = Read-HelloOutput ((Get-Content -Raw -LiteralPath $outFile -ErrorAction SilentlyContinue) | Out-String)
@@ -717,6 +748,13 @@ function Check-S12p {
 # $Target is 'body' (the toast's text) or 'button' (its "Open" action). A post that gets no
 # launch is posted again, up to 3 posts; a refusal goes to the owner's click (fix round 3).
 
+# Windows' own toast chrome, as name patterns: the dismiss or close button, "..." or "More
+# options", settings, and names that name the app ("Notification from LILITH Spike"). They are
+# known in a toast's scope, so their presence doesn't make the scope foreign, but they are never
+# pressed: S1.3 accepts only "Open", and S1.5's dismissal only the toast's own dismiss button.
+# Shared by S1.3 and S1.5 (fix round 4, m6, m7); tests/strict-results.ps1 uses this list.
+$script:ToastChrome = @('(?i)^(dismiss|close)\b', '(?i)^(more|more options|see more|options|\.\.\.|…)$', '(?i)settings', '(?i)\bLILITH Spike\b')
+
 # Why a found toast's automated click must go to the owner instead (fix round 3, N2-I2), or $null
 # when the click was made (and only the launch failed to come, which is reposted). Every
 # refusal falls back: the owner using the PC, the scope refusing the button, or every way
@@ -762,7 +800,7 @@ function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithBu
                     # This toast's own names (review N-I3), plus Windows' own toast chrome, which is
                     # known but never pressed (fix round 3, N2-I2): only "Open" is ever accepted.
                     $allowed = @('LILITH spike', 'LILITH Spike', 'Open')
-                    $chrome = @('(?i)^(dismiss|close)\b', '(?i)^(more|more options|see more|options|\.\.\.|…)$', '(?i)settings', '(?i)\bLILITH Spike\b')
+                    $chrome = $script:ToastChrome
                     if ($Target -eq 'button') {
                         $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' } $allowed $chrome
                         if ($b.Ok) { $el = $b.Button; $attempt.button_depth = $b.Depth }
@@ -1059,7 +1097,8 @@ function Check-S15 {
 
     $handsOff = Start-HandsOff 'opens the notification centre and closes the progress toast there (the mouse may move)' 20
     try {
-        $dismiss = Dismiss-InNotificationCentre "#$n" @('Spike job running', 'LILITH Spike', 'LILITH spike') @('^sampling$', '^\d+ ?%$', '^\d+(\.\d+)?$')
+        # This toast's own names and progress strings, plus Windows' chrome (fix round 4, m7).
+        $dismiss = Dismiss-InNotificationCentre "#$n" @('Spike job running', 'LILITH Spike', 'LILITH spike') (@('^sampling$', '^\d+ ?%$', '^\d+(\.\d+)?$') + $script:ToastChrome)
     } finally { Stop-HandsOff $handsOff }
     $gone = $false
     for ($k = 0; $k -lt 10 -and -not $gone; $k++) { Start-Sleep -Milliseconds 500; $gone = (P (Tool history --tag $ProgressTag) 'has_tag') -eq $false }
@@ -1335,6 +1374,17 @@ function Power-StayAwake([string]$Api, $Timeout) {
     Start-Sleep -Seconds 5
     $after += @((Get-PowerEvidence))
     foreach ($a in $after) { [void]$evidence.Add([ordered]@{ phase = 'after'; reading = $a }) }
+    # The PC is past its idle timeout now, and nothing holds it until the next stage starts its
+    # keep-awake (the cleanup, the stage switch, run-sandbox's start: 15 to 25 s). One reset of the
+    # idle timer gives that a whole "Sleep after" of grace (fix round 4, N3-I2). It is made after
+    # the evidence reads and outside the judged span, and holds nothing: ES_SYSTEM_REQUIRED without
+    # ES_CONTINUOUS. No request is held through S1.7 itself.
+    $idleReset = [ordered]@{ at = $null; previous_state = $null; call = 'SetThreadExecutionState(ES_SYSTEM_REQUIRED), once, not continuous' }
+    if (Initialize-SpikeUi) {
+        $prevState = [SpikeUi.Win]::ResetIdleOnce()
+        $idleReset.at = (Get-Date).ToUniversalTime().ToString('o')
+        $idleReset.previous_state = $(if ($prevState -eq 0) { 'failed' } else { '0x{0:x}' -f $prevState })
+    }
     # An independent witness: the System log's Kernel-Power sleep, resume and Modern Standby
     # entries in the hold's span (42 sleep, 107 resume, 506/507 standby enter/exit) (M6).
     $kernel = @()
@@ -1354,6 +1404,7 @@ function Power-StayAwake([string]$Api, $Timeout) {
         slept_after_release = $sleptAfter; slept_after_release_note = 'information only: after the request was cleared'
         idle_method = 'GetLastInputInfo every 30 s'
         evidence = $evidence.ToArray()
+        idle_reset = $idleReset; idle_reset_at = $idleReset.at
         self_check_system_required_while_held = $(if ($held.Count -gt 0) { @($held | Where-Object { (P $_ 'system_required') -ne $true }).Count -eq 0 } else { $null })
         pass = ($slept.Count -eq 0 -and $kernelSlept.Count -eq 0 -and @($kernel | Where-Object { P $_ 'error' }).Count -eq 0)
         core = $doc
@@ -1629,11 +1680,12 @@ try {
 }
 finally {
     Step 'Cleanup'
+    # The stage's pop-up records first, then the pop-ups are told to close (fix round 4, N3-I1).
+    $stage.hands_off = @($script:HandsOffLog)
     Stop-AllPopups
     $Report.cleanup = Invoke-Cleanup -Final
     $stage.cleanup = $Report.cleanup
     $stage.uia_hosts = $script:Uia.hosts
-    $stage.hands_off = @($script:HandsOffLog)
     $Report.finished = (Get-Date).ToUniversalTime().ToString('o')
     Save-Report
     Say ("Cleanup -> {0}" -f $(if ($Report.cleanup.pass) { 'PASS' } else { 'FAIL' })) $(if ($Report.cleanup.pass) { 'Green' } else { 'Red' })

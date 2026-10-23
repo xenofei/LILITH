@@ -1,7 +1,8 @@
 //! `winshell-tool`: the console helper the scripts call. Each command prints one JSON line.
 //!
 //! - `spawn -- <exe> [args...]`: start a process detached (`DETACHED_PROCESS |
-//!   CREATE_NEW_PROCESS_GROUP`), as `lil-client` starts the core; prints `{pid}`
+//!   CREATE_NEW_PROCESS_GROUP`), as `lil-client` starts the core; prints `{pid, created}` (the
+//!   creation time as a FILETIME number, which pins the child with its pid; 0 if unknown)
 //! - `programs-dir`: `FOLDERID_Programs`
 //! - `shortcut-write --path <lnk> --target <exe> --aumid <id> [--toast-clsid]` /
 //!   `shortcut-read --path <lnk>` (`--toast-clsid` also sets the spike's ToastActivatorCLSID)
@@ -101,7 +102,7 @@ fn spawn(args: &Args) -> Value {
         return json!({ "error": "spawn needs -- <exe> [args...]" });
     };
     match spawn_detached(exe, rest) {
-        Ok(pid) => json!({ "pid": pid }),
+        Ok((pid, created)) => json!({ "pid": pid, "created": created }),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }

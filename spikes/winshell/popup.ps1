@@ -18,7 +18,9 @@ topmost with SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE
 SWP_SHOWWINDOW), not with the form's TopMost property (whose show path focuses the form). It is
 click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT): mouse input and WindowFromPoint / UIA
 FromPoint go to the windows under it. It closes when -ParentPid has gone (that process is pinned
-by its handle at start), and after the run plus 15 minutes at the latest. It changes nothing else.
+by its handle at start), and after the run plus 15 minutes at the latest, removing its state files
+whichever way it closes. Nothing ends it from outside: the caller only writes -StateFile. It
+changes nothing else.
 #>
 param(
     [string]$What = 'is working',
@@ -89,7 +91,11 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 250
 $timer.Add_Tick({
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    if (($null -ne $parent -and $parent.HasExited) -or $nowMs -gt $capMs) { $form.Close(); return }
+    if (($null -ne $parent -and $parent.HasExited) -or $nowMs -gt $capMs) {
+        # Closed by the parent watch or the cap: the state files go too (fix round 4, m8).
+        if ($StateFile) { foreach ($f in $StateFile, "$StateFile.shown", "$StateFile.start") { try { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue } catch { } } }
+        $form.Close(); return
+    }
     if ($StateFile) {
         $sf = "$StateFile.start"
         if (Test-Path -LiteralPath $sf) { try { $script:startAt = [long]((Get-Content -Raw -LiteralPath $sf).Trim()) } catch { } }

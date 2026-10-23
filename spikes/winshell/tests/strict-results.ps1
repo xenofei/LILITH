@@ -242,26 +242,49 @@ function Start-Ping([int]$Count) {
 }
 $pingExe = Join-Path $env:windir 'System32\PING.EXE'
 $t = Get-Date
-$pingProc = Start-Ping 1
-$pinned = Get-PinnedProcess $pingProc.Id $pingExe $t
-Try-Case 'pinned: the process just started is pinned' { $null -ne $pinned } 'True'
-[void]$pingProc.WaitForExit(10000)
-Try-Case 'pinned: HasExited after it ended' { if ($null -ne $pinned) { [void]$pinned.WaitForExit(10000); $pinned.HasExited } else { 'not pinned' } } 'True'
+# The setup runs inside cases too, so that a script without these functions fails them instead
+# of ending the file (fix round 4, m6).
+$pinned = $null; $pingProc = $null; $live = $null
+Try-Case 'pinned: the process just started is pinned' { $script:pingProc = Start-Ping 1; $script:pinned = Get-PinnedProcess $pingProc.Id $pingExe $t; $null -ne $pinned } 'True'
+Try-Case 'pinned: HasExited after it ended' { [void]$pingProc.WaitForExit(10000); if ($null -ne $pinned) { [void]$pinned.WaitForExit(10000); $pinned.HasExited } else { 'not pinned' } } 'True'
 Try-Case 'pinned: Stop-PinnedProcess on an exited process does nothing' { try { Stop-PinnedProcess $pinned; 'no-op' } catch { "threw $($_.Exception.Message)" } } 'no-op'
-$live = Start-Ping 3
-Try-Case 'pinned: refuses a process older than the start' { $null -eq (Get-PinnedProcess $live.Id $pingExe (Get-Date).AddMinutes(5)) } 'True'
+# A ping of about 30 s: only a real stop ends it within a second (fix round 4, m6).
+Try-Case 'pinned: refuses a process older than the start' { $script:live = Start-Ping 30; $null -eq (Get-PinnedProcess $live.Id $pingExe (Get-Date).AddMinutes(5)) } 'True'
 Try-Case 'pinned: refuses another exe' { $null -eq (Get-PinnedProcess $live.Id 'C:\nowhere\other.exe' $t) } 'True'
 Try-Case 'pinned: refuses a pid that is gone' { $null -eq (Get-PinnedProcess 2147483000 $pingExe $t) } 'True'
-Stop-PinnedProcess $live
-[void]$live.WaitForExit(5000)
-Try-Case 'pinned: Stop-PinnedProcess ends the live one it pinned' { $live.HasExited } 'True'
+# Fix round 4, m1: the pid and the exact creation time pin one process, with no path and no window.
+Try-Case 'pinned: by its creation time' { $null -ne (Get-PinnedProcess $live.Id '' ([datetime]::MinValue) $live.StartTime.ToFileTimeUtc()) } 'True'
+Try-Case 'pinned: refuses another creation time' { $null -eq (Get-PinnedProcess $live.Id '' ([datetime]::MinValue) ($live.StartTime.ToFileTimeUtc() + 1)) } 'True'
+Try-Case 'pinned: Stop-PinnedProcess ends the live one it pinned, within 1 s' {
+    $p = Get-PinnedProcess $live.Id '' ([datetime]::MinValue) $live.StartTime.ToFileTimeUtc()
+    Stop-PinnedProcess $p
+    $live.WaitForExit(1000)
+} 'True'
+# winshell-tool spawn prints the creation time that pins its child (built by cargo test).
+$toolBuilt = @('target\debug\winshell-tool.exe', 'target\release\winshell-tool.exe' | ForEach-Object { Join-Path (Split-Path $PSScriptRoot) $_ } | Where-Object { Test-Path -LiteralPath $_ } |
+    Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending) | Select-Object -First 1   # the newest build
+if ($toolBuilt) {
+    Try-Case 'pinned: a winshell-tool spawn pins by its printed creation time' {
+        $r = (& $toolBuilt spawn '--' $pingExe -n 2 127.0.0.1 | Out-String) | ConvertFrom-Json
+        $p = Get-PinnedProcess ([int]$r.pid) '' ([datetime]::MinValue) (Get-SpawnCreated $r)
+        $ok = $null -ne $p -and $p.ProcessName -eq 'PING'
+        if ($null -ne $p) { [void]$p.WaitForExit(5000) }
+        $ok
+    } 'True'
+} else { Write-Host 'skip pinned: no built winshell-tool.exe' }
 
 # ---- Fix round 3: S1.3 refusals go to the owner (N2-I2)
 Try-Case 'fallback: the button refused' { Get-ClickFallback ([ordered]@{ button_missing = $true; button_why = 'no such button inside this toast''s own list item'; clicks = @() }) } 'the script refused to act: no such button inside this toast''s own list item'
 Try-Case 'fallback: every way refused' { Get-ClickFallback ([ordered]@{ clicks = @([ordered]@{ ok = $false; why = 'UIA puts no candidate point on the target' }, [ordered]@{ ok = $false; why = 'the per-monitor DPI context did not apply: nothing clicked' }) }) } 'the script refused to act: UIA puts no candidate point on the target'
 Try-Case 'fallback: the owner was active' { Get-ClickFallback ([ordered]@{ clicks = @([ordered]@{ ok = $false; owner_active = $true; why = 'owner active' }) }) } 'the owner was using the PC during the synthesized click'
 Try-Case 'fallback: a click was made (only the launch is missing): repost' { $null -eq (Get-ClickFallback ([ordered]@{ clicks = @([ordered]@{ ok = $true }) })) } 'True'
-$chrome = @('(?i)^(dismiss|close)\b', '(?i)^(more|more options|see more|options|\.\.\.|…)$', '(?i)settings', '(?i)\bLILITH Spike\b')
+# The list Click-Trial and S1.5's dismissal use, not a copy (fix round 4, m6).
+$chrome = $script:ToastChrome
+Try-Case 'the toast chrome list is defined' { @($chrome).Count -ge 4 } 'True'
+Try-Case 'S1.5 dismissal: the own dismiss with the chrome in the item' {
+    $r = Select-ToastTarget @((Lv 0 $true @('Spike job running', 'LILITH Spike', 'Progress toast (S1.5) #a1b2c3', '42 %', 'Dismiss', '...', 'Notification settings', 'Notification from LILITH Spike') @((Btn 'Dismiss'), (Btn '...')))) '#a1b2c3' @('Spike job running', 'LILITH Spike') (@('^\d+ ?%$') + $chrome) $isDismiss
+    "$($r.ok) $($r.candidate['name'])"
+} 'True Dismiss'
 Try-Case 'S1.3 chrome is known, so it does not refuse' {
     $r = Select-ToastTarget @((Lv 0 $true @('LILITH spike', $text, 'Open', 'Dismiss', '...', 'Notification settings', 'Notification from LILITH Spike') @((Btn 'Open'), (Btn 'Dismiss'), (Btn '...')))) '#a1b2c3' $own @() $isOpen
     "$($r.ok)"
@@ -308,6 +331,61 @@ Try-Case 'Write-Shortcut -WithToastClsid refuses a read-back without the CLSID' 
     try { Write-Shortcut -WithToastClsid; 'no throw' } catch { "$($_.Exception.Message)".StartsWith('shortcut ToastActivatorCLSID reads back as') }
 } 'True'
 Try-Case 'Write-Shortcut plain' { Write-Shortcut; $script:ShortcutForm } 'plain'
+
+# ---- Fix round 4, m9: an unpinned core's result counts only once it is complete
+$coreTmp = Join-Path ([IO.Path]::GetTempPath()) ('winshell-core-test-' + [guid]::NewGuid().ToString('N') + '.json')
+try {
+    Set-Content -LiteralPath $coreTmp -Value '{"command":"power","events":[{"kind":"set","t_ms":1}]}'
+    Try-Case 'core result: a power file without its exit event is not complete' { $null -eq (Read-CoreFinal $coreTmp) } 'True'
+    Set-Content -LiteralPath $coreTmp -Value '{"command":"power","events":[{"kind":"set","t_ms":1},{"kind":"exit","t_ms":2}]}'
+    Try-Case 'core result: with its exit event it is' { (Read-CoreFinal $coreTmp).command } 'power'
+    Set-Content -LiteralPath $coreTmp -Value '{"command":"toast","posted":true}'
+    Try-Case 'core result: a file without events is complete' { (Read-CoreFinal $coreTmp).posted } 'True'
+    Set-Content -LiteralPath $coreTmp -Value '{"command":"pow'
+    Try-Case 'core result: a file caught mid-write is not' { $null -eq (Read-CoreFinal $coreTmp) } 'True'
+} finally { Remove-Item -LiteralPath $coreTmp -ErrorAction SilentlyContinue }
+
+# ---- Fix round 4: the pop-up, with its spawn faked by a windowless ping this test starts and
+# never ends (it lives about 4 s). Nothing is shown.
+$savedTool = $ToolExe
+$ToolExe = $pingExe   # any existing file: Start-HandsOff only checks it is there
+$script:Sleeps = [System.Collections.Generic.List[double]]::new()
+$script:FakeMs = 0.0
+$script:PopupState = $null
+$script:PopupStates = [System.Collections.Generic.List[string]]::new()
+function Start-Sleep { param([double]$Seconds = 0, [int]$Milliseconds = 0) $ms = $Seconds * 1000 + $Milliseconds; $script:Sleeps.Add($ms); $script:FakeMs += $ms }
+function Get-Date { [datetime]::Now.AddMilliseconds($script:FakeMs) }
+function Invoke-PopupSpawn([string]$Tool, [string[]]$SpawnArgs) {
+    $script:PopupState = $SpawnArgs[[array]::IndexOf($SpawnArgs, '-StateFile') + 1]
+    $script:PopupStates.Add($script:PopupState)
+    $p = Start-Ping 5
+    [pscustomobject]@{ pid = $p.Id; created = $p.StartTime.ToFileTimeUtc() }
+}
+try {
+    $script:HandsOffLog = @()
+    $h = $null
+    # m2: a pop-up that never reports itself shown. The wait gives up after 8 s, and the warning
+    # still lasts 10 s from then.
+    Try-Case 'pop-up give-up: pinned, not shown' { $script:h = Start-HandsOff 'test' 5; "$($h.Record.popup_started) $($h.Record.shown)" } 'True False'
+    Try-Case 'pop-up give-up: waited 8 s for it' { [math]::Round((@($script:Sleeps) | Select-Object -SkipLast 1 | Measure-Object -Sum).Sum / 1000) } '8'
+    Try-Case 'pop-up give-up: then 10 s of warning' { $script:Sleeps[$script:Sleeps.Count - 1] -ge 9900 } 'True'
+    Try-Case 'pop-up give-up: its start is 10 s from the give-up' { [long](Get-Content -Raw -LiteralPath "$($script:PopupState).start").Trim() -ge [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 9000 } 'True'
+    # A restarted stay-awake pop-up: not checked, so "shown" is $null.
+    Try-Case 'pop-up without the warning wait: shown not checked' { $h2 = Start-HandsOff 'test again' 5 -NoWarnWait; "$($h2.Record.popup_started) $($null -eq $h2.Record.shown)" } 'True True'
+    # N3-I1 and m1: the end tells the running pop-ups to close (their state file) and keeps the log.
+    Try-Case 'Stop-AllPopups keeps the pop-up log' { $n = @($script:HandsOffLog).Count; Stop-AllPopups; "$n $(@($script:HandsOffLog).Count)" } '2 2'
+    Try-Case 'Stop-AllPopups writes the state file and ends nothing' { "$(Test-Path -LiteralPath $h.StateFile) $($h.Process.HasExited)" } 'True False'
+    Try-Case 'Stop-AllPopups once they have gone: their state files are removed' {
+        [void]$h.Process.WaitForExit(10000)
+        $script:Popups = @($h)
+        Stop-AllPopups
+        @($h.StateFile, "$($h.StateFile).start" | Where-Object { Test-Path -LiteralPath $_ }).Count
+    } '0'
+} finally {
+    $ToolExe = $savedTool
+    Remove-Item Function:\Get-Date, Function:\Invoke-PopupSpawn -ErrorAction SilentlyContinue
+    foreach ($s in $script:PopupStates) { foreach ($f in $s, "$s.shown", "$s.start") { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue } }
+}
 
 if ($failures.Count -gt 0) { Write-Host "$($failures.Count) failed"; exit 1 }
 Write-Host 'all cases passed'

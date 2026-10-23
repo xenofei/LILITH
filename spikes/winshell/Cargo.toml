@@ -37,7 +37,7 @@ features = [
     "Win32_System_LibraryLoader",         # GetModuleHandleW
     "Win32_System_Pipes",                 # the single-instance pipe
     "Win32_System_Power",                 # PowerCreateRequest, PowerSetRequest, PowerClearRequest
-    "Win32_System_Threading",             # REASON_CONTEXT, OpenProcess, QueryFullProcessImageNameW
+    "Win32_System_Threading",             # REASON_CONTEXT, OpenProcess, QueryFullProcessImageNameW, GetProcessTimes
     "Win32_System_TpmBaseServices",       # Tbsi_GetDeviceInfo
     "Win32_System_Variant",               # VT_LPWSTR
     "Win32_System_WinRT",                 # RoInitialize, IUserConsentVerifierInterop

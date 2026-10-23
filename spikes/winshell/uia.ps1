@@ -14,6 +14,8 @@ What they detect, and how (automation round, owner direction 2026-10-23):
 - The session's lock state: WTSQuerySessionInformation(WTSSessionInfoEx), SessionFlags.
 - The owner's own input: GetLastInputInfo, told apart from the script's own injections.
 - Power evidence: CallNtPowerInformation (SystemExecutionState, SystemPowerInformation), read only.
+  The one power call that is not a read: ResetIdleOnce, a single SetThreadExecutionState(
+  ES_SYSTEM_REQUIRED) without ES_CONTINUOUS, made once after S1.7's stay-awake evidence is read.
 
 What they do to the desktop, and only when a caller asks: a synthesized left click (one SendInput
 call carrying the position, MOUSEEVENTF_MOVE | ABSOLUTE | VIRTUALDESK, with the button down and up;
@@ -67,6 +69,7 @@ namespace SpikeUi {
         [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
         [DllImport("powrprof.dll")] static extern uint CallNtPowerInformation(int level, IntPtr inBuf, uint inLen, out uint outBuf, uint outLen);
         [DllImport("powrprof.dll")] static extern uint CallNtPowerInformation(int level, IntPtr inBuf, uint inLen, out SPI outBuf, uint outLen);
+        [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
 
         // The tick of the script's own last injection, so its own input is not taken for the owner's.
         static uint lastInject;
@@ -255,6 +258,10 @@ namespace SpikeUi {
             return r == 0 ? (long)s : -(long)r;
         }
 
+        // One reset of the system idle timer: ES_SYSTEM_REQUIRED without ES_CONTINUOUS, so no state
+        // is held afterwards (fix round 4, N3-I2). Returns the previous execution state (0 = failed).
+        public static uint ResetIdleOnce() { return SetThreadExecutionState(0x00000001); }
+
         // SystemPowerInformation (12): {status, MaxIdlenessAllowed, Idleness, TimeRemaining}.
         public static long[] PowerInfo() {
             SPI p; uint r = CallNtPowerInformation(12, IntPtr.Zero, 0, out p, (uint)Marshal.SizeOf(typeof(SPI)));
@@ -271,28 +278,45 @@ $script:Uia = [ordered]@{ ready = $false; error = $null; proven = $false; hosts 
 $script:ProcNames = @{}
 $script:UiaSearchFailed = $false
 
-# The hands-off pop-ups this script started (Start-HandsOff), each with its pinned Process (an
-# open handle, so its pid can't be reused under it) and its state files.
+# The hands-off pop-ups this script started (Start-HandsOff): each handle holds its pinned Process
+# (an open handle, so its pid can't be reused under it), or $null when it couldn't be pinned, and
+# its state file.
 $script:Popups = @()
-# Every pop-up's record (shown, took the foreground), for the results (review m1 of fix round 2).
+# Every pop-up's record (whether it started, showed, when, and took the foreground), for the
+# results (review m1 of fix round 2). It is kept for the whole run: the stage records read it
+# (fix round 4, N3-I1).
 $script:HandsOffLog = @()
 
 # ---------------------------------------------------------------- the processes the scripts start
 
 # The process this script has just started, as a Process object that holds an open handle from
 # now on (review N2-C1): a Process from Get-Process -Id holds none, so a later HasExited or
-# Kill() would open whatever process has that pid by then. It must have started no earlier than
-# $NotBefore (2 s slack) and, when given, run $ExpectedPath; otherwise $null. This is the only
-# place a pid is turned into a Process the scripts may later check or end
-# (tests/kill_scope.rs checks that).
-function Get-PinnedProcess([int]$ProcessId, [string]$ExpectedPath, [datetime]$NotBefore) {
+# Kill() would open whatever process has that pid by then. This is the only place a pid is turned
+# into a Process the scripts may later check or end (tests/kill_scope.rs checks that).
+# - With $CreatedFileTime (what winshell-tool spawn prints: the child's creation time, read from
+#   the handle CreateProcessW returned), the process must have exactly that creation time: the
+#   pid and the creation time name one process, with no time window and no path check (fix
+#   round 4, m1).
+# - Without it (a process the script didn't spawn itself, such as the Sandbox's own), it must
+#   have started no earlier than $NotBefore (2 s slack) and, when given, run $ExpectedPath.
+# Otherwise $null.
+function Get-PinnedProcess([int]$ProcessId, [string]$ExpectedPath, [datetime]$NotBefore, [long]$CreatedFileTime = 0) {
     try {
         $p = Get-Process -Id $ProcessId -ErrorAction Stop   # pin-lookup: right after the start
         [void]$p.Handle
+        if ($CreatedFileTime -ne 0) {
+            if ($p.StartTime.ToFileTimeUtc() -ne $CreatedFileTime) { return $null }
+            return $p
+        }
         if ($ExpectedPath -and $p.Path -ne $ExpectedPath) { return $null }
         if ($p.StartTime -lt $NotBefore.AddSeconds(-2)) { return $null }
         $p
     } catch { $null }
+}
+
+# The creation time winshell-tool spawn printed ({pid, created}), or 0 when it printed none.
+function Get-SpawnCreated($Spawn) {
+    if ($null -ne $Spawn -and $Spawn.PSObject.Properties['created']) { [long]$Spawn.created } else { [long]0 }
 }
 
 # Ends a pinned process if it is still running (a no-op for one that has exited).
@@ -303,30 +327,32 @@ function Stop-PinnedProcess($Process) {
 
 # The pids of this script's pop-ups that are still running (a dead pop-up's pid may be reused).
 function Get-PopupPids {
-    $script:Popups = @($script:Popups | Where-Object { $null -ne $_.Process -and -not $_.Process.HasExited })
-    @($script:Popups | ForEach-Object { [int]$_.Process.Id })
+    @(@($script:Popups) | Where-Object { $null -ne $_.Process -and -not $_.Process.HasExited } | ForEach-Object { [int]$_.Process.Id })
 }
 
 # Owner direction 2026-10-23: before anything that needs hands off the keyboard and mouse, a
 # topmost pop-up warns at least 10 s ahead, then counts down until the PC may be used again, and
 # says when it's done. The pop-up (popup.ps1, in Windows PowerShell 5.1 for WinForms) is started
-# detached, with no console, through winshell-tool spawn, and pinned at once. It never takes the
-# focus (WS_EX_NOACTIVATE, ShowWithoutActivation; topmost through SetWindowPos with
-# SWP_NOACTIVATE), is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT, so WindowFromPoint and
-# UIA's FromPoint look through it), sits at the top centre of the primary screen, away from the
-# toasts at the bottom right, and its pid is skipped by every window search and foreground check
-# while it runs. Without winshell-tool (inside the Sandbox) there is no pop-up.
+# detached, with no console, through winshell-tool spawn, and pinned at once by its pid and
+# creation time. It never takes the focus (WS_EX_NOACTIVATE, ShowWithoutActivation; topmost
+# through SetWindowPos with SWP_NOACTIVATE), is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT,
+# so WindowFromPoint and UIA's FromPoint look through it), sits at the top centre of the primary
+# screen, away from the toasts at the bottom right, and its pid is skipped by every window search
+# and foreground check while it runs. Without winshell-tool (inside the Sandbox) there is no
+# pop-up.
 #
-# The handshake (fix round 3): the pop-up touches <state>.shown once it is on screen; this waits
-# for that (up to 8 s), then writes <state>.start with the hands-off start (epoch ms, 10 s from
-# then), and waits until that moment. The warning therefore lasts at least 10 s on screen, and
-# the countdown runs from the real start. With -NoWarnWait (a restarted stay-awake wait) it
-# doesn't wait. Whether the pop-up showed and whether it took the foreground is recorded.
+# The handshake (fix round 3; fix round 4, m2): the pop-up touches <state>.shown once it is on
+# screen. This waits for that, up to 8 s, then writes <state>.start with the hands-off start (epoch
+# ms) and waits until that moment. The start is 10 s from the moment the wait ended, whether the
+# pop-up showed or the wait gave up: a slow pop-up never gets less than 10 s of warning (and the
+# terminal line has been up all along). With -NoWarnWait (a restarted stay-awake wait) it doesn't
+# wait, and "shown" is recorded as not checked ($null). Recorded per pop-up: whether it started,
+# whether it showed and how long after the spawn, and whether it took the foreground.
 function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
     Show-HandsOff $What
-    $spawned = Get-Date
-    $startAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 10000
-    $h = [pscustomobject]@{ Process = $null; StateFile = $null; Done = $false; Record = [ordered]@{ what = $What; shown = $false; took_foreground = $null } }
+    $spawnMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $startAt = $spawnMs + 10000
+    $h = [pscustomobject]@{ Process = $null; StateFile = $null; Done = $false; Record = [ordered]@{ what = $What; popup_started = $false; shown = $null; shown_after_ms = $null; took_foreground = $null } }
     $tool = Get-Variable -Name ToolExe -Scope Script -ValueOnly -ErrorAction SilentlyContinue
     $popup = Join-Path $PSScriptRoot 'popup.ps1'
     if ($tool -and (Test-Path -LiteralPath $tool) -and (Test-Path -LiteralPath $popup)) {
@@ -335,23 +361,33 @@ function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
             $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
             $r = Invoke-PopupSpawn $tool @($ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $popup, '-What', $What, '-StartAtMs', "$startAt", '-RunSec', "$Seconds", '-StateFile', $h.StateFile, '-ParentPid', "$PID")
             if ($null -ne $r -and $r.PSObject.Properties['pid']) {
-                $h.Process = Get-PinnedProcess ([int]$r.pid) $ps $spawned
-                if ($null -ne $h.Process) { $script:Popups = @($script:Popups) + @($h) }
+                $created = Get-SpawnCreated $r
+                if ($created -ne 0) { $h.Process = Get-PinnedProcess ([int]$r.pid) '' ([datetime]::MinValue) $created }
+                # Every pop-up that may be running is kept, pinned or not: Stop-AllPopups tells
+                # each one still open to close.
+                $script:Popups = @($script:Popups) + @($h)
             }
         } catch { }
     }
+    $h.Record.popup_started = ($null -ne $h.Process)
     if ($null -ne $h.Process -and -not $NoWarnWait) {
+        $shownFile = "$($h.StateFile).shown"
         $deadline = (Get-Date).AddSeconds(8)
-        while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath "$($h.StateFile).shown") -and -not $h.Process.HasExited) { Start-Sleep -Milliseconds 100 }
-        $h.Record.shown = Test-Path -LiteralPath "$($h.StateFile).shown"
+        while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $shownFile) -and -not $h.Process.HasExited) { Start-Sleep -Milliseconds 100 }
+        $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $h.Record.shown = [bool](Test-Path -LiteralPath $shownFile)
         if ($h.Record.shown) {
-            $startAt = [math]::Max($startAt, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 10000)
-            try { Set-Content -LiteralPath "$($h.StateFile).start" -Value "$startAt" } catch { }
+            $at = $nowMs
+            try { $at = [long]((Get-Content -Raw -LiteralPath $shownFile).Trim()) } catch { }
+            $h.Record.shown_after_ms = [math]::Max([long]0, $at - $spawnMs)
+        }
+        $startAt = [math]::Max($startAt, $nowMs + 10000)
+        try { Set-Content -LiteralPath "$($h.StateFile).start" -Value "$startAt" } catch { }
+        if ($h.Record.shown) {
             $fg = Get-ForegroundNow
             $h.Record.took_foreground = ($null -ne $fg -and $fg.pid -eq $h.Process.Id)
         }
     }
-    $h.Record.popup_started = ($null -ne $h.Process)
     $script:HandsOffLog = @($script:HandsOffLog) + @($h.Record)
     if (-not $NoWarnWait) {
         $wait = $startAt - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -374,15 +410,20 @@ function Stop-HandsOff($Handle) {
     try { Set-Content -LiteralPath $Handle.StateFile -Value 'done' } catch { }
 }
 
-# Ends the pop-ups this script started that are still open and were never told they were done
-# (the others close themselves), through their pinned Process objects only (review N2-C1).
+# At the end: every pop-up this script started that was never told it was done is told now (its
+# state file: it says "done" and closes itself, and it closes anyway once this script has exited).
+# No pop-up is ever killed (fix round 4, m1). The state files of pop-ups that have gone are
+# removed (m8); a pop-up still running removes its own when it closes. The pop-up log is kept for
+# the stage records (N3-I1).
 function Stop-AllPopups {
     foreach ($h in @($script:Popups)) {
-        if (-not $h.Done) { Stop-PinnedProcess $h.Process }
+        if ($null -ne $h.Process -and $h.Process.HasExited) {
+            foreach ($f in $h.StateFile, "$($h.StateFile).shown", "$($h.StateFile).start") { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        } elseif (-not $h.Done) {
+            Stop-HandsOff $h
+        }
     }
     $script:Popups = @()
-# Every pop-up's record (shown, took the foreground), for the results (review m1 of fix round 2).
-$script:HandsOffLog = @()
 }
 
 function Initialize-SpikeUi {

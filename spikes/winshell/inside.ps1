@@ -105,13 +105,26 @@ function Stop-Spike {
 function Run-Core([string]$Name, [string[]]$CoreArgs, [int]$TimeoutSec) {
     $outFile = Join-Path $Work "$Name.json"
     Remove-Item $outFile -ErrorAction SilentlyContinue
-    $spawned = Get-Date
     $r = Tool spawn '--' $Core @CoreArgs --out $outFile
-    # Waited on through its pinned Process (fix round 3, N2-C1), else by its result file.
-    $p = $(if ($r.pid) { Get-PinnedProcess ([int]$r.pid) $Core $spawned } else { $null })
-    if ($null -ne $p) { [void]$p.WaitForExit($TimeoutSec * 1000) }
-    else { $deadline = (Get-Date).AddSeconds($TimeoutSec); while (-not (Test-Path $outFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 } }
-    if (Test-Path $outFile) { return (Get-Content -Raw $outFile | ConvertFrom-Json) }
+    # Waited on through its Process, pinned by its pid and creation time (fix round 3, N2-C1;
+    # fix round 4, m1), else by its result file: only a complete one counts (one that parses and,
+    # for a power core, holds its "exit" event), and a read caught mid-write is retried (m9).
+    $created = Get-SpawnCreated $r
+    $p = $(if ($r.pid -and $created -ne 0) { Get-PinnedProcess ([int]$r.pid) '' ([datetime]::MinValue) $created } else { $null })
+    if ($null -ne $p) {
+        [void]$p.WaitForExit($TimeoutSec * 1000)
+        if (Test-Path $outFile) { try { return (Get-Content -Raw $outFile | ConvertFrom-Json) } catch { } }
+        return $null
+    }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $outFile) {
+            $doc = $null
+            try { $doc = Get-Content -Raw $outFile | ConvertFrom-Json } catch { }
+            if ($null -ne $doc -and (-not $doc.PSObject.Properties['events'] -or @($doc.events | Where-Object { $_.kind -eq 'exit' }).Count -gt 0)) { return $doc }
+        }
+        Start-Sleep -Milliseconds 200
+    }
     $null
 }
 
@@ -243,10 +256,12 @@ function Foreground-Attempt([int]$Attempt) {
     Stop-Spike
     $n = @(Get-Events).Count
     $a = Start-Process -FilePath $App -ArgumentList '--recipe', 'basic', '--exit-after-secs', '120' -PassThru
+    [void]$a.Handle   # pinned at once (fix round 4, m3)
     $aWin = Wait-SpikeEvent 'window' $n 20 { param($e) $e.pid -eq $a.Id }
     # The second window, brought to the front by this script; once in front it launches B
     # itself (ShellExecuteW of the URL), as the toast host does after a click.
     $b = Start-Process -FilePath $App -ArgumentList '--blocker', '--launch-url', $ConfirmUrl, '--launch-after-ms', '3000', '--exit-after-secs', '120' -PassThru
+    [void]$b.Handle
     $bFront = Wait-SpikeEvent 'front_check' $n 20 { param($e) $e.pid -eq $b.Id }
     $valid = [bool]($bFront -and $bFront.is_foreground)
     $chk = Wait-SpikeEvent 'front_check' $n 30 { param($e) $e.pid -eq $a.Id -and $e.phase -eq 'activate' }
@@ -285,9 +300,9 @@ function Item-Power {
     Remove-Item (Join-Path $LogDir 'power-*.flag') -ErrorAction SilentlyContinue
     $outFile = Join-Path $Work 'power-core.json'
     Remove-Item $outFile -ErrorAction SilentlyContinue
-    $spawned = Get-Date
     $r = Tool spawn '--' $Core power --api request --max-secs 120 --out $outFile
-    $pp = $(if ($r.pid) { Get-PinnedProcess ([int]$r.pid) $Core $spawned } else { $null })
+    $created = Get-SpawnCreated $r
+    $pp = $(if ($r.pid -and $created -ne 0) { Get-PinnedProcess ([int]$r.pid) '' ([datetime]::MinValue) $created } else { $null })
     $set = $null
     for ($i = 0; $i -lt 40 -and -not $set; $i++) {
         Start-Sleep -Milliseconds 500
@@ -316,7 +331,10 @@ function Run-Exe([string]$Exe, [string]$PathValue) {
     try {
         $p = Start-Process -FilePath $Exe -ArgumentList '--test-threads', '1' -PassThru `
             -RedirectStandardOutput (Join-Path $Work 'rust-stdout.txt') -RedirectStandardError (Join-Path $Work 'rust-stderr.txt')
-        if (-not $p.WaitForExit(60000)) { Stop-PinnedProcess $p; return 'timeout' }   # a Start-Process -PassThru object
+        # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no
+        # handle until .Handle is read (fix round 4, m3).
+        [void]$p.Handle
+        if (-not $p.WaitForExit(60000)) { Stop-PinnedProcess $p; return 'timeout' }
         return $p.ExitCode
     } catch {
         return "start failed: $($_.Exception.Message)"
@@ -365,6 +383,9 @@ function Start-Qt([string]$Exe, [string]$Arguments, [string]$Name) {
     $sp = @{ FilePath = $Exe; PassThru = $true; RedirectStandardError = $err; RedirectStandardOutput = (Join-Path $Work "$Name-stdout.txt") }
     if ($Arguments) { $sp.ArgumentList = $Arguments }
     $p = Start-Process @sp
+    # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no handle
+    # until .Handle is read (fix round 4, m3).
+    [void]$p.Handle
     [pscustomobject]@{ Process = $p; Stderr = $err }
 }
 
@@ -380,7 +401,7 @@ function Item-Qt([string]$Name) {
     Remove-Item $offPng -ErrorAction SilentlyContinue
     $env:QT_QPA_PLATFORM = 'offscreen'
     $q = Start-Qt $exe ($Config.qt_grab_args -replace '\{png\}', $offPng) "$Name-offscreen"
-    if (-not $q.Process.WaitForExit(60000)) { Stop-PinnedProcess $q.Process }   # a Start-Process -PassThru object
+    if (-not $q.Process.WaitForExit(60000)) { Stop-PinnedProcess $q.Process }   # pinned in Start-Qt (its handle read at once)
     Remove-Item Env:\QT_QPA_PLATFORM
     $offErr = $(if (Test-Path $q.Stderr) { Get-Content -Raw $q.Stderr } else { '' })
     $off = Get-GrabStats $offPng
@@ -408,7 +429,7 @@ function Item-Qt([string]$Name) {
         $on.nonflat = $false
         $on.error = 'no main window'
     }
-    Stop-PinnedProcess $q2.Process   # a Start-Process -PassThru object
+    Stop-PinnedProcess $q2.Process   # pinned in Start-Qt (its handle read at once)
     Start-Sleep -Seconds 1
     $onErr = $(if (Test-Path $q2.Stderr) { Get-Content -Raw $q2.Stderr } else { '' })
     $on.backend = Get-Backend $onErr

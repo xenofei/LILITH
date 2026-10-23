@@ -12,7 +12,7 @@ use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{
     NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND};
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_ELEVATION,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel,
@@ -29,9 +29,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Environment::GetCommandLineW;
 use windows::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, OpenProcess,
-    OpenProcessToken, PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW, STARTUPINFOW,
+    CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, GetProcessTimes,
+    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, STARTUPINFOW,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
@@ -237,13 +237,19 @@ pub fn read_shortcut(lnk: &Path) -> Result<(String, String, Option<String>)> {
 }
 
 /// Starts `exe args` with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, as `lil-client`
-/// starts the core; returns the pid.
+/// starts the core; returns the pid and the child's creation time (a FILETIME as a u64, from
+/// `GetProcessTimes` on the handle `CreateProcessW` returned, read before it is closed).
+///
+/// The pid and the creation time together name one process: the scripts pin the child by both
+/// (`Get-PinnedProcess` compares `StartTime.ToFileTimeUtc()` exactly), so a pid reused after the
+/// child exits can't be taken for it (fix round 4, m1). The creation time is 0 when
+/// `GetProcessTimes` fails; the scripts then don't pin the child.
 ///
 /// `CreateProcessW` is called directly with `bInheritHandles = FALSE`. `std::process::Command`
 /// passes TRUE, and then the child inherits every inheritable handle of this process,
 /// including a stdout pipe its caller reads to EOF: the caller would wait for the child to
 /// exit (fix round 1, C1; `tests/spawn_detached.rs`).
-pub fn spawn_detached(exe: &str, args: &[String]) -> std::io::Result<u32> {
+pub fn spawn_detached(exe: &str, args: &[String]) -> std::io::Result<(u32, u64)> {
     let mut line: Vec<u16> = crate::text::command_line(exe, args)
         .encode_utf16()
         .chain([0])
@@ -253,9 +259,16 @@ pub fn spawn_detached(exe: &str, args: &[String]) -> std::io::Result<u32> {
         ..Default::default()
     };
     let mut info = PROCESS_INFORMATION::default();
+    let (mut ft_created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
     // SAFETY: `line` is NUL-terminated and mutable as CreateProcessW requires; `startup` and
-    // `info` are valid for the call; both returned handles are closed here.
-    unsafe {
+    // `info` are valid for the call; the FILETIMEs outlive GetProcessTimes; both returned
+    // handles are closed here.
+    let created = unsafe {
         CreateProcessW(
             PCWSTR::null(),
             Some(PWSTR(line.as_mut_ptr())),
@@ -269,10 +282,23 @@ pub fn spawn_detached(exe: &str, args: &[String]) -> std::io::Result<u32> {
             &mut info,
         )
         .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
+        let ok = GetProcessTimes(
+            info.hProcess,
+            &mut ft_created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .is_ok();
         let _ = CloseHandle(info.hThread);
         let _ = CloseHandle(info.hProcess);
-    }
-    Ok(info.dwProcessId)
+        if ok {
+            (u64::from(ft_created.dwHighDateTime) << 32) | u64::from(ft_created.dwLowDateTime)
+        } else {
+            0
+        }
+    };
+    Ok((info.dwProcessId, created))
 }
 
 /// `ShellExecuteW(NULL, "open", url, ...)`; the return value (> 32 is success).
