@@ -2,7 +2,7 @@
 
 Date: 2026-10-12
 
-GPU: NVIDIA GeForce RTX 5080 16 GB, driver 610.88. Qt 6.12.0 + Qt WebEngine 6.140.0. ComfyUI 0.39.2, frontend `comfyui-frontend-package` 1.53.10, workflow templates 0.11.78.
+GPU: a 16 GB consumer GPU (name and driver version removed). Qt 6.12.0 + Qt WebEngine 6.140.0. ComfyUI 0.39.2, frontend `comfyui-frontend-package` 1.53.10, workflow templates 0.11.78.
 
 ## 1. Question
 
@@ -15,7 +15,7 @@ GPU: NVIDIA GeForce RTX 5080 16 GB, driver 610.88. Qt 6.12.0 + Qt WebEngine 6.14
 | Item | Version |
 |---|---|
 | OS | Windows 11 Pro 10.0.26200 |
-| GPU / driver | NVIDIA GeForce RTX 5080 16 GB, 610.88 |
+| GPU / driver | 16 GB consumer GPU |
 | Qt / Qt WebEngine | 6.12.0 `msvc2022_64` / 6.140.0 (Chromium 140 base) |
 | MSVC / CMake / Ninja | cl 19.44.35227 / 4.4.4 / 1.13.2 |
 | KDDockWidgets | 2.4.1 (FetchContent, Qt Quick frontend) |

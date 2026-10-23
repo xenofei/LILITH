@@ -1,6 +1,6 @@
 # Canvas engine research: Rust core + Qt 6.12 Quick (QQuickRhiItem) on Windows
 
-Date: 2026-10-12. Target: native image studio, Rust core, Qt 6.12 Quick/QML via cxx-qt 0.10 plus a C++ shim, RTX 5080, layered documents stored as content-addressed layer files.
+Date: 2026-10-12. Target: native image studio, Rust core, Qt 6.12 Quick/QML via cxx-qt 0.10 plus a C++ shim, a 16 GB consumer GPU, layered documents stored as content-addressed layer files.
 
 **Verification legend**
 - **[V]** I checked this against a primary source: official docs, source code at `master`/`dev`, or a project's own README or blog.
@@ -137,7 +137,7 @@ Plan the type system for multiple formats now: `enum TileFormat { Rgba8Srgb, Rgb
 Recommended defaults [U]:
 - **RAM:** tile store budget is about 50% of physical RAM, matching Krita's default. Beyond that, LRU-evict *clean* tiles, which already live in the CAS on disk, and compress or spill undo tiles.
 - **VRAM:** tile-cache budget of about **1.5–2 GB by default, configurable**, not "everything resident".
-  - The RTX 5080 has 16 GB, but **ComfyUI runs on the same GPU** and SDXL/Flux-class models want most of it.
+  - The test machine's GPU has 16 GB, but **ComfyUI runs on the same GPU** and SDXL/Flux-class models want most of it.
   - Add a hook that trims the canvas cache when a ComfyUI job starts. ComfyUI also has its own `free` endpoint (the MCP server exposes `free_memory`).
 - Real documents are sparse, so the full-coverage numbers are worst cases.
 
@@ -196,7 +196,7 @@ Recommended defaults [U]:
 5. **Pan and zoom never recomposite.** They only change the view uniform used to sample projection pages. Use the mip chain plus trilinear sampling when zoomed out, and nearest-neighbour above 200% zoom so pixel artists see real pixels.
 6. **Seams:** compositing is 1:1 texel-to-texel and needs no borders. Only the display sampling of projection pages does. Either add an apron to pages, as Krita does with a `1<<mipLevels` border [V], or sample across page edges in the shader by clamping to inner texels and accepting tiny seams at very low zoom.
 
-**QQuickRhiItem vs QSGRenderNode [U].** QQuickRhiItem renders into its own texture, which Qt Quick then composites. That is one extra full-viewport copy, about 33 MP/s at 4K60, which is trivial on a 5080. QSGRenderNode draws directly into the window's pass and saves that copy, but its API is harder. Start with QQuickRhiItem.
+**QQuickRhiItem vs QSGRenderNode [U].** QQuickRhiItem renders into its own texture, which Qt Quick then composites. That is one extra full-viewport copy, about 33 MP/s at 4K60, which is trivial on a 16 GB consumer GPU. QSGRenderNode draws directly into the window's pass and saves that copy, but its API is harder. Start with QQuickRhiItem.
 
 **C++ shim boundary [U].**
 - The cxx-qt 0.10 changelog (2026-08-24) covers JSON types, item-model enums and image-provider bindings (0.9). It mentions no QQuickItem or QQuickRhiItem subclass support ([releases](https://github.com/KDAB/cxx-qt/releases)) [V for changelog contents].
@@ -421,7 +421,7 @@ Recommended defaults [U]:
 | Brush input→photon | ≤ 2 frames at 60 Hz (~33 ms), ideally ~1.5 frames. Dab rasterisation < 1 ms per input sample for ≤ 500 px brushes. |
 | Tablet sampling | Process every sample (200 pps Wacom Pro [P]). Never compress. |
 | Dirty recomposite | ≤ 4 ms per frame budget. Visible tiles first; remainder deferred. |
-| Layer property slider (opacity, blend mode, curves) | Interactive at 60 fps on 8K × 20 layers: the full-canvas recomposite of visible pages fits in a few ms on a 5080 [U]. |
+| Layer property slider (opacity, blend mode, curves) | Interactive at 60 fps on 8K × 20 layers: the full-canvas recomposite of visible pages fits in a few ms on a 16 GB consumer GPU [U]. |
 | Open 8K/20-layer doc | First frame from the low-res pyramid in < 1 s; full-resolution tiles stream in. |
 | ComfyUI preview frame → screen | < 1 frame after receipt (decode off-thread). |
 
@@ -445,7 +445,7 @@ Recommended defaults [U]:
 7. **The threaded render loop with vsync** adds about one frame of pipeline latency [U]. For the brush, draw the *current stroke's* overlay from the latest samples during `synchronize()`, so the cursor-to-ink gap stays minimal. Optionally predict 1 frame of pen motion for the brush cursor only.
 8. **High-DPI:** use device pixels everywhere in the renderer (render target size, not item size [V note]). Map tablet scene positions with the DPR in mind.
 9. **QRhi API instability across minor versions [V]:** pin Qt 6.12 LTS and isolate all QRhi use in the C++ shim.
-10. **VRAM contention with ComfyUI** on the same RTX 5080 (§1.2): a budgeted cache, trimmed on job start.
+10. **VRAM contention with ComfyUI** on the same 16 GB GPU (§1.2): a budgeted cache, trimmed on job start.
 11. **`generateMips` is not guaranteed for every format [V].** Check at startup. If needed, fall back to a tiny compute downsample shader, which also allows **partial** mip updates for only the dirty region (better than regenerating a 2048² page).
 
 ---

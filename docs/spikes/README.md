@@ -1,6 +1,6 @@
 # M0 spike results
 
-Plan 0 (`docs/superpowers/plans/2026-10-12-m0-spikes.md`) ran on 2026-10-12 on the test machine: Windows 11 Pro, RTX 5080 16 GB, ComfyUI 0.39.2 with frontend 1.53.10. Each decision is recorded in the spec (`docs/superpowers/specs/2026-10-12-lilith-design.md`) as an "(M0 result, 2026-10-12: …)" note on the rule it settles. No rule was renumbered or deleted. IMG-033 is marked *withdrawn* and keeps its ID.
+Plan 0 (`docs/superpowers/plans/2026-10-12-m0-spikes.md`) ran on 2026-10-12 on the test machine: Windows 11 Pro, 16 GB consumer GPU, ComfyUI 0.39.2 with frontend 1.53.10. Each decision is recorded in the spec (`docs/superpowers/specs/2026-10-12-lilith-design.md`) as an "(M0 result, 2026-10-12: …)" note on the rule it settles. No rule was renumbered or deleted. IMG-033 is marked *withdrawn* and keeps its ID.
 
 There is no spike 05. Pen input (IMG-046, IMG-154) is on hold by project decision, so that spike was not run.
 

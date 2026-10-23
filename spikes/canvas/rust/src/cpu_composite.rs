@@ -125,7 +125,7 @@ pub fn apply_curves(b: Px, lut: &[u8], opacity: f32) -> Px {
     o
 }
 
-/// `round(clamp(v) * 255)`, ties away from zero. (Measured on the RTX 5080: the GPU results come
+/// `round(clamp(v) * 255)`, ties away from zero. (Measured on the test machine's 16 GB GPU: the GPU results come
 /// out a few hundredths of an LSB lower and its UNORM8 stores round exact ties down, so GPU and CPU
 /// differ by 1 on ~2.4 % of channels, never by 2; the 1/255 golden tolerance covers it. See
 /// docs/spikes/03-canvas-compositing.md.)

@@ -2,7 +2,7 @@
 
 Date: 2026-10-12
 
-GPU: NVIDIA GeForce RTX 5080 16 GB, driver 610.88. Qt 6.12.0 (Qt Quick on Direct3D 11 by default; Direct3D 12 via `QSG_RHI_BACKEND=d3d12`). ComfyUI is not involved in this spike.
+GPU: a 16 GB consumer GPU (name and driver version removed). Qt 6.12.0 (Qt Quick on Direct3D 11 by default; Direct3D 12 via `QSG_RHI_BACKEND=d3d12`). ComfyUI is not involved in this spike.
 
 ## 1. Question
 
@@ -18,7 +18,7 @@ GPU: NVIDIA GeForce RTX 5080 16 GB, driver 610.88. Qt 6.12.0 (Qt Quick on Direct
 | Item | Version |
 |---|---|
 | OS | Windows 11 Pro 10.0.26200 |
-| GPU / driver | NVIDIA GeForce RTX 5080 16 GB, 610.88 |
+| GPU / driver | 16 GB consumer GPU |
 | Graphics Tools (debug layers) | installed: `d3d11_3SDKLayers.dll` and `d3d12SDKLayers.dll` 10.0.26100.9549 in System32. Nothing was installed for this spike. |
 | Rust | 1.99.0 |
 | CMake / Ninja | 4.4.4 / 1.13.2 |
