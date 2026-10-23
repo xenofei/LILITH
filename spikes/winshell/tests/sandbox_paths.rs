@@ -54,10 +54,6 @@ fn task0_repo_env_and_deploy_dir_find_the_deploy_and_the_app_exe() {
     assert_eq!(v["deploy"]["path"], deploy.to_str().unwrap());
     assert_eq!(v["deploy"]["exists"], true);
     assert_eq!(v["qt_exe"], "app_shell_spike.exe");
-    assert_eq!(
-        v["qt_grab_args"],
-        "--screenshot {png} --quit-after 5000 --no-activate"
-    );
 
     // Pasted as -Task0Repo "C:\x\" from Windows PowerShell 5.1 or cmd, the value arrives with a
     // trailing backslash and a literal quote (review M12).

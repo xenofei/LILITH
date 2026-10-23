@@ -85,11 +85,10 @@ function Start-Sleep {
     $real = [int][math]::Min(300, $ms / 50)
     if ($real -gt 0) { [Threading.Thread]::Sleep($real) }
 }
+# The default run must never prompt (scope cut): a prompt in the simulation is a failure.
 function Read-Host {
     param([Parameter(Position = 0)]$Prompt)
-    $answer = $(if ("$Prompt" -match '\[y/n\]') { 'y' } else { '' })
-    Write-Host "$Prompt (the simulation answers '$answer')"
-    $answer
+    throw "simulation: a prompt was reached: $Prompt"
 }
 function Beep([int]$Frequency, [int]$Ms) { }
 function cargo { $global:LASTEXITCODE = 0 }
@@ -313,6 +312,8 @@ $script:SimIdleCalls = 0
 $script:SimLockCalls = 0
 $script:SimPopups = 0
 $script:SimSandbox = $null
+$script:SimTicking = $false
+$script:SimQtLaunches = 0
 $script:SimTopAtPoint = 0
 
 function Add-SimEvent($E) {
@@ -628,10 +629,15 @@ function Find-VcRedist { @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.d
 function Get-WsbIds { @() }
 function Assert-NoSandboxRunning { if (@(Get-SandboxPids).Count -gt 0) { throw 'simulation: a Sandbox of an earlier run is still running' } }
 
-function Write-SimItems([string]$Res, [string]$Sfx) {
+function Write-SimItems([string]$Res, [string]$Sfx, [string]$Deploy, [string]$QtExe) {
     Write-SimJson (Join-Path $Res "toast$Sfx.json") ([ordered]@{ setting = 'Enabled'; history_has_tag = $true; popup = [ordered]@{ method = 'uia'; appearances = @([ordered]@{ from_s = 1; to_s = 5 }) }; popup_seen = $true; pass = $true })
     Write-SimJson (Join-Path $Res "foreground$Sfx.json") ([ordered]@{ precondition_met = $true; a_pid = 4242; foreground_pid_after_handoff = 4242; pass = $true })
-    Write-SimJson (Join-Path $Res "qt$Sfx.json") ([ordered]@{ platform_plugins = @('qwindows.dll', 'qoffscreen.dll'); offscreen = [ordered]@{ available = $true; nonflat = $true }; onscreen = [ordered]@{ available = $true; nonflat = $true }; rhi_backend = 'D3D11'; pass = $true })
+    # The Qt item is the real Invoke-QtItem (uia.ps1) over the deploy copy the run mapped (Task 0's
+    # trimmed deploy: platforms\qwindows.dll only), with a fake launcher that shows nothing: the
+    # plugin decision, the missing offscreen plugin and the record are the real code's.
+    $script:SimQtLaunches++
+    $qt = Invoke-QtItem $Deploy $QtExe { param($exe) [ordered]@{ hwnd = 9001; class = 'Qt6QWindowIcon'; nonflat = $true; exit = 0; stderr = 'rhi: backend D3D11 (simulation)'; backend = 'D3D11' } }
+    Write-SimJson (Join-Path $Res "qt$Sfx.json") $qt
 }
 
 function Start-SimSandbox([string]$WsbFile, $Launcher) {
@@ -639,33 +645,20 @@ function Start-SimSandbox([string]$WsbFile, $Launcher) {
     $res = Join-Path $runDir 'results'
     $cfg = [IO.File]::ReadAllText((Join-Path $runDir 'bundle\config.json')) | ConvertFrom-Json
     $pids = @((New-SimPid), (New-SimPid))
-    # Unattended run 2 doesn't close by itself: the stop path ends it through its pinned object.
-    $script:SimSandbox = @{ Res = $res; Observe = [bool]$cfg.observe; Run = [int]$cfg.run; Pids = $pids; Launcher = $Launcher; Sticky = (-not $cfg.observe -and [int]$cfg.run -eq 2) }
+    # Run 2 doesn't close by itself: the stop path ends it through its pinned object.
+    $script:SimSandbox = @{ Res = $res; Run = [int]$cfg.run; Pids = $pids; Launcher = $Launcher; Sticky = ([int]$cfg.run -eq 2); Deploy = [string]$cfg.deploy_dir; QtExe = [string]$cfg.qt_exe }
     $script:SimWindows = @(@($script:SimWindows) | Where-Object { $_.class -ne 'WindowsSandboxWindow' }) + @(@{ pid = $pids[1]; hwnd = 8001; class = 'WindowsSandboxWindow'; name = 'Windows Sandbox' })
-    Write-SimJson (Join-Path $res 'started.json') ([ordered]@{ at = (Get-Date).ToUniversalTime().ToString('o'); ps = '5.1 (simulation)'; run = $cfg.run; observe = $cfg.observe })
-    if ($cfg.observe) {
-        Write-SimItems $res ''
-        Write-SimJson (Join-Path $res 'round-1.json') ([ordered]@{ at = 'simulation' })
-    }
+    Write-SimJson (Join-Path $res 'started.json') ([ordered]@{ at = (Get-Date).ToUniversalTime().ToString('o'); ps = '5.1 (simulation)'; run = $cfg.run })
 }
 
-# What inside.ps1 has written by now: the rounds after the host's flags, then the items and done.json.
+# What inside.ps1 has written by now: the items and done.json.
 function Invoke-SimSandboxTick {
     $s = $script:SimSandbox
-    if ($null -eq $s) { return }
+    if ($null -eq $s -or $script:SimTicking) { return }   # Invoke-QtItem calls Test-Path, which ticks
     $res = $s.Res
     if ([IO.File]::Exists((Join-Path $res 'done.json'))) { return }
-    if ($s.Observe) {
-        foreach ($r in 2, 3) {
-            if ([IO.File]::Exists((Join-Path $res "go-$r.flag")) -and -not [IO.File]::Exists((Join-Path $res "round-$r.json"))) {
-                Write-SimItems $res "-r$r"
-                Write-SimJson (Join-Path $res "round-$r.json") ([ordered]@{ at = 'simulation' })
-            }
-        }
-        if (-not [IO.File]::Exists((Join-Path $res 'round-3.json'))) { return }
-    } else {
-        Write-SimItems $res ''
-    }
+    $script:SimTicking = $true
+    try { Write-SimItems $res '' $s.Deploy $s.QtExe } finally { $script:SimTicking = $false }
     Write-SimJson (Join-Path $res 'elevation.json') ([ordered]@{ token = [ordered]@{ elevated = $false; integrity = 'Medium' }; whoami_label = 'Mandatory Label\Medium Mandatory Level (simulation)'; deelevated = $null })
     Write-SimJson (Join-Path $res 'protocol.json') ([ordered]@{ command_key_present = $true; argument = '"lilspike:confirm/cf_0123456789abcdef"'; pass = $true })
     Write-SimJson (Join-Path $res 'power.json') ([ordered]@{ listed = $true; pass = $true })

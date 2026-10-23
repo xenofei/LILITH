@@ -41,33 +41,30 @@ fn stages(v: &serde_json::Value) -> Vec<(String, Vec<String>)> {
 }
 
 #[test]
-fn the_one_command_is_part_b_then_the_sandbox_runs() {
+fn the_default_runs_only_s1_9_in_the_sandbox() {
+    // Scope cut: Part B is answered by the owner's recorded runs, so the default is S1.9 alone.
     let (code, out, err) = dry_run(&[]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    let s = stages(&v);
+    assert_eq!(s.len(), 1, "{out}");
+    assert_eq!(s[0].0, "run-sandbox.ps1");
+    assert_eq!(s[0].1, vec!["-Runs", "3", "-KeepAwake"]);
+}
+
+#[test]
+fn part_b_runs_only_with_part_b() {
+    let (code, out, err) = dry_run(&["-Only", "s1.4"]);
+    assert_ne!(code, Some(0), "{out}{err}");
+    assert!(err.contains("run only with -PartB"), "{err}");
+    assert!(out.is_empty(), "printed: {out}");
+    let (code, out, err) = dry_run(&["-PartB"]);
     assert_eq!(code, Some(0), "{out}{err}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");
     let s = stages(&v);
     assert_eq!(s.len(), 2, "{out}");
     assert_eq!(s[0].0, "run-spike.ps1");
-    // Part B: the host checks, one run, no -PowerPart and no -Append (S1.7 is self-contained now).
-    assert_eq!(s[0].1, vec!["-Only", "S1.2p,S1.3,S1.4,S1.5,S1.7,S1.8"]);
-    // Part C: 3 Sandbox runs, kept awake, no -Observe (no watched run, owner run 3).
     assert_eq!(s[1].0, "run-sandbox.ps1");
-    assert_eq!(s[1].1, vec!["-Runs", "3", "-KeepAwake"]);
-}
-
-#[test]
-fn a_rerun_of_one_check_runs_only_that_part() {
-    let (code, out, err) = dry_run(&["-Only", "s1.4"]);
-    assert_eq!(code, Some(0), "{out}{err}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    let s = stages(&v);
-    assert_eq!(s.len(), 1, "{out}");
-    assert_eq!(s[0].1, vec!["-Only", "S1.4"]);
-    let (_, out, _) = dry_run(&["-Only", "s1.9"]);
-    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    let s = stages(&v);
-    assert_eq!(s.len(), 1, "{out}");
-    assert_eq!(s[0].0, "run-sandbox.ps1");
 }
 
 #[test]

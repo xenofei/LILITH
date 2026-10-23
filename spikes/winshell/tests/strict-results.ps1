@@ -347,6 +347,24 @@ Try-Case 'Write-Shortcut -WithToastClsid refuses a read-back without the CLSID' 
 } 'True'
 Try-Case 'Write-Shortcut plain' { Write-Shortcut; $script:ShortcutForm } 'plain'
 
+# ---- Scope cut: S1.9's Qt item (Invoke-QtItem). A missing platform plugin is recorded and the
+# app never started (no modal box); the offscreen grab is never tested; a dialog is never a grab.
+$qtTmp = Join-Path ([IO.Path]::GetTempPath()) ('winshell-qt-test-' + [guid]::NewGuid().ToString('N'))
+try {
+    [void][IO.Directory]::CreateDirectory((Join-Path $qtTmp 'platforms'))   # New-Item is stubbed above
+    [IO.File]::WriteAllText((Join-Path $qtTmp 'app.exe'), '')
+    $script:QtLaunched = 0
+    $grab = { param($exe) $script:QtLaunched++; [ordered]@{ hwnd = 1; class = 'Qt6QWindowIcon'; nonflat = $true } }
+    Try-Case 'Qt: no qwindows.dll, not launched' { $r = Invoke-QtItem $qtTmp 'app.exe' $grab; "$($r.pass) $($r.onscreen.launched) $script:QtLaunched" } 'False False 0'
+    [IO.File]::WriteAllText((Join-Path $qtTmp 'platforms\qwindows.dll'), '')
+    Try-Case 'Qt: qwindows.dll present, on-screen grab judged' { $r = Invoke-QtItem $qtTmp 'app.exe' $grab; "$($r.pass) $($r.onscreen.launched) $script:QtLaunched" } 'True True 1'
+    Try-Case 'Qt: offscreen not tested without qoffscreen.dll' { (Invoke-QtItem $qtTmp 'app.exe' $grab).offscreen.reason } 'offscreen not tested: the trimmed deploy ships no qoffscreen.dll; CI''s S0.9 covers offscreen'
+    Try-Case 'Qt: a dialog window is never a grab' { $r = Invoke-QtItem $qtTmp 'app.exe' { param($exe) [ordered]@{ hwnd = 2; class = '#32770'; nonflat = $true } }; "$($r.pass) $($r.onscreen.error_dialog)" } 'False True'
+    [IO.File]::WriteAllText((Join-Path $qtTmp 'platforms\qoffscreen.dll'), '')
+    Try-Case 'Qt: offscreen still not tested with qoffscreen.dll present' { $r = Invoke-QtItem $qtTmp 'app.exe' $grab; "$($r.offscreen.tested) $($r.qt_qpa_platform)" } 'False (unset: the default windows plugin)'
+    Try-Case 'Qt: the app missing is recorded, not launched' { $script:QtLaunched = 0; $r = Invoke-QtItem $qtTmp 'nope.exe' $grab; "$($r.pass) $($r.onscreen.launched) $script:QtLaunched" } 'False False 0'
+} finally { Remove-Item -LiteralPath $qtTmp -Recurse -Force -ErrorAction SilentlyContinue }
+
 # ---- Fix round 4, m9: an unpinned core's result counts only once it is complete
 $coreTmp = Join-Path ([IO.Path]::GetTempPath()) ('winshell-core-test-' + [guid]::NewGuid().ToString('N') + '.json')
 try {

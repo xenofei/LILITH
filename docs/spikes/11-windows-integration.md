@@ -2,7 +2,7 @@
 
 Date: 2026-10-21
 
-Status: sections 1–4 are written and committed before anything runs (plan 4a, Task 1, Step 1). The owner-present runs (Step 2 on the host, Step 2b in Windows Sandbox) fill sections 5–8.
+Status: sections 1–4 were written and committed before anything ran (plan 4a, Task 1, Step 1). Sections 5–8 are written from the owner's three runs; S1.9 is pending its unattended run.
 
 ## 1. Question
 
@@ -119,14 +119,9 @@ Part B and the stay-awake wait write `results/checks.json`; the Sandbox runs wri
 - **One idle-timer reset after S1.7's stay-awake wait.** After the evidence reads, a single `SetThreadExecutionState(ES_SYSTEM_REQUIRED)` without `ES_CONTINUOUS` covers the switch to the Sandbox stage. It is outside the judged span and holds nothing.
 - **The host keep-awake runs from a copy of the core,** so that the Sandbox stage's build can replace the release binaries.
 
-**Owner run 3, full automation (owner's round-12 answers, 2026-10-23).** The owner asked for no hands: at most one short pop-up check per feature, and ideally none. The run is now one unattended command, `spikes/winshell/run-all.ps1`, Part B on the host then Part C in the Sandbox, with no clicks, watching, Hello gesture, sleep or lock.
-- **UI Automation never saw this PC's toast banner** (owner run 3). On Windows 11 26H2 the shell renders toast banners and the notification centre in a surface that is not in the UIA tree a medium-integrity desktop process sees: the native (UIA3) and managed clients both list the same nine top-level windows, none from ShellExperienceHost/ShellHost, and no banner appeared across 31 clean polls per toast (and 73–75 for S1.2p). So detection moved off UIA: a toast's pop is read from its own `ToastNotification` events (`Dismissed`/`Failed`/`Activated`, sender side), and its presence in the centre from `ToastNotificationManager::History`.
-- **S1.5** counts pops from the toasts' own `TimedOut` dismissals (a fade-out per pop), with a control toast each run to prove the signal fired; it needs no owner and no notification-centre navigation.
-- **S1.3 and S1.4 are settled from the owner's recorded runs** and never re-run (their bars are a real click, which only a person gives). S1.3's activation grammar is still reconfirmed automatically through `ShellExecuteW` of the scheme.
-- **S1.7** is judged from the execution-state self-check (`PowerSetRequest` held, read through `CallNtPowerInformation` before/while/after), with the owner's earlier elevated `powercfg /requests` listing corroborating. No real sleep.
-- **S1.8**: the app brings the Hello prompt forward itself — `winshell-hello` creates a window, foregrounds it (`AllowSetForegroundWindow` + `SetForegroundWindow`), and passes it to `IUserConsentVerifierInterop::RequestVerificationForWindowAsync`. A probe checks the prompt comes in front of a normal, a topmost and a fullscreen window, then cancels it (no gesture). The KEK crypto is settled from the owner's run; the real gesture is proven by first real use. The passphrase is the fallback if the prompt can't be placed.
-- **S1.9** runs entirely unattended: no watched run and no lock. The Qt step sets `QT_QPA_PLATFORM=offscreen` only when `qoffscreen.dll` is present, checks each platform plugin before launch so a missing one is recorded rather than shown as Qt 6.12's modal "no Qt platform plugin" box, and judges the on-screen grab (the Sandbox has its own screen).
-Re-run: the commands above. `spikes/winshell/OWNER-STEPS.md` lists what each step shows, what the owner does, how long it takes, and what it writes and removes.
+**Scope cut (2026-10-23, after the owner's third run).** Part B (S1.1 to S1.8) is answered by the owner's three recorded runs and is not re-run: its results are taken from that evidence (§5). Only S1.9 still runs, unattended: `run-all.ps1` starts `run-sandbox.ps1 -Runs 3 -KeepAwake` and nothing else unless given `-PartB`. The Sandbox run asks nothing, bounds every wait, cleans up on every exit path, and touches nothing on the host desktop beyond starting the Sandbox window (and a parent-watched keep-awake for the runs). Its Qt item grabs the on-screen window only: Task 0's trimmed deploy ships no `qoffscreen.dll`, the offscreen grab is CI's S0.9, and nothing is copied into the deploy. The app is started only when `platforms\qwindows.dll` is present, because Qt 6.12 shows a modal "no Qt platform plugin could be initialized" box when the plugin can't load (`qguiapplication.cpp`, `init_platform`: a `MessageBox` when the build is release and no console is attached), which blocked the owner's watched Sandbox run.
+
+Re-run: `pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Task0Repo "<Task 0's worktree>"`. `spikes/winshell/OWNER-STEPS.md` says what it shows, how long it takes, and what it writes and removes.
 
 ## 4. Pass criteria
 
@@ -192,14 +187,75 @@ The full measurements are written after the owner-present runs (Step 3). Run 1 o
 - **S1.5: a progress toast may pop again while it updates (APP-146).** The FAIL is a true result under the bar, not a verdict-logic bug: the code updates through `UpdateWithTagAndGroup` with `NotificationData` and never re-posts, and the verdict is FAIL only because the owner saw a second pop. Microsoft's documentation of progress toasts says an update "won't reappear as a popup", so what the owner saw contradicts the documented behaviour. The next session counts the popups with UIA, with the time and rectangle of each appearance, while the owner watches. Two or more popups confirm the FAIL path (progress toasts left out of plan 4a, the `job_progress` category kept off, the owner told before Task 2). One popup goes to the owner, since an in-place re-animation is invisible to UIA. Zero popups mean UIA didn't see the toast, and the owner's answer is recorded instead. A pre-release build may not behave as the documentation says, so the build goes with the result.
 - **S1.7's stay-awake wait would have failed falsely on this PC.** The core holding the request stopped by itself after 7200 s, but with a 2-hour timeout the wait is 7530 s: the request would have been cleared 5.5 minutes before the end, just as the PC reached its timeout. The core's limit now covers the wait with its restarts, and the core releases the request as soon as the script's process is gone.
 
+
+### Run 3 (2026-10-23, 20:46–21:04 UTC; Windows 11 26H2, build 10.0.26300, a pre-release build)
+
+The automation round's attended block, on commit `3fb2fac`. The owner gave every click and every answer: the harness's UI Automation search found none of the run's toasts (below), so each automated step fell back to the owner.
+- **S1.2p RECORDED.** Both forms, the plain AUMID shortcut and the one with the spike's `ToastActivatorCLSID` registered, were in `ToastNotificationManager::History` at once and still there 20 s after the 5 s banner.
+- **S1.3 PASS.** 6 of 6 owner clicks (3 on the body, 3 on the Open button) gave exactly `"<exe>" "lilspike:confirm/cf_0123456789abcdef"`. The Run dialog, filled in by the script (Win+R, UIA `ValuePattern.SetValue`, Enter), delivered `"<exe>" "lilspike:open/<base64url>"` and the same with a trailing `/`, each as one quoted argument, unchanged, the trailing `/` kept.
+- **S1.4 PASS.** Basic recipe: with A running, 5 of 5 owner clicks left A in front with focus after B's hand-off (B's `AllowSetForegroundWindow(A)` returned true each time); without A, 5 of 5 left B in front with focus. The recorded synthetic-click set made no synthetic click (the toast was never found), so whether a test runner could stand in for the click is unknown.
+- **S1.5 FAIL**, on the owner's answers. All 20 updates returned `Succeeded`; after the owner's dismissal `Update` returned `NotificationNotFound`; `Remove(tag, group)` then a new toast popped. The owner saw no second pop while the toast updated, but saw the `SuppressPopup` toast pop. It was in the notification centre.
+- **S1.7, the sleep and wake:** the core's hidden window received `PBT_APMSUSPEND`, `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND` across the owner's sleep. No Modern Standby (S3 sleep).
+- **S1.8:** (a) supported; (b) `RequestCreateAsync` returned `Success`, but the prompt did not come in front by itself (it appeared behind the foreground window, and came forward only after the owner's input); (c) 10 of 10 signatures byte-identical, 5 per process in two processes; (d) TPM 2.0; (e) `RequestVerificationForWindowAsync(GetConsoleWindow(), …)` returned `Verified`, owner-assisted (not in front by itself); (f) `DeleteAsync` removed the credential and `OpenAsync` then returned `NotFound`. DPAPI round-tripped. By the bars this is "passphrase only".
+- **The watched Sandbox run** stopped at a modal Qt error box inside the Sandbox ("no Qt platform plugin could be initialized … Available platform plugins are: windows"): `inside.ps1` started the app with `QT_QPA_PLATFORM=offscreen`, and the trimmed deploy has no `qoffscreen.dll`. Fixed since (§3).
+- **Cleanup PASS.**
+
+**Observation, not a proven cause: UI Automation never found a toast in this harness.** On this PC (26H2, build 26300) the harness's UIA search found no toast banner in any watch (31 clean polls for the calibration toast, 29 per S1.3 trial, 73–75 across S1.2p's 20 s), and found no entry in the notification centre while it was open and in the foreground (S1.2p: `centre_identified = true`, `listed = false`). Read-only probes between toasts found the same 9 top-level windows with the managed (`System.Windows.Automation`) and the native (`IUIAutomation`) clients, none from ShellExperienceHost or ShellHost. No probe listed the UIA tree while a banner or the centre was up, and no Microsoft page found says toasts are hidden from UIA (Narrator reads them), so why the search missed them is not known. One hypothesis is that the shell's toast and centre surfaces are not reachable this way from a medium-integrity process on this build. A desktop test should not rely on UIA to find toasts until this is understood: History says whether a toast is in the centre, and the toast's own `Activated`/`Failed` events are documented; `Dismissed` with `TimedOut` ("shown for the maximum allowed time and was faded out") is a weaker signal of a pop, untested on this PC.
+
+### Results
+
+Evidence lives in the run folders under `spikes/winshell/results/` (not in git): run 1 `run-20261022T033715Z`, run 2 `run-20261023T032541Z`, run 3 `checks.json` of 2026-10-23 20:46 UTC (moved to `run-20261023T204648Z` by the next run). Each folder's `checks.json` holds the check's `details`; `raw/` holds the core results and the event log.
+
+| Check | Verdict | Evidence |
+|---|---|---|
+| S1.1 crate surface | PASS | run 1: release build exit 0, 0 warnings, with the 29 `windows` features in `spikes/winshell/Cargo.toml` (S1.1 `features`) |
+| S1.2 windowless sender | PASS | run 1: 3 of 3 posted from the detached core, seen to pop by the owner, `Setting()` `Enabled`, each in History. Recorded: with only `HKCU\Software\Classes\AppUserModelId\LILITH.Spike.Notify` and no shortcut, the toast also posted and showed |
+| S1.2p missed toast stays | RECORDED | run 3: both shortcut forms stayed in the centre after the banner |
+| S1.3 protocol activation | PASS | run 3: 6 of 6 exact (owner clicks). Recorded: Edge (run 1) and the Run dialog with and without a trailing `/` (run 3) each delivered one quoted argument, unchanged |
+| S1.4 foreground | PASS | run 3: 5 of 5 with A, 5 of 5 without A, basic recipe (owner clicks) |
+| S1.5 progress toasts | FAIL | run 2: the owner saw a second pop while the toast updated. Run 3: the owner saw the `SuppressPopup` toast pop. Every API result matched the bar in both runs |
+| S1.6 fullscreen poll | PASS | run 2: (a) 15 of 15 `QUNS_ACCEPTS_NOTIFICATIONS`; p50 0.032 ms, p99 0.124 ms over 100 calls; (b) `QUNS_RUNNING_D3D_FULL_SCREEN` from 14 s, 22 polls in a row |
+| S1.7 keep-awake | PASS, without the stay-awake proof | run 2: the owner's elevated `powercfg /requests` listed the request under SYSTEM while held and not after `PowerClearRequest`. Run 3: `PBT_APMSUSPEND` and `PBT_APMRESUMEAUTOMATIC` across one sleep. No Modern Standby. The "awake 5 minutes past the timeout" part was not run (§6) |
+| S1.8 Windows Hello | not decided | run 3: (a), (c), (d), (f) and DPAPI pass; (b) create `Success` but the prompt not in front; (e) `Verified` but not in front by itself. By the bars' letter: passphrase only. The route is left to Task 28 (§7) |
+| S1.9 inside Windows Sandbox | pending | its unattended run (`run-all.ps1`) has not run yet |
+| Cleanup | PASS | runs 2 and 3. Run 1's check reported `pass: false` from a strict-mode bug, though everything was removed |
+
 ## 6. Verdict
 
-To be written after the owner-present runs (Step 3).
+**Part B is answered; S1.9 is pending its run.** S1.1, S1.2, S1.3, S1.4 and S1.6 PASS; S1.2p is recorded; S1.5 FAILs; S1.7 PASSes without its stay-awake proof; S1.8 is not decided. S1.9's verdict is filled in after its unattended run.
+
+**Deviations from the plan.**
+- **S1.3 and S1.4 are judged on the owner's real clicks.** The automation round was to click S1.3's toasts itself, but its UIA search never found them on this PC (§5), so the owner clicked; S1.4's bar always needed the owner's click. Both are settled from run 3 and are not re-run.
+- **S1.7 has no real-sleep proof, by the owner's choice** (round 12: keep-awake is checked through Windows' own reports only). The request was listed while held and gone after the clear (Windows' own report, run 2), and the sleep and wake broadcasts arrived (run 3); the bar's "the PC stays awake 5 minutes past the timeout with no input while the request is held" was not run.
+- **S1.8's route is open.** The key crypto works, but no prompt came to the front by itself (§5); the window-owned API that would fix that is not in `windows 0.62.2` (§7). No route is claimed beyond that evidence.
+- **S1.5's evidence is the owner's eyes,** not a measurement, and the two runs saw different failures on two Windows builds (25H2 and 26H2 pre-release).
+- **S1.9's Qt item grabs the on-screen window only.** Offscreen is not tested: the trimmed deploy ships no `qoffscreen.dll`, and CI's S0.9 covers it. The bar's "both grabs are non-flat" is therefore half-tested here. The watched run and the lock step (host state) are dropped: the run is unattended.
+- **The automation round's own results are not used** for any verdict: owner run 3 is the record.
 
 ## 7. Decision
 
-To be written after the owner-present runs (Step 3).
+**For Task 2 (Appendix G, P4a-R3).** A protocol activation's raw command line is `"<exe>" "<url>"`, the URL one quoted argument, unchanged, from a toast's body and button, from Edge and from the Run dialog, the trailing `/` kept and the base64url intact. The grammar needs no change. The AUMID shortcut persists a missed toast in the centre with or without `ToastActivatorCLSID` (S1.2p, on 26H2), so the CLSID is not needed for that.
+
+**For Task 5 (toasts and the `windows` features).**
+- The feature list is the 29 features in `spikes/winshell/Cargo.toml` (S1.1).
+- A windowless, detached process posts toasts under a per-user shortcut's AUMID (S1.2).
+- **Progress toasts re-pop (S1.5 FAIL).** The bar's FAIL path applies: progress toasts are left out of plan 4a, the `job_progress` category stays, off, with no toasts, and the owner hears before Task 2. If the owner wants progress toasts later, one option is posting them with `SuppressPopup = true` and popping only the completion replacement, but run 3's owner saw a `SuppressPopup` toast pop on 26H2, so that option is unproven too.
+- `SHQueryUserNotificationState` reports `QUNS_RUNNING_D3D_FULL_SCREEN` (then `QUNS_BUSY`) for a fullscreen Direct3D program, in well under 1 ms (S1.6); fullscreen auto-pause and the quiet mode can use it.
+- Keep-awake: `PowerSetRequest(PowerRequestSystemRequired)` on a `PowerCreateRequest` object with a reason string (S1.7), from the detached core; `WM_POWERBROADCAST` arrives across a sleep, so ARCH-127's sleep-gap record can use it (the clock-jump fallback stays as a backstop). Not proven: that the request keeps the PC awake past its timeout.
+
+**For Task 28 (Windows Hello).** The KEK route's crypto works on this PC: create, 10 identical signatures across two processes, delete, TPM 2.0 (S1.8). What fails is the prompt's placement: neither the create prompt nor the consent prompt came to the front by itself. The owner's requirement (round 12) is that the prompt "comes to the front on all applications", with the passphrase as the fallback when it can't.
+- The KEK route needs the window-owned calls: `KeyCredentialManager.RequestCreateForWindowAsync(WindowId, name, option)` and `KeyCredential.RequestSignForWindowAsync(WindowId, data)` (learn.microsoft.com/uwp/api/windows.security.credentials.keycredentialmanager.requestcreateforwindowasync and …keycredential.requestsignforwindowasync, winrt-28000). They are not in `windows 0.62.2`, so they need bindings generated from newer metadata (`windows-bindgen`) or a raw COM binding.
+- The DPAPI-with-gate route's prompt is owned through `IUserConsentVerifierInterop::RequestVerificationForWindowAsync(HWND, …)` (learn.microsoft.com/windows/win32/api/userconsentverifierinterop/nf-userconsentverifierinterop-iuserconsentverifierinterop-requestverificationforwindowasync), which is in the crate; run 3 passed it the console window, which was not in front.
+- Proving that the prompt comes to the front of every application, a fullscreen one included, is Task 28's. This spike proves only that it did not come forward when owned by a window that was not in front.
+
+**For Task 30 (the desktop test runner).** Pending S1.9's run: which items work inside Windows Sandbox unattended, and how long a run takes. Already known: the Sandbox's Qt item must have its platform plugin in the deploy, or Qt blocks on a modal box; the offscreen platform is not in the trimmed deploy; and on this PC the harness's UIA search did not find toasts (§5), so toast tests should read History and the toast's own events rather than UIA.
 
 ## 8. Follow-ups
 
-To be written after the owner-present runs (Step 3).
+- **S1.9:** the coordinator runs `pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Task0Repo "<Task 0's worktree>"` and fills in its verdict (§5, §6, §7 for Task 30).
+- **S1.5:** the owner hears the FAIL before Task 2 (the bar's FAIL path).
+- **S1.8:** to Task 28: bind the `*ForWindowAsync` calls, own the prompt by a window that is in front, and prove placement against other apps, a fullscreen one included; else the passphrase.
+- **S1.7:** the stay-awake proof was not run; if a later task needs it, it needs the owner's consent to a long unattended wait.
+- **UIA and toasts:** why the harness's search missed every toast on 26H2 is unconfirmed; a tree listing taken while a banner is up would settle it.
+- **S1.4 for Task 30:** no synthetic click was ever made on a toast, so whether a runner can stand in for the owner's click is unknown.
+- **Builds:** runs 1 and 2 ran on 25H2 (10.0.26200), run 3 on a 26H2 pre-release (10.0.26300); a result belongs to its build.

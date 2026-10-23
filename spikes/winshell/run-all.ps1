@@ -1,26 +1,22 @@
 #requires -Version 7
 <#
 .SYNOPSIS
-Spike 11 (plan 4a Task 1): the one command that runs the whole spike, unattended (owner run 3,
-owner q1/q2: tests may run on the PC at any time and need no one present).
+Spike 11 (plan 4a Task 1): runs S1.9, the desktop checks inside Windows Sandbox, unattended.
 
 .DESCRIPTION
-One command, no owner input. It runs, in order:
-  1. Part B on the host desktop (run-spike.ps1 -Only <the host checks>): the toast, activation,
-     foreground, progress-toast, keep-awake and Windows Hello checks. Each check decides itself
-     (uia.ps1 / the toasts' own events / the Hello prompt placement probe); none asks a question.
-     Toasts may pop and the Hello prompt may appear; a hands-off pop-up still warns before any
-     stretch that moves the mouse or presses keys, and nothing acts on the owner's own windows.
-  2. Part C in Windows Sandbox (run-sandbox.ps1 -Runs 3): the desktop checks inside the Sandbox,
-     3 runs of 3. No watched run and no lock step.
+Scope cut (coordinator's ruling, 2026-10-23): Part B (S1.1 to S1.8) is answered by the owner's
+three recorded runs and is not re-run, so by default this runs only Part C:
+run-sandbox.ps1 -Runs 3 -KeepAwake. It asks nothing, every wait in it is bounded, and it cleans
+up on every exit path. It touches nothing on the host desktop beyond starting the Sandbox window
+(and holding a parent-watched keep-awake for the runs).
 
-It prints each check's verdict at the end. Ctrl+C stops it and still cleans up. The owner is
-involved only if a check is genuinely undecidable, and then only through a short pop-up prompt
-(owner q2); as designed, the whole run needs none.
+-PartB adds the old host Part B stage (run-spike.ps1). That code asks the owner questions and
+is kept only for reference: never pass -PartB to an unattended run.
 
 .PARAMETER Only
-The checks to run, for reruns: S1.1 to S1.8 are Part B, S1.9 is Part C. The default is what is
-still open after the earlier runs: S1.2p,S1.3,S1.4,S1.5,S1.7,S1.8,S1.9.
+The checks to run: S1.9 by default. Part B names (S1.1 to S1.8) are accepted only with -PartB.
+.PARAMETER PartB
+Also runs the host Part B stage (owner-present, interactive; not used by the spike any more).
 .PARAMETER Task0Repo
 The folder of Task 0's worktree, where its deploy folder was built (or set LILITH_TASK0_REPO).
 .PARAMETER DeployDir
@@ -39,6 +35,7 @@ param(
     [string]$Task0Repo = '',
     [string]$DeployDir = '',
     [int]$Runs = 3,
+    [switch]$PartB,
     [switch]$DryRun,
     [switch]$Simulate
 )
@@ -47,9 +44,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $Spike = $PSScriptRoot
-$PartB = @('S1.1', 'S1.2', 'S1.2p', 'S1.3', 'S1.4', 'S1.5', 'S1.6', 'S1.7', 'S1.8')
-$Known = $PartB + @('S1.9')
-$Default = @('S1.2p', 'S1.3', 'S1.4', 'S1.5', 'S1.7', 'S1.8', 'S1.9')
+$PartBChecks = @('S1.1', 'S1.2', 'S1.2p', 'S1.3', 'S1.4', 'S1.5', 'S1.6', 'S1.7', 'S1.8')
+$Known = $PartBChecks + @('S1.9')
+# The default is S1.9 alone (scope cut); with -PartB, the Part B checks the owner runs left open.
+$Default = $(if ($PartB) { @('S1.2p', 'S1.3', 'S1.4', 'S1.5', 'S1.7', 'S1.8', 'S1.9') } else { @('S1.9') })
 
 # `pwsh -File` hands a comma list over as one string (as in run-spike.ps1).
 $Only = @($Only | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
@@ -58,7 +56,10 @@ $unknown = @($Only | Where-Object { $_ -notin $Known })
 if ($unknown.Count -gt 0) { throw "Unknown check name in -Only: $($unknown -join ', '). The names are: $($Known -join ', '). Nothing was done." }
 $givenOnly = $Only.Count -gt 0
 if (-not $givenOnly) { $Only = $Default }
-$b = @($PartB | Where-Object { $_ -in $Only })
+$b = @($PartBChecks | Where-Object { $_ -in $Only })
+if ($b.Count -gt 0 -and -not $PartB) {
+    throw "Part B checks ($($b -join ', ')) run only with -PartB: they are answered by the owner's recorded runs, and their code asks the owner. Nothing was done."
+}
 $withSandbox = 'S1.9' -in $Only
 
 $sandboxArgs = @()
@@ -102,10 +103,10 @@ if ($withSandbox) {
 }
 
 Write-Host ''
-Say 'Spike 11, the whole run (unattended). Nobody need be at the PC.' 'Yellow'
+Say 'Spike 11, S1.9 in Windows Sandbox (unattended). Nobody need be at the PC.' 'Yellow'
 Say ('  Stages: ' + (@($stages | ForEach-Object { $_.name }) -join ' then '))
-Say '  Toasts may pop and a Windows Hello prompt may appear and close by itself. A hands-off pop-up warns before'
-Say '  any stretch that moves the mouse or presses keys. Ctrl+C stops at any time and still cleans up.'
+Say '  A Windows Sandbox window opens and closes by itself 3 times. Nothing else on this desktop is touched.'
+Say '  Ctrl+C stops at any time and still cleans up.'
 Write-Host ''
 
 $started = Get-Date

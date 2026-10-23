@@ -1,13 +1,13 @@
-//! Fix round 4 (coordinator's ruling): run-all.ps1's attended and unattended blocks end to end
+//! run-all.ps1's default run (S1.9 in the Sandbox, after the 2026-10-23 scope cut) end to end
 //! under the scripts' own strict mode, with every Windows call faked (tests/simulate.ps1,
-//! tests/sim-fakes.ps1). Nothing on this PC is touched; the only real processes are the fakes'
-//! windowless pings. Needs PowerShell 7 (`pwsh`); takes about 30 s.
+//! tests/sim-fakes.ps1): the Qt step runs, nothing prompts. Nothing on this PC is touched; the
+//! only real processes are the fakes' windowless pings. Needs PowerShell 7 (`pwsh`).
 
 use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn both_blocks_run_end_to_end_under_strict_mode_with_fakes() {
+fn the_default_run_goes_end_to_end_under_strict_mode_with_fakes() {
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("simulate.ps1");

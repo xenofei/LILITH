@@ -991,6 +991,48 @@ function Get-KeepAwakeAdvice([string]$State) {
      "Optional: powercfg /requests in a terminal opened with 'Run as administrator' names the program (it only reads).")
 }
 
+# ---------------------------------------------------------------- the Sandbox Qt item
+
+# S1.9's Qt item (scope cut, 2026-10-23): the on-screen grab only, with QT_QPA_PLATFORM unset
+# (the default 'windows' plugin). The app is launched only when $Deploy\platforms\qwindows.dll is
+# there, because Qt 6.12 shows a modal "no Qt platform plugin could be initialized" box when the
+# plugin can't load (owner run 3's Sandbox dialog); a missing plugin is recorded, never launched.
+# The offscreen grab is not tested here: Task 0's trimmed deploy ships no qoffscreen.dll, and CI's
+# S0.9 covers offscreen. $Launch is called with the exe path and returns {hwnd, class, nonflat,
+# exit, stderr, ...}; a main window of class #32770 is a dialog (an error box), recorded as one
+# and never judged a grab. Returns the qt.json record, with pass = the on-screen grab is
+# non-flat. Pure but for the plugin probes and $Launch; tested (tests/strict-results.ps1) and run
+# by the simulation with a fake launcher.
+function Invoke-QtItem([string]$Deploy, [string]$QtExe, [scriptblock]$Launch) {
+    $platforms = Join-Path $Deploy 'platforms'
+    $plugins = @(if (Test-Path -LiteralPath $platforms) { Get-ChildItem -LiteralPath $platforms -Filter '*.dll' -File | ForEach-Object { $_.Name } })
+    $exe = Join-Path $Deploy $QtExe
+    $offReason = $(if ($plugins -contains 'qoffscreen.dll') { 'offscreen not tested in the Sandbox: CI''s S0.9 covers offscreen' }
+                   else { 'offscreen not tested: the trimmed deploy ships no qoffscreen.dll; CI''s S0.9 covers offscreen' })
+    $off = [ordered]@{ tested = $false; reason = $offReason }
+    if ($plugins -notcontains 'qwindows.dll') {
+        $on = [ordered]@{ available = $false; launched = $false; nonflat = $false; reason = 'platforms\qwindows.dll is not in the deploy folder: the app was not started (Qt would show a modal error box)' }
+    } elseif (-not (Test-Path -LiteralPath $exe)) {
+        $on = [ordered]@{ available = $true; launched = $false; nonflat = $false; reason = "the app is not in the deploy folder: $QtExe" }
+    } else {
+        $l = & $Launch $exe
+        $on = [ordered]@{ available = $true; launched = $true }
+        foreach ($k in @($l.Keys)) { $on[$k] = $l[$k] }
+        if ("$($on['class'])" -eq '#32770') {
+            $on.error_dialog = $true
+            $on.nonflat = $false
+            $on.reason = 'the app''s main window was a dialog (#32770), most likely a start error; it was ended'
+        }
+    }
+    [ordered]@{
+        exe = $exe; platform_plugins = $plugins; qt_qpa_platform = '(unset: the default windows plugin)'
+        onscreen = $on; offscreen = $off
+        rhi_backend = $on['backend']
+        bar = 'on-screen grab only'
+        pass = ([bool]$on['launched'] -and [bool]$on['nonflat'])
+    }
+}
+
 # ---------------------------------------------------------------- the Sandbox runs' timeline (pure)
 
 # Whether the PC slept between $FromMs and $ToMs (unix ms), from the host core's events (a

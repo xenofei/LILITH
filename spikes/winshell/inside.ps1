@@ -11,11 +11,10 @@ C:\lil\out (writable) receives started.json at once, one JSON file per item, and
 then the Sandbox shuts itself down.
 
 With -Items a,b -Suffix x it runs only those items and names their files <item>-x.json: the
-de-elevated relaunch uses that (-Suffix limited). With config.observe it writes round-1.json
-after the first round, then runs the toast, foreground and Qt items twice more (-r2, -r3), each
-after the host writes go-2.flag (the Sandbox window covered) / go-3.flag (the host locked) into
-C:\lil\out. The toast item also detects its own popup with UI Automation (uia.ps1, beside this
-script in the bundle); that is recorded, not judged.
+de-elevated relaunch uses that (-Suffix limited). The toast item also looks for its own popup
+with UI Automation (uia.ps1, beside this script in the bundle); that is recorded, not judged.
+It runs unattended: no prompt, and every wait has a time limit. The Qt item grabs the on-screen
+window only (Invoke-QtItem in uia.ps1); the offscreen grab is CI's S0.9.
 
 It refuses to run anywhere but inside Windows Sandbox (it writes HKCU keys and ends with
 shutdown /s /t 0): the user must be WDAGUtilityAccount, the Sandbox's account, and the
@@ -135,12 +134,13 @@ $Config = Get-Content -Raw (Join-Path $In 'config.json') | ConvertFrom-Json
 Add-Type -Namespace Spike -Name Native -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);
 [DllImport("user32.dll")] public static extern bool GetWindowRect(System.IntPtr hwnd, out RECT rect);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(System.IntPtr hwnd, System.Text.StringBuilder name, int count);
 [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
 '@
 [void][Spike.Native]::SetErrorMode(0x0001 -bor 0x0002)   # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
 
 if ($RunSuffix -eq '') {
-    Write-Result 'started' @{ at = Now; ps = $PSVersionTable.PSVersion.ToString(); run = $Config.run; observe = $Config.observe }
+    Write-Result 'started' @{ at = Now; ps = $PSVersionTable.PSVersion.ToString(); run = $Config.run }
 }
 
 # Explorer and the notification platform come up with the logon; give them a moment.
@@ -376,33 +376,56 @@ function Get-Backend([string]$Text) {
     if ($m.Success) { $m.Groups[1].Value } else { $null }
 }
 
-# The Qt platform plugin a launch needs, by name (owner run 3 analysis: Task 0's trimmed deploy
-# ships only platforms\qwindows.dll; an offscreen launch with no qoffscreen.dll made Qt 6.12 show
-# a modal "no Qt platform plugin could be initialized" box and block the unattended run). Qt shows
-# that box when the build is release and no console is attached, whatever QT_FORCE_STDERR_LOGGING
-# is (qguiapplication.cpp init_platform: MessageBox when !isDebugBuild() && !GetConsoleWindow()).
-# So the plugin DLL is checked before the launch: a missing one is recorded and the app is never
-# started, and QT_QPA_PLATFORM is set only for a plugin that is present.
-function Get-QtPlatformDll([string]$Deploy, [string]$Platform) {
-    Join-Path $Deploy "platforms\q$Platform.dll"
-}
-
-# Starts the Qt app with QT_QPA_PLATFORM = $Platform ('' leaves it unset, the default 'windows').
-# QT_FORCE_STDERR_LOGGING = 1 keeps non-fatal Qt logging off the debug channel and on stderr.
-function Start-Qt([string]$Exe, [string]$Arguments, [string]$Name, [string]$Platform) {
+# The Qt item (scope cut, 2026-10-23): the on-screen grab only. The plugin decision and the
+# record are Invoke-QtItem's (uia.ps1, tested and run by the simulation); this is only the real
+# launcher. Qt 6.12 shows a modal "no Qt platform plugin could be initialized" box when the build
+# is release and no console is attached (qguiapplication.cpp init_platform), whatever
+# QT_FORCE_STDERR_LOGGING says, so Invoke-QtItem never launches without platforms\qwindows.dll,
+# QT_QPA_PLATFORM is left unset (the default 'windows' plugin), and a window that turns out to be
+# a dialog (#32770) is recorded as one, never judged a grab. Every wait is bounded: 10 s, then the
+# app is ended through its pinned object.
+function Start-QtOnScreen([string]$Exe, [string]$Name) {
     $err = Join-Path $Work "$Name-stderr.txt"
     $env:QSG_INFO = '1'
     $env:QT_FORCE_STDERR_LOGGING = '1'
-    if ($Platform) { $env:QT_QPA_PLATFORM = $Platform }
+    $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $err -RedirectStandardOutput (Join-Path $Work "$Name-stdout.txt")
+    # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no handle
+    # until .Handle is read (fix round 4, m3).
+    [void]$p.Handle
+    $rec = [ordered]@{ hwnd = 0; class = $null; nonflat = $false; exit = $null; stderr = ''; png = $null }
     try {
-        $sp = @{ FilePath = $Exe; PassThru = $true; RedirectStandardError = $err; RedirectStandardOutput = (Join-Path $Work "$Name-stdout.txt") }
-        if ($Arguments) { $sp.ArgumentList = $Arguments }
-        $p = Start-Process @sp
-        # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no handle
-        # until .Handle is read (fix round 4, m3).
-        [void]$p.Handle
-    } finally { if ($Platform) { Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue } }
-    [pscustomobject]@{ Process = $p; Stderr = $err }
+        Start-Sleep -Seconds 10
+        $p.Refresh()
+        $hwnd = $p.MainWindowHandle
+        $rec.hwnd = [int64]$hwnd
+        if ($hwnd -ne [IntPtr]::Zero) {
+            $cls = New-Object System.Text.StringBuilder 256
+            [void][Spike.Native]::GetClassNameW($hwnd, $cls, 256)
+            $rec.class = "$cls"
+            $rect = New-Object Spike.Native+RECT
+            if ($rec.class -ne '#32770' -and [Spike.Native]::GetWindowRect($hwnd, [ref]$rect)) {
+                Add-Type -AssemblyName System.Drawing
+                $onPng = Join-Path $Work "$Name-onscreen.png"
+                $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
+                $bmp = New-Object System.Drawing.Bitmap $w, $h
+                $g = [System.Drawing.Graphics]::FromImage($bmp)
+                $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+                $bmp.Save($onPng, [System.Drawing.Imaging.ImageFormat]::Png)
+                $g.Dispose(); $bmp.Dispose()
+                $stats = Get-GrabStats $onPng
+                $rec.nonflat = [bool]$stats.nonflat
+                $rec.png = $onPng
+                $rec.stats = $stats
+            }
+        }
+    } finally {
+        Stop-PinnedProcess $p   # pinned above
+        [void]$p.WaitForExit(5000)
+        $rec.exit = $(if ($p.HasExited) { $p.ExitCode } else { 'still running' })
+        $rec.stderr = $(if (Test-Path $err) { Get-Content -Raw $err } else { '' })
+        $rec.backend = Get-Backend "$($rec.stderr)"
+    }
+    $rec
 }
 
 function Item-Qt([string]$Name) {
@@ -411,72 +434,9 @@ function Item-Qt([string]$Name) {
         Write-Result $Name ([ordered]@{ pass = $false; error = "deploy folder not mapped: $deploy" })
         return
     }
-    $exe = Join-Path $deploy $Config.qt_exe
-    $platforms = Join-Path $deploy 'platforms'
-    $hasWindows = Test-Path -LiteralPath (Get-QtPlatformDll $deploy 'windows')
-    $hasOffscreen = Test-Path -LiteralPath (Get-QtPlatformDll $deploy 'offscreen')
-    $plugins = @(if (Test-Path -LiteralPath $platforms) { Get-ChildItem -LiteralPath $platforms -Filter *.dll -File | ForEach-Object { $_.Name } })
-
-    # Offscreen (QT_QPA_PLATFORM=offscreen): only when qoffscreen.dll is in the deploy; otherwise
-    # recorded as not shipped, and never launched (so no modal error).
-    $offPng = Join-Path $Work "$Name-offscreen.png"
-    $offErr = ''
-    if ($hasOffscreen) {
-        Remove-Item $offPng -ErrorAction SilentlyContinue
-        $q = Start-Qt $exe ($Config.qt_grab_args -replace '\{png\}', $offPng) "$Name-offscreen" 'offscreen'
-        if (-not $q.Process.WaitForExit(60000)) { Stop-PinnedProcess $q.Process }   # pinned in Start-Qt
-        $offErr = $(if (Test-Path $q.Stderr) { Get-Content -Raw $q.Stderr } else { '' })
-        $off = Get-GrabStats $offPng
-        $off.available = $true
-        $off.exit = $(if ($q.Process.HasExited) { $q.Process.ExitCode } else { 'killed' })
-        $off.backend = Get-Backend $offErr
-    } else {
-        $off = [ordered]@{ available = $false; nonflat = $false; reason = 'qoffscreen.dll not in the deploy folder''s platforms\; offscreen grab not tested' }
-    }
-
-    # On the Sandbox's own screen: a visible window (the default 'windows' plugin), captured with
-    # CopyFromScreen. Only when qwindows.dll is present; otherwise recorded, never launched.
-    $onPng = Join-Path $Work "$Name-onscreen.png"
-    $onErr = ''
-    if ($hasWindows) {
-        $q2 = Start-Qt $exe '' "$Name-onscreen" ''
-        Start-Sleep -Seconds 10
-        $q2.Process.Refresh()
-        $hwnd = $q2.Process.MainWindowHandle
-        $rect = New-Object Spike.Native+RECT
-        $on = [ordered]@{ available = $true; hwnd = [int64]$hwnd }
-        if ($hwnd -ne [IntPtr]::Zero -and [Spike.Native]::GetWindowRect($hwnd, [ref]$rect)) {
-            Add-Type -AssemblyName System.Drawing
-            $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
-            $bmp = New-Object System.Drawing.Bitmap $w, $h
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
-            $bmp.Save($onPng, [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $bmp.Dispose()
-            $on = Get-GrabStats $onPng
-            $on.available = $true
-            $on.hwnd = [int64]$hwnd
-        } else {
-            $on.nonflat = $false
-            $on.error = 'no main window'
-        }
-        Stop-PinnedProcess $q2.Process   # pinned in Start-Qt
-        Start-Sleep -Seconds 1
-        $onErr = $(if (Test-Path $q2.Stderr) { Get-Content -Raw $q2.Stderr } else { '' })
-        $on.backend = Get-Backend $onErr
-    } else {
-        $on = [ordered]@{ available = $false; nonflat = $false; reason = 'qwindows.dll not in the deploy folder''s platforms\; on-screen grab not tested' }
-    }
-
-    foreach ($png in $offPng, $onPng) { if (Test-Path $png) { Copy-Item $png $Out -Force } }
-    # The bar is the on-screen grab (the Sandbox has its own screen); offscreen counts when its
-    # plugin ships. A platform plugin that is absent is recorded, never a dialog.
-    Write-Result $Name ([ordered]@{
-        exe = $exe; platform_plugins = $plugins; offscreen = $off; onscreen = $on
-        rhi_backend = $(if ($on.backend) { $on.backend } else { $off.backend })
-        stderr_offscreen = $offErr; stderr_onscreen = $onErr
-        pass = ([bool]$on.available -and [bool]$on.nonflat -and ($off.available -eq $false -or [bool]$off.nonflat))
-    })
+    $rec = Invoke-QtItem $deploy $Config.qt_exe { param($exe) Start-QtOnScreen $exe $Name }
+    if ($rec.onscreen['png'] -and (Test-Path $rec.onscreen['png'])) { Copy-Item $rec.onscreen['png'] $Out -Force }
+    Write-Result $Name $rec
 }
 
 function Run-Items([string[]]$List, [string]$Sfx) {
@@ -500,18 +460,6 @@ function Run-Items([string[]]$List, [string]$Sfx) {
 }
 
 Run-Items $Items $RunSuffix
-
-if ($RunSuffix -eq '' -and $Config.observe) {
-    # Host-state observation: round-1.json tells the host round 1 is done; the host then writes
-    # go-2.flag (the Sandbox window covered), then go-3.flag (once it has seen the host locked).
-    Write-Result 'round-1' @{ at = Now }
-    foreach ($round in 2, 3) {
-        if (Wait-File (Join-Path $Out "go-$round.flag") 1200) {
-            Run-Items @('toast', 'foreground', 'qt') "-r$round"
-            Write-Result "round-$round" @{ at = Now }
-        }
-    }
-}
 
 $doneName = "done$RunSuffix"
 Write-Result $doneName ([ordered]@{ at = Now; items = $Items; seconds = [int]((Get-Date) - $T0).TotalSeconds })

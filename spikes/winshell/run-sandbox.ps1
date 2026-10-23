@@ -10,16 +10,17 @@ Needs the Windows Sandbox feature on (OWNER-STEPS.md) and Task 0's deploy folder
   - the bundle read-only at C:\lil\in,
   - a copy of the deploy folder read-only at its own host path,
   - an empty results folder writable at C:\lil\out,
-starts the Sandbox, waits for started.json (120 s) and done.json, makes sure the Sandbox has
-closed, and judges every item from the files inside.ps1 wrote. Nothing is written outside
-spikes/winshell/build and spikes/winshell/results on the host.
+starts the Sandbox, waits for started.json (120 s) and done.json (600 s), makes sure the Sandbox
+has closed, and judges every item from the files inside.ps1 wrote. Nothing is written outside
+spikes/winshell/build and spikes/winshell/results on the host, except the Sandbox's own start and
+the optional keep-awake (-KeepAwake).
+
+It runs unattended (scope cut, 2026-10-23): no prompt, no watched run, no lock step, every wait
+bounded, cleanup in a finally on every exit path. Qt: the on-screen grab only. The offscreen grab
+is not tested here: Task 0's trimmed deploy ships no qoffscreen.dll, and CI's S0.9 covers it.
 
 .PARAMETER Runs
 How many runs (the bar is 3 of 3).
-.PARAMETER Observe
-The host-state observation (one run, owner present): the toast, foreground and Qt items run
-again with the Sandbox window covered by another window (the script places one of its own over
-it), then with the host locked (the owner presses Win+L; the script sees the lock itself).
 .PARAMETER DeployDir
 Task 0's deploy folder. When not given: -Task0Repo's spikes\app-shell\build\deploy, else the
 environment variable LILITH_TASK0_REPO's, else this worktree's own. If none exists, the script
@@ -29,13 +30,9 @@ The worktree (or checkout) where Task 0 built its deploy folder.
 .PARAMETER QtExe
 The spike app's exe, relative to DeployDir; empty = app_shell_spike.exe when present, else the
 one .exe in it.
-.PARAMETER QtGrabArgs
-The arguments that make the spike app grab its window offscreen to {png} and exit (Task 0's
-app: --screenshot grabs only just before an automatic quit, so --quit-after is needed).
 .PARAMETER KeepAwake
 Holds a keep-awake for the whole run: the spike core's PowerSetRequest(PowerRequestSystemRequired),
-watching this script's process (--parent-pid), released in the finally (run-all's unattended block,
-which comes right after the stay-awake wait has left the PC past its idle timeout; review N-I1).
+watching this script's process (--parent-pid), released in the finally (run-all.ps1 passes it).
 Without it the same core runs with --api none and only listens for sleep. Either way a run during
 which the PC slept (a suspend broadcast, a clock jump, or a Kernel-Power sleep entry in the run's
 time) is recorded as interrupted by sleep, never as a FAIL.
@@ -49,11 +46,9 @@ to the folder that test made (WINSHELL_SIM_DIR).
 #>
 param(
     [int]$Runs = 3,
-    [switch]$Observe,
     [string]$DeployDir = '',
     [string]$Task0Repo = '',
     [string]$QtExe = '',
-    [string]$QtGrabArgs = '--screenshot {png} --quit-after 5000 --no-activate',
     [switch]$SkipBuild,
     [switch]$Preflight,
     [switch]$KeepAwake,
@@ -72,9 +67,8 @@ $ToolExe = Join-Path $Bin 'winshell-tool.exe'
 $Build = Join-Path $Spike 'build\sandbox'
 $ResultsRoot = Join-Path $Spike 'results'
 $RunLimitSec = 600
-# The blocker window the observation places over the Sandbox window: started by this script and
-# ended only through its own Process object (Start-Process -PassThru, its handle held).
-$script:BlockerProcess = $null
+# What S1.9's Qt bar means in this harness (scope cut): recorded in the summary.
+$QtBarNote = 'on-screen grab only; offscreen not tested: the trimmed deploy ships no qoffscreen.dll; CI''s S0.9 covers offscreen'
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 function Beep([int]$Frequency, [int]$Ms) { [console]::Beep($Frequency, $Ms) }
@@ -137,19 +131,6 @@ function Get-DeploySuggestions([string]$OwnRepo) {
         }
     } catch { }
     @($out)
-}
-
-# A qoffscreen.dll to add to the deploy copy, so the Sandbox can test the offscreen grab. Looked
-# for near the deploy (a sibling of qwindows.dll in its platforms\), then next to a qmake on PATH
-# (a Qt install), then under a QTDIR. No hardcoded path, and nothing is guessed: $null when none
-# is found. Pure but for the file probes.
-function Find-QOffscreen([string]$DeployDir) {
-    $cands = @()
-    $cands += (Join-Path $DeployDir 'platforms\qoffscreen.dll')
-    $qmake = Get-Command qmake -ErrorAction SilentlyContinue
-    if ($qmake) { $cands += (Join-Path (Split-Path (Split-Path $qmake.Source)) 'plugins\platforms\qoffscreen.dll') }
-    if ($env:QTDIR) { $cands += (Join-Path $env:QTDIR 'plugins\platforms\qoffscreen.dll') }
-    @($cands | Where-Object { Test-Path -LiteralPath $_ })
 }
 
 # The spike app's exe in the deploy folder: -QtExe, else app_shell_spike.exe, else the only exe.
@@ -356,8 +337,8 @@ function New-Bundle([string]$Dir, [string]$TestExe, [string[]]$Dlls, [int]$Run, 
     foreach ($d in $Dlls) { Copy-Item $d (Join-Path $Dir 'bin'); Copy-Item $d (Join-Path $Dir 'vcrt') }
     Copy-Item $TestExe (Join-Path $Dir 'rusttest\winshell-tests.exe')
     [ordered]@{
-        run = $Run; observe = [bool]$Observe
-        deploy_dir = $DeploySandboxPath; qt_exe = $Exe; qt_grab_args = $QtGrabArgs
+        run = $Run
+        deploy_dir = $DeploySandboxPath; qt_exe = $Exe
     } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $Dir 'config.json')
 }
 
@@ -382,7 +363,8 @@ $Judges = [ordered]@{
     foreground = { param($d) (P $d 'precondition_met') -eq $true -and $null -ne (P $d 'a_pid') -and (P $d 'foreground_pid_after_handoff') -eq (P $d 'a_pid') }
     power      = { param($d) (P $d 'listed') -eq $true }
     rust       = { param($d) $e = P $d 'exit_with_dlls'; $e -is [ValueType] -and $e -eq 0 }
-    qt         = { param($d) $on = P $d 'onscreen'; $off = P $d 'offscreen'; (P $on 'available') -eq $true -and (P $on 'nonflat') -eq $true -and ((P $off 'available') -eq $false -or (P $off 'nonflat') -eq $true) }
+    # On-screen grab only (scope cut): the offscreen grab is CI's S0.9, recorded as not tested.
+    qt         = { param($d) $on = P $d 'onscreen'; (P $on 'launched') -eq $true -and (P $on 'nonflat') -eq $true }
 }
 
 function Judge-Run([string]$Res, [string]$Sfx = '') {
@@ -472,97 +454,6 @@ function Get-RunSleep([long]$FromMs, [long]$ToMs) {
     Get-SleepInWindow @(P $doc 'events') $kernel $FromMs $ToMs
 }
 
-# ---------------------------------------------------------------- the host-state observation
-
-function Wait-ResultFile([string]$Path, [int]$TimeoutSec) {
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) { if (Test-Path -LiteralPath $Path) { return $true }; Start-Sleep -Seconds 2 }
-    $false
-}
-
-# The blocker this script started, ended through its own Process object (never a bare pid that
-# could have been reused).
-function Stop-Blocker {
-    $p = $script:BlockerProcess
-    $script:BlockerProcess = $null
-    Stop-PinnedProcess $p   # a Start-Process -PassThru object: it holds the handle from the start
-}
-
-# Round 2's host state: one of the spike's own windows (a blocker) placed over the Sandbox
-# window and clicked to the front by the script; UIA then checks the Sandbox window's centre is
-# covered. The blocker logs into build\sandbox, not the user's profile.
-function Cover-SandboxWindow($Started) {
-    $rec = [ordered]@{ method = 'a spike blocker window placed over the Sandbox window (SetWindowPos), clicked to the front (synthetic)'; covered = $false }
-    if (-not (Initialize-SpikeUi)) { $rec.why = "UI Automation not available: $($script:Uia.error)"; return $rec }
-    $own = @(Get-OwnPids $Started) + @($Started.own_pids) | Sort-Object -Unique
-    $win = @(Get-UiaTop | Where-Object { $_.Current.ProcessId -in $own }) | Select-Object -First 1
-    if ($null -eq $win) { $rec.why = 'no visible window of the Sandbox this run started'; return $rec }
-    $sb = Get-TopInfo $win
-    $r = $win.Current.BoundingRectangle
-    $rec.sandbox_window = [ordered]@{ process = $sb.process; class = $sb.class }
-    $env:WINSHELL_LOG_DIR = Join-Path $Build 'host-blocker-log'
-    try { $p = Start-Process -FilePath (Join-Path $Bin 'winshell-app.exe') -ArgumentList '--blocker', '--exit-after-secs', '1200' -PassThru }
-    finally { Remove-Item Env:\WINSHELL_LOG_DIR -ErrorAction SilentlyContinue }
-    [void]$p.Handle
-    $script:BlockerProcess = $p
-    $bw = $null
-    for ($i = 0; $i -lt 40 -and $null -eq $bw; $i++) {
-        Start-Sleep -Milliseconds 250
-        $bw = @(Get-UiaTop | Where-Object { $_.Current.ProcessId -eq $p.Id }) | Select-Object -First 1
-    }
-    if ($null -eq $bw) { $rec.why = 'the blocker window did not appear'; return $rec }
-    $bh = [int64]$bw.Current.NativeWindowHandle
-    $rec.placed = [SpikeUi.Win]::Place($bh, [int]$r.X - 20, [int]$r.Y - 20, [int]$r.Width + 40, [int]$r.Height + 40)
-    Start-Sleep -Milliseconds 500
-    $rec.click = Click-WindowVisible $bh
-    Start-Sleep -Milliseconds 500
-    $cx = [int]($r.X + $r.Width / 2); $cy = [int]($r.Y + $r.Height / 2)
-    $rec.covered = (Get-TopAtPoint $cx $cy) -eq $bh
-    $fg = Get-ForegroundNow
-    $rec.blocker_in_front = ($null -ne $fg -and $fg.pid -eq $p.Id)
-    $rec
-}
-
-# The observation: no question asked. Round 1 runs uncovered (inside.ps1 detects its own toast
-# popup by UIA); round 2 with the Sandbox window covered; round 3 with the host locked, which
-# the owner does (Win+L) and the script detects (WTS session flags).
-function Invoke-Observation([string]$Res, $Started) {
-    $obs = [ordered]@{}
-    $obs.round1_done = Wait-ResultFile (Join-Path $Res 'round-1.json') 900
-    # Hands off while the cover is placed and round 2 runs behind it (owner direction: a pop-up).
-    $handsOff = Start-HandsOff 'places one of its windows over the Sandbox window and keeps it there for round 2 (the mouse moves once)' 300
-    try {
-    $obs.round2_cover = Cover-SandboxWindow $Started
-    Say ("Round 2: the Sandbox window is {0}." -f $(if ($obs.round2_cover.covered) { 'covered by a spike window' } else { "not covered ($(P $obs.round2_cover 'why'))" }))
-    New-Item -ItemType File -Force -Path (Join-Path $Res 'go-2.flag') | Out-Null
-    $obs.round2_done = Wait-ResultFile (Join-Path $Res 'round-2.json') 600
-    } finally { Stop-HandsOff $handsOff; Stop-Blocker }
-
-    Beep 880 300
-    Say 'YOUR TURN: lock the PC now (Win+L). Stay locked until you hear two beeps (about 4 minutes), then sign in again. The script sees the lock and the sign-in by itself.' 'Yellow'
-    $lock = [ordered]@{ method = 'WTSQuerySessionInformation(WTSSessionInfoEx) SessionFlags, every 2 s'; locked_after_s = $null; locked_throughout = $null; unlocked_after_s = $null }
-    $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalSeconds -lt 300 -and (Get-SessionLocked) -ne $true) { Start-Sleep -Seconds 2 }
-    if ((Get-SessionLocked) -eq $true) { $lock.locked_after_s = [int]((Get-Date) - $t0).TotalSeconds }
-    else { $lock.why = 'not locked within 5 minutes: round 3 runs unlocked' }
-    New-Item -ItemType File -Force -Path (Join-Path $Res 'go-3.flag') | Out-Null
-    $states = @()
-    $deadline = (Get-Date).AddSeconds(600)
-    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath (Join-Path $Res 'round-3.json'))) { $states += (Get-SessionLocked); Start-Sleep -Seconds 2 }
-    $obs.round3_done = Test-Path -LiteralPath (Join-Path $Res 'round-3.json')
-    if ($null -ne $lock.locked_after_s) {
-        # A beep can be heard on the lock screen: the cue to sign in again (review M12).
-        Beep 660 400; Beep 880 400
-        Say $(if ($obs.round3_done) { 'Round 3 is done: sign in again now.' } else { 'Round 3 did not finish in time: sign in again now.' }) 'Yellow'
-    }
-    if ($null -ne $lock.locked_after_s) { $lock.locked_throughout = @($states | Where-Object { $_ -ne $true }).Count -eq 0 }
-    $deadline = (Get-Date).AddSeconds(1200)
-    while ((Get-Date) -lt $deadline -and (Get-SessionLocked) -eq $true) { Start-Sleep -Seconds 2 }
-    if ((Get-SessionLocked) -ne $true) { $lock.unlocked_after_s = [int]((Get-Date) - $t0).TotalSeconds }
-    $obs.round3_lock = $lock
-    $obs
-}
-
 # -Simulate (fix round 4): the fakes replace every Windows call and redirect the paths; the
 # main part below then runs as it does for the owner.
 if ($Simulate) { . (Join-Path $PSScriptRoot 'tests\sim-fakes.ps1') -SimFor 'run-sandbox' }
@@ -576,175 +467,145 @@ if ($Preflight) {
     if (-not $d.exists) { $why += "Task 0's deploy folder is missing: $($d.path) (from $($d.from))" }
     else { try { $qt = Resolve-QtExe $d.path $QtExe } catch { $why += $_.Exception.Message } }
     [ordered]@{
-        ready = ($why.Count -eq 0); why = $why; sandbox = $i.kind; deploy = $d; qt_exe = $qt; qt_grab_args = $QtGrabArgs
+        ready = ($why.Count -eq 0); why = $why; sandbox = $i.kind; deploy = $d; qt_exe = $qt
         task0_worktrees_with_a_deploy = @(Get-DeploySuggestions $Repo)
     } | ConvertTo-Json -Depth 5 -Compress
     return
 }
 
+
 # ---------------------------------------------------------------- main
 
-# The host's keep-awake (or sleep watch) starts first thing, before the build and the deploy copy:
-# in the unattended block the stay-awake wait has just left the PC past its idle timeout (fix
-# round 3, N2-I1). If winshell-core isn't built yet it starts again right after the build.
-Start-HostPowerWatch -Hold:$KeepAwake
+# Unattended by design (scope cut, 2026-10-23): no prompt and no watched run, every wait below has
+# a time limit, and the host's keep-awake, the Sandbox this run started and the pop-ups are cleaned
+# up in a finally on every exit path, Ctrl+C and errors included. The summary is written from the
+# finally too, so the runs that finished are kept when a later step fails.
+$summary = $null
 try {
+    # The host's keep-awake (or sleep watch) starts before the build and the deploy copy.
+    Start-HostPowerWatch -Hold:$KeepAwake
 
-$info = Get-SandboxInfo
-Say "Windows Sandbox: $($info.kind) $($info.package) $($info.exe_version)"
-if ($info.kind -eq 'absent') { throw 'Windows Sandbox is not turned on: see spikes/winshell/OWNER-STEPS.md, "Turn on Windows Sandbox".' }
-$deploy = Resolve-DeployDir $DeployDir $Task0Repo $env:LILITH_TASK0_REPO $Repo
-if (-not $deploy.exists) {
-    $cmd = 'pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1'
-    $hint = @(Get-DeploySuggestions $Repo | ForEach-Object { "  $cmd -Task0Repo `"$_`"" })
-    if ($hint.Count -eq 0) { $hint = @("  $cmd -Task0Repo `"<the folder of Task 0's worktree>`"") }
-    throw ("Task 0's deploy folder is missing: $($deploy.path) (from $($deploy.from)). Run this instead (from the repository folder):`n" + ($hint -join "`n"))
-}
-$DeployDir = $deploy.path
-Say "Task 0's deploy folder: $DeployDir (from $($deploy.from))"
-$QtExe = Resolve-QtExe $DeployDir $QtExe
-
-$testExe = if ($SkipBuild) { (Get-ChildItem (Join-Path $Bin 'deps') -Filter 'winshell-*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName } else { Build-Spike }
-$dlls = Find-VcRedist
-if ($null -eq $script:HostPower.Process) { Start-HostPowerWatch -Hold:$KeepAwake }
-
-# The deploy copy, mapped read-only at its own host path inside the Sandbox.
-$deployCopy = Join-Path $Build 'deploy-copy'
-New-EmptyDir $deployCopy
-Copy-Item (Join-Path $DeployDir '*') $deployCopy -Recurse -Force
-# The offscreen grab needs qoffscreen.dll; Task 0's trimmed deploy ships only qwindows.dll (owner
-# run 3). If one can be found near the host's Qt, it is copied into the deploy copy so the Sandbox
-# can test offscreen too; if not, the Sandbox records offscreen as not shipped (no dialog, m-Qt).
-$offSrc = @(Find-QOffscreen $DeployDir) | Select-Object -First 1
-if ($offSrc) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $deployCopy 'platforms') | Out-Null
-    Copy-Item -LiteralPath $offSrc -Destination (Join-Path $deployCopy 'platforms\qoffscreen.dll') -Force
-    Say "Added qoffscreen.dll to the deploy copy (from $offSrc)"
-} else {
-    Say 'No qoffscreen.dll found near the deploy; the Sandbox tests the on-screen grab only.' 'Yellow'
-}
-
-Assert-NoSandboxRunning
-
-$label = if ($Observe) { 'observe' } else { 'run' }
-$summary = [ordered]@{ spike = 11; item = 'S1.9'; observe = [bool]$Observe; sandbox = $info; runs = @() }
-$runCount = if ($Observe) { 1 } else { $Runs }
-
-for ($run = 1; $run -le $runCount; $run++) {
-    Say "---- $label $run of $runCount" 'Yellow'
-    $runDir = Join-Path $Build "$label-$run"
-    $bundle = Join-Path $runDir 'bundle'
-    $res = Join-Path $runDir 'results'
-    New-Bundle $bundle $testExe $dlls $run $deployCopy $QtExe
-    $acl = New-ResultsFolder $res
-    $wsbFile = Join-Path $runDir 'spike.wsb'
-    $w = Tool wsb --bundle $bundle --deploy $deployCopy --results $res --out $wsbFile
-    if (-not (P $w 'written')) { throw "wsb not written: $(P $w 'error')" }
-
-    $t0 = Get-Date
-    $t0ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $started = $null
-    $stop = $null
-    $procs = @()
-    $startedAt = $null
-    $doneAt = $null
-    # Ctrl+C or a throw still stops this run's Sandbox (fix round 1, M1).
-    try {
-        Assert-NoSandboxRunning
-        $started = Start-Sandbox $wsbFile
-        while (((Get-Date) - $t0).TotalSeconds -lt 120 -and -not $startedAt) {
-            if (Test-Path (Join-Path $res 'started.json')) { $startedAt = ((Get-Date) - $t0).TotalSeconds }
-            $procs += Get-SandboxProcesses
-            [void](Get-OwnPids $started)
-            Start-Sleep -Seconds 2
-        }
-        if ($startedAt) { Say ("started.json after {0:N0} s" -f $startedAt) } else { Say 'no started.json within 120 s' 'Red' }
-
-        if ($Observe -and $startedAt) {
-            Say 'Host-state observation: round 1 runs with the Sandbox window uncovered; hands off until the script asks for the lock.'
-            $summary.observation = Invoke-Observation $res $started
-        }
-
-        $limit = if ($Observe) { 2400 } else { $RunLimitSec }
-        while (((Get-Date) - $t0).TotalSeconds -lt $limit -and -not $doneAt) {
-            if (Test-Path (Join-Path $res 'done.json')) { $doneAt = ((Get-Date) - $t0).TotalSeconds }
-            $procs += Get-SandboxProcesses
-            [void](Get-OwnPids $started)
-            Start-Sleep -Seconds 3
-        }
-        $stop = Stop-Sandbox $started
+    $info = Get-SandboxInfo
+    Say "Windows Sandbox: $($info.kind) $($info.package) $($info.exe_version)"
+    if ($info.kind -eq 'absent') { throw 'Windows Sandbox is not turned on: see spikes/winshell/OWNER-STEPS.md, "Turn on Windows Sandbox".' }
+    $deploy = Resolve-DeployDir $DeployDir $Task0Repo $env:LILITH_TASK0_REPO $Repo
+    if (-not $deploy.exists) {
+        $cmd = 'pwsh -NoProfile -File spikes/winshell/run-sandbox.ps1'
+        $hint = @(Get-DeploySuggestions $Repo | ForEach-Object { "  $cmd -Task0Repo `"$_`"" })
+        if ($hint.Count -eq 0) { $hint = @("  $cmd -Task0Repo `"<the folder of Task 0's worktree>`"") }
+        throw ("Task 0's deploy folder is missing: $($deploy.path) (from $($deploy.from)). Run this instead (from the repository folder):`n" + ($hint -join "`n"))
     }
-    finally {
-        Stop-Blocker
-        if ($started -and -not $stop) {
-            Say 'Interrupted: stopping the Sandbox this run started.' 'Red'
-            $stop = Stop-Sandbox $started -Now
-        }
-    }
-    $closedAt = ((Get-Date) - $t0).TotalSeconds
+    $DeployDir = $deploy.path
+    Say "Task 0's deploy folder: $DeployDir (from $($deploy.from))"
+    $QtExe = Resolve-QtExe $DeployDir $QtExe
 
-    $lifecycle = [ordered]@{
-        sandbox = $info; started = $started; acl = $acl
-        detection = [ordered]@{
-            wsb_list_ok = ($info.wsb_list_exit -eq 0)
-            exe_present_and_started_within_120s = ($info.exe_present -and [bool]$startedAt)
-            started_s = $startedAt
-        }
-        done_s = $doneAt; stop = $stop; start_to_closed_s = [int]$closedAt
-        process_names = @($procs | Sort-Object -Unique)
-    }
-    $detected = $lifecycle.detection.wsb_list_ok -or ($startedAt -and $startedAt -le 120)
-    $stopped = $stop.method -ne 'none worked'
-    $lifecyclePass = [bool]($detected -and $stopped -and $doneAt -and $closedAt -lt $RunLimitSec)
-    if ($Observe) { $lifecyclePass = [bool]($detected -and $stopped -and $doneAt) }
-    $lifecycle.pass = $lifecyclePass
-    $lifecycle | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 (Join-Path $res 'lifecycle.json')
+    $testExe = if ($SkipBuild) { (Get-ChildItem (Join-Path $Bin 'deps') -Filter 'winshell-*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName } else { Build-Spike }
+    $dlls = Find-VcRedist
+    if ($null -eq $script:HostPower.Process) { Start-HostPowerWatch -Hold:$KeepAwake }
 
-    $items = Judge-Run $res
-    $items['lifecycle'] = [ordered]@{ pass = $lifecyclePass; file = $lifecycle }
-    if ($Observe) {
-        # Round 1's toast popup, detected inside the Sandbox by UIA (replaces the owner watching).
-        if ($summary.Contains('observation')) { $summary.observation.round1_toast_popup = P (Read-Json (Join-Path $res 'toast.json')) 'popup' }
-        foreach ($r in 2, 3) {
-            $items["round$r"] = [ordered]@{
-                recorded = [ordered]@{
-                    toast = Read-Json (Join-Path $res "toast-r$r.json")
-                    foreground = Read-Json (Join-Path $res "foreground-r$r.json")
-                    qt = Read-Json (Join-Path $res "qt-r$r.json")
-                }
+    # The deploy copy, mapped read-only at its own host path inside the Sandbox. It is Task 0's
+    # trimmed deploy as it is: nothing is added to it (the Qt step tests the on-screen grab; the
+    # offscreen grab is CI's S0.9).
+    $deployCopy = Join-Path $Build 'deploy-copy'
+    New-EmptyDir $deployCopy
+    Copy-Item (Join-Path $DeployDir '*') $deployCopy -Recurse -Force
+
+    Assert-NoSandboxRunning
+
+    $summary = [ordered]@{ spike = 11; item = 'S1.9'; sandbox = $info; runs = @() }
+
+    for ($run = 1; $run -le $Runs; $run++) {
+        Say "---- run $run of $Runs" 'Yellow'
+        $runDir = Join-Path $Build "run-$run"
+        $bundle = Join-Path $runDir 'bundle'
+        $res = Join-Path $runDir 'results'
+        New-Bundle $bundle $testExe $dlls $run $deployCopy $QtExe
+        $acl = New-ResultsFolder $res
+        $wsbFile = Join-Path $runDir 'spike.wsb'
+        $w = Tool wsb --bundle $bundle --deploy $deployCopy --results $res --out $wsbFile
+        if (-not (P $w 'written')) { throw "wsb not written: $(P $w 'error')" }
+
+        $t0 = Get-Date
+        $t0ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $started = $null
+        $stop = $null
+        $procs = @()
+        $startedAt = $null
+        $doneAt = $null
+        # Ctrl+C or a throw still stops this run's Sandbox (fix round 1, M1).
+        try {
+            Assert-NoSandboxRunning
+            $started = Start-Sandbox $wsbFile
+            # Both waits are bounded: 120 s for started.json, $RunLimitSec for done.json.
+            while (((Get-Date) - $t0).TotalSeconds -lt 120 -and -not $startedAt) {
+                if (Test-Path (Join-Path $res 'started.json')) { $startedAt = ((Get-Date) - $t0).TotalSeconds }
+                $procs += Get-SandboxProcesses
+                [void](Get-OwnPids $started)
+                Start-Sleep -Seconds 2
+            }
+            if ($startedAt) { Say ("started.json after {0:N0} s" -f $startedAt) } else { Say 'no started.json within 120 s' 'Red' }
+            while ($startedAt -and ((Get-Date) - $t0).TotalSeconds -lt $RunLimitSec -and -not $doneAt) {
+                if (Test-Path (Join-Path $res 'done.json')) { $doneAt = ((Get-Date) - $t0).TotalSeconds }
+                $procs += Get-SandboxProcesses
+                [void](Get-OwnPids $started)
+                Start-Sleep -Seconds 3
+            }
+            $stop = Stop-Sandbox $started
+        }
+        finally {
+            if ($started -and -not $stop) {
+                Say 'Interrupted: stopping the Sandbox this run started.' 'Red'
+                $stop = Stop-Sandbox $started -Now
             }
         }
-    }
-    $runPass = @($items.Values | Where-Object { $_.Contains('pass') -and -not $_.pass }).Count -eq 0
-    # A run during which the PC slept says nothing about the Sandbox (review N-I1).
-    $sleep = Get-RunSleep $t0ms ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
-    $interrupted = $sleep.slept
-    if ($interrupted) { Say '  interrupted by sleep: this run is not judged' 'Yellow' }
-    $summary.runs += [ordered]@{ run = $run; pass = $(if ($interrupted) { $null } else { $runPass }); interrupted_by_sleep = $interrupted; sleep = $sleep; items = $items }
+        $closedAt = ((Get-Date) - $t0).TotalSeconds
 
-    $keep = Join-Path $ResultsRoot "sandbox\$label-$run"
-    New-EmptyDir $keep
-    Copy-Item (Join-Path $res '*') $keep -Recurse -Force
-    foreach ($k in $items.Keys) {
-        $v = $items[$k]
-        $text = if ($v.Contains('pass')) { if ($v.pass) { 'PASS' } else { 'FAIL' } } else { 'recorded' }
-        Say ("  {0,-11} {1}" -f $k, $text) $(if ($text -eq 'FAIL') { 'Red' } elseif ($text -eq 'PASS') { 'Green' } else { 'Gray' })
-    }
-    Say ("  start to closed: {0:N0} s; stop: {1}" -f $closedAt, $stop.method)
-}
+        $lifecycle = [ordered]@{
+            sandbox = $info; started = $started; acl = $acl
+            detection = [ordered]@{
+                wsb_list_ok = ($info.wsb_list_exit -eq 0)
+                exe_present_and_started_within_120s = ($info.exe_present -and [bool]$startedAt)
+                started_s = $startedAt
+            }
+            done_s = $doneAt; stop = $stop; start_to_closed_s = [int]$closedAt
+            process_names = @($procs | Sort-Object -Unique)
+        }
+        $detected = $lifecycle.detection.wsb_list_ok -or ($startedAt -and $startedAt -le 120)
+        $stopped = $stop.method -ne 'none worked'
+        $lifecyclePass = [bool]($detected -and $stopped -and $doneAt -and $closedAt -lt $RunLimitSec)
+        $lifecycle.pass = $lifecyclePass
+        $lifecycle | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 (Join-Path $res 'lifecycle.json')
 
-$summary.verdict = Get-SandboxVerdict @($summary.runs)
-$summary.pass = $summary.verdict -eq 'PASS'
+        $items = Judge-Run $res
+        $items['lifecycle'] = [ordered]@{ pass = $lifecyclePass; file = $lifecycle }
+        $runPass = @($items.Values | Where-Object { $_.Contains('pass') -and -not $_.pass }).Count -eq 0
+        # A run during which the PC slept says nothing about the Sandbox (review N-I1).
+        $sleep = Get-RunSleep $t0ms ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $interrupted = $sleep.slept
+        if ($interrupted) { Say '  interrupted by sleep: this run is not judged' 'Yellow' }
+        $summary.runs += [ordered]@{ run = $run; pass = $(if ($interrupted) { $null } else { $runPass }); interrupted_by_sleep = $interrupted; sleep = $sleep; items = $items }
+
+        $keep = Join-Path $ResultsRoot "sandbox\run-$run"
+        New-EmptyDir $keep
+        Copy-Item (Join-Path $res '*') $keep -Recurse -Force
+        foreach ($k in $items.Keys) {
+            $v = $items[$k]
+            $text = if ($v.Contains('pass')) { if ($v.pass) { 'PASS' } else { 'FAIL' } } else { 'recorded' }
+            Say ("  {0,-11} {1}" -f $k, $text) $(if ($text -eq 'FAIL') { 'Red' } elseif ($text -eq 'PASS') { 'Green' } else { 'Gray' })
+        }
+        Say ("  start to closed: {0:N0} s; stop: {1}" -f $closedAt, $stop.method)
+    }
 }
 finally {
     $hp = Stop-HostPowerWatch
-    # The cover pop-up's record (whether it showed, and took the foreground), then the pop-ups
-    # are told to close (fix round 4, N3-I1).
-    $handsOff = @($script:HandsOffLog)
     Stop-AllPopups
-    if (Get-Variable -Name summary -ErrorAction SilentlyContinue) { $summary.host_power = $hp; $summary.host_kept_awake = [bool]$KeepAwake; $summary.hands_off = $handsOff }
+    if ($null -ne $summary) {
+        $summary.verdict = Get-SandboxVerdict @($summary.runs)
+        $summary.pass = $summary.verdict -eq 'PASS'
+        $summary.qt_bar = $QtBarNote
+        $summary.host_power = $hp; $summary.host_kept_awake = [bool]$KeepAwake
+        $summary | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $ResultsRoot 'sandbox-checks.json')
+        Say ("S1.9: {0}" -f $summary.verdict) $(if ($summary.pass) { 'Green' } elseif ($summary.verdict -like 'INCOMPLETE*') { 'Yellow' } else { 'Red' })
+        Say "Results: $(Join-Path $ResultsRoot 'sandbox-checks.json')"
+    }
 }
-$name = if ($Observe) { 'sandbox-observe.json' } else { 'sandbox-checks.json' }
-$summary | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $ResultsRoot $name)
-Say ("S1.9 {0}: {1}" -f $label, $summary.verdict) $(if ($summary.pass) { 'Green' } elseif ($summary.verdict -like 'INCOMPLETE*') { 'Yellow' } else { 'Red' })
-Say "Results: $(Join-Path $ResultsRoot $name)"
