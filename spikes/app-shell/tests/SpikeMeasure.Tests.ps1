@@ -278,7 +278,7 @@ Describe 'Guards' {
     }
     It 'accepts only deploy and deploy-NAME (letters and digits) as a deploy folder name' {
         foreach ($ok in 'deploy', 'deploy-check', 'deploy-2') { Test-DeployName $ok | Should -BeTrue }
-        foreach ($bad in '.', '..', 'runs', 'cmake', 'cargo-lint', 'sizecheck', 'deploy\..', 'deploy-', 'deploy-a/b', 'Deploy', '') {
+        foreach ($bad in '.', '..', 'runs', 'cmake', 'cargo-lint', 'sizecheck', 'deploy\..', 'deploy-', 'deploy-a/b', 'Deploy', "deploy`n", '') {
             Test-DeployName $bad | Should -BeFalse
         }
     }
@@ -300,6 +300,15 @@ Describe 'S0.6 workload check' {
                                    chart_points = 0; grid_rows_scrolled = 0; web_shown = $false }
         @(Test-S06Workload $zero 60 10).Count | Should -Be 6   # visible, feed, decoded, charts, rows, web
     }
+    It 'does not read a long GUI stall (dropped 1 s ticks) as the list not being visible, but never allows a hidden second' {
+        $stalled = [pscustomobject]@{ grid_visible_seconds = 57; grid_hidden_seconds = 0; feed_ticks = 600; decoded = 4800
+                                      chart_points = 370; grid_rows_scrolled = 12000; web_shown = $true }
+        @(Test-S06Workload $stalled 60 10).Count | Should -Be 0
+        $stalled.grid_visible_seconds = 20
+        Test-S06Workload $stalled 60 10 | Should -Match 'list visible only 20 s'
+        $stalled.grid_visible_seconds = 59; $stalled.grid_hidden_seconds = 1
+        Test-S06Workload $stalled 60 10 | Should -Match 'list hidden 1 s'
+    }
     It 'scales the expected counts with the fallback''s 5 Hz' {
         $half = [pscustomobject]@{ grid_visible_seconds = 60; grid_hidden_seconds = 0; feed_ticks = 160; decoded = 1300
                                    chart_points = 390; grid_rows_scrolled = 12900; web_shown = $true }
@@ -311,6 +320,11 @@ Describe 'S0.6 workload check' {
         Complete-S06Verdict 'PASS' @() $true | Should -Match '^INVALID \(the app and Windows'
         Complete-S06Verdict 'FAIL (heartbeat p99 20 ms)' @('no load_counts logged') $true | Should -Match '^FAIL'
         Complete-S06Verdict 'PASS' @() $false | Should -Be 'PASS'
+    }
+    It 'keeps an earlier INVALID cause and appends the workload and refresh causes' {
+        $v = Complete-S06Verdict 'INVALID (GPU >= 95 % in only 80 % of the samples; 90 % needed)' @('no load_counts logged') $true
+        $v | Should -Match '^INVALID \(GPU >= 95 % in only 80 % of the samples; 90 % needed; workload not running as the bar requires: no load_counts logged; the app and Windows report refresh rates more than 2 Hz apart\)$'
+        Complete-S06Verdict 'INVALID (GPU samples too sparse)' @() $false | Should -Be 'INVALID (GPU samples too sparse)'
     }
 }
 
@@ -358,19 +372,20 @@ Describe 'VRAM sampling' {
     It 'keeps sampling while the process has no GPU instance yet, and Read-VramSamples drops the retries' {
         $out = Join-Path $TestDrive 'vram.jsonl'
         # A pid with no GPU Process Memory instance: the old -Continuous sampler ended at once here.
-        $job = Start-VramSampler 999999 $out
+        $sampler = Start-VramSampler 999999 $out
         Start-Sleep -Seconds 4
-        $job.State | Should -Be 'Running'
-        Stop-Job $job
-        Remove-Job $job -Force
+        $sampler.HasExited | Should -BeFalse
+        $sampler.Kill(); [void]$sampler.WaitForExit(5000)
         @(Read-JsonLines $out | Where-Object { $_.missing }).Count | Should -BeGreaterThan 0
         @(Read-VramSamples $out).Count | Should -Be 0
     }
 }
 
 Describe 'Kill-on-close job (comfy-load.ps1 never leaves ComfyUI or nvidia-smi behind)' {
-    # Harmless children only: hidden pwsh processes that sleep. Every one is ours and is killed in
-    # AfterAll if a test left it alive.
+    # Harmless hidden children only: pwsh processes that sleep, and cmd running timeout (cmd is
+    # outside the Store pwsh's package, like python, nvidia-smi and the app, which is the case
+    # that escaped the job). Every one is ours, found by its own pid or as the child of one of
+    # ours, and is killed by pid in AfterAll if a test left it alive.
     BeforeAll {
         $script:ours = [System.Collections.Generic.List[int]]::new()
         function Start-Sleeper { $p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -WindowStyle Hidden -PassThru; $script:ours.Add($p.Id); $p }
@@ -378,6 +393,21 @@ Describe 'Kill-on-close job (comfy-load.ps1 never leaves ComfyUI or nvidia-smi b
             $sw = [Diagnostics.Stopwatch]::StartNew()
             while ($sw.ElapsedMilliseconds -lt $Ms) { if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }; Start-Sleep -Milliseconds 100 }
             $false
+        }
+        # The timeout.exe that our cmd (pinned by its Process handle, so its pid can't be reused)
+        # started after itself: by parent pid and creation time, never by name alone.
+        function Wait-TimeoutChild([System.Diagnostics.Process]$Cmd, [int]$Ms = 10000) {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            while ($sw.ElapsedMilliseconds -lt $Ms) {
+                $c = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($Cmd.Id) AND Name='timeout.exe'" |
+                    Where-Object { $_.CreationDate -ge $Cmd.StartTime.AddSeconds(-1) } | Select-Object -First 1
+                if ($c) {
+                    $p = [System.Diagnostics.Process]::GetProcessById([int]$c.ProcessId)
+                    if ([math]::Abs(($p.StartTime - $c.CreationDate).TotalMilliseconds) -le 1) { $script:ours.Add($p.Id); return $p }
+                }
+                Start-Sleep -Milliseconds 100
+            }
+            $null
         }
         $module = Join-Path $PSScriptRoot '..\lib\SpikeMeasure.psm1'
     }
@@ -393,48 +423,56 @@ Describe 'Kill-on-close job (comfy-load.ps1 never leaves ComfyUI or nvidia-smi b
         Wait-Gone $inJob.Id | Should -BeTrue
         Get-Process -Id $outside.Id -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
     }
-    It 'kills what a process started after putting itself in the job, when that process is killed (a closed console)' {
-        $pidFile = Join-Path $TestDrive 'grandchild.pid'
+    It 'starts an out-of-package child (cmd) suspended in the job; it and its own grandchild are in it and die with the handle' {
+        $job = New-KillOnCloseJob
+        $bystander = Start-Sleeper
+        $cmd = Start-ProcessInJob $job $env:ComSpec -ArgumentList '/c', 'timeout /t 60 /nobreak'
+        $script:ours.Add($cmd.Id)
+        $grandchild = Wait-TimeoutChild $cmd
+        $grandchild | Should -Not -BeNullOrEmpty
+        Test-ProcessInJob $job $cmd | Should -BeTrue
+        Test-ProcessInJob $job $grandchild | Should -BeTrue
+        Test-ProcessInJob $job $bystander | Should -BeFalse
+        $job.Dispose()
+        Wait-Gone $cmd.Id | Should -BeTrue
+        Wait-Gone $grandchild.Id | Should -BeTrue
+        Get-Process -Id $bystander.Id -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+    }
+    It 'kills what the script started (cmd and its grandchild) when the script''s pwsh is killed (a closed console)' {
+        $pidFile = Join-Path $TestDrive 'cmd.pid'
         $helperScript = Join-Path $TestDrive 'helper.ps1'
         Set-Content $helperScript @"
 Import-Module '$module'
-Enable-KillOnCloseForSelf | Out-Null
-`$c = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -WindowStyle Hidden -PassThru
+`$job = Enable-KillOnCloseForSelf
+`$c = Start-ProcessInJob `$job `$env:ComSpec -ArgumentList '/c', 'timeout /t 60 /nobreak'
 Set-Content '$pidFile' `$c.Id
 Start-Sleep 60
 "@
         $helper = Start-Process pwsh -ArgumentList '-NoProfile', '-File', $helperScript -WindowStyle Hidden -PassThru
         $script:ours.Add($helper.Id)
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        while (-not (Test-Path $pidFile) -and $sw.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 200 }
-        $grandchild = [int](Get-Content $pidFile)
-        $script:ours.Add($grandchild)
-        Get-Process -Id $grandchild -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+        while (-not ((Test-Path $pidFile) -and (Get-Content $pidFile)) -and $sw.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 200 }
+        $cmd = [System.Diagnostics.Process]::GetProcessById([int](Get-Content $pidFile))
+        $script:ours.Add($cmd.Id)
+        $grandchild = Wait-TimeoutChild $cmd
+        $grandchild | Should -Not -BeNullOrEmpty
         Stop-Process -Id $helper.Id -Force   # what closing the console window does to the script
-        Wait-Gone $grandchild | Should -BeTrue
+        Wait-Gone $cmd.Id | Should -BeTrue
+        Wait-Gone $grandchild.Id | Should -BeTrue
     }
-    It 'assigns a started process and its descendants (not others) with Add-TreeToJob' {
-        $pidFile = Join-Path $TestDrive 'tree.pid'
-        $parentScript = Join-Path $TestDrive 'parent.ps1'
-        Set-Content $parentScript @"
-`$c = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -WindowStyle Hidden -PassThru
-Set-Content '$pidFile' `$c.Id
-Start-Sleep 60
-"@
-        $parent = Start-Process pwsh -ArgumentList '-NoProfile', '-File', $parentScript -WindowStyle Hidden -PassThru
-        $script:ours.Add($parent.Id)
-        $bystander = Start-Sleeper
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        while (-not (Test-Path $pidFile) -and $sw.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 200 }
-        $child = [int](Get-Content $pidFile)
-        $script:ours.Add($child)
+    It 'redirects stdout and stderr to files and reports the exit code' {
         $job = New-KillOnCloseJob
-        Add-TreeToJob $job $parent.Id | Should -Be 2
-        Test-ProcessInJob $job (Get-Process -Id $child) | Should -BeTrue
-        Test-ProcessInJob $job $bystander | Should -BeFalse
+        $o = Join-Path $TestDrive 'out.log'; $e = Join-Path $TestDrive 'err.log'
+        $p = Start-ProcessInJob $job $env:ComSpec -ArgumentList '/c', 'echo to-out& echo to-err 1>&2& exit /b 7' -StdOut $o -StdErr $e
+        $script:ours.Add($p.Id)
+        $p.WaitForExit(10000) | Should -BeTrue
+        $p.ExitCode | Should -Be 7
+        (Get-Content $o) | Should -Be 'to-out'
+        (Get-Content $e) | Should -Match 'to-err'
         $job.Dispose()
-        Wait-Gone $parent.Id | Should -BeTrue
-        Wait-Gone $child | Should -BeTrue
-        Get-Process -Id $bystander.Id -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+    }
+    It 'quotes arguments the way the child reads them back' {
+        ConvertTo-CommandLine @('C:\a\b.exe', 'plain', 'with space', '', 'say "hi"', 'C:\dir with space\', 'a\\b') |
+            Should -Be 'C:\a\b.exe plain "with space" "" "say \"hi\"" "C:\dir with space\\" a\\b'
     }
 }

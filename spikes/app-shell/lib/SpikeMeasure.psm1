@@ -87,10 +87,11 @@ function Get-S06Verdict {
     if ($hbOk -and $frOk) { 'PASS' } else { "FAIL (heartbeat p99 $($Heartbeat.p99) ms, frame p99 $($Frames.p99) ms against $threshold ms)" }
 }
 
-# nvidia-smi samples its own clock every $IntervalMs into $Out (CSV: timestamp, util, memory).
-function Start-GpuSampler([string]$Out, [int]$IntervalMs = 500) {
+# nvidia-smi samples its own clock every $IntervalMs into $Out (CSV: timestamp, util, memory),
+# started inside $Job (Start-ProcessInJob; none if $Job is $null).
+function Start-GpuSampler([string]$Out, [int]$IntervalMs = 500, $Job = $null) {
     $smi = (Get-Command nvidia-smi.exe -ErrorAction Stop).Source
-    Start-Process -FilePath $smi -WindowStyle Hidden -PassThru -RedirectStandardOutput $Out -ArgumentList @(
+    Start-ProcessInJob $Job $smi -StdOut $Out -ArgumentList @(
         '--query-gpu=timestamp,utilization.gpu,memory.used', '--format=csv,noheader,nounits', "-lms", "$IntervalMs")
 }
 
@@ -106,15 +107,19 @@ function Read-GpuSamples([string]$File) {
 }
 
 # PDH "GPU Process Memory(pid_<pid>_*)" Local Usage and Dedicated Usage, about once a second, as
-# JSON lines in $Out, until the job is stopped. The instance exists only once the process has a
-# D3D device, so each sample is its own Get-Counter call and a missing instance is retried, not
-# fatal (a -Continuous Get-Counter on a not-yet-existing instance ends at once: the owner's first
-# S0.6 run got 0 samples). Retries are written as {"t":..,"missing":true} lines.
-function Start-VramSampler([int]$ProcessId, [string]$Out) {
-    Start-Job -ArgumentList $ProcessId, $Out -ScriptBlock {
-        param($procId, $out)
+# JSON lines in $Out, until the returned sampler process is stopped. The instance exists only once
+# the process has a D3D device, so each sample is its own Get-Counter call and a missing instance
+# is retried, not fatal (a -Continuous Get-Counter on a not-yet-existing instance ends at once:
+# the owner's first S0.6 run got 0 samples). Retries are written as {"t":..,"missing":true}
+# lines. The sampler is a hidden pwsh started inside $Job (Start-ProcessInJob; none if $Job is
+# $null), so it is in the job from its start rather than relying on Start-Job's child inheriting.
+# It also stops by itself once the pwsh that started it is gone (run-spike.ps1 has no job).
+function Start-VramSampler([int]$ProcessId, [string]$Out, $Job = $null) {
+    $body = {
+        param($procId, $out, $parentPid)
+        $parent = [System.Diagnostics.Process]::GetProcessById($parentPid); [void]$parent.Handle   # pinned
         $paths = foreach ($n in 'Local Usage', 'Dedicated Usage') { "\GPU Process Memory(pid_${procId}_*)\$n" }
-        while ($true) {
+        while (-not $parent.HasExited) {
             $t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             try {
                 $c = Get-Counter -Counter $paths -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
@@ -130,6 +135,9 @@ function Start-VramSampler([int]$ProcessId, [string]$Out) {
             Add-Content -Path $out -Value ($row | ConvertTo-Json -Compress)
         }
     }
+    $cmd = "& { $body } $ProcessId '$($Out -replace "'", "''")' $PID"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+    Start-ProcessInJob $Job ([Environment]::ProcessPath) @('-NoProfile', '-NonInteractive', '-EncodedCommand', $enc)
 }
 
 # VRAM samples that hold values (the "missing" retries left out).
@@ -273,18 +281,21 @@ function Get-SpikeAppProcesses([object[]]$Processes = $null) {
 
 # -DeployName is one folder under build/: "deploy" or "deploy-<letters/digits>", nothing else, so
 # a slip can't point the deploy folder's delete at build/, runs/, cmake/ or the sources.
-function Test-DeployName([string]$Name) { [bool]($Name -cmatch '^deploy(-[A-Za-z0-9]+)?$') }
+function Test-DeployName([string]$Name) { [bool]($Name -cmatch '^deploy(-[A-Za-z0-9]+)?\z') }
 
 # ---- S0.6 workload and refresh-rate checks ----------------------------------------------------
 
 # Did the bar's workload actually run? load_counts is logged at the end of the measured window,
 # with cumulative counters from the load's start (5 s of warm-up and the measured window), so
-# each count must be at least half of what the measured window alone should give.
+# each count must be at least half of what the measured window alone should give. The list's
+# visible seconds follow the same rule: they come from a 1 s QML Timer, which drops the ticks a
+# GUI stall misses, so one long stall (the thing S0.6 measures) must not read as "not visible".
+# A hidden second is still never allowed.
 function Test-S06Workload($Counts, [int]$MeasureSeconds = 60, [int]$RateHz = 10) {
     if (-not $Counts) { return @('no load_counts logged') }
     $p = @()
     $half = 0.5 * $MeasureSeconds
-    if ([double]$Counts.grid_visible_seconds -lt $MeasureSeconds - 1) { $p += "list visible only $($Counts.grid_visible_seconds) s of $MeasureSeconds" }
+    if ([double]$Counts.grid_visible_seconds -lt $half) { $p += "list visible only $($Counts.grid_visible_seconds) s of $MeasureSeconds (expected >= $half)" }
     if ([double]$Counts.grid_hidden_seconds -gt 0) { $p += "list hidden $($Counts.grid_hidden_seconds) s" }
     if ([double]$Counts.feed_ticks -lt $half * $RateHz) { $p += "feed ticks $($Counts.feed_ticks) (expected >= $($half * $RateHz))" }
     if ([double]$Counts.decoded -lt $half * $RateHz * 8) { $p += "previews decoded $($Counts.decoded) (expected >= $($half * $RateHz * 8))" }
@@ -296,12 +307,16 @@ function Test-S06Workload($Counts, [int]$MeasureSeconds = 60, [int]$RateHz = 10)
 
 # The final S0.6 verdict: a FAIL stays a FAIL; otherwise a missing workload or a refresh rate the
 # app and Windows disagree on makes the run INVALID, because PASS would then rest on missing data.
+# Every cause is kept: an INVALID from the GPU check gets these appended, not replaced.
 function Complete-S06Verdict([string]$Verdict, [string[]]$WorkloadProblems, [bool]$RefreshMismatch) {
     if ($Verdict -match '^FAIL') { return $Verdict }
     $problems = @($WorkloadProblems | Where-Object { $_ })
-    if ($problems.Count) { return "INVALID (workload not running as the bar requires: $($problems -join '; '))" }
-    if ($RefreshMismatch) { return 'INVALID (the app and Windows report refresh rates more than 2 Hz apart)' }
-    $Verdict
+    $extra = @()
+    if ($problems.Count) { $extra += "workload not running as the bar requires: $($problems -join '; ')" }
+    if ($RefreshMismatch) { $extra += 'the app and Windows report refresh rates more than 2 Hz apart' }
+    if (-not $extra.Count) { return $Verdict }
+    if ($Verdict -match '^INVALID \((.*)\)$') { return "INVALID ($($Matches[1]); $($extra -join '; '))" }
+    "INVALID ($($extra -join '; '))"
 }
 
 # A refresh rate S0.6 can judge with: 0, 1 ("hardware default") and anything under 24 Hz count as
@@ -309,14 +324,24 @@ function Complete-S06Verdict([string]$Verdict, [string[]]$WorkloadProblems, [boo
 function Test-PlausibleRefresh([double]$Hz) { $Hz -ge 24 -and $Hz -le 1000 }
 
 # ---- a kill-on-close job object (comfy-load.ps1) -----------------------------------------------
-# Every process in the job dies when the last handle to the job closes; a process's children
-# join its job automatically. comfy-load.ps1 puts its own pwsh in such a job, holding the only
-# handle, so if the owner closes its console window, everything the script started (ComfyUI and
-# its children, nvidia-smi, keep_busy, the sampler job, the app) dies with it. Nothing that was
-# running before, and nothing the script didn't start, is ever in the job.
+# Every process in the job dies when the last handle to the job closes. comfy-load.ps1 creates
+# one and holds its only handle, so if the owner closes its console window, everything the script
+# started dies with it.
+#
+# Children do NOT reliably join their parent's job by themselves here. The Store pwsh is an
+# MSIX-packaged app, and Windows creates a packaged app's out-of-package children (cmd, python,
+# nvidia-smi, the spike app) outside the package's environment and outside every job its parent
+# is in. Measured on the owner's PC (fix round 4): from a packaged pwsh in a kill-on-close job,
+# `cmd /c timeout` was in no job at all, while `pwsh -c Start-Sleep` (in the package) was in ours;
+# from Windows PowerShell 5.1 (not packaged), cmd was in the job. So every process the script
+# starts is created suspended, put in the job, and only then resumed (Start-ProcessInJob). A
+# process that is in the job before it runs passes membership on to its own children (they are
+# not packaged), so no later sweep is needed and nothing the script didn't start is ever put in.
 $script:JobSource = @'
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 public sealed class KillOnCloseJob : IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct BASIC {
         public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
@@ -326,13 +351,27 @@ public sealed class KillOnCloseJob : IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct EXTENDED {
         public BASIC Basic; public IO Io; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit;
         public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct STARTUPINFO {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError; }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    [StructLayout(LayoutKind.Sequential)] struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public int bInheritHandle; }
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr attrs, string name);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int cls, ref EXTENDED info, int len);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcessW(string app, StringBuilder cmd,
+        IntPtr procAttrs, IntPtr threadAttrs, bool inheritHandles, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateFileW(string name, uint access, uint share,
+        ref SECURITY_ATTRIBUTES sa, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint code);
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
-    // The job this process put itself in: kept here so the handle lives as long as the process.
+    const uint CREATE_SUSPENDED = 0x4, CREATE_NO_WINDOW = 0x08000000;
+    const int STARTF_USESTDHANDLES = 0x100;
+    // The job this process created for itself: kept here so the handle lives as long as the process.
     public static KillOnCloseJob Self;
     IntPtr handle;
     public KillOnCloseJob() {
@@ -350,6 +389,68 @@ public sealed class KillOnCloseJob : IDisposable {
     }
     public bool Contains(IntPtr process) { bool r; return IsProcessInJob(process, handle, out r) && r; }
     public void Dispose() { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } }
+
+    // One argument quoted the way CommandLineToArgvW and the C runtime read it back.
+    public static string Quote(string a) {
+        if (a.Length > 0 && a.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0) return a;
+        var sb = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char c in a) {
+            if (c == '\\') { slashes++; continue; }
+            if (c == '"') sb.Append('\\', 2 * slashes + 1); else sb.Append('\\', slashes);
+            slashes = 0; sb.Append(c);
+        }
+        sb.Append('\\', 2 * slashes).Append('"');
+        return sb.ToString();
+    }
+
+    static IntPtr OpenStd(string path, bool write) {
+        var sa = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), bInheritHandle = 1 };
+        // Writers truncate (like Start-Process -RedirectStandardOutput) and share read and write,
+        // so the script can read a file (nvidia-smi's samples) while the child appends to it.
+        IntPtr h = write ? CreateFileW(path, 0x40000000, 3, ref sa, 2, 0x80, IntPtr.Zero)    // GENERIC_WRITE, CREATE_ALWAYS
+                         : CreateFileW(path, 0x80000000, 3, ref sa, 3, 0x80, IntPtr.Zero);   // GENERIC_READ, OPEN_EXISTING
+        if (h == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "cannot open " + path);
+        return h;
+    }
+
+    // Starts `app` with `commandLine` suspended, without a console window (a GUI exe ignores
+    // that), puts it in `job` (none if null) and only then lets it run. With stdOut or stdErr,
+    // stdin is NUL, the named streams go to those files and the other to NUL; handles are then
+    // inherited (bInheritHandles must be TRUE for the redirect), otherwise nothing is. If the
+    // process can't be put in the job it is ended before it ran. The returned Process holds its
+    // own handle, opened while ours still pinned the pid, so its Id can't be reused under it.
+    public static Process Start(KillOnCloseJob job, string app, string commandLine, string cwd, string stdOut, string stdErr) {
+        var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        bool redirect = !string.IsNullOrEmpty(stdOut) || !string.IsNullOrEmpty(stdErr);
+        var opened = new System.Collections.Generic.List<IntPtr>();
+        PROCESS_INFORMATION pi;
+        try {
+            if (redirect) {
+                si.dwFlags = STARTF_USESTDHANDLES;
+                si.hStdInput = OpenStd("NUL", false); opened.Add(si.hStdInput);
+                si.hStdOutput = OpenStd(string.IsNullOrEmpty(stdOut) ? "NUL" : stdOut, true); opened.Add(si.hStdOutput);
+                si.hStdError = OpenStd(string.IsNullOrEmpty(stdErr) ? "NUL" : stdErr, true); opened.Add(si.hStdError);
+            }
+            if (!CreateProcessW(app, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, redirect,
+                                CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, string.IsNullOrEmpty(cwd) ? null : cwd, ref si, out pi))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "cannot start " + app);
+        } finally {
+            foreach (var h in opened) CloseHandle(h);   // the child has its own copies
+        }
+        try {
+            if (job != null && !job.Contains(pi.hProcess)) job.Assign(pi.hProcess);
+            var p = Process.GetProcessById(pi.dwProcessId);
+            var pinned = p.Handle;   // Process opens and keeps its own handle now
+            if (ResumeThread(pi.hThread) == 0xFFFFFFFF) throw new System.ComponentModel.Win32Exception();
+            return p;
+        } catch {
+            TerminateProcess(pi.hProcess, 1);   // never let it run outside the job
+            throw;
+        } finally {
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        }
+    }
 }
 '@
 
@@ -364,36 +465,25 @@ function Add-ProcessToJob($Job, [System.Diagnostics.Process]$Process) { $Job.Ass
 # Is this process in the job?
 function Test-ProcessInJob($Job, [System.Diagnostics.Process]$Process) { $Job.Contains($Process.Handle) }
 
-# Assigns a process this script started, and every descendant of it (by parent pid, created
-# after its parent, so a reused pid is never taken), to the job. Children normally join by
-# themselves, but some don't: nvidia-smi.exe started from a job member was observed outside the
-# job (its parent's job membership didn't carry over), so each one is assigned explicitly, and
-# the tree is swept again while the script waits. Returns how many processes are in the job.
-function Add-TreeToJob($Job, [int]$RootPid) {
-    $all = @(Get-CimInstance Win32_Process)
-    $byParent = @{}
-    foreach ($p in $all) { if (-not $byParent.ContainsKey([int]$p.ParentProcessId)) { $byParent[[int]$p.ParentProcessId] = @() }; $byParent[[int]$p.ParentProcessId] += $p }
-    $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
-    if (-not $root) { return 0 }
-    $queue = [System.Collections.Generic.Queue[object]]::new(); $queue.Enqueue($root)
-    $n = 0
-    while ($queue.Count) {
-        $p = $queue.Dequeue()
-        try {
-            $proc = [System.Diagnostics.Process]::GetProcessById([int]$p.ProcessId)
-            if (-not $Job.Contains($proc.Handle)) { $Job.Assign($proc.Handle) }
-            $n++
-        } catch { }   # gone already, or not ours to open
-        foreach ($c in @($byParent[[int]$p.ProcessId])) {
-            if ($c -and $c.CreationDate -ge $p.CreationDate -and $c.Name -ne 'conhost.exe') { $queue.Enqueue($c) }
-        }
-    }
-    $n
+# A command line from separate arguments, each quoted the way the child reads it back.
+function ConvertTo-CommandLine([string[]]$Arguments) {
+    Initialize-JobType
+    (@($Arguments) | ForEach-Object { [KillOnCloseJob]::Quote("$_") }) -join ' '
 }
 
-# Puts the current process in a kill-on-close job whose only handle this process holds, so every
-# process it starts from now on dies with it, however it ends. Call it only from a process that
-# runs nothing but this script (pwsh -File), never from an interactive shell.
+# Starts $FilePath (a full path) with $ArgumentList inside $Job (or in no job if $Job is $null):
+# created suspended, assigned, then resumed, so it and all its descendants are in the job from
+# their first instruction. No console window. -StdOut/-StdErr redirect to files (stdin is then
+# NUL); without them nothing is redirected. Returns a System.Diagnostics.Process.
+function Start-ProcessInJob {
+    param($Job, [string]$FilePath, [string[]]$ArgumentList = @(), [string]$WorkingDirectory, [string]$StdOut, [string]$StdErr)
+    Initialize-JobType
+    [KillOnCloseJob]::Start($Job, $FilePath, (ConvertTo-CommandLine (@($FilePath) + @($ArgumentList))), $WorkingDirectory, $StdOut, $StdErr)
+}
+
+# Creates the script's kill-on-close job, holding its only handle, and puts the current process
+# in it too, so its in-package children (pwsh) are covered as well. Call it only from a process
+# that runs nothing but this script (pwsh -File, without -NoExit), never from an interactive shell.
 function Enable-KillOnCloseForSelf {
     Initialize-JobType
     if (-not [KillOnCloseJob]::Self) {
@@ -413,5 +503,5 @@ function Get-CpuPercent {
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
-    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, Add-TreeToJob, Enable-KillOnCloseForSelf,
+    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob, Enable-KillOnCloseForSelf,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

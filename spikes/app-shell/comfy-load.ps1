@@ -38,9 +38,10 @@
   timers are throttled, spike 04); don't use the mouse or keyboard while it runs.
 
   Everything it starts is in a kill-on-close Windows job object held by this script's own pwsh,
-  so closing its console window also ends ComfyUI, nvidia-smi, the load and the app; Ctrl+C
-  and errors still clean up explicitly. Run it only as pwsh -NoProfile -File (an in-process run
-  is refused).
+  so closing its console window also ends ComfyUI, nvidia-smi, the load, the VRAM sampler and the
+  app; Ctrl+C and errors still clean up explicitly. Each of them is created suspended, put in the
+  job, and only then resumed, so its own children are in the job from their start too. Run it
+  only as pwsh -NoProfile -File, without -NoExit (an in-process run is refused).
 
   -SamplersOnly -ProcessId <pid> runs just the two samplers against another process for
   -SamplerSeconds and reports their coverage (no ComfyUI, no app); it checks the sampling.
@@ -73,19 +74,22 @@ New-Item -ItemType Directory -Force $Runs, $Results | Out-Null
 Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force
 
 # Everything this script starts (ComfyUI and its children, nvidia-smi, keep_busy, the VRAM
-# sampler's job, the app) must die with it, even if its console window is closed: an orphaned
-# ComfyUI holds the GPU and port 8188, and the next run then refuses. So this pwsh puts itself in
-# a kill-on-close job, holding the only handle, before it starts anything; children join the job
-# by themselves, and nothing started before or elsewhere is in it. That is only safe in a pwsh
-# that runs this script alone, so an in-process run (from an interactive shell) is refused.
+# sampler, the app) must die with it, even if its console window is closed: an orphaned ComfyUI
+# holds the GPU and port 8188, and the next run then refuses. So this pwsh creates a kill-on-close
+# job, holding the only handle, before it starts anything (and puts itself in it).
+# Children don't join it by themselves: the Store pwsh is an MSIX-packaged app, and Windows
+# creates its out-of-package children (python, nvidia-smi, the app) outside every job it is in
+# (fix round 4 measured this: cmd escaped, an in-package pwsh didn't). So each process is started
+# with Start-ProcessInJob: created suspended, assigned, then resumed. Its own children, which
+# aren't packaged, then inherit the job from their first instruction. Nothing started before or
+# elsewhere is ever put in the job. This pwsh is in the job too, so it must run this script and
+# nothing else: an in-process run (from an interactive shell) and -NoExit are refused.
 $selfCmd = "$((Get-CimInstance Win32_Process -Filter "ProcessId=$PID").CommandLine)"
-if ($selfCmd -notmatch '(?i)\s-f(ile)?\s' -or $selfCmd -notmatch [regex]::Escape((Split-Path -Leaf $PSCommandPath))) {
-    throw "run this script in its own pwsh: pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1"
+if ($selfCmd -notmatch '(?i)\s-f(ile)?\s' -or $selfCmd -notmatch [regex]::Escape((Split-Path -Leaf $PSCommandPath)) -or
+    $selfCmd -match '(?i)\s-noe(xit)?\b') {
+    throw "run this script in its own pwsh, without -NoExit: pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1"
 }
 $job = Enable-KillOnCloseForSelf
-# Each started process (and its descendants) is also assigned explicitly: nvidia-smi.exe was seen
-# outside the job although its parent was in it. The tree is swept again while the script waits.
-function Join-OurJob([System.Diagnostics.Process]$Proc) { if ($Proc) { [void](Add-TreeToJob $job $Proc.Id) } }
 
 Add-Type -Namespace AppShellComfy -Name Win -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
 [void][AppShellComfy.Win]::SetErrorMode(0x0001 -bor 0x8000)
@@ -98,14 +102,13 @@ $vramFile = Join-Path $Runs 'vram.jsonl'
 # ---- -SamplersOnly: check the sampling against another process ------------------------------
 if ($SamplersOnly) {
     if (-not $ProcessId) { throw '-SamplersOnly needs -ProcessId' }
-    $g = Start-GpuSampler $gpuFile
-    Join-OurJob $g
-    $v = Start-VramSampler $ProcessId $vramFile
+    $g = Start-GpuSampler $gpuFile -Job $job
+    $v = Start-VramSampler $ProcessId $vramFile -Job $job
     $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     Start-Sleep -Seconds ($SamplerSeconds + 2)
     $t1 = $t0 + $SamplerSeconds * 1000 + 1000
     Stop-Process -Id $g.Id -Force -ErrorAction SilentlyContinue
-    Stop-Job $v; Remove-Job $v -Force
+    try { $v.Kill() } catch {}
     $gs = Read-GpuSamples $gpuFile
     $vs = Read-VramSamples $vramFile
     $win = [ordered]@{ start = $t0 + 1000; end = $t1 }
@@ -135,39 +138,37 @@ if (Test-Comfy) { throw "something already answers on $Url; this script only mea
 if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "ComfyUI not found at $ComfyMain" }
 
 $res = [ordered]@{ check = 'S0.6'; started = (Get-Date).ToString('o'); rate_hz = $RateHz; charts_batched = [bool]$ChartsBatched; runs = $Runs }
-$comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramJob = $null
+$comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramProc = $null
 try {
     Write-Host "starting ComfyUI on $Url ..."
-    $comfy = Start-Process -FilePath $ComfyPython -ArgumentList @($ComfyMain, '--listen', '127.0.0.1', '--port', "$Port") `
-        -WorkingDirectory (Split-Path $ComfyMain) -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $Runs 'comfy.out.log') -RedirectStandardError (Join-Path $Runs 'comfy.err.log')
+    $comfy = Start-ProcessInJob $job $ComfyPython -ArgumentList @($ComfyMain, '--listen', '127.0.0.1', '--port', "$Port") `
+        -WorkingDirectory (Split-Path $ComfyMain) `
+        -StdOut (Join-Path $Runs 'comfy.out.log') -StdErr (Join-Path $Runs 'comfy.err.log')
     $deadline = (Get-Date).AddSeconds(300)
-    Join-OurJob $comfy
-    while (-not (Test-Comfy) -and (Get-Date) -lt $deadline -and -not $comfy.HasExited) { Start-Sleep -Seconds 2; Join-OurJob $comfy }
-    Join-OurJob $comfy
+    while (-not (Test-Comfy) -and (Get-Date) -lt $deadline -and -not $comfy.HasExited) { Start-Sleep -Seconds 2 }
     if (-not (Test-Comfy)) { throw 'ComfyUI did not answer /system_stats within 300 s' }
     $res.comfy_version = (Invoke-RestMethod "$Url/system_stats" -TimeoutSec 5).system.comfyui_version
 
-    $gpuProc = Start-GpuSampler $gpuFile
-    Join-OurJob $gpuProc
+    $gpuProc = Start-GpuSampler $gpuFile -Job $job
     # The load keeps a prompt queued behind the running one (comfy/keep_busy.py, depth 2) and runs
     # until this script stops it, so it can't end before the measured minute does (the owner's
     # first run: one prompt at a time, ~75 % of samples >= 95 %, and the load ended 240 s after it
     # started, before the app's measured minute).
     $stopFile = Join-Path $Runs 'stop-load'
-    $load = Start-Process -FilePath $ComfyPython -WindowStyle Hidden -PassThru -ArgumentList @('-I',
+    $load = Start-ProcessInJob $job $ComfyPython -ArgumentList @('-I',
         (Join-Path $Root 'comfy\keep_busy.py'), '--port', "$Port", '--depth', '2', '--seconds', '1800', '--stop-file', $stopFile,
         '--parent-pid', "$PID",   # it stops by itself if this script's window is closed
         '--workflow', (Join-Path $Root 'comfy\load-workflow.json'), '--summary', (Join-Path $Runs 'keep-busy.json')) `
-        -RedirectStandardOutput (Join-Path $Runs 'keep-busy.out.log') -RedirectStandardError (Join-Path $Runs 'keep-busy.err.log')
+        -StdOut (Join-Path $Runs 'keep-busy.out.log') -StdErr (Join-Path $Runs 'keep-busy.err.log')
 
     # Gate: the measured minute starts only once the last 20 s of samples meet the measured
     # window's own GPU condition (dense, >= 95 % in at least 90 % of the samples). At most 300 s
-    # (model load); if it never gets there, the app is not run at all and the result says why.
+    # (model load); if it never gets there, the app is not run at all and the result says why. It
+    # stops waiting at once if the load or ComfyUI exits (keep_busy would otherwise poll a dead
+    # ComfyUI until the deadline).
     $deadline = (Get-Date).AddSeconds(300); $saturated = $false
-    while (-not $saturated -and (Get-Date) -lt $deadline -and -not $load.HasExited) {
+    while (-not $saturated -and (Get-Date) -lt $deadline -and -not $load.HasExited -and -not $comfy.HasExited) {
         Start-Sleep -Seconds 1
-        Join-OurJob $load; Join-OurJob $comfy
         $saturated = Test-GpuSaturatedRecently (Read-GpuSamples $gpuFile) ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
     }
     $res.gpu_saturated_before_start = $saturated
@@ -181,7 +182,7 @@ try {
         prompts_finished = @(Get-Content (Join-Path $Runs 'keep-busy.out.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match '^prompt ' }).Count }
     if (-not $saturated) {
         $res.load_exit_code = if ($load.HasExited) { $load.ExitCode } else { $null }
-        throw "the GPU never reached the measurement condition before the measured minute (load exited: $($load.HasExited)); see keep-busy.*.log and comfy.err.log in $Runs"
+        throw "the GPU never reached the measurement condition before the measured minute (load exited: $($load.HasExited), ComfyUI exited: $($comfy.HasExited)); see keep-busy.*.log and comfy.err.log in $Runs"
     }
     $res.os_primary_refresh_hz = Get-OsPrimaryRefreshHz
 
@@ -189,16 +190,16 @@ try {
     $log = Join-Path $Runs 's06.jsonl'
     $appArgs = @('--log', $log, '--no-activate', '--on-top', '--load', '--load-rate', "$RateHz", '--show-web', '2000', '--measure', "$MeasureSeconds")
     if ($ChartsBatched) { $appArgs += '--charts-batched' }
-    $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
-    foreach ($a in $appArgs) { $psi.ArgumentList.Add($a) }
-    $psi.UseShellExecute = $false
-    $psi.WorkingDirectory = $Deploy
-    $app = [System.Diagnostics.Process]::Start($psi)
-    Join-OurJob $app
+    $app = Start-ProcessInJob $job $Exe -ArgumentList $appArgs -WorkingDirectory $Deploy
     $appStart = ([DateTimeOffset]$app.StartTime).ToUnixTimeMilliseconds()
-    $vramJob = Start-VramSampler $app.Id $vramFile
+    $vramProc = Start-VramSampler $app.Id $vramFile -Job $job
     $res.in_kill_on_close_job = [ordered]@{ comfy = (Test-ProcessInJob $job $comfy); load = (Test-ProcessInJob $job $load)
-                                           gpu_sampler = (Test-ProcessInJob $job $gpuProc); app = (Test-ProcessInJob $job $app) }
+                                           gpu_sampler = (Test-ProcessInJob $job $gpuProc); vram_sampler = (Test-ProcessInJob $job $vramProc)
+                                           app = (Test-ProcessInJob $job $app) }
+    # Start-ProcessInJob ends a process it couldn't assign before it runs, so a false here would
+    # mean the check itself is wrong; say so rather than record it silently.
+    $notIn = @($res.in_kill_on_close_job.Keys | Where-Object { -not $res.in_kill_on_close_job[$_] })
+    if ($notIn.Count) { Write-Warning "not in the kill-on-close job: $($notIn -join ', '); closing this window would leave them running" }
     # Short waits in a loop, so Ctrl+C reaches `finally` (and stops ComfyUI) at once.
     $waitUntil = (Get-Date).AddSeconds($MeasureSeconds + 90)
     while (-not $app.WaitForExit(250) -and (Get-Date) -lt $waitUntil) { }
@@ -209,7 +210,7 @@ try {
 
     Set-Content -Path $stopFile -Value 'stop'
     Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue
-    Stop-Job $vramJob -ErrorAction SilentlyContinue
+    if (-not $vramProc.HasExited) { try { $vramProc.Kill() } catch {} }
 
     $ev = Read-JsonLines $log
     $measured = $ev | Where-Object { $_.event -eq 'stall_report' -and $_.label -eq 'measured' } | Select-Object -Last 1
@@ -261,7 +262,7 @@ try {
     if ($stopFile -and -not (Test-Path $stopFile)) { Set-Content -Path $stopFile -Value 'stop' -ErrorAction SilentlyContinue }
     if ($app -and -not $app.HasExited) { try { $app.Kill($true) } catch {} }
     if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue }
-    if ($vramJob) { Stop-Job $vramJob -ErrorAction SilentlyContinue; Remove-Job $vramJob -Force -ErrorAction SilentlyContinue }
+    if ($vramProc -and -not $vramProc.HasExited) { try { $vramProc.Kill() } catch {} }
     if ($load -and -not $load.HasExited) { & taskkill /PID $load.Id /T /F *>&1 | Out-Null }
     if ($comfy -and -not $comfy.HasExited) { & taskkill /PID $comfy.Id /T /F *>&1 | Out-Null; Write-Host 'stopped the ComfyUI process this script started' }
     $res.comfy_stopped = -not (Test-Comfy)

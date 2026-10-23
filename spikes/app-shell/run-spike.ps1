@@ -401,6 +401,7 @@ function Copy-OurFiles([string]$dest) {
 # deploy of the same configuration into a scratch folder (with --list source too).
 function Get-DryRunList([string[]]$qmlDirs, [string[]]$flags) {
     $tmp = Join-Path $Build 'sizecheck'
+    if (@(Get-ProcessesUnder $tmp).Count) { throw "a process started from $tmp after the preflight; not deleting it" }
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
     Copy-OurFiles $tmp
     $base = @('--release') + @($qmlDirs | ForEach-Object { '--qmldir', $_ }) + $flags
@@ -586,7 +587,7 @@ if (Want 'S0.6smoke') {
     $script:smokeVram = $null
     $osHz = Get-OsPrimaryRefreshHz
     $r = Invoke-Spike $dExe 's06-smoke' @('--load', '--show-web', '2000', '--measure', '10') $StripSet $StripUnset 90 $true { param($proc) $script:smokeVram = Start-VramSampler $proc.Id $vramFile }
-    if ($script:smokeVram) { Stop-Job $script:smokeVram -ErrorAction SilentlyContinue; Remove-Job $script:smokeVram -Force -ErrorAction SilentlyContinue }
+    if ($script:smokeVram -and -not $script:smokeVram.HasExited) { try { $script:smokeVram.Kill() } catch {} }   # the sampler pwsh it started
     $vram = @(Read-VramSamples $vramFile)
     $vramMissing = @(Read-JsonLines $vramFile | Where-Object { $_.missing }).Count
     $ev = $r.events
