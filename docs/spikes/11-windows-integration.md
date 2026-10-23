@@ -103,6 +103,13 @@ Part B and the stay-awake wait write `results/checks.json`; the Sandbox runs wri
 - **The unattended block checks the execution state before Enter, while the owner is present.** It names the likely holder (the Claude app's "Keep computer awake while Claude works" setting while a Claude session works) and waits until the state clears or the owner types `skip`. The stay-awake wait is "not decisive" if the state is set before the hold, if it is still set after the release, or if a reading while held doesn't show the spike's own request. A requester that came and went entirely inside the hold can't be seen without elevation.
 - **The unattended Sandbox runs hold a parent-watched keep-awake** (the spike core's request). Any run during which the host slept (a suspend or resume broadcast, a clock jump, or a Kernel-Power entry in its time) is recorded as interrupted by sleep, never as a FAIL.
 - **"Sleep after" is only read.** The attended block records it, and the unattended block prints the value in use at its start and reminds the owner at its end of the value to set back.
+**Fix round 3.**
+- **Every process the scripts check or end is pinned when it starts.** The scripts keep a Process object holding an open handle (`Get-PinnedProcess`), and end processes only through `Stop-PinnedProcess` or a stated name-and-path check. A pid looked up later can't reach someone else's process (`tests/kill_scope.rs`).
+- **S1.7 judges only the span from the request being set to its being cleared.** The Kernel-Power query is bounded to that span. A sleep after the release is recorded as information.
+- **The unattended Sandbox stage starts its keep-awake before the build and the copy.**
+- **Any S1.3 refusal goes to the owner's click,** recorded as such. Windows' own toast chrome (close, "…", settings) is known in the scope and never pressed.
+- **The pop-up is made topmost with `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | …)`.** Its warning runs to an absolute start time that the caller sets only after the pop-up reports itself shown, so it lasts at least 10 s on screen. It is cleared in a `finally` on every path.
+- **Unknown controls in a scope are recorded by AutomationId, control type and class only,** never by their Name.
 Re-run: the commands above. `spikes/winshell/OWNER-STEPS.md` lists what each step shows, what the owner does, how long it takes, and what it writes and removes.
 
 ## 4. Pass criteria

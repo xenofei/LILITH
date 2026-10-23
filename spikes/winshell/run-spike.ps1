@@ -193,15 +193,21 @@ function Get-ProgramsDir {
 function Start-Core([string]$Name, [string[]]$CoreArgs) {
     $out = Join-Path $Raw "$Name.json"
     Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
+    $spawned = Get-Date
     $r = Tool spawn '--' $Core @CoreArgs --out $out   # a quoted '--': a bare one is PowerShell's
     if (-not $r.PSObject.Properties['pid']) { throw "spawn failed: $($r | ConvertTo-Json -Compress)" }
-    [pscustomobject]@{ Name = $Name; Pid = [int]$r.pid; Out = $out }
+    # Pinned at once (an open handle: its pid can't be reused under it; fix round 3, N2-C1). A core
+    # that has already exited can't be pinned, and is then waited for by its result file only.
+    [pscustomobject]@{ Name = $Name; Pid = [int]$r.pid; Out = $out; Process = (Get-PinnedProcess ([int]$r.pid) $Core $spawned) }
 }
 
 function Wait-Core($C, [int]$TimeoutSec = 60) {
-    try { Wait-Process -Id $C.Pid -Timeout $TimeoutSec -ErrorAction Stop } catch { }
-    if (Get-Process -Id $C.Pid -ErrorAction SilentlyContinue) {
-        throw "winshell-core $($C.Name) still running after $TimeoutSec s"
+    if ($null -ne $C.Process) {
+        [void]$C.Process.WaitForExit($TimeoutSec * 1000)
+        if (-not $C.Process.HasExited) { throw "winshell-core $($C.Name) still running after $TimeoutSec s" }
+    } else {
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        while (-not (Test-Path $C.Out) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
     }
     if (-not (Test-Path $C.Out)) { throw "winshell-core $($C.Name) wrote no result" }
     Get-Content -Raw $C.Out | ConvertFrom-Json
@@ -243,7 +249,7 @@ function Stop-SpikeProcesses {
     foreach ($name in 'winshell-app', 'winshell-core') {
         Get-Process -Name $name -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -and $_.Path.StartsWith($Bin, [StringComparison]::OrdinalIgnoreCase) } |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Process -Force -ErrorAction SilentlyContinue   # kill-scope: looked up by name and path at kill time
     }
 }
 
@@ -702,7 +708,21 @@ function Check-S12p {
 #   'synthetic' a synthesized click only (S1.4's recorded set)
 #   'owner'     the owner clicks (S1.4's bar: the foreground right a real click gives)
 # $Target is 'body' (the toast's text) or 'button' (its "Open" action). A post that gets no
-# launch is posted again, up to 3 posts; nothing is asked (automation round).
+# launch is posted again, up to 3 posts; a refusal goes to the owner's click (fix round 3).
+
+# Why a found toast's automated click must go to the owner instead (fix round 3, N2-I2), or $null
+# when the click was made (and only the launch failed to come, which is reposted). Every
+# refusal falls back: the owner using the PC, the scope refusing the button, or every way
+# refusing (scope, point, DPI). Pure; tested.
+function Get-ClickFallback($Attempt) {
+    $clicks = @(P $Attempt 'clicks' | Where-Object { $null -ne $_ })
+    if (@($clicks | Where-Object { (P $_ 'owner_active') -eq $true }).Count -gt 0) { return 'the owner was using the PC during the synthesized click' }
+    if ((P $Attempt 'button_missing') -eq $true) { return "the script refused to act: $(P $Attempt 'button_why')" }
+    if (@($clicks | Where-Object { (P $_ 'ok') -eq $true }).Count -gt 0) { return $null }
+    $why = @($clicks | ForEach-Object { P $_ 'why' } | Where-Object { $_ }) | Select-Object -First 1
+    "the script refused to act: $(if ($why) { $why } else { 'no way to click' })"
+}
+
 function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithButton, [string]$Target = 'body',
         [string]$Click = 'auto', [string]$Instruction, [scriptblock]$Prepare, [scriptblock]$Await) {
     $posts = @()
@@ -713,43 +733,52 @@ function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithBu
         $nonce = New-Nonce
         $toastArgs = @('--tag', $Tag, '--launch', $ConfirmUrl, '--title', 'LILITH spike', '--body', "$Body #$nonce")
         if ($WithButton) { $toastArgs += @('--button', $ConfirmUrl) }
-        # Hands off from before the post: the banner lasts only a few seconds (owner direction:
-        # the pop-up warns 10 s ahead).
-        $handsOff = $null
-        if ($Click -ne 'owner') { $handsOff = Start-HandsOff "clicks a toast itself ($Name, the mouse moves)" 20 }
-        $before = Get-UiaSnapshot
-        $r = Post-Toast "$Name-$post" $toastArgs
-        $attempt = [ordered]@{ post = $post; posted = (P $r 'posted'); shortcut = $script:ShortcutForm; found = $null; clicks = @(); clicked_by = $null }
+        $attempt = [ordered]@{ post = $post; posted = $null; shortcut = $script:ShortcutForm; found = $null; clicks = @(); clicked_by = $null }
         $result = $null
         $mode = $Click
-        if ($mode -ne 'owner') {
-            $w = Watch-Needle -Needle "#$nonce" -Before $before -Seconds 8 -UntilFound
-            $attempt.found = $w.Record
-            if ($null -eq $w.Hit) {
-                if ($script:Uia.proven) { $mode = 'none' }
-                else { $mode = 'owner'; $attempt.fallback = 'UIA has not found a toast in this run: the owner clicks' }
-            } else {
-                $el = $w.Hit.Element
-                # This toast's own names (review N-I3): anything else in the scope stops the action.
-                $allowed = @('LILITH spike', 'LILITH Spike', 'Open')
-                if ($Target -eq 'button') {
-                    $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' } $allowed @()
-                    if ($b.Ok) { $el = $b.Button; $attempt.button_depth = $b.Depth } else { $attempt.button_missing = $true; $attempt.button_why = $b.Why }
-                }
-                $ways = $(if ($mode -eq 'synthetic') { @('mouse') } else { @('invoke', 'mouse') })
-                foreach ($way in $ways) {
-                    if ($Target -eq 'button' -and $attempt.Contains('button_missing')) { break }
-                    $c = $(if ($way -eq 'invoke') { if ($Target -eq 'button') { Invoke-UiaButton $el } else { Invoke-UiaElement $w.Hit "#$nonce" $allowed @() } } else { Click-ElementCentre $el $w.Hit.TopInfo })
-                    $attempt.clicks += $c
-                    if ($c.ok) { $result = & $Await $n $ctx 6 }
-                    if ($null -ne $result) { $attempt.clicked_by = $c.mode; break }
-                }
-                if ($null -eq $result -and @($attempt.clicks | Where-Object { $_.Contains('owner_active') }).Count -gt 0) {
-                    $mode = 'owner'; $attempt.fallback = 'the owner was using the PC during the synthesized click: the owner clicks'
+        # Hands off from before the post: the banner lasts only a few seconds (owner direction:
+        # the pop-up warns 10 s ahead). The pop-up is cleared in the finally on every path.
+        $handsOff = $null
+        try {
+            if ($Click -ne 'owner') { $handsOff = Start-HandsOff "clicks a toast itself ($Name, the mouse moves)" 20; $attempt.hands_off = $handsOff.Record }
+            $before = Get-UiaSnapshot
+            $r = Post-Toast "$Name-$post" $toastArgs
+            $attempt.posted = P $r 'posted'
+            if ($mode -ne 'owner') {
+                $w = Watch-Needle -Needle "#$nonce" -Before $before -Seconds 8 -UntilFound
+                $attempt.found = $w.Record
+                if ($null -eq $w.Hit) {
+                    if ($script:Uia.proven) { $mode = 'none' }
+                    else { $mode = 'owner'; $attempt.fallback = 'UIA has not found a toast in this run: the owner clicks' }
+                } else {
+                    $el = $w.Hit.Element
+                    # This toast's own names (review N-I3), plus Windows' own toast chrome, which is
+                    # known but never pressed (fix round 3, N2-I2): only "Open" is ever accepted.
+                    $allowed = @('LILITH spike', 'LILITH Spike', 'Open')
+                    $chrome = @('(?i)^(dismiss|close)\b', '(?i)^(more|more options|see more|options|\.\.\.|…)$', '(?i)settings', '(?i)\bLILITH Spike\b')
+                    if ($Target -eq 'button') {
+                        $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' } $allowed $chrome
+                        if ($b.Ok) { $el = $b.Button; $attempt.button_depth = $b.Depth }
+                        else { $attempt.button_missing = $true; $attempt.button_why = $b.Why; $attempt.unknown_controls = $b.UnknownControls }
+                    }
+                    if (-not $attempt.Contains('button_missing')) {
+                        $ways = $(if ($mode -eq 'synthetic') { @('mouse') } else { @('invoke', 'mouse') })
+                        foreach ($way in $ways) {
+                            $c = $(if ($way -eq 'invoke') { if ($Target -eq 'button') { Invoke-UiaButton $el } else { Invoke-UiaElement $w.Hit "#$nonce" $allowed $chrome } } else { Click-ElementCentre $el $w.Hit.TopInfo })
+                            $attempt.clicks += $c
+                            if ($c.ok) { $result = & $Await $n $ctx 6 }
+                            if ($null -ne $result) { $attempt.clicked_by = $c.mode; break }
+                        }
+                    }
+                    if ($null -eq $result) {
+                        $fb = Get-ClickFallback $attempt
+                        if ($null -ne $fb) { $mode = 'owner'; $attempt.fallback = "${fb}: the owner clicks" }
+                    }
                 }
             }
+        } finally {
+            Stop-HandsOff $handsOff
         }
-        Stop-HandsOff $handsOff
         if ($mode -eq 'owner') {
             Say $Instruction
             $result = & $Await $n $ctx 60
@@ -1183,6 +1212,17 @@ function Find-EarlierListing {
     $null
 }
 
+# The span the stay-awake verdict judges: from the core's "set" event to its "cleared" event
+# (unix ms). Missing events fall back to $StartMs and to now. Pure; tested.
+function Get-HoldSpan($Events, [long]$StartMs) {
+    $set = @(@($Events) | Where-Object { $null -ne $_ -and (P $_ 'kind') -eq 'set' } | Select-Object -First 1)
+    $clr = @(@($Events) | Where-Object { $null -ne $_ -and (P $_ 'kind') -eq 'cleared' } | Select-Object -First 1)
+    [ordered]@{
+        set_ms = $(if ($set.Count -gt 0) { [long](P $set[0] 't_ms') } else { $StartMs })
+        cleared_ms = $(if ($clr.Count -gt 0) { [long](P $clr[0] 't_ms') } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() })
+    }
+}
+
 # Whether input came during a quiet stretch: the PC's idle time is shorter than the stretch so far
 # (5 s slack). Pure; tested.
 function Test-InputDuring([double]$StretchS, $IdleS) {
@@ -1271,22 +1311,29 @@ function Power-StayAwake([string]$Api, $Timeout) {
             if ($null -ne $d -and @(P $d 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' }).Count -gt 0) { break }
         }
     } finally {
+        # The pop-up first, each on its own: Stop-Power throws when the core outlives 30 s.
+        try { Stop-HandsOff $handsOff } catch { }
         $doc = Stop-Power $c
-        Stop-HandsOff $handsOff
     }
     $elapsed = ((Get-Date) - $t0).TotalSeconds
-    $slept = @(P $doc 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' })
-    # After the release: the execution state again at once and 30 s later (another requester
-    # still holding it shows here).
+    # Only the span from the request being set to its being cleared is judged (fix round 3,
+    # N2-I1): anything after the release is recorded as information.
+    $span = Get-HoldSpan @(P $doc 'events') ([DateTimeOffset]$t0).ToUnixTimeMilliseconds()
+    $allSleep = @(P $doc 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' })
+    $slept = @($allSleep | Where-Object { [long]$_.t_ms -le $span.cleared_ms })
+    $sleptAfter = @($allSleep | Where-Object { [long]$_.t_ms -gt $span.cleared_ms })
+    # After the release: the execution state again at once and 5 s later (another requester
+    # still holding it shows here; kept short, since the PC may sleep once released).
     $after = @((Get-PowerEvidence))
-    Start-Sleep -Seconds 30
+    Start-Sleep -Seconds 5
     $after += @((Get-PowerEvidence))
     foreach ($a in $after) { [void]$evidence.Add([ordered]@{ phase = 'after'; reading = $a }) }
     # An independent witness: the System log's Kernel-Power sleep, resume and Modern Standby
-    # entries since the request was set (42 sleep, 107 resume, 506/507 standby enter/exit) (M6).
+    # entries in the hold's span (42 sleep, 107 resume, 506/507 standby enter/exit) (M6).
     $kernel = @()
     try {
-        $kernel = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 107, 506, 507; StartTime = $t0 } -ErrorAction Stop |
+        $kernel = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 107, 506, 507
+                StartTime = [DateTimeOffset]::FromUnixTimeMilliseconds($span.set_ms).LocalDateTime; EndTime = [DateTimeOffset]::FromUnixTimeMilliseconds($span.cleared_ms).LocalDateTime } -ErrorAction Stop |
             ForEach-Object { [ordered]@{ id = $_.Id; at = $_.TimeCreated.ToUniversalTime().ToString('o') } })
     } catch [Exception] {
         if ($_.Exception.Message -notmatch 'No events were found') { $kernel = @([ordered]@{ error = $_.Exception.Message }) }
@@ -1296,7 +1343,8 @@ function Power-StayAwake([string]$Api, $Timeout) {
     $notDecisive = Get-StayNotDecisive $pre $held $after
     $r = [ordered]@{
         api = $Api; timeout_s = $Timeout.used_s; needed_quiet_s = $needS; waited_s = [int]$elapsed
-        restarts = $restarts; slept_events = $slept; kernel_power_events = $kernel
+        restarts = $restarts; hold_span = $span; slept_events = $slept; kernel_power_events = $kernel
+        slept_after_release = $sleptAfter; slept_after_release_note = 'information only: after the request was cleared'
         idle_method = 'GetLastInputInfo every 30 s'
         evidence = $evidence.ToArray()
         self_check_system_required_while_held = $(if ($held.Count -gt 0) { @($held | Where-Object { (P $_ 'system_required') -ne $true }).Count -eq 0 } else { $null })
@@ -1574,6 +1622,7 @@ finally {
     $Report.cleanup = Invoke-Cleanup -Final
     $stage.cleanup = $Report.cleanup
     $stage.uia_hosts = $script:Uia.hosts
+    $stage.hands_off = @($script:HandsOffLog)
     $Report.finished = (Get-Date).ToUniversalTime().ToString('o')
     Save-Report
     Say ("Cleanup -> {0}" -f $(if ($Report.cleanup.pass) { 'PASS' } else { 'FAIL' })) $(if ($Report.cleanup.pass) { 'Green' } else { 'Red' })

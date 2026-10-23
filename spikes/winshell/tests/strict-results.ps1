@@ -229,6 +229,58 @@ function Run1($Pass, $Int) { [ordered]@{ pass = $Pass; interrupted_by_sleep = $I
 Try-Case 'sandbox verdict: 3 of 3' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $true $false), (Run1 $true $false)) } 'PASS'
 Try-Case 'sandbox verdict: one interrupted' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $null $true), (Run1 $true $false)) } 'INCOMPLETE (1 run(s) interrupted by sleep: rerun them)'
 Try-Case 'sandbox verdict: a judged FAIL decides' { Get-SandboxVerdict @((Run1 $false $false), (Run1 $null $true)) } 'FAIL'
+# ---- Fix round 3: a pinned process (N2-C1). A process this test starts itself (ping, no window)
+# is pinned at once; once it has exited, HasExited stays true on the pinned object and
+# Stop-PinnedProcess does nothing, whatever now has its pid. The identity checks refuse a
+# process that started before the given time or runs another exe.
+function Start-Ping([int]$Count) {
+    $si = New-Object System.Diagnostics.ProcessStartInfo
+    $si.FileName = Join-Path $env:windir 'System32\PING.EXE'
+    $si.Arguments = "-n $Count 127.0.0.1"
+    $si.UseShellExecute = $false; $si.CreateNoWindow = $true; $si.RedirectStandardOutput = $true
+    [System.Diagnostics.Process]::Start($si)
+}
+$pingExe = Join-Path $env:windir 'System32\PING.EXE'
+$t = Get-Date
+$pingProc = Start-Ping 1
+$pinned = Get-PinnedProcess $pingProc.Id $pingExe $t
+Try-Case 'pinned: the process just started is pinned' { $null -ne $pinned } 'True'
+[void]$pingProc.WaitForExit(10000)
+Try-Case 'pinned: HasExited after it ended' { if ($null -ne $pinned) { [void]$pinned.WaitForExit(10000); $pinned.HasExited } else { 'not pinned' } } 'True'
+Try-Case 'pinned: Stop-PinnedProcess on an exited process does nothing' { try { Stop-PinnedProcess $pinned; 'no-op' } catch { "threw $($_.Exception.Message)" } } 'no-op'
+$live = Start-Ping 3
+Try-Case 'pinned: refuses a process older than the start' { $null -eq (Get-PinnedProcess $live.Id $pingExe (Get-Date).AddMinutes(5)) } 'True'
+Try-Case 'pinned: refuses another exe' { $null -eq (Get-PinnedProcess $live.Id 'C:\nowhere\other.exe' $t) } 'True'
+Try-Case 'pinned: refuses a pid that is gone' { $null -eq (Get-PinnedProcess 2147483000 $pingExe $t) } 'True'
+Stop-PinnedProcess $live
+[void]$live.WaitForExit(5000)
+Try-Case 'pinned: Stop-PinnedProcess ends the live one it pinned' { $live.HasExited } 'True'
+
+# ---- Fix round 3: S1.3 refusals go to the owner (N2-I2)
+Try-Case 'fallback: the button refused' { Get-ClickFallback ([ordered]@{ button_missing = $true; button_why = 'no such button inside this toast''s own list item'; clicks = @() }) } 'the script refused to act: no such button inside this toast''s own list item'
+Try-Case 'fallback: every way refused' { Get-ClickFallback ([ordered]@{ clicks = @([ordered]@{ ok = $false; why = 'UIA puts no candidate point on the target' }, [ordered]@{ ok = $false; why = 'the per-monitor DPI context did not apply: nothing clicked' }) }) } 'the script refused to act: UIA puts no candidate point on the target'
+Try-Case 'fallback: the owner was active' { Get-ClickFallback ([ordered]@{ clicks = @([ordered]@{ ok = $false; owner_active = $true; why = 'owner active' }) }) } 'the owner was using the PC during the synthesized click'
+Try-Case 'fallback: a click was made (only the launch is missing): repost' { $null -eq (Get-ClickFallback ([ordered]@{ clicks = @([ordered]@{ ok = $true }) })) } 'True'
+$chrome = @('(?i)^(dismiss|close)\b', '(?i)^(more|more options|see more|options|\.\.\.|…)$', '(?i)settings', '(?i)\bLILITH Spike\b')
+Try-Case 'S1.3 chrome is known, so it does not refuse' {
+    $r = Select-ToastTarget @((Lv 0 $true @('LILITH spike', $text, 'Open', 'Dismiss', '...', 'Notification settings', 'Notification from LILITH Spike') @((Btn 'Open'), (Btn 'Dismiss'), (Btn '...')))) '#a1b2c3' $own @() $isOpen
+    "$($r.ok)"
+} 'False'
+Try-Case 'S1.3 chrome with the chrome patterns: Open is pressed, chrome never' {
+    $r = Select-ToastTarget @((Lv 0 $true @('LILITH spike', $text, 'Open', 'Dismiss', '...', 'Notification settings', 'Notification from LILITH Spike') @((Btn 'Dismiss'), (Btn '...'), (Btn 'Open')))) '#a1b2c3' $own $chrome $isOpen
+    "$($r.ok) $($r.candidate['name'])"
+} 'True Open'
+Try-Case 'unknown controls: AutomationId and control type only, never the Name' {
+    $lv = Lv 0 $true @($text, 'Open', 'Hi from a friend') @((Btn 'Open'))
+    $lv.elements = @([ordered]@{ name = $text; automation_id = 'Text1'; control = 'ControlType.Text'; class = 'TextBlock' }, [ordered]@{ name = 'Open'; automation_id = 'B'; control = 'ControlType.Button'; class = 'Button' }, [ordered]@{ name = 'Hi from a friend'; automation_id = 'Body2'; control = 'ControlType.Text'; class = 'TextBlock' })
+    $r = Select-ToastTarget @($lv) '#a1b2c3' $own @() $isOpen
+    $u = @($r.unknown_controls)
+    "$($u.Count) $($u[0]['automation_id']) $($u[0]['control_type']) $(($r | ConvertTo-Json -Depth 5).Contains('Hi from a friend'))"
+} '1 Body2 ControlType.Text False'
+
+# ---- Fix round 3: S1.7 judges the hold's span only (N2-I1)
+Try-Case 'hold span: from set to cleared' { $sp = Get-HoldSpan @([ordered]@{ kind = 'window'; t_ms = 1 }, [ordered]@{ kind = 'set'; t_ms = 1000 }, [ordered]@{ kind = 'cleared'; t_ms = 9000 }) 500; "$($sp.set_ms)-$($sp.cleared_ms)" } '1000-9000'
+Try-Case 'hold span: no set event falls back to the start' { (Get-HoldSpan @([ordered]@{ kind = 'cleared'; t_ms = 9000 }) 500).set_ms } '500'
 # ---- The CLSID read-back (rerun of 2026-10-23: S1.2p, S1.3 and S1.4 stopped at the compare).
 # The root cause, reproduced: a [switch] parameter named like the script's $ToastClsid string
 # hides that string inside the function, and the CLSID is compared with "True".

@@ -23,7 +23,7 @@ A session is two commands (the two blocks below), run from a normal **Windows Te
    pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Attended -Task0Repo "<folder of Task 0's worktree>"
    ```
 
-2. **The unattended block, with nobody at the PC.** Its length follows "Sleep after": about 55 minutes with it at 5 minutes (your plan), about 2 hours 40 minutes at 2 hours. Start it when you leave. When the attended block ends it prints this command for you:
+2. **The unattended block, with nobody at the PC.** Its length follows "Sleep after": about 45 minutes with it at 5 minutes (your plan), about 2 hours 40 minutes at 2 hours; the block prints its own figure before it starts. Start it when you leave. When the attended block ends it prints this command for you:
 
    ```powershell
    pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Unattended -Task0Repo "<folder of Task 0's worktree>"
@@ -68,7 +68,7 @@ Each block prints its plan and its time on this PC, then waits for Enter. The un
 **"Sleep after".** The wait follows this PC's "Sleep after" (on mains) setting in Settings, System, Power. The scripts only read it and never change it.
 - **Your plan:** set it to 5 minutes yourself before the unattended block, and back afterwards.
 - **At the start**, the unattended block prints the value it finds and how long the block will take.
-- **At the end**, the terminal reminds you of the value the attended block noted, for example "set it back to 2 h 00 min".
+- **At the end**, the terminal reminds you of the largest value the attended blocks noted, for example "set it back to 2 h 00 min".
 
 **Nothing else may keep the PC awake during the wait.**
 - **The script checks before you press Enter,** while you are still there. If something holds the PC awake, it says what to do and checks again each time you press Enter. Type `skip` to run only the Sandbox part.

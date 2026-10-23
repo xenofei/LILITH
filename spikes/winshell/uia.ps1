@@ -171,8 +171,10 @@ namespace SpikeUi {
             i[1].type = 0; i[1].u.mi.dx = nx; i[1].u.mi.dy = ny; i[1].u.mi.dwFlags = at | 0x0004;   // LEFTUP
             uint n = SendInput(2, i, Marshal.SizeOf(typeof(INPUT)));
             MarkInjected();
-            POINT landed; GetPhysicalCursorPos(out landed); LandedX = landed.X; LandedY = landed.Y;
+            // Injected input is processed asynchronously: the landing point is read after the wait,
+            // before the cursor is put back (review m4 of fix round 2).
             Thread.Sleep(150);
+            POINT landed; GetPhysicalCursorPos(out landed); LandedX = landed.X; LandedY = landed.Y;
             SetPhysicalCursorPos(old.X, old.Y);
             return n == 2 ? 2 : -3;
         }
@@ -268,11 +270,114 @@ namespace SpikeUi {
 $script:Uia = [ordered]@{ ready = $false; error = $null; proven = $false; hosts = @() }
 $script:ProcNames = @{}
 $script:UiaSearchFailed = $false
-# The hands-off pop-ups this script started (Start-HandsOff): their processes, so that they are
-# ended only through their own Process objects, and their pids, which every window search and
-# foreground check skips.
+
+# The hands-off pop-ups this script started (Start-HandsOff), each with its pinned Process (an
+# open handle, so its pid can't be reused under it) and its state files.
 $script:Popups = @()
-$script:PopupPids = @()
+# Every pop-up's record (shown, took the foreground), for the results (review m1 of fix round 2).
+$script:HandsOffLog = @()
+
+# ---------------------------------------------------------------- the processes the scripts start
+
+# The process this script has just started, as a Process object that holds an open handle from
+# now on (review N2-C1): a Process from Get-Process -Id holds none, so a later HasExited or
+# Kill() would open whatever process has that pid by then. It must have started no earlier than
+# $NotBefore (2 s slack) and, when given, run $ExpectedPath; otherwise $null. This is the only
+# place a pid is turned into a Process the scripts may later check or end
+# (tests/kill_scope.rs checks that).
+function Get-PinnedProcess([int]$ProcessId, [string]$ExpectedPath, [datetime]$NotBefore) {
+    try {
+        $p = Get-Process -Id $ProcessId -ErrorAction Stop   # pin-lookup: right after the start
+        [void]$p.Handle
+        if ($ExpectedPath -and $p.Path -ne $ExpectedPath) { return $null }
+        if ($p.StartTime -lt $NotBefore.AddSeconds(-2)) { return $null }
+        $p
+    } catch { $null }
+}
+
+# Ends a pinned process if it is still running (a no-op for one that has exited).
+function Stop-PinnedProcess($Process) {
+    if ($null -eq $Process) { return }
+    try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
+}
+
+# The pids of this script's pop-ups that are still running (a dead pop-up's pid may be reused).
+function Get-PopupPids {
+    $script:Popups = @($script:Popups | Where-Object { $null -ne $_.Process -and -not $_.Process.HasExited })
+    @($script:Popups | ForEach-Object { [int]$_.Process.Id })
+}
+
+# Owner direction 2026-10-23: before anything that needs hands off the keyboard and mouse, a
+# topmost pop-up warns at least 10 s ahead, then counts down until the PC may be used again, and
+# says when it's done. The pop-up (popup.ps1, in Windows PowerShell 5.1 for WinForms) is started
+# detached, with no console, through winshell-tool spawn, and pinned at once. It never takes the
+# focus (WS_EX_NOACTIVATE, ShowWithoutActivation; topmost through SetWindowPos with
+# SWP_NOACTIVATE), is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT, so WindowFromPoint and
+# UIA's FromPoint look through it), sits at the top centre of the primary screen, away from the
+# toasts at the bottom right, and its pid is skipped by every window search and foreground check
+# while it runs. Without winshell-tool (inside the Sandbox) there is no pop-up.
+#
+# The handshake (fix round 3): the pop-up touches <state>.shown once it is on screen; this waits
+# for that (up to 8 s), then writes <state>.start with the hands-off start (epoch ms, 10 s from
+# then), and waits until that moment. The warning therefore lasts at least 10 s on screen, and
+# the countdown runs from the real start. With -NoWarnWait (a restarted stay-awake wait) it
+# doesn't wait. Whether the pop-up showed and whether it took the foreground is recorded.
+function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
+    Show-HandsOff $What
+    $spawned = Get-Date
+    $startAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 10000
+    $h = [pscustomobject]@{ Process = $null; StateFile = $null; Done = $false; Record = [ordered]@{ what = $What; shown = $false; took_foreground = $null } }
+    $tool = Get-Variable -Name ToolExe -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $popup = Join-Path $PSScriptRoot 'popup.ps1'
+    if ($tool -and (Test-Path -LiteralPath $tool) -and (Test-Path -LiteralPath $popup)) {
+        try {
+            $h.StateFile = Join-Path ([IO.Path]::GetTempPath()) ('winshell-popup-' + [guid]::NewGuid().ToString('N') + '.done')
+            $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $out = & $tool spawn '--' $ps -NoProfile -ExecutionPolicy Bypass -File $popup -What $What -StartAtMs $startAt -RunSec $Seconds -StateFile $h.StateFile -ParentPid $PID
+            $r = ($out | Out-String) | ConvertFrom-Json
+            if ($r.PSObject.Properties['pid']) {
+                $h.Process = Get-PinnedProcess ([int]$r.pid) $ps $spawned
+                if ($null -ne $h.Process) { $script:Popups = @($script:Popups) + @($h) }
+            }
+        } catch { }
+    }
+    if ($null -ne $h.Process -and -not $NoWarnWait) {
+        $deadline = (Get-Date).AddSeconds(8)
+        while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath "$($h.StateFile).shown") -and -not $h.Process.HasExited) { Start-Sleep -Milliseconds 100 }
+        $h.Record.shown = Test-Path -LiteralPath "$($h.StateFile).shown"
+        if ($h.Record.shown) {
+            $startAt = [math]::Max($startAt, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 10000)
+            try { Set-Content -LiteralPath "$($h.StateFile).start" -Value "$startAt" } catch { }
+            $fg = Get-ForegroundNow
+            $h.Record.took_foreground = ($null -ne $fg -and $fg.pid -eq $h.Process.Id)
+        }
+    }
+    $h.Record.popup_started = ($null -ne $h.Process)
+    $script:HandsOffLog = @($script:HandsOffLog) + @($h.Record)
+    if (-not $NoWarnWait) {
+        $wait = $startAt - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+    }
+    $h
+}
+
+# The stretch is over: the pop-up says "done" for 5 s and closes itself.
+function Stop-HandsOff($Handle) {
+    if ($null -eq $Handle -or -not $Handle.StateFile) { return }
+    $Handle.Done = $true
+    try { Set-Content -LiteralPath $Handle.StateFile -Value 'done' } catch { }
+}
+
+# Ends the pop-ups this script started that are still open and were never told they were done
+# (the others close themselves), through their pinned Process objects only (review N2-C1).
+function Stop-AllPopups {
+    foreach ($h in @($script:Popups)) {
+        if (-not $h.Done) { Stop-PinnedProcess $h.Process }
+    }
+    $script:Popups = @()
+# Every pop-up's record (shown, took the foreground), for the results (review m1 of fix round 2).
+$script:HandsOffLog = @()
+}
 
 function Initialize-SpikeUi {
     if ($script:Uia.ready) { return $true }
@@ -293,56 +398,11 @@ function Show-HandsOff([string]$What) {
     Write-Host "HANDS OFF: the script $What now. Ctrl+C in this terminal stops it." -ForegroundColor Yellow
 }
 
-# Owner direction 2026-10-23: before anything that needs hands off the keyboard and mouse, a
-# topmost pop-up warns at least 10 s ahead, then counts down until the PC may be used again, and
-# says when it's done. The pop-up (popup.ps1, in Windows PowerShell 5.1 for WinForms) is started
-# detached, with no console, through winshell-tool spawn. It never takes the focus (WS_EX_
-# NOACTIVATE, ShowWithoutActivation), is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT, so
-# WindowFromPoint and UIA's FromPoint look through it), sits at the top centre of the primary
-# screen, away from the toasts at the bottom right, and its pid is skipped by every window
-# search and foreground check here. Without winshell-tool (inside the Sandbox) there is no pop-up.
-# -NoWarnWait shows the warning without waiting for it (a restarted stay-awake wait).
-function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
-    Show-HandsOff $What
-    $h = [pscustomobject]@{ Process = $null; StateFile = $null; Started = (Get-Date) }
-    $tool = Get-Variable -Name ToolExe -Scope Script -ValueOnly -ErrorAction SilentlyContinue
-    $popup = Join-Path $PSScriptRoot 'popup.ps1'
-    if ($tool -and (Test-Path -LiteralPath $tool) -and (Test-Path -LiteralPath $popup)) {
-        try {
-            $h.StateFile = Join-Path ([IO.Path]::GetTempPath()) ('winshell-popup-' + [guid]::NewGuid().ToString('N') + '.done')
-            $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $out = & $tool spawn '--' $ps -NoProfile -ExecutionPolicy Bypass -File $popup -What $What -WarnSec 10 -RunSec $Seconds -StateFile $h.StateFile -ParentPid $PID
-            $r = ($out | Out-String) | ConvertFrom-Json
-            if ($r.PSObject.Properties['pid']) {
-                $p = Get-Process -Id ([int]$r.pid) -ErrorAction SilentlyContinue
-                if ($p -and $p.Path -and $p.Path -eq $ps) {
-                    $h.Process = $p
-                    $script:Popups = @($script:Popups) + @($p)
-                    $script:PopupPids = @($script:PopupPids) + @([int]$p.Id)
-                }
-            }
-        } catch { }
-    }
-    if (-not $NoWarnWait) { Start-Sleep -Seconds 10 }
-    $h
-}
-
-# The stretch is over: the pop-up says "done" for 5 s and closes itself.
-function Stop-HandsOff($Handle) {
-    if ($null -eq $Handle -or -not $Handle.StateFile) { return }
-    try { Set-Content -LiteralPath $Handle.StateFile -Value 'done' } catch { }
-}
-
-# Ends every pop-up this script started that is still open (its own Process objects only).
-function Stop-AllPopups {
-    foreach ($p in @($script:Popups)) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
-    $script:Popups = @()
-}
 
 function Get-ProcName([int]$ProcessId) {
     if (-not $script:ProcNames.ContainsKey($ProcessId)) {
         $n = $null
-        try { $n = (Get-Process -Id $ProcessId -ErrorAction Stop).ProcessName } catch { }
+        try { $n = (Get-Process -Id $ProcessId -ErrorAction Stop).ProcessName } catch { }   # read-only pid lookup: the name only
         $script:ProcNames[$ProcessId] = $n
     }
     $script:ProcNames[$ProcessId]
@@ -351,8 +411,9 @@ function Get-ProcName([int]$ProcessId) {
 # The visible top-level windows, in z-order, without this script's own pop-ups.
 function Get-UiaTop {
     $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $live = @(Get-PopupPids)
     @($root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
-        Where-Object { $_.Current.ProcessId -notin $script:PopupPids })
+        Where-Object { $_.Current.ProcessId -notin $live })
 }
 
 function Get-TopInfo($Top) {
@@ -511,15 +572,18 @@ function Test-OnlyThisToast([string[]]$Names, [string]$Needle, [int]$OpenButtons
 # no other app's text is recorded). Pure; tested.
 function Test-ScopeNames([string[]]$Names, [string]$Needle, [string[]]$Allowed, [string[]]$Patterns) {
     $unknown = @()
-    foreach ($n in @($Names | Where-Object { $_ })) {
-        if ($n.Contains($Needle)) { if (@([regex]::Matches($n, '#[0-9a-f]{6}') | Where-Object { $_.Value -ne $Needle }).Count -gt 0) { $unknown += $n }; continue }
+    $all = @($Names)
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $n = "$($all[$i])"
+        if (-not $n) { continue }
+        if ($n.Contains($Needle)) { if (@([regex]::Matches($n, '#[0-9a-f]{6}') | Where-Object { $_.Value -ne $Needle }).Count -gt 0) { $unknown += $i }; continue }
         if (@($Allowed | Where-Object { $_ -and $n -eq $_ }).Count -gt 0) { continue }
         if (@($Patterns | Where-Object { $_ -and $n -match $_ }).Count -gt 0) { continue }
-        $unknown += $n
+        $unknown += $i
     }
-    # The first few unknown names, cut to 40 characters, go into the local (git-ignored) results,
-    # so that the next round can tell Windows' own toast chrome from another app's entry.
-    [ordered]@{ ok = ($unknown.Count -eq 0); unknown = $unknown.Count; unknown_names = @($unknown | Select-Object -First 5 | ForEach-Object { if ($_.Length -gt 40) { $_.Substring(0, 40) } else { $_ } }) }
+    # Only the count and the positions come back, never the Names (fix round 3 ruling 5): the
+    # caller records the unknown elements' AutomationIds and control types instead.
+    [ordered]@{ ok = ($unknown.Count -eq 0); unknown = $unknown.Count; unknown_index = $unknown }
 }
 
 # Never pressed, whatever else it says: anything about "clear" or "all" (the notification
@@ -553,7 +617,11 @@ function Select-ToastTarget($Levels, [string]$Needle, [string[]]$Allowed, [strin
             if (@(@($lv['names']) | Where-Object { $_ -and $_.Contains($Needle) }).Count -eq 0) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'the scope does not hold this toast''s text: nothing pressed' } }
             if (-not (Test-OnlyThisToast $lv['names'] $Needle $open)) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'the scope holds another spike toast or a second Open: nothing pressed' } }
             $scope = Test-ScopeNames $lv['names'] $Needle $Allowed $Patterns
-            if (-not $scope.ok) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = "the scope holds $($scope.unknown) name(s) that are not this toast's own: nothing pressed"; unknown_names = $scope.unknown_names } }
+            if (-not $scope.ok) {
+                $els = @($lv['elements'])
+                $ctl = @(@($scope.unknown_index) | Select-Object -First 8 | ForEach-Object { if ($_ -lt $els.Count -and $null -ne $els[$_]) { [ordered]@{ automation_id = $els[$_]['automation_id']; control_type = $els[$_]['control']; class = $els[$_]['class'] } } })
+                return [ordered]@{ ok = $false; depth = $lv['depth']; why = "the scope holds $($scope.unknown) name(s) that are not this toast's own: nothing pressed"; unknown_controls = $ctl }
+            }
             if ($null -ne $pick['rect'] -and $null -ne $lv['rect'] -and -not (Test-RectInside $pick['rect'] $lv['rect'])) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'the button lies outside the toast: nothing pressed' } }
             return [ordered]@{ ok = $true; depth = $lv['depth']; candidate = $pick }
         }
@@ -562,9 +630,16 @@ function Select-ToastTarget($Levels, [string]$Needle, [string[]]$Allowed, [strin
     [ordered]@{ ok = $false; why = 'no such button near this toast' }
 }
 
-function Get-SubtreeNames($Element) {
+function Get-SubtreeNames($Element) { @(Get-SubtreeElements $Element | ForEach-Object { $_['name'] }) }
+
+# {name, automation_id, control, class} for every element of a subtree; an unreadable one is
+# named '<unreadable>', which no scope accepts.
+function Get-SubtreeElements($Element) {
     @($Element.FindAll([System.Windows.Automation.TreeScope]::Subtree, [System.Windows.Automation.Condition]::TrueCondition) |
-        ForEach-Object { try { $_.Current.Name } catch { '<unreadable>' } })
+        ForEach-Object {
+            try { $c = $_.Current; [ordered]@{ name = $c.Name; automation_id = $c.AutomationId; control = $c.ControlType.ProgrammaticName; class = $c.ClassName } }
+            catch { [ordered]@{ name = '<unreadable>'; automation_id = $null; control = $null; class = $null } }
+        })
 }
 
 function Get-Buttons($Element) {
@@ -592,7 +667,8 @@ function Get-ToastLevels($Hit, [switch]$Invoke) {
         } else {
             $cands = @(Get-Buttons $e | ForEach-Object { [ordered]@{ name = $_.Current.Name; automation_id = $_.Current.AutomationId; rect = $_.Current.BoundingRectangle; element = $_ } })
         }
-        $levels += [ordered]@{ depth = $i; list_item = $isItem; names = @(Get-SubtreeNames $e); rect = $c.BoundingRectangle; candidates = $cands }
+        $els = @(Get-SubtreeElements $e)
+        $levels += [ordered]@{ depth = $i; list_item = $isItem; names = @($els | ForEach-Object { $_['name'] }); elements = $els; rect = $c.BoundingRectangle; candidates = $cands }
         if ($isItem -or [int64]$c.NativeWindowHandle -eq $topHwnd) { break }
         $e = $walker.GetParent($e)
     }
@@ -602,7 +678,7 @@ function Get-ToastLevels($Hit, [switch]$Invoke) {
 # This toast's own button that $Accept takes, or $null (then nothing is pressed); with the why.
 function Find-ToastButton($Hit, [string]$Needle, [scriptblock]$Accept, [string[]]$Allowed, [string[]]$Patterns) {
     $sel = Select-ToastTarget (Get-ToastLevels $Hit) $Needle $Allowed $Patterns $Accept
-    [pscustomobject]@{ Ok = [bool]$sel.ok; Button = $(if ($sel.ok) { $sel.candidate['element'] } else { $null }); Why = (P2 $sel 'why'); Depth = (P2 $sel 'depth') }
+    [pscustomobject]@{ Ok = [bool]$sel.ok; Button = $(if ($sel.ok) { $sel.candidate['element'] } else { $null }); Why = (P2 $sel 'why'); Depth = (P2 $sel 'depth'); UnknownControls = (P2 $sel 'unknown_controls') }
 }
 
 function P2($Obj, [string]$Name) { if ($null -ne $Obj -and $Obj.Contains($Name)) { $Obj[$Name] } else { $null } }
@@ -638,7 +714,7 @@ function Test-PointOnElement([int]$X, [int]$Y, $Target) {
 function Invoke-UiaElement($Hit, [string]$Needle, [string[]]$Allowed, [string[]]$Patterns) {
     try {
         $sel = Select-ToastTarget (Get-ToastLevels $Hit -Invoke) $Needle $Allowed $Patterns { param($n, $a) $true }
-        if (-not $sel.ok) { return [ordered]@{ mode = 'uia-invoke'; ok = $false; why = $sel.why } }
+        if (-not $sel.ok) { return [ordered]@{ mode = 'uia-invoke'; ok = $false; refused = $true; why = $sel.why; unknown_controls = (P2 $sel 'unknown_controls') } }
         $info = Get-ElementInfo $sel.candidate['element']
         $sel.candidate['pattern'].Invoke()
         [ordered]@{ mode = 'uia-invoke'; ok = $true; invoked = $info; levels_up = $sel.depth }
@@ -777,7 +853,7 @@ function Get-PowerEvidence {
 function Get-CentreHwnd($Watch, $Before) {
     if ($null -ne $Watch.Hit) { return [int64]$Watch.Hit.TopInfo.hwnd }
     $fg = Get-ForegroundNow
-    if ($null -ne $fg -and $fg.hwnd -ne 0 -and $fg.pid -notin $script:PopupPids -and -not (Test-WasShown $Before ([int64]$fg.hwnd))) { return [int64]$fg.hwnd }
+    if ($null -ne $fg -and $fg.hwnd -ne 0 -and $fg.pid -notin @(Get-PopupPids) -and -not (Test-WasShown $Before ([int64]$fg.hwnd))) { return [int64]$fg.hwnd }
     [int64]0
 }
 
@@ -845,6 +921,7 @@ function Dismiss-InNotificationCentre([string]$Needle, [string[]]$Allowed, [stri
                     $rec.ok = [bool]$how.ok
                 } else {
                     $rec.why = "$($found.Why)"
+                    $rec.unknown_controls = $found.UnknownControls
                 }
             }
         }
@@ -874,8 +951,9 @@ function Get-KeepAwakeAdvice([string]$State) {
 # sleep, 107 resume), each {t_ms, ...}. Returns {slept, events, kernel}. Pure; tested.
 function Get-SleepInWindow($Events, $Kernel, [long]$FromMs, [long]$ToMs) {
     $in = { param($e) $null -ne $e -and [long](P2o $e 't_ms') -ge $FromMs -and [long](P2o $e 't_ms') -le $ToMs }
+    # 42 sleep, 107 resume, 506 and 507 Modern Standby enter and exit (fix round 3 m8).
     $ev = @(@($Events) | Where-Object { (& $in $_) -and ((P2o $_ 'kind') -eq 'clock_jump' -or ((P2o $_ 'kind') -eq 'power_broadcast' -and (P2o $_ 'pbt') -in 'PBT_APMSUSPEND', 'PBT_APMRESUMEAUTOMATIC', 'PBT_APMRESUMESUSPEND')) })
-    $kn = @(@($Kernel) | Where-Object { (& $in $_) -and (P2o $_ 'id') -in 42, 107 })
+    $kn = @(@($Kernel) | Where-Object { (& $in $_) -and (P2o $_ 'id') -in 42, 107, 506, 507 })
     [ordered]@{ slept = ($ev.Count + $kn.Count) -gt 0; events = $ev; kernel = $kn }
 }
 

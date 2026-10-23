@@ -190,7 +190,15 @@ function Assert-NoSandboxRunning {
 function Get-OwnPids($Started) {
     $now = @(Get-SandboxPids)
     $fresh = @($now | Where-Object { $_ -notin $Started.pids_before })
-    foreach ($p in $fresh) { if ($Started.own_pids -notcontains $p) { $Started.own_pids += $p } }
+    foreach ($p in $fresh) {
+        if ($Started.own_pids -notcontains $p) {
+            $Started.own_pids += $p
+            # Pinned the moment it is first seen (an open handle, so a later stop can only reach
+            # this process; fix round 3, N2-C1). Its name is checked again on the pinned object.
+            $pp = Get-PinnedProcess $p '' $Started.started_at
+            if ($null -ne $pp -and $pp.ProcessName -match '^WindowsSandbox') { $Started.own_procs += $pp }
+        }
+    }
     $fresh
 }
 
@@ -201,6 +209,7 @@ function Test-SandboxRunning($Started) {
 }
 
 function Start-Sandbox([string]$WsbFile) {
+    $startedAt = Get-Date
     $before = @(Get-SandboxPids)
     if (Get-Command wsb -ErrorAction SilentlyContinue) {
         # One line: the configuration is passed as a single command-line argument.
@@ -209,10 +218,10 @@ function Start-Sandbox([string]$WsbFile) {
         $id = [regex]::Match($out, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}').Value
         # The logon command needs a user session: connect opens the Sandbox window.
         if ($id) { Start-Process -FilePath wsb -ArgumentList 'connect', '--id', $id | Out-Null }
-        return [ordered]@{ via = 'wsb start + wsb connect'; id = $id; start_output = $out.Trim(); process = $null; pids_before = $before; own_pids = @() }
+        return [ordered]@{ via = 'wsb start + wsb connect'; id = $id; start_output = $out.Trim(); process = $null; pids_before = $before; own_pids = @(); own_procs = @(); started_at = $startedAt }
     }
     $p = Start-Process -FilePath (Join-Path $env:windir 'System32\WindowsSandbox.exe') -ArgumentList "`"$WsbFile`"" -PassThru
-    [ordered]@{ via = 'WindowsSandbox.exe <file.wsb>'; id = $null; start_output = $null; process = $p.Id; pids_before = $before; own_pids = @() }
+    [ordered]@{ via = 'WindowsSandbox.exe <file.wsb>'; id = $null; start_output = $null; process = $p.Id; pids_before = $before; own_pids = @(); own_procs = @($p); started_at = $startedAt }
 }
 
 # Waits for the Sandbox to close by itself (inside.ps1 ends with shutdown /s /t 0), then tries
@@ -229,12 +238,13 @@ function Stop-Sandbox($Started, [switch]$Now) {
         Start-Sleep -Seconds 15
         if (-not (Test-SandboxRunning $Started)) { return [ordered]@{ method = 'wsb stop --id'; tries = $tries } }
     }
-    $procs = @(Get-OwnPids $Started | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-    $tries += "Stop-Process (own pids): $(($procs | ForEach-Object { "$($_.Name) $($_.Id)" }) -join ', ')"
-    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    [void](Get-OwnPids $Started)
+    $procs = @($Started.own_procs | Where-Object { $null -ne $_ -and -not $_.HasExited })
+    $tries += "Kill (the run's own pinned WindowsSandbox* processes): $(($procs | ForEach-Object { "$($_.ProcessName) $($_.Id)" }) -join ', ')"
+    foreach ($pp in $procs) { Stop-PinnedProcess $pp }
     Start-Sleep -Seconds 10
-    $still = if ($Started.id) { Test-SandboxRunning $Started } else { @(Get-OwnPids $Started).Count -gt 0 }
-    [ordered]@{ method = $(if ($still) { 'none worked' } else { 'Stop-Process (the run''s own WindowsSandbox* pids)' }); tries = $tries }
+    $still = if ($Started.id) { Test-SandboxRunning $Started } else { @($Started.own_procs | Where-Object { $null -ne $_ -and -not $_.HasExited }).Count -gt 0 }
+    [ordered]@{ method = $(if ($still) { 'none worked' } else { 'Kill (the run''s own pinned WindowsSandbox* processes)' }); tries = $tries }
 }
 
 # ---------------------------------------------------------------- the bundle
@@ -360,10 +370,11 @@ function Start-HostPowerWatch([switch]$Hold) {
     $out = Join-Path $dir 'power.json'
     Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
     $env:WINSHELL_LOG_DIR = $dir
+    $spawned = Get-Date
     try { $r = Tool spawn '--' (Join-Path $Bin 'winshell-core.exe') power --api $(if ($Hold) { 'request' } else { 'none' }) --max-secs 43200 --parent-pid "$PID" --out $out }
     finally { Remove-Item Env:\WINSHELL_LOG_DIR -ErrorAction SilentlyContinue }
     $p = $null
-    if ($r -and $r.PSObject.Properties['pid']) { $p = Get-Process -Id ([int]$r.pid) -ErrorAction SilentlyContinue }
+    if ($r -and $r.PSObject.Properties['pid']) { $p = Get-PinnedProcess ([int]$r.pid) (Join-Path $Bin 'winshell-core.exe') $spawned }
     $script:HostPower = [pscustomobject]@{ Process = $p; Out = $out; Dir = $dir; Hold = [bool]$Hold }
     Say $(if ($Hold) { 'The host is kept awake for these runs (a parent-watched power request).' } else { 'The host''s sleep and wake are watched during these runs.' })
 }
@@ -373,7 +384,7 @@ function Stop-HostPowerWatch {
     if ($null -eq $h) { return $null }
     New-Item -ItemType File -Force -Path (Join-Path $h.Dir 'power-quit.flag') | Out-Null
     if ($null -ne $h.Process) {
-        try { if (-not $h.Process.WaitForExit(20000)) { $h.Process.Kill() } } catch { }
+        try { if (-not $h.Process.WaitForExit(20000)) { Stop-PinnedProcess $h.Process } } catch { }
     }
     Remove-Item (Join-Path $h.Dir 'power-*.flag') -ErrorAction SilentlyContinue
     Read-Json $h.Out
@@ -382,11 +393,15 @@ function Stop-HostPowerWatch {
 # The sleeps between two times (unix ms): the core's events, and the System log's Kernel-Power
 # sleep (42) and resume (107) entries.
 function Get-RunSleep([long]$FromMs, [long]$ToMs) {
-    $doc = $(if ($script:HostPower) { Read-Json $script:HostPower.Out } else { $null })
+    $doc = $null
+    if ($script:HostPower) {
+        $doc = Read-Json $script:HostPower.Out
+        if ($null -eq $doc) { Start-Sleep -Milliseconds 200; $doc = Read-Json $script:HostPower.Out }   # caught mid-write
+    }
     $kernel = @()
     try {
         $from = [DateTimeOffset]::FromUnixTimeMilliseconds($FromMs).LocalDateTime
-        $kernel = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 107; StartTime = $from } -ErrorAction Stop |
+        $kernel = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 107, 506, 507; StartTime = $from } -ErrorAction Stop |
             ForEach-Object { [ordered]@{ id = $_.Id; t_ms = ([DateTimeOffset]$_.TimeCreated).ToUnixTimeMilliseconds() } })
     } catch { }
     Get-SleepInWindow @(P $doc 'events') $kernel $FromMs $ToMs
@@ -405,7 +420,7 @@ function Wait-ResultFile([string]$Path, [int]$TimeoutSec) {
 function Stop-Blocker {
     $p = $script:BlockerProcess
     $script:BlockerProcess = $null
-    if ($null -ne $p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+    Stop-PinnedProcess $p   # a Start-Process -PassThru object: it holds the handle from the start
 }
 
 # Round 2's host state: one of the spike's own windows (a blocker) placed over the Sandbox
@@ -499,6 +514,12 @@ if ($Preflight) {
 
 # ---------------------------------------------------------------- main
 
+# The host's keep-awake (or sleep watch) starts first thing, before the build and the deploy copy:
+# in the unattended block the stay-awake wait has just left the PC past its idle timeout (fix
+# round 3, N2-I1). If winshell-core isn't built yet it starts again right after the build.
+Start-HostPowerWatch -Hold:$KeepAwake
+try {
+
 $info = Get-SandboxInfo
 Say "Windows Sandbox: $($info.kind) $($info.package) $($info.exe_version)"
 if ($info.kind -eq 'absent') { throw 'Windows Sandbox is not turned on: see spikes/winshell/OWNER-STEPS.md, "Turn on Windows Sandbox".' }
@@ -515,6 +536,7 @@ $QtExe = Resolve-QtExe $DeployDir $QtExe
 
 $testExe = if ($SkipBuild) { (Get-ChildItem (Join-Path $Bin 'deps') -Filter 'winshell-*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName } else { Build-Spike }
 $dlls = Find-VcRedist
+if ($null -eq $script:HostPower.Process) { Start-HostPowerWatch -Hold:$KeepAwake }
 
 # The deploy copy, mapped read-only at its own host path inside the Sandbox.
 $deployCopy = Join-Path $Build 'deploy-copy'
@@ -527,8 +549,6 @@ $label = if ($Observe) { 'observe' } else { 'run' }
 $summary = [ordered]@{ spike = 11; item = 'S1.9'; observe = [bool]$Observe; sandbox = $info; runs = @() }
 $runCount = if ($Observe) { 1 } else { $Runs }
 
-Start-HostPowerWatch -Hold:$KeepAwake
-try {
 for ($run = 1; $run -le $runCount; $run++) {
     Say "---- $label $run of $runCount" 'Yellow'
     $runDir = Join-Path $Build "$label-$run"
@@ -632,13 +652,13 @@ for ($run = 1; $run -le $runCount; $run++) {
     Say ("  start to closed: {0:N0} s; stop: {1}" -f $closedAt, $stop.method)
 }
 
-}
-finally {
-    $summary.host_power = Stop-HostPowerWatch
-    $summary.host_kept_awake = [bool]$KeepAwake
-}
 $summary.verdict = Get-SandboxVerdict @($summary.runs)
 $summary.pass = $summary.verdict -eq 'PASS'
+}
+finally {
+    $hp = Stop-HostPowerWatch
+    if (Get-Variable -Name summary -ErrorAction SilentlyContinue) { $summary.host_power = $hp; $summary.host_kept_awake = [bool]$KeepAwake }
+}
 $name = if ($Observe) { 'sandbox-observe.json' } else { 'sandbox-checks.json' }
 $summary | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $ResultsRoot $name)
 Say ("S1.9 {0}: {1}" -f $label, $summary.verdict) $(if ($summary.pass) { 'Green' } elseif ($summary.verdict -like 'INCOMPLETE*') { 'Yellow' } else { 'Red' })

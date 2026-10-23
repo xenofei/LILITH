@@ -98,15 +98,19 @@ function Wait-SpikeEvent([string]$Kind, [int]$After, [int]$TimeoutSec, [scriptbl
 }
 
 function Stop-Spike {
-    Get-Process -Name winshell-app, winshell-core -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name winshell-app, winshell-core -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue   # kill-scope: inside the Sandbox only, by name
 }
 
 # Starts winshell-core detached through winshell-tool and waits for it to exit.
 function Run-Core([string]$Name, [string[]]$CoreArgs, [int]$TimeoutSec) {
     $outFile = Join-Path $Work "$Name.json"
     Remove-Item $outFile -ErrorAction SilentlyContinue
+    $spawned = Get-Date
     $r = Tool spawn '--' $Core @CoreArgs --out $outFile
-    if ($r.pid) { Wait-Process -Id $r.pid -Timeout $TimeoutSec -ErrorAction SilentlyContinue }
+    # Waited on through its pinned Process (fix round 3, N2-C1), else by its result file.
+    $p = $(if ($r.pid) { Get-PinnedProcess ([int]$r.pid) $Core $spawned } else { $null })
+    if ($null -ne $p) { [void]$p.WaitForExit($TimeoutSec * 1000) }
+    else { $deadline = (Get-Date).AddSeconds($TimeoutSec); while (-not (Test-Path $outFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 } }
     if (Test-Path $outFile) { return (Get-Content -Raw $outFile | ConvertFrom-Json) }
     $null
 }
@@ -281,7 +285,9 @@ function Item-Power {
     Remove-Item (Join-Path $LogDir 'power-*.flag') -ErrorAction SilentlyContinue
     $outFile = Join-Path $Work 'power-core.json'
     Remove-Item $outFile -ErrorAction SilentlyContinue
+    $spawned = Get-Date
     $r = Tool spawn '--' $Core power --api request --max-secs 120 --out $outFile
+    $pp = $(if ($r.pid) { Get-PinnedProcess ([int]$r.pid) $Core $spawned } else { $null })
     $set = $null
     for ($i = 0; $i -lt 40 -and -not $set; $i++) {
         Start-Sleep -Milliseconds 500
@@ -297,7 +303,7 @@ function Item-Power {
     New-Item -ItemType File -Force -Path (Join-Path $LogDir 'power-clear.flag') | Out-Null
     Start-Sleep -Seconds 2
     New-Item -ItemType File -Force -Path (Join-Path $LogDir 'power-quit.flag') | Out-Null
-    if ($r.pid) { Wait-Process -Id $r.pid -Timeout 20 -ErrorAction SilentlyContinue }
+    if ($null -ne $pp) { [void]$pp.WaitForExit(20000) }
     Write-Result "power$script:Sfx" ([ordered]@{
         set = $set; powercfg_requests = $requests; listed = [bool]$listed
         token = (Tool token); pass = [bool]$listed
@@ -310,7 +316,7 @@ function Run-Exe([string]$Exe, [string]$PathValue) {
     try {
         $p = Start-Process -FilePath $Exe -ArgumentList '--test-threads', '1' -PassThru `
             -RedirectStandardOutput (Join-Path $Work 'rust-stdout.txt') -RedirectStandardError (Join-Path $Work 'rust-stderr.txt')
-        if (-not $p.WaitForExit(60000)) { $p.Kill(); return 'timeout' }
+        if (-not $p.WaitForExit(60000)) { Stop-PinnedProcess $p; return 'timeout' }   # a Start-Process -PassThru object
         return $p.ExitCode
     } catch {
         return "start failed: $($_.Exception.Message)"
@@ -374,7 +380,7 @@ function Item-Qt([string]$Name) {
     Remove-Item $offPng -ErrorAction SilentlyContinue
     $env:QT_QPA_PLATFORM = 'offscreen'
     $q = Start-Qt $exe ($Config.qt_grab_args -replace '\{png\}', $offPng) "$Name-offscreen"
-    if (-not $q.Process.WaitForExit(60000)) { $q.Process.Kill() }
+    if (-not $q.Process.WaitForExit(60000)) { Stop-PinnedProcess $q.Process }   # a Start-Process -PassThru object
     Remove-Item Env:\QT_QPA_PLATFORM
     $offErr = $(if (Test-Path $q.Stderr) { Get-Content -Raw $q.Stderr } else { '' })
     $off = Get-GrabStats $offPng
@@ -402,7 +408,7 @@ function Item-Qt([string]$Name) {
         $on.nonflat = $false
         $on.error = 'no main window'
     }
-    if (-not $q2.Process.HasExited) { $q2.Process.Kill() }
+    Stop-PinnedProcess $q2.Process   # a Start-Process -PassThru object
     Start-Sleep -Seconds 1
     $onErr = $(if (Test-Path $q2.Stderr) { Get-Content -Raw $q2.Stderr } else { '' })
     $on.backend = Get-Backend $onErr

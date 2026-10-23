@@ -10,10 +10,11 @@ it will take before it starts.
      asked; the owner clicks S1.4's toasts, watches S1.5's progress toast, and does the body
      steps (one sleep and wake, the Hello prompts).
   2. Part C's watched run (run-sandbox.ps1 -Observe): the owner locks the PC once.
--Block Unattended (about 2 h 40 min with a 2-hour sleep timeout; nobody at the PC):
+-Block Unattended (nobody at the PC; its length follows "Sleep after": about 46 min at 5 min,
+about 2 h 40 min at 2 hours):
   1. S1.7's stay-awake wait (run-spike.ps1 -Only S1.7 -Append -PowerPart stay-awake), first, so
      that no Sandbox is running during it and it starts right after the owner's last input.
-  2. Part C's 3 runs (run-sandbox.ps1 -Runs 3).
+  2. Part C's 3 runs (run-sandbox.ps1 -Runs 3 -KeepAwake: the PC is kept awake meanwhile).
 Each stage registers what it needs and removes it again (run-spike.ps1 and run-sandbox.ps1 say
 what); one stage failing doesn't stop the next. Part B and the stay-awake wait write
 results\checks.json; Part C writes results\sandbox-observe.json and results\sandbox-checks.json.
@@ -123,11 +124,19 @@ $timeoutText = Fmt-Timeout $timeoutNow.used_s
 $original = $null
 if ($Block -eq 'Attended') {
     # Kept so that the unattended block can remind the owner of the value to set back (ruling
-    # of 2026-10-23: the owner may lower "Sleep after" for the stay-awake test; the scripts only read).
+    # of 2026-10-23: the owner may lower "Sleep after" for the stay-awake test; the scripts only
+    # read). Every value seen is kept, never overwritten, so a rerun after lowering it can't hide
+    # the original (fix round 3, m6); the reminder names the largest.
     New-Item -ItemType Directory -Force -Path (Split-Path $TimeoutFile) | Out-Null
-    $timeoutNow | ConvertTo-Json | Set-Content -Encoding utf8 $TimeoutFile
+    $seen = @()
+    if (Test-Path -LiteralPath $TimeoutFile) { try { $seen = @((Get-Content -Raw -LiteralPath $TimeoutFile | ConvertFrom-Json).values) } catch { } }
+    if (@($seen | Where-Object { $_.used_s -eq $timeoutNow.used_s }).Count -eq 0) { $seen += [pscustomobject]$timeoutNow }
+    [ordered]@{ values = @($seen) } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 $TimeoutFile
 } elseif (Test-Path -LiteralPath $TimeoutFile) {
-    try { $original = Get-Content -Raw -LiteralPath $TimeoutFile | ConvertFrom-Json } catch { }
+    try {
+        $vals = @((Get-Content -Raw -LiteralPath $TimeoutFile | ConvertFrom-Json).values | Where-Object { $null -ne $_.used_s })
+        $original = @($vals | Sort-Object { if ($_.used_s -eq 0) { [long]::MaxValue } else { [long]$_.used_s } } -Descending) | Select-Object -First 1
+    } catch { }
 }
 if ($withS17 -and $Block -eq 'Unattended' -and $timeoutNow.used_s -gt 0) { $stayMin = ($timeoutNow.used_s + 330) / 60 }
 
@@ -165,7 +174,8 @@ if ($Block -eq 'Attended') {
         Say  '     the PC (Win+L) when asked, and sign in again when you hear two beeps (about 4 minutes).'
     }
 } else {
-    $cMin = $(if ($withSandbox -and $sandboxReady) { 10 * $Runs } else { 0 })
+    # The runs, plus about 5 minutes for the build, the copy and the Sandbox start.
+    $cMin = $(if ($withSandbox -and $sandboxReady) { 10 * $Runs + 5 } else { 0 })
     # At worst (review m9): per power API, the 10-minute recheck and the wait plus 3 restarts,
     # and the second API after a failed first one.
     $worstStay = $(if ($stayMin -gt 0) { 2 * (10 + 4 * $stayMin) } else { 0 })
@@ -177,9 +187,9 @@ if ($Block -eq 'Attended') {
         Say  '     If the first method fails, the wait runs once more with the second one; touches and a'
         Say  '     program keeping the PC awake add to that (the "at worst" time).'
         Say  '     It does not start while a Windows Sandbox runs or while something else keeps the PC awake.'
-        Say  '     Optional, your choice: the wait follows this PC''s "Sleep after" setting, which the scripts only'
-        Say  '     read. If you shorten it in Settings yourself before starting, the wait shrinks to match (set it'
-        Say  '     back afterwards).' 'Gray'
+        Say  '     The wait follows "Sleep after" (Settings, System, Power), which the scripts only read; at 5'
+        Say  '     minutes, as planned, it is about 11 minutes. The end of this block reminds you of the value to'
+        Say  '     set back.' 'Gray'
     }
     if ($cMin -gt 0) { Say ("  2. Part C, {0} runs (about {1}): a Windows Sandbox window opens and closes by itself; the PC is kept" -f $Runs, (Fmt $cMin)); Say '     awake meanwhile (a parent-watched request, released at the end).' }
 }
@@ -243,9 +253,9 @@ if ($Block -eq 'Unattended' -and $withS17) {
     $nowT = Get-SleepTimeout
     if ($null -ne $original -and $null -ne $original.used_s) {
         if ($original.used_s -ne $nowT.used_s) {
-            Say ("REMINDER: 'Sleep after' is {0} now. When the attended block started it was {1}: set it back to {1} in Settings, System, Power." -f (Fmt-Timeout $nowT.used_s), (Fmt-Timeout $original.used_s)) 'Yellow'
+            Say ("REMINDER: 'Sleep after' is {0} now. Before the test it was {1}: set it back to {1} in Settings, System, Power." -f (Fmt-Timeout $nowT.used_s), (Fmt-Timeout $original.used_s)) 'Yellow'
         } else {
-            Say ("'Sleep after' is {0}, as when the attended block started." -f (Fmt-Timeout $nowT.used_s))
+            Say ("'Sleep after' is {0}, as before the test." -f (Fmt-Timeout $nowT.used_s))
         }
     } else {
         Say ("'Sleep after' is {0} now. If you changed it for this test, set it back to what it was." -f (Fmt-Timeout $nowT.used_s)) 'Yellow'
