@@ -308,6 +308,102 @@ function Complete-S06Verdict([string]$Verdict, [string[]]$WorkloadProblems, [boo
 # unknown.
 function Test-PlausibleRefresh([double]$Hz) { $Hz -ge 24 -and $Hz -le 1000 }
 
+# ---- a kill-on-close job object (comfy-load.ps1) -----------------------------------------------
+# Every process in the job dies when the last handle to the job closes; a process's children
+# join its job automatically. comfy-load.ps1 puts its own pwsh in such a job, holding the only
+# handle, so if the owner closes its console window, everything the script started (ComfyUI and
+# its children, nvidia-smi, keep_busy, the sampler job, the app) dies with it. Nothing that was
+# running before, and nothing the script didn't start, is ever in the job.
+$script:JobSource = @'
+using System;
+using System.Runtime.InteropServices;
+public sealed class KillOnCloseJob : IDisposable {
+    [StructLayout(LayoutKind.Sequential)] struct BASIC {
+        public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass; }
+    [StructLayout(LayoutKind.Sequential)] struct IO { public ulong a, b, c, d, e, f; }
+    [StructLayout(LayoutKind.Sequential)] struct EXTENDED {
+        public BASIC Basic; public IO Io; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; }
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr attrs, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int cls, ref EXTENDED info, int len);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    // The job this process put itself in: kept here so the handle lives as long as the process.
+    public static KillOnCloseJob Self;
+    IntPtr handle;
+    public KillOnCloseJob() {
+        handle = CreateJobObjectW(IntPtr.Zero, null);
+        if (handle == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        var info = new EXTENDED();
+        info.Basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(handle, 9, ref info, Marshal.SizeOf(typeof(EXTENDED)))) {
+            int e = Marshal.GetLastWin32Error(); CloseHandle(handle); handle = IntPtr.Zero;
+            throw new System.ComponentModel.Win32Exception(e);
+        }
+    }
+    public void Assign(IntPtr process) {
+        if (!AssignProcessToJobObject(handle, process)) throw new System.ComponentModel.Win32Exception();
+    }
+    public bool Contains(IntPtr process) { bool r; return IsProcessInJob(process, handle, out r) && r; }
+    public void Dispose() { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } }
+}
+'@
+
+function Initialize-JobType {
+    if (-not ('KillOnCloseJob' -as [type])) { Add-Type -TypeDefinition $script:JobSource }
+}
+
+# A new kill-on-close job; Add-ProcessToJob assigns a running process, Dispose() closes it.
+function New-KillOnCloseJob { Initialize-JobType; [KillOnCloseJob]::new() }
+function Add-ProcessToJob($Job, [System.Diagnostics.Process]$Process) { $Job.Assign($Process.Handle) }
+
+# Is this process in the job?
+function Test-ProcessInJob($Job, [System.Diagnostics.Process]$Process) { $Job.Contains($Process.Handle) }
+
+# Assigns a process this script started, and every descendant of it (by parent pid, created
+# after its parent, so a reused pid is never taken), to the job. Children normally join by
+# themselves, but some don't: nvidia-smi.exe started from a job member was observed outside the
+# job (its parent's job membership didn't carry over), so each one is assigned explicitly, and
+# the tree is swept again while the script waits. Returns how many processes are in the job.
+function Add-TreeToJob($Job, [int]$RootPid) {
+    $all = @(Get-CimInstance Win32_Process)
+    $byParent = @{}
+    foreach ($p in $all) { if (-not $byParent.ContainsKey([int]$p.ParentProcessId)) { $byParent[[int]$p.ParentProcessId] = @() }; $byParent[[int]$p.ParentProcessId] += $p }
+    $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
+    if (-not $root) { return 0 }
+    $queue = [System.Collections.Generic.Queue[object]]::new(); $queue.Enqueue($root)
+    $n = 0
+    while ($queue.Count) {
+        $p = $queue.Dequeue()
+        try {
+            $proc = [System.Diagnostics.Process]::GetProcessById([int]$p.ProcessId)
+            if (-not $Job.Contains($proc.Handle)) { $Job.Assign($proc.Handle) }
+            $n++
+        } catch { }   # gone already, or not ours to open
+        foreach ($c in @($byParent[[int]$p.ProcessId])) {
+            if ($c -and $c.CreationDate -ge $p.CreationDate -and $c.Name -ne 'conhost.exe') { $queue.Enqueue($c) }
+        }
+    }
+    $n
+}
+
+# Puts the current process in a kill-on-close job whose only handle this process holds, so every
+# process it starts from now on dies with it, however it ends. Call it only from a process that
+# runs nothing but this script (pwsh -File), never from an interactive shell.
+function Enable-KillOnCloseForSelf {
+    Initialize-JobType
+    if (-not [KillOnCloseJob]::Self) {
+        $j = [KillOnCloseJob]::new()
+        $j.Assign([System.Diagnostics.Process]::GetCurrentProcess().Handle)
+        [KillOnCloseJob]::Self = $j
+    }
+    [KillOnCloseJob]::Self
+}
+
 # The machine's CPU load (%), averaged over one second; recorded beside every timing.
 function Get-CpuPercent {
     try { [math]::Round((Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).CounterSamples[0].CookedValue, 1) }
@@ -317,4 +413,5 @@ function Get-CpuPercent {
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
+    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, Add-TreeToJob, Enable-KillOnCloseForSelf,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

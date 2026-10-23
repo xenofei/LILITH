@@ -37,6 +37,11 @@
   threshold follows from it. The spike window stays on top during the 65 s run (an occluded window's
   timers are throttled, spike 04); don't use the mouse or keyboard while it runs.
 
+  Everything it starts is in a kill-on-close Windows job object held by this script's own pwsh,
+  so closing its console window also ends ComfyUI, nvidia-smi, the load and the app; Ctrl+C
+  and errors still clean up explicitly. Run it only as pwsh -NoProfile -File (an in-process run
+  is refused).
+
   -SamplersOnly -ProcessId <pid> runs just the two samplers against another process for
   -SamplerSeconds and reports their coverage (no ComfyUI, no app); it checks the sampling.
 
@@ -67,6 +72,21 @@ $Runs    = Join-Path $Root "build\runs\$stamp-s06"
 New-Item -ItemType Directory -Force $Runs, $Results | Out-Null
 Import-Module (Join-Path $Root 'lib\SpikeMeasure.psm1') -Force
 
+# Everything this script starts (ComfyUI and its children, nvidia-smi, keep_busy, the VRAM
+# sampler's job, the app) must die with it, even if its console window is closed: an orphaned
+# ComfyUI holds the GPU and port 8188, and the next run then refuses. So this pwsh puts itself in
+# a kill-on-close job, holding the only handle, before it starts anything; children join the job
+# by themselves, and nothing started before or elsewhere is in it. That is only safe in a pwsh
+# that runs this script alone, so an in-process run (from an interactive shell) is refused.
+$selfCmd = "$((Get-CimInstance Win32_Process -Filter "ProcessId=$PID").CommandLine)"
+if ($selfCmd -notmatch '(?i)\s-f(ile)?\s' -or $selfCmd -notmatch [regex]::Escape((Split-Path -Leaf $PSCommandPath))) {
+    throw "run this script in its own pwsh: pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1"
+}
+$job = Enable-KillOnCloseForSelf
+# Each started process (and its descendants) is also assigned explicitly: nvidia-smi.exe was seen
+# outside the job although its parent was in it. The tree is swept again while the script waits.
+function Join-OurJob([System.Diagnostics.Process]$Proc) { if ($Proc) { [void](Add-TreeToJob $job $Proc.Id) } }
+
 Add-Type -Namespace AppShellComfy -Name Win -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
 [void][AppShellComfy.Win]::SetErrorMode(0x0001 -bor 0x8000)
 
@@ -79,6 +99,7 @@ $vramFile = Join-Path $Runs 'vram.jsonl'
 if ($SamplersOnly) {
     if (-not $ProcessId) { throw '-SamplersOnly needs -ProcessId' }
     $g = Start-GpuSampler $gpuFile
+    Join-OurJob $g
     $v = Start-VramSampler $ProcessId $vramFile
     $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     Start-Sleep -Seconds ($SamplerSeconds + 2)
@@ -121,11 +142,14 @@ try {
         -WorkingDirectory (Split-Path $ComfyMain) -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $Runs 'comfy.out.log') -RedirectStandardError (Join-Path $Runs 'comfy.err.log')
     $deadline = (Get-Date).AddSeconds(300)
-    while (-not (Test-Comfy) -and (Get-Date) -lt $deadline -and -not $comfy.HasExited) { Start-Sleep -Seconds 2 }
+    Join-OurJob $comfy
+    while (-not (Test-Comfy) -and (Get-Date) -lt $deadline -and -not $comfy.HasExited) { Start-Sleep -Seconds 2; Join-OurJob $comfy }
+    Join-OurJob $comfy
     if (-not (Test-Comfy)) { throw 'ComfyUI did not answer /system_stats within 300 s' }
     $res.comfy_version = (Invoke-RestMethod "$Url/system_stats" -TimeoutSec 5).system.comfyui_version
 
     $gpuProc = Start-GpuSampler $gpuFile
+    Join-OurJob $gpuProc
     # The load keeps a prompt queued behind the running one (comfy/keep_busy.py, depth 2) and runs
     # until this script stops it, so it can't end before the measured minute does (the owner's
     # first run: one prompt at a time, ~75 % of samples >= 95 %, and the load ended 240 s after it
@@ -143,6 +167,7 @@ try {
     $deadline = (Get-Date).AddSeconds(300); $saturated = $false
     while (-not $saturated -and (Get-Date) -lt $deadline -and -not $load.HasExited) {
         Start-Sleep -Seconds 1
+        Join-OurJob $load; Join-OurJob $comfy
         $saturated = Test-GpuSaturatedRecently (Read-GpuSamples $gpuFile) ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
     }
     $res.gpu_saturated_before_start = $saturated
@@ -169,8 +194,11 @@ try {
     $psi.UseShellExecute = $false
     $psi.WorkingDirectory = $Deploy
     $app = [System.Diagnostics.Process]::Start($psi)
+    Join-OurJob $app
     $appStart = ([DateTimeOffset]$app.StartTime).ToUnixTimeMilliseconds()
     $vramJob = Start-VramSampler $app.Id $vramFile
+    $res.in_kill_on_close_job = [ordered]@{ comfy = (Test-ProcessInJob $job $comfy); load = (Test-ProcessInJob $job $load)
+                                           gpu_sampler = (Test-ProcessInJob $job $gpuProc); app = (Test-ProcessInJob $job $app) }
     # Short waits in a loop, so Ctrl+C reaches `finally` (and stops ComfyUI) at once.
     $waitUntil = (Get-Date).AddSeconds($MeasureSeconds + 90)
     while (-not $app.WaitForExit(250) -and (Get-Date) -lt $waitUntil) { }

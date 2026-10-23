@@ -57,6 +57,7 @@ Before you start it:
 
 - Run it on whichever display is primary. The result records that display's refresh rate, and the frame threshold follows from it.
 - The spike window stays on top for that minute. Don't touch the mouse or keyboard while it runs.
+- To stop it early, press Ctrl+C or close its console window: either way ComfyUI, the GPU sampler, the load and the spike all stop (they're in a Windows job object that ends with the script).
 - Under this load, the Web dock sits below Jobs and Grid, so the scrolled list stays visible throughout.
 
 ```powershell
