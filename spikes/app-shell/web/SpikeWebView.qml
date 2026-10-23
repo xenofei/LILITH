@@ -43,6 +43,9 @@ Item {
                 })
             }
 
+            // S0.6 loads a page whose script sets the title, so this proves the page ran.
+            onTitleChanged: root.logged("web_title", { title: title })
+
             onRenderProcessTerminated: function(status, exitCode) {
                 root.logged("web_render_process_terminated", { status: status, exit_code: exitCode })
             }

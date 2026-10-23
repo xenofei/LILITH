@@ -1,6 +1,6 @@
 # Spike 10: the owner's steps (plan 4a, Task 0, Step 3)
 
-## The one command (about 10-16 minutes; up to about 26 with the fallback)
+## The one command (about 10-16 minutes; at most about 30 with the fallback)
 
 Close every spike window, and don't start ComfyUI yourself. Then, in a PowerShell 7 window at the repository root of the task worktree (branch `p4a-task0`), run:
 
@@ -13,10 +13,10 @@ pwsh -NoProfile -File spikes/app-shell/run-owner.ps1
   2. It prints a time estimate.
   3. It rebuilds and redeploys (S0.4).
   4. It runs the accessibility check (S0.7, with UI Automation, so there's no Narrator and nothing for you to do).
-  5. It runs S0.6 under ComfyUI load (section 3 below), and the 5 Hz fallback only if S0.6 FAILs.
+  5. It runs S0.6 under ComfyUI load (section 3 below) whenever the deploy matches the build, even if S0.4 failed for another reason, and the 5 Hz fallback only if S0.6 FAILs.
   6. It prints one line per check at the end.
 - **During the run:**
-  - Spike windows open without taking focus.
+  - Spike windows open without taking focus (S0.7's takes it for a fraction of a second when it clicks the counter). The ones S0.4 and S0.7 open close by themselves within a minute.
   - During S0.6, the spike window stays on top for about a minute, so don't use the mouse or keyboard then.
   - Ctrl+C or closing the window stops everything, ComfyUI included.
 - **Afterwards:** hand `spikes/app-shell/results/` (`checks.json`, `s07.json`, `s06*.json`) back to the agent.
@@ -99,7 +99,7 @@ pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1 -RateHz 5 -ChartsBatched
 
 ## 4. S0.7: the accessibility check (automated; about 1 minute)
 
-No Narrator and nothing to do: it reads the spike's windows through UI Automation, the same data a screen reader gets, without taking focus. `run-owner.ps1` runs it, and so does the harness on its own:
+No Narrator and nothing to do: it reads the spike's windows through UI Automation, the same data a screen reader gets, then clicks the counter through UI Automation and closes the spike. The spike window may take the focus for a fraction of a second at that click, which Qt does when a button is invoked. `run-owner.ps1` runs it, and so does the harness on its own:
 
 ```powershell
 pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.7

@@ -2,15 +2,22 @@
 .SYNOPSIS
   S0.7's UI Automation client (APP-156). Runs under Windows PowerShell 5.1, whose .NET Framework
   has the managed UIA client (System.Windows.Automation, with NotificationEvent); run-spike.ps1
-  starts it beside a spike started with --no-activate --auto-counter. It needs no focus: UIA
-  reads properties and receives events from a window that was never activated.
+  starts it beside a spike started with --no-activate. It needs no focus: UIA reads properties,
+  receives events and invokes a button in a window that was never activated (Qt then activates
+  that window itself; see step 5).
 
-  It waits for the app's top-level windows, reads every element under them (Name, ControlType,
-  FrameworkId, ...), subscribes to UIA notification events (what Accessible.announce() raises),
-  writes <Out>.ready, waits until the app exits or -WaitSeconds, and writes <Out> (JSON). It
-  judges nothing: Get-S07Items in lib/SpikeMeasure.psm1 does.
+  Order, each step only once the one before it is done:
+    1. read the app's windows' elements (Name, ControlType, FrameworkId, ProcessId, ...) every
+       500 ms until every item S0.7 looks for is present, at most -TreeTimeoutSeconds;
+    2. subscribe to UIA notification events (what Accessible.announce() raises);
+    3. click "Increment the counter" through its InvokePattern (no mouse, no focus);
+    4. wait at most -AnnounceTimeoutSeconds for "Count is now 1";
+    5. close the app's windows (WindowPattern): Qt activates the window whose button was invoked,
+       so the app is ended at once rather than keeping the focus; then write <Out> (JSON).
+  Times are recorded in ms since the app's start (read_app_ms, subscribed_app_ms,
+  invoked_app_ms). It judges nothing: Get-S07Items in lib/SpikeMeasure.psm1 does.
 #>
-param([int]$AppPid, [string]$Out, [int]$WaitSeconds = 40, [int]$MinWindows = 2, [int]$SettleMs = 1500)
+param([int]$AppPid, [string]$Out, [int]$TreeTimeoutSeconds = 15, [int]$AnnounceTimeoutSeconds = 5, [int]$MinWindows = 2)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
 Add-Type -ReferencedAssemblies UIAutomationClient, UIAutomationTypes, WindowsBase -TypeDefinition @'
@@ -64,7 +71,7 @@ public static class S07Uia {
             try {
                 var cur = c.Current;
                 var row = new Dictionary<string, object>();
-                row["window"] = windowName; row["depth"] = depth + 1;
+                row["window"] = windowName; row["depth"] = depth + 1; row["process_id"] = cur.ProcessId;
                 row["name"] = cur.Name; row["control_type"] = cur.ControlType.ProgrammaticName;
                 row["localized_control_type"] = cur.LocalizedControlType; row["framework_id"] = cur.FrameworkId;
                 row["class_name"] = cur.ClassName; row["automation_id"] = cur.AutomationId;
@@ -78,37 +85,75 @@ public static class S07Uia {
 }
 '@
 
-$res = [ordered]@{ app_pid = $AppPid; started = (Get-Date).ToString('o'); windows = @(); window_polls = @(); elements = @(); notifications = @() }
+$res = [ordered]@{ app_pid = $AppPid; started = (Get-Date).ToString('o'); windows_found = $false; items_ready = $false
+                   invoked = $false; windows = @(); elements = @(); notifications = @() }
+# The items S0.7 looks for (Get-S07Items judges them): present means the layout is built.
+function Get-Missing($rows) {
+    $qt = @($rows | Where-Object { $_.framework_id -eq 'Qt' -and [int]$_.process_id -eq $AppPid })
+    $m = @()
+    if (-not @($qt | Where-Object { $_.control_type -eq 'ControlType.TitleBar' -and $_.name -in 'Jobs', 'Grid' }).Count) { $m += 'title bar' }
+    foreach ($t in 'Grid', 'Web') { if (-not @($qt | Where-Object { $_.control_type -eq 'ControlType.TabItem' -and $_.name -eq $t }).Count) { $m += "tab $t" } }
+    if (-not @($qt | Where-Object { $_.control_type -eq 'ControlType.Button' -and $_.name -eq 'Increment the counter' }).Count) { $m += 'counter button' }
+    if (-not @($qt | Where-Object { $_.name -match '^GPU load chart, latest ' }).Count) { $m += 'chart tile' }
+    $m
+}
 try {
     $app = [System.Diagnostics.Process]::GetProcessById($AppPid); [void]$app.Handle   # pinned
-    # The app's top-level windows (main-a, main-b and the floating Counter window), at most 20 s.
-    $wins = $null
-    while ([S07Uia]::Clock.ElapsedMilliseconds -lt 20000 -and -not $app.HasExited) {
-        $wins = [S07Uia]::Windows($AppPid)
-        $res.window_polls += [ordered]@{ ms = [S07Uia]::Clock.ElapsedMilliseconds; n = $wins.Count }
-        if ($wins.Count -ge $MinWindows) { break }
-        Start-Sleep -Milliseconds 250
+    $appMs = { [math]::Round(((Get-Date) - $app.StartTime).TotalMilliseconds) }
+    $wins = @(); $rows = @(); $missing = @('everything'); $polls = 0
+    $deadline = (Get-Date).AddSeconds($TreeTimeoutSeconds)
+    while ((Get-Date) -lt $deadline -and -not $app.HasExited) {
+        $polls++
+        $wins = @([S07Uia]::Windows($AppPid))
+        if ($wins.Count -ge $MinWindows) {
+            $res.windows_found = $true
+            $rows = @(); foreach ($w in $wins) { $rows += @([S07Uia]::Elements($w, $w.Current.Name) | ForEach-Object { [pscustomobject]$_ }) }
+            $missing = @(Get-Missing $rows)
+            if (-not $missing.Count) { break }
+        }
+        Start-Sleep -Milliseconds 500
     }
-    Start-Sleep -Milliseconds $SettleMs   # the layout settles (the floating Counter window is owned by main-a)
-    $res.windows_found_ms = [S07Uia]::Clock.ElapsedMilliseconds
-    [S07Uia]::Subscribe($AppPid)
-    $res.subscribed_ms = [S07Uia]::Clock.ElapsedMilliseconds
-    $res.subscribed_utc = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    Set-Content -Path "$Out.ready" -Value $res.subscribed_utc
-    # Read the trees now (the counter is clicked a few seconds later, so its label still says 0).
-    $els = @()
-    foreach ($w in @($wins)) {
-        $wn = $w.Current.Name
-        $res.windows += [ordered]@{ name = $wn; control_type = $w.Current.ControlType.ProgrammaticName; framework_id = $w.Current.FrameworkId
-                                    class_name = $w.Current.ClassName }
-        $els += @([S07Uia]::Elements($w, $wn))
+    $res.read_app_ms = & $appMs
+    $res.tree_polls = $polls
+    $res.items_ready = $res.windows_found -and -not $missing.Count
+    $res.missing_at_timeout = @($missing | Where-Object { -not $res.items_ready })
+    foreach ($w in $wins) {   # the floating Counter window is owned by main-b in the UIA tree
+        $res.windows += [ordered]@{ name = $w.Current.Name; control_type = $w.Current.ControlType.ProgrammaticName
+                                    framework_id = $w.Current.FrameworkId; class_name = $w.Current.ClassName }
     }
-    $res.elements = @($els | ForEach-Object { [pscustomobject]$_ })
-    $res.elements_read_ms = [S07Uia]::Clock.ElapsedMilliseconds
+    $res.elements = $rows
     $res.element_errors = [S07Uia]::Errors
-    $until = [S07Uia]::Clock.ElapsedMilliseconds + $WaitSeconds * 1000
-    while (-not $app.HasExited -and [S07Uia]::Clock.ElapsedMilliseconds -lt $until) { Start-Sleep -Milliseconds 200 }
-    Start-Sleep -Milliseconds 300   # events raised just before the exit
+
+    [S07Uia]::Subscribe($AppPid)
+    $res.subscribed_app_ms = & $appMs
+    $cond = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $AppPid),
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Increment the counter'),
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))
+    $btn = $null
+    foreach ($w in $wins) { if (-not $btn) { $btn = $w.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond) } }
+    if (-not $btn) { $res.invoke_error = 'no button named "Increment the counter"' }
+    else {
+        try {
+            $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            $res.invoked = $true
+            $res.invoked_app_ms = & $appMs
+        } catch { $res.invoke_error = "$($_.Exception.GetType().Name): $($_.Exception.Message)" }
+    }
+    if ($res.invoked) {
+        $until = (Get-Date).AddSeconds($AnnounceTimeoutSeconds)
+        while ((Get-Date) -lt $until -and -not @([S07Uia]::Notifications() | Where-Object { $_['display_string'] -eq 'Count is now 1' }).Count) {
+            Start-Sleep -Milliseconds 100
+        }
+        $res.announce_wait_ended_app_ms = & $appMs
+    }
+    # Qt activates the window whose button UIA invoked, although S0.7 itself needs no focus, and
+    # UIA can't hand the focus back. So the client closes the app's windows (WindowPattern) as soon
+    # as it is done: the app quits, and the focus goes back, within a fraction of a second.
+    foreach ($w in $wins) {
+        try { $w.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close() } catch { $res.close_error = "$($_.Exception.GetType().Name)" }
+    }
+    $res.closed_app_ms = & $appMs
 } catch {
     $res.error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
 } finally {

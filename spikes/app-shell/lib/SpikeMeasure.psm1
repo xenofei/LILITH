@@ -326,18 +326,35 @@ function Test-S06Workload($Counts, [int]$MeasureSeconds = 60, [int]$RateHz = 10)
     $p
 }
 
-# Did the Web dock's view really load (S0.6 runs the app inside the kill-on-close job, and
-# WebEngine's sandboxed renderer must work there)? From the app's own log: the dock shown, then a
-# web_load "succeeded" after it, and no web_render_process_terminated. S0.6 takes no grabs, so
-# this is the evidence. Returns the problems (empty when it loaded).
+# The page S0.6's Web dock loads (--web-url): local, no network. Its body is coloured, a canvas is
+# drawn by script, and the script sets the title, so a logged web_title proves that Blink and V8
+# ran the page inside the job (about:blank has no content, no script and nothing to raster). `#`
+# is %23 (else it starts a fragment), and the HTML uses single quotes only. S0.3 and S0.9 keep
+# about:blank, which their bars name.
+$script:S06WebTitle = 's06-rendered-42'
+$script:S06WebUrl = "data:text/html;charset=utf-8,<!doctype html><title>pending</title><body style='margin:0;background:%2320a060'>" +
+    "<canvas id=c width=512 height=512></canvas><script>var g=c.getContext('2d');g.fillStyle='%23f0c000';g.fillRect(64,64,384,384);" +
+    "document.title='s06-rendered-'+(6*7)</script>"
+function Get-S06WebUrl { $script:S06WebUrl }
+
+# Did the Web dock's page really load and run (S0.6 runs the app inside the kill-on-close job, and
+# WebEngine's sandboxed renderer must work there)? From the app's own log, after web_dock_shown:
+# a web_load "succeeded" for the data: page, a web_title equal to the one its script sets, and no
+# web_render_process_terminated. S0.6 takes no grabs. Returns the problems (empty when it ran).
+# A dock never shown is left to Test-S06Workload, which already reports it.
 function Test-S06Web([object[]]$Events) {
     $shown = @($Events | Where-Object { $_.event -eq 'web_dock_shown' }) | Select-Object -First 1
-    if (-not $shown) { return @('web dock not shown') }
+    if (-not $shown) { return @() }
+    $after = @($Events | Where-Object { [double]$_.t_ms -ge [double]$shown.t_ms })
     $p = @()
-    $ok = @($Events | Where-Object { $_.event -eq 'web_load' -and $_.status -eq 'succeeded' -and [double]$_.t_ms -ge [double]$shown.t_ms })
+    $ok = @($after | Where-Object { $_.event -eq 'web_load' -and $_.status -eq 'succeeded' -and "$($_.url)".StartsWith('data:text/html') })
     if (-not $ok.Count) {
         $last = @($Events | Where-Object { $_.event -eq 'web_load' }) | Select-Object -Last 1
-        $p += if ($last) { "web view did not load (last load event: $($last.status) $($last.url) $($last.error_string))".TrimEnd() } else { 'web view did not load (no web_load event)' }
+        $p += if ($last) { "web page did not load (last load event: $($last.status) $("$($last.url)".Substring(0, [math]::Min(40, "$($last.url)".Length))) $($last.error_string))".TrimEnd() }
+              else { 'web page did not load (no web_load event)' }
+    }
+    if (-not @($after | Where-Object { $_.event -eq 'web_title' -and $_.title -eq $script:S06WebTitle }).Count) {
+        $p += "web page's script did not run (no web_title '$script:S06WebTitle')"
     }
     $dead = @($Events | Where-Object { $_.event -eq 'web_render_process_terminated' })
     if ($dead.Count) { $p += "web renderer terminated ($($dead[0].status), exit $($dead[0].exit_code))" }
@@ -366,11 +383,11 @@ function Test-PlausibleRefresh([double]$Hz) { $Hz -ge 24 -and $Hz -le 1000 }
 
 # S0.7's items, judged from s07-uia.ps1's output (elements of the app's windows and the UIA
 # notifications it received). Each item is PASS or FAIL with the UIA values it matched. Only
-# elements from Qt's own provider count (FrameworkId "Qt"), not Windows' non-client title bars.
-# $FirstClickUtc (epoch ms of the first --auto-counter click, from the app's log) makes a missed
-# announcement INVALID rather than FAIL when the client subscribed after that click.
-function Get-S07Items($Uia, [int]$AppPid, $FirstClickUtc = $null) {
-    $qt = @($Uia.elements | Where-Object { $_.framework_id -eq 'Qt' })
+# elements of the app's own process from Qt's own provider count (FrameworkId "Qt"), not Windows'
+# non-client title bars or another process's hosted window. The client clicks the counter itself
+# (InvokePattern) after it has subscribed; if it never clicked, the announcement is INVALID.
+function Get-S07Items($Uia, [int]$AppPid) {
+    $qt = @($Uia.elements | Where-Object { $_.framework_id -eq 'Qt' -and [int]$_.process_id -eq $AppPid })
     $pick = { param($rows) @($rows | ForEach-Object { [ordered]@{ window = $_.window; name = $_.name; control_type = $_.control_type
                                                                   localized_control_type = $_.localized_control_type } }) }
     $items = [ordered]@{}
@@ -388,19 +405,33 @@ function Get-S07Items($Uia, [int]$AppPid, $FirstClickUtc = $null) {
     $items.chart_tile = [ordered]@{ verdict = $(if ($chart.Count) { 'PASS' } else { 'FAIL' }); kddw = $false
         wanted = 'the chart tile in main-b named "GPU load chart, latest <n> %" (its ControlType is recorded)'; found = @(& $pick $chart) }
     $note = @($Uia.notifications | Where-Object { $_.display_string -eq 'Count is now 1' -and [int]$_.process_id -eq $AppPid })
-    $late = ($null -ne $FirstClickUtc) -and ($null -ne $Uia.subscribed_utc) -and ([long]$Uia.subscribed_utc -gt [long]$FirstClickUtc)
-    $items.announce = [ordered]@{ verdict = $(if ($note.Count) { 'PASS' } elseif ($late) { 'INVALID (the client subscribed after the first click)' } else { 'FAIL' }); kddw = $false
-        wanted = 'a UIA notification event "Count is now 1" from the app (Accessible.announce)'
+    $av = if ($note.Count) { 'PASS' } elseif (-not $Uia.invoked) { "INVALID (the client never clicked the button: $($Uia.invoke_error))" } else { 'FAIL' }
+    $items.announce = [ordered]@{ verdict = $av; kddw = $false
+        wanted = 'a UIA notification event "Count is now 1" from the app (Accessible.announce), after the client clicked the button'
         found = @($note | ForEach-Object { [ordered]@{ display_string = $_.display_string; kind = $_.kind; processing = $_.processing
                                                        source_name = $_.source_name; source_control_type = $_.source_control_type } })
         notifications_received = @($Uia.notifications).Count }
     $items
 }
 
+# Conditions under which S0.7 measured nothing (INVALID, not FAIL): the app's windows never
+# appeared to UIA, or the tree was last read before the app logged layout_built ($LayoutBuiltMs,
+# ms since the app's start) while items were still missing.
+function Get-S07Problems($Uia, $LayoutBuiltMs) {
+    $p = @()
+    if (-not $Uia.windows_found) { $p += "the app's windows never appeared to UI Automation" }
+    elseif (-not $Uia.items_ready -and ($null -eq $LayoutBuiltMs -or [double]$Uia.read_app_ms -lt [double]$LayoutBuiltMs)) {
+        $p += "the tree was read before the app's layout was built" }
+    $p
+}
+
 # S0.7's verdict (the brief): PASS when the spike's own controls are read (the counter button,
 # the chart tile, the announcement). The KDDockWidgets items are recorded; a FAIL there doesn't
-# fail the check but is named for the owner (APP-156).
-function Get-S07Verdict($Items) {
+# fail the check but is named for the owner (APP-156). $Problems (measurement conditions not met)
+# make it INVALID first.
+function Get-S07Verdict($Items, [string[]]$Problems = @()) {
+    $problems = @($Problems | Where-Object { $_ })
+    if ($problems.Count) { return "INVALID ($($problems -join '; '))" }
     $own = @($Items.Keys | Where-Object { -not $Items[$_].kddw })
     $bad = @($own | Where-Object { $Items[$_].verdict -match '^FAIL' })
     $invalid = @($own | Where-Object { $Items[$_].verdict -match '^INVALID' })
@@ -587,6 +618,6 @@ function Get-CpuPercent {
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
-    Get-OwnerRunBlockers, Test-S06Web, Get-S07Items, Get-S07Verdict,
+    Get-OwnerRunBlockers, Get-S06WebUrl, Test-S06Web, Get-S07Items, Get-S07Problems, Get-S07Verdict,
     New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

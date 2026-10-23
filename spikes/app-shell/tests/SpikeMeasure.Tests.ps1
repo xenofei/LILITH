@@ -287,47 +287,56 @@ Describe 'Guards' {
 Describe 'S0.7 UI Automation items' {
     BeforeAll {
         # Rows as s07-uia.ps1 writes them (taken from a real run, trimmed).
-        function Row($w, $n, $t, $f = 'Qt') { [pscustomobject]@{ window = "LILITH spike - $w"; name = $n; control_type = "ControlType.$t"; localized_control_type = $t.ToLower(); framework_id = $f } }
-        $script:full = [pscustomobject]@{
-            subscribed_utc = 1000
-            elements = @(
-                (Row 'main-a' 'LILITH spike - main-a' 'TitleBar' 'Win32'),
-                (Row 'main-a' 'Jobs' 'TitleBar'), (Row 'main-a' 'Grid' 'TitleBar'),
-                (Row 'main-a' 'Grid' 'TabItem'), (Row 'main-a' 'Web' 'TabItem'),
-                (Row 'main-b' 'Increment the counter' 'Button'),
-                (Row 'main-b' 'GPU load chart, latest 44.0 %' 'Custom'),
-                (Row 'main-b' 'VRAM chart, latest 7.2 GiB' 'Custom'))
-            notifications = @([pscustomobject]@{ display_string = 'Count is now 1'; process_id = 42; kind = 'Other'; processing = 'All'
-                                                 source_name = 'Increment the counter'; source_control_type = 'ControlType.Button' }) }
+        function Row($w, $n, $t, $f = 'Qt', $procId = 42) {
+            [pscustomobject]@{ window = "LILITH spike - $w"; name = $n; control_type = "ControlType.$t"; localized_control_type = $t.ToLower()
+                               framework_id = $f; process_id = $procId } }
+        $script:els = @(
+            (Row 'main-a' 'LILITH spike - main-a' 'TitleBar' 'Win32'),
+            (Row 'main-a' 'Jobs' 'TitleBar'), (Row 'main-a' 'Grid' 'TitleBar'),
+            (Row 'main-a' 'Grid' 'TabItem'), (Row 'main-a' 'Web' 'TabItem'),
+            (Row 'main-b' 'Increment the counter' 'Button'),
+            (Row 'main-b' 'GPU load chart, latest 44.0 %' 'Custom'),
+            (Row 'main-b' 'VRAM chart, latest 7.2 GiB' 'Custom'))
+        $script:note = @([pscustomobject]@{ display_string = 'Count is now 1'; process_id = 42; kind = 'Other'; processing = 'All'
+                                            source_name = 'Increment the counter'; source_control_type = 'ControlType.Button' })
+        function Uia($elements = $els, $notifications = $note, $invoked = $true, $found = $true, $ready = $true, $readMs = 2500) {
+            [pscustomobject]@{ elements = $elements; notifications = $notifications; invoked = $invoked; invoke_error = 'no button'
+                               windows_found = $found; items_ready = $ready; read_app_ms = $readMs } }
     }
     It 'passes every item of a full read, and records the chart''s ControlType' {
-        $items = Get-S07Items $full 42 2000
+        $items = Get-S07Items (Uia) 42
         @($items.Keys | Where-Object { $items[$_].verdict -ne 'PASS' }).Count | Should -Be 0
         $items.chart_tile.found[0].control_type | Should -Be 'ControlType.Custom'
-        Get-S07Verdict $items | Should -Be 'PASS'
+        Get-S07Verdict $items @(Get-S07Problems (Uia) 1750) | Should -Be 'PASS'
     }
-    It 'counts only Qt''s own elements (not the Win32 non-client title bar) and wants both tabs in main-a' {
-        $u = [pscustomobject]@{ subscribed_utc = 1000; notifications = $full.notifications
-            elements = @((Row 'main-a' 'Jobs' 'TitleBar' 'Win32'), (Row 'main-a' 'Grid' 'TabItem'), (Row 'main-b' 'Web' 'TabItem'),
-                         (Row 'main-b' 'Increment the counter' 'Button'), (Row 'main-b' 'GPU load chart, latest 1 %' 'Custom')) }
-        $items = Get-S07Items $u 42 2000
+    It 'counts only Qt''s own elements of the app''s process (not the Win32 title bar or another process) and wants both tabs in main-a' {
+        $u = Uia @((Row 'main-a' 'Jobs' 'TitleBar' 'Win32'), (Row 'main-a' 'Grid' 'TitleBar' 'Qt' 7), (Row 'main-a' 'Grid' 'TabItem'),
+                   (Row 'main-b' 'Web' 'TabItem'), (Row 'main-b' 'Increment the counter' 'Button'), (Row 'main-b' 'GPU load chart, latest 1 %' 'Custom'))
+        $items = Get-S07Items $u 42
         $items.kddw_title_bar.verdict | Should -Be 'FAIL'
         $items.kddw_dock_tabs.verdict | Should -Be 'FAIL'
         # The spike's own controls pass, so the check passes and names the KDDockWidgets items for the owner.
         Get-S07Verdict $items | Should -Be 'PASS; KDDockWidgets not read, for the owner: kddw_title_bar, kddw_dock_tabs'
     }
-    It 'fails a missing announcement, or one from another process, unless the client subscribed after the first click' {
-        $other = [pscustomobject]@{ subscribed_utc = 1000; elements = $full.elements
-            notifications = @([pscustomobject]@{ display_string = 'Count is now 1'; process_id = 7 }) }
-        (Get-S07Items $other 42 2000).announce.verdict | Should -Be 'FAIL'
-        Get-S07Verdict (Get-S07Items $other 42 2000) | Should -Be 'FAIL (announce)'
-        $late = [pscustomobject]@{ subscribed_utc = 3000; elements = $full.elements; notifications = @() }
-        Get-S07Verdict (Get-S07Items $late 42 2000) | Should -Match '^INVALID \(announce\)'
+    It 'fails a missing announcement or one from another process, and is INVALID when the client never clicked' {
+        $other = Uia -notifications @([pscustomobject]@{ display_string = 'Count is now 1'; process_id = 7 })
+        Get-S07Verdict (Get-S07Items $other 42) | Should -Be 'FAIL (announce)'
+        Get-S07Verdict (Get-S07Items (Uia -notifications @() -invoked $false) 42) | Should -Match '^INVALID \(announce\)'
     }
     It 'fails a counter button without its accessible name' {
-        $u = [pscustomobject]@{ subscribed_utc = 1000; notifications = $full.notifications
-            elements = @($full.elements | Where-Object { $_.name -ne 'Increment the counter' }) + @(Row 'main-b' 'Increment' 'Button') }
-        Get-S07Verdict (Get-S07Items $u 42 2000) | Should -Be 'FAIL (counter_button)'
+        $u = Uia (@($els | Where-Object { $_.name -ne 'Increment the counter' }) + @(Row 'main-b' 'Increment' 'Button'))
+        Get-S07Verdict (Get-S07Items $u 42) | Should -Match '^FAIL \(counter_button'
+    }
+    It 'is INVALID, not FAIL, when nothing was measured: no windows, or items read before the layout was built' {
+        $none = Uia @() @() $false $false $false 20000
+        Get-S07Verdict (Get-S07Items $none 42) @(Get-S07Problems $none 1750) | Should -Match '^INVALID \(the app''s windows never appeared'
+        $early = Uia @() @() $false $true $false 900
+        Get-S07Problems $early 1750 | Should -Match 'before the app''s layout was built'
+        Get-S07Problems $early $null | Should -Match 'before the app''s layout was built'
+        # Read after the layout was built and still missing: a real FAIL.
+        $late = Uia @() @() $false $true $false 16000
+        @(Get-S07Problems $late 1750).Count | Should -Be 0
+        Get-S07Verdict (Get-S07Items $late 42) @(Get-S07Problems $late 1750) | Should -Match '^FAIL'
     }
 }
 
@@ -351,22 +360,34 @@ Describe 'run-owner.ps1 refusal (by path, never by name)' {
 }
 
 Describe 'S0.6 web view check' {
-    It 'accepts a load that succeeded after the dock was shown' {
-        $ev = @([pscustomobject]@{ event = 'web_dock_shown'; t_ms = 2000 },
-                [pscustomobject]@{ event = 'web_load'; status = 'started'; url = 'about:blank'; t_ms = 2900 },
-                [pscustomobject]@{ event = 'web_load'; status = 'succeeded'; url = 'about:blank'; t_ms = 3100 })
-        @(Test-S06Web $ev).Count | Should -Be 0
+    BeforeAll {
+        function Ev($e, $t, $more = @{}) { $o = [ordered]@{ event = $e; t_ms = $t }; foreach ($k in $more.Keys) { $o[$k] = $more[$k] }; [pscustomobject]$o }
+        $script:shown = Ev 'web_dock_shown' 2000
+        $script:loaded = Ev 'web_load' 3100 @{ status = 'succeeded'; url = 'data:text/html;charset=utf-8,<!doctype html>...' }
+        $script:titled = Ev 'web_title' 3150 @{ title = 's06-rendered-42' }
     }
-    It 'rejects a failed or missing load, a terminated renderer, and a dock never shown' {
-        Test-S06Web @([pscustomobject]@{ event = 'web_dock_shown'; t_ms = 2000 },
-                      [pscustomobject]@{ event = 'web_load'; status = 'failed'; url = 'about:blank'; error_string = 'x'; t_ms = 3000 }) |
+    It 'accepts the data: page loaded after the dock was shown, with the title its script sets' {
+        @(Test-S06Web @($shown, (Ev 'web_title' 2950 @{ title = 'pending' }), $loaded, $titled)).Count | Should -Be 0
+    }
+    It 'loads a local page whose script sets that title (no network, no about:blank)' {
+        $u = Get-S06WebUrl
+        $u | Should -Match '^data:text/html'
+        $u | Should -Match "document\.title='s06-rendered-'\+\(6\*7\)"
+        $u | Should -Not -Match '#'      # a bare # would start a fragment
+        $u | Should -Not -Match '"'      # no inner double quotes to escape on the command line
+    }
+    It 'rejects about:blank, a page whose script never ran, a failed load and a terminated renderer' {
+        (@(Test-S06Web @($shown, (Ev 'web_load' 3000 @{ status = 'succeeded'; url = 'about:blank' }))) -join '; ') | Should -Match 'did not load'
+        (@(Test-S06Web @($shown, $loaded)) -join '; ') | Should -Match 'script did not run'
+        (@(Test-S06Web @($shown, (Ev 'web_load' 3000 @{ status = 'failed'; url = 'data:text/html,x'; error_string = 'x' }), $titled)) -join '; ') |
             Should -Match 'did not load \(last load event: failed'
-        Test-S06Web @([pscustomobject]@{ event = 'web_dock_shown'; t_ms = 2000 }) | Should -Match 'no web_load event'
-        @(Test-S06Web @([pscustomobject]@{ event = 'web_dock_shown'; t_ms = 2000 },
-                        [pscustomobject]@{ event = 'web_load'; status = 'succeeded'; t_ms = 3000 },
-                        [pscustomobject]@{ event = 'web_render_process_terminated'; status = 2; exit_code = 5; t_ms = 9000 })) |
+        (@(Test-S06Web @($shown, $loaded, $titled, (Ev 'web_render_process_terminated' 9000 @{ status = 2; exit_code = 5 }))) -join '; ') |
             Should -Match 'renderer terminated'
-        Test-S06Web @() | Should -Be @('web dock not shown')
+        # A title from before the dock was shown doesn't count.
+        (@(Test-S06Web @((Ev 'web_title' 1000 @{ title = 's06-rendered-42' }), $shown, $loaded)) -join '; ') | Should -Match 'script did not run'
+    }
+    It 'leaves a dock never shown to the workload check (no duplicate message)' {
+        @(Test-S06Web @()).Count | Should -Be 0
     }
 }
 

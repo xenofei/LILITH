@@ -142,6 +142,13 @@ if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "Comf
 $res = [ordered]@{ check = 'S0.6'; started = (Get-Date).ToString('o'); rate_hz = $RateHz; charts_batched = [bool]$ChartsBatched; runs = $Runs }
 $comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramProc = $null
 try {
+    # Checked again right before the start (run-owner.ps1 checked minutes ago): no ComfyUI or spike
+    # process by path. An elevated ComfyUI on another port can't be seen this way (Windows hides
+    # an elevated process's path and command line), so the GPU's compute processes are recorded.
+    $blockers = @(Get-OwnerRunBlockers (Join-Path $Root 'build') $ComfyMain)
+    if ($blockers.Count) { throw "not starting ComfyUI: $($blockers -join '; ')" }
+    $res.gpu_compute_apps_before = @(& nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>$null | Where-Object { "$_".Trim() } |
+        ForEach-Object { $f = "$_" -split '\s*,\s*', 2; "$($f[0]) $(Split-Path -Leaf "$($f[1])")" })   # pid and exe name, no path
     Write-Host "starting ComfyUI on $Url ..."
     $comfy = Start-ProcessInJob $job $ComfyPython -ArgumentList @($ComfyMain, '--listen', '127.0.0.1', '--port', "$Port") `
         -WorkingDirectory (Split-Path $ComfyMain) `
@@ -190,7 +197,10 @@ try {
 
     $res.cpu_percent_before_app = Get-CpuPercent
     $log = Join-Path $Runs 's06.jsonl'
-    $appArgs = @('--log', $log, '--no-activate', '--on-top', '--load', '--load-rate', "$RateHz", '--show-web', '2000', '--measure', "$MeasureSeconds")
+    # The Web dock shows a local page with content and script (Get-S06WebUrl), not about:blank,
+    # so the run shows WebEngine rendering inside the job and the VRAM figure has a page in it.
+    $appArgs = @('--log', $log, '--no-activate', '--on-top', '--load', '--load-rate', "$RateHz", '--show-web', '2000', '--measure', "$MeasureSeconds",
+                 '--web-url', (Get-S06WebUrl))
     if ($ChartsBatched) { $appArgs += '--charts-batched' }
     $app = Start-ProcessInJob $job $Exe -ArgumentList $appArgs -WorkingDirectory $Deploy
     $appStart = ([DateTimeOffset]$app.StartTime).ToUnixTimeMilliseconds()
@@ -250,7 +260,9 @@ try {
     $res.stack_files = @(Get-ChildItem $Runs -Filter 's06.jsonl.*stacks.txt' -ErrorAction SilentlyContinue | ForEach-Object Name)
     $res.refresh_mismatch = $rr.mismatch
     $res.web = [ordered]@{ problems = @(Test-S06Web $ev)
-                           loads = @($ev | Where-Object { $_.event -eq 'web_load' } | ForEach-Object { "$($_.status) $($_.url)" }) }
+                           loads = @($ev | Where-Object { $_.event -eq 'web_load' } | ForEach-Object { "$($_.status) $("$($_.url)".Substring(0, [math]::Min(40, "$($_.url)".Length)))" })
+                           titles = @($ev | Where-Object { $_.event -eq 'web_title' } | ForEach-Object { $_.title })
+                           page = 'data: page (Get-S06WebUrl): coloured body, script-drawn canvas, script-set title' }
     # A web view that didn't load counts with the workload: the run is then INVALID, with the reason.
     $res.workload_problems = @(Test-S06Workload $counts $MeasureSeconds $RateHz) + @($res.web.problems)
     $verdict = Get-S06Verdict -HasMeasuredReport ([bool]$measured) -ExitCode $res.app_exit_code -TimedOut $res.app_timed_out `

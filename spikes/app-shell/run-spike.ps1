@@ -159,17 +159,22 @@ function Invoke-App([string]$exe, [string[]]$appArgs, [hashtable]$envSet = @{}, 
     foreach ($k in $envUnset) { [void]$psi.Environment.Remove($k) }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $p = [System.Diagnostics.Process]::Start($psi)
-    if ($OnStart) { & $OnStart $p }   # e.g. start a sampler on the new process
     $fgHits = 0; $samples = 0
-    while (-not $p.WaitForExit(250)) {
-        $samples++
-        if ([AppShellSpike.Win]::ForegroundPid() -eq $p.Id) { $fgHits++ }
-        if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
-            try { $p.Kill($true) } catch {}
-            $p.WaitForExit()
-            return [ordered]@{ launched = $true; pid = $p.Id; exit_code = $null; timed_out = $true; wall_ms = $sw.ElapsedMilliseconds
-                               foreground_samples = $samples; foreground_was_ours = $fgHits }
+    try {
+        if ($OnStart) { & $OnStart $p }   # e.g. start a sampler on the new process
+        while (-not $p.WaitForExit(250)) {
+            $samples++
+            if ([AppShellSpike.Win]::ForegroundPid() -eq $p.Id) { $fgHits++ }
+            if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
+                try { $p.Kill($true) } catch {}
+                $p.WaitForExit()
+                return [ordered]@{ launched = $true; pid = $p.Id; exit_code = $null; timed_out = $true; wall_ms = $sw.ElapsedMilliseconds
+                                   foreground_samples = $samples; foreground_was_ours = $fgHits }
+            }
         }
+    } finally {
+        # Ctrl+C or a throw (the OnStart hook's too): stop the app this run started.
+        if (-not $p.HasExited) { try { $p.Kill($true) } catch {} }
     }
     $p.WaitForExit()
     [ordered]@{ launched = $true; pid = $p.Id; exit_code = $p.ExitCode; timed_out = $false; wall_ms = $sw.ElapsedMilliseconds
@@ -577,39 +582,56 @@ if (Want 'S0.9') {
 
 # ==========================================================================================
 # S0.7 (APP-156): the accessibility smoke check, automated with UI Automation (no Narrator, no
-# owner). The deployed app runs with --no-activate (UIA needs no focus) and clicks its own
-# counter 3 times from 8 s; s07-uia.ps1 (Windows PowerShell 5.1, the managed UIA client) reads
-# its windows' elements and listens for UIA notification events. Get-S07Items judges each item.
+# owner). The deployed app runs with --no-activate (UIA needs no focus); s07-uia.ps1 (Windows
+# PowerShell 5.1, the managed UIA client) reads its windows' elements until every item is there,
+# subscribes to UIA notification events, then clicks the counter through InvokePattern.
+# Get-S07Items judges each item.
 # ==========================================================================================
 if (Want 'S0.7') {
     $uiaOut = Join-Path $Runs 's07-uia.json'
-    $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $script:uiaProc = $null
-    $r = Invoke-Spike $dExe 's07' @('--auto-counter', '8000', '--quit-after', '12000') $StripSet $StripUnset 60 $true {
-        param($proc)
-        $script:uiaProc = Start-Process $ps51 -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-            '-File', (Join-Path $Root 's07-uia.ps1'), '-AppPid', $proc.Id, '-Out', $uiaOut, '-WaitSeconds', '40'
-        $script:s07AppStart = ([DateTimeOffset]$proc.StartTime).ToUnixTimeMilliseconds()
+    try {
+        # The client clicks the counter itself, once it has read every item and subscribed, so
+        # the app needs no --auto-counter; it then closes the app's windows. --quit-after is the
+        # backstop, with time for the client on a slow machine.
+        $r = Invoke-Spike $dExe 's07' @('--quit-after', '25000') $StripSet $StripUnset 60 $true {
+            param($proc)
+            $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+            foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 's07-uia.ps1'),
+                           '-AppPid', "$($proc.Id)", '-Out', $uiaOut) { $psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $script:uiaProc = [System.Diagnostics.Process]::Start($psi)
+        }
+        if ($script:uiaProc -and -not $script:uiaProc.WaitForExit(30000)) { try { $script:uiaProc.Kill() } catch {} }
+    } finally {
+        # Ctrl+C or a throw: stop the client through its own Process object (the app is stopped by Invoke-App).
+        if ($script:uiaProc -and -not $script:uiaProc.HasExited) { try { $script:uiaProc.Kill() } catch {} }
     }
-    # The client ends when the app does; it is stopped through its own Process object otherwise.
-    if ($script:uiaProc -and -not $script:uiaProc.WaitForExit(30000)) { try { $script:uiaProc.Kill() } catch {} }
     $uia = if (Test-Path $uiaOut) { Get-Content $uiaOut -Raw | ConvertFrom-Json } else { $null }
-    $click = Get-Events $r.events 'counter' | Select-Object -First 1
-    $firstClickUtc = if ($click -and $script:s07AppStart) { $script:s07AppStart + [long]$click.t_ms } else { $null }
-    if (-not $uia -or $uia.error) {
-        $detail = [ordered]@{ reason = $(if ($uia) { "UIA client error: $($uia.error)" } else { 'the UIA client wrote no result' }) }
-        $verdict = 'ERROR'
-    } else {
-        $items = Get-S07Items $uia $r.run.pid $firstClickUtc
-        $verdict = if ($r.run.exit_code -ne 0) { "FAIL (the app exited with $($r.run.exit_code))" } else { Get-S07Verdict $items }
-        $detail = [ordered]@{ items = $items }
-    }
+    $built = Get-Events $r.events 'layout_built' | Select-Object -First 1
+    $stale = @(Test-DeployCurrent $Deploy $BinDir)   # empty when the deploy matches the build
+    $detail = [ordered]@{}
+    if ($uia -and -not $uia.error) { $detail.items = Get-S07Items $uia $r.run.pid }
+    $verdict = if ($r.run.timed_out) { 'FAIL (the app timed out)' }
+               elseif ($r.run.exit_code -ne 0) { "FAIL (the app exited with $($r.run.exit_code))" }
+               elseif (-not $uia -or $uia.error) { $detail.reason = $(if ($uia) { "UIA client error: $($uia.error)" } else { 'the UIA client wrote no result' }); 'ERROR' }
+               elseif ($stale.Count) { "INVALID (the deploy folder is older than the build: $($stale -join ', '); run S0.4 first)" }
+               else { Get-S07Verdict $detail.items @(Get-S07Problems $uia $(if ($built) { [double]$built.t_ms } else { $null })) }
     $detail.exit_code = $r.run.exit_code
-    $detail.deploy_stale_files = @(Test-DeployCurrent $Deploy $BinDir)   # empty when the deploy matches the build
+    $detail.deploy_stale_files = $stale
+    # Qt activates the window when UIA invokes its button (S0.7 needs no focus); the client then
+    # closes the app at once, so this is a fraction of a second: samples every 250 ms.
     $detail.focus_taken = ($r.run.foreground_was_ours -gt 0)
+    $detail.foreground_samples_ours = $r.run.foreground_was_ours
+    $detail.foreground_samples = $r.run.foreground_samples
     $detail.counter_clicks_logged = @(Get-Events $r.events 'counter').Count
-    $detail.uia = if ($uia) { [ordered]@{ windows = $uia.windows; windows_found_ms = $uia.windows_found_ms; subscribed_ms = $uia.subscribed_ms
-                                         elements = @($uia.elements).Count; element_errors = $uia.element_errors
+    # Times in ms since the app's start: the layout built (app log), the tree read with every item
+    # present, the subscription and the click (client).
+    $detail.timeline_app_ms = [ordered]@{ layout_built = $(if ($built) { [math]::Round([double]$built.t_ms) } else { $null })
+        items_present = $uia.read_app_ms; subscribed = $uia.subscribed_app_ms; invoked = $uia.invoked_app_ms }
+    $detail.uia = if ($uia) { [ordered]@{ windows_found = $uia.windows_found; items_ready = $uia.items_ready; missing_at_timeout = $uia.missing_at_timeout
+                                         tree_polls = $uia.tree_polls; invoked = $uia.invoked; invoke_error = $uia.invoke_error
+                                         windows = $uia.windows; elements = @($uia.elements).Count; element_errors = $uia.element_errors
                                          notifications = $uia.notifications } } else { $null }
     $detail.files = [ordered]@{ log = $r.log; uia = $uiaOut }
     Set-Check 'S0.7' $verdict $detail
@@ -628,7 +650,7 @@ if (Want 'S0.6smoke') {
     $vramFile = Join-Path $Runs 's06-smoke-vram.jsonl'
     $script:smokeVram = $null
     $osHz = Get-OsPrimaryRefreshHz
-    $r = Invoke-Spike $dExe 's06-smoke' @('--load', '--show-web', '2000', '--measure', '10') $StripSet $StripUnset 90 $true { param($proc) $script:smokeVram = Start-VramSampler $proc.Id $vramFile }
+    $r = Invoke-Spike $dExe 's06-smoke' @('--load', '--show-web', '2000', '--measure', '10', '--web-url', (Get-S06WebUrl)) $StripSet $StripUnset 90 $true { param($proc) $script:smokeVram = Start-VramSampler $proc.Id $vramFile }
     if ($script:smokeVram -and -not $script:smokeVram.HasExited) { try { $script:smokeVram.Kill() } catch {} }   # the sampler pwsh it started
     $vram = @(Read-VramSamples $vramFile)
     $vramMissing = @(Read-JsonLines $vramFile | Where-Object { $_.missing }).Count

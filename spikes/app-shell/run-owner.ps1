@@ -37,12 +37,14 @@ if ($why.Count) { Write-Host "NOT RUN: $($why -join '; '). Nothing was started."
 Write-Host @'
 Spike 10 owner run. Expected time on an idle machine:
   S0.4  rebuild (incremental) and redeploy ........ 2-5 min
-  S0.7  UI Automation check (no focus taken) ...... 1 min
-  S0.6  ComfyUI load, gate, 65 s measured run ..... 6-10 min (up to 5 min of it is ComfyUI start-up)
-        the 5 Hz fallback, only if S0.6 FAILs ..... 6-10 min more
-  Total: about 10-16 min, up to about 26 min with the fallback.
-Spike windows open without taking focus. During S0.6 the spike stays on top for about a minute:
-don't use the mouse or keyboard then. Ctrl+C or closing this window stops everything.
+  S0.7  UI Automation check ...................... 1 min
+  S0.6  ComfyUI load, gate, 65 s measured run ..... usually 6-10 min, at most about 12
+        (ComfyUI's start and the GPU gate are each capped at 5 min)
+        the 5 Hz fallback, only if S0.6 FAILs ..... the same again
+  Total: about 10-16 min; at most about 30 min with the fallback.
+Spike windows open without taking focus (S0.7's takes it for a fraction of a second when it clicks
+the counter), and those S0.4 and S0.7 open close by themselves within a minute. During S0.6 the spike stays on top for about a minute: don't use the mouse or
+keyboard then. Ctrl+C or closing this window stops everything.
 '@
 
 function Read-Json([string]$f) { if (Test-Path $f) { try { Get-Content $f -Raw | ConvertFrom-Json } catch { $null } } else { $null } }
@@ -61,8 +63,14 @@ foreach ($id in 'S0.4', 'S0.7') {
 }
 
 # ---- S0.6, and its fallback only on FAIL ----------------------------------------------------
-if ($lines['S0.4'] -notmatch '^PASS') {
-    $lines['S0.6'] = 'NOT RUN (the redeploy did not pass, and S0.6 refuses a stale deploy)'
+# S0.6 needs a deploy that matches the build, and S0.7 not to have broken down; an S0.4 FAIL for
+# another reason (a size or a restore off by a few px) doesn't stop it. comfy-load.ps1 refuses an
+# incomplete or stale deploy itself as well.
+$stale = @(Test-DeployCurrent (Join-Path $Root 'build\deploy') (Join-Path $Root 'build\cmake\bin'))
+if ($stale.Count) {
+    $lines['S0.6'] = "NOT RUN (the deploy folder doesn't match the build: $($stale -join ', '))"
+} elseif ($lines['S0.7'] -match '^ERROR') {
+    $lines['S0.6'] = 'NOT RUN (S0.7 broke down with ERROR; see the output above)'
 } else {
     $s06 = Join-Path $Results 's06.json'
     $before = Get-Date
