@@ -16,7 +16,7 @@ pwsh -NoProfile -File spikes/app-shell/run-owner.ps1
   5. It runs S0.6 under ComfyUI load (section 3 below) whenever the deploy matches the build, even if S0.4 failed for another reason, and the 5 Hz fallback only if S0.6 FAILs.
   6. It prints one line per check at the end.
 - **During the run:**
-  - Whenever you must keep off the keyboard and mouse, a small notice appears 10 s ahead (on a screen other than the main one if you have one; it never takes the focus). It counts down until the PC is free, and then says "Done". That happens twice: S0.7's click (about 10 s), and S0.6's measured minute (about 70 s).
+  - Whenever you must keep off the keyboard and mouse, a small notice appears at least 10 s ahead (in the bottom-right corner of your main screen; it never takes the focus). It counts down until the PC is free, and then says "Done". That happens twice: S0.7's click (about 10 s), and S0.6's measured minute (about 70 s).
   - Spike windows open without taking focus. S0.7's takes it when it clicks the counter: about 0.1–0.2 s normally, at most about 2 s if something goes wrong. The ones S0.4 and S0.7 open close by themselves within a minute.
   - During S0.6, the spike window stays on top for about a minute, so don't use the mouse or keyboard then.
   - Ctrl+C or closing the window stops everything, ComfyUI included.

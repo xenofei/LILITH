@@ -203,7 +203,7 @@ try {
 
     # Hands off from here until the app exits (the spike is on top and measured): the owner gets
     # a notice 10 s ahead, then a countdown, then "done" (hands-off.ps1; it takes no focus or input,
-    # on a screen other than the primary one if there is one). The load keeps running meanwhile.
+    # in the primary screen's bottom-right corner). The load keeps running meanwhile.
     $handsOffDone = Join-Path $Runs 'hands-off.done'
     $res.hands_off_notice = [ordered]@{ lead_s = 10; hands_off_s = $MeasureSeconds + 10; log = (Join-Path $Runs 'hands-off.json') }
     $notice = Start-HandsOffNotice "S0.6, the measured minute" ($MeasureSeconds + 10) $handsOffDone $res.hands_off_notice.log

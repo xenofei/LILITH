@@ -45,7 +45,7 @@ Spike 10 owner run. Expected time on an idle machine:
 Spike windows open without taking focus; S0.7's takes it when it clicks the counter (about
 0.1-0.2 s, at most about 2 s). Those S0.4 and S0.7 open close by themselves within a minute.
 Whenever you must keep off the keyboard and mouse (S0.7's click, S0.6's measured minute), a small
-notice appears 10 s ahead (on another screen if you have one), counts down, and says when you
+notice appears at least 10 s ahead (bottom-right of the main screen), counts down, and says when you
 can use the PC again. During S0.6 the spike stays on top for about a minute: don't use the mouse or
 keyboard then. Ctrl+C or closing this window stops everything.
 '@
