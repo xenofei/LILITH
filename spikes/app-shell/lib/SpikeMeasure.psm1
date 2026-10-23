@@ -222,6 +222,16 @@ function Test-GpuSaturatedRecently([object[]]$Samples, [long]$NowMs, [long]$Wind
     [bool]($c.dense -and $c.saturated)
 }
 
+# How close the load came to the gate's condition, recorded either way: the GPU condition over the
+# last 20 s and 60 s. (Owner run 3's record came out all null: Select-Object on an [ordered]
+# dictionary finds no properties, so each coverage is made a pscustomobject first.)
+function Get-GateSummary([object[]]$Samples, [long]$NowMs) {
+    $pick = 'n', 'saturated_fraction', 'min_util', 'max_gap_ms', 'level', 'dense', 'saturated'
+    [ordered]@{
+        last_20_s = [pscustomobject](Test-GpuCoverage -Samples $Samples -StartMs ($NowMs - 20000) -EndMs $NowMs) | Select-Object $pick
+        last_60_s = [pscustomobject](Test-GpuCoverage -Samples $Samples -StartMs ($NowMs - 60000) -EndMs $NowMs) | Select-Object $pick }
+}
+
 function Read-JsonLines([string]$File) {
     if (-not (Test-Path $File)) { return @() }
     @(Get-Content $File | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_ })
@@ -640,16 +650,47 @@ function Start-ProcessInJob {
     [KillOnCloseJob]::Start($Job, $FilePath, (ConvertTo-CommandLine (@($FilePath) + @($ArgumentList))), $WorkingDirectory, $StdOut, $StdErr, $hook)
 }
 
-# The owner's hands-off notice (hands-off.ps1, Windows PowerShell 5.1): warns $LeadSeconds ahead,
-# then counts down $Seconds; the caller waits $LeadSeconds before the stretch and writes $DoneFile
-# after it. Started outside any job (it must outlive comfy-load's job to say "done"); it closes
-# by itself when this process exits. Returns its Process.
+# The owner's hands-off notice (hands-off.ps1, Windows PowerShell 5.1). Start-HandsOffNotice
+# starts it with an absolute hands-off time (now + $LeadSeconds); the notice moves that later if it
+# is shown late, so its warning is on screen for at least $LeadSeconds, and writes the time it
+# chose to its ready file. Wait-HandsOffStart then waits for that file and until that time, and
+# returns what happened, for the run's results. The caller writes $DoneFile after the stretch.
+# The notice runs outside any job (it must outlive comfy-load's job to say "done"), and closes by
+# itself when this process exits.
 function Start-HandsOffNotice([string]$What, [int]$Seconds, [string]$DoneFile, [string]$Log = '', [int]$LeadSeconds = 10) {
     $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $ready = "$DoneFile.ready"
+    Remove-Item $ready -ErrorAction SilentlyContinue
+    $at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 1000L * $LeadSeconds
     $a = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot '..\hands-off.ps1'),
-           '-LeadSeconds', "$LeadSeconds", '-Seconds', "$Seconds", '-What', $What, '-DoneFile', $DoneFile, '-ParentPid', "$PID")
+           '-LeadSeconds', "$LeadSeconds", '-Seconds', "$Seconds", '-What', $What, '-DoneFile', $DoneFile, '-ParentPid', "$PID",
+           '-HandsOffAtEpochMs', "$at", '-ReadyFile', $ready)
     if ($Log) { $a += @('-Log', $Log) }
-    Start-ProcessInJob $null $ps51 -ArgumentList $a
+    [pscustomobject]@{ Process = (Start-ProcessInJob $null $ps51 -ArgumentList $a); ReadyFile = $ready; LeadSeconds = $LeadSeconds
+                       StartedEpochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+}
+
+# Waits until the hands-off stretch may start: for the notice's ready file (at most $TimeoutSec),
+# then until the time written in it, which is at least $LeadSeconds after the notice was shown.
+# Without a ready file (the notice failed or was too slow) it still waits $LeadSeconds from the
+# start, and says the notice wasn't shown.
+function Wait-HandsOffStart($Notice, [int]$TimeoutSec = 30) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $info = $null
+    while (-not $info -and (Get-Date) -lt $deadline -and -not $Notice.Process.HasExited) {
+        if (Test-Path $Notice.ReadyFile) { try { $info = Get-Content $Notice.ReadyFile -Raw | ConvertFrom-Json } catch {} }
+        if (-not $info) { Start-Sleep -Milliseconds 100 }
+    }
+    if ($info) {
+        $wait = [long]$info.hands_off_epoch_ms - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+        return [ordered]@{ shown = $true; shown_epoch_ms = [long]$info.shown_epoch_ms; hands_off_epoch_ms = [long]$info.hands_off_epoch_ms
+                           warning_ms = [long]$info.hands_off_epoch_ms - [long]$info.shown_epoch_ms
+                           startup_ms = [long]$info.shown_epoch_ms - [long]$Notice.StartedEpochMs }
+    }
+    $left = [long]$Notice.StartedEpochMs + 1000L * $Notice.LeadSeconds - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($left -gt 0) { Start-Sleep -Milliseconds $left }
+    [ordered]@{ shown = $false; reason = $(if ($Notice.Process.HasExited) { "the notice exited ($($Notice.Process.ExitCode))" } else { "no ready file within $TimeoutSec s" }) }
 }
 
 # The machine's CPU load (%), averaged over one second; recorded beside every timing.
@@ -659,8 +700,8 @@ function Get-CpuPercent {
 }
 
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
-    Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
+    Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Get-GateSummary, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
     Get-OwnerRunBlockers, Get-ResultsDir, Get-S06WebUrl, Test-S06Web, Get-S07Items, Get-S07Problems, Get-S07Verdict,
-    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob, Start-HandsOffNotice,
+    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob, Start-HandsOffNotice, Wait-HandsOffStart,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

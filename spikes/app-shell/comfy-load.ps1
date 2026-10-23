@@ -193,10 +193,8 @@ try {
     # many prompts keep_busy has finished.
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $gs = Read-GpuSamples $gpuFile
-    $res.gate = [ordered]@{
-        last_20_s = [pscustomobject](Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 20000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
-        last_60_s = [pscustomobject](Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 60000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
-        prompts_finished = @(Get-Content (Join-Path $Runs 'keep-busy.out.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match '^prompt ' }).Count }
+    $res.gate = Get-GateSummary $gs $nowMs
+    $res.gate.prompts_finished = @(Get-Content (Join-Path $Runs 'keep-busy.out.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match '^prompt ' }).Count
     if (-not $saturated) {
         $res.load_exit_code = if ($load.HasExited) { $load.ExitCode } else { $null }
         throw "the GPU never reached the measurement condition before the measured minute (load exited: $($load.HasExited), ComfyUI exited: $($comfy.HasExited)); see keep-busy.*.log and comfy.err.log in $Runs"
@@ -209,7 +207,7 @@ try {
     $handsOffDone = Join-Path $Runs 'hands-off.done'
     $res.hands_off_notice = [ordered]@{ lead_s = 10; hands_off_s = $MeasureSeconds + 10; log = (Join-Path $Runs 'hands-off.json') }
     $notice = Start-HandsOffNotice "S0.6, the measured minute" ($MeasureSeconds + 10) $handsOffDone $res.hands_off_notice.log
-    Start-Sleep -Seconds 10
+    $res.hands_off_notice.start = Wait-HandsOffStart $notice   # shown, and at least 10 s of warning on screen
 
     $res.cpu_percent_before_app = Get-CpuPercent
     $log = Join-Path $Runs 's06.jsonl'

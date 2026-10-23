@@ -601,12 +601,12 @@ if (Want 'S0.9') {
 # ==========================================================================================
 if (Want 'S0.7') {
     $uiaOut = Join-Path $Runs 's07-uia.json'
-    $script:uiaProc = $null
+    $script:uiaProc = $null; $script:s07AppStartEpoch = $null
     # The spike takes the focus for a moment at the click: the owner gets a notice 10 s ahead
     # (hands-off.ps1), then a countdown, then "done".
     $handsOffDone = Join-Path $Runs 's07-hands-off.done'
-    $null = Start-HandsOffNotice 'S0.7, the accessibility check' 10 $handsOffDone (Join-Path $Runs 's07-hands-off.json')
-    Start-Sleep -Seconds 10
+    $notice = Start-HandsOffNotice 'S0.7, the accessibility check' 10 $handsOffDone (Join-Path $Runs 's07-hands-off.json')
+    $s07Notice = Wait-HandsOffStart $notice   # shown, and at least 10 s of warning on screen
     try {
         # The client clicks the counter itself, once it has read every item and subscribed, so
         # the app needs no --auto-counter; it then closes the app's windows. --quit-after is the
@@ -618,6 +618,7 @@ if (Want 'S0.7') {
                            '-AppPid', "$($proc.Id)", '-Out', $uiaOut) { $psi.ArgumentList.Add($a) }
             $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
             $script:uiaProc = [System.Diagnostics.Process]::Start($psi)
+            $script:s07AppStartEpoch = ([DateTimeOffset]$proc.StartTime).ToUnixTimeMilliseconds()
         }
         if ($script:uiaProc -and -not $script:uiaProc.WaitForExit(30000)) { try { $script:uiaProc.Kill() } catch {} }
     } finally {
@@ -643,6 +644,11 @@ if (Want 'S0.7') {
     $detail.foreground_samples_ours = $r.run.foreground_was_ours
     $detail.foreground_samples = $r.run.foreground_samples
     $detail.counter_clicks_logged = @(Get-Events $r.events 'counter').Count
+    $detail.hands_off_notice = $s07Notice
+    if ($s07Notice.shown -and $script:s07AppStartEpoch -and $uia.invoked_app_ms) {
+        # How long after the warning ended the click (which moves the focus) came: never negative.
+        $detail.hands_off_notice.click_after_hands_off_start_ms = $script:s07AppStartEpoch + [long]$uia.invoked_app_ms - $s07Notice.hands_off_epoch_ms
+    }
     # Times in ms since the app's start: the layout built (app log), the tree read with every item
     # present, the subscription and the click (client).
     $detail.timeline_app_ms = [ordered]@{ layout_built = $(if ($built) { [math]::Round([double]$built.t_ms) } else { $null })

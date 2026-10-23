@@ -507,6 +507,64 @@ Describe 'S0.6 workload check' {
     }
 }
 
+Describe 'S0.6 re-score and gate diagnostics (owner run 3)' {
+    It 'summarises the gate''s last 20 s and 60 s with real values (they came out null)' {
+        $s = for ($k = 0; $k -lt 130; $k++) { [pscustomobject]@{ t = 1000 + $k * 500; util = $(if ($k % 10 -eq 0) { 93 } else { 99 }) } }
+        $g = Get-GateSummary $s 66000
+        $g.last_20_s.n | Should -BeGreaterThan 30
+        $g.last_60_s.n | Should -BeGreaterThan 100
+        $g.last_60_s.level | Should -Be 90
+        $g.last_60_s.saturated | Should -BeTrue
+    }
+    It 'recovers the measured window from the recorded coverage and re-scores it, keeping the original verdict' {
+        # A synthetic run: 500 ms samples, 99 % with a 93 % sample every 3 s and a dip every 12.5 s.
+        $dir = Join-Path $TestDrive 'run'; New-Item -ItemType Directory $dir | Out-Null
+        $base = [datetime]'2026-10-23T12:00:00'
+        $lines = for ($k = 0; $k -lt 300; $k++) {
+            $u = if ($k % 25 -eq 7) { 6 } elseif ($k % 6 -eq 5) { 93 } else { 99 }
+            '{0}, {1}, 11000' -f $base.AddMilliseconds(500 * $k).ToString('yyyy/MM/dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture), $u
+        }
+        Set-Content (Join-Path $dir 'gpu.csv') $lines
+        $samples = @(Read-GpuSamples (Join-Path $dir 'gpu.csv'))
+        $s0 = $samples[40].t - 120; $e0 = $s0 + 60000          # the live window, not recorded in old results
+        $orig = Test-GpuCoverage -Samples $samples -StartMs $s0 -EndMs $e0 -MinUtil 95
+        $truth = Test-GpuCoverage -Samples $samples -StartMs $s0 -EndMs $e0 -MinUtil 90
+        $result = [ordered]@{ runs = $dir; gpu_coverage = $orig; verdict = 'INVALID (GPU >= 95 % in only 80 % of the samples; 90 % needed)'
+                              heartbeat_lateness_ms = @{ n = 100; p99 = 3 }; frame_interval_ms = @{ n = 100; p99 = 8 }
+                              app_exit_code = 0; app_timed_out = $false; primary_refresh_hz = 240; workload_problems = @(); refresh_mismatch = $false }
+        $file = Join-Path $TestDrive 's06.json'
+        $result | ConvertTo-Json -Depth 6 | Set-Content $file
+        & pwsh -NoProfile -File (Join-Path $PSScriptRoot '..\rescore-s06.ps1') -Result $file | Out-Null
+        $r = Get-Content $file -Raw | ConvertFrom-Json
+        $r.verdict | Should -Be 'INVALID (GPU >= 95 % in only 80 % of the samples; 90 % needed)'
+        $r.verdict_rescored | Should -Be 'PASS'
+        $r.gpu_coverage_rescored.n | Should -Be $truth.n
+        $r.gpu_coverage_rescored.below_min | Should -Be $truth.below_min
+        $r.rescore_rule.window | Should -Match 'matched to the recorded coverage'
+    }
+}
+
+Describe 'Hands-off notice timing' {
+    It 'shows its warning for at least the lead time before the caller may start, and records it' {
+        $done = Join-Path $TestDrive 'ho.done'; $log = Join-Path $TestDrive 'ho.json'
+        $n = Start-HandsOffNotice 'a Pester test' 1 $done $log 2
+        try {
+            $w = Wait-HandsOffStart $n 30
+            $after = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $w.shown | Should -BeTrue
+            $w.warning_ms | Should -BeGreaterOrEqual 2000
+            $after | Should -BeGreaterOrEqual $w.hands_off_epoch_ms   # the caller didn't start early
+        } finally {
+            Set-Content $done 'done'
+            if (-not $n.Process.WaitForExit(15000)) { try { $n.Process.Kill() } catch {} }
+        }
+        $l = Get-Content $log -Raw | ConvertFrom-Json
+        $l.end | Should -Be 'done'
+        $l.ever_foreground | Should -BeFalse
+        $l.warning_ms | Should -BeGreaterOrEqual 2000
+    }
+}
+
 Describe 'Test-GpuSaturatedRecently (the gate before the measured minute)' {
     It 'holds the measurement back for the owner''s one-prompt-at-a-time pattern (15 of 20 samples loaded)' {
         $s = for ($k = 0; $k -lt 40; $k++) { [pscustomobject]@{ t = 1000 + $k * 500; util = $(if ($k % 4 -eq 0) { 5 } else { 99 }) } }
