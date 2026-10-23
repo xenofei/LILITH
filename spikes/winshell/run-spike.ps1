@@ -49,6 +49,11 @@ tests/cleanup-strict.ps1 dot-sources the script this way).
 .PARAMETER CleanupOnly
 Registers nothing and runs no check: removes whatever an interrupted run left and reports
 what is still there.
+
+.PARAMETER Simulate
+For tests/simulate.ps1 only (through run-all.ps1 -Simulate): runs the checks with every Windows
+call faked (tests/sim-fakes.ps1). Nothing on this PC is touched, and every path goes to the
+folder that test made (WINSHELL_SIM_DIR).
 #>
 param(
     [string[]]$Only = @(),
@@ -58,7 +63,8 @@ param(
     [switch]$DryRun,
     [switch]$Append,
     [ValidateSet('all', 'sleep-wake', 'stay-awake')]
-    [string]$PowerPart = 'all'
+    [string]$PowerPart = 'all',
+    [switch]$Simulate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,6 +125,7 @@ $Report = [ordered]@{
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 function Step([string]$Text) { Write-Host ''; Write-Host "==== $Text" -ForegroundColor Yellow }
+function Beep([int]$Frequency, [int]$Ms) { [console]::Beep($Frequency, $Ms) }
 
 function Ask([string]$Question) {
     while ($true) {
@@ -1122,7 +1129,7 @@ function Check-S16 {
     $p99 = P (P $a 'call_ms') 'p99'
     Wait-Owner '(b) Next: start a fullscreen Direct3D game or program. You have 20 s to get it fullscreen; keep it there until you hear a beep (60 s). Ready?'
     $b = Wait-Core (Start-Core 's16-b-d3d' @('fullscreen', '--secs', '60')) 120
-    [console]::Beep(880, 400)
+    Beep 880 400
     # PASS for (b): at least 5 polls in a row (10 s) read D3D fullscreen or busy.
     $bSamples = @(P $b 'samples')
     $bRun = Longest-Run $bSamples @('QUNS_RUNNING_D3D_FULL_SCREEN', 'QUNS_BUSY')
@@ -1130,11 +1137,11 @@ function Check-S16 {
     $c = $null; $d = $null
     if (Ask '(c) Recorded: play a video fullscreen in a browser next (20 s to set it up, 60 s total, until the beep)?') {
         $c = Wait-Core (Start-Core 's16-c-video' @('fullscreen', '--secs', '60')) 120
-        [console]::Beep(880, 400)
+        Beep 880 400
     }
     if (Ask '(d) Recorded: is a presentation at hand to run as a slide show (same timing)?') {
         $d = Wait-Core (Start-Core 's16-d-presentation' @('fullscreen', '--secs', '60')) 120
-        [console]::Beep(880, 400)
+        Beep 880 400
     }
     $pass = $aPass -and $bRun -ge 5 -and $null -ne $p99 -and $p99 -lt 1.0
     Set-Check 'S1.6' $(if ($pass) { 'PASS' } else { 'FAIL' }) ([ordered]@{
@@ -1519,6 +1526,10 @@ function Invoke-Check([string]$Id, [scriptblock]$Body) {
         try { Stop-SpikeProcesses } catch { }
     }
 }
+
+# -Simulate (fix round 4): the fakes replace every Windows call and redirect the paths; the
+# main part below then runs as it does for the owner.
+if ($Simulate) { . (Join-Path $PSScriptRoot 'tests\sim-fakes.ps1') -SimFor 'run-spike' }
 
 if ($LibraryOnly) { return }
 

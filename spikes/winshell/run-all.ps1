@@ -32,6 +32,10 @@ Task 0's deploy folder itself, instead of -Task0Repo.
 Part C's unattended runs (the bar is 3 of 3).
 .PARAMETER DryRun
 Prints the plan as JSON and stops; nothing runs (tests/run_all.rs).
+.PARAMETER Simulate
+For tests/simulate.ps1 only: runs the block end to end with every Windows call faked
+(tests/sim-fakes.ps1). Nothing on this PC is touched, every path goes to the folder that test
+made (WINSHELL_SIM_DIR), and each stage gets -Simulate too.
 #>
 param(
     [ValidateSet('Attended', 'Unattended')]
@@ -40,7 +44,8 @@ param(
     [string]$Task0Repo = '',
     [string]$DeployDir = '',
     [int]$Runs = 3,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Simulate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -110,6 +115,9 @@ function Get-SleepTimeout {
 function Fmt-Timeout($Sec) { if ($null -eq $Sec) { 'unknown' } elseif ($Sec -eq 0) { 'never' } else { Fmt ($Sec / 60) } }
 $TimeoutFile = Join-Path $Spike 'results\sleep-timeout-at-attended.json'
 function Fmt([double]$Min) { $m = [int][math]::Ceiling($Min); if ($m -ge 60) { '{0} h {1:00} min' -f [math]::Floor($m / 60), ($m % 60) } else { "$m min" } }
+# -Simulate (fix round 4): the fakes replace every Windows call and redirect the paths.
+$simArg = @()
+if ($Simulate) { . (Join-Path $Spike 'tests\sim-fakes.ps1') -SimFor 'run-all'; $simArg = @('-Simulate') }
 
 $identity = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -143,7 +151,7 @@ if ($withS17 -and $Block -eq 'Unattended' -and $timeoutNow.used_s -gt 0) { $stay
 # Part C can start only with the Sandbox feature on and Task 0's deploy folder found.
 $sandboxReady = $false
 if ($withSandbox) {
-    $pf = (& pwsh -NoProfile -File (Join-Path $Spike 'run-sandbox.ps1') -Preflight @sandboxArgs) | Out-String | ConvertFrom-Json
+    $pf = (& pwsh -NoProfile -File (Join-Path $Spike 'run-sandbox.ps1') -Preflight @sandboxArgs @simArg) | Out-String | ConvertFrom-Json
     $sandboxReady = [bool]$pf.ready
     if (-not $sandboxReady) {
         Say 'Part C (Windows Sandbox) cannot start, so this block leaves it out:' 'Red'
@@ -221,7 +229,7 @@ $outcomes = @()
 foreach ($s in $stages) {
     Write-Host ''
     Say ("######## {0} ({1:HH:mm})" -f $s.name, (Get-Date)) 'Yellow'
-    & pwsh -NoProfile -File (Join-Path $Spike $s.script) @($s.args)
+    & pwsh -NoProfile -File (Join-Path $Spike $s.script) @($s.args) @simArg
     $outcomes += [ordered]@{ stage = $s.name; exit = $LASTEXITCODE }
     if ($LASTEXITCODE -ne 0) { Say "$($s.name) ended with exit code $LASTEXITCODE; going on with the next part." 'Red' }
 }

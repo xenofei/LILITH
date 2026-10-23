@@ -333,9 +333,8 @@ function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
         try {
             $h.StateFile = Join-Path ([IO.Path]::GetTempPath()) ('winshell-popup-' + [guid]::NewGuid().ToString('N') + '.done')
             $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $out = & $tool spawn '--' $ps -NoProfile -ExecutionPolicy Bypass -File $popup -What $What -StartAtMs $startAt -RunSec $Seconds -StateFile $h.StateFile -ParentPid $PID
-            $r = ($out | Out-String) | ConvertFrom-Json
-            if ($r.PSObject.Properties['pid']) {
+            $r = Invoke-PopupSpawn $tool @($ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $popup, '-What', $What, '-StartAtMs', "$startAt", '-RunSec', "$Seconds", '-StateFile', $h.StateFile, '-ParentPid', "$PID")
+            if ($null -ne $r -and $r.PSObject.Properties['pid']) {
                 $h.Process = Get-PinnedProcess ([int]$r.pid) $ps $spawned
                 if ($null -ne $h.Process) { $script:Popups = @($script:Popups) + @($h) }
             }
@@ -359,6 +358,13 @@ function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
         if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
     }
     $h
+}
+
+# winshell-tool spawn of the pop-up: its one JSON line. A seam: under -Simulate,
+# tests/sim-fakes.ps1 replaces it, so no pop-up is shown.
+function Invoke-PopupSpawn([string]$Tool, [string[]]$SpawnArgs) {
+    $out = & $Tool spawn '--' @SpawnArgs
+    ($out | Out-String) | ConvertFrom-Json
 }
 
 # The stretch is over: the pop-up says "done" for 5 s and closes itself.

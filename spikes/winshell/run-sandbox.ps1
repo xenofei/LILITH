@@ -42,6 +42,10 @@ time) is recorded as interrupted by sleep, never as a FAIL.
 .PARAMETER Preflight
 Starts nothing: prints, as JSON, whether a run could start now (the Sandbox feature, Task 0's
 deploy folder, the Qt exe) and what to type when it couldn't (run-all.ps1, tests/sandbox_paths.rs).
+.PARAMETER Simulate
+For tests/simulate.ps1 only (through run-all.ps1 -Simulate): runs with every Windows call faked
+(tests/sim-fakes.ps1), the Sandbox included. Nothing on this PC is touched, and every path goes
+to the folder that test made (WINSHELL_SIM_DIR).
 #>
 param(
     [int]$Runs = 3,
@@ -52,7 +56,8 @@ param(
     [string]$QtGrabArgs = '--screenshot {png} --quit-after 5000 --no-activate',
     [switch]$SkipBuild,
     [switch]$Preflight,
-    [switch]$KeepAwake
+    [switch]$KeepAwake,
+    [switch]$Simulate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,6 +77,7 @@ $RunLimitSec = 600
 $script:BlockerProcess = $null
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
+function Beep([int]$Frequency, [int]$Ms) { [console]::Beep($Frequency, $Ms) }
 
 function Tool {
     $out = & $ToolExe @args
@@ -472,7 +478,7 @@ function Invoke-Observation([string]$Res, $Started) {
     $obs.round2_done = Wait-ResultFile (Join-Path $Res 'round-2.json') 600
     } finally { Stop-HandsOff $handsOff; Stop-Blocker }
 
-    [console]::Beep(880, 300)
+    Beep 880 300
     Say 'YOUR TURN: lock the PC now (Win+L). Stay locked until you hear two beeps (about 4 minutes), then sign in again. The script sees the lock and the sign-in by itself.' 'Yellow'
     $lock = [ordered]@{ method = 'WTSQuerySessionInformation(WTSSessionInfoEx) SessionFlags, every 2 s'; locked_after_s = $null; locked_throughout = $null; unlocked_after_s = $null }
     $t0 = Get-Date
@@ -486,7 +492,7 @@ function Invoke-Observation([string]$Res, $Started) {
     $obs.round3_done = Test-Path -LiteralPath (Join-Path $Res 'round-3.json')
     if ($null -ne $lock.locked_after_s) {
         # A beep can be heard on the lock screen: the cue to sign in again (review M12).
-        [console]::Beep(660, 400); [console]::Beep(880, 400)
+        Beep 660 400; Beep 880 400
         Say $(if ($obs.round3_done) { 'Round 3 is done: sign in again now.' } else { 'Round 3 did not finish in time: sign in again now.' }) 'Yellow'
     }
     if ($null -ne $lock.locked_after_s) { $lock.locked_throughout = @($states | Where-Object { $_ -ne $true }).Count -eq 0 }
@@ -496,6 +502,10 @@ function Invoke-Observation([string]$Res, $Started) {
     $obs.round3_lock = $lock
     $obs
 }
+
+# -Simulate (fix round 4): the fakes replace every Windows call and redirect the paths; the
+# main part below then runs as it does for the owner.
+if ($Simulate) { . (Join-Path $PSScriptRoot 'tests\sim-fakes.ps1') -SimFor 'run-sandbox' }
 
 if ($Preflight) {
     $i = Get-SandboxInfo
