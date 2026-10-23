@@ -114,20 +114,66 @@ Try-Case 'one missed poll inside a banner is not a second pop' { @(Get-Appearanc
 Try-Case 'an unknown poll is skipped' { @(Get-Appearances @((Smp 0.25 $true), (Smp 0.5 $null), (Smp 0.75 $true))).Count } '1'
 Try-Case 'a second pop after the banner went' { @(Get-Appearances @((Smp 0.25 $true), (Smp 5 $true), (Smp 5.25 $false), (Smp 9 $false), (Smp 9.25 $true))).Count } '2'
 Try-Case 'a slow poll with no absence between is one appearance' { @(Get-Appearances @((Smp 0.25 $true), (Smp 2.5 $true))).Count } '1'
+Try-Case 'a single missed poll then a slow poll is not a second pop' { @(Get-Appearances @((Smp 0.25 $true), (Smp 0.5 $false), (Smp 2.5 $true))).Count } '1'
 Try-Case 'never shown' { @(Get-Appearances @((Smp 0.25 $false), (Smp 0.5 $null))).Count } '0'
 Try-Case 'appearance times' { $a = @(Get-Appearances @((Smp 1.5 $true), (Smp 6 $true))); "$($a[0]['from_s'])-$($a[0]['to_s'])" } '1.5-6'
-$term = [ordered]@{ hwnd = 100; pid = 10; process = 'WindowsTerminal' }
-Try-Case 'prompt in front: another process took the front' { Get-PromptInFront $term @($term, [ordered]@{ hwnd = 200; pid = 20 }) } 'True'
-Try-Case 'prompt in front: the terminal stayed in front' { Get-PromptInFront $term @($term) } 'False'
-Try-Case 'prompt in front: nothing known before' { $null -eq (Get-PromptInFront $null @($term)) } 'True'
 
-# Resolve-Popped once UIA has found a toast in this run (no question is asked then).
+# ---- S1.8: the Hello prompt in front (automation review I4)
+$term = [ordered]@{ hwnd = 100; pid = 10; process = 'WindowsTerminal' }
+function Fg([int64]$H, [int]$P, [string]$Proc, [double]$T, [bool]$Typed) { [ordered]@{ hwnd = $H; pid = $P; process = $Proc; first_s = $T; input_since_start = $Typed } }
+Try-Case 'prompt in front: another process took the front, no input' { (Get-PromptInFront $term @($term, (Fg 200 20 'CredentialUIBroker' 0.6 $false))).how } 'in front'
+Try-Case 'prompt in front: the terminal stayed in front' { (Get-PromptInFront $term @($term)).how } 'not in front'
+Try-Case 'prompt in front: an empty foreground reading is ignored' { (Get-PromptInFront $term @($term, (Fg 0 0 $null 0.3 $false))).how } 'not in front'
+Try-Case 'prompt in front: the taskbar is not the prompt' { (Get-PromptInFront $term @((Fg 300 30 'explorer' 0.3 $false))).value } 'False'
+Try-Case 'prompt in front: moved after the owner''s input' { (Get-PromptInFront $term @((Fg 0 0 $null 0.2 $false), (Fg 200 20 'CredentialUIBroker' 2.1 $true))).how } 'owner-assisted'
+Try-Case 'prompt in front: the first move decides' { (Get-PromptInFront $term @((Fg 200 20 'CredentialUIBroker' 0.5 $false), (Fg 400 40 'notepad' 3.0 $true))).value } 'True'
+Try-Case 'prompt in front: nothing known before' { $null -eq (Get-PromptInFront $null @($term)) } 'True'
+Try-Case 'prompt in front: an empty reading before' { $null -eq (Get-PromptInFront (Fg 0 0 $null 0 $false) @($term)) } 'True'
+
+# ---- Scoping to one toast, and the deny list (automation review I2, I3)
+Try-Case 'only this toast: its nonce alone' { Test-OnlyThisToast @('LILITH spike', 'Click the Open button (S1.3, 4 of 6) #a1b2c3', 'Open') '#a1b2c3' 1 } 'True'
+Try-Case 'only this toast: another spike toast in the subtree' { Test-OnlyThisToast @('x #a1b2c3', 'y #ffee00') '#a1b2c3' 1 } 'False'
+Try-Case 'only this toast: two Open buttons' { Test-OnlyThisToast @('x #a1b2c3') '#a1b2c3' 2 } 'False'
+Try-Case 'only this toast: the nonce missing' { Test-OnlyThisToast @('LILITH spike') '#a1b2c3' 0 } 'False'
+foreach ($deny in @(@('Clear all', ''), @('Clear all notifications', ''), @('Clear notifications', ''), @('Clear all LILITH Spike notifications', ''), @('', 'ClearAllButton'), @('Close all', ''), @('Dismiss all', ''))) {
+    Try-Case "deny list: '$($deny[0])' '$($deny[1])'" { (Test-DeniedButton $deny[0] $deny[1]) -and -not (Test-DismissButton $deny[0] $deny[1]) } 'True'
+}
+foreach ($ok in @(@('Dismiss', ''), @('Close', ''), @('', 'DismissButton'), @('Close notification', ''))) {
+    Try-Case "own dismiss button: '$($ok[0])' '$($ok[1])'" { Test-DismissButton $ok[0] $ok[1] } 'True'
+}
+Try-Case 'not a dismiss button: Open' { Test-DismissButton 'Open' '' } 'False'
+Try-Case 'rect inside' { Test-RectInside ([pscustomobject]@{ X = 110; Y = 210; Width = 50; Height = 20 }) ([pscustomobject]@{ X = 100; Y = 200; Width = 300; Height = 100 }) } 'True'
+Try-Case 'rect outside' { Test-RectInside ([pscustomobject]@{ X = 110; Y = 310; Width = 50; Height = 20 }) ([pscustomobject]@{ X = 100; Y = 200; Width = 300; Height = 100 }) } 'False'
+
+# ---- The owner's answers, faked: these functions ask only through Ask.
+$script:AskedCount = 0
+$script:FakeAnswer = $true
+function Ask { $script:AskedCount++; $script:FakeAnswer }
+
+# Resolve-Popped (automation review M6): "not seen" decides only with clean readings.
 $script:Uia.proven = $true
-Try-Case 'Resolve-Popped: one appearance' { (Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ appearances = @([ordered]@{ from_s = 1; to_s = 5 }) } }) 'q').value } 'True'
-Try-Case 'Resolve-Popped: none' { (Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ appearances = @() } }) 'q').value } 'False'
-Try-Case 'Resolve-Popped: a record without appearances is not a pop' { (Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ method = 'none' } }) 'q').value } 'False'
+Try-Case 'Resolve-Popped: one appearance' { (Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ appearances = @([ordered]@{ from_s = 1; to_s = 5 }); clean_polls = 30 } }) 'q').value } 'True'
+Try-Case 'Resolve-Popped: none in clean readings' { (Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ appearances = @(); clean_polls = 30 } }) 'q').method } 'uia'
+Try-Case 'Resolve-Popped: no clean readings asks the owner' { $script:AskedCount = 0; $r = Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ method = 'none'; clean_polls = 0 } }) 'q'; "$($script:AskedCount) $($r.method)" } '1 owner (only 0 clean UIA readings)'
+Try-Case 'Resolve-Popped: untrusted (control toast unseen) asks the owner' { $script:AskedCount = 0; $r = Resolve-Popped ([pscustomobject]@{ Record = [ordered]@{ appearances = @(); clean_polls = 30 } }) 'q' -Trust:$false; "$($script:AskedCount) $($r.method)" } '1 owner (the control toast just before was not seen)'
 $script:Uia.proven = $false
 
+# S1.5's second pop (automation review C1): 0 never decides, 1 is the owner's, 2+ is FAIL.
+Try-Case 'second pop: 0 popups asks the owner' { $script:AskedCount = 0; $script:FakeAnswer = $true; $r = Resolve-SecondPop 0 { Ask 'q' }; "$($script:AskedCount) $($r.value) $($r.method)" } '1 True owner (UIA did not see the progress toast)'
+Try-Case 'second pop: 1 popup, the owner decides' { $script:AskedCount = 0; $script:FakeAnswer = $false; $r = Resolve-SecondPop 1 { Ask 'q' }; "$($script:AskedCount) $($r.value) $($r.method)" } '1 False owner decides (UIA saw 1 popup)'
+Try-Case 'second pop: 2 popups is FAIL without asking' { $script:AskedCount = 0; $r = Resolve-SecondPop 2 { Ask 'q' }; "$($script:AskedCount) $($r.value) $($r.method)" } '0 False uia'
+Try-Case 'S1.5 verdict: 2 popups' { Get-S15Verdict $false (Resolve-SecondPop 2 { $true }) } 'FAIL'
+Try-Case 'S1.5 verdict: 1 popup, owner saw no second' { Get-S15Verdict $true (Resolve-SecondPop 1 { $true }) } 'PASS (UIA saw 1 popup; the owner saw no second pop)'
+Try-Case 'S1.5 verdict: 1 popup, owner saw a second' { Get-S15Verdict $false (Resolve-SecondPop 1 { $false }) } 'FAIL (UIA saw 1 popup; the owner saw a second pop, for example an in-place re-animation)'
+Try-Case 'S1.5 verdict: 0 popups, owner says once' { Get-S15Verdict $true (Resolve-SecondPop 0 { $true }) } 'PASS'
+
+# ---- The stay-awake wait (automation review I5, M11)
+Try-Case 'input during the wait: idle shorter than the stretch' { Test-InputDuring 600 120 } 'True'
+Try-Case 'no input during the wait' { Test-InputDuring 600 598 } 'False'
+Try-Case 'idle unknown is not input' { Test-InputDuring 600 $null } 'False'
+Try-Case 'S1.7 a Sandbox running: not decisive' { (Get-S17Verdict $listed ([ordered]@{ api = 'request'; result = 'not run'; why = 'a Windows Sandbox is running' }) $null $true).verdict } 'INCOMPLETE (the stay-awake wait was not decisive: a Windows Sandbox is running)'
+Try-Case 'S1.7 another requester before the hold' { (Get-S17Verdict $listed ([ordered]@{ api = 'request'; result = 'not decisive'; why = 'another requester' }) $null $true).verdict } 'INCOMPLETE (the stay-awake wait was not decisive: another requester)'
+Try-Case 'Test-NeedSte: a not-decisive wait needs no second API' { Test-NeedSte $listed ([ordered]@{ result = 'not decisive' }) } 'False'
 # ---- The CLSID read-back (rerun of 2026-10-23: S1.2p, S1.3 and S1.4 stopped at the compare).
 # The root cause, reproduced: a [switch] parameter named like the script's $ToastClsid string
 # hides that string inside the function, and the CLSID is compared with "True".

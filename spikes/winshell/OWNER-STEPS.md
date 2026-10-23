@@ -1,6 +1,6 @@
 # Spike 11: what you run, and what you do
 
-Plan 4a, Task 1. Since 2026-10-23 a session is **one command**. The scripts watch the screen themselves, so they no longer ask "did a toast appear?" or "is it in Win+N?". You do only what needs a person: a few clicks, Windows Hello, one sleep and one lock.
+Plan 4a, Task 1. Since 2026-10-23 a session is **two commands**: one for the part that needs you, one for the part that needs nobody. The scripts watch the screen themselves, so they no longer ask "did a toast appear?" or "is it in Win+N?". You do only what needs a person: a few clicks, Windows Hello, one sleep and one lock.
 
 Nothing starts until you press Enter after the plan is printed.
 
@@ -13,40 +13,51 @@ Nothing starts until you press Enter after the plan is printed.
 5. **Task 0's app is built**: Task 0's worktree has the folder `spikes\app-shell\build\deploy`.
 6. **Save your work** in other programs. The PC sleeps once, and at the end it must sit untouched for a long time.
 
-## The session
+## The session: two blocks
 
-1. Open **Windows Terminal normally** (not "Run as administrator"; the script refuses an elevated terminal, because Windows hides toasts from elevated programs).
-2. Go to this repository's folder: `cd ` and the folder's path.
-3. Type, with the folder of Task 0's worktree in the quotes:
+A session is two commands (the two blocks below), run from a normal **Windows Terminal** (not "Run as administrator": Windows hides toasts from elevated programs) in this repository's folder. Put the folder of Task 0's worktree in the quotes. If you leave out `-Task0Repo`, the script prints the exact command to type instead; setting the environment variable `LILITH_TASK0_REPO` to that folder works too.
+
+1. **The attended block, about 50 minutes, with you at the PC:**
 
    ```powershell
-   pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Task0Repo "<folder of Task 0's worktree>"
+   pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Attended -Task0Repo "<folder of Task 0's worktree>"
    ```
 
-   If you leave out `-Task0Repo`, the script looks in this worktree, and if Task 0's app isn't there it prints the exact command to type instead (it lists the worktrees that have it). Setting the environment variable `LILITH_TASK0_REPO` to that folder works too.
-4. The script prints the plan and the time it will take on this PC, then waits for Enter.
+2. **The unattended block, about 2 hours 40 minutes with a 2-hour sleep timeout, with nobody at the PC.** Start it when you leave, for example in the evening. When the attended block ends it prints this command for you:
 
-### What happens, and when you act
+   ```powershell
+   pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Unattended -Task0Repo "<folder of Task 0's worktree>"
+   ```
 
-**About 3 hours 25 minutes in all with a 2-hour sleep timeout** (the script prints the figure for your PC). The last 2 hours or so need nobody.
+Each block prints its plan and its time on this PC, then waits for Enter. The unattended block then counts down 60 seconds so that you can leave.
+
+Whenever the script is about to move the mouse or press keys, it prints a yellow **HANDS OFF** line first. If you are using the mouse or keyboard at that moment, it holds back and tries again, and after a few tries it hands that step to you. **Ctrl+C** in the terminal stops it at any time. Whenever a step needs you, it says **YOUR TURN** in yellow.
+
+### The attended block
 
 | Part | Time | What the PC shows | What you do |
 |---|---|---|---|
-| Calibration | under a minute | one toast, "Calibration toast" | nothing. If the script can't see it, it asks you once whether it showed; then it asks a few simple questions later instead of detecting |
+| Calibration | under a minute | one toast, "Calibration toast" | nothing. If the script can't see it, it asks you once whether it showed, and then asks a few simple questions later instead of detecting |
 | Toasts that stay (S1.2p) | about 2 min | two toasts; the notification centre opens and closes by itself | **hands off** |
 | Clicking toasts (S1.3) | about 4 min | six toasts, clicked by the script; small "winshell-app" windows; the Run box opens and types a link by itself | **hands off**: the mouse moves by itself |
-| Foreground (S1.4) | about 14 min | in each trial two small windows, "winshell-app" and "winshell blocker" (the script clicks the blocker to the front), then a toast | **YOUR TURN**: click the toast's text, 10 times (15 if the first method fails). A real click is what this check measures. Then 5 more trials that the script clicks itself: hands off |
-| Progress toasts (S1.5) | about 3 min | a toast with a progress bar; the notification centre opens, the script closes that toast | hands off. Only if the script can't close it, it says YOUR TURN: close "Spike job running" in Win+N with its X; it notices by itself |
-| Sleep and wake (S1.7) | about 5 min | — | **YOUR TURN**: Start, Power, **Sleep**; wait about a minute; wake the PC and sign in. The script notices the wake |
-| Windows Hello (S1.8) | about 4 min | Windows Hello prompts: 1, then up to 10, then 1 | **YOUR TURN**: complete each prompt. Keep the terminal in front; the script checks by itself whether each prompt comes in front of it |
-| Sandbox, watched run | about 15 min | a Windows Sandbox window with things happening inside; then one of the spike's windows is placed over it | when the script beeps and says YOUR TURN: **lock the PC (Win+L)**, stay locked about 4 minutes, then sign in. It sees the lock and the sign-in |
-| Sandbox, 3 runs | about 30 min | the Sandbox window opens and closes 3 times | nothing. Don't click inside the Sandbox window |
-| Stay-awake (S1.7) | your sleep timeout plus about 6 min | nothing; the screen may turn off | **nobody touches the PC**, and it must not go to sleep. You can walk away. If someone touches it, the script notices (Windows' last-input time) and marks that wait as needing a rerun |
+| Foreground (S1.4) | about 16 min | in each trial two small windows, "winshell-app" and "winshell blocker" (the script clicks the blocker to the front), then a toast | **YOUR TURN**: click the toast's text, 10 times (15 if the first method fails). A real click is what this check measures. Keep your hand off the mouse until the toast is there. Then 5 more trials that the script clicks itself: hands off |
+| Progress toasts (S1.5) | about 4 min | a toast with a progress bar for 20 s; the notification centre opens, the script closes that toast | **YOUR TURN, watch only**: does the progress toast slide in a second time? The script asks you when it can't tell by itself. If it can't close the toast, it asks you to close it with its own X (never "Clear all") |
+| Sleep and wake (S1.7) | about 5 min | — | **YOUR TURN**: Start, Power, **Sleep**; wait about a minute; wake the PC and sign in. The script carries on once the PC is awake again |
+| Windows Hello (S1.8) | about 4 min | Windows Hello prompts: 1, then up to 10, then 1 | **YOUR TURN**: complete each prompt, **without clicking it first**. Keep the terminal in front. The script checks whether each prompt comes in front by itself, and a prompt you had to click or type into before it came forward counts as "owner-assisted", not as "in front" |
+| Sandbox, watched run | about 15 min | a Windows Sandbox window with things happening inside; then one of the spike's windows is placed over it | when the script beeps and says YOUR TURN: **lock the PC (Win+L)**. Sign in again when you hear **two beeps** (about 4 minutes). The script sees the lock and the sign-in |
 
-When it ends, the terminal prints each check's verdict (PASS, FAIL, INCOMPLETE or RECORDED) and the cleanup's result. Tell the agent the session is done; the results are in `spikes\winshell\results\`.
+### The unattended block
 
-Whenever a part says YOUR TURN it is printed in yellow; everything else needs nothing from you.
+| Part | Time | What happens |
+|---|---|---|
+| Stay-awake (S1.7) | your sleep timeout plus about 6 minutes; at worst twice that, if the first method fails and the wait runs once more with the second one | nothing on screen, and the screen may turn off. The PC must **not** go to sleep. Nobody touches the PC: a touch restarts the wait from that moment (up to 3 times). The wait doesn't start while a Windows Sandbox runs, or while another program already keeps the PC awake; the script checks that, waits up to 10 minutes for it to stop, and otherwise records the wait as not decisive |
+| Sandbox, 3 runs | about 30 minutes | the Sandbox window opens and closes 3 times by itself |
 
+**Optional, your choice:** the wait follows this PC's "Sleep after" setting (Settings, System, Power), which the scripts only read and never change. If you shorten it yourself before starting the unattended block, the wait shrinks to match. If you do, set it back afterwards.
+
+**Programs that keep the PC awake** (a playing video, a download, an app with a keep-awake option) make the wait not decisive. Close them before you start the unattended block.
+
+When a block ends, the terminal prints each check's verdict (PASS, FAIL, INCOMPLETE, RECORDED or PENDING) and the cleanup's result. Tell the agent the block is done. The results are in `spikes\winshell\results\`: `checks.json` for Part B and the stay-awake wait, and `sandbox-observe.json` and `sandbox-checks.json` for the Sandbox.
 ## What the session changes, and how it is undone
 
 Each part removes what it added and checks that it is gone (the line "Cleanup -> PASS").
@@ -60,9 +71,9 @@ Each part removes what it added and checks that it is gone (the line "Cleanup ->
 | Windows' own notification setting for "LILITH Spike", and any `lilspike` entries under `ApplicationAssociationToasts` | added by Windows | deleted |
 | The Windows Hello key "LILITH-spike-kek" | S1.8 | deleted; the cleanup passes only when Hello says "not found" |
 | The spike's toasts in the notification centre | throughout | cleared |
-| The power request "LILITH spike 11 keep-awake check" | S1.7 | released; the cleanup checks no `winshell-core` is left running |
+| The power request "LILITH spike 11 keep-awake check" | S1.7 | released by the script; if the terminal is closed instead, the program holding it notices and releases it within a second; the cleanup checks no `winshell-core` is left running |
 | `%LOCALAPPDATA%\LILITH-spike\winshell` (a log) | throughout | copied into the results, then deleted |
-| The mouse pointer | S1.3, S1.4, S1.5, the Sandbox run | it is put back where it was after each synthesized click |
+| The mouse pointer | S1.3, S1.4, S1.5, the Sandbox watched run | it is put back where it was after each synthesized click or hover |
 | `spikes\winshell\build\` and `spikes\winshell\results\` | throughout | kept for the agent; git ignores both; delete them whenever you like |
 | Inside the Sandbox: a shortcut, the link type, logs | Part C | gone when the Sandbox closes. The Sandbox has no network, clipboard, microphone, camera or printer; only two folders connect it to this PC |
 
@@ -71,13 +82,13 @@ The script inside the Sandbox (`inside.ps1`) first checks that it really is insi
 ## If something looks wrong
 
 - **You want to stop:** press **Ctrl+C**. The part that is running cleans up, and the Sandbox it started (only that one) is closed.
-- **A check ends as INCOMPLETE:** something couldn't be decided (a click that never came, input during the stay-awake wait). Nothing is wrong with the PC. Tell the agent, who will give you a shorter command, for example `-Only S1.4`.
+- **A check ends as INCOMPLETE:** something couldn't be decided (a click that never came, too many touches during the stay-awake wait, another program keeping the PC awake). Nothing is wrong with the PC. Tell the agent, who will give you a shorter command, for example `-Only S1.4`.
 - **A check stops with an error** (a red line "... stopped with an error ... Going on"): nothing to do; the error is recorded and the session goes on.
 - **"Task 0's deploy folder is missing":** type the command the script printed (it has the `-Task0Repo` folder in it), or wait for Task 0's run.
 - **"A Windows Sandbox is already running":** close your own Sandbox window, then run the command again.
 - **The terminal closed or the PC restarted in the middle:** in a normal terminal in the repository folder, type `pwsh -NoProfile -File spikes/winshell/run-spike.ps1 -CleanupOnly`. It adds nothing, removes what is left and prints what remains.
-- **To repeat only some checks:** add `-Only` with the names, commas and no spaces, for example `-Only S1.4,S1.9` (S1.9 is the Sandbox part). A misspelt name stops the script at once, before it does anything.
-- **Earlier results are kept:** each session moves the previous `checks.json` and `raw\` into `results\run-<date and time>\` first. The console of each session is in `results\raw\console.log`.
+- **To repeat only some checks:** add `-Only` with the names, commas and no spaces, for example `-Block Attended -Only S1.4,S1.9` (S1.9 is the Sandbox part; the attended block runs its watched run, the unattended block its 3 runs). A misspelt name stops the script at once, before it does anything.
+- **Earlier results are kept:** each attended block moves the previous `checks.json` and `raw\` into `results\run-<date and time>\` first; the unattended block adds to the attended block's results. The console is in `results\raw\console.log`.
 
 ## Turn on Windows Sandbox (only if it isn't on; about 10 minutes with a restart)
 

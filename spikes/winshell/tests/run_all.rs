@@ -1,4 +1,5 @@
-//! Automation round (owner direction 2026-10-23): `run-all.ps1` is the owner's one command. Its
+//! Automation round (owner direction 2026-10-23): `run-all.ps1` runs a session in two blocks,
+//! `-Block Attended` and `-Block Unattended`. Its
 //! `-DryRun` prints the stages it would run and stops; nothing else runs. Needs `pwsh`.
 
 use std::path::Path;
@@ -40,12 +41,13 @@ fn stages(v: &serde_json::Value) -> Vec<(String, Vec<String>)> {
 }
 
 #[test]
-fn the_default_session_is_part_b_then_the_sandbox_then_the_stay_awake_wait() {
+fn the_attended_block_is_part_b_then_the_watched_sandbox_run() {
     let (code, out, err) = dry_run(&[]);
     assert_eq!(code, Some(0), "{out}{err}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["block"], "Attended");
     let s = stages(&v);
-    assert_eq!(s.len(), 4, "{out}");
+    assert_eq!(s.len(), 2, "{out}");
     assert_eq!(s[0].0, "run-spike.ps1");
     assert_eq!(
         s[0].1,
@@ -57,12 +59,21 @@ fn the_default_session_is_part_b_then_the_sandbox_then_the_stay_awake_wait() {
         ]
     );
     assert_eq!(
-        (s[1].0.as_str(), s[1].1[0].as_str()),
-        ("run-sandbox.ps1", "-Observe")
+        (s[1].0.as_str(), s[1].1.as_slice()),
+        ("run-sandbox.ps1", &["-Observe".to_string()][..])
     );
-    assert_eq!(s[2].1, vec!["-Runs", "3"]);
+}
+
+#[test]
+fn the_unattended_block_is_the_stay_awake_wait_first_then_the_sandbox_runs() {
+    let (code, out, err) = dry_run(&["-Block", "Unattended"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    let s = stages(&v);
+    assert_eq!(s.len(), 2, "{out}");
+    assert_eq!(s[0].0, "run-spike.ps1");
     assert_eq!(
-        s[3].1,
+        s[0].1,
         vec![
             "-Only",
             "S1.7",
@@ -72,6 +83,8 @@ fn the_default_session_is_part_b_then_the_sandbox_then_the_stay_awake_wait() {
             "-SkipBuild"
         ]
     );
+    assert_eq!(s[1].0, "run-sandbox.ps1");
+    assert_eq!(s[1].1, vec!["-Runs", "3"]);
 }
 
 #[test]
@@ -82,20 +95,25 @@ fn a_rerun_of_one_check_runs_only_that_part() {
     let s = stages(&v);
     assert_eq!(s.len(), 1, "{out}");
     assert_eq!(s[0].1, vec!["-Only", "S1.4"]);
+    let (_, out, _) = dry_run(&["-Only", "s1.4", "-Block", "Unattended"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(stages(&v).len(), 0, "{out}");
 }
 
 #[test]
 fn the_task0_folder_is_passed_to_both_sandbox_stages() {
-    let (code, out, err) = dry_run(&["-Only", "S1.9", "-Task0Repo", r"X:\t0"]);
-    assert_eq!(code, Some(0), "{out}{err}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    let s = stages(&v);
-    assert_eq!(s.len(), 2, "{out}");
-    for (script, args) in &s {
-        assert_eq!(script, "run-sandbox.ps1");
+    for block in ["Attended", "Unattended"] {
+        let (code, out, err) = dry_run(&["-Block", block, "-Only", "S1.9", "-Task0Repo", r"X:\t0"]);
+        assert_eq!(code, Some(0), "{out}{err}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let s = stages(&v);
+        assert_eq!(s.len(), 1, "{out}");
+        assert_eq!(s[0].0, "run-sandbox.ps1");
         assert!(
-            args.ends_with(&["-Task0Repo".to_string(), r"X:\t0".to_string()]),
-            "{args:?}"
+            s[0].1
+                .ends_with(&["-Task0Repo".to_string(), r"X:\t0".to_string()]),
+            "{:?}",
+            s[0].1
         );
     }
 }

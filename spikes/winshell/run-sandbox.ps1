@@ -88,12 +88,21 @@ function P($Obj, [string]$Name) {
 # this worktree's own. $null when the chosen one (or, with nothing given, this worktree's) is
 # missing. No path is guessed: other worktrees are only suggested (Get-DeploySuggestions).
 function Resolve-DeployDir([string]$Given, [string]$Task0, [string]$EnvRepo, [string]$OwnRepo) {
+    # A path pasted as "C:\x\" from Windows PowerShell 5.1 or cmd arrives with a literal quote.
+    $Given = Get-CleanPath $Given; $Task0 = Get-CleanPath $Task0; $EnvRepo = Get-CleanPath $EnvRepo
     $pick = if ($Given) { [ordered]@{ path = $Given; from = '-DeployDir' } }
             elseif ($Task0) { [ordered]@{ path = ([IO.Path]::Combine($Task0, $DeployRel)); from = '-Task0Repo' } }
             elseif ($EnvRepo) { [ordered]@{ path = ([IO.Path]::Combine($EnvRepo, $DeployRel)); from = 'LILITH_TASK0_REPO' } }
             else { [ordered]@{ path = ([IO.Path]::Combine($OwnRepo, $DeployRel)); from = 'this worktree' } }
     $pick.exists = [bool](Test-Path -LiteralPath $pick.path -PathType Container)
     $pick
+}
+
+# A stray quote removed, and a trailing backslash (but not a drive root's). Pure; tested.
+function Get-CleanPath([string]$Path) {
+    $p = "$Path".Trim().Trim('"')
+    while ($p.Length -gt 3 -and $p.EndsWith('\')) { $p = $p.Substring(0, $p.Length - 1) }
+    $p
 }
 
 # The worktrees of this repository (git worktree list) that hold a deploy folder: each becomes
@@ -337,10 +346,19 @@ function Wait-ResultFile([string]$Path, [int]$TimeoutSec) {
     $false
 }
 
+# The blocker this script started, ended through its own Process object (never a bare pid that
+# could have been reused).
+function Stop-Blocker {
+    $p = $script:BlockerProcess
+    $script:BlockerProcess = $null
+    if ($null -ne $p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+}
+
 # Round 2's host state: one of the spike's own windows (a blocker) placed over the Sandbox
 # window and clicked to the front by the script; UIA then checks the Sandbox window's centre is
 # covered. The blocker logs into build\sandbox, not the user's profile.
 function Cover-SandboxWindow($Started) {
+    Show-HandsOff 'places one of its windows over the Sandbox window and clicks it (the mouse moves)'
     $rec = [ordered]@{ method = 'a spike blocker window placed over the Sandbox window (SetWindowPos), clicked to the front (synthetic)'; covered = $false }
     if (-not (Initialize-SpikeUi)) { $rec.why = "UI Automation not available: $($script:Uia.error)"; return $rec }
     $own = @(Get-OwnPids $Started) + @($Started.own_pids) | Sort-Object -Unique
@@ -381,10 +399,10 @@ function Invoke-Observation([string]$Res, $Started) {
     Say ("Round 2: the Sandbox window is {0}." -f $(if ($obs.round2_cover.covered) { 'covered by a spike window' } else { "not covered ($(P $obs.round2_cover 'why'))" }))
     New-Item -ItemType File -Force -Path (Join-Path $Res 'go-2.flag') | Out-Null
     $obs.round2_done = Wait-ResultFile (Join-Path $Res 'round-2.json') 600
-    if ($script:BlockerProcess) { Stop-Process -Id $script:BlockerProcess.Id -Force -ErrorAction SilentlyContinue; $script:BlockerProcess = $null }
+    Stop-Blocker
 
     [console]::Beep(880, 300)
-    Say 'YOUR TURN: lock the PC now (Win+L). Stay locked for about 4 minutes, then sign in again. The script sees the lock and the sign-in by itself.' 'Yellow'
+    Say 'YOUR TURN: lock the PC now (Win+L). Stay locked until you hear two beeps (about 4 minutes), then sign in again. The script sees the lock and the sign-in by itself.' 'Yellow'
     $lock = [ordered]@{ method = 'WTSQuerySessionInformation(WTSSessionInfoEx) SessionFlags, every 2 s'; locked_after_s = $null; locked_throughout = $null; unlocked_after_s = $null }
     $t0 = Get-Date
     while (((Get-Date) - $t0).TotalSeconds -lt 300 -and (Get-SessionLocked) -ne $true) { Start-Sleep -Seconds 2 }
@@ -395,6 +413,11 @@ function Invoke-Observation([string]$Res, $Started) {
     $deadline = (Get-Date).AddSeconds(600)
     while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath (Join-Path $Res 'round-3.json'))) { $states += (Get-SessionLocked); Start-Sleep -Seconds 2 }
     $obs.round3_done = Test-Path -LiteralPath (Join-Path $Res 'round-3.json')
+    if ($null -ne $lock.locked_after_s) {
+        # A beep can be heard on the lock screen: the cue to sign in again (review M12).
+        [console]::Beep(660, 400); [console]::Beep(880, 400)
+        Say 'Round 3 is done: sign in again now.' 'Yellow'
+    }
     if ($null -ne $lock.locked_after_s) { $lock.locked_throughout = @($states | Where-Object { $_ -ne $true }).Count -eq 0 }
     $deadline = (Get-Date).AddSeconds(1200)
     while ((Get-Date) -lt $deadline -and (Get-SessionLocked) -eq $true) { Start-Sleep -Seconds 2 }
@@ -492,7 +515,7 @@ for ($run = 1; $run -le $runCount; $run++) {
         $stop = Stop-Sandbox $started
     }
     finally {
-        if ($script:BlockerProcess) { Stop-Process -Id $script:BlockerProcess.Id -Force -ErrorAction SilentlyContinue; $script:BlockerProcess = $null }
+        Stop-Blocker
         if ($started -and -not $stop) {
             Say 'Interrupted: stopping the Sandbox this run started.' 'Red'
             $stop = Stop-Sandbox $started -Now

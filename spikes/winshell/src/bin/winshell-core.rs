@@ -2,17 +2,19 @@
 //! Every command writes its result as JSON to `--out <file>` (there is no console).
 //!
 //! - `toast --tag T [--launch URL] [--button URL] [--suppress] [--title X] [--body Y]` (S1.2–S1.4)
-//! - `progress [--secs 20]`: the progress toast and its updates (S1.5)
+//! - `progress [--secs 20] [--body B]`: the progress toast and its updates (S1.5; the script puts a nonce in B)
 //! - `update [--seq N]`: one more update of the progress toast (S1.5)
-//! - `remove-repost`: `Remove(tag, group)`, then a new toast with that Tag (S1.5)
+//! - `remove-repost [--body B]`: `Remove(tag, group)`, then a new toast with that Tag (S1.5)
 //! - `fullscreen [--secs 60] [--timing 100]`: the 2 s `SHQueryUserNotificationState` poll (S1.6)
-//! - `power [--api request|ste|none] [--max-secs 7200]`: the keep-awake request (S1.7); `none`
-//!   holds nothing and only listens for power broadcasts (the sleep-and-wake check)
+//! - `power [--api request|ste|none] [--max-secs 7200] [--parent-pid P]`: the keep-awake request
+//!   (S1.7); `none` holds nothing and only listens for power broadcasts (the sleep-and-wake check).
+//!   With `--parent-pid` it clears the request and exits once that process has gone, so a closed
+//!   console never leaves the PC held awake (automation review M1; `tests/core_parent.rs`)
 #![windows_subsystem = "windows"]
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -21,14 +23,17 @@ use serde_json::{Value, json};
 use windows::UI::Notifications::{
     NotificationData, NotificationUpdateResult, ToastNotificationManager,
 };
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_SYSTEM_REQUIRED, PowerClearRequest, PowerCreateRequest,
     PowerRequestSystemRequired, PowerSetRequest, SetThreadExecutionState,
 };
 use windows::Win32::System::Threading::{
-    POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+    OpenProcess, POWER_REQUEST_CONTEXT_SIMPLE_STRING, PROCESS_SYNCHRONIZE, REASON_CONTEXT,
+    REASON_CONTEXT_0, WaitForSingleObject,
 };
 use windows::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
 use windows::Win32::UI::Shell::{
@@ -55,7 +60,7 @@ fn main() {
         Some("toast") => toast(&args),
         Some("progress") => progress(&args),
         Some("update") => update(&args),
-        Some("remove-repost") => remove_repost(),
+        Some("remove-repost") => remove_repost(&args),
         Some("fullscreen") => fullscreen(&args),
         Some("power") => power(&args, &out),
         other => json!({ "error": format!("unknown command {other:?}") }),
@@ -128,10 +133,10 @@ fn progress_data(seq: u32, value: f64) -> windows::core::Result<NotificationData
     Ok(data)
 }
 
-fn post_progress() -> windows::core::Result<()> {
+fn post_progress(body: &str) -> windows::core::Result<()> {
     let xml = toast_xml(&ToastSpec {
         title: "Spike job running",
-        body: "Progress toast (S1.5)",
+        body,
         progress: true,
         ..Default::default()
     });
@@ -155,7 +160,7 @@ fn do_update(seq: u32, value: f64) -> String {
 
 fn progress(args: &Args) -> Value {
     let secs = args.num("secs", 20) as u32;
-    let posted = post_progress();
+    let posted = post_progress(args.get_or("body", "Progress toast (S1.5)"));
     let mut updates = Vec::new();
     if posted.is_ok() {
         for i in 1..=secs {
@@ -177,7 +182,7 @@ fn update(args: &Args) -> Value {
     json!({ "command": "update", "seq": seq, "result": do_update(seq, 0.5) })
 }
 
-fn remove_repost() -> Value {
+fn remove_repost(args: &Args) -> Value {
     let removed = ToastNotificationManager::History().and_then(|h| {
         h.RemoveGroupedTagWithId(
             &HSTRING::from(PROGRESS_TAG),
@@ -187,7 +192,7 @@ fn remove_repost() -> Value {
     });
     let xml = toast_xml(&ToastSpec {
         title: "Spike job finished",
-        body: "Posted after Remove(tag, group) (S1.5)",
+        body: args.get_or("body", "Posted after Remove(tag, group) (S1.5)"),
         ..Default::default()
     });
     let posted = notifier().and_then(|n| {
@@ -263,6 +268,9 @@ struct PowerState {
 
 static POWER: Mutex<Option<PowerState>> = Mutex::new(None);
 static CLEAR_NOW: AtomicBool = AtomicBool::new(false);
+/// A SYNCHRONIZE handle on the parent process (`--parent-pid`), or 0. Held from the start, so
+/// a reused pid can't stand in for the parent.
+static PARENT: AtomicIsize = AtomicIsize::new(0);
 const TIMER_FLAGS: usize = 1;
 const TIMER_CLOCK: usize = 2;
 
@@ -310,6 +318,19 @@ extern "system" fn power_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             let dir = log_dir();
             if dir.join("power-clear.flag").exists() && !CLEAR_NOW.swap(true, Ordering::SeqCst) {
                 power_event("clear_flag_seen", json!({}));
+            }
+            let parent = PARENT.load(Ordering::SeqCst);
+            // SAFETY: a handle this process opened and keeps open until exit.
+            if parent != 0
+                && unsafe { WaitForSingleObject(HANDLE(parent as *mut _), 0) } == WAIT_OBJECT_0
+            {
+                power_event("parent_gone", json!({}));
+                // SAFETY: our own window and timer.
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_FLAGS);
+                    PostQuitMessage(0);
+                }
+                return LRESULT(0);
             }
             if dir.join("power-quit.flag").exists() {
                 // SAFETY: our own window and timer.
@@ -372,6 +393,15 @@ fn power(args: &Args, out: &Path) -> Value {
     let _ = std::fs::remove_file(dir.join("power-clear.flag"));
     let _ = std::fs::remove_file(dir.join("power-quit.flag"));
     let base = json!({ "command": "power", "api": api, "reason": winshell::POWER_REASON });
+    if let Some(pid) = args.get("parent-pid").and_then(|p| p.parse::<u32>().ok()) {
+        // SAFETY: plain call; the handle is closed before exit.
+        match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+            Ok(h) => PARENT.store(h.0 as isize, Ordering::SeqCst),
+            Err(e) => {
+                return json!({ "command": "power", "api": api, "error": format!("parent process {pid} not found: {e}") });
+            }
+        }
+    }
     *POWER.lock().expect("power lock") = Some(PowerState {
         events: Vec::new(),
         out: out.to_path_buf(),
@@ -492,6 +522,13 @@ fn power(args: &Args, out: &Path) -> Value {
     }
     if let Some(t) = ste_thread {
         let _ = t.join();
+    }
+    let parent = PARENT.swap(0, Ordering::SeqCst);
+    if parent != 0 {
+        // SAFETY: the handle opened above, closed once.
+        unsafe {
+            let _ = CloseHandle(HANDLE(parent as *mut _));
+        }
     }
     power_event("exit", json!({}));
     let guard = POWER.lock().expect("power lock");
