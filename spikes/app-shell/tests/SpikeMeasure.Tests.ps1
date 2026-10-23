@@ -39,7 +39,7 @@ Describe 'Test-GpuCoverage' {
         $c.below_min | Should -Be 0
         $c.saturated | Should -BeTrue
     }
-    It 'allows brief dips (>= 95 % in at least 90 % of the samples) and records them' {
+    It 'allows brief dips (>= 90 % in at least 90 % of the samples) and records them' {
         $s = @(New-Samples 0 60000 1000)
         foreach ($k in 10, 30, 50) { $s[$k].util = 60 }
         $c = Test-GpuCoverage -Samples $s -StartMs 0 -EndMs 60000
@@ -48,12 +48,21 @@ Describe 'Test-GpuCoverage' {
         $c.dips.Count | Should -Be 3
         $c.dips[0].util | Should -Be 60
     }
-    It 'rejects a run with more than 10 % of the samples under 95 %' {
+    It 'rejects a run with more than 10 % of the samples under 90 %' {
         $s = @(New-Samples 0 60000 1000)
         for ($k = 0; $k -lt 7; $k++) { $s[$k * 8].util = 80 }
         $c = Test-GpuCoverage -Samples $s -StartMs 0 -EndMs 60000
         $c.saturated_fraction | Should -BeLessThan 0.9
         $c.saturated | Should -BeFalse
+    }
+    It 'counts owner run 3''s pattern as loaded: 99 % with a 92-93 % sample every 3 s and a dip at each prompt (12.5 s)' {
+        $s = @(New-Samples 0 60000 500)
+        for ($k = 0; $k -lt $s.Count; $k++) { if ($k % 6 -eq 5) { $s[$k].util = 93 } else { $s[$k].util = 99 } }
+        foreach ($k in 20, 45, 70, 95, 120) { if ($k -lt $s.Count) { $s[$k].util = 6 } }
+        $c = Test-GpuCoverage -Samples $s -StartMs 0 -EndMs 60000
+        $c.level | Should -Be 90
+        $c.saturated | Should -BeTrue
+        (Test-GpuCoverage -Samples $s -StartMs 0 -EndMs 60000 -MinUtil 95).saturated | Should -BeFalse   # the old level
     }
     It 'reports an empty series as neither dense nor saturated' {
         $c = Test-GpuCoverage -Samples @() -StartMs 0 -EndMs 60000
@@ -499,7 +508,7 @@ Describe 'S0.6 workload check' {
 }
 
 Describe 'Test-GpuSaturatedRecently (the gate before the measured minute)' {
-    It 'holds the measurement back for the owner''s one-prompt-at-a-time pattern (15 of 20 samples >= 95 %)' {
+    It 'holds the measurement back for the owner''s one-prompt-at-a-time pattern (15 of 20 samples loaded)' {
         $s = for ($k = 0; $k -lt 40; $k++) { [pscustomobject]@{ t = 1000 + $k * 500; util = $(if ($k % 4 -eq 0) { 5 } else { 99 }) } }
         Test-GpuSaturatedRecently $s 21000 | Should -BeFalse
     }

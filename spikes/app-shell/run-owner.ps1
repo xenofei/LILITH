@@ -37,13 +37,16 @@ if ($why.Count) { Write-Host "NOT RUN: $($why -join '; '). Nothing was started."
 Write-Host @'
 Spike 10 owner run. Expected time on an idle machine:
   S0.4  rebuild (incremental) and redeploy ........ 2-5 min
-  S0.7  UI Automation check ...................... 1 min
+  S0.7  UI Automation check ...................... 1 min (10 s of it is the notice below)
   S0.6  ComfyUI load, gate, 65 s measured run ..... usually 6-10 min, at most about 12
         (ComfyUI's start and the GPU gate are each capped at 5 min)
         the 5 Hz fallback, only if S0.6 FAILs ..... the same again
   Total: about 10-16 min; at most about 30 min with the fallback.
 Spike windows open without taking focus; S0.7's takes it when it clicks the counter (about
-0.1-0.2 s, at most about 2 s). Those S0.4 and S0.7 open close by themselves within a minute. During S0.6 the spike stays on top for about a minute: don't use the mouse or
+0.1-0.2 s, at most about 2 s). Those S0.4 and S0.7 open close by themselves within a minute.
+Whenever you must keep off the keyboard and mouse (S0.7's click, S0.6's measured minute), a small
+notice appears 10 s ahead (on another screen if you have one), counts down, and says when you
+can use the PC again. During S0.6 the spike stays on top for about a minute: don't use the mouse or
 keyboard then. Ctrl+C or closing this window stops everything.
 '@
 

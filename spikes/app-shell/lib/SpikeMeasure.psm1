@@ -16,14 +16,17 @@ function Get-NearestRankStats([object[]]$Values) {
 # Was the GPU loaded through the window [StartMs, EndMs]? Two conditions (controller ruling):
 # - dense: at least 0.8 samples a second (48 in 60 s) and no gap over 2 s, the window's edges
 #   counting as gaps;
-# - saturated: utilisation >= 95 % in at least 90 % of the samples, so brief dips between prompts
-#   are allowed. Every dip is recorded.
+# - saturated: utilisation >= 90 % in at least 90 % of the samples, so brief dips between prompts
+#   are allowed. Every dip is recorded. The level was 95 % until owner run 3 (2026-10-23): under the
+#   real ComfyUI loop with the spike running, nvidia-smi reads 99 % most of the time with isolated
+#   92-93 % samples every few seconds, so 95 % measured the workload's own ceiling rather than
+#   whether ComfyUI loads the GPU (a deviation from the plan's S0.6 rule, recorded in §3 and §5).
 function Test-GpuCoverage {
     param(
         [object[]]$Samples,            # objects with t (epoch ms) and util (%)
         [long]$StartMs,
         [long]$EndMs,
-        [int]$MinUtil = 95,
+        [int]$MinUtil = 90,
         [int]$MaxGapMs = 2000,
         [double]$MinPerSecond = 0.8,
         [double]$MinSaturatedFraction = 0.9
@@ -41,6 +44,7 @@ function Test-GpuCoverage {
         min_util = $(if ($in.Count) { ($in | Measure-Object util -Minimum).Minimum } else { $null })
         below_min = $below; saturated_fraction = $fraction
         dips = @($dips | ForEach-Object { [ordered]@{ t = [long]$_.t; util = $_.util } })
+        level = $MinUtil
         dense = ($in.Count -ge $needed) -and ($maxGap -le $MaxGapMs)
         saturated = ($in.Count -gt 0) -and ($fraction -ge $MinSaturatedFraction)
     }
@@ -81,7 +85,7 @@ function Get-S06Verdict {
     $threshold = Get-FrameThresholdMs $RefreshHz
     if ($null -eq $threshold) { return 'INVALID (the screen refresh rate was not recorded)' }
     if (-not $Coverage.dense) { return "INVALID (GPU samples too sparse: $($Coverage.n) of $($Coverage.needed), largest gap $($Coverage.max_gap_ms) ms)" }
-    if (-not $Coverage.saturated) { return "INVALID (GPU >= 95 % in only $([math]::Round(100 * $Coverage.saturated_fraction, 1)) % of the samples; 90 % needed)" }
+    if (-not $Coverage.saturated) { return "INVALID (GPU >= $(if ($Coverage.level) { $Coverage.level } else { 90 }) % in only $([math]::Round(100 * $Coverage.saturated_fraction, 1)) % of the samples; 90 % needed)" }
     $hbOk = $Heartbeat.p99 -lt 16
     $frOk = $Frames.p99 -lt $threshold
     if ($hbOk -and $frOk) { 'PASS' } else { "FAIL (heartbeat p99 $($Heartbeat.p99) ms, frame p99 $($Frames.p99) ms against $threshold ms)" }
@@ -212,7 +216,7 @@ function Test-DeployCurrent([string]$Deploy, [string]$BinDir) {
 }
 
 # The saturation gate before the measured minute: the same conditions as the measured window
-# (dense, and >= 95 % in at least 90 % of the samples) over the last $WindowMs of samples.
+# (dense, and >= 90 % in at least 90 % of the samples) over the last $WindowMs of samples.
 function Test-GpuSaturatedRecently([object[]]$Samples, [long]$NowMs, [long]$WindowMs = 20000) {
     $c = Test-GpuCoverage -Samples $Samples -StartMs ($NowMs - $WindowMs) -EndMs $NowMs
     [bool]($c.dense -and $c.saturated)
@@ -636,6 +640,18 @@ function Start-ProcessInJob {
     [KillOnCloseJob]::Start($Job, $FilePath, (ConvertTo-CommandLine (@($FilePath) + @($ArgumentList))), $WorkingDirectory, $StdOut, $StdErr, $hook)
 }
 
+# The owner's hands-off notice (hands-off.ps1, Windows PowerShell 5.1): warns $LeadSeconds ahead,
+# then counts down $Seconds; the caller waits $LeadSeconds before the stretch and writes $DoneFile
+# after it. Started outside any job (it must outlive comfy-load's job to say "done"); it closes
+# by itself when this process exits. Returns its Process.
+function Start-HandsOffNotice([string]$What, [int]$Seconds, [string]$DoneFile, [string]$Log = '', [int]$LeadSeconds = 10) {
+    $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $a = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot '..\hands-off.ps1'),
+           '-LeadSeconds', "$LeadSeconds", '-Seconds', "$Seconds", '-What', $What, '-DoneFile', $DoneFile, '-ParentPid', "$PID")
+    if ($Log) { $a += @('-Log', $Log) }
+    Start-ProcessInJob $null $ps51 -ArgumentList $a
+}
+
 # The machine's CPU load (%), averaged over one second; recorded beside every timing.
 function Get-CpuPercent {
     try { [math]::Round((Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).CounterSamples[0].CookedValue, 1) }
@@ -646,5 +662,5 @@ Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameT
     Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Get-ProcessesUnder, Get-SpikeAppProcesses, Test-DeployName, Test-S06Workload, Test-PlausibleRefresh, Complete-S06Verdict,
     Get-OwnerRunBlockers, Get-ResultsDir, Get-S06WebUrl, Test-S06Web, Get-S07Items, Get-S07Problems, Get-S07Verdict,
-    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob,
+    New-KillOnCloseJob, Add-ProcessToJob, Test-ProcessInJob, ConvertTo-CommandLine, Start-ProcessInJob, Start-HandsOffNotice,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

@@ -27,7 +27,8 @@
   Verdict (lib/SpikeMeasure.psm1, Get-S06Verdict):
     - FAIL if the app hung, crashed or logged no measured report (with any stack file named);
     - INVALID if the GPU samples don't cover the measured 60 s (>= 48 samples, no gap over 2 s),
-      fewer than 90 % of them are >= 95 % (brief dips between prompts are allowed and recorded),
+      fewer than 90 % of them are >= 90 % (brief dips between prompts are allowed and recorded;
+      the level was 95 % until owner run 3, see Test-GpuCoverage),
       the refresh rate is unknown, or the list was hidden;
     - else PASS if heartbeat lateness p99 < 16 ms and frame interval p99 < the frame threshold:
       max(16 ms, 1.5 vsync periods of the primary display), on main-a's frames alone (75 Hz gives
@@ -142,7 +143,7 @@ if (Test-Comfy) { throw "something already answers on $Url; this script only mea
 if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "ComfyUI not found at $ComfyMain" }
 
 $res = [ordered]@{ check = 'S0.6'; started = (Get-Date).ToString('o'); rate_hz = $RateHz; charts_batched = [bool]$ChartsBatched; runs = $Runs }
-$comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramProc = $null
+$comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramProc = $null; $handsOffDone = $null
 try {
     # Checked again right before the start (run-owner.ps1 checked minutes ago): no ComfyUI or spike
     # process by path. An elevated ComfyUI on another port can't be seen this way (Windows hides
@@ -178,7 +179,7 @@ try {
         -StdOut (Join-Path $Runs 'keep-busy.out.log') -StdErr (Join-Path $Runs 'keep-busy.err.log')
 
     # Gate: the measured minute starts only once the last 20 s of samples meet the measured
-    # window's own GPU condition (dense, >= 95 % in at least 90 % of the samples). At most 300 s
+    # window's own GPU condition (dense, >= 90 % in at least 90 % of the samples). At most 300 s
     # (model load); if it never gets there, the app is not run at all and the result says why. It
     # stops waiting at once if the load or ComfyUI exits (keep_busy would otherwise poll a dead
     # ComfyUI until the deadline).
@@ -193,14 +194,22 @@ try {
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $gs = Read-GpuSamples $gpuFile
     $res.gate = [ordered]@{
-        last_20_s = (Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 20000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
-        last_60_s = (Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 60000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
+        last_20_s = [pscustomobject](Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 20000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
+        last_60_s = [pscustomobject](Test-GpuCoverage -Samples $gs -StartMs ($nowMs - 60000) -EndMs $nowMs) | Select-Object n, saturated_fraction, min_util, max_gap_ms, dense, saturated
         prompts_finished = @(Get-Content (Join-Path $Runs 'keep-busy.out.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match '^prompt ' }).Count }
     if (-not $saturated) {
         $res.load_exit_code = if ($load.HasExited) { $load.ExitCode } else { $null }
         throw "the GPU never reached the measurement condition before the measured minute (load exited: $($load.HasExited), ComfyUI exited: $($comfy.HasExited)); see keep-busy.*.log and comfy.err.log in $Runs"
     }
     $res.os_primary_refresh_hz = Get-OsPrimaryRefreshHz
+
+    # Hands off from here until the app exits (the spike is on top and measured): the owner gets
+    # a notice 10 s ahead, then a countdown, then "done" (hands-off.ps1; it takes no focus or input,
+    # on a screen other than the primary one if there is one). The load keeps running meanwhile.
+    $handsOffDone = Join-Path $Runs 'hands-off.done'
+    $res.hands_off_notice = [ordered]@{ lead_s = 10; hands_off_s = $MeasureSeconds + 10; log = (Join-Path $Runs 'hands-off.json') }
+    $notice = Start-HandsOffNotice "S0.6, the measured minute" ($MeasureSeconds + 10) $handsOffDone $res.hands_off_notice.log
+    Start-Sleep -Seconds 10
 
     $res.cpu_percent_before_app = Get-CpuPercent
     $log = Join-Path $Runs 's06.jsonl'
@@ -211,6 +220,7 @@ try {
     if ($ChartsBatched) { $appArgs += '--charts-batched' }
     $app = Start-ProcessInJob $job $Exe -ArgumentList $appArgs -WorkingDirectory $Deploy
     $appStart = ([DateTimeOffset]$app.StartTime).ToUnixTimeMilliseconds()
+    $res.app_start_epoch_ms = $appStart   # so the measured window can be re-scored from the raw files
     $vramProc = Start-VramSampler $app.Id $vramFile -Job $job
     $res.in_kill_on_close_job = [ordered]@{ comfy = (Test-ProcessInJob $job $comfy); load = (Test-ProcessInJob $job $load)
                                            gpu_sampler = (Test-ProcessInJob $job $gpuProc); vram_sampler = (Test-ProcessInJob $job $vramProc)
@@ -286,6 +296,7 @@ try {
         "INVALID ($($_.Exception.Message))" } else { 'ERROR' }
     $res.error = "$($_.Exception.Message)"
 } finally {
+    if ($handsOffDone) { Set-Content -Path $handsOffDone -Value 'done' -ErrorAction SilentlyContinue }   # the notice says the PC is free
     if ($stopFile -and -not (Test-Path $stopFile)) { Set-Content -Path $stopFile -Value 'stop' -ErrorAction SilentlyContinue }
     if ($app -and -not $app.HasExited) { try { $app.Kill($true) } catch {} }
     if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue }

@@ -602,6 +602,11 @@ if (Want 'S0.9') {
 if (Want 'S0.7') {
     $uiaOut = Join-Path $Runs 's07-uia.json'
     $script:uiaProc = $null
+    # The spike takes the focus for a moment at the click: the owner gets a notice 10 s ahead
+    # (hands-off.ps1), then a countdown, then "done".
+    $handsOffDone = Join-Path $Runs 's07-hands-off.done'
+    $null = Start-HandsOffNotice 'S0.7, the accessibility check' 10 $handsOffDone (Join-Path $Runs 's07-hands-off.json')
+    Start-Sleep -Seconds 10
     try {
         # The client clicks the counter itself, once it has read every item and subscribed, so
         # the app needs no --auto-counter; it then closes the app's windows. --quit-after is the
@@ -618,6 +623,7 @@ if (Want 'S0.7') {
     } finally {
         # Ctrl+C or a throw: stop the client through its own Process object (the app is stopped by Invoke-App).
         if ($script:uiaProc -and -not $script:uiaProc.HasExited) { try { $script:uiaProc.Kill() } catch {} }
+        Set-Content -Path $handsOffDone -Value 'done' -ErrorAction SilentlyContinue
     }
     $uia = if (Test-Path $uiaOut) { Get-Content $uiaOut -Raw | ConvertFrom-Json } else { $null }
     $built = Get-Events $r.events 'layout_built' | Select-Object -First 1
