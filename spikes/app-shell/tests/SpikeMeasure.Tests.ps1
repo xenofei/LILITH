@@ -214,3 +214,79 @@ Describe 'Split-BuildWarnings' {
         $w.own[0].origin | Should -Match 'Heartbeat\.cpp'
     }
 }
+
+Describe 'Resolve-RefreshHz' {
+    It 'prefers the app''s primary_refresh_hz' {
+        $r = Resolve-RefreshHz ([pscustomobject]@{ primary_refresh_hz = 239.98 }) 240
+        $r.hz | Should -Be 239.98
+        $r.source | Should -Be 'app'
+    }
+    It 'reads the older report format (the owner''s first S0.6 run)' {
+        $old = [pscustomobject]@{ screens = @([pscustomobject]@{ window = 'main-a'; refresh_hz = 239.984; primary = $true }) }
+        $r = Resolve-RefreshHz $old 0
+        $r.hz | Should -Be 239.984
+        $r.source | Should -Match 'older'
+    }
+    It 'falls back to the Windows value, and says so' {
+        $r = Resolve-RefreshHz ([pscustomobject]@{ primary_refresh_hz = 0 }) 75
+        $r.hz | Should -Be 75
+        $r.source | Should -Be 'windows'
+    }
+    It 'reports none when nothing is known' {
+        (Resolve-RefreshHz $null 0).source | Should -Be 'none'
+    }
+}
+
+Describe 'Get-OsPrimaryRefreshHz' {
+    It 'reads a plausible refresh rate for the primary display' {
+        $hz = Get-OsPrimaryRefreshHz
+        $hz | Should -BeGreaterThan 20
+        $hz | Should -BeLessThan 1000
+    }
+}
+
+Describe 'Test-GpuSaturatedRecently (the gate before the measured minute)' {
+    It 'holds the measurement back for the owner''s one-prompt-at-a-time pattern (15 of 20 samples >= 95 %)' {
+        $s = for ($k = 0; $k -lt 40; $k++) { [pscustomobject]@{ t = 1000 + $k * 500; util = $(if ($k % 4 -eq 0) { 5 } else { 99 }) } }
+        Test-GpuSaturatedRecently $s 21000 | Should -BeFalse
+    }
+    It 'opens for a queued load with rare dips' {
+        $s = for ($k = 0; $k -lt 40; $k++) { [pscustomobject]@{ t = 1000 + $k * 500; util = $(if ($k -eq 17) { 40 } else { 99 }) } }
+        Test-GpuSaturatedRecently $s 21000 | Should -BeTrue
+    }
+    It 'stays shut with no samples yet' {
+        Test-GpuSaturatedRecently @() 21000 | Should -BeFalse
+    }
+}
+
+Describe 'Test-DeployCurrent' {
+    BeforeAll {
+        $testRoot = Join-Path $TestDrive 'deploycheck'
+        $bin = Join-Path $testRoot 'bin'; $dep = Join-Path $testRoot 'deploy'
+        foreach ($d in $bin, $dep) {
+            New-Item -ItemType Directory -Force (Join-Path $d 'SpikeWeb') | Out-Null
+            foreach ($f in 'app_shell_spike.exe', 'spike_shell_shim.dll', 'kddockwidgets-qt62.dll', 'SpikeWeb\spike_web.dll') { Set-Content (Join-Path $d $f) 'same' }
+        }
+    }
+    It 'accepts a deploy identical to the build' {
+        @(Test-DeployCurrent $dep $bin).Count | Should -Be 0
+    }
+    It 'names a stale file' {
+        Set-Content (Join-Path $bin 'spike_shell_shim.dll') 'rebuilt'
+        Test-DeployCurrent $dep $bin | Should -Be @('spike_shell_shim.dll')
+    }
+}
+
+Describe 'VRAM sampling' {
+    It 'keeps sampling while the process has no GPU instance yet, and Read-VramSamples drops the retries' {
+        $out = Join-Path $TestDrive 'vram.jsonl'
+        # A pid with no GPU Process Memory instance: the old -Continuous sampler ended at once here.
+        $job = Start-VramSampler 999999 $out
+        Start-Sleep -Seconds 4
+        $job.State | Should -Be 'Running'
+        Stop-Job $job
+        Remove-Job $job -Force
+        @(Read-JsonLines $out | Where-Object { $_.missing }).Count | Should -BeGreaterThan 0
+        @(Read-VramSamples $out).Count | Should -Be 0
+    }
+}

@@ -38,6 +38,8 @@ $exe = Join-Path $Folder 'app_shell_spike.exe'
 $need = 'app_shell_spike.exe', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Qml.dll', 'Qt6Quick.dll', 'kddockwidgets-qt62.dll', 'spike_shell_shim.dll', 'vcruntime140.dll', 'msvcp140.dll', 'platforms\qwindows.dll'
 $missing = @($need | Where-Object { -not (Test-Path (Join-Path $Folder $_)) })
 if ($missing.Count) { throw "not launched: $Folder is missing $($missing -join ', ')" }
+$stale = @(Test-DeployCurrent $Folder (Join-Path $PSScriptRoot 'build\cmake\bin'))
+if ($stale.Count) { throw "not launched: $Folder is older than the build ($($stale -join ', ')); redeploy: pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4" }
 
 $cache = Join-Path $env:LOCALAPPDATA 'LILITH-spike\image\cache'
 $cacheAside = "$cache.aside-$(Get-Date -Format 'yyyyMMddHHmmss')"

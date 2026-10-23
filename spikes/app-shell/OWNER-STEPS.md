@@ -44,11 +44,17 @@ Remove-Item -Recurse -Force $copy
 
 You run this script yourself, when you're ready; no agent starts it. It:
 - starts ComfyUI on `127.0.0.1:8188`, and refuses if something already answers there;
-- runs the spike's own Z-Image Turbo int8 loop (1024×1024, batch 2, 8 steps, preview images only, so nothing is saved to ComfyUI's output folder);
-- samples GPU utilisation twice a second, and waits until it has been ≥ 95 % for 10 s;
+- runs the spike's own Z-Image Turbo int8 loop (1024×1024, batch 2, 20 steps, preview images only, so nothing is saved to ComfyUI's output folder), keeping a second prompt queued so the GPU doesn't idle between prompts;
+- samples GPU utilisation twice a second, and starts the measurement only once the last 20 s meet the GPU condition (at most 5 minutes; if that never happens, the spike isn't run and the result is INVALID);
 - runs the spike for 5 s of warm-up plus 60 s measured, then stops ComfyUI.
 
 Before you start it:
+- **Close any spike window that's still open** (for example the Narrator one), then redeploy, because the script refuses a deploy folder that is older than the build:
+
+  ```powershell
+  pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4
+  ```
+
 - Run it on whichever display is primary. The result records that display's refresh rate, and the frame threshold follows from it.
 - The spike window stays on top for that minute. Don't touch the mouse or keyboard while it runs.
 - Under this load, the Web dock sits below Jobs and Grid, so the scrolled list stays visible throughout.

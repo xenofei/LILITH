@@ -6,14 +6,16 @@
 
 .DESCRIPTION
   The owner runs this script (an agent never does). Steps:
-    1. refuses to start if something already answers on 127.0.0.1:<Port> (it never touches a
-       ComfyUI it did not start);
+    1. refuses to start if the deploy folder is older than the build, or if something already
+       answers on 127.0.0.1:<Port> (it never touches a ComfyUI it did not start);
     2. starts ComfyUI (`--listen 127.0.0.1 --port <Port>`, hidden window) and waits for
        /system_stats;
-    3. starts the GPU sampler (nvidia-smi, every 500 ms, its own clock) and runs
-       spikes/canvas/load/comfy_load.py with comfy/load-workflow.json (Z-Image Turbo int8,
-       1024x1024, batch 2, 8 steps; PreviewImage, so nothing lands in ComfyUI's output folder);
-    4. waits until GPU utilisation has been >= 95 % for 10 s in a row;
+    3. starts the GPU sampler (nvidia-smi, every 500 ms, its own clock) and comfy/keep_busy.py,
+       which keeps 2 prompts of comfy/load-workflow.json outstanding (Z-Image Turbo int8,
+       1024x1024, batch 2, 20 steps; PreviewImage, so nothing lands in ComfyUI's output folder)
+       until this script stops it;
+    4. waits (at most 300 s) until the last 20 s of samples meet the measured window's GPU
+       condition; if they never do, the app is not run and the result is INVALID;
     5. records the machine's CPU load, then starts the deployed spike: --no-activate --on-top
        --load --load-rate <RateHz> [--charts-batched] --show-web 2000 --measure 60. Under --load
        the Web dock has its own place below Jobs and Grid, so the scrolled list stays visible;
@@ -84,12 +86,14 @@ if ($SamplersOnly) {
     Stop-Process -Id $g.Id -Force -ErrorAction SilentlyContinue
     Stop-Job $v; Remove-Job $v -Force
     $gs = Read-GpuSamples $gpuFile
-    $vs = Read-JsonLines $vramFile
+    $vs = Read-VramSamples $vramFile
     $win = [ordered]@{ start = $t0 + 1000; end = $t1 }
     $cov = Test-GpuCoverage -Samples $gs -StartMs $win.start -EndMs $win.end -MinUtil 0
     $vt = @($vs | ForEach-Object { [long]$_.t } | Where-Object { $_ -ge $win.start -and $_ -le $win.end } | Sort-Object)
     $vGap = 0; for ($i = 1; $i -lt $vt.Count; $i++) { $vGap = [math]::Max($vGap, $vt[$i] - $vt[$i - 1]) }
-    $out = [ordered]@{ seconds = $SamplerSeconds; gpu = $cov; vram_samples = $vt.Count; vram_max_gap_ms = $vGap; files = $Runs }
+    $out = [ordered]@{ seconds = $SamplerSeconds; gpu = $cov; vram_samples = $vt.Count; vram_max_gap_ms = $vGap
+                       vram_missing_retries = @(Read-JsonLines $vramFile | Where-Object { $_.missing }).Count
+                       os_primary_refresh_hz = (Get-OsPrimaryRefreshHz); files = $Runs }
     $out | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $Results 's06-samplers-check.json')
     $out | ConvertTo-Json -Depth 4
     return
@@ -99,6 +103,9 @@ if ($SamplersOnly) {
 $need = 'app_shell_spike.exe', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Qml.dll', 'Qt6Quick.dll', 'kddockwidgets-qt62.dll', 'spike_shell_shim.dll', 'vcruntime140.dll', 'platforms\qwindows.dll', 'SpikeWeb\spike_web.dll'
 $missing = @($need | Where-Object { -not (Test-Path (Join-Path $Deploy $_)) })
 if ($missing.Count) { throw "the deploy folder is incomplete (run run-spike.ps1 first): missing $($missing -join ', ')" }
+# ...and built from the current build (the owner's first run measured a stale deploy).
+$stale = @(Test-DeployCurrent $Deploy (Join-Path $Root 'build\cmake\bin'))
+if ($stale.Count) { throw "the deploy folder is older than the build ($($stale -join ', ')); redeploy first: pwsh -NoProfile -File spikes/app-shell/run-spike.ps1 -Only S0.4" }
 if (Test-Comfy) { throw "something already answers on $Url; this script only measures with a ComfyUI it starts itself" }
 if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "ComfyUI not found at $ComfyMain" }
 
@@ -115,19 +122,30 @@ try {
     $res.comfy_version = (Invoke-RestMethod "$Url/system_stats" -TimeoutSec 5).system.comfyui_version
 
     $gpuProc = Start-GpuSampler $gpuFile
+    # The load keeps a prompt queued behind the running one (comfy/keep_busy.py, depth 2) and runs
+    # until this script stops it, so it can't end before the measured minute does (the owner's
+    # first run: one prompt at a time, ~75 % of samples >= 95 %, and the load ended 240 s after it
+    # started, before the app's measured minute).
+    $stopFile = Join-Path $Runs 'stop-load'
     $load = Start-Process -FilePath $ComfyPython -WindowStyle Hidden -PassThru -ArgumentList @('-I',
-        (Join-Path $Repo 'spikes\canvas\load\comfy_load.py'), '--port', "$Port", '--seconds', "$($MeasureSeconds + 180)",
-        '--workflow', (Join-Path $Root 'comfy\load-workflow.json'), '--summary', (Join-Path $Runs 'comfy-load.json')) `
-        -RedirectStandardOutput (Join-Path $Runs 'comfy-load.out.log') -RedirectStandardError (Join-Path $Runs 'comfy-load.err.log')
+        (Join-Path $Root 'comfy\keep_busy.py'), '--port', "$Port", '--depth', '2', '--seconds', '1800', '--stop-file', $stopFile,
+        '--workflow', (Join-Path $Root 'comfy\load-workflow.json'), '--summary', (Join-Path $Runs 'keep-busy.json')) `
+        -RedirectStandardOutput (Join-Path $Runs 'keep-busy.out.log') -RedirectStandardError (Join-Path $Runs 'keep-busy.err.log')
 
-    # Wait for the GPU to be saturated (>= 95 % for 10 s in a row), at most 240 s (model load).
-    $deadline = (Get-Date).AddSeconds(240); $saturated = $false
-    while (-not $saturated -and (Get-Date) -lt $deadline) {
+    # Gate: the measured minute starts only once the last 20 s of samples meet the measured
+    # window's own GPU condition (dense, >= 95 % in at least 90 % of the samples). At most 300 s
+    # (model load); if it never gets there, the app is not run at all and the result says why.
+    $deadline = (Get-Date).AddSeconds(300); $saturated = $false
+    while (-not $saturated -and (Get-Date) -lt $deadline -and -not $load.HasExited) {
         Start-Sleep -Seconds 1
-        $last = @(Read-GpuSamples $gpuFile | Select-Object -Last 20)
-        $saturated = ($last.Count -ge 20) -and (@($last | Where-Object { $_.util -lt 95 }).Count -eq 0)
+        $saturated = Test-GpuSaturatedRecently (Read-GpuSamples $gpuFile) ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
     }
     $res.gpu_saturated_before_start = $saturated
+    if (-not $saturated) {
+        $res.load_exit_code = if ($load.HasExited) { $load.ExitCode } else { $null }
+        throw "the GPU never reached the measurement condition before the measured minute (load exited: $($load.HasExited)); see keep-busy.*.log and comfy.err.log in $Runs"
+    }
+    $res.os_primary_refresh_hz = Get-OsPrimaryRefreshHz
 
     $res.cpu_percent_before_app = Get-CpuPercent
     $log = Join-Path $Runs 's06.jsonl'
@@ -145,6 +163,7 @@ try {
     $res.app_exit_code = if ($res.app_timed_out) { $null } else { $app.ExitCode }
     $res.cpu_percent_after_app = Get-CpuPercent
 
+    Set-Content -Path $stopFile -Value 'stop'
     Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue
     Stop-Job $vramJob -ErrorAction SilentlyContinue
 
@@ -155,13 +174,17 @@ try {
     $webShown = $ev | Where-Object { $_.event -eq 'web_dock_shown' } | Select-Object -First 1
     $hb = if ($measured) { Get-NearestRankStats @($measured.heartbeat_lateness_ms.raw) } else { $null }
     $fr = if ($measured) { Get-NearestRankStats @($measured.frame_interval_ms.raw) } else { $null }
-    $refresh = if ($measured) { [double]$measured.primary_refresh_hz } else { 0 }
+    $rr = Resolve-RefreshHz $measured $res.os_primary_refresh_hz
+    $refresh = $rr.hz
     $endEpoch = if ($measured) { $appStart + [long]$measured.t_ms } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
     $cov = Test-GpuCoverage -Samples (Read-GpuSamples $gpuFile) -StartMs ($endEpoch - $MeasureSeconds * 1000) -EndMs $endEpoch
-    $vram = @(Read-JsonLines $vramFile)
+    $vram = @(Read-VramSamples $vramFile)
     $vWeb = @($vram | Where-Object { $webShown -and $_.t -ge ($appStart + [long]$webShown.t_ms + 3000) })
+    $res.vram_samples_total = $vram.Count
+    $res.vram_missing_retries = @(Read-JsonLines $vramFile | Where-Object { $_.missing }).Count
 
     $res.primary_refresh_hz = $refresh
+    $res.refresh_source = $rr.source
     $res.windows = if ($measured) { $measured.windows } else { $null }   # refresh rate and on_primary per window, no names
     $res.frame_threshold_ms = Get-FrameThresholdMs $refresh
     $res.dropped_frames = if ($measured) { Get-DroppedFrames @($measured.frame_interval_ms.raw) $refresh } else { $null }
@@ -185,9 +208,12 @@ try {
     $res.verdict = $verdict
     $res.log = $log
 } catch {
-    $res.verdict = 'ERROR'
+    # A load that never saturated the GPU is a measurement condition not met (no app was run).
+    $res.verdict = if ($res.Contains('gpu_saturated_before_start') -and -not $res.gpu_saturated_before_start) {
+        "INVALID ($($_.Exception.Message))" } else { 'ERROR' }
     $res.error = "$($_.Exception.Message)"
 } finally {
+    if ($stopFile -and -not (Test-Path $stopFile)) { Set-Content -Path $stopFile -Value 'stop' -ErrorAction SilentlyContinue }
     if ($app -and -not $app.HasExited) { try { $app.Kill($true) } catch {} }
     if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue }
     if ($vramJob) { Stop-Job $vramJob -ErrorAction SilentlyContinue; Remove-Job $vramJob -Force -ErrorAction SilentlyContinue }

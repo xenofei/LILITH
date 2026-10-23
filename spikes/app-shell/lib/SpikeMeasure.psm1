@@ -105,21 +105,100 @@ function Read-GpuSamples([string]$File) {
     } | Where-Object { $_ })
 }
 
-# PDH "GPU Process Memory(pid_<pid>_*)" Local Usage and Dedicated Usage, once a second, as JSON
-# lines in $Out, until the job is stopped.
+# PDH "GPU Process Memory(pid_<pid>_*)" Local Usage and Dedicated Usage, about once a second, as
+# JSON lines in $Out, until the job is stopped. The instance exists only once the process has a
+# D3D device, so each sample is its own Get-Counter call and a missing instance is retried, not
+# fatal (a -Continuous Get-Counter on a not-yet-existing instance ends at once: the owner's first
+# S0.6 run got 0 samples). Retries are written as {"t":..,"missing":true} lines.
 function Start-VramSampler([int]$ProcessId, [string]$Out) {
     Start-Job -ArgumentList $ProcessId, $Out -ScriptBlock {
         param($procId, $out)
         $paths = foreach ($n in 'Local Usage', 'Dedicated Usage') { "\GPU Process Memory(pid_${procId}_*)\$n" }
-        Get-Counter -Counter $paths -Continuous -SampleInterval 1 -ErrorAction SilentlyContinue | ForEach-Object {
-            $row = [ordered]@{ t = ([DateTimeOffset]$_.Timestamp).ToUnixTimeMilliseconds() }
-            foreach ($key in 'local usage', 'dedicated usage') {
-                $sum = ($_.CounterSamples | Where-Object { $_.Path -like "*\$key" } | Measure-Object CookedValue -Sum).Sum
-                $row[($key -replace ' ', '_') + '_mib'] = [math]::Round($sum / 1MB, 1)
+        while ($true) {
+            $t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            try {
+                $c = Get-Counter -Counter $paths -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
+                $row = [ordered]@{ t = ([DateTimeOffset]$c.Timestamp).ToUnixTimeMilliseconds() }
+                foreach ($key in 'local usage', 'dedicated usage') {
+                    $sum = ($c.CounterSamples | Where-Object { $_.Path -like "*\$key" } | Measure-Object CookedValue -Sum).Sum
+                    $row[($key -replace ' ', '_') + '_mib'] = [math]::Round($sum / 1MB, 1)
+                }
+            } catch {
+                $row = [ordered]@{ t = $t; missing = $true }
+                Start-Sleep -Milliseconds 500
             }
             Add-Content -Path $out -Value ($row | ConvertTo-Json -Compress)
         }
     }
+}
+
+# VRAM samples that hold values (the "missing" retries left out).
+function Read-VramSamples([string]$File) {
+    @(Read-JsonLines $File | Where-Object { -not $_.missing -and $null -ne $_.local_usage_mib })
+}
+
+$script:DisplaySource = @'
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct DEVMODE {
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+    public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;
+    public int dmFields; public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation;
+    public int dmDisplayFixedOutput; public short dmColor; public short dmDuplex; public short dmYResolution;
+    public short dmTTOption; public short dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+    public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
+    public int dmDisplayFlags; public int dmDisplayFrequency;
+    public int dmICMMethod; public int dmICMIntent; public int dmMediaType; public int dmDitherType;
+    public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
+}
+[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+public static extern bool EnumDisplaySettingsW(string deviceName, int modeNum, ref DEVMODE devMode);
+public static int PrimaryHz() {
+    var dm = new DEVMODE(); dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+    return EnumDisplaySettingsW(null, -1, ref dm) ? dm.dmDisplayFrequency : 0;
+}
+'@
+
+# The primary display's refresh rate from Windows (EnumDisplaySettingsW with
+# ENUM_CURRENT_SETTINGS for the primary device), as a cross-check of what the app reports.
+# 0 if it can't be read.
+function Get-OsPrimaryRefreshHz {
+    if (-not ('SpikeMeasure.Display' -as [type])) {
+        Add-Type -Namespace SpikeMeasure -Name Display -MemberDefinition $script:DisplaySource
+    }
+    [double][SpikeMeasure.Display]::PrimaryHz()
+}
+
+# Which refresh rate S0.6 judges with, and where it came from: the app's report
+# (`primary_refresh_hz`; builds before fix round 2 logged `screens[].refresh_hz`), else Windows'.
+function Resolve-RefreshHz($StallReport, [double]$OsHz) {
+    if ($StallReport -and $StallReport.primary_refresh_hz -gt 0) {
+        return [ordered]@{ hz = [double]$StallReport.primary_refresh_hz; source = 'app' }
+    }
+    if ($StallReport -and $StallReport.screens) {
+        $p = @($StallReport.screens) | Where-Object { $_.primary -and $_.refresh_hz -gt 0 } | Select-Object -First 1
+        if ($p) { return [ordered]@{ hz = [double]$p.refresh_hz; source = 'app (older report format)' } }
+    }
+    if ($OsHz -gt 0) { return [ordered]@{ hz = $OsHz; source = 'windows' } }
+    [ordered]@{ hz = 0.0; source = 'none' }
+}
+
+# Is the deploy folder built from the current build? Our binaries in it must match the build
+# tree's byte for byte; the owner's first S0.6 run used a deploy from before fix round 2. Returns
+# the stale or missing files (empty when current).
+function Test-DeployCurrent([string]$Deploy, [string]$BinDir) {
+    $ours = 'app_shell_spike.exe', 'spike_shell_shim.dll', 'kddockwidgets-qt62.dll', 'SpikeWeb\spike_web.dll'
+    @($ours | Where-Object {
+        $a = Join-Path $Deploy $_; $b = Join-Path $BinDir $_
+        -not (Test-Path $a) -or -not (Test-Path $b) -or (Get-FileHash $a).Hash -ne (Get-FileHash $b).Hash
+    })
+}
+
+# The saturation gate before the measured minute: the same conditions as the measured window
+# (dense, and >= 95 % in at least 90 % of the samples) over the last $WindowMs of samples.
+function Test-GpuSaturatedRecently([object[]]$Samples, [long]$NowMs, [long]$WindowMs = 20000) {
+    $c = Test-GpuCoverage -Samples $Samples -StartMs ($NowMs - $WindowMs) -EndMs $NowMs
+    [bool]($c.dense -and $c.saturated)
 }
 
 function Read-JsonLines([string]$File) {
@@ -174,4 +253,5 @@ function Get-CpuPercent {
 }
 
 Export-ModuleMember -Function Get-NearestRankStats, Test-GpuCoverage, Get-FrameThresholdMs, Get-DroppedFrames, Get-S06Verdict, Split-BuildWarnings,
+    Get-OsPrimaryRefreshHz, Resolve-RefreshHz, Test-DeployCurrent, Test-GpuSaturatedRecently, Read-VramSamples,
     Start-GpuSampler, Read-GpuSamples, Start-VramSampler, Read-JsonLines, Get-CpuPercent

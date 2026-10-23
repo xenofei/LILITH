@@ -32,7 +32,8 @@ param(
     [string]$KddwTag = 'v2.5.0',
     [string[]]$Only = @(),
     [int]$WarmStarts = 10,
-    [int]$IdleCpuPercent = 35   # S0.5 (a) waits (up to 3 min) for the CPU to drop under this
+    [int]$IdleCpuPercent = 35,  # S0.5 (a) waits (up to 3 min) for the CPU to drop under this
+    [string]$DeployName = 'deploy'   # build/<name>; another name leaves the owner's deploy folder alone
 )
 $ErrorActionPreference = 'Stop'
 # -Only S0.1,S0.3 arrives as one string through pwsh -File.
@@ -43,7 +44,7 @@ $Repo    = (Resolve-Path (Join-Path $Root '..\..')).Path
 $Build   = Join-Path $Root 'build'
 $CmakeDir = Join-Path $Build 'cmake'
 $BinDir  = Join-Path $CmakeDir 'bin'
-$Deploy  = Join-Path $Build 'deploy'
+$Deploy  = Join-Path $Build $DeployName
 # Every harness run keeps its own logs: build/runs/<yyyyMMdd-HHmmss>/ (never overwritten).
 $Runs    = Join-Path $Build ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $Results = Join-Path $Root 'results'
@@ -114,7 +115,7 @@ function Test-Launchable([string]$exe, [bool]$deployed) {
 # Starts a process (inheriting this process's error mode), samples the foreground window's
 # process every 250 ms, kills the tree after $TimeoutSec.
 function Invoke-App([string]$exe, [string[]]$appArgs, [hashtable]$envSet = @{}, [string[]]$envUnset = @(),
-                    [int]$TimeoutSec = 60, [bool]$Deployed = $false) {
+                    [int]$TimeoutSec = 60, [bool]$Deployed = $false, [scriptblock]$OnStart = $null) {
     $missing = @(Test-Launchable $exe $Deployed)
     if ($missing.Count) {
         Write-Host "NOT LAUNCHED ${exe}: missing $($missing -join ', ')"
@@ -128,6 +129,7 @@ function Invoke-App([string]$exe, [string[]]$appArgs, [hashtable]$envSet = @{}, 
     foreach ($k in $envUnset) { [void]$psi.Environment.Remove($k) }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $p = [System.Diagnostics.Process]::Start($psi)
+    if ($OnStart) { & $OnStart $p }   # e.g. start a sampler on the new process
     $fgHits = 0; $samples = 0
     while (-not $p.WaitForExit(250)) {
         $samples++
@@ -145,9 +147,9 @@ function Invoke-App([string]$exe, [string[]]$appArgs, [hashtable]$envSet = @{}, 
 }
 
 function Invoke-Spike([string]$exe, [string]$tag, [string[]]$extra, [hashtable]$envSet = @{}, [string[]]$envUnset = @(),
-                      [int]$TimeoutSec = 60, [bool]$Deployed = $false) {
+                      [int]$TimeoutSec = 60, [bool]$Deployed = $false, [scriptblock]$OnStart = $null) {
     $log = Join-Path $Runs "$tag.jsonl"   # $Runs is this harness run's own folder
-    $run = Invoke-App $exe (@('--log', $log, '--no-activate') + $extra) $envSet $envUnset $TimeoutSec $Deployed
+    $run = Invoke-App $exe (@('--log', $log, '--no-activate') + $extra) $envSet $envUnset $TimeoutSec $Deployed $OnStart
     [ordered]@{ tag = $tag; log = $log; run = $run; events = (Read-Log $log) }
 }
 
@@ -393,6 +395,14 @@ if ((Want 'S0.4') -or (Want 'S0.5a') -or (Want 'S0.8')) {
         trimmed = Get-DryRunList $QmlDirs $TrimFlags
         trimmed_without_webengine = Get-DryRunList @($QmlDirs | Where-Object { $_ -notmatch '\\web$' }) $TrimFlags
     }
+    # Never replace a folder a spike process is running from (the owner may have one open; the
+    # first try at this round deleted one file from under the owner's open Narrator window).
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='app_shell_spike.exe'" | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Deploy + '\', [StringComparison]::OrdinalIgnoreCase) })
+    if ($running.Count) {
+        Set-Check 'S0.4' 'NOT RUN' ([ordered]@{ reason = "a spike process (pid $(($running | ForEach-Object ProcessId) -join ', ')) runs from $Deploy; close it, or use -DeployName <other>" })
+        Save-Results; exit 1
+    }
     if (Test-Path $Deploy) { Remove-Item -Recurse -Force $Deploy }
     Copy-OurFiles $Deploy
     $wdqLog = Join-Path $Build 'windeployqt.log'
@@ -537,18 +547,30 @@ if (Want 'S0.9') {
 # shown beside it. comfy-load.ps1 makes the real run.
 # ==========================================================================================
 if (Want 'S0.6smoke') {
-    $r = Invoke-Spike $dExe 's06-smoke' @('--load', '--show-web', '2000', '--measure', '10') $StripSet $StripUnset 90 $true
+    # The S0.6 samplers' self-check rides along: the VRAM sampler on the app's own pid from its
+    # first moment (before it has a D3D device), and Windows' own reading of the refresh rate.
+    $vramFile = Join-Path $Runs 's06-smoke-vram.jsonl'
+    $script:smokeVram = $null
+    $osHz = Get-OsPrimaryRefreshHz
+    $r = Invoke-Spike $dExe 's06-smoke' @('--load', '--show-web', '2000', '--measure', '10') $StripSet $StripUnset 90 $true { param($proc) $script:smokeVram = Start-VramSampler $proc.Id $vramFile }
+    if ($script:smokeVram) { Stop-Job $script:smokeVram -ErrorAction SilentlyContinue; Remove-Job $script:smokeVram -Force -ErrorAction SilentlyContinue }
+    $vram = @(Read-VramSamples $vramFile)
+    $vramMissing = @(Read-JsonLines $vramFile | Where-Object { $_.missing }).Count
     $ev = $r.events
     $m = Get-Events $ev 'stall_report' | Where-Object { $_.label -eq 'measured' } | Select-Object -Last 1
     $counts = Get-Events $ev 'load_counts' | Select-Object -Last 1
-    $refresh = if ($m) { [double]$m.primary_refresh_hz } else { 0 }
+    $rr = Resolve-RefreshHz $m $osHz
+    $refresh = $rr.hz
     $hb = if ($m) { Get-NearestRankStats @($m.heartbeat_lateness_ms.raw) } else { $null }
     $fr = if ($m) { Get-NearestRankStats @($m.frame_interval_ms.raw) } else { $null }
-    $ok = ($r.run.exit_code -eq 0) -and $m -and ($refresh -gt 0) -and $counts -and
+    $ok = ($r.run.exit_code -eq 0) -and $m -and ($rr.source -eq 'app') -and ($refresh -gt 0) -and ($osHz -gt 0) -and
+          ([math]::Abs($refresh - $osHz) -le 2) -and ($vram.Count -ge 5) -and $counts -and
           ($counts.grid_visible_seconds -ge 9) -and ($counts.grid_hidden_seconds -eq 0) -and $counts.web_shown -and
           ($counts.feed_ticks -gt 0) -and ($counts.decoded -gt 0) -and ($counts.chart_points -gt 0)
     Set-Check 'S0.6smoke' ($(if ($ok) { 'OK (plumbing; not a verdict)' } else { 'BROKEN (plumbing)' })) ([ordered]@{
-        exit_code = $r.run.exit_code; primary_refresh_hz = $refresh; windows = $m.windows; frame_threshold_ms = (Get-FrameThresholdMs $refresh)
+        exit_code = $r.run.exit_code; primary_refresh_hz = $refresh; refresh_source = $rr.source; os_primary_refresh_hz = $osHz
+        vram_samples = $vram.Count; vram_missing_retries = $vramMissing
+        vram_local_usage_max_mib = ($vram | Measure-Object local_usage_mib -Maximum).Maximum; windows = $m.windows; frame_threshold_ms = (Get-FrameThresholdMs $refresh)
         dropped_frames = (Get-DroppedFrames @($m.frame_interval_ms.raw) $refresh)
         heartbeat_lateness_ms = $hb; frame_interval_ms = $fr; load_counts = $counts
         cpu_percent = (Get-CpuPercent); focus_taken = ($r.run.foreground_was_ours -gt 0); log = $r.log })
