@@ -32,6 +32,13 @@ one .exe in it.
 .PARAMETER QtGrabArgs
 The arguments that make the spike app grab its window offscreen to {png} and exit (Task 0's
 app: --screenshot grabs only just before an automatic quit, so --quit-after is needed).
+.PARAMETER KeepAwake
+Holds a keep-awake for the whole run: the spike core's PowerSetRequest(PowerRequestSystemRequired),
+watching this script's process (--parent-pid), released in the finally (run-all's unattended block,
+which comes right after the stay-awake wait has left the PC past its idle timeout; review N-I1).
+Without it the same core runs with --api none and only listens for sleep. Either way a run during
+which the PC slept (a suspend broadcast, a clock jump, or a Kernel-Power sleep entry in the run's
+time) is recorded as interrupted by sleep, never as a FAIL.
 .PARAMETER Preflight
 Starts nothing: prints, as JSON, whether a run could start now (the Sandbox feature, Task 0's
 deploy folder, the Qt exe) and what to type when it couldn't (run-all.ps1, tests/sandbox_paths.rs).
@@ -44,7 +51,8 @@ param(
     [string]$QtExe = '',
     [string]$QtGrabArgs = '--screenshot {png} --quit-after 5000 --no-activate',
     [switch]$SkipBuild,
-    [switch]$Preflight
+    [switch]$Preflight,
+    [switch]$KeepAwake
 )
 
 $ErrorActionPreference = 'Stop'
@@ -338,6 +346,52 @@ function Judge-Run([string]$Res, [string]$Sfx = '') {
     $items
 }
 
+# ---------------------------------------------------------------- the host's power during the runs
+
+# The spike core on the host for the whole of this script: with -KeepAwake it holds the request,
+# otherwise it holds nothing (--api none); either way its hidden window logs every suspend and
+# resume and any clock jump, with times. It watches this script's process and stops with it.
+# Its log and flags live under build\sandbox\host-power, not the user's profile.
+$script:HostPower = $null
+function Start-HostPowerWatch([switch]$Hold) {
+    $dir = Join-Path $Build 'host-power'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Remove-Item (Join-Path $dir 'power-*.flag') -ErrorAction SilentlyContinue
+    $out = Join-Path $dir 'power.json'
+    Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
+    $env:WINSHELL_LOG_DIR = $dir
+    try { $r = Tool spawn '--' (Join-Path $Bin 'winshell-core.exe') power --api $(if ($Hold) { 'request' } else { 'none' }) --max-secs 43200 --parent-pid "$PID" --out $out }
+    finally { Remove-Item Env:\WINSHELL_LOG_DIR -ErrorAction SilentlyContinue }
+    $p = $null
+    if ($r -and $r.PSObject.Properties['pid']) { $p = Get-Process -Id ([int]$r.pid) -ErrorAction SilentlyContinue }
+    $script:HostPower = [pscustomobject]@{ Process = $p; Out = $out; Dir = $dir; Hold = [bool]$Hold }
+    Say $(if ($Hold) { 'The host is kept awake for these runs (a parent-watched power request).' } else { 'The host''s sleep and wake are watched during these runs.' })
+}
+
+function Stop-HostPowerWatch {
+    $h = $script:HostPower
+    if ($null -eq $h) { return $null }
+    New-Item -ItemType File -Force -Path (Join-Path $h.Dir 'power-quit.flag') | Out-Null
+    if ($null -ne $h.Process) {
+        try { if (-not $h.Process.WaitForExit(20000)) { $h.Process.Kill() } } catch { }
+    }
+    Remove-Item (Join-Path $h.Dir 'power-*.flag') -ErrorAction SilentlyContinue
+    Read-Json $h.Out
+}
+
+# The sleeps between two times (unix ms): the core's events, and the System log's Kernel-Power
+# sleep (42) and resume (107) entries.
+function Get-RunSleep([long]$FromMs, [long]$ToMs) {
+    $doc = $(if ($script:HostPower) { Read-Json $script:HostPower.Out } else { $null })
+    $kernel = @()
+    try {
+        $from = [DateTimeOffset]::FromUnixTimeMilliseconds($FromMs).LocalDateTime
+        $kernel = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 107; StartTime = $from } -ErrorAction Stop |
+            ForEach-Object { [ordered]@{ id = $_.Id; t_ms = ([DateTimeOffset]$_.TimeCreated).ToUnixTimeMilliseconds() } })
+    } catch { }
+    Get-SleepInWindow @(P $doc 'events') $kernel $FromMs $ToMs
+}
+
 # ---------------------------------------------------------------- the host-state observation
 
 function Wait-ResultFile([string]$Path, [int]$TimeoutSec) {
@@ -358,7 +412,6 @@ function Stop-Blocker {
 # window and clicked to the front by the script; UIA then checks the Sandbox window's centre is
 # covered. The blocker logs into build\sandbox, not the user's profile.
 function Cover-SandboxWindow($Started) {
-    Show-HandsOff 'places one of its windows over the Sandbox window and clicks it (the mouse moves)'
     $rec = [ordered]@{ method = 'a spike blocker window placed over the Sandbox window (SetWindowPos), clicked to the front (synthetic)'; covered = $false }
     if (-not (Initialize-SpikeUi)) { $rec.why = "UI Automation not available: $($script:Uia.error)"; return $rec }
     $own = @(Get-OwnPids $Started) + @($Started.own_pids) | Sort-Object -Unique
@@ -395,11 +448,14 @@ function Cover-SandboxWindow($Started) {
 function Invoke-Observation([string]$Res, $Started) {
     $obs = [ordered]@{}
     $obs.round1_done = Wait-ResultFile (Join-Path $Res 'round-1.json') 900
+    # Hands off while the cover is placed and round 2 runs behind it (owner direction: a pop-up).
+    $handsOff = Start-HandsOff 'places one of its windows over the Sandbox window and keeps it there for round 2 (the mouse moves once)' 300
+    try {
     $obs.round2_cover = Cover-SandboxWindow $Started
     Say ("Round 2: the Sandbox window is {0}." -f $(if ($obs.round2_cover.covered) { 'covered by a spike window' } else { "not covered ($(P $obs.round2_cover 'why'))" }))
     New-Item -ItemType File -Force -Path (Join-Path $Res 'go-2.flag') | Out-Null
     $obs.round2_done = Wait-ResultFile (Join-Path $Res 'round-2.json') 600
-    Stop-Blocker
+    } finally { Stop-HandsOff $handsOff; Stop-Blocker }
 
     [console]::Beep(880, 300)
     Say 'YOUR TURN: lock the PC now (Win+L). Stay locked until you hear two beeps (about 4 minutes), then sign in again. The script sees the lock and the sign-in by itself.' 'Yellow'
@@ -416,7 +472,7 @@ function Invoke-Observation([string]$Res, $Started) {
     if ($null -ne $lock.locked_after_s) {
         # A beep can be heard on the lock screen: the cue to sign in again (review M12).
         [console]::Beep(660, 400); [console]::Beep(880, 400)
-        Say 'Round 3 is done: sign in again now.' 'Yellow'
+        Say $(if ($obs.round3_done) { 'Round 3 is done: sign in again now.' } else { 'Round 3 did not finish in time: sign in again now.' }) 'Yellow'
     }
     if ($null -ne $lock.locked_after_s) { $lock.locked_throughout = @($states | Where-Object { $_ -ne $true }).Count -eq 0 }
     $deadline = (Get-Date).AddSeconds(1200)
@@ -471,6 +527,8 @@ $label = if ($Observe) { 'observe' } else { 'run' }
 $summary = [ordered]@{ spike = 11; item = 'S1.9'; observe = [bool]$Observe; sandbox = $info; runs = @() }
 $runCount = if ($Observe) { 1 } else { $Runs }
 
+Start-HostPowerWatch -Hold:$KeepAwake
+try {
 for ($run = 1; $run -le $runCount; $run++) {
     Say "---- $label $run of $runCount" 'Yellow'
     $runDir = Join-Path $Build "$label-$run"
@@ -483,6 +541,7 @@ for ($run = 1; $run -le $runCount; $run++) {
     if (-not (P $w 'written')) { throw "wsb not written: $(P $w 'error')" }
 
     $t0 = Get-Date
+    $t0ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $started = $null
     $stop = $null
     $procs = @()
@@ -556,7 +615,11 @@ for ($run = 1; $run -le $runCount; $run++) {
         }
     }
     $runPass = @($items.Values | Where-Object { $_.Contains('pass') -and -not $_.pass }).Count -eq 0
-    $summary.runs += [ordered]@{ run = $run; pass = $runPass; items = $items }
+    # A run during which the PC slept says nothing about the Sandbox (review N-I1).
+    $sleep = Get-RunSleep $t0ms ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    $interrupted = $sleep.slept
+    if ($interrupted) { Say '  interrupted by sleep: this run is not judged' 'Yellow' }
+    $summary.runs += [ordered]@{ run = $run; pass = $(if ($interrupted) { $null } else { $runPass }); interrupted_by_sleep = $interrupted; sleep = $sleep; items = $items }
 
     $keep = Join-Path $ResultsRoot "sandbox\$label-$run"
     New-EmptyDir $keep
@@ -569,8 +632,14 @@ for ($run = 1; $run -le $runCount; $run++) {
     Say ("  start to closed: {0:N0} s; stop: {1}" -f $closedAt, $stop.method)
 }
 
-$summary.pass = @($summary.runs | Where-Object { -not $_.pass }).Count -eq 0
+}
+finally {
+    $summary.host_power = Stop-HostPowerWatch
+    $summary.host_kept_awake = [bool]$KeepAwake
+}
+$summary.verdict = Get-SandboxVerdict @($summary.runs)
+$summary.pass = $summary.verdict -eq 'PASS'
 $name = if ($Observe) { 'sandbox-observe.json' } else { 'sandbox-checks.json' }
 $summary | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $ResultsRoot $name)
-Say ("S1.9 {0}: {1}" -f $label, $(if ($summary.pass) { 'PASS' } else { 'FAIL' })) $(if ($summary.pass) { 'Green' } else { 'Red' })
+Say ("S1.9 {0}: {1}" -f $label, $summary.verdict) $(if ($summary.pass) { 'Green' } elseif ($summary.verdict -like 'INCOMPLETE*') { 'Yellow' } else { 'Red' })
 Say "Results: $(Join-Path $ResultsRoot $name)"

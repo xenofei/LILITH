@@ -165,7 +165,8 @@ Try-Case 'second pop: 2 popups is FAIL without asking' { $script:AskedCount = 0;
 Try-Case 'S1.5 verdict: 2 popups' { Get-S15Verdict $false (Resolve-SecondPop 2 { $true }) } 'FAIL'
 Try-Case 'S1.5 verdict: 1 popup, owner saw no second' { Get-S15Verdict $true (Resolve-SecondPop 1 { $true }) } 'PASS (UIA saw 1 popup; the owner saw no second pop)'
 Try-Case 'S1.5 verdict: 1 popup, owner saw a second' { Get-S15Verdict $false (Resolve-SecondPop 1 { $false }) } 'FAIL (UIA saw 1 popup; the owner saw a second pop, for example an in-place re-animation)'
-Try-Case 'S1.5 verdict: 0 popups, owner says once' { Get-S15Verdict $true (Resolve-SecondPop 0 { $true }) } 'PASS'
+Try-Case 'S1.5 verdict: 0 popups, owner says once' { Get-S15Verdict $true (Resolve-SecondPop 0 { $true }) } 'PASS (owner: UIA did not see the progress toast)'
+Try-Case 'S1.5 verdict: 0 popups, owner saw a second' { Get-S15Verdict $false (Resolve-SecondPop 0 { $false }) } 'FAIL (owner: UIA did not see the progress toast; the owner saw a second pop)'
 
 # ---- The stay-awake wait (automation review I5, M11)
 Try-Case 'input during the wait: idle shorter than the stretch' { Test-InputDuring 600 120 } 'True'
@@ -174,6 +175,60 @@ Try-Case 'idle unknown is not input' { Test-InputDuring 600 $null } 'False'
 Try-Case 'S1.7 a Sandbox running: not decisive' { (Get-S17Verdict $listed ([ordered]@{ api = 'request'; result = 'not run'; why = 'a Windows Sandbox is running' }) $null $true).verdict } 'INCOMPLETE (the stay-awake wait was not decisive: a Windows Sandbox is running)'
 Try-Case 'S1.7 another requester before the hold' { (Get-S17Verdict $listed ([ordered]@{ api = 'request'; result = 'not decisive'; why = 'another requester' }) $null $true).verdict } 'INCOMPLETE (the stay-awake wait was not decisive: another requester)'
 Try-Case 'Test-NeedSte: a not-decisive wait needs no second API' { Test-NeedSte $listed ([ordered]@{ result = 'not decisive' }) } 'False'
+
+# ---- Fix round 2: a foreign window as the "prompt" (m3)
+Try-Case 'prompt in front: another app''s window is not the prompt' { $r = Get-PromptInFront $term @((Fg 400 40 'notepad' 0.5 $false)); "$($null -eq $r.value) $($r.how)" } 'True another window (notepad)'
+
+# ---- Fix round 2: scope names and the target selection, with fake levels (N-I3, m11)
+$own = @('LILITH spike', 'LILITH Spike', 'Open')
+Try-Case 'scope names: this toast''s own' { (Test-ScopeNames @('LILITH spike', 'Click the Open button (S1.3, 4 of 6) #a1b2c3', 'Open', '') '#a1b2c3' $own @()).ok } 'True'
+Try-Case 'scope names: another app''s entry' { $r = Test-ScopeNames @('LILITH spike', 'x #a1b2c3', 'Mail', 'New message from someone') '#a1b2c3' $own @(); "$($r.ok) $($r.unknown)" } 'False 2'
+Try-Case 'scope names: a name with two nonces' { (Test-ScopeNames @('a #a1b2c3 b #ffee00') '#a1b2c3' $own @()).ok } 'False'
+Try-Case 'scope names: a pattern' { (Test-ScopeNames @('42 %', 'p #a1b2c3') '#a1b2c3' @() @('^\d+ ?%$')).ok } 'True'
+function Btn([string]$N, [string]$A = '', $R = $null) { [ordered]@{ name = $N; automation_id = $A; rect = $R } }
+function Lv([int]$D, [bool]$Item, [string[]]$Names, $Cands, $R = $null) { [ordered]@{ depth = $D; list_item = $Item; names = $Names; rect = $R; candidates = @($Cands) } }
+$isOpen = { param($n, $a) $n -eq 'Open' }
+$isDismiss = { param($n, $a) Test-DismissButton $n $a }
+$text = 'Click the Open button (S1.3, 4 of 6) #a1b2c3'
+Try-Case 'target: this toast''s own Open one level up' {
+    $r = Select-ToastTarget @((Lv 0 $false @($text) @()), (Lv 1 $false @('LILITH spike', $text, 'Open') @((Btn 'Open')))) '#a1b2c3' $own @() $isOpen; "$($r.ok) $($r.depth)"
+} 'True 1'
+Try-Case 'target: a foreign entry in the scope refuses' {
+    $r = Select-ToastTarget @((Lv 0 $false @($text) @()), (Lv 1 $false @($text, 'Open', 'Chat', 'Hi there') @((Btn 'Open')))) '#a1b2c3' $own @() $isOpen; "$($r.ok) $($r.why)"
+} "False the scope holds 2 name(s) that are not this toast's own: nothing pressed"
+Try-Case 'target: never past this toast''s list item' {
+    $r = Select-ToastTarget @((Lv 0 $false @($text) @()), (Lv 1 $true @($text) @()), (Lv 2 $false @($text, 'Dismiss') @((Btn 'Dismiss')))) '#a1b2c3' $own @('(?i)^(dismiss|close)\b') $isDismiss; "$($r.ok) $($r.depth)"
+} 'False 1'
+Try-Case 'target: Clear all is never picked' {
+    $r = Select-ToastTarget @((Lv 0 $true @($text, 'Clear all') @((Btn 'Clear all' 'ClearAllButton')))) '#a1b2c3' @($own + 'Clear all') @('(?i)^(dismiss|close)\b') { param($n, $a) $true }; "$($r.ok)"
+} 'False'
+Try-Case 'target: the own dismiss inside the list item' {
+    $r = Select-ToastTarget @((Lv 0 $false @($text) @()), (Lv 1 $true @('LILITH Spike', $text, 'Dismiss') @((Btn 'Dismiss')))) '#a1b2c3' $own @('(?i)^(dismiss|close)\b') $isDismiss; "$($r.ok) $($r.candidate['name'])"
+} 'True Dismiss'
+Try-Case 'target: a button outside the toast refuses' {
+    $r = Select-ToastTarget @((Lv 0 $false @($text, 'Open') @((Btn 'Open' '' ([pscustomobject]@{ X = 0; Y = 900; Width = 50; Height = 20 }))) ([pscustomobject]@{ X = 100; Y = 100; Width = 300; Height = 100 }))) '#a1b2c3' $own @() $isOpen; "$($r.ok)"
+} 'False'
+Try-Case 'target: another spike toast in the scope refuses' {
+    $r = Select-ToastTarget @((Lv 0 $false @($text, 'other #ffee00', 'Open') @((Btn 'Open')))) '#a1b2c3' $own @() $isOpen; "$($r.ok)"
+} 'False'
+
+# ---- Fix round 2: the stay-awake wait's evidence (N-I2)
+function Ev($Req) { [ordered]@{ execution_state = $(if ($Req) { '0x1' } else { '0x0' }); system_required = $Req } }
+Try-Case 'stay decisive: clean before, held, after' { $null -eq (Get-StayNotDecisive (Ev $false) @((Ev $true), (Ev $true)) @((Ev $false), (Ev $false))) } 'True'
+Try-Case 'stay not decisive: another requester before' { Get-StayNotDecisive (Ev $true) @((Ev $true)) @((Ev $false)) } 'another requester held the PC awake before the request (execution state 0x1)'
+Try-Case 'stay not decisive: self-check false' { Get-StayNotDecisive (Ev $false) @((Ev $true), (Ev $false)) @((Ev $false)) } 'the execution state did not show the spike''s own request while it was held (self-check false)'
+Try-Case 'stay not decisive: still held after the release' { Get-StayNotDecisive (Ev $false) @((Ev $true)) @((Ev $false), (Ev $true)) } 'another requester still held the PC awake after the release (execution state 0x1)'
+
+# ---- Fix round 2: the Sandbox runs' sleep timeline and verdict (N-I1)
+$evs = @([ordered]@{ t_ms = 1000; kind = 'set' }, [ordered]@{ t_ms = 5000; kind = 'power_broadcast'; pbt = 'PBT_APMSUSPEND' }, [ordered]@{ t_ms = 9000; kind = 'clock_jump' })
+Try-Case 'sleep in window: a suspend inside' { (Get-SleepInWindow $evs @() 4000 6000).slept } 'True'
+Try-Case 'sleep in window: none inside' { (Get-SleepInWindow $evs @() 6000 8000).slept } 'False'
+Try-Case 'sleep in window: a Kernel-Power resume' { (Get-SleepInWindow @() @([ordered]@{ id = 107; t_ms = 7000 }) 6000 8000).slept } 'True'
+Try-Case 'sleep in window: a power-status broadcast is not a sleep' { (Get-SleepInWindow @([ordered]@{ t_ms = 7000; kind = 'power_broadcast'; pbt = 'PBT_APMPOWERSTATUSCHANGE' }) @() 6000 8000).slept } 'False'
+function Run1($Pass, $Int) { [ordered]@{ pass = $Pass; interrupted_by_sleep = $Int } }
+Try-Case 'sandbox verdict: 3 of 3' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $true $false), (Run1 $true $false)) } 'PASS'
+Try-Case 'sandbox verdict: one interrupted' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $null $true), (Run1 $true $false)) } 'INCOMPLETE (1 run(s) interrupted by sleep: rerun them)'
+Try-Case 'sandbox verdict: a judged FAIL decides' { Get-SandboxVerdict @((Run1 $false $false), (Run1 $null $true)) } 'FAIL'
 # ---- The CLSID read-back (rerun of 2026-10-23: S1.2p, S1.3 and S1.4 stopped at the compare).
 # The root cause, reproduced: a [switch] parameter named like the script's $ToastClsid string
 # hides that string inside the function, and the CLSID is compared with "True".

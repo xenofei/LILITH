@@ -23,7 +23,7 @@ A session is two commands (the two blocks below), run from a normal **Windows Te
    pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Attended -Task0Repo "<folder of Task 0's worktree>"
    ```
 
-2. **The unattended block, about 2 hours 40 minutes with a 2-hour sleep timeout, with nobody at the PC.** Start it when you leave, for example in the evening. When the attended block ends it prints this command for you:
+2. **The unattended block, with nobody at the PC.** Its length follows "Sleep after": about 55 minutes with it at 5 minutes (your plan), about 2 hours 40 minutes at 2 hours. Start it when you leave. When the attended block ends it prints this command for you:
 
    ```powershell
    pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Unattended -Task0Repo "<folder of Task 0's worktree>"
@@ -31,7 +31,19 @@ A session is two commands (the two blocks below), run from a normal **Windows Te
 
 Each block prints its plan and its time on this PC, then waits for Enter. The unattended block then counts down 60 seconds so that you can leave.
 
-Whenever the script is about to move the mouse or press keys, it prints a yellow **HANDS OFF** line first. If you are using the mouse or keyboard at that moment, it holds back and tries again, and after a few tries it hands that step to you. **Ctrl+C** in the terminal stops it at any time. Whenever a step needs you, it says **YOUR TURN** in yellow.
+**The hands-off pop-up.** A pop-up appears at the top centre of the screen whenever the script is about to move the mouse or press keys, and for the whole stay-awake wait:
+
+1. **Amber, at least 10 seconds ahead:** "In N s: HANDS OFF the mouse and keyboard", and what is coming.
+2. **Red:** "HANDS OFF", with a countdown until you can use the PC again.
+3. **Green:** "Done: you can use the PC again". Then it closes.
+
+**It stays out of the way.**
+- It never takes the focus, and clicks pass through it, so it can't get in the way of what the script clicks or checks.
+- The terminal also prints a yellow HANDS OFF line.
+
+**If you touch the mouse or keyboard anyway,** the script holds back and tries again. After a few tries it hands that step to you.
+
+**Ctrl+C** in the terminal stops it at any time. Whenever a step needs you, the script says **YOUR TURN** in yellow.
 
 ### The attended block
 
@@ -43,19 +55,26 @@ Whenever the script is about to move the mouse or press keys, it prints a yellow
 | Foreground (S1.4) | about 16 min | in each trial two small windows, "winshell-app" and "winshell blocker" (the script clicks the blocker to the front), then a toast | **YOUR TURN**: click the toast's text, 10 times (15 if the first method fails). A real click is what this check measures. Keep your hand off the mouse until the toast is there. Then 5 more trials that the script clicks itself: hands off |
 | Progress toasts (S1.5) | about 4 min | a toast with a progress bar for 20 s; the notification centre opens, the script closes that toast | **YOUR TURN, watch only**: does the progress toast slide in a second time? The script asks you when it can't tell by itself. If it can't close the toast, it asks you to close it with its own X (never "Clear all") |
 | Sleep and wake (S1.7) | about 5 min | — | **YOUR TURN**: Start, Power, **Sleep**; wait about a minute; wake the PC and sign in. The script carries on once the PC is awake again |
-| Windows Hello (S1.8) | about 4 min | Windows Hello prompts: 1, then up to 10, then 1 | **YOUR TURN**: complete each prompt, **without clicking it first**. Keep the terminal in front. The script checks whether each prompt comes in front by itself, and a prompt you had to click or type into before it came forward counts as "owner-assisted", not as "in front" |
+| Windows Hello (S1.8) | about 4 min | Windows Hello prompts: 1, then up to 10, then 1 | **YOUR TURN**: keep your hands off until each prompt shows, then complete it, **without clicking it first**. Keep the terminal in front. The script checks whether each prompt comes in front by itself, and a prompt you had to click or type into before it came forward counts as "owner-assisted", not as "in front" |
 | Sandbox, watched run | about 15 min | a Windows Sandbox window with things happening inside; then one of the spike's windows is placed over it | when the script beeps and says YOUR TURN: **lock the PC (Win+L)**. Sign in again when you hear **two beeps** (about 4 minutes). The script sees the lock and the sign-in |
 
 ### The unattended block
 
 | Part | Time | What happens |
 |---|---|---|
-| Stay-awake (S1.7) | your sleep timeout plus about 6 minutes; at worst twice that, if the first method fails and the wait runs once more with the second one | nothing on screen, and the screen may turn off. The PC must **not** go to sleep. Nobody touches the PC: a touch restarts the wait from that moment (up to 3 times). The wait doesn't start while a Windows Sandbox runs, or while another program already keeps the PC awake; the script checks that, waits up to 10 minutes for it to stop, and otherwise records the wait as not decisive |
-| Sandbox, 3 runs | about 30 minutes | the Sandbox window opens and closes 3 times by itself |
+| Stay-awake (S1.7) | "Sleep after" plus about 6 minutes (about 11 minutes at 5 minutes); longer if someone touches the PC or the first method fails | the hands-off pop-up counts down, and the screen may turn off. The PC must **not** go to sleep. Nobody touches the PC: a touch restarts the wait from that moment (up to 3 times) |
+| Sandbox, 3 runs | about 30 minutes | the Sandbox window opens and closes 3 times by itself. The PC is kept awake meanwhile, and released at the end or as soon as the script stops. A run during which the PC slept anyway is recorded as interrupted, not as a failure |
 
-**Optional, your choice:** the wait follows this PC's "Sleep after" setting (Settings, System, Power), which the scripts only read and never change. If you shorten it yourself before starting the unattended block, the wait shrinks to match. If you do, set it back afterwards.
+**"Sleep after".** The wait follows this PC's "Sleep after" (on mains) setting in Settings, System, Power. The scripts only read it and never change it.
+- **Your plan:** set it to 5 minutes yourself before the unattended block, and back afterwards.
+- **At the start**, the unattended block prints the value it finds and how long the block will take.
+- **At the end**, the terminal reminds you of the value the attended block noted, for example "set it back to 2 h 00 min".
 
-**Programs that keep the PC awake** (a playing video, a download, an app with a keep-awake option) make the wait not decisive. Close them before you start the unattended block.
+**Nothing else may keep the PC awake during the wait.**
+- **The script checks before you press Enter,** while you are still there. If something holds the PC awake, it says what to do and checks again each time you press Enter. Type `skip` to run only the Sandbox part.
+- **The likely cause:** the Claude app's "Keep computer awake while Claude works" setting holds the PC awake while any Claude session is working. Pause your Claude sessions, or turn that setting off, for this test.
+- **Other causes:** a playing video, a download, or another app with a keep-awake option.
+- **If something starts keeping the PC awake during the wait,** the result is recorded as "not decisive" rather than as a pass.
 
 When a block ends, the terminal prints each check's verdict (PASS, FAIL, INCOMPLETE, RECORDED or PENDING) and the cleanup's result. Tell the agent the block is done. The results are in `spikes\winshell\results\`: `checks.json` for Part B and the stay-awake wait, and `sandbox-observe.json` and `sandbox-checks.json` for the Sandbox.
 ## What the session changes, and how it is undone
@@ -73,6 +92,8 @@ Each part removes what it added and checks that it is gone (the line "Cleanup ->
 | The spike's toasts in the notification centre | throughout | cleared |
 | The power request "LILITH spike 11 keep-awake check" | S1.7 | released by the script; if the terminal is closed instead, the program holding it notices and releases it within a second; the cleanup checks no `winshell-core` is left running |
 | `%LOCALAPPDATA%\LILITH-spike\winshell` (a log) | throughout | copied into the results, then deleted |
+| The hands-off pop-up (a small window at the top centre) | before each hands-off stretch | it closes by itself when the stretch is done, and when the script stops |
+| A power request that keeps the PC awake during the 3 unattended Sandbox runs | the unattended block | released at the end; if the terminal is closed instead, the program holding it notices and releases it within a second |
 | The mouse pointer | S1.3, S1.4, S1.5, the Sandbox watched run | it is put back where it was after each synthesized click or hover |
 | `spikes\winshell\build\` and `spikes\winshell\results\` | throughout | kept for the agent; git ignores both; delete them whenever you like |
 | Inside the Sandbox: a shortcut, the link type, logs | Part C | gone when the Sandbox closes. The Sandbox has no network, clipboard, microphone, camera or printer; only two folders connect it to this PC |

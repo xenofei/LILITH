@@ -78,7 +78,8 @@ if ($Block -eq 'Attended') {
     if ($withSandbox) { $stages += [ordered]@{ name = 'Part C, the watched run'; script = 'run-sandbox.ps1'; args = @('-Observe') + $sandboxArgs } }
 } else {
     if ($withS17) { $stages += [ordered]@{ name = 'S1.7, the stay-awake wait'; script = 'run-spike.ps1'; args = @('-Only', 'S1.7', '-Append', '-PowerPart', 'stay-awake', '-SkipBuild') } }
-    if ($withSandbox) { $stages += [ordered]@{ name = 'Part C, the unattended runs'; script = 'run-sandbox.ps1'; args = @('-Runs', "$Runs") + $sandboxArgs } }
+    # -KeepAwake: the wait before has left the PC past its idle timeout (review N-I1).
+    if ($withSandbox) { $stages += [ordered]@{ name = 'Part C, the unattended runs'; script = 'run-sandbox.ps1'; args = @('-Runs', "$Runs", '-KeepAwake') + $sandboxArgs } }
 }
 
 if ($DryRun) {
@@ -87,6 +88,26 @@ if ($DryRun) {
 }
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
+. (Join-Path $Spike 'uia.ps1')   # Get-PowerEvidence, Get-KeepAwakeAdvice (defines functions only)
+
+# The sleep timeout in use (read only: powercfg /query; the scripts never change it).
+function Get-SleepTimeout {
+    $q = (& powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE) -join "`n"
+    $onBattery = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Where-Object { $_.BatteryStatus -eq 1 }).Count -gt 0
+    $ac = [regex]::Match($q, 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)')
+    $dc = [regex]::Match($q, 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)')
+    $use = $(if ($onBattery) { $dc } else { $ac })
+    [ordered]@{
+        ac_s = $(if ($ac.Success) { [Convert]::ToInt64($ac.Groups[1].Value, 16) } else { $null })
+        dc_s = $(if ($dc.Success) { [Convert]::ToInt64($dc.Groups[1].Value, 16) } else { $null })
+        on_battery = $onBattery
+        used_s = $(if ($use.Success) { [Convert]::ToInt64($use.Groups[1].Value, 16) } else { $null })
+        at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
+function Fmt-Timeout($Sec) { if ($null -eq $Sec) { 'unknown' } elseif ($Sec -eq 0) { 'never' } else { Fmt ($Sec / 60) } }
+$TimeoutFile = Join-Path $Spike 'results\sleep-timeout-at-attended.json'
 function Fmt([double]$Min) { $m = [int][math]::Ceiling($Min); if ($m -ge 60) { '{0} h {1:00} min' -f [math]::Floor($m / 60), ($m % 60) } else { "$m min" } }
 
 $identity = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -97,17 +118,18 @@ if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 
 # The sleep timeout in use decides the stay-awake wait. It is only ever read (the same query as
 # S1.7); the wait follows whatever value it finds.
 $stayMin = 0.0
-$timeoutText = 'unknown'
-if ($withS17 -and $Block -eq 'Unattended') {
-    $q = (& powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE) -join "`n"
-    $onBattery = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Where-Object { $_.BatteryStatus -eq 1 }).Count -gt 0
-    $m = [regex]::Match($q, "Current $(if ($onBattery) { 'DC' } else { 'AC' }) Power Setting Index:\s*0x([0-9a-fA-F]+)")
-    if ($m.Success) {
-        $sec = [Convert]::ToInt64($m.Groups[1].Value, 16)
-        $timeoutText = $(if ($sec -eq 0) { 'never' } else { Fmt ($sec / 60) })
-        if ($sec -gt 0) { $stayMin = ($sec + 330) / 60 }
-    }
+$timeoutNow = Get-SleepTimeout
+$timeoutText = Fmt-Timeout $timeoutNow.used_s
+$original = $null
+if ($Block -eq 'Attended') {
+    # Kept so that the unattended block can remind the owner of the value to set back (ruling
+    # of 2026-10-23: the owner may lower "Sleep after" for the stay-awake test; the scripts only read).
+    New-Item -ItemType Directory -Force -Path (Split-Path $TimeoutFile) | Out-Null
+    $timeoutNow | ConvertTo-Json | Set-Content -Encoding utf8 $TimeoutFile
+} elseif (Test-Path -LiteralPath $TimeoutFile) {
+    try { $original = Get-Content -Raw -LiteralPath $TimeoutFile | ConvertFrom-Json } catch { }
 }
+if ($withS17 -and $Block -eq 'Unattended' -and $timeoutNow.used_s -gt 0) { $stayMin = ($timeoutNow.used_s + 330) / 60 }
 
 # Part C can start only with the Sandbox feature on and Task 0's deploy folder found.
 $sandboxReady = $false
@@ -133,7 +155,8 @@ if ($Block -eq 'Attended') {
     Say ("Spike 11, the attended block: about {0}, you at the PC." -f (Fmt ($bMin + $cMin))) 'Yellow'
     Say ("  1. Part B (about {0}): {1}." -f (Fmt $bMin), ($b -join ', '))
     Say  '     The script watches the screen itself (UI Automation) and at times moves the mouse or presses'
-    Say  '     keys; it says HANDS OFF before each such stretch, and holds back while you are using the PC.'
+    Say  '     keys. Before each such stretch a pop-up at the top of the screen warns you 10 s ahead and then'
+    Say  '     counts down until you can use the PC again; it holds back while you are using the PC.'
     Say  '     Your turns, each marked YOUR TURN: click 10 toasts in S1.4 (15 if its first method fails;'
     Say  '     a real click is what S1.4 measures); watch the progress toast in S1.5; then, together, one'
     Say  '     sleep and wake (the script carries on only once the PC is awake again) and the Hello prompts.'
@@ -143,19 +166,41 @@ if ($Block -eq 'Attended') {
     }
 } else {
     $cMin = $(if ($withSandbox -and $sandboxReady) { 10 * $Runs } else { 0 })
-    Say ("Spike 11, the unattended block: about {0} (at worst {1}); nobody at the PC." -f (Fmt ($stayMin + $cMin)), (Fmt (2 * $stayMin + $cMin))) 'Yellow'
+    # At worst (review m9): per power API, the 10-minute recheck and the wait plus 3 restarts,
+    # and the second API after a failed first one.
+    $worstStay = $(if ($stayMin -gt 0) { 2 * (10 + 4 * $stayMin) } else { 0 })
+    Say ("Spike 11, the unattended block: about {0} (at worst {1}); nobody at the PC." -f (Fmt ($stayMin + $cMin)), (Fmt ($worstStay + $cMin))) 'Yellow'
     if ($withS17) {
-        Say ("  1. The stay-awake wait (about {0}; the sleep timeout in use is {1}). Nobody touches the PC; the" -f (Fmt $stayMin), $timeoutText)
+        Say ("  Sleep after (in use now): {0}. The stay-awake wait is that plus about 5.5 minutes." -f $timeoutText) 'Yellow'
+        Say ("  1. The stay-awake wait (about {0}). Nobody touches the PC; the" -f (Fmt $stayMin))
         Say  '     screen may turn off, and the PC must NOT go to sleep. A touch restarts the wait (up to 3 times).'
-        Say  '     If the first method fails, the wait runs once more with the second one (the "at worst" time).'
+        Say  '     If the first method fails, the wait runs once more with the second one; touches and a'
+        Say  '     program keeping the PC awake add to that (the "at worst" time).'
         Say  '     It does not start while a Windows Sandbox runs or while something else keeps the PC awake.'
         Say  '     Optional, your choice: the wait follows this PC''s "Sleep after" setting, which the scripts only'
         Say  '     read. If you shorten it in Settings yourself before starting, the wait shrinks to match (set it'
         Say  '     back afterwards).' 'Gray'
     }
-    if ($cMin -gt 0) { Say ("  2. Part C, {0} runs (about {1}): a Windows Sandbox window opens and closes by itself." -f $Runs, (Fmt $cMin)) }
+    if ($cMin -gt 0) { Say ("  2. Part C, {0} runs (about {1}): a Windows Sandbox window opens and closes by itself; the PC is kept" -f $Runs, (Fmt $cMin)); Say '     awake meanwhile (a parent-watched request, released at the end).' }
 }
 Say  '  Everything the scripts add is removed at the end of each part. Ctrl+C stops at any time and still cleans up.'
+# Nothing else may hold the PC awake during the stay-awake wait (review N-I2): checked now, while
+# the owner is still here, and again until it clears or the owner types skip.
+if ($Block -eq 'Unattended' -and $withS17) {
+    $ev = Get-PowerEvidence
+    while ((P2o $ev 'system_required') -eq $true) {
+        Write-Host ''
+        Say (Get-KeepAwakeAdvice (P2o $ev 'execution_state')) 'Yellow'
+        $a = Read-Host 'Press Enter to check again, or type skip to run only the Sandbox part'
+        if ($a -match '^\s*skip\s*$') {
+            $stages = @($stages | Where-Object { $_.script -ne 'run-spike.ps1' })
+            Say 'Skipped: the stay-awake wait is left out of this block.' 'Yellow'
+            break
+        }
+        $ev = Get-PowerEvidence
+    }
+    if ((P2o $ev 'system_required') -ne $true) { Say ("Nothing else keeps the PC awake now (execution state {0})." -f (P2o $ev 'execution_state')) 'Green' }
+}
 [void](Read-Host 'Press Enter to start')
 if ($Block -eq 'Unattended') {
     for ($k = 60; $k -gt 0; $k -= 10) { Say "Starting in $k s: leave the PC now (Ctrl+C stops)." 'Yellow'; Start-Sleep -Seconds 10 }
@@ -183,7 +228,8 @@ foreach ($f in 'sandbox-checks.json', 'sandbox-observe.json') {
     $p = Join-Path $Spike "results\$f"
     if ((Test-Path $p) -and (Get-Item $p).LastWriteTime -gt $started) {
         $j = Get-Content -Raw $p | ConvertFrom-Json
-        Say ("  S1.9 {0}: {1}" -f $(if ($f -like '*observe*') { 'watched run' } else { 'runs' }), $(if ($j.pass) { 'PASS' } else { 'FAIL' }))
+        $v = $(if ($j.PSObject.Properties['verdict']) { $j.verdict } elseif ($j.pass) { 'PASS' } else { 'FAIL' })
+        Say ("  S1.9 {0}: {1}" -f $(if ($f -like '*observe*') { 'watched run' } else { 'runs' }), $v)
     }
 }
 foreach ($o in $outcomes) { if ($o.exit -ne 0) { Say "  $($o.stage): exit code $($o.exit)" 'Red' } }
@@ -192,5 +238,17 @@ if ($Block -eq 'Attended' -and ($withS17 -or $withSandbox)) {
     $t0 = $(if ($Task0Repo) { " -Task0Repo `"$Task0Repo`"" } elseif ($DeployDir) { " -DeployDir `"$DeployDir`"" } else { '' })
     Say 'Next, when you can leave the PC for a few hours (that block prints its own time first), type:' 'Yellow'
     Say "  pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Block Unattended$rest$t0" 'Yellow'
+}
+if ($Block -eq 'Unattended' -and $withS17) {
+    $nowT = Get-SleepTimeout
+    if ($null -ne $original -and $null -ne $original.used_s) {
+        if ($original.used_s -ne $nowT.used_s) {
+            Say ("REMINDER: 'Sleep after' is {0} now. When the attended block started it was {1}: set it back to {1} in Settings, System, Power." -f (Fmt-Timeout $nowT.used_s), (Fmt-Timeout $original.used_s)) 'Yellow'
+        } else {
+            Say ("'Sleep after' is {0}, as when the attended block started." -f (Fmt-Timeout $nowT.used_s))
+        }
+    } else {
+        Say ("'Sleep after' is {0} now. If you changed it for this test, set it back to what it was." -f (Fmt-Timeout $nowT.used_s)) 'Yellow'
+    }
 }
 Say "Results: spikes\winshell\results\ (tell the agent the block is done)."

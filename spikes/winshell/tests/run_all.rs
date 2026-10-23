@@ -84,7 +84,7 @@ fn the_unattended_block_is_the_stay_awake_wait_first_then_the_sandbox_runs() {
         ]
     );
     assert_eq!(s[1].0, "run-sandbox.ps1");
-    assert_eq!(s[1].1, vec!["-Runs", "3"]);
+    assert_eq!(s[1].1, vec!["-Runs", "3", "-KeepAwake"]);
 }
 
 #[test]

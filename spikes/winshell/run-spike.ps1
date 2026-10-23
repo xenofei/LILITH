@@ -309,6 +309,9 @@ function Invoke-UiaCalibration {
 #   as "in front".
 # Returns {value, how, prompt}, or $null when the foreground before the call is unknown. Pure;
 # tests/strict-results.ps1 covers it.
+# The process that hosts the Windows Hello prompt on Windows 11 (the Windows Security dialog).
+$script:HelloHosts = @('CredentialUIBroker')
+
 function Get-PromptInFront($Before, $Seen) {
     if ($null -eq $Before -or [int64]$Before['hwnd'] -eq 0) { return $null }
     $cands = @(@($Seen) | Where-Object {
@@ -316,6 +319,8 @@ function Get-PromptInFront($Before, $Seen) {
             $_['pid'] -ne $Before['pid'] -and $_['hwnd'] -ne $Before['hwnd'] -and $_['process'] -ne 'explorer' })
     if ($cands.Count -eq 0) { return [ordered]@{ value = $false; how = 'not in front'; prompt = $null } }
     $first = @($cands | Sort-Object { [double]$_['first_s'] })[0]
+    # Only the known Hello UI host counts as the prompt (review m3); another window is asked about.
+    if ($first['process'] -notin $script:HelloHosts) { return [ordered]@{ value = $null; how = "another window ($($first['process']))"; prompt = $first } }
     if ($first['input_since_start'] -eq $true) { return [ordered]@{ value = $false; how = 'owner-assisted'; prompt = $first } }
     [ordered]@{ value = $true; how = 'in front'; prompt = $first }
 }
@@ -350,7 +355,7 @@ function HelloWatched([string[]]$HelloArgs, [string]$Question) {
         $f = $null
         try { $f = Get-ForegroundNow } catch { }
         if ($null -ne $f -and ([int64]$f.hwnd -eq 0 -or $f.pid -eq 0)) { $empty++ }
-        elseif ($null -ne $f -and -not $seen.Contains("$($f.hwnd)")) {
+        elseif ($null -ne $f -and $f.pid -notin $script:PopupPids -and -not $seen.Contains("$($f.hwnd)")) {
             $f.first_s = [math]::Round($sw.Elapsed.TotalSeconds, 2)
             $f.input_since_start = ([SpikeUi.Win]::LastInputTick() -ne $startInput)
             $seen["$($f.hwnd)"] = $f
@@ -366,6 +371,7 @@ function HelloWatched([string[]]$HelloArgs, [string]$Question) {
         before = $pre; seen = @($seen.Values); empty_readings_skipped = $empty
     }
     if ($null -eq $judged) { $front.value = Ask $Question; $front.how = 'asked'; $front.method = 'owner (the foreground window could not be read)' }
+    elseif ($null -eq $front.value) { $front.value = Ask $Question; $front.method = "owner ($($front.how) came forward, not a known Hello host)" }
     [pscustomobject]@{ Result = $r; Front = $front }
 }
 
@@ -381,7 +387,7 @@ function Invoke-RunBox([string]$Url) {
     while ($null -eq $box -and (Get-Date) -lt $deadline) {
         foreach ($t in Get-UiaTop) {
             try {
-                if ($before.ContainsKey([int64]$t.Current.NativeWindowHandle)) { continue }
+                if (Test-WasShown $before ([int64]$t.Current.NativeWindowHandle)) { continue }
                 if ($t.Current.ClassName -ne '#32770' -or (Get-ProcName $t.Current.ProcessId) -ne 'explorer') { continue }
                 $edit = $t.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $editCond)
                 if ($null -ne $edit) { $box = [pscustomobject]@{ Top = $t; Edit = $edit }; break }
@@ -653,8 +659,9 @@ function Check-S12p {
     $banner = Get-BannerSeconds
     $wait = [math]::Max(20, $banner + 15)
     Say "Two toasts follow, one at a time; let each one slide away by itself (about $banner s)."
-    Show-HandsOff 'opens and closes the notification centre (Win+N, Esc)'
     $forms = [ordered]@{}
+    $handsOff = Start-HandsOff 'shows two toasts and opens and closes the notification centre (Win+N, Esc)' (2 * ($wait + 12))
+    try {
     foreach ($form in 'plain', 'toast_clsid') {
         if ($form -eq 'toast_clsid') { Write-Shortcut -WithToastClsid } else { Write-Shortcut }
         $tag = "persist-$form"
@@ -676,6 +683,7 @@ function Check-S12p {
         }
         Save-Partial 'S1.2p' ([ordered]@{ banner_seconds = $banner; forms = $forms })
     }
+    } finally { Stop-HandsOff $handsOff }
     # Its two toasts would otherwise wait in the notification centre while S1.3 asks for clicks
     # there (rerun review M2).
     $cleared = $true
@@ -705,6 +713,10 @@ function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithBu
         $nonce = New-Nonce
         $toastArgs = @('--tag', $Tag, '--launch', $ConfirmUrl, '--title', 'LILITH spike', '--body', "$Body #$nonce")
         if ($WithButton) { $toastArgs += @('--button', $ConfirmUrl) }
+        # Hands off from before the post: the banner lasts only a few seconds (owner direction:
+        # the pop-up warns 10 s ahead).
+        $handsOff = $null
+        if ($Click -ne 'owner') { $handsOff = Start-HandsOff "clicks a toast itself ($Name, the mouse moves)" 20 }
         $before = Get-UiaSnapshot
         $r = Post-Toast "$Name-$post" $toastArgs
         $attempt = [ordered]@{ post = $post; posted = (P $r 'posted'); shortcut = $script:ShortcutForm; found = $null; clicks = @(); clicked_by = $null }
@@ -717,17 +729,17 @@ function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithBu
                 if ($script:Uia.proven) { $mode = 'none' }
                 else { $mode = 'owner'; $attempt.fallback = 'UIA has not found a toast in this run: the owner clicks' }
             } else {
-                $top = [int64]$w.Hit.TopInfo.hwnd
                 $el = $w.Hit.Element
+                # This toast's own names (review N-I3): anything else in the scope stops the action.
+                $allowed = @('LILITH spike', 'LILITH Spike', 'Open')
                 if ($Target -eq 'button') {
-                    # Only this toast's own "Open" button (automation review I2).
-                    $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' -and -not (Test-DeniedButton $n $a) }
-                    if ($null -ne $b) { $el = $b.Button; $attempt.toast_root = Get-ElementInfo $b.Root } else { $attempt.button_missing = $true }
+                    $b = Find-ToastButton $w.Hit "#$nonce" { param($n, $a) $n -eq 'Open' } $allowed @()
+                    if ($b.Ok) { $el = $b.Button; $attempt.button_depth = $b.Depth } else { $attempt.button_missing = $true; $attempt.button_why = $b.Why }
                 }
                 $ways = $(if ($mode -eq 'synthetic') { @('mouse') } else { @('invoke', 'mouse') })
                 foreach ($way in $ways) {
                     if ($Target -eq 'button' -and $attempt.Contains('button_missing')) { break }
-                    $c = $(if ($way -eq 'invoke') { Invoke-UiaElement $el $top "#$nonce" } else { Click-ElementCentre $el $w.Hit.TopInfo })
+                    $c = $(if ($way -eq 'invoke') { if ($Target -eq 'button') { Invoke-UiaButton $el } else { Invoke-UiaElement $w.Hit "#$nonce" $allowed @() } } else { Click-ElementCentre $el $w.Hit.TopInfo })
                     $attempt.clicks += $c
                     if ($c.ok) { $result = & $Await $n $ctx 6 }
                     if ($null -ne $result) { $attempt.clicked_by = $c.mode; break }
@@ -737,6 +749,7 @@ function Click-Trial([string]$Name, [string]$Tag, [string]$Body, [switch]$WithBu
                 }
             }
         }
+        Stop-HandsOff $handsOff
         if ($mode -eq 'owner') {
             Say $Instruction
             $result = & $Await $n $ctx 60
@@ -766,7 +779,6 @@ function Get-S13Verdict($Trials) {
 
 function Check-S13 {
     Step 'S1.3 protocol activation: the raw command line'
-    Show-HandsOff 'clicks six toasts and types a link into the Run box (the mouse moves)'
     if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -WithToastClsid }
     $expected = "`"$App`" `"$ConfirmUrl`""
     $trials = @()
@@ -799,7 +811,8 @@ function Check-S13 {
         $url = "lilspike:open/$b64$suffix"
         Stop-SpikeProcesses
         $n = @(Get-Events).Count
-        $box = Invoke-RunBox $url
+        $handsOff = Start-HandsOff 'opens the Run box and types a link into it (Win+R)' 15
+        try { $box = Invoke-RunBox $url } finally { Stop-HandsOff $handsOff }
         $ev = $null
         if ($box.ok) { $ev = Wait-SpikeEvent 'start' $n 20 }
         $cmd = P $ev 'cmdline'
@@ -825,7 +838,8 @@ function Ensure-BlockerFront($Blocker, $Check) {
     $hwnd = [int64](P $Check 'hwnd')
     $synthetic = $null
     if ($hwnd -ne 0 -and (Initialize-SpikeUi)) {
-        $synthetic = Click-WindowVisible $hwnd
+        $handsOff = Start-HandsOff 'clicks the blocker window to the front' 5
+        try { $synthetic = Click-WindowVisible $hwnd } finally { Stop-HandsOff $handsOff }
         $deadline = (Get-Date).AddSeconds(3)
         while ($synthetic.ok -and (Get-Date) -lt $deadline) {
             $fg = $null
@@ -939,7 +953,6 @@ function Get-S14Verdict($WithA, $Fallback, $NoA) {
 function Check-S14 {
     Step 'S1.4 foreground: a toast click hands off to the running instance'
     if ($script:ShortcutForm -ne 'toast_clsid') { Write-Shortcut -WithToastClsid }
-    Show-HandsOff 'clicks the blocker window to the front before each toast (the mouse moves)'
     Say 'YOUR TURN: each trial opens two small windows (A, then a "winshell blocker" that the script clicks to the front). When a toast appears, click its text yourself: S1.4 measures what a real click allows. Keep your hand off the mouse until the toast is there.' 'Yellow'
     $withA = @(); $fallback = @(); $noA = @(); $synthetic = @()
     $partial = { Save-Partial 'S1.4' ([ordered]@{ shortcut = $script:ShortcutForm; with_a = $withA; with_a_fallback = $fallback; no_a = $noA; with_a_synthetic = $synthetic }) }
@@ -956,12 +969,12 @@ function Check-S14 {
     $verdict = Get-S14Verdict $withA $fallback $noA
     # Recorded, not the bar: the same with-A trial clicked by a synthesized mouse click, to show
     # whether a test runner could stand in for the real click (Task 30).
-    Show-HandsOff 'clicks the toasts itself in 5 recorded trials (the mouse moves)'
+    Say 'Next: 5 recorded trials in which the script clicks the toasts itself (a pop-up warns before each).' 'Yellow'
     for ($i = 1; $i -le 5; $i++) { $synthetic += Trial-WithA $i 'basic' 'synthetic'; & $partial }
     Set-Check 'S1.4' $verdict ([ordered]@{
         invalid_trials = $invalid; shortcut = $script:ShortcutForm; click_for_the_bar = 'owner (a real click)'
         with_a = $withA; with_a_fallback = $fallback; no_a = $noA
-        with_a_synthetic = [ordered]@{ recorded_only = $true; passes = @($synthetic | Where-Object { $_.pass }).Count; trials = $synthetic }
+        with_a_synthetic = [ordered]@{ recorded_only = $true; passes = @($synthetic | Where-Object { $_.pass -and $_.click_method -eq 'synthetic-mouse' }).Count; owner_clicked = @($synthetic | Where-Object { $_.click_method -eq 'owner' }).Count; trials = $synthetic }
     })
 }
 
@@ -983,6 +996,11 @@ function Get-S15Verdict([bool]$Pass, $SecondPop) {
         if ($Pass) { return 'PASS (UIA saw 1 popup; the owner saw no second pop)' }
         if ((P $SecondPop 'value') -eq $false) { return 'FAIL (UIA saw 1 popup; the owner saw a second pop, for example an in-place re-animation)' }
     }
+    # Zero popups seen: the owner's answer decided, and the verdict says so (review m1).
+    if ($m.StartsWith('owner (UIA did not see')) {
+        if ($Pass) { return 'PASS (owner: UIA did not see the progress toast)' }
+        if ((P $SecondPop 'value') -eq $false) { return 'FAIL (owner: UIA did not see the progress toast; the owner saw a second pop)' }
+    }
     $(if ($Pass) { 'PASS' } else { 'FAIL' })
 }
 
@@ -992,7 +1010,6 @@ function Get-S15Verdict([bool]$Pass, $SecondPop) {
 # itself (History). Every toast carries a nonce, the progress toast included.
 function Check-S15 {
     Step 'S1.5 progress toasts (detected)'
-    Show-HandsOff 'opens the notification centre and closes one toast there (the mouse may move)'
     [void](Tool history-clear)
     $n = New-Nonce
     $before = Get-UiaSnapshot
@@ -1004,10 +1021,14 @@ function Check-S15 {
     $noRepop = Resolve-SecondPop $pops { Ask 'Did the progress toast pop only once (no second slide-in while it updated)?' }
     $noRepop.watch = $w.Record
 
-    $dismiss = Dismiss-InNotificationCentre "#$n"
+    $handsOff = Start-HandsOff 'opens the notification centre and closes the progress toast there (the mouse may move)' 20
+    try {
+        $dismiss = Dismiss-InNotificationCentre "#$n" @('Spike job running', 'LILITH Spike', 'LILITH spike') @('^sampling$', '^\d+ ?%$', '^\d+(\.\d+)?$')
+    } finally { Stop-HandsOff $handsOff }
     $gone = $false
     for ($k = 0; $k -lt 10 -and -not $gone; $k++) { Start-Sleep -Milliseconds 500; $gone = (P (Tool history --tag $ProgressTag) 'has_tag') -eq $false }
-    $dismissedBy = 'uia'
+    # 'uia' only when UIA pressed the toast's own button (review m4).
+    $dismissedBy = $(if ($dismiss.ok) { 'uia' } else { 'gone (not by the script)' })
     if (-not $gone) {
         $dismissedBy = 'owner (detected by History)'
         Say 'YOUR TURN: open the notification centre (Win+N) and close "Spike job running" with its own X (not "Clear all"). The script carries on by itself once it is gone (up to 3 minutes).' 'Yellow'
@@ -1033,7 +1054,8 @@ function Check-S15 {
     $q = $wq.Toast
     $quietPopped = Resolve-Popped $wq.Watch 'Did the quiet toast pop up (slide in)?' -Trust:$controlSeen
     $qh = Tool history --tag 's15-quiet'
-    $quietCentre = Test-InNotificationCentre "#$nq"
+    $handsOff = Start-HandsOff 'opens and closes the notification centre (Win+N, Esc)' 12
+    try { $quietCentre = Test-InNotificationCentre "#$nq" } finally { Stop-HandsOff $handsOff }
     $inCentre = (P $qh 'has_tag') -eq $true
 
     $pass = [bool]((P $p 'posted') -and (P $p 'all_succeeded') -and $noRepop.value -and (P $u 'result') -eq 'NotificationNotFound' -and
@@ -1171,13 +1193,32 @@ function Get-SandboxRunning {
     @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^WindowsSandbox' } | ForEach-Object { $_.Name } | Sort-Object -Unique)
 }
 
-# The no-input wait while the request is held (automation review I5, M11):
+# Why a finished stay-awake wait proves nothing about the spike's request, or $null when it does
+# (review N-I2). $Pre is the reading just before the request; $Held the readings while it was
+# held; $After the readings after it was released. Pure; tested.
+# - something held ES_SYSTEM_REQUIRED before the request: another requester;
+# - a reading while held did not show it: the execution state does not reflect the spike's own
+#   request, so the "before" and "after" readings prove nothing either (the self-check);
+# - it was still set after the release: another requester held the PC awake at the end.
+# A requester that came and went entirely inside the hold can't be seen without elevation.
+function Get-StayNotDecisive($Pre, $Held, $After) {
+    if ((P $Pre 'system_required') -eq $true) { return "another requester held the PC awake before the request (execution state $(P $Pre 'execution_state'))" }
+    $held = @(@($Held) | Where-Object { $null -ne $_ })
+    if (@($held | Where-Object { (P $_ 'system_required') -ne $true }).Count -gt 0) { return 'the execution state did not show the spike''s own request while it was held (self-check false)' }
+    $still = @(@($After) | Where-Object { (P $_ 'system_required') -eq $true })
+    if ($still.Count -gt 0) { return "another requester still held the PC awake after the release (execution state $(P $still[0] 'execution_state'))" }
+    $null
+}
+
+# The no-input wait while the request is held (automation review I5, M11; fix round 2 N-I2):
 # - it refuses to start while a Windows Sandbox runs, or while something else already holds the
-#   PC awake (ES_SYSTEM_REQUIRED in the execution state before the request is set; it rechecks
-#   every 30 s for 10 minutes first): either would make a pass say nothing about the request;
-# - the execution state and the idle timer are recorded before and every 60 s during the hold
-#   (read only, CallNtPowerInformation), as evidence and as a self-check of the request;
+#   PC awake (ES_SYSTEM_REQUIRED before the request is set; run-all's unattended block checks
+#   that with the owner before Enter, and this rechecks every 30 s for 10 minutes): either
+#   would make a pass say nothing about the request;
+# - the execution state and the idle timer are recorded before, every 60 s during, and twice
+#   after the hold (read only, CallNtPowerInformation): Get-StayNotDecisive judges them;
 # - input during the wait restarts it from that input (GetLastInputInfo), up to 3 times;
+# - a hands-off pop-up warns 10 s ahead and counts down (owner direction 2026-10-23);
 # - the core watches this script's process (--parent-pid) and releases the request if it goes.
 function Power-StayAwake([string]$Api, $Timeout) {
     if ($null -eq $Timeout.used_s) { return [ordered]@{ api = $Api; result = 'skipped'; why = 'timeout unknown (powercfg output not parsed)' } }
@@ -1188,7 +1229,8 @@ function Power-StayAwake([string]$Api, $Timeout) {
     $pre = Get-PowerEvidence
     [void]$evidence.Add([ordered]@{ phase = 'before'; reading = $pre })
     if ((P $pre 'system_required') -eq $true) {
-        Say ("Something on this PC already keeps it awake (execution state {0}), so the wait could show nothing. The script checks again every 30 s for 10 minutes; programs that play video, download, or have a keep-awake option are the usual cause." -f (P $pre 'execution_state')) 'Yellow'
+        Say (Get-KeepAwakeAdvice (P $pre 'execution_state')) 'Yellow'
+        Say 'The script checks again every 30 s for 10 minutes.' 'Yellow'
         for ($k = 0; $k -lt 20 -and (P $pre 'system_required') -eq $true; $k++) {
             Start-Sleep -Seconds 30
             $pre = Get-PowerEvidence
@@ -1200,32 +1242,46 @@ function Power-StayAwake([string]$Api, $Timeout) {
     }
     $needS = [int]$Timeout.used_s + 330
     $maxRestarts = 3
+    $handsOff = Start-HandsOff 'checks that the PC stays awake with nobody using it; a touch restarts the wait' $needS
     Say ("Stay-awake check: nobody touches the PC for {0} min from now (until about {1:HH:mm}). The display may turn off; that is fine. A touch restarts the wait (up to {2} times)." -f [math]::Ceiling($needS / 60), (Get-Date).AddSeconds($needS), $maxRestarts) 'Yellow'
     $c = Start-Core "s17-$Api-stayawake" @('power', '--api', $Api, '--max-secs', "$($needS * ($maxRestarts + 1) + 900)", '--parent-pid', "$PID")
-    [void](Wait-PowerEvent $c 'set' 20)
-    $t0 = Get-Date
-    $quietSince = $t0
+    $doc = $null
     $restarts = @()
-    $lastEvidence = Get-Date
     $why = $null
-    while (((Get-Date) - $quietSince).TotalSeconds -lt $needS) {
-        Start-Sleep -Seconds 30
-        $now = Get-Date
-        $idle = Get-IdleSeconds
-        if (Test-InputDuring (($now - $quietSince).TotalSeconds) $idle) {
-            $quietSince = $now.AddSeconds(-[double]$idle)
-            $restarts += $quietSince.ToUniversalTime().ToString('o')
-            Say ("Input at {0:HH:mm:ss}: the stay-awake wait starts again from there." -f $quietSince) 'Yellow'
-            if ($restarts.Count -gt $maxRestarts) { $why = "input during the wait more than $maxRestarts times"; break }
+    $t0 = Get-Date
+    try {
+        [void](Wait-PowerEvent $c 'set' 20)
+        $t0 = Get-Date
+        $quietSince = $t0
+        $lastEvidence = Get-Date
+        while (((Get-Date) - $quietSince).TotalSeconds -lt $needS) {
+            Start-Sleep -Seconds 30
+            $now = Get-Date
+            $idle = Get-IdleSeconds
+            if (Test-InputDuring (($now - $quietSince).TotalSeconds) $idle) {
+                $quietSince = $now.AddSeconds(-[double]$idle)
+                $restarts += $quietSince.ToUniversalTime().ToString('o')
+                Say ("Input at {0:HH:mm:ss}: the stay-awake wait starts again from there." -f $quietSince) 'Yellow'
+                if ($restarts.Count -gt $maxRestarts) { $why = "input during the wait more than $maxRestarts times"; break }
+                Stop-HandsOff $handsOff
+                $handsOff = Start-HandsOff 'checks that the PC stays awake with nobody using it (restarted after a touch)' $needS -NoWarnWait
+            }
+            if (($now - $lastEvidence).TotalSeconds -ge 60) { [void]$evidence.Add([ordered]@{ phase = 'held'; reading = (Get-PowerEvidence) }); $lastEvidence = $now }
+            $d = Read-CoreNow $c
+            if ($null -ne $d -and @(P $d 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' }).Count -gt 0) { break }
         }
-        if (($now - $lastEvidence).TotalSeconds -ge 60) { [void]$evidence.Add([ordered]@{ phase = 'held'; reading = (Get-PowerEvidence) }); $lastEvidence = $now }
-        $doc = Read-CoreNow $c
-        if ($null -ne $doc -and @(P $doc 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' }).Count -gt 0) { break }
+    } finally {
+        $doc = Stop-Power $c
+        Stop-HandsOff $handsOff
     }
     $elapsed = ((Get-Date) - $t0).TotalSeconds
-    $quietS = ((Get-Date) - $quietSince).TotalSeconds
-    $doc = Stop-Power $c
     $slept = @(P $doc 'events' | Where-Object { ($_.kind -eq 'power_broadcast' -and $_.pbt -eq 'PBT_APMSUSPEND') -or $_.kind -eq 'clock_jump' })
+    # After the release: the execution state again at once and 30 s later (another requester
+    # still holding it shows here).
+    $after = @((Get-PowerEvidence))
+    Start-Sleep -Seconds 30
+    $after += @((Get-PowerEvidence))
+    foreach ($a in $after) { [void]$evidence.Add([ordered]@{ phase = 'after'; reading = $a }) }
     # An independent witness: the System log's Kernel-Power sleep, resume and Modern Standby
     # entries since the request was set (42 sleep, 107 resume, 506/507 standby enter/exit) (M6).
     $kernel = @()
@@ -1236,17 +1292,20 @@ function Power-StayAwake([string]$Api, $Timeout) {
         if ($_.Exception.Message -notmatch 'No events were found') { $kernel = @([ordered]@{ error = $_.Exception.Message }) }
     }
     $kernelSlept = @($kernel | Where-Object { (P $_ 'id') -in 42, 506 })
-    $held = @($evidence | Where-Object { $_['phase'] -eq 'held' })
+    $held = @($evidence | Where-Object { $_['phase'] -eq 'held' } | ForEach-Object { $_['reading'] })
+    $notDecisive = Get-StayNotDecisive $pre $held $after
     $r = [ordered]@{
-        api = $Api; timeout_s = $Timeout.used_s; needed_quiet_s = $needS; waited_s = [int]$elapsed; quiet_s_at_end = [int]$quietS
+        api = $Api; timeout_s = $Timeout.used_s; needed_quiet_s = $needS; waited_s = [int]$elapsed
         restarts = $restarts; slept_events = $slept; kernel_power_events = $kernel
         idle_method = 'GetLastInputInfo every 30 s'
         evidence = $evidence.ToArray()
-        self_check_system_required_while_held = $(if ($held.Count -gt 0) { @($held | Where-Object { $_['reading'] -and $_['reading']['system_required'] -eq $true }).Count -eq $held.Count } else { $null })
+        self_check_system_required_while_held = $(if ($held.Count -gt 0) { @($held | Where-Object { (P $_ 'system_required') -ne $true }).Count -eq 0 } else { $null })
         pass = ($slept.Count -eq 0 -and $kernelSlept.Count -eq 0 -and @($kernel | Where-Object { P $_ 'error' }).Count -eq 0)
         core = $doc
     }
-    if ($null -ne $why -and $slept.Count -eq 0 -and $kernelSlept.Count -eq 0) { $r.result = 'invalid'; $r.why = $why; $r.pass = $null }
+    $sleptAtAll = $slept.Count -gt 0 -or $kernelSlept.Count -gt 0
+    if ($null -ne $why -and -not $sleptAtAll) { $r.result = 'invalid'; $r.why = $why; $r.pass = $null }
+    elseif ($null -ne $notDecisive -and -not $sleptAtAll) { $r.result = 'not decisive'; $r.why = $notDecisive; $r.pass = $null }
     $r
 }
 
@@ -1357,7 +1416,7 @@ function Check-S18 {
     Say "(a) supported: $(P $a 'supported'); (d) TPM: $(P $d 'tpm_version'); DPAPI round trip: $(P $dp 'round_trip')"
     $b = $null; $bFront = $null; $c1 = $null; $c2 = $null
     if (P $a 'supported') {
-        Say 'YOUR TURN, Windows Hello: complete each prompt (PIN, finger or face). First one prompt to create the spike key; the script checks by itself whether the prompt comes in front.' 'Yellow'
+        Say 'YOUR TURN, Windows Hello: keep your hands off the mouse and keyboard until each prompt shows, then complete it (PIN, finger or face). First one prompt to create the spike key; the script checks by itself whether the prompt comes in front.' 'Yellow'
         $bw = HelloWatched @('create') 'Was the Hello prompt in front of the terminal?'
         $b = $bw.Result; $bFront = $bw.Front
         Say 'Next: up to 10 prompts, 5 and then 5 more from a second process. Complete each one.' 'Yellow'
@@ -1511,6 +1570,7 @@ try {
 }
 finally {
     Step 'Cleanup'
+    Stop-AllPopups
     $Report.cleanup = Invoke-Cleanup -Final
     $stage.cleanup = $Report.cleanup
     $stage.uia_hosts = $script:Uia.hosts

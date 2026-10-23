@@ -25,6 +25,14 @@ it is injected, that the window under the point belongs to the expected process 
 Every UIA action on a toast is scoped to that toast: the nearest ancestor of its nonce text that
 holds no other spike toast's nonce. Nothing whose Name or AutomationId says "clear" or "all" is
 ever pressed (Test-DeniedButton).
+
+Fix round 2: the scope never goes past the toast's own notification list item, and every Name in
+it must be one of that toast's own (Test-ScopeNames, Select-ToastTarget); each click try re-reads
+the target's rectangle (stable over 100 ms, on screen), requires UIA's ElementFromPoint at the point
+to be the target or inside it, and checks that the per-monitor DPI context applied; Win is always
+released after a partial key injection; hands-off pop-ups (popup.ps1) warn 10 s ahead and count
+down. Known limit: owner input within 400 ms after one of the script's own injections is taken for
+the script's own (GetLastInputInfo keeps only the latest input time).
 #>
 
 $script:SpikeUiSource = @'
@@ -64,10 +72,34 @@ namespace SpikeUi {
         static uint lastInject;
         static bool injected;
 
-        // Physical pixels for this thread, as UI Automation reports rectangles.
-        public static void PerMonitorAware() {
-            try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { }
+        [DllImport("user32.dll")] static extern IntPtr GetThreadDpiAwarenessContext();
+        [DllImport("user32.dll")] static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+
+        // Physical pixels for this thread, as UI Automation reports rectangles. True only when the
+        // thread's context is per-monitor-aware v2 afterwards (the return value is checked).
+        public static bool PerMonitorAware() {
+            try {
+                SetThreadDpiAwarenessContext(new IntPtr(-4));
+                return AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), new IntPtr(-4));
+            } catch (EntryPointNotFoundException) { return false; }
         }
+
+        // Visible and not cloaked (a closed notification centre may stay listed, cloaked).
+        public static bool Shown(long hwnd) {
+            IntPtr h = new IntPtr(hwnd);
+            if (!IsWindowVisible(h)) return false;
+            int cloaked = 0;
+            if (DwmGetWindowAttribute(h, 14, out cloaked, 4) != 0) return true;   // DWMWA_CLOAKED
+            return cloaked == 0;
+        }
+
+        // The virtual desktop in physical pixels: {x, y, width, height}.
+        public static int[] VirtualDesk() { PerMonitorAware(); return new int[] { GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79) }; }
+
+        // Where the cursor was right after the last click's SendInput, before it was put back.
+        public static int LandedX, LandedY;
 
         public static uint LastInputTick() {
             LASTINPUTINFO i = new LASTINPUTINFO(); i.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
@@ -125,7 +157,7 @@ namespace SpikeUi {
         // injected; -2 when the owner gave input in the last 2 s; -1 when the window under the
         // point is not the expected process and class; -3 when SendInput injected fewer than 2.
         public static int ClickAt(int x, int y, long wantPid, string wantClass) {
-            PerMonitorAware();
+            if (!PerMonitorAware()) return -4;
             if (OwnerIdleMs() < 2000) return -2;
             long[] r = RootAt(x, y);
             if (r[0] == 0 || r[1] != wantPid || ClassOf(r[0]) != wantClass) return -1;
@@ -139,6 +171,7 @@ namespace SpikeUi {
             i[1].type = 0; i[1].u.mi.dx = nx; i[1].u.mi.dy = ny; i[1].u.mi.dwFlags = at | 0x0004;   // LEFTUP
             uint n = SendInput(2, i, Marshal.SizeOf(typeof(INPUT)));
             MarkInjected();
+            POINT landed; GetPhysicalCursorPos(out landed); LandedX = landed.X; LandedY = landed.Y;
             Thread.Sleep(150);
             SetPhysicalCursorPos(old.X, old.Y);
             return n == 2 ? 2 : -3;
@@ -158,10 +191,31 @@ namespace SpikeUi {
         public static void MoveBack(int x, int y) { PerMonitorAware(); SetPhysicalCursorPos(x, y); }
 
         // Presses the keys in order, then releases them in reverse (a chord such as Win+N), in one
-        // SendInput call. Returns the number injected, or -2 when the owner gave input in the
-        // last 2 s.
+        // SendInput call. Returns the number injected when all were, -2 when the owner gave input
+        // in the last 2 s, -3 when only some were: then every key-up is sent again, in a finally,
+        // so that Win is never left held down.
         public static int Keys(ushort[] vks) {
             if (OwnerIdleMs() < 2000) return -2;
+            uint sent = 0;
+            try {
+                sent = KeysOnce(vks);
+            } finally {
+                if (sent != (uint)(vks.Length * 2)) KeyUps(vks);
+            }
+            return sent == (uint)(vks.Length * 2) ? (int)sent : -3;
+        }
+
+        static void KeyUps(ushort[] vks) {
+            INPUT[] u = new INPUT[vks.Length];
+            for (int k = 0; k < vks.Length; k++) {
+                ushort vk = vks[vks.Length - 1 - k];
+                u[k].type = 1; u[k].u.ki.wVk = vk;
+                u[k].u.ki.dwFlags = 0x0002u | (vk == 0x5B ? 0x0001u : 0u);
+            }
+            SendInput((uint)u.Length, u, Marshal.SizeOf(typeof(INPUT)));
+        }
+
+        static uint KeysOnce(ushort[] vks) {
             INPUT[] i = new INPUT[vks.Length * 2];
             for (int k = 0; k < vks.Length; k++) {
                 i[k].type = 1; i[k].u.ki.wVk = vks[k];
@@ -174,7 +228,7 @@ namespace SpikeUi {
             }
             uint n = SendInput((uint)i.Length, i, Marshal.SizeOf(typeof(INPUT)));
             MarkInjected();
-            return (int)n;
+            return n;
         }
 
         // Moves and sizes a window (physical pixels) and puts it at the top of the z-order.
@@ -208,11 +262,17 @@ namespace SpikeUi {
 }
 '@
 
+
 # ready: the assemblies and the helper type loaded; proven: a toast was found this run, so a
 # toast not found in clean readings is a toast that did not show; hosts: where toasts were found.
 $script:Uia = [ordered]@{ ready = $false; error = $null; proven = $false; hosts = @() }
 $script:ProcNames = @{}
 $script:UiaSearchFailed = $false
+# The hands-off pop-ups this script started (Start-HandsOff): their processes, so that they are
+# ended only through their own Process objects, and their pids, which every window search and
+# foreground check skips.
+$script:Popups = @()
+$script:PopupPids = @()
 
 function Initialize-SpikeUi {
     if ($script:Uia.ready) { return $true }
@@ -220,7 +280,7 @@ function Initialize-SpikeUi {
     try {
         Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
         if (-not ('SpikeUi.Win' -as [type])) { Add-Type -TypeDefinition $script:SpikeUiSource }
-        [SpikeUi.Win]::PerMonitorAware()
+        $script:Uia.per_monitor_dpi = [SpikeUi.Win]::PerMonitorAware()
         $script:Uia.ready = $true
     } catch {
         $script:Uia.error = $_.Exception.Message
@@ -228,9 +288,55 @@ function Initialize-SpikeUi {
     $script:Uia.ready
 }
 
-# The one-line warning before each stretch of synthesized input.
+# The one-line warning before each stretch of synthesized input (Start-HandsOff adds the pop-up).
 function Show-HandsOff([string]$What) {
     Write-Host "HANDS OFF: the script $What now. Ctrl+C in this terminal stops it." -ForegroundColor Yellow
+}
+
+# Owner direction 2026-10-23: before anything that needs hands off the keyboard and mouse, a
+# topmost pop-up warns at least 10 s ahead, then counts down until the PC may be used again, and
+# says when it's done. The pop-up (popup.ps1, in Windows PowerShell 5.1 for WinForms) is started
+# detached, with no console, through winshell-tool spawn. It never takes the focus (WS_EX_
+# NOACTIVATE, ShowWithoutActivation), is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT, so
+# WindowFromPoint and UIA's FromPoint look through it), sits at the top centre of the primary
+# screen, away from the toasts at the bottom right, and its pid is skipped by every window
+# search and foreground check here. Without winshell-tool (inside the Sandbox) there is no pop-up.
+# -NoWarnWait shows the warning without waiting for it (a restarted stay-awake wait).
+function Start-HandsOff([string]$What, [int]$Seconds, [switch]$NoWarnWait) {
+    Show-HandsOff $What
+    $h = [pscustomobject]@{ Process = $null; StateFile = $null; Started = (Get-Date) }
+    $tool = Get-Variable -Name ToolExe -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $popup = Join-Path $PSScriptRoot 'popup.ps1'
+    if ($tool -and (Test-Path -LiteralPath $tool) -and (Test-Path -LiteralPath $popup)) {
+        try {
+            $h.StateFile = Join-Path ([IO.Path]::GetTempPath()) ('winshell-popup-' + [guid]::NewGuid().ToString('N') + '.done')
+            $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $out = & $tool spawn '--' $ps -NoProfile -ExecutionPolicy Bypass -File $popup -What $What -WarnSec 10 -RunSec $Seconds -StateFile $h.StateFile -ParentPid $PID
+            $r = ($out | Out-String) | ConvertFrom-Json
+            if ($r.PSObject.Properties['pid']) {
+                $p = Get-Process -Id ([int]$r.pid) -ErrorAction SilentlyContinue
+                if ($p -and $p.Path -and $p.Path -eq $ps) {
+                    $h.Process = $p
+                    $script:Popups = @($script:Popups) + @($p)
+                    $script:PopupPids = @($script:PopupPids) + @([int]$p.Id)
+                }
+            }
+        } catch { }
+    }
+    if (-not $NoWarnWait) { Start-Sleep -Seconds 10 }
+    $h
+}
+
+# The stretch is over: the pop-up says "done" for 5 s and closes itself.
+function Stop-HandsOff($Handle) {
+    if ($null -eq $Handle -or -not $Handle.StateFile) { return }
+    try { Set-Content -LiteralPath $Handle.StateFile -Value 'done' } catch { }
+}
+
+# Ends every pop-up this script started that is still open (its own Process objects only).
+function Stop-AllPopups {
+    foreach ($p in @($script:Popups)) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+    $script:Popups = @()
 }
 
 function Get-ProcName([int]$ProcessId) {
@@ -242,10 +348,11 @@ function Get-ProcName([int]$ProcessId) {
     $script:ProcNames[$ProcessId]
 }
 
-# The visible top-level windows, in z-order.
+# The visible top-level windows, in z-order, without this script's own pop-ups.
 function Get-UiaTop {
     $root = [System.Windows.Automation.AutomationElement]::RootElement
-    @($root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition))
+    @($root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
+        Where-Object { $_.Current.ProcessId -notin $script:PopupPids })
 }
 
 function Get-TopInfo($Top) {
@@ -261,13 +368,16 @@ function Get-ElementInfo($Element) {
     } catch { [ordered]@{ error = $_.Exception.Message } }
 }
 
-# The top-level windows' handles now: what a later search treats as "already there".
+# The top-level windows now: handle -> whether it was shown (visible and not cloaked). A window
+# that was listed but cloaked (a closed notification centre) counts as new once it shows.
 function Get-UiaSnapshot {
     $s = @{}
     if (-not (Initialize-SpikeUi)) { return $s }
-    foreach ($t in Get-UiaTop) { try { $s[[int64]$t.Current.NativeWindowHandle] = $true } catch { } }
+    foreach ($t in Get-UiaTop) { try { $h = [int64]$t.Current.NativeWindowHandle; $s[$h] = [SpikeUi.Win]::Shown($h) } catch { } }
     $s
 }
+
+function Test-WasShown($Before, [int64]$Hwnd) { $Before.ContainsKey($Hwnd) -and $Before[$Hwnd] -eq $true }
 
 function Add-UiaHost($Info) {
     foreach ($h in $script:Uia.hosts) { if ($h.process -eq $Info.process -and $h.class -eq $Info.class) { return } }
@@ -279,24 +389,26 @@ function Test-KnownHost($Info) {
     $false
 }
 
+# An element whose Name can't be read makes the search unknown, not "absent" (review m13).
 function Find-NeedleUnder($Top, [string]$Needle) {
     if ("$($Top.Current.Name)".Contains($Needle)) { return $Top }
     foreach ($e in @($Top.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition))) {
-        try { if ("$($e.Current.Name)".Contains($Needle)) { return $e } } catch { }
+        try { if ("$($e.Current.Name)".Contains($Needle)) { return $e } } catch { $script:UiaSearchFailed = $true }
     }
     $null
 }
 
-# The element whose Name contains $Needle, in a top-level window that is new since $Before or
-# is a host learned earlier; $null when there is none. A window whose search threw sets
-# $script:UiaSearchFailed, so that a poll without a hit counts as unknown, not as absent.
+# The element whose Name contains $Needle, in a shown top-level window that is new since $Before
+# (or was cloaked then) or is a host learned earlier; $null when there is none. A window whose
+# search threw sets $script:UiaSearchFailed, so that a poll without a hit counts as unknown.
 function Find-Needle([string]$Needle, $Before) {
     $script:UiaSearchFailed = $false
     foreach ($t in Get-UiaTop) {
         try {
             $hwnd = [int64]$t.Current.NativeWindowHandle
+            if (-not [SpikeUi.Win]::Shown($hwnd)) { continue }
             $info = $null
-            if ($Before.ContainsKey($hwnd)) {
+            if (Test-WasShown $Before $hwnd) {
                 $info = Get-TopInfo $t
                 if (-not (Test-KnownHost $info)) { continue }
             }
@@ -392,6 +504,24 @@ function Test-OnlyThisToast([string[]]$Names, [string]$Needle, [int]$OpenButtons
     [bool]($ours -and $others -eq 0 -and $OpenButtons -le 1)
 }
 
+# Whether every non-empty Name in a scope is one of this spike toast's own (review N-I3): one
+# that holds its nonce, one of $Allowed (its title, the app name, "Open", ...), or one matching
+# $Patterns (its dismiss or close button, its progress strings). Anything else, such as another
+# app's notification, makes the scope foreign. Returns {ok, unknown} (unknown is a count only, so
+# no other app's text is recorded). Pure; tested.
+function Test-ScopeNames([string[]]$Names, [string]$Needle, [string[]]$Allowed, [string[]]$Patterns) {
+    $unknown = @()
+    foreach ($n in @($Names | Where-Object { $_ })) {
+        if ($n.Contains($Needle)) { if (@([regex]::Matches($n, '#[0-9a-f]{6}') | Where-Object { $_.Value -ne $Needle }).Count -gt 0) { $unknown += $n }; continue }
+        if (@($Allowed | Where-Object { $_ -and $n -eq $_ }).Count -gt 0) { continue }
+        if (@($Patterns | Where-Object { $_ -and $n -match $_ }).Count -gt 0) { continue }
+        $unknown += $n
+    }
+    # The first few unknown names, cut to 40 characters, go into the local (git-ignored) results,
+    # so that the next round can tell Windows' own toast chrome from another app's entry.
+    [ordered]@{ ok = ($unknown.Count -eq 0); unknown = $unknown.Count; unknown_names = @($unknown | Select-Object -First 5 | ForEach-Object { if ($_.Length -gt 40) { $_.Substring(0, 40) } else { $_ } }) }
+}
+
 # Never pressed, whatever else it says: anything about "clear" or "all" (the notification
 # centre's "Clear all" and "Clear all <app> notifications"). Pure; tested.
 function Test-DeniedButton([string]$Name, [string]$AutomationId) {
@@ -409,9 +539,32 @@ function Test-RectInside($Inner, $Outer) {
         ($Inner.X + $Inner.Width) -le ($Outer.X + $Outer.Width + 1) -and ($Inner.Y + $Inner.Height) -le ($Outer.Y + $Outer.Height + 1))
 }
 
+# The level to act on, from the hit upward (review N-I3, m11). $Levels are records
+# {depth, list_item, names, rect, candidates = [{name, automation_id, rect, ...}]}, nearest first.
+# The first level with a candidate that $Accept takes (and that isn't denied) is used, but only
+# when its subtree is this toast's alone (Test-OnlyThisToast and Test-ScopeNames) and the
+# candidate lies inside it; the climb never goes past the nearest notification list item.
+# Returns {ok, depth, candidate} or {ok = $false, why}. Pure; tested with fake levels.
+function Select-ToastTarget($Levels, [string]$Needle, [string[]]$Allowed, [string[]]$Patterns, [scriptblock]$Accept) {
+    foreach ($lv in @($Levels)) {
+        $pick = @(@($lv['candidates']) | Where-Object { $null -ne $_ -and (& $Accept $_['name'] $_['automation_id']) -and -not (Test-DeniedButton $_['name'] $_['automation_id']) }) | Select-Object -First 1
+        if ($null -ne $pick) {
+            $open = @(@($lv['candidates']) | Where-Object { $null -ne $_ -and $_['name'] -eq 'Open' }).Count
+            if (@(@($lv['names']) | Where-Object { $_ -and $_.Contains($Needle) }).Count -eq 0) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'the scope does not hold this toast''s text: nothing pressed' } }
+            if (-not (Test-OnlyThisToast $lv['names'] $Needle $open)) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'the scope holds another spike toast or a second Open: nothing pressed' } }
+            $scope = Test-ScopeNames $lv['names'] $Needle $Allowed $Patterns
+            if (-not $scope.ok) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = "the scope holds $($scope.unknown) name(s) that are not this toast's own: nothing pressed"; unknown_names = $scope.unknown_names } }
+            if ($null -ne $pick['rect'] -and $null -ne $lv['rect'] -and -not (Test-RectInside $pick['rect'] $lv['rect'])) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'the button lies outside the toast: nothing pressed' } }
+            return [ordered]@{ ok = $true; depth = $lv['depth']; candidate = $pick }
+        }
+        if ($lv['list_item'] -eq $true) { return [ordered]@{ ok = $false; depth = $lv['depth']; why = 'no such button inside this toast''s own list item' } }
+    }
+    [ordered]@{ ok = $false; why = 'no such button near this toast' }
+}
+
 function Get-SubtreeNames($Element) {
     @($Element.FindAll([System.Windows.Automation.TreeScope]::Subtree, [System.Windows.Automation.Condition]::TrueCondition) |
-        ForEach-Object { try { $_.Current.Name } catch { } })
+        ForEach-Object { try { $_.Current.Name } catch { '<unreadable>' } })
 }
 
 function Get-Buttons($Element) {
@@ -419,30 +572,40 @@ function Get-Buttons($Element) {
     @($Element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond))
 }
 
-# The toast that carries $Needle: the nearest ancestor of the hit (up to 8 levels, not beyond its
-# top-level window) whose subtree holds a button that $Accept takes, as long as that subtree holds
-# this toast only. Returns {Root, Button, Buttons} or $null (then nothing is pressed).
-function Find-ToastButton($Hit, [string]$Needle, [scriptblock]$Accept) {
+# The level records for Select-ToastTarget, from the hit upward: up to 8 levels, never past the
+# nearest list item or the hit's top-level window. -Invoke makes each level's own element its
+# candidate when it supports InvokePattern; otherwise the candidates are its buttons.
+function Get-ToastLevels($Hit, [switch]$Invoke) {
     $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
     $topHwnd = [int64]$Hit.TopInfo.hwnd
+    $levels = @()
     $e = $Hit.Element
     for ($i = 0; $i -lt 8 -and $null -ne $e; $i++) {
-        $buttons = @(Get-Buttons $e)
-        $pick = @($buttons | Where-Object { & $Accept $_.Current.Name $_.Current.AutomationId }) | Select-Object -First 1
-        if ($null -ne $pick) {
-            $open = @($buttons | Where-Object { $_.Current.Name -eq 'Open' }).Count
-            if (-not (Test-OnlyThisToast (Get-SubtreeNames $e) $Needle $open)) { return $null }
-            if (-not (Test-RectInside $pick.Current.BoundingRectangle $e.Current.BoundingRectangle)) { return $null }
-            return [pscustomobject]@{
-                Root = $e; Button = $pick
-                Buttons = @($buttons | ForEach-Object { [ordered]@{ name = $_.Current.Name; automation_id = $_.Current.AutomationId } })
+        $c = $e.Current
+        $isItem = $c.ControlType -eq [System.Windows.Automation.ControlType]::ListItem
+        $cands = @()
+        if ($Invoke) {
+            $pat = $null
+            if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+                $cands = @([ordered]@{ name = $c.Name; automation_id = $c.AutomationId; rect = $null; element = $e; pattern = $pat })
             }
+        } else {
+            $cands = @(Get-Buttons $e | ForEach-Object { [ordered]@{ name = $_.Current.Name; automation_id = $_.Current.AutomationId; rect = $_.Current.BoundingRectangle; element = $_ } })
         }
-        if ([int64]$e.Current.NativeWindowHandle -eq $topHwnd) { break }
+        $levels += [ordered]@{ depth = $i; list_item = $isItem; names = @(Get-SubtreeNames $e); rect = $c.BoundingRectangle; candidates = $cands }
+        if ($isItem -or [int64]$c.NativeWindowHandle -eq $topHwnd) { break }
         $e = $walker.GetParent($e)
     }
-    $null
+    $levels
 }
+
+# This toast's own button that $Accept takes, or $null (then nothing is pressed); with the why.
+function Find-ToastButton($Hit, [string]$Needle, [scriptblock]$Accept, [string[]]$Allowed, [string[]]$Patterns) {
+    $sel = Select-ToastTarget (Get-ToastLevels $Hit) $Needle $Allowed $Patterns $Accept
+    [pscustomobject]@{ Ok = [bool]$sel.ok; Button = $(if ($sel.ok) { $sel.candidate['element'] } else { $null }); Why = (P2 $sel 'why'); Depth = (P2 $sel 'depth') }
+}
+
+function P2($Obj, [string]$Name) { if ($null -ne $Obj -and $Obj.Contains($Name)) { $Obj[$Name] } else { $null } }
 
 # ---------------------------------------------------------------- actions
 
@@ -458,86 +621,114 @@ function Get-TopAtPoint([int]$X, [int]$Y) {
     [int64]0
 }
 
-# InvokePattern on the element or its nearest ancestor that has one, inside the window $TopHwnd;
-# with $Needle, an ancestor is used only while its subtree holds this toast only.
-function Invoke-UiaElement($Element, [int64]$TopHwnd, [string]$Needle = '') {
+# Whether the element UIA finds at (x, y) (IUIAutomation::ElementFromPoint) is $Target or one of
+# its descendants.
+function Test-PointOnElement([int]$X, [int]$Y, $Target) {
     $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-    $e = $Element
-    try {
-        for ($i = 0; $i -lt 12 -and $null -ne $e; $i++) {
-            if (Test-DeniedButton $e.Current.Name $e.Current.AutomationId) {
-                return [ordered]@{ mode = 'uia-invoke'; ok = $false; why = 'reached an element that says clear or all: nothing invoked' }
-            }
-            if ($Needle -and $i -gt 0 -and -not (Test-OnlyThisToast (Get-SubtreeNames $e) $Needle @(Get-Buttons $e | Where-Object { $_.Current.Name -eq 'Open' }).Count)) {
-                return [ordered]@{ mode = 'uia-invoke'; ok = $false; why = 'the nearest invokable element is shared with another toast: nothing invoked' }
-            }
-            $pat = $null
-            if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
-                $info = Get-ElementInfo $e
-                $pat.Invoke()
-                return [ordered]@{ mode = 'uia-invoke'; ok = $true; invoked = $info; levels_up = $i }
-            }
-            if ([int64]$e.Current.NativeWindowHandle -eq $TopHwnd) { break }
-            $e = $walker.GetParent($e)
-        }
-    } catch {
-        return [ordered]@{ mode = 'uia-invoke'; ok = $false; why = $_.Exception.Message }
+    $e = [System.Windows.Automation.AutomationElement]::FromPoint((New-Object System.Windows.Point($X, $Y)))
+    for ($i = 0; $i -lt 40 -and $null -ne $e; $i++) {
+        if ([System.Windows.Automation.Automation]::Compare($e, $Target)) { return $true }
+        $e = $walker.GetParent($e)
     }
-    [ordered]@{ mode = 'uia-invoke'; ok = $false; why = 'no InvokePattern on the element or its ancestors in its window' }
+    $false
 }
 
-# A synthesized click at (x, y) on the window $Top ({hwnd, pid, class}): UIA must put the point
-# on that window, and ClickAt re-checks the window under the point right before injecting. While
-# the owner is using the PC it waits 2 s and tries again, up to 5 times, then gives up.
-function Invoke-SafeClick([int]$X, [int]$Y, $Top) {
-    for ($try = 1; $try -le 5; $try++) {
-        $at = Get-TopAtPoint $X $Y
-        if ($at -ne [int64]$Top.hwnd) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = "the point ($X, $Y) is on another window ($at), not on $($Top.hwnd)"; point = "$X,$Y" } }
-        $code = [SpikeUi.Win]::ClickAt($X, $Y, [int64]$Top.pid, [string]$Top.class)
-        if ($code -eq 2) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $true; point = "$X,$Y"; tries = $try } }
-        if ($code -eq -1) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'the window under the point changed before the click: nothing clicked'; point = "$X,$Y" } }
-        if ($code -eq -3) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'SendInput injected fewer than 2 events'; point = "$X,$Y" } }
-        Start-Sleep -Seconds 2   # -2: the owner is using the PC
+# InvokePattern on the hit or its nearest invokable ancestor, scoped as Select-ToastTarget says
+# (this toast's own names only, never past its list item).
+function Invoke-UiaElement($Hit, [string]$Needle, [string[]]$Allowed, [string[]]$Patterns) {
+    try {
+        $sel = Select-ToastTarget (Get-ToastLevels $Hit -Invoke) $Needle $Allowed $Patterns { param($n, $a) $true }
+        if (-not $sel.ok) { return [ordered]@{ mode = 'uia-invoke'; ok = $false; why = $sel.why } }
+        $info = Get-ElementInfo $sel.candidate['element']
+        $sel.candidate['pattern'].Invoke()
+        [ordered]@{ mode = 'uia-invoke'; ok = $true; invoked = $info; levels_up = $sel.depth }
+    } catch {
+        [ordered]@{ mode = 'uia-invoke'; ok = $false; why = $_.Exception.Message }
     }
-    [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'owner active: the owner gave input within 2 s of each of 5 tries'; owner_active = $true }
+}
+
+# InvokePattern on one element itself (a button already chosen by Find-ToastButton).
+function Invoke-UiaButton($Button) {
+    try {
+        $pat = $null
+        if ($Button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+            $info = Get-ElementInfo $Button
+            $pat.Invoke()
+            return [ordered]@{ mode = 'uia-invoke'; ok = $true; invoked = $info }
+        }
+        [ordered]@{ mode = 'uia-invoke'; ok = $false; why = 'the button has no InvokePattern' }
+    } catch { [ordered]@{ mode = 'uia-invoke'; ok = $false; why = $_.Exception.Message } }
+}
+
+function Get-RectNow($Element) {
+    try { $c = $Element.Current; [pscustomobject]@{ R = $c.BoundingRectangle; Off = $c.IsOffscreen } } catch { $null }
+}
+
+# A synthesized click on $Target, which lies on the window $Top ({hwnd, pid, class}). On every
+# try (review N-I4): the per-monitor DPI context must apply; the target's rectangle is read
+# twice 100 ms apart and must be unchanged, non-empty and on screen; the point (the centre, or
+# the first of $Fractions that UIA puts on the target) must be the target or one of its
+# descendants by UIA's ElementFromPoint; then ClickAt re-checks the window under the point and
+# holds back while the owner is using the PC (5 tries, 2 s apart, then the owner's turn). The
+# point where the cursor landed is recorded (review m7).
+function Invoke-SafeClick($Target, $Top, $Fractions = @(, @(0.5, 0.5))) {
+    $why = 'no try made'
+    for ($try = 1; $try -le 5; $try++) {
+        if (-not [SpikeUi.Win]::PerMonitorAware()) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'the per-monitor DPI context did not apply: nothing clicked' } }
+        $a = Get-RectNow $Target; Start-Sleep -Milliseconds 100; $b = Get-RectNow $Target
+        if ($null -eq $a -or $null -eq $b -or $b.R.IsEmpty -or $b.Off -or $a.R -ne $b.R) {
+            $why = 'the target was moving, hidden or gone'
+            Start-Sleep -Milliseconds 400
+            continue
+        }
+        $r = $b.R
+        $pt = $null
+        foreach ($f in @($Fractions)) {
+            $x = [int]($r.X + $r.Width * $f[0]); $y = [int]($r.Y + $r.Height * $f[1])
+            if (Test-PointOnElement $x $y $Target) { $pt = @($x, $y); break }
+        }
+        if ($null -eq $pt) { $why = 'UIA puts no candidate point on the target'; Start-Sleep -Milliseconds 400; continue }
+        $code = [SpikeUi.Win]::ClickAt($pt[0], $pt[1], [int64]$Top.pid, [string]$Top.class)
+        if ($code -eq 2) {
+            $lx = [SpikeUi.Win]::LandedX; $ly = [SpikeUi.Win]::LandedY
+            $miss = [math]::Max([math]::Abs($lx - $pt[0]), [math]::Abs($ly - $pt[1]))
+            return [ordered]@{ mode = 'synthetic-mouse'; ok = $true; point = "$($pt[0]),$($pt[1])"; landed = "$lx,$ly"; missed_by_px = $miss; landed_off = ($miss -gt 1)
+                               virtual_desk = (@([SpikeUi.Win]::VirtualDesk()) -join ','); tries = $try }
+        }
+        if ($code -eq -1) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'the window under the point changed before the click: nothing clicked' } }
+        if ($code -eq -3) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'SendInput injected fewer than 2 events' } }
+        if ($code -eq -4) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'the per-monitor DPI context did not apply: nothing clicked' } }
+        $why = 'owner active: the owner gave input within 2 s of each try'
+        Start-Sleep -Seconds 2   # -2: the owner is using the PC; the next try reads everything again
+    }
+    [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = $why; owner_active = $why.StartsWith('owner active') }
 }
 
 # A synthesized click on the centre of the element, which must be on the window $Top.
 function Click-ElementCentre($Element, $Top) {
-    try {
-        [SpikeUi.Win]::PerMonitorAware()
-        $r = $Element.Current.BoundingRectangle
-        if ($r.IsEmpty -or $r.Width -le 0 -or $r.Height -le 0) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'no bounding rectangle' } }
-        Invoke-SafeClick ([int]($r.X + $r.Width / 2)) ([int]($r.Y + $r.Height / 2)) $Top
-    } catch {
-        [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = $_.Exception.Message }
-    }
+    try { Invoke-SafeClick $Element $Top } catch { [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = $_.Exception.Message } }
 }
 
 # A synthesized click on a visible part of the window $Hwnd's lower area (never its title bar,
-# so never its close button): the first point of a grid that UIA says is on that window.
+# so never its close button): the first point of a grid that UIA puts on that window.
 function Click-WindowVisible([int64]$Hwnd) {
     try {
-        [SpikeUi.Win]::PerMonitorAware()
-        $r = ([System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)).Current.BoundingRectangle
-        if ($r.IsEmpty) { return [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'no window rectangle' } }
+        $el = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
         $top = [ordered]@{ hwnd = $Hwnd; pid = [SpikeUi.Win]::PidOf($Hwnd); class = [SpikeUi.Win]::ClassOf($Hwnd) }
-        foreach ($fy in 0.5, 0.65, 0.8, 0.92, 0.4) {
-            foreach ($fx in 0.5, 0.3, 0.7, 0.1, 0.9) {
-                $x = [int]($r.X + $r.Width * $fx); $y = [int]($r.Y + $r.Height * $fy)
-                if ((Get-TopAtPoint $x $y) -eq $Hwnd) { return Invoke-SafeClick $x $y $top }
-            }
-        }
-        [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = 'no visible point of the window' }
+        $grid = @(foreach ($fy in 0.5, 0.65, 0.8, 0.92, 0.4) { foreach ($fx in 0.5, 0.3, 0.7, 0.1, 0.9) { , @($fx, $fy) } })
+        Invoke-SafeClick $el $top $grid
     } catch {
         [ordered]@{ mode = 'synthetic-mouse'; ok = $false; why = $_.Exception.Message }
     }
 }
 
-# Key presses, held back while the owner is using the PC (5 tries, 2 s apart). $true when sent.
+# Key presses, held back while the owner is using the PC (5 tries, 2 s apart). $true only when
+# every key went down and up; a partial injection is released by Keys itself (review m6).
 function Send-Keys([int[]]$Vk) {
     for ($try = 1; $try -le 5; $try++) {
-        if ([SpikeUi.Win]::Keys([uint16[]]$Vk) -gt 0) { return $true }
+        $n = [SpikeUi.Win]::Keys([uint16[]]$Vk)
+        if ($n -eq 2 * $Vk.Count) { return $true }
+        if ($n -eq -3) { return $false }
         Start-Sleep -Seconds 2
     }
     $false
@@ -580,28 +771,28 @@ function Get-PowerEvidence {
     }
 }
 
-# The notification centre the script opened: the window holding the needle, else the new window
-# that took the foreground after Win+N; 0 when neither (then nothing is sent to close it).
+# The notification centre the script opened: the window holding the needle, else the window
+# that took the foreground after Win+N and wasn't shown before (it may have been listed
+# cloaked); 0 when neither (then nothing is sent to close it).
 function Get-CentreHwnd($Watch, $Before) {
     if ($null -ne $Watch.Hit) { return [int64]$Watch.Hit.TopInfo.hwnd }
     $fg = Get-ForegroundNow
-    if ($null -ne $fg -and $fg.hwnd -ne 0 -and -not $Before.ContainsKey([int64]$fg.hwnd)) { return [int64]$fg.hwnd }
+    if ($null -ne $fg -and $fg.hwnd -ne 0 -and $fg.pid -notin $script:PopupPids -and -not (Test-WasShown $Before ([int64]$fg.hwnd))) { return [int64]$fg.hwnd }
     [int64]0
 }
 
-function Test-TopPresent([int64]$Hwnd) {
-    @(Get-UiaTop | Where-Object { [int64]$_.Current.NativeWindowHandle -eq $Hwnd }).Count -gt 0
-}
+# Shown: visible and not cloaked (review m5), not merely listed by UIA.
+function Test-TopPresent([int64]$Hwnd) { [SpikeUi.Win]::Shown($Hwnd) }
 
 # Closes the centre the script opened: Esc only while that window is the foreground, else Win+N
-# (which toggles it) only while it is still shown. Nothing is sent for a centre not identified.
+# (which toggles it) only while it is confirmed shown. Nothing is sent for a centre not identified.
 function Close-NotificationCentre([int64]$CentreHwnd) {
     if ($CentreHwnd -eq 0) { return 'not identified: nothing sent' }
     for ($k = 0; $k -lt 2; $k++) {
         if (-not (Test-TopPresent $CentreHwnd)) { return 'closed' }
         $fg = Get-ForegroundNow
         if ($null -ne $fg -and [int64]$fg.hwnd -eq $CentreHwnd) { [void](Send-Keys @(0x1B)) }   # Esc
-        else { [void](Send-Keys @(0x5B, 0x4E)) }                                                 # Win+N
+        elseif (Test-TopPresent $CentreHwnd) { [void](Send-Keys @(0x5B, 0x4E)) }                 # Win+N
         Start-Sleep -Milliseconds 800
     }
     $(if (Test-TopPresent $CentreHwnd) { 'still open' } else { 'closed' })
@@ -622,15 +813,17 @@ function Test-InNotificationCentre([string]$Needle) {
 
 # Dismisses the notification-centre entry holding $Needle with that entry's own dismiss button:
 # Win+N, find the entry, hover over it (the button may show only then), find a dismiss or close
-# button scoped to this toast (Find-ToastButton; never "clear" or "all"), invoke it (or click
-# it). When no such button is found, nothing is pressed and the caller asks the owner.
-function Dismiss-InNotificationCentre([string]$Needle) {
+# button inside this toast's own list item whose scope holds this toast's names only
+# (Find-ToastButton), invoke it (or click it). When the hover is held back (the owner is using
+# the mouse) nothing is searched, and when no such button is found nothing is pressed: the
+# caller then asks the owner. $Allowed and $Patterns are this toast's own names.
+function Dismiss-InNotificationCentre([string]$Needle, [string[]]$Allowed, [string[]]$Patterns) {
     if (-not (Initialize-SpikeUi)) { return [ordered]@{ method = 'none'; ok = $false; why = "UI Automation not available: $($script:Uia.error)" } }
     $before = Get-UiaSnapshot
     if (-not (Send-Keys @(0x5B, 0x4E))) { return [ordered]@{ method = 'none'; ok = $false; why = 'owner active: Win+N not sent' } }
     $w = Watch-Needle -Needle $Needle -Before $before -Seconds 5 -UntilFound
     $centre = Get-CentreHwnd $w $before
-    $rec = [ordered]@{ method = 'uia (Win+N, hover, this entry''s own dismiss button)'; found_entry = ($null -ne $w.Hit); ok = $false; buttons = @(); used = $null; hovered = $false }
+    $rec = [ordered]@{ method = 'uia (Win+N, hover, this entry''s own dismiss button)'; found_entry = ($null -ne $w.Hit); ok = $false; used = $null; hovered = $false }
     $restore = $null
     try {
         if ($null -ne $w.Hit) {
@@ -638,18 +831,21 @@ function Dismiss-InNotificationCentre([string]$Needle) {
             if (-not $r.IsEmpty) {
                 $restore = [SpikeUi.Win]::MoveTo([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
                 $rec.hovered = $null -ne $restore
-                Start-Sleep -Milliseconds 700
             }
-            $found = Find-ToastButton $w.Hit $Needle { param($n, $a) Test-DismissButton $n $a }
-            if ($null -ne $found) {
-                $rec.buttons = $found.Buttons
-                $rec.used = Get-ElementInfo $found.Button
-                $how = Invoke-UiaElement $found.Button ([int64]$found.Button.Current.NativeWindowHandle)
-                if (-not $how.ok) { $how = Click-ElementCentre $found.Button $w.Hit.TopInfo }
-                $rec.how = $how
-                $rec.ok = [bool]$how.ok
+            if (-not $rec.hovered) {
+                $rec.why = 'the hover was held back (the owner was using the PC): nothing searched, nothing pressed'
             } else {
-                $rec.why = 'no dismiss or close button scoped to this toast: nothing pressed'
+                Start-Sleep -Milliseconds 700
+                $found = Find-ToastButton $w.Hit $Needle { param($n, $a) Test-DismissButton $n $a } $Allowed (@($Patterns) + @('(?i)^(dismiss|close)\b'))
+                if ($found.Ok) {
+                    $rec.used = Get-ElementInfo $found.Button
+                    $how = Invoke-UiaButton $found.Button
+                    if (-not $how.ok) { $how = Click-ElementCentre $found.Button $w.Hit.TopInfo }
+                    $rec.how = $how
+                    $rec.ok = [bool]$how.ok
+                } else {
+                    $rec.why = "$($found.Why)"
+                }
             }
         }
     } catch {
@@ -659,4 +855,46 @@ function Dismiss-InNotificationCentre([string]$Needle) {
         $rec.closed_after = Close-NotificationCentre $centre
     }
     $rec
+}
+
+# What to tell the owner when something already holds ES_SYSTEM_REQUIRED (review N-I2): run-all's
+# unattended block shows it before Enter, Power-StayAwake again if it is still set.
+function Get-KeepAwakeAdvice([string]$State) {
+    ("Something on this PC is keeping it awake right now (execution state $State), so the stay-awake check can't prove anything. " +
+     "The likely cause: the Claude app's 'Keep computer awake while Claude works' setting holds the PC awake while any Claude session is working. " +
+     "Pause your Claude sessions, or turn that setting off, for this test. " +
+     "Other usual causes: a playing video, a download, or another app with a keep-awake option. " +
+     "Optional: powercfg /requests in a terminal opened with 'Run as administrator' names the program (it only reads).")
+}
+
+# ---------------------------------------------------------------- the Sandbox runs' timeline (pure)
+
+# Whether the PC slept between $FromMs and $ToMs (unix ms), from the host core's events (a
+# suspend or resume broadcast, or a clock jump) and the System log's Kernel-Power entries (42
+# sleep, 107 resume), each {t_ms, ...}. Returns {slept, events, kernel}. Pure; tested.
+function Get-SleepInWindow($Events, $Kernel, [long]$FromMs, [long]$ToMs) {
+    $in = { param($e) $null -ne $e -and [long](P2o $e 't_ms') -ge $FromMs -and [long](P2o $e 't_ms') -le $ToMs }
+    $ev = @(@($Events) | Where-Object { (& $in $_) -and ((P2o $_ 'kind') -eq 'clock_jump' -or ((P2o $_ 'kind') -eq 'power_broadcast' -and (P2o $_ 'pbt') -in 'PBT_APMSUSPEND', 'PBT_APMRESUMEAUTOMATIC', 'PBT_APMRESUMESUSPEND')) })
+    $kn = @(@($Kernel) | Where-Object { (& $in $_) -and (P2o $_ 'id') -in 42, 107 })
+    [ordered]@{ slept = ($ev.Count + $kn.Count) -gt 0; events = $ev; kernel = $kn }
+}
+
+# S1.9's verdict from its runs (review N-I1): a judged run that failed is FAIL; otherwise runs
+# interrupted by sleep make it INCOMPLETE; otherwise PASS. Pure; tested.
+function Get-SandboxVerdict($Runs) {
+    $all = @(@($Runs) | Where-Object { $null -ne $_ })
+    $judged = @($all | Where-Object { (P2o $_ 'interrupted_by_sleep') -ne $true })
+    $interrupted = $all.Count - $judged.Count
+    if (@($judged | Where-Object { (P2o $_ 'pass') -ne $true }).Count -gt 0) { return 'FAIL' }
+    if ($interrupted -gt 0) { return "INCOMPLETE ($interrupted run(s) interrupted by sleep: rerun them)" }
+    if ($all.Count -eq 0) { return 'INCOMPLETE (no run)' }
+    'PASS'
+}
+
+# A field of a dictionary or an object, or $null (strict-mode safe; the scripts' own P).
+function P2o($Obj, [string]$Name) {
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [System.Collections.IDictionary]) { return $Obj[$Name] }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { $p.Value } else { $null }
 }
