@@ -42,7 +42,7 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Sign-off | Choosing a candidate and sealing it as a new version; ungated for you, gated for agents by failed technical QA. | approve, accept, publish | CORE-026, CORE-051, CORE-132 |
 | Seal | The step of sign-off that moves the chosen files into a read-only version folder with a frozen manifest snapshot. | lock, freeze, commit | CORE-026 |
 | Human edit | An outside change to a candidate or sealed file, recorded and offered as a new version. | manual edit, drift | CORE-034, ARCH-079 |
-| Agent edit | A change an AI agent made to a candidate or sealed file, recorded as AI work and never as a human edit. | human edit, hand edit | roadmap row 4b (attribution) |
+| Agent edit | A change an AI agent made to a candidate or sealed file, recorded as AI work and never as a human edit. | human edit, hand edit | CORE-034, roadmap row 4b (attribution) |
 | Claim | Your hold on an asset or document you opened to edit: the director doesn't write to it, and it lasts until you hand it back. | lock, lease (a checkout lease is another thing), hold (a document hold is APP-103's) | roadmap N31 |
 | Hand back | Your action that ends a claim, so the director may work on that asset again. | release, unlock | roadmap N31 |
 | Redirect | The record a renamed or moved asset leaves, so old references still resolve. | alias, symlink | ARCH-125, CORE-153 |
