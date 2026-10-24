@@ -44,7 +44,7 @@ use lil_protocol::codes::{PROTOCOL_INCOMPATIBLE, WORKSPACE_UNKNOWN};
 use lil_protocol::{
     CAPABILITIES, DrainResult, HelloParams, HelloResult, NO_WORKSPACE, Outcome, RpcError,
     SubscribeParams, SubscribeResult, ToolCallParams, ToolDescriptor, ToolOutput, ToolsListResult,
-    method, rpc_code, schema_hash,
+    UnsubscribeParams, UnsubscribeResult, method, rpc_code, schema_hash,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -54,7 +54,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::conn::{Conn, EventStream};
-use crate::{ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
+use crate::{CANNOT_START, ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
 
 /// The first pause between attempts to open the pipe.
 const BACKOFF_START: Duration = Duration::from_millis(25);
@@ -147,11 +147,22 @@ impl Client {
         args: serde_json::Map<String, Value>,
         key: Option<String>,
     ) -> Result<Outcome<ToolOutput>, ClientError> {
+        self.call_tool_traced(name, args, key, None).await
+    }
+
+    /// [`Client::call_tool`], carrying the caller's `trace_id` (ARCH-118).
+    pub(crate) async fn call_tool_traced(
+        &self,
+        name: &str,
+        args: serde_json::Map<String, Value>,
+        key: Option<String>,
+        trace_id: Option<String>,
+    ) -> Result<Outcome<ToolOutput>, ClientError> {
         let params = ToolCallParams {
             name: name.to_string(),
             arguments: args,
             idempotency_key: Some(key.unwrap_or_else(|| RandomIds.id("ik"))),
-            trace_id: None,
+            trace_id,
         };
         let result = self
             .conn
@@ -171,6 +182,60 @@ impl Client {
         let method = lil_protocol::app::CONFIRMATIONS_LIST;
         let result = self.conn.call(method, to_value(&params)).await?;
         decode(result, method)
+    }
+
+    /// An `app/*` method (APP-043) with `params`, its result as an [`Outcome`]: a refusal
+    /// (`caller.not_allowed` for a caller that may not call it, say) is an error outcome, not
+    /// a [`ClientError`]. A method outside `app/` is [`ClientError::Protocol`] and is not sent:
+    /// the session methods have their own calls.
+    pub async fn app_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Outcome<Value>, ClientError> {
+        if !method.starts_with(method::APP_PREFIX) {
+            return Err(ClientError::Protocol(RpcError::new(
+                rpc_code::INVALID_REQUEST,
+                format!("{method} is not an app/* method"),
+            )));
+        }
+        let result = self.conn.call(method, params).await?;
+        decode(result, method)
+    }
+
+    /// The connection, for the session's own event sink.
+    pub(crate) fn conn(&self) -> &Arc<Conn> {
+        &self.conn
+    }
+
+    /// `lil/subscribe` on this connection with no stream of its own: the events reach every
+    /// sink that wants them (the session's).
+    pub(crate) async fn subscribe_only(
+        &self,
+        topics: Vec<String>,
+        since_seq: BTreeMap<String, u64>,
+    ) -> Result<SubscribeResult, ClientError> {
+        let params = SubscribeParams { topics, since_seq };
+        let result = self.conn.call(method::SUBSCRIBE, to_value(&params)).await?;
+        match decode::<SubscribeResult>(result, method::SUBSCRIBE)? {
+            Outcome::Ok(subscribed) => Ok(subscribed),
+            Outcome::Error { error } => Err(ClientError::Refused(error)),
+            Outcome::PendingConfirmation(_) => Err(unexpected_pending(method::SUBSCRIBE)),
+        }
+    }
+
+    /// `lil/unsubscribe` on this connection.
+    pub(crate) async fn unsubscribe_only(&self, topics: Vec<String>) -> Result<(), ClientError> {
+        let params = UnsubscribeParams { topics };
+        let result = self
+            .conn
+            .call(method::UNSUBSCRIBE, to_value(&params))
+            .await?;
+        match decode::<UnsubscribeResult>(result, method::UNSUBSCRIBE)? {
+            Outcome::Ok(_) => Ok(()),
+            Outcome::Error { error } => Err(ClientError::Refused(error)),
+            Outcome::PendingConfirmation(_) => Err(unexpected_pending(method::UNSUBSCRIBE)),
+        }
     }
 
     /// `tools/list`: the tools this session may see.
@@ -516,7 +581,7 @@ impl<'a> Finder<'a> {
                 .map_err(|e| {
                     ClientError::Io(io::Error::new(
                         e.kind(),
-                        format!("Cannot start the LILITH core {}: {e}", exe.display()),
+                        format!("{CANNOT_START} {}: {e}", exe.display()),
                     ))
                 })?;
                 self.spawned = Some(handle);

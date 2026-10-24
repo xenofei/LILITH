@@ -266,6 +266,7 @@ fn comfy_pass_env_split(env: &Env) -> (Vec<String>, Vec<(String, String)>) {
 /// harmless: the core ends a connection that closes before its hello like any other, and no
 /// core is started by it.
 pub fn core_running(env: &Env) -> bool {
+    crate::blocking::not_on_gui_thread("doctor::core_running");
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -286,6 +287,7 @@ const GIT_LIMIT: Duration = Duration::from_secs(30);
 /// # Errors
 /// When `ws` has no `.git`, `git` isn't on `PATH` or doesn't finish in 30 s, or `git` fails.
 pub fn set_repo_autocrlf_false(ws: &Path) -> io::Result<()> {
+    crate::blocking::not_on_gui_thread("doctor::set_repo_autocrlf_false");
     if !ws.join(".git").exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,

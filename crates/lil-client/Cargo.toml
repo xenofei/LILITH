@@ -15,7 +15,8 @@ rusqlite.workspace = true
 # Only for the `Serialize`/`DeserializeOwned` bounds of the generic request helpers.
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
+# macros: `select!` in the session task.
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 tokio-util.workspace = true
 lil-platform = { path = "../lil-platform" }
 lil-protocol = { path = "../lil-protocol" }
@@ -23,6 +24,8 @@ lil-schema = { path = "../lil-schema" }
 
 [dev-dependencies]
 tempfile.workspace = true
+# test-util: the session's backoff test reads tokio's paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 lil-testkit = { path = "../lil-testkit" }
 
 [lints]
