@@ -272,7 +272,7 @@ S1.1, S1.2, S1.3, S1.4 and S1.6 PASS; S1.2p is recorded; S1.5 FAILs; S1.7 PASSes
 - Proving that the prompt comes to the front of every application, a fullscreen one included, is Task 28's. This spike shows only what is above: with the prompts owned by windows that were not in front, one was not seen in front before owner input and the other was in front after owner input.
 
 **For Task 30 (the desktop test runner): owner decision 2026-10-23 (round 12) plus spike result.**
-- **The Sandbox runner covers protocol activation, power requests, Rust tests and the Sandbox lifecycle.** These passed 3 of 3 unattended. A run takes about 2.5 minutes from start to closed once the Qt record bug is out (run 1); the bar is under 10 minutes.
+- **The Sandbox runner covers protocol activation, power requests, Rust tests and the Sandbox lifecycle.** These passed 3 of 3 unattended. Run 1, which the Qt record bug did not slow, took 149 s from start to closed, and every run came in under the bar's 10 minutes.
 - **The desktop group runs on the owner's PC:** toasts, foreground and screen grabs. This rests on the owner's round-12 answer that tests may run on the owner's PC at any time, under the hands-off pop-up rule. It follows the bar's FAIL path, so it needs a plan amendment to Task 30 and to QA-042, which says the desktop tests use the Sandbox.
 - **What the evidence says:**
   - Inside the Sandbox the toast's raw fields passed in every run, and the foreground hand-off passed under the scheduled-task launch in runs 2 and 3. Every token there was elevated, though, and an elevated sender is not how the product runs.
