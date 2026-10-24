@@ -24,9 +24,18 @@ fn notifier(aumid: &str) -> windows::core::Result<ToastNotifier> {
     ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid))
 }
 
-/// The notifier's `Setting()` for `aumid`; `None` when there is no notifier (no platform).
+/// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`: what `Setting()` answers before the AUMID's first
+/// toast.
+const NOT_FOUND: windows::core::HRESULT = windows::core::HRESULT(0x8007_0490_u32 as i32);
+
+/// The notifier's `Setting()` for `aumid`; `None` when there is no notifier (no platform), and
+/// [`NotifierSetting::NotYetShown`] when the AUMID has never shown a toast.
 pub(crate) fn setting(aumid: &str) -> Option<NotifierSetting> {
-    let setting = notifier(aumid).and_then(|n| n.Setting()).ok()?;
+    let setting = match notifier(aumid).and_then(|n| n.Setting()) {
+        Ok(s) => s,
+        Err(e) if e.code() == NOT_FOUND => return Some(NotifierSetting::NotYetShown),
+        Err(_) => return None,
+    };
     Some(match setting {
         NotificationSetting::Enabled => NotifierSetting::Enabled,
         NotificationSetting::DisabledForUser => NotifierSetting::DisabledForUser,

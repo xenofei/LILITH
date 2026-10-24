@@ -186,6 +186,8 @@ fn fake_desktop_records_posts_and_removes() {
     fake.set_foreground(Some(4242));
     assert_eq!(fake.foreground_pid(), Some(4242));
     assert_eq!(fake.toasts_state(), ToastsState::Ready);
+    fake.set_toasts_state(ToastsState::NotYetShown);
+    assert_eq!(fake.toasts_state(), ToastsState::NotYetShown);
     fake.set_toasts_state(ToastsState::Unavailable("disabled_for_user"));
     assert_eq!(
         fake.toasts_state(),
@@ -319,6 +321,13 @@ fn toasts_state_maps_each_notifier_setting() {
             ToastsState::Unavailable("disabled_by_policy"),
         ),
         (None, false, ToastsState::Unavailable("no_platform")),
+        // Never shown a toast yet (plan 4a ruling 2026-10-24): postable, unless elevated.
+        (Some(NotYetShown), false, ToastsState::NotYetShown),
+        (
+            Some(NotYetShown),
+            true,
+            ToastsState::Unavailable("elevated"),
+        ),
         // Elevated: never ready, whatever the setting.
         (Some(Enabled), true, ToastsState::Unavailable("elevated")),
         (
@@ -335,6 +344,8 @@ fn toasts_state_maps_each_notifier_setting() {
             "{setting:?} elevated={elevated}"
         );
     }
+    assert!(ToastsState::Ready.can_post() && ToastsState::NotYetShown.can_post());
+    assert!(!ToastsState::Unavailable("disabled_for_user").can_post());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -454,9 +465,10 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
     let exe = std::env::current_exe().unwrap();
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
+    // A fresh AUMID is `NotYetShown` until its first toast (plan 4a ruling 2026-10-24).
     eventually(
-        "toasts ready",
-        || desktop.toasts_state() == ToastsState::Ready,
+        "toasts postable",
+        || desktop.toasts_state().can_post(),
         || format!("toasts_state {:?}", desktop.toasts_state()),
     );
 
@@ -491,6 +503,12 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         },
         context,
     );
+    // Once a toast has shown, Windows has the AUMID's settings: `Setting()` is `Enabled`.
+    eventually(
+        "toasts ready after the first toast",
+        || desktop.toasts_state() == ToastsState::Ready,
+        context,
+    );
     desktop.remove(tag, "job_finished");
     eventually(
         "the toast gone from History",
@@ -509,11 +527,31 @@ fn desktop_toasts_state_is_ready_on_this_pc() {
     let exe = std::env::current_exe().unwrap();
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
+    let state = || format!("toasts_state {:?}", desktop.toasts_state());
+    // Before its first toast a fresh AUMID is `NotYetShown`, which may post (plan 4a ruling
+    // 2026-10-24); after it, Windows reports the user's real setting, which must be `Enabled`.
     eventually(
-        "toasts ready",
-        || desktop.toasts_state() == ToastsState::Ready,
-        || format!("toasts_state {:?}", desktop.toasts_state()),
+        "toasts postable",
+        || desktop.toasts_state().can_post(),
+        state,
     );
+    if desktop.toasts_state() == ToastsState::NotYetShown {
+        let tag = "j_00000000000000a6";
+        let xml = concat!(
+            r#"<toast><visual><binding template="ToastGeneric"><text>Desktop test</text>"#,
+            r#"<text>toasts state</text></binding></visual></toast>"#
+        );
+        desktop
+            .post(&toast(tag, "job_finished", xml, true))
+            .expect("the first toast posts");
+        eventually(
+            "toasts ready after the first toast",
+            || desktop.toasts_state() == ToastsState::Ready,
+            state,
+        );
+        desktop.remove(tag, "job_finished");
+    }
+    assert_eq!(desktop.toasts_state(), ToastsState::Ready);
 }
 
 /// The shortcut and handlers round trip, in the Sandbox, under both classes roots a test

@@ -223,11 +223,21 @@ pub struct Toast {
 
 /// Whether the channel's toasts can be posted (Appendix G "Ready"). `Unavailable` carries the
 /// `toasts_reason`: `disabled_for_app`, `disabled_for_user`, `disabled_by_policy`, `elevated`
-/// or `no_platform`.
+/// or `no_platform`. `NotYetShown` (plan 4a ruling 2026-10-24): this AUMID has never shown a
+/// toast, so Windows has no notification settings for it yet; posting is allowed, and the
+/// post's result, or the next reading once it showed, decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastsState {
     Ready,
+    NotYetShown,
     Unavailable(&'static str),
+}
+
+impl ToastsState {
+    /// Whether a toast may be posted: [`ToastsState::Ready`] or [`ToastsState::NotYetShown`].
+    pub fn can_post(self) -> bool {
+        matches!(self, ToastsState::Ready | ToastsState::NotYetShown)
+    }
 }
 
 /// The AUMID shortcut's state (`notification_path.shortcut`; P4a-R37). `WrongClsid`: the
@@ -251,10 +261,13 @@ pub enum HandlerState {
     OtherChannel(PathBuf),
 }
 
-/// `ToastNotifier::Setting()`, as this crate names it.
+/// `ToastNotifier::Setting()`, as this crate names it. `NotYetShown`: it failed with
+/// `ERROR_NOT_FOUND` ("Element not found"), which it does until the AUMID's first toast,
+/// when Windows creates the app's notification settings (Task 30's host run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifierSetting {
     Enabled,
+    NotYetShown,
     DisabledForApplication,
     DisabledForUser,
     DisabledByGroupPolicy,
@@ -268,7 +281,8 @@ pub trait Desktop: Send + Sync {
     /// The process that owns the foreground window, if any (P4a-R7).
     fn foreground_pid(&self) -> Option<u32>;
     /// [`ToastsState::Ready`] only when the channel's notifier reports `Setting() == Enabled`
-    /// and this process isn't elevated.
+    /// and this process isn't elevated; [`ToastsState::NotYetShown`] before the AUMID's first
+    /// toast.
     fn toasts_state(&self) -> ToastsState;
     /// Posts `t` under the channel's AUMID.
     fn post(&self, t: &Toast) -> Result<(), String>;
@@ -288,7 +302,8 @@ pub trait Desktop: Send + Sync {
 /// Appendix G's map from the notifier's setting to [`ToastsState`]: no notifier (`None`) is
 /// `no_platform`; an elevated process is `elevated` whatever the setting; then
 /// `DisabledForApplication` and `DisabledByManifest` are `disabled_for_app`, `DisabledForUser`
-/// `disabled_for_user` and `DisabledByGroupPolicy` `disabled_by_policy`.
+/// `disabled_for_user` and `DisabledByGroupPolicy` `disabled_by_policy`; `NotYetShown` is
+/// [`ToastsState::NotYetShown`] (plan 4a ruling 2026-10-24).
 pub fn toasts_state_for(setting: Option<NotifierSetting>, elevated: bool) -> ToastsState {
     let Some(setting) = setting else {
         return ToastsState::Unavailable("no_platform");
@@ -298,6 +313,7 @@ pub fn toasts_state_for(setting: Option<NotifierSetting>, elevated: bool) -> Toa
     }
     match setting {
         NotifierSetting::Enabled => ToastsState::Ready,
+        NotifierSetting::NotYetShown => ToastsState::NotYetShown,
         NotifierSetting::DisabledForApplication | NotifierSetting::DisabledByManifest => {
             ToastsState::Unavailable("disabled_for_app")
         }
