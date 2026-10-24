@@ -267,6 +267,9 @@ fn json_value_end(json: &[u8], at: usize, max_depth: usize) -> Result<usize, &'s
 /// key or family over 64 KiB, or a key-value section over 100 MiB, is [`Family::Unknown`]. Other
 /// values are skipped whatever their length.
 ///
+/// The walk makes many small reads (a hostile file can hold millions of tiny keys within the
+/// 100 MiB bound), so pass a buffered reader such as [`std::io::BufReader`].
+///
 /// # Errors
 /// [`HeaderError`] when the header can't be read or isn't a GGUF header.
 pub fn gguf_family(r: &mut dyn std::io::Read) -> Result<Family, HeaderError> {
