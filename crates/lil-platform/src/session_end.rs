@@ -17,6 +17,12 @@
 //! ignored and reported as [`SessionEnd::CloseIgnored`], and a `WM_QUIT` posted from outside
 //! does not end the message loop, so the window lives exactly as long as its watcher.
 //!
+//! The same window reports the sleep broadcasts (ARCH-127; Appendix G "Keep-awake"):
+//! `WM_POWERBROADCAST` with `PBT_APMSUSPEND` → [`PowerEvent::Suspending`], with
+//! `PBT_APMRESUMEAUTOMATIC` → [`PowerEvent::Resumed`], on the receiver
+//! [`SessionEndWatcher::power_events`] hands out once. Task 1's S1.7 saw both arrive at a
+//! hidden top-level window across a real sleep.
+//!
 //! [`SessionEndWatcher::simulate`] sends those messages to the watcher's own window, for
 //! tests. What it sends is a [`SessionEndSim`], a type of its own: the [`SessionEnd`] events are
 //! only what the window reports. Nothing here looks at or enumerates any other window.
@@ -35,9 +41,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IsWindow,
-    IsWindowVisible, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
-    WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+    IsWindowVisible, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
+    RegisterClassW, SendMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -64,6 +70,19 @@ pub enum SessionEndSim {
     End,
     /// `WM_CLOSE`, as another program could send it.
     Close,
+    /// `WM_POWERBROADCAST` with `PBT_APMSUSPEND`.
+    Suspend,
+    /// `WM_POWERBROADCAST` with `PBT_APMRESUMEAUTOMATIC`.
+    Resume,
+}
+
+/// A sleep broadcast the window was told (ARCH-127).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerEvent {
+    /// `PBT_APMSUSPEND`: the PC is going to sleep.
+    Suspending,
+    /// `PBT_APMRESUMEAUTOMATIC`: the PC woke up.
+    Resumed,
 }
 
 /// What the window was told.
@@ -82,6 +101,7 @@ pub enum SessionEnd {
 #[derive(Debug)]
 struct Shared {
     tx: UnboundedSender<SessionEnd>,
+    power_tx: UnboundedSender<PowerEvent>,
     state: Mutex<Waiting>,
     changed: Condvar,
     /// The lParam of [`WM_DESTROY_WATCHER`]: random, so only the watcher's `Drop` sends it.
@@ -137,6 +157,8 @@ pub struct SessionEndWatcher {
     hwnd: isize,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The sleep broadcasts' receiver until [`SessionEndWatcher::power_events`] takes it.
+    power_rx: Mutex<Option<UnboundedReceiver<PowerEvent>>>,
 }
 
 impl SessionEndWatcher {
@@ -147,10 +169,12 @@ impl SessionEndWatcher {
     /// If the window class cannot be registered, or the thread or window cannot be created.
     pub fn start() -> io::Result<(SessionEndWatcher, UnboundedReceiver<SessionEnd>)> {
         let (tx, rx) = unbounded_channel();
+        let (power_tx, power_rx) = unbounded_channel();
         let mut key = [0u8; 8];
         getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
         let shared = Arc::new(Shared {
             tx,
+            power_tx,
             state: Mutex::new(Waiting::default()),
             changed: Condvar::new(),
             // Never 0, so a message without an lParam never matches.
@@ -177,9 +201,19 @@ impl SessionEndWatcher {
                 hwnd,
                 shared,
                 thread: Some(thread),
+                power_rx: Mutex::new(Some(power_rx)),
             },
             rx,
         ))
+    }
+
+    /// The receiver of every [`PowerEvent`] the window is told. The first call takes it; later
+    /// calls return `None`.
+    pub fn power_events(&self) -> Option<UnboundedReceiver<PowerEvent>> {
+        self.power_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// The core's shutdown is complete: a waiting `WM_ENDSESSION`, and any later one, returns.
@@ -213,6 +247,24 @@ impl SessionEndWatcher {
                 // SAFETY: as above; the window ignores the message.
                 unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
                 self.is_alive()
+            }
+            SessionEndSim::Suspend | SessionEndSim::Resume => {
+                let event = if msg == SessionEndSim::Suspend {
+                    PBT_APMSUSPEND
+                } else {
+                    PBT_APMRESUMEAUTOMATIC
+                };
+                // SAFETY: as above. The broadcast's wParam is the event; lParam is unused.
+                let answer = unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_POWERBROADCAST,
+                        Some(WPARAM(event as usize)),
+                        Some(LPARAM(0)),
+                    )
+                };
+                // TRUE: the broadcast was handled.
+                answer.0 != 0
             }
         }
     }
@@ -378,6 +430,18 @@ unsafe extern "system" fn window_proc(
                 shared.wait_for_shutdown();
             }
             LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            let event = match wparam.0 as u32 {
+                PBT_APMSUSPEND => Some(PowerEvent::Suspending),
+                PBT_APMRESUMEAUTOMATIC => Some(PowerEvent::Resumed),
+                _ => None,
+            };
+            if let (Some(event), Some(shared)) = (event, shared()) {
+                let _ = shared.power_tx.send(event);
+            }
+            // TRUE: handled (the broadcast's documented answer).
+            LRESULT(1)
         }
         WM_DESTROY_WATCHER if shared().is_some_and(|s| lparam.0 == s.destroy_key) => {
             // SAFETY: `hwnd` is the window this procedure serves, on its own thread; the key

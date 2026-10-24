@@ -32,9 +32,11 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
     PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, RegisterWaitForSingleObject, STARTUPINFOW, TerminateProcess,
-    UnregisterWaitEx, WT_EXECUTEONLYONCE, WaitForSingleObject,
+    QueryFullProcessImageNameW, RegisterWaitForSingleObject, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    STARTUPINFOW_FLAGS, TerminateProcess, UnregisterWaitEx, WT_EXECUTEONLYONCE,
+    WaitForSingleObject,
 };
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::sid;
@@ -386,51 +388,83 @@ pub struct SystemSpawner;
 
 impl RawSpawner for SystemSpawner {
     fn spawn(&self, req: &SpawnRequest, flags: u32) -> io::Result<ProcessHandle> {
-        let application = wide_nul(req.exe.as_os_str(), "the exe path")?;
-        let mut command_line = command_line(req.exe.as_os_str(), &req.args)?;
-        let environment =
-            environment_block(current_environment()?, &req.extra_env, &req.remove_env)?;
-        let directory = match req.exe.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => {
-                Some(wide_nul(dir.as_os_str(), "the exe folder")?)
-            }
-            _ => None,
-        };
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..Default::default()
-        };
-        let mut info = PROCESS_INFORMATION::default();
-        // SAFETY: every buffer is NUL-terminated (the environment block double-NUL-terminated)
-        // and outlives the call; `command_line` is mutable as `CreateProcessW` requires;
-        // `startup` and `info` are valid for reads and writes respectively.
-        unsafe {
-            CreateProcessW(
-                PCWSTR(application.as_ptr()),
-                Some(PWSTR(command_line.as_mut_ptr())),
-                None,
-                None,
-                false,
-                // The block below is always UTF-16, whatever the caller's flags say.
-                PROCESS_CREATION_FLAGS(flags | CREATE_UNICODE_ENVIRONMENT.0),
-                Some(environment.as_ptr().cast()),
-                directory
-                    .as_ref()
-                    .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
-                &startup,
-                &mut info,
-            )
-        }
-        .map_err(|e| io_error(&e))?;
-        // SAFETY: `CreateProcessW` succeeded, so both handles are fresh and ours; the thread
-        // handle is not needed.
-        let _ = unsafe { CloseHandle(info.hThread) };
-        Ok(ProcessHandle {
-            // SAFETY: the process handle is fresh and owned by nothing else.
-            handle: unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) },
-            pid: info.dwProcessId,
-        })
+        create_process(req, flags, None)
     }
+}
+
+/// Starts an app detached and without focus, as `lil-mcp` starts a stopped app for an agent
+/// (ARCH-015, Appendix G "`lil-mcp` launches"): the spawn of [`spawn_detached`], with
+/// `STARTF_USESHOWWINDOW` and `SW_SHOWNOACTIVATE`, so the app's first window shows without
+/// taking the foreground. Returns the pid; the process handle is closed.
+pub fn spawn_no_activate(exe: &Path, args: &[String]) -> io::Result<u32> {
+    let req = SpawnRequest {
+        exe: exe.to_path_buf(),
+        args: args.iter().map(OsString::from).collect(),
+        extra_env: Vec::new(),
+        remove_env: Vec::new(),
+    };
+    let show = Some(SW_SHOWNOACTIVATE.0 as u16);
+    let handle = match create_process(&req, DETACHED_FLAGS | BREAKAWAY, show) {
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {
+            create_process(&req, DETACHED_FLAGS, show)
+        }
+        other => other,
+    }?;
+    Ok(handle.pid())
+}
+
+/// `CreateProcessW` as [`SystemSpawner`] documents it; with `show`, the child's first
+/// `ShowWindow` uses that command (`STARTF_USESHOWWINDOW`).
+fn create_process(req: &SpawnRequest, flags: u32, show: Option<u16>) -> io::Result<ProcessHandle> {
+    let application = wide_nul(req.exe.as_os_str(), "the exe path")?;
+    let mut command_line = command_line(req.exe.as_os_str(), &req.args)?;
+    let environment = environment_block(current_environment()?, &req.extra_env, &req.remove_env)?;
+    let directory = match req.exe.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            Some(wide_nul(dir.as_os_str(), "the exe folder")?)
+        }
+        _ => None,
+    };
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        dwFlags: if show.is_some() {
+            STARTF_USESHOWWINDOW
+        } else {
+            STARTUPINFOW_FLAGS(0)
+        },
+        wShowWindow: show.unwrap_or(0),
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: every buffer is NUL-terminated (the environment block double-NUL-terminated)
+    // and outlives the call; `command_line` is mutable as `CreateProcessW` requires;
+    // `startup` and `info` are valid for reads and writes respectively.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(application.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            // The block below is always UTF-16, whatever the caller's flags say.
+            PROCESS_CREATION_FLAGS(flags | CREATE_UNICODE_ENVIRONMENT.0),
+            Some(environment.as_ptr().cast()),
+            directory
+                .as_ref()
+                .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+            &startup,
+            &mut info,
+        )
+    }
+    .map_err(|e| io_error(&e))?;
+    // SAFETY: `CreateProcessW` succeeded, so both handles are fresh and ours; the thread
+    // handle is not needed.
+    let _ = unsafe { CloseHandle(info.hThread) };
+    Ok(ProcessHandle {
+        // SAFETY: the process handle is fresh and owned by nothing else.
+        handle: unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) },
+        pid: info.dwProcessId,
+    })
 }
 
 /// Spawns `req` detached with [`SystemSpawner`].
