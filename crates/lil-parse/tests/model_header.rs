@@ -327,11 +327,7 @@ fn gguf_string_over_64_kib_is_unknown() {
     assert_eq!(gg(&at_limit.bytes()).unwrap(), known(&long));
     let over = Gguf::new(3).string("general.architecture", &format!("{long}a"));
     assert_eq!(gg(&over.bytes()).unwrap(), Family::Unknown);
-    // A long string before the key, as a value or as a key.
-    let value_first = Gguf::new(3)
-        .string("x.template", &format!("{long}a"))
-        .string("general.architecture", "llama");
-    assert_eq!(gg(&value_first.bytes()).unwrap(), Family::Unknown);
+    // A long key before the family is held in memory to be compared, so it is refused.
     let key_first = Gguf::new(3)
         .kv(&format!("{long}a"), T_U8, &[0])
         .string("general.architecture", "llama");
@@ -348,6 +344,37 @@ fn gguf_string_over_64_kib_is_unknown() {
     };
     assert_eq!(gguf_family(&mut r).unwrap(), Family::Unknown);
     assert_eq!(r.pos, head.len());
+}
+
+#[test] // spec: CORE-164
+fn gguf_long_skipped_values_keep_the_family() {
+    // Skipped values aren't held in memory, so the 64 KiB limit doesn't apply to them: a
+    // 100 KiB chat template before or after the family, or in an array, doesn't hide it.
+    let template = "{% x %}".repeat(100 * 1024 / 7 + 1);
+    assert!(template.len() > 100 * 1024);
+    let after = Gguf::new(3)
+        .string("general.architecture", "llama")
+        .string("tokenizer.chat_template", &template);
+    assert_eq!(gg(&after.bytes()).unwrap(), known("llama"));
+    let before = Gguf::new(3)
+        .string("tokenizer.chat_template", &template)
+        .string("general.architecture", "llama");
+    assert_eq!(gg(&before.bytes()).unwrap(), known("llama"));
+    let mut strings = Vec::new();
+    gstr(&mut strings, template.as_bytes());
+    let in_array = Gguf::new(3).string("general.architecture", "llama").kv(
+        "x.templates",
+        T_ARRAY,
+        &array(T_STRING, 1, &strings),
+    );
+    assert_eq!(gg(&in_array.bytes()).unwrap(), known("llama"));
+    // A skipped value longer than the file is still an unexpected end of file.
+    let mut head = Gguf::new(3).string("general.architecture", "llama").bytes();
+    head[16..24].copy_from_slice(&2_u64.to_le_bytes());
+    gstr(&mut head, b"x");
+    head.extend_from_slice(&T_STRING.to_le_bytes());
+    head.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(matches!(gg(&head), Err(HeaderError::Io(_))));
 }
 
 #[test] // spec: CORE-164

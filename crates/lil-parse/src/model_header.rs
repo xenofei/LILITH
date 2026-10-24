@@ -13,7 +13,8 @@ use std::io::{self, Read};
 const MAX_SAFETENSORS_HEADER: u64 = 100 * 1024 * 1024;
 /// The most GGUF keys before `general.architecture`.
 const MAX_GGUF_KEYS_FIRST: u64 = 1024;
-/// The longest string read, or skipped, in a header.
+/// The longest string held in memory: a key or the family. A skipped value has no limit of its
+/// own; the 100 MiB read bound covers it.
 const MAX_STRING: u64 = 64 * 1024;
 /// The deepest GGUF array of arrays skipped.
 const MAX_GGUF_ARRAY_DEPTH: u32 = 8;
@@ -263,7 +264,8 @@ fn json_value_end(json: &[u8], at: usize, max_depth: usize) -> Result<usize, &'s
 
 /// The family in a GGUF header (versions 2 and 3; another version is [`Family::Unknown`]);
 /// more than 1,024 keys before `general.architecture`, `general.architecture` given twice, a
-/// string over 64 KiB, or a key-value section over 100 MiB, is [`Family::Unknown`].
+/// key or family over 64 KiB, or a key-value section over 100 MiB, is [`Family::Unknown`]. Other
+/// values are skipped whatever their length.
 ///
 /// # Errors
 /// [`HeaderError`] when the header can't be read or isn't a GGUF header.
@@ -341,9 +343,6 @@ fn skip_value(r: &mut dyn Read, ty: u32, depth: u32) -> Result<(), Stop> {
     match ty {
         GGUF_STRING => {
             let len = read_u64(r)?;
-            if len > MAX_STRING {
-                return Err(Stop::Limit);
-            }
             skip(r, len)
         }
         GGUF_ARRAY => {
