@@ -16,11 +16,17 @@
 //!   **phase 1**, hands off: four prompts, each owned by the probe's window while another
 //!   application (a test window) is in front, first an ordinary window and then a fullscreen
 //!   one: create, create, consent, consent. Each is cancelled by the probe as soon as its
-//!   placement is read (at most 6 s), so nothing is created. Then **phase 2**: three prompts the
-//!   owner confirms (face, fingerprint or PIN) once each is in front: create the throwaway
+//!   placement is read (at most 6 s), so nothing is created (unless Windows Hello Face confirms
+//!   one by itself first). Then **phase 2**: three prompts the owner confirms (face, fingerprint
+//!   or PIN) once each is in front, each after its own 10 s warning: create the throwaway
 //!   credential, sign with it with the ordinary window in front, sign with the fullscreen window
 //!   in front. Then the credential is deleted and checked gone. Every 150 ms of every call,
 //!   `GetForegroundWindow` and the last-input time are recorded.
+//!
+//!   The credential is removed on every way out: a leftover from an earlier run first, then at
+//!   the end, on an error or a panic (a drop guard), and on Ctrl+C, Ctrl+Break or a closed
+//!   terminal (a console handler). If that removal ever fails, the run prints the `cleanup`
+//!   command.
 //! - `cleanup` (no prompt): deletes the throwaway credential, if a stopped run left it.
 //! - `blocker [--fullscreen]` and `owner --op create|sign|consent --mode placement|gesture`: the
 //!   two child processes `run` starts. The owner child is started by this background process,
@@ -246,10 +252,28 @@ fn run(out: PathBuf) -> i32 {
         );
         return 1;
     }
+    // The throwaway credential goes on every way out: a normal end, an error or a panic (the
+    // guard's drop), and Ctrl+C, Ctrl+Break or a closed terminal (the console handler).
+    let mut guard = CredentialGuard { finished: false };
+    if !cleanup::install_console_handler() {
+        eprintln!("couldn't install the Ctrl+C handler; nothing was done");
+        return 1;
+    }
+    // A leftover from an earlier run is removed first.
+    let leftover = if pre["probe_credential_exists"]["Ok"] == json!(true) {
+        Some(hello::kek_remove(CREDENTIAL).map_err(|e| e.to_string()))
+    } else {
+        None
+    };
     println!(
         "This takes about 2 minutes. A pop-up at the top of the screen says when to keep your"
     );
-    println!("hands off and when to confirm a Windows Hello prompt. Press Enter to start.");
+    println!("hands off and when to confirm a Windows Hello prompt.");
+    println!(
+        "If you stop it part-way (Ctrl+C), it removes its test key itself; if that ever fails, run:"
+    );
+    println!("  {CLEANUP_COMMAND}");
+    println!("Press Enter to start.");
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
 
@@ -272,7 +296,16 @@ fn run(out: PathBuf) -> i32 {
         "Next: 3 Windows Hello prompts. Don't touch anything until each one is in front,\nthen confirm it (face, fingerprint or PIN).",
         phase_2_s,
     );
-    for step in PHASE_2 {
+    for (i, step) in PHASE_2.into_iter().enumerate() {
+        // At least 10 s of warning before each prompt's hands-off stretch, so the tail of the
+        // last confirmation (a PIN's keys, a mouse move) can't land in the next call.
+        if i > 0 {
+            popup.warn_owner(
+                10,
+                "Next prompt in a moment: hands off until it is in front, then confirm it.",
+                (PHASE_2.len() - i) as u64 * PHASE_2_STEP_S,
+            );
+        }
         let record = run_step(step, &popup);
         popup.resume();
         let failed = record["result"]["ok"] != json!(true);
@@ -283,6 +316,7 @@ fn run(out: PathBuf) -> i32 {
     }
     let deleted = hello::kek_remove(CREDENTIAL).map_err(|e| e.to_string());
     let gone = hello::credential_exists(CREDENTIAL).map_err(|e| e.to_string());
+    guard.finished = gone == Ok(false);
     popup.done();
 
     let verdict = route_verdict(&steps, gone == Ok(false));
@@ -291,7 +325,7 @@ fn run(out: PathBuf) -> i32 {
         "time": utc_now(),
         "preflight": pre,
         "steps": steps,
-        "cleanup": { "delete": deleted, "exists_after": gone },
+        "cleanup": { "leftover_at_start": leftover, "delete": deleted, "exists_after": gone },
         "verdict": verdict,
     });
     write_results(&out, &record);
@@ -303,6 +337,72 @@ fn run(out: PathBuf) -> i32 {
     );
     println!("Results: {}", out.display());
     0
+}
+
+/// The one command that removes the throwaway credential by hand (no prompt), from any folder.
+const CLEANUP_COMMAND: &str = r#"cargo run -q --offline --manifest-path "$env:USERPROFILE\LILITH-work\p4a-t28\Cargo.toml" -p lil-platform --example hello-probe -- cleanup"#;
+
+/// Removes the throwaway credential when `run` ends any other way than cleanly: an early
+/// return, an error or a panic (drop runs while unwinding). Says what to run if that fails.
+struct CredentialGuard {
+    /// Set once the credential was deleted and checked gone.
+    finished: bool,
+}
+
+impl Drop for CredentialGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        cleanup::remove_and_report("the run ended early");
+    }
+}
+
+/// The abnormal-end cleanup, shared by the drop guard and the console handler.
+mod cleanup {
+    use super::{CLEANUP_COMMAND, CREDENTIAL, hello};
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+        SetConsoleCtrlHandler,
+    };
+    use windows::core::BOOL;
+
+    /// Deletes the credential (no prompt) and says so; on failure, prints the exact command.
+    pub fn remove_and_report(why: &str) {
+        match hello::kek_remove(CREDENTIAL).and_then(|()| hello::credential_exists(CREDENTIAL)) {
+            Ok(false) => eprintln!("hello-probe: {why}; its test key {CREDENTIAL} is removed."),
+            Ok(true) => eprintln!(
+                "hello-probe: {why}, and its test key {CREDENTIAL} is still there. Remove it with:\n  {CLEANUP_COMMAND}"
+            ),
+            Err(e) => eprintln!(
+                "hello-probe: {why}, and removing its test key {CREDENTIAL} failed ({e}). Remove it with:\n  {CLEANUP_COMMAND}"
+            ),
+        }
+    }
+
+    extern "system" fn on_console_event(event: u32) -> BOOL {
+        match event {
+            e if e == CTRL_C_EVENT
+                || e == CTRL_BREAK_EVENT
+                || e == CTRL_CLOSE_EVENT
+                || e == CTRL_LOGOFF_EVENT
+                || e == CTRL_SHUTDOWN_EVENT =>
+            {
+                remove_and_report("stopped");
+                // Not handled: Windows' default handler then ends the process. The test window
+                // and the owner child share this console and get the same event.
+                BOOL(0)
+            }
+            _ => BOOL(0),
+        }
+    }
+
+    /// Installs [`on_console_event`] for this process. `false` when Windows refused.
+    pub fn install_console_handler() -> bool {
+        // SAFETY: a plain `extern "system"` handler with the documented signature, for the
+        // life of the process.
+        unsafe { SetConsoleCtrlHandler(Some(on_console_event), true) }.is_ok()
+    }
 }
 
 /// One step: the test window takes the front, then the owner child makes its call.
