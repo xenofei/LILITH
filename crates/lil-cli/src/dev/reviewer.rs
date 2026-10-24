@@ -1081,14 +1081,31 @@ pub(crate) fn with_owner_authenticator<T>(
     }
     let ask = |label: &str| Zeroizing::new(prompt.passphrase(label));
     let label = format!("Reviewer key passphrase (to {what}): ");
-    let passphrase = PassphraseUnlocker::new(&key_file.encrypted_pem, &ask).labelled(&label);
+    let at_terminal = PassphraseUnlocker::new(&key_file.encrypted_pem, &ask).labelled(&label);
+    // Without a terminal nobody can type the passphrase, so a failed Hello ends there; the
+    // console is never read (rpassword opens it directly, where no one may be looking).
+    let passphrase: &dyn Unlocker = if prompt.is_interactive() {
+        &at_terminal
+    } else {
+        &NoTerminal
+    };
     let auth = KeyAuthenticator::new(
         &say_escaped,
         hello.as_ref().map(|h| h as &dyn Unlocker),
-        &passphrase,
+        passphrase,
         &say_escaped,
     );
     Ok(f(&key_file, &auth))
+}
+
+/// The passphrase path when there is no terminal: it unlocks nothing.
+struct NoTerminal;
+
+impl Unlocker for NoTerminal {
+    fn unlock(&self) -> std::result::Result<Zeroizing<Vec<u8>>, KeyError> {
+        say_escaped("There is no terminal here to type the passphrase into.");
+        Err(KeyError::Unavailable)
+    }
 }
 
 /// `lil dev approve <pr>`: exit 0 when the approval was posted, 1 otherwise.
