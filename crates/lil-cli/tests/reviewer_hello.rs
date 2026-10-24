@@ -1114,17 +1114,64 @@ fn subject(pr: u64, head: &str) -> merge_flow::MergeSubject<'_> {
     }
 }
 
-/// Re-review m3: a long agent summary is cut, so it can't bury the audit.
+/// Re-review m3 and n1: a long agent summary is cut, by lines and by characters, so it can't
+/// bury the audit; the cut is said in lil's own words, outside the agent's quote.
 #[test] // spec: QA-036
 fn a_long_summary_is_cut_before_the_audit() {
-    let l = log();
-    let auth = FakeAuth::new(&l, Ok(()));
-    let steps = FakeSteps::new(&l, &[]);
+    let shown = |summary: &str| {
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let steps = FakeSteps::new(&l, &[]);
+        merge_flow(summary, "the audit", &steps, &auth).unwrap();
+        auth.seen.borrow()[0].0.clone()
+    };
+    let quoted_chars = |text: &str| -> usize {
+        text.lines()
+            .filter_map(|l| l.strip_prefix(QUOTE))
+            .map(|l| l.chars().count())
+            .sum()
+    };
+    let cut_line = |text: &str| -> String {
+        let cut: Vec<&str> = text.lines().filter(|l| l.contains("not shown")).collect();
+        assert_eq!(cut.len(), 1, "{text}");
+        assert!(!cut[0].starts_with(QUOTE), "the cut is lil's line: {text}");
+        // After the agent's text.
+        assert!(!text.lines().last().unwrap().starts_with(QUOTE), "{text}");
+        cut[0].to_string()
+    };
+
+    // Many short lines.
     let long: String = (1..=200).map(|i| format!("line {i}\n")).collect();
-    merge_flow(&long, "the audit", &steps, &auth).unwrap();
-    let (summary, _) = auth.seen.borrow()[0].clone();
-    assert!(summary.contains("line 60\n"), "{summary}");
+    let summary = shown(&long);
+    assert!(summary.contains(&format!("{QUOTE}line 60\n")), "{summary}");
     assert!(!summary.contains("line 61\n"), "{summary}");
-    assert!(summary.contains("(140 more lines not shown)"), "{summary}");
-    assert_eq!(merge_flow::capped("a\nb", 60), "a\nb");
+    let rest: usize = (61..=200).map(|i| format!("line {i}").len()).sum();
+    assert!(
+        cut_line(&summary).contains(&format!("{rest} more characters")),
+        "{summary}"
+    );
+
+    // One 64 KiB line, with no newline.
+    let one_line = "x".repeat(64 * 1024);
+    let summary = shown(&one_line);
+    assert_eq!(
+        quoted_chars(&summary),
+        merge_flow::SUMMARY_CHARS,
+        "{summary}"
+    );
+    let rest = 64 * 1024 - merge_flow::SUMMARY_CHARS;
+    assert!(
+        cut_line(&summary).contains(&format!("{rest} more characters")),
+        "{summary}"
+    );
+
+    // Short text is shown whole, with no cut.
+    assert_eq!(
+        merge_flow::capped("a\nb\n", 60, 4_000),
+        ("a\nb".to_string(), None)
+    );
+    // A cut inside a multi-byte character is never made.
+    let (kept, cut) = merge_flow::capped("ééé", 60, 2);
+    assert_eq!(kept, "éé");
+    assert!(cut.unwrap().contains("1 more character "));
 }

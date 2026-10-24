@@ -190,17 +190,44 @@ pub trait MergeFlowSteps {
 /// independent audit below it.
 pub const SUMMARY_LINES: usize = 60;
 
-/// `text`'s first `max` lines, then "(N more lines not shown)" when there were more.
-pub fn capped(text: &str, max: usize) -> String {
-    let lines: Vec<&str> = text.trim_end().lines().collect();
-    if lines.len() <= max {
-        return lines.join("\n");
+/// How many characters of the agent's summary are shown (re-review 2 n1): the window wraps long
+/// lines, so one long line could bury the audit too.
+pub const SUMMARY_CHARS: usize = 4_000;
+
+/// The part of `text` that is shown: at most `max_lines` lines and `max_chars` characters (the
+/// newlines between the lines don't count). When anything was cut, also lil's own line saying
+/// so, to be shown after the quoted text, never inside it.
+pub fn capped(text: &str, max_lines: usize, max_chars: usize) -> (String, Option<String>) {
+    let text = text.trim_end();
+    let mut kept = String::new();
+    let mut chars = 0;
+    let mut end = 0;
+    'lines: for (i, line) in text.lines().enumerate() {
+        if i == max_lines {
+            break;
+        }
+        if i > 0 {
+            kept.push('\n');
+        }
+        for c in line.chars() {
+            if chars == max_chars {
+                break 'lines;
+            }
+            kept.push(c);
+            chars += 1;
+        }
+        end = i + 1;
     }
-    format!(
-        "{}\n({} more lines not shown)",
-        lines[..max].join("\n"),
-        lines.len() - max
-    )
+    let all: usize = text.lines().map(|l| l.chars().count()).sum();
+    if chars == all && end == text.lines().count() {
+        return (kept, None);
+    }
+    let rest = all - chars;
+    let s = if rest == 1 { "" } else { "s" };
+    let cut = format!(
+        "(lil cut the agent's summary here: {rest} more character{s} not shown. The whole text is in the --summary file.)"
+    );
+    (kept, Some(cut))
 }
 
 /// The flow: the facts, then your authentication with the summary and the audit shown first,
@@ -213,11 +240,16 @@ pub fn merge_flow(
     auth: &dyn Authenticator,
 ) -> Result<String> {
     let facts = steps.facts()?;
-    let shown = format!(
+    let (kept, cut) = capped(summary, SUMMARY_LINES, SUMMARY_CHARS);
+    let mut shown = format!(
         "{}\nSummary of the change (written by the agent that ran the flow):\n{}",
         render_facts(&facts),
-        quoted(&capped(summary, SUMMARY_LINES))
+        quoted(&kept)
     );
+    if let Some(cut) = cut {
+        shown.push_str(&cut);
+        shown.push('\n');
+    }
     let pem = auth
         .authenticate(&shown, audit)
         .map_err(|e| anyhow!("{e}; nothing was approved or merged"))?;
