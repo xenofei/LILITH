@@ -25,6 +25,10 @@ toml.workspace = true
 # workspace's tracing stack.
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# `IAsyncOperation<T>` named as a type: Windows Hello's window-owned calls, bound by hand (hello,
+# Task 28). Not a workspace dependency, since only lil-platform names it; the version is the one
+# `windows` 0.62.2 already pulls in.
+windows-future = "0.3.2"
 zeroize.workspace = true
 
 # Plan 4a Task 5 adds the feature set Task 1 recorded (spike 11, S1.1), and the registry.
@@ -110,8 +114,21 @@ features = [
 [dev-dependencies]
 tempfile.workspace = true
 # tests/spawn.rs and tests/engine_spawn.rs mark a pipe handle inheritable to prove the spawn
-# does not leak it; tests/clock.rs reads the time zone's raw fields.
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time"] }
+# does not leak it; tests/clock.rs reads the time zone's raw fields. The Windows Hello probe
+# (examples/hello-probe.rs, Task 28 Step 0) reads the last-input time and the tick count, and
+# its test window may send one Alt tap before a call.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# Task 28's route step (P4a-R38): `cargo run -p lil-platform --example hello-probe -- dry | run`.
+# Its own tests (the placement bar and the route rule) run with the crate's.
+[[example]]
+name = "hello-probe"
+test = true
 
 [lints]
 workspace = true
