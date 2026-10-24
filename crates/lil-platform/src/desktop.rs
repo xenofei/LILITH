@@ -36,11 +36,13 @@ use crate::env::Env;
 use crate::power::PowerRequest;
 
 pub use crate::classes::{
-    leftover_registrations, register_handlers, remove_test_registry, unregister_handlers,
+    TEST_MARKER, leftover_registrations, register_handlers, remove_test_registry,
+    unregister_handlers,
 };
 pub use crate::power::POWER_REASON;
 pub use crate::shortcut::{
-    ShortcutInfo, read_shortcut, remove_clsid_registration, remove_shortcut, write_shortcut,
+    ShortcutInfo, read_shortcut, remove_aumid_registration, remove_clsid_registration,
+    remove_shortcut, write_shortcut,
 };
 pub use crate::toast::{
     WatchedToast, clear_toast_history, is_elevated, post_watched, toast_history_tags,
@@ -83,13 +85,23 @@ pub fn desktop_test_id_in(name: &str) -> Option<String> {
     })
 }
 
-/// The ids of the desktop-group test channels that still have a scheme key under
-/// `HKCU\Software\Classes`, a registry root under `HKCU\Software` or a shortcut in `programs`
-/// (read-only): what a killed host run can leave behind, for `lil dev desktop-tests --host` to
-/// sweep with the test-only removers (P4a-R39). Sorted, without repeats.
+/// Whether `id` is a desktop-group test channel id: `desktop-<16 lowercase hex>`.
+fn is_desktop_test_id(id: &str) -> bool {
+    id.strip_prefix(DESKTOP_TEST_ID_PREFIX).is_some_and(|hex| {
+        hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// The ids of the desktop-group test channels that left something on this PC (read-only):
+/// by name, a scheme key under `HKCU\Software\Classes`, a registry root under `HKCU\Software`
+/// or a shortcut in `programs`; and by [`TEST_MARKER`], any marked key directly below
+/// `HKCU\Software\Classes`, its `CLSID` or its `AppUserModelId`, so an orphaned CLSID or AUMID
+/// key whose other names are gone is found too. What a killed host run can leave behind, for
+/// [`sweep_desktop_tests`] (P4a-R39). Sorted, without repeats.
 pub fn desktop_test_ids_left(programs: &Path) -> std::io::Result<Vec<String>> {
-    let mut names = crate::classes::subkey_names(r"Software\Classes")?;
-    names.extend(crate::classes::subkey_names("Software")?);
+    use crate::classes::{marked_ids, subkey_names};
+    let mut names = subkey_names(r"Software\Classes")?;
+    names.extend(subkey_names("Software")?);
     match std::fs::read_dir(programs) {
         Ok(entries) => {
             for entry in entries {
@@ -100,9 +112,92 @@ pub fn desktop_test_ids_left(programs: &Path) -> std::io::Result<Vec<String>> {
         Err(e) => return Err(e),
     }
     let mut ids: Vec<String> = names.iter().filter_map(|n| desktop_test_id_in(n)).collect();
+    for root in [
+        r"Software\Classes",
+        r"Software\Classes\CLSID",
+        r"Software\Classes\AppUserModelId",
+    ] {
+        ids.extend(
+            marked_ids(root)?
+                .into_iter()
+                .filter(|id| is_desktop_test_id(id)),
+        );
+    }
     ids.sort();
     ids.dedup();
     Ok(ids)
+}
+
+/// The desktop test channel `id` as the host run's tests build it: the shell's classes root and
+/// `programs` as its Programs folder. Its roots are never used.
+fn desktop_sweep_env(id: &str, programs: &Path) -> Env {
+    let scratch = std::env::temp_dir().join("lil-desktop-sweep");
+    Env::with_roots(
+        crate::env::Channel::Test(id.to_string()),
+        crate::env::Roots {
+            roaming: scratch.clone(),
+            local: scratch.clone(),
+            user_profile: scratch,
+        },
+        "S-1-0-0".to_string(),
+    )
+    .with_programs_dir(programs.to_path_buf())
+    .with_shell_classes_root()
+}
+
+/// What `env` still has: its shortcut, its keys ([`leftover_registrations`]) and its toasts. A
+/// History that can't be read (`GetHistoryWithId` answers "not found" for an AUMID Windows never
+/// saw) counts as empty here; the tests' own cleanup checks it strictly.
+fn leftovers_of(env: &Env) -> std::io::Result<Vec<String>> {
+    let mut left = Vec::new();
+    let lnk = env.start_menu_shortcut();
+    if lnk.exists() {
+        left.push(lnk.display().to_string());
+    }
+    left.extend(leftover_registrations(env)?);
+    if let Ok(tags) = toast_history_tags(env) {
+        let aumid = env.notification_aumid();
+        left.extend(tags.into_iter().map(|t| format!("toast {t} of {aumid}")));
+    }
+    Ok(left)
+}
+
+/// What [`sweep_desktop_tests`] removed, and what is still there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopSweep {
+    pub removed: Vec<String>,
+    pub remaining: Vec<String>,
+}
+
+/// What every desktop test channel of [`desktop_test_ids_left`] still has (read-only).
+pub fn desktop_test_leftovers(programs: &Path) -> std::io::Result<Vec<String>> {
+    let mut left = Vec::new();
+    for id in desktop_test_ids_left(programs)? {
+        left.extend(leftovers_of(&desktop_sweep_env(&id, programs))?);
+    }
+    Ok(left)
+}
+
+/// Removes what every desktop test channel of [`desktop_test_ids_left`] left, each by its exact
+/// name through the test-only removers (which refuse anything but a test channel): the
+/// shortcut, the CLSID and AUMID registrations, the scheme, the registry root and the toasts.
+pub fn sweep_desktop_tests(programs: &Path) -> std::io::Result<DesktopSweep> {
+    let mut sweep = DesktopSweep::default();
+    for id in desktop_test_ids_left(programs)? {
+        let env = desktop_sweep_env(&id, programs);
+        let before = leftovers_of(&env)?;
+        remove_shortcut(&env)?;
+        unregister_handlers(&env)?;
+        remove_test_registry(&env)?;
+        // A History Windows never had for this AUMID can't be cleared: nothing to clear.
+        let _ = clear_toast_history(&env);
+        let after = leftovers_of(&env)?;
+        sweep
+            .removed
+            .extend(before.into_iter().filter(|b| !after.contains(b)));
+        sweep.remaining.extend(after);
+    }
+    Ok(sweep)
 }
 
 /// What `SHQueryUserNotificationState` says (CORE-160, P4a-R6): `D3d`, `Busy` and

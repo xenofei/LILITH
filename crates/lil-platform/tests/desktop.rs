@@ -525,8 +525,8 @@ fn desktop_toasts_state_is_ready_on_this_pc() {
 #[ignore = "desktop"]
 fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
     use lil_platform::desktop::{
-        leftover_registrations, read_shortcut, register_handlers, remove_clsid_registration,
-        remove_shortcut, unregister_handlers, write_shortcut,
+        leftover_registrations, read_shortcut, register_handlers, remove_aumid_registration,
+        remove_clsid_registration, remove_shortcut, unregister_handlers, write_shortcut,
     };
     require_desktop_group(false);
     let dir = tempfile::tempdir().unwrap();
@@ -589,6 +589,14 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
     );
     write_shortcut(&env, &exe).unwrap();
     assert_eq!(desktop.shortcut_state(&env, &exe), ShortcutState::Ok);
+    // The AUMID's registration alone gone: wrong too (plan 4a ruling 2026-10-24).
+    remove_aumid_registration(&env).unwrap();
+    assert_eq!(
+        desktop.shortcut_state(&env, &exe),
+        ShortcutState::WrongClsid
+    );
+    write_shortcut(&env, &exe).unwrap();
+    assert_eq!(desktop.shortcut_state(&env, &exe), ShortcutState::Ok);
 
     // Another build of the channel holds the handlers.
     register_handlers(&env, &other).unwrap();
@@ -620,13 +628,17 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
         r"HKCU\Software\Classes\CLSID\{}",
         shell.toast_activator_clsid()
     );
+    let aumid = format!(
+        r"HKCU\Software\Classes\AppUserModelId\{}",
+        shell.notification_aumid()
+    );
     let mut written = leftover_registrations(&shell).unwrap();
     written.sort();
-    let mut want = vec![scheme, clsid];
+    let mut want = vec![scheme, clsid, aumid];
     want.sort();
     assert_eq!(
         written, want,
-        "only the scheme and the CLSID, never .lilref"
+        "only the scheme, the CLSID and the AUMID, never .lilref"
     );
     remove_shortcut(&shell).unwrap();
     unregister_handlers(&shell).unwrap();
@@ -634,6 +646,50 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
         leftover_registrations(&shell).unwrap(),
         Vec::<String>::new()
     );
+}
+
+/// A killed run's orphans are found by their `LilTestChannel` marker, not only by name (Task 30's
+/// sweep): here the CLSID key and the AUMID key are each left alone, with every other name gone,
+/// and the sweep finds and removes them.
+#[test] // spec: APP-022, QA-042
+#[ignore = "desktop"]
+fn desktop_sweep_finds_orphaned_keys_by_their_marker() {
+    use lil_platform::desktop::{
+        desktop_test_ids_left, leftover_registrations, remove_aumid_registration,
+        remove_clsid_registration, sweep_desktop_tests, write_shortcut,
+    };
+    require_desktop_group(false);
+    let dir = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    for orphan in ["CLSID", "AppUserModelId"] {
+        let env = desktop_env(&dir.path().join(orphan)).with_shell_classes_root();
+        let _cleanup = Cleanup { env: &env };
+        let Channel::Test(id) = env.channel().clone() else {
+            unreachable!()
+        };
+        let lnk = env.start_menu_shortcut();
+        let programs = lnk.parent().unwrap().to_path_buf();
+        write_shortcut(&env, &exe).unwrap();
+        // Every other name gone: the shortcut, and the other key.
+        std::fs::remove_file(&lnk).unwrap();
+        if orphan == "CLSID" {
+            remove_aumid_registration(&env).unwrap();
+        } else {
+            remove_clsid_registration(&env).unwrap();
+        }
+        let left = leftover_registrations(&env).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].contains(&format!(r"\{orphan}\")), "{left:?}");
+        assert!(
+            desktop_test_ids_left(&programs).unwrap().contains(&id),
+            "the orphaned {orphan} key isn't found by its marker"
+        );
+        let sweep = sweep_desktop_tests(&programs).unwrap();
+        assert!(sweep.removed.contains(&left[0]), "{sweep:?}");
+        assert!(sweep.remaining.is_empty(), "{sweep:?}");
+        assert_eq!(leftover_registrations(&env).unwrap(), Vec::<String>::new());
+        assert!(!desktop_test_ids_left(&programs).unwrap().contains(&id));
+    }
 }
 
 #[test] // spec: ARCH-127, QA-042

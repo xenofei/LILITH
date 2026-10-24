@@ -95,6 +95,8 @@ const VC_RUNTIME: [&str; 3] = ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp1
 pub const OWNER_STEP: &str = "Windows Sandbox isn't turned on. It's a one-time step for you: \
     Settings > System > Optional features > More Windows features > Windows Sandbox (it needs \
     virtualization on in the firmware), then restart, and run this again.";
+/// Why a run that Ctrl+C stopped ends.
+pub const INTERRUPTED: &str = "interrupted (Ctrl+C)";
 /// The refusal while another Sandbox runs.
 pub const ONE_AT_A_TIME: &str =
     "Only one Windows Sandbox can run at a time; close the open one, then run this again.";
@@ -395,6 +397,9 @@ pub trait HostOps {
     fn sweep_desktop_leftovers(&self) -> io::Result<Swept>;
     /// `LIL_QT_DIR`: the Qt pair's folder.
     fn qt_dir(&self) -> Option<PathBuf>;
+    /// Whether Ctrl+C or Ctrl+Break came: the run then stops its Sandbox, or cleans up after
+    /// the host run, before it exits.
+    fn interrupted(&self) -> bool;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -651,6 +656,9 @@ fn run_sandbox(
         ));
     }
     write(&l.wsb, &wsb_xml(&mapped))?;
+    if host.interrupted() {
+        return fail(INTERRUPTED);
+    }
     println!("Starting Windows Sandbox ({}).", l.wsb.display());
     println!(
         "Keep the PC unlocked until the run is done; the Sandbox's window may stay in the \
@@ -659,8 +667,9 @@ fn run_sandbox(
     let handle = launcher
         .start(&l.wsb)
         .or_else(|e| fail(format!("couldn't start Windows Sandbox: {e}")))?;
-    let outcome = wait_and_collect(l, cfg, clock);
-    if cfg.keep_open {
+    let outcome = wait_and_collect(l, cfg, host, clock);
+    // Ctrl+C closes the Sandbox even with --keep-open.
+    if cfg.keep_open && !host.interrupted() {
         println!("--keep-open: the Sandbox stays open; close its window when you are done.");
     } else if let Err(e) = launcher.stop(&handle) {
         eprintln!(
@@ -839,10 +848,18 @@ struct Done {
     error: Option<String>,
 }
 
-fn wait_and_collect(l: &Layout, cfg: &RunConfig, clock: &dyn Clock) -> Result<Summary, RunError> {
+fn wait_and_collect(
+    l: &Layout,
+    cfg: &RunConfig,
+    host: &dyn HostOps,
+    clock: &dyn Clock,
+) -> Result<Summary, RunError> {
     let t0 = clock.now();
     let started = l.out_dir.join("started.json");
     while !started.is_file() {
+        if host.interrupted() {
+            return fail(INTERRUPTED);
+        }
         if clock.now() - t0 >= cfg.start_timeout {
             return fail(format!(
                 "Windows Sandbox didn't start: no started.json within {} s.",
@@ -858,6 +875,9 @@ fn wait_and_collect(l: &Layout, cfg: &RunConfig, clock: &dyn Clock) -> Result<Su
     );
     let done = l.out_dir.join("done.json");
     while !done.is_file() {
+        if host.interrupted() {
+            return fail(INTERRUPTED);
+        }
         if clock.now() - t0 >= cfg.timeout {
             return fail(format!(
                 "the tests didn't finish within {} s (no done.json).",
@@ -990,11 +1010,16 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
         })?;
     clock.sleep(HANDS_OFF_WARNING);
     let mut run = host_nextest(&l.repo, "run");
+    // Ctrl+C during the warning: nothing runs, but the cleanup below still does.
     run.env.push(("LIL_DESKTOP_HOST".into(), "1".into()));
     run.env
         .push(("LIL_DEPLOY_DIR".into(), l.deploy.display().to_string()));
     run.env_remove.push("LIL_SANDBOX".into());
-    let ran = host.run(&run);
+    let ran = if host.interrupted() {
+        Err(io::Error::other(INTERRUPTED))
+    } else {
+        host.run(&run)
+    };
     let mut summary = Summary::default();
     match host.desktop_leftovers() {
         Ok(left) if left.is_empty() => {}
@@ -1016,6 +1041,15 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
             .push(format!("couldn't check what the tests left behind: {e}")),
     }
     popup.done();
+    // Ctrl+C reaches the tests too; their leftovers were checked and swept above.
+    if host.interrupted() {
+        let cleanup = if summary.problems.is_empty() {
+            "nothing was left behind".to_string()
+        } else {
+            summary.problems.join("; ")
+        };
+        return fail(format!("{INTERRUPTED}; {cleanup}"));
+    }
     let code = ran.or_else(|e| fail(format!("couldn't run `{}`: {e}", run.line())))?;
     let xml = std::fs::read_to_string(&junit)
         .or_else(|e| fail(format!("no JUnit file at {}: {e}", junit.display())))?;
@@ -1073,6 +1107,9 @@ pub fn cli(suite: Suite, timeout: Duration, keep_open: bool) -> i32 {
         start_timeout: START_TIMEOUT,
         keep_open,
     };
+    if let Err(e) = lil_platform::interrupt::catch_interrupts() {
+        eprintln!("warning: Ctrl+C can't be caught ({e}): it would leave the Sandbox open.");
+    }
     let result = run(&repo, &cfg, &RealLauncher::new(), &SystemClock::new());
     match &result {
         Ok(s) => print_summary(s),
@@ -1518,41 +1555,6 @@ fn encoded_command(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// The Env of the desktop test channel `id` as the host run builds it: the shell's classes root
-/// and the real Programs folder (its roots are never used: nothing is written there).
-fn desktop_env(id: &str, programs: &Path) -> lil_platform::Env {
-    let scratch = std::env::temp_dir().join("lil-desktop-sweep");
-    lil_platform::Env::with_roots(
-        lil_platform::Channel::Test(id.to_string()),
-        lil_platform::Roots {
-            roaming: scratch.clone(),
-            local: scratch.clone(),
-            user_profile: scratch,
-        },
-        "S-1-0-0".to_string(),
-    )
-    .with_programs_dir(programs.to_path_buf())
-    .with_shell_classes_root()
-}
-
-/// What `env` (a desktop test channel) still has: its shortcut, its keys (scheme, CLSID,
-/// registry root) and its toasts. A History that can't be read for an AUMID Windows never saw
-/// counts as empty here (the tests' own cleanup checks it strictly).
-fn leftovers_of(env: &lil_platform::Env) -> io::Result<Vec<String>> {
-    use lil_platform::desktop::{leftover_registrations, toast_history_tags};
-    let mut left = Vec::new();
-    let lnk = env.start_menu_shortcut();
-    if lnk.exists() {
-        left.push(lnk.display().to_string());
-    }
-    left.extend(leftover_registrations(env)?);
-    if let Ok(tags) = toast_history_tags(env) {
-        let aumid = env.notification_aumid();
-        left.extend(tags.into_iter().map(|t| format!("toast {t} of {aumid}")));
-    }
-    Ok(left)
-}
-
 struct RealHandsOff {
     state: PathBuf,
 }
@@ -1756,35 +1758,20 @@ impl HostOps for RealHost {
 
     fn desktop_leftovers(&self) -> io::Result<Vec<String>> {
         let programs = lil_platform::known_folders::programs().map_err(io::Error::other)?;
-        let mut left = Vec::new();
-        for id in lil_platform::desktop::desktop_test_ids_left(&programs)? {
-            left.extend(leftovers_of(&desktop_env(&id, &programs))?);
-        }
-        Ok(left)
+        lil_platform::desktop::desktop_test_leftovers(&programs)
     }
 
     fn sweep_desktop_leftovers(&self) -> io::Result<Swept> {
-        use lil_platform::desktop::{
-            clear_toast_history, remove_shortcut, remove_test_registry, unregister_handlers,
-        };
         let programs = lil_platform::known_folders::programs().map_err(io::Error::other)?;
-        let mut swept = Swept::default();
-        for id in lil_platform::desktop::desktop_test_ids_left(&programs)? {
-            let env = desktop_env(&id, &programs);
-            let before = leftovers_of(&env)?;
-            // Each remover refuses anything but a test channel.
-            remove_shortcut(&env)?;
-            unregister_handlers(&env)?;
-            remove_test_registry(&env)?;
-            // A History Windows never had for this AUMID can't be cleared: nothing to clear.
-            let _ = clear_toast_history(&env);
-            let after = leftovers_of(&env)?;
-            swept
-                .removed
-                .extend(before.into_iter().filter(|b| !after.contains(b)));
-            swept.remaining.extend(after);
-        }
-        Ok(swept)
+        let sweep = lil_platform::desktop::sweep_desktop_tests(&programs)?;
+        Ok(Swept {
+            removed: sweep.removed,
+            remaining: sweep.remaining,
+        })
+    }
+
+    fn interrupted(&self) -> bool {
+        lil_platform::interrupt::interrupted()
     }
 
     fn qt_dir(&self) -> Option<PathBuf> {
@@ -1854,6 +1841,10 @@ mod tests {
         ctest_json: String,
         qt: Option<PathBuf>,
         host_junit: String,
+        /// Ctrl+C has come.
+        interrupt: Rc<Cell<bool>>,
+        /// Ctrl+C comes while the host tests run, and they leave this behind.
+        run_interrupted_leaving: Option<String>,
     }
 
     struct FakePopup {
@@ -1885,6 +1876,11 @@ mod tests {
                     std::fs::write(dir.join("lil.pdb"), b"pdb").unwrap();
                 }
                 ("cargo", ["nextest", "run", ..]) => {
+                    if let Some(left) = &self.run_interrupted_leaving {
+                        self.interrupt.set(true);
+                        self.leftovers.borrow_mut().push(left.clone());
+                        return Ok(1);
+                    }
                     let dir = self.repo.join(r"target\nextest\desktop");
                     std::fs::create_dir_all(&dir).unwrap();
                     std::fs::write(dir.join("junit.xml"), &self.host_junit).unwrap();
@@ -1954,6 +1950,10 @@ mod tests {
 
         fn qt_dir(&self) -> Option<PathBuf> {
             self.qt.clone()
+        }
+
+        fn interrupted(&self) -> bool {
+            self.interrupt.get()
         }
     }
 
@@ -2067,6 +2067,8 @@ mod tests {
                     ctest_json: String::new(),
                     qt: None,
                     host_junit: junit(&[(HOST_SET[0], true), (HOST_SET[1], true)]),
+                    interrupt: Rc::default(),
+                    run_interrupted_leaving: None,
                 },
                 clock: FakeClock {
                     now: Cell::new(Duration::ZERO),
@@ -3119,6 +3121,9 @@ mod tests {
             fn qt_dir(&self) -> Option<PathBuf> {
                 None
             }
+            fn interrupted(&self) -> bool {
+                false
+            }
         }
         let leaving = Leaving(host, leftover);
         let summary =
@@ -3134,6 +3139,56 @@ mod tests {
         assert_eq!(log[check + 1], "sweep", "{log:?}");
         assert!(host.leftovers.borrow().is_empty(), "swept");
         assert_eq!(log.last().unwrap(), "popup done");
+    }
+
+    #[test] // spec: QA-042
+    fn ctrl_c_stops_the_sandbox_even_with_keep_open() {
+        let fx = Fx::new();
+        let interrupt = fx.host.interrupt.clone();
+        let launcher = fx.launcher(Box::new(move |out: &Path| {
+            std::fs::write(out.join("started.json"), "{}").unwrap();
+            interrupt.set(true);
+        }));
+        let mut c = cfg(Suite::Desktop);
+        c.keep_open = true;
+        let result = fx.run(&c, &launcher);
+        assert_eq!(exit_code(&result), 2);
+        assert_eq!(result.unwrap_err().0, INTERRUPTED);
+        assert_eq!(
+            launcher.stops.get(),
+            1,
+            "the Sandbox and its viewer are closed"
+        );
+        // Ctrl+C while the Sandbox starts, before started.json: stopped too.
+        let fx = Fx::new();
+        let interrupt = fx.host.interrupt.clone();
+        let launcher = fx.launcher(Box::new(move |_: &Path| interrupt.set(true)));
+        assert_eq!(exit_code(&fx.run(&cfg(Suite::Desktop), &launcher)), 2);
+        assert_eq!(launcher.stops.get(), 1);
+    }
+
+    #[test] // spec: QA-042
+    fn ctrl_c_on_the_host_run_still_cleans_up() {
+        let mut fx = Fx::new();
+        let leftover = r"HKCU\Software\Classes\CLSID\{00000000-0000-5000-8000-000000000000}";
+        fx.host.run_interrupted_leaving = Some(leftover.to_string());
+        let launcher = fx.launcher(finishes());
+        let result = fx.run(&cfg(Suite::Host), &launcher);
+        assert_eq!(exit_code(&result), 2);
+        let err = result.unwrap_err().0;
+        assert!(err.starts_with(INTERRUPTED), "{err}");
+        assert!(err.contains(leftover), "{err}");
+        let log = fx.log.borrow();
+        let ran = log
+            .iter()
+            .position(|e| e.starts_with("run cargo nextest run"))
+            .unwrap();
+        assert_eq!(
+            log[ran + 1..],
+            ["check leftovers", "sweep", "popup done"],
+            "{log:?}"
+        );
+        assert!(fx.host.leftovers.borrow().is_empty(), "swept");
     }
 
     #[test] // spec: QA-042

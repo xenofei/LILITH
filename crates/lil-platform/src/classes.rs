@@ -237,6 +237,27 @@ pub(crate) fn require_test_channel(env: &Env, what: &str) -> io::Result<()> {
     }
 }
 
+/// The value every registry key a test channel's registration writes carries: the test
+/// channel's id (Appendix G, plan 4a ruling 2026-10-24). A killed run's keys are found by it
+/// ([`marked_ids`]), even when the names that would lead to them are gone.
+pub const TEST_MARKER: &str = "LilTestChannel";
+
+/// Writes [`TEST_MARKER`] into `HKCU\<subkey>` on a test channel; nothing on stable or dev.
+pub(crate) fn mark(env: &Env, subkey: &str) -> io::Result<()> {
+    match env.channel() {
+        Channel::Test(id) => set_string(subkey, Some(TEST_MARKER), id),
+        _ => Ok(()),
+    }
+}
+
+/// The [`TEST_MARKER`] values of the subkeys directly below `HKCU\<subkey>` (read-only).
+pub(crate) fn marked_ids(subkey: &str) -> io::Result<Vec<String>> {
+    Ok(subkey_names(subkey)?
+        .into_iter()
+        .filter_map(|name| get_string(&format!(r"{subkey}\{name}"), Some(TEST_MARKER)))
+        .collect())
+}
+
 /// `"<exe>"`: the exe as the registry values quote it. An exe path that isn't valid Unicode
 /// (it would be written lossily) or holds a `"` (it can't be quoted) is refused.
 pub(crate) fn quoted(exe: &Path) -> io::Result<String> {
@@ -296,11 +317,15 @@ pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
         &format!("{exe},0"),
     )?;
     set_string(&format!(r"{}\shell\open\command", k.scheme), None, &command)?;
+    mark(env, &k.scheme)?;
     if env.uses_shell_classes_root() {
         return Ok(());
     }
-    set_string(&format!(r"{}\.lilref", k.root), None, &lilref_progid(env))?;
-    set_string(&format!(r"{}\shell\open\command", k.progid), None, &command)
+    let association = format!(r"{}\.lilref", k.root);
+    set_string(&association, None, &lilref_progid(env))?;
+    mark(env, &association)?;
+    set_string(&format!(r"{}\shell\open\command", k.progid), None, &command)?;
+    mark(env, &k.progid)
 }
 
 /// Removes a test channel's scheme and `.lilref` file type, and the `.lilref` association while
@@ -327,17 +352,19 @@ pub fn remove_test_registry(env: &Env) -> io::Result<()> {
 
 /// What a test channel's registrations left behind (read-only; the desktop group's check that
 /// its cleanup removed everything, P4a-R39): each of its scheme key, `.lilref` file type, toast
-/// CLSID key and registry root that still exists, and the `.lilref` association while it names
+/// CLSID key, AUMID registration and registry root that still exists, and the `.lilref` association while it names
 /// the channel's type, as `HKCU\…` names. Refused on a stable or dev channel.
 pub fn leftover_registrations(env: &Env) -> io::Result<Vec<String>> {
     require_test_channel(env, "checking for leftover registrations")?;
     let k = keys(env)?;
     let clsid = format!(r"{}\CLSID\{}", k.root, env.toast_activator_clsid());
+    let aumid = format!(r"{}\AppUserModelId\{}", k.root, env.notification_aumid());
     let association = format!(r"{}\.lilref", k.root);
     let mut left: Vec<String> = [
         k.scheme,
         k.progid,
         clsid,
+        aumid,
         hkcu_subkey(&env.registry_root())?,
     ]
     .into_iter()

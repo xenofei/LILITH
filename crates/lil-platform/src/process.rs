@@ -396,6 +396,13 @@ impl RawSpawner for SystemSpawner {
 /// (ARCH-015, Appendix G "`lil-mcp` launches"): the spawn of [`spawn_detached`], with
 /// `STARTF_USESHOWWINDOW` and `SW_SHOWNOACTIVATE`, so the app's first window shows without
 /// taking the foreground. Returns the pid; the process handle is closed.
+///
+/// It is for GUI programs (the apps). A console program that needs a console gets none here
+/// (`DETACHED_PROCESS`) and quits without doing its work: checked on Windows 11 with this
+/// function and [`spawn_detached`], `cmd.exe /c exit 7` exits 1 and `powershell.exe -Command
+/// "exit 7"` (or `-File <script>`, WinForms or not) exits 0 without running a line. That is
+/// why the hands-off pop-up of `lil dev desktop-tests --host`, a PowerShell script, never
+/// showed through it (Task 30). Start such a program with `CREATE_NO_WINDOW` instead.
 pub fn spawn_no_activate(exe: &Path, args: &[String]) -> io::Result<u32> {
     let req = SpawnRequest {
         exe: exe.to_path_buf(),
