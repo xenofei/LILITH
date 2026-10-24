@@ -359,6 +359,48 @@ fn toasts_state_maps_each_notifier_setting() {
 }
 
 #[test] // spec: APP-022, ARCH-055
+fn not_yet_shown_restarts_after_any_other_reading() {
+    use lil_platform::desktop::{NOT_SHOWN_GRACE, NotShownEnd};
+    let s = Duration::from_secs;
+    let mut end = NotShownEnd::default();
+    // An Ok post that never shows: no platform once the grace has passed.
+    end.posted_ok(s(0));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(1)),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, NOT_SHOWN_GRACE),
+        ToastsState::Unavailable("no_platform")
+    );
+    // It showed after all: Ready, and the timer is cleared.
+    assert_eq!(end.state(ToastsState::Ready, s(6)), ToastsState::Ready);
+    // A later NotYetShown (a reset platform) starts afresh: postable, not no_platform at once.
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(100)),
+        ToastsState::NotYetShown
+    );
+    end.posted_ok(s(100));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(104)),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(105)),
+        ToastsState::Unavailable("no_platform")
+    );
+    // A Disabled reading clears it too.
+    let mut end = NotShownEnd::default();
+    end.posted_ok(s(0));
+    let off = ToastsState::Unavailable("disabled_for_user");
+    assert_eq!(end.state(off, s(10)), off);
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(11)),
+        ToastsState::NotYetShown
+    );
+}
+
+#[test] // spec: APP-022, ARCH-055
 fn not_yet_shown_ends_when_an_ok_post_never_shows() {
     use lil_platform::desktop::{NOT_SHOWN_GRACE, toasts_state_after_post};
     let grace = NOT_SHOWN_GRACE;

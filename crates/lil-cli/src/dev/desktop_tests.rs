@@ -101,6 +101,8 @@ pub const OWNER_STEP: &str = "Windows Sandbox isn't turned on. It's a one-time s
     virtualization on in the firmware), then restart, and run this again.";
 /// Why a run that Ctrl+C stopped ends.
 pub const INTERRUPTED: &str = "interrupted (Ctrl+C)";
+/// The per-user named mutex that lets one host run go at a time.
+pub const HOST_RUN_MUTEX: &str = r"Local\LILITH-desktop-host-run";
 /// The refusal while another Sandbox runs.
 pub const ONE_AT_A_TIME: &str =
     "Only one Windows Sandbox can run at a time; close the open one, then run this again.";
@@ -398,8 +400,10 @@ pub trait HostOps {
         run: Duration,
         cap: Duration,
     ) -> io::Result<Box<dyn HandsOff>>;
-    /// Whether the process `pid` runs (the host-run lock's owner).
-    fn process_alive(&self, pid: u32) -> bool;
+    /// Takes the per-user host-run lock ([`HOST_RUN_MUTEX`]) without waiting. `None` when
+    /// another run holds it; otherwise the held lock, which the run keeps until it ends, and
+    /// whether its last owner ended without releasing it (a crash: Windows released it).
+    fn lock_host_run(&self) -> io::Result<Option<(Box<dyn std::any::Any>, bool)>>;
     /// What desktop test channels left on this PC: shortcuts, registry keys, CLSIDs, toasts.
     fn desktop_leftovers(&self) -> io::Result<Vec<String>>;
     /// Removes what [`HostOps::desktop_leftovers`] finds, through the test-only removers.
@@ -989,8 +993,30 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
              from a terminal that isn't elevated (not \"Run as administrator\").",
         );
     }
-    // One host run at a time: a second one's sweep would remove the first one's live keys.
-    let _lock = HostLock::take(&l.root.join("host").join("host-run.lock"), host)?;
+    // One host run at a time per user, whatever checkout it runs from: a second run's sweep or
+    // cleanup would remove the first one's live keys (they share the fixed test id). Held for the
+    // whole run, the start-up sweep and the final cleanup included.
+    let _lock = match host.lock_host_run().or_else(|e| {
+        fail(format!(
+            "couldn't take the host-run lock {HOST_RUN_MUTEX}: {e}"
+        ))
+    })? {
+        None => {
+            return fail(format!(
+                "another host run is in progress (it holds {HOST_RUN_MUTEX}); let it finish, \
+                 then run this again."
+            ));
+        }
+        Some((lock, abandoned)) => {
+            if abandoned {
+                println!(
+                    "note: an earlier host run ended without releasing {HOST_RUN_MUTEX} (a \
+                     crash or a kill); Windows released it, and this run took it."
+                );
+            }
+            lock
+        }
+    };
     // What a killed earlier run left behind.
     let swept = host.sweep_desktop_leftovers().or_else(|e| {
         fail(format!(
@@ -1124,53 +1150,6 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
             .push(format!("cargo nextest exited {code}"));
     }
     Ok(summary)
-}
-
-/// The host run's lock file, holding the owner's pid; removed when dropped.
-struct HostLock(PathBuf);
-
-impl HostLock {
-    /// Takes the lock at `path`. A lock whose owner no longer runs is stale and is taken over;
-    /// a live owner's refuses (exit 2).
-    fn take(path: &Path, host: &dyn HostOps) -> Result<HostLock, RunError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .or_else(|e| fail(format!("couldn't create {}: {e}", dir.display())))?;
-        }
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write as _;
-                    let _ = write!(f, "{}", std::process::id());
-                    return Ok(HostLock(path.to_path_buf()));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let owner = std::fs::read_to_string(path)
-                        .ok()
-                        .and_then(|t| t.trim().parse::<u32>().ok());
-                    if let Some(pid) = owner.filter(|p| host.process_alive(*p)) {
-                        return fail(format!(
-                            "another host run is in progress (process {pid}); let it finish, \
-                             then run this again."
-                        ));
-                    }
-                    let _ = std::fs::remove_file(path);
-                }
-                Err(e) => return fail(format!("couldn't take {}: {e}", path.display())),
-            }
-        }
-        fail(format!("couldn't take {}", path.display()))
-    }
-}
-
-impl Drop for HostLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// One line per test, the problems, then the counts.
@@ -1904,8 +1883,13 @@ impl HostOps for RealHost {
         lil_platform::interrupt::interrupted()
     }
 
-    fn process_alive(&self, pid: u32) -> bool {
-        lil_platform::process::open(pid).is_ok_and(|h| matches!(h.exit_code(), Ok(None)))
+    fn lock_host_run(&self) -> io::Result<Option<(Box<dyn std::any::Any>, bool)>> {
+        use lil_platform::named_mutex::{Taken, try_lock};
+        Ok(match try_lock(HOST_RUN_MUTEX)? {
+            Taken::Acquired(g) => Some((Box::new(g), false)),
+            Taken::Abandoned(g) => Some((Box::new(g), true)),
+            Taken::Busy => None,
+        })
     }
 
     fn qt_dir(&self) -> Option<PathBuf> {
@@ -1977,8 +1961,10 @@ mod tests {
         popups: RefCell<Vec<(Duration, Duration, Duration)>>,
         /// The pop-up has gone away.
         popup_closed: Rc<Cell<bool>>,
-        /// Processes that run (the host-run lock's owner).
-        alive_pids: Vec<u32>,
+        /// The host-run lock, shared like a per-user mutex between the fakes that hold a clone.
+        lock: Rc<FakeLock>,
+        /// The pop-up goes away while the tests run.
+        popup_closes_during_run: bool,
         /// What the host's `cargo nextest run` exits with, and whether it writes the JUnit file.
         host_exit: i32,
         host_writes_junit: bool,
@@ -1989,6 +1975,22 @@ mod tests {
         interrupt: Rc<Cell<bool>>,
         /// Ctrl+C comes while the host tests run, and they leave this behind.
         run_interrupted_leaving: Option<String>,
+    }
+
+    /// A per-user lock: one holder at a time; released when its guard drops.
+    #[derive(Default)]
+    struct FakeLock {
+        held: Cell<bool>,
+        abandoned: Cell<bool>,
+    }
+
+    struct FakeLockGuard(Rc<FakeLock>, Log);
+
+    impl Drop for FakeLockGuard {
+        fn drop(&mut self) {
+            self.0.held.set(false);
+            self.1.borrow_mut().push("unlock".to_string());
+        }
     }
 
     struct FakePopup {
@@ -2032,6 +2034,9 @@ mod tests {
                         self.interrupt.set(true);
                         self.leftovers.borrow_mut().push(left.clone());
                         return Ok(1);
+                    }
+                    if self.popup_closes_during_run {
+                        self.popup_closed.set(true);
                     }
                     if self.host_writes_junit {
                         let dir = self.repo.join(r"target\nextest\desktop");
@@ -2092,8 +2097,16 @@ mod tests {
             }))
         }
 
-        fn process_alive(&self, pid: u32) -> bool {
-            self.alive_pids.contains(&pid)
+        fn lock_host_run(&self) -> io::Result<Option<(Box<dyn std::any::Any>, bool)>> {
+            self.log.borrow_mut().push("lock".to_string());
+            if self.lock.held.get() {
+                return Ok(None);
+            }
+            self.lock.held.set(true);
+            Ok(Some((
+                Box::new(FakeLockGuard(self.lock.clone(), self.log.clone())),
+                self.lock.abandoned.get(),
+            )))
         }
 
         fn desktop_leftovers(&self) -> io::Result<Vec<String>> {
@@ -2231,7 +2244,8 @@ mod tests {
                     interrupt: Rc::default(),
                     run_interrupted_leaving: None,
                     popup_closed: Rc::default(),
-                    alive_pids: Vec::new(),
+                    lock: Rc::default(),
+                    popup_closes_during_run: false,
                     host_exit: 0,
                     host_writes_junit: true,
                 },
@@ -3246,7 +3260,7 @@ mod tests {
         let launcher = fx.launcher(finishes());
         let summary = fx.run(&cfg(Suite::Host), &launcher).unwrap();
         assert_eq!(summary.exit_code(), 0, "{summary:?}");
-        assert_eq!(fx.log.borrow()[0], "sweep");
+        assert_eq!(fx.log.borrow()[..2], ["lock", "sweep"]);
 
         // This run's tests leave something: the run fails, names it and sweeps it.
         let fx = Fx::new();
@@ -3286,8 +3300,8 @@ mod tests {
             ) -> io::Result<Box<dyn HandsOff>> {
                 self.0.show_hands_off(what, warning, run, cap)
             }
-            fn process_alive(&self, pid: u32) -> bool {
-                self.0.process_alive(pid)
+            fn lock_host_run(&self) -> io::Result<Option<(Box<dyn std::any::Any>, bool)>> {
+                self.0.lock_host_run()
             }
             fn desktop_leftovers(&self) -> io::Result<Vec<String>> {
                 self.0.desktop_leftovers()
@@ -3315,7 +3329,7 @@ mod tests {
         let check = log.iter().position(|e| e == "check leftovers").unwrap();
         assert_eq!(log[check + 1], "sweep", "{log:?}");
         assert!(host.leftovers.borrow().is_empty(), "swept");
-        assert_eq!(log.last().unwrap(), "popup done");
+        assert_eq!(log[log.len() - 2..], ["popup done", "unlock"], "{log:?}");
     }
 
     #[test] // spec: QA-042
@@ -3362,7 +3376,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             log[ran + 1..],
-            ["check leftovers", "sweep", "popup done"],
+            ["check leftovers", "sweep", "popup done", "unlock"],
             "{log:?}"
         );
         assert!(fx.host.leftovers.borrow().is_empty(), "swept");
@@ -3450,7 +3464,7 @@ mod tests {
             // The cleanup ran all the same.
             let log = fx.log.borrow();
             assert!(log.contains(&"check leftovers".to_string()), "{log:?}");
-            assert_eq!(log.last().unwrap(), "popup done");
+            assert_eq!(log[log.len() - 2..], ["popup done", "unlock"], "{log:?}");
         }
         let mut fx = Fx::new();
         fx.host.host_junit = r#"<testsuites><testsuite name="s"><testcase name="desktop_x" classname="c"><skipped/></testcase></testsuite></testsuites>"#.into();
@@ -3471,32 +3485,58 @@ mod tests {
             !log.iter().any(|e| e.starts_with("run cargo nextest run")),
             "no test ran without the pop-up: {log:?}"
         );
-        assert_eq!(log.last().unwrap(), "popup done");
+        assert_eq!(log[log.len() - 2..], ["popup done", "unlock"], "{log:?}");
     }
 
     #[test] // spec: QA-042
     fn one_host_run_at_a_time() {
-        let mut fx = Fx::new();
-        let lock = fx.layout().root.join(r"host\host-run.lock");
-        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-        // A live run holds the lock: refused before anything is swept.
-        std::fs::write(&lock, "4242").unwrap();
-        fx.host.alive_pids = vec![4242];
-        let result = fx.run(&cfg(Suite::Host), &fx.launcher(finishes()));
+        // Two contenders, as two checkouts would be: their layouts differ, the per-user lock
+        // doesn't.
+        let first = Fx::new();
+        let mut second = Fx::new();
+        assert_ne!(first.layout().root, second.layout().root);
+        second.host.lock = first.host.lock.clone();
+        first.host.lock.held.set(true);
+        let result = second.run(&cfg(Suite::Host), &second.launcher(finishes()));
         assert_eq!(exit_code(&result), 2);
-        assert!(
-            result
-                .unwrap_err()
-                .0
-                .contains("another host run is in progress")
-        );
-        assert!(fx.log.borrow().is_empty(), "{:?}", fx.log.borrow());
-        assert!(lock.is_file(), "the live run's lock is left alone");
-        // A dead owner's lock is stale: taken over, and gone after the run.
-        fx.host.alive_pids.clear();
+        let err = result.unwrap_err().0;
+        assert!(err.contains("another host run is in progress"), "{err}");
+        assert!(err.contains(HOST_RUN_MUTEX), "{err}");
+        assert_eq!(*second.log.borrow(), ["lock"], "nothing swept or run");
+        // Free again: the run takes it, holds it to the end (after the final cleanup), and lets go.
+        first.host.lock.held.set(false);
+        let summary = second
+            .run(&cfg(Suite::Host), &second.launcher(finishes()))
+            .unwrap();
+        assert_eq!(summary.exit_code(), 0);
+        assert!(!first.host.lock.held.get(), "released");
+        let log = second.log.borrow();
+        let taken = log.iter().rposition(|e| e == "lock").unwrap();
+        let sweep = log.iter().skip(taken).position(|e| e == "sweep").unwrap() + taken;
+        let done = log.iter().position(|e| e == "popup done").unwrap();
+        let unlock = log.iter().position(|e| e == "unlock").unwrap();
+        assert!(taken < sweep && done < unlock, "{log:?}");
+        // An abandoned lock (a crashed run) is taken, and the run goes on.
+        let fx = Fx::new();
+        fx.host.lock.abandoned.set(true);
         let summary = fx.run(&cfg(Suite::Host), &fx.launcher(finishes())).unwrap();
         assert_eq!(summary.exit_code(), 0);
-        assert!(!lock.exists());
+    }
+
+    #[test] // spec: QA-042
+    fn a_pop_up_that_closes_during_the_run_fails_it() {
+        let mut fx = Fx::new();
+        fx.host.popup_closes_during_run = true;
+        let summary = fx.run(&cfg(Suite::Host), &fx.launcher(finishes())).unwrap();
+        assert_eq!(summary.exit_code(), 1, "{summary:?}");
+        assert_eq!(summary.failed(), 0);
+        assert!(
+            summary
+                .problems
+                .iter()
+                .any(|p| p.contains("pop-up closed during the run")),
+            "{summary:?}"
+        );
     }
 
     #[test] // spec: QA-042

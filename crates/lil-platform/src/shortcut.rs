@@ -35,7 +35,7 @@ use windows::Win32::UI::Shell::{IShellLinkW, SHStrDupW, ShellLink};
 use windows::core::{BSTR, GUID, HSTRING, Interface};
 
 use crate::classes::{
-    delete_tree, get_string, hkcu_subkey, mark, quoted, require_test_channel, set_string,
+    KeyWrite, apply, delete_tree, get_string, hkcu_subkey, marker, quoted, require_test_channel,
 };
 use crate::desktop::{ShortcutState, same_path};
 use crate::env::{Channel, Env};
@@ -133,19 +133,34 @@ pub fn write_shortcut(env: &Env, exe: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     with_com(|| save(&lnk, exe, &aumid, clsid)).map_err(|e| io_error(&e))?;
-    // Each key's marker goes first, so a run killed between two writes leaves a key the sweep
-    // finds.
+    apply(&key_writes(env, &server)?)
+}
+
+/// The registry writes of [`write_shortcut`], in order: the CLSID's `LocalServer32` (`server`,
+/// the quoted exe) and the AUMID's registration. On a test channel each key's marker comes
+/// first, so a run killed between two writes leaves a key the sweep finds.
+fn key_writes(env: &Env, server: &str) -> io::Result<Vec<KeyWrite>> {
+    let mut w = Vec::new();
     let clsid_key = clsid_key(env)?;
-    mark(env, &clsid_key)?;
-    set_string(&format!(r"{clsid_key}\LocalServer32"), None, &server)?;
+    marker(env, &clsid_key, &mut w);
+    w.push(KeyWrite::new(
+        &format!(r"{clsid_key}\LocalServer32"),
+        None,
+        server,
+    ));
     let aumid_key = aumid_key(env)?;
-    mark(env, &aumid_key)?;
-    set_string(&aumid_key, Some("DisplayName"), &display_name(env))?;
-    set_string(
+    marker(env, &aumid_key, &mut w);
+    w.push(KeyWrite::new(
+        &aumid_key,
+        Some("DisplayName"),
+        &display_name(env),
+    ));
+    w.push(KeyWrite::new(
         &aumid_key,
         Some("CustomActivator"),
         &env.toast_activator_clsid(),
-    )
+    ));
+    Ok(w)
 }
 
 fn save(lnk: &Path, exe: &Path, aumid: &str, clsid: GUID) -> windows::core::Result<()> {
@@ -276,6 +291,28 @@ pub(crate) fn state(env: &Env, exe: &Path) -> ShortcutState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: APP-022, QA-042
+    fn the_clsid_and_aumid_keys_are_marked_before_their_values() {
+        let env = Env::with_roots(
+            Channel::Test("desktop-0123456789abcdef".into()),
+            crate::env::Roots {
+                roaming: PathBuf::from(r"C:\T\roaming"),
+                local: PathBuf::from(r"C:\T\local"),
+                user_profile: PathBuf::from(r"C:\T\profile"),
+            },
+            "S-1".into(),
+        );
+        for e in [env.clone(), env.with_shell_classes_root()] {
+            let writes = key_writes(&e, r#""C:\a\lil-image.exe""#).unwrap();
+            crate::classes::markers_come_first(&writes).unwrap();
+            let marked = writes
+                .iter()
+                .filter(|w| w.name.as_deref() == Some(crate::classes::TEST_MARKER))
+                .count();
+            assert_eq!(marked, 2, "the CLSID and the AUMID: {writes:?}");
+        }
+    }
 
     #[test] // spec: APP-022
     fn clsid_strings_round_trip_through_guid() {

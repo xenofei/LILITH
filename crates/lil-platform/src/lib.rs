@@ -27,6 +27,7 @@ pub mod interrupt;
 pub mod job_object;
 pub mod known_folders;
 pub mod logs;
+pub mod named_mutex;
 pub mod names;
 pub mod paths;
 pub mod pipe;

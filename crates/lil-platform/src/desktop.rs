@@ -170,6 +170,10 @@ fn leftovers_of(env: &Env) -> std::io::Result<Vec<String>> {
     Ok(left)
 }
 
+/// How long [`sweep_desktop_tests`] keeps removing a settings entry the notification platform
+/// writes back.
+const SWEEP_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What [`sweep_desktop_tests`] removed, and what is still there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DesktopSweep {
@@ -197,9 +201,22 @@ pub fn sweep_desktop_tests(programs: &Path) -> std::io::Result<DesktopSweep> {
         remove_shortcut(&env)?;
         unregister_handlers(&env)?;
         remove_test_registry(&env)?;
-        remove_notification_settings(&env)?;
-        // A History Windows never had for this AUMID can't be cleared: nothing to clear.
+        // History first: the notification platform writes the settings entry back a moment
+        // after a toast or a History clear, so that entry goes last and until it stays gone (the
+        // same order as the desktop tests' cleanup). A History Windows never had for this AUMID
+        // can't be cleared: nothing to clear.
         let _ = clear_toast_history(&env);
+        let deadline = std::time::Instant::now() + SWEEP_SETTLE;
+        loop {
+            remove_notification_settings(&env)?;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let back = leftover_registrations(&env)?
+                .iter()
+                .any(|k| k.contains(r"\Notifications\Settings\"));
+            if !back || std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
         let after = leftovers_of(&env)?;
         sweep
             .removed
@@ -353,21 +370,48 @@ pub fn toasts_state_after_post(
     }
 }
 
+/// The end of [`ToastsState::NotYetShown`], kept per desktop (plan 4a ruling 2026-10-24): the
+/// first post that returned `Ok` since the last reading that wasn't `NotYetShown` starts the
+/// [`NOT_SHOWN_GRACE`]; any other reading clears it, so a later `NotYetShown` (a reset platform)
+/// starts afresh instead of reading `no_platform` at once. Times are from any fixed origin.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NotShownEnd {
+    first_ok_post: Option<std::time::Duration>,
+}
+
+impl NotShownEnd {
+    /// A post returned `Ok` at `now`.
+    pub fn posted_ok(&mut self, now: std::time::Duration) {
+        self.first_ok_post.get_or_insert(now);
+    }
+
+    /// The state to report for the reading `read` at `now` ([`toasts_state_after_post`]).
+    pub fn state(&mut self, read: ToastsState, now: std::time::Duration) -> ToastsState {
+        if read != ToastsState::NotYetShown {
+            self.first_ok_post = None;
+            return read;
+        }
+        toasts_state_after_post(read, self.first_ok_post.map(|t| now.saturating_sub(t)))
+    }
+}
+
 /// The real desktop for `env`'s channel: toasts through
 /// `CreateToastNotifierWithId(env.notification_aumid())`.
 pub fn real_desktop(env: &Env) -> Arc<dyn Desktop> {
     Arc::new(RealDesktop {
         aumid: env.notification_aumid(),
         power: PowerRequest::default(),
-        first_ok_post: std::sync::Mutex::new(None),
+        not_shown: std::sync::Mutex::new(NotShownEnd::default()),
+        start: std::time::Instant::now(),
     })
 }
 
 struct RealDesktop {
     aumid: String,
     power: PowerRequest,
-    /// When this process's first post that returned `Ok` was made ([`NOT_SHOWN_GRACE`]).
-    first_ok_post: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The end of `NotYetShown` ([`NotShownEnd`]), timed from `start`.
+    not_shown: std::sync::Mutex<NotShownEnd>,
+    start: std::time::Instant,
 }
 
 impl Desktop for RealDesktop {
@@ -396,26 +440,22 @@ impl Desktop for RealDesktop {
     }
 
     fn toasts_state(&self) -> ToastsState {
-        let since = self
-            .first_ok_post
+        let read = toasts_state_for(
+            crate::toast::setting(&self.aumid),
+            crate::toast::is_elevated(),
+        );
+        self.not_shown
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map(|at| at.elapsed());
-        toasts_state_after_post(
-            toasts_state_for(
-                crate::toast::setting(&self.aumid),
-                crate::toast::is_elevated(),
-            ),
-            since,
-        )
+            .state(read, self.start.elapsed())
     }
 
     fn post(&self, t: &Toast) -> Result<(), String> {
         crate::toast::post(&self.aumid, t)?;
-        self.first_ok_post
+        self.not_shown
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(std::time::Instant::now);
+            .posted_ok(self.start.elapsed());
         Ok(())
     }
 

@@ -242,14 +242,6 @@ pub(crate) fn require_test_channel(env: &Env, what: &str) -> io::Result<()> {
 /// ([`marked_ids`]), even when the names that would lead to them are gone.
 pub const TEST_MARKER: &str = "LilTestChannel";
 
-/// Writes [`TEST_MARKER`] into `HKCU\<subkey>` on a test channel; nothing on stable or dev.
-pub(crate) fn mark(env: &Env, subkey: &str) -> io::Result<()> {
-    match env.channel() {
-        Channel::Test(id) => set_string(subkey, Some(TEST_MARKER), id),
-        _ => Ok(()),
-    }
-}
-
 /// The [`TEST_MARKER`] values of the subkeys directly below `HKCU\<subkey>` (read-only).
 pub(crate) fn marked_ids(subkey: &str) -> io::Result<Vec<String>> {
     Ok(subkey_names(subkey)?
@@ -302,31 +294,79 @@ fn keys(env: &Env) -> io::Result<Keys> {
 /// channel on the shell's classes root ([`Env::with_shell_classes_root`]) writes its scheme
 /// only: never the `.lilref` association or file type, so your own association never moves.
 pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
+    apply(&handler_writes(env, exe)?)
+}
+
+/// What [`register_handlers`] writes, in order. On a test channel each key's marker comes
+/// first, so a run killed between two writes leaves a key the sweep finds.
+pub(crate) fn handler_writes(env: &Env, exe: &Path) -> io::Result<Vec<KeyWrite>> {
     let exe = quoted(exe)?;
     let command = format!("{exe} \"%1\"");
     let k = keys(env)?;
-    // The marker goes first, so a run killed between two writes leaves a key the sweep finds.
-    mark(env, &k.scheme)?;
-    set_string(
+    let mut w = Vec::new();
+    marker(env, &k.scheme, &mut w);
+    w.push(KeyWrite::new(
         &k.scheme,
         None,
         &format!("URL:{} ({})", names::APP_NAME, env.channel().capitalised()),
-    )?;
-    set_string(&k.scheme, Some("URL Protocol"), "")?;
-    set_string(
+    ));
+    w.push(KeyWrite::new(&k.scheme, Some("URL Protocol"), ""));
+    w.push(KeyWrite::new(
         &format!(r"{}\DefaultIcon", k.scheme),
         None,
         &format!("{exe},0"),
-    )?;
-    set_string(&format!(r"{}\shell\open\command", k.scheme), None, &command)?;
+    ));
+    w.push(KeyWrite::new(
+        &format!(r"{}\shell\open\command", k.scheme),
+        None,
+        &command,
+    ));
     if env.uses_shell_classes_root() {
-        return Ok(());
+        return Ok(w);
     }
     let association = format!(r"{}\.lilref", k.root);
-    mark(env, &association)?;
-    set_string(&association, None, &lilref_progid(env))?;
-    mark(env, &k.progid)?;
-    set_string(&format!(r"{}\shell\open\command", k.progid), None, &command)
+    marker(env, &association, &mut w);
+    w.push(KeyWrite::new(&association, None, &lilref_progid(env)));
+    marker(env, &k.progid, &mut w);
+    w.push(KeyWrite::new(
+        &format!(r"{}\shell\open\command", k.progid),
+        None,
+        &command,
+    ));
+    Ok(w)
+}
+
+/// One string value written under `HKCU\<key>` (`name` `None`: the key's default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyWrite {
+    pub key: String,
+    pub name: Option<String>,
+    pub value: String,
+}
+
+impl KeyWrite {
+    pub(crate) fn new(key: &str, name: Option<&str>, value: &str) -> KeyWrite {
+        KeyWrite {
+            key: key.to_string(),
+            name: name.map(str::to_string),
+            value: value.to_string(),
+        }
+    }
+}
+
+/// [`TEST_MARKER`] for `key` on a test channel; nothing on stable or dev.
+pub(crate) fn marker(env: &Env, key: &str, w: &mut Vec<KeyWrite>) {
+    if let Channel::Test(id) = env.channel() {
+        w.push(KeyWrite::new(key, Some(TEST_MARKER), id));
+    }
+}
+
+/// Writes `writes` in order.
+pub(crate) fn apply(writes: &[KeyWrite]) -> io::Result<()> {
+    for w in writes {
+        set_string(&w.key, w.name.as_deref(), &w.value)?;
+    }
+    Ok(())
 }
 
 /// Removes a test channel's scheme and `.lilref` file type, and the `.lilref` association while
@@ -434,9 +474,73 @@ pub(crate) fn state(env: &Env, exe: &Path) -> HandlerState {
     }
 }
 
+/// Each key `writes` marks is marked before any other value is written under it or below it
+/// (review M4): `Err` names the first write that comes before its key's marker.
+#[cfg(test)]
+pub(crate) fn markers_come_first(writes: &[KeyWrite]) -> Result<(), String> {
+    let marked: Vec<&str> = writes
+        .iter()
+        .filter(|w| w.name.as_deref() == Some(TEST_MARKER))
+        .map(|w| w.key.as_str())
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
+    for w in writes {
+        if w.name.as_deref() == Some(TEST_MARKER) {
+            seen.push(&w.key);
+            continue;
+        }
+        let owner = marked
+            .iter()
+            .filter(|k| w.key == **k || w.key.starts_with(&format!(r"{k}\")))
+            .max_by_key(|k| k.len());
+        match owner {
+            Some(k) if !seen.contains(k) => return Err(format!("{w:?} before {k}'s marker")),
+            None => return Err(format!("{w:?} is under no marked key")),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(channel: Channel) -> Env {
+        Env::with_roots(
+            channel,
+            crate::env::Roots {
+                roaming: PathBuf::from(r"C:\T\roaming"),
+                local: PathBuf::from(r"C:\T\local"),
+                user_profile: PathBuf::from(r"C:\T\profile"),
+            },
+            "S-1".into(),
+        )
+    }
+
+    #[test] // spec: APP-022, QA-042
+    fn every_handler_key_is_marked_before_its_values() {
+        let exe = Path::new(r"C:\a\lil-image.exe");
+        let own = env(Channel::Test("desktop-0123456789abcdef".into()));
+        for e in [own.clone(), own.with_shell_classes_root()] {
+            let writes = handler_writes(&e, exe).unwrap();
+            markers_come_first(&writes).unwrap();
+            assert!(
+                writes
+                    .iter()
+                    .any(|w| w.name.as_deref() == Some(TEST_MARKER))
+            );
+        }
+        // Stable and dev carry no marker.
+        for c in [Channel::Stable, Channel::Dev] {
+            let writes = handler_writes(&env(c), exe).unwrap();
+            assert!(
+                writes
+                    .iter()
+                    .all(|w| w.name.as_deref() != Some(TEST_MARKER))
+            );
+        }
+    }
 
     #[test] // spec: APP-022
     fn only_per_user_keys_are_written() {
