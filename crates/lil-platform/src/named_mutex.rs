@@ -21,10 +21,6 @@ pub struct MutexGuard {
     handle: HANDLE,
 }
 
-// SAFETY: a mutex handle may move between threads; the guard only releases it on drop (and
-// the release fails harmlessly on a thread that doesn't own it).
-unsafe impl Send for MutexGuard {}
-
 impl Drop for MutexGuard {
     fn drop(&mut self) {
         // SAFETY: the handle is the mutex this guard took and still owns; it is released once and

@@ -398,6 +398,15 @@ fn not_yet_shown_restarts_after_any_other_reading() {
         end.state(ToastsState::NotYetShown, s(11)),
         ToastsState::NotYetShown
     );
+    // A post made while Ready starts nothing: a reset platform read just after it is still
+    // postable, not no_platform.
+    let mut end = NotShownEnd::default();
+    assert_eq!(end.state(ToastsState::Ready, s(0)), ToastsState::Ready);
+    end.posted_ok(s(1));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(7)),
+        ToastsState::NotYetShown
+    );
 }
 
 #[test] // spec: APP-022, ARCH-055

@@ -101,7 +101,7 @@ pub const OWNER_STEP: &str = "Windows Sandbox isn't turned on. It's a one-time s
     virtualization on in the firmware), then restart, and run this again.";
 /// Why a run that Ctrl+C stopped ends.
 pub const INTERRUPTED: &str = "interrupted (Ctrl+C)";
-/// The per-user named mutex that lets one host run go at a time.
+/// The per-logon-session (`Local`) named mutex that lets one host run go at a time.
 pub const HOST_RUN_MUTEX: &str = r"Local\LILITH-desktop-host-run";
 /// The refusal while another Sandbox runs.
 pub const ONE_AT_A_TIME: &str =
@@ -400,7 +400,7 @@ pub trait HostOps {
         run: Duration,
         cap: Duration,
     ) -> io::Result<Box<dyn HandsOff>>;
-    /// Takes the per-user host-run lock ([`HOST_RUN_MUTEX`]) without waiting. `None` when
+    /// Takes the logon session's host-run lock ([`HOST_RUN_MUTEX`]) without waiting. `None` when
     /// another run holds it; otherwise the held lock, which the run keeps until it ends, and
     /// whether its last owner ended without releasing it (a crash: Windows released it).
     fn lock_host_run(&self) -> io::Result<Option<(Box<dyn std::any::Any>, bool)>>;
@@ -993,7 +993,7 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
              from a terminal that isn't elevated (not \"Run as administrator\").",
         );
     }
-    // One host run at a time per user, whatever checkout it runs from: a second run's sweep or
+    // One host run at a time per logon session, whatever checkout it runs from: a second run's sweep or
     // cleanup would remove the first one's live keys (they share the fixed test id). Held for the
     // whole run, the start-up sweep and the final cleanup included.
     let _lock = match host.lock_host_run().or_else(|e| {
@@ -1961,7 +1961,7 @@ mod tests {
         popups: RefCell<Vec<(Duration, Duration, Duration)>>,
         /// The pop-up has gone away.
         popup_closed: Rc<Cell<bool>>,
-        /// The host-run lock, shared like a per-user mutex between the fakes that hold a clone.
+        /// The host-run lock, shared like the logon-session mutex between the fakes that hold a clone.
         lock: Rc<FakeLock>,
         /// The pop-up goes away while the tests run.
         popup_closes_during_run: bool,
@@ -1977,7 +1977,7 @@ mod tests {
         run_interrupted_leaving: Option<String>,
     }
 
-    /// A per-user lock: one holder at a time; released when its guard drops.
+    /// A logon-session lock: one holder at a time; released when its guard drops.
     #[derive(Default)]
     struct FakeLock {
         held: Cell<bool>,
@@ -3490,7 +3490,7 @@ mod tests {
 
     #[test] // spec: QA-042
     fn one_host_run_at_a_time() {
-        // Two contenders, as two checkouts would be: their layouts differ, the per-user lock
+        // Two contenders, as two checkouts would be: their layouts differ, the logon-session lock
         // doesn't.
         let first = Fx::new();
         let mut second = Fx::new();

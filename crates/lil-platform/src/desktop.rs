@@ -377,16 +377,22 @@ pub fn toasts_state_after_post(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NotShownEnd {
     first_ok_post: Option<std::time::Duration>,
+    /// The last reading, so only a post made while `NotYetShown` (or before any reading)
+    /// starts the grace.
+    last: Option<ToastsState>,
 }
 
 impl NotShownEnd {
     /// A post returned `Ok` at `now`.
     pub fn posted_ok(&mut self, now: std::time::Duration) {
-        self.first_ok_post.get_or_insert(now);
+        if matches!(self.last, None | Some(ToastsState::NotYetShown)) {
+            self.first_ok_post.get_or_insert(now);
+        }
     }
 
     /// The state to report for the reading `read` at `now` ([`toasts_state_after_post`]).
     pub fn state(&mut self, read: ToastsState, now: std::time::Duration) -> ToastsState {
+        self.last = Some(read);
         if read != ToastsState::NotYetShown {
             self.first_ok_post = None;
             return read;
