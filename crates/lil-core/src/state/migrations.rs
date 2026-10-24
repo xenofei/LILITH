@@ -243,7 +243,9 @@ CREATE TABLE cap_alerts (
 /// 63); `engine_device`, `phase`, `subtasks` (JSON), `indeterminate`, `last_progress_ms`
 /// (Unix ms), `cache_hit_nodes` (JSON) and `all_cached` what its run reported; `estimate` and
 /// `estimate_key` the estimate taken at submission (Task 7 fills them); `withdrawn_id` the
-/// prompt id a pause withdrew, kept until it is known gone (CORE-160, CORE-120). A row from
+/// prompt id a pause withdrew, kept until it is known gone (CORE-160, CORE-120). `job_order`
+/// holds the high-water mark of the core-wide order counter (Appendix G "Queue order"),
+/// one row; only the suite `state.db`'s is used. A row from
 /// before this migration gets the batch of its own job id (`b_<its 16 hex>`), index 0, its
 /// `seq` as its order key, and the origin its idempotency scope names (a scope of another
 /// form, or none, leaves it null). A `cli|…` scope gives `{surface: "cli"}`, also for a job
@@ -275,7 +277,11 @@ UPDATE jobs SET
         WHEN idem_scope LIKE 'assistant|%' THEN json_object('surface', 'agent_session')
         WHEN idem_scope LIKE 'cli|%' THEN json_object('surface', 'cli')
     END;
-CREATE INDEX jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;";
+CREATE INDEX jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;
+CREATE TABLE job_order (
+    k INTEGER PRIMARY KEY CHECK (k = 0),
+    last_order INTEGER NOT NULL
+);";
 
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[

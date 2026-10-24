@@ -309,6 +309,8 @@ pub(crate) struct Shared {
     /// shutdown step's wait).
     changed: watch::Sender<u64>,
     recovered: Mutex<HashMap<String, Arc<OnceCell<()>>>>,
+    /// The order counter was raised to the suite `state.db`'s high-water mark (N4).
+    order_seeded: OnceCell<()>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The engine ids of the jobs taken up again from an earlier core run (ruling P3-R21):
     /// their prompts are the suite's, not outside ones.
@@ -885,7 +887,7 @@ impl Shared {
         };
         let (reservation, owner) = (first.reservation.clone(), first.owner.clone());
         let first_hash = args_hash(&json!({"kind": first.spec.kind, "args": first.spec.args}));
-        let keys = self.order_keys(news.len());
+        let keys = self.order_keys(news.len()).await;
         let mut rows = Vec::with_capacity(news.len());
         let mut infos = Vec::with_capacity(news.len());
         for (i, new) in news.into_iter().enumerate() {
@@ -905,6 +907,15 @@ impl Shared {
             let id = self.ids.id("j");
             let (key_scope, idem_key) = idem.unzip();
             let idem_scope = key_scope.or(caller_scope);
+            // N5: a re-run of a job whose withdrawn prompt was never known gone keeps its id,
+            // so its first post waits for that prompt (Appendix G "Withdrawal").
+            let withdrawn_id = match &retry_of {
+                Some(of) => record::get(scope.db(), of)
+                    .await
+                    .map_err(|e| state_unavailable(&e, &trace_id))?
+                    .and_then(|r| r.withdrawn_id),
+                None => None,
+            };
             let (batch_id, batch_index) =
                 batch.unwrap_or_else(|| (new_batch.clone(), u32::try_from(i).unwrap_or(u32::MAX)));
             rows.push(JobRow {
@@ -949,7 +960,7 @@ impl Shared {
                 started_by: started_by.clone(),
                 status_seq: Vec::new(),
                 report: RunReport::default(),
-                withdrawn_id: None,
+                withdrawn_id,
             });
             infos.push(Info {
                 id: JobId(id),
@@ -1031,8 +1042,41 @@ impl Shared {
 
     /// The next `n` core-wide submission keys (CORE-160; Appendix G "Queue order"): one
     /// counter for every scope's `state.db`, above every key this core queued and never below
-    /// the time in microseconds, so first in, first out holds across scopes and restarts.
-    fn order_keys(&self, n: usize) -> Vec<i64> {
+    /// the time in microseconds, so first in, first out holds across scopes and restarts. Its
+    /// high-water mark is kept in the suite `state.db` (read at the first submission of a
+    /// run, raised with each), so a clock set back across a restart never gives a newer job
+    /// a lower key (N4). A mark that can't be read or written is logged; the keys still come.
+    async fn order_keys(&self, n: usize) -> Vec<i64> {
+        self.order_seeded
+            .get_or_init(|| async {
+                match record::order_mark(self.states.suite()).await {
+                    Ok(Some(mark)) => {
+                        let mut q = self.queue();
+                        q.last_order = q.last_order.max(mark);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "the order counter's mark can't be read");
+                    }
+                }
+            })
+            .await;
+        let keys = self.next_keys(n);
+        if let Some(last) = keys.last() {
+            self.keep_order_mark(*last).await;
+        }
+        keys
+    }
+
+    /// Writes `key` as the order counter's high-water mark (logged when it can't be).
+    async fn keep_order_mark(&self, key: i64) {
+        if let Err(e) = record::raise_order_mark(self.states.suite(), key).await {
+            tracing::error!(error = %e, "the order counter's mark can't be written");
+        }
+    }
+
+    /// The next `n` keys of the counter, in memory ([`Shared::order_keys`]).
+    fn next_keys(&self, n: usize) -> Vec<i64> {
         let floor = self
             .clock
             .utc_now()
@@ -1473,7 +1517,7 @@ impl Shared {
                             return self.complete(&info, attempt, End::Cancelled).await;
                         }
                         if withdrawn {
-                            return self.requeue_withdrawn(&info);
+                            return self.requeue_withdrawn(&info, attempt).await;
                         }
                         if preempted {
                             return self.requeue(&info).await;
@@ -1535,7 +1579,7 @@ impl Shared {
                     }
                     Err(_) if cancelling => return self.complete(&info, attempt, End::Cancelled).await,
                     // Its pending prompt was withdrawn by a pause (CORE-160): it waits again.
-                    Err(_) if withdrawn => return self.requeue_withdrawn(&info),
+                    Err(_) if withdrawn => return self.requeue_withdrawn(&info, attempt).await,
                     Err(_) if preempted => return self.requeue(&info).await,
                     Err(failure) => failure,
                 };
@@ -1565,7 +1609,7 @@ impl Shared {
                         // A pause that came during the backoff holds the next attempt
                         // (CORE-160): it waits again, and runs as that attempt once released.
                         if self.hold_if_paused(&id, Some(attempt + 1), false).await {
-                            return self.requeue_withdrawn(&info);
+                            return self.requeue_withdrawn(&info, attempt + 1).await;
                         }
                         attempt += 1;
                         continue;
@@ -1638,25 +1682,39 @@ impl Shared {
     /// A job whose pending prompt a pause withdrew (CORE-160), or that a pause held before it
     /// reached its engine ([`Shared::hold_if_paused`]), leaves its lane and waits again: its
     /// row was written (`queue_paused`; a withdrawn prompt's id moved to `withdrawn_id`), and
-    /// its next attempt posts a new prompt only once an old one is gone (CORE-120).
-    fn requeue_withdrawn(self: &Arc<Self>, info: &Info) {
-        {
+    /// its next attempt posts a new prompt only once an old one is gone (CORE-120). A job
+    /// cancelled meanwhile (N1: a `job.cancel` while the hold was written) ends `cancelled`
+    /// now, as attempt `attempt`, instead of waiting held.
+    async fn requeue_withdrawn(self: &Arc<Self>, info: &Info, attempt: u32) {
+        let cancelling = {
             let mut q = self.queue();
-            let lane = info.spec.lane.index();
-            if q.lanes[lane].running.as_deref() == Some(info.id.as_str()) {
-                q.lanes[lane].running = None;
+            let cancelling = q.jobs.get(info.id.as_str()).is_some_and(|a| a.cancelling);
+            if !cancelling {
+                Self::leave_lane_queued(&mut q, info);
+                self.tell_busy(&mut q);
             }
-            if let Some(a) = q.jobs.get_mut(info.id.as_str()) {
-                a.running = false;
-                a.withdrawal = Withdrawal::None;
-                a.engine_cancel_sent = false;
-                a.exec_start = None;
-                a.cancel = watch::Sender::new(false);
-            }
-            self.tell_busy(&mut q);
+            cancelling
+        };
+        if cancelling {
+            return self.complete(info, attempt, End::Cancelled).await;
         }
         tracing::info!(job_id = %info.id, "a job whose prompt was withdrawn waits again");
         self.pump();
+    }
+
+    /// [`Shared::requeue_withdrawn`]'s change to the queue: the job leaves its lane and waits.
+    fn leave_lane_queued(q: &mut Queue, info: &Info) {
+        let lane = info.spec.lane.index();
+        if q.lanes[lane].running.as_deref() == Some(info.id.as_str()) {
+            q.lanes[lane].running = None;
+        }
+        if let Some(a) = q.jobs.get_mut(info.id.as_str()) {
+            a.running = false;
+            a.withdrawal = Withdrawal::None;
+            a.engine_cancel_sent = false;
+            a.exec_start = None;
+            a.cancel = watch::Sender::new(false);
+        }
     }
 
     /// Whether the job is still in its completions in this core: the shutdown step gives up on
@@ -2001,6 +2059,49 @@ impl Shared {
         let held: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
         self.apply(id, &scope, c, Some(held)).await;
         true
+    }
+
+    /// `JobCtx::late_withdrawn` (recommendation B, plan 4a ruling, 2026-10-24): running job
+    /// `id`'s prompt, whose withdrawal's delete went unseen, is gone after all. It ends the
+    /// way a withdrawn attempt does: its row moves the id to `withdrawn_id` and shows
+    /// `queue_paused` while a reason of its lane covers it (counted as withdrawn), else
+    /// `waiting`; the next attempt's gone-check keeps the work once.
+    pub(crate) async fn late_withdrawn(&self, id: &str, prompt_id: &str) {
+        let (scope, lane, held) = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let Some(a) = jobs.get_mut(id) else {
+                return;
+            };
+            if !a.running
+                || a.completing
+                || a.cancelling
+                || a.preempted
+                || a.withdrawal != Withdrawal::None
+            {
+                return;
+            }
+            let lane = a.info.spec.lane;
+            let held = !lanes[lane.index()].holding(a.info.spec.priority).is_empty();
+            a.withdrawal = Withdrawal::Withdrawn;
+            a.held_shown = held;
+            (a.info.scope.clone(), lane, held)
+        };
+        let to = if held {
+            Substatus::QueuePaused
+        } else {
+            Substatus::Waiting
+        };
+        let c = Change {
+            external_id: Some(None),
+            withdrawn_id: Some(Some(prompt_id.to_string())),
+            ..Change::to(to)
+        };
+        let withdrawn: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
+        if self.apply(id, &scope, c, Some(withdrawn)).await.is_some() && held {
+            self.queue().lanes[lane.index()].withdrawn += 1;
+            self.publish_queue(lane);
+        }
     }
 
     /// `JobCtx::settle_withdrawn`: the prompt a pause withdrew is known gone (`follow` is
@@ -2510,6 +2611,7 @@ impl Jobs {
             queue: Mutex::new(Queue::default()),
             changed: watch::Sender::new(0),
             recovered: Mutex::new(HashMap::new()),
+            order_seeded: OnceCell::new(),
             locks: Mutex::new(HashMap::new()),
             adopted: Mutex::new(HashSet::new()),
             withdrawers: RwLock::new(HashMap::new()),
@@ -3085,6 +3187,7 @@ impl Jobs {
             order_key: Some(key),
             ..Change::default()
         };
+        s.keep_order_mark(key).await;
         let (_, moved) = record::update(scope.db(), id.as_str(), c, s.now())
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?
@@ -3260,10 +3363,15 @@ impl Jobs {
         tracing::info!(lane = lane.wire(), reason = why.wire(), "a lane is paused");
         s.pump();
         s.publish_queue(lane);
+        // The pause answers at once (N2): each withdrawal asks ComfyUI on its own, and the
+        // lane's state is published again once it is decided.
         for id in withdraw {
-            s.withdraw_one(&id).await;
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.withdraw_one(&id).await;
+                s.publish_queue(lane);
+            });
         }
-        s.publish_queue(lane);
         self.queue_state(lane)
     }
 

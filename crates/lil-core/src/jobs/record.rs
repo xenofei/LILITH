@@ -719,6 +719,33 @@ pub async fn update(
     .await
 }
 
+/// The core-wide order counter's high-water mark (Appendix G "Queue order"), if any was
+/// kept (the suite `state.db`).
+pub async fn order_mark(db: &StateDb) -> Result<Option<i64>, StateError> {
+    db.call(|conn| {
+        conn.query_row("SELECT last_order FROM job_order WHERE k = 0", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| sql(&e))
+    })
+    .await
+}
+
+/// Raises the order counter's high-water mark to `key` (never lowers it).
+pub async fn raise_order_mark(db: &StateDb, key: i64) -> Result<(), StateError> {
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO job_order (k, last_order) VALUES (0, ?1)
+             ON CONFLICT(k) DO UPDATE SET last_order = max(last_order, excluded.last_order)",
+            params![key],
+        )
+        .map(|_| ())
+        .map_err(|e| sql(&e))
+    })
+    .await
+}
+
 /// The newest job whose `retry_of` is `job_id`: the attempt that retried it (a `job.retry`, a
 /// batch retry or the automatic re-run), with its idempotency scope and key.
 pub async fn retried_by(

@@ -833,6 +833,13 @@ impl JobCtx {
         self.jobs.hold_if_paused(self.id.as_str(), None, true).await
     }
 
+    /// The job's prompt `prompt_id` is gone after a withdrawal's delete whose outcome nobody
+    /// saw (CORE-160; plan 4a ruling, 2026-10-24): the runner ends the attempt as a withdrawn
+    /// one, with the id in `withdrawn_id`. The handler then returns any error.
+    pub async fn late_withdrawn(&self, prompt_id: &str) {
+        self.jobs.late_withdrawn(self.id.as_str(), prompt_id).await;
+    }
+
     /// Settles the row's `withdrawn_id`, the prompt a pause withdrew (CORE-160), once the
     /// engine said where it is (CORE-120): gone (`follow` is `None`), or still the job's
     /// (`follow` names it, and it becomes the row's `external_id` again).

@@ -59,6 +59,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
+/// How the fake goes quiet after a delete ([`FakeComfy::stall_after_delete`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stall {
+    /// Every HTTP request but the websocket's is answered 503 ([`FakeComfy::refuse_http`]).
+    Refuse,
+    /// Every HTTP request but the websocket's is left unanswered ([`FakeComfy::hang_http`]).
+    Hang,
+}
+
 /// A failure [`FakeComfy::fail_next`] injects into the next prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeFailure {
@@ -151,6 +160,7 @@ impl FakeComfy {
             }),
             wake: Notify::new(),
             uploads: Notify::new(),
+            hang: Notify::new(),
             root: root.to_path_buf(),
             addr,
         });
@@ -314,6 +324,20 @@ impl FakeComfy {
         self.shared.lock().refuse_http = on;
     }
 
+    /// While on, every HTTP request but the websocket's is recorded and then left unanswered
+    /// until it is turned off: a ComfyUI that takes connections but doesn't answer.
+    pub fn hang_http(&self, on: bool) {
+        self.shared.lock().hang_http = on;
+        self.shared.hang.notify_waiters();
+    }
+
+    /// The next `POST /queue {"delete"}` is carried out and answered, and then the fake stops
+    /// answering as `how` says ([`Stall`]): what a withdrawal sees when ComfyUI takes its delete
+    /// and then goes quiet. Undo it with [`FakeComfy::refuse_http`] or [`FakeComfy::hang_http`].
+    pub fn stall_after_delete(&self, how: Stall) {
+        self.shared.lock().stall_after_delete = Some(how);
+    }
+
     /// While on, each `POST /upload/image` is recorded and then left unanswered until it is
     /// turned off (a test holds an attempt between its start and its `POST /prompt`).
     pub fn hold_uploads(&self, on: bool) {
@@ -412,6 +436,8 @@ struct Shared {
     wake: Notify,
     /// Wakes the uploads [`FakeComfy::hold_uploads`] holds.
     uploads: Notify,
+    /// Wakes the requests [`FakeComfy::hang_http`] holds.
+    hang: Notify,
     root: PathBuf,
     addr: SocketAddr,
 }
@@ -637,6 +663,8 @@ struct State {
     extra_outputs: Vec<(String, bool)>,
     refuse_http: bool,
     hold_uploads: bool,
+    hang_http: bool,
+    stall_after_delete: Option<Stall>,
     drop_after_accept: bool,
     restart_after: Option<u32>,
     outputs_since_armed: u32,
@@ -1164,6 +1192,13 @@ async fn handle(
             &json!({"error": "the fake ComfyUI is not answering"}),
         ));
     }
+    while segments.as_slice() != ["ws"] {
+        let released = shared.hang.notified();
+        if !shared.lock().hang_http {
+            break;
+        }
+        released.await;
+    }
     let response = match (&method, segments.as_slice()) {
         (&Method::GET, ["ws"]) => upgrade_ws(&shared, &mut req, &query),
         (&Method::GET, ["system_stats"]) => {
@@ -1416,6 +1451,13 @@ fn post_queue(shared: &Shared, body: Option<&Value>) -> Response<Full> {
         if st.queue.iter().any(|q| q == id) {
             st.queue.retain(|q| q != id);
             st.prompts.retain(|p| p.id != id);
+        }
+    }
+    if body.and_then(|b| b.get("delete")).is_some() {
+        match st.stall_after_delete.take() {
+            Some(Stall::Refuse) => st.refuse_http = true,
+            Some(Stall::Hang) => st.hang_http = true,
+            None => {}
         }
     }
     st.broadcast_status();

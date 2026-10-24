@@ -1085,6 +1085,44 @@ async fn fifo_within_a_class_holds_across_the_suite_and_workspace_scopes() {
     fx.shutdown().await;
 }
 
+/// Fix round 2, N4 (Appendix G "Queue order"): the order counter's high-water mark is kept in
+/// the suite `state.db`, so after a restart with the clock set back an hour, a new job still
+/// sorts after a job queued before the restart (here one of a workspace not recovered yet).
+#[tokio::test(start_paused = true)] // spec: CORE-124, CORE-160
+async fn the_order_counter_survives_a_restart_with_the_clock_set_back() {
+    let fx = Fx::workspace().await;
+    let _running = running_gate(&fx, Lane::Cpu, "run").await;
+    let older = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let older_key = fx.row(&older.job_id).await.order_key;
+    fx.clock.shift_utc(-3600);
+    let (restarted, _fresh, _) = restart(&fx).await;
+    let mut suite = fx.ctx();
+    suite.workspace = None;
+    suite.idem_scope = "cli|none".into();
+    let newer = restarted
+        .submit(
+            &suite,
+            spec(Lane::Cpu, Priority::Agent, json!({"gate": "never"})),
+        )
+        .await
+        .unwrap();
+    let newer_key = record::get(&fx.states.suite_db(), &newer.job_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .order_key;
+    assert!(
+        newer_key > older_key,
+        "a newer job sorts after an older one: {newer_key} <= {older_key}"
+    );
+    fx.handler.open("run");
+    restarted
+        .cancel(&suite, &JobId(newer.job_id.clone()))
+        .await
+        .unwrap();
+    fx.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)] // spec: CORE-124
 async fn grouping_never_overtakes_a_job_more_than_8_times() {
     let fx = Fx::suite().await;
