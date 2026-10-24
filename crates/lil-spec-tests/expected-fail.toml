@@ -6,17 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 7
-    # CORE-161
-    { name = "lil-spec-tests::estimates::job_estimate_is_none_without_history", rule = "CORE-161", file = "tests/estimates.rs" },
-    # CORE-161, APP-140
-    { name = "lil-spec-tests::estimates::job_estimate_uses_measured_history_after_three_runs", rule = "CORE-161", file = "tests/estimates.rs" },
-    # CORE-161
-    { name = "lil-spec-tests::estimates::job_estimate_validates_args_like_a_call", rule = "CORE-161", file = "tests/estimates.rs" },
-    # CORE-161
-    { name = "lil-spec-tests::estimates::telemetry_energy_sums_a_range", rule = "CORE-161", file = "tests/estimates.rs" },
-    # APP-127
-    { name = "lil-spec-tests::estimates::ui_connections_are_tracked_in_telemetry", rule = "APP-127", file = "tests/estimates.rs" },
     # Task 8
     # ARCH-126
     { name = "lil-spec-tests::comfy_profile::owned_comfyui_starts_with_the_launch_profile", rule = "ARCH-126", file = "tests/comfy_profile.rs" },
