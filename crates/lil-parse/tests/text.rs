@@ -57,11 +57,25 @@ fn bidi_and_zero_width_are_shown() {
 
 #[test] // spec: APP-022
 fn emoji_sequences_and_rtl_text_survive() {
-    // Man, woman, girl, boy: U+200D between two Extended_Pictographic code points each time.
-    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
-    assert_eq!(shown_text(family, 200), family);
-    let rainbow = "\u{1f3f3}\u{200d}\u{1f308}";
-    assert_eq!(shown_text(rainbow, 200), rainbow);
+    // UTS #51 emoji ZWJ sequences: each element is an Extended_Pictographic code point,
+    // optionally followed by one Emoji_Modifier or U+FE0F.
+    let kept = [
+        // Man, woman, girl, boy.
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+        // Woman technologist: medium skin tone (an Emoji_Modifier) before the joiner.
+        "\u{1f469}\u{1f3fd}\u{200d}\u{1f4bb}",
+        // Heart on fire: U+FE0F before the joiner.
+        "\u{2764}\u{fe0f}\u{200d}\u{1f525}",
+        // Rainbow flag: U+FE0F before the joiner.
+        "\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}",
+        // Without the variation selector.
+        "\u{1f3f3}\u{200d}\u{1f308}",
+        // Family with skin tones on every element.
+        "\u{1f468}\u{1f3fb}\u{200d}\u{1f469}\u{1f3ff}\u{200d}\u{1f467}",
+    ];
+    for emoji in kept {
+        assert_eq!(shown_text(emoji, 200), emoji, "{emoji:?}");
+    }
     let hebrew = "שלום עולם, זה טקסט בעברית";
     assert_eq!(shown_text(hebrew, 200), hebrew);
     let arabic = "مرحبا بالعالم";
@@ -88,11 +102,31 @@ fn other_joiners_are_shown() {
         shown_text("می\u{200c}خواهم", 200),
         format!("می{}خواهم", marker('\u{200c}'))
     );
+    // A lone joiner between letters.
+    assert_eq!(
+        shown_text("a\u{200d}b", 200),
+        format!("a{}b", marker('\u{200d}'))
+    );
     // Two joiners in a row: neither is between two pictographs.
     assert_eq!(
         shown_text("\u{1f468}\u{200d}\u{200d}\u{1f469}", 200),
         format!("\u{1f468}{0}{0}\u{1f469}", marker('\u{200d}'))
     );
+    // A modifier or U+FE0F counts only right after a pictograph, and only once.
+    for (before, after) in [
+        ("\u{1f3fd}", "\u{1f4bb}"),
+        ("a\u{fe0f}", "\u{1f525}"),
+        ("a\u{1f3fd}", "\u{1f4bb}"),
+        ("\u{1f469}\u{1f3fd}\u{1f3fd}", "\u{1f4bb}"),
+        ("\u{2764}\u{fe0f}\u{fe0f}", "\u{1f525}"),
+        ("\u{2764}\u{fe0f}", "b"),
+    ] {
+        assert_eq!(
+            shown_text(&format!("{before}\u{200d}{after}"), 200),
+            format!("{before}{}{after}", marker('\u{200d}')),
+            "{before:?} ZWJ {after:?}"
+        );
+    }
 }
 
 #[test] // spec: APP-022

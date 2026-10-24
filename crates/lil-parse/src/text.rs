@@ -1,8 +1,8 @@
 //! The shown-text normaliser for notification text (Appendix G "Toast XML"; P4a-R8).
 
 /// `s` with C0 and C1 controls removed, the bidirectional and zero-width characters Appendix G
-/// lists shown as `⟨U+XXXX⟩` (a U+200D between two `Extended_Pictographic` code points is kept),
-/// and at most `max_chars` `char`s over the whole text, ending `…` when cut.
+/// lists shown as `⟨U+XXXX⟩` (a U+200D inside a UTS #51 emoji ZWJ sequence is kept), and at most
+/// `max_chars` `char`s over the whole text, ending `…` when cut.
 ///
 /// The limit counts the output, markers included. A marker is never cut in half: when the next
 /// piece doesn't fit before the `…`, the text ends there.
@@ -52,17 +52,19 @@ impl Piece {
 
 /// The pieces of `s`, in order: controls dropped, listed characters as markers.
 fn pieces(s: &str) -> impl Iterator<Item = Piece> + '_ {
-    let mut prev: Option<char> = None;
+    // The two input code points before the current one, nearest first.
+    let mut before: [Option<char>; 2] = [None; 2];
     let mut rest = s.chars().peekable();
     std::iter::from_fn(move || {
         loop {
             let c = rest.next()?;
-            let before = prev.replace(c);
+            let [prev, prev2] = before;
+            before = [Some(c), prev];
             if c.is_control() {
                 continue;
             }
             let joins_pictographs = c == '\u{200d}'
-                && before.is_some_and(is_extended_pictographic)
+                && ends_an_emoji_element(prev, prev2)
                 && rest.peek().copied().is_some_and(is_extended_pictographic);
             return Some(if is_shown_as_marker(c) && !joins_pictographs {
                 Piece::Marker(c)
@@ -71,6 +73,24 @@ fn pieces(s: &str) -> impl Iterator<Item = Piece> + '_ {
             });
         }
     })
+}
+
+/// Whether the input just before a U+200D ends an element of a UTS #51 emoji ZWJ sequence: an
+/// `Extended_Pictographic` code point, optionally followed by one `Emoji_Modifier` or U+FE0F
+/// (Appendix G "Toast XML").
+fn ends_an_emoji_element(prev: Option<char>, prev2: Option<char>) -> bool {
+    match prev {
+        Some(c) if is_extended_pictographic(c) => true,
+        Some(c) if is_emoji_modifier(c) || c == '\u{fe0f}' => {
+            prev2.is_some_and(is_extended_pictographic)
+        }
+        _ => false,
+    }
+}
+
+/// `Emoji_Modifier` in Unicode 16.0.0's `emoji-data.txt`: U+1F3FB–U+1F3FF, the skin tones.
+fn is_emoji_modifier(c: char) -> bool {
+    matches!(c, '\u{1f3fb}'..='\u{1f3ff}')
 }
 
 /// The bidirectional controls and zero-width characters of Appendix G: U+200E, U+200F,
