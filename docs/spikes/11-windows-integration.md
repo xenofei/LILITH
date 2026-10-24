@@ -2,7 +2,7 @@
 
 Date: 2026-10-21
 
-Status: sections 1–4 were written and committed before anything ran (plan 4a, Task 1, Step 1). Sections 5–8 are written from the owner's three runs; S1.9 is pending its unattended run.
+Status: sections 1–4 were written and committed before anything ran (plan 4a, Task 1, Step 1). Sections 5–8 are written from the owner's three host runs and the unattended S1.9 run.
 
 ## 1. Question
 
@@ -152,7 +152,7 @@ If S1.1 or S1.2 fails, stop: the result goes to the owner before Task 2 (APP-022
 
 ## 5. Measurements
 
-The full measurements are written after the owner-present runs (Step 3). Run 1 of Step 2 (2026-10-22, 03:37–03:48 UTC) was interrupted; what it showed is kept here because it changed the method.
+Runs 1 to 3 are the owner's host runs (Part B); the S1.9 run is the unattended Sandbox run. Runs 1 and 2 were interrupted; what they showed is kept because it changed the method.
 
 ### Run 1 (interrupted)
 
@@ -202,6 +202,23 @@ The automation round's attended block, on commit `3fb2fac`. The owner gave every
 
 **Observation, not a proven cause: UI Automation never found a toast in this harness.** On this PC (26H2, build 26300) the harness's UIA search found no toast banner in any watch (31 clean polls for the calibration toast, 29 per S1.3 trial, 73–75 across S1.2p's 20 s), and found no entry in the notification centre while it was open and in the foreground (S1.2p: `centre_identified = true`, `listed = false`). Read-only probes between toasts found the same 9 top-level windows with the managed (`System.Windows.Automation`) and the native (`IUIAutomation`) clients, none from ShellExperienceHost or ShellHost. No probe listed the UIA tree while a banner or the centre was up, and no Microsoft page found says toasts are hidden from UIA (Narrator reads them), so why the search missed them is not known. One hypothesis is that the shell's toast and centre surfaces are not reachable this way from a medium-integrity process on this build. A desktop test should not rely on UIA to find toasts until this is understood: History says whether a toast is in the centre, and the toast's own `Activated`/`Failed` events are documented; `Dismissed` with `TimedOut` ("shown for the maximum allowed time and was faded out") is a weaker signal of a pop, untested on this PC.
 
+### S1.9 run (2026-10-24, 00:13–00:35 UTC; unattended)
+
+`run-all.ps1 -NonInteractive -Task0Repo …` on commit `cb4aea0`, started by the coordinator: exit 0, about 22 minutes, 3 runs of the inbox Windows Sandbox (no `wsb` CLI; `WindowsSandbox.exe` 10.0.26100.1). The record is `results/sandbox-checks.json`, and each run's files are in `results/sandbox/run-<n>/`. **Verdict: FAIL**, the same items in all 3 runs:
+
+| Item | Run 1 | Run 2 | Run 3 | Why |
+|---|---|---|---|---|
+| elevation | recorded | recorded | recorded | the logon command's process was elevated (`TokenElevation` true, High integrity). Both de-elevated launches ran and returned, and both gave an elevated, High-integrity token again: a scheduled task with `/RL LIMITED`, and `runas /trustlevel:0x20000`. Microsoft's `.wsb` page says only that "the container user account should be an administrator account" |
+| toast | FAIL | FAIL | FAIL | judged by the bar's elevation rule: "elevated, and no de-elevated launch worked". The raw fields met the toast bar in every run, elevated and under the scheduled task alike: `Setting()` `Enabled`, the Tag in History. UIA saw no banner (`popup_seen` false), as on the host |
+| protocol | PASS | PASS | PASS | the argument arrived exactly as sent |
+| foreground | FAIL | FAIL | FAIL | the same elevation rule. Raw fields: in run 1 `GetForegroundWindow` returned no window at all (0) in every attempt, so the precondition was never met. In runs 2 and 3 the elevated attempts' hand-off `AllowSetForegroundWindow` failed with "Access is denied" (`0x80070005`), and the attempt under the scheduled task met the precondition and left A in front after B's hand-off |
+| power | PASS | PASS | PASS | `PowerSetRequest` listed by `powercfg /requests` inside the Sandbox |
+| Rust exe | PASS | PASS | PASS | exit 0 with the three VC++ DLLs; without them `0xC0000135` (DLL not found), recorded |
+| Qt (on-screen) | FAIL | FAIL | FAIL | run 1: `CopyFromScreen` threw "The handle is invalid" (`inside.ps1:422`), in the same run where no window was ever in the foreground. Runs 2 and 3: the grab worked, and the kept `qt-onscreen.png` (896 × 639) shows the spike app's charts, 277 distinct colours on the 64 × 64 grid, measured on the host from the kept file. The item still failed because writing `qt.json` threw "Cannot convert value to type System.String." (`Write-Result`). The cause is a harness bug: the app's stderr, read with `Get-Content -Raw` in Windows PowerShell 5.1, carries `PSDrive` and `PSProvider`, which `ConvertTo-Json -Depth 10` walks for minutes (reproduced locally: over 10 minutes for a two-line file). This also explains the roughly 7 extra minutes in runs 2 and 3. Fixed since (a `[string]` cast); not re-run |
+| lifecycle | PASS | PASS | PASS | start to closed 149, 556 and 579 s, each stopped by `shutdown /s /t 0` inside; `started.json` after 11–12 s; no lingering process. Run 1's processes included `WindowsSandboxClient`, and runs 2 and 3's included `WindowsSandboxRemoteSession` and `WindowsSandboxServer` |
+
+**The host was not locked at any sample:** 52, 186 and 193 samples, every one unlocked, none unknown. No run was interrupted by sleep, and the host was kept awake for the runs. The offscreen grab was not tested (no `qoffscreen.dll` in the trimmed deploy; CI's S0.9).
+
 ### Results
 
 Evidence lives in the run folders under `spikes/winshell/results/` (not in git): run 1 `run-20261022T033715Z`, run 2 `run-20261023T032541Z`, run 3 `results/checks.json` itself (started 2026-10-23 20:46 UTC). The S1.9 run does not move it; only a later `run-spike.ps1` run (Part B, `-PartB`) would, into `run-<its start time>`. Each folder's `checks.json` holds the check's `details`; `raw/` holds the core results and the event log.
@@ -217,19 +234,25 @@ Evidence lives in the run folders under `spikes/winshell/results/` (not in git):
 | S1.6 fullscreen poll | PASS | run 2: (a) 15 of 15 `QUNS_ACCEPTS_NOTIFICATIONS`; p50 0.032 ms, p99 0.124 ms over 100 calls; (b) `QUNS_RUNNING_D3D_FULL_SCREEN` from 14 s, 22 polls in a row |
 | S1.7 keep-awake | PASS by the owner's round-12 waiver (stay-awake part not run) | run 2: the owner's elevated `powercfg /requests` listed the request under SYSTEM while held and not after `PowerClearRequest`. Run 3: `PBT_APMSUSPEND` and `PBT_APMRESUMEAUTOMATIC` across one sleep. No Modern Standby. The "awake 5 minutes past the timeout" part was not run (§6) |
 | S1.8 Windows Hello | not decided | run 3: (a), (c), (d), (f) and DPAPI pass; (b) create `Success`, the prompt not seen in front until after owner input; (e) `Verified`, the dialog in front at 1.96 s but after owner input. The harness's rule gives passphrase only; read literally, (e) passes, which would give DPAPI with the Hello gate. Left to Task 28 (§7) |
-| S1.9 inside Windows Sandbox | pending | its unattended run (`run-all.ps1`) has not run yet; `results/sandbox-checks.json` and `results/sandbox/run-<n>/` when it has |
+| S1.9 inside Windows Sandbox | FAIL | `results/sandbox-checks.json`: protocol, power, Rust exe and lifecycle pass 3 of 3. Toast and foreground fail by the elevation rule: no de-elevated token could be had, though the toast's raw fields met its bar in every run and the foreground's in runs 2 and 3. Qt failed 3 of 3: in run 1 the screen capture failed; in runs 2 and 3 the grab worked but a harness bug broke the record (above) |
 | Cleanup | PASS | runs 2 and 3. Run 1's check reported `pass: false` from a strict-mode bug, though everything was removed |
 
 ## 6. Verdict
 
-**Part B is answered; S1.9 is pending its run.** S1.1, S1.2, S1.3, S1.4 and S1.6 PASS; S1.2p is recorded; S1.5 FAILs; S1.7 PASSes by the owner's round-12 waiver (its stay-awake part not run); S1.8 is not decided. S1.9's verdict is filled in after its unattended run.
+S1.1, S1.2, S1.3, S1.4 and S1.6 PASS; S1.2p is recorded; S1.5 FAILs; S1.7 PASSes by the owner's round-12 waiver (its stay-awake part not run); S1.8 is not decided; **S1.9 FAILs.** In S1.9 protocol activation, the power request, the Rust exe and the lifecycle pass 3 of 3; the toast, foreground and Qt items fail. The reasons:
+- the logon command runs elevated, and both de-elevated launch routes tried gave an elevated token again;
+- in run 1 the session had no foreground window and the screen capture failed;
+- in runs 2 and 3 the Qt grab worked, but the harness failed to write its record.
 
 **Deviations from the plan.**
 - **S1.3 and S1.4 are judged on the owner's real clicks.** The automation round was to click S1.3's toasts itself, but its UIA search never found them on this PC (§5), so the owner clicked; S1.4's bar always needed the owner's click. Both are settled from run 3 and are not re-run.
 - **S1.7 has no stay-awake proof, by the owner's choice** (round 12: keep-awake is checked through Windows' own reports only). The request was listed while held and gone after the clear (Windows' own report, run 2), and the sleep and wake broadcasts arrived (run 3); the bar's "the PC stays awake 5 minutes past the timeout with no input while the request is held" was not run.
 - **S1.8's route is open.** The key crypto works. The create prompt was not seen in front until after the owner's input; the consent prompt was in front 1.96 s after its call, but after owner input, so whether it came forward by itself is undetermined (§5). The harness's rule gives passphrase only and a literal reading of (e) gives DPAPI with the Hello gate; the window-owned KEK calls are not in `windows 0.62.2` (§7). No route is claimed beyond that evidence.
 - **S1.5's evidence is the owner's eyes,** not a measurement, and the two runs saw different failures on two Windows builds (25H2 and 26H2 pre-release).
-- **S1.9's Qt item grabs the on-screen window only.** Offscreen is not tested: the trimmed deploy ships no `qoffscreen.dll`, and CI's S0.9 covers it. The bar's "both grabs are non-flat" is therefore half-tested here. The watched run and the lock step (host state) are dropped: the run is unattended.
+- **S1.9's limits.**
+  - The Qt item grabs the on-screen window only. Offscreen is not tested: the trimmed deploy ships no `qoffscreen.dll`, and CI's S0.9 covers it. The bar's "both grabs are non-flat" is therefore half-tested.
+  - The watched run and the lock step are dropped, because the run is unattended. The host's lock state was recorded instead (never locked).
+  - The Qt record bug of runs 2 and 3 is fixed but not re-run. The Qt result therefore rests on run 1's capture failure and the two kept grabs.
 - **The automation round's own results are not used** for any verdict: owner run 3 is the record.
 
 ## 7. Decision
@@ -248,12 +271,27 @@ Evidence lives in the run folders under `spikes/winshell/results/` (not in git):
 - The DPAPI-with-gate route's prompt is owned through `IUserConsentVerifierInterop::RequestVerificationForWindowAsync(HWND, …)` (learn.microsoft.com/windows/win32/api/userconsentverifierinterop/nf-userconsentverifierinterop-iuserconsentverifierinterop-requestverificationforwindowasync), which is in the crate; run 3 passed it `GetConsoleWindow()`. Under Windows Terminal that is the ConPTY pseudo-console window, which is never in front; owning the prompt by a real window that is in front is the first thing to try.
 - Proving that the prompt comes to the front of every application, a fullscreen one included, is Task 28's. This spike shows only what is above: with the prompts owned by windows that were not in front, one was not seen in front before owner input and the other was in front after owner input.
 
-**For Task 30 (the desktop test runner).** Pending S1.9's run: which items work inside Windows Sandbox unattended, and how long a run takes. Already known: the Sandbox's Qt item must have its platform plugin in the deploy, or Qt blocks on a modal box; the offscreen platform is not in the trimmed deploy; and on this PC the harness's UIA search did not find toasts (§5), so toast tests should read History and the toast's own events rather than UIA (the events are documented but untested on this PC).
+**For Task 30 (the desktop test runner): owner decision 2026-10-23 (round 12) plus spike result.**
+- **The Sandbox runner covers protocol activation, power requests, Rust tests and the Sandbox lifecycle.** These passed 3 of 3 unattended. A run takes about 2.5 minutes from start to closed once the Qt record bug is out (run 1); the bar is under 10 minutes.
+- **The desktop group runs on the owner's PC:** toasts, foreground and screen grabs. This rests on the owner's round-12 answer that tests may run on the owner's PC at any time, under the hands-off pop-up rule. It follows the bar's FAIL path, so it needs a plan amendment to Task 30 and to QA-042, which says the desktop tests use the Sandbox.
+- **What the evidence says:**
+  - Inside the Sandbox the toast's raw fields passed in every run, and the foreground hand-off passed under the scheduled-task launch in runs 2 and 3. Every token there was elevated, though, and an elevated sender is not how the product runs.
+  - The screen capture failed in one run of three, while the session had no foreground window; Microsoft's winapp Sandbox page says to "keep the host session unlocked for real input and screen capture", and the host was unlocked throughout.
+  - A runner that wants these items back in the Sandbox needs a non-elevated token there first.
+- **De-elevated launch routes:**
+  - Tried, both returned an elevated token: `schtasks /RL LIMITED` and `runas /trustlevel:0x20000`.
+  - One documented route was not tried: the Sandbox CLI's `wsb exec --id <id> -c <command> -r ExistingLogin`, which "runs in the currently active user session" (learn.microsoft.com/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-cli). It needs the Store version of Windows Sandbox (this PC has the inbox one), and the page does not say whether that session's token is elevated.
+- **Already known:**
+  - The Sandbox's Qt item must have its platform plugin in the deploy, or Qt blocks on a modal box.
+  - The offscreen platform is not in the trimmed deploy.
+  - Records written from Windows PowerShell 5.1 must not serialise a `Get-Content` string as is.
+  - On this PC the harness's UIA search did not find toasts (§5). Toast tests should read History and the toast's own events rather than UIA (the events are documented but untested on this PC).
 
 ## 8. Follow-ups
 
-- **S1.9:** the coordinator runs `pwsh -NoProfile -NonInteractive -File spikes/winshell/run-all.ps1 -Task0Repo "<Task 0's worktree>"` and fills in its verdict (§5, §6, §7 for Task 30). The host's lock state is recorded per run, not controlled; a run that fails a desktop item while the host was locked is not judged.
-- **README:** `docs/spikes/README.md` gets spike 11's row once S1.9 has its verdict (Step 3).
+- **S1.9, Task 30 and QA-042:** the plan amendment that moves the desktop group (toasts, foreground, screen grabs) to the owner's PC (§7).
+- **S1.9's Qt item:** the record bug is fixed but not re-run. Rerunning `pwsh -NoProfile -NonInteractive -File spikes/winshell/run-all.ps1 -Task0Repo "<Task 0's worktree>"` would show whether the on-screen grab passes 3 of 3 inside the Sandbox. It does not change the toast and foreground FAILs.
+- **A non-elevated token in the Sandbox:** untried `wsb exec … -r ExistingLogin` (§7), if Task 30 wants the desktop group back in the Sandbox.
 - **S1.5:** the owner hears the FAIL before Task 2 (the bar's FAIL path).
 - **S1.8:** to Task 28: own the prompt by a real window that is in front (not `GetConsoleWindow()`), bind the `*ForWindowAsync` calls for KEK, and prove placement against other apps, a fullscreen one included, with no input during the call; else DPAPI with the Hello gate, if its prompt is proven in front; else the passphrase.
 - **S1.7:** the stay-awake part was not run; if a later task needs it, it needs the owner's consent to a long unattended wait.

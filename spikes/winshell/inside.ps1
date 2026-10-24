@@ -432,7 +432,9 @@ function Start-QtOnScreen([string]$Exe, [string]$Name) {
         Stop-PinnedProcess $p   # pinned above
         [void]$p.WaitForExit(5000)
         $rec.exit = $(if ($p.HasExited) { $p.ExitCode } else { 'still running' })
-        $rec.stderr = $(if (Test-Path $err) { Get-Content -Raw $err } else { '' })
+        # [string]: in Windows PowerShell 5.1 a Get-Content string carries PSDrive and PSProvider, which
+        # ConvertTo-Json -Depth 10 walks for minutes and then fails on (S1.9 runs 2 and 3).
+        $rec.stderr = [string]$(if (Test-Path $err) { Get-Content -Raw $err } else { '' })
         $rec.backend = Get-Backend "$($rec.stderr)"
     }
     $rec
