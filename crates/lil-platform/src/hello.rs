@@ -20,11 +20,14 @@
 //! ([`choice_from_command`]): the accept button is subclassed and armed only by a `WM_LBUTTONUP`
 //! inside it from a real mouse, touch, pen or touchpad, on its own thread ([`arms_accept`]:
 //! `GetCurrentInputMessageSource` is `IMO_HARDWARE` with a pointer device, `InSendMessage` is
-//! false), and only a `BN_CLICKED` from that button's own window counts, so a posted or sent
-//! `WM_COMMAND`, `BM_CLICK`, UI Automation's Invoke, `SendInput` and any key (Space, Enter) are
-//! ignored. The buttons work only once the window has been in front for [`BUTTONS_LIVE_AFTER`],
-//! and stop when it loses the front, moves or is resized. "Deny" accepts any source: refusing
-//! is always safe.
+//! false), after a real press on it that, for a mouse or touchpad, followed a real hover of
+//! [`HOVER_BEFORE_PRESS`] ([`PressTracker`]); and only a `BN_CLICKED` from that button's own
+//! window counts, so a posted or sent `WM_COMMAND`, `BM_CLICK`, UI Automation's Invoke,
+//! `SendInput` and any key (Space, Enter) are ignored. The buttons work only once the window
+//! has been in front for [`BUTTONS_LIVE_AFTER`] of real time ([`LiveClock`]), and stop when it
+//! loses the front, or it or the accept button moves or is resized. The text and the labels
+//! refuse changes from other programs ([`text_change`]). "Deny" accepts any source: refusing is
+//! always safe.
 //!
 //! **Placement (P4a-R38).** The owner's rule is that the prompt comes to the front of every
 //! application, a fullscreen one included. Spike 11 showed that an unowned create prompt and a
@@ -50,7 +53,7 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use windows::Security::Credentials::UI::{UserConsentVerificationResult, UserConsentVerifier};
@@ -62,7 +65,7 @@ use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow,
+    MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -70,7 +73,10 @@ use windows::Win32::Security::Cryptography::{
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::System::TpmBaseServices::{TPM_DEVICE_INFO, Tbsi_GetDeviceInfo};
 use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled, SetFocus};
+use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SETREADONLY, WM_MOUSELEAVE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::Input::{
     GetCurrentInputMessageSource, IMDT_KEYBOARD, IMDT_MOUSE, IMDT_PEN, IMDT_TOUCH, IMDT_TOUCHPAD,
     IMO_HARDWARE, IMO_INJECTED, IMO_SYSTEM, INPUT_MESSAGE_SOURCE,
@@ -79,13 +85,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BringWindowToTop, CW_USEDEFAULT, CallWindowProcW, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL,
     FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWLP_WNDPROC, GetClientRect, GetDlgItem,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HMENU, InSendMessage, KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_SETFONT, WM_TIMER,
-    WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetForegroundWindow, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HMENU, InSendMessage, KillTimer, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE,
+    WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PASTE, WM_SETFONT, WM_SETTEXT,
+    WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED,
+    WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, Interface, w};
 use windows_future::IAsyncOperation;
@@ -888,14 +895,17 @@ pub struct ButtonInput {
     pub device: InputDevice,
     /// The message was sent from another thread or process (`InSendMessage`).
     pub sent_by_another_thread: bool,
+    /// A real press on the button preceded this release ([`PressTracker`]).
+    pub pressed_by_hardware: bool,
 }
 
 /// Whether a message arms the accept button for the click it is about to report (pure): only a
 /// `WM_LBUTTONUP` inside the button, from real hardware (`IMO_HARDWARE`) that is a mouse, touch,
-/// pen or touchpad, handled on the button's own thread (re-review 2 N4; the touchpad by the
-/// fix round 4 ruling). No key arms it: a program can
-/// move the focus to the button without hardware input, and the owner's next Space must not
-/// merge. "Deny" isn't subclassed and takes any input; closing the window refuses too.
+/// pen or touchpad, handled on the button's own thread, after a real press on the button
+/// (re-review 2 N4; the touchpad by the fix round 4 ruling; the press by re-review 3 m1). No
+/// key arms it: a program can move the focus to the button without hardware input, and the
+/// owner's next Space must not merge. "Deny" takes any input (its subclass only guards its
+/// label); closing the window refuses too.
 pub fn arms_accept(input: ButtonInput) -> bool {
     input.msg == WM_LBUTTONUP
         && input.over_button
@@ -905,6 +915,7 @@ pub fn arms_accept(input: ButtonInput) -> bool {
             InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
         )
         && !input.sent_by_another_thread
+        && input.pressed_by_hardware
 }
 
 /// A `WM_COMMAND` the owner window got, as [`choice_from_command`] judges it.
@@ -947,36 +958,106 @@ pub const BUTTONS_LIVE_AFTER: Duration = Duration::from_secs(1);
 /// How often the live timer checks that the window is in front.
 pub const LIVE_TICK: Duration = Duration::from_millis(250);
 
-/// The window's time in front, counted in [`LIVE_TICK`]s (pure). The timer ticks for the
-/// window's whole life until a choice is made, so the buttons go live whenever the window gets
-/// to the front, however late (re-review 2 n3).
+/// The window's time in front, in real time (pure: the caller passes `now`). The timer ticks
+/// for the window's whole life until a choice is made, so the buttons go live whenever the
+/// window gets to the front, however late (re-review 2 n3). A tick only samples: any program
+/// can post `WM_TIMER`, so the number of ticks never counts, only the time since the first tick
+/// that saw the window in front (re-review 3 I1).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LiveClock {
-    /// Consecutive ticks on which the window was in front.
-    ticks_in_front: u32,
+    /// When a tick first saw the window in front, since the last restart.
+    in_front_since: Option<Instant>,
 }
 
 impl LiveClock {
-    /// One tick of the timer; whether the buttons are live after it.
-    pub fn tick(&mut self, in_front: bool) -> bool {
-        self.ticks_in_front = if in_front {
-            self.ticks_in_front.saturating_add(1)
+    /// One tick of the timer at `now`; whether the buttons are live after it.
+    pub fn tick(&mut self, in_front: bool, now: Instant) -> bool {
+        if in_front {
+            self.in_front_since.get_or_insert(now);
         } else {
-            0
-        };
-        self.is_live()
+            self.in_front_since = None;
+        }
+        self.is_live(now)
     }
 
     /// The window lost the front, moved or was resized: the delay starts again.
     pub fn restart(&mut self) {
-        self.ticks_in_front = 0;
+        self.in_front_since = None;
     }
 
-    /// Whether the window has been seen in front for at least [`BUTTONS_LIVE_AFTER`]: from the
-    /// first tick it was seen in front to this one.
-    pub fn is_live(&self) -> bool {
-        self.ticks_in_front > 0 && LIVE_TICK * (self.ticks_in_front - 1) >= BUTTONS_LIVE_AFTER
+    /// Whether the window has been in front for at least [`BUTTONS_LIVE_AFTER`] at `now`.
+    pub fn is_live(&self, now: Instant) -> bool {
+        self.in_front_since
+            .and_then(|since| now.checked_duration_since(since))
+            .is_some_and(|d| d >= BUTTONS_LIVE_AFTER)
     }
+}
+
+/// How long the cursor must rest on the accept button, by real pointer moves, before a mouse
+/// or touchpad press on it counts (re-review 3 m3): a program that warps the cursor onto Merge
+/// (`SetCursorPos`) doesn't make the owner's next click a click on Merge.
+pub const HOVER_BEFORE_PRESS: Duration = Duration::from_millis(300);
+
+/// The accept button's press state (pure: the caller passes what it judged and `now`). Only a
+/// real press on the button lets its release arm it (re-review 3 m1): a posted
+/// `WM_LBUTTONDOWN` gives the button its pushed state and the capture, so a hardware release
+/// over it would otherwise click after a press made somewhere else.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PressTracker {
+    /// When real pointer moves first had the cursor on the button, since it last left.
+    hover_since: Option<Instant>,
+    /// A real press on the button is down.
+    pressed: bool,
+}
+
+impl PressTracker {
+    /// A `WM_MOUSEMOVE` to the button; `real` when it is a hardware pointer move inside it,
+    /// handled on its own thread. Any other move starts the hover again.
+    pub fn on_move(&mut self, real: bool, now: Instant) {
+        if real {
+            self.hover_since.get_or_insert(now);
+        } else {
+            self.hover_since = None;
+        }
+    }
+
+    /// The cursor left the button (`WM_MOUSELEAVE`).
+    pub fn on_leave(&mut self) {
+        self.hover_since = None;
+    }
+
+    /// A `WM_LBUTTONDOWN` (or double-click) to the button; `real` as for [`Self::on_move`].
+    /// A mouse or touchpad press counts only after [`HOVER_BEFORE_PRESS`]; touch and pen press
+    /// where the contact is, not at the cursor, so they need no hover.
+    pub fn on_press(&mut self, real: bool, device: InputDevice, now: Instant) {
+        let rested = match device {
+            InputDevice::Touch | InputDevice::Pen => true,
+            _ => self
+                .hover_since
+                .and_then(|since| now.checked_duration_since(since))
+                .is_some_and(|d| d >= HOVER_BEFORE_PRESS),
+        };
+        self.pressed = real && rested;
+    }
+
+    /// A `WM_LBUTTONUP` to the button: whether a real press preceded it. The press is used up.
+    pub fn on_release(&mut self) -> bool {
+        std::mem::take(&mut self.pressed)
+    }
+
+    /// The button lost the capture, a mode was cancelled, or the delay restarted: the press and
+    /// the hover are dropped.
+    pub fn cancel(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Whether a message to the read-only text or a button would change what it shows (re-review 3
+/// m2, m4). The text and the labels are set when the window is made and never after, so these
+/// are refused from anyone: `ES_READONLY` blocks only typing, and another program can still
+/// send `WM_SETTEXT` or `EM_REPLACESEL`, or post `EM_SETREADONLY` and `WM_PASTE`. Pure.
+pub fn text_change(msg: u32) -> bool {
+    matches!(msg, WM_SETTEXT | EM_REPLACESEL | EM_SETREADONLY | WM_PASTE)
 }
 
 /// The accept button's control id.
@@ -994,14 +1075,60 @@ static ARMED: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::n
 // thread's locals: process-local, out of reach of other programs (re-review 2 n4: a window's
 // `GWLP_USERDATA` can be written from another process).
 thread_local! {
-    /// The accept button's original window procedure, kept when it is subclassed.
+    /// The BUTTON class's original window procedure, kept when the buttons are subclassed.
     static BUTTON_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// The EDIT class's original window procedure, kept when the text is subclassed.
+    static EDIT_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     /// The asking window's time in front.
     static LIVE: std::cell::Cell<LiveClock> = const {
-        std::cell::Cell::new(LiveClock { ticks_in_front: 0 })
+        std::cell::Cell::new(LiveClock { in_front_since: None })
+    };
+    /// The accept button's press and hover.
+    static PRESS: std::cell::Cell<PressTracker> = const {
+        std::cell::Cell::new(PressTracker { hover_since: None, pressed: false })
     };
     /// The asking window's last known place and size, to tell a move or resize.
     static PLACE: std::cell::Cell<(i32, i32, i32, i32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// The accept button's last known place and size in the window (re-review 3 m2).
+    static ACCEPT_PLACE: std::cell::Cell<(i32, i32, i32, i32)> = const {
+        std::cell::Cell::new((0, 0, 0, 0))
+    };
+}
+
+/// Changes this thread's accept-button press state.
+fn with_press<T>(f: impl FnOnce(&mut PressTracker) -> T) -> T {
+    PRESS.with(|c| {
+        let mut press = c.get();
+        let out = f(&mut press);
+        c.set(press);
+        out
+    })
+}
+
+/// `control`'s place and size in its parent's client area.
+fn place_in_parent(control: HWND) -> Option<(i32, i32, i32, i32)> {
+    // SAFETY: queries into local structures, for this window's own control.
+    unsafe {
+        let parent = GetParent(control).ok()?;
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        GetWindowRect(control, &mut rect).ok()?;
+        let mut corners = [
+            windows::Win32::Foundation::POINT {
+                x: rect.left,
+                y: rect.top,
+            },
+            windows::Win32::Foundation::POINT {
+                x: rect.right,
+                y: rect.bottom,
+            },
+        ];
+        for p in &mut corners {
+            if !ScreenToClient(parent, p).as_bool() {
+                return None;
+            }
+        }
+        Some((corners[0].x, corners[0].y, corners[1].x, corners[1].y))
+    }
 }
 
 /// The choices made in this process's asking windows, by window handle. Written on the window's
@@ -1063,34 +1190,116 @@ fn point_inside(button: HWND, lp: LPARAM) -> bool {
         && y < rect.bottom
 }
 
-/// The accept button's subclass: a real pointer release over it arms it ([`arms_accept`]), for
-/// exactly the one call of its own procedure that reports the click.
+/// Whether the mouse message being handled is a real pointer message inside `button`, handled
+/// on its own thread: hardware origin, a mouse, touch, pen or touchpad, not sent.
+fn real_pointer_inside(button: HWND, lp: LPARAM) -> (bool, InputDevice) {
+    let (origin, device) = current_input_source();
+    // SAFETY: a query about the message this thread is handling.
+    let sent = unsafe { InSendMessage() }.as_bool();
+    let pointer = matches!(
+        device,
+        InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
+    );
+    (
+        origin == InputOrigin::Hardware && pointer && !sent && point_inside(button, lp),
+        device,
+    )
+}
+
+/// The original procedure kept in `slot`, or `None` before it was kept.
+fn original_proc(slot: &'static std::thread::LocalKey<std::cell::Cell<isize>>) -> WNDPROC {
+    let original = slot.with(|p| p.get());
+    // SAFETY: a non-zero value is a class's own window procedure, kept on this thread when the
+    // control was subclassed; it stays valid for the process's life. Zero is `None`.
+    unsafe { std::mem::transmute::<isize, WNDPROC>(original) }
+}
+
+/// The accept button's subclass: a real pointer release over it, after a real press on it,
+/// arms it ([`arms_accept`], [`PressTracker`]), for exactly the one call of its own procedure
+/// that reports the click. Its label can't be changed, and moving or resizing it restarts the
+/// delay (re-review 3 m2).
 extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let original = BUTTON_PROC.with(|p| p.get());
-    // SAFETY: `original` is the button class's own procedure, kept on this thread when the
-    // button was subclassed (BUTTON_PROC); it stays valid for the process's life.
+    let Some(original) = original_proc(&BUTTON_PROC) else {
+        // SAFETY: the default procedure for this window's message.
+        return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+    };
+    let now = Instant::now();
+    // SAFETY: this button's own messages, passed on to its class's procedure.
     unsafe {
-        if original == 0 {
-            return DefWindowProcW(hwnd, msg, wp, lp);
-        }
-        let original: WNDPROC = std::mem::transmute(original);
-        if msg == WM_LBUTTONUP {
-            let (origin, device) = current_input_source();
-            let input = ButtonInput {
-                msg,
-                over_button: point_inside(hwnd, lp),
-                origin,
-                device,
-                sent_by_another_thread: InSendMessage().as_bool(),
-            };
-            if arms_accept(input) {
-                ARMED.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
-                let result = CallWindowProcW(original, hwnd, msg, wp, lp);
-                ARMED.store(0, std::sync::atomic::Ordering::SeqCst);
-                return result;
+        match msg {
+            _ if text_change(msg) => return LRESULT(0),
+            WM_MOUSEMOVE => {
+                let (real, _) = real_pointer_inside(hwnd, lp);
+                with_press(|p| p.on_move(real, now));
+                if real {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                }
             }
+            WM_MOUSELEAVE => with_press(PressTracker::on_leave),
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                let (real, device) = real_pointer_inside(hwnd, lp);
+                with_press(|p| p.on_press(real, device, now));
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => with_press(PressTracker::cancel),
+            WM_WINDOWPOSCHANGED => {
+                // Moved, resized, or its place can't be read: the delay starts again.
+                let place = place_in_parent(hwnd);
+                if place.is_none_or(|place| ACCEPT_PLACE.with(|p| p.replace(place)) != place)
+                    && let Ok(parent) = GetParent(hwnd)
+                {
+                    restart_live(parent);
+                }
+            }
+            WM_LBUTTONUP => {
+                let (origin, device) = current_input_source();
+                let input = ButtonInput {
+                    msg,
+                    over_button: point_inside(hwnd, lp),
+                    origin,
+                    device,
+                    sent_by_another_thread: InSendMessage().as_bool(),
+                    pressed_by_hardware: with_press(PressTracker::on_release),
+                };
+                if arms_accept(input) {
+                    ARMED.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
+                    let result = CallWindowProcW(Some(original), hwnd, msg, wp, lp);
+                    ARMED.store(0, std::sync::atomic::Ordering::SeqCst);
+                    return result;
+                }
+            }
+            _ => {}
         }
-        CallWindowProcW(original, hwnd, msg, wp, lp)
+        CallWindowProcW(Some(original), hwnd, msg, wp, lp)
+    }
+}
+
+/// "Deny"'s subclass: only its label is guarded (re-review 3 m2), so the two can't be swapped.
+extern "system" fn deny_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // SAFETY: this button's own messages, passed on to its class's procedure.
+    unsafe {
+        match original_proc(&BUTTON_PROC) {
+            _ if text_change(msg) => LRESULT(0),
+            Some(original) => CallWindowProcW(Some(original), hwnd, msg, wp, lp),
+            None => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+/// The read-only text's subclass: what it shows can't be changed (re-review 3 m4).
+extern "system" fn shown_text_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // SAFETY: this control's own messages, passed on to its class's procedure.
+    unsafe {
+        match original_proc(&EDIT_PROC) {
+            _ if text_change(msg) => LRESULT(0),
+            Some(original) => CallWindowProcW(Some(original), hwnd, msg, wp, lp),
+            None => DefWindowProcW(hwnd, msg, wp, lp),
+        }
     }
 }
 
@@ -1113,6 +1322,7 @@ fn restart_live(window: HWND) {
         clock.restart();
         c.set(clock);
     });
+    with_press(PressTracker::cancel);
     set_buttons_enabled(window, false);
 }
 
@@ -1212,6 +1422,10 @@ fn window_thread(
             None,
         ) {
             set_font(edit);
+            // Subclassed so other programs can't change what it shows (shown_text_proc); the
+            // original procedure is kept on this thread first.
+            EDIT_PROC.with(|p| p.set(GetWindowLongPtrW(edit, GWLP_WNDPROC)));
+            SetWindowLongPtrW(edit, GWLP_WNDPROC, shown_text_proc as *const () as isize);
             // The read-only text has the focus, so a stray Space or Enter clicks nothing.
             let _ = SetFocus(Some(edit));
         }
@@ -1240,16 +1454,21 @@ fn window_thread(
                     None,
                 ) {
                     set_font(b);
-                    if id == ID_ACCEPT {
-                        // Subclassed, so its own input can be checked (accept_button_proc).
-                        // The original procedure is kept on this thread first, so the
-                        // subclass never runs without it.
-                        BUTTON_PROC.with(|p| p.set(GetWindowLongPtrW(b, GWLP_WNDPROC)));
-                        SetWindowLongPtrW(
-                            b,
-                            GWLP_WNDPROC,
-                            accept_button_proc as *const () as isize,
-                        );
+                    // Both are subclassed: the accept button so its own input can be checked
+                    // (accept_button_proc), and both so their labels can't be swapped. The
+                    // original procedure is kept on this thread first, so a subclass never
+                    // runs without it.
+                    BUTTON_PROC.with(|p| p.set(GetWindowLongPtrW(b, GWLP_WNDPROC)));
+                    let proc = if id == ID_ACCEPT {
+                        accept_button_proc as *const () as isize
+                    } else {
+                        deny_button_proc as *const () as isize
+                    };
+                    SetWindowLongPtrW(b, GWLP_WNDPROC, proc);
+                    if id == ID_ACCEPT
+                        && let Some(place) = place_in_parent(b)
+                    {
+                        ACCEPT_PLACE.with(|p| p.set(place));
                     }
                 }
             }
@@ -1318,7 +1537,7 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     let in_front = GetForegroundWindow() == hwnd;
                     let live = LIVE.with(|c| {
                         let mut clock = c.get();
-                        let live = clock.tick(in_front);
+                        let live = clock.tick(in_front, Instant::now());
                         c.set(clock);
                         live
                     });
@@ -1343,7 +1562,7 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN};
+    use windows::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN, WM_KEYUP};
 
     #[test] // spec: QA-088
     fn kek_is_sha256_over_the_domain_then_the_signature() {
@@ -1493,6 +1712,7 @@ mod tests {
             origin: InputOrigin::Hardware,
             device: InputDevice::Mouse,
             sent_by_another_thread: false,
+            pressed_by_hardware: true,
         }
     }
 
@@ -1619,40 +1839,133 @@ mod tests {
         }
     }
 
-    /// Re-review m1 and re-review 2 n2, n3: the buttons go live only after the window has been
-    /// in front for [`BUTTONS_LIVE_AFTER`]; losing the front, a move or a resize starts the delay
-    /// again; and the timer keeps checking until they are live.
+    /// Re-review m1, re-review 2 n2 and n3, re-review 3 I1: the buttons go live only after the
+    /// window has been in front for [`BUTTONS_LIVE_AFTER`] of real time, however many timer
+    /// messages arrive; losing the front, a move or a resize starts the delay again; and the
+    /// timer keeps checking until they are live.
     #[test] // spec: QA-088, QA-036
     fn the_buttons_go_live_after_a_second_in_front_and_a_move_restarts_the_delay() {
-        let ticks_for_a_second = (BUTTONS_LIVE_AFTER.as_millis() / LIVE_TICK.as_millis()) as usize;
-        let live_after = |clock: &mut LiveClock, ticks: usize| {
-            (0..ticks).map(|_| clock.tick(true)).last().unwrap()
-        };
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
 
-        // In front on every tick: live once a full second has been seen, not before.
+        // I1: 100 ticks inside the first second (posted WM_TIMERs) never make it live.
         let mut clock = LiveClock::default();
-        assert!(!live_after(&mut clock, ticks_for_a_second));
-        assert!(clock.tick(true));
+        for i in 0..100 {
+            assert!(!clock.tick(true, at(i * 9)), "tick {i}");
+        }
+        // A full second after the first tick in front: live.
+        assert!(!clock.tick(true, at(999)));
+        assert!(clock.tick(true, at(1_000)));
 
         // n3: not in front for a long time (the raise hadn't won yet), then in front: the timer
         // kept checking, so the buttons still go live, a full second after it got there.
         let mut clock = LiveClock::default();
-        for _ in 0..100 {
-            assert!(!clock.tick(false));
+        for i in 0..100 {
+            assert!(!clock.tick(false, at(i * 250)));
         }
-        assert!(!live_after(&mut clock, ticks_for_a_second));
-        assert!(clock.tick(true));
+        assert!(!clock.tick(true, at(30_000)));
+        assert!(!clock.tick(true, at(30_999)));
+        assert!(clock.tick(true, at(31_000)));
 
-        // A tick not in front, then back: the second starts again.
-        assert!(!clock.tick(false));
-        assert!(!live_after(&mut clock, ticks_for_a_second));
-        assert!(clock.tick(true));
+        // A tick not in front, then back: the second starts again from the new tick.
+        assert!(!clock.tick(false, at(31_100)));
+        assert!(!clock.tick(true, at(31_200)));
+        assert!(!clock.tick(true, at(32_199)));
+        assert!(clock.tick(true, at(32_200)));
 
-        // n2: moved or resized (or deactivated) while live: not live until a new second passed.
+        // n2: moved or resized (or deactivated) while live: not live, and a restart can't be
+        // skipped: the first tick after it starts a new second, however late it comes.
         clock.restart();
-        assert!(!clock.is_live());
-        assert!(!live_after(&mut clock, ticks_for_a_second));
-        assert!(clock.tick(true));
+        assert!(!clock.is_live(at(40_000)));
+        assert!(!clock.tick(true, at(40_000)));
+        for i in 0..100 {
+            assert!(!clock.tick(true, at(40_000 + i * 9)));
+        }
+        assert!(clock.tick(true, at(41_000)));
+        // Time that goes backwards (it can't with Instant) is never live.
+        assert!(!clock.is_live(at(39_000)));
+    }
+
+    /// Re-review 3 m1 and m3: a release arms only after a hardware press on the button, and a
+    /// mouse or touchpad press counts only after the cursor rested on the button by hardware
+    /// moves for [`HOVER_BEFORE_PRESS`].
+    #[test] // spec: QA-088, QA-036
+    fn a_release_arms_only_after_a_real_press_on_a_hovered_button() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let hover = HOVER_BEFORE_PRESS.as_millis() as u64;
+
+        // Hovered long enough by real moves, then a real press: the release arms.
+        let mut p = PressTracker::default();
+        p.on_move(true, at(0));
+        p.on_move(true, at(hover / 2));
+        p.on_press(true, InputDevice::Mouse, at(hover));
+        assert!(p.on_release());
+        // A release consumes the press: a second release doesn't arm.
+        assert!(!p.on_release());
+
+        // m1: no press at all (another program posted WM_LBUTTONDOWN, or the press was made
+        // elsewhere): the release doesn't arm.
+        let mut p = PressTracker::default();
+        p.on_move(true, at(0));
+        p.on_press(false, InputDevice::Mouse, at(hover * 2));
+        assert!(!p.on_release());
+        assert!(!arms_accept(ButtonInput {
+            pressed_by_hardware: false,
+            ..real_release()
+        }));
+
+        // m3: the cursor arrived without a real move (SetCursorPos), or a moment ago: a mouse
+        // or touchpad press doesn't count.
+        for device in [InputDevice::Mouse, InputDevice::Touchpad] {
+            let mut p = PressTracker::default();
+            p.on_press(true, device, at(hover * 2));
+            assert!(!p.on_release(), "{device:?} with no hover");
+            let mut p = PressTracker::default();
+            p.on_move(true, at(0));
+            p.on_press(true, device, at(hover - 1));
+            assert!(!p.on_release(), "{device:?} hovered too briefly");
+        }
+        // A move that isn't a real pointer move, or the cursor leaving, starts the hover again.
+        let mut p = PressTracker::default();
+        p.on_move(true, at(0));
+        p.on_move(false, at(hover / 2));
+        p.on_move(true, at(hover));
+        p.on_press(true, InputDevice::Mouse, at(hover + hover / 2));
+        assert!(!p.on_release());
+        let mut p = PressTracker::default();
+        p.on_move(true, at(0));
+        p.on_leave();
+        p.on_press(true, InputDevice::Mouse, at(hover * 2));
+        assert!(!p.on_release());
+
+        // Touch and pen press where the contact is, not at the cursor: no hover needed.
+        for device in [InputDevice::Touch, InputDevice::Pen] {
+            let mut p = PressTracker::default();
+            p.on_press(true, device, at(0));
+            assert!(p.on_release(), "{device:?}");
+        }
+
+        // A lost capture, a cancelled mode or a restart of the delay drops the press and the
+        // hover.
+        let mut p = PressTracker::default();
+        p.on_move(true, at(0));
+        p.on_press(true, InputDevice::Mouse, at(hover));
+        p.cancel();
+        assert!(!p.on_release());
+        p.on_press(true, InputDevice::Mouse, at(hover * 3));
+        assert!(!p.on_release(), "the hover went with the cancel");
+    }
+
+    /// Re-review 3 m2 and m4: other programs can't relabel the buttons or rewrite the text.
+    #[test] // spec: QA-088, QA-036
+    fn the_shown_text_and_the_labels_refuse_changes() {
+        for msg in [WM_SETTEXT, EM_REPLACESEL, EM_SETREADONLY, WM_PASTE] {
+            assert!(text_change(msg), "{msg:#x}");
+        }
+        for msg in [WM_SETFONT, WM_LBUTTONUP, WM_KEYDOWN, WM_TIMER] {
+            assert!(!text_change(msg), "{msg:#x}");
+        }
     }
 
     /// A window for [`run_in`]: records what was asked of it.

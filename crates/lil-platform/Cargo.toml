@@ -101,6 +101,9 @@ features = [
     "Win32_System_WinRT",
     # QueryUnbiasedInterruptTime: the sleep record's monotonic clock (ARCH-127, Task 9).
     "Win32_System_WindowsProgramming",
+    # EM_REPLACESEL, EM_SETREADONLY and WM_MOUSELEAVE: the Windows Hello window's text and its
+    # Merge button refuse changes from other programs (Task 28).
+    "Win32_UI_Controls",
     # EnableWindow and SetFocus: the Windows Hello window's Merge / Deny buttons (Task 28).
     "Win32_UI_Input_KeyboardAndMouse",
     # GetCurrentInputMessageSource: only a real click accepts the Windows Hello window (Task 28).
