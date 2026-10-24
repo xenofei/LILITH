@@ -108,7 +108,8 @@ fn legacy_data_dir_hook_trips() {
 fn remove_helpers_refuse_a_real_channel_before_touching_anything() {
     use lil_platform::desktop::{
         Toast, clear_toast_history, leftover_registrations, post_watched,
-        remove_clsid_registration, remove_shortcut, remove_test_registry, unregister_handlers,
+        remove_aumid_registration, remove_clsid_registration, remove_notification_settings,
+        remove_shortcut, remove_test_registry, unregister_handlers,
     };
     let env = stable_env();
     let refused = |what: &str, got: std::io::Result<()>| {
@@ -128,6 +129,11 @@ fn remove_helpers_refuse_a_real_channel_before_touching_anything() {
     refused("remove_clsid_registration", remove_clsid_registration(env));
     refused("clear_toast_history", clear_toast_history(env));
     refused("remove_test_registry", remove_test_registry(env));
+    refused("remove_aumid_registration", remove_aumid_registration(env));
+    refused(
+        "remove_notification_settings",
+        remove_notification_settings(env),
+    );
     refused(
         "leftover_registrations",
         leftover_registrations(env).map(drop),

@@ -24,9 +24,31 @@ fn notifier(aumid: &str) -> windows::core::Result<ToastNotifier> {
     ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid))
 }
 
-/// The notifier's `Setting()` for `aumid`; `None` when there is no notifier (no platform).
+/// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`: what `Setting()` answers before the AUMID's first
+/// toast.
+const NOT_FOUND: windows::core::HRESULT = windows::core::HRESULT(0x8007_0490_u32 as i32);
+
+/// The notifier's `Setting()` for `aumid`; `None` when there is no notifier (no platform), and
+/// [`NotifierSetting::NotYetShown`] when `Setting()` itself answers `ERROR_NOT_FOUND`: the
+/// AUMID has never shown a toast. A notifier that can't be created is `None`, whatever the
+/// error.
 pub(crate) fn setting(aumid: &str) -> Option<NotifierSetting> {
-    let setting = notifier(aumid).and_then(|n| n.Setting()).ok()?;
+    reading(notifier(aumid), |n| n.Setting())
+}
+
+/// [`setting`]'s mapping, apart from Windows: `created` is the notifier (or why it couldn't be
+/// created), and `read` asks it for `Setting()`. Only `Setting()`'s `ERROR_NOT_FOUND` is
+/// `NotYetShown`; a notifier that couldn't be created is `None`, whatever the error (review M1).
+pub(crate) fn reading<N>(
+    created: windows::core::Result<N>,
+    read: impl FnOnce(&N) -> windows::core::Result<NotificationSetting>,
+) -> Option<NotifierSetting> {
+    let notifier = created.ok()?;
+    let setting = match read(&notifier) {
+        Ok(s) => s,
+        Err(e) if e.code() == NOT_FOUND => return Some(NotifierSetting::NotYetShown),
+        Err(_) => return None,
+    };
     Some(match setting {
         NotificationSetting::Enabled => NotifierSetting::Enabled,
         NotificationSetting::DisabledForUser => NotifierSetting::DisabledForUser,
@@ -38,8 +60,9 @@ pub(crate) fn setting(aumid: &str) -> Option<NotifierSetting> {
 }
 
 /// Whether this process's token is elevated. A token that can't be read counts as not
-/// elevated: the notifier's own setting still decides.
-pub(crate) fn is_elevated() -> bool {
+/// elevated: the notifier's own setting still decides. `lil dev desktop-tests --host` refuses
+/// to run elevated with it (P4a-R39).
+pub fn is_elevated() -> bool {
     let mut token = HANDLE::default();
     // SAFETY: the pseudo-handle of this process is always valid; `token` is a valid
     // out-pointer, and the handle it receives is closed below.
@@ -195,4 +218,36 @@ pub fn clear_toast_history(env: &Env) -> std::io::Result<()> {
     ToastNotificationManager::History()
         .and_then(|history| history.ClearWithId(&HSTRING::from(env.notification_aumid())))
         .map_err(|e| crate::process::io_error(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] // spec: APP-022, ARCH-055
+    fn only_settings_not_found_means_not_yet_shown() {
+        let not_found = || windows::core::Error::from(NOT_FOUND);
+        let other = || windows::core::Error::from(windows::core::HRESULT(0x8000_4005_u32 as i32));
+        // From Setting(): never shown.
+        assert_eq!(
+            reading(Ok(()), |_| Err(not_found())),
+            Some(NotifierSetting::NotYetShown)
+        );
+        // From creating the notifier: no platform, never NotYetShown.
+        assert_eq!(
+            reading(Err::<(), _>(not_found()), |_| Ok(
+                NotificationSetting::Enabled
+            )),
+            None
+        );
+        assert_eq!(reading(Ok(()), |_| Err(other())), None);
+        assert_eq!(
+            reading(Ok(()), |_| Ok(NotificationSetting::Enabled)),
+            Some(NotifierSetting::Enabled)
+        );
+        assert_eq!(
+            reading(Ok(()), |_| Ok(NotificationSetting::DisabledForUser)),
+            Some(NotifierSetting::DisabledForUser)
+        );
+    }
 }

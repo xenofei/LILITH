@@ -1,6 +1,7 @@
 //! `lil dev ...` subcommands. Add a variant to `DevCommand` and a match arm in `run`.
 
 pub mod agent_access;
+pub mod desktop_tests;
 pub mod github;
 #[cfg(test)]
 pub mod github_fake;
@@ -22,6 +23,44 @@ use clap::Subcommand;
 pub enum DevCommand {
     /// Run the spec tests and apply the expected-fail list.
     SpecTests,
+
+    /// Run the desktop-group tests in Windows Sandbox, or the toast and foreground tests here.
+    ///
+    /// The desktop group is the `desktop_*` tests marked #[ignore = "desktop"] (QA-042).
+    /// By default it builds a bundle in build\sandbox\in (a nextest archive of the desktop
+    /// packages, the tracked source files, the test kit's binaries, cargo-nextest and the VC++
+    /// runtime), writes build\sandbox\lilith-desktop.wsb, starts Windows Sandbox with the bundle
+    /// and the deploy folder read-only and build\sandbox\out writable, waits for the results,
+    /// copies them to build\sandbox\results and closes the Sandbox and its window. About 8
+    /// minutes (plus about 10 for the first bundle); keep the PC unlocked meanwhile. The toast and
+    /// foreground tests never run in the Sandbox (its tokens are elevated): use --host for them.
+    ///
+    ///   --suite qml|grabs  the CTest preset's commands in the Sandbox instead (P4a-R35)
+    ///   --host             the toast and foreground tests on this PC, no Sandbox (P4a-R39):
+    ///                      refused when elevated; a hands-off pop-up warns at least 10 s ahead
+    ///                      and counts down; afterwards every test shortcut, registry key, CLSID
+    ///                      and toast is checked gone (and removed if not)
+    ///
+    /// Exits 0 when every test passed, 1 when a test failed or something was left behind, and
+    /// 2 when the run couldn't happen (no Windows Sandbox, another one running, a timeout).
+    #[command(verbatim_doc_comment)]
+    DesktopTests {
+        /// Which tests run in the Sandbox: desktop (the Rust desktop group), qml or grabs.
+        #[arg(long, default_value = "desktop", value_parser = ["desktop", "qml", "grabs"])]
+        suite: String,
+        /// Run the toast and foreground tests on this PC instead, without the Sandbox.
+        #[arg(long, conflicts_with_all = ["suite", "keep_open"])]
+        host: bool,
+        /// How long the Sandbox run may take in all, in minutes.
+        #[arg(long, value_name = "N", default_value_t = desktop_tests::DEFAULT_TIMEOUT_MINS)]
+        timeout_mins: u64,
+        /// The same in seconds (for tests).
+        #[arg(long, hide = true, conflicts_with = "timeout_mins")]
+        timeout_secs: Option<u64>,
+        /// Leave the Sandbox open afterwards.
+        #[arg(long)]
+        keep_open: bool,
+    },
 
     /// Report which spec rules the tests cite (QA-028).
     ///
@@ -269,6 +308,24 @@ pub fn run(cmd: DevCommand) -> i32 {
     match cmd {
         DevCommand::SpecTests => spec_tests::run(),
         DevCommand::SpecReport => spec_report::run(),
+        DevCommand::DesktopTests {
+            suite,
+            host,
+            timeout_mins,
+            timeout_secs,
+            keep_open,
+        } => {
+            let suite = match (host, suite.as_str()) {
+                (true, _) => desktop_tests::Suite::Host,
+                (false, "qml") => desktop_tests::Suite::Qml,
+                (false, "grabs") => desktop_tests::Suite::Grabs,
+                _ => desktop_tests::Suite::Desktop,
+            };
+            let timeout = std::time::Duration::from_secs(
+                timeout_secs.unwrap_or(timeout_mins.saturating_mul(60)),
+            );
+            desktop_tests::cli(suite, timeout, keep_open)
+        }
         DevCommand::Guard {
             post_merge: true,
             before: Some(before),
@@ -472,6 +529,54 @@ mod tests {
         assert!(parse(&["privacy-scan"]).is_err());
         assert!(parse(&["privacy-scan", "--tree", "HEAD", "--range", "a..b"]).is_err());
         assert!(parse(&["privacy-scan", "--tree", "HEAD", "--commits", "HEAD"]).is_err());
+    }
+
+    #[test] // spec: QA-042
+    fn desktop_tests_cli() {
+        let c = parse(&["desktop-tests"]).unwrap();
+        assert!(matches!(
+            c,
+            DevCommand::DesktopTests { suite, host: false, timeout_mins: 20, timeout_secs: None, keep_open: false }
+                if suite == "desktop"
+        ));
+        let c = parse(&[
+            "desktop-tests",
+            "--suite",
+            "qml",
+            "--keep-open",
+            "--timeout-mins",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c,
+            DevCommand::DesktopTests { suite, keep_open: true, timeout_mins: 5, .. } if suite == "qml"
+        ));
+        assert!(matches!(
+            parse(&["desktop-tests", "--host"]).unwrap(),
+            DevCommand::DesktopTests { host: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["desktop-tests", "--timeout-secs", "5"]).unwrap(),
+            DevCommand::DesktopTests {
+                timeout_secs: Some(5),
+                ..
+            }
+        ));
+        for bad in [
+            &["desktop-tests", "--suite", "host"][..],
+            &["desktop-tests", "--host", "--suite", "qml"],
+            &["desktop-tests", "--host", "--keep-open"],
+            &[
+                "desktop-tests",
+                "--timeout-secs",
+                "5",
+                "--timeout-mins",
+                "1",
+            ],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
