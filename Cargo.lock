@@ -1690,6 +1690,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lil-parse"
+version = "0.0.0"
+
+[[package]]
 name = "lil-platform"
 version = "0.0.0"
 dependencies = [
@@ -1733,6 +1737,7 @@ dependencies = [
 name = "lil-spec-tests"
 version = "0.0.0"
 dependencies = [
+ "lil-parse",
  "lil-protocol",
  "lil-testkit",
  "serde_json",
