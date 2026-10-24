@@ -159,6 +159,13 @@ fn cut_at_max_with_an_ellipsis() {
         198
     );
 
+    // A kept joiner cut from the pictograph after it is dropped before the `…`.
+    let s = format!("{}\u{1f469}\u{200d}\u{1f4bb}y", "x".repeat(197));
+    assert_eq!(
+        shown_text(&s, 200),
+        format!("{}\u{1f469}…", "x".repeat(197))
+    );
+
     // Removed controls don't count.
     let s = format!("{}{}", "\u{7}".repeat(50), "x".repeat(200));
     assert_eq!(shown_text(&s, 200), "x".repeat(200));

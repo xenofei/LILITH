@@ -154,12 +154,17 @@ fn open_target(text: &str) -> Result<String, &'static str> {
     if target.chars().any(char::is_control) {
         return Err("the target holds a control character");
     }
-    if target
-        .get(..lil_schema::SCHEME.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(lil_schema::SCHEME))
-        && target.parse::<AssetRef>().is_err()
-    {
-        return Err("the target starts with lil:// but isn't a ref");
+    // The legacy `ww://` parses as a ref too (`lil_schema::LEGACY_SCHEME`), so it is held to the
+    // same rule.
+    let ref_like = [lil_schema::SCHEME, lil_schema::LEGACY_SCHEME]
+        .iter()
+        .any(|scheme| {
+            target
+                .get(..scheme.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        });
+    if ref_like && target.parse::<AssetRef>().is_err() {
+        return Err("the target starts like a ref but isn't one");
     }
     Ok(target)
 }

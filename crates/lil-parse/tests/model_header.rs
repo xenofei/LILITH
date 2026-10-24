@@ -233,7 +233,7 @@ fn typical(version: u32) -> Gguf {
         .kv("x.bytes", T_ARRAY, &array(T_U8, 4, &[9, 9, 9, 9]))
         .kv("x.nested", T_ARRAY, &array(T_ARRAY, 2, &nested))
         .string("general.architecture", "llama")
-        .string("llama.after", "never read")
+        .string("llama.after", "read for duplicates")
 }
 
 #[test] // spec: CORE-164
@@ -247,7 +247,7 @@ fn gguf_reads_general_architecture() {
         let first = Gguf::new(version).string("general.architecture", "qwen2");
         assert_eq!(gg(&first.bytes()).unwrap(), known("qwen2"));
     }
-    // Nothing after `general.architecture` is read.
+    // The rest of the key-value section is read, and nothing after it.
     let mut file = Gguf::new(3).string("general.architecture", "gemma").bytes();
     let mut r = FailAfter {
         data: file.clone(),
@@ -286,8 +286,12 @@ fn gguf_reads_general_architecture() {
         Err(HeaderError::Malformed(_))
     ));
     let mut truncated = typical(3).bytes();
-    // Cut inside `general.architecture`'s value: the last pair is 41 bytes, that one 45.
-    truncated.truncate(truncated.len() - 41 - 3);
+    // Cut inside `general.architecture`'s value: the last pair is 50 bytes, that one 45.
+    truncated.truncate(truncated.len() - 50 - 3);
+    assert!(matches!(gg(&truncated), Err(HeaderError::Io(_))));
+    // Cut inside the pair after it: that pair is still read, looking for a repeat.
+    let mut truncated = typical(3).bytes();
+    truncated.truncate(truncated.len() - 3);
     assert!(matches!(gg(&truncated), Err(HeaderError::Io(_))));
     let invalid_utf8 = Gguf::new(3).kv("general.architecture", T_STRING, &{
         let mut v = Vec::new();
@@ -346,8 +350,190 @@ fn gguf_string_over_64_kib_is_unknown() {
     assert_eq!(r.pos, head.len());
 }
 
+#[test] // spec: CORE-164
+fn gguf_repeated_architecture_is_unknown() {
+    let twice = Gguf::new(3)
+        .string("general.architecture", "llama")
+        .string("general.name", "x")
+        .string("general.architecture", "qwen2");
+    assert_eq!(gg(&twice.bytes()).unwrap(), Family::Unknown);
+    let other_type = Gguf::new(3).string("general.architecture", "llama").kv(
+        "general.architecture",
+        T_U32,
+        &1_u32.to_le_bytes(),
+    );
+    assert_eq!(gg(&other_type.bytes()).unwrap(), Family::Unknown);
+}
+
+#[test] // spec: CORE-164
+fn gguf_reads_at_most_100_mib() {
+    // An array before `general.architecture` that announces 200 MiB of bytes, served by a
+    // reader that never ends: the walk stops at 100 MiB.
+    let head = Gguf::new(3)
+        .kv("x.blob", T_ARRAY, &array(T_U8, 200 * MIB, &[]))
+        .string("general.architecture", "llama")
+        .bytes();
+    let blob_end = head.len() - 45;
+    let mut r = (&head[..blob_end]).chain(io::repeat(0));
+    assert_eq!(gguf_family(&mut r).unwrap(), Family::Unknown);
+    // A short file still ends as an unexpected end of file.
+    assert!(matches!(gg(&head[..blob_end]), Err(HeaderError::Io(_))));
+}
+
+#[test] // spec: CORE-164
+fn gguf_key_shorter_than_its_length_is_an_io_error() {
+    let mut head = Gguf::new(3).bytes();
+    head[16..24].copy_from_slice(&1_u64.to_le_bytes());
+    head.extend_from_slice(&10_u64.to_le_bytes());
+    head.extend_from_slice(b"gen");
+    assert!(matches!(gg(&head), Err(HeaderError::Io(_))));
+}
+
+#[test] // spec: CORE-164
+fn safetensors_repeated_keys_give_no_family() {
+    // A repeated `__metadata__` is refused, as the reference loader refuses it.
+    let twice = r#"{"__metadata__":{"modelspec.architecture":"a"},"__metadata__":{}}"#;
+    assert!(matches!(
+        st(&safetensors(twice)),
+        Err(HeaderError::Malformed(_))
+    ));
+    // A repeated candidate: loaders disagree on which copy wins, so neither is shown.
+    for metadata in [
+        r#"{"modelspec.architecture":"a","modelspec.architecture":"b"}"#,
+        r#"{"ss_base_model_version":"a","x":"y","ss_base_model_version":"b"}"#,
+        r#"{"modelspec.architecture":"a","ss_base_model_version":"c","ss_base_model_version":"d"}"#,
+    ] {
+        let header = format!(r#"{{"__metadata__":{metadata}}}"#);
+        assert_eq!(
+            st(&safetensors(&header)).unwrap(),
+            Family::Unknown,
+            "{metadata}"
+        );
+    }
+}
+
+/// `n` arrays nested in a member of the top object (or of `__metadata__`), so the document is
+/// `n + 1` (or `n + 2`) levels deep.
+fn nested(n: usize, in_metadata: bool) -> String {
+    let value = format!("{}{}", "[".repeat(n), "]".repeat(n));
+    if in_metadata {
+        format!(r#"{{"__metadata__":{{"x":{value}}}}}"#)
+    } else {
+        format!(r#"{{"x":{value}}}"#)
+    }
+}
+
+#[test] // spec: CORE-164, QA-050
+fn safetensors_invalid_json_is_malformed() {
+    for bad in [
+        r#"{"x":[}"#,
+        r#"{"x":{]}"#,
+        r#"{"x":[1,2}}"#,
+        r#"{"x":x"}"#,
+        r#"{"x":tru}"#,
+        r#"{"x":truex}"#,
+        r#"{"x":[1,]}"#,
+        r#"{"x":{"a":1,}}"#,
+        r#"{"x":{"a" 1}}"#,
+        r#"{"x":{1:2}}"#,
+        r#"{"x":[1 2]}"#,
+        r#"{"x":1,}"#,
+        r#"{"x":1}}"#,
+        r#"{"x":1} x"#,
+        r#"{"__metadata__":{"modelspec.architecture":"a"],"x":1}"#,
+    ] {
+        assert!(
+            matches!(st(&safetensors(bad)), Err(HeaderError::Malformed(_))),
+            "{bad}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "{bad}"
+        );
+    }
+    for good in [
+        r#"{"x":[1,-2.5e+3,true,false,null,"]",{"a":[]},{}]}"#,
+        " {\n\t\"x\" : [ 1 , { } ] \r} ",
+    ] {
+        assert_eq!(st(&safetensors(good)).unwrap(), Family::Unknown, "{good}");
+    }
+    // The nesting limit is serde_json's, which the reference loader inherits.
+    for in_metadata in [false, true] {
+        for n in 120..135 {
+            let json = nested(n, in_metadata);
+            let reference = serde_json::from_str::<serde_json::Value>(&json).is_ok();
+            let ours = st(&safetensors(&json));
+            assert_eq!(
+                ours.is_ok(),
+                reference,
+                "depth {n} (in metadata: {in_metadata}): {ours:?}"
+            );
+        }
+    }
+}
+
+#[test] // spec: CORE-164
+fn safetensors_family_cap_is_checked_before_decoding() {
+    // 65,536 `\u0061` escapes are 6 * 64 KiB + 2 bytes with the quotes and decode to exactly
+    // 64 KiB: within the cap, so the pre-decode bound must not refuse it.
+    let escaped = "\\u0061".repeat(64 * 1024);
+    let header = format!(r#"{{"__metadata__":{{"modelspec.architecture":"{escaped}"}}}}"#);
+    assert_eq!(
+        st(&safetensors(&header)).unwrap(),
+        known(&"a".repeat(64 * 1024))
+    );
+    // One more byte of text is over the bound, and over the cap once decoded.
+    let header = format!(r#"{{"__metadata__":{{"modelspec.architecture":"{escaped}a"}}}}"#);
+    assert_eq!(st(&safetensors(&header)).unwrap(), Family::Unknown);
+}
+
+/// JSON-ish text built from fragments, so the scanner's deep paths see more than byte flips.
+fn json_fragments() -> impl Strategy<Value = String> {
+    let fragment = prop_oneof![
+        Just("{"),
+        Just("}"),
+        Just("["),
+        Just("]"),
+        Just("\""),
+        Just("\\"),
+        Just(":"),
+        Just(","),
+        Just(" "),
+        Just("\"__metadata__\""),
+        Just("\"modelspec.architecture\""),
+        Just("\"ss_base_model_version\""),
+        Just("\"sdxl\""),
+        Just("\"\\u0061\""),
+        Just("12"),
+        Just("-1.5e3"),
+        Just("true"),
+        Just("null"),
+    ];
+    proptest::collection::vec(fragment, 0..64).prop_map(|f| {
+        let body = f.concat();
+        if body.starts_with('{') {
+            body
+        } else {
+            format!("{{{body}")
+        }
+    })
+}
+
+fn family_within_cap(r: &Result<Family, HeaderError>) -> bool {
+    !matches!(r, Ok(Family::Known(f)) if f.is_empty() || f.len() > 64 * 1024)
+}
+
 proptest! {
     #![proptest_config(common::config())]
+
+    #[test] // spec: QA-050, CORE-164
+    fn fragment_headers_never_panic(json in json_fragments()) {
+        let result = st(&safetensors(&json));
+        prop_assert!(family_within_cap(&result));
+        if result.is_ok() {
+            prop_assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok(), "{}", json);
+        }
+    }
 
     #[test] // spec: QA-050, CORE-164
     fn truncated_or_random_headers_never_panic(
@@ -365,17 +551,17 @@ proptest! {
                 bytes[at % n] = *b;
             }
             for data in [&base[..cut.min(base.len())], &bytes[..], &bytes[..cut.min(bytes.len())]] {
-                let _ = st(data);
-                let _ = gg(data);
+                prop_assert!(family_within_cap(&st(data)));
+                prop_assert!(family_within_cap(&gg(data)));
             }
         }
-        let _ = st(&random);
-        let _ = gg(&random);
+        prop_assert!(family_within_cap(&st(&random)));
+        prop_assert!(family_within_cap(&gg(&random)));
         let mut gguf_random = b"GGUF\x03\0\0\0".to_vec();
         gguf_random.extend_from_slice(&random);
-        let _ = gg(&gguf_random);
+        prop_assert!(family_within_cap(&gg(&gguf_random)));
         let mut st_random = (random.len() as u64).to_le_bytes().to_vec();
         st_random.extend_from_slice(&random);
-        let _ = st(&st_random);
+        prop_assert!(family_within_cap(&st(&st_random)));
     }
 }

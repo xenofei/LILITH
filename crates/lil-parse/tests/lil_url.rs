@@ -5,6 +5,7 @@ mod common;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lil_parse::{LilUrl, confirm_url, deny_url, open_url, parse_lil_url, strip_argument, task_url};
+use lil_schema::AssetRef;
 use proptest::prelude::*;
 
 const SCHEME: &str = "lil-dev";
@@ -143,6 +144,14 @@ fn bad_ids_and_padding_are_refused() {
     refused(&format!("{SCHEME}:open/{}", b64(&[0xff, 0xfe])));
     refused(&format!("{SCHEME}:open/{}", b64(b"lil://not a ref")));
     refused(&format!("{SCHEME}:open/{}", b64(b"LIL://not a ref")));
+    // The legacy scheme parses as a ref, so it is held to the same rule.
+    refused(&format!("{SCHEME}:open/{}", b64(b"ww://not a ref")));
+    refused(&format!("{SCHEME}:open/{}", b64(b"WW://not a ref")));
+    let legacy = "ww://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0";
+    assert_eq!(
+        ok(&format!("{SCHEME}:open/{}", b64(legacy.as_bytes()))),
+        LilUrl::Open(legacy.into())
+    );
     refused(&format!("{SCHEME}:open/{}", b64(&[b'a'; 4097])));
     assert_eq!(
         ok(&format!("{SCHEME}:open/{}", b64(&[b'a'; 4096]))),
@@ -293,8 +302,18 @@ fn target() -> impl Strategy<Value = String> {
         }
         s
     })
-    .prop_filter("not a lil:// ref", |s| {
-        !s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("lil://"))
+    .prop_filter("not ref-like", |s| {
+        !["lil://", "ww://"].iter().any(|scheme| {
+            s.get(..scheme.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        })
+    })
+}
+
+/// `^<prefix>[0-9a-f]{<hex>}$`.
+fn is_id(s: &str, prefix: &str, hex: usize) -> bool {
+    s.strip_prefix(prefix).is_some_and(|h| {
+        h.len() == hex && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     })
 }
 
@@ -306,6 +325,8 @@ fn argument() -> impl Strategy<Value = String> {
         Just("lil-dev:open/"),
         Just("lil-dev:deny/cf_0123456789abcdef/"),
         Just("lil-dev:confirm/"),
+        Just("lil-dev:confirm/cf_"),
+        Just("lil-dev:task/j_"),
         Just("lil://"),
         Just("lil://0123456789abcdef/sketchbook/"),
     ];
@@ -313,6 +334,9 @@ fn argument() -> impl Strategy<Value = String> {
         proptest::collection::vec(any::<char>(), 0..10_000)
             .prop_map(|c| c.into_iter().collect::<String>()),
         "[A-Za-z0-9_%/@.#=:-]{0,200}",
+        // Near-valid ids and tokens, so the accepting branches are reached.
+        "[0-9a-fA/]{14,36}",
+        "[a-z_]{1,20}@[0-9.]{1,8}",
     ];
     (prefix, body).prop_map(|(p, b)| {
         let mut s = format!("{p}{b}");
@@ -335,10 +359,25 @@ proptest! {
 
     #[test] // spec: QA-050
     fn any_argument_is_classified_or_refused_without_panic(arg in argument()) {
-        match parse_lil_url(&arg, SCHEME) {
-            Ok(LilUrl::Open(t)) => prop_assert!(!t.chars().any(char::is_control)),
-            Ok(LilUrl::Ref(r)) => prop_assert!(r.starts_with("lil://")),
-            Ok(_) => {}
+        let parsed = parse_lil_url(&arg, SCHEME);
+        if arg.chars().count() > 8192 {
+            prop_assert!(parsed.is_err());
+        }
+        match parsed {
+            Ok(LilUrl::Open(t)) => {
+                prop_assert!(!t.is_empty() && t.len() <= 4096);
+                prop_assert!(!t.chars().any(char::is_control));
+            }
+            Ok(LilUrl::Ref(r)) => {
+                prop_assert!(r.starts_with("lil://"));
+                prop_assert!(r.parse::<AssetRef>().is_ok());
+            }
+            Ok(LilUrl::Confirm(id)) => prop_assert!(is_id(&id, "cf_", 16)),
+            Ok(LilUrl::Deny { id, token }) => {
+                prop_assert!(is_id(&id, "cf_", 16));
+                prop_assert!(is_id(&token, "", 32));
+            }
+            Ok(LilUrl::Task(id)) => prop_assert!(is_id(&id, "j_", 16)),
             Err(r) => {
                 prop_assert!(r.shown.chars().count() <= 80);
                 prop_assert!(!r.shown.chars().any(char::is_control));

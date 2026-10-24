@@ -29,6 +29,10 @@ pub fn shown_text(s: &str, max_chars: usize) -> String {
         }
     }
     if !fits {
+        // A kept joiner cut from the pictograph after it no longer joins anything.
+        if out.ends_with('\u{200d}') {
+            out.pop();
+        }
         out.push('…');
     }
     out
