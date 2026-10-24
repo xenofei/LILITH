@@ -127,7 +127,7 @@ pub struct Estimate {
     pub unknown: Vec<UnknownPart>,
 }
 
-/// One job's p50 and p90 of a part, as numbers.
+/// One job's p50 and p90 of a part, as numbers: each finite and 0 or more.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spread {
     pub p50: f64,
@@ -135,45 +135,100 @@ pub struct Spread {
 }
 
 impl Spread {
-    pub fn new(p50: f64, p90: f64) -> Spread {
-        Spread { p50, p90 }
+    /// `None` unless both figures are finite and 0 or more: anything else (NaN, an infinity,
+    /// a negative) is not an estimate (Appendix G "Adding estimates").
+    pub fn new(p50: f64, p90: f64) -> Option<Spread> {
+        let fine = |v: f64| v.is_finite() && v >= 0.0;
+        (fine(p50) && fine(p90)).then_some(Spread { p50, p90 })
     }
 
     fn parse(p50: &str, p90: &str) -> Option<Spread> {
-        Some(Spread::new(p50.parse().ok()?, p90.parse().ok()?))
+        Spread::new(p50.parse().ok()?, p90.parse().ok()?)
     }
 }
 
-/// A part summed over jobs: `of` jobs, `not_estimated` of them without the part.
+impl MoneyPart {
+    /// The amounts as a [`Spread`] (`None` when a figure doesn't read); its currency is
+    /// `currency`.
+    pub fn spread(&self) -> Option<Spread> {
+        Spread::parse(&self.p50, &self.p90)
+    }
+}
+
+/// A part summed over jobs: `of` jobs, `not_estimated` of them without the part. `total` is
+/// `None` when no job had it: nothing estimated reads as not estimated, never as 0.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpreadSum {
-    pub p50: f64,
-    pub p90: f64,
+    pub total: Option<Spread>,
     pub of: u32,
     pub not_estimated: u32,
 }
 
 /// The sum of one part over jobs, one entry per job (`None`: the job has no such part): the
 /// p50s add, and the p90 is that sum plus the root of the summed squares of each job's
-/// (p90 − p50); p90s are never added (Appendix G "Adding estimates").
+/// (p90 − p50); p90s are never added (Appendix G "Adding estimates"). For `money` use
+/// [`sum_money`], which never adds across currencies.
 pub fn sum_part(parts: &[Option<&Spread>]) -> SpreadSum {
-    let (mut p50, mut squares, mut missing) = (0.0, 0.0, 0_u32);
-    for part in parts {
-        match part {
-            Some(s) => {
-                p50 += s.p50;
-                let spread = s.p90 - s.p50;
-                squares += spread * spread;
-            }
-            None => missing += 1,
-        }
+    let (mut p50, mut squares, mut found) = (0.0, 0.0, 0_u32);
+    for s in parts.iter().flatten() {
+        found += 1;
+        p50 += s.p50;
+        let spread = s.p90 - s.p50;
+        squares += spread * spread;
     }
+    let of = u32::try_from(parts.len()).unwrap_or(u32::MAX);
     SpreadSum {
-        p50,
-        p90: p50 + f64::sqrt(squares),
-        of: u32::try_from(parts.len()).unwrap_or(u32::MAX),
-        not_estimated: missing,
+        total: (found > 0).then(|| Spread {
+            p50,
+            p90: p50 + f64::sqrt(squares),
+        }),
+        of,
+        not_estimated: of.saturating_sub(found),
     }
+}
+
+/// One currency's `money` sum ([`sum_money`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoneySum {
+    pub currency: String,
+    /// `of` is every job; `not_estimated` the jobs with no `money` part (or one whose figures
+    /// don't read). Jobs priced in another currency are in that currency's sum.
+    pub sum: SpreadSum,
+}
+
+/// The `money` parts of jobs summed per currency, never converted into one (Appendix G), by
+/// currency code. No job with a readable `money` part: an empty list.
+pub fn sum_money(parts: &[Option<&MoneyPart>]) -> Vec<MoneySum> {
+    let priced: Vec<(&str, Spread)> = parts
+        .iter()
+        .flatten()
+        .filter_map(|m| Some((m.currency.as_str(), m.spread()?)))
+        .collect();
+    let mut currencies: Vec<&str> = priced.iter().map(|(c, _)| *c).collect();
+    currencies.sort_unstable();
+    currencies.dedup();
+    let of = u32::try_from(parts.len()).unwrap_or(u32::MAX);
+    let not_estimated = of.saturating_sub(u32::try_from(priced.len()).unwrap_or(u32::MAX));
+    currencies
+        .into_iter()
+        .map(|currency| {
+            let mine: Vec<&Spread> = priced
+                .iter()
+                .filter(|(c, _)| *c == currency)
+                .map(|(_, s)| s)
+                .collect();
+            let refs: Vec<Option<&Spread>> = mine.iter().copied().map(Some).collect();
+            let total = sum_part(&refs).total;
+            MoneySum {
+                currency: currency.to_string(),
+                sum: SpreadSum {
+                    total,
+                    of,
+                    not_estimated,
+                },
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -181,19 +236,44 @@ mod tests {
     use super::*;
 
     #[test] // spec: CORE-161
-    fn sum_part_of_nothing_estimated_is_zero_and_counted() {
+    fn nothing_estimated_is_never_zero_and_bad_figures_are_not_estimates() {
         let sum = sum_part(&[None, None]);
-        assert_eq!(
-            (sum.p50, sum.p90, sum.of, sum.not_estimated),
-            (0.0, 0.0, 2, 2)
-        );
-        let wall = WallPart {
+        assert_eq!((sum.total, sum.of, sum.not_estimated), (None, 2, 2));
+        let wall = |p50: &str, p90: &str| WallPart {
             source: EstimateSource::MeasuredHistory,
             samples: 3,
-            p50: "15.0".into(),
-            p90: "23.0".into(),
+            p50: p50.into(),
+            p90: p90.into(),
         };
-        assert_eq!(wall.spread(), Some(Spread::new(15.0, 23.0)));
+        assert_eq!(wall("15.0", "23.0").spread(), Spread::new(15.0, 23.0));
+        for (p50, p90) in [("NaN", "1.0"), ("1.0", "inf"), ("-1.0", "2.0"), ("x", "1")] {
+            assert_eq!(wall(p50, p90).spread(), None, "{p50} {p90}");
+        }
+        assert_eq!(Spread::new(f64::NAN, 1.0), None);
+    }
+
+    #[test] // spec: CORE-161
+    fn money_adds_only_within_a_currency() {
+        let money = |p50: &str, p90: &str, currency: &str| MoneyPart {
+            source: EstimateSource::PricesYaml,
+            p50: p50.into(),
+            p90: p90.into(),
+            upper_bound: p90.into(),
+            currency: currency.into(),
+        };
+        let (a, b, c) = (
+            money("1", "4", "USD"),
+            money("2", "6", "USD"),
+            money("5", "5", "EUR"),
+        );
+        let sums = sum_money(&[Some(&a), None, Some(&c), Some(&b)]);
+        assert_eq!(sums.len(), 2);
+        assert_eq!(sums[0].currency, "EUR");
+        assert_eq!(sums[0].sum.total, Spread::new(5.0, 5.0));
+        assert_eq!(sums[1].currency, "USD");
+        assert_eq!(sums[1].sum.total, Spread::new(3.0, 8.0));
+        assert_eq!((sums[1].sum.of, sums[1].sum.not_estimated), (4, 1));
+        assert!(sum_money(&[None]).is_empty());
     }
 
     #[test] // spec: CORE-161

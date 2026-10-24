@@ -1112,6 +1112,13 @@ pub trait JobCompletion: Send + Sync {
         outcome: &'a Outcome<ToolOutput>,
         done: Option<&'a JobDone>,
     ) -> JobFuture<'a, ()>;
+
+    /// Runs once the job's final state `succeeded` is written, after its Record step, in
+    /// registration order: never for a job whose Record step failed or that a shutdown marked
+    /// `interrupted` (`meter` writes the job's history here, Appendix G). Nothing by default.
+    fn succeeded<'a>(&'a self, _job: &'a JobCtx) -> JobFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// `jobs.list`'s filter (Appendix F).

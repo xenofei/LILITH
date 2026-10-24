@@ -2139,7 +2139,8 @@ async fn version_1_migrates_to_2_keeping_rows() {
 }
 
 /// `put_job_stats` and `history` round-trip a row; history is the newest first, by kind and
-/// key, at most `newest`; a second write for a job replaces the first.
+/// key, at most `newest`; a job's row is written once, and a second write for it changes
+/// nothing (plan 4a ruling, 2026-10-24).
 #[tokio::test] // spec: CORE-161
 async fn job_stats_rows_round_trip() {
     let rig = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
@@ -2177,8 +2178,48 @@ async fn job_stats_rows_round_trip() {
     again.system_mj = 5;
     t.put_job_stats(&again).await.unwrap();
     let history = t.history("k.job", "k", 20).await.unwrap();
-    assert_eq!(history.len(), 3, "replaced, not added");
-    assert_eq!(history[0], again);
+    assert_eq!(history.len(), 3, "not added");
+    assert_eq!(
+        history[2],
+        stats("j_000000000000000a", "k", T0_MS, 4000),
+        "not changed"
+    );
+}
+
+/// `job_stats` keeps the newest 20 rows of each kind and key, the ones the estimator reads,
+/// deleting older ones as a row is added; other keys keep theirs (plan 4a ruling, 2026-10-24).
+#[tokio::test] // spec: CORE-161
+async fn job_stats_keeps_the_newest_20_per_kind_and_key() {
+    let rig = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
+    let t = rig.telemetry.clone();
+    for i in 1..=25_i64 {
+        t.put_job_stats(&stats(&format!("j_{i:016x}"), "k", T0_MS + i * 1000, 1000))
+            .await
+            .unwrap();
+    }
+    for i in 1..=3_i64 {
+        t.put_job_stats(&stats(&format!("j_{:016x}", 100 + i), "other", T0_MS, 1000))
+            .await
+            .unwrap();
+    }
+    let count = |key: &str| -> i64 {
+        rusqlite::Connection::open(&rig.db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM job_stats WHERE estimate_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!((count("k"), count("other")), (20, 3));
+    let kept = t.history("k.job", "k", 100).await.unwrap();
+    assert_eq!(kept.len(), 20);
+    assert_eq!(
+        kept[19].job_id,
+        format!("j_{:016x}", 6),
+        "the newest 20 stay"
+    );
 }
 
 /// A GPU at 100 W (its counter rising 100 000 mJ a sample) and a CPU package metered at 30 W,
@@ -2255,11 +2296,16 @@ async fn energy_over_a_range_matches_the_job_energy_formula() {
 }
 
 /// A range the 1-second samples no longer hold is read from the minute rows, and one the
-/// minute rows no longer hold from the hourly rows: the energy stays the same (CORE-062).
+/// minute rows no longer hold from the hourly rows (CORE-062). Samples in two minutes of one
+/// hour tell the tables apart: over the first minute, `m1` gives that minute's energy and
+/// `h1` the whole hour's.
 #[tokio::test] // spec: APP-131, CORE-062
 async fn energy_picks_the_finest_table_that_holds_the_range() {
     let rig = Rig::new(&metered());
     rig.run(3).await;
+    // Two more samples a minute later, in the same hour.
+    rig.clock.advance(Duration::from_secs(60));
+    rig.run(2).await;
     let range = (T0_MS, T0_MS + 2000);
     let fresh = rig.telemetry.energy(range.0, range.1).await.unwrap();
     assert_eq!(fresh.gpu_mj, 200_000);
@@ -2280,12 +2326,25 @@ async fn energy_picks_the_finest_table_that_holds_the_range() {
     assert_eq!(minutes.cpu_mj, fresh.cpu_mj);
     assert!(minutes.measured.gpu);
 
-    // Past 30 days only the hourly rows hold it.
+    // Past 30 days only the hourly rows hold it: their bucket is the whole hour, both
+    // minutes.
     rig.clock.advance(Duration::from_secs(31 * 86_400));
     rig.run(1).await;
     let hours = rig.telemetry.energy(range.0, range.1).await.unwrap();
-    assert_eq!(hours.gpu_mj, 200_000, "from h1");
-    assert_eq!(hours.cpu_mj, fresh.cpu_mj);
+    assert_eq!(hours.gpu_mj, 400_000, "from h1");
+}
+
+/// An app's close untracks its pid only while the pid is still tracked as the app: an engine
+/// process that took the pid over stays tracked (M6).
+#[tokio::test] // spec: APP-127
+async fn untracking_an_app_never_untracks_an_engine() {
+    let rig = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
+    rig.telemetry.track(7, "comfyui");
+    rig.telemetry.untrack_if(7, "app");
+    assert_eq!(rig.telemetry.tracked(), [(7, "comfyui")]);
+    rig.telemetry.track(8, "app");
+    rig.telemetry.untrack_if(8, "app");
+    assert_eq!(rig.telemetry.tracked(), [(7, "comfyui")]);
 }
 
 /// `gpu_users` lists the 8 processes with the most dedicated GPU memory, tracked or not, the

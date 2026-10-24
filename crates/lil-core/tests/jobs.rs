@@ -4136,20 +4136,28 @@ async fn estimate_uses_nearest_rank_over_the_newest_20() {
 }
 
 /// `comfy.prompt`'s key: the first 16 hex of SHA-256 over the canonical graph without its
-/// `seed`, `noise_seed` and `filename_prefix` inputs (Appendix G).
+/// `seed`, `noise_seed` and `filename_prefix` inputs, its nodes' `_meta`, and its free text
+/// (Appendix G, plan 4a ruling 2026-10-24): a new seed, prefix, title or prompt is the same
+/// work; another step count, size or model is not.
 #[test] // spec: CORE-161
 fn estimate_key_ignores_seeds_and_prefixes() {
-    let graph = |seed: u64, prefix: &str, steps: u64| {
+    let graph = |seed: u64, prefix: &str, steps: u64, text: &str, width: u64| {
         json!({
             "3": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps,
-                  "model": ["4", 0]}},
+                  "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0]},
+                  "_meta": {"title": format!("KSampler {seed}")}},
             "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}},
             "5": {"class_type": "SamplerCustom", "inputs": {"noise_seed": seed + 1}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": text, "clip": ["4", 1]}},
+            "7": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text_g": text, "text_l": text,
+                  "width": width, "clip": ["4", 1]}},
+            "8": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": 512}},
             "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix,
                   "images": ["3", 0]}},
+            "10": {"class_type": "PromptNode", "inputs": {"prompt": text}},
         })
     };
-    let key = comfy_estimate_key(&graph(1, "ComfyUI", 20));
+    let key = comfy_estimate_key(&graph(1, "ComfyUI", 20, "a cat", 512));
     assert_eq!(key.len(), 16);
     assert!(
         key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
@@ -4157,13 +4165,22 @@ fn estimate_key_ignores_seeds_and_prefixes() {
     );
     assert_eq!(
         key,
-        comfy_estimate_key(&graph(987_654, "lil_0123456789abcdef_", 20))
+        comfy_estimate_key(&graph(987_654, "lil_0123456789abcdef_", 20, "a dog", 512)),
+        "seed, prefix, title and prompt text are not the work"
     );
     assert_ne!(
         key,
-        comfy_estimate_key(&graph(1, "ComfyUI", 21)),
-        "steps count"
+        comfy_estimate_key(&graph(1, "ComfyUI", 21, "a cat", 512)),
+        "steps"
     );
+    assert_ne!(
+        key,
+        comfy_estimate_key(&graph(1, "ComfyUI", 20, "a cat", 1024)),
+        "resolution"
+    );
+    let mut other_model = graph(1, "ComfyUI", 20, "a cat", 512);
+    other_model["4"]["inputs"]["ckpt_name"] = json!("b.safetensors");
+    assert_ne!(key, comfy_estimate_key(&other_model), "model");
 }
 
 /// An in-process core over the pipe (its clock and ids fake), and a session with it.
@@ -4359,11 +4376,14 @@ async fn a_local_job_has_no_money_part_and_an_energy_cost_when_a_rate_is_set() {
 /// not taken as zero.
 #[test] // spec: CORE-161
 fn sum_part_adds_p50s_and_never_p90s() {
-    let (a, b) = (Spread::new(10.0, 14.0), Spread::new(20.0, 23.0));
+    let (a, b) = (
+        Spread::new(10.0, 14.0).unwrap(),
+        Spread::new(20.0, 23.0).unwrap(),
+    );
     let sum = sum_part(&[Some(&a), Some(&b)]);
-    assert_eq!((sum.p50, sum.p90), (30.0, 35.0));
+    assert_eq!(sum.total, Spread::new(30.0, 35.0));
     assert_eq!((sum.of, sum.not_estimated), (2, 0));
     let with_gap = sum_part(&[Some(&a), None, Some(&b)]);
-    assert_eq!((with_gap.p50, with_gap.p90), (30.0, 35.0));
+    assert_eq!(with_gap.total, Spread::new(30.0, 35.0));
     assert_eq!((with_gap.of, with_gap.not_estimated), (3, 1));
 }

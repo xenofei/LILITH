@@ -1271,11 +1271,29 @@ async fn a_job_that_ran_unchecked_stays_marked_after_a_preemption() {
     rig.shutdown().await;
 }
 
-/// Whether job `id`'s row carries the watchdog's flag yet (after the flag's write, which the
-/// watchdog makes from a task of its own, had its chance): for what must not have happened.
+/// Whether job `id` was flagged by now: reads the events that arrive for a moment (a short
+/// grace for the watchdog's own task and its row write, never a measurement), then looks for
+/// a `watchdog` event on `job:<id>` among every event read so far and at the row. For what must
+/// not have happened: a flag that came early is still among the events at a later check.
 async fn flagged(rig: &Rig, id: &str) -> bool {
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
+    let topic = format!("job:{id}");
+    {
+        let mut guard = rig.rx.lock().await;
+        let (rx, seen) = &mut *guard;
+        let until = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(line)) = tokio::time::timeout_at(until, rx.recv()).await {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            seen.push((
+                event["params"]["topic"].as_str().unwrap().to_string(),
+                event["params"]["data"].clone(),
+            ));
+        }
+        if seen
+            .iter()
+            .any(|(t, d)| *t == topic && d["kind"] == "watchdog")
+        {
+            return true;
+        }
     }
     row(rig, id).await.watchdog.is_some()
 }

@@ -1900,7 +1900,12 @@ impl Shared {
                 c
             }
         };
-        self.apply(id, &info.scope, c, None).await;
+        let ended = self.apply(id, &info.scope, c, None).await;
+        if ended.is_some_and(|row| row.status == JobStatus::Succeeded) {
+            for c in read(&self.completions) {
+                c.succeeded(&ctx).await;
+            }
+        }
         self.leave(info);
         if rerun {
             tracing::info!(

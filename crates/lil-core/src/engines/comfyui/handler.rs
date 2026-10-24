@@ -151,20 +151,49 @@ pub struct PromptArgs {
     pub inputs: Vec<PromptInput>,
 }
 
-/// The inputs a `comfy.prompt` estimate key leaves out of its graph (Appendix G): they change
-/// each run, not the work.
-const UNKEYED_INPUTS: [&str; 3] = ["seed", "noise_seed", "filename_prefix"];
+/// The inputs a `comfy.prompt` estimate key leaves out of its graph (Appendix G): the ones
+/// that change each run, and the free text, neither of which changes the work.
+const UNKEYED_INPUTS: [&str; 8] = [
+    "seed",
+    "noise_seed",
+    "filename_prefix",
+    "text",
+    "text_g",
+    "text_l",
+    "prompt",
+    "negative",
+];
 
-/// The estimate key of an API-format `graph` (CORE-161; Appendix G): the first 16 hex of
-/// SHA-256 over its canonical JSON (keys sorted, no whitespace) with every input named
-/// `seed`, `noise_seed` or `filename_prefix` removed.
+/// The estimate key of an API-format `graph` (CORE-161; Appendix G, plan 4a ruling
+/// 2026-10-24): the first 16 hex of SHA-256 over its canonical JSON (keys sorted, no
+/// whitespace) without each node's `_meta`, every input named in [`UNKEYED_INPUTS`], and every
+/// string input of a node whose `class_type` contains `TextEncode`. Model names, sizes and
+/// numbers stay in.
 pub fn comfy_estimate_key(graph: &Value) -> String {
     let mut graph = graph.clone();
     if let Some(nodes) = graph.as_object_mut() {
         for node in nodes.values_mut() {
+            let Some(node) = node.as_object_mut() else {
+                continue;
+            };
+            lil_schema::remove_key(node, "_meta");
+            let encoder = node
+                .get("class_type")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.contains("TextEncode"));
             if let Some(inputs) = node.get_mut("inputs").and_then(Value::as_object_mut) {
                 for name in UNKEYED_INPUTS {
                     lil_schema::remove_key(inputs, name);
+                }
+                if encoder {
+                    let text: Vec<String> = inputs
+                        .iter()
+                        .filter(|(_, v)| v.is_string())
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for name in text {
+                        lil_schema::remove_key(inputs, &name);
+                    }
                 }
             }
         }

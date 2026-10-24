@@ -929,6 +929,15 @@ impl Telemetry {
         lock(&self.inner.tracked).remove(&pid);
     }
 
+    /// Stops following `pid` only while it is tracked with `role`: a connected app's close
+    /// never untracks an engine process that took over its pid.
+    pub fn untrack_if(&self, pid: u32, role: &str) {
+        let mut tracked = lock(&self.inner.tracked);
+        if tracked.get(&pid).is_some_and(|r| *r == role) {
+            tracked.remove(&pid);
+        }
+    }
+
     /// The processes [`Telemetry::track`] follows, with their roles, by pid.
     pub fn tracked(&self) -> Vec<(u32, &'static str)> {
         lock(&self.inner.tracked)
@@ -1154,8 +1163,9 @@ impl Telemetry {
             .map_err(|e| db_error("the read", &e))
     }
 
-    /// Stores a job's history row (`meter` is the only writer); a second write for the same
-    /// job replaces the first.
+    /// Stores a job's history row (`meter` is the only writer): once per job, a second write
+    /// for the same job changing nothing, and only the newest 20 rows of its kind and key are
+    /// kept (Appendix G).
     ///
     /// # Errors
     /// `store.io` when the write fails.
@@ -1164,6 +1174,7 @@ impl Telemetry {
         tokio::task::spawn_blocking(move || inner.db.put_job_stats(&row))
             .await
             .map_err(|e| db_error("the write", &e))?
+            .map(drop)
             .map_err(|e| db_error("the write", &e))
     }
 

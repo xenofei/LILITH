@@ -286,6 +286,10 @@ CREATE TABLE job_stats (
 CREATE INDEX job_stats_key ON job_stats (kind, estimate_key, finished_ms);
 ";
 
+/// The history rows `job_stats` keeps per kind and estimate key: the ones the estimator reads
+/// (Appendix G).
+pub(crate) const HISTORY_KEPT: u32 = 20;
+
 const TABLES: [&str; 6] = ["s1", "m1", "h1", "proc_s1", "job_energy", "job_stats"];
 
 /// The open database.
@@ -579,7 +583,7 @@ impl Db {
                 };
                 let mut stmt = conn.prepare_cached(&format!(
                     "SELECT ts, n, min, max, sum FROM {table} \
-                     WHERE metric = ?1 AND ts + ?2 > ?3 AND ts <= ?4 ORDER BY ts LIMIT ?5"
+                     WHERE metric = ?1 AND ts > ?3 - ?2 AND ts <= ?4 ORDER BY ts LIMIT ?5"
                 ))?;
                 let energy = metric.is_energy();
                 stmt.query_map(params![metric.name(), len, from_ms, to_ms, limit], |r| {
@@ -786,12 +790,17 @@ impl Db {
         Ok(out)
     }
 
-    /// Writes (or replaces) a job's history row.
-    pub(crate) fn put_job_stats(&self, r: &JobStatsRow) -> rusqlite::Result<()> {
-        let conn = self.lock();
+    /// Writes a job's history row once (a second write for the same job changes nothing),
+    /// and keeps only the newest [`HISTORY_KEPT`] rows of its kind and key, in one transaction
+    /// (Appendix G, plan 4a ruling 2026-10-24). `true` when the row was new.
+    pub(crate) fn put_job_stats(&self, r: &JobStatsRow) -> rusqlite::Result<bool> {
+        let mut conn = self.lock();
         let big = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-        conn.execute(
-            "INSERT OR REPLACE INTO job_stats (job_id, kind, estimate_key, finished_ms, wall_ms,              gpu_seconds_milli, system_mj) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        let tx = conn.transaction()?;
+        let added = tx.execute(
+            "INSERT INTO job_stats (job_id, kind, estimate_key, finished_ms, wall_ms, \
+             gpu_seconds_milli, system_mj) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (job_id) DO NOTHING",
             params![
                 r.job_id,
                 r.kind,
@@ -802,7 +811,14 @@ impl Db {
                 big(r.system_mj),
             ],
         )?;
-        Ok(())
+        tx.execute(
+            "DELETE FROM job_stats WHERE kind = ?1 AND estimate_key = ?2 AND job_id NOT IN \
+             (SELECT job_id FROM job_stats WHERE kind = ?1 AND estimate_key = ?2 \
+             ORDER BY finished_ms DESC, job_id DESC LIMIT ?3)",
+            params![r.kind, r.estimate_key, HISTORY_KEPT],
+        )?;
+        tx.commit()?;
+        Ok(added > 0)
     }
 
     /// The newest `newest` history rows of `kind` and `key`: by `finished_ms`, then `job_id`,
@@ -815,7 +831,9 @@ impl Db {
     ) -> rusqlite::Result<Vec<JobStatsRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT job_id, kind, estimate_key, finished_ms, wall_ms, gpu_seconds_milli,              system_mj FROM job_stats WHERE kind = ?1 AND estimate_key = ?2              ORDER BY finished_ms DESC, job_id DESC LIMIT ?3",
+            "SELECT job_id, kind, estimate_key, finished_ms, wall_ms, gpu_seconds_milli, \
+             system_mj FROM job_stats WHERE kind = ?1 AND estimate_key = ?2 \
+             ORDER BY finished_ms DESC, job_id DESC LIMIT ?3",
         )?;
         let unsigned = |v: i64| u64::try_from(v).unwrap_or(0);
         stmt.query_map(params![kind, key, newest], |r| {
@@ -869,7 +887,8 @@ impl Db {
                     ("h1", HOUR_MS)
                 };
                 let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT metric, SUM(n), SUM(sum) FROM {table}                      WHERE metric IN (?1, ?2, ?3) AND ts + ?4 > ?5 AND ts <= ?6 GROUP BY metric"
+                    "SELECT metric, SUM(n), SUM(sum) FROM {table} \
+                     WHERE metric IN (?1, ?2, ?3) AND ts > ?5 - ?4 AND ts <= ?6 GROUP BY metric"
                 ))?;
                 let mut found = stmt.query(params![
                     Metric::GpuEnergy.name(),

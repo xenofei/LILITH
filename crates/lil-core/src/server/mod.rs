@@ -602,7 +602,7 @@ impl ConnObserver for AppTracker {
         if let Some(pid) = conns.remove(&conn_id)
             && !conns.values().any(|p| *p == pid)
         {
-            self.telemetry.untrack(pid);
+            self.telemetry.untrack_if(pid, telemetry::APP_ROLE);
         }
     }
 }
