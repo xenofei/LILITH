@@ -15,12 +15,14 @@
 //!   can't start, isn't trusted, or refused the hello). A `lil/subscribe` gets at most the
 //!   configuration's `start_hard_cap` for its answer; a core that takes longer counts as one
 //!   that didn't answer in time, and its connection is dropped.
-//! - **After a failed start** (a core that exited with a start failure, or one that could not
-//!   be launched), the attempts only look for a core someone else started
+//! - **After a failed start** (a core that exited with a start failure, or a core executable
+//!   that could not be launched), the attempts only look for a core someone else started
 //!   ([`StartPolicy::NoStart`]): such a failure needs a person (`lil doctor`, CORE-004), and a
-//!   core launched every 5 s would get in the way of the fix. Starting is allowed again after
-//!   the next connection, on [`Session::set_workspace`], and on [`Session::retry_now`] (the
-//!   banner's "Try again").
+//!   core launched every 5 s would get in the way of the fix. While none is found, the state
+//!   stays [`SessionState::Unavailable`] with the start failure. Starting is allowed again
+//!   after the next connection, on [`Session::set_workspace`], and on [`Session::retry_now`]
+//!   (the banner's "Try again"); a retry asked for while a core is being started is the same
+//!   retry, not a second start.
 //! - **Resubscribing** (APP-035, ARCH-100). Each topic keeps its last seq: the seq of the
 //!   newest event the session took from it, else its seq when it was subscribed. Every
 //!   connection after the first subscribes the topics with `since_seq` from their last seqs,
@@ -32,7 +34,11 @@
 //!   snapshot, so the new `instance_id` in [`SessionState::Ready`] is the app's signal to
 //!   reload everything it built from the old core (ARCH-100).
 //! - **Events** reach [`Session::events`] in the core's order, across reconnects. A topic
-//!   subscribed while there is no connection is subscribed on the next one.
+//!   subscribed while there is no connection, or while one is being set up, is subscribed on
+//!   it: the task subscribes every topic it finds after making the connection the current one,
+//!   and [`Session::subscribe`] sends a topic on the current connection after adding it, so
+//!   each topic reaches each connection at least once (a second subscribe of a topic is a
+//!   no-op in the core).
 //! - **Calls** ([`Session::call_tool`], [`Session::app_call`]) go out on the current
 //!   connection and the session never sends one again: a call in flight when the connection
 //!   is lost ends with [`ClientError::Closed`], and a call while there is no connection is
@@ -41,16 +47,18 @@
 //! - **Switching workspace** (P4a-R34) is a new connection whose hello names the workspace. It
 //!   replaces the current one only once the core accepted it, and it never changes
 //!   `suite.toml`'s default.
-//! - **Topic names** that aren't topics (Appendix D's pattern) are left out at
-//!   [`Session::start`], since the core would refuse the whole subscribe.
+//! - **Topic names** that aren't topics (Appendix D's pattern) never reach the core, which
+//!   would refuse the whole subscribe: [`Session::start`] leaves them out, and
+//!   [`Session::subscribe`] refuses them.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use lil_protocol::codes::PARAMS_INVALID;
 use lil_protocol::{
-    CLIENT_QUEUE, EventKind, EventParams, HelloResult, Outcome, ToolOutput, TopicState,
+    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, Outcome, ToolOutput, TopicState,
     is_valid_topic,
 };
 use serde_json::Value;
@@ -58,7 +66,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::{Client, ClientConfig, ClientError, StartPolicy};
+use crate::{CANNOT_START, Client, ClientConfig, ClientError, StartPolicy};
 
 /// The first pause before another attempt.
 const BACKOFF_FIRST: Duration = Duration::from_millis(250);
@@ -104,9 +112,6 @@ struct Shared {
     client: Mutex<Option<Arc<Client>>>,
     /// The subscribed topics and their last seqs (`None`: not subscribed on a connection yet).
     topics: Mutex<BTreeMap<String, Option<u64>>>,
-    /// Held while topics are subscribed on a connection, so a topic added meanwhile is either
-    /// in the task's subscribe or sent on the connection after it.
-    subscribing: tokio::sync::Mutex<()>,
     /// [`Session::events`]' receiver, until it is taken.
     events: Mutex<Option<mpsc::Receiver<EventParams>>>,
     /// Held for the whole of a `set_workspace`, so the configuration and the adopted
@@ -147,7 +152,6 @@ impl Session {
                     .map(|t| (t, None))
                     .collect(),
             ),
-            subscribing: tokio::sync::Mutex::new(()),
             events: Mutex::new(Some(events_rx)),
             switching: tokio::sync::Mutex::new(()),
         });
@@ -201,12 +205,19 @@ impl Session {
         self.client()?.app_call(method, params).await
     }
 
-    /// Adds `topics` (live events only). Without a connection they are subscribed on the next
-    /// one. A topic the core refuses is not added: the error, and none of this call's topics
-    /// stay; so it is when the core doesn't answer within `start_hard_cap`
+    /// Adds `topics` (live events only). Without a connection, or while one is being set up,
+    /// they are subscribed on it, and this returns at once. A name that isn't a topic is
+    /// `params.invalid`, and so is a topic the core refuses: the error, and none of this call's
+    /// topics stay; so it is when the core doesn't answer within `start_hard_cap`
     /// ([`ClientError::Timeout`]).
     pub async fn subscribe(&self, topics: Vec<String>) -> Result<(), ClientError> {
-        let _subscribing = self.shared.subscribing.lock().await;
+        if let Some(bad) = topics.iter().find(|t| !is_valid_topic(t)) {
+            return Err(ClientError::Refused(ErrorBody::new(
+                &PARAMS_INVALID,
+                format!("\"{bad}\" is not a topic name"),
+                crate::mint_id("t"),
+            )));
+        }
         let added: Vec<String> = {
             let mut known = lock(&self.shared.topics);
             topics
@@ -240,7 +251,6 @@ impl Session {
 
     /// Removes `topics`, and their last seqs; their events stop reaching [`Session::events`].
     pub async fn unsubscribe(&self, topics: Vec<String>) -> Result<(), ClientError> {
-        let _subscribing = self.shared.subscribing.lock().await;
         let removed: Vec<String> = {
             let mut known = lock(&self.shared.topics);
             topics
@@ -352,8 +362,9 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
     let mut instance: Option<String> = None;
     // Failed attempts since the last connection, a lost connection counting as one.
     let mut failed: u32 = 0;
-    // After a failed start: attempts only look for a core (module docs).
-    let mut attach_only = false;
+    // After a failed start: attempts only look for a core (module docs), and the state they
+    // keep showing while none is found.
+    let mut attach_only: Option<SessionState> = None;
     // A connection `set_workspace` made, to adopt instead of the next attempt.
     let mut offered: Option<(Box<Client>, oneshot::Sender<()>)> = None;
     loop {
@@ -366,13 +377,15 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
             }
         }
         if std::mem::take(&mut ctl.retried) {
-            attach_only = false;
+            attach_only = None;
         }
+        // Whether this attempt may start a core: a retry asked for meanwhile is this one.
+        let may_start = offered.is_none() && attach_only.is_none();
         let (attempt, done) = match offered.take() {
             Some((client, done)) => (Ok(*client), Some(done)),
             None => {
                 let mut cfg = lock(&shared.cfg).clone();
-                if attach_only {
+                if attach_only.is_some() {
                     cfg.start = StartPolicy::NoStart;
                 }
                 match until(Client::connect(&cfg), &mut ctl, false).await {
@@ -404,12 +417,24 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
             Err(e) => {
                 *lock(&shared.client) = None;
                 failed += 1;
-                if matches!(e, ClientError::StartFailed { .. } | ClientError::Io(_)) {
-                    attach_only = true;
+                if may_start {
+                    ctl.retried = false;
                 }
-                // An attach-only attempt that finds no core keeps the reason it waits for.
-                if !(attach_only && matches!(e, ClientError::NotRunning)) {
-                    report(&shared, &e, failed);
+                let state = state_after(&e, failed);
+                let start_failed = match &e {
+                    ClientError::StartFailed { .. } => true,
+                    ClientError::Io(io) => io.to_string().starts_with(CANNOT_START),
+                    _ => false,
+                };
+                if start_failed {
+                    attach_only = Some(state.clone());
+                    set_state(&shared, state);
+                } else if let (Some(waiting), ClientError::NotRunning) = (&attach_only, &e) {
+                    // No core yet: the start failure is still why (and a state an earlier
+                    // attach-only attempt met, a foreign core's, clears).
+                    set_state(&shared, waiting.clone());
+                } else {
+                    set_state(&shared, state);
                 }
                 if let Some(done) = done {
                     let _ = done.send(());
@@ -418,7 +443,7 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
             }
         };
         failed = 0;
-        attach_only = false;
+        attach_only = None;
         shared
             .state
             .send_replace(SessionState::Ready(Box::new(live.client.hello().clone())));
@@ -460,7 +485,6 @@ async fn establish(
     let cap = lock(&shared.cfg).start_hard_cap;
     // Registered before the subscribe is written: replays may beat its reply.
     let events = client.conn().add_sink_all().ok_or(ClientError::Closed)?;
-    let _subscribing = shared.subscribing.lock().await;
     let now = &client.hello().instance_id;
     let restarted = instance.as_ref().is_some_and(|old| old != now);
     let (topics, since) = {
@@ -476,12 +500,27 @@ async fn establish(
             .collect();
         (known.keys().cloned().collect::<Vec<_>>(), since)
     };
+    let mut sent: BTreeSet<String> = topics.iter().cloned().collect();
     if !topics.is_empty() {
         let subscribed = bounded(cap, client.subscribe_only(topics, since)).await?;
         note_subscribed(shared, &subscribed.topics);
     }
-    *lock(&shared.client) = Some(client.clone());
     *instance = Some(now.clone());
+    *lock(&shared.client) = Some(client.clone());
+    // Topics added meanwhile, live only: from now on `Session::subscribe` sends them itself.
+    loop {
+        let added: Vec<String> = lock(&shared.topics)
+            .keys()
+            .filter(|topic| !sent.contains(*topic))
+            .cloned()
+            .collect();
+        if added.is_empty() {
+            break;
+        }
+        sent.extend(added.iter().cloned());
+        let subscribed = bounded(cap, client.subscribe_only(added, BTreeMap::new())).await?;
+        note_subscribed(shared, &subscribed.topics);
+    }
     Ok(Live { client, events })
 }
 
@@ -506,8 +545,8 @@ fn note_subscribed(shared: &Shared, states: &[TopicState]) {
 }
 
 /// The state after a failed attempt (module docs, "Backoff").
-fn report(shared: &Shared, error: &ClientError, failed: u32) {
-    let state = match error {
+fn state_after(error: &ClientError, failed: u32) -> SessionState {
+    match error {
         ClientError::Incompatible { core_protocol } => SessionState::Incompatible {
             core_protocol: core_protocol.clone(),
         },
@@ -517,8 +556,7 @@ fn report(shared: &Shared, error: &ClientError, failed: u32) {
         other => SessionState::Unavailable {
             reason: other.to_string(),
         },
-    };
-    set_state(shared, state);
+    }
 }
 
 /// Sets the state; receivers hear of it only when it changed.
@@ -849,6 +887,14 @@ mod tests {
             let session = Session::start(cfg.clone(), vec!["test:r".to_string()]);
             let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
             fake.request("lil/subscribe").await;
+            // Nor does a subscribe: the topic waits for the connection being set up.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                session.subscribe(vec!["test:later".to_string()]),
+            )
+            .await
+            .expect("subscribe waited for the stalled subscribe")
+            .expect("subscribe");
             tokio::time::timeout(Duration::from_secs(5), session.close())
                 .await
                 .expect("close waited for the stalled subscribe");
@@ -873,6 +919,88 @@ mod tests {
             wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
             session.close().await;
             drop(fake);
+        });
+    }
+
+    fn event(topic: &str, seq: u64) -> EventParams {
+        EventParams {
+            topic: topic.to_string(),
+            seq,
+            kind: EventKind::Event,
+            data: json!({"n": seq}),
+        }
+    }
+
+    /// A full backlog gives way to one `resync_required` per topic at its newest seq, the
+    /// event that overflowed it included, and later events queue after them in order.
+    #[test] // spec: ARCH-032
+    fn a_full_backlog_becomes_one_resync_per_topic() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut out = Outbox {
+            tx,
+            backlog: VecDeque::new(),
+        };
+        out.push(event("test:a", 1));
+        for n in 0..BACKLOG_MAX as u64 {
+            let (topic, seq) = if n % 2 == 0 {
+                ("test:a", 2 + n / 2)
+            } else {
+                ("test:b", 1 + n / 2)
+            };
+            out.push(event(topic, seq));
+        }
+        assert_eq!(out.backlog.len(), BACKLOG_MAX);
+        let newest_b = out.backlog.back().unwrap().seq;
+        out.push(event("test:a", 9000));
+        out.push(event("test:b", newest_b + 1));
+
+        let kept: Vec<(&str, u64, EventKind)> = out
+            .backlog
+            .iter()
+            .map(|e| (e.topic.as_str(), e.seq, e.kind))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("test:a", 9000, EventKind::ResyncRequired),
+                ("test:b", newest_b, EventKind::ResyncRequired),
+                ("test:b", newest_b + 1, EventKind::Event),
+            ]
+        );
+        assert!(out.backlog.iter().take(2).all(|e| e.data.is_null()));
+        assert_eq!(
+            rx.try_recv().unwrap().seq,
+            1,
+            "the event sent before the backlog"
+        );
+    }
+
+    /// Names that aren't topics never reach the core: left out at the start, refused by
+    /// `subscribe` (which adds none of the call's topics then).
+    #[test] // spec: ARCH-032
+    fn invalid_topic_names_are_left_out_or_refused() {
+        let env = lil_testkit::TestEnv::new();
+        let mut cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+        cfg.start = StartPolicy::NoStart;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let topics = ["Bad Topic", "test:ok", ""].map(str::to_string).to_vec();
+            let session = Session::start(cfg, topics);
+            let known =
+                |s: &Session| -> Vec<String> { lock(&s.shared.topics).keys().cloned().collect() };
+            assert_eq!(known(&session), ["test:ok"]);
+            let refused = session
+                .subscribe(vec!["test:new".to_string(), "no spaces".to_string()])
+                .await;
+            match refused {
+                Err(ClientError::Refused(error)) => assert_eq!(error.code, "params.invalid"),
+                other => panic!("expected params.invalid, got {other:?}"),
+            }
+            assert_eq!(known(&session), ["test:ok"]);
+            session.close().await;
         });
     }
 }

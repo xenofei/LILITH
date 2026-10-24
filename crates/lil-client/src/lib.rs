@@ -50,6 +50,9 @@ pub use workspace::{
 /// the current user that it could inspect).
 pub(crate) const WRONG_FOLDER: &str = "its executable is not in the folder this client trusts";
 
+/// The start of the `Io` message of a core executable that could not be launched.
+pub(crate) const CANNOT_START: &str = "Cannot start the LILITH core";
+
 /// The core executable's file name, next to the client's own executable.
 pub const CORE_EXE: &str = "lil-core.exe";
 

@@ -54,7 +54,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::conn::{Conn, EventStream};
-use crate::{ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
+use crate::{CANNOT_START, ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
 
 /// The first pause between attempts to open the pipe.
 const BACKOFF_START: Duration = Duration::from_millis(25);
@@ -581,7 +581,7 @@ impl<'a> Finder<'a> {
                 .map_err(|e| {
                     ClientError::Io(io::Error::new(
                         e.kind(),
-                        format!("Cannot start the LILITH core {}: {e}", exe.display()),
+                        format!("{CANNOT_START} {}: {e}", exe.display()),
                     ))
                 })?;
                 self.spawned = Some(handle);
