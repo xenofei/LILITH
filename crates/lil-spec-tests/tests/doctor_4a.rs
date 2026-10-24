@@ -128,6 +128,14 @@ fn doctor_registers_the_handlers_after_yes() {
         printed.contains(&format!("LILITH.lilref.{}", env.env.channel())),
         "{printed}"
     );
+    // A test channel never writes the real classes root (QA-040).
+    let real = Command::new("reg")
+        .args(["query", &format!(r"HKCU\Software\Classes\{scheme}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("cannot run reg: {e}"));
+    assert!(!real.success(), "{scheme} reached HKCU\\Software\\Classes");
 
     let again = doctor(&env, "n");
     assert!(!lines(&again, "ok:", "handler").is_empty(), "{again:?}");
@@ -247,9 +255,9 @@ fn confirm_window_starts_the_app_in_confirm_mode() {
 
     let refused = run(&env, &lil, &["--non-interactive", "confirm-window", id]);
     assert_eq!(refused.code, 2, "{refused:?}");
+    // Appendix G doesn't name the stream the refusal goes to.
     assert!(
-        refused
-            .stderr
+        format!("{}{}", refused.stdout, refused.stderr)
             .contains("the confirm window is for interactive use"),
         "{refused:?}"
     );

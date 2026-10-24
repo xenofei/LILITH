@@ -121,7 +121,11 @@ fn job_estimate_uses_measured_history_after_three_runs() {
         tick(&mut pipe, 1);
     }
 
-    let measured = estimate(&mut pipe, args);
+    // `meter` may write the third run's history just after `job.wait` reports it done.
+    let measured = poll("an estimate from 3 runs", || {
+        let e = estimate(&mut pipe, args.clone());
+        (e["wall_s"]["samples"] == 3).then_some(e)
+    });
     let wall = &measured["wall_s"];
     assert_eq!(wall["source"], "measured_history", "{measured}");
     assert_eq!(wall["samples"], 3, "{measured}");
@@ -211,8 +215,11 @@ fn telemetry_energy_sums_a_range() {
         json!({"from": from, "to": to}),
         None,
     );
-    assert_eq!(energy["from"], from.as_str(), "{energy}");
-    assert_eq!(energy["to"], to.as_str(), "{energy}");
+    let instant = |v: &Value| {
+        utc::parse_rfc3339(v.as_str().unwrap_or_else(|| panic!("not a time: {energy}")))
+    };
+    assert_eq!(instant(&energy["from"]), instant(&json!(from)), "{energy}");
+    assert_eq!(instant(&energy["to"]), instant(&json!(to)), "{energy}");
     let gpu_mj = number(&energy["gpu_mj"]);
     assert!(
         (gpu_mj - points).abs() < 0.5,
@@ -240,16 +247,27 @@ fn ui_connections_are_tracked_in_telemetry() {
 
     let app = TestApp::start(&env, None, &[]);
     let pid = app.pid();
-    poll("the app tracked as role app", || {
-        tick(&mut pipe, 1);
-        let snapshot = ok(&mut pipe, "telemetry.snapshot", json!({}), None);
-        tracked_as_app(&snapshot, pid).then_some(())
-    });
+    assert!(
+        within_ticks(&mut pipe, |s| tracked_as_app(s, pid)),
+        "the connected app is tracked with role app"
+    );
 
     drop(app);
-    poll("the app no longer tracked once it closed", || {
-        tick(&mut pipe, 1);
-        let snapshot = ok(&mut pipe, "telemetry.snapshot", json!({}), None);
-        (!tracked_as_app(&snapshot, pid)).then_some(())
-    });
+    assert!(
+        within_ticks(&mut pipe, |s| !tracked_as_app(s, pid)),
+        "the app is no longer tracked once it closed"
+    );
+}
+
+/// Whether `pred` holds for a snapshot within 20 ticks (a tool error fails at once).
+fn within_ticks(pipe: &mut RawPipe, pred: impl Fn(&Value) -> bool) -> bool {
+    (0..20).any(|_| {
+        tick(pipe, 1);
+        let snapshot = ok(pipe, "telemetry.snapshot", json!({}), None);
+        let held = pred(&snapshot);
+        if !held {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        held
+    })
 }

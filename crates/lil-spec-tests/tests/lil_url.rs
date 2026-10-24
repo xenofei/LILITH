@@ -154,6 +154,9 @@ fn refuses_everything_else() {
         "https://example.com/".to_string(),
         String::new(),
     ];
+    // An 8,193-character argument is refused and its `shown` text cut to 80 characters. It
+    // doesn't isolate the 8,192 limit (no well-formed URL is that long: its target would pass
+    // 4,096 bytes); Task 4's own `long_arguments_are_refused` checks the limit alone.
     let long = format!(
         "{SCHEME}:open/{}",
         "A".repeat(8193 - SCHEME.len() - ":open/".len())

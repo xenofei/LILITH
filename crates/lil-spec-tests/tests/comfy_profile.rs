@@ -203,12 +203,9 @@ fn models_report_names_orphan_duplicate_and_unknown_family() {
     let _core = CoreFixture::start(&env);
     let mut pipe = session(&env, Some(&ws));
     let report = poll("a refreshed models report", || {
-        let out = pipe.tool("models.report", json!({}), None);
-        (out["status"] == "ok"
-            && out["structured"]["models"]
-                .as_array()
-                .is_some_and(|m| m.len() == 3))
-        .then(|| out["structured"].clone())
+        // An error outcome fails at once; only the refresh is waited for.
+        let report = ok(&mut pipe, "models.report", json!({}), None);
+        (report["models"].as_array().is_some_and(|m| m.len() == 3)).then_some(report)
     });
 
     let entry = |path: &str| -> Value {
@@ -293,8 +290,11 @@ fn engine_environment_reports_a_changed_node() {
     assert_eq!(changes.len(), 1, "one node changed, nothing else: {view}");
     assert_eq!(changes[0]["what"], "node", "{view}");
     assert_eq!(changes[0]["change"], "changed", "{view}");
-    assert_eq!(changes[0]["from"], "1.0.0", "{view}");
-    assert_eq!(changes[0]["to"], "1.0.1", "{view}");
+    // Appendix G doesn't say whether a node's `from` and `to` are its version, its commit or
+    // both: each holds the version at least.
+    let holds = |v: &Value, version: &str| v.as_str().is_some_and(|s| s.contains(version));
+    assert!(holds(&changes[0]["from"], "1.0.0"), "{view}");
+    assert!(holds(&changes[0]["to"], "1.0.1"), "{view}");
     assert!(
         changes[0]["name"]
             .as_str()

@@ -29,7 +29,7 @@ tests = [
     # ARCH-022, CORE-160
     { name = "lil-spec-tests::jobs_queue_4a::a_restart_holds_never_started_jobs_until_resumed", rule = "ARCH-022", file = "tests/jobs_queue_4a.rs" },
     # CORE-117
-    { name = "lil-spec-tests::jobs_queue_4a::job_records_carry_batch_phase_and_last_progress", rule = "CORE-117", file = "tests/jobs_queue_4a.rs" },
+    { name = "lil-spec-tests::jobs_queue_4a::job_records_carry_batch_origin_phase_and_status_seq", rule = "CORE-117", file = "tests/jobs_queue_4a.rs" },
     # ARCH-072
     { name = "lil-spec-tests::jobs_queue_4a::a_silent_job_is_unresponsive_and_nothing_is_cancelled", rule = "ARCH-072", file = "tests/jobs_queue_4a.rs" },
     # Task 7

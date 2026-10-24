@@ -334,15 +334,30 @@ fn turning_off_confirmation_toasts_makes_agent_calls_unavailable() {
         settings["notifications"]["confirmation_waiting"], false,
         "{settings}"
     );
-    let refused = pipe.tool("test.destructive", json!({}), Some(&key()));
-    assert_eq!(error_code(&refused), "confirm.unavailable", "{refused}");
+    // The app has just disconnected: until the core has seen that, the call may still wait
+    // with it, so ask again with a fresh key until the answer comes.
+    poll("confirm.unavailable once no app is connected", || {
+        let refused = pipe.tool("test.destructive", json!({}), Some(&key()));
+        (refused["status"] == "error").then(|| {
+            assert_eq!(error_code(&refused), "confirm.unavailable", "{refused}");
+        })
+    });
+}
+
+/// The contrast these tests need: with the path ready and no app, an interactive `cli` call
+/// waits (`pending_confirmation`) and its confirmation toast is posted. Only the notification
+/// path makes that true; a plan-3 core answers `confirm.unavailable`.
+fn a_call_waits_through_the_toast(pipe: &mut lil_testkit::RawPipe, env: &TestEnv) {
+    path_ready(pipe);
+    let id = pending_id(&pipe.tool("test.destructive", json!({}), Some(&key())));
+    confirmation_toast(pipe, env, &id);
 }
 
 #[test] // spec: APP-022, ARCH-055, QA-016
 fn toasts_off_in_windows_make_the_path_unreachable() {
     let env = TestEnv::new();
     let (_core, mut pipe) = ready_core(&env);
-    path_ready(&mut pipe);
+    a_call_waits_through_the_toast(&mut pipe, &env);
 
     desktop(
         &mut pipe,
@@ -355,14 +370,18 @@ fn toasts_off_in_windows_make_the_path_unreachable() {
 
     let refused = pipe.tool("test.destructive", json!({}), Some(&key()));
     assert_eq!(error_code(&refused), "confirm.unavailable", "{refused}");
-    assert_eq!(toast_ops(&mut pipe), Vec::<Value>::new(), "no toast");
+    assert!(
+        posts_in(&mut pipe, "confirmation_waiting").is_empty(),
+        "no new confirmation toast"
+    );
 }
 
 #[test] // spec: QA-016, ARCH-055
 fn non_interactive_callers_never_wait() {
     let env = TestEnv::new();
     let (_core, mut pipe) = ready_core(&env);
-    path_ready(&mut pipe);
+    a_call_waits_through_the_toast(&mut pipe, &env);
+    desktop(&mut pipe, json!({"clear": true}));
 
     let out = env.lil(&[
         "--non-interactive",
@@ -380,7 +399,7 @@ fn non_interactive_callers_never_wait() {
     );
     assert!(
         posts_in(&mut pipe, "confirmation_waiting").is_empty(),
-        "no confirmation toast for a non-interactive caller"
+        "no new confirmation toast for a non-interactive caller"
     );
 }
 

@@ -97,9 +97,16 @@ fn diagnostics_bundle_redacts_secrets_labels_and_emails() {
         name.starts_with("lilith-diagnostics-") && name.ends_with(".zip"),
         "{bundle}"
     );
+    // The same folder, whatever its case or `\\?\` prefix.
+    let norm = |p: &Path| {
+        path_str(p)
+            .replace('/', "\\")
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase()
+    };
     assert_eq!(
-        path.parent(),
-        Some(env.env.local_dir().join("diagnostics").as_path()),
+        path.parent().map(norm),
+        Some(norm(&env.env.local_dir().join("diagnostics"))),
         "{bundle}"
     );
     assert!(bundle["redactions"].as_u64().unwrap_or(0) >= 3, "{bundle}");

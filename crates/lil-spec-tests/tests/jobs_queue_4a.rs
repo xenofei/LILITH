@@ -7,7 +7,8 @@
 //! (QA-018).
 //!
 //! Not here: the all-cached run (CORE-117's `all_cached`), which needs a fake ComfyUI that
-//! reports cached nodes; the test kit has none yet.
+//! reports cached nodes. Task 6 adds that fake (`FakeComfy::cached_nodes`) together with the
+//! spec test `all_cached_run_says_nothing_changed` in a spec-test file of its own.
 
 mod p4a;
 mod support;
@@ -197,8 +198,6 @@ fn queue_pause_holds_every_queued_job_and_never_interrupts_the_running_prompt() 
     assert_eq!(state["lane"], "gpu-heavy", "{state}");
     assert_eq!(state["paused"], true, "{state}");
     assert_eq!(state["reasons"], json!(["manual"]), "{state}");
-    assert_eq!(state["held"], 2, "{state}");
-    assert_eq!(state["restart_held"], 0, "{state}");
 
     assert_eq!(
         job(&mut pipe, &gate)["status"],
@@ -212,9 +211,14 @@ fn queue_pause_holds_every_queued_job_and_never_interrupts_the_running_prompt() 
         assert_eq!(held["status"], "queued", "{held}");
         assert_eq!(held["pause_reasons"], json!(["manual"]), "{held}");
     }
-    let lane = lane_state(&mut pipe, "gpu-heavy");
+    // The counts are read once the jobs show the pause: the call need not wait for it.
+    let lane = poll("the lane counting its 2 held jobs", || {
+        let lane = lane_state(&mut pipe, "gpu-heavy");
+        (lane["held"] == 2).then_some(lane)
+    });
     assert_eq!(lane["paused"], true, "{lane}");
     assert_eq!(lane["reasons"], json!(["manual"]), "{lane}");
+    assert_eq!(lane["restart_held"], 0, "{lane}");
 
     // A paused lane dispatches nothing, even once the running job ends.
     release(&mut pipe, &gate);
@@ -275,11 +279,16 @@ fn queue_pause_withdraws_a_pending_prompt_and_reposts_it_once() {
         .to_string();
 
     let state = app_ok(&mut app, "app/queue.pause", json!({}));
-    assert_eq!(state["withdrawn"], 1, "{state}");
+    assert_eq!(state["paused"], true, "{state}");
     let held = until_job(&mut pipe, &id, "queue_paused", |j| {
         j["substatus"] == "queue_paused"
     });
     assert_eq!(held["status"], "queued", "{held}");
+    let lane = poll("the lane counting one withdrawn prompt", || {
+        let lane = lane_state(&mut pipe, "gpu-heavy");
+        (lane["withdrawn"] == 1).then_some(lane)
+    });
+    assert_eq!(lane["held"], 1, "{lane}");
     let cancels: Vec<_> = fake
         .requests()
         .into_iter()
@@ -395,7 +404,7 @@ fn a_restart_holds_never_started_jobs_until_resumed() {
 }
 
 #[test] // spec: CORE-117
-fn job_records_carry_batch_phase_and_last_progress() {
+fn job_records_carry_batch_origin_phase_and_status_seq() {
     let env = TestEnv::new();
     let _core = CoreFixture::start(&env);
     let mut pipe = session(&env, None);
