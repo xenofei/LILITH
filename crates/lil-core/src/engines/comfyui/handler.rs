@@ -233,7 +233,14 @@ pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<Strin
             .get(id)
             .and_then(|n| n.get("inputs"))
             .and_then(Value::as_object);
-        for link in inputs.into_iter().flat_map(|i| i.values()) {
+        // A linked `filename_prefix` is replaced by the suite's own string before the POST,
+        // so what it links to never runs (m2).
+        let links = inputs
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| name.as_str() != "filename_prefix")
+            .map(|(_, link)| link);
+        for link in links {
             let Some([from, slot]) = link.as_array().map(Vec::as_slice) else {
                 continue;
             };
@@ -1716,9 +1723,9 @@ impl Attempt<'_> {
             }
             ComfyEvent::Executed { .. } => {}
             ComfyEvent::Success { .. } => {
-                // Every node the prompt executes but its output nodes served from the cache:
-                // nothing changed (CORE-117; plan 4a ruling, 2026-10-24: the output nodes run
-                // again).
+                // Every node the prompt executes but the nodes whose `filename_prefix` the
+                // suite sets served from the cache: nothing changed (CORE-117; plan 4a ruling,
+                // 2026-10-24: only those run again).
                 let info = self.comfy.graph_info(&self.client).await.ok();
                 let judged = judged_nodes(&self.graph, info.as_ref().map(|i| &*i.object_info));
                 if !judged.is_empty() && judged.iter().all(|n| self.cached.contains(n)) {
@@ -2233,6 +2240,8 @@ mod tests {
             "4": {"class_type": "Preview", "inputs": {"images": ["2", 0]}},
             "5": {"class_type": "Loader", "inputs": {}},
             "6": {"class_type": "Unlisted", "inputs": {"images": ["2", 0], "filename_prefix": "p"}},
+            "7": {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": ["8", 0]}},
+            "8": {"class_type": "StringConcat", "inputs": {}},
         });
         let info = json!({
             "Loader": {"output_node": false},
@@ -2241,7 +2250,8 @@ mod tests {
             "Preview": {"output_node": true},
         });
         // The sampler and the preview are output nodes without a prefix: judged. The Save
-        // and the unlisted prefixed node may re-run; loader 5 is used by nothing.
+        // and the unlisted prefixed node may re-run; loader 5 is used by nothing; string 8 only
+        // feeds a `filename_prefix`, which the suite replaces, so it never runs.
         assert_eq!(judged_nodes(&graph, Some(&info)), set(&["1", "2", "4"]));
         // Without object_info only the prefixed nodes are outputs: what they need is judged.
         assert_eq!(judged_nodes(&graph, None), set(&["1", "2"]));
