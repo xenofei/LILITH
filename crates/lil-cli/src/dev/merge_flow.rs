@@ -18,7 +18,7 @@
 //! This module needs no GitHub and no git: the steps that do are behind [`MergeFlowSteps`] (the
 //! real ones are `reviewer.rs`'s), so `tests/reviewer_hello.rs` compiles it on its own.
 
-use super::reviewer_hello::Authenticator;
+use super::reviewer_hello::{Authenticator, quoted};
 use anyhow::{Result, anyhow};
 use std::fmt::Write as _;
 
@@ -132,10 +132,13 @@ impl MergeGate for Authenticated {
 pub trait MergeFlowSteps {
     /// Reads the PR (read-only; nothing is posted or changed).
     fn facts(&self) -> Result<Facts>;
-    /// Posts the reviewer App's approval of `facts.head`, signed with the unlocked key.
-    fn post_approval(&self, pem: &[u8], facts: &Facts) -> Result<()>;
-    /// Waits for every required CI check on `facts.head` to pass.
-    fn wait_for_checks(&self, facts: &Facts) -> Result<()>;
+    /// Posts the reviewer App's approval of `facts.head`, signed with the unlocked key. `true`
+    /// when GitHub accepted a re-run of the guard check, which then turns green.
+    fn post_approval(&self, pem: &[u8], facts: &Facts) -> Result<bool>;
+    /// Waits for every required CI check on `facts.head` to pass. A failed guard check is
+    /// waited on only when `guard_rerun` (the approval just asked for its re-run); any other
+    /// failure ends the wait at once.
+    fn wait_for_checks(&self, facts: &Facts, guard_rerun: bool) -> Result<()>;
     /// Merges through `lil dev merge`'s checks, which ask `gate` last.
     fn merge(&self, gate: &dyn MergeGate) -> Result<String>;
 }
@@ -151,18 +154,20 @@ pub fn merge_flow(
 ) -> Result<String> {
     let facts = steps.facts()?;
     let shown = format!(
-        "{}\nSummary of the change:\n{}",
+        "{}\nSummary of the change (written by the agent that ran the flow):\n{}",
         render_facts(&facts),
-        summary.trim_end()
+        quoted(summary)
     );
     let pem = auth
         .authenticate(&shown, audit)
         .map_err(|e| anyhow!("{e}; nothing was approved or merged"))?;
-    if !facts.protected.is_empty() && !facts.already_approved {
-        steps.post_approval(&pem, &facts)?;
-    }
+    let guard_rerun = if !facts.protected.is_empty() && !facts.already_approved {
+        steps.post_approval(&pem, &facts)?
+    } else {
+        false
+    };
     drop(pem);
-    steps.wait_for_checks(&facts)?;
+    steps.wait_for_checks(&facts, guard_rerun)?;
     let gate = Authenticated {
         pr: facts.pr,
         head: facts.head.clone(),

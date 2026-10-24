@@ -1,13 +1,14 @@
 //! Windows Hello for the reviewer key and the one-click merge flow (plan 4a Task 28: QA-088,
 //! QA-020, QA-036; P4a-R23, P4a-R38).
 //!
-//! No real Windows Hello: every test injects a fake `HelloPlatform` (the route seam), a fake
-//! `Unlocker` or a fake `Authenticator`, and uses a temp home. The three modules under test
+//! No real Windows Hello: every test injects a fake `HelloPlatform` (the Windows Hello seam), a
+//! fake `Unlocker` or a fake `Authenticator`, and uses a temp home. The three modules under test
 //! need no GitHub and no git, so this file compiles them in directly, as `hook_patterns.rs`
 //! does: `reviewer_key` (the key file and its age encryption), `reviewer_hello` (enrol, status,
 //! remove, the unlock order and the authenticator) and `merge_flow` (the flow's order and the
-//! merge gate). `lil dev approve` and `lil dev merge` call these same functions; their wiring has
-//! its own unit tests in `src/dev/reviewer.rs` and `src/dev/merge.rs`.
+//! merge gate). `lil dev approve`, `lil dev merge` and `lil dev merge-flow` call these same
+//! functions; their wiring (the real flow steps, the authenticator's construction, the gate
+//! `lil dev merge` uses) has its own unit tests in `src/dev/reviewer.rs` and `src/dev/merge.rs`.
 
 #[allow(dead_code, reason = "only part of the key module is used here")]
 #[path = "../src/dev/reviewer_key.rs"]
@@ -28,9 +29,9 @@ use std::rc::Rc;
 
 use merge_flow::{AskOnEveryMerge, Facts, MergeFlowSteps, MergeGate, merge_flow};
 use reviewer_hello::{
-    Authenticator, CREDENTIAL, HelloFile, HelloPlatform, KeyAuthenticator, PassphraseUnlocker,
-    Route, Unlocker, dpapi_path_in, enroll, enrolled_hello, hello_age_path_in, hello_file_path_in,
-    remove, status, unlock_reviewer_key,
+    Authenticator, CREDENTIAL, HelloFile, HelloPlatform, KeyAuthenticator, NoTerminal,
+    PassphraseUnlocker, QUOTE, Route, Unlocker, discard_enrolment_beside, enroll, enrolled_hello,
+    hello_age_path_in, hello_file_path_in, presentation, remove, status, unlock_reviewer_key,
 };
 use reviewer_key::{KeyError, ReviewerKeyFile, encrypt_key_with_work_factor, key_path_in};
 use zeroize::Zeroizing;
@@ -93,7 +94,6 @@ impl Home {
         [
             hello_file_path_in(&self.profile),
             hello_age_path_in(&self.profile),
-            dpapi_path_in(&self.profile),
         ]
         .into_iter()
         .filter(|p| p.exists())
@@ -101,7 +101,7 @@ impl Home {
     }
 }
 
-// ---- the route seam's fake ---------------------------------------------------------------------
+// ---- the Windows Hello seam's fake -------------------------------------------------------------
 
 /// What the fake Windows Hello does when asked to prompt.
 #[derive(Clone, Copy, PartialEq)]
@@ -109,6 +109,10 @@ enum Answer {
     Ok,
     Cancel,
     Fail,
+    /// Its window couldn't be brought to the front (`lil_platform::hello::front_or_refuse`).
+    NotInFront,
+    /// Nobody answered in time (`lil_platform::hello::wait_bounded`).
+    TimedOut,
 }
 
 struct FakeHello {
@@ -117,6 +121,9 @@ struct FakeHello {
     tpm: bool,
     kek: [u8; 32],
     answer: Answer,
+    remove_fails: bool,
+    /// What the window that owns each prompt showed.
+    shown: RefCell<Vec<String>>,
 }
 
 impl FakeHello {
@@ -127,6 +134,8 @@ impl FakeHello {
             tpm: true,
             kek: KEK,
             answer: Answer::Ok,
+            remove_fails: false,
+            shown: RefCell::default(),
         }
     }
 
@@ -141,17 +150,22 @@ impl FakeHello {
         self.log.borrow_mut().push(what);
     }
 
-    fn prompt(&self) -> io::Result<()> {
+    fn prompt(&self, shown: &str) -> io::Result<()> {
+        self.shown.borrow_mut().push(shown.to_string());
         match self.answer {
             Answer::Ok => Ok(()),
             Answer::Cancel => Err(io::Error::new(io::ErrorKind::Interrupted, "UserCanceled")),
             Answer::Fail => Err(io::Error::other("SecurityDeviceLocked")),
+            Answer::NotInFront => Err(io::Error::other(
+                "the Windows Hello window couldn't be brought to the front of the other windows",
+            )),
+            Answer::TimedOut => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the Windows Hello prompt wasn't answered within 120 s, so it was cancelled",
+            )),
         }
     }
 }
-
-/// The fake's DPAPI: a marker and the bytes reversed (never the plaintext as is).
-const FAKE_DPAPI: &[u8] = b"FAKE-DPAPI:";
 
 impl HelloPlatform for FakeHello {
     fn supported(&self) -> bool {
@@ -160,47 +174,29 @@ impl HelloPlatform for FakeHello {
     fn hardware_held(&self) -> bool {
         self.tpm
     }
-    fn kek_enroll(&self, credential: &str, _message: &str) -> io::Result<()> {
+    fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()> {
         self.note(format!("hello:kek_enroll {credential}"));
-        self.prompt()
+        self.prompt(shown)
     }
     fn kek_derive(
         &self,
         credential: &str,
         challenge: &[u8; 32],
-        _message: &str,
+        shown: &str,
     ) -> io::Result<Zeroizing<[u8; 32]>> {
         self.note(format!(
             "hello:kek_derive {credential} {:02x}",
             challenge[0]
         ));
-        self.prompt()?;
+        self.prompt(shown)?;
         Ok(Zeroizing::new(self.kek))
     }
     fn kek_remove(&self, credential: &str) -> io::Result<()> {
         self.note(format!("hello:kek_remove {credential}"));
-        Ok(())
-    }
-    fn consent(&self, _message: &str) -> io::Result<bool> {
-        self.note("hello:consent".into());
-        match self.answer {
-            Answer::Ok => Ok(true),
-            Answer::Cancel => Ok(false),
-            Answer::Fail => Err(io::Error::other("DeviceBusy")),
+        if self.remove_fails {
+            return Err(io::Error::other("Windows Hello is switched off"));
         }
-    }
-    fn dpapi_protect(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        self.note("hello:dpapi_protect".into());
-        let mut out = FAKE_DPAPI.to_vec();
-        out.extend(data.iter().rev());
-        Ok(out)
-    }
-    fn dpapi_unprotect(&self, blob: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
-        self.note("hello:dpapi_unprotect".into());
-        let body = blob
-            .strip_prefix(FAKE_DPAPI)
-            .ok_or_else(|| io::Error::other("not a DPAPI blob"))?;
-        Ok(Zeroizing::new(body.iter().rev().copied().collect()))
+        Ok(())
     }
 }
 
@@ -220,25 +216,15 @@ fn never_asked(_label: &str) -> Zeroizing<String> {
 
 fn quiet(_: &str) {}
 
+fn as_is(text: &str) -> String {
+    text.to_string()
+}
+
 fn enroll_kek(home: &Home, hello: &FakeHello) {
     let l = log();
     enroll(
         &home.profile,
         Route::Kek,
-        hello,
-        &asks(&l, PASS),
-        CHALLENGE,
-        LOG_N,
-        &quiet,
-    )
-    .unwrap();
-}
-
-fn enroll_dpapi(home: &Home, hello: &FakeHello) {
-    let l = log();
-    enroll(
-        &home.profile,
-        Route::Dpapi,
         hello,
         &asks(&l, PASS),
         CHALLENGE,
@@ -342,7 +328,14 @@ fn enroll_needs_the_existing_passphrase_key() {
     let sealed = std::fs::read(hello_age_path_in(&home.profile)).unwrap();
     let kek_hex: String = KEK.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(reviewer_key::decrypt_key(&sealed, &kek_hex).unwrap(), PEM);
-    assert!(!dpapi_path_in(&home.profile).exists());
+    // The window that owned both prompts said what they were for.
+    assert!(
+        hello
+            .shown
+            .borrow()
+            .iter()
+            .all(|s| s.contains("set up Windows Hello"))
+    );
 
     // Enrolling again over an enrolment is refused until it is removed.
     let l = log();
@@ -359,31 +352,16 @@ fn enroll_needs_the_existing_passphrase_key() {
         )
         .is_err()
     );
-
-    // The DPAPI route writes app-key.dpapi instead, also only after the passphrase.
-    let home = Home::with_key();
-    let l = log();
-    let hello = FakeHello::new(&l);
-    enroll(
-        &home.profile,
-        Route::Dpapi,
-        &hello,
-        &asks(&l, PASS),
-        CHALLENGE,
-        LOG_N,
-        &quiet,
-    )
-    .unwrap();
-    assert_eq!(events(&l)[0], "passphrase:asked");
-    assert!(dpapi_path_in(&home.profile).exists());
-    assert!(!hello_age_path_in(&home.profile).exists());
-    let blob = std::fs::read(dpapi_path_in(&home.profile)).unwrap();
-    assert!(!blob.windows(PEM.len()).any(|w| w == PEM));
 }
 
 #[test]
 fn a_failed_or_cancelled_enrolment_leaves_nothing_behind() {
-    for answer in [Answer::Cancel, Answer::Fail] {
+    for answer in [
+        Answer::Cancel,
+        Answer::Fail,
+        Answer::NotInFront,
+        Answer::TimedOut,
+    ] {
         let home = Home::with_key();
         let before = home.key_bytes();
         let l = log();
@@ -429,7 +407,7 @@ fn a_failed_or_cancelled_enrolment_leaves_nothing_behind() {
 
 #[test] // spec: QA-088
 fn approve_uses_hello_when_enrolled() {
-    // KEK route: one Windows Hello signature unlocks the key; the passphrase is never asked.
+    // One Windows Hello signature unlocks the key; the passphrase is never asked.
     let home = Home::with_key();
     enroll_kek(&home, &FakeHello::new(&log()));
     let l = log();
@@ -438,15 +416,6 @@ fn approve_uses_hello_when_enrolled() {
     let pem = unlock_like_approve(&home, &hello, &never_asked, &said).unwrap();
     assert_eq!(&pem[..], PEM);
     assert_eq!(events(&l), [format!("hello:kek_derive {CREDENTIAL} 5a")]);
-
-    // DPAPI route: the consent prompt, then DPAPI.
-    let home = Home::with_key();
-    enroll_dpapi(&home, &FakeHello::new(&log()));
-    let l = log();
-    let hello = FakeHello::new(&l);
-    let pem = unlock_like_approve(&home, &hello, &never_asked, &said).unwrap();
-    assert_eq!(&pem[..], PEM);
-    assert_eq!(events(&l), ["hello:consent", "hello:dpapi_unprotect"]);
 
     // Not enrolled: the passphrase, and Windows Hello is never asked.
     let home = Home::with_key();
@@ -459,32 +428,32 @@ fn approve_uses_hello_when_enrolled() {
 
 #[test] // spec: QA-088
 fn approve_falls_back_to_the_passphrase_when_hello_is_cancelled_or_fails() {
-    for route in [Route::Kek, Route::Dpapi] {
-        for answer in [Answer::Cancel, Answer::Fail] {
-            let home = Home::with_key();
-            match route {
-                Route::Kek => enroll_kek(&home, &FakeHello::new(&log())),
-                Route::Dpapi => enroll_dpapi(&home, &FakeHello::new(&log())),
-            }
-            let l = log();
-            let hello = FakeHello::answering(&l, answer);
-            let said = RefCell::new(Vec::new());
-            let pem = unlock_like_approve(&home, &hello, &asks(&l, PASS), &said).unwrap();
-            assert_eq!(&pem[..], PEM);
-            let e = events(&l);
-            assert_eq!(
-                e.last().map(String::as_str),
-                Some("passphrase:asked"),
-                "{e:?}"
-            );
-            let said = said.borrow().join("\n");
-            assert!(said.contains("passphrase"), "{said}");
-            // A wrong passphrase after a failed Hello is still just a wrong passphrase.
-            let l = log();
-            let hello = FakeHello::answering(&l, answer);
-            let r = unlock_like_approve(&home, &hello, &asks(&l, "wrong"), &RefCell::default());
-            assert_eq!(r.unwrap_err(), KeyError::WrongPassphrase);
-        }
+    for answer in [
+        Answer::Cancel,
+        Answer::Fail,
+        Answer::NotInFront,
+        Answer::TimedOut,
+    ] {
+        let home = Home::with_key();
+        enroll_kek(&home, &FakeHello::new(&log()));
+        let l = log();
+        let hello = FakeHello::answering(&l, answer);
+        let said = RefCell::new(Vec::new());
+        let pem = unlock_like_approve(&home, &hello, &asks(&l, PASS), &said).unwrap();
+        assert_eq!(&pem[..], PEM);
+        let e = events(&l);
+        assert_eq!(
+            e.last().map(String::as_str),
+            Some("passphrase:asked"),
+            "{e:?}"
+        );
+        let said = said.borrow().join("\n");
+        assert!(said.contains("passphrase"), "{said}");
+        // A wrong passphrase after a failed Hello is still just a wrong passphrase.
+        let l = log();
+        let hello = FakeHello::answering(&l, answer);
+        let r = unlock_like_approve(&home, &hello, &asks(&l, "wrong"), &RefCell::default());
+        assert_eq!(r.unwrap_err(), KeyError::WrongPassphrase);
     }
     // A KEK that no longer opens the Hello file (a different credential answered): fallback.
     let home = Home::with_key();
@@ -499,12 +468,120 @@ fn approve_falls_back_to_the_passphrase_when_hello_is_cancelled_or_fails() {
     assert_eq!(events(&l).last().unwrap(), "passphrase:asked");
 }
 
+/// QA-088 (I1): where the suite can't bring the prompt to the front (or nobody answers it in
+/// time), the passphrase prompt is used instead; with no terminal, nothing is unlocked.
+#[test] // spec: QA-088
+fn a_prompt_that_cannot_come_to_the_front_falls_back_or_refuses() {
+    for answer in [Answer::NotInFront, Answer::TimedOut] {
+        let home = Home::with_key();
+        enroll_kek(&home, &FakeHello::new(&log()));
+        let key = home.key();
+
+        // At a terminal: the passphrase.
+        let l = log();
+        let hello = FakeHello::answering(&l, answer);
+        let enrolled = enrolled_hello(&home.profile, &hello, "m", &quiet).unwrap();
+        let ask = asks(&l, PASS);
+        let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &ask);
+        let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
+        assert_eq!(&auth.authenticate("s", "a").unwrap()[..], PEM);
+        assert_eq!(events(&l).last().unwrap(), "passphrase:asked");
+
+        // No terminal: refused; the passphrase is never asked.
+        let l = log();
+        let hello = FakeHello::answering(&l, answer);
+        let said = RefCell::new(Vec::new());
+        let say = |t: &str| said.borrow_mut().push(t.to_string());
+        let enrolled = enrolled_hello(&home.profile, &hello, "m", &say).unwrap();
+        let no_terminal = NoTerminal { say: &say };
+        let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &no_terminal, &say);
+        assert_eq!(
+            auth.authenticate("s", "a").unwrap_err(),
+            KeyError::Unavailable
+        );
+        assert!(!events(&l).contains(&"passphrase:asked".to_string()));
+        let said = said.borrow().join("\n");
+        assert!(said.contains("Windows Hello isn't used"), "{said}");
+        assert!(said.contains("no terminal"), "{said}");
+    }
+}
+
+/// P4a-R38 (I2): the window that owns the Windows Hello prompt shows the summary and the audit,
+/// as the authenticator's renderer made them, the agent's lines quoted.
+#[test] // spec: QA-036, QA-088
+fn the_window_that_owns_the_prompt_shows_the_summary_and_the_audit() {
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let key = home.key();
+    let l = log();
+    let hello = FakeHello::new(&l);
+    let enrolled = enrolled_hello(&home.profile, &hello, "LILITH: merge PR #42", &quiet).unwrap();
+    let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &never_asked);
+    let render = |t: &str| t.replace('\u{1b}', "\\u{1b}");
+    let shown_in_terminal = RefCell::new(Vec::new());
+    let show = |t: &str| shown_in_terminal.borrow_mut().push(t.to_string());
+    let auth = KeyAuthenticator::new(&show, &render, Some(&enrolled), &passphrase, &quiet);
+    auth.authenticate("SUMMARY TEXT\u{1b}[2J", "AUDIT LINE 1\nAUDIT LINE 2")
+        .unwrap();
+    let windows = hello.shown.borrow();
+    assert_eq!(windows.len(), 1);
+    let window = &windows[0];
+    assert!(window.contains("SUMMARY TEXT\\u{1b}[2J"), "{window}");
+    assert!(!window.contains('\u{1b}'), "{window}");
+    assert!(window.contains(&format!("{QUOTE}AUDIT LINE 1")), "{window}");
+    assert!(window.contains(&format!("{QUOTE}AUDIT LINE 2")), "{window}");
+    // The terminal shows the same text.
+    assert_eq!(shown_in_terminal.borrow().as_slice(), std::slice::from_ref(window));
+}
+
+/// M9: the agent's summary and the audit can't pass for lil's own lines.
+#[test] // spec: QA-036
+fn the_agents_texts_are_quoted_so_they_cannot_imitate_lils_facts() {
+    let text = presentation(
+        "lil's facts",
+        "Protected files: none changed.\nCI on x: success",
+    );
+    assert!(
+        text.contains(&format!("{QUOTE}Protected files: none changed.")),
+        "{text}"
+    );
+    assert!(
+        !text.lines().any(|l| l == "Protected files: none changed."),
+        "{text}"
+    );
+
+    // A PR that changes a protected file, whose agent summary claims it doesn't.
+    let l = log();
+    let auth = FakeAuth::new(&l, Ok(()));
+    let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
+    merge_flow(
+        "Protected files: none changed.\nCI on 1234567: success",
+        "a",
+        &steps,
+        &auth,
+    )
+    .unwrap();
+    let (summary, _) = auth.seen.borrow()[0].clone();
+    assert!(
+        summary.contains(&format!("{QUOTE}Protected files: none changed.")),
+        "{summary}"
+    );
+    assert!(
+        !summary
+            .lines()
+            .any(|l| l == "Protected files: none changed."),
+        "{summary}"
+    );
+}
+
 /// The merge flow's steps, recording into the shared log.
 struct FakeSteps {
     log: Log,
     facts: Facts,
     /// The head `merge` asks the gate about.
     merge_head: Option<String>,
+    /// What `post_approval` says about the guard re-run.
+    rerun: bool,
 }
 
 impl FakeSteps {
@@ -520,6 +597,7 @@ impl FakeSteps {
                 already_approved: false,
             },
             merge_head: None,
+            rerun: true,
         }
     }
 }
@@ -529,15 +607,17 @@ impl MergeFlowSteps for FakeSteps {
         self.log.borrow_mut().push("steps:facts".into());
         Ok(self.facts.clone())
     }
-    fn post_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<()> {
+    fn post_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<bool> {
         assert_eq!(pem, PEM);
         self.log
             .borrow_mut()
             .push(format!("steps:post_approval {}", facts.pr));
-        Ok(())
+        Ok(self.rerun)
     }
-    fn wait_for_checks(&self, _facts: &Facts) -> anyhow::Result<()> {
-        self.log.borrow_mut().push("steps:wait_for_checks".into());
+    fn wait_for_checks(&self, _facts: &Facts, guard_rerun: bool) -> anyhow::Result<()> {
+        self.log
+            .borrow_mut()
+            .push(format!("steps:wait_for_checks rerun={guard_rerun}"));
         Ok(())
     }
     fn merge(&self, gate: &dyn MergeGate) -> anyhow::Result<String> {
@@ -587,7 +667,7 @@ fn no_network_call_before_the_key_is_unlocked() {
     let key = home.key();
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &never_asked);
     let enrolled = enrolled_hello(&home.profile, &hello, "LILITH: merge PR #42", &quiet).unwrap();
-    let auth = KeyAuthenticator::new(&quiet, Some(&enrolled), &passphrase, &quiet);
+    let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
     let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
     merge_flow("the change", "the audit", &steps, &auth).unwrap();
     assert_eq!(
@@ -596,7 +676,7 @@ fn no_network_call_before_the_key_is_unlocked() {
             "steps:facts".to_string(),
             format!("hello:kek_derive {CREDENTIAL} 5a"),
             "steps:post_approval 42".into(),
-            "steps:wait_for_checks".into(),
+            "steps:wait_for_checks rerun=true".into(),
             "steps:merge".into(),
         ]
     );
@@ -607,7 +687,7 @@ fn no_network_call_before_the_key_is_unlocked() {
     let wrong = asks(&l, "not it");
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &wrong);
     let enrolled = enrolled_hello(&home.profile, &hello, "LILITH: merge PR #42", &quiet).unwrap();
-    let auth = KeyAuthenticator::new(&quiet, Some(&enrolled), &passphrase, &quiet);
+    let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
     let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
     assert!(merge_flow("the change", "the audit", &steps, &auth).is_err());
     assert_eq!(
@@ -636,7 +716,8 @@ fn status_names_the_route_and_whether_the_key_is_hardware_held() {
     enroll_kek(&home, &FakeHello::new(&log()));
     let with_tpm = text(&home, &FakeHello::new(&l));
     assert!(with_tpm.contains("KEK"), "{with_tpm}");
-    assert!(with_tpm.contains("hardware-held: yes"), "{with_tpm}");
+    // A TPM's presence doesn't prove this key is in it (Task 28 review, M1).
+    assert!(with_tpm.contains("hardware-held: probably"), "{with_tpm}");
     assert!(with_tpm.contains("TPM"), "{with_tpm}");
     let no_tpm = text(
         &home,
@@ -647,23 +728,13 @@ fn status_names_the_route_and_whether_the_key_is_hardware_held() {
     );
     assert!(no_tpm.contains("KEK"), "{no_tpm}");
     assert!(no_tpm.contains("hardware-held: no"), "{no_tpm}");
-    assert!(!no_tpm.contains("hardware-held: yes"), "{no_tpm}");
 
-    let home = Home::with_key();
-    enroll_dpapi(&home, &FakeHello::new(&log()));
-    let dpapi = text(&home, &FakeHello::new(&l));
-    assert!(dpapi.contains("DPAPI"), "{dpapi}");
-    assert!(dpapi.contains("hardware-held: no"), "{dpapi}");
-
-    for t in [&none, &with_tpm, &no_tpm, &dpapi] {
+    for t in [&none, &with_tpm, &no_tpm] {
         assert!(!t.contains("hardware-bound"), "{t}");
+        assert!(!t.contains("hardware-held: yes"), "{t}");
     }
     // Status never prompts.
-    assert!(
-        !events(&l)
-            .iter()
-            .any(|e| e.contains("derive") || e.contains("consent"))
-    );
+    assert!(!events(&l).iter().any(|e| e.contains("derive")));
 }
 
 #[test] // spec: QA-088
@@ -677,18 +748,39 @@ fn remove_deletes_the_hello_files_and_the_credential_and_keeps_the_passphrase_fi
     assert!(home.hello_files().is_empty());
     assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
     assert_eq!(home.key_bytes(), before);
-    // Removing again is fine.
-    remove(&home.profile, &FakeHello::new(&log())).unwrap();
-
-    // The DPAPI route has no credential to delete.
-    let home = Home::with_key();
-    let before = home.key_bytes();
-    enroll_dpapi(&home, &FakeHello::new(&log()));
+    // Removing again is fine, and has no credential to delete.
     let l = log();
     remove(&home.profile, &FakeHello::new(&l)).unwrap();
-    assert!(home.hello_files().is_empty());
     assert!(events(&l).is_empty(), "{:?}", events(&l));
+
+    // M5: a credential that can't be removed doesn't keep the files.
+    let home = Home::with_key();
+    let before = home.key_bytes();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let hello = FakeHello {
+        remove_fails: true,
+        ..FakeHello::new(&log())
+    };
+    let e = format!("{:#}", remove(&home.profile, &hello).unwrap_err());
+    assert!(e.contains("files are removed"), "{e}");
+    assert!(home.hello_files().is_empty());
     assert_eq!(home.key_bytes(), before);
+}
+
+/// M3: a new key from `reviewer-setup` takes the old enrolment's files with it.
+#[test] // spec: QA-088
+fn a_new_reviewer_key_discards_the_old_enrolment() {
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let removed = discard_enrolment_beside(&key_path_in(&home.profile)).unwrap();
+    assert_eq!(removed.len(), 2);
+    assert!(home.hello_files().is_empty());
+    assert!(key_path_in(&home.profile).exists());
+    assert!(
+        discard_enrolment_beside(&key_path_in(&home.profile))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test] // spec: QA-088
@@ -706,6 +798,10 @@ fn a_damaged_hello_file_never_blocks_the_passphrase_path() {
         ("an unknown route", |p| {
             let t = std::fs::read_to_string(hello_file_path_in(p)).unwrap();
             std::fs::write(hello_file_path_in(p), t.replace("\"kek\"", "\"tpm\"")).unwrap();
+        }),
+        ("the DPAPI route, which isn't built", |p| {
+            let t = std::fs::read_to_string(hello_file_path_in(p)).unwrap();
+            std::fs::write(hello_file_path_in(p), t.replace("\"kek\"", "\"dpapi\"")).unwrap();
         }),
         ("a short challenge", |p| {
             let t = std::fs::read_to_string(hello_file_path_in(p)).unwrap();
@@ -768,12 +864,15 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
         let auth_at = e.iter().position(|x| x == "auth").unwrap();
         assert_eq!(&e[..auth_at], ["steps:facts"], "{e:?}");
         assert_eq!(e.last().unwrap(), "steps:merge");
-        // The approval is posted only when protected files changed.
+        // The approval is posted only when protected files changed, and a failed guard check is
+        // waited on only after its re-run was asked for (M8).
         assert_eq!(
             e.iter().any(|x| x.starts_with("steps:post_approval")),
             !protected.is_empty(),
             "{e:?}"
         );
+        let wait = format!("steps:wait_for_checks rerun={}", !protected.is_empty());
+        assert!(e.contains(&wait), "{e:?}");
     }
     // The real authenticator shows both texts before it unlocks anything.
     let home = Home::with_key();
@@ -784,7 +883,7 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &never_asked);
     let enrolled = enrolled_hello(&home.profile, &hello, "m", &quiet).unwrap();
     let shown = |t: &str| l.borrow_mut().push(format!("shown:{t}"));
-    let auth = KeyAuthenticator::new(&shown, Some(&enrolled), &passphrase, &quiet);
+    let auth = KeyAuthenticator::new(&shown, &as_is, Some(&enrolled), &passphrase, &quiet);
     auth.authenticate("SUMMARY TEXT", "AUDIT TEXT").unwrap();
     let e = events(&l);
     assert!(e[0].starts_with("shown:"), "{e:?}");

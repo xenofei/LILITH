@@ -1,13 +1,18 @@
 //! Windows Hello for the reviewer key (QA-088, P4a-R23, P4a-R38; plan 4a Task 28).
 //!
-//! Two routes can unlock the reviewer App key with Windows Hello instead of the passphrase:
+//! **The one route LILITH builds: the KEK.** A Windows Hello key credential
+//! ([`KeyCredentialManager`]) signs a fixed 32-byte challenge, and the key-encryption key is
+//! SHA-256 over [`KEK_DOMAIN`] followed by the raw signature ([`kek_from_signature`], P4a-R23).
+//! Spike 11 (S1.8) found 10 of 10 signatures over one challenge byte-identical, across two
+//! processes. The DPAPI route is not built (Task 28 fix round 1: a DPAPI-protected key is
+//! readable without a prompt by every program running as you). The DPAPI calls and the consent
+//! check below stay only because the route probe (`examples/hello-probe.rs`) still measures
+//! them.
 //!
-//! - **KEK:** a Windows Hello key credential ([`KeyCredentialManager`]) signs a fixed 32-byte
-//!   challenge, and the key-encryption key is SHA-256 over [`KEK_DOMAIN`] followed by the raw
-//!   signature ([`kek_from_signature`], P4a-R23). Spike 11 (S1.8) found 10 of 10 signatures over
-//!   one challenge byte-identical, across two processes.
-//! - **DPAPI:** the key is protected for the current user ([`dpapi_protect`]) and Windows Hello's
-//!   consent prompt ([`consent`]) gates its use. The gate is a check in the UI, not encryption.
+//! **In front, or not at all (QA-088).** [`kek_enroll`] and [`kek_derive`] open an
+//! [`OwnerWindow`] that shows what you are confirming, bring it to the front, and refuse when it
+//! didn't get there ([`front_or_refuse`]); the caller then asks for the passphrase. Every
+//! prompt is cancelled after [`HELLO_WAIT`] ([`wait_bounded`]).
 //!
 //! **Placement (P4a-R38).** The owner's rule is that the prompt comes to the front of every
 //! application, a fullscreen one included. Spike 11 showed that an unowned create prompt and a
@@ -19,21 +24,21 @@
 //! Windows build's own metadata (`C:\Windows\System32\WinMetadata\Windows.Security.winmd`):
 //! `IKeyCredentialManagerCreateWithWindowStatics` {30b1b9c9-61ef-43e8-88ac-cc433b38d1a6} and
 //! `IKeyCredentialWithWindow` {050deb3b-b19c-4635-9df6-5650d66c62b1}, each one method after
-//! `IInspectable`. Which route the suite uses is Task 28's Step 0 (the probe,
-//! `examples/hello-probe.rs`); this module has both.
+//! `IInspectable`. Whether the prompt then comes to the front by itself is Task 28's Step 0 (the
+//! probe).
 //!
 //! **Secrets.** The signature and the KEK live in [`Zeroizing`] buffers and are never logged;
 //! DPAPI's plaintext comes back in one. Nothing here prints.
 //!
-//! **Prompts.** [`kek_enroll`], [`kek_derive`], [`consent`] and their `*_for_window` and
-//! `start_*` forms raise a Windows Hello prompt. [`supported`], [`tpm_present`],
-//! [`credential_exists`], [`kek_remove`], [`window_bindings_available`] and the DPAPI calls never
-//! do.
+//! **Prompts.** [`kek_enroll`], [`kek_derive`], their `*_for_window` forms and the `start_*`
+//! calls raise a Windows Hello prompt. [`supported`], [`tpm_present`], [`credential_exists`],
+//! [`kek_remove`], [`window_bindings_available`] and the DPAPI calls never do.
 
 use std::ffi::c_void;
 use std::io;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use windows::Security::Credentials::UI::{UserConsentVerificationResult, UserConsentVerifier};
@@ -80,7 +85,8 @@ pub fn kek_from_signature(signature: &[u8]) -> Zeroizing<[u8; 32]> {
     hasher.update(KEK_DOMAIN);
     hasher.update(signature);
     let mut kek = Zeroizing::new([0u8; 32]);
-    kek.copy_from_slice(&hasher.finalize());
+    // Straight into the zeroized buffer: no temporary copy of the KEK is left behind.
+    hasher.finalize_into((&mut *kek).into());
     kek
 }
 
@@ -341,7 +347,7 @@ pub fn finish_sign(pending: PendingSign) -> io::Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Starts `IUserConsentVerifierInterop::RequestVerificationForWindowAsync(hwnd, message)`: the
-/// DPAPI route's gate, owned by `hwnd`.
+/// DPAPI route's gate, owned by `hwnd`. Kept only for the route probe; LILITH doesn't use it.
 pub fn start_consent_for_window(hwnd: isize, message: &str) -> io::Result<PendingConsent> {
     let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()
         .map_err(io_err)?;
@@ -362,50 +368,106 @@ pub fn finish_consent(pending: PendingConsent) -> io::Result<bool> {
     Ok(result == UserConsentVerificationResult::Verified)
 }
 
+/// How long a Windows Hello prompt waits for you before it is cancelled (QA-088): a prompt you
+/// can't see must not keep `lil` waiting, nor be answered hours later.
+pub const HELLO_WAIT: Duration = Duration::from_secs(120);
+
+/// How often [`wait_bounded`] looks.
+const HELLO_POLL: Duration = Duration::from_millis(100);
+
+/// Waits until `finished()` says so, for at most `timeout`; past that it calls `cancel()` (which
+/// closes the prompt) and is a `TimedOut` error. `pause` is `std::thread::sleep` for real.
+pub fn wait_bounded(
+    finished: &dyn Fn() -> bool,
+    cancel: &dyn Fn(),
+    timeout: Duration,
+    pause: &dyn Fn(Duration),
+) -> io::Result<()> {
+    let mut waited = Duration::ZERO;
+    while !finished() {
+        if waited >= timeout {
+            cancel();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the Windows Hello prompt wasn't answered within {} s, so it was cancelled",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        pause(HELLO_POLL);
+        waited += HELLO_POLL;
+    }
+    Ok(())
+}
+
+impl<T: windows::core::RuntimeType + 'static> Pending<T> {
+    /// [`wait_bounded`] on this call, for at most [`HELLO_WAIT`].
+    fn wait(&self) -> io::Result<()> {
+        wait_bounded(
+            &|| self.finished(),
+            &|| self.cancel(),
+            HELLO_WAIT,
+            &std::thread::sleep,
+        )
+    }
+}
+
 /// Creates (or replaces) the Windows Hello key credential `credential`, the prompt owned by
-/// `hwnd` (KEK route enrolment).
+/// `hwnd` (KEK route enrolment). Cancelled after [`HELLO_WAIT`].
 pub fn kek_enroll_for_window(hwnd: isize, credential: &str) -> io::Result<()> {
-    finish_create(start_create_for_window(hwnd, credential)?)
+    let pending = start_create_for_window(hwnd, credential)?;
+    pending.wait()?;
+    finish_create(pending)
 }
 
 /// Signs `challenge` with `credential`, the prompt owned by `hwnd`, and returns the KEK
-/// ([`kek_from_signature`]).
+/// ([`kek_from_signature`]). Cancelled after [`HELLO_WAIT`].
 pub fn kek_derive_for_window(
     hwnd: isize,
     credential: &str,
     challenge: &[u8; 32],
 ) -> io::Result<Zeroizing<[u8; 32]>> {
-    let signature = finish_sign(start_sign_for_window(hwnd, credential, challenge)?)?;
+    let pending = start_sign_for_window(hwnd, credential, challenge)?;
+    pending.wait()?;
+    let signature = finish_sign(pending)?;
     Ok(kek_from_signature(&signature))
 }
 
-/// The consent check, owned by `hwnd`: `true` when Windows Hello verified the user.
-pub fn consent_for_window(hwnd: isize, message: &str) -> io::Result<bool> {
-    finish_consent(start_consent_for_window(hwnd, message)?)
+/// QA-088: Windows Hello is used only when its window is in front; otherwise the caller uses
+/// the passphrase (or refuses without a terminal). Pure.
+pub fn front_or_refuse(raise: Raise) -> io::Result<()> {
+    match raise {
+        Raise::AlreadyInFront | Raise::SetForeground | Raise::AttachedInput => Ok(()),
+        Raise::NotInFront => Err(io::Error::other(
+            "the Windows Hello window couldn't be brought to the front of the other windows, so Windows Hello isn't used",
+        )),
+    }
 }
 
-/// [`kek_enroll_for_window`] with an [`OwnerWindow`] opened and brought to the front for it.
-pub fn kek_enroll(credential: &str) -> io::Result<()> {
-    let window = OwnerWindow::open(
-        "LILITH: Windows Hello",
-        "Setting up Windows Hello for the reviewer key.",
-    )?;
-    window.bring_to_front();
-    kek_enroll_for_window(window.hwnd(), credential)
+/// Opens an [`OwnerWindow`] showing `shown`, brings it to the front, and runs `call` with it
+/// only when it got there ([`front_or_refuse`]).
+fn in_front<T>(shown: &str, call: impl FnOnce(isize) -> io::Result<T>) -> io::Result<T> {
+    let window = OwnerWindow::open("LILITH: Windows Hello", shown)?;
+    front_or_refuse(window.bring_to_front())?;
+    call(window.hwnd())
 }
 
-/// [`kek_derive_for_window`] with an [`OwnerWindow`] opened and brought to the front for it.
-pub fn kek_derive(credential: &str, challenge: &[u8; 32]) -> io::Result<Zeroizing<[u8; 32]>> {
-    let window = OwnerWindow::open("LILITH: Windows Hello", "Unlocking the reviewer key.")?;
-    window.bring_to_front();
-    kek_derive_for_window(window.hwnd(), credential, challenge)
+/// [`kek_enroll_for_window`], owned by an [`OwnerWindow`] in front that shows `shown`.
+pub fn kek_enroll(credential: &str, shown: &str) -> io::Result<()> {
+    in_front(shown, |hwnd| kek_enroll_for_window(hwnd, credential))
 }
 
-/// [`consent_for_window`] with an [`OwnerWindow`] showing `message`, brought to the front.
-pub fn consent(message: &str) -> io::Result<bool> {
-    let window = OwnerWindow::open("LILITH: Windows Hello", message)?;
-    window.bring_to_front();
-    consent_for_window(window.hwnd(), message)
+/// [`kek_derive_for_window`], owned by an [`OwnerWindow`] in front that shows `shown` (for a
+/// merge, the summary and the audit, P4a-R38).
+pub fn kek_derive(
+    credential: &str,
+    challenge: &[u8; 32],
+    shown: &str,
+) -> io::Result<Zeroizing<[u8; 32]>> {
+    in_front(shown, |hwnd| {
+        kek_derive_for_window(hwnd, credential, challenge)
+    })
 }
 
 /// Whether the key credential `credential` exists (`OpenAsync`). No prompt.
@@ -429,7 +491,7 @@ pub fn kek_remove(credential: &str) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// DPAPI (the DPAPI route).
+// DPAPI: kept only for the route probe's `dry` check; LILITH doesn't use it.
 // ---------------------------------------------------------------------------------------------
 
 const DPAPI_DESCRIPTION: &str = "LILITH reviewer key";
@@ -573,6 +635,9 @@ impl OwnerWindow {
             }
             let front = GetForegroundWindow();
             let front_thread = GetWindowThreadProcessId(front, None);
+            // The calling thread's input is attached, as the route probe measures it. If the probe
+            // reports `not_in_front`, the first change to try is attaching the window's own
+            // thread (`GetWindowThreadProcessId(hwnd)`) instead (Task 28 review, M7).
             let mine = GetCurrentThreadId();
             if front_thread != 0 && front_thread != mine {
                 let attached = AttachThreadInput(mine, front_thread, true).as_bool();
@@ -724,5 +789,52 @@ mod tests {
     fn window_id_carries_the_handle() {
         assert_eq!(WindowId::of(0x1234_5678).value, 0x1234_5678);
         assert_eq!(size_of::<WindowId>(), 8);
+    }
+
+    #[test] // spec: QA-088
+    fn windows_hello_is_used_only_when_its_window_is_in_front() {
+        for ok in [
+            Raise::AlreadyInFront,
+            Raise::SetForeground,
+            Raise::AttachedInput,
+        ] {
+            assert!(front_or_refuse(ok).is_ok(), "{ok:?}");
+        }
+        let e = front_or_refuse(Raise::NotInFront).unwrap_err();
+        // Not `Interrupted` (a cancel): the caller treats it as Hello being unavailable.
+        assert_ne!(e.kind(), io::ErrorKind::Interrupted);
+        assert!(e.to_string().contains("front"), "{e}");
+    }
+
+    #[test] // spec: QA-088
+    fn an_unanswered_prompt_is_cancelled_after_the_wait() {
+        use std::cell::Cell;
+        // Never answered: cancelled once, at the limit, and a `TimedOut` error.
+        let cancelled = Cell::new(0);
+        let waited = Cell::new(Duration::ZERO);
+        let e = wait_bounded(
+            &|| false,
+            &|| cancelled.set(cancelled.get() + 1),
+            Duration::from_secs(2),
+            &|d| waited.set(waited.get() + d),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(cancelled.get(), 1);
+        assert_eq!(waited.get(), Duration::from_secs(2));
+
+        // Answered in time: no cancel.
+        let polls = Cell::new(0);
+        wait_bounded(
+            &|| {
+                polls.set(polls.get() + 1);
+                polls.get() > 3
+            },
+            &|| panic!("cancelled an answered prompt"),
+            Duration::from_secs(2),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(HELLO_WAIT, Duration::from_secs(120));
     }
 }

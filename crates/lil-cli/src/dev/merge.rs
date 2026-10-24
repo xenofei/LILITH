@@ -44,6 +44,7 @@ use super::github::{
 };
 use super::guard::{self, Verdict};
 use super::merge_flow::{AskOnEveryMerge, MergeGate};
+use super::reviewer_hello::Authenticator;
 use super::root;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -700,6 +701,26 @@ pub(crate) fn merge_in_repo<'g>(
     )
 }
 
+/// `lil dev merge`'s merge: [`merge_in_repo`] with the gate that asks `auth` on every merge,
+/// protected files or not (QA-036, P4a-R38).
+pub(crate) fn merge_asking<'g>(
+    repo: &Path,
+    pr: u64,
+    checked: &MergeGuardConfig,
+    hooks_path_configured: Option<String>,
+    github: &dyn Fn(&MergeGuardConfig) -> Result<Box<dyn GitHubApi + 'g>>,
+    auth: &dyn Authenticator,
+) -> Result<String, Vec<Refusal>> {
+    merge_in_repo(
+        repo,
+        pr,
+        checked,
+        hooks_path_configured,
+        github,
+        &AskOnEveryMerge::new(auth),
+    )
+}
+
 fn refuse(header: &str, refusals: &[Refusal]) -> i32 {
     eprintln!("{header}");
     for line in explain(refusals).lines() {
@@ -740,7 +761,7 @@ pub fn run_merge(pr: u64) -> i32 {
     // missing one is refused before any network call.
     let merged =
         super::reviewer::with_owner_authenticator(&format!("merge PR #{pr}"), |_, auth| {
-            merge_in_repo(&repo, pr, &cfg, hooks, &github, &AskOnEveryMerge::new(auth))
+            merge_asking(&repo, pr, &cfg, hooks, &github, auth)
         });
     match merged {
         Ok(Ok(merge_sha)) => {
@@ -2114,5 +2135,67 @@ mod tests {
             &cfg().reviewer_login(),
             HEAD
         ));
+    }
+
+    /// An `Authenticator` that records what it was asked and answers `answer`.
+    struct RecordingAuth {
+        asked: RefCell<Vec<String>>,
+        answer: std::result::Result<(), crate::dev::reviewer_key::KeyError>,
+    }
+
+    impl Authenticator for RecordingAuth {
+        fn authenticate(
+            &self,
+            summary: &str,
+            _audit: &str,
+        ) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, crate::dev::reviewer_key::KeyError>
+        {
+            self.asked.borrow_mut().push(summary.to_string());
+            self.answer
+                .map(|()| zeroize::Zeroizing::new(b"pem".to_vec()))
+        }
+    }
+
+    /// `lil dev merge`'s merge (`merge_asking`, what `run_merge` calls) asks your authentication
+    /// once, about the checked head, after every other condition held; without it nothing is
+    /// merged (QA-036, P4a-R38; Task 28 review, I3).
+    #[test] // spec: QA-036
+    fn dev_merge_uses_the_gate_that_asks_you_on_every_merge() {
+        use crate::dev::reviewer_key::KeyError;
+        for answer in [
+            Ok(()),
+            Err(KeyError::Cancelled),
+            Err(KeyError::WrongPassphrase),
+        ] {
+            let f = fixture();
+            let fake = FakeGitHub::new();
+            fake.add_pr(42, &f.head, "main");
+            for name in cfg().required_checks {
+                fake.set_check(&f.head, &name, CheckState::Success);
+            }
+            fake.add_review(42, BOT, "APPROVED", &f.head);
+            let github =
+                |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> { Ok(boxed(&fake)) };
+            let auth = RecordingAuth {
+                asked: RefCell::default(),
+                answer,
+            };
+            let r = merge_asking(&f.work, 42, &cfg(), hooks(), &github, &auth);
+            let asked = auth.asked.borrow().clone();
+            assert_eq!(asked.len(), 1, "{asked:?}");
+            assert!(asked[0].contains("PR #42"), "{asked:?}");
+            assert!(asked[0].contains(&f.head), "{asked:?}");
+            match answer {
+                Ok(()) => {
+                    assert_eq!(r, Ok(format!("merge-of-{}", f.head)));
+                    assert_eq!(fake.pr(42).unwrap().state, "closed");
+                }
+                Err(_) => {
+                    let r = refusals(r);
+                    assert!(matches!(&r[..], [Refusal::NotAuthenticated(_)]), "{r:?}");
+                    assert_eq!(fake.pr(42).unwrap().state, "open");
+                }
+            }
+        }
     }
 }

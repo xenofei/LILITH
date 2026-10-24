@@ -2,23 +2,29 @@
 //! (QA-088, P4a-R23, P4a-R38; plan 4a Task 28), and the authentication every approval and every
 //! merge asks for (QA-036).
 //!
-//! **The files**, beside the passphrase file `app-key.age` (which always stays, the fallback):
+//! **The one route: the KEK** (Task 28 fix round 1: the DPAPI route is not built, because a
+//! DPAPI-protected key is readable without a prompt by every program running as you, agents
+//! included). The files, beside the passphrase file `app-key.age`, which always stays as the
+//! fallback:
 //!
-//! - `app-key.hello.toml`: `route = "kek" | "dpapi"`, `credential = "LILITH-reviewer-kek"`,
+//! - `app-key.hello.toml`: `route = "kek"`, `credential = "LILITH-reviewer-kek"`,
 //!   `challenge = "<64 lowercase hex>"` ([`HelloFile`]). Written last, so it marks a finished
-//!   enrolment.
-//! - KEK route: `app-key.hello.age`, the PEM under age's scrypt with the passphrase the
-//!   lowercase hex of the KEK: SHA-256 over `LILITH reviewer KEK v1` and the Windows Hello key
-//!   credential's signature over the challenge (P4a-R23). The existing age decryption stays the
-//!   one path.
-//! - DPAPI route: `app-key.dpapi`, the PEM protected with DPAPI for this Windows user, used only
-//!   after Windows Hello's consent prompt says yes. That gate is a check in the UI, not
-//!   encryption, the weaker option.
+//!   enrolment. Any other route in it makes the file damaged.
+//! - `app-key.hello.age`: the PEM under age's scrypt, the passphrase the lowercase hex of the
+//!   KEK: SHA-256 over `LILITH reviewer KEK v1` and the Windows Hello key credential's signature
+//!   over the challenge (P4a-R23). The existing age decryption stays the one path.
 //!
-//! **The seam.** Everything route-specific goes through [`HelloPlatform`]: [`WindowsHello`] for
-//! real (`lil_platform::hello`), a fake in `tests/reviewer_hello.rs`. Which route `enroll` uses
-//! is [`PROVEN_ROUTE`], settled by Task 28's route step (Step 0, P4a-R38); until then it is
-//! `None`, so `enroll` refuses and every approval and merge uses the passphrase.
+//! **The seam.** The Windows Hello calls go through [`HelloPlatform`]: [`WindowsHello`] for real
+//! (`lil_platform::hello`), a fake in `tests/reviewer_hello.rs`. Whether `enroll` may run is
+//! [`PROVEN_ROUTE`], settled by Task 28's route step (Step 0, P4a-R38); until then it is `None`,
+//! so `enroll` refuses and every approval and merge uses the passphrase. If the probe shows the
+//! KEK can't work, the owner decides what follows; no other route is built for it.
+//!
+//! **In front, or the passphrase (QA-088).** The window that owns the Windows Hello prompt shows
+//! what you are confirming (for a merge, the summary and the audit, P4a-R38). When it can't be
+//! brought to the front, or the prompt isn't answered within `lil_platform::hello::HELLO_WAIT`,
+//! Windows Hello is unavailable and the passphrase is asked for, or, with no terminal
+//! ([`NoTerminal`]), nothing is unlocked.
 //!
 //! **The order** ([`unlock_reviewer_key`]): Windows Hello first when enrolled; when it is
 //! cancelled or fails, or its files are damaged, the passphrase. Nothing that uses the key runs
@@ -39,24 +45,23 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-/// The Windows Hello key credential's name (KEK route).
+/// The Windows Hello key credential's name.
 pub const CREDENTIAL: &str = "LILITH-reviewer-kek";
 
-/// The route Task 28's Step 0 proved (P4a-R38), or `None` until it has run. Phase B sets it.
+/// `Some(Route::Kek)` once Task 28's Step 0 proved it (P4a-R38); `None` until then. Phase B sets
+/// it.
 pub const PROVEN_ROUTE: Option<Route> = None;
 
-/// Which Windows Hello route protects the key.
+/// The Windows Hello route that protects the key. The KEK is the only one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Kek,
-    Dpapi,
 }
 
 impl Route {
     fn name(self) -> &'static str {
         match self {
             Route::Kek => "kek",
-            Route::Dpapi => "dpapi",
         }
     }
 }
@@ -115,15 +120,14 @@ impl HelloFile {
         .context("writing the Windows Hello file")
     }
 
-    /// Strict: unknown keys, another route, another credential name or a challenge that isn't
-    /// 64 lowercase hex digits are errors.
+    /// Strict: unknown keys, a route other than `kek`, another credential name or a challenge
+    /// that isn't 64 lowercase hex digits are errors.
     pub fn from_toml(text: &str) -> Result<Self> {
         let raw: HelloToml =
             toml::from_str(text).context("it is not a valid Windows Hello file")?;
         let route = match raw.route.as_str() {
             "kek" => Route::Kek,
-            "dpapi" => Route::Dpapi,
-            other => bail!("its route {other:?} is neither \"kek\" nor \"dpapi\""),
+            other => bail!("its route {other:?} isn't \"kek\", the only one LILITH builds"),
         };
         if raw.credential != CREDENTIAL {
             bail!(
@@ -147,33 +151,24 @@ impl HelloFile {
     }
 }
 
-fn reviewer_dir(profile: &Path) -> PathBuf {
-    key_path_in(profile)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
+/// `app-key.hello.toml` beside the key file `key_path`.
+fn hello_file_beside(key_path: &Path) -> PathBuf {
+    key_path.with_file_name("app-key.hello.toml")
+}
+
+/// `app-key.hello.age` beside the key file `key_path`.
+fn hello_age_beside(key_path: &Path) -> PathBuf {
+    key_path.with_file_name("app-key.hello.age")
 }
 
 /// `<profile>\<home>\reviewer\app-key.hello.toml`.
 pub fn hello_file_path_in(profile: &Path) -> PathBuf {
-    reviewer_dir(profile).join("app-key.hello.toml")
+    hello_file_beside(&key_path_in(profile))
 }
 
-/// `<profile>\<home>\reviewer\app-key.hello.age` (KEK route).
+/// `<profile>\<home>\reviewer\app-key.hello.age`.
 pub fn hello_age_path_in(profile: &Path) -> PathBuf {
-    reviewer_dir(profile).join("app-key.hello.age")
-}
-
-/// `<profile>\<home>\reviewer\app-key.dpapi` (DPAPI route).
-pub fn dpapi_path_in(profile: &Path) -> PathBuf {
-    reviewer_dir(profile).join("app-key.dpapi")
-}
-
-fn sealed_path_in(profile: &Path, route: Route) -> PathBuf {
-    match route {
-        Route::Kek => hello_age_path_in(profile),
-        Route::Dpapi => dpapi_path_in(profile),
-    }
+    hello_age_beside(&key_path_in(profile))
 }
 
 /// Writes `bytes` through a temporary file and a rename, so a failed write leaves nothing half
@@ -212,46 +207,48 @@ fn remove_if_there(path: &Path) -> Result<bool> {
     }
 }
 
+/// Removes the Windows Hello files beside `key_path` (not the credential): `reviewer-setup`
+/// calls this when it writes a new key, since an enrolment holds the old key (Task 28 review,
+/// M3). Returns what was removed.
+pub fn discard_enrolment_beside(key_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    for path in [hello_file_beside(key_path), hello_age_beside(key_path)] {
+        if remove_if_there(&path)? {
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 // ---------------------------------------------------------------------------------------------
-// The route seam.
+// The Windows Hello seam.
 // ---------------------------------------------------------------------------------------------
 
-/// The route-specific calls (P4a-R38), one seam: [`WindowsHello`] for real, a fake in tests.
-/// `message` is what the window that owns the prompt says.
+/// The Windows Hello calls (P4a-R38), one seam: [`WindowsHello`] for real, a fake in tests.
+/// `shown` is what the window that owns the prompt shows.
 pub trait HelloPlatform {
     /// Whether Windows Hello is set up for this user. No prompt.
     fn supported(&self) -> bool;
-    /// Whether a Windows Hello key would be held in hardware (a TPM 2.0 is present). No prompt.
+    /// Whether a TPM 2.0 is present (Windows Hello normally keeps its keys there). No prompt.
     fn hardware_held(&self) -> bool;
-    /// KEK route: creates (or replaces) the key credential. Prompts.
-    fn kek_enroll(&self, credential: &str, message: &str) -> io::Result<()>;
-    /// KEK route: the KEK from the credential's signature over `challenge`. Prompts.
+    /// Creates (or replaces) the key credential. Prompts. An error when its window can't be
+    /// brought to the front or the prompt isn't answered in time.
+    fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()>;
+    /// The KEK from the credential's signature over `challenge`. Prompts; errors as above.
     fn kek_derive(
         &self,
         credential: &str,
         challenge: &[u8; 32],
-        message: &str,
+        shown: &str,
     ) -> io::Result<Zeroizing<[u8; 32]>>;
-    /// KEK route: deletes the key credential; one that isn't there is fine. No prompt.
+    /// Deletes the key credential; one that isn't there is fine. No prompt.
     fn kek_remove(&self, credential: &str) -> io::Result<()>;
-    /// DPAPI route's gate: `true` when Windows Hello verified you. Prompts.
-    fn consent(&self, message: &str) -> io::Result<bool>;
-    /// DPAPI route: protects for this Windows user. No prompt.
-    fn dpapi_protect(&self, data: &[u8]) -> io::Result<Vec<u8>>;
-    /// DPAPI route: unprotects. No prompt.
-    fn dpapi_unprotect(&self, blob: &[u8]) -> io::Result<Zeroizing<Vec<u8>>>;
 }
 
-/// The real Windows Hello (`lil_platform::hello`). Every prompt is owned by a window this
-/// process opens and brings to the front ([`lil_platform::hello::OwnerWindow`]), never the
-/// console (P4a-R38).
+/// The real Windows Hello (`lil_platform::hello`): every prompt is owned by a window this
+/// process opens and brings to the front, never the console; Windows Hello isn't used when that
+/// window can't get to the front (QA-088), and a prompt is cancelled after `HELLO_WAIT`.
 pub struct WindowsHello;
-
-fn owned<T>(message: &str, call: impl FnOnce(isize) -> io::Result<T>) -> io::Result<T> {
-    let window = lil_platform::hello::OwnerWindow::open("LILITH: Windows Hello", message)?;
-    window.bring_to_front();
-    call(window.hwnd())
-}
 
 impl HelloPlatform for WindowsHello {
     fn supported(&self) -> bool {
@@ -260,34 +257,19 @@ impl HelloPlatform for WindowsHello {
     fn hardware_held(&self) -> bool {
         lil_platform::hello::tpm_present()
     }
-    fn kek_enroll(&self, credential: &str, message: &str) -> io::Result<()> {
-        owned(message, |hwnd| {
-            lil_platform::hello::kek_enroll_for_window(hwnd, credential)
-        })
+    fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()> {
+        lil_platform::hello::kek_enroll(credential, shown)
     }
     fn kek_derive(
         &self,
         credential: &str,
         challenge: &[u8; 32],
-        message: &str,
+        shown: &str,
     ) -> io::Result<Zeroizing<[u8; 32]>> {
-        owned(message, |hwnd| {
-            lil_platform::hello::kek_derive_for_window(hwnd, credential, challenge)
-        })
+        lil_platform::hello::kek_derive(credential, challenge, shown)
     }
     fn kek_remove(&self, credential: &str) -> io::Result<()> {
         lil_platform::hello::kek_remove(credential)
-    }
-    fn consent(&self, message: &str) -> io::Result<bool> {
-        owned(message, |hwnd| {
-            lil_platform::hello::consent_for_window(hwnd, message)
-        })
-    }
-    fn dpapi_protect(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        lil_platform::hello::dpapi_protect(data)
-    }
-    fn dpapi_unprotect(&self, blob: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
-        lil_platform::hello::dpapi_unprotect(blob)
     }
 }
 
@@ -340,14 +322,27 @@ impl Unlocker for PassphraseUnlocker<'_> {
     }
 }
 
-/// The Windows Hello path for an enrolment: the KEK route signs the challenge and opens
-/// `app-key.hello.age`; the DPAPI route asks for consent and then unprotects `app-key.dpapi`.
-/// Whatever goes wrong is [`KeyError::Cancelled`] or [`KeyError::Unavailable`], after `say`
-/// has told you why.
+/// The passphrase path where there is no terminal: nobody can type it, so it unlocks nothing
+/// (and the console, which `rpassword` would open directly, is never read).
+pub struct NoTerminal<'a> {
+    pub say: &'a dyn Fn(&str),
+}
+
+impl Unlocker for NoTerminal<'_> {
+    fn unlock(&self) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        (self.say)("There is no terminal here to type the passphrase into.");
+        Err(KeyError::Unavailable)
+    }
+}
+
+/// Windows Hello for an enrolment: signs the challenge and opens `app-key.hello.age`. Whatever
+/// goes wrong is [`KeyError::Cancelled`] or [`KeyError::Unavailable`], after `say` has told you
+/// why.
 pub struct HelloUnlocker<'a> {
     file: HelloFile,
     sealed: Vec<u8>,
     platform: &'a dyn HelloPlatform,
+    /// What the owner window shows when nothing more specific is given.
     message: String,
     say: &'a dyn Fn(&str),
 }
@@ -356,50 +351,46 @@ fn hello_error(say: &dyn Fn(&str), e: &io::Error) -> KeyError {
     if e.kind() == io::ErrorKind::Interrupted {
         KeyError::Cancelled
     } else {
-        say(&format!("Windows Hello failed: {e}."));
+        say(&format!("Windows Hello isn't used: {e}."));
         KeyError::Unavailable
+    }
+}
+
+impl HelloUnlocker<'_> {
+    /// Unlocks with the owner window showing `shown`.
+    pub fn unlock_showing(&self, shown: &str) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        let kek = self
+            .platform
+            .kek_derive(&self.file.credential, &self.file.challenge, shown)
+            .map_err(|e| hello_error(self.say, &e))?;
+        let passphrase = hex(&kek[..]);
+        drop(kek);
+        decrypt_key(&self.sealed, &passphrase)
+            .map(Zeroizing::new)
+            .map_err(|_| {
+                (self.say)("Windows Hello answered, but its key doesn't open app-key.hello.age.");
+                KeyError::Unavailable
+            })
     }
 }
 
 impl Unlocker for HelloUnlocker<'_> {
     fn unlock(&self) -> Result<Zeroizing<Vec<u8>>, KeyError> {
-        match self.file.route {
-            Route::Kek => {
-                let kek = self
-                    .platform
-                    .kek_derive(&self.file.credential, &self.file.challenge, &self.message)
-                    .map_err(|e| hello_error(self.say, &e))?;
-                let passphrase = hex(&kek[..]);
-                drop(kek);
-                decrypt_key(&self.sealed, &passphrase)
-                    .map(Zeroizing::new)
-                    .map_err(|_| {
-                        (self.say)(&format!(
-                            "Windows Hello answered, but its key doesn't open {}.",
-                            HELLO_AGE_NAME
-                        ));
-                        KeyError::Unavailable
-                    })
-            }
-            Route::Dpapi => {
-                if !self
-                    .platform
-                    .consent(&self.message)
-                    .map_err(|e| hello_error(self.say, &e))?
-                {
-                    return Err(KeyError::Cancelled);
-                }
-                self.platform.dpapi_unprotect(&self.sealed).map_err(|e| {
-                    (self.say)(&format!("DPAPI couldn't open {DPAPI_NAME}: {e}."));
-                    KeyError::Unavailable
-                })
-            }
-        }
+        self.unlock_showing(&self.message)
     }
 }
 
-const HELLO_AGE_NAME: &str = "app-key.hello.age";
-const DPAPI_NAME: &str = "app-key.dpapi";
+/// A [`HelloUnlocker`] that shows a given text.
+struct Showing<'a, 'h> {
+    hello: &'a HelloUnlocker<'h>,
+    shown: &'a str,
+}
+
+impl Unlocker for Showing<'_, '_> {
+    fn unlock(&self) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        self.hello.unlock_showing(self.shown)
+    }
+}
 
 /// The enrolment in `profile`, read and checked: `Ok(None)` when there is none.
 fn read_enrolment(profile: &Path) -> Result<Option<(HelloFile, Vec<u8>)>> {
@@ -408,17 +399,18 @@ fn read_enrolment(profile: &Path) -> Result<Option<(HelloFile, Vec<u8>)>> {
         return Ok(None);
     }
     let file = HelloFile::load(&path)?;
-    let sealed_path = sealed_path_in(profile, file.route);
+    let sealed_path = hello_age_path_in(profile);
     let sealed = std::fs::read(&sealed_path)
         .with_context(|| format!("reading {}", sealed_path.display()))?;
-    if file.route == Route::Kek && check_encrypted(&sealed).is_err() {
+    if check_encrypted(&sealed).is_err() {
         bail!("{} is not an age passphrase file", sealed_path.display());
     }
     Ok(Some((file, sealed)))
 }
 
 /// Windows Hello for an approval or a merge, when you enrolled it: `None` when you didn't, or
-/// when its files are damaged (then `say` tells you, and the passphrase is used).
+/// when its files are damaged (then `say` tells you, and the passphrase is used). `message` is
+/// what its window shows unless the caller gives more ([`HelloUnlocker::unlock_showing`]).
 pub fn enrolled_hello<'a>(
     profile: &Path,
     platform: &'a dyn HelloPlatform,
@@ -475,10 +467,13 @@ pub trait Authenticator {
     fn authenticate(&self, summary: &str, audit: &str) -> Result<Zeroizing<Vec<u8>>, KeyError>;
 }
 
-/// The real [`Authenticator`]: `show` gets the summary and the audit before anything prompts.
+/// The real [`Authenticator`]. The summary and the audit, made safe to show by `render`, go to
+/// `show` (the terminal) and to the window that owns the Windows Hello prompt, before anything
+/// prompts.
 pub struct KeyAuthenticator<'a> {
     show: &'a dyn Fn(&str),
-    hello: Option<&'a dyn Unlocker>,
+    render: &'a dyn Fn(&str) -> String,
+    hello: Option<&'a HelloUnlocker<'a>>,
     passphrase: &'a dyn Unlocker,
     say: &'a dyn Fn(&str),
 }
@@ -486,12 +481,14 @@ pub struct KeyAuthenticator<'a> {
 impl<'a> KeyAuthenticator<'a> {
     pub fn new(
         show: &'a dyn Fn(&str),
-        hello: Option<&'a dyn Unlocker>,
+        render: &'a dyn Fn(&str) -> String,
+        hello: Option<&'a HelloUnlocker<'a>>,
         passphrase: &'a dyn Unlocker,
         say: &'a dyn Fn(&str),
     ) -> Self {
         Self {
             show,
+            render,
             hello,
             passphrase,
             say,
@@ -499,19 +496,43 @@ impl<'a> KeyAuthenticator<'a> {
     }
 }
 
-/// What you read before you authenticate.
+/// The mark in front of every line someone else wrote (an agent's summary, the audit), so it
+/// can't pass for lil's own lines (Task 28 review, M9).
+pub const QUOTE: &str = "  | ";
+
+/// `text`'s lines, each behind [`QUOTE`].
+pub fn quoted(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.trim_end().lines() {
+        out.push_str(QUOTE);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// What you read before you authenticate: the summary, then the audit, quoted.
 pub fn presentation(summary: &str, audit: &str) -> String {
     format!(
-        "{}\n\nIndependent audit:\n{}\n",
+        "{}\n\nIndependent audit:\n{}",
         summary.trim_end(),
-        audit.trim_end()
+        quoted(audit)
     )
 }
 
 impl Authenticator for KeyAuthenticator<'_> {
     fn authenticate(&self, summary: &str, audit: &str) -> Result<Zeroizing<Vec<u8>>, KeyError> {
-        (self.show)(&presentation(summary, audit));
-        unlock_reviewer_key(self.hello, self.passphrase, self.say)
+        let shown = (self.render)(&presentation(summary, audit));
+        (self.show)(&shown);
+        let hello = self.hello.map(|hello| Showing {
+            hello,
+            shown: &shown,
+        });
+        unlock_reviewer_key(
+            hello.as_ref().map(|h| h as &dyn Unlocker),
+            self.passphrase,
+            self.say,
+        )
     }
 }
 
@@ -519,10 +540,10 @@ impl Authenticator for KeyAuthenticator<'_> {
 // enroll, status, remove.
 // ---------------------------------------------------------------------------------------------
 
-/// Enrols Windows Hello on `route`: decrypts `app-key.age` with your passphrase first (a wrong
-/// passphrase stops here, before Windows Hello is asked), then seals the same PEM for the route
-/// and writes the Hello file last. `app-key.age` is only read. On any failure the files written
-/// so far, and the credential, are removed again.
+/// Enrols Windows Hello: decrypts `app-key.age` with your passphrase first (a wrong passphrase
+/// stops here, before Windows Hello is asked), then seals the same PEM under the KEK and writes
+/// the Hello file last. `app-key.age` is only read. On any failure the files written so far, and
+/// the credential, are removed again.
 pub fn enroll(
     profile: &Path,
     route: Route,
@@ -553,41 +574,24 @@ pub fn enroll(
             "Windows Hello isn't set up for your Windows account; set it up in Settings, Accounts, Sign-in options, then try again. Nothing was written"
         );
     }
-    let sealed_path = sealed_path_in(profile, route);
-    let message = "LILITH: set up Windows Hello for the reviewer key";
+    let sealed_path = hello_age_path_in(profile);
+    let shown = "LILITH: set up Windows Hello for the reviewer key.\n\nWindows Hello asks twice: once to create the key, once to sign with it.";
     let written = (|| -> Result<()> {
-        let sealed = match route {
-            Route::Kek => {
-                say("Windows Hello asks twice: once to create the key, once to sign with it.");
-                platform
-                    .kek_enroll(CREDENTIAL, message)
-                    .map_err(|e| anyhow!("Windows Hello didn't create the key: {e}"))?;
-                let kek = platform
-                    .kek_derive(CREDENTIAL, &challenge, message)
-                    .map_err(|e| anyhow!("Windows Hello didn't sign: {e}"))?;
-                let passphrase = hex(&kek[..]);
-                drop(kek);
-                let sealed = encrypt_key_with_work_factor(&pem, &passphrase, log_n)?;
-                // The sealed copy must open with the same KEK before it replaces anything.
-                let back = Zeroizing::new(decrypt_key(&sealed, &passphrase)?);
-                if back[..] != pem[..] {
-                    bail!("the sealed key didn't read back the same");
-                }
-                sealed
-            }
-            Route::Dpapi => {
-                let sealed = platform
-                    .dpapi_protect(&pem)
-                    .map_err(|e| anyhow!("DPAPI couldn't protect the key: {e}"))?;
-                let back = platform
-                    .dpapi_unprotect(&sealed)
-                    .map_err(|e| anyhow!("DPAPI couldn't read the key back: {e}"))?;
-                if back[..] != pem[..] {
-                    bail!("the protected key didn't read back the same");
-                }
-                sealed
-            }
-        };
+        say("Windows Hello asks twice: once to create the key, once to sign with it.");
+        platform
+            .kek_enroll(CREDENTIAL, shown)
+            .map_err(|e| anyhow!("Windows Hello didn't create the key: {e}"))?;
+        let kek = platform
+            .kek_derive(CREDENTIAL, &challenge, shown)
+            .map_err(|e| anyhow!("Windows Hello didn't sign: {e}"))?;
+        let passphrase = hex(&kek[..]);
+        drop(kek);
+        let sealed = encrypt_key_with_work_factor(&pem, &passphrase, log_n)?;
+        // The sealed copy must open with the same KEK before it replaces anything.
+        let back = Zeroizing::new(decrypt_key(&sealed, &passphrase)?);
+        if back[..] != pem[..] {
+            bail!("the sealed key didn't read back the same");
+        }
         write_atomic(&sealed_path, &sealed)?;
         let file = HelloFile {
             route,
@@ -599,16 +603,14 @@ pub fn enroll(
     if let Err(e) = written {
         let _ = remove_if_there(&sealed_path);
         let _ = remove_if_there(&hello_file_path_in(profile));
-        if route == Route::Kek {
-            let _ = platform.kek_remove(CREDENTIAL);
-        }
+        let _ = platform.kek_remove(CREDENTIAL);
         return Err(e.context("nothing was enrolled"));
     }
     Ok(())
 }
 
 /// What `lil dev reviewer-hello status` prints: the passphrase file, the route, and whether the
-/// key is hardware-held (never "hardware-bound" without a TPM, QA-088). Never prompts.
+/// key is likely hardware-held (never "hardware-bound", QA-088). Never prompts.
 pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
     let key = key_path_in(profile);
     let mut out = vec![format!(
@@ -620,30 +622,20 @@ pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
         Ok(None) => out.push(
             "Windows Hello: not enrolled; approvals and merges ask for the passphrase.".into(),
         ),
-        Ok(Some((file, _))) => match file.route {
-            Route::Kek => {
-                out.push(format!(
-                    "Windows Hello: enrolled, route KEK: the key credential {} signs a fixed challenge, and a key derived from that signature opens {}.",
-                    file.credential,
-                    hello_age_path_in(profile).display()
-                ));
-                out.push(if platform.hardware_held() {
-                    "Key storage: hardware-held: yes (a TPM 2.0 is present, and Windows Hello keeps its key in it).".into()
-                } else {
-                    "Key storage: hardware-held: no (no TPM 2.0 was found, so the Windows Hello key is held in software).".into()
-                });
-            }
-            Route::Dpapi => {
-                out.push(format!(
-                    "Windows Hello: enrolled, route DPAPI: {} is protected for your Windows account, and Windows Hello's consent prompt gates it (a check in the UI, not encryption).",
-                    dpapi_path_in(profile).display()
-                ));
-                out.push(
-                    "Key storage: hardware-held: no (DPAPI is held in software, under your Windows sign-in)."
-                        .into(),
-                );
-            }
-        },
+        Ok(Some((file, _))) => {
+            out.push(format!(
+                "Windows Hello: enrolled, route KEK: the key credential {} signs a fixed challenge, and a key derived from that signature opens {}.",
+                file.credential,
+                hello_age_path_in(profile).display()
+            ));
+            // Windows Hello normally keeps its keys in the TPM when there is one, but can fall
+            // back to software; this isn't checked per key (Task 28 review, M1).
+            out.push(if platform.hardware_held() {
+                "Key storage: hardware-held: probably (a TPM 2.0 is present, and Windows Hello normally keeps its key in it; not checked for this key).".into()
+            } else {
+                "Key storage: hardware-held: no (no TPM 2.0 was found, so the Windows Hello key is held in software).".into()
+            });
+        }
         Err(e) => out.push(format!(
             "Windows Hello: its files are damaged ({}); approvals and merges ask for the passphrase. Run `lil dev reviewer-hello remove`, then enroll again.",
             one_line(&format!("{e:#}"))
@@ -660,31 +652,26 @@ pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
     out
 }
 
-/// Removes the Windows Hello files and the key credential; `app-key.age` stays. A damaged
-/// enrolment is removed too (the credential then also, in case it was the KEK route). Returns
-/// what was removed.
+/// Removes the Windows Hello files, then the key credential; `app-key.age` stays. A damaged
+/// enrolment is removed too. The files go first, so a credential that can't be removed (Windows
+/// Hello switched off) never keeps them; that failure is then the error. Returns what was
+/// removed.
 pub fn remove(profile: &Path, platform: &dyn HelloPlatform) -> Result<Vec<String>> {
-    let route = HelloFile::load(&hello_file_path_in(profile))
-        .ok()
-        .map(|f| f.route);
-    let enrolled_somehow = route.is_some()
-        || hello_file_path_in(profile).exists()
-        || hello_age_path_in(profile).exists();
+    let enrolled_somehow =
+        hello_file_path_in(profile).exists() || hello_age_path_in(profile).exists();
     let mut removed = Vec::new();
-    if route == Some(Route::Kek) || (route.is_none() && enrolled_somehow) {
-        platform.kek_remove(CREDENTIAL).map_err(|e| {
-            anyhow!("removing the Windows Hello key credential {CREDENTIAL} failed: {e}")
-        })?;
-        removed.push(format!("the Windows Hello key credential {CREDENTIAL}"));
-    }
-    for path in [
-        hello_file_path_in(profile),
-        hello_age_path_in(profile),
-        dpapi_path_in(profile),
-    ] {
+    for path in [hello_file_path_in(profile), hello_age_path_in(profile)] {
         if remove_if_there(&path)? {
             removed.push(path.display().to_string());
         }
+    }
+    if enrolled_somehow {
+        platform.kek_remove(CREDENTIAL).map_err(|e| {
+            anyhow!(
+                "the Windows Hello files are removed, but removing the key credential {CREDENTIAL} failed: {e}"
+            )
+        })?;
+        removed.push(format!("the Windows Hello key credential {CREDENTIAL}"));
     }
     Ok(removed)
 }
@@ -721,7 +708,7 @@ pub fn run_enroll() -> i32 {
     }
     let Some(route) = PROVEN_ROUTE else {
         return fail(&anyhow!(
-            "Windows Hello's route isn't settled yet (plan 4a Task 28's route step); approvals and merges keep asking for the passphrase. Nothing was written"
+            "Windows Hello's route isn't proven yet (plan 4a Task 28's route step); approvals and merges keep asking for the passphrase. Nothing was written"
         ));
     };
     let result = reviewer_key::user_profile().and_then(|profile| {
