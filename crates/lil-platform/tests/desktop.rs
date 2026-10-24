@@ -75,6 +75,11 @@ fn split_first_argument_keeps_the_rest_untouched() {
 fn leftover_names_give_the_desktop_test_id() {
     use lil_platform::desktop::desktop_test_id_in;
     let id = Some("desktop-0123456789abcdef".to_string());
+    // The host toast tests' fixed id is swept like any other.
+    assert_eq!(
+        desktop_test_id_in(&format!("lil-test-{HOST_TOAST_TEST_ID}")).as_deref(),
+        Some(HOST_TOAST_TEST_ID)
+    );
     for name in [
         "lil-test-desktop-0123456789abcdef",
         "LILITH-test-desktop-0123456789abcdef",
@@ -400,8 +405,13 @@ fn desktop_env(dir: &Path) -> Env {
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).unwrap();
     let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    env_with_id(&format!("{DESKTOP_TEST_ID_PREFIX}{id}"), dir)
+}
+
+/// The test channel `test-<id>`, its roots in `dir`.
+fn env_with_id(id: &str, dir: &Path) -> Env {
     Env::with_roots(
-        Channel::Test(format!("{DESKTOP_TEST_ID_PREFIX}{id}")),
+        Channel::Test(id.to_string()),
         Roots {
             roaming: dir.join("roaming"),
             local: dir.join("local"),
@@ -428,16 +438,29 @@ impl Drop for Cleanup<'_> {
             toast_history_tags, unregister_handlers,
         };
         let env = self.env;
-        let removed = [
+        let mut removed = vec![
             ("the shortcut", remove_shortcut(env)),
-            (
-                "the notification settings",
-                remove_notification_settings(env),
-            ),
             ("the handlers", unregister_handlers(env)),
             ("the registry root", remove_test_registry(env)),
             ("the toast history", clear_toast_history(env)),
         ];
+        // Windows' notification settings entry goes last: the notification platform writes it
+        // after a toast (and after the History is cleared), a moment later, so it is removed
+        // until it stays gone, within the desktop group's deadline; the check below fails if it
+        // never does.
+        let deadline = Instant::now() + DESKTOP_DEADLINE;
+        let settings_removed = loop {
+            if let Err(e) = remove_notification_settings(env) {
+                break Err(e);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let back = leftover_registrations(env)
+                .is_ok_and(|keys| keys.iter().any(|k| k.contains(r"\Notifications\Settings\")));
+            if !back || Instant::now() >= deadline {
+                break Ok(());
+            }
+        };
+        removed.push(("the notification settings", settings_removed));
         let desktop = real_desktop(env);
         let any_exe = Path::new(r"C:\none\lil-image.exe");
         let mut left: Vec<String> = removed
@@ -493,12 +516,25 @@ fn eventually(what: &str, mut f: impl FnMut() -> bool, context: impl Fn() -> Str
 /// the test channel's name, so Windows knows its AUMID (Task 1's S1.2). Its CLSID is registered
 /// under the shell's classes root, where COM reads it (Appendix G, P4a-R37), through the
 /// desktop group's opt-in, which writes the scheme and the CLSID only, never `.lilref`.
+///
+/// The host toast tests share one fixed id per PC, [`HOST_TOAST_TEST_ID`] (plan 4a ruling
+/// 2026-10-24): Windows keeps a sender record for every AUMID that ever showed a toast (in
+/// Settings > System > Notifications), which nothing documented removes, so a random id per run
+/// would grow that list by two every run. With the fixed id it holds at most one test sender.
+/// Everything registered under it is still removed and checked gone after each test (`Cleanup`),
+/// and the host run's lock keeps two runs off it at once. On a PC whose notification platform
+/// never saw this AUMID, the first toast test starts from `NotYetShown`; on later runs Windows
+/// knows the sender and `Setting()` may read `Ready` from the start: both tests accept either.
 fn host_env(dir: &Path) -> Env {
     let programs = lil_platform::known_folders::programs().expect("FOLDERID_Programs");
-    desktop_env(dir)
+    env_with_id(HOST_TOAST_TEST_ID, dir)
         .with_programs_dir(programs)
         .with_shell_classes_root()
 }
+
+/// The host toast tests' fixed test channel id, in the desktop group's `desktop-<16 hex>` shape,
+/// so a killed run's leftovers are swept like any other.
+const HOST_TOAST_TEST_ID: &str = "desktop-00000000000000f1";
 
 #[test] // spec: APP-022, QA-042
 #[ignore = "desktop"]
@@ -574,6 +610,12 @@ fn desktop_toasts_state_is_ready_on_this_pc() {
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
     let state = || format!("toasts_state {:?}", desktop.toasts_state());
+    // Which one this run started from: NotYetShown on the fixed id's first run on a PC, Ready
+    // once Windows knows the sender (shown with --success-output).
+    eprintln!(
+        "{HOST_TOAST_TEST_ID}: toasts_state at the start {:?}",
+        desktop.toasts_state()
+    );
     // Before its first toast a fresh AUMID is `NotYetShown`, which may post (plan 4a ruling
     // 2026-10-24); after it, Windows reports the user's real setting, which must be `Enabled`.
     eventually(
