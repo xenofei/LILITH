@@ -1500,7 +1500,10 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     from_deny: is(child(ID_DENY)),
                     armed: sender != 0 && ARMED.load(std::sync::atomic::Ordering::SeqCst) == sender,
                     sent_by_another_thread: InSendMessage().as_bool(),
-                    enabled: accept.is_some_and(|b| IsWindowEnabled(b).as_bool()),
+                    // Enabled and live by our own clock: another program can enable the button
+                    // with EnableWindow, but it can't move the clock.
+                    enabled: accept.is_some_and(|b| IsWindowEnabled(b).as_bool())
+                        && LIVE.with(|c| c.get().is_live(Instant::now())),
                 };
                 if let Some(choice) = choice_from_command(command) {
                     record_choice(hwnd, choice);
