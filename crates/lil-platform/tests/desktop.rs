@@ -68,6 +68,73 @@ fn split_first_argument_keeps_the_rest_untouched() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The names a killed desktop run can leave behind (P4a-R39, Task 30's sweep).
+// ---------------------------------------------------------------------------------------------
+
+#[test] // spec: QA-042
+fn leftover_names_give_the_desktop_test_id() {
+    use lil_platform::desktop::desktop_test_id_in;
+    let id = Some("desktop-0123456789abcdef".to_string());
+    // The host toast tests' fixed id is swept like any other.
+    assert_eq!(
+        desktop_test_id_in(&format!("lil-test-{HOST_TOAST_TEST_ID}")).as_deref(),
+        Some(HOST_TOAST_TEST_ID)
+    );
+    for name in [
+        "lil-test-desktop-0123456789abcdef",
+        "LILITH-test-desktop-0123456789abcdef",
+        "LILITH (Test-desktop-0123456789abcdef).lnk",
+        "lilith (test-desktop-0123456789ABCDEF).LNK",
+        "LILITH.Suite.Test-desktop-0123456789abcdef",
+    ] {
+        assert_eq!(desktop_test_id_in(name), id, "{name}");
+    }
+    // The env's own names give the same id back.
+    let dir = tempfile::tempdir().unwrap();
+    let env = desktop_env(dir.path());
+    let Channel::Test(own) = env.channel().clone() else {
+        unreachable!()
+    };
+    let shortcut = env.start_menu_shortcut();
+    let shortcut = shortcut.file_name().unwrap().to_string_lossy();
+    let root = env.registry_root();
+    for name in [
+        env.activation_scheme().as_str(),
+        root.trim_start_matches(r"HKCU\Software\"),
+        &shortcut,
+        &env.notification_aumid(),
+    ] {
+        assert_eq!(
+            desktop_test_id_in(name).as_deref(),
+            Some(own.as_str()),
+            "{name}"
+        );
+    }
+    // Stable, dev, other test channels, other lengths and other characters: none.
+    for name in [
+        "lil",
+        "lil-dev",
+        "LILITH",
+        "LILITH-dev",
+        "LILITH.lnk",
+        "LILITH (Dev).lnk",
+        "LILITH.Suite.Stable",
+        "LILITH.Suite.Dev",
+        "LILITH.Suite.Test-0123456789abcdef",
+        "lil-test-0123456789abcdef",
+        "LILITH-test-a",
+        "lil-test-desktop-0123456789abcde",
+        "lil-test-desktop-0123456789abcdef0",
+        "lil-test-desktop-0123456789abcdeg",
+        "lil-test-desktop-0123456789abcdef.lnk",
+        "LILITH (Test-desktop-0123456789abcdef)",
+        "x-lil-test-desktop-0123456789abcdef",
+    ] {
+        assert_eq!(desktop_test_id_in(name), None, "{name}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // FakeDesktop (QA-066's test fakes).
 // ---------------------------------------------------------------------------------------------
 
@@ -129,6 +196,8 @@ fn fake_desktop_records_posts_and_removes() {
     fake.set_foreground(Some(4242));
     assert_eq!(fake.foreground_pid(), Some(4242));
     assert_eq!(fake.toasts_state(), ToastsState::Ready);
+    fake.set_toasts_state(ToastsState::NotYetShown);
+    assert_eq!(fake.toasts_state(), ToastsState::NotYetShown);
     fake.set_toasts_state(ToastsState::Unavailable("disabled_for_user"));
     assert_eq!(
         fake.toasts_state(),
@@ -262,6 +331,13 @@ fn toasts_state_maps_each_notifier_setting() {
             ToastsState::Unavailable("disabled_by_policy"),
         ),
         (None, false, ToastsState::Unavailable("no_platform")),
+        // Never shown a toast yet (plan 4a ruling 2026-10-24): postable, unless elevated.
+        (Some(NotYetShown), false, ToastsState::NotYetShown),
+        (
+            Some(NotYetShown),
+            true,
+            ToastsState::Unavailable("elevated"),
+        ),
         // Elevated: never ready, whatever the setting.
         (Some(Enabled), true, ToastsState::Unavailable("elevated")),
         (
@@ -278,6 +354,95 @@ fn toasts_state_maps_each_notifier_setting() {
             "{setting:?} elevated={elevated}"
         );
     }
+    assert!(ToastsState::Ready.can_post() && ToastsState::NotYetShown.can_post());
+    assert!(!ToastsState::Unavailable("disabled_for_user").can_post());
+}
+
+#[test] // spec: APP-022, ARCH-055
+fn not_yet_shown_restarts_after_any_other_reading() {
+    use lil_platform::desktop::{NOT_SHOWN_GRACE, NotShownEnd};
+    let s = Duration::from_secs;
+    let mut end = NotShownEnd::default();
+    // An Ok post that never shows: no platform once the grace has passed.
+    end.posted_ok(s(0));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(1)),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, NOT_SHOWN_GRACE),
+        ToastsState::Unavailable("no_platform")
+    );
+    // It showed after all: Ready, and the timer is cleared.
+    assert_eq!(end.state(ToastsState::Ready, s(6)), ToastsState::Ready);
+    // A later NotYetShown (a reset platform) starts afresh: postable, not no_platform at once.
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(100)),
+        ToastsState::NotYetShown
+    );
+    end.posted_ok(s(100));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(104)),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(105)),
+        ToastsState::Unavailable("no_platform")
+    );
+    // A Disabled reading clears it too.
+    let mut end = NotShownEnd::default();
+    end.posted_ok(s(0));
+    let off = ToastsState::Unavailable("disabled_for_user");
+    assert_eq!(end.state(off, s(10)), off);
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(11)),
+        ToastsState::NotYetShown
+    );
+    // A post made while Ready starts nothing: a reset platform read just after it is still
+    // postable, not no_platform.
+    let mut end = NotShownEnd::default();
+    assert_eq!(end.state(ToastsState::Ready, s(0)), ToastsState::Ready);
+    end.posted_ok(s(1));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(7)),
+        ToastsState::NotYetShown
+    );
+}
+
+#[test] // spec: APP-022, ARCH-055
+fn not_yet_shown_ends_when_an_ok_post_never_shows() {
+    use lil_platform::desktop::{NOT_SHOWN_GRACE, toasts_state_after_post};
+    let grace = NOT_SHOWN_GRACE;
+    assert_eq!(grace, Duration::from_secs(5));
+    let after = |state, since| toasts_state_after_post(state, since);
+    // Before any post, and within the grace after one: still postable.
+    assert_eq!(
+        after(ToastsState::NotYetShown, None),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        after(
+            ToastsState::NotYetShown,
+            Some(grace - Duration::from_millis(1))
+        ),
+        ToastsState::NotYetShown
+    );
+    // Still never shown 5 s after an Ok post: no platform, so confirmations answer at once.
+    for since in [grace, grace * 10] {
+        assert_eq!(
+            after(ToastsState::NotYetShown, Some(since)),
+            ToastsState::Unavailable("no_platform")
+        );
+    }
+    // Every other reading keeps its meaning.
+    for state in [
+        ToastsState::Ready,
+        ToastsState::Unavailable("disabled_for_user"),
+        ToastsState::Unavailable("elevated"),
+    ] {
+        assert_eq!(after(state, Some(grace * 2)), state);
+        assert_eq!(after(state, None), state);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -291,8 +456,13 @@ fn desktop_env(dir: &Path) -> Env {
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).unwrap();
     let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    env_with_id(&format!("{DESKTOP_TEST_ID_PREFIX}{id}"), dir)
+}
+
+/// The test channel `test-<id>`, its roots in `dir`.
+fn env_with_id(id: &str, dir: &Path) -> Env {
     Env::with_roots(
-        Channel::Test(format!("{DESKTOP_TEST_ID_PREFIX}{id}")),
+        Channel::Test(id.to_string()),
         Roots {
             roaming: dir.join("roaming"),
             local: dir.join("local"),
@@ -314,16 +484,34 @@ struct Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         use lil_platform::desktop::{
-            clear_toast_history, leftover_registrations, real_desktop, remove_shortcut,
-            remove_test_registry, toast_history_tags, unregister_handlers,
+            clear_toast_history, leftover_registrations, real_desktop,
+            remove_notification_settings, remove_shortcut, remove_test_registry,
+            toast_history_tags, unregister_handlers,
         };
         let env = self.env;
-        let removed = [
+        let mut removed = vec![
             ("the shortcut", remove_shortcut(env)),
             ("the handlers", unregister_handlers(env)),
             ("the registry root", remove_test_registry(env)),
             ("the toast history", clear_toast_history(env)),
         ];
+        // Windows' notification settings entry goes last: the notification platform writes it
+        // after a toast (and after the History is cleared), a moment later, so it is removed
+        // until it stays gone, within the desktop group's deadline; the check below fails if it
+        // never does.
+        let deadline = Instant::now() + DESKTOP_DEADLINE;
+        let settings_removed = loop {
+            if let Err(e) = remove_notification_settings(env) {
+                break Err(e);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let back = leftover_registrations(env)
+                .is_ok_and(|keys| keys.iter().any(|k| k.contains(r"\Notifications\Settings\")));
+            if !back || Instant::now() >= deadline {
+                break Ok(());
+            }
+        };
+        removed.push(("the notification settings", settings_removed));
         let desktop = real_desktop(env);
         let any_exe = Path::new(r"C:\none\lil-image.exe");
         let mut left: Vec<String> = removed
@@ -379,12 +567,25 @@ fn eventually(what: &str, mut f: impl FnMut() -> bool, context: impl Fn() -> Str
 /// the test channel's name, so Windows knows its AUMID (Task 1's S1.2). Its CLSID is registered
 /// under the shell's classes root, where COM reads it (Appendix G, P4a-R37), through the
 /// desktop group's opt-in, which writes the scheme and the CLSID only, never `.lilref`.
+///
+/// The host toast tests share one fixed id per PC, [`HOST_TOAST_TEST_ID`] (plan 4a ruling
+/// 2026-10-24): Windows keeps a sender record for every AUMID that ever showed a toast (in
+/// Settings > System > Notifications), which nothing documented removes, so a random id per run
+/// would grow that list by two every run. With the fixed id it holds at most one test sender.
+/// Everything registered under it is still removed and checked gone after each test (`Cleanup`),
+/// and the host run's lock keeps two runs off it at once. On a PC whose notification platform
+/// never saw this AUMID, the first toast test starts from `NotYetShown`; on later runs Windows
+/// knows the sender and `Setting()` may read `Ready` from the start: both tests accept either.
 fn host_env(dir: &Path) -> Env {
     let programs = lil_platform::known_folders::programs().expect("FOLDERID_Programs");
-    desktop_env(dir)
+    env_with_id(HOST_TOAST_TEST_ID, dir)
         .with_programs_dir(programs)
         .with_shell_classes_root()
 }
+
+/// The host toast tests' fixed test channel id, in the desktop group's `desktop-<16 hex>` shape,
+/// so a killed run's leftovers are swept like any other.
+const HOST_TOAST_TEST_ID: &str = "desktop-00000000000000f1";
 
 #[test] // spec: APP-022, QA-042
 #[ignore = "desktop"]
@@ -397,9 +598,10 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
     let exe = std::env::current_exe().unwrap();
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
+    // A fresh AUMID is `NotYetShown` until its first toast (plan 4a ruling 2026-10-24).
     eventually(
-        "toasts ready",
-        || desktop.toasts_state() == ToastsState::Ready,
+        "toasts postable",
+        || desktop.toasts_state().can_post(),
         || format!("toasts_state {:?}", desktop.toasts_state()),
     );
 
@@ -434,6 +636,12 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         },
         context,
     );
+    // Once a toast has shown, Windows has the AUMID's settings: `Setting()` is `Enabled`.
+    eventually(
+        "toasts ready after the first toast",
+        || desktop.toasts_state() == ToastsState::Ready,
+        context,
+    );
     desktop.remove(tag, "job_finished");
     eventually(
         "the toast gone from History",
@@ -452,11 +660,37 @@ fn desktop_toasts_state_is_ready_on_this_pc() {
     let exe = std::env::current_exe().unwrap();
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
-    eventually(
-        "toasts ready",
-        || desktop.toasts_state() == ToastsState::Ready,
-        || format!("toasts_state {:?}", desktop.toasts_state()),
+    let state = || format!("toasts_state {:?}", desktop.toasts_state());
+    // Which one this run started from: NotYetShown on the fixed id's first run on a PC, Ready
+    // once Windows knows the sender (shown with --success-output).
+    eprintln!(
+        "{HOST_TOAST_TEST_ID}: toasts_state at the start {:?}",
+        desktop.toasts_state()
     );
+    // Before its first toast a fresh AUMID is `NotYetShown`, which may post (plan 4a ruling
+    // 2026-10-24); after it, Windows reports the user's real setting, which must be `Enabled`.
+    eventually(
+        "toasts postable",
+        || desktop.toasts_state().can_post(),
+        state,
+    );
+    if desktop.toasts_state() == ToastsState::NotYetShown {
+        let tag = "j_00000000000000a6";
+        let xml = concat!(
+            r#"<toast><visual><binding template="ToastGeneric"><text>Desktop test</text>"#,
+            r#"<text>toasts state</text></binding></visual></toast>"#
+        );
+        desktop
+            .post(&toast(tag, "job_finished", xml, true))
+            .expect("the first toast posts");
+        eventually(
+            "toasts ready after the first toast",
+            || desktop.toasts_state() == ToastsState::Ready,
+            state,
+        );
+        desktop.remove(tag, "job_finished");
+    }
+    assert_eq!(desktop.toasts_state(), ToastsState::Ready);
 }
 
 /// The shortcut and handlers round trip, in the Sandbox, under both classes roots a test
@@ -468,8 +702,8 @@ fn desktop_toasts_state_is_ready_on_this_pc() {
 #[ignore = "desktop"]
 fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
     use lil_platform::desktop::{
-        leftover_registrations, read_shortcut, register_handlers, remove_clsid_registration,
-        remove_shortcut, unregister_handlers, write_shortcut,
+        leftover_registrations, read_shortcut, register_handlers, remove_aumid_registration,
+        remove_clsid_registration, remove_shortcut, unregister_handlers, write_shortcut,
     };
     require_desktop_group(false);
     let dir = tempfile::tempdir().unwrap();
@@ -532,6 +766,14 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
     );
     write_shortcut(&env, &exe).unwrap();
     assert_eq!(desktop.shortcut_state(&env, &exe), ShortcutState::Ok);
+    // The AUMID's registration alone gone: wrong too (plan 4a ruling 2026-10-24).
+    remove_aumid_registration(&env).unwrap();
+    assert_eq!(
+        desktop.shortcut_state(&env, &exe),
+        ShortcutState::WrongClsid
+    );
+    write_shortcut(&env, &exe).unwrap();
+    assert_eq!(desktop.shortcut_state(&env, &exe), ShortcutState::Ok);
 
     // Another build of the channel holds the handlers.
     register_handlers(&env, &other).unwrap();
@@ -563,19 +805,102 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
         r"HKCU\Software\Classes\CLSID\{}",
         shell.toast_activator_clsid()
     );
+    let aumid = format!(
+        r"HKCU\Software\Classes\AppUserModelId\{}",
+        shell.notification_aumid()
+    );
     let mut written = leftover_registrations(&shell).unwrap();
     written.sort();
-    let mut want = vec![scheme, clsid];
+    let mut want = vec![scheme, clsid, aumid];
     want.sort();
     assert_eq!(
         written, want,
-        "only the scheme and the CLSID, never .lilref"
+        "only the scheme, the CLSID and the AUMID, never .lilref"
     );
     remove_shortcut(&shell).unwrap();
     unregister_handlers(&shell).unwrap();
     assert_eq!(
         leftover_registrations(&shell).unwrap(),
         Vec::<String>::new()
+    );
+}
+
+/// A killed run's orphans are found by their `LilTestChannel` marker, not only by name (Task 30's
+/// sweep): here the CLSID key and the AUMID key are each left alone, with every other name gone,
+/// and the sweep finds and removes them.
+#[test] // spec: APP-022, QA-042
+#[ignore = "desktop"]
+fn desktop_sweep_finds_orphaned_keys_by_their_marker() {
+    use lil_platform::desktop::{
+        desktop_test_ids_left, leftover_registrations, remove_aumid_registration,
+        remove_clsid_registration, sweep_desktop_tests, write_shortcut,
+    };
+    require_desktop_group(false);
+    let dir = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    for orphan in ["CLSID", "AppUserModelId"] {
+        let env = desktop_env(&dir.path().join(orphan)).with_shell_classes_root();
+        let _cleanup = Cleanup { env: &env };
+        let Channel::Test(id) = env.channel().clone() else {
+            unreachable!()
+        };
+        let lnk = env.start_menu_shortcut();
+        let programs = lnk.parent().unwrap().to_path_buf();
+        write_shortcut(&env, &exe).unwrap();
+        // Every other name gone: the shortcut, and the other key.
+        std::fs::remove_file(&lnk).unwrap();
+        if orphan == "CLSID" {
+            remove_aumid_registration(&env).unwrap();
+        } else {
+            remove_clsid_registration(&env).unwrap();
+        }
+        let left = leftover_registrations(&env).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].contains(&format!(r"\{orphan}\")), "{left:?}");
+        assert!(
+            desktop_test_ids_left(&programs).unwrap().contains(&id),
+            "the orphaned {orphan} key isn't found by its marker"
+        );
+        let sweep = sweep_desktop_tests(&programs).unwrap();
+        assert!(sweep.removed.contains(&left[0]), "{sweep:?}");
+        assert!(sweep.remaining.is_empty(), "{sweep:?}");
+        assert_eq!(leftover_registrations(&env).unwrap(), Vec::<String>::new());
+        assert!(!desktop_test_ids_left(&programs).unwrap().contains(&id));
+    }
+}
+
+/// The marker only nominates an id: the sweep removes that id's own names, never the key that
+/// carries the marker (unless it is one of them).
+#[test] // spec: QA-042
+#[ignore = "desktop"]
+fn desktop_sweep_leaves_a_foreign_marked_key() {
+    use lil_platform::desktop::{TEST_MARKER, desktop_test_ids_left, sweep_desktop_tests};
+    require_desktop_group(false);
+    let dir = tempfile::tempdir().unwrap();
+    let env = desktop_env(dir.path()).with_shell_classes_root();
+    let _cleanup = Cleanup { env: &env };
+    let Channel::Test(id) = env.channel().clone() else {
+        unreachable!()
+    };
+    let programs = dir.path().join("programs");
+    let foreign = r"HKCU\Software\Classes\LilForeignMarkedKey";
+    let reg = |args: &[&str]| {
+        let out = std::process::Command::new("reg")
+            .args(args)
+            .output()
+            .unwrap();
+        out.status.success()
+    };
+    assert!(reg(&["add", foreign, "/v", TEST_MARKER, "/d", &id, "/f"]));
+    let found = desktop_test_ids_left(&programs).unwrap().contains(&id);
+    let sweep = sweep_desktop_tests(&programs);
+    let survived = reg(&["query", foreign]);
+    assert!(reg(&["delete", foreign, "/f"]));
+    assert!(found, "the marker nominates its id");
+    sweep.unwrap();
+    assert!(
+        survived,
+        "the sweep deleted a key that isn't one of the id's names"
     );
 }
 

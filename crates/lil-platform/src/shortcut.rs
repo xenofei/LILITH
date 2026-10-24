@@ -6,6 +6,12 @@
 //! removed with the shortcut. The CLSID only keeps a missed toast in the notification centre:
 //! every toast activates by protocol, and no COM activator runs.
 //!
+//! With them the AUMID itself is registered per user, `<classes root>\AppUserModelId\<AUMID>`
+//! with `DisplayName` and `CustomActivator` = the CLSID (Appendix G, plan 4a ruling
+//! 2026-10-24): a toast posts with only this key (Task 1's S1.2), so a new install's first
+//! toast works before the Start-menu index has the shortcut. On a test channel each key carries
+//! [`crate::classes::TEST_MARKER`].
+//!
 //! The shortcut goes through `IShellLinkW` and its `IPropertyStore`, as Task 1's spike wrote
 //! and read it back (S1.2p). The COM calls run on a short thread of their own with a
 //! single-threaded apartment, so the caller's thread keeps whatever apartment it has.
@@ -29,10 +35,11 @@ use windows::Win32::UI::Shell::{IShellLinkW, SHStrDupW, ShellLink};
 use windows::core::{BSTR, GUID, HSTRING, Interface};
 
 use crate::classes::{
-    delete_tree, get_string, hkcu_subkey, quoted, require_test_channel, set_string,
+    KeyWrite, apply, delete_tree, get_string, hkcu_subkey, marker, quoted, require_test_channel,
 };
 use crate::desktop::{ShortcutState, same_path};
-use crate::env::Env;
+use crate::env::{Channel, Env};
+use crate::names;
 use crate::process::io_error;
 
 /// What a shortcut says, read back.
@@ -96,9 +103,27 @@ fn clsid_key(env: &Env) -> io::Result<String> {
     ))
 }
 
-/// Writes the channel's AUMID shortcut to `exe`, with its AUMID and CLSID, and registers the
-/// CLSID's `LocalServer32` under the classes root (P4a-R26: only after your own input). An
-/// existing shortcut is replaced.
+/// `HKCU`'s subkey of `<classes root>\AppUserModelId\<AUMID>`.
+fn aumid_key(env: &Env) -> io::Result<String> {
+    Ok(format!(
+        r"{}\AppUserModelId\{}",
+        hkcu_subkey(&env.classes_root())?,
+        env.notification_aumid()
+    ))
+}
+
+/// The AUMID's `DisplayName`: `LILITH` for stable, `LILITH (<Channel>)` otherwise.
+fn display_name(env: &Env) -> String {
+    match env.channel() {
+        Channel::Stable => names::APP_NAME.to_string(),
+        other => format!("{} ({})", names::APP_NAME, other.capitalised()),
+    }
+}
+
+/// Writes the channel's AUMID shortcut to `exe`, with its AUMID and CLSID, registers the
+/// CLSID's `LocalServer32` and the AUMID (`DisplayName`, `CustomActivator`) under the classes
+/// root (P4a-R26: only after your own input). An existing shortcut is replaced. No channel has
+/// an icon file yet, so no `IconUri` is written.
 pub fn write_shortcut(env: &Env, exe: &Path) -> io::Result<()> {
     let lnk = env.start_menu_shortcut();
     let aumid = env.notification_aumid();
@@ -108,11 +133,34 @@ pub fn write_shortcut(env: &Env, exe: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     with_com(|| save(&lnk, exe, &aumid, clsid)).map_err(|e| io_error(&e))?;
-    set_string(
-        &format!(r"{}\LocalServer32", clsid_key(env)?),
+    apply(&key_writes(env, &server)?)
+}
+
+/// The registry writes of [`write_shortcut`], in order: the CLSID's `LocalServer32` (`server`,
+/// the quoted exe) and the AUMID's registration. On a test channel each key's marker comes
+/// first, so a run killed between two writes leaves a key the sweep finds.
+fn key_writes(env: &Env, server: &str) -> io::Result<Vec<KeyWrite>> {
+    let mut w = Vec::new();
+    let clsid_key = clsid_key(env)?;
+    marker(env, &clsid_key, &mut w);
+    w.push(KeyWrite::new(
+        &format!(r"{clsid_key}\LocalServer32"),
         None,
-        &server,
-    )
+        server,
+    ));
+    let aumid_key = aumid_key(env)?;
+    marker(env, &aumid_key, &mut w);
+    w.push(KeyWrite::new(
+        &aumid_key,
+        Some("DisplayName"),
+        &display_name(env),
+    ));
+    w.push(KeyWrite::new(
+        &aumid_key,
+        Some("CustomActivator"),
+        &env.toast_activator_clsid(),
+    ));
+    Ok(w)
 }
 
 fn save(lnk: &Path, exe: &Path, aumid: &str, clsid: GUID) -> windows::core::Result<()> {
@@ -175,15 +223,24 @@ fn load(lnk: &Path) -> windows::core::Result<ShortcutInfo> {
     }
 }
 
-/// Removes a test channel's shortcut and its CLSID registration; missing ones are no error.
-/// Refused, before anything is read or written, on a stable or dev channel.
+/// Removes a test channel's shortcut, its CLSID registration and its AUMID registration;
+/// missing ones are no error. Refused, before anything is read or written, on a stable or dev
+/// channel.
 pub fn remove_shortcut(env: &Env) -> io::Result<()> {
     require_test_channel(env, "removing the shortcut")?;
     match std::fs::remove_file(env.start_menu_shortcut()) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    remove_clsid_registration(env)
+    remove_clsid_registration(env)?;
+    remove_aumid_registration(env)
+}
+
+/// Removes only a test channel's AUMID registration, `<classes root>\AppUserModelId\<AUMID>`,
+/// by its exact name. Refused, before anything is read or written, on a stable or dev channel.
+pub fn remove_aumid_registration(env: &Env) -> io::Result<()> {
+    require_test_channel(env, "removing the AUMID registration")?;
+    delete_tree(&aumid_key(env)?)
 }
 
 /// Removes only a test channel's CLSID registration, `<classes root>\CLSID\{<CLSID>}`.
@@ -194,7 +251,9 @@ pub fn remove_clsid_registration(env: &Env) -> io::Result<()> {
 }
 
 /// The shortcut's state for `exe`, checked in this order: there, its target, its AUMID, then
-/// its CLSID and that CLSID's `LocalServer32` (P4a-R37).
+/// its CLSID, that CLSID's `LocalServer32` (P4a-R37) and the AUMID's registration, read back
+/// (`DisplayName`, and `CustomActivator` naming the CLSID; plan 4a ruling 2026-10-24). A
+/// missing or different registration is `WrongClsid`.
 pub(crate) fn state(env: &Env, exe: &Path) -> ShortcutState {
     let lnk = env.start_menu_shortcut();
     if matches!(lnk.try_exists(), Ok(false)) {
@@ -217,7 +276,12 @@ pub(crate) fn state(env: &Env, exe: &Path) -> ShortcutState {
         .toast_activator_clsid
         .is_some_and(|c| c.eq_ignore_ascii_case(&clsid))
         && registered.is_some_and(|server| same_path(Path::new(&server), exe));
-    if clsid_ok {
+    let aumid_ok = aumid_key(env).ok().is_some_and(|key| {
+        get_string(&key, Some("DisplayName")).as_deref() == Some(display_name(env).as_str())
+            && get_string(&key, Some("CustomActivator"))
+                .is_some_and(|c| c.eq_ignore_ascii_case(&clsid))
+    });
+    if clsid_ok && aumid_ok {
         ShortcutState::Ok
     } else {
         ShortcutState::WrongClsid
@@ -227,6 +291,28 @@ pub(crate) fn state(env: &Env, exe: &Path) -> ShortcutState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: APP-022, QA-042
+    fn the_clsid_and_aumid_keys_are_marked_before_their_values() {
+        let env = Env::with_roots(
+            Channel::Test("desktop-0123456789abcdef".into()),
+            crate::env::Roots {
+                roaming: PathBuf::from(r"C:\T\roaming"),
+                local: PathBuf::from(r"C:\T\local"),
+                user_profile: PathBuf::from(r"C:\T\profile"),
+            },
+            "S-1".into(),
+        );
+        for e in [env.clone(), env.with_shell_classes_root()] {
+            let writes = key_writes(&e, r#""C:\a\lil-image.exe""#).unwrap();
+            crate::classes::markers_come_first(&writes).unwrap();
+            let marked = writes
+                .iter()
+                .filter(|w| w.name.as_deref() == Some(crate::classes::TEST_MARKER))
+                .count();
+            assert_eq!(marked, 2, "the CLSID and the AUMID: {writes:?}");
+        }
+    }
 
     #[test] // spec: APP-022
     fn clsid_strings_round_trip_through_guid() {
