@@ -5,9 +5,11 @@
 //! buffers what arrives meanwhile. [`drain`] is `lil core stop`. None of it may be used from
 //! inside a tokio runtime (`block_on` panics there).
 //!
-//! QA-026: an app marks its GUI thread with [`mark_gui_thread`]; in a debug build, every call
-//! here that waits on the core panics on that thread before it waits (APP-024: the GUI thread
-//! never waits on the core; an app uses [`crate::session::Session`] on a background runtime).
+//! QA-026: an app marks its GUI thread with [`mark_gui_thread`]; in a debug build, every
+//! blocking call of `lil-client` panics on that thread before it waits: each call here that
+//! waits on the core, and `doctor::core_running` and `doctor::set_repo_autocrlf_false`
+//! (APP-024: the GUI thread never waits on the core; an app uses
+//! [`crate::session::Session`] on a background runtime).
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -31,11 +33,11 @@ pub fn mark_gui_thread() {
     GUI_THREAD.with(|gui| gui.set(true));
 }
 
-/// QA-026: `call` must not wait on the core from the GUI thread (debug builds only).
-fn not_on_gui_thread(call: &str) {
+/// QA-026: the blocking call `call` must not run on the GUI thread (debug builds only).
+pub(crate) fn not_on_gui_thread(call: &str) {
     debug_assert!(
         !GUI_THREAD.with(Cell::get),
-        "lil_client::blocking::{call} was called on the GUI thread, which never waits on the core (QA-026, APP-024)"
+        "lil_client::{call} was called on the GUI thread, which never blocks (QA-026, APP-024)"
     );
 }
 
@@ -50,7 +52,7 @@ pub struct BlockingClient {
 impl BlockingClient {
     /// [`Client::connect`].
     pub fn connect(cfg: &ClientConfig) -> Result<BlockingClient, ClientError> {
-        not_on_gui_thread("BlockingClient::connect");
+        not_on_gui_thread("blocking::BlockingClient::connect");
         let rt = runtime()?;
         let client = rt.block_on(Client::connect(cfg))?;
         Ok(BlockingClient { client, rt })
@@ -68,7 +70,7 @@ impl BlockingClient {
         args: serde_json::Map<String, serde_json::Value>,
         key: Option<String>,
     ) -> Result<Outcome<ToolOutput>, ClientError> {
-        not_on_gui_thread("BlockingClient::call_tool");
+        not_on_gui_thread("blocking::BlockingClient::call_tool");
         self.rt.block_on(self.client.call_tool(name, args, key))
     }
 
@@ -77,13 +79,13 @@ impl BlockingClient {
         &self,
         state: lil_protocol::app::ListWhich,
     ) -> Result<Outcome<lil_protocol::app::ConfirmationsListResult>, ClientError> {
-        not_on_gui_thread("BlockingClient::confirmations");
+        not_on_gui_thread("blocking::BlockingClient::confirmations");
         self.rt.block_on(self.client.confirmations(state))
     }
 
     /// [`Client::list_tools`].
     pub fn list_tools(&self) -> Result<Vec<ToolDescriptor>, ClientError> {
-        not_on_gui_thread("BlockingClient::list_tools");
+        not_on_gui_thread("blocking::BlockingClient::list_tools");
         self.rt.block_on(self.client.list_tools())
     }
 
@@ -94,7 +96,7 @@ impl BlockingClient {
         topics: Vec<String>,
         since: BTreeMap<String, u64>,
     ) -> Result<Events<'_>, ClientError> {
-        not_on_gui_thread("BlockingClient::subscribe");
+        not_on_gui_thread("blocking::BlockingClient::subscribe");
         let stream = self.rt.block_on(self.client.subscribe(topics, since))?;
         Ok(Events {
             rt: &self.rt,
@@ -119,7 +121,7 @@ impl Events<'_> {
     /// The next event, waiting at most `within`: `Ok(None)` once the core went away,
     /// [`ClientError::Timeout`] when nothing came in time.
     pub fn next_within(&mut self, within: Duration) -> Result<Option<EventParams>, ClientError> {
-        not_on_gui_thread("Events::next_within");
+        not_on_gui_thread("blocking::Events::next_within");
         self.rt
             .block_on(async { tokio::time::timeout(within, self.stream.next()).await })
             .map_err(|_| ClientError::Timeout)
@@ -130,14 +132,14 @@ impl Iterator for Events<'_> {
     type Item = EventParams;
 
     fn next(&mut self) -> Option<EventParams> {
-        not_on_gui_thread("Events::next");
+        not_on_gui_thread("blocking::Events::next");
         self.rt.block_on(self.stream.next())
     }
 }
 
 /// [`drain_and_wait`] on a runtime of its own: `lil core stop`.
 pub fn drain(cfg: &ClientConfig, within: Duration) -> Result<DrainOutcome, ClientError> {
-    not_on_gui_thread("drain");
+    not_on_gui_thread("blocking::drain");
     runtime()?.block_on(drain_and_wait(cfg, within))
 }
 

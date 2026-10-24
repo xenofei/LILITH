@@ -225,11 +225,18 @@ fn session_reconnects_and_resubscribes_from_the_last_seq() {
                 .collect();
             assert_eq!(of_topic, [(1, 6), (2, 7), (3, 8)], "{topic}: {got:?}");
         }
-        assert!(events.try_recv().is_err(), "an event was doubled");
+        // A late duplicate would come before this one.
+        let emit = json!({"topic": "a", "data": {"n": 9}});
+        ok(session
+            .call_tool("test.emit", args(emit), None, None)
+            .await
+            .expect("test.emit on the new core"));
+        let last = next_event(&mut events).await;
+        assert_eq!((last.topic.as_str(), last.seq), ("test:a", 4), "{last:?}");
+        assert_eq!(last.data, json!({"n": 9}));
     });
-    for topic in topics {
-        assert_eq!(session.last_seq(topic), Some(3), "{topic}");
-    }
+    assert_eq!(session.last_seq("test:a"), Some(4));
+    assert_eq!(session.last_seq("test:b"), Some(3));
 
     let seen = states
         .lock()
@@ -391,7 +398,10 @@ fn in_flight_calls_fail_and_are_never_resent() {
         // The session started a new core itself.
         let second = wait_ready(&mut state, Some(&first.instance_id)).await;
         assert_ne!(second.core.pid, first.core.pid);
-        let probe = ok(session
+        // The new core released the dead core's claim on the key at its start. Had the session
+        // sent `test.block` again, the new core would hold the key for it, and a call with the
+        // same key and other arguments would be refused; it runs, so nothing was resent.
+        let probe = session
             .call_tool(
                 "test.write",
                 args(json!({"label": "probe"})),
@@ -399,16 +409,18 @@ fn in_flight_calls_fail_and_are_never_resent() {
                 None,
             )
             .await
-            .expect("test.write with the in-flight call's key"));
-        assert_eq!(probe.structured["executions"], 1, "{probe:?}");
+            .expect("test.write with the in-flight call's key");
+        assert!(matches!(probe, Outcome::Ok(_)), "{probe:?}");
         session.close().await;
     });
     stop(&cfg);
 }
 
-/// APP-036, ARCH-014: a client of an older major (`LIL_TEST_CLIENT_PROTOCOL=0.9` makes
-/// `ClientConfig::for_env` say 0.9 on a test channel) reports the core incompatible, naming its
-/// protocol, and leaves it running.
+/// APP-036, ARCH-014: a client of an older major reports the core incompatible, naming its
+/// protocol, and leaves it running. The test sets `cfg.protocol` to 0.9 itself, which is what
+/// `LIL_TEST_CLIENT_PROTOCOL=0.9` makes `ClientConfig::for_env` say on a test channel (the unit
+/// test `client_protocol_override_is_test_channels_only`): setting the variable in-process is
+/// `unsafe` in edition 2024, and the session reads only `cfg.protocol`.
 #[test] // spec: APP-036, ARCH-014, ARCH-100
 fn incompatible_core_reports_incompatible_and_is_left_running() {
     let env = TestEnv::new();
@@ -484,6 +496,62 @@ fn unavailable_when_no_core_can_start() {
         }
     });
     assert_eq!(sha256_file(&db), before, "{} was changed", db.display());
+}
+
+/// How many cores of the channel have exited with a start failure: each logs `core exiting`.
+fn failed_starts(env: &TestEnv) -> usize {
+    if !env.env.logs_dir().exists() {
+        return 0;
+    }
+    core_log(env).matches("core exiting").count()
+}
+
+/// After a failed start, the session only looks for a core someone else started: one failing
+/// core, not one every 5 s. `retry_now` starts one again; once the person has set the
+/// database aside and a core runs, the session finds it by itself.
+#[test] // spec: ARCH-100, CORE-004, ARCH-018
+fn a_failed_start_is_tried_once_until_retry_now() {
+    let env = TestEnv::new();
+    let cfg = config(&env);
+    let db = env.env.suite_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
+    let rt = runtime();
+    let (session, mut state) = rt.block_on(async {
+        let session = Session::start(cfg.clone(), Vec::new());
+        let mut state = session.state();
+        wait_state(&mut state, "Unavailable", |s| {
+            matches!(s, SessionState::Unavailable { .. })
+        })
+        .await;
+        // The attempts 250, 750, 1750 and 3750 ms after the failure only look for a core.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(failed_starts(&env), 1);
+        assert!(
+            matches!(*state.borrow(), SessionState::Unavailable { .. }),
+            "{:?}",
+            *state.borrow()
+        );
+
+        session.retry_now();
+        let asked = tokio::time::Instant::now();
+        while failed_starts(&env) < 2 {
+            assert!(asked.elapsed() < DEADLINE, "retry_now started no core");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (session, state)
+    });
+
+    // What `lil doctor` does: the damaged database goes aside, and a core starts.
+    std::fs::rename(&db, db.with_extension("db.aside")).unwrap();
+    let core = CoreFixture::start(&env);
+    rt.block_on(async {
+        let ready = wait_ready(&mut state, None).await;
+        assert_eq!(ready.core.pid, core.pid());
+        session.close().await;
+    });
+    assert_eq!(failed_starts(&env), 2, "the session started another core");
+    stop(&cfg);
 }
 
 /// P4a-R33: after each failed attempt the session waits 250 ms, doubling up to 5 s.
@@ -648,26 +716,70 @@ fn blocking_calls_on_the_gui_thread_panic_in_debug() {
     let env = TestEnv::new();
     let mut cfg = config(&env);
     cfg.start = StartPolicy::NoStart;
+    let _core = CoreFixture::start(&env);
 
-    let on_gui = {
-        let cfg = cfg.clone();
+    let refused: Vec<(&str, bool)> = {
+        let (cfg, env) = (cfg.clone(), env.env.clone());
         std::thread::spawn(move || {
+            // Made before the mark, to reach the calls that need them.
+            let client = BlockingClient::connect(&cfg).expect("connect before the mark");
+            let mut events = client
+                .subscribe(vec!["test:a".to_string()], Default::default())
+                .expect("subscribe before the mark");
             mark_gui_thread();
-            let connect = catch_unwind(AssertUnwindSafe(|| BlockingClient::connect(&cfg).is_ok()));
-            let drain = catch_unwind(AssertUnwindSafe(|| blocking::drain(&cfg, DEADLINE).is_ok()));
-            (connect.is_err(), drain.is_err())
+            let panics =
+                |call: &mut dyn FnMut() -> bool| catch_unwind(AssertUnwindSafe(call)).is_err();
+            let a = args(json!({"text": "x"}));
+            vec![
+                (
+                    "connect",
+                    panics(&mut || BlockingClient::connect(&cfg).is_ok()),
+                ),
+                (
+                    "drain",
+                    panics(&mut || blocking::drain(&cfg, DEADLINE).is_ok()),
+                ),
+                (
+                    "call_tool",
+                    panics(&mut || client.call_tool("test.echo", a.clone(), None).is_ok()),
+                ),
+                ("list_tools", panics(&mut || client.list_tools().is_ok())),
+                (
+                    "confirmations",
+                    panics(&mut || {
+                        client
+                            .confirmations(lil_protocol::app::ListWhich::Pending)
+                            .is_ok()
+                    }),
+                ),
+                (
+                    "subscribe",
+                    panics(&mut || client.subscribe(Vec::new(), Default::default()).is_ok()),
+                ),
+                (
+                    "next_within",
+                    panics(&mut || events.next_within(Duration::ZERO).is_ok()),
+                ),
+                ("next", panics(&mut || events.next().is_some())),
+                (
+                    "doctor::core_running",
+                    panics(&mut || lil_client::doctor::core_running(&env)),
+                ),
+            ]
         })
         .join()
         .expect("the GUI thread")
     };
-    assert_eq!(
-        on_gui,
-        (true, true),
-        "a blocking call ran on the GUI thread"
-    );
+    let ran: Vec<&str> = refused
+        .iter()
+        .filter(|(_, panicked)| !panicked)
+        .map(|(call, _)| *call)
+        .collect();
+    assert!(ran.is_empty(), "ran on the GUI thread: {ran:?}");
 
     let elsewhere = std::thread::spawn(move || {
-        matches!(BlockingClient::connect(&cfg), Err(ClientError::NotRunning))
+        let client = BlockingClient::connect(&cfg).expect("connect off the GUI thread");
+        client.list_tools().is_ok()
     })
     .join()
     .expect("another thread panicked");
