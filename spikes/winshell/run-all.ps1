@@ -7,7 +7,7 @@ Spike 11 (plan 4a Task 1): runs S1.9, the desktop checks inside Windows Sandbox,
 Scope cut (coordinator's ruling, 2026-10-23): Part B (S1.1 to S1.8) is answered by the owner's
 three recorded runs and is not re-run, so by default this runs only Part C:
 run-sandbox.ps1 -Runs 3 -KeepAwake. It asks nothing, every wait in it is bounded, and it cleans
-up on every exit path. It touches nothing on the host desktop beyond starting the Sandbox window
+up on every exit path. It touches nothing on the host desktop beyond starting the Sandbox window and closing it (and its viewer) after each run
 (and holding a parent-watched keep-awake for the runs).
 
 -PartB adds the old host Part B stage (run-spike.ps1). That code is UNMAINTAINED: it is the
@@ -124,7 +124,7 @@ if ($withSandbox) {
 Write-Host ''
 Say 'Spike 11, S1.9 in Windows Sandbox (unattended). Nobody need be at the PC.' 'Yellow'
 Say ('  Stages: ' + (@($stages | ForEach-Object { $_.name }) -join ' then '))
-Say '  A Windows Sandbox window opens and closes by itself 3 times. Nothing else on this desktop is touched.'
+Say '  A Windows Sandbox window opens 3 times; the script closes it, and its viewer, after each run. Nothing else on this desktop is touched.'
 Say '  Ctrl+C stops at any time and still cleans up.'
 Write-Host ''
 
