@@ -18,7 +18,7 @@
 //! [`HELLO_WAIT`] refuses with `PermissionDenied` (Task 28 fix round 2: Windows Hello Face can
 //! complete a prompt with no deliberate act). Only a real pointer click accepts
 //! ([`choice_from_command`]): the accept button is subclassed and armed only by a `WM_LBUTTONUP`
-//! inside it from a real mouse, touch or pen, on its own thread ([`arms_accept`]:
+//! inside it from a real mouse, touch, pen or touchpad, on its own thread ([`arms_accept`]:
 //! `GetCurrentInputMessageSource` is `IMO_HARDWARE` with a pointer device, `InSendMessage` is
 //! false), and only a `BN_CLICKED` from that button's own window counts, so a posted or sent
 //! `WM_COMMAND`, `BM_CLICK`, UI Automation's Invoke, `SendInput` and any key (Space, Enter) are
@@ -891,8 +891,9 @@ pub struct ButtonInput {
 }
 
 /// Whether a message arms the accept button for the click it is about to report (pure): only a
-/// `WM_LBUTTONUP` inside the button, from real hardware (`IMO_HARDWARE`) that is a mouse, touch
-/// or pen, handled on the button's own thread (re-review 2 N4). No key arms it: a program can
+/// `WM_LBUTTONUP` inside the button, from real hardware (`IMO_HARDWARE`) that is a mouse, touch,
+/// pen or touchpad, handled on the button's own thread (re-review 2 N4; the touchpad by the
+/// fix round 4 ruling). No key arms it: a program can
 /// move the focus to the button without hardware input, and the owner's next Space must not
 /// merge. "Deny" isn't subclassed and takes any input; closing the window refuses too.
 pub fn arms_accept(input: ButtonInput) -> bool {
@@ -901,7 +902,7 @@ pub fn arms_accept(input: ButtonInput) -> bool {
         && input.origin == InputOrigin::Hardware
         && matches!(
             input.device,
-            InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen
+            InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
         )
         && !input.sent_by_another_thread
 }
@@ -1500,8 +1501,14 @@ mod tests {
     fn only_a_real_click_on_the_accept_button_accepts() {
         assert_eq!(choice_from_command(real_click()), Some(Choice::Accepted));
 
-        // Arming: a real mouse, touch or pen release over the button, on its own thread.
-        for device in [InputDevice::Mouse, InputDevice::Touch, InputDevice::Pen] {
+        // Arming: a real mouse, touch, pen or touchpad release over the button, on its own
+        // thread.
+        for device in [
+            InputDevice::Mouse,
+            InputDevice::Touch,
+            InputDevice::Pen,
+            InputDevice::Touchpad,
+        ] {
             let input = ButtonInput {
                 device,
                 ..real_release()
@@ -1528,11 +1535,7 @@ mod tests {
             assert_eq!(choice_from_command(c), None, "{origin:?}");
         }
         // A hardware release whose device isn't a pointer: no.
-        for device in [
-            InputDevice::Keyboard,
-            InputDevice::Touchpad,
-            InputDevice::Unavailable,
-        ] {
+        for device in [InputDevice::Keyboard, InputDevice::Unavailable] {
             let input = ButtonInput {
                 device,
                 ..real_release()

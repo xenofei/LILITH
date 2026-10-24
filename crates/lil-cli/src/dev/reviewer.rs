@@ -1102,13 +1102,23 @@ fn render_escaped(text: &str) -> String {
 /// `app-key.age` in `%USERPROFILE%`, and an [`Authenticator`] that shows the summary and the
 /// audit (in the terminal and in the window that owns the Windows Hello prompt), then asks
 /// Windows Hello when you enrolled it, and the passphrase at the terminal otherwise or when
-/// Hello is cancelled, fails or can't come to the front. Local only: a missing key, or neither
-/// Hello nor a terminal, is refused before any network call.
+/// Hello is cancelled, fails or can't come to the front. With `passphrase_only` (`--passphrase`,
+/// Task 28 fix round 4: for an owner who can't click "Merge"), Windows Hello is skipped and the
+/// passphrase is asked at the terminal after the same texts are shown. Local only: a missing
+/// key, or neither Hello nor a terminal, is refused before any network call.
 pub(crate) fn with_owner_authenticator<T>(
     what: &str,
+    passphrase_only: bool,
     f: impl FnOnce(&ReviewerKeyFile, &dyn Authenticator) -> T,
 ) -> Result<T> {
-    with_owner_authenticator_in(&user_profile()?, &TerminalPrompt, &WindowsHello, what, f)
+    with_owner_authenticator_in(
+        &user_profile()?,
+        &TerminalPrompt,
+        &WindowsHello,
+        what,
+        passphrase_only,
+        f,
+    )
 }
 
 /// [`with_owner_authenticator`] for `profile`, with `prompt` and `platform` given (fakes in
@@ -1118,13 +1128,23 @@ pub(crate) fn with_owner_authenticator_in<T>(
     prompt: &dyn Prompt,
     platform: &dyn HelloPlatform,
     what: &str,
+    passphrase_only: bool,
     f: impl FnOnce(&ReviewerKeyFile, &dyn Authenticator) -> T,
 ) -> Result<T> {
     let (_, key_file) = load_key_in(profile)
         .context("every approval and merge needs your authentication with the reviewer key")?;
     let say = |text: &str| prompt.say(&render_escaped(text));
+    if passphrase_only && !prompt.is_interactive() {
+        bail!(
+            "--passphrase asks for the passphrase at a real terminal, and this isn't one, so you can't authenticate to {what}; nothing was approved or merged"
+        );
+    }
     let message = format!("LILITH: {what}");
-    let hello = enrolled_hello(profile, platform, &message, Some("Merge"), &say);
+    let hello = if passphrase_only {
+        None
+    } else {
+        enrolled_hello(profile, platform, &message, Some("Merge"), &say)
+    };
     if hello.is_none() && !prompt.is_interactive() {
         bail!(
             "Windows Hello isn't enrolled and this isn't a real terminal, so you can't authenticate to {what}; nothing was approved or merged"
@@ -1146,8 +1166,9 @@ pub(crate) fn with_owner_authenticator_in<T>(
     Ok(f(&key_file, &auth))
 }
 
-/// `lil dev approve <pr>`: exit 0 when the approval was posted, 1 otherwise.
-pub fn run_approve(pr: u64) -> i32 {
+/// `lil dev approve <pr> [--passphrase]`: exit 0 when the approval was posted, 1 otherwise.
+/// With `passphrase_only`, Windows Hello is skipped and the passphrase is asked.
+pub fn run_approve(pr: u64, passphrase_only: bool) -> i32 {
     let refuse = |message: &str| {
         eprintln!(
             "lil dev approve refused PR #{pr}: {}",
@@ -1197,7 +1218,11 @@ pub fn run_approve(pr: u64) -> i32 {
         "LILITH: approve PR #{pr}'s protected changes\n\n{}",
         summary_display(&prepared.head, &prepared.summary)
     ));
-    let hello = enrolled_hello(&profile, &platform, &shown, Some("Approve"), &say_escaped);
+    let hello = if passphrase_only {
+        None
+    } else {
+        enrolled_hello(&profile, &platform, &shown, Some("Approve"), &say_escaped)
+    };
     match approve(
         pr,
         &prepared.cfg,
@@ -1492,9 +1517,15 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
     }
 }
 
-/// `lil dev merge-flow <pr> --summary <file> --audit <file>` (P4a-R38): exit 0 when merged, 1
-/// otherwise.
-pub fn run_merge_flow(pr: u64, summary_path: &Path, audit_path: &Path) -> i32 {
+/// `lil dev merge-flow <pr> --summary <file> --audit <file> [--passphrase]` (P4a-R38): exit 0
+/// when merged, 1 otherwise. With `passphrase_only`, Windows Hello is skipped and the passphrase
+/// is asked at the terminal.
+pub fn run_merge_flow(
+    pr: u64,
+    summary_path: &Path,
+    audit_path: &Path,
+    passphrase_only: bool,
+) -> i32 {
     let refuse = |message: &str| {
         eprintln!(
             "lil dev merge-flow refused PR #{pr}: {}",
@@ -1527,7 +1558,8 @@ pub fn run_merge_flow(pr: u64, summary_path: &Path, audit_path: &Path) -> i32 {
             &super::github::github_token()?,
         )?))
     };
-    let outcome = with_owner_authenticator(&format!("merge PR #{pr}"), |key_file, auth| {
+    let what = format!("merge PR #{pr}");
+    let outcome = with_owner_authenticator(&what, passphrase_only, |key_file, auth| {
         let steps = FlowSteps {
             repo: &repo,
             pr,
@@ -1670,6 +1702,8 @@ mod tests {
         confirms: RefCell<VecDeque<bool>>,
         asked: RefCell<Vec<String>>,
         said: RefCell<Vec<String>>,
+        /// For each passphrase asked, how many texts had been said before it.
+        said_before_passphrase: RefCell<Vec<usize>>,
     }
 
     impl FakePrompt {
@@ -1681,6 +1715,7 @@ mod tests {
                 confirms: RefCell::default(),
                 asked: RefCell::default(),
                 said: RefCell::default(),
+                said_before_passphrase: RefCell::default(),
             }
         }
         fn not_a_terminal() -> Self {
@@ -1719,6 +1754,9 @@ mod tests {
         }
         fn passphrase(&self, label: &str) -> String {
             self.asked.borrow_mut().push(label.to_string());
+            self.said_before_passphrase
+                .borrow_mut()
+                .push(self.said.borrow().len());
             self.passphrases
                 .borrow_mut()
                 .pop_front()
@@ -3560,6 +3598,7 @@ mod tests {
             &prompt,
             &TestHello::ok(),
             "merge PR #42",
+            false,
             |_, _| called.set(true),
         )
         .unwrap_err();
@@ -3576,6 +3615,7 @@ mod tests {
                 &FakePrompt::new(),
                 &TestHello::ok(),
                 "merge PR #42",
+                false,
                 |_, _| called.set(true),
             )
             .is_err()
@@ -3594,6 +3634,7 @@ mod tests {
             &prompt,
             &hello,
             "merge PR #42",
+            false,
             |_, auth| auth.authenticate("S", "A").map(drop),
         )
         .unwrap();
@@ -3614,6 +3655,7 @@ mod tests {
             &prompt,
             &hello,
             "merge PR #42",
+            false,
             |_, auth| auth.authenticate("SUMMARY \u{1b}[2J", "AUDIT"),
         )
         .unwrap()
@@ -3640,6 +3682,7 @@ mod tests {
             &prompt,
             &TestHello::ok(),
             "merge PR #42",
+            false,
             |_, auth| auth.authenticate("S", "A"),
         )
         .unwrap()
@@ -3650,6 +3693,59 @@ mod tests {
             "{:?}",
             prompt.asked()
         );
+    }
+
+    /// Fix round 4 ruling: `--passphrase` skips Windows Hello even when it is enrolled, shows
+    /// the summary and the audit before asking, and refuses without a terminal.
+    #[test] // spec: QA-036, QA-088
+    fn the_passphrase_flag_never_calls_windows_hello_and_needs_a_terminal() {
+        let profile = profile_with_key(true);
+        let prompt = FakePrompt::new().passphrases(&[PASS]);
+        let hello = TestHello::ok();
+        let pem = with_owner_authenticator_in(
+            profile.path(),
+            &prompt,
+            &hello,
+            "merge PR #42",
+            true,
+            |_, auth| auth.authenticate("SUMMARY", "AUDIT"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&pem[..], test_pem());
+        assert!(hello.shown.borrow().is_empty(), "Windows Hello was called");
+        assert!(
+            hello.accepts.borrow().is_empty(),
+            "the Merge window was asked"
+        );
+        // Both texts were shown before the passphrase was asked.
+        let before = prompt.said_before_passphrase.borrow()[0];
+        let shown = prompt.said()[..before].join("\n");
+        assert!(shown.contains("SUMMARY"), "{shown}");
+        assert!(shown.contains("AUDIT"), "{shown}");
+        assert!(
+            prompt.asked().iter().any(|q| q.contains("merge PR #42")),
+            "{:?}",
+            prompt.asked()
+        );
+
+        // No terminal: refused before anything runs, and Windows Hello isn't tried instead.
+        let prompt = FakePrompt::not_a_terminal();
+        let called = std::cell::Cell::new(false);
+        let e = with_owner_authenticator_in(
+            profile.path(),
+            &prompt,
+            &hello,
+            "merge PR #42",
+            true,
+            |_, _| called.set(true),
+        )
+        .unwrap_err();
+        assert!(!called.get(), "it ran without a way to authenticate");
+        let e = format!("{e:#}");
+        assert!(e.contains("--passphrase"), "{e}");
+        assert!(e.contains("nothing was approved or merged"), "{e}");
+        assert!(hello.shown.borrow().is_empty(), "Windows Hello was called");
     }
 
     /// The test key, as the flow's authentication hands it over.

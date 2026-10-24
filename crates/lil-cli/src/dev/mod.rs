@@ -157,6 +157,9 @@ pub enum DevCommand {
     Merge {
         /// The pull request number.
         pr: u64,
+        /// Skip Windows Hello: show the same texts, then ask for the passphrase at a terminal.
+        #[arg(long)]
+        passphrase: bool,
     },
 
     /// The one-click merge: show a PR's summary and audit, authenticate, approve, merge.
@@ -177,6 +180,9 @@ pub enum DevCommand {
         /// A file with the independent audit (a review by an agent that didn't make it).
         #[arg(long)]
         audit: std::path::PathBuf,
+        /// Skip Windows Hello: show the same texts, then ask for the passphrase at a terminal.
+        #[arg(long)]
+        passphrase: bool,
     },
 
     /// Set up, show or remove Windows Hello for the reviewer key (the passphrase stays).
@@ -214,6 +220,9 @@ pub enum DevCommand {
     Approve {
         /// The pull request number.
         pr: u64,
+        /// Skip Windows Hello: show the same summary, then ask for the passphrase.
+        #[arg(long)]
+        passphrase: bool,
     },
 
     /// Point git at the repo's hooks and at the agent credential helper.
@@ -392,17 +401,20 @@ pub fn run(cmd: DevCommand) -> i32 {
             after,
             tests_result,
         } => post_merge::run_revert_pr(&before, &after, tests_result.as_deref()),
-        DevCommand::Merge { pr } => merge::run_merge(pr),
-        DevCommand::MergeFlow { pr, summary, audit } => {
-            reviewer::run_merge_flow(pr, &summary, &audit)
-        }
+        DevCommand::Merge { pr, passphrase } => merge::run_merge(pr, passphrase),
+        DevCommand::MergeFlow {
+            pr,
+            summary,
+            audit,
+            passphrase,
+        } => reviewer::run_merge_flow(pr, &summary, &audit, passphrase),
         DevCommand::ReviewerHello(cmd) => match cmd {
             ReviewerHelloCommand::Enroll => reviewer_hello::run_enroll(),
             ReviewerHelloCommand::Status => reviewer_hello::run_status(),
             ReviewerHelloCommand::Remove => reviewer_hello::run_remove(),
         },
         DevCommand::ReviewerSetup => reviewer::run_reviewer_setup(),
-        DevCommand::Approve { pr } => reviewer::run_approve(pr),
+        DevCommand::Approve { pr, passphrase } => reviewer::run_approve(pr, passphrase),
         DevCommand::InstallHooks => hooks::run_install_hooks(),
         DevCommand::AgentToken(cmd) => match cmd {
             AgentTokenCommand::Set => agent_access::run_set(),

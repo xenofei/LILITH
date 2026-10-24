@@ -595,7 +595,17 @@ mod tests {
         let cli = parse(&["lil", "dev", "merge", "3"]);
         assert!(matches!(
             cli.command,
-            Command::Dev(crate::dev::DevCommand::Merge { pr: 3 })
+            Command::Dev(crate::dev::DevCommand::Merge {
+                pr: 3,
+                passphrase: false
+            })
+        ));
+        assert!(matches!(
+            parse(&["lil", "dev", "merge", "3", "--passphrase"]).command,
+            Command::Dev(crate::dev::DevCommand::Merge {
+                pr: 3,
+                passphrase: true
+            })
         ));
         assert!(matches!(
             parse(&["lil", "dev", "spec-tests"]).command,

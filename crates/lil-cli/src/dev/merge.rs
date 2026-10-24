@@ -745,8 +745,9 @@ fn refuse(header: &str, refusals: &[Refusal]) -> i32 {
     1
 }
 
-/// `lil dev merge <pr>`: exit 0 when merged, 1 when refused.
-pub fn run_merge(pr: u64) -> i32 {
+/// `lil dev merge <pr> [--passphrase]`: exit 0 when merged, 1 when refused. With
+/// `passphrase_only`, Windows Hello is skipped and the passphrase is asked at the terminal.
+pub fn run_merge(pr: u64, passphrase_only: bool) -> i32 {
     let header = format!("lil dev merge refused PR #{pr}:");
     let repo = match root::repo_root() {
         Ok(r) => r,
@@ -775,10 +776,10 @@ pub fn run_merge(pr: u64) -> i32 {
     // QA-036, P4a-R38: every merge asks for your authentication (Windows Hello when enrolled,
     // then the passphrase), after every other condition held. The key is loaded first, so a
     // missing one is refused before any network call.
-    let merged =
-        super::reviewer::with_owner_authenticator(&format!("merge PR #{pr}"), |_, auth| {
-            merge_asking(&repo, pr, &cfg, hooks, &github, auth)
-        });
+    let what = format!("merge PR #{pr}");
+    let merged = super::reviewer::with_owner_authenticator(&what, passphrase_only, |_, auth| {
+        merge_asking(&repo, pr, &cfg, hooks, &github, auth)
+    });
     match merged {
         Ok(Ok(merge_sha)) => {
             println!("Merged PR #{pr} (merge commit {}).", short(&merge_sha));
