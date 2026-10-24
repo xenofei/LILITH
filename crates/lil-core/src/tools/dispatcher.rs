@@ -992,6 +992,30 @@ impl Redispatch {
             )
             .await
     }
+
+    /// [`Redispatch::retry`] for one job of a `job.retry {batch_id}` (Appendix G): with no
+    /// approval and no idempotency row of its own, so a retry that would need your
+    /// confirmation is refused (`confirm.unavailable`) instead of waiting under a key no one
+    /// would retry with; retry such a job alone with `job.retry {job_id}`.
+    ///
+    /// # Errors
+    /// As [`Redispatch::retry`].
+    pub(crate) async fn retry_in_batch(
+        &self,
+        ctx: &CallCtx,
+        id: &JobId,
+    ) -> Result<JobSummary, ErrorBody> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(ErrorBody::new(
+                &codes::CORE_DRAINING,
+                "The core is shutting down. Retry with the same idempotency key once it runs again.",
+                ctx.trace_id.clone(),
+            ));
+        };
+        inner
+            .retry(ctx, id, None, &PendingSlot::default(), None)
+            .await
+    }
 }
 
 /// A call that retries job `of`, in the job's project. `always_confirm`: the job had

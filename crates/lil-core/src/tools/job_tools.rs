@@ -1,11 +1,13 @@
-//! The job tools (CORE-146, AI-113; Appendix F "Product tools"), module `jobs`:
+//! The job tools (CORE-146, CORE-160, AI-113; Appendix F "Product tools", Appendix G "Jobs"),
+//! module `jobs`:
 //!
 //! | Tool | Effect | Arguments | `structured` |
 //! |---|---|---|---|
-//! | `jobs.list` | read | `{status?, kind?, project?, ids?, limit? (1–500, default 100), cursor?}` | `{jobs, next_cursor}`, newest first |
+//! | `jobs.list` | read | `{status?, kind?, project?, ids?, since?, batch_id?, limit? (1–500, default 100), cursor?}` | `{jobs, next_cursor, lanes}`, newest first |
 //! | `job.wait` | read | `{job_id, timeout_s? (1–90, default 90)}` | `{job, done}` |
-//! | `job.cancel` | write | `{job_id}` | `{job}`; a finished job as it is |
-//! | `job.retry` | write | `{job_id}` | `{job, retry_of}`; only `failed` or `cancelled` |
+//! | `job.cancel` | write | exactly one of `{job_id}`, `{ids}` (1–500), `{batch_id}`, `{all_mine: true}` | `{job}` for `job_id`, else `{jobs}`; a finished job as it is |
+//! | `job.retry` | write | exactly one of `{job_id}`, `{batch_id}` | `{job, retry_of}`, or `{retried: [{job, retry_of}], refused: [{job_id, error}]}` |
+//! | `job.move` | write | `{job_id, to: "next" \| "last"}` | `{job}` |
 //!
 //! Each works in the call's scope: the session's workspace, or the suite without one. They live
 //! in `tools`, not in `jobs`, so that `jobs` depends on no `tools` type (CORE-010): they build
@@ -14,15 +16,24 @@
 //! `job.retry` re-dispatches the tool call that made the job, with the retry's caller and
 //! idempotency key: the confirm, estimate and reserve stages run for it as for a fresh call
 //! ([`Redispatch`](super::Redispatch)), so a retry is never a way around a confirmation or a cap.
+//! `job.retry {batch_id}` does it for each job of the batch, without a key of its own per job,
+//! so a job whose retry would need your confirmation is refused there (retry it alone).
+//!
+//! `job.wait`'s summary text for a job whose every node the engine served from its cache is
+//! "Nothing changed: ComfyUI served every node from its cache." (CORE-117).
 
 use std::time::Duration;
 
+use lil_protocol::app::QueueState;
 use lil_protocol::{EffectClass, ErrorBody, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::registry::{Registry, typed_tool};
-use crate::jobs::{JOBS_MODULE, JobFilter, JobId, JobSummary, MAX_WAIT};
+use crate::jobs::{
+    CancelSelector, JOBS_MODULE, JobFilter, JobId, JobSummary, Lane, MAX_WAIT, MoveTo,
+    NOTHING_CHANGED, RetryBatch,
+};
 
 /// The retry tool's name: the dispatcher re-dispatches the call it retries.
 pub const JOB_RETRY: &str = "job.retry";
@@ -32,6 +43,8 @@ struct ListResult {
     jobs: Vec<JobSummary>,
     /// Pass it as `cursor` for the next page; `null` on the last.
     next_cursor: Option<String>,
+    /// Each lane's pause (Appendix G `QueueState`).
+    lanes: Vec<QueueState>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -52,10 +65,80 @@ struct WaitResult {
     done: bool,
 }
 
+/// `job.cancel`'s selectors: exactly one.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct JobArgs {
+struct CancelArgs {
+    #[serde(default)]
+    job_id: Option<String>,
+    /// 1–500 job ids.
+    #[serde(default)]
+    ids: Option<Vec<String>>,
+    #[serde(default)]
+    batch_id: Option<String>,
+    /// `true`: every unfinished job your caller kind submitted (for an app, that app's).
+    #[serde(default)]
+    all_mine: Option<bool>,
+}
+
+impl CancelArgs {
+    /// The one selector, or why there isn't exactly one.
+    fn selector(self) -> Result<CancelSelector, String> {
+        let mut found = Vec::new();
+        if let Some(id) = self.job_id {
+            found.push(CancelSelector::One(JobId(id)));
+        }
+        if let Some(ids) = self.ids {
+            found.push(CancelSelector::Ids(ids.into_iter().map(JobId).collect()));
+        }
+        if let Some(batch) = self.batch_id {
+            found.push(CancelSelector::Batch(batch));
+        }
+        match self.all_mine {
+            Some(true) => found.push(CancelSelector::AllMine),
+            Some(false) => return Err("all_mine is true when it is given".to_string()),
+            None => {}
+        }
+        if found.len() != 1 {
+            return Err(
+                "job.cancel takes exactly one of job_id, ids, batch_id or all_mine".to_string(),
+            );
+        }
+        Ok(found.remove(0))
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum CancelResult {
+    One { job: Box<JobSummary> },
+    Many { jobs: Vec<JobSummary> },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RetryArgs {
+    #[serde(default)]
+    job_id: Option<String>,
+    #[serde(default)]
+    batch_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum RetryResult {
+    One {
+        job: Box<JobSummary>,
+        retry_of: String,
+    },
+    Batch(RetryBatch),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MoveArgs {
     job_id: String,
+    to: MoveTo,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -63,24 +146,33 @@ struct JobResultOut {
     job: JobSummary,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
-struct RetryResult {
-    job: JobSummary,
-    retry_of: String,
+fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
+    ErrorBody::new(&codes::PARAMS_INVALID, message, trace_id)
 }
 
-/// Registers `jobs.list`, `job.wait`, `job.cancel` and `job.retry` on `reg`.
+/// Registers `jobs.list`, `job.wait`, `job.cancel`, `job.retry` and `job.move` on `reg`.
 pub fn register_job_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "jobs.list",
-        "Lists jobs, newest first: `status`, `kind`, `project` and `ids` filter them; `limit` (1–500, default 100) and `cursor` (the previous page's `next_cursor`) page through them.",
+        "Lists jobs, newest first: `status`, `kind`, `project`, `ids`, `since` (RFC 3339: updated later) and `batch_id` filter them; `limit` (1–500, default 100) and `cursor` (the previous page's `next_cursor`) page through them. `lanes` gives each lane's pause.",
         EffectClass::Read,
         JOBS_MODULE,
         |ctx, f: JobFilter| {
             Box::pin(async move {
                 let (jobs, next_cursor) = ctx.jobs.list(&ctx.job_caller(), f).await?;
+                let lanes = Lane::ALL
+                    .into_iter()
+                    .map(|lane| ctx.jobs.queue_state(lane))
+                    .collect();
                 let summary = format!("{} job(s)", jobs.len());
-                Ok((ListResult { jobs, next_cursor }, summary))
+                Ok((
+                    ListResult {
+                        jobs,
+                        next_cursor,
+                        lanes,
+                    },
+                    summary,
+                ))
             })
         },
     ));
@@ -99,7 +191,11 @@ pub fn register_job_tools(reg: &mut Registry) {
                     .jobs
                     .wait(&ctx.job_caller(), &JobId(args.job_id), timeout)
                     .await?;
-                let summary = format!("job {} is {}", job.job_id, job.status.wire());
+                let summary = if done && job.all_cached {
+                    NOTHING_CHANGED.to_string()
+                } else {
+                    format!("job {} is {}", job.job_id, job.status.wire())
+                };
                 Ok((WaitResult { job, done }, summary))
             })
         },
@@ -107,29 +203,36 @@ pub fn register_job_tools(reg: &mut Registry) {
 
     reg.register(typed_tool(
         "job.cancel",
-        "Cancels a job: a queued job at once, a running one through its engine (it is cancelled when it stops). A finished job is returned as it is.",
+        "Cancels jobs: exactly one of `job_id`, `ids` (1–500 job ids), `batch_id` or `all_mine: true` (every unfinished job your caller kind submitted). A queued job is cancelled at once, a running one through its engine (it is cancelled when it stops). A finished job is returned as it is.",
         EffectClass::Write,
         JOBS_MODULE,
-        |ctx, args: JobArgs| {
+        |ctx, args: CancelArgs| {
             Box::pin(async move {
-                let job = ctx
+                let selector = args
+                    .selector()
+                    .map_err(|why| params_invalid(why, &ctx.trace_id))?;
+                let one = matches!(selector, CancelSelector::One(_));
+                let mut jobs = ctx
                     .jobs
-                    .cancel(&ctx.job_caller(), &JobId(args.job_id))
+                    .cancel_selected(&ctx.job_caller(), selector)
                     .await?;
-                let summary = format!("job {} is {}", job.job_id, job.status.wire());
-                Ok((JobResultOut { job }, summary))
+                if one && let Some(job) = jobs.pop() {
+                    let summary = format!("job {} is {}", job.job_id, job.status.wire());
+                    return Ok((CancelResult::One { job: Box::new(job) }, summary));
+                }
+                let summary = format!("{} job(s) cancelled or ended", jobs.len());
+                Ok((CancelResult::Many { jobs }, summary))
             })
         },
     ));
 
     reg.register(typed_tool(
         JOB_RETRY,
-        "Runs a failed or cancelled job again as a new job, whose `retry_of` is the old one. The tool call that made the job runs again for you, so it asks for the same confirmations and counts against the same caps.",
+        "Runs a failed or cancelled job again as a new job, whose `retry_of` is the old one and which keeps its batch and index: `job_id`, or `batch_id` for the newest attempt at each index of a batch that failed or was cancelled (the others are listed in `refused`). A job already retried is never retried again. The tool call that made the job runs again for you, so it asks for the same confirmations and counts against the same caps.",
         EffectClass::Write,
         JOBS_MODULE,
-        |ctx, args: JobArgs| {
+        |ctx, args: RetryArgs| {
             Box::pin(async move {
-                let id = JobId(args.job_id.clone());
                 let Some(redispatch) = &ctx.redispatch else {
                     return Err(ErrorBody::new(
                         &codes::CORE_BUG,
@@ -137,15 +240,55 @@ pub fn register_job_tools(reg: &mut Registry) {
                         ctx.trace_id.clone(),
                     ));
                 };
-                let job = redispatch.retry(ctx, &id).await?;
-                let summary = format!("job {} retries {}", job.job_id, args.job_id);
-                Ok((
-                    RetryResult {
-                        job,
-                        retry_of: args.job_id,
-                    },
-                    summary,
-                ))
+                match (args.job_id, args.batch_id) {
+                    (Some(job_id), None) => {
+                        let job = redispatch.retry(ctx, &JobId(job_id.clone())).await?;
+                        let summary = format!("job {} retries {job_id}", job.job_id);
+                        Ok((
+                            RetryResult::One {
+                                job: Box::new(job),
+                                retry_of: job_id,
+                            },
+                            summary,
+                        ))
+                    }
+                    (None, Some(batch_id)) => {
+                        let caller = ctx.job_caller();
+                        let batch = ctx
+                            .jobs
+                            .retry_batch(&caller, &batch_id, |id| {
+                                Box::pin(async move { redispatch.retry_in_batch(ctx, &id).await })
+                            })
+                            .await?;
+                        let summary = format!(
+                            "{} job(s) of batch {batch_id} retried, {} not",
+                            batch.retried.len(),
+                            batch.refused.len()
+                        );
+                        Ok((RetryResult::Batch(batch), summary))
+                    }
+                    _ => Err(params_invalid(
+                        "job.retry takes exactly one of job_id or batch_id".to_string(),
+                        &ctx.trace_id,
+                    )),
+                }
+            })
+        },
+    ));
+
+    reg.register(typed_tool(
+        "job.move",
+        "Moves a job that waits its turn to the front (`next`) or the back (`last`) of its own class in its lane. It never moves a job ahead of a higher class, nor touches a prompt in the engine; a job with the engine, running or finished gets job.not_queued.",
+        EffectClass::Write,
+        JOBS_MODULE,
+        |ctx, args: MoveArgs| {
+            Box::pin(async move {
+                let job = ctx
+                    .jobs
+                    .move_job(&ctx.job_caller(), &JobId(args.job_id), args.to)
+                    .await?;
+                let summary = format!("job {} moved", job.job_id);
+                Ok((JobResultOut { job }, summary))
             })
         },
     ));

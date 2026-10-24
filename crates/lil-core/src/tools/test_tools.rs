@@ -15,7 +15,7 @@
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
-//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?}` | `{job}`: a job of kind `test.job` |
+//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
 //!
@@ -25,7 +25,11 @@
 //! `params.invalid`, `disk_full` once with `store.disk_full`. Its priority is the argument,
 //! else the caller's class (CORE-124). A job with `engine` passes through `submitting` and the
 //! fail points `jobs.after_post` and `jobs.after_outputs`, as an engine job would;
-//! `external_side_effects` marks it as hosted or paid work would be (CORE-128).
+//! `external_side_effects` marks it as hosted or paid work would be (CORE-128). Plan 4a's
+//! test contract (Global Constraints, "Test-channel tools"): `phases` are set in order once it
+//! executes (`JobCtx::set_phase`), `silent_secs` keeps it executing that long with no progress
+//! (the stall rule's test, ARCH-072), and `batch: n` (1–500) submits `n` such jobs as one
+//! batch (P4a-R13), each of which `job.retry` runs again alone.
 //!
 //! `test.comfy_submit` (a `comfy.prompt` job) lives with the engines (`engines::tools`), which
 //! the server registers on test channels.
@@ -154,6 +158,18 @@ impl TestJobHandler {
             job.failpoint("jobs.after_post").map_err(io)?;
             job.set_substatus(Substatus::Executing).await;
         }
+        for phase in &args.phases {
+            job.set_phase(phase);
+        }
+        if args.silent_secs > 0 {
+            let mut cancel = job.cancel.clone();
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(args.silent_secs)) => {}
+                _ = cancel.wait_for(|c| *c) => {
+                    return Err(JobFailure::Final(cancelled_error(&job.trace_id)));
+                }
+            }
+        }
         if args.gated {
             let mut cancel = job.cancel.clone();
             let gate = job_gate(job.id.as_str());
@@ -242,11 +258,30 @@ struct TestJobArgs {
     engine: Option<EngineKind>,
     #[serde(default)]
     external_side_effects: bool,
+    /// Set in order once the job executes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phases: Vec<String>,
+    /// Executes this long with no progress before it goes on.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    silent_secs: u64,
+    /// 1–500: that many jobs, one batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 500))]
+    batch: Option<u32>,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The most jobs one `test.job {batch}` submits.
+const MAX_TEST_BATCH: u32 = 500;
+
 #[derive(Debug, Serialize, JsonSchema)]
-struct TestJobResult {
-    job: JobSummary,
+#[serde(untagged)]
+enum TestJobResult {
+    One { job: Box<JobSummary> },
+    Batch { jobs: Vec<JobSummary> },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -255,8 +290,14 @@ struct JobReleaseArgs {
     job_id: String,
 }
 
-/// `test.job`'s body: the handler reads `args` back from the job's spec.
-async fn test_job(ctx: &CallCtx, args: TestJobArgs) -> Result<(TestJobResult, String), ErrorBody> {
+/// `test.job`'s body: the handler reads `args` back from the job's spec. A batch's jobs each
+/// keep the call without `batch` as the tool call that made them, so `job.retry` runs one job
+/// again, not the batch.
+async fn test_job(
+    ctx: &CallCtx,
+    mut args: TestJobArgs,
+) -> Result<(TestJobResult, String), ErrorBody> {
+    let batch = args.batch.take();
     let raw = serde_json::to_value(&args).expect("test.job arguments serialise");
     let spec = JobSpec {
         kind: TEST_JOB_KIND,
@@ -265,7 +306,7 @@ async fn test_job(ctx: &CallCtx, args: TestJobArgs) -> Result<(TestJobResult, St
             .priority
             .unwrap_or_else(|| Priority::for_caller(&ctx.session.caller, false)),
         module: TEST_MODULE.to_string(),
-        args: raw,
+        args: raw.clone(),
         project: ctx.project.clone(),
         asset_id: None,
         doc_id: None,
@@ -276,9 +317,25 @@ async fn test_job(ctx: &CallCtx, args: TestJobArgs) -> Result<(TestJobResult, St
         group: None,
         external_side_effects: args.external_side_effects,
     };
-    let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
-    let summary = format!("job {} is {}", job.job_id, job.status.wire());
-    Ok((TestJobResult { job }, summary))
+    let Some(n) = batch else {
+        let job = ctx.jobs.submit(&ctx.job_caller(), spec).await?;
+        let summary = format!("job {} is {}", job.job_id, job.status.wire());
+        return Ok((TestJobResult::One { job: Box::new(job) }, summary));
+    };
+    if !(1..=MAX_TEST_BATCH).contains(&n) {
+        return Err(params_invalid(
+            ctx,
+            format!("batch must be 1–{MAX_TEST_BATCH}, not {n}"),
+        ));
+    }
+    let mut caller = ctx.job_caller();
+    if let Some(origin) = &mut caller.origin {
+        origin.arguments = raw.clone();
+    }
+    let specs = (0..n).map(|_| spec.clone()).collect();
+    let jobs = ctx.jobs.submit_batch(&caller, specs).await?;
+    let summary = format!("{} job(s) in batch {}", jobs.len(), jobs[0].batch_id);
+    Ok((TestJobResult::Batch { jobs }, summary))
 }
 
 /// Run counters per tool and label.

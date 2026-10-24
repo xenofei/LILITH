@@ -1,4 +1,5 @@
-//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run;
+//! Fail points (QA-066, QA-055): named places in the store (and, for `jobs.*`, in a job's run
+//! or its withdrawal;
 //! for `confirm.after_answer`, in a confirmation's answer) where a test makes the next file call
 //! fail, or ends the process as a crash would.
 //!
@@ -47,6 +48,10 @@ pub const NAMES: &[&str] = &[
     "meter.after_usage_line",
     // After a cap reservation commits, before the call runs (Task 16).
     "caps.after_reserve",
+    // After the engine answered a paused lane's withdrawal, before the job's row
+    // changes (plan 4a, CORE-160). Only `abort` means anything here: an error is logged and
+    // the withdrawal goes on (Appendix G).
+    "jobs.after_withdraw",
 ];
 
 /// The exit code of the `abort` action.

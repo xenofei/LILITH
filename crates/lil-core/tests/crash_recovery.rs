@@ -1068,3 +1068,124 @@ fn a_taken_up_job_stages_beside_a_dead_runs_copy() {
     assert_eq!(name, format!("2_{}", left[0]), "{job}");
     assert!(cache.join(&left[0]).is_file(), "the dead run's copy stays");
 }
+
+/// Review Focus 4 (CORE-160, CORE-120, ARCH-022): a real core killed right after ComfyUI
+/// answered a paused lane's withdrawal, before the job's row changed (fail point
+/// `jobs.after_withdraw`): the next core finds the job with its engine id, so it is
+/// `interrupted`, and the fake saw exactly one `POST /prompt` for it.
+#[test] // spec: CORE-160, CORE-120, ARCH-022, QA-055
+fn crash_after_withdraw_never_posts_twice() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, mpsc};
+    let env = TestEnv::new();
+    let fake = lil_testkit::FakeComfy::start();
+    attach_fake(&env, &fake);
+    let id = {
+        let spec = failpoints::spec(&[("jobs.after_withdraw", "abort")]);
+        let mut core = CoreFixture::start_with_env(&env, &[(failpoints::ENV, &spec)]);
+        let mut pipe = RawPipe::connect(&env);
+        assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+        // When the suite's prompt arrives, an outside prompt starts first, so the suite's
+        // waits in ComfyUI's queue behind it (`queued_in_engine`).
+        let (arrived_tx, arrived_rx) = mpsc::sync_channel::<()>(1);
+        let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
+        let (arrived_tx, go_rx) = (Mutex::new(arrived_tx), Mutex::new(go_rx));
+        let first = AtomicBool::new(true);
+        fake.on_prompt(move |_| {
+            if first.swap(false, Ordering::SeqCst) {
+                let _ = arrived_tx.lock().map(|tx| tx.send(()));
+                let _ = go_rx.lock().map(|rx| rx.recv_timeout(DEADLINE));
+            }
+        });
+        let deadline = std::time::Instant::now() + DEADLINE;
+        let id = loop {
+            let made = pipe.tool("test.comfy_submit", json!({"graph": "tiny"}), Some(&key()));
+            if made["status"] == "ok" {
+                break made["structured"]["job"]["job_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            }
+            assert!(std::time::Instant::now() < deadline, "{made}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        arrived_rx
+            .recv_timeout(DEADLINE)
+            .expect("the suite's prompt never reached ComfyUI");
+        let _outside = fake.add_outside_prompt(true, None);
+        go_tx.send(()).expect("the fake's hook is gone");
+        let deadline = std::time::Instant::now() + DEADLINE;
+        loop {
+            let listed = pipe.tool_ok("jobs.list", json!({"ids": [id]}), None);
+            if listed["jobs"][0]["substatus"] == "queued_in_engine" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{listed}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut app = lil_testkit::TestApp::start_with_capabilities(
+            &env,
+            None,
+            &[],
+            &[
+                "events.v1",
+                "tools.v1",
+                "jobs.v1",
+                "confirmations.v1",
+                "caps.v1",
+                "queue.v1",
+            ],
+        );
+        // The pause never answers: the core dies in it, so the call is left to its thread.
+        std::thread::spawn(move || {
+            let _ = app.call("app/queue.pause", json!({}));
+        });
+        assert_eq!(
+            core.wait_exit(DEADLINE),
+            Some(ABORT_EXIT),
+            "the core didn't end at jobs.after_withdraw"
+        );
+        id
+    };
+    let posts_for = |fake: &lil_testkit::FakeComfy| {
+        fake.requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path.trim_start_matches("/api") == "/prompt")
+            .count()
+    };
+    assert_eq!(posts_for(&fake), 1);
+    assert_eq!(
+        fake.requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.trim_start_matches("/api") == "/queue")
+            .count(),
+        1,
+        "the withdrawal's delete was answered before the core died"
+    );
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/cancel")),
+        "a withdrawal never cancels"
+    );
+    let _core = CoreFixture::start(&env);
+    let mut pipe = RawPipe::connect(&env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    let waited = pipe.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    assert_eq!(waited["done"], true, "{waited}");
+    let job = &waited["job"];
+    assert_eq!(
+        (job["status"].as_str(), job["substatus"].as_str()),
+        (Some("failed"), Some("interrupted")),
+        "{job}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(posts_for(&fake), 1, "never posted twice");
+    let listed = pipe.tool_ok("jobs.list", json!({"kind": "comfy.prompt"}), None);
+    assert_eq!(
+        listed["jobs"].as_array().unwrap().len(),
+        1,
+        "no re-run: {listed}"
+    );
+}

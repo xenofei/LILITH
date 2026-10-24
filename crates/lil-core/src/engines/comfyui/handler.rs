@@ -50,6 +50,25 @@
 //!    written salvaged by the prefix ([`super::salvage::salvage`]); the runner re-runs an
 //!    `agent` job once, unless it has external side effects (CORE-128).
 //!
+//! **Plan 4a's job fields** (CORE-117; Appendix G "Jobs"): the phase follows the class type of
+//! the node ComfyUI reports `executing` ([`phase_of`]), and is `ingesting` from
+//! `execution_success` until the outputs are staged; each `executing` and `progress` is a sign
+//! of life, and a node is `indeterminate` until it reports measurable progress; the nodes of
+//! `execution_cached` are the job's `cache_hit_nodes`, and when every node of the prompt but its
+//! output nodes (those with a `filename_prefix`, which always run again) was cached the job is
+//! `all_cached`; the GPU adapter's name is its `engine_device`.
+//!
+//! **Withdrawal** ([`ComfyWithdraw`], CORE-160; plan 4a ruling, 2026-10-24): a paused lane's
+//! suite prompt is taken out of ComfyUI's queue only while `/queue` lists it pending, with
+//! `POST /queue {"delete"}` (which never touches a running prompt, so one that started in
+//! between runs on), under the same lock as the POST and the cancel; `/api/jobs/{id}` then
+//! says whether it is gone (asked again a few times when ComfyUI can't say; never seen gone,
+//! it isn't withdrawn). The attempt ignores its prompt's disappearance and ends when the
+//! runner tells it; the old id is kept in the row's `withdrawn_id`, and the job's next attempt,
+//! in this core run or after a restart, asks about it (`/api/jobs/{old}`, `/history/{old}`)
+//! before it posts a new one, and follows it if it is still there (CORE-120). A paused lane's
+//! job that hasn't posted yet is held at the POST ([`JobCtx::hold_if_paused`]).
+//!
 //! **Cancel** ([`JobHandler::cancel_in_engine`]) posts `POST /api/jobs/{id}/cancel` once, never
 //! `/interrupt` (ARCH-021); the POST and the cancel take one lock, so a prompt is either never
 //! posted or cancelled after it was. The `CancelEnginePrompts` shutdown step
@@ -79,7 +98,7 @@ use crate::engines::{EngineClass, Engines};
 use crate::jobs::record;
 use crate::jobs::{
     EngineKind, ExecWindow, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobId, JobSpec,
-    Lane, Priority, Substatus, cancelled_error,
+    Lane, Priority, Substatus, Withdraw, WithdrawOutcome, cancelled_error,
 };
 use crate::store::{WsPath, fsops};
 
@@ -174,6 +193,70 @@ pub fn prefix_outputs(graph: &mut Value, job: &JobId) -> String {
         }
     }
     prefix
+}
+
+/// The nodes `all_cached` judges (CORE-117; Appendix G, plan 4a ruling, 2026-10-24): every
+/// node ComfyUI executes, which is the graph's output nodes and their ancestors through its
+/// `[node_id, slot]` links, except the nodes whose `filename_prefix` the suite sets
+/// ([`prefix_outputs`]): only the suite's own prefix (part of the cache key) makes those run
+/// again. An output node without that input (a sampler marked `output_node`, a preview) is
+/// judged like any other, and a node with no path to an output is left out. Output nodes are
+/// those whose class `object_info` marks `output_node`; for a class it doesn't list (or no
+/// `object_info`), a node with a `filename_prefix` input.
+pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<String> {
+    let Some(nodes) = graph.as_object() else {
+        return HashSet::new();
+    };
+    let prefixed = |n: &Value| {
+        n.get("inputs")
+            .and_then(|i| i.get("filename_prefix"))
+            .is_some()
+    };
+    let output = |n: &Value| {
+        let class = n
+            .get("class_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match object_info.and_then(|o| o.get(class)) {
+            Some(info) => info.get("output_node").and_then(Value::as_bool) == Some(true),
+            None => prefixed(n),
+        }
+    };
+    let mut todo: Vec<&str> = nodes
+        .iter()
+        .filter(|(_, n)| output(n))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut executed: HashSet<&str> = todo.iter().copied().collect();
+    while let Some(id) = todo.pop() {
+        let inputs = nodes
+            .get(id)
+            .and_then(|n| n.get("inputs"))
+            .and_then(Value::as_object);
+        // A linked `filename_prefix` is replaced by the suite's own string before the POST,
+        // so what it links to never runs (m2).
+        let links = inputs
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| name.as_str() != "filename_prefix")
+            .map(|(_, link)| link);
+        for link in links {
+            let Some([from, slot]) = link.as_array().map(Vec::as_slice) else {
+                continue;
+            };
+            let (Some(from), true) = (from.as_str(), slot.is_u64()) else {
+                continue;
+            };
+            if nodes.contains_key(from) && executed.insert(from) {
+                todo.push(from);
+            }
+        }
+    }
+    executed
+        .into_iter()
+        .filter(|id| !prefixed(&nodes[*id]))
+        .map(str::to_string)
+        .collect()
 }
 
 /// `lil_<first 16 hex of the job id>_`.
@@ -388,12 +471,19 @@ pub(crate) struct Live {
     posted: tokio::sync::Mutex<Posted>,
     /// The shutdown step ran: the job ends interrupted.
     shutdown: AtomicBool,
+    /// A pause is withdrawing (or withdrew) the prompt: its disappearance is no outside cancel,
+    /// and the attempt ends once the runner tells it.
+    withdrawn: AtomicBool,
 }
 
 #[derive(Debug, Default)]
 struct Posted {
     prompt_id: Option<String>,
     cancel_sent: bool,
+    /// A withdrawal sent its delete for this prompt id and never saw where the prompt went
+    /// (recommendation B, plan 4a ruling, 2026-10-24): finding it gone later is the
+    /// withdrawal's doing, not an outside cancel.
+    deleted: Option<String>,
 }
 
 impl SuitePrompts {
@@ -530,6 +620,203 @@ impl Drop for LiveGuard {
     }
 }
 
+/// The phase of a node of class type `class` (Appendix G "Phase"), the first match winning:
+/// `Loader` → `loading_models`; `TextEncode` → `encoding`; `Sampler` → `sampling`; `Decode` →
+/// `decoding`; starting `Save` or `Preview` → `saving`; anything else `other`.
+pub fn phase_of(class: &str) -> &'static str {
+    if class.contains("Loader") {
+        "loading_models"
+    } else if class.contains("TextEncode") {
+        "encoding"
+    } else if class.contains("Sampler") {
+        "sampling"
+    } else if class.contains("Decode") {
+        "decoding"
+    } else if class.starts_with("Save") || class.starts_with("Preview") {
+        "saving"
+    } else {
+        "other"
+    }
+}
+
+/// The phase from `execution_success` until the outputs are staged.
+pub const INGESTING_PHASE: &str = "ingesting";
+
+/// Withdraws a pending `comfy.prompt` prompt for a paused lane (module docs, CORE-160; plan 4a
+/// ruling, 2026-10-24): only while `/queue` lists it pending, with `POST /queue {"delete"}`,
+/// which never touches a running prompt, under the lock of the POST; then `/api/jobs/{id}`
+/// says whether it is gone (withdrawn) or started (it runs on). When ComfyUI can't say, it is
+/// asked again [`LOOK_AGAIN`] times; a prompt never seen gone isn't withdrawn (plan 4a
+/// ruling, 2026-10-24): the attempt follows it on.
+#[derive(Debug)]
+pub struct ComfyWithdraw {
+    engines: Weak<Engines>,
+}
+
+/// How often a withdrawal asks again where a prompt is when ComfyUI didn't say, how long it
+/// waits before each, and the bound on all its looks together (N2: a ComfyUI that takes
+/// connections but doesn't answer never holds up a withdrawal for longer).
+const LOOK_AGAIN: u32 = 3;
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(250);
+const LOOKS_WITHIN: Duration = Duration::from_secs(5);
+/// The bound on the `/queue` read and the delete together, under the POST's lock (M3): a
+/// hung ComfyUI never holds a cancel or the shutdown step's `cancel_all` for longer.
+const LOCKED_WITHIN: Duration = Duration::from_secs(5);
+
+/// Where a prompt is after a withdrawal's delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterDelete {
+    Gone,
+    Pending,
+    Started,
+    Unknown,
+}
+
+impl ComfyWithdraw {
+    pub fn new(engines: Weak<Engines>) -> ComfyWithdraw {
+        ComfyWithdraw { engines }
+    }
+
+    /// Where `prompt_id` is now: `/api/jobs/{id}` first (absent: gone; `pending`: still
+    /// queued; anything else: it started), else the fuller look of [`ComfyClient::state`].
+    async fn after_delete(client: &ComfyClient, prompt_id: &str) -> AfterDelete {
+        match client.job_detail(prompt_id).await {
+            Ok(None) => return AfterDelete::Gone,
+            Ok(Some(job)) if job.get("status").and_then(Value::as_str) == Some("pending") => {
+                return AfterDelete::Pending;
+            }
+            Ok(Some(_)) => return AfterDelete::Started,
+            Err(_) => {}
+        }
+        match client.state(prompt_id).await {
+            Ok(RemoteState::Gone) => AfterDelete::Gone,
+            Ok(RemoteState::Queued) => AfterDelete::Pending,
+            Ok(RemoteState::Running | RemoteState::Done(_) | RemoteState::Cancelled) => {
+                AfterDelete::Started
+            }
+            Err(_) => AfterDelete::Unknown,
+        }
+    }
+
+    /// Where `prompt_id` went after the delete: [`ComfyWithdraw::after_delete`], asked again
+    /// while ComfyUI doesn't say, all within [`LOOKS_WITHIN`] (else unknown).
+    async fn looks(client: &ComfyClient, prompt_id: &str) -> AfterDelete {
+        let looks = async {
+            let mut after = Self::after_delete(client, prompt_id).await;
+            for _ in 0..LOOK_AGAIN {
+                if after != AfterDelete::Unknown {
+                    break;
+                }
+                tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+                after = Self::after_delete(client, prompt_id).await;
+            }
+            after
+        };
+        tokio::time::timeout(LOOKS_WITHIN, looks)
+            .await
+            .unwrap_or(AfterDelete::Unknown)
+    }
+
+    async fn run(&self, job: &JobId, prompt_id: &str) -> WithdrawOutcome {
+        let Some(engines) = self.engines.upgrade() else {
+            return WithdrawOutcome::NotPending;
+        };
+        let comfy = engines.comfy();
+        let (Some(live), Some(client)) = (comfy.prompts().get(job), comfy.client()) else {
+            return WithdrawOutcome::NotPending;
+        };
+        {
+            // No POST or cancel of the attempt runs while `/queue` is read and the delete sent.
+            let mut posted = live.posted.lock().await;
+            if posted.prompt_id.as_deref() != Some(prompt_id)
+                || posted.cancel_sent
+                || live_shut(&live)
+            {
+                return WithdrawOutcome::NotPending;
+            }
+            let locked = tokio::time::timeout(LOCKED_WITHIN, async {
+                let queue = match client.queue().await {
+                    Ok(queue) => queue,
+                    Err(e) => {
+                        tracing::info!(job_id = %job, prompt_id, error = %e, "/queue can't be read; the prompt is not withdrawn");
+                        return Some(WithdrawOutcome::NotPending);
+                    }
+                };
+                if queue.running.iter().any(|e| e.prompt_id == prompt_id) {
+                    return Some(WithdrawOutcome::AlreadyStarted);
+                }
+                if !queue.pending.iter().any(|e| e.prompt_id == prompt_id) {
+                    return Some(WithdrawOutcome::NotPending);
+                }
+                // Its disappearance from now on is the withdrawal's, not an outside cancel.
+                live.withdrawn.store(true, Ordering::SeqCst);
+                posted.deleted = Some(prompt_id.to_string());
+                if let Err(e) = client.delete_pending(prompt_id).await {
+                    tracing::warn!(job_id = %job, prompt_id, error = %e, "the withdrawal's delete got no answer; where the prompt is decides");
+                }
+                None
+            })
+            .await;
+            match locked {
+                Ok(Some(outcome)) => return outcome,
+                Ok(None) => {}
+                // The delete may have been sent: the looks (and, unanswered, the attempt's
+                // follow) decide, as for an unanswered delete.
+                Err(_) if posted.deleted.as_deref() == Some(prompt_id) => {
+                    tracing::warn!(job_id = %job, prompt_id, "ComfyUI didn't answer the withdrawal's delete in time");
+                }
+                Err(_) => {
+                    tracing::info!(job_id = %job, prompt_id, "/queue didn't answer in time; the prompt is not withdrawn");
+                    return WithdrawOutcome::NotPending;
+                }
+            }
+        }
+        // The looks run without the lock (N2): a cancel or the shutdown step goes ahead
+        // meanwhile. Whether or not the delete was answered, only where the prompt is decides;
+        // a look with no answer is asked again, and still unknown it is no withdrawal.
+        let after = Self::looks(client, prompt_id).await;
+        let mut posted = live.posted.lock().await;
+        let ours = posted.prompt_id.as_deref() == Some(prompt_id)
+            && !posted.cancel_sent
+            && !live_shut(&live);
+        let outcome = match after {
+            AfterDelete::Gone if ours => WithdrawOutcome::Withdrawn,
+            // Cancelled or stopped meanwhile: that path ends the attempt.
+            AfterDelete::Gone | AfterDelete::Pending | AfterDelete::Unknown => {
+                WithdrawOutcome::NotPending
+            }
+            AfterDelete::Started => WithdrawOutcome::AlreadyStarted,
+        };
+        if after == AfterDelete::Unknown {
+            // Recommendation B: the attempt follows it on and remembers the delete.
+            tracing::warn!(job_id = %job, prompt_id, "ComfyUI doesn't say where a prompt is after the withdrawal's delete; it isn't taken as withdrawn, and the attempt follows it on");
+        } else {
+            posted.deleted = None;
+        }
+        if outcome != WithdrawOutcome::Withdrawn {
+            live.withdrawn.store(false, Ordering::SeqCst);
+            return outcome;
+        }
+        posted.cancel_sent = true;
+        WithdrawOutcome::Withdrawn
+    }
+}
+
+/// The shutdown step ran for `live`'s attempt.
+fn live_shut(live: &Live) -> bool {
+    live.shutdown.load(Ordering::SeqCst)
+}
+
+impl Withdraw for ComfyWithdraw {
+    fn withdraw<'a>(
+        &'a self,
+        job: &'a JobId,
+        external_id: &'a str,
+    ) -> JobFuture<'a, WithdrawOutcome> {
+        Box::pin(self.run(job, external_id))
+    }
+}
+
 /// Runs `comfy.prompt` jobs (module docs).
 #[derive(Debug)]
 pub struct ComfyPromptHandler {
@@ -600,13 +887,30 @@ fn unreachable(e: &ComfyError, job: &JobCtx) -> JobFailure {
     ))
 }
 
-/// The prompt id an earlier attempt persisted (CORE-120), read from the job's row. A row that
-/// can't be read is no answer (Task 12 re-review N3): a job with external side effects ends
+/// The prompt id an earlier attempt persisted (CORE-120), and the one a pause withdrew
+/// (`withdrawn_id`, CORE-160), read from the job's row. A row that can't be read is no answer (Task 12 re-review N3): a job with external side effects ends
 /// `Unknown`, since an earlier prompt may have been sent and paid for; any other job is retried
 /// later. Never "no earlier prompt", which would post a new one.
-async fn earlier_prompt(job: &JobCtx) -> Result<Option<String>, JobFailure> {
-    match record::get(&job.state, job.id.as_str()).await {
-        Ok(row) => Ok(row.and_then(|r| r.external_id)),
+async fn earlier_prompt(job: &JobCtx) -> Result<Earlier, JobFailure> {
+    let read = async {
+        let Some(row) = record::get(&job.state, job.id.as_str()).await? else {
+            return Ok(Earlier::default());
+        };
+        // A `withdrawn_id` the row copied from the job it re-runs (N5) is that job's prompt.
+        let inherited = match (&row.withdrawn_id, &row.retry_of) {
+            (Some(old), Some(of)) => record::get(&job.state, of)
+                .await?
+                .is_some_and(|r| r.withdrawn_id.as_ref() == Some(old)),
+            _ => false,
+        };
+        Ok::<_, crate::state::StateError>(Earlier {
+            external_id: row.external_id,
+            withdrawn_id: row.withdrawn_id,
+            inherited,
+        })
+    };
+    match read.await {
+        Ok(earlier) => Ok(earlier),
         Err(e) => {
             tracing::error!(job_id = %job.id, error = %e, "the job's row can't be read before its attempt");
             let e = error(
@@ -622,6 +926,15 @@ async fn earlier_prompt(job: &JobCtx) -> Result<Option<String>, JobFailure> {
             })
         }
     }
+}
+
+/// What a job's row says about prompts posted before its attempt ([`earlier_prompt`]).
+#[derive(Debug, Default)]
+struct Earlier {
+    external_id: Option<String>,
+    withdrawn_id: Option<String>,
+    /// `withdrawn_id` is the prompt of the job this one re-runs, not its own.
+    inherited: bool,
 }
 
 /// The job stops because the core is stopping (the shutdown step ran): interrupted.
@@ -670,7 +983,7 @@ impl JobHandler for ComfyPromptHandler {
                     // An earlier prompt with external side effects that can't be looked at is
                     // unknown (fail closed, CORE-128); so is a row that can't be read.
                     let earlier = match earlier_prompt(job).await {
-                        Ok(earlier) => earlier.is_some(),
+                        Ok(earlier) => earlier.external_id.is_some(),
                         Err(failure) if external => return Err(failure),
                         Err(_) => false,
                     };
@@ -687,6 +1000,19 @@ impl JobHandler for ComfyPromptHandler {
                 e.trace_id.clone_from(&job.trace_id);
                 JobFailure::Final(e)
             })?;
+            let classes = args
+                .graph
+                .as_object()
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .map(|(id, n)| {
+                            let class = n.get("class_type").and_then(Value::as_str);
+                            (id.clone(), class.unwrap_or_default().to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut attempt = Attempt {
                 job,
                 comfy: &comfy,
@@ -702,6 +1028,9 @@ impl JobHandler for ComfyPromptHandler {
                 started: None,
                 accepted: false,
                 abandoned: false,
+                graph: args.graph.clone(),
+                classes,
+                cached: HashSet::new(),
             };
             let mut result = attempt.run(args).await;
             // CORE-128: work with external side effects that ComfyUI accepted is never retried
@@ -767,6 +1096,12 @@ struct Attempt<'a> {
     accepted: bool,
     /// The attempt leaves its prompt behind (a fail point stopped it after the POST).
     abandoned: bool,
+    /// The class type of each node of the job's graph, by node id (the phase, Appendix G).
+    classes: HashMap<String, String>,
+    /// The nodes ComfyUI served from its cache.
+    cached: HashSet<String>,
+    /// The job's graph as it came (`all_cached` judges the nodes ComfyUI executes).
+    graph: Value,
 }
 
 /// How a followed prompt ended, before its outcome is made.
@@ -780,6 +1115,8 @@ enum Ended {
     Interrupted,
     /// Lost in a restart (or with the core's own engine).
     Lost,
+    /// Gone after a withdrawal's delete whose outcome nobody saw (recommendation B).
+    Withdrawn,
 }
 
 impl Attempt<'_> {
@@ -789,6 +1126,11 @@ impl Attempt<'_> {
 
     fn shut(&self) -> bool {
         self.live.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// A pause withdrew (or is withdrawing) the prompt (module docs, "Withdrawal").
+    fn withdrawn(&self) -> bool {
+        self.live.withdrawn.load(Ordering::SeqCst)
     }
 
     /// `Unknown`: whether the work ran (and was charged) can't be told (CORE-128).
@@ -804,7 +1146,12 @@ impl Attempt<'_> {
         // CORE-120: an earlier attempt's prompt is asked about before anything is posted. A
         // row that can't be read says nothing about one, so nothing is posted (re-review N3:
         // fail closed; paid work may have been sent).
-        let earlier = earlier_prompt(self.job).await?;
+        let row = earlier_prompt(self.job).await?;
+        let earlier = match (row.external_id, row.withdrawn_id) {
+            (Some(prompt_id), _) => Some(prompt_id),
+            (None, None) => None,
+            (None, Some(old)) => self.settle_withdrawn(&old, row.inherited).await?,
+        };
         if let Some(prompt_id) = earlier {
             // Known to the shutdown step and to a cancel at once (I2), registered before the
             // shutdown check: a step that ran meanwhile missed it, so it is cancelled here
@@ -1086,7 +1433,70 @@ impl Attempt<'_> {
         Ok(())
     }
 
-    /// `POST /prompt`, under the cancel lock (module docs, step 2).
+    /// The prompt a pause withdrew (the row's `withdrawn_id`, CORE-160), asked about before a
+    /// new one is posted, as an earlier attempt's is (CORE-120): `/api/jobs/{old}`, then
+    /// `/history/{old}` (and `/queue`). Still in ComfyUI, or done with outputs, it is the
+    /// job's prompt again and is followed (`Some`); gone, a new one may be posted (`None`).
+    /// `withdrawn_id` is cleared only with that answer, so after a stop, a crash or a restart
+    /// hold the next attempt asks again: the work never runs twice. A prompt `inherited` from
+    /// the job this one re-runs (N5) is never taken over (its outputs carry that job's
+    /// prefix): while it waits or runs, nothing is posted and the attempt is retried; once it
+    /// ended or is gone, a new prompt is posted.
+    async fn settle_withdrawn(
+        &self,
+        old: &str,
+        inherited: bool,
+    ) -> Result<Option<String>, JobFailure> {
+        let follow = match self.client.state(old).await {
+            Ok(RemoteState::Queued | RemoteState::Running) if inherited => {
+                tracing::info!(prompt_id = %old, "the prompt of the job this one re-runs is still in ComfyUI; the job waits for it");
+                self.wait_out(old).await?;
+                false
+            }
+            Ok(RemoteState::Queued | RemoteState::Running) => {
+                tracing::warn!(prompt_id = %old, "a withdrawn prompt is still in ComfyUI; it is followed");
+                true
+            }
+            Ok(RemoteState::Done(history)) => !inherited && succeeded(&history),
+            Ok(RemoteState::Gone | RemoteState::Cancelled) => false,
+            // Nothing is known: the row keeps it, and it is asked about again next time.
+            Err(e) => return Err(unreachable(&e, self.job)),
+        };
+        let follow = follow.then_some(old);
+        self.job
+            .settle_withdrawn(follow)
+            .await
+            .map_err(JobFailure::Final)?;
+        Ok(follow.map(str::to_string))
+    }
+
+    /// Waits, holding the lane, until `old`, the prompt of the job this one re-runs (N5), is
+    /// neither pending nor running, asking ComfyUI every [`POLL_EVERY`] (Appendix G, plan 4a
+    /// ruling, 2026-10-24). A cancel ends the attempt cancelled, the shutdown step interrupted;
+    /// a look that gets no answer is `comfyui.unreachable` (retried; the row keeps the id).
+    async fn wait_out(&self, old: &str) -> Result<(), JobFailure> {
+        let mut cancel = self.job.cancel.clone();
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(POLL_EVERY) => {}
+                () = cancel_set(&mut cancel) => {}
+            }
+            if self.cancelled() {
+                return Err(JobFailure::Final(cancelled_error(&self.job.trace_id)));
+            }
+            if self.shut() {
+                return Err(stopping(self.job));
+            }
+            match self.client.state(old).await {
+                Ok(RemoteState::Queued | RemoteState::Running) => {}
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(unreachable(&e, self.job)),
+            }
+        }
+    }
+
+    /// `POST /prompt`, under the cancel lock (module docs, step 2). A pause of the job's lane
+    /// that came before it is posted holds it instead (CORE-160): nothing is posted.
     async fn post(
         &mut self,
         prompt_id: &str,
@@ -1100,6 +1510,13 @@ impl Attempt<'_> {
         }
         if self.cancelled() {
             return Err(JobFailure::Final(cancelled_error(&self.job.trace_id)));
+        }
+        if self.job.hold_if_paused().await {
+            return Err(JobFailure::Retryable(error(
+                &codes::COMFYUI_UNREACHABLE,
+                "The job's lane was paused before its prompt was sent; it waits again.",
+                self.job,
+            )));
         }
         for resubmit in [false, true] {
             if resubmit {
@@ -1217,8 +1634,14 @@ impl Attempt<'_> {
                         }
                     }
                     Ok(RemoteState::Done(history)) => break ended_from_history(history),
+                    // Withdrawn by a pause: the runner ends the attempt.
+                    Ok(RemoteState::Cancelled | RemoteState::Gone) if self.withdrawn() => {}
                     Ok(RemoteState::Cancelled) => break Ended::Interrupted,
                     Ok(RemoteState::Gone) => {
+                        // The withdrawal's delete took after all (recommendation B).
+                        if self.live.posted.lock().await.deleted.as_deref() == Some(prompt_id) {
+                            break Ended::Withdrawn;
+                        }
                         // A restart closes the websocket; a queued prompt someone cancelled
                         // disappears while it stays connected (I1).
                         break if still_connected(&mut socket).await {
@@ -1267,18 +1690,49 @@ impl Attempt<'_> {
         match event {
             ComfyEvent::ExecutionStart { .. } => {
                 self.started = Some(self.comfy.clock.monotonic());
+                if let Some(gpu) = self.comfy.gpu_name() {
+                    self.job.set_engine_device(&gpu);
+                }
                 self.job.set_substatus(Substatus::Executing).await;
             }
-            ComfyEvent::Executing { node, .. } => self.node = node,
+            ComfyEvent::Cached { nodes, .. } => {
+                self.job.mark_cached(&nodes);
+                self.cached.extend(nodes);
+            }
+            ComfyEvent::Executing { node, .. } => {
+                if let Some(node) = &node {
+                    self.job.node_started();
+                    let class = self.classes.get(node).map_or("", String::as_str);
+                    self.job.set_phase(phase_of(class));
+                }
+                self.node = node;
+            }
             ComfyEvent::Progress { value, max, .. } => {
                 let node = self.node.clone();
                 self.report_progress(value, max, node);
+                self.job.measured();
             }
             ComfyEvent::ProgressState {
                 node, value, max, ..
-            } => self.report_progress(value, max, Some(node)),
+            } => {
+                // A node's own one-unit state is no measurable progress.
+                if max > 1 && self.node.as_deref() == Some(node.as_str()) {
+                    self.job.measured();
+                }
+                self.report_progress(value, max, Some(node));
+            }
             ComfyEvent::Executed { .. } => {}
-            ComfyEvent::Success { .. } => return Some(Ended::Success(None)),
+            ComfyEvent::Success { .. } => {
+                // Every node the prompt executes but the nodes whose `filename_prefix` the
+                // suite sets served from the cache: nothing changed (CORE-117; plan 4a ruling,
+                // 2026-10-24: only those run again).
+                let info = self.comfy.graph_info(&self.client).await.ok();
+                let judged = judged_nodes(&self.graph, info.as_ref().map(|i| &*i.object_info));
+                if !judged.is_empty() && judged.iter().all(|n| self.cached.contains(n)) {
+                    self.job.set_all_cached();
+                }
+                return Some(Ended::Success(None));
+            }
             ComfyEvent::Error {
                 exception_type,
                 message,
@@ -1289,6 +1743,8 @@ impl Attempt<'_> {
                     message,
                 });
             }
+            // Withdrawn by a pause: the runner ends the attempt.
+            ComfyEvent::Interrupted { .. } if self.withdrawn() => {}
             ComfyEvent::Interrupted { .. } => return Some(Ended::Interrupted),
             // Only while the job's own prompt executes (M2): before that, a preview is another
             // prompt's.
@@ -1420,6 +1876,22 @@ impl Attempt<'_> {
                     "ComfyUI restarted or stopped during the job and lost its prompt",
                 )
                 .await),
+            Ended::Withdrawn => {
+                // Never cancelled after this; the runner holds the job (or requeues it) with
+                // the id in `withdrawn_id`, and the next attempt's gone-check keeps it once.
+                self.live.posted.lock().await.cancel_sent = true;
+                tracing::info!(
+                    prompt_id,
+                    "a prompt whose withdrawal nobody saw is gone: it was withdrawn"
+                );
+                self.job.late_withdrawn(prompt_id).await;
+                Err(JobFailure::Retryable(error(
+                    &codes::COMFYUI_UNREACHABLE,
+                    "The paused lane's withdrawal took the prompt out of ComfyUI after all; the \
+                     job waits again.",
+                    self.job,
+                )))
+            }
         }
     }
 
@@ -1497,6 +1969,8 @@ impl Attempt<'_> {
         history: Option<Value>,
     ) -> Result<JobDone, JobFailure> {
         let windows: Vec<ExecWindow> = self.window(true).into_iter().collect();
+        self.job.measured();
+        self.job.set_phase(INGESTING_PHASE);
         self.job.set_substatus(Substatus::Ingesting).await;
         let history = match history {
             Some(history) => history,
@@ -1750,6 +2224,40 @@ fn output_files(history: &Value) -> Vec<OutputFile> {
 mod tests {
     use super::*;
 
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Fix round 3, I1 (CORE-117; Appendix G): every node ComfyUI executes is judged, an
+    /// output node without a `filename_prefix` included; only the nodes whose prefix the suite
+    /// sets, and nodes with no path to an output, are left out.
+    #[test] // spec: CORE-117
+    fn judged_nodes_are_the_executed_ones_but_the_prefixed() {
+        let graph = json!({
+            "1": {"class_type": "Loader", "inputs": {}},
+            "2": {"class_type": "Sampler", "inputs": {"model": ["1", 0], "seed": 7, "save_prefix": "x"}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": "p"}},
+            "4": {"class_type": "Preview", "inputs": {"images": ["2", 0]}},
+            "5": {"class_type": "Loader", "inputs": {}},
+            "6": {"class_type": "Unlisted", "inputs": {"images": ["2", 0], "filename_prefix": "p"}},
+            "7": {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": ["8", 0]}},
+            "8": {"class_type": "StringConcat", "inputs": {}},
+        });
+        let info = json!({
+            "Loader": {"output_node": false},
+            "Sampler": {"output_node": true},
+            "SaveImage": {"output_node": true},
+            "Preview": {"output_node": true},
+        });
+        // The sampler and the preview are output nodes without a prefix: judged. The Save
+        // and the unlisted prefixed node may re-run; loader 5 is used by nothing; string 8 only
+        // feeds a `filename_prefix`, which the suite replaces, so it never runs.
+        assert_eq!(judged_nodes(&graph, Some(&info)), set(&["1", "2", "4"]));
+        // Without object_info only the prefixed nodes are outputs: what they need is judged.
+        assert_eq!(judged_nodes(&graph, None), set(&["1", "2"]));
+        assert!(judged_nodes(&json!([]), None).is_empty());
+    }
+
     /// Task 12 re-review N1: an input inside a root the store keeps to itself is refused by its
     /// long name and by its 8.3 short name (`LILITH~1`, `GIT~1`, `TRASH~1`), as the store
     /// refuses it; a plain workspace file is accepted. On a volume with 8.3 names off the
@@ -1839,6 +2347,28 @@ mod tests {
             assert_eq!(graph[node]["inputs"]["filename_prefix"], prefix.as_str());
         }
         assert_eq!(graph["1"]["inputs"], json!({"width": 8}));
+    }
+
+    /// Appendix G's phase table, the first match winning.
+    #[test] // spec: CORE-117
+    fn the_phase_follows_the_node_class() {
+        for (class, phase) in [
+            ("CheckpointLoaderSimple", "loading_models"),
+            ("LoraLoaderModelOnly", "loading_models"),
+            ("CLIPTextEncode", "encoding"),
+            ("KSampler", "sampling"),
+            ("SamplerCustomAdvanced", "sampling"),
+            ("VAEDecode", "decoding"),
+            ("SaveImage", "saving"),
+            ("PreviewImage", "saving"),
+            ("EmptyImage", "other"),
+            ("ImageSave", "other"),
+            // The first match wins: a loader that decodes loads.
+            ("DecoderLoader", "loading_models"),
+            ("", "other"),
+        ] {
+            assert_eq!(phase_of(class), phase, "{class:?}");
+        }
     }
 
     #[test] // spec: ARCH-072

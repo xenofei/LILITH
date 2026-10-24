@@ -8,8 +8,9 @@
 //! - The jobs ([`crate::jobs`]) are the dispatcher's: before it serves, the core registers
 //!   their handlers (the test channels' `test.job`), reads `[jobs] preempt_agent_batches`,
 //!   stops them starting queued jobs once a drain begins, recovers the suite scope's jobs
-//!   (ARCH-022), and adds the `jobs` idle blocker (ARCH-020) and the `PersistInterrupted`
-//!   shutdown step (ARCH-021). The default workspace's jobs are
+//!   (ARCH-022; a job that never reached an engine is held instead, P4a-R41), checks the stall
+//!   rule every 5 s (ARCH-072), and adds the `jobs` idle blocker (ARCH-020) and the
+//!   `PersistInterrupted` shutdown step (ARCH-021). The default workspace's jobs are
 //!   recovered once it opens. The GPU scheduler ([`crate::jobs::scheduler`]) is their
 //!   admission, and every telemetry sample kicks them: a job waiting for VRAM is asked about
 //!   again, and the watchdog looks at the running ones.
@@ -350,6 +351,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
     }
     jobs.set_preempt_agent_batches(preempt_agent_batches(&cfg.env));
+    // The stall rule (ARCH-072): checked every 5 s while the core serves.
+    jobs.set_stall_after(cfg.stall_after);
+    jobs.spawn_stall_check(lifecycle.drain_token());
     // The engines (ARCH-064): they register the node-install handler, and are the scheduler's
     // engine processes and unload (ARCH-071).
     let engines = Engines::new(

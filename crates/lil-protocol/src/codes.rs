@@ -279,6 +279,13 @@ pub const CONFIRM_ALREADY_ANSWERED: CodeSpec =
     spec("confirm.already_answered", C::DataConflict, R::Never, false);
 pub const CAPS_INVALID: CodeSpec = spec("caps.invalid", C::UserFixable, R::AfterResolve, false);
 
+// Plan 4a (Appendix D).
+
+/// `job.move` of a job that isn't waiting its turn (CORE-160).
+pub const JOB_NOT_QUEUED: CodeSpec = spec("job.not_queued", C::DataConflict, R::Never, false);
+/// `job.not_queued`'s message (Appendix D).
+pub const JOB_NOT_QUEUED_MESSAGE: &str = "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished.";
+
 /// Every code, in table order.
 pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_DENIED,
@@ -347,6 +354,7 @@ pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_UNKNOWN,
     &CONFIRM_ALREADY_ANSWERED,
     &CAPS_INVALID,
+    &JOB_NOT_QUEUED,
 ];
 
 #[cfg(test)]
@@ -543,6 +551,7 @@ mod tests {
         ("confirm.unknown", C::UserFixable, R::Never, false),
         ("confirm.already_answered", C::DataConflict, R::Never, false),
         ("caps.invalid", C::UserFixable, R::AfterResolve, false),
+        ("job.not_queued", C::DataConflict, R::Never, false),
     ];
 
     /// `^[a-z_]+(\.[a-z_]+)+$`
@@ -556,7 +565,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 66);
+        assert_eq!(TABLE.len(), 67);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);
@@ -587,5 +596,19 @@ mod tests {
         assert_eq!(body.message, "busy");
         assert_eq!(body.trace_id, "t1");
         assert!(body.detail.is_none() && body.fix.is_none() && body.data.is_none());
+    }
+
+    /// Plan 4a's code (Appendix D): `job.not_queued`, `data_conflict`, `never`, with its
+    /// message.
+    #[test] // spec: CORE-160, QA-003
+    fn job_not_queued_is_in_the_table() {
+        assert!(ALL.iter().any(|s| **s == JOB_NOT_QUEUED));
+        assert_eq!(JOB_NOT_QUEUED.code, "job.not_queued");
+        assert_eq!(JOB_NOT_QUEUED.category, C::DataConflict);
+        assert_eq!(JOB_NOT_QUEUED.retry, R::Never);
+        assert_eq!(
+            JOB_NOT_QUEUED_MESSAGE,
+            "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished."
+        );
     }
 }

@@ -235,6 +235,54 @@ CREATE TABLE cap_alerts (
     PRIMARY KEY (period, cap, threshold_pct)
 );";
 
+/// Suite migration 9 and workspace migration 8: plan 4a's job fields (CORE-117, CORE-160;
+/// Appendix G "Jobs"). `batch_id`/`batch_index` are the job's batch and its place in it (every
+/// job has one, P4a-R13); `order_key` orders a class in its lane (a new job's is its `seq`;
+/// `job.move` changes it); `origin` is the typed `{surface, id?, step?}` JSON of who started
+/// it (P4a-R12); `status_seq` the JSON list of its status changes (the first and the newest
+/// 63); `engine_device`, `phase`, `subtasks` (JSON), `indeterminate`, `last_progress_ms`
+/// (Unix ms), `cache_hit_nodes` (JSON) and `all_cached` what its run reported; `estimate` and
+/// `estimate_key` the estimate taken at submission (Task 7 fills them); `withdrawn_id` the
+/// prompt id a pause withdrew, kept until it is known gone (CORE-160, CORE-120). `job_order`
+/// holds the high-water mark of the core-wide order counter (Appendix G "Queue order"),
+/// one row; only the suite `state.db`'s is used. A row from
+/// before this migration gets the batch of its own job id (`b_<its 16 hex>`), index 0, its
+/// `seq` as its order key, and the origin its idempotency scope names (a scope of another
+/// form, or none, leaves it null). A `cli|…` scope gives `{surface: "cli"}`, also for a job
+/// the core submitted itself, which a new row records as `core` (`StartedBy::of`): the old
+/// row doesn't tell the two apart.
+const JOBS_V2: &str = "ALTER TABLE jobs ADD COLUMN batch_id TEXT;
+ALTER TABLE jobs ADD COLUMN batch_index INTEGER;
+ALTER TABLE jobs ADD COLUMN order_key INTEGER;
+ALTER TABLE jobs ADD COLUMN origin TEXT;
+ALTER TABLE jobs ADD COLUMN status_seq TEXT;
+ALTER TABLE jobs ADD COLUMN engine_device TEXT;
+ALTER TABLE jobs ADD COLUMN phase TEXT;
+ALTER TABLE jobs ADD COLUMN subtasks TEXT;
+ALTER TABLE jobs ADD COLUMN indeterminate INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN last_progress_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN cache_hit_nodes TEXT;
+ALTER TABLE jobs ADD COLUMN all_cached INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN estimate TEXT;
+ALTER TABLE jobs ADD COLUMN estimate_key TEXT;
+ALTER TABLE jobs ADD COLUMN withdrawn_id TEXT;
+UPDATE jobs SET
+    batch_id = 'b_' || substr(job_id, 3, 16),
+    batch_index = 0,
+    order_key = seq,
+    origin = CASE
+        WHEN idem_scope LIKE 'ui:%|%' THEN json_object('surface', 'panel', 'id',
+            substr(idem_scope, 4, instr(idem_scope, '|') - 4))
+        WHEN idem_scope LIKE 'mcp|%' THEN json_object('surface', 'mcp')
+        WHEN idem_scope LIKE 'assistant|%' THEN json_object('surface', 'agent_session')
+        WHEN idem_scope LIKE 'cli|%' THEN json_object('surface', 'cli')
+    END;
+CREATE INDEX jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;
+CREATE TABLE job_order (
+    k INTEGER PRIMARY KEY CHECK (k = 0),
+    last_order INTEGER NOT NULL
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -245,6 +293,7 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     CONFIRMATIONS,
     USAGE_PENDING,
     CAPS,
+    JOBS_V2,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
@@ -256,6 +305,7 @@ pub const WORKSPACE_MIGRATIONS: &[&str] = &[
     CONFIRMATIONS,
     HOLDS,
     USAGE_PENDING,
+    JOBS_V2,
 ];
 
 #[cfg(test)]
@@ -328,8 +378,10 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 8);
-        assert_eq!(WORKSPACE_MIGRATIONS.len(), 7);
+        assert_eq!(SUITE_MIGRATIONS.len(), 9);
+        assert_eq!(WORKSPACE_MIGRATIONS.len(), 8);
+        assert_eq!(SUITE_MIGRATIONS[8], JOBS_V2, "appended, never inserted");
+        assert_eq!(WORKSPACE_MIGRATIONS[7], JOBS_V2, "appended, never inserted");
         assert_eq!(WORKSPACE_MIGRATIONS[5], HOLDS, "appended, never inserted");
         assert_eq!(
             SUITE_MIGRATIONS[6], USAGE_PENDING,
@@ -394,6 +446,64 @@ mod tests {
             insert("j_3", "queued", None).unwrap();
             insert("j_4", "queued", None).unwrap();
             assert!(insert("j_5", "lost", None).is_err(), "the status CHECK");
+        }
+    }
+
+    /// JOBS_V2 gives a row from before it the batch of its own job id, index 0, its `seq` as
+    /// its order key and the origin its idempotency scope names (Task 6).
+    #[test] // spec: CORE-117, CORE-160
+    fn jobs_v2_derives_batch_order_and_origin_for_old_rows() {
+        for list in [SUITE_MIGRATIONS, WORKSPACE_MIGRATIONS] {
+            let at = list.iter().position(|m| *m == JOBS_V2).unwrap();
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            for m in &list[..at] {
+                db.execute_batch(m).unwrap();
+            }
+            for (id, scope) in [
+                ("j_00000000000000a1", Some("ui:image|ws1")),
+                ("j_00000000000000a2", Some("cli|none")),
+                ("j_00000000000000a3", Some("mcp|none")),
+                ("j_00000000000000a4", Some("assistant|ws1")),
+                ("j_00000000000000a5", None),
+            ] {
+                db.execute(
+                    "INSERT INTO jobs (job_id, kind, lane, priority, module, args, status,
+                         substatus, attempt, created_utc, updated_utc, trace_id, idem_scope,
+                         args_hash, expected_secs, expected_output_bytes, external_side_effects)
+                     VALUES (?1, 'k', 'cpu', 'agent', 'm', '{}', 'queued', 'waiting', 1, 0, 0,
+                         't', ?2, 'h', 0, 0, 0)",
+                    rusqlite::params![id, scope],
+                )
+                .unwrap();
+            }
+            db.execute_batch(JOBS_V2).unwrap();
+            let rows: Vec<(String, String, i64, bool, Option<String>)> = db
+                .prepare(
+                    "SELECT batch_id, job_id, batch_index, order_key = seq, origin FROM jobs
+                     ORDER BY seq",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let origins: Vec<Option<&str>> = rows.iter().map(|r| r.4.as_deref()).collect();
+            assert_eq!(
+                origins,
+                [
+                    Some(r#"{"surface":"panel","id":"image"}"#),
+                    Some(r#"{"surface":"cli"}"#),
+                    Some(r#"{"surface":"mcp"}"#),
+                    Some(r#"{"surface":"agent_session"}"#),
+                    None,
+                ]
+            );
+            for (batch, job, index, ordered, _) in &rows {
+                assert_eq!(batch, &format!("b_{}", &job[2..]));
+                assert_eq!((*index, *ordered), (0, true));
+            }
         }
     }
 }

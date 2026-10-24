@@ -22,10 +22,10 @@ use std::time::Duration;
 use lil_core::events::EventBus;
 use lil_core::jobs::record::{self, JobRow};
 use lil_core::jobs::{
-    Admission, Admit, COMPLETION_GRACE, EngineKind, JobCaller, JobCompletion, JobCtx, JobDone,
-    JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin, JobSpec, JobStatus, JobSummary,
-    Jobs, Lane, MAX_BACKOFF, Priority, Reservations, SubmittedSlot, Substatus, backoff,
-    cancelled_error,
+    Admission, Admit, COMPLETION_GRACE, CancelSelector, EngineKind, JobCaller, JobCompletion,
+    JobCtx, JobDone, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin, JobSpec,
+    JobStatus, JobSummary, Jobs, Lane, MAX_BACKOFF, MoveTo, PauseReason, Priority, Reservations,
+    SubmittedSlot, Substatus, backoff, cancelled_error,
 };
 use lil_core::lifecycle::{DrainReason, Lifecycle, ShutdownPhase, ShutdownStep};
 use lil_core::pipeline::{RecordBranch, RecordPlan, start_candidate_run};
@@ -66,7 +66,9 @@ struct Seen {
 /// cancel; `gate_self: true` gates on the job's own id), `on_cancel` (what a gated attempt
 /// that sees its cancel returns: `unknown`, `interrupted`, else the cancelled error), `fail`
 /// (`retryable` on attempts 1–2, `retryable_always`, `disk_full`, `unknown`, `interrupted`),
-/// `record` (leave a candidate-run record plan).
+/// `record` (leave a candidate-run record plan), `in_engine: true` (the attempt shows
+/// `queued_in_engine` first), `progress_on` (a gate: once it opens, a gated attempt reports
+/// one progress).
 #[derive(Default)]
 struct TestHandler {
     seen: Mutex<Seen>,
@@ -139,12 +141,23 @@ impl TestHandler {
             Some(gate) => Some(gate.to_string()),
             None => (args.get("gate_self") == Some(&json!(true))).then(|| job.id.to_string()),
         };
+        if args.get("in_engine") == Some(&json!(true)) {
+            job.set_substatus(Substatus::QueuedInEngine).await;
+        }
         if let Some(gate) = gate {
             let mut changed = self.changed.subscribe();
             let mut cancel = job.cancel.clone();
+            let progress_on = args.get("progress_on").and_then(Value::as_str);
+            let mut reported = false;
             loop {
                 if self.seen.lock().unwrap().open_gates.contains(&gate) {
                     break;
+                }
+                if !reported
+                    && progress_on.is_some_and(|p| self.seen.lock().unwrap().open_gates.contains(p))
+                {
+                    reported = true;
+                    job.progress(1, 2, None);
                 }
                 if *cancel.borrow() {
                     return Err(match args.get("on_cancel").and_then(Value::as_str) {
@@ -200,6 +213,24 @@ impl JobHandler for TestHandler {
             .push(job.id.to_string());
         self.bump();
         Box::pin(std::future::ready(()))
+    }
+}
+
+/// Runs director tasks (`assistant_task`, CORE-118) as [`TestHandler`] runs `t.job`: a restart
+/// never holds them (ARCH-022 until the director plan).
+struct Director(Arc<TestHandler>);
+
+impl JobHandler for Director {
+    fn kind(&self) -> &'static str {
+        "assistant_task"
+    }
+
+    fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
+        Box::pin(self.0.attempt(job))
+    }
+
+    fn cancel_in_engine<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, ()> {
+        self.0.cancel_in_engine(job)
     }
 }
 
@@ -810,6 +841,7 @@ async fn log_line_per_state_change_with_contract_fields() {
                 "kind",
                 "lane",
                 "priority",
+                "origin",
                 "project",
                 "asset_id",
                 "module",
@@ -833,6 +865,7 @@ async fn log_line_per_state_change_with_contract_fields() {
         assert_eq!(line["trace_id"], "t_log");
         assert_eq!(line["lane"], "cpu");
         assert_eq!(line["priority"], "agent");
+        assert_eq!(line["origin"], json!({"surface": "cli"}));
     }
     fx.shutdown().await;
 }
@@ -858,7 +891,10 @@ async fn trace_id_reaches_the_job_record() {
 // Recovery (ARCH-022, QA-007, Review Focus 1).
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::test(start_paused = true)] // spec: ARCH-022, QA-007, CORE-128
+/// Plan 4a (P4a-R41, Appendix G "Restart hold"): the job queued behind the running one never
+/// reached an engine, so it is held (`queue_paused`, `pause_reasons: ["restart"]`) instead of
+/// interrupted; the running job and the engine job are interrupted as before.
+#[tokio::test(start_paused = true)] // spec: ARCH-022, QA-007, CORE-128, CORE-160
 async fn startup_marks_unfinished_jobs_interrupted_and_runs_nothing() {
     let fx = Fx::suite().await;
     // An earlier core: a finished job, a running one, one queued behind it, and an engine job
@@ -898,22 +934,26 @@ async fn startup_marks_unfinished_jobs_interrupted_and_runs_nothing() {
         .map(|id| id.0)
         .collect();
     marked.sort();
-    let mut want = vec![
-        running.job_id.clone(),
-        queued.job_id.clone(),
-        external.job_id.clone(),
-    ];
+    let mut want = vec![running.job_id.clone(), external.job_id.clone()];
     want.sort();
     assert_eq!(marked, want);
-    for id in [&running.job_id, &queued.job_id] {
-        let row = fx.row(id).await;
-        assert_eq!(
-            (row.status, row.substatus),
-            (JobStatus::Failed, Some(Substatus::Interrupted)),
-            "{id}"
-        );
-        assert!(row.finished_utc.is_some());
-    }
+    let row = fx.row(&running.job_id).await;
+    assert_eq!(
+        (row.status, row.substatus),
+        (JobStatus::Failed, Some(Substatus::Interrupted))
+    );
+    assert!(row.finished_utc.is_some());
+    // The queued job is held by the restart, not interrupted.
+    let held = restarted
+        .get(&fx.ctx(), &JobId(queued.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (held.status, held.substatus.as_deref()),
+        (JobStatus::Queued, Some("queue_paused"))
+    );
+    assert_eq!(held.pause_reasons, ["restart"]);
+    assert!(held.finished.is_none());
     let row = fx.row(&external.job_id).await;
     assert_eq!(
         (row.status, row.substatus),
@@ -924,7 +964,7 @@ async fn startup_marks_unfinished_jobs_interrupted_and_runs_nothing() {
     assert!(restarted.recover_suite().await.unwrap().is_empty());
     tokio::task::yield_now().await;
     assert!(fresh.runs().is_empty(), "{:?}", fresh.runs());
-    assert!(!restarted.busy());
+    assert!(!restarted.busy(), "a held job doesn't keep the core up");
     assert_eq!(fx.handler.runs().len(), runs_before);
     // `interrupted_unknown` is never retried.
     let e = restarted
@@ -994,6 +1034,92 @@ async fn class_rank_then_fifo() {
     let u2 = self_gated(&fx, Priority::User, None).await;
     // Interactive goes after the running job, before everything else.
     assert_eq!(start_order(&fx, 6).await, [a1, i1, u1, u2, a2, a3]);
+    fx.shutdown().await;
+}
+
+/// Fix round 1, I3 (CORE-124, CORE-160; Appendix G "Queue order"): the order key is one
+/// core-wide submission sequence, not each `state.db`'s `seq`, so jobs of the suite scope and of
+/// a workspace, submitted alternately into one lane and class, start in submission order even
+/// when the suite `state.db`'s own sequence runs ahead.
+#[tokio::test(start_paused = true)] // spec: CORE-124, CORE-160
+async fn fifo_within_a_class_holds_across_the_suite_and_workspace_scopes() {
+    let fx = Fx::workspace().await;
+    let suite = || {
+        let mut c = fx.ctx();
+        c.workspace = None;
+        c.idem_scope = "cli|none".into();
+        c
+    };
+    // The suite state.db's own sequence runs ahead of the workspace's.
+    for _ in 0..5 {
+        let job = fx
+            .jobs
+            .submit(&suite(), spec(Lane::Cpu, Priority::Agent, json!({})))
+            .await
+            .unwrap();
+        fx.finished(&job.job_id).await;
+    }
+    let first = self_gated(&fx, Priority::Agent, None).await;
+    fx.handler.until_started(&first).await;
+    let mut want = vec![first];
+    for i in 0..4 {
+        let caller = if i % 2 == 0 { suite() } else { fx.ctx() };
+        let job = fx
+            .jobs
+            .submit(
+                &caller,
+                spec(Lane::GpuHeavy, Priority::Agent, json!({"gate_self": true})),
+            )
+            .await
+            .unwrap();
+        want.push(job.job_id);
+    }
+    let skip = fx.handler.started().len() - 1;
+    for n in 0..want.len() {
+        fx.handler.until(|s| s.runs.len() > skip + n).await;
+        let job = fx.handler.runs()[skip + n].job.clone();
+        fx.handler.open(&job);
+        fx.finished(&job).await;
+    }
+    assert_eq!(fx.handler.started()[skip..], want[..]);
+    fx.shutdown().await;
+}
+
+/// Fix round 2, N4 (Appendix G "Queue order"): the order counter's high-water mark is kept in
+/// the suite `state.db`, so after a restart with the clock set back an hour, a new job still
+/// sorts after a job queued before the restart (here one of a workspace not recovered yet).
+#[tokio::test(start_paused = true)] // spec: CORE-124, CORE-160
+async fn the_order_counter_survives_a_restart_with_the_clock_set_back() {
+    let fx = Fx::workspace().await;
+    let _running = running_gate(&fx, Lane::Cpu, "run").await;
+    let older = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let older_key = fx.row(&older.job_id).await.order_key;
+    fx.clock.shift_utc(-3600);
+    let (restarted, _fresh, _) = restart(&fx).await;
+    let mut suite = fx.ctx();
+    suite.workspace = None;
+    suite.idem_scope = "cli|none".into();
+    let newer = restarted
+        .submit(
+            &suite,
+            spec(Lane::Cpu, Priority::Agent, json!({"gate": "never"})),
+        )
+        .await
+        .unwrap();
+    let newer_key = record::get(&fx.states.suite_db(), &newer.job_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .order_key;
+    assert!(
+        newer_key > older_key,
+        "a newer job sorts after an older one: {newer_key} <= {older_key}"
+    );
+    fx.handler.open("run");
+    restarted
+        .cancel(&suite, &JobId(newer.job_id.clone()))
+        .await
+        .unwrap();
     fx.shutdown().await;
 }
 
@@ -1409,21 +1535,22 @@ async fn retry_only_failed_or_cancelled() {
 async fn a_retry_runs_in_the_retrying_callers_class() {
     let fx = Fx::suite().await;
     let ui = CallerKind::Ui("image".into());
-    let mine = fx
-        .jobs
-        .submit(
-            &fx.ctx_as(ui.clone(), None, "t_ui"),
-            spec(Lane::Cpu, Priority::User, json!({"fail": "disk_full"})),
-        )
-        .await
-        .unwrap();
-    fx.finished(&mine.job_id).await;
     for (caller, class, want) in [
         (CallerKind::Mcp, Priority::User, Priority::Agent),
         (CallerKind::Cli, Priority::Interactive, Priority::Agent),
         (ui.clone(), Priority::Interactive, Priority::Interactive),
-        (ui, Priority::Agent, Priority::User),
+        (ui.clone(), Priority::Agent, Priority::User),
     ] {
+        // A job is retried once (Appendix G): a fresh failed one for each retry.
+        let mine = fx
+            .jobs
+            .submit(
+                &fx.ctx_as(ui.clone(), None, "t_ui"),
+                spec(Lane::Cpu, Priority::User, json!({"fail": "disk_full"})),
+            )
+            .await
+            .unwrap();
+        fx.finished(&mine.job_id).await;
         let mut retry = fx.ctx_as(caller.clone(), None, "t_retry");
         retry.retry_of = Some(JobId(mine.job_id.clone()));
         let job = fx
@@ -1562,7 +1689,9 @@ impl ShutdownStep for CancelEnginePrompts {
     }
 }
 
-#[tokio::test(start_paused = true)] // spec: ARCH-021
+/// The running job is marked after the engine step; the queued one never reached an engine, so
+/// it is left queued for the next start's restart hold (P4a-R41).
+#[tokio::test(start_paused = true)] // spec: ARCH-021, CORE-160
 async fn shutdown_persists_interrupted_after_engine_cancel() {
     let fx = Fx::suite().await;
     let lifecycle = Lifecycle::new(fx.clock.clone(), Duration::from_secs(600));
@@ -1586,14 +1715,18 @@ async fn shutdown_persists_interrupted_after_engine_cancel() {
         ["test.cancel_engine_prompts", "jobs.persist_interrupted"]
     );
     assert_eq!(*seen.lock().unwrap(), ["cancel_engine running"]);
-    for id in [&running.job_id, &queued.job_id] {
-        let row = fx.row(id).await;
-        assert_eq!(
-            (row.status, row.substatus),
-            (JobStatus::Failed, Some(Substatus::Interrupted)),
-            "{id}"
-        );
-    }
+    let row = fx.row(&running.job_id).await;
+    assert_eq!(
+        (row.status, row.substatus),
+        (JobStatus::Failed, Some(Substatus::Interrupted))
+    );
+    // The queued job never reached an engine: it is left queued for the next start's restart
+    // hold (P4a-R41).
+    let row = fx.row(&queued.job_id).await;
+    assert_eq!(
+        (row.status, row.substatus),
+        (JobStatus::Queued, Some(Substatus::Waiting))
+    );
     assert!(!fx.jobs.busy());
     // Nothing starts after the step.
     let late = fx
@@ -1960,6 +2093,9 @@ async fn shutdown_marks_a_job_stuck_in_its_completions_interrupted_with_its_resu
 #[tokio::test(start_paused = true)] // spec: ARCH-022, CORE-088
 async fn recovery_runs_the_completions_of_jobs_that_never_started() {
     let fx = Fx::suite().await;
+    // From plan 4a a queued `t.job` is held by the restart (P4a-R41): a director task, which
+    // never is, stands for a job that never started.
+    fx.jobs.register(Arc::new(Director(fx.handler.clone())));
     let mut caller = fx.ctx();
     caller.reservation = Some("rv_run".into());
     let running = fx
@@ -1969,11 +2105,9 @@ async fn recovery_runs_the_completions_of_jobs_that_never_started() {
         .unwrap();
     let mut caller = fx.ctx();
     caller.reservation = Some("rv_q".into());
-    let queued = fx
-        .jobs
-        .submit(&caller, spec(Lane::Cpu, Priority::Agent, json!({})))
-        .await
-        .unwrap();
+    let mut director = spec(Lane::Cpu, Priority::Agent, json!({}));
+    director.kind = "assistant_task";
+    let queued = fx.jobs.submit(&caller, director).await.unwrap();
     fx.handler.until_started(&running.job_id).await;
 
     let restarted = Jobs::new(
@@ -1984,7 +2118,9 @@ async fn recovery_runs_the_completions_of_jobs_that_never_started() {
         Arc::new(SeqIds::new()),
         fx.failpoints.clone(),
     );
-    restarted.register(Arc::new(TestHandler::default()));
+    let fresh = Arc::new(TestHandler::default());
+    restarted.register(fresh.clone());
+    restarted.register(Arc::new(Director(fresh)));
     let log: Arc<Mutex<Ends>> = Arc::default();
     restarted.add_completion(Arc::new(Reserving { log: log.clone() }));
     let marked = restarted.recover_suite().await.unwrap();
@@ -2048,8 +2184,9 @@ async fn an_interrupted_unknown_job_is_resolved_only_by_you() {
     fx.shutdown().await;
 }
 
-/// I7: once the core drains, no queued job starts: the drain waits for the running job only,
-/// and the shutdown step marks the queued ones (their completions release their reservations).
+/// I7: once the core drains, no queued job starts: the drain waits for the running job only.
+/// From plan 4a the shutdown step leaves the queued ones queued, keeping their reservations, so
+/// the next start holds them (P4a-R41: a restart never fails a job that never started).
 #[tokio::test(start_paused = true)] // spec: ARCH-021, ARCH-023
 async fn a_drain_starts_no_queued_job_and_waits_only_for_the_running_one() {
     let fx = Fx::suite().await;
@@ -2073,26 +2210,21 @@ async fn a_drain_starts_no_queued_job_and_waits_only_for_the_running_one() {
     assert_eq!(report.steps, ["jobs.persist_interrupted"]);
     assert_eq!(fx.handler.started(), std::slice::from_ref(&running.job_id));
     assert_eq!(fx.row(&running.job_id).await.status, JobStatus::Succeeded);
+    // The queued ones never reached an engine: they stay queued, keeping their reservations,
+    // for the next start's restart hold (P4a-R41).
     for id in [&a.job_id, &b.job_id] {
         let row = fx.row(id).await;
         assert_eq!(
             (row.status, row.substatus),
-            (JobStatus::Failed, Some(Substatus::Interrupted)),
+            (JobStatus::Queued, Some(Substatus::Waiting)),
             "{id}"
         );
     }
-    let mut codes: Vec<(String, String)> = seen(&log)
+    let codes: Vec<(String, String)> = seen(&log)
         .into_iter()
         .map(|(id, _, code, _)| (id, code))
         .collect();
-    codes.sort();
-    let mut want = vec![
-        (running.job_id.clone(), "ok".to_string()),
-        (a.job_id.clone(), "job.not_started".to_string()),
-        (b.job_id.clone(), "job.not_started".to_string()),
-    ];
-    want.sort();
-    assert_eq!(codes, want);
+    assert_eq!(codes, [(running.job_id.clone(), "ok".to_string())]);
     fx.shutdown().await;
 }
 
@@ -2194,9 +2326,10 @@ async fn jobs_list_gives_no_cursor_on_the_last_page() {
 }
 
 /// Earlier behaviour (re-review observation): an agent never retries a job that was already re-run
-/// automatically (the re-run is the retry); it is told which job that is. You still may.
+/// automatically (the re-run is the retry); it is told which job that is. From plan 4a nobody
+/// does (Appendix G: only the newest attempt is retried), you neither.
 #[tokio::test(start_paused = true)] // spec: CORE-128, CORE-146, QA-009
-async fn an_agent_never_retries_a_job_that_was_re_run_automatically() {
+async fn nobody_retries_a_job_that_was_re_run_automatically() {
     let fx = Fx::suite().await;
     let lost = fx
         .submit(spec(
@@ -2224,7 +2357,9 @@ async fn an_agent_never_retries_a_job_that_was_re_run_automatically() {
         assert!(e.message.contains(&rerun), "{}", e.message);
     }
     let you = fx.ctx_as(CallerKind::Ui("app".into()), None, "t_ui");
-    fx.jobs.retry_origin(&you, &id).await.unwrap();
+    let e = fx.jobs.retry_origin(&you, &id).await.unwrap_err();
+    assert_eq!(e.code, "job.not_retryable");
+    assert!(e.message.contains("already retried as"), "{}", e.message);
     // The re-run itself was never re-run, so it can be retried.
     fx.jobs
         .retry_origin(&fx.ctx(), &JobId(rerun.clone()))
@@ -2530,5 +2665,1342 @@ async fn an_external_job_with_an_engine_id_is_never_plain_interrupted() {
             "{id}"
         );
     }
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 4a: job fields, queue order and `job.move`, batch cancels, Pause GPU work, the restart
+// hold and `job.retry {batch_id}` (CORE-117, CORE-120, CORE-160, ARCH-022, ARCH-072;
+// Appendix G "Jobs"; P4a-R5, P4a-R12, P4a-R13, P4a-R41).
+// ---------------------------------------------------------------------------------------------
+
+/// Waits (no timer) for a `jobs` event of `id` with `substatus`; its summary.
+async fn until_substatus(fx: &Fx, id: &str, substatus: &str) -> JobSummary {
+    let data = fx
+        .event_until(|d| {
+            d["kind"] == "job" && d["job"]["job_id"] == id && d["job"]["substatus"] == substatus
+        })
+        .await
+        .unwrap();
+    serde_json::from_value(data["job"].clone()).unwrap()
+}
+
+/// A summary of `id` from `jobs`, until `f` holds for it (yielding meanwhile, no timer).
+async fn until_summary(
+    jobs: &Jobs,
+    fx: &Fx,
+    id: &str,
+    f: impl Fn(&JobSummary) -> bool,
+) -> JobSummary {
+    loop {
+        let job = jobs.get(&fx.ctx(), &JobId(id.to_string())).await.unwrap();
+        if f(&job) {
+            return job;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Ids for a restarted "core", apart from the fixture's (its rows keep theirs).
+#[derive(Debug)]
+struct LaterIds(std::sync::atomic::AtomicU64);
+
+impl IdSource for LaterIds {
+    fn id(&self, prefix: &str) -> String {
+        let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("{prefix}_{:016}", 9_000_000 + n)
+    }
+
+    fn uuid(&self) -> String {
+        let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("00000000-0000-4000-9000-{n:012x}")
+    }
+}
+
+fn later_ids() -> Arc<dyn IdSource> {
+    Arc::new(LaterIds(std::sync::atomic::AtomicU64::new(0)))
+}
+
+/// A new "core" on the fixture's state: a new `Jobs` with fresh handlers (`t.job` and director
+/// tasks), recovered. The earlier `Jobs` is left as a killed core leaves its jobs: its running
+/// job never ends.
+async fn restart(fx: &Fx) -> (Arc<Jobs>, Arc<TestHandler>, Vec<String>) {
+    let restarted = Jobs::new(
+        fx.states.clone(),
+        fx.hub.clone(),
+        fx.events.clone(),
+        fx.clock.clone(),
+        later_ids(),
+        fx.failpoints.clone(),
+    );
+    let fresh = Arc::new(TestHandler::default());
+    restarted.register(fresh.clone());
+    restarted.register(Arc::new(Director(fresh.clone())));
+    let marked = restarted
+        .recover_suite()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    (restarted, fresh, marked)
+}
+
+/// A `t.job` running gated on `gate` in `lane`, started.
+async fn running_gate(fx: &Fx, lane: Lane, gate: &str) -> JobSummary {
+    let job = fx.submit(gated(lane, Priority::Agent, gate)).await;
+    fx.handler.until_started(&job.job_id).await;
+    job
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn move_next_and_last_stay_within_the_class() {
+    let fx = Fx::suite().await;
+    let a0 = self_gated(&fx, Priority::Agent, None).await;
+    fx.handler.until_started(&a0).await;
+    let a1 = self_gated(&fx, Priority::Agent, None).await;
+    let a2 = self_gated(&fx, Priority::Agent, None).await;
+    let a3 = self_gated(&fx, Priority::Agent, None).await;
+    let u1 = self_gated(&fx, Priority::User, None).await;
+    let moved = fx
+        .jobs
+        .move_job(&fx.ctx(), &JobId(a3.clone()), MoveTo::Next)
+        .await
+        .unwrap();
+    assert_eq!(
+        moved.priority,
+        Priority::Agent,
+        "a move never changes the class"
+    );
+    fx.jobs
+        .move_job(&fx.ctx(), &JobId(a1.clone()), MoveTo::Last)
+        .await
+        .unwrap();
+    // The user job still goes first (a higher class); then the agent class in its new order.
+    assert_eq!(start_order(&fx, 5).await, [a0, u1, a3, a2, a1]);
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn move_refuses_engine_running_and_finished_jobs() {
+    let fx = Fx::suite().await;
+    let mut in_engine = spec(
+        Lane::GpuHeavy,
+        Priority::Agent,
+        json!({"gate": "engine", "in_engine": true}),
+    );
+    in_engine.engine = Some(EngineKind::ComfyUi);
+    let in_engine = fx.submit(in_engine).await;
+    until_substatus(&fx, &in_engine.job_id, "queued_in_engine").await;
+    let running = running_gate(&fx, Lane::Cpu, "run").await;
+    let done = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    fx.handler.open("run");
+    fx.finished(&running.job_id).await;
+    assert_eq!(fx.finished(&done.job_id).await.status, JobStatus::Succeeded);
+    let still = running_gate(&fx, Lane::Cpu, "still").await;
+    for id in [&in_engine.job_id, &still.job_id, &done.job_id] {
+        for to in [MoveTo::Next, MoveTo::Last] {
+            let e = fx
+                .jobs
+                .move_job(&fx.ctx(), &JobId(id.clone()), to)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, "job.not_queued", "{id}");
+            assert_eq!(e.message, codes::JOB_NOT_QUEUED_MESSAGE);
+        }
+    }
+    let e = fx
+        .jobs
+        .move_job(&fx.ctx(), &JobId("j_00000000000000ff".into()), MoveTo::Next)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "job.unknown");
+    // Nothing in the engine was touched.
+    assert!(fx.handler.engine_cancels().is_empty());
+    fx.handler.open("engine");
+    fx.handler.open("still");
+    fx.finished(&in_engine.job_id).await;
+    fx.finished(&still.job_id).await;
+    fx.shutdown().await;
+}
+
+/// A job moved to the front goes first without overtaking anyone (CORE-124's limit counts
+/// only group moves): the older job of another group is still overtaken by the lane's group
+/// 8 times, then runs.
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-124
+async fn moved_jobs_never_count_as_overtaken_by_groups() {
+    let fx = Fx::suite().await;
+    let g0 = self_gated(&fx, Priority::Agent, Some("a")).await;
+    fx.handler.until_started(&g0).await;
+    let x = self_gated(&fx, Priority::Agent, Some("b")).await;
+    let mut moved = Vec::new();
+    for _ in 0..10 {
+        let m = self_gated(&fx, Priority::Agent, Some("a")).await;
+        fx.jobs
+            .move_job(&fx.ctx(), &JobId(m.clone()), MoveTo::Next)
+            .await
+            .unwrap();
+        moved.push(m);
+    }
+    let mut grouped = Vec::new();
+    for _ in 0..9 {
+        grouped.push(self_gated(&fx, Priority::Agent, Some("a")).await);
+    }
+    let order = start_order(&fx, 21).await;
+    let mut want = vec![g0];
+    want.extend(moved.iter().rev().cloned());
+    want.extend(grouped[..8].iter().cloned());
+    want.push(x);
+    want.push(grouped[8].clone());
+    assert_eq!(order, want);
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn all_mine_is_scoped_by_caller_kind_and_app() {
+    let fx = Fx::suite().await;
+    // Everything waits behind a `cli` job that runs until it is cancelled.
+    let blocker = running_gate(&fx, Lane::Cpu, "never").await;
+    let app = fx.ctx_as(CallerKind::Ui("test".into()), None, "t_app");
+    let other_app = fx.ctx_as(CallerKind::Ui("other".into()), None, "t_other");
+    let theirs = fx
+        .jobs
+        .submit(&app, spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .unwrap();
+    let other = fx
+        .jobs
+        .submit(&other_app, spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .unwrap();
+    let mine = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    // The ui:test app's all_mine is its own jobs: not another app's, not the cli's.
+    let cancelled = fx
+        .jobs
+        .cancel_selected(&app, CancelSelector::AllMine)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = cancelled.iter().map(|j| j.job_id.as_str()).collect();
+    assert_eq!(ids, [theirs.job_id.as_str()]);
+    assert_eq!(
+        fx.finished(&theirs.job_id).await.status,
+        JobStatus::Cancelled
+    );
+    // The cli's all_mine is the cli jobs: a ui:test job survives it.
+    let cancelled = fx
+        .jobs
+        .cancel_selected(&fx.ctx(), CancelSelector::AllMine)
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = cancelled.iter().map(|j| j.job_id.clone()).collect();
+    ids.sort();
+    let mut want = vec![blocker.job_id.clone(), mine.job_id.clone()];
+    want.sort();
+    assert_eq!(ids, want, "a cli caller's all_mine is the cli jobs");
+    assert_eq!(fx.finished(&mine.job_id).await.status, JobStatus::Cancelled);
+    assert_eq!(
+        fx.finished(&blocker.job_id).await.status,
+        JobStatus::Cancelled
+    );
+    let kept = fx.finished(&other.job_id).await;
+    assert_eq!(
+        kept.status,
+        JobStatus::Succeeded,
+        "another app's job is not mine"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-117
+async fn cancel_by_batch_and_by_ids() {
+    let fx = Fx::suite().await;
+    let blocker = running_gate(&fx, Lane::Cpu, "never").await;
+    let batch = fx
+        .jobs
+        .submit_batch(
+            &fx.ctx(),
+            (0..3)
+                .map(|_| spec(Lane::Cpu, Priority::Agent, json!({})))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let batch_id = batch[0].batch_id.clone();
+    let loose: Vec<JobSummary> = {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.push(fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await);
+        }
+        v
+    };
+    // {ids}: exactly those; an unknown id refuses the whole call first.
+    let unknown = fx
+        .jobs
+        .cancel_selected(
+            &fx.ctx(),
+            CancelSelector::Ids(vec![
+                JobId(loose[0].job_id.clone()),
+                JobId("j_00000000000000ff".into()),
+            ]),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, "job.unknown");
+    assert_eq!(fx.row(&loose[0].job_id).await.status, JobStatus::Queued);
+    for bad in [Vec::new(), vec![JobId(loose[0].job_id.clone()); 501]] {
+        let e = fx
+            .jobs
+            .cancel_selected(&fx.ctx(), CancelSelector::Ids(bad))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "params.invalid");
+    }
+    let by_ids = fx
+        .jobs
+        .cancel_selected(
+            &fx.ctx(),
+            CancelSelector::Ids(vec![
+                JobId(loose[0].job_id.clone()),
+                JobId(loose[1].job_id.clone()),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        by_ids.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(),
+        [loose[0].job_id.as_str(), loose[1].job_id.as_str()]
+    );
+    assert!(by_ids.iter().all(|j| j.status == JobStatus::Cancelled));
+    assert_eq!(fx.row(&loose[2].job_id).await.status, JobStatus::Queued);
+    // {batch_id}: the batch's jobs, by index.
+    let by_batch = fx
+        .jobs
+        .cancel_selected(&fx.ctx(), CancelSelector::Batch(batch_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        by_batch.iter().map(|j| j.index).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(by_batch.iter().all(|j| j.status == JobStatus::Cancelled));
+    let e = fx
+        .jobs
+        .cancel_selected(
+            &fx.ctx(),
+            CancelSelector::Batch("b_00000000000000ff".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "job.unknown");
+    fx.jobs
+        .cancel(&fx.ctx(), &JobId(blocker.job_id.clone()))
+        .await
+        .unwrap();
+    fx.finished(&blocker.job_id).await;
+    fx.finished(&loose[2].job_id).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-117
+async fn pause_holds_every_class_and_caller_as_queue_paused() {
+    let fx = Fx::suite().await;
+    let gate = running_gate(&fx, Lane::Cpu, "gate").await;
+    let mut queued = Vec::new();
+    for (caller, class) in [
+        (CallerKind::Cli, Priority::Agent),
+        (CallerKind::Mcp, Priority::Agent),
+        (CallerKind::Ui("image".into()), Priority::User),
+        (CallerKind::Ui("image".into()), Priority::Interactive),
+    ] {
+        let ctx = fx.ctx_as(caller, None, "t_q");
+        let job = fx
+            .jobs
+            .submit(&ctx, spec(Lane::Cpu, class, json!({})))
+            .await
+            .unwrap();
+        queued.push(job.job_id);
+    }
+    let state = fx.jobs.pause(Lane::Cpu, PauseReason::Manual).await;
+    assert_eq!(
+        (state.paused, state.reasons.clone()),
+        (true, vec!["manual".to_string()])
+    );
+    for id in &queued {
+        let held = until_substatus(&fx, id, "queue_paused").await;
+        assert_eq!(held.status, JobStatus::Queued);
+        assert_eq!(held.pause_reasons, ["manual"]);
+    }
+    let state = fx.jobs.queue_state(Lane::Cpu);
+    assert_eq!((state.held, state.restart_held), (4, 0));
+    // The other lane isn't paused.
+    assert!(!fx.jobs.queue_state(Lane::GpuHeavy).paused);
+    // A job submitted while paused is held at once.
+    let late = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    until_substatus(&fx, &late.job_id, "queue_paused").await;
+    // The paused lane dispatches nothing, even once its running job ended.
+    fx.handler.open("gate");
+    fx.finished(&gate.job_id).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(fx.handler.started(), std::slice::from_ref(&gate.job_id));
+    let state = fx.jobs.resume(Lane::Cpu, PauseReason::Manual).await;
+    assert!(!state.paused && state.reasons.is_empty(), "{state:?}");
+    for id in queued.iter().chain(std::iter::once(&late.job_id)) {
+        assert_eq!(fx.finished(id).await.status, JobStatus::Succeeded);
+    }
+    // In class order: interactive, user, then the agent jobs.
+    assert_eq!(
+        fx.handler.started()[1..3],
+        [queued[3].clone(), queued[2].clone()]
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn pause_never_interrupts_the_executing_prompt() {
+    let fx = Fx::suite().await;
+    let mut engine = gated(Lane::GpuHeavy, Priority::Agent, "exec");
+    engine.engine = Some(EngineKind::ComfyUi);
+    let running = fx.submit(engine).await;
+    fx.handler.until_started(&running.job_id).await;
+    let before = fx.row(&running.job_id).await;
+    fx.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    let row = fx.row(&running.job_id).await;
+    assert_eq!(
+        (row.status, row.substatus, row.updated_utc),
+        (before.status, before.substatus, before.updated_utc),
+        "the running job is left alone: {row:?}"
+    );
+    assert!(fx.handler.engine_cancels().is_empty());
+    assert_eq!(fx.jobs.queue_state(Lane::GpuHeavy).withdrawn, 0);
+    fx.handler.open("exec");
+    assert_eq!(
+        fx.finished(&running.job_id).await.status,
+        JobStatus::Succeeded
+    );
+    fx.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    fx.shutdown().await;
+}
+
+/// Two reasons: `resume(manual)` removes only `manual`, so the lane stays paused by
+/// `fullscreen` and its jobs list it (P4a-R5; Appendix G `pause_reasons`).
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn resume_removes_only_its_reason() {
+    let fx = Fx::suite().await;
+    let gate = running_gate(&fx, Lane::Cpu, "gate").await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    fx.jobs.pause(Lane::Cpu, PauseReason::Manual).await;
+    let state = fx.jobs.pause(Lane::Cpu, PauseReason::Fullscreen).await;
+    assert_eq!(state.reasons, ["manual", "fullscreen"]);
+    let state = fx.jobs.resume(Lane::Cpu, PauseReason::Manual).await;
+    assert!(state.paused, "{state:?}");
+    assert_eq!(state.reasons, ["fullscreen"]);
+    fx.handler.open("gate");
+    fx.finished(&gate.job_id).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(fx.row(&job.job_id).await.status, JobStatus::Queued);
+    let state = fx.jobs.resume(Lane::Cpu, PauseReason::Fullscreen).await;
+    assert!(!state.paused);
+    assert_eq!(fx.finished(&job.job_id).await.status, JobStatus::Succeeded);
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-117
+async fn queue_paused_jobs_list_their_reasons() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    assert!(job.pause_reasons.is_empty());
+    fx.jobs.pause(Lane::Cpu, PauseReason::Manual).await;
+    fx.jobs.pause(Lane::Cpu, PauseReason::Fullscreen).await;
+    until_substatus(&fx, &job.job_id, "queue_paused").await;
+    let both = until_summary(&fx.jobs, &fx, &job.job_id, |j| j.pause_reasons.len() == 2).await;
+    assert_eq!(both.pause_reasons, ["manual", "fullscreen"]);
+    fx.jobs.resume(Lane::Cpu, PauseReason::Manual).await;
+    let one = until_summary(&fx.jobs, &fx, &job.job_id, |j| j.pause_reasons.len() == 1).await;
+    assert_eq!(one.pause_reasons, ["fullscreen"]);
+    assert_eq!(one.substatus.as_deref(), Some("queue_paused"));
+    // The change of reasons is published.
+    let announced = fx
+        .event_until(|d| {
+            d["kind"] == "job"
+                && d["job"]["job_id"] == job.job_id.as_str()
+                && d["job"]["pause_reasons"] == json!(["fullscreen"])
+        })
+        .await;
+    assert!(announced.is_some());
+    fx.shutdown().await;
+}
+
+/// P4a-R5: a pause lives in memory, so a restart ends it; the jobs it held are then held by
+/// the restart (P4a-R41).
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn a_restart_ends_a_pause() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    fx.jobs.pause(Lane::Cpu, PauseReason::Manual).await;
+    until_substatus(&fx, &job.job_id, "queue_paused").await;
+    let (restarted, _, _) = restart(&fx).await;
+    let state = restarted.queue_state(Lane::Cpu);
+    assert!(!state.paused && state.reasons.is_empty(), "{state:?}");
+    let held = restarted
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(held.pause_reasons, ["restart"]);
+    fx.shutdown().await;
+}
+
+/// P4a-R41, ARCH-022's exception: a batch of 3 waiting jobs is held by the restart; a job that
+/// reached its engine (`queued_in_engine`, with an engine id) is interrupted as before; a job
+/// submitted after the restart runs, the lane isn't paused.
+#[tokio::test(start_paused = true)] // spec: ARCH-022, CORE-160
+async fn a_restart_holds_never_started_jobs() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let batch = fx
+        .jobs
+        .submit_batch(
+            &fx.ctx(),
+            (0..3)
+                .map(|_| spec(Lane::Cpu, Priority::Agent, json!({})))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let in_engine = running_gate(&fx, Lane::GpuHeavy, "never").await;
+    let c = record::Change {
+        external_id: Some(Some("prompt-of-the-dead-core".into())),
+        ..record::Change::to(Substatus::QueuedInEngine)
+    };
+    record::update(&fx.states.suite_db(), &in_engine.job_id, c, 0)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (restarted, fresh, marked) = restart(&fx).await;
+    assert!(marked.contains(&in_engine.job_id), "{marked:?}");
+    for job in &batch {
+        assert!(!marked.contains(&job.job_id), "{marked:?}");
+        let held = restarted
+            .get(&fx.ctx(), &JobId(job.job_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (held.status, held.substatus.as_deref()),
+            (JobStatus::Queued, Some("queue_paused"))
+        );
+        assert_eq!(held.pause_reasons, ["restart"]);
+        assert_eq!(held.batch_id, batch[0].batch_id);
+    }
+    let lost = fx.row(&in_engine.job_id).await;
+    assert_eq!(lost.substatus, Some(Substatus::Interrupted));
+    let state = restarted.queue_state(Lane::Cpu);
+    assert!(!state.paused, "a restart never pauses the lane: {state:?}");
+    assert_eq!((state.held, state.restart_held), (3, 3));
+    // New jobs run.
+    let new = restarted
+        .submit(&fx.ctx(), spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    fresh.until_started(&new.job_id).await;
+    assert_eq!(fresh.started(), std::slice::from_ref(&new.job_id));
+    fx.shutdown().await;
+}
+
+/// `resume(manual)` releases the restart's jobs too (P4a-R41); a released job still waits
+/// while another reason (`fullscreen`) covers it.
+#[tokio::test(start_paused = true)] // spec: CORE-160, ARCH-022
+async fn resume_releases_restart_held_jobs() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let (restarted, fresh, _) = restart(&fx).await;
+    restarted.pause(Lane::Cpu, PauseReason::Fullscreen).await;
+    let state = restarted.resume(Lane::Cpu, PauseReason::Manual).await;
+    assert_eq!(state.restart_held, 0, "{state:?}");
+    let waiting = until_summary(&restarted, &fx, &job.job_id, |j| {
+        j.pause_reasons == ["fullscreen"]
+    })
+    .await;
+    assert_eq!(waiting.substatus.as_deref(), Some("queue_paused"));
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(fresh.started().is_empty());
+    restarted.resume(Lane::Cpu, PauseReason::Fullscreen).await;
+    fresh.until_started(&job.job_id).await;
+    assert_eq!(fx.finished(&job.job_id).await.status, JobStatus::Succeeded);
+    fx.shutdown().await;
+}
+
+/// The hold lives in memory: another restart holds the same jobs again.
+#[tokio::test(start_paused = true)] // spec: CORE-160, ARCH-022
+async fn a_second_restart_holds_them_again() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let (first, _, _) = restart(&fx).await;
+    assert_eq!(first.queue_state(Lane::Cpu).restart_held, 1);
+    let (second, fresh, marked) = restart(&fx).await;
+    assert!(marked.is_empty(), "{marked:?}");
+    let held = second
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(held.pause_reasons, ["restart"]);
+    assert_eq!(second.queue_state(Lane::Cpu).restart_held, 1);
+    second.release_restart_held(Lane::Cpu).await;
+    fresh.until_started(&job.job_id).await;
+    fx.shutdown().await;
+}
+
+/// ARCH-022 for director tasks until the director plan: never held, interrupted.
+#[tokio::test(start_paused = true)] // spec: ARCH-022, CORE-118
+async fn a_director_task_is_never_held() {
+    let fx = Fx::suite().await;
+    fx.jobs.register(Arc::new(Director(fx.handler.clone())));
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let mut task = spec(Lane::Cpu, Priority::Agent, json!({}));
+    task.kind = "assistant_task";
+    let task = fx.submit(task).await;
+    let (restarted, _, marked) = restart(&fx).await;
+    assert!(marked.contains(&task.job_id), "{marked:?}");
+    let row = fx.row(&task.job_id).await;
+    assert_eq!(
+        (row.status, row.substatus),
+        (JobStatus::Failed, Some(Substatus::Interrupted))
+    );
+    assert_eq!(restarted.queue_state(Lane::Cpu).restart_held, 0);
+    fx.shutdown().await;
+}
+
+/// A held job keeps its cap reservation (no completion runs at the restart); it settles when
+/// the job runs after a resume.
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-088
+async fn a_held_job_keeps_its_reservation() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let mut caller = fx.ctx();
+    caller.reservation = Some("rv_held".into());
+    let job = fx
+        .jobs
+        .submit(&caller, spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    let restarted = Jobs::new(
+        fx.states.clone(),
+        fx.hub.clone(),
+        fx.events.clone(),
+        fx.clock.clone(),
+        later_ids(),
+        fx.failpoints.clone(),
+    );
+    let fresh = Arc::new(TestHandler::default());
+    restarted.register(fresh.clone());
+    let log: Arc<Mutex<Ends>> = Arc::default();
+    restarted.add_completion(Arc::new(Reserving { log: log.clone() }));
+    restarted.recover_suite().await.unwrap();
+    assert!(
+        seen(&log).is_empty(),
+        "no completion at the restart: {:?}",
+        seen(&log)
+    );
+    assert_eq!(
+        fx.row(&job.job_id).await.reservation.as_deref(),
+        Some("rv_held")
+    );
+    restarted.release_restart_held(Lane::Cpu).await;
+    fx.finished(&job.job_id).await;
+    while seen(&log).is_empty() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        seen(&log),
+        [(
+            job.job_id.clone(),
+            Some("rv_held".into()),
+            "ok".into(),
+            false
+        )]
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn queue_state_counts_restart_held() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    for _ in 0..2 {
+        fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    }
+    let (restarted, _, _) = restart(&fx).await;
+    let state = restarted.queue_state(Lane::Cpu);
+    assert_eq!(
+        (
+            state.paused,
+            state.held,
+            state.restart_held,
+            state.withdrawn
+        ),
+        (false, 2, 2, 0)
+    );
+    // A job submitted to the restarted core and held by your pause counts in `held` only.
+    let state = restarted.pause(Lane::Cpu, PauseReason::Manual).await;
+    assert_eq!((state.held, state.restart_held), (2, 2));
+    let late = restarted
+        .submit(&fx.ctx(), spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    until_substatus(&fx, &late.job_id, "queue_paused").await;
+    let state = restarted.queue_state(Lane::Cpu);
+    assert_eq!((state.held, state.restart_held), (3, 2));
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        json!({"lane": "cpu", "paused": true, "reasons": ["manual"], "held": 3,
+               "restart_held": 2, "withdrawn": 0})
+    );
+    fx.shutdown().await;
+}
+
+/// P4a-R41: "Resume held jobs" (`app/queue.resume {held_only: true}`) releases the restart's
+/// jobs and keeps your pause: nothing runs until a plain resume.
+#[tokio::test(start_paused = true)] // spec: CORE-160, ARCH-022
+async fn held_only_resume_keeps_your_pause() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(
+            fx.submit(spec(Lane::Cpu, Priority::Agent, json!({})))
+                .await
+                .job_id,
+        );
+    }
+    let (restarted, fresh, _) = restart(&fx).await;
+    restarted.pause(Lane::Cpu, PauseReason::Manual).await;
+    let state = restarted.release_restart_held(Lane::Cpu).await;
+    assert!(state.paused, "{state:?}");
+    assert_eq!(state.reasons, ["manual"]);
+    assert_eq!((state.held, state.restart_held), (3, 0));
+    for id in &ids {
+        let job = until_summary(&restarted, &fx, id, |j| j.pause_reasons == ["manual"]).await;
+        assert_eq!(job.substatus.as_deref(), Some("queue_paused"));
+    }
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(fresh.started().is_empty(), "nothing runs while you pause");
+    restarted.resume(Lane::Cpu, PauseReason::Manual).await;
+    for id in &ids {
+        assert_eq!(fx.finished(id).await.status, JobStatus::Succeeded);
+    }
+    fx.shutdown().await;
+}
+
+/// The test retry of [`Jobs::retry_batch`]: `job.retry {job_id}`'s rules (the retry origin),
+/// then the tool call again, as the dispatcher runs it.
+fn retry_with<'a>(
+    fx: &'a Fx,
+    caller: &'a JobCaller,
+) -> impl Fn(JobId) -> JobFuture<'a, Result<JobSummary, ErrorBody>> {
+    move |id: JobId| {
+        Box::pin(async move {
+            fx.jobs.retry_origin(caller, &id).await?;
+            let row = fx.row(id.as_str()).await;
+            let mut retry = fx.ctx_as(caller.caller.clone(), None, "t_retry");
+            retry.retry_of = Some(id.clone());
+            fx.jobs
+                .submit(
+                    &retry,
+                    spec(row.lane, row.priority, json!({"gate_self": true})),
+                )
+                .await
+        })
+    }
+}
+
+/// `job.retry {batch_id}` (Appendix G): only the newest attempt at each index that ended
+/// failed or cancelled; the retries keep the batch and the index; an `interrupted_unknown`
+/// job and one that succeeded are refused with `job.not_retryable`.
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-146
+async fn retry_by_batch_retries_only_ended_jobs() {
+    let fx = Fx::suite().await;
+    let batch = fx
+        .jobs
+        .submit_batch(
+            &fx.ctx(),
+            [
+                json!({"fail": "disk_full"}),
+                json!({}),
+                json!({"fail": "unknown"}),
+                json!({"gate": "never_0"}),
+            ]
+            .into_iter()
+            .map(|args| spec(Lane::Cpu, Priority::Agent, args))
+            .collect(),
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = batch.iter().map(|j| j.job_id.clone()).collect();
+    fx.finished(&ids[0]).await;
+    fx.finished(&ids[1]).await;
+    until_substatus(&fx, &ids[2], "interrupted_unknown").await;
+    fx.jobs
+        .cancel(&fx.ctx(), &JobId(ids[3].clone()))
+        .await
+        .unwrap();
+    fx.finished(&ids[3]).await;
+    let caller = fx.ctx();
+    let out = fx
+        .jobs
+        .retry_batch(&caller, &batch[0].batch_id, retry_with(&fx, &caller))
+        .await
+        .unwrap();
+    let retried: Vec<(&str, u32)> = out
+        .retried
+        .iter()
+        .map(|r| (r.retry_of.as_str(), r.job.index))
+        .collect();
+    assert_eq!(retried, [(ids[0].as_str(), 0), (ids[3].as_str(), 3)]);
+    for r in &out.retried {
+        assert_eq!(r.job.batch_id, batch[0].batch_id, "a retry keeps its batch");
+        assert_eq!(r.job.retry_of.as_deref(), Some(r.retry_of.as_str()));
+    }
+    let refused: Vec<(&str, &str)> = out
+        .refused
+        .iter()
+        .map(|r| (r.job_id.as_str(), r.error.code.as_str()))
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            (ids[1].as_str(), "job.not_retryable"),
+            (ids[2].as_str(), "job.not_retryable"),
+        ]
+    );
+    assert!(
+        out.refused[0].error.message.contains("succeeded"),
+        "{:?}",
+        out.refused[0]
+    );
+    assert!(
+        out.refused[1].error.message.contains("interrupted_unknown"),
+        "{:?}",
+        out.refused[1]
+    );
+    let e = fx
+        .jobs
+        .retry_batch(&caller, "b_00000000000000ff", retry_with(&fx, &caller))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "job.unknown");
+    fx.shutdown().await;
+}
+
+/// A second `job.retry {batch_id}` creates nothing new: the first call's originals are refused
+/// as already retried, its still-running retries with their status; `job.retry {job_id}` of an
+/// already retried job is refused too.
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-146
+async fn retry_by_batch_twice_retries_nothing_new() {
+    let fx = Fx::suite().await;
+    let batch = fx
+        .jobs
+        .submit_batch(
+            &fx.ctx(),
+            (0..2)
+                .map(|_| spec(Lane::Cpu, Priority::Agent, json!({"fail": "disk_full"})))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    for job in &batch {
+        fx.finished(&job.job_id).await;
+    }
+    let caller = fx.ctx();
+    let first = fx
+        .jobs
+        .retry_batch(&caller, &batch[0].batch_id, retry_with(&fx, &caller))
+        .await
+        .unwrap();
+    assert_eq!(first.retried.len(), 2);
+    assert!(first.refused.is_empty(), "{:?}", first.refused);
+    let retries: Vec<String> = first.retried.iter().map(|r| r.job.job_id.clone()).collect();
+    fx.handler.until_started(&retries[0]).await;
+    let all_before = fx
+        .jobs
+        .list(&fx.ctx(), JobFilter::default())
+        .await
+        .unwrap()
+        .0
+        .len();
+    let second = fx
+        .jobs
+        .retry_batch(&caller, &batch[0].batch_id, retry_with(&fx, &caller))
+        .await
+        .unwrap();
+    assert!(second.retried.is_empty(), "{:?}", second.retried);
+    let all_after = fx
+        .jobs
+        .list(&fx.ctx(), JobFilter::default())
+        .await
+        .unwrap()
+        .0
+        .len();
+    assert_eq!(all_before, all_after, "nothing new");
+    let refused: Vec<&str> = second.refused.iter().map(|r| r.job_id.as_str()).collect();
+    assert_eq!(
+        refused,
+        [
+            batch[0].job_id.as_str(),
+            retries[0].as_str(),
+            batch[1].job_id.as_str(),
+            retries[1].as_str()
+        ]
+    );
+    for r in &second.refused {
+        assert_eq!(r.error.code, "job.not_retryable", "{r:?}");
+    }
+    assert!(
+        second.refused[0]
+            .error
+            .message
+            .contains(&format!("already retried as {}", retries[0])),
+        "{:?}",
+        second.refused[0]
+    );
+    assert!(
+        second.refused[1].error.message.contains("executing"),
+        "{:?}",
+        second.refused[1]
+    );
+    assert!(
+        second.refused[3].error.message.contains("waiting"),
+        "{:?}",
+        second.refused[3]
+    );
+    let e = fx
+        .jobs
+        .retry_origin(&fx.ctx(), &JobId(batch[1].job_id.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "job.not_retryable");
+    for id in &retries {
+        fx.handler.open(id);
+        fx.finished(id).await;
+    }
+    fx.shutdown().await;
+}
+
+/// P4a-R13: every job has a batch: one submit is a batch of one (`b_<16 hex>`, index 0); a
+/// batch's jobs share it, in order.
+#[tokio::test(start_paused = true)] // spec: CORE-117, CORE-160
+async fn every_job_has_a_batch_and_an_index() {
+    let fx = Fx::suite().await;
+    let one = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let hex = one.batch_id.strip_prefix("b_").unwrap();
+    assert!(
+        hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{}",
+        one.batch_id
+    );
+    assert_eq!(one.index, 0);
+    let batch = fx
+        .jobs
+        .submit_batch(
+            &fx.ctx(),
+            (0..3)
+                .map(|_| spec(Lane::Cpu, Priority::Agent, json!({})))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch.iter().map(|j| j.index).collect::<Vec<_>>(), [0, 1, 2]);
+    assert!(batch.iter().all(|j| j.batch_id == batch[0].batch_id));
+    assert_ne!(batch[0].batch_id, one.batch_id);
+    let listed = fx
+        .jobs
+        .list(
+            &fx.ctx(),
+            JobFilter {
+                batch_id: Some(batch[0].batch_id.clone()),
+                ..JobFilter::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(listed.len(), 3);
+    for job in batch.iter().chain(std::iter::once(&one)) {
+        fx.finished(&job.job_id).await;
+    }
+    fx.shutdown().await;
+}
+
+/// P4a-R12: `origin` is derived from the caller and typed.
+#[tokio::test(start_paused = true)] // spec: CORE-117
+async fn origin_follows_the_caller() {
+    let fx = Fx::suite().await;
+    let mut core = fx.ctx_as(CallerKind::Cli, None, "t_core");
+    // A job the core submits itself has no tool call (as `comfy.inventory`'s).
+    core.origin = None;
+    for (caller, want) in [
+        (
+            fx.ctx_as(CallerKind::Ui("test".into()), None, "t_ui"),
+            json!({"surface": "panel", "id": "test"}),
+        ),
+        (
+            fx.ctx_as(CallerKind::Cli, None, "t_cli"),
+            json!({"surface": "cli"}),
+        ),
+        (
+            fx.ctx_as(CallerKind::Mcp, None, "t_mcp"),
+            json!({"surface": "mcp"}),
+        ),
+        (
+            fx.ctx_as(CallerKind::Assistant, None, "t_as"),
+            json!({"surface": "agent_session"}),
+        ),
+        (core, json!({"surface": "core"})),
+    ] {
+        let job = fx
+            .jobs
+            .submit(&caller, spec(Lane::Cpu, Priority::Agent, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&job.origin).unwrap(),
+            want,
+            "{}",
+            caller.caller
+        );
+        let done = fx.finished(&job.job_id).await;
+        assert_eq!(serde_json::to_value(&done.origin).unwrap(), want);
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-117, CORE-009
+async fn jobs_log_lines_carry_origin() {
+    let fx = Fx::workspace().await;
+    let app = fx.ctx_as(CallerKind::Ui("image".into()), None, "t_log");
+    let job = fx
+        .jobs
+        .submit(&app, spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .unwrap();
+    fx.finished(&job.job_id).await;
+    let lines: Vec<Value> = fx
+        .log_lines()
+        .into_iter()
+        .filter(|l| l["job_id"] == job.job_id.as_str())
+        .collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert_eq!(
+            line["origin"],
+            json!({"surface": "panel", "id": "image"}),
+            "{line}"
+        );
+        let keys: Vec<&str> = line
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let at = keys.iter().position(|k| *k == "origin").unwrap();
+        assert_eq!(
+            keys[at - 1],
+            "priority",
+            "origin follows priority: {keys:?}"
+        );
+    }
+    fx.shutdown().await;
+}
+
+/// A surface this build doesn't know (a later plan's) reads back unchanged.
+#[tokio::test(start_paused = true)] // spec: CORE-117
+async fn an_unknown_surface_round_trips() {
+    let fx = Fx::suite().await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    fx.finished(&job.job_id).await;
+    let stored = json!({"surface": "later_thing", "id": "x", "step": "2"});
+    let db = rusqlite::Connection::open(fx.env.env.suite_state_db()).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db.execute(
+        "UPDATE jobs SET origin = ?1 WHERE job_id = ?2",
+        rusqlite::params![stored.to_string(), job.job_id],
+    )
+    .unwrap();
+    drop(db);
+    let read = fx
+        .jobs
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        read.origin.as_ref().map(|o| o.surface.clone()),
+        Some(lil_core::jobs::Surface::Other("later_thing".into()))
+    );
+    assert_eq!(serde_json::to_value(&read.origin).unwrap(), stored);
+    fx.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)] // spec: CORE-117
+async fn status_seq_keeps_the_first_and_newest_63() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let db = fx.states.suite_db();
+    for n in 1..=100_i64 {
+        let to = if n % 2 == 1 {
+            Substatus::QueuePaused
+        } else {
+            Substatus::Waiting
+        };
+        record::update(&db, &job.job_id, record::Change::to(to), n)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let row = fx.row(&job.job_id).await;
+    assert_eq!(row.status_seq.len(), 64);
+    assert_eq!(row.status_seq[0].status, JobStatus::Queued);
+    assert_eq!(row.status_seq[0].substatus.as_deref(), Some("waiting"));
+    assert_eq!(
+        row.status_seq[0].at,
+        lil_schema::time::rfc3339(row.created_utc)
+    );
+    // The newest 63: changes 38 to 100.
+    assert_eq!(row.status_seq[1].at, lil_schema::time::rfc3339(38));
+    assert_eq!(row.status_seq[63].at, lil_schema::time::rfc3339(100));
+    assert_eq!(row.status_seq[63].substatus.as_deref(), Some("waiting"));
+    // A change that keeps the status and substatus adds nothing.
+    let c = record::Change {
+        watchdog: Some("slow".into()),
+        ..record::Change::default()
+    };
+    record::update(&db, &job.job_id, c, 101)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fx.row(&job.job_id).await.status_seq, row.status_seq);
+    fx.shutdown().await;
+}
+
+/// The stall rule (ARCH-072): a running job with no sign of life for 30 s is `unresponsive`
+/// (published as `{kind: "unresponsive", on}` on `job:<id>`) and keeps running; a progress
+/// ends it.
+#[tokio::test(start_paused = true)] // spec: ARCH-072, CORE-117
+async fn unresponsive_flips_after_30_s_and_back() {
+    let fx = Fx::suite().await;
+    let job = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Agent,
+            json!({"gate": "end", "progress_on": "tick"}),
+        ))
+        .await;
+    let topic = format!("job:{}", job.job_id);
+    fx.subscribe(&topic).await;
+    fx.handler.until_started(&job.job_id).await;
+    fx.clock.advance(Duration::from_secs(29));
+    fx.jobs.check_unresponsive();
+    let summary = fx
+        .jobs
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(!summary.unresponsive, "29 s is not yet 30");
+    fx.clock.advance(Duration::from_secs(1));
+    fx.jobs.check_unresponsive();
+    let on = fx
+        .event_until(|d| d["kind"] == "unresponsive" && d["on"] == true)
+        .await
+        .unwrap();
+    assert_eq!(on, json!({"kind": "unresponsive", "on": true}));
+    let summary = fx
+        .jobs
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(summary.unresponsive);
+    assert_eq!(summary.status, JobStatus::Running, "nothing is cancelled");
+    fx.handler.open("tick");
+    fx.event_until(|d| d["kind"] == "unresponsive" && d["on"] == false)
+        .await
+        .unwrap();
+    let summary = fx
+        .jobs
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert!(!summary.unresponsive);
+    assert!(summary.last_progress_at.is_some());
+    fx.handler.open("end");
+    assert_eq!(fx.finished(&job.job_id).await.status, JobStatus::Succeeded);
+    fx.shutdown().await;
+}
+
+/// The job tools' plan-4a arguments over the pipe of an in-process core: `job.cancel` takes
+/// exactly one selector (`params.invalid` for none or two), `job.retry` one of `job_id` and
+/// `batch_id`, and `test.job {batch}` makes one batch that `job.retry {batch_id}` retries.
+#[test] // spec: CORE-160, CORE-146
+fn job_tools_take_exactly_one_selector() {
+    let env = TestEnv::new();
+    let _core = lil_core::start_in_thread(lil_core::CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        ..lil_core::CoreConfig::for_env(env.env.clone()).unwrap()
+    });
+    let mut pipe = lil_testkit::RawPipe::connect(&env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    let made = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "gated": true, "batch": 2}),
+        Some("b1"),
+    );
+    let jobs = made["jobs"].as_array().unwrap().clone();
+    assert_eq!(jobs.len(), 2, "{made}");
+    let batch_id = jobs[0]["batch_id"].as_str().unwrap().to_string();
+    let ids: Vec<String> = jobs
+        .iter()
+        .map(|j| j["job_id"].as_str().unwrap().to_string())
+        .collect();
+    let again = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "gated": true, "batch": 2}),
+        Some("b1"),
+    );
+    assert_eq!(again["jobs"], made["jobs"], "one key, one batch");
+    pipe.tool_ok(
+        "job.cancel",
+        json!({ "batch_id": batch_id }),
+        Some("c-first"),
+    );
+    for id in &ids {
+        let waited = pipe.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+        assert_eq!(waited["job"]["status"], "cancelled", "{waited}");
+    }
+    for (n, args) in [
+        json!({}),
+        json!({"job_id": ids[0], "ids": [ids[0]]}),
+        json!({"batch_id": batch_id, "all_mine": true}),
+        json!({"all_mine": false}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = pipe.tool("job.cancel", args.clone(), Some(&format!("c{n}")));
+        assert_eq!(
+            refused["error"]["code"], "params.invalid",
+            "{args}: {refused}"
+        );
+    }
+    for (n, args) in [json!({}), json!({"job_id": ids[0], "batch_id": batch_id})]
+        .into_iter()
+        .enumerate()
+    {
+        let refused = pipe.tool("job.retry", args.clone(), Some(&format!("r{n}")));
+        assert_eq!(
+            refused["error"]["code"], "params.invalid",
+            "{args}: {refused}"
+        );
+    }
+    let retried = pipe.tool_ok("job.retry", json!({ "batch_id": batch_id }), Some("rb"));
+    let retried_of: Vec<&str> = retried["retried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["retry_of"].as_str().unwrap())
+        .collect();
+    assert_eq!(retried_of, [ids[0].as_str(), ids[1].as_str()], "{retried}");
+    for (n, r) in retried["retried"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(r["job"]["batch_id"], batch_id.as_str());
+        assert_eq!(r["job"]["index"], n);
+    }
+    // The same key gives back the same answer; a new one retries nothing new.
+    let again = pipe.tool_ok("job.retry", json!({ "batch_id": batch_id }), Some("rb"));
+    assert_eq!(again, retried);
+    let twice = pipe.tool_ok("job.retry", json!({ "batch_id": batch_id }), Some("rb2"));
+    assert_eq!(twice["retried"], json!([]), "{twice}");
+    let alone = pipe.tool("job.retry", json!({"job_id": ids[0]}), Some("r1"));
+    assert_eq!(alone["error"]["code"], "job.not_retryable", "{alone}");
+    let cancelled = pipe.tool_ok("job.cancel", json!({ "batch_id": batch_id }), Some("cb"));
+    assert_eq!(
+        cancelled["jobs"].as_array().unwrap().len(),
+        4,
+        "{cancelled}"
+    );
+    let listed = pipe.tool_ok("jobs.list", json!({}), None);
+    let lanes: Vec<&str> = listed["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["lane"].as_str().unwrap())
+        .collect();
+    assert_eq!(lanes, ["gpu-heavy", "cpu"], "{listed}");
+}
+
+/// A drain and a restart (a reboot for an update, P4a-R41's case): the shutdown step leaves a
+/// queued job that never reached an engine queued, with its reservation, and the next start
+/// holds it instead of failing it; a resume then runs it.
+#[tokio::test(start_paused = true)] // spec: ARCH-022, ARCH-021, CORE-160
+async fn a_drain_and_restart_holds_a_queued_job() {
+    let fx = Fx::suite().await;
+    let lifecycle = Lifecycle::new(fx.clock.clone(), Duration::from_secs(600));
+    lifecycle.add_blocker(fx.jobs.clone());
+    lifecycle.add_shutdown_step(fx.jobs.persist_interrupted_step());
+    fx.jobs.stop_on_drain(lifecycle.drain_token());
+    let running = running_gate(&fx, Lane::Cpu, "run").await;
+    let mut caller = fx.ctx();
+    caller.reservation = Some("rv_drain".into());
+    let queued = fx
+        .jobs
+        .submit(&caller, spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    lifecycle.begin_drain(DrainReason::Requested);
+    let shutdown = {
+        let lifecycle = lifecycle.clone();
+        tokio::spawn(async move { lifecycle.run_shutdown().await })
+    };
+    fx.handler.open("run");
+    shutdown.await.unwrap();
+    assert_eq!(fx.row(&running.job_id).await.status, JobStatus::Succeeded);
+    let left = fx.row(&queued.job_id).await;
+    assert_eq!(
+        (left.status, left.substatus),
+        (JobStatus::Queued, Some(Substatus::Waiting))
+    );
+    let (restarted, fresh, marked) = restart(&fx).await;
+    assert!(marked.is_empty(), "nothing failed: {marked:?}");
+    let held = restarted
+        .get(&fx.ctx(), &JobId(queued.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (held.status, held.substatus.as_deref()),
+        (JobStatus::Queued, Some("queue_paused"))
+    );
+    assert_eq!(held.pause_reasons, ["restart"]);
+    assert_eq!(
+        fx.row(&queued.job_id).await.reservation.as_deref(),
+        Some("rv_drain")
+    );
+    restarted.release_restart_held(Lane::Cpu).await;
+    fresh.until_started(&queued.job_id).await;
+    assert_eq!(
+        fx.finished(&queued.job_id).await.status,
+        JobStatus::Succeeded
+    );
     fx.shutdown().await;
 }

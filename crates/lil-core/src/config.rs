@@ -33,6 +33,8 @@ pub const ENV_TEST_CONFIRM_LIFETIME_SECS: &str = "LIL_TEST_CONFIRM_LIFETIME_SECS
 /// Test channels only: a file of socket rows to rewrite ([`ScriptedSockets`]), so the engine
 /// loopback check can see a wildcard listener that no test ever binds (P3-R11).
 pub const ENV_TEST_FAKE_SOCKETS: &str = "LIL_TEST_FAKE_SOCKETS";
+/// Test channels only: the stall rule's time in seconds instead of 30 (ARCH-072; plan 4a).
+pub const ENV_TEST_STALL_SECS: &str = "LIL_TEST_STALL_SECS";
 
 /// The plan-3 test knobs, all `None` off a test channel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,6 +45,8 @@ struct TestKnobs {
     confirm_lifetime: Option<Duration>,
     /// `LIL_TEST_FAKE_SOCKETS`.
     fake_sockets: Option<PathBuf>,
+    /// `LIL_TEST_STALL_SECS`; a value that does not parse is `None`.
+    stall_after: Option<Duration>,
 }
 
 fn test_knobs(channel: &Channel, var: &dyn Fn(&str) -> Option<String>) -> TestKnobs {
@@ -56,6 +60,9 @@ fn test_knobs(channel: &Channel, var: &dyn Fn(&str) -> Option<String>) -> TestKn
             .and_then(|v| v.trim().parse().ok())
             .map(Duration::from_secs),
         fake_sockets: path(ENV_TEST_FAKE_SOCKETS),
+        stall_after: var(ENV_TEST_STALL_SECS)
+            .and_then(|v| v.trim().parse().ok())
+            .map(Duration::from_secs),
     }
 }
 
@@ -141,6 +148,8 @@ pub struct CoreConfig {
     /// How long a confirmation stays answerable: 30 minutes, or
     /// `LIL_TEST_CONFIRM_LIFETIME_SECS` on a test channel.
     pub confirm_lifetime: Duration,
+    /// The stall rule's time (ARCH-072): 30 s, or `LIL_TEST_STALL_SECS` on a test channel.
+    pub stall_after: Duration,
     /// Test channels only: the fake hardware script `LIL_TEST_FAKE_HW` names, read instead of
     /// NVML, PDH and `sysinfo`.
     pub fake_hw: Option<PathBuf>,
@@ -215,6 +224,9 @@ impl CoreConfig {
                 .map_or(DEFAULT_IDLE_AFTER, Duration::from_secs),
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
             confirm_lifetime: knobs.confirm_lifetime.unwrap_or(DEFAULT_CONFIRM_LIFETIME),
+            stall_after: knobs
+                .stall_after
+                .unwrap_or(crate::jobs::runner::STALL_AFTER),
             fake_hw: knobs.fake_hw,
             sockets,
             test_tools,
@@ -307,14 +319,16 @@ mod tests {
         assert_eq!(codes, [3, 2, 5, 6, 7]);
     }
 
-    /// `LIL_TEST_FAKE_HW`, `LIL_TEST_CONFIRM_LIFETIME_SECS` and `LIL_TEST_FAKE_SOCKETS` count on
-    /// test channels only; a lifetime that does not parse is ignored.
+    /// `LIL_TEST_FAKE_HW`, `LIL_TEST_CONFIRM_LIFETIME_SECS`, `LIL_TEST_FAKE_SOCKETS` and
+    /// `LIL_TEST_STALL_SECS` count on test channels only; a lifetime that does not parse is
+    /// ignored.
     #[test] // spec: QA-066, CORE-115
     fn test_knobs_are_read_on_test_channels_only() {
         let set = |name: &str| match name {
             ENV_TEST_FAKE_HW => Some(r"C:\t\hw.json".to_string()),
             ENV_TEST_CONFIRM_LIFETIME_SECS => Some("1".to_string()),
             ENV_TEST_FAKE_SOCKETS => Some(r"C:\t\fake-sockets.json".to_string()),
+            ENV_TEST_STALL_SECS => Some("2".to_string()),
             _ => None,
         };
         let test = Channel::Test("ab12cd34".into());
@@ -324,6 +338,7 @@ mod tests {
                 fake_hw: Some(PathBuf::from(r"C:\t\hw.json")),
                 confirm_lifetime: Some(Duration::from_secs(1)),
                 fake_sockets: Some(PathBuf::from(r"C:\t\fake-sockets.json")),
+                stall_after: Some(Duration::from_secs(2)),
             }
         );
         let unparsable =

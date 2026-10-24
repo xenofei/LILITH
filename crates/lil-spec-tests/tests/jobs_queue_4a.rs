@@ -289,13 +289,25 @@ fn queue_pause_withdraws_a_pending_prompt_and_reposts_it_once() {
         (lane["withdrawn"] == 1).then_some(lane)
     });
     assert_eq!(lane["held"], 1, "{lane}");
-    let cancels: Vec<_> = fake
+    // One withdrawal, through `POST /queue {"delete"}` (plan 4a ruling, 2026-10-24), and no
+    // cancel: the per-job cancel would interrupt a prompt that started meanwhile.
+    let deletes: Vec<_> = fake
         .requests()
         .into_iter()
-        .filter(|r| r.method == "POST" && r.path.ends_with("/cancel"))
+        .filter(|r| r.method == "POST" && r.path.trim_start_matches("/api") == "/queue")
         .collect();
-    assert_eq!(cancels.len(), 1, "one cancel: {cancels:?}");
-    assert_eq!(cancels[0].path, format!("/api/jobs/{old}/cancel"));
+    assert_eq!(deletes.len(), 1, "one withdrawal: {deletes:?}");
+    assert_eq!(
+        deletes[0].body.as_ref().map(|b| b["delete"].clone()),
+        Some(json!([old]))
+    );
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/cancel")),
+        "a withdrawal is no cancel"
+    );
     assert!(
         !fake
             .requests()

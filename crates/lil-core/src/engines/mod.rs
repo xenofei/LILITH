@@ -209,6 +209,11 @@ impl Engines {
         let engines = Arc::new_cyclic(|weak: &Weak<Engines>| {
             jobs.register(Arc::new(NodeInstallHandler::new(weak.clone())));
             jobs.register(Arc::new(ComfyPromptHandler::new(weak.clone())));
+            // A paused lane's pending prompt is withdrawn through ComfyUI (CORE-160).
+            jobs.set_withdraw(
+                EngineKind::ComfyUi,
+                Arc::new(comfyui::handler::ComfyWithdraw::new(weak.clone())),
+            );
             jobs.register(Arc::new(InventoryHandler::new(
                 weak.clone(),
                 Arc::new(SystemProbe),

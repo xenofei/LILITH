@@ -629,3 +629,48 @@ fn idem_finish_on_a_missing_row_is_an_error() {
         vec![("cli|none".into(), "k".into(), "done".into())]
     );
 }
+
+/// A suite `state.db` from before plan 4a (migration 8) holding a job row migrates to 9 (Task
+/// 6's `JOBS_V2`), and the row reads back with the derived values: the batch of its own job id,
+/// index 0, its `seq` as its place in its class, and the origin its idempotency scope names.
+#[test] // spec: CORE-004, CORE-117, CORE-160
+fn old_rows_read_with_derived_batch_and_origin() {
+    let env = TestEnv::new();
+    let path = env.root().join("old").join("state.db");
+    env.write_state_db_version(&path, 8, true);
+    let db = Connection::open(&path).expect("open the old database");
+    for m in &SUITE_MIGRATIONS[..8] {
+        db.execute_batch(m).expect("an earlier migration");
+    }
+    db.execute(
+        "INSERT INTO jobs (job_id, kind, lane, priority, module, args, status, substatus,
+             attempt, created_utc, updated_utc, trace_id, idem_scope, args_hash, expected_secs,
+             expected_output_bytes, external_side_effects)
+         VALUES ('j_00000000000000a7', 'test.job', 'cpu', 'user', 'test', '{}', 'succeeded',
+             NULL, 1, 10, 20, 't', 'ui:image|none', 'h', 0, 0, 0)",
+        [],
+    )
+    .expect("an old job row");
+    db.close().expect("close");
+
+    let migrated = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("migrate");
+    assert_eq!(migrated.schema_version(), 9);
+    let row = runtime()
+        .block_on(lil_core::jobs::record::get(&migrated, "j_00000000000000a7"))
+        .expect("read")
+        .expect("the row");
+    assert_eq!(row.batch_id, "b_00000000000000a7");
+    assert_eq!(row.batch_index, 0);
+    assert_eq!(row.order_key, row.seq);
+    let summary = row.summary(None);
+    assert_eq!(
+        serde_json::to_value(&summary.origin).unwrap(),
+        serde_json::json!({"surface": "panel", "id": "image"})
+    );
+    assert_eq!(
+        (summary.batch_id.as_str(), summary.index),
+        ("b_00000000000000a7", 0)
+    );
+    assert!(summary.status_seq.is_empty(), "no history before plan 4a");
+    migrated.close();
+}

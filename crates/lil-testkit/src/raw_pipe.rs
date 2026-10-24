@@ -332,19 +332,10 @@ mod tests {
     #[test] // spec: QA-056
     fn raw_pipe_hello_merge_removes_null_keys() {
         let base = merge_hello(json!({}));
-        assert_eq!(base["protocol"], "1.1");
+        assert_eq!(base["protocol"], lil_protocol::PROTOCOL.to_string());
         assert_eq!(base["build_id"], "testkit");
         assert_eq!(base["schema_hash"], lil_protocol::schema_hash());
-        assert_eq!(
-            base["capabilities"],
-            json!([
-                "events.v1",
-                "tools.v1",
-                "jobs.v1",
-                "confirmations.v1",
-                "caps.v1"
-            ])
-        );
+        assert_eq!(base["capabilities"], json!(lil_protocol::CAPABILITIES));
         assert_eq!(base["caller_kind"], "cli");
         assert_eq!(base["non_interactive"], false);
         assert_eq!(base["workspace"], "none");

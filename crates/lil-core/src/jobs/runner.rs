@@ -15,7 +15,8 @@
 //! **Draining** (ARCH-021 step 1). Once the lifecycle drains ([`Jobs::stop_on_drain`]), no
 //! queued job starts and no interrupted job is re-run; the `jobs` blocker then counts only the
 //! jobs that are running or in their completions, so a drain waits for those alone, and the
-//! `PersistInterrupted` step marks the queued rest.
+//! `PersistInterrupted` step leaves the queued rest for the next start's restart hold
+//! (P4a-R41). Outside a drain, a job held by a restart alone never keeps the core up.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, UNIX_EPOCH};
 
 use lil_platform::{Clock, IdSource};
+use lil_protocol::app::{QueueLane, QueueState};
 use lil_protocol::codes::{self, CodeSpec};
 use lil_protocol::{ErrorBody, ErrorCategory, Outcome, RetryPolicy, ToolOutput, args_hash};
 use serde_json::{Value, json};
@@ -31,15 +33,17 @@ use tokio::sync::{OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+use super::pause::{PauseReason, RESTART_REASON};
 use super::queue::{self, Candidate};
-use super::record::{self, Change, Inserted, JobRow};
+use super::record::{self, Change, Inserted, JobRow, LiveView, RunReport};
 use super::scheduler::watchdog_slow;
 use super::{
-    Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, DISK_MARGIN_BYTES, ExecWindow, JOB_CANCELLED,
-    JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion, JobCtx, JobDone, JobFailure,
-    JobFilter, JobHandler, JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane,
-    MAX_ATTEMPTS, MAX_WAIT, NoReservations, Priority, Progress, Reservations, RetryPlan, Substatus,
-    backoff,
+    Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, CancelSelector, DISK_MARGIN_BYTES, EngineKind,
+    ExecWindow, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion,
+    JobCtx, JobDone, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin, JobResult,
+    JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS, MAX_CANCEL_IDS, MAX_WAIT, MoveTo,
+    NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob, Reservations, RetriedJob,
+    RetryBatch, RetryPlan, StartedBy, Substatus, Subtask, Withdraw, WithdrawOutcome, backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -152,16 +156,45 @@ struct Info {
     origin: Option<JobOrigin>,
     /// The row's `idem_scope` (an automatic re-run keeps it).
     idem_scope: Option<String>,
+    /// Who started it (an automatic re-run keeps it).
+    started_by: Option<StartedBy>,
+    /// Its batch and its index in it (a retry keeps them).
+    batch: (String, u32),
     /// The execution windows its attempts reported (`JobCtx::add_window`), shared by every
     /// attempt and its completions.
     windows: Arc<Mutex<Vec<ExecWindow>>>,
 }
 
+/// Where a withdrawal of a job's pending prompt stands (CORE-160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    None,
+    /// [`Withdraw::withdraw`] is asking the engine.
+    Deciding,
+    /// The engine cancelled the pending prompt: the attempt ends and the job waits again.
+    Withdrawn,
+}
+
 /// A job this core runs.
 struct Active {
     info: Info,
-    /// Submission order in this core.
-    order: u64,
+    /// Its place in its class (CORE-160): its core-wide submission sequence, until `job.move`
+    /// changes it.
+    order_key: i64,
+    /// Held by a restart (P4a-R41) until a resume releases it.
+    restart_held: bool,
+    /// The hold the job was last asked to show (`queue_paused`), and the reasons it showed.
+    held_shown: bool,
+    reasons_shown: Vec<String>,
+    /// The row's substatus, as this core last wrote it.
+    substatus: Option<Substatus>,
+    withdrawal: Withdrawal,
+    /// What its run reported, written with each state change.
+    report: RunReport,
+    /// Its newest sign of life in the current attempt (monotonic): the stall rule's clock.
+    last_progress: Option<Duration>,
+    /// The stall rule flagged it (ARCH-072).
+    unresponsive: bool,
     /// Requeued at the head of its class (preempted, CORE-125).
     head: bool,
     overtaken: u32,
@@ -190,17 +223,64 @@ struct LaneState {
     running: Option<String>,
     /// The group of the lane's last job (CORE-124).
     group: Option<String>,
+    /// Its pause: the reasons set, in the order they were set (CORE-160).
+    reasons: Vec<PauseReason>,
+    /// The prompts the current pause withdrew from the engine.
+    withdrawn: u32,
+}
+
+impl LaneState {
+    /// The lane's reasons that hold a job of class `p`, by name.
+    fn holding(&self, p: Priority) -> Vec<String> {
+        self.reasons
+            .iter()
+            .filter(|r| r.scope().covers(p))
+            .map(|r| r.wire().to_string())
+            .collect()
+    }
+}
+
+impl Active {
+    /// Whether a pause may withdraw this job's prompt (CORE-160): a running suite engine job
+    /// in `queued_in_engine`, without external side effects, not ending, cancelled,
+    /// preempted or withdrawn already.
+    fn withdrawable(&self) -> bool {
+        self.running
+            && !self.completing
+            && !self.cancelling
+            && !self.preempted
+            && self.withdrawal == Withdrawal::None
+            && self.substatus == Some(Substatus::QueuedInEngine)
+            && self.info.spec.engine.is_some()
+            && !self.info.spec.external_side_effects
+    }
+
+    /// The reasons that hold this queued job (none for a job that runs or ends; a withdrawn
+    /// one is queued again while its attempt winds down).
+    fn hold_reasons(&self, lane: &LaneState) -> Vec<String> {
+        let queued = !self.running || self.withdrawal == Withdrawal::Withdrawn;
+        if !queued || self.completing {
+            return Vec::new();
+        }
+        let mut reasons = lane.holding(self.info.spec.priority);
+        if self.restart_held {
+            reasons.push(RESTART_REASON.to_string());
+        }
+        reasons
+    }
 }
 
 #[derive(Default)]
 struct Queue {
     jobs: HashMap<String, Active>,
     lanes: [LaneState; 2],
-    next_order: u64,
     /// Set by the `PersistInterrupted` step: nothing starts or finishes any more.
     closed: bool,
     /// What the admission was last told: a job runs or waits for VRAM.
     busy: bool,
+    /// The newest core-wide submission key (Appendix G "Queue order"): above every key of
+    /// the jobs this core queued.
+    last_order: i64,
 }
 
 /// A state change applies only while the job, as the queue holds it, passes this check.
@@ -229,11 +309,23 @@ pub(crate) struct Shared {
     /// shutdown step's wait).
     changed: watch::Sender<u64>,
     recovered: Mutex<HashMap<String, Arc<OnceCell<()>>>>,
+    /// The order counter was raised to the suite `state.db`'s high-water mark (N4).
+    order_seeded: OnceCell<()>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The engine ids of the jobs taken up again from an earlier core run (ruling P3-R21):
     /// their prompts are the suite's, not outside ones.
     adopted: Mutex<HashSet<String>>,
+    /// Who withdraws a pending prompt, per engine (CORE-160).
+    withdrawers: RwLock<HashMap<EngineKind, Arc<dyn Withdraw>>>,
+    /// The stall rule's time (ARCH-072): 30 s, or `LIL_TEST_STALL_SECS` on a test channel.
+    stall_after: RwLock<Duration>,
 }
+
+/// The stall rule's time (ARCH-072): a running job that reported nothing this long is shown
+/// `unresponsive`.
+pub const STALL_AFTER: Duration = Duration::from_secs(30);
+/// How often the stall rule is checked (P4a-R33).
+pub const STALL_CHECK_EVERY: Duration = Duration::from_secs(5);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -364,6 +456,10 @@ struct NewJob {
     owner: String,
     retry_of: Option<String>,
     origin: Option<JobOrigin>,
+    started_by: Option<StartedBy>,
+    /// Its batch and index: a retry's are the job's it retries (`None`: a new batch, whose
+    /// index is the job's place in its submit).
+    batch: Option<(String, u32)>,
 }
 
 impl Shared {
@@ -442,12 +538,38 @@ impl Shared {
         }
     }
 
-    fn progress_of(&self, id: &str) -> Option<Progress> {
-        self.queue().jobs.get(id).and_then(|a| a.progress.clone())
+    /// What a job this core runs shows on top of its row.
+    fn live_of(&self, id: &str) -> Option<LiveView> {
+        let q = self.queue();
+        let a = q.jobs.get(id)?;
+        Some(LiveView {
+            progress: a.progress.clone(),
+            report: Some(a.report.clone()),
+            unresponsive: a.unresponsive,
+            pause_reasons: a.hold_reasons(&q.lanes[a.info.spec.lane.index()]),
+        })
     }
 
     fn summary(&self, row: &JobRow) -> JobSummary {
-        row.summary(self.progress_of(&row.job_id))
+        row.summary(self.live_of(&row.job_id).as_ref())
+    }
+
+    /// Publishes the job's summary on `jobs` and `job:<id>` with no state change (its phase or
+    /// its pause reasons changed): no jobs log line.
+    async fn announce_live(&self, id: &str, scope: &Scope) {
+        let lock = self.job_lock(id);
+        let _serial = lock.lock().await;
+        let Ok(Some(row)) = record::get(scope.db(), id).await else {
+            return;
+        };
+        if row.status.is_final() {
+            return;
+        }
+        let job = serde_json::to_value(self.summary(&row)).expect("a job summary serialises");
+        self.events
+            .publish("jobs", json!({"kind": "job", "job": job.clone()}));
+        self.events
+            .publish(&format!("job:{id}"), json!({"kind": "status", "job": job}));
     }
 
     /// The jobs log line, the events and the `job.wait` wake-up for `row`'s new state.
@@ -480,10 +602,19 @@ impl Shared {
     ) -> Result<Option<JobRow>, StateError> {
         let lock = self.job_lock(id);
         let _serial = lock.lock().await;
-        if let Some(guard) = guard
-            && !self.queue().jobs.get(id).is_some_and(guard)
+        let mut c = c;
         {
-            return Ok(None);
+            let q = self.queue();
+            let a = q.jobs.get(id);
+            if let Some(guard) = guard
+                && !a.is_some_and(guard)
+            {
+                return Ok(None);
+            }
+            // What its run reported goes with the change (Appendix G "Jobs").
+            if c.report.is_none() {
+                c.report = a.map(|a| a.report.clone());
+            }
         }
         let submitting = c.substatus == Some(Some(Substatus::Submitting));
         let Some((before, row)) = record::update(scope.db(), id, c, self.now()).await? else {
@@ -492,6 +623,7 @@ impl Shared {
         // The watchdog times only executing: any other substatus (retrying, cancelling,
         // ingesting) stops its clock, and the next `executing` starts it again.
         if let Some(a) = self.queue().jobs.get_mut(id) {
+            a.substatus = row.substatus;
             if row.substatus != Some(Substatus::Executing) {
                 a.exec_start = None;
             } else if a.exec_start.is_none() {
@@ -566,15 +698,24 @@ impl Shared {
     /// P3-R29). A row already `interrupted_unknown` stays as it is. The
     /// completions of a job that never started run with a [`super::never_started`] outcome
     /// (its reservation is released); one that had started keeps its reservation.
+    ///
+    /// The restart hold (P4a-R41, an exception to ARCH-022's first sentence): a job that never
+    /// reached an engine ([`holdable`]) stays queued instead, in `queue_paused` with the reason
+    /// `restart`, keeping its reservation; it runs only once a resume releases it.
     async fn recover_rows(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
         let rows = record::open_rows(scope.db()).await?;
         let mine: HashSet<String> = self.queue().jobs.keys().cloned().collect();
         let mut marked = Vec::new();
+        let mut held = 0;
         for row in rows {
             if mine.contains(&row.job_id) || row.substatus == Some(Substatus::InterruptedUnknown) {
                 continue;
             }
             if self.adopt(&row, scope) {
+                continue;
+            }
+            if self.hold(&row, scope).await? {
+                held += 1;
                 continue;
             }
             let c = interrupt_change(&row, self.now());
@@ -592,7 +733,54 @@ impl Shared {
                 marked.push(JobId(after.job_id));
             }
         }
+        if held > 0 {
+            tracing::warn!(
+                count = held,
+                scope = %scope.key(),
+                "jobs of an earlier core run that never started are held; they run once you resume them"
+            );
+        }
         Ok(marked)
+    }
+
+    /// The restart hold of one row ([`Shared::recover_rows`]): `true` when the job is queued
+    /// again, held, and shown `queue_paused`.
+    async fn hold(self: &Arc<Self>, row: &JobRow, scope: &Scope) -> Result<bool, StateError> {
+        if !holdable(row) || self.draining() {
+            return Ok(false);
+        }
+        let Some(kind) = self.static_kind(&row.kind) else {
+            return Ok(false);
+        };
+        let info = Info {
+            id: JobId(row.job_id.clone()),
+            spec: row.spec(kind),
+            scope: scope.clone(),
+            trace_id: row.trace_id.clone(),
+            reservation: row.reservation.clone(),
+            retry_of: row.retry_of.clone(),
+            origin: row.origin.clone(),
+            idem_scope: row.idem_scope.clone(),
+            started_by: row.started_by.clone(),
+            batch: (row.batch_id.clone(), row.batch_index),
+            windows: Arc::default(),
+        };
+        if !self.enqueue_held(info, row) {
+            return Ok(false);
+        }
+        if row.substatus != Some(Substatus::QueuePaused) {
+            let shown: Guard = |a| a.restart_held && !a.running && !a.completing;
+            self.apply_checked(
+                &row.job_id,
+                scope,
+                Change::to(Substatus::QueuePaused),
+                Some(shown),
+            )
+            .await?;
+        } else {
+            self.announce_live(&row.job_id, scope).await;
+        }
+        Ok(true)
     }
 
     /// Recovers `scope` once (module docs): the jobs it marked, empty on every later call. A
@@ -631,9 +819,11 @@ impl Shared {
             retry_of: row.retry_of.clone(),
             origin: row.origin.clone(),
             idem_scope: row.idem_scope.clone(),
+            started_by: row.started_by.clone(),
+            batch: (row.batch_id.clone(), row.batch_index),
             windows: Arc::default(),
         };
-        self.enqueue(info, false)
+        self.enqueue(info, false, row.order_key)
     }
 
     async fn ensure_recovered(self: &Arc<Self>, scope: &Scope) -> Result<Vec<JobId>, StateError> {
@@ -655,21 +845,21 @@ impl Shared {
         Ok(marked)
     }
 
-    /// A new job row, queued (ARCH-034): written and logged before the job can start, and its
-    /// reservation handed over to it. A job that holds `idem` already is returned instead when
-    /// its arguments match (and the new call's reservation is released: it submitted nothing),
-    /// else `idempotency.conflict` (CORE-016).
-    async fn submit_new(self: &Arc<Self>, scope: &Scope, new: NewJob) -> Result<JobRow, ErrorBody> {
-        let NewJob {
-            spec,
-            trace_id,
-            idem,
-            caller_scope,
-            reservation,
-            owner,
-            retry_of,
-            origin,
-        } = new;
+    /// New job rows, queued (ARCH-034): written in one transaction and logged before any can
+    /// start, and the call's reservation handed over to the first. Jobs submitted together
+    /// share one batch (P4a-R13), in submission order; a retry keeps the batch and the index of
+    /// the job it retries. A job that holds the first one's `idem` already is returned instead
+    /// (with every job of its batch) when its arguments match (and the new call's reservation
+    /// is released: it submitted nothing), else `idempotency.conflict` (CORE-016).
+    async fn submit_many(
+        self: &Arc<Self>,
+        scope: &Scope,
+        news: Vec<NewJob>,
+    ) -> Result<Vec<JobRow>, ErrorBody> {
+        let Some(first) = news.first() else {
+            return Ok(Vec::new());
+        };
+        let trace_id = first.trace_id.clone();
         let trace_id = trace_id.as_str();
         if self.queue().closed {
             return Err(ErrorBody::new(
@@ -678,71 +868,136 @@ impl Shared {
                 trace_id,
             ));
         }
-        if self.handler(spec.kind).is_none() {
+        if let Some(missing) = news.iter().find(|n| self.handler(n.spec.kind).is_none()) {
             return Err(ErrorBody::new(
                 &codes::CORE_BUG,
                 format!(
                     "No handler runs jobs of kind {:?}. This is a bug in LILITH.",
-                    spec.kind
+                    missing.spec.kind
                 ),
                 trace_id,
             ));
         }
-        let hash = args_hash(&json!({"kind": spec.kind, "args": spec.args}));
         let now = self.now();
-        let id = self.ids.id("j");
-        let (key_scope, idem_key) = idem.unzip();
-        let idem_scope = key_scope.or(caller_scope);
-        let row = JobRow {
-            seq: 0,
-            job_id: id.clone(),
-            kind: spec.kind.to_string(),
-            lane: spec.lane,
-            priority: spec.priority,
-            module: spec.module.clone(),
-            args: spec.args.clone(),
-            project: spec.project.clone(),
-            asset_id: spec.asset_id.clone(),
-            doc_id: spec.doc_id.clone(),
-            status: JobStatus::Queued,
-            substatus: Some(Substatus::Waiting),
-            attempt: 1,
-            created_utc: now,
-            updated_utc: now,
-            started_utc: None,
-            finished_utc: None,
-            watchdog: None,
-            vram_unchecked: false,
-            error: None,
-            result: None,
-            retry_of: retry_of.clone(),
-            trace_id: trace_id.to_string(),
-            idem_scope,
-            idem_key,
-            args_hash: hash.clone(),
-            expected_secs: spec.expected_secs,
-            expected_output_bytes: spec.expected_output_bytes,
-            vram_need_mib: spec.vram_need_mib,
-            engine: spec.engine,
-            group: spec.group.clone(),
-            external_side_effects: spec.external_side_effects,
-            reservation: reservation.clone(),
-            origin: origin.clone(),
-            external_id: None,
+        // A new batch only for jobs that don't keep one (a retry keeps its job's).
+        let new_batch = if news.iter().any(|n| n.batch.is_none()) {
+            self.ids.id("b")
+        } else {
+            String::new()
         };
-        let serial = self.job_lock(&id);
-        let guard = serial.lock().await;
-        let inserted = record::insert(scope.db(), row).await;
-        let row = match inserted {
+        let (reservation, owner) = (first.reservation.clone(), first.owner.clone());
+        let first_hash = args_hash(&json!({"kind": first.spec.kind, "args": first.spec.args}));
+        let keys = self.order_keys(news.len()).await;
+        let mut rows = Vec::with_capacity(news.len());
+        let mut infos = Vec::with_capacity(news.len());
+        for (i, new) in news.into_iter().enumerate() {
+            let NewJob {
+                spec,
+                trace_id,
+                idem,
+                caller_scope,
+                reservation,
+                owner: _,
+                retry_of,
+                origin,
+                started_by,
+                batch,
+            } = new;
+            let hash = args_hash(&json!({"kind": spec.kind, "args": spec.args}));
+            let id = self.ids.id("j");
+            let (key_scope, idem_key) = idem.unzip();
+            let idem_scope = key_scope.or(caller_scope);
+            // N5: a re-run of a job whose withdrawn prompt was never known gone keeps its id,
+            // so its first post waits for that prompt (Appendix G "Withdrawal").
+            let withdrawn_id = match &retry_of {
+                Some(of) => record::get(scope.db(), of)
+                    .await
+                    .map_err(|e| state_unavailable(&e, &trace_id))?
+                    .and_then(|r| r.withdrawn_id),
+                None => None,
+            };
+            let (batch_id, batch_index) =
+                batch.unwrap_or_else(|| (new_batch.clone(), u32::try_from(i).unwrap_or(u32::MAX)));
+            rows.push(JobRow {
+                seq: 0,
+                job_id: id.clone(),
+                kind: spec.kind.to_string(),
+                lane: spec.lane,
+                priority: spec.priority,
+                module: spec.module.clone(),
+                args: spec.args.clone(),
+                project: spec.project.clone(),
+                asset_id: spec.asset_id.clone(),
+                doc_id: spec.doc_id.clone(),
+                status: JobStatus::Queued,
+                substatus: Some(Substatus::Waiting),
+                attempt: 1,
+                created_utc: now,
+                updated_utc: now,
+                started_utc: None,
+                finished_utc: None,
+                watchdog: None,
+                vram_unchecked: false,
+                error: None,
+                result: None,
+                retry_of: retry_of.clone(),
+                trace_id: trace_id.clone(),
+                idem_scope: idem_scope.clone(),
+                idem_key,
+                args_hash: hash,
+                expected_secs: spec.expected_secs,
+                expected_output_bytes: spec.expected_output_bytes,
+                vram_need_mib: spec.vram_need_mib,
+                engine: spec.engine,
+                group: spec.group.clone(),
+                external_side_effects: spec.external_side_effects,
+                reservation: reservation.clone(),
+                origin: origin.clone(),
+                external_id: None,
+                batch_id: batch_id.clone(),
+                batch_index,
+                order_key: keys[i],
+                started_by: started_by.clone(),
+                status_seq: Vec::new(),
+                report: RunReport::default(),
+                withdrawn_id,
+            });
+            infos.push(Info {
+                id: JobId(id),
+                spec,
+                scope: scope.clone(),
+                trace_id,
+                reservation,
+                retry_of,
+                origin,
+                idem_scope,
+                started_by,
+                batch: (batch_id, batch_index),
+                windows: Arc::default(),
+            });
+        }
+        // Each job's lock is held from its insert to its first announcement.
+        let locks: Vec<_> = infos.iter().map(|i| self.job_lock(i.id.as_str())).collect();
+        let mut guards = Vec::with_capacity(locks.len());
+        for l in &locks {
+            guards.push(l.lock().await);
+        }
+        let forget = |me: &Self| {
+            let mut held = lock(&me.locks);
+            for info in &infos {
+                held.remove(info.id.as_str());
+            }
+        };
+        let inserted = match record::insert_batch(scope.db(), rows).await {
             Err(e) => {
-                drop(guard);
-                lock(&self.locks).remove(&id);
+                drop(guards);
+                forget(self);
                 return Err(state_unavailable(&e, trace_id));
             }
             Ok(Inserted::Existing(existing)) => {
-                drop(guard);
-                lock(&self.locks).remove(&id);
-                if existing.args_hash != hash {
+                drop(guards);
+                forget(self);
+                if existing.first().is_some_and(|e| e.args_hash != first_hash) {
                     return Err(ErrorBody::new(
                         &codes::IDEMPOTENCY_CONFLICT,
                         "The idempotency key was used before for another job.",
@@ -750,38 +1005,126 @@ impl Shared {
                     ));
                 }
                 if let Some(rv) = &reservation {
-                    tracing::info!(job_id = %existing.job_id, reservation = %rv, "the key's job exists; the call's own reservation is released");
+                    tracing::info!(job_id = ?existing.first().map(|e| &e.job_id), reservation = %rv, "the key's job exists; the call's own reservation is released");
                     self.reservations().release(rv, &owner).await;
                 }
                 return Ok(existing);
             }
-            Ok(Inserted::New(row)) => row,
+            Ok(Inserted::Retried(by)) => {
+                drop(guards);
+                forget(self);
+                return Err(ErrorBody::new(
+                    &codes::JOB_NOT_RETRYABLE,
+                    format!("The job was already retried as {by}; retry that job instead."),
+                    trace_id,
+                ));
+            }
+            Ok(Inserted::New(rows)) => rows,
         };
-        self.announce(scope.workspace(), &row).await;
-        let job_id = JobId(id.clone());
-        if let Some(rv) = &reservation {
-            self.reservations().hand_over(rv, &owner, &job_id).await;
+        for row in &inserted {
+            self.announce(scope.workspace(), row).await;
         }
-        drop(guard);
-        let info = Info {
-            id: job_id,
-            spec,
-            scope: scope.clone(),
-            trace_id: trace_id.to_string(),
-            reservation,
-            retry_of,
-            origin,
-            idem_scope: row.idem_scope.clone(),
-            windows: Arc::default(),
-        };
-        self.enqueue(info, true);
-        Ok(row)
+        if let (Some(rv), Some(info)) = (&reservation, infos.first()) {
+            self.reservations().hand_over(rv, &owner, &info.id).await;
+        }
+        drop(guards);
+        for (info, row) in infos.into_iter().zip(&inserted) {
+            self.enqueue(info, true, row.order_key);
+        }
+        Ok(inserted)
+    }
+
+    /// One new job row ([`Shared::submit_many`]).
+    async fn submit_new(self: &Arc<Self>, scope: &Scope, new: NewJob) -> Result<JobRow, ErrorBody> {
+        let mut rows = self.submit_many(scope, vec![new]).await?;
+        Ok(rows.remove(0))
+    }
+
+    /// The next `n` core-wide submission keys (CORE-160; Appendix G "Queue order"): one
+    /// counter for every scope's `state.db`, above every key this core queued and never below
+    /// the time in microseconds, so first in, first out holds across scopes and restarts. Its
+    /// high-water mark is kept in the suite `state.db` (read at the first submission of a
+    /// run, raised with each), so a clock set back across a restart never gives a newer job
+    /// a lower key (N4). A mark that can't be read or written is logged; the keys still come.
+    async fn order_keys(&self, n: usize) -> Vec<i64> {
+        self.order_seeded
+            .get_or_init(|| async {
+                match record::order_mark(self.states.suite()).await {
+                    Ok(Some(mark)) => {
+                        let mut q = self.queue();
+                        q.last_order = q.last_order.max(mark);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "the order counter's mark can't be read");
+                    }
+                }
+            })
+            .await;
+        let keys = self.next_keys(n);
+        if let Some(last) = keys.last() {
+            self.keep_order_mark(*last).await;
+        }
+        keys
+    }
+
+    /// Writes `key` as the order counter's high-water mark (logged when it can't be).
+    async fn keep_order_mark(&self, key: i64) {
+        if let Err(e) = record::raise_order_mark(self.states.suite(), key).await {
+            tracing::error!(error = %e, "the order counter's mark can't be written");
+        }
+    }
+
+    /// The next `n` keys of the counter, in memory ([`Shared::order_keys`]).
+    fn next_keys(&self, n: usize) -> Vec<i64> {
+        let floor = self
+            .clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+        let mut q = self.queue();
+        (0..n)
+            .map(|_| {
+                q.last_order = q.last_order.saturating_add(1).max(floor);
+                q.last_order
+            })
+            .collect()
+    }
+
+    /// A new queue entry for `info`'s job, with its class place `order_key`.
+    fn active(info: Info, order_key: i64) -> Active {
+        Active {
+            info,
+            order_key,
+            restart_held: false,
+            held_shown: false,
+            reasons_shown: Vec::new(),
+            substatus: Some(Substatus::Waiting),
+            withdrawal: Withdrawal::None,
+            report: RunReport::default(),
+            last_progress: None,
+            unresponsive: false,
+            head: false,
+            overtaken: 0,
+            running: false,
+            completing: false,
+            recording: false,
+            cancel: watch::Sender::new(false),
+            cancelling: false,
+            preempted: false,
+            engine_cancel_sent: false,
+            ctx: None,
+            progress: None,
+            waiting_for_vram: false,
+            exec_start: None,
+            slow: false,
+        }
     }
 
     /// Adds `info`'s job to the queue (with the CORE-125 preemption when `preempt` allows it)
     /// and starts what can start. After the shutdown step nothing is added: the row stays
     /// queued, and the next start recovers it. `false` then.
-    fn enqueue(self: &Arc<Self>, info: Info, preempt: bool) -> bool {
+    fn enqueue(self: &Arc<Self>, info: Info, preempt: bool, order_key: i64) -> bool {
         let id = info.id.to_string();
         let preempt = {
             let mut q = self.queue();
@@ -791,40 +1134,39 @@ impl Shared {
                 lock(&self.locks).remove(&id);
                 return false;
             }
-            q.next_order += 1;
-            let order = q.next_order;
             let preempt = if preempt {
                 self.preemption(&mut q, &info.spec)
             } else {
                 None
             };
-            q.jobs.insert(
-                id,
-                Active {
-                    info,
-                    order,
-                    head: false,
-                    overtaken: 0,
-                    running: false,
-                    completing: false,
-                    recording: false,
-                    cancel: watch::Sender::new(false),
-                    cancelling: false,
-                    preempted: false,
-                    engine_cancel_sent: false,
-                    ctx: None,
-                    progress: None,
-                    waiting_for_vram: false,
-                    exec_start: None,
-                    slow: false,
-                },
-            );
+            q.last_order = q.last_order.max(order_key);
+            q.jobs.insert(id, Shared::active(info, order_key));
             preempt
         };
         if let Some((ctx, handler)) = preempt {
             tokio::spawn(async move { handler.cancel_in_engine(&ctx).await });
         }
         self.pump();
+        true
+    }
+
+    /// Adds a job a restart holds (P4a-R41) to the queue, with its row's place and report: it
+    /// shows `queue_paused` and starts only once a resume releases it. `false` after the
+    /// shutdown step.
+    fn enqueue_held(self: &Arc<Self>, info: Info, row: &JobRow) -> bool {
+        let id = info.id.to_string();
+        let mut q = self.queue();
+        if q.closed {
+            return false;
+        }
+        let mut a = Shared::active(info, row.order_key);
+        a.restart_held = true;
+        a.held_shown = true;
+        a.reasons_shown = vec![RESTART_REASON.to_string()];
+        a.substatus = row.substatus;
+        a.report = row.report.clone();
+        q.last_order = q.last_order.max(row.order_key);
+        q.jobs.insert(id, a);
         true
     }
 
@@ -863,7 +1205,9 @@ impl Shared {
     }
 
     /// Starts the next job of each free lane (CORE-121, CORE-123, CORE-124); none while the
-    /// core drains.
+    /// core drains. A queued job a lane's pause or a restart holds is never picked (the pause
+    /// is decided before the admission, so before VRAM; CORE-160) and shows `queue_paused`
+    /// with its reasons; one released shows `waiting` again.
     fn pump(self: &Arc<Self>) {
         if self.draining() {
             return;
@@ -872,10 +1216,33 @@ impl Shared {
         let mut start = Vec::new();
         let mut wait = Vec::new();
         let mut rewait = Vec::new();
+        let mut held = Vec::new();
+        let mut released = Vec::new();
+        let mut reasons_changed = Vec::new();
         {
             let mut q = self.queue();
             if q.closed {
                 return;
+            }
+            // What each queued job shows: held by a reason, or waiting its turn.
+            let Queue { jobs, lanes, .. } = &mut *q;
+            for (id, a) in jobs.iter_mut() {
+                if a.running || a.completing {
+                    continue;
+                }
+                let reasons = a.hold_reasons(&lanes[a.info.spec.lane.index()]);
+                let holding = !reasons.is_empty();
+                if holding && !a.held_shown {
+                    a.held_shown = true;
+                    a.waiting_for_vram = false;
+                    held.push((id.clone(), a.info.scope.clone()));
+                } else if !holding && a.held_shown {
+                    a.held_shown = false;
+                    released.push((id.clone(), a.info.scope.clone()));
+                } else if holding && reasons != a.reasons_shown {
+                    reasons_changed.push((id.clone(), a.info.scope.clone()));
+                }
+                a.reasons_shown = reasons;
             }
             for lane in Lane::ALL {
                 let li = lane.index();
@@ -886,12 +1253,14 @@ impl Shared {
                     let candidates: Vec<Candidate<'_>> = q
                         .jobs
                         .iter()
-                        .filter(|(_, a)| !a.running && !a.completing && a.info.spec.lane == lane)
+                        .filter(|(_, a)| {
+                            !a.running && !a.completing && !a.held_shown && a.info.spec.lane == lane
+                        })
                         .map(|(id, a)| Candidate {
                             id,
                             priority: a.info.spec.priority,
                             head: a.head,
-                            order: a.order,
+                            order: a.order_key,
                             group: a.info.spec.group.as_deref(),
                             overtaken: a.overtaken,
                         })
@@ -939,15 +1308,59 @@ impl Shared {
                                 o.overtaken += 1;
                             }
                         }
-                        q.lanes[li] = LaneState {
-                            running: Some(id.clone()),
-                            group,
-                        };
+                        let lane_state = &mut q.lanes[li];
+                        lane_state.running = Some(id.clone());
+                        lane_state.group = group;
                         start.push((id, admit == Admit::GoUnchecked));
                     }
                 }
             }
             self.tell_busy(&mut q);
+        }
+        for (id, scope) in held {
+            let shared = self.clone();
+            tokio::spawn(async move {
+                // Only while it is still held and not shown so already.
+                let still_held: Guard = |a| {
+                    a.held_shown
+                        && !a.running
+                        && !a.completing
+                        && a.substatus != Some(Substatus::QueuePaused)
+                };
+                shared
+                    .apply(
+                        &id,
+                        &scope,
+                        Change::to(Substatus::QueuePaused),
+                        Some(still_held),
+                    )
+                    .await;
+            });
+        }
+        for (id, scope) in released {
+            let shared = self.clone();
+            tokio::spawn(async move {
+                // Only while it is still released, not picked since, and shown held.
+                let still_released: Guard = |a| {
+                    !a.held_shown
+                        && !a.running
+                        && !a.completing
+                        && !a.waiting_for_vram
+                        && a.substatus == Some(Substatus::QueuePaused)
+                };
+                shared
+                    .apply(
+                        &id,
+                        &scope,
+                        Change::to(Substatus::Waiting),
+                        Some(still_released),
+                    )
+                    .await;
+            });
+        }
+        for (id, scope) in reasons_changed {
+            let shared = self.clone();
+            tokio::spawn(async move { shared.announce_live(&id, &scope).await });
         }
         for (id, scope) in wait {
             let shared = self.clone();
@@ -967,8 +1380,10 @@ impl Shared {
         for (id, scope) in rewait {
             let shared = self.clone();
             tokio::spawn(async move {
-                // Only while it still waits for its turn: not picked and waiting again since.
-                let overtaken: Guard = |a| !a.waiting_for_vram && !a.running && !a.completing;
+                // Only while it still waits for its turn: not picked and waiting again since,
+                // and not held meanwhile.
+                let overtaken: Guard =
+                    |a| !a.waiting_for_vram && !a.running && !a.completing && !a.held_shown;
                 shared
                     .apply(&id, &scope, Change::to(Substatus::Waiting), Some(overtaken))
                     .await;
@@ -1039,12 +1454,15 @@ impl Shared {
         }
     }
 
-    /// `(cancelling, preempted)` of a job this core runs.
-    fn flags(&self, id: &str) -> (bool, bool) {
-        self.queue()
-            .jobs
-            .get(id)
-            .map_or((true, false), |a| (a.cancelling, a.preempted))
+    /// `(cancelling, preempted, withdrawn)` of a job this core runs.
+    fn flags(&self, id: &str) -> (bool, bool, bool) {
+        self.queue().jobs.get(id).map_or((true, false, false), |a| {
+            (
+                a.cancelling,
+                a.preempted,
+                a.withdrawal == Withdrawal::Withdrawn,
+            )
+        })
     }
 
     /// One job's run, from its start to its end (module docs of [`crate::jobs`]).
@@ -1069,9 +1487,11 @@ impl Shared {
                 return self.complete(&info, attempt, End::Failed(error)).await;
             }
             loop {
-                // The watchdog measures each attempt from its own `execution_start`.
+                // The watchdog and the stall rule measure each attempt from its own start.
                 if let Some(a) = self.queue().jobs.get_mut(&id) {
                     a.exec_start = None;
+                    a.last_progress = None;
+                    a.unresponsive = false;
                 }
                 let initial = if info.spec.engine.is_some() {
                     Substatus::Submitting
@@ -1092,9 +1512,12 @@ impl Shared {
                 match self.apply_checked(&id, &info.scope, c, Some(live)).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        let (cancelling, preempted) = self.flags(&id);
+                        let (cancelling, preempted, withdrawn) = self.flags(&id);
                         if cancelling {
                             return self.complete(&info, attempt, End::Cancelled).await;
+                        }
+                        if withdrawn {
+                            return self.requeue_withdrawn(&info, attempt).await;
                         }
                         if preempted {
                             return self.requeue(&info).await;
@@ -1141,7 +1564,7 @@ impl Shared {
                     // The attempt is over: neither its backoff nor its end counts (watchdog).
                     a.exec_start = None;
                 }
-                let (cancelling, preempted) = self.flags(&id);
+                let (cancelling, preempted, withdrawn) = self.flags(&id);
                 // An unknown outcome stays unknown, and an engine that lost the job is an
                 // interruption, whatever cancel or preemption came meanwhile: a cancel never
                 // hides a charge that may have happened, the outputs salvaged are kept, and
@@ -1155,6 +1578,8 @@ impl Shared {
                         return self.complete(&info, attempt, End::Interrupted { error, salvaged }).await;
                     }
                     Err(_) if cancelling => return self.complete(&info, attempt, End::Cancelled).await,
+                    // Its pending prompt was withdrawn by a pause (CORE-160): it waits again.
+                    Err(_) if withdrawn => return self.requeue_withdrawn(&info, attempt).await,
                     Err(_) if preempted => return self.requeue(&info).await,
                     Err(failure) => failure,
                 };
@@ -1175,11 +1600,16 @@ impl Shared {
                             _ = cancel.wait_for(|c| *c) => true,
                         };
                         if woke {
-                            let (cancelling, preempted) = self.flags(&id);
+                            let (cancelling, preempted, _) = self.flags(&id);
                             if preempted && !cancelling {
                                 return self.requeue(&info).await;
                             }
                             return self.complete(&info, attempt, End::Cancelled).await;
+                        }
+                        // A pause that came during the backoff holds the next attempt
+                        // (CORE-160): it waits again, and runs as that attempt once released.
+                        if self.hold_if_paused(&id, Some(attempt + 1), false).await {
+                            return self.requeue_withdrawn(&info, attempt + 1).await;
                         }
                         attempt += 1;
                         continue;
@@ -1249,6 +1679,44 @@ impl Shared {
         self.pump();
     }
 
+    /// A job whose pending prompt a pause withdrew (CORE-160), or that a pause held before it
+    /// reached its engine ([`Shared::hold_if_paused`]), leaves its lane and waits again: its
+    /// row was written (`queue_paused`; a withdrawn prompt's id moved to `withdrawn_id`), and
+    /// its next attempt posts a new prompt only once an old one is gone (CORE-120). A job
+    /// cancelled meanwhile (N1: a `job.cancel` while the hold was written) ends `cancelled`
+    /// now, as attempt `attempt`, instead of waiting held.
+    async fn requeue_withdrawn(self: &Arc<Self>, info: &Info, attempt: u32) {
+        let cancelling = {
+            let mut q = self.queue();
+            let cancelling = q.jobs.get(info.id.as_str()).is_some_and(|a| a.cancelling);
+            if !cancelling {
+                Self::leave_lane_queued(&mut q, info);
+                self.tell_busy(&mut q);
+            }
+            cancelling
+        };
+        if cancelling {
+            return self.complete(info, attempt, End::Cancelled).await;
+        }
+        tracing::info!(job_id = %info.id, "a job whose prompt was withdrawn waits again");
+        self.pump();
+    }
+
+    /// [`Shared::requeue_withdrawn`]'s change to the queue: the job leaves its lane and waits.
+    fn leave_lane_queued(q: &mut Queue, info: &Info) {
+        let lane = info.spec.lane.index();
+        if q.lanes[lane].running.as_deref() == Some(info.id.as_str()) {
+            q.lanes[lane].running = None;
+        }
+        if let Some(a) = q.jobs.get_mut(info.id.as_str()) {
+            a.running = false;
+            a.withdrawal = Withdrawal::None;
+            a.engine_cancel_sent = false;
+            a.exec_start = None;
+            a.cancel = watch::Sender::new(false);
+        }
+    }
+
     /// Whether the job is still in its completions in this core: the shutdown step gives up on
     /// a job that took longer than [`COMPLETION_GRACE`], and then nothing more is written.
     fn still_completing(&self, id: &str) -> bool {
@@ -1297,11 +1765,23 @@ impl Shared {
         if rerun {
             ctx.reservation = None;
         }
+        let all_cached = {
+            let mut q = self.queue();
+            q.jobs.get_mut(id).is_some_and(|a| {
+                // Nothing executes any more.
+                a.report.indeterminate = false;
+                a.report.all_cached
+            })
+        };
         let outcome = match &end {
             End::Succeeded(done) => Outcome::Ok(ToolOutput {
                 structured: done.structured.clone(),
                 artifacts: done.artifacts.clone(),
-                summary_text: format!("{} succeeded", info.spec.kind),
+                summary_text: if all_cached {
+                    NOTHING_CHANGED.to_string()
+                } else {
+                    format!("{} succeeded", info.spec.kind)
+                },
             }),
             End::Failed(error) | End::Interrupted { error, .. } | End::Unknown(error) => {
                 Outcome::Error {
@@ -1395,6 +1875,8 @@ impl Shared {
                 owner: id.to_string(),
                 retry_of: Some(id.to_string()),
                 origin: info.origin.clone(),
+                started_by: info.started_by.clone(),
+                batch: Some(info.batch.clone()),
             };
             if let Err(e) = self.submit_new(&info.scope, new).await {
                 tracing::warn!(job_id = id, code = %e.code, "the re-run of an interrupted agent job could not be queued");
@@ -1490,8 +1972,10 @@ impl Shared {
         self.changed.send_modify(|n| *n += 1);
     }
 
-    /// `JobCtx::set_substatus`.
-    pub(crate) async fn handler_substatus(&self, id: &JobId, s: Substatus) {
+    /// `JobCtx::set_substatus`. A job reaching `queued_in_engine` while a reason of its lane
+    /// covers it (a pause that came after its POST was decided, CORE-160) has its prompt
+    /// withdrawn as the pause would have.
+    pub(crate) async fn handler_substatus(self: &Arc<Self>, id: &JobId, s: Substatus) {
         let scope = {
             let q = self.queue();
             match q.jobs.get(id.as_str()) {
@@ -1499,9 +1983,153 @@ impl Shared {
                 _ => return,
             }
         };
-        let live: Guard = |a| a.running && !a.cancelling && !a.completing;
+        // A withdrawn attempt (CORE-160) no longer shows its own state.
+        let live: Guard = |a| {
+            a.running && !a.cancelling && !a.completing && a.withdrawal != Withdrawal::Withdrawn
+        };
         self.apply(id.as_str(), &scope, Change::to(s), Some(live))
             .await;
+        if s != Substatus::QueuedInEngine {
+            return;
+        }
+        let lane = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            jobs.get_mut(id.as_str()).and_then(|a| {
+                let lane = a.info.spec.lane;
+                let covered = !lanes[lane.index()].holding(a.info.spec.priority).is_empty();
+                (covered && a.withdrawable()).then(|| {
+                    a.withdrawal = Withdrawal::Deciding;
+                    lane
+                })
+            })
+        };
+        if let Some(lane) = lane {
+            let (me, id) = (self.clone(), id.to_string());
+            tokio::spawn(async move {
+                me.withdraw_one(&id).await;
+                me.publish_queue(lane);
+            });
+        }
+    }
+
+    /// `JobCtx::hold_if_paused`, and the retry loop's check before the next attempt (CORE-160;
+    /// plan 4a ruling, 2026-10-24): when a reason of its lane covers running job `id`, which
+    /// hasn't reached its engine, its attempt ends the way a withdrawal's does, with nothing
+    /// withdrawn: its row goes to `queue_paused` (with `attempt`, when given; the engine id
+    /// cleared when `clear_external`, for a prompt id persisted but never posted), and it
+    /// waits again ([`Shared::requeue_withdrawn`]). `true` when it was held.
+    pub(crate) async fn hold_if_paused(
+        &self,
+        id: &str,
+        attempt: Option<u32>,
+        clear_external: bool,
+    ) -> bool {
+        let scope = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let Some(a) = jobs.get_mut(id) else {
+                return false;
+            };
+            let covered = !lanes[a.info.spec.lane.index()]
+                .holding(a.info.spec.priority)
+                .is_empty();
+            if !covered
+                || !a.running
+                || a.completing
+                || a.cancelling
+                || a.preempted
+                || a.withdrawal != Withdrawal::None
+            {
+                return false;
+            }
+            a.withdrawal = Withdrawal::Withdrawn;
+            a.held_shown = true;
+            a.info.scope.clone()
+        };
+        tracing::info!(
+            job_id = id,
+            "a paused lane holds a job before it reaches its engine"
+        );
+        let mut c = Change::to(Substatus::QueuePaused);
+        c.attempt = attempt;
+        if clear_external {
+            c.external_id = Some(None);
+        }
+        let held: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
+        self.apply(id, &scope, c, Some(held)).await;
+        true
+    }
+
+    /// `JobCtx::late_withdrawn` (recommendation B, plan 4a ruling, 2026-10-24): running job
+    /// `id`'s prompt, whose withdrawal's delete went unseen, is gone after all. It ends the
+    /// way a withdrawn attempt does: its row moves the id to `withdrawn_id` and shows
+    /// `queue_paused` while a reason of its lane covers it (counted as withdrawn), else
+    /// `waiting`; the next attempt's gone-check keeps the work once.
+    pub(crate) async fn late_withdrawn(&self, id: &str, prompt_id: &str) {
+        let (scope, lane, held) = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let Some(a) = jobs.get_mut(id) else {
+                return;
+            };
+            // A withdrawal still deciding is taken over (M1): it changes only a `Deciding`
+            // value, and its engine call sees the attempt's `cancel_sent` and doesn't withdraw.
+            if !a.running
+                || a.completing
+                || a.cancelling
+                || a.preempted
+                || a.withdrawal == Withdrawal::Withdrawn
+            {
+                return;
+            }
+            let lane = a.info.spec.lane;
+            let held = !lanes[lane.index()].holding(a.info.spec.priority).is_empty();
+            a.withdrawal = Withdrawal::Withdrawn;
+            a.held_shown = held;
+            (a.info.scope.clone(), lane, held)
+        };
+        let to = if held {
+            Substatus::QueuePaused
+        } else {
+            Substatus::Waiting
+        };
+        let c = Change {
+            external_id: Some(None),
+            withdrawn_id: Some(Some(prompt_id.to_string())),
+            ..Change::to(to)
+        };
+        let withdrawn: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
+        if self.apply(id, &scope, c, Some(withdrawn)).await.is_some() && held {
+            Self::count_withdrawn(&mut self.queue(), lane);
+            self.publish_queue(lane);
+        }
+    }
+
+    /// Counts one withdrawn prompt of `lane`'s pause, only while the lane is still paused (M2:
+    /// a withdrawal decided after a resume reset the count belongs to no pause).
+    fn count_withdrawn(q: &mut Queue, lane: Lane) {
+        let state = &mut q.lanes[lane.index()];
+        if !state.reasons.is_empty() {
+            state.withdrawn += 1;
+        }
+    }
+
+    /// `JobCtx::settle_withdrawn`: the prompt a pause withdrew is known gone (`follow` is
+    /// `None`) or is still the job's (`follow` names it, and it becomes the engine id again);
+    /// either way `withdrawn_id` is cleared (CORE-160, CORE-120).
+    pub(crate) async fn handler_settle_withdrawn(
+        &self,
+        id: &JobId,
+        follow: Option<&str>,
+        trace_id: &str,
+    ) -> Result<(), ErrorBody> {
+        let c = Change {
+            external_id: follow.map(|f| Some(f.to_string())),
+            withdrawn_id: Some(None),
+            ..Change::default()
+        };
+        self.handler_row(id, c, trace_id).await
     }
 
     /// `JobCtx::set_external_id`: a guarded update of the running job's row (never a final
@@ -1512,6 +2140,16 @@ impl Shared {
         external_id: Option<&str>,
         trace_id: &str,
     ) -> Result<(), ErrorBody> {
+        let c = Change {
+            external_id: Some(external_id.map(str::to_string)),
+            ..Change::default()
+        };
+        self.handler_row(id, c, trace_id).await
+    }
+
+    /// A guarded update of the running job's row (never a final one) by its handler, without
+    /// an announcement.
+    async fn handler_row(&self, id: &JobId, c: Change, trace_id: &str) -> Result<(), ErrorBody> {
         let scope = {
             let q = self.queue();
             match q.jobs.get(id.as_str()) {
@@ -1521,10 +2159,6 @@ impl Shared {
         };
         let lock = self.job_lock(id.as_str());
         let _serial = lock.lock().await;
-        let c = Change {
-            external_id: Some(external_id.map(str::to_string)),
-            ..Change::default()
-        };
         match record::update(scope.db(), id.as_str(), c, self.now()).await {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(job_unknown(id.as_str(), trace_id)),
@@ -1544,14 +2178,132 @@ impl Shared {
             max,
             node: node.map(str::to_string),
         };
-        if let Some(a) = self.queue().jobs.get_mut(id.as_str()) {
-            a.progress = Some(progress.clone());
-        }
+        let (mono, wall) = (self.clock.monotonic(), self.now_ms());
+        let back = {
+            let mut q = self.queue();
+            q.jobs.get_mut(id.as_str()).and_then(|a| {
+                a.progress = Some(progress.clone());
+                a.last_progress = Some(mono);
+                a.report.last_progress_ms = Some(wall);
+                if let Some(current) = a.report.subtasks.last_mut() {
+                    current.value = Some(value);
+                    current.max = Some(max);
+                }
+                std::mem::take(&mut a.unresponsive).then_some(())
+            })
+        };
         let mut data = json!({"kind": "progress", "value": value, "max": max});
         if let Some(node) = &progress.node {
             data["node"] = Value::from(node.as_str());
         }
         self.events.publish(&format!("job:{id}"), data);
+        if back.is_some() {
+            self.publish_unresponsive(id.as_str(), false);
+        }
+    }
+
+    /// `JobCtx::set_phase` (Appendix G "Phase"): a new phase is added to the job's subtasks;
+    /// the one before it keeps only its name.
+    pub(crate) fn set_phase(self: &Arc<Self>, id: &JobId, phase: &str) {
+        let scope = {
+            let mut q = self.queue();
+            let Some(a) = q.jobs.get_mut(id.as_str()) else {
+                return;
+            };
+            if a.report.phase.as_deref() == Some(phase) {
+                return;
+            }
+            if let Some(before) = a.report.subtasks.last_mut() {
+                before.value = None;
+                before.max = None;
+            }
+            a.report.subtasks.push(Subtask {
+                name: phase.to_string(),
+                value: None,
+                max: None,
+            });
+            a.report.phase = Some(phase.to_string());
+            a.info.scope.clone()
+        };
+        let (shared, id) = (self.clone(), id.to_string());
+        tokio::spawn(async move { shared.announce_live(&id, &scope).await });
+    }
+
+    /// Changes what a running job's run reported (`JobCtx::mark_cached` and the like).
+    pub(crate) fn report(&self, id: &JobId, f: impl FnOnce(&mut RunReport)) {
+        if let Some(a) = self.queue().jobs.get_mut(id.as_str()) {
+            f(&mut a.report);
+        }
+    }
+
+    /// `JobCtx::node_started`: a sign of life, `indeterminate` until measured.
+    pub(crate) fn node_started(&self, id: &JobId) {
+        let (mono, wall) = (self.clock.monotonic(), self.now_ms());
+        let back = {
+            let mut q = self.queue();
+            q.jobs.get_mut(id.as_str()).and_then(|a| {
+                a.last_progress = Some(mono);
+                a.report.last_progress_ms = Some(wall);
+                a.report.indeterminate = true;
+                std::mem::take(&mut a.unresponsive).then_some(())
+            })
+        };
+        if back.is_some() {
+            self.publish_unresponsive(id.as_str(), false);
+        }
+    }
+
+    /// Unix milliseconds now.
+    fn now_ms(&self) -> i64 {
+        self.clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    }
+
+    /// `{kind: "unresponsive", on}` on `job:<id>` (ARCH-072).
+    fn publish_unresponsive(&self, id: &str, on: bool) {
+        if on {
+            tracing::warn!(
+                job_id = id,
+                "a running job has reported nothing for the stall time; it keeps running"
+            );
+        }
+        self.events.publish(
+            &format!("job:{id}"),
+            json!({"kind": "unresponsive", "on": on}),
+        );
+    }
+
+    /// The stall rule (ARCH-072; Appendix G): a job `running` in `executing` whose newest sign
+    /// of life (or, before any, its start of executing) is the stall time or more ago is
+    /// `unresponsive`; a flip either way is published. It never cancels anything.
+    fn check_unresponsive(&self) {
+        let now = self.clock.monotonic();
+        let stall = *self
+            .stall_after
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut flips = Vec::new();
+        {
+            let mut q = self.queue();
+            for (id, a) in &mut q.jobs {
+                let stalled = a.running
+                    && !a.completing
+                    && a.substatus == Some(Substatus::Executing)
+                    && a.exec_start.is_some_and(|start| {
+                        let since = a.last_progress.filter(|t| *t >= start).unwrap_or(start);
+                        now.saturating_sub(since) >= stall
+                    });
+                if stalled != a.unresponsive {
+                    a.unresponsive = stalled;
+                    flips.push((id.clone(), stalled));
+                }
+            }
+        }
+        for (id, on) in flips {
+            self.publish_unresponsive(&id, on);
+        }
     }
 
     /// The watchdog (ARCH-072, CORE-126): a running job past [`watchdog_slow`] since its
@@ -1595,6 +2347,116 @@ impl Shared {
         }
     }
 
+    /// `lane`'s pause now.
+    fn queue_state(&self, lane: Lane) -> QueueState {
+        let q = self.queue();
+        let state = &q.lanes[lane.index()];
+        let (mut held, mut restart_held) = (0u32, 0u32);
+        for a in q.jobs.values().filter(|a| a.info.spec.lane == lane) {
+            if !a.hold_reasons(state).is_empty() {
+                held += 1;
+            }
+            if a.restart_held && !a.running && !a.completing {
+                restart_held += 1;
+            }
+        }
+        QueueState {
+            lane: match lane {
+                Lane::GpuHeavy => QueueLane::GpuHeavy,
+                Lane::Cpu => QueueLane::Cpu,
+            },
+            paused: !state.reasons.is_empty(),
+            reasons: state.reasons.iter().map(|r| r.wire().to_string()).collect(),
+            held,
+            restart_held,
+            withdrawn: state.withdrawn,
+        }
+    }
+
+    /// `{kind: "queue", state}` on `jobs` (Appendix G).
+    fn publish_queue(&self, lane: Lane) {
+        let state = serde_json::to_value(self.queue_state(lane)).expect("a queue state serialises");
+        self.events
+            .publish("jobs", json!({"kind": "queue", "state": state}));
+    }
+
+    /// Releases `lane`'s jobs a restart holds (P4a-R41); the next pump shows them.
+    fn release_held(q: &mut Queue, lane: Lane) {
+        for a in q.jobs.values_mut().filter(|a| a.info.spec.lane == lane) {
+            a.restart_held = false;
+        }
+    }
+
+    /// Withdraws the pending prompt of running job `id` (marked `Deciding` by the pause):
+    /// only its engine's [`Withdraw`] says whether it was still pending. A withdrawn job's
+    /// attempt is told to end, and only then, after the fail point `jobs.after_withdraw` (only
+    /// its `abort` means anything: an error is logged and the withdrawal goes on), its row
+    /// changes: the engine id moves to `withdrawn_id`, kept until the next attempt knows the
+    /// old prompt gone (CORE-120), and it is `queue_paused` (Appendix G "Withdrawal").
+    async fn withdraw_one(self: &Arc<Self>, id: &str) {
+        let decided = |me: &Self, w: Withdrawal| {
+            if let Some(a) = me.queue().jobs.get_mut(id)
+                && a.withdrawal == Withdrawal::Deciding
+            {
+                a.withdrawal = w;
+            }
+        };
+        let Some((scope, engine, lane)) = self
+            .queue()
+            .jobs
+            .get(id)
+            .and_then(|a| Some((a.info.scope.clone(), a.info.spec.engine?, a.info.spec.lane)))
+        else {
+            return decided(self, Withdrawal::None);
+        };
+        let withdrawer = read(&self.withdrawers).get(&engine).cloned();
+        let external_id = match record::get(scope.db(), id).await {
+            Ok(Some(row)) if row.substatus == Some(Substatus::QueuedInEngine) => row.external_id,
+            _ => None,
+        };
+        let (Some(withdrawer), Some(external_id)) = (withdrawer, external_id) else {
+            return decided(self, Withdrawal::None);
+        };
+        let job = JobId(id.to_string());
+        let outcome = withdrawer.withdraw(&job, &external_id).await;
+        if outcome != WithdrawOutcome::Withdrawn {
+            tracing::info!(job_id = id, outcome = ?outcome, "a paused lane's prompt was not withdrawn; it runs on");
+            return decided(self, Withdrawal::None);
+        }
+        if let Err(e) = self.failpoints.hit("jobs.after_withdraw") {
+            tracing::warn!(job_id = id, error = %e, "fail point jobs.after_withdraw");
+        }
+        // Only while still deciding: a late "gone" may have taken the withdrawal over (M1),
+        // and then its row and count are that path's.
+        {
+            let mut q = self.queue();
+            match q.jobs.get_mut(id) {
+                Some(a) if a.withdrawal == Withdrawal::Deciding => {
+                    a.withdrawal = Withdrawal::Withdrawn;
+                    a.held_shown = true;
+                }
+                _ => return,
+            }
+        }
+        tracing::info!(job_id = id, prompt_id = %external_id, "a paused lane's pending prompt was withdrawn");
+        // The row first, then the attempt ends: the attempt writes nothing once withdrawn.
+        let c = Change {
+            external_id: Some(None),
+            withdrawn_id: Some(Some(external_id.clone())),
+            ..Change::to(Substatus::QueuePaused)
+        };
+        let withdrawn: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
+        // Counted only once its row says so: a job cancelled meanwhile ends cancelled.
+        if self.apply(id, &scope, c, Some(withdrawn)).await.is_some() {
+            Self::count_withdrawn(&mut self.queue(), lane);
+        }
+        if let Some(a) = self.queue().jobs.get_mut(id)
+            && a.withdrawal == Withdrawal::Withdrawn
+        {
+            a.cancel.send_replace(true);
+        }
+    }
+
     /// Marks a job of this core that a shutdown leaves behind, as a recovery would; the
     /// completions of one that never started run (module docs, "Reservations").
     async fn persist_one(self: &Arc<Self>, info: &Info, started: bool) {
@@ -1606,6 +2468,12 @@ impl Shared {
                 return;
             }
         };
+        // The restart hold (P4a-R41): a job that never reached an engine stays queued, so the
+        // next start holds it rather than failing it.
+        if !started && holdable(&row) {
+            tracing::info!(job_id = %info.id, "a queued job is left queued at shutdown; the next start holds it");
+            return;
+        }
         let never = !started && never_ran(row.substatus);
         let c = interrupt_change(&row, self.now());
         if let Some(after) = self.apply(info.id.as_str(), &info.scope, c, None).await
@@ -1637,7 +2505,9 @@ impl Shared {
                 .filter_map(|id| q.jobs.remove(&id))
                 .map(|a| {
                     a.cancel.send_replace(true);
-                    (a.info, a.running)
+                    // A withdrawn (or held) attempt winding down never reached its engine again:
+                    // its row decides, as for a queued job (the restart hold).
+                    (a.info, a.running && a.withdrawal != Withdrawal::Withdrawn)
                 })
                 .collect();
             self.tell_busy(&mut q);
@@ -1681,12 +2551,27 @@ impl Shared {
     }
 }
 
-/// Whether a job in `substatus` never started (it was waiting for its turn or for VRAM).
+/// Whether a job in `substatus` never started (it was waiting for its turn or for VRAM, or
+/// held).
 fn never_ran(substatus: Option<Substatus>) -> bool {
     matches!(
         substatus,
-        Some(Substatus::Waiting | Substatus::WaitingForVram)
+        Some(Substatus::Waiting | Substatus::WaitingForVram | Substatus::QueuePaused)
     )
+}
+
+/// The kind of a director task (CORE-118): never held by a restart (ARCH-022 until the
+/// director plan).
+const DIRECTOR_TASK_KIND: &str = "assistant_task";
+
+/// Whether a restart holds `row` (P4a-R41; Appendix G "Restart hold"): a queued job that never
+/// reached an engine (`waiting`, `waiting_for_vram` or `queue_paused`, and no engine id),
+/// other than a director task.
+fn holdable(row: &JobRow) -> bool {
+    row.status == JobStatus::Queued
+        && never_ran(row.substatus)
+        && row.external_id.is_none()
+        && row.kind != DIRECTOR_TASK_KIND
 }
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
@@ -1745,8 +2630,11 @@ impl Jobs {
             queue: Mutex::new(Queue::default()),
             changed: watch::Sender::new(0),
             recovered: Mutex::new(HashMap::new()),
+            order_seeded: OnceCell::new(),
             locks: Mutex::new(HashMap::new()),
             adopted: Mutex::new(HashSet::new()),
+            withdrawers: RwLock::new(HashMap::new()),
+            stall_after: RwLock::new(STALL_AFTER),
         });
         events.register_snapshot("job:", Arc::new(JobSnapshots(Arc::downgrade(&shared))));
         Arc::new(Jobs { shared })
@@ -1839,6 +2727,14 @@ impl Jobs {
         s.ensure_recovered(&scope)
             .await
             .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
+        // A retry keeps the batch and the index of the job it retries (Appendix G).
+        let batch = match &caller.retry_of {
+            None => None,
+            Some(of) => record::get(scope.db(), of.as_str())
+                .await
+                .map_err(|e| state_unavailable(&e, &caller.trace_id))?
+                .map(|r| (r.batch_id, r.batch_index)),
+        };
         if caller.retry_of.is_some() {
             spec.priority =
                 Priority::for_caller(&caller.caller, spec.priority == Priority::Interactive);
@@ -1855,10 +2751,72 @@ impl Jobs {
             owner: caller.call_id.clone(),
             retry_of: caller.retry_of.as_ref().map(|j| j.0.clone()),
             origin: caller.origin.clone(),
+            started_by: Some(StartedBy::of(caller)),
+            batch,
         };
         let row = s.submit_new(&scope, new).await?;
         caller.submitted.set(JobId(row.job_id.clone()));
         Ok(s.summary(&row))
+    }
+
+    /// Submits `specs` as one batch in `caller`'s scope (P4a-R13; `test.job {batch}`): every
+    /// job shares one `batch_id`, each with its index in order, all written in one
+    /// transaction. The call's reservation passes to the first; with an idempotency key, the
+    /// batch that key made before is returned. Sets `caller.submitted` to the first job.
+    ///
+    /// # Errors
+    /// As [`Jobs::submit`]; `params.invalid` for no spec, or a retry.
+    pub async fn submit_batch(
+        &self,
+        caller: &JobCaller,
+        specs: Vec<JobSpec>,
+    ) -> Result<Vec<JobSummary>, ErrorBody> {
+        let s = &self.shared;
+        if specs.is_empty() || caller.retry_of.is_some() {
+            return Err(params_invalid(
+                "a batch is at least one job, and never a retry".to_string(),
+                &caller.trace_id,
+            ));
+        }
+        if let Some(first) = caller.submitted.get() {
+            return Err(ErrorBody::new(
+                &codes::CORE_BUG,
+                format!(
+                    "A tool call submitted a second job after {first}; one call submits at most one. This is a bug in LILITH."
+                ),
+                caller.trace_id.clone(),
+            ));
+        }
+        let scope = s.scope_of(caller);
+        s.ensure_recovered(&scope)
+            .await
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
+        let news = specs
+            .into_iter()
+            .enumerate()
+            .map(|(i, spec)| NewJob {
+                spec,
+                trace_id: caller.trace_id.clone(),
+                // The key goes on the first job: it gives back the whole batch.
+                idem: caller
+                    .idem_key
+                    .as_ref()
+                    .filter(|_| i == 0)
+                    .map(|key| (caller.idem_scope.clone(), key.clone())),
+                caller_scope: Some(caller.idem_scope.clone()),
+                reservation: caller.reservation.clone().filter(|_| i == 0),
+                owner: caller.call_id.clone(),
+                retry_of: None,
+                origin: caller.origin.clone(),
+                started_by: Some(StartedBy::of(caller)),
+                batch: None,
+            })
+            .collect();
+        let rows = s.submit_many(&scope, news).await?;
+        if let Some(first) = rows.first() {
+            caller.submitted.set(JobId(first.job_id.clone()));
+        }
+        Ok(rows.iter().map(|r| s.summary(r)).collect())
     }
 
     /// Job `id` of `caller`'s scope.
@@ -1904,12 +2862,18 @@ impl Jobs {
                 params_invalid(format!("{c:?} is not a jobs.list cursor"), trace_id)
             })?),
         };
+        let since = match &f.since {
+            None => None,
+            Some(t) => Some(rfc3339_ms(t).map(|ms| ms.div_euclid(1000)).ok_or_else(|| {
+                params_invalid(format!("since {t:?} is not an RFC 3339 time"), trace_id)
+            })?),
+        };
         let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?;
         // One row more than the page: there is a next page only when it exists.
-        let mut rows = record::list(scope.db(), &f, limit + 1, before)
+        let mut rows = record::list(scope.db(), &f, since, limit + 1, before)
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?;
         let more = rows.len() > limit as usize;
@@ -2139,17 +3103,24 @@ impl Jobs {
         // Ruling P3-R21: an agent's retry of paid or hosted work that may have run
         // (`interrupted_with_side_effects` below) needs your confirmation; the dispatcher makes
         // it `pending_confirmation`. An `interrupted_unknown` job is retried by no one (above):
-        // it is resolved first.
-        if caller.caller.is_agent()
-            && let Some(rerun) = record::auto_rerun_of(scope.db(), id.as_str())
-                .await
-                .map_err(|e| state_unavailable(&e, trace_id))?
+        // it is resolved first. From plan 4a only the newest attempt is retried (Appendix G):
+        // a job another job retried already (a `job.retry`, a batch retry or the automatic
+        // re-run) is never retried again, by anyone; only the same call, with the same
+        // idempotency key, gets back the job it made.
+        if let Some((newer, scope_of, key)) = record::retried_by(scope.db(), id.as_str())
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?
         {
-            let mut error = not_retryable(format!(
-                "Job {id} was re-run automatically as job {rerun}; follow that job instead."
-            ));
-            error.data = Some(json!({ "rerun": rerun }));
-            return Err(error);
+            let same_call = caller.idem_key.is_some()
+                && key == caller.idem_key
+                && scope_of.as_deref() == Some(caller.idem_scope.as_str());
+            if !same_call {
+                let mut error = not_retryable(format!(
+                    "Job {id} was already retried as {newer}; follow or retry that job instead."
+                ));
+                error.data = Some(json!({ "rerun": newer }));
+                return Err(error);
+            }
         }
         let origin = row.origin.ok_or_else(|| {
             not_retryable(format!(
@@ -2162,6 +3133,353 @@ impl Jobs {
             interrupted_with_side_effects: row.external_side_effects
                 && row.substatus == Some(Substatus::Interrupted),
         })
+    }
+
+    /// `job.move` (CORE-160; Appendix G): job `id` of `caller`'s scope goes to the front
+    /// (`next`: one below the lowest `order_key`) or the back (`last`: one above the highest)
+    /// of the queued jobs of its lane and class. Only a job waiting its turn moves (`waiting`,
+    /// `waiting_for_vram` or `queue_paused`); a move never changes its class, never touches a
+    /// prompt in the engine, and is no overtake (CORE-124). Its summary is published; no jobs
+    /// log line is written (it is no state change).
+    ///
+    /// # Errors
+    /// `job.unknown`; `job.not_queued` for any other job; `state.unavailable`.
+    pub async fn move_job(
+        &self,
+        caller: &JobCaller,
+        id: &JobId,
+        to: MoveTo,
+    ) -> Result<JobSummary, ErrorBody> {
+        let s = &self.shared;
+        let trace_id = &caller.trace_id;
+        let scope = s.scope_of(caller);
+        s.ensure_recovered(&scope)
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?;
+        let row = record::get(scope.db(), id.as_str())
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?
+            .ok_or_else(|| job_unknown(id.as_str(), trace_id))?;
+        let not_queued = || {
+            ErrorBody::new(
+                &codes::JOB_NOT_QUEUED,
+                codes::JOB_NOT_QUEUED_MESSAGE,
+                trace_id.clone(),
+            )
+        };
+        if !never_ran(row.substatus) || row.status != JobStatus::Queued {
+            return Err(not_queued());
+        }
+        let lock = s.job_lock(id.as_str());
+        let _serial = lock.lock().await;
+        let key = {
+            let mut q = s.queue();
+            let Some(a) = q.jobs.get(id.as_str()) else {
+                return Err(not_queued());
+            };
+            if a.running || a.completing || a.cancelling {
+                return Err(not_queued());
+            }
+            let (lane, class) = (a.info.spec.lane, a.info.spec.priority);
+            let keys = q
+                .jobs
+                .values()
+                .filter(|o| {
+                    !o.running
+                        && !o.completing
+                        && o.info.spec.lane == lane
+                        && o.info.spec.priority == class
+                })
+                .map(|o| o.order_key);
+            let key = match to {
+                MoveTo::Next => keys.min().map_or(0, |k| k.saturating_sub(1)),
+                MoveTo::Last => keys.max().map_or(0, |k| k.saturating_add(1)),
+            };
+            if let Some(a) = q.jobs.get_mut(id.as_str()) {
+                a.order_key = key;
+            }
+            // A job submitted later still goes after one moved last.
+            q.last_order = q.last_order.max(key);
+            key
+        };
+        let c = Change {
+            order_key: Some(key),
+            ..Change::default()
+        };
+        s.keep_order_mark(key).await;
+        let (_, moved) = record::update(scope.db(), id.as_str(), c, s.now())
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?
+            .ok_or_else(not_queued)?;
+        drop(_serial);
+        tracing::info!(job_id = %id, to = ?to, order_key = key, "a queued job moved in its class");
+        s.announce_live(id.as_str(), &scope).await;
+        s.pump();
+        Ok(s.summary(&moved))
+    }
+
+    /// `job.cancel` with any of its selectors (Appendix G): one job (as [`Jobs::cancel`]),
+    /// `ids` (1–500, every one of them first checked to exist), every job of a batch, or
+    /// every unfinished job whose idempotency scope names the caller's kind (for a `ui:*`
+    /// caller, the same app). Each is cancelled as [`Jobs::cancel`] cancels it; an
+    /// `interrupted_unknown` job an agent may not resolve is returned as it is. The jobs, in
+    /// the order they were named, or by `seq`.
+    ///
+    /// # Errors
+    /// `params.invalid` for an empty or too long `ids`; `job.unknown` for an id or a batch
+    /// this scope doesn't have; `state.unavailable`.
+    pub async fn cancel_selected(
+        &self,
+        caller: &JobCaller,
+        sel: CancelSelector,
+    ) -> Result<Vec<JobSummary>, ErrorBody> {
+        let s = &self.shared;
+        let trace_id = &caller.trace_id;
+        let scope = s.scope_of(caller);
+        s.ensure_recovered(&scope)
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?;
+        let ids: Vec<JobId> = match sel {
+            CancelSelector::One(id) => return Ok(vec![self.cancel(caller, &id).await?]),
+            CancelSelector::Ids(ids) => {
+                if ids.is_empty() || ids.len() > MAX_CANCEL_IDS {
+                    return Err(params_invalid(
+                        format!("ids holds 1–{MAX_CANCEL_IDS} job ids, not {}", ids.len()),
+                        trace_id,
+                    ));
+                }
+                for id in &ids {
+                    record::get(scope.db(), id.as_str())
+                        .await
+                        .map_err(|e| state_unavailable(&e, trace_id))?
+                        .ok_or_else(|| job_unknown(id.as_str(), trace_id))?;
+                }
+                ids
+            }
+            CancelSelector::Batch(batch_id) => {
+                let rows = record::batch(scope.db(), &batch_id)
+                    .await
+                    .map_err(|e| state_unavailable(&e, trace_id))?;
+                if rows.is_empty() {
+                    return Err(ErrorBody::new(
+                        &codes::JOB_UNKNOWN,
+                        format!("There is no batch {batch_id:?} here."),
+                        trace_id.clone(),
+                    ));
+                }
+                rows.into_iter().map(|r| JobId(r.job_id)).collect()
+            }
+            CancelSelector::AllMine => {
+                let mine = format!("{}|", caller.caller);
+                record::open_rows(scope.db())
+                    .await
+                    .map_err(|e| state_unavailable(&e, trace_id))?
+                    .into_iter()
+                    .filter(|r| {
+                        r.idem_scope
+                            .as_deref()
+                            .is_some_and(|x| x.starts_with(&mine))
+                    })
+                    .map(|r| JobId(r.job_id))
+                    .collect()
+            }
+        };
+        let mut jobs = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.cancel(caller, id).await {
+                Ok(job) => jobs.push(job),
+                // An `interrupted_unknown` job is the person's to resolve: it stays as it is.
+                Err(e) if e.code == codes::CONFIRM_UNAVAILABLE.code => {
+                    jobs.push(self.get(caller, id).await?);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// `job.retry {batch_id}` (Appendix G; P4a-R41): for each job of the batch, by index, then
+    /// by attempt, `retry` runs `job.retry {job_id}`'s rules for it (the tool call that made
+    /// it, again). So only the newest attempt at each index that `failed` (`interrupted`
+    /// included) or was `cancelled` is retried, once; every other job is in `refused` with
+    /// its reason (an attempt a later one retried, a newest attempt that succeeded or hasn't
+    /// ended, one `job.retry {job_id}` refuses). A second call creates nothing new for the
+    /// jobs the first retried. The retries keep their `batch_id` and `index`.
+    ///
+    /// # Errors
+    /// `job.unknown` for a batch this scope doesn't have; `state.unavailable`.
+    pub async fn retry_batch<'a>(
+        &'a self,
+        caller: &'a JobCaller,
+        batch_id: &'a str,
+        retry: impl Fn(JobId) -> JobFuture<'a, Result<JobSummary, ErrorBody>>,
+    ) -> Result<RetryBatch, ErrorBody> {
+        let s = &self.shared;
+        let trace_id = &caller.trace_id;
+        let scope = s.scope_of(caller);
+        s.ensure_recovered(&scope)
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?;
+        let rows = record::batch(scope.db(), batch_id)
+            .await
+            .map_err(|e| state_unavailable(&e, trace_id))?;
+        if rows.is_empty() {
+            return Err(ErrorBody::new(
+                &codes::JOB_UNKNOWN,
+                format!("There is no batch {batch_id:?} here."),
+                trace_id.clone(),
+            ));
+        }
+        let mut out = RetryBatch {
+            retried: Vec::new(),
+            refused: Vec::new(),
+        };
+        for row in rows {
+            match retry(JobId(row.job_id.clone())).await {
+                Ok(job) => out.retried.push(RetriedJob {
+                    job,
+                    retry_of: row.job_id,
+                }),
+                Err(error) => out.refused.push(RefusedJob {
+                    job_id: row.job_id,
+                    error,
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pause GPU work (CORE-160; P4a-R5): `why` is added to `lane`'s reasons, so the lane
+    /// dispatches no job of a class the reason's scope covers, and each such queued job shows
+    /// `queue_paused`; the prompt executing is never interrupted. A suite prompt of the lane
+    /// still pending in its engine is withdrawn ([`Withdraw`]): only while the engine lists it
+    /// pending, never one with external side effects; the fail point `jobs.after_withdraw`
+    /// fires after the withdrawal's answer and before the row changes (Appendix G). The lane's
+    /// state is published on `jobs` as `{kind: "queue", state}`.
+    pub async fn pause(&self, lane: Lane, why: PauseReason) -> QueueState {
+        let s = &self.shared;
+        let withdraw: Vec<String> = {
+            let mut q = s.queue();
+            let li = lane.index();
+            if !q.lanes[li].reasons.contains(&why) {
+                q.lanes[li].reasons.push(why);
+            }
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let running = lanes[li].running.clone();
+            running
+                .into_iter()
+                .filter(|id| {
+                    jobs.get_mut(id).is_some_and(|a| {
+                        let eligible = a.withdrawable() && why.scope().covers(a.info.spec.priority);
+                        if eligible {
+                            a.withdrawal = Withdrawal::Deciding;
+                        }
+                        eligible
+                    })
+                })
+                .collect()
+        };
+        tracing::info!(lane = lane.wire(), reason = why.wire(), "a lane is paused");
+        s.pump();
+        s.publish_queue(lane);
+        // The pause answers at once (N2): each withdrawal asks ComfyUI on its own, and the
+        // lane's state is published again once it is decided.
+        for id in withdraw {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.withdraw_one(&id).await;
+                s.publish_queue(lane);
+            });
+        }
+        self.queue_state(lane)
+    }
+
+    /// Ends `why` of `lane`'s pause (P4a-R5: an automatic resume never removes your own
+    /// pause); `manual` also releases the lane's jobs a restart holds (P4a-R41). A released job
+    /// still waits while another reason covers it. The lane's state is published.
+    pub async fn resume(&self, lane: Lane, why: PauseReason) -> QueueState {
+        let s = &self.shared;
+        {
+            let mut q = s.queue();
+            let li = lane.index();
+            q.lanes[li].reasons.retain(|r| *r != why);
+            if q.lanes[li].reasons.is_empty() {
+                q.lanes[li].withdrawn = 0;
+            }
+            if why == PauseReason::Manual {
+                Shared::release_held(&mut q, lane);
+            }
+        }
+        tracing::info!(
+            lane = lane.wire(),
+            reason = why.wire(),
+            "a lane's pause reason ends"
+        );
+        s.pump();
+        s.publish_queue(lane);
+        self.queue_state(lane)
+    }
+
+    /// `app/queue.resume {held_only: true}` (P4a-R41): releases `lane`'s jobs a restart holds
+    /// and removes no reason, so your own pause stays. The lane's state is published.
+    pub async fn release_restart_held(&self, lane: Lane) -> QueueState {
+        let s = &self.shared;
+        Shared::release_held(&mut s.queue(), lane);
+        tracing::info!(
+            lane = lane.wire(),
+            "a lane's jobs held by a restart are released"
+        );
+        s.pump();
+        s.publish_queue(lane);
+        self.queue_state(lane)
+    }
+
+    /// `lane`'s pause now (Appendix G `QueueState`).
+    pub fn queue_state(&self, lane: Lane) -> QueueState {
+        self.shared.queue_state(lane)
+    }
+
+    /// Who withdraws a pending prompt of `engine` (CORE-160): the engines set ComfyUI's.
+    pub fn set_withdraw(&self, engine: EngineKind, w: Arc<dyn Withdraw>) {
+        self.shared
+            .withdrawers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(engine, w);
+    }
+
+    /// The stall rule's time (ARCH-072; default [`STALL_AFTER`]).
+    pub fn set_stall_after(&self, d: Duration) {
+        *self
+            .shared
+            .stall_after
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = d;
+    }
+
+    /// Checks the stall rule now ([`Jobs::spawn_stall_check`] does every 5 s).
+    pub fn check_unresponsive(&self) {
+        self.shared.check_unresponsive();
+    }
+
+    /// Checks the stall rule every [`STALL_CHECK_EVERY`] until `stop` (P4a-R33), on the
+    /// current runtime.
+    pub fn spawn_stall_check(self: &Arc<Self>, stop: CancellationToken) {
+        let jobs = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(STALL_CHECK_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                match jobs.upgrade() {
+                    Some(jobs) => jobs.check_unresponsive(),
+                    None => return,
+                }
+            }
+        });
     }
 
     /// The startup recovery of the suite scope (ARCH-022), once per core: the jobs it marked
@@ -2200,7 +3518,11 @@ impl Jobs {
         if draining {
             q.jobs.values().any(|a| a.running || a.completing)
         } else {
-            !q.jobs.is_empty()
+            // A job a restart holds waits for you, maybe for long: it doesn't keep the core
+            // up (the next start holds it again, P4a-R41).
+            q.jobs
+                .values()
+                .any(|a| !a.restart_held || a.running || a.completing)
         }
     }
 
@@ -2319,6 +3641,33 @@ impl SnapshotProvider for JobSnapshots {
             unknown()
         })
     }
+}
+
+/// Unix milliseconds of an RFC 3339 time, `Z` or an offset `+HH:MM`/`-HH:MM` (`jobs.list`'s
+/// `since`, Appendix G).
+fn rfc3339_ms(s: &str) -> Option<i64> {
+    if s.ends_with('Z') {
+        return crate::telemetry::parse_ts(s);
+    }
+    let at = s.len().checked_sub(6)?;
+    let (time, offset) = (s.get(..at)?, s.get(at..)?.as_bytes());
+    let sign = match offset[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = &offset[r];
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
+    };
+    let (h, m) = (digits(1..3)?, digits(4..6)?);
+    if offset[3] != b':' || h > 23 || m > 59 {
+        return None;
+    }
+    let utc = crate::telemetry::parse_ts(&format!("{time}Z"))?;
+    Some(utc - sign * (h * 60 + m) * 60_000)
 }
 
 #[cfg(test)]
@@ -2491,5 +3840,21 @@ mod tests {
         tokio::task::spawn_blocking(move || states.close())
             .await
             .unwrap();
+    }
+
+    #[test] // spec: Appendix G (jobs.list since)
+    fn since_takes_z_or_an_offset() {
+        let z = rfc3339_ms("2026-10-24T10:00:00Z").unwrap();
+        assert_eq!(rfc3339_ms("2026-10-24T12:00:00+02:00"), Some(z));
+        assert_eq!(rfc3339_ms("2026-10-24T07:30:00-02:30"), Some(z));
+        assert_eq!(rfc3339_ms("2026-10-24T10:00:00.250+00:00"), Some(z + 250));
+        for bad in [
+            "2026-10-24T10:00:00",
+            "2026-10-24T10:00:00+0200",
+            "2026-10-24T10:00:00+24:00",
+            "x",
+        ] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad}");
+        }
     }
 }

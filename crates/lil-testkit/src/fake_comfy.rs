@@ -5,7 +5,8 @@
 //! It answers the endpoints the core uses, in ComfyUI 0.41.0's shapes as far as the core reads
 //! them (spec Appendix B.3): `GET /system_stats`, `POST /prompt`, `GET /queue`, `GET /api/jobs`,
 //! `GET /api/jobs/{id}`, `POST /api/jobs/{id}/cancel`, `POST /api/jobs/cancel` (the batch
-//! cancel), `GET /history[/{id}]`, `GET /view`,
+//! cancel), `POST /queue {"delete"?, "clear"?}` (takes pending prompts out of the queue, never a
+//! running one, as ComfyUI 0.42.1 does), `GET /history[/{id}]`, `GET /view`,
 //! `POST /upload/image`, `POST /free`, `GET /object_info[/{class}]`, `GET /node_replacements`
 //! and the websocket `/ws?clientId=<id>`. Every route also answers under `/api` (except the
 //! jobs routes, which live there), as ComfyUI's do. `POST /interrupt` answers 500, so a suite
@@ -17,7 +18,9 @@
 //!
 //! **Execution.** One prompt runs at a time, in the order accepted. Which prompt runs is decided
 //! when a prompt is accepted or one ends, so `/queue` is exact as soon as a call returns. A run
-//! sends `execution_start` and `execution_cached`, then for each node that saves nothing a
+//! sends `execution_start` and `execution_cached` (naming the prompt's nodes that
+//! [`FakeComfy::cached_nodes`] marks cached; those send nothing else and save nothing), then for
+//! each other node that saves nothing a
 //! `progress_state` (`running`), `executing`, and for a node that reports steps (a class type
 //! starting `KSampler`, or a numeric `steps` input) one `progress` and one `progress_state` per
 //! step, then a `progress_state` (`finished`). Then (unless it is held,
@@ -55,6 +58,15 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
+
+/// How the fake goes quiet after a delete ([`FakeComfy::stall_after_delete`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stall {
+    /// Every HTTP request but the websocket's is answered 503 ([`FakeComfy::refuse_http`]).
+    Refuse,
+    /// Every HTTP request but the websocket's is left unanswered ([`FakeComfy::hang_http`]).
+    Hang,
+}
 
 /// A failure [`FakeComfy::fail_next`] injects into the next prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +160,7 @@ impl FakeComfy {
             }),
             wake: Notify::new(),
             uploads: Notify::new(),
+            hang: Notify::new(),
             root: root.to_path_buf(),
             addr,
         });
@@ -195,6 +208,25 @@ impl FakeComfy {
     /// `<root>\output`, where prompts write their images.
     pub fn output_dir(&self) -> PathBuf {
         self.shared.root.join("output")
+    }
+
+    /// From now on, the nodes of each prompt whose ids are in `nodes` are served from the
+    /// cache, as ComfyUI does for a node whose inputs didn't change: the run's
+    /// `execution_cached` names them, and they send no `executing`, `progress` or
+    /// `progress_state` and write no output. A Save node left out runs again and writes its
+    /// output, as ComfyUI's does with the suite's own `filename_prefix`, part of its cache key.
+    /// An empty list ends it.
+    pub fn cached_nodes(&self, nodes: &[&str]) {
+        self.shared.lock().cached = nodes.iter().map(|n| (*n).to_string()).collect();
+    }
+
+    /// The next `GET /queue` (not `/api/queue`) that lists `prompt_id` first in the pending
+    /// queue answers so, and then, before its
+    /// answer is sent, the running prompt is let finish and `prompt_id` starts (it must be the
+    /// next in the queue): the moment between a client's look at `/queue` and what it does
+    /// next, in which ComfyUI starts the prompt.
+    pub fn start_after_queue_read(&self, prompt_id: &str) {
+        self.shared.lock().start_after_read = Some(prompt_id.to_string());
     }
 
     /// Step-reporting nodes send only `progress_state` and no `progress`, as a ComfyUI that has
@@ -290,6 +322,20 @@ impl FakeComfy {
     /// stalled); the websocket stays connected.
     pub fn refuse_http(&self, on: bool) {
         self.shared.lock().refuse_http = on;
+    }
+
+    /// While on, every HTTP request but the websocket's is recorded and then left unanswered
+    /// until it is turned off: a ComfyUI that takes connections but doesn't answer.
+    pub fn hang_http(&self, on: bool) {
+        self.shared.lock().hang_http = on;
+        self.shared.hang.notify_waiters();
+    }
+
+    /// The next `POST /queue {"delete"}` is carried out and answered, and then the fake stops
+    /// answering as `how` says ([`Stall`]): what a withdrawal sees when ComfyUI takes its delete
+    /// and then goes quiet. Undo it with [`FakeComfy::refuse_http`] or [`FakeComfy::hang_http`].
+    pub fn stall_after_delete(&self, how: Stall) {
+        self.shared.lock().stall_after_delete = Some(how);
     }
 
     /// While on, each `POST /upload/image` is recorded and then left unanswered until it is
@@ -390,6 +436,8 @@ struct Shared {
     wake: Notify,
     /// Wakes the uploads [`FakeComfy::hold_uploads`] holds.
     uploads: Notify,
+    /// Wakes the requests [`FakeComfy::hang_http`] holds.
+    hang: Notify,
     root: PathBuf,
     addr: SocketAddr,
 }
@@ -606,11 +654,17 @@ struct State {
     /// Step-reporting nodes send no `progress`, only `progress_state`
     /// ([`FakeComfy::only_progress_state`]).
     only_progress_state: bool,
+    /// The node ids served from the cache ([`FakeComfy::cached_nodes`]).
+    cached: Vec<String>,
+    /// The prompt [`FakeComfy::start_after_queue_read`] starts after the next `GET /queue`.
+    start_after_read: Option<String>,
     fail_next: std::collections::VecDeque<FakeFailure>,
     on_prompt: Option<PromptHook>,
     extra_outputs: Vec<(String, bool)>,
     refuse_http: bool,
     hold_uploads: bool,
+    hang_http: bool,
+    stall_after_delete: Option<Stall>,
     drop_after_accept: bool,
     restart_after: Option<u32>,
     outputs_since_armed: u32,
@@ -631,6 +685,8 @@ struct Job {
     id: String,
     graph: Value,
     generation: u64,
+    /// The prompt's nodes served from the cache: they save nothing.
+    cached: Vec<String>,
 }
 
 impl State {
@@ -709,10 +765,16 @@ impl State {
         p.started = true;
         p.phase = Phase::Running;
         p.start_time = Some(now_ms());
+        let graph = p.graph.clone();
+        let cached: Vec<String> = node_ids(&graph)
+            .into_iter()
+            .filter(|n| self.cached.contains(n))
+            .collect();
         let job = Job {
             id: id.clone(),
-            graph: p.graph.clone(),
+            graph,
             generation,
+            cached,
         };
         let ts = now_ms();
         self.event(
@@ -723,11 +785,11 @@ impl State {
         self.event(
             &id,
             "execution_cached",
-            json!({"nodes": [], "prompt_id": id, "timestamp": ts}),
+            json!({"nodes": job.cached, "prompt_id": id, "timestamp": ts}),
         );
         let saving: Vec<String> = save_nodes(&job.graph).into_iter().map(|(n, _)| n).collect();
         for node in node_ids(&job.graph) {
-            if saving.contains(&node) {
+            if saving.contains(&node) || job.cached.contains(&node) {
                 continue;
             }
             // ComfyUI sends `progress` only from nodes that report steps (samplers), each step
@@ -885,6 +947,9 @@ async fn run(shared: &Shared, job: Job) {
         }
     }
     for (node, prefix) in save_nodes(&job.graph) {
+        if job.cached.contains(&node) {
+            continue;
+        }
         if !still_running(&mut shared.lock(), &job) {
             return;
         }
@@ -1127,6 +1192,13 @@ async fn handle(
             &json!({"error": "the fake ComfyUI is not answering"}),
         ));
     }
+    while segments.as_slice() != ["ws"] {
+        let released = shared.hang.notified();
+        if !shared.lock().hang_http {
+            break;
+        }
+        released.await;
+    }
     let response = match (&method, segments.as_slice()) {
         (&Method::GET, ["ws"]) => upgrade_ws(&shared, &mut req, &query),
         (&Method::GET, ["system_stats"]) => {
@@ -1139,15 +1211,23 @@ async fn handle(
         }
         (&Method::POST, ["prompt"]) => return post_prompt(&shared, body),
         (&Method::GET, ["queue"]) => {
-            let st = shared.lock();
-            let entry = |id: &String| st.prompt(id).map(Prompt::queue_entry);
-            let running: Vec<Value> = st.running.iter().filter_map(entry).collect();
-            let pending: Vec<Value> = st.queue.iter().filter_map(entry).collect();
-            json_response(
-                StatusCode::OK,
-                &json!({"queue_running": running, "queue_pending": pending}),
-            )
+            let (answer, start) = {
+                let mut st = shared.lock();
+                let entry = |id: &String| st.prompt(id).map(Prompt::queue_entry);
+                let running: Vec<Value> = st.running.iter().filter_map(entry).collect();
+                let pending: Vec<Value> = st.queue.iter().filter_map(entry).collect();
+                let answer = json!({"queue_running": running, "queue_pending": pending});
+                // Only the bare `/queue` (the outside-jobs poll reads `/api/queue`).
+                let next = st.queue.first().cloned().filter(|_| path == "/queue");
+                let start = st.start_after_read.take_if(|id| next.as_ref() == Some(id));
+                (answer, start)
+            };
+            if let Some(id) = start {
+                start_now(&shared, &id).await;
+            }
+            json_response(StatusCode::OK, &answer)
         }
+        (&Method::POST, ["queue"]) => post_queue(&shared, body.as_ref()),
         (&Method::GET, ["api", "jobs"]) => match list_jobs(&shared, &query) {
             Ok(list) => json_response(StatusCode::OK, &list),
             Err(why) => json_response(StatusCode::BAD_REQUEST, &json!({"error": why})),
@@ -1326,6 +1406,64 @@ fn accept(shared: &Shared, body: &Value) -> Result<(String, u64), Box<Response<F
     drop(st);
     shared.wake.notify_one();
     Ok((id, number))
+}
+
+/// [`FakeComfy::start_after_queue_read`]: lets the running prompt finish and waits until
+/// `id`, next in the queue, has started (at most 10 s).
+async fn start_now(shared: &Shared, id: &str) {
+    {
+        let mut st = shared.lock();
+        if let Some(running) = st.running.clone()
+            && let Some(p) = st.prompt_mut(&running)
+        {
+            p.held = false;
+        }
+    }
+    shared.wake.notify_one();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let started = |shared: &Shared| {
+        shared
+            .lock()
+            .prompt(id)
+            .is_none_or(|p| p.phase != Phase::Pending)
+    };
+    while !started(shared) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// `POST /queue {"delete": [ids], "clear": bool}`: each pending prompt named is taken out of the
+/// queue and forgotten, `clear` empties the queue; a running prompt is never touched. 200 with
+/// no body, whatever it did (ComfyUI 0.42.1).
+fn post_queue(shared: &Shared, body: Option<&Value>) -> Response<Full> {
+    let mut st = shared.lock();
+    if body.and_then(|b| b.get("clear")).and_then(Value::as_bool) == Some(true) {
+        let pending = std::mem::take(&mut st.queue);
+        st.prompts.retain(|p| !pending.contains(&p.id));
+    }
+    for id in body
+        .and_then(|b| b.get("delete"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if st.queue.iter().any(|q| q == id) {
+            st.queue.retain(|q| q != id);
+            st.prompts.retain(|p| p.id != id);
+        }
+    }
+    if body.and_then(|b| b.get("delete")).is_some() {
+        match st.stall_after_delete.take() {
+            Some(Stall::Refuse) => st.refuse_http = true,
+            Some(Stall::Hang) => st.hang_http = true,
+            None => {}
+        }
+    }
+    st.broadcast_status();
+    drop(st);
+    shared.wake.notify_one();
+    respond(StatusCode::OK, "text/plain", "")
 }
 
 /// `POST /api/jobs/{id}/cancel`: a pending prompt is dequeued and forgotten (it never reaches

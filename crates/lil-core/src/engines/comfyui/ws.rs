@@ -1,11 +1,11 @@
 //! ComfyUI's websocket, `/ws?clientId=<id>` (Appendix F "ComfyUI client"): the events of the
 //! channel's prompts and its binary preview frames.
 //!
-//! Text frames are `{type, data}`: `execution_start`, `executing`, `progress`,
-//! `progress_state` (ComfyUI's per-node aggregate: the node it names `running` is read as
-//! progress, so a ComfyUI that sends only these still reports it), `executed`,
-//! `execution_success`, `execution_error` and `execution_interrupted` become [`ComfyEvent`]s;
-//! the others (`status`, `execution_cached`, …) are skipped. A binary frame whose first 4 bytes
+//! Text frames are `{type, data}`: `execution_start`, `execution_cached` (the nodes served
+//! from ComfyUI's cache, CORE-117), `executing`, `progress`, `progress_state` (ComfyUI's
+//! per-node aggregate: the node it names `running` is read as progress, so a ComfyUI that
+//! sends only these still reports it), `executed`, `execution_success`, `execution_error` and
+//! `execution_interrupted` become [`ComfyEvent`]s; the others (`status`, …) are skipped. A binary frame whose first 4 bytes
 //! (big-endian) are event type 1 is a preview: 4 more bytes of image type (1 JPEG, 2 PNG), then
 //! the image. ComfyUI sends that form only to a client that hasn't announced the
 //! `supports_preview_metadata` feature flag, so the core never sends a `feature_flags` message
@@ -45,6 +45,11 @@ impl PreviewFormat {
 pub enum ComfyEvent {
     ExecutionStart {
         prompt_id: String,
+    },
+    /// The node ids ComfyUI serves from its cache (string ids only).
+    Cached {
+        prompt_id: String,
+        nodes: Vec<String>,
     },
     /// `node: None` once the prompt is done.
     Executing {
@@ -90,6 +95,7 @@ impl ComfyEvent {
     pub fn prompt_id(&self) -> Option<&str> {
         match self {
             ComfyEvent::ExecutionStart { prompt_id }
+            | ComfyEvent::Cached { prompt_id, .. }
             | ComfyEvent::Executing { prompt_id, .. }
             | ComfyEvent::Progress { prompt_id, .. }
             | ComfyEvent::ProgressState { prompt_id, .. }
@@ -120,6 +126,16 @@ pub fn parse_text(text: &str) -> Option<ComfyEvent> {
     Some(match v.get("type")?.as_str()? {
         "execution_start" => ComfyEvent::ExecutionStart {
             prompt_id: prompt_id()?,
+        },
+        "execution_cached" => ComfyEvent::Cached {
+            prompt_id: prompt_id()?,
+            nodes: data
+                .get("nodes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect(),
         },
         "executing" => ComfyEvent::Executing {
             prompt_id: prompt_id()?,
@@ -284,6 +300,30 @@ mod tests {
             parse_text(&frame(serde_json::json!({
                 "1": {"value": -1.0, "max": 1.0, "state": "running"}}))),
             None
+        );
+    }
+
+    /// `execution_cached` names the cached nodes (CORE-117); an empty list is no node.
+    #[test] // spec: CORE-117, CORE-130
+    fn execution_cached_names_its_nodes() {
+        let frame = |nodes: serde_json::Value| {
+            serde_json::json!({"type": "execution_cached",
+                               "data": {"prompt_id": "p", "nodes": nodes, "timestamp": 1}})
+            .to_string()
+        };
+        assert_eq!(
+            parse_text(&frame(serde_json::json!(["1", "2", 3]))),
+            Some(ComfyEvent::Cached {
+                prompt_id: "p".into(),
+                nodes: vec!["1".into(), "2".into()],
+            })
+        );
+        assert_eq!(
+            parse_text(&frame(serde_json::json!([]))),
+            Some(ComfyEvent::Cached {
+                prompt_id: "p".into(),
+                nodes: Vec::new(),
+            })
         );
     }
 

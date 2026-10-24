@@ -1,6 +1,6 @@
-//! The `jobs` module (CORE-014, CORE-117, CORE-121–124, CORE-128; ARCH-020–022, ARCH-034):
-//! job records in `state.db`, the two lanes and their priority classes, the suite-held queue,
-//! retries, recovery after a crash, and the job tools.
+//! The `jobs` module (CORE-014, CORE-117, CORE-121–124, CORE-128, CORE-160; ARCH-020–022,
+//! ARCH-034, ARCH-072): job records in `state.db`, the two lanes and their priority classes, the
+//! suite-held queue and its controls, retries, recovery after a crash, and the job tools.
 //!
 //! - **Records** ([`record`]). A job lives in the `state.db` of its call's scope: the session's
 //!   workspace, or the suite's for a call without one (ARCH-099). The row is written as
@@ -9,13 +9,25 @@
 //!   job that finished is never changed again, and cancellation happens once. Each state
 //!   change is one line of the workspace's jobs log (CORE-009, Appendix F field list); a job
 //!   without a workspace writes none. The `jobs` topic carries `{kind: "job", job}` and
-//!   `job:<id>` carries `status`, `progress`, `retrying` and `watchdog` (snapshot: the
-//!   [`JobSummary`]).
+//!   `{kind: "queue", state}`, and `job:<id>` carries `status`, `progress`, `retrying`,
+//!   `watchdog` and `unresponsive` (snapshot: the [`JobSummary`]). From plan 4a (Appendix G)
+//!   every job has a batch and its index in it (P4a-R13; [`Jobs::submit_batch`] submits many),
+//!   the typed `origin` of its caller (P4a-R12, also in its log lines), its `status_seq`, and
+//!   what its run reports through [`JobCtx`] (phase and subtasks, `indeterminate`,
+//!   `last_progress_at`, the cached nodes, the GPU adapter), kept in memory while it runs and
+//!   written with each state change. A running job with no sign of life for 30 s is shown
+//!   `unresponsive`, checked every 5 s; nothing is cancelled (ARCH-072).
 //! - **Lanes and the queue** ([`queue`]). Each lane (`gpu-heavy`, `cpu`) runs at most one job
 //!   at a time; the next starts when it ends (CORE-121, CORE-123, ARCH-071). The next job is
-//!   the first of the best class (`interactive` > `user` > `agent`), first in, first out
-//!   within it; a job with a `group` (the lane's last group) may move ahead of older jobs of its
-//!   class, but never past one that was overtaken that way 8 times (CORE-124). With
+//!   the first of the best class (`interactive` > `user` > `agent`), the lowest `order_key`
+//!   within it (its core-wide submission sequence, one counter for every scope, until
+//!   [`Jobs::move_job`] puts it at the front or the back of its class, CORE-160); a job with
+//!   a `group` (the lane's last group) may move ahead of older jobs of its class, but never
+//!   past one that was overtaken that way 8 times (CORE-124). A lane's pause ([`Jobs::pause`],
+//!   reasons in [`pause`]) is decided before the admission: a job it covers isn't picked and
+//!   shows `queue_paused`; a suite prompt still pending in its engine is withdrawn
+//!   ([`Withdraw`]), and one not posted yet (`submitting`, or in a retry's backoff) is held
+//!   before it posts. With
 //!   `[jobs] preempt_agent_batches = true` an `interactive` job cancels the running `agent`
 //!   engine job of its lane, which goes back to the head of its class (CORE-125). Before a job
 //!   starts, the [`Admission`] (the GPU scheduler, [`scheduler`]; [`AlwaysAdmit`] by default)
@@ -33,9 +45,13 @@
 //! - **Recovery** (ARCH-022). [`Jobs::recover_suite`] and [`Jobs::recover_workspace`] mark every
 //!   job of a scope that this core is not running and that has no final state `interrupted`,
 //!   or `interrupted_unknown` when it was `submitting` with external side effects; nothing
-//!   re-runs. The core recovers the suite scope before it serves, and a workspace scope before
-//!   its first job operation, once per scope. The `PersistInterrupted` shutdown step does the
-//!   same for the jobs still queued or running when a drain ends (ARCH-021).
+//!   re-runs. The exception is the restart hold (P4a-R41): a job that never reached an engine
+//!   (`waiting`, `waiting_for_vram` or `queue_paused`, no engine id; never a director task)
+//!   stays queued, held with the reason `restart` and its reservation, until a resume
+//!   releases it. The core recovers the suite scope before it serves, and a workspace scope
+//!   before its first job operation, once per scope. The `PersistInterrupted` shutdown step
+//!   does the same for the jobs still queued or running when a drain ends (ARCH-021), and
+//!   leaves the never-started ones queued so the next start holds them.
 //!
 //! Handlers register with [`Jobs::register`] (CORE-010: `jobs` defines [`JobHandler`], tool
 //! modules register with it). `jobs` depends on no `tools` type: a tool hands
@@ -53,8 +69,9 @@
 //! - an interrupted `agent` job re-run automatically (local work only, CORE-128) hands its
 //!   reservation to the re-run: its completions get `reservation: None`, the re-run's settle
 //!   it;
-//! - a job that never started (`waiting`, `waiting_for_vram`) when a core stopped gets its
-//!   completions at recovery or at `PersistInterrupted`, with an outcome for which
+//! - a job that never started when a core stopped is held by the next start and keeps its
+//!   reservation until it runs (P4a-R41); one the hold doesn't take (a director task) gets
+//!   its completions at recovery or at `PersistInterrupted`, with an outcome for which
 //!   [`never_started`] holds: nothing was used;
 //! - a job that was running when a core stopped keeps its reservation (Appendix F's pending
 //!   usage rule): Task 16's startup repair owns it;
@@ -73,10 +90,13 @@
 //! its run is recorded, so the row and the recorded run agree (or, when the core stops first,
 //! the next start's recovery marks it `interrupted` with its result, as after a crash).
 
+pub mod pause;
 pub mod queue;
 pub mod record;
 pub mod runner;
 pub mod scheduler;
+
+pub use pause::{PauseReason, PauseScope, RESTART_REASON};
 
 use std::fmt;
 use std::future::Future;
@@ -286,24 +306,30 @@ impl JobStatus {
 pub enum Substatus {
     Waiting,
     WaitingForVram,
+    /// Held by a lane's pause or a restart (CORE-160; Appendix G).
+    QueuePaused,
     Submitting,
     QueuedInEngine,
     Executing,
     Ingesting,
-    Retrying { attempt: u32, of: u32 },
+    Retrying {
+        attempt: u32,
+        of: u32,
+    },
     Cancelling,
     Interrupted,
     InterruptedUnknown,
 }
 
 impl Substatus {
-    /// The status it belongs to: `waiting`, `waiting_for_vram`, `submitting`,
+    /// The status it belongs to: `waiting`, `waiting_for_vram`, `queue_paused`, `submitting`,
     /// `queued_in_engine` → `queued`; `executing`, `ingesting`, `retrying_<n>_of_<m>`,
     /// `cancelling`, `interrupted_unknown` → `running`; `interrupted` → `failed`.
     pub fn status(&self) -> JobStatus {
         match self {
             Substatus::Waiting
             | Substatus::WaitingForVram
+            | Substatus::QueuePaused
             | Substatus::Submitting
             | Substatus::QueuedInEngine => JobStatus::Queued,
             Substatus::Executing
@@ -319,6 +345,7 @@ impl Substatus {
         match self {
             Substatus::Waiting => "waiting".into(),
             Substatus::WaitingForVram => "waiting_for_vram".into(),
+            Substatus::QueuePaused => "queue_paused".into(),
             Substatus::Submitting => "submitting".into(),
             Substatus::QueuedInEngine => "queued_in_engine".into(),
             Substatus::Executing => "executing".into(),
@@ -334,6 +361,7 @@ impl Substatus {
         Some(match s {
             "waiting" => Substatus::Waiting,
             "waiting_for_vram" => Substatus::WaitingForVram,
+            "queue_paused" => Substatus::QueuePaused,
             "submitting" => Substatus::Submitting,
             "queued_in_engine" => Substatus::QueuedInEngine,
             "executing" => Substatus::Executing,
@@ -470,6 +498,224 @@ pub struct JobSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_of: Option<String>,
     pub trace_id: String,
+    /// The job's batch, `b_<16 hex>`: every job has one (P4a-R13).
+    pub batch_id: String,
+    /// Its 0-based place in the batch.
+    pub index: u32,
+    /// Its status changes in order: the first and the newest 63.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_seq: Vec<StatusStep>,
+    /// Who started it (P4a-R12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<StartedBy>,
+    /// The GPU adapter of a job that held the GPU lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtasks: Vec<Subtask>,
+    /// Present (and `true`) while the executing node has sent no progress.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub indeterminate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_nodes: Option<Vec<String>>,
+    /// Present (and `true`) when every node of the prompt was served from the cache.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_cached: bool,
+    /// Present (and `true`) while a running job has reported nothing for the stall time
+    /// (ARCH-072; a display flag only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unresponsive: bool,
+    /// While the job is `queue_paused`: the reasons holding it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pause_reasons: Vec<String>,
+}
+
+/// The summary text of a job whose every node the engine served from its cache (CORE-117).
+pub const NOTHING_CHANGED: &str = "Nothing changed: ComfyUI served every node from its cache.";
+
+/// One entry of a job's `status_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StatusStep {
+    pub status: JobStatus,
+    pub substatus: Option<String>,
+    /// RFC 3339 UTC.
+    pub at: String,
+}
+
+/// One phase a job reached (`subtasks`): the current one carries its newest progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Subtask {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
+}
+
+/// The surface that started a job (P4a-R12): an open set, written snake_case; one this build
+/// doesn't know (a later plan's, such as `director_task`) reads back as [`Surface::Other`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Surface {
+    /// A verified `ui:<app>` caller.
+    Panel,
+    /// Claude Code.
+    Mcp,
+    /// The in-app assistant.
+    AgentSession,
+    Cli,
+    /// A job the core submits itself.
+    Core,
+    Other(String),
+}
+
+impl Surface {
+    pub fn wire(&self) -> &str {
+        match self {
+            Surface::Panel => "panel",
+            Surface::Mcp => "mcp",
+            Surface::AgentSession => "agent_session",
+            Surface::Cli => "cli",
+            Surface::Core => "core",
+            Surface::Other(name) => name,
+        }
+    }
+
+    pub fn parse(s: &str) -> Surface {
+        match s {
+            "panel" => Surface::Panel,
+            "mcp" => Surface::Mcp,
+            "agent_session" => Surface::AgentSession,
+            "cli" => Surface::Cli,
+            "core" => Surface::Core,
+            other => Surface::Other(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for Surface {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for Surface {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Surface, D::Error> {
+        String::deserialize(d).map(|s| Surface::parse(&s))
+    }
+}
+
+impl JsonSchema for Surface {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Surface".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+}
+
+/// Who started a job: `JobSummary.origin`, `{surface, id?, step?}` (P4a-R12). Named apart
+/// from [`JobOrigin`], the stored tool call `job.retry` runs again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StartedBy {
+    pub surface: Surface,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+}
+
+impl StartedBy {
+    /// The origin of a job `caller` submits (P4a-R12): `{surface: "panel", id: <app>}` for a
+    /// verified `ui:<app>`, `mcp`, `agent_session` for the assistant, `cli`; and `core` for a
+    /// job the core submits itself (a `cli` caller with no tool call, Appendix F).
+    pub fn of(caller: &JobCaller) -> StartedBy {
+        let (surface, id) = match &caller.caller {
+            CallerKind::Ui(app) => (Surface::Panel, Some(app.clone())),
+            CallerKind::Mcp => (Surface::Mcp, None),
+            CallerKind::Assistant => (Surface::AgentSession, None),
+            CallerKind::Cli if caller.origin.is_none() => (Surface::Core, None),
+            CallerKind::Cli => (Surface::Cli, None),
+        };
+        StartedBy {
+            surface,
+            id,
+            step: None,
+        }
+    }
+}
+
+/// Where `job.move` puts a queued job in its class (CORE-160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveTo {
+    /// The front of its class.
+    Next,
+    /// The back of its class.
+    Last,
+}
+
+/// Which jobs `job.cancel` cancels (Appendix G): exactly one selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelSelector {
+    One(JobId),
+    /// 1–500 jobs.
+    Ids(Vec<JobId>),
+    /// Every job of the batch.
+    Batch(String),
+    /// Every unfinished job the caller's kind submitted (for a `ui:*` caller, the same app's).
+    AllMine,
+}
+
+/// The most ids one `job.cancel {ids}` takes.
+pub const MAX_CANCEL_IDS: usize = 500;
+
+/// `job.retry {batch_id}`'s result (Appendix G).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RetryBatch {
+    pub retried: Vec<RetriedJob>,
+    pub refused: Vec<RefusedJob>,
+}
+
+/// A job a batch retry made, and the job it retries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RetriedJob {
+    pub job: JobSummary,
+    pub retry_of: String,
+}
+
+/// A job of the batch it didn't retry, and why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RefusedJob {
+    pub job_id: String,
+    pub error: ErrorBody,
+}
+
+/// What [`Withdraw::withdraw`] did with a job's prompt (CORE-160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawOutcome {
+    /// The engine still listed it pending: it was cancelled there, and it never ran.
+    Withdrawn,
+    /// It started meanwhile: it runs on.
+    AlreadyStarted,
+    /// The engine doesn't list it pending (or couldn't be asked): nothing was done.
+    NotPending,
+}
+
+/// Withdraws a suite prompt still pending in its engine (CORE-160; Appendix G "Withdrawal"):
+/// the engines implement it for ComfyUI. Only `Withdrawn` means the prompt was cancelled
+/// before it ran; the job's next attempt checks the old prompt is gone before it posts a new
+/// one (CORE-120).
+pub trait Withdraw: Send + Sync {
+    fn withdraw<'a>(
+        &'a self,
+        job: &'a JobId,
+        external_id: &'a str,
+    ) -> JobFuture<'a, WithdrawOutcome>;
 }
 
 /// One stretch of engine execution, in monotonic time (telemetry attribution, Task 15).
@@ -579,6 +825,33 @@ impl JobCtx {
             .await
     }
 
+    /// Called under the handler's POST lock just before it posts to its engine (CORE-160): when
+    /// a reason of the job's lane covers it now, nothing may be posted. The runner then holds
+    /// the job (`queue_paused`, its unposted engine id cleared) and `true` comes back: the
+    /// handler returns any error, and its attempt ends the way a withdrawn one does.
+    pub async fn hold_if_paused(&self) -> bool {
+        self.jobs.hold_if_paused(self.id.as_str(), None, true).await
+    }
+
+    /// The job's prompt `prompt_id` is gone after a withdrawal's delete whose outcome nobody
+    /// saw (CORE-160; plan 4a ruling, 2026-10-24): the runner ends the attempt as a withdrawn
+    /// one, with the id in `withdrawn_id`. The handler then returns any error.
+    pub async fn late_withdrawn(&self, prompt_id: &str) {
+        self.jobs.late_withdrawn(self.id.as_str(), prompt_id).await;
+    }
+
+    /// Settles the row's `withdrawn_id`, the prompt a pause withdrew (CORE-160), once the
+    /// engine said where it is (CORE-120): gone (`follow` is `None`), or still the job's
+    /// (`follow` names it, and it becomes the row's `external_id` again).
+    ///
+    /// # Errors
+    /// As [`JobCtx::set_external_id`].
+    pub async fn settle_withdrawn(&self, follow: Option<&str>) -> Result<(), ErrorBody> {
+        self.jobs
+            .handler_settle_withdrawn(&self.id, follow, &self.trace_id)
+            .await
+    }
+
     /// Reports an execution window of the job's engine work, whatever the attempt's outcome
     /// (CORE-065: a run that fails used the GPU too). A success's [`JobDone::windows`] are
     /// added by the runner.
@@ -604,9 +877,56 @@ impl JobCtx {
         self.jobs.uuid()
     }
 
-    /// Publishes progress on `job:<id>`; job summaries show the latest.
+    /// Publishes progress on `job:<id>`; job summaries show the latest. It is the job's newest
+    /// sign of life (`last_progress_at`), and the current phase's `value` and `max`.
     pub fn progress(&self, value: u64, max: u64, node: Option<&str>) {
         self.jobs.progress(&self.id, value, max, node);
+    }
+
+    /// The job's run is in `phase` now (Appendix G "Phase"): a phase other than the current
+    /// one is added to its `subtasks`. Its summary is published on `jobs` and `job:<id>`; the
+    /// row gets it with the job's next state change.
+    pub fn set_phase(&self, phase: &str) {
+        self.jobs.set_phase(&self.id, phase);
+    }
+
+    /// The engine served `nodes` from its cache (`cache_hit_nodes`, CORE-117); none leaves
+    /// the list out.
+    pub fn mark_cached(&self, nodes: &[String]) {
+        if nodes.is_empty() {
+            return;
+        }
+        self.jobs.report(&self.id, |r| {
+            let hits = r.cache_hit_nodes.get_or_insert_with(Vec::new);
+            for node in nodes {
+                if !hits.contains(node) {
+                    hits.push(node.clone());
+                }
+            }
+        });
+    }
+
+    /// Every node of the job's prompt was served from the cache: it succeeds saying nothing
+    /// changed (`all_cached`, [`NOTHING_CHANGED`]).
+    pub fn set_all_cached(&self) {
+        self.jobs.report(&self.id, |r| r.all_cached = true);
+    }
+
+    /// The GPU adapter the job runs on (`engine_device`).
+    pub fn set_engine_device(&self, name: &str) {
+        self.jobs
+            .report(&self.id, |r| r.engine_device = Some(name.to_string()));
+    }
+
+    /// A node of the job began executing: a sign of life, and `indeterminate` until it
+    /// reports measurable progress ([`JobCtx::measured`]).
+    pub fn node_started(&self) {
+        self.jobs.node_started(&self.id);
+    }
+
+    /// The executing node reports measurable progress: no longer `indeterminate`.
+    pub fn measured(&self) {
+        self.jobs.report(&self.id, |r| r.indeterminate = false);
     }
 
     /// Runs the fail point `name` (`jobs.after_post`, `jobs.after_outputs`): the handler
@@ -794,6 +1114,12 @@ pub struct JobFilter {
     /// The previous page's `next_cursor`.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// RFC 3339: the jobs whose `updated` is later.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// The jobs of this batch.
+    #[serde(default)]
+    pub batch_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -805,6 +1131,7 @@ mod tests {
         for s in [
             Substatus::Waiting,
             Substatus::WaitingForVram,
+            Substatus::QueuePaused,
             Substatus::Submitting,
             Substatus::QueuedInEngine,
             Substatus::Executing,

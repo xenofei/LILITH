@@ -34,7 +34,7 @@ pub use bins::{Bins, ensure_built};
 pub use clock::FakeClock;
 pub use core::{CoreFixture, KillOnDrop};
 pub use env::{HOT_JOURNAL_ROWS, LilChild, LilOutput, TestEnv};
-pub use fake_comfy::{FakeComfy, FakeFailure, FakeRequest};
+pub use fake_comfy::{FakeComfy, FakeFailure, FakeRequest, Stall};
 pub use fake_hw::FakeHwScript;
 pub use files::{sha256_bytes, sha256_file};
 pub use gitops::GitOps;

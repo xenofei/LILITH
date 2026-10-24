@@ -374,6 +374,127 @@ fn fake_comfy_cancelled_pending_prompt_is_forgotten() {
     );
 }
 
+/// `cached_nodes` (Task 6): a run's `execution_cached` names the prompt's cached nodes, which
+/// send no `executing` and save nothing; the prompt still succeeds.
+#[test] // spec: QA-066, CORE-117
+fn fake_comfy_cached_nodes_are_named_and_skipped() {
+    let fake = FakeComfy::start();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let url = format!("ws://127.0.0.1:{}/ws?clientId=suite", fake.port());
+        let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .unwrap();
+        fake.cached_nodes(&["1", "2", "9"]);
+        let id = uuid(21);
+        submit(&fake, &id, &["lil_c_"]);
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let message = tokio::time::timeout_at(deadline, ws.next())
+                .await
+                .expect("the run's events")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(text.as_str()).unwrap();
+            if v["data"]["prompt_id"] != id.as_str() {
+                continue;
+            }
+            seen.push(v.clone());
+            if v["type"] == "execution_success" {
+                break;
+            }
+        }
+        let cached: Vec<&Value> = seen
+            .iter()
+            .filter(|v| v["type"] == "execution_cached")
+            .collect();
+        assert_eq!(cached.len(), 1, "{seen:?}");
+        // Only the prompt's own nodes: `9` is not in it.
+        assert_eq!(cached[0]["data"]["nodes"], json!(["1", "2"]));
+        assert!(
+            !seen
+                .iter()
+                .any(|v| v["type"] == "executing" && v["data"]["node"].is_string()),
+            "a cached node executed: {seen:?}"
+        );
+        let _ = ws.close(None).await;
+    });
+    assert!(output_files(&fake.output_dir()).is_empty(), "nothing saved");
+    let history = get(&fake, &format!("/history/{}", uuid(21)));
+    assert_eq!(
+        history[&uuid(21)]["status"]["status_str"],
+        "success",
+        "{history}"
+    );
+}
+
+/// `POST /queue {"delete": [...]}` takes a pending prompt out and forgets it, and never touches
+/// a running one (ComfyUI 0.42.1's `delete_queue_item` looks at the pending list only);
+/// `start_after_queue_read` starts the next pending prompt right after a `/queue` read.
+#[test] // spec: QA-066, CORE-160
+fn fake_comfy_queue_delete_takes_only_pending_prompts() {
+    let fake = FakeComfy::start();
+    fake.hold_prompts(true);
+    let (a, b, c) = (uuid(31), uuid(32), uuid(33));
+    submit(&fake, &a, &["lil_a_"]);
+    submit(&fake, &b, &["lil_b_"]);
+    submit(&fake, &c, &["lil_c_"]);
+    let (status, _) = http(
+        fake.port(),
+        "POST",
+        "/queue",
+        Some(&json!({"delete": [a.clone(), b.clone()]})),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        queue_ids(&fake),
+        (vec![a.clone()], vec![c.clone()]),
+        "a runs on"
+    );
+    assert_eq!(
+        http(fake.port(), "GET", &format!("/api/jobs/{b}"), None).0,
+        404
+    );
+    assert_eq!(
+        get(&fake, &format!("/api/jobs/{a}"))["status"],
+        "in_progress"
+    );
+    // A read of /queue that lists `c` pending; `c` starts before the answer comes back.
+    fake.start_after_queue_read(&c);
+    assert_eq!(
+        queue_ids(&fake),
+        (vec![a.clone()], vec![c.clone()]),
+        "the answer of the read"
+    );
+    assert_eq!(
+        get(&fake, &format!("/api/jobs/{c}"))["status"],
+        "in_progress"
+    );
+    let (status, _) = http(
+        fake.port(),
+        "POST",
+        "/queue",
+        Some(&json!({"delete": [c.clone()]})),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        queue_ids(&fake),
+        (vec![c.clone()], vec![]),
+        "a started prompt stays"
+    );
+    fake.hold_prompts(false);
+    wait_until("c is done", || {
+        get(&fake, &format!("/api/jobs/{c}"))["status"] == "completed"
+    });
+}
+
 #[test] // spec: QA-066, CORE-120
 fn fake_comfy_drop_after_accept_queues_then_closes() {
     let fake = FakeComfy::start();
