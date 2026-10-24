@@ -2073,11 +2073,13 @@ impl Shared {
             let Some(a) = jobs.get_mut(id) else {
                 return;
             };
+            // A withdrawal still deciding is taken over (M1): it changes only a `Deciding`
+            // value, and its engine call sees the attempt's `cancel_sent` and doesn't withdraw.
             if !a.running
                 || a.completing
                 || a.cancelling
                 || a.preempted
-                || a.withdrawal != Withdrawal::None
+                || a.withdrawal == Withdrawal::Withdrawn
             {
                 return;
             }
@@ -2099,8 +2101,17 @@ impl Shared {
         };
         let withdrawn: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
         if self.apply(id, &scope, c, Some(withdrawn)).await.is_some() && held {
-            self.queue().lanes[lane.index()].withdrawn += 1;
+            Self::count_withdrawn(&mut self.queue(), lane);
             self.publish_queue(lane);
+        }
+    }
+
+    /// Counts one withdrawn prompt of `lane`'s pause, only while the lane is still paused (M2:
+    /// a withdrawal decided after a resume reset the count belongs to no pause).
+    fn count_withdrawn(q: &mut Queue, lane: Lane) {
+        let state = &mut q.lanes[lane.index()];
+        if !state.reasons.is_empty() {
+            state.withdrawn += 1;
         }
     }
 
@@ -2429,7 +2440,7 @@ impl Shared {
         let withdrawn: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
         // Counted only once its row says so: a job cancelled meanwhile ends cancelled.
         if self.apply(id, &scope, c, Some(withdrawn)).await.is_some() {
-            self.queue().lanes[lane.index()].withdrawn += 1;
+            Self::count_withdrawn(&mut self.queue(), lane);
         }
         if let Some(a) = self.queue().jobs.get_mut(id)
             && a.withdrawal == Withdrawal::Withdrawn

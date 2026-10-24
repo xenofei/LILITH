@@ -195,16 +195,22 @@ pub fn prefix_outputs(graph: &mut Value, job: &JobId) -> String {
     prefix
 }
 
-/// The nodes `all_cached` judges (CORE-117; Appendix G, plan 4a ruling, 2026-10-24): the
-/// ancestors of the graph's output nodes, through its `[node_id, slot]` links, as ComfyUI
-/// executes only the output nodes and what they need. The output nodes themselves may run
-/// again (the suite's own `filename_prefix` is part of the cache key) and are left out, as is
-/// a node with no path to an output. Output nodes are those whose class `object_info` marks
-/// `output_node`; for a class it doesn't list (or no `object_info`), a node with a
-/// `filename_prefix` input, as [`prefix_outputs`] sees it.
+/// The nodes `all_cached` judges (CORE-117; Appendix G, plan 4a ruling, 2026-10-24): every
+/// node ComfyUI executes, which is the graph's output nodes and their ancestors through its
+/// `[node_id, slot]` links, except the nodes whose `filename_prefix` the suite sets
+/// ([`prefix_outputs`]): only the suite's own prefix (part of the cache key) makes those run
+/// again. An output node without that input (a sampler marked `output_node`, a preview) is
+/// judged like any other, and a node with no path to an output is left out. Output nodes are
+/// those whose class `object_info` marks `output_node`; for a class it doesn't list (or no
+/// `object_info`), a node with a `filename_prefix` input.
 pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<String> {
     let Some(nodes) = graph.as_object() else {
         return HashSet::new();
+    };
+    let prefixed = |n: &Value| {
+        n.get("inputs")
+            .and_then(|i| i.get("filename_prefix"))
+            .is_some()
     };
     let output = |n: &Value| {
         let class = n
@@ -213,20 +219,15 @@ pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<Strin
             .unwrap_or_default();
         match object_info.and_then(|o| o.get(class)) {
             Some(info) => info.get("output_node").and_then(Value::as_bool) == Some(true),
-            None => n
-                .get("inputs")
-                .and_then(|i| i.get("filename_prefix"))
-                .is_some(),
+            None => prefixed(n),
         }
     };
-    let outputs: HashSet<&str> = nodes
+    let mut todo: Vec<&str> = nodes
         .iter()
         .filter(|(_, n)| output(n))
         .map(|(id, _)| id.as_str())
         .collect();
-    let mut judged = HashSet::new();
-    let mut todo: Vec<&str> = outputs.iter().copied().collect();
-    let mut seen: HashSet<&str> = outputs.clone();
+    let mut executed: HashSet<&str> = todo.iter().copied().collect();
     while let Some(id) = todo.pop() {
         let inputs = nodes
             .get(id)
@@ -239,13 +240,16 @@ pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<Strin
             let (Some(from), true) = (from.as_str(), slot.is_u64()) else {
                 continue;
             };
-            if nodes.contains_key(from) && seen.insert(from) {
-                judged.insert(from.to_string());
+            if nodes.contains_key(from) && executed.insert(from) {
                 todo.push(from);
             }
         }
     }
-    judged
+    executed
+        .into_iter()
+        .filter(|id| !prefixed(&nodes[*id]))
+        .map(str::to_string)
+        .collect()
 }
 
 /// `lil_<first 16 hex of the job id>_`.
@@ -648,6 +652,9 @@ pub struct ComfyWithdraw {
 const LOOK_AGAIN: u32 = 3;
 const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(250);
 const LOOKS_WITHIN: Duration = Duration::from_secs(5);
+/// The bound on the `/queue` read and the delete together, under the POST's lock (M3): a
+/// hung ComfyUI never holds a cancel or the shutdown step's `cancel_all` for longer.
+const LOCKED_WITHIN: Duration = Duration::from_secs(5);
 
 /// Where a prompt is after a withdrawal's delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,24 +727,41 @@ impl ComfyWithdraw {
             {
                 return WithdrawOutcome::NotPending;
             }
-            let queue = match client.queue().await {
-                Ok(queue) => queue,
-                Err(e) => {
-                    tracing::info!(job_id = %job, prompt_id, error = %e, "/queue can't be read; the prompt is not withdrawn");
+            let locked = tokio::time::timeout(LOCKED_WITHIN, async {
+                let queue = match client.queue().await {
+                    Ok(queue) => queue,
+                    Err(e) => {
+                        tracing::info!(job_id = %job, prompt_id, error = %e, "/queue can't be read; the prompt is not withdrawn");
+                        return Some(WithdrawOutcome::NotPending);
+                    }
+                };
+                if queue.running.iter().any(|e| e.prompt_id == prompt_id) {
+                    return Some(WithdrawOutcome::AlreadyStarted);
+                }
+                if !queue.pending.iter().any(|e| e.prompt_id == prompt_id) {
+                    return Some(WithdrawOutcome::NotPending);
+                }
+                // Its disappearance from now on is the withdrawal's, not an outside cancel.
+                live.withdrawn.store(true, Ordering::SeqCst);
+                posted.deleted = Some(prompt_id.to_string());
+                if let Err(e) = client.delete_pending(prompt_id).await {
+                    tracing::warn!(job_id = %job, prompt_id, error = %e, "the withdrawal's delete got no answer; where the prompt is decides");
+                }
+                None
+            })
+            .await;
+            match locked {
+                Ok(Some(outcome)) => return outcome,
+                Ok(None) => {}
+                // The delete may have been sent: the looks (and, unanswered, the attempt's
+                // follow) decide, as for an unanswered delete.
+                Err(_) if posted.deleted.as_deref() == Some(prompt_id) => {
+                    tracing::warn!(job_id = %job, prompt_id, "ComfyUI didn't answer the withdrawal's delete in time");
+                }
+                Err(_) => {
+                    tracing::info!(job_id = %job, prompt_id, "/queue didn't answer in time; the prompt is not withdrawn");
                     return WithdrawOutcome::NotPending;
                 }
-            };
-            if queue.running.iter().any(|e| e.prompt_id == prompt_id) {
-                return WithdrawOutcome::AlreadyStarted;
-            }
-            if !queue.pending.iter().any(|e| e.prompt_id == prompt_id) {
-                return WithdrawOutcome::NotPending;
-            }
-            // Its disappearance from now on is the withdrawal's, not an outside cancel.
-            live.withdrawn.store(true, Ordering::SeqCst);
-            posted.deleted = Some(prompt_id.to_string());
-            if let Err(e) = client.delete_pending(prompt_id).await {
-                tracing::warn!(job_id = %job, prompt_id, error = %e, "the withdrawal's delete got no answer; where the prompt is decides");
             }
         }
         // The looks run without the lock (N2): a cancel or the shutdown step goes ahead
@@ -1418,12 +1442,9 @@ impl Attempt<'_> {
     ) -> Result<Option<String>, JobFailure> {
         let follow = match self.client.state(old).await {
             Ok(RemoteState::Queued | RemoteState::Running) if inherited => {
-                return Err(JobFailure::Retryable(error(
-                    &codes::COMFYUI_UNREACHABLE,
-                    "The job this one re-runs left its prompt in ComfyUI, where it still waits \
-                     or runs; this job posts its own only once that one has ended.",
-                    self.job,
-                )));
+                tracing::info!(prompt_id = %old, "the prompt of the job this one re-runs is still in ComfyUI; the job waits for it");
+                self.wait_out(old).await?;
+                false
             }
             Ok(RemoteState::Queued | RemoteState::Running) => {
                 tracing::warn!(prompt_id = %old, "a withdrawn prompt is still in ComfyUI; it is followed");
@@ -1440,6 +1461,31 @@ impl Attempt<'_> {
             .await
             .map_err(JobFailure::Final)?;
         Ok(follow.map(str::to_string))
+    }
+
+    /// Waits, holding the lane, until `old`, the prompt of the job this one re-runs (N5), is
+    /// neither pending nor running, asking ComfyUI every [`POLL_EVERY`] (Appendix G, plan 4a
+    /// ruling, 2026-10-24). A cancel ends the attempt cancelled, the shutdown step interrupted;
+    /// a look that gets no answer is `comfyui.unreachable` (retried; the row keeps the id).
+    async fn wait_out(&self, old: &str) -> Result<(), JobFailure> {
+        let mut cancel = self.job.cancel.clone();
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(POLL_EVERY) => {}
+                () = cancel_set(&mut cancel) => {}
+            }
+            if self.cancelled() {
+                return Err(JobFailure::Final(cancelled_error(&self.job.trace_id)));
+            }
+            if self.shut() {
+                return Err(stopping(self.job));
+            }
+            match self.client.state(old).await {
+                Ok(RemoteState::Queued | RemoteState::Running) => {}
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(unreachable(&e, self.job)),
+            }
+        }
     }
 
     /// `POST /prompt`, under the cancel lock (module docs, step 2). A pause of the job's lane
@@ -2170,6 +2216,37 @@ fn output_files(history: &Value) -> Vec<OutputFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Fix round 3, I1 (CORE-117; Appendix G): every node ComfyUI executes is judged, an
+    /// output node without a `filename_prefix` included; only the nodes whose prefix the suite
+    /// sets, and nodes with no path to an output, are left out.
+    #[test] // spec: CORE-117
+    fn judged_nodes_are_the_executed_ones_but_the_prefixed() {
+        let graph = json!({
+            "1": {"class_type": "Loader", "inputs": {}},
+            "2": {"class_type": "Sampler", "inputs": {"model": ["1", 0], "seed": 7, "save_prefix": "x"}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": "p"}},
+            "4": {"class_type": "Preview", "inputs": {"images": ["2", 0]}},
+            "5": {"class_type": "Loader", "inputs": {}},
+            "6": {"class_type": "Unlisted", "inputs": {"images": ["2", 0], "filename_prefix": "p"}},
+        });
+        let info = json!({
+            "Loader": {"output_node": false},
+            "Sampler": {"output_node": true},
+            "SaveImage": {"output_node": true},
+            "Preview": {"output_node": true},
+        });
+        // The sampler and the preview are output nodes without a prefix: judged. The Save
+        // and the unlisted prefixed node may re-run; loader 5 is used by nothing.
+        assert_eq!(judged_nodes(&graph, Some(&info)), set(&["1", "2", "4"]));
+        // Without object_info only the prefixed nodes are outputs: what they need is judged.
+        assert_eq!(judged_nodes(&graph, None), set(&["1", "2"]));
+        assert!(judged_nodes(&json!([]), None).is_empty());
+    }
 
     /// Task 12 re-review N1: an input inside a root the store keeps to itself is refused by its
     /// long name and by its 8.3 short name (`LILITH~1`, `GIT~1`, `TRASH~1`), as the store
