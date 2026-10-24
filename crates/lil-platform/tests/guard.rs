@@ -253,7 +253,12 @@ fn test_channel_shortcut_in_the_real_programs_folder_trips() {
     assert_eq!(own.classes_root(), r"HKCU\Software\LILITH-test-abc\Classes");
     assert!(fake_real().is_real_classes_root(r"HKCU\Software\Classes"));
     // The desktop group's opt-in into the shell's classes root still trips once armed.
-    let shell = own.clone().with_shell_classes_root();
+    let shell = Env::with_roots(
+        Channel::Test("desktop-abc".into()),
+        roots(r"D:\Scratch"),
+        "S-1".into(),
+    )
+    .with_shell_classes_root();
     let msg = panics(|| drop(shell.classes_root())).expect("must panic");
     assert!(msg.contains("real LILITH location"), "{msg}");
     assert!(msg.contains(r"HKCU\Software\Classes"), "{msg}");

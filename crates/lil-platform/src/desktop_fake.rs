@@ -222,6 +222,13 @@ fn unescape(s: &str) -> String {
                 "quot" => Some('"'),
                 "apos" => Some('\''),
                 "amp" => Some('&'),
+                // XML allows no sign in a character reference.
+                _ if name.starts_with("#+")
+                    || name.starts_with("#x+")
+                    || name.starts_with("#X+") =>
+                {
+                    None
+                }
                 _ => name
                     .strip_prefix("#x")
                     .or_else(|| name.strip_prefix("#X"))
@@ -259,8 +266,8 @@ mod tests {
         );
         // Not references: kept as written.
         assert_eq!(
-            unescape("& &unknown; &#xZZ; &#55296; x&"),
-            "& &unknown; &#xZZ; &#55296; x&"
+            unescape("& &unknown; &#xZZ; &#55296; &#+65; &#x+41; x&"),
+            "& &unknown; &#xZZ; &#55296; &#+65; &#x+41; x&"
         );
     }
 }

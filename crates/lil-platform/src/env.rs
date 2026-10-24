@@ -306,8 +306,9 @@ impl Env {
     #[must_use]
     pub fn with_shell_classes_root(mut self) -> Env {
         assert!(
-            matches!(self.channel, Channel::Test(_)),
-            "only a test channel takes the shell classes root this way"
+            matches!(&self.channel, Channel::Test(id)
+                if id.starts_with(crate::desktop::DESKTOP_TEST_ID_PREFIX)),
+            "only a desktop-group test channel takes the shell classes root this way"
         );
         self.shell_classes = true;
         self

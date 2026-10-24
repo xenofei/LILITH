@@ -166,16 +166,20 @@ fn real_programs_and_classes_root_are_real_and_test_names_are_not() {
 /// is for test channels outside the desktop group): test channels only.
 #[test] // spec: APP-022, QA-038
 fn shell_classes_root_is_a_test_channel_opt_in() {
-    let test = env(Channel::Test("abc".into())).with_shell_classes_root();
+    let test = env(Channel::Test("desktop-abc".into())).with_shell_classes_root();
     assert_eq!(test.classes_root(), r"HKCU\Software\Classes");
     // Nothing else moves: the scheme, the CLSID and the registry root stay the channel's own.
-    assert_eq!(test.activation_scheme(), "lil-test-abc");
+    assert_eq!(test.activation_scheme(), "lil-test-desktop-abc");
     assert_eq!(
         test.toast_activator_clsid(),
-        env(Channel::Test("abc".into())).toast_activator_clsid()
+        env(Channel::Test("desktop-abc".into())).toast_activator_clsid()
     );
-    assert_eq!(test.registry_root(), r"HKCU\Software\LILITH-test-abc");
-    for channel in [Channel::Stable, Channel::Dev] {
+    assert_eq!(
+        test.registry_root(),
+        r"HKCU\Software\LILITH-test-desktop-abc"
+    );
+    // Only a desktop-group id, so Task 30's sweep by prefix finds whatever it wrote.
+    for channel in [Channel::Stable, Channel::Dev, Channel::Test("abc".into())] {
         let got = std::panic::catch_unwind(|| env(channel.clone()).with_shell_classes_root());
         assert!(got.is_err(), "{channel} must refuse the opt-in");
     }
