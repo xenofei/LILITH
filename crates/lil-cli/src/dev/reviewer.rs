@@ -1147,7 +1147,7 @@ pub(crate) fn with_owner_authenticator_in<T>(
     };
     if hello.is_none() && !prompt.is_interactive() {
         bail!(
-            "Windows Hello isn't enrolled and this isn't a real terminal, so you can't authenticate to {what}; nothing was approved or merged"
+            "Windows Hello isn't enrolled or can't be used, and this isn't a real terminal, so you can't authenticate to {what}; nothing was approved or merged"
         );
     }
     let ask = |label: &str| Zeroizing::new(prompt.passphrase(label));
@@ -3516,6 +3516,7 @@ mod tests {
     struct TestHello {
         kek: [u8; 32],
         fail: bool,
+        face: reviewer_hello::FaceSignIn,
         shown: RefCell<Vec<String>>,
         accepts: RefCell<Vec<Option<String>>>,
     }
@@ -3525,6 +3526,7 @@ mod tests {
             Self {
                 kek: [0x11; 32],
                 fail: false,
+                face: reviewer_hello::FaceSignIn::Off,
                 shown: RefCell::default(),
                 accepts: RefCell::default(),
             }
@@ -3540,6 +3542,9 @@ mod tests {
     impl HelloPlatform for TestHello {
         fn supported(&self) -> bool {
             true
+        }
+        fn face_sign_in(&self) -> reviewer_hello::FaceSignIn {
+            self.face.clone()
         }
         fn hardware_held(&self) -> bool {
             false
@@ -3746,6 +3751,54 @@ mod tests {
         assert!(e.contains("--passphrase"), "{e}");
         assert!(e.contains("nothing was approved or merged"), "{e}");
         assert!(hello.shown.borrow().is_empty(), "Windows Hello was called");
+    }
+
+    /// Owner decision 2026-10-24: with face sign-in on (or unknown), every merge's
+    /// authentication skips Windows Hello and says why: the passphrase at a terminal, a refusal
+    /// without one.
+    #[test] // spec: QA-036, QA-088
+    fn with_face_sign_in_on_merges_use_the_passphrase_or_refuse() {
+        for face in [
+            reviewer_hello::FaceSignIn::On,
+            reviewer_hello::FaceSignIn::Unknown("WinBio said no".into()),
+        ] {
+            let profile = profile_with_key(true);
+            let hello = TestHello {
+                face: face.clone(),
+                ..TestHello::ok()
+            };
+            let prompt = FakePrompt::new().passphrases(&[PASS]);
+            let pem = with_owner_authenticator_in(
+                profile.path(),
+                &prompt,
+                &hello,
+                "merge PR #42",
+                false,
+                |_, auth| auth.authenticate("SUMMARY", "AUDIT"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(&pem[..], test_pem());
+            assert!(hello.shown.borrow().is_empty(), "Windows Hello was called");
+            let said = prompt.said().join("\n");
+            assert!(said.contains("face sign-in"), "{said}");
+            assert_eq!(prompt.asked().len(), 1, "{:?}", prompt.asked());
+
+            // No terminal: refused before anything runs.
+            let called = std::cell::Cell::new(false);
+            let e = with_owner_authenticator_in(
+                profile.path(),
+                &FakePrompt::not_a_terminal(),
+                &hello,
+                "merge PR #42",
+                false,
+                |_, _| called.set(true),
+            )
+            .unwrap_err();
+            assert!(!called.get(), "{face:?}");
+            assert!(format!("{e:#}").contains("nothing was approved or merged"));
+            assert!(hello.shown.borrow().is_empty(), "Windows Hello was called");
+        }
     }
 
     /// The test key, as the flow's authentication hands it over.

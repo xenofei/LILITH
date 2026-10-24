@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use merge_flow::{AskOnEveryMerge, Facts, MergeFlowSteps, MergeGate, merge_flow};
 use reviewer_hello::{
-    Authenticator, CREDENTIAL, HelloFile, HelloPlatform, KeyAuthenticator, NoTerminal,
+    Authenticator, CREDENTIAL, FaceSignIn, HelloFile, HelloPlatform, KeyAuthenticator, NoTerminal,
     PassphraseUnlocker, QUOTE, Route, Unlocker, discard_enrolment_beside, enroll, enrolled_hello,
     hello_age_path_in, hello_file_path_in, presentation, remove, status, unlock_reviewer_key,
 };
@@ -109,8 +109,9 @@ enum Answer {
     Ok,
     Cancel,
     Fail,
-    /// Its window couldn't be brought to the front (`lil_platform::hello::front_or_refuse`).
-    NotInFront,
+    /// Windows kept its window behind, and nobody brought it forward within the 120 s
+    /// (`lil_platform::hello::front_or_wait`, `ask_then`; Phase B ruling).
+    NeverBroughtForward,
     /// Nobody answered in time (`lil_platform::hello::wait_bounded`).
     TimedOut,
 }
@@ -133,6 +134,7 @@ struct FakeHello {
     answer: Answer,
     click: Click,
     remove_fails: bool,
+    face: FaceSignIn,
     /// What the window that owns each prompt showed.
     shown: RefCell<Vec<String>>,
 }
@@ -147,7 +149,15 @@ impl FakeHello {
             answer: Answer::Ok,
             click: Click::Accept,
             remove_fails: false,
+            face: FaceSignIn::Off,
             shown: RefCell::default(),
+        }
+    }
+
+    fn with_face(log: &Log, face: FaceSignIn) -> Self {
+        Self {
+            face,
+            ..Self::new(log)
         }
     }
 
@@ -169,19 +179,28 @@ impl FakeHello {
         self.log.borrow_mut().push(what);
     }
 
-    /// The window, as `lil_platform::hello::ask_then` runs it: in front first, then the click,
-    /// and only after an accept click Windows Hello (logged as `hello:kek_derive`).
+    /// The window, as `lil_platform::hello::run_in` runs it: with an accept label, the click
+    /// (which can only come once the window is in front), and only after an accept click
+    /// Windows Hello (logged as `hello:kek_derive`); without, the window in front first.
     fn window(&self, shown: &str, accept: Option<&str>) -> io::Result<()> {
         self.shown.borrow_mut().push(shown.to_string());
-        if self.answer == Answer::NotInFront {
-            return Err(io::Error::other(
-                "the Windows Hello window couldn't be brought to the front of the other windows",
-            ));
-        }
         let Some(label) = accept else {
+            if self.answer == Answer::NeverBroughtForward {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the LILITH window wasn't brought forward within 120 s",
+                ));
+            }
             return Ok(());
         };
         self.note(format!("window:{label}"));
+        if self.answer == Answer::NeverBroughtForward {
+            self.note("window:never brought forward".into());
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "nothing was chosen in the LILITH window in time",
+            ));
+        }
         let why = match self.click {
             Click::Accept => return Ok(()),
             Click::Deny => "you chose Deny",
@@ -197,7 +216,7 @@ impl FakeHello {
             Answer::Ok => Ok(()),
             Answer::Cancel => Err(io::Error::new(io::ErrorKind::Interrupted, "UserCanceled")),
             Answer::Fail => Err(io::Error::other("SecurityDeviceLocked")),
-            Answer::NotInFront => unreachable!("handled by `window`"),
+            Answer::NeverBroughtForward => unreachable!("handled by `window`"),
             Answer::TimedOut => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the Windows Hello prompt wasn't answered within 120 s, so it was cancelled",
@@ -212,6 +231,9 @@ impl HelloPlatform for FakeHello {
     }
     fn hardware_held(&self) -> bool {
         self.tpm
+    }
+    fn face_sign_in(&self) -> FaceSignIn {
+        self.face.clone()
     }
     fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()> {
         self.note(format!("hello:kek_enroll {credential}"));
@@ -407,7 +429,7 @@ fn a_failed_or_cancelled_enrolment_leaves_nothing_behind() {
     for answer in [
         Answer::Cancel,
         Answer::Fail,
-        Answer::NotInFront,
+        Answer::NeverBroughtForward,
         Answer::TimedOut,
     ] {
         let home = Home::with_key();
@@ -482,12 +504,7 @@ fn approve_uses_hello_when_enrolled() {
 
 #[test] // spec: QA-088
 fn approve_falls_back_to_the_passphrase_when_hello_is_cancelled_or_fails() {
-    for answer in [
-        Answer::Cancel,
-        Answer::Fail,
-        Answer::NotInFront,
-        Answer::TimedOut,
-    ] {
+    for answer in [Answer::Cancel, Answer::Fail, Answer::TimedOut] {
         let home = Home::with_key();
         enroll_kek(&home, &FakeHello::new(&log()));
         let l = log();
@@ -522,11 +539,37 @@ fn approve_falls_back_to_the_passphrase_when_hello_is_cancelled_or_fails() {
     assert_eq!(events(&l).last().unwrap(), "passphrase:asked");
 }
 
-/// QA-088 (I1): where the suite can't bring the prompt to the front (or nobody answers it in
-/// time), the passphrase prompt is used instead; with no terminal, nothing is unlocked.
+/// QA-088 (I1, Phase B ruling): a Merge window Windows keeps behind flashes and waits; never
+/// brought forward in time, it is a refusal, and the passphrase is not asked instead.
 #[test] // spec: QA-088
-fn a_prompt_that_cannot_come_to_the_front_falls_back_or_refuses() {
-    for answer in [Answer::NotInFront, Answer::TimedOut] {
+fn a_window_that_cannot_take_the_front_waits_and_then_refuses_without_the_passphrase() {
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let key = home.key();
+    let l = log();
+    let hello = FakeHello::answering(&l, Answer::NeverBroughtForward);
+    let said = RefCell::new(Vec::new());
+    let say = |t: &str| said.borrow_mut().push(t.to_string());
+    let enrolled = enrolled_hello(&home.profile, &hello, "m", Some("Merge"), &say).unwrap();
+    let ask = asks(&l, PASS);
+    let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &ask);
+    let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &say);
+    assert_eq!(auth.authenticate("s", "a").unwrap_err(), KeyError::Denied);
+    assert_eq!(
+        events(&l),
+        ["window:Merge", "window:never brought forward"],
+        "Windows Hello or the passphrase was asked"
+    );
+    let said = said.borrow().join("\n");
+    assert!(said.contains("nothing was approved or merged"), "{said}");
+}
+
+/// QA-088 (I1): a prompt nobody answers in time makes Windows Hello unavailable: the
+/// passphrase prompt is used instead; with no terminal, nothing is unlocked.
+#[test] // spec: QA-088
+fn an_unanswered_prompt_falls_back_or_refuses() {
+    {
+        let answer = Answer::TimedOut;
         let home = Home::with_key();
         enroll_kek(&home, &FakeHello::new(&log()));
         let key = home.key();
@@ -819,6 +862,57 @@ fn status_names_the_route_and_whether_the_key_is_hardware_held() {
     }
     // Status never prompts.
     assert!(!events(&l).iter().any(|e| e.contains("derive")));
+}
+
+/// Owner decision 2026-10-24: Windows Hello unlocks the reviewer key only while face sign-in is
+/// off. On, or unknown: approvals and merges use the passphrase and say why, `enroll` refuses
+/// before asking anything, and `status` shows it.
+#[test] // spec: QA-088
+fn windows_hello_is_used_only_while_face_sign_in_is_off() {
+    for face in [FaceSignIn::On, FaceSignIn::Unknown("WinBio said no".into())] {
+        // Enrolled while face was off; now it is on (or can't be told).
+        let home = Home::with_key();
+        enroll_kek(&home, &FakeHello::new(&log()));
+        let l = log();
+        let hello = FakeHello::with_face(&l, face.clone());
+        let said = RefCell::new(Vec::new());
+        let pem = unlock_like_approve(&home, &hello, &asks(&l, PASS), &said).unwrap();
+        assert_eq!(&pem[..], PEM);
+        assert_eq!(events(&l), ["passphrase:asked"], "{face:?}");
+        let said = said.borrow().join("\n");
+        assert!(said.contains("face sign-in"), "{said}");
+        if face == FaceSignIn::On {
+            assert!(
+                said.contains("Settings > Accounts > Sign-in options"),
+                "{said}"
+            );
+        }
+
+        let text = status(&home.profile, &hello).join("\n");
+        assert!(text.contains("Face sign-in: "), "{text}");
+        assert!(!text.contains("Face sign-in: off"), "{text}");
+
+        // `enroll` refuses before the passphrase or Windows Hello is asked.
+        let home = Home::with_key();
+        let l = log();
+        let e = enroll(
+            &home.profile,
+            Route::Kek,
+            &FakeHello::with_face(&l, face.clone()),
+            &never_asked,
+            CHALLENGE,
+            LOG_N,
+            &quiet,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("face sign-in"), "{e:#}");
+        assert!(events(&l).is_empty(), "{:?}", events(&l));
+        assert!(home.hello_files().is_empty());
+    }
+    // Off: status says Windows Hello can unlock the key.
+    let home = Home::with_key();
+    let text = status(&home.profile, &FakeHello::new(&log())).join("\n");
+    assert!(text.contains("Face sign-in: off"), "{text}");
 }
 
 #[test] // spec: QA-088

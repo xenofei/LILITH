@@ -51,6 +51,11 @@ features = [
     "Security_Cryptography",
     # IBuffer (Windows Hello, Task 28).
     "Storage_Streams",
+    # WinBioEnumBiometricUnits and WinBioEnumEnrollments: whether Windows Hello face sign-in is
+    # enrolled, read-only (Task 28 Phase B, owner decision 2026-10-24).
+    "Win32_Devices_BiometricFramework",
+    # SetupDiGetClassDevsW: whether any biometric device is present, read-only (Task 28 Phase B).
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
     # The NVIDIA adapter's LUID, for the PDH GPU memory instances (CORE-059).
     "Win32_Graphics_Dxgi",

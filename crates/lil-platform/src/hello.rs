@@ -9,10 +9,14 @@
 //! check below stay only because the route probe (`examples/hello-probe.rs`) still measures
 //! them.
 //!
-//! **In front, or not at all (QA-088).** [`kek_enroll`] and [`kek_derive`] open an
-//! [`OwnerWindow`] that shows what you are confirming, bring it to the front, and refuse when it
-//! didn't get there ([`front_or_refuse`]); the caller then asks for the passphrase. Every
-//! prompt is cancelled after [`HELLO_WAIT`] ([`wait_bounded`]). With an accept label ("Merge",
+//! **In front first (QA-088, Task 28 Phase B ruling).** [`kek_enroll`] and [`kek_derive`] open
+//! an [`OwnerWindow`] that shows what you are confirming and try to bring it to the front. When
+//! Windows keeps another window in front (on the owner's PC the foreground lock timeout is at
+//! its maximum, and the probe saw the raise fail), the window's taskbar button flashes and it
+//! waits, within [`HELLO_WAIT`], for you to bring it forward ([`front_or_wait`], [`ask_then`]);
+//! it never falls back to the passphrase for that. The Windows Hello prompt raised after that
+//! comes to the front by itself (the probe: 7 of 7 steps, within 302 ms, over fullscreen too).
+//! Every prompt is cancelled after [`HELLO_WAIT`] ([`wait_bounded`]). With an accept label ("Merge",
 //! "Approve"), [`kek_derive`]'s window has that button and "Deny", and Windows Hello is raised
 //! only after the accept click ([`ask_then`]); "Deny", closing the window or no choice within
 //! [`HELLO_WAIT`] refuses with `PermissionDenied` (Task 28 fix round 2: Windows Hello Face can
@@ -39,8 +43,9 @@
 //! Windows build's own metadata (`C:\Windows\System32\WinMetadata\Windows.Security.winmd`):
 //! `IKeyCredentialManagerCreateWithWindowStatics` {30b1b9c9-61ef-43e8-88ac-cc433b38d1a6} and
 //! `IKeyCredentialWithWindow` {050deb3b-b19c-4635-9df6-5650d66c62b1}, each one method after
-//! `IInspectable`. Whether the prompt then comes to the front by itself is Task 28's Step 0 (the
-//! probe).
+//! `IInspectable`. The route probe (Task 28 Step 0, 2026-10-24) showed the window-owned prompt
+//! comes to the front by itself, and that a create and two signs work with identical
+//! signatures: the KEK route.
 //!
 //! **Secrets.** The signature and the KEK live in [`Zeroizing`] buffers and are never logged;
 //! DPAPI's plaintext comes back in one. Nothing here prints.
@@ -62,14 +67,26 @@ use windows::Security::Credentials::{
     KeyCredentialRetrievalResult, KeyCredentialStatus,
 };
 use windows::Security::Cryptography::CryptographicBuffer;
+use windows::Win32::Devices::BiometricFramework::{
+    WINBIO_E_UNKNOWN_ID, WINBIO_IDENTITY, WINBIO_POOL_SYSTEM, WINBIO_UNIT_SCHEMA,
+    WinBioCloseSession, WinBioEnumBiometricUnits, WinBioEnumEnrollments, WinBioFree,
+    WinBioOpenSession,
+};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    DIGCF_PRESENT, GUID_DEVCLASS_BIOMETRIC, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+};
+use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MonitorFromWindow, ScreenToClient,
 };
+use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
+use windows::Win32::Security::{GetLengthSid, PSID};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::System::TpmBaseServices::{TPM_DEVICE_INFO, Tbsi_GetDeviceInfo};
 use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
@@ -464,14 +481,37 @@ pub fn kek_derive_for_window(
     Ok(kek_from_signature(&signature))
 }
 
-/// QA-088: Windows Hello is used only when its window is in front; otherwise the caller uses
-/// the passphrase (or refuses without a terminal). Pure.
-pub fn front_or_refuse(raise: Raise) -> io::Result<()> {
+/// QA-088 (Task 28 Phase B ruling): Windows Hello is raised only once its window is in front.
+/// When Windows kept another window in front, the window's taskbar button flashes
+/// ([`OwnerWindow::bring_to_front`]) and `brought_forward` waits, within [`HELLO_WAIT`], for you
+/// to bring it forward; it never falls back to the passphrase. Not brought forward in time is a
+/// `TimedOut` error. Pure over its closure.
+pub fn front_or_wait(raise: Raise, brought_forward: impl FnOnce() -> bool) -> io::Result<()> {
     match raise {
         Raise::AlreadyInFront | Raise::SetForeground | Raise::AttachedInput => Ok(()),
-        Raise::NotInFront => Err(io::Error::other(
-            "the Windows Hello window couldn't be brought to the front of the other windows, so Windows Hello isn't used",
+        Raise::NotInFront if brought_forward() => Ok(()),
+        Raise::NotInFront => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the LILITH window wasn't brought forward within {} s (its taskbar button flashes), so Windows Hello wasn't asked",
+                HELLO_WAIT.as_secs()
+            ),
         )),
+    }
+}
+
+/// Waits until `ready()`, for at most `timeout`; whether it got there. Pure over its closures.
+pub fn wait_until(ready: &dyn Fn() -> bool, timeout: Duration, pause: &dyn Fn(Duration)) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        if ready() {
+            return true;
+        }
+        if waited >= timeout {
+            return false;
+        }
+        pause(HELLO_POLL);
+        waited += HELLO_POLL;
     }
 }
 
@@ -521,21 +561,22 @@ pub fn choice_or_refuse(choice: Choice) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
 }
 
-/// The order every asking prompt keeps (pure): the window in front ([`front_or_refuse`]), then
-/// your choice ([`choice_or_refuse`]), and only then `call`, which raises Windows Hello.
+/// The order every asking prompt keeps (pure): your choice ([`choice_or_refuse`]), and only then
+/// `call`, which raises Windows Hello. The window doesn't have to be in front when it is asked:
+/// its buttons work only once it has been in front for [`BUTTONS_LIVE_AFTER`] ([`LiveClock`]),
+/// so `choose` waits, the taskbar button flashing, until you bring it forward, choose, or
+/// [`HELLO_WAIT`] passes (`TimedOut`, a refusal; never the passphrase).
 pub fn ask_then<T>(
-    raise: Raise,
     choose: impl FnOnce() -> Choice,
     call: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
-    front_or_refuse(raise)?;
     choice_or_refuse(choose())?;
     call()
 }
 
-/// Opens an [`OwnerWindow`] showing `shown` and brings it to the front. With `accept`, it has
-/// that button and "Deny", and `call` runs only after you clicked `accept` ([`ask_then`]);
-/// without, `call` runs as soon as the window is in front ([`front_or_refuse`]).
+/// Opens an [`OwnerWindow`] showing `shown` and tries to bring it to the front. With `accept`,
+/// it has that button and "Deny", and `call` runs only after you clicked `accept`
+/// ([`ask_then`]); without, `call` runs once the window is in front ([`front_or_wait`]).
 fn in_front<T>(
     shown: &str,
     accept: Option<&str>,
@@ -552,6 +593,8 @@ fn in_front<T>(
 trait PromptWindow {
     fn raise(&self) -> Raise;
     fn wait_choice(&self, timeout: Duration) -> Choice;
+    /// Waits until the window is the foreground window, for at most `timeout`.
+    fn wait_front(&self, timeout: Duration) -> bool;
     fn hwnd(&self) -> isize;
 }
 
@@ -562,13 +605,18 @@ impl PromptWindow for OwnerWindow {
     fn wait_choice(&self, timeout: Duration) -> Choice {
         OwnerWindow::wait_choice(self, timeout)
     }
+    fn wait_front(&self, timeout: Duration) -> bool {
+        OwnerWindow::wait_front(self, timeout)
+    }
     fn hwnd(&self) -> isize {
         OwnerWindow::hwnd(self)
     }
 }
 
-/// [`in_front`]'s order, over any window (re-review m6): raise it; when `asking`, wait for the
-/// choice ([`ask_then`]); run `call` with its handle only then.
+/// [`in_front`]'s order, over any window (re-review m6): try to raise it (it flashes when
+/// Windows refuses); when `asking`, wait for the choice ([`ask_then`]), otherwise for the window
+/// to be in front ([`front_or_wait`]); run `call` with its handle only then. All within
+/// [`HELLO_WAIT`].
 fn run_in<W: PromptWindow, T>(
     window: &W,
     asking: bool,
@@ -576,13 +624,9 @@ fn run_in<W: PromptWindow, T>(
 ) -> io::Result<T> {
     let raise = window.raise();
     if asking {
-        ask_then(
-            raise,
-            || window.wait_choice(HELLO_WAIT),
-            || call(window.hwnd()),
-        )
+        ask_then(|| window.wait_choice(HELLO_WAIT), || call(window.hwnd()))
     } else {
-        front_or_refuse(raise)?;
+        front_or_wait(raise, || window.wait_front(HELLO_WAIT))?;
         call(window.hwnd())
     }
 }
@@ -625,6 +669,218 @@ pub fn kek_remove(credential: &str) -> io::Result<()> {
     KeyCredentialManager::DeleteAsync(&HSTRING::from(credential))
         .and_then(|op| op.join())
         .map_err(io_err)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Face sign-in (owner decision 2026-10-24: Windows Hello unlocks merges only without it).
+// ---------------------------------------------------------------------------------------------
+
+/// Whether Windows Hello face recognition is enrolled for the user running this process
+/// ([`face_sign_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaceSignIn {
+    /// No face camera Windows Hello can use, or none has a face enrolled for this user.
+    Off,
+    /// A face is enrolled for this user on a Windows Hello face camera.
+    On,
+    /// It couldn't be told; why.
+    Unknown(String),
+}
+
+/// What one face camera (a facial-features biometric unit in the system pool) says about this
+/// user's enrollments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaceUnit {
+    /// `WinBioEnumEnrollments` succeeded with this many enrolled sub-factors.
+    Enrolled(usize),
+    /// `WINBIO_E_UNKNOWN_ID`: this user has no template on the unit.
+    NotEnrolled,
+    /// Any other failure, with the call and the error.
+    Failed(String),
+}
+
+/// The verdict from the face cameras' answers and whether any biometric device is present
+/// (pure). Any enrollment: on. Any failure without an enrollment: unknown, so the caller uses
+/// the passphrase. No face camera listed: off only when no biometric device is present at all
+/// (face can't sign in on this PC); with one present, WinBio may be hiding it from this program
+/// (Enhanced Sign-in Security does), so unknown. Otherwise off.
+pub fn face_sign_in_from(
+    units: Result<Vec<FaceUnit>, String>,
+    biometric_device_present: Result<bool, String>,
+) -> FaceSignIn {
+    let units = match units {
+        Ok(units) => units,
+        Err(why) => return FaceSignIn::Unknown(why),
+    };
+    if units.is_empty() {
+        return match biometric_device_present {
+            Ok(false) => FaceSignIn::Off,
+            Ok(true) => FaceSignIn::Unknown(
+                "a biometric device is present, but WinBio lists no face camera to LILITH (Enhanced Sign-in Security can hide it)".into(),
+            ),
+            Err(why) => FaceSignIn::Unknown(why),
+        };
+    }
+    if units
+        .iter()
+        .any(|u| matches!(u, FaceUnit::Enrolled(n) if *n > 0))
+    {
+        return FaceSignIn::On;
+    }
+    match units.iter().find_map(|u| match u {
+        FaceUnit::Failed(why) => Some(why.clone()),
+        _ => None,
+    }) {
+        Some(why) => FaceSignIn::Unknown(why),
+        None => FaceSignIn::Off,
+    }
+}
+
+/// `WINBIO_TYPE_FACIAL_FEATURES` (winbio_types.h); not in `windows` 0.62.2.
+const WINBIO_TYPE_FACIAL_FEATURES: u32 = 0x0000_0002;
+/// `WINBIO_FLAG_DEFAULT` (winbio_types.h).
+const WINBIO_FLAG_DEFAULT: u32 = 0;
+/// `WINBIO_ID_TYPE_SID` (winbio_types.h).
+const WINBIO_ID_TYPE_SID: u32 = 3;
+
+/// Whether Windows Hello face recognition is enrolled for this user, read-only through the
+/// Windows Biometric Framework: `WinBioEnumBiometricUnits(WINBIO_TYPE_FACIAL_FEATURES)` lists the
+/// face cameras, and for each one in the system pool (the pool Windows Hello sign-in uses),
+/// `WinBioEnumEnrollments` in a system-pool session asks for this user's enrollments, the user
+/// named by the SID of this process's token. No camera is turned on, nothing is captured, no
+/// prompt is shown and nothing is changed. Relied on: that Windows Hello Face keeps its
+/// templates in the system pool under the user's SID, and that `WINBIO_E_UNKNOWN_ID` means none.
+/// When WinBio lists no face camera, the device list (`SetupDiGetClassDevsW` for the Biometric
+/// device class, present devices only) tells whether there is no biometric hardware at all
+/// (off) or hardware WinBio doesn't show this program (unknown). Any failure is
+/// [`FaceSignIn::Unknown`].
+pub fn face_sign_in() -> FaceSignIn {
+    face_sign_in_from(face_units(), biometric_device_present())
+}
+
+/// Whether any device of the Biometric class is present (read-only device enumeration).
+fn biometric_device_present() -> Result<bool, String> {
+    // SAFETY: a device list for one class, read for its first member and destroyed once.
+    unsafe {
+        let set = SetupDiGetClassDevsW(
+            Some(&GUID_DEVCLASS_BIOMETRIC),
+            windows::core::PCWSTR::null(),
+            None,
+            DIGCF_PRESENT,
+        )
+        .map_err(|e| format!("SetupDiGetClassDevsW: {e}"))?;
+        let mut data = SP_DEVINFO_DATA {
+            cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        let present = match SetupDiEnumDeviceInfo(set, 0, &mut data) {
+            Ok(()) => Ok(true),
+            Err(e) if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() => Ok(false),
+            Err(e) => Err(format!("SetupDiEnumDeviceInfo: {e}")),
+        };
+        let _ = SetupDiDestroyDeviceInfoList(set);
+        present
+    }
+}
+
+/// Closes a WinBio session on every exit path.
+struct WinBioSession(u32);
+
+impl Drop for WinBioSession {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `WinBioOpenSession` and is closed only here.
+        let _ = unsafe { WinBioCloseSession(self.0) };
+    }
+}
+
+/// This process's user as a WinBio identity (`WINBIO_ID_TYPE_SID`).
+fn current_identity() -> Result<WINBIO_IDENTITY, String> {
+    let sid = crate::sid::current_user_sid().map_err(|e| format!("the user's SID: {e}"))?;
+    let mut psid = PSID::default();
+    // SAFETY: `sid` outlives the call; the SID allocated by `ConvertStringSidToSidW` is copied
+    // into the identity and freed once with `LocalFree`.
+    unsafe {
+        ConvertStringSidToSidW(&HSTRING::from(sid), &mut psid)
+            .map_err(|e| format!("ConvertStringSidToSidW: {e}"))?;
+        let len = GetLengthSid(psid) as usize;
+        let mut identity = WINBIO_IDENTITY {
+            Type: WINBIO_ID_TYPE_SID,
+            ..Default::default()
+        };
+        let copied = if len <= identity.Value.AccountSid.Data.len() {
+            let bytes = std::slice::from_raw_parts(psid.0.cast::<u8>(), len);
+            identity.Value.AccountSid.Data[..len].copy_from_slice(bytes);
+            identity.Value.AccountSid.Size = len as u32;
+            Ok(identity)
+        } else {
+            Err(format!(
+                "the user's SID is {len} bytes, too long for WinBio"
+            ))
+        };
+        let _ = LocalFree(Some(HLOCAL(psid.0)));
+        copied
+    }
+}
+
+/// Each system-pool face camera's answer for this user.
+fn face_units() -> Result<Vec<FaceUnit>, String> {
+    // SAFETY: WinBio calls with valid out-pointers; each buffer WinBio allocates is read within
+    // its reported length and freed once with `WinBioFree`.
+    unsafe {
+        let mut schema: *mut WINBIO_UNIT_SCHEMA = std::ptr::null_mut();
+        let mut count = 0usize;
+        WinBioEnumBiometricUnits(WINBIO_TYPE_FACIAL_FEATURES, &mut schema, &mut count)
+            .map_err(|e| format!("WinBioEnumBiometricUnits: {e}"))?;
+        let units: Vec<u32> = if schema.is_null() {
+            Vec::new()
+        } else {
+            let list = std::slice::from_raw_parts(schema, count)
+                .iter()
+                .filter(|u| u.PoolType == WINBIO_POOL_SYSTEM.0)
+                .map(|u| u.UnitId)
+                .collect();
+            let _ = WinBioFree(schema.cast());
+            list
+        };
+        if units.is_empty() {
+            return Ok(Vec::new());
+        }
+        let identity = current_identity()?;
+        let session = WinBioSession(
+            WinBioOpenSession(
+                WINBIO_TYPE_FACIAL_FEATURES,
+                WINBIO_POOL_SYSTEM,
+                WINBIO_FLAG_DEFAULT,
+                None,
+                None,
+            )
+            .map_err(|e| format!("WinBioOpenSession: {e}"))?,
+        );
+        Ok(units
+            .into_iter()
+            .map(|unit| {
+                let mut subfactors: *mut u8 = std::ptr::null_mut();
+                let mut n = 0usize;
+                let result = WinBioEnumEnrollments(
+                    session.0,
+                    unit,
+                    &identity,
+                    &mut subfactors,
+                    Some(&mut n),
+                );
+                if !subfactors.is_null() {
+                    let _ = WinBioFree(subfactors.cast());
+                }
+                match result {
+                    Ok(()) => FaceUnit::Enrolled(n),
+                    Err(e) if e.code() == WINBIO_E_UNKNOWN_ID => FaceUnit::NotEnrolled,
+                    Err(e) => {
+                        FaceUnit::Failed(format!("WinBioEnumEnrollments on unit {unit}: {e}"))
+                    }
+                }
+            })
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -771,6 +1027,15 @@ impl OwnerWindow {
     /// `timeout` ([`wait_for_choice`]).
     pub fn wait_choice(&self, timeout: Duration) -> Choice {
         wait_for_choice(&|| choice_of(self.hwnd), timeout, &std::thread::sleep)
+    }
+
+    /// Waits until the window is the foreground window (you brought it forward), for at most
+    /// `timeout` ([`wait_until`]).
+    pub fn wait_front(&self, timeout: Duration) -> bool {
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        // SAFETY: a plain query.
+        let in_front = || unsafe { GetForegroundWindow() } == hwnd;
+        wait_until(&in_front, timeout, &std::thread::sleep)
     }
 
     /// Brings the window to the front without any synthetic input: `SetForegroundWindow`, then
@@ -1583,6 +1848,8 @@ mod tests {
         assert_eq!(size_of::<WindowId>(), 8);
     }
 
+    /// Phase B ruling: a window Windows keeps behind flashes and is waited for; Windows Hello
+    /// is used only once it is in front.
     #[test] // spec: QA-088
     fn windows_hello_is_used_only_when_its_window_is_in_front() {
         for ok in [
@@ -1590,12 +1857,31 @@ mod tests {
             Raise::SetForeground,
             Raise::AttachedInput,
         ] {
-            assert!(front_or_refuse(ok).is_ok(), "{ok:?}");
+            assert!(
+                front_or_wait(ok, || panic!("waited while in front")).is_ok(),
+                "{ok:?}"
+            );
         }
-        let e = front_or_refuse(Raise::NotInFront).unwrap_err();
-        // Not `Interrupted` (a cancel): the caller treats it as Hello being unavailable.
-        assert_ne!(e.kind(), io::ErrorKind::Interrupted);
-        assert!(e.to_string().contains("front"), "{e}");
+        assert!(front_or_wait(Raise::NotInFront, || true).is_ok());
+        let e = front_or_wait(Raise::NotInFront, || false).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("brought forward"), "{e}");
+
+        // The wait itself: until ready, at most the timeout.
+        use std::cell::Cell;
+        let polls = Cell::new(0);
+        assert!(wait_until(
+            &|| {
+                polls.set(polls.get() + 1);
+                polls.get() > 3
+            },
+            Duration::from_secs(1),
+            &|_| {}
+        ));
+        let waited = Cell::new(Duration::ZERO);
+        assert!(!wait_until(&|| false, Duration::from_secs(2), &|d| waited
+            .set(waited.get() + d)));
+        assert_eq!(waited.get(), Duration::from_secs(2));
     }
 
     #[test] // spec: QA-088
@@ -1631,7 +1917,7 @@ mod tests {
     }
 
     /// Fix round 2: Windows Hello is raised only after "Merge" / "Approve"; "Deny", closing the
-    /// window or no choice in time refuses, and a window not in front never asks at all.
+    /// window or no choice in time refuses.
     #[test] // spec: QA-088, QA-036
     fn windows_hello_is_raised_only_after_the_accept_click() {
         use std::cell::Cell;
@@ -1640,13 +1926,12 @@ mod tests {
             called.set(true);
             Ok(())
         };
-        ask_then(Raise::SetForeground, || Choice::Accepted, call).unwrap();
+        ask_then(|| Choice::Accepted, call).unwrap();
         assert!(called.get());
 
         for refused in [Choice::Denied, Choice::Closed, Choice::TimedOut] {
             let called = Cell::new(false);
             let e = ask_then(
-                Raise::AlreadyInFront,
                 || refused,
                 || {
                     called.set(true);
@@ -1658,20 +1943,6 @@ mod tests {
             // A refusal, not a reason to fall back to the passphrase.
             assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{refused:?}");
         }
-
-        // Not in front: nobody is asked, Hello isn't raised, and it isn't a refusal.
-        let asked = Cell::new(false);
-        let e = ask_then(
-            Raise::NotInFront,
-            || {
-                asked.set(true);
-                Choice::Accepted
-            },
-            || -> io::Result<()> { panic!("Windows Hello was raised behind other windows") },
-        )
-        .unwrap_err();
-        assert!(!asked.get());
-        assert_ne!(e.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test] // spec: QA-088
@@ -1971,10 +2242,58 @@ mod tests {
         }
     }
 
+    /// Owner decision 2026-10-24: whether face sign-in is on, from the face cameras' answers;
+    /// anything that can't be told is unknown, never off.
+    #[test] // spec: QA-088
+    fn face_sign_in_is_on_when_any_camera_has_this_users_face_and_unknown_when_unsure() {
+        use FaceUnit::*;
+        let face = |units: Result<Vec<FaceUnit>, String>| face_sign_in_from(units, Ok(true));
+        // No face camera and no biometric device at all: face can't sign in on this PC.
+        assert_eq!(face_sign_in_from(Ok(vec![]), Ok(false)), FaceSignIn::Off);
+        // No face camera listed, but a biometric device is there (hidden from WinBio, as
+        // Enhanced Sign-in Security does), or the device list failed: can't tell.
+        assert!(matches!(
+            face_sign_in_from(Ok(vec![]), Ok(true)),
+            FaceSignIn::Unknown(_)
+        ));
+        assert_eq!(
+            face_sign_in_from(Ok(vec![]), Err("SetupDi".into())),
+            FaceSignIn::Unknown("SetupDi".into())
+        );
+        assert_eq!(face(Ok(vec![NotEnrolled, Enrolled(0)])), FaceSignIn::Off);
+        assert_eq!(face(Ok(vec![NotEnrolled, Enrolled(1)])), FaceSignIn::On);
+        // An enrollment wins over another camera's failure.
+        assert_eq!(
+            face(Ok(vec![Failed("x".into()), Enrolled(2)])),
+            FaceSignIn::On
+        );
+        assert_eq!(
+            face(Ok(vec![NotEnrolled, Failed("E_ACCESSDENIED".into())])),
+            FaceSignIn::Unknown("E_ACCESSDENIED".into())
+        );
+        assert_eq!(
+            face(Err("WinBioEnumBiometricUnits: off".into())),
+            FaceSignIn::Unknown("WinBioEnumBiometricUnits: off".into())
+        );
+    }
+
+    /// Reads this PC's real face enrollment state (read-only: no camera, no prompt, nothing
+    /// changed). Run by hand: `cargo nextest run -p lil-platform --run-ignored only -E
+    /// 'test(face_sign_in_can_be_read)'`.
+    #[test]
+    #[ignore = "desktop"]
+    fn face_sign_in_can_be_read_on_this_pc() {
+        let face = face_sign_in();
+        println!("face sign-in: {face:?}");
+        assert!(!matches!(face, FaceSignIn::Unknown(_)), "{face:?}");
+    }
+
     /// A window for [`run_in`]: records what was asked of it.
     struct FakeWindow {
         raise: Raise,
         choice: Choice,
+        /// Whether the owner brings it forward within the wait.
+        brought_forward: bool,
         log: std::cell::RefCell<Vec<&'static str>>,
     }
 
@@ -1988,17 +2307,24 @@ mod tests {
             self.log.borrow_mut().push("choice");
             self.choice
         }
+        fn wait_front(&self, timeout: Duration) -> bool {
+            assert_eq!(timeout, HELLO_WAIT);
+            self.log.borrow_mut().push("wait_front");
+            self.brought_forward
+        }
         fn hwnd(&self) -> isize {
             42
         }
     }
 
-    /// Re-review m6: `in_front`'s glue keeps the order, over a fake window.
+    /// Re-review m6: `in_front`'s glue keeps the order, over a fake window. Phase B ruling: a
+    /// window Windows keeps behind is waited for (it flashes), never a passphrase fallback.
     #[test] // spec: QA-088
     fn the_window_is_raised_then_asked_and_only_then_windows_hello_runs() {
         let window = |raise, choice| FakeWindow {
             raise,
             choice,
+            brought_forward: true,
             log: Default::default(),
         };
         let w = window(Raise::SetForeground, Choice::Accepted);
@@ -2017,15 +2343,38 @@ mod tests {
             assert_eq!(*w.log.borrow(), ["raise", "choice"]);
         }
 
+        // Not in front: still asked (the buttons go live only once you brought it forward), and
+        // Windows Hello runs only after the click.
         let w = window(Raise::NotInFront, Choice::Accepted);
-        assert!(run_in(&w, true, |_| -> io::Result<()> { panic!("hello ran") }).is_err());
-        assert_eq!(*w.log.borrow(), ["raise"]);
+        run_in(&w, true, |_| {
+            w.log.borrow_mut().push("hello");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*w.log.borrow(), ["raise", "choice", "hello"]);
+        // Not brought forward in time: the choice times out, a refusal, never a fallback.
+        let w = window(Raise::NotInFront, Choice::TimedOut);
+        let e = run_in(&w, true, |_| -> io::Result<()> { panic!("hello ran") }).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 
         // Not asking (enrolment): raised, then Windows Hello, no choice.
         let w = window(Raise::AttachedInput, Choice::Denied);
         run_in(&w, false, |_| Ok(())).unwrap();
         assert_eq!(*w.log.borrow(), ["raise"]);
-        let w = window(Raise::NotInFront, Choice::Accepted);
-        assert!(run_in(&w, false, |_| -> io::Result<()> { panic!("hello ran") }).is_err());
+        // Not in front: it waits until you bring it forward, then Windows Hello.
+        let w = window(Raise::NotInFront, Choice::Denied);
+        run_in(&w, false, |_| {
+            w.log.borrow_mut().push("hello");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*w.log.borrow(), ["raise", "wait_front", "hello"]);
+        // Never brought forward: a timeout, and Windows Hello isn't raised.
+        let w = FakeWindow {
+            brought_forward: false,
+            ..window(Raise::NotInFront, Choice::Accepted)
+        };
+        let e = run_in(&w, false, |_| -> io::Result<()> { panic!("hello ran") }).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     }
 }

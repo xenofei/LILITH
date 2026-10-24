@@ -15,16 +15,23 @@
 //!   over the challenge (P4a-R23). The existing age decryption stays the one path.
 //!
 //! **The seam.** The Windows Hello calls go through [`HelloPlatform`]: [`WindowsHello`] for real
-//! (`lil_platform::hello`), a fake in `tests/reviewer_hello.rs`. Whether `enroll` may run is
-//! [`PROVEN_ROUTE`], settled by Task 28's route step (Step 0, P4a-R38); until then it is `None`,
-//! so `enroll` refuses and every approval and merge uses the passphrase. If the probe shows the
-//! KEK can't work, the owner decides what follows; no other route is built for it.
+//! (`lil_platform::hello`), a fake in `tests/reviewer_hello.rs`. [`PROVEN_ROUTE`] is the KEK,
+//! proven by Task 28's route step (Step 0, P4a-R38) on 2026-10-24.
 //!
-//! **In front, or the passphrase (QA-088).** The window that owns the Windows Hello prompt shows
-//! what you are confirming (for a merge, the summary and the audit, P4a-R38). When it can't be
-//! brought to the front, or the prompt isn't answered within `lil_platform::hello::HELLO_WAIT`,
-//! Windows Hello is unavailable and the passphrase is asked for, or, with no terminal
-//! ([`NoTerminal`]), nothing is unlocked.
+//! **Not with face sign-in** (owner decision 2026-10-24). Windows Hello unlocks the key only
+//! while face recognition isn't enrolled for Windows Hello on this account
+//! ([`face_blocks_hello`]), so the prompt always needs a deliberate PIN or fingerprint. While it
+//! is on, or can't be told, the passphrase is used and you are told why; `enroll` refuses, and
+//! `status` shows it.
+//!
+//! **In front first (QA-088, Phase B ruling).** The window that owns the Windows Hello prompt
+//! shows what you are confirming (for a merge, the summary and the audit, P4a-R38). When
+//! Windows keeps it behind, it flashes in the taskbar and waits, within
+//! `lil_platform::hello::HELLO_WAIT`, for you to bring it forward; it doesn't fall back to the
+//! passphrase for that. Not brought forward in time is a refusal for a merge or an approval
+//! ([`KeyError::Denied`]). A prompt that isn't answered in time, or that fails, makes Windows
+//! Hello unavailable, and the passphrase is asked for, or, with no terminal ([`NoTerminal`]),
+//! nothing is unlocked.
 //!
 //! **Merge or Deny first** (Task 28 fix round 2). Windows Hello Face can complete a prompt with
 //! no deliberate act, so for an approval or a merge that window has two buttons, "Merge" (or
@@ -57,9 +64,10 @@ use zeroize::Zeroizing;
 /// The Windows Hello key credential's name.
 pub const CREDENTIAL: &str = "LILITH-reviewer-kek";
 
-/// `Some(Route::Kek)` once Task 28's Step 0 proved it (P4a-R38); `None` until then. Phase B sets
-/// it.
-pub const PROVEN_ROUTE: Option<Route> = None;
+/// The route Task 28's Step 0 proved (P4a-R38): the KEK. On 2026-10-24 the probe created a
+/// window-owned credential and signed twice with identical signatures, and the prompt came to
+/// the front by itself in every step, over a fullscreen window too.
+pub const PROVEN_ROUTE: Option<Route> = Some(Route::Kek);
 
 /// The Windows Hello route that protects the key. The KEK is the only one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +241,24 @@ pub fn discard_enrolment_beside(key_path: &Path) -> Result<Vec<PathBuf>> {
 // The Windows Hello seam.
 // ---------------------------------------------------------------------------------------------
 
+pub use lil_platform::hello::FaceSignIn;
+
+/// Why Windows Hello isn't used for the reviewer key, or `None` when face sign-in is off
+/// (owner decision 2026-10-24: Windows Hello unlocks merges only without face sign-in, so the
+/// prompt always needs a deliberate PIN or fingerprint). Pure.
+pub fn face_blocks_hello(face: &FaceSignIn) -> Option<String> {
+    match face {
+        FaceSignIn::Off => None,
+        FaceSignIn::On => Some(
+            "face sign-in is on for Windows Hello; LILITH uses your passphrase until you turn it off in Settings > Accounts > Sign-in options".into(),
+        ),
+        FaceSignIn::Unknown(why) => Some(format!(
+            "LILITH can't tell whether face sign-in is on for Windows Hello ({}), so it uses your passphrase",
+            one_line(why)
+        )),
+    }
+}
+
 /// The Windows Hello calls (P4a-R38), one seam: [`WindowsHello`] for real, a fake in tests.
 /// `shown` is what the window that owns the prompt shows.
 pub trait HelloPlatform {
@@ -240,13 +266,18 @@ pub trait HelloPlatform {
     fn supported(&self) -> bool;
     /// Whether a TPM 2.0 is present (Windows Hello normally keeps its keys there). No prompt.
     fn hardware_held(&self) -> bool;
-    /// Creates (or replaces) the key credential. Prompts. An error when its window can't be
-    /// brought to the front or the prompt isn't answered in time.
+    /// Whether Windows Hello face sign-in is enrolled for this user (owner decision 2026-10-24:
+    /// Windows Hello unlocks only without it). Read-only; no prompt.
+    fn face_sign_in(&self) -> FaceSignIn;
+    /// Creates (or replaces) the key credential. Prompts. An error when its window wasn't
+    /// brought forward in time (it flashes in the taskbar meanwhile) or the prompt isn't
+    /// answered in time.
     fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()>;
     /// The KEK from the credential's signature over `challenge`. Prompts; errors as above.
     /// With `accept` ("Merge", "Approve"), the window has that button and "Deny", and Windows
     /// Hello is raised only after the accept click; "Deny", closing the window or no choice in
-    /// time is a `PermissionDenied` error, which refuses outright (Task 28 fix round 2).
+    /// time (the window never brought forward included) is a `PermissionDenied` error, which
+    /// refuses outright (Task 28 fix round 2, Phase B ruling).
     fn kek_derive(
         &self,
         credential: &str,
@@ -259,8 +290,9 @@ pub trait HelloPlatform {
 }
 
 /// The real Windows Hello (`lil_platform::hello`): every prompt is owned by a window this
-/// process opens and brings to the front, never the console; Windows Hello isn't used when that
-/// window can't get to the front (QA-088), and a prompt is cancelled after `HELLO_WAIT`.
+/// process opens and tries to bring to the front, never the console. When Windows keeps it
+/// behind, it flashes in the taskbar and waits for you to bring it forward (QA-088, Phase B
+/// ruling); a prompt is cancelled after `HELLO_WAIT`.
 pub struct WindowsHello;
 
 impl HelloPlatform for WindowsHello {
@@ -269,6 +301,9 @@ impl HelloPlatform for WindowsHello {
     }
     fn hardware_held(&self) -> bool {
         lil_platform::hello::tpm_present()
+    }
+    fn face_sign_in(&self) -> FaceSignIn {
+        lil_platform::hello::face_sign_in()
     }
     fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()> {
         lil_platform::hello::kek_enroll(credential, shown)
@@ -445,6 +480,10 @@ pub fn enrolled_hello<'a>(
 ) -> Option<HelloUnlocker<'a>> {
     match read_enrolment(profile) {
         Ok(None) => None,
+        Ok(Some(_)) if let Some(why) = face_blocks_hello(&platform.face_sign_in()) => {
+            say(&format!("Windows Hello isn't used: {why}."));
+            None
+        }
         Ok(Some((file, sealed))) => Some(HelloUnlocker {
             file,
             sealed,
@@ -592,6 +631,10 @@ pub fn enroll(
             hello_file_path_in(profile).display()
         );
     }
+    // Owner decision 2026-10-24: no enrolment while face sign-in is on (or can't be told).
+    if let Some(why) = face_blocks_hello(&platform.face_sign_in()) {
+        bail!("{why}. Nothing was written");
+    }
     let pem = PassphraseUnlocker::new(&key.encrypted_pem, ask)
         .unlock()
         .map_err(|e| match e {
@@ -606,7 +649,9 @@ pub fn enroll(
     let sealed_path = hello_age_path_in(profile);
     let shown = "LILITH: set up Windows Hello for the reviewer key.\n\nWindows Hello asks twice: once to create the key, once to sign with it.";
     let written = (|| -> Result<()> {
-        say("Windows Hello asks twice: once to create the key, once to sign with it.");
+        say(
+            "Windows Hello asks twice: once to create the key, once to sign with it. If a LILITH window flashes in the taskbar instead of coming forward, click it.",
+        );
         platform
             .kek_enroll(CREDENTIAL, shown)
             .map_err(|e| anyhow!("Windows Hello didn't create the key: {e}"))?;
@@ -678,6 +723,14 @@ pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
             "not set up"
         }
     ));
+    let face = platform.face_sign_in();
+    out.push(match face_blocks_hello(&face) {
+        None => "Face sign-in: off, so Windows Hello can unlock the reviewer key (a PIN or fingerprint at its prompt).".into(),
+        Some(why) => format!(
+            "Face sign-in: {} ({why}).",
+            if face == FaceSignIn::On { "on" } else { "unknown" }
+        ),
+    });
     out
 }
 
