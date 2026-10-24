@@ -2426,9 +2426,17 @@ impl Shared {
         if let Err(e) = self.failpoints.hit("jobs.after_withdraw") {
             tracing::warn!(job_id = id, error = %e, "fail point jobs.after_withdraw");
         }
-        if let Some(a) = self.queue().jobs.get_mut(id) {
-            a.withdrawal = Withdrawal::Withdrawn;
-            a.held_shown = true;
+        // Only while still deciding: a late "gone" may have taken the withdrawal over (M1),
+        // and then its row and count are that path's.
+        {
+            let mut q = self.queue();
+            match q.jobs.get_mut(id) {
+                Some(a) if a.withdrawal == Withdrawal::Deciding => {
+                    a.withdrawal = Withdrawal::Withdrawn;
+                    a.held_shown = true;
+                }
+                _ => return,
+            }
         }
         tracing::info!(job_id = id, prompt_id = %external_id, "a paused lane's pending prompt was withdrawn");
         // The row first, then the attempt ends: the attempt writes nothing once withdrawn.
