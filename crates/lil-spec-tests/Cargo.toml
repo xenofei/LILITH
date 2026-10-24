@@ -11,6 +11,8 @@ publish.workspace = true
 serde_json.workspace = true
 lil-protocol = { path = "../lil-protocol" }
 lil-testkit = { path = "../lil-testkit" }
+# Plan 4a: the `lil:` URL grammar is a format (QA-018), checked through its public parser.
+lil-parse = { path = "../lil-parse" }
 
 [lints]
 workspace = true
