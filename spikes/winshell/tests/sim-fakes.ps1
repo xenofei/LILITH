@@ -670,8 +670,25 @@ function Get-SandboxPids {
     Invoke-SimSandboxTick
     $s = $script:SimSandbox
     if ($null -eq $s) { return @() }
+    if ($s.ContainsKey('Killed') -and $s.Killed) { return @() }
     $done = [IO.File]::Exists((Join-Path $s.Res 'done.json'))
     if ($done -and (-not $s.Sticky -or $s.Launcher.HasExited)) { return @() }
     @($s.Pids)
+}
+# The fake Sandbox's own processes, pinned as the real ones are (scope-cut review M11: "running"
+# is judged from the pinned WindowsSandbox* processes). Killing one ends the fake Sandbox. Any
+# other pid goes to the real Get-PinnedProcess.
+$script:RealGetPinnedProcess = ${function:Get-PinnedProcess}
+function Get-PinnedProcess([int]$ProcessId, [string]$ExpectedPath, [datetime]$NotBefore, [long]$CreatedFileTime = 0) {
+    $s = $script:SimSandbox
+    if ($null -ne $s -and $ProcessId -in @($s.Pids)) {
+        $p = [pscustomobject]@{ Id = $ProcessId; ProcessName = 'WindowsSandboxClient'; Sim = $s }
+        $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { ($this.Sim.ContainsKey('Killed') -and $this.Sim.Killed) -or -not (@(Get-SandboxPids) -contains $this.Id) }
+        $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Sim.Killed = $true }
+        $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $this.Sim.Killed = $true; if ($args.Count -gt 0) { $true } }
+        return $p
+    }
+    if ($null -eq $script:RealGetPinnedProcess) { return $null }
+    & $script:RealGetPinnedProcess $ProcessId $ExpectedPath $NotBefore $CreatedFileTime
 }
 function Get-SandboxProcesses { $(if (@(Get-SandboxPids).Count -gt 0) { @('WindowsSandbox', 'WindowsSandboxRemoteSession') } else { @() }) }

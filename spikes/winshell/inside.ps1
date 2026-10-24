@@ -392,15 +392,25 @@ function Start-QtOnScreen([string]$Exe, [string]$Name) {
     # Pinned at once: in Windows PowerShell 5.1 a redirected Start-Process object holds no handle
     # until .Handle is read (fix round 4, m3).
     [void]$p.Handle
-    $rec = [ordered]@{ hwnd = 0; class = $null; nonflat = $false; exit = $null; stderr = ''; png = $null }
+    $rec = [ordered]@{ hwnd = 0; class = $null; nonflat = $false; exit = $null; stderr = ''; png = $null; window_wait_s = $null }
     try {
+        # At least 10 s to draw, then up to 30 s in all for a main window that is not an error
+        # box (scope-cut review M13: a WebEngine app on WARP may show its window late).
+        $t0 = Get-Date
         Start-Sleep -Seconds 10
-        $p.Refresh()
-        $hwnd = $p.MainWindowHandle
+        $hwnd = [IntPtr]::Zero
+        $cls = New-Object System.Text.StringBuilder 256
+        while ($true) {
+            $p.Refresh()
+            $hwnd = $p.MainWindowHandle
+            [void]$cls.Clear()
+            if ($hwnd -ne [IntPtr]::Zero) { [void][Spike.Native]::GetClassNameW($hwnd, $cls, 256) }
+            if (($hwnd -ne [IntPtr]::Zero -and "$cls" -ne '#32770') -or "$cls" -eq '#32770' -or $p.HasExited -or ((Get-Date) - $t0).TotalSeconds -ge 30) { break }
+            Start-Sleep -Seconds 1
+        }
+        $rec.window_wait_s = [int]((Get-Date) - $t0).TotalSeconds
         $rec.hwnd = [int64]$hwnd
         if ($hwnd -ne [IntPtr]::Zero) {
-            $cls = New-Object System.Text.StringBuilder 256
-            [void][Spike.Native]::GetClassNameW($hwnd, $cls, 256)
             $rec.class = "$cls"
             $rect = New-Object Spike.Native+RECT
             if ($rec.class -ne '#32770' -and [Spike.Native]::GetWindowRect($hwnd, [ref]$rect)) {

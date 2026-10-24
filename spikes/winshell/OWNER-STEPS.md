@@ -16,20 +16,21 @@ The coordinator starts it; this doc is here so anyone can see what it does and r
 From a normal **Windows Terminal** (not "Run as administrator"), in this repository's folder:
 
 ```powershell
-pwsh -NoProfile -File spikes/winshell/run-all.ps1 -Task0Repo "<folder of Task 0's worktree>"
+pwsh -NoProfile -NonInteractive -File spikes/winshell/run-all.ps1 -Task0Repo "<folder of Task 0's worktree>"
 ```
 
-Put the folder of Task 0's worktree in the quotes (or set the environment variable `LILITH_TASK0_REPO` to it). If the deploy folder can't be found, the run stops before starting a Sandbox and prints the command to use.
+Put the folder of Task 0's worktree in the quotes (or set the environment variable `LILITH_TASK0_REPO` to it). If the deploy folder can't be found (or Windows Sandbox is off), the run stops before starting a Sandbox, says why, and exits with an error code.
 
 It runs `run-sandbox.ps1 -Runs 3 -KeepAwake` and nothing else:
 
-- it builds the spike (`cargo build --release`), copies Task 0's deploy folder as it is into `spikes\winshell\build\deploy-copy`, and finds the three runtime files;
+- it builds the spike (`cargo build --release`), copies Task 0's deploy folder as it is into `spikes\winshell\build\sandbox\deploy-copy`, and finds the three runtime files;
 - a Windows Sandbox window opens and closes by itself, 3 times. Each run is limited to 120 s to start and 600 s to finish; a run that goes over is recorded and its Sandbox closed;
-- the PC is kept awake for the runs (a power request held by a spike program that watches the script, released at the end). A run during which the PC slept anyway is recorded as interrupted, not as a failure.
+- the PC is kept awake for the runs (a power request held by a spike program that watches the script, released at the end). A run during which the PC slept anyway is recorded as interrupted, not as a failure;
+- whether the PC is locked is read (never changed) every few seconds during each run and recorded. The keep-awake doesn't stop the screen turning off or the PC locking; a toast, foreground or Qt item that fails while the PC was locked is recorded as "host locked: not judged" rather than as a failure.
 
 The Qt item inside the Sandbox starts Task 0's app on the normal (on-screen) platform and grabs its window. The offscreen grab is **not tested**: the trimmed deploy ships no `qoffscreen.dll`, and CI's S0.9 covers offscreen. If the deploy has no `platforms\qwindows.dll`, the app is not started and that is recorded (Qt would otherwise show a blocking error box).
 
-When it ends, the terminal prints the verdict per run and overall. The results are in `spikes\winshell\results\`: `sandbox-checks.json`, and each run's files in `results\sandbox\run-<n>\`. **Ctrl+C** stops it at any time and still cleans up.
+When it ends, the terminal prints the verdict per run and overall. The overall verdict is PASS only when all 3 runs finished and passed (it reads "PASS (Qt: on-screen grab only; offscreen not tested)"); fewer finished runs give INCOMPLETE. The results are in `spikes\winshell\results\`: `sandbox-checks.json`, and each run's files in `results\sandbox\run-<n>\`. **Ctrl+C** stops it at any time and still cleans up.
 
 **Part B** runs only when asked for by name with `-PartB` (for example `-PartB -Only S1.5`). It is not part of the default run: it posts toasts, writes a shortcut and registry entries, may show a Windows Hello prompt, and may ask questions in the terminal. Asking for a Part B check without `-PartB` stops the script before it does anything.
 
@@ -39,7 +40,7 @@ When it ends, the terminal prints the verdict per run and overall. The results a
 |---|---|
 | A Windows Sandbox (the `WindowsSandbox` processes this run started) | closed by the script after each run, and in the cleanup on any exit; only the processes it started are ended |
 | The power request "LILITH spike 11 keep-awake check" | released by the script at the end; if the terminal is closed instead, the program holding it notices and releases it within a second |
-| A permission for SYSTEM to write to `spikes\winshell\build\run-<n>\results\` (the Sandbox writes its results through it), added only when that folder doesn't already inherit one | the folder is inside this worktree; delete it whenever you like |
+| A permission for SYSTEM to write to `spikes\winshell\build\sandbox\run-<n>\results\` (the Sandbox writes its results through it), added only when that folder doesn't already inherit one | the folder is inside this worktree; delete it whenever you like |
 | `spikes\winshell\build\` and `spikes\winshell\results\` | kept for the agent; git ignores both; delete them whenever you like |
 | Inside the Sandbox: a shortcut, the link type `lilspike:`, logs | gone when the Sandbox closes. The Sandbox has no network, clipboard, microphone, camera or printer; only the bundle, the deploy copy (both read-only) and the run's results folder connect it to this PC |
 

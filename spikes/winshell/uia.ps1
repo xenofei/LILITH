@@ -1046,16 +1046,34 @@ function Get-SleepInWindow($Events, $Kernel, [long]$FromMs, [long]$ToMs) {
     [ordered]@{ slept = ($ev.Count + $kn.Count) -gt 0; events = $ev; kernel = $kn }
 }
 
-# S1.9's verdict from its runs (review N-I1): a judged run that failed is FAIL; otherwise runs
-# interrupted by sleep make it INCOMPLETE; otherwise PASS. Pure; tested.
-function Get-SandboxVerdict($Runs) {
+# S1.9's verdict from its runs (review N-I1; scope-cut review I1, I2): a judged run that failed is
+# FAIL; fewer finished runs than requested is INCOMPLETE; runs interrupted by sleep, or not judged
+# because the host was locked while a desktop item failed, make it INCOMPLETE; otherwise PASS.
+# Pure; tested.
+function Get-SandboxVerdict($Runs, [int]$Requested = 0) {
     $all = @(@($Runs) | Where-Object { $null -ne $_ })
-    $judged = @($all | Where-Object { (P2o $_ 'interrupted_by_sleep') -ne $true })
-    $interrupted = $all.Count - $judged.Count
+    $slept = @($all | Where-Object { (P2o $_ 'interrupted_by_sleep') -eq $true })
+    $isLocked = { param($r) $n = P2o $r 'host_locked_not_judged'; (P2o $r 'interrupted_by_sleep') -ne $true -and $null -eq (P2o $r 'pass') -and $null -ne $n -and @($n | Where-Object { $_ }).Count -gt 0 }
+    $locked = @($all | Where-Object { & $isLocked $_ })
+    $judged = @($all | Where-Object { (P2o $_ 'interrupted_by_sleep') -ne $true -and -not (& $isLocked $_) })
     if (@($judged | Where-Object { (P2o $_ 'pass') -ne $true }).Count -gt 0) { return 'FAIL' }
-    if ($interrupted -gt 0) { return "INCOMPLETE ($interrupted run(s) interrupted by sleep: rerun them)" }
     if ($all.Count -eq 0) { return 'INCOMPLETE (no run)' }
+    if ($Requested -gt 0 -and $all.Count -lt $Requested) { return "INCOMPLETE ($($all.Count) of $Requested runs finished)" }
+    if ($slept.Count -gt 0) { return "INCOMPLETE ($($slept.Count) run(s) interrupted by sleep: rerun them)" }
+    if ($locked.Count -gt 0) { return "INCOMPLETE ($($locked.Count) run(s) not judged: the host was locked while a desktop item failed)" }
     'PASS'
+}
+
+# One Sandbox run's pass from its judged items (scope-cut review I2). A failed desktop item (toast,
+# foreground, Qt) while the host was locked at any sample is not counted as a Sandbox result: it is
+# listed in host_locked_not_judged, and the run's pass is $null when nothing else failed. Any other
+# failed item still fails the run. Pure; tested.
+function Get-SandboxRunPass($Items, $LockedAny) {
+    $failed = @(@($Items.Keys) | Where-Object { $v = $Items[$_]; $v.Contains('pass') -and -not $v.pass })
+    $excused = @(); if ($LockedAny -eq $true) { $excused = @($failed | Where-Object { $_ -in 'toast', 'foreground', 'qt' }) }
+    $rest = @($failed | Where-Object { $_ -notin $excused })
+    $pass = $(if ($rest.Count -gt 0) { $false } elseif ($excused.Count -gt 0) { $null } else { $true })
+    [ordered]@{ pass = $pass; host_locked_not_judged = $excused }
 }
 
 # A field of a dictionary or an object, or $null (strict-mode safe; the scripts' own P).

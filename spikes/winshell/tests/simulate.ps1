@@ -83,7 +83,8 @@ try {
     # ---- the 3 Sandbox runs
     Expect 'sandbox-checks.json' ($null -ne $runs) 'written and read back'
     if ($null -ne $runs) {
-        Expect 'Sandbox runs' ((P $runs 'verdict') -eq 'PASS') "verdict '$(P $runs 'verdict')'"
+        Expect 'Sandbox runs' ((P $runs 'verdict') -eq 'PASS (Qt: on-screen grab only; offscreen not tested)' -and (P $runs 'pass') -eq $true) "verdict '$(P $runs 'verdict')'"
+        Expect 'runs requested recorded (scope-cut I1)' ((P $runs 'runs_requested') -eq 3) "runs_requested $(P $runs 'runs_requested')"
         $rr = @(P $runs 'runs')
         Expect 'Sandbox runs' ($rr.Count -eq 3) "3 runs ($($rr.Count))"
         Expect 'Qt bar recorded' ("$(P $runs 'qt_bar')" -match 'on-screen grab only' -and "$(P $runs 'qt_bar')" -match 'no qoffscreen\.dll') "qt_bar: '$(P $runs 'qt_bar')'"
@@ -96,6 +97,14 @@ try {
         if ($rr.Count -eq 3) {
             $stop2 = "$(P (P (P (P (P $rr[1] 'items') 'lifecycle') 'file') 'stop') 'method')"
             Expect 'Sandbox run 2 ended through its pinned object' ($stop2.StartsWith('Kill')) "stop: '$stop2'"
+            $stop1 = "$(P (P (P (P (P $rr[0] 'items') 'lifecycle') 'file') 'stop') 'method')"
+            Expect 'Sandbox run 1 closed by itself, judged from its pinned processes (M11)' ($stop1 -eq 'shutdown /s /t 0 inside') "stop: '$stop1'"
+            # The fakes report the host locked for the first two samples: run 1 records it, and
+            # with every item passing the run still passes (scope-cut I2).
+            $l1 = P (P (P $rr[0] 'items') 'lifecycle') 'file'
+            $l3 = P (P (P $rr[2] 'items') 'lifecycle') 'file'
+            Expect 'host lock sampled (I2)' (@(P $l1 'host_locked_samples').Count -ge 3 -and (P $l1 'host_locked_at_start') -eq $true -and (P $l1 'host_locked_any') -eq $true -and (P $l3 'host_locked_any') -eq $false) "run 1: $(@(P $l1 'host_locked_samples').Count) samples, any $(P $l1 'host_locked_any'); run 3 any $(P $l3 'host_locked_any')"
+            Expect 'a lock with no failed item is still judged (I2)' ((P $rr[0] 'pass') -eq $true -and @(P $rr[0] 'host_locked_not_judged').Count -eq 0) "run 1 pass $(P $rr[0] 'pass')"
             $own = @(P (P (P (P (P $rr[0] 'items') 'lifecycle') 'file') 'started') 'own_procs')
             Expect 'lifecycle record (N3-C2)' ($own.Count -ge 1 -and @($own | Where-Object { @($_.PSObject.Properties.Name | Where-Object { $_ -notin 'pid', 'name', 'start' }).Count -gt 0 }).Count -eq 0) "own_procs hold pid, name and start only ($($own.Count))"
         }

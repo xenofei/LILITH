@@ -244,6 +244,18 @@ function Run1($Pass, $Int) { [ordered]@{ pass = $Pass; interrupted_by_sleep = $I
 Try-Case 'sandbox verdict: 3 of 3' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $true $false), (Run1 $true $false)) } 'PASS'
 Try-Case 'sandbox verdict: one interrupted' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $null $true), (Run1 $true $false)) } 'INCOMPLETE (1 run(s) interrupted by sleep: rerun them)'
 Try-Case 'sandbox verdict: a judged FAIL decides' { Get-SandboxVerdict @((Run1 $false $false), (Run1 $null $true)) } 'FAIL'
+# Scope-cut review I1: fewer finished runs than requested is never PASS.
+Try-Case 'sandbox verdict: 1 of 3 runs finished' { Get-SandboxVerdict @((Run1 $true $false)) 3 } 'INCOMPLETE (1 of 3 runs finished)'
+Try-Case 'sandbox verdict: 3 of 3 requested' { Get-SandboxVerdict @((Run1 $true $false), (Run1 $true $false), (Run1 $true $false)) 3 } 'PASS'
+Try-Case 'sandbox verdict: a FAIL still decides with runs missing' { Get-SandboxVerdict @((Run1 $false $false)) 3 } 'FAIL'
+# Scope-cut review I2: a desktop item that failed while the host was locked is not a Sandbox result.
+function Items($Fail) { $i = [ordered]@{}; foreach ($k in 'toast', 'protocol', 'foreground', 'power', 'rust', 'qt') { $i[$k] = [ordered]@{ pass = ($k -notin $Fail) } }; $i['elevation'] = [ordered]@{ recorded = $null }; $i }
+Try-Case 'run pass: locked, Qt failed' { $j = Get-SandboxRunPass (Items @('qt')) $true; "$($j.pass)|$($j.host_locked_not_judged -join ',')" } '|qt'
+Try-Case 'run pass: locked, protocol failed' { $j = Get-SandboxRunPass (Items @('qt', 'protocol')) $true; "$($j.pass)|$($j.host_locked_not_judged -join ',')" } 'False|qt'
+Try-Case 'run pass: unlocked, Qt failed' { $j = Get-SandboxRunPass (Items @('qt')) $false; "$($j.pass)|$($j.host_locked_not_judged -join ',')" } 'False|'
+Try-Case 'run pass: locked, nothing failed' { $j = Get-SandboxRunPass (Items @()) $true; "$($j.pass)|$($j.host_locked_not_judged -join ',')" } 'True|'
+Try-Case 'sandbox verdict: a run not judged for a lock' { Get-SandboxVerdict @((Run1 $true $false), [ordered]@{ pass = $null; interrupted_by_sleep = $false; host_locked_not_judged = @('qt') }, (Run1 $true $false)) 3 } 'INCOMPLETE (1 run(s) not judged: the host was locked while a desktop item failed)'
+Try-Case 'sandbox verdict: an empty lock list is not a lock' { Get-SandboxVerdict @([ordered]@{ pass = $true; interrupted_by_sleep = $false; host_locked_not_judged = @() }) 1 } 'PASS'
 # ---- Fix round 3: a pinned process (N2-C1). A process this test starts itself (ping, no window)
 # is pinned at once; once it has exited, HasExited stays true on the pinned object and
 # Stop-PinnedProcess does nothing, whatever now has its pid. The identity checks refuse a

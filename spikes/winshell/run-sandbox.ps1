@@ -71,7 +71,6 @@ $RunLimitSec = 600
 $QtBarNote = 'on-screen grab only; offscreen not tested: the trimmed deploy ships no qoffscreen.dll; CI''s S0.9 covers offscreen'
 
 function Say([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
-function Beep([int]$Frequency, [int]$Ms) { [console]::Beep($Frequency, $Ms) }
 
 function Tool { Invoke-ToolAt $ToolExe @args }
 
@@ -185,8 +184,13 @@ function Assert-NoSandboxRunning {
         $ids = @(Get-WsbIds)
         if ($ids.Count -gt 0) { throw "A Windows Sandbox is already running ($($ids -join ', ')). Close it, then run this again." }
     } else {
-        $open = @(Get-Process | Where-Object { $_.Name -in 'WindowsSandbox', 'WindowsSandboxClient', 'WindowsSandboxRemoteSession' })
-        if ($open.Count -gt 0) { throw 'A Windows Sandbox is already running. Close it, then run this again.' }
+        # Processes of the previous run's Sandbox may linger a little after its shutdown: up to
+        # 30 s is allowed for them to go (scope-cut review M11), then it refuses.
+        $names = 'WindowsSandbox', 'WindowsSandboxClient', 'WindowsSandboxRemoteSession'
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Date) -lt $deadline -and @(Get-Process | Where-Object { $_.Name -in $names }).Count -gt 0) { Start-Sleep -Seconds 2 }
+        $open = @(Get-Process | Where-Object { $_.Name -in $names })
+        if ($open.Count -gt 0) { throw "A Windows Sandbox is already running ($(@($open | ForEach-Object { $_.Name } | Sort-Object -Unique) -join ', ')). Close it, then run this again." }
     }
 }
 
@@ -223,10 +227,28 @@ function Get-OwnPids($Started) {
     $fresh
 }
 
-# With the CLI and an id: that id only. Otherwise: the run's own pids.
+# With the CLI and an id: that id only. Otherwise: the run's own pinned WindowsSandbox* processes
+# (the launcher and the client it started) that are still running (scope-cut review M11). A new
+# WindowsSandbox* process that could not be pinned (another user's, such as SYSTEM's) or that
+# lingers is not counted here; Get-SandboxLingering records its name.
 function Test-SandboxRunning($Started) {
     if ($Started.id) { return @(Get-WsbIds) -contains $Started.id }
-    @(Get-OwnPids $Started).Count -gt 0
+    [void](Get-OwnPids $Started)
+    @($script:SandboxPinned | Where-Object {
+        $pp = $_
+        $alive = $false
+        try { $alive = $null -ne $pp -and -not $pp.HasExited -and $pp.ProcessName -match '^WindowsSandbox' } catch { }
+        $alive
+    }).Count -gt 0
+}
+
+# The names of the WindowsSandbox* processes that appeared after this run's start, are not pinned,
+# and still run (recorded in lifecycle.json; scope-cut review M11).
+function Get-SandboxLingering($Started) {
+    $pinnedIds = @($script:SandboxPinned | ForEach-Object { try { [int]$_.Id } catch { } })
+    @(@(Get-SandboxPids) | Where-Object { $_ -notin $Started.pids_before -and $_ -notin $pinnedIds } | ForEach-Object {
+        try { (Get-Process -Id $_ -ErrorAction Stop).ProcessName } catch { }   # read-only pid lookup: a name
+    } | Sort-Object -Unique)
 }
 
 function Start-Sandbox([string]$WsbFile) {
@@ -512,7 +534,7 @@ try {
 
     Assert-NoSandboxRunning
 
-    $summary = [ordered]@{ spike = 11; item = 'S1.9'; sandbox = $info; runs = @() }
+    $summary = [ordered]@{ spike = 11; item = 'S1.9'; sandbox = $info; runs_requested = $Runs; runs = @() }
 
     for ($run = 1; $run -le $Runs; $run++) {
         Say "---- run $run of $Runs" 'Yellow'
@@ -532,15 +554,21 @@ try {
         $procs = @()
         $startedAt = $null
         $doneAt = $null
+        # The host's lock state, sampled read-only (WTSQuerySessionInformation) through both waits
+        # (scope-cut review I2): recorded, not controlled.
+        $lockSamples = [System.Collections.Generic.List[object]]::new()
+        $sampleLock = { $lockSamples.Add([ordered]@{ t_s = [int]((Get-Date) - $t0).TotalSeconds; locked = (Get-SessionLocked) }) }
         # Ctrl+C or a throw still stops this run's Sandbox (fix round 1, M1).
         try {
             Assert-NoSandboxRunning
+            & $sampleLock
             $started = Start-Sandbox $wsbFile
             # Both waits are bounded: 120 s for started.json, $RunLimitSec for done.json.
             while (((Get-Date) - $t0).TotalSeconds -lt 120 -and -not $startedAt) {
                 if (Test-Path (Join-Path $res 'started.json')) { $startedAt = ((Get-Date) - $t0).TotalSeconds }
                 $procs += Get-SandboxProcesses
                 [void](Get-OwnPids $started)
+                & $sampleLock
                 Start-Sleep -Seconds 2
             }
             if ($startedAt) { Say ("started.json after {0:N0} s" -f $startedAt) } else { Say 'no started.json within 120 s' 'Red' }
@@ -548,6 +576,7 @@ try {
                 if (Test-Path (Join-Path $res 'done.json')) { $doneAt = ((Get-Date) - $t0).TotalSeconds }
                 $procs += Get-SandboxProcesses
                 [void](Get-OwnPids $started)
+                & $sampleLock
                 Start-Sleep -Seconds 3
             }
             $stop = Stop-Sandbox $started
@@ -569,6 +598,11 @@ try {
             }
             done_s = $doneAt; stop = $stop; start_to_closed_s = [int]$closedAt
             process_names = @($procs | Sort-Object -Unique)
+            lingering_after_stop = $(if ($started) { @(Get-SandboxLingering $started) } else { @() })
+            host_locked_at_start = $(if ($lockSamples.Count -gt 0) { $lockSamples[0].locked } else { $null })
+            host_locked_any = (@($lockSamples | Where-Object { $_.locked -eq $true }).Count -gt 0)
+            host_lock_unknown_samples = @($lockSamples | Where-Object { $null -eq $_.locked }).Count
+            host_locked_samples = @($lockSamples)
         }
         $detected = $lifecycle.detection.wsb_list_ok -or ($startedAt -and $startedAt -le 120)
         $stopped = $stop.method -ne 'none worked'
@@ -578,19 +612,21 @@ try {
 
         $items = Judge-Run $res
         $items['lifecycle'] = [ordered]@{ pass = $lifecyclePass; file = $lifecycle }
-        $runPass = @($items.Values | Where-Object { $_.Contains('pass') -and -not $_.pass }).Count -eq 0
+        $judgement = Get-SandboxRunPass $items $lifecycle.host_locked_any
         # A run during which the PC slept says nothing about the Sandbox (review N-I1).
         $sleep = Get-RunSleep $t0ms ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $interrupted = $sleep.slept
         if ($interrupted) { Say '  interrupted by sleep: this run is not judged' 'Yellow' }
-        $summary.runs += [ordered]@{ run = $run; pass = $(if ($interrupted) { $null } else { $runPass }); interrupted_by_sleep = $interrupted; sleep = $sleep; items = $items }
+        if ($lifecycle.host_locked_any) { Say '  the host was locked during this run (recorded in lifecycle.json)' 'Yellow' }
+        if (@($judgement.host_locked_not_judged).Count -gt 0) { Say "  host locked: not judged for $(@($judgement.host_locked_not_judged) -join ', ')" 'Yellow' }
+        $summary.runs += [ordered]@{ run = $run; pass = $(if ($interrupted) { $null } else { $judgement.pass }); interrupted_by_sleep = $interrupted; host_locked_any = $lifecycle.host_locked_any; host_locked_not_judged = @($judgement.host_locked_not_judged); sleep = $sleep; items = $items }
 
         $keep = Join-Path $ResultsRoot "sandbox\run-$run"
         New-EmptyDir $keep
         Copy-Item (Join-Path $res '*') $keep -Recurse -Force
         foreach ($k in $items.Keys) {
             $v = $items[$k]
-            $text = if ($v.Contains('pass')) { if ($v.pass) { 'PASS' } else { 'FAIL' } } else { 'recorded' }
+            $text = if ($v.Contains('pass')) { if ($v.pass) { 'PASS' } elseif ($k -in @($judgement.host_locked_not_judged)) { 'host locked: not judged' } else { 'FAIL' } } else { 'recorded' }
             Say ("  {0,-11} {1}" -f $k, $text) $(if ($text -eq 'FAIL') { 'Red' } elseif ($text -eq 'PASS') { 'Green' } else { 'Gray' })
         }
         Say ("  start to closed: {0:N0} s; stop: {1}" -f $closedAt, $stop.method)
@@ -598,10 +634,11 @@ try {
 }
 finally {
     $hp = Stop-HostPowerWatch
-    Stop-AllPopups
     if ($null -ne $summary) {
-        $summary.verdict = Get-SandboxVerdict @($summary.runs)
-        $summary.pass = $summary.verdict -eq 'PASS'
+        $v = Get-SandboxVerdict @($summary.runs) $Runs
+        $summary.pass = $v -eq 'PASS'
+        # The Qt bar is half-tested here (scope-cut review M6): the verdict says so itself.
+        $summary.verdict = $(if ($summary.pass) { 'PASS (Qt: on-screen grab only; offscreen not tested)' } else { $v })
         $summary.qt_bar = $QtBarNote
         $summary.host_power = $hp; $summary.host_kept_awake = [bool]$KeepAwake
         $summary | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8 (Join-Path $ResultsRoot 'sandbox-checks.json')

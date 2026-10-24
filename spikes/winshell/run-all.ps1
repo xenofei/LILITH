@@ -91,12 +91,17 @@ if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 
 # Part C can start only with the Sandbox feature on and Task 0's deploy folder found. When it
 # can't, the run goes ahead with Part B and leaves Part C out (it prints why).
 if ($withSandbox) {
-    $pf = (& pwsh -NoProfile -File (Join-Path $Spike 'run-sandbox.ps1') -Preflight @sandboxArgs @simArg) | Out-String | ConvertFrom-Json
+    $pf = (& pwsh -NoProfile -NonInteractive -File (Join-Path $Spike 'run-sandbox.ps1') -Preflight @sandboxArgs @simArg) | Out-String | ConvertFrom-Json
     if (-not [bool]$pf.ready) {
         Say 'Part C (Windows Sandbox) cannot start, so this run leaves it out:' 'Yellow'
         foreach ($w in @($pf.why)) { Say "  - $w" 'Yellow' }
         foreach ($t in @($pf.task0_worktrees_with_a_deploy)) { Say "  To include it, add:  -Task0Repo `"$t`"" 'Yellow' }
         $stages = @($stages | Where-Object { $_.script -ne 'run-sandbox.ps1' })
+        # A run that would run nothing is not a success (scope-cut review M10).
+        if ($stages.Count -eq 0) {
+            Say 'Nothing to run: S1.9 cannot start (above), and no other check was asked for.' 'Red'
+            exit 2
+        }
     } else {
         Say "Task 0's app: $($pf.deploy.path)\$($pf.qt_exe) (from $($pf.deploy.from))"
     }
@@ -114,7 +119,10 @@ $outcomes = @()
 foreach ($s in $stages) {
     Write-Host ''
     Say ("######## {0} ({1:HH:mm})" -f $s.name, (Get-Date)) 'Yellow'
-    & pwsh -NoProfile -File (Join-Path $Spike $s.script) @($s.args) @simArg
+    # Non-interactive (scope-cut review M7), so a prompt nobody foresaw is an error, not a wait.
+    # Part B's run-spike.ps1 asks the owner by design, so it alone is left interactive (-PartB).
+    $ni = @(if ($s.script -ne 'run-spike.ps1') { '-NonInteractive' })
+    & pwsh -NoProfile @ni -File (Join-Path $Spike $s.script) @($s.args) @simArg
     $outcomes += [ordered]@{ stage = $s.name; exit = $LASTEXITCODE }
     if ($LASTEXITCODE -ne 0) { Say "$($s.name) ended with exit code $LASTEXITCODE; going on with the next part." 'Red' }
 }
