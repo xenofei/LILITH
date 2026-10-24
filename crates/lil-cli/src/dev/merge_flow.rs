@@ -30,6 +30,12 @@ pub const NO_AUDIT: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Facts {
     pub pr: u64,
+    /// The PR's title, its author's login, its base branch and its head branch, as GitHub
+    /// reports them (shown only).
+    pub title: String,
+    pub author: String,
+    pub base_ref: String,
+    pub head_ref: String,
     /// The PR's head commit everything was checked on.
     pub head: String,
     /// The files the PR changes against `origin/main`.
@@ -48,9 +54,20 @@ fn short(sha: &str) -> &str {
 
 /// The facts as you read them.
 pub fn render_facts(facts: &Facts) -> String {
+    let given = |s: &str| {
+        if s.is_empty() {
+            "(not given)".to_string()
+        } else {
+            s.to_string()
+        }
+    };
     let mut out = format!(
-        "PR #{} at {} (head commit {})\n",
+        "PR #{}: {}\nAuthor: {}\nInto {} from {}, at {} (head commit {})\n",
         facts.pr,
+        given(&facts.title),
+        given(&facts.author),
+        given(&facts.base_ref),
+        given(&facts.head_ref),
         short(&facts.head),
         facts.head
     );

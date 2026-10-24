@@ -101,6 +101,8 @@ features = [
     "Win32_System_WinRT",
     # QueryUnbiasedInterruptTime: the sleep record's monotonic clock (ARCH-127, Task 9).
     "Win32_System_WindowsProgramming",
+    # EnableWindow and SetFocus: the Windows Hello window's Merge / Deny buttons (Task 28).
+    "Win32_UI_Input_KeyboardAndMouse",
     # Also SHQueryUserNotificationState (fullscreen, CORE-160), IShellLinkW and
     # FOLDERID_Programs (the AUMID shortcut).
     "Win32_UI_Shell",

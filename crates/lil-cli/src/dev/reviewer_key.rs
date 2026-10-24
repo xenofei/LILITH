@@ -27,7 +27,7 @@ pub const MAX_WORK_FACTOR: u8 = 20;
 
 pub const DAMAGED_KEY: &str = "the key file is damaged or not an age passphrase file";
 
-/// Why a key file could not be decrypted, or the key not unlocked (Task 28 added the last two).
+/// Why a key file could not be decrypted, or the key not unlocked (Task 28 added the last three).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyError {
     WrongPassphrase,
@@ -36,6 +36,9 @@ pub enum KeyError {
     Cancelled,
     /// Windows Hello couldn't unlock the key: a failed call, or a Hello file it doesn't open.
     Unavailable,
+    /// You chose "Deny" in the LILITH window, closed it, or chose nothing in time: a refusal,
+    /// never a reason to ask for the passphrase instead (Task 28 fix round 2).
+    Denied,
 }
 
 impl fmt::Display for KeyError {
@@ -45,6 +48,9 @@ impl fmt::Display for KeyError {
             KeyError::Damaged => DAMAGED_KEY,
             KeyError::Cancelled => "the Windows Hello prompt was cancelled",
             KeyError::Unavailable => "Windows Hello couldn't unlock the reviewer key",
+            KeyError::Denied => {
+                "you didn't confirm it in the LILITH window (Deny, closed, or no choice in time)"
+            }
         })
     }
 }

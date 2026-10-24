@@ -115,12 +115,23 @@ enum Answer {
     TimedOut,
 }
 
+/// What the owner clicks in the LILITH window that asks before Windows Hello (fix round 2).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Click {
+    Accept,
+    Deny,
+    Close,
+    /// Nothing within the 120 s.
+    Nothing,
+}
+
 struct FakeHello {
     log: Log,
     supported: bool,
     tpm: bool,
     kek: [u8; 32],
     answer: Answer,
+    click: Click,
     remove_fails: bool,
     /// What the window that owns each prompt showed.
     shown: RefCell<Vec<String>>,
@@ -134,6 +145,7 @@ impl FakeHello {
             tpm: true,
             kek: KEK,
             answer: Answer::Ok,
+            click: Click::Accept,
             remove_fails: false,
             shown: RefCell::default(),
         }
@@ -146,19 +158,46 @@ impl FakeHello {
         }
     }
 
+    fn clicking(log: &Log, click: Click) -> Self {
+        Self {
+            click,
+            ..Self::new(log)
+        }
+    }
+
     fn note(&self, what: String) {
         self.log.borrow_mut().push(what);
     }
 
-    fn prompt(&self, shown: &str) -> io::Result<()> {
+    /// The window, as `lil_platform::hello::ask_then` runs it: in front first, then the click,
+    /// and only after an accept click Windows Hello (logged as `hello:kek_derive`).
+    fn window(&self, shown: &str, accept: Option<&str>) -> io::Result<()> {
         self.shown.borrow_mut().push(shown.to_string());
+        if self.answer == Answer::NotInFront {
+            return Err(io::Error::other(
+                "the Windows Hello window couldn't be brought to the front of the other windows",
+            ));
+        }
+        let Some(label) = accept else {
+            return Ok(());
+        };
+        self.note(format!("window:{label}"));
+        let why = match self.click {
+            Click::Accept => return Ok(()),
+            Click::Deny => "you chose Deny",
+            Click::Close => "the LILITH window was closed",
+            Click::Nothing => "nothing was chosen in the LILITH window in time",
+        };
+        self.note(format!("window:refused {:?}", self.click));
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
+    }
+
+    fn prompt(&self) -> io::Result<()> {
         match self.answer {
             Answer::Ok => Ok(()),
             Answer::Cancel => Err(io::Error::new(io::ErrorKind::Interrupted, "UserCanceled")),
             Answer::Fail => Err(io::Error::other("SecurityDeviceLocked")),
-            Answer::NotInFront => Err(io::Error::other(
-                "the Windows Hello window couldn't be brought to the front of the other windows",
-            )),
+            Answer::NotInFront => unreachable!("handled by `window`"),
             Answer::TimedOut => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the Windows Hello prompt wasn't answered within 120 s, so it was cancelled",
@@ -176,19 +215,22 @@ impl HelloPlatform for FakeHello {
     }
     fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()> {
         self.note(format!("hello:kek_enroll {credential}"));
-        self.prompt(shown)
+        self.window(shown, None)?;
+        self.prompt()
     }
     fn kek_derive(
         &self,
         credential: &str,
         challenge: &[u8; 32],
         shown: &str,
+        accept: Option<&str>,
     ) -> io::Result<Zeroizing<[u8; 32]>> {
+        self.window(shown, accept)?;
         self.note(format!(
             "hello:kek_derive {credential} {:02x}",
             challenge[0]
         ));
-        self.prompt(shown)?;
+        self.prompt()?;
         Ok(Zeroizing::new(self.kek))
     }
     fn kek_remove(&self, credential: &str) -> io::Result<()> {
@@ -244,7 +286,13 @@ fn unlock_like_approve(
     let say = |t: &str| said.borrow_mut().push(t.to_string());
     let key = home.key();
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, ask);
-    let enrolled = enrolled_hello(&home.profile, hello, "LILITH: approve PR #42", &say);
+    let enrolled = enrolled_hello(
+        &home.profile,
+        hello,
+        "LILITH: approve PR #42",
+        Some("Approve"),
+        &say,
+    );
     unlock_reviewer_key(
         enrolled.as_ref().map(|h| h as &dyn Unlocker),
         &passphrase,
@@ -415,7 +463,13 @@ fn approve_uses_hello_when_enrolled() {
     let said = RefCell::new(Vec::new());
     let pem = unlock_like_approve(&home, &hello, &never_asked, &said).unwrap();
     assert_eq!(&pem[..], PEM);
-    assert_eq!(events(&l), [format!("hello:kek_derive {CREDENTIAL} 5a")]);
+    assert_eq!(
+        events(&l),
+        [
+            "window:Approve".to_string(),
+            format!("hello:kek_derive {CREDENTIAL} 5a")
+        ]
+    );
 
     // Not enrolled: the passphrase, and Windows Hello is never asked.
     let home = Home::with_key();
@@ -480,7 +534,7 @@ fn a_prompt_that_cannot_come_to_the_front_falls_back_or_refuses() {
         // At a terminal: the passphrase.
         let l = log();
         let hello = FakeHello::answering(&l, answer);
-        let enrolled = enrolled_hello(&home.profile, &hello, "m", &quiet).unwrap();
+        let enrolled = enrolled_hello(&home.profile, &hello, "m", Some("Merge"), &quiet).unwrap();
         let ask = asks(&l, PASS);
         let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &ask);
         let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
@@ -492,7 +546,7 @@ fn a_prompt_that_cannot_come_to_the_front_falls_back_or_refuses() {
         let hello = FakeHello::answering(&l, answer);
         let said = RefCell::new(Vec::new());
         let say = |t: &str| said.borrow_mut().push(t.to_string());
-        let enrolled = enrolled_hello(&home.profile, &hello, "m", &say).unwrap();
+        let enrolled = enrolled_hello(&home.profile, &hello, "m", Some("Merge"), &say).unwrap();
         let no_terminal = NoTerminal { say: &say };
         let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &no_terminal, &say);
         assert_eq!(
@@ -515,7 +569,14 @@ fn the_window_that_owns_the_prompt_shows_the_summary_and_the_audit() {
     let key = home.key();
     let l = log();
     let hello = FakeHello::new(&l);
-    let enrolled = enrolled_hello(&home.profile, &hello, "LILITH: merge PR #42", &quiet).unwrap();
+    let enrolled = enrolled_hello(
+        &home.profile,
+        &hello,
+        "LILITH: merge PR #42",
+        Some("Merge"),
+        &quiet,
+    )
+    .unwrap();
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &never_asked);
     let render = |t: &str| t.replace('\u{1b}', "\\u{1b}");
     let shown_in_terminal = RefCell::new(Vec::new());
@@ -531,7 +592,10 @@ fn the_window_that_owns_the_prompt_shows_the_summary_and_the_audit() {
     assert!(window.contains(&format!("{QUOTE}AUDIT LINE 1")), "{window}");
     assert!(window.contains(&format!("{QUOTE}AUDIT LINE 2")), "{window}");
     // The terminal shows the same text.
-    assert_eq!(shown_in_terminal.borrow().as_slice(), std::slice::from_ref(window));
+    assert_eq!(
+        shown_in_terminal.borrow().as_slice(),
+        std::slice::from_ref(window)
+    );
 }
 
 /// M9: the agent's summary and the audit can't pass for lil's own lines.
@@ -590,6 +654,10 @@ impl FakeSteps {
             log: log.clone(),
             facts: Facts {
                 pr: 42,
+                title: "Add the thing".into(),
+                author: "an-agent".into(),
+                base_ref: "main".into(),
+                head_ref: "p4a-t28-hello".into(),
                 head: "1234567890abcdef1234567890abcdef12345678".into(),
                 files: vec!["crates/lil-cli/src/dev/merge.rs".into(), "README.md".into()],
                 protected: protected.iter().map(|s| s.to_string()).collect(),
@@ -666,7 +734,14 @@ fn no_network_call_before_the_key_is_unlocked() {
     let hello = FakeHello::new(&l);
     let key = home.key();
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &never_asked);
-    let enrolled = enrolled_hello(&home.profile, &hello, "LILITH: merge PR #42", &quiet).unwrap();
+    let enrolled = enrolled_hello(
+        &home.profile,
+        &hello,
+        "LILITH: merge PR #42",
+        Some("Merge"),
+        &quiet,
+    )
+    .unwrap();
     let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
     let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
     merge_flow("the change", "the audit", &steps, &auth).unwrap();
@@ -674,6 +749,7 @@ fn no_network_call_before_the_key_is_unlocked() {
         events(&l),
         [
             "steps:facts".to_string(),
+            "window:Merge".into(),
             format!("hello:kek_derive {CREDENTIAL} 5a"),
             "steps:post_approval 42".into(),
             "steps:wait_for_checks rerun=true".into(),
@@ -686,7 +762,14 @@ fn no_network_call_before_the_key_is_unlocked() {
     let hello = FakeHello::answering(&l, Answer::Fail);
     let wrong = asks(&l, "not it");
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &wrong);
-    let enrolled = enrolled_hello(&home.profile, &hello, "LILITH: merge PR #42", &quiet).unwrap();
+    let enrolled = enrolled_hello(
+        &home.profile,
+        &hello,
+        "LILITH: merge PR #42",
+        Some("Merge"),
+        &quiet,
+    )
+    .unwrap();
     let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
     let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
     assert!(merge_flow("the change", "the audit", &steps, &auth).is_err());
@@ -694,6 +777,7 @@ fn no_network_call_before_the_key_is_unlocked() {
         events(&l),
         [
             "steps:facts".to_string(),
+            "window:Merge".into(),
             format!("hello:kek_derive {CREDENTIAL} 5a"),
             "passphrase:asked".into(),
         ]
@@ -856,6 +940,10 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
         assert!(summary.contains("1234567"), "{summary}");
         assert!(summary.contains("README.md"), "{summary}");
         assert!(summary.contains("every-push"), "{summary}");
+        // Fix round 2: the title, author, base and head branch, as GitHub reports them.
+        for detail in ["Add the thing", "an-agent", "main", "p4a-t28-hello"] {
+            assert!(summary.contains(detail), "{detail}: {summary}");
+        }
         for p in protected {
             assert!(summary.contains(p), "{summary}");
         }
@@ -881,7 +969,7 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
     let hello = FakeHello::new(&l);
     let key = home.key();
     let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &never_asked);
-    let enrolled = enrolled_hello(&home.profile, &hello, "m", &quiet).unwrap();
+    let enrolled = enrolled_hello(&home.profile, &hello, "m", Some("Merge"), &quiet).unwrap();
     let shown = |t: &str| l.borrow_mut().push(format!("shown:{t}"));
     let auth = KeyAuthenticator::new(&shown, &as_is, Some(&enrolled), &passphrase, &quiet);
     auth.authenticate("SUMMARY TEXT", "AUDIT TEXT").unwrap();
@@ -891,7 +979,8 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
         e[0].contains("SUMMARY TEXT") && e[0].contains("AUDIT TEXT"),
         "{e:?}"
     );
-    assert!(e[1].starts_with("hello:kek_derive"), "{e:?}");
+    assert_eq!(e[1], "window:Merge", "{e:?}");
+    assert!(e[2].starts_with("hello:kek_derive"), "{e:?}");
 }
 
 #[test] // spec: QA-036
@@ -945,4 +1034,67 @@ fn dev_merge_asks_for_authentication_on_every_merge() {
             .unwrap_err();
         assert!(e.contains("nothing was merged"), "{e}");
     }
+}
+
+/// Fix round 2: Windows Hello Face can complete a prompt with no deliberate act, so the LILITH
+/// window asks first ("Merge" / "Approve", or "Deny"). "Deny", closing the window or no choice in
+/// time refuses outright: Windows Hello is never raised, the passphrase is never asked, and
+/// nothing is approved or merged.
+#[test] // spec: QA-036, QA-088
+fn deny_close_or_no_choice_refuses_and_never_raises_windows_hello() {
+    for click in [Click::Deny, Click::Close, Click::Nothing] {
+        let home = Home::with_key();
+        enroll_kek(&home, &FakeHello::new(&log()));
+        let key = home.key();
+
+        // The merge flow: only the read-only facts happen.
+        let l = log();
+        let hello = FakeHello::clicking(&l, click);
+        let enrolled = enrolled_hello(&home.profile, &hello, "m", Some("Merge"), &quiet).unwrap();
+        // A terminal is there, but a refusal is not a reason to ask for the passphrase.
+        let ask = asks(&l, PASS);
+        let passphrase = PassphraseUnlocker::new(&key.encrypted_pem, &ask);
+        let auth = KeyAuthenticator::new(&quiet, &as_is, Some(&enrolled), &passphrase, &quiet);
+        let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
+        let e = format!("{:#}", merge_flow("s", "a", &steps, &auth).unwrap_err());
+        assert!(
+            e.contains("nothing was approved or merged"),
+            "{click:?}: {e}"
+        );
+        assert_eq!(
+            events(&l),
+            [
+                "steps:facts".to_string(),
+                "window:Merge".into(),
+                format!("window:refused {click:?}"),
+            ],
+            "{click:?}"
+        );
+
+        // `lil dev approve`'s unlock: the same refusal.
+        let l = log();
+        let hello = FakeHello::clicking(&l, click);
+        let r = unlock_like_approve(&home, &hello, &asks(&l, PASS), &RefCell::default());
+        assert_eq!(r.unwrap_err(), KeyError::Denied, "{click:?}");
+        assert!(
+            !events(&l).iter().any(|e| e.starts_with("hello:")),
+            "{click:?}"
+        );
+        assert!(!events(&l).contains(&"passphrase:asked".to_string()));
+    }
+
+    // "Merge": the window first, then Windows Hello.
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let l = log();
+    let hello = FakeHello::clicking(&l, Click::Accept);
+    let said = RefCell::new(Vec::new());
+    unlock_like_approve(&home, &hello, &never_asked, &said).unwrap();
+    assert_eq!(
+        events(&l),
+        [
+            "window:Approve".to_string(),
+            format!("hello:kek_derive {CREDENTIAL} 5a")
+        ]
+    );
 }

@@ -12,7 +12,11 @@
 //! **In front, or not at all (QA-088).** [`kek_enroll`] and [`kek_derive`] open an
 //! [`OwnerWindow`] that shows what you are confirming, bring it to the front, and refuse when it
 //! didn't get there ([`front_or_refuse`]); the caller then asks for the passphrase. Every
-//! prompt is cancelled after [`HELLO_WAIT`] ([`wait_bounded`]).
+//! prompt is cancelled after [`HELLO_WAIT`] ([`wait_bounded`]). With an accept label ("Merge",
+//! "Approve"), [`kek_derive`]'s window has that button and "Deny", and Windows Hello is raised
+//! only after the accept click ([`ask_then`]); "Deny", closing the window or no choice within
+//! [`HELLO_WAIT`] refuses with `PermissionDenied` (Task 28 fix round 2: Windows Hello Face can
+//! complete a prompt with no deliberate act).
 //!
 //! **Placement (P4a-R38).** The owner's rule is that the prompt comes to the front of every
 //! application, a fullscreen one included. Spike 11 showed that an unowned create prompt and a
@@ -55,14 +59,15 @@ use windows::Win32::Security::Cryptography::{
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::System::TpmBaseServices::{TPM_DEVICE_INFO, Tbsi_GetDeviceInfo};
 use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL, FLASHW_TIMERNOFG,
-    FLASHWINFO, FlashWindowEx, GetClientRect, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL,
-    SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_STYLE, WM_CLOSE,
-    WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_OVERLAPPED,
-    WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    FLASHWINFO, FlashWindowEx, GetClientRect, GetDlgItem, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, HMENU, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, Interface, w};
 use windows_future::IAsyncOperation;
@@ -445,27 +450,106 @@ pub fn front_or_refuse(raise: Raise) -> io::Result<()> {
     }
 }
 
-/// Opens an [`OwnerWindow`] showing `shown`, brings it to the front, and runs `call` with it
-/// only when it got there ([`front_or_refuse`]).
-fn in_front<T>(shown: &str, call: impl FnOnce(isize) -> io::Result<T>) -> io::Result<T> {
-    let window = OwnerWindow::open("LILITH: Windows Hello", shown)?;
-    front_or_refuse(window.bring_to_front())?;
-    call(window.hwnd())
+/// What you chose in an [`OwnerWindow`] that asks (Task 28 fix round 2): Windows Hello Face can
+/// complete a prompt with no deliberate act, so a merge's or an approval's prompt is raised
+/// only after you clicked its accept button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// The accept button ("Merge", "Approve").
+    Accepted,
+    /// "Deny".
+    Denied,
+    /// The window was closed.
+    Closed,
+    /// Nothing was chosen within [`HELLO_WAIT`].
+    TimedOut,
+}
+
+/// Waits until `read()` gives a choice, for at most `timeout`. Pure over its closures.
+pub fn wait_for_choice(
+    read: &dyn Fn() -> Option<Choice>,
+    timeout: Duration,
+    pause: &dyn Fn(Duration),
+) -> Choice {
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(choice) = read() {
+            return choice;
+        }
+        if waited >= timeout {
+            return Choice::TimedOut;
+        }
+        pause(HELLO_POLL);
+        waited += HELLO_POLL;
+    }
+}
+
+/// Only [`Choice::Accepted`] goes on; anything else refuses with `PermissionDenied`, which
+/// the caller treats as a refusal, not as a reason to ask for the passphrase. Pure.
+pub fn choice_or_refuse(choice: Choice) -> io::Result<()> {
+    let why = match choice {
+        Choice::Accepted => return Ok(()),
+        Choice::Denied => "you chose Deny",
+        Choice::Closed => "the LILITH window was closed",
+        Choice::TimedOut => "nothing was chosen in the LILITH window in time",
+    };
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
+}
+
+/// The order every asking prompt keeps (pure): the window in front ([`front_or_refuse`]), then
+/// your choice ([`choice_or_refuse`]), and only then `call`, which raises Windows Hello.
+pub fn ask_then<T>(
+    raise: Raise,
+    choose: impl FnOnce() -> Choice,
+    call: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    front_or_refuse(raise)?;
+    choice_or_refuse(choose())?;
+    call()
+}
+
+/// Opens an [`OwnerWindow`] showing `shown` and brings it to the front. With `accept`, it has
+/// that button and "Deny", and `call` runs only after you clicked `accept` ([`ask_then`]);
+/// without, `call` runs as soon as the window is in front ([`front_or_refuse`]).
+fn in_front<T>(
+    shown: &str,
+    accept: Option<&str>,
+    call: impl FnOnce(isize) -> io::Result<T>,
+) -> io::Result<T> {
+    let window = match accept {
+        Some(label) => OwnerWindow::open_asking("LILITH: Windows Hello", shown, label)?,
+        None => OwnerWindow::open("LILITH: Windows Hello", shown)?,
+    };
+    let raise = window.bring_to_front();
+    match accept {
+        Some(_) => ask_then(
+            raise,
+            || window.wait_choice(HELLO_WAIT),
+            || call(window.hwnd()),
+        ),
+        None => {
+            front_or_refuse(raise)?;
+            call(window.hwnd())
+        }
+    }
 }
 
 /// [`kek_enroll_for_window`], owned by an [`OwnerWindow`] in front that shows `shown`.
 pub fn kek_enroll(credential: &str, shown: &str) -> io::Result<()> {
-    in_front(shown, |hwnd| kek_enroll_for_window(hwnd, credential))
+    in_front(shown, None, |hwnd| kek_enroll_for_window(hwnd, credential))
 }
 
 /// [`kek_derive_for_window`], owned by an [`OwnerWindow`] in front that shows `shown` (for a
-/// merge, the summary and the audit, P4a-R38).
+/// merge, the summary and the audit, P4a-R38). With `accept` ("Merge", "Approve"), Windows
+/// Hello is asked only after you clicked it; "Deny", closing the window or no choice within
+/// [`HELLO_WAIT`] refuses (`PermissionDenied`).
 pub fn kek_derive(
     credential: &str,
     challenge: &[u8; 32],
     shown: &str,
+    accept: Option<&str>,
 ) -> io::Result<Zeroizing<[u8; 32]>> {
-    in_front(shown, |hwnd| {
+    in_front(shown, accept, |hwnd| {
         kek_derive_for_window(hwnd, credential, challenge)
     })
 }
@@ -579,24 +663,63 @@ impl Raise {
     }
 }
 
-/// A plain top-level window that owns a Windows Hello prompt and shows `body` (read-only). It
-/// runs on its own thread with a message loop, so it stays responsive while the caller waits
-/// on Windows Hello; it closes when this is dropped.
+/// A plain top-level window that owns a Windows Hello prompt and shows `body` (read-only),
+/// optionally with an accept button and "Deny" ([`OwnerWindow::open_asking`]). It runs on its
+/// own thread with a message loop, so it stays responsive while the caller waits; it closes
+/// when this is dropped.
 pub struct OwnerWindow {
     hwnd: isize,
     thread: Option<JoinHandle<()>>,
 }
 
+/// The accept button's control id.
+const ID_ACCEPT: usize = 1;
+/// "Deny"'s control id.
+const ID_DENY: usize = 2;
+
+/// The choices made in this process's asking windows, by window handle. Written on the window's
+/// thread, read by [`OwnerWindow::wait_choice`]; an entry goes when its window is dropped.
+static CHOICES: std::sync::Mutex<Vec<(isize, Choice)>> = std::sync::Mutex::new(Vec::new());
+
+fn record_choice(hwnd: HWND, choice: Choice) {
+    let mut choices = CHOICES.lock().unwrap_or_else(|e| e.into_inner());
+    let key = hwnd.0 as isize;
+    // The first choice stands: closing the window after "Merge" doesn't undo it.
+    if !choices.iter().any(|(h, _)| *h == key) {
+        choices.push((key, choice));
+    }
+}
+
+fn choice_of(hwnd: isize) -> Option<Choice> {
+    CHOICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| *h == hwnd)
+        .map(|(_, c)| *c)
+}
+
 impl OwnerWindow {
     /// Opens the window, shown but not yet brought to the front.
     pub fn open(title: &str, body: &str) -> io::Result<Self> {
+        Self::open_with(title, body, None)
+    }
+
+    /// The same window with two buttons at the bottom, `accept` and "Deny"
+    /// ([`OwnerWindow::wait_choice`]).
+    pub fn open_asking(title: &str, body: &str, accept: &str) -> io::Result<Self> {
+        Self::open_with(title, body, Some(accept))
+    }
+
+    fn open_with(title: &str, body: &str, accept: Option<&str>) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel::<io::Result<isize>>();
         let title = HSTRING::from(title);
         // An EDIT control wants CRLF line ends.
         let body = HSTRING::from(body.replace("\r\n", "\n").replace('\n', "\r\n"));
+        let accept = accept.map(HSTRING::from);
         let thread = std::thread::Builder::new()
             .name("hello-owner-window".into())
-            .spawn(move || window_thread(&title, &body, &tx))?;
+            .spawn(move || window_thread(&title, &body, accept.as_ref(), &tx))?;
         match rx.recv() {
             Ok(Ok(hwnd)) => Ok(Self {
                 hwnd,
@@ -616,6 +739,12 @@ impl OwnerWindow {
     /// The window handle, for the `*_for_window` calls.
     pub fn hwnd(&self) -> isize {
         self.hwnd
+    }
+
+    /// Waits for a click on the accept button or "Deny", or the window's closing, for at most
+    /// `timeout` ([`wait_for_choice`]).
+    pub fn wait_choice(&self, timeout: Duration) -> Choice {
+        wait_for_choice(&|| choice_of(self.hwnd), timeout, &std::thread::sleep)
     }
 
     /// Brings the window to the front without any synthetic input: `SetForegroundWindow`, then
@@ -677,10 +806,22 @@ impl Drop for OwnerWindow {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        CHOICES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(h, _)| *h != self.hwnd);
     }
 }
 
-fn window_thread(title: &HSTRING, body: &HSTRING, tx: &mpsc::Sender<io::Result<isize>>) {
+/// The height of the button row, in pixels.
+const BUTTON_ROW: i32 = 48;
+
+fn window_thread(
+    title: &HSTRING,
+    body: &HSTRING,
+    accept: Option<&HSTRING>,
+    tx: &mpsc::Sender<io::Result<isize>>,
+) {
     // SAFETY: standard window creation and a message loop on this thread; the strings outlive
     // the calls that borrow them.
     unsafe {
@@ -700,7 +841,7 @@ fn window_thread(title: &HSTRING, body: &HSTRING, tx: &mpsc::Sender<io::Result<i
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             720,
-            480,
+            520,
             None,
             None,
             None,
@@ -712,8 +853,18 @@ fn window_thread(title: &HSTRING, body: &HSTRING, tx: &mpsc::Sender<io::Result<i
                 return;
             }
         };
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let set_font = |control: HWND| {
+            SendMessageW(
+                control,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        };
         let mut client = windows::Win32::Foundation::RECT::default();
         let _ = GetClientRect(hwnd, &mut client);
+        let row = if accept.is_some() { BUTTON_ROW } else { 0 };
         let edit_style = WINDOW_STYLE(
             WS_CHILD.0
                 | WS_VISIBLE.0
@@ -730,19 +881,42 @@ fn window_thread(title: &HSTRING, body: &HSTRING, tx: &mpsc::Sender<io::Result<i
             8,
             8,
             client.right - 16,
-            client.bottom - 16,
+            client.bottom - 16 - row,
             Some(hwnd),
             None,
             None,
             None,
         ) {
-            let font = GetStockObject(DEFAULT_GUI_FONT);
-            SendMessageW(
-                edit,
-                WM_SETFONT,
-                Some(WPARAM(font.0 as usize)),
-                Some(LPARAM(1)),
-            );
+            set_font(edit);
+            // The read-only text has the focus, so a stray Space or Enter clicks nothing.
+            let _ = SetFocus(Some(edit));
+        }
+        if let Some(accept) = accept {
+            // Plain push buttons, neither the default: only a deliberate click chooses.
+            let button = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0);
+            let (w, h) = (110, 30);
+            let y = client.bottom - 8 - h;
+            for (label, id, x) in [
+                (accept, ID_ACCEPT, client.right - 2 * (w + 8)),
+                (&HSTRING::from("Deny"), ID_DENY, client.right - (w + 8)),
+            ] {
+                if let Ok(b) = CreateWindowExW(
+                    Default::default(),
+                    w!("BUTTON"),
+                    label,
+                    button,
+                    x,
+                    y,
+                    w,
+                    h,
+                    Some(hwnd),
+                    Some(HMENU(id as *mut c_void)),
+                    None,
+                    None,
+                ) {
+                    set_font(b);
+                }
+            }
         }
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = tx.send(Ok(hwnd.0 as isize));
@@ -758,7 +932,26 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
     // SAFETY: the window procedure of this module's own class.
     unsafe {
         match msg {
+            WM_COMMAND => {
+                // A button click: the low word is the control id.
+                let choice = match wp.0 & 0xffff {
+                    ID_ACCEPT => Some(Choice::Accepted),
+                    ID_DENY => Some(Choice::Denied),
+                    _ => None,
+                };
+                if let Some(choice) = choice {
+                    record_choice(hwnd, choice);
+                    // One choice only: both buttons go grey.
+                    for id in [ID_ACCEPT, ID_DENY] {
+                        if let Ok(b) = GetDlgItem(Some(hwnd), id as i32) {
+                            let _ = EnableWindow(b, false);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
+                record_choice(hwnd, Choice::Closed);
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
@@ -836,5 +1029,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(HELLO_WAIT, Duration::from_secs(120));
+    }
+
+    /// Fix round 2: Windows Hello is raised only after "Merge" / "Approve"; "Deny", closing the
+    /// window or no choice in time refuses, and a window not in front never asks at all.
+    #[test] // spec: QA-088, QA-036
+    fn windows_hello_is_raised_only_after_the_accept_click() {
+        use std::cell::Cell;
+        let called = Cell::new(false);
+        let call = || {
+            called.set(true);
+            Ok(())
+        };
+        ask_then(Raise::SetForeground, || Choice::Accepted, call).unwrap();
+        assert!(called.get());
+
+        for refused in [Choice::Denied, Choice::Closed, Choice::TimedOut] {
+            let called = Cell::new(false);
+            let e = ask_then(
+                Raise::AlreadyInFront,
+                || refused,
+                || {
+                    called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(!called.get(), "Windows Hello was raised after {refused:?}");
+            // A refusal, not a reason to fall back to the passphrase.
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{refused:?}");
+        }
+
+        // Not in front: nobody is asked, Hello isn't raised, and it isn't a refusal.
+        let asked = Cell::new(false);
+        let e = ask_then(
+            Raise::NotInFront,
+            || {
+                asked.set(true);
+                Choice::Accepted
+            },
+            || -> io::Result<()> { panic!("Windows Hello was raised behind other windows") },
+        )
+        .unwrap_err();
+        assert!(!asked.get());
+        assert_ne!(e.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test] // spec: QA-088
+    fn a_choice_not_made_in_time_is_a_timeout() {
+        use std::cell::Cell;
+        let waited = Cell::new(Duration::ZERO);
+        let choice = wait_for_choice(&|| None, Duration::from_secs(1), &|d| {
+            waited.set(waited.get() + d)
+        });
+        assert_eq!(choice, Choice::TimedOut);
+        assert_eq!(waited.get(), Duration::from_secs(1));
+        let polls = Cell::new(0);
+        let choice = wait_for_choice(
+            &|| {
+                polls.set(polls.get() + 1);
+                (polls.get() > 2).then_some(Choice::Denied)
+            },
+            Duration::from_secs(1),
+            &|_| {},
+        );
+        assert_eq!(choice, Choice::Denied);
     }
 }

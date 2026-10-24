@@ -73,8 +73,20 @@ impl FakeGitHub {
                 base_ref: base_ref.into(),
                 state: "open".into(),
                 draft: false,
+                title: format!("PR {number}'s title"),
+                author: "an-author".into(),
+                head_ref: "feature".into(),
             },
         );
+    }
+
+    /// Sets the PR's title, author and head branch (shown in the merge flow's summary).
+    pub fn set_pr_details(&self, number: u64, title: &str, author: &str, head_ref: &str) {
+        if let Some(pr) = self.lock().prs.get_mut(&number) {
+            pr.title = title.into();
+            pr.author = author.into();
+            pr.head_ref = head_ref.into();
+        }
     }
 
     /// Moves the PR head (a push after the check or review was done).

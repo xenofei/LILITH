@@ -510,6 +510,7 @@ pub fn approve(
     let say = |text: &str| prompt.say(text);
     let pem = unlock_reviewer_key(hello, &passphrase, &say).map_err(|e| match e {
         KeyError::WrongPassphrase => anyhow!(WRONG_PASSPHRASE),
+        KeyError::Denied => anyhow!("{}; nothing was posted", KeyError::Denied),
         _ => anyhow!("{DAMAGED_KEY}; run `lil dev reviewer-setup` again; nothing was posted"),
     })?;
     approve_with_key(
@@ -1123,7 +1124,7 @@ pub(crate) fn with_owner_authenticator_in<T>(
         .context("every approval and merge needs your authentication with the reviewer key")?;
     let say = |text: &str| prompt.say(&render_escaped(text));
     let message = format!("LILITH: {what}");
-    let hello = enrolled_hello(profile, platform, &message, &say);
+    let hello = enrolled_hello(profile, platform, &message, Some("Merge"), &say);
     if hello.is_none() && !prompt.is_interactive() {
         bail!(
             "Windows Hello isn't enrolled and this isn't a real terminal, so you can't authenticate to {what}; nothing was approved or merged"
@@ -1196,7 +1197,7 @@ pub fn run_approve(pr: u64) -> i32 {
         "LILITH: approve PR #{pr}'s protected changes\n\n{}",
         summary_display(&prepared.head, &prepared.summary)
     ));
-    let hello = enrolled_hello(&profile, &platform, &shown, &say_escaped);
+    let hello = enrolled_hello(&profile, &platform, &shown, Some("Approve"), &say_escaped);
     match approve(
         pr,
         &prepared.cfg,
@@ -1352,7 +1353,14 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
         if let Some(problem) = pr_problem(self.pr, &info, &cfg) {
             bail!(problem.replace("nothing was approved", "nothing was approved or merged"));
         }
-        let head = info.head_sha;
+        let PrInfo {
+            head_sha: head,
+            title,
+            author,
+            base_ref,
+            head_ref,
+            ..
+        } = info;
         if !is_commit_sha(&head) {
             bail!(
                 "GitHub reported a head commit for PR #{} that is not a commit SHA: {head:?}",
@@ -1383,6 +1391,10 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
         *self.state.borrow_mut() = Some((cfg, gh));
         Ok(Facts {
             pr: self.pr,
+            title,
+            author,
+            base_ref,
+            head_ref,
             head,
             files,
             protected,
@@ -3464,6 +3476,7 @@ mod tests {
         kek: [u8; 32],
         fail: bool,
         shown: RefCell<Vec<String>>,
+        accepts: RefCell<Vec<Option<String>>>,
     }
 
     impl TestHello {
@@ -3472,6 +3485,7 @@ mod tests {
                 kek: [0x11; 32],
                 fail: false,
                 shown: RefCell::default(),
+                accepts: RefCell::default(),
             }
         }
         fn failing() -> Self {
@@ -3498,8 +3512,10 @@ mod tests {
             _: &str,
             _: &[u8; 32],
             shown: &str,
+            accept: Option<&str>,
         ) -> std::io::Result<Zeroizing<[u8; 32]>> {
             self.shown.borrow_mut().push(shown.into());
+            self.accepts.borrow_mut().push(accept.map(str::to_string));
             if self.fail {
                 return Err(std::io::Error::other(
                     "the Windows Hello window couldn't be brought to the front",
@@ -3605,6 +3621,11 @@ mod tests {
         assert!(window.contains("SUMMARY"), "{window}");
         assert!(window.contains("AUDIT"), "{window}");
         assert!(!window.contains('\u{1b}'), "{window}");
+        // Fix round 2: the window asks "Merge" before Windows Hello.
+        assert_eq!(
+            hello.accepts.borrow().last(),
+            Some(&Some("Merge".to_string()))
+        );
         // The terminal (here the fake's `say`) got the same text.
         assert!(prompt.said().iter().any(|s| s.contains("AUDIT")));
 
@@ -3750,8 +3771,19 @@ mod tests {
         };
         let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
         let steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        fake.set_pr_details(42, "Fix the thing", "someone", "feature-x");
         let facts = steps.facts().unwrap();
         assert_eq!(facts.head, protected);
+        // Fix round 2: the PR's title, author and branches come from GitHub.
+        assert_eq!(
+            (
+                facts.title.as_str(),
+                facts.author.as_str(),
+                facts.base_ref.as_str(),
+                facts.head_ref.as_str()
+            ),
+            ("Fix the thing", "someone", "main", "feature-x")
+        );
         fake.set_head(42, NEW);
         let e = format!("{:#}", steps.post_approval(test_pem(), &facts).unwrap_err());
         assert!(e.contains(HEAD_MOVED), "{e}");

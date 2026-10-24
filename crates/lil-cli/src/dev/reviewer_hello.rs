@@ -26,6 +26,13 @@
 //! Windows Hello is unavailable and the passphrase is asked for, or, with no terminal
 //! ([`NoTerminal`]), nothing is unlocked.
 //!
+//! **Merge or Deny first** (Task 28 fix round 2). Windows Hello Face can complete a prompt with
+//! no deliberate act, so for an approval or a merge that window has two buttons, "Merge" (or
+//! "Approve") and "Deny", and Windows Hello is raised only after you clicked the first. "Deny",
+//! closing the window or no choice within `HELLO_WAIT` refuses ([`KeyError::Denied`]): nothing is
+//! approved or merged, and the passphrase is not asked instead. At a terminal without Windows
+//! Hello the same summary and audit are printed, then the passphrase is asked.
+//!
 //! **The order** ([`unlock_reviewer_key`]): Windows Hello first when enrolled; when it is
 //! cancelled or fails, or its files are damaged, the passphrase. Nothing that uses the key runs
 //! before one of them has unlocked it.
@@ -235,11 +242,15 @@ pub trait HelloPlatform {
     /// brought to the front or the prompt isn't answered in time.
     fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()>;
     /// The KEK from the credential's signature over `challenge`. Prompts; errors as above.
+    /// With `accept` ("Merge", "Approve"), the window has that button and "Deny", and Windows
+    /// Hello is raised only after the accept click; "Deny", closing the window or no choice in
+    /// time is a `PermissionDenied` error, which refuses outright (Task 28 fix round 2).
     fn kek_derive(
         &self,
         credential: &str,
         challenge: &[u8; 32],
         shown: &str,
+        accept: Option<&str>,
     ) -> io::Result<Zeroizing<[u8; 32]>>;
     /// Deletes the key credential; one that isn't there is fine. No prompt.
     fn kek_remove(&self, credential: &str) -> io::Result<()>;
@@ -265,8 +276,9 @@ impl HelloPlatform for WindowsHello {
         credential: &str,
         challenge: &[u8; 32],
         shown: &str,
+        accept: Option<&str>,
     ) -> io::Result<Zeroizing<[u8; 32]>> {
-        lil_platform::hello::kek_derive(credential, challenge, shown)
+        lil_platform::hello::kek_derive(credential, challenge, shown, accept)
     }
     fn kek_remove(&self, credential: &str) -> io::Result<()> {
         lil_platform::hello::kek_remove(credential)
@@ -344,12 +356,17 @@ pub struct HelloUnlocker<'a> {
     platform: &'a dyn HelloPlatform,
     /// What the owner window shows when nothing more specific is given.
     message: String,
+    /// The accept button ("Merge", "Approve"), or `None` for none.
+    accept: Option<String>,
     say: &'a dyn Fn(&str),
 }
 
 fn hello_error(say: &dyn Fn(&str), e: &io::Error) -> KeyError {
     if e.kind() == io::ErrorKind::Interrupted {
         KeyError::Cancelled
+    } else if e.kind() == io::ErrorKind::PermissionDenied {
+        say(&format!("Refused: {e}; nothing was approved or merged."));
+        KeyError::Denied
     } else {
         say(&format!("Windows Hello isn't used: {e}."));
         KeyError::Unavailable
@@ -361,7 +378,12 @@ impl HelloUnlocker<'_> {
     pub fn unlock_showing(&self, shown: &str) -> Result<Zeroizing<Vec<u8>>, KeyError> {
         let kek = self
             .platform
-            .kek_derive(&self.file.credential, &self.file.challenge, shown)
+            .kek_derive(
+                &self.file.credential,
+                &self.file.challenge,
+                shown,
+                self.accept.as_deref(),
+            )
             .map_err(|e| hello_error(self.say, &e))?;
         let passphrase = hex(&kek[..]);
         drop(kek);
@@ -410,11 +432,13 @@ fn read_enrolment(profile: &Path) -> Result<Option<(HelloFile, Vec<u8>)>> {
 
 /// Windows Hello for an approval or a merge, when you enrolled it: `None` when you didn't, or
 /// when its files are damaged (then `say` tells you, and the passphrase is used). `message` is
-/// what its window shows unless the caller gives more ([`HelloUnlocker::unlock_showing`]).
+/// what its window shows unless the caller gives more ([`HelloUnlocker::unlock_showing`]);
+/// `accept` ("Merge", "Approve") is the button you click before Windows Hello is raised.
 pub fn enrolled_hello<'a>(
     profile: &Path,
     platform: &'a dyn HelloPlatform,
     message: &str,
+    accept: Option<&str>,
     say: &'a dyn Fn(&str),
 ) -> Option<HelloUnlocker<'a>> {
     match read_enrolment(profile) {
@@ -424,6 +448,7 @@ pub fn enrolled_hello<'a>(
             sealed,
             platform,
             message: message.to_string(),
+            accept: accept.map(str::to_string),
             say,
         }),
         Err(e) => {
@@ -446,6 +471,8 @@ pub fn unlock_reviewer_key(
     if let Some(hello) = hello {
         match hello.unlock() {
             Ok(pem) => return Ok(pem),
+            // "Deny" in the LILITH window is your answer, not a reason to ask again.
+            Err(KeyError::Denied) => return Err(KeyError::Denied),
             Err(KeyError::Cancelled) => {
                 say("Windows Hello was cancelled; asking for the passphrase instead.");
             }
@@ -582,7 +609,7 @@ pub fn enroll(
             .kek_enroll(CREDENTIAL, shown)
             .map_err(|e| anyhow!("Windows Hello didn't create the key: {e}"))?;
         let kek = platform
-            .kek_derive(CREDENTIAL, &challenge, shown)
+            .kek_derive(CREDENTIAL, &challenge, shown, None)
             .map_err(|e| anyhow!("Windows Hello didn't sign: {e}"))?;
         let passphrase = hex(&kek[..]);
         drop(kek);
