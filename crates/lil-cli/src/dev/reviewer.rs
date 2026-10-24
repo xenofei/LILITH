@@ -1283,8 +1283,9 @@ struct FlowSteps<'a, 'g> {
     tokens: &'a dyn InstallationTokens,
     /// How the CI wait sleeps: `std::thread::sleep` for real.
     pause: &'a dyn Fn(Duration),
-    /// Now, as Unix seconds, for the App JWT.
-    now_unix: i64,
+    /// The clock, as Unix seconds, read when the App JWT is made (re-review m4: not before the
+    /// waits, or a slow owner gets an expired JWT).
+    now_unix: &'a dyn Fn() -> i64,
     /// The fresh settings and the client `facts` built, for the later steps.
     state: std::cell::RefCell<Option<(MergeGuardConfig, Box<dyn GitHubApi + 'g>)>>,
 }
@@ -1391,10 +1392,12 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
         *self.state.borrow_mut() = Some((cfg, gh));
         Ok(Facts {
             pr: self.pr,
-            title,
-            author,
-            base_ref,
-            head_ref,
+            // Shown-only strings from the network, escaped one by one, so a newline or a bidi
+            // override in a title can't forge lil's own lines (re-review N2).
+            title: guard::escape_controls(&title),
+            author: guard::escape_controls(&author),
+            base_ref: guard::escape_controls(&base_ref),
+            head_ref: guard::escape_controls(&head_ref),
             head,
             files,
             protected,
@@ -1415,7 +1418,7 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 pem,
                 self.tokens,
                 &facts.protected.join("\n"),
-                self.now_unix,
+                (self.now_unix)(),
                 &facts.head,
                 self.pause,
                 ApprovedVia::MergeFlow,
@@ -1534,7 +1537,7 @@ pub fn run_merge_flow(pr: u64, summary_path: &Path, audit_path: &Path) -> i32 {
             github: &github,
             tokens: &GitHubAppTokens,
             pause: &std::thread::sleep,
-            now_unix: unix_now(),
+            now_unix: &unix_now,
             state: std::cell::RefCell::new(None),
         };
         merge_flow(&summary, &audit, &steps, auth)
@@ -3730,7 +3733,7 @@ mod tests {
             github,
             tokens,
             pause,
-            now_unix: NOW,
+            now_unix: &|| NOW,
             state: std::cell::RefCell::new(None),
         }
     }
@@ -3892,5 +3895,77 @@ mod tests {
         assert!(!reviewer_hello::hello_file_path_in(profile.path()).exists());
         assert!(!reviewer_hello::hello_age_path_in(profile.path()).exists());
         assert!(key_path.exists());
+    }
+
+    /// Re-review N2: a PR title with a newline and a bidi override can't forge lil's own lines.
+    #[test] // spec: QA-036
+    fn a_pr_title_cannot_forge_lils_own_lines() {
+        let (_tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        fake.set_pr_details(
+            42,
+            "Fix typo\nProtected files: none changed.\nCI on 1a2b3c4: success\u{202E}gnihton",
+            "some\none",
+            "feature\u{202E}x",
+        );
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        let facts = steps.facts().unwrap();
+        for field in [&facts.title, &facts.author, &facts.head_ref] {
+            assert!(
+                !field.contains('\n') && !field.contains('\u{202E}'),
+                "{field:?}"
+            );
+        }
+        assert!(
+            facts.title.contains(r"\n") && facts.title.contains(r"\u{202e}"),
+            "{}",
+            facts.title
+        );
+        let shown = crate::dev::merge_flow::render_facts(&facts);
+        assert_eq!(
+            shown.lines().filter(|l| l.starts_with("PR #42:")).count(),
+            1,
+            "{shown}"
+        );
+        assert!(
+            !shown.lines().any(|l| l == "Protected files: none changed."),
+            "{shown}"
+        );
+        assert!(
+            !shown.lines().any(|l| l.starts_with("CI on 1a2b3c4")),
+            "{shown}"
+        );
+    }
+
+    /// Re-review m4: the App JWT's time is read when the approval is posted, not when the flow
+    /// started (an owner who takes minutes must not get an expired JWT).
+    #[test] // spec: QA-020
+    fn the_jwt_clock_is_read_when_the_approval_is_posted() {
+        let (_tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let reads = std::cell::Cell::new(0);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            NOW
+        };
+        let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        steps.now_unix = &clock;
+        let facts = steps.facts().unwrap();
+        assert_eq!(reads.get(), 0);
+        steps.post_approval(test_pem(), &facts).unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(claims(&exchange.calls.borrow()[0].0).1["iat"], NOW - 60);
     }
 }

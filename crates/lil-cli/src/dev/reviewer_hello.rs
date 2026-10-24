@@ -31,7 +31,9 @@
 //! "Approve") and "Deny", and Windows Hello is raised only after you clicked the first. "Deny",
 //! closing the window or no choice within `HELLO_WAIT` refuses ([`KeyError::Denied`]): nothing is
 //! approved or merged, and the passphrase is not asked instead. At a terminal without Windows
-//! Hello the same summary and audit are printed, then the passphrase is asked.
+//! Hello the same summary and audit are printed, then the passphrase is asked. Only a real
+//! hardware click on "Merge" or "Approve" counts (`lil_platform::hello::choice_from_command`):
+//! another program running as you can't press it.
 //!
 //! **The order** ([`unlock_reviewer_key`]): Windows Hello first when enrolled; when it is
 //! cancelled or fails, or its files are damaged, the passphrase. Nothing that uses the key runs

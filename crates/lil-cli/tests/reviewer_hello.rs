@@ -690,7 +690,7 @@ impl MergeFlowSteps for FakeSteps {
     }
     fn merge(&self, gate: &dyn MergeGate) -> anyhow::Result<String> {
         let head = self.merge_head.as_deref().unwrap_or(&self.facts.head);
-        gate.authorize(self.facts.pr, head)
+        gate.authorize(&subject(self.facts.pr, head))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         self.log.borrow_mut().push("steps:merge".into());
         Ok("feedface".into())
@@ -1016,7 +1016,7 @@ fn dev_merge_asks_for_authentication_on_every_merge() {
     let auth = FakeAuth::new(&l, Ok(()));
     let gate = AskOnEveryMerge::new(&auth);
     for pr in [1, 2, 3] {
-        gate.authorize(pr, "1234567890abcdef1234567890abcdef12345678")
+        gate.authorize(&subject(pr, "1234567890abcdef1234567890abcdef12345678"))
             .unwrap();
     }
     assert_eq!(events(&l), ["auth", "auth", "auth"]);
@@ -1024,13 +1024,17 @@ fn dev_merge_asks_for_authentication_on_every_merge() {
     assert!(seen[0].0.contains("PR #1"), "{:?}", seen[0]);
     assert!(seen[2].0.contains("1234567"), "{:?}", seen[2]);
     assert!(!seen[0].1.is_empty(), "the audit slot says there is none");
+    // Re-review m5: which PR it is, and into which branch.
+    for detail in ["Add the thing", "an-agent", "Into main"] {
+        assert!(seen[0].0.contains(detail), "{detail}: {:?}", seen[0]);
+    }
     drop(seen);
 
     for answer in [KeyError::Cancelled, KeyError::WrongPassphrase] {
         let auth = FakeAuth::new(&log(), Err(answer));
         let gate = AskOnEveryMerge::new(&auth);
         let e = gate
-            .authorize(7, "1234567890abcdef1234567890abcdef12345678")
+            .authorize(&subject(7, "1234567890abcdef1234567890abcdef12345678"))
             .unwrap_err();
         assert!(e.contains("nothing was merged"), "{e}");
     }
@@ -1097,4 +1101,30 @@ fn deny_close_or_no_choice_refuses_and_never_raises_windows_hello() {
             format!("hello:kek_derive {CREDENTIAL} 5a")
         ]
     );
+}
+
+/// A merge to ask a gate about.
+fn subject(pr: u64, head: &str) -> merge_flow::MergeSubject<'_> {
+    merge_flow::MergeSubject {
+        pr,
+        head,
+        title: "Add the thing",
+        author: "an-agent",
+        base_branch: "main",
+    }
+}
+
+/// Re-review m3: a long agent summary is cut, so it can't bury the audit.
+#[test] // spec: QA-036
+fn a_long_summary_is_cut_before_the_audit() {
+    let l = log();
+    let auth = FakeAuth::new(&l, Ok(()));
+    let steps = FakeSteps::new(&l, &[]);
+    let long: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+    merge_flow(&long, "the audit", &steps, &auth).unwrap();
+    let (summary, _) = auth.seen.borrow()[0].clone();
+    assert!(summary.contains("line 60\n"), "{summary}");
+    assert!(!summary.contains("line 61\n"), "{summary}");
+    assert!(summary.contains("(140 more lines not shown)"), "{summary}");
+    assert_eq!(merge_flow::capped("a\nb", 60), "a\nb");
 }

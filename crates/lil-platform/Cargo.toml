@@ -103,6 +103,8 @@ features = [
     "Win32_System_WindowsProgramming",
     # EnableWindow and SetFocus: the Windows Hello window's Merge / Deny buttons (Task 28).
     "Win32_UI_Input_KeyboardAndMouse",
+    # GetCurrentInputMessageSource: only a real click accepts the Windows Hello window (Task 28).
+    "Win32_UI_Input",
     # Also SHQueryUserNotificationState (fullscreen, CORE-160), IShellLinkW and
     # FOLDERID_Programs (the AUMID shortcut).
     "Win32_UI_Shell",

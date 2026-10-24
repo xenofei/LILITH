@@ -43,7 +43,7 @@ use super::github::{
     BASE_BRANCH, CheckState, GitHubApi, MergeOutcome, RestClient, Review, github_token,
 };
 use super::guard::{self, Verdict};
-use super::merge_flow::{AskOnEveryMerge, MergeGate};
+use super::merge_flow::{AskOnEveryMerge, MergeGate, MergeSubject};
 use super::reviewer_hello::Authenticator;
 use super::root;
 use anyhow::{Context, Result, bail};
@@ -350,7 +350,23 @@ pub fn merge_pr(
     gate: &dyn MergeGate,
 ) -> Result<String, Vec<Refusal>> {
     let head = merge_conditions(cfg, gh, pr, verdict_for, hooks_path_configured)?;
-    gate.authorize(pr, &head)
+    // What the gate shows of the PR (re-review m5): its title and author, escaped, from a read
+    // at the checked head; nothing is decided on them.
+    let (title, author) = match gh.pr(pr) {
+        Ok(info) if info.head_sha == head => (
+            guard::escape_controls(&info.title),
+            guard::escape_controls(&info.author),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let subject = MergeSubject {
+        pr,
+        head: &head,
+        title: &title,
+        author: &author,
+        base_branch: &cfg.base_branch,
+    };
+    gate.authorize(&subject)
         .map_err(|e| vec![Refusal::NotAuthenticated(one_line(&e))])?;
     match gh.merge(pr, &head) {
         Ok(MergeOutcome::Merged { sha }) => Ok(sha),
@@ -904,7 +920,7 @@ mod tests {
     struct Allow;
 
     impl MergeGate for Allow {
-        fn authorize(&self, _: u64, _: &str) -> std::result::Result<(), String> {
+        fn authorize(&self, _: &MergeSubject) -> std::result::Result<(), String> {
             Ok(())
         }
     }
@@ -916,8 +932,8 @@ mod tests {
     }
 
     impl MergeGate for Gate {
-        fn authorize(&self, pr: u64, head: &str) -> std::result::Result<(), String> {
-            self.asked.borrow_mut().push((pr, head.to_string()));
+        fn authorize(&self, s: &MergeSubject) -> std::result::Result<(), String> {
+            self.asked.borrow_mut().push((s.pr, s.head.to_string()));
             self.answer.clone()
         }
     }
@@ -2185,6 +2201,10 @@ mod tests {
             assert_eq!(asked.len(), 1, "{asked:?}");
             assert!(asked[0].contains("PR #42"), "{asked:?}");
             assert!(asked[0].contains(&f.head), "{asked:?}");
+            // Re-review m5: the PR's title and author, and the configured base branch.
+            for detail in ["PR 42's title", "an-author", "Into main"] {
+                assert!(asked[0].contains(detail), "{detail}: {asked:?}");
+            }
             match answer {
                 Ok(()) => {
                     assert_eq!(r, Ok(format!("merge-of-{}", f.head)));

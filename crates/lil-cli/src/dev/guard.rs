@@ -961,6 +961,12 @@ pub fn verdict(repo: &Path, base: &str, head: &str) -> Result<Verdict> {
 /// overrides and isolates (U+202A-U+202E, U+2066-U+2069), the zero-width characters and
 /// direction marks (U+200B-U+200F), the line and paragraph separators (U+2028, U+2029), the
 /// byte-order mark (U+FEFF), the soft hyphen (U+00AD) and the Arabic letter mark (U+061C).
+/// Plan 4a Task 28 (re-review m7) adds the other characters that hide or pad text: the word
+/// joiner and invisible operators (U+2060-U+2064), the deprecated format characters
+/// (U+206A-U+206F), the Mongolian vowel separator (U+180E), the combining grapheme joiner
+/// (U+034F), the variation selectors (U+FE00-U+FE0F, U+E0100-U+E01EF), the tag characters
+/// (U+E0000-U+E007F) and the Hangul fillers (U+115F, U+1160, U+3164, U+FFA0); to be aligned
+/// with Appendix G's `shown_text` list when Task 4 lands.
 /// The one list every escape and every path check uses.
 pub(crate) fn is_dangerous_char(c: char) -> bool {
     c.is_control()
@@ -974,6 +980,17 @@ pub(crate) fn is_dangerous_char(c: char) -> bool {
                 | '\u{FEFF}'
                 | '\u{00AD}'
                 | '\u{061C}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{206A}'..='\u{206F}'
+                | '\u{180E}'
+                | '\u{034F}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{E0100}'..='\u{E01EF}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{FFA0}'
         )
 }
 
@@ -2646,6 +2663,40 @@ Binary files a/bin.png and b/bin.png differ\n";
         for c in [
             'a', '\u{e9}', '\u{c9}', ' ', '\u{4e2d}', '\u{2010}', '\u{2070}', '\u{2027}',
         ] {
+            assert!(!is_dangerous_char(c), "{:04X}", c as u32);
+        }
+    }
+
+    /// Task 28 (re-review m7): the other characters that hide or pad text.
+    #[test]
+    fn hiding_and_padding_characters_are_dangerous_too() {
+        for c in [
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{180E}',
+            '\u{034F}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{E0100}',
+            '\u{E01EF}',
+            '\u{E0000}',
+            '\u{E007F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+        ] {
+            assert!(is_dangerous_char(c), "{:04X}", c as u32);
+            assert!(
+                escape_controls(&c.to_string()).starts_with("\\u{"),
+                "{:04X}",
+                c as u32
+            );
+        }
+        // Their neighbours stay.
+        for c in ['\u{2065}', '\u{2070}', '\u{FE10}', '\u{3163}', '\u{FFA1}'] {
             assert!(!is_dangerous_char(c), "{:04X}", c as u32);
         }
     }

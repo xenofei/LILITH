@@ -16,7 +16,13 @@
 //! "Approve"), [`kek_derive`]'s window has that button and "Deny", and Windows Hello is raised
 //! only after the accept click ([`ask_then`]); "Deny", closing the window or no choice within
 //! [`HELLO_WAIT`] refuses with `PermissionDenied` (Task 28 fix round 2: Windows Hello Face can
-//! complete a prompt with no deliberate act).
+//! complete a prompt with no deliberate act). Only a real click accepts ([`choice_from_command`]):
+//! the accept button is subclassed and armed only by hardware input on its own thread
+//! (`GetCurrentInputMessageSource` is `IMO_HARDWARE`, `InSendMessage` is false), and only a
+//! `BN_CLICKED` from that button's own window counts, so a posted or sent `WM_COMMAND`,
+//! `BM_CLICK`, UI Automation's Invoke and `SendInput` are ignored. The buttons work only once
+//! the window has been in front for [`BUTTONS_LIVE_AFTER`], and stop when it loses the front.
+//! "Deny" accepts any source: refusing is always safe.
 //!
 //! **Placement (P4a-R38).** The owner's rule is that the prompt comes to the front of every
 //! application, a fullscreen one included. Spike 11 showed that an unowned create prompt and a
@@ -52,22 +58,33 @@ use windows::Security::Credentials::{
 };
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
-use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
+use windows::Win32::Graphics::Gdi::{
+    DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow,
+};
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::System::TpmBaseServices::{TPM_DEVICE_INFO, Tbsi_GetDeviceInfo};
 use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, IsWindowEnabled, SetFocus, VK_SPACE,
+};
+use windows::Win32::UI::Input::{
+    GetCurrentInputMessageSource, IMO_HARDWARE, IMO_INJECTED, IMO_SYSTEM, INPUT_MESSAGE_SOURCE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL, FLASHW_TIMERNOFG,
-    FLASHWINFO, FlashWindowEx, GetClientRect, GetDlgItem, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, HMENU, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    BN_CLICKED, BringWindowToTop, CW_USEDEFAULT, CallWindowProcW, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL,
+    FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect,
+    GetDlgItem, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
+    HMENU, InSendMessage, KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYUP, WM_LBUTTONUP, WM_SETFONT, WM_TIMER,
+    WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW, WS_OVERLAPPED,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, Interface, w};
 use windows_future::IAsyncOperation;
@@ -520,17 +537,45 @@ fn in_front<T>(
         Some(label) => OwnerWindow::open_asking("LILITH: Windows Hello", shown, label)?,
         None => OwnerWindow::open("LILITH: Windows Hello", shown)?,
     };
-    let raise = window.bring_to_front();
-    match accept {
-        Some(_) => ask_then(
+    run_in(&window, accept.is_some(), call)
+}
+
+/// What [`run_in`] needs of a window: [`OwnerWindow`] for real, a fake in tests.
+trait PromptWindow {
+    fn raise(&self) -> Raise;
+    fn wait_choice(&self, timeout: Duration) -> Choice;
+    fn hwnd(&self) -> isize;
+}
+
+impl PromptWindow for OwnerWindow {
+    fn raise(&self) -> Raise {
+        self.bring_to_front()
+    }
+    fn wait_choice(&self, timeout: Duration) -> Choice {
+        OwnerWindow::wait_choice(self, timeout)
+    }
+    fn hwnd(&self) -> isize {
+        OwnerWindow::hwnd(self)
+    }
+}
+
+/// [`in_front`]'s order, over any window (re-review m6): raise it; when `asking`, wait for the
+/// choice ([`ask_then`]); run `call` with its handle only then.
+fn run_in<W: PromptWindow, T>(
+    window: &W,
+    asking: bool,
+    call: impl FnOnce(isize) -> io::Result<T>,
+) -> io::Result<T> {
+    let raise = window.raise();
+    if asking {
+        ask_then(
             raise,
             || window.wait_choice(HELLO_WAIT),
             || call(window.hwnd()),
-        ),
-        None => {
-            front_or_refuse(raise)?;
-            call(window.hwnd())
-        }
+        )
+    } else {
+        front_or_refuse(raise)?;
+        call(window.hwnd())
     }
 }
 
@@ -672,33 +717,6 @@ pub struct OwnerWindow {
     thread: Option<JoinHandle<()>>,
 }
 
-/// The accept button's control id.
-const ID_ACCEPT: usize = 1;
-/// "Deny"'s control id.
-const ID_DENY: usize = 2;
-
-/// The choices made in this process's asking windows, by window handle. Written on the window's
-/// thread, read by [`OwnerWindow::wait_choice`]; an entry goes when its window is dropped.
-static CHOICES: std::sync::Mutex<Vec<(isize, Choice)>> = std::sync::Mutex::new(Vec::new());
-
-fn record_choice(hwnd: HWND, choice: Choice) {
-    let mut choices = CHOICES.lock().unwrap_or_else(|e| e.into_inner());
-    let key = hwnd.0 as isize;
-    // The first choice stands: closing the window after "Merge" doesn't undo it.
-    if !choices.iter().any(|(h, _)| *h == key) {
-        choices.push((key, choice));
-    }
-}
-
-fn choice_of(hwnd: isize) -> Option<Choice> {
-    CHOICES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|(h, _)| *h == hwnd)
-        .map(|(_, c)| *c)
-}
-
 impl OwnerWindow {
     /// Opens the window, shown but not yet brought to the front.
     pub fn open(title: &str, body: &str) -> io::Result<Self> {
@@ -813,6 +831,143 @@ impl Drop for OwnerWindow {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The buttons: only a real click accepts (re-review N1, m1).
+// ---------------------------------------------------------------------------------------------
+
+/// Where the input message being handled came from (`GetCurrentInputMessageSource`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// A real mouse, touch, pen or keyboard (`IMO_HARDWARE`).
+    Hardware,
+    /// `SendInput` (`IMO_INJECTED`).
+    Injected,
+    /// Windows itself (`IMO_SYSTEM`).
+    System,
+    /// Not an input message: posted or sent (`IMO_UNAVAILABLE`), or the query failed.
+    Unavailable,
+}
+
+/// Whether the accept button's own mouse-up or Space key-up arms it for the click it is about
+/// to report: only real hardware input handled on its own thread (not a message another thread
+/// sent, `InSendMessage`). Pure.
+pub fn arms_accept(origin: InputOrigin, sent_by_another_thread: bool) -> bool {
+    origin == InputOrigin::Hardware && !sent_by_another_thread
+}
+
+/// A `WM_COMMAND` the owner window got, as [`choice_from_command`] judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ButtonCommand {
+    /// The notification is `BN_CLICKED`.
+    pub clicked: bool,
+    /// `lParam` is the accept button's own window.
+    pub from_accept: bool,
+    /// `lParam` is "Deny"'s own window.
+    pub from_deny: bool,
+    /// The accept button was armed by the hardware input that produced this click
+    /// ([`arms_accept`]).
+    pub armed: bool,
+    /// The command was sent from another thread or process (`InSendMessage`).
+    pub sent_by_another_thread: bool,
+    /// The buttons were live: the window had been in front for [`BUTTONS_LIVE_AFTER`].
+    pub enabled: bool,
+}
+
+/// The choice a `WM_COMMAND` makes, if any (pure): "Deny" from its own button, whatever sent it
+/// (refusing is always safe); the accept button only for a `BN_CLICKED` from its own window,
+/// handled on its thread, armed by real hardware input, while the buttons were live. A posted
+/// or sent `WM_COMMAND`, `BM_CLICK`, UI Automation's Invoke and `SendInput` all fail one of these.
+pub fn choice_from_command(c: ButtonCommand) -> Option<Choice> {
+    if !c.clicked {
+        return None;
+    }
+    if c.from_deny {
+        return Some(Choice::Denied);
+    }
+    (c.from_accept && c.armed && !c.sent_by_another_thread && c.enabled).then_some(Choice::Accepted)
+}
+
+/// How long the window must be in front before its buttons work (re-review m1): a click meant
+/// for whatever was in front a moment ago doesn't count.
+pub const BUTTONS_LIVE_AFTER: Duration = Duration::from_secs(1);
+
+/// The accept button's control id.
+const ID_ACCEPT: usize = 1;
+/// "Deny"'s control id.
+const ID_DENY: usize = 2;
+/// The timer that makes the buttons live.
+const TIMER_LIVE: usize = 1;
+
+/// The accept button the current hardware input armed, or 0; set and cleared around one call
+/// of the button's own window procedure.
+static ARMED: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// The choices made in this process's asking windows, by window handle. Written on the window's
+/// thread, read by [`OwnerWindow::wait_choice`]; an entry goes when its window is dropped.
+static CHOICES: std::sync::Mutex<Vec<(isize, Choice)>> = std::sync::Mutex::new(Vec::new());
+
+fn record_choice(hwnd: HWND, choice: Choice) {
+    let mut choices = CHOICES.lock().unwrap_or_else(|e| e.into_inner());
+    let key = hwnd.0 as isize;
+    // The first choice stands: closing the window after "Merge" doesn't undo it.
+    if !choices.iter().any(|(h, _)| *h == key) {
+        choices.push((key, choice));
+    }
+}
+
+fn choice_of(hwnd: isize) -> Option<Choice> {
+    CHOICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| *h == hwnd)
+        .map(|(_, c)| *c)
+}
+
+/// The origin of the input message this thread is handling.
+fn current_input_origin() -> InputOrigin {
+    let mut source = INPUT_MESSAGE_SOURCE::default();
+    // SAFETY: a plain query into a local structure.
+    if unsafe { GetCurrentInputMessageSource(&mut source) }.is_err() {
+        return InputOrigin::Unavailable;
+    }
+    match source.originId {
+        IMO_HARDWARE => InputOrigin::Hardware,
+        IMO_INJECTED => InputOrigin::Injected,
+        IMO_SYSTEM => InputOrigin::System,
+        _ => InputOrigin::Unavailable,
+    }
+}
+
+/// The accept button's subclass: its mouse-up and Space key-up arm it only for real hardware
+/// input ([`arms_accept`]), for exactly the one call of its own procedure that reports the click.
+extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // SAFETY: the original procedure was stored in this button's GWLP_USERDATA when it was
+    // subclassed, and stays valid for the button's life.
+    unsafe {
+        let original: WNDPROC = std::mem::transmute(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        let releases = msg == WM_LBUTTONUP || (msg == WM_KEYUP && wp.0 == usize::from(VK_SPACE.0));
+        if releases && arms_accept(current_input_origin(), InSendMessage().as_bool()) {
+            ARMED.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
+            let result = CallWindowProcW(original, hwnd, msg, wp, lp);
+            ARMED.store(0, std::sync::atomic::Ordering::SeqCst);
+            return result;
+        }
+        CallWindowProcW(original, hwnd, msg, wp, lp)
+    }
+}
+
+fn set_buttons_enabled(window: HWND, enabled: bool) {
+    // SAFETY: the window's own child controls.
+    unsafe {
+        for id in [ID_ACCEPT, ID_DENY] {
+            if let Ok(b) = GetDlgItem(Some(window), id as i32) {
+                let _ = EnableWindow(b, enabled);
+            }
+        }
+    }
+}
+
 /// The height of the button row, in pixels.
 const BUTTON_ROW: i32 = 48;
 
@@ -853,6 +1008,27 @@ fn window_thread(
                 return;
             }
         };
+        // Within the monitor's work area, centred, so the buttons are on screen at any scaling
+        // (re-review m2).
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let work = info.rcWork;
+            let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+            let (w, h) = (720.min(ww - 32), 520.min(wh - 32));
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                work.left + (ww - w) / 2,
+                work.top + (wh - h) / 2,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let set_font = |control: HWND| {
             SendMessageW(
@@ -892,8 +1068,9 @@ fn window_thread(
             let _ = SetFocus(Some(edit));
         }
         if let Some(accept) = accept {
-            // Plain push buttons, neither the default: only a deliberate click chooses.
-            let button = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0);
+            // Plain push buttons, neither the default, both disabled until the window has been
+            // in front for BUTTONS_LIVE_AFTER: only a deliberate click chooses.
+            let button = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_DISABLED.0);
             let (w, h) = (110, 30);
             let y = client.bottom - 8 - h;
             for (label, id, x) in [
@@ -915,6 +1092,15 @@ fn window_thread(
                     None,
                 ) {
                     set_font(b);
+                    if id == ID_ACCEPT {
+                        // Subclassed, so its own input can be checked (accept_button_proc).
+                        let original = SetWindowLongPtrW(
+                            b,
+                            GWLP_WNDPROC,
+                            accept_button_proc as *const () as isize,
+                        );
+                        SetWindowLongPtrW(b, GWLP_USERDATA, original);
+                    }
                 }
             }
         }
@@ -933,20 +1119,44 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
     unsafe {
         match msg {
             WM_COMMAND => {
-                // A button click: the low word is the control id.
-                let choice = match wp.0 & 0xffff {
-                    ID_ACCEPT => Some(Choice::Accepted),
-                    ID_DENY => Some(Choice::Denied),
-                    _ => None,
+                let child = |id: usize| GetDlgItem(Some(hwnd), id as i32).ok();
+                let sender = lp.0;
+                let is = |b: Option<HWND>| b.is_some_and(|b| b.0 as isize == sender && sender != 0);
+                let accept = child(ID_ACCEPT);
+                let command = ButtonCommand {
+                    clicked: ((wp.0 >> 16) & 0xffff) as u32 == BN_CLICKED,
+                    from_accept: is(accept),
+                    from_deny: is(child(ID_DENY)),
+                    armed: sender != 0 && ARMED.load(std::sync::atomic::Ordering::SeqCst) == sender,
+                    sent_by_another_thread: InSendMessage().as_bool(),
+                    enabled: accept.is_some_and(|b| IsWindowEnabled(b).as_bool()),
                 };
-                if let Some(choice) = choice {
+                if let Some(choice) = choice_from_command(command) {
                     record_choice(hwnd, choice);
                     // One choice only: both buttons go grey.
-                    for id in [ID_ACCEPT, ID_DENY] {
-                        if let Ok(b) = GetDlgItem(Some(hwnd), id as i32) {
-                            let _ = EnableWindow(b, false);
-                        }
-                    }
+                    set_buttons_enabled(hwnd, false);
+                }
+                LRESULT(0)
+            }
+            WM_ACTIVATE => {
+                if (wp.0 & 0xffff) as u32 == WA_INACTIVE {
+                    // Not in front: the buttons stop working until it has been again.
+                    let _ = KillTimer(Some(hwnd), TIMER_LIVE);
+                    set_buttons_enabled(hwnd, false);
+                } else if choice_of(hwnd.0 as isize).is_none() {
+                    SetTimer(
+                        Some(hwnd),
+                        TIMER_LIVE,
+                        BUTTONS_LIVE_AFTER.as_millis() as u32,
+                        None,
+                    );
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_TIMER if wp.0 == TIMER_LIVE => {
+                let _ = KillTimer(Some(hwnd), TIMER_LIVE);
+                if choice_of(hwnd.0 as isize).is_none() && GetForegroundWindow() == hwnd {
+                    set_buttons_enabled(hwnd, true);
                 }
                 LRESULT(0)
             }
@@ -1094,5 +1304,145 @@ mod tests {
             &|_| {},
         );
         assert_eq!(choice, Choice::Denied);
+    }
+
+    /// A real click on the accept button, as the owner window sees it.
+    fn real_click() -> ButtonCommand {
+        ButtonCommand {
+            clicked: true,
+            from_accept: true,
+            from_deny: false,
+            armed: true,
+            sent_by_another_thread: false,
+            enabled: true,
+        }
+    }
+
+    /// Re-review N1: only a real hardware click (or Space) on the accept button accepts.
+    #[test] // spec: QA-088, QA-036
+    fn only_a_real_click_on_the_accept_button_accepts() {
+        assert_eq!(choice_from_command(real_click()), Some(Choice::Accepted));
+
+        // Arming: only hardware input on the button's own thread.
+        assert!(arms_accept(InputOrigin::Hardware, false));
+        for origin in [
+            // SendInput.
+            InputOrigin::Injected,
+            InputOrigin::System,
+            // A posted or sent message (WM_LBUTTONUP, BM_CLICK, UI Automation's Invoke).
+            InputOrigin::Unavailable,
+        ] {
+            assert!(!arms_accept(origin, false), "{origin:?}");
+            // Not armed, so its click doesn't accept.
+            let c = ButtonCommand {
+                armed: arms_accept(origin, false),
+                ..real_click()
+            };
+            assert_eq!(choice_from_command(c), None, "{origin:?}");
+        }
+        // Hardware input, but handled as a message another thread sent: no.
+        assert!(!arms_accept(InputOrigin::Hardware, true));
+
+        // A WM_COMMAND posted or sent by another process: never armed.
+        let forged = ButtonCommand {
+            armed: false,
+            ..real_click()
+        };
+        assert_eq!(choice_from_command(forged), None);
+        // Sent from another thread even while armed: no.
+        let sent = ButtonCommand {
+            sent_by_another_thread: true,
+            ..real_click()
+        };
+        assert_eq!(choice_from_command(sent), None);
+        // Not BN_CLICKED: no.
+        let other = ButtonCommand {
+            clicked: false,
+            ..real_click()
+        };
+        assert_eq!(choice_from_command(other), None);
+        // Claiming the accept id from another window (lParam isn't the button): no.
+        let elsewhere = ButtonCommand {
+            from_accept: false,
+            ..real_click()
+        };
+        assert_eq!(choice_from_command(elsewhere), None);
+        // Before the window was in front long enough (m1): no.
+        let early = ButtonCommand {
+            enabled: false,
+            ..real_click()
+        };
+        assert_eq!(choice_from_command(early), None);
+
+        // "Deny" from its own button, whatever sent it: refusing is always safe.
+        for (armed, sent, enabled) in [(false, true, false), (true, false, true)] {
+            let deny = ButtonCommand {
+                clicked: true,
+                from_accept: false,
+                from_deny: true,
+                armed,
+                sent_by_another_thread: sent,
+                enabled,
+            };
+            assert_eq!(choice_from_command(deny), Some(Choice::Denied));
+        }
+    }
+
+    /// A window for [`run_in`]: records what was asked of it.
+    struct FakeWindow {
+        raise: Raise,
+        choice: Choice,
+        log: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl PromptWindow for FakeWindow {
+        fn raise(&self) -> Raise {
+            self.log.borrow_mut().push("raise");
+            self.raise
+        }
+        fn wait_choice(&self, timeout: Duration) -> Choice {
+            assert_eq!(timeout, HELLO_WAIT);
+            self.log.borrow_mut().push("choice");
+            self.choice
+        }
+        fn hwnd(&self) -> isize {
+            42
+        }
+    }
+
+    /// Re-review m6: `in_front`'s glue keeps the order, over a fake window.
+    #[test] // spec: QA-088
+    fn the_window_is_raised_then_asked_and_only_then_windows_hello_runs() {
+        let window = |raise, choice| FakeWindow {
+            raise,
+            choice,
+            log: Default::default(),
+        };
+        let w = window(Raise::SetForeground, Choice::Accepted);
+        let hwnd = run_in(&w, true, |h| {
+            w.log.borrow_mut().push("hello");
+            Ok(h)
+        })
+        .unwrap();
+        assert_eq!(hwnd, 42);
+        assert_eq!(*w.log.borrow(), ["raise", "choice", "hello"]);
+
+        for choice in [Choice::Denied, Choice::Closed, Choice::TimedOut] {
+            let w = window(Raise::SetForeground, choice);
+            let e = run_in(&w, true, |_| -> io::Result<()> { panic!("hello ran") }).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(*w.log.borrow(), ["raise", "choice"]);
+        }
+
+        let w = window(Raise::NotInFront, Choice::Accepted);
+        assert!(run_in(&w, true, |_| -> io::Result<()> { panic!("hello ran") }).is_err());
+        assert_eq!(*w.log.borrow(), ["raise"]);
+
+        // Not asking (enrolment): raised, then Windows Hello, no choice.
+        let w = window(Raise::AttachedInput, Choice::Denied);
+        run_in(&w, false, |_| Ok(())).unwrap();
+        assert_eq!(*w.log.borrow(), ["raise"]);
+        let w = window(Raise::NotInFront, Choice::Accepted);
+        assert!(run_in(&w, false, |_| -> io::Result<()> { panic!("hello ran") }).is_err());
     }
 }

@@ -93,10 +93,22 @@ pub fn render_facts(facts: &Facts) -> String {
     out
 }
 
+/// The merge a [`MergeGate`] is asked about: the PR, the head commit every condition was
+/// checked on, and what is shown of it (the title and author as GitHub reports them, escaped by
+/// the caller; the configured base branch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeSubject<'a> {
+    pub pr: u64,
+    pub head: &'a str,
+    pub title: &'a str,
+    pub author: &'a str,
+    pub base_branch: &'a str,
+}
+
 /// A merge's authentication: [`MergeGate::authorize`] runs after every other merge condition
 /// held and just before GitHub is asked to merge. An error refuses the merge.
 pub trait MergeGate {
-    fn authorize(&self, pr: u64, head: &str) -> std::result::Result<(), String>;
+    fn authorize(&self, subject: &MergeSubject) -> std::result::Result<(), String>;
 }
 
 /// `lil dev merge` on its own: asks you to authenticate on every merge, protected files or not.
@@ -111,10 +123,23 @@ impl<'a> AskOnEveryMerge<'a> {
 }
 
 impl MergeGate for AskOnEveryMerge<'_> {
-    fn authorize(&self, pr: u64, head: &str) -> std::result::Result<(), String> {
+    fn authorize(&self, s: &MergeSubject) -> std::result::Result<(), String> {
+        let given = |t: &str| {
+            if t.is_empty() {
+                "(not given)".to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        // Re-review m5: which PR it is, and into which branch.
         let summary = format!(
-            "Merge PR #{pr} at {} (head commit {head}) into main.\nCI is green on that commit, and protected changes, if any, carry the reviewer approval.",
-            short(head)
+            "Merge PR #{}: {}\nAuthor: {}\nInto {} at {} (head commit {}).\nCI is green on that commit, and protected changes, if any, carry the reviewer approval.",
+            s.pr,
+            given(s.title),
+            given(s.author),
+            s.base_branch,
+            short(s.head),
+            s.head
         );
         self.auth
             .authenticate(&summary, NO_AUDIT)
@@ -131,7 +156,8 @@ pub struct Authenticated {
 }
 
 impl MergeGate for Authenticated {
-    fn authorize(&self, pr: u64, head: &str) -> std::result::Result<(), String> {
+    fn authorize(&self, s: &MergeSubject) -> std::result::Result<(), String> {
+        let (pr, head) = (s.pr, s.head);
         if pr == self.pr && head == self.head {
             Ok(())
         } else {
@@ -160,6 +186,23 @@ pub trait MergeFlowSteps {
     fn merge(&self, gate: &dyn MergeGate) -> Result<String>;
 }
 
+/// How many lines of the agent's summary are shown (re-review m3): a long one mustn't bury the
+/// independent audit below it.
+pub const SUMMARY_LINES: usize = 60;
+
+/// `text`'s first `max` lines, then "(N more lines not shown)" when there were more.
+pub fn capped(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    if lines.len() <= max {
+        return lines.join("\n");
+    }
+    format!(
+        "{}\n({} more lines not shown)",
+        lines[..max].join("\n"),
+        lines.len() - max
+    )
+}
+
 /// The flow: the facts, then your authentication with the summary and the audit shown first,
 /// then (only after it succeeded) the approval when protected files changed, CI, and the merge.
 /// Returns the merge commit.
@@ -173,7 +216,7 @@ pub fn merge_flow(
     let shown = format!(
         "{}\nSummary of the change (written by the agent that ran the flow):\n{}",
         render_facts(&facts),
-        quoted(summary)
+        quoted(&capped(summary, SUMMARY_LINES))
     );
     let pem = auth
         .authenticate(&shown, audit)
