@@ -242,10 +242,13 @@ CREATE TABLE cap_alerts (
 /// it (P4a-R12); `status_seq` the JSON list of its status changes (the first and the newest
 /// 63); `engine_device`, `phase`, `subtasks` (JSON), `indeterminate`, `last_progress_ms`
 /// (Unix ms), `cache_hit_nodes` (JSON) and `all_cached` what its run reported; `estimate` and
-/// `estimate_key` the estimate taken at submission (Task 7 fills them). A row from before
-/// this migration gets the batch of its own job id (`b_<its 16 hex>`), index 0, its `seq` as
-/// its order key, and the origin its idempotency scope names (a scope of another form, or
-/// none, leaves it null).
+/// `estimate_key` the estimate taken at submission (Task 7 fills them); `withdrawn_id` the
+/// prompt id a pause withdrew, kept until it is known gone (CORE-160, CORE-120). A row from
+/// before this migration gets the batch of its own job id (`b_<its 16 hex>`), index 0, its
+/// `seq` as its order key, and the origin its idempotency scope names (a scope of another
+/// form, or none, leaves it null). A `cli|…` scope gives `{surface: "cli"}`, also for a job
+/// the core submitted itself, which a new row records as `core` (`StartedBy::of`): the old
+/// row doesn't tell the two apart.
 const JOBS_V2: &str = "ALTER TABLE jobs ADD COLUMN batch_id TEXT;
 ALTER TABLE jobs ADD COLUMN batch_index INTEGER;
 ALTER TABLE jobs ADD COLUMN order_key INTEGER;
@@ -260,6 +263,7 @@ ALTER TABLE jobs ADD COLUMN cache_hit_nodes TEXT;
 ALTER TABLE jobs ADD COLUMN all_cached INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN estimate TEXT;
 ALTER TABLE jobs ADD COLUMN estimate_key TEXT;
+ALTER TABLE jobs ADD COLUMN withdrawn_id TEXT;
 UPDATE jobs SET
     batch_id = 'b_' || substr(job_id, 3, 16),
     batch_index = 0,

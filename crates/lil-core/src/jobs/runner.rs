@@ -178,7 +178,8 @@ enum Withdrawal {
 /// A job this core runs.
 struct Active {
     info: Info,
-    /// Its place in its class (CORE-160): its `seq`, until `job.move` changes it.
+    /// Its place in its class (CORE-160): its core-wide submission sequence, until `job.move`
+    /// changes it.
     order_key: i64,
     /// Held by a restart (P4a-R41) until a resume releases it.
     restart_held: bool,
@@ -240,6 +241,20 @@ impl LaneState {
 }
 
 impl Active {
+    /// Whether a pause may withdraw this job's prompt (CORE-160): a running suite engine job
+    /// in `queued_in_engine`, without external side effects, not ending, cancelled,
+    /// preempted or withdrawn already.
+    fn withdrawable(&self) -> bool {
+        self.running
+            && !self.completing
+            && !self.cancelling
+            && !self.preempted
+            && self.withdrawal == Withdrawal::None
+            && self.substatus == Some(Substatus::QueuedInEngine)
+            && self.info.spec.engine.is_some()
+            && !self.info.spec.external_side_effects
+    }
+
     /// The reasons that hold this queued job (none for a job that runs or ends; a withdrawn
     /// one is queued again while its attempt winds down).
     fn hold_reasons(&self, lane: &LaneState) -> Vec<String> {
@@ -263,6 +278,9 @@ struct Queue {
     closed: bool,
     /// What the admission was last told: a job runs or waits for VRAM.
     busy: bool,
+    /// The newest core-wide submission key (Appendix G "Queue order"): above every key of
+    /// the jobs this core queued.
+    last_order: i64,
 }
 
 /// A state change applies only while the job, as the queue holds it, passes this check.
@@ -867,6 +885,7 @@ impl Shared {
         };
         let (reservation, owner) = (first.reservation.clone(), first.owner.clone());
         let first_hash = args_hash(&json!({"kind": first.spec.kind, "args": first.spec.args}));
+        let keys = self.order_keys(news.len());
         let mut rows = Vec::with_capacity(news.len());
         let mut infos = Vec::with_capacity(news.len());
         for (i, new) in news.into_iter().enumerate() {
@@ -926,10 +945,11 @@ impl Shared {
                 external_id: None,
                 batch_id: batch_id.clone(),
                 batch_index,
-                order_key: 0,
+                order_key: keys[i],
                 started_by: started_by.clone(),
                 status_seq: Vec::new(),
                 report: RunReport::default(),
+                withdrawn_id: None,
             });
             infos.push(Info {
                 id: JobId(id),
@@ -1009,6 +1029,24 @@ impl Shared {
         Ok(rows.remove(0))
     }
 
+    /// The next `n` core-wide submission keys (CORE-160; Appendix G "Queue order"): one
+    /// counter for every scope's `state.db`, above every key this core queued and never below
+    /// the time in microseconds, so first in, first out holds across scopes and restarts.
+    fn order_keys(&self, n: usize) -> Vec<i64> {
+        let floor = self
+            .clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+        let mut q = self.queue();
+        (0..n)
+            .map(|_| {
+                q.last_order = q.last_order.saturating_add(1).max(floor);
+                q.last_order
+            })
+            .collect()
+    }
+
     /// A new queue entry for `info`'s job, with its class place `order_key`.
     fn active(info: Info, order_key: i64) -> Active {
         Active {
@@ -1057,6 +1095,7 @@ impl Shared {
             } else {
                 None
             };
+            q.last_order = q.last_order.max(order_key);
             q.jobs.insert(id, Shared::active(info, order_key));
             preempt
         };
@@ -1082,6 +1121,7 @@ impl Shared {
         a.reasons_shown = vec![RESTART_REASON.to_string()];
         a.substatus = row.substatus;
         a.report = row.report.clone();
+        q.last_order = q.last_order.max(row.order_key);
         q.jobs.insert(id, a);
         true
     }
@@ -1522,6 +1562,11 @@ impl Shared {
                             }
                             return self.complete(&info, attempt, End::Cancelled).await;
                         }
+                        // A pause that came during the backoff holds the next attempt
+                        // (CORE-160): it waits again, and runs as that attempt once released.
+                        if self.hold_if_paused(&id, Some(attempt + 1), false).await {
+                            return self.requeue_withdrawn(&info);
+                        }
                         attempt += 1;
                         continue;
                     }
@@ -1590,9 +1635,10 @@ impl Shared {
         self.pump();
     }
 
-    /// A job whose pending prompt a pause withdrew (CORE-160) leaves its lane and waits again:
-    /// the pause wrote its row (`queue_paused`, the engine id cleared), and its next attempt
-    /// posts a new prompt once the old one is gone (CORE-120).
+    /// A job whose pending prompt a pause withdrew (CORE-160), or that a pause held before it
+    /// reached its engine ([`Shared::hold_if_paused`]), leaves its lane and waits again: its
+    /// row was written (`queue_paused`; a withdrawn prompt's id moved to `withdrawn_id`), and
+    /// its next attempt posts a new prompt only once an old one is gone (CORE-120).
     fn requeue_withdrawn(self: &Arc<Self>, info: &Info) {
         {
             let mut q = self.queue();
@@ -1868,8 +1914,10 @@ impl Shared {
         self.changed.send_modify(|n| *n += 1);
     }
 
-    /// `JobCtx::set_substatus`.
-    pub(crate) async fn handler_substatus(&self, id: &JobId, s: Substatus) {
+    /// `JobCtx::set_substatus`. A job reaching `queued_in_engine` while a reason of its lane
+    /// covers it (a pause that came after its POST was decided, CORE-160) has its prompt
+    /// withdrawn as the pause would have.
+    pub(crate) async fn handler_substatus(self: &Arc<Self>, id: &JobId, s: Substatus) {
         let scope = {
             let q = self.queue();
             match q.jobs.get(id.as_str()) {
@@ -1883,6 +1931,93 @@ impl Shared {
         };
         self.apply(id.as_str(), &scope, Change::to(s), Some(live))
             .await;
+        if s != Substatus::QueuedInEngine {
+            return;
+        }
+        let lane = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            jobs.get_mut(id.as_str()).and_then(|a| {
+                let lane = a.info.spec.lane;
+                let covered = !lanes[lane.index()].holding(a.info.spec.priority).is_empty();
+                (covered && a.withdrawable()).then(|| {
+                    a.withdrawal = Withdrawal::Deciding;
+                    lane
+                })
+            })
+        };
+        if let Some(lane) = lane {
+            let (me, id) = (self.clone(), id.to_string());
+            tokio::spawn(async move {
+                me.withdraw_one(&id).await;
+                me.publish_queue(lane);
+            });
+        }
+    }
+
+    /// `JobCtx::hold_if_paused`, and the retry loop's check before the next attempt (CORE-160;
+    /// plan 4a ruling, 2026-10-24): when a reason of its lane covers running job `id`, which
+    /// hasn't reached its engine, its attempt ends the way a withdrawal's does, with nothing
+    /// withdrawn: its row goes to `queue_paused` (with `attempt`, when given; the engine id
+    /// cleared when `clear_external`, for a prompt id persisted but never posted), and it
+    /// waits again ([`Shared::requeue_withdrawn`]). `true` when it was held.
+    pub(crate) async fn hold_if_paused(
+        &self,
+        id: &str,
+        attempt: Option<u32>,
+        clear_external: bool,
+    ) -> bool {
+        let scope = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let Some(a) = jobs.get_mut(id) else {
+                return false;
+            };
+            let covered = !lanes[a.info.spec.lane.index()]
+                .holding(a.info.spec.priority)
+                .is_empty();
+            if !covered
+                || !a.running
+                || a.completing
+                || a.cancelling
+                || a.preempted
+                || a.withdrawal != Withdrawal::None
+            {
+                return false;
+            }
+            a.withdrawal = Withdrawal::Withdrawn;
+            a.held_shown = true;
+            a.info.scope.clone()
+        };
+        tracing::info!(
+            job_id = id,
+            "a paused lane holds a job before it reaches its engine"
+        );
+        let mut c = Change::to(Substatus::QueuePaused);
+        c.attempt = attempt;
+        if clear_external {
+            c.external_id = Some(None);
+        }
+        let held: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
+        self.apply(id, &scope, c, Some(held)).await;
+        true
+    }
+
+    /// `JobCtx::settle_withdrawn`: the prompt a pause withdrew is known gone (`follow` is
+    /// `None`) or is still the job's (`follow` names it, and it becomes the engine id again);
+    /// either way `withdrawn_id` is cleared (CORE-160, CORE-120).
+    pub(crate) async fn handler_settle_withdrawn(
+        &self,
+        id: &JobId,
+        follow: Option<&str>,
+        trace_id: &str,
+    ) -> Result<(), ErrorBody> {
+        let c = Change {
+            external_id: follow.map(|f| Some(f.to_string())),
+            withdrawn_id: Some(None),
+            ..Change::default()
+        };
+        self.handler_row(id, c, trace_id).await
     }
 
     /// `JobCtx::set_external_id`: a guarded update of the running job's row (never a final
@@ -1893,6 +2028,16 @@ impl Shared {
         external_id: Option<&str>,
         trace_id: &str,
     ) -> Result<(), ErrorBody> {
+        let c = Change {
+            external_id: Some(external_id.map(str::to_string)),
+            ..Change::default()
+        };
+        self.handler_row(id, c, trace_id).await
+    }
+
+    /// A guarded update of the running job's row (never a final one) by its handler, without
+    /// an announcement.
+    async fn handler_row(&self, id: &JobId, c: Change, trace_id: &str) -> Result<(), ErrorBody> {
         let scope = {
             let q = self.queue();
             match q.jobs.get(id.as_str()) {
@@ -1902,10 +2047,6 @@ impl Shared {
         };
         let lock = self.job_lock(id.as_str());
         let _serial = lock.lock().await;
-        let c = Change {
-            external_id: Some(external_id.map(str::to_string)),
-            ..Change::default()
-        };
         match record::update(scope.db(), id.as_str(), c, self.now()).await {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(job_unknown(id.as_str(), trace_id)),
@@ -2136,8 +2277,10 @@ impl Shared {
 
     /// Withdraws the pending prompt of running job `id` (marked `Deciding` by the pause):
     /// only its engine's [`Withdraw`] says whether it was still pending. A withdrawn job's
-    /// attempt is told to end, and only then, after the fail point `jobs.after_withdraw`, its
-    /// row changes: the engine id cleared, `queue_paused` (Appendix G "Withdrawal").
+    /// attempt is told to end, and only then, after the fail point `jobs.after_withdraw` (only
+    /// its `abort` means anything: an error is logged and the withdrawal goes on), its row
+    /// changes: the engine id moves to `withdrawn_id`, kept until the next attempt knows the
+    /// old prompt gone (CORE-120), and it is `queue_paused` (Appendix G "Withdrawal").
     async fn withdraw_one(self: &Arc<Self>, id: &str) {
         let decided = |me: &Self, w: Withdrawal| {
             if let Some(a) = me.queue().jobs.get_mut(id)
@@ -2171,22 +2314,22 @@ impl Shared {
         if let Err(e) = self.failpoints.hit("jobs.after_withdraw") {
             tracing::warn!(job_id = id, error = %e, "fail point jobs.after_withdraw");
         }
-        {
-            let mut q = self.queue();
-            if let Some(a) = q.jobs.get_mut(id) {
-                a.withdrawal = Withdrawal::Withdrawn;
-                a.held_shown = true;
-            }
-            q.lanes[lane.index()].withdrawn += 1;
+        if let Some(a) = self.queue().jobs.get_mut(id) {
+            a.withdrawal = Withdrawal::Withdrawn;
+            a.held_shown = true;
         }
         tracing::info!(job_id = id, prompt_id = %external_id, "a paused lane's pending prompt was withdrawn");
         // The row first, then the attempt ends: the attempt writes nothing once withdrawn.
         let c = Change {
             external_id: Some(None),
+            withdrawn_id: Some(Some(external_id.clone())),
             ..Change::to(Substatus::QueuePaused)
         };
         let withdrawn: Guard = |a| a.withdrawal == Withdrawal::Withdrawn && !a.cancelling;
-        self.apply(id, &scope, c, Some(withdrawn)).await;
+        // Counted only once its row says so: a job cancelled meanwhile ends cancelled.
+        if self.apply(id, &scope, c, Some(withdrawn)).await.is_some() {
+            self.queue().lanes[lane.index()].withdrawn += 1;
+        }
         if let Some(a) = self.queue().jobs.get_mut(id)
             && a.withdrawal == Withdrawal::Withdrawn
         {
@@ -2242,7 +2385,9 @@ impl Shared {
                 .filter_map(|id| q.jobs.remove(&id))
                 .map(|a| {
                     a.cancel.send_replace(true);
-                    (a.info, a.running)
+                    // A withdrawn (or held) attempt winding down never reached its engine again:
+                    // its row decides, as for a queued job (the restart hold).
+                    (a.info, a.running && a.withdrawal != Withdrawal::Withdrawn)
                 })
                 .collect();
             self.tell_busy(&mut q);
@@ -2598,13 +2743,9 @@ impl Jobs {
         };
         let since = match &f.since {
             None => None,
-            Some(t) => Some(
-                crate::telemetry::parse_ts(t)
-                    .map(|ms| ms.div_euclid(1000))
-                    .ok_or_else(|| {
-                        params_invalid(format!("since {t:?} is not an RFC 3339 time"), trace_id)
-                    })?,
-            ),
+            Some(t) => Some(rfc3339_ms(t).map(|ms| ms.div_euclid(1000)).ok_or_else(|| {
+                params_invalid(format!("since {t:?} is not an RFC 3339 time"), trace_id)
+            })?),
         };
         let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
@@ -2936,6 +3077,8 @@ impl Jobs {
             if let Some(a) = q.jobs.get_mut(id.as_str()) {
                 a.order_key = key;
             }
+            // A job submitted later still goes after one moved last.
+            q.last_order = q.last_order.max(key);
             key
         };
         let c = Change {
@@ -3105,15 +3248,7 @@ impl Jobs {
                 .into_iter()
                 .filter(|id| {
                     jobs.get_mut(id).is_some_and(|a| {
-                        let eligible = a.running
-                            && !a.completing
-                            && !a.cancelling
-                            && !a.preempted
-                            && a.withdrawal == Withdrawal::None
-                            && a.substatus == Some(Substatus::QueuedInEngine)
-                            && a.info.spec.engine.is_some()
-                            && !a.info.spec.external_side_effects
-                            && why.scope().covers(a.info.spec.priority);
+                        let eligible = a.withdrawable() && why.scope().covers(a.info.spec.priority);
                         if eligible {
                             a.withdrawal = Withdrawal::Deciding;
                         }
@@ -3381,6 +3516,33 @@ impl SnapshotProvider for JobSnapshots {
     }
 }
 
+/// Unix milliseconds of an RFC 3339 time, `Z` or an offset `+HH:MM`/`-HH:MM` (`jobs.list`'s
+/// `since`, Appendix G).
+fn rfc3339_ms(s: &str) -> Option<i64> {
+    if s.ends_with('Z') {
+        return crate::telemetry::parse_ts(s);
+    }
+    let at = s.len().checked_sub(6)?;
+    let (time, offset) = (s.get(..at)?, s.get(at..)?.as_bytes());
+    let sign = match offset[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = &offset[r];
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
+    };
+    let (h, m) = (digits(1..3)?, digits(4..6)?);
+    if offset[3] != b':' || h > 23 || m > 59 {
+        return None;
+    }
+    let utc = crate::telemetry::parse_ts(&format!("{time}Z"))?;
+    Some(utc - sign * (h * 60 + m) * 60_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3551,5 +3713,21 @@ mod tests {
         tokio::task::spawn_blocking(move || states.close())
             .await
             .unwrap();
+    }
+
+    #[test] // spec: Appendix G (jobs.list since)
+    fn since_takes_z_or_an_offset() {
+        let z = rfc3339_ms("2026-10-24T10:00:00Z").unwrap();
+        assert_eq!(rfc3339_ms("2026-10-24T12:00:00+02:00"), Some(z));
+        assert_eq!(rfc3339_ms("2026-10-24T07:30:00-02:30"), Some(z));
+        assert_eq!(rfc3339_ms("2026-10-24T10:00:00.250+00:00"), Some(z + 250));
+        for bad in [
+            "2026-10-24T10:00:00",
+            "2026-10-24T10:00:00+0200",
+            "2026-10-24T10:00:00+24:00",
+            "x",
+        ] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad}");
+        }
     }
 }

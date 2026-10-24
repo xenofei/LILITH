@@ -1405,6 +1405,7 @@ fn earlier_row(job_id: &str, prompt_id: &str, substatus: Substatus, external: bo
         started_by: None,
         status_seq: Vec::new(),
         report: Default::default(),
+        withdrawn_id: None,
     }
 }
 
@@ -2066,41 +2067,36 @@ async fn subtasks_and_indeterminate() {
     assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
 }
 
-/// `execution_cached`'s nodes are the job's `cache_hit_nodes`; when every node of the prompt
-/// was cached the job succeeds with `all_cached` (CORE-117).
+/// `execution_cached`'s nodes are the job's `cache_hit_nodes`; when every node of the prompt but
+/// its output nodes was cached the job succeeds with `all_cached` (CORE-117; plan 4a ruling,
+/// 2026-10-24: the Save node, whose `filename_prefix` is the suite's own, always runs again).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-117
 async fn all_cached_run_says_nothing_changed() {
     let env = TestEnv::new();
     let fake = FakeComfy::start();
     attach(&env, &fake);
     let rig = Rig::new(&env);
-    fake.cached_nodes(&["1", "2"]);
-    let id = rig.submit(tiny_args(1), Priority::Agent).await;
-    let done = rig.done(&id).await;
-    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
-    assert!(done.all_cached, "{done:?}");
-    let mut hits = done.cache_hit_nodes.clone().unwrap();
-    hits.sort();
-    assert_eq!(hits, ["1", "2"]);
-    assert!(
-        done.result.as_ref().unwrap().artifacts.is_empty(),
-        "nothing was saved"
-    );
-    // One node executes: something changed.
+    // The image node is served from the cache; the Save node runs again, as in ComfyUI.
     fake.cached_nodes(&["1"]);
     let id = rig.submit(tiny_args(1), Priority::Agent).await;
     let done = rig.done(&id).await;
     assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
-    assert!(!done.all_cached, "{done:?}");
+    assert!(done.all_cached, "{done:?}");
     assert_eq!(
         done.cache_hit_nodes.as_deref(),
         Some(&["1".to_string()][..])
     );
-    // None cached: no list.
+    assert_eq!(
+        done.result.as_ref().unwrap().artifacts.len(),
+        1,
+        "the Save node ran again: {done:?}"
+    );
+    // The image node executes: something changed. None cached: no list.
     fake.cached_nodes(&[]);
     let id = rig.submit(tiny_args(1), Priority::Agent).await;
     let done = rig.done(&id).await;
-    assert!(!done.all_cached);
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert!(!done.all_cached, "{done:?}");
     assert_eq!(done.cache_hit_nodes, None, "{done:?}");
 }
 
@@ -2150,10 +2146,12 @@ async fn withdraw_only_while_pending_and_repost_with_a_new_id_once() {
         .await;
     assert_eq!(held.pause_reasons, ["manual"]);
     assert_eq!(held.status, JobStatus::Queued);
+    let row = rig.row(&id).await;
+    assert_eq!(row.external_id, None, "the engine id is cleared");
     assert_eq!(
-        rig.row(&id).await.external_id,
-        None,
-        "the engine id is cleared"
+        row.withdrawn_id.as_deref(),
+        Some(old.as_str()),
+        "the old id is kept until it is known gone"
     );
     assert_eq!(queue_deletes(&fake), [json!([old])]);
     assert_eq!(count(&fake, "POST", &format!("/jobs/{old}/cancel")), 0);
@@ -2185,6 +2183,7 @@ async fn withdraw_only_while_pending_and_repost_with_a_new_id_once() {
         jobs_look < history_look && history_look < repost,
         "/api/jobs/{{old}}, then /history/{{old}}, then the POST: {jobs_look} {history_look} {repost}"
     );
+    assert_eq!(rig.row(&id).await.withdrawn_id, None, "known gone");
     fake.release(&outside);
     assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
     let bodies = posted(&fake);
@@ -2273,6 +2272,239 @@ async fn a_prompt_that_starts_between_the_queue_read_and_the_withdrawal_runs_on(
     );
     rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
     fake.release(&outside);
+}
+
+/// Fix round 1, I1 (CORE-160): a job of the lane that is still `submitting` when the lane pauses
+/// (here: its input upload is held) posts nothing. At its POST it is held instead, back in
+/// `queue_paused` with its unposted prompt id cleared, and it posts once after the resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160
+async fn a_pause_while_submitting_holds_the_job_before_it_posts() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let rig = Rig::in_workspace(&env).await;
+    let input = rig.open.as_ref().unwrap().store.root().join("held.png");
+    lil_testkit::files::write_file(&input, b"an input whose upload is held");
+    let mut graph = tiny(1);
+    graph["9"] = json!({"class_type": "LoadImage", "inputs": {"image": "placeholder"}});
+    let args = json!({"graph": graph, "inputs": [{"node": "9", "input": "image", "path": input}]});
+    fake.hold_uploads(true);
+    let id = rig.submit(args, Priority::User).await;
+    rig.until(&id, "the upload is held", |_| {
+        count(&fake, "POST", "/upload/image") == 1
+    })
+    .await;
+    assert_eq!(
+        rig.summary(&id).await.substatus.as_deref(),
+        Some("submitting")
+    );
+    let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    assert_eq!(state.withdrawn, 0, "nothing was in ComfyUI: {state:?}");
+    fake.hold_uploads(false);
+    let held = rig
+        .until(&id, "held at its POST", |j| {
+            j.substatus.as_deref() == Some("queue_paused")
+        })
+        .await;
+    assert_eq!(held.status, JobStatus::Queued);
+    assert_eq!(held.pause_reasons, ["manual"]);
+    let row = rig.row(&id).await;
+    assert_eq!((row.external_id, row.withdrawn_id), (None, None));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(posted(&fake).is_empty(), "nothing is posted while paused");
+
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert_eq!(posted(&fake).len(), 1, "posted once, after the resume");
+}
+
+/// Fix round 1, I1 (CORE-160): a pause that comes while a job waits out a retry's backoff
+/// holds its next attempt: it returns to `queue_paused` and posts nothing until the resume,
+/// then runs as that next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-123
+async fn a_pause_during_a_retry_backoff_holds_the_next_attempt() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    // Refused twice: the first attempt fails and the job waits out its backoff (1 s).
+    fake.fail_next(FakeFailure::Refuse503);
+    fake.fail_next(FakeFailure::Refuse503);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "in its backoff", |j| {
+        j.substatus
+            .as_deref()
+            .is_some_and(|s| s.starts_with("retrying_"))
+    })
+    .await;
+    rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    let held = rig
+        .until(&id, "held after its backoff", |j| {
+            j.substatus.as_deref() == Some("queue_paused")
+        })
+        .await;
+    assert_eq!(held.status, JobStatus::Queued);
+    assert_eq!(held.pause_reasons, ["manual"]);
+    assert_eq!(
+        rig.row(&id).await.attempt,
+        2,
+        "it waits as its next attempt"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(posted(&fake).len(), 2, "only the refused attempt's POSTs");
+
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    let done = rig.done(&id).await;
+    assert_eq!(
+        (done.status, done.attempt),
+        (JobStatus::Succeeded, 2),
+        "{done:?}"
+    );
+    assert_eq!(posted(&fake).len(), 3, "one POST of the next attempt");
+}
+
+/// Fix round 1, I2 (CORE-160, CORE-120): the withdrawn prompt's id is in the row
+/// (`withdrawn_id`), so after a drain (`clean`) or a crash once the withdrawal's row is
+/// written, the next start holds the job, and once it is released the core asks
+/// `/api/jobs/{old}` and `/history/{old}` before its one new `POST /prompt`.
+async fn withdrawn_then_restarted(clean: bool) {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let ids = Arc::new(SeqIds::new());
+    let rig = Rig::with_ids(&env, ids.clone());
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "queued in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let old = rig.row(&id).await.external_id.unwrap();
+    let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    assert_eq!(state.withdrawn, 1, "{state:?}");
+    rig.until(&id, "held", |j| {
+        j.substatus.as_deref() == Some("queue_paused")
+    })
+    .await;
+    if clean {
+        // The drain's shutdown steps.
+        rig.engines.cancel_prompts_step().run().await;
+        rig.jobs.persist_interrupted_step().run().await;
+    }
+    let row = rig.row(&id).await;
+    assert_eq!(
+        (row.status, row.substatus, row.external_id.as_deref()),
+        (JobStatus::Queued, Some(Substatus::QueuePaused), None)
+    );
+    assert_eq!(row.withdrawn_id.as_deref(), Some(old.as_str()));
+    rig.close().await;
+
+    let rig = Rig::with_ids(&env, ids);
+    let marked = rig.jobs.recover_suite().await.unwrap();
+    assert!(marked.is_empty(), "nothing is interrupted: {marked:?}");
+    let held = rig.summary(&id).await;
+    assert_eq!(
+        (held.status, held.substatus.as_deref()),
+        (JobStatus::Queued, Some("queue_paused"))
+    );
+    assert_eq!(held.pause_reasons, ["restart"]);
+    let before = fake.requests().len();
+    rig.jobs.release_restart_held(Lane::GpuHeavy).await;
+    rig.until(&id, "queued in ComfyUI again", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let requests = fake.requests();
+    let jobs_look = first_after(&requests, before, |r| {
+        r.method == "GET" && bare(&r.path) == format!("/jobs/{old}")
+    });
+    let history_look = first_after(&requests, before, |r| {
+        r.method == "GET" && bare(&r.path) == format!("/history/{old}")
+    });
+    let repost = first_after(&requests, before, |r| {
+        r.method == "POST" && bare(&r.path) == "/prompt"
+    });
+    assert!(
+        jobs_look < history_look && history_look < repost,
+        "/api/jobs/{{old}}, then /history/{{old}}, then the POST: {jobs_look} {history_look} {repost}"
+    );
+    assert_eq!(rig.row(&id).await.withdrawn_id, None, "known gone");
+    fake.release(&outside);
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    let bodies = posted(&fake);
+    assert_eq!(bodies.len(), 2, "exactly one new POST /prompt: {bodies:?}");
+    assert_ne!(bodies[1]["prompt_id"], old.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120, ARCH-021
+async fn a_withdrawn_job_asks_about_its_old_prompt_after_a_drain_and_restart() {
+    withdrawn_then_restarted(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120, ARCH-022
+async fn a_withdrawn_job_asks_about_its_old_prompt_after_a_crash() {
+    withdrawn_then_restarted(false).await;
+}
+
+/// Fix round 1, I2 (CORE-160, CORE-120): a crash after the withdrawal's row write, when the
+/// old prompt ran after all (ComfyUI kept it). The row still names it in `withdrawn_id`, so
+/// the next start holds the job; once released, the job finds the old prompt done and takes
+/// its outputs. Nothing is posted again: the work never runs twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120
+async fn a_withdrawn_prompt_that_ran_after_all_is_taken_up_never_posted_again() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let mut row = earlier_row(
+        "j_00000000000000b1",
+        "00000000-0000-4000-8000-0000000000b1",
+        Substatus::QueuePaused,
+        false,
+    );
+    post_as_earlier_core(&fake, &row).await;
+    let old = row.external_id.take().unwrap();
+    row.withdrawn_id = Some(old.clone());
+    row.started_utc = None;
+    let client = ComfyClient::new(&fake.url()).unwrap();
+    let deadline = Instant::now() + DEADLINE;
+    while client.history(&old).await.unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the old prompt did not finish");
+        tokio::time::sleep(POLL).await;
+    }
+    let posts_before = posted(&fake).len();
+
+    let rig = Rig::new(&env);
+    record::insert(rig.states.suite(), row.clone())
+        .await
+        .unwrap();
+    let marked = rig.jobs.recover_suite().await.unwrap();
+    assert!(marked.is_empty(), "{marked:?}");
+    assert_eq!(rig.summary(&row.job_id).await.pause_reasons, ["restart"]);
+    let before = fake.requests().len();
+    rig.jobs.release_restart_held(Lane::GpuHeavy).await;
+    let done = rig.done(&row.job_id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert_eq!(
+        done.result.unwrap().artifacts.len(),
+        1,
+        "the old run's output"
+    );
+    assert_eq!(
+        posted(&fake).len(),
+        posts_before,
+        "nothing was posted again: {:?}",
+        &fake.requests()[before..]
+    );
+    let requests = fake.requests();
+    first_after(&requests, before, |r| {
+        r.method == "GET" && bare(&r.path) == format!("/jobs/{old}")
+    });
+    let after = rig.row(&row.job_id).await;
+    assert_eq!(
+        (after.external_id.as_deref(), after.withdrawn_id),
+        (Some(old.as_str()), None)
+    );
 }
 
 /// A job with external side effects is never withdrawn (it is never posted again by itself).

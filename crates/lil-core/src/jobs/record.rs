@@ -95,13 +95,17 @@ pub struct JobRow {
     pub batch_id: String,
     /// Its 0-based place in the batch.
     pub batch_index: u32,
-    /// Its place in its class (CORE-160); an insert sets it to the row's `seq`.
+    /// Its place in its class (CORE-160): the core-wide submission sequence the runner gives
+    /// it (Appendix G), or, for an insert with none (0), the row's `seq`.
     pub order_key: i64,
     /// Who started it: the `JobSummary`'s `origin` (P4a-R12).
     pub started_by: Option<StartedBy>,
     /// Its status changes, in order (the first and the newest 63).
     pub status_seq: Vec<StatusStep>,
     pub report: RunReport,
+    /// The prompt id a pause withdrew (CORE-160), until its next attempt knows it gone
+    /// (CORE-120).
+    pub withdrawn_id: Option<String>,
 }
 
 /// `b_<the job id's 16 hex>`: the batch of a job that has none (a row from before plan 4a).
@@ -246,6 +250,8 @@ pub struct Change {
     pub external_id: Option<Option<String>>,
     /// Sets the job's place in its class (`job.move`).
     pub order_key: Option<i64>,
+    /// Sets (or, `Some(None)`, clears) the prompt id a pause withdrew.
+    pub withdrawn_id: Option<Option<String>>,
     /// Writes what the job's run reported.
     pub report: Option<RunReport>,
 }
@@ -276,7 +282,7 @@ const COLUMNS: &str = "seq, job_id, kind, lane, priority, module, args, project,
     args_hash, expected_secs, expected_output_bytes, vram_need_mib, engine, grp, \
     external_side_effects, reservation, tool, tool_args, external_id, batch_id, batch_index, \
     order_key, origin, status_seq, engine_device, phase, subtasks, indeterminate, \
-    last_progress_ms, cache_hit_nodes, all_cached";
+    last_progress_ms, cache_hit_nodes, all_cached, withdrawn_id";
 
 /// A JSON column, `None` when it is NULL or doesn't parse (logged).
 fn json_col<T: serde::de::DeserializeOwned>(r: &Row<'_>, i: usize) -> rusqlite::Result<Option<T>> {
@@ -378,6 +384,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
             cache_hit_nodes: json_col(r, 46)?,
             all_cached: r.get::<_, i64>(47)? != 0,
         },
+        withdrawn_id: r.get(48)?,
     })
 }
 
@@ -446,8 +453,8 @@ pub enum Inserted<T> {
     Retried(String),
 }
 
-/// One row's insert in `tx`: its `seq` and `order_key` (its `seq`) are assigned, its
-/// `status_seq` starts with its state.
+/// One row's insert in `tx`: its `seq` is assigned, and its `order_key` when it has none (0:
+/// its `seq`); its `status_seq` starts with its state.
 fn insert_in(tx: &rusqlite::Transaction<'_>, mut r: JobRow) -> rusqlite::Result<JobRow> {
     if r.batch_id.is_empty() {
         r.batch_id = own_batch(&r.job_id);
@@ -461,10 +468,11 @@ fn insert_in(tx: &rusqlite::Transaction<'_>, mut r: JobRow) -> rusqlite::Result<
              finished_utc, watchdog, vram_unchecked, error, result, retry_of, trace_id,
              idem_scope, idem_key, args_hash, expected_secs, expected_output_bytes,
              vram_need_mib, engine, grp, external_side_effects, reservation, tool,
-             tool_args, external_id, batch_id, batch_index, origin, status_seq)
+             tool_args, external_id, batch_id, batch_index, origin, status_seq, order_key,
+             withdrawn_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-             ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+             ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
         params![
             r.job_id,
             r.kind,
@@ -505,10 +513,12 @@ fn insert_in(tx: &rusqlite::Transaction<'_>, mut r: JobRow) -> rusqlite::Result<
             r.batch_index,
             r.started_by.as_ref().map(to_text),
             to_text(&r.status_seq),
+            (r.order_key != 0).then_some(r.order_key),
+            r.withdrawn_id,
         ],
     )?;
     tx.execute(
-        "UPDATE jobs SET order_key = seq WHERE job_id = ?1",
+        "UPDATE jobs SET order_key = seq WHERE job_id = ?1 AND order_key IS NULL",
         params![r.job_id],
     )?;
     Ok(get_in(tx, &r.job_id)?.expect("the row was just inserted"))
@@ -657,6 +667,9 @@ pub async fn update(
             if let Some(key) = c.order_key {
                 r.order_key = key;
             }
+            if let Some(withdrawn_id) = c.withdrawn_id {
+                r.withdrawn_id = withdrawn_id;
+            }
             if let Some(report) = c.report {
                 r.report = report;
             }
@@ -671,7 +684,7 @@ pub async fn update(
                      vram_unchecked = ?10, watchdog = ?11, external_id = ?12, order_key = ?13,
                      status_seq = ?14, engine_device = ?15, phase = ?16, subtasks = ?17,
                      indeterminate = ?18, last_progress_ms = ?19, cache_hit_nodes = ?20,
-                     all_cached = ?21
+                     all_cached = ?21, withdrawn_id = ?22
                  WHERE job_id = ?1",
                 params![
                     job_id,
@@ -695,6 +708,7 @@ pub async fn update(
                     report.last_progress_ms,
                     report.cache_hit_nodes.as_ref().map(to_text),
                     i64::from(report.all_cached),
+                    r.withdrawn_id,
                 ],
             )?;
             tx.commit()?;
@@ -862,6 +876,7 @@ mod tests {
             started_by: None,
             status_seq: Vec::new(),
             report: RunReport::default(),
+            withdrawn_id: None,
         }
     }
 

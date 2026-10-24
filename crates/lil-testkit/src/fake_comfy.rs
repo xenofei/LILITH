@@ -203,7 +203,9 @@ impl FakeComfy {
     /// From now on, the nodes of each prompt whose ids are in `nodes` are served from the
     /// cache, as ComfyUI does for a node whose inputs didn't change: the run's
     /// `execution_cached` names them, and they send no `executing`, `progress` or
-    /// `progress_state` and write no output. An empty list ends it.
+    /// `progress_state` and write no output. A Save node left out runs again and writes its
+    /// output, as ComfyUI's does with the suite's own `filename_prefix`, part of its cache key.
+    /// An empty list ends it.
     pub fn cached_nodes(&self, nodes: &[&str]) {
         self.shared.lock().cached = nodes.iter().map(|n| (*n).to_string()).collect();
     }

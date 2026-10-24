@@ -49,7 +49,8 @@ pub const NAMES: &[&str] = &[
     // After a cap reservation commits, before the call runs (Task 16).
     "caps.after_reserve",
     // After the engine answered a paused lane's withdrawal, before the job's row
-    // changes (plan 4a, CORE-160).
+    // changes (plan 4a, CORE-160). Only `abort` means anything here: an error is logged and
+    // the withdrawal goes on (Appendix G).
     "jobs.after_withdraw",
 ];
 

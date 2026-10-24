@@ -1037,6 +1037,54 @@ async fn class_rank_then_fifo() {
     fx.shutdown().await;
 }
 
+/// Fix round 1, I3 (CORE-124, CORE-160; Appendix G "Queue order"): the order key is one
+/// core-wide submission sequence, not each `state.db`'s `seq`, so jobs of the suite scope and of
+/// a workspace, submitted alternately into one lane and class, start in submission order even
+/// when the suite `state.db`'s own sequence runs ahead.
+#[tokio::test(start_paused = true)] // spec: CORE-124, CORE-160
+async fn fifo_within_a_class_holds_across_the_suite_and_workspace_scopes() {
+    let fx = Fx::workspace().await;
+    let suite = || {
+        let mut c = fx.ctx();
+        c.workspace = None;
+        c.idem_scope = "cli|none".into();
+        c
+    };
+    // The suite state.db's own sequence runs ahead of the workspace's.
+    for _ in 0..5 {
+        let job = fx
+            .jobs
+            .submit(&suite(), spec(Lane::Cpu, Priority::Agent, json!({})))
+            .await
+            .unwrap();
+        fx.finished(&job.job_id).await;
+    }
+    let first = self_gated(&fx, Priority::Agent, None).await;
+    fx.handler.until_started(&first).await;
+    let mut want = vec![first];
+    for i in 0..4 {
+        let caller = if i % 2 == 0 { suite() } else { fx.ctx() };
+        let job = fx
+            .jobs
+            .submit(
+                &caller,
+                spec(Lane::GpuHeavy, Priority::Agent, json!({"gate_self": true})),
+            )
+            .await
+            .unwrap();
+        want.push(job.job_id);
+    }
+    let skip = fx.handler.started().len() - 1;
+    for n in 0..want.len() {
+        fx.handler.until(|s| s.runs.len() > skip + n).await;
+        let job = fx.handler.runs()[skip + n].job.clone();
+        fx.handler.open(&job);
+        fx.finished(&job).await;
+    }
+    assert_eq!(fx.handler.started()[skip..], want[..]);
+    fx.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)] // spec: CORE-124
 async fn grouping_never_overtakes_a_job_more_than_8_times() {
     let fx = Fx::suite().await;

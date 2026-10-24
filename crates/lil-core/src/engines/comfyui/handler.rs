@@ -54,16 +54,20 @@
 //! the node ComfyUI reports `executing` ([`phase_of`]), and is `ingesting` from
 //! `execution_success` until the outputs are staged; each `executing` and `progress` is a sign
 //! of life, and a node is `indeterminate` until it reports measurable progress; the nodes of
-//! `execution_cached` are the job's `cache_hit_nodes`, and when every node of the prompt was
-//! cached the job is `all_cached`; the GPU adapter's name is its `engine_device`.
+//! `execution_cached` are the job's `cache_hit_nodes`, and when every node of the prompt but its
+//! output nodes (those with a `filename_prefix`, which always run again) was cached the job is
+//! `all_cached`; the GPU adapter's name is its `engine_device`.
 //!
 //! **Withdrawal** ([`ComfyWithdraw`], CORE-160; plan 4a ruling, 2026-10-24): a paused lane's
 //! suite prompt is taken out of ComfyUI's queue only while `/queue` lists it pending, with
 //! `POST /queue {"delete"}` (which never touches a running prompt, so one that started in
 //! between runs on), under the same lock as the POST and the cancel; `/api/jobs/{id}` then
-//! says whether it is gone. The attempt ignores its prompt's disappearance and ends when the
-//! runner tells it, and the job's next attempt asks about the old prompt (`/api/jobs/{old}`,
-//! `/history/{old}`) before it posts a new one (CORE-120).
+//! says whether it is gone (asked again a few times when ComfyUI can't say; never seen gone,
+//! it isn't withdrawn). The attempt ignores its prompt's disappearance and ends when the
+//! runner tells it; the old id is kept in the row's `withdrawn_id`, and the job's next attempt,
+//! in this core run or after a restart, asks about it (`/api/jobs/{old}`, `/history/{old}`)
+//! before it posts a new one, and follows it if it is still there (CORE-120). A paused lane's
+//! job that hasn't posted yet is held at the POST ([`JobCtx::hold_if_paused`]).
 //!
 //! **Cancel** ([`JobHandler::cancel_in_engine`]) posts `POST /api/jobs/{id}/cancel` once, never
 //! `/interrupt` (ARCH-021); the POST and the cancel take one lock, so a prompt is either never
@@ -189,6 +193,22 @@ pub fn prefix_outputs(graph: &mut Value, job: &JobId) -> String {
         }
     }
     prefix
+}
+
+/// The nodes of `graph` with a `filename_prefix` input: its output nodes, as
+/// [`prefix_outputs`] sees them.
+fn output_nodes(graph: &Value) -> HashSet<String> {
+    graph
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, n)| {
+            n.get("inputs")
+                .and_then(|i| i.get("filename_prefix"))
+                .is_some()
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// `lil_<first 16 hex of the job id>_`.
@@ -393,8 +413,6 @@ struct Prompts {
     /// Every prompt id the suite's attempts took up or minted in this core run, claimed
     /// before the POST: the outside-jobs poll tells the suite's prompts apart by id only.
     ids: HashSet<String>,
-    /// The prompt a pause withdrew, by job: its next attempt asks about it first.
-    withdrawn: HashMap<String, String>,
 }
 
 /// One running `comfy.prompt` attempt.
@@ -453,18 +471,6 @@ impl SuitePrompts {
     /// Every prompt id the suite claimed in this core run ([`SuitePrompts::claim`]).
     pub(crate) fn prompt_ids(&self) -> HashSet<String> {
         self.lock().ids.clone()
-    }
-
-    /// The pending prompt of `job` a pause withdrew (CORE-160).
-    fn note_withdrawn(&self, job: &JobId, prompt_id: &str) {
-        self.lock()
-            .withdrawn
-            .insert(job.to_string(), prompt_id.to_string());
-    }
-
-    /// The prompt a pause withdrew from `job`, once.
-    fn take_withdrawn(&self, job: &JobId) -> Option<String> {
-        self.lock().withdrawn.remove(job.as_str())
     }
 
     /// The `CancelEnginePrompts` step: the gate closes (no attempt enters or posts any more),
@@ -587,11 +593,18 @@ pub const INGESTING_PHASE: &str = "ingesting";
 /// Withdraws a pending `comfy.prompt` prompt for a paused lane (module docs, CORE-160; plan 4a
 /// ruling, 2026-10-24): only while `/queue` lists it pending, with `POST /queue {"delete"}`,
 /// which never touches a running prompt, under the lock of the POST; then `/api/jobs/{id}`
-/// says whether it is gone (withdrawn) or started (it runs on).
+/// says whether it is gone (withdrawn) or started (it runs on). When ComfyUI can't say, it is
+/// asked again [`LOOK_AGAIN`] times; a prompt never seen gone isn't withdrawn (plan 4a
+/// ruling, 2026-10-24): the attempt follows it on.
 #[derive(Debug)]
 pub struct ComfyWithdraw {
     engines: Weak<Engines>,
 }
+
+/// How often a withdrawal asks again where a prompt is when ComfyUI didn't say, and how long
+/// it waits before each.
+const LOOK_AGAIN: u32 = 3;
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(250);
 
 /// Where a prompt is after a withdrawal's delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,26 +671,33 @@ impl ComfyWithdraw {
         // Its disappearance from now on is the withdrawal's, not an outside cancel.
         live.withdrawn.store(true, Ordering::SeqCst);
         let deleted = client.delete_pending(prompt_id).await;
-        let outcome = match (Self::after_delete(client, prompt_id).await, &deleted) {
-            (AfterDelete::Gone, _) => WithdrawOutcome::Withdrawn,
-            (AfterDelete::Started, _) => WithdrawOutcome::AlreadyStarted,
-            (AfterDelete::Pending, _) | (AfterDelete::Unknown, Err(_)) => {
-                WithdrawOutcome::NotPending
+        // Whether or not the delete was answered, only where the prompt is decides; a look
+        // with no answer is asked again, and still unknown it is no withdrawal (the gone-check
+        // never settled it).
+        let mut after = Self::after_delete(client, prompt_id).await;
+        for _ in 0..LOOK_AGAIN {
+            if after != AfterDelete::Unknown {
+                break;
             }
-            // ComfyUI took the delete but can't be asked now: taken as withdrawn. Its next
-            // attempt still asks about the old prompt first and follows it if it runs after
-            // all (CORE-120), so it never runs twice.
-            (AfterDelete::Unknown, Ok(())) => WithdrawOutcome::Withdrawn,
+            tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+            after = Self::after_delete(client, prompt_id).await;
+        }
+        let outcome = match after {
+            AfterDelete::Gone => WithdrawOutcome::Withdrawn,
+            AfterDelete::Started => WithdrawOutcome::AlreadyStarted,
+            AfterDelete::Pending | AfterDelete::Unknown => WithdrawOutcome::NotPending,
         };
         if let Err(e) = &deleted {
             tracing::warn!(job_id = %job, prompt_id, error = %e, outcome = ?outcome, "the withdrawal's delete got no answer; where the prompt is decides");
+        }
+        if after == AfterDelete::Unknown {
+            tracing::warn!(job_id = %job, prompt_id, "ComfyUI doesn't say where a prompt is after the withdrawal's delete; it isn't taken as withdrawn, and the attempt follows it on");
         }
         if outcome != WithdrawOutcome::Withdrawn {
             live.withdrawn.store(false, Ordering::SeqCst);
             return outcome;
         }
         posted.cancel_sent = true;
-        comfy.prompts().note_withdrawn(job, prompt_id);
         WithdrawOutcome::Withdrawn
     }
 }
@@ -767,13 +787,13 @@ fn unreachable(e: &ComfyError, job: &JobCtx) -> JobFailure {
     ))
 }
 
-/// The prompt id an earlier attempt persisted (CORE-120), read from the job's row. A row that
-/// can't be read is no answer (Task 12 re-review N3): a job with external side effects ends
+/// The prompt id an earlier attempt persisted (CORE-120), and the one a pause withdrew
+/// (`withdrawn_id`, CORE-160), read from the job's row. A row that can't be read is no answer (Task 12 re-review N3): a job with external side effects ends
 /// `Unknown`, since an earlier prompt may have been sent and paid for; any other job is retried
 /// later. Never "no earlier prompt", which would post a new one.
-async fn earlier_prompt(job: &JobCtx) -> Result<Option<String>, JobFailure> {
+async fn earlier_prompt(job: &JobCtx) -> Result<(Option<String>, Option<String>), JobFailure> {
     match record::get(&job.state, job.id.as_str()).await {
-        Ok(row) => Ok(row.and_then(|r| r.external_id)),
+        Ok(row) => Ok(row.map_or((None, None), |r| (r.external_id, r.withdrawn_id))),
         Err(e) => {
             tracing::error!(job_id = %job.id, error = %e, "the job's row can't be read before its attempt");
             let e = error(
@@ -837,7 +857,7 @@ impl JobHandler for ComfyPromptHandler {
                     // An earlier prompt with external side effects that can't be looked at is
                     // unknown (fail closed, CORE-128); so is a row that can't be read.
                     let earlier = match earlier_prompt(job).await {
-                        Ok(earlier) => earlier.is_some(),
+                        Ok(earlier) => earlier.0.is_some(),
                         Err(failure) if external => return Err(failure),
                         Err(_) => false,
                     };
@@ -882,6 +902,7 @@ impl JobHandler for ComfyPromptHandler {
                 started: None,
                 accepted: false,
                 abandoned: false,
+                outputs: output_nodes(&args.graph),
                 classes,
                 cached: HashSet::new(),
             };
@@ -953,6 +974,9 @@ struct Attempt<'a> {
     classes: HashMap<String, String>,
     /// The nodes ComfyUI served from its cache.
     cached: HashSet<String>,
+    /// The graph's output nodes, whose `filename_prefix` the suite sets ([`prefix_outputs`]):
+    /// they always run again, since the prefix is part of ComfyUI's cache key.
+    outputs: HashSet<String>,
 }
 
 /// How a followed prompt ended, before its outcome is made.
@@ -995,37 +1019,11 @@ impl Attempt<'_> {
         // CORE-120: an earlier attempt's prompt is asked about before anything is posted. A
         // row that can't be read says nothing about one, so nothing is posted (re-review N3:
         // fail closed; paid work may have been sent).
-        let earlier = earlier_prompt(self.job).await?;
-        // A prompt a pause withdrew (CORE-160) is asked about before a new one is posted, as an
-        // earlier attempt's is (CORE-120): `/api/jobs/{old}`, then `/history/{old}`.
-        let earlier = match earlier {
-            Some(prompt_id) => Some(prompt_id),
-            None => match self.comfy.prompts().take_withdrawn(&self.job.id) {
-                None => None,
-                Some(old) => match self.client.state(&old).await {
-                    Ok(RemoteState::Queued | RemoteState::Running) => {
-                        tracing::warn!(prompt_id = %old, "a withdrawn prompt is still in ComfyUI; it is followed");
-                        self.job
-                            .set_external_id(&old)
-                            .await
-                            .map_err(JobFailure::Final)?;
-                        Some(old)
-                    }
-                    Ok(RemoteState::Done(history)) if succeeded(&history) => {
-                        self.job
-                            .set_external_id(&old)
-                            .await
-                            .map_err(JobFailure::Final)?;
-                        Some(old)
-                    }
-                    Ok(_) => None,
-                    Err(e) => {
-                        // Nothing is known: it is asked about again next time.
-                        self.comfy.prompts().note_withdrawn(&self.job.id, &old);
-                        return Err(unreachable(&e, self.job));
-                    }
-                },
-            },
+        let (earlier, withdrawn) = earlier_prompt(self.job).await?;
+        let earlier = match (earlier, withdrawn) {
+            (Some(prompt_id), _) => Some(prompt_id),
+            (None, None) => None,
+            (None, Some(old)) => self.settle_withdrawn(&old).await?,
         };
         if let Some(prompt_id) = earlier {
             // Known to the shutdown step and to a cancel at once (I2), registered before the
@@ -1308,7 +1306,33 @@ impl Attempt<'_> {
         Ok(())
     }
 
-    /// `POST /prompt`, under the cancel lock (module docs, step 2).
+    /// The prompt a pause withdrew (the row's `withdrawn_id`, CORE-160), asked about before a
+    /// new one is posted, as an earlier attempt's is (CORE-120): `/api/jobs/{old}`, then
+    /// `/history/{old}` (and `/queue`). Still in ComfyUI, or done with outputs, it is the
+    /// job's prompt again and is followed (`Some`); gone, a new one may be posted (`None`).
+    /// `withdrawn_id` is cleared only with that answer, so after a stop, a crash or a restart
+    /// hold the next attempt asks again: the work never runs twice.
+    async fn settle_withdrawn(&self, old: &str) -> Result<Option<String>, JobFailure> {
+        let follow = match self.client.state(old).await {
+            Ok(RemoteState::Queued | RemoteState::Running) => {
+                tracing::warn!(prompt_id = %old, "a withdrawn prompt is still in ComfyUI; it is followed");
+                true
+            }
+            Ok(RemoteState::Done(history)) => succeeded(&history),
+            Ok(RemoteState::Gone | RemoteState::Cancelled) => false,
+            // Nothing is known: the row keeps it, and it is asked about again next time.
+            Err(e) => return Err(unreachable(&e, self.job)),
+        };
+        let follow = follow.then_some(old);
+        self.job
+            .settle_withdrawn(follow)
+            .await
+            .map_err(JobFailure::Final)?;
+        Ok(follow.map(str::to_string))
+    }
+
+    /// `POST /prompt`, under the cancel lock (module docs, step 2). A pause of the job's lane
+    /// that came before it is posted holds it instead (CORE-160): nothing is posted.
     async fn post(
         &mut self,
         prompt_id: &str,
@@ -1322,6 +1346,13 @@ impl Attempt<'_> {
         }
         if self.cancelled() {
             return Err(JobFailure::Final(cancelled_error(&self.job.trace_id)));
+        }
+        if self.job.hold_if_paused().await {
+            return Err(JobFailure::Retryable(error(
+                &codes::COMFYUI_UNREACHABLE,
+                "The job's lane was paused before its prompt was sent; it waits again.",
+                self.job,
+            )));
         }
         for resubmit in [false, true] {
             if resubmit {
@@ -1524,9 +1555,14 @@ impl Attempt<'_> {
             }
             ComfyEvent::Executed { .. } => {}
             ComfyEvent::Success { .. } => {
-                // Every node of the prompt served from the cache: nothing changed (CORE-117).
-                if !self.classes.is_empty() && self.classes.keys().all(|n| self.cached.contains(n))
-                {
+                // Every node of the prompt but its output nodes served from the cache: nothing
+                // changed (CORE-117; plan 4a ruling, 2026-10-24: the output nodes run again).
+                let mut inner = self
+                    .classes
+                    .keys()
+                    .filter(|n| !self.outputs.contains(*n))
+                    .peekable();
+                if inner.peek().is_some() && inner.all(|n| self.cached.contains(n)) {
                     self.job.set_all_cached();
                 }
                 return Some(Ended::Success(None));

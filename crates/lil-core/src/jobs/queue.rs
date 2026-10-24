@@ -2,9 +2,9 @@
 //!
 //! The candidates are the lane's queued jobs that nothing holds. The best class present wins
 //! (`interactive` > `user` > `agent`); within it a job requeued at the head (a preempted one,
-//! CORE-125) comes first, then the lower `order_key` (CORE-160: a job's `seq`, until
-//! `job.move` puts it at the front or the back of its class; a move is never counted as an
-//! overtake). When the lane last ran a job of a `group` (a model profile),
+//! CORE-125) comes first, then the lower `order_key` (CORE-160: its core-wide submission
+//! sequence, until `job.move` puts it at the front or the back of its class; a move is never
+//! counted as an overtake), then the job id. When the lane last ran a job of a `group` (a model profile),
 //! the oldest job of the class with that group may go first, overtaking the older jobs of its
 //! class, unless one of them has been overtaken [`MAX_OVERTAKES`] times already or was
 //! requeued at the head; then the class's first job goes.
@@ -36,7 +36,7 @@ pub struct Pick<'a> {
 pub fn pick<'a>(candidates: &[Candidate<'a>], lane_group: Option<&str>) -> Option<Pick<'a>> {
     let best = candidates.iter().map(|c| c.priority).min()?;
     let mut class: Vec<&Candidate<'a>> = candidates.iter().filter(|c| c.priority == best).collect();
-    class.sort_by_key(|c| (!c.head, c.order));
+    class.sort_by_key(|c| (!c.head, c.order, c.id));
     let first = Pick {
         id: class[0].id,
         overtakes: Vec::new(),

@@ -20,12 +20,14 @@
 //! - **Lanes and the queue** ([`queue`]). Each lane (`gpu-heavy`, `cpu`) runs at most one job
 //!   at a time; the next starts when it ends (CORE-121, CORE-123, ARCH-071). The next job is
 //!   the first of the best class (`interactive` > `user` > `agent`), the lowest `order_key`
-//!   within it (its `seq`, until [`Jobs::move_job`] puts it at the front or the back of its
-//!   class, CORE-160); a job with a `group` (the lane's last group) may move ahead of older
-//!   jobs of its class, but never past one that was overtaken that way 8 times (CORE-124). A
-//!   lane's pause ([`Jobs::pause`], reasons in [`pause`]) is decided before the admission: a
-//!   job it covers isn't picked and shows `queue_paused`; a suite prompt still pending in its
-//!   engine is withdrawn ([`Withdraw`]). With
+//!   within it (its core-wide submission sequence, one counter for every scope, until
+//!   [`Jobs::move_job`] puts it at the front or the back of its class, CORE-160); a job with
+//!   a `group` (the lane's last group) may move ahead of older jobs of its class, but never
+//!   past one that was overtaken that way 8 times (CORE-124). A lane's pause ([`Jobs::pause`],
+//!   reasons in [`pause`]) is decided before the admission: a job it covers isn't picked and
+//!   shows `queue_paused`; a suite prompt still pending in its engine is withdrawn
+//!   ([`Withdraw`]), and one not posted yet (`submitting`, or in a retry's backoff) is held
+//!   before it posts. With
 //!   `[jobs] preempt_agent_batches = true` an `interactive` job cancels the running `agent`
 //!   engine job of its lane, which goes back to the head of its class (CORE-125). Before a job
 //!   starts, the [`Admission`] (the GPU scheduler, [`scheduler`]; [`AlwaysAdmit`] by default)
@@ -820,6 +822,26 @@ impl JobCtx {
     pub async fn clear_external_id(&self) -> Result<(), ErrorBody> {
         self.jobs
             .handler_external_id(&self.id, None, &self.trace_id)
+            .await
+    }
+
+    /// Called under the handler's POST lock just before it posts to its engine (CORE-160): when
+    /// a reason of the job's lane covers it now, nothing may be posted. The runner then holds
+    /// the job (`queue_paused`, its unposted engine id cleared) and `true` comes back: the
+    /// handler returns any error, and its attempt ends the way a withdrawn one does.
+    pub async fn hold_if_paused(&self) -> bool {
+        self.jobs.hold_if_paused(self.id.as_str(), None, true).await
+    }
+
+    /// Settles the row's `withdrawn_id`, the prompt a pause withdrew (CORE-160), once the
+    /// engine said where it is (CORE-120): gone (`follow` is `None`), or still the job's
+    /// (`follow` names it, and it becomes the row's `external_id` again).
+    ///
+    /// # Errors
+    /// As [`JobCtx::set_external_id`].
+    pub async fn settle_withdrawn(&self, follow: Option<&str>) -> Result<(), ErrorBody> {
+        self.jobs
+            .handler_settle_withdrawn(&self.id, follow, &self.trace_id)
             .await
     }
 
