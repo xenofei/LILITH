@@ -294,3 +294,5 @@ CORE-178 = "manual"
 CORE-179 = "manual"
 APP-163 = "manual"
 APP-164 = "manual"
+# Plan 4a (Task 2): keep-awake, which Task 9's desktop-state tests cite.
+ARCH-127 = "test"
