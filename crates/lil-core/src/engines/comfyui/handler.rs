@@ -50,6 +50,21 @@
 //!    written salvaged by the prefix ([`super::salvage::salvage`]); the runner re-runs an
 //!    `agent` job once, unless it has external side effects (CORE-128).
 //!
+//! **Plan 4a's job fields** (CORE-117; Appendix G "Jobs"): the phase follows the class type of
+//! the node ComfyUI reports `executing` ([`phase_of`]), and is `ingesting` from
+//! `execution_success` until the outputs are staged; each `executing` and `progress` is a sign
+//! of life, and a node is `indeterminate` until it reports measurable progress; the nodes of
+//! `execution_cached` are the job's `cache_hit_nodes`, and when every node of the prompt was
+//! cached the job is `all_cached`; the GPU adapter's name is its `engine_device`.
+//!
+//! **Withdrawal** ([`ComfyWithdraw`], CORE-160; plan 4a ruling, 2026-10-24): a paused lane's
+//! suite prompt is taken out of ComfyUI's queue only while `/queue` lists it pending, with
+//! `POST /queue {"delete"}` (which never touches a running prompt, so one that started in
+//! between runs on), under the same lock as the POST and the cancel; `/api/jobs/{id}` then
+//! says whether it is gone. The attempt ignores its prompt's disappearance and ends when the
+//! runner tells it, and the job's next attempt asks about the old prompt (`/api/jobs/{old}`,
+//! `/history/{old}`) before it posts a new one (CORE-120).
+//!
 //! **Cancel** ([`JobHandler::cancel_in_engine`]) posts `POST /api/jobs/{id}/cancel` once, never
 //! `/interrupt` (ARCH-021); the POST and the cancel take one lock, so a prompt is either never
 //! posted or cancelled after it was. The `CancelEnginePrompts` shutdown step
@@ -79,7 +94,7 @@ use crate::engines::{EngineClass, Engines};
 use crate::jobs::record;
 use crate::jobs::{
     EngineKind, ExecWindow, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobId, JobSpec,
-    Lane, Priority, Substatus, cancelled_error,
+    Lane, Priority, Substatus, Withdraw, WithdrawOutcome, cancelled_error,
 };
 use crate::store::{WsPath, fsops};
 
@@ -378,6 +393,8 @@ struct Prompts {
     /// Every prompt id the suite's attempts took up or minted in this core run, claimed
     /// before the POST: the outside-jobs poll tells the suite's prompts apart by id only.
     ids: HashSet<String>,
+    /// The prompt a pause withdrew, by job: its next attempt asks about it first.
+    withdrawn: HashMap<String, String>,
 }
 
 /// One running `comfy.prompt` attempt.
@@ -388,6 +405,9 @@ pub(crate) struct Live {
     posted: tokio::sync::Mutex<Posted>,
     /// The shutdown step ran: the job ends interrupted.
     shutdown: AtomicBool,
+    /// A pause is withdrawing (or withdrew) the prompt: its disappearance is no outside cancel,
+    /// and the attempt ends once the runner tells it.
+    withdrawn: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -433,6 +453,18 @@ impl SuitePrompts {
     /// Every prompt id the suite claimed in this core run ([`SuitePrompts::claim`]).
     pub(crate) fn prompt_ids(&self) -> HashSet<String> {
         self.lock().ids.clone()
+    }
+
+    /// The pending prompt of `job` a pause withdrew (CORE-160).
+    fn note_withdrawn(&self, job: &JobId, prompt_id: &str) {
+        self.lock()
+            .withdrawn
+            .insert(job.to_string(), prompt_id.to_string());
+    }
+
+    /// The prompt a pause withdrew from `job`, once.
+    fn take_withdrawn(&self, job: &JobId) -> Option<String> {
+        self.lock().withdrawn.remove(job.as_str())
     }
 
     /// The `CancelEnginePrompts` step: the gate closes (no attempt enters or posts any more),
@@ -527,6 +559,141 @@ impl Drop for LiveGuard {
         {
             prompts.jobs.remove(&self.job);
         }
+    }
+}
+
+/// The phase of a node of class type `class` (Appendix G "Phase"), the first match winning:
+/// `Loader` → `loading_models`; `TextEncode` → `encoding`; `Sampler` → `sampling`; `Decode` →
+/// `decoding`; starting `Save` or `Preview` → `saving`; anything else `other`.
+pub fn phase_of(class: &str) -> &'static str {
+    if class.contains("Loader") {
+        "loading_models"
+    } else if class.contains("TextEncode") {
+        "encoding"
+    } else if class.contains("Sampler") {
+        "sampling"
+    } else if class.contains("Decode") {
+        "decoding"
+    } else if class.starts_with("Save") || class.starts_with("Preview") {
+        "saving"
+    } else {
+        "other"
+    }
+}
+
+/// The phase from `execution_success` until the outputs are staged.
+pub const INGESTING_PHASE: &str = "ingesting";
+
+/// Withdraws a pending `comfy.prompt` prompt for a paused lane (module docs, CORE-160; plan 4a
+/// ruling, 2026-10-24): only while `/queue` lists it pending, with `POST /queue {"delete"}`,
+/// which never touches a running prompt, under the lock of the POST; then `/api/jobs/{id}`
+/// says whether it is gone (withdrawn) or started (it runs on).
+#[derive(Debug)]
+pub struct ComfyWithdraw {
+    engines: Weak<Engines>,
+}
+
+/// Where a prompt is after a withdrawal's delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterDelete {
+    Gone,
+    Pending,
+    Started,
+    Unknown,
+}
+
+impl ComfyWithdraw {
+    pub fn new(engines: Weak<Engines>) -> ComfyWithdraw {
+        ComfyWithdraw { engines }
+    }
+
+    /// Where `prompt_id` is now: `/api/jobs/{id}` first (absent: gone; `pending`: still
+    /// queued; anything else: it started), else the fuller look of [`ComfyClient::state`].
+    async fn after_delete(client: &ComfyClient, prompt_id: &str) -> AfterDelete {
+        match client.job_detail(prompt_id).await {
+            Ok(None) => return AfterDelete::Gone,
+            Ok(Some(job)) if job.get("status").and_then(Value::as_str) == Some("pending") => {
+                return AfterDelete::Pending;
+            }
+            Ok(Some(_)) => return AfterDelete::Started,
+            Err(_) => {}
+        }
+        match client.state(prompt_id).await {
+            Ok(RemoteState::Gone) => AfterDelete::Gone,
+            Ok(RemoteState::Queued) => AfterDelete::Pending,
+            Ok(RemoteState::Running | RemoteState::Done(_) | RemoteState::Cancelled) => {
+                AfterDelete::Started
+            }
+            Err(_) => AfterDelete::Unknown,
+        }
+    }
+
+    async fn run(&self, job: &JobId, prompt_id: &str) -> WithdrawOutcome {
+        let Some(engines) = self.engines.upgrade() else {
+            return WithdrawOutcome::NotPending;
+        };
+        let comfy = engines.comfy();
+        let (Some(live), Some(client)) = (comfy.prompts().get(job), comfy.client()) else {
+            return WithdrawOutcome::NotPending;
+        };
+        // No POST or cancel of the attempt runs meanwhile.
+        let mut posted = live.posted.lock().await;
+        if posted.prompt_id.as_deref() != Some(prompt_id) || posted.cancel_sent || live_shut(&live)
+        {
+            return WithdrawOutcome::NotPending;
+        }
+        let queue = match client.queue().await {
+            Ok(queue) => queue,
+            Err(e) => {
+                tracing::info!(job_id = %job, prompt_id, error = %e, "/queue can't be read; the prompt is not withdrawn");
+                return WithdrawOutcome::NotPending;
+            }
+        };
+        if queue.running.iter().any(|e| e.prompt_id == prompt_id) {
+            return WithdrawOutcome::AlreadyStarted;
+        }
+        if !queue.pending.iter().any(|e| e.prompt_id == prompt_id) {
+            return WithdrawOutcome::NotPending;
+        }
+        // Its disappearance from now on is the withdrawal's, not an outside cancel.
+        live.withdrawn.store(true, Ordering::SeqCst);
+        let deleted = client.delete_pending(prompt_id).await;
+        let outcome = match (Self::after_delete(client, prompt_id).await, &deleted) {
+            (AfterDelete::Gone, _) => WithdrawOutcome::Withdrawn,
+            (AfterDelete::Started, _) => WithdrawOutcome::AlreadyStarted,
+            (AfterDelete::Pending, _) | (AfterDelete::Unknown, Err(_)) => {
+                WithdrawOutcome::NotPending
+            }
+            // ComfyUI took the delete but can't be asked now: taken as withdrawn. Its next
+            // attempt still asks about the old prompt first and follows it if it runs after
+            // all (CORE-120), so it never runs twice.
+            (AfterDelete::Unknown, Ok(())) => WithdrawOutcome::Withdrawn,
+        };
+        if let Err(e) = &deleted {
+            tracing::warn!(job_id = %job, prompt_id, error = %e, outcome = ?outcome, "the withdrawal's delete got no answer; where the prompt is decides");
+        }
+        if outcome != WithdrawOutcome::Withdrawn {
+            live.withdrawn.store(false, Ordering::SeqCst);
+            return outcome;
+        }
+        posted.cancel_sent = true;
+        comfy.prompts().note_withdrawn(job, prompt_id);
+        WithdrawOutcome::Withdrawn
+    }
+}
+
+/// The shutdown step ran for `live`'s attempt.
+fn live_shut(live: &Live) -> bool {
+    live.shutdown.load(Ordering::SeqCst)
+}
+
+impl Withdraw for ComfyWithdraw {
+    fn withdraw<'a>(
+        &'a self,
+        job: &'a JobId,
+        external_id: &'a str,
+    ) -> JobFuture<'a, WithdrawOutcome> {
+        Box::pin(self.run(job, external_id))
     }
 }
 
@@ -687,6 +854,19 @@ impl JobHandler for ComfyPromptHandler {
                 e.trace_id.clone_from(&job.trace_id);
                 JobFailure::Final(e)
             })?;
+            let classes = args
+                .graph
+                .as_object()
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .map(|(id, n)| {
+                            let class = n.get("class_type").and_then(Value::as_str);
+                            (id.clone(), class.unwrap_or_default().to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut attempt = Attempt {
                 job,
                 comfy: &comfy,
@@ -702,6 +882,8 @@ impl JobHandler for ComfyPromptHandler {
                 started: None,
                 accepted: false,
                 abandoned: false,
+                classes,
+                cached: HashSet::new(),
             };
             let mut result = attempt.run(args).await;
             // CORE-128: work with external side effects that ComfyUI accepted is never retried
@@ -767,6 +949,10 @@ struct Attempt<'a> {
     accepted: bool,
     /// The attempt leaves its prompt behind (a fail point stopped it after the POST).
     abandoned: bool,
+    /// The class type of each node of the job's graph, by node id (the phase, Appendix G).
+    classes: HashMap<String, String>,
+    /// The nodes ComfyUI served from its cache.
+    cached: HashSet<String>,
 }
 
 /// How a followed prompt ended, before its outcome is made.
@@ -791,6 +977,11 @@ impl Attempt<'_> {
         self.live.shutdown.load(Ordering::SeqCst)
     }
 
+    /// A pause withdrew (or is withdrawing) the prompt (module docs, "Withdrawal").
+    fn withdrawn(&self) -> bool {
+        self.live.withdrawn.load(Ordering::SeqCst)
+    }
+
     /// `Unknown`: whether the work ran (and was charged) can't be told (CORE-128).
     fn unknown(&self, spec: &CodeSpec, message: &str, text: Option<&str>) -> JobFailure {
         let e = error(spec, message, self.job);
@@ -805,6 +996,37 @@ impl Attempt<'_> {
         // row that can't be read says nothing about one, so nothing is posted (re-review N3:
         // fail closed; paid work may have been sent).
         let earlier = earlier_prompt(self.job).await?;
+        // A prompt a pause withdrew (CORE-160) is asked about before a new one is posted, as an
+        // earlier attempt's is (CORE-120): `/api/jobs/{old}`, then `/history/{old}`.
+        let earlier = match earlier {
+            Some(prompt_id) => Some(prompt_id),
+            None => match self.comfy.prompts().take_withdrawn(&self.job.id) {
+                None => None,
+                Some(old) => match self.client.state(&old).await {
+                    Ok(RemoteState::Queued | RemoteState::Running) => {
+                        tracing::warn!(prompt_id = %old, "a withdrawn prompt is still in ComfyUI; it is followed");
+                        self.job
+                            .set_external_id(&old)
+                            .await
+                            .map_err(JobFailure::Final)?;
+                        Some(old)
+                    }
+                    Ok(RemoteState::Done(history)) if succeeded(&history) => {
+                        self.job
+                            .set_external_id(&old)
+                            .await
+                            .map_err(JobFailure::Final)?;
+                        Some(old)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        // Nothing is known: it is asked about again next time.
+                        self.comfy.prompts().note_withdrawn(&self.job.id, &old);
+                        return Err(unreachable(&e, self.job));
+                    }
+                },
+            },
+        };
         if let Some(prompt_id) = earlier {
             // Known to the shutdown step and to a cancel at once (I2), registered before the
             // shutdown check: a step that ran meanwhile missed it, so it is cancelled here
@@ -1217,6 +1439,8 @@ impl Attempt<'_> {
                         }
                     }
                     Ok(RemoteState::Done(history)) => break ended_from_history(history),
+                    // Withdrawn by a pause: the runner ends the attempt.
+                    Ok(RemoteState::Cancelled | RemoteState::Gone) if self.withdrawn() => {}
                     Ok(RemoteState::Cancelled) => break Ended::Interrupted,
                     Ok(RemoteState::Gone) => {
                         // A restart closes the websocket; a queued prompt someone cancelled
@@ -1267,18 +1491,46 @@ impl Attempt<'_> {
         match event {
             ComfyEvent::ExecutionStart { .. } => {
                 self.started = Some(self.comfy.clock.monotonic());
+                if let Some(gpu) = self.comfy.gpu_name() {
+                    self.job.set_engine_device(&gpu);
+                }
                 self.job.set_substatus(Substatus::Executing).await;
             }
-            ComfyEvent::Executing { node, .. } => self.node = node,
+            ComfyEvent::Cached { nodes, .. } => {
+                self.job.mark_cached(&nodes);
+                self.cached.extend(nodes);
+            }
+            ComfyEvent::Executing { node, .. } => {
+                if let Some(node) = &node {
+                    self.job.node_started();
+                    let class = self.classes.get(node).map_or("", String::as_str);
+                    self.job.set_phase(phase_of(class));
+                }
+                self.node = node;
+            }
             ComfyEvent::Progress { value, max, .. } => {
                 let node = self.node.clone();
                 self.report_progress(value, max, node);
+                self.job.measured();
             }
             ComfyEvent::ProgressState {
                 node, value, max, ..
-            } => self.report_progress(value, max, Some(node)),
+            } => {
+                // A node's own one-unit state is no measurable progress.
+                if max > 1 && self.node.as_deref() == Some(node.as_str()) {
+                    self.job.measured();
+                }
+                self.report_progress(value, max, Some(node));
+            }
             ComfyEvent::Executed { .. } => {}
-            ComfyEvent::Success { .. } => return Some(Ended::Success(None)),
+            ComfyEvent::Success { .. } => {
+                // Every node of the prompt served from the cache: nothing changed (CORE-117).
+                if !self.classes.is_empty() && self.classes.keys().all(|n| self.cached.contains(n))
+                {
+                    self.job.set_all_cached();
+                }
+                return Some(Ended::Success(None));
+            }
             ComfyEvent::Error {
                 exception_type,
                 message,
@@ -1289,6 +1541,8 @@ impl Attempt<'_> {
                     message,
                 });
             }
+            // Withdrawn by a pause: the runner ends the attempt.
+            ComfyEvent::Interrupted { .. } if self.withdrawn() => {}
             ComfyEvent::Interrupted { .. } => return Some(Ended::Interrupted),
             // Only while the job's own prompt executes (M2): before that, a preview is another
             // prompt's.
@@ -1497,6 +1751,8 @@ impl Attempt<'_> {
         history: Option<Value>,
     ) -> Result<JobDone, JobFailure> {
         let windows: Vec<ExecWindow> = self.window(true).into_iter().collect();
+        self.job.measured();
+        self.job.set_phase(INGESTING_PHASE);
         self.job.set_substatus(Substatus::Ingesting).await;
         let history = match history {
             Some(history) => history,
@@ -1839,6 +2095,28 @@ mod tests {
             assert_eq!(graph[node]["inputs"]["filename_prefix"], prefix.as_str());
         }
         assert_eq!(graph["1"]["inputs"], json!({"width": 8}));
+    }
+
+    /// Appendix G's phase table, the first match winning.
+    #[test] // spec: CORE-117
+    fn the_phase_follows_the_node_class() {
+        for (class, phase) in [
+            ("CheckpointLoaderSimple", "loading_models"),
+            ("LoraLoaderModelOnly", "loading_models"),
+            ("CLIPTextEncode", "encoding"),
+            ("KSampler", "sampling"),
+            ("SamplerCustomAdvanced", "sampling"),
+            ("VAEDecode", "decoding"),
+            ("SaveImage", "saving"),
+            ("PreviewImage", "saving"),
+            ("EmptyImage", "other"),
+            ("ImageSave", "other"),
+            // The first match wins: a loader that decodes loads.
+            ("DecoderLoader", "loading_models"),
+            ("", "other"),
+        ] {
+            assert_eq!(phase_of(class), phase, "{class:?}");
+        }
     }
 
     #[test] // spec: ARCH-072

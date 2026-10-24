@@ -6,25 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 6
-    # CORE-160
-    { name = "lil-spec-tests::jobs_queue_4a::job_move_next_and_last_stay_within_the_class", rule = "CORE-160", file = "tests/jobs_queue_4a.rs" },
-    # CORE-160
-    { name = "lil-spec-tests::jobs_queue_4a::job_move_of_a_running_job_is_not_queued", rule = "CORE-160", file = "tests/jobs_queue_4a.rs" },
-    # CORE-160
-    { name = "lil-spec-tests::jobs_queue_4a::job_cancel_by_ids_batch_and_all_mine", rule = "CORE-160", file = "tests/jobs_queue_4a.rs" },
-    # CORE-117, CORE-160
-    { name = "lil-spec-tests::jobs_queue_4a::queue_pause_holds_every_queued_job_and_never_interrupts_the_running_prompt", rule = "CORE-117", file = "tests/jobs_queue_4a.rs" },
-    # CORE-160, CORE-120
-    { name = "lil-spec-tests::jobs_queue_4a::queue_pause_withdraws_a_pending_prompt_and_reposts_it_once", rule = "CORE-160", file = "tests/jobs_queue_4a.rs" },
-    # APP-040, CORE-160
-    { name = "lil-spec-tests::jobs_queue_4a::queue_pause_is_only_for_verified_apps", rule = "APP-040", file = "tests/jobs_queue_4a.rs" },
-    # ARCH-022, CORE-160
-    { name = "lil-spec-tests::jobs_queue_4a::a_restart_holds_never_started_jobs_until_resumed", rule = "ARCH-022", file = "tests/jobs_queue_4a.rs" },
-    # CORE-117
-    { name = "lil-spec-tests::jobs_queue_4a::job_records_carry_batch_origin_phase_and_status_seq", rule = "CORE-117", file = "tests/jobs_queue_4a.rs" },
-    # ARCH-072
-    { name = "lil-spec-tests::jobs_queue_4a::a_silent_job_is_unresponsive_and_nothing_is_cancelled", rule = "ARCH-072", file = "tests/jobs_queue_4a.rs" },
     # Task 7
     # CORE-161
     { name = "lil-spec-tests::estimates::job_estimate_is_none_without_history", rule = "CORE-161", file = "tests/estimates.rs" },

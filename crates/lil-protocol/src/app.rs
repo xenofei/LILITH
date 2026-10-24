@@ -1,6 +1,8 @@
 //! The `app/*` methods of protocol 1.1 (APP-043; Appendix F "`app/*` methods"): the
 //! confirmation list and answer, and `app/caps.set` (CORE-008), whose result is the
-//! [`CapsView`] `caps.get` returns too.
+//! [`CapsView`] `caps.get` returns too; and of protocol 1.2 (Appendix G "Pause GPU work"),
+//! `app/queue.pause` and `app/queue.resume`, which need `queue.v1` and return a
+//! [`QueueState`].
 //!
 //! Every `app/*` method is for verified `ui:*` connections only, except the read-only
 //! `app/confirmations.list`, which `cli` may call too; the confirmation methods need
@@ -26,6 +28,13 @@ pub const CONFIRMATION_CAPABILITIES: &[&str] = &["confirmations.v1", "caps.v1"];
 
 /// The capability `app/caps.set` needs.
 pub const CAPS_CAPABILITY: &str = "caps.v1";
+
+/// `app/queue.pause` (protocol 1.2).
+pub const QUEUE_PAUSE: &str = "app/queue.pause";
+/// `app/queue.resume` (protocol 1.2).
+pub const QUEUE_RESUME: &str = "app/queue.resume";
+/// The capability `app/queue.pause` and `app/queue.resume` need.
+pub const QUEUE_CAPABILITY: &str = "queue.v1";
 
 /// The most confirmations one `app/confirmations.list` returns, and its default.
 pub const LIST_LIMIT_MAX: u32 = 500;
@@ -217,10 +226,79 @@ pub struct CapsView {
     pub period: String,
 }
 
+/// A lane `app/queue.*` names (CORE-121): wire `gpu-heavy` or `cpu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, JsonSchema)]
+pub enum QueueLane {
+    #[default]
+    #[serde(rename = "gpu-heavy")]
+    GpuHeavy,
+    #[serde(rename = "cpu")]
+    Cpu,
+}
+
+/// `app/queue.pause {lane?}` and `app/queue.resume {lane?, held_only?}` params (Appendix G
+/// "Pause GPU work"): `lane` defaults to `gpu-heavy`; `held_only` is for a resume only, and
+/// then releases the lane's jobs held by a restart and removes no reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QueueParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<QueueLane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_only: Option<bool>,
+}
+
+/// A lane's pause (Appendix G "Pause GPU work"): `paused` while it has any reason; `held`
+/// counts its queued jobs in `queue_paused` for any reason, a restart's included,
+/// `restart_held` those a restart holds, and `withdrawn` the prompts the current pause
+/// withdrew from the engine. `reasons` is an open set of names (`manual` and `fullscreen` in
+/// plan 4a); an app shows one it doesn't know by its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct QueueState {
+    pub lane: QueueLane,
+    pub paused: bool,
+    pub reasons: Vec<String>,
+    pub held: u32,
+    pub restart_held: u32,
+    pub withdrawn: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test] // spec: CORE-160, APP-043
+    fn queue_params_are_strict_and_the_lane_defaults_to_gpu_heavy() {
+        let p: QueueParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(p.lane.unwrap_or_default(), QueueLane::GpuHeavy);
+        let p: QueueParams =
+            serde_json::from_value(json!({"lane": "cpu", "held_only": true})).unwrap();
+        assert_eq!((p.lane, p.held_only), (Some(QueueLane::Cpu), Some(true)));
+        for bad in [
+            json!({"lane": "gpu-light"}),
+            json!({"lane": "gpu_heavy"}),
+            json!({"reason": "manual"}),
+        ] {
+            assert!(
+                serde_json::from_value::<QueueParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        let state = QueueState {
+            lane: QueueLane::GpuHeavy,
+            paused: true,
+            reasons: vec!["manual".into()],
+            held: 2,
+            restart_held: 1,
+            withdrawn: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            json!({"lane": "gpu-heavy", "paused": true, "reasons": ["manual"], "held": 2,
+                   "restart_held": 1, "withdrawn": 0})
+        );
+    }
 
     #[test] // spec: APP-043, CORE-111
     fn app_params_are_strict() {

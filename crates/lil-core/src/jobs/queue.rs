@@ -1,8 +1,10 @@
 //! The suite-held queue's choice of the next job of a lane (CORE-123, CORE-124).
 //!
-//! The candidates are the lane's queued jobs. The best class present wins (`interactive` >
-//! `user` > `agent`); within it a job requeued at the head (a preempted one, CORE-125) comes
-//! first, then submission order. When the lane last ran a job of a `group` (a model profile),
+//! The candidates are the lane's queued jobs that nothing holds. The best class present wins
+//! (`interactive` > `user` > `agent`); within it a job requeued at the head (a preempted one,
+//! CORE-125) comes first, then the lower `order_key` (CORE-160: a job's `seq`, until
+//! `job.move` puts it at the front or the back of its class; a move is never counted as an
+//! overtake). When the lane last ran a job of a `group` (a model profile),
 //! the oldest job of the class with that group may go first, overtaking the older jobs of its
 //! class, unless one of them has been overtaken [`MAX_OVERTAKES`] times already or was
 //! requeued at the head; then the class's first job goes.
@@ -16,8 +18,8 @@ pub struct Candidate<'a> {
     pub priority: Priority,
     /// Requeued at the head of its class.
     pub head: bool,
-    /// Submission order.
-    pub order: u64,
+    /// Its place in its class: its `order_key`.
+    pub order: i64,
     pub group: Option<&'a str>,
     /// How often a grouped job went before it.
     pub overtaken: u32,
@@ -60,7 +62,7 @@ pub fn pick<'a>(candidates: &[Candidate<'a>], lane_group: Option<&str>) -> Optio
 mod tests {
     use super::*;
 
-    fn c<'a>(id: &'a str, priority: Priority, order: u64, group: Option<&'a str>) -> Candidate<'a> {
+    fn c<'a>(id: &'a str, priority: Priority, order: i64, group: Option<&'a str>) -> Candidate<'a> {
         Candidate {
             id,
             priority,

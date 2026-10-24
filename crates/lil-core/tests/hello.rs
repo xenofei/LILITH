@@ -52,7 +52,7 @@ fn hello_returns_session_and_shared_capabilities() {
     let instance = result["instance_id"].as_str().expect("instance_id");
     assert!(session.starts_with("s_"), "{response}");
     assert!(instance.starts_with("c_"), "{response}");
-    assert_eq!(result["protocol"], "1.1", "{response}");
+    assert_eq!(result["protocol"], "1.2", "{response}");
     assert_eq!(result["build_id"], lil_protocol::BUILD_ID, "{response}");
     assert_eq!(
         result["schema_hash"],
@@ -65,14 +65,35 @@ fn hello_returns_session_and_shared_capabilities() {
 
     // A second connection gets its own session from the same core instance.
     let mut other = RawPipe::connect(&env);
-    let second = other.hello(json!({"protocol": "1.7"}));
+    let second =
+        other.hello(json!({"protocol": "1.7", "capabilities": lil_protocol::CAPABILITIES}));
     assert_eq!(second["result"]["status"], "ok", "{second}");
     assert_eq!(second["result"]["instance_id"], instance, "{second}");
     assert_ne!(second["result"]["session_id"], session, "{second}");
-    // The session runs at the lower minor, and shares protocol 1.1's five capabilities.
-    assert_eq!(second["result"]["protocol"], "1.1", "{second}");
+    // The session runs at the lower minor, 1.2, and shares the core's list: protocol 1.1's
+    // five capabilities, then `queue.v1` (later plan-4a capabilities may follow it).
+    assert_eq!(second["result"]["protocol"], "1.2", "{second}");
+    let shared = second["result"]["capabilities"].as_array().unwrap();
     assert_eq!(
-        second["result"]["capabilities"],
+        shared[..6],
+        [
+            "events.v1",
+            "tools.v1",
+            "jobs.v1",
+            "confirmations.v1",
+            "caps.v1",
+            "queue.v1"
+        ],
+        "{second}"
+    );
+    // A 1.1 client keeps working: it shares its five, never `queue.v1`.
+    let mut older = RawPipe::connect(&env);
+    let fourth = older.hello(json!({"protocol": "1.1", "capabilities": [
+        "events.v1", "tools.v1", "jobs.v1", "confirmations.v1", "caps.v1"
+    ]}));
+    assert_eq!(fourth["result"]["protocol"], "1.1", "{fourth}");
+    assert_eq!(
+        fourth["result"]["capabilities"],
         json!([
             "events.v1",
             "tools.v1",
@@ -80,7 +101,7 @@ fn hello_returns_session_and_shared_capabilities() {
             "confirmations.v1",
             "caps.v1"
         ]),
-        "{second}"
+        "{fourth}"
     );
 
     // A 1.0 client keeps working: its session runs at 1.0 with what it offers.
@@ -144,7 +165,7 @@ fn major_mismatch_with_unknown_params_is_incompatible_not_invalid_params() {
             "{response}"
         );
         assert_eq!(
-            result["error"]["data"]["core_protocol"], "1.1",
+            result["error"]["data"]["core_protocol"], "1.2",
             "{response}"
         );
         assert!(

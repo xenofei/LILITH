@@ -23,7 +23,9 @@
 //!   1.1's `app/confirmations.list` and `app/confirmation.answer` go to the [`Confirm`]
 //!   (they need `confirmations.v1` or `caps.v1` in the shared capabilities, else
 //!   `caller.not_allowed`), `app/caps.set` goes to the [`Caps`] (it needs `caps.v1`, else
-//!   `caller.not_allowed`; CORE-008), and any other `app/*` method is -32601 for an app. `tools/list`
+//!   `caller.not_allowed`; CORE-008), protocol 1.2's `app/queue.pause` and `app/queue.resume`
+//!   go to the jobs (they need `queue.v1`, else `caller.not_allowed`; CORE-160), and any other
+//!   `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   A verified `ui:*` session that can answer confirmations counts in the
 //!   [`crate::confirm::UiPresence`] while its connection is open; when it closes, its pending
@@ -88,6 +90,7 @@ use crate::confirm::{
 };
 use crate::events::EventBus;
 use crate::identity::{EngineSession, EngineTokens, TrustedDirs, resolve_caller};
+use crate::jobs::{Lane, PauseReason};
 use crate::lifecycle::{DrainReason, Lifecycle};
 use crate::meter::Caps;
 use crate::session::Session;
@@ -388,6 +391,9 @@ impl RpcRouter {
             };
             return outcome(id, into_outcome(caps.set(session, p).await));
         }
+        if matches!(m, app::QUEUE_PAUSE | app::QUEUE_RESUME) {
+            return self.queue(id.clone(), session, m, params, refuse).await;
+        }
         if !matches!(m, app::CONFIRMATIONS_LIST | app::CONFIRMATION_ANSWER) {
             return not_found(id);
         }
@@ -440,6 +446,57 @@ impl RpcRouter {
                     confirmation: row.view(),
                 });
         outcome(id, into_outcome(answered))
+    }
+
+    /// `app/queue.pause {lane?}` and `app/queue.resume {lane?, held_only?}` (CORE-160;
+    /// Appendix G "Pause GPU work"), for a verified app whose session shares `queue.v1`
+    /// (`refuse` answers anyone else). Your pause is the reason `manual`; a resume removes only
+    /// it and releases the lane's jobs a restart holds, `held_only: true` releases those jobs
+    /// only (P4a-R41). `held_only` on a pause is -32602.
+    async fn queue(
+        &self,
+        id: Id,
+        session: &Session,
+        m: &str,
+        params: Option<Value>,
+        refuse: impl Fn(String) -> Response,
+    ) -> Response {
+        if !session
+            .capabilities
+            .iter()
+            .any(|c| c == app::QUEUE_CAPABILITY)
+        {
+            return refuse(format!(
+                "{m} needs the queue.v1 capability, and this session's core/hello did not offer it."
+            ));
+        }
+        let p: app::QueueParams = match parse_params(params) {
+            Ok(p) => p,
+            Err(error) => {
+                return Response::Error {
+                    id: Some(id),
+                    error,
+                };
+            }
+        };
+        let lane = match p.lane.unwrap_or_default() {
+            app::QueueLane::GpuHeavy => Lane::GpuHeavy,
+            app::QueueLane::Cpu => Lane::Cpu,
+        };
+        let jobs = self.dispatcher.jobs();
+        let state = match (m, p.held_only) {
+            (app::QUEUE_PAUSE, Some(_)) => {
+                return fault(
+                    id,
+                    rpc_code::INVALID_PARAMS,
+                    "invalid params: held_only is for app/queue.resume",
+                );
+            }
+            (app::QUEUE_PAUSE, None) => jobs.pause(lane, PauseReason::Manual).await,
+            (_, Some(true)) => jobs.release_restart_held(lane).await,
+            _ => jobs.resume(lane, PauseReason::Manual).await,
+        };
+        outcome(id, Outcome::Ok(state))
     }
 
     /// `core/hello`, in the order of the module docs. `None`: the reply is already queued

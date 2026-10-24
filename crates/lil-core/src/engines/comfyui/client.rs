@@ -387,6 +387,25 @@ impl ComfyClient {
         checked(response).await.map(drop)
     }
 
+    /// `POST /queue {"delete": [<prompt_id>]}`: takes `prompt_id` out of ComfyUI's queue while
+    /// it is pending, and does nothing to a running prompt (ComfyUI 0.42.1's `server.py` and
+    /// `execution.py`: `delete_queue_item` looks only at the pending list, under the queue's
+    /// lock). It answers 200 whatever it did, so the caller looks at the prompt afterwards. A
+    /// paused lane's withdrawal (CORE-160; plan 4a ruling, 2026-10-24).
+    ///
+    /// # Errors
+    /// [`ComfyError`].
+    pub async fn delete_pending(&self, prompt_id: &str) -> Result<(), ComfyError> {
+        let response = self
+            .http
+            .post(self.endpoint("queue")?)
+            .json(&json!({ "delete": [prompt_id] }))
+            .send()
+            .await
+            .map_err(unreachable)?;
+        checked(response).await.map(drop)
+    }
+
     /// `GET /view` of `file`, streamed into the new file `dest` (never an existing one), with
     /// the SHA-256 of the stream taken on the way: `(bytes, sha256)`. A failed download, or one
     /// over [`MAX_OUTPUT_BYTES`], leaves no file.

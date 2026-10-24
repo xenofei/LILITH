@@ -29,18 +29,22 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
-/// The protocol this build speaks: 1.1 (plan 3, Appendix D). 1.0 clients keep working.
-pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
+/// The protocol this build speaks: 1.2 (plan 4a, Appendix D). 1.0 and 1.1 clients keep
+/// working.
+pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
 
 /// The capabilities this build offers. A minor version adds features only as new strings:
 /// 1.0 had `events.v1` and `tools.v1`; 1.1 adds `jobs.v1`, `confirmations.v1` and `caps.v1`
-/// (the `app/*` methods need `confirmations.v1` or `caps.v1` in the shared capabilities).
+/// (the `app/*` methods need `confirmations.v1` or `caps.v1` in the shared capabilities); 1.2
+/// adds `queue.v1` (`app/queue.pause` and `app/queue.resume` need it), and plan 4a's later
+/// capabilities follow it.
 pub const CAPABILITIES: &[&str] = &[
     "events.v1",
     "tools.v1",
     "jobs.v1",
     "confirmations.v1",
     "caps.v1",
+    "queue.v1",
 ];
 
 /// `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">`; the suffix is fixed at compile time by
@@ -160,6 +164,9 @@ pub fn schema_hash() -> String {
             schemars::schema_for!(crate::app::ConfirmationAnswerResult),
             schemars::schema_for!(crate::app::CapsSetParams),
             schemars::schema_for!(crate::app::CapsView),
+            // Protocol 1.2.
+            schemars::schema_for!(crate::app::QueueParams),
+            schemars::schema_for!(crate::app::QueueState),
         ];
         let all = serde_json::Value::Array(
             schemas
@@ -460,36 +467,36 @@ mod tests {
         assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
     }
 
-    /// Protocol 1.1 (Appendix D): five capabilities, shared in the core's order.
+    /// Protocol 1.2 (Appendix D): the five capabilities of 1.1, then `queue.v1`, shared in the
+    /// core's order. Checked by content, so the later plan-4a capabilities may follow it.
     #[test] // spec: ARCH-029, APP-043
-    fn protocol_is_1_1_with_five_capabilities() {
-        assert_eq!(PROTOCOL.to_string(), "1.1");
-        let all = [
+    fn protocol_is_1_2_and_offers_queue_v1() {
+        assert_eq!(PROTOCOL.to_string(), "1.2");
+        let of_1_1 = [
             "events.v1",
             "tools.v1",
             "jobs.v1",
             "confirmations.v1",
             "caps.v1",
         ];
-        assert_eq!(CAPABILITIES, &all);
-        // A client offering all five, in another order and with an unknown one, gets all five
-        // in the core's order.
-        let client: Vec<String> = [
-            "caps.v1",
-            "future.v9",
-            "confirmations.v1",
-            "tools.v1",
-            "jobs.v1",
-            "events.v1",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(shared_capabilities(&client, CAPABILITIES), all);
-        // A 1.0 client keeps working: it shares what it offers.
-        let old: Vec<String> = vec!["events.v1".into(), "tools.v1".into()];
+        assert_eq!(&CAPABILITIES[..5], &of_1_1);
+        assert_eq!(CAPABILITIES.get(5), Some(&"queue.v1"));
+        let unique: std::collections::BTreeSet<_> = CAPABILITIES.iter().collect();
+        assert_eq!(unique.len(), CAPABILITIES.len(), "{CAPABILITIES:?}");
+        // A client offering them all, in another order and with an unknown one, gets them in
+        // the core's order.
+        let mut client: Vec<String> = CAPABILITIES.iter().rev().map(|s| s.to_string()).collect();
+        client.insert(2, "future.v9".to_string());
+        assert_eq!(shared_capabilities(&client, CAPABILITIES), CAPABILITIES);
+        // A 1.1 client keeps working: it shares what it offers, never `queue.v1`.
+        let old: Vec<String> = of_1_1.iter().map(|s| s.to_string()).collect();
+        let shared = shared_capabilities(&old, CAPABILITIES);
+        assert_eq!(shared, of_1_1);
+        assert!(!shared.iter().any(|c| c == "queue.v1"));
+        // A 1.0 client too.
+        let older: Vec<String> = vec!["events.v1".into(), "tools.v1".into()];
         assert_eq!(
-            shared_capabilities(&old, CAPABILITIES),
+            shared_capabilities(&older, CAPABILITIES),
             ["events.v1", "tools.v1"]
         );
     }
@@ -582,8 +589,9 @@ mod tests {
         );
         assert_eq!(h, schema_hash());
         // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation)
-        // and `app/caps.set`'s params and `CapsView`.
-        assert_eq!(h, "99caa63ddb3964d5");
+        // and `app/caps.set`'s params and `CapsView`; 1.2 the `app/queue.*` params and
+        // `QueueState`.
+        assert_eq!(h, "7ecb7a0cf051f2b3");
     }
 
     #[test] // spec: ARCH-029

@@ -113,6 +113,93 @@ fn app_namespace_refuses_non_ui() {
     }
 }
 
+/// An in-process core that trusts the test binaries' folder for apps (`lil-test-app.exe`).
+fn app_core(env: &TestEnv) -> CoreThread {
+    let base = CoreConfig::for_env(env.env.clone()).expect("core config");
+    start_in_thread(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        trusted: lil_core::identity::TrustedDirs {
+            app_dirs: vec![lil_testkit::ensure_built().dir.clone()],
+            test_app: true,
+            ..base.trusted.clone()
+        },
+        ..base
+    })
+}
+
+/// Protocol 1.2's capabilities (Appendix D), as a plan-4a app offers them.
+const CAPS_1_2: &[&str] = &[
+    "events.v1",
+    "tools.v1",
+    "jobs.v1",
+    "confirmations.v1",
+    "caps.v1",
+    "queue.v1",
+];
+
+/// `app/queue.pause` and `app/queue.resume` (CORE-160, APP-040; Appendix D): a verified app
+/// only, and only with `queue.v1` in the shared capabilities; then a `QueueState`.
+#[test] // spec: APP-040, APP-039, CORE-160
+fn queue_methods_need_a_verified_app_and_the_capability() {
+    let env = TestEnv::new();
+    let _core = app_core(&env);
+    let mut cli = connect(&env, json!({}));
+    for m in ["app/queue.pause", "app/queue.resume"] {
+        let refused = cli.call(m, json!({}));
+        assert_eq!(
+            refused["result"]["error"]["code"], "caller.not_allowed",
+            "{refused}"
+        );
+    }
+    let mut old = lil_testkit::TestApp::start(&env, None, &[]);
+    assert_eq!(old.hello()["caller_kind"], "ui:test");
+    let refused = old.call("app/queue.pause", json!({}));
+    assert_eq!(
+        refused["result"]["error"]["code"], "caller.not_allowed",
+        "an app without queue.v1: {refused}"
+    );
+    let mut app = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], CAPS_1_2);
+    let paused = app.call("app/queue.pause", json!({}));
+    assert_eq!(paused["result"]["status"], "ok", "{paused}");
+    assert_eq!(
+        paused["result"]["lane"], "gpu-heavy",
+        "the default lane: {paused}"
+    );
+    assert_eq!(paused["result"]["paused"], true, "{paused}");
+    assert_eq!(paused["result"]["reasons"], json!(["manual"]), "{paused}");
+    for key in ["held", "restart_held", "withdrawn"] {
+        assert_eq!(paused["result"][key], 0, "{paused}");
+    }
+    // `held_only` is for a resume; the params are strict.
+    for (m, params) in [
+        ("app/queue.pause", json!({"held_only": true})),
+        ("app/queue.pause", json!({"lane": "gpu-light"})),
+        ("app/queue.resume", json!({"reason": "fullscreen"})),
+    ] {
+        let bad = app.call(m, params.clone());
+        assert_eq!(bad["error"]["code"], -32602, "{m} {params}: {bad}");
+    }
+    let held_only = app.call("app/queue.resume", json!({"held_only": true}));
+    assert_eq!(
+        held_only["result"]["reasons"],
+        json!(["manual"]),
+        "{held_only}"
+    );
+    let resumed = app.call("app/queue.resume", json!({}));
+    assert_eq!(resumed["result"]["paused"], false, "{resumed}");
+    assert_eq!(resumed["result"]["reasons"], json!([]), "{resumed}");
+    let cpu = app.call("app/queue.pause", json!({"lane": "cpu"}));
+    assert_eq!(cpu["result"]["lane"], "cpu", "{cpu}");
+    // The pause shows in `jobs.list`'s lanes.
+    let listed = cli.tool("jobs.list", json!({}), None);
+    let lanes = listed["structured"]["lanes"].as_array().unwrap();
+    assert_eq!(lanes[1]["lane"], "cpu", "{listed}");
+    assert_eq!(lanes[1]["paused"], true, "{listed}");
+    assert_eq!(lanes[0]["paused"], false, "{listed}");
+}
+
 #[test] // spec: CORE-016
 fn concurrent_same_key_gets_in_progress() {
     let env = TestEnv::new();
@@ -910,7 +997,8 @@ async fn job_retry_of_an_interrupted_job_with_side_effects_needs_a_confirmation(
     let env = TestEnv::new();
     let (d, confirm) = confirming(&env);
     let mut ids = Vec::new();
-    for (n, external) in [false, true].into_iter().enumerate() {
+    // A job is retried once (Appendix G): the third is yours to retry.
+    for (n, external) in [false, true, true].into_iter().enumerate() {
         let made = d
             .call(
                 ui_session(),
@@ -949,6 +1037,9 @@ async fn job_retry_of_an_interrupted_job_with_side_effects_needs_a_confirmation(
     let out = d.call(direct_session(None), retry(&ids[1], "r")).await;
     assert_eq!(ok_of(&out)["retry_of"], ids[1].as_str());
     // Yours never asks.
-    let yours = d.call(ui_session(), retry(&ids[1], "yours")).await;
-    assert_eq!(ok_of(&yours)["retry_of"], ids[1].as_str());
+    let yours = d.call(ui_session(), retry(&ids[2], "yours")).await;
+    assert_eq!(ok_of(&yours)["retry_of"], ids[2].as_str());
+    // A job retried already is never retried again, by anyone.
+    let again = d.call(ui_session(), retry(&ids[1], "again")).await;
+    assert_eq!(code_of(&again), "job.not_retryable");
 }

@@ -30,7 +30,8 @@ use lil_core::events::EventBus;
 use lil_core::jobs::record::{self, JobRow};
 use lil_core::jobs::{
     EngineKind, ExecWindow, JobCaller, JobCompletion, JobCtx, JobDone, JobFilter, JobFuture, JobId,
-    JobOrigin, JobStatus, JobSummary, Jobs, Lane, Priority, SubmittedSlot, Substatus,
+    JobOrigin, JobStatus, JobSummary, Jobs, Lane, PauseReason, Priority, SubmittedSlot, Substatus,
+    WithdrawOutcome,
 };
 use lil_core::lifecycle::ShutdownPhase;
 use lil_core::state::StateRegistry;
@@ -1398,6 +1399,12 @@ fn earlier_row(job_id: &str, prompt_id: &str, substatus: Substatus, external: bo
             arguments: json!({}),
         }),
         external_id: Some(prompt_id.into()),
+        batch_id: String::new(),
+        batch_index: 0,
+        order_key: 0,
+        started_by: None,
+        status_seq: Vec::new(),
+        report: Default::default(),
     }
 }
 
@@ -1941,4 +1948,359 @@ async fn job_progress_comes_from_progress_or_progress_state() {
         fake.hold_prompts(false);
         assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 4a: phases, subtasks, the cache, and withdrawing a paused lane's pending prompt
+// (CORE-117, CORE-120, CORE-160; Appendix G "Jobs").
+// ---------------------------------------------------------------------------------------------
+
+/// A graph with one node of each class the phase table names, in that order.
+fn phased() -> Value {
+    json!({
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}},
+        "3": {"class_type": "KSampler", "inputs": {"steps": 2, "seed": 1}},
+        "4": {"class_type": "VAEDecode", "inputs": {}},
+        "5": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ComfyUI"}},
+    })
+}
+
+fn names(job: &JobSummary) -> Vec<&str> {
+    job.subtasks.iter().map(|s| s.name.as_str()).collect()
+}
+
+/// The phase follows the class type of the node ComfyUI reports `executing` (Appendix G's
+/// table), and is `ingesting` from `execution_success` until the outputs are staged; each
+/// phase reached is a subtask, in order; `progress.node` stays the raw node id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-117
+async fn phase_follows_the_executing_node_class() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let rig = Rig::new(&env);
+    let id = rig
+        .submit(json!({ "graph": phased() }), Priority::Agent)
+        .await;
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert_eq!(
+        names(&done),
+        [
+            "loading_models",
+            "encoding",
+            "sampling",
+            "decoding",
+            "saving",
+            "ingesting"
+        ]
+    );
+    assert_eq!(done.phase.as_deref(), Some("ingesting"));
+    assert!(!done.indeterminate);
+    assert!(done.last_progress_at.is_some());
+    // Only the current phase carries its progress; the earlier ones keep their names.
+    assert!(
+        done.subtasks
+            .iter()
+            .all(|s| s.value.is_none() && s.max.is_none()),
+        "{done:?}"
+    );
+    let row = rig.row(&id).await;
+    assert_eq!(
+        row.report.phase.as_deref(),
+        Some("ingesting"),
+        "written with the end"
+    );
+}
+
+/// A loader node that sends no `progress` is `indeterminate`; a sampler with `progress` is
+/// not, and the current subtask carries its value and max.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-117
+async fn subtasks_and_indeterminate() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.hold_prompts(true);
+    let rig = Rig::new(&env);
+    let loader = json!({
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "2": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ComfyUI"}},
+    });
+    let id = rig
+        .submit(json!({ "graph": loader }), Priority::Agent)
+        .await;
+    rig.until(&id, "loading", |j| {
+        j.phase.as_deref() == Some("loading_models")
+    })
+    .await;
+    let held = rig.until(&id, "indeterminate", |j| j.indeterminate).await;
+    assert_eq!(names(&held), ["loading_models"]);
+    let prompt = rig.row(&id).await.external_id.unwrap();
+    fake.release(&prompt);
+    let done = rig.done(&id).await;
+    assert!(!done.indeterminate, "{done:?}");
+
+    let sampler = json!({
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "2": {"class_type": "KSampler", "inputs": {"steps": 3, "seed": 1}},
+        "3": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ComfyUI"}},
+    });
+    let id = rig
+        .submit(json!({ "graph": sampler }), Priority::Agent)
+        .await;
+    let held = rig
+        .until(&id, "the sampler's last step", |j| {
+            j.subtasks.last().is_some_and(|s| s.value == Some(3))
+        })
+        .await;
+    assert_eq!(names(&held), ["loading_models", "sampling"]);
+    let last = held.subtasks.last().unwrap();
+    assert_eq!((last.value, last.max), (Some(3), Some(3)));
+    assert!(held.subtasks[0].value.is_none());
+    assert!(!held.indeterminate, "{held:?}");
+    assert_eq!(
+        held.progress.as_ref().and_then(|p| p.node.as_deref()),
+        Some("2")
+    );
+    fake.hold_prompts(false);
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+}
+
+/// `execution_cached`'s nodes are the job's `cache_hit_nodes`; when every node of the prompt
+/// was cached the job succeeds with `all_cached` (CORE-117).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-117
+async fn all_cached_run_says_nothing_changed() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let rig = Rig::new(&env);
+    fake.cached_nodes(&["1", "2"]);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert!(done.all_cached, "{done:?}");
+    let mut hits = done.cache_hit_nodes.clone().unwrap();
+    hits.sort();
+    assert_eq!(hits, ["1", "2"]);
+    assert!(
+        done.result.as_ref().unwrap().artifacts.is_empty(),
+        "nothing was saved"
+    );
+    // One node executes: something changed.
+    fake.cached_nodes(&["1"]);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    assert!(!done.all_cached, "{done:?}");
+    assert_eq!(
+        done.cache_hit_nodes.as_deref(),
+        Some(&["1".to_string()][..])
+    );
+    // None cached: no list.
+    fake.cached_nodes(&[]);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    let done = rig.done(&id).await;
+    assert!(!done.all_cached);
+    assert_eq!(done.cache_hit_nodes, None, "{done:?}");
+}
+
+/// The index of the first request after `from` that `f` matches.
+fn first_after(requests: &[FakeRequest], from: usize, f: impl Fn(&FakeRequest) -> bool) -> usize {
+    requests[from..]
+        .iter()
+        .position(f)
+        .map(|i| i + from)
+        .unwrap_or_else(|| panic!("no such request after {from}: {:?}", &requests[from..]))
+}
+
+/// The `POST /queue {"delete": [...]}` withdrawals the fake saw, by the prompt ids they named.
+fn queue_deletes(fake: &FakeComfy) -> Vec<Value> {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && bare(&r.path) == "/queue")
+        .map(|r| r.body.unwrap_or(Value::Null)["delete"].clone())
+        .collect()
+}
+
+/// Review Focus 4 (CORE-160, CORE-120; plan 4a ruling, 2026-10-24): a suite prompt pending
+/// behind an outside one is withdrawn by a pause with one `POST /queue {"delete"}` (never a
+/// cancel or `/interrupt`, the outside prompt runs
+/// on); on resume the core asks `/api/jobs/{old}` and `/history/{old}` first, then posts once
+/// with a new id. A prompt that already runs is left to run (`AlreadyStarted`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120
+async fn withdraw_only_while_pending_and_repost_with_a_new_id_once() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "queued in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let old = rig.row(&id).await.external_id.unwrap();
+
+    let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    assert_eq!(state.withdrawn, 1, "{state:?}");
+    let held = rig
+        .until(&id, "held", |j| {
+            j.substatus.as_deref() == Some("queue_paused")
+        })
+        .await;
+    assert_eq!(held.pause_reasons, ["manual"]);
+    assert_eq!(held.status, JobStatus::Queued);
+    assert_eq!(
+        rig.row(&id).await.external_id,
+        None,
+        "the engine id is cleared"
+    );
+    assert_eq!(queue_deletes(&fake), [json!([old])]);
+    assert_eq!(count(&fake, "POST", &format!("/jobs/{old}/cancel")), 0);
+    assert_eq!(
+        count(&fake, "POST", "/interrupt"),
+        0,
+        "the outside prompt runs on"
+    );
+    let state = rig.jobs.queue_state(Lane::GpuHeavy);
+    assert_eq!((state.held, state.withdrawn), (1, 1));
+
+    let before_resume = fake.requests().len();
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&id, "queued in ComfyUI again", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let requests = fake.requests();
+    let jobs_look = first_after(&requests, before_resume, |r| {
+        r.method == "GET" && bare(&r.path) == format!("/jobs/{old}")
+    });
+    let history_look = first_after(&requests, before_resume, |r| {
+        r.method == "GET" && bare(&r.path) == format!("/history/{old}")
+    });
+    let repost = first_after(&requests, before_resume, |r| {
+        r.method == "POST" && bare(&r.path) == "/prompt"
+    });
+    assert!(
+        jobs_look < history_look && history_look < repost,
+        "/api/jobs/{{old}}, then /history/{{old}}, then the POST: {jobs_look} {history_look} {repost}"
+    );
+    fake.release(&outside);
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    let bodies = posted(&fake);
+    assert_eq!(bodies.len(), 2, "exactly one new POST /prompt: {bodies:?}");
+    let new = bodies[1]["prompt_id"].as_str().unwrap();
+    assert!(is_uuid_v4(new), "{new}");
+    assert_ne!(new, old);
+    assert_eq!(
+        rig.jobs.queue_state(Lane::GpuHeavy).withdrawn,
+        0,
+        "the pause ended"
+    );
+
+    // A prompt that runs already is left running.
+    fake.hold_prompts(true);
+    let running = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.executing(&running).await;
+    let prompt = rig.row(&running).await.external_id.unwrap();
+    let withdraw =
+        lil_core::engines::comfyui::handler::ComfyWithdraw::new(Arc::downgrade(&rig.engines));
+    use lil_core::jobs::Withdraw as _;
+    assert_eq!(
+        withdraw.withdraw(&JobId(running.clone()), &prompt).await,
+        WithdrawOutcome::AlreadyStarted
+    );
+    assert_eq!(
+        withdraw
+            .withdraw(&JobId(running.clone()), "not-its-prompt")
+            .await,
+        WithdrawOutcome::NotPending
+    );
+    assert_eq!(count(&fake, "POST", &format!("/jobs/{prompt}/cancel")), 0);
+    assert_eq!(
+        queue_deletes(&fake).len(),
+        1,
+        "no delete for a running prompt"
+    );
+    fake.hold_prompts(false);
+    assert_eq!(rig.done(&running).await.status, JobStatus::Succeeded);
+}
+
+/// The window the ruling closes (plan 4a ruling, 2026-10-24): the prompt is pending when the
+/// withdrawal reads `/queue`, and ComfyUI starts it before the withdrawal acts. The delete
+/// can't touch a running prompt, `/api/jobs/{id}` says it started, so it is left to run
+/// (`AlreadyStarted`): the job stays the engine's and succeeds, posted once, never cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120
+async fn a_prompt_that_starts_between_the_queue_read_and_the_withdrawal_runs_on() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "queued in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let prompt = rig.row(&id).await.external_id.unwrap();
+    // It stays running once it starts, until released.
+    fake.hold_prompts(true);
+    fake.start_after_queue_read(&prompt);
+    let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    assert_eq!(state.withdrawn, 0, "{state:?}");
+    // The withdrawal read /queue, then deleted (a no-op on a running prompt), then looked.
+    let requests = fake.requests();
+    let read = first_after(&requests, 0, |r| r.method == "GET" && r.path == "/queue");
+    let delete = first_after(&requests, read, |r| {
+        r.method == "POST" && bare(&r.path) == "/queue"
+    });
+    first_after(&requests, delete, |r| {
+        r.method == "GET" && bare(&r.path) == format!("/jobs/{prompt}")
+    });
+    assert_eq!(queue_deletes(&fake), [json!([prompt])]);
+    assert_eq!(count(&fake, "POST", &format!("/jobs/{prompt}/cancel")), 0);
+    assert_eq!(count(&fake, "POST", "/interrupt"), 0);
+    let running = rig.executing(&id).await;
+    assert_eq!(running.status, JobStatus::Running, "{running:?}");
+    fake.hold_prompts(false);
+    let done = rig.done(&id).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "it ran on: {done:?}");
+    assert_eq!(done.attempt, 1);
+    assert_eq!(posted(&fake).len(), 1, "posted once");
+    assert_eq!(
+        rig.row(&id).await.external_id.as_deref(),
+        Some(prompt.as_str())
+    );
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    fake.release(&outside);
+}
+
+/// A job with external side effects is never withdrawn (it is never posted again by itself).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-128
+async fn external_side_effects_jobs_are_never_withdrawn() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let id = rig.submit_external(tiny_args(1), Priority::Agent).await;
+    rig.until(&id, "queued in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    let prompt = rig.row(&id).await.external_id.unwrap();
+    let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    assert_eq!(state.withdrawn, 0, "{state:?}");
+    assert_eq!(count(&fake, "POST", &format!("/jobs/{prompt}/cancel")), 0);
+    let job = rig.summary(&id).await;
+    assert_eq!(
+        job.substatus.as_deref(),
+        Some("queued_in_engine"),
+        "it stays: {job:?}"
+    );
+    // It runs once the outside prompt is done, paused lane or not: it is in ComfyUI already.
+    fake.release(&outside);
+    assert_eq!(rig.done(&id).await.status, JobStatus::Succeeded);
+    assert_eq!(posted(&fake).len(), 1);
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
 }

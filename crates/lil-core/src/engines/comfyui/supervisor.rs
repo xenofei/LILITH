@@ -485,6 +485,11 @@ impl Comfy {
         self.telemetry.snapshot().gpu.map(|g| g.driver)
     }
 
+    /// The GPU adapter's name in the latest reading (a job's `engine_device`).
+    pub(crate) fn gpu_name(&self) -> Option<String> {
+        self.telemetry.snapshot().gpu.map(|g| g.name)
+    }
+
     /// Now, in seconds since 1970, by the core's clock.
     fn now_secs(&self) -> i64 {
         self.clock
