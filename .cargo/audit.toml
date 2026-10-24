@@ -1,0 +1,8 @@
+# cargo-audit policy. Vulnerabilities fail the PR-ready tier (QA-071), except the exceptions below,
+# which mirror deny.toml's [[advisories.ignore]] entries.
+
+[advisories]
+# Owner decision 2026-10-24: crypto-bigint 0.5.5 timing leaks, transitive via age 0.12.1 -> p256.
+# lil-cli uses only age's scrypt passphrase recipient and identity (crates/lil-cli/src/dev/reviewer.rs),
+# never p256 arithmetic on secrets. Revisit when age moves to crypto-bigint 0.7.6 or later.
+ignore = ["RUSTSEC-2026-0387"]
