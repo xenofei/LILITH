@@ -902,7 +902,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 | `handlers.for`, `open_in`, `ui.show` | read | M1 | agents never steal focus (§3.4) |
 | `lilref.write`, `notify.claude_code` | write | M1 | a `.lilref` file in the cache for a sealed ref (APP-021); Claude Code's notices as toasts, from `lil hook notification` (APP-146) |
 | `prompt.interview_start`, `prompt.interview_answer`, `brief.create`, `brief.update`, `brief.save_version`, `brief.compile`, `brief.stage_to`, `brief.promote` | write | M1a | Prompt Studio (§4.7a, AI-187); `brief.stage_to` is fill-only (AI-186) |
-| `prompt.interview_get`, `prompt.dialects`, `brief.get`, `briefs.list` | read | M1a | |
+| `prompt.interview_get`, `prompt.interviews_list`, `prompt.dialects`, `brief.get`, `briefs.list` | read | M1a | `prompt.interviews_list`: AI-187 (owner decision 2026-10-23, round 13; reservation for plan 6b) |
 | `project.clone` | write | Later | |
 | `project.delete` | destructive | Later | lists inbound links first |
 
