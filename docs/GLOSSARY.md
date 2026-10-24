@@ -82,6 +82,8 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Lane | A scheduling queue for jobs: `gpu-heavy` (holds the GPU lease) or `cpu`. | queue, channel | CORE-121 |
 | Priority class | The order across lanes: interactive operations, then your generations, then agent and director batches. | priority (alone) | CORE-124 |
 | Pause GPU work | Holding every queued job of a lane, yours and agents', without stopping the running prompt. | suspend, stop | CORE-160 |
+| Pause reason | A named cause that holds queued jobs, such as your own pause or the fullscreen auto-pause, each with the classes it covers. | pause type, pause flag | CORE-160 |
+| Restart hold | Keeping a queued job that never reached an engine waiting after a core restart, instead of failing it, until you release it. | hold (alone: a document hold is APP-103's), pause | ARCH-022, CORE-160 |
 | GPU lease | What a `gpu-heavy` job holds while it runs: one heavy GPU job at a time. | lease (alone), lock | ARCH-071, CORE-121 |
 | Power request | What the core holds so the PC doesn't sleep while a GPU job runs. | wake lock, keep-awake lock | ARCH-127 |
 | Checkout lease | A later record (holder, purpose, expiry) that checks a file out to an editor or tool, persisted in the manifest's `leases` field. | lease (alone), lock, hold | ARCH-092, CORE-036, ARCH-020 |
