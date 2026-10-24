@@ -28,7 +28,9 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{IShellLinkW, SHStrDupW, ShellLink};
 use windows::core::{BSTR, GUID, HSTRING, Interface};
 
-use crate::classes::{delete_tree, get_string, hkcu_subkey, quoted, set_string};
+use crate::classes::{
+    delete_tree, get_string, hkcu_subkey, quoted, require_test_channel, set_string,
+};
 use crate::desktop::{ShortcutState, same_path};
 use crate::env::Env;
 use crate::process::io_error;
@@ -173,8 +175,10 @@ fn load(lnk: &Path) -> windows::core::Result<ShortcutInfo> {
     }
 }
 
-/// Removes the channel's shortcut and its CLSID registration; missing ones are no error.
+/// Removes a test channel's shortcut and its CLSID registration; missing ones are no error.
+/// Refused, before anything is read or written, on a stable or dev channel.
 pub fn remove_shortcut(env: &Env) -> io::Result<()> {
+    require_test_channel(env, "removing the shortcut")?;
     match std::fs::remove_file(env.start_menu_shortcut()) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
@@ -182,8 +186,10 @@ pub fn remove_shortcut(env: &Env) -> io::Result<()> {
     remove_clsid_registration(env)
 }
 
-/// Removes only the CLSID's registration, `<classes root>\CLSID\{<CLSID>}`.
+/// Removes only a test channel's CLSID registration, `<classes root>\CLSID\{<CLSID>}`.
+/// Refused, before anything is read or written, on a stable or dev channel.
 pub fn remove_clsid_registration(env: &Env) -> io::Result<()> {
+    require_test_channel(env, "removing the CLSID registration")?;
     delete_tree(&clsid_key(env)?)
 }
 

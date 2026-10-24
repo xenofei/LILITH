@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lil_platform::desktop::{
-    Desktop, Fullscreen, HandlerState, NotifierSetting, ShortcutState, Toast, ToastsState,
-    split_first_argument, toasts_state_for,
+    DESKTOP_TEST_ID_PREFIX, Desktop, Fullscreen, HandlerState, NotifierSetting, ShortcutState,
+    Toast, ToastsState, split_first_argument, toasts_state_for,
 };
 use lil_platform::desktop_fake::{FakeDesktop, ToastOp};
 use lil_platform::guard::require_desktop_group;
@@ -285,13 +285,14 @@ fn toasts_state_maps_each_notifier_setting() {
 // `--run-ignored`; `lil dev desktop-tests` runs them serialised, the toast tests with `--host`.
 // ---------------------------------------------------------------------------------------------
 
-/// A test channel with an id of its own (`p4a5<16 hex>`), its roots in a temporary folder.
+/// A test channel with an id of its own, `test-desktop-<16 hex>` (the fixed prefix lets a killed
+/// run's leftovers be swept by name), its roots in a temporary folder.
 fn desktop_env(dir: &Path) -> Env {
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).unwrap();
     let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
     Env::with_roots(
-        Channel::Test(format!("p4a5{id}")),
+        Channel::Test(format!("{DESKTOP_TEST_ID_PREFIX}{id}")),
         Roots {
             roaming: dir.join("roaming"),
             local: dir.join("local"),
@@ -303,7 +304,9 @@ fn desktop_env(dir: &Path) -> Env {
 
 /// Removes, on drop, everything a desktop test may have written under its test channel: the
 /// shortcut, the CLSID registration, the handlers, the test channel's registry root and its
-/// toasts. Then checks each is gone (P4a-R39).
+/// toasts. Then checks that each is gone (P4a-R39): the shortcut file and its state, the
+/// handlers' state, every registry key (`leftover_registrations`) and the notification
+/// centre's History, where a read error is a failure too.
 struct Cleanup<'a> {
     env: &'a Env,
 }
@@ -311,44 +314,82 @@ struct Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         use lil_platform::desktop::{
-            clear_toast_history, remove_shortcut, remove_test_registry, toast_history_tags,
-            unregister_handlers,
+            clear_toast_history, leftover_registrations, real_desktop, remove_shortcut,
+            remove_test_registry, toast_history_tags, unregister_handlers,
         };
         let env = self.env;
-        let _ = remove_shortcut(env);
-        let _ = unregister_handlers(env);
-        let _ = remove_test_registry(env);
-        clear_toast_history(env);
-        let left = (
-            env.start_menu_shortcut().exists(),
-            toast_history_tags(env).map(|t| t.len()).unwrap_or(0),
-        );
+        let removed = [
+            ("the shortcut", remove_shortcut(env)),
+            ("the handlers", unregister_handlers(env)),
+            ("the registry root", remove_test_registry(env)),
+            ("the toast history", clear_toast_history(env)),
+        ];
+        let desktop = real_desktop(env);
+        let any_exe = Path::new(r"C:\none\lil-image.exe");
+        let mut left: Vec<String> = removed
+            .iter()
+            .filter_map(|(what, r)| r.as_ref().err().map(|e| format!("removing {what}: {e}")))
+            .collect();
+        if env.start_menu_shortcut().exists() {
+            left.push(format!("{}", env.start_menu_shortcut().display()));
+        }
+        let shortcut = desktop.shortcut_state(env, any_exe);
+        if shortcut != ShortcutState::Missing {
+            left.push(format!("shortcut state {shortcut:?}"));
+        }
+        let handlers = desktop.handler_state(env, any_exe);
+        if handlers != HandlerState::Missing {
+            left.push(format!("handler state {handlers:?}"));
+        }
+        match leftover_registrations(env) {
+            Ok(keys) => left.extend(keys),
+            Err(e) => left.push(format!("reading the registrations: {e}")),
+        }
+        match toast_history_tags(env) {
+            Ok(tags) => left.extend(tags.into_iter().map(|t| format!("toast {t}"))),
+            Err(e) => left.push(format!("reading the toast history: {e}")),
+        }
         if !std::thread::panicking() {
-            assert_eq!(left, (false, 0), "the desktop test left something behind");
+            assert!(
+                left.is_empty(),
+                "the desktop test left something behind: {left:?}"
+            );
         }
     }
 }
 
-/// Waits up to 10 s for `f` to hold.
-fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// The desktop group's failure deadline: a shortcut just written, and the History entry after
+/// it, can take a while on a busy PC. Never a measurement (QA-031).
+const DESKTOP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Waits up to [`DESKTOP_DEADLINE`] for `f` to hold; a timeout says `context()`.
+fn eventually(what: &str, mut f: impl FnMut() -> bool, context: impl Fn() -> String) {
+    let deadline = Instant::now() + DESKTOP_DEADLINE;
     while !f() {
-        assert!(Instant::now() < deadline, "{what} within 10 s");
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            Instant::now() < deadline,
+            "{what} within {DESKTOP_DEADLINE:?}; {}",
+            context()
+        );
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// The host run's test channel: its shortcut in the real Start-menu Programs folder under the
-/// test channel's name, so Windows knows its AUMID (Task 1's S1.2); its registry keys under
-/// the test channel's own root.
+/// The host run's test channel. Its shortcut goes in the real Start-menu Programs folder under
+/// the test channel's name, so Windows knows its AUMID (Task 1's S1.2). Its CLSID is registered
+/// under the shell's classes root, where COM reads it (Appendix G, P4a-R37), through the
+/// desktop group's opt-in, which writes the scheme and the CLSID only, never `.lilref`.
 fn host_env(dir: &Path) -> Env {
     let programs = lil_platform::known_folders::programs().expect("FOLDERID_Programs");
-    desktop_env(dir).with_programs_dir(programs)
+    desktop_env(dir)
+        .with_programs_dir(programs)
+        .with_shell_classes_root()
 }
 
 #[test] // spec: APP-022, QA-042
 #[ignore = "desktop"]
 fn desktop_toast_posts_under_the_shortcut_aumid() {
+    use lil_platform::desktop::{post_watched, toast_history_tags};
     require_desktop_group(true);
     let dir = tempfile::tempdir().unwrap();
     let env = host_env(dir.path());
@@ -356,9 +397,11 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
     let exe = std::env::current_exe().unwrap();
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
-    eventually("toasts ready", || {
-        desktop.toasts_state() == ToastsState::Ready
-    });
+    eventually(
+        "toasts ready",
+        || desktop.toasts_state() == ToastsState::Ready,
+        || format!("toasts_state {:?}", desktop.toasts_state()),
+    );
 
     let tag = "j_00000000000000a5";
     let xml = format!(
@@ -370,16 +413,33 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         env.activation_scheme(),
         tag
     );
-    desktop
-        .post(&toast(tag, "job_finished", &xml, true))
-        .expect("the toast posts");
-    eventually("the toast in History", || {
-        lil_platform::desktop::toast_history_tags(&env).is_ok_and(|t| t.iter().any(|x| x == tag))
-    });
+    // The toast's own events say why a dropped toast never reached History (P4a-R39).
+    let watched =
+        post_watched(&env, &toast(tag, "job_finished", &xml, true)).expect("the toast posts");
+    let context = || {
+        format!(
+            "toasts_state {:?}, the toast's events {:?}, History {:?}",
+            desktop.toasts_state(),
+            watched.events(),
+            toast_history_tags(&env)
+        )
+    };
+    eventually(
+        "the toast in History",
+        || {
+            if let Some(failed) = watched.failure() {
+                panic!("Windows dropped the toast ({failed}); {}", context());
+            }
+            toast_history_tags(&env).is_ok_and(|t| t.iter().any(|x| x == tag))
+        },
+        context,
+    );
     desktop.remove(tag, "job_finished");
-    eventually("the toast gone from History", || {
-        lil_platform::desktop::toast_history_tags(&env).is_ok_and(|t| t.is_empty())
-    });
+    eventually(
+        "the toast gone from History",
+        || toast_history_tags(&env).is_ok_and(|t| t.is_empty()),
+        context,
+    );
 }
 
 #[test] // spec: APP-022, ARCH-055, QA-042
@@ -392,30 +452,36 @@ fn desktop_toasts_state_is_ready_on_this_pc() {
     let exe = std::env::current_exe().unwrap();
     lil_platform::desktop::write_shortcut(&env, &exe).unwrap();
     let desktop = lil_platform::desktop::real_desktop(&env);
-    eventually("toasts ready", || {
-        desktop.toasts_state() == ToastsState::Ready
-    });
+    eventually(
+        "toasts ready",
+        || desktop.toasts_state() == ToastsState::Ready,
+        || format!("toasts_state {:?}", desktop.toasts_state()),
+    );
 }
 
+/// The shortcut and handlers round trip, in the Sandbox, under both classes roots a test
+/// channel can have (Appendix G): first the test channel's own,
+/// `HKCU\Software\LILITH-test-<id>\Classes`, with every handler (`.lilref` too); then the
+/// desktop group's opt-in into the shell's `HKCU\Software\Classes`, where only the
+/// `lil-test-<id>` scheme and the CLSID are written and the `.lilref` association never moves.
 #[test] // spec: APP-022, QA-038, QA-042
 #[ignore = "desktop"]
 fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
     use lil_platform::desktop::{
-        read_shortcut, register_handlers, remove_clsid_registration, remove_shortcut,
-        unregister_handlers, write_shortcut,
+        leftover_registrations, read_shortcut, register_handlers, remove_clsid_registration,
+        remove_shortcut, unregister_handlers, write_shortcut,
     };
     require_desktop_group(false);
     let dir = tempfile::tempdir().unwrap();
-    let env = desktop_env(dir.path());
+    let env = desktop_env(&dir.path().join("own"));
     let _cleanup = Cleanup { env: &env };
     assert!(
         env.start_menu_shortcut()
-            .starts_with(dir.path().join("profile"))
+            .starts_with(dir.path().join("own").join("profile"))
     );
-    assert!(
-        env.classes_root()
-            .starts_with(r"HKCU\Software\LILITH-test-p4a5")
-    );
+    assert!(env.classes_root().starts_with(&format!(
+        r"HKCU\Software\LILITH-test-{DESKTOP_TEST_ID_PREFIX}"
+    )));
     let desktop = lil_platform::desktop::real_desktop(&env);
     // Long, non-verbatim paths to files that exist, as a deployed exe's would be.
     let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -446,6 +512,18 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
         ShortcutState::WrongTarget
     );
 
+    // A shortcut at this channel's path that carries another channel's AUMID.
+    let foreign = desktop_env(&dir.path().join("foreign"));
+    let _foreign_cleanup = Cleanup { env: &foreign };
+    write_shortcut(&foreign, &exe).unwrap();
+    std::fs::copy(foreign.start_menu_shortcut(), env.start_menu_shortcut()).unwrap();
+    assert_eq!(
+        desktop.shortcut_state(&env, &exe),
+        ShortcutState::WrongAumid
+    );
+    write_shortcut(&env, &exe).unwrap();
+    assert_eq!(desktop.shortcut_state(&env, &exe), ShortcutState::Ok);
+
     // The CLSID's registration alone gone: the shortcut is wrong (P4a-R37).
     remove_clsid_registration(&env).unwrap();
     assert_eq!(
@@ -467,6 +545,38 @@ fn desktop_shortcut_and_handlers_round_trip_under_a_test_scheme() {
     unregister_handlers(&env).unwrap();
     assert_eq!(desktop.shortcut_state(&env, &exe), ShortcutState::Missing);
     assert_eq!(desktop.handler_state(&env, &exe), HandlerState::Missing);
+
+    // Opted into the shell's classes root: the scheme and the CLSID only.
+    let shell = desktop_env(&dir.path().join("shell")).with_shell_classes_root();
+    let _shell_cleanup = Cleanup { env: &shell };
+    assert_eq!(shell.classes_root(), r"HKCU\Software\Classes");
+    let shell_desktop = lil_platform::desktop::real_desktop(&shell);
+    write_shortcut(&shell, &exe).unwrap();
+    register_handlers(&shell, &exe).unwrap();
+    assert_eq!(
+        shell_desktop.shortcut_state(&shell, &exe),
+        ShortcutState::Ok
+    );
+    assert_eq!(shell_desktop.handler_state(&shell, &exe), HandlerState::Ok);
+    let scheme = format!(r"HKCU\Software\Classes\{}", shell.activation_scheme());
+    let clsid = format!(
+        r"HKCU\Software\Classes\CLSID\{}",
+        shell.toast_activator_clsid()
+    );
+    let mut written = leftover_registrations(&shell).unwrap();
+    written.sort();
+    let mut want = vec![scheme, clsid];
+    want.sort();
+    assert_eq!(
+        written, want,
+        "only the scheme and the CLSID, never .lilref"
+    );
+    remove_shortcut(&shell).unwrap();
+    unregister_handlers(&shell).unwrap();
+    assert_eq!(
+        leftover_registrations(&shell).unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 #[test] // spec: ARCH-127, QA-042

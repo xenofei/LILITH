@@ -9,15 +9,19 @@
 //!   `<root>\LILITH.lilref.<channel>\shell\open\command = "<exe>" "%1"`.
 //!
 //! Written only after your own input (P4a-R26). A test channel's classes root is
-//! `HKCU\Software\LILITH-test-<id>\Classes`, which the shell never reads.
+//! `HKCU\Software\LILITH-test-<id>\Classes`, which the shell never reads, unless it is a
+//! desktop-group channel that opted into the shell's root (`Env::with_shell_classes_root`):
+//! then only its `lil-test-<id>` scheme is written there, never the `.lilref` association.
+//! The remove helpers act only on test channels.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
-    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW,
+    RegOpenKeyExW, RegSetValueExW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -145,10 +149,50 @@ pub(crate) fn delete_tree(subkey: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// `"<exe>"`: the exe as the registry values quote it. An exe path with a `"` in it can't be
-/// quoted and is refused.
+/// Whether `HKCU\<subkey>` exists (read-only).
+pub(crate) fn key_exists(subkey: &str) -> bool {
+    let mut key = HKEY::default();
+    // SAFETY: the name outlives the call; `key` is a valid out-pointer, closed below on success.
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(subkey),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+    };
+    if opened == ERROR_SUCCESS {
+        // SAFETY: `key` was opened above and is closed once.
+        let _ = unsafe { RegCloseKey(key) };
+        true
+    } else {
+        false
+    }
+}
+
+/// Refuses every channel but a test channel, before anything is read or written: the remove
+/// helpers exist for the desktop group's cleanup and never touch a stable or dev registration.
+pub(crate) fn require_test_channel(env: &Env, what: &str) -> io::Result<()> {
+    if matches!(env.channel(), Channel::Test(_)) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} is done only on a test channel"),
+        ))
+    }
+}
+
+/// `"<exe>"`: the exe as the registry values quote it. An exe path that isn't valid Unicode
+/// (it would be written lossily) or holds a `"` (it can't be quoted) is refused.
 pub(crate) fn quoted(exe: &Path) -> io::Result<String> {
-    let exe = exe.to_string_lossy();
+    let exe = exe.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the exe path isn't valid Unicode",
+        )
+    })?;
     if exe.contains('"') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -180,7 +224,9 @@ fn keys(env: &Env) -> io::Result<Keys> {
 }
 
 /// Writes the channel's scheme and `.lilref` handlers for `exe` (P4a-R26: only after your own
-/// input). A `.lilref` association another channel held is replaced.
+/// input). A `.lilref` association another channel held is replaced. A desktop-group test
+/// channel on the shell's classes root ([`Env::with_shell_classes_root`]) writes its scheme
+/// only: never the `.lilref` association or file type, so your own association never moves.
 pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
     let exe = quoted(exe)?;
     let command = format!("{exe} \"%1\"");
@@ -197,13 +243,18 @@ pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
         &format!("{exe},0"),
     )?;
     set_string(&format!(r"{}\shell\open\command", k.scheme), None, &command)?;
+    if env.uses_shell_classes_root() {
+        return Ok(());
+    }
     set_string(&format!(r"{}\.lilref", k.root), None, &lilref_progid(env))?;
     set_string(&format!(r"{}\shell\open\command", k.progid), None, &command)
 }
 
-/// Removes the channel's scheme and `.lilref` file type, and the `.lilref` association while it
-/// still names this channel's type. Missing keys are no error.
+/// Removes a test channel's scheme and `.lilref` file type, and the `.lilref` association while
+/// it still names this channel's type: exactly the names [`register_handlers`] writes. Missing
+/// keys are no error. Refused, before anything is read or written, on a stable or dev channel.
 pub fn unregister_handlers(env: &Env) -> io::Result<()> {
+    require_test_channel(env, "removing the handlers")?;
     let k = keys(env)?;
     delete_tree(&k.scheme)?;
     delete_tree(&k.progid)?;
@@ -217,27 +268,53 @@ pub fn unregister_handlers(env: &Env) -> io::Result<()> {
 /// Removes a test channel's whole registry root, `HKCU\Software\LILITH-test-<id>` (its classes
 /// root among it): the desktop group's cleanup. Refused for any other channel.
 pub fn remove_test_registry(env: &Env) -> io::Result<()> {
-    if !matches!(env.channel(), Channel::Test(_)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "only a test channel's registry root is removed",
-        ));
-    }
+    require_test_channel(env, "removing the registry root")?;
     delete_tree(&hkcu_subkey(&env.registry_root())?)
 }
 
+/// What a test channel's registrations left behind (read-only; the desktop group's check that
+/// its cleanup removed everything, P4a-R39): each of its scheme key, `.lilref` file type, toast
+/// CLSID key and registry root that still exists, and the `.lilref` association while it names
+/// the channel's type, as `HKCU\…` names. Refused on a stable or dev channel.
+pub fn leftover_registrations(env: &Env) -> io::Result<Vec<String>> {
+    require_test_channel(env, "checking for leftover registrations")?;
+    let k = keys(env)?;
+    let clsid = format!(r"{}\CLSID\{}", k.root, env.toast_activator_clsid());
+    let association = format!(r"{}\.lilref", k.root);
+    let mut left: Vec<String> = [
+        k.scheme,
+        k.progid,
+        clsid,
+        hkcu_subkey(&env.registry_root())?,
+    ]
+    .into_iter()
+    .filter(|key| key_exists(key))
+    .collect();
+    if get_string(&association, None).as_deref() == Some(lilref_progid(env).as_str()) {
+        left.push(association);
+    }
+    Ok(left.into_iter().map(|key| format!(r"HKCU\{key}")).collect())
+}
+
 /// The handlers' state for `exe`: `OtherChannel` when a command runs another exe, else
-/// `Missing` when a key, value or the expected command is missing, else `Ok`.
+/// `Missing` when a key, value or the expected command is missing, else `Ok`. A desktop-group
+/// test channel on the shell's classes root has only its scheme to check.
 pub(crate) fn state(env: &Env, exe: &Path) -> HandlerState {
     let Ok(k) = keys(env) else {
         return HandlerState::Missing;
     };
     let scheme = get_string(&k.scheme, Some("URL Protocol"))
         .and_then(|_| get_string(&format!(r"{}\shell\open\command", k.scheme), None));
-    let lilref = get_string(&format!(r"{}\.lilref", k.root), None)
-        .and_then(|progid| get_string(&format!(r"{}\{progid}\shell\open\command", k.root), None));
+    let mut commands = vec![scheme];
+    if !env.uses_shell_classes_root() {
+        commands.push(
+            get_string(&format!(r"{}\.lilref", k.root), None).and_then(|progid| {
+                get_string(&format!(r"{}\{progid}\shell\open\command", k.root), None)
+            }),
+        );
+    }
     let mut missing = false;
-    for command in [scheme, lilref] {
+    for command in commands {
         match command {
             None => missing = true,
             Some(command) => {
@@ -284,5 +361,12 @@ mod tests {
             r#""C:\a b\lil-image.exe""#
         );
         assert!(quoted(Path::new(r#"C:\a"b.exe"#)).is_err());
+        // An unpaired surrogate would be written as U+FFFD: refused instead.
+        use std::os::windows::ffi::OsStringExt as _;
+        let mut wide: Vec<u16> = r"C:\a".encode_utf16().collect();
+        wide.push(0xD800);
+        let lossy = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+        let err = quoted(&lossy).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 }

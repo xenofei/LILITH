@@ -161,3 +161,36 @@ fn real_programs_and_classes_root_are_real_and_test_names_are_not() {
         assert!(!real.is_real_classes_root(&v), "{v}");
     }
 }
+
+/// The desktop group's opt-in into the shell's classes root (Appendix G: the test classes root
+/// is for test channels outside the desktop group): test channels only.
+#[test] // spec: APP-022, QA-038
+fn shell_classes_root_is_a_test_channel_opt_in() {
+    let test = env(Channel::Test("abc".into())).with_shell_classes_root();
+    assert_eq!(test.classes_root(), r"HKCU\Software\Classes");
+    // Nothing else moves: the scheme, the CLSID and the registry root stay the channel's own.
+    assert_eq!(test.activation_scheme(), "lil-test-abc");
+    assert_eq!(
+        test.toast_activator_clsid(),
+        env(Channel::Test("abc".into())).toast_activator_clsid()
+    );
+    assert_eq!(test.registry_root(), r"HKCU\Software\LILITH-test-abc");
+    for channel in [Channel::Stable, Channel::Dev] {
+        let got = std::panic::catch_unwind(|| env(channel.clone()).with_shell_classes_root());
+        assert!(got.is_err(), "{channel} must refuse the opt-in");
+    }
+}
+
+/// A URL scheme is letters, digits, `+`, `-` and `.` (RFC 3986 §3.1): a test id with `_` makes
+/// none, so `activation_scheme` refuses it rather than give a scheme the shell won't resolve.
+#[test] // spec: APP-020, QA-038
+fn a_test_id_with_an_underscore_makes_no_scheme() {
+    assert_eq!(
+        env(Channel::Test("desktop-0a1B".into())).activation_scheme(),
+        "lil-test-desktop-0a1B"
+    );
+    let got = std::panic::catch_unwind(|| env(Channel::Test("a_b".into())).activation_scheme());
+    let msg = got.expect_err("must panic");
+    let msg = msg.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(msg.contains("can't make a URL scheme"), "{msg}");
+}

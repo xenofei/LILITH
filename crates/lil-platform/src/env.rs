@@ -185,6 +185,9 @@ pub struct Env {
     /// The folder of the AUMID shortcut: `FOLDERID_Programs` from [`Env::from_system`], else
     /// `<user_profile>\Programs` (on a test channel `<test root>\profile\Programs`).
     programs: PathBuf,
+    /// A desktop-group test channel registers under the shell's classes root
+    /// ([`Env::with_shell_classes_root`]).
+    shell_classes: bool,
 }
 
 impl Env {
@@ -287,7 +290,32 @@ impl Env {
             user_sid,
             volumes: Arc::new(SystemVolumeResolver),
             programs,
+            shell_classes: false,
         }
+    }
+
+    /// The desktop group's opt-in (Appendix G: the test classes root is for test channels
+    /// *outside* the desktop group): this test channel's [`Env::classes_root`] becomes the
+    /// shell's own, `HKCU\Software\Classes`, so its `lil-test-<id>` scheme resolves and its
+    /// toast CLSID is registered where COM reads it. Only the scheme and the CLSID are written
+    /// there, never the `.lilref` association ([`crate::desktop::register_handlers`]), and the
+    /// desktop group's cleanup removes exactly those names. The armed guard still trips on it.
+    ///
+    /// # Panics
+    /// On a stable or dev channel (a programming error).
+    #[must_use]
+    pub fn with_shell_classes_root(mut self) -> Env {
+        assert!(
+            matches!(self.channel, Channel::Test(_)),
+            "only a test channel takes the shell classes root this way"
+        );
+        self.shell_classes = true;
+        self
+    }
+
+    /// Whether this is a desktop-group test channel on the shell's classes root.
+    pub(crate) fn uses_shell_classes_root(&self) -> bool {
+        self.shell_classes
     }
 
     /// Replaces the folder the AUMID shortcut goes in. [`Env::from_system`] sets the real
@@ -457,21 +485,34 @@ impl Env {
 
     /// The channel's activation scheme (P4a-R2): `lil` for stable, `lil-dev` for dev,
     /// `lil-test-<id>` for a test channel.
+    ///
+    /// # Panics
+    /// On a test channel whose id holds `_`: a URL scheme is letters, digits, `+`, `-` and `.`
+    /// only (RFC 3986 §3.1), and the test kit's and the desktop group's ids are hex.
     pub fn activation_scheme(&self) -> String {
         let scheme = match self.channel {
             Channel::Stable => "lil".to_string(),
-            ref other => format!("lil-{other}"),
+            Channel::Dev => "lil-dev".to_string(),
+            Channel::Test(ref id) => {
+                assert!(
+                    id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                    "test channel `{id}` can't make a URL scheme (letters, digits and `-` only)"
+                );
+                format!("lil-test-{id}")
+            }
         };
         guard::check_channel_name(&self.channel, scheme)
     }
 
     /// The per-user classes root the handlers and the toast CLSID are registered under
-    /// (Appendix G): `HKCU\Software\Classes` for stable and dev, `<registry root>\Classes`
-    /// (`HKCU\Software\LILITH-test-<id>\Classes`) for a test channel, which the shell never reads.
+    /// (Appendix G): `HKCU\Software\Classes` for stable and dev, and for a desktop-group test
+    /// channel that opted in ([`Env::with_shell_classes_root`]); `<registry root>\Classes`
+    /// (`HKCU\Software\LILITH-test-<id>\Classes`) for every other test channel, which the shell
+    /// never reads.
     pub fn classes_root(&self) -> String {
         let root = match self.channel {
-            Channel::Stable | Channel::Dev => r"HKCU\Software\Classes".to_string(),
-            Channel::Test(_) => format!(r"{}\Classes", self.registry_root()),
+            Channel::Test(_) if !self.shell_classes => format!(r"{}\Classes", self.registry_root()),
+            _ => r"HKCU\Software\Classes".to_string(),
         };
         guard::check_classes_root(root)
     }
@@ -488,7 +529,10 @@ impl Env {
 
     /// The shortcut's `System.AppUserModel.ToastActivatorCLSID` (P4a-R37): fixed per channel and
     /// different for each, in the registry form `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`. It is
-    /// a name-based UUID (the version 5 layout) over SHA-256 of the channel's AUMID.
+    /// the first 16 bytes of SHA-256 over the UTF-8 text `<AUMID> ToastActivatorCLSID`
+    /// (`LILITH.Suite.<Channel> ToastActivatorCLSID`), with the version nibble set to 5 and the
+    /// RFC 4122 variant bits set: a v5-style layout, not an RFC 4122 v5 UUID (that one is SHA-1
+    /// over a namespace).
     pub fn toast_activator_clsid(&self) -> String {
         let aumid = format!("{}.Suite.{}", names::APP_NAME, self.channel.capitalised());
         let digest = Sha256::digest(format!("{aumid} ToastActivatorCLSID").as_bytes());

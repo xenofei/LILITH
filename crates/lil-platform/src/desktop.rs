@@ -35,12 +35,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::env::Env;
 use crate::power::PowerRequest;
 
-pub use crate::classes::{register_handlers, remove_test_registry, unregister_handlers};
+pub use crate::classes::{
+    leftover_registrations, register_handlers, remove_test_registry, unregister_handlers,
+};
 pub use crate::power::POWER_REASON;
 pub use crate::shortcut::{
     ShortcutInfo, read_shortcut, remove_clsid_registration, remove_shortcut, write_shortcut,
 };
-pub use crate::toast::{clear_toast_history, toast_history_tags};
+pub use crate::toast::{WatchedToast, clear_toast_history, post_watched, toast_history_tags};
+
+/// The fixed start of every desktop-group test channel's id: `test-desktop-<16 hex>`. A run
+/// that was killed before its cleanup ran can then be swept by name (Task 30's runner, P4a-R39):
+/// the shortcut `<Programs>\LILITH (Test-desktop-*).lnk`, the keys
+/// `HKCU\Software\LILITH-test-desktop-*`, and under `HKCU\Software\Classes` the scheme
+/// `lil-test-desktop-*` and the channel's toast CLSID. The id read from any of those names
+/// gives that CLSID ([`Env::toast_activator_clsid`] of `test-<id>`), and
+/// [`leftover_registrations`] lists what is still there.
+pub const DESKTOP_TEST_ID_PREFIX: &str = "desktop-";
 
 /// What `SHQueryUserNotificationState` says (CORE-160, P4a-R6): `D3d`, `Busy` and
 /// `Presentation` are fullscreen; `Unknown` when the call failed.

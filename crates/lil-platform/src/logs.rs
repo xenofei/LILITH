@@ -85,13 +85,26 @@ impl DailyWriter {
     /// (`YYYY-MM-DD`).
     ///
     /// # Errors
-    /// If `dir` can't be made.
+    /// If `process` isn't 1 to 64 ASCII letters, digits, `-` or `_` (so its files stay in
+    /// `dir`), or `dir` can't be made.
     pub fn new(
         dir: &Path,
         process: &str,
         cap_bytes: u64,
         today: impl Fn() -> String + Send + Sync + 'static,
     ) -> io::Result<DailyWriter> {
+        let valid = (1..=64).contains(&process.len())
+            && process
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a log's process name is 1 to 64 ASCII letters, digits, `-` or `_`: {process:?}"
+                ),
+            ));
+        }
         std::fs::create_dir_all(dir)?;
         Ok(DailyWriter {
             inner: Arc::new(Mutex::new(Inner {

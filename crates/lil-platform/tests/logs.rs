@@ -64,6 +64,60 @@ fn one_file_a_day_and_14_kept() {
     assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
 }
 
+/// A process that starts again on a day whose file is already capped writes nothing more and
+/// no second `log_capped` line; the next day starts a new file.
+#[test] // spec: ARCH-117
+fn a_restart_on_a_capped_day_writes_no_second_capped_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = b"{\"fields\":{\"message\":\"0123456789abcdef0123456789abcdef\"}}\n";
+    let writer = |date: &'static str| {
+        DailyWriter::new(dir.path(), "core", 256, move || date.to_string()).unwrap()
+    };
+    let mut first = writer("2026-02-01");
+    for _ in 0..20 {
+        first.write_all(line).unwrap();
+    }
+    drop(first);
+    let path = dir.path().join("core.2026-02-01.log");
+    let capped = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(capped.matches("log_capped").count(), 1, "{capped}");
+
+    let mut again = writer("2026-02-01");
+    for _ in 0..20 {
+        again.write_all(line).unwrap();
+    }
+    drop(again);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), capped);
+
+    let mut next = writer("2026-02-02");
+    next.write_all(line).unwrap();
+    let text = std::fs::read_to_string(dir.path().join("core.2026-02-02.log")).unwrap();
+    assert_eq!(text.as_bytes(), line);
+}
+
+/// A process name that could leave the log folder, or isn't a plain name, is refused.
+#[test] // spec: ARCH-117
+fn a_log_process_name_stays_in_the_log_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in [
+        "",
+        r"..\core",
+        "a/b",
+        r"a\b",
+        "core.x",
+        "a b",
+        &"x".repeat(65),
+    ] {
+        let err = DailyWriter::new(dir.path(), bad, 1024, || "2026-01-01".to_string())
+            .err()
+            .unwrap_or_else(|| panic!("{bad:?} must be refused"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        assert!(init_at(dir.path(), bad, 1024).is_err(), "{bad:?}");
+    }
+    assert!(DailyWriter::new(dir.path(), "lil-core_2", 1024, || "2026-01-01".into()).is_ok());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[test] // spec: ARCH-117
 fn a_day_stops_at_the_cap_with_one_capped_line() {
     const CAP: u64 = 4 * 1024;

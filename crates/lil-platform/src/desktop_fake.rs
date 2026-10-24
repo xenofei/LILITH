@@ -17,8 +17,9 @@ pub enum ToastOp {
 }
 
 /// One recorded call. A post carries the `Toast.xml` handed to the desktop, whether it was
-/// quiet, and the title, body and launch URL read back from that XML (unescaped); a remove
-/// carries only its tag and group.
+/// quiet, and the title, body and launch URL read back from that XML (named and numeric
+/// references decoded); a remove carries only its tag and group. The actions (a
+/// confirmation's Open and Deny URLs) aren't split out: a test that needs them reads `xml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToastRecord {
     pub op: ToastOp,
@@ -204,11 +205,62 @@ fn attribute(xml: &str, element: &str, attr: &str) -> Option<String> {
     Some(unescape(&value[..value.find('"')?]))
 }
 
-/// XML's five predefined entities.
+/// XML's references, in one pass: the five predefined entities and the numeric references
+/// `&#<decimal>;` and `&#x<hex>;`. A reference that isn't one of those, or names no character,
+/// is kept as written.
 fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').and_then(|semi| {
+            let name = &rest[1..semi];
+            let c = match name {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .map(|hex| u32::from_str_radix(hex, 16))
+                    .or_else(|| name.strip_prefix('#').map(str::parse::<u32>))
+                    .and_then(Result::ok)
+                    .and_then(char::from_u32),
+            };
+            c.map(|c| (c, semi))
+        });
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] // spec: QA-066
+    fn unescape_reads_named_and_numeric_references() {
+        assert_eq!(
+            unescape("a &amp;lt; b &lt;&gt;&quot;&apos; &#65;&#x42;&#X43; &#x1F600;"),
+            "a &lt; b <>\"' ABC \u{1F600}"
+        );
+        // Not references: kept as written.
+        assert_eq!(
+            unescape("& &unknown; &#xZZ; &#55296; x&"),
+            "& &unknown; &#xZZ; &#55296; x&"
+        );
+    }
 }
