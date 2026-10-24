@@ -1,0 +1,23 @@
+# The `desktop` nextest profile (QA-042; P4a-R29, P4a-R31, P4a-R39): the desktop group, run by
+# `lil dev desktop-tests`. This file is its one home. Inside Windows Sandbox, run-inside.ps1
+# passes it with `--config-file`, which replaces `.config/nextest.toml`; the host run
+# (`--host`) passes it the same way.
+#
+# No setup scripts: there is no cargo in the Sandbox. The test binaries come from
+# LIL_TESTBINS_DIR (lil_testkit::bins).
+
+# Where nextest keeps its run data, relative to the workspace root (inside the Sandbox, the
+# remapped C:\lil\work\src). The JUnit file is <dir>/desktop/junit.xml.
+[store]
+dir = "target/nextest"
+
+[profile.desktop]
+# The group is serialised (QA-042).
+test-threads = 1
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Every test of the group runs, so the summary lists each one.
+fail-fast = false
+
+[profile.desktop.junit]
+path = "junit.xml"

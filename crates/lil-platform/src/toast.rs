@@ -38,8 +38,9 @@ pub(crate) fn setting(aumid: &str) -> Option<NotifierSetting> {
 }
 
 /// Whether this process's token is elevated. A token that can't be read counts as not
-/// elevated: the notifier's own setting still decides.
-pub(crate) fn is_elevated() -> bool {
+/// elevated: the notifier's own setting still decides. `lil dev desktop-tests --host` refuses
+/// to run elevated with it (P4a-R39).
+pub fn is_elevated() -> bool {
     let mut token = HANDLE::default();
     // SAFETY: the pseudo-handle of this process is always valid; `token` is a valid
     // out-pointer, and the handle it receives is closed below.

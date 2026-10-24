@@ -68,6 +68,63 @@ fn split_first_argument_keeps_the_rest_untouched() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The names a killed desktop run can leave behind (P4a-R39, Task 30's sweep).
+// ---------------------------------------------------------------------------------------------
+
+#[test] // spec: QA-042
+fn leftover_names_give_the_desktop_test_id() {
+    use lil_platform::desktop::desktop_test_id_in;
+    let id = Some("desktop-0123456789abcdef".to_string());
+    for name in [
+        "lil-test-desktop-0123456789abcdef",
+        "LILITH-test-desktop-0123456789abcdef",
+        "LILITH (Test-desktop-0123456789abcdef).lnk",
+        "lilith (test-desktop-0123456789ABCDEF).LNK",
+    ] {
+        assert_eq!(desktop_test_id_in(name), id, "{name}");
+    }
+    // The env's own names give the same id back.
+    let dir = tempfile::tempdir().unwrap();
+    let env = desktop_env(dir.path());
+    let Channel::Test(own) = env.channel().clone() else {
+        unreachable!()
+    };
+    let shortcut = env.start_menu_shortcut();
+    let shortcut = shortcut.file_name().unwrap().to_string_lossy();
+    let root = env.registry_root();
+    for name in [
+        env.activation_scheme().as_str(),
+        root.trim_start_matches(r"HKCU\Software\"),
+        &shortcut,
+    ] {
+        assert_eq!(
+            desktop_test_id_in(name).as_deref(),
+            Some(own.as_str()),
+            "{name}"
+        );
+    }
+    // Stable, dev, other test channels, other lengths and other characters: none.
+    for name in [
+        "lil",
+        "lil-dev",
+        "LILITH",
+        "LILITH-dev",
+        "LILITH.lnk",
+        "LILITH (Dev).lnk",
+        "lil-test-0123456789abcdef",
+        "LILITH-test-a",
+        "lil-test-desktop-0123456789abcde",
+        "lil-test-desktop-0123456789abcdef0",
+        "lil-test-desktop-0123456789abcdeg",
+        "lil-test-desktop-0123456789abcdef.lnk",
+        "LILITH (Test-desktop-0123456789abcdef)",
+        "x-lil-test-desktop-0123456789abcdef",
+    ] {
+        assert_eq!(desktop_test_id_in(name), None, "{name}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // FakeDesktop (QA-066's test fakes).
 // ---------------------------------------------------------------------------------------------
 

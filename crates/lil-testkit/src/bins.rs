@@ -10,6 +10,11 @@
 //! `.config/nextest.toml` has built them once before any test starts. Anywhere else (plain
 //! `cargo test`, another profile), or when any binary is missing although the script ran,
 //! [`ensure_built`] runs the same `cargo build` itself, once per process.
+//!
+//! Inside Windows Sandbox there is no cargo (QA-042, P4a-R31): `lil dev desktop-tests` bundles
+//! `target\testbins\debug` and sets [`ENV_TESTBINS_DIR`] to it. When that variable is set, the
+//! binaries are taken from that folder and nothing is ever built; when it is set and a binary is
+//! missing, or when `LIL_SANDBOX=1` and it isn't set, the test fails ([`locate`]).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,6 +44,20 @@ pub struct Bins {
 }
 
 impl Bins {
+    /// The test binaries in `dir`.
+    pub fn in_dir(dir: &Path) -> Bins {
+        Bins {
+            lil: dir.join("lil.exe"),
+            lil_core: dir.join("lil-core.exe"),
+            lil_mcp: dir.join("lil-mcp.exe"),
+            test_app: dir.join("lil-test-app.exe"),
+            fake_comfyui: dir.join("lil-fake-comfyui.exe"),
+            fake_comfy_cli: dir.join("lil-fake-comfy-cli.exe"),
+            claude: dir.join("claude.exe"),
+            dir: dir.to_path_buf(),
+        }
+    }
+
     fn all(&self) -> [&PathBuf; 7] {
         [
             &self.lil,
@@ -49,6 +68,52 @@ impl Bins {
             &self.fake_comfy_cli,
             &self.claude,
         ]
+    }
+}
+
+/// The folder the test binaries are taken from instead of `target\testbins\debug`, without
+/// building: the Sandbox runner sets it to its bundled copy (P4a-R31).
+pub const ENV_TESTBINS_DIR: &str = "LIL_TESTBINS_DIR";
+
+/// Set to `1` inside Windows Sandbox by the runner (`lil_platform::guard::ENV_SANDBOX`'s name).
+const ENV_SANDBOX: &str = "LIL_SANDBOX";
+
+/// Where [`ensure_built`] takes the binaries from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    /// [`ENV_TESTBINS_DIR`]'s folder, which holds every binary: used as it is, never built.
+    Use(Bins),
+    /// The compile-time `target\testbins\debug`, built when this run's setup script didn't.
+    BuildIfNeeded(Bins),
+}
+
+/// Where the test binaries come from: `testbins_dir` ([`ENV_TESTBINS_DIR`]) when it is given,
+/// else `compiled` (the compile-time `target\testbins\debug`), which may be built, except inside
+/// the Sandbox (`sandbox`, `LIL_SANDBOX=1`), where nothing can be built. `Err` holds the test's
+/// failure message: "test binaries not found in <dir>; the Sandbox runner bundles
+/// target\testbins\debug".
+pub fn locate(
+    testbins_dir: Option<&Path>,
+    sandbox: bool,
+    compiled: &Path,
+) -> Result<Located, String> {
+    let not_found = |dir: &Path| {
+        format!(
+            r"test binaries not found in {}; the Sandbox runner bundles target\testbins\debug",
+            dir.display()
+        )
+    };
+    match testbins_dir {
+        Some(dir) => {
+            let bins = Bins::in_dir(dir);
+            if bins.all().iter().all(|b| b.is_file()) {
+                Ok(Located::Use(bins))
+            } else {
+                Err(not_found(dir))
+            }
+        }
+        None if sandbox => Err(not_found(compiled)),
+        None => Ok(Located::BuildIfNeeded(Bins::in_dir(compiled))),
     }
 }
 
@@ -64,33 +129,33 @@ pub(crate) fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The test binaries, built if this run's setup script did not build them.
+/// The test binaries, built if this run's setup script did not build them, or taken from
+/// [`ENV_TESTBINS_DIR`] without building ([`locate`]).
 ///
 /// # Panics
-/// If the build fails; the message carries cargo's output.
+/// If the build fails (the message carries cargo's output), or when [`locate`] refuses.
 pub fn ensure_built() -> &'static Bins {
     static BINS: OnceLock<Bins> = OnceLock::new();
     BINS.get_or_init(|| {
         let root = workspace_root();
         let target = root.join("target").join("testbins");
-        let dir = target.join("debug");
-        let bins = Bins {
-            lil: dir.join("lil.exe"),
-            lil_core: dir.join("lil-core.exe"),
-            lil_mcp: dir.join("lil-mcp.exe"),
-            test_app: dir.join("lil-test-app.exe"),
-            fake_comfyui: dir.join("lil-fake-comfyui.exe"),
-            fake_comfy_cli: dir.join("lil-fake-comfy-cli.exe"),
-            claude: dir.join("claude.exe"),
-            dir,
-        };
-        if needs_build(
-            built_by_setup_script(),
-            bins.all().iter().all(|b| b.is_file()),
-        ) {
-            build(&root, &target);
+        let override_dir = std::env::var_os(ENV_TESTBINS_DIR)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let sandbox = std::env::var(ENV_SANDBOX).is_ok_and(|v| v == "1");
+        match locate(override_dir.as_deref(), sandbox, &target.join("debug")) {
+            Err(message) => panic!("{message}"),
+            Ok(Located::Use(bins)) => bins,
+            Ok(Located::BuildIfNeeded(bins)) => {
+                if needs_build(
+                    built_by_setup_script(),
+                    bins.all().iter().all(|b| b.is_file()),
+                ) {
+                    build(&root, &target);
+                }
+                bins
+            }
         }
-        bins
     })
 }
 

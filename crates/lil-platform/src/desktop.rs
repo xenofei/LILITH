@@ -42,7 +42,9 @@ pub use crate::power::POWER_REASON;
 pub use crate::shortcut::{
     ShortcutInfo, read_shortcut, remove_clsid_registration, remove_shortcut, write_shortcut,
 };
-pub use crate::toast::{WatchedToast, clear_toast_history, post_watched, toast_history_tags};
+pub use crate::toast::{
+    WatchedToast, clear_toast_history, is_elevated, post_watched, toast_history_tags,
+};
 
 /// The fixed start of every desktop-group test channel's id: `test-desktop-<16 hex>`. A run
 /// that was killed before its cleanup ran can then be swept by name (Task 30's runner, P4a-R39):
@@ -52,6 +54,56 @@ pub use crate::toast::{WatchedToast, clear_toast_history, post_watched, toast_hi
 /// gives that CLSID ([`Env::toast_activator_clsid`] of `test-<id>`), and
 /// [`leftover_registrations`] lists what is still there.
 pub const DESKTOP_TEST_ID_PREFIX: &str = "desktop-";
+
+/// The desktop-group test channel id (`desktop-<16 hex>`, lowercase) that `name` belongs to,
+/// when it is one of the names a desktop test writes ([`DESKTOP_TEST_ID_PREFIX`]): the scheme
+/// key `lil-test-desktop-<hex>`, the registry root `LILITH-test-desktop-<hex>` or the shortcut
+/// `LILITH (Test-desktop-<hex>).lnk`. Compared ASCII case-insensitively; anything else, the
+/// stable and dev names among it, is `None`.
+pub fn desktop_test_id_in(name: &str) -> Option<String> {
+    let app = crate::names::APP_NAME;
+    let forms = [
+        (format!("lil-test-{DESKTOP_TEST_ID_PREFIX}"), String::new()),
+        (
+            format!("{app}-test-{DESKTOP_TEST_ID_PREFIX}"),
+            String::new(),
+        ),
+        (
+            format!("{app} (Test-{DESKTOP_TEST_ID_PREFIX}"),
+            ").lnk".to_string(),
+        ),
+    ];
+    let lower = name.to_ascii_lowercase();
+    forms.iter().find_map(|(head, tail)| {
+        let hex = lower
+            .strip_prefix(&head.to_ascii_lowercase())?
+            .strip_suffix(tail.as_str())?;
+        (hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("{DESKTOP_TEST_ID_PREFIX}{hex}"))
+    })
+}
+
+/// The ids of the desktop-group test channels that still have a scheme key under
+/// `HKCU\Software\Classes`, a registry root under `HKCU\Software` or a shortcut in `programs`
+/// (read-only): what a killed host run can leave behind, for `lil dev desktop-tests --host` to
+/// sweep with the test-only removers (P4a-R39). Sorted, without repeats.
+pub fn desktop_test_ids_left(programs: &Path) -> std::io::Result<Vec<String>> {
+    let mut names = crate::classes::subkey_names(r"Software\Classes")?;
+    names.extend(crate::classes::subkey_names("Software")?);
+    match std::fs::read_dir(programs) {
+        Ok(entries) => {
+            for entry in entries {
+                names.push(entry?.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut ids: Vec<String> = names.iter().filter_map(|n| desktop_test_id_in(n)).collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
 
 /// What `SHQueryUserNotificationState` says (CORE-160, P4a-R6): `D3d`, `Busy` and
 /// `Presentation` are fullscreen; `Unknown` when the call failed.

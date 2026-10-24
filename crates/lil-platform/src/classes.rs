@@ -17,13 +17,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR,
+};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW,
-    RegOpenKeyExW, RegSetValueExW,
+    RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW,
+    RegGetValueW, RegOpenKeyExW, RegSetValueExW,
 };
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use crate::desktop::{HandlerState, same_path, split_first_argument};
 use crate::env::{Channel, Env};
@@ -169,6 +171,57 @@ pub(crate) fn key_exists(subkey: &str) -> bool {
     } else {
         false
     }
+}
+
+/// The names of the subkeys directly below `HKCU\<subkey>` (read-only); a missing key has
+/// none.
+pub(crate) fn subkey_names(subkey: &str) -> io::Result<Vec<String>> {
+    let mut key = HKEY::default();
+    // SAFETY: the name outlives the call; `key` is a valid out-pointer, closed below on success.
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(subkey),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+    };
+    if opened == ERROR_FILE_NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    check(opened)?;
+    let mut names = Vec::new();
+    let mut result = Ok(());
+    for index in 0u32.. {
+        // A key name is at most 255 characters.
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        // SAFETY: `key` is open; `buf` holds `len` UTF-16 units and outlives the call.
+        let e = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if e == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if let Err(err) = check(e) {
+            result = Err(err);
+            break;
+        }
+        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+    }
+    // SAFETY: `key` was opened above and is closed once.
+    let _ = unsafe { RegCloseKey(key) };
+    result.map(|()| names)
 }
 
 /// Refuses every channel but a test channel, before anything is read or written: the remove
