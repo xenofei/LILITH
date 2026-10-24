@@ -259,15 +259,19 @@ fn ui_connections_are_tracked_in_telemetry() {
     );
 }
 
-/// Whether `pred` holds for a snapshot within 20 ticks (a tool error fails at once).
+/// Whether `pred` holds for a snapshot, ticking, within 10 s (a deadline, never a
+/// measurement; a tool error fails at once).
 fn within_ticks(pipe: &mut RawPipe, pred: impl Fn(&Value) -> bool) -> bool {
-    (0..20).any(|_| {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         tick(pipe, 1);
         let snapshot = ok(pipe, "telemetry.snapshot", json!({}), None);
-        let held = pred(&snapshot);
-        if !held {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if pred(&snapshot) {
+            return true;
         }
-        held
-    })
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

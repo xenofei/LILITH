@@ -386,13 +386,17 @@ fn a_restart_holds_never_started_jobs_until_resumed() {
     let state = app_ok(&mut app, "app/queue.resume", json!({"held_only": true}));
     assert_eq!(state["paused"], true, "{state}");
     assert_eq!(state["reasons"], json!(["manual"]), "{state}");
-    assert_eq!(state["restart_held"], 0, "{state}");
     for id in &held {
         let j = until_job(&mut pipe, id, "held by the manual pause only", |j| {
             j["pause_reasons"] == json!(["manual"])
         });
         assert_eq!(j["substatus"], "queue_paused", "{j}");
     }
+    // The count is read once the jobs show the release: the call need not wait for it.
+    let lane = lane_state(&mut pipe, "gpu-heavy");
+    assert_eq!(lane["restart_held"], 0, "{lane}");
+    assert_eq!(lane["held"], 2, "both still held by your pause: {lane}");
+    assert_eq!(lane["reasons"], json!(["manual"]), "{lane}");
 
     let state = app_ok(&mut app, "app/queue.resume", json!({}));
     assert_eq!(state["paused"], false, "{state}");
