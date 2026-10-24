@@ -14,6 +14,11 @@ yanked = "deny"
 id = "RUSTSEC-2026-0374"
 reason = "basic-toml is unmaintained; transitive via age's i18n-embed; no maintained upgrade path; revisit when age drops i18n-embed"
 
+# Owner decision 2026-10-24: the one recorded exception to "vulnerabilities are always denied".
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0387"
+reason = "crypto-bigint 0.5.5 timing leaks; transitive via age 0.12.1 -> p256 (p256tag recipients). lil-cli uses only age's scrypt passphrase recipient and identity (crates/lil-cli/src/dev/reviewer.rs), never p256 arithmetic on secrets. The fix is in crypto-bigint 0.7.6, which age 0.12.1 can't use; revisit when age moves to it"
+
 [licenses]
 # Third-party crates: permissive licences only, all compatible with distributing the
 # suite's binaries under AGPL-3.0-or-later (the suite's own licence; see LICENSE).
