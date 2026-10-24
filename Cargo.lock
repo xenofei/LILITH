@@ -1692,6 +1692,12 @@ dependencies = [
 [[package]]
 name = "lil-parse"
 version = "0.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "lil-schema",
+ "proptest",
+ "serde_json",
+]
 
 [[package]]
 name = "lil-platform"

@@ -158,6 +158,14 @@ const ALLOW: &[Allow] = &[
         why: "the legacy-name rename test builds a plugin-era workspace",
         until: "the legacy workspace readers go",
     },
+    // Plan 4a, Task 4: an `open/` target written with the legacy `ww://` scheme is checked as
+    // a ref and refused, and a raw legacy ref is never accepted as a `lil:` target.
+    Allow {
+        globs: &["crates/lil-parse/tests/lil_url.rs"],
+        lines_with: &["ww://", "WW://"],
+        why: "the URL grammar's tests refuse legacy `ww://` targets",
+        until: "the legacy workspace readers go",
+    },
     // Plan 3, Global Constraints "Old names", the Task 2 spec row: Appendix F's legacy-name
     // contract (`lil doctor`'s legacy-name rename) and its plugin contract (plugin 1.3 keeps
     // the id, R1), one row per end condition.

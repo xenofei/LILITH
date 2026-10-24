@@ -1,5 +1,5 @@
-//! Dependency-boundary test (ARCH-111, QA-027): `lil-schema` and `lil-protocol` have no Qt or
-//! Windows crates anywhere in their normal dependency closure.
+//! Dependency-boundary test (ARCH-111, QA-027): `lil-schema`, `lil-protocol` and `lil-parse` have
+//! no Qt or Windows crates anywhere in their normal dependency closure.
 //!
 //! Each crate's closure is resolved on its own, as a standalone build of that crate resolves
 //! it: `cargo tree -p <crate> -e normal --prefix none` for the one supported target,
@@ -140,7 +140,7 @@ fn platform_crates(closure: &BTreeSet<String>) -> Vec<&String> {
 
 #[test] // spec: ARCH-111, QA-027
 fn schema_and_protocol_have_no_platform_deps() {
-    for root in ["lil-schema", "lil-protocol"] {
+    for root in ["lil-schema", "lil-protocol", "lil-parse"] {
         let closure = standalone_closure(root);
         assert!(closure.contains("serde_json"), "{root}: {closure:?}");
         let bad = platform_crates(&closure);
@@ -157,7 +157,7 @@ fn boundaries_hold_per_crate_with_rmcp_in_the_workspace() {
         closure_from_metadata(&metadata, "lil-mcp").contains("rmcp"),
         "rmcp is not in the workspace graph, so this test would prove nothing"
     );
-    for root in ["lil-schema", "lil-protocol"] {
+    for root in ["lil-schema", "lil-protocol", "lil-parse"] {
         let closure = standalone_closure(root);
         assert!(!closure.contains("rmcp"), "{root}: {closure:?}");
         let bad = platform_crates(&closure);
