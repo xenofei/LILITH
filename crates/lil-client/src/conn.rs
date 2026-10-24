@@ -57,10 +57,11 @@ struct Inner {
     closed: bool,
 }
 
-/// Where one [`EventStream`]'s events go.
+/// Where one [`EventStream`]'s events go, or a session's (every topic).
 struct Sink {
     id: u64,
-    topics: BTreeSet<String>,
+    /// `None`: every event the connection receives (`crate::session`).
+    topics: Option<BTreeSet<String>>,
     tx: mpsc::UnboundedSender<EventParams>,
 }
 
@@ -140,6 +141,19 @@ impl Conn {
         &self,
         topics: &[String],
     ) -> Option<(u64, mpsc::UnboundedReceiver<EventParams>)> {
+        self.add(Some(topics.iter().cloned().collect()))
+    }
+
+    /// Registers a stream for every event this connection receives, whatever its topic;
+    /// `None` when the connection is closed. It ends when the connection closes.
+    pub(crate) fn add_sink_all(&self) -> Option<mpsc::UnboundedReceiver<EventParams>> {
+        self.add(None).map(|(_, rx)| rx)
+    }
+
+    fn add(
+        &self,
+        topics: Option<BTreeSet<String>>,
+    ) -> Option<(u64, mpsc::UnboundedReceiver<EventParams>)> {
         let mut inner = self.shared.lock();
         if inner.closed {
             return None;
@@ -147,11 +161,7 @@ impl Conn {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = inner.next_sink;
         inner.next_sink += 1;
-        inner.sinks.push(Sink {
-            id,
-            topics: topics.iter().cloned().collect(),
-            tx,
-        });
+        inner.sinks.push(Sink { id, topics, tx });
         Some((id, rx))
     }
 
@@ -228,7 +238,11 @@ fn route(shared: &Shared, line: &str) -> bool {
             };
             // A stream whose receiver is gone is dropped here.
             shared.lock().sinks.retain(|sink| {
-                !sink.topics.contains(&event.topic) || sink.tx.send(event.clone()).is_ok()
+                let wanted = sink
+                    .topics
+                    .as_ref()
+                    .is_none_or(|topics| topics.contains(&event.topic));
+                !wanted || sink.tx.send(event.clone()).is_ok()
             });
         }
         Err(_) => return false,

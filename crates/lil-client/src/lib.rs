@@ -10,11 +10,10 @@
 //! (ARCH-032). [`drain_and_wait`] is `lil core stop`. [`resolve_workspace`] is the `cli`
 //! workspace chain (ARCH-030); a core that does not know the workspace it names is
 //! [`ClientError::UnknownWorkspace`], naming the folder. [`blocking`] wraps all of it for
-//! synchronous callers such as `lil`.
-//!
-//! Deferred to plan 4: reconnecting and resubscribing after a core restart (APP-034/035;
-//! `HelloResult::instance_id` already tells a client that a core restarted), and QA-026's
-//! GUI-thread check in [`blocking`].
+//! synchronous callers such as `lil`, and panics in a debug build when called on a thread
+//! [`mark_gui_thread`] marked (QA-026). [`session::Session`] is an app's connection: it
+//! reconnects, resubscribes from each topic's last seq and makes app calls (APP-033–036,
+//! ARCH-100).
 
 // `ClientError::Refused` carries the core's `ErrorBody` by value, as the interface says; it is
 // larger than clippy's default for an `Err` variant.
@@ -24,6 +23,7 @@ pub mod blocking;
 mod conn;
 mod connect;
 pub mod doctor;
+pub mod session;
 mod workspace;
 
 use std::ffi::OsString;
@@ -38,6 +38,7 @@ use lil_protocol::{
     BUILD_ID, CallerKind, ErrorBody, NO_WORKSPACE, PROTOCOL, ProtocolVersion, RpcError,
 };
 
+pub use blocking::mark_gui_thread;
 pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
 pub use workspace::{
