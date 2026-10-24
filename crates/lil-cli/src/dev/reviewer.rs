@@ -56,293 +56,64 @@
 //! **What the owner reads** is escaped: control characters in paths (ESC sequences that move the
 //! cursor or erase lines) are printed as `\u{1b}` and so on, and such paths always need approval
 //! (ruling R23).
+//!
+//! **Windows Hello and the merge flow** (plan 4a Task 28: QA-088, QA-036, P4a-R38). When you
+//! enrolled Windows Hello (`lil dev reviewer-hello`, `reviewer_hello.rs`), `approve` unlocks the
+//! key with it first and asks for the passphrase only when Hello is cancelled or fails; the
+//! passphrase file stays. The key file and its encryption are in `reviewer_key.rs`.
+//! [`with_owner_authenticator`] is the authentication every `lil dev merge` and every
+//! `lil dev merge-flow` asks for, and [`run_merge_flow`] wires the flow (`merge_flow.rs`) to git
+//! and GitHub; the flow posts the approval with [`approve_with_key`] after you authenticated.
 
-use super::github::{API_BASE, GitHubApi, PrInfo, WorkflowRun};
+use super::github::{API_BASE, CheckState, GitHubApi, PrInfo, WorkflowRun};
 use super::guard;
 use super::merge::{
     self, MergeGuardConfig, blocker_lines, check_origin, committed_config, explain, fetch,
     is_commit_sha, one_line, short,
 };
-use age::secrecy::SecretString;
+use super::merge_flow::{Facts, MergeFlowSteps, MergeGate, merge_flow};
+use super::reviewer_hello::{
+    Authenticator, KeyAuthenticator, PassphraseUnlocker, Unlocker, WindowsHello, enrolled_hello,
+    unlock_reviewer_key,
+};
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use lil_platform::names;
 use reqwest::Method;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue, USER_AGENT};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// The shortest passphrase `reviewer-setup` accepts, in characters.
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
-/// scrypt work factor (`N = 2^18`) for the stored key: fixed, not calibrated, so a slow or debug
-/// build never writes a weaker file.
-pub const WORK_FACTOR: u8 = 18;
-/// The largest work factor a key file may demand when it is decrypted.
-pub const MAX_WORK_FACTOR: u8 = 20;
 
 pub const NOT_INTERACTIVE: &str = "lil dev approve only runs at a real terminal (stdin and stderr must both be one); nothing was approved";
 pub const WRONG_PASSPHRASE: &str = "wrong passphrase; nothing was posted";
 pub const HEAD_MOVED: &str = "the PR head moved since the summary; nothing was approved";
 pub const NOTHING_PROTECTED: &str = "nothing protected to approve";
-pub const DAMAGED_KEY: &str = "the key file is damaged or not an age passphrase file";
-
-/// Why a key file could not be decrypted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyError {
-    WrongPassphrase,
-    Damaged,
-}
-
-impl fmt::Display for KeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            KeyError::WrongPassphrase => "wrong passphrase",
-            KeyError::Damaged => DAMAGED_KEY,
-        })
-    }
-}
-
-impl std::error::Error for KeyError {}
 
 const SETUP_NOT_INTERACTIVE: &str = "lil dev reviewer-setup only runs at a real terminal (stdin and stderr must both be one); nothing was written";
 
-// ---------------------------------------------------------------------------------------------
-// The key file.
-// ---------------------------------------------------------------------------------------------
-
-/// The reviewer App's credentials as stored on disk. `encrypted_pem` is an age (scrypt) file;
-/// on disk it is TOML with that field base64-encoded.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ReviewerKeyFile {
-    pub app_id: u64,
-    pub installation_id: u64,
-    pub encrypted_pem: Vec<u8>,
-}
-
-impl fmt::Debug for ReviewerKeyFile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReviewerKeyFile")
-            .field("app_id", &self.app_id)
-            .field("installation_id", &self.installation_id)
-            .field(
-                "encrypted_pem",
-                &format_args!("<redacted, {} bytes>", self.encrypted_pem.len()),
-            )
-            .finish()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeyFileToml {
-    app_id: u64,
-    installation_id: u64,
-    encrypted_pem: String,
-}
-
-impl ReviewerKeyFile {
-    pub fn to_toml(&self) -> Result<String> {
-        toml::to_string(&KeyFileToml {
-            app_id: self.app_id,
-            installation_id: self.installation_id,
-            encrypted_pem: STANDARD.encode(&self.encrypted_pem),
-        })
-        .context("writing the reviewer key file")
-    }
-
-    pub fn from_toml(text: &str) -> Result<Self> {
-        let raw: KeyFileToml = toml::from_str(text).context("parsing the reviewer key file")?;
-        if raw.app_id == 0 || raw.installation_id == 0 {
-            bail!("the reviewer key file has an App id or installation id of 0");
-        }
-        let encrypted_pem = STANDARD
-            .decode(raw.encrypted_pem.trim())
-            .context("the reviewer key file's `encrypted_pem` is not base64")?;
-        Ok(Self {
-            app_id: raw.app_id,
-            installation_id: raw.installation_id,
-            encrypted_pem,
-        })
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading the reviewer key file {}", path.display()))?;
-        Self::from_toml(&text).with_context(|| format!("in {}", path.display()))
-    }
-
-    /// Writes the file (creating its folder) through a temporary file and a rename, so a failed
-    /// write never leaves half a key file behind.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let dir = path
-            .parent()
-            .ok_or_else(|| anyhow!("{} has no parent folder", path.display()))?;
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let text = self.to_toml()?;
-        let tmp = path.with_extension("age.tmp");
-        let written = (|| -> Result<()> {
-            let mut file = std::fs::File::create(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-            file.write_all(text.as_bytes())
-                .with_context(|| format!("writing {}", tmp.display()))?;
-            file.sync_all()
-                .with_context(|| format!("flushing {} to disk", tmp.display()))?;
-            drop(file);
-            std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written
-    }
-}
-
-/// `<profile>\<home>\reviewer\app-key.age` ([`names::HOME_DIR`]): where `reviewer-setup`
-/// writes the key.
-pub fn key_path_in(profile: &Path) -> PathBuf {
-    profile
-        .join(names::HOME_DIR)
-        .join("reviewer")
-        .join("app-key.age")
-}
-
-/// The reviewer key to use: [`key_path_in`] when anything is there, else `None`. "Anything"
-/// means whatever isn't a plain not-found: a file, a folder, a link, or a path that can't be
-/// examined. So an occupied or unreadable path is chosen, and loading it refuses. Only looks;
-/// nothing is created.
-pub fn find_key_in(profile: &Path) -> Option<PathBuf> {
-    Some(key_path_in(profile)).filter(|p| {
-        !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-    })
-}
-
-/// [`find_key_in`], or an error naming the path it looked at.
-fn locate_key_in(profile: &Path) -> Result<PathBuf> {
-    find_key_in(profile).ok_or_else(|| {
-        anyhow!(
-            "there is no reviewer key at {}; run `lil dev reviewer-setup` first",
-            key_path_in(profile).display()
-        )
-    })
-}
-
-/// The key file [`locate_key_in`] finds, loaded, with its path. A key that can't be read or
-/// parsed is an error naming its path.
-fn load_key_in(profile: &Path) -> Result<(PathBuf, ReviewerKeyFile)> {
-    let path = locate_key_in(profile)?;
-    let key = ReviewerKeyFile::load(&path)?;
-    Ok((path, key))
-}
-
-/// Where `reviewer-setup` writes the key: [`setup_key_path_in`] for `%USERPROFILE%`.
-pub fn setup_key_path() -> Result<PathBuf> {
-    Ok(setup_key_path_in(&user_profile()?))
-}
-
-/// Where `reviewer-setup` writes the key for `profile`: [`key_path_in`].
-pub fn setup_key_path_in(profile: &Path) -> PathBuf {
-    key_path_in(profile)
-}
-
-/// `%USERPROFILE%`, which must be set and absolute.
-fn user_profile() -> Result<PathBuf> {
-    let profile = std::env::var_os("USERPROFILE")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            anyhow!("USERPROFILE is not set, so there is no place for the reviewer key")
-        })?;
-    if !profile.is_absolute() {
-        bail!(
-            "USERPROFILE ({}) is not an absolute path",
-            profile.display()
-        );
-    }
-    Ok(profile)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Encryption and the App JWT.
-// ---------------------------------------------------------------------------------------------
-
-/// Encrypts `pem` to `passphrase` with age's scrypt recipient at [`WORK_FACTOR`]. Only tests use
-/// it; setup calls [`encrypt_key_with_work_factor`] directly.
+// The key file and its encryption live in `reviewer_key` (Task 28), so that they compile on
+// their own in `tests/reviewer_hello.rs`; every name stays reachable from here.
+pub use super::reviewer_key::{
+    DAMAGED_KEY, KeyError, ReviewerKeyFile, WORK_FACTOR, encrypt_key_with_work_factor,
+    setup_key_path,
+};
 #[cfg(test)]
-pub fn encrypt_key(pem: &[u8], passphrase: &str) -> Result<Vec<u8>> {
-    encrypt_key_with_work_factor(pem, passphrase, WORK_FACTOR)
-}
+pub use super::reviewer_key::{
+    MAX_WORK_FACTOR, decrypt_key, encrypt_key, find_key_in, key_path_in, setup_key_path_in,
+};
+use super::reviewer_key::{load_key_in, user_profile};
+#[cfg(test)]
+use {super::reviewer_key::locate_key_in, lil_platform::names};
 
-/// Encrypts `pem` to `passphrase` with age's scrypt recipient at the scrypt work factor
-/// `log_n` ([`WORK_FACTOR`] for real keys; tests use a cheap one).
-pub fn encrypt_key_with_work_factor(pem: &[u8], passphrase: &str, log_n: u8) -> Result<Vec<u8>> {
-    let mut recipient = age::scrypt::Recipient::new(SecretString::from(passphrase.to_owned()));
-    recipient.set_work_factor(log_n);
-    let encryptor =
-        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
-            .context("setting up the encryption")?;
-    let mut out = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut out)
-        .context("encrypting the key")?;
-    writer.write_all(pem).context("encrypting the key")?;
-    writer.finish().context("encrypting the key")?;
-    Ok(out)
-}
-
-/// The scrypt work factor in an age header's `-> scrypt <salt> <log_n>` stanza.
-fn header_work_factor(blob: &[u8]) -> Option<u8> {
-    let end = blob.windows(4).position(|w| w == b"\n---")?;
-    std::str::from_utf8(&blob[..end])
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("-> scrypt "))?
-        .split(' ')
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
-/// Errors with [`KeyError::Damaged`] unless `blob` is a passphrase-encrypted age file whose work
-/// factor is at most [`MAX_WORK_FACTOR`]. Needs no passphrase, so it runs before the prompt.
-fn check_encrypted(blob: &[u8]) -> std::result::Result<age::Decryptor<&[u8]>, KeyError> {
-    let decryptor = age::Decryptor::new_buffered(blob).map_err(|_| KeyError::Damaged)?;
-    if !decryptor.is_scrypt() {
-        return Err(KeyError::Damaged);
-    }
-    match header_work_factor(blob) {
-        Some(log_n) if log_n <= MAX_WORK_FACTOR => Ok(decryptor),
-        _ => Err(KeyError::Damaged),
-    }
-}
-
-/// Decrypts a blob made by [`encrypt_key_with_work_factor`]. The error is a [`KeyError`]:
-/// `WrongPassphrase` when the passphrase doesn't unlock it, `Damaged` for a malformed or
-/// truncated file or one that demands more than [`MAX_WORK_FACTOR`]. Neither carries any secret.
-pub fn decrypt_key(blob: &[u8], passphrase: &str) -> Result<Vec<u8>> {
-    let decryptor = check_encrypted(blob)?;
-    let mut identity = age::scrypt::Identity::new(SecretString::from(passphrase.to_owned()));
-    identity.set_max_work_factor(MAX_WORK_FACTOR);
-    let mut reader = decryptor
-        .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|e| match e {
-            age::DecryptError::DecryptionFailed
-            | age::DecryptError::KeyDecryptionFailed
-            | age::DecryptError::NoMatchingKeys => KeyError::WrongPassphrase,
-            _ => KeyError::Damaged,
-        })?;
-    // Sized up front so the plaintext isn't left behind in reallocated buffers.
-    let mut pem = Zeroizing::new(Vec::with_capacity(blob.len()));
-    reader
-        .read_to_end(&mut pem)
-        .map_err(|_| KeyError::Damaged)?;
-    Ok(std::mem::take(&mut *pem))
-}
+// ---------------------------------------------------------------------------------------------
+// The App JWT.
+// ---------------------------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct AppClaims {
@@ -674,10 +445,11 @@ pub(crate) fn review_body(head: &str, summary: &str) -> String {
 
 /// Posts the reviewer App's `APPROVE` review on PR `pr`, pinned to `expected_head`: the head the
 /// guard `summary` was computed for. See the module docs for the order of the steps; every
-/// refusal posts nothing.
+/// refusal posts nothing. `hello` is Windows Hello when you enrolled it (QA-088): it is tried
+/// first, and the passphrase is asked for only when it is cancelled or fails.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the brief's signature plus expected_head (ruling R20) and pause (R40)"
+    reason = "the brief's signature plus expected_head (ruling R20), pause (R40) and hello (Task 28)"
 )]
 pub fn approve(
     pr: u64,
@@ -685,6 +457,7 @@ pub fn approve(
     gh: &dyn GitHubApi,
     prompt: &dyn Prompt,
     key_file: &ReviewerKeyFile,
+    hello: Option<&dyn Unlocker>,
     tokens: &dyn InstallationTokens,
     summary: &str,
     now_unix: i64,
@@ -708,29 +481,58 @@ pub fn approve(
         bail!("you said no; nothing was approved");
     }
 
-    let damaged =
-        || anyhow!("{DAMAGED_KEY}; run `lil dev reviewer-setup` again; nothing was posted");
-    // A damaged file is refused before the owner types the passphrase.
-    check_encrypted(&key_file.encrypted_pem).map_err(|_| damaged())?;
-    let passphrase = Zeroizing::new(prompt.passphrase("Reviewer key passphrase: "));
-    // Decrypt before anything touches the network: a wrong passphrase stops here.
-    let pem = Zeroizing::new(
-        decrypt_key(&key_file.encrypted_pem, &passphrase).map_err(|e| {
-            match e.downcast_ref::<KeyError>() {
-                Some(KeyError::WrongPassphrase) => anyhow!(WRONG_PASSPHRASE),
-                _ => damaged(),
-            }
-        })?,
-    );
-    drop(passphrase);
-    let jwt = Zeroizing::new(app_jwt(key_file.app_id, &pem, now_unix)?);
-    drop(pem);
+    // Unlock before anything touches the network: Windows Hello first when enrolled, then the
+    // passphrase. A wrong passphrase stops here, and a damaged file is refused before the owner
+    // types the passphrase.
+    let ask = |label: &str| Zeroizing::new(prompt.passphrase(label));
+    let passphrase = PassphraseUnlocker::new(&key_file.encrypted_pem, &ask);
+    let say = |text: &str| prompt.say(text);
+    let pem = unlock_reviewer_key(hello, &passphrase, &say).map_err(|e| match e {
+        KeyError::WrongPassphrase => anyhow!(WRONG_PASSPHRASE),
+        _ => anyhow!("{DAMAGED_KEY}; run `lil dev reviewer-setup` again; nothing was posted"),
+    })?;
+    approve_with_key(
+        pr,
+        cfg,
+        gh,
+        &say,
+        key_file,
+        &pem,
+        tokens,
+        summary,
+        now_unix,
+        expected_head,
+        pause,
+    )
+}
+
+/// What [`approve`] does once the key is unlocked: the App JWT, the live slug, the installation
+/// token, the pinned review and the guard re-run. The merge flow calls it after your
+/// authentication (P4a-R38). `pem` is only read, to sign the JWT.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "approve's arguments, the unlocked key in place of the prompt"
+)]
+pub(crate) fn approve_with_key(
+    pr: u64,
+    cfg: &MergeGuardConfig,
+    gh: &dyn GitHubApi,
+    say: &dyn Fn(&str),
+    key_file: &ReviewerKeyFile,
+    pem: &[u8],
+    tokens: &dyn InstallationTokens,
+    summary: &str,
+    now_unix: i64,
+    expected_head: &str,
+    pause: &dyn Fn(Duration),
+) -> Result<Rerun> {
+    let jwt = Zeroizing::new(app_jwt(key_file.app_id, pem, now_unix)?);
     // Which App the key belongs to, as GitHub sees it now (D6): only the configured slug may
     // approve. Asked before any installation token exists.
     let live = gh.app_slug(&jwt).context(
         "asking GitHub for the reviewer App's slug (GET /app) failed; nothing was approved",
     )?;
-    prompt.say(&format!(
+    say(&format!(
         "reviewer App slug: {}",
         guard::escape_controls(&live)
     ));
@@ -1221,6 +1023,74 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// What `lil dev approve` and the merge flow print about the guard re-run.
+fn print_rerun(rerun: Rerun) {
+    let ids = |ids: &[u64]| {
+        ids.iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match rerun {
+        Rerun::Requested { run_ids } => println!(
+            "Asked GitHub to re-run protected-test-check (workflow runs {}); it reads the approval and turns green when it finishes.",
+            ids(&run_ids)
+        ),
+        Rerun::AlreadyPassed { run_id } => println!(
+            "protected-test-check already passed for this commit (workflow run {run_id}); nothing to re-run."
+        ),
+        Rerun::Warning { text, requested } => {
+            if !requested.is_empty() {
+                println!(
+                    "Asked GitHub to re-run protected-test-check (workflow runs {}).",
+                    ids(&requested)
+                );
+            }
+            eprintln!("{text}");
+        }
+    }
+}
+
+/// Prints `text` to stderr, each line with its control characters escaped (R23).
+fn say_escaped(text: &str) {
+    for line in text.lines() {
+        eprintln!("{}", guard::escape_controls(line));
+    }
+}
+
+/// Runs `f` with your authentication for `what` (QA-036, P4a-R38): the reviewer key loaded from
+/// `app-key.age`, and an [`Authenticator`] that shows the summary and the audit, then asks
+/// Windows Hello when you enrolled it, and the passphrase at the terminal otherwise or when
+/// Hello is cancelled or fails. Local only: a missing key, or neither Hello nor a terminal, is
+/// refused before any network call.
+pub(crate) fn with_owner_authenticator<T>(
+    what: &str,
+    f: impl FnOnce(&ReviewerKeyFile, &dyn Authenticator) -> T,
+) -> Result<T> {
+    let profile = user_profile()?;
+    let (_, key_file) = load_key_in(&profile)
+        .context("every approval and merge needs your authentication with the reviewer key")?;
+    let prompt = TerminalPrompt;
+    let platform = WindowsHello;
+    let message = format!("LILITH: {what}");
+    let hello = enrolled_hello(&profile, &platform, &message, &say_escaped);
+    if hello.is_none() && !prompt.is_interactive() {
+        bail!(
+            "Windows Hello isn't enrolled and this isn't a real terminal, so you can't authenticate to {what}; nothing was approved or merged"
+        );
+    }
+    let ask = |label: &str| Zeroizing::new(prompt.passphrase(label));
+    let label = format!("Reviewer key passphrase (to {what}): ");
+    let passphrase = PassphraseUnlocker::new(&key_file.encrypted_pem, &ask).labelled(&label);
+    let auth = KeyAuthenticator::new(
+        &say_escaped,
+        hello.as_ref().map(|h| h as &dyn Unlocker),
+        &passphrase,
+        &say_escaped,
+    );
+    Ok(f(&key_file, &auth))
+}
+
 /// `lil dev approve <pr>`: exit 0 when the approval was posted, 1 otherwise.
 pub fn run_approve(pr: u64) -> i32 {
     let refuse = |message: &str| {
@@ -1235,13 +1105,18 @@ pub fn run_approve(pr: u64) -> i32 {
     if !prompt.is_interactive() {
         return refuse(NOT_INTERACTIVE);
     }
-    let key_file = match user_profile().and_then(|profile| load_key_in(&profile)) {
-        Ok((path, key)) => {
+    let found = user_profile().and_then(|profile| Ok((load_key_in(&profile)?, profile)));
+    let (key_file, profile) = match found {
+        Ok(((path, key), profile)) => {
             println!("Reviewer key: {}", path.display());
-            key
+            (key, profile)
         }
         Err(e) => return refuse(&format!("{e:#}")),
     };
+    // Windows Hello, when you enrolled it, is tried first (QA-088).
+    let platform = WindowsHello;
+    let message = format!("LILITH: approve PR #{pr}'s protected changes");
+    let hello = enrolled_hello(&profile, &platform, &message, &say_escaped);
     let repo = match super::root::repo_root() {
         Ok(r) => r,
         Err(e) => return refuse(&e),
@@ -1270,6 +1145,7 @@ pub fn run_approve(pr: u64) -> i32 {
         prepared.gh.as_ref(),
         &prompt,
         &key_file,
+        hello.as_ref().map(|h| h as &dyn Unlocker),
         &GitHubAppTokens,
         &prepared.summary,
         unix_now(),
@@ -1281,33 +1157,306 @@ pub fn run_approve(pr: u64) -> i32 {
                 "Approved PR #{pr} at {} as the reviewer App.",
                 short(&prepared.head)
             );
-            let ids = |ids: &[u64]| {
-                ids.iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            match rerun {
-                Rerun::Requested { run_ids } => println!(
-                    "Asked GitHub to re-run protected-test-check (workflow runs {}); it reads the approval and turns green when it finishes.",
-                    ids(&run_ids)
-                ),
-                Rerun::AlreadyPassed { run_id } => println!(
-                    "protected-test-check already passed for this commit (workflow run {run_id}); nothing to re-run."
-                ),
-                Rerun::Warning { text, requested } => {
-                    if !requested.is_empty() {
-                        println!(
-                            "Asked GitHub to re-run protected-test-check (workflow runs {}).",
-                            ids(&requested)
-                        );
-                    }
-                    eprintln!("{text}");
-                }
-            }
+            print_rerun(rerun);
             0
         }
         Err(e) => refuse(&format!("{e:#}")),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `lil dev merge-flow` (P4a-R38): the real steps behind `merge_flow::MergeFlowSteps`.
+// ---------------------------------------------------------------------------------------------
+
+/// The longest summary or audit file the flow reads.
+const MAX_FLOW_TEXT: u64 = 64 * 1024;
+/// How long the flow waits for CI on the head (after posting the approval, the guard re-runs).
+const CHECKS_WAIT: Duration = Duration::from_secs(20 * 60);
+/// How often it looks.
+const CHECKS_POLL: Duration = Duration::from_secs(15);
+/// The check that the approval's guard re-run turns green (when protected files changed); a
+/// failure of any other one stops the wait at once.
+const GUARD_CHECK: &str = "protected-test-check";
+
+/// A summary or audit file: UTF-8, not empty, at most [`MAX_FLOW_TEXT`] bytes.
+fn read_flow_text(path: &Path, what: &str) -> Result<String> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("reading the {what} file {}", path.display()))?
+        .len();
+    if size > MAX_FLOW_TEXT {
+        bail!(
+            "the {what} file {} is {size} bytes; at most {MAX_FLOW_TEXT} are read",
+            path.display()
+        );
+    }
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading the {what} file {} (it must be UTF-8)",
+            path.display()
+        )
+    })?;
+    if text.trim().is_empty() {
+        bail!("the {what} file {} is empty", path.display());
+    }
+    Ok(text)
+}
+
+fn check_state_name(state: &CheckState) -> String {
+    match state {
+        CheckState::Success => "success".into(),
+        CheckState::Pending => "pending".into(),
+        CheckState::Missing => "missing".into(),
+        CheckState::Failure(c) => c.clone(),
+    }
+}
+
+type GitHubFor<'g> = dyn Fn(&MergeGuardConfig) -> Result<Box<dyn GitHubApi + 'g>> + 'g;
+
+/// The flow's git and GitHub steps.
+struct FlowSteps<'a, 'g> {
+    repo: &'a Path,
+    pr: u64,
+    checked: &'a MergeGuardConfig,
+    hooks: Option<String>,
+    key_file: &'a ReviewerKeyFile,
+    github: &'a GitHubFor<'g>,
+    /// The fresh settings and the client `facts` built, for the later steps.
+    state: std::cell::RefCell<Option<(MergeGuardConfig, Box<dyn GitHubApi + 'g>)>>,
+}
+
+impl FlowSteps<'_, '_> {
+    fn with_gh<T>(
+        &self,
+        f: impl FnOnce(&MergeGuardConfig, &dyn GitHubApi) -> Result<T>,
+    ) -> Result<T> {
+        let state = self.state.borrow();
+        let (cfg, gh) = state
+            .as_ref()
+            .ok_or_else(|| anyhow!("the PR wasn't read first"))?;
+        f(cfg, gh.as_ref())
+    }
+
+    /// `git diff --name-only <base>...<head>`, escaped for display.
+    fn files(&self, base: &str, head: &str) -> Result<Vec<String>> {
+        let out = super::root::git_command()
+            .arg("-C")
+            .arg(self.repo)
+            .args(["diff", "--name-only", "-z", &format!("{base}...{head}")])
+            .output()
+            .context("could not run git diff")?;
+        if !out.status.success() {
+            bail!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .split_terminator('\0')
+            .map(guard::escape_controls)
+            .collect())
+    }
+}
+
+impl MergeFlowSteps for FlowSteps<'_, '_> {
+    fn facts(&self) -> Result<Facts> {
+        let base_branch = &self.checked.base_branch;
+        fetch(
+            self.repo,
+            &[&format!(
+                "+refs/heads/{base_branch}:{}",
+                merge::remote_base_ref(base_branch)
+            )],
+        )
+        .with_context(|| format!("fetching origin/{base_branch} failed"))?;
+        let cfg = committed_config(self.repo).map_err(|r| anyhow!(explain(&[r])))?;
+        if !cfg.owner.eq_ignore_ascii_case(&self.checked.owner)
+            || !cfg.repo.eq_ignore_ascii_case(&self.checked.repo)
+        {
+            bail!(
+                "the freshly fetched {} names github.com/{}/{}, but origin was checked against github.com/{}/{}",
+                merge::CONFIG_PATH,
+                cfg.owner,
+                cfg.repo,
+                self.checked.owner,
+                self.checked.repo
+            );
+        }
+        let gh = (self.github)(&cfg).context("no GitHub access")?;
+        let info = gh
+            .pr(self.pr)
+            .with_context(|| format!("reading PR #{} from GitHub failed", self.pr))?;
+        if let Some(problem) = pr_problem(self.pr, &info, &cfg) {
+            bail!(problem.replace("nothing was approved", "nothing was approved or merged"));
+        }
+        let head = info.head_sha;
+        if !is_commit_sha(&head) {
+            bail!(
+                "GitHub reported a head commit for PR #{} that is not a commit SHA: {head:?}",
+                self.pr
+            );
+        }
+        fetch(self.repo, &[&format!("refs/pull/{}/head", self.pr)])
+            .with_context(|| format!("fetching PR #{}'s head failed", self.pr))?;
+        // The full ref: a local branch named `origin/main` must not stand in for it.
+        let base = merge::remote_base_ref(&cfg.base_branch);
+        let verdict = guard::verdict(self.repo, &base, &head).with_context(|| {
+            format!(
+                "the test-diff guard could not judge {} against {base}",
+                short(&head)
+            )
+        })?;
+        let protected = blocker_lines(&verdict);
+        let already_approved = !protected.is_empty()
+            && merge::app_approved(&gh.reviews(self.pr)?, &cfg.reviewer_login(), &head);
+        let mut checks = Vec::new();
+        for name in &cfg.required_checks {
+            let state = gh
+                .check(&head, name)
+                .with_context(|| format!("reading CI check {name} on {} failed", short(&head)))?;
+            checks.push((name.clone(), check_state_name(&state)));
+        }
+        let files = self.files(&base, &head)?;
+        *self.state.borrow_mut() = Some((cfg, gh));
+        Ok(Facts {
+            pr: self.pr,
+            head,
+            files,
+            protected,
+            checks,
+            already_approved,
+        })
+    }
+
+    fn post_approval(&self, pem: &[u8], facts: &Facts) -> Result<()> {
+        let rerun = self.with_gh(|cfg, gh| {
+            approve_with_key(
+                self.pr,
+                cfg,
+                gh,
+                &say_escaped,
+                self.key_file,
+                pem,
+                &GitHubAppTokens,
+                &facts.protected.join("\n"),
+                unix_now(),
+                &facts.head,
+                &std::thread::sleep,
+            )
+        })?;
+        println!(
+            "Approved PR #{} at {} as the reviewer App.",
+            self.pr,
+            short(&facts.head)
+        );
+        print_rerun(rerun);
+        Ok(())
+    }
+
+    fn wait_for_checks(&self, facts: &Facts) -> Result<()> {
+        self.with_gh(|cfg, gh| {
+            let mut waited = Duration::ZERO;
+            loop {
+                let mut waiting = Vec::new();
+                for name in &cfg.required_checks {
+                    match gh.check(&facts.head, name)? {
+                        CheckState::Success => {}
+                        CheckState::Failure(c) if name != GUARD_CHECK || facts.protected.is_empty() => bail!(
+                            "CI check {name} finished as {c} on {}; nothing was merged",
+                            short(&facts.head)
+                        ),
+                        other => waiting.push(format!("{name}: {}", check_state_name(&other))),
+                    }
+                }
+                if waiting.is_empty() {
+                    return Ok(());
+                }
+                if waited >= CHECKS_WAIT {
+                    bail!(
+                        "CI isn't green on {} after {} minutes ({}); nothing was merged. Run the merge flow again once it is",
+                        short(&facts.head),
+                        CHECKS_WAIT.as_secs() / 60,
+                        waiting.join(", ")
+                    );
+                }
+                if waited.as_secs().is_multiple_of(60) {
+                    eprintln!(
+                        "Waiting for CI on {}: {}",
+                        short(&facts.head),
+                        waiting.join(", ")
+                    );
+                }
+                std::thread::sleep(CHECKS_POLL);
+                waited += CHECKS_POLL;
+            }
+        })
+    }
+
+    fn merge(&self, gate: &dyn MergeGate) -> Result<String> {
+        merge::merge_in_repo(
+            self.repo,
+            self.pr,
+            self.checked,
+            self.hooks.clone(),
+            self.github,
+            gate,
+        )
+        .map_err(|refusals| anyhow!(explain(&refusals)))
+    }
+}
+
+/// `lil dev merge-flow <pr> --summary <file> --audit <file>` (P4a-R38): exit 0 when merged, 1
+/// otherwise.
+pub fn run_merge_flow(pr: u64, summary_path: &Path, audit_path: &Path) -> i32 {
+    let refuse = |message: &str| {
+        eprintln!(
+            "lil dev merge-flow refused PR #{pr}: {}",
+            guard::escape_controls(&one_line(message))
+        );
+        1
+    };
+    // Local checks first, before any network call.
+    let texts = read_flow_text(summary_path, "summary")
+        .and_then(|summary| Ok((summary, read_flow_text(audit_path, "audit")?)));
+    let (summary, audit) = match texts {
+        Ok(t) => t,
+        Err(e) => return refuse(&format!("{e:#}")),
+    };
+    let repo = match super::root::repo_root() {
+        Ok(r) => r,
+        Err(e) => return refuse(&e),
+    };
+    let (checked, hooks) = match merge::preflight(&repo) {
+        Ok(x) => x,
+        Err(refusals) => return refuse(&explain(&refusals)),
+    };
+    if let Err(r) = check_origin(&repo, &checked) {
+        return refuse(&explain(&[r]));
+    }
+    let github = |cfg: &MergeGuardConfig| -> Result<Box<dyn GitHubApi>> {
+        Ok(Box::new(super::github::RestClient::new(
+            &cfg.owner,
+            &cfg.repo,
+            &super::github::github_token()?,
+        )?))
+    };
+    let outcome = with_owner_authenticator(&format!("merge PR #{pr}"), |key_file, auth| {
+        let steps = FlowSteps {
+            repo: &repo,
+            pr,
+            checked: &checked,
+            hooks,
+            key_file,
+            github: &github,
+            state: std::cell::RefCell::new(None),
+        };
+        merge_flow(&summary, &audit, &steps, auth)
+    });
+    match outcome {
+        Ok(Ok(merge_sha)) => {
+            println!("Merged PR #{pr} (merge commit {}).", short(&merge_sha));
+            0
+        }
+        Ok(Err(e)) | Err(e) => refuse(&format!("{e:#}")),
     }
 }
 
@@ -1605,6 +1754,7 @@ mod tests {
             fake,
             prompt,
             &key_file(),
+            None,
             exchange,
             summary,
             NOW,
@@ -1697,6 +1847,85 @@ mod tests {
         assert!(!e.contains("definitely wrong"), "{e}");
         assert!(exchange.calls.borrow().is_empty(), "token exchange ran");
         assert!(fake.posted_reviews().is_empty());
+    }
+
+    // ---- Windows Hello through approve (Task 28; the pure parts are tests/reviewer_hello.rs) --
+
+    /// Windows Hello for `approve`: the test key, or `KeyError` (cancelled, failed).
+    struct HelloStandIn(std::result::Result<(), KeyError>);
+
+    impl Unlocker for HelloStandIn {
+        fn unlock(&self) -> std::result::Result<Zeroizing<Vec<u8>>, KeyError> {
+            self.0.map(|()| Zeroizing::new(test_pem().to_vec()))
+        }
+    }
+
+    fn run_with_hello(
+        fake: &FakeGitHub,
+        prompt: &FakePrompt,
+        exchange: &Exchange,
+        hello: &dyn Unlocker,
+    ) -> Result<Rerun> {
+        approve(
+            PR,
+            &cfg(),
+            fake,
+            prompt,
+            &key_file(),
+            Some(hello),
+            exchange,
+            SUMMARY,
+            NOW,
+            HEAD,
+            &|_| {},
+        )
+    }
+
+    #[test] // spec: QA-088
+    fn approve_with_hello_enrolled_posts_without_asking_the_passphrase() {
+        let fake = open_pr();
+        // No passphrase is scripted: being asked for one panics.
+        let prompt = FakePrompt::new().confirms(&[true]);
+        let exchange = Exchange::default();
+        run_with_hello(&fake, &prompt, &exchange, &HelloStandIn(Ok(()))).unwrap();
+        assert_eq!(fake.posted_reviews().len(), 1);
+        assert_eq!(fake.posted_reviews()[0].sha, HEAD);
+        assert_eq!(exchange.calls.borrow().len(), 1);
+    }
+
+    /// The existing invariant through Windows Hello: whatever Hello does, no App call happens
+    /// until a key is unlocked, and a wrong passphrase after it still posts nothing.
+    #[test] // spec: QA-088, QA-020
+    fn a_failed_hello_then_a_wrong_passphrase_touches_no_network() {
+        for failed in [KeyError::Cancelled, KeyError::Unavailable] {
+            let fake = open_pr();
+            let prompt = FakePrompt::new()
+                .confirms(&[true])
+                .passphrases(&["definitely wrong passphrase"]);
+            let exchange = Exchange::default();
+            let e = err_text(run_with_hello(
+                &fake,
+                &prompt,
+                &exchange,
+                &HelloStandIn(Err(failed)),
+            ));
+            assert_eq!(e, WRONG_PASSPHRASE);
+            assert!(exchange.calls.borrow().is_empty(), "token exchange ran");
+            assert!(fake.app_jwts().is_empty(), "GET /app ran");
+            assert!(fake.posted_reviews().is_empty());
+            assert!(
+                prompt.said().iter().any(|s| s.contains("passphrase")),
+                "{:?}",
+                prompt.said()
+            );
+
+            // The right passphrase after the failed Hello approves.
+            let fake = open_pr();
+            let prompt = FakePrompt::new().confirms(&[true]).passphrases(&[PASS]);
+            let exchange = Exchange::default();
+            run_with_hello(&fake, &prompt, &exchange, &HelloStandIn(Err(failed))).unwrap();
+            assert_eq!(fake.posted_reviews().len(), 1);
+        }
     }
 
     #[test]
@@ -2238,6 +2467,7 @@ mod tests {
                 &fake,
                 &prompt,
                 &damaged,
+                None,
                 &exchange,
                 SUMMARY,
                 NOW,
@@ -2734,6 +2964,7 @@ mod tests {
             gh,
             &approved(),
             &key_file(),
+            None,
             exchange,
             SUMMARY,
             NOW,

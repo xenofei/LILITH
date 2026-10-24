@@ -16,7 +16,9 @@ nvml-wrapper.workspace = true
 rusqlite.workspace = true
 # The fake hardware script the test kit and a test-channel core read (hw_fake, QA-066).
 serde_json.workspace = true
-sha2.workspace = true
+# `zeroize`: the KEK hasher's state, which holds the Windows Hello signature, is wiped on drop
+# (hello, P4a-R23).
+sha2 = { workspace = true, features = ["zeroize"] }
 # CPU, RAM, per-process CPU time, network and disks (CORE-059).
 sysinfo.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }

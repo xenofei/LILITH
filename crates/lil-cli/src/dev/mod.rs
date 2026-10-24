@@ -8,9 +8,12 @@ pub mod github_fake;
 pub mod guard;
 pub mod hooks;
 pub mod merge;
+pub mod merge_flow;
 pub mod post_merge;
 pub mod privacy;
 pub mod reviewer;
+pub mod reviewer_hello;
+pub mod reviewer_key;
 pub mod root;
 pub mod spec_report;
 pub mod spec_tests;
@@ -146,11 +149,39 @@ pub enum DevCommand {
     /// Draft PRs, closed PRs and PRs into another branch are refused. If anything can't
     /// be checked (a network or git error), it refuses. Every refusal says, in plain
     /// words, which condition failed.
+    ///
+    /// Every merge, protected files or not, then asks for the owner's authentication
+    /// before GitHub is asked: Windows Hello when enrolled, else the reviewer key's
+    /// passphrase at a terminal. Without it nothing is merged.
     #[command(verbatim_doc_comment)]
     Merge {
         /// The pull request number.
         pr: u64,
     },
+
+    /// The one-click merge: show a PR's summary and audit, authenticate, approve, merge.
+    ///
+    /// Reads what lil checks itself (the head commit, the files, the protected changes,
+    /// CI on that commit) and shows it with the summary and the independent audit from
+    /// the two files. Then it asks for the owner's authentication: Windows Hello first,
+    /// then the reviewer key's passphrase. Only after that succeeds does it post the
+    /// reviewer approval (when protected files changed), wait for CI on that commit and
+    /// merge with `lil dev merge`'s checks. Without it nothing is approved or merged.
+    #[command(verbatim_doc_comment)]
+    MergeFlow {
+        /// The pull request number.
+        pr: u64,
+        /// A file with the change's summary.
+        #[arg(long)]
+        summary: std::path::PathBuf,
+        /// A file with the independent audit (a review by an agent that didn't make it).
+        #[arg(long)]
+        audit: std::path::PathBuf,
+    },
+
+    /// Set up, show or remove Windows Hello for the reviewer key (the passphrase stays).
+    #[command(subcommand)]
+    ReviewerHello(ReviewerHelloCommand),
 
     /// Set up the reviewer GitHub App's key on this machine (run once, by the owner, at a terminal).
     ///
@@ -166,6 +197,8 @@ pub enum DevCommand {
     /// Shows what the test-diff guard says needs approval on the PR's current head commit (judged
     /// against origin/main), asks "(y/N)", then asks for the reviewer key's passphrase. The key
     /// is read from %USERPROFILE%\.lilith\reviewer\app-key.age, and the path used is printed.
+    /// With Windows Hello enrolled (`lil dev reviewer-hello`), Hello is asked first, and the
+    /// passphrase only when Hello is cancelled or fails.
     /// Only then does it contact GitHub as the app and post one APPROVE review pinned to that exact commit.
     /// It refuses when stdin or stderr isn't a terminal, when nothing protected changed, when the
     /// PR is closed, a draft or not into main, and when the head moved after the summary.
@@ -288,6 +321,16 @@ pub enum AgentTokenCommand {
 }
 
 #[derive(Subcommand)]
+pub enum ReviewerHelloCommand {
+    /// Enroll Windows Hello (at a real terminal): your passphrase first, then Windows Hello.
+    Enroll,
+    /// Say whether Windows Hello is enrolled, its route and whether the key is hardware-held.
+    Status,
+    /// Remove the Windows Hello files and key credential; the passphrase key stays.
+    Remove,
+}
+
+#[derive(Subcommand)]
 pub enum HookCommand {
     /// pre-push: reads git's list of refs on stdin, runs the privacy scan on every pushed ref,
     /// and refuses anything that changes main.
@@ -350,6 +393,14 @@ pub fn run(cmd: DevCommand) -> i32 {
             tests_result,
         } => post_merge::run_revert_pr(&before, &after, tests_result.as_deref()),
         DevCommand::Merge { pr } => merge::run_merge(pr),
+        DevCommand::MergeFlow { pr, summary, audit } => {
+            reviewer::run_merge_flow(pr, &summary, &audit)
+        }
+        DevCommand::ReviewerHello(cmd) => match cmd {
+            ReviewerHelloCommand::Enroll => reviewer_hello::run_enroll(),
+            ReviewerHelloCommand::Status => reviewer_hello::run_status(),
+            ReviewerHelloCommand::Remove => reviewer_hello::run_remove(),
+        },
         DevCommand::ReviewerSetup => reviewer::run_reviewer_setup(),
         DevCommand::Approve { pr } => reviewer::run_approve(pr),
         DevCommand::InstallHooks => hooks::run_install_hooks(),

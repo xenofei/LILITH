@@ -21,6 +21,7 @@
 //!   credential, sign with it with the ordinary window in front, sign with the fullscreen window
 //!   in front. Then the credential is deleted and checked gone. Every 150 ms of every call,
 //!   `GetForegroundWindow` and the last-input time are recorded.
+//! - `cleanup` (no prompt): deletes the throwaway credential, if a stopped run left it.
 //! - `blocker [--fullscreen]` and `owner --op create|sign|consent --mode placement|gesture`: the
 //!   two child processes `run` starts. The owner child is started by this background process,
 //!   as `lil` is by an agent's shell, so Windows gives it no special right to the foreground.
@@ -87,13 +88,23 @@ fn main() {
             0
         }
         Some("run") => run(out_path(value("--out"))),
+        Some("cleanup") => match hello::kek_remove(CREDENTIAL) {
+            Ok(()) => {
+                println!("The probe credential {CREDENTIAL} is gone (or never existed).");
+                0
+            }
+            Err(e) => {
+                eprintln!("couldn't remove {CREDENTIAL}: {e}");
+                1
+            }
+        },
         Some("blocker") => blocker(has("--fullscreen")),
         Some("owner") => owner(
             value("--op").as_deref().unwrap_or(""),
             value("--mode").as_deref() == Some("gesture"),
         ),
         _ => {
-            eprintln!("usage: hello-probe dry | run [--out <file>]");
+            eprintln!("usage: hello-probe dry | run | cleanup [--out <file>]");
             2
         }
     };
