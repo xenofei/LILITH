@@ -7,11 +7,15 @@ use std::path::PathBuf;
 use lil_platform::names::{LEGACY_APP_NAME, LEGACY_LOCAL_DIR};
 use lil_platform::{Channel, Env, RealLocations, Roots, arm_test_guard};
 
+/// The fake real Start-menu Programs folder (`FOLDERID_Programs`).
+const REAL_PROGRAMS: &str = r"C:\Users\Fake\AppData\Roaming\Microsoft\Windows\Start Menu\Programs";
+
 fn fake_real() -> RealLocations {
     RealLocations {
         roaming: PathBuf::from(r"C:\Users\Fake\AppData\Roaming"),
         local: PathBuf::from(r"C:\Users\Fake\AppData\Local"),
         user_profile: PathBuf::from(r"C:\Users\Fake"),
+        programs: PathBuf::from(REAL_PROGRAMS),
         registry_root: r"HKCU\Software\LILITH".to_string(),
         credential_prefix: "LILITH/".to_string(),
         workspaces: vec![PathBuf::from(r"C:\Users\Fake\Ws")],
@@ -205,6 +209,49 @@ fn test_scoped_names_do_not_trip_and_real_ones_do() {
     assert!(!real.is_real_registry(&format!(r"HKCU\Software\{LEGACY_APP_NAME}-test-abc")));
     assert!(real.is_real_credential(&format!("{LEGACY_APP_NAME}/")));
     assert!(!real.is_real_credential(&format!("{LEGACY_APP_NAME}-test-abc/")));
+}
+
+/// A test channel whose AUMID shortcut resolves to the real Start-menu Programs folder trips
+/// the guard, by its roots or by an explicit Programs folder; its own shortcut and classes root
+/// don't (APP-022's names, QA-038).
+#[test] // spec: QA-040, QA-038
+fn test_channel_shortcut_in_the_real_programs_folder_trips() {
+    arm();
+    let start_menu = PathBuf::from(REAL_PROGRAMS).parent().unwrap().to_path_buf();
+    let by_roots = Env::with_roots(
+        Channel::Test("abc".into()),
+        Roots {
+            roaming: PathBuf::from(r"D:\Scratch\Roaming"),
+            local: PathBuf::from(r"D:\Scratch\Local"),
+            user_profile: start_menu,
+        },
+        "S-1".into(),
+    );
+    let by_dir = Env::with_roots(
+        Channel::Test("abc".into()),
+        roots(r"D:\Scratch"),
+        "S-1".into(),
+    )
+    .with_programs_dir(PathBuf::from(
+        r"c:\users\fake\appdata\roaming\microsoft\windows\start menu\PROGRAMS",
+    ));
+    for env in [&by_roots, &by_dir] {
+        let msg = panics(|| drop(env.start_menu_shortcut())).expect("must panic");
+        assert!(msg.contains("real LILITH location"), "{msg}");
+        assert!(msg.contains("LILITH (Test-abc).lnk"), "{msg}");
+    }
+
+    let own = Env::with_roots(
+        Channel::Test("abc".into()),
+        roots(r"D:\Scratch"),
+        "S-1".into(),
+    );
+    assert_eq!(
+        own.start_menu_shortcut(),
+        PathBuf::from(r"D:\Scratch\Profile\Programs\LILITH (Test-abc).lnk")
+    );
+    assert_eq!(own.classes_root(), r"HKCU\Software\LILITH-test-abc\Classes");
+    assert!(fake_real().is_real_classes_root(r"HKCU\Software\Classes"));
 }
 
 #[test] // spec: QA-040

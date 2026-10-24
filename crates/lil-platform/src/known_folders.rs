@@ -1,4 +1,5 @@
-//! Known folders via `SHGetKnownFolderPath`. Only `Env::from_system` calls these.
+//! Known folders via `SHGetKnownFolderPath`. Only `Env::from_system`, the guard's real
+//! locations and the desktop group's host run call these.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -6,8 +7,8 @@ use std::path::PathBuf;
 
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_RoamingAppData, KF_FLAG_DEFAULT,
-    SHGetKnownFolderPath,
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_Programs, FOLDERID_RoamingAppData,
+    KF_FLAG_DEFAULT, SHGetKnownFolderPath,
 };
 use windows::core::GUID;
 
@@ -26,6 +27,12 @@ pub fn local_app_data() -> Result<PathBuf, EnvError> {
 /// `FOLDERID_Profile` (`%USERPROFILE%`).
 pub fn profile() -> Result<PathBuf, EnvError> {
     known_folder(&FOLDERID_Profile)
+}
+
+/// `FOLDERID_Programs`: the per-user Start-menu Programs folder, where the AUMID shortcut goes
+/// (APP-022).
+pub fn programs() -> Result<PathBuf, EnvError> {
+    known_folder(&FOLDERID_Programs)
 }
 
 fn known_folder(id: &GUID) -> Result<PathBuf, EnvError> {

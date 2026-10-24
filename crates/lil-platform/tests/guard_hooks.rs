@@ -24,6 +24,7 @@ fn stable_env() -> &'static Env {
         arm_test_guard(RealLocations {
             roaming: roots.roaming,
             local: roots.local,
+            programs: roots.user_profile.join("Programs"),
             user_profile: roots.user_profile,
             registry_root: r"HKCU\Software\LILITH".to_string(),
             credential_prefix: "LILITH/".to_string(),
@@ -61,6 +62,36 @@ fn notification_aumid_hook_trips() {
 #[should_panic(expected = "real LILITH location")]
 fn claude_default_profile_dir_hook_trips() {
     let _ = stable_env().claude_default_profile_dir();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn activation_scheme_hook_trips() {
+    let _ = stable_env().activation_scheme();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn classes_root_hook_trips() {
+    let _ = stable_env().classes_root();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn start_menu_shortcut_hook_trips() {
+    let _ = stable_env().start_menu_shortcut();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn toast_activator_clsid_hook_trips() {
+    let _ = stable_env().toast_activator_clsid();
+}
+
+#[test] // spec: QA-040
+#[should_panic(expected = "real LILITH location")]
+fn app_pipe_name_hook_trips() {
+    let _ = stable_env().app_pipe_name("image", false);
 }
 
 #[test] // spec: QA-040

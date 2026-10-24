@@ -54,8 +54,8 @@ impl Channel {
     }
 
     /// Display form with the first letter capitalised: `Stable`, `Dev` or `Test-<id>`.
-    /// Used for the notification AUMID.
-    fn capitalised(&self) -> String {
+    /// Used for the notification AUMID, the shortcut's name and the scheme's display name.
+    pub(crate) fn capitalised(&self) -> String {
         match self {
             Channel::Stable => "Stable".to_string(),
             Channel::Dev => "Dev".to_string(),
@@ -182,6 +182,9 @@ pub struct Env {
     roots: Roots,
     user_sid: String,
     volumes: Arc<dyn VolumeResolver>,
+    /// The folder of the AUMID shortcut: `FOLDERID_Programs` from [`Env::from_system`], else
+    /// `<user_profile>\Programs` (on a test channel `<test root>\profile\Programs`).
+    programs: PathBuf,
 }
 
 impl Env {
@@ -195,7 +198,8 @@ impl Env {
             local: known_folders::local_app_data()?,
             user_profile: known_folders::profile()?,
         };
-        Ok(Env::with_roots(channel, roots, sid::current_user_sid()?))
+        let programs = known_folders::programs()?;
+        Ok(Env::with_roots(channel, roots, sid::current_user_sid()?).with_programs_dir(programs))
     }
 
     /// The environment of the running process: [`Env::from_vars`] with the compile-time build
@@ -276,12 +280,23 @@ impl Env {
     pub fn with_roots(channel: Channel, roots: Roots, user_sid: String) -> Env {
         assert!(channel.is_valid(), "invalid channel `{channel}`");
         guard::check_channel_constructible(&channel);
+        let programs = roots.user_profile.join("Programs");
         Env {
             channel,
             roots,
             user_sid,
             volumes: Arc::new(SystemVolumeResolver),
+            programs,
         }
+    }
+
+    /// Replaces the folder the AUMID shortcut goes in. [`Env::from_system`] sets the real
+    /// `FOLDERID_Programs`; the desktop group's host run sets it for a test channel, so Windows
+    /// knows that channel's AUMID (P4a-R39). The guard still checks the shortcut it gives.
+    #[must_use]
+    pub fn with_programs_dir(mut self, programs: PathBuf) -> Env {
+        self.programs = programs;
+        self
     }
 
     /// Replaces the volume resolver (tests inject a fake).
@@ -440,6 +455,98 @@ impl Env {
         )
     }
 
+    /// The channel's activation scheme (P4a-R2): `lil` for stable, `lil-dev` for dev,
+    /// `lil-test-<id>` for a test channel.
+    pub fn activation_scheme(&self) -> String {
+        let scheme = match self.channel {
+            Channel::Stable => "lil".to_string(),
+            ref other => format!("lil-{other}"),
+        };
+        guard::check_channel_name(&self.channel, scheme)
+    }
+
+    /// The per-user classes root the handlers and the toast CLSID are registered under
+    /// (Appendix G): `HKCU\Software\Classes` for stable and dev, `<registry root>\Classes`
+    /// (`HKCU\Software\LILITH-test-<id>\Classes`) for a test channel, which the shell never reads.
+    pub fn classes_root(&self) -> String {
+        let root = match self.channel {
+            Channel::Stable | Channel::Dev => r"HKCU\Software\Classes".to_string(),
+            Channel::Test(_) => format!(r"{}\Classes", self.registry_root()),
+        };
+        guard::check_classes_root(root)
+    }
+
+    /// The AUMID shortcut (APP-022): `<Programs>\LILITH.lnk` for stable,
+    /// `<Programs>\LILITH (<Channel>).lnk` otherwise, with the capitalised channel.
+    pub fn start_menu_shortcut(&self) -> PathBuf {
+        let name = match self.channel {
+            Channel::Stable => format!("{}.lnk", names::APP_NAME),
+            _ => format!("{} ({}).lnk", names::APP_NAME, self.channel.capitalised()),
+        };
+        guard::check_shortcut(self.programs.join(name))
+    }
+
+    /// The shortcut's `System.AppUserModel.ToastActivatorCLSID` (P4a-R37): fixed per channel and
+    /// different for each, in the registry form `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`. It is
+    /// a name-based UUID (the version 5 layout) over SHA-256 of the channel's AUMID.
+    pub fn toast_activator_clsid(&self) -> String {
+        let aumid = format!("{}.Suite.{}", names::APP_NAME, self.channel.capitalised());
+        let digest = Sha256::digest(format!("{aumid} ToastActivatorCLSID").as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0F) | 0x50;
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        let v = u128::from_be_bytes(bytes);
+        guard::check_channel_name(
+            &self.channel,
+            format!(
+                "{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+                v >> 96,
+                (v >> 80) & 0xFFFF,
+                (v >> 64) & 0xFFFF,
+                (v >> 48) & 0xFFFF,
+                v & 0xFFFF_FFFF_FFFF
+            ),
+        )
+    }
+
+    /// `local_dir\apps\<app>`: an app's own state (P4a-R16).
+    ///
+    /// # Panics
+    /// If `app` isn't 1 to 64 ASCII letters, digits, `-` or `_` (a programming error).
+    pub fn app_state_dir(&self, app: &str) -> PathBuf {
+        assert!(is_valid_app(app), "invalid app name `{app}`");
+        self.local_dir().join("apps").join(app)
+    }
+
+    /// An app's single-instance pipe (APP-013), `\\.\pipe\lilith-app-<app>-<userSID>-<channel>`,
+    /// or with `confirm` its confirm window's,
+    /// `\\.\pipe\lilith-app-<app>-confirm-<userSID>-<channel>` (P4a-R11).
+    ///
+    /// # Panics
+    /// If `app` isn't 1 to 64 ASCII letters, digits, `-` or `_` (a programming error).
+    pub fn app_pipe_name(&self, app: &str, confirm: bool) -> String {
+        assert!(is_valid_app(app), "invalid app name `{app}`");
+        let confirm = if confirm { "-confirm" } else { "" };
+        guard::check_channel_name(
+            &self.channel,
+            format!(
+                r"\\.\pipe\lilith-app-{app}{confirm}-{}-{}",
+                self.user_sid, self.channel
+            ),
+        )
+    }
+
+    /// `local_dir\diagnostics`: the diagnostics bundles (P4a-R19).
+    pub fn diagnostics_dir(&self) -> PathBuf {
+        self.local_dir().join("diagnostics")
+    }
+
+    /// `local_dir\cache\lilref`: the `.lilref` files `lilref.write` makes (APP-021).
+    pub fn lilref_dir(&self) -> PathBuf {
+        self.local_dir().join("cache").join("lilref")
+    }
+
     /// The `<machine>` of append-log names (ARCH-081): [`TEST_MACHINE_ID`] on test channels,
     /// else [`machine_id_from`] of the computer name (`COMPUTERNAME`; `unknown` when unset).
     pub fn machine_id(&self) -> String {
@@ -477,6 +584,14 @@ fn choose_suite_toml(
     } else {
         legacy
     }
+}
+
+/// An app name that can go into folder and pipe names: 1 to 64 ASCII letters, digits, `-` or `_`.
+fn is_valid_app(app: &str) -> bool {
+    (1..=64).contains(&app.len())
+        && app
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The machine id of append-log names (ARCH-081): `computer_name` lowercased, with every

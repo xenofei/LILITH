@@ -21,24 +21,54 @@ sha2.workspace = true
 sysinfo.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 toml.workspace = true
+# The shared log setup every process uses (logs, ARCH-117, P4a-R20): JSON lines through the
+# workspace's tracing stack.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 zeroize.workspace = true
 
+# Plan 4a Task 5 adds the feature set Task 1 recorded (spike 11, S1.1), and the registry.
 [dependencies.windows]
 workspace = true
 features = [
+    # IAsyncOperation and IAsyncAction (Windows Hello, Task 28).
+    "Foundation",
+    # XmlDocument: a toast's XML (desktop, APP-022).
+    "Data_Xml_Dom",
+    # ToastNotificationManager, ToastNotifier, ToastNotification and History (APP-022).
+    "UI_Notifications",
+    # KeyCredentialManager (Windows Hello, Task 28).
+    "Security_Credentials",
+    # UserConsentVerifier (Windows Hello, Task 28).
+    "Security_Credentials_UI",
+    # CryptographicBuffer: IBuffer to bytes (Windows Hello, Task 28).
+    "Security_Cryptography",
+    # IBuffer (Windows Hello, Task 28).
+    "Storage_Streams",
     "Win32_Foundation",
     # The NVIDIA adapter's LUID, for the PDH GPU memory instances (CORE-059).
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
+    # Also the token's elevation, for whether toasts are ready (APP-022).
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Credentials",
+    # CryptProtectData and CryptUnprotectData: the DPAPI route (Windows Hello, Task 28).
+    "Win32_Security_Cryptography",
     "Win32_Storage_CloudFilters",
+    # PKEY_AppUserModel_ID and PKEY_AppUserModel_ToastActivatorCLSID (the AUMID shortcut).
+    "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",
+    # Also IShellLinkW's CoCreateInstance and IPersistFile (the AUMID shortcut).
     "Win32_System_Com",
+    # PROPVARIANT, InitPropVariantFromCLSID and PropVariantToGUID (the AUMID shortcut).
+    "Win32_System_Com_StructuredStorage",
+    # GetConsoleWindow (Windows Hello, Task 28).
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    # Also GetCommandLineW: the raw command line (APP-020, P4a-R3).
     "Win32_System_Environment",
     "Win32_System_IO",
     # Kill-on-close engine Job Objects (ARCH-064).
@@ -47,11 +77,31 @@ features = [
     # PDH: GPU Process Memory and the Energy Meter (CORE-059).
     "Win32_System_Performance",
     "Win32_System_Pipes",
+    # PowerCreateRequest, PowerSetRequest and PowerClearRequest: keep-awake (ARCH-127).
+    "Win32_System_Power",
+    # RegCreateKeyExW, RegGetValueW and RegDeleteTreeW: the per-user handlers and the CLSID
+    # (APP-022).
+    "Win32_System_Registry",
     "Win32_System_SystemServices",
+    # Also REASON_CONTEXT: the power request's reason string (ARCH-127).
     "Win32_System_Threading",
     # The local time offset through the dynamic time zone (CORE-012).
     "Win32_System_Time",
+    # Tbsi_GetDeviceInfo: the TPM check (Windows Hello, Task 28).
+    "Win32_System_TpmBaseServices",
+    # VT_LPWSTR: the shortcut's AUMID value (the AUMID shortcut).
+    "Win32_System_Variant",
+    # RoInitialize and IUserConsentVerifierInterop (Windows Hello, Task 28).
+    "Win32_System_WinRT",
+    # QueryUnbiasedInterruptTime: the sleep record's monotonic clock (ARCH-127, Task 9).
+    "Win32_System_WindowsProgramming",
+    # Also SHQueryUserNotificationState (fullscreen, CORE-160), IShellLinkW and
+    # FOLDERID_Programs (the AUMID shortcut).
     "Win32_UI_Shell",
+    # IPropertyStore: the shortcut's AUMID and CLSID (the AUMID shortcut).
+    "Win32_UI_Shell_PropertiesSystem",
+    # Also the foreground window, AllowSetForegroundWindow and WM_POWERBROADCAST (APP-014,
+    # ARCH-127).
     "Win32_UI_WindowsAndMessaging",
     # RtlUpcaseUnicodeChar (ntdll): the system uppercase table that file names compare by.
     "Wdk_System_SystemServices",

@@ -16,7 +16,13 @@
 //! - the real registry root, `HKCU\Software\<App>`, and its `-<channel>` variants, except
 //!   `HKCU\Software\<App>-test-*`;
 //! - the real credential prefix, `<App>/`, and its `-<channel>` variants, except
-//!   `<App>-test-*`.
+//!   `<App>-test-*`;
+//! - the real Start-menu Programs folder (`FOLDERID_Programs`) and anything in it, for the
+//!   AUMID shortcut, and the real classes root `HKCU\Software\Classes` and anything below it,
+//!   for the handlers and the toast CLSID (APP-022).
+//!
+//! [`require_desktop_group`] is the desktop gate of the desktop-group tests (QA-042, P4a-R29),
+//! a separate check that reads only the process variables.
 //!
 //! The registry root and credential prefix in [`RealLocations`] are built under one app name;
 //! the guard derives the other name's root and prefix from them.
@@ -59,6 +65,9 @@ pub struct RealLocations {
     pub local: PathBuf,
     /// The real user profile (`%USERPROFILE%`). Only `<user_profile>\.claude` is real.
     pub user_profile: PathBuf,
+    /// The real Start-menu Programs folder (`FOLDERID_Programs`): no test's AUMID shortcut may
+    /// go in it while the guard is armed (APP-022, QA-038).
+    pub programs: PathBuf,
     /// `HKCU\Software\<App>` (the guard derives the other app name's root from it)
     pub registry_root: String,
     /// `<App>/` (the guard derives the other app name's prefix from it)
@@ -78,6 +87,7 @@ impl RealLocations {
             roaming,
             local: known_folders::local_app_data()?,
             user_profile: known_folders::profile()?,
+            programs: known_folders::programs()?,
             registry_root: format!(r"HKCU\Software\{app}"),
             credential_prefix: format!("{app}/"),
             workspaces,
@@ -163,7 +173,24 @@ impl RealLocations {
             .iter()
             .any(|root| is_real_name(value, root, &['-', '/']))
     }
+
+    /// True for a path in the real Start-menu Programs folder (or the folder itself), compared
+    /// by prefix and case-insensitively.
+    pub fn is_real_shortcut(&self, path: &Path) -> bool {
+        let p = normalise_for_hash(path);
+        let programs = normalise_for_hash(&self.programs);
+        p == programs || first_component_below(&p, &programs).is_some()
+    }
+
+    /// True for the real per-user classes root, `HKCU\Software\Classes`, and anything below it
+    /// (the schemes, the file types and the CLSIDs the shell reads).
+    pub fn is_real_classes_root(&self, value: &str) -> bool {
+        is_real_name(value, REAL_CLASSES_ROOT, &['\\'])
+    }
 }
+
+/// The per-user classes root the shell reads.
+const REAL_CLASSES_ROOT: &str = r"HKCU\Software\Classes";
 
 /// `<App>` or `<App>-<channel>` under either app name, but not a test channel
 /// (`<App>-test-*`). `<App>Suite` (the install folder) is not one: no hyphen.
@@ -308,8 +335,26 @@ pub(crate) fn check_credential(value: String) -> String {
     value
 }
 
-/// Names that carry only the channel (pipe, AUMID): once armed, only test channels may
-/// produce them.
+pub(crate) fn check_shortcut(path: PathBuf) -> PathBuf {
+    if let Some(real) = ARMED.get()
+        && (real.is_real_shortcut(&path) || real.is_real_path(&path))
+    {
+        trip(&path.display().to_string());
+    }
+    path
+}
+
+pub(crate) fn check_classes_root(value: String) -> String {
+    if let Some(real) = ARMED.get()
+        && (real.is_real_classes_root(&value) || real.is_real_registry(&value))
+    {
+        trip(&value);
+    }
+    value
+}
+
+/// Names that carry only the channel (pipe, AUMID, scheme, CLSID): once armed, only test
+/// channels may produce them.
 pub(crate) fn check_channel_name(channel: &Channel, value: String) -> String {
     if ARMED.get().is_some() && !matches!(channel, Channel::Test(_)) {
         trip(&value);
@@ -323,6 +368,39 @@ pub(crate) fn check_channel_constructible(channel: &Channel) {
     }
 }
 
+/// `LIL_SANDBOX`: `1` inside the Windows Sandbox runner (`lil dev desktop-tests`, P4a-R31).
+pub const ENV_SANDBOX: &str = "LIL_SANDBOX";
+/// `LIL_DESKTOP_HOST`: `1` in the host run (`lil dev desktop-tests --host`, P4a-R39).
+pub const ENV_DESKTOP_HOST: &str = "LIL_DESKTOP_HOST";
+
+/// The desktop gate (QA-042, P4a-R29): the first call of every desktop-group test, before it
+/// touches the desktop. It returns only when `LIL_SANDBOX` is `1`, or when `host_ok` (the toast
+/// and foreground tests, P4a-R39) and `LIL_DESKTOP_HOST` is `1`; anywhere else, CI included, it
+/// panics.
+///
+/// # Panics
+/// Outside the gate, as above.
+pub fn require_desktop_group(host_ok: bool) {
+    let is_one = |name: &str| std::env::var(name).is_ok_and(|v| v == "1");
+    if is_one(ENV_SANDBOX) || (host_ok && is_one(ENV_DESKTOP_HOST)) {
+        return;
+    }
+    let runs = if host_ok {
+        "`lil dev desktop-tests` or `lil dev desktop-tests --host`"
+    } else {
+        "`lil dev desktop-tests` (the Windows Sandbox runner)"
+    };
+    panic!(
+        "desktop test outside the desktop gate: it runs only through {runs}, which sets \
+         {ENV_SANDBOX}=1{} (QA-042)",
+        if host_ok {
+            format!(" or {ENV_DESKTOP_HOST}=1")
+        } else {
+            String::new()
+        }
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +412,9 @@ mod tests {
             roaming: PathBuf::from(r"C:\Fake\AppData\Roaming"),
             local: PathBuf::from(r"C:\Fake\AppData\Local"),
             user_profile: PathBuf::from(r"C:\Fake"),
+            programs: PathBuf::from(
+                r"C:\Fake\AppData\Roaming\Microsoft\Windows\Start Menu\Programs",
+            ),
             registry_root: format!(r"HKCU\Software\{app}"),
             credential_prefix: format!("{app}/"),
             workspaces: Vec::new(),
@@ -565,6 +646,7 @@ path = 'C:\Ws\Two'
             roaming: PathBuf::from(r"C:\R"),
             local: PathBuf::from(r"C:\L"),
             user_profile: PathBuf::from(r"C:\U"),
+            programs: PathBuf::from(r"C:\U\Programs"),
             registry_root: format!(r"HKCU\Software\{APP_NAME}"),
             credential_prefix: format!("{APP_NAME}/"),
             workspaces: vec![PathBuf::from(r"C:\Ws\One")],

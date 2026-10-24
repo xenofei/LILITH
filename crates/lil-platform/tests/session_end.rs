@@ -6,14 +6,14 @@
 
 use std::time::{Duration, Instant};
 
-use lil_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
+use lil_platform::session_end::{PowerEvent, SessionEnd, SessionEndSim, SessionEndWatcher};
 
 /// Failure deadline for anything the test waits on.
 const DEADLINE: Duration = Duration::from_secs(30);
 /// Pause between polls.
 const POLL: Duration = Duration::from_millis(5);
 
-fn recv(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEnd>) -> SessionEnd {
+fn recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
     let deadline = Instant::now() + DEADLINE;
     loop {
         match rx.try_recv() {
@@ -128,4 +128,26 @@ fn simulate_selector_is_separate_from_reported_events() {
     }
     assert!(watcher.is_alive());
     assert!(rx.try_recv().is_err(), "one report per message");
+}
+
+/// The same window reports the sleep broadcasts the core's sleep record reads (ARCH-127;
+/// Appendix G "Keep-awake"): `PBT_APMSUSPEND` and `PBT_APMRESUMEAUTOMATIC`, on a receiver of
+/// their own that is taken once.
+#[test] // spec: ARCH-127
+fn power_broadcasts_are_reported() {
+    let (watcher, mut rx) = SessionEndWatcher::start().expect("the session-end window");
+    let mut power = watcher
+        .power_events()
+        .expect("the power events, taken once");
+    assert!(watcher.power_events().is_none(), "taken twice");
+    assert!(watcher.simulate(SessionEndSim::Suspend));
+    assert!(watcher.simulate(SessionEndSim::Resume));
+    assert_eq!(recv(&mut power), PowerEvent::Suspending);
+    assert_eq!(recv(&mut power), PowerEvent::Resumed);
+    assert!(power.try_recv().is_err(), "one report per broadcast");
+    assert!(
+        rx.try_recv().is_err(),
+        "power broadcasts aren't session-end messages"
+    );
+    assert!(watcher.is_alive());
 }
