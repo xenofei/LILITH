@@ -1,2 +1,4 @@
 /target/
 /build/
+# Screen grabs from the Sandbox show whatever was on its screen: they stay local (final review M9).
+/results/**/*.png

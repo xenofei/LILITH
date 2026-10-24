@@ -199,6 +199,7 @@ function Assert-NoSandboxRunning {
 # takes seconds on a Get-Process one, and either would carry the whole environment block (fix
 # round 4, N3-C2). The record holds {pid, name, start} for each (Get-ProcRecord).
 $script:SandboxPinned = @()
+$script:ConnectPinned = @()
 
 function Get-ProcRecord($P) {
     $rec = [ordered]@{ pid = $null; name = $null; start = $null }
@@ -227,41 +228,82 @@ function Get-OwnPids($Started) {
     $fresh
 }
 
+# The viewer client `wsb connect` opens (final review I1). It stays open after the Sandbox itself has
+# shut down, so it is never counted as the Sandbox running, and Close-SandboxClients closes it.
+$ClientNames = @('WindowsSandboxRemoteSession')
+
 # With the CLI and an id: that id only. Otherwise: the run's own pinned WindowsSandbox* processes
-# (the launcher and the client it started) that are still running (scope-cut review M11). A new
-# WindowsSandbox* process that could not be pinned (another user's, such as SYSTEM's) or that
-# lingers is not counted here; Get-SandboxLingering records its name.
+# (the launcher and its client) that are still running, the viewer client excepted (scope-cut
+# review M11; final review I1). A new WindowsSandbox* process that could not be pinned (another
+# user's, such as SYSTEM's) is not counted here; Get-SandboxLingering records its name.
 function Test-SandboxRunning($Started) {
     if ($Started.id) { return @(Get-WsbIds) -contains $Started.id }
     [void](Get-OwnPids $Started)
     @($script:SandboxPinned | Where-Object {
         $pp = $_
         $alive = $false
-        try { $alive = $null -ne $pp -and -not $pp.HasExited -and $pp.ProcessName -match '^WindowsSandbox' } catch { }
+        try { $alive = $null -ne $pp -and -not $pp.HasExited -and $pp.ProcessName -match '^WindowsSandbox' -and $pp.ProcessName -notin $ClientNames } catch { }
         $alive
     }).Count -gt 0
 }
 
-# The names of the WindowsSandbox* processes that appeared after this run's start, are not pinned,
-# and still run (recorded in lifecycle.json; scope-cut review M11).
+# After the stop: closes this run's own viewer clients, pinned when first seen (the `wsb connect`
+# process itself, pinned at its start, and the WindowsSandboxRemoteSession it opens): CloseMainWindow,
+# up to 10 s to exit, then the pinned object is stopped. Returns what each one needed.
+function Close-SandboxClients($Started) {
+    [void](Get-OwnPids $Started)
+    $out = @()
+    $clients = @(@($script:SandboxPinned) + @($script:ConnectPinned) | Where-Object {
+        $pp = $_; $is = $false
+        try { $is = $null -ne $pp -and -not $pp.HasExited -and ($pp.ProcessName -in $ClientNames -or $pp.ProcessName -eq 'wsb') } catch { }
+        $is
+    })
+    foreach ($c in $clients) {
+        $rec = [ordered]@{ pid = $null; name = $null; how = $null }
+        try { $rec.pid = [int]$c.Id; $rec.name = [string]$c.ProcessName } catch { }
+        $sent = $false
+        try { $sent = [bool]$c.CloseMainWindow() } catch { }
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline -and -not $c.HasExited) { Start-Sleep -Milliseconds 500 }
+        if ($c.HasExited) { $rec.how = $(if ($sent) { 'CloseMainWindow' } else { 'exited' }) }
+        else {
+            Stop-PinnedProcess $c   # pinned when first seen
+            Start-Sleep -Seconds 1
+            $rec.how = $(if ($c.HasExited) { 'stopped (pinned object)' } else { 'still running' })
+        }
+        $out += $rec
+    }
+    $out
+}
+
+# The names of every WindowsSandbox* process that appeared after this run's start and still runs,
+# pinned or not (recorded in lifecycle.json; scope-cut review M11, final review I1).
 function Get-SandboxLingering($Started) {
-    $pinnedIds = @($script:SandboxPinned | ForEach-Object { try { [int]$_.Id } catch { } })
-    @(@(Get-SandboxPids) | Where-Object { $_ -notin $Started.pids_before -and $_ -notin $pinnedIds } | ForEach-Object {
-        try { (Get-Process -Id $_ -ErrorAction Stop).ProcessName } catch { }   # read-only pid lookup: a name
-    } | Sort-Object -Unique)
+    @(@(Get-SandboxPids) | Where-Object { $_ -notin $Started.pids_before } | ForEach-Object { Get-ProcNameById $_ } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+# A running process's name, or $null. A seam: the simulation fakes it.
+function Get-ProcNameById([int]$ProcessId) {
+    try { (Get-Process -Id $ProcessId -ErrorAction Stop).ProcessName } catch { $null }   # read-only pid lookup: a name
 }
 
 function Start-Sandbox([string]$WsbFile) {
     $startedAt = Get-Date
     $before = @(Get-SandboxPids)
     $script:SandboxPinned = @()
+    $script:ConnectPinned = @()
     if (Get-Command wsb -ErrorAction SilentlyContinue) {
         # One line: the configuration is passed as a single command-line argument.
         $xml = (Get-Content -Raw $WsbFile) -replace '\r?\n\s*', ''
         $out = (& wsb start --config $xml 2>&1 | Out-String)
         $id = [regex]::Match($out, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}').Value
         # The logon command needs a user session: connect opens the Sandbox window.
-        if ($id) { Start-Process -FilePath wsb -ArgumentList 'connect', '--id', $id | Out-Null }
+        if ($id) {
+            # Pinned at its start (final review I1): closed after the run by Close-SandboxClients.
+            $c = Start-Process -FilePath wsb -ArgumentList 'connect', '--id', $id -PassThru
+            [void]$c.Handle
+            $script:ConnectPinned = @($c)
+        }
         return [ordered]@{ via = 'wsb start + wsb connect'; id = $id; start_output = $out.Trim(); process = $null; pids_before = $before; own_pids = @(); own_procs = @(); started_at = $startedAt }
     }
     $p = Start-Process -FilePath (Join-Path $env:windir 'System32\WindowsSandbox.exe') -ArgumentList "`"$WsbFile`"" -PassThru
@@ -586,6 +628,9 @@ try {
                 Say 'Interrupted: stopping the Sandbox this run started.' 'Red'
                 $stop = Stop-Sandbox $started -Now
             }
+            # The viewer client stays open after the Sandbox has shut down (final review I1).
+            $lingeringAfterStop = $(if ($started) { @(Get-SandboxLingering $started) } else { @() })
+            $clientClose = $(if ($started) { @(Close-SandboxClients $started) } else { @() })
         }
         $closedAt = ((Get-Date) - $t0).TotalSeconds
 
@@ -598,7 +643,9 @@ try {
             }
             done_s = $doneAt; stop = $stop; start_to_closed_s = [int]$closedAt
             process_names = @($procs | Sort-Object -Unique)
-            lingering_after_stop = $(if ($started) { @(Get-SandboxLingering $started) } else { @() })
+            lingering_after_stop = @($lingeringAfterStop)
+            client_close = @($clientClose)
+            lingering_after_close = $(if ($started) { @(Get-SandboxLingering $started) } else { @() })
             host_locked_at_start = $(if ($lockSamples.Count -gt 0) { $lockSamples[0].locked } else { $null })
             host_locked_any = (@($lockSamples | Where-Object { $_.locked -eq $true }).Count -gt 0)
             host_lock_unknown_samples = @($lockSamples | Where-Object { $null -eq $_.locked }).Count

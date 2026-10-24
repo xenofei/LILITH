@@ -1,6 +1,6 @@
-//! Owner run 3 (owner q1/q2): `run-all.ps1` is one unattended command — Part B on the host, then
-//! Part C in Windows Sandbox. Its `-DryRun` prints the stages it would run and stops; nothing else
-//! runs. Needs `pwsh`.
+//! `run-all.ps1` runs S1.9 in Windows Sandbox by default (scope cut); the unmaintained Part B stage
+//! only with `-PartB -PartBUnmaintained`. Its `-DryRun` prints the stages it would run and stops;
+//! nothing else runs. Needs `pwsh`.
 
 use std::path::Path;
 use std::process::Command;
@@ -58,7 +58,12 @@ fn part_b_runs_only_with_part_b() {
     assert_ne!(code, Some(0), "{out}{err}");
     assert!(err.contains("run only with -PartB"), "{err}");
     assert!(out.is_empty(), "printed: {out}");
+    // Final review I5: the Part B code is unmaintained, so -PartB alone refuses and says why.
     let (code, out, err) = dry_run(&["-PartB"]);
+    assert_ne!(code, Some(0), "{out}{err}");
+    assert!(err.contains("unmaintained"), "{err}");
+    assert!(out.is_empty(), "printed: {out}");
+    let (code, out, err) = dry_run(&["-PartB", "-PartBUnmaintained"]);
     assert_eq!(code, Some(0), "{out}{err}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");
     let s = stages(&v);

@@ -671,20 +671,30 @@ function Get-SandboxPids {
     $s = $script:SimSandbox
     if ($null -eq $s) { return @() }
     if ($s.ContainsKey('Killed') -and $s.Killed) { return @() }
+    # Pids[1] is the viewer client (WindowsSandboxRemoteSession): as on the owner's PC, it stays
+    # open after the Sandbox has shut down, until it is closed (final review I1).
+    $client = $(if ($s.ContainsKey('ClientClosed') -and $s.ClientClosed) { @() } else { @($s.Pids[1]) })
     $done = [IO.File]::Exists((Join-Path $s.Res 'done.json'))
-    if ($done -and (-not $s.Sticky -or $s.Launcher.HasExited)) { return @() }
-    @($s.Pids)
+    if ($done -and (-not $s.Sticky -or $s.Launcher.HasExited)) { return $client }
+    @($s.Pids[0]) + $client
 }
 # The fake Sandbox's own processes, pinned as the real ones are (scope-cut review M11: "running"
 # is judged from the pinned WindowsSandbox* processes). Killing one ends the fake Sandbox. Any
 # other pid goes to the real Get-PinnedProcess.
 $script:RealGetPinnedProcess = ${function:Get-PinnedProcess}
+function Get-ProcNameById([int]$ProcessId) {
+    $s = $script:SimSandbox
+    if ($null -ne $s -and $ProcessId -in @(Get-SandboxPids)) { return $(if ($ProcessId -eq $s.Pids[1]) { 'WindowsSandboxRemoteSession' } else { 'WindowsSandboxClient' }) }
+    $null
+}
 function Get-PinnedProcess([int]$ProcessId, [string]$ExpectedPath, [datetime]$NotBefore, [long]$CreatedFileTime = 0) {
     $s = $script:SimSandbox
     if ($null -ne $s -and $ProcessId -in @($s.Pids)) {
-        $p = [pscustomobject]@{ Id = $ProcessId; ProcessName = 'WindowsSandboxClient'; Sim = $s }
+        $isClient = $ProcessId -eq $s.Pids[1]
+        $p = [pscustomobject]@{ Id = $ProcessId; ProcessName = $(if ($isClient) { 'WindowsSandboxRemoteSession' } else { 'WindowsSandboxClient' }); Sim = $s; IsClient = $isClient }
         $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { ($this.Sim.ContainsKey('Killed') -and $this.Sim.Killed) -or -not (@(Get-SandboxPids) -contains $this.Id) }
-        $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Sim.Killed = $true }
+        $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { if ($this.IsClient) { $this.Sim.ClientClosed = $true } else { $this.Sim.Killed = $true } }
+        $p | Add-Member -MemberType ScriptMethod -Name CloseMainWindow -Value { if ($this.IsClient) { $this.Sim.ClientClosed = $true; $true } else { $false } }
         $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $this.Sim.Killed = $true; if ($args.Count -gt 0) { $true } }
         return $p
     }

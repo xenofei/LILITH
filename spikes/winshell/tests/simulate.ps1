@@ -98,6 +98,13 @@ try {
             $stop2 = "$(P (P (P (P (P $rr[1] 'items') 'lifecycle') 'file') 'stop') 'method')"
             Expect 'Sandbox run 2 ended through its pinned object' ($stop2.StartsWith('Kill')) "stop: '$stop2'"
             $stop1 = "$(P (P (P (P (P $rr[0] 'items') 'lifecycle') 'file') 'stop') 'method')"
+            # Final review I1: the viewer client stays open after the Sandbox's own shutdown; the run
+            # records it and closes it (CloseMainWindow), so nothing is left for the next run.
+            $lf1 = P (P (P $rr[0] 'items') 'lifecycle') 'file'
+            $closed1 = @(P $lf1 'client_close')
+            $closed1 = @($closed1 | Where-Object { $_ })
+            Expect 'viewer client recorded and closed (I1)' (@(P $lf1 'lingering_after_stop') -contains 'WindowsSandboxRemoteSession' -and $closed1.Count -eq 1 -and (P $closed1[0] 'how') -eq 'CloseMainWindow' -and @(P $lf1 'lingering_after_close' | Where-Object { $_ }).Count -eq 0) "after stop: $(@(P $lf1 'lingering_after_stop') -join ','); closed: $(@($closed1 | ForEach-Object { P $_ 'how' }) -join ','); after close: $(@(P $lf1 'lingering_after_close') -join ',')"
+            Expect 'nothing left after any run (I1)' (@($rr | Where-Object { @(P (P (P (P $_ 'items') 'lifecycle') 'file') 'lingering_after_close' | Where-Object { $_ }).Count -gt 0 }).Count -eq 0) 'lingering_after_close empty in every run'
             Expect 'Sandbox run 1 closed by itself, judged from its pinned processes (M11)' ($stop1 -eq 'shutdown /s /t 0 inside') "stop: '$stop1'"
             # The fakes report the host locked for the first two samples: run 1 records it, and
             # with every item passing the run still passes (scope-cut I2).

@@ -24,7 +24,7 @@ Put the folder of Task 0's worktree in the quotes (or set the environment variab
 It runs `run-sandbox.ps1 -Runs 3 -KeepAwake` and nothing else:
 
 - it builds the spike (`cargo build --release`), copies Task 0's deploy folder as it is into `spikes\winshell\build\sandbox\deploy-copy`, and finds the three runtime files;
-- a Windows Sandbox window opens and closes by itself, 3 times. Each run is limited to 120 s to start and 600 s to finish; a run that goes over is recorded and its Sandbox closed;
+- a Windows Sandbox window opens 3 times. Each Sandbox shuts itself down at the end of its run, and the script then closes its window (the viewer `wsb connect` opens, which stays open otherwise). Each run is limited to 120 s to start and 600 s to finish; a run that goes over is recorded and its Sandbox closed;
 - the PC is kept awake for the runs (a power request held by a spike program that watches the script, released at the end). A run during which the PC slept anyway is recorded as interrupted, not as a failure;
 - whether the PC is locked is read (never changed) every few seconds during each run and recorded. The keep-awake doesn't stop the screen turning off or the PC locking; a toast, foreground or Qt item that fails while the PC was locked is recorded as "host locked: not judged" rather than as a failure.
 
@@ -32,13 +32,13 @@ The Qt item inside the Sandbox starts Task 0's app on the normal (on-screen) pla
 
 When it ends, the terminal prints the verdict per run and overall. The overall verdict is PASS only when all 3 runs finished and passed (it reads "PASS (Qt: on-screen grab only; offscreen not tested)"); fewer finished runs give INCOMPLETE. The results are in `spikes\winshell\results\`: `sandbox-checks.json`, and each run's files in `results\sandbox\run-<n>\`. **Ctrl+C** stops it at any time and still cleans up.
 
-**Part B** runs only when asked for by name with `-PartB` (for example `-PartB -Only S1.5`). It is not part of the default run: it posts toasts, writes a shortcut and registry entries, may show a Windows Hello prompt, and may ask questions in the terminal. Asking for a Part B check without `-PartB` stops the script before it does anything.
+**Part B is not runnable.** Its code is unmaintained: it is the full-automation code that never ran on a real desktop, and its review findings are still open, so its verdicts would not be reliable. Part B's results are the owner's recorded runs. Asking for a Part B check stops the script before it does anything, and says why.
 
 ## What the default run changes, and how it is undone
 
 | What | Undone |
 |---|---|
-| A Windows Sandbox (the `WindowsSandbox` processes this run started) | closed by the script after each run, and in the cleanup on any exit; only the processes it started are ended |
+| A Windows Sandbox (the `WindowsSandbox` processes this run started) and its window | the Sandbox shuts itself down after each run; the script then closes the run's own Sandbox window (`CloseMainWindow`, then it is ended if it doesn't close within 10 s), and anything still left is recorded in the run's `lifecycle.json`. On any other exit the script stops the Sandbox it started. Only the processes this run started are touched |
 | The power request "LILITH spike 11 keep-awake check" | released by the script at the end; if the terminal is closed instead, the program holding it notices and releases it within a second |
 | A permission for SYSTEM to write to `spikes\winshell\build\sandbox\run-<n>\results\` (the Sandbox writes its results through it), added only when that folder doesn't already inherit one | the folder is inside this worktree; delete it whenever you like |
 | `spikes\winshell\build\` and `spikes\winshell\results\` | kept for the agent; git ignores both; delete them whenever you like |

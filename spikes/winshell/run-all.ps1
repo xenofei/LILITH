@@ -10,13 +10,18 @@ run-sandbox.ps1 -Runs 3 -KeepAwake. It asks nothing, every wait in it is bounded
 up on every exit path. It touches nothing on the host desktop beyond starting the Sandbox window
 (and holding a parent-watched keep-awake for the runs).
 
--PartB adds the old host Part B stage (run-spike.ps1). That code asks the owner questions and
-is kept only for reference: never pass -PartB to an unattended run.
+-PartB adds the old host Part B stage (run-spike.ps1). That code is UNMAINTAINED: it is the
+full-automation code that never ran on a real desktop, with the full-auto review's C2 (a hang with
+a Hello prompt on screen), C3 (S1.8's KEK route judged from the consent prompt, not the KEK one)
+and I1 (S1.5 judged from toast events) still open. It refuses unless -PartBUnmaintained is also
+passed. Part B's verdicts come from the owner's recorded runs, not from this code.
 
 .PARAMETER Only
 The checks to run: S1.9 by default. Part B names (S1.1 to S1.8) are accepted only with -PartB.
 .PARAMETER PartB
-Also runs the host Part B stage (owner-present, interactive; not used by the spike any more).
+Also runs the host Part B stage (owner-present, interactive; unmaintained: see above).
+.PARAMETER PartBUnmaintained
+Needed with -PartB: says you know the Part B code is unmaintained and its verdicts unreliable.
 .PARAMETER Task0Repo
 The folder of Task 0's worktree, where its deploy folder was built (or set LILITH_TASK0_REPO).
 .PARAMETER DeployDir
@@ -36,6 +41,7 @@ param(
     [string]$DeployDir = '',
     [int]$Runs = 3,
     [switch]$PartB,
+    [switch]$PartBUnmaintained,
     [switch]$DryRun,
     [switch]$Simulate
 )
@@ -59,6 +65,14 @@ if (-not $givenOnly) { $Only = $Default }
 $b = @($PartBChecks | Where-Object { $_ -in $Only })
 if ($b.Count -gt 0 -and -not $PartB) {
     throw "Part B checks ($($b -join ', ')) run only with -PartB: they are answered by the owner's recorded runs, and their code asks the owner. Nothing was done."
+}
+# The Part B code is unmaintained (final review I5): it refuses unless that is acknowledged.
+if ($PartB -and -not $PartBUnmaintained) {
+    throw ("-PartB runs unmaintained code: the full-automation Part B never ran on a real desktop, and its review's " +
+        "C2 (a hang with a Hello prompt on screen), C3 (S1.8's KEK route judged from the wrong prompt) and I1 " +
+        "(S1.5 judged from toast events) are still open, so its verdicts are not reliable. Part B's results are the " +
+        "owner's recorded runs (docs/spikes/11-windows-integration.md, section 5). Add -PartBUnmaintained to run it " +
+        "anyway. Nothing was done.")
 }
 $withSandbox = 'S1.9' -in $Only
 
