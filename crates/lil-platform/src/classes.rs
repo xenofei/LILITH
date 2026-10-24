@@ -305,6 +305,8 @@ pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
     let exe = quoted(exe)?;
     let command = format!("{exe} \"%1\"");
     let k = keys(env)?;
+    // The marker goes first, so a run killed between two writes leaves a key the sweep finds.
+    mark(env, &k.scheme)?;
     set_string(
         &k.scheme,
         None,
@@ -317,15 +319,14 @@ pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
         &format!("{exe},0"),
     )?;
     set_string(&format!(r"{}\shell\open\command", k.scheme), None, &command)?;
-    mark(env, &k.scheme)?;
     if env.uses_shell_classes_root() {
         return Ok(());
     }
     let association = format!(r"{}\.lilref", k.root);
-    set_string(&association, None, &lilref_progid(env))?;
     mark(env, &association)?;
-    set_string(&format!(r"{}\shell\open\command", k.progid), None, &command)?;
-    mark(env, &k.progid)
+    set_string(&association, None, &lilref_progid(env))?;
+    mark(env, &k.progid)?;
+    set_string(&format!(r"{}\shell\open\command", k.progid), None, &command)
 }
 
 /// Removes a test channel's scheme and `.lilref` file type, and the `.lilref` association while
@@ -350,9 +351,28 @@ pub fn remove_test_registry(env: &Env) -> io::Result<()> {
     delete_tree(&hkcu_subkey(&env.registry_root())?)
 }
 
+/// `HKCU`'s subkey of Windows' own per-app notification settings for `env`'s AUMID, which
+/// Windows creates on the AUMID's first toast (`Setting()` answers `ERROR_NOT_FOUND` until then).
+pub(crate) const NOTIFICATION_SETTINGS: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings";
+
+fn notification_settings_key(env: &Env) -> String {
+    format!(r"{NOTIFICATION_SETTINGS}\{}", env.notification_aumid())
+}
+
+/// Removes Windows' notification settings entry for a test channel's AUMID,
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\<AUMID>`, by its exact
+/// name: the desktop group's toast tests make Windows create it. A missing key is no error.
+/// Refused, before anything is read or written, on a stable or dev channel.
+pub fn remove_notification_settings(env: &Env) -> io::Result<()> {
+    require_test_channel(env, "removing the notification settings")?;
+    delete_tree(&notification_settings_key(env))
+}
+
 /// What a test channel's registrations left behind (read-only; the desktop group's check that
 /// its cleanup removed everything, P4a-R39): each of its scheme key, `.lilref` file type, toast
-/// CLSID key, AUMID registration and registry root that still exists, and the `.lilref` association while it names
+/// CLSID key, AUMID registration, Windows' notification settings entry for the AUMID and
+/// registry root that still exists, and the `.lilref` association while it names
 /// the channel's type, as `HKCU\…` names. Refused on a stable or dev channel.
 pub fn leftover_registrations(env: &Env) -> io::Result<Vec<String>> {
     require_test_channel(env, "checking for leftover registrations")?;
@@ -365,6 +385,7 @@ pub fn leftover_registrations(env: &Env) -> io::Result<Vec<String>> {
         k.progid,
         clsid,
         aumid,
+        notification_settings_key(env),
         hkcu_subkey(&env.registry_root())?,
     ]
     .into_iter()

@@ -29,9 +29,12 @@ fn notifier(aumid: &str) -> windows::core::Result<ToastNotifier> {
 const NOT_FOUND: windows::core::HRESULT = windows::core::HRESULT(0x8007_0490_u32 as i32);
 
 /// The notifier's `Setting()` for `aumid`; `None` when there is no notifier (no platform), and
-/// [`NotifierSetting::NotYetShown`] when the AUMID has never shown a toast.
+/// [`NotifierSetting::NotYetShown`] when `Setting()` itself answers `ERROR_NOT_FOUND`: the
+/// AUMID has never shown a toast. A notifier that can't be created is `None`, whatever the
+/// error.
 pub(crate) fn setting(aumid: &str) -> Option<NotifierSetting> {
-    let setting = match notifier(aumid).and_then(|n| n.Setting()) {
+    let notifier = notifier(aumid).ok()?;
+    let setting = match notifier.Setting() {
         Ok(s) => s,
         Err(e) if e.code() == NOT_FOUND => return Some(NotifierSetting::NotYetShown),
         Err(_) => return None,

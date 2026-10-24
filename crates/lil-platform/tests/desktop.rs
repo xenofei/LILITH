@@ -80,6 +80,7 @@ fn leftover_names_give_the_desktop_test_id() {
         "LILITH-test-desktop-0123456789abcdef",
         "LILITH (Test-desktop-0123456789abcdef).lnk",
         "lilith (test-desktop-0123456789ABCDEF).LNK",
+        "LILITH.Suite.Test-desktop-0123456789abcdef",
     ] {
         assert_eq!(desktop_test_id_in(name), id, "{name}");
     }
@@ -96,6 +97,7 @@ fn leftover_names_give_the_desktop_test_id() {
         env.activation_scheme().as_str(),
         root.trim_start_matches(r"HKCU\Software\"),
         &shortcut,
+        &env.notification_aumid(),
     ] {
         assert_eq!(
             desktop_test_id_in(name).as_deref(),
@@ -111,6 +113,9 @@ fn leftover_names_give_the_desktop_test_id() {
         "LILITH-dev",
         "LILITH.lnk",
         "LILITH (Dev).lnk",
+        "LILITH.Suite.Stable",
+        "LILITH.Suite.Dev",
+        "LILITH.Suite.Test-0123456789abcdef",
         "lil-test-0123456789abcdef",
         "LILITH-test-a",
         "lil-test-desktop-0123456789abcde",
@@ -348,6 +353,42 @@ fn toasts_state_maps_each_notifier_setting() {
     assert!(!ToastsState::Unavailable("disabled_for_user").can_post());
 }
 
+#[test] // spec: APP-022, ARCH-055
+fn not_yet_shown_ends_when_an_ok_post_never_shows() {
+    use lil_platform::desktop::{NOT_SHOWN_GRACE, toasts_state_after_post};
+    let grace = NOT_SHOWN_GRACE;
+    assert_eq!(grace, Duration::from_secs(5));
+    let after = |state, since| toasts_state_after_post(state, since);
+    // Before any post, and within the grace after one: still postable.
+    assert_eq!(
+        after(ToastsState::NotYetShown, None),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        after(
+            ToastsState::NotYetShown,
+            Some(grace - Duration::from_millis(1))
+        ),
+        ToastsState::NotYetShown
+    );
+    // Still never shown 5 s after an Ok post: no platform, so confirmations answer at once.
+    for since in [grace, grace * 10] {
+        assert_eq!(
+            after(ToastsState::NotYetShown, Some(since)),
+            ToastsState::Unavailable("no_platform")
+        );
+    }
+    // Every other reading keeps its meaning.
+    for state in [
+        ToastsState::Ready,
+        ToastsState::Unavailable("disabled_for_user"),
+        ToastsState::Unavailable("elevated"),
+    ] {
+        assert_eq!(after(state, Some(grace * 2)), state);
+        assert_eq!(after(state, None), state);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The desktop group (QA-042; P4a-R29, P4a-R31, P4a-R39). Not run by `cargo nextest` without
 // `--run-ignored`; `lil dev desktop-tests` runs them serialised, the toast tests with `--host`.
@@ -382,12 +423,17 @@ struct Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         use lil_platform::desktop::{
-            clear_toast_history, leftover_registrations, real_desktop, remove_shortcut,
-            remove_test_registry, toast_history_tags, unregister_handlers,
+            clear_toast_history, leftover_registrations, real_desktop,
+            remove_notification_settings, remove_shortcut, remove_test_registry,
+            toast_history_tags, unregister_handlers,
         };
         let env = self.env;
         let removed = [
             ("the shortcut", remove_shortcut(env)),
+            (
+                "the notification settings",
+                remove_notification_settings(env),
+            ),
             ("the handlers", unregister_handlers(env)),
             ("the registry root", remove_test_registry(env)),
             ("the toast history", clear_toast_history(env)),
@@ -728,6 +774,41 @@ fn desktop_sweep_finds_orphaned_keys_by_their_marker() {
         assert_eq!(leftover_registrations(&env).unwrap(), Vec::<String>::new());
         assert!(!desktop_test_ids_left(&programs).unwrap().contains(&id));
     }
+}
+
+/// The marker only nominates an id: the sweep removes that id's own names, never the key that
+/// carries the marker (unless it is one of them).
+#[test] // spec: QA-042
+#[ignore = "desktop"]
+fn desktop_sweep_leaves_a_foreign_marked_key() {
+    use lil_platform::desktop::{TEST_MARKER, desktop_test_ids_left, sweep_desktop_tests};
+    require_desktop_group(false);
+    let dir = tempfile::tempdir().unwrap();
+    let env = desktop_env(dir.path()).with_shell_classes_root();
+    let _cleanup = Cleanup { env: &env };
+    let Channel::Test(id) = env.channel().clone() else {
+        unreachable!()
+    };
+    let programs = dir.path().join("programs");
+    let foreign = r"HKCU\Software\Classes\LilForeignMarkedKey";
+    let reg = |args: &[&str]| {
+        let out = std::process::Command::new("reg")
+            .args(args)
+            .output()
+            .unwrap();
+        out.status.success()
+    };
+    assert!(reg(&["add", foreign, "/v", TEST_MARKER, "/d", &id, "/f"]));
+    let found = desktop_test_ids_left(&programs).unwrap().contains(&id);
+    let sweep = sweep_desktop_tests(&programs);
+    let survived = reg(&["query", foreign]);
+    assert!(reg(&["delete", foreign, "/f"]));
+    assert!(found, "the marker nominates its id");
+    sweep.unwrap();
+    assert!(
+        survived,
+        "the sweep deleted a key that isn't one of the id's names"
+    );
 }
 
 #[test] // spec: ARCH-127, QA-042

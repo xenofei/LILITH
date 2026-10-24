@@ -133,17 +133,19 @@ pub fn write_shortcut(env: &Env, exe: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     with_com(|| save(&lnk, exe, &aumid, clsid)).map_err(|e| io_error(&e))?;
+    // Each key's marker goes first, so a run killed between two writes leaves a key the sweep
+    // finds.
     let clsid_key = clsid_key(env)?;
-    set_string(&format!(r"{clsid_key}\LocalServer32"), None, &server)?;
     mark(env, &clsid_key)?;
+    set_string(&format!(r"{clsid_key}\LocalServer32"), None, &server)?;
     let aumid_key = aumid_key(env)?;
+    mark(env, &aumid_key)?;
     set_string(&aumid_key, Some("DisplayName"), &display_name(env))?;
     set_string(
         &aumid_key,
         Some("CustomActivator"),
         &env.toast_activator_clsid(),
-    )?;
-    mark(env, &aumid_key)
+    )
 }
 
 fn save(lnk: &Path, exe: &Path, aumid: &str, clsid: GUID) -> windows::core::Result<()> {

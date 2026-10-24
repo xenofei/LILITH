@@ -117,6 +117,19 @@ pub fn locate(
     }
 }
 
+/// [`locate`] with [`ENV_TESTBINS_DIR`] and `LIL_SANDBOX` read through `var`: an empty
+/// `LIL_TESTBINS_DIR` counts as unset, and only `LIL_SANDBOX=1` means the Sandbox.
+pub fn locate_from(
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    compiled: &Path,
+) -> Result<Located, String> {
+    let override_dir = var(ENV_TESTBINS_DIR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let sandbox = var(ENV_SANDBOX).is_some_and(|v| v == "1");
+    locate(override_dir.as_deref(), sandbox, compiled)
+}
+
 /// The nextest profiles whose setup script builds the binaries.
 const PROFILES_WITH_SETUP_SCRIPT: &[&str] = &["default", "spec"];
 
@@ -139,11 +152,7 @@ pub fn ensure_built() -> &'static Bins {
     BINS.get_or_init(|| {
         let root = workspace_root();
         let target = root.join("target").join("testbins");
-        let override_dir = std::env::var_os(ENV_TESTBINS_DIR)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
-        let sandbox = std::env::var(ENV_SANDBOX).is_ok_and(|v| v == "1");
-        match locate(override_dir.as_deref(), sandbox, &target.join("debug")) {
+        match locate_from(&|name| std::env::var_os(name), &target.join("debug")) {
             Err(message) => panic!("{message}"),
             Ok(Located::Use(bins)) => bins,
             Ok(Located::BuildIfNeeded(bins)) => {

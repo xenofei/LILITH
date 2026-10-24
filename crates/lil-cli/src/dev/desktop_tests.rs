@@ -70,6 +70,10 @@ pub const HANDS_OFF_WARNING: Duration = Duration::from_secs(10);
 /// the pop-up says "almost done" once it has passed.
 const HOST_SECS_PER_TEST: u64 = 30;
 const HOST_OVERHEAD_SECS: u64 = 30;
+/// The worst case per test: the desktop profile's `slow-timeout` (60 s × `terminate-after = 5`).
+/// The pop-up's cap is this per test, plus [`HOST_CAP_OVERHEAD_SECS`].
+const HOST_WORST_SECS_PER_TEST: u64 = 300;
+const HOST_CAP_OVERHEAD_SECS: u64 = 120;
 /// What the pop-up says is happening.
 const HANDS_OFF_WHAT: &str = "runs its toast and foreground tests";
 
@@ -366,6 +370,8 @@ pub struct Swept {
 pub trait HandsOff {
     /// Shows "done" and lets the pop-up close.
     fn done(&self);
+    /// `Ok` while the pop-up is still on screen; why it isn't, otherwise.
+    fn check(&self) -> Result<(), String>;
 }
 
 /// Everything else the run does on the host.
@@ -384,13 +390,16 @@ pub trait HostOps {
     /// Whether this process runs elevated.
     fn elevated(&self) -> bool;
     /// Shows the hands-off pop-up and returns once it is on screen: `warning` of "in N s", then
-    /// a countdown of `run`.
+    /// a countdown of `run`; it stays up at most `cap` after the countdown's start.
     fn show_hands_off(
         &self,
         what: &str,
         warning: Duration,
         run: Duration,
+        cap: Duration,
     ) -> io::Result<Box<dyn HandsOff>>;
+    /// Whether the process `pid` runs (the host-run lock's owner).
+    fn process_alive(&self, pid: u32) -> bool;
     /// What desktop test channels left on this PC: shortcuts, registry keys, CLSIDs, toasts.
     fn desktop_leftovers(&self) -> io::Result<Vec<String>>;
     /// Removes what [`HostOps::desktop_leftovers`] finds, through the test-only removers.
@@ -667,17 +676,40 @@ fn run_sandbox(
     let handle = launcher
         .start(&l.wsb)
         .or_else(|e| fail(format!("couldn't start Windows Sandbox: {e}")))?;
+    // From here every way out, a panic included, closes the Sandbox and its viewer, except
+    // --keep-open without Ctrl+C.
+    let mut guard = StopOnDrop {
+        launcher,
+        handle,
+        armed: true,
+    };
     let outcome = wait_and_collect(l, cfg, host, clock);
-    // Ctrl+C closes the Sandbox even with --keep-open.
     if cfg.keep_open && !host.interrupted() {
+        guard.armed = false;
         println!("--keep-open: the Sandbox stays open; close its window when you are done.");
-    } else if let Err(e) = launcher.stop(&handle) {
-        eprintln!(
-            "warning: couldn't close the Sandbox or its window ({e}); close the Windows Sandbox \
-             window yourself."
-        );
     }
+    drop(guard);
     outcome
+}
+
+/// Stops the Sandbox it holds when dropped, unless disarmed.
+struct StopOnDrop<'a> {
+    launcher: &'a dyn SandboxLauncher,
+    handle: SandboxHandle,
+    armed: bool,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(e) = self.launcher.stop(&self.handle)
+        {
+            eprintln!(
+                "warning: couldn't close the Sandbox or its window ({e}); close the Windows \
+                 Sandbox window yourself."
+            );
+        }
+    }
 }
 
 /// The bundle in `build\sandbox\in`, and the folders the `.wsb` maps.
@@ -957,6 +989,8 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
              from a terminal that isn't elevated (not \"Run as administrator\").",
         );
     }
+    // One host run at a time: a second one's sweep would remove the first one's live keys.
+    let _lock = HostLock::take(&l.root.join("host").join("host-run.lock"), host)?;
     // What a killed earlier run left behind.
     let swept = host.sweep_desktop_leftovers().or_else(|e| {
         fail(format!(
@@ -1001,14 +1035,22 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
         "{count} host test(s). The hands-off pop-up warns you {} s ahead.",
         HANDS_OFF_WARNING.as_secs()
     );
+    let cap = Duration::from_secs(count * HOST_WORST_SECS_PER_TEST + HOST_CAP_OVERHEAD_SECS);
     let popup = host
-        .show_hands_off(HANDS_OFF_WHAT, HANDS_OFF_WARNING, estimate)
+        .show_hands_off(HANDS_OFF_WHAT, HANDS_OFF_WARNING, estimate, cap)
         .or_else(|e| {
             fail(format!(
                 "the hands-off pop-up didn't show, so nothing ran: {e}"
             ))
         })?;
     clock.sleep(HANDS_OFF_WARNING);
+    // The tests start only while the pop-up is on screen.
+    if let Err(e) = popup.check() {
+        popup.done();
+        return fail(format!(
+            "the hands-off pop-up closed ({e}), so nothing ran."
+        ));
+    }
     let mut run = host_nextest(&l.repo, "run");
     // Ctrl+C during the warning: nothing runs, but the cleanup below still does.
     run.env.push(("LIL_DESKTOP_HOST".into(), "1".into()));
@@ -1021,6 +1063,13 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
         host.run(&run)
     };
     let mut summary = Summary::default();
+    if ran.is_ok()
+        && let Err(e) = popup.check()
+    {
+        summary
+            .problems
+            .push(format!("the hands-off pop-up closed during the run ({e})"));
+    }
     match host.desktop_leftovers() {
         Ok(left) if left.is_empty() => {}
         Ok(left) => {
@@ -1062,6 +1111,9 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
             passed: !c.failed,
         })
         .collect();
+    if summary.tests.is_empty() {
+        return fail("no host test ran: every case in the JUnit file was skipped.");
+    }
     let kept = l.results.join("host");
     reset_dir(&kept)?;
     copy(&junit, &kept.join("junit.xml"))?;
@@ -1072,6 +1124,53 @@ fn run_host(l: &Layout, host: &dyn HostOps, clock: &dyn Clock) -> Result<Summary
             .push(format!("cargo nextest exited {code}"));
     }
     Ok(summary)
+}
+
+/// The host run's lock file, holding the owner's pid; removed when dropped.
+struct HostLock(PathBuf);
+
+impl HostLock {
+    /// Takes the lock at `path`. A lock whose owner no longer runs is stale and is taken over;
+    /// a live owner's refuses (exit 2).
+    fn take(path: &Path, host: &dyn HostOps) -> Result<HostLock, RunError> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .or_else(|e| fail(format!("couldn't create {}: {e}", dir.display())))?;
+        }
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(HostLock(path.to_path_buf()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let owner = std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|t| t.trim().parse::<u32>().ok());
+                    if let Some(pid) = owner.filter(|p| host.process_alive(*p)) {
+                        return fail(format!(
+                            "another host run is in progress (process {pid}); let it finish, \
+                             then run this again."
+                        ));
+                    }
+                    let _ = std::fs::remove_file(path);
+                }
+                Err(e) => return fail(format!("couldn't take {}: {e}", path.display())),
+            }
+        }
+        fail(format!("couldn't take {}", path.display()))
+    }
+}
+
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// One line per test, the problems, then the counts.
@@ -1289,10 +1388,20 @@ impl SandboxLauncher for RealLauncher {
                     )));
                 };
                 // The logon command needs a user session: connect opens the Sandbox's window.
-                let connect = self.sys.spawn(
+                let connect = match self.sys.spawn(
                     &cli,
                     &["connect".to_string(), "--id".to_string(), id.clone()],
-                )?;
+                ) {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        // The VM is up, but without a user session its logon command never
+                        // runs, so it would never shut itself down.
+                        let _ = self
+                            .sys
+                            .output(&cli, &["stop".to_string(), "--id".to_string(), id.clone()]);
+                        return Err(e);
+                    }
+                };
                 Ok(SandboxHandle {
                     via: Availability::Cli,
                     id: Some(id),
@@ -1557,11 +1666,25 @@ fn encoded_command(script: &str) -> String {
 
 struct RealHandsOff {
     state: PathBuf,
+    error: PathBuf,
+    child: std::sync::Mutex<std::process::Child>,
 }
 
 impl HandsOff for RealHandsOff {
     fn done(&self) {
         let _ = std::fs::write(&self.state, "done");
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if let Ok(e) = std::fs::read_to_string(&self.error) {
+            return Err(format!("hands-off.ps1 failed: {}", e.trim()));
+        }
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        match child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => Err(format!("it exited ({status})")),
+            Err(e) => Err(format!("it can't be checked: {e}")),
+        }
     }
 }
 
@@ -1693,6 +1816,7 @@ impl HostOps for RealHost {
         what: &str,
         warning: Duration,
         run: Duration,
+        cap: Duration,
     ) -> io::Result<Box<dyn HandsOff>> {
         let dir = self.layout.root.join("host");
         std::fs::create_dir_all(&dir)?;
@@ -1721,6 +1845,8 @@ impl HostOps for RealHost {
             warning.as_secs().to_string(),
             "-RunSec".to_string(),
             run.as_secs().to_string(),
+            "-CapSec".to_string(),
+            cap.as_secs().to_string(),
             "-StateFile".to_string(),
             state.display().to_string(),
             "-ParentPid".to_string(),
@@ -1728,7 +1854,7 @@ impl HostOps for RealHost {
         ])
         .collect();
         // No console window (CREATE_NO_WINDOW); the form itself never takes the focus.
-        {
+        let child = {
             use std::os::windows::process::CommandExt as _;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             Command::new(windows_powershell())
@@ -1737,9 +1863,13 @@ impl HostOps for RealHost {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW)
-                .spawn()?;
-        }
-        let popup = RealHandsOff { state };
+                .spawn()?
+        };
+        let popup = RealHandsOff {
+            state,
+            error: error.clone(),
+            child: std::sync::Mutex::new(child),
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         while !shown.is_file() {
             if let Ok(e) = std::fs::read_to_string(&error) {
@@ -1774,6 +1904,10 @@ impl HostOps for RealHost {
         lil_platform::interrupt::interrupted()
     }
 
+    fn process_alive(&self, pid: u32) -> bool {
+        lil_platform::process::open(pid).is_ok_and(|h| matches!(h.exit_code(), Ok(None)))
+    }
+
     fn qt_dir(&self) -> Option<PathBuf> {
         std::env::var_os("LIL_QT_DIR")
             .filter(|v| !v.is_empty())
@@ -1798,6 +1932,8 @@ mod tests {
     struct FakeClock {
         now: Cell<Duration>,
         log: Log,
+        /// The wait panics (a bug in the run) at its first sleep.
+        panics: Cell<bool>,
     }
 
     impl Clock for FakeClock {
@@ -1805,6 +1941,7 @@ mod tests {
             self.now.get()
         }
         fn sleep(&self, d: Duration) {
+            assert!(!self.panics.get(), "a bug in the wait");
             self.now.set(self.now.get() + d);
             self.log.borrow_mut().push(format!("sleep {}", d.as_secs()));
         }
@@ -1837,7 +1974,14 @@ mod tests {
         refuse: Vec<PathBuf>,
         elevated: bool,
         leftovers: RefCell<Vec<String>>,
-        popups: RefCell<Vec<(Duration, Duration)>>,
+        popups: RefCell<Vec<(Duration, Duration, Duration)>>,
+        /// The pop-up has gone away.
+        popup_closed: Rc<Cell<bool>>,
+        /// Processes that run (the host-run lock's owner).
+        alive_pids: Vec<u32>,
+        /// What the host's `cargo nextest run` exits with, and whether it writes the JUnit file.
+        host_exit: i32,
+        host_writes_junit: bool,
         ctest_json: String,
         qt: Option<PathBuf>,
         host_junit: String,
@@ -1849,11 +1993,19 @@ mod tests {
 
     struct FakePopup {
         log: Log,
+        closed: Rc<Cell<bool>>,
     }
 
     impl HandsOff for FakePopup {
         fn done(&self) {
             self.log.borrow_mut().push("popup done".to_string());
+        }
+        fn check(&self) -> Result<(), String> {
+            if self.closed.get() {
+                Err("it exited".to_string())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1881,9 +2033,12 @@ mod tests {
                         self.leftovers.borrow_mut().push(left.clone());
                         return Ok(1);
                     }
-                    let dir = self.repo.join(r"target\nextest\desktop");
-                    std::fs::create_dir_all(&dir).unwrap();
-                    std::fs::write(dir.join("junit.xml"), &self.host_junit).unwrap();
+                    if self.host_writes_junit {
+                        let dir = self.repo.join(r"target\nextest\desktop");
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("junit.xml"), &self.host_junit).unwrap();
+                    }
+                    return Ok(self.host_exit);
                 }
                 _ => {}
             }
@@ -1927,12 +2082,18 @@ mod tests {
             _what: &str,
             warning: Duration,
             run: Duration,
+            cap: Duration,
         ) -> io::Result<Box<dyn HandsOff>> {
             self.log.borrow_mut().push("popup".to_string());
-            self.popups.borrow_mut().push((warning, run));
+            self.popups.borrow_mut().push((warning, run, cap));
             Ok(Box::new(FakePopup {
                 log: self.log.clone(),
+                closed: self.popup_closed.clone(),
             }))
+        }
+
+        fn process_alive(&self, pid: u32) -> bool {
+            self.alive_pids.contains(&pid)
         }
 
         fn desktop_leftovers(&self) -> io::Result<Vec<String>> {
@@ -2069,10 +2230,15 @@ mod tests {
                     host_junit: junit(&[(HOST_SET[0], true), (HOST_SET[1], true)]),
                     interrupt: Rc::default(),
                     run_interrupted_leaving: None,
+                    popup_closed: Rc::default(),
+                    alive_pids: Vec::new(),
+                    host_exit: 0,
+                    host_writes_junit: true,
                 },
                 clock: FakeClock {
                     now: Cell::new(Duration::ZERO),
                     log: log.clone(),
+                    panics: Cell::new(false),
                 },
                 repo,
                 log,
@@ -2711,6 +2877,8 @@ mod tests {
         closes: bool,
         /// Sleeps until the VM shuts itself down (`None`: never).
         self_stop_after: Cell<Option<u32>>,
+        /// `spawn` (`wsb connect`) fails.
+        spawn_fails: bool,
         calls: RefCell<Vec<String>>,
     }
 
@@ -2782,6 +2950,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("spawn {} {}", program.display(), args.join(" ")));
+            if self.spawn_fails {
+                return Err(io::Error::other("no session"));
+            }
             self.alive.borrow_mut().insert(CONNECT_PID);
             Ok(CONNECT_PID)
         }
@@ -3028,9 +3199,11 @@ mod tests {
             .map(|s| s.parse::<u64>().unwrap())
             .sum();
         assert!(warned >= 10, "{log:?}");
-        let (warning, countdown) = fx.host.popups.borrow()[0];
+        let (warning, countdown, cap) = fx.host.popups.borrow()[0];
         assert!(warning >= Duration::from_secs(10));
         assert!(countdown > Duration::ZERO);
+        // The pop-up outlasts the worst case: each of the 2 tests running until nextest ends it.
+        assert!(cap >= Duration::from_secs(2 * 300), "{cap:?}");
         // Then the cleanup check, then "done".
         assert!(ran < at("check leftovers") && at("check leftovers") < at("popup done"));
         let run = fx.cmd("cargo", "run");
@@ -3109,8 +3282,12 @@ mod tests {
                 what: &str,
                 warning: Duration,
                 run: Duration,
+                cap: Duration,
             ) -> io::Result<Box<dyn HandsOff>> {
-                self.0.show_hands_off(what, warning, run)
+                self.0.show_hands_off(what, warning, run, cap)
+            }
+            fn process_alive(&self, pid: u32) -> bool {
+                self.0.process_alive(pid)
             }
             fn desktop_leftovers(&self) -> io::Result<Vec<String>> {
                 self.0.desktop_leftovers()
@@ -3189,6 +3366,137 @@ mod tests {
             "{log:?}"
         );
         assert!(fx.host.leftovers.borrow().is_empty(), "swept");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Fail-closed paths (review M2, M3, M5, M6, M7).
+    // -----------------------------------------------------------------------------------------
+
+    #[test] // spec: QA-042
+    fn a_sandbox_run_without_junit_or_with_an_error_never_passes() {
+        // exit 0, but no JUnit file came back: couldn't run.
+        let fx = Fx::new();
+        let launcher = fx.launcher(Box::new(|out: &Path| {
+            std::fs::write(out.join("started.json"), "{}").unwrap();
+            std::fs::write(out.join("done.json"), r#"{"exit":0,"tests":0}"#).unwrap();
+        }));
+        let result = fx.run(&cfg(Suite::Desktop), &launcher);
+        assert_eq!(exit_code(&result), 2, "{result:?}");
+        assert_eq!(launcher.stops.get(), 1);
+        // Every test passed, but run-inside.ps1 reported an error: fails.
+        let fx = Fx::new();
+        let launcher = fx.launcher(Box::new(|out: &Path| {
+            finishes()(out);
+            std::fs::write(
+                out.join("done.json"),
+                r#"{"exit":0,"error":"Copy-Item failed"}"#,
+            )
+            .unwrap();
+        }));
+        let s = fx.run(&cfg(Suite::Desktop), &launcher).unwrap();
+        assert_eq!(s.exit_code(), 1);
+        assert_eq!(s.problems, ["run-inside.ps1 failed: Copy-Item failed"]);
+        // No exit code at all (a crash before nextest returned): fails.
+        let fx = Fx::new();
+        let launcher = fx.launcher(Box::new(|out: &Path| {
+            finishes()(out);
+            std::fs::write(out.join("done.json"), r#"{"exit":null}"#).unwrap();
+        }));
+        assert_eq!(
+            fx.run(&cfg(Suite::Desktop), &launcher).unwrap().exit_code(),
+            1
+        );
+    }
+
+    #[test] // spec: QA-042
+    fn a_panic_in_the_wait_still_closes_the_sandbox() {
+        let fx = Fx::new();
+        fx.clock.panics.set(true);
+        let launcher = fx.launcher(Box::new(|_: &Path| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fx.run(&cfg(Suite::Desktop), &launcher)
+        }));
+        assert!(caught.is_err(), "the fake clock panics");
+        assert_eq!(launcher.stops.get(), 1, "the guard stopped the Sandbox");
+    }
+
+    #[test] // spec: QA-042
+    fn a_failed_connect_stops_the_started_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsb = wsb_file(dir.path());
+        let sys = Rc::new(FakeSys {
+            spawn_fails: true,
+            ..FakeSys::store()
+        });
+        let launcher = RealLauncher::with_sys(Box::new(sys.clone()));
+        assert!(launcher.start(&wsb).is_err());
+        let calls = sys.calls();
+        assert!(
+            calls.contains(&format!(r"output C:\apps\wsb.exe stop --id {ID}")),
+            "{calls:?}"
+        );
+        assert!(!launcher.running(), "nothing is left running");
+    }
+
+    #[test] // spec: QA-042
+    fn a_host_run_without_junit_or_with_only_skipped_cases_exits_2() {
+        for exit in [0, 1] {
+            let mut fx = Fx::new();
+            fx.host.host_writes_junit = false;
+            fx.host.host_exit = exit;
+            let result = fx.run(&cfg(Suite::Host), &fx.launcher(finishes()));
+            assert_eq!(exit_code(&result), 2, "exit {exit}: {result:?}");
+            assert!(result.unwrap_err().0.contains("no JUnit file"));
+            // The cleanup ran all the same.
+            let log = fx.log.borrow();
+            assert!(log.contains(&"check leftovers".to_string()), "{log:?}");
+            assert_eq!(log.last().unwrap(), "popup done");
+        }
+        let mut fx = Fx::new();
+        fx.host.host_junit = r#"<testsuites><testsuite name="s"><testcase name="desktop_x" classname="c"><skipped/></testcase></testsuite></testsuites>"#.into();
+        let result = fx.run(&cfg(Suite::Host), &fx.launcher(finishes()));
+        assert_eq!(exit_code(&result), 2, "{result:?}");
+        assert!(result.unwrap_err().0.contains("no host test ran"));
+    }
+
+    #[test] // spec: QA-042
+    fn a_closed_pop_up_stops_the_host_run_before_the_tests() {
+        let fx = Fx::new();
+        fx.host.popup_closed.set(true);
+        let result = fx.run(&cfg(Suite::Host), &fx.launcher(finishes()));
+        assert_eq!(exit_code(&result), 2);
+        assert!(result.unwrap_err().0.contains("pop-up closed"));
+        let log = fx.log.borrow();
+        assert!(
+            !log.iter().any(|e| e.starts_with("run cargo nextest run")),
+            "no test ran without the pop-up: {log:?}"
+        );
+        assert_eq!(log.last().unwrap(), "popup done");
+    }
+
+    #[test] // spec: QA-042
+    fn one_host_run_at_a_time() {
+        let mut fx = Fx::new();
+        let lock = fx.layout().root.join(r"host\host-run.lock");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        // A live run holds the lock: refused before anything is swept.
+        std::fs::write(&lock, "4242").unwrap();
+        fx.host.alive_pids = vec![4242];
+        let result = fx.run(&cfg(Suite::Host), &fx.launcher(finishes()));
+        assert_eq!(exit_code(&result), 2);
+        assert!(
+            result
+                .unwrap_err()
+                .0
+                .contains("another host run is in progress")
+        );
+        assert!(fx.log.borrow().is_empty(), "{:?}", fx.log.borrow());
+        assert!(lock.is_file(), "the live run's lock is left alone");
+        // A dead owner's lock is stale: taken over, and gone after the run.
+        fx.host.alive_pids.clear();
+        let summary = fx.run(&cfg(Suite::Host), &fx.launcher(finishes())).unwrap();
+        assert_eq!(summary.exit_code(), 0);
+        assert!(!lock.exists());
     }
 
     #[test] // spec: QA-042

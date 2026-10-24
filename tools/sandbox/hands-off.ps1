@@ -15,13 +15,16 @@ seconds after that. It never takes the focus (WS_EX_NOACTIVATE and ShowWithoutAc
 topmost with SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE |
 SWP_SHOWWINDOW), not with the form's TopMost property, whose show path focuses the form), and it
 is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT). It closes when -ParentPid has gone, and at
-the latest 15 minutes after the countdown's end, removing its state files whichever way it
+the latest -CapSec seconds after the countdown's start (the runner's worst case), removing its state files whichever way it
 closes. It changes nothing else.
 #>
 param(
     [string]$What = 'runs the desktop tests',
     [int]$WarnSec = 10,
     [int]$RunSec = 60,
+    # The latest it closes, counted from the countdown's start: the runner sizes it to the
+    # worst-case run (every test running until nextest ends it).
+    [int]$CapSec = 1200,
     [string]$StateFile = '',
     [int]$ParentPid = 0
 )
@@ -102,7 +105,7 @@ $timer.Add_Tick({
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     if ($null -eq $script:shownAt) { return }
     $startAt = $script:shownAt + $WarnSec * 1000
-    $capMs = $startAt + ($RunSec + 900) * 1000
+    $capMs = $startAt + [math]::Max($CapSec, $RunSec) * 1000
     if (($null -ne $parent -and $parent.HasExited) -or $nowMs -gt $capMs) {
         Remove-StateFiles
         $form.Close(); return

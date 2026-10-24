@@ -623,13 +623,16 @@ pub fn lilref_dir(&self) -> PathBuf;                  // local_dir\cache\lilref
 pub enum Fullscreen { No, D3d, Busy, Presentation, Unknown }
 pub struct Toast { pub tag: String, pub group: String, pub xml: String, pub silent: bool }
 // no ToastProgress, UpdateResult or Desktop::update: no progress toasts in this plan (P4a-R36)
-pub enum ToastsState { Ready, Unavailable(&'static str /* disabled_for_app | disabled_for_user | disabled_by_policy | elevated | no_platform */) }
+pub enum ToastsState { Ready, NotYetShown, Unavailable(&'static str /* disabled_for_app | disabled_for_user | disabled_by_policy | elevated | no_platform */) }   // NotYetShown: Setting() answers ERROR_NOT_FOUND, the AUMID never showed a toast (plan 4a ruling 2026-10-24, Appendix G "Ready")
+impl ToastsState { pub fn can_post(self) -> bool; }   // Ready or NotYetShown: the posting rule and Reachable gate on can_post() together with shortcut: ok
+pub const NOT_SHOWN_GRACE: Duration;                  // 5 s
+pub fn toasts_state_after_post(state: ToastsState, since_first_ok_post: Option<Duration>) -> ToastsState;   // NotYetShown NOT_SHOWN_GRACE after an Ok post → Unavailable("no_platform")
 pub enum ShortcutState { Ok, Missing, WrongTarget, WrongAumid, WrongClsid }   // WrongClsid: the CLSID or its registration is missing or differs (P4a-R37)
 pub enum HandlerState { Ok, Missing, OtherChannel(PathBuf) }
 pub trait Desktop: Send + Sync {
     fn fullscreen(&self) -> Fullscreen;
     fn foreground_pid(&self) -> Option<u32>;
-    fn toasts_state(&self) -> ToastsState;    // Ready only when Setting() == Enabled and not elevated
+    fn toasts_state(&self) -> ToastsState;    // Ready only when Setting() == Enabled and not elevated; NotYetShown before the AUMID's first toast, ending as no_platform 5 s after an Ok post that never showed
     fn post(&self, t: &Toast) -> Result<(), String>;
     fn remove(&self, tag: &str, group: &str);
     fn set_power_request(&self, held: bool) -> std::io::Result<()>;

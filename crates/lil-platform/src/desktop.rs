@@ -36,8 +36,8 @@ use crate::env::Env;
 use crate::power::PowerRequest;
 
 pub use crate::classes::{
-    TEST_MARKER, leftover_registrations, register_handlers, remove_test_registry,
-    unregister_handlers,
+    TEST_MARKER, leftover_registrations, register_handlers, remove_notification_settings,
+    remove_test_registry, unregister_handlers,
 };
 pub use crate::power::POWER_REASON;
 pub use crate::shortcut::{
@@ -59,8 +59,8 @@ pub const DESKTOP_TEST_ID_PREFIX: &str = "desktop-";
 
 /// The desktop-group test channel id (`desktop-<16 hex>`, lowercase) that `name` belongs to,
 /// when it is one of the names a desktop test writes ([`DESKTOP_TEST_ID_PREFIX`]): the scheme
-/// key `lil-test-desktop-<hex>`, the registry root `LILITH-test-desktop-<hex>` or the shortcut
-/// `LILITH (Test-desktop-<hex>).lnk`. Compared ASCII case-insensitively; anything else, the
+/// key `lil-test-desktop-<hex>`, the registry root `LILITH-test-desktop-<hex>`, the shortcut
+/// `LILITH (Test-desktop-<hex>).lnk` or the AUMID `LILITH.Suite.Test-desktop-<hex>`. Compared ASCII case-insensitively; anything else, the
 /// stable and dev names among it, is `None`.
 pub fn desktop_test_id_in(name: &str) -> Option<String> {
     let app = crate::names::APP_NAME;
@@ -73,6 +73,11 @@ pub fn desktop_test_id_in(name: &str) -> Option<String> {
         (
             format!("{app} (Test-{DESKTOP_TEST_ID_PREFIX}"),
             ").lnk".to_string(),
+        ),
+        // The AUMID: its registration and Windows' notification settings entry.
+        (
+            format!("{app}.Suite.Test-{DESKTOP_TEST_ID_PREFIX}"),
+            String::new(),
         ),
     ];
     let lower = name.to_ascii_lowercase();
@@ -93,8 +98,9 @@ fn is_desktop_test_id(id: &str) -> bool {
 }
 
 /// The ids of the desktop-group test channels that left something on this PC (read-only):
-/// by name, a scheme key under `HKCU\Software\Classes`, a registry root under `HKCU\Software`
-/// or a shortcut in `programs`; and by [`TEST_MARKER`], any marked key directly below
+/// by name, a scheme key under `HKCU\Software\Classes`, a registry root under `HKCU\Software`,
+/// an AUMID under `HKCU\Software\Classes\AppUserModelId` or under Windows' notification
+/// settings (`…\CurrentVersion\Notifications\Settings`), or a shortcut in `programs`; and by [`TEST_MARKER`], any marked key directly below
 /// `HKCU\Software\Classes`, its `CLSID` or its `AppUserModelId`, so an orphaned CLSID or AUMID
 /// key whose other names are gone is found too. What a killed host run can leave behind, for
 /// [`sweep_desktop_tests`] (P4a-R39). Sorted, without repeats.
@@ -102,6 +108,8 @@ pub fn desktop_test_ids_left(programs: &Path) -> std::io::Result<Vec<String>> {
     use crate::classes::{marked_ids, subkey_names};
     let mut names = subkey_names(r"Software\Classes")?;
     names.extend(subkey_names("Software")?);
+    names.extend(subkey_names(r"Software\Classes\AppUserModelId")?);
+    names.extend(subkey_names(crate::classes::NOTIFICATION_SETTINGS)?);
     match std::fs::read_dir(programs) {
         Ok(entries) => {
             for entry in entries {
@@ -189,6 +197,7 @@ pub fn sweep_desktop_tests(programs: &Path) -> std::io::Result<DesktopSweep> {
         remove_shortcut(&env)?;
         unregister_handlers(&env)?;
         remove_test_registry(&env)?;
+        remove_notification_settings(&env)?;
         // A History Windows never had for this AUMID can't be cleared: nothing to clear.
         let _ = clear_toast_history(&env);
         let after = leftovers_of(&env)?;
@@ -225,7 +234,9 @@ pub struct Toast {
 /// `toasts_reason`: `disabled_for_app`, `disabled_for_user`, `disabled_by_policy`, `elevated`
 /// or `no_platform`. `NotYetShown` (plan 4a ruling 2026-10-24): this AUMID has never shown a
 /// toast, so Windows has no notification settings for it yet; posting is allowed, and the
-/// post's result, or the next reading once it showed, decides.
+/// post's result, or the next reading once it showed, decides. It ends as
+/// `Unavailable("no_platform")` when it lasts [`NOT_SHOWN_GRACE`] after a post that returned
+/// `Ok` ([`toasts_state_after_post`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastsState {
     Ready,
@@ -322,18 +333,41 @@ pub fn toasts_state_for(setting: Option<NotifierSetting>, elevated: bool) -> Toa
     }
 }
 
+/// How long `Setting()` may still answer `ERROR_NOT_FOUND` after a post that returned `Ok`
+/// (plan 4a ruling 2026-10-24; Task 30's host run saw `Enabled` about 7 ms after the post).
+pub const NOT_SHOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The end of [`ToastsState::NotYetShown`] (Appendix G "Ready"): `state` as read, unless it is
+/// still `NotYetShown` at least [`NOT_SHOWN_GRACE`] after this process's first post that
+/// returned `Ok` (`since_first_ok_post`). Then the toast didn't show and Windows never created
+/// the AUMID's settings, so toasts can't reach you: `Unavailable("no_platform")`.
+pub fn toasts_state_after_post(
+    state: ToastsState,
+    since_first_ok_post: Option<std::time::Duration>,
+) -> ToastsState {
+    match (state, since_first_ok_post) {
+        (ToastsState::NotYetShown, Some(since)) if since >= NOT_SHOWN_GRACE => {
+            ToastsState::Unavailable("no_platform")
+        }
+        _ => state,
+    }
+}
+
 /// The real desktop for `env`'s channel: toasts through
 /// `CreateToastNotifierWithId(env.notification_aumid())`.
 pub fn real_desktop(env: &Env) -> Arc<dyn Desktop> {
     Arc::new(RealDesktop {
         aumid: env.notification_aumid(),
         power: PowerRequest::default(),
+        first_ok_post: std::sync::Mutex::new(None),
     })
 }
 
 struct RealDesktop {
     aumid: String,
     power: PowerRequest,
+    /// When this process's first post that returned `Ok` was made ([`NOT_SHOWN_GRACE`]).
+    first_ok_post: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Desktop for RealDesktop {
@@ -362,14 +396,27 @@ impl Desktop for RealDesktop {
     }
 
     fn toasts_state(&self) -> ToastsState {
-        toasts_state_for(
-            crate::toast::setting(&self.aumid),
-            crate::toast::is_elevated(),
+        let since = self
+            .first_ok_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|at| at.elapsed());
+        toasts_state_after_post(
+            toasts_state_for(
+                crate::toast::setting(&self.aumid),
+                crate::toast::is_elevated(),
+            ),
+            since,
         )
     }
 
     fn post(&self, t: &Toast) -> Result<(), String> {
-        crate::toast::post(&self.aumid, t)
+        crate::toast::post(&self.aumid, t)?;
+        self.first_ok_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(std::time::Instant::now);
+        Ok(())
     }
 
     fn remove(&self, tag: &str, group: &str) {
