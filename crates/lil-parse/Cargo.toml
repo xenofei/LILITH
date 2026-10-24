@@ -6,9 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Qt-free and platform-neutral (ARCH-110, ARCH-111). Task 4 fills the bodies and may depend on
-# `lil-schema`, `base64`, `serde_json` and `sha2` only (`proptest` for tests).
+# Qt-free and platform-neutral (ARCH-110, ARCH-111): it may depend on `lil-schema`, `base64`,
+# `serde_json` and `sha2` only (`proptest` for tests).
 [dependencies]
+lil-schema = { path = "../lil-schema" }
+base64.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

@@ -6,13 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 4
-    # APP-020, QA-050
-    { name = "lil-spec-tests::lil_url::every_form_round_trips", rule = "APP-020", file = "tests/lil_url.rs" },
-    # APP-020, QA-050
-    { name = "lil-spec-tests::lil_url::refuses_everything_else", rule = "APP-020", file = "tests/lil_url.rs" },
-    # APP-020, QA-050
-    { name = "lil-spec-tests::lil_url::raw_refs_are_percent_decoded_once", rule = "APP-020", file = "tests/lil_url.rs" },
     # Task 6
     # CORE-160
     { name = "lil-spec-tests::jobs_queue_4a::job_move_next_and_last_stay_within_the_class", rule = "CORE-160", file = "tests/jobs_queue_4a.rs" },
