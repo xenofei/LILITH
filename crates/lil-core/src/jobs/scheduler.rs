@@ -34,10 +34,13 @@
 //!   waits (`waiting`, [`Admit::Wait`]) until the engine's poll sees none
 //!   ([`EngineControl::outside_busy`], ARCH-069, CORE-123); the engine kicks the jobs after
 //!   each poll.
-//! - **The watchdog** ([`watchdog_slow`]): a job running more than 3× its expected time since
-//!   `execution_start` is flagged `watchdog: "slow"` and never cancelled. The runner keeps the
-//!   time its attempt became `executing` (for a ComfyUI job, the engine's `execution_start`)
-//!   and checks on every [`Jobs::kick`].
+//! - **The watchdog** ([`watchdog_limit`]): a job running past its bound since
+//!   `execution_start` is flagged `watchdog: "slow"` and never cancelled. The bound is
+//!   `max(3 × p50, 2 × p90)` of the measured `wall_s` of the estimate it took at submission,
+//!   else 3× its expected time (ARCH-072, Appendix G); a history that measured no time (0 s)
+//!   counts as none. The runner keeps the time its attempt became `executing` (for a ComfyUI
+//!   job, the engine's `execution_start`) and checks on every [`Jobs::kick`]; the bound only
+//!   decides how far that clock may run, never when it starts.
 //!
 //! [`Jobs::kick`]: super::Jobs::kick
 
@@ -46,6 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use lil_protocol::estimate::WallPart;
 
 use super::{Admission, Admit, EngineKind, JobSpec, Lane};
 use crate::telemetry::{Telemetry, VramView};
@@ -84,12 +88,35 @@ pub fn free_vram_mib(v: &VramView, engine_pids: &[u32]) -> u64 {
         .saturating_sub(VRAM_MARGIN_MIB)
 }
 
-/// Whether a job expected to take `expected_secs` is slow after `since_execution_start`: more
-/// than 3× (ARCH-072). A job with no expected time (0) is never slow.
+/// The time since `execution_start` past which a job is slow (ARCH-072, Appendix G):
+/// `max(3 × p50, 2 × p90)` of its measured `wall`, else 3× `expected_secs`. A history bound of
+/// 0 (no time measured) counts as no history; `None`: no bound (no history and no expected
+/// time), never slow.
+pub fn watchdog_limit(expected_secs: u32, wall: Option<&WallPart>) -> Option<Duration> {
+    let ms = |text: &str| {
+        lil_schema::Money::parse_decimal(text)
+            .ok()
+            .and_then(|m| u64::try_from(m.micros() / 1000).ok())
+    };
+    let history = wall
+        .and_then(|w| Some((ms(&w.p50)?, ms(&w.p90)?)))
+        .map(|(p50, p90)| {
+            p50.saturating_mul(WATCHDOG_FACTOR)
+                .max(p90.saturating_mul(2))
+        })
+        .filter(|bound| *bound > 0)
+        .map(Duration::from_millis);
+    history.or_else(|| {
+        (expected_secs > 0)
+            .then(|| Duration::from_secs(u64::from(expected_secs).saturating_mul(WATCHDOG_FACTOR)))
+    })
+}
+
+/// Whether a job expected to take `expected_secs`, with no history, is slow after
+/// `since_execution_start`: more than 3× (ARCH-072). A job with no expected time (0) is never
+/// slow.
 pub fn watchdog_slow(expected_secs: u32, since_execution_start: Duration) -> bool {
-    expected_secs > 0
-        && since_execution_start
-            > Duration::from_secs(u64::from(expected_secs).saturating_mul(WATCHDOG_FACTOR))
+    watchdog_limit(expected_secs, None).is_some_and(|limit| since_execution_start > limit)
 }
 
 /// What the scheduler needs of the engines (Task 11 implements it; `jobs` never uses

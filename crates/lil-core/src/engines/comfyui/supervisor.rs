@@ -642,7 +642,7 @@ impl Comfy {
     fn set_pids(&self, new: Vec<u32>) {
         let mut pids = lock(&self.pids);
         for pid in pids.iter().filter(|p| !new.contains(p)) {
-            self.telemetry.untrack(*pid);
+            self.telemetry.untrack_if(*pid, COMFYUI_ROLE);
         }
         for pid in new.iter().filter(|p| !pids.contains(p)) {
             self.telemetry.track(*pid, COMFYUI_ROLE);

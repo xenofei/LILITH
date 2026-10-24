@@ -27,16 +27,18 @@ use std::time::{Duration, UNIX_EPOCH};
 use lil_platform::{Clock, IdSource};
 use lil_protocol::app::{QueueLane, QueueState};
 use lil_protocol::codes::{self, CodeSpec};
+use lil_protocol::estimate::{Estimate, UnknownReason, WallPart};
 use lil_protocol::{ErrorBody, ErrorCategory, Outcome, RetryPolicy, ToolOutput, args_hash};
 use serde_json::{Value, json};
 use tokio::sync::{OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+use super::estimate::{self, Estimator};
 use super::pause::{PauseReason, RESTART_REASON};
 use super::queue::{self, Candidate};
 use super::record::{self, Change, Inserted, JobRow, LiveView, RunReport};
-use super::scheduler::watchdog_slow;
+use super::scheduler::watchdog_limit;
 use super::{
     Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, CancelSelector, DISK_MARGIN_BYTES, EngineKind,
     ExecWindow, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion,
@@ -163,6 +165,9 @@ struct Info {
     /// The execution windows its attempts reported (`JobCtx::add_window`), shared by every
     /// attempt and its completions.
     windows: Arc<Mutex<Vec<ExecWindow>>>,
+    /// The `wall_s` part of the estimate it took at submission: the watchdog's bound
+    /// (ARCH-072).
+    wall: Option<WallPart>,
 }
 
 /// Where a withdrawal of a job's pending prompt stands (CORE-160).
@@ -319,6 +324,8 @@ pub(crate) struct Shared {
     withdrawers: RwLock<HashMap<EngineKind, Arc<dyn Withdraw>>>,
     /// The stall rule's time (ARCH-072): 30 s, or `LIL_TEST_STALL_SECS` on a test channel.
     stall_after: RwLock<Duration>,
+    /// The estimate a job takes at submission (CORE-161); none: no estimate.
+    estimator: RwLock<Option<Arc<Estimator>>>,
 }
 
 /// The stall rule's time (ARCH-072): a running job that reported nothing this long is shown
@@ -764,6 +771,7 @@ impl Shared {
             started_by: row.started_by.clone(),
             batch: (row.batch_id.clone(), row.batch_index),
             windows: Arc::default(),
+            wall: row.estimate.as_ref().and_then(|e| e.wall_s.clone()),
         };
         if !self.enqueue_held(info, row) {
             return Ok(false);
@@ -822,6 +830,7 @@ impl Shared {
             started_by: row.started_by.clone(),
             batch: (row.batch_id.clone(), row.batch_index),
             windows: Arc::default(),
+            wall: row.estimate.as_ref().and_then(|e| e.wall_s.clone()),
         };
         self.enqueue(info, false, row.order_key)
     }
@@ -887,10 +896,11 @@ impl Shared {
         };
         let (reservation, owner) = (first.reservation.clone(), first.owner.clone());
         let first_hash = args_hash(&json!({"kind": first.spec.kind, "args": first.spec.args}));
+        let estimates = self.estimates(&news).await;
         let keys = self.order_keys(news.len()).await;
         let mut rows = Vec::with_capacity(news.len());
         let mut infos = Vec::with_capacity(news.len());
-        for (i, new) in news.into_iter().enumerate() {
+        for ((i, new), (estimate_key, estimate)) in news.into_iter().enumerate().zip(estimates) {
             let NewJob {
                 spec,
                 trace_id,
@@ -961,6 +971,8 @@ impl Shared {
                 status_seq: Vec::new(),
                 report: RunReport::default(),
                 withdrawn_id,
+                estimate: estimate.clone(),
+                estimate_key,
             });
             infos.push(Info {
                 id: JobId(id),
@@ -974,6 +986,7 @@ impl Shared {
                 started_by,
                 batch: (batch_id, batch_index),
                 windows: Arc::default(),
+                wall: estimate.and_then(|e| e.wall_s),
             });
         }
         // Each job's lock is held from its insert to its first announcement.
@@ -1032,6 +1045,34 @@ impl Shared {
             self.enqueue(info, true, row.order_key);
         }
         Ok(inserted)
+    }
+
+    /// Each new job's estimate key (its handler's, from its arguments) and the estimate it
+    /// takes at submission (CORE-161, P4a-R40), asked once per kind and key; no estimate
+    /// without an estimator.
+    async fn estimates(&self, news: &[NewJob]) -> Vec<(Option<String>, Option<Estimate>)> {
+        let estimator = read(&self.estimator);
+        let mut asked: HashMap<(&str, Option<String>), Estimate> = HashMap::new();
+        let mut out = Vec::with_capacity(news.len());
+        for new in news {
+            let kind = new.spec.kind;
+            let key = self
+                .handler(kind)
+                .and_then(|h| h.estimate_key(&new.spec.args));
+            let estimate = match &estimator {
+                None => None,
+                Some(e) => Some(match asked.get(&(kind, key.clone())) {
+                    Some(known) => known.clone(),
+                    None => {
+                        let fresh = e.estimate(kind, key.as_deref()).await;
+                        asked.insert((kind, key.clone()), fresh.clone());
+                        fresh
+                    }
+                }),
+            };
+            out.push((key, estimate));
+        }
+        out
     }
 
     /// One new job row ([`Shared::submit_many`]).
@@ -1859,7 +1900,12 @@ impl Shared {
                 c
             }
         };
-        self.apply(id, &info.scope, c, None).await;
+        let ended = self.apply(id, &info.scope, c, None).await;
+        if ended.is_some_and(|row| row.status == JobStatus::Succeeded) {
+            for c in read(&self.completions) {
+                c.succeeded(&ctx).await;
+            }
+        }
         self.leave(info);
         if rerun {
             tracing::info!(
@@ -2317,9 +2363,10 @@ impl Shared {
                 .iter_mut()
                 .filter(|(_, a)| a.running && !a.completing && !a.slow)
                 .filter(|(_, a)| {
-                    a.exec_start.is_some_and(|start| {
-                        watchdog_slow(a.info.spec.expected_secs, now.saturating_sub(start))
-                    })
+                    let limit = watchdog_limit(a.info.spec.expected_secs, a.info.wall.as_ref());
+                    a.exec_start
+                        .zip(limit)
+                        .is_some_and(|(start, limit)| now.saturating_sub(start) > limit)
                 })
                 .map(|(id, a)| {
                     a.slow = true;
@@ -2330,7 +2377,7 @@ impl Shared {
         for (id, scope) in slow {
             let shared = self.clone();
             tokio::spawn(async move {
-                tracing::warn!(job_id = %id, "a job runs more than 3 times its expected time; it keeps running");
+                tracing::warn!(job_id = %id, "a job runs past its watchdog bound (3 times its expected time, or its history's); it keeps running");
                 let c = Change {
                     watchdog: Some("slow".to_string()),
                     ..Change::default()
@@ -2635,6 +2682,7 @@ impl Jobs {
             adopted: Mutex::new(HashSet::new()),
             withdrawers: RwLock::new(HashMap::new()),
             stall_after: RwLock::new(STALL_AFTER),
+            estimator: RwLock::new(None),
         });
         events.register_snapshot("job:", Arc::new(JobSnapshots(Arc::downgrade(&shared))));
         Arc::new(Jobs { shared })
@@ -2685,6 +2733,27 @@ impl Jobs {
             .drain
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some(drain);
+    }
+
+    /// Sets the estimator a job takes its estimate from at submission (CORE-161; the core sets
+    /// it over its telemetry). Without one, jobs have no estimate.
+    pub fn set_estimator(&self, e: Arc<Estimator>) {
+        *self
+            .shared
+            .estimator
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(e);
+    }
+
+    /// The estimate of a job of `kind` with estimate key `key` now (`job.estimate`): the
+    /// estimator's; without one, nothing is known (`no_key` without a key, else
+    /// `no_history`).
+    pub async fn estimate(&self, kind: &str, key: Option<&str>) -> Estimate {
+        match read(&self.shared.estimator) {
+            Some(e) => e.estimate(kind, key).await,
+            None if key.is_none() => estimate::unknown(UnknownReason::NoKey),
+            None => estimate::unknown(UnknownReason::NoHistory),
+        }
     }
 
     /// `[jobs] preempt_agent_batches` (CORE-125; default `false`).

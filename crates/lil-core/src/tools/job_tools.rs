@@ -8,6 +8,12 @@
 //! | `job.cancel` | write | exactly one of `{job_id}`, `{ids}` (1–500), `{batch_id}`, `{all_mine: true}` | `{job}` for `job_id`, else `{jobs}`; a finished job as it is |
 //! | `job.retry` | write | exactly one of `{job_id}`, `{batch_id}` | `{job, retry_of}`, or `{retried: [{job, retry_of}], refused: [{job_id, error}]}` |
 //! | `job.move` | write | `{job_id, to: "next" \| "last"}` | `{job}` |
+//! | `job.estimate` | read | `{tool, args?}` (default `{}`) | the `Estimate` of that call (CORE-161) |
+//!
+//! `job.estimate` checks `args` as a call of `tool` would (`tool.unknown` for a tool the
+//! caller can't call, `params.invalid` for arguments it refuses) and estimates the job that
+//! call would submit from its history (Appendix G "Estimates"); a tool with no estimate key
+//! has both parts unknown, `no_key`. It runs nothing.
 //!
 //! Each works in the call's scope: the session's workspace, or the suite without one. They live
 //! in `tools`, not in `jobs`, so that `jobs` depends on no `tools` type (CORE-010): they build
@@ -25,6 +31,7 @@
 use std::time::Duration;
 
 use lil_protocol::app::QueueState;
+use lil_protocol::estimate::Estimate;
 use lil_protocol::{EffectClass, ErrorBody, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -146,11 +153,22 @@ struct JobResultOut {
     job: JobSummary,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EstimateArgs {
+    /// The tool whose call to estimate.
+    tool: String,
+    /// The call's arguments; default `{}`.
+    #[serde(default)]
+    args: serde_json::Map<String, serde_json::Value>,
+}
+
 fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
     ErrorBody::new(&codes::PARAMS_INVALID, message, trace_id)
 }
 
-/// Registers `jobs.list`, `job.wait`, `job.cancel`, `job.retry` and `job.move` on `reg`.
+/// Registers `jobs.list`, `job.wait`, `job.cancel`, `job.retry`, `job.move` and
+/// `job.estimate` on `reg`.
 pub fn register_job_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "jobs.list",
@@ -289,6 +307,49 @@ pub fn register_job_tools(reg: &mut Registry) {
                     .await?;
                 let summary = format!("job {} moved", job.job_id);
                 Ok((JobResultOut { job }, summary))
+            })
+        },
+    ));
+
+    reg.register(typed_tool(
+        "job.estimate",
+        "Estimates a tool call before it runs, from the measured history of similar jobs (the newest 20 that succeeded, at least 3): `local` (p50 and p90 GPU-seconds and watt-hours, and their energy cost when an electricity rate is set) and `wall_s` (p50 and p90 seconds), each with its `source` and `samples`. `unknown` lists the parts it couldn't estimate and why (no_history, no_key, no_price). `args` is checked as the call would check it. Nothing runs.",
+        EffectClass::Read,
+        JOBS_MODULE,
+        |ctx, args: EstimateArgs| {
+            Box::pin(async move {
+                let Some(redispatch) = &ctx.redispatch else {
+                    return Err(ErrorBody::new(
+                        &codes::CORE_BUG,
+                        "job.estimate ran outside the dispatcher. This is a bug in LILITH.",
+                        ctx.trace_id.clone(),
+                    ));
+                };
+                let tool = redispatch
+                    .tool(&args.tool, &ctx.session.caller)
+                    .ok_or_else(|| {
+                        ErrorBody::new(
+                            &codes::TOOL_UNKNOWN,
+                            format!("There is no tool called {:?}.", args.tool),
+                            ctx.trace_id.clone(),
+                        )
+                    })?;
+                let call = serde_json::Value::Object(args.args);
+                tool.validate(&call).map_err(|why| {
+                    params_invalid(
+                        format!("Invalid arguments for {}: {why}", args.tool),
+                        &ctx.trace_id,
+                    )
+                })?;
+                let estimate: Estimate = match tool.estimate_key(&call) {
+                    Some(k) => ctx.jobs.estimate(k.kind, Some(&k.key)).await,
+                    None => ctx.jobs.estimate(&args.tool, None).await,
+                };
+                let summary = match &estimate.wall_s {
+                    Some(w) => format!("{}: about {} s", args.tool, w.p50),
+                    None => format!("{}: no estimate yet", args.tool),
+                };
+                Ok((estimate, summary))
             })
         },
     ));

@@ -32,7 +32,7 @@ pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
 pub use job_tools::{JOB_RETRY, register_job_tools};
 pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
-pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool};
+pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool, with_estimate_key};
 pub use stages::{
     AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
     ConfirmStage, ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks,

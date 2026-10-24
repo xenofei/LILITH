@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use lil_core::events::EventBus;
+use lil_core::jobs::estimate::Estimator;
 use lil_core::jobs::record;
 use lil_core::jobs::scheduler::{
-    EngineControl, GpuScheduler, NoEngines, free_vram_mib, watchdog_slow,
+    EngineControl, GpuScheduler, NoEngines, free_vram_mib, watchdog_limit, watchdog_slow,
 };
 use lil_core::jobs::{
     Admission, Admit, EngineKind, JobCaller, JobCtx, JobDone, JobFailure, JobFuture, JobHandler,
@@ -24,11 +25,13 @@ use lil_core::jobs::{
 };
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
-use lil_core::telemetry::{HwSources, PowerSettings, Telemetry, TickMode, VramView};
+use lil_core::telemetry::{HwSources, JobStatsRow, PowerSettings, Telemetry, TickMode, VramView};
 use lil_core::workspace::WorkspaceHub;
 use lil_platform::fs::SystemProbe;
 use lil_platform::{Clock, IdSource};
+use lil_protocol::estimate::{EstimateSource, WallPart};
 use lil_protocol::{CallerKind, ErrorBody, codes};
+use lil_schema::Currency;
 use lil_testkit::{FakeClock, FakeHwScript, SeqIds, TestEnv};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
@@ -69,6 +72,11 @@ impl Gates {
 impl JobHandler for Gates {
     fn kind(&self) -> &'static str {
         "t.gpu"
+    }
+
+    /// Its `key` argument.
+    fn estimate_key(&self, args: &Value) -> Option<String> {
+        args.get("key").and_then(Value::as_str).map(str::to_string)
     }
 
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
@@ -1260,5 +1268,132 @@ async fn a_job_that_ran_unchecked_stays_marked_after_a_preemption() {
         batch_answers.contains(&Admit::GoUnchecked) && batch_answers.last() == Some(&Admit::Go),
         "{asked:?}"
     );
+    rig.shutdown().await;
+}
+
+/// Whether job `id` was flagged by now: reads the events that arrive for a moment (a short
+/// grace for the watchdog's own task and its row write, never a measurement), then looks for
+/// a `watchdog` event on `job:<id>` among every event read so far and at the row. For what must
+/// not have happened: a flag that came early is still among the events at a later check.
+async fn flagged(rig: &Rig, id: &str) -> bool {
+    let topic = format!("job:{id}");
+    {
+        let mut guard = rig.rx.lock().await;
+        let (rx, seen) = &mut *guard;
+        let until = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(line)) = tokio::time::timeout_at(until, rx.recv()).await {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            seen.push((
+                event["params"]["topic"].as_str().unwrap().to_string(),
+                event["params"]["data"].clone(),
+            ));
+        }
+        if seen
+            .iter()
+            .any(|(t, d)| *t == topic && d["kind"] == "watchdog")
+        {
+            return true;
+        }
+    }
+    row(rig, id).await.watchdog.is_some()
+}
+
+/// The watchdog's bound (ARCH-072, Appendix G): `max(3 × p50, 2 × p90)` of the job's measured
+/// `wall_s` when it has one; else 3 × `expected_secs`. A history of p50 10 s and p90 30 s
+/// flags at 60 s, not at the 30 s its expected time of 10 s would; a job with no history and
+/// an expected 20 s at 60 s too.
+#[tokio::test] // spec: ARCH-072, CORE-161
+async fn watchdog_uses_the_history_bound() {
+    let wall = WallPart {
+        source: EstimateSource::MeasuredHistory,
+        samples: 3,
+        p50: "10.0".into(),
+        p90: "30.0".into(),
+    };
+    assert_eq!(
+        watchdog_limit(10, Some(&wall)),
+        Some(Duration::from_secs(60))
+    );
+    assert_eq!(watchdog_limit(20, None), Some(Duration::from_secs(60)));
+    assert_eq!(
+        watchdog_limit(0, None),
+        None,
+        "no expected time, no history"
+    );
+    let unmeasured = WallPart {
+        p50: "0.0".into(),
+        p90: "0.0".into(),
+        ..wall.clone()
+    };
+    assert_eq!(
+        watchdog_limit(10, Some(&unmeasured)),
+        Some(Duration::from_secs(30)),
+        "a history that measured no time counts as none"
+    );
+
+    let rig = Rig::new(Some(roomy()), Arc::new(NoEngines)).await;
+    rig.jobs.set_estimator(Estimator::new(
+        rig.telemetry.clone(),
+        &PowerSettings::default(),
+        Arc::new(|| Currency::parse("USD").unwrap()),
+    ));
+    for (n, wall_ms) in [10_000, 10_000, 30_000].into_iter().enumerate() {
+        rig.telemetry
+            .put_job_stats(&JobStatsRow {
+                job_id: format!("j_{n:016x}"),
+                kind: "t.gpu".into(),
+                estimate_key: "k".into(),
+                finished_ms: 1_800_000_000_000,
+                wall_ms,
+                gpu_seconds_milli: 0,
+                system_mj: 0,
+            })
+            .await
+            .unwrap();
+    }
+    rig.telemetry.tick(1).await;
+
+    // p50 10 s, p90 30 s: the bound is 60 s.
+    let job = rig
+        .submit(spec(Lane::GpuHeavy, json!({"gate": "known", "key": "k"})))
+        .await;
+    let est = job.estimate.as_ref().expect("an estimate at submission");
+    assert_eq!(est.wall_s, Some(wall.clone()), "{est:?}");
+    rig.subscribe(format!("job:{}", job.job_id)).await;
+    rig.gates.until_started(&job.job_id).await;
+    rig.clock.advance(Duration::from_secs(31));
+    rig.telemetry.tick(1).await;
+    assert!(
+        !flagged(&rig, &job.job_id).await,
+        "3 × expected is not the bound"
+    );
+    rig.clock.advance(Duration::from_secs(29));
+    rig.telemetry.tick(1).await;
+    assert!(!flagged(&rig, &job.job_id).await, "60 s is not past 60 s");
+    rig.clock.advance(Duration::from_secs(1));
+    rig.telemetry.tick(1).await;
+    // Past max(3 × p50, 2 × p90).
+    rig.event(&format!("job:{}", job.job_id), |d| d["kind"] == "watchdog")
+        .await;
+    rig.gates.open("known");
+    assert_eq!(rig.finished(&job.job_id).await["watchdog"], "slow");
+
+    // No history (`unknown` only): 3 × its expected 20 s.
+    let mut fresh = spec(Lane::GpuHeavy, json!({"gate": "fresh", "key": "fresh"}));
+    fresh.expected_secs = 20;
+    let job = rig.submit(fresh).await;
+    let est = job.estimate.as_ref().expect("an estimate at submission");
+    assert!(est.wall_s.is_none(), "{est:?}");
+    rig.subscribe(format!("job:{}", job.job_id)).await;
+    rig.gates.until_started(&job.job_id).await;
+    rig.clock.advance(Duration::from_secs(60));
+    rig.telemetry.tick(1).await;
+    assert!(!flagged(&rig, &job.job_id).await);
+    rig.clock.advance(Duration::from_secs(1));
+    rig.telemetry.tick(1).await;
+    rig.event(&format!("job:{}", job.job_id), |d| d["kind"] == "watchdog")
+        .await;
+    rig.gates.open("fresh");
+    rig.finished(&job.job_id).await;
     rig.shutdown().await;
 }

@@ -6,6 +6,7 @@
 //! entry and the newest 63, Appendix G).
 
 use lil_protocol::ErrorBody;
+use lil_protocol::estimate::Estimate;
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde_json::{Map, Value, json};
 
@@ -106,6 +107,12 @@ pub struct JobRow {
     /// The prompt id a pause withdrew (CORE-160), until its next attempt knows it gone
     /// (CORE-120).
     pub withdrawn_id: Option<String>,
+    /// The estimate taken at submission (CORE-161, P4a-R40): written with the row, never
+    /// changed.
+    pub estimate: Option<Estimate>,
+    /// The handler's estimate key for the job (Appendix G): `meter` writes the job's history
+    /// under it when the job succeeds.
+    pub estimate_key: Option<String>,
 }
 
 /// `b_<the job id's 16 hex>`: the batch of a job that has none (a row from before plan 4a).
@@ -163,6 +170,7 @@ impl JobRow {
             } else {
                 Vec::new()
             },
+            estimate: self.estimate.clone(),
         }
     }
 
@@ -282,7 +290,7 @@ const COLUMNS: &str = "seq, job_id, kind, lane, priority, module, args, project,
     args_hash, expected_secs, expected_output_bytes, vram_need_mib, engine, grp, \
     external_side_effects, reservation, tool, tool_args, external_id, batch_id, batch_index, \
     order_key, origin, status_seq, engine_device, phase, subtasks, indeterminate, \
-    last_progress_ms, cache_hit_nodes, all_cached, withdrawn_id";
+    last_progress_ms, cache_hit_nodes, all_cached, withdrawn_id, estimate, estimate_key";
 
 /// A JSON column, `None` when it is NULL or doesn't parse (logged).
 fn json_col<T: serde::de::DeserializeOwned>(r: &Row<'_>, i: usize) -> rusqlite::Result<Option<T>> {
@@ -385,6 +393,8 @@ fn row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
             all_cached: r.get::<_, i64>(47)? != 0,
         },
         withdrawn_id: r.get(48)?,
+        estimate: json_col(r, 49)?,
+        estimate_key: r.get(50)?,
     })
 }
 
@@ -469,10 +479,10 @@ fn insert_in(tx: &rusqlite::Transaction<'_>, mut r: JobRow) -> rusqlite::Result<
              idem_scope, idem_key, args_hash, expected_secs, expected_output_bytes,
              vram_need_mib, engine, grp, external_side_effects, reservation, tool,
              tool_args, external_id, batch_id, batch_index, origin, status_seq, order_key,
-             withdrawn_id)
+             withdrawn_id, estimate, estimate_key)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-             ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+             ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
         params![
             r.job_id,
             r.kind,
@@ -515,6 +525,8 @@ fn insert_in(tx: &rusqlite::Transaction<'_>, mut r: JobRow) -> rusqlite::Result<
             to_text(&r.status_seq),
             (r.order_key != 0).then_some(r.order_key),
             r.withdrawn_id,
+            r.estimate.as_ref().map(to_text),
+            r.estimate_key,
         ],
     )?;
     tx.execute(
@@ -904,6 +916,8 @@ mod tests {
             status_seq: Vec::new(),
             report: RunReport::default(),
             withdrawn_id: None,
+            estimate: None,
+            estimate_key: None,
         }
     }
 

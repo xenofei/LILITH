@@ -15,7 +15,7 @@
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
-//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
+//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
 //!
@@ -29,7 +29,8 @@
 //! test contract (Global Constraints, "Test-channel tools"): `phases` are set in order once it
 //! executes (`JobCtx::set_phase`), `silent_secs` keeps it executing that long with no progress
 //! (the stall rule's test, ARCH-072), and `batch: n` (1–500) submits `n` such jobs as one
-//! batch (P4a-R13), each of which `job.retry` runs again alone.
+//! batch (P4a-R13), each of which `job.retry` runs again alone. Its estimate key is its
+//! `estimate_key` argument, default `"test"` (Appendix G), for the tool and the handler alike.
 //!
 //! `test.comfy_submit` (a `comfy.prompt` job) lives with the engines (`engines::tools`), which
 //! the server registers on test channels.
@@ -73,10 +74,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use super::registry::{CallCtx, Registry, typed_tool};
+use super::registry::{CallCtx, Registry, typed_tool, with_estimate_key};
 use crate::jobs::{
-    EngineKind, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec, JobSummary, Lane,
-    Priority, Substatus, runner::cancelled_error,
+    EngineKind, EstimateKey, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec,
+    JobSummary, Lane, Priority, Substatus, runner::cancelled_error,
 };
 use crate::state::StateRegistry;
 use crate::store::{CommitOp, Expect, ManifestEdit, OutputMove, StoreError, WsPath, fsops};
@@ -221,6 +222,10 @@ impl JobHandler for TestJobHandler {
         TEST_JOB_KIND
     }
 
+    fn estimate_key(&self, args: &Value) -> Option<String> {
+        Some(test_job_key(args))
+    }
+
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
         Box::pin(self.attempt(job))
     }
@@ -268,10 +273,24 @@ struct TestJobArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 500))]
     batch: Option<u32>,
+    /// The estimate key of its jobs (default `"test"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    estimate_key: Option<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// The estimate key `test.job` calls get without an `estimate_key` (Appendix G).
+const DEFAULT_TEST_KEY: &str = "test";
+
+/// A `test.job` call's (or job's) estimate key: its `estimate_key` argument, else `"test"`.
+fn test_job_key(args: &Value) -> String {
+    args.get("estimate_key")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_TEST_KEY)
+        .to_string()
 }
 
 /// The most jobs one `test.job {batch}` submits.
@@ -950,12 +969,20 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         },
     ));
 
-    reg.register(typed_tool(
-        "test.job",
-        "Test channels only: submits a test.job job in `lane`. `gated` holds it until test.job_release; `fail` makes it fail (transient_2, final or disk_full).",
-        EffectClass::Write,
-        TEST_MODULE,
-        |ctx, args: TestJobArgs| Box::pin(test_job(ctx, args)),
+    reg.register(with_estimate_key(
+        typed_tool(
+            "test.job",
+            "Test channels only: submits a test.job job in `lane`. `gated` holds it until test.job_release; `fail` makes it fail (transient_2, final or disk_full); `estimate_key` (default test) is its jobs' estimate key.",
+            EffectClass::Write,
+            TEST_MODULE,
+            |ctx, args: TestJobArgs| Box::pin(test_job(ctx, args)),
+        ),
+        |args| {
+            Some(EstimateKey {
+                kind: TEST_JOB_KIND,
+                key: test_job_key(args),
+            })
+        },
     ));
 
     reg.register(typed_tool(

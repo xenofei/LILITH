@@ -21,7 +21,12 @@
 //!   core kicks the jobs there); the engines [`Telemetry::track`] their
 //!   processes; `meter` takes a job's [`EnergySlice`] with [`Telemetry::energy_between`] and
 //!   writes its [`JobEnergy`] with [`Telemetry::put_job_energy`], the only writer; the
-//!   `telemetry.jobs` tool reads them back with [`Telemetry::job_energy`].
+//!   `telemetry.jobs` tool reads them back with [`Telemetry::job_energy`]. `meter` also writes
+//!   each succeeded job's history row ([`Telemetry::put_job_stats`]) when it has an estimate
+//!   key, which the estimator reads ([`Telemetry::history`], CORE-161); `telemetry.energy`
+//!   sums a time range ([`Telemetry::energy`], APP-131). The server tracks each verified app's
+//!   process with role `app` while it is connected (P4a-R27): it is listed in `processes` for
+//!   that long, its connection being the proof that it runs.
 //!   The hardware profile of a workspace is checked once, at start ([`profile`]).
 //! - **Times** are RFC 3339 UTC with milliseconds (`2026-10-18T12:00:00.123Z`) wherever a
 //!   caller sees one.
@@ -32,6 +37,8 @@ mod db;
 mod energy;
 mod sampler;
 
+pub(crate) use energy::share;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +47,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lil_platform::Clock;
 use lil_platform::hw::{CpuEnergySource, GpuMemSource, GpuSource, SysSample, SysSource};
+use lil_protocol::estimate::Cost;
 use lil_protocol::{ErrorBody, codes};
 use lil_schema::{Currency, Money, PowerToml};
 use schemars::JsonSchema;
@@ -58,6 +66,8 @@ use crate::events::{EventBus, SnapshotProvider};
 pub const TELEMETRY_MODULE: &str = "telemetry";
 /// The topic.
 pub const TOPIC: &str = "telemetry";
+/// The role a connected app's process is tracked with (P4a-R27).
+pub const APP_ROLE: &str = "app";
 /// The most points `telemetry.series` returns per metric (Appendix F).
 pub const MAX_POINTS: usize = 3600;
 /// A step that took longer than this since the previous one counts as this much (a machine
@@ -408,8 +418,25 @@ pub struct AlertView {
     pub since: String,
 }
 
+/// One of the processes with the most dedicated GPU memory (Appendix G `gpu_users`); `name` is
+/// untrusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GpuUser {
+    pub pid: u32,
+    pub name: String,
+    pub vram_local_mib: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sm_permille: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// The most processes `gpu_users` lists.
+pub const GPU_USERS: usize = 8;
+
 /// The current hardware state: the `telemetry.snapshot` result and the `telemetry` topic's
-/// snapshot (Appendix F). There is no CPU temperature (CORE-060).
+/// snapshot (Appendix F; `gpu_users` from plan 4a, Appendix G). There is no CPU temperature
+/// (CORE-060).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Snapshot {
     pub ts: String,
@@ -424,6 +451,10 @@ pub struct Snapshot {
     pub system_power_mw: u64,
     pub system_parts: Vec<SystemPart>,
     pub alerts: Vec<AlertView>,
+    /// The [`GPU_USERS`] processes with the most dedicated GPU memory, tracked or not, the
+    /// most first ("who's using the GPU", APP-127).
+    #[serde(default)]
+    pub gpu_users: Vec<GpuUser>,
 }
 
 impl Snapshot {
@@ -455,6 +486,7 @@ impl Snapshot {
                 part(Part::Rest, Basis::Unknown),
             ],
             alerts: Vec::new(),
+            gpu_users: Vec::new(),
         }
     }
 }
@@ -494,6 +526,36 @@ pub struct JobEnergy {
     pub measured: Measured,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub idle_unknown: bool,
+}
+
+/// One succeeded job of the estimator's history (`telemetry.db` `job_stats`, Appendix G):
+/// `wall_ms` is the sum of its execution windows, `gpu_seconds_milli` and `system_mj` its
+/// `JobEnergy`'s (0 when it had none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStatsRow {
+    pub job_id: String,
+    pub kind: String,
+    pub estimate_key: String,
+    /// Unix ms.
+    pub finished_ms: i64,
+    pub wall_ms: u64,
+    pub gpu_seconds_milli: u64,
+    pub system_mj: u64,
+}
+
+/// `telemetry.energy`'s result (Appendix G, APP-131): the energy of the samples in a range,
+/// both bounds included, and the whole system by `JobEnergy`'s formula.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EnergyTotals {
+    pub from: String,
+    pub to: String,
+    pub gpu_mj: u64,
+    pub cpu_mj: u64,
+    pub system_mj: u64,
+    pub measured: Measured,
+    /// `system_mj` at `[power] electricity`, in that rate's currency, when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_cost: Option<Cost>,
 }
 
 /// The `telemetry.jobs` arguments.
@@ -651,6 +713,8 @@ struct Inner {
     clock: Arc<dyn Clock>,
     events: Arc<EventBus>,
     mode: TickMode,
+    /// `[power]`: the whole-system formula of `telemetry.energy`.
+    power: PowerSettings,
     db: Db,
     /// The core run: its start, Unix ms. Samples store it, because monotonic times only compare
     /// within a run.
@@ -781,7 +845,7 @@ impl Telemetry {
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
         );
         let (run, run_mono_ms) = (unix_ms(started), mono_ms(started_mono));
-        let mut sampler = Sampler::new(src, power, mode == TickMode::Real);
+        let mut sampler = Sampler::new(src, power.clone(), mode == TickMode::Real);
         if let Some(newest) = db.max_ts() {
             // A newer row than a day ahead of the clock is a wrong clock that was corrected:
             // following it would keep every new sample in the future, and the old rows past
@@ -798,6 +862,7 @@ impl Telemetry {
             clock,
             events,
             mode,
+            power,
             db,
             run,
             run_mono_ms,
@@ -862,6 +927,15 @@ impl Telemetry {
 
     pub fn untrack(&self, pid: u32) {
         lock(&self.inner.tracked).remove(&pid);
+    }
+
+    /// Stops following `pid` only while it is tracked with `role`: a connected app's close
+    /// never untracks an engine process that took over its pid.
+    pub fn untrack_if(&self, pid: u32, role: &str) {
+        let mut tracked = lock(&self.inner.tracked);
+        if tracked.get(&pid).is_some_and(|r| *r == role) {
+            tracked.remove(&pid);
+        }
     }
 
     /// The processes [`Telemetry::track`] follows, with their roles, by pid.
@@ -1087,6 +1161,91 @@ impl Telemetry {
             .await
             .map_err(|e| db_error("the read", &e))?
             .map_err(|e| db_error("the read", &e))
+    }
+
+    /// Stores a job's history row (`meter` is the only writer): once per job, a second write
+    /// for the same job changing nothing, and only the newest 20 rows of its kind and key are
+    /// kept (Appendix G).
+    ///
+    /// # Errors
+    /// `store.io` when the write fails.
+    pub async fn put_job_stats(&self, row: &JobStatsRow) -> Result<(), ErrorBody> {
+        let (inner, row) = (self.inner.clone(), row.clone());
+        tokio::task::spawn_blocking(move || inner.db.put_job_stats(&row))
+            .await
+            .map_err(|e| db_error("the write", &e))?
+            .map(drop)
+            .map_err(|e| db_error("the write", &e))
+    }
+
+    /// The newest `newest` history rows of jobs of `kind` with estimate key `key`, newest
+    /// first (by finish time, then job id).
+    ///
+    /// # Errors
+    /// `store.io` when the read fails.
+    pub async fn history(
+        &self,
+        kind: &str,
+        key: &str,
+        newest: u32,
+    ) -> Result<Vec<JobStatsRow>, ErrorBody> {
+        let (inner, kind, key) = (self.inner.clone(), kind.to_string(), key.to_string());
+        tokio::task::spawn_blocking(move || inner.db.history(&kind, &key, newest))
+            .await
+            .map_err(|e| db_error("the read", &e))?
+            .map_err(|e| db_error("the read", &e))
+    }
+
+    /// The energy of the samples from `from` to `to` (Unix ms, both included), from the finest
+    /// table whose retention still holds `from` (`s1`, `m1`, then `h1`; a coarser bucket counts
+    /// when it holds any of the range), with `JobEnergy`'s whole-system formula: (GPU + CPU +
+    /// `rest_of_system_w` over the samples' time) / `psu_efficiency` (APP-131; Appendix G).
+    ///
+    /// # Errors
+    /// `params.invalid` when `from` is after `to`; `store.io` when the read fails.
+    pub async fn energy(&self, from: i64, to: i64) -> Result<EnergyTotals, ErrorBody> {
+        if from > to {
+            return Err(params_invalid("from is after to"));
+        }
+        let now = unix_ms(self.inner.clock.utc_now());
+        let res = if from >= now - db::KEEP_S1_MS {
+            Resolution::Second
+        } else if from >= now - db::KEEP_M1_MS {
+            Resolution::Minute
+        } else {
+            Resolution::Hour
+        };
+        let inner = self.inner.clone();
+        let found = tokio::task::spawn_blocking(move || inner.db.energy(from, to, res))
+            .await
+            .map_err(|e| db_error("the read", &e))?
+            .map_err(|e| db_error("the read", &e))?;
+        let power = &self.inner.power;
+        let rest_mj = u64::from(power.rest_of_system_mw).saturating_mul(found.covered_ms) / 1000;
+        let psu = u64::from(power.psu_efficiency_permille.clamp(1, 1000));
+        let system_mj = share(found.gpu_mj + found.cpu_mj + rest_mj, 1000, psu);
+        let energy_cost = power.electricity.as_ref().map(|(rate, currency)| {
+            // A kWh is 3.6e9 mJ.
+            let rate = u64::try_from(rate.micros()).unwrap_or(0);
+            let micros = share(rate, system_mj, 3_600_000_000);
+            Cost {
+                amount: Money::from_micros(i64::try_from(micros).unwrap_or(i64::MAX))
+                    .to_decimal_string(),
+                currency: currency.as_str().to_string(),
+            }
+        });
+        Ok(EnergyTotals {
+            from: format_ts(from),
+            to: format_ts(to),
+            gpu_mj: found.gpu_mj,
+            cpu_mj: found.cpu_mj,
+            system_mj,
+            measured: Measured {
+                gpu: found.gpu_measured,
+                cpu: found.cpu_measured,
+            },
+            energy_cost,
+        })
     }
 
     /// Cancelled when the telemetry stops (its [`shutdown`](Telemetry::shutdown) or its drop).

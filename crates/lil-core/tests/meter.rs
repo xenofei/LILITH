@@ -57,11 +57,15 @@ const KIND: &str = "meter.test_job";
 // ---------------------------------------------------------------------------------------------
 
 /// Runs `meter.test_job` jobs: reports each `windows` entry (`[start_ms, end_ms, [pids]]`),
-/// then ends as `end` says: `ok` (the default), `fail`, `unknown`, or `cancel` (waits for its
-/// cancel).
+/// then ends as `end` says: `ok` (the default), `fail`, `unknown`, `cancel` (waits for its
+/// cancel), or `interrupt_once` (the handler's first such attempt is interrupted by its engine,
+/// later ones work). A working run with `cached: "all"` was all cached, with `"some"` partly;
+/// with `record: true` it leaves a record, which fails its Record step (the rig has no
+/// workspace).
 #[derive(Default)]
 struct WindowHandler {
     started: Mutex<Vec<String>>,
+    interrupted: std::sync::atomic::AtomicBool,
 }
 
 impl WindowHandler {
@@ -82,7 +86,24 @@ impl WindowHandler {
         }
         self.started.lock().unwrap().push(job.id.to_string());
         let error = |code: &lil_protocol::CodeSpec| ErrorBody::new(code, "on purpose", "");
+        match args["cached"].as_str() {
+            Some("all") => {
+                job.mark_cached(&["1".to_string(), "2".to_string()]);
+                job.set_all_cached();
+            }
+            Some("some") => job.mark_cached(&["1".to_string()]),
+            _ => {}
+        }
+        let first = || {
+            !self
+                .interrupted
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        };
         match args["end"].as_str().unwrap_or("ok") {
+            "interrupt_once" if first() => Err(JobFailure::Interrupted {
+                error: error(&codes::COMFYUI_UNREACHABLE),
+                salvaged: Vec::new(),
+            }),
             "fail" => Err(JobFailure::Final(error(&codes::COMFYUI_EXECUTION_FAILED))),
             "unknown" => Err(JobFailure::Unknown(error(&codes::COMFYUI_UNREACHABLE))),
             "cancel" => {
@@ -93,16 +114,44 @@ impl WindowHandler {
             _ => Ok(JobDone {
                 structured: json!({}),
                 artifacts: Vec::new(),
-                record: None,
+                record: (args["record"] == true).then(record_plan),
                 windows: Vec::new(),
             }),
         }
     }
 }
 
+/// A candidate run of `prop_meter` in `sketchbook` with no files: a job without a workspace
+/// that leaves it fails its Record step.
+fn record_plan() -> lil_core::pipeline::RecordPlan {
+    lil_core::pipeline::RecordPlan {
+        branch: lil_core::pipeline::RecordBranch::CandidateRun {
+            run_id: "r_20270115_0800".to_string(),
+        },
+        project: "sketchbook".to_string(),
+        asset_id: "prop_meter".to_string(),
+        commit: lil_core::store::CommitOp {
+            outputs: Vec::new(),
+            moved: Vec::new(),
+            removed: Vec::new(),
+            manifest: None,
+            job_line: None,
+            progress: None,
+        },
+        progress_entry: "a job's run".to_string(),
+        refs: Vec::new(),
+        version_guard: None,
+    }
+}
+
 impl JobHandler for WindowHandler {
     fn kind(&self) -> &'static str {
         KIND
+    }
+
+    /// Its `key` argument.
+    fn estimate_key(&self, args: &Value) -> Option<String> {
+        args.get("key").and_then(Value::as_str).map(str::to_string)
     }
 
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
@@ -1693,4 +1742,193 @@ monthly = \"5\"
         CapCheck::Exceeds(_)
     ));
     drop(open);
+}
+
+/// Every `job_stats` row of the rig's `telemetry.db`: `(job_id, kind, estimate_key, wall_ms,
+/// gpu_seconds_milli, system_mj)`.
+fn job_stats(rig: &Rig) -> Vec<(String, String, String, i64, i64, i64)> {
+    let conn = rusqlite::Connection::open(rig.env.env.local_dir().join("telemetry.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT job_id, kind, estimate_key, wall_ms, gpu_seconds_milli, system_mj \
+             FROM job_stats ORDER BY job_id",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// Waits until no job is queued, running or ending: its `succeeded` completions (the
+/// history row) are done (a failure deadline, never a measurement).
+async fn idle(rig: &Rig) {
+    tokio::time::timeout(DEADLINE, async {
+        while rig.jobs.busy() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the jobs never went idle");
+}
+
+/// [`Rig::job`], then [`idle`].
+async fn job_done(rig: &Rig, args: Value) -> lil_core::jobs::JobSummary {
+    let job = rig.job(args).await;
+    idle(rig).await;
+    job
+}
+
+/// `meter` writes a job's history row (Appendix G) only when the job ends `succeeded` and its
+/// handler gave it an estimate key: its execution windows' time, its SM-weighted GPU-seconds
+/// and its whole-system energy, as its `JobEnergy` has them. An all-cached run adds none, a
+/// partly cached one does (plan 4a ruling, 2026-10-24).
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-161, CORE-065
+async fn job_stats_written_only_for_succeeded_jobs_with_a_key() {
+    let rig = Rig::new(&busy());
+    rig.telemetry.track(200, "comfyui");
+    rig.run(30).await;
+    let windows = json!([[2_000, 6_000, [200]], [10_000, 13_000, [200]]]);
+    let ok = job_done(&rig, json!({"key": "k", "windows": windows})).await;
+    assert_eq!(ok.status, JobStatus::Succeeded);
+    let failed = job_done(&rig, json!({"key": "k", "windows": windows, "end": "fail"})).await;
+    assert_eq!(failed.status, JobStatus::Failed);
+    let keyless = job_done(&rig, json!({"windows": windows})).await;
+    assert_eq!(keyless.status, JobStatus::Succeeded);
+    // A job with a key and no window has a row too: no time or energy was measured.
+    let bare = job_done(&rig, json!({"key": "bare"})).await;
+    assert_eq!(bare.status, JobStatus::Succeeded);
+    let cached = job_done(
+        &rig,
+        json!({"key": "k", "windows": [[20_000, 20_200, [200]]], "cached": "all"}),
+    )
+    .await;
+    assert!(cached.all_cached, "{cached:?}");
+    let partly = job_done(
+        &rig,
+        json!({"key": "partly", "windows": [[20_000, 21_000, [200]]], "cached": "some"}),
+    )
+    .await;
+    assert_eq!(partly.status, JobStatus::Succeeded);
+
+    let e = rig.energy(&ok.job_id).await.expect("the job's energy");
+    let p = rig.energy(&partly.job_id).await.expect("its energy");
+    let wanted = |id: &str, key: &str, wall: i64, gpu: u64, system: u64| {
+        (
+            id.to_string(),
+            KIND.to_string(),
+            key.to_string(),
+            wall,
+            i64::try_from(gpu).unwrap(),
+            i64::try_from(system).unwrap(),
+        )
+    };
+    let mut want = vec![
+        wanted(&ok.job_id, "k", 7_000, e.gpu_seconds_milli, e.system_mj),
+        wanted(&bare.job_id, "bare", 0, 0, 0),
+        wanted(
+            &partly.job_id,
+            "partly",
+            1_000,
+            p.gpu_seconds_milli,
+            p.system_mj,
+        ),
+    ];
+    want.sort();
+    assert_eq!(job_stats(&rig), want);
+    let history = rig.telemetry.history(KIND, "k", 20).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].job_id, ok.job_id);
+    assert!(e.gpu_seconds_milli > 0 && e.system_mj > 0, "{e:?}");
+}
+
+/// 18 all-cached runs among similar jobs move neither the estimate nor the watchdog's bound
+/// (plan 4a ruling, 2026-10-24): without the rule they would be 18 of the newest 20, and the
+/// p50 and the p90 would both be theirs.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-161, ARCH-072
+async fn all_cached_runs_never_move_the_estimate_or_the_watchdog_bound() {
+    let rig = Rig::new(&busy());
+    rig.telemetry.track(200, "comfyui");
+    rig.run(30).await;
+    let estimator = lil_core::jobs::Estimator::new(
+        rig.telemetry.clone(),
+        &PowerSettings::default(),
+        std::sync::Arc::new(|| Currency::parse("USD").unwrap()),
+    );
+    for to in [12_000, 13_000, 14_000] {
+        job_done(&rig, json!({"key": "k", "windows": [[2_000, to, [200]]]})).await;
+    }
+    let before = estimator.estimate(KIND, Some("k")).await;
+    assert_eq!(
+        before
+            .wall_s
+            .as_ref()
+            .map(|w| (w.p50.as_str(), w.p90.as_str())),
+        Some(("11.0", "12.0")),
+        "{before:?}"
+    );
+    for _ in 0..18 {
+        let cached = job_done(
+            &rig,
+            json!({"key": "k", "windows": [[20_000, 20_500, [200]]], "cached": "all"}),
+        )
+        .await;
+        assert!(cached.all_cached);
+    }
+    let after = estimator.estimate(KIND, Some("k")).await;
+    assert_eq!(after, before);
+    let bound = |e: &lil_protocol::estimate::Estimate| {
+        lil_core::jobs::scheduler::watchdog_limit(10, e.wall_s.as_ref())
+    };
+    assert_eq!(bound(&after), bound(&before));
+    assert_eq!(bound(&after), Some(Duration::from_secs(33)));
+}
+
+/// The row is written once the job is `succeeded`, once per job id: a job whose Record step
+/// fails, and an agent job its engine interrupted (which runs once more as a new job), add no
+/// row of their own; the re-run that succeeds adds one (plan 4a ruling, 2026-10-24).
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-161, CORE-128
+async fn a_failed_record_or_an_interrupted_run_never_counts() {
+    let rig = Rig::new(&busy());
+    rig.telemetry.track(200, "comfyui");
+    rig.run(30).await;
+    let windows = json!([[2_000, 6_000, [200]]]);
+    let unrecorded = job_done(
+        &rig,
+        json!({"key": "k", "windows": windows, "record": true}),
+    )
+    .await;
+    assert_eq!(unrecorded.status, JobStatus::Failed, "{unrecorded:?}");
+    assert_eq!(job_stats(&rig), [], "a failed Record step adds no row");
+
+    let interrupted = job_done(
+        &rig,
+        json!({"key": "k", "windows": windows, "end": "interrupt_once"}),
+    )
+    .await;
+    assert_eq!(interrupted.status, JobStatus::Failed, "{interrupted:?}");
+    // Its re-run is queued as it ends: wait for the re-run's row, then for the jobs to go
+    // idle (a failure deadline).
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while job_stats(&rig).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-run added no row"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    idle(&rig).await;
+    let rows = job_stats(&rig);
+    assert_eq!(rows.len(), 1, "only the re-run: {rows:?}");
+    assert_ne!(rows[0].0, interrupted.job_id);
+    assert_eq!(rows[0].3, 4_000);
 }

@@ -23,8 +23,8 @@ pub use environment::EnvCapture;
 pub use graph::{MODEL_EXTENSIONS, ModelRef, apply_node_replacements, model_refs, partner_nodes};
 pub use handler::{
     ComfyPromptHandler, DEFAULT_EXPECTED_OUTPUT_BYTES, DEFAULT_EXPECTED_SECS,
-    DEFAULT_PREVIEW_METHOD, OOM_RETRIES, PROMPT_KIND, PromptArgs, PromptInput, confine_input,
-    is_oom, prefix_outputs, prompt_spec, rejection_detail, safe_name,
+    DEFAULT_PREVIEW_METHOD, OOM_RETRIES, PROMPT_KIND, PromptArgs, PromptInput, comfy_estimate_key,
+    confine_input, is_oom, prefix_outputs, prompt_spec, rejection_detail, safe_name,
 };
 pub use install::{INSTALL_KIND, NodeInstallHandler};
 pub use inventory::{INVENTORY_KIND, InventoryHandler};
