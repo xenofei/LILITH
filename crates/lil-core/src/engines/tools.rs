@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::comfyui::install::{self, ExactVersion, NodeId};
-use super::comfyui::prompt_spec;
+use super::comfyui::{PROMPT_KIND, comfy_estimate_key, prompt_spec};
 use super::{ENGINES_MODULE, EngineStatus, Engines, unknown_engine};
-use crate::jobs::{EngineKind, JobSummary, Priority};
-use crate::tools::{CallCtx, Registry, TEST_MODULE, typed_tool};
+use crate::jobs::{EngineKind, EstimateKey, JobSummary, Priority};
+use crate::tools::{CallCtx, Registry, TEST_MODULE, typed_tool, with_estimate_key};
 
 /// Where the engine tools find the engines, filled by the server before it serves.
 pub type EnginesSlot = Arc<OnceLock<Arc<Engines>>>;
@@ -189,6 +189,17 @@ fn tiny_graph(outputs: u32) -> Value {
     Value::Object(graph)
 }
 
+/// The graph a `test.comfy_submit` call sends: the tiny one (the default, or `"tiny"`), or
+/// `graph` itself; `None` for anything else.
+fn submit_graph(graph: Option<&Value>, outputs: Option<u32>) -> Option<Value> {
+    match graph {
+        None => Some(tiny_graph(outputs.unwrap_or(1))),
+        Some(Value::String(s)) if s == "tiny" => Some(tiny_graph(outputs.unwrap_or(1))),
+        Some(g @ Value::Object(_)) => Some(g.clone()),
+        Some(_) => None,
+    }
+}
+
 /// The expected time of a `test.comfy_submit` job (the watchdog's yardstick).
 const TEST_PROMPT_SECS: u32 = 60;
 
@@ -200,9 +211,9 @@ const TEST_PROMPT_SECS: u32 = 60;
 ///
 /// `"tiny"` (the default) is an `EmptyImage` node and `outputs` `SaveImage` nodes; an object
 /// is sent as it is. The spec is [`prompt_spec`]'s, in the caller's class unless `priority`
-/// says otherwise.
+/// says otherwise. Its estimate key is the graph's ([`comfy_estimate_key`]), as the job's.
 pub fn register_engine_test_tools(reg: &mut Registry) {
-    reg.register(typed_tool(
+    let tool = typed_tool(
         "test.comfy_submit",
         "Test channels only: submits a comfy.prompt job: the tiny graph (an EmptyImage and \
          `outputs` SaveImage nodes) or `graph`.",
@@ -210,17 +221,12 @@ pub fn register_engine_test_tools(reg: &mut Registry) {
         TEST_MODULE,
         |ctx, args: ComfySubmitArgs| {
             Box::pin(async move {
-                let graph = match args.graph {
-                    None => tiny_graph(args.outputs.unwrap_or(1)),
-                    Some(Value::String(s)) if s == "tiny" => tiny_graph(args.outputs.unwrap_or(1)),
-                    Some(g @ Value::Object(_)) => g,
-                    Some(_) => {
-                        return Err(ErrorBody::new(
-                            &codes::PARAMS_INVALID,
-                            "graph is \"tiny\" or an API-format graph object",
-                            ctx.trace_id.clone(),
-                        ));
-                    }
+                let Some(graph) = submit_graph(args.graph.as_ref(), args.outputs) else {
+                    return Err(ErrorBody::new(
+                        &codes::PARAMS_INVALID,
+                        "graph is \"tiny\" or an API-format graph object",
+                        ctx.trace_id.clone(),
+                    ));
                 };
                 let priority = args
                     .priority
@@ -239,7 +245,18 @@ pub fn register_engine_test_tools(reg: &mut Registry) {
                 Ok((SubmitResult { job }, summary))
             })
         },
-    ));
+    );
+    reg.register(with_estimate_key(tool, |args| {
+        let outputs = args
+            .get("outputs")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        let graph = submit_graph(args.get("graph"), outputs)?;
+        Some(EstimateKey {
+            kind: PROMPT_KIND,
+            key: comfy_estimate_key(&graph),
+        })
+    }));
 }
 
 /// Registers `engines.status`, `engines.start`, `engines.stop`, `engines.restart` and

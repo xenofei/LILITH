@@ -151,6 +151,29 @@ pub struct PromptArgs {
     pub inputs: Vec<PromptInput>,
 }
 
+/// The inputs a `comfy.prompt` estimate key leaves out of its graph (Appendix G): they change
+/// each run, not the work.
+const UNKEYED_INPUTS: [&str; 3] = ["seed", "noise_seed", "filename_prefix"];
+
+/// The estimate key of an API-format `graph` (CORE-161; Appendix G): the first 16 hex of
+/// SHA-256 over its canonical JSON (keys sorted, no whitespace) with every input named
+/// `seed`, `noise_seed` or `filename_prefix` removed.
+pub fn comfy_estimate_key(graph: &Value) -> String {
+    let mut graph = graph.clone();
+    if let Some(nodes) = graph.as_object_mut() {
+        for node in nodes.values_mut() {
+            if let Some(inputs) = node.get_mut("inputs").and_then(Value::as_object_mut) {
+                for name in UNKEYED_INPUTS {
+                    lil_schema::remove_key(inputs, name);
+                }
+            }
+        }
+    }
+    let mut key = lil_protocol::args_hash(&graph);
+    key.truncate(16);
+    key
+}
+
 /// The `JobSpec` of a `comfy.prompt` job with `args` (`{graph, preview_method?, inputs?}`).
 pub fn prompt_spec(
     args: Value,
@@ -952,6 +975,11 @@ fn stopping(job: &JobCtx) -> JobFailure {
 impl JobHandler for ComfyPromptHandler {
     fn kind(&self) -> &'static str {
         PROMPT_KIND
+    }
+
+    /// Its graph's [`comfy_estimate_key`].
+    fn estimate_key(&self, args: &Value) -> Option<String> {
+        args.get("graph").map(comfy_estimate_key)
     }
 
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {

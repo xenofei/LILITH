@@ -6,7 +6,9 @@
 //!   maximum and sum of the samples in the bucket, upserted as each sample is written, so the
 //!   rolled-up rows are always current and the energy sums stay exact. `proc_s1` holds the
 //!   per-process figures of the processes that matter (tracked ones and any using the GPU),
-//!   24 h. `job_energy` holds the per-job rows `meter` writes when a job completes.
+//!   24 h. `job_energy` holds the per-job rows `meter` writes when a job completes, and
+//!   `job_stats` (version 2) the history of each succeeded job with an estimate key, which the
+//!   estimator reads (CORE-161, Appendix G).
 //! - **Metrics.** The twelve series metrics are columns of `s1`; a column is `NULL` when its
 //!   figure was unknown at that sample, and a bucket only counts the samples that had it. For
 //!   the two `*.energy` metrics a sample's value is that interval's energy in mJ, so a bucket's
@@ -32,15 +34,29 @@ use rusqlite::{Connection, OpenFlags, params};
 
 use crate::store::fsops;
 
-use super::{EnergySlice, JobEnergy, JobEnergyQuery, Measured};
+use super::{EnergySlice, JobEnergy, JobEnergyQuery, JobStatsRow, Measured};
 
 /// `PRAGMA user_version` of `telemetry.db`.
-pub(crate) const USER_VERSION: i64 = 1;
+pub(crate) const USER_VERSION: i64 = 2;
+
+/// Version 2 (plan 4a): the estimator's history (Appendix G).
+const JOB_STATS: &str = "
+CREATE TABLE job_stats (
+    job_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    estimate_key TEXT NOT NULL,
+    finished_ms INTEGER NOT NULL,
+    wall_ms INTEGER NOT NULL,
+    gpu_seconds_milli INTEGER NOT NULL,
+    system_mj INTEGER NOT NULL
+);
+CREATE INDEX job_stats_key ON job_stats (kind, estimate_key, finished_ms);
+";
 
 /// The forward migrations: entry `i` takes a file from version `i + 1` to `i + 2`, so a file of
 /// any older version reaches [`USER_VERSION`]. A schema change appends its step here, edits
 /// [`SCHEMA`] (what a new file gets) to match, and bumps [`USER_VERSION`].
-const MIGRATIONS: &[&str] = &[];
+const MIGRATIONS: &[&str] = &[JOB_STATS];
 
 /// What [`open_file`] expects: the schema of a new file, its version, and the steps that bring
 /// an older file to it (production: [`SCHEMA`], [`USER_VERSION`], [`MIGRATIONS`]).
@@ -258,9 +274,19 @@ CREATE TABLE job_energy (
     idle_unknown INTEGER NOT NULL
 );
 CREATE INDEX job_energy_to ON job_energy (to_ms);
+CREATE TABLE job_stats (
+    job_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    estimate_key TEXT NOT NULL,
+    finished_ms INTEGER NOT NULL,
+    wall_ms INTEGER NOT NULL,
+    gpu_seconds_milli INTEGER NOT NULL,
+    system_mj INTEGER NOT NULL
+);
+CREATE INDEX job_stats_key ON job_stats (kind, estimate_key, finished_ms);
 ";
 
-const TABLES: [&str; 5] = ["s1", "m1", "h1", "proc_s1", "job_energy"];
+const TABLES: [&str; 6] = ["s1", "m1", "h1", "proc_s1", "job_energy", "job_stats"];
 
 /// The open database.
 pub(crate) struct Db {
@@ -759,6 +785,135 @@ impl Db {
         }
         Ok(out)
     }
+
+    /// Writes (or replaces) a job's history row.
+    pub(crate) fn put_job_stats(&self, r: &JobStatsRow) -> rusqlite::Result<()> {
+        let conn = self.lock();
+        let big = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        conn.execute(
+            "INSERT OR REPLACE INTO job_stats (job_id, kind, estimate_key, finished_ms, wall_ms,              gpu_seconds_milli, system_mj) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                r.job_id,
+                r.kind,
+                r.estimate_key,
+                r.finished_ms,
+                big(r.wall_ms),
+                big(r.gpu_seconds_milli),
+                big(r.system_mj),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The newest `newest` history rows of `kind` and `key`: by `finished_ms`, then `job_id`,
+    /// newest first.
+    pub(crate) fn history(
+        &self,
+        kind: &str,
+        key: &str,
+        newest: u32,
+    ) -> rusqlite::Result<Vec<JobStatsRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT job_id, kind, estimate_key, finished_ms, wall_ms, gpu_seconds_milli,              system_mj FROM job_stats WHERE kind = ?1 AND estimate_key = ?2              ORDER BY finished_ms DESC, job_id DESC LIMIT ?3",
+        )?;
+        let unsigned = |v: i64| u64::try_from(v).unwrap_or(0);
+        stmt.query_map(params![kind, key, newest], |r| {
+            Ok(JobStatsRow {
+                job_id: r.get(0)?,
+                kind: r.get(1)?,
+                estimate_key: r.get(2)?,
+                finished_ms: r.get(3)?,
+                wall_ms: unsigned(r.get(4)?),
+                gpu_seconds_milli: unsigned(r.get(5)?),
+                system_mj: unsigned(r.get(6)?),
+            })
+        })?
+        .collect()
+    }
+
+    /// The energy of the samples with `from_ms <= ts <= to_ms`, from table `res` (a coarser
+    /// bucket counts when it holds any millisecond of the range, as in [`Db::series`]).
+    pub(crate) fn energy(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        res: Resolution,
+    ) -> rusqlite::Result<RangeEnergy> {
+        let conn = self.lock();
+        let mut out = RangeEnergy::default();
+        match res {
+            Resolution::Second => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT est, gpu_energy, cpu_energy, dt FROM s1 WHERE ts BETWEEN ?1 AND ?2",
+                )?;
+                let mut found = stmt.query(params![from_ms, to_ms])?;
+                let (mut gpu_all, mut cpu_all) = (true, true);
+                while let Some(r) = found.next()? {
+                    let est: i64 = r.get(0)?;
+                    let (gpu, cpu): (Option<i64>, Option<i64>) = (r.get(1)?, r.get(2)?);
+                    out.samples += 1;
+                    gpu_all &= gpu.is_some() && est & EST_GPU_ENERGY == 0;
+                    cpu_all &= cpu.is_some() && est & EST_CPU_ENERGY == 0;
+                    out.gpu_mj += gpu.map_or(0, |v| u64::try_from(v).unwrap_or(0));
+                    out.cpu_mj += cpu.map_or(0, |v| u64::try_from(v).unwrap_or(0));
+                    out.covered_ms += u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0);
+                }
+                out.gpu_measured = out.samples > 0 && gpu_all;
+                out.cpu_measured = out.samples > 0 && cpu_all;
+            }
+            Resolution::Minute | Resolution::Hour => {
+                let (table, len) = if res == Resolution::Minute {
+                    ("m1", MINUTE_MS)
+                } else {
+                    ("h1", HOUR_MS)
+                };
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT metric, SUM(n), SUM(sum) FROM {table}                      WHERE metric IN (?1, ?2, ?3) AND ts + ?4 > ?5 AND ts <= ?6 GROUP BY metric"
+                ))?;
+                let mut found = stmt.query(params![
+                    Metric::GpuEnergy.name(),
+                    Metric::CpuEnergy.name(),
+                    Metric::CpuUtil.name(),
+                    len,
+                    from_ms,
+                    to_ms
+                ])?;
+                let (mut gpu_n, mut cpu_n) = (0, 0);
+                while let Some(r) = found.next()? {
+                    let metric: String = r.get(0)?;
+                    let (n, sum) = (
+                        u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                        u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                    );
+                    match Metric::parse(&metric) {
+                        Some(Metric::GpuEnergy) => (out.gpu_mj, gpu_n) = (sum, n),
+                        Some(Metric::CpuEnergy) => (out.cpu_mj, cpu_n) = (sum, n),
+                        // Every sample has the CPU's utilisation: it counts the samples.
+                        _ => out.samples = n,
+                    }
+                }
+                // A nominal second a sample (CORE-061): the rolled-up rows keep no `dt`.
+                out.covered_ms = out.samples * 1000;
+                out.gpu_measured = out.samples > 0 && gpu_n == out.samples;
+                out.cpu_measured = out.samples > 0 && cpu_n == out.samples;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// What [`Db::energy`] found: the summed energy, whether every sample had each figure from a
+/// counter (from `m1` and `h1`: had it at all, since they keep no estimated mark), how many
+/// samples, and the time they stand for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RangeEnergy {
+    pub gpu_mj: u64,
+    pub cpu_mj: u64,
+    pub gpu_measured: bool,
+    pub cpu_measured: bool,
+    pub samples: u64,
+    pub covered_ms: u64,
 }
 
 /// The idle power before a window (CORE-065): the median power of the 60 s before it with
@@ -927,16 +1082,16 @@ mod tests {
 
     /// An older file is migrated forward in place and keeps its history; only a newer version,
     /// version 0 or a migration that fails sets a file aside, and nothing is deleted (CORE-004,
-    /// CORE-062). The layout stands in for a later schema (a version 2 with one more table).
+    /// CORE-062). The layout stands in for a later schema (a version 3 with one more table).
     #[test] // spec: CORE-004
     fn an_older_version_migrates_in_place_and_only_a_newer_or_broken_one_is_set_aside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.db");
-        let v2_schema = format!("{SCHEMA}CREATE TABLE later (x INTEGER);");
-        let v2 = Layout {
-            schema: &v2_schema,
-            version: 2,
-            migrations: &["CREATE TABLE later (x INTEGER);"],
+        let v3_schema = format!("{SCHEMA}CREATE TABLE later (x INTEGER);");
+        let v3 = Layout {
+            schema: &v3_schema,
+            version: 3,
+            migrations: &[JOB_STATS, "CREATE TABLE later (x INTEGER);"],
         };
         let names = || -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(dir.path())
@@ -951,12 +1106,12 @@ mod tests {
         db.write(&row(1, &[(Metric::RamUsed, 7)])).unwrap();
         drop(db);
 
-        // Version 1 under a core that knows version 2: migrated, every row kept.
-        let conn = open_file(&path, 1_800_000_060, v2).unwrap();
+        // Version 2 under a core that knows version 3: migrated, every row kept.
+        let conn = open_file(&path, 1_800_000_060, v3).unwrap();
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let kept: i64 = conn
             .query_row("SELECT ram_used FROM s1 WHERE ts = 1", [], |r| r.get(0))
             .unwrap();
@@ -965,7 +1120,7 @@ mod tests {
         drop(conn);
         assert!(names().is_empty(), "{:?}", names());
 
-        // The same file (now version 2) under this core's version 1: newer, so set aside.
+        // The same file (now version 3) under this core's version 2: newer, so set aside.
         let db = Db::open(&path, 1_800_000_120);
         drop(db);
         assert_eq!(names(), ["telemetry.db.damaged-20270115T080200Z"]);
@@ -978,9 +1133,9 @@ mod tests {
         }
         drop(open_file(&path, 1_800_000_180, LAYOUT).unwrap());
         let broken = Layout {
-            schema: &v2_schema,
-            version: 2,
-            migrations: &["CREATE TABLE s1 (x INTEGER);"],
+            schema: &v3_schema,
+            version: 3,
+            migrations: &[JOB_STATS, "CREATE TABLE s1 (x INTEGER);"],
         };
         drop(open_file(&path, 1_800_000_240, broken).unwrap());
         assert_eq!(
@@ -996,7 +1151,7 @@ mod tests {
         let version: i64 = aside
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1, "a failed step is rolled back");
+        assert_eq!(version, 2, "a failed step is rolled back");
     }
 
     /// A file that isn't a database, and one of a newer schema version, are set aside whole

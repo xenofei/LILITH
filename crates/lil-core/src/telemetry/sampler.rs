@@ -41,8 +41,8 @@ use super::energy::{
     Accum, CounterStep, CounterTracker, cpu_estimate_mw, power_accum, pwh_accum, system_power_mw,
 };
 use super::{
-    AlertView, Basis, CpuView, DiskView, GpuView, HwSources, NetView, Part, PowerSettings,
-    ProcessView, RamView, Sizes, Snapshot, SystemPart, VramView, format_ts,
+    APP_ROLE, AlertView, Basis, CpuView, DiskView, GPU_USERS, GpuUser, GpuView, HwSources, NetView,
+    Part, PowerSettings, ProcessView, RamView, Sizes, Snapshot, SystemPart, VramView, format_ts,
 };
 
 /// Per-process GPU memory while no job runs (CORE-061).
@@ -500,7 +500,9 @@ impl Sampler {
         }
         self.proc_prev = proc_now;
 
-        // The processes worth showing: tracked engines, anything using the GPU.
+        // The processes worth showing: tracked engines, anything using the GPU, and each
+        // connected app, whose connection shows it runs even when the system source doesn't
+        // report it (P4a-R27).
         let sm: BTreeMap<u32, u16> = gpu
             .sample
             .iter()
@@ -518,6 +520,13 @@ impl Sampler {
         pids.extend(cpu_delta.keys());
         pids.extend(sm.keys());
         pids.extend(mem.keys());
+        pids.extend(
+            input
+                .tracked
+                .iter()
+                .filter(|(_, role)| **role == APP_ROLE)
+                .map(|(pid, _)| *pid),
+        );
         let cores = u64::try_from(sys.per_core_permille.len().max(1)).unwrap_or(1);
         let mut processes = Vec::new();
         let mut proc_rows = Vec::new();
@@ -555,6 +564,7 @@ impl Sampler {
         }
         let live_pids: BTreeSet<u32> = processes.iter().map(|p| p.pid).collect();
         self.names.retain(|pid, _| live_pids.contains(pid));
+        let gpu_users = gpu_users(&processes);
 
         // Alerts, from a real reading only (a gap leaves them as they were).
         let live_sample = gpu.sample.as_ref().filter(|_| gpu.live);
@@ -624,6 +634,7 @@ impl Sampler {
             system_power_mw: system.unwrap_or(0),
             system_parts,
             alerts: self.alerts_view(),
+            gpu_users,
         };
 
         let mut row = Row {
@@ -773,6 +784,31 @@ impl Sampler {
             })
             .collect()
     }
+}
+
+/// The [`GPU_USERS`] processes with the most dedicated GPU memory, the most first (by pid
+/// among equals), tracked or not (Appendix G `gpu_users`).
+fn gpu_users(processes: &[ProcessView]) -> Vec<GpuUser> {
+    let mut users: Vec<GpuUser> = processes
+        .iter()
+        .filter_map(|p| {
+            let vram = p.vram_local_mib.filter(|mib| *mib > 0)?;
+            Some(GpuUser {
+                pid: p.pid,
+                name: p.name.clone(),
+                vram_local_mib: vram,
+                sm_permille: p.sm_permille,
+                role: p.role.clone(),
+            })
+        })
+        .collect();
+    users.sort_by(|a, b| {
+        b.vram_local_mib
+            .cmp(&a.vram_local_mib)
+            .then(a.pid.cmp(&b.pid))
+    });
+    users.truncate(GPU_USERS);
+    users
 }
 
 fn alert_json(id: &str, a: &Active) -> Value {

@@ -7,6 +7,7 @@
 pub mod app;
 pub mod canonical;
 pub mod codes;
+pub mod estimate;
 pub mod events;
 pub mod jsonrpc;
 pub mod lowering;

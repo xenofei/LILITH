@@ -30,6 +30,10 @@
 //!   from here (QA1 I5). An `interrupted_unknown` engine job you resolved gets a `cancelled`
 //!   line, with its energy when this core run saw its windows, else without. A job that never
 //!   started gets neither. The completion never settles a reservation: only Caps' does.
+//!   A job that succeeded with an estimate key (its row's, from its handler) also gets its
+//!   history row ([`Telemetry::put_job_stats`], Appendix G): the time of its execution
+//!   windows, and its GPU-seconds and whole-system energy (0 without windows), so the
+//!   estimator learns from it (CORE-161).
 //!   The set of jobs that own their line is in memory: an entry goes at the job's
 //!   completion (for an `interrupted_unknown` job, when you resolve it), and with the core.
 //! - **Summaries** ([`summary`], `usage.summary`).
@@ -66,10 +70,11 @@ pub use tools::{register_caps_tools, register_meter_tools};
 use self::record::PendingRow;
 use self::summary::{Period, Range};
 use crate::events::EventBus;
+use crate::jobs::ExecWindow;
 use crate::jobs::{JobCompletion, JobCtx, JobDone, JobFuture, never_started, resolved_unknown};
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::{FailPoints, LogKind, WsPath, logs};
-use crate::telemetry::{JobEnergy, PowerSettings, Telemetry, format_ts, parse_ts};
+use crate::telemetry::{JobEnergy, JobStatsRow, PowerSettings, Telemetry, format_ts, parse_ts};
 use crate::tools::stages::BillingBasis;
 use crate::workspace::{Access, OpenWorkspace};
 
@@ -790,6 +795,37 @@ impl Meter {
         }
     }
 
+    /// The history row of a job that succeeded, when its row has an estimate key (module
+    /// docs, "Jobs"). A row that can't be read or written is logged; the job is unchanged.
+    async fn job_stats(&self, job: &JobCtx, windows: &[ExecWindow], e: Option<&JobEnergy>) {
+        let key = match crate::jobs::record::get(&job.state, job.id.as_str()).await {
+            Ok(row) => row.and_then(|r| r.estimate_key),
+            Err(err) => {
+                tracing::warn!(job_id = %job.id, error = %err, "a job's estimate key can't be read; it adds no history");
+                None
+            }
+        };
+        let Some(estimate_key) = key else {
+            return;
+        };
+        let wall_ms = windows
+            .iter()
+            .map(|w| u64::try_from(w.end.saturating_sub(w.start).as_millis()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        let row = JobStatsRow {
+            job_id: job.id.to_string(),
+            kind: job.spec.kind.to_string(),
+            estimate_key,
+            finished_ms: self.now_ms(),
+            wall_ms,
+            gpu_seconds_milli: e.map_or(0, |e| e.gpu_seconds_milli),
+            system_mj: e.map_or(0, |e| e.system_mj),
+        };
+        if let Err(err) = self.telemetry.put_job_stats(&row).await {
+            tracing::warn!(job_id = %job.id, error = %err.message, "a job's history row could not be stored");
+        }
+    }
+
     async fn job_completed(&self, job: &JobCtx, outcome: &Outcome<ToolOutput>) {
         let owns_its_line = lock(&self.own).remove(job.id.as_str());
         if never_started(outcome) {
@@ -827,6 +863,9 @@ impl Meter {
                 tracing::warn!(job_id = %job.id, error = %err.message, "a job's energy could not be stored");
             }
             energy = Some(e);
+        }
+        if matches!(outcome, Outcome::Ok(_)) {
+            self.job_stats(job, &windows, energy.as_ref()).await;
         }
         if owns_its_line {
             return;

@@ -5,20 +5,21 @@
 //! | `telemetry.snapshot` | read | `{}` | the [`Snapshot`](crate::telemetry::Snapshot) |
 //! | `telemetry.series` | read | `{metrics, from, to, resolution?}` | `{series: [{metric, points: [[ts, min, avg, max]]}]}` |
 //! | `telemetry.jobs` | read | `{job_ids?, from?, to?, limit?}` | `{jobs: [JobEnergy]}` (newest first) |
+//! | `telemetry.energy` | read | `{from, to}` | `{from, to, gpu_mj, cpu_mj, system_mj, measured: {gpu, cpu}, energy_cost?}` (APP-131) |
 //!
 //! They live in `tools`, not in `telemetry`, so that `telemetry` depends on no `tools` type
 //! (CORE-010). `meter` writes the `JobEnergy` rows `telemetry.jobs` reads.
 
 use std::sync::Arc;
 
-use lil_protocol::EffectClass;
+use lil_protocol::{EffectClass, ErrorBody, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::registry::{Registry, typed_tool};
 
 use crate::telemetry::{
-    JobEnergy, JobEnergyQuery, Series, SeriesQuery, Snapshot, TELEMETRY_MODULE, Telemetry,
+    JobEnergy, JobEnergyQuery, Series, SeriesQuery, Snapshot, TELEMETRY_MODULE, Telemetry, parse_ts,
 };
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -48,12 +49,28 @@ const JOBS_DESCRIPTION: &str = "Returns the energy of finished jobs, newest firs
     listed. `job_ids` picks jobs; `from` and `to` (RFC 3339 UTC) keep jobs that ended at or \
     after `from` and began at or before `to`; `limit` is 1-500 (default 100).";
 
+const ENERGY_DESCRIPTION: &str = "Returns the energy used between `from` and `to` (RFC 3339 \
+    UTC times, both included): the GPU's and the CPU package's in mJ, the whole-system estimate \
+    ((GPU + CPU + the rest-of-system baseline) / PSU efficiency), whether the GPU and CPU parts \
+    were measured, and its cost at the electricity rate when one is set. Older ranges are read \
+    from the minute or hourly rows, whose totals stay exact.";
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct JobsResult {
     jobs: Vec<JobEnergy>,
 }
 
-/// Registers `telemetry.snapshot`, `telemetry.series` and `telemetry.jobs` on `reg`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EnergyArgs {
+    /// RFC 3339 UTC; included.
+    from: String,
+    /// RFC 3339 UTC; included.
+    to: String,
+}
+
+/// Registers `telemetry.snapshot`, `telemetry.series`, `telemetry.jobs` and
+/// `telemetry.energy` on `reg`.
 pub fn register_telemetry_tools(reg: &mut Registry, telemetry: &Arc<Telemetry>) {
     let t = telemetry.clone();
     reg.register(typed_tool(
@@ -103,6 +120,36 @@ pub fn register_telemetry_tools(reg: &mut Registry, telemetry: &Arc<Telemetry>) 
                 })?;
                 let summary = format!("{} job(s)", jobs.len());
                 Ok((JobsResult { jobs }, summary))
+            })
+        },
+    ));
+    let t = telemetry.clone();
+    reg.register(typed_tool(
+        "telemetry.energy",
+        ENERGY_DESCRIPTION,
+        EffectClass::Read,
+        TELEMETRY_MODULE,
+        move |ctx, args: EnergyArgs| {
+            let t = t.clone();
+            Box::pin(async move {
+                let time = |what: &str, text: &str| {
+                    parse_ts(text).ok_or_else(|| {
+                        ErrorBody::new(
+                            &codes::PARAMS_INVALID,
+                            format!(
+                                "{what} {text:?} is not an RFC 3339 UTC time like 2026-10-18T12:00:00Z"
+                            ),
+                            ctx.trace_id.clone(),
+                        )
+                    })
+                };
+                let (from, to) = (time("from", &args.from)?, time("to", &args.to)?);
+                let totals = t.energy(from, to).await.map_err(|mut e| {
+                    e.trace_id.clone_from(&ctx.trace_id);
+                    e
+                })?;
+                let summary = format!("{} mJ in all", totals.system_mj);
+                Ok((totals, summary))
             })
         },
     ));

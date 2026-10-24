@@ -97,6 +97,22 @@ pub(crate) fn system_power_mw(
     Some(sum * 1000 / u64::from(psu_permille.max(1)))
 }
 
+/// `v × num / den`, rounded half to even; 0 when `den` is 0 (as `meter`'s attribution shares
+/// round; `telemetry` uses no `meter` item).
+pub(crate) fn share(v: u64, num: u64, den: u64) -> u64 {
+    if den == 0 {
+        return 0;
+    }
+    let (p, d) = (u128::from(v) * u128::from(num), u128::from(den));
+    let (q, rem) = (p / d, p % d);
+    let up = match (2 * rem).cmp(&d) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => q % 2 == 1,
+        std::cmp::Ordering::Less => false,
+    };
+    u64::try_from(q + u128::from(up)).unwrap_or(u64::MAX)
+}
+
 /// The median of `values`, an even count averaging its two middle values (rounded down);
 /// `None` for no values.
 pub(crate) fn median(values: &mut [u64]) -> Option<u64> {

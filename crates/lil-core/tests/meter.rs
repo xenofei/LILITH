@@ -105,6 +105,11 @@ impl JobHandler for WindowHandler {
         KIND
     }
 
+    /// Its `key` argument.
+    fn estimate_key(&self, args: &Value) -> Option<String> {
+        args.get("key").and_then(Value::as_str).map(str::to_string)
+    }
+
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>> {
         Box::pin(self.attempt(job))
     }
@@ -1693,4 +1698,73 @@ monthly = \"5\"
         CapCheck::Exceeds(_)
     ));
     drop(open);
+}
+
+/// Every `job_stats` row of the rig's `telemetry.db`: `(job_id, kind, estimate_key, wall_ms,
+/// gpu_seconds_milli, system_mj)`.
+fn job_stats(rig: &Rig) -> Vec<(String, String, String, i64, i64, i64)> {
+    let conn = rusqlite::Connection::open(rig.env.env.local_dir().join("telemetry.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT job_id, kind, estimate_key, wall_ms, gpu_seconds_milli, system_mj \
+             FROM job_stats ORDER BY job_id",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// `meter` writes a job's history row (Appendix G) only when the job succeeds and its handler
+/// gave it an estimate key: its execution windows' time, its SM-weighted GPU-seconds and its
+/// whole-system energy, as its `JobEnergy` has them.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-161, CORE-065
+async fn job_stats_written_only_for_succeeded_jobs_with_a_key() {
+    let rig = Rig::new(&busy());
+    rig.telemetry.track(200, "comfyui");
+    rig.run(30).await;
+    let windows = json!([[2_000, 6_000, [200]], [10_000, 13_000, [200]]]);
+    let ok = rig.job(json!({"key": "k", "windows": windows})).await;
+    assert_eq!(ok.status, JobStatus::Succeeded);
+    let failed = rig
+        .job(json!({"key": "k", "windows": windows, "end": "fail"}))
+        .await;
+    assert_eq!(failed.status, JobStatus::Failed);
+    let keyless = rig.job(json!({"windows": windows})).await;
+    assert_eq!(keyless.status, JobStatus::Succeeded);
+    // A job with a key and no window has a row too: no time or energy was measured.
+    let bare = rig.job(json!({"key": "bare"})).await;
+    assert_eq!(bare.status, JobStatus::Succeeded);
+
+    let e = rig.energy(&ok.job_id).await.expect("the job's energy");
+    let wanted = |id: &str, key: &str, wall: i64, gpu: u64, system: u64| {
+        (
+            id.to_string(),
+            KIND.to_string(),
+            key.to_string(),
+            wall,
+            i64::try_from(gpu).unwrap(),
+            i64::try_from(system).unwrap(),
+        )
+    };
+    let mut want = vec![
+        wanted(&ok.job_id, "k", 7_000, e.gpu_seconds_milli, e.system_mj),
+        wanted(&bare.job_id, "bare", 0, 0, 0),
+    ];
+    want.sort();
+    assert_eq!(job_stats(&rig), want);
+    let history = rig.telemetry.history(KIND, "k", 20).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].job_id, ok.job_id);
+    assert!(e.gpu_seconds_milli > 0 && e.system_mj > 0, "{e:?}");
 }

@@ -1406,6 +1406,8 @@ fn earlier_row(job_id: &str, prompt_id: &str, substatus: Substatus, external: bo
         status_seq: Vec::new(),
         report: Default::default(),
         withdrawn_id: None,
+        estimate: None,
+        estimate_key: None,
     }
 }
 

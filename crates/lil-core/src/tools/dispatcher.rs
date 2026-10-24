@@ -93,8 +93,8 @@ use std::time::UNIX_EPOCH;
 
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{
-    CodeSpec, Detail, EffectClass, ErrorBody, Outcome, PendingConfirmation, ToolCallParams,
-    ToolDescriptor, ToolOutput, args_hash, codes, fits_response_result,
+    CallerKind, CodeSpec, Detail, EffectClass, ErrorBody, Outcome, PendingConfirmation,
+    ToolCallParams, ToolDescriptor, ToolOutput, args_hash, codes, fits_response_result,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinError;
@@ -991,6 +991,16 @@ impl Redispatch {
                 self.idem.as_ref(),
             )
             .await
+    }
+
+    /// The tool `name` as `caller` may see it (`job.estimate` checks a call of it): `None`
+    /// for no such tool, one the caller may not see, or a core that is shutting down.
+    pub(crate) fn tool(&self, name: &str, caller: &CallerKind) -> Option<Arc<dyn Tool>> {
+        self.inner
+            .upgrade()?
+            .reg
+            .get(name)
+            .filter(|t| t.visible_to(caller))
     }
 
     /// [`Redispatch::retry`] for one job of a `job.retry {batch_id}` (Appendix G): with no

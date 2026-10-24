@@ -19,7 +19,9 @@
 //!   (`LIL_TEST_FAKE_HW`) advanced only by `test.hw_tick`. Its tools and its topic's snapshot
 //!   are registered, the default workspace's hardware profile is checked once the workspace is
 //!   open and the first sample is in (CORE-067), and sampling stops right after the shutdown
-//!   steps.
+//!   steps. Its history gives each job its estimate at submission (the jobs' estimator,
+//!   CORE-161), and each verified app's process is tracked with role `app` while it is
+//!   connected (`AppTracker`, P4a-R27).
 //! - The confirmations ([`crate::confirm`]) are stage 5's confirm half ([`AgentConfirm`]), the
 //!   router's `app/*` methods and an idle blocker (ARCH-020; never a drain's). The suite
 //!   database's pending ones are loaded at start, the default workspace's once it opens, and
@@ -41,12 +43,14 @@
 //!   ([`Engines::observe`]: the outside-jobs poll every 2 s while ComfyUI is ready, the model
 //!   inventory each time it becomes ready) starts with the suite's jobs recovered.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lil_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
 use lil_platform::{Env, process};
+use lil_protocol::CallerKind;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -57,12 +61,14 @@ use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
 use crate::interchange::{Interchange, register_interchange_tools};
+use crate::jobs::Estimator;
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
 use crate::meter::{Caps, Meter, MeterSettle, register_caps_tools, register_meter_tools};
 use crate::projects::ActiveProjects;
 use crate::resources::{Resources, register_resource_tools, spawn_personal_maintenance};
 use crate::rpc::RpcRouter;
+use crate::session::Session;
 use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
@@ -347,6 +353,16 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     );
     let active_projects = dispatcher.active_projects().clone();
     let jobs = dispatcher.jobs().clone();
+    // The estimate each job takes at submission, from the telemetry's history (CORE-161).
+    let display = {
+        let caps = caps.clone();
+        Arc::new(move || caps.display_currency())
+    };
+    jobs.set_estimator(Estimator::new(
+        telemetry.clone(),
+        &power_settings(&cfg.env),
+        display,
+    ));
     if cfg.test_tools {
         jobs.register(Arc::new(TestJobHandler::new(test_gates.clone())));
     }
@@ -449,7 +465,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
         .with_caps(caps.clone())
         .with_observer(holds)
-        .with_observer(interchange);
+        .with_observer(interchange)
+        .with_observer(Arc::new(AppTracker::new(telemetry.clone())));
     if cfg.test_tools {
         router = router.with_observer(test_holds);
     }
@@ -544,6 +561,50 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         session_end,
         shutdown,
     })
+}
+
+/// Tracks each verified `ui:*` connection's process in the telemetry with role `app` while it
+/// is connected (P4a-R27): Hardware's "who's using the GPU" shows the app, and a later plan's
+/// RAM admission reads its working set. A process with two connections stays tracked until
+/// both closed; a connection whose process Windows didn't report (pid 0) isn't tracked.
+struct AppTracker {
+    telemetry: Arc<Telemetry>,
+    /// Each tracked connection's process.
+    conns: std::sync::Mutex<HashMap<u64, u32>>,
+}
+
+impl AppTracker {
+    fn new(telemetry: Arc<Telemetry>) -> AppTracker {
+        AppTracker {
+            telemetry,
+            conns: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn conns(&self) -> std::sync::MutexGuard<'_, HashMap<u64, u32>> {
+        self.conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl ConnObserver for AppTracker {
+    fn ready(&self, conn_id: u64, session: &Session) {
+        if matches!(session.caller, CallerKind::Ui(_)) && session.client_pid != 0 {
+            self.conns().insert(conn_id, session.client_pid);
+            self.telemetry
+                .track(session.client_pid, telemetry::APP_ROLE);
+        }
+    }
+
+    fn closed(&self, conn_id: u64) {
+        let mut conns = self.conns();
+        if let Some(pid) = conns.remove(&conn_id)
+            && !conns.values().any(|p| *p == pid)
+        {
+            self.telemetry.untrack(pid);
+        }
+    }
 }
 
 /// What the shutdown supervisor owns.

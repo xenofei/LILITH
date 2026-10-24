@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lil_core::engines::comfyui::handler::comfy_estimate_key;
 use lil_core::events::EventBus;
+use lil_core::jobs::estimate::Estimator;
 use lil_core::jobs::record::{self, JobRow};
 use lil_core::jobs::{
     Admission, Admit, COMPLETION_GRACE, CancelSelector, EngineKind, JobCaller, JobCompletion,
@@ -31,11 +33,13 @@ use lil_core::lifecycle::{DrainReason, Lifecycle, ShutdownPhase, ShutdownStep};
 use lil_core::pipeline::{RecordBranch, RecordPlan, start_candidate_run};
 use lil_core::state::StateRegistry;
 use lil_core::store::{CommitOp, FailPoints, ManifestEdit, WsPath};
+use lil_core::telemetry::{HwSources, JobStatsRow, PowerSettings, Telemetry, TickMode};
 use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::SystemProbe;
 use lil_platform::{Clock, IdSource};
+use lil_protocol::estimate::{Estimate, Spread, sum_part};
 use lil_protocol::{CallerKind, ErrorBody, Outcome, ToolOutput, codes};
-use lil_schema::Manifest;
+use lil_schema::{Currency, Manifest};
 use lil_testkit::{FakeClock, SeqIds, TestEnv};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
@@ -4003,4 +4007,363 @@ async fn a_drain_and_restart_holds_a_queued_job() {
         JobStatus::Succeeded
     );
     fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Estimates (CORE-161, APP-140; Appendix G "Estimates", P4a-R14, P4a-R40).
+// ---------------------------------------------------------------------------------------------
+
+/// A manual telemetry with no hardware (its database in `dir`) and an estimator over it, with
+/// `power` and the display currency `display`.
+fn estimator(dir: &Path, power: PowerSettings, display: &str) -> (Arc<Telemetry>, Arc<Estimator>) {
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let telemetry = Telemetry::start(
+        HwSources::none(),
+        dir.join("telemetry.db"),
+        clock.clone(),
+        power.clone(),
+        Arc::new(EventBus::new(clock)),
+        TickMode::Manual,
+    );
+    let display = Currency::parse(display).unwrap();
+    let estimator = Estimator::new(telemetry.clone(), &power, Arc::new(move || display.clone()));
+    (telemetry, estimator)
+}
+
+/// Records `n` similar jobs of `kind`/`key`, the `i`-th (from 1) finished at `i` s with
+/// `wall(i)` ms of execution, `wall(i) / 2` milli-GPU-seconds and `system_mj` mJ.
+async fn history(t: &Telemetry, key: &str, n: u64, wall: impl Fn(u64) -> u64, system_mj: u64) {
+    for i in 1..=n {
+        t.put_job_stats(&JobStatsRow {
+            job_id: format!("j_{i:016x}"),
+            kind: "t.job".into(),
+            estimate_key: key.into(),
+            finished_ms: i64::try_from(i * 1000).unwrap(),
+            wall_ms: wall(i),
+            gpu_seconds_milli: wall(i) / 2,
+            system_mj,
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// The `(part, reason)` pairs of an estimate's `unknown`, as the wire names them.
+fn unknown_parts(e: &Estimate) -> Vec<(String, String)> {
+    let v = serde_json::to_value(e).unwrap();
+    v["unknown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["part"].as_str().unwrap().to_string(),
+                u["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test] // spec: CORE-161
+async fn estimate_has_no_local_or_wall_part_below_three_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, e) = estimator(dir.path(), PowerSettings::default(), "USD");
+    let none = [
+        ("local".to_string(), "no_history".to_string()),
+        ("wall_s".to_string(), "no_history".to_string()),
+    ];
+    let empty = e.estimate("t.job", Some("k")).await;
+    assert!(empty.local.is_none() && empty.wall_s.is_none() && empty.money.is_none());
+    assert_eq!(unknown_parts(&empty), none);
+
+    history(&t, "k", 2, |i| i * 1000, 3600).await;
+    let two = e.estimate("t.job", Some("k")).await;
+    assert!(two.local.is_none() && two.wall_s.is_none(), "{two:?}");
+    assert_eq!(unknown_parts(&two), none, "2 similar jobs are not history");
+
+    history(&t, "k", 3, |i| i * 1000, 3600).await;
+    let three = e.estimate("t.job", Some("k")).await;
+    assert_eq!(
+        three.wall_s.as_ref().map(|w| w.samples),
+        Some(3),
+        "{three:?}"
+    );
+    assert_eq!(
+        three.local.as_ref().map(|l| l.samples),
+        Some(3),
+        "{three:?}"
+    );
+    assert!(three.unknown.is_empty(), "{three:?}");
+
+    // A tool with no estimate key has neither part, and says why.
+    let keyless = e.estimate("t.job", None).await;
+    assert!(keyless.local.is_none() && keyless.wall_s.is_none());
+    assert_eq!(
+        unknown_parts(&keyless),
+        [
+            ("local".to_string(), "no_key".to_string()),
+            ("wall_s".to_string(), "no_key".to_string())
+        ]
+    );
+    // Another kind with the same key has no history of its own.
+    let other = e.estimate("t.other", Some("k")).await;
+    assert!(other.wall_s.is_none(), "{other:?}");
+}
+
+/// Wall seconds 1 to 25 recorded: the newest 20 are 6 to 25, whose nearest-rank p50 is the
+/// 10th (15 s) and p90 the 18th (23 s); seconds have one decimal and Wh three (P4a-R14).
+#[tokio::test] // spec: CORE-161
+async fn estimate_uses_nearest_rank_over_the_newest_20() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, e) = estimator(dir.path(), PowerSettings::default(), "USD");
+    // 1.25 Wh each (4 500 000 mJ).
+    history(&t, "k", 25, |i| i * 1000, 4_500_000).await;
+    let est = e.estimate("t.job", Some("k")).await;
+    let v = serde_json::to_value(&est).unwrap();
+    assert_eq!(
+        v["wall_s"],
+        json!({"source": "measured_history", "samples": 20, "p50": "15.0", "p90": "23.0"}),
+        "{v}"
+    );
+    assert_eq!(
+        v["local"],
+        json!({"source": "measured_history", "samples": 20, "gpu_s_p50": "7.5",
+               "gpu_s_p90": "11.5", "wh_p50": "1.250", "wh_p90": "1.250"}),
+        "{v}"
+    );
+    assert_eq!(v["unknown"], json!([]), "{v}");
+    assert!(v.get("money").is_none(), "{v}");
+}
+
+/// `comfy.prompt`'s key: the first 16 hex of SHA-256 over the canonical graph without its
+/// `seed`, `noise_seed` and `filename_prefix` inputs (Appendix G).
+#[test] // spec: CORE-161
+fn estimate_key_ignores_seeds_and_prefixes() {
+    let graph = |seed: u64, prefix: &str, steps: u64| {
+        json!({
+            "3": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps,
+                  "model": ["4", 0]}},
+            "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}},
+            "5": {"class_type": "SamplerCustom", "inputs": {"noise_seed": seed + 1}},
+            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix,
+                  "images": ["3", 0]}},
+        })
+    };
+    let key = comfy_estimate_key(&graph(1, "ComfyUI", 20));
+    assert_eq!(key.len(), 16);
+    assert!(
+        key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{key}"
+    );
+    assert_eq!(
+        key,
+        comfy_estimate_key(&graph(987_654, "lil_0123456789abcdef_", 20))
+    );
+    assert_ne!(
+        key,
+        comfy_estimate_key(&graph(1, "ComfyUI", 21)),
+        "steps count"
+    );
+}
+
+/// An in-process core over the pipe (its clock and ids fake), and a session with it.
+fn core_session(env: &TestEnv) -> (lil_core::CoreThread, lil_testkit::RawPipe) {
+    let core = lil_core::start_in_thread(lil_core::CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        ..lil_core::CoreConfig::for_env(env.env.clone()).unwrap()
+    });
+    let mut pipe = lil_testkit::RawPipe::connect(env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    (core, pipe)
+}
+
+/// Runs `test.job` with `args` under key `key` to its end; its final summary.
+fn run_test_job(pipe: &mut lil_testkit::RawPipe, args: &Value, key: &str) -> Value {
+    let id = pipe.tool_ok("test.job", args.clone(), Some(key))["job"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let waited = pipe.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    assert_eq!(waited["job"]["status"], "succeeded", "{waited}");
+    waited["job"].clone()
+}
+
+/// `job.estimate` of `test.job` with `args`, once its history holds `samples` jobs (the meter
+/// writes a job's history as it completes, so just after `job.wait` reports it done).
+fn estimate_with(pipe: &mut lil_testkit::RawPipe, args: &Value, samples: u64) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let e = pipe.tool_ok(
+            "job.estimate",
+            json!({"tool": "test.job", "args": args}),
+            None,
+        );
+        if e["wall_s"]["samples"] == samples {
+            return e;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no history of {samples}: {e}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test] // spec: CORE-161, P4a-R40
+fn estimate_is_taken_at_submit() {
+    let env = TestEnv::new();
+    let (_core, mut pipe) = core_session(&env);
+    let args = json!({"lane": "cpu", "estimate_key": "at-submit"});
+    for n in 0..3 {
+        run_test_job(&mut pipe, &args, &format!("run{n}"));
+    }
+    let before = estimate_with(&mut pipe, &args, 3);
+    assert_eq!(before["wall_s"]["source"], "measured_history", "{before}");
+    let job = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "estimate_key": "at-submit", "gated": true}),
+        Some("gated"),
+    )["job"]
+        .clone();
+    assert_eq!(job["estimate"], before, "{job}");
+
+    // A job of another key gets that key's estimate: none yet.
+    let fresh = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "estimate_key": "fresh", "gated": true}),
+        Some("fresh"),
+    )["job"]
+        .clone();
+    assert!(fresh["estimate"]["wall_s"].is_null(), "{fresh}");
+    assert_eq!(
+        fresh["estimate"]["unknown"],
+        json!([{"part": "local", "reason": "no_history"},
+               {"part": "wall_s", "reason": "no_history"}]),
+        "{fresh}"
+    );
+}
+
+#[test] // spec: CORE-161, P4a-R40
+fn estimate_is_never_changed_after_submit() {
+    let env = TestEnv::new();
+    let (_core, mut pipe) = core_session(&env);
+    let args = json!({"lane": "cpu", "estimate_key": "kept"});
+    for n in 0..3 {
+        run_test_job(&mut pipe, &args, &format!("run{n}"));
+    }
+    let at_submit = estimate_with(&mut pipe, &args, 3);
+    let held = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "gpu-heavy", "estimate_key": "kept", "gated": true}),
+        Some("held"),
+    )["job"]
+        .clone();
+    let id = held["job_id"].as_str().unwrap().to_string();
+    assert_eq!(held["estimate"], at_submit);
+
+    // More history meanwhile (the cpu lane runs while the held job waits in its own).
+    for n in 3..5 {
+        run_test_job(&mut pipe, &args, &format!("run{n}"));
+    }
+    let later = estimate_with(&mut pipe, &args, 5);
+    assert_ne!(later, at_submit);
+    let listed = pipe.tool_ok("jobs.list", json!({"ids": [id]}), None);
+    assert_eq!(listed["jobs"][0]["estimate"], at_submit, "{listed}");
+    pipe.tool_ok("test.job_release", json!({"job_id": id}), Some("release"));
+    let done = pipe.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    assert_eq!(done["job"]["status"], "succeeded", "{done}");
+    assert_eq!(done["job"]["estimate"], at_submit, "{done}");
+}
+
+#[test] // spec: CORE-161
+fn job_estimate_validates_args_like_a_call() {
+    let env = TestEnv::new();
+    let (_core, mut pipe) = core_session(&env);
+    let unknown_arg = pipe.tool(
+        "job.estimate",
+        json!({"tool": "test.job", "args": {"lane": "cpu", "no_such_argument": 1}}),
+        None,
+    );
+    assert_eq!(
+        unknown_arg["error"]["code"], "params.invalid",
+        "{unknown_arg}"
+    );
+    let missing = pipe.tool(
+        "job.estimate",
+        json!({"tool": "test.job", "args": {}}),
+        None,
+    );
+    assert_eq!(missing["error"]["code"], "params.invalid", "{missing}");
+    let unknown_tool = pipe.tool(
+        "job.estimate",
+        json!({"tool": "no.such_tool", "args": {}}),
+        None,
+    );
+    assert_eq!(
+        unknown_tool["error"]["code"], "tool.unknown",
+        "{unknown_tool}"
+    );
+    // A tool with no estimate key: both parts unknown, `no_key`.
+    let keyless = pipe.tool_ok("job.estimate", json!({"tool": "jobs.list"}), None);
+    assert_eq!(
+        keyless,
+        json!({"unknown": [{"part": "local", "reason": "no_key"},
+                           {"part": "wall_s", "reason": "no_key"}]})
+    );
+}
+
+/// A local job spends no money: no `money` part and none unknown. With `[power] electricity`
+/// in the display currency, `local` has the cost of `wh_p50` at that rate; in another
+/// currency none (plan 4a converts no rate).
+#[tokio::test] // spec: CORE-161, APP-140, CORE-064
+async fn a_local_job_has_no_money_part_and_an_energy_cost_when_a_rate_is_set() {
+    let rated = PowerSettings {
+        electricity: Some((
+            lil_schema::Money::parse_decimal("0.30").unwrap(),
+            Currency::parse("EUR").unwrap(),
+        )),
+        ..PowerSettings::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (t, e) = estimator(dir.path(), rated.clone(), "EUR");
+    // 1 Wh each.
+    history(&t, "k", 3, |i| i * 1000, 3_600_000).await;
+    let v = serde_json::to_value(e.estimate("t.job", Some("k")).await).unwrap();
+    assert!(v.get("money").is_none(), "{v}");
+    assert_eq!(v["unknown"], json!([]), "{v}");
+    assert_eq!(v["local"]["wh_p50"], "1.000", "{v}");
+    // 1 Wh at 0.30 a kWh.
+    assert_eq!(
+        v["local"]["energy_cost"],
+        json!({"amount": "0.0003", "currency": "EUR"}),
+        "{v}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (t, e) = estimator(dir.path(), rated, "USD");
+    history(&t, "k", 3, |i| i * 1000, 3_600_000).await;
+    let v = serde_json::to_value(e.estimate("t.job", Some("k")).await).unwrap();
+    assert!(v["local"].get("energy_cost").is_none(), "{v}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (t, e) = estimator(dir.path(), PowerSettings::default(), "EUR");
+    history(&t, "k", 3, |i| i * 1000, 3_600_000).await;
+    let v = serde_json::to_value(e.estimate("t.job", Some("k")).await).unwrap();
+    assert!(v["local"].get("energy_cost").is_none(), "no rate: {v}");
+}
+
+/// Adding estimates (Appendix G): p50s add; the p90 is their sum plus the root of the summed
+/// squares of each (p90 − p50), never the sum of the p90s; a job without the part is counted,
+/// not taken as zero.
+#[test] // spec: CORE-161
+fn sum_part_adds_p50s_and_never_p90s() {
+    let (a, b) = (Spread::new(10.0, 14.0), Spread::new(20.0, 23.0));
+    let sum = sum_part(&[Some(&a), Some(&b)]);
+    assert_eq!((sum.p50, sum.p90), (30.0, 35.0));
+    assert_eq!((sum.of, sum.not_estimated), (2, 0));
+    let with_gap = sum_part(&[Some(&a), None, Some(&b)]);
+    assert_eq!((with_gap.p50, with_gap.p90), (30.0, 35.0));
+    assert_eq!((with_gap.of, with_gap.not_estimated), (3, 1));
 }

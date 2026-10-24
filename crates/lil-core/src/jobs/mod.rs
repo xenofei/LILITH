@@ -34,8 +34,14 @@
 //!   may hold it in `waiting_for_vram`, or in `waiting` while its engine runs outside prompts
 //!   ([`Admit::Wait`]), and it is told whether jobs run or wait for VRAM.
 //!   [`Jobs::kick`] (on every telemetry sample) asks again, and runs the watchdog: a running job
-//!   more than 3× its `expected_secs` past the moment its attempt became `executing` gets
-//!   `watchdog: "slow"` (a `watchdog` event on `job:<id>`); it keeps running (ARCH-072).
+//!   past its bound since the moment its attempt became `executing` gets `watchdog: "slow"`
+//!   (a `watchdog` event on `job:<id>`); it keeps running (ARCH-072). The bound is
+//!   `max(3 × p50, 2 × p90)` of the `wall_s` its estimate has, else 3× its `expected_secs`
+//!   ([`scheduler::watchdog_limit`]).
+//! - **Estimates** ([`estimate`]). A job takes its [`Estimate`] when it is submitted and keeps
+//!   it (P4a-R40): the [`Estimator`] ([`Jobs::set_estimator`]; none, and jobs have no
+//!   estimate) reads the history of jobs of its kind with its handler's estimate key
+//!   ([`JobHandler::estimate_key`]), and the row keeps both.
 //! - **Running** ([`runner`]). A free-space preflight on the staging volume (2 ×
 //!   `expected_output_bytes` + 64 MiB) fails a job with `store.disk_full` before its handler
 //!   runs. A [`JobFailure::Retryable`] is retried after 1 s, doubling, at most 30 s, at most 5
@@ -90,12 +96,14 @@
 //! its run is recorded, so the row and the recorded run agree (or, when the core stops first,
 //! the next start's recovery marks it `interrupted` with its result, as after a crash).
 
+pub mod estimate;
 pub mod pause;
 pub mod queue;
 pub mod record;
 pub mod runner;
 pub mod scheduler;
 
+pub use estimate::{EstimateKey, Estimator};
 pub use pause::{PauseReason, PauseScope, RESTART_REASON};
 
 use std::fmt;
@@ -105,6 +113,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use lil_protocol::estimate::Estimate;
 use lil_protocol::{CallerKind, ErrorBody, FileRef, Outcome, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -532,6 +541,10 @@ pub struct JobSummary {
     /// While the job is `queue_paused`: the reasons holding it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pause_reasons: Vec<String>,
+    /// The estimate taken when the job was submitted, never changed afterwards (CORE-161,
+    /// P4a-R40); none for a job of a core without an estimator, or of before plan 4a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
 }
 
 /// The summary text of a job whose every node the engine served from its cache (CORE-117).
@@ -942,6 +955,12 @@ impl JobCtx {
 /// Runs the jobs of one kind (CORE-010).
 pub trait JobHandler: Send + Sync + 'static {
     fn kind(&self) -> &'static str;
+    /// The estimate key of a job of this kind with handler arguments `args` (CORE-161;
+    /// Appendix G): similar jobs share it. `None` (the default): its jobs are never estimated
+    /// from history.
+    fn estimate_key(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
     /// One attempt. It watches `job.cancel` and returns soon after it turns `true`.
     fn run<'a>(&'a self, job: &'a JobCtx) -> JobFuture<'a, Result<JobDone, JobFailure>>;
     /// Cancels the job's own work in its engine (never anything else); called at most once

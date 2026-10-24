@@ -19,8 +19,8 @@ use lil_core::events::EventBus;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::telemetry::{
-    HwSources, JobEnergy, JobEnergyQuery, Measured, PowerSettings, SeriesQuery, Sizes, Snapshot,
-    Telemetry, TickMode, format_ts, parse_ts, profile_check,
+    HwSources, JobEnergy, JobEnergyQuery, JobStatsRow, Measured, PowerSettings, SeriesQuery, Sizes,
+    Snapshot, Telemetry, TickMode, format_ts, parse_ts, profile_check,
 };
 use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::SystemProbe;
@@ -2065,5 +2065,310 @@ async fn a_forward_clock_jump_does_not_stick_across_restarts() {
         snap.ts,
         format_ts(T0_MS),
         "the new run is back in real time"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 4a: job history, energy over a range, GPU users, apps (CORE-161, APP-127, APP-131;
+// Appendix G "Estimates").
+// ---------------------------------------------------------------------------------------------
+
+/// A `job_stats` row of kind `k.job`.
+fn stats(job_id: &str, key: &str, finished_ms: i64, wall_ms: u64) -> JobStatsRow {
+    JobStatsRow {
+        job_id: job_id.into(),
+        kind: "k.job".into(),
+        estimate_key: key.into(),
+        finished_ms,
+        wall_ms,
+        gpu_seconds_milli: wall_ms / 2,
+        system_mj: wall_ms * 3,
+    }
+}
+
+/// A version-1 file (no `job_stats`) is migrated forward in place: its samples stay, and the
+/// history table is there afterwards (Appendix G, CORE-004).
+#[tokio::test] // spec: CORE-004, CORE-161
+async fn version_1_migrates_to_2_keeping_rows() {
+    let hw = script(vec![gpu(100_000, 1000), gpu(100_000, 3000)], vec![sys(100)]);
+    let first = Rig::new(&hw);
+    first.run(2).await;
+    let energy = first.total("gpu.energy", "1s").await;
+    assert_eq!(energy, 2000.0);
+    first.telemetry.shutdown().await;
+    // What a plan-3 core left: version 1, without the history table.
+    {
+        let conn = rusqlite::Connection::open(&first.db).unwrap();
+        conn.execute_batch("DROP TABLE job_stats; PRAGMA user_version = 1;")
+            .unwrap();
+    }
+    let second = Rig::at(
+        HwSources::from_fake(FakeHwScript::new(hw).sources()),
+        PowerSettings::default(),
+        first.db.clone(),
+        None,
+    );
+    assert_eq!(second.total("gpu.energy", "1s").await, energy, "rows kept");
+    let version: i64 = rusqlite::Connection::open(&first.db)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    second
+        .telemetry
+        .put_job_stats(&stats("j_0000000000000001", "k", T0_MS, 1000))
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .telemetry
+            .history("k.job", "k", 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let names: Vec<String> = std::fs::read_dir(first.db.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("damaged")),
+        "migrated, not set aside: {names:?}"
+    );
+}
+
+/// `put_job_stats` and `history` round-trip a row; history is the newest first, by kind and
+/// key, at most `newest`; a second write for a job replaces the first.
+#[tokio::test] // spec: CORE-161
+async fn job_stats_rows_round_trip() {
+    let rig = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
+    let t = rig.telemetry.clone();
+    for (id, key, at) in [
+        ("j_000000000000000a", "k", T0_MS),
+        ("j_000000000000000b", "k", T0_MS + 2000),
+        ("j_000000000000000c", "other", T0_MS + 1000),
+        ("j_000000000000000d", "k", T0_MS + 1000),
+    ] {
+        t.put_job_stats(&stats(id, key, at, 4000)).await.unwrap();
+    }
+    let mut other_kind = stats("j_000000000000000e", "k", T0_MS + 5000, 1);
+    other_kind.kind = "other.job".into();
+    t.put_job_stats(&other_kind).await.unwrap();
+
+    let history = t.history("k.job", "k", 20).await.unwrap();
+    let ids: Vec<&str> = history.iter().map(|r| r.job_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "j_000000000000000b",
+            "j_000000000000000d",
+            "j_000000000000000a"
+        ],
+        "newest first, this kind and key only"
+    );
+    assert_eq!(
+        history[0],
+        stats("j_000000000000000b", "k", T0_MS + 2000, 4000)
+    );
+    assert_eq!(t.history("k.job", "k", 2).await.unwrap().len(), 2);
+
+    let mut again = stats("j_000000000000000a", "k", T0_MS + 9000, 7000);
+    again.system_mj = 5;
+    t.put_job_stats(&again).await.unwrap();
+    let history = t.history("k.job", "k", 20).await.unwrap();
+    assert_eq!(history.len(), 3, "replaced, not added");
+    assert_eq!(history[0], again);
+}
+
+/// A GPU at 100 W (its counter rising 100 000 mJ a sample) and a CPU package metered at 30 W,
+/// for 40 samples.
+fn metered() -> Value {
+    let readings: Vec<Value> = (1..=40).map(|n| gpu(100_000, n * 100_000)).collect();
+    let cpu: Vec<Value> = (0..=40_u64)
+        .map(|n| json!({"package_energy_pwh": n * 8_333_333_333_u64, "package_power_mw": 30_000}))
+        .collect();
+    json!({"gpu": readings, "gpu_mem": [[]], "cpu_energy": cpu, "sys": [sys(100)]})
+}
+
+/// `telemetry.energy` over ticked samples: the samples' GPU and CPU energy, and the whole
+/// system by `JobEnergy`'s formula, (GPU + CPU + rest × the samples' time) / PSU efficiency;
+/// with an electricity rate, its cost (APP-131, CORE-064).
+#[tokio::test] // spec: APP-131, CORE-064, CORE-161
+async fn energy_over_a_range_matches_the_job_energy_formula() {
+    let power = PowerSettings {
+        rest_of_system_mw: 45_000,
+        electricity: Some((
+            lil_schema::Money::parse_decimal("0.30").unwrap(),
+            lil_schema::Currency::parse("EUR").unwrap(),
+        )),
+        ..PowerSettings::default()
+    };
+    let rig = Rig::with(&metered(), power);
+    rig.run(6).await;
+    let gpu_mj = rig.total("gpu.energy", "1s").await as u64;
+    let cpu_mj = rig.total("cpu.energy", "1s").await as u64;
+    assert!(gpu_mj > 0 && cpu_mj > 0, "{gpu_mj} {cpu_mj}");
+
+    // Six samples from T0: the first stands for no time, each later one for a second.
+    let totals = rig.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    let v = serde_json::to_value(&totals).unwrap();
+    assert_eq!(v["from"], "2027-01-15T08:00:00.000Z", "{v}");
+    assert_eq!(v["to"], "2027-01-15T08:00:05.000Z", "{v}");
+    assert_eq!((totals.gpu_mj, totals.cpu_mj), (gpu_mj, cpu_mj), "{v}");
+    let whole = gpu_mj + cpu_mj + 45_000 * 5;
+    assert_ne!((whole * 1000) % 900, 450, "no tie to round");
+    let expected = (whole * 1000 + 450) / 900;
+    assert_eq!(totals.system_mj, expected, "{v}");
+    assert_eq!(v["measured"], json!({"gpu": true, "cpu": true}), "{v}");
+    // 0.30 a kWh; a kWh is 3.6e9 mJ.
+    let cost: f64 = v["energy_cost"]["amount"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((cost - 0.30 * expected as f64 / 3.6e9).abs() < 1e-6, "{v}");
+    assert_eq!(v["energy_cost"]["currency"], "EUR", "{v}");
+
+    // Both bounds are included: a range of one instant holds the sample taken then.
+    let one = rig
+        .telemetry
+        .energy(T0_MS + 2000, T0_MS + 2000)
+        .await
+        .unwrap();
+    assert_eq!(one.gpu_mj, 100_000);
+    // A range backwards is refused.
+    assert_eq!(
+        rig.telemetry
+            .energy(T0_MS + 1, T0_MS)
+            .await
+            .unwrap_err()
+            .code,
+        "params.invalid"
+    );
+    // Without a rate there is no cost.
+    let plain = Rig::new(&metered());
+    plain.run(2).await;
+    let v =
+        serde_json::to_value(plain.telemetry.energy(T0_MS, T0_MS + 1000).await.unwrap()).unwrap();
+    assert!(v.get("energy_cost").is_none(), "{v}");
+}
+
+/// A range the 1-second samples no longer hold is read from the minute rows, and one the
+/// minute rows no longer hold from the hourly rows: the energy stays the same (CORE-062).
+#[tokio::test] // spec: APP-131, CORE-062
+async fn energy_picks_the_finest_table_that_holds_the_range() {
+    let rig = Rig::new(&metered());
+    rig.run(3).await;
+    let range = (T0_MS, T0_MS + 2000);
+    let fresh = rig.telemetry.energy(range.0, range.1).await.unwrap();
+    assert_eq!(fresh.gpu_mj, 200_000);
+    assert!(fresh.measured.gpu);
+
+    // Two days later the samples are gone; the minute rows answer.
+    rig.clock.advance(Duration::from_secs(2 * 86_400));
+    rig.run(1).await;
+    assert!(
+        rig.series("gpu.energy", "1s")
+            .await
+            .iter()
+            .all(|p| p.0 > range.1),
+        "the old samples were pruned"
+    );
+    let minutes = rig.telemetry.energy(range.0, range.1).await.unwrap();
+    assert_eq!(minutes.gpu_mj, 200_000, "from m1");
+    assert_eq!(minutes.cpu_mj, fresh.cpu_mj);
+    assert!(minutes.measured.gpu);
+
+    // Past 30 days only the hourly rows hold it.
+    rig.clock.advance(Duration::from_secs(31 * 86_400));
+    rig.run(1).await;
+    let hours = rig.telemetry.energy(range.0, range.1).await.unwrap();
+    assert_eq!(hours.gpu_mj, 200_000, "from h1");
+    assert_eq!(hours.cpu_mj, fresh.cpu_mj);
+}
+
+/// `gpu_users` lists the 8 processes with the most dedicated GPU memory, tracked or not, the
+/// most first, with their role and SM share when known (Appendix G, APP-127).
+#[tokio::test] // spec: APP-127
+async fn gpu_users_lists_the_top_8_by_vram_tracked_or_not() {
+    let mem: Vec<Value> = (1..=10_u64)
+        .map(|pid| json!({"pid": pid, "local_mib": pid * 100, "committed_mib": 0}))
+        .collect();
+    let mut reading = gpu(100_000, 1000);
+    reading["sm_by_pid"] = json!([[10, 500]]);
+    let rig = Rig::new(&json!({
+        "gpu": [reading], "gpu_mem": [mem], "cpu_energy": null, "sys": [sys(100)],
+    }));
+    rig.telemetry.track(3, "comfyui");
+    let snap = rig.run(1).await;
+    let pids: Vec<u32> = snap.gpu_users.iter().map(|u| u.pid).collect();
+    assert_eq!(pids, [10, 9, 8, 7, 6, 5, 4, 3]);
+    let v = serde_json::to_value(&snap).unwrap();
+    assert_eq!(
+        v["gpu_users"][0],
+        json!({"pid": 10, "name": "pid 10", "vram_local_mib": 1000, "sm_permille": 500})
+    );
+    assert_eq!(
+        v["gpu_users"][7],
+        json!({"pid": 3, "name": "comfyui", "vram_local_mib": 300, "role": "comfyui"})
+    );
+    // Before any sample, and without per-process GPU memory, the list is empty.
+    let empty = Rig::new(&script(vec![gpu(1, 1)], vec![sys(0)]));
+    assert!(empty.telemetry.snapshot().gpu_users.is_empty());
+    assert!(empty.run(1).await.gpu_users.is_empty());
+}
+
+/// A verified `ui:*` connection's process is tracked with role `app` while it is connected,
+/// and listed in the snapshot; no longer once it closed (P4a-R27). A `cli` connection is not.
+#[test] // spec: APP-127
+fn a_ui_connection_is_tracked_as_app_until_it_closes() {
+    // The core runs on its own runtime; this one only takes the manual samples.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let env = TestEnv::new();
+    let base = lil_core::CoreConfig::for_env(env.env.clone()).unwrap();
+    let core = lil_core::start_in_thread(lil_core::CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        trusted: lil_core::identity::TrustedDirs {
+            app_dirs: vec![lil_testkit::ensure_built().dir.clone()],
+            test_app: true,
+            ..base.trusted.clone()
+        },
+        ..base
+    });
+    let telemetry = core.core().telemetry().clone();
+    let mut pipe = lil_testkit::RawPipe::connect(&env);
+    assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
+    assert!(telemetry.tracked().is_empty(), "{:?}", telemetry.tracked());
+
+    let app = lil_testkit::TestApp::start(&env, None, &[]);
+    assert_eq!(app.hello()["caller_kind"], "ui:test");
+    let pid = app.pid();
+    assert_eq!(telemetry.tracked(), [(pid, "app")]);
+    let snap = rt.block_on(telemetry.tick(1));
+    assert!(
+        snap.processes
+            .iter()
+            .any(|p| p.pid == pid && p.role.as_deref() == Some("app")),
+        "{:?}",
+        snap.processes
+    );
+
+    drop(app);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !telemetry.tracked().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still tracked after the app closed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap = rt.block_on(telemetry.tick(1));
+    assert!(
+        !snap.processes.iter().any(|p| p.pid == pid),
+        "{:?}",
+        snap.processes
     );
 }

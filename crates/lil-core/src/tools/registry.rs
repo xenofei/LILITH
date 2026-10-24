@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use super::dispatcher::Redispatch;
 use super::stages::{ConfirmedVia, Settings};
 use crate::events::EventBus;
-use crate::jobs::{JobCaller, JobId, JobOrigin, Jobs, SubmittedSlot};
+use crate::jobs::{EstimateKey, JobCaller, JobId, JobOrigin, Jobs, SubmittedSlot};
 use crate::pipeline::RecordSlot;
 use crate::session::Session;
 use crate::workspace::OpenWorkspace;
@@ -127,6 +127,49 @@ pub trait Tool: Send + Sync + 'static {
     fn validate(&self, args: &serde_json::Value) -> Result<(), String>;
     /// Stage 7: runs the call with arguments `validate` accepted.
     fn run<'a>(&'a self, ctx: &'a CallCtx, args: serde_json::Value) -> ToolFuture<'a>;
+    /// The kind and estimate key of the job a call with arguments `args` (which `validate`
+    /// accepted) would submit (`job.estimate`, CORE-161; Appendix G): the same key the job's
+    /// handler gives it at submission. `None` (the default): the call is estimated `no_key`.
+    fn estimate_key(&self, _args: &serde_json::Value) -> Option<EstimateKey> {
+        None
+    }
+}
+
+/// `tool` with an estimate key: `key` gives it from a call's arguments
+/// ([`Tool::estimate_key`]).
+pub fn with_estimate_key(
+    tool: Arc<dyn Tool>,
+    key: fn(&serde_json::Value) -> Option<EstimateKey>,
+) -> Arc<dyn Tool> {
+    Arc::new(Keyed { tool, key })
+}
+
+/// A tool with an estimate key ([`with_estimate_key`]).
+struct Keyed {
+    tool: Arc<dyn Tool>,
+    key: fn(&serde_json::Value) -> Option<EstimateKey>,
+}
+
+impl Tool for Keyed {
+    fn descriptor(&self) -> &ToolDescriptor {
+        self.tool.descriptor()
+    }
+
+    fn visible_to(&self, caller: &CallerKind) -> bool {
+        self.tool.visible_to(caller)
+    }
+
+    fn validate(&self, args: &serde_json::Value) -> Result<(), String> {
+        self.tool.validate(args)
+    }
+
+    fn run<'a>(&'a self, ctx: &'a CallCtx, args: serde_json::Value) -> ToolFuture<'a> {
+        self.tool.run(ctx, args)
+    }
+
+    fn estimate_key(&self, args: &serde_json::Value) -> Option<EstimateKey> {
+        (self.key)(args)
+    }
 }
 
 /// A JSON Schema 2020-12 root schema for `T`, with its `$schema` (ARCH-037).
