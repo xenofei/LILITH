@@ -676,10 +676,10 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
         EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetMessageW,
-        GetSystemMetrics, GetWindowThreadProcessId, MSG, PostQuitMessage, RegisterClassW,
-        SM_CXSCREEN, SM_CYSCREEN, SPI_GETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SetForegroundWindow,
-        ShowWindow, SystemParametersInfoW, TranslateMessage, WM_DESTROY, WM_PAINT, WNDCLASSW,
-        WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        GetSystemMetrics, GetWindowThreadProcessId, IsWindowVisible, MSG, PostQuitMessage,
+        RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_GETFOREGROUNDLOCKTIMEOUT, SW_SHOW,
+        SetForegroundWindow, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_DESTROY,
+        WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
     };
     use windows::core::{BOOL, HSTRING, PWSTR, w};
 
@@ -810,7 +810,8 @@ mod win {
         extern "system" fn each(hwnd: HWND, lp: LPARAM) -> BOOL {
             // SAFETY: lp is the &mut Ctx below, live for the enumeration.
             let ctx = unsafe { &mut *(lp.0 as *mut Ctx) };
-            if class_of(hwnd) == ctx.want {
+            // SAFETY: a plain query on a window handle from the enumeration.
+            if class_of(hwnd) == ctx.want && unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 ctx.found = hwnd.0 as isize;
             }
             BOOL(1)
