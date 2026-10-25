@@ -71,12 +71,12 @@ fn hello_returns_session_and_shared_capabilities() {
     assert_eq!(second["result"]["instance_id"], instance, "{second}");
     assert_ne!(second["result"]["session_id"], session, "{second}");
     // The session runs at the lower minor, 1.2, and shares the core's list: protocol 1.1's
-    // five capabilities, then `queue.v1` and `desktop.v1` (later plan-4a capabilities may
-    // follow them).
+    // five capabilities, then `queue.v1`, `desktop.v1` and `context.v1` (later plan-4a
+    // capabilities may follow them).
     assert_eq!(second["result"]["protocol"], "1.2", "{second}");
     let shared = second["result"]["capabilities"].as_array().unwrap();
     assert_eq!(
-        shared[..7],
+        shared[..8],
         [
             "events.v1",
             "tools.v1",
@@ -84,7 +84,8 @@ fn hello_returns_session_and_shared_capabilities() {
             "confirmations.v1",
             "caps.v1",
             "queue.v1",
-            "desktop.v1"
+            "desktop.v1",
+            "context.v1"
         ],
         "{second}"
     );

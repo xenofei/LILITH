@@ -99,6 +99,12 @@ pub const CONFIRMATION_WAITING: &str = "confirmation_waiting";
 pub const CAP_ALERT: &str = "cap_alert";
 pub const AGENT_ACTIVITY: &str = "agent_activity";
 
+/// `url` as a toast's launch, unless it passes the longest `lil:` argument. A valid target
+/// (4,096 bytes at most) never makes one that long; this is the bound should that change.
+fn within_url_limit(url: String) -> Option<String> {
+    (url.chars().count() <= MAX_URL_CHARS).then_some(url)
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -503,7 +509,7 @@ impl Notifier {
         let text = ToastText {
             body: format!("{who} opened {target_title}"),
             title: who,
-            launch: (url.chars().count() <= MAX_URL_CHARS).then_some(url),
+            launch: within_url_limit(url),
             actions: ToastActions::None,
         };
         self.post(AGENT_ACTIVITY, &self.ids.id("n"), &text).await
@@ -997,6 +1003,16 @@ pub fn elapsed_text(secs: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test] // spec: APP-065
+    fn a_launch_url_over_8192_characters_is_left_out() {
+        let at = "u".repeat(super::MAX_URL_CHARS);
+        assert_eq!(super::within_url_limit(at.clone()), Some(at));
+        assert_eq!(
+            super::within_url_limit("é".repeat(super::MAX_URL_CHARS + 1)),
+            None
+        );
+    }
+
     use super::*;
 
     #[test] // spec: APP-146

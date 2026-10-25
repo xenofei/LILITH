@@ -1,26 +1,46 @@
-//! `handlers.for`, `open_in` and `ui.show` (Appendix F "Product tools") and `notify.claude_code`
-//! (Appendix G "Notifications"), module `interchange`:
+//! `handlers.for`, `open_in` and `ui.show` (Appendix F "Product tools"), `lilref.write`
+//! (Appendix G "`.lilref` files") and `notify.claude_code` (Appendix G "Notifications"), module
+//! `interchange`:
 //!
 //! | Tool | Effect | Arguments | `structured` |
 //! |---|---|---|---|
 //! | `handlers.for` | read | `{target}` | `{handlers: [{app, intents, external}]}` |
 //! | `open_in` | read | `{app, target, intent: "open" \| "edit" \| "use_as_input"}` | `{running, pid, launch_command}` |
 //! | `ui.show` | read | `{target}` | as `open_in` |
+//! | `lilref.write` | write | `{ref, title?}` (a sealed ref with `#sha256=`) | `{path}` |
 //! | `notify.claude_code` | write | `{message, title?}` (1–2,000 and at most 100 characters) | `{posted, reason?: "category_off" \| "foreground" \| "duplicate" \| "unavailable"}` |
 //!
 //! The intent set is closed (APP-066): any other value is `params.invalid`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lil_protocol::{EffectClass, ErrorBody, codes};
+use lil_schema::refs::AssetRef;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
     HandlerView, INTERCHANGE_MODULE, Intent, Interchange, NotifyOutcome, OpenResult, Target,
-    handlers_for_target,
+    handlers_for_target, write_lilref,
 };
 use crate::tools::{Registry, typed_tool};
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LilrefArgs {
+    /// A sealed ref carrying its content hash: `lil://<ws>/<project>/<asset>@<version>#sha256=<hex>`.
+    r#ref: String,
+    /// Shown by the app; at most 200 characters, no control or text-direction character.
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct LilrefResult {
+    /// The `.lilref` file, in the suite's cache: print it as a link.
+    path: PathBuf,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +153,49 @@ pub fn register_interchange_tools(reg: &mut Registry, interchange: &Arc<Intercha
                 let result = ix.ui_show(ctx, &args.target).await?;
                 let summary = summary("the app", &result);
                 Ok((result, summary))
+            })
+        },
+    ));
+    let ix = interchange.clone();
+    reg.register(typed_tool(
+        "lilref.write",
+        "Writes a small .lilref file for a sealed version and returns its path, so you can give \
+         the person a clickable link: print the path, and opening it shows the version in \
+         LILITH (terminals only open file links). ref is a sealed ref with its content hash \
+         (lil://...@<version>#sha256=<hex>, as asset.get gives it); a candidate ref or one \
+         without #sha256= is ref.invalid. title, at most 200 characters, is shown with it. The \
+         same ref always gets the same file.",
+        EffectClass::Write,
+        INTERCHANGE_MODULE,
+        move |ctx, args: LilrefArgs| {
+            let ix = ix.clone();
+            Box::pin(async move {
+                let parsed: AssetRef = args.r#ref.parse().map_err(|why| {
+                    ErrorBody::new(
+                        &codes::REF_INVALID,
+                        format!("`{}` is not a lil:// ref: {why}", args.r#ref),
+                        ctx.trace_id.clone(),
+                    )
+                })?;
+                let env = ix.env().clone();
+                let title = args.title.clone();
+                let written = tokio::task::spawn_blocking(move || {
+                    write_lilref(&env, &parsed, title.as_deref())
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(ErrorBody::new(
+                        &codes::STORE_IO,
+                        format!("The .lilref write stopped: {e}"),
+                        "",
+                    ))
+                });
+                let path = written.map_err(|mut e| {
+                    e.trace_id.clone_from(&ctx.trace_id);
+                    e
+                })?;
+                let summary = format!("wrote {}", path.display());
+                Ok((LilrefResult { path }, summary))
             })
         },
     ));

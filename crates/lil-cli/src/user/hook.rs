@@ -1,5 +1,6 @@
-//! `lil hook <session-start | pre-tool-use | post-tool-use>` (spec ARCH-018, ARCH-103–107,
-//! AI-116; Appendix F "Plugin 1.3" and "The `lil` commands this plan adds"): the plugin's
+//! `lil hook <session-start | pre-tool-use | post-tool-use | notification>` (spec ARCH-018,
+//! ARCH-103–107, AI-116; Appendix F "Plugin 1.3" and "The `lil` commands this plan adds",
+//! Appendix G "Plugin 1.3.1"): the plugin's
 //! hooks. It reads the hook JSON on stdin, prints the hook output JSON or nothing, and always
 //! exits 0. It never answers `allow` (ruling P3-R28): only `ask`, `deny` or no decision, so a
 //! command it doesn't flag is left to Claude Code's own permission mode. A malformed input
@@ -15,7 +16,13 @@
 //! - **SessionStart:** while a core runs, `additionalContext` with the active project, the open
 //!   jobs (each `job_id`) and the pending confirmations (each `id`) of the workspace the `cli`
 //!   chain finds from the session's folder; nothing otherwise.
-//! - With `LIL_ENGINE=1` (Engine A) every hook prints nothing (ARCH-107).
+//! - **Notification** (plugin 1.3.1, P4a-R18): Claude Code's notice (`message`, `title?`) goes
+//!   to `notify.claude_code` on a core that already runs, which shows it as a Windows
+//!   notification from the suite; nothing otherwise. A message over 2,000 characters or a
+//!   title over 100 is cut to that length; an input without a non-empty string `message`, or
+//!   with a `title` that isn't a string, calls nothing. It waits at most 5 s for the core and
+//!   always prints nothing: Claude Code ignores a Notification hook's output and exit code.
+//! - With `LIL_ENGINE=1` (Engine A) every hook prints nothing (ARCH-107) and calls nothing.
 //!
 //! The hooks never start a core and never wait for a person (ARCH-018). PreToolUse fails
 //! closed (ruling P3-R28): a hook that panics, can't read its input, or can't tell whether a
@@ -45,6 +52,7 @@ pub enum HookEvent {
     SessionStart,
     PreToolUse,
     PostToolUse,
+    Notification,
 }
 
 /// The Engine A marker (ARCH-107).
@@ -53,6 +61,13 @@ const ENGINE_MARKER: &str = "LIL_ENGINE";
 /// At most this many open jobs and pending confirmations are named in the session context
 /// (Claude Code caps hook strings at 10,000 characters).
 const LISTED: usize = 20;
+
+/// The longest message and title `notify.claude_code` takes, in characters (Appendix G).
+const NOTICE_MESSAGE_MAX: usize = 2000;
+const NOTICE_TITLE_MAX: usize = 100;
+
+/// The longest the Notification hook waits for the core: Claude Code ignores its result.
+const NOTICE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `lil hook <event>`: reads stdin and prints the output.
 ///
@@ -118,6 +133,10 @@ pub fn run_hook(event: HookEvent, stdin: &str, global: &GlobalArgs) -> (String, 
         HookEvent::PreToolUse => pre_tool_use(&input),
         HookEvent::PostToolUse => {
             post_tool_use(&input);
+            None
+        }
+        HookEvent::Notification => {
+            notification(&input);
             None
         }
         HookEvent::SessionStart => session_start(&input, global),
@@ -209,6 +228,44 @@ fn post_tool_use(input: &Value) {
     let mut args = Map::new();
     args.insert("paths".into(), json!([rel]));
     let _ = client.call_tool("watch.notify", args, None);
+}
+
+/// `s` cut to at most `max` characters.
+fn cut(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Notification: `notify.claude_code` on a core that already runs (module docs).
+fn notification(input: &Value) {
+    let Some(message) = input["message"].as_str().filter(|m| !m.trim().is_empty()) else {
+        return;
+    };
+    let title = match input.get("title") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(_) => return,
+    };
+    let Ok(env) = Env::from_process() else {
+        return;
+    };
+    let Some(cfg) = hook_config(env) else {
+        return;
+    };
+    let mut args = Map::new();
+    args.insert("message".into(), json!(cut(message, NOTICE_MESSAGE_MAX)));
+    if let Some(title) = title.filter(|t| !t.is_empty()) {
+        args.insert("title".into(), json!(cut(title, NOTICE_TITLE_MAX)));
+    }
+    // A core that hangs keeps no `lil` waiting past the deadline (review M8): the hook returns
+    // and the process exits, ending the call's thread with it.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(client) = BlockingClient::connect(&cfg) {
+            let _ = client.call_tool("notify.claude_code", args, Some(lil_client::mint_id("ik")));
+        }
+        let _ = done.send(());
+    });
+    let _ = finished.recv_timeout(NOTICE_DEADLINE);
 }
 
 fn session_start(input: &Value, global: &GlobalArgs) -> Option<Value> {

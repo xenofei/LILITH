@@ -113,6 +113,191 @@ pub fn write_new_file(
     Ok(())
 }
 
+/// Writes `bytes` as the file `path`, directly in one of the suite's own cache folders: the
+/// `.lilref` cache ([`Env::lilref_dir`], APP-021) or the diagnostics folder
+/// ([`Env::diagnostics_dir`], ARCH-119). The folder is made; the data goes to a new temp file
+/// beside the target (flushed to disk), which is moved to the target's name, or replaces the
+/// file there (`ReplaceFileW`, its backup then removed). Whatever fails, the temp file is
+/// removed again, and a file `ReplaceFileW` had already moved to the backup name is moved
+/// back when nothing took its place. Temp and backup files of this function older than a day
+/// (a crash's leftovers) are removed from the folder first.
+///
+/// Refused with `PermissionDenied` before anything is written or made: a relative path, a
+/// path with a `.` or `..` part, a path whose folder isn't one of the two (compared with
+/// `folder_key`, ignoring case), and a file name Windows would read as something else: one
+/// with `:` (a stream), `*?"<>|` or a control character, one ending in `.` or a space, or a
+/// reserved device name (`CON`, `NUL`, `COM1`, … with any extension). So nothing is written
+/// anywhere else (Appendix G).
+///
+/// [`Env::lilref_dir`]: lil_platform::Env::lilref_dir
+/// [`Env::diagnostics_dir`]: lil_platform::Env::diagnostics_dir
+pub fn write_suite_cache_file(
+    env: &lil_platform::Env,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let refuse = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a file of the suite's .lilref or diagnostics folder: {why}",
+                path.display()
+            ),
+        )
+    };
+    if !path.is_absolute() {
+        return Err(refuse("the path is relative"));
+    }
+    // Read from the text: `Path::components` drops a `.` in the middle.
+    if path
+        .to_string_lossy()
+        .split(['\\', '/'])
+        .any(|part| part == "." || part == "..")
+    {
+        return Err(refuse("its name holds `.` or `..`"));
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse("it names no file"));
+    };
+    if let Some(why) = name
+        .to_str()
+        .map_or(Some("its name is not Unicode"), odd_file_name)
+    {
+        return Err(refuse(why));
+    }
+    let key = lil_platform::paths::folder_key(dir);
+    if ![env.lilref_dir(), env.diagnostics_dir()]
+        .iter()
+        .any(|allowed| lil_platform::paths::folder_key(allowed) == key)
+    {
+        return Err(refuse("its folder is another one"));
+    }
+    ensure_dir(dir)?;
+    sweep_leftovers(dir);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
+    let temp = write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none())?;
+    let placed = match move_new(&temp, path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let backup = dir.join(format!("{stem}.bak"));
+            let replaced = replace(path, &temp, &backup);
+            settle_replace(path, &backup, replaced, move_new)
+        }
+        other => other,
+    };
+    if placed.is_err() {
+        let _ = remove_file(&temp);
+    }
+    placed
+}
+
+/// After `ReplaceFileW` of `path` with `backup` gave `replaced`: the backup (the old file) is
+/// removed only once the new file is in place. When the replace failed halfway (the old file
+/// already at the backup name, nothing at `path`), `restore` moves it back; if that fails too,
+/// the backup is kept, the only copy of the old file (review N3).
+fn settle_replace(
+    path: &Path,
+    backup: &Path,
+    replaced: std::io::Result<()>,
+    restore: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match &replaced {
+        Ok(()) => {
+            let _ = remove_file(backup);
+        }
+        Err(_) if !path.exists() && backup.exists() => {
+            if let Err(e) = restore(backup, path) {
+                tracing::warn!(backup = %backup.display(), error = %e, "the old file could not be put back; it is kept at its backup name");
+            }
+        }
+        Err(_) => {}
+    }
+    replaced
+}
+
+/// Why `name` can't be a file name [`write_suite_cache_file`] writes, if it can't.
+fn odd_file_name(name: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Some("its name holds a character Windows reads otherwise");
+    }
+    if name.ends_with(['.', ' ']) {
+        return Some("its name ends in `.` or a space");
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    // `COM0`–`COM9` and `LPT0`–`LPT9`, and the superscript `COM¹`–`COM³` and `LPT¹`–`LPT³`
+    // (review N2).
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix).is_some_and(|n| {
+            let mut digits = n.chars();
+            matches!(
+                (digits.next(), digits.next()),
+                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
+        })
+    };
+    if RESERVED.contains(&stem.as_str()) || numbered("COM") || numbered("LPT") {
+        return Some("its name is a reserved device name");
+    }
+    None
+}
+
+/// Whether `name` is one of [`write_suite_cache_file`]'s temp or backup names:
+/// `.<name>.<pid>-<n>.tmp` or `.bak`, with `<pid>` and `<n>` decimal (review N4).
+fn own_leftover(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".tmp").or_else(|| n.strip_suffix(".bak")))
+    else {
+        return false;
+    };
+    let Some((target, counter)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    !target.is_empty()
+        && counter
+            .split_once('-')
+            .is_some_and(|(pid, n)| decimal(pid) && decimal(n))
+}
+
+/// Removes [`write_suite_cache_file`]'s temp and backup files ([`own_leftover`]) older than a
+/// day from `dir`: what a crash between writing and moving left.
+#[allow(clippy::disallowed_methods)]
+fn sweep_leftovers(dir: &Path) {
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !own_leftover(&name) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > DAY);
+        if old {
+            let _ = remove_file(&entry.path());
+        }
+    }
+}
+
 /// A new file written in pieces (an engine output streamed into a staging handle or a job
 /// cache, Appendix F "ComfyUI client"): [`create_streamed`] creates it (never an existing
 /// file), [`StreamedFile::write`] appends, [`StreamedFile::finish`] flushes it with
@@ -384,6 +569,59 @@ pub fn append_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review N3: the old file at the backup name is removed only once the new file is in
+    /// place; a failed replace puts it back, and when that fails too it is kept.
+    #[test] // spec: APP-021, ARCH-119
+    #[allow(clippy::disallowed_methods)] // plants the old file at its backup name
+    fn a_failed_restore_keeps_the_old_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, backup) = (
+            dir.path().join("a.lilref"),
+            dir.path().join(".a.lilref.1-1.bak"),
+        );
+        let failed = || Err(std::io::Error::other("replace failed"));
+        let cannot = |_: &Path, _: &Path| Err(std::io::Error::other("restore failed"));
+
+        // The restore fails: the backup stays, the only copy.
+        std::fs::write(&backup, b"old").unwrap();
+        assert!(settle_replace(&path, &backup, failed(), cannot).is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert!(!path.exists());
+
+        // The restore works: the old file is back at its name.
+        assert!(settle_replace(&path, &backup, failed(), move_new).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!backup.exists());
+
+        // The new file is in place: the backup goes.
+        std::fs::write(&backup, b"old").unwrap();
+        settle_replace(&path, &backup, Ok(()), cannot).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test] // spec: APP-021, ARCH-119
+    fn only_the_writers_own_leftovers_are_swept() {
+        for own in [
+            ".a.lilref.12-3.tmp",
+            ".a.lilref.12-3.bak",
+            ".bundle.zip.1-99.tmp",
+        ] {
+            assert!(own_leftover(own), "{own}");
+        }
+        for other in [
+            ".a.tmp",
+            ".a.lilref.tmp",
+            ".a.lilref.12-x.tmp",
+            ".a.lilref.12.tmp",
+            "..1-2.tmp",
+            "a.lilref.1-2.tmp",
+            ".a.lilref.1-2.txt",
+            ".task12-temp.tmp",
+        ] {
+            assert!(!own_leftover(other), "{other}");
+        }
+    }
 
     #[test] // spec: ARCH-112
     fn ensure_dir_creates_nested_dirs() {

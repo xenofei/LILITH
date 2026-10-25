@@ -27,7 +27,9 @@
 //!   go to the jobs (they need `queue.v1`, else `caller.not_allowed`; CORE-160),
 //!   `app/desktop.set` goes to the [`DesktopSettingsStore`] (it needs `desktop.v1`, else
 //!   `caller.not_allowed`; a category `desktop.get` doesn't list is -32602; APP-146), as does
-//!   `app/confirmation.answer`'s `toast_token` (a deny from a toast, P4a-R9), and any
+//!   `app/confirmation.answer`'s `toast_token` (a deny from a toast, P4a-R9),
+//!   `app/set_context` goes to the dispatcher, which keeps the sessions' projects (it needs
+//!   `context.v1`, else `caller.not_allowed`; ARCH-088), and any
 //!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   A verified `ui:*` session that can answer confirmations counts in the
@@ -407,6 +409,32 @@ impl RpcRouter {
         }
         if matches!(m, app::QUEUE_PAUSE | app::QUEUE_RESUME) {
             return self.queue(id.clone(), session, m, params, refuse).await;
+        }
+        if m == app::SET_CONTEXT {
+            if !session
+                .capabilities
+                .iter()
+                .any(|c| c == app::CONTEXT_CAPABILITY)
+            {
+                return refuse(format!(
+                    "{m} needs the context.v1 capability, and this session's core/hello did not offer it."
+                ));
+            }
+            let p: app::SetContextParams = match parse_params(params) {
+                Ok(p) => p,
+                Err(error) => {
+                    return Response::Error {
+                        id: Some(id),
+                        error,
+                    };
+                }
+            };
+            let trace_id = self.ids.id("t");
+            let set = self
+                .dispatcher
+                .set_context(session, p.project.as_ref().map(Option::as_deref), &trace_id)
+                .await;
+            return outcome(id, into_outcome(set));
         }
         if m == app::DESKTOP_SET {
             let Some(store) = &self.desktop else {

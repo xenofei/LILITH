@@ -461,12 +461,13 @@ fn hook_args(event: &str) -> Value {
         "SessionStart" => "session-start",
         "PreToolUse" => "pre-tool-use",
         "PostToolUse" => "post-tool-use",
+        "Notification" => "notification",
         other => panic!("a lil hook on an unexpected event {other}"),
     };
     json!(["hook", arg])
 }
 
-/// `plugin.json` has `name: "worldwright"`, `version: "1.3.0"`, and the two `userConfig`
+/// `plugin.json` has `name: "worldwright"`, `version: "1.3.1"`, and the two `userConfig`
 /// paths; `.mcp.json` and `hooks/hooks.json` name them (ruling P3-R6).
 #[test] // spec: ARCH-013, AI-107, ARCH-101
 fn plugin_uses_the_user_config_paths() {
@@ -477,7 +478,7 @@ fn plugin_uses_the_user_config_paths() {
 
     let manifest = read_json(&plugin.join(".claude-plugin").join("plugin.json"));
     assert_eq!(manifest["name"], id, "{manifest}");
-    assert_eq!(manifest["version"], "1.3.0", "{manifest}");
+    assert_eq!(manifest["version"], "1.3.1", "{manifest}");
     for field in ["lil_mcp_path", "lil_path"] {
         let entry = &manifest["userConfig"][field];
         for text in ["title", "description"] {
@@ -518,8 +519,13 @@ fn plugin_uses_the_user_config_paths() {
             // Every hook is the exec-form lil hook (plugin 1.2.0 had no `hooks.json`), and a
             // hook that fails blocks its action (ruling P3-R30).
             for h in group["hooks"].as_array().into_iter().flatten() {
-                let exec = json!({"type": "command", "command": "${user_config.lil_path}",
-                                  "args": hook_args(event), "onFailure": "block"});
+                let mut exec = json!({"type": "command", "command": "${user_config.lil_path}",
+                                      "args": hook_args(event), "onFailure": "block"});
+                // Plugin 1.3.1's Notification hook has no `onFailure`: Claude Code ignores its
+                // exit code (Appendix G "Plugin 1.3.1").
+                if event == "Notification" {
+                    exec.as_object_mut().unwrap().remove("onFailure");
+                }
                 assert_eq!(h, &exec, "{event}: every hook is exec form");
                 lil_hooks.push((event.clone(), matcher.clone()));
             }
@@ -529,7 +535,7 @@ fn plugin_uses_the_user_config_paths() {
     let events: Vec<&str> = lil_hooks.iter().map(|(e, _)| e.as_str()).collect();
     assert_eq!(
         events,
-        ["PostToolUse", "PreToolUse", "SessionStart"],
+        ["Notification", "PostToolUse", "PreToolUse", "SessionStart"],
         "one lil hook per event: {lil_hooks:?}"
     );
     let matcher = |event: &str| {

@@ -1,8 +1,10 @@
 //! The `rmcp` stdio server `lil` (ARCH-012): protocol adaptation only. `tools/list` is the
 //! core's list for this `mcp` session, lowered, plus `lil_status`, which `lil-mcp` answers
 //! itself; `tools/call` takes `retry_token` out of the arguments and uses it as the call's
-//! idempotency key (a fresh key otherwise); results are lowered as Appendix F says. On an
-//! incompatible or unreachable core only `lil_status` is listed (ARCH-014).
+//! idempotency key (a fresh key otherwise); results are lowered as Appendix F says, and an
+//! `open_in` or `ui.show` that started a stopped app says so in one more text block
+//! ([`crate::launch`]). On an incompatible or unreachable core only `lil_status` is listed
+//! (ARCH-014).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ use rmcp::{RoleServer, ServerHandler};
 use serde_json::{Value, json};
 
 use crate::core_link::{CoreLink, LIL_STATUS, Link, Linked};
-use crate::resources;
+use crate::{launch, resources};
 
 const LIL_STATUS_DESCRIPTION: &str = "Whether LILITH's core is connected (status connected, \
 incompatible or unreachable), the caller kind the core gave this session (mcp, or cli when \
@@ -183,6 +185,7 @@ impl ServerHandler for LilServer {
                 return Ok(lower(&refused, None).into());
             }
         };
+        let mut started = None;
         let (outcome, linked) = if request.name == mcp_name(LIL_STATUS) {
             self.status().await
         } else {
@@ -193,7 +196,13 @@ impl ServerHandler for LilServer {
                         .iter()
                         .find(|t| mcp_name(&t.name) == request.name)
                     {
-                        Some(d) => self.link.call(&d.name, args, key).await,
+                        Some(d) => {
+                            let (outcome, on) = self.link.call(&d.name, args, key).await;
+                            if let Some(on) = &on {
+                                started = launch::after_call(on, &d.name, &outcome).await;
+                            }
+                            (outcome, on)
+                        }
                         None => {
                             let unknown = local_error(
                                 &TOOL_UNKNOWN,
@@ -208,7 +217,11 @@ impl ServerHandler for LilServer {
                 }
             }
         };
-        Ok(lower(&outcome, linked.as_deref()).into())
+        let mut result = lower(&outcome, linked.as_deref());
+        if let Some(line) = started {
+            result.content.push(ContentBlock::text(line));
+        }
+        Ok(result.into())
     }
 
     async fn list_resources(

@@ -6,19 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 11
-    # APP-020, APP-063
-    { name = "lil-spec-tests::interchange_4a::open_in_launch_args_carry_base64url_targets", rule = "APP-020", file = "tests/interchange_4a.rs" },
-    # APP-021
-    { name = "lil-spec-tests::interchange_4a::lilref_write_makes_a_file_that_parses_back", rule = "APP-021", file = "tests/interchange_4a.rs" },
-    # APP-021
-    { name = "lil-spec-tests::interchange_4a::lilref_write_refuses_a_candidate_ref", rule = "APP-021", file = "tests/interchange_4a.rs" },
-    # ARCH-088, APP-043
-    { name = "lil-spec-tests::interchange_4a::app_set_context_sets_the_session_project", rule = "ARCH-088", file = "tests/interchange_4a.rs" },
-    # APP-006
-    { name = "lil-spec-tests::interchange_4a::projects_and_workspaces_are_listed", rule = "APP-006", file = "tests/interchange_4a.rs" },
-    # ARCH-015, APP-065
-    { name = "lil-spec-tests::interchange_4a::mcp_launches_a_stopped_app_without_focus", rule = "ARCH-015", file = "tests/interchange_4a.rs" },
     # Task 12
     # ARCH-121, QA-084
     { name = "lil-spec-tests::diagnostics::diagnostics_bundle_redacts_secrets_labels_and_emails", rule = "ARCH-121", file = "tests/diagnostics.rs" },

@@ -410,7 +410,7 @@ pub fn spawn_no_activate(exe: &Path, args: &[String]) -> io::Result<u32> {
         extra_env: Vec::new(),
         remove_env: Vec::new(),
     };
-    let show = Some(SW_SHOWNOACTIVATE.0 as u16);
+    let show = NO_ACTIVATE_SHOW;
     let handle = match create_process(&req, DETACHED_FLAGS | BREAKAWAY, show) {
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {
             create_process(&req, DETACHED_FLAGS, show)
@@ -418,6 +418,24 @@ pub fn spawn_no_activate(exe: &Path, args: &[String]) -> io::Result<u32> {
         other => other,
     }?;
     Ok(handle.pid())
+}
+
+/// The show command [`spawn_no_activate`] starts a program with.
+const NO_ACTIVATE_SHOW: Option<u16> = Some(SW_SHOWNOACTIVATE.0 as u16);
+
+/// The `STARTUPINFOW` of a program started with `show`: `STARTF_USESHOWWINDOW` and that
+/// `wShowWindow`; neither without it.
+fn startup_info(show: Option<u16>) -> STARTUPINFOW {
+    STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        dwFlags: if show.is_some() {
+            STARTF_USESHOWWINDOW
+        } else {
+            STARTUPINFOW_FLAGS(0)
+        },
+        wShowWindow: show.unwrap_or(0),
+        ..Default::default()
+    }
 }
 
 /// `CreateProcessW` as [`SystemSpawner`] documents it; with `show`, the child's first
@@ -432,16 +450,7 @@ fn create_process(req: &SpawnRequest, flags: u32, show: Option<u16>) -> io::Resu
         }
         _ => None,
     };
-    let startup = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        dwFlags: if show.is_some() {
-            STARTF_USESHOWWINDOW
-        } else {
-            STARTUPINFOW_FLAGS(0)
-        },
-        wShowWindow: show.unwrap_or(0),
-        ..Default::default()
-    };
+    let startup = startup_info(show);
     let mut info = PROCESS_INFORMATION::default();
     // SAFETY: every buffer is NUL-terminated (the environment block double-NUL-terminated)
     // and outlives the call; `command_line` is mutable as `CreateProcessW` requires;
@@ -848,6 +857,19 @@ pub fn terminate_self(code: u32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruling I2 of the Task 11 review: `spawn_no_activate` asks for the first window to be
+    /// shown without activation (APP-065); a plain spawn sets no show command.
+    #[test] // spec: APP-065
+    fn spawn_no_activate_shows_without_activating() {
+        let startup = startup_info(NO_ACTIVATE_SHOW);
+        assert_eq!(startup.cb as usize, size_of::<STARTUPINFOW>());
+        assert_eq!(startup.dwFlags, STARTF_USESHOWWINDOW);
+        assert_eq!(startup.wShowWindow, 4, "SW_SHOWNOACTIVATE");
+        let plain = startup_info(None);
+        assert_eq!(plain.dwFlags, STARTUPINFOW_FLAGS(0));
+        assert_eq!(plain.wShowWindow, 0);
+    }
 
     /// Set by `terminate_self_ends_the_process_with_its_code` for the child run only.
     const TERMINATE_HELPER_VAR: &str = "LIL_PLATFORM_TEST_TERMINATE_SELF";

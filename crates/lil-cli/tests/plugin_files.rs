@@ -119,7 +119,7 @@ fn plugin_files_are_valid_and_use_the_user_config_paths() {
 
     let manifest = read_json(&plugin.join(".claude-plugin/plugin.json"));
     assert_eq!(manifest["name"], plugin_name());
-    assert_eq!(manifest["version"], "1.3.0");
+    assert_eq!(manifest["version"], "1.3.1");
     let config = manifest["userConfig"].as_object().expect("userConfig");
     for field in ["lil_mcp_path", "lil_path"] {
         let entry = config[field]
@@ -149,14 +149,20 @@ fn plugin_files_are_valid_and_use_the_user_config_paths() {
             "SessionStart" => "session-start",
             "PreToolUse" => "pre-tool-use",
             "PostToolUse" => "post-tool-use",
+            "Notification" => "notification",
             other => panic!("unexpected event {other}"),
         };
         for group in groups.as_array().expect("a list of groups") {
             for h in group["hooks"].as_array().expect("a list of hooks") {
+                let mut exec = json!({"type": "command", "command": "${user_config.lil_path}",
+                                      "args": ["hook", arg], "onFailure": "block"});
+                // Claude Code ignores a Notification hook's exit code (Appendix G
+                // "Plugin 1.3.1"): it has no `onFailure`.
+                if event == "Notification" {
+                    exec.as_object_mut().unwrap().remove("onFailure");
+                }
                 assert_eq!(
-                    h,
-                    &json!({"type": "command", "command": "${user_config.lil_path}",
-                            "args": ["hook", arg], "onFailure": "block"}),
+                    h, &exec,
                     "{event}: exec form, the event as `lil hook` takes it, failing closed"
                 );
             }
@@ -195,6 +201,38 @@ fn plugin_files_are_valid_and_use_the_user_config_paths() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// Plugin 1.3.1 (ARCH-103, AI-116; Appendix G "Plugin 1.3.1", P4a-R18): `version` "1.3.1",
+/// and `hooks.json` gains one Notification hook, `lil hook notification` in exec form with no
+/// matcher and no `onFailure`, beside the three hooks of 1.3. The `lilith` skill says how to
+/// give the person a link to a sealed version (APP-021).
+#[test] // spec: ARCH-103, AI-116, APP-021
+fn plugin_1_3_1_has_the_notification_hook() {
+    let dir = plugin_dir();
+    assert_eq!(
+        read_json(&dir.join(".claude-plugin/plugin.json"))["version"],
+        "1.3.1"
+    );
+    let hooks = read_json(&dir.join("hooks/hooks.json"));
+    let mut events: Vec<&String> = hooks["hooks"].as_object().unwrap().keys().collect();
+    events.sort();
+    assert_eq!(
+        events,
+        ["Notification", "PostToolUse", "PreToolUse", "SessionStart"]
+    );
+    assert_eq!(
+        hooks["hooks"]["Notification"],
+        json!([{"hooks": [{"type": "command", "command": "${user_config.lil_path}",
+                           "args": ["hook", "notification"]}]}])
+    );
+    let skill = std::fs::read_to_string(dir.join("skills/lilith/SKILL.md")).unwrap();
+    assert!(
+        skill
+            .lines()
+            .any(|l| l.contains("`lilref_write`") && l.contains("link")),
+        "{skill}"
+    );
 }
 
 /// `carried-1.2.0.toml`: one `[[file]] path, sha256` per file copied from plugin 1.2.0.
@@ -311,7 +349,7 @@ fn plugin_1_3_carries_none_of_the_retired_parts() {
     let dir = plugin_dir();
     assert_eq!(
         read_json(&dir.join(".claude-plugin/plugin.json"))["version"],
-        "1.3.0"
+        "1.3.1"
     );
     let retired = ["licenses", "compliance", "license-auditor"];
     let mut files = Vec::new();

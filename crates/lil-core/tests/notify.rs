@@ -1323,11 +1323,27 @@ fn agent_open_posts_agent_activity_with_an_open_url() {
     );
     until_posts(&mut p, "agent_activity", 2);
 
-    // A target whose open URL would pass 8,192 characters: no launch.
-    let long = format!(r"C:\{}.png", "\u{1F600}".repeat(2000));
+    // The longest target, 4,096 bytes of UTF-8, still has its open URL (well within 8,192
+    // characters); a longer one is refused before anything is posted (Appendix G "`lil:`
+    // URLs", plan 4a clarification 2026-10-25).
+    let long = format!(r"C:\{}.png", "\u{1F600}".repeat(1022));
+    assert_eq!(long.len(), 4095);
     p.tool_ok("ui.show", json!({"target": long}), None);
     let toast = until_posts(&mut p, "agent_activity", 3).remove(2);
-    assert!(toast.get("launch").is_none(), "{toast}");
+    assert_eq!(
+        toast["launch"],
+        lil_parse::open_url(&scheme, &long),
+        "{toast}"
+    );
+    let longer = format!(r"C:\{}.png", "\u{1F600}".repeat(1023));
+    let refused = p.tool("ui.show", json!({ "target": longer }), None);
+    assert_eq!(refused["error"]["code"], "params.invalid", "{refused}");
+    fence(&mut p, &env);
+    assert_eq!(
+        posts(&mut p, "agent_activity").len(),
+        3,
+        "nothing posted for it"
+    );
 
     // Your own app's request posts nothing.
     let mut a = app(&env);

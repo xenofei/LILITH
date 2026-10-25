@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use lil_testkit::bins::{Located, locate, locate_from};
 
 /// The file names every test binary folder holds.
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 8] = [
     "lil.exe",
     "lil-core.exe",
     "lil-mcp.exe",
     "lil-test-app.exe",
     "lil-fake-comfyui.exe",
     "lil-fake-comfy-cli.exe",
+    "lil-fake-image.exe",
     "claude.exe",
 ];
 

@@ -124,7 +124,7 @@ fn fake_claude_honours_claude_config_dir() {
         claude(&env, Some(dir), &["plugin", "list", "--json"]),
         (0, "[]\n".into())
     );
-    let plugins = r#"[{"id":"demo@market","version":"1.3.0","enabled":true}]"#;
+    let plugins = r#"[{"id":"demo@market","version":"1.3.1","enabled":true}]"#;
     std::fs::write(dir.join("fake-plugins.json"), plugins).unwrap();
     assert_eq!(
         claude(&env, Some(dir), &["plugin", "list", "--json"]),

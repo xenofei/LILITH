@@ -1,8 +1,10 @@
 //! The app handler registry, `open_in` and `ui.show` (APP-061, APP-063–066): registrations
 //! from both folders, handlers matched on type and format, a running app told without focus
-//! for an agent, a launch command and no process for an app that isn't running, and the closed
-//! set of intents. Driven through the registered tools on a `Registry`, with the connections
-//! the production router reports ([`ConnObserver`]) simulated.
+//! for an agent, a launch command and no process for an app that isn't running, whose last
+//! argument is the target as a base64url `open/` URL (APP-020, N6), and the closed set of
+//! intents; and `lilref.write` (APP-021), which writes only in the `.lilref` cache. Driven
+//! through the registered tools on a `Registry`, with the connections the production router
+//! reports ([`ConnObserver`]) simulated.
 
 mod common;
 
@@ -12,13 +14,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lil_core::events::EventBus;
-use lil_core::interchange::{Interchange, load_registrations, register_interchange_tools};
+use lil_core::interchange::{
+    AppRegistration, Intent, Interchange, OpensEntry, Target, launch_args, load_registrations,
+    register_interchange_tools,
+};
 use lil_core::server::ConnObserver;
 use lil_core::session::Session;
 use lil_core::tools::{CallCtx, Registry};
+use lil_parse::{LilUrl, parse_lil_url};
 use lil_protocol::CallerKind;
 use lil_testkit::files::write_file;
-use lil_testkit::{FakeClock, TestEnv};
+use lil_testkit::{FakeClock, TestEnv, sha256_bytes};
 use serde_json::{Value, json};
 
 /// A failure deadline only, never a measurement (QA-031).
@@ -47,7 +53,7 @@ struct Rig {
 fn rig() -> Rig {
     let env = TestEnv::new();
     let core_dir = env.root().join("core");
-    let interchange = Interchange::new(core_dir.clone(), env.env.data_dir());
+    let interchange = Interchange::new(core_dir.clone(), env.env.clone());
     let mut reg = Registry::new();
     register_interchange_tools(&mut reg, &interchange);
     Rig {
@@ -131,14 +137,95 @@ fn registrations_load_from_both_folders() {
     // An external program can't replace an installed app.
     register(&data_dir, "test", r"C:\Tools\fake.exe", "", "", r#""open""#);
 
-    let regs = load_registrations(&r.core_dir, &data_dir);
+    let regs = load_registrations(&r.core_dir, &data_dir, false);
     let names: Vec<(&str, bool)> = regs.iter().map(|g| (g.app.as_str(), g.external)).collect();
     assert_eq!(names, [("test", false), ("viewer", true)]);
     // An installed app's relative exe is beside the core.
     assert_eq!(regs[0].exe, r.core_dir.join("test.exe"));
     assert_eq!(regs[1].exe, PathBuf::from(r"C:\Tools\viewer.exe"));
     assert_eq!(regs[1].args, ["--flag"]);
-    assert!(load_registrations(&r.core_dir.join("nowhere"), &r.core_dir.join("nor")).is_empty());
+    assert!(
+        load_registrations(&r.core_dir.join("nowhere"), &r.core_dir.join("nor"), false).is_empty()
+    );
+}
+
+/// Ruling I1 of the Task 11 review: an external registration whose exe is in the core's folder
+/// (or below it) is skipped, so it can't start a suite program with arguments of its own.
+#[test] // spec: APP-061, ARCH-015
+#[allow(clippy::disallowed_methods)] // makes the hard link and the folder it is in
+fn an_external_registration_of_a_suite_exe_is_skipped() {
+    let r = rig();
+    let data_dir = r.env.env.data_dir();
+    register(
+        &r.core_dir,
+        "image",
+        "lil-image.exe",
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let inside = r.core_dir.join("LIL-IMAGE.EXE");
+    let below = r.core_dir.join("sub").join("x.exe");
+    for (name, exe) in [("evil", &inside), ("evil-two", &below)] {
+        register(
+            &data_dir,
+            name,
+            &exe.display().to_string(),
+            r#""image""#,
+            r#""png""#,
+            r#""open""#,
+        );
+    }
+    register(
+        &data_dir,
+        "viewer",
+        &r.env
+            .root()
+            .join("tools")
+            .join("viewer.exe")
+            .display()
+            .to_string(),
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let test_app = r.core_dir.join("lil-test-app.exe");
+    register(
+        &data_dir,
+        "test",
+        &test_app.display().to_string(),
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let names = |test_app: bool| -> Vec<String> {
+        load_registrations(&r.core_dir, &data_dir, test_app)
+            .into_iter()
+            .map(|g| g.app)
+            .collect()
+    };
+    assert_eq!(names(false), ["image", "viewer"]);
+
+    // Review N1: the same file by another path is caught by its identity, not its path.
+    write_file(&r.core_dir.join("lil-image.exe"), b"MZ suite program");
+    let tools = r.env.root().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let link = tools.join("innocent.exe");
+    std::fs::hard_link(r.core_dir.join("lil-image.exe"), &link).unwrap();
+    register(
+        &data_dir,
+        "linked",
+        &link.display().to_string(),
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    assert_eq!(names(false), ["image", "viewer"]);
+    // An unrelated program outside is still registered.
+    write_file(&tools.join("viewer.exe"), b"MZ another program");
+    assert_eq!(names(false), ["image", "viewer"]);
+    // On a test channel the test app, beside the test core, may be registered from outside.
+    assert_eq!(names(true), ["image", "test", "viewer"]);
 }
 
 #[tokio::test] // spec: APP-061
@@ -278,9 +365,15 @@ async fn open_in_never_spawns_a_process() {
         result["launch_command"]["exe"],
         exe.to_string_lossy().as_ref()
     );
+    let scheme = r.env.env.activation_scheme();
     assert_eq!(
         result["launch_command"]["args"],
-        json!(["--flag", format!("lil:open/{}", target.display())])
+        json!([
+            "--flag",
+            "--intent",
+            "open",
+            lil_parse::open_url(&scheme, &target.to_string_lossy())
+        ])
     );
     let tasks = std::process::Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq spec-viewer.exe", "/NH"])
@@ -365,4 +458,303 @@ async fn a_target_of_unknown_type_has_no_handler() {
         .await
         .unwrap();
     assert_eq!(png["handlers"].as_array().unwrap().len(), 2, "{png}");
+}
+
+/// The target the launch argument `url` carries, read as the app's handler reads it.
+fn opened_by(url: &str, scheme: &str) -> String {
+    match parse_lil_url(url, scheme) {
+        Ok(LilUrl::Open(target)) => target,
+        other => panic!("{url:?} is not an open/ URL of {scheme}: {other:?}"),
+    }
+}
+
+#[test] // spec: APP-020, APP-063
+fn launch_args_are_intent_then_a_base64url_url() {
+    let reg = AppRegistration {
+        app: "image".into(),
+        exe: PathBuf::from(r"C:\Suite\lil-image.exe"),
+        args: vec!["--flag".into(), "two words".into()],
+        opens: vec![OpensEntry {
+            types: Vec::new(),
+            formats: Vec::new(),
+            intents: vec![Intent::Open, Intent::Edit, Intent::UseAsInput],
+        }],
+        external: false,
+    };
+    let scheme = "lil-test-0a1b";
+    let sealed = format!(
+        "lil://0123456789abcdef/sketchbook/kite@1.0.0#sha256={}",
+        "ab".repeat(32)
+    );
+    for (text, intent, word) in [
+        (sealed.as_str(), Intent::Open, "open"),
+        ("doc:d_1/proposal/r_20261018_0900/1", Intent::Edit, "edit"),
+        (
+            r"C:\pics\a picture #1 ünï.png",
+            Intent::UseAsInput,
+            "use_as_input",
+        ),
+    ] {
+        let target = Target::parse(text).unwrap();
+        let args = launch_args(&reg, &target, intent, scheme);
+        assert_eq!(args.len(), 5, "{args:?}");
+        assert_eq!(
+            args[..4],
+            ["--flag", "two words", "--intent", word],
+            "{args:?}"
+        );
+        let b64 = args[4]
+            .strip_prefix(&format!("{scheme}:open/"))
+            .unwrap_or_else(|| panic!("{args:?}"));
+        assert!(
+            b64.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "base64url without padding: {args:?}"
+        );
+        assert_eq!(opened_by(&args[4], scheme), text);
+    }
+}
+
+#[tokio::test] // spec: APP-020
+async fn a_target_is_at_most_4096_bytes() {
+    let r = rig();
+    register(&r.core_dir, "test", "test.exe", "", "", r#""open""#);
+    let agent = r.ctx(CallerKind::Cli);
+    // 4,096 bytes is the longest target an open/ URL carries.
+    let longest = format!("{}.png", "a".repeat(4092));
+    let args = json!({"app": "test", "target": longest, "intent": "open"});
+    let opened = common::call(&r.reg, &agent, "open_in", args).await.unwrap();
+    let url = opened["launch_command"]["args"][3].as_str().unwrap();
+    assert_eq!(opened_by(url, &r.env.env.activation_scheme()), longest);
+    // Fewer than 4,096 characters, but more bytes.
+    let wide = format!("{}.png", "ü".repeat(2047));
+    assert!(wide.chars().count() < 4096 && wide.len() > 4096);
+    let args = json!({"app": "test", "target": wide, "intent": "open"});
+    let refused = common::call(&r.reg, &agent, "open_in", args)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "params.invalid");
+}
+
+/// A sealed ref with a content hash, in a workspace that needn't be open.
+fn sealed(asset: &str) -> String {
+    format!(
+        "lil://0123456789abcdef/sketchbook/{asset}@1.0.0#sha256={}",
+        "ab".repeat(32)
+    )
+}
+
+/// The file names in `dir`.
+fn names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[tokio::test] // spec: APP-021
+async fn lilref_write_path_and_contents() {
+    let r = rig();
+    let agent = r.ctx(CallerKind::Mcp);
+    let kite = sealed("kite");
+    let args = json!({"ref": kite, "title": "Kite, sealed"});
+    let written = common::call(&r.reg, &agent, "lilref.write", args)
+        .await
+        .unwrap();
+    let path = PathBuf::from(written["path"].as_str().unwrap());
+    let name = format!("{}.lilref", &sha256_bytes(kite.as_bytes())[..16]);
+    assert_eq!(path, r.env.env.lilref_dir().join(&name), "{written}");
+    let parsed = lil_schema::parse_lilref(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(parsed.r#ref, kite);
+    assert_eq!(parsed.title.as_deref(), Some("Kite, sealed"));
+
+    // The same ref again replaces its file; a ref from before the rename is written in the
+    // canonical form, so it is the same file.
+    common::call(&r.reg, &agent, "lilref.write", json!({ "ref": kite }))
+        .await
+        .unwrap();
+    let parsed = lil_schema::parse_lilref(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(parsed.title, None);
+    let legacy = kite.replacen(lil_schema::SCHEME, lil_schema::LEGACY_SCHEME, 1);
+    let again = common::call(&r.reg, &agent, "lilref.write", json!({ "ref": legacy }))
+        .await
+        .unwrap();
+    assert_eq!(again["path"], written["path"], "{again}");
+    assert_eq!(
+        names_in(&r.env.env.lilref_dir()),
+        [name],
+        "one file, no temp left"
+    );
+}
+
+#[tokio::test] // spec: APP-021
+async fn lilref_write_refuses_unsealed_refs() {
+    let r = rig();
+    let agent = r.ctx(CallerKind::Mcp);
+    for bad in [
+        "lil://0123456789abcdef/sketchbook/kite@1.0.0",
+        "lil://0123456789abcdef/sketchbook/kite@candidate/r_20261002_0915/a.png",
+        "lil://nonsense",
+        r"C:\pics\a.png",
+    ] {
+        let refused = common::call(&r.reg, &agent, "lilref.write", json!({ "ref": bad }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "ref.invalid", "{bad}");
+    }
+    for title in [
+        "x".repeat(201),
+        "a\nb".to_string(),
+        "\u{202E}gnp.exe".to_string(),
+    ] {
+        let args = json!({"ref": sealed("kite"), "title": title});
+        let refused = common::call(&r.reg, &agent, "lilref.write", args)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "params.invalid", "{title:?}");
+    }
+    assert!(
+        !r.env.env.lilref_dir().exists(),
+        "nothing was written for a refused call"
+    );
+}
+
+#[test] // spec: APP-021, ARCH-112
+fn lilref_write_stays_in_the_cache_folder() {
+    use lil_core::store::fsops::write_suite_cache_file;
+    let env = TestEnv::new();
+    let cache = env.env.lilref_dir();
+    let diagnostics = env.env.diagnostics_dir();
+    write_suite_cache_file(&env.env, &cache.join("a.lilref"), b"one").unwrap();
+    write_suite_cache_file(&env.env, &cache.join("a.lilref"), b"two").unwrap();
+    assert_eq!(std::fs::read(cache.join("a.lilref")).unwrap(), b"two");
+    assert_eq!(names_in(&cache), ["a.lilref"], "no temp or backup left");
+    write_suite_cache_file(&env.env, &diagnostics.join("bundle.zip"), b"zip").unwrap();
+    assert_eq!(
+        std::fs::read(diagnostics.join("bundle.zip")).unwrap(),
+        b"zip"
+    );
+    let local = env.env.local_dir();
+    for outside in [
+        local.join("cache").join("a.lilref"),
+        local.join(r"cache\lilref\..\escaped.lilref"),
+        local.join(r"cache\lilref\.\dot.lilref"),
+        cache.join("sub").join("a.lilref"),
+        env.root().join("elsewhere.lilref"),
+        cache.clone(),
+        PathBuf::from("a.lilref"),
+        // Names Windows reads as something else (review M1).
+        cache.join("a.lilref:evil"),
+        cache.join("a*.lilref"),
+        cache.join("a?.lilref"),
+        cache.join("a\"b.lilref"),
+        cache.join("a<b.lilref"),
+        cache.join("a>b.lilref"),
+        cache.join("a|b.lilref"),
+        cache.join("a\u{1}b.lilref"),
+        cache.join("a.lilref."),
+        cache.join("a.lilref "),
+        cache.join("NUL"),
+        cache.join("nul.lilref"),
+        cache.join("Con.txt"),
+        cache.join("aux"),
+        cache.join("PRN.zip"),
+        cache.join("com1.lilref"),
+        cache.join("LPT9"),
+        cache.join("nul .lilref"),
+        cache.join("COM\u{B9}.lilref"),
+        cache.join("lpt\u{B3}"),
+        cache.join("CONIN$"),
+        cache.join("conout$.txt"),
+    ] {
+        let refused = write_suite_cache_file(&env.env, &outside, b"x").unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{}",
+            outside.display()
+        );
+    }
+    assert!(!local.join("cache").join("a.lilref").exists());
+    assert!(!local.join("cache").join("escaped.lilref").exists());
+    assert!(!cache.join("sub").exists());
+    // The folder is compared as Windows compares names, ignoring case.
+    let upper = PathBuf::from(cache.to_string_lossy().to_uppercase()).join("b.lilref");
+    write_suite_cache_file(&env.env, &upper, b"b").unwrap();
+    assert_eq!(std::fs::read(cache.join("b.lilref")).unwrap(), b"b");
+    // Names that only look like device names are fine.
+    for fine in ["console.lilref", "com10.lilref", "nul-x.lilref", "lpt.zip"] {
+        write_suite_cache_file(&env.env, &cache.join(fine), b"f").unwrap();
+    }
+}
+
+/// Review M2: a crash's temp and backup files older than a day are swept when the folder is
+/// written next; newer ones, and other files, stay.
+#[test] // spec: APP-021, ARCH-119
+#[allow(clippy::disallowed_methods)] // ages the leftovers it plants
+fn suite_cache_leftovers_older_than_a_day_are_swept() {
+    use lil_core::store::fsops::write_suite_cache_file;
+    let env = TestEnv::new();
+    let cache = env.env.lilref_dir();
+    let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+    for name in [
+        ".a.lilref.1-1.tmp",
+        ".a.lilref.1-2.bak",
+        ".b.lilref.1-3.tmp",
+        ".someone-else.tmp",
+        "old.lilref",
+    ] {
+        write_file(&cache.join(name), b"x");
+        if name != ".b.lilref.1-3.tmp" {
+            std::fs::File::options()
+                .write(true)
+                .open(cache.join(name))
+                .unwrap()
+                .set_modified(two_days_ago)
+                .unwrap();
+        }
+    }
+    write_suite_cache_file(&env.env, &cache.join("c.lilref"), b"c").unwrap();
+    let mut left = names_in(&cache);
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            ".b.lilref.1-3.tmp",
+            ".someone-else.tmp",
+            "c.lilref",
+            "old.lilref"
+        ]
+    );
+}
+
+/// The interchange rows (CORE-146; Appendix G): `handlers.for`, `open_in` and `ui.show` read,
+/// `lilref.write` and `notify.claude_code` write, all in `interchange`.
+#[test] // spec: CORE-146, CORE-058, APP-021
+fn the_interchange_tools_are_pinned() {
+    let r = rig();
+    let mut tools: Vec<(String, String, String)> = r
+        .reg
+        .descriptors()
+        .into_iter()
+        .map(|d| (d.name, format!("{:?}", d.effect), d.module))
+        .collect();
+    tools.sort();
+    let row = |name: &str, effect: &str| {
+        (
+            name.to_string(),
+            effect.to_string(),
+            "interchange".to_string(),
+        )
+    };
+    assert_eq!(
+        tools,
+        [
+            row("handlers.for", "Read"),
+            row("lilref.write", "Write"),
+            row("notify.claude_code", "Write"),
+            row("open_in", "Read"),
+            row("ui.show", "Read"),
+        ]
+    );
 }
