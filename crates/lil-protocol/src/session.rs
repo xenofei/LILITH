@@ -36,8 +36,8 @@ pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
 /// The capabilities this build offers. A minor version adds features only as new strings:
 /// 1.0 had `events.v1` and `tools.v1`; 1.1 adds `jobs.v1`, `confirmations.v1` and `caps.v1`
 /// (the `app/*` methods need `confirmations.v1` or `caps.v1` in the shared capabilities); 1.2
-/// adds `queue.v1` (`app/queue.pause` and `app/queue.resume` need it), and plan 4a's later
-/// capabilities follow it.
+/// adds `queue.v1` (`app/queue.pause` and `app/queue.resume` need it) and `desktop.v1`
+/// (`app/desktop.set` needs it), and plan 4a's later capabilities follow them.
 pub const CAPABILITIES: &[&str] = &[
     "events.v1",
     "tools.v1",
@@ -45,6 +45,7 @@ pub const CAPABILITIES: &[&str] = &[
     "confirmations.v1",
     "caps.v1",
     "queue.v1",
+    "desktop.v1",
 ];
 
 /// `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">`; the suffix is fixed at compile time by
@@ -167,6 +168,8 @@ pub fn schema_hash() -> String {
             // Protocol 1.2.
             schemars::schema_for!(crate::app::QueueParams),
             schemars::schema_for!(crate::app::QueueState),
+            schemars::schema_for!(crate::app::DesktopSetParams),
+            schemars::schema_for!(crate::app::DesktopSettings),
         ];
         let all = serde_json::Value::Array(
             schemas
@@ -467,8 +470,9 @@ mod tests {
         assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
     }
 
-    /// Protocol 1.2 (Appendix D): the five capabilities of 1.1, then `queue.v1`, shared in the
-    /// core's order. Checked by content, so the later plan-4a capabilities may follow it.
+    /// Protocol 1.2 (Appendix D): the five capabilities of 1.1, then `queue.v1` and
+    /// `desktop.v1`, shared in the core's order. Checked by position, so the later plan-4a
+    /// capabilities may follow them.
     #[test] // spec: ARCH-029, APP-043
     fn protocol_is_1_2_and_offers_queue_v1() {
         assert_eq!(PROTOCOL.to_string(), "1.2");
@@ -481,6 +485,7 @@ mod tests {
         ];
         assert_eq!(&CAPABILITIES[..5], &of_1_1);
         assert_eq!(CAPABILITIES.get(5), Some(&"queue.v1"));
+        assert_eq!(CAPABILITIES.get(6), Some(&"desktop.v1"));
         let unique: std::collections::BTreeSet<_> = CAPABILITIES.iter().collect();
         assert_eq!(unique.len(), CAPABILITIES.len(), "{CAPABILITIES:?}");
         // A client offering them all, in another order and with an unknown one, gets them in
@@ -591,7 +596,7 @@ mod tests {
         // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation)
         // and `app/caps.set`'s params and `CapsView`; 1.2 the `app/queue.*` params and
         // `QueueState`, and the fix's optional `user_hint` (Appendix G "Out of memory").
-        assert_eq!(h, "206c4af53e269e72");
+        assert_eq!(h, "c24f996f22d5a3cc");
     }
 
     #[test] // spec: ARCH-029

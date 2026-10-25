@@ -5,6 +5,7 @@
 
 pub mod asset_read_tools;
 pub mod asset_tools;
+pub mod desktop_tools;
 pub mod dispatcher;
 pub mod doctor_tools;
 pub mod job_tools;
@@ -27,6 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
 pub use asset_tools::register_asset_tools;
+pub use desktop_tools::register_desktop_tools;
 pub use dispatcher::{Dispatcher, Redispatch};
 pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
 pub use job_tools::{JOB_RETRY, register_job_tools};
@@ -42,7 +44,8 @@ pub use stages::{
 };
 pub use telemetry_tools::register_telemetry_tools;
 pub use test_tools::{
-    TEST_JOB_KIND, TEST_MODULE, TestGates, TestJobHandler, register_hw_tick, register_test_tools,
+    TEST_JOB_KIND, TEST_MODULE, TestGates, TestJobHandler, register_hw_tick, register_test_desktop,
+    register_test_tools,
 };
 pub use topics::{AssetSnapshots, ProjectSnapshots, register_snapshots};
 pub use trash_tools::register_trash_tools;

@@ -14,7 +14,8 @@
 //! `server`, which builds every module and wires them together.
 //!
 //! Every module of the crate is scanned, the infrastructure ones too (`state`, `workspace`,
-//! `server`, `transport`, `rpc`, `config`, `events`, `identity`, `lifecycle`, `session`), and
+//! `server`, `transport`, `rpc`, `config`, `events`, `identity`, `lifecycle`, `session`,
+//! `desktop`), and
 //! the list is checked against `src/lib.rs`, so a new module can't be missed. The store names
 //! none of them: it defines `StoreRows`, which `state` implements, and `Access`, which
 //! `workspace` re-exports; `state` holds `WorkspaceRef`. The connection types (`ConnCtx`,
@@ -39,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 /// Every module of the crate (`pub mod` in `src/lib.rs`): the CORE-014 modules and the
 /// infrastructure.
-const MODULES: [&str; 26] = [
+const MODULES: [&str; 27] = [
     "store",
     "index",
     "watch",
@@ -66,6 +67,7 @@ const MODULES: [&str; 26] = [
     "identity",
     "lifecycle",
     "session",
+    "desktop",
 ];
 
 /// The modules `src/lib.rs` declares, at any visibility: `mod`, `pub mod`, `pub(crate) mod`,
@@ -506,6 +508,14 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     // that trait (`ConfirmStage::on_replay`).
     forbidden("tools", &["confirm"]);
     forbidden("jobs", &["confirm"]);
+    // `desktop` is infrastructure (P4a-R24): it drives the jobs' pause and watches them for
+    // keep-awake; `tools` registers its tools, so it never uses `tools`, and neither `jobs` nor
+    // `telemetry` knows it.
+    forbidden("desktop", &["tools", "confirm", "meter", "engines"]);
+    forbidden("jobs", &["desktop"]);
+    forbidden("telemetry", &["desktop"]);
+    assert!(graph["desktop"].contains("jobs"), "{graph:?}");
+    assert!(graph["tools"].contains("desktop"), "{graph:?}");
     assert!(graph["confirm"].contains("tools"), "{graph:?}");
     // `resources` is registered by the server like `engines`: no other module names it, and it
     // uses `tools` (the call context and the registry) and the store.

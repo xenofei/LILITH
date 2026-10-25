@@ -841,6 +841,48 @@ fn every_tool_declares_a_module() {
     assert!(refused.is_err());
 }
 
+/// The desktop's tools (P4a-R24, APP-039): `desktop.get` is the only `desktop` tool and only
+/// reads (the settings change only through `app/desktop.set`); `test.desktop` is a test tool.
+/// The server registers both, `test.desktop` on test channels only.
+#[tokio::test] // spec: APP-039, APP-146, CORE-058
+async fn the_desktop_tools_are_pinned() {
+    let env = TestEnv::new();
+    let fake = Arc::new(lil_platform::desktop_fake::FakeDesktop::new());
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let store = crate::desktop::DesktopSettingsStore::load(
+        env.env.clone(),
+        fake.clone(),
+        env.root().join("lil-image.exe"),
+        clock.clone(),
+        Arc::new(SeqIds::new()),
+        Arc::new(EventBus::new(clock)),
+        FailPoints::none(),
+    );
+    let mut reg = Registry::new();
+    register_desktop_tools(&mut reg, &store);
+    register_test_desktop(&mut reg, fake, Arc::new(crate::desktop::UiApps::default()));
+    let tools: Vec<(String, EffectClass, String)> = reg
+        .descriptors()
+        .into_iter()
+        .map(|d| (d.name, d.effect, d.module))
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            (
+                "desktop.get".to_string(),
+                EffectClass::Read,
+                crate::desktop::DESKTOP_MODULE.to_string()
+            ),
+            (
+                "test.desktop".to_string(),
+                EffectClass::Write,
+                TEST_MODULE.to_string()
+            ),
+        ]
+    );
+}
+
 #[test] // spec: CORE-014
 fn registry_and_dispatcher_live_in_the_tools_module() {
     let _: fn() -> crate::tools::Registry = crate::tools::Registry::new;

@@ -6,17 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 9
-    # APP-039, APP-146
-    { name = "lil-spec-tests::desktop::desktop_settings_are_set_only_by_a_verified_app", rule = "APP-039", file = "tests/desktop.rs" },
-    # CORE-160
-    { name = "lil-spec-tests::desktop::autopause_is_off_by_default", rule = "CORE-160", file = "tests/desktop.rs" },
-    # CORE-160
-    { name = "lil-spec-tests::desktop::fullscreen_autopause_pauses_and_resumes", rule = "CORE-160", file = "tests/desktop.rs" },
-    # CORE-160
-    { name = "lil-spec-tests::desktop::fullscreen_reason_never_clears_a_manual_pause", rule = "CORE-160", file = "tests/desktop.rs" },
-    # ARCH-127
-    { name = "lil-spec-tests::desktop::keep_awake_is_held_only_while_a_gpu_job_runs", rule = "ARCH-127", file = "tests/desktop.rs" },
     # Task 10
     # APP-146, APP-022
     { name = "lil-spec-tests::notifications::toasts_follow_categories_and_defaults", rule = "APP-146", file = "tests/notifications.rs" },

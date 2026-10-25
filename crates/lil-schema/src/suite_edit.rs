@@ -257,9 +257,145 @@ fn set_value(table: &mut dyn toml_edit::TableLike, key: &str, amount: &str) {
     table.insert(key, new);
 }
 
+/// A change of the desktop settings (`app/desktop.set`; Appendix G "Notifications"): each
+/// `Some` is written, each `None` left as it is. `notifications` holds `(category, on)` pairs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopEdit {
+    pub notifications: Vec<(String, bool)>,
+    pub quiet_while_fullscreen: Option<bool>,
+    pub fullscreen_autopause: Option<bool>,
+    pub keep_awake_gpu: Option<bool>,
+}
+
+/// Applies `edit`: the categories and `quiet_while_fullscreen` under `[notifications]`,
+/// `fullscreen_autopause` under `[jobs]` and `keep_awake_gpu` under `[power]`, each a TOML
+/// boolean; a missing table is added. Comments, key order and every other key and table are
+/// kept. Returns the new text; when nothing changes it is `text` itself, byte for byte. A
+/// leading UTF-8 byte-order mark is kept.
+///
+/// # Errors
+/// The text isn't TOML, or `notifications`, `jobs` or `power` isn't a table.
+pub fn set_desktop(text: &str, edit: &DesktopEdit) -> Result<String, String> {
+    let (bom, body) = match text.strip_prefix(BOM) {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let mut doc: DocumentMut = body
+        .parse()
+        .map_err(|e| format!("suite.toml is not valid TOML: {e}"))?;
+    let before = doc.to_string();
+    let mut changes: Vec<(&str, &str, bool)> = edit
+        .notifications
+        .iter()
+        .map(|(category, on)| ("notifications", category.as_str(), *on))
+        .collect();
+    for (table, key, value) in [
+        (
+            "notifications",
+            "quiet_while_fullscreen",
+            edit.quiet_while_fullscreen,
+        ),
+        ("jobs", "fullscreen_autopause", edit.fullscreen_autopause),
+        ("power", "keep_awake_gpu", edit.keep_awake_gpu),
+    ] {
+        if let Some(value) = value {
+            changes.push((table, key, value));
+        }
+    }
+    for (table, key, on) in changes {
+        if doc.get(table).is_none() {
+            doc.insert(table, Item::Table(implicit()));
+        }
+        let t = doc
+            .get_mut(table)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| format!("suite.toml: `{table}` is not a table"))?;
+        if t.get(key).and_then(Item::as_bool) == Some(on) {
+            continue;
+        }
+        let mut new = value(on);
+        match t.get_mut(key) {
+            // In place, so the key keeps the comment above it and the value its own.
+            Some(item) => {
+                if let (Some(old), Some(v)) = (item.as_value(), new.as_value_mut()) {
+                    *v.decor_mut() = old.decor().clone();
+                }
+                *item = new;
+            }
+            None => {
+                t.insert(key, new);
+            }
+        }
+    }
+    let after = doc.to_string();
+    Ok(if after == before {
+        text.to_string()
+    } else {
+        let mut out = after;
+        if bom {
+            out.insert(0, BOM);
+        }
+        out
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: APP-146, CORE-007
+    fn set_desktop_writes_booleans_and_keeps_comments_and_other_keys() {
+        let text = "# my suite, by hand\ndefault_workspace = 'C:\\w'\n\n\
+                    [notifications]\n# off while I stream\njob_finished = true # was on\n\
+                    job_progress = true\n\n[jobs]\npreempt_agent_batches = true\n";
+        let edit = DesktopEdit {
+            notifications: vec![("job_finished".into(), false), ("cap_alert".into(), false)],
+            quiet_while_fullscreen: None,
+            fullscreen_autopause: Some(true),
+            keep_awake_gpu: Some(false),
+        };
+        let out = set_desktop(text, &edit).unwrap();
+        assert!(out.starts_with("# my suite, by hand\n"), "{out}");
+        assert!(out.contains("# off while I stream\n"), "{out}");
+        assert!(out.contains("job_finished = false # was on\n"), "{out}");
+        assert!(
+            out.contains("job_progress = true\n"),
+            "unknown keys stay: {out}"
+        );
+        assert!(out.contains("preempt_agent_batches = true\n"), "{out}");
+        assert!(out.contains("[power]\nkeep_awake_gpu = false\n"), "{out}");
+        let suite = crate::SuiteToml::parse(&out).unwrap();
+        let desktop = suite.desktop();
+        assert!(desktop.fullscreen_autopause && !desktop.keep_awake_gpu);
+        assert!(desktop.quiet_while_fullscreen, "left as it was");
+        let on = |c: &str| {
+            desktop
+                .notifications
+                .iter()
+                .find(|(k, _)| *k == c)
+                .unwrap()
+                .1
+        };
+        assert!(!on("job_finished") && !on("cap_alert") && on("job_failed"));
+        assert!(suite.preempt_agent_batches());
+        // A no-op is the text itself; a BOM is kept.
+        assert_eq!(set_desktop(&out, &edit).unwrap(), out);
+        assert_eq!(set_desktop(text, &DesktopEdit::default()).unwrap(), text);
+        let bom = format!("\u{feff}{text}");
+        let out = set_desktop(&bom, &edit).unwrap();
+        assert!(out.starts_with("\u{feff}# my suite"), "{out:?}");
+        // An empty file gets the tables.
+        let fresh = set_desktop("", &edit).unwrap();
+        assert!(
+            crate::SuiteToml::parse(&fresh)
+                .unwrap()
+                .desktop()
+                .fullscreen_autopause
+        );
+        // A table that isn't one, or text that isn't TOML, is refused.
+        assert!(set_desktop("power = 3\n", &edit).is_err());
+        assert!(set_desktop("this = = not toml", &edit).is_err());
+    }
 
     #[test] // spec: CORE-008, CORE-085
     fn set_caps_writes_new_keys_drops_legacy_ones_and_keeps_comments() {

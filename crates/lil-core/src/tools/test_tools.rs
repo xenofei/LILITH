@@ -18,6 +18,7 @@
 //! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
+//! | `test.desktop` | write | `{fullscreen?: "no" \| "d3d" \| "busy" \| "presentation", foreground?: "suite" \| "other", shortcut?: bool, handlers?: bool, toasts?: "ready" \| "not_yet_shown" \| "disabled_for_app" \| "disabled_for_user" \| "disabled_by_policy" \| "elevated" \| "no_platform", clear?: bool}` | `{toasts: [{op: "post" \| "remove", tag, group, title?, body?, launch?, silent?, xml?}], power_held, polls}`: sets the test channel's `FakeDesktop` and reads what it recorded (plan 4a's test contract); the server registers it |
 //!
 //! `test.job` submits a job that [`TestJobHandler`] runs (the core registers it on test
 //! channels): a gated one waits until `test.job_release` (or a cancel), `transient_2` fails
@@ -788,6 +789,187 @@ pub fn register_hw_tick(reg: &mut Registry, telemetry: Arc<Telemetry>) {
                 }
                 let snapshot = telemetry.tick(args.samples).await;
                 Ok((snapshot, format!("{} sample(s) taken", args.samples)))
+            })
+        },
+    ));
+}
+
+/// `test.desktop`'s fullscreen states.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum FullscreenArg {
+    No,
+    D3d,
+    Busy,
+    Presentation,
+}
+
+/// Who `test.desktop` puts in front.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ForegroundArg {
+    /// A connected verified `ui:*` app's process.
+    Suite,
+    /// Another process (the core's own).
+    Other,
+}
+
+/// `test.desktop`'s toasts states: `ready`, `not_yet_shown`, or an unavailable reason.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ToastsArg {
+    Ready,
+    NotYetShown,
+    DisabledForApp,
+    DisabledForUser,
+    DisabledByPolicy,
+    Elevated,
+    NoPlatform,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DesktopArgs {
+    #[serde(default)]
+    fullscreen: Option<FullscreenArg>,
+    #[serde(default)]
+    foreground: Option<ForegroundArg>,
+    /// `true`: the shortcut is `ok`; `false`: `missing`.
+    #[serde(default)]
+    shortcut: Option<bool>,
+    /// `true`: the handlers are `ok`; `false`: `missing`.
+    #[serde(default)]
+    handlers: Option<bool>,
+    #[serde(default)]
+    toasts: Option<ToastsArg>,
+    /// Forget the recorded toasts first.
+    #[serde(default)]
+    clear: bool,
+}
+
+/// One recorded toast operation.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ToastSeen {
+    /// `post` or `remove`.
+    op: &'static str,
+    tag: String,
+    group: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    silent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xml: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct DesktopSeen {
+    toasts: Vec<ToastSeen>,
+    power_held: bool,
+    polls: u32,
+}
+
+/// Registers `test.desktop` on `reg` (plan 4a's test contract): it sets `fake`, the test
+/// channel's desktop, and returns what it recorded. `foreground: "suite"` puts a process of
+/// `apps` in front (`params.invalid` while no verified app is connected); `"other"` the core's
+/// own process, which is never an app's.
+pub fn register_test_desktop(
+    reg: &mut Registry,
+    fake: Arc<lil_platform::desktop_fake::FakeDesktop>,
+    apps: Arc<crate::desktop::UiApps>,
+) {
+    use lil_platform::desktop::{Fullscreen, HandlerState, ShortcutState, ToastsState};
+    use lil_platform::desktop_fake::ToastOp;
+    reg.register(typed_tool(
+        "test.desktop",
+        "Test channels only: sets the fake desktop (fullscreen no/d3d/busy/presentation, the foreground suite/other, the shortcut and handlers present or missing, the toasts state; clear forgets the recorded toasts) and returns the toasts it recorded, whether the power request is held, and how many times the fullscreen state was polled.",
+        EffectClass::Write,
+        TEST_MODULE,
+        move |ctx, args: DesktopArgs| {
+            let (fake, apps) = (fake.clone(), apps.clone());
+            Box::pin(async move {
+                if let Some(f) = args.fullscreen {
+                    fake.set_fullscreen(match f {
+                        FullscreenArg::No => Fullscreen::No,
+                        FullscreenArg::D3d => Fullscreen::D3d,
+                        FullscreenArg::Busy => Fullscreen::Busy,
+                        FullscreenArg::Presentation => Fullscreen::Presentation,
+                    });
+                }
+                match args.foreground {
+                    None => {}
+                    Some(ForegroundArg::Other) => fake.set_foreground(Some(std::process::id())),
+                    Some(ForegroundArg::Suite) => {
+                        let Some(pid) = apps.pids().first().copied() else {
+                            return Err(ErrorBody::new(
+                                &codes::PARAMS_INVALID,
+                                "foreground \"suite\" needs a connected verified app",
+                                ctx.trace_id.clone(),
+                            ));
+                        };
+                        fake.set_foreground(Some(pid));
+                    }
+                }
+                if let Some(ok) = args.shortcut {
+                    fake.set_shortcut(if ok {
+                        ShortcutState::Ok
+                    } else {
+                        ShortcutState::Missing
+                    });
+                }
+                if let Some(ok) = args.handlers {
+                    fake.set_handlers(if ok {
+                        HandlerState::Ok
+                    } else {
+                        HandlerState::Missing
+                    });
+                }
+                if let Some(t) = args.toasts {
+                    fake.set_toasts_state(match t {
+                        ToastsArg::Ready => ToastsState::Ready,
+                        ToastsArg::NotYetShown => ToastsState::NotYetShown,
+                        ToastsArg::DisabledForApp => ToastsState::Unavailable("disabled_for_app"),
+                        ToastsArg::DisabledForUser => {
+                            ToastsState::Unavailable("disabled_for_user")
+                        }
+                        ToastsArg::DisabledByPolicy => {
+                            ToastsState::Unavailable("disabled_by_policy")
+                        }
+                        ToastsArg::Elevated => ToastsState::Unavailable("elevated"),
+                        ToastsArg::NoPlatform => ToastsState::Unavailable("no_platform"),
+                    });
+                }
+                if args.clear {
+                    fake.clear();
+                }
+                let toasts: Vec<ToastSeen> = fake
+                    .records()
+                    .into_iter()
+                    .map(|r| ToastSeen {
+                        op: match r.op {
+                            ToastOp::Post => "post",
+                            ToastOp::Remove => "remove",
+                        },
+                        tag: r.tag,
+                        group: r.group,
+                        title: r.title,
+                        body: r.body,
+                        launch: r.launch,
+                        silent: r.silent,
+                        xml: r.xml,
+                    })
+                    .collect();
+                let seen = DesktopSeen {
+                    power_held: fake.power_held(),
+                    polls: fake.polls(),
+                    toasts,
+                };
+                let summary = format!("{} toast operation(s) recorded", seen.toasts.len());
+                Ok((seen, summary))
             })
         },
     ));

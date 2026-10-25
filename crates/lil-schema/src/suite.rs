@@ -105,9 +105,116 @@ pub fn is_reserve_vram_gb(s: &str) -> bool {
             .is_ok_and(|gb| gb <= f64::from(MAX_RESERVE_VRAM_GB))
 }
 
+// ---------------------------------------------------------------------------------------------
+// The desktop settings (APP-146, CORE-160, ARCH-127; Appendix G "Notifications").
+
+/// The notification categories plan 4a knows, each on by default (owner decision 2026-10-22),
+/// in `suite.toml`'s `[notifications]` by name. The set is open: a later plan adds a category
+/// here; any other key under `[notifications]` (an old `job_progress` among them) is kept and
+/// ignored.
+pub const NOTIFICATION_CATEGORIES: [&str; 6] = [
+    "job_finished",
+    "job_failed",
+    "confirmation_waiting",
+    "cap_alert",
+    "director_decision",
+    "agent_activity",
+];
+/// `[notifications] quiet_while_fullscreen` unless it is set.
+pub const DEFAULT_QUIET_WHILE_FULLSCREEN: bool = true;
+/// `[jobs] fullscreen_autopause` unless it is set.
+pub const DEFAULT_FULLSCREEN_AUTOPAUSE: bool = false;
+/// `[power] keep_awake_gpu` unless it is set.
+pub const DEFAULT_KEEP_AWAKE_GPU: bool = true;
+
+/// The desktop settings of `suite.toml` (`SuiteToml::desktop`): each known category in
+/// [`NOTIFICATION_CATEGORIES`]' order, and the three switches. A value that isn't a boolean
+/// counts as not set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopToml {
+    pub notifications: Vec<(&'static str, bool)>,
+    pub quiet_while_fullscreen: bool,
+    pub fullscreen_autopause: bool,
+    pub keep_awake_gpu: bool,
+}
+
+impl Default for DesktopToml {
+    fn default() -> Self {
+        DesktopToml {
+            notifications: NOTIFICATION_CATEGORIES.iter().map(|c| (*c, true)).collect(),
+            quiet_while_fullscreen: DEFAULT_QUIET_WHILE_FULLSCREEN,
+            fullscreen_autopause: DEFAULT_FULLSCREEN_AUTOPAUSE,
+            keep_awake_gpu: DEFAULT_KEEP_AWAKE_GPU,
+        }
+    }
+}
+
+impl SuiteToml {
+    /// `[notifications]`, `[jobs] fullscreen_autopause` and `[power] keep_awake_gpu`, with
+    /// their defaults where a key is missing or not a boolean.
+    pub fn desktop(&self) -> DesktopToml {
+        let flag = |table: &str, key: &str, default: bool| {
+            self.other
+                .get(table)
+                .and_then(|t| t.get(key))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(default)
+        };
+        DesktopToml {
+            notifications: NOTIFICATION_CATEGORIES
+                .iter()
+                .map(|c| (*c, flag("notifications", c, true)))
+                .collect(),
+            quiet_while_fullscreen: flag(
+                "notifications",
+                "quiet_while_fullscreen",
+                DEFAULT_QUIET_WHILE_FULLSCREEN,
+            ),
+            fullscreen_autopause: flag(
+                "jobs",
+                "fullscreen_autopause",
+                DEFAULT_FULLSCREEN_AUTOPAUSE,
+            ),
+            keep_awake_gpu: flag("power", "keep_awake_gpu", DEFAULT_KEEP_AWAKE_GPU),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: APP-146, CORE-160, ARCH-127
+    fn desktop_settings_default_and_ignore_unknown_or_odd_keys() {
+        assert_eq!(
+            SuiteToml::parse("").unwrap().desktop(),
+            DesktopToml::default()
+        );
+        let d = DesktopToml::default();
+        assert!(d.notifications.iter().all(|(_, on)| *on));
+        assert_eq!(d.notifications.len(), 6);
+        assert!(!d.notifications.iter().any(|(c, _)| *c == "job_progress"));
+        assert!(d.quiet_while_fullscreen && !d.fullscreen_autopause && d.keep_awake_gpu);
+
+        let suite = SuiteToml::parse(
+            "[notifications]\njob_finished = false\njob_progress = true\nfuture_thing = false\n\
+             quiet_while_fullscreen = false\ncap_alert = \"no\"\n\
+             [jobs]\nfullscreen_autopause = true\n[power]\nkeep_awake_gpu = false\n",
+        )
+        .unwrap();
+        let got = suite.desktop();
+        let on = |c: &str| got.notifications.iter().find(|(k, _)| *k == c).unwrap().1;
+        assert!(!on("job_finished"));
+        assert!(
+            on("cap_alert"),
+            "a value that isn't a boolean is the default"
+        );
+        assert!(on("job_failed"));
+        assert_eq!(got.notifications.len(), 6, "unknown keys are ignored");
+        assert!(!got.quiet_while_fullscreen);
+        assert!(got.fullscreen_autopause);
+        assert!(!got.keep_awake_gpu);
+    }
 
     const TEXT: &str = r#"
 default_workspace = 'C:\work\Ünïcödé space'

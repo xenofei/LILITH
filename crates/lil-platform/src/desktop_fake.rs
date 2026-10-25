@@ -41,11 +41,13 @@ struct State {
     handlers: HandlerState,
     records: Vec<ToastRecord>,
     power_held: bool,
+    power_available: bool,
     polls: u32,
 }
 
 /// The fake desktop. It starts not fullscreen, with no foreground process, toasts ready, the
-/// shortcut and handlers `Ok`, nothing recorded and no power request held.
+/// shortcut and handlers `Ok`, nothing recorded, and the power request available and not
+/// held.
 #[derive(Debug)]
 pub struct FakeDesktop {
     state: Mutex<State>,
@@ -68,6 +70,7 @@ impl FakeDesktop {
                 handlers: HandlerState::Ok,
                 records: Vec::new(),
                 power_held: false,
+                power_available: true,
                 polls: 0,
             }),
         }
@@ -110,6 +113,12 @@ impl FakeDesktop {
     /// Whether the power request is held.
     pub fn power_held(&self) -> bool {
         self.lock().power_held
+    }
+
+    /// Whether this PC lets the power request be made ([`Desktop::power_request_available`]).
+    /// While it doesn't, setting the request fails and holds nothing.
+    pub fn set_power_available(&self, available: bool) {
+        self.lock().power_available = available;
     }
 
     /// How many times the fullscreen state was read.
@@ -162,12 +171,18 @@ impl Desktop for FakeDesktop {
     }
 
     fn set_power_request(&self, held: bool) -> std::io::Result<()> {
-        self.lock().power_held = held;
+        let mut state = self.lock();
+        if !state.power_available {
+            return Err(std::io::Error::other(
+                "the fake PC refuses the power request",
+            ));
+        }
+        state.power_held = held;
         Ok(())
     }
 
     fn power_request_available(&self) -> bool {
-        true
+        self.lock().power_available
     }
 
     fn shortcut_state(&self, _env: &Env, _exe: &Path) -> ShortcutState {
