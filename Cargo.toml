@@ -67,6 +67,9 @@ rmcp = { version = "3.5.1", default-features = false, features = ["server", "tra
 # The fake ComfyUI's HTTP server: lil-testkit only.
 hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http1"] }
+# Plan 4a (Task 12): the diagnostics bundle (P4a-R19), current on crates.io on 2026-10-25; deflate
+# only, through the pure-Rust zlib-rs back end.
+zip = { version = "9.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # The reviewer key's scrypt (N = 2^18) takes minutes unoptimised; optimise just the KDF so
 # `lil dev reviewer-setup` / `approve` and their tests stay quick in dev and test builds.
