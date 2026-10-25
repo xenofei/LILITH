@@ -282,8 +282,9 @@ pub enum ShortcutState {
     WrongClsid,
 }
 
-/// The channel's scheme and `.lilref` handlers (`notification_path.handlers`). `OtherChannel`
-/// names the exe another build's command runs.
+/// The channel's handlers as `notification_path.handlers` shows them: its own scheme alone,
+/// which toast URLs use; who holds `.lilref` never changes it (plan 4a ruling, 2026-10-25;
+/// [`HandlerParts`] has both). `OtherChannel` names the exe, or the program, the scheme runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandlerState {
     Ok,

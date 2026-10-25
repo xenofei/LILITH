@@ -581,24 +581,15 @@ pub struct HandlerParts {
 }
 
 impl HandlerParts {
-    /// The one state `notification_path.handlers` shows: a missing own scheme is `Missing`
-    /// whoever holds `.lilref` (plan 4a ruling, 2026-10-25); a scheme held elsewhere is
-    /// `OtherChannel`; with the scheme in place, `.lilref` decides.
+    /// The one state `notification_path.handlers` shows, and toast reachability reads: the
+    /// channel's own scheme alone, the one toast URLs use (plan 4a rulings, 2026-10-25). Who
+    /// holds `.lilref`, or a missing one, never changes it; `lil doctor` reports `.lilref`.
     pub fn state(&self) -> HandlerState {
-        let held = |part: &HandlerPart| match part {
-            HandlerPart::OtherBuild(exe) => Some(exe.clone()),
-            HandlerPart::Foreign(holder) => Some(PathBuf::from(holder)),
-            HandlerPart::Ok | HandlerPart::Missing => None,
-        };
-        match (&self.scheme, &self.lilref) {
-            (HandlerPart::Missing, _) | (HandlerPart::Ok, HandlerPart::Missing) => {
-                HandlerState::Missing
-            }
-            (HandlerPart::Ok, HandlerPart::Ok) => HandlerState::Ok,
-            (HandlerPart::Ok, lilref) => {
-                HandlerState::OtherChannel(held(lilref).unwrap_or_default())
-            }
-            (scheme, _) => HandlerState::OtherChannel(held(scheme).unwrap_or_default()),
+        match &self.scheme {
+            HandlerPart::Ok => HandlerState::Ok,
+            HandlerPart::Missing => HandlerState::Missing,
+            HandlerPart::OtherBuild(exe) => HandlerState::OtherChannel(exe.clone()),
+            HandlerPart::Foreign(holder) => HandlerState::OtherChannel(PathBuf::from(holder)),
         }
     }
 }
@@ -803,13 +794,14 @@ mod tests {
         assert_eq!(p.lilref, HandlerPart::OtherBuild(PathBuf::from(other)));
         assert_eq!(p.state(), HandlerState::Missing);
 
-        // The scheme in place: the other channel's `.lilref` decides.
+        // The scheme in place: `ok`, whoever holds `.lilref` (it is reported apart).
         put(&mut fake, &k.scheme, Some("URL Protocol"), "");
         let command = format!(r"{}\shell\open\command", k.scheme);
         put(&mut fake, &command, None, r#""C:\own\lil-image.exe" "%1""#);
         let p = parts(&own, exe, &fake);
         assert_eq!(p.scheme, HandlerPart::Ok);
-        assert_eq!(p.state(), HandlerState::OtherChannel(PathBuf::from(other)));
+        assert_eq!(p.lilref, HandlerPart::OtherBuild(PathBuf::from(other)));
+        assert_eq!(p.state(), HandlerState::Ok);
 
         // Without its protocol value the scheme is ours, incomplete: `Missing`.
         fake.remove(&(k.scheme.clone(), Some("URL Protocol".into())));
@@ -837,6 +829,58 @@ mod tests {
         // The shell's classes root of a desktop-group channel has its scheme only.
         let shell = env(Channel::Test("desktop-0123456789abcdef".into())).with_shell_classes_root();
         assert_eq!(parts(&shell, exe, &Fake::new()).lilref, HandlerPart::Ok);
+    }
+
+    /// Stable holds the shared `.lilref` (`HKCU\Software\Classes`); dev's own scheme opens dev's
+    /// app: dev's handlers are `ok`, so with its shortcut `ok` dev's toasts are reachable
+    /// (plan 4a ruling, 2026-10-25). A missing `.lilref` doesn't change it either.
+    #[test] // spec: APP-022, ARCH-055
+    fn dev_is_reachable_while_stable_holds_lilref() {
+        let dev = env(Channel::Dev);
+        let exe = Path::new(r"C:\dev\lil-image.exe");
+        let k = keys(&dev).unwrap();
+        let mut fake = Fake::new();
+        put(&mut fake, &k.scheme, Some("URL Protocol"), "");
+        put(
+            &mut fake,
+            &format!(r"{}\shell\open\command", k.scheme),
+            None,
+            r#""C:\dev\lil-image.exe" "%1""#,
+        );
+        assert_eq!(
+            parts(&dev, exe, &fake).state(),
+            HandlerState::Ok,
+            "no .lilref"
+        );
+        put(
+            &mut fake,
+            &format!(r"{}\.lilref", k.root),
+            None,
+            "LILITH.lilref.stable",
+        );
+        put(
+            &mut fake,
+            &format!(r"{}\LILITH.lilref.stable\shell\open\command", k.root),
+            None,
+            r#""C:\stable\lil-image.exe" "%1""#,
+        );
+        let p = parts(&dev, exe, &fake);
+        assert_eq!(
+            p.lilref,
+            HandlerPart::OtherBuild(r"C:\stable\lil-image.exe".into())
+        );
+        assert_eq!(p.state(), HandlerState::Ok);
+        // Stable holding dev's own scheme is what makes it unreachable.
+        put(
+            &mut fake,
+            &format!(r"{}\shell\open\command", k.scheme),
+            None,
+            r#""C:\stable\lil-image.exe" "%1""#,
+        );
+        assert_eq!(
+            parts(&dev, exe, &fake).state(),
+            HandlerState::OtherChannel(r"C:\stable\lil-image.exe".into())
+        );
     }
 
     #[test] // spec: APP-020, APP-021
