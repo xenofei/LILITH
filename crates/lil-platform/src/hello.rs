@@ -1541,7 +1541,8 @@ impl StatusLine {
 /// isn't a hardware one and starts the rest again, and a still hand sends no moves, so the
 /// length only narrows a warp made while the hand is still moving. Real moves over the button
 /// while it is grey count too ([`grey_rest_move`]). With raw input (Task 28d) the hand's raw
-/// motion ends the rest too, so the 150 ms run from its last real move.
+/// motion beyond [`RAW_JITTER_COUNTS`] ends the rest too, so the 150 ms run from its last real
+/// move.
 pub const HOVER_BEFORE_PRESS: Duration = Duration::from_millis(150);
 
 /// The accept button's press state (pure: the caller passes what it judged and `now`). Only a
@@ -1716,18 +1717,36 @@ impl PointerMsg {
 ///
 /// **Raw input** (Task 28d). The window registers for raw mouse input (`RIDEV_INPUTSINK`), so
 /// it knows when the hand moves the mouse:
-/// - any raw motion (a device's non-zero relative motion, or a new absolute position) means the
-///   hand moved: the rest ends, and the next real move starts it again;
-/// - an input move that isn't hardware, at the position last recorded and with no raw motion
-///   since that record, is Windows' own move under a still hand: it keeps the rest (it never
-///   starts one);
-/// - an own move anywhere else still ends the rest, and so does one after raw motion: "moved
-///   away for real, then warped back to the very same pixel", which arrives as one own move at
-///   the old place when Windows merges the moves or this window never saw them, stays refused.
+/// - raw motion is added up since the last real move (every packet's `|dx| + |dy|`, from a
+///   device or with a null `hDevice`; a new absolute position counts as beyond the bound).
+///   Beyond [`RAW_JITTER_COUNTS`] the hand moved: the rest ends, and the next real move starts
+///   it again. Up to it is a hand settling on the mouse, or a press jolting it (round 1);
+/// - an input move that isn't hardware, at the position last recorded and with no more than
+///   that jitter since the last real move, is Windows' own move under a still hand: it keeps
+///   the rest (it never starts one);
+/// - that keep is on only once this window has seen a real move with device raw motion since
+///   the record before it, so the mouse is known to make raw input. Before that, and with a
+///   device that never sends any, Task 28c's rule holds (round 1);
+/// - an own move anywhere else still ends the rest, and so does one after the hand moved:
+///   "moved away for real, then warped back to the very same pixel", which arrives as one own
+///   move at the old place when Windows merges the moves or this window never saw them, stays
+///   refused.
 ///
 /// Without raw input (registration failed, or another registration in this process took it,
 /// checked before each move is judged) every move that isn't hardware ends the rest, even at
 /// the same position, as in Task 28c.
+///
+/// **Known limits** (Task 28d round 1). A still click after a click on grey Merge, or after
+/// Merge turns on under the pointer, still needs a small move first: the press on the window
+/// (re-review N2) and the window's leave (review I2) forget where the cursor was, so there is
+/// nothing to compare Windows' own move with. The status line says to move. The confirmation
+/// is for the window, not per device: with a mouse that makes raw input and a second pointer
+/// device that doesn't, the second's moves aren't seen as the hand moving.
+///
+/// **Documented residuals** (Task 28d round 1, not measured): that a `WM_INPUT` always comes
+/// before a later `WM_LBUTTONDOWN` of the same hand, and what a real click's own raw packet
+/// carries (the probe allowed no clicks). The PIN at the Windows Hello prompt is still the real
+/// gate.
 ///
 /// **Open under Hardware** (re-review N1, a documented residual, not seen on build 26300): a
 /// warp that Windows merges with one of its own moves arrives as a single move at a new place;
@@ -1758,11 +1777,27 @@ pub struct ClickGate {
     button_tracked: bool,
     /// Raw mouse input is registered for the window, and still is (Task 28d).
     raw: bool,
-    /// A device's raw motion came since `last_at` was last recorded (Task 28d).
-    hand_moved: bool,
+    /// The raw motion since the last real move or restart, in counts: every packet's
+    /// `|dx| + |dy|` (Task 28d round 1).
+    raw_counts: u32,
+    /// Some of that motion came from a device (`hDevice` not null).
+    device_raw: bool,
+    /// This window has seen a real move with device raw motion since the record before it:
+    /// the mouse makes raw input, so the same-place keep is on (Task 28d round 1).
+    raw_confirmed: bool,
     /// The last absolute raw position (a tablet, a remote session), to tell motion.
     last_absolute: Option<(i32, i32)>,
 }
+
+/// How much raw mouse motion since the last real move is still a still hand (Task 28d round
+/// 1), in counts: every packet's `|dx| + |dy|`, added up. Up to this, a same-place own move
+/// keeps the rest and a press counts; more is the hand moving, and the rest ends. The pointer
+/// probe on the owner's PC (build 26300) saw both real hand motions end with raw motion that
+/// moved no pixel and had no move after it: a hand settling on the mouse, (1, 0) once, and
+/// (0, -2) then (-1, 0) 160 ms later. A press can jolt the mouse the same way. A drift of 4
+/// counts moves the cursor a pixel or two at most, so it can't carry a click from somewhere
+/// else, and every unlock still needs the owner's PIN at the Windows Hello prompt.
+pub const RAW_JITTER_COUNTS: u32 = 4;
 
 /// One mouse `WM_INPUT` as the click gate judges it (Task 28d): whether the header names a
 /// device (`hDevice` isn't null), whether it is an absolute position (`MOUSE_MOVE_ABSOLUTE`),
@@ -1791,7 +1826,9 @@ impl ClickGate {
             window_tracked: false,
             button_tracked: false,
             raw: false,
-            hand_moved: false,
+            raw_counts: 0,
+            device_raw: false,
+            raw_confirmed: false,
             last_absolute: None,
         }
     }
@@ -1813,17 +1850,29 @@ impl ClickGate {
         self.raw
     }
 
-    /// A mouse `WM_INPUT` (Task 28d). Motion is a device's non-zero relative motion, or an
-    /// absolute position other than the last one: the hand moved, so the rest ends, and the
+    /// A mouse `WM_INPUT` (Task 28d). Relative motion adds `|dx| + |dy|` to the motion since
+    /// the last real move, from a device or not; an absolute position other than the last one
+    /// is the hand moving. Beyond [`RAW_JITTER_COUNTS`] the hand moved: the rest ends, and the
     /// next real move starts it again.
     pub fn raw_input(&mut self, r: RawMouse, now: Instant) {
-        let motion = if r.absolute {
-            self.last_absolute.replace(r.last) != Some(r.last)
+        let counts = if r.absolute {
+            if self.last_absolute.replace(r.last) == Some(r.last) {
+                0
+            } else {
+                RAW_JITTER_COUNTS + 1
+            }
         } else {
-            r.device && r.last != (0, 0)
+            r.last
+                .0
+                .unsigned_abs()
+                .saturating_add(r.last.1.unsigned_abs())
         };
-        if motion {
-            self.hand_moved = true;
+        if counts == 0 {
+            return;
+        }
+        self.raw_counts = self.raw_counts.saturating_add(counts);
+        self.device_raw |= r.device;
+        if self.raw_counts > RAW_JITTER_COUNTS {
             self.press.on_move(false, now);
         }
     }
@@ -1834,7 +1883,8 @@ impl ClickGate {
         self.live.restart();
         self.press.cancel();
         self.last_at = cursor;
-        self.hand_moved = false;
+        self.raw_counts = 0;
+        self.device_raw = false;
     }
 
     /// The live timer's sample at `now`; whether the buttons are live.
@@ -1860,16 +1910,26 @@ impl ClickGate {
     fn judge_move(&mut self, tracked: bool, on_accept: bool, m: PointerMsg, now: Instant) -> bool {
         let moved = tracked && m.at.is_some_and(|at| cursor_moved(self.last_at, at));
         // Task 28d: an input move that isn't hardware, at the place last recorded, with raw
-        // input on and no raw motion since that record: Windows' own move under a still hand.
+        // input on and confirmed, and no more than jitter since the last real move: Windows'
+        // own move under a still hand.
         let still = self.raw
+            && self.raw_confirmed
             && tracked
             && m.is_input()
-            && !self.hand_moved
+            && self.raw_counts <= RAW_JITTER_COUNTS
             && m.at.is_some()
             && m.at == self.last_at;
         if m.is_input() {
             self.last_at = m.at;
-            self.hand_moved = false;
+        }
+        // The raw motion since the last real move starts again with this one, and device
+        // motion before a real move shows the mouse makes raw input (Task 28d round 1).
+        // Windows' own moves don't start it again: the bound is on the drift since the hand
+        // last put the cursor somewhere.
+        if m.is_input() && m.real() {
+            self.raw_confirmed |= self.device_raw;
+            self.raw_counts = 0;
+            self.device_raw = false;
         }
         let counts = grey_rest_move(on_accept, moved, m.origin, m.device, m.sent);
         // A real move on the button that left the cursor where it was, or (with raw input) any
@@ -2128,7 +2188,8 @@ fn log_raw_mouse_off() {
 }
 
 /// The mouse `WM_INPUT` this thread is handling (Task 28d); `None` when it isn't a mouse's. One
-/// that can't be read is taken as motion, the safe side.
+/// that can't be read is taken as the hand moving (beyond [`RAW_JITTER_COUNTS`], from no
+/// device, so it never turns the same-place keep on), the safe side.
 fn raw_mouse_input(lp: LPARAM) -> Option<RawMouse> {
     let mut raw = RAWINPUT::default();
     let mut size = size_of::<RAWINPUT>() as u32;
@@ -2145,9 +2206,9 @@ fn raw_mouse_input(lp: LPARAM) -> Option<RawMouse> {
     };
     if got == u32::MAX || got == 0 {
         return Some(RawMouse {
-            device: true,
+            device: false,
             absolute: false,
-            last: (1, 0),
+            last: (RAW_JITTER_COUNTS as i32 + 1, 0),
         });
     }
     if raw.header.dwType != RIM_TYPEMOUSE.0 {
@@ -3717,6 +3778,9 @@ mod tests {
         /// Raw mouse input is registered (Task 28d): the hand's moves and clicks make it;
         /// warps and Windows' own moves make none (measured on build 26300).
         raw: bool,
+        /// What raw input the owner's mouse makes: from a device (`Some(true)`, the
+        /// default), with a null `hDevice` (`Some(false)`), or none.
+        hand_raw: Option<bool>,
         clicks: Vec<Click>,
         trace: Vec<String>,
     }
@@ -3750,6 +3814,7 @@ mod tests {
                 window_armed: false,
                 button_armed: false,
                 raw,
+                hand_raw: Some(true),
                 clicks: Vec::new(),
                 trace: Vec::new(),
             }
@@ -3885,16 +3950,28 @@ mod tests {
             self.ms = end;
         }
 
-        /// A `WM_INPUT` from the mouse (`last` is its motion), if raw input is registered.
+        /// A `WM_INPUT` from the owner's mouse (`last` is its motion), if raw input is
+        /// registered and the mouse makes it ([`Self::hand_raw`]).
         fn raw_from_device(&mut self, last: (i32, i32)) {
-            if self.raw {
+            if self.raw
+                && let Some(device) = self.hand_raw
+            {
                 let now = self.now();
                 let r = RawMouse {
-                    device: true,
+                    device,
                     absolute: false,
                     last,
                 };
                 self.gate.raw_input(r, now);
+            }
+        }
+
+        /// The owner's hand settles on the mouse: raw `packets`, `gaps` ms apart, that move
+        /// no pixel, so no move follows them.
+        fn settle(&mut self, packets: &[(u64, (i32, i32))]) {
+            for &(gap, last) in packets {
+                self.wait(gap);
+                self.raw_from_device(last);
             }
         }
 
@@ -4539,7 +4616,7 @@ mod tests {
 
     /// Task 28d: Windows' own moves at the same place (measured on build 26300: about 0.9
     /// bursts a second by themselves, whenever a window anywhere changes, all `IMO_SYSTEM`)
-    /// keep the rest the owner's hand made, while no raw motion came since. A still click
+    /// keep the rest the owner's hand made, while no more than jitter came since. A still click
     /// counts once the hand has rested 150 ms; one sooner is `no_rest`, and a still click after
     /// it counts.
     #[test] // spec: QA-088
@@ -4610,8 +4687,9 @@ mod tests {
         }
     }
 
-    /// Task 28d: raw motion from the mouse ends the rest even when this window gets no move at
-    /// all. Clicks are refused until a real move on Merge and 150 ms of rest after it.
+    /// Task 28d: raw motion from the mouse beyond the jitter bound (here 15 counts) ends the
+    /// rest even when this window gets no move at all. Clicks are refused until a real move on
+    /// Merge and 150 ms of rest after it.
     #[test] // spec: QA-088, QA-036
     fn replay_raw_motion_without_a_move_ends_the_rest() {
         for fakes in ALL_FAKES {
@@ -4676,18 +4754,20 @@ mod tests {
         }
     }
 
-    /// Task 28d: which `WM_INPUT`s are the hand moving. Relative motion counts only from a
-    /// device (`hDevice` not null) and only when it isn't zero; an absolute position counts
-    /// when it differs from the last one, the first one included.
+    /// Task 28d round 1: how much raw motion is the hand moving. Every packet's `|dx| + |dy|`
+    /// is added up since the last real move, from a device or with a null `hDevice`; up to
+    /// [`RAW_JITTER_COUNTS`] is a hand settling on the mouse and keeps the rest, more ends it.
+    /// An absolute position other than the last one (the first one included) is the hand
+    /// moving.
     #[test] // spec: QA-088
-    fn raw_motion_counts_only_a_devices_motion_or_a_new_absolute_place() {
+    fn raw_motion_ends_the_rest_only_beyond_the_jitter_bound() {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let real = PointerMsg {
+        let real = |x: i32| PointerMsg {
             origin: InputOrigin::Hardware,
             device: InputDevice::Mouse,
             sent: false,
-            at: Some((1, 10)),
+            at: Some((x, 10)),
         };
         // A gate rested on the button from 0 ms (after `before`), then fed `raws`; whether a
         // press at 400 ms still counts.
@@ -4699,12 +4779,12 @@ mod tests {
             }
             g.restart(Some((0, 0)));
             g.button_tracking(true);
-            assert!(g.button_move(true, real, at(0)));
+            assert!(g.button_move(true, real(1), at(0)));
             for r in raws {
                 g.raw_input(*r, at(100));
             }
-            g.button_press(true, real, at(400));
-            g.button_release(true, real).0
+            g.button_press(true, real(1), at(400));
+            g.button_release(true, real(1)).0
         };
         let rel = |device, last| RawMouse {
             device,
@@ -4717,15 +4797,203 @@ mod tests {
             last,
         };
         assert!(still_rested(&[], &[]));
-        assert!(!still_rested(&[], &[rel(true, (1, 0))]));
-        assert!(!still_rested(&[], &[rel(true, (0, -1))]));
         assert!(still_rested(&[], &[rel(true, (0, 0))]), "buttons only");
-        assert!(still_rested(&[], &[rel(false, (5, 5))]), "no device");
+        assert!(
+            still_rested(&[], &[rel(true, (1, 0))]),
+            "the probe's (1, 0)"
+        );
+        assert!(
+            still_rested(&[], &[rel(true, (0, -2)), rel(true, (-1, 0))]),
+            "the probe's (0, -2), (-1, 0)"
+        );
+        assert!(still_rested(&[], &[rel(true, (2, -2))]), "4 counts");
+        assert!(!still_rested(&[], &[rel(true, (3, -2))]), "5 counts");
+        assert!(
+            !still_rested(
+                &[],
+                &[rel(true, (0, -2)), rel(true, (-1, 0)), rel(true, (0, 2))]
+            ),
+            "5 counts in three packets"
+        );
+        assert!(!still_rested(&[], &[rel(false, (5, 0))]), "no device");
+        assert!(
+            !still_rested(&[], &[rel(false, (3, 0)), rel(true, (0, 2))]),
+            "no device, then a device"
+        );
         assert!(!still_rested(&[], &[abs(true, (300, 300))]), "the first");
         assert!(!still_rested(&[], &[abs(false, (300, 300))]), "no device");
         let first = [abs(true, (300, 300))];
         assert!(still_rested(&first, &[abs(true, (300, 300))]), "same place");
         assert!(!still_rested(&first, &[abs(true, (301, 300))]), "new place");
+
+        // The sum runs from the last real move: Windows' own moves between the packets don't
+        // start it again, so 3 + 2 counts around one is the hand moving.
+        let system = PointerMsg {
+            origin: InputOrigin::System,
+            ..real(1)
+        };
+        let mut g = ClickGate::new();
+        g.raw_registered(true);
+        g.restart(Some((0, 0)));
+        g.button_tracking(true);
+        g.raw_input(rel(true, (1, 0)), at(0));
+        assert!(g.button_move(true, real(1), at(0)));
+        g.raw_input(rel(true, (3, 0)), at(100));
+        assert!(!g.button_move(true, system, at(150)));
+        g.raw_input(rel(true, (0, 2)), at(200));
+        g.button_press(true, real(1), at(400));
+        assert!(!g.button_release(true, real(1)).0);
+    }
+
+    /// Task 28d round 1: the same-place keep is on only once this window has seen device raw
+    /// motion together with real moves (a hardware move with device raw motion since the
+    /// record before it). Before that, with raw motion from a null `hDevice` only, or none,
+    /// Task 28c's rule.
+    #[test] // spec: QA-088, QA-036
+    fn the_same_place_keep_needs_device_raw_with_real_moves() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let real = |x: i32| PointerMsg {
+            origin: InputOrigin::Hardware,
+            device: InputDevice::Mouse,
+            sent: false,
+            at: Some((x, 10)),
+        };
+        let system = PointerMsg {
+            origin: InputOrigin::System,
+            ..real(2)
+        };
+        // Rested by real moves to (2, 10), with `raw` between them; Windows' own move there;
+        // a press.
+        let kept = |raw: Option<RawMouse>| {
+            let mut g = ClickGate::new();
+            g.raw_registered(true);
+            g.restart(Some((0, 0)));
+            g.button_tracking(true);
+            assert!(g.button_move(true, real(1), at(0)));
+            if let Some(r) = raw {
+                g.raw_input(r, at(5));
+            }
+            assert!(g.button_move(true, real(2), at(10)));
+            assert!(!g.button_move(true, system, at(300)));
+            g.button_press(true, real(2), at(400));
+            g.button_release(true, real(2)).0
+        };
+        let rel = |device| RawMouse {
+            device,
+            absolute: false,
+            last: (1, 0),
+        };
+        assert!(kept(Some(rel(true))), "device raw, then a real move");
+        assert!(!kept(Some(rel(false))), "raw with no device only");
+        assert!(!kept(None), "no raw input");
+        // Device raw that a restart came after, not a real move, doesn't turn it on either.
+        let mut g = ClickGate::new();
+        g.raw_registered(true);
+        g.raw_input(rel(true), at(0));
+        g.restart(Some((0, 0)));
+        g.button_tracking(true);
+        assert!(g.button_move(true, real(1), at(10)));
+        let system_here = PointerMsg {
+            origin: InputOrigin::System,
+            ..real(1)
+        };
+        assert!(!g.button_move(true, system_here, at(300)));
+        g.button_press(true, real(1), at(400));
+        assert!(!g.button_release(true, real(1)).0, "raw before a restart");
+    }
+
+    /// Task 28d round 1: the hand settling on the mouse, as the probe recorded it on the
+    /// owner's PC (raw motion that moved no pixel, with no move after it), keeps the rest: a
+    /// still click among Windows' own moves counts. A sum of 5 counts is the hand moving.
+    #[test] // spec: QA-088
+    fn replay_the_recorded_settling_keeps_the_rest() {
+        type Settle = (&'static str, &'static [(u64, (i32, i32))], bool);
+        let patterns: [Settle; 4] = [
+            ("(1, 0) after 61 ms", &[(61, (1, 0))], true),
+            (
+                "(0, -2), then (-1, 0)",
+                &[(5, (0, -2)), (160, (-1, 0))],
+                true,
+            ),
+            (
+                "4 counts",
+                &[(5, (0, -2)), (100, (-1, 0)), (50, (1, 0))],
+                true,
+            ),
+            (
+                "5 counts",
+                &[(5, (0, -2)), (100, (-1, 0)), (50, (2, 0))],
+                false,
+            ),
+        ];
+        for fakes in ALL_FAKES {
+            for (name, packets, merges) in patterns {
+                let mut r = Replay::open(fakes, true);
+                rest_on_merge(&mut r);
+                r.settle(packets);
+                r.wait(100);
+                r.background_move();
+                r.wait(150);
+                r.background_move();
+                r.wait(100);
+                r.click();
+                r.report(name);
+                let want = if merges {
+                    Click::Accepted
+                } else {
+                    refused("no_move")
+                };
+                assert_eq!(r.clicks, [want], "{fakes:?}, {name}");
+            }
+        }
+    }
+
+    /// Task 28d round 1: a press that jolts the mouse by a count just before it is still a
+    /// click on Merge.
+    #[test] // spec: QA-088
+    fn replay_a_press_with_a_one_count_jolt_counts() {
+        for (fakes, raw) in WITH_AND_WITHOUT_RAW {
+            let mut r = Replay::open_with(fakes, true, raw);
+            rest_on_merge(&mut r);
+            r.wait(300);
+            r.raw_from_device((0, 1));
+            r.click();
+            r.report("a jolt");
+            assert_eq!(r.clicks, [Click::Accepted], "{fakes:?}, raw {raw}");
+        }
+    }
+
+    /// Task 28d round 1: a mouse that makes no raw input, or only raw input with a null
+    /// `hDevice` (injected, or a remote session), never turns the same-place keep on: Windows'
+    /// own moves end the rest, as in Task 28c, and the warp-back case stays refused.
+    #[test] // spec: QA-088, QA-036
+    fn replay_without_device_raw_input_with_real_moves_task_28c_holds() {
+        for fakes in ALL_FAKES {
+            for hand_raw in [None, Some(false)] {
+                let mut r = Replay::open(fakes, true);
+                r.hand_raw = hand_raw;
+                still_clicks_among_background_moves(&mut r);
+                r.report("no device raw input");
+                assert_eq!(
+                    r.clicks,
+                    [refused("no_move"), refused("no_move")],
+                    "{fakes:?}, {hand_raw:?}"
+                );
+
+                let mut r = Replay::open(fakes, true);
+                r.hand_raw = hand_raw;
+                rest_on_merge(&mut r);
+                r.wait(500);
+                r.warp(MERGE);
+                three_still_clicks(&mut r);
+                assert!(
+                    r.clicks.iter().all(|c| *c == refused("no_move")),
+                    "warp back, {fakes:?}, {hand_raw:?}: {:?}",
+                    r.clicks
+                );
+            }
+        }
     }
 
     /// Task 28c re-review N2: a press on the window itself, or the accept button losing the
