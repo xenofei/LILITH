@@ -83,8 +83,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow, ScreenToClient,
+    ClientToScreen, DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::Cryptography::{
@@ -109,15 +109,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BringWindowToTop, CW_USEDEFAULT, CallWindowProcW, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL,
     FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWLP_WNDPROC, GetClientRect, GetCursorPos,
-    GetDlgItem, GetForegroundWindow, GetMessagePos, GetMessageW, GetParent, GetWindowLongPtrW,
-    GetWindowRect, GetWindowThreadProcessId, HMENU, InSendMessage, KillTimer, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INPUT, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PASTE, WM_SETFONT, WM_SETTEXT, WM_TIMER,
-    WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetDlgItem, GetForegroundWindow, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HMENU, InSendMessage, KillTimer, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_INPUT, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_PASTE, WM_SETFONT, WM_SETTEXT, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW,
+    WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, Interface, w};
 use windows_future::IAsyncOperation;
@@ -1679,9 +1679,11 @@ pub struct PointerMsg {
     /// Sent from another thread or process (`InSendMessage`).
     pub sent: bool,
     pub at: Option<(i32, i32)>,
-    /// Where the cursor was when Windows made the message (`GetMessagePos`). For a real move
-    /// it must match `at`: otherwise something moved the cursor while the move was being
-    /// handled, and the move is judged as an own move at a new place (Task 28d review m1).
+    /// The message's own point (`lParam` through `ClientToScreen`): where the cursor was when
+    /// Windows made it. Only compared, never recorded. For a real move (whose point Windows
+    /// set, since posted and sent moves are never real) it must match `at`: otherwise
+    /// something moved the cursor while the move was being handled, and the move is judged as
+    /// an own move at a new place, so a mismatch can only refuse (Task 28d review m1).
     pub message_at: Option<(i32, i32)>,
 }
 
@@ -1761,7 +1763,9 @@ impl PointerMsg {
 ///   click is refused (the safe side, but no better than Task 28c for that mouse);
 ///   `replay_the_hands_raw_after_its_move_is_refused` pins it;
 /// - whether a `WM_INPUT` can be dropped or delayed relative to mouse messages while another
-///   program floods this thread's posted queue.
+///   program floods this thread's posted queue;
+/// - whether a move's own point and `GetCursorPos` always agree under DPI virtualization on a
+///   scaled display (no DPI awareness is declared; the probe saw 110 of 110 agree here).
 ///
 /// The PIN at the Windows Hello prompt is still the real gate.
 ///
@@ -2143,9 +2147,10 @@ fn with_gate<T>(f: impl FnOnce(&mut ClickGate) -> T) -> T {
     })
 }
 
-/// The pointer message this thread is handling: its source, and where the cursor really is
-/// (`GetCursorPos`, never the message's `lParam`: review I1).
-fn pointer_msg() -> PointerMsg {
+/// The pointer message to `hwnd` this thread is handling: its source, where the cursor really
+/// is (`GetCursorPos`, never the message's `lParam`: review I1), and the message's own point
+/// in screen coordinates, only to compare with it (Task 28d review m1).
+fn pointer_msg(hwnd: HWND, lp: LPARAM) -> PointerMsg {
     let (origin, device) = current_input_source();
     PointerMsg {
         origin,
@@ -2153,8 +2158,19 @@ fn pointer_msg() -> PointerMsg {
         // SAFETY: a query about the message this thread is handling.
         sent: unsafe { InSendMessage() }.as_bool(),
         at: cursor_screen(),
-        message_at: Some(message_pos()),
+        message_at: message_screen_point(hwnd, lp),
     }
+}
+
+/// A mouse message's own point (`lParam`, `hwnd`'s client coordinates) in screen coordinates
+/// (`ClientToScreen`), as the pointer probe compared it with `GetCursorPos` on the owner's PC.
+fn message_screen_point(hwnd: HWND, lp: LPARAM) -> Option<(i32, i32)> {
+    let (x, y) = message_point(lp);
+    let mut p = windows::Win32::Foundation::POINT { x, y };
+    // SAFETY: this thread's own window, and a local point.
+    unsafe { ClientToScreen(hwnd, &mut p) }
+        .as_bool()
+        .then_some((p.x, p.y))
 }
 
 /// Registers this process's raw mouse input (usage page 1, usage 2) for `window`, delivered
@@ -2252,17 +2268,6 @@ fn raw_mouse_input(lp: LPARAM) -> Option<RawMouse> {
         absolute: m.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0,
         last: (m.lLastX, m.lLastY),
     })
-}
-
-/// Where the cursor was when Windows made the message this thread is handling
-/// (`GetMessagePos`, screen coordinates as `GetCursorPos` gives them).
-fn message_pos() -> (i32, i32) {
-    // SAFETY: a plain query about the message this thread is handling.
-    let pos = unsafe { GetMessagePos() };
-    (
-        i32::from(pos as u16 as i16),
-        i32::from((pos >> 16) as u16 as i16),
-    )
 }
 
 /// Arms `TME_LEAVE` on `hwnd`; whether it is armed.
@@ -2397,7 +2402,7 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 } else {
                     with_gate(ClickGate::raw_lost);
                 }
-                let m = pointer_msg();
+                let m = pointer_msg(hwnd, lp);
                 with_gate(|g| g.button_move(point_inside(hwnd, lp), m, now));
                 // Armed on every move, so leaving always ends the rest and forgets where the
                 // cursor was (review I2).
@@ -2406,7 +2411,7 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_MOUSELEAVE => with_gate(ClickGate::button_leave),
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-                let m = pointer_msg();
+                let m = pointer_msg(hwnd, lp);
                 with_gate(|g| g.button_press(point_inside(hwnd, lp), m, now));
             }
             WM_CAPTURECHANGED => with_gate(ClickGate::capture_changed),
@@ -2421,7 +2426,7 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             WM_LBUTTONUP => {
-                let m = pointer_msg();
+                let m = pointer_msg(hwnd, lp);
                 let (armed, refusal) = with_gate(|g| g.button_release(point_inside(hwnd, lp), m));
                 // The button's own procedure releases the capture (WM_CAPTURECHANGED, back
                 // here) and reports the click (WM_COMMAND to the window) within this call.
@@ -2843,7 +2848,7 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 // (review I1); TME_LEAVE is armed on every move (review I2). With raw input
                 // still this window's, an own move at the same place keeps the rest (Task 28d).
                 check_raw_mouse(hwnd);
-                let m = pointer_msg();
+                let m = pointer_msg(hwnd, lp);
                 let over = over_accept(hwnd, message_point(lp), true);
                 with_gate(|g| g.window_move(over, m, Instant::now()));
                 let armed = track_leave(hwnd);
