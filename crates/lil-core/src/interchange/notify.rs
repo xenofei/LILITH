@@ -260,7 +260,7 @@ impl Notifier {
                     return;
                 };
                 match news {
-                    ConfirmNews::Pending(view) => me.confirmation_pending(&view).await,
+                    ConfirmNews::Pending(view) => me.confirmation_pending(&view, false).await,
                     ConfirmNews::Ended(id) => me.confirmation_ended(&id).await,
                     ConfirmNews::Reconcile => {
                         me.reconcile_queued.store(false, Ordering::SeqCst);
@@ -601,7 +601,8 @@ impl Notifier {
 
     /// A pending confirmation: its toast with Open and Deny and a fresh token, unless this run
     /// posted one already.
-    async fn confirmation_pending(&self, view: &ConfirmationView) {
+    /// `reconciling`: an earlier run's toast of a refused re-post is looked for and removed.
+    async fn confirmation_pending(&self, view: &ConfirmationView, reconciling: bool) {
         if lock(&self.memory).confirmations.contains(&view.id) {
             return;
         }
@@ -640,6 +641,9 @@ impl Notifier {
             confirm.forget_toast_token(&view.id, &token);
             tracing::info!(confirmation = %view.id, outcome = ?outcome, "no confirmation toast");
             // An earlier run's toast of it is still there with a dead Deny: it goes.
+            if !reconciling {
+                return;
+            }
             let desktop = self.desktop.clone();
             let shown = tokio::task::spawn_blocking(move || desktop.history())
                 .await
@@ -686,7 +690,7 @@ impl Notifier {
         let mut pending = confirm.tracked_ids();
         pending.extend(rows.iter().map(|r| r.id.clone()));
         for row in &rows {
-            self.confirmation_pending(&row.view()).await;
+            self.confirmation_pending(&row.view(), true).await;
         }
         let gone: Vec<String> = lock(&self.memory)
             .confirmations

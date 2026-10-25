@@ -1460,3 +1460,32 @@ fn a_carried_over_confirmation_of_a_later_workspace_gets_its_toast_when_its_retr
     let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
     assert_eq!(toast["tag"], id.as_str(), "{toast}");
 }
+
+/// m5: a settled batch whose job is retried ends again, and toasts again (the retry is a new
+/// job id, so the settled batch's memory doesn't hold it back).
+#[test] // spec: APP-146
+fn a_retried_job_of_a_settled_batch_toasts_again() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let failed = job_ids(&write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final"}),
+    ))
+    .remove(0);
+    assert_eq!(wait_done(&mut p, &failed)["status"], "failed");
+    until_posts(&mut p, "job_failed", 1);
+    let retried = write(&mut p, "job.retry", json!({"job_id": failed}));
+    let again = retried["job"]["job_id"].as_str().unwrap().to_string();
+    assert_ne!(again, failed);
+    assert_eq!(wait_done(&mut p, &again)["status"], "failed");
+    let toasts = until_posts(&mut p, "job_failed", 2);
+    assert_eq!(
+        toasts[1]["launch"],
+        format!("{scheme}:task/{again}"),
+        "{toasts:?}"
+    );
+}

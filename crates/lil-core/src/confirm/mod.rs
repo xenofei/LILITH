@@ -92,6 +92,33 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The newest ended confirmation ids, at most [`ENDED_KEPT`]: a queue for their order and a
+/// set for the lookups.
+#[derive(Debug, Default)]
+struct Ended {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl Ended {
+    fn add(&mut self, id: &str) {
+        if self.set.insert(id.to_string()) {
+            self.order.push_back(id.to_string());
+            while self.order.len() > ENDED_KEPT {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn forget(&mut self, id: &str) {
+        if self.set.remove(id) {
+            self.order.retain(|e| e != id);
+        }
+    }
+}
+
 /// The event topic of the confirmations.
 pub const CONFIRMATIONS_TOPIC: &str = "confirmations";
 
@@ -354,7 +381,7 @@ pub struct Confirm {
     pending: Mutex<HashMap<String, Tracked>>,
     /// The newest confirmations that ended in this core: a read that raced the end never
     /// tracks one again. Taken under `pending`'s lock.
-    ended: Mutex<VecDeque<String>>,
+    ended: Mutex<Ended>,
     /// The caps: stage 5's cap half and a cap answer's `raise`.
     caps: std::sync::OnceLock<Arc<Caps>>,
 }
@@ -395,7 +422,7 @@ impl Confirm {
             mcp,
             failpoints,
             pending: Mutex::new(HashMap::new()),
-            ended: Mutex::new(VecDeque::new()),
+            ended: Mutex::new(Ended::default()),
             caps: std::sync::OnceLock::new(),
         })
     }
@@ -508,7 +535,7 @@ impl Confirm {
     /// read it before its answer landed) is never known again.
     fn track(&self, row: &ConfirmationRow) -> bool {
         let mut tracked = self.tracked();
-        if lock(&self.ended).contains(&row.id) {
+        if lock(&self.ended).set.contains(&row.id) {
             return false;
         }
         let known = tracked.get(&row.id);
@@ -537,16 +564,17 @@ impl Confirm {
     fn untrack(&self, id: &str) {
         {
             let mut tracked = self.tracked();
-            let mut ended = lock(&self.ended);
-            if !ended.iter().any(|e| e == id) {
-                ended.push_back(id.to_string());
-                while ended.len() > ENDED_KEPT {
-                    ended.pop_front();
-                }
-            }
+            lock(&self.ended).add(id);
             tracked.remove(id);
         }
         self.notify.ended(id);
+    }
+
+    /// The end of `id` couldn't be written: it is still pending, so a later list or retry may
+    /// track it again (and its sweep or expiry then ends it).
+    fn end_failed(&self, id: &str) {
+        let _tracked = self.tracked();
+        lock(&self.ended).forget(id);
     }
 
     /// Asks the notification path to reconcile its toasts with the pending confirmations
@@ -683,7 +711,10 @@ impl Confirm {
     /// ended it.
     async fn expire(&self, db: &StateDb, id: &str) -> Result<(), StateError> {
         self.untrack(id);
-        if let Some(row) = store::end(db, id, ConfState::Expired, None, None, None, None).await? {
+        let ended = store::end(db, id, ConfState::Expired, None, None, None, None)
+            .await
+            .inspect_err(|_| self.end_failed(id))?;
+        if let Some(row) = ended {
             tracing::info!(confirmation = %row.id, "a confirmation expired unanswered");
             self.publish("expired", &row);
         }
@@ -983,6 +1014,7 @@ impl Confirm {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    self.end_failed(&id);
                     tracing::warn!(confirmation = %id, error = %e, "a cap confirmation could not be cancelled")
                 }
             }
@@ -1200,6 +1232,10 @@ mod tests {
         assert!(!c.tracked_ids().contains("cf_2"));
         assert!(c.track(&row("cf_3")), "new");
         assert!(!c.track(&row("cf_3")), "known");
+        // An end that couldn't be written leaves it trackable again.
+        c.untrack("cf_3");
+        c.end_failed("cf_3");
+        assert!(c.track(&row("cf_3")), "still pending");
         assert!(same_token("ab", "ab") && !same_token("ab", "ac") && !same_token("ab", "abc"));
     }
 }
