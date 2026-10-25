@@ -611,9 +611,9 @@ impl ComfyClient {
 
     /// Whether the asset catalogue is on, by `GET /api/features`'s `assets` boolean (ARCH-065;
     /// Appendix G), within [`CATALOGUE_TIMEOUT`]: `Some` for an answer that stands
-    /// ([`Catalogue::Unknown`] for a missing route, an older ComfyUI's 404, or no `assets`
-    /// key), `None` when the request failed to connect, timed out or got a 5xx, so it may be
-    /// asked again. `/api/assets` is never asked: ComfyUI registers it even when the catalogue
+    /// ([`Catalogue::Unknown`] for a missing route, an older ComfyUI's 404, or a JSON answer
+    /// without `assets`), `None` for any other failure (no connection, a timeout, another 4xx,
+    /// a 5xx, an answer that isn't JSON), so it may be asked again. `/api/assets` is never asked: ComfyUI registers it even when the catalogue
     /// is off.
     pub async fn asset_catalogue(&self) -> Option<Catalogue> {
         let answer = tokio::time::timeout(CATALOGUE_TIMEOUT, self.get_json("api/features")).await;
@@ -623,8 +623,9 @@ impl ComfyClient {
                 Some(false) => Catalogue::Off,
                 None => Catalogue::Unknown,
             }),
-            Ok(Err(ComfyError::Http(status, _))) if status < 500 => Some(Catalogue::Unknown),
-            Ok(Err(ComfyError::Protocol(_))) => Some(Catalogue::Unknown),
+            // Only an older ComfyUI's missing route is final; every other failure (another 4xx,
+            // a 5xx, an answer that can't be read) is asked again (plan 4a ruling, 2026-10-24).
+            Ok(Err(ComfyError::Http(404, _))) => Some(Catalogue::Unknown),
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, "ComfyUI's /api/features did not answer; asked again later");
                 None

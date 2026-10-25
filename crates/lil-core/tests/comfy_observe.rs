@@ -1770,6 +1770,48 @@ async fn quiet_restarts_keep_the_rollback_capture() {
     let changes = environment::changes(&kept[0], &kept[1]);
     assert_eq!(changes.len(), 1, "{changes:?}");
     assert_eq!(changes[0].from.as_deref(), Some("1.0.0"));
+
+    // A capture taken before the first GPU reading has no driver: the first known driver is
+    // stored as a new row, so a driver update after it is recorded (plan 4a ruling, fix
+    // round 2).
+    let engine = "driver-test";
+    let at = |driver: Value, free: i64| capture("1.1.0", driver, free);
+    let unknown = at(Value::Null, 100);
+    let d570 = at(json!("570.10"), 101);
+    let d580 = at(json!("580.20"), 104);
+    assert!(
+        environment::store_capture(&db, engine, &unknown, 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        environment::store_capture(&db, engine, &d570, 2)
+            .await
+            .unwrap(),
+        "the driver became known"
+    );
+    for (n, quiet) in [at(json!("570.10"), 102), at(Value::Null, 103)]
+        .iter()
+        .enumerate()
+    {
+        let kept = environment::store_capture(&db, engine, quiet, 3 + i64::try_from(n).unwrap())
+            .await
+            .unwrap();
+        assert!(!kept, "quiet restart {n}");
+    }
+    assert!(
+        environment::store_capture(&db, engine, &d580, 10)
+            .await
+            .unwrap(),
+        "the driver changed"
+    );
+    let kept = environment::recent(&db, engine, 20).await.unwrap();
+    assert_eq!(kept, [d580.clone(), d570.clone(), unknown.clone()]);
+    let changes = serde_json::to_value(environment::changes(&kept[0], &kept[1])).unwrap();
+    assert_eq!(
+        changes,
+        json!([{"what": "driver", "from": "570.10", "to": "580.20", "change": "changed"}])
+    );
 }
 
 /// A probe that can't open any file to read it.

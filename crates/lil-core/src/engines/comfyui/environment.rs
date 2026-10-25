@@ -264,9 +264,15 @@ pub async fn store_capture(
                     rusqlite::Error::QueryReturnedNoRows => Ok(None),
                     e => Err(e),
                 })?;
+            // The same environment, unless a known driver arrives after an unknown one: that is
+            // stored too (never written into the stored row), so a later driver change is
+            // compared with it (plan 4a ruling, 2026-10-24, fix round 2).
             let same = newest.as_ref().is_some_and(|(_, stored)| {
-                serde_json::from_str::<Value>(stored)
-                    .is_ok_and(|old| changes(&new, &old).is_empty())
+                serde_json::from_str::<Value>(stored).is_ok_and(|old| {
+                    let learns_driver =
+                        text_of(&old, "driver").is_none() && text_of(&new, "driver").is_some();
+                    changes(&new, &old).is_empty() && !learns_driver
+                })
             });
             if same {
                 return Ok(false);

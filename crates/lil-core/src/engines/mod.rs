@@ -3,11 +3,15 @@
 //! **owned** engine it started or an **attached** one someone else started.
 //!
 //! - **Owned.** [`Engines::start`] runs `<python> main.py --listen 127.0.0.1 --port <port>
-//!   <profile flags> <extra_args>` in `<root>` (the launch profile, [`LaunchProfile`],
-//!   ARCH-126), in a kill-on-close Job Object, with its output in the core's log (target
+//!   <profile flags> <extra_args> --disable-assets` in `<root>` (the launch profile,
+//!   [`LaunchProfile`], ARCH-126; the last flag keeps ComfyUI's asset catalogue off,
+//!   ARCH-065), in a kill-on-close Job Object, with its output in the core's log (target
 //!   `engine.comfyui`, ARCH-119) and a scrubbed environment ([`scrubbed_env`], ARCH-063).
-//!   `extra_args` holding `--listen` or `--enable-assets` is refused before anything starts. Once it answers `GET /system_stats`, every listening socket of every process in
-//!   its Job Object must be on loopback, read through the core's socket table
+//!   `extra_args` holding `--listen`, `--port`, `--enable-assets` or
+//!   `--windows-standalone-build` (or a prefix argparse takes for one) is refused before
+//!   anything starts, as is a launch-profile value that isn't valid. Once it answers
+//!   `GET /system_stats`, every listening socket of every process in its Job Object must be
+//!   on loopback, read through the core's socket table
 //!   (`CoreConfig::sockets`), or the core stops it and fails with `comfyui.not_loopback`
 //!   (ARCH-068). An owned engine idle for `idle_free_after_s` with no suite job gets
 //!   `/free {unload_models: true, free_memory: true}`; it is stopped in the shutdown's

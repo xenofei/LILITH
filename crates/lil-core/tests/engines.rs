@@ -2072,3 +2072,45 @@ async fn restart_cancels_a_start_in_progress() {
     gone_async(pid).await;
     engines.stop(EngineKind::ComfyUi).await.unwrap();
 }
+
+/// Only a 404, or a JSON answer without `assets`, ends the probing; another 4xx or an answer
+/// that can't be read is probed again like a 5xx (plan 4a ruling, 2026-10-24, fix round 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-065
+async fn other_4xx_and_unreadable_answers_are_probed_again() {
+    for (status, text) in [
+        (429, r#"{"error": "busy"}"#),
+        (408, r#"{"error": "slow"}"#),
+        (403, r#"{"error": "no"}"#),
+        (200, r#"{"assets": tr"#),
+        (200, "not json"),
+    ] {
+        let fake = FakeComfy::start();
+        fake.set_features_text(status, text);
+        let env = TestEnv::new();
+        attach(&env, fake.port(), &fake.root());
+        let rig = Rig::new(env);
+        let engines = rig.engines(Arc::new(OsSockets));
+        engines.tick().await;
+        assert_eq!(probes(&fake), 1, "{status} {text}");
+        fake.set_features(200, json!({"assets": false}));
+        rig.clock.advance(Duration::from_secs(30));
+        engines.tick().await;
+        until(&format!("{status} {text} probed again"), || {
+            probes(&fake) == 2
+        })
+        .await;
+        let shown = serde_json::to_value(engines.status().await.remove(0)).unwrap();
+        assert_eq!(shown["asset_catalogue"], "off", "{status} {text}: {shown}");
+    }
+    // A JSON answer without `assets` stands, as a 404 does.
+    let fake = FakeComfy::start();
+    fake.set_features(200, json!({"supports_preview_metadata": true}));
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    engines.tick().await;
+    rig.clock.advance(Duration::from_secs(60));
+    engines.tick().await;
+    assert_eq!(probes(&fake), 1, "an answer without assets stands");
+}

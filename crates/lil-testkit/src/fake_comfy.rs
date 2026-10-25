@@ -319,7 +319,13 @@ impl FakeComfy {
     /// `{"supports_preview_metadata": true, "assets": false}`, as ComfyUI 0.42.1 with its asset
     /// catalogue off).
     pub fn set_features(&self, status: u16, body: Value) {
-        self.shared.lock().features = Some((status, body));
+        self.shared.lock().features = Some((status, body.to_string()));
+    }
+
+    /// What `GET /api/features` answers: `status` with `body` as it is, JSON or not (an answer
+    /// cut short, say).
+    pub fn set_features_text(&self, status: u16, body: &str) {
+        self.shared.lock().features = Some((status, body.to_string()));
     }
 
     /// The next suite prompt that runs also reports an output named `filename` (under a node
@@ -689,7 +695,7 @@ struct State {
     /// `system.argv` (`None`: `["main.py"]`).
     argv: Option<Vec<String>>,
     /// `GET /api/features`'s status and body (`None`: the default, [`FakeComfy::set_features`]).
-    features: Option<(u16, Value)>,
+    features: Option<(u16, String)>,
     clients: Vec<Client>,
     next_number: u64,
     next_id: u64,
@@ -1309,12 +1315,13 @@ async fn handle(
             let (status, body) = shared.lock().features.clone().unwrap_or_else(|| {
                 (
                     200,
-                    json!({"supports_preview_metadata": true, "assets": false}),
+                    json!({"supports_preview_metadata": true, "assets": false}).to_string(),
                 )
             });
-            json_response(
+            respond(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                &body,
+                "application/json",
+                body,
             )
         }
         _ => json_response(StatusCode::NOT_FOUND, &json!({"error": "not found"})),
