@@ -69,6 +69,7 @@
 //!   would refuse the whole subscribe: [`Session::start`] leaves them out, and
 //!   [`Session::subscribe`] refuses them.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -274,7 +275,14 @@ impl Session {
             let mut known = lock(&self.shared.topics);
             topics
                 .into_iter()
-                .filter(|topic| known.insert(topic.clone(), None).is_none())
+                .filter(|topic| match known.entry(topic.clone()) {
+                    // A topic the session has keeps its last seq.
+                    Entry::Vacant(slot) => {
+                        slot.insert(None);
+                        true
+                    }
+                    Entry::Occupied(_) => false,
+                })
                 .collect()
         };
         if added.is_empty() {
@@ -655,7 +663,7 @@ async fn establish(
         if !added.is_empty() {
             sent.extend(added.iter().cloned());
             let subscribed = bounded(cap, client.subscribe_only(added, BTreeMap::new())).await?;
-            note_subscribed(shared, &subscribed.topics);
+            note_live(shared, &subscribed.topics);
         }
     }
     Ok(Live { client, events })
@@ -695,7 +703,19 @@ fn note_if_current(shared: &Shared, client: &Arc<Client>, states: &[TopicState])
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, client))
     {
-        note_subscribed(shared, states);
+        note_live(shared, states);
+    }
+}
+
+/// A live-only answer: each topic's last seq is at least the seq it was answered with, as all
+/// events of that subscription are above it (an event of an earlier one that got in first
+/// does not keep the floor lower).
+fn note_live(shared: &Shared, states: &[TopicState]) {
+    let mut known = lock(&shared.topics);
+    for state in states {
+        if let Some(last) = known.get_mut(&state.topic) {
+            *last = Some(last.map_or(state.seq, |seq| seq.max(state.seq)));
+        }
     }
 }
 
@@ -1883,6 +1903,67 @@ mod tests {
             assert!(took_kind(EventKind::ResyncRequired, 3, 5));
             assert!(took_kind(EventKind::Event, 4, 6));
             assert_eq!(session.last_seq("test:r"), Some(4));
+            session.close().await;
+        });
+    }
+
+    /// Subscribing a topic the session already has changes nothing about it: its last seq stays,
+    /// so a connection lost right after still resumes the topic from that seq and the events
+    /// published meanwhile are replayed, not lost.
+    #[test] // spec: APP-035, ARCH-100
+    fn subscribing_a_known_topic_keeps_its_cursor() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let mut state = session.state();
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            fake.subscribed("test:r", 5).await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            session
+                .subscribe(vec!["test:r".to_string(), "test:r".to_string()])
+                .await
+                .expect("subscribe");
+            assert_eq!(session.last_seq("test:r"), Some(5));
+
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            drop(fake);
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            let first = fake.request("lil/subscribe").await;
+            assert_eq!(first["params"]["since_seq"], json!({"test:r": 5}));
+            fake.reply_subscribed(&first, &[("test:r", 9)]).await;
+            session.close().await;
+            drop(fake);
+        });
+    }
+
+    /// A live-only answer raises the floor to its seq when an event of the topic got in before
+    /// it, and never lowers it.
+    #[test] // spec: APP-035, ARCH-032
+    fn a_live_only_answer_raises_the_last_seq() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        current_thread().block_on(async {
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let answer = |seq: u64| {
+                [TopicState {
+                    topic: "test:r".to_string(),
+                    seq,
+                }]
+            };
+            // An event that slipped in before the answer.
+            lock(&session.shared.topics).insert("test:r".to_string(), Some(3));
+            note_live(&session.shared, &answer(8));
+            assert_eq!(session.last_seq("test:r"), Some(8));
+            note_live(&session.shared, &answer(6));
+            assert_eq!(session.last_seq("test:r"), Some(8));
+            // No last seq yet: the answer's seq.
+            lock(&session.shared.topics).insert("test:r".to_string(), None);
+            note_live(&session.shared, &answer(2));
+            assert_eq!(session.last_seq("test:r"), Some(2));
             session.close().await;
         });
     }
