@@ -82,8 +82,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow, ScreenToClient,
+    ClientToScreen, DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::Cryptography::{
@@ -1295,12 +1295,7 @@ pub struct ButtonInput {
 pub fn arms_accept(input: ButtonInput) -> bool {
     input.msg == WM_LBUTTONUP
         && input.over_button
-        && input.origin == InputOrigin::Hardware
-        && matches!(
-            input.device,
-            InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
-        )
-        && !input.sent_by_another_thread
+        && is_real_pointer(input.origin, input.device, input.sent_by_another_thread)
         && input.pressed_by_hardware
 }
 
@@ -1620,14 +1615,25 @@ pub fn is_real_pointer(origin: InputOrigin, device: InputDevice, sent: bool) -> 
 /// button (plan 4a ruling 2026-10-25; pure). A grey button gets no mouse input, so the window
 /// gets the moves over it: a real pointer move over the grey button counts, so a pointer parked
 /// there before the buttons turn on isn't refused; any other move (elsewhere, or not real, a
-/// `SetCursorPos` warp's included) starts the rest again ([`PressTracker::on_move`]).
+/// `SetCursorPos` warp's included) starts the rest again ([`PressTracker::on_move`]). It also
+/// needs `moved` ([`cursor_moved`], Task 28b review m1): the window or the button sliding under
+/// a still cursor makes Windows send a move, and that move never counts, whatever origin it
+/// reports.
 pub fn grey_rest_move(
     over_grey_accept: bool,
+    moved: bool,
     origin: InputOrigin,
     device: InputDevice,
     sent: bool,
 ) -> bool {
-    over_grey_accept && is_real_pointer(origin, device, sent)
+    over_grey_accept && moved && is_real_pointer(origin, device, sent)
+}
+
+/// Whether the cursor's screen position `now` differs from where it was at the last restart of
+/// the delay (Task 28b review m1; pure). A position that couldn't be read at the restart counts
+/// as not moved.
+pub fn cursor_moved(at_restart: Option<(i32, i32)>, now: (i32, i32)) -> bool {
+    at_restart.is_some_and(|then| then != now)
 }
 
 /// Whether a message to the read-only text or a button would change what it shows (re-review 3
@@ -1684,6 +1690,8 @@ thread_local! {
     static ACCEPT_LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// The STATIC class's original window procedure, kept when the status line is subclassed.
     static STATUS_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// The cursor's screen position at the last restart of the delay (Task 28b review m1).
+    static RESTART_CURSOR: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
     /// lil itself is setting the status line's text (the subclass refuses everyone else).
     static OWN_STATUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The asking window's last known place and size, to tell a move or resize.
@@ -1964,12 +1972,43 @@ fn refuse_click(window: HWND, refusal: Refusal) {
     });
     show_status(window);
     let label = ACCEPT_LABEL.with(|l| l.borrow().clone());
-    // Never panic in a window procedure: a closed stderr just loses the line.
-    let _ = writeln!(
-        io::stderr(),
+    log_refusal(format!(
         "lil: a click on {label} didn't count: {}",
         refusal.name()
-    );
+    ));
+}
+
+/// How many refusal lines may wait for stderr; more are dropped.
+const REFUSAL_LOG_QUEUE: usize = 16;
+
+/// Hands `line` to a logging thread that writes it to stderr (Task 28b review), so the window
+/// thread never waits on stderr: a full pipe or a slow console can't stall the window. The
+/// queue is bounded and `try_send` never blocks; a line that doesn't fit is dropped, and a
+/// closed stderr just loses it.
+fn log_refusal(line: String) {
+    static LOG: std::sync::OnceLock<Option<mpsc::SyncSender<String>>> = std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<String>(REFUSAL_LOG_QUEUE);
+        std::thread::Builder::new()
+            .name("hello-refusal-log".into())
+            .spawn(move || {
+                for line in rx {
+                    let _ = writeln!(io::stderr(), "{line}");
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(tx) = log {
+        let _ = tx.try_send(line);
+    }
+}
+
+/// The cursor's screen position, if it can be read.
+fn cursor_screen() -> Option<(i32, i32)> {
+    let mut p = windows::Win32::Foundation::POINT::default();
+    // SAFETY: a query into a local structure.
+    unsafe { GetCursorPos(&mut p) }.ok().map(|()| (p.x, p.y))
 }
 
 /// Whether `point` (the window's client coordinates) is on the accept button; with
@@ -2007,6 +2046,8 @@ fn restart_live(window: HWND) {
         c.set(clock);
     });
     with_press(PressTracker::cancel);
+    // Only a move away from here counts towards the rest over the grey button (review m1).
+    RESTART_CURSOR.with(|c| c.set(cursor_screen()));
     set_buttons_enabled(window, false);
 }
 
@@ -2243,9 +2284,16 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 // Moves over the grey button come here too; real ones count towards the rest
                 // (plan 4a ruling 2026-10-25). A move here anywhere else, or one that isn't
                 // real, starts it again.
+                // Only a cursor that moved since the last restart counts, so the window or the
+                // button sliding under a still cursor never does (review m1).
                 let (origin, device) = current_input_source();
+                let (x, y) = message_point(lp);
+                let mut screen = windows::Win32::Foundation::POINT { x, y };
+                let moved = ClientToScreen(hwnd, &mut screen).as_bool()
+                    && cursor_moved(RESTART_CURSOR.with(|c| c.get()), (screen.x, screen.y));
                 let real = grey_rest_move(
-                    over_accept(hwnd, message_point(lp), true),
+                    over_accept(hwnd, (x, y), true),
+                    moved,
                     origin,
                     device,
                     InSendMessage().as_bool(),
@@ -2270,8 +2318,18 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 let on_button = GetCursorPos(&mut cursor).is_ok()
                     && ScreenToClient(hwnd, &mut cursor).as_bool()
                     && over_accept(hwnd, (cursor.x, cursor.y), false);
-                if !on_button {
-                    with_press(PressTracker::on_leave);
+                match GetDlgItem(Some(hwnd), ID_ACCEPT as i32) {
+                    // Track the button's own leave, so leaving it drops the rest (review m2).
+                    Ok(accept) if on_button => {
+                        let mut track = TRACKMOUSEEVENT {
+                            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: accept,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut track);
+                    }
+                    _ => with_press(PressTracker::on_leave),
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2816,17 +2874,17 @@ mod tests {
         ];
         for device in pointers {
             assert!(
-                grey_rest_move(true, InputOrigin::Hardware, device, false),
+                grey_rest_move(true, true, InputOrigin::Hardware, device, false),
                 "{device:?}"
             );
             // Elsewhere in the window, it isn't on the button.
             assert!(
-                !grey_rest_move(false, InputOrigin::Hardware, device, false),
+                !grey_rest_move(false, true, InputOrigin::Hardware, device, false),
                 "{device:?}"
             );
             // Sent from another thread.
             assert!(
-                !grey_rest_move(true, InputOrigin::Hardware, device, true),
+                !grey_rest_move(true, true, InputOrigin::Hardware, device, true),
                 "{device:?}"
             );
         }
@@ -2836,13 +2894,13 @@ mod tests {
             InputOrigin::Unavailable,
         ] {
             assert!(
-                !grey_rest_move(true, origin, InputDevice::Mouse, false),
+                !grey_rest_move(true, true, origin, InputDevice::Mouse, false),
                 "{origin:?}"
             );
         }
         for device in [InputDevice::Keyboard, InputDevice::Unavailable] {
             assert!(
-                !grey_rest_move(true, InputOrigin::Hardware, device, false),
+                !grey_rest_move(true, true, InputOrigin::Hardware, device, false),
                 "{device:?}"
             );
         }
@@ -2854,11 +2912,11 @@ mod tests {
         let hover = HOVER_BEFORE_PRESS.as_millis() as u64;
         let mut p = PressTracker::default();
         p.on_move(
-            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            grey_rest_move(true, true, InputOrigin::Hardware, InputDevice::Mouse, false),
             at(0),
         );
         p.on_move(
-            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            grey_rest_move(true, true, InputOrigin::Hardware, InputDevice::Mouse, false),
             at(5),
         );
         p.on_press(true, InputDevice::Mouse, at(hover));
@@ -2867,11 +2925,11 @@ mod tests {
         // clicks at once: the rest started again at the warp, so the press doesn't count.
         let mut p = PressTracker::default();
         p.on_move(
-            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            grey_rest_move(true, true, InputOrigin::Hardware, InputDevice::Mouse, false),
             at(0),
         );
         p.on_move(
-            grey_rest_move(true, InputOrigin::System, InputDevice::Mouse, false),
+            grey_rest_move(true, true, InputOrigin::System, InputDevice::Mouse, false),
             at(hover * 3),
         );
         p.on_press(true, InputDevice::Mouse, at(hover * 3 + 1));
@@ -2879,15 +2937,76 @@ mod tests {
         // Parked, then moved off the button within the window: the rest is gone.
         let mut p = PressTracker::default();
         p.on_move(
-            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            grey_rest_move(true, true, InputOrigin::Hardware, InputDevice::Mouse, false),
             at(0),
         );
         p.on_move(
-            grey_rest_move(false, InputOrigin::Hardware, InputDevice::Mouse, false),
+            grey_rest_move(
+                false,
+                true,
+                InputOrigin::Hardware,
+                InputDevice::Mouse,
+                false,
+            ),
             at(1),
         );
         p.on_press(true, InputDevice::Mouse, at(hover * 3));
         assert_eq!(p.on_release(), Err(Refusal::NoRest));
+    }
+
+    /// Task 28b review m1: a move over the grey button counts towards the rest only when the
+    /// cursor's screen position changed since the last restart. The window or the button sliding
+    /// under a still cursor (which restarts the delay and makes Windows send a move) never counts,
+    /// whatever origin that move reports.
+    #[test] // spec: QA-088
+    fn a_slide_under_a_still_cursor_never_counts_towards_the_rest() {
+        // Where the cursor was at the restart, and where it is now.
+        assert!(cursor_moved(Some((100, 200)), (101, 200)));
+        assert!(cursor_moved(Some((100, 200)), (100, 199)));
+        assert!(!cursor_moved(Some((100, 200)), (100, 200)));
+        // The position at the restart couldn't be read: nothing counts.
+        assert!(!cursor_moved(None, (100, 200)));
+
+        // A still cursor: even a move reporting real hardware doesn't count.
+        let still = cursor_moved(Some((100, 200)), (100, 200));
+        assert!(!grey_rest_move(
+            true,
+            still,
+            InputOrigin::Hardware,
+            InputDevice::Mouse,
+            false
+        ));
+        // After the slide the owner parks the pointer and clicks without moving: refused.
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let hover = HOVER_BEFORE_PRESS.as_millis() as u64;
+        let mut p = PressTracker::default();
+        p.on_move(
+            grey_rest_move(
+                true,
+                still,
+                InputOrigin::Hardware,
+                InputDevice::Mouse,
+                false,
+            ),
+            at(0),
+        );
+        p.on_press(true, InputDevice::Mouse, at(hover * 3));
+        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        // The owner's hand then really moves it onto the button: that counts.
+        let moved = cursor_moved(Some((100, 200)), (104, 201));
+        p.on_move(
+            grey_rest_move(
+                true,
+                moved,
+                InputOrigin::Hardware,
+                InputDevice::Mouse,
+                false,
+            ),
+            at(hover * 4),
+        );
+        p.on_press(true, InputDevice::Mouse, at(hover * 5));
+        assert_eq!(p.on_release(), Ok(()));
     }
 
     /// Task 28b: a refused release names the first gate it failed: a pointer that isn't real
