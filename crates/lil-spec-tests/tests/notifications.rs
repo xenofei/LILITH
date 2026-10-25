@@ -58,11 +58,12 @@ fn confirmation_toast(
     id: &str,
 ) -> (String, String) {
     let scheme = scheme(env);
-    let posts = until_posted(pipe, "confirmation_waiting");
-    let toast = posts
-        .iter()
-        .find(|t| t["tag"] == id)
-        .unwrap_or_else(|| panic!("no confirmation toast tagged {id}: {posts:?}"));
+    // The notifier posts on its own task: wait for this id's toast, not for any earlier one.
+    let toast = &poll(&format!("a confirmation toast tagged {id}"), || {
+        posts_in(pipe, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id)
+    });
     assert_eq!(toast["launch"], format!("{scheme}:confirm/{id}"), "{toast}");
     let actions = toast_actions(toast);
     assert_eq!(actions.len(), 2, "Open and Deny: {toast}");
