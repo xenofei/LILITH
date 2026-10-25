@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lil_core::desktop::{
-    DesktopSettingsStore, DesktopWatch, POLL_EVERY, start_autopause, start_keep_awake,
+    DesktopSettingsStore, DesktopWatch, POLL_EVERY, RELEASE_RETRY_EVERY, start_autopause,
+    start_keep_awake,
 };
 use lil_core::events::EventBus;
 use lil_core::jobs::{
@@ -512,6 +513,49 @@ async fn keep_awake_unavailable_is_reported() {
     );
 }
 
+/// Dropping keep-awake (the core's shutdown) releases a held request, and nothing holds it
+/// afterwards.
+#[tokio::test(start_paused = true)] // spec: ARCH-127
+async fn dropping_keep_awake_releases_the_request() {
+    let fx = Fx::new(None).await;
+    let awake = start_keep_awake(fx.fake.clone(), fx.jobs.clone(), fx.store.current());
+    let gpu = fx.submit(Lane::GpuHeavy).await;
+    fx.until_job(&gpu, running).await;
+    settle().await;
+    assert!(fx.fake.power_held() && awake.held());
+
+    drop(awake);
+    assert!(!fx.fake.power_held(), "released while the job still runs");
+    fx.set(json!({"keep_awake_gpu": true})).await;
+    let second = fx.submit(Lane::GpuHeavy).await;
+    fx.handler.open(&gpu);
+    fx.until_job(&second, running).await;
+    settle().await;
+    assert!(!fx.fake.power_held(), "nothing holds it after the drop");
+    fx.handler.open(&second);
+    fx.until_job(&second, finished).await;
+}
+
+/// A release the PC refused is tried again soon, with nothing else happening.
+#[tokio::test(start_paused = true)] // spec: ARCH-127
+async fn a_failed_release_is_tried_again() {
+    let fx = Fx::new(None).await;
+    let _awake = start_keep_awake(fx.fake.clone(), fx.jobs.clone(), fx.store.current());
+    let gpu = fx.submit(Lane::GpuHeavy).await;
+    fx.until_job(&gpu, running).await;
+    settle().await;
+    assert!(fx.fake.power_held());
+
+    fx.fake.set_power_available(false);
+    fx.handler.open(&gpu);
+    fx.until_job(&gpu, finished).await;
+    settle().await;
+    assert!(fx.fake.power_held(), "the release was refused");
+    fx.fake.set_power_available(true);
+    fx.advance(RELEASE_RETRY_EVERY).await;
+    assert!(!fx.fake.power_held(), "released on the retry");
+}
+
 /// A log event: its message and its other fields, as `(name, value)` pairs.
 type LogEvent = (String, Vec<(String, String)>);
 
@@ -544,6 +588,17 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
 }
 
 impl Captured {
+    /// The process's only log subscriber (nextest runs each test in its own process).
+    fn install() -> Captured {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let captured = Captured::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(captured.clone()),
+        )
+        .expect("the only global subscriber of this test");
+        captured
+    }
+
     fn slept(&self) -> Vec<Vec<(String, String)>> {
         self.0
             .lock()
@@ -555,51 +610,105 @@ impl Captured {
     }
 }
 
+/// The value of the log field `name`, or empty.
+fn field(fields: &[(String, String)], name: &str) -> String {
+    fields
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
 #[tokio::test(start_paused = true)] // spec: ARCH-127
 async fn a_sleep_gap_is_logged_and_published() {
-    use tracing_subscriber::layer::SubscriberExt as _;
-    let captured = Captured::default();
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(captured.clone()))
-        .expect("the only global subscriber of this test");
+    let captured = Captured::install();
     let fx = Fx::new(None).await;
     fx.events().await;
 
     // The hidden window's broadcasts.
     let from = utc_text(fx.clock.utc_now());
     fx.watch.power_event(PowerEvent::Suspending);
-    fx.clock.shift_utc(3600);
+    fx.clock.sleep(Duration::from_secs(3600));
     fx.watch.power_event(PowerEvent::Resumed);
     let at = utc_text(fx.clock.utc_now());
     let slept = captured.slept();
     assert_eq!(slept.len(), 1, "{slept:?}");
-    let field = |name: &str| {
-        slept[0]
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
-    };
-    assert!(field("from").contains(&from), "{slept:?}");
-    assert!(field("to").contains(&at), "{slept:?}");
+    assert!(field(&slept[0], "from").contains(&from), "{slept:?}");
+    assert!(field(&slept[0], "to").contains(&at), "{slept:?}");
     assert_eq!(
         fx.events().await,
         [json!({"kind": "resumed", "slept_from": from, "at": at})]
     );
 
-    // The backstop: a wall-clock jump of more than 60 s against the monotonic clock, seen by
-    // the 30 s check, when no broadcast came.
+    // The backstop, the 30 s check: the time asleep grew by more than 60 s with no broadcast.
+    // Since the broadcast reported the hour, the next check sees nothing new.
     fx.advance(Duration::from_secs(30)).await;
-    assert_eq!(captured.slept().len(), 1, "no jump, no sleep");
-    fx.clock.shift_utc(61);
+    assert_eq!(captured.slept().len(), 1, "the hour is reported once");
+    fx.clock.sleep(Duration::from_secs(61));
+    let to = fx.clock.utc_now();
+    fx.advance(Duration::from_secs(30)).await;
+    let slept = captured.slept();
+    assert_eq!(slept.len(), 2, "{slept:?}");
+    let events = fx.events().await;
+    assert_eq!(
+        events,
+        [json!({"kind": "resumed",
+                "slept_from": utc_text(to - Duration::from_secs(61)),
+                "at": utc_text(to)})],
+        "a sleep of the bias's growth, ending at the check"
+    );
+    // 60 s or less isn't a sleep, and a wall-clock step (NTP, or you) never is.
+    fx.clock.sleep(Duration::from_secs(60));
+    fx.watch.check_sleep();
+    fx.clock.shift_utc(7200);
+    fx.watch.check_sleep();
+    fx.clock.shift_utc(-7200);
+    fx.watch.check_sleep();
+    assert_eq!(captured.slept().len(), 2);
+    assert!(fx.events().await.is_empty());
+}
+
+/// A sleep that a broadcast and the backstop both see is reported once, whichever comes first.
+#[tokio::test(start_paused = true)] // spec: ARCH-127
+async fn a_sleep_seen_by_the_broadcast_and_the_backstop_is_reported_once() {
+    let captured = Captured::install();
+    let fx = Fx::new(None).await;
+    fx.events().await;
+
+    // The backstop first: the resume broadcast that comes after it is the same sleep.
+    fx.watch.power_event(PowerEvent::Suspending);
+    fx.clock.sleep(Duration::from_secs(600));
+    fx.watch.check_sleep();
+    fx.clock.advance(Duration::from_secs(5));
+    fx.watch.power_event(PowerEvent::Resumed);
+    assert_eq!(captured.slept().len(), 1, "{:?}", captured.slept());
+    assert_eq!(fx.events().await.len(), 1);
+
+    // The broadcast first: the next check sees no new time asleep.
+    fx.clock.advance(Duration::from_secs(120));
+    fx.watch.power_event(PowerEvent::Suspending);
+    fx.clock.sleep(Duration::from_secs(600));
+    fx.watch.power_event(PowerEvent::Resumed);
+    fx.watch.check_sleep();
     fx.advance(Duration::from_secs(30)).await;
     assert_eq!(captured.slept().len(), 2, "{:?}", captured.slept());
-    let events = fx.events().await;
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0]["kind"], "resumed");
-    // A jump of 60 s or less isn't a sleep.
-    fx.clock.shift_utc(59);
-    fx.advance(Duration::from_secs(30)).await;
-    assert_eq!(captured.slept().len(), 2);
+    assert_eq!(fx.events().await.len(), 1);
+}
+
+/// A suspend whose resume never came doesn't start the next sleep: the newest one does.
+#[tokio::test(start_paused = true)] // spec: ARCH-127
+async fn a_stale_suspend_is_discarded() {
+    let captured = Captured::install();
+    let fx = Fx::new(None).await;
+    fx.watch.power_event(PowerEvent::Suspending);
+    fx.clock.advance(Duration::from_secs(86_400));
+    let from = utc_text(fx.clock.utc_now());
+    fx.watch.power_event(PowerEvent::Suspending);
+    fx.clock.sleep(Duration::from_secs(120));
+    fx.watch.power_event(PowerEvent::Resumed);
+    let slept = captured.slept();
+    assert_eq!(slept.len(), 1, "{slept:?}");
+    assert!(field(&slept[0], "from").contains(&from), "{slept:?}");
 }
 
 // ---------------------------------------------------------------------------------------------

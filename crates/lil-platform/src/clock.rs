@@ -18,6 +18,13 @@ pub trait Clock: Send + Sync + std::fmt::Debug {
     /// Local time minus UTC at the instant `utc`, in seconds, daylight saving time included
     /// (the local calendar month of CORE-012).
     fn local_offset_secs(&self, utc: SystemTime) -> i32;
+    /// How long this PC has slept or hibernated since it started: on Windows the interrupt-time
+    /// bias, `QueryInterruptTime` minus `QueryUnbiasedInterruptTime`, which grows by exactly the
+    /// time asleep and never with a wall-clock step (ARCH-127; plan 4a clarification,
+    /// 2026-10-25). Only its growth means anything. A clock that can't tell answers zero.
+    fn slept(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The real clocks. `monotonic` is the time since construction.
@@ -55,6 +62,29 @@ impl Clock for SystemClock {
     fn local_offset_secs(&self, utc: SystemTime) -> i32 {
         system_local_offset(utc).unwrap_or(0)
     }
+
+    fn slept(&self) -> Duration {
+        interrupt_time_bias()
+    }
+}
+
+/// `QueryInterruptTime` minus `QueryUnbiasedInterruptTime`: the time spent asleep or
+/// hibernated since boot. The unbiased time is read first, so a read never comes out negative
+/// (a negative difference is taken as zero anyway).
+fn interrupt_time_bias() -> Duration {
+    use windows::Win32::System::WindowsProgramming::{
+        QueryInterruptTime, QueryUnbiasedInterruptTime,
+    };
+    let mut unbiased = 0u64;
+    // SAFETY: plain queries; `unbiased` is a valid out-pointer for the call.
+    let biased = unsafe {
+        if !QueryUnbiasedInterruptTime(&mut unbiased).as_bool() {
+            return Duration::ZERO;
+        }
+        QueryInterruptTime()
+    };
+    // Both in 100 ns units.
+    Duration::from_nanos(biased.saturating_sub(unbiased).saturating_mul(100))
 }
 
 /// 100-ns intervals between 1601-01-01 (the `FILETIME` origin) and 1970-01-01.

@@ -21,7 +21,9 @@
 //! `WM_POWERBROADCAST` with `PBT_APMSUSPEND` → [`PowerEvent::Suspending`], with
 //! `PBT_APMRESUMEAUTOMATIC` → [`PowerEvent::Resumed`], on the receiver
 //! [`SessionEndWatcher::power_events`] hands out once. Task 1's S1.7 saw both arrive at a
-//! hidden top-level window across a real sleep.
+//! hidden top-level window across a real sleep. The window also registers for them with
+//! `RegisterSuspendResumeNotification` (plan 4a clarification, 2026-10-25), which a desktop app
+//! needs on a Modern Standby PC; a registration that fails is only logged.
 //!
 //! [`SessionEndWatcher::simulate`] sends those messages to the watcher's own window, for
 //! tests. What it sends is a [`SessionEndSim`], a type of its own: the [`SessionEnd`] events are
@@ -39,6 +41,9 @@ use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{
+    RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IsWindow,
     IsWindowVisible, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
@@ -372,15 +377,31 @@ fn window_thread(shared: Arc<Shared>, created: &std::sync::mpsc::Sender<io::Resu
         }
         .map_err(|e| io_error(&e))
     })();
-    match made {
+    let hwnd = match made {
         Ok(hwnd) => {
             let _ = created.send(Ok(hwnd.0 as isize));
+            hwnd
         }
         Err(e) => {
             let _ = created.send(Err(e));
             return;
         }
-    }
+    };
+    // The sleep broadcasts on a Modern Standby PC (plan 4a clarification, 2026-10-25).
+    // SAFETY: `hwnd` is this thread's live window; the flag says the recipient is a window.
+    let registered = unsafe {
+        RegisterSuspendResumeNotification(
+            windows::Win32::Foundation::HANDLE(hwnd.0),
+            windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+    };
+    let registered = match registered {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!(error = %e, "RegisterSuspendResumeNotification failed; the sleep broadcasts rely on WM_POWERBROADCAST alone");
+            None
+        }
+    };
     let mut msg = MSG::default();
     loop {
         // SAFETY: `msg` is a valid out-pointer; `None` takes messages for every window of
@@ -403,6 +424,10 @@ fn window_thread(shared: Arc<Shared>, created: &std::sync::mpsc::Sender<io::Resu
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+    if let Some(handle) = registered {
+        // SAFETY: the handle came from `RegisterSuspendResumeNotification` and is released once.
+        let _ = unsafe { UnregisterSuspendResumeNotification(handle) };
     }
     SHARED.with(|s| s.borrow_mut().take());
 }

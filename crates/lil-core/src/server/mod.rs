@@ -342,7 +342,11 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let desktop_settings = DesktopSettingsStore::load(
         cfg.env.clone(),
         desktop.clone(),
-        core_dir().join(crate::identity::APP_EXES[0].0),
+        // The folder identity trusts apps from: the installed one on stable.
+        cfg.env
+            .install_dir()
+            .unwrap_or_else(core_dir)
+            .join(crate::identity::APP_EXES[0].0),
         cfg.clock.clone(),
         cfg.ids.clone(),
         events.clone(),

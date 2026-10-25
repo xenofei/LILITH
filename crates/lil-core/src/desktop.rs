@@ -19,16 +19,20 @@
 //!   prompt executing is never interrupted (the jobs' pause).
 //! - [`start_keep_awake`]: while a `gpu-heavy` job is `running` and `[power] keep_awake_gpu` is
 //!   on, the one system-required power request is held; it is set only when "should hold"
-//!   changes, never through a power setting.
+//!   changes, never through a power setting. A release that fails is tried again every
+//!   [`RELEASE_RETRY_EVERY`]; dropping [`KeepAwake`] releases the request, and nothing holds it
+//!   afterwards.
 //! - The sleep log: the hidden window's `PBT_APMSUSPEND` and `PBT_APMRESUMEAUTOMATIC`
-//!   ([`DesktopWatch::power_event`]), and, as the backstop for a sleep no broadcast reported, a
-//!   wall-clock jump of more than [`SLEEP_GAP`] against the monotonic clock between two checks.
-//!   Each sleep is logged once (`slept`, with `from` and `to`) and published as
-//!   `{kind: "resumed", slept_from, at}`.
+//!   ([`DesktopWatch::power_event`]), and, as the backstop for a sleep no broadcast reported,
+//!   the growth of the time asleep ([`Clock::slept`], the interrupt-time bias) by more than
+//!   [`SLEEP_GAP`] between two checks: a sleep of that length ending at the check (plan 4a
+//!   clarification, 2026-10-25). A wall-clock step never counts. Each sleep is logged once
+//!   (`slept`, with `from` and `to`) and published once as `{kind: "resumed", slept_from, at}`,
+//!   whether a broadcast, the backstop or both saw it; a `PBT_APMSUSPEND` older than the newest
+//!   resume is discarded.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -61,10 +65,13 @@ pub const TOPIC: &str = "desktop";
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
 /// Leaving fullscreen counts after this many polls in a row that aren't fullscreen (P4a-R6).
 pub const LEAVE_AFTER_POLLS: u32 = 2;
-/// How often the wall clock is checked against the monotonic clock (ARCH-127).
+/// How often the time asleep is checked (ARCH-127).
 pub const SLEEP_CHECK_EVERY: Duration = Duration::from_secs(30);
-/// A wall-clock jump of more than this against the monotonic clock is a sleep.
+/// A growth of the time asleep by more than this between two checks is a sleep; a resume
+/// broadcast this soon after the backstop reported a sleep is that sleep.
 pub const SLEEP_GAP: Duration = Duration::from_secs(60);
+/// How soon keep-awake tries again a release that failed.
+pub const RELEASE_RETRY_EVERY: Duration = Duration::from_secs(2);
 /// How long the notification path is served from its cache (P4a-R33).
 pub const PATH_CACHE_FOR: Duration = Duration::from_secs(10);
 
@@ -96,10 +103,10 @@ pub struct DesktopWatch {
 
 /// What the sleep log knows.
 struct SleepLog {
-    /// When a `PBT_APMSUSPEND` came, until its resume.
+    /// When the newest `PBT_APMSUSPEND` came, until a sleep is reported.
     suspended_at: Option<SystemTime>,
-    /// The last check (or report): the wall and the monotonic clock then.
-    checked: (SystemTime, Duration),
+    /// The time asleep ([`Clock::slept`]) at the last check or report.
+    slept_seen: Duration,
     /// When the last sleep reported ended.
     reported_to: Option<SystemTime>,
 }
@@ -121,7 +128,7 @@ impl DesktopWatch {
         every: Duration,
         events: Arc<EventBus>,
     ) -> Arc<DesktopWatch> {
-        let checked = (clock.utc_now(), clock.monotonic());
+        let slept_seen = clock.slept();
         let me = Arc::new(DesktopWatch {
             desktop,
             clock,
@@ -129,7 +136,7 @@ impl DesktopWatch {
             fullscreen: watch::Sender::new(false),
             sleep: Mutex::new(SleepLog {
                 suspended_at: None,
-                checked,
+                slept_seen,
                 reported_to: None,
             }),
             stop: CancellationToken::new(),
@@ -198,51 +205,64 @@ impl DesktopWatch {
         }
     }
 
-    /// A sleep broadcast of the hidden window (ARCH-127).
+    /// A sleep broadcast of the hidden window (ARCH-127). A resume reports the sleep from the
+    /// newest suspend that isn't older than the last sleep reported; with none, from the growth
+    /// of the time asleep since the last check, unless the backstop reported this sleep within
+    /// [`SLEEP_GAP`].
     pub fn power_event(&self, event: PowerEvent) {
         let now = self.clock.utc_now();
         let mut log = lock(&self.sleep);
         match event {
             PowerEvent::Suspending => {
-                log.suspended_at.get_or_insert(now);
+                // The newest wins: a suspend whose resume never came is stale.
+                log.suspended_at = Some(now);
                 tracing::info!("the PC is going to sleep");
             }
             PowerEvent::Resumed => {
-                let from = match log.suspended_at.take() {
+                let reported_to = log.reported_to;
+                let suspended = log
+                    .suspended_at
+                    .take()
+                    .filter(|at| reported_to.is_none_or(|to| *at >= to));
+                let from = match suspended {
                     Some(from) => from,
                     // The backstop already reported this sleep.
-                    None if log.reported_to.is_some_and(|to| {
+                    None if reported_to.is_some_and(|to| {
                         now.duration_since(to).unwrap_or_default() <= SLEEP_GAP
                     }) =>
                     {
+                        log.slept_seen = self.clock.slept();
                         return;
                     }
-                    None => log.checked.0,
+                    None => {
+                        let grown = self.clock.slept().saturating_sub(log.slept_seen);
+                        now.checked_sub(grown).unwrap_or(now)
+                    }
                 };
                 self.report(&mut log, from, now);
             }
         }
     }
 
-    /// The backstop (every [`SLEEP_CHECK_EVERY`]): a wall-clock jump of more than
-    /// [`SLEEP_GAP`] against the monotonic clock since the last check is a sleep no broadcast
-    /// reported. Its `from` is where the wall clock would be without the jump.
+    /// The backstop (every [`SLEEP_CHECK_EVERY`]): the time asleep grew by more than
+    /// [`SLEEP_GAP`] since the last check, so the PC slept that long, ending now. A wall-clock
+    /// step changes nothing here.
     pub fn check_sleep(&self) {
-        let (wall, mono) = (self.clock.utc_now(), self.clock.monotonic());
+        let slept = self.clock.slept();
         let mut log = lock(&self.sleep);
-        let (wall0, mono0) = log.checked;
-        log.checked = (wall, mono);
-        let awake = mono.saturating_sub(mono0);
-        let passed = wall.duration_since(wall0).unwrap_or_default();
-        if passed > awake + SLEEP_GAP {
-            let from = log.suspended_at.take().unwrap_or(wall0 + awake);
-            self.report(&mut log, from, wall);
+        let grown = slept.saturating_sub(log.slept_seen);
+        log.slept_seen = slept;
+        if grown > SLEEP_GAP {
+            let to = self.clock.utc_now();
+            let from = to.checked_sub(grown).unwrap_or(to);
+            log.suspended_at = None;
+            self.report(&mut log, from, to);
         }
     }
 
     /// Logs and publishes one sleep from `from` to `to`.
     fn report(&self, log: &mut SleepLog, from: SystemTime, to: SystemTime) {
-        log.checked = (to, self.clock.monotonic());
+        log.slept_seen = self.clock.slept();
         log.reported_to = Some(to);
         let (from, to) = (utc_text(from), utc_text(to));
         tracing::info!(from = %from, to = %to, "slept");
@@ -552,17 +572,72 @@ pub fn start_autopause(
     Arc::new(AutoPause { task })
 }
 
-/// Keep-awake (ARCH-127): runs until dropped, and releases a held request then.
+/// Keep-awake (ARCH-127): runs until dropped, and releases the request then.
 pub struct KeepAwake {
-    desktop: Arc<dyn Desktop>,
-    held: Arc<AtomicBool>,
+    power: Arc<PowerHold>,
     task: AbortHandle,
+}
+
+/// The power request and what keep-awake did with it. Every call to the desktop's request is
+/// made under the one lock, so a release when keep-awake stops can't race a hold.
+struct PowerHold {
+    desktop: Arc<dyn Desktop>,
+    state: Mutex<HoldState>,
+}
+
+#[derive(Default)]
+struct HoldState {
+    held: bool,
+    /// Keep-awake was dropped: nothing is held any more.
+    stopped: bool,
+    /// The last call failed (logged once per streak).
+    refused: bool,
+}
+
+impl PowerHold {
+    /// Holds (`want`) or releases the request, unless it already is so or keep-awake stopped.
+    /// `false` while it isn't as wanted (the call failed).
+    fn apply(&self, want: bool) -> bool {
+        let mut s = lock(&self.state);
+        if s.stopped || s.held == want {
+            return true;
+        }
+        match self.desktop.set_power_request(want) {
+            Ok(()) => {
+                s.held = want;
+                s.refused = false;
+                tracing::info!(held = want, "keep-awake: the power request changed");
+                true
+            }
+            Err(e) => {
+                if !s.refused {
+                    tracing::warn!(held = want, error = %e, "keep-awake: the power request can't be set on this PC");
+                }
+                s.refused = true;
+                false
+            }
+        }
+    }
+
+    /// Stops keep-awake: the request is released (the platform calls nothing when it isn't
+    /// held), and nothing holds it afterwards.
+    fn stop(&self) {
+        let mut s = lock(&self.state);
+        s.stopped = true;
+        match self.desktop.set_power_request(false) {
+            Ok(()) => s.held = false,
+            Err(e) if s.held => {
+                tracing::warn!(error = %e, "keep-awake: the power request could not be released");
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 impl std::fmt::Debug for KeepAwake {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeepAwake")
-            .field("held", &self.held.load(Ordering::SeqCst))
+            .field("held", &self.held())
             .finish_non_exhaustive()
     }
 }
@@ -570,65 +645,49 @@ impl std::fmt::Debug for KeepAwake {
 impl KeepAwake {
     /// Whether the power request is held.
     pub fn held(&self) -> bool {
-        self.held.load(Ordering::SeqCst)
+        lock(&self.power.state).held
     }
 }
 
 impl Drop for KeepAwake {
     fn drop(&mut self) {
         self.task.abort();
-        if self.held.swap(false, Ordering::SeqCst)
-            && let Err(e) = self.desktop.set_power_request(false)
-        {
-            tracing::warn!(error = %e, "keep-awake: the power request could not be released");
-        }
+        self.power.stop();
     }
 }
 
 /// Starts keep-awake: the one system-required power request is held while a `gpu-heavy` job
 /// is `running` and `keep_awake_gpu` is on, and released as soon as either ends. The request
-/// is set only when that changes. A PC that refuses it is logged once per refusal streak.
+/// is set only when that changes; a release that failed is tried again every
+/// [`RELEASE_RETRY_EVERY`] (a hold that failed waits for the next change). A PC that refuses
+/// it is logged once per refusal streak.
 pub fn start_keep_awake(
     d: Arc<dyn Desktop>,
     jobs: Arc<Jobs>,
     s: watch::Receiver<DesktopSettings>,
 ) -> Arc<KeepAwake> {
-    let held = Arc::new(AtomicBool::new(false));
+    let power = Arc::new(PowerHold {
+        desktop: d,
+        state: Mutex::new(HoldState::default()),
+    });
     let task = {
-        let (desktop, held, mut settings) = (d.clone(), held.clone(), s);
+        let (power, mut settings) = (power.clone(), s);
         tokio::spawn(async move {
             let mut changes = jobs.changes();
-            let mut refused = false;
             loop {
-                let want = settings.borrow_and_update().keep_awake_gpu
-                    && jobs.any_running(Lane::GpuHeavy);
-                if want != held.load(Ordering::SeqCst) {
-                    match desktop.set_power_request(want) {
-                        Ok(()) => {
-                            held.store(want, Ordering::SeqCst);
-                            refused = false;
-                            tracing::info!(held = want, "keep-awake: the power request changed");
-                        }
-                        Err(e) if !refused => {
-                            refused = true;
-                            tracing::warn!(held = want, error = %e, "keep-awake: the power request can't be set on this PC");
-                        }
-                        Err(_) => {}
-                    }
-                }
+                let want =
+                    settings.borrow_and_update().keep_awake_gpu && jobs.any_running(Lane::GpuHeavy);
+                let release_failed = !power.apply(want) && !want;
                 tokio::select! {
                     changed = changes.changed() => if changed.is_err() { return },
                     changed = settings.changed() => if changed.is_err() { return },
+                    () = tokio::time::sleep(RELEASE_RETRY_EVERY), if release_failed => {}
                 }
             }
         })
         .abort_handle()
     };
-    Arc::new(KeepAwake {
-        desktop: d,
-        held,
-        task,
-    })
+    Arc::new(KeepAwake { power, task })
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -18,6 +18,8 @@ pub struct FakeClock {
 struct State {
     monotonic: Duration,
     utc: SystemTime,
+    /// The time asleep ([`Clock::slept`]).
+    slept: Duration,
     /// `(from, offset)`, sorted by `from`.
     offsets: Vec<(SystemTime, i32)>,
 }
@@ -31,6 +33,7 @@ impl FakeClock {
             state: Mutex::new(State {
                 monotonic: Duration::ZERO,
                 utc: UNIX_EPOCH + Duration::from_secs(UTC_START_SECS),
+                slept: Duration::ZERO,
                 offsets: Vec::new(),
             }),
         })
@@ -41,6 +44,15 @@ impl FakeClock {
         let mut s = self.lock();
         s.monotonic += d;
         s.utc += d;
+    }
+
+    /// The PC sleeps for `d`: the wall clock, the monotonic clock (Windows' QPC counts sleep)
+    /// and the time asleep ([`Clock::slept`]) all move forward by `d`.
+    pub fn sleep(&self, d: Duration) {
+        let mut s = self.lock();
+        s.monotonic += d;
+        s.utc += d;
+        s.slept += d;
     }
 
     /// Moves only the wall clock, by `by` seconds (negative moves it back), as a user changing
@@ -73,6 +85,10 @@ impl Clock for FakeClock {
 
     fn utc_now(&self) -> SystemTime {
         self.lock().utc
+    }
+
+    fn slept(&self) -> Duration {
+        self.lock().slept
     }
 
     fn local_offset_secs(&self, utc: SystemTime) -> i32 {
@@ -116,6 +132,17 @@ mod tests {
         assert_eq!(
             clock.utc_now(),
             u0 + Duration::from_millis(1500) - Duration::from_secs(3540)
+        );
+        assert_eq!(
+            clock.slept(),
+            Duration::ZERO,
+            "a wall-clock step isn't a sleep"
+        );
+        clock.sleep(Duration::from_secs(90));
+        assert_eq!(clock.slept(), Duration::from_secs(90));
+        assert_eq!(
+            clock.monotonic(),
+            m0 + Duration::from_millis(1500) + Duration::from_secs(90)
         );
     }
 }
