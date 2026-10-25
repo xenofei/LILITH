@@ -262,8 +262,14 @@ pub enum ClientError {
         source: io::Error,
     },
     Io(io::Error),
-    /// The core closed the connection.
+    /// The connection closed: the core went away, or the session ended. A call that gets this
+    /// may have been sent, and may have run: its outcome is unknown. Compare
+    /// [`ClientError::NotConnected`].
     Closed,
+    /// A call of a [`session::Session`] that was refused before anything was sent: the session
+    /// has no current connection (it is switching workspace, reconnecting, or ended). Safe to
+    /// make again once the session is [`session::SessionState::Ready`].
+    NotConnected,
 }
 
 impl fmt::Display for ClientError {
@@ -402,6 +408,9 @@ impl fmt::Display for ClientError {
             ),
             ClientError::Io(e) => write!(f, "{e}"),
             ClientError::Closed => f.write_str("The LILITH core closed the connection."),
+            ClientError::NotConnected => f.write_str(
+                "The LILITH core is not connected right now; nothing was sent. Try again once it is.",
+            ),
         }
     }
 }

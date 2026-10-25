@@ -21,10 +21,10 @@
 //!   core launched every 5 s would get in the way of the fix. While none is found, the state
 //!   stays [`SessionState::Unavailable`] with the start failure. Starting is allowed again
 //!   after the next connection, on [`Session::set_workspace`], and on [`Session::retry_now`]
-//!   (the banner's "Try again"). A retry asked for while a core is being started is the same
-//!   retry, not a second start; asked for during any other attempt (a core that doesn't
-//!   answer, say), it is kept and applies when that attempt ends: the next one follows at
-//!   once, with no backoff, and may start a core.
+//!   (the banner's "Try again"). A retry asked for during an attempt that then fails to start
+//!   a core is that start's retry, not a second start. After any other failure of the attempt
+//!   (a core that doesn't answer, or a start that timed out), the retry is kept and the next
+//!   attempt follows at once, with no backoff, and may start a core.
 //! - **Resubscribing** (APP-035, ARCH-100). Each topic keeps its last seq: the seq of the
 //!   newest event the session took from it, else its seq when it was subscribed. Every
 //!   connection after the first subscribes the topics with `since_seq` from their last seqs,
@@ -42,16 +42,20 @@
 //!   connection's agree. [`Session::subscribe`] and [`Session::unsubscribe`] change the
 //!   topics and send the change on the current connection one call at a time (the task's
 //!   catch-up included), so the core ends with what the last call left; a call that comes in
-//!   meanwhile waits its turn, within the same `start_hard_cap` as the call itself.
+//!   meanwhile waits its turn, within the same `start_hard_cap` as the call itself. An event
+//!   that was already on its way when its topic was unsubscribed never reaches the app after
+//!   the topic is subscribed again: it belongs to the earlier subscription.
 //! - **A switch** ([`Session::set_workspace`]) or a lost connection leaves no current
 //!   connection until the next one is established: the old one is no longer read, so calls
-//!   fail with [`ClientError::Closed`] meanwhile and topics are recorded for the next one,
-//!   which learns their cursors from its own answers only.
+//!   fail with [`ClientError::NotConnected`] meanwhile and topics are recorded for the next
+//!   one, which learns their cursors from its own answers only.
 //! - **Calls** ([`Session::call_tool`], [`Session::app_call`]) go out on the current
-//!   connection and the session never sends one again: a call in flight when the connection
-//!   is lost ends with [`ClientError::Closed`], and a call while there is no connection is
-//!   [`ClientError::Closed`] at once. Retrying is the caller's, with the same idempotency key,
-//!   so a caller that may retry passes its own ([`crate::mint_id`]`("ik")`).
+//!   connection and the session never sends one again. A call while there is no connection is
+//!   [`ClientError::NotConnected`] at once: nothing was sent, so it is safe to make again. A
+//!   call in flight when the connection is lost ends with [`ClientError::Closed`]: it may have
+//!   run. Retrying after `Closed` is the caller's, with the same idempotency key, so a caller
+//!   that may retry passes its own ([`crate::mint_id`]`("ik")`); `app/*` methods have no key,
+//!   so they are not retried after `Closed`.
 //! - **Switching workspace** (P4a-R34) is a new connection whose hello names the workspace. It
 //!   replaces the current one only once the core accepted it, and it never changes
 //!   `suite.toml`'s default.
@@ -130,6 +134,21 @@ struct Shared {
     /// the core, and by the task's catch-up on a new connection: the core sees the changes in
     /// the order they were made.
     ops: tokio::sync::Mutex<()>,
+    /// What tells the events of an earlier subscription from the current one's.
+    history: Mutex<History>,
+}
+
+/// What the session remembers about subscriptions that ended, so that their events are not
+/// taken for the events of a later subscription to the same topic.
+#[derive(Default)]
+struct History {
+    /// Topics removed while there was no connection: the one being set up may already have
+    /// subscribed them (its first `lil/subscribe` is under way), and then they are subscribed
+    /// there although the session removed them.
+    removed: BTreeSet<String>,
+    /// Per topic: the events of the current connection's stream up to this position (the
+    /// stream's `n`th event is position `n`) belong to a subscription that has ended.
+    stale: BTreeMap<String, u64>,
 }
 
 /// Every update is a single step, so the data stays consistent after a panic.
@@ -168,6 +187,7 @@ impl Session {
             events: Mutex::new(Some(events_rx)),
             switching: tokio::sync::Mutex::new(()),
             ops: tokio::sync::Mutex::new(()),
+            history: Mutex::new(History::default()),
         });
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(
@@ -194,10 +214,11 @@ impl Session {
     /// idempotency key is minted), carrying `trace_id` when given (ARCH-118). Never sent again
     /// by the session (module docs).
     ///
-    /// [`ClientError::Closed`] means either that the call was never sent (no connection) or
-    /// that its connection was lost while it was in flight, so its outcome is unknown. A
-    /// caller that may retry it passes its own key ([`crate::mint_id`]`("ik")`) and retries
-    /// with that key: a key minted here is never seen by the caller.
+    /// [`ClientError::NotConnected`]: no connection, nothing was sent. [`ClientError::Closed`]:
+    /// the connection was lost while the call was in flight, so it may have run and its
+    /// outcome is unknown. A caller that may retry after `Closed` passes its own key
+    /// ([`crate::mint_id`]`("ik")`) and retries with that key: a key minted here is never seen
+    /// by the caller.
     pub async fn call_tool(
         &self,
         name: &str,
@@ -210,7 +231,9 @@ impl Session {
             .await
     }
 
-    /// An `app/*` method on the current connection ([`Client::app_call`]).
+    /// An `app/*` method on the current connection ([`Client::app_call`]). These have no
+    /// idempotency key: after [`ClientError::Closed`] the method may have run, and sending it
+    /// again may run it twice. [`ClientError::NotConnected`] means nothing was sent.
     pub async fn app_call(
         &self,
         method: &str,
@@ -219,8 +242,9 @@ impl Session {
         self.client()?.app_call(method, params).await
     }
 
-    /// Adds `topics` (live events only). Without a connection, or while one is being set up,
-    /// they are subscribed on it, and this returns at once. A name that isn't a topic is
+    /// Adds `topics` (live events only). Without a connection, or while the first
+    /// `lil/subscribe` of one being set up is under way, they are subscribed on it, and this
+    /// returns once it has its turn. A name that isn't a topic is
     /// `params.invalid`, and so is a topic the core refuses: the error, and none of this call's
     /// topics stay; so it is when the core doesn't answer within `start_hard_cap`
     /// ([`ClientError::Timeout`]; the call may still have reached the core, which the session
@@ -283,21 +307,33 @@ impl Session {
     pub async fn unsubscribe(&self, topics: Vec<String>) -> Result<(), ClientError> {
         let deadline = Instant::now() + lock(&self.shared.cfg).start_hard_cap;
         let _turn = self.turn(deadline).await?;
+        let client = lock(&self.shared.client).clone();
         let removed: Vec<String> = {
             let mut known = lock(&self.shared.topics);
-            topics
+            let removed: Vec<String> = topics
                 .into_iter()
                 .filter(|topic| known.remove(topic).is_some())
-                .collect()
+                .collect();
+            if client.is_none() {
+                lock(&self.shared.history)
+                    .removed
+                    .extend(removed.iter().cloned());
+            }
+            removed
         };
         if removed.is_empty() {
             return Ok(());
         }
-        let Some(client) = lock(&self.shared.client).clone() else {
+        let Some(client) = client else {
             return Ok(());
         };
-        match by(deadline, client.unsubscribe_only(removed)).await {
-            Ok(()) | Err(ClientError::Closed) => Ok(()),
+        match by(deadline, client.unsubscribe_only(removed.clone())).await {
+            Ok(()) => {
+                // Its events still on their way are not a later subscription's.
+                mark_stale(&self.shared, &client, &removed);
+                Ok(())
+            }
+            Err(ClientError::Closed) => Ok(()),
             // Replaced meanwhile: the next connection never subscribes them.
             Err(_) if !is_current(&self.shared, &client) => Ok(()),
             Err(e) => Err(e),
@@ -366,7 +402,9 @@ impl Session {
     }
 
     fn client(&self) -> Result<Arc<Client>, ClientError> {
-        lock(&self.shared.client).clone().ok_or(ClientError::Closed)
+        lock(&self.shared.client)
+            .clone()
+            .ok_or(ClientError::NotConnected)
     }
 }
 
@@ -534,6 +572,8 @@ async fn establish(
     let restarted = instance.as_ref().is_some_and(|old| old != now);
     let (topics, since) = {
         let mut known = lock(&shared.topics);
+        // A new stream: what was noted about the last one is of no use now.
+        *lock(&shared.history) = History::default();
         if restarted {
             for last in known.values_mut().filter(|last| last.is_some()) {
                 *last = Some(0);
@@ -554,22 +594,32 @@ async fn establish(
     *lock(&shared.client) = Some(client.clone());
     // From now on `Session::subscribe` and `unsubscribe` send on this connection themselves.
     // What they changed before, and while this runs, is put right here, one turn at a time.
-    let _turn = shared.ops.lock().await;
+    let _turn = by(Instant::now() + cap, async { Ok(shared.ops.lock().await) }).await?;
+    // Topics removed while the first subscribe was under way, and possibly added again since:
+    // the core has them from the earlier subscription, and its events are on the stream.
+    let mut removed = std::mem::take(&mut lock(&shared.history).removed);
     loop {
         let (added, stale): (Vec<String>, Vec<String>) = {
-            let known = lock(&shared.topics);
-            (
-                known
-                    .keys()
-                    .filter(|topic| !sent.contains(*topic))
-                    .cloned()
-                    .collect(),
-                sent.iter()
-                    .filter(|topic| !known.contains_key(*topic))
-                    .cloned()
-                    .collect(),
-            )
+            let mut known = lock(&shared.topics);
+            let stale: Vec<String> = sent
+                .iter()
+                .filter(|topic| !known.contains_key(*topic) || removed.contains(*topic))
+                .cloned()
+                .collect();
+            // Added again: a new subscription, with no cursor of the earlier one.
+            for topic in &stale {
+                if let Some(last) = known.get_mut(topic) {
+                    *last = None;
+                }
+            }
+            let added = known
+                .keys()
+                .filter(|topic| !sent.contains(*topic) || stale.contains(*topic))
+                .cloned()
+                .collect();
+            (added, stale)
         };
+        removed.clear();
         if added.is_empty() && stale.is_empty() {
             break;
         }
@@ -577,7 +627,8 @@ async fn establish(
             for topic in &stale {
                 sent.remove(topic);
             }
-            bounded(cap, client.unsubscribe_only(stale)).await?;
+            bounded(cap, client.unsubscribe_only(stale.clone())).await?;
+            mark_stale(shared, &client, &stale);
         }
         if !added.is_empty() {
             sent.extend(added.iter().cloned());
@@ -642,9 +693,10 @@ fn state_after(error: &ClientError, failed: u32) -> SessionState {
         ClientError::Incompatible { core_protocol } => SessionState::Incompatible {
             core_protocol: core_protocol.clone(),
         },
-        ClientError::NotRunning | ClientError::Timeout | ClientError::Closed => {
-            SessionState::Reconnecting { attempt: failed }
-        }
+        ClientError::NotRunning
+        | ClientError::Timeout
+        | ClientError::Closed
+        | ClientError::NotConnected => SessionState::Reconnecting { attempt: failed },
         other => SessionState::Unavailable {
             reason: other.to_string(),
         },
@@ -675,10 +727,13 @@ async fn forward(
     mut events: mpsc::UnboundedReceiver<EventParams>,
     ctl: &mut Ctl,
 ) -> Interrupt {
+    // Events taken from this stream so far: the position of the one in hand.
+    let mut position: u64 = 0;
     loop {
         match until(events.recv(), ctl, false).await {
             Step::Done(Some(event)) => {
-                if took(shared, &event) {
+                position += 1;
+                if took(shared, &event, position) {
                     ctl.out.push(event);
                 }
             }
@@ -690,9 +745,34 @@ async fn forward(
     }
 }
 
-/// Records `event` as its topic's last seq; `false` for a topic no longer subscribed (one
-/// still on its way after an unsubscribe).
-fn took(shared: &Shared, event: &EventParams) -> bool {
+/// Notes that the events of `topics` that the stream of `client` has received so far belong to
+/// subscriptions that have ended, if `client` is still the current connection (another one has
+/// a stream of its own, and a fresh [`History`]).
+fn mark_stale(shared: &Shared, client: &Arc<Client>, topics: &[String]) {
+    let current = lock(&shared.client);
+    if current
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, client))
+    {
+        let upto = client.conn().routed_all();
+        let mut history = lock(&shared.history);
+        for topic in topics {
+            history.stale.insert(topic.clone(), upto);
+        }
+    }
+}
+
+/// Records `event`, the `position`th of its connection's stream, as its topic's last seq;
+/// `false` for a topic no longer subscribed (one still on its way after an unsubscribe), and
+/// for an event of a subscription that has ended while the topic is subscribed again.
+fn took(shared: &Shared, event: &EventParams, position: u64) -> bool {
+    let ended = lock(&shared.history)
+        .stale
+        .get(&event.topic)
+        .is_some_and(|upto| position <= *upto);
+    if ended {
+        return false;
+    }
     match lock(&shared.topics).get_mut(&event.topic) {
         Some(last) => {
             *last = Some(event.seq);
@@ -1199,7 +1279,7 @@ mod tests {
     }
 
     /// A switch that cancels a connection's setup leaves no connection current until the new
-    /// one is: the cancelled one is no longer read.
+    /// one is: the cancelled one is no longer read, and calls meanwhile are `NotConnected`.
     #[test] // spec: APP-034, ARCH-100
     fn a_switch_during_the_setup_leaves_no_connection_current() {
         let env = lil_testkit::TestEnv::new();
@@ -1230,6 +1310,16 @@ mod tests {
                     lock(&session.shared.client).is_none(),
                     "a connection nobody reads is still current"
                 );
+                // Calls are refused before anything is sent, and say so.
+                let called = session
+                    .call_tool("test.echo", serde_json::Map::new(), None, None)
+                    .await;
+                assert!(
+                    matches!(called, Err(ClientError::NotConnected)),
+                    "{called:?}"
+                );
+                let app = session.app_call("app/confirmations.list", json!({})).await;
+                assert!(matches!(app, Err(ClientError::NotConnected)), "{app:?}");
                 new.reply_subscribed(&first, &[("test:r", 0), ("test:x", 3)])
                     .await;
                 new
@@ -1439,6 +1529,243 @@ mod tests {
             drop(core);
             wait_until(&mut state, |s| *s == failure).await;
             session.close().await;
+        });
+    }
+
+    /// A topic unsubscribed and subscribed again while a connection's first `lil/subscribe` is
+    /// under way (the session has no connection to tell yet) is a new subscription: the
+    /// replay of the earlier one, already on the stream, never reaches the app.
+    #[test] // spec: APP-035, APP-033, ARCH-032
+    fn a_resubscribed_topic_gets_no_events_of_the_earlier_subscription() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let mut events = session.events();
+            let mut state = session.state();
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            fake.subscribed("test:r", 5).await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+            assert_eq!(session.last_seq("test:r"), Some(5));
+
+            // The core restarts as the same instance (a lost connection); the second
+            // connection's first subscribe asks for what follows seq 5.
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            drop(fake);
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            let first = fake.request("lil/subscribe").await;
+            assert_eq!(first["params"]["since_seq"], json!({"test:r": 5}));
+            let topic = || vec!["test:r".to_string()];
+            session.unsubscribe(topic()).await.expect("unsubscribe");
+            session.subscribe(topic()).await.expect("subscribe");
+
+            // The earlier subscription's replay, then its answer.
+            for seq in 6..=9 {
+                fake.event("test:r", seq).await;
+            }
+            fake.reply_subscribed(&first, &[("test:r", 9)]).await;
+            // The setup ends that subscription and starts a new one, live only.
+            let off = tokio::time::timeout(PROMPT, fake.request("lil/unsubscribe"))
+                .await
+                .expect("the earlier subscription was not ended");
+            fake.reply_unsubscribed(&off).await;
+            let on = fake.request("lil/subscribe").await;
+            assert_eq!(on["params"], json!({"topics": ["test:r"], "since_seq": {}}));
+            fake.reply_subscribed(&on, &[("test:r", 9)]).await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+            fake.event("test:r", 10).await;
+            assert_eq!(next(&mut events).await, ("test:r".to_string(), 10));
+            assert_eq!(session.last_seq("test:r"), Some(10));
+            session.close().await;
+            drop(fake);
+        });
+    }
+
+    /// Connected: after an unsubscribe is answered, the topic's events that the stream had
+    /// already received are marked as the ended subscription's, and `took` drops exactly
+    /// those, whichever topic they follow.
+    #[test] // spec: APP-035, ARCH-032
+    fn an_unsubscribe_marks_the_events_already_received_as_ended() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let topics = ["test:r", "test:o"].map(str::to_string).to_vec();
+            let session = Session::start(cfg, topics);
+            let mut state = session.state();
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            let first = fake.request("lil/subscribe").await;
+            fake.reply_subscribed(&first, &[("test:r", 0), ("test:o", 0)])
+                .await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            let call = session.unsubscribe(vec!["test:r".to_string()]);
+            let core = async {
+                let off = fake.request("lil/unsubscribe").await;
+                // Two events of the topic, and one of another, come before the answer.
+                fake.event("test:r", 1).await;
+                fake.event("test:o", 1).await;
+                fake.event("test:r", 2).await;
+                fake.reply_unsubscribed(&off).await;
+            };
+            let (called, ()) = tokio::join!(call, core);
+            called.expect("unsubscribe");
+            assert_eq!(lock(&session.shared.history).stale.get("test:r"), Some(&3));
+
+            // Subscribed again: the three events of the stream so far are the earlier one's.
+            let history_says = |position: u64, topic: &str| {
+                let event = EventParams {
+                    topic: topic.to_string(),
+                    seq: position,
+                    kind: EventKind::Event,
+                    data: Value::Null,
+                };
+                took(&session.shared, &event, position)
+            };
+            lock(&session.shared.topics).insert("test:r".to_string(), None);
+            assert!(!history_says(3, "test:r"));
+            assert!(history_says(4, "test:r"));
+            assert!(history_says(3, "test:o"));
+            session.close().await;
+            drop(fake);
+        });
+    }
+
+    /// The setup's wait for its turn has the same bound as the topic calls: a topic call that
+    /// holds the turn and is never polled again ends the setup with `Timeout` (and a new
+    /// attempt), not a session that never becomes ready.
+    #[test] // spec: APP-034, ARCH-100
+    fn a_setup_does_not_wait_for_a_turn_for_ever() {
+        let env = lil_testkit::TestEnv::new();
+        let mut cfg = fake_config(&env);
+        cfg.start_hard_cap = Duration::from_secs(1);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, Vec::new());
+            let mut state = session.state();
+            let mut old = FakeCore::accept(server, "c_0000000000000001").await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            // A subscribe that takes the turn and sends, and is then left alone.
+            let mut parked = Box::pin(session.subscribe(vec!["test:x".to_string()]));
+            std::future::poll_fn(|cx| {
+                assert!(parked.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            old.request("lil/subscribe").await;
+
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            let switch = session.set_workspace("0123456789abcdef");
+            let during = async {
+                let mut new = FakeCore::accept(server, "c_0000000000000001").await;
+                let first = new.request("lil/subscribe").await;
+                new.reply_subscribed(&first, &[("test:x", 0)]).await;
+                // The setup now waits for the turn; its bound ends the attempt.
+                let reconnecting = SessionState::Reconnecting { attempt: 1 };
+                let mut watch = session.state();
+                wait_until(&mut watch, |s| *s == reconnecting).await;
+                new
+            };
+            let (switched, new) =
+                tokio::time::timeout(PROMPT, async { tokio::join!(switch, during) })
+                    .await
+                    .expect("the setup waited for the turn for ever");
+            switched.expect("set_workspace");
+            drop((parked, new));
+            session.close().await;
+            drop(old);
+        });
+    }
+
+    /// An answer of a replaced connection to a subscribe that was in flight when the switch
+    /// came sets no cursor: the topic's cursor is the new connection's.
+    #[test] // spec: APP-035, ARCH-100
+    fn a_late_answer_of_a_replaced_connection_sets_no_cursor() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, Vec::new());
+            let mut state = session.state();
+            let mut old = FakeCore::accept(server, "c_0000000000000001").await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            let (answered, answered_rx) = oneshot::channel();
+            let sub = async {
+                let subscribed = session.subscribe(vec!["test:x".to_string()]).await;
+                let _ = answered.send(());
+                subscribed
+            };
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            let switch = session.set_workspace("0123456789abcdef");
+            let during = async {
+                let on_old = old.request("lil/subscribe").await;
+                let mut new = FakeCore::accept(server, "c_0000000000000001").await;
+                let first = new.request("lil/subscribe").await;
+                // The replaced connection answers first, with its own seq, and the call has
+                // taken it before the new connection answers.
+                old.reply_subscribed(&on_old, &[("test:x", 99)]).await;
+                answered_rx.await.expect("the call ended");
+                new.reply_subscribed(&first, &[("test:x", 7)]).await;
+                new
+            };
+            let (subscribed, switched, new) = tokio::join!(sub, switch, during);
+            subscribed.expect("subscribe");
+            switched.expect("set_workspace");
+            assert_eq!(session.last_seq("test:x"), Some(7));
+            session.close().await;
+            drop((old, new));
+        });
+    }
+
+    /// An error from a connection that has been replaced is not the call's error: the topic
+    /// stays, and the new connection subscribes it.
+    #[test] // spec: APP-035, ARCH-100
+    fn an_error_of_a_replaced_connection_leaves_the_topic_alone() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, Vec::new());
+            let mut state = session.state();
+            let mut old = FakeCore::accept(server, "c_0000000000000001").await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            let (answered, answered_rx) = oneshot::channel();
+            let sub = async {
+                let subscribed = session.subscribe(vec!["test:x".to_string()]).await;
+                let _ = answered.send(());
+                subscribed
+            };
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            let switch = session.set_workspace("0123456789abcdef");
+            let during = async {
+                let on_old = old.request("lil/subscribe").await;
+                let mut new = FakeCore::accept(server, "c_0000000000000001").await;
+                let first = new.request("lil/subscribe").await;
+                let fault = json!({
+                    "jsonrpc": "2.0",
+                    "id": on_old["id"],
+                    "error": {"code": -32603, "message": "internal"},
+                });
+                old.send(&fault.to_string()).await;
+                answered_rx.await.expect("the call ended");
+                new.reply_subscribed(&first, &[("test:x", 7)]).await;
+                new
+            };
+            let (subscribed, switched, new) = tokio::join!(sub, switch, during);
+            subscribed.expect("an error of the replaced connection reached the caller");
+            switched.expect("set_workspace");
+            assert_eq!(session.last_seq("test:x"), Some(7));
+            session.close().await;
+            drop((old, new));
         });
     }
 }

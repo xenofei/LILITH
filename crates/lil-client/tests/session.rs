@@ -444,7 +444,10 @@ fn incompatible_core_reports_incompatible_and_is_left_running() {
         let refused = session
             .call_tool("test.echo", args(json!({"text": "x"})), None, None)
             .await;
-        assert!(matches!(refused, Err(ClientError::Closed)), "{refused:?}");
+        assert!(
+            matches!(refused, Err(ClientError::NotConnected)),
+            "{refused:?}"
+        );
         session.close().await;
     });
 
@@ -554,11 +557,12 @@ fn a_failed_start_is_tried_once_until_retry_now() {
     stop(&cfg);
 }
 
-/// A `retry_now` that comes while a start is under way is that start's retry, not a second
-/// start: two in a row (the second one 20 ms later, with the core still starting) give one
-/// core start. Only a later `retry_now` starts another.
+/// A `retry_now` made during the attempt that starts a core, and so before that start fails,
+/// is that start's retry, not a second start. Both are sent before the session's task first
+/// runs (a current-thread runtime), so they reach it while the attempt is under way, with no
+/// timing involved: only the end of the failed start decides.
 #[test] // spec: ARCH-100, CORE-004, ARCH-018
-fn two_retries_during_a_start_give_one_start() {
+fn retries_during_a_start_give_one_start() {
     let env = TestEnv::new();
     let cfg = config(&env);
     let db = env.env.suite_state_db();
@@ -566,24 +570,16 @@ fn two_retries_during_a_start_give_one_start() {
     std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
     runtime().block_on(async {
         let session = Session::start(cfg.clone(), Vec::new());
+        session.retry_now();
+        session.retry_now();
         let mut state = session.state();
         wait_state(&mut state, "Unavailable", |s| {
             matches!(s, SessionState::Unavailable { .. })
         })
         .await;
-        assert_eq!(failed_starts(&env), 1);
-
-        session.retry_now();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        session.retry_now();
-        let asked = tokio::time::Instant::now();
-        while failed_starts(&env) < 2 {
-            assert!(asked.elapsed() < DEADLINE, "retry_now started no core");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
         // A second start would follow the first one's failure at once.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(failed_starts(&env), 2, "the second retry started a core");
+        assert_eq!(failed_starts(&env), 1, "the retries started another core");
         session.close().await;
     });
 }

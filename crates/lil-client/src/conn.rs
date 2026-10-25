@@ -54,6 +54,9 @@ struct Inner {
     pending: HashMap<i64, oneshot::Sender<Reply>>,
     sinks: Vec<Sink>,
     next_sink: u64,
+    /// Events delivered to sinks that want every topic ([`Conn::add_sink_all`]), in the order
+    /// the reader received them.
+    routed_all: u64,
     closed: bool,
 }
 
@@ -142,6 +145,13 @@ impl Conn {
         topics: &[String],
     ) -> Option<(u64, mpsc::UnboundedReceiver<EventParams>)> {
         self.add(Some(topics.iter().cloned().collect()))
+    }
+
+    /// How many events this connection has delivered to its [`Conn::add_sink_all`] stream so
+    /// far. The stream's `n`th event is the `n`th counted here, so the count read after a
+    /// reply tells which of the stream's events came before that reply.
+    pub(crate) fn routed_all(&self) -> u64 {
+        self.shared.lock().routed_all
     }
 
     /// Registers a stream for every event this connection receives, whatever its topic;
@@ -237,13 +247,23 @@ fn route(shared: &Shared, line: &str) -> bool {
                 return true;
             };
             // A stream whose receiver is gone is dropped here.
-            shared.lock().sinks.retain(|sink| {
+            let mut inner = shared.lock();
+            let mut to_all = 0;
+            inner.sinks.retain(|sink| {
                 let wanted = sink
                     .topics
                     .as_ref()
                     .is_none_or(|topics| topics.contains(&event.topic));
-                !wanted || sink.tx.send(event.clone()).is_ok()
+                if !wanted {
+                    return true;
+                }
+                let sent = sink.tx.send(event.clone()).is_ok();
+                if sent && sink.topics.is_none() {
+                    to_all += 1;
+                }
+                sent
             });
+            inner.routed_all += to_all;
         }
         Err(_) => return false,
         // A reply to nothing this client asked (a string id, or one already given up), a
