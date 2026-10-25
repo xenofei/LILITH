@@ -6,17 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 8
-    # ARCH-126
-    { name = "lil-spec-tests::comfy_profile::owned_comfyui_starts_with_the_launch_profile", rule = "ARCH-126", file = "tests/comfy_profile.rs" },
-    # ARCH-126
-    { name = "lil-spec-tests::comfy_profile::enable_assets_in_extra_args_stops_the_start", rule = "ARCH-126", file = "tests/comfy_profile.rs" },
-    # CORE-163
-    { name = "lil-spec-tests::comfy_profile::out_of_memory_retries_twice_then_fails_with_advice", rule = "CORE-163", file = "tests/comfy_profile.rs" },
-    # CORE-164
-    { name = "lil-spec-tests::comfy_profile::models_report_names_orphan_duplicate_and_unknown_family", rule = "CORE-164", file = "tests/comfy_profile.rs" },
-    # CORE-130
-    { name = "lil-spec-tests::comfy_profile::engine_environment_reports_a_changed_node", rule = "CORE-130", file = "tests/comfy_profile.rs" },
     # Task 9
     # APP-039, APP-146
     { name = "lil-spec-tests::desktop::desktop_settings_are_set_only_by_a_verified_app", rule = "APP-039", file = "tests/desktop.rs" },
