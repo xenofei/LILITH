@@ -91,7 +91,10 @@ use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{GetLengthSid, PSID};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows::Win32::System::TpmBaseServices::{TPM_DEVICE_INFO, Tbsi_GetDeviceInfo};
 use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
 use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SETREADONLY, WM_MOUSELEAVE};
@@ -111,13 +114,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWLP_WNDPROC, GetClientRect, GetCursorPos,
     GetDlgItem, GetForegroundWindow, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowRect, GetWindowThreadProcessId, HMENU, InSendMessage, KillTimer, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SM_REMOTESESSION, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INPUT, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PASTE, WM_SETFONT, WM_SETTEXT,
-    WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED,
-    WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    PostQuitMessage, RegisterClassW, SM_REMOTECONTROL, SM_REMOTESESSION, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INPUT,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PASTE,
+    WM_SETFONT, WM_SETTEXT, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC, WS_CAPTION,
+    WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, Interface, w};
 use windows_future::IAsyncOperation;
@@ -1744,7 +1748,11 @@ impl PointerMsg {
 /// - any digitizer report since the last real move counts like motion beyond the bound for
 ///   the keep, and one before that move means a digitizer may have made it, so the keep is off
 ///   (round 3, re-review I1). A report doesn't end the rest itself, since a finger resting on a
-///   touchpad keeps reporting: a touchpad, pen or touch screen gets exactly Task 28c's rule;
+///   touchpad keeps reporting. But if the keep saved the rest and a report has come since the
+///   rest's last real move, in whatever order, the next press finds the rest gone (round 4).
+///   So a touchpad, pen or touch screen that reports as a digitizer gets a rule never looser
+///   than Task 28c's (exactly it when the device makes no mouse raw input; one that also does
+///   gets the mouse's bound too, which is stricter);
 /// - an own move anywhere else still ends the rest, and so does one after the hand moved:
 ///   "moved away for real, then warped back to the very same pixel", which arrives as one own
 ///   move at the old place when Windows merges the moves or this window never saw them, stays
@@ -1754,17 +1762,26 @@ impl PointerMsg {
 /// `hDevice` not null) came with the rest's last real move, with no digitizer report since the
 /// real move before it and none since, the mouse's and the digitizers' registrations both in
 /// place and still this window's, and the window never in a remote session since it opened
-/// (`SM_REMOTESESSION`, read at open and before each move). Anything else gets Task 28c's rule.
+/// (`SM_REMOTESESSION`, `SM_REMOTECONTROL`, and this process's session being the one attached
+/// to the console: [`session_is_remote`], read at open and before each move). Anything else
+/// gets Task 28c's rule.
 ///
 /// Without raw input (the mouse's registration failed, or another registration in this process
 /// took the mouse's or the digitizers', checked before each move is judged) every move that
 /// isn't hardware ends the rest, even at the same position, as in Task 28c. If only the
 /// digitizers' registration fails, the keep is off for the window.
 ///
-/// **Known limits** (Task 28d round 1). A still click after a click on grey Merge, or after
-/// Merge turns on under the pointer, still needs a small move first: the press on the window
-/// (re-review N2) and the window's leave (review I2) forget where the cursor was, so there is
-/// nothing to compare Windows' own move with. The status line says to move.
+/// **Known limits** (Task 28d rounds 1 and 4). A still click after a click on grey Merge, or
+/// after Merge turns on under the pointer, still needs a small move first: the press on the
+/// window (re-review N2) and the window's leave (review I2) forget where the cursor was, so
+/// there is nothing to compare Windows' own move with. The status line says to move. The
+/// asking window is the only raw-input user in the lil process while it is open (during the
+/// merge flow it is): raw input goes to one window per device class in a process, so
+/// registering takes the mouse and digitizer classes from any other window of the process,
+/// and closing removes them rather than giving them back ([`register_raw`]). A legacy touchpad
+/// driven as a mouse, with no digitizer collection, gets the mouse's rule, keep included: its
+/// motion makes mouse raw input. A device that moves the pointer with no raw input at all
+/// isn't seen (below).
 ///
 /// **Documented residuals** (Task 28d rounds 1 to 3, not measured):
 /// - that a `WM_INPUT` always comes before a later `WM_LBUTTONDOWN` of the same hand, and what
@@ -1844,6 +1861,9 @@ pub struct ClickGate {
     /// A real move's own point and the cursor's disagreed in this window, and that is yet to be
     /// logged (`Some(true)`), or was (`Some(false)`) (round 3, re-review M2).
     point_mismatch: Option<bool>,
+    /// The same-place keep saved the rest since its last real move: an own move Task 28c's rule
+    /// would have ended it on (round 4).
+    kept_since_real: bool,
 }
 
 /// How much raw mouse motion since the last real move is still a still hand (Task 28d round
@@ -1856,6 +1876,31 @@ pub struct ClickGate {
 /// pointer speeds, so it can't carry a click from somewhere else, and every unlock still needs
 /// the owner's PIN at the Windows Hello prompt.
 pub const RAW_JITTER_COUNTS: u32 = 4;
+
+/// What the asking window's process reads about its session (Task 28d rounds 3 to 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFacts {
+    /// `GetSystemMetrics(SM_REMOTESESSION)`.
+    pub remote_session: bool,
+    /// `GetSystemMetrics(SM_REMOTECONTROL)`: the console is shadowed.
+    pub remote_control: bool,
+    /// `ProcessIdToSessionId` for this process; `None` when it failed.
+    pub process_session: Option<u32>,
+    /// `WTSGetActiveConsoleSessionId`; `None` when no session is attached to the console.
+    pub console_session: Option<u32>,
+}
+
+/// Whether the same-place keep is off for the session (pure; rounds 3 to 4): a remote session
+/// or a shadowed console, or this process not in the session attached to the physical console
+/// (which covers a RemoteFX session that `SM_REMOTESESSION` reads as local). Anything that
+/// can't be read counts as remote.
+pub fn session_is_remote(f: SessionFacts) -> bool {
+    f.remote_session
+        || f.remote_control
+        || f.process_session.is_none()
+        || f.console_session.is_none()
+        || f.process_session != f.console_session
+}
 
 /// One mouse `WM_INPUT` as the click gate judges it (Task 28d): whether the header names a
 /// device (`hDevice` isn't null), whether it is an absolute position (`MOUSE_MOVE_ABSOLUTE`),
@@ -1892,6 +1937,7 @@ impl ClickGate {
             remote: false,
             digitizer_report: false,
             point_mismatch: None,
+            kept_since_real: false,
         }
     }
 
@@ -1901,8 +1947,8 @@ impl ClickGate {
         self.digitizers = ok;
     }
 
-    /// Whether the window is in a remote session (`SM_REMOTESESSION`, read at open and before
-    /// each move: rounds 3 and 3b): then the same-place keep is off, and stays off for the
+    /// Whether the window's session is remote ([`session_is_remote`], read at open and before
+    /// each move: rounds 3 to 4): then the same-place keep is off, and stays off for the
     /// window once it has been remote.
     pub fn remote_session(&mut self, remote: bool) {
         self.remote |= remote;
@@ -1911,7 +1957,8 @@ impl ClickGate {
     /// A digitizer `WM_INPUT` (a touchpad, pen or touch screen report, round 3): like motion
     /// beyond [`RAW_JITTER_COUNTS`] for the keep, which then doesn't apply until a real move
     /// that came with none. It doesn't end the rest itself: a finger resting on a touchpad
-    /// keeps reporting, and the touchpad then gets exactly Task 28c's rule.
+    /// keeps reporting. A rest the keep saved is checked at the press ([`Self::button_press`]),
+    /// so the touchpad gets a rule never looser than Task 28c's.
     pub fn raw_digitizer(&mut self) {
         self.digitizer_report = true;
     }
@@ -1979,6 +2026,7 @@ impl ClickGate {
         self.raw_counts = 0;
         self.device_raw = false;
         self.digitizer_report = false;
+        self.kept_since_real = false;
     }
 
     /// The live timer's sample at `now`; whether the buttons are live.
@@ -2041,6 +2089,7 @@ impl ClickGate {
             self.raw_counts = 0;
             self.device_raw = false;
             self.digitizer_report = false;
+            self.kept_since_real = false;
         }
         let counts = real && grey_rest_move(on_accept, moved, m.origin, m.device, m.sent);
         // A real move on the button that left the cursor where it was, or (with raw input) any
@@ -2048,6 +2097,9 @@ impl ClickGate {
         // nor ends the rest.
         if counts || !(on_accept && (real || still)) {
             self.press.on_move(counts, now);
+        } else if !real {
+            // The keep saved the rest, where Task 28c's rule would have ended it (round 4).
+            self.kept_since_real = true;
         }
         counts
     }
@@ -2110,8 +2162,14 @@ impl ClickGate {
         self.press.on_leave();
     }
 
-    /// A `WM_LBUTTONDOWN` or `WM_LBUTTONDBLCLK` to the accept button.
+    /// A `WM_LBUTTONDOWN` or `WM_LBUTTONDBLCLK` to the accept button. If the keep saved this
+    /// rest and a digitizer report has come since the rest's last real move, in whatever order
+    /// it arrived, the keep is off for this click: the rest is gone, as Task 28c's rule would
+    /// have it (round 4, re-review 2 M1).
     pub fn button_press(&mut self, inside: bool, m: PointerMsg, now: Instant) {
+        if self.kept_since_real && self.digitizer_report {
+            self.press.on_move(false, now);
+        }
         self.press.on_press(inside && m.real(), m.device, now);
     }
 
@@ -2261,6 +2319,12 @@ const RAW_DIGITIZERS: [(u16, u16); 3] = [(0x0D, 0x05), (0x0D, 0x02), (0x0D, 0x04
 /// Registers this process's raw input for `usages` with `window`, delivered even while it
 /// isn't in front (`RIDEV_INPUTSINK`); with `None`, removes it (`RIDEV_REMOVE`). Whether that
 /// worked (Task 28d).
+///
+/// Raw input goes to one window per device class in a process (the last one registered), so
+/// this takes these classes from any other window of the lil process, and the asking window's
+/// `WM_DESTROY` removes them without giving them back. That is fine only while the asking
+/// window is the process's sole raw-input user, as it is during the merge flow. Don't add a
+/// second raw-input window to the same process without revisiting this (re-review 2 M3).
 fn register_raw(window: Option<HWND>, usages: &[(u16, u16)]) -> bool {
     let devices: Vec<RAWINPUTDEVICE> = usages
         .iter()
@@ -2313,8 +2377,7 @@ fn raw_is_for(window: HWND, usages: &[(u16, u16)]) -> bool {
 /// now on, and one line says so (Task 28d). A session that has turned remote turns the
 /// same-place keep off (round 3b).
 fn check_raw_mouse(window: HWND) {
-    // SAFETY: a plain query.
-    let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
+    let remote = session_is_remote(session_facts());
     with_gate(|g| g.remote_session(remote));
     let digitizers = DIGITIZERS.with(|d| d.get());
     if with_gate(|g| g.raw_on())
@@ -2323,6 +2386,31 @@ fn check_raw_mouse(window: HWND) {
         with_gate(ClickGate::raw_lost);
         log_raw_input_off();
     }
+}
+
+/// What this process reads about its session ([`session_is_remote`]).
+fn session_facts() -> SessionFacts {
+    let mut session = 0u32;
+    // SAFETY: plain queries; a local out value.
+    unsafe {
+        SessionFacts {
+            remote_session: GetSystemMetrics(SM_REMOTESESSION) != 0,
+            remote_control: GetSystemMetrics(SM_REMOTECONTROL) != 0,
+            process_session: ProcessIdToSessionId(GetCurrentProcessId(), &mut session)
+                .is_ok()
+                .then_some(session),
+            console_session: Some(WTSGetActiveConsoleSessionId()).filter(|&id| id != u32::MAX),
+        }
+    }
+}
+
+/// The one line said when only the digitizers' raw input couldn't be registered: the mouse's is
+/// on, and the same-place keep is off (round 4).
+fn log_digitizers_off() {
+    let label = ACCEPT_LABEL.with(|l| l.borrow().clone());
+    log_refusal(format!(
+        "lil: raw input from touchpads, pens and touch screens is off for this window: after          anything changes on screen, move the pointer a little on {label} before clicking it"
+    ));
 }
 
 /// The one line said when raw input is off for the asking window (Task 28d).
@@ -2918,14 +3006,16 @@ fn window_thread(
             let raw = register_raw(Some(hwnd), &RAW_MOUSE);
             let digitizers = raw && register_raw(Some(hwnd), &RAW_DIGITIZERS);
             DIGITIZERS.with(|d| d.set(digitizers));
-            let remote = GetSystemMetrics(SM_REMOTESESSION) != 0;
+            let remote = session_is_remote(session_facts());
             with_gate(|g| {
                 g.raw_registered(raw);
                 g.digitizers_registered(digitizers);
                 g.remote_session(remote);
             });
-            if !digitizers {
+            if !raw {
                 log_raw_input_off();
+            } else if !digitizers {
+                log_digitizers_off();
             }
             // The live timer runs until a choice is made (re-review 2 n3).
             SetTimer(Some(hwnd), TIMER_LIVE, LIVE_TICK.as_millis() as u32, None);
@@ -3069,7 +3159,8 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 LRESULT(0)
             }
             WM_INPUT => {
-                // The hand moved the mouse: the rest ends (Task 28d). DefWindowProc cleans up.
+                // The mouse's motion (beyond the jitter bound, it ends the rest) or a digitizer's
+                // report (the keep is off: Task 28d). DefWindowProc cleans up.
                 match raw_input_event(lp) {
                     Some(RawEvent::Mouse(r)) => with_gate(|g| g.raw_input(r, Instant::now())),
                     Some(RawEvent::Digitizer) => with_gate(ClickGate::raw_digitizer),
@@ -5491,6 +5582,170 @@ mod tests {
             r.wait(300);
             r.click();
             assert_eq!(r.clicks, [Click::Accepted], "{fakes:?}");
+        }
+    }
+
+    /// Task 28d round 4 (re-review 2 M1): sequence A with the touchpad's report handled after
+    /// the warp's own move. The keep saved the rest at that move, but the report since the
+    /// rest's last real move turns it off for the click, so the click is refused, whatever the
+    /// order.
+    #[test] // spec: QA-088, QA-036
+    fn replay_a_touchpad_report_after_the_warps_own_move_still_refuses_the_click() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, true);
+            rest_on_merge(&mut r);
+            r.wait(300);
+            use_touchpad(&mut r);
+            // The finger moves away unseen and a warp puts the cursor back; the warp's own move
+            // is handled before the touchpad's report.
+            r.warp(MERGE);
+            r.gate.raw_digitizer();
+            r.wait(200);
+            three_still_clicks(&mut r);
+            r.report("touchpad report after the warp's move");
+            assert!(
+                r.clicks.iter().all(|c| *c == refused("no_move")),
+                "{fakes:?}: {:?}",
+                r.clicks
+            );
+        }
+    }
+
+    /// Task 28d round 4 (re-review 2 M2): a finger resting on the touchpad after its last move
+    /// keeps reporting, and that doesn't end the rest: the deliberate click counts, as with
+    /// raw input off.
+    #[test] // spec: QA-088
+    fn replay_a_finger_resting_on_the_touchpad_doesnt_end_the_rest() {
+        for (fakes, raw) in WITH_AND_WITHOUT_RAW {
+            let mut r = Replay::open_with(fakes, true, raw);
+            use_touchpad(&mut r);
+            rest_on_merge(&mut r);
+            for _ in 0..4 {
+                r.wait(50);
+                r.digitizer_from_hand();
+            }
+            r.wait(100);
+            r.click();
+            r.report("a resting finger");
+            assert_eq!(r.clicks, [Click::Accepted], "{fakes:?}, raw {raw}");
+        }
+    }
+
+    /// Task 28d round 4 (re-review 2 M2): the keep comes back after a real move of the mouse.
+    /// The owner touched the touchpad, then made the rest with the mouse; Windows' own moves
+    /// then keep it, and the still click counts.
+    #[test] // spec: QA-088
+    fn replay_the_keep_comes_back_after_the_mouse_makes_the_rest() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, true);
+            use_touchpad(&mut r);
+            r.wait(3_000);
+            r.move_to(ROW, 30);
+            r.hand_raw = Some(true);
+            r.hand_device = InputDevice::Mouse;
+            r.hand_digitizer = false;
+            r.move_to(MERGE, 5);
+            for _ in 0..4 {
+                r.wait(250);
+                r.background_move();
+            }
+            r.wait(100);
+            r.click();
+            r.report("touchpad, then the mouse");
+            assert_eq!(r.clicks, [Click::Accepted], "{fakes:?}");
+        }
+    }
+
+    /// Task 28d round 4 (re-review 2 M4): the keep is off for a remote session, a shadowed
+    /// console, or a process that isn't in the session attached to the console (a RemoteFX
+    /// session reads local to `SM_REMOTESESSION`); anything unreadable counts as remote.
+    #[test] // spec: QA-088
+    fn the_session_is_remote_unless_this_process_is_on_the_console() {
+        let local = SessionFacts {
+            remote_session: false,
+            remote_control: false,
+            process_session: Some(1),
+            console_session: Some(1),
+        };
+        assert!(!session_is_remote(local));
+        for (facts, why) in [
+            (
+                SessionFacts {
+                    remote_session: true,
+                    ..local
+                },
+                "SM_REMOTESESSION",
+            ),
+            (
+                SessionFacts {
+                    remote_control: true,
+                    ..local
+                },
+                "SM_REMOTECONTROL",
+            ),
+            (
+                SessionFacts {
+                    process_session: Some(2),
+                    ..local
+                },
+                "another session than the console's",
+            ),
+            (
+                SessionFacts {
+                    process_session: None,
+                    ..local
+                },
+                "the process's session unreadable",
+            ),
+            (
+                SessionFacts {
+                    console_session: None,
+                    ..local
+                },
+                "no session on the console",
+            ),
+        ] {
+            assert!(session_is_remote(facts), "{why}");
+        }
+    }
+
+    /// Task 28d round 4 (re-review 2 M4): the window opens on the console session; mid-window
+    /// the console is attached to another session (this one is now remote, though
+    /// `SM_REMOTESESSION` reads local). The keep goes off, and the still click is refused.
+    #[test] // spec: QA-088, QA-036
+    fn replay_a_session_off_the_console_turns_the_keep_off() {
+        let on_console = SessionFacts {
+            remote_session: false,
+            remote_control: false,
+            process_session: Some(1),
+            console_session: Some(1),
+        };
+        let off_console = SessionFacts {
+            console_session: Some(3),
+            ..on_console
+        };
+        for fakes in ALL_FAKES {
+            for (facts, want) in [
+                (on_console, Click::Accepted),
+                (off_console, refused("no_move")),
+            ] {
+                let mut r = Replay::open(fakes, true);
+                r.gate.remote_session(session_is_remote(on_console));
+                rest_on_merge(&mut r);
+                r.wait(250);
+                r.background_move();
+                r.gate.remote_session(session_is_remote(facts));
+                r.wait(250);
+                r.background_move();
+                r.wait(100);
+                r.click();
+                r.report("the console session");
+                assert_eq!(
+                    r.clicks,
+                    std::slice::from_ref(&want),
+                    "{fakes:?}, {facts:?}"
+                );
+            }
         }
     }
 

@@ -93,6 +93,9 @@ features = [
     # RegCreateKeyExW, RegGetValueW and RegDeleteTreeW: the per-user handlers and the CLSID
     # (APP-022).
     "Win32_System_Registry",
+    # ProcessIdToSessionId and WTSGetActiveConsoleSessionId: the Merge window's keep is off
+    # outside the console session (Task 28d).
+    "Win32_System_RemoteDesktop",
     "Win32_System_SystemServices",
     # Also REASON_CONTEXT: the power request's reason string (ARCH-127).
     "Win32_System_Threading",
