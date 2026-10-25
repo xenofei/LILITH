@@ -7,7 +7,9 @@
 //! bad file never hides the others. An installed app wins over an external one of the same
 //! name, so a program in the user's folder can't stand in for an app the suite ships, and an
 //! external registration whose `exe` is in the core's folder is skipped, so it can't start a
-//! suite program with arguments of its own (ruling I1 of the Task 11 review). The one
+//! suite program with arguments of its own (ruling I1 of the Task 11 review); so is one whose
+//! `exe` is the same file as a suite program by file identity (a hard link, an 8.3 name, a UNC
+//! path to a local share: volume serial and file id, review N1). The one
 //! exception is the test app (`lil-test-app.exe`) on a test channel, the channels whose core
 //! accepts it as `ui:test` ([`crate::identity::trusts_test_app`]): tests register it from
 //! outside, and it sits beside the test core.
@@ -91,8 +93,16 @@ pub fn load_registrations(
     test_app: bool,
 ) -> Vec<AppRegistration> {
     let mut found: Vec<AppRegistration> = Vec::new();
+    let mut suite: Option<Vec<FileKey>> = None;
     for (dir, external) in [(core_dir, false), (data_dir, true)] {
         for reg in load_folder(&dir.join("apps"), core_dir, external, test_app) {
+            if external && !is_test_app(&reg.exe, test_app) {
+                let suite = suite.get_or_insert_with(|| suite_exes(core_dir, &found));
+                if file_key(&reg.exe).is_some_and(|key| suite.contains(&key)) {
+                    tracing::warn!(app = %reg.app, exe = %reg.exe.display(), "an external registration names a suite program (the same file by another path); it is skipped");
+                    continue;
+                }
+            }
             if found.iter().any(|f| f.app == reg.app) {
                 tracing::warn!(app = %reg.app, external, "an app of this name is registered already; this registration is skipped");
             } else {
@@ -101,6 +111,39 @@ pub fn load_registrations(
         }
     }
     found
+}
+
+/// A file's identity: its volume serial and file id. Two paths with the same key are one file
+/// (a hard link, an 8.3 name, a UNC path to a local share).
+type FileKey = (u64, [u8; 16]);
+
+/// `path`'s [`FileKey`], when it exists and its file system gives a usable id.
+fn file_key(path: &Path) -> Option<FileKey> {
+    let id = lil_platform::fs::identity(path).ok()?;
+    Some((id.volume_serial, id.file_id?))
+}
+
+/// The [`FileKey`]s of the suite's programs: each `.exe` in the core's folder and each
+/// installed registration's `exe` (review N1).
+fn suite_exes(core_dir: &Path, installed: &[AppRegistration]) -> Vec<FileKey> {
+    let beside = std::fs::read_dir(core_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")));
+    beside
+        .chain(installed.iter().map(|r| r.exe.clone()))
+        .filter_map(|p| file_key(&p))
+        .collect()
+}
+
+/// Whether `exe` is the test app and the test app may be registered from outside.
+fn is_test_app(exe: &Path, test_app: bool) -> bool {
+    test_app
+        && exe
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case(crate::identity::TEST_APP_EXE.0))
 }
 
 fn load_folder(
@@ -157,11 +200,7 @@ fn read_registration(
     } else {
         core_dir.join(raw.exe)
     };
-    let the_test_app = test_app
-        && exe
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case(crate::identity::TEST_APP_EXE.0));
-    if external && !the_test_app {
+    if external && !is_test_app(&exe, test_app) {
         let core = lil_platform::paths::folder_key(core_dir);
         if exe
             .ancestors()

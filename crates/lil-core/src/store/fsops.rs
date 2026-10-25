@@ -183,12 +183,7 @@ pub fn write_suite_cache_file(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let backup = dir.join(format!("{stem}.bak"));
             let replaced = replace(path, &temp, &backup);
-            if replaced.is_err() && !path.exists() {
-                // `ReplaceFileW` had moved the old file to the backup name: put it back.
-                let _ = move_new(&backup, path);
-            }
-            let _ = remove_file(&backup);
-            replaced
+            settle_replace(path, &backup, replaced, move_new)
         }
         other => other,
     };
@@ -198,9 +193,33 @@ pub fn write_suite_cache_file(
     placed
 }
 
+/// After `ReplaceFileW` of `path` with `backup` gave `replaced`: the backup (the old file) is
+/// removed only once the new file is in place. When the replace failed halfway (the old file
+/// already at the backup name, nothing at `path`), `restore` moves it back; if that fails too,
+/// the backup is kept, the only copy of the old file (review N3).
+fn settle_replace(
+    path: &Path,
+    backup: &Path,
+    replaced: std::io::Result<()>,
+    restore: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match &replaced {
+        Ok(()) => {
+            let _ = remove_file(backup);
+        }
+        Err(_) if !path.exists() && backup.exists() => {
+            if let Err(e) = restore(backup, path) {
+                tracing::warn!(backup = %backup.display(), error = %e, "the old file could not be put back; it is kept at its backup name");
+            }
+        }
+        Err(_) => {}
+    }
+    replaced
+}
+
 /// Why `name` can't be a file name [`write_suite_cache_file`] writes, if it can't.
 fn odd_file_name(name: &str) -> Option<&'static str> {
-    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
     if name
         .chars()
         .any(|c| c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
@@ -216,9 +235,16 @@ fn odd_file_name(name: &str) -> Option<&'static str> {
         .unwrap_or("")
         .trim_end()
         .to_ascii_uppercase();
+    // `COM0`–`COM9` and `LPT0`–`LPT9`, and the superscript `COM¹`–`COM³` and `LPT¹`–`LPT³`
+    // (review N2).
     let numbered = |prefix: &str| {
-        stem.strip_prefix(prefix)
-            .is_some_and(|n| n.len() == 1 && n.chars().all(|c| c.is_ascii_digit()))
+        stem.strip_prefix(prefix).is_some_and(|n| {
+            let mut digits = n.chars();
+            matches!(
+                (digits.next(), digits.next()),
+                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
+        })
     };
     if RESERVED.contains(&stem.as_str()) || numbered("COM") || numbered("LPT") {
         return Some("its name is a reserved device name");
@@ -226,8 +252,27 @@ fn odd_file_name(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Removes [`write_suite_cache_file`]'s temp and backup files (`.<name>.<pid>-<n>.tmp` or
-/// `.bak`) older than a day from `dir`: what a crash between writing and moving left.
+/// Whether `name` is one of [`write_suite_cache_file`]'s temp or backup names:
+/// `.<name>.<pid>-<n>.tmp` or `.bak`, with `<pid>` and `<n>` decimal (review N4).
+fn own_leftover(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".tmp").or_else(|| n.strip_suffix(".bak")))
+    else {
+        return false;
+    };
+    let Some((target, counter)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    !target.is_empty()
+        && counter
+            .split_once('-')
+            .is_some_and(|(pid, n)| decimal(pid) && decimal(n))
+}
+
+/// Removes [`write_suite_cache_file`]'s temp and backup files ([`own_leftover`]) older than a
+/// day from `dir`: what a crash between writing and moving left.
 #[allow(clippy::disallowed_methods)]
 fn sweep_leftovers(dir: &Path) {
     const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -237,7 +282,7 @@ fn sweep_leftovers(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with('.') || !(name.ends_with(".tmp") || name.ends_with(".bak")) {
+        if !own_leftover(&name) {
             continue;
         }
         let old = entry
@@ -524,6 +569,59 @@ pub fn append_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review N3: the old file at the backup name is removed only once the new file is in
+    /// place; a failed replace puts it back, and when that fails too it is kept.
+    #[test] // spec: APP-021, ARCH-119
+    #[allow(clippy::disallowed_methods)] // plants the old file at its backup name
+    fn a_failed_restore_keeps_the_old_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, backup) = (
+            dir.path().join("a.lilref"),
+            dir.path().join(".a.lilref.1-1.bak"),
+        );
+        let failed = || Err(std::io::Error::other("replace failed"));
+        let cannot = |_: &Path, _: &Path| Err(std::io::Error::other("restore failed"));
+
+        // The restore fails: the backup stays, the only copy.
+        std::fs::write(&backup, b"old").unwrap();
+        assert!(settle_replace(&path, &backup, failed(), cannot).is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert!(!path.exists());
+
+        // The restore works: the old file is back at its name.
+        assert!(settle_replace(&path, &backup, failed(), move_new).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!backup.exists());
+
+        // The new file is in place: the backup goes.
+        std::fs::write(&backup, b"old").unwrap();
+        settle_replace(&path, &backup, Ok(()), cannot).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test] // spec: APP-021, ARCH-119
+    fn only_the_writers_own_leftovers_are_swept() {
+        for own in [
+            ".a.lilref.12-3.tmp",
+            ".a.lilref.12-3.bak",
+            ".bundle.zip.1-99.tmp",
+        ] {
+            assert!(own_leftover(own), "{own}");
+        }
+        for other in [
+            ".a.tmp",
+            ".a.lilref.tmp",
+            ".a.lilref.12-x.tmp",
+            ".a.lilref.12.tmp",
+            "..1-2.tmp",
+            "a.lilref.1-2.tmp",
+            ".a.lilref.1-2.txt",
+            ".task12-temp.tmp",
+        ] {
+            assert!(!own_leftover(other), "{other}");
+        }
+    }
 
     #[test] // spec: ARCH-112
     fn ensure_dir_creates_nested_dirs() {

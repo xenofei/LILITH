@@ -152,6 +152,7 @@ fn registrations_load_from_both_folders() {
 /// Ruling I1 of the Task 11 review: an external registration whose exe is in the core's folder
 /// (or below it) is skipped, so it can't start a suite program with arguments of its own.
 #[test] // spec: APP-061, ARCH-015
+#[allow(clippy::disallowed_methods)] // makes the hard link and the folder it is in
 fn an_external_registration_of_a_suite_exe_is_skipped() {
     let r = rig();
     let data_dir = r.env.env.data_dir();
@@ -203,6 +204,25 @@ fn an_external_registration_of_a_suite_exe_is_skipped() {
             .map(|g| g.app)
             .collect()
     };
+    assert_eq!(names(false), ["image", "viewer"]);
+
+    // Review N1: the same file by another path is caught by its identity, not its path.
+    write_file(&r.core_dir.join("lil-image.exe"), b"MZ suite program");
+    let tools = r.env.root().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let link = tools.join("innocent.exe");
+    std::fs::hard_link(r.core_dir.join("lil-image.exe"), &link).unwrap();
+    register(
+        &data_dir,
+        "linked",
+        &link.display().to_string(),
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    assert_eq!(names(false), ["image", "viewer"]);
+    // An unrelated program outside is still registered.
+    write_file(&tools.join("viewer.exe"), b"MZ another program");
     assert_eq!(names(false), ["image", "viewer"]);
     // On a test channel the test app, beside the test core, may be registered from outside.
     assert_eq!(names(true), ["image", "test", "viewer"]);
@@ -642,6 +662,10 @@ fn lilref_write_stays_in_the_cache_folder() {
         cache.join("com1.lilref"),
         cache.join("LPT9"),
         cache.join("nul .lilref"),
+        cache.join("COM\u{B9}.lilref"),
+        cache.join("lpt\u{B3}"),
+        cache.join("CONIN$"),
+        cache.join("conout$.txt"),
     ] {
         let refused = write_suite_cache_file(&env.env, &outside, b"x").unwrap_err();
         assert_eq!(
@@ -677,6 +701,7 @@ fn suite_cache_leftovers_older_than_a_day_are_swept() {
         ".a.lilref.1-1.tmp",
         ".a.lilref.1-2.bak",
         ".b.lilref.1-3.tmp",
+        ".someone-else.tmp",
         "old.lilref",
     ] {
         write_file(&cache.join(name), b"x");
@@ -692,7 +717,15 @@ fn suite_cache_leftovers_older_than_a_day_are_swept() {
     write_suite_cache_file(&env.env, &cache.join("c.lilref"), b"c").unwrap();
     let mut left = names_in(&cache);
     left.sort();
-    assert_eq!(left, [".b.lilref.1-3.tmp", "c.lilref", "old.lilref"]);
+    assert_eq!(
+        left,
+        [
+            ".b.lilref.1-3.tmp",
+            ".someone-else.tmp",
+            "c.lilref",
+            "old.lilref"
+        ]
+    );
 }
 
 /// The interchange rows (CORE-146; Appendix G): `handlers.for`, `open_in` and `ui.show` read,
