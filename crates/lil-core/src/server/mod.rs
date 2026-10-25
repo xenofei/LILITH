@@ -42,13 +42,22 @@
 //!   Their outside-jobs watch is an idle blocker (it holds no drain), and their observation
 //!   ([`Engines::observe`]: the outside-jobs poll every 2 s while ComfyUI is ready, the model
 //!   inventory each time it becomes ready) starts with the suite's jobs recovered.
+//! - The desktop ([`crate::desktop`], P4a-R24): `real_desktop` on the stable and dev channels,
+//!   a `FakeDesktop` on test channels (which `test.desktop` sets). Its settings are read from
+//!   `suite.toml` before the dispatcher is built (`desktop.get`, and the router's
+//!   `app/desktop.set`); once the jobs exist, the fullscreen poll starts (every 2 s, or
+//!   `LIL_TEST_DESKTOP_POLL_MS` on a test channel), with the auto-pause and keep-awake, and
+//!   the session-end window's sleep broadcasts go to the poll's sleep log. Keep-awake releases
+//!   its request when the shutdown ends.
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lil_platform::session_end::{SessionEnd, SessionEndSim, SessionEndWatcher};
+use lil_platform::desktop::{Desktop, real_desktop};
+use lil_platform::desktop_fake::FakeDesktop;
+use lil_platform::session_end::{PowerEvent, SessionEnd, SessionEndSim, SessionEndWatcher};
 use lil_platform::{Env, process};
 use lil_protocol::CallerKind;
 use tokio::task::JoinHandle;
@@ -56,6 +65,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep};
 use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NoNotificationPath, UiPresence};
+use crate::desktop::{
+    AutoPause, DesktopSettingsStore, DesktopWatch, KeepAwake, UiApps, start_autopause,
+    start_keep_awake,
+};
 use crate::docs::{Holds, TestHolds, register_doc_tools, register_test_hold};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
@@ -74,7 +87,7 @@ use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
     Dispatcher, PipelineHooks, TestGates, TestJobHandler, ToolEstimates, core_registry,
-    register_hw_tick, register_telemetry_tools,
+    register_desktop_tools, register_hw_tick, register_telemetry_tools, register_test_desktop,
 };
 use crate::transport::serve_with;
 pub use crate::transport::{
@@ -109,6 +122,12 @@ pub struct RunningCore {
     confirm: Arc<Confirm>,
     /// The hidden session-end window; `None` if it could not be created.
     session_end: Option<Arc<SessionEndWatcher>>,
+    /// The fullscreen poll and the sleep log (P4a-R6, ARCH-127).
+    desktop_watch: Arc<DesktopWatch>,
+    /// The desktop settings (`desktop.get`, `app/desktop.set`).
+    desktop_settings: Arc<DesktopSettingsStore>,
+    /// The verified apps' processes, while they are connected (P4a-R7).
+    ui_apps: Arc<UiApps>,
     /// The supervisor: ends with the shutdown's report.
     shutdown: JoinHandle<ShutdownReport>,
 }
@@ -153,6 +172,21 @@ impl RunningCore {
     /// The confirmations: pending ones, answers, the apps that can answer.
     pub fn confirm(&self) -> &Arc<Confirm> {
         &self.confirm
+    }
+
+    /// The fullscreen poll and the sleep log.
+    pub fn desktop_watch(&self) -> &Arc<DesktopWatch> {
+        &self.desktop_watch
+    }
+
+    /// The desktop settings.
+    pub fn desktop_settings(&self) -> &Arc<DesktopSettingsStore> {
+        &self.desktop_settings
+    }
+
+    /// The verified apps' processes, while they are connected.
+    pub fn ui_apps(&self) -> &Arc<UiApps> {
+        &self.ui_apps
     }
 
     /// Idle accounting, drains and shutdown steps.
@@ -297,6 +331,27 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     register_engine_tools(&mut registry, &engine_slot);
     if cfg.test_tools {
         register_engine_test_tools(&mut registry);
+    }
+    // The desktop (P4a-R24): the real one on stable and dev, the fake on test channels, so no
+    // test reads the real desktop or holds a real power request (QA-038).
+    let fake_desktop = cfg.test_tools.then(|| Arc::new(FakeDesktop::new()));
+    let desktop: Arc<dyn Desktop> = match &fake_desktop {
+        Some(fake) => fake.clone(),
+        None => real_desktop(&cfg.env),
+    };
+    let desktop_settings = DesktopSettingsStore::load(
+        cfg.env.clone(),
+        desktop.clone(),
+        core_dir().join(crate::identity::APP_EXES[0].0),
+        cfg.clock.clone(),
+        cfg.ids.clone(),
+        events.clone(),
+        cfg.failpoints.clone(),
+    );
+    register_desktop_tools(&mut registry, &desktop_settings);
+    let ui_apps = Arc::new(UiApps::default());
+    if let Some(fake) = &fake_desktop {
+        register_test_desktop(&mut registry, fake.clone(), ui_apps.clone());
     }
     // The confirmations (ARCH-052–055): stage 5's confirm half, answered by the apps.
     let confirm = Confirm::new(
@@ -452,6 +507,15 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }
     lifecycle.add_blocker(jobs.clone());
+    // The fullscreen poll, the auto-pause and keep-awake (CORE-160, ARCH-127).
+    let desktop_watch = DesktopWatch::start(
+        desktop.clone(),
+        cfg.clock.clone(),
+        cfg.desktop_poll.unwrap_or(crate::desktop::POLL_EVERY),
+        events.clone(),
+    );
+    let autopause = start_autopause(&desktop_watch, jobs.clone(), desktop_settings.current());
+    let keep_awake = start_keep_awake(desktop, jobs.clone(), desktop_settings.current());
     // Outside ComfyUI jobs keep the core up but hold no drain (ARCH-020, ARCH-069); the poller
     // runs while the engine is ready.
     let outside = engines.outside_watch();
@@ -464,6 +528,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     lifecycle.add_shutdown_step(engines.stop_engines_step());
     let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
         .with_caps(caps.clone())
+        .with_desktop(desktop_settings.clone())
+        .with_observer(ui_apps.clone())
         .with_observer(holds)
         .with_observer(interchange)
         .with_observer(Arc::new(AppTracker::new(telemetry.clone())));
@@ -530,6 +596,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let session_end = match SessionEndWatcher::start() {
         Ok((watcher, messages)) => {
             helpers.push(tokio::spawn(watch_session_end(messages, lifecycle.clone())));
+            if let Some(power) = watcher.power_events() {
+                helpers.push(tokio::spawn(watch_power(power, desktop_watch.clone())));
+            }
             Some(Arc::new(watcher))
         }
         Err(e) => {
@@ -546,6 +615,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         helpers,
         telemetry: telemetry.clone(),
         session_end: session_end.clone(),
+        desktop_tasks: (autopause, keep_awake),
     }));
     tracing::info!(pipe = %pipe, channel = %cfg.env.channel(), "core serving");
     Ok(RunningCore {
@@ -559,6 +629,9 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         active_projects,
         confirm,
         session_end,
+        desktop_watch,
+        desktop_settings,
+        ui_apps,
         shutdown,
     })
 }
@@ -617,6 +690,8 @@ struct Supervised {
     helpers: Vec<JoinHandle<()>>,
     telemetry: Arc<Telemetry>,
     session_end: Option<Arc<SessionEndWatcher>>,
+    /// Stopped once the pipe is closed; keep-awake releases its request then.
+    desktop_tasks: (Arc<AutoPause>, Arc<KeepAwake>),
 }
 
 /// Waits for a drain (or for the listener to fail, which is fatal), then shuts down in the
@@ -631,6 +706,7 @@ async fn supervise(s: Supervised) -> ShutdownReport {
         helpers,
         telemetry,
         session_end,
+        desktop_tasks,
     } = s;
     let drain = lifecycle.drain_token();
     let served_early = tokio::select! {
@@ -675,6 +751,7 @@ async fn supervise(s: Supervised) -> ShutdownReport {
     for helper in helpers {
         helper.abort();
     }
+    drop(desktop_tasks);
     if let Some(window) = session_end {
         window.shutdown_complete();
     }
@@ -847,6 +924,16 @@ async fn watch_session_end(
                 lifecycle.begin_drain(DrainReason::SessionEnd);
             }
         }
+    }
+}
+
+/// The session-end window's sleep broadcasts, for the desktop's sleep log (ARCH-127).
+async fn watch_power(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<PowerEvent>,
+    watch: Arc<DesktopWatch>,
+) {
+    while let Some(event) = events.recv().await {
+        watch.power_event(event);
     }
 }
 

@@ -24,8 +24,10 @@
 //!   (they need `confirmations.v1` or `caps.v1` in the shared capabilities, else
 //!   `caller.not_allowed`), `app/caps.set` goes to the [`Caps`] (it needs `caps.v1`, else
 //!   `caller.not_allowed`; CORE-008), protocol 1.2's `app/queue.pause` and `app/queue.resume`
-//!   go to the jobs (they need `queue.v1`, else `caller.not_allowed`; CORE-160), and any other
-//!   `app/*` method is -32601 for an app. `tools/list`
+//!   go to the jobs (they need `queue.v1`, else `caller.not_allowed`; CORE-160),
+//!   `app/desktop.set` goes to the [`DesktopSettingsStore`] (it needs `desktop.v1`, else
+//!   `caller.not_allowed`; a category `desktop.get` doesn't list is -32602; APP-146), and any
+//!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   A verified `ui:*` session that can answer confirmations counts in the
 //!   [`crate::confirm::UiPresence`] while its connection is open; when it closes, its pending
@@ -88,6 +90,7 @@ use crate::config::CoreConfig;
 use crate::confirm::{
     Confirm, ConfirmationRow, ListState, can_answer, has_confirmation_capability,
 };
+use crate::desktop::{DesktopSettingsStore, unknown_category};
 use crate::events::EventBus;
 use crate::identity::{EngineSession, EngineTokens, TrustedDirs, resolve_caller};
 use crate::jobs::{Lane, PauseReason};
@@ -143,6 +146,8 @@ pub struct RpcRouter {
     confirm: Arc<Confirm>,
     /// The caps `app/caps.set` changes; `None`: the method is -32601.
     caps: Option<Arc<Caps>>,
+    /// The desktop settings `app/desktop.set` changes; `None`: the method is -32601.
+    desktop: Option<Arc<DesktopSettingsStore>>,
     /// Told when a session is established and when its connection ends.
     observers: Vec<Arc<dyn ConnObserver>>,
     /// Unit tests only: requests with this method panic (`CoreConfig::panic_on_method`).
@@ -181,6 +186,7 @@ impl RpcRouter {
             lifecycle,
             confirm,
             caps: None,
+            desktop: None,
             observers: Vec::new(),
             #[cfg(test)]
             panic_on_method: cfg.panic_on_method,
@@ -191,6 +197,13 @@ impl RpcRouter {
     #[must_use]
     pub fn with_caps(mut self, caps: Arc<Caps>) -> RpcRouter {
         self.caps = Some(caps);
+        self
+    }
+
+    /// Serves `app/desktop.set` with `store`.
+    #[must_use]
+    pub fn with_desktop(mut self, store: Arc<DesktopSettingsStore>) -> RpcRouter {
+        self.desktop = Some(store);
         self
     }
 
@@ -393,6 +406,37 @@ impl RpcRouter {
         }
         if matches!(m, app::QUEUE_PAUSE | app::QUEUE_RESUME) {
             return self.queue(id.clone(), session, m, params, refuse).await;
+        }
+        if m == app::DESKTOP_SET {
+            let Some(store) = &self.desktop else {
+                return not_found(id);
+            };
+            if !session
+                .capabilities
+                .iter()
+                .any(|c| c == app::DESKTOP_CAPABILITY)
+            {
+                return refuse(format!(
+                    "{m} needs the desktop.v1 capability, and this session's core/hello did not offer it."
+                ));
+            }
+            let p: app::DesktopSetParams = match parse_params(params) {
+                Ok(p) => p,
+                Err(error) => {
+                    return Response::Error {
+                        id: Some(id),
+                        error,
+                    };
+                }
+            };
+            if let Some(category) = unknown_category(&p) {
+                return fault(
+                    id,
+                    rpc_code::INVALID_PARAMS,
+                    &format!("invalid params: {category:?} is not a notification category"),
+                );
+            }
+            return outcome(id, into_outcome(store.set(p).await));
         }
         if !matches!(m, app::CONFIRMATIONS_LIST | app::CONFIRMATION_ANSWER) {
             return not_found(id);

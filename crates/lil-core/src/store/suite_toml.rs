@@ -1,7 +1,8 @@
 //! `suite.toml` writes (CORE-007, ARCH-090; owner decision 1): the core is the file's only
 //! writer. `lil workspace init|use` reach it through the tools `workspace.create` and
 //! `workspace.set_default`; the caps change only through `app/caps.set` ([`set_caps`],
-//! CORE-008).
+//! CORE-008), and the desktop settings only through `app/desktop.set` ([`set_desktop`],
+//! APP-146).
 //!
 //! An edit is targeted (`lil_schema::suite_edit::register`, through `toml_edit`), so comments,
 //! key order and unknown keys and tables survive. The write is the store's swap, applied to a
@@ -113,6 +114,24 @@ pub async fn set_caps(
     let written = edit(env, fp, &|text| suite_edit::set_caps(text, caps)).await?;
     if written {
         tracing::info!("suite.toml: the caps changed");
+    }
+    Ok(written)
+}
+
+/// Applies `desktop` to `[notifications]`, `[jobs]` and `[power]` (`app/desktop.set`, APP-146;
+/// `lil_schema::suite_edit::set_desktop`), keeping comments. Returns whether the file was
+/// written.
+///
+/// # Errors
+/// As [`register_workspace`], `store.path_invalid` aside.
+pub async fn set_desktop(
+    env: &Env,
+    desktop: &suite_edit::DesktopEdit,
+    fp: &FailPoints,
+) -> Result<bool, StoreError> {
+    let written = edit(env, fp, &|text| suite_edit::set_desktop(text, desktop)).await?;
+    if written {
+        tracing::info!("suite.toml: the desktop settings changed");
     }
     Ok(written)
 }

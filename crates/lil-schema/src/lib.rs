@@ -41,6 +41,9 @@ pub use money::{Currency, Money, Rate};
 pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};
 pub use refs::{AssetRef, LEGACY_SCHEME, LinkRef, SCHEME, is_asset_id, is_run_id, is_slug};
 pub use status::{Status, StatusEvent, Transition, transition};
-pub use suite::{PowerToml, SUITE_STATE_SCHEMA, SuiteToml, WORKSPACE_STATE_SCHEMA, WorkspaceEntry};
+pub use suite::{
+    DesktopToml, NOTIFICATION_CATEGORIES, PowerToml, SUITE_STATE_SCHEMA, SuiteToml,
+    WORKSPACE_STATE_SCHEMA, WorkspaceEntry,
+};
 pub use version::{Bump, Version};
 pub use yaml_edit::{YamlEdit, YamlEditError, YamlValue};

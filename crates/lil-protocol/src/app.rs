@@ -2,7 +2,8 @@
 //! confirmation list and answer, and `app/caps.set` (CORE-008), whose result is the
 //! [`CapsView`] `caps.get` returns too; and of protocol 1.2 (Appendix G "Pause GPU work"),
 //! `app/queue.pause` and `app/queue.resume`, which need `queue.v1` and return a
-//! [`QueueState`].
+//! [`QueueState`], and `app/desktop.set` (Appendix G "Notifications"), which needs `desktop.v1`
+//! and returns the [`DesktopSettings`] `desktop.get` returns too.
 //!
 //! Every `app/*` method is for verified `ui:*` connections only, except the read-only
 //! `app/confirmations.list`, which `cli` may call too; the confirmation methods need
@@ -35,6 +36,11 @@ pub const QUEUE_PAUSE: &str = "app/queue.pause";
 pub const QUEUE_RESUME: &str = "app/queue.resume";
 /// The capability `app/queue.pause` and `app/queue.resume` need.
 pub const QUEUE_CAPABILITY: &str = "queue.v1";
+
+/// `app/desktop.set` (protocol 1.2).
+pub const DESKTOP_SET: &str = "app/desktop.set";
+/// The capability `app/desktop.set` needs.
+pub const DESKTOP_CAPABILITY: &str = "desktop.v1";
 
 /// The most confirmations one `app/confirmations.list` returns, and its default.
 pub const LIST_LIMIT_MAX: u32 = 500;
@@ -263,6 +269,75 @@ pub struct QueueState {
     pub withdrawn: u32,
 }
 
+/// `app/desktop.set {notifications?, quiet_while_fullscreen?, fullscreen_autopause?,
+/// keep_awake_gpu?}` params (Appendix G "Notifications"): a field left out stays as it is;
+/// `notifications` names categories by their key, only those `desktop.get` lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopSetParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<std::collections::BTreeMap<String, bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_while_fullscreen: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fullscreen_autopause: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_awake_gpu: Option<bool>,
+}
+
+/// Whether the channel's toasts can be posted (Appendix G "Ready").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToastsWire {
+    Ready,
+    /// The AUMID has never shown a toast; posting is allowed (plan 4a ruling 2026-10-24).
+    NotYetShown,
+    Unavailable,
+}
+
+/// The AUMID shortcut's state; `wrong` covers a wrong target, AUMID or CLSID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutWire {
+    Ok,
+    Missing,
+    Wrong,
+}
+
+/// The channel's scheme and `.lilref` handlers' state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandlersWire {
+    Ok,
+    Missing,
+    OtherChannel,
+}
+
+/// `notification_path {toasts, toasts_reason?, shortcut, handlers}` (Appendix G "Ready"):
+/// `toasts_reason` (`disabled_for_app`, `disabled_for_user`, `disabled_by_policy`, `elevated`
+/// or `no_platform`) is there only while `toasts` is `unavailable`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NotificationPath {
+    pub toasts: ToastsWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toasts_reason: Option<String>,
+    pub shortcut: ShortcutWire,
+    pub handlers: HandlersWire,
+}
+
+/// `DesktopSettings` (Appendix G "Notifications"), what `desktop.get` and `app/desktop.set`
+/// return. `notifications` holds each category this core knows, by its key; an app shows a
+/// category it doesn't know by its key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DesktopSettings {
+    pub notifications: std::collections::BTreeMap<String, bool>,
+    pub quiet_while_fullscreen: bool,
+    pub fullscreen_autopause: bool,
+    pub keep_awake_gpu: bool,
+    pub keep_awake_available: bool,
+    pub notification_path: NotificationPath,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +372,63 @@ mod tests {
             serde_json::to_value(&state).unwrap(),
             json!({"lane": "gpu-heavy", "paused": true, "reasons": ["manual"], "held": 2,
                    "restart_held": 1, "withdrawn": 0})
+        );
+    }
+
+    #[test] // spec: APP-146, APP-039
+    fn desktop_set_params_are_strict_and_settings_serialise() {
+        let p: DesktopSetParams = serde_json::from_value(
+            json!({"notifications": {"job_finished": false}, "keep_awake_gpu": true}),
+        )
+        .unwrap();
+        assert!(!p.notifications.as_ref().unwrap()["job_finished"]);
+        assert_eq!(
+            (p.keep_awake_gpu, p.fullscreen_autopause),
+            (Some(true), None)
+        );
+        let empty: DesktopSetParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, DesktopSetParams::default());
+        for bad in [
+            json!({"keep_awake_available": true}),
+            json!({"notifications": {"job_finished": "no"}}),
+            json!({"fullscreen_autopause": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<DesktopSetParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        let settings = DesktopSettings {
+            notifications: [("job_failed".to_string(), true)].into(),
+            quiet_while_fullscreen: true,
+            fullscreen_autopause: false,
+            keep_awake_gpu: true,
+            keep_awake_available: false,
+            notification_path: NotificationPath {
+                toasts: ToastsWire::Unavailable,
+                toasts_reason: Some("disabled_for_app".into()),
+                shortcut: ShortcutWire::Wrong,
+                handlers: HandlersWire::OtherChannel,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap(),
+            json!({"notifications": {"job_failed": true}, "quiet_while_fullscreen": true,
+                   "fullscreen_autopause": false, "keep_awake_gpu": true,
+                   "keep_awake_available": false,
+                   "notification_path": {"toasts": "unavailable",
+                                         "toasts_reason": "disabled_for_app",
+                                         "shortcut": "wrong", "handlers": "other_channel"}})
+        );
+        let path = NotificationPath {
+            toasts: ToastsWire::NotYetShown,
+            toasts_reason: None,
+            shortcut: ShortcutWire::Ok,
+            handlers: HandlersWire::Ok,
+        };
+        assert_eq!(
+            serde_json::to_value(&path).unwrap(),
+            json!({"toasts": "not_yet_shown", "shortcut": "ok", "handlers": "ok"})
         );
     }
 

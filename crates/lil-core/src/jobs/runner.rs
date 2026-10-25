@@ -3514,6 +3514,25 @@ impl Jobs {
         self.shared.queue_state(lane)
     }
 
+    /// Changes whenever a job's state changes or a job leaves the queue: a watcher re-reads
+    /// what it needs then (keep-awake reads [`Jobs::any_running`]).
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.shared.changed.subscribe()
+    }
+
+    /// Whether a job of `lane` is `running` now (ARCH-127): an attempt of it is under way and
+    /// its row's status is `running`. A job whose outcome is unknown (`interrupted_unknown`)
+    /// waits for you, not for the GPU, so it doesn't count.
+    pub fn any_running(&self, lane: Lane) -> bool {
+        self.shared.queue().jobs.values().any(|a| {
+            a.info.spec.lane == lane
+                && a.running
+                && a.substatus.is_some_and(|s| {
+                    s.status() == JobStatus::Running && s != Substatus::InterruptedUnknown
+                })
+        })
+    }
+
     /// Who withdraws a pending prompt of `engine` (CORE-160): the engines set ComfyUI's.
     pub fn set_withdraw(&self, engine: EngineKind, w: Arc<dyn Withdraw>) {
         self.shared

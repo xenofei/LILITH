@@ -137,7 +137,130 @@ const CAPS_1_2: &[&str] = &[
     "confirmations.v1",
     "caps.v1",
     "queue.v1",
+    "desktop.v1",
 ];
+
+/// `app/desktop.set` (APP-039, APP-146; Appendix D): a verified app only, and only with
+/// `desktop.v1` in the shared capabilities; then `DesktopSettings`. Its params are strict, and a
+/// category `desktop.get` doesn't list is -32602 (plan 4a ruling, 2026-10-25).
+#[test] // spec: APP-039, APP-146
+fn desktop_set_needs_a_verified_app_and_the_capability() {
+    let env = TestEnv::new();
+    let _core = app_core(&env);
+    let change = json!({"keep_awake_gpu": false});
+    for caller in ["cli", "mcp"] {
+        let mut pipe = connect(&env, json!({"caller_kind": caller}));
+        let refused = pipe.call("app/desktop.set", change.clone());
+        assert_eq!(
+            refused["result"]["error"]["code"], "caller.not_allowed",
+            "{caller}: {refused}"
+        );
+    }
+    let without: Vec<&str> = CAPS_1_2
+        .iter()
+        .copied()
+        .filter(|c| *c != "desktop.v1")
+        .collect();
+    let mut old = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], &without);
+    let refused = old.call("app/desktop.set", change.clone());
+    assert_eq!(
+        refused["result"]["error"]["code"], "caller.not_allowed",
+        "an app without desktop.v1: {refused}"
+    );
+    let mut app = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], CAPS_1_2);
+    let set = app.call("app/desktop.set", change);
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+    assert_eq!(set["result"]["keep_awake_gpu"], false, "{set}");
+    assert_eq!(set["result"]["keep_awake_available"], true, "{set}");
+    assert_eq!(
+        set["result"]["notification_path"]["toasts"], "ready",
+        "{set}"
+    );
+    assert_eq!(set["result"]["notifications"]["job_failed"], true, "{set}");
+    for bad in [
+        json!({"keep_awake_available": false}),
+        json!({"notifications": {"job_progress": true}}),
+        json!({"notifications": {"later_category": false}}),
+        json!({"fullscreen_autopause": "yes"}),
+    ] {
+        let refused = app.call("app/desktop.set", bad.clone());
+        assert_eq!(refused["error"]["code"], -32602, "{bad}: {refused}");
+    }
+    // Nothing of the refused calls was written.
+    let text = std::fs::read_to_string(env.env.suite_toml()).unwrap_or_default();
+    assert!(!text.contains("job_progress"), "{text}");
+    assert!(!text.contains("later_category"), "{text}");
+}
+
+/// `app/desktop.set` edits `suite.toml` with targeted edits (APP-146, CORE-007): comments and
+/// every other key stay; `desktop.get` reads the new values, and the `desktop` topic gets
+/// `{kind: "settings", settings}`.
+#[test] // spec: APP-146, CORE-007
+fn desktop_set_edits_suite_toml_keeping_comments() {
+    let env = TestEnv::new();
+    let file = env.env.suite_toml();
+    let before = std::fs::read_to_string(&file).unwrap_or_default();
+    let mine = "# my desktop settings, by hand\n[notifications]\n# loud, please\n\
+                job_finished = true # on\njob_progress = true\n\n[jobs]\n\
+                preempt_agent_batches = false\n";
+    lil_testkit::files::write_file(&file, format!("{before}\n{mine}").as_bytes());
+    let _core = app_core(&env);
+    let mut cli = connect(&env, json!({}));
+    let got = cli.tool("desktop.get", json!({}), None);
+    assert_eq!(got["status"], "ok", "{got}");
+    assert_eq!(
+        got["structured"]["notifications"]["job_finished"], true,
+        "{got}"
+    );
+    assert!(
+        got["structured"]["notifications"]
+            .get("job_progress")
+            .is_none(),
+        "an old job_progress is kept and ignored: {got}"
+    );
+
+    let mut app = lil_testkit::TestApp::start_with_capabilities(&env, None, &["desktop"], CAPS_1_2);
+    let set = app.call(
+        "app/desktop.set",
+        json!({"notifications": {"job_finished": false}, "fullscreen_autopause": true,
+               "quiet_while_fullscreen": false}),
+    );
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+    let deadline = Instant::now() + DEADLINE;
+    let event = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let event = app
+            .next_event(left)
+            .unwrap_or_else(|| panic!("no desktop settings event within {DEADLINE:?}"));
+        if event["topic"] == "desktop" && event["data"]["kind"] == "settings" {
+            break event;
+        }
+    };
+    assert_eq!(
+        event["data"]["settings"]["fullscreen_autopause"], true,
+        "{event}"
+    );
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    for kept in [
+        "# my desktop settings, by hand\n",
+        "# loud, please\n",
+        "job_finished = false # on\n",
+        "job_progress = true\n",
+        "preempt_agent_batches = false\n",
+        "quiet_while_fullscreen = false\n",
+        "fullscreen_autopause = true\n",
+    ] {
+        assert!(text.contains(kept), "{kept:?} is missing:\n{text}");
+    }
+    assert!(text.starts_with(&before), "{text}");
+    let got = cli.tool("desktop.get", json!({"fresh": true}), None);
+    let s = &got["structured"];
+    assert_eq!(s["notifications"]["job_finished"], false, "{got}");
+    assert_eq!(s["fullscreen_autopause"], true, "{got}");
+    assert_eq!(s["quiet_while_fullscreen"], false, "{got}");
+    assert_eq!(s["keep_awake_gpu"], true, "{got}");
+}
 
 /// `app/queue.pause` and `app/queue.resume` (CORE-160, APP-040; Appendix D): a verified app
 /// only, and only with `queue.v1` in the shared capabilities; then a `QueueState`.

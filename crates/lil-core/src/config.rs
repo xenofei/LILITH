@@ -35,6 +35,8 @@ pub const ENV_TEST_CONFIRM_LIFETIME_SECS: &str = "LIL_TEST_CONFIRM_LIFETIME_SECS
 pub const ENV_TEST_FAKE_SOCKETS: &str = "LIL_TEST_FAKE_SOCKETS";
 /// Test channels only: the stall rule's time in seconds instead of 30 (ARCH-072; plan 4a).
 pub const ENV_TEST_STALL_SECS: &str = "LIL_TEST_STALL_SECS";
+/// Test channels only: the desktop poll's interval in milliseconds instead of 2 s (P4a-R6).
+pub const ENV_TEST_DESKTOP_POLL_MS: &str = "LIL_TEST_DESKTOP_POLL_MS";
 
 /// The plan-3 test knobs, all `None` off a test channel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +49,8 @@ struct TestKnobs {
     fake_sockets: Option<PathBuf>,
     /// `LIL_TEST_STALL_SECS`; a value that does not parse is `None`.
     stall_after: Option<Duration>,
+    /// `LIL_TEST_DESKTOP_POLL_MS`; a value that does not parse, or 0, is `None`.
+    desktop_poll: Option<Duration>,
 }
 
 fn test_knobs(channel: &Channel, var: &dyn Fn(&str) -> Option<String>) -> TestKnobs {
@@ -63,6 +67,10 @@ fn test_knobs(channel: &Channel, var: &dyn Fn(&str) -> Option<String>) -> TestKn
         stall_after: var(ENV_TEST_STALL_SECS)
             .and_then(|v| v.trim().parse().ok())
             .map(Duration::from_secs),
+        desktop_poll: var(ENV_TEST_DESKTOP_POLL_MS)
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis),
     }
 }
 
@@ -150,6 +158,9 @@ pub struct CoreConfig {
     pub confirm_lifetime: Duration,
     /// The stall rule's time (ARCH-072): 30 s, or `LIL_TEST_STALL_SECS` on a test channel.
     pub stall_after: Duration,
+    /// How often the desktop's fullscreen state is polled instead of every 2 s (P4a-R6):
+    /// `LIL_TEST_DESKTOP_POLL_MS` on a test channel, else `None`.
+    pub desktop_poll: Option<Duration>,
     /// Test channels only: the fake hardware script `LIL_TEST_FAKE_HW` names, read instead of
     /// NVML, PDH and `sysinfo`.
     pub fake_hw: Option<PathBuf>,
@@ -227,6 +238,7 @@ impl CoreConfig {
             stall_after: knobs
                 .stall_after
                 .unwrap_or(crate::jobs::runner::STALL_AFTER),
+            desktop_poll: knobs.desktop_poll,
             fake_hw: knobs.fake_hw,
             sockets,
             test_tools,
@@ -319,9 +331,9 @@ mod tests {
         assert_eq!(codes, [3, 2, 5, 6, 7]);
     }
 
-    /// `LIL_TEST_FAKE_HW`, `LIL_TEST_CONFIRM_LIFETIME_SECS`, `LIL_TEST_FAKE_SOCKETS` and
-    /// `LIL_TEST_STALL_SECS` count on test channels only; a lifetime that does not parse is
-    /// ignored.
+    /// `LIL_TEST_FAKE_HW`, `LIL_TEST_CONFIRM_LIFETIME_SECS`, `LIL_TEST_FAKE_SOCKETS`,
+    /// `LIL_TEST_STALL_SECS` and `LIL_TEST_DESKTOP_POLL_MS` count on test channels only; a
+    /// lifetime that does not parse is ignored.
     #[test] // spec: QA-066, CORE-115
     fn test_knobs_are_read_on_test_channels_only() {
         let set = |name: &str| match name {
@@ -329,6 +341,7 @@ mod tests {
             ENV_TEST_CONFIRM_LIFETIME_SECS => Some("1".to_string()),
             ENV_TEST_FAKE_SOCKETS => Some(r"C:\t\fake-sockets.json".to_string()),
             ENV_TEST_STALL_SECS => Some("2".to_string()),
+            ENV_TEST_DESKTOP_POLL_MS => Some("50".to_string()),
             _ => None,
         };
         let test = Channel::Test("ab12cd34".into());
@@ -339,6 +352,7 @@ mod tests {
                 confirm_lifetime: Some(Duration::from_secs(1)),
                 fake_sockets: Some(PathBuf::from(r"C:\t\fake-sockets.json")),
                 stall_after: Some(Duration::from_secs(2)),
+                desktop_poll: Some(Duration::from_millis(50)),
             }
         );
         let unparsable =
