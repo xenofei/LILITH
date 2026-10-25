@@ -6,31 +6,6 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 10
-    # APP-146, APP-022
-    { name = "lil-spec-tests::notifications::toasts_follow_categories_and_defaults", rule = "APP-146", file = "tests/notifications.rs" },
-    # APP-146
-    { name = "lil-spec-tests::notifications::no_toast_while_a_suite_window_is_in_front", rule = "APP-146", file = "tests/notifications.rs" },
-    # APP-146
-    { name = "lil-spec-tests::notifications::quiet_while_fullscreen_posts_silently_and_never_drops", rule = "APP-146", file = "tests/notifications.rs" },
-    # APP-146
-    { name = "lil-spec-tests::notifications::no_progress_toast_for_a_long_job", rule = "APP-146", file = "tests/notifications.rs" },
-    # ARCH-055, CORE-113, APP-051, QA-016
-    { name = "lil-spec-tests::notifications::with_the_notification_path_a_call_waits_without_an_app", rule = "ARCH-055", file = "tests/notifications.rs" },
-    # APP-022, ARCH-055
-    { name = "lil-spec-tests::notifications::a_toast_deny_answers_once_with_its_token", rule = "APP-022", file = "tests/notifications.rs" },
-    # APP-146, ARCH-055
-    { name = "lil-spec-tests::notifications::turning_off_confirmation_toasts_makes_agent_calls_unavailable", rule = "APP-146", file = "tests/notifications.rs" },
-    # APP-022, ARCH-055, QA-016
-    { name = "lil-spec-tests::notifications::toasts_off_in_windows_make_the_path_unreachable", rule = "APP-022", file = "tests/notifications.rs" },
-    # QA-016, ARCH-055
-    { name = "lil-spec-tests::notifications::non_interactive_callers_never_wait", rule = "QA-016", file = "tests/notifications.rs" },
-    # APP-022
-    { name = "lil-spec-tests::notifications::toast_text_is_escaped_and_normalised", rule = "APP-022", file = "tests/notifications.rs" },
-    # ARCH-103, APP-146
-    { name = "lil-spec-tests::notifications::notify_claude_code_posts_agent_activity_and_drops_duplicates", rule = "ARCH-103", file = "tests/notifications.rs" },
-    # APP-065, ARCH-005
-    { name = "lil-spec-tests::notifications::agent_open_posts_agent_activity", rule = "APP-065", file = "tests/notifications.rs" },
     # Task 11
     # APP-020, APP-063
     { name = "lil-spec-tests::interchange_4a::open_in_launch_args_carry_base64url_targets", rule = "APP-020", file = "tests/interchange_4a.rs" },
