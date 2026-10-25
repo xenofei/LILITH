@@ -31,7 +31,9 @@
 //! has been in front for [`BUTTONS_LIVE_AFTER`] of real time ([`LiveClock`]), and stop when it
 //! loses the front, or it or the accept button moves or is resized. The text and the labels
 //! refuse changes from other programs ([`text_change`]). "Deny" accepts any source: refusing is
-//! always safe.
+//! always safe. A click on the accept button that a gate refuses is never silent (Task 28b): a
+//! status line beside the buttons says which gate ([`Refusal::message`]) and the window stays
+//! open; while the buttons are grey it says what they wait for ([`StatusLine`]).
 //!
 //! **Placement (P4a-R38).** The owner's rule is that the prompt comes to the front of every
 //! application, a fullscreen one included. Spike 11 showed that an unowned create prompt and a
@@ -48,14 +50,15 @@
 //! signatures: the KEK route.
 //!
 //! **Secrets.** The signature and the KEK live in [`Zeroizing`] buffers and are never logged;
-//! DPAPI's plaintext comes back in one. Nothing here prints.
+//! DPAPI's plaintext comes back in one. The only output is one stderr line per refused accept
+//! click, naming the gate ([`Refusal::name`]) and nothing about the input.
 //!
 //! **Prompts.** [`kek_enroll`], [`kek_derive`], their `*_for_window` forms and the `start_*`
 //! calls raise a Windows Hello prompt. [`supported`], [`tpm_present`], [`credential_exists`],
 //! [`kek_remove`], [`window_bindings_available`] and the DPAPI calls never do.
 
 use std::ffi::c_void;
-use std::io;
+use std::io::{self, Write as _};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -105,11 +108,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HMENU, InSendMessage, KillTimer, MSG, PostMessageW, PostQuitMessage,
     RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE,
-    WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PASTE, WM_SETFONT, WM_SETTEXT,
-    WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_DISABLED,
-    WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_PASTE, WM_SETFONT, WM_SETTEXT, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WNDPROC,
+    WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, Interface, w};
 use windows_future::IAsyncOperation;
@@ -1332,6 +1336,83 @@ pub fn choice_from_command(c: ButtonCommand) -> Option<Choice> {
     (c.from_accept && c.armed && !c.sent_by_another_thread && c.enabled).then_some(Choice::Accepted)
 }
 
+/// Why a click on the accept button didn't count (Task 28b), one value per gate: the window
+/// says which in its status line ([`Refusal::message`]) and logs its name, so a refusal is
+/// never silent. It carries nothing about the input itself: no point, no timing, no device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The click was the one that brought the window to the front, so the buttons were grey.
+    NotInFront,
+    /// The window hadn't been in front for [`BUTTONS_LIVE_AFTER`] yet: the buttons were grey.
+    NotLiveYet,
+    /// Not a real pointer click handled on the button's own thread: injected or system input,
+    /// a key, a posted or sent message, `BM_CLICK` or UI Automation ([`arms_accept`]).
+    NotPointer,
+    /// No real press on the button came before the release ([`PressTracker`]).
+    NoRealPress,
+    /// A mouse or touchpad press before the pointer had rested on the button for
+    /// [`HOVER_BEFORE_PRESS`] ([`PressTracker`]).
+    NoRest,
+}
+
+impl Refusal {
+    /// A stable name, for the log.
+    pub fn name(self) -> &'static str {
+        match self {
+            Refusal::NotInFront => "not_in_front",
+            Refusal::NotLiveYet => "not_live_yet",
+            Refusal::NotPointer => "not_pointer",
+            Refusal::NoRealPress => "no_real_press",
+            Refusal::NoRest => "no_rest",
+        }
+    }
+
+    /// The status line for it (pure): which gate refused and what to do next, nothing else.
+    /// `accept` is the button's own label ("Merge", "Approve").
+    pub fn message(self, accept: &str) -> String {
+        match self {
+            Refusal::NotInFront => format!(
+                "That click brought this window to the front. Wait a moment for the buttons to turn on, then click {accept}."
+            ),
+            Refusal::NotLiveYet => {
+                "Wait a moment: the buttons turn on a second after this window comes to the front."
+                    .to_owned()
+            }
+            Refusal::NotPointer => format!(
+                "That click didn't come from your mouse or touchpad, so it didn't count. Click {accept} with the pointer."
+            ),
+            Refusal::NoRealPress => format!(
+                "Press and release on {accept} itself: a press that started somewhere else doesn't count."
+            ),
+            Refusal::NoRest => format!("Rest the pointer on {accept} for a moment, then click."),
+        }
+    }
+}
+
+/// The gate that refused a `WM_COMMAND` click of the accept button, if it was one and was
+/// refused (pure). Grey buttons come first; then what the button's subclass found for the
+/// release that produced the click (`release`, [`release_refusal`]); with no hardware release
+/// behind it (a key, a posted or sent message, `BM_CLICK`, UI Automation), the pointer.
+pub fn click_refusal(c: ButtonCommand, release: Option<Refusal>) -> Option<Refusal> {
+    if !c.clicked || !c.from_accept || choice_from_command(c).is_some() {
+        return None;
+    }
+    if !c.enabled {
+        return Some(Refusal::NotLiveYet);
+    }
+    Some(release.unwrap_or(Refusal::NotPointer))
+}
+
+/// A press on the grey accept button reaches the window itself, not the button (pure):
+/// `brought_forward` when that press is what brought the window to the front.
+pub fn grey_click_refusal(brought_forward: bool) -> Refusal {
+    if brought_forward {
+        Refusal::NotInFront
+    } else {
+        Refusal::NotLiveYet
+    }
+}
+
 /// How long the window must be in front before its buttons work (re-review m1): a click meant
 /// for whatever was in front a moment ago doesn't count. Moving or resizing the window starts
 /// it again (re-review 2 n2), so a program can't slide Merge under the cursor.
@@ -1375,6 +1456,71 @@ impl LiveClock {
     }
 }
 
+/// What the buttons are doing, for the status line (Task 28b).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonsState {
+    /// Grey: the window isn't in front.
+    NotInFront,
+    /// Grey: in front, but not yet for [`BUTTONS_LIVE_AFTER`].
+    #[default]
+    TurningOn,
+    /// Live.
+    Live,
+}
+
+/// The buttons' state from whether the window is in front and whether [`LiveClock`] says live
+/// (pure).
+pub fn buttons_state(in_front: bool, live: bool) -> ButtonsState {
+    match (in_front, live) {
+        (_, true) => ButtonsState::Live,
+        (true, false) => ButtonsState::TurningOn,
+        (false, false) => ButtonsState::NotInFront,
+    }
+}
+
+/// The asking window's status line (Task 28b; pure): the last refused click's message
+/// ([`Refusal::message`]) until the buttons change state, otherwise what grey buttons wait for.
+/// Live buttons say nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatusLine {
+    state: ButtonsState,
+    refusal: Option<Refusal>,
+}
+
+impl StatusLine {
+    /// The live timer's sample; whether the text may have changed.
+    pub fn tick(&mut self, state: ButtonsState) -> bool {
+        if state == self.state {
+            return false;
+        }
+        *self = Self {
+            state,
+            refusal: None,
+        };
+        true
+    }
+
+    /// A click was refused while the buttons were in `state`.
+    pub fn refuse(&mut self, refusal: Refusal, state: ButtonsState) {
+        *self = Self {
+            state,
+            refusal: Some(refusal),
+        };
+    }
+
+    /// The text, for the accept button labelled `accept`.
+    pub fn text(&self, accept: &str) -> String {
+        if let Some(refusal) = self.refusal {
+            return refusal.message(accept);
+        }
+        match self.state {
+            ButtonsState::NotInFront => "Bring this window to the front first (click it, or its taskbar button). The buttons turn on a second later.".to_owned(),
+            ButtonsState::TurningOn => "The buttons turn on in a moment.".to_owned(),
+            ButtonsState::Live => String::new(),
+        }
+    }
+}
+
 /// How long the cursor must rest on the accept button, by real pointer moves, before a mouse
 /// or touchpad press on it counts (re-review 3 m3): a program that warps the cursor onto Merge
 /// (`SetCursorPos`) doesn't make the owner's next click a click on Merge.
@@ -1388,8 +1534,9 @@ pub const HOVER_BEFORE_PRESS: Duration = Duration::from_millis(300);
 pub struct PressTracker {
     /// When real pointer moves first had the cursor on the button, since it last left.
     hover_since: Option<Instant>,
-    /// A real press on the button is down.
-    pressed: bool,
+    /// The press on the button that is down: whether it counts, or which gate refused it
+    /// (Task 28b). `None`: no press since the last release or cancel.
+    press: Option<Result<(), Refusal>>,
 }
 
 impl PressTracker {
@@ -1419,12 +1566,18 @@ impl PressTracker {
                 .and_then(|since| now.checked_duration_since(since))
                 .is_some_and(|d| d >= HOVER_BEFORE_PRESS),
         };
-        self.pressed = real && rested;
+        self.press = Some(match (real, rested) {
+            (false, _) => Err(Refusal::NoRealPress),
+            (true, false) => Err(Refusal::NoRest),
+            (true, true) => Ok(()),
+        });
     }
 
-    /// A `WM_LBUTTONUP` to the button: whether a real press preceded it. The press is used up.
-    pub fn on_release(&mut self) -> bool {
-        std::mem::take(&mut self.pressed)
+    /// A `WM_LBUTTONUP` to the button: `Ok` when a real press preceded it, otherwise the gate
+    /// that refused the press ([`Refusal::NoRealPress`] when there was none). The press is used
+    /// up.
+    pub fn on_release(&mut self) -> Result<(), Refusal> {
+        self.press.take().unwrap_or(Err(Refusal::NoRealPress))
     }
 
     /// The button lost the capture, a mode was cancelled, or the delay restarted: the press and
@@ -1432,6 +1585,26 @@ impl PressTracker {
     pub fn cancel(&mut self) {
         *self = Self::default();
     }
+}
+
+/// The gate that refused a release on the accept button, if it didn't arm it (Task 28b; pure):
+/// the pointer first (hardware, a pointer device, on the button's own thread), then the press
+/// (`press`, [`PressTracker::on_release`]). A release outside the button, or another message,
+/// clicks nothing, so there is nothing to say.
+pub fn release_refusal(input: ButtonInput, press: Result<(), Refusal>) -> Option<Refusal> {
+    if arms_accept(input) || input.msg != WM_LBUTTONUP || !input.over_button {
+        return None;
+    }
+    let pointer = input.origin == InputOrigin::Hardware
+        && matches!(
+            input.device,
+            InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
+        )
+        && !input.sent_by_another_thread;
+    if !pointer {
+        return Some(Refusal::NotPointer);
+    }
+    Some(press.err().unwrap_or(Refusal::NoRealPress))
 }
 
 /// Whether a message to the read-only text or a button would change what it shows (re-review 3
@@ -1446,6 +1619,11 @@ pub fn text_change(msg: u32) -> bool {
 const ID_ACCEPT: usize = 1;
 /// "Deny"'s control id.
 const ID_DENY: usize = 2;
+/// The status line's control id (Task 28b).
+const ID_STATUS: usize = 3;
+/// `SS_NOPREFIX` (winuser.h; `windows` 0.62.2 has it only behind `Win32_System_SystemServices`):
+/// an `&` in the status line shows as it is. Left-aligned, wrapped text is `SS_LEFT`, which is 0.
+const SS_NOPREFIX: u32 = 0x80;
 /// The timer that makes the buttons live.
 const TIMER_LIVE: usize = 1;
 
@@ -1467,8 +1645,24 @@ thread_local! {
     };
     /// The accept button's press and hover.
     static PRESS: std::cell::Cell<PressTracker> = const {
-        std::cell::Cell::new(PressTracker { hover_since: None, pressed: false })
+        std::cell::Cell::new(PressTracker { hover_since: None, press: None })
     };
+    /// Why the release being handled by the accept button's own procedure didn't arm it, for
+    /// the `WM_COMMAND` that procedure sends (Task 28b); set and cleared around that one call.
+    static RELEASE_REFUSAL: std::cell::Cell<Option<Refusal>> = const { std::cell::Cell::new(None) };
+    /// The next left press is the one that brought the window to the front (`WM_MOUSEACTIVATE`).
+    /// Each live tick clears it, so it can't outlast that press.
+    static CLICK_ACTIVATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The asking window's status line (Task 28b).
+    static STATUS: std::cell::Cell<StatusLine> = const {
+        std::cell::Cell::new(StatusLine { state: ButtonsState::TurningOn, refusal: None })
+    };
+    /// The accept button's label, for the status line.
+    static ACCEPT_LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The STATIC class's original window procedure, kept when the status line is subclassed.
+    static STATUS_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// lil itself is setting the status line's text (the subclass refuses everyone else).
+    static OWN_STATUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The asking window's last known place and size, to tell a move or resize.
     static PLACE: std::cell::Cell<(i32, i32, i32, i32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
     /// The accept button's last known place and size in the window (re-review 3 m2).
@@ -1559,10 +1753,17 @@ fn current_input_source() -> (InputOrigin, InputDevice) {
     (origin, device)
 }
 
+/// A mouse message's point (`lParam`), in the receiving window's client coordinates.
+fn message_point(lp: LPARAM) -> (i32, i32) {
+    (
+        i32::from((lp.0 & 0xffff) as u16 as i16),
+        i32::from(((lp.0 >> 16) & 0xffff) as u16 as i16),
+    )
+}
+
 /// Whether a mouse message's point (`lParam`, client coordinates) is inside `button`.
 fn point_inside(button: HWND, lp: LPARAM) -> bool {
-    let x = i32::from((lp.0 & 0xffff) as u16 as i16);
-    let y = i32::from(((lp.0 >> 16) & 0xffff) as u16 as i16);
+    let (x, y) = message_point(lp);
     let mut rect = windows::Win32::Foundation::RECT::default();
     // SAFETY: a query into a local structure, for this button.
     unsafe { GetClientRect(button, &mut rect) }.is_ok()
@@ -1640,13 +1841,14 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_LBUTTONUP => {
                 let (origin, device) = current_input_source();
+                let press = with_press(PressTracker::on_release);
                 let input = ButtonInput {
                     msg,
                     over_button: point_inside(hwnd, lp),
                     origin,
                     device,
                     sent_by_another_thread: InSendMessage().as_bool(),
-                    pressed_by_hardware: with_press(PressTracker::on_release),
+                    pressed_by_hardware: press.is_ok(),
                 };
                 if arms_accept(input) {
                     ARMED.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
@@ -1654,6 +1856,11 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     ARMED.store(0, std::sync::atomic::Ordering::SeqCst);
                     return result;
                 }
+                // Not armed: the click this release reports (if any) says why (Task 28b).
+                RELEASE_REFUSAL.with(|r| r.set(release_refusal(input, press)));
+                let result = CallWindowProcW(Some(original), hwnd, msg, wp, lp);
+                RELEASE_REFUSAL.with(|r| r.set(None));
+                return result;
             }
             _ => {}
         }
@@ -1683,6 +1890,67 @@ extern "system" fn shown_text_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             None => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
+}
+
+/// The status line's subclass: only lil sets its text (Task 28b), so another program can't
+/// write its own instructions into it.
+extern "system" fn status_line_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // SAFETY: this control's own messages, passed on to its class's procedure.
+    unsafe {
+        match original_proc(&STATUS_PROC) {
+            _ if text_change(msg) && !OWN_STATUS.with(|o| o.get()) => LRESULT(0),
+            Some(original) => CallWindowProcW(Some(original), hwnd, msg, wp, lp),
+            None => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+/// Sets the status line's text.
+fn set_status_text(window: HWND, text: &str) {
+    // SAFETY: the window's own child control, on its own thread.
+    unsafe {
+        if let Ok(status) = GetDlgItem(Some(window), ID_STATUS as i32) {
+            OWN_STATUS.with(|o| o.set(true));
+            let _ = SetWindowTextW(status, &HSTRING::from(text));
+            OWN_STATUS.with(|o| o.set(false));
+        }
+    }
+}
+
+/// Shows [`STATUS`]'s text in the status line.
+fn show_status(window: HWND) {
+    let text = ACCEPT_LABEL.with(|l| STATUS.with(|s| s.get().text(&l.borrow())));
+    set_status_text(window, &text);
+}
+
+/// The buttons' state now.
+fn current_buttons_state(window: HWND) -> ButtonsState {
+    // SAFETY: a plain query.
+    let in_front = unsafe { GetForegroundWindow() } == window;
+    buttons_state(in_front, LIVE.with(|c| c.get().is_live(Instant::now())))
+}
+
+/// A click on the accept button didn't count: the status line says which gate refused it, and
+/// one line on stderr names the gate (Task 28b), nothing about the input. Once a choice is
+/// made, nothing is said.
+fn refuse_click(window: HWND, refusal: Refusal) {
+    if choice_of(window.0 as isize).is_some() {
+        return;
+    }
+    let state = current_buttons_state(window);
+    STATUS.with(|s| {
+        let mut status = s.get();
+        status.refuse(refusal, state);
+        s.set(status);
+    });
+    show_status(window);
+    let label = ACCEPT_LABEL.with(|l| l.borrow().clone());
+    // Never panic in a window procedure: a closed stderr just loses the line.
+    let _ = writeln!(
+        io::stderr(),
+        "lil: a click on {label} didn't count: {}",
+        refusal.name()
+    );
 }
 
 fn set_buttons_enabled(window: HWND, enabled: bool) {
@@ -1854,6 +2122,28 @@ fn window_thread(
                     }
                 }
             }
+            // The status line, left of the buttons: what grey buttons wait for, and why a click
+            // didn't count (Task 28b). Subclassed so only lil sets its text.
+            ACCEPT_LABEL.with(|l| *l.borrow_mut() = accept.to_string());
+            let first = STATUS.with(|s| s.get().text(&accept.to_string()));
+            if let Ok(status) = CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                &HSTRING::from(first),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | SS_NOPREFIX),
+                8,
+                client.bottom - BUTTON_ROW + 4,
+                (client.right - 2 * (w + 8) - 16).max(0),
+                BUTTON_ROW - 8,
+                Some(hwnd),
+                Some(HMENU(ID_STATUS as *mut c_void)),
+                None,
+                None,
+            ) {
+                set_font(status);
+                STATUS_PROC.with(|p| p.set(GetWindowLongPtrW(status, GWLP_WNDPROC)));
+                SetWindowLongPtrW(status, GWLP_WNDPROC, status_line_proc as *const () as isize);
+            }
             // The live timer runs until a choice is made (re-review 2 n3).
             SetTimer(Some(hwnd), TIMER_LIVE, LIVE_TICK.as_millis() as u32, None);
         }
@@ -1892,8 +2182,36 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     // One choice only: both buttons go grey.
                     let _ = KillTimer(Some(hwnd), TIMER_LIVE);
                     set_buttons_enabled(hwnd, false);
+                    set_status_text(hwnd, "");
+                } else if let Some(refusal) =
+                    click_refusal(command, RELEASE_REFUSAL.with(|r| r.get()))
+                {
+                    refuse_click(hwnd, refusal);
                 }
                 LRESULT(0)
+            }
+            WM_MOUSEACTIVATE => {
+                // A click on the window while another is in front (Task 28b).
+                if ((lp.0 >> 16) & 0xffff) as u32 == WM_LBUTTONDOWN {
+                    CLICK_ACTIVATED.with(|c| c.set(true));
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_LBUTTONDOWN => {
+                // A grey button gets no mouse input: a press on it comes here (Task 28b).
+                let brought_forward = CLICK_ACTIVATED.with(|c| c.replace(false));
+                let (x, y) = message_point(lp);
+                let on_grey_accept = GetDlgItem(Some(hwnd), ID_ACCEPT as i32)
+                    .ok()
+                    .filter(|&b| !IsWindowEnabled(b).as_bool())
+                    .and_then(place_in_parent)
+                    .is_some_and(|(left, top, right, bottom)| {
+                        x >= left && x < right && y >= top && y < bottom
+                    });
+                if on_grey_accept {
+                    refuse_click(hwnd, grey_click_refusal(brought_forward));
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_ACTIVATE => {
                 if (wp.0 & 0xffff) as u32 == WA_INACTIVE {
@@ -1919,6 +2237,7 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 if choice_of(hwnd.0 as isize).is_some() {
                     let _ = KillTimer(Some(hwnd), TIMER_LIVE);
                 } else {
+                    CLICK_ACTIVATED.with(|c| c.set(false));
                     let in_front = GetForegroundWindow() == hwnd;
                     let live = LIVE.with(|c| {
                         let mut clock = c.get();
@@ -1927,6 +2246,15 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                         live
                     });
                     set_buttons_enabled(hwnd, live);
+                    let changed = STATUS.with(|s| {
+                        let mut status = s.get();
+                        let changed = status.tick(buttons_state(in_front, live));
+                        s.set(status);
+                        changed
+                    });
+                    if changed {
+                        show_status(hwnd);
+                    }
                 }
                 LRESULT(0)
             }
@@ -2291,16 +2619,16 @@ mod tests {
         p.on_move(true, at(0));
         p.on_move(true, at(hover / 2));
         p.on_press(true, InputDevice::Mouse, at(hover));
-        assert!(p.on_release());
+        assert_eq!(p.on_release(), Ok(()));
         // A release consumes the press: a second release doesn't arm.
-        assert!(!p.on_release());
+        assert_eq!(p.on_release(), Err(Refusal::NoRealPress));
 
         // m1: no press at all (another program posted WM_LBUTTONDOWN, or the press was made
         // elsewhere): the release doesn't arm.
         let mut p = PressTracker::default();
         p.on_move(true, at(0));
         p.on_press(false, InputDevice::Mouse, at(hover * 2));
-        assert!(!p.on_release());
+        assert_eq!(p.on_release(), Err(Refusal::NoRealPress));
         assert!(!arms_accept(ButtonInput {
             pressed_by_hardware: false,
             ..real_release()
@@ -2311,11 +2639,19 @@ mod tests {
         for device in [InputDevice::Mouse, InputDevice::Touchpad] {
             let mut p = PressTracker::default();
             p.on_press(true, device, at(hover * 2));
-            assert!(!p.on_release(), "{device:?} with no hover");
+            assert_eq!(
+                p.on_release(),
+                Err(Refusal::NoRest),
+                "{device:?} with no hover"
+            );
             let mut p = PressTracker::default();
             p.on_move(true, at(0));
             p.on_press(true, device, at(hover - 1));
-            assert!(!p.on_release(), "{device:?} hovered too briefly");
+            assert_eq!(
+                p.on_release(),
+                Err(Refusal::NoRest),
+                "{device:?} hovered too briefly"
+            );
         }
         // A move that isn't a real pointer move, or the cursor leaving, starts the hover again.
         let mut p = PressTracker::default();
@@ -2323,18 +2659,23 @@ mod tests {
         p.on_move(false, at(hover / 2));
         p.on_move(true, at(hover));
         p.on_press(true, InputDevice::Mouse, at(hover + hover / 2));
-        assert!(!p.on_release());
+        assert_eq!(p.on_release(), Err(Refusal::NoRest));
         let mut p = PressTracker::default();
         p.on_move(true, at(0));
         p.on_leave();
         p.on_press(true, InputDevice::Mouse, at(hover * 2));
-        assert!(!p.on_release());
+        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        // A press that isn't real is put down to the press, even after a long hover.
+        let mut p = PressTracker::default();
+        p.on_move(true, at(0));
+        p.on_press(false, InputDevice::Mouse, at(hover * 2));
+        assert_eq!(p.on_release(), Err(Refusal::NoRealPress));
 
         // Touch and pen press where the contact is, not at the cursor: no hover needed.
         for device in [InputDevice::Touch, InputDevice::Pen] {
             let mut p = PressTracker::default();
             p.on_press(true, device, at(0));
-            assert!(p.on_release(), "{device:?}");
+            assert_eq!(p.on_release(), Ok(()), "{device:?}");
         }
 
         // A lost capture, a cancelled mode or a restart of the delay drops the press and the
@@ -2343,9 +2684,232 @@ mod tests {
         p.on_move(true, at(0));
         p.on_press(true, InputDevice::Mouse, at(hover));
         p.cancel();
-        assert!(!p.on_release());
+        assert_eq!(p.on_release(), Err(Refusal::NoRealPress));
         p.on_press(true, InputDevice::Mouse, at(hover * 3));
-        assert!(!p.on_release(), "the hover went with the cancel");
+        assert_eq!(
+            p.on_release(),
+            Err(Refusal::NoRest),
+            "the hover went with the cancel"
+        );
+    }
+
+    /// Task 28b: every gate that can refuse a click on the accept button has its own message
+    /// and its own log name. The message tells the owner what to do next; it depends only on
+    /// the gate and lil's own label, never on the input.
+    #[test] // spec: QA-088
+    fn each_refused_click_says_which_gate_refused_it() {
+        let all = [
+            Refusal::NotInFront,
+            Refusal::NotLiveYet,
+            Refusal::NotPointer,
+            Refusal::NoRealPress,
+            Refusal::NoRest,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            let text = a.message("Merge");
+            assert!(!text.is_empty(), "{a:?}");
+            assert!(
+                a.name()
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{a:?}"
+            );
+            for b in &all[i + 1..] {
+                assert_ne!(text, b.message("Merge"), "{a:?} {b:?}");
+                assert_ne!(a.name(), b.name(), "{a:?} {b:?}");
+            }
+        }
+        assert_eq!(
+            Refusal::NoRest.message("Merge"),
+            "Rest the pointer on Merge for a moment, then click."
+        );
+        assert_eq!(
+            Refusal::NoRest.message("Approve"),
+            "Rest the pointer on Approve for a moment, then click."
+        );
+        assert!(
+            Refusal::NotLiveYet
+                .message("Merge")
+                .starts_with("Wait a moment")
+        );
+        assert!(Refusal::NotInFront.message("Merge").contains("front"));
+        assert!(
+            Refusal::NotPointer
+                .message("Merge")
+                .starts_with("That click didn't come from your mouse or touchpad")
+        );
+        assert!(Refusal::NoRealPress.message("Approve").contains("Approve"));
+    }
+
+    /// Task 28b: a refused release names the first gate it failed: a pointer that isn't real
+    /// hardware first, then the press (a real one, after the rest).
+    #[test] // spec: QA-088
+    fn a_refused_release_names_the_gate_it_failed() {
+        assert_eq!(release_refusal(real_release(), Ok(())), None);
+        let unpressed = ButtonInput {
+            pressed_by_hardware: false,
+            ..real_release()
+        };
+        for why in [Refusal::NoRealPress, Refusal::NoRest] {
+            assert_eq!(release_refusal(unpressed, Err(why)), Some(why), "{why:?}");
+        }
+        for input in [
+            ButtonInput {
+                origin: InputOrigin::Injected,
+                ..real_release()
+            },
+            ButtonInput {
+                origin: InputOrigin::Unavailable,
+                ..real_release()
+            },
+            ButtonInput {
+                device: InputDevice::Keyboard,
+                ..real_release()
+            },
+            ButtonInput {
+                sent_by_another_thread: true,
+                ..real_release()
+            },
+            // Not real and not pressed: the pointer is the first gate.
+            ButtonInput {
+                origin: InputOrigin::Injected,
+                ..unpressed
+            },
+        ] {
+            let press = if input.pressed_by_hardware {
+                Ok(())
+            } else {
+                Err(Refusal::NoRest)
+            };
+            assert_eq!(
+                release_refusal(input, press),
+                Some(Refusal::NotPointer),
+                "{input:?}"
+            );
+        }
+        // Released outside the button, or not a release: no click follows, nothing to say.
+        let outside = ButtonInput {
+            over_button: false,
+            ..unpressed
+        };
+        assert_eq!(release_refusal(outside, Err(Refusal::NoRest)), None);
+        let press = ButtonInput {
+            msg: WM_LBUTTONDOWN,
+            ..real_release()
+        };
+        assert_eq!(release_refusal(press, Ok(())), None);
+    }
+
+    /// Task 28b: a click on the accept button that doesn't count is put down to one gate: grey
+    /// buttons first, then what the release found, and with no hardware release behind it (a
+    /// key, a posted or sent message, `BM_CLICK`, UI Automation), the pointer.
+    #[test] // spec: QA-088
+    fn a_refused_click_is_put_down_to_the_first_gate_it_failed() {
+        assert_eq!(click_refusal(real_click(), None), None);
+        let unarmed = ButtonCommand {
+            armed: false,
+            ..real_click()
+        };
+        // Grey: whatever the release found.
+        for release in [None, Some(Refusal::NoRest), Some(Refusal::NotPointer)] {
+            let grey = ButtonCommand {
+                enabled: false,
+                ..unarmed
+            };
+            assert_eq!(
+                click_refusal(grey, release),
+                Some(Refusal::NotLiveYet),
+                "{release:?}"
+            );
+        }
+        let grey_armed = ButtonCommand {
+            enabled: false,
+            ..real_click()
+        };
+        assert_eq!(click_refusal(grey_armed, None), Some(Refusal::NotLiveYet));
+        // The release's own verdict.
+        for why in [Refusal::NotPointer, Refusal::NoRealPress, Refusal::NoRest] {
+            assert_eq!(click_refusal(unarmed, Some(why)), Some(why), "{why:?}");
+        }
+        // No hardware release behind it, or sent from another thread while armed.
+        assert_eq!(click_refusal(unarmed, None), Some(Refusal::NotPointer));
+        let sent = ButtonCommand {
+            sent_by_another_thread: true,
+            ..real_click()
+        };
+        assert_eq!(click_refusal(sent, None), Some(Refusal::NotPointer));
+        // Not a click of the accept button: nothing to say.
+        let deny = ButtonCommand {
+            from_accept: false,
+            from_deny: true,
+            ..unarmed
+        };
+        assert_eq!(click_refusal(deny, None), None);
+        let other = ButtonCommand {
+            clicked: false,
+            ..unarmed
+        };
+        assert_eq!(click_refusal(other, None), None);
+        let elsewhere = ButtonCommand {
+            from_accept: false,
+            ..unarmed
+        };
+        assert_eq!(click_refusal(elsewhere, None), None);
+
+        // A press on the grey button reaches the window itself: the click that brought the
+        // window to the front, or one before the second was up.
+        assert_eq!(grey_click_refusal(true), Refusal::NotInFront);
+        assert_eq!(grey_click_refusal(false), Refusal::NotLiveYet);
+    }
+
+    /// Task 28b: grey buttons say what they wait for; a refused click's message stays until the
+    /// buttons change (they turn on, or the window loses the front), and live buttons say
+    /// nothing.
+    #[test] // spec: QA-088
+    fn grey_buttons_say_what_they_wait_for_and_a_refusal_shows_until_they_change() {
+        use ButtonsState::{Live, NotInFront, TurningOn};
+        assert_eq!(buttons_state(false, false), NotInFront);
+        assert_eq!(buttons_state(true, false), TurningOn);
+        assert_eq!(buttons_state(true, true), Live);
+
+        let turning_on = "The buttons turn on in a moment.";
+        let mut s = StatusLine::default();
+        assert_eq!(s.text("Merge"), turning_on);
+        // Not in front: say so, once.
+        assert!(s.tick(NotInFront));
+        assert!(
+            s.text("Merge")
+                .starts_with("Bring this window to the front first")
+        );
+        assert!(!s.tick(NotInFront));
+        // In front, still grey.
+        assert!(s.tick(TurningOn));
+        assert_eq!(s.text("Merge"), turning_on);
+        // A click on the grey button: its message stays while they are still grey.
+        s.refuse(Refusal::NotLiveYet, TurningOn);
+        assert_eq!(s.text("Merge"), Refusal::NotLiveYet.message("Merge"));
+        assert!(!s.tick(TurningOn));
+        assert_eq!(s.text("Merge"), Refusal::NotLiveYet.message("Merge"));
+        // Live: the message goes, and nothing is said.
+        assert!(s.tick(Live));
+        assert_eq!(s.text("Merge"), "");
+        // A refusal while live stays while live, and the next one replaces it.
+        s.refuse(Refusal::NoRest, Live);
+        assert!(!s.tick(Live));
+        assert_eq!(s.text("Merge"), Refusal::NoRest.message("Merge"));
+        s.refuse(Refusal::NotPointer, Live);
+        assert_eq!(s.text("Merge"), Refusal::NotPointer.message("Merge"));
+        // Losing the front ends it.
+        assert!(s.tick(NotInFront));
+        assert!(
+            s.text("Merge")
+                .starts_with("Bring this window to the front first")
+        );
+        // The click that brought the window forward is judged once it is in front, so its
+        // message outlives the next tick.
+        s.refuse(Refusal::NotInFront, TurningOn);
+        assert!(!s.tick(TurningOn));
+        assert_eq!(s.text("Approve"), Refusal::NotInFront.message("Approve"));
     }
 
     /// Re-review 3 m2 and m4: other programs can't relabel the buttons or rewrite the text.
