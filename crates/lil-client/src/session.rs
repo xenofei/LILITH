@@ -42,9 +42,15 @@
 //!   connection's agree. [`Session::subscribe`] and [`Session::unsubscribe`] change the
 //!   topics and send the change on the current connection one call at a time (the task's
 //!   catch-up included), so the core ends with what the last call left; a call that comes in
-//!   meanwhile waits its turn, within the same `start_hard_cap` as the call itself. An event
-//!   that was already on its way when its topic was unsubscribed never reaches the app after
-//!   the topic is subscribed again: it belongs to the earlier subscription.
+//!   meanwhile waits its turn, within the same `start_hard_cap` as the call itself.
+//! - **Events of an ended subscription** (a topic unsubscribed and then subscribed again) are
+//!   dropped where the session can tell them: those the connection had received when the
+//!   unsubscribe was answered, those of a subscription the setup ended, and, as every topic's
+//!   seqs only rise within a connection, any event at or below the topic's last seq (what the
+//!   newest subscribe was answered with, or the newest event taken). The core may send an
+//!   event just before it answers the unsubscribe, and that one can still arrive in the short
+//!   moment between a subscribe's edit of the topics and its answer. An app that loads a
+//!   topic's state itself ignores the events at or below the seq it loaded at (APP-033).
 //! - **A switch** ([`Session::set_workspace`]) or a lost connection leaves no current
 //!   connection until the next one is established: the old one is no longer read, so calls
 //!   fail with [`ClientError::NotConnected`] meanwhile and topics are recorded for the next
@@ -277,12 +283,25 @@ impl Session {
         let Some(client) = lock(&self.shared.client).clone() else {
             return Ok(());
         };
-        match by(
-            deadline,
-            client.subscribe_only(added.clone(), BTreeMap::new()),
-        )
-        .await
-        {
+        // Topics the setup's first subscribe may have sent although the app removed them:
+        // their earlier subscription ends here, as it would in the setup's catch-up, which
+        // must not end the subscription made now.
+        let ended: Vec<String> = {
+            let mut history = lock(&self.shared.history);
+            added
+                .iter()
+                .filter(|topic| history.removed.remove(*topic))
+                .cloned()
+                .collect()
+        };
+        let wire = async {
+            if !ended.is_empty() {
+                client.unsubscribe_only(ended.clone()).await?;
+                mark_stale(&self.shared, &client, &ended);
+            }
+            client.subscribe_only(added.clone(), BTreeMap::new()).await
+        };
+        match by(deadline, wire).await {
             Ok(subscribed) => {
                 note_if_current(&self.shared, &client, &subscribed.topics);
                 Ok(())
@@ -307,19 +326,22 @@ impl Session {
     pub async fn unsubscribe(&self, topics: Vec<String>) -> Result<(), ClientError> {
         let deadline = Instant::now() + lock(&self.shared.cfg).start_hard_cap;
         let _turn = self.turn(deadline).await?;
-        let client = lock(&self.shared.client).clone();
-        let removed: Vec<String> = {
+        // The connection is read while the topics are held (in the order of
+        // `note_if_current`), so a setup that starts meanwhile reads the topics after this
+        // edit, or finds the connection here: either way the earlier subscription is ended.
+        let (client, removed) = {
+            let current = lock(&self.shared.client);
             let mut known = lock(&self.shared.topics);
             let removed: Vec<String> = topics
                 .into_iter()
                 .filter(|topic| known.remove(topic).is_some())
                 .collect();
-            if client.is_none() {
+            if current.is_none() {
                 lock(&self.shared.history)
                     .removed
                     .extend(removed.iter().cloned());
             }
-            removed
+            (current.clone(), removed)
         };
         if removed.is_empty() {
             return Ok(());
@@ -763,8 +785,10 @@ fn mark_stale(shared: &Shared, client: &Arc<Client>, topics: &[String]) {
 }
 
 /// Records `event`, the `position`th of its connection's stream, as its topic's last seq;
-/// `false` for a topic no longer subscribed (one still on its way after an unsubscribe), and
-/// for an event of a subscription that has ended while the topic is subscribed again.
+/// `false` for a topic no longer subscribed (one still on its way after an unsubscribe), for
+/// an event of a subscription that has ended while the topic is subscribed again, and for an
+/// `event` at or below the topic's last seq: seqs only rise within a connection, so it is from
+/// an earlier subscription or a duplicate (a snapshot or resync request is kept).
 fn took(shared: &Shared, event: &EventParams, position: u64) -> bool {
     let ended = lock(&shared.history)
         .stale
@@ -775,6 +799,9 @@ fn took(shared: &Shared, event: &EventParams, position: u64) -> bool {
     }
     match lock(&shared.topics).get_mut(&event.topic) {
         Some(last) => {
+            if event.kind == EventKind::Event && last.is_some_and(|seq| event.seq <= seq) {
+                return false;
+            }
             *last = Some(event.seq);
             true
         }
@@ -1766,6 +1793,97 @@ mod tests {
             assert_eq!(session.last_seq("test:x"), Some(7));
             session.close().await;
             drop((old, new));
+        });
+    }
+
+    /// A subscribe that gets its turn between the new connection becoming current and the
+    /// setup's catch-up sends the topic on that connection itself, and has to end the earlier
+    /// subscription (removed while the first subscribe was under way) on the way: the catch-up
+    /// then finds nothing to do, and does not end the app's new subscription, whose events
+    /// would be lost without a trace.
+    #[test] // spec: APP-035, APP-033, ARCH-032
+    fn a_subscribe_between_the_connection_and_the_catch_up_keeps_its_events() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let mut events = session.events();
+            let mut state = session.state();
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            fake.subscribed("test:r", 5).await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            drop(fake);
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            let first = fake.request("lil/subscribe").await;
+            let topic = || vec!["test:r".to_string()];
+            session.unsubscribe(topic()).await.expect("unsubscribe");
+            // A topic call in flight, whose turn the subscribe and then the catch-up wait for.
+            let holder = session.shared.ops.lock().await;
+            let sub = session.subscribe(topic());
+            let driver = async {
+                fake.reply_subscribed(&first, &[("test:r", 5)]).await;
+                // Current now, with the catch-up queued behind the subscribe.
+                while lock(&session.shared.client).is_none() {
+                    tokio::task::yield_now().await;
+                }
+                drop(holder);
+                let off = tokio::time::timeout(PROMPT, fake.request("lil/unsubscribe"))
+                    .await
+                    .expect("the earlier subscription was not ended first");
+                fake.reply_unsubscribed(&off).await;
+                let on = fake.request("lil/subscribe").await;
+                assert_eq!(on["params"], json!({"topics": ["test:r"], "since_seq": {}}));
+                fake.reply_subscribed(&on, &[("test:r", 5)]).await;
+                fake.event("test:r", 6).await;
+                fake
+            };
+            let (subscribed, mut fake) = tokio::join!(sub, driver);
+            subscribed.expect("subscribe");
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+            assert_eq!(next(&mut events).await, ("test:r".to_string(), 6));
+            assert!(
+                fake.quiet_for(Duration::from_millis(300)).await,
+                "the catch-up ended the new subscription"
+            );
+            session.close().await;
+            drop(fake);
+        });
+    }
+
+    /// Within one connection a topic's event seqs only rise, so once the topic has a last seq
+    /// (the seq a subscribe was answered with, or the newest event taken), an event at or
+    /// below it is from an earlier subscription or a duplicate, and is dropped. A snapshot or
+    /// a resync request is not an event of that kind and is kept.
+    #[test] // spec: APP-035, ARCH-032
+    fn an_event_at_or_below_the_last_seq_is_dropped() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        current_thread().block_on(async {
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let took_kind = |kind: EventKind, seq: u64, position: u64| {
+                let event = EventParams {
+                    topic: "test:r".to_string(),
+                    seq,
+                    kind,
+                    data: Value::Null,
+                };
+                took(&session.shared, &event, position)
+            };
+            // No last seq yet: nothing to compare with.
+            assert!(took_kind(EventKind::Event, 3, 1));
+            assert_eq!(session.last_seq("test:r"), Some(3));
+            assert!(!took_kind(EventKind::Event, 3, 2), "a duplicate");
+            assert!(!took_kind(EventKind::Event, 2, 3), "an older event");
+            assert_eq!(session.last_seq("test:r"), Some(3));
+            assert!(took_kind(EventKind::Snapshot, 3, 4));
+            assert!(took_kind(EventKind::ResyncRequired, 3, 5));
+            assert!(took_kind(EventKind::Event, 4, 6));
+            assert_eq!(session.last_seq("test:r"), Some(4));
+            session.close().await;
         });
     }
 }
