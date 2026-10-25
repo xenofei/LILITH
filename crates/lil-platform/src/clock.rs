@@ -21,9 +21,10 @@ pub trait Clock: Send + Sync + std::fmt::Debug {
     /// How long this PC has slept or hibernated since it started: on Windows the interrupt-time
     /// bias, `QueryInterruptTime` minus `QueryUnbiasedInterruptTime`, which grows by exactly the
     /// time asleep and never with a wall-clock step (ARCH-127; plan 4a clarification,
-    /// 2026-10-25). Only its growth means anything. A clock that can't tell answers zero.
-    fn slept(&self) -> Duration {
-        Duration::ZERO
+    /// 2026-10-25). Only its growth means anything. `None` when it can't be read now, and
+    /// always for a clock that can't tell.
+    fn slept(&self) -> Option<Duration> {
+        None
     }
 }
 
@@ -63,15 +64,16 @@ impl Clock for SystemClock {
         system_local_offset(utc).unwrap_or(0)
     }
 
-    fn slept(&self) -> Duration {
+    fn slept(&self) -> Option<Duration> {
         interrupt_time_bias()
     }
 }
 
 /// `QueryInterruptTime` minus `QueryUnbiasedInterruptTime`: the time spent asleep or
-/// hibernated since boot. The unbiased time is read first, so a read never comes out negative
-/// (a negative difference is taken as zero anyway).
-fn interrupt_time_bias() -> Duration {
+/// hibernated since boot; `None` when the unbiased time can't be read. The unbiased time is
+/// read first, so a read never comes out negative (a negative difference is taken as zero
+/// anyway).
+fn interrupt_time_bias() -> Option<Duration> {
     use windows::Win32::System::WindowsProgramming::{
         QueryInterruptTime, QueryUnbiasedInterruptTime,
     };
@@ -79,12 +81,14 @@ fn interrupt_time_bias() -> Duration {
     // SAFETY: plain queries; `unbiased` is a valid out-pointer for the call.
     let biased = unsafe {
         if !QueryUnbiasedInterruptTime(&mut unbiased).as_bool() {
-            return Duration::ZERO;
+            return None;
         }
         QueryInterruptTime()
     };
     // Both in 100 ns units.
-    Duration::from_nanos(biased.saturating_sub(unbiased).saturating_mul(100))
+    Some(Duration::from_nanos(
+        biased.saturating_sub(unbiased).saturating_mul(100),
+    ))
 }
 
 /// 100-ns intervals between 1601-01-01 (the `FILETIME` origin) and 1970-01-01.
@@ -132,6 +136,24 @@ fn system_local_offset(utc: SystemTime) -> Option<i32> {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    /// The real interrupt-time bias reads, and is sane: below the time since boot, and not
+    /// going back by more than the jitter between its two calls (the reads aren't atomic, so
+    /// strict non-decrease isn't asserted). Read-only.
+    #[test] // spec: ARCH-127
+    fn system_clock_slept_is_below_the_uptime() {
+        use windows::Win32::System::SystemInformation::GetTickCount64;
+        let clock = SystemClock::new();
+        let first = clock.slept().expect("the interrupt-time bias reads");
+        // SAFETY: a plain query.
+        let uptime = Duration::from_millis(unsafe { GetTickCount64() });
+        assert!(first < uptime, "slept {first:?}, up {uptime:?}");
+        let second = clock.slept().expect("the interrupt-time bias reads");
+        assert!(
+            second + Duration::from_millis(50) >= first,
+            "{second:?} after {first:?}"
+        );
+    }
 
     #[test] // spec: QA-031
     fn system_clock_monotonic_never_decreases() {

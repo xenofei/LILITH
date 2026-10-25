@@ -20,6 +20,8 @@ struct State {
     utc: SystemTime,
     /// The time asleep ([`Clock::slept`]).
     slept: Duration,
+    /// [`Clock::slept`] can't be read (`None`).
+    slept_unreadable: bool,
     /// `(from, offset)`, sorted by `from`.
     offsets: Vec<(SystemTime, i32)>,
 }
@@ -34,6 +36,7 @@ impl FakeClock {
                 monotonic: Duration::ZERO,
                 utc: UNIX_EPOCH + Duration::from_secs(UTC_START_SECS),
                 slept: Duration::ZERO,
+                slept_unreadable: false,
                 offsets: Vec::new(),
             }),
         })
@@ -53,6 +56,12 @@ impl FakeClock {
         s.monotonic += d;
         s.utc += d;
         s.slept += d;
+    }
+
+    /// While `unreadable`, [`Clock::slept`] answers `None`, as a failed read of the
+    /// interrupt-time bias would.
+    pub fn set_slept_unreadable(&self, unreadable: bool) {
+        self.lock().slept_unreadable = unreadable;
     }
 
     /// Moves only the wall clock, by `by` seconds (negative moves it back), as a user changing
@@ -87,8 +96,9 @@ impl Clock for FakeClock {
         self.lock().utc
     }
 
-    fn slept(&self) -> Duration {
-        self.lock().slept
+    fn slept(&self) -> Option<Duration> {
+        let s = self.lock();
+        (!s.slept_unreadable).then_some(s.slept)
     }
 
     fn local_offset_secs(&self, utc: SystemTime) -> i32 {
@@ -135,11 +145,13 @@ mod tests {
         );
         assert_eq!(
             clock.slept(),
-            Duration::ZERO,
+            Some(Duration::ZERO),
             "a wall-clock step isn't a sleep"
         );
         clock.sleep(Duration::from_secs(90));
-        assert_eq!(clock.slept(), Duration::from_secs(90));
+        assert_eq!(clock.slept(), Some(Duration::from_secs(90)));
+        clock.set_slept_unreadable(true);
+        assert_eq!(clock.slept(), None);
         assert_eq!(
             clock.monotonic(),
             m0 + Duration::from_millis(1500) + Duration::from_secs(90)

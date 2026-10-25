@@ -695,6 +695,39 @@ async fn a_sleep_seen_by_the_broadcast_and_the_backstop_is_reported_once() {
     assert_eq!(fx.events().await.len(), 1);
 }
 
+/// A failed read of the time asleep keeps the last baseline and reports nothing, so the next
+/// good read never turns the whole time asleep since boot into a sleep. A resume with no known
+/// suspend and no growth reports nothing either.
+#[tokio::test(start_paused = true)] // spec: ARCH-127
+async fn a_failed_bias_read_reports_nothing() {
+    let captured = Captured::install();
+    let fx = Fx::new(None).await;
+    fx.clock.sleep(Duration::from_secs(3600));
+    fx.watch.check_sleep();
+    assert_eq!(captured.slept().len(), 1);
+
+    fx.clock.set_slept_unreadable(true);
+    fx.watch.check_sleep();
+    fx.watch.power_event(PowerEvent::Resumed);
+    fx.clock.set_slept_unreadable(false);
+    fx.watch.check_sleep();
+    fx.clock.advance(Duration::from_secs(120));
+    fx.watch.power_event(PowerEvent::Resumed);
+    fx.watch.check_sleep();
+    assert_eq!(captured.slept().len(), 1, "{:?}", captured.slept());
+
+    // A real sleep after the failed read is still seen, at its own length.
+    fx.clock.sleep(Duration::from_secs(90));
+    let to = fx.clock.utc_now();
+    fx.watch.check_sleep();
+    let slept = captured.slept();
+    assert_eq!(slept.len(), 2, "{slept:?}");
+    assert!(
+        field(&slept[1], "from").contains(&utc_text(to - Duration::from_secs(90))),
+        "{slept:?}"
+    );
+}
+
 /// A suspend whose resume never came doesn't start the next sleep: the newest one does.
 #[tokio::test(start_paused = true)] // spec: ARCH-127
 async fn a_stale_suspend_is_discarded() {

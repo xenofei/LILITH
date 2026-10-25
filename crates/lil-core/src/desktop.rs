@@ -105,8 +105,9 @@ pub struct DesktopWatch {
 struct SleepLog {
     /// When the newest `PBT_APMSUSPEND` came, until a sleep is reported.
     suspended_at: Option<SystemTime>,
-    /// The time asleep ([`Clock::slept`]) at the last check or report.
-    slept_seen: Duration,
+    /// The time asleep ([`Clock::slept`]) at the last check or report; `None` until a read
+    /// succeeds (and after a report whose read failed), so the next good read is only a baseline.
+    slept_seen: Option<Duration>,
     /// When the last sleep reported ended.
     reported_to: Option<SystemTime>,
 }
@@ -206,9 +207,9 @@ impl DesktopWatch {
     }
 
     /// A sleep broadcast of the hidden window (ARCH-127). A resume reports the sleep from the
-    /// newest suspend that isn't older than the last sleep reported; with none, from the growth
-    /// of the time asleep since the last check, unless the backstop reported this sleep within
-    /// [`SLEEP_GAP`].
+    /// newest suspend; with none, from the growth of the time asleep since the last check,
+    /// unless the backstop reported this sleep within [`SLEEP_GAP`] or the time asleep didn't
+    /// grow (or can't be read): then nothing is reported.
     pub fn power_event(&self, event: PowerEvent) {
         let now = self.clock.utc_now();
         let mut log = lock(&self.sleep);
@@ -219,23 +220,24 @@ impl DesktopWatch {
                 tracing::info!("the PC is going to sleep");
             }
             PowerEvent::Resumed => {
-                let reported_to = log.reported_to;
-                let suspended = log
-                    .suspended_at
-                    .take()
-                    .filter(|at| reported_to.is_none_or(|to| *at >= to));
-                let from = match suspended {
+                // Every report clears the suspend, so one still here belongs to this resume.
+                let from = match log.suspended_at.take() {
                     Some(from) => from,
-                    // The backstop already reported this sleep.
-                    None if reported_to.is_some_and(|to| {
-                        now.duration_since(to).unwrap_or_default() <= SLEEP_GAP
-                    }) =>
-                    {
-                        log.slept_seen = self.clock.slept();
-                        return;
-                    }
                     None => {
-                        let grown = self.clock.slept().saturating_sub(log.slept_seen);
+                        let slept = self.clock.slept();
+                        let grown = match (slept, log.slept_seen) {
+                            (Some(now), Some(seen)) => now.saturating_sub(seen),
+                            _ => Duration::ZERO,
+                        };
+                        let backstop_had_it = log.reported_to.is_some_and(|to| {
+                            now.duration_since(to).unwrap_or_default() <= SLEEP_GAP
+                        });
+                        if backstop_had_it || grown.is_zero() {
+                            if slept.is_some() {
+                                log.slept_seen = slept;
+                            }
+                            return;
+                        }
                         now.checked_sub(grown).unwrap_or(now)
                     }
                 };
@@ -246,12 +248,17 @@ impl DesktopWatch {
 
     /// The backstop (every [`SLEEP_CHECK_EVERY`]): the time asleep grew by more than
     /// [`SLEEP_GAP`] since the last check, so the PC slept that long, ending now. A wall-clock
-    /// step changes nothing here.
+    /// step changes nothing here. A read that fails keeps the last baseline and reports
+    /// nothing; the first good read after none is only a baseline.
     pub fn check_sleep(&self) {
-        let slept = self.clock.slept();
+        let Some(slept) = self.clock.slept() else {
+            return;
+        };
         let mut log = lock(&self.sleep);
-        let grown = slept.saturating_sub(log.slept_seen);
-        log.slept_seen = slept;
+        let Some(seen) = log.slept_seen.replace(slept) else {
+            return;
+        };
+        let grown = slept.saturating_sub(seen);
         if grown > SLEEP_GAP {
             let to = self.clock.utc_now();
             let from = to.checked_sub(grown).unwrap_or(to);
@@ -262,6 +269,7 @@ impl DesktopWatch {
 
     /// Logs and publishes one sleep from `from` to `to`.
     fn report(&self, log: &mut SleepLog, from: SystemTime, to: SystemTime) {
+        // A failed read leaves no baseline, so this sleep is never counted again.
         log.slept_seen = self.clock.slept();
         log.reported_to = Some(to);
         let (from, to) = (utc_text(from), utc_text(to));
