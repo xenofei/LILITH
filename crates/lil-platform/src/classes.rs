@@ -18,12 +18,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR,
+    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FILETIME, WIN32_ERROR,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW,
-    RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
+    REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW,
+    RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetValueExW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
@@ -97,6 +97,11 @@ pub(crate) fn set_string(subkey: &str, name: Option<&str>, value: &str) -> io::R
 /// The string value `name` (`None`: the default) of `HKCU\<subkey>`, or `None` when the key or
 /// the value is missing or isn't a string.
 pub(crate) fn get_string(subkey: &str, name: Option<&str>) -> Option<String> {
+    get_string_in(HKEY_CURRENT_USER, subkey, name)
+}
+
+/// [`get_string`] under `root` (`HKEY_CURRENT_USER`, or `HKEY_LOCAL_MACHINE` read-only).
+pub(crate) fn get_string_in(root: HKEY, subkey: &str, name: Option<&str>) -> Option<String> {
     let subkey = HSTRING::from(subkey);
     let name = name.map(HSTRING::from);
     let name = name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr()));
@@ -104,7 +109,7 @@ pub(crate) fn get_string(subkey: &str, name: Option<&str>) -> Option<String> {
     // SAFETY: a size query: no buffer, `bytes` receives the size.
     check(unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             &subkey,
             name,
             RRF_RT_REG_SZ,
@@ -119,7 +124,7 @@ pub(crate) fn get_string(subkey: &str, name: Option<&str>) -> Option<String> {
     // SAFETY: `buf` holds `bytes` bytes; the call writes at most that many.
     check(unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             &subkey,
             name,
             RRF_RT_REG_SZ,
@@ -297,9 +302,30 @@ pub fn register_handlers(env: &Env, exe: &Path) -> io::Result<()> {
     apply(&handler_writes(env, exe)?)
 }
 
-/// What [`register_handlers`] writes, in order. On a test channel each key's marker comes
-/// first, so a run killed between two writes leaves a key the sweep finds.
+/// Writes only the channel's scheme for `exe` (P4a-R26: only after your own input), leaving the
+/// `.lilref` association as it is: for a scheme that is missing while another channel holds
+/// `.lilref` (plan 4a ruling, 2026-10-25).
+pub fn register_scheme(env: &Env, exe: &Path) -> io::Result<()> {
+    apply(&scheme_writes(env, exe)?)
+}
+
+/// Writes only the channel's `.lilref` association and file type for `exe` (P4a-R26), leaving
+/// the scheme as it is. A desktop-group channel on the shell's classes root writes nothing.
+pub fn register_lilref(env: &Env, exe: &Path) -> io::Result<()> {
+    apply(&lilref_writes(env, exe)?)
+}
+
+/// What [`register_handlers`] writes, in order: [`scheme_writes`], then [`lilref_writes`]. On a
+/// test channel each key's marker comes first, so a run killed between two writes leaves a key
+/// the sweep finds.
 pub(crate) fn handler_writes(env: &Env, exe: &Path) -> io::Result<Vec<KeyWrite>> {
+    let mut w = scheme_writes(env, exe)?;
+    w.extend(lilref_writes(env, exe)?);
+    Ok(w)
+}
+
+/// The scheme's writes, in order.
+pub(crate) fn scheme_writes(env: &Env, exe: &Path) -> io::Result<Vec<KeyWrite>> {
     let exe = quoted(exe)?;
     let command = format!("{exe} \"%1\"");
     let k = keys(env)?;
@@ -321,9 +347,18 @@ pub(crate) fn handler_writes(env: &Env, exe: &Path) -> io::Result<Vec<KeyWrite>>
         None,
         &command,
     ));
+    Ok(w)
+}
+
+/// The `.lilref` association's and file type's writes, in order; none on the shell's classes
+/// root of a desktop-group channel.
+pub(crate) fn lilref_writes(env: &Env, exe: &Path) -> io::Result<Vec<KeyWrite>> {
+    let mut w = Vec::new();
     if env.uses_shell_classes_root() {
         return Ok(w);
     }
+    let command = format!("{} \"%1\"", quoted(exe)?);
+    let k = keys(env)?;
     let association = format!(r"{}\.lilref", k.root);
     marker(env, &association, &mut w);
     w.push(KeyWrite::new(&association, None, &lilref_progid(env)));
@@ -391,6 +426,94 @@ pub fn remove_test_registry(env: &Env) -> io::Result<()> {
     delete_tree(&hkcu_subkey(&env.registry_root())?)
 }
 
+/// The value a `TestEnv`'s registry root carries naming the process that owns it,
+/// `<pid>:<process creation FILETIME>` ([`mark_test_registry_owner`]).
+pub const TEST_OWNER: &str = "LilTestOwner";
+
+/// A test channel's registry root as [`test_registry_roots`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRegistryRoot {
+    /// The `<8 lowercase hex>` of `LILITH-test-<id>`.
+    pub id: String,
+    /// Its [`TEST_OWNER`] value, when it has one.
+    pub owner: Option<String>,
+    /// When the key was last written (`RegQueryInfoKeyW`'s last write time).
+    pub last_written: std::time::SystemTime,
+}
+
+/// The test channels' registry roots directly below `HKCU\Software` that have `TestEnv`'s
+/// shape, `LILITH-test-<8 lowercase hex>` (read-only): what a killed test can leave behind
+/// (Task 3's review M9). Every other name, a desktop-group root among them, is left out. A key
+/// that vanishes while it is read is left out too.
+pub fn test_registry_roots() -> io::Result<Vec<TestRegistryRoot>> {
+    let head = format!("{}-test-", names::APP_NAME);
+    Ok(subkey_names("Software")?
+        .into_iter()
+        .filter_map(|name| {
+            name.get(..head.len())
+                .filter(|h| h.eq_ignore_ascii_case(&head))?;
+            let id = &name[head.len()..];
+            if !(id.len() == 8 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))) {
+                return None;
+            }
+            let key = format!(r"Software\{name}");
+            Some(TestRegistryRoot {
+                id: id.to_string(),
+                owner: get_string(&key, Some(TEST_OWNER)),
+                last_written: last_written(&key).ok()?,
+            })
+        })
+        .collect())
+}
+
+/// Writes `owner` as a test channel's registry root's [`TEST_OWNER`], creating the root. Refused
+/// on a stable or dev channel.
+pub fn mark_test_registry_owner(env: &Env, owner: &str) -> io::Result<()> {
+    require_test_channel(env, "marking the registry root's owner")?;
+    set_string(&hkcu_subkey(&env.registry_root())?, Some(TEST_OWNER), owner)
+}
+
+/// When `HKCU\<subkey>` was last written.
+fn last_written(subkey: &str) -> io::Result<std::time::SystemTime> {
+    let mut key = HKEY::default();
+    // SAFETY: the name outlives the call; `key` is a valid out-pointer, closed below on success.
+    check(unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(subkey),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+    })?;
+    let mut written = FILETIME::default();
+    // SAFETY: `key` is open; only the last-write-time out-pointer is asked for.
+    let queried = check(unsafe {
+        RegQueryInfoKeyW(
+            key,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut written),
+        )
+    });
+    // SAFETY: `key` was opened above and is closed once.
+    let _ = unsafe { RegCloseKey(key) };
+    queried?;
+    // FILETIME counts 100 ns ticks from 1601; the Unix epoch is 11,644,473,600 s later.
+    let ticks = (u64::from(written.dwHighDateTime) << 32) | u64::from(written.dwLowDateTime);
+    let unix = std::time::Duration::from_nanos(ticks.saturating_mul(100))
+        .saturating_sub(std::time::Duration::from_secs(11_644_473_600));
+    Ok(std::time::UNIX_EPOCH + unix)
+}
+
 /// `HKCU`'s subkey of Windows' own per-app notification settings for `env`'s AUMID, which
 /// Windows creates on the AUMID's first toast (`Setting()` answers `ERROR_NOT_FOUND` until then).
 pub(crate) const NOTIFICATION_SETTINGS: &str =
@@ -437,41 +560,206 @@ pub fn leftover_registrations(env: &Env) -> io::Result<Vec<String>> {
     Ok(left.into_iter().map(|key| format!(r"HKCU\{key}")).collect())
 }
 
-/// The handlers' state for `exe`: `OtherChannel` when a command runs another exe, else
-/// `Missing` when a key, value or the expected command is missing, else `Ok`. A desktop-group
-/// test channel on the shell's classes root has only its scheme to check.
-pub(crate) fn state(env: &Env, exe: &Path) -> HandlerState {
-    let Ok(k) = keys(env) else {
-        return HandlerState::Missing;
-    };
-    let scheme = get_string(&k.scheme, Some("URL Protocol"))
-        .and_then(|_| get_string(&format!(r"{}\shell\open\command", k.scheme), None));
-    let mut commands = vec![scheme];
-    if !env.uses_shell_classes_root() {
-        commands.push(
-            get_string(&format!(r"{}\.lilref", k.root), None).and_then(|progid| {
-                get_string(&format!(r"{}\{progid}\shell\open\command", k.root), None)
-            }),
-        );
+/// The app every LILITH channel registers its handlers for.
+const APP_EXE: &str = "lil-image.exe";
+
+/// One of the channel's two handlers: its scheme, or the `.lilref` association (plan 4a ruling,
+/// 2026-10-25: they are checked, reported and written apart).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandlerPart {
+    /// It opens `exe`, completely.
+    Ok,
+    /// Not registered, or registered for `exe` incompletely, or a dead association to another
+    /// channel's file type: this channel may write it.
+    Missing,
+    /// A LILITH registration whose `lil-image.exe` no longer exists (plan 4a ruling,
+    /// 2026-10-25): this channel may rewrite it, never delete it.
+    Stale(PathBuf),
+    /// Its command runs another `lil-image.exe`: another LILITH channel or build holds it.
+    OtherBuild(PathBuf),
+    /// Another program holds it: its command's program, the file type `.lilref` names, or the
+    /// default of a scheme key that isn't LILITH's (under `HKCU`, or only under `HKLM`).
+    Foreign(String),
+}
+
+impl HandlerPart {
+    /// Whether this channel may write it: `Missing` or `Stale`.
+    pub fn writable(&self) -> bool {
+        matches!(self, HandlerPart::Missing | HandlerPart::Stale(_))
     }
-    let mut missing = false;
-    for command in commands {
-        match command {
-            None => missing = true,
-            Some(command) => {
-                let (named, rest) = split_first_argument(&command);
-                if !same_path(Path::new(&named), exe) {
-                    return HandlerState::OtherChannel(PathBuf::from(named));
-                }
-                missing |= rest != "\"%1\"";
-            }
+}
+
+/// The channel's scheme and `.lilref` association, each on its own ([`handler_parts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerParts {
+    pub scheme: HandlerPart,
+    pub lilref: HandlerPart,
+}
+
+impl HandlerParts {
+    /// The one state `notification_path.handlers` shows, and toast reachability reads: the
+    /// channel's own scheme alone, the one toast URLs use (plan 4a rulings, 2026-10-25). Who
+    /// holds `.lilref`, or a missing one, never changes it; `lil doctor` reports `.lilref`. A
+    /// stale scheme is `Missing`.
+    pub fn state(&self) -> HandlerState {
+        match &self.scheme {
+            HandlerPart::Ok => HandlerState::Ok,
+            HandlerPart::Missing | HandlerPart::Stale(_) => HandlerState::Missing,
+            HandlerPart::OtherBuild(exe) => HandlerState::OtherChannel(exe.clone()),
+            HandlerPart::Foreign(holder) => HandlerState::OtherChannel(PathBuf::from(holder)),
         }
     }
-    if missing {
-        HandlerState::Missing
+}
+
+/// Which registry hive a handler reading comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hive {
+    User,
+    /// `HKLM`: read only to see another program's machine-wide registration, which a per-user
+    /// write would shadow.
+    Machine,
+}
+
+/// The scheme's and the `.lilref` association's states for `exe`, read from the registry
+/// (read-only). A desktop-group test channel on the shell's classes root has only its scheme:
+/// its `.lilref` is `Ok`.
+pub fn handler_parts(env: &Env, exe: &Path) -> HandlerParts {
+    parts_with(
+        env,
+        exe,
+        |hive, key, name| match hive {
+            Hive::User => get_string(key, name),
+            Hive::Machine => get_string_in(HKEY_LOCAL_MACHINE, key, name),
+        },
+        Path::is_file,
+    )
+}
+
+/// Whether a scheme key's `(Default)` is a LILITH one, `URL:LILITH (<Channel>)`.
+fn lilith_url_default(default: &str) -> bool {
+    let head = format!("URL:{} (", names::APP_NAME);
+    default
+        .get(..head.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(&head))
+        && default.ends_with(')')
+}
+
+/// [`handler_parts`] over `get` (a string value of a hive's subkey, as [`get_string`] reads
+/// one) and `exists` (whether an exe is still a file).
+pub(crate) fn parts_with(
+    env: &Env,
+    exe: &Path,
+    get: impl Fn(Hive, &str, Option<&str>) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> HandlerParts {
+    let Ok(k) = keys(env) else {
+        return HandlerParts {
+            scheme: HandlerPart::Missing,
+            lilref: HandlerPart::Missing,
+        };
+    };
+    let user = |key: &str, name: Option<&str>| get(Hive::User, key, name);
+    // Only the shell's own classes root has a machine-wide counterpart a per-user write shadows.
+    let machine_view = env
+        .classes_root()
+        .eq_ignore_ascii_case(r"HKCU\Software\Classes");
+    // What a command runs: `exe` (complete only with the protocol value and `"%1"`), another
+    // build of the app (stale when it is gone and `lilith` says the registration is LILITH's),
+    // or another program.
+    let command_part = |command: &str, complete: bool, lilith: bool| -> HandlerPart {
+        let (named, rest) = split_first_argument(command);
+        let named = PathBuf::from(named);
+        if same_path(&named, exe) {
+            if complete && rest == "\"%1\"" {
+                HandlerPart::Ok
+            } else {
+                HandlerPart::Missing
+            }
+        } else if named
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(APP_EXE))
+        {
+            if lilith && !exists(&named) {
+                HandlerPart::Stale(named)
+            } else {
+                HandlerPart::OtherBuild(named)
+            }
+        } else {
+            HandlerPart::Foreign(named.display().to_string())
+        }
+    };
+    // Another program's machine-wide registration of `key`, when there is one and no per-user
+    // key of that name.
+    let machine_holder = |key: &str| -> Option<String> {
+        if !machine_view {
+            return None;
+        }
+        let command = get(Hive::Machine, &format!(r"{key}\shell\open\command"), None);
+        let default = get(Hive::Machine, key, None);
+        match (command, default) {
+            (Some(c), _) => Some(split_first_argument(&c).0),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        }
+    };
+    let scheme = {
+        let default = user(&k.scheme, None);
+        let lilith = default.as_deref().is_none_or(lilith_url_default);
+        match user(&format!(r"{}\shell\open\command", k.scheme), None) {
+            Some(command) => command_part(
+                &command,
+                user(&k.scheme, Some("URL Protocol")).is_some(),
+                lilith,
+            ),
+            None if !lilith => HandlerPart::Foreign(default.unwrap_or_default()),
+            None => match machine_holder(&k.scheme) {
+                Some(holder) if !lilith_url_default(&holder) => HandlerPart::Foreign(holder),
+                _ => HandlerPart::Missing,
+            },
+        }
+    };
+    let lilref = if env.uses_shell_classes_root() {
+        HandlerPart::Ok
     } else {
-        HandlerState::Ok
-    }
+        let ours = lilref_progid(env);
+        let family = format!("{}.lilref.", names::APP_NAME);
+        let in_family = |progid: &str| {
+            progid
+                .get(..family.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(&family))
+        };
+        let association = format!(r"{}\.lilref", k.root);
+        match user(&association, None) {
+            None => match machine_holder(&association) {
+                Some(progid) if !in_family(&progid) => HandlerPart::Foreign(progid),
+                _ => HandlerPart::Missing,
+            },
+            Some(progid) => {
+                let command = user(&format!(r"{}\{progid}\shell\open\command", k.root), None);
+                if !in_family(&progid) {
+                    HandlerPart::Foreign(progid)
+                } else {
+                    match command {
+                        None => HandlerPart::Missing,
+                        Some(command) => match command_part(&command, true, true) {
+                            // Another channel's file type that already opens `exe` is this
+                            // channel's to write.
+                            HandlerPart::Ok if !progid.eq_ignore_ascii_case(&ours) => {
+                                HandlerPart::Missing
+                            }
+                            part => part,
+                        },
+                    }
+                }
+            }
+        }
+    };
+    HandlerParts { scheme, lilref }
+}
+
+/// The handlers' one state for `exe` ([`HandlerParts::state`]).
+pub(crate) fn state(env: &Env, exe: &Path) -> HandlerState {
+    handler_parts(env, exe).state()
 }
 
 /// Each key `writes` marks is marked before any other value is written under it or below it
@@ -540,6 +828,292 @@ mod tests {
                     .all(|w| w.name.as_deref() != Some(TEST_MARKER))
             );
         }
+    }
+
+    /// A registry of `(hive is HKLM, key, value name) → string` for [`parts_with`].
+    type Fake = std::collections::HashMap<(bool, String, Option<String>), String>;
+
+    /// [`parts_with`] over `fake`; every exe exists except one whose path holds `gone`.
+    fn parts(env: &Env, exe: &Path, fake: &Fake) -> HandlerParts {
+        parts_with(
+            env,
+            exe,
+            |hive, key, name| {
+                fake.get(&(
+                    hive == Hive::Machine,
+                    key.to_string(),
+                    name.map(str::to_string),
+                ))
+                .cloned()
+            },
+            |exe| !exe.to_string_lossy().contains("gone"),
+        )
+    }
+
+    fn put(fake: &mut Fake, key: &str, name: Option<&str>, value: &str) {
+        fake.insert(
+            (false, key.to_string(), name.map(str::to_string)),
+            value.to_string(),
+        );
+    }
+
+    fn put_machine(fake: &mut Fake, key: &str, name: Option<&str>, value: &str) {
+        fake.insert(
+            (true, key.to_string(), name.map(str::to_string)),
+            value.to_string(),
+        );
+    }
+
+    /// A LILITH registration whose `lil-image.exe` is gone is stale: `Missing` in the
+    /// notification path and rewritten by this channel, never deleted (plan 4a ruling,
+    /// 2026-10-25). The same command without LILITH's default is another build's.
+    #[test] // spec: APP-020, APP-021
+    fn a_lilith_registration_of_a_gone_exe_is_stale() {
+        let dev = env(Channel::Dev);
+        let exe = Path::new(r"C:\dev\lil-image.exe");
+        let gone = r"C:\gone build\lil-image.exe";
+        let k = keys(&dev).unwrap();
+        let mut fake = Fake::new();
+        let command = format!(r"{}\shell\open\command", k.scheme);
+        put(&mut fake, &k.scheme, None, "URL:LILITH (Dev)");
+        put(&mut fake, &k.scheme, Some("URL Protocol"), "");
+        put(&mut fake, &command, None, &format!("\"{gone}\" \"%1\""));
+        put(
+            &mut fake,
+            &format!(r"{}\.lilref", k.root),
+            None,
+            "LILITH.lilref.stable",
+        );
+        put(
+            &mut fake,
+            &format!(r"{}\LILITH.lilref.stable\shell\open\command", k.root),
+            None,
+            &format!("\"{gone}\" \"%1\""),
+        );
+        let p = parts(&dev, exe, &fake);
+        assert_eq!(p.scheme, HandlerPart::Stale(PathBuf::from(gone)));
+        assert_eq!(p.lilref, HandlerPart::Stale(PathBuf::from(gone)));
+        assert!(p.scheme.writable() && p.lilref.writable());
+        assert_eq!(p.state(), HandlerState::Missing);
+
+        // A live other build stays another build's; so does a gone one under a default that
+        // isn't LILITH's.
+        let live = r"C:\stable\lil-image.exe";
+        put(&mut fake, &command, None, &format!("\"{live}\" \"%1\""));
+        assert_eq!(
+            parts(&dev, exe, &fake).scheme,
+            HandlerPart::OtherBuild(PathBuf::from(live))
+        );
+        put(&mut fake, &command, None, &format!("\"{gone}\" \"%1\""));
+        put(&mut fake, &k.scheme, None, "URL:Some other app");
+        assert_eq!(
+            parts(&dev, exe, &fake).scheme,
+            HandlerPart::OtherBuild(PathBuf::from(gone))
+        );
+    }
+
+    /// A scheme key with no command is ours to write only when it is LILITH's; on stable and dev
+    /// another program's registration only under `HKLM` is kept and never shadowed (plan 4a
+    /// ruling, 2026-10-25).
+    #[test] // spec: APP-020, APP-021
+    fn foreign_and_machine_wide_registrations_are_never_shadowed() {
+        let dev = env(Channel::Dev);
+        let exe = Path::new(r"C:\dev\lil-image.exe");
+        let k = keys(&dev).unwrap();
+
+        let mut fake = Fake::new();
+        put(&mut fake, &k.scheme, None, "URL:Another app");
+        assert_eq!(
+            parts(&dev, exe, &fake).scheme,
+            HandlerPart::Foreign("URL:Another app".into())
+        );
+        put(&mut fake, &k.scheme, None, "URL:LILITH (Dev)");
+        assert_eq!(parts(&dev, exe, &fake).scheme, HandlerPart::Missing);
+
+        let mut fake = Fake::new();
+        put_machine(
+            &mut fake,
+            &format!(r"{}\shell\open\command", k.scheme),
+            None,
+            r#""C:\Program Files\Other\other.exe" "%1""#,
+        );
+        put_machine(
+            &mut fake,
+            &format!(r"{}\.lilref", k.root),
+            None,
+            "OtherApp.File",
+        );
+        let p = parts(&dev, exe, &fake);
+        assert_eq!(
+            p.scheme,
+            HandlerPart::Foreign(r"C:\Program Files\Other\other.exe".into())
+        );
+        assert_eq!(p.lilref, HandlerPart::Foreign("OtherApp.File".into()));
+        assert_eq!(
+            p.state(),
+            HandlerState::OtherChannel(r"C:\Program Files\Other\other.exe".into())
+        );
+        // A LILITH registration under HKLM isn't another program's.
+        let mut fake = Fake::new();
+        put_machine(&mut fake, &k.scheme, None, "URL:LILITH (Dev)");
+        assert_eq!(parts(&dev, exe, &fake).scheme, HandlerPart::Missing);
+        // A test channel's own classes root has no machine-wide counterpart.
+        let test = env(Channel::Test("0123abcd".into()));
+        let tk = keys(&test).unwrap();
+        let mut fake = Fake::new();
+        put_machine(&mut fake, &tk.scheme, None, "URL:Another app");
+        assert_eq!(parts(&test, exe, &fake).scheme, HandlerPart::Missing);
+    }
+
+    #[test] // spec: APP-020, APP-021
+    fn the_scheme_and_lilref_are_read_apart() {
+        let own = env(Channel::Test("0123abcd".into()));
+        let exe = Path::new(r"C:\own\lil-image.exe");
+        let other = r"C:\stable\lil-image.exe";
+        let k = keys(&own).unwrap();
+        let mut fake = Fake::new();
+        assert_eq!(
+            parts(&own, exe, &fake),
+            HandlerParts {
+                scheme: HandlerPart::Missing,
+                lilref: HandlerPart::Missing
+            }
+        );
+
+        // Another channel holds `.lilref`; this channel's scheme is missing: `Missing`, so the
+        // scheme is still offered (plan 4a ruling, 2026-10-25).
+        put(
+            &mut fake,
+            &format!(r"{}\.lilref", k.root),
+            None,
+            "LILITH.lilref.stable",
+        );
+        put(
+            &mut fake,
+            &format!(r"{}\LILITH.lilref.stable\shell\open\command", k.root),
+            None,
+            &format!("\"{other}\" \"%1\""),
+        );
+        let p = parts(&own, exe, &fake);
+        assert_eq!(p.scheme, HandlerPart::Missing);
+        assert_eq!(p.lilref, HandlerPart::OtherBuild(PathBuf::from(other)));
+        assert_eq!(p.state(), HandlerState::Missing);
+
+        // The scheme in place: `ok`, whoever holds `.lilref` (it is reported apart).
+        put(&mut fake, &k.scheme, Some("URL Protocol"), "");
+        let command = format!(r"{}\shell\open\command", k.scheme);
+        put(&mut fake, &command, None, r#""C:\own\lil-image.exe" "%1""#);
+        let p = parts(&own, exe, &fake);
+        assert_eq!(p.scheme, HandlerPart::Ok);
+        assert_eq!(p.lilref, HandlerPart::OtherBuild(PathBuf::from(other)));
+        assert_eq!(p.state(), HandlerState::Ok);
+
+        // Without its protocol value the scheme is ours, incomplete: `Missing`.
+        fake.remove(&(false, k.scheme.clone(), Some("URL Protocol".into())));
+        assert_eq!(parts(&own, exe, &fake).scheme, HandlerPart::Missing);
+
+        // Another program's command, and another program's file type, are `Foreign`.
+        put(&mut fake, &command, None, r#""C:\Tools\viewer.exe" "%1""#);
+        put(&mut fake, &format!(r"{}\.lilref", k.root), None, "txtfile");
+        let p = parts(&own, exe, &fake);
+        assert_eq!(
+            p.scheme,
+            HandlerPart::Foreign(r"C:\Tools\viewer.exe".into())
+        );
+        assert_eq!(p.lilref, HandlerPart::Foreign("txtfile".into()));
+
+        // Another channel's file type that opens nothing is a dead association: `Missing`.
+        put(
+            &mut fake,
+            &format!(r"{}\.lilref", k.root),
+            None,
+            "LILITH.lilref.dev",
+        );
+        assert_eq!(parts(&own, exe, &fake).lilref, HandlerPart::Missing);
+
+        // The shell's classes root of a desktop-group channel has its scheme only.
+        let shell = env(Channel::Test("desktop-0123456789abcdef".into())).with_shell_classes_root();
+        assert_eq!(parts(&shell, exe, &Fake::new()).lilref, HandlerPart::Ok);
+    }
+
+    /// Stable holds the shared `.lilref` (`HKCU\Software\Classes`); dev's own scheme opens dev's
+    /// app: dev's handlers are `ok`, so with its shortcut `ok` dev's toasts are reachable
+    /// (plan 4a ruling, 2026-10-25). A missing `.lilref` doesn't change it either.
+    #[test] // spec: APP-022, ARCH-055
+    fn dev_is_reachable_while_stable_holds_lilref() {
+        let dev = env(Channel::Dev);
+        let exe = Path::new(r"C:\dev\lil-image.exe");
+        let k = keys(&dev).unwrap();
+        let mut fake = Fake::new();
+        put(&mut fake, &k.scheme, Some("URL Protocol"), "");
+        put(
+            &mut fake,
+            &format!(r"{}\shell\open\command", k.scheme),
+            None,
+            r#""C:\dev\lil-image.exe" "%1""#,
+        );
+        assert_eq!(
+            parts(&dev, exe, &fake).state(),
+            HandlerState::Ok,
+            "no .lilref"
+        );
+        put(
+            &mut fake,
+            &format!(r"{}\.lilref", k.root),
+            None,
+            "LILITH.lilref.stable",
+        );
+        put(
+            &mut fake,
+            &format!(r"{}\LILITH.lilref.stable\shell\open\command", k.root),
+            None,
+            r#""C:\stable\lil-image.exe" "%1""#,
+        );
+        let p = parts(&dev, exe, &fake);
+        assert_eq!(
+            p.lilref,
+            HandlerPart::OtherBuild(r"C:\stable\lil-image.exe".into())
+        );
+        assert_eq!(p.state(), HandlerState::Ok);
+        // Stable holding dev's own scheme is what makes it unreachable.
+        put(
+            &mut fake,
+            &format!(r"{}\shell\open\command", k.scheme),
+            None,
+            r#""C:\stable\lil-image.exe" "%1""#,
+        );
+        assert_eq!(
+            parts(&dev, exe, &fake).state(),
+            HandlerState::OtherChannel(r"C:\stable\lil-image.exe".into())
+        );
+    }
+
+    #[test] // spec: APP-020, APP-021
+    fn the_scheme_and_lilref_are_written_apart() {
+        let own = env(Channel::Test("0123abcd".into()));
+        let exe = Path::new(r"C:\own\lil-image.exe");
+        let k = keys(&own).unwrap();
+        let scheme = scheme_writes(&own, exe).unwrap();
+        let lilref = lilref_writes(&own, exe).unwrap();
+        assert!(
+            scheme.iter().all(|w| w.key.starts_with(&k.scheme)),
+            "{scheme:?}"
+        );
+        assert!(
+            lilref.iter().all(|w| !w.key.starts_with(&k.scheme)),
+            "{lilref:?}"
+        );
+        assert!(
+            lilref.iter().any(|w| w.key.ends_with(r"\.lilref")),
+            "{lilref:?}"
+        );
+        markers_come_first(&scheme).unwrap();
+        markers_come_first(&lilref).unwrap();
+        let mut both = scheme;
+        both.extend(lilref);
+        assert_eq!(handler_writes(&own, exe).unwrap(), both);
+        let shell = env(Channel::Test("desktop-0123456789abcdef".into())).with_shell_classes_root();
+        assert!(lilref_writes(&shell, exe).unwrap().is_empty());
     }
 
     #[test] // spec: APP-022

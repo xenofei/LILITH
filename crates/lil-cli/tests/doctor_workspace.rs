@@ -6,11 +6,16 @@
 //!   registered as it is, reported, and renamed only after `y`.
 //!
 //! The prompts are answered through stdin. Every test runs on its own `TestEnv` channel with
-//! isolated git (QA-038); any core `lil` starts is drained when the env drops (QA-041).
+//! isolated git (QA-038); any core `lil` starts is drained when the env drops (QA-041). Since
+//! plan 4a the doctor also asks to set up the notification shortcut and handlers (Task 13), so
+//! a run that should leave no problem answers [`YES`].
 
 use std::path::{Path, PathBuf};
 
 use lil_testkit::{LilOutput, TestEnv, sha256_file};
+
+/// `y` to every question: the one a test is about, then the notification setup's.
+const YES: &str = "y\ny\ny\n";
 
 /// The non-empty stdout lines.
 fn printed(out: &LilOutput) -> Vec<&str> {
@@ -112,7 +117,7 @@ fn doctor_sets_a_damaged_workspace_state_db_aside_after_yes() {
 
     // `y`: the database and its side files are set aside under one UTC stamp, and the core
     // then opens the workspace with a fresh database.
-    let yes = env.lil_with_stdin(&["doctor"], "y\n");
+    let yes = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(yes.code, 0, "{yes:?}");
     let lines = printed(&yes);
     assert!(
@@ -172,7 +177,7 @@ fn doctor_offers_to_set_aside_orphan_sidecars_in_the_local_folder() {
     assert_eq!(std::fs::read(&wal).unwrap(), b"an old write-ahead log");
     assert!(!db.exists(), "no database was created beside the old log");
 
-    let yes = env.lil_with_stdin(&["doctor"], "y\n");
+    let yes = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(yes.code, 0, "{yes:?}");
     // The core's own new log may be there now, never the old one.
     assert_ne!(
@@ -295,7 +300,7 @@ fn legacy_named_workspace_is_reported_not_reinitialised() {
     legacy_untouched(&no);
 
     // `y`: renamed through the core's store; nothing deleted, the sealed snapshot skipped.
-    let yes = env.lil_with_stdin(&["doctor"], "y\n");
+    let yes = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(yes.code, 0, "{yes:?}");
     let lines = printed(&yes);
     assert!(

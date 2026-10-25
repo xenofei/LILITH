@@ -75,7 +75,8 @@ fn doctor_fixes_git_config_and_gitignore_then_changes_nothing() {
         std::fs::remove_file(&gitattributes).unwrap();
     }
 
-    let first = env.lil(&["doctor"]);
+    // `y` sets up the notification shortcut and handlers (plan 4a, APP-022), the only questions.
+    let first = env.lil_with_stdin(&["doctor"], "y\ny\n");
     assert_eq!(first.code, 0, "{first:?}");
     let lines = printed(&first);
     assert!(
@@ -150,7 +151,8 @@ fn doctor_sets_damaged_state_db_aside_only_after_yes() {
     assert_eq!(sha256_file(&db), before, "answering n changed the database");
     assert!(set_aside_files(&db).is_empty(), "{no:?}");
 
-    let yes = env.lil_with_stdin(&["doctor"], "y\n");
+    // Then `y` to the notification setup's two questions (plan 4a, APP-022).
+    let yes = env.lil_with_stdin(&["doctor"], "y\ny\ny\n");
     assert_eq!(yes.code, 0, "{yes:?}");
     assert!(
         printed(&yes).contains(&"ok: no default workspace; workspace checks skipped"),

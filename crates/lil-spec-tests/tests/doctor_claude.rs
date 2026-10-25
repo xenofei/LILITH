@@ -80,12 +80,21 @@ fn tree(dir: &Path, skip: &Path, out: &mut Vec<(PathBuf, String)>) {
 }
 
 /// The Claude Code side outside `CLAUDE_CONFIG_DIR`: the profile folder and the suite's other
-/// Claude Code profiles.
+/// Claude Code profiles. Only the channel's notification shortcut,
+/// `profile\Programs\LILITH (Test-<id>).lnk`, is left out: the same `y` lets the doctor write
+/// it (plan 4a, APP-022; Appendix G "Activation and registration").
 fn outside_profile(env: &TestEnv) -> Vec<(PathBuf, String)> {
     let skip = profile(env);
     let mut out = Vec::new();
     tree(&env.root().join("profile"), &skip, &mut out);
     tree(&env.env.claude_profiles_dir(), &skip, &mut out);
+    let channel = env.env.channel().to_string();
+    let id = channel.strip_prefix("test-").unwrap_or(&channel);
+    let shortcut = env
+        .root()
+        .join(r"profile\Programs")
+        .join(format!("LILITH (Test-{id}).lnk"));
+    out.retain(|(path, _)| *path != shortcut);
     out.sort();
     out
 }
