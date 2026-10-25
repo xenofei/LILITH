@@ -155,7 +155,7 @@ fn doctor_installs_the_plugin_only_after_yes() {
 fn doctor_writes_claude_rules_only_after_yes() {
     let env = TestEnv::new();
     let ws = default_workspace(&env, "doctorrules");
-    installed(&env, "1.3.0");
+    installed(&env, "1.3.1");
     let settings = ws.join(".claude").join("settings.json");
 
     doctor(&env, &ws, "n");
