@@ -189,6 +189,7 @@ impl Fx {
                 ConfirmationAnswerParams {
                     confirmation_id: id.into(),
                     answer,
+                    toast_token: None,
                     cap: None,
                 },
             )
@@ -358,6 +359,7 @@ async fn only_a_verified_ui_session_can_answer_directly() {
     let ask = |answer| ConfirmationAnswerParams {
         confirmation_id: p.confirmation_id.clone(),
         answer,
+        toast_token: None,
         cap: None,
     };
     // Agents never answer, and an app whose hello shared no confirmation capability can't.
@@ -384,6 +386,7 @@ async fn only_a_verified_ui_session_can_answer_directly() {
             ConfirmationAnswerParams {
                 confirmation_id: "cf_ffffffffffffffff".into(),
                 answer: Answer::Approve,
+                toast_token: None,
                 cap: None,
             },
         )
@@ -395,6 +398,7 @@ async fn only_a_verified_ui_session_can_answer_directly() {
         .answer(
             &app(),
             ConfirmationAnswerParams {
+                toast_token: None,
                 cap: Some(lil_protocol::app::CapAnswer {
                     action: lil_protocol::app::CapAction::AllowOnce,
                     raise_to: None,
@@ -481,6 +485,7 @@ async fn deny_and_expiry_return_their_codes_and_release_the_key() {
             ConfirmationAnswerParams {
                 confirmation_id: third.confirmation_id.clone(),
                 answer: Answer::Approve,
+                toast_token: None,
                 cap: None,
             },
         )
@@ -1123,5 +1128,320 @@ async fn claude_code_marker_lowers_to_the_top_level_of_mcp_meta() {
             "{}",
             t.name
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The notification path (plan 4a): the notifier over a fake desktop.
+// ---------------------------------------------------------------------------------------------
+
+/// A notifier over `FakeDesktop` (ready, shortcut and handlers `ok`, every category on), its
+/// desktop settings and the fake.
+struct PathRig {
+    notifier: Arc<lil_core::interchange::Notifier>,
+    fake: Arc<lil_platform::desktop_fake::FakeDesktop>,
+    store: Arc<lil_core::desktop::DesktopSettingsStore>,
+    _watch: Arc<lil_core::desktop::DesktopWatch>,
+    _env: TestEnv,
+}
+
+impl PathRig {
+    async fn new() -> PathRig {
+        let env = TestEnv::new();
+        let clock: Arc<dyn Clock> = FakeClock::new();
+        let events = Arc::new(lil_core::events::EventBus::new(clock.clone()));
+        let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
+        let fake = Arc::new(lil_platform::desktop_fake::FakeDesktop::new());
+        let store = lil_core::desktop::DesktopSettingsStore::load(
+            env.env.clone(),
+            fake.clone(),
+            env.root().join("lil-image.exe"),
+            clock.clone(),
+            ids.clone(),
+            events.clone(),
+            lil_core::store::FailPoints::none(),
+        );
+        let watch = lil_core::desktop::DesktopWatch::start(
+            fake.clone(),
+            clock.clone(),
+            lil_core::desktop::POLL_EVERY,
+            events.clone(),
+        );
+        let notifier =
+            lil_core::interchange::Notifier::start(lil_core::interchange::NotifierParts {
+                desktop: fake.clone(),
+                watch: watch.clone(),
+                settings: store.clone(),
+                events,
+                apps: Arc::new(lil_core::desktop::UiApps::default()),
+                env: env.env.clone(),
+                clock,
+                ids,
+            })
+            .await;
+        PathRig {
+            notifier,
+            fake,
+            store,
+            _watch: watch,
+            _env: env,
+        }
+    }
+
+    /// Whether the path reaches you, after `desktop.get {fresh: true}`.
+    async fn reachable_fresh(&self) -> bool {
+        self.store.get(true).await;
+        self.reachable()
+    }
+
+    fn reachable(&self) -> bool {
+        use lil_core::confirm::NotificationPath as _;
+        self.notifier.reachable()
+    }
+
+    async fn category(&self, on: bool) {
+        self.store
+            .set(lil_protocol::app::DesktopSetParams {
+                notifications: Some([("confirmation_waiting".to_string(), on)].into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test] // spec: ARCH-055, APP-051, QA-016, CORE-113
+async fn reachable_needs_toasts_shortcut_handlers_and_the_category() {
+    use lil_platform::desktop::{HandlerState, ShortcutState, ToastsState};
+    let rig = PathRig::new().await;
+    assert!(
+        rig.reachable_fresh().await,
+        "ready, ok, ok and the category on"
+    );
+    // `not_yet_shown` counts as ready.
+    rig.fake.set_toasts_state(ToastsState::NotYetShown);
+    assert!(rig.reachable_fresh().await);
+    rig.fake.set_toasts_state(ToastsState::Ready);
+
+    for shortcut in [
+        ShortcutState::Missing,
+        ShortcutState::WrongTarget,
+        ShortcutState::WrongAumid,
+        ShortcutState::WrongClsid,
+    ] {
+        rig.fake.set_shortcut(shortcut);
+        assert!(!rig.reachable_fresh().await, "{shortcut:?}");
+    }
+    rig.fake.set_shortcut(ShortcutState::Ok);
+    for handlers in [
+        HandlerState::Missing,
+        HandlerState::OtherChannel(r"C:\other\lil-image.exe".into()),
+    ] {
+        rig.fake.set_handlers(handlers.clone());
+        assert!(!rig.reachable_fresh().await, "{handlers:?}");
+    }
+    rig.fake.set_handlers(HandlerState::Ok);
+    assert!(rig.reachable_fresh().await);
+
+    rig.category(false).await;
+    assert!(!rig.reachable_fresh().await, "confirmation_waiting off");
+    rig.category(true).await;
+    assert!(rig.reachable_fresh().await);
+
+    // The reading is cached for 10 s (P4a-R33): a change shows after `desktop.get {fresh}`...
+    rig.fake
+        .set_toasts_state(ToastsState::Unavailable("disabled_for_user"));
+    assert!(rig.reachable(), "served from the cache");
+    assert!(!rig.reachable_fresh().await);
+    // ...except a cached `not_yet_shown`, read again on each call, so its end as
+    // `no_platform` answers at once (plan 4a clarification, 2026-10-25).
+    rig.fake.set_toasts_state(ToastsState::NotYetShown);
+    assert!(rig.reachable_fresh().await);
+    rig.fake
+        .set_toasts_state(ToastsState::Unavailable("no_platform"));
+    assert!(!rig.reachable(), "no_platform at once");
+}
+
+#[tokio::test] // spec: APP-022, ARCH-055, QA-016
+async fn reachable_is_false_when_windows_turns_the_apps_toasts_off() {
+    use lil_platform::desktop::ToastsState;
+    let rig = PathRig::new().await;
+    for reason in [
+        "disabled_for_app",
+        "disabled_for_user",
+        "disabled_by_policy",
+        "elevated",
+        "no_platform",
+    ] {
+        rig.fake.set_toasts_state(ToastsState::Unavailable(reason));
+        let got = rig.store.get(true).await;
+        assert_eq!(
+            got.notification_path.toasts,
+            lil_protocol::app::ToastsWire::Unavailable,
+            "{reason}"
+        );
+        assert_eq!(
+            got.notification_path.toasts_reason.as_deref(),
+            Some(reason),
+            "desktop.get names it"
+        );
+        assert!(!rig.reachable(), "{reason}");
+    }
+}
+
+#[tokio::test] // spec: APP-022, ARCH-055
+async fn an_elevated_core_is_never_reachable() {
+    use lil_platform::desktop::{NotifierSetting, ToastsState, toasts_state_for};
+    for setting in [NotifierSetting::Enabled, NotifierSetting::NotYetShown] {
+        assert_eq!(
+            toasts_state_for(Some(setting), true),
+            ToastsState::Unavailable("elevated"),
+            "{setting:?}"
+        );
+    }
+    let rig = PathRig::new().await;
+    rig.fake
+        .set_toasts_state(toasts_state_for(Some(NotifierSetting::Enabled), true));
+    assert!(!rig.reachable_fresh().await);
+}
+
+/// `test.desktop` on `pipe`.
+fn fake_desktop(pipe: &mut RawPipe, args: Value) -> Value {
+    let out = pipe.tool("test.desktop", args, Some(&next_key()));
+    assert_eq!(out["status"], "ok", "{out}");
+    out["structured"].clone()
+}
+
+/// The notification path ready on a test core: toasts, shortcut and handlers in place, another
+/// program in front; the recorded toasts cleared.
+fn path_ready(pipe: &mut RawPipe) {
+    fake_desktop(
+        pipe,
+        json!({"toasts": "ready", "shortcut": true, "handlers": true, "foreground": "other",
+               "clear": true}),
+    );
+}
+
+fn confirmation_posts(pipe: &mut RawPipe) -> Vec<Value> {
+    fake_desktop(pipe, json!({}))["toasts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["op"] == "post" && t["group"] == "confirmation_waiting")
+        .cloned()
+        .collect()
+}
+
+/// Polls until `id`'s confirmation toast is posted.
+fn toast_of(pipe: &mut RawPipe, id: &str) -> Value {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        if let Some(t) = confirmation_posts(pipe)
+            .into_iter()
+            .find(|t| t["tag"] == id)
+        {
+            return t;
+        }
+        assert!(std::time::Instant::now() < deadline, "no toast for {id}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test] // spec: ARCH-055, QA-016, APP-051
+fn an_unreachable_path_answers_unavailable_at_once_without_an_app() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut agent = connect(&env, json!({}));
+    // A test core starts as before the notification setup: the handlers are missing.
+    let started = std::time::Instant::now();
+    let out = agent.tool("test.destructive", json!({}), Some(&next_key()));
+    assert_eq!(out["error"]["code"], "confirm.unavailable", "{out}");
+    // Toasts off in Windows: the same, at once.
+    path_ready(&mut agent);
+    fake_desktop(&mut agent, json!({"toasts": "disabled_for_user"}));
+    let out = agent.tool("test.destructive", json!({}), Some(&next_key()));
+    assert_eq!(out["error"]["code"], "confirm.unavailable", "{out}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "no wait: {:?}",
+        started.elapsed()
+    );
+    assert!(confirmation_posts(&mut agent).is_empty());
+}
+
+#[test] // spec: ARCH-055, CORE-113, APP-051, QA-016
+fn a_call_waits_without_an_app_when_reachable() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut agent = connect(&env, json!({}));
+    path_ready(&mut agent);
+    let k = next_key();
+    let id = pending_id(&agent.tool("test.destructive", json!({}), Some(&k)));
+    let toast = toast_of(&mut agent, &id);
+    assert_eq!(
+        toast["launch"],
+        format!("{}:confirm/{id}", env.env.activation_scheme()),
+        "{toast}"
+    );
+    assert_eq!(toast["title"], "Confirmation waiting", "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) wants to run test.destructive",
+        "{toast}"
+    );
+
+    // An app connected later answers it; the retry runs once.
+    let mut app = TestApp::start(&env, None, &[]);
+    let answered = answer_with(&mut app, &id, "approve");
+    assert_eq!(answered["result"]["status"], "ok", "{answered}");
+    let ran = agent.tool("test.destructive", json!({}), Some(&k));
+    assert_eq!(ran["structured"]["count"], 1, "{ran}");
+    let replay = agent.tool("test.destructive", json!({}), Some(&k));
+    assert_eq!(replay, ran, "it runs once");
+}
+
+#[test] // spec: QA-016, ARCH-055, APP-051
+fn non_interactive_callers_still_get_unavailable() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut setup = connect(&env, json!({}));
+    path_ready(&mut setup);
+    let mut quiet = connect(&env, json!({"caller_kind": "cli", "non_interactive": true}));
+    let out = quiet.tool("test.destructive", json!({}), Some(&next_key()));
+    assert_eq!(out["error"]["code"], "confirm.unavailable", "{out}");
+    // The interactive contrast waits through the toast; the refused call has none.
+    let id = pending_id(&setup.tool("test.destructive", json!({}), Some(&next_key())));
+    toast_of(&mut setup, &id);
+    let tags: Vec<Value> = confirmation_posts(&mut setup)
+        .iter()
+        .map(|t| t["tag"].clone())
+        .collect();
+    assert_eq!(tags, [json!(id)], "none for the non-interactive call");
+}
+
+#[test] // spec: APP-146, ARCH-055
+fn turning_the_category_off_makes_calls_unavailable_without_an_app() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut agent = connect(&env, json!({}));
+    path_ready(&mut agent);
+    pending_id(&agent.tool("test.destructive", json!({}), Some(&next_key())));
+    {
+        let mut app = TestApp::start_with_capabilities(&env, None, &[], ALL_CAPABILITIES);
+        let set = app.call(
+            "app/desktop.set",
+            json!({"notifications": {"confirmation_waiting": false}}),
+        );
+        assert_eq!(set["result"]["status"], "ok", "{set}");
+    }
+    // Until the core has seen the app go, the call may still wait with it.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let out = agent.tool("test.destructive", json!({}), Some(&next_key()));
+        if out["status"] == "error" {
+            assert_eq!(out["error"]["code"], "confirm.unavailable", "{out}");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "still {out}");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

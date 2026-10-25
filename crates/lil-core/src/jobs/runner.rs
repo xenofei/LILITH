@@ -3514,6 +3514,37 @@ impl Jobs {
         self.shared.queue_state(lane)
     }
 
+    /// The jobs of batch `batch_id`, by index, from whichever writable database holds it (a
+    /// batch id is unique across the suite): every attempt, retries included. Empty when no
+    /// open database has it, or one can't be read (logged). The notifier reads a batch's end
+    /// here (APP-146).
+    pub async fn batch_summaries(&self, batch_id: &str) -> Vec<JobSummary> {
+        let s = &self.shared;
+        for (_, db) in s.states.writable_dbs() {
+            match record::batch(&db, batch_id).await {
+                Ok(rows) if rows.is_empty() => {}
+                Ok(rows) => return rows.iter().map(|r| s.summary(r)).collect(),
+                Err(e) => {
+                    tracing::warn!(batch_id, error = %e, "a batch's jobs could not be read");
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// The jobs a restart holds now (P4a-R41), in queue order: class, then `order_key`.
+    pub fn restart_held_jobs(&self) -> Vec<JobId> {
+        let q = self.shared.queue();
+        let mut held: Vec<(Priority, i64, JobId)> = q
+            .jobs
+            .values()
+            .filter(|a| a.restart_held)
+            .map(|a| (a.info.spec.priority, a.order_key, a.info.id.clone()))
+            .collect();
+        held.sort();
+        held.into_iter().map(|(_, _, id)| id).collect()
+    }
+
     /// Changes whenever a job's state changes or a job leaves the queue: a watcher re-reads
     /// what it needs then (keep-awake reads [`Jobs::any_running`]).
     pub fn changes(&self) -> watch::Receiver<u64> {

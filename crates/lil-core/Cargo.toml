@@ -40,6 +40,8 @@ lil-schema = { path = "../lil-schema" }
 [dev-dependencies]
 # The shrinkable simulated outside-writers reconciler (QA-046, tests/reconcile_sim.rs).
 proptest.workspace = true
+# The toast tests parse the toast XML (tests/notify.rs).
+roxmltree.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 lil-testkit = { path = "../lil-testkit" }

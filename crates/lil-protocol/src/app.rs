@@ -159,7 +159,9 @@ pub struct CapAnswer {
     pub raise_to: Option<RaiseTo>,
 }
 
-/// `app/confirmation.answer` params: `{confirmation_id, answer, cap?}`.
+/// `app/confirmation.answer` params: `{confirmation_id, answer, cap?, toast_token?}`. From
+/// protocol 1.2 a `toast_token` (32 hex, with `desktop.v1`) is a deny from a confirmation
+/// toast: `answer: "deny"` only, and no `cap` (Appendix G "Deny from a toast").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConfirmationAnswerParams {
@@ -167,6 +169,8 @@ pub struct ConfirmationAnswerParams {
     pub answer: Answer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<CapAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toast_token: Option<String>,
 }
 
 /// `app/confirmation.answer` result.
@@ -454,6 +458,16 @@ mod tests {
         .unwrap();
         assert_eq!(answer.answer, Answer::Approve);
         assert_eq!(answer.cap.unwrap().action.wire(), "raise");
+        assert_eq!(answer.toast_token, None);
+        let deny: ConfirmationAnswerParams = serde_json::from_value(json!({
+            "confirmation_id": "cf_1", "answer": "deny",
+            "toast_token": "0123456789abcdef0123456789abcdef"
+        }))
+        .unwrap();
+        assert_eq!(
+            deny.toast_token.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
         // A caller-supplied `confirm: true` is an unknown field, never accepted (CORE-111).
         let set: CapsSetParams = serde_json::from_value(
             json!({"monthly": "5", "per_call_max": null, "provider_monthly": {"a": "1", "b": null}}),

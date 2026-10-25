@@ -876,11 +876,13 @@ struct DesktopSeen {
 /// Registers `test.desktop` on `reg` (plan 4a's test contract): it sets `fake`, the test
 /// channel's desktop, and returns what it recorded. `foreground: "suite"` puts a process of
 /// `apps` in front (`params.invalid` while no verified app is connected); `"other"` the core's
-/// own process, which is never an app's.
+/// own process, which is never an app's. A change of the toasts, the shortcut or the handlers
+/// recomputes `store`'s cached notification path, so the core sees it at once.
 pub fn register_test_desktop(
     reg: &mut Registry,
     fake: Arc<lil_platform::desktop_fake::FakeDesktop>,
     apps: Arc<crate::desktop::UiApps>,
+    store: Arc<crate::desktop::DesktopSettingsStore>,
 ) {
     use lil_platform::desktop::{Fullscreen, HandlerState, ShortcutState, ToastsState};
     use lil_platform::desktop_fake::ToastOp;
@@ -890,8 +892,10 @@ pub fn register_test_desktop(
         EffectClass::Write,
         TEST_MODULE,
         move |ctx, args: DesktopArgs| {
-            let (fake, apps) = (fake.clone(), apps.clone());
+            let (fake, apps, store) = (fake.clone(), apps.clone(), store.clone());
             Box::pin(async move {
+                let path_changed =
+                    args.shortcut.is_some() || args.handlers.is_some() || args.toasts.is_some();
                 if let Some(f) = args.fullscreen {
                     fake.set_fullscreen(match f {
                         FullscreenArg::No => Fullscreen::No,
@@ -945,6 +949,9 @@ pub fn register_test_desktop(
                 }
                 if args.clear {
                     fake.clear();
+                }
+                if path_changed {
+                    let _ = tokio::task::spawn_blocking(move || store.notification_path(true)).await;
                 }
                 let toasts: Vec<ToastSeen> = fake
                     .records()

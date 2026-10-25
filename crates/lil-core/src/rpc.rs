@@ -26,7 +26,8 @@
 //!   `caller.not_allowed`; CORE-008), protocol 1.2's `app/queue.pause` and `app/queue.resume`
 //!   go to the jobs (they need `queue.v1`, else `caller.not_allowed`; CORE-160),
 //!   `app/desktop.set` goes to the [`DesktopSettingsStore`] (it needs `desktop.v1`, else
-//!   `caller.not_allowed`; a category `desktop.get` doesn't list is -32602; APP-146), and any
+//!   `caller.not_allowed`; a category `desktop.get` doesn't list is -32602; APP-146), as does
+//!   `app/confirmation.answer`'s `toast_token` (a deny from a toast, P4a-R9), and any
 //!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   A verified `ui:*` session that can answer confirmations counts in the
@@ -482,6 +483,16 @@ impl RpcRouter {
             Ok(p) => p,
             Err(error) => return invalid(error),
         };
+        if p.toast_token.is_some()
+            && !session
+                .capabilities
+                .iter()
+                .any(|c| c == app::DESKTOP_CAPABILITY)
+        {
+            return refuse(format!(
+                "{m}'s toast_token needs the desktop.v1 capability, and this session's core/hello did not offer it."
+            ));
+        }
         let answered =
             self.confirm
                 .answer(session, p)
@@ -1071,11 +1082,13 @@ mod panic_tests {
         let core = core_panicking_on(&env, method::SUBSCRIBE);
         let lifecycle = core.core().lifecycle().clone();
         let events = core.core().events().clone();
+        // The bus's in-process clients (the notifier) aren't connections.
+        let in_process = events.clients();
         let mut pipe = RawPipe::connect(&env);
         let hello = pipe.hello(json!({}));
         assert_eq!(hello["result"]["status"], "ok", "{hello}");
         assert_eq!(lifecycle.connections(), 1);
-        assert_eq!(events.clients(), 1);
+        assert_eq!(events.clients(), in_process + 1);
 
         // `lil/subscribe` runs on the reader; its panic ends the connection, and `closed` still
         // runs: the connection stops counting and leaves the event bus.
@@ -1088,7 +1101,7 @@ mod panic_tests {
         );
         assert!(pipe.wait_closed(DEADLINE), "the connection stays open");
         wait_until("closed to run", || {
-            lifecycle.connections() == 0 && events.clients() == 0
+            lifecycle.connections() == 0 && events.clients() == in_process
         });
 
         // The core still serves.

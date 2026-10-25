@@ -1,0 +1,1048 @@
+//! The notifier (ARCH-005, ARCH-055, CORE-113, APP-022, APP-051, APP-065, APP-146, QA-016;
+//! Appendix G "Notifications"; rulings P4a-R7, P4a-R8, P4a-R9, P4a-R36, P4a-R41): the toast
+//! XML, toasts by category with their defaults, one per batch, none while a suite window is
+//! in front, quiet while fullscreen, no progress toasts, the restart hold's toast, per-origin
+//! coalescing, the confirmation toast with Open and Deny and its one-use token, cap alerts,
+//! Claude Code's notices and an agent's opens.
+//!
+//! The XML and the batch rule are checked as functions; everything else runs over the pipe of
+//! an in-process core on a test channel, whose `FakeDesktop` records each toast
+//! (`test.desktop`). No real toast is posted (QA-038). Wall-clock durations are failure
+//! deadlines only.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use lil_core::identity::TrustedDirs;
+use lil_core::interchange::notify::batch_end;
+use lil_core::interchange::{ToastActions, ToastText, toast_xml};
+use lil_core::jobs::JobSummary;
+use lil_core::{CoreConfig, CoreThread, start_in_thread};
+use lil_platform::IdSource;
+use lil_testkit::{FakeClock, RawPipe, SeqIds, TestApp, TestEnv, ensure_built};
+use serde_json::{Value, json};
+
+/// Failure deadline for anything a test waits on.
+const DEADLINE: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------------------------
+// The harness.
+// ---------------------------------------------------------------------------------------------
+
+fn key() -> String {
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!("k-notify-{}", N.fetch_add(1, Ordering::SeqCst))
+}
+
+/// An in-process core that trusts the test app, polls the fake desktop every 50 ms, and runs
+/// on `clock` with `ids` (`None`: the OS random source, as a real core).
+fn core_with(
+    env: &TestEnv,
+    clock: Arc<FakeClock>,
+    ids: Option<Arc<dyn IdSource>>,
+    lifetime: Option<Duration>,
+) -> CoreThread {
+    let base = CoreConfig::for_env(env.env.clone()).expect("core config");
+    start_in_thread(CoreConfig {
+        clock,
+        ids: ids.unwrap_or_else(|| base.ids.clone()),
+        test_parent_pid: None,
+        desktop_poll: Some(Duration::from_millis(50)),
+        confirm_lifetime: lifetime.unwrap_or(base.confirm_lifetime),
+        trusted: TrustedDirs {
+            app_dirs: vec![ensure_built().dir.clone()],
+            test_app: true,
+            ..base.trusted.clone()
+        },
+        ..base
+    })
+}
+
+fn core(env: &TestEnv) -> CoreThread {
+    core_with(env, FakeClock::new(), Some(Arc::new(SeqIds::new())), None)
+}
+
+fn pipe(env: &TestEnv, hello: Value) -> RawPipe {
+    let mut pipe = RawPipe::connect(env);
+    let response = pipe.hello(hello);
+    assert_eq!(response["result"]["status"], "ok", "hello: {response}");
+    pipe
+}
+
+/// The `ui:test` app with every capability of this protocol.
+fn app(env: &TestEnv) -> TestApp {
+    TestApp::start_with_capabilities(env, None, &[], lil_protocol::CAPABILITIES)
+}
+
+/// A write call that must succeed: its `structured`.
+fn write(p: &mut RawPipe, name: &str, args: Value) -> Value {
+    p.tool_ok(name, args, Some(&key()))
+}
+
+fn desktop(p: &mut RawPipe, args: Value) -> Value {
+    write(p, "test.desktop", args)
+}
+
+/// The path ready: toasts ready, shortcut and handlers in place, another program in front,
+/// no fullscreen; the recorded toasts cleared.
+fn ready(p: &mut RawPipe) {
+    desktop(
+        p,
+        json!({"toasts": "ready", "shortcut": true, "handlers": true, "foreground": "other",
+               "fullscreen": "no", "clear": true}),
+    );
+}
+
+fn ops(p: &mut RawPipe) -> Vec<Value> {
+    desktop(p, json!({}))["toasts"].as_array().unwrap().clone()
+}
+
+fn posts(p: &mut RawPipe, group: &str) -> Vec<Value> {
+    ops(p)
+        .into_iter()
+        .filter(|t| t["op"] == "post" && t["group"] == group)
+        .collect()
+}
+
+fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "{what}: not within {DEADLINE:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Polls until `group` has at least `n` posts; returns them.
+fn until_posts(p: &mut RawPipe, group: &str, n: usize) -> Vec<Value> {
+    until(&format!("{n} {group} toast(s)"), || {
+        let found = posts(p, group);
+        (found.len() >= n).then_some(found)
+    })
+}
+
+fn wait_done(p: &mut RawPipe, id: &str) -> Value {
+    let waited = p.tool_ok("job.wait", json!({"job_id": id, "timeout_s": 30}), None);
+    assert_eq!(waited["done"], true, "{waited}");
+    waited["job"].clone()
+}
+
+fn job_ids(structured: &Value) -> Vec<String> {
+    match structured.get("jobs") {
+        Some(jobs) => jobs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["job_id"].as_str().unwrap().to_string())
+            .collect(),
+        None => vec![structured["job"]["job_id"].as_str().unwrap().to_string()],
+    }
+}
+
+/// A finished `cli` batch of `n` quick `cpu` jobs; its ids.
+fn batch(p: &mut RawPipe, n: u64) -> Vec<String> {
+    let ids = job_ids(&write(p, "test.job", json!({"lane": "cpu", "batch": n})));
+    for id in &ids {
+        assert_eq!(wait_done(p, id)["status"], "succeeded");
+    }
+    ids
+}
+
+/// Everything the notifier had to handle before now has been handled: a `cli` job finishes
+/// and its own toast is posted (the notifier handles events in order). Needs `job_finished`
+/// on and the path ready.
+fn fence(p: &mut RawPipe, env: &TestEnv) {
+    let id = batch(p, 1).remove(0);
+    let launch = format!("{}:task/{id}", env.env.activation_scheme());
+    until("the fence's toast", || {
+        posts(p, "job_finished")
+            .iter()
+            .any(|t| t["launch"] == launch.as_str())
+            .then_some(())
+    });
+}
+
+fn pending_id(outcome: &Value) -> String {
+    assert_eq!(outcome["status"], "pending_confirmation", "{outcome}");
+    outcome["confirmation_id"].as_str().unwrap().to_string()
+}
+
+fn error_code(outcome: &Value) -> String {
+    outcome["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `(content, arguments, activationType)` of each `<action>` of a toast's XML.
+fn actions(xml: &str) -> Vec<(String, String, String)> {
+    let doc = roxmltree::Document::parse(xml).unwrap_or_else(|e| panic!("{e}: {xml}"));
+    doc.descendants()
+        .filter(|n| n.has_tag_name("action"))
+        .map(|n| {
+            let a = |k: &str| n.attribute(k).unwrap_or_default().to_string();
+            (a("content"), a("arguments"), a("activationType"))
+        })
+        .collect()
+}
+
+/// The confirmation toast of `id`, posted: its Deny URL's token.
+fn deny_token(p: &mut RawPipe, scheme: &str, id: &str) -> String {
+    let toast = until(&format!("the toast of {id}"), || {
+        posts(p, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id)
+    });
+    let xml = toast["xml"].as_str().unwrap();
+    let deny = actions(xml)[1].1.clone();
+    deny.strip_prefix(&format!("{scheme}:deny/{id}/"))
+        .unwrap_or_else(|| panic!("not a deny URL of {id}: {deny}"))
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The toast XML.
+// ---------------------------------------------------------------------------------------------
+
+#[test] // spec: APP-022, ARCH-060
+fn toast_xml_escapes_and_normalises() {
+    let xml = toast_xml(&ToastText {
+        title: "a <b> & \"c\"".into(),
+        body: "x\u{202E}y\u{0007}z 'q'".into(),
+        launch: Some("lil-test-a:task/j_0123456789abcdef".into()),
+        actions: ToastActions::None,
+    });
+    assert!(xml.contains("a &lt;b&gt; &amp; &quot;c&quot;"), "{xml}");
+    assert!(
+        xml.contains("x\u{27E8}U+202E\u{27E9}yz &apos;q&apos;"),
+        "{xml}"
+    );
+    assert!(
+        !xml.contains('\u{202E}') && !xml.contains('\u{0007}'),
+        "{xml:?}"
+    );
+    let doc = roxmltree::Document::parse(&xml).unwrap_or_else(|e| panic!("{e}: {xml}"));
+    let root = doc.root_element();
+    assert_eq!(root.tag_name().name(), "toast");
+    assert_eq!(root.attribute("activationType"), Some("protocol"));
+    assert_eq!(
+        root.attribute("launch"),
+        Some("lil-test-a:task/j_0123456789abcdef")
+    );
+    let texts: Vec<&str> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("text"))
+        .filter_map(|n| n.text())
+        .collect();
+    assert_eq!(texts, ["a <b> & \"c\"", "x\u{27E8}U+202E\u{27E9}yz 'q'"]);
+    let binding = doc
+        .descendants()
+        .find(|n| n.has_tag_name("binding"))
+        .unwrap();
+    assert_eq!(binding.attribute("template"), Some("ToastGeneric"));
+    assert!(
+        !doc.descendants().any(|n| n.has_tag_name("progress")),
+        "no progress binding (P4a-R36)"
+    );
+
+    // At most 200 characters, ending … when cut.
+    let long = toast_xml(&ToastText {
+        title: "t".into(),
+        body: "b".repeat(500),
+        launch: None,
+        actions: ToastActions::None,
+    });
+    let doc = roxmltree::Document::parse(&long).unwrap();
+    let body = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("text"))
+        .nth(1)
+        .and_then(|n| n.text())
+        .unwrap();
+    assert_eq!(body.chars().count(), 200);
+    assert!(body.ends_with('…'));
+    assert_eq!(doc.root_element().attribute("launch"), None, "no target");
+}
+
+#[test] // spec: APP-022
+fn confirmation_toast_xml_has_open_and_deny() {
+    let (open, deny) = (
+        "lil-test-a:confirm/cf_0123456789abcdef",
+        "lil-test-a:deny/cf_0123456789abcdef/0123456789abcdef0123456789abcdef",
+    );
+    let xml = toast_xml(&ToastText {
+        title: "Confirmation waiting".into(),
+        body: "A script (lil) wants to run test.destructive".into(),
+        launch: Some(open.into()),
+        actions: ToastActions::OpenAndDeny {
+            open_url: open.into(),
+            deny_url: deny.into(),
+        },
+    });
+    assert_eq!(
+        actions(&xml),
+        [
+            ("Open".into(), open.into(), "protocol".into()),
+            ("Deny".into(), deny.into(), "protocol".into())
+        ]
+    );
+    let plain = toast_xml(&ToastText {
+        title: "Job finished".into(),
+        body: "b".into(),
+        launch: Some("lil-test-a:task/j_0123456789abcdef".into()),
+        actions: ToastActions::None,
+    });
+    assert!(actions(&plain).is_empty());
+    assert!(!plain.contains("<actions"), "{plain}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The batch rule.
+// ---------------------------------------------------------------------------------------------
+
+fn summary(
+    id: &str,
+    index: u32,
+    status: &str,
+    surface: &str,
+    retry_of: Option<&str>,
+) -> JobSummary {
+    let mut j = json!({
+        "job_id": id, "kind": "test.job", "lane": "cpu", "priority": "agent", "status": status,
+        "substatus": null, "created": "2027-01-15T08:00:00Z", "updated": "2027-01-15T08:00:05Z",
+        "started": "2027-01-15T08:00:01Z", "finished": "2027-01-15T08:00:05Z", "attempt": 1,
+        "trace_id": "t_0", "batch_id": "b_0123456789abcdef", "index": index,
+        "origin": {"surface": surface},
+    });
+    if let Some(of) = retry_of {
+        j["retry_of"] = json!(of);
+    }
+    serde_json::from_value(j).unwrap()
+}
+
+#[test] // spec: APP-146
+fn cancelled_and_core_jobs_never_toast() {
+    // A batch whose every job was cancelled, or whose jobs the core submitted itself.
+    assert!(batch_end(&[summary("j_1", 0, "cancelled", "cli", None)]).is_none());
+    assert!(batch_end(&[summary("j_1", 0, "succeeded", "core", None)]).is_none());
+    // A cancelled job is left out of the count.
+    let end = batch_end(&[
+        summary("j_1", 0, "succeeded", "cli", None),
+        summary("j_2", 1, "cancelled", "cli", None),
+    ])
+    .unwrap();
+    assert_eq!(end.counted.len(), 1);
+    // Not yet: a newest attempt is still running. A retried attempt doesn't count.
+    assert!(
+        batch_end(&[
+            summary("j_1", 0, "failed", "cli", None),
+            summary("j_2", 0, "running", "cli", Some("j_1")),
+        ])
+        .is_none()
+    );
+    let end = batch_end(&[
+        summary("j_1", 0, "failed", "cli", None),
+        summary("j_2", 0, "succeeded", "cli", Some("j_1")),
+    ])
+    .unwrap();
+    assert_eq!(end.newest, ["j_2"]);
+    assert!(end.failed.is_none());
+
+    // Over the pipe: a cancelled job posts nothing.
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let id = job_ids(&write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "gated": true}),
+    ))
+    .remove(0);
+    write(&mut p, "job.cancel", json!({"job_id": id}));
+    assert_eq!(wait_done(&mut p, &id)["status"], "cancelled");
+    fence(&mut p, &env);
+    let launch = format!("{}:task/{id}", env.env.activation_scheme());
+    assert!(
+        !ops(&mut p).iter().any(|t| t["launch"] == launch.as_str()),
+        "{:?}",
+        ops(&mut p)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Over the pipe.
+// ---------------------------------------------------------------------------------------------
+
+#[test] // spec: APP-146
+fn categories_and_their_defaults() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    let got = p.tool_ok("desktop.get", json!({}), None);
+    let categories: Vec<&String> = got["notifications"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        categories,
+        [
+            "agent_activity",
+            "cap_alert",
+            "confirmation_waiting",
+            "director_decision",
+            "job_failed",
+            "job_finished"
+        ]
+    );
+    assert!(
+        got["notifications"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|on| *on == json!(true)),
+        "{got}"
+    );
+    assert_eq!(got["quiet_while_fullscreen"], true, "{got}");
+
+    // A category that is off posts nothing.
+    ready(&mut p);
+    let mut a = app(&env);
+    let set = a.call(
+        "app/desktop.set",
+        json!({"notifications": {"agent_activity": false}}),
+    );
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+    let off = write(&mut p, "notify.claude_code", json!({"message": "off"}));
+    assert_eq!(off, json!({"posted": false, "reason": "category_off"}));
+}
+
+#[test] // spec: APP-146, APP-022
+fn one_toast_per_batch_when_its_last_job_ends() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+
+    let ids = batch(&mut p, 3);
+    let found = until_posts(&mut p, "job_finished", 1);
+    fence(&mut p, &env);
+    let finished: Vec<Value> = posts(&mut p, "job_finished")
+        .into_iter()
+        .filter(|t| t["title"] != "Job finished")
+        .collect();
+    assert_eq!(finished.len(), 1, "one toast for the batch: {found:?}");
+    let toast = &finished[0];
+    assert_eq!(toast["title"], "Batch finished (3 jobs)", "{toast}");
+    assert_eq!(
+        toast["launch"],
+        format!("{scheme}:task/{}", ids[0]),
+        "{toast}"
+    );
+    let body = toast["body"].as_str().unwrap();
+    assert!(body.starts_with("test.job · no project · "), "{body}");
+    assert!(body.ends_with(" s"), "{body}");
+
+    // A failed job: "Job failed" with its error, launching it.
+    let failed = job_ids(&write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final"}),
+    ))
+    .remove(0);
+    assert_eq!(wait_done(&mut p, &failed)["status"], "failed");
+    let toast = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert_eq!(toast["title"], "Job failed", "{toast}");
+    assert_eq!(
+        toast["launch"],
+        format!("{scheme}:task/{failed}"),
+        "{toast}"
+    );
+    assert!(
+        toast["body"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("test.job: ")),
+        "{toast}"
+    );
+    // No job toast has actions.
+    for t in ops(&mut p).iter().filter(|t| t["op"] == "post") {
+        assert!(actions(t["xml"].as_str().unwrap()).is_empty(), "{t}");
+    }
+}
+
+#[test] // spec: APP-146
+fn a_suite_window_in_front_suppresses_and_nothing_is_queued() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let _app = app(&env);
+
+    desktop(&mut p, json!({"foreground": "suite"}));
+    let ids = batch(&mut p, 1);
+    let held = write(&mut p, "notify.claude_code", json!({"message": "in front"}));
+    assert_eq!(held, json!({"posted": false, "reason": "foreground"}));
+    desktop(&mut p, json!({"foreground": "other"}));
+    // Later toasts go out; nothing of the time in front comes with them.
+    fence(&mut p, &env);
+    let launch = format!("{}:task/{}", env.env.activation_scheme(), ids[0]);
+    let all = ops(&mut p);
+    assert!(
+        !all.iter().any(|t| t["launch"] == launch.as_str()),
+        "nothing queued: {all:?}"
+    );
+    assert!(posts(&mut p, "agent_activity").is_empty(), "{all:?}");
+}
+
+#[test] // spec: APP-146
+fn quiet_while_fullscreen_sets_silent_and_drops_nothing() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let start = desktop(&mut p, json!({"fullscreen": "d3d"}))["polls"]
+        .as_u64()
+        .unwrap();
+    until("two more polls", || {
+        (desktop(&mut p, json!({}))["polls"].as_u64().unwrap() >= start + 2).then_some(())
+    });
+    let posted = write(
+        &mut p,
+        "notify.claude_code",
+        json!({"message": "quiet one"}),
+    );
+    assert_eq!(posted["posted"], true, "{posted}");
+    let k = key();
+    let id = pending_id(&p.tool("test.destructive", json!({}), Some(&k)));
+    let toast = until(&format!("the toast of {id}"), || {
+        posts(&mut p, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id.as_str())
+    });
+    assert_eq!(
+        toast["silent"], true,
+        "confirmations are quiet too: {toast}"
+    );
+    assert_eq!(posts(&mut p, "agent_activity")[0]["silent"], true);
+
+    // With quiet mode off, the same desktop pops.
+    let mut a = app(&env);
+    let set = a.call("app/desktop.set", json!({"quiet_while_fullscreen": false}));
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+    drop(a);
+    write(&mut p, "notify.claude_code", json!({"message": "loud one"}));
+    let all = posts(&mut p, "agent_activity");
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[1]["silent"], false, "{all:?}");
+}
+
+#[test] // spec: APP-146
+fn no_progress_toast_is_ever_posted() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[notifications]\njob_progress = true\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let got = p.tool_ok("desktop.get", json!({}), None);
+    assert!(got["notifications"].get("job_progress").is_none(), "{got}");
+
+    let id = job_ids(&write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "gated": true, "expected_secs": 60}),
+    ))
+    .remove(0);
+    until("the job runs", || {
+        let listed = p.tool_ok("jobs.list", json!({"ids": [id]}), None);
+        (listed["jobs"][0]["status"] == "running").then_some(())
+    });
+    let start = desktop(&mut p, json!({}))["polls"].as_u64().unwrap();
+    until("two more polls", || {
+        (desktop(&mut p, json!({}))["polls"].as_u64().unwrap() >= start + 2).then_some(())
+    });
+    assert_eq!(ops(&mut p), Vec::<Value>::new(), "no toast while it runs");
+    write(&mut p, "test.job_release", json!({"job_id": id}));
+    assert_eq!(wait_done(&mut p, &id)["status"], "succeeded");
+    let finished = until_posts(&mut p, "job_finished", 1);
+    assert_eq!(finished[0]["title"], "Job finished");
+    assert_eq!(ops(&mut p).len(), 1, "only the job_finished post");
+}
+
+#[test] // spec: APP-146, ARCH-022, CORE-160
+fn a_restart_hold_posts_one_toast() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let ids = {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut a = app(&env);
+        let paused = a.call("app/queue.pause", json!({}));
+        assert_eq!(paused["result"]["status"], "ok", "{paused}");
+        let mut p = pipe(&env, json!({}));
+        job_ids(&write(
+            &mut p,
+            "test.job",
+            json!({"lane": "gpu-heavy", "batch": 3}),
+        ))
+    };
+    {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        let held = until_posts(&mut p, "job_failed", 1);
+        assert_eq!(held.len(), 1, "{held:?}");
+        let toast = &held[0];
+        assert_eq!(toast["title"], "Jobs held after a restart", "{toast}");
+        assert_eq!(
+            toast["body"], "3 jobs wait until you resume them in Jobs",
+            "{toast}"
+        );
+        assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");
+        assert_eq!(
+            toast["launch"],
+            format!("{scheme}:task/{}", ids[0]),
+            "{toast}"
+        );
+        write(&mut p, "job.cancel", json!({"all_mine": true}));
+    }
+    // A start that held none posts nothing.
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    fence(&mut p, &env);
+    assert!(posts(&mut p, "job_failed").is_empty());
+}
+
+#[test] // spec: APP-146
+fn fyi_toasts_coalesce_per_origin() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+
+    // Two `cli` batches: the same Tag, each posted once when it ends.
+    batch(&mut p, 2);
+    batch(&mut p, 2);
+    let both = until_posts(&mut p, "job_finished", 2);
+    assert_eq!(both.len(), 2, "{both:?}");
+    let tag = both[0]["tag"].as_str().unwrap();
+    assert!(
+        tag.starts_with("o_") && tag.len() == 18 && tag[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+        "{tag}"
+    );
+    assert_eq!(both[1]["tag"], tag, "the newer replaces the older");
+
+    // A panel batch keeps its own Tag: its batch id.
+    let mut a = app(&env);
+    let made = a.tool("test.job", json!({"lane": "cpu", "batch": 2}), Some(&key()));
+    assert_eq!(made["status"], "ok", "{made}");
+    let batch_id = made["structured"]["jobs"][0]["batch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let toast = until("the panel batch's toast", || {
+        posts(&mut p, "job_finished")
+            .into_iter()
+            .find(|t| t["tag"] == batch_id.as_str())
+    });
+    assert_eq!(toast["title"], "Batch finished (2 jobs)", "{toast}");
+    drop(a);
+
+    // A confirmation's toast is never replaced by another's: each has its own Tag.
+    let first = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    let second = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    let asks = until_posts(&mut p, "confirmation_waiting", 2);
+    let tags: Vec<&str> = asks.iter().map(|t| t["tag"].as_str().unwrap()).collect();
+    assert_eq!(tags, [first.as_str(), second.as_str()]);
+}
+
+#[test] // spec: APP-146
+fn an_unknown_category_key_is_kept_and_ignored() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[notifications]\nlater_category = false\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let got = p.tool_ok("desktop.get", json!({}), None);
+    assert!(
+        got["notifications"].get("later_category").is_none(),
+        "{got}"
+    );
+    let posted = write(&mut p, "notify.claude_code", json!({"message": "still on"}));
+    assert_eq!(posted["posted"], true, "{posted}");
+    let mut a = app(&env);
+    let set = a.call(
+        "app/desktop.set",
+        json!({"notifications": {"cap_alert": true}}),
+    );
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+    let text = std::fs::read_to_string(env.env.suite_toml()).unwrap();
+    assert!(text.contains("later_category = false"), "{text}");
+}
+
+#[test] // spec: APP-146, APP-022, CORE-115
+fn confirmation_toast_is_removed_when_answered_or_expired() {
+    let env = TestEnv::new();
+    let clock = FakeClock::new();
+    let _core = core_with(&env, clock.clone(), Some(Arc::new(SeqIds::new())), None);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let removed = |p: &mut RawPipe, id: &str| {
+        until(&format!("the toast of {id} removed"), || {
+            ops(p)
+                .iter()
+                .any(|t| {
+                    t["op"] == "remove" && t["tag"] == id && t["group"] == "confirmation_waiting"
+                })
+                .then_some(())
+        });
+    };
+
+    // Answered in the app.
+    let answered = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    until_posts(&mut p, "confirmation_waiting", 1);
+    let mut a = app(&env);
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": answered, "answer": "deny"}),
+    );
+    assert_eq!(r["result"]["status"], "ok", "{r}");
+    removed(&mut p, &answered);
+    drop(a);
+
+    // Expired unanswered.
+    let expired = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    until_posts(&mut p, "confirmation_waiting", 2);
+    clock.advance(Duration::from_secs(31 * 60));
+    removed(&mut p, &expired);
+}
+
+#[test] // spec: APP-022, ARCH-053, CORE-111
+fn a_toast_deny_needs_its_token_and_works_once() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let ids: Arc<dyn IdSource> = Arc::new(lil_platform::RandomIds);
+    let clock = FakeClock::new();
+    let k = key();
+    let (survivor, old_token) = {
+        let _core = core_with(&env, clock.clone(), Some(ids.clone()), None);
+        let mut p = pipe(&env, json!({}));
+        ready(&mut p);
+        let mut a = app(&env);
+        let deny = |a: &mut TestApp, id: &str, token: &str| -> Value {
+            a.call(
+                "app/confirmation.answer",
+                json!({"confirmation_id": id, "answer": "deny", "toast_token": token}),
+            )["result"]
+                .clone()
+        };
+
+        let first = pending_id(&p.tool("test.destructive", json!({}), Some(&k)));
+        let token = deny_token(&mut p, &scheme, &first);
+        let second = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        let other = deny_token(&mut p, &scheme, &second);
+        assert_ne!(token, other, "each toast its own token");
+        // A wrong token, and another confirmation's: unknown, and the confirmation still waits.
+        assert_eq!(
+            error_code(&deny(&mut a, &first, "0123456789abcdef0123456789abcdef")),
+            "confirm.unknown"
+        );
+        assert_eq!(error_code(&deny(&mut a, &first, &other)), "confirm.unknown");
+        // A token only denies, and never with a cap.
+        let approve = a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": first, "answer": "approve", "toast_token": token}),
+        );
+        assert_eq!(
+            error_code(&approve["result"]),
+            "params.invalid",
+            "{approve}"
+        );
+        let with_cap = a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": first, "answer": "deny", "toast_token": token,
+                   "cap": {"action": "allow_once"}}),
+        );
+        assert_eq!(
+            error_code(&with_cap["result"]),
+            "params.invalid",
+            "{with_cap}"
+        );
+        // The right one denies once, recorded as the app's answer.
+        let denied = deny(&mut a, &first, &token);
+        assert_eq!(denied["status"], "ok", "{denied}");
+        assert_eq!(denied["confirmation"]["state"], "denied");
+        assert_eq!(denied["confirmation"]["confirmed_via"], "app");
+        assert_eq!(
+            error_code(&p.tool("test.destructive", json!({}), Some(&k))),
+            "confirm.denied"
+        );
+        assert_eq!(error_code(&deny(&mut a, &first, &token)), "confirm.unknown");
+        // The window's path keeps its own codes.
+        let again = a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": first, "answer": "deny"}),
+        );
+        assert_eq!(error_code(&again["result"]), "confirm.already_answered");
+
+        // Answered in the window: its toast's token is dead at once.
+        let r = a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": second, "answer": "deny"}),
+        );
+        assert_eq!(r["result"]["status"], "ok");
+        assert_eq!(
+            error_code(&deny(&mut a, &second, &other)),
+            "confirm.unknown"
+        );
+
+        // Expired: dead at once.
+        let third = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        let t3 = deny_token(&mut p, &scheme, &third);
+        clock.advance(Duration::from_secs(31 * 60));
+        assert_eq!(error_code(&deny(&mut a, &third, &t3)), "confirm.unknown");
+
+        // One that survives the restart.
+        let fourth = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        let t4 = deny_token(&mut p, &scheme, &fourth);
+        (fourth, t4)
+    };
+    // After a core restart an old token is unknown; the confirmation still waits.
+    let _core = core_with(&env, clock, Some(ids), None);
+    let mut a = app(&env);
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": survivor, "answer": "deny", "toast_token": old_token}),
+    );
+    assert_eq!(error_code(&r["result"]), "confirm.unknown", "{r}");
+    let listed = a.call("app/confirmations.list", json!({"state": "pending"}));
+    assert_eq!(
+        listed["result"]["confirmations"][0]["id"],
+        survivor.as_str(),
+        "{listed}"
+    );
+}
+
+/// What a test's core logs, all of it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+#[test] // spec: APP-022, ARCH-117
+fn a_toast_token_never_reaches_a_log_line() {
+    let logs = Captured::default();
+    // nextest runs each test in its own process, so this one owns the global subscriber.
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut a = app(&env);
+    let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    let token = deny_token(&mut p, &scheme, &id);
+    let wrong = "fedcba9876543210fedcba9876543210";
+    for t in [wrong, token.as_str()] {
+        a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": id, "answer": "deny", "toast_token": t}),
+        );
+    }
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    assert!(
+        !text.contains(&token),
+        "a log line holds the token:\n{text}"
+    );
+    assert!(
+        !text.contains(wrong),
+        "a log line holds a refused token:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("{scheme}:deny/{id}/…")),
+        "the posted Deny URL is logged cut:\n{text}"
+    );
+}
+
+#[test] // spec: APP-022, QA-031
+fn toast_tokens_come_from_the_os_random_source() {
+    // In production the core's ids are the OS random source.
+    let env = TestEnv::new();
+    let base = CoreConfig::for_env(env.env.clone()).unwrap();
+    assert_eq!(format!("{:?}", base.ids), "RandomIds");
+
+    // The notifier takes its tokens from the injected source: here the test's counter.
+    let scheme = env.env.activation_scheme();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    let token = deny_token(&mut p, &scheme, &id);
+    assert_eq!(token.len(), 32, "{token}");
+    let (a, b) = token.split_at(16);
+    let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+    assert_eq!(b, a + 1, "two ids of the injected source in a row: {token}");
+}
+
+#[test] // spec: APP-146, CORE-089
+fn cap_alert_posts_once_per_threshold() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({"non_interactive": true}));
+    ready(&mut p);
+    // 60 %, 70 %, 85 %, 100 %.
+    for amount in ["0.6", "0.1", "0.15", "0.15"] {
+        write(
+            &mut p,
+            "test.meter_external",
+            json!({"provider": "fakeprov", "amount": amount}),
+        );
+    }
+    let alerts = until_posts(&mut p, "cap_alert", 3);
+    let titles: Vec<&str> = alerts
+        .iter()
+        .map(|t| t["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        ["Spending at 50 %", "Spending at 80 %", "Spending at 100 %"]
+    );
+    for t in &alerts {
+        assert!(
+            t["body"]
+                .as_str()
+                .is_some_and(|b| b.starts_with("monthly cap, ")),
+            "{t}"
+        );
+        assert!(t.get("launch").is_none(), "no target: {t}");
+    }
+    let tags: std::collections::HashSet<&str> =
+        alerts.iter().map(|t| t["tag"].as_str().unwrap()).collect();
+    assert_eq!(tags.len(), 3, "{alerts:?}");
+    fence(&mut p, &env);
+    assert_eq!(posts(&mut p, "cap_alert").len(), 3, "once each");
+}
+
+#[test] // spec: ARCH-103, APP-146
+fn claude_code_duplicates_within_10_s_are_dropped() {
+    let env = TestEnv::new();
+    let clock = FakeClock::new();
+    let _core = core_with(&env, clock.clone(), Some(Arc::new(SeqIds::new())), None);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let say = |p: &mut RawPipe, args: Value| write(p, "notify.claude_code", args);
+    assert_eq!(
+        say(&mut p, json!({"message": "m"})),
+        json!({"posted": true})
+    );
+    assert_eq!(
+        say(&mut p, json!({"message": "m"})),
+        json!({"posted": false, "reason": "duplicate"})
+    );
+    assert_eq!(
+        say(&mut p, json!({"message": "other", "title": "Waiting"})),
+        json!({"posted": true})
+    );
+    clock.advance(Duration::from_secs(9));
+    assert_eq!(say(&mut p, json!({"message": "m"}))["reason"], "duplicate");
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(
+        say(&mut p, json!({"message": "m"})),
+        json!({"posted": true})
+    );
+
+    let all = posts(&mut p, "agent_activity");
+    let shown: Vec<(&str, &str)> = all
+        .iter()
+        .map(|t| (t["title"].as_str().unwrap(), t["body"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("Claude Code", "m"),
+            ("Claude Code: Waiting", "other"),
+            ("Claude Code", "m")
+        ]
+    );
+    assert!(all.iter().all(|t| t.get("launch").is_none()), "{all:?}");
+    // Each its own Tag.
+    assert_ne!(all[0]["tag"], all[2]["tag"]);
+
+    for bad in [
+        json!({"message": ""}),
+        json!({"message": "x".repeat(2001)}),
+        json!({"message": "x", "title": "t".repeat(101)}),
+    ] {
+        let refused = p.tool("notify.claude_code", bad, Some(&key()));
+        assert_eq!(error_code(&refused), "params.invalid", "{refused}");
+    }
+}
+
+#[test] // spec: APP-065, ARCH-005
+fn agent_open_posts_agent_activity_with_an_open_url() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let viewer = env.root().join("viewer").join("spec-viewer.exe");
+    lil_testkit::files::write_file(
+        &env.env.data_dir().join(r"apps\viewer.toml"),
+        format!(
+            "app = \"viewer\"\nexe = '{}'\n[[opens]]\ntypes = [\"image\"]\nformats = [\"png\"]\nintents = [\"open\", \"edit\"]\n",
+            viewer.display()
+        )
+        .as_bytes(),
+    );
+    let target = env.root().join("picture.png");
+    lil_testkit::files::write_file(&target, b"\x89PNG\r\n\x1a\n");
+    let target = target.to_string_lossy().into_owned();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+
+    let shown = p.tool_ok("ui.show", json!({"target": target}), None);
+    assert_eq!(shown["running"], false, "{shown}");
+    let toast = until_posts(&mut p, "agent_activity", 1).remove(0);
+    assert_eq!(toast["title"], "Claude Code", "{toast}");
+    assert_eq!(toast["body"], "Claude Code opened picture.png", "{toast}");
+    assert_eq!(
+        toast["launch"],
+        lil_parse::open_url(&scheme, &target),
+        "{toast}"
+    );
+    p.tool_ok(
+        "open_in",
+        json!({"app": "viewer", "target": target, "intent": "edit"}),
+        None,
+    );
+    until_posts(&mut p, "agent_activity", 2);
+
+    // Your own app's request posts nothing.
+    let mut a = app(&env);
+    let mine = a.tool("ui.show", json!({"target": target}), None);
+    assert_eq!(mine["status"], "ok", "{mine}");
+    drop(a);
+    fence(&mut p, &env);
+    assert_eq!(posts(&mut p, "agent_activity").len(), 2);
+}

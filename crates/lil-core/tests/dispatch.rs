@@ -1032,6 +1032,7 @@ async fn approve(confirm: &lil_core::confirm::Confirm, id: &str) {
             lil_protocol::app::ConfirmationAnswerParams {
                 confirmation_id: id.into(),
                 answer: lil_protocol::app::Answer::Approve,
+                toast_token: None,
                 cap: None,
             },
         )

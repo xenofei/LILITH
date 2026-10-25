@@ -48,14 +48,21 @@
 //!   `app/desktop.set`); once the jobs exist, the fullscreen poll starts (every 2 s, or
 //!   `LIL_TEST_DESKTOP_POLL_MS` on a test channel), with the auto-pause and keep-awake, and
 //!   the session-end window's sleep broadcasts go to the poll's sleep log. Keep-awake releases
-//!   its request when the shutdown ends.
+//!   its request when the shutdown ends. A test channel's fake desktop starts with the
+//!   handlers `missing`, as before the notification setup, so its notification path can't
+//!   reach you until a test sets it up (`test.desktop`).
+//! - The notifier ([`crate::interchange::Notifier`], APP-146) starts with the fullscreen poll,
+//!   before the dispatcher is built: it is the confirmations' notification path (ARCH-055)
+//!   and posts `notify.claude_code`'s and an agent's `open_in`'s toasts, and it reads the
+//!   jobs' batches once they exist. When a start held jobs (P4a-R41), it posts one toast once
+//!   the suite's jobs and the default workspace's are recovered.
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lil_platform::desktop::{Desktop, real_desktop};
+use lil_platform::desktop::{Desktop, HandlerState, real_desktop};
 use lil_platform::desktop_fake::FakeDesktop;
 use lil_platform::session_end::{PowerEvent, SessionEnd, SessionEndSim, SessionEndWatcher};
 use lil_platform::{Env, process};
@@ -64,7 +71,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CoreConfig, CoreExit, ParentWatchFault, ParentWatchStep};
-use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NoNotificationPath, UiPresence};
+use crate::confirm::{AgentConfirm, Confirm, MCP_CONFIRMATION, NotificationPath, UiPresence};
 use crate::desktop::{
     AutoPause, DesktopSettingsStore, DesktopWatch, KeepAwake, UiApps, start_autopause,
     start_keep_awake,
@@ -73,7 +80,7 @@ use crate::docs::{Holds, TestHolds, register_doc_tools, register_test_hold};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
-use crate::interchange::{Interchange, register_interchange_tools};
+use crate::interchange::{Interchange, Notifier, NotifierParts, register_interchange_tools};
 use crate::jobs::Estimator;
 use crate::jobs::scheduler::GpuScheduler;
 use crate::lifecycle::{DrainReason, IDLE_TICK, Lifecycle, ShutdownReport};
@@ -334,7 +341,12 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     }
     // The desktop (P4a-R24): the real one on stable and dev, the fake on test channels, so no
     // test reads the real desktop or holds a real power request (QA-038).
-    let fake_desktop = cfg.test_tools.then(|| Arc::new(FakeDesktop::new()));
+    let fake_desktop = cfg.test_tools.then(|| {
+        let fake = Arc::new(FakeDesktop::new());
+        // As before the notification setup: no toast can reach you until a test sets it up.
+        fake.set_handlers(HandlerState::Missing);
+        fake
+    });
     let desktop: Arc<dyn Desktop> = match &fake_desktop {
         Some(fake) => fake.clone(),
         None => real_desktop(&cfg.env),
@@ -355,21 +367,49 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     register_desktop_tools(&mut registry, &desktop_settings);
     let ui_apps = Arc::new(UiApps::default());
     if let Some(fake) = &fake_desktop {
-        register_test_desktop(&mut registry, fake.clone(), ui_apps.clone());
+        register_test_desktop(
+            &mut registry,
+            fake.clone(),
+            ui_apps.clone(),
+            desktop_settings.clone(),
+        );
     }
-    // The confirmations (ARCH-052–055): stage 5's confirm half, answered by the apps.
+    // The fullscreen poll (CORE-160, APP-146), shared by the auto-pause and the quiet mode.
+    let desktop_watch = DesktopWatch::start(
+        desktop.clone(),
+        cfg.clock.clone(),
+        cfg.desktop_poll.unwrap_or(crate::desktop::POLL_EVERY),
+        events.clone(),
+    );
+    // The notifier (APP-146): the toasts, and the confirmations' notification path.
+    let notifier = Notifier::start(NotifierParts {
+        desktop: desktop.clone(),
+        watch: desktop_watch.clone(),
+        settings: desktop_settings.clone(),
+        events: events.clone(),
+        apps: ui_apps.clone(),
+        env: cfg.env.clone(),
+        clock: cfg.clock.clone(),
+        ids: cfg.ids.clone(),
+    })
+    .await;
+    interchange.set_notifier(notifier.clone());
+    // The confirmations (ARCH-052–055): stage 5's confirm half, answered by the apps, or
+    // waiting for you through the notifier's toasts.
+    let path: Arc<dyn NotificationPath> = notifier.clone();
     let confirm = Confirm::new(
         state.clone(),
         events.clone(),
         cfg.clock.clone(),
         cfg.ids.clone(),
         UiPresence::new(),
-        Arc::new(NoNotificationPath),
+        path,
         cfg.confirm_lifetime,
         MCP_CONFIRMATION,
         cfg.failpoints.clone(),
     );
     confirm.set_caps(caps.clone());
+    notifier.set_confirm(&confirm);
     match confirm.load(state.suite()).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "pending confirmations of an earlier core run"),
@@ -412,6 +452,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     );
     let active_projects = dispatcher.active_projects().clone();
     let jobs = dispatcher.jobs().clone();
+    notifier.set_jobs(&jobs);
     // The estimate each job takes at submission, from the telemetry's history (CORE-161).
     let display = {
         let caps = caps.clone();
@@ -511,13 +552,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         }
     }
     lifecycle.add_blocker(jobs.clone());
-    // The fullscreen poll, the auto-pause and keep-awake (CORE-160, ARCH-127).
-    let desktop_watch = DesktopWatch::start(
-        desktop.clone(),
-        cfg.clock.clone(),
-        cfg.desktop_poll.unwrap_or(crate::desktop::POLL_EVERY),
-        events.clone(),
-    );
+    // The auto-pause and keep-awake (CORE-160, ARCH-127).
     let autopause = start_autopause(&desktop_watch, jobs.clone(), desktop_settings.current());
     let keep_awake = start_keep_awake(desktop, jobs.clone(), desktop_settings.current());
     // Outside ComfyUI jobs keep the core up but hold no drain (ARCH-020, ARCH-069); the poller
@@ -551,8 +586,13 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.pipe_instance_fault.clone(),
     ));
 
-    if let Some(ws) = hub.default_ref() {
+    let default_ws = hub.default_ref();
+    if default_ws.is_none() {
+        tokio::spawn(post_restart_hold(notifier.clone(), jobs.clone()));
+    }
+    if let Some(ws) = default_ws {
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
+        let notifier = notifier.clone();
         let confirm = confirm.clone();
         let models = models.clone();
         let meter = meter.clone();
@@ -561,11 +601,13 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             match hub.open(&ws).await {
                 Err(e) => {
                     tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
+                    post_restart_hold(notifier, jobs).await;
                 }
                 Ok(open) => {
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
+                    post_restart_hold(notifier, jobs.clone()).await;
                     // The meter's recovery only after a successful repair (ruling P3-R33).
                     let start = caps.repair_then_recover_workspace(&meter, &open).await;
                     if let Err(e) = start.repaired {
@@ -900,6 +942,16 @@ async fn tick_idle(lifecycle: Arc<Lifecycle>, idle_after: Duration) {
         if lifecycle.drain_if_idle() {
             return;
         }
+    }
+}
+
+/// The restart hold's one toast (P4a-R41): the jobs a restart holds once the start's
+/// recoveries ran, if any.
+async fn post_restart_hold(notifier: Arc<Notifier>, jobs: Arc<crate::jobs::Jobs>) {
+    let held = jobs.restart_held_jobs();
+    if let Some(first) = held.first() {
+        let outcome = notifier.restart_held(held.len(), first).await;
+        tracing::info!(held = held.len(), outcome = ?outcome, "the restart hold's toast");
     }
 }
 

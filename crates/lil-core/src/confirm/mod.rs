@@ -13,8 +13,9 @@
 //!   verified app's own caps change, CORE-008). Denying it is the cancel.
 //! - **When it can be answered** ([`Confirm::answerable`]): while a verified `ui:*` connection
 //!   whose shared capabilities hold `confirmations.v1` or `caps.v1` is open ([`UiPresence`]),
-//!   or the notification path can reach you (plan 4; [`NoNotificationPath`] until then).
-//!   Otherwise, and always for a non-interactive caller, the call gets `confirm.unavailable`.
+//!   or the notification path can reach you (from plan 4a the server's notifier;
+//!   [`NoNotificationPath`] never does). Otherwise, and always for a non-interactive caller,
+//!   the call gets `confirm.unavailable`.
 //! - **Where it lives.** In the `state.db` of the call's scope (the suite one, or the
 //!   workspace's), keyed by the call's idempotency row `(scope, key)` and bound to the tool and
 //!   the arguments' hash. It expires [`Confirm::new`]'s `lifetime` after it was made (30
@@ -33,6 +34,13 @@
 //!   dialog, which the core cannot see: it verifies the connection, not the click (APP-044).
 //!   A caller-supplied `confirm: true` is an unknown field everywhere (CORE-111). Every answer
 //!   records how it was given (`confirmed_via`), and the answered ones are the history.
+//! - **Toast tokens** (P4a-R9; Appendix G "Deny from a toast"). The notifier mints one for
+//!   each confirmation toast it posts and binds it here ([`Confirm::bind_toast_token`]), only
+//!   while the confirmation is pending; it lives in memory with the pending entry, so the
+//!   confirmation's end by any route (an answer, the expiry, a cancel) and a core stop kill it
+//!   at once. An answer with a `toast_token` is a deny only, without a `cap`
+//!   (`params.invalid`); the token is checked first and taken, so an unknown, dead or reused
+//!   one is `confirm.unknown` whatever state the confirmation is in. No log line holds it.
 //! - **`mcp_confirmation`** ([`McpConfirmation`], Appendix F: [`MCP_CONFIRMATION`] =
 //!   `Core`). With `Core` an `mcp` call is confirmed like any agent call and no tool carries
 //!   `anthropic/requiresUserInteraction` (ruling P3-R10: one prompt); with `ClaudeCode` the
@@ -193,7 +201,8 @@ fn workspace_of(scope: &str) -> &str {
     scope.rsplit_once('|').map_or(NO_WORKSPACE, |(_, ws)| ws)
 }
 
-/// How the core reaches you with no app open (plan 4: toasts and `lil:confirm/<id>`).
+/// How the core reaches you with no app open (plan 4a: toasts and `lil:confirm/<id>`). It may
+/// read the desktop, so [`Confirm::answerable`] calls it off the async threads.
 pub trait NotificationPath: Send + Sync {
     fn reachable(&self) -> bool;
 }
@@ -309,6 +318,8 @@ struct Tracked {
     expires_utc: i64,
     session_id: String,
     ui_cap: bool,
+    /// The live toast token of its toast, if one was posted (module docs, "Toast tokens").
+    toast_token: Option<String>,
 }
 
 /// The confirmations of every scope (module docs).
@@ -394,9 +405,64 @@ impl Confirm {
     }
 
     /// Whether a confirmation can be answered now (APP-051): an app that can answer is
-    /// connected, or the notification path reaches you.
-    pub fn answerable(&self) -> bool {
-        self.presence.any() || self.notify.reachable()
+    /// connected, or the notification path reaches you (read on a blocking thread: it may read
+    /// the desktop).
+    pub async fn answerable(&self) -> bool {
+        if self.presence.any() {
+            return true;
+        }
+        let notify = self.notify.clone();
+        tokio::task::spawn_blocking(move || notify.reachable())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "reading the notification path failed");
+                false
+            })
+    }
+
+    /// Binds `token` to the pending confirmation `id`'s toast (module docs, "Toast tokens"):
+    /// `false`, and nothing bound, when `id` isn't pending in this core any more.
+    pub fn bind_toast_token(&self, id: &str, token: String) -> bool {
+        match self.tracked().get_mut(id) {
+            Some(t) => {
+                t.toast_token = Some(token);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Unbinds `token` from `id` (its toast wasn't posted after all).
+    pub fn forget_toast_token(&self, id: &str, token: &str) {
+        let _ = self.take_toast_token(id, token);
+    }
+
+    /// Takes the live toast token of `id` when it is `token`: the token dies here, so it works
+    /// once. `false` for any other token, and for a confirmation with none.
+    fn take_toast_token(&self, id: &str, token: &str) -> bool {
+        let mut tracked = self.tracked();
+        let Some(t) = tracked.get_mut(id) else {
+            return false;
+        };
+        if t.toast_token
+            .as_deref()
+            .is_some_and(|live| same_token(live, token))
+        {
+            t.toast_token = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Puts back a token [`Confirm::take_toast_token`] took, when the deny it carried could not
+    /// be recorded (the database failed) and the confirmation is still pending.
+    fn restore_toast_token(&self, id: &str, token: String) {
+        if let Some(t) = self.tracked().get_mut(id)
+            && t.toast_token.is_none()
+        {
+            t.toast_token = Some(token);
+        }
     }
 
     fn now(&self) -> i64 {
@@ -414,14 +480,18 @@ impl Confirm {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Knows `row` as pending; a toast token already bound to it stays.
     fn track(&self, row: &ConfirmationRow) {
-        self.tracked().insert(
+        let mut tracked = self.tracked();
+        let toast_token = tracked.get(&row.id).and_then(|t| t.toast_token.clone());
+        tracked.insert(
             row.id.clone(),
             Tracked {
                 workspace: row.workspace().to_string(),
                 expires_utc: row.expires_utc,
                 session_id: row.session_id.clone(),
                 ui_cap: row.caller_kind.starts_with("ui:") && row.covers.contains(&Cover::Cap),
+                toast_token,
             },
         );
     }
@@ -591,13 +661,69 @@ impl Confirm {
     /// An approval of a confirmation that covers a cap needs a cap action (module docs, "Cap
     /// answers"); `raise` changes the cap before the answer is recorded.
     ///
+    /// With a `toast_token` it is a deny from a confirmation toast (module docs, "Toast
+    /// tokens"): the token is checked, and taken, before anything about the confirmation, and
+    /// every way the deny can't land is `confirm.unknown`; it is recorded `confirmed_via: app`
+    /// like any app answer.
+    ///
     /// # Errors
     /// `caller.not_allowed` for any other session; `confirm.unknown`; `confirm.expired` for one
     /// that expired or was cancelled; `confirm.already_answered`; `params.invalid` for a cap
-    /// action on a confirmation that covers no cap, an approval of a cap without one, or a
-    /// `raise` without a valid `raise_to`; the caps' errors for a `raise` (`caps.invalid`, the
-    /// store's); `state.unavailable`.
+    /// action on a confirmation that covers no cap, an approval of a cap without one, a
+    /// `raise` without a valid `raise_to`, or a `toast_token` with an approval or a cap; the
+    /// caps' errors for a `raise` (`caps.invalid`, the store's); `state.unavailable`.
     pub async fn answer(
+        &self,
+        by: &Session,
+        mut p: ConfirmationAnswerParams,
+    ) -> Result<ConfirmationRow, ErrorBody> {
+        let Some(token) = p.toast_token.take() else {
+            return self.answer_checked(by, p).await;
+        };
+        let trace_id = self.ids.id("t");
+        let fail = |spec: &CodeSpec, message: String| ErrorBody::new(spec, message, &trace_id);
+        let id = p.confirmation_id.clone();
+        if !can_answer(by) {
+            tracing::warn!(caller = %by.caller, session = %by.id, "a toast deny from a session that can't answer; refused");
+            return Err(fail(
+                &codes::CALLER_NOT_ALLOWED,
+                "Only the LILITH app can answer a confirmation.".into(),
+            ));
+        }
+        if p.answer != Answer::Deny || p.cap.is_some() {
+            return Err(fail(
+                &codes::PARAMS_INVALID,
+                "A toast's token only denies, and takes no cap action.".into(),
+            ));
+        }
+        // The token is never logged: only the confirmation id.
+        if !self.take_toast_token(&id, &token) {
+            tracing::info!(confirmation = %id, "a toast deny whose token isn't live; refused");
+            return Err(fail(
+                &codes::CONFIRM_UNKNOWN,
+                format!("This toast's Deny is no longer live for confirmation {id}."),
+            ));
+        }
+        match self.answer_checked(by, p).await {
+            Ok(row) => {
+                tracing::info!(confirmation = %id, "a confirmation was denied from its toast");
+                Ok(row)
+            }
+            Err(e) if e.code == codes::STATE_UNAVAILABLE.code => {
+                self.restore_toast_token(&id, token);
+                Err(e)
+            }
+            Err(e) if e.code == codes::CALLER_NOT_ALLOWED.code => Err(e),
+            // Answered elsewhere or expired meanwhile: the window's codes aren't the toast's.
+            Err(_) => Err(fail(
+                &codes::CONFIRM_UNKNOWN,
+                format!("This toast's Deny is no longer live for confirmation {id}."),
+            )),
+        }
+    }
+
+    /// [`Confirm::answer`] without a toast token.
+    async fn answer_checked(
         &self,
         by: &Session,
         p: ConfirmationAnswerParams,
@@ -883,6 +1009,15 @@ impl Confirm {
     pub fn busy(&self) -> bool {
         IdleBlocker::busy(self)
     }
+}
+
+/// Whether two toast tokens are equal, in time that doesn't depend on where they differ.
+fn same_token(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// `confirm` before `cap`, each once.
