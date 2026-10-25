@@ -1625,6 +1625,9 @@ git commit -m "dev: Windows Hello (route proven in Step 0) unlocks the reviewer 
 - **Face sign-in found on removes LILITH's own enrolment** (plan 4a ruling): both Hello files and the key credential; the passphrase file stays. Unknown keeps the enrolment and warns.
 - **Step 4's owner check is the first real merge through `lil dev merge-flow`** on the next real PR, not a test PR (plan 4a ruling).
 
+**Recorded 2026-10-25 (Task 28 follow-up; QA-088's 2026-10-25 line):**
+- **The rest before a Merge or Approve click is 150 ms** (plan 4a ruling 2026-10-25), down from 300 ms, which refused a brisk, deliberate first click in the first real merges. Real pointer moves over the button while it is still grey count towards the rest, so a pointer parked on it before the buttons turn on isn't refused. A move that isn't real, such as a program warping the cursor onto the button, starts the rest again.
+
 ---
 
 ### Task 29: Close-out: the desktop group, the layout and responsiveness checks, and the milestone checks (APP-001, APP-003, APP-135, APP-136, APP-139, ARCH-116, QA-030, QA-042, QA-064, QA-071; P4a-R31) — **protected: `test-params.toml`, `.github/workflows/ci-pr-ready.yml` (pushed by the owner)**
