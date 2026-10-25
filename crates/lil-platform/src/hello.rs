@@ -1753,8 +1753,8 @@ impl PointerMsg {
 /// **Which devices the keep trusts** (round 3): only a mouse whose raw input (from a device,
 /// `hDevice` not null) came with the rest's last real move, with no digitizer report since the
 /// real move before it and none since, the mouse's and the digitizers' registrations both in
-/// place and still this window's, and the window not in a remote session
-/// (`SM_REMOTESESSION`). Anything else gets Task 28c's rule.
+/// place and still this window's, and the window never in a remote session since it opened
+/// (`SM_REMOTESESSION`, read at open and before each move). Anything else gets Task 28c's rule.
 ///
 /// Without raw input (the mouse's registration failed, or another registration in this process
 /// took the mouse's or the digitizers', checked before each move is judged) every move that
@@ -1901,10 +1901,11 @@ impl ClickGate {
         self.digitizers = ok;
     }
 
-    /// Whether the window is in a remote session (`SM_REMOTESESSION`, round 3): then the
-    /// same-place keep is off.
+    /// Whether the window is in a remote session (`SM_REMOTESESSION`, read at open and before
+    /// each move: rounds 3 and 3b): then the same-place keep is off, and stays off for the
+    /// window once it has been remote.
     pub fn remote_session(&mut self, remote: bool) {
-        self.remote = remote;
+        self.remote |= remote;
     }
 
     /// A digitizer `WM_INPUT` (a touchpad, pen or touch screen report, round 3): like motion
@@ -2309,8 +2310,12 @@ fn raw_is_for(window: HWND, usages: &[(u16, u16)]) -> bool {
 
 /// Before a move to `window` (or its accept button) is judged: when raw input is on but the
 /// mouse's, or the digitizers' it registered, is no longer this window's, Task 28c's rule from
-/// now on, and one line says so (Task 28d).
+/// now on, and one line says so (Task 28d). A session that has turned remote turns the
+/// same-place keep off (round 3b).
 fn check_raw_mouse(window: HWND) {
+    // SAFETY: a plain query.
+    let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
+    with_gate(|g| g.remote_session(remote));
     let digitizers = DIGITIZERS.with(|d| d.get());
     if with_gate(|g| g.raw_on())
         && !(raw_is_for(window, &RAW_MOUSE) && (!digitizers || raw_is_for(window, &RAW_DIGITIZERS)))
@@ -5486,6 +5491,35 @@ mod tests {
             r.wait(300);
             r.click();
             assert_eq!(r.clicks, [Click::Accepted], "{fakes:?}");
+        }
+    }
+
+    /// Task 28d round 3b: the session turns remote while the window is open (checked before
+    /// each move). The keep goes off at once, and stays off for the window even if the session
+    /// reads local again.
+    #[test] // spec: QA-088, QA-036
+    fn replay_the_session_turning_remote_mid_window_turns_the_keep_off() {
+        for fakes in ALL_FAKES {
+            for back_local in [false, true] {
+                let mut r = Replay::open(fakes, true);
+                rest_on_merge(&mut r);
+                r.wait(250);
+                r.background_move(); // kept: local, the mouse made the rest
+                r.gate.remote_session(true);
+                if back_local {
+                    r.gate.remote_session(false);
+                }
+                r.wait(250);
+                r.background_move();
+                r.wait(100);
+                r.click();
+                r.report("turned remote");
+                assert_eq!(
+                    r.clicks,
+                    [refused("no_move")],
+                    "{fakes:?}, back local {back_local}"
+                );
+            }
         }
     }
 
