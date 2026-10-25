@@ -1703,7 +1703,12 @@ impl PointerMsg {
 /// keeps a slide, and a warp followed by Windows' own move, from counting even if that move
 /// reports hardware, as far as this window knows where the cursor was (below): after a leave,
 /// or with no leave armed, it can't know, so the position is then unknown. Whether Windows' own
-/// moves report hardware is still to be measured (Task 28 check 11, Task 28c review I2). A move
+/// moves report hardware is still to be measured (Task 28 check 11, Task 28c review I2). **Open
+/// under Hardware** (re-review N1, a documented residual): a warp that Windows merges with one
+/// of its own moves arrives as a single move at a new place; if that reports hardware it counts,
+/// and no `GetCursorPos` rule can tell it from the hand. Closing it needs raw input (backlog,
+/// Task 28c option (b)); the test `replay_a_warp_merged_with_windows_own_move_is_open_under_hardware`
+/// pins it. Every unlock still needs the owner's PIN at the Windows Hello prompt. A move
 /// that isn't hardware still ends the rest even at the same position: after
 /// moves this window never saw (the cursor over another window, or moves Windows merged into
 /// one), a warp back to the very same pixel can't be told from a still hand.
@@ -1818,7 +1823,12 @@ impl ClickGate {
 
     /// A `WM_LBUTTONDOWN` to the window itself: a press on the grey accept button is refused,
     /// as the click that brought the window to the front or as one before the buttons were live.
+    /// Any press here forgets where the cursor is (re-review N2): while the button is down,
+    /// another thread can take the capture and move the cursor where this window never sees it.
+    /// The rest is untouched, and the next move just records the place.
     pub fn window_press(&mut self, over_grey_accept: bool) -> Option<Refusal> {
+        self.window_tracked = false;
+        self.last_at = None;
         let brought_forward = std::mem::replace(&mut self.click_activated, false);
         over_grey_accept.then(|| grey_click_refusal(brought_forward))
     }
@@ -1874,12 +1884,15 @@ impl ClickGate {
     /// `WM_CAPTURECHANGED` to the accept button. Within its own release after a real release
     /// inside it (the button gives the capture back), the press is gone and the rest stays, so
     /// clicking again without moving can count (Task 28c); any other loss of the capture drops
-    /// both.
+    /// both, and forgets where the cursor is (re-review N2): the capture may have gone to
+    /// another thread, and the cursor with it, unseen.
     pub fn capture_changed(&mut self) {
         if self.own_release {
             self.press.drop_press();
         } else {
             self.press.cancel();
+            self.button_tracked = false;
+            self.last_at = None;
         }
     }
 
@@ -3664,6 +3677,19 @@ mod tests {
         }
 
         /// The window or Merge slides under the still cursor: the delay restarts.
+        /// Another program warps the cursor to `p` and at once makes Windows send one of its own
+        /// moves (it shows or hides a window of its own, or changes the z-order), before this
+        /// window's thread pumps its queue: Windows merges the two into one move at `p`, which
+        /// reports what Windows' own moves report (Task 28c re-review N1).
+        fn merged_warp(&mut self, p: (i32, i32)) {
+            let origin = match self.fakes {
+                // No own move: only the warp's.
+                Fakes::NoMove | Fakes::System => InputOrigin::System,
+                Fakes::Hardware => InputOrigin::Hardware,
+            };
+            self.place(p, origin);
+        }
+
         fn slide(&mut self) {
             self.gate.restart(Some(self.cursor));
             self.enabled = false;
@@ -4161,6 +4187,79 @@ mod tests {
                 r.clicks
             );
         }
+    }
+
+    /// Task 28c re-review N1, **pinned as open** (ruled a documented residual 2026-10-25): a warp
+    /// merged with Windows' own move into one move. While Merge is grey, the cursor is on the
+    /// window's own row; another program warps it onto grey Merge and at once triggers one of
+    /// Windows' own moves, so the window gets a single move at the new place. If Windows' own
+    /// moves report `IMO_HARDWARE`, that move is a real move somewhere new, the rest starts,
+    /// and a still owner click once Merge is live merges. No `GetCursorPos` rule can tell it
+    /// from the hand; closing it needs raw input (backlog: Task 28c option (b), with the Phase B
+    /// measurement of what that merged move reports). The Merge gate is defence in depth: every
+    /// unlock still needs the owner's PIN at the Windows Hello prompt. This test records the
+    /// case; when it is closed, the Hardware row becomes all `no_move`.
+    #[test] // spec: QA-088, QA-036
+    fn replay_a_warp_merged_with_windows_own_move_is_open_under_hardware() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, true);
+            r.move_to(ROW, 20);
+            r.wait(100);
+            r.merged_warp(MERGE);
+            r.wait(1_500);
+            three_still_clicks(&mut r);
+            r.report("merged warp");
+            match fakes {
+                Fakes::NoMove | Fakes::System => assert!(
+                    r.clicks.iter().all(|c| *c == refused("no_move")),
+                    "{fakes:?}: {:?}",
+                    r.clicks
+                ),
+                // OPEN (backlog, option (b)): a still owner click merges.
+                Fakes::Hardware => assert_eq!(r.clicks[0], Click::Accepted, "{fakes:?}"),
+            }
+        }
+    }
+
+    /// Task 28c re-review N2: a press on the window itself, or the accept button losing the
+    /// capture to anything but its own real release, forgets where the cursor is: another
+    /// thread holding the capture could have moved it unseen. A press doesn't move the cursor,
+    /// so the next move just records it, and the rest itself is untouched.
+    #[test] // spec: QA-088, QA-036
+    fn a_press_or_a_lost_capture_forgets_where_the_cursor_was() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let real = |x: i32| PointerMsg {
+            origin: InputOrigin::Hardware,
+            device: InputDevice::Mouse,
+            sent: false,
+            at: Some((x, 10)),
+        };
+        // The window's own press (grey Merge, or the click that brings it forward).
+        let mut g = ClickGate::new();
+        g.restart(Some((0, 0)));
+        g.window_tracking(true);
+        assert!(g.window_move(true, real(1), at(0)));
+        assert_eq!(g.window_press(true), Some(Refusal::NotLiveYet));
+        // Windows' own move after the capture went, at a place this window never saw.
+        assert!(!g.window_move(true, real(5), at(10)));
+        g.window_tracking(true);
+        assert!(g.window_move(true, real(6), at(20)));
+        // The rest from before the press is still there.
+        g.button_tracking(true);
+        g.button_press(true, real(6), at(400));
+        assert_eq!(g.button_release(true, real(6)), (true, None));
+
+        // Merge loses the capture during a held press, not by its own real release.
+        let mut g = ClickGate::new();
+        g.restart(Some((0, 0)));
+        g.button_tracking(true);
+        assert!(g.button_move(true, real(1), at(0)));
+        g.button_press(true, real(1), at(400));
+        g.capture_changed();
+        assert!(!g.button_move(true, real(5), at(410)));
+        g.button_tracking(true);
+        assert!(g.button_move(true, real(6), at(420)));
     }
 
     /// The gates the replays must not loosen: a warp, a slide, the live delay and input that
