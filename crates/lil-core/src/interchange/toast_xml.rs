@@ -4,9 +4,10 @@
 //! <text>TITLE</text><text>BODY</text></binding></visual>ACTIONS</toast>`
 //!
 //! TITLE and BODY are [`lil_parse::shown_text`] output (controls removed, bidirectional and
-//! zero-width characters shown as `⟨U+XXXX⟩`, at most [`SHOWN_CHARS`] `char`s), then
-//! XML-escaped; the URLs are escaped too. ACTIONS is Open and Deny for a confirmation toast
-//! and empty otherwise. A toast with no target (a `notify.claude_code` message) has no
+//! zero-width characters shown as `⟨U+XXXX⟩`, at most [`SHOWN_CHARS`] `char`s), without the
+//! characters XML 1.0 doesn't allow, then XML-escaped; the URLs are escaped too. ACTIONS is
+//! Open and Deny for a confirmation toast and empty otherwise. A toast with no target (a
+//! `notify.claude_code` message, a cap alert, an `open` URL too long to launch) has no
 //! `launch` attribute, so a click only dismisses it (plan 4a clarification, 2026-10-25). No
 //! toast approves anything (owner decision 2026-10-22), and none carries a progress binding
 //! (P4a-R36).
@@ -52,9 +53,20 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// The text of a `<text>` element: shown, then escaped.
+/// The text of a `<text>` element: shown, without the characters XML 1.0 doesn't allow
+/// (U+FFFE, U+FFFF; `shown_text` already removed the controls), then escaped (plan 4a
+/// clarification, 2026-10-25).
 fn shown(s: &str) -> String {
-    escape(&lil_parse::shown_text(s, SHOWN_CHARS))
+    let text: String = lil_parse::shown_text(s, SHOWN_CHARS)
+        .chars()
+        .filter(|c| xml_char(*c))
+        .collect();
+    escape(&text)
+}
+
+/// Whether XML 1.0 allows `c` (its `Char` production; a Rust `char` is never a surrogate).
+fn xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
 }
 
 /// The toast XML of `t` (module docs).

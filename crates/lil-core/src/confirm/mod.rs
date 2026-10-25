@@ -203,8 +203,19 @@ fn workspace_of(scope: &str) -> &str {
 
 /// How the core reaches you with no app open (plan 4a: toasts and `lil:confirm/<id>`). It may
 /// read the desktop, so [`Confirm::answerable`] calls it off the async threads.
+///
+/// [`Confirm`] also tells it of each confirmation that becomes pending in this core and each
+/// that ends by any route, straight away and in order, and asks it to reconcile its toasts
+/// with the pending confirmations (at start, after a load, when the last app that can answer
+/// closes). None of these may block.
 pub trait NotificationPath: Send + Sync {
     fn reachable(&self) -> bool;
+    /// A confirmation became pending.
+    fn pending(&self, _view: &ConfirmationView) {}
+    /// Confirmation `id` ended: answered, expired or cancelled.
+    fn ended(&self, _id: &str) {}
+    /// Reconcile the toasts with the pending confirmations.
+    fn reconcile(&self) {}
 }
 
 /// Plan 3: there is no notification path, so it never reaches you (APP-051).
@@ -496,8 +507,27 @@ impl Confirm {
         );
     }
 
+    /// Forgets `id` as pending: it ended (its toast token dies with it), and the notification
+    /// path is told.
     fn untrack(&self, id: &str) {
         self.tracked().remove(id);
+        self.notify.ended(id);
+    }
+
+    /// Asks the notification path to reconcile its toasts with the pending confirmations
+    /// (after a [`Confirm::load`] at start or of a workspace).
+    pub fn reconcile_toasts(&self) {
+        self.notify.reconcile();
+    }
+
+    /// A verified app's connection closed (after its cap confirmations were cancelled): when
+    /// no app that can answer is left, the toasts are reconciled, so a confirmation whose
+    /// toast was held back while the app was in front gets one (plan 4a clarification,
+    /// 2026-10-25).
+    pub fn after_app_closed(&self) {
+        if !self.presence.any() {
+            self.notify.reconcile();
+        }
     }
 
     fn publish(&self, kind: &str, row: &ConfirmationRow) {
@@ -566,6 +596,7 @@ impl Confirm {
                 "a call waits for your confirmation"
             );
             self.publish("pending", &requested.row);
+            self.notify.pending(&requested.row.view());
         }
         Ok(requested.row.pending())
     }
@@ -1053,4 +1084,80 @@ fn raise_params(to: &RaiseTo) -> Option<CapsSetParams> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Confirm` over a fresh suite database, and the env it lives in.
+    fn confirm() -> (Arc<Confirm>, lil_testkit::TestEnv) {
+        let env = lil_testkit::TestEnv::new();
+        let states = Arc::new(
+            StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap(),
+        );
+        let clock: Arc<dyn Clock> = lil_testkit::FakeClock::new();
+        let confirm = Confirm::new(
+            states,
+            Arc::new(EventBus::new(clock.clone())),
+            clock,
+            Arc::new(lil_testkit::SeqIds::new()),
+            UiPresence::new(),
+            Arc::new(NoNotificationPath),
+            Duration::from_secs(1800),
+            McpConfirmation::Core,
+            FailPoints::none(),
+        );
+        (confirm, env)
+    }
+
+    fn row(id: &str) -> ConfirmationRow {
+        ConfirmationRow {
+            id: id.into(),
+            scope: "cli|none".into(),
+            idem_key: "k".into(),
+            tool: "test.destructive".into(),
+            args_hash: "h".into(),
+            arguments: json!({}),
+            caller_kind: "cli".into(),
+            covers: vec![Cover::Confirm],
+            cap: None,
+            state: ConfState::Pending,
+            confirmed_via: None,
+            created_utc: 0,
+            expires_utc: i64::MAX,
+            answered_utc: None,
+            cap_action: None,
+            session_id: "s".into(),
+            project: None,
+        }
+    }
+
+    /// A toast token works once even while its confirmation is still pending (two denies
+    /// racing), a wrong or another confirmation's token never, and a token a failed deny took
+    /// is put back (P4a-R9).
+    #[test] // spec: APP-022, ARCH-053
+    fn a_toast_token_is_taken_once_and_restored_after_a_failed_deny() {
+        let (c, _env) = confirm();
+        c.track(&row("cf_1"));
+        c.track(&row("cf_2"));
+        assert!(c.bind_toast_token("cf_1", "a".repeat(32)));
+        assert!(c.bind_toast_token("cf_2", "b".repeat(32)));
+        assert!(
+            !c.bind_toast_token("cf_gone", "c".repeat(32)),
+            "not pending"
+        );
+        assert!(!c.take_toast_token("cf_1", &"b".repeat(32)), "another's");
+        assert!(!c.take_toast_token("cf_1", &"x".repeat(32)), "a wrong one");
+        assert!(c.take_toast_token("cf_1", &"a".repeat(32)));
+        assert!(!c.take_toast_token("cf_1", &"a".repeat(32)), "once");
+        // A re-track (a retry, a list) keeps a live token.
+        c.track(&row("cf_2"));
+        c.restore_toast_token("cf_1", "a".repeat(32));
+        assert!(c.take_toast_token("cf_1", &"a".repeat(32)), "restored");
+        // The end kills it.
+        c.untrack("cf_2");
+        assert!(!c.take_toast_token("cf_2", &"b".repeat(32)));
+        assert!(same_token("ab", "ab") && !same_token("ab", "ac") && !same_token("ab", "abc"));
+    }
 }

@@ -954,7 +954,12 @@ impl Router for RpcRouter {
                     // An app's pending cap confirmations end with it (Appendix F).
                     if matches!(session.caller, CallerKind::Ui(_)) {
                         let (confirm, id) = (self.confirm.clone(), session.id.clone());
-                        tokio::spawn(async move { confirm.cancel_for_session(&id).await });
+                        // Then, with no app left that can answer, the toasts held back while
+                        // it was in front go out (the notifier's reconcile).
+                        tokio::spawn(async move {
+                            confirm.cancel_for_session(&id).await;
+                            confirm.after_app_closed();
+                        });
                     }
                 }
                 gone.counted

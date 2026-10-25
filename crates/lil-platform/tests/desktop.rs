@@ -937,3 +937,50 @@ fn desktop_power_request_sets_and_clears() {
     );
     desktop.set_power_request(false).unwrap();
 }
+
+#[test] // spec: APP-022, ARCH-055
+fn a_failed_post_starts_the_not_yet_shown_grace_too() {
+    use lil_platform::desktop::{NOT_SHOWN_GRACE, NotShownEnd};
+    let s = Duration::from_secs;
+    let mut end = NotShownEnd::default();
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(0)),
+        ToastsState::NotYetShown
+    );
+    // Posts that keep failing: no platform once the grace from the first has passed.
+    end.post_failed(s(1));
+    end.post_failed(s(3));
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(5)),
+        ToastsState::NotYetShown
+    );
+    assert_eq!(
+        end.state(ToastsState::NotYetShown, s(1) + NOT_SHOWN_GRACE),
+        ToastsState::Unavailable("no_platform")
+    );
+    // Any other reading clears it, as for an Ok post.
+    assert_eq!(end.state(ToastsState::Ready, s(8)), ToastsState::Ready);
+}
+
+#[test] // spec: APP-022, QA-066
+fn fake_desktop_posts_can_fail_and_its_history_is_what_stays() {
+    let fake = FakeDesktop::new();
+    let xml = "<toast><visual><binding><text>a</text><text>b</text></binding></visual></toast>";
+    fake.post(&toast("cf_1", "confirmation_waiting", xml, false))
+        .unwrap();
+    fake.post(&toast("j_1", "job_finished", xml, false))
+        .unwrap();
+    fake.post(&toast("cf_1", "confirmation_waiting", xml, false))
+        .unwrap();
+    fake.remove("j_1", "job_finished");
+    assert_eq!(
+        fake.history(),
+        [("cf_1".to_string(), "confirmation_waiting".to_string())]
+    );
+    fake.set_post_fails(true);
+    assert!(
+        fake.post(&toast("j_2", "job_finished", xml, false))
+            .is_err()
+    );
+    assert_eq!(fake.records().len(), 4, "a failed post records nothing");
+}

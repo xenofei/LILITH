@@ -1,12 +1,16 @@
 //! `FakeDesktop` (QA-066's test fakes): the [`Desktop`] of every test-channel core. It posts no
 //! real toast and touches nothing on the desktop; it records each post and remove, and reports
 //! the fullscreen state, foreground process, toasts state, shortcut and handler states a test
-//! set (through `test.desktop`), counting each fullscreen read as a poll.
+//! set (through `test.desktop`), counting each fullscreen read as a poll. Its toasts state ends
+//! `not_yet_shown` as the real one does ([`NotShownEnd`], timed in real time), and a test can
+//! make its posts fail; its history is the toasts posted and not removed.
 
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
-use crate::desktop::{Desktop, Fullscreen, HandlerState, ShortcutState, Toast, ToastsState};
+use crate::desktop::{
+    Desktop, Fullscreen, HandlerState, NotShownEnd, ShortcutState, Toast, ToastsState,
+};
 use crate::env::Env;
 
 /// A post or a remove.
@@ -43,6 +47,11 @@ struct State {
     power_held: bool,
     power_available: bool,
     polls: u32,
+    /// Posts fail (`test.desktop {post_fails}`).
+    post_fails: bool,
+    not_shown: NotShownEnd,
+    /// The toasts posted and not removed: `(tag, group)`, in post order.
+    shown: Vec<(String, String)>,
 }
 
 /// The fake desktop. It starts not fullscreen, with no foreground process, toasts ready, the
@@ -51,6 +60,7 @@ struct State {
 #[derive(Debug)]
 pub struct FakeDesktop {
     state: Mutex<State>,
+    start: std::time::Instant,
 }
 
 impl Default for FakeDesktop {
@@ -72,7 +82,11 @@ impl FakeDesktop {
                 power_held: false,
                 power_available: true,
                 polls: 0,
+                post_fails: false,
+                not_shown: NotShownEnd::default(),
+                shown: Vec::new(),
             }),
+            start: std::time::Instant::now(),
         }
     }
 
@@ -98,6 +112,11 @@ impl FakeDesktop {
 
     pub fn set_toasts_state(&self, toasts: ToastsState) {
         self.lock().toasts = toasts;
+    }
+
+    /// Makes every post fail (`true`) or work again.
+    pub fn set_post_fails(&self, fails: bool) {
+        self.lock().post_fails = fails;
     }
 
     /// Every post and remove since the start or the last [`FakeDesktop::clear`], in order.
@@ -139,12 +158,26 @@ impl Desktop for FakeDesktop {
     }
 
     fn toasts_state(&self) -> ToastsState {
-        self.lock().toasts
+        let now = self.start.elapsed();
+        let mut state = self.lock();
+        let read = state.toasts;
+        state.not_shown.state(read, now)
     }
 
     fn post(&self, t: &Toast) -> Result<(), String> {
+        let now = self.start.elapsed();
         let texts = elements(&t.xml, "text");
-        self.lock().records.push(ToastRecord {
+        let mut state = self.lock();
+        if state.post_fails {
+            state.not_shown.post_failed(now);
+            return Err("the fake desktop refuses the post".to_string());
+        }
+        state.not_shown.posted_ok(now);
+        state
+            .shown
+            .retain(|(tag, group)| (tag, group) != (&t.tag, &t.group));
+        state.shown.push((t.tag.clone(), t.group.clone()));
+        state.records.push(ToastRecord {
             op: ToastOp::Post,
             tag: t.tag.clone(),
             group: t.group.clone(),
@@ -158,7 +191,11 @@ impl Desktop for FakeDesktop {
     }
 
     fn remove(&self, tag: &str, group: &str) {
-        self.lock().records.push(ToastRecord {
+        let mut state = self.lock();
+        state
+            .shown
+            .retain(|(t, g)| (t.as_str(), g.as_str()) != (tag, group));
+        state.records.push(ToastRecord {
             op: ToastOp::Remove,
             tag: tag.to_string(),
             group: group.to_string(),
@@ -168,6 +205,10 @@ impl Desktop for FakeDesktop {
             silent: None,
             xml: None,
         });
+    }
+
+    fn history(&self) -> Vec<(String, String)> {
+        self.lock().shown.clone()
     }
 
     fn set_power_request(&self, held: bool) -> std::io::Result<()> {

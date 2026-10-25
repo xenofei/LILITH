@@ -44,8 +44,9 @@ use super::{
     ExecWindow, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion,
     JobCtx, JobDone, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin, JobResult,
     JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS, MAX_CANCEL_IDS, MAX_WAIT, MoveTo,
-    NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob, Reservations, RetriedJob,
-    RetryBatch, RetryPlan, StartedBy, Substatus, Subtask, Withdraw, WithdrawOutcome, backoff,
+    NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob, Reservations, RestartHoldSink,
+    RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus, Subtask, Withdraw, WithdrawOutcome,
+    backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -302,6 +303,8 @@ pub(crate) struct Shared {
     handlers: RwLock<HashMap<&'static str, Arc<dyn JobHandler>>>,
     admission: RwLock<Arc<dyn Admission>>,
     completions: RwLock<Vec<Arc<dyn JobCompletion>>>,
+    /// Told the jobs each recovery held, when it held any (P4a-R41: the restart hold's toast).
+    restart_sink: RwLock<Option<RestartHoldSink>>,
     /// The execution windows of the jobs that ended `interrupted_unknown` in this core run,
     /// for their completions when you resolve them (after a restart they are gone).
     unknown_windows: Mutex<HashMap<String, Arc<Mutex<Vec<ExecWindow>>>>>,
@@ -719,7 +722,7 @@ impl Shared {
         let rows = record::open_rows(scope.db()).await?;
         let mine: HashSet<String> = self.queue().jobs.keys().cloned().collect();
         let mut marked = Vec::new();
-        let mut held = 0;
+        let mut held: Vec<(Priority, i64, JobId)> = Vec::new();
         for row in rows {
             if mine.contains(&row.job_id) || row.substatus == Some(Substatus::InterruptedUnknown) {
                 continue;
@@ -728,7 +731,7 @@ impl Shared {
                 continue;
             }
             if self.hold(&row, scope).await? {
-                held += 1;
+                held.push((row.priority, row.order_key, JobId(row.job_id.clone())));
                 continue;
             }
             let c = interrupt_change(&row, self.now());
@@ -746,12 +749,18 @@ impl Shared {
                 marked.push(JobId(after.job_id));
             }
         }
-        if held > 0 {
+        if !held.is_empty() {
             tracing::warn!(
-                count = held,
+                count = held.len(),
                 scope = %scope.key(),
                 "jobs of an earlier core run that never started are held; they run once you resume them"
             );
+            held.sort();
+            let held: Vec<JobId> = held.into_iter().map(|(_, _, id)| id).collect();
+            let sink = read(&self.restart_sink);
+            if let Some(sink) = sink {
+                sink(held);
+            }
         }
         Ok(marked)
     }
@@ -2676,6 +2685,7 @@ impl Jobs {
             handlers: RwLock::new(HashMap::new()),
             admission: RwLock::new(Arc::new(AlwaysAdmit)),
             completions: RwLock::new(Vec::new()),
+            restart_sink: RwLock::new(None),
             unknown_windows: Mutex::new(HashMap::new()),
             reservations: RwLock::new(Arc::new(NoReservations)),
             drain: RwLock::new(None),
@@ -2714,6 +2724,17 @@ impl Jobs {
 
     /// Adds a completion; they run in the order they were added (Meter before Caps). Add them
     /// before the core's first recovery, which runs them for jobs that never started.
+    /// Tells `sink` the jobs each recovery holds (P4a-R41), in queue order, once per recovery
+    /// that holds any: the suite's and the default workspace's at start, another workspace's
+    /// when it is first used.
+    pub fn set_restart_hold_sink(&self, sink: RestartHoldSink) {
+        *self
+            .shared
+            .restart_sink
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
     pub fn add_completion(&self, c: Arc<dyn JobCompletion>) {
         self.shared
             .completions
@@ -3514,16 +3535,15 @@ impl Jobs {
         self.shared.queue_state(lane)
     }
 
-    /// The jobs of batch `batch_id`, by index, from whichever writable database holds it (a
-    /// batch id is unique across the suite): every attempt, retries included. Empty when no
-    /// open database has it, or one can't be read (logged). The notifier reads a batch's end
-    /// here (APP-146).
-    pub async fn batch_summaries(&self, batch_id: &str) -> Vec<JobSummary> {
-        let s = &self.shared;
-        for (_, db) in s.states.writable_dbs() {
-            match record::batch(&db, batch_id).await {
+    /// The jobs of batch `batch_id`, narrowly ([`super::BatchJob`]), by index, from whichever
+    /// writable database holds it (a batch id is unique across the suite): every attempt,
+    /// retries included. Empty when no open database has it, or one can't be read (logged).
+    /// The notifier reads a batch's end here (APP-146).
+    pub async fn batch_jobs(&self, batch_id: &str) -> Vec<super::BatchJob> {
+        for (_, db) in self.shared.states.writable_dbs() {
+            match record::batch_brief(&db, batch_id).await {
                 Ok(rows) if rows.is_empty() => {}
-                Ok(rows) => return rows.iter().map(|r| s.summary(r)).collect(),
+                Ok(rows) => return rows,
                 Err(e) => {
                     tracing::warn!(batch_id, error = %e, "a batch's jobs could not be read");
                 }
@@ -3532,17 +3552,30 @@ impl Jobs {
         Vec::new()
     }
 
-    /// The jobs a restart holds now (P4a-R41), in queue order: class, then `order_key`.
-    pub fn restart_held_jobs(&self) -> Vec<JobId> {
-        let q = self.shared.queue();
-        let mut held: Vec<(Priority, i64, JobId)> = q
+    /// Whether a job of batch `batch_id` is still in this core's queue and not yet recording
+    /// its end (queued, running or held): its batch hasn't ended yet. A job recording its end
+    /// may still lack its final state; the batch's rows say.
+    pub fn batch_live(&self, batch_id: &str) -> bool {
+        self.shared
+            .queue()
             .jobs
             .values()
-            .filter(|a| a.restart_held)
-            .map(|a| (a.info.spec.priority, a.order_key, a.info.id.clone()))
-            .collect();
-        held.sort();
-        held.into_iter().map(|(_, _, id)| id).collect()
+            .any(|a| a.info.batch.0 == batch_id && !a.completing)
+    }
+
+    /// The batches, in every writable database, with a job that finished at `since_utc`
+    /// (Unix seconds) or later: what the notifier checks again after it missed events.
+    pub async fn batches_finished_since(&self, since_utc: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        for (_, db) in self.shared.states.writable_dbs() {
+            match record::batches_finished_since(&db, since_utc).await {
+                Ok(found) => out.extend(found),
+                Err(e) => tracing::warn!(error = %e, "the finished batches could not be read"),
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Changes whenever a job's state changes or a job leaves the queue: a watcher re-reads

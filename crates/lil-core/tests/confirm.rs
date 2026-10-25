@@ -1445,3 +1445,92 @@ fn turning_the_category_off_makes_calls_unavailable_without_an_app() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// I2: a reconcile posts a toast for each pending confirmation that has none, and removes a
+/// confirmation toast left in the notification centre whose confirmation isn't pending.
+#[tokio::test] // spec: APP-146, APP-022, ARCH-055
+async fn a_reconcile_posts_the_missing_toasts_and_clears_stale_ones() {
+    use lil_platform::desktop::{Desktop as _, Toast};
+    use lil_platform::desktop_fake::ToastOp;
+    let rig = PathRig::new().await;
+    let states = Arc::new(
+        StateRegistry::open(
+            &rig._env.env,
+            Arc::new(|what: &str| panic!("fatal: {what}")),
+        )
+        .unwrap(),
+    );
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    // A `Confirm` whose notification path is the rig's notifier.
+    let confirm = Confirm::new(
+        states,
+        Arc::new(lil_core::events::EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        UiPresence::new(),
+        rig.notifier.clone(),
+        LIFETIME,
+        McpConfirmation::Core,
+        lil_core::store::FailPoints::none(),
+    );
+    rig.notifier.set_confirm(&confirm);
+    let request = |key: &str| ConfirmRequest {
+        scope: "cli|none".into(),
+        idem_key: key.into(),
+        tool: "test.destructive".into(),
+        args_hash: "h".into(),
+        arguments: json!({}),
+        caller_kind: "cli".into(),
+        session_id: "s_cli".into(),
+        project: None,
+        covers: vec![Cover::Confirm],
+        cap: None,
+    };
+    let posted = |fake: &lil_platform::desktop_fake::FakeDesktop, tag: &str| {
+        fake.records()
+            .iter()
+            .any(|r| r.op == ToastOp::Post && r.tag == tag)
+    };
+    // One that became pending while toasts couldn't be posted: it has none.
+    rig.fake
+        .set_shortcut(lil_platform::desktop::ShortcutState::Missing);
+    rig.store.get(true).await;
+    let missed = confirm.request(request("k-missed")).await.unwrap();
+    rig.fake
+        .set_shortcut(lil_platform::desktop::ShortcutState::Ok);
+    rig.store.get(true).await;
+    // A toast an earlier run left for a confirmation that isn't pending any more.
+    rig.fake
+        .post(&Toast {
+            tag: "cf_stale".into(),
+            group: "confirmation_waiting".into(),
+            xml: "<toast/>".into(),
+            silent: false,
+        })
+        .unwrap();
+    confirm.reconcile_toasts();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let removed = rig
+            .fake
+            .records()
+            .iter()
+            .any(|r| r.op == ToastOp::Remove && r.tag == "cf_stale");
+        if removed && posted(&rig.fake, &missed.confirmation_id) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            rig.fake.records()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        rig.fake.history(),
+        [(
+            missed.confirmation_id.clone(),
+            "confirmation_waiting".to_string()
+        )]
+    );
+}

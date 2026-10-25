@@ -18,7 +18,7 @@
 //! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
-//! | `test.desktop` | write | `{fullscreen?: "no" \| "d3d" \| "busy" \| "presentation", foreground?: "suite" \| "other", shortcut?: bool, handlers?: bool, toasts?: "ready" \| "not_yet_shown" \| "disabled_for_app" \| "disabled_for_user" \| "disabled_by_policy" \| "elevated" \| "no_platform", clear?: bool}` | `{toasts: [{op: "post" \| "remove", tag, group, title?, body?, launch?, silent?, xml?}], power_held, polls}`: sets the test channel's `FakeDesktop` and reads what it recorded (plan 4a's test contract); the server registers it |
+//! | `test.desktop` | write | `{fullscreen?: "no" \| "d3d" \| "busy" \| "presentation", foreground?: "suite" \| "other", shortcut?: bool, handlers?: bool, toasts?: "ready" \| "not_yet_shown" \| "disabled_for_app" \| "disabled_for_user" \| "disabled_by_policy" \| "elevated" \| "no_platform", post_fails?: bool, clear?: bool}` | `{toasts: [{op: "post" \| "remove", tag, group, title?, body?, launch?, silent?, xml?}], power_held, polls}`: sets the test channel's `FakeDesktop` and reads what it recorded (plan 4a's test contract); the server registers it |
 //!
 //! `test.job` submits a job that [`TestJobHandler`] runs (the core registers it on test
 //! channels): a gated one waits until `test.job_release` (or a cancel), `transient_2` fails
@@ -842,6 +842,9 @@ struct DesktopArgs {
     handlers: Option<bool>,
     #[serde(default)]
     toasts: Option<ToastsArg>,
+    /// `true`: every post fails; `false`: posts work again.
+    #[serde(default)]
+    post_fails: Option<bool>,
     /// Forget the recorded toasts first.
     #[serde(default)]
     clear: bool,
@@ -946,6 +949,9 @@ pub fn register_test_desktop(
                         ToastsArg::Elevated => ToastsState::Unavailable("elevated"),
                         ToastsArg::NoPlatform => ToastsState::Unavailable("no_platform"),
                     });
+                }
+                if let Some(fails) = args.post_fails {
+                    fake.set_post_fails(fails);
                 }
                 if args.clear {
                     fake.clear();

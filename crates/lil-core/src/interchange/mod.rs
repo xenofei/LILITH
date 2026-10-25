@@ -124,8 +124,9 @@ impl Interchange {
         }
         if let Some(notifier) = self.notifier().cloned() {
             let (title, text) = (target_title(&target.text), target.text.clone());
+            let caller = ctx.session.caller.clone();
             tokio::spawn(async move {
-                notifier.agent_opened(&title, &text).await;
+                notifier.agent_opened(&caller, &title, &text).await;
             });
         }
     }

@@ -54,8 +54,10 @@
 //! - The notifier ([`crate::interchange::Notifier`], APP-146) starts with the fullscreen poll,
 //!   before the dispatcher is built: it is the confirmations' notification path (ARCH-055)
 //!   and posts `notify.claude_code`'s and an agent's `open_in`'s toasts, and it reads the
-//!   jobs' batches once they exist. When a start held jobs (P4a-R41), it posts one toast once
-//!   the suite's jobs and the default workspace's are recovered.
+//!   jobs' batches once they exist. Each recovery that holds jobs (P4a-R41), at start or of a
+//!   workspace first used later, posts one toast for them (the jobs' restart-hold sink). After
+//!   each confirmation load (the suite's at start, the default workspace's once it opens) the
+//!   notifier reconciles the confirmation toasts with the pending confirmations.
 
 use std::collections::HashMap;
 use std::io;
@@ -135,6 +137,8 @@ pub struct RunningCore {
     desktop_settings: Arc<DesktopSettingsStore>,
     /// The verified apps' processes, while they are connected (P4a-R7).
     ui_apps: Arc<UiApps>,
+    /// The toasts and the confirmations' notification path (APP-146).
+    notifier: Arc<Notifier>,
     /// The supervisor: ends with the shutdown's report.
     shutdown: JoinHandle<ShutdownReport>,
 }
@@ -194,6 +198,11 @@ impl RunningCore {
     /// The verified apps' processes, while they are connected.
     pub fn ui_apps(&self) -> &Arc<UiApps> {
         &self.ui_apps
+    }
+
+    /// The notifier (APP-146).
+    pub fn notifier(&self) -> &Arc<Notifier> {
+        &self.notifier
     }
 
     /// Idle accounting, drains and shutdown steps.
@@ -417,6 +426,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             tracing::error!(error = %e, "the pending confirmations could not be read; a retry with its token finds each")
         }
     }
+    confirm.reconcile_toasts();
     let display = {
         let caps = caps.clone();
         Arc::new(move || caps.display_currency())
@@ -452,7 +462,20 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     );
     let active_projects = dispatcher.active_projects().clone();
     let jobs = dispatcher.jobs().clone();
-    notifier.set_jobs(&jobs);
+    notifier.set_jobs(&jobs).await;
+    // One restart-hold toast per recovery that holds jobs (P4a-R41), set before any recovery.
+    {
+        let notifier = notifier.clone();
+        jobs.set_restart_hold_sink(Arc::new(move |held: Vec<crate::jobs::JobId>| {
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                if let Some(first) = held.first() {
+                    let outcome = notifier.restart_held(held.len(), first).await;
+                    tracing::info!(held = held.len(), outcome = ?outcome, "the restart hold's toast");
+                }
+            });
+        }));
+    }
     // The estimate each job takes at submission, from the telemetry's history (CORE-161).
     let display = {
         let caps = caps.clone();
@@ -586,13 +609,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.pipe_instance_fault.clone(),
     ));
 
-    let default_ws = hub.default_ref();
-    if default_ws.is_none() {
-        tokio::spawn(post_restart_hold(notifier.clone(), jobs.clone()));
-    }
-    if let Some(ws) = default_ws {
+    if let Some(ws) = hub.default_ref() {
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());
-        let notifier = notifier.clone();
         let confirm = confirm.clone();
         let models = models.clone();
         let meter = meter.clone();
@@ -601,13 +619,11 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             match hub.open(&ws).await {
                 Err(e) => {
                     tracing::warn!(workspace = %ws.path.display(), code = %e.code, error = %e.message, "the default workspace didn't open at start");
-                    post_restart_hold(notifier, jobs).await;
                 }
                 Ok(open) => {
                     if let Err(e) = jobs.recover_workspace(&open).await {
                         tracing::warn!(workspace = %ws.path.display(), code = %e.code, "the workspace's jobs could not be recovered; its first job call tries again");
                     }
-                    post_restart_hold(notifier, jobs.clone()).await;
                     // The meter's recovery only after a successful repair (ruling P3-R33).
                     let start = caps.repair_then_recover_workspace(&meter, &open).await;
                     if let Err(e) = start.repaired {
@@ -619,6 +635,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
                     if let Err(e) = confirm.load(&open.state).await {
                         tracing::warn!(workspace = %ws.path.display(), error = %e, "the workspace's pending confirmations could not be read");
                     }
+                    confirm.reconcile_toasts();
                     telemetry.set_sizes_probe(telemetry::sizes_probe(
                         Some(open.ws.path.clone()),
                         models,
@@ -678,6 +695,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         desktop_watch,
         desktop_settings,
         ui_apps,
+        notifier,
         shutdown,
     })
 }
@@ -942,16 +960,6 @@ async fn tick_idle(lifecycle: Arc<Lifecycle>, idle_after: Duration) {
         if lifecycle.drain_if_idle() {
             return;
         }
-    }
-}
-
-/// The restart hold's one toast (P4a-R41): the jobs a restart holds once the start's
-/// recoveries ran, if any.
-async fn post_restart_hold(notifier: Arc<Notifier>, jobs: Arc<crate::jobs::Jobs>) {
-    let held = jobs.restart_held_jobs();
-    if let Some(first) = held.first() {
-        let outcome = notifier.restart_held(held.len(), first).await;
-        tracing::info!(held = held.len(), outcome = ?outcome, "the restart hold's toast");
     }
 }
 

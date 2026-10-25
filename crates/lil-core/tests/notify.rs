@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use lil_core::identity::TrustedDirs;
 use lil_core::interchange::notify::batch_end;
 use lil_core::interchange::{ToastActions, ToastText, toast_xml};
-use lil_core::jobs::JobSummary;
+use lil_core::jobs::{BatchJob, JobStatus, Priority, StartedBy, Surface};
 use lil_core::{CoreConfig, CoreThread, start_in_thread};
 use lil_platform::IdSource;
 use lil_testkit::{FakeClock, RawPipe, SeqIds, TestApp, TestEnv, ensure_built};
@@ -248,6 +248,21 @@ fn toast_xml_escapes_and_normalises() {
         "no progress binding (P4a-R36)"
     );
 
+    // Non-characters XML forbids are removed, so the toast still parses.
+    let odd = toast_xml(&ToastText {
+        title: "a\u{FFFF}b".into(),
+        body: "c\u{FFFE}d".into(),
+        launch: None,
+        actions: ToastActions::None,
+    });
+    let doc = roxmltree::Document::parse(&odd).unwrap_or_else(|e| panic!("{e}: {odd:?}"));
+    let texts: Vec<&str> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("text"))
+        .filter_map(|n| n.text())
+        .collect();
+    assert_eq!(texts, ["ab", "cd"]);
+
     // At most 200 characters, ending … when cut.
     let long = toast_xml(&ToastText {
         title: "t".into(),
@@ -303,24 +318,48 @@ fn confirmation_toast_xml_has_open_and_deny() {
 // The batch rule.
 // ---------------------------------------------------------------------------------------------
 
-fn summary(
-    id: &str,
-    index: u32,
-    status: &str,
-    surface: &str,
-    retry_of: Option<&str>,
-) -> JobSummary {
-    let mut j = json!({
-        "job_id": id, "kind": "test.job", "lane": "cpu", "priority": "agent", "status": status,
-        "substatus": null, "created": "2027-01-15T08:00:00Z", "updated": "2027-01-15T08:00:05Z",
-        "started": "2027-01-15T08:00:01Z", "finished": "2027-01-15T08:00:05Z", "attempt": 1,
-        "trace_id": "t_0", "batch_id": "b_0123456789abcdef", "index": index,
-        "origin": {"surface": surface},
-    });
-    if let Some(of) = retry_of {
-        j["retry_of"] = json!(of);
+fn summary(id: &str, index: u32, status: &str, surface: &str, retry_of: Option<&str>) -> BatchJob {
+    BatchJob {
+        job_id: id.into(),
+        kind: "test.job".into(),
+        priority: Priority::Agent,
+        status: JobStatus::parse(status).unwrap(),
+        substatus: None,
+        project: None,
+        created_utc: 100,
+        started_utc: Some(101),
+        finished_utc: JobStatus::parse(status)
+            .unwrap()
+            .is_final()
+            .then_some(105 + i64::from(index)),
+        error_message: None,
+        retry_of: retry_of.map(str::to_string),
+        index,
+        origin: Some(StartedBy {
+            surface: Surface::parse(surface),
+            id: None,
+            step: None,
+        }),
+        batch_id: "b_0123456789abcdef".into(),
     }
-    serde_json::from_value(j).unwrap()
+}
+
+#[test] // spec: APP-146, ARCH-022
+fn a_batch_ended_by_a_core_start_or_stop_never_toasts() {
+    let mut interrupted = summary("j_2", 1, "failed", "cli", None);
+    interrupted.substatus = Some("interrupted".into());
+    assert!(
+        batch_end(&[
+            summary("j_1", 0, "succeeded", "cli", None),
+            interrupted.clone()
+        ])
+        .is_none(),
+        "the job that ended last was interrupted"
+    );
+    // Ended later by a job of its own: it toasts, the interrupted one counted as failed.
+    interrupted.finished_utc = Some(100);
+    let end = batch_end(&[summary("j_1", 0, "succeeded", "cli", None), interrupted]).unwrap();
+    assert_eq!(end.failed.unwrap().job_id, "j_2");
 }
 
 #[test] // spec: APP-146
@@ -426,13 +465,25 @@ fn one_toast_per_batch_when_its_last_job_ends() {
     ready(&mut p);
 
     let ids = batch(&mut p, 3);
-    let found = until_posts(&mut p, "job_finished", 1);
+    until_posts(&mut p, "job_finished", 1);
     fence(&mut p, &env);
-    let finished: Vec<Value> = posts(&mut p, "job_finished")
-        .into_iter()
-        .filter(|t| t["title"] != "Job finished")
-        .collect();
-    assert_eq!(finished.len(), 1, "one toast for the batch: {found:?}");
+    // Counted by launch: one toast, for the batch's first job, and none for the others.
+    let all = posts(&mut p, "job_finished");
+    let launching = |id: &str| -> Vec<Value> {
+        let url = format!("{scheme}:task/{id}");
+        all.iter()
+            .filter(|t| t["launch"] == url.as_str())
+            .cloned()
+            .collect()
+    };
+    let finished = launching(&ids[0]);
+    assert_eq!(finished.len(), 1, "one toast for the batch: {all:?}");
+    for id in &ids[1..] {
+        assert!(
+            launching(id).is_empty(),
+            "no toast of its own for {id}: {all:?}"
+        );
+    }
     let toast = &finished[0];
     assert_eq!(toast["title"], "Batch finished (3 jobs)", "{toast}");
     assert_eq!(
@@ -479,10 +530,22 @@ fn a_suite_window_in_front_suppresses_and_nothing_is_queued() {
     ready(&mut p);
     let _app = app(&env);
 
+    let logs = capture_logs();
     desktop(&mut p, json!({"foreground": "suite"}));
-    let ids = batch(&mut p, 1);
+    let made = write(&mut p, "test.job", json!({"lane": "cpu"}));
+    let batch_id = made["job"]["batch_id"].as_str().unwrap().to_string();
+    let ids = job_ids(&made);
+    assert_eq!(wait_done(&mut p, &ids[0])["status"], "succeeded");
     let held = write(&mut p, "notify.claude_code", json!({"message": "in front"}));
     assert_eq!(held, json!({"posted": false, "reason": "foreground"}));
+    // The notifier has handled the batch's end while the app was in front (its log line),
+    // before the foreground moves.
+    until("the batch's end handled", || {
+        logs.text()
+            .lines()
+            .any(|l| l.contains(&batch_id) && l.contains("outcome=Foreground"))
+            .then_some(())
+    });
     desktop(&mut p, json!({"foreground": "other"}));
     // Later toasts go out; nothing of the time in front comes with them.
     fence(&mut p, &env);
@@ -716,6 +779,212 @@ fn confirmation_toast_is_removed_when_answered_or_expired() {
     removed(&mut p, &expired);
 }
 
+#[test] // spec: APP-146, APP-054, CORE-114
+fn a_cancelled_cap_confirmation_loses_its_toast() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    // Your own call that would pass a cap asks about the cap; the app isn't in front.
+    let mut a = app(&env);
+    let asked = a.tool("test.destructive", json!({"cost": "5"}), Some(&key()));
+    let id = pending_id(&asked);
+    let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
+    assert_eq!(toast["tag"], id.as_str(), "{toast}");
+    assert_eq!(
+        toast["body"], "A call would go over your monthly cap",
+        "{toast}"
+    );
+    // The app closes: its cap confirmation is cancelled, and its toast goes.
+    drop(a);
+    until(&format!("the toast of {id} removed"), || {
+        ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == id.as_str())
+            .then_some(())
+    });
+}
+
+#[test] // spec: APP-146, APP-022, ARCH-055
+fn a_restart_reposts_the_waiting_toasts_and_removes_them_when_answered() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let ids: Arc<dyn IdSource> = Arc::new(lil_platform::RandomIds);
+    let (id, old_token) = {
+        let _core = core_with(&env, FakeClock::new(), Some(ids.clone()), None);
+        let mut p = pipe(&env, json!({}));
+        ready(&mut p);
+        let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        let token = deny_token(&mut p, &scheme, &id);
+        (id, token)
+    };
+    // The next core posts it again, Tag and all (replacing the old toast and its dead Deny),
+    // with a fresh token.
+    let _core = core_with(&env, FakeClock::new(), Some(ids), None);
+    let mut p = pipe(&env, json!({}));
+    let token = deny_token(&mut p, &scheme, &id);
+    assert_ne!(token, old_token);
+    let mut a = app(&env);
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": id, "answer": "deny", "toast_token": token}),
+    );
+    assert_eq!(r["result"]["status"], "ok", "the new token denies: {r}");
+    until(&format!("the toast of {id} removed"), || {
+        ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == id.as_str())
+            .then_some(())
+    });
+}
+
+#[test] // spec: APP-146, ARCH-055, APP-022
+fn a_toast_held_back_while_the_app_was_in_front_goes_out_when_it_closes() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let a = app(&env);
+    desktop(&mut p, json!({"foreground": "suite"}));
+    let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    // The app shows it; no toast while it is in front.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(posts(&mut p, "confirmation_waiting").is_empty());
+    // The app closes unanswered: the confirmation still waits, now with its toast.
+    drop(a);
+    let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
+    assert_eq!(toast["tag"], id.as_str(), "{toast}");
+}
+
+#[test] // spec: APP-146, APP-022, ARCH-055, QA-016
+fn a_bus_overflow_mid_batch_still_ends_in_one_toast() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let core = core(&env);
+    let (notifier, events) = (core.core().notifier().clone(), core.core().events().clone());
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut a = app(&env);
+    let noise = |n: usize| {
+        for i in 0..n {
+            events.publish("jobs", json!({"kind": "noise", "n": i}));
+        }
+    };
+
+    // The notifier falls behind: its queue fills with other events first.
+    notifier.pause_job_events(true);
+    noise(1500);
+    let ids = batch(&mut p, 2);
+    // A confirmation waits meanwhile, and one is answered: its own path, never dropped.
+    let waiting = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    let answered = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    until_posts(&mut p, "confirmation_waiting", 2);
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": answered, "answer": "deny"}),
+    );
+    assert_eq!(r["result"]["status"], "ok", "{r}");
+    // More than the bus holds: the batch's end events are cleared, and a resync is queued.
+    noise(1500);
+    notifier.pause_job_events(false);
+
+    let launch = format!("{scheme}:task/{}", ids[0]);
+    until("the batch's toast after the resync", || {
+        posts(&mut p, "job_finished")
+            .iter()
+            .any(|t| t["launch"] == launch.as_str())
+            .then_some(())
+    });
+    fence(&mut p, &env);
+    let all = posts(&mut p, "job_finished");
+    assert_eq!(
+        all.iter()
+            .filter(|t| t["launch"] == launch.as_str())
+            .count(),
+        1,
+        "once: {all:?}"
+    );
+    assert!(
+        ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == answered.as_str())
+    );
+    assert!(
+        !ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == waiting.as_str())
+    );
+}
+
+#[test] // spec: APP-022, ARCH-055, QA-016
+fn posts_that_keep_failing_while_not_yet_shown_make_calls_unavailable() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    desktop(
+        &mut p,
+        json!({"toasts": "not_yet_shown", "post_fails": true}),
+    );
+    // Not yet shown counts as ready: the call waits, and its toast fails.
+    pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+    let first = Instant::now();
+    // The failed post started the 5 s grace; once it passes, the path is unavailable.
+    let refused = until("confirm.unavailable", || {
+        std::thread::sleep(Duration::from_millis(200));
+        let out = p.tool("test.destructive", json!({}), Some(&key()));
+        (out["status"] == "error").then_some(out)
+    });
+    assert_eq!(error_code(&refused), "confirm.unavailable", "{refused}");
+    assert!(
+        first.elapsed() >= Duration::from_secs(4),
+        "{:?}",
+        first.elapsed()
+    );
+    let got = p.tool_ok("desktop.get", json!({"fresh": true}), None);
+    assert_eq!(got["notification_path"]["toasts"], "unavailable", "{got}");
+    assert_eq!(
+        got["notification_path"]["toasts_reason"], "no_platform",
+        "{got}"
+    );
+    assert!(posts(&mut p, "confirmation_waiting").is_empty());
+}
+
+#[test] // spec: QA-056, ARCH-055, CORE-113
+fn lil_waits_through_the_toast_with_no_app_open() {
+    let env = TestEnv::new();
+    // The real core binary: `lil` trusts only a core beside it.
+    let _core =
+        lil_testkit::CoreFixture::start_with_env(&env, &[("LIL_TEST_DESKTOP_POLL_MS", "50")]);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let k = key();
+    let call =
+        |env: &TestEnv| env.lil(&["call", "test.destructive", "{}", "--idempotency-key", &k]);
+    let out = call(&env);
+    assert_eq!(out.code, 4, "pending_confirmation: {out:?}");
+    let outcome: Value = serde_json::from_str(&out.stdout).unwrap();
+    let id = pending_id(&outcome);
+    let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
+    assert_eq!(toast["tag"], id.as_str(), "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) wants to run test.destructive",
+        "{toast}"
+    );
+    // An app opened later answers it; the retry runs it.
+    let mut a = app(&env);
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": id, "answer": "approve"}),
+    );
+    assert_eq!(r["result"]["status"], "ok", "{r}");
+    let out = call(&env);
+    assert_eq!(out.code, 0, "{out:?}");
+    let ran: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(ran["structured"]["count"], 1, "{ran}");
+}
+
 #[test] // spec: APP-022, ARCH-053, CORE-111
 fn a_toast_deny_needs_its_token_and_works_once() {
     let env = TestEnv::new();
@@ -845,10 +1114,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-#[test] // spec: APP-022, ARCH-117
-fn a_toast_token_never_reaches_a_log_line() {
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Captures every log line of this process from now on (nextest runs each test in its own
+/// process, so the test owns the global subscriber).
+fn capture_logs() -> Captured {
     let logs = Captured::default();
-    // nextest runs each test in its own process, so this one owns the global subscriber.
     let _ = tracing::subscriber::set_global_default(
         tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -856,6 +1131,12 @@ fn a_toast_token_never_reaches_a_log_line() {
             .with_max_level(tracing::Level::TRACE)
             .finish(),
     );
+    logs
+}
+
+#[test] // spec: APP-022, ARCH-117
+fn a_toast_token_never_reaches_a_log_line() {
+    let logs = capture_logs();
     let env = TestEnv::new();
     let scheme = env.env.activation_scheme();
     let _core = core_with(&env, FakeClock::new(), None, None);
@@ -871,7 +1152,7 @@ fn a_toast_token_never_reaches_a_log_line() {
             json!({"confirmation_id": id, "answer": "deny", "toast_token": t}),
         );
     }
-    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    let text = logs.text();
     assert!(
         !text.contains(&token),
         "a log line holds the token:\n{text}"
@@ -1024,8 +1305,12 @@ fn agent_open_posts_agent_activity_with_an_open_url() {
     let shown = p.tool_ok("ui.show", json!({"target": target}), None);
     assert_eq!(shown["running"], false, "{shown}");
     let toast = until_posts(&mut p, "agent_activity", 1).remove(0);
-    assert_eq!(toast["title"], "Claude Code", "{toast}");
-    assert_eq!(toast["body"], "Claude Code opened picture.png", "{toast}");
+    // A script (this `cli` pipe) is named as the confirmation toast names it (ruling).
+    assert_eq!(toast["title"], "A script (lil)", "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) opened picture.png",
+        "{toast}"
+    );
     assert_eq!(
         toast["launch"],
         lil_parse::open_url(&scheme, &target),
@@ -1038,11 +1323,62 @@ fn agent_open_posts_agent_activity_with_an_open_url() {
     );
     until_posts(&mut p, "agent_activity", 2);
 
+    // A target whose open URL would pass 8,192 characters: no launch.
+    let long = format!(r"C:\{}.png", "\u{1F600}".repeat(2000));
+    p.tool_ok("ui.show", json!({"target": long}), None);
+    let toast = until_posts(&mut p, "agent_activity", 3).remove(2);
+    assert!(toast.get("launch").is_none(), "{toast}");
+
     // Your own app's request posts nothing.
     let mut a = app(&env);
     let mine = a.tool("ui.show", json!({"target": target}), None);
     assert_eq!(mine["status"], "ok", "{mine}");
     drop(a);
     fence(&mut p, &env);
-    assert_eq!(posts(&mut p, "agent_activity").len(), 2);
+    assert_eq!(posts(&mut p, "agent_activity").len(), 3);
+}
+
+#[test] // spec: APP-146, ARCH-022, CORE-160
+fn a_workspace_recovered_later_posts_its_own_restart_toast() {
+    let env = TestEnv::new();
+    let (first, later) = (env.make_workspace("first"), env.make_workspace("later"));
+    env.register_workspace(&first, false);
+    env.register_workspace(&later, true);
+    let ids = {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut a = app(&env);
+        let paused = a.call("app/queue.pause", json!({}));
+        assert_eq!(paused["result"]["status"], "ok", "{paused}");
+        let mut p = pipe(&env, json!({"workspace": env.workspace_id(&later)}));
+        job_ids(&write(
+            &mut p,
+            "test.job",
+            json!({"lane": "gpu-heavy", "batch": 2}),
+        ))
+    };
+    // The next core starts in another workspace: the held jobs' one isn't recovered yet.
+    env.register_workspace(&first, true);
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        posts(&mut p, "job_failed").is_empty(),
+        "the workspace isn't recovered until it is used: {:?}",
+        posts(&mut p, "job_failed")
+    );
+    // Switched to, and first used: that recovery's held jobs get their own toast.
+    write(
+        &mut p,
+        "workspace.set_default",
+        json!({"path": later.to_string_lossy()}),
+    );
+    let mut in_ws = pipe(&env, json!({"workspace": env.workspace_id(&later)}));
+    in_ws.tool_ok("jobs.list", json!({}), None);
+    let toast = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert_eq!(toast["title"], "Jobs held after a restart", "{toast}");
+    assert_eq!(
+        toast["body"], "2 jobs wait until you resume them in Jobs",
+        "{toast}"
+    );
+    assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");
 }

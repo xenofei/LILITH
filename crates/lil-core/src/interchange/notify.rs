@@ -2,18 +2,34 @@
 //! P4a-R7, P4a-R8, P4a-R9, P4a-R36, P4a-R41): the core's Windows toasts and the notification
 //! path that lets a confirmation wait with no app open.
 //!
-//! - **What it posts.** It subscribes in-process to the `jobs`, `confirmations` and `caps`
-//!   topics: `job_finished` or `job_failed` once per batch, when its last job ends
-//!   ([`batch_end`]); `confirmation_waiting` for each pending confirmation, removed when it is
-//!   answered, expires or is cancelled; `cap_alert` for each `caps` alert. It is called for
-//!   `notify.claude_code` ([`Notifier::claude_code`]), an agent's `open_in` and `ui.show`
-//!   ([`Notifier::agent_opened`]) and a start that held jobs ([`Notifier::restart_held`]).
-//!   No toast is ever a progress toast or updated in place (P4a-R36).
+//! - **What it posts.**
+//!   - `job_finished` or `job_failed` once per batch, when its last job ends ([`batch_end`]),
+//!     from the `jobs` topic (its own bus client).
+//!   - `confirmation_waiting` for each pending confirmation, removed by its Tag whenever it
+//!     ends, whichever core run posted it. [`Confirm`] tells the notifier straight away
+//!     ([`NotificationPath::pending`], [`NotificationPath::ended`]) through an unbounded
+//!     channel, so no burst of other events can drop one.
+//!   - `cap_alert` for each `caps` alert (a bus client of its own).
+//!   - `notify.claude_code` ([`Notifier::claude_code`]), an agent's `open_in` and `ui.show`
+//!     ([`Notifier::agent_opened`]) and each recovery that held jobs ([`Notifier::restart_held`]).
+//!   - No toast is ever a progress toast or updated in place (P4a-R36).
 //! - **When.** A toast is posted only when its category is on, the channel's toasts can post
 //!   (`ready` or `not_yet_shown`) with the shortcut `ok`, and no connected `ui:*` app owns the
 //!   foreground window (P4a-R7); otherwise nothing is posted or queued. While the fullscreen
 //!   poll says fullscreen and `quiet_while_fullscreen` is on, every toast is quiet
-//!   (`SuppressPopup`), confirmations included; none is dropped for it.
+//!   (`SuppressPopup`), confirmations included; none is dropped for it. A post that fails
+//!   recomputes the notification path, so Reachable sees it at once.
+//! - **Batch ends, in O(n).** A final job event marks its batch; the batch is read (narrowly,
+//!   [`Jobs::batch_jobs`]) only once none of its jobs is queued, running or held any more
+//!   ([`Jobs::batch_live`]), and again on the jobs' change watch until its newest attempts are
+//!   all final. When the bus dropped `jobs` events (`resync_required`), every batch
+//!   with a job finished since a little before the last event handled is checked again; each
+//!   batch end is toasted once (the newest attempts' ids).
+//! - **Reconcile** (plan 4a clarification, 2026-10-25): at start, after each confirmation load
+//!   and when the last app that can answer confirmations closes, each pending confirmation
+//!   without a toast from this run gets one, with a fresh token (the same Tag replaces an
+//!   earlier run's toast and its dead Deny), and a confirmation toast in the notification
+//!   centre whose confirmation isn't pending is removed.
 //! - **Tags.** A confirmation's toast is tagged with its id, so it is never replaced by
 //!   another's; a batch from a panel with its batch id; any other batch's with `o_<16 hex>` of
 //!   its origin, so a newer one from the same origin replaces the older one (a new post, never
@@ -29,9 +45,9 @@
 //!   `not_yet_shown` is read again on each call, so its end as `no_platform` answers at once
 //!   (plan 4a clarification, 2026-10-25).
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use lil_platform::desktop::{Desktop, Toast};
 use lil_platform::{Clock, Env, IdSource};
@@ -39,26 +55,35 @@ use lil_protocol::app::{
     ConfirmationView, DesktopSettings, HandlersWire, NotificationPath as PathWire, ShortcutWire,
     ToastsWire,
 };
-use lil_protocol::{Cover, EventKind, EventParams};
+use lil_protocol::{CallerKind, Cover, EventKind, EventParams};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::toast_xml::{ToastActions, ToastText, cut_token, toast_xml};
-use crate::confirm::{self, Confirm};
+use crate::confirm::{Confirm, ListState, NotificationPath};
 use crate::desktop::{DesktopSettingsStore, DesktopWatch, UiApps};
 use crate::events::{ClientId, EventBus};
-use crate::jobs::{JobId, JobStatus, JobSummary, Jobs, Priority, Surface};
+use crate::jobs::{BatchJob, JobId, JobStatus, Jobs, Priority, Surface};
 
-/// The notifier's client id on the event bus: no connection has it.
-pub const NOTIFIER_CLIENT: ClientId = u64::MAX;
+/// The notifier's bus client for the `jobs` topic: no connection has it.
+pub const JOBS_CLIENT: ClientId = u64::MAX;
+/// The notifier's bus client for the `caps` topic, apart from the jobs' volume.
+pub const CAPS_CLIENT: ClientId = u64::MAX - 1;
 /// The same Claude Code message within this long is a duplicate (Appendix G).
 pub const DUPLICATE_WITHIN: Duration = Duration::from_secs(10);
 /// How many ended batches the notifier remembers, so each ends in one toast.
 const BATCHES_KEPT: usize = 512;
-/// How many event lines may wait for the notifier.
+/// How many event lines may wait for the notifier, per client.
 const EVENT_QUEUE: usize = 1024;
+/// After a `jobs` resync, batches with a job finished this long before the last event handled
+/// are checked again too.
+const RESYNC_LOOKBACK_SECS: i64 = 5;
+/// The most pending confirmations a reconcile reads.
+const RECONCILE_LIMIT: u32 = 1000;
+/// The longest `lil:` URL argument (Appendix G "`lil:` URLs"): a longer `open` launch is left out.
+const MAX_URL_CHARS: usize = 8192;
 
 /// The categories (Appendix G).
 pub const JOB_FINISHED: &str = "job_finished";
@@ -110,12 +135,19 @@ pub struct NotifierParts {
     pub ids: Arc<dyn IdSource>,
 }
 
+/// What [`Confirm`] tells the notifier, in order.
+enum ConfirmNews {
+    Pending(Box<ConfirmationView>),
+    Ended(String),
+    Reconcile,
+}
+
 /// What the notifier remembers.
 #[derive(Default)]
 struct Memory {
     /// Claude Code messages posted (or being posted), with when (monotonic).
     recent: VecDeque<(Duration, String)>,
-    /// The confirmations whose toast is posted.
+    /// The confirmations whose toast this run posted.
     confirmations: HashSet<String>,
     /// The ended batches toasted: `(batch id, the newest attempts' ids)`, newest last.
     batches: VecDeque<(String, Vec<String>)>,
@@ -126,6 +158,7 @@ pub struct Notifier {
     desktop: Arc<dyn Desktop>,
     watch: Arc<DesktopWatch>,
     settings: Arc<DesktopSettingsStore>,
+    events: Arc<EventBus>,
     current: watch::Receiver<DesktopSettings>,
     fullscreen: watch::Receiver<bool>,
     apps: Arc<UiApps>,
@@ -134,8 +167,11 @@ pub struct Notifier {
     ids: Arc<dyn IdSource>,
     confirm: OnceLock<Weak<Confirm>>,
     jobs: OnceLock<Weak<Jobs>>,
+    news: mpsc::UnboundedSender<ConfirmNews>,
+    /// Holds the handling of `jobs` events while `true` (the overflow test's lever).
+    jobs_paused: watch::Sender<bool>,
     memory: Mutex<Memory>,
-    /// Ends the event task when the notifier is dropped.
+    /// Ends the notifier's tasks when it is dropped.
     stop: CancellationToken,
 }
 
@@ -153,9 +189,16 @@ impl Drop for Notifier {
     }
 }
 
+/// The parameters of one bus line, if it is a `lil/event`.
+fn event_of(line: &str) -> Option<EventParams> {
+    let note = serde_json::from_str::<Value>(line).ok()?;
+    serde_json::from_value(note.get("params")?.clone()).ok()
+}
+
 impl Notifier {
-    /// Starts the notifier on the current runtime: it is subscribed to `jobs`, `confirmations`
-    /// and `caps` when this returns. Its task ends when the notifier is dropped.
+    /// Starts the notifier on the current runtime: its confirmation news and its `caps` bus
+    /// client are in place when this returns; the `jobs` client starts with
+    /// [`Notifier::set_jobs`]. Its tasks end when the notifier is dropped.
     pub async fn start(parts: NotifierParts) -> Arc<Notifier> {
         let NotifierParts {
             desktop,
@@ -167,26 +210,53 @@ impl Notifier {
             clock,
             ids,
         } = parts;
+        let (news, mut news_rx) = mpsc::unbounded_channel();
         let me = Arc::new(Notifier {
             current: settings.current(),
             fullscreen: watch.fullscreen(),
             desktop,
             watch,
             settings,
+            events: events.clone(),
             apps,
             scheme: env.activation_scheme(),
             clock,
             ids,
             confirm: OnceLock::new(),
             jobs: OnceLock::new(),
+            news,
+            jobs_paused: watch::Sender::new(false),
             memory: Mutex::new(Memory::default()),
             stop: CancellationToken::new(),
         });
+
+        // The confirmations, in order, never dropped.
+        let (weak, stop) = (Arc::downgrade(&me), me.stop.clone());
+        tokio::spawn(async move {
+            loop {
+                let news = tokio::select! {
+                    () = stop.cancelled() => return,
+                    news = news_rx.recv() => match news {
+                        Some(news) => news,
+                        None => return,
+                    },
+                };
+                let Some(me) = weak.upgrade() else {
+                    return;
+                };
+                match news {
+                    ConfirmNews::Pending(view) => me.confirmation_pending(&view).await,
+                    ConfirmNews::Ended(id) => me.confirmation_ended(&id).await,
+                    ConfirmNews::Reconcile => me.reconcile_confirmations().await,
+                }
+            }
+        });
+
+        // The caps alerts.
         let (tx, mut rx) = mpsc::channel(EVENT_QUEUE);
-        events.attach(NOTIFIER_CLIENT, tx);
-        let topics = ["jobs", confirm::CONFIRMATIONS_TOPIC, "caps"].map(str::to_string);
+        events.attach(CAPS_CLIENT, tx);
         events
-            .subscribe(NOTIFIER_CLIENT, &topics, &BTreeMap::new())
+            .subscribe(CAPS_CLIENT, &["caps".to_string()], &BTreeMap::new())
             .await;
         let (weak, stop) = (Arc::downgrade(&me), me.stop.clone());
         tokio::spawn(async move {
@@ -201,9 +271,20 @@ impl Notifier {
                 let Some(me) = weak.upgrade() else {
                     break;
                 };
-                me.on_line(&line).await;
+                if let Some(p) = event_of(&line)
+                    && p.kind == EventKind::Event
+                    && p.data.get("kind").and_then(Value::as_str) == Some("alert")
+                {
+                    let text = |k: &str| p.data.get(k).and_then(Value::as_str).unwrap_or_default();
+                    let pct = p
+                        .data
+                        .get("threshold_pct")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    me.cap_alert(text("cap"), pct, text("period")).await;
+                }
             }
-            events.drop_client(NOTIFIER_CLIENT);
+            events.drop_client(CAPS_CLIENT);
         });
         me
     }
@@ -213,9 +294,118 @@ impl Notifier {
         let _ = self.confirm.set(Arc::downgrade(confirm));
     }
 
-    /// The jobs whose batches it reads.
-    pub fn set_jobs(&self, jobs: &Arc<Jobs>) {
-        let _ = self.jobs.set(Arc::downgrade(jobs));
+    /// The jobs whose batches it reads: subscribes its `jobs` bus client and starts handling
+    /// their events (once; a second call is ignored).
+    pub async fn set_jobs(self: &Arc<Self>, jobs: &Arc<Jobs>) {
+        if self.jobs.set(Arc::downgrade(jobs)).is_err() {
+            return;
+        }
+        let (tx, mut rx) = mpsc::channel(EVENT_QUEUE);
+        self.events.attach(JOBS_CLIENT, tx);
+        self.events
+            .subscribe(JOBS_CLIENT, &["jobs".to_string()], &BTreeMap::new())
+            .await;
+        let mut changes = jobs.changes();
+        let mut paused = self.jobs_paused.subscribe();
+        let (weak, stop, events) = (Arc::downgrade(self), self.stop.clone(), self.events.clone());
+        tokio::spawn(async move {
+            let mut marked: BTreeSet<String> = BTreeSet::new();
+            let mut last_utc: Option<i64> = None;
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => break,
+                    held = paused.wait_for(|p| !*p) => if held.is_err() { break },
+                }
+                tokio::select! {
+                    () = stop.cancelled() => break,
+                    line = rx.recv() => match line {
+                        Some(line) => {
+                            let Some(me) = weak.upgrade() else { break };
+                            me.on_jobs_line(&line, &mut marked, &mut last_utc).await;
+                        }
+                        None => break,
+                    },
+                    changed = changes.changed() => if changed.is_err() { break },
+                }
+                let Some(me) = weak.upgrade() else { break };
+                me.settle_batches(&mut marked).await;
+            }
+            events.drop_client(JOBS_CLIENT);
+        });
+    }
+
+    /// Holds (`true`) or lets go the handling of `jobs` events. Only the bus overflow test
+    /// uses it: events queue up meanwhile, as when the notifier falls behind.
+    #[doc(hidden)]
+    pub fn pause_job_events(&self, on: bool) {
+        self.jobs_paused.send_replace(on);
+    }
+
+    fn utc_secs(&self) -> i64 {
+        self.clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    }
+
+    /// One `jobs` line: a batch to look at, or after a resync every batch with a job finished
+    /// since a little before the last event handled.
+    async fn on_jobs_line(
+        &self,
+        line: &str,
+        marked: &mut BTreeSet<String>,
+        last_utc: &mut Option<i64>,
+    ) {
+        let Some(p) = event_of(line) else {
+            return;
+        };
+        match p.kind {
+            EventKind::ResyncRequired => {
+                let since = last_utc.unwrap_or_else(|| self.utc_secs()) - RESYNC_LOOKBACK_SECS;
+                if let Some(jobs) = self.jobs.get().and_then(Weak::upgrade) {
+                    let found = jobs.batches_finished_since(since).await;
+                    tracing::info!(
+                        batches = found.len(),
+                        "the notifier missed jobs events; it checks the batches again"
+                    );
+                    marked.extend(found);
+                }
+            }
+            EventKind::Event if p.data.get("kind").and_then(Value::as_str) == Some("job") => {
+                *last_utc = Some(self.utc_secs());
+                let job = &p.data["job"];
+                let status = job["status"].as_str().and_then(JobStatus::parse);
+                let interrupted = job["substatus"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("interrupted"));
+                if status.is_some_and(JobStatus::is_final)
+                    && !interrupted
+                    && let Some(batch) = job["batch_id"].as_str()
+                {
+                    marked.insert(batch.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Each marked batch none of whose jobs is queued, running or held any more: its end, read
+    /// once its newest attempts are all final (until then it stays marked, and the jobs' change
+    /// watch brings it back).
+    async fn settle_batches(&self, marked: &mut BTreeSet<String>) {
+        let Some(jobs) = self.jobs.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let candidates: Vec<String> = marked
+            .iter()
+            .filter(|b| !jobs.batch_live(b))
+            .cloned()
+            .collect();
+        for batch in candidates {
+            if self.batch_ended(&jobs, &batch).await {
+                marked.remove(&batch);
+            }
+        }
     }
 
     /// `notify.claude_code`: an `agent_activity` toast, "Claude Code" (or "Claude Code:
@@ -256,19 +446,28 @@ impl Notifier {
         outcome
     }
 
-    /// An agent's `open_in` or `ui.show` (APP-065): "Claude Code opened <target title>",
-    /// launching `<scheme>:open/<base64url of target>`.
-    pub async fn agent_opened(&self, target_title: &str, target: &str) -> NotifyOutcome {
+    /// An agent's `open_in` or `ui.show` (APP-065): "<who>" / "<who> opened <target title>",
+    /// who as for a confirmation (plan 4a ruling, 2026-10-25), launching
+    /// `<scheme>:open/<base64url of target>`, or nothing when that URL would pass the longest
+    /// `lil:` argument.
+    pub async fn agent_opened(
+        &self,
+        caller: &CallerKind,
+        target_title: &str,
+        target: &str,
+    ) -> NotifyOutcome {
+        let who = who(&caller.to_string()).to_string();
+        let url = lil_parse::open_url(&self.scheme, target);
         let text = ToastText {
-            title: "Claude Code".to_string(),
-            body: format!("Claude Code opened {target_title}"),
-            launch: Some(lil_parse::open_url(&self.scheme, target)),
+            body: format!("{who} opened {target_title}"),
+            title: who,
+            launch: (url.chars().count() <= MAX_URL_CHARS).then_some(url),
             actions: ToastActions::None,
         };
         self.post(AGENT_ACTIVITY, &self.ids.id("n"), &text).await
     }
 
-    /// The restart hold (P4a-R41): one `job_failed` toast for a start that held `held` jobs,
+    /// The restart hold (P4a-R41): one `job_failed` toast for a recovery that held `held` jobs,
     /// launching the first. With `held` 0 nothing is posted (`Unavailable`).
     pub async fn restart_held(&self, held: usize, first: &JobId) -> NotifyOutcome {
         if held == 0 {
@@ -289,93 +488,44 @@ impl Notifier {
             .await
     }
 
-    /// One event line of the bus.
-    async fn on_line(&self, line: &str) {
-        let Ok(note) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        let Some(params) = note
-            .get("params")
-            .cloned()
-            .and_then(|p| serde_json::from_value::<EventParams>(p).ok())
-        else {
-            return;
-        };
-        if params.kind != EventKind::Event {
-            return;
+    /// The end of `batch`: its toast, once. `false` while one of its newest attempts isn't
+    /// final yet (a job still recording its end).
+    async fn batch_ended(&self, jobs: &Jobs, batch: &str) -> bool {
+        let rows = jobs.batch_jobs(batch).await;
+        if !all_final(&rows) {
+            return false;
         }
-        let kind = params.data.get("kind").and_then(Value::as_str);
-        match (params.topic.as_str(), kind) {
-            ("jobs", Some("job")) => {
-                if let Some(job) = params
-                    .data
-                    .get("job")
-                    .cloned()
-                    .and_then(|j| serde_json::from_value::<JobSummary>(j).ok())
-                {
-                    self.job_changed(&job).await;
-                }
-            }
-            (confirm::CONFIRMATIONS_TOPIC, Some(kind)) => {
-                let Some(view) = params
-                    .data
-                    .get("confirmation")
-                    .cloned()
-                    .and_then(|c| serde_json::from_value::<ConfirmationView>(c).ok())
-                else {
-                    return;
-                };
-                if kind == "pending" {
-                    self.confirmation_pending(&view).await;
-                } else {
-                    self.confirmation_ended(&view.id).await;
-                }
-            }
-            ("caps", Some("alert")) => {
-                let d = &params.data;
-                let text = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or_default();
-                let pct = d.get("threshold_pct").and_then(Value::as_u64).unwrap_or(0);
-                self.cap_alert(text("cap"), pct, text("period")).await;
-            }
-            _ => {}
-        }
-    }
-
-    /// A job's new state: when it ended its batch, the batch's toast (module docs).
-    async fn job_changed(&self, job: &JobSummary) {
-        if !job.status.is_final() || interrupted(job) {
-            return;
-        }
-        let Some(jobs) = self.jobs.get().and_then(Weak::upgrade) else {
-            return;
-        };
-        let batch = jobs.batch_summaries(&job.batch_id).await;
-        let Some(end) = batch_end(&batch) else {
-            return;
+        let Some(end) = batch_end(&rows) else {
+            return true;
         };
         {
             let mut memory = lock(&self.memory);
             if memory
                 .batches
                 .iter()
-                .any(|(b, ids)| *b == job.batch_id && *ids == end.newest)
+                .any(|(b, ids)| b == batch && *ids == end.newest)
             {
-                return;
+                return true;
             }
             memory
                 .batches
-                .push_back((job.batch_id.clone(), end.newest.clone()));
+                .push_back((batch.to_string(), end.newest.clone()));
             while memory.batches.len() > BATCHES_KEPT {
                 memory.batches.pop_front();
             }
         }
         let (category, text) = batch_text(&self.scheme, &end);
         let outcome = self.post(category, &end.tag, &text).await;
-        tracing::info!(batch_id = %job.batch_id, jobs = end.counted.len(), category, outcome = ?outcome, "a batch ended");
+        tracing::info!(batch_id = %batch, jobs = end.counted.len(), category, outcome = ?outcome, "a batch ended");
+        true
     }
 
-    /// A pending confirmation: its toast with Open and Deny and a fresh token.
+    /// A pending confirmation: its toast with Open and Deny and a fresh token, unless this run
+    /// posted one already.
     async fn confirmation_pending(&self, view: &ConfirmationView) {
+        if lock(&self.memory).confirmations.contains(&view.id) {
+            return;
+        }
         let Some(confirm) = self.confirm.get().and_then(Weak::upgrade) else {
             return;
         };
@@ -413,11 +563,13 @@ impl Notifier {
         }
     }
 
-    /// A confirmation answered, expired or cancelled: its toast goes.
+    /// A confirmation answered, expired or cancelled: its toast goes, whichever run posted it.
     async fn confirmation_ended(&self, id: &str) {
-        if !lock(&self.memory).confirmations.remove(id) {
-            return;
-        }
+        lock(&self.memory).confirmations.remove(id);
+        self.remove_toast(id).await;
+    }
+
+    async fn remove_toast(&self, id: &str) {
         let (desktop, tag) = (self.desktop.clone(), id.to_string());
         let removed = tokio::task::spawn_blocking(move || {
             desktop.remove(&tag, CONFIRMATION_WAITING);
@@ -425,6 +577,43 @@ impl Notifier {
         .await;
         if let Err(e) = removed {
             tracing::warn!(confirmation = %id, error = %e, "a confirmation toast could not be removed");
+        }
+    }
+
+    /// The confirmation toasts against the pending confirmations (module docs, "Reconcile").
+    async fn reconcile_confirmations(&self) {
+        let Some(confirm) = self.confirm.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let rows = match confirm.list(ListState::Pending, RECONCILE_LIMIT).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(code = %e.code, "the confirmation toasts could not be reconciled");
+                return;
+            }
+        };
+        let pending: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+        for row in &rows {
+            self.confirmation_pending(&row.view()).await;
+        }
+        let gone: Vec<String> = lock(&self.memory)
+            .confirmations
+            .iter()
+            .filter(|id| !pending.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            self.confirmation_ended(&id).await;
+        }
+        let desktop = self.desktop.clone();
+        let shown = tokio::task::spawn_blocking(move || desktop.history())
+            .await
+            .unwrap_or_default();
+        for (tag, group) in shown {
+            if group == CONFIRMATION_WAITING && !pending.contains(&tag) {
+                tracing::info!(confirmation = %tag, "a stale confirmation toast is removed");
+                self.remove_toast(&tag).await;
+            }
         }
     }
 
@@ -478,6 +667,8 @@ impl Notifier {
                 Ok(()) => NotifyOutcome::Posted,
                 Err(e) => {
                     tracing::warn!(tag = %toast.tag, group = %toast.group, error = %e, "a toast could not be posted");
+                    // Reachable sees the failure at once (Appendix G "Ready").
+                    settings.notification_path(true);
                     NotifyOutcome::Unavailable
                 }
             }
@@ -490,7 +681,7 @@ impl Notifier {
     }
 }
 
-impl confirm::NotificationPath for Notifier {
+impl NotificationPath for Notifier {
     /// Appendix G "Reachable" (module docs). It may read the desktop.
     fn reachable(&self) -> bool {
         let mut path = self.settings.notification_path(false);
@@ -505,6 +696,18 @@ impl confirm::NotificationPath for Notifier {
             .copied()
             .unwrap_or(true);
         on && can_post(&path) && path.handlers == HandlersWire::Ok
+    }
+
+    fn pending(&self, view: &ConfirmationView) {
+        let _ = self.news.send(ConfirmNews::Pending(Box::new(view.clone())));
+    }
+
+    fn ended(&self, id: &str) {
+        let _ = self.news.send(ConfirmNews::Ended(id.to_string()));
+    }
+
+    fn reconcile(&self) {
+        let _ = self.news.send(ConfirmNews::Reconcile);
     }
 }
 
@@ -526,8 +729,8 @@ fn hex16(text: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A failed job marked `interrupted` by a core's start or stop: it ends no batch's toast.
-fn interrupted(job: &JobSummary) -> bool {
+/// A failed job marked `interrupted` by a core's start or stop.
+fn interrupted(job: &BatchJob) -> bool {
     job.status == JobStatus::Failed
         && job
             .substatus
@@ -535,7 +738,8 @@ fn interrupted(job: &JobSummary) -> bool {
             .is_some_and(|s| s.starts_with("interrupted"))
 }
 
-/// Who asks, in a confirmation toast (Appendix G "Copy").
+/// Who asks (a confirmation toast) or opened something (an agent-activity toast), by caller
+/// kind (Appendix G "Copy").
 fn who(caller_kind: &str) -> &str {
     match caller_kind {
         "mcp" => "Claude Code",
@@ -560,28 +764,46 @@ fn cap_name(cap: Option<&Value>) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchEnd {
     /// The jobs it counts: the newest attempt at each index, not cancelled, by index.
-    pub counted: Vec<JobSummary>,
+    pub counted: Vec<BatchJob>,
     /// The newest attempts' ids, by index: one batch end is toasted once.
     pub newest: Vec<String>,
     /// Its first failed job, if any.
-    pub failed: Option<JobSummary>,
+    pub failed: Option<BatchJob>,
     pub tag: String,
 }
 
-/// The end of a batch, from all its jobs (every attempt): `None` while one of its newest
-/// attempts isn't final, or when nothing in it toasts: every one cancelled, or none of
-/// priority `user` or `agent` with an origin other than `core`.
-pub fn batch_end(batch: &[JobSummary]) -> Option<BatchEnd> {
+/// The newest attempt at each index of `batch` (every attempt), by index.
+fn newest(batch: &[BatchJob]) -> Vec<&BatchJob> {
     let retried: HashSet<&str> = batch.iter().filter_map(|j| j.retry_of.as_deref()).collect();
-    let mut newest: Vec<&JobSummary> = batch
+    let mut newest: Vec<&BatchJob> = batch
         .iter()
         .filter(|j| !retried.contains(j.job_id.as_str()))
         .collect();
     newest.sort_by_key(|j| j.index);
+    newest
+}
+
+/// Whether every newest attempt of `batch` is final (an empty batch counts as ended).
+fn all_final(batch: &[BatchJob]) -> bool {
+    newest(batch).iter().all(|j| j.status.is_final())
+}
+
+/// The end of a batch, from all its jobs (every attempt): `None` while one of its newest
+/// attempts isn't final, when the one that ended last was marked `interrupted` by a core's
+/// start or stop, or when nothing in it toasts: every one cancelled, or none of priority
+/// `user` or `agent` with an origin other than `core`.
+pub fn batch_end(batch: &[BatchJob]) -> Option<BatchEnd> {
+    let newest = newest(batch);
     if newest.is_empty() || newest.iter().any(|j| !j.status.is_final()) {
         return None;
     }
-    let counted: Vec<JobSummary> = newest
+    let last = newest
+        .iter()
+        .max_by_key(|j| (j.finished_utc.unwrap_or(i64::MIN), j.index))?;
+    if interrupted(last) {
+        return None;
+    }
+    let counted: Vec<BatchJob> = newest
         .iter()
         .filter(|j| j.status != JobStatus::Cancelled)
         .filter(|j| matches!(j.priority, Priority::User | Priority::Agent))
@@ -618,10 +840,7 @@ pub fn batch_end(batch: &[JobSummary]) -> Option<BatchEnd> {
 fn batch_text(scheme: &str, end: &BatchEnd) -> (&'static str, ToastText) {
     let first = &end.counted[0];
     if let Some(failed) = &end.failed {
-        let message = failed
-            .error
-            .as_ref()
-            .map_or("it failed", |e| e.message.as_str());
+        let message = failed.error_message.as_deref().unwrap_or("it failed");
         return (
             JOB_FAILED,
             ToastText {
@@ -638,19 +857,14 @@ fn batch_text(scheme: &str, end: &BatchEnd) -> (&'static str, ToastText) {
     } else {
         format!("Batch finished ({n} jobs)")
     };
-    let ms = |t: Option<&String>| t.and_then(|t| crate::telemetry::parse_ts(t));
     let start = end
         .counted
         .iter()
-        .filter_map(|j| ms(j.started.as_ref()).or_else(|| ms(Some(&j.created))))
+        .map(|j| j.started_utc.unwrap_or(j.created_utc))
         .min();
-    let stop = end
-        .counted
-        .iter()
-        .filter_map(|j| ms(j.finished.as_ref()))
-        .max();
+    let stop = end.counted.iter().filter_map(|j| j.finished_utc).max();
     let elapsed = match (start, stop) {
-        (Some(a), Some(b)) => elapsed_text((b - a).max(0) / 1000),
+        (Some(a), Some(b)) => elapsed_text(b - a),
         _ => elapsed_text(0),
     };
     let project = first.project.as_deref().unwrap_or("no project");
@@ -696,5 +910,12 @@ mod tests {
         let token = toast_token(&lil_platform::RandomIds);
         assert_eq!(token.len(), 32);
         assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "{token}");
+    }
+
+    #[test] // spec: APP-065, APP-022
+    fn the_agent_names_follow_the_confirmation_copy() {
+        assert_eq!(who(&CallerKind::Mcp.to_string()), "Claude Code");
+        assert_eq!(who(&CallerKind::Assistant.to_string()), "The assistant");
+        assert_eq!(who(&CallerKind::Cli.to_string()), "A script (lil)");
     }
 }
