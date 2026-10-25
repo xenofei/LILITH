@@ -112,8 +112,9 @@ fn root(id: &str, owner: Option<&str>, now: SystemTime, age: Duration) -> TestRe
 
 /// A killed test leaves its `HKCU\Software\LILITH-test-<id>` key (Task 3's review M9). The
 /// sweep's rule, over a fake registry so no real key of another worktree can be hit: a key is
-/// removed only with no `lil-testenv-*<id>-*` folder, at least an hour old and with no live
-/// owner; a failed removal doesn't stop the rest.
+/// removed only when at least an hour old, and either its owner is dead (its folder may be
+/// left: a killed test leaves both) or, naming no owner, no `lil-testenv-*<id>-*` folder is
+/// left; a failed removal doesn't stop the rest.
 #[test] // spec: QA-038
 fn leftover_test_registry_keys_are_swept() {
     let now = SystemTime::now();
@@ -127,6 +128,8 @@ fn leftover_test_registry_keys_are_swept() {
         root("0000000f", None, now, hours), // its labelled folder is there
         root("00000010", None, now, hours), // can't be removed
         root("00000011", None, now, hours), // removed after the failure
+        root("00000013", Some("dead"), now, hours), // a killed test: dead owner, folder left
+        root("00000014", Some("live"), now, hours), // a live owner with its folder: kept
         TestRegistryRoot {
             // Written after `now` (a clock change): kept.
             last_written: now + hours,
@@ -139,6 +142,8 @@ fn leftover_test_registry_keys_are_swept() {
         // Not a TestEnv folder, and the id doesn't end a segment: neither counts.
         "lil-other-0000000a-a1b2c3".to_string(),
         "lil-testenv-0000000b0-a1b2c3".to_string(),
+        "lil-testenv-00000013-k1l2m3".to_string(),
+        "lil-testenv-00000014-n1o2p3".to_string(),
     ];
     let alive = |owner: &str| owner == "live";
     let mut asked = Vec::new();
@@ -152,13 +157,17 @@ fn leftover_test_registry_keys_are_swept() {
     };
     let sweep = lil_testkit::env::sweep_with(&roots, &folders, now, &alive, &mut remove);
 
-    assert_eq!(asked, ["0000000a", "0000000b", "00000010", "00000011"]);
+    assert_eq!(
+        asked,
+        ["0000000a", "0000000b", "00000010", "00000011", "00000013"]
+    );
     assert_eq!(
         sweep.removed,
         [
             r"HKCU\Software\LILITH-test-0000000a",
             r"HKCU\Software\LILITH-test-0000000b",
             r"HKCU\Software\LILITH-test-00000011",
+            r"HKCU\Software\LILITH-test-00000013",
         ]
     );
     assert_eq!(sweep.failed.len(), 1, "{sweep:?}");
@@ -176,6 +185,17 @@ fn a_root_owner_is_alive_only_as_this_very_process() {
     assert!(!lil_testkit::env::owner_alive(&reused));
     for bad in ["", "x", "1:", ":1", "4294967296:1"] {
         assert!(!lil_testkit::env::owner_alive(bad), "{bad}");
+    }
+}
+
+/// The keys `HKCU\Software\<name>` this test made, removed by exact name when it ends.
+struct Made<'a>(&'a [String]);
+
+impl Drop for Made<'_> {
+    fn drop(&mut self) {
+        for name in self.0 {
+            let _ = reg(&["delete", &format!(r"HKCU\Software\{name}"), "/f"]);
+        }
     }
 }
 
@@ -204,6 +224,8 @@ fn a_test_env_owns_its_registry_root_and_its_drop_removes_it() {
         format!("LILITH-test-{}", &id[..7]),
         format!("LILITH-testx-{id}"),
     ];
+    // No sweep ever removes these shapes, so they go by exact name even if the test panics.
+    let _made = Made(&other_shapes);
     for name in &other_shapes {
         assert!(reg(&[
             "add",
@@ -216,9 +238,6 @@ fn a_test_env_owns_its_registry_root_and_its_drop_removes_it() {
         ]));
     }
     let listed = test_registry_roots().unwrap();
-    for name in &other_shapes {
-        let _ = reg(&["delete", &format!(r"HKCU\Software\{name}"), "/f"]);
-    }
     for name in &other_shapes {
         let tail = name.split_once("-test-").map_or("", |(_, t)| t);
         assert!(!listed.iter().any(|r| r.id == tail), "{name} listed");

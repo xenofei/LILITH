@@ -315,7 +315,8 @@ pub enum ShortcutWire {
     Wrong,
 }
 
-/// The channel's scheme and `.lilref` handlers' state.
+/// The channel's own scheme handler's state, the one toast URLs use; `.lilref` never changes
+/// it (plan 4a ruling, 2026-10-25).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HandlersWire {

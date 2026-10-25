@@ -603,7 +603,9 @@ mod tests {
         // `QueueState`, the fix's optional `user_hint` (Appendix G "Out of memory"), and
         // `app/confirmation.answer`'s optional `toast_token` (Appendix G "Deny from a toast"),
         // and `app/set_context`'s params and result (Appendix G "Session and listing tools").
-        assert_eq!(h, "14f52e5dd994e024");
+        // The `HandlersWire` description changed (the scheme only, plan 4a ruling 2026-10-25):
+        // no wire value changed, so no protocol bump.
+        assert_eq!(h, "815b9a5e6f201285");
     }
 
     #[test] // spec: ARCH-029

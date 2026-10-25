@@ -630,10 +630,12 @@ pub fn sweep_test_registry_roots() -> std::io::Result<RegistrySweep> {
     ))
 }
 
-/// The sweep's rule (I3): a root is removed only when all three hold:
-/// 1. no `folders` entry is a `lil-testenv-*<id>-*` folder;
-/// 2. it was last written at least [`SWEEP_MIN_AGE`] before `now` (a time after `now` keeps it);
-/// 3. it names no owner, or its owner isn't `alive`.
+/// The sweep's rule (I3, amended by the re-review's N3): a root is removed only when it was
+/// last written at least [`SWEEP_MIN_AGE`] before `now` (a time after `now` keeps it), and
+/// - it names an owner that isn't `alive`, whether or not its folder is left (a killed test
+///   leaves both); or
+/// - it names no owner (an older test kit's root), and no `folders` entry is a
+///   `lil-testenv-*<id>-*` folder.
 ///
 /// `remove` is called with the id of each root to remove; one that fails is reported in
 /// [`RegistrySweep::failed`] and the others are still tried.
@@ -654,8 +656,11 @@ pub fn sweep_with(
         let old = now
             .duration_since(root.last_written)
             .is_ok_and(|age| age >= SWEEP_MIN_AGE);
-        let owned = root.owner.as_deref().is_some_and(alive);
-        if has_folder || !old || owned {
+        let gone = match root.owner.as_deref() {
+            Some(owner) => !alive(owner),
+            None => !has_folder,
+        };
+        if !old || !gone {
             continue;
         }
         let key = format!(r"HKCU\Software\{}-test-{}", names::APP_NAME, root.id);

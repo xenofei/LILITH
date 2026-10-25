@@ -1356,8 +1356,9 @@ fn shortcut(
 
 /// The channel's scheme and `.lilref` handlers, each on its own (plan 4a ruling, 2026-10-25):
 /// `ok:` for one that opens `exe`; a `warning:` for one another LILITH channel or build, or
-/// another program, holds, which is kept; and one `problem:` for the missing ones, which are
-/// registered, and only they, after `y`. Whether anything was written.
+/// another program, holds, which is kept; and one `problem:` for the missing ones and the stale
+/// ones (a LILITH registration whose exe is gone), which are registered, and only they, after
+/// `y`. Whether anything was written.
 fn handlers(
     env: &Env,
     exe: &Path,
@@ -1390,13 +1391,21 @@ fn handlers(
                  it as it is",
                 shown(holder)
             )),
-            HandlerPart::Missing => {}
+            HandlerPart::Missing | HandlerPart::Stale(_) => {}
         }
     }
-    let (scheme_missing, lilref_missing) = (
-        parts.scheme == HandlerPart::Missing,
-        parts.lilref == HandlerPart::Missing,
-    );
+    // Missing or stale: this channel's to write (a stale one is rewritten, never deleted).
+    let (scheme_missing, lilref_missing) = (parts.scheme.writable(), parts.lilref.writable());
+    let stale: Vec<String> = named
+        .iter()
+        .filter_map(|(part, name)| match part {
+            HandlerPart::Stale(gone) => Some(format!(
+                "{name} still names {}, which no longer exists",
+                shown(&gone.display().to_string())
+            )),
+            _ => None,
+        })
+        .collect();
     let (subject, is, opens) = match (scheme_missing, lilref_missing) {
         (true, true) => (
             format!("the {scheme}: link and .lilref file handlers"),
@@ -1420,7 +1429,10 @@ fn handlers(
     } else {
         "it"
     };
-    let what = format!("{subject} {is} registered for {shown_exe}, so {opens}");
+    let mut what = format!("{subject} {is} registered for {shown_exe}, so {opens}");
+    if !stale.is_empty() {
+        let _ = write!(what, " ({})", stale.join("; "));
+    }
     let explain = format!(
         "lil doctor can register {it} for your user account under {}, opening {shown_exe}; a \
          handler held by another channel, build or program stays as it is.",

@@ -146,7 +146,8 @@ fn handlers_missing_then_registered_after_yes() {
 #[test] // spec: APP-020, APP-021
 fn handlers_held_by_another_channel_are_a_warning_and_kept() {
     let env = TestEnv::new();
-    let other = env.root().join(r"other build\lil-image.exe");
+    // Another build that is there: a stale one would be repaired instead.
+    let other = existing(&env.root().join(r"other build\lil-image.exe"));
     register_handlers(&env.env, &other).unwrap();
     let classes = env.env.classes_root();
     let keys = [
@@ -197,6 +198,47 @@ fn non_interactive_never_writes() {
     );
 }
 
+/// `exe`, made an (empty) file so it counts as a build that is there; returned.
+fn existing(exe: &std::path::Path) -> PathBuf {
+    lil_testkit::files::write_file(exe, b"");
+    exe.to_path_buf()
+}
+
+#[test] // spec: APP-020, APP-021
+fn a_stale_registration_is_rewritten_after_yes_never_deleted() {
+    let env = TestEnv::new();
+    // A LILITH registration of this channel by a build that is gone (a removed worktree).
+    let gone = env.root().join(r"removed build\lil-image.exe");
+    register_handlers(&env.env, &gone).unwrap();
+    let parts = handler_parts(&env.env, &app_exe());
+    assert_eq!(parts.scheme, HandlerPart::Stale(gone.clone()));
+    assert_eq!(handler_state(&env.env, &app_exe()), HandlerState::Missing);
+
+    let no = doctor(&env, "n");
+    let stale = lines(&no, "problem:", "no longer exists");
+    assert_eq!(stale.len(), 1, "{no:?}");
+    assert!(stale[0].contains(&gone.display().to_string()), "{no:?}");
+    assert!(lines(&no, "warning:", "handler").is_empty(), "{no:?}");
+    assert_eq!(
+        handler_parts(&env.env, &app_exe()),
+        parts,
+        "`n` changes nothing"
+    );
+
+    let yes = doctor(&env, "y");
+    assert_eq!(lines(&yes, "fixed:", "handler").len(), 1, "{yes:?}");
+    let parts = handler_parts(&env.env, &app_exe());
+    assert_eq!(parts.scheme, HandlerPart::Ok);
+    assert_eq!(parts.lilref, HandlerPart::Ok);
+    // Rewritten in place: the keys are still there, now naming this channel's app.
+    let scheme = format!(
+        r"{}\{}",
+        env.env.classes_root(),
+        env.env.activation_scheme()
+    );
+    assert!(reg_tree(&scheme).contains(&app_exe().display().to_string()));
+}
+
 /// `reg add <key> /ve /d <value> /f`: the key's default value.
 fn reg_default(key: &str, value: &str) {
     let ok = Command::new("reg")
@@ -213,7 +255,7 @@ fn reg_default(key: &str, value: &str) {
 fn a_missing_own_scheme_is_offered_while_another_channel_holds_lilref() {
     let env = TestEnv::new();
     let classes = env.env.classes_root();
-    let other = env.root().join(r"stable\lil-image.exe");
+    let other = existing(&env.root().join(r"stable\lil-image.exe"));
     reg_default(&format!(r"{classes}\.lilref"), "LILITH.lilref.stable");
     reg_default(
         &format!(r"{classes}\LILITH.lilref.stable\shell\open\command"),
