@@ -177,8 +177,12 @@ pub enum CoreCommand {
     },
 }
 
-/// Runs a user command and returns `lil`'s exit code.
+/// Runs a user command and returns `lil`'s exit code. The command logs to the channel's
+/// `lil.<YYYY-MM-DD>.log` (ARCH-117, P4a-R20); a log that can't start stops no command.
 pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
+    if let Ok(env) = Env::from_process() {
+        let _ = lil_platform::logs::init(&env, "lil");
+    }
     let result = match cmd {
         UserCommand::Status { json } => status::run(global, json),
         UserCommand::Call {

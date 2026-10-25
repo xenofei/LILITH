@@ -15,7 +15,7 @@
 //!
 //! Every module of the crate is scanned, the infrastructure ones too (`state`, `workspace`,
 //! `server`, `transport`, `rpc`, `config`, `events`, `identity`, `lifecycle`, `session`,
-//! `desktop`), and
+//! `desktop`, `diagnostics`), and
 //! the list is checked against `src/lib.rs`, so a new module can't be missed. The store names
 //! none of them: it defines `StoreRows`, which `state` implements, and `Access`, which
 //! `workspace` re-exports; `state` holds `WorkspaceRef`. The connection types (`ConnCtx`,
@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 /// Every module of the crate (`pub mod` in `src/lib.rs`): the CORE-014 modules and the
 /// infrastructure.
-const MODULES: [&str; 27] = [
+const MODULES: [&str; 28] = [
     "store",
     "index",
     "watch",
@@ -68,6 +68,7 @@ const MODULES: [&str; 27] = [
     "lifecycle",
     "session",
     "desktop",
+    "diagnostics",
 ];
 
 /// The modules `src/lib.rs` declares, at any visibility: `mod`, `pub mod`, `pub(crate) mod`,
@@ -517,6 +518,16 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
     assert!(graph["desktop"].contains("jobs"), "{graph:?}");
     assert!(graph["tools"].contains("desktop"), "{graph:?}");
     assert!(graph["confirm"].contains("tools"), "{graph:?}");
+    // `diagnostics` is infrastructure too (P4a-R24): it reads the engines, the telemetry and
+    // the jobs for the bundle and registers its own tools, so it uses `tools`; the dispatcher
+    // reaches it only through the `tools` error sink, and only the server names it.
+    let users: Vec<&String> = graph
+        .iter()
+        .filter(|(m, uses)| m.as_str() != "diagnostics" && uses.contains("diagnostics"))
+        .map(|(m, _)| m)
+        .collect();
+    assert_eq!(users, ["server"], "{users:?} use diagnostics");
+    assert!(graph["diagnostics"].contains("tools"), "{graph:?}");
     // `resources` is registered by the server like `engines`: no other module names it, and it
     // uses `tools` (the call context and the registry) and the store.
     for module in graph.keys().filter(|m| *m != "resources" && *m != "server") {

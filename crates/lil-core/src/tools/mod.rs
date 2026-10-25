@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 pub use asset_read_tools::register_asset_read_tools;
 pub use asset_tools::register_asset_tools;
 pub use desktop_tools::register_desktop_tools;
-pub use dispatcher::{Dispatcher, Redispatch};
+pub use dispatcher::{Dispatcher, ErrorSink, Redispatch};
 pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
 pub use job_tools::{JOB_RETRY, register_job_tools};
 pub use project_tools::register_project_tools;

@@ -88,7 +88,7 @@
 //! anyway (a bug in a stage) releases its row from its `Drop`, in a task that counts as in
 //! flight, so a drain waits for the release too.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::UNIX_EPOCH;
 
 use lil_platform::{Clock, IdSource};
@@ -117,6 +117,13 @@ use crate::state::{IdemBegin, StateDb, StateError, StateRegistry};
 use crate::store::StoreError;
 use crate::workspace::{Access, OpenWorkspace, WorkspaceHub};
 
+/// Hears of every error outcome of a `tools/call`: the diagnostics' recent errors (ARCH-121;
+/// Appendix G "Diagnostics"). `tools` defines it so that it names no `diagnostics` type.
+pub trait ErrorSink: Send + Sync + 'static {
+    /// The call of `tool` ended with error `code` and `message` at `at_ms` (Unix ms).
+    fn record_error(&self, code: &str, tool: Option<&str>, message: &str, at_ms: i64);
+}
+
 /// Runs `tools/call` (module docs).
 #[derive(Clone)]
 pub struct Dispatcher {
@@ -138,6 +145,8 @@ struct Inner {
     active: Arc<ActiveProjects>,
     /// The core's jobs (`CallCtx::jobs`).
     jobs: Arc<Jobs>,
+    /// Where each error outcome goes ([`Dispatcher::set_error_sink`]).
+    errors: OnceLock<Arc<dyn ErrorSink>>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -186,8 +195,15 @@ impl Dispatcher {
                 lifecycle,
                 active: Arc::new(ActiveProjects::new()),
                 jobs,
+                errors: OnceLock::new(),
             }),
         }
+    }
+
+    /// Sends every later error outcome to `sink` (the server sets the diagnostics'); only the
+    /// first call counts.
+    pub fn set_error_sink(&self, sink: Arc<dyn ErrorSink>) {
+        let _ = self.inner.errors.set(sink);
     }
 
     /// The core's jobs: the server registers their handlers, blocker and shutdown step.
@@ -285,7 +301,7 @@ impl Dispatcher {
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
-    /// an `Outcome::Error`.
+    /// an `Outcome::Error`, and each goes to the error sink, also when the caller has gone.
     pub async fn call(&self, session: Arc<Session>, p: ToolCallParams) -> Outcome<ToolOutput> {
         let trace_id = match p.trace_id.as_deref() {
             Some(t) if is_trace_id(t) => t.to_string(),
@@ -301,13 +317,15 @@ impl Dispatcher {
         };
         let Some(in_flight) = self.inner.lifecycle.try_call_started() else {
             tracing::info!(tool = %p.name, caller = %session.caller, trace_id, "tool call refused: the core is draining");
-            return Outcome::Error {
+            let refused = Outcome::Error {
                 error: ErrorBody::new(
                     &codes::CORE_DRAINING,
                     "The core is shutting down. Retry with the same idempotency key once it runs again.",
                     trace_id,
                 ),
             };
+            self.inner.record_error(&p.name, &refused);
+            return refused;
         };
         let (name, inner, trace) = (p.name.clone(), self.inner.clone(), trace_id.clone());
         // ERROR level, so the span and its `trace_id` stay on every line even under a raised
@@ -323,15 +341,29 @@ impl Dispatcher {
             Err(e) => {
                 let text = join_error_text(e);
                 tracing::error!(tool = %name, trace_id, panic = %text, "the dispatcher pipeline panicked");
-                Outcome::Error {
+                let panicked = Outcome::Error {
                     error: core_bug(&name, text, &trace_id),
-                }
+                };
+                self.inner.record_error(&name, &panicked);
+                panicked
             }
         }
     }
 }
 
 impl Inner {
+    /// Tells the error sink of `outcome`, the outcome of a call of `tool`, if it is an error.
+    fn record_error(&self, tool: &str, outcome: &Outcome<ToolOutput>) {
+        if let (Outcome::Error { error }, Some(sink)) = (outcome, self.errors.get()) {
+            let at_ms = self
+                .clock
+                .utc_now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+            sink.record_error(&error.code, Some(tool), &error.message, at_ms);
+        }
+    }
+
     async fn pipeline(
         &self,
         in_flight: &CallGuard,
@@ -352,6 +384,7 @@ impl Inner {
                 tool = %name, caller = %session.caller, trace_id, code = %error.code, "tool call failed"
             ),
         }
+        self.record_error(&name, &outcome);
         outcome
     }
 

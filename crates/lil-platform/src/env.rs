@@ -604,6 +604,18 @@ impl Env {
         }
     }
 
+    /// The computer name (`COMPUTERNAME`) on every channel, test channels too: what a
+    /// diagnostics bundle replaces with `<machine>` (ARCH-121). `None` when unset or empty.
+    pub fn computer_name(&self) -> Option<String> {
+        std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty())
+    }
+
+    /// `<user_profile>`: the user-profile folder (on a test channel `<test root>\profile`),
+    /// which a diagnostics bundle replaces with `%USERPROFILE%` (ARCH-121).
+    pub fn user_profile(&self) -> PathBuf {
+        guard::check_path(self.roots.user_profile.clone())
+    }
+
     /// `<user_profile>\.claude`
     pub fn claude_default_profile_dir(&self) -> PathBuf {
         guard::check_path(self.roots.user_profile.join(".claude"))

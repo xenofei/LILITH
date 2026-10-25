@@ -193,6 +193,30 @@ pub fn write_suite_cache_file(
     placed
 }
 
+/// The newest `max` bytes of `path` (all of it when it is shorter), cut so they start at a
+/// line: the diagnostics bundle's logs (Appendix G "Diagnostics"). `File::open` shares
+/// reading, writing and deleting, so a process still writing the file goes on.
+pub fn read_tail(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(long_path(path))?;
+    let len = file.metadata()?.len();
+    if len <= max {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    // One byte more, to see whether the tail already starts at a line.
+    let from = len - max - 1;
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    let cut = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(bytes.len(), |nl| nl + 1);
+    bytes.drain(..cut);
+    Ok(bytes)
+}
+
 /// After `ReplaceFileW` of `path` with `backup` gave `replaced`: the backup (the old file) is
 /// removed only once the new file is in place. When the replace failed halfway (the old file
 /// already at the backup name, nothing at `path`), `restore` moves it back; if that fails too,

@@ -1,8 +1,8 @@
 //! The one log setup every process uses (ARCH-117, ARCH-119; P4a-R20, Appendix G
 //! "Diagnostics"): `tracing` JSON lines to `<logs dir>\<process>.<YYYY-MM-DD>.log` (the UTC
 //! date), a new file each day, 14 kept per process, and a day's file stopped at 64 MiB with one
-//! `log_capped` line; and a panic hook that logs `panic` with its location before the previous
-//! hook runs.
+//! `log_capped` line; a panic hook that logs `panic` with its location before the previous
+//! hook runs; and a first `logging started` line with the process name and id.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write};
@@ -52,6 +52,8 @@ pub fn init_at(dir: &Path, process: &str, cap_bytes: u64) -> io::Result<LogGuard
         tracing::error!(%location, panic = text, "panic");
         previous(info);
     }));
+    // Every process's log starts with a line, so its file is there from the start.
+    tracing::info!(process, pid = std::process::id(), "logging started");
     Ok(LogGuard)
 }
 

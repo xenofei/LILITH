@@ -2947,6 +2947,21 @@ impl Jobs {
     /// # Errors
     /// `job.unknown`; `state.unavailable`.
     pub async fn get(&self, caller: &JobCaller, id: &JobId) -> Result<JobSummary, ErrorBody> {
+        self.get_with_origin(caller, id)
+            .await
+            .map(|(summary, _)| summary)
+    }
+
+    /// [`Jobs::get`], with the tool call that made the job when one did: the diagnostics
+    /// bundle's `job.json` (Appendix G "Diagnostics").
+    ///
+    /// # Errors
+    /// As [`Jobs::get`].
+    pub async fn get_with_origin(
+        &self,
+        caller: &JobCaller,
+        id: &JobId,
+    ) -> Result<(JobSummary, Option<JobOrigin>), ErrorBody> {
         let s = &self.shared;
         let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
@@ -2956,7 +2971,7 @@ impl Jobs {
             .await
             .map_err(|e| state_unavailable(&e, &caller.trace_id))?
             .ok_or_else(|| job_unknown(id.as_str(), &caller.trace_id))?;
-        Ok(s.summary(&row))
+        Ok((s.summary(&row), row.origin))
     }
 
     /// The jobs of `caller`'s scope that `f` selects, newest first, and the cursor of the next
