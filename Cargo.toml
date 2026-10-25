@@ -47,7 +47,6 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "1.2.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
-tracing-appender = "0.2.5"
 # Session, trace and idempotency ids: lil-platform only, never lil-protocol (ARCH-111).
 getrandom = "0.4.3"
 # Plan 2b (core platform I-b), pinned to the crates.io releases current on 2026-10-16.
