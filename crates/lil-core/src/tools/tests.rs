@@ -860,7 +860,12 @@ async fn the_desktop_tools_are_pinned() {
     );
     let mut reg = Registry::new();
     register_desktop_tools(&mut reg, &store);
-    register_test_desktop(&mut reg, fake, Arc::new(crate::desktop::UiApps::default()));
+    register_test_desktop(
+        &mut reg,
+        fake,
+        Arc::new(crate::desktop::UiApps::default()),
+        store.clone(),
+    );
     let tools: Vec<(String, EffectClass, String)> = reg
         .descriptors()
         .into_iter()

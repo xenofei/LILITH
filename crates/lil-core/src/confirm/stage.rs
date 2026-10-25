@@ -103,7 +103,7 @@ impl AgentConfirm {
                 Err(e) => ConfirmDecision::Failed(state_unavailable(&e)),
             };
         }
-        if !self.confirm.answerable() {
+        if !self.confirm.answerable().await {
             return refuse(&hits);
         }
         match self.confirm.request(request).await {

@@ -492,6 +492,7 @@ fn answer(id: &str, answer: Answer, cap: Option<CapAnswer>) -> ConfirmationAnswe
     ConfirmationAnswerParams {
         confirmation_id: id.into(),
         answer,
+        toast_token: None,
         cap,
     }
 }

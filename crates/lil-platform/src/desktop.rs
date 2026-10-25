@@ -316,6 +316,9 @@ pub trait Desktop: Send + Sync {
     fn post(&self, t: &Toast) -> Result<(), String>;
     /// Removes the toast `tag` of `group` from the notification centre, if it is there.
     fn remove(&self, tag: &str, group: &str);
+    /// The `(tag, group)` of each of the channel's toasts in the notification centre (empty
+    /// when it can't be read).
+    fn history(&self) -> Vec<(String, String)>;
     /// Holds (`true`) or releases (`false`) the one system-required power request (ARCH-127).
     /// Holding twice holds it once.
     fn set_power_request(&self, held: bool) -> std::io::Result<()>;
@@ -390,6 +393,12 @@ impl NotShownEnd {
         }
     }
 
+    /// A post failed at `now`: it starts the grace as an `Ok` one does (plan 4a clarification,
+    /// 2026-10-25), so posts that keep failing while `NotYetShown` end as `no_platform` too.
+    pub fn post_failed(&mut self, now: std::time::Duration) {
+        self.posted_ok(now);
+    }
+
     /// The state to report for the reading `read` at `now` ([`toasts_state_after_post`]).
     pub fn state(&mut self, read: ToastsState, now: std::time::Duration) -> ToastsState {
         self.last = Some(read);
@@ -457,16 +466,24 @@ impl Desktop for RealDesktop {
     }
 
     fn post(&self, t: &Toast) -> Result<(), String> {
-        crate::toast::post(&self.aumid, t)?;
-        self.not_shown
+        let posted = crate::toast::post(&self.aumid, t);
+        let mut not_shown = self
+            .not_shown
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .posted_ok(self.start.elapsed());
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &posted {
+            Ok(()) => not_shown.posted_ok(self.start.elapsed()),
+            Err(_) => not_shown.post_failed(self.start.elapsed()),
+        }
+        posted
     }
 
     fn remove(&self, tag: &str, group: &str) {
         crate::toast::remove(&self.aumid, tag, group);
+    }
+
+    fn history(&self) -> Vec<(String, String)> {
+        crate::toast::history(&self.aumid)
     }
 
     fn set_power_request(&self, held: bool) -> std::io::Result<()> {

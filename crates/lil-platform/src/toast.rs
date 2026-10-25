@@ -195,6 +195,21 @@ pub(crate) fn remove(aumid: &str, tag: &str, group: &str) {
     }
 }
 
+/// The `(tag, group)` of each toast of `aumid` in the notification centre; empty when the
+/// history can't be read (an AUMID Windows never saw).
+pub(crate) fn history(aumid: &str) -> Vec<(String, String)> {
+    let read = || -> windows::core::Result<Vec<(String, String)>> {
+        let list = ToastNotificationManager::History()?.GetHistoryWithId(&HSTRING::from(aumid))?;
+        let mut out = Vec::new();
+        for i in 0..list.Size()? {
+            let toast = list.GetAt(i)?;
+            out.push((toast.Tag()?.to_string(), toast.Group()?.to_string()));
+        }
+        Ok(out)
+    };
+    read().unwrap_or_default()
+}
+
 /// The Tags of the channel's toasts in the notification centre, from
 /// `ToastNotificationManager::History` (the desktop group's check, P4a-R39: History and the
 /// toast's own events, never UI Automation).

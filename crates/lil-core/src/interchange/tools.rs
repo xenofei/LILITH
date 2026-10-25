@@ -1,10 +1,12 @@
-//! `handlers.for`, `open_in` and `ui.show` (Appendix F "Product tools"), module `interchange`:
+//! `handlers.for`, `open_in` and `ui.show` (Appendix F "Product tools") and `notify.claude_code`
+//! (Appendix G "Notifications"), module `interchange`:
 //!
 //! | Tool | Effect | Arguments | `structured` |
 //! |---|---|---|---|
 //! | `handlers.for` | read | `{target}` | `{handlers: [{app, intents, external}]}` |
 //! | `open_in` | read | `{app, target, intent: "open" \| "edit" \| "use_as_input"}` | `{running, pid, launch_command}` |
 //! | `ui.show` | read | `{target}` | as `open_in` |
+//! | `notify.claude_code` | write | `{message, title?}` (1–2,000 and at most 100 characters) | `{posted, reason?: "category_off" \| "foreground" \| "duplicate" \| "unavailable"}` |
 //!
 //! The intent set is closed (APP-066): any other value is `params.invalid`.
 
@@ -15,7 +17,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    HandlerView, INTERCHANGE_MODULE, Intent, Interchange, OpenResult, Target, handlers_for_target,
+    HandlerView, INTERCHANGE_MODULE, Intent, Interchange, NotifyOutcome, OpenResult, Target,
+    handlers_for_target,
 };
 use crate::tools::{Registry, typed_tool};
 
@@ -44,6 +47,30 @@ struct OpenArgs {
 #[serde(deny_unknown_fields)]
 struct ShowArgs {
     target: String,
+}
+
+/// The longest `notify.claude_code` message and title, in characters (Appendix G).
+const MAX_MESSAGE: usize = 2000;
+const MAX_TITLE: usize = 100;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NotifyArgs {
+    /// Claude Code's notice, 1–2,000 characters.
+    #[schemars(length(min = 1, max = 2000))]
+    message: String,
+    /// At most 100 characters.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    title: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct NotifyResult {
+    posted: bool,
+    /// Why it wasn't posted: `category_off`, `foreground`, `duplicate` or `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 /// Registers `handlers.for`, `open_in` and `ui.show` on `reg`.
@@ -105,6 +132,50 @@ pub fn register_interchange_tools(reg: &mut Registry, interchange: &Arc<Intercha
             Box::pin(async move {
                 let result = ix.ui_show(ctx, &args.target).await?;
                 let summary = summary("the app", &result);
+                Ok((result, summary))
+            })
+        },
+    ));
+    let ix = interchange.clone();
+    reg.register(typed_tool(
+        "notify.claude_code",
+        "Shows Claude Code's notice as a Windows notification from LILITH (lil hook \
+         notification calls it). message is 1-2,000 characters, title at most 100. Returns \
+         {posted, reason?}: nothing is posted while the Claude Code and agent activity \
+         category is off (category_off), a LILITH window is in front (foreground), the same \
+         message came within 10 s (duplicate) or notifications can't be shown (unavailable).",
+        EffectClass::Write,
+        INTERCHANGE_MODULE,
+        move |ctx, args: NotifyArgs| {
+            let ix = ix.clone();
+            Box::pin(async move {
+                let chars = args.message.chars().count();
+                if !(1..=MAX_MESSAGE).contains(&chars)
+                    || args
+                        .title
+                        .as_ref()
+                        .is_some_and(|t| t.chars().count() > MAX_TITLE)
+                {
+                    return Err(ErrorBody::new(
+                        &codes::PARAMS_INVALID,
+                        format!(
+                            "message is 1 to {MAX_MESSAGE} characters and title at most {MAX_TITLE}"
+                        ),
+                        ctx.trace_id.clone(),
+                    ));
+                }
+                let outcome = match ix.notifier() {
+                    Some(n) => n.claude_code(&args.message, args.title.as_deref()).await,
+                    None => NotifyOutcome::Unavailable,
+                };
+                let result = NotifyResult {
+                    posted: outcome == NotifyOutcome::Posted,
+                    reason: outcome.reason(),
+                };
+                let summary = match result.reason {
+                    None => "posted".to_string(),
+                    Some(why) => format!("not posted: {why}"),
+                };
                 Ok((result, summary))
             })
         },

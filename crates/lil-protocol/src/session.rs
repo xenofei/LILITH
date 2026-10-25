@@ -595,8 +595,9 @@ mod tests {
         assert_eq!(h, schema_hash());
         // Protocol 1.1 added the `app/*` confirmation types (with `project` on a confirmation)
         // and `app/caps.set`'s params and `CapsView`; 1.2 the `app/queue.*` params and
-        // `QueueState`, and the fix's optional `user_hint` (Appendix G "Out of memory").
-        assert_eq!(h, "c24f996f22d5a3cc");
+        // `QueueState`, the fix's optional `user_hint` (Appendix G "Out of memory"), and
+        // `app/confirmation.answer`'s optional `toast_token` (Appendix G "Deny from a toast").
+        assert_eq!(h, "8dc4501c6f1c3744");
     }
 
     #[test] // spec: ARCH-029

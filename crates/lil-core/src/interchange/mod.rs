@@ -1,8 +1,14 @@
-//! The `interchange` module (CORE-014; APP-061, APP-063–066): the app handler registry,
-//! `open_in` and `ui.show`. Notifications, `lil:` activation and thumbnails are plan 4's.
+//! The `interchange` module (CORE-014; APP-022, APP-061, APP-063–066, APP-146): the app
+//! handler registry, `open_in` and `ui.show`, and the notifier. `lil:` activation and
+//! thumbnails are the apps'.
 //!
 //! - `handlers`: registrations (`apps\<app>.toml`), targets and which app handles what;
-//! - `tools`: `handlers.for`, `open_in` and `ui.show`.
+//! - `notify`: the notifier, the core's toasts and the notification path (plan 4a);
+//! - `toast_xml`: the toast XML (Appendix G "Toast XML");
+//! - `tools`: `handlers.for`, `open_in`, `ui.show` and `notify.claude_code`.
+//!
+//! An agent's `open_in` or `ui.show` that names an app posts an `agent_activity` toast
+//! ([`notify::Notifier::agent_opened`], APP-065), once the server has set the notifier.
 //!
 //! **The core never launches an app** (APP-064): a window the core opened could not come
 //! forward from a terminal's job object. [`Interchange::open_in`] answers
@@ -19,11 +25,13 @@
 //! parsed beyond its type and format.
 
 pub mod handlers;
+pub mod notify;
+pub mod toast_xml;
 pub mod tools;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use lil_protocol::{CallerKind, ErrorBody, codes};
 use lil_schema::refs::AssetRef;
@@ -35,6 +43,8 @@ pub use handlers::{
     AppRegistration, HandlerView, Intent, OpensEntry, Target, handlers_for_target,
     load_registrations,
 };
+pub use notify::{Notifier, NotifierParts, NotifyOutcome};
+pub use toast_xml::{ToastActions, ToastText, toast_xml};
 pub use tools::register_interchange_tools;
 
 use crate::session::Session;
@@ -73,6 +83,8 @@ pub struct Interchange {
     data_dir: PathBuf,
     /// The open `ui:*` connections, by connection id.
     connected: Mutex<BTreeMap<u64, AppConn>>,
+    /// The notifier, once the server set it: `notify.claude_code` and the agent-activity toasts.
+    notifier: OnceLock<Arc<Notifier>>,
 }
 
 impl std::fmt::Debug for Interchange {
@@ -90,7 +102,33 @@ impl Interchange {
             core_dir,
             data_dir,
             connected: Mutex::new(BTreeMap::new()),
+            notifier: OnceLock::new(),
         })
+    }
+
+    /// Sets the notifier (once; a second call is ignored).
+    pub fn set_notifier(&self, notifier: Arc<Notifier>) {
+        let _ = self.notifier.set(notifier);
+    }
+
+    /// The notifier, once set.
+    pub fn notifier(&self) -> Option<&Arc<Notifier>> {
+        self.notifier.get()
+    }
+
+    /// An agent caller's request (APP-065): its `agent_activity` toast, posted in the
+    /// background so the call doesn't wait for the desktop.
+    fn agent_activity(&self, ctx: &CallCtx, target: &Target) {
+        if !ctx.session.caller.is_agent() {
+            return;
+        }
+        if let Some(notifier) = self.notifier().cloned() {
+            let (title, text) = (target_title(&target.text), target.text.clone());
+            let caller = ctx.session.caller.clone();
+            tokio::spawn(async move {
+                notifier.agent_opened(&caller, &title, &text).await;
+            });
+        }
     }
 
     fn connected(&self) -> MutexGuard<'_, BTreeMap<u64, AppConn>> {
@@ -154,7 +192,9 @@ impl Interchange {
                 ctx.trace_id.clone(),
             ));
         }
-        Ok(self.deliver(ctx, reg, &target, intent))
+        let result = self.deliver(ctx, reg, &target, intent);
+        self.agent_activity(ctx, &target);
+        Ok(result)
     }
 
     /// Shows `target` in the app that handles it, without taking focus when an agent asks
@@ -180,7 +220,9 @@ impl Interchange {
                 ctx.trace_id.clone(),
             ));
         };
-        Ok(self.deliver(ctx, reg, &target, Intent::Open))
+        let result = self.deliver(ctx, reg, &target, Intent::Open);
+        self.agent_activity(ctx, &target);
+        Ok(result)
     }
 
     /// Tells a running app, or says how to start it. Never starts anything.
@@ -264,6 +306,16 @@ async fn resolve(ctx: &CallCtx, text: &str) -> Result<Target, ErrorBody> {
         target.kind = row.asset_type;
     }
     Ok(target)
+}
+
+/// What a toast calls `target`: a path's or candidate's file name, a ref's asset (without its
+/// `#…` part), else the text as given.
+fn target_title(target: &str) -> String {
+    let text = target.split(['#', '?']).next().unwrap_or(target);
+    text.rsplit(['\\', '/'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(target)
+        .to_string()
 }
 
 fn intent_name(intent: Intent) -> &'static str {

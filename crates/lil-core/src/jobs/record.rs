@@ -11,8 +11,8 @@ use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde_json::{Map, Value, json};
 
 use super::{
-    EngineKind, JobFilter, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane, Priority,
-    StartedBy, StatusStep, Subtask,
+    BatchJob, EngineKind, JobFilter, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane,
+    Priority, StartedBy, StatusStep, Subtask,
 };
 use super::{Progress, Substatus};
 use crate::state::{StateDb, StateError};
@@ -624,6 +624,63 @@ pub async fn batch(db: &StateDb, batch_id: &str) -> Result<Vec<JobRow>, StateErr
     let batch_id = batch_id.to_string();
     db.call(move |conn| batch_in(conn, &batch_id).map_err(|e| sql(&e)))
         .await
+}
+
+/// Every job of batch `batch_id`, narrowly (no arguments or results), by index, then by `seq`.
+pub async fn batch_brief(db: &StateDb, batch_id: &str) -> Result<Vec<BatchJob>, StateError> {
+    let batch_id = batch_id.to_string();
+    db.call(move |conn| {
+        let read = || -> rusqlite::Result<Vec<BatchJob>> {
+            conn.prepare(
+                "SELECT job_id, kind, priority, status, substatus, project, created_utc,                  started_utc, finished_utc, error, retry_of, batch_index, origin, batch_id                  FROM jobs WHERE batch_id = ?1 ORDER BY batch_index, seq",
+            )?
+            .query_map(params![batch_id], |r| {
+                let priority: String = r.get(2)?;
+                let status: String = r.get(3)?;
+                let error: Option<ErrorBody> = json_col(r, 9)?;
+                Ok(BatchJob {
+                    job_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    priority: Priority::parse(&priority).ok_or_else(|| bad(2, "priority"))?,
+                    status: JobStatus::parse(&status).ok_or_else(|| bad(3, "status"))?,
+                    substatus: r.get(4)?,
+                    project: r.get(5)?,
+                    created_utc: r.get(6)?,
+                    started_utc: r.get(7)?,
+                    finished_utc: r.get(8)?,
+                    error_code: error.as_ref().map(|e| e.code.clone()),
+                    error_message: error.map(|e| e.message),
+                    retry_of: r.get(10)?,
+                    index: u32_col(r, 11)?,
+                    origin: json_col(r, 12)?,
+                    batch_id: r.get(13)?,
+                })
+            })?
+            .collect()
+        };
+        read().map_err(|e| sql(&e))
+    })
+    .await
+}
+
+/// The batches with a job that finished at `since_utc` (Unix seconds) or later, the latest
+/// first, at most 1,000.
+pub async fn batches_finished_since(
+    db: &StateDb,
+    since_utc: i64,
+) -> Result<Vec<String>, StateError> {
+    db.call(move |conn| {
+        let read = || -> rusqlite::Result<Vec<String>> {
+            conn.prepare(
+                "SELECT DISTINCT batch_id FROM jobs                  WHERE finished_utc >= ?1 AND batch_id IS NOT NULL \
+                 GROUP BY batch_id ORDER BY max(finished_utc) DESC LIMIT 1000",
+            )?
+            .query_map(params![since_utc], |r| r.get(0))?
+            .collect()
+        };
+        read().map_err(|e| sql(&e))
+    })
+    .await
 }
 
 /// Applies `c` to `job_id` at `now_utc`, unless the row is gone or already in a final status:

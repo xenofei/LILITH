@@ -1664,6 +1664,7 @@ dependencies = [
  "lil-testkit",
  "proptest",
  "reqwest",
+ "roxmltree",
  "rusqlite",
  "schemars",
  "serde",
