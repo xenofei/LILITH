@@ -996,6 +996,47 @@ async fn a_bundle_in_the_same_second_never_replaces_another() {
     assert_eq!(std::fs::read(&next).unwrap(), b"not a bundle");
 }
 
+/// The folder keeps the newest 10 bundles, by time stamp and then number compared as a number:
+/// a burst within one second keeps every bundle of it, and a bundle a second later trims the
+/// older ones back to 10, keeping the newest second's.
+#[tokio::test] // spec: ARCH-121, P4a-R19
+async fn a_bundle_a_second_later_trims_the_folder_back_to_ten() {
+    let env = TestEnv::new();
+    let clock = FakeClock::new();
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let d = Diagnostics::new(
+        env.env.clone(),
+        clock.clone(),
+        events.clone(),
+        DiagnosticsSources::default(),
+    );
+    let ctx = common::ctx(&env, lil_protocol::CallerKind::Cli, &events);
+    let notes = env.env.diagnostics_dir().join("notes.txt");
+    write_file(&notes, b"mine");
+    let mut burst = Vec::new();
+    for _ in 0..15 {
+        burst.push(d.bundle(&ctx, None).await.unwrap().path);
+    }
+    let listed = || -> BTreeSet<String> {
+        std::fs::read_dir(env.env.diagnostics_dir())
+            .unwrap()
+            .map(|e| e.unwrap().path().display().to_string())
+            .collect()
+    };
+    let mut want: BTreeSet<String> = burst.iter().cloned().collect();
+    want.insert(notes.display().to_string());
+    assert_eq!(listed(), want, "a burst of 15 in one second keeps all 15");
+
+    clock.advance(Duration::from_secs(1));
+    let later = d.bundle(&ctx, None).await.unwrap().path;
+    // The oldest go: no suffix, then -2 … -6 (numbers, so -10 … -15 are newer than -2).
+    let mut want: BTreeSet<String> = burst[6..].iter().cloned().collect();
+    want.insert(later.clone());
+    want.insert(notes.display().to_string());
+    assert_eq!(listed(), want);
+    assert!(!later.ends_with("-2.zip"), "{later}");
+}
+
 /// A message is redacted whole before the 2,000-character cut, and the cut never leaves part
 /// of a word, so no fragment of a secret or a path is left that no rule knows.
 #[tokio::test] // spec: ARCH-121, QA-084

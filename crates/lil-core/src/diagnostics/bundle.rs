@@ -17,10 +17,13 @@
 //! Never a workspace file. Every entry is redacted ([`super::redact`]); `redactions` counts
 //! the replacements. The zip is built in memory and written by the store's cache writer
 //! (`fsops::write_new_suite_cache_file`: a temp file in the diagnostics folder, then a move
-//! that never replaces), so nothing is written anywhere else. No bundle ever removes or
-//! replaces another, and no path is handed out twice: a taken name, or one this core handed
-//! out already, is skipped for the next number. A log whose file name a rule changes is named
-//! `logs/redacted-<n>.<date>.log`. Nothing is sent anywhere (ARCH-122).
+//! that never replaces), so nothing is written anywhere else. No path is handed out twice: a
+//! taken name, or one this core handed out already, is skipped for the next number. Then the
+//! folder keeps the newest [`KEEP_BUNDLES`] bundles, ordered by time stamp, then number (as a
+//! number); a bundle of the new one's second or later is never removed, so a burst within one
+//! second keeps every bundle of it, and the next bundle trims the older ones. A log whose file
+//! name a rule changes is named `logs/redacted-<n>.<date>.log`. Nothing is sent anywhere
+//! (ARCH-122).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Write as _};
@@ -45,6 +48,8 @@ use crate::tools::CallCtx;
 pub const LOG_TAIL_BYTES: u64 = 5 * 1024 * 1024;
 /// How much of the logs goes in, in all.
 pub const LOGS_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// How many bundles the diagnostics folder keeps, beyond those of the newest bundle's second.
+pub const KEEP_BUNDLES: usize = 10;
 /// A bundle's name before its time stamp.
 const BUNDLE_PREFIX: &str = "lilith-diagnostics-";
 /// The manifest's `bundle` version.
@@ -330,12 +335,54 @@ fn write_bundle(
         set().contains(&key(candidate))
     })?;
     set().insert(key(&path));
+    prune_bundles(env, &lil_schema::time::compact(parts.unix_secs));
     Ok(BundleResult {
         path: path.display().to_string(),
         bytes: bytes.len() as u64,
         files: entries.into_iter().map(|(name, _)| name).collect(),
         redactions,
     })
+}
+
+/// `name`'s time stamp and number, when it is a bundle's name
+/// (`lilith-diagnostics-<YYYYMMDDTHHMMSSZ>[-<n>].zip`; no suffix is number 1).
+fn bundle_order(name: &str) -> Option<(String, u64)> {
+    let stem = name.strip_prefix(BUNDLE_PREFIX)?.strip_suffix(".zip")?;
+    let (stamp, number) = match stem.split_once('-') {
+        Some((stamp, k)) => (stamp, k.parse().ok()?),
+        None => (stem, 1),
+    };
+    let stamped = stamp.len() == 16 && stamp.as_bytes()[8] == b'T' && stamp.ends_with('Z');
+    stamped.then(|| (stamp.to_string(), number))
+}
+
+/// Keeps the newest [`KEEP_BUNDLES`] bundles of the diagnostics folder: while there are more,
+/// the oldest is removed (by time stamp, then number), but never one stamped `current` (the
+/// second of the bundle just made, which every path handed out in that second shares) or
+/// later. Other files are never touched; one that can't be removed is left.
+fn prune_bundles(env: &Env, current: &str) {
+    let dir = env.diagnostics_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut bundles: Vec<((String, u64), String)> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|name| bundle_order(&name).map(|order| (order, name)))
+        .collect();
+    bundles.sort();
+    let mut excess = bundles.len().saturating_sub(KEEP_BUNDLES);
+    for ((stamp, _), name) in &bundles {
+        if excess == 0 || stamp.as_str() >= current {
+            break;
+        }
+        match fsops::remove_suite_cache_file(env, &dir.join(name)) {
+            Ok(()) => excess -= 1,
+            Err(e) => {
+                tracing::warn!(bundle = %name, error = %e, "an old diagnostics bundle could not be removed");
+            }
+        }
+    }
 }
 
 /// `text` redacted line by line.

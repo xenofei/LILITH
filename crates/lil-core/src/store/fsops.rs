@@ -210,6 +210,16 @@ pub fn write_new_suite_cache_file(
     ))
 }
 
+/// Removes the file `path` of one of the suite's cache folders (the same check as
+/// [`write_suite_cache_file`]): the diagnostics folder's older bundles.
+///
+/// # Errors
+/// `PermissionDenied` for a path outside the two folders; the removal's error.
+pub fn remove_suite_cache_file(env: &lil_platform::Env, path: &Path) -> std::io::Result<()> {
+    check_cache_path(env, path)?;
+    remove_file(path)
+}
+
 /// The checks of [`write_suite_cache_file`], then `bytes` in a new temp file beside `path`
 /// (the folder made, a day's leftovers swept first): the folder and the temp file.
 fn cache_temp<'p>(

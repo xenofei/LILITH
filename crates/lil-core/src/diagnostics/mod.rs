@@ -170,8 +170,9 @@ const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the su
     <machine>. Still in it: the names of other programs and network adapters (the hardware \
     snapshot), the job's arguments with any prompt text, and model file names and workspace \
     paths outside the user-profile folder (the logs). It never holds a workspace file; a bundle \
-    made in the same second as another gets a name of its own, no bundle removes or replaces \
-    another, and nothing is sent anywhere: the bundle leaves this PC only when you hand it on.";
+    made in the same second as another gets a name of its own, the folder keeps the newest 10 \
+    (and every bundle of the newest second), and nothing is sent anywhere: the bundle leaves \
+    this PC only when you hand it on.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
