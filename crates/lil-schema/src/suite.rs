@@ -92,12 +92,17 @@ pub const DEFAULT_PREVIEW_METHOD: &str = "taesd";
 /// The `preview_method` values ComfyUI's `--preview-method` takes.
 pub const PREVIEW_METHODS: [&str; 4] = ["none", "auto", "latent2rgb", "taesd"];
 
-/// Whether `s` is a valid `reserve_vram_gb`: a non-negative decimal, digits with at most one
-/// `.`, as ComfyUI's `--reserve-vram` reads it (a float, in gigabytes).
+/// The most `reserve_vram_gb` may be, in gigabytes (plan 4a ruling, 2026-10-24).
+pub const MAX_RESERVE_VRAM_GB: u32 = 256;
+
+/// Whether `s` is a valid `reserve_vram_gb`: a decimal, digits with at most one `.`, from 0 to
+/// [`MAX_RESERVE_VRAM_GB`], as ComfyUI's `--reserve-vram` reads it (a float, in gigabytes).
 pub fn is_reserve_vram_gb(s: &str) -> bool {
     s.bytes().any(|b| b.is_ascii_digit())
         && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
         && s.bytes().filter(|b| *b == b'.').count() <= 1
+        && s.parse::<f64>()
+            .is_ok_and(|gb| gb <= f64::from(MAX_RESERVE_VRAM_GB))
 }
 
 #[cfg(test)]

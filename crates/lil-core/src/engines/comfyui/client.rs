@@ -26,6 +26,8 @@ use crate::store::fsops;
 
 /// How long one request may take, connection included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the asset-catalogue probe may take: it runs in a supervisor pass.
+pub const CATALOGUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a connection may take. A refused connection on Windows loopback isn't immediate (the
 /// stack retries it), so a probe of a stopped engine takes about this long, 2 s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -608,20 +610,26 @@ impl ComfyClient {
     }
 
     /// Whether the asset catalogue is on, by `GET /api/features`'s `assets` boolean (ARCH-065;
-    /// Appendix G): [`Catalogue::Unknown`] when the request fails, the route is missing (an
-    /// older ComfyUI) or there is no `assets` key. `/api/assets` is never asked: ComfyUI
-    /// registers it even when the catalogue is off.
-    pub async fn asset_catalogue(&self) -> Catalogue {
-        match self.get_json("api/features").await {
-            Ok(features) => match features.get("assets").and_then(Value::as_bool) {
+    /// Appendix G), within [`CATALOGUE_TIMEOUT`]: `Some` for an answer that stands
+    /// ([`Catalogue::Unknown`] for a missing route, an older ComfyUI's 404, or no `assets`
+    /// key), `None` when the request failed to connect, timed out or got a 5xx, so it may be
+    /// asked again. `/api/assets` is never asked: ComfyUI registers it even when the catalogue
+    /// is off.
+    pub async fn asset_catalogue(&self) -> Option<Catalogue> {
+        let answer = tokio::time::timeout(CATALOGUE_TIMEOUT, self.get_json("api/features")).await;
+        match answer {
+            Ok(Ok(features)) => Some(match features.get("assets").and_then(Value::as_bool) {
                 Some(true) => Catalogue::On,
                 Some(false) => Catalogue::Off,
                 None => Catalogue::Unknown,
-            },
-            Err(e) => {
-                tracing::debug!(error = %e, "ComfyUI's /api/features did not say whether the asset catalogue is on");
-                Catalogue::Unknown
+            }),
+            Ok(Err(ComfyError::Http(status, _))) if status < 500 => Some(Catalogue::Unknown),
+            Ok(Err(ComfyError::Protocol(_))) => Some(Catalogue::Unknown),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "ComfyUI's /api/features did not answer; asked again later");
+                None
             }
+            Err(_) => None,
         }
     }
 }

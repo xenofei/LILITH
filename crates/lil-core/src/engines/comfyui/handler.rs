@@ -96,11 +96,11 @@ use super::supervisor::{Comfy, ComfyEndpoint};
 use super::uploads::Uploads;
 use super::ws::{ComfyEvent, ComfySocket, MAX_PREVIEW_BYTES};
 use crate::engines::{EngineClass, Engines};
-use crate::jobs::record;
 use crate::jobs::{
     EngineKind, ExecWindow, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobId, JobSpec,
     Lane, Priority, Substatus, Withdraw, WithdrawOutcome, cancelled_error,
 };
+use crate::jobs::{RETRY_ACTION, record};
 use crate::store::{WsPath, fsops};
 
 /// The job kind.
@@ -110,6 +110,11 @@ pub const OOM_RETRIES: u32 = 2;
 /// The advice of the out-of-memory failure that ends a job (CORE-163; Appendix G).
 pub const OOM_ADVICE: &str = "Close other programs that use the GPU, or choose the model \
                               profile's lighter variant, then retry.";
+/// The same advice for a job with external side effects, never retried on its own: a retry
+/// runs the paid call again (plan 4a ruling, 2026-10-24).
+pub const OOM_ADVICE_PAID: &str = "Close other programs that use the GPU, or choose the model \
+                                   profile's lighter variant. Retrying runs the paid call \
+                                   again, and it is charged again.";
 /// `extra_data.preview_method` unless the arguments say otherwise (CORE-130).
 pub const DEFAULT_PREVIEW_METHOD: &str = "taesd";
 /// The `expected_secs` of a prompt whose submitter gives none (the watchdog's yardstick).
@@ -360,10 +365,18 @@ async fn cancel_set(cancel: &mut tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-/// CUDA out of memory (Appendix F): `exception_type` contains `OutOfMemoryError`, or the
-/// message contains `CUDA out of memory`.
+/// ComfyUI's own tip, added to the message of every out of memory it recognises.
+const COMFY_OOM_TIP: &str = "This error means you ran out of memory on your GPU.";
+
+/// CUDA out of memory (Appendix F; plan 4a ruling, 2026-10-24): `exception_type` contains
+/// `OutOfMemoryError`, or the message contains `CUDA out of memory` or ComfyUI's own tip, or
+/// `exception_type` contains `AcceleratorError` and the message contains `out of memory`, as
+/// ComfyUI 0.42's `is_oom` counts them.
 pub fn is_oom(exception_type: &str, message: &str) -> bool {
-    exception_type.contains("OutOfMemoryError") || message.contains("CUDA out of memory")
+    exception_type.contains("OutOfMemoryError")
+        || message.contains("CUDA out of memory")
+        || message.contains(COMFY_OOM_TIP)
+        || (exception_type.contains("AcceleratorError") && message.contains("out of memory"))
 }
 
 /// `s` cut to at most `max` bytes, on a character boundary.
@@ -1973,8 +1986,12 @@ impl Attempt<'_> {
         let retry = !self.external && self.job.attempt <= OOM_RETRIES;
         // The failure that ends the job says what ran out and what to try (CORE-163; Appendix
         // G "Out of memory").
-        let message = if retry || self.external {
+        let message = if retry {
             "ComfyUI ran out of GPU memory.".to_string()
+        } else if self.external {
+            "ComfyUI ran out of GPU memory. The job has external side effects, so it was not \
+             retried."
+                .to_string()
         } else {
             format!("ComfyUI ran out of GPU memory, also on {OOM_RETRIES} retries.")
         };
@@ -1983,13 +2000,20 @@ impl Attempt<'_> {
             &text,
         );
         if !retry {
+            // Paid work gets no one-click retry: its fix is to look at the job, and the runner
+            // adds no `job.retry` hint to a fix of its own (plan 4a ruling, 2026-10-24).
+            let (id, label, advice) = if self.external {
+                ("show_job", "Show the job", OOM_ADVICE_PAID)
+            } else {
+                (RETRY_ACTION, "Retry the job", OOM_ADVICE)
+            };
             e.fix = Some(lil_protocol::Fix {
                 ui_action: lil_protocol::UiAction {
-                    id: "retry_job".to_string(),
-                    label: "Retry the job".to_string(),
+                    id: id.to_string(),
+                    label: label.to_string(),
                 },
                 agent_hint: None,
-                user_hint: Some(OOM_ADVICE.to_string()),
+                user_hint: Some(advice.to_string()),
             });
         }
         if !retry && !self.external {
@@ -2454,6 +2478,19 @@ mod tests {
             "CUDA out of memory. Tried to allocate"
         ));
         assert!(!is_oom("RuntimeError", "out of memory"));
+        // ComfyUI's own tip, and its AcceleratorError form (plan 4a ruling, 2026-10-24).
+        assert!(is_oom(
+            "RuntimeError",
+            "CUDA error: out of memory\n\nThis error means you ran out of memory on your GPU."
+        ));
+        assert!(is_oom(
+            "torch.AcceleratorError",
+            "CUDA error: out of memory"
+        ));
+        assert!(!is_oom(
+            "torch.AcceleratorError",
+            "CUDA error: illegal address"
+        ));
     }
 
     #[test] // spec: ARCH-060

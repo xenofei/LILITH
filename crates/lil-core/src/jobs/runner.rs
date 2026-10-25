@@ -365,6 +365,8 @@ fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
 
 /// The tool an agent retries a finished job with (CORE-146; `jobs` names no `tools` item).
 const JOB_RETRY_TOOL: &str = "job.retry";
+/// The UI action that retries a finished job ("Retry the job").
+pub const RETRY_ACTION: &str = "retry_job";
 
 /// How a finished job's error is retried ([`job_error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,13 +400,16 @@ fn job_error(mut error: ErrorBody, job_id: &str, how: RetryHow) -> ErrorBody {
             arguments: json!({ "job_id": job_id }),
         };
         match &mut error.fix {
+            // A fix of its own other than "Retry the job" (paid work's out of memory: "Show
+            // the job") gets no `job.retry` hint (plan 4a ruling, 2026-10-24).
+            Some(fix) if fix.ui_action.id != RETRY_ACTION => {}
             Some(fix) => {
                 fix.agent_hint.get_or_insert(hint);
             }
             None => {
                 error.fix = Some(lil_protocol::Fix {
                     ui_action: lil_protocol::UiAction {
-                        id: "retry_job".to_string(),
+                        id: RETRY_ACTION.to_string(),
                         label: "Retry the job".to_string(),
                     },
                     agent_hint: Some(hint),

@@ -65,6 +65,9 @@ pub struct ModelFile {
     /// The model family its header names (untrusted, ARCH-060); `None` when it names none, for
     /// a format without a header, or when it couldn't be read.
     pub family: Option<String>,
+    /// `<volume serial>-<FileId>`: two paths with one key are one file (links); `None` without
+    /// a FileId.
+    pub file_key: Option<String>,
 }
 
 /// The inventory kept while the engine stays ready.
@@ -214,7 +217,8 @@ pub async fn scan(
         }
         let key = f.abs.display().to_string();
         seen.insert(key.clone());
-        let file_id = identity_key(&f.id).unwrap_or_default();
+        let file_key = identity_key(&f.id);
+        let file_id = file_key.clone().unwrap_or_default();
         let own = cached.get(&key);
         let known: Option<&Row> = match own {
             Some(row) if row.0 == f.id.size && row.1 == f.id.last_write && row.2 == file_id => {
@@ -279,6 +283,7 @@ pub async fn scan(
             size: f.id.size,
             sha256,
             family,
+            file_key,
         });
     }
     let kept: Vec<String> = walked.unreadable.iter().map(|d| d.to_lowercase()).collect();
@@ -515,22 +520,42 @@ pub fn model_entries(
         .collect()
 }
 
-/// The entries of `<ws>\registry\models.yaml`; none when there is no file. A file that can't
-/// be read or parsed is logged and matches nothing.
-fn read_registry(ws: Option<&Path>) -> Vec<lil_schema::engine_files::RegistryModel> {
+/// Whether the default workspace's `registry/models.yaml` could be read (Appendix G "Model
+/// inventory report"; plan 4a ruling, 2026-10-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryStatus {
+    /// Read.
+    Ok,
+    /// The file doesn't exist.
+    Missing,
+    /// An I/O error, or not YAML, or not a list.
+    Unreadable,
+    /// There is no default workspace.
+    NoWorkspace,
+}
+
+/// The entries of `<ws>\registry\models.yaml` and whether it could be read; none unless it is
+/// [`RegistryStatus::Ok`]. A file that can't be read or parsed is logged.
+fn read_registry(
+    ws: Option<&Path>,
+) -> (Vec<lil_schema::engine_files::RegistryModel>, RegistryStatus) {
     let Some(ws) = ws else {
-        return Vec::new();
+        return (Vec::new(), RegistryStatus::NoWorkspace);
     };
     let path = ws.join("registry").join("models.yaml");
     match std::fs::read_to_string(&path) {
-        Ok(text) => lil_schema::engine_files::read_models_yaml(&text).unwrap_or_else(|e| {
-            tracing::warn!(file = %path.display(), error = %e, "registry/models.yaml can't be read; no model file is named from it");
-            Vec::new()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Ok(text) => match lil_schema::engine_files::read_models_yaml(&text) {
+            Ok(entries) => (entries, RegistryStatus::Ok),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "registry/models.yaml can't be read; no model file is named from it");
+                (Vec::new(), RegistryStatus::Unreadable)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), RegistryStatus::Missing),
         Err(e) => {
             tracing::warn!(file = %path.display(), error = %e, "registry/models.yaml can't be read");
-            Vec::new()
+            (Vec::new(), RegistryStatus::Unreadable)
         }
     }
 }
@@ -595,7 +620,7 @@ impl InventoryHandler {
         let captured = comfy.now_rfc3339();
         let workspace = comfy.default_workspace();
         let (env_root, when) = (root.clone(), captured.clone());
-        let (environment, registry) = tokio::task::spawn_blocking(move || {
+        let (environment, (registry, _)) = tokio::task::spawn_blocking(move || {
             (
                 environment::capture(stats, driver, env_root.as_deref(), when),
                 read_registry(workspace.as_deref()),
@@ -609,8 +634,8 @@ impl InventoryHandler {
                 "",
             )))
         })?;
-        // Kept for `engines.environment` and `lil doctor`; one that can't be kept is logged,
-        // and the inventory goes on.
+        // Kept for `engines.environment` and `lil doctor` when the environment changed; one that
+        // can't be kept is logged, and the inventory goes on.
         let kept = serde_json::to_value(&environment).unwrap_or(Value::Null);
         if let Err(e) = environment::store_capture(
             &comfy.suite_state(),
@@ -684,6 +709,9 @@ pub struct ModelsReport {
     pub root: String,
     /// When the inventory was refreshed (RFC 3339 UTC); `null` before the first one.
     pub refreshed: Option<String>,
+    /// Whether `registry/models.yaml` was read: unless it was, nothing is `orphan` or
+    /// `missing`, since the report doesn't guess from a registry it couldn't read.
+    pub registry: RegistryStatus,
     pub models: Vec<ModelReportEntry>,
     pub missing: Vec<MissingModel>,
 }
@@ -714,7 +742,7 @@ pub struct ModelReportEntry {
 pub enum ModelState {
     /// No `registry/models.yaml` entry has its SHA-256.
     Orphan,
-    /// Another file has the same SHA-256.
+    /// Another file (not another path to the same file) has the same SHA-256.
     Duplicate,
     /// Its header names no family.
     UnknownFamily,
@@ -730,18 +758,27 @@ pub struct MissingModel {
 }
 
 /// The report's entries for `files` against `registry` (Appendix G): each file's states, and
-/// the registry hashes no file has, each once per entry.
+/// the registry hashes no file has, each once per entry. With `registry_read` false (it
+/// couldn't be read), no file is `orphan` and nothing is `missing`. Copies are counted by
+/// file, so two paths to one file (`file_key`) aren't duplicates.
 pub fn report_entries(
     files: &[ModelFile],
     registry: &[lil_schema::engine_files::RegistryModel],
+    registry_read: bool,
 ) -> (Vec<ModelReportEntry>, Vec<MissingModel>) {
     let by_hash: HashMap<&str, &lil_schema::engine_files::RegistryModel> = registry
         .iter()
         .flat_map(|m| m.sha256.iter().map(move |h| (h.as_str(), m)))
         .collect();
-    let mut copies: HashMap<&str, usize> = HashMap::new();
-    for sha in files.iter().filter_map(|f| f.sha256.as_deref()) {
-        *copies.entry(sha).or_default() += 1;
+    let mut copies: HashMap<&str, HashSet<String>> = HashMap::new();
+    for f in files {
+        if let Some(sha) = f.sha256.as_deref() {
+            let file = f
+                .file_key
+                .clone()
+                .unwrap_or_else(|| format!("path:{}", f.path));
+            copies.entry(sha).or_default().insert(file);
+        }
     }
     let models = files
         .iter()
@@ -749,10 +786,10 @@ pub fn report_entries(
             let sha = f.sha256.as_deref();
             let entry = sha.and_then(|h| by_hash.get(h));
             let mut states = Vec::new();
-            if entry.is_none() {
+            if entry.is_none() && registry_read {
                 states.push(ModelState::Orphan);
             }
-            if sha.is_some_and(|h| copies.get(h).is_some_and(|n| *n > 1)) {
+            if sha.is_some_and(|h| copies.get(h).is_some_and(|n| n.len() > 1)) {
                 states.push(ModelState::Duplicate);
             }
             if f.family.is_none() {
@@ -776,7 +813,7 @@ pub fn report_entries(
             let listed = missing
                 .iter()
                 .any(|x| x.model_id == m.id && x.sha256 == *sha);
-            if !copies.contains_key(sha.as_str()) && !listed {
+            if registry_read && !copies.contains_key(sha.as_str()) && !listed {
                 missing.push(MissingModel {
                     model_id: m.id.clone(),
                     model_name: m.name.clone(),
@@ -806,22 +843,26 @@ pub async fn models_report(engines: &Engines) -> Result<ModelsReport, ErrorBody>
         )
     })?;
     let root = root.display().to_string();
+    let workspace = comfy.default_workspace();
+    let (registry, status) =
+        tokio::task::spawn_blocking(move || read_registry(workspace.as_deref()))
+            .await
+            .unwrap_or((Vec::new(), RegistryStatus::Unreadable));
     let Some(inventory) = comfy.last_inventory() else {
         return Ok(ModelsReport {
             root,
             refreshed: None,
+            registry: status,
             models: Vec::new(),
             missing: Vec::new(),
         });
     };
-    let workspace = comfy.default_workspace();
-    let registry = tokio::task::spawn_blocking(move || read_registry(workspace.as_deref()))
-        .await
-        .unwrap_or_default();
-    let (models, missing) = report_entries(&inventory.files, &registry);
+    let (models, missing) =
+        report_entries(&inventory.files, &registry, status == RegistryStatus::Ok);
     Ok(ModelsReport {
         root,
         refreshed: Some(inventory.refreshed.clone()),
+        registry: status,
         models,
         missing,
     })

@@ -8,9 +8,9 @@
 //! <name>`), then that ref's loose file or its `packed-refs` line. A repository it can't read
 //! has no commit; nothing here fails the capture.
 //!
-//! **Stored captures** (plan 4a; Appendix G "Engine environments"): each capture is kept in the
-//! suite `state.db` table `engine_captures`, the newest [`KEEP_CAPTURES`] per engine
-//! ([`store_capture`]); `engines.environment` ([`environment`]) shows the newest two and what
+//! **Stored captures** (plan 4a; Appendix G "Engine environments"): a capture whose environment
+//! differs from the newest stored one is kept in the suite `state.db` table `engine_captures`,
+//! the newest [`KEEP_CAPTURES`] per engine ([`store_capture`]); `engines.environment` ([`environment`]) shows the newest two and what
 //! changed between them ([`changes`]). The suite records environments and never restores one
 //! (CORE-130; CORE-166 is Later).
 
@@ -74,6 +74,9 @@ pub fn capture(
         .and_then(Value::as_array_mut)
     {
         blank_secret_args(argv);
+        if let Some(root) = root {
+            relative_to_root(argv, root);
+        }
     }
     let comfyui = root.and_then(|r| {
         let (rev, version) = revision(r);
@@ -90,7 +93,8 @@ pub fn capture(
             let (rev, version) = revision(&e.path());
             (e.file_name().to_string_lossy().into_owned(), rev, version)
         })
-        .filter(|(name, _, _)| name != "__pycache__")
+        // ComfyUI-Manager's `.disabled` (and any dot folder) holds no node of its own.
+        .filter(|(name, _, _)| name != "__pycache__" && !name.starts_with('.'))
         .collect();
     nodes.sort_by(|a, b| a.0.cmp(&b.0));
     EnvCapture {
@@ -99,6 +103,43 @@ pub fn capture(
         comfyui,
         nodes,
         captured,
+    }
+}
+
+/// Each `argv` entry that is a path inside `root` (or `--flag=<such a path>`) is written relative
+/// to `root` (`.` for `root` itself), so a stored or served capture holds no absolute path into
+/// the ComfyUI folder (plan 4a ruling, 2026-10-24). Other entries are kept.
+pub fn relative_to_root(argv: &mut [Value], root: &Path) {
+    let base = root.display().to_string().replace('/', "\\");
+    let base = base.trim_end_matches('\\');
+    if base.is_empty() {
+        return;
+    }
+    let inside = |path: &str| -> Option<String> {
+        let path = path.replace('/', "\\");
+        let head = path.get(..base.len())?;
+        if !head.eq_ignore_ascii_case(base) {
+            return None;
+        }
+        let rest = &path[base.len()..];
+        if rest.is_empty() {
+            return Some(".".to_string());
+        }
+        rest.strip_prefix('\\')
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+    };
+    for arg in argv.iter_mut() {
+        let Some(text) = arg.as_str() else { continue };
+        let relative = match text.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => {
+                inside(value).map(|v| format!("{flag}={v}"))
+            }
+            _ => inside(text),
+        };
+        if let Some(relative) = relative {
+            *arg = Value::from(relative);
+        }
     }
 }
 
@@ -194,7 +235,10 @@ fn git_head(dir: &Path) -> Option<String> {
 }
 
 /// Keeps `capture` of `engine` taken at `at_ms` (Unix milliseconds; one more than the engine's
-/// newest when that is not earlier), then drops all but the newest [`KEEP_CAPTURES`] of it.
+/// newest when that is not earlier), then drops all but the newest [`KEEP_CAPTURES`] of it;
+/// whether it was kept. A capture whose environment is the newest stored one's (no
+/// [`changes`] between them) isn't kept: the stored ones are the last different environments
+/// (plan 4a ruling, 2026-10-24).
 ///
 /// # Errors
 /// The suite `state.db` can't be written.
@@ -203,17 +247,31 @@ pub async fn store_capture(
     engine: &str,
     capture: &Value,
     at_ms: i64,
-) -> Result<(), StateError> {
-    let (engine, text) = (engine.to_string(), capture.to_string());
+) -> Result<bool, StateError> {
+    let (engine, text, new) = (engine.to_string(), capture.to_string(), capture.clone());
     db.call(move |conn| {
-        let mut run = || -> rusqlite::Result<()> {
+        let mut run = || -> rusqlite::Result<bool> {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let newest: Option<i64> = tx.query_row(
-                "SELECT MAX(captured_utc) FROM engine_captures WHERE engine = ?1",
-                [&engine],
-                |r| r.get(0),
-            )?;
-            let at = newest.map_or(at_ms, |n| at_ms.max(n.saturating_add(1)));
+            let newest: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT captured_utc, capture FROM engine_captures WHERE engine = ?1 \
+                     ORDER BY captured_utc DESC LIMIT 1",
+                    [&engine],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?;
+            let same = newest.as_ref().is_some_and(|(_, stored)| {
+                serde_json::from_str::<Value>(stored)
+                    .is_ok_and(|old| changes(&new, &old).is_empty())
+            });
+            if same {
+                return Ok(false);
+            }
+            let at = newest.map_or(at_ms, |(n, _)| at_ms.max(n.saturating_add(1)));
             tx.execute(
                 "INSERT INTO engine_captures (engine, captured_utc, capture) VALUES (?1, ?2, ?3)",
                 params![engine, at, text],
@@ -224,7 +282,8 @@ pub async fn store_capture(
                   ORDER BY captured_utc DESC LIMIT ?2)",
                 params![engine, KEEP_CAPTURES],
             )?;
-            tx.commit()
+            tx.commit()?;
+            Ok(true)
         };
         run().map_err(|e| StateError::Io(e.to_string()))
     })
@@ -374,11 +433,10 @@ pub fn changes(newer: &Value, older: &Value) -> Vec<EnvChange> {
             });
         }
     }
-    out.extend(change_of(
-        ChangeWhat::Driver,
-        text_of(older, "driver"),
-        text_of(newer, "driver"),
-    ));
+    // A driver that isn't known (no GPU reading at the capture) is never a difference.
+    if let (Some(from), Some(to)) = (text_of(older, "driver"), text_of(newer, "driver")) {
+        out.extend(change_of(ChangeWhat::Driver, Some(from), Some(to)));
+    }
     out
 }
 

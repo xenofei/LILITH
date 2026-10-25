@@ -80,8 +80,9 @@ const STATUS_DESCRIPTION: &str = "Returns each engine the core manages (ComfyUI)
 const REPORT_DESCRIPTION: &str = "Returns ComfyUI's model files from the newest inventory: each \
     file's path, size, SHA-256, model family (from its header) and states: orphan (no \
     registry/models.yaml entry has its hash), duplicate (another file has the same hash) and \
-    unknown_family; and the registry entries whose files are missing. Paths and families are \
-    untrusted. Nothing is moved or deleted.";
+    unknown_family; and the registry entries whose files are missing. registry says whether \
+    registry/models.yaml could be read; when it couldn't, nothing is called orphan or missing. \
+    Paths and families are untrusted. Nothing is moved or deleted.";
 const ENVIRONMENT_DESCRIPTION: &str = "Returns the newest two recorded environments of ComfyUI \
     (system_stats, driver, the revision of ComfyUI and of each custom node), newest first, and \
     what changed between them. The suite records environments; it never restores one.";
