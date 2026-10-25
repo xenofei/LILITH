@@ -1051,6 +1051,103 @@ async fn oom_frees_then_retries_at_most_twice() {
     assert_eq!(calls, ["/prompt", "/free", "/prompt", "/free", "/prompt"]);
 }
 
+/// Submits the tiny graph as a tool call would (with an origin, so an agent may `job.retry`
+/// it), with `external_side_effects` as given; returns the job id.
+async fn submit_as_tool(rig: &Rig, external: bool) -> String {
+    let mut spec = prompt_spec(
+        tiny_args(1),
+        Priority::Agent,
+        "test",
+        None,
+        DEFAULT_EXPECTED_SECS,
+    );
+    spec.external_side_effects = external;
+    let mut caller = rig.caller();
+    caller.origin = Some(JobOrigin {
+        tool: "test.comfy_submit".into(),
+        arguments: json!({}),
+    });
+    rig.jobs.submit(&caller, spec).await.unwrap().job_id
+}
+
+/// The last out of memory after the two retries fails with Appendix G's advice (CORE-163).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-163
+async fn out_of_memory_fails_with_advice_after_two_retries() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.oom_next(3);
+    let rig = Rig::new(&env);
+    let id = submit_as_tool(&rig, false).await;
+    let failed = rig.done(&id).await;
+    assert_eq!(failed.status, JobStatus::Failed, "{failed:?}");
+    assert_eq!(posted(&fake).len(), 3, "the first try and two retries");
+    let error = failed.error.expect("the job's error");
+    assert_eq!(error.code, "comfyui.out_of_memory");
+    assert_eq!(
+        error.message,
+        "ComfyUI ran out of GPU memory, also on 2 retries."
+    );
+    let fix = error.fix.expect("a fix");
+    assert_eq!(
+        fix.user_hint.as_deref(),
+        Some(
+            "Close other programs that use the GPU, or choose the model profile's lighter \
+             variant, then retry."
+        )
+    );
+    assert_eq!(
+        (fix.ui_action.id.as_str(), fix.ui_action.label.as_str()),
+        ("retry_job", "Retry the job")
+    );
+    let hint = fix.agent_hint.expect("the job.retry hint");
+    assert_eq!(
+        (hint.tool.as_str(), &hint.arguments),
+        ("job.retry", &json!({"job_id": id}))
+    );
+    assert_eq!(error.retry, lil_protocol::RetryPolicy::AfterResolve);
+    assert!(
+        error.detail.is_some_and(|d| d.untrusted),
+        "ComfyUI's own text stays untrusted"
+    );
+}
+
+/// Paid work's out of memory is final at once and says that a retry is charged again; it has
+/// no one-click retry (plan 4a ruling, 2026-10-24).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-163, CORE-128
+async fn external_out_of_memory_says_a_retry_is_charged_again() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.oom_next(1);
+    let rig = Rig::new(&env);
+    let id = submit_as_tool(&rig, true).await;
+    let failed = rig.done(&id).await;
+    assert_eq!(
+        (failed.status, failed.attempt),
+        (JobStatus::Failed, 1),
+        "{failed:?}"
+    );
+    assert_eq!(posted(&fake).len(), 1, "paid work is never re-posted");
+    let error = failed.error.expect("the job's error");
+    assert_eq!(error.code, "comfyui.out_of_memory");
+    assert_eq!(
+        error.message,
+        "ComfyUI ran out of GPU memory. The job has external side effects, so it was not retried."
+    );
+    let fix = error.fix.expect("a fix");
+    assert_eq!(
+        fix.user_hint.as_deref(),
+        Some(
+            "Close other programs that use the GPU, or choose the model profile's lighter \
+             variant. Retrying runs the paid call again, and it is charged again."
+        )
+    );
+    assert_eq!(fix.ui_action.id, "show_job", "no one-click retry");
+    assert_eq!(fix.agent_hint, None, "no job.retry hint");
+    assert_eq!(error.retry, lil_protocol::RetryPolicy::AfterResolve);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Previews, windows and the watchdog (ARCH-033, CORE-065, CORE-126).
 // ---------------------------------------------------------------------------------------------

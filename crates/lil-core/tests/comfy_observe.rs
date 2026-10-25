@@ -674,6 +674,8 @@ async fn inventory_matches_registry_by_sha256() {
         path: "n.safetensors".into(),
         size: 1,
         sha256: Some("0".repeat(64)),
+        family: None,
+        file_key: None,
     }];
     let registry = lil_schema::engine_files::read_models_yaml(&format!(
         "- id: no-name\n  files:\n    - {{sha256: \"{}\"}}\n",
@@ -1230,4 +1232,683 @@ async fn an_outside_prompt_id_stays_one_path_segment() {
         .map(|r| format!("{}?{}", r.path, r.query))
         .collect();
     assert_eq!(paths, ["/api/jobs/x%2F..%2Fsystem_stats%3Fy%23z?"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 4a: the model inventory report (CORE-164) and the stored environment captures (CORE-130).
+// ---------------------------------------------------------------------------------------------
+
+/// A safetensors file: the 8-byte little-endian header length, then the JSON header.
+fn safetensors(header: &Value) -> Vec<u8> {
+    let json = header.to_string();
+    let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(json.as_bytes());
+    bytes
+}
+
+/// A GGUF version 3 file whose only key is `general.architecture` = `family`.
+fn gguf(family: &str) -> Vec<u8> {
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    let key = b"general.architecture";
+    bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(&(family.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(family.as_bytes());
+    bytes
+}
+
+/// The real probe, keeping the path of every file it opens to read.
+#[derive(Debug, Default)]
+struct OpenedProbe(Mutex<Vec<String>>);
+
+impl OpenedProbe {
+    fn opened(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.0.lock().unwrap().clone();
+        names.sort();
+        names
+    }
+}
+
+impl Probe for OpenedProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        self.0.lock().unwrap().push(name);
+        SystemProbe.open_read(path)
+    }
+}
+
+/// The `states` of a report entry, sorted.
+fn states_of(entry: &Value) -> Vec<String> {
+    let mut states: Vec<String> = entry["states"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no states: {entry}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    states.sort();
+    states
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-164, ARCH-060
+async fn models_report_states() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    let models = fake.root().join("models");
+    let with_family = safetensors(&json!({"__metadata__": {"modelspec.architecture": "arch-x"}}));
+    let plain = safetensors(&json!({"__metadata__": {}}));
+    let known = safetensors(&json!({"__metadata__": {"ss_base_model_version": "base-y"}}));
+    lil_testkit::files::write_file(&models.join(r"checkpoints\a.safetensors"), &with_family);
+    lil_testkit::files::write_file(
+        &models.join(r"checkpoints\a_copy.safetensors"),
+        &with_family,
+    );
+    lil_testkit::files::write_file(&models.join(r"loras\plain.safetensors"), &plain);
+    lil_testkit::files::write_file(&models.join(r"loras\known.safetensors"), &known);
+    // Another path to the same file: one file, so no duplicate.
+    hard_link(
+        &models.join(r"loras\known.safetensors"),
+        &models.join(r"links\known_link.safetensors"),
+    );
+    let known_sha = lil_testkit::files::sha256_bytes(&known);
+    let absent = "ab".repeat(32);
+    let ws = env.make_workspace("report");
+    lil_testkit::files::write_file(
+        &ws.join(r"registry\models.yaml"),
+        format!(
+            "- id: known-lora\n  name: Known LoRA\n  files:\n    - sha256: {known_sha}\n\
+             - id: absent-model\n  files:\n    - sha256: {absent}\n"
+        )
+        .as_bytes(),
+    );
+    env.register_workspace(&ws, true);
+    let before: Vec<(std::path::PathBuf, String)> = [
+        r"checkpoints\a.safetensors",
+        r"checkpoints\a_copy.safetensors",
+        r"loras\plain.safetensors",
+        r"loras\known.safetensors",
+    ]
+    .iter()
+    .map(|p| (models.join(p), lil_testkit::sha256_file(&models.join(p))))
+    .collect();
+
+    let rig = Rig::new(&env);
+    let empty = serde_json::to_value(
+        lil_core::engines::comfyui::inventory::models_report(&rig.engines)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(empty["refreshed"], Value::Null, "{empty}");
+    assert_eq!(empty["models"], json!([]), "{empty}");
+    assert_eq!(empty["missing"], json!([]), "{empty}");
+    assert_eq!(empty["registry"], "ok", "{empty}");
+    rig.ready().await;
+    rig.observed().await;
+    // The inventory kept its environment capture.
+    let view = environment::environment(&rig.engines).await.unwrap();
+    assert_eq!(view.captures.len(), 1, "{view:?}");
+    let report = serde_json::to_value(
+        lil_core::engines::comfyui::inventory::models_report(&rig.engines)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(report["root"], fake.root().to_str().unwrap(), "{report}");
+    assert!(report["refreshed"].is_string(), "{report}");
+    let entry = |path: &str| -> Value {
+        report["models"]
+            .as_array()
+            .and_then(|m| m.iter().find(|e| e["path"] == path))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {path} in {report}"))
+    };
+    for path in [
+        r"checkpoints\a.safetensors",
+        r"checkpoints\a_copy.safetensors",
+    ] {
+        let e = entry(path);
+        assert_eq!(e["family"], "arch-x", "{e}");
+        assert_eq!(states_of(&e), ["duplicate", "orphan"], "{e}");
+        assert_eq!(e["untrusted"], true, "{e}");
+        assert_eq!(e["sha256"], lil_testkit::files::sha256_bytes(&with_family));
+    }
+    let e = entry(r"loras\plain.safetensors");
+    assert_eq!(e["family"], Value::Null, "{e}");
+    assert_eq!(states_of(&e), ["orphan", "unknown_family"], "{e}");
+    for path in [r"loras\known.safetensors", r"links\known_link.safetensors"] {
+        let e = entry(path);
+        assert_eq!(states_of(&e), Vec::<String>::new(), "{e}");
+        assert_eq!(e["family"], "base-y", "{e}");
+        assert_eq!(
+            (&e["model_id"], &e["model_name"], &e["size"]),
+            (
+                &json!("known-lora"),
+                &json!("Known LoRA"),
+                &json!(known.len())
+            )
+        );
+    }
+    assert_eq!(report["registry"], "ok", "{report}");
+    assert_eq!(report["models"].as_array().unwrap().len(), 5, "{report}");
+    assert_eq!(
+        report["missing"],
+        json!([{"model_id": "absent-model", "sha256": absent}]),
+        "{report}"
+    );
+    for (path, sha) in before {
+        assert_eq!(
+            lil_testkit::sha256_file(&path),
+            sha,
+            "{} changed",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-164, CORE-130
+async fn models_report_without_a_root_is_not_configured() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, false);
+    let rig = Rig::new(&env);
+    let refused = lil_core::engines::comfyui::inventory::models_report(&rig.engines)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "engine.not_configured", "{refused:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-164, CORE-130
+async fn families_are_cached_by_identity_and_read_once() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let models = env.root().join("comfy").join("models");
+    let st = safetensors(&json!({"__metadata__": {"modelspec.architecture": "arch-x"}}));
+    lil_testkit::files::write_file(&models.join(r"checkpoints\a.safetensors"), &st);
+    lil_testkit::files::write_file(&models.join(r"text\b.gguf"), &gguf("arch-g"));
+    let scan = |p: &Arc<OpenedProbe>| {
+        let p: Arc<dyn Probe> = p.clone();
+        inventory::scan(&models, p, states.suite_db(), Arc::new(|| false))
+    };
+
+    let probe = Arc::new(OpenedProbe::default());
+    let first = scan(&probe).await.unwrap();
+    assert_eq!(
+        probe.opened(),
+        ["a.safetensors", "b.gguf"],
+        "each file opened once, for its header and its hash"
+    );
+    let families: Vec<Option<&str>> = first.iter().map(|f| f.family.as_deref()).collect();
+    assert_eq!(families, [Some("arch-x"), Some("arch-g")]);
+
+    let probe = Arc::new(OpenedProbe::default());
+    let second = scan(&probe).await.unwrap();
+    assert!(probe.opened().is_empty(), "{:?}", probe.opened());
+    assert_eq!(second, first);
+
+    // The same file reached through another link keeps its cached hash and family.
+    hard_link(
+        &models.join(r"checkpoints\a.safetensors"),
+        &models.join(r"linked\a_link.safetensors"),
+    );
+    let probe = Arc::new(OpenedProbe::default());
+    let third = scan(&probe).await.unwrap();
+    assert!(probe.opened().is_empty(), "{:?}", probe.opened());
+    let linked = third
+        .iter()
+        .find(|f| f.path == r"linked\a_link.safetensors")
+        .expect("the link");
+    assert_eq!(linked.family.as_deref(), Some("arch-x"));
+    assert_eq!(linked.sha256, first[0].sha256);
+
+    // A changed file is read again, header and all.
+    touch_later(&models.join(r"text\b.gguf"));
+    let probe = Arc::new(OpenedProbe::default());
+    let fourth = scan(&probe).await.unwrap();
+    assert_eq!(probe.opened(), ["b.gguf"]);
+    let b = fourth.iter().find(|f| f.path == r"text\b.gguf").unwrap();
+    assert_eq!(b.family.as_deref(), Some("arch-g"));
+}
+
+/// A hard link `link` to `target`, its folder made first.
+#[allow(clippy::disallowed_methods)]
+fn hard_link(target: &Path, link: &Path) {
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::fs::hard_link(target, link).unwrap();
+}
+
+/// Pickles are opened only to hash them (CORE-130), never parsed for a family (CORE-164).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-164, CORE-130
+async fn pickle_formats_are_never_parsed() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let models = env.root().join("comfy").join("models");
+    let header = safetensors(&json!({"__metadata__": {"modelspec.architecture": "arch-s"}}));
+    for name in ["m.ckpt", "m.pt", "m.pth", "m.bin"] {
+        // A pickle that starts like a safetensors header: still never read as one.
+        lil_testkit::files::write_file(&models.join(name), &header);
+    }
+    lil_testkit::files::write_file(&models.join("s.sft"), &header);
+    let db = states.suite_db();
+    let probe = Arc::new(OpenedProbe::default());
+    let p: Arc<dyn Probe> = probe.clone();
+    let first = inventory::scan(&models, p, db.clone(), Arc::new(|| false))
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.opened(),
+        ["m.bin", "m.ckpt", "m.pt", "m.pth", "s.sft"],
+        "each opened once, a pickle only for its hash"
+    );
+    for f in &first {
+        let want = (f.path == "s.sft").then_some("arch-s");
+        assert_eq!(f.family.as_deref(), want, "{f:?}");
+        assert!(f.sha256.is_some(), "every file is hashed: {f:?}");
+    }
+    // Every cached family forgotten, as rows from before plan 4a are: only the header formats
+    // are opened to read them.
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute("UPDATE model_hashes SET family = NULL, family_read = 0", [])
+        .unwrap();
+    drop(conn);
+    let probe = Arc::new(OpenedProbe::default());
+    let p: Arc<dyn Probe> = probe.clone();
+    let second = inventory::scan(&models, p, db, Arc::new(|| false))
+        .await
+        .unwrap();
+    assert_eq!(probe.opened(), ["s.sft"], "no pickle file was opened");
+    assert_eq!(second, first);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130
+async fn captures_keep_the_newest_10() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let db = states.suite_db();
+    let at = |n: i64| json!({"n": n, "comfyui": format!("rev-{n}")});
+    for n in 0..12 {
+        let kept = environment::store_capture(&db, "comfyui", &at(n), 1_000 + n)
+            .await
+            .unwrap();
+        assert!(kept, "{n}");
+    }
+    // A clock that gives no later time still orders the next capture after the newest.
+    environment::store_capture(&db, "comfyui", &at(12), 5)
+        .await
+        .unwrap();
+    environment::store_capture(&db, "other", &at(0), 1)
+        .await
+        .unwrap();
+    let kept = environment::recent(&db, "comfyui", 20).await.unwrap();
+    let ns: Vec<i64> = kept.iter().map(|c| c["n"].as_i64().unwrap()).collect();
+    assert_eq!(
+        ns,
+        [12, 11, 10, 9, 8, 7, 6, 5, 4, 3],
+        "the newest 10, newest first"
+    );
+    assert_eq!(
+        environment::recent(&db, "other", 20).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        environment::recent(&db, "comfyui", 2).await.unwrap().len(),
+        2
+    );
+}
+
+/// A ComfyUI folder at `version` with node packs `nodes` (`(folder, version)`).
+fn comfy_tree(root: &Path, version: &str, nodes: &[(&str, &str)]) {
+    lil_testkit::files::write_file(
+        &root.join("pyproject.toml"),
+        format!("[project]\nname = \"comfyui\"\nversion = \"{version}\"\n").as_bytes(),
+    );
+    for (name, v) in nodes {
+        lil_testkit::files::write_file(
+            &root.join("custom_nodes").join(name).join("pyproject.toml"),
+            format!("[project]\nname = \"{name}\"\nversion = \"{v}\"\n").as_bytes(),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130
+async fn environment_lists_changes_between_two_captures() {
+    let env = TestEnv::new();
+    let (old_root, new_root) = (env.root().join("old"), env.root().join("new"));
+    comfy_tree(
+        &old_root,
+        "0.42.0",
+        &[
+            ("pack-a", "1.0.0"),
+            ("pack-b", "2.0.0"),
+            ("pack-gone", "3.0.0"),
+        ],
+    );
+    comfy_tree(
+        &new_root,
+        "0.42.1",
+        &[
+            ("pack-a", "1.1.0"),
+            ("pack-b", "2.0.0"),
+            ("pack-c", "0.1.0"),
+            // ComfyUI-Manager's folder of disabled packs is no node.
+            (".disabled", "9.9.9"),
+        ],
+    );
+    let stats = json!({"system": {"comfyui_version": "0.42.1"}});
+    let capture = |root: &Path, driver: &str, at: &str| {
+        serde_json::to_value(environment::capture(
+            stats.clone(),
+            Some(driver.into()),
+            Some(root),
+            at.into(),
+        ))
+        .unwrap()
+    };
+    let older = capture(&old_root, "100.1", "2026-10-24T00:00:00Z");
+    let newer = capture(&new_root, "100.2", "2026-10-24T01:00:00Z");
+    let changes = serde_json::to_value(environment::changes(&newer, &older)).unwrap();
+    assert_eq!(
+        changes,
+        json!([
+            {"what": "comfyui", "from": "0.42.0", "to": "0.42.1", "change": "changed"},
+            {"what": "node", "name": "pack-a", "from": "1.0.0", "to": "1.1.0", "change": "changed"},
+            {"what": "node", "name": "pack-c", "to": "0.1.0", "change": "added"},
+            {"what": "node", "name": "pack-gone", "from": "3.0.0", "change": "removed"},
+            {"what": "driver", "from": "100.1", "to": "100.2", "change": "changed"},
+        ])
+    );
+    // A driver that isn't known is no change.
+    let mut unknown = newer.clone();
+    unknown["driver"] = Value::Null;
+    assert!(
+        environment::changes(&unknown, &older)
+            .iter()
+            .all(|c| c.what != environment::ChangeWhat::Driver)
+    );
+    // ComfyUI's and a node's git commit win over their version; a node shows both.
+    let git_root = env.root().join("git");
+    comfy_tree(&git_root, "0.42.1", &[]);
+    env.git_init(&git_root);
+    let commit = env
+        .git(&git_root, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let with_git = capture(&git_root, "100.2", "2026-10-24T02:00:00Z");
+    assert_eq!(with_git["comfyui"], commit.as_str());
+    let node = env
+        .root()
+        .join("git-node")
+        .join("custom_nodes")
+        .join("pack-g");
+    lil_testkit::files::write_file(
+        &node.join("pyproject.toml"),
+        b"[project]\nname = \"pack-g\"\nversion = \"5.0.0\"\n",
+    );
+    env.git_init(&node);
+    let node_commit = env.git(&node, &["rev-parse", "HEAD"]).trim().to_string();
+    let with_node = capture(
+        &env.root().join("git-node"),
+        "100.2",
+        "2026-10-24T03:00:00Z",
+    );
+    let added = environment::changes(&with_node, &json!({"nodes": []}));
+    assert_eq!(
+        added[0].to.as_deref(),
+        Some(format!("5.0.0 ({node_commit})").as_str())
+    );
+    assert_eq!(
+        environment::changes(&newer, &newer),
+        Vec::new(),
+        "nothing changed"
+    );
+
+    // Through the engines: the newest two of the stored captures, newest first.
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    let rig = Rig::new(&env);
+    let view = environment::environment(&rig.engines).await.unwrap();
+    let view = serde_json::to_value(view).unwrap();
+    assert_eq!(view, json!({"captures": [], "changes": []}));
+    let db = rig.states.suite_db();
+    environment::store_capture(&db, "comfyui", &older, 1)
+        .await
+        .unwrap();
+    environment::store_capture(&db, "comfyui", &newer, 2)
+        .await
+        .unwrap();
+    let view = serde_json::to_value(environment::environment(&rig.engines).await.unwrap()).unwrap();
+    assert_eq!(view["captures"], json!([newer, older]));
+    assert_eq!(view["changes"], changes);
+}
+
+#[test] // spec: CORE-130
+fn argv_inside_root_is_kept_relative_to_it() {
+    let env = TestEnv::new();
+    let root = env.root().join("Comfy");
+    let inside = |rest: &str| format!("{}\\{rest}", root.display());
+    let stats = json!({"system": {"argv": [
+        inside("main.py"),
+        "--output-directory",
+        inside("out").to_uppercase(),
+        format!("--temp-directory={}", inside("tmp")),
+        root.display().to_string(),
+        "D:\\elsewhere\\main.py",
+        "--lowvram",
+    ]}});
+    let captured = environment::capture(stats, None, Some(&root), "t".into());
+    assert_eq!(
+        captured.system_stats["system"]["argv"],
+        json!([
+            "main.py",
+            "--output-directory",
+            "OUT",
+            "--temp-directory=tmp",
+            ".",
+            "D:\\elsewhere\\main.py",
+            "--lowvram"
+        ])
+    );
+}
+
+/// Restarts that change nothing store nothing, so the capture a rollback needs stays (plan 4a
+/// ruling, 2026-10-24).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130
+async fn quiet_restarts_keep_the_rollback_capture() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let db = states.suite_db();
+    let capture = |version: &str, driver: Value, free: i64| {
+        json!({"system_stats": {"devices": [{"vram_free": free}]}, "driver": driver,
+               "comfyui": "0.42.1", "captured": format!("t{free}"),
+               "nodes": [{"name": "pack-a", "git_rev": null, "version": version}]})
+    };
+    let before = capture("1.0.0", json!("100.1"), 1);
+    let after = capture("1.1.0", json!("100.1"), 2);
+    assert!(
+        environment::store_capture(&db, "comfyui", &before, 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        environment::store_capture(&db, "comfyui", &after, 2)
+            .await
+            .unwrap()
+    );
+    for n in 0..10 {
+        // Free memory, the time and an unknown driver are no change.
+        let driver = if n % 2 == 0 {
+            Value::Null
+        } else {
+            json!("100.1")
+        };
+        let quiet = capture("1.1.0", driver, 10 + n);
+        let kept = environment::store_capture(&db, "comfyui", &quiet, 10 + n)
+            .await
+            .unwrap();
+        assert!(!kept, "restart {n} changed nothing");
+    }
+    let kept = environment::recent(&db, "comfyui", 20).await.unwrap();
+    assert_eq!(kept, [after.clone(), before.clone()]);
+    let changes = environment::changes(&kept[0], &kept[1]);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].from.as_deref(), Some("1.0.0"));
+
+    // A capture taken before the first GPU reading has no driver: the first known driver is
+    // stored as a new row, so a driver update after it is recorded (plan 4a ruling, fix
+    // round 2).
+    let engine = "driver-test";
+    let at = |driver: Value, free: i64| capture("1.1.0", driver, free);
+    let unknown = at(Value::Null, 100);
+    let d570 = at(json!("570.10"), 101);
+    let d580 = at(json!("580.20"), 104);
+    assert!(
+        environment::store_capture(&db, engine, &unknown, 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        environment::store_capture(&db, engine, &d570, 2)
+            .await
+            .unwrap(),
+        "the driver became known"
+    );
+    for (n, quiet) in [at(json!("570.10"), 102), at(Value::Null, 103)]
+        .iter()
+        .enumerate()
+    {
+        let kept = environment::store_capture(&db, engine, quiet, 3 + i64::try_from(n).unwrap())
+            .await
+            .unwrap();
+        assert!(!kept, "quiet restart {n}");
+    }
+    assert!(
+        environment::store_capture(&db, engine, &d580, 10)
+            .await
+            .unwrap(),
+        "the driver changed"
+    );
+    let kept = environment::recent(&db, engine, 20).await.unwrap();
+    assert_eq!(kept, [d580.clone(), d570.clone(), unknown.clone()]);
+    let changes = serde_json::to_value(environment::changes(&kept[0], &kept[1])).unwrap();
+    assert_eq!(
+        changes,
+        json!([{"what": "driver", "from": "570.10", "to": "580.20", "change": "changed"}])
+    );
+}
+
+/// A probe that can't open any file to read it.
+#[derive(Debug, Default)]
+struct ClosedProbe;
+
+impl Probe for ClosedProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, _path: &Path) -> std::io::Result<std::fs::File> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the file is locked",
+        ))
+    }
+}
+
+/// `family_read` of the cached row whose path ends with `name`.
+fn family_read(db: &lil_core::state::StateDb, name: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.query_row(
+        "SELECT family_read FROM model_hashes WHERE path LIKE ?1",
+        [format!("%\\{name}")],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A header that couldn't be read is read again next time (`family_read` stays 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-164
+async fn a_family_read_that_fails_is_read_again() {
+    let env = TestEnv::new();
+    let states =
+        StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap();
+    let models = env.root().join("comfy").join("models");
+    let st = safetensors(&json!({"__metadata__": {"modelspec.architecture": "arch-x"}}));
+    lil_testkit::files::write_file(&models.join("a.safetensors"), &st);
+    let db = states.suite_db();
+    let scan =
+        |probe: Arc<dyn Probe>| inventory::scan(&models, probe, db.clone(), Arc::new(|| false));
+    scan(Arc::new(SystemProbe)).await.unwrap();
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute("UPDATE model_hashes SET family = NULL, family_read = 0", [])
+        .unwrap();
+    drop(conn);
+
+    let closed = scan(Arc::new(ClosedProbe)).await.unwrap();
+    assert_eq!(closed[0].family, None);
+    assert!(closed[0].sha256.is_some(), "the cached hash stays");
+    assert_eq!(family_read(&db, "a.safetensors"), 0, "to be read again");
+
+    let read = scan(Arc::new(SystemProbe)).await.unwrap();
+    assert_eq!(read[0].family.as_deref(), Some("arch-x"));
+    assert_eq!(family_read(&db, "a.safetensors"), 1);
+}
+
+/// A registry that can't be read names no file `orphan` and nothing `missing` (plan 4a
+/// ruling, 2026-10-24); the report says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-164
+async fn models_report_does_not_guess_from_an_unreadable_registry() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    let models = fake.root().join("models");
+    let plain = safetensors(&json!({"__metadata__": {}}));
+    lil_testkit::files::write_file(&models.join("a.safetensors"), &plain);
+    lil_testkit::files::write_file(&models.join("a_copy.safetensors"), &plain);
+    let rig = Rig::new(&env);
+    rig.ready().await;
+    rig.observed().await;
+    let report = async || {
+        serde_json::to_value(inventory::models_report(&rig.engines).await.unwrap()).unwrap()
+    };
+    let none = report().await;
+    assert_eq!(none["registry"], "no_workspace", "{none}");
+
+    let ws = env.make_workspace("unreadable");
+    env.register_workspace(&ws, true);
+    let absent = report().await;
+    assert_eq!(absent["registry"], "missing", "{absent}");
+    lil_testkit::files::write_file(
+        &ws.join(r"registry\models.yaml"),
+        b"<<<<<<< HEAD\n- id: [unclosed\n",
+    );
+    let broken = report().await;
+    assert_eq!(broken["registry"], "unreadable", "{broken}");
+    for r in [&none, &absent, &broken] {
+        assert_eq!(r["missing"], json!([]), "{r}");
+        for e in r["models"].as_array().unwrap() {
+            assert_eq!(states_of(e), ["duplicate", "unknown_family"], "{e}");
+            assert!(e.get("model_id").is_none(), "{e}");
+        }
+    }
 }

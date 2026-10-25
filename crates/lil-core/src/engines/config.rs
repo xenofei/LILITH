@@ -1,5 +1,6 @@
 //! `suite.toml` `[engines.comfyui]` (Appendix F "ComfyUI engine"; CORE-007: machine-level), the
-//! owned launch's arguments (ARCH-068) and the scrubbed engine environment (ARCH-063).
+//! owned launch's arguments (ARCH-068) with its launch profile (ARCH-126; Appendix G "ComfyUI
+//! launch profile") and the scrubbed engine environment (ARCH-063).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,59 @@ pub struct ComfyConfig {
     /// The `pass_env` entries the scrub still refuses, or that can never name a variable
     /// (ruling P3-R31): `(entry, why)`. `lil doctor` reports them; they never go through.
     pub pass_env_rejected: Vec<(String, String)>,
+    /// The owned start's launch profile (ARCH-126); a key whose value isn't valid holds its
+    /// default here and is listed in `profile_invalid`.
+    pub profile: LaunchProfile,
+    /// The launch-profile keys whose values aren't valid: `(key, why)`. They refuse only an
+    /// owned start ([`ComfyConfig::launch_args`]); attaching, the inventory and the outside-jobs
+    /// watch don't use the profile (plan 4a ruling, 2026-10-24).
+    pub profile_invalid: Vec<(String, String)>,
+}
+
+/// An owned ComfyUI's launch profile (ARCH-126; Appendix G "ComfyUI launch profile"): the VRAM
+/// it leaves to the studio, its default previews, ComfyUI-Manager, and whether it may use
+/// dynamic VRAM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchProfile {
+    /// Gigabytes, a decimal string (`--reserve-vram`).
+    pub reserve_vram_gb: String,
+    /// `none`, `auto`, `latent2rgb` or `taesd` (`--preview-method`).
+    pub preview_method: String,
+    /// `--enable-manager` when true.
+    pub manager: bool,
+    /// `--disable-dynamic-vram` when false.
+    pub dynamic_vram: bool,
+}
+
+impl Default for LaunchProfile {
+    fn default() -> LaunchProfile {
+        LaunchProfile {
+            reserve_vram_gb: lil_schema::suite::DEFAULT_RESERVE_VRAM_GB.to_string(),
+            preview_method: lil_schema::suite::DEFAULT_PREVIEW_METHOD.to_string(),
+            manager: false,
+            dynamic_vram: true,
+        }
+    }
+}
+
+impl LaunchProfile {
+    /// Its flags in Appendix G's order: `--reserve-vram <gb> --preview-method <method>`, then
+    /// `--enable-manager` when `manager`, then `--disable-dynamic-vram` unless `dynamic_vram`.
+    pub fn flags(&self) -> Vec<String> {
+        let mut flags = vec![
+            "--reserve-vram".to_string(),
+            self.reserve_vram_gb.clone(),
+            "--preview-method".to_string(),
+            self.preview_method.clone(),
+        ];
+        if self.manager {
+            flags.push("--enable-manager".to_string());
+        }
+        if !self.dynamic_vram {
+            flags.push("--disable-dynamic-vram".to_string());
+        }
+        flags
+    }
 }
 
 /// The table as written; unknown keys are left alone.
@@ -49,6 +103,65 @@ struct RawComfy {
     idle_free_after_s: Option<u64>,
     comfy_cli: Option<PathBuf>,
     pass_env: Option<Vec<String>>,
+    // The launch profile's keys are read from the TOML itself (`read_profile`): a bad one never
+    // makes the table invalid, and a non-finite float isn't lost to JSON's `null`.
+}
+
+/// The launch profile of a table's raw keys, each missing or invalid one at its default, and
+/// the invalid ones as `(key, why)` (Appendix G "ComfyUI launch profile").
+fn read_profile(table: &toml::Value) -> (LaunchProfile, Vec<(String, String)>) {
+    use toml::Value;
+    let mut profile = LaunchProfile::default();
+    let mut invalid = Vec::new();
+    let mut bad = |key: &str, value: &Value, why: &str| {
+        invalid.push((key.to_string(), format!("= {value} {why}")));
+    };
+    if let Some(v) = table.get("reserve_vram_gb") {
+        let text = match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Integer(n) => (*n >= 0).then(|| n.to_string()),
+            Value::Float(f) => (f.is_finite() && *f >= 0.0).then(|| f.to_string()),
+            _ => None,
+        };
+        match text.filter(|t| lil_schema::suite::is_reserve_vram_gb(t)) {
+            Some(text) => profile.reserve_vram_gb = text,
+            None => bad(
+                "reserve_vram_gb",
+                v,
+                &format!(
+                    "is not a number of gigabytes from 0 to {}, such as 1.5",
+                    lil_schema::suite::MAX_RESERVE_VRAM_GB
+                ),
+            ),
+        }
+    }
+    if let Some(v) = table.get("preview_method") {
+        match v.as_str() {
+            Some(m) if lil_schema::suite::PREVIEW_METHODS.contains(&m) => {
+                profile.preview_method = m.to_string();
+            }
+            _ => bad(
+                "preview_method",
+                v,
+                &format!(
+                    "is not one of {}",
+                    lil_schema::suite::PREVIEW_METHODS.join(", ")
+                ),
+            ),
+        }
+    }
+    for (key, slot) in [
+        ("manager", &mut profile.manager),
+        ("dynamic_vram", &mut profile.dynamic_vram),
+    ] {
+        if let Some(v) = table.get(key) {
+            match v.as_bool() {
+                Some(b) => *slot = b,
+                None => bad(key, v, "is not true or false"),
+            }
+        }
+    }
+    (profile, invalid)
 }
 
 impl ComfyConfig {
@@ -71,6 +184,7 @@ impl ComfyConfig {
         if raw.port == Some(0) {
             return Err("[engines.comfyui] port must be 1–65535".to_string());
         }
+        let (profile, profile_invalid) = read_profile(table);
         let mut pass_env = Vec::new();
         let mut pass_env_rejected = Vec::new();
         for entry in raw.pass_env.unwrap_or_default() {
@@ -89,6 +203,8 @@ impl ComfyConfig {
             comfy_cli: raw.comfy_cli,
             pass_env,
             pass_env_rejected,
+            profile,
+            profile_invalid,
         }))
     }
 
@@ -123,14 +239,28 @@ impl ComfyConfig {
     }
 
     /// The owned start's arguments after the Python: `main.py --listen 127.0.0.1 --port <port>
-    /// <extra_args>`.
+    /// <profile flags> <extra_args> --disable-assets` ([`LaunchProfile::flags`]): the last flag
+    /// wins over anything that would turn the asset catalogue on (ARCH-065).
     ///
     /// # Errors
     /// `comfyui.not_loopback` when `extra_args` holds `--listen` (or a prefix of it that
     /// Python's argparse would take for it, `--listen=…` included): ComfyUI takes the last one.
     /// `engine.not_configured` for `--port` in the same forms: the port is `port`, which the
-    /// suite also talks to, so another one would only make the start time out.
+    /// suite also talks to, so another one would only make the start time out; for the flags
+    /// that turn the asset catalogue on ([`refuse_enable_assets`]); and for a launch-profile key
+    /// whose value isn't valid, named.
     pub fn launch_args(&self) -> Result<Vec<OsString>, ErrorBody> {
+        refuse_enable_assets(&self.extra_args)?;
+        if let Some((key, why)) = self.profile_invalid.first() {
+            return Err(ErrorBody::new(
+                &codes::ENGINE_NOT_CONFIGURED,
+                format!(
+                    "[engines.comfyui] {key} {why}: the suite starts ComfyUI only with a valid \
+                     launch profile. Fix {key} in suite.toml, or remove it for its default."
+                ),
+                "",
+            ));
+        }
         if let Some(bad) = self.extra_args.iter().find(|a| is_flag(a, "--port")) {
             return Err(ErrorBody::new(
                 &codes::ENGINE_NOT_CONFIGURED,
@@ -158,8 +288,51 @@ impl ComfyConfig {
             .map(OsString::from)
             .collect();
         args.push(self.port.to_string().into());
+        args.extend(self.profile.flags().into_iter().map(OsString::from));
         args.extend(self.extra_args.iter().map(OsString::from));
+        args.push(DISABLE_ASSETS.into());
         Ok(args)
+    }
+}
+
+/// The last flag of every owned start: it wins over any flag that turns ComfyUI's asset
+/// catalogue on (ARCH-065; plan 4a ruling, 2026-10-24).
+pub const DISABLE_ASSETS: &str = "--disable-assets";
+
+/// The flags that turn ComfyUI's asset catalogue on, each with its shortest prefix the suite
+/// refuses: `--enable-assets` from `--enable-as`, and `--windows-standalone-build`, which also
+/// turns it on, from `--wi` (argparse takes any unique prefix).
+const CATALOGUE_ON: [(&str, &str); 2] = [
+    ("--enable-assets", "--enable-as"),
+    ("--windows-standalone-build", "--wi"),
+];
+
+/// `engine.not_configured` naming the first `extra_args` entry that is `--enable-assets` or a
+/// prefix of it from `--enable-as` on, or `--windows-standalone-build` or a prefix of it from
+/// `--wi` on, with or without `=<value>` (ARCH-065, ARCH-126): the suite never turns ComfyUI's
+/// asset catalogue on.
+///
+/// # Errors
+/// That refusal.
+pub fn refuse_enable_assets(extra_args: &[String]) -> Result<(), ErrorBody> {
+    let refused = extra_args.iter().find_map(|arg| {
+        let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+        CATALOGUE_ON
+            .iter()
+            .find(|(flag, shortest)| name.len() >= shortest.len() && flag.starts_with(name))
+            .map(|(flag, _)| (arg, *flag))
+    });
+    match refused {
+        Some((bad, flag)) => Err(ErrorBody::new(
+            &codes::ENGINE_NOT_CONFIGURED,
+            format!(
+                "[engines.comfyui] extra_args holds {bad:?} ({flag}), which turns on ComfyUI's \
+                 asset catalogue: the suite never does that (ARCH-065). Remove it from \
+                 extra_args."
+            ),
+            "",
+        )),
+        None => Ok(()),
     }
 }
 
@@ -274,6 +447,8 @@ mod tests {
                 comfy_cli: None,
                 pass_env: Vec::new(),
                 pass_env_rejected: Vec::new(),
+                profile: LaunchProfile::default(),
+                profile_invalid: Vec::new(),
             }
         );
         assert_eq!(ComfyConfig::from_suite_toml("theme = 'dark'\n"), Ok(None));

@@ -147,6 +147,7 @@ pub(crate) fn unsupported(default: Option<&str>, requested: &str, trace_id: &str
                 tool: SET_DEFAULT_ACTION.to_string(),
                 arguments: json!({ "path": requested }),
             }),
+            user_hint: None,
         }),
         ..ErrorBody::new(
             &WORKSPACE_UNSUPPORTED,

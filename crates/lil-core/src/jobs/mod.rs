@@ -123,7 +123,7 @@ use crate::pipeline::RecordPlan;
 use crate::state::StateDb;
 use crate::workspace::OpenWorkspace;
 
-pub use runner::{Jobs, cancelled_error};
+pub use runner::{Jobs, RETRY_ACTION, cancelled_error};
 
 /// The module the job tools declare.
 pub const JOBS_MODULE: &str = "jobs";

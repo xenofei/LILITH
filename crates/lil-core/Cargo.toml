@@ -31,6 +31,8 @@ toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+# The model-header readers of the inventory's families (CORE-164).
+lil-parse = { path = "../lil-parse" }
 lil-platform = { path = "../lil-platform" }
 lil-protocol = { path = "../lil-protocol" }
 lil-schema = { path = "../lil-schema" }

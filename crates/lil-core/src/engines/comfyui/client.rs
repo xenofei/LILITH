@@ -6,7 +6,8 @@
 //! ([`ComfyClient::state`]: `/api/jobs/{id}`, `/history/{id}`, `/queue`), `/view` streamed into
 //! a new file with its SHA-256 taken on the way, `/upload/image`, `/queue`, `/api/jobs`,
 //! `/object_info` and `/node_replacements`; for the outside-jobs poll, `/api/queue` and
-//! `/api/jobs/{id}`. The websocket is in [`super::ws`].
+//! `/api/jobs/{id}`; for the asset catalogue, `/api/features`. The websocket is in
+//! [`super::ws`].
 //!
 //! The client never uses a proxy and never follows a redirect (a 3xx is
 //! [`ComfyError::Protocol`]): every request goes straight to the loopback address, and only
@@ -20,10 +21,13 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::engines::Catalogue;
 use crate::store::fsops;
 
 /// How long one request may take, connection included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the asset-catalogue probe may take: it runs in a supervisor pass.
+pub const CATALOGUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a connection may take. A refused connection on Windows loopback isn't immediate (the
 /// stack retries it), so a probe of a stopped engine takes about this long, 2 s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -603,6 +607,31 @@ impl ComfyClient {
     /// [`ComfyError`].
     pub async fn node_replacements(&self) -> Result<Value, ComfyError> {
         self.get_json("node_replacements").await
+    }
+
+    /// Whether the asset catalogue is on, by `GET /api/features`'s `assets` boolean (ARCH-065;
+    /// Appendix G), within [`CATALOGUE_TIMEOUT`]: `Some` for an answer that stands
+    /// ([`Catalogue::Unknown`] for a missing route, an older ComfyUI's 404, or a JSON answer
+    /// without `assets`), `None` for any other failure (no connection, a timeout, another 4xx,
+    /// a 5xx, an answer that isn't JSON), so it may be asked again. `/api/assets` is never asked: ComfyUI registers it even when the catalogue
+    /// is off.
+    pub async fn asset_catalogue(&self) -> Option<Catalogue> {
+        let answer = tokio::time::timeout(CATALOGUE_TIMEOUT, self.get_json("api/features")).await;
+        match answer {
+            Ok(Ok(features)) => Some(match features.get("assets").and_then(Value::as_bool) {
+                Some(true) => Catalogue::On,
+                Some(false) => Catalogue::Off,
+                None => Catalogue::Unknown,
+            }),
+            // Only an older ComfyUI's missing route is final; every other failure (another 4xx,
+            // a 5xx, an answer that can't be read) is asked again (plan 4a ruling, 2026-10-24).
+            Ok(Err(ComfyError::Http(404, _))) => Some(Catalogue::Unknown),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "ComfyUI's /api/features did not answer; asked again later");
+                None
+            }
+            Err(_) => None,
+        }
     }
 }
 

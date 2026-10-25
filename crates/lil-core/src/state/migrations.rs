@@ -283,6 +283,22 @@ CREATE TABLE job_order (
     last_order INTEGER NOT NULL
 );";
 
+/// Suite migration 10: plan 4a's engine records (CORE-130, CORE-164; Appendix G "Model
+/// inventory report", "Engine environments"). `model_hashes.family` is the model family a
+/// file's header names (untrusted, ARCH-060; `NULL`: none), and `family_read` is 1 once the
+/// header gave its answer for the cached size, mtime and FileId, so a row from before this
+/// migration (0) has its header read once by the next inventory. `engine_captures` keeps each
+/// engine's environment captures (`capture` is the `EnvCapture` JSON), the newest 10 per
+/// engine; `captured_utc` is Unix milliseconds.
+const ENGINE_RECORDS: &str = "ALTER TABLE model_hashes ADD COLUMN family TEXT;
+ALTER TABLE model_hashes ADD COLUMN family_read INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE engine_captures (
+    engine TEXT NOT NULL,
+    captured_utc INTEGER NOT NULL,
+    capture TEXT NOT NULL,
+    PRIMARY KEY (engine, captured_utc)
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -294,6 +310,7 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     USAGE_PENDING,
     CAPS,
     JOBS_V2,
+    ENGINE_RECORDS,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
@@ -378,7 +395,11 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 9);
+        assert_eq!(SUITE_MIGRATIONS.len(), 10);
+        assert_eq!(
+            SUITE_MIGRATIONS[9], ENGINE_RECORDS,
+            "appended, never inserted"
+        );
         assert_eq!(WORKSPACE_MIGRATIONS.len(), 8);
         assert_eq!(SUITE_MIGRATIONS[8], JOBS_V2, "appended, never inserted");
         assert_eq!(WORKSPACE_MIGRATIONS[7], JOBS_V2, "appended, never inserted");

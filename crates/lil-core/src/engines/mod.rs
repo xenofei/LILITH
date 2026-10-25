@@ -3,11 +3,15 @@
 //! **owned** engine it started or an **attached** one someone else started.
 //!
 //! - **Owned.** [`Engines::start`] runs `<python> main.py --listen 127.0.0.1 --port <port>
-//!   <extra_args>` in `<root>`, in a kill-on-close Job Object, with its output in the core's
-//!   log (target `engine.comfyui`, ARCH-119) and a scrubbed environment
-//!   ([`scrubbed_env`], ARCH-063). `extra_args` holding `--listen` is refused before anything
-//!   starts. Once it answers `GET /system_stats`, every listening socket of every process in
-//!   its Job Object must be on loopback, read through the core's socket table
+//!   <profile flags> <extra_args> --disable-assets` in `<root>` (the launch profile,
+//!   [`LaunchProfile`], ARCH-126; the last flag keeps ComfyUI's asset catalogue off,
+//!   ARCH-065), in a kill-on-close Job Object, with its output in the core's log (target
+//!   `engine.comfyui`, ARCH-119) and a scrubbed environment ([`scrubbed_env`], ARCH-063).
+//!   `extra_args` holding `--listen`, `--port`, `--enable-assets` or
+//!   `--windows-standalone-build` (or a prefix argparse takes for one) is refused before
+//!   anything starts, as is a launch-profile value that isn't valid. Once it answers
+//!   `GET /system_stats`, every listening socket of every process in its Job Object must be
+//!   on loopback, read through the core's socket table
 //!   (`CoreConfig::sockets`), or the core stops it and fails with `comfyui.not_loopback`
 //!   (ARCH-068). An owned engine idle for `idle_free_after_s` with no suite job gets
 //!   `/free {unload_models: true, free_memory: true}`; it is stopped in the shutdown's
@@ -30,8 +34,10 @@
 //!
 //! - **Observation** ([`Engines::observe`]): outside jobs ([`comfyui::outside`]) keep the core
 //!   up and are waited for, never cancelled; each time ComfyUI becomes ready a `comfy.inventory`
-//!   job ([`comfyui::inventory`]) captures the environment and the model files; before the
-//!   POST, a prompt's graph is checked ([`comfyui::graph`]).
+//!   job ([`comfyui::inventory`]) captures the environment (kept in the suite `state.db`, the
+//!   newest 10, [`comfyui::environment`]) and the model files with their families; before the
+//!   POST, a prompt's graph is checked ([`comfyui::graph`]). The supervisor probes the asset
+//!   catalogue (`GET /api/features`) once each time the engine becomes ready (ARCH-065).
 //!
 //! The engine tools are in [`tools`] (registered by the server, since they need the running
 //! engines). The `engines` topic carries `{kind: "status", engine}`,
@@ -69,7 +75,9 @@ pub use comfyui::install::NodeInstallHandler;
 pub use comfyui::inventory::InventoryHandler;
 pub use comfyui::outside::OutsideWatch;
 pub use comfyui::supervisor::ComfyEndpoint;
-pub use config::{ComfyConfig, classify_pass_env, scrubbed_env};
+pub use config::{
+    ComfyConfig, LaunchProfile, classify_pass_env, refuse_enable_assets, scrubbed_env,
+};
 
 /// The module the engine tools declare.
 pub const ENGINES_MODULE: &str = "engines";
@@ -143,6 +151,46 @@ pub struct EngineStatus {
     /// The model inventory refreshed since the engine became ready ([`comfyui::inventory`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory: Option<InventoryStatus>,
+    /// The launch profile of an owned engine, or the one an owned start would use when no
+    /// engine runs; `null` for an attached engine or when ComfyUI isn't configured (ARCH-126;
+    /// Appendix G "ComfyUI launch profile").
+    pub launch_profile: Option<LaunchProfileStatus>,
+    /// Whether ComfyUI's asset catalogue is on (ARCH-065), probed once each time the engine
+    /// becomes ready; `unknown` until then.
+    pub asset_catalogue: Catalogue,
+}
+
+/// `engines.status`'s `launch_profile`: the profile's keys and the flags they give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LaunchProfileStatus {
+    pub reserve_vram_gb: String,
+    pub preview_method: String,
+    pub manager: bool,
+    pub dynamic_vram: bool,
+    pub flags: Vec<String>,
+}
+
+impl LaunchProfileStatus {
+    /// What `engines.status` shows of `profile`.
+    pub fn of(profile: &LaunchProfile) -> LaunchProfileStatus {
+        LaunchProfileStatus {
+            reserve_vram_gb: profile.reserve_vram_gb.clone(),
+            preview_method: profile.preview_method.clone(),
+            manager: profile.manager,
+            dynamic_vram: profile.dynamic_vram,
+            flags: profile.flags(),
+        }
+    }
+}
+
+/// Whether ComfyUI's asset catalogue is on, by `GET /api/features`'s `assets` boolean (ARCH-065;
+/// Appendix G): `unknown` when the request fails, the route is missing or the key is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Catalogue {
+    On,
+    Off,
+    Unknown,
 }
 
 /// `engines.status`'s `inventory`: how many model files, refreshed when (RFC 3339 UTC).

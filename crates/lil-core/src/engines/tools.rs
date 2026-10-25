@@ -6,6 +6,8 @@
 //! | `engines.start` | write | `{engine: "comfyui"}` | `{engine}` |
 //! | `engines.stop`, `engines.restart` | destructive | `{engine: "comfyui"}` | `{engine}`; `engine.attached` for an attached engine |
 //! | `engines.comfyui.install_node` | exec | `{id, version}` | `{job}` |
+//! | `models.report` | read | `{}` | [`ModelsReport`] (CORE-164) |
+//! | `engines.environment` | read | `{}` | [`EnvironmentView`] (CORE-130) |
 //!
 //! The effect classes are static (ARCH-051): stopping or restarting can kill outside jobs, and
 //! an install runs third-party code, so an agent's call waits for your confirmation. An engine
@@ -23,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::comfyui::install::{self, ExactVersion, NodeId};
-use super::comfyui::{PROMPT_KIND, comfy_estimate_key, prompt_spec};
+use super::comfyui::{
+    EnvironmentView, ModelsReport, PROMPT_KIND, comfy_estimate_key, environment, inventory,
+    prompt_spec,
+};
 use super::{ENGINES_MODULE, EngineStatus, Engines, unknown_engine};
 use crate::jobs::{EngineKind, EstimateKey, JobSummary, Priority};
 use crate::tools::{CallCtx, Registry, TEST_MODULE, typed_tool, with_estimate_key};
@@ -70,7 +75,17 @@ struct SubmitResult {
 const STATUS_DESCRIPTION: &str = "Returns each engine the core manages (ComfyUI): whether the core \
     started it (owned) or someone else did (attached), its state, URL, process, version, where it \
     listens, prompts from outside the suite (suite jobs wait for them), whether a node install \
-    needs a restart, and how many model files its inventory holds.";
+    needs a restart, how many model files its inventory holds, the launch profile an owned \
+    ComfyUI starts with, and whether ComfyUI's asset catalogue is on.";
+const REPORT_DESCRIPTION: &str = "Returns ComfyUI's model files from the newest inventory: each \
+    file's path, size, SHA-256, model family (from its header) and states: orphan (no \
+    registry/models.yaml entry has its hash), duplicate (another file has the same hash) and \
+    unknown_family; and the registry entries whose files are missing. registry says whether \
+    registry/models.yaml could be read; when it couldn't, nothing is called orphan or missing. \
+    Paths and families are untrusted. Nothing is moved or deleted.";
+const ENVIRONMENT_DESCRIPTION: &str = "Returns the newest two recorded environments of ComfyUI \
+    (system_stats, driver, the revision of ComfyUI and of each custom node), newest first, and \
+    what changed between them. The suite records environments; it never restores one.";
 const START_DESCRIPTION: &str = "Starts ComfyUI as an owned engine, from [engines.comfyui] in \
     suite.toml, listening on 127.0.0.1 only. A ComfyUI that already runs (started by the suite or \
     by you) is returned as it is.";
@@ -259,8 +274,8 @@ pub fn register_engine_test_tools(reg: &mut Registry) {
     }));
 }
 
-/// Registers `engines.status`, `engines.start`, `engines.stop`, `engines.restart` and
-/// `engines.comfyui.install_node` on `reg`.
+/// Registers `engines.status`, `engines.start`, `engines.stop`, `engines.restart`,
+/// `models.report`, `engines.environment` and `engines.comfyui.install_node` on `reg`.
 pub fn register_engine_tools(reg: &mut Registry, slot: &EnginesSlot) {
     let status_slot = slot.clone();
     reg.register(typed_tool(
@@ -301,6 +316,50 @@ pub fn register_engine_tools(reg: &mut Registry, slot: &EnginesSlot) {
         EffectClass::Destructive,
         Act::Restart,
     );
+    let report_slot = slot.clone();
+    reg.register(typed_tool(
+        "models.report",
+        REPORT_DESCRIPTION,
+        EffectClass::Read,
+        ENGINES_MODULE,
+        move |ctx, _args: NoArgs| {
+            let slot = report_slot.clone();
+            Box::pin(async move {
+                let engines = engines_of(&slot, ctx)?;
+                let report: ModelsReport = inventory::models_report(&engines)
+                    .await
+                    .map_err(|e| traced(e, ctx))?;
+                let summary = format!(
+                    "{} model file(s), {} missing",
+                    report.models.len(),
+                    report.missing.len()
+                );
+                Ok((report, summary))
+            })
+        },
+    ));
+    let environment_slot = slot.clone();
+    reg.register(typed_tool(
+        "engines.environment",
+        ENVIRONMENT_DESCRIPTION,
+        EffectClass::Read,
+        ENGINES_MODULE,
+        move |ctx, _args: NoArgs| {
+            let slot = environment_slot.clone();
+            Box::pin(async move {
+                let engines = engines_of(&slot, ctx)?;
+                let view: EnvironmentView = environment::environment(&engines)
+                    .await
+                    .map_err(|e| traced(e, ctx))?;
+                let summary = format!(
+                    "{} capture(s), {} change(s)",
+                    view.captures.len(),
+                    view.changes.len()
+                );
+                Ok((view, summary))
+            })
+        },
+    ));
     let install_slot = slot.clone();
     reg.register(typed_tool(
         install::INSTALL_TOOL,

@@ -69,11 +69,13 @@ fn owned_comfyui_starts_with_the_launch_profile() {
         .unwrap_or_else(|| panic!("no main.py in {argv:?}"));
     let after: Vec<&str> = argv[at + 1..].iter().map(String::as_str).collect();
     assert_eq!(after[..4], head[1..], "{argv:?}");
+    // Plan 4a ruling, 2026-10-24: an owned start always ends with --disable-assets.
     assert_eq!(
-        after[4..],
+        after[4..after.len() - 1],
         flags,
         "the profile flags, then no extra_args: {argv:?}"
     );
+    assert_eq!(after.last(), Some(&"--disable-assets"), "{argv:?}");
     assert!(
         !argv
             .iter()

@@ -722,6 +722,7 @@ fn link_external_refusal(ctx: &CallCtx, a: &Asset) -> ErrorBody {
             tool: "asset.collect".to_string(),
             arguments: json!({"project": a.project, "asset_id": a.asset_id}),
         }),
+        user_hint: None,
     });
     e
 }

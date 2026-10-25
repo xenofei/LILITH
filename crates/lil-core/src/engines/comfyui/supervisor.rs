@@ -32,8 +32,8 @@ use super::outside::{OutsideWatch, Suite};
 use super::uploads::Uploads;
 use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK};
 use crate::engines::{
-    COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, InventoryStatus, Listen, OutsideJobs,
-    TOPIC,
+    COMFYUI_ROLE, Catalogue, EngineClass, EngineState, EngineStatus, InventoryStatus,
+    LaunchProfileStatus, Listen, OutsideJobs, TOPIC,
 };
 use crate::events::EventBus;
 use crate::jobs::{EngineKind, Jobs};
@@ -41,6 +41,10 @@ use crate::meter::UsageSink;
 use crate::state::StateDb;
 use crate::telemetry::Telemetry;
 
+/// How long after a failed catalogue probe another may be made (plan 4a ruling, 2026-10-24).
+const CATALOGUE_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The most catalogue probes of one readiness epoch.
+const CATALOGUE_PROBES: u32 = 5;
 /// How often the supervisor sweeps the unused uploads.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// How often the supervisor asks `/system_stats`.
@@ -179,6 +183,22 @@ pub(crate) struct Comfy {
     graph_info: tokio::sync::Mutex<Option<(u64, Arc<GraphInfo>)>>,
     /// The model inventory refreshed in a readiness epoch.
     inventory: Mutex<Option<(u64, Arc<Inventory>)>>,
+    /// The newest inventory of this core run, whatever its epoch (`models.report`).
+    last_inventory: Mutex<Option<Arc<Inventory>>>,
+    /// The asset catalogue as probed in a readiness epoch (ARCH-065).
+    catalogue: Mutex<Option<CatalogueProbe>>,
+}
+
+/// The asset-catalogue probes of one readiness epoch.
+#[derive(Debug, Clone, Copy)]
+struct CatalogueProbe {
+    epoch: u64,
+    found: Catalogue,
+    /// An answer that stands: no more probes this epoch.
+    settled: bool,
+    attempts: u32,
+    /// When the last probe was made (the core's monotonic clock).
+    last: Duration,
 }
 
 /// What the graph checks need of one engine run: `/object_info` and `/node_replacements`
@@ -246,6 +266,8 @@ impl Comfy {
             ready: tokio::sync::watch::Sender::new((0, false)),
             graph_info: tokio::sync::Mutex::new(None),
             inventory: Mutex::new(None),
+            last_inventory: Mutex::new(None),
+            catalogue: Mutex::new(None),
         })
     }
 
@@ -402,6 +424,54 @@ impl Comfy {
                 models: u32::try_from(inv.files.len()).unwrap_or(u32::MAX),
                 refreshed: inv.refreshed.clone(),
             }),
+            launch_profile: self
+                .config
+                .as_ref()
+                .filter(|_| v.class != EngineClass::Attached)
+                .map(|c| LaunchProfileStatus::of(&c.profile)),
+            asset_catalogue: self.catalogue_now(v.state),
+        }
+    }
+
+    /// The catalogue probed since the engine last became ready; `unknown` before that, or when
+    /// it isn't ready.
+    fn catalogue_now(&self, state: EngineState) -> Catalogue {
+        let epoch = self.ready_epoch();
+        match *lock(&self.catalogue) {
+            Some(p) if p.epoch == epoch && state == EngineState::Ready => p.found,
+            _ => Catalogue::Unknown,
+        }
+    }
+
+    /// Probes the asset catalogue when the engine becomes ready (ARCH-065; Appendix G), and
+    /// again after a probe that failed to connect, timed out or got a 5xx, at least
+    /// [`CATALOGUE_RETRY_AFTER`] later and at most [`CATALOGUE_PROBES`] times per readiness
+    /// epoch, until an answer stands; publishes the status once it is `on` or `off`. Called by a
+    /// supervisor pass that found the engine ready.
+    async fn probe_catalogue(&self, client: &ComfyClient) {
+        let epoch = self.ready_epoch();
+        let now = self.clock.monotonic();
+        let before = (*lock(&self.catalogue)).filter(|p| p.epoch == epoch);
+        let due = before.is_none_or(|p| {
+            !p.settled
+                && p.attempts < CATALOGUE_PROBES
+                && now.saturating_sub(p.last) >= CATALOGUE_RETRY_AFTER
+        });
+        if epoch == 0 || !due {
+            return;
+        }
+        let answer = client.asset_catalogue().await;
+        let found = answer.unwrap_or(Catalogue::Unknown);
+        *lock(&self.catalogue) = Some(CatalogueProbe {
+            epoch,
+            found,
+            settled: answer.is_some(),
+            attempts: before.map_or(1, |p| p.attempts + 1),
+            last: now,
+        });
+        tracing::info!(catalogue = ?found, settled = answer.is_some(), "ComfyUI's asset catalogue was probed");
+        if found != Catalogue::Unknown {
+            self.publish("status");
         }
     }
 
@@ -498,6 +568,14 @@ impl Comfy {
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
     }
 
+    /// Now, in milliseconds since 1970, by the core's clock.
+    pub(crate) fn now_ms(&self) -> i64 {
+        self.clock
+            .utc_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    }
+
     /// Now, RFC 3339 UTC, by the core's clock.
     pub(crate) fn now_rfc3339(&self) -> String {
         lil_schema::time::rfc3339(self.now_secs())
@@ -511,9 +589,16 @@ impl Comfy {
     /// Keeps the inventory a job refreshed in readiness `epoch`, unless the engine became ready
     /// again since.
     pub(crate) fn set_inventory(&self, epoch: u64, inventory: Inventory) {
+        let inventory = Arc::new(inventory);
+        *lock(&self.last_inventory) = Some(inventory.clone());
         if epoch == self.ready_epoch() {
-            *lock(&self.inventory) = Some((epoch, Arc::new(inventory)));
+            *lock(&self.inventory) = Some((epoch, inventory));
         }
+    }
+
+    /// The newest inventory of this core run, even of an engine that has stopped since.
+    pub(crate) fn last_inventory(&self) -> Option<Arc<Inventory>> {
+        lock(&self.last_inventory).clone()
     }
 
     /// The inventory refreshed since the engine last became ready, if any.
@@ -740,6 +825,7 @@ impl Comfy {
                         version: version_of(&stats),
                     });
                 }
+                self.probe_catalogue(client).await;
                 self.idle_free(config, client).await;
             }
             (Some((launcher, _)), Err(e)) => {
@@ -787,6 +873,8 @@ impl Comfy {
                         self.set_view(v);
                     }
                 }
+                drop(ops);
+                self.probe_catalogue(client).await;
             }
             (None, Err(_)) => {
                 let Ok(ops) = self.ops.try_lock() else {
@@ -945,8 +1033,6 @@ impl Comfy {
 
     pub(crate) async fn start(&self) -> Result<EngineStatus, ErrorBody> {
         let (config, client) = self.configured()?;
-        // Refused before anything starts (ARCH-068).
-        let args = config.launch_args()?;
         let cancel = lock(&self.start_cancel).clone();
         let mut ops = self.ops.lock().await;
         if ops.as_ref().is_some_and(Owned::running) {
@@ -965,6 +1051,9 @@ impl Comfy {
             self.observe_attached(config.port, &stats).await;
             return Ok(self.status());
         }
+        // Refused before anything starts (ARCH-068, ARCH-065); a ComfyUI already running was
+        // attached above whatever the launch profile says (plan 4a ruling, 2026-10-24).
+        let args = config.launch_args()?;
         let root = config.root.clone().filter(|r| r.is_dir()).ok_or_else(|| {
             not_configured(
                 "[engines.comfyui] root is not set or is not a folder: the core starts ComfyUI \

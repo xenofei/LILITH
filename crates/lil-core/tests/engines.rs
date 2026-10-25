@@ -416,7 +416,12 @@ fn launch_args_pin_loopback_and_refuse_listen_in_extra_args() {
             "127.0.0.1",
             "--port",
             "8190",
-            "--lowvram"
+            "--reserve-vram",
+            "1.5",
+            "--preview-method",
+            "taesd",
+            "--lowvram",
+            "--disable-assets"
         ]
     );
     for extra in [
@@ -439,6 +444,406 @@ fn launch_args_pin_loopback_and_refuse_listen_in_extra_args() {
         let refused = config.launch_args().unwrap_err();
         assert_eq!(refused.code, "engine.not_configured", "{extra}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The launch profile and the asset catalogue (ARCH-065, ARCH-126; Appendix G).
+// ---------------------------------------------------------------------------------------------
+
+/// The owned start's arguments for a `[engines.comfyui]` holding `lines`.
+#[allow(
+    clippy::result_large_err,
+    reason = "the wire ErrorBody, as launch_args returns it"
+)]
+fn args_of(lines: &str) -> Result<Vec<String>, lil_protocol::ErrorBody> {
+    let config = ComfyConfig::from_suite_toml(&format!("[engines.comfyui]\nport = 8190\n{lines}"))
+        .unwrap()
+        .unwrap();
+    config
+        .launch_args()
+        .map(|args| args.into_iter().map(|a| a.into_string().unwrap()).collect())
+}
+
+/// What follows `--port 8190` in the owned start's arguments, up to the `--disable-assets`
+/// every one ends with.
+fn after_port(lines: &str) -> Vec<String> {
+    let args = args_of(lines).unwrap();
+    assert_eq!(
+        args[..5],
+        ["main.py", "--listen", "127.0.0.1", "--port", "8190"]
+    );
+    assert_eq!(args.last().map(String::as_str), Some("--disable-assets"));
+    args[5..args.len() - 1].to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-126
+async fn owned_start_flags_follow_the_profile() {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-profile", false, false);
+    let port = own(&env, &root, "extra_args = ['--lowvram']\n");
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let started = engines.start(EngineKind::ComfyUi).await.unwrap();
+    assert_eq!(started.class, EngineClass::Owned);
+
+    let argv: Vec<String> = recorded(&root.join("fake-comfyui.json"), "listen")["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    let port = port.to_string();
+    assert_eq!(
+        argv[1..],
+        [
+            "main.py",
+            "--listen",
+            "127.0.0.1",
+            "--port",
+            port.as_str(),
+            "--reserve-vram",
+            "1.5",
+            "--preview-method",
+            "taesd",
+            "--lowvram",
+            "--disable-assets"
+        ],
+        "the profile's flags, then extra_args, then the catalogue kept off"
+    );
+    let shown = serde_json::to_value(&started).unwrap();
+    assert_eq!(
+        shown["launch_profile"],
+        json!({"reserve_vram_gb": "1.5", "preview_method": "taesd", "manager": false,
+               "dynamic_vram": true,
+               "flags": ["--reserve-vram", "1.5", "--preview-method", "taesd"]}),
+        "{shown}"
+    );
+    engines.stop(EngineKind::ComfyUi).await.unwrap();
+}
+
+#[test] // spec: ARCH-126
+fn manager_flag_only_when_on() {
+    let profile = ["--reserve-vram", "1.5", "--preview-method", "taesd"];
+    assert_eq!(after_port(""), profile);
+    assert_eq!(after_port("manager = false\n"), profile);
+    assert_eq!(
+        after_port("manager = true\nreserve_vram_gb = '2.25'\npreview_method = 'latent2rgb'\n"),
+        [
+            "--reserve-vram",
+            "2.25",
+            "--preview-method",
+            "latent2rgb",
+            "--enable-manager"
+        ]
+    );
+    // The Manager flag comes before the dynamic-VRAM opt-out, and both before extra_args.
+    assert_eq!(
+        after_port("manager = true\ndynamic_vram = false\nextra_args = ['--lowvram']\n"),
+        [
+            "--reserve-vram",
+            "1.5",
+            "--preview-method",
+            "taesd",
+            "--enable-manager",
+            "--disable-dynamic-vram",
+            "--lowvram"
+        ]
+    );
+}
+
+#[test] // spec: ARCH-126
+fn dynamic_vram_opt_out_only_when_off() {
+    let profile = ["--reserve-vram", "1.5", "--preview-method", "taesd"];
+    assert_eq!(after_port("dynamic_vram = true\n"), profile);
+    assert_eq!(
+        after_port("dynamic_vram = false\n"),
+        [
+            "--reserve-vram",
+            "1.5",
+            "--preview-method",
+            "taesd",
+            "--disable-dynamic-vram"
+        ]
+    );
+}
+
+/// A bad launch-profile value refuses only an owned start, naming its key; the table stays
+/// valid, the key shows its default, and a ComfyUI already running is attached (plan 4a
+/// ruling, 2026-10-24). `reserve_vram_gb` takes a TOML number too, up to 256.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-126
+async fn a_bad_profile_value_refuses_only_an_owned_start() {
+    for (line, key) in [
+        ("reserve_vram_gb = 'lots'\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = '-1'\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = '1.2.3'\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = ''\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = '256.5'\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = 300\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = -1.0\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = inf\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = nan\n", "reserve_vram_gb"),
+        ("reserve_vram_gb = true\n", "reserve_vram_gb"),
+        ("preview_method = 'fast'\n", "preview_method"),
+        ("dynamic_vram = 'no'\n", "dynamic_vram"),
+        ("manager = 1\n", "manager"),
+    ] {
+        let text = format!("[engines.comfyui]\nroot = 'C:\\comfy'\n{line}");
+        let config = ComfyConfig::from_suite_toml(&text)
+            .unwrap_or_else(|e| panic!("{line}: {e}"))
+            .unwrap();
+        assert_eq!(
+            config.profile,
+            lil_core::engines::LaunchProfile::default(),
+            "{line}"
+        );
+        let refused = config.launch_args().unwrap_err();
+        assert_eq!(refused.code, "engine.not_configured", "{line}");
+        assert!(refused.message.contains(key), "{line}: {}", refused.message);
+    }
+    for (line, gb) in [
+        ("reserve_vram_gb = '0'\n", "0"),
+        ("reserve_vram_gb = '0.5'\n", "0.5"),
+        ("reserve_vram_gb = '256'\n", "256"),
+        ("reserve_vram_gb = '1.'\n", "1."),
+        ("reserve_vram_gb = '.5'\n", ".5"),
+        ("reserve_vram_gb = 1.5\n", "1.5"),
+        ("reserve_vram_gb = 2\n", "2"),
+        ("reserve_vram_gb = 0.75\n", "0.75"),
+    ] {
+        let flags = after_port(line);
+        assert_eq!(flags[..2], ["--reserve-vram", gb], "{line}");
+    }
+
+    // Attached: the bad value changes nothing.
+    let fake = FakeComfy::start();
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let text = std::fs::read_to_string(env.env.suite_toml()).unwrap();
+    env.suite_toml_set(&format!("{text}preview_method = 'fast'\n"));
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let started = engines.start(EngineKind::ComfyUi).await.unwrap();
+    assert_eq!(started.class, EngineClass::Attached);
+    assert_eq!(started.state, EngineState::Ready);
+
+    // Owned: refused before anything starts, naming the key; the status shows the default.
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-bad-profile", false, false);
+    own(&env, &root, "reserve_vram_gb = 'lots'\n");
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let refused = engines.start(EngineKind::ComfyUi).await.unwrap_err();
+    assert_eq!(refused.code, "engine.not_configured", "{refused:?}");
+    assert!(refused.message.contains("reserve_vram_gb"), "{refused:?}");
+    assert!(
+        !root.join("fake-comfyui.json").exists(),
+        "no process started"
+    );
+    let shown = serde_json::to_value(engines.status().await.remove(0)).unwrap();
+    assert_eq!(shown["launch_profile"]["reserve_vram_gb"], "1.5", "{shown}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-065, ARCH-126
+async fn enable_assets_in_extra_args_is_refused() {
+    for flag in [
+        "--enable-assets",
+        "--enable-asse",
+        "--enable-as",
+        "--enable-assets=1",
+        "--windows-standalone-build",
+        "--windows-st",
+        "--wi",
+        "--windows-standalone-build=1",
+    ] {
+        let refused = args_of(&format!("extra_args = ['--lowvram', '{flag}']\n")).unwrap_err();
+        assert_eq!(refused.code, "engine.not_configured", "{flag}");
+        assert!(
+            refused.message.contains(flag),
+            "{flag}: {}",
+            refused.message
+        );
+        let direct = lil_core::engines::config::refuse_enable_assets(&[flag.to_string()]);
+        assert_eq!(direct.unwrap_err().code, "engine.not_configured", "{flag}");
+    }
+    // Other flags, and prefixes too short to be it, are left to ComfyUI.
+    for other in [
+        "--enable-a",
+        "--enable-asset-hashing",
+        "--disable-assets",
+        "--enable-manager",
+        "--enable-assetsx",
+        "--w",
+        "--whitelist-custom-nodes",
+        "--windows-standalone-buildx",
+    ] {
+        assert!(
+            lil_core::engines::config::refuse_enable_assets(&[other.to_string()]).is_ok(),
+            "{other}"
+        );
+    }
+    // A refused start starts nothing.
+    for flag in ["--enable-assets", "--windows-standalone-build"] {
+        let env = TestEnv::new();
+        let root = comfy_root(&env, "comfy-assets", false, false);
+        own(&env, &root, &format!("extra_args = ['{flag}']\n"));
+        let rig = Rig::new(env);
+        let engines = rig.engines(Arc::new(OsSockets));
+        let refused = engines.start(EngineKind::ComfyUi).await.unwrap_err();
+        assert_eq!(refused.code, "engine.not_configured", "{refused:?}");
+        assert!(refused.message.contains(flag), "{refused:?}");
+        assert!(
+            !root.join("fake-comfyui.json").exists(),
+            "no process started"
+        );
+    }
+    // Whatever extra_args hold, an owned start ends with --disable-assets, which wins.
+    for extra in [
+        "",
+        "extra_args = ['--lowvram']\n",
+        "extra_args = ['--disable-assets']\n",
+    ] {
+        let args = args_of(extra).unwrap();
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--disable-assets"),
+            "{extra}"
+        );
+    }
+}
+
+/// The count of `GET /api/features` the fake received.
+fn probes(fake: &FakeComfy) -> usize {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.path == "/api/features")
+        .count()
+}
+
+/// A probe that failed (no answer, a 5xx) is made again on a later pass, 30 s on, at most 5
+/// times while the engine stays ready, until an answer stands; a 404 stands at once; a new
+/// readiness probes again (plan 4a ruling, 2026-10-24).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-065
+async fn a_failed_catalogue_probe_is_made_again_at_most_5_times() {
+    let fake = FakeComfy::start();
+    fake.set_features(500, json!({"error": "broken"}));
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let catalogue =
+        |e: &lil_core::engines::EngineStatus| serde_json::to_value(e.asset_catalogue).unwrap();
+    engines.tick().await;
+    assert_eq!(probes(&fake), 1);
+    engines.tick().await;
+    assert_eq!(probes(&fake), 1, "not again before 30 s");
+    for n in 2..=5 {
+        rig.clock.advance(Duration::from_secs(30));
+        engines.tick().await;
+        until(&format!("probe {n}"), || probes(&fake) == n).await;
+    }
+    rig.clock.advance(Duration::from_secs(60));
+    engines.tick().await;
+    engines.tick().await;
+    assert_eq!(probes(&fake), 5, "at most 5 per readiness");
+    assert_eq!(catalogue(&engines.status().await[0]), "unknown");
+
+    // A new readiness probes again; a probe that then succeeds ends it, and is shown.
+    fake.refuse_http(true);
+    engines.tick().await;
+    assert_ne!(engines.status().await[0].state, EngineState::Ready);
+    fake.refuse_http(false);
+    fake.set_features(503, json!({}));
+    engines.tick().await;
+    assert_eq!(engines.status().await[0].state, EngineState::Ready);
+    until("probe 6", || probes(&fake) == 6).await;
+    fake.set_features(200, json!({"assets": true}));
+    rig.clock.advance(Duration::from_secs(30));
+    engines.tick().await;
+    until("probe 7", || probes(&fake) == 7).await;
+    assert_eq!(catalogue(&engines.status().await[0]), "on");
+    rig.clock.advance(Duration::from_secs(60));
+    engines.tick().await;
+    assert_eq!(probes(&fake), 7, "an answer stands");
+
+    // A 404 is a final unknown.
+    let fake = FakeComfy::start();
+    fake.set_features(404, json!({"error": "not found"}));
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    engines.tick().await;
+    rig.clock.advance(Duration::from_secs(60));
+    engines.tick().await;
+    assert_eq!(probes(&fake), 1, "a 404 stands");
+    assert_eq!(catalogue(&engines.status().await[0]), "unknown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-065, ARCH-126
+async fn engines_status_shows_the_launch_profile_and_the_catalogue() {
+    for (status, body, want) in [
+        (
+            200,
+            json!({"assets": true, "supports_preview_metadata": true}),
+            "on",
+        ),
+        (200, json!({"assets": false}), "off"),
+        (200, json!({"supports_preview_metadata": true}), "unknown"),
+        (404, json!({"error": "not found"}), "unknown"),
+        (500, json!({"error": "broken"}), "unknown"),
+    ] {
+        let fake = FakeComfy::start();
+        fake.set_features(status, body.clone());
+        let env = TestEnv::new();
+        attach(&env, fake.port(), &fake.root());
+        let rig = Rig::new(env);
+        let engines = rig.engines(Arc::new(OsSockets));
+        engines.tick().await;
+        let shown = serde_json::to_value(engines.status().await.remove(0)).unwrap();
+        assert_eq!(shown["class"], "attached", "{shown}");
+        assert_eq!(shown["asset_catalogue"], want, "{status} {body}: {shown}");
+        assert!(
+            shown
+                .as_object()
+                .is_some_and(|o| o.get("launch_profile") == Some(&Value::Null)),
+            "an attached engine's profile is null: {shown}"
+        );
+        let probes = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/api/features")
+            .count();
+        assert_eq!(probes, 1, "probed once while it stays ready");
+        engines.tick().await;
+        let again = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/api/features" || r.path.starts_with("/api/assets"))
+            .count();
+        assert_eq!(again, 1, "never /api/assets, and no second probe");
+    }
+
+    // No engine runs: the profile an owned start would use, and no catalogue.
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-stopped", false, false);
+    own(&env, &root, "dynamic_vram = false\n");
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let shown = serde_json::to_value(engines.status().await.remove(0)).unwrap();
+    assert_eq!(shown["class"], "none", "{shown}");
+    assert_eq!(shown["asset_catalogue"], "unknown", "{shown}");
+    assert_eq!(
+        shown["launch_profile"]["flags"],
+        json!([
+            "--reserve-vram",
+            "1.5",
+            "--preview-method",
+            "taesd",
+            "--disable-dynamic-vram"
+        ]),
+        "{shown}"
+    );
+    assert_eq!(shown["launch_profile"]["dynamic_vram"], false, "{shown}");
 }
 
 #[test] // spec: ARCH-063, QA-032
@@ -1147,10 +1552,12 @@ fn engine_tools_have_the_declared_effects() {
         .collect();
     let want = [
         ("engines.comfyui.install_node", EffectClass::Exec),
+        ("engines.environment", EffectClass::Read),
         ("engines.restart", EffectClass::Destructive),
         ("engines.start", EffectClass::Write),
         ("engines.status", EffectClass::Read),
         ("engines.stop", EffectClass::Destructive),
+        ("models.report", EffectClass::Read),
     ];
     assert_eq!(
         effects,
@@ -1664,4 +2071,46 @@ async fn restart_cancels_a_start_in_progress() {
     assert_eq!(first.unwrap_err().code, "comfyui.start_failed");
     gone_async(pid).await;
     engines.stop(EngineKind::ComfyUi).await.unwrap();
+}
+
+/// Only a 404, or a JSON answer without `assets`, ends the probing; another 4xx or an answer
+/// that can't be read is probed again like a 5xx (plan 4a ruling, 2026-10-24, fix round 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-065
+async fn other_4xx_and_unreadable_answers_are_probed_again() {
+    for (status, text) in [
+        (429, r#"{"error": "busy"}"#),
+        (408, r#"{"error": "slow"}"#),
+        (403, r#"{"error": "no"}"#),
+        (200, r#"{"assets": tr"#),
+        (200, "not json"),
+    ] {
+        let fake = FakeComfy::start();
+        fake.set_features_text(status, text);
+        let env = TestEnv::new();
+        attach(&env, fake.port(), &fake.root());
+        let rig = Rig::new(env);
+        let engines = rig.engines(Arc::new(OsSockets));
+        engines.tick().await;
+        assert_eq!(probes(&fake), 1, "{status} {text}");
+        fake.set_features(200, json!({"assets": false}));
+        rig.clock.advance(Duration::from_secs(30));
+        engines.tick().await;
+        until(&format!("{status} {text} probed again"), || {
+            probes(&fake) == 2
+        })
+        .await;
+        let shown = serde_json::to_value(engines.status().await.remove(0)).unwrap();
+        assert_eq!(shown["asset_catalogue"], "off", "{status} {text}: {shown}");
+    }
+    // A JSON answer without `assets` stands, as a 404 does.
+    let fake = FakeComfy::start();
+    fake.set_features(200, json!({"supports_preview_metadata": true}));
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    engines.tick().await;
+    rig.clock.advance(Duration::from_secs(60));
+    engines.tick().await;
+    assert_eq!(probes(&fake), 1, "an answer without assets stands");
 }
