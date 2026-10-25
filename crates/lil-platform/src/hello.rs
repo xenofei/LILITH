@@ -25,7 +25,8 @@
 //! inside it from a real mouse, touch, pen or touchpad, on its own thread ([`arms_accept`]:
 //! `GetCurrentInputMessageSource` is `IMO_HARDWARE` with a pointer device, `InSendMessage` is
 //! false), after a real press on it that, for a mouse or touchpad, followed a real hover of
-//! [`HOVER_BEFORE_PRESS`] ([`PressTracker`]); and only a `BN_CLICKED` from that button's own
+//! [`HOVER_BEFORE_PRESS`] ([`PressTracker`]: real pointer moves that put the cursor on it, judged
+//! with every other gate in [`ClickGate`], Task 28c); and only a `BN_CLICKED` from that button's own
 //! window counts, so a posted or sent `WM_COMMAND`, `BM_CLICK`, UI Automation's Invoke,
 //! `SendInput` and any key (Space, Enter) are ignored. The buttons work only once the window
 //! has been in front for [`BUTTONS_LIVE_AFTER`] of real time ([`LiveClock`]), and stop when it
@@ -82,8 +83,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MonitorFromWindow, ScreenToClient,
+    DEFAULT_GUI_FONT, GetMonitorInfoW, GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::Cryptography::{
@@ -1345,9 +1346,15 @@ pub enum Refusal {
     NotPointer,
     /// No real press on the button came before the release ([`PressTracker`]).
     NoRealPress,
-    /// A mouse or touchpad press before the pointer had rested on the button for
-    /// [`HOVER_BEFORE_PRESS`] ([`PressTracker`]).
+    /// A mouse or touchpad press less than [`HOVER_BEFORE_PRESS`] after real pointer moves
+    /// brought the cursor onto the button ([`PressTracker`]).
     NoRest,
+    /// A mouse or touchpad press with no real pointer move onto the button since the rest was
+    /// last ended: the cursor got there by a warp, by the window or the button sliding under
+    /// it, or (Task 28c) under a still hand after something Windows itself reports as a move
+    /// (the window coming to the top, the button turning on, a click's release), which can't
+    /// be told from a warp ([`PressTracker`]).
+    NoMove,
 }
 
 impl Refusal {
@@ -1359,27 +1366,35 @@ impl Refusal {
             Refusal::NotPointer => "not_pointer",
             Refusal::NoRealPress => "no_real_press",
             Refusal::NoRest => "no_rest",
+            Refusal::NoMove => "no_move",
         }
     }
 
-    /// The status line for it (pure): which gate refused and what to do next, nothing else.
-    /// `accept` is the button's own label ("Merge", "Approve").
+    /// The status line for it (pure): which gate refused and exactly what to do next, nothing
+    /// else. `accept` is the button's own label ("Merge", "Approve"). A still hand can't start
+    /// the rest (Task 28c), so every message that leads to another click says to move the
+    /// pointer a little on the button first; that works whatever Windows reports for its own
+    /// moves.
     pub fn message(self, accept: &str) -> String {
         match self {
             Refusal::NotInFront => format!(
-                "That click brought this window to the front. Wait a moment for the buttons to turn on, then click {accept}."
+                "That click brought this window to the front. When the buttons turn on, move the pointer a little on {accept}, then click it."
             ),
-            Refusal::NotLiveYet => {
-                "Wait a moment: the buttons turn on a second after this window comes to the front."
-                    .to_owned()
-            }
+            Refusal::NotLiveYet => format!(
+                "Wait a moment: the buttons turn on a second after this window comes to the front. Then move the pointer a little on {accept} and click it."
+            ),
             Refusal::NotPointer => format!(
                 "That click didn't come from your mouse or touchpad, so it didn't count. Click {accept} with the pointer."
             ),
             Refusal::NoRealPress => format!(
                 "Press and release on {accept} itself: a press that started somewhere else doesn't count."
             ),
-            Refusal::NoRest => format!("Rest the pointer on {accept} for a moment, then click."),
+            Refusal::NoRest => format!(
+                "That click came too soon: move the pointer a little on {accept}, pause a moment, then click it."
+            ),
+            Refusal::NoMove => {
+                format!("Move the pointer a little on {accept}, then click it.")
+            }
         }
     }
 }
@@ -1557,19 +1572,30 @@ impl PressTracker {
     /// A `WM_LBUTTONDOWN` (or double-click) to the button; `real` as for [`Self::on_move`].
     /// A mouse or touchpad press counts only after [`HOVER_BEFORE_PRESS`]; touch and pen press
     /// where the contact is, not at the cursor, so they need no hover.
+    /// A press with no hover at all is [`Refusal::NoMove`], one too soon [`Refusal::NoRest`].
     pub fn on_press(&mut self, real: bool, device: InputDevice, now: Instant) {
         let rested = match device {
-            InputDevice::Touch | InputDevice::Pen => true,
-            _ => self
-                .hover_since
-                .and_then(|since| now.checked_duration_since(since))
-                .is_some_and(|d| d >= HOVER_BEFORE_PRESS),
+            InputDevice::Touch | InputDevice::Pen => Ok(()),
+            _ => match self.hover_since {
+                None => Err(Refusal::NoMove),
+                Some(since) => now
+                    .checked_duration_since(since)
+                    .is_some_and(|d| d >= HOVER_BEFORE_PRESS)
+                    .then_some(())
+                    .ok_or(Refusal::NoRest),
+            },
         };
-        self.press = Some(match (real, rested) {
-            (false, _) => Err(Refusal::NoRealPress),
-            (true, false) => Err(Refusal::NoRest),
-            (true, true) => Ok(()),
+        self.press = Some(if real {
+            rested
+        } else {
+            Err(Refusal::NoRealPress)
         });
+    }
+
+    /// The press is used up and the rest stays: the accept button's own release of the
+    /// capture after a real release inside it (Task 28c). A click doesn't move the cursor.
+    pub fn drop_press(&mut self) {
+        self.press = None;
     }
 
     /// A `WM_LBUTTONUP` to the button: `Ok` when a real press preceded it, otherwise the gate
@@ -1618,7 +1644,8 @@ pub fn is_real_pointer(origin: InputOrigin, device: InputDevice, sent: bool) -> 
 /// `SetCursorPos` warp's included) starts the rest again ([`PressTracker::on_move`]). It also
 /// needs `moved` ([`cursor_moved`], Task 28b review m1): the window or the button sliding under
 /// a still cursor makes Windows send a move, and that move never counts, whatever origin it
-/// reports.
+/// reports. Since Task 28c the live button's own moves are judged by the same rule, with `moved`
+/// against the last move the window saw ([`ClickGate`]).
 pub fn grey_rest_move(
     over_grey_accept: bool,
     moved: bool,
@@ -1634,6 +1661,245 @@ pub fn grey_rest_move(
 /// as not moved.
 pub fn cursor_moved(at_restart: Option<(i32, i32)>, now: (i32, i32)) -> bool {
     at_restart.is_some_and(|then| then != now)
+}
+
+/// A pointer message as the click gate judges it: where it came from, and where the cursor
+/// really is (`GetCursorPos` when the message is handled, never the message's own point, which
+/// a program that posts or sends it chooses: Task 28c review I1). `None` when it can't be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerMsg {
+    pub origin: InputOrigin,
+    pub device: InputDevice,
+    /// Sent from another thread or process (`InSendMessage`).
+    pub sent: bool,
+    pub at: Option<(i32, i32)>,
+}
+
+impl PointerMsg {
+    fn real(self) -> bool {
+        is_real_pointer(self.origin, self.device, self.sent)
+    }
+
+    /// An input message Windows itself queued (hardware, injected or its own), not one another
+    /// program posted or sent: only those say where the cursor is (review I1).
+    fn is_input(self) -> bool {
+        !self.sent && self.origin != InputOrigin::Unavailable
+    }
+}
+
+/// The asking window's click gates in one place (Task 28c; pure: the window procedure gathers
+/// what Windows says and delegates every decision here, so a replay of a whole click sequence
+/// tests what the window runs). It holds the live clock, the accept button's press and rest,
+/// where the cursor was at the last move or restart, and whether the next left press is the one
+/// that brought the window to the front.
+///
+/// **What counts towards the rest.** Only a real pointer move (hardware, a pointer device, not
+/// sent) on the accept button that put the cursor somewhere new: its screen position differs
+/// from the last move's, or from where the cursor was at the last restart of the delay. Any
+/// other move there, and a move elsewhere, ends the rest. A hardware-reported move at the same
+/// position ends nothing and counts for nothing (Task 28c): Windows makes such moves itself
+/// under a still cursor (the window coming to the top, the button turning on, a capture
+/// released), and what it reports for them is undocumented, so they never start a rest. That
+/// keeps a slide, and a warp followed by Windows' own move, from counting even if that move
+/// reports hardware, as far as this window knows where the cursor was (below): after a leave,
+/// or with no leave armed, it can't know, so the position is then unknown. Whether Windows' own
+/// moves report hardware is still to be measured (Task 28 check 11, Task 28c review I2). **Open
+/// under Hardware** (re-review N1, a documented residual): a warp that Windows merges with one
+/// of its own moves arrives as a single move at a new place; if that reports hardware it counts,
+/// and no `GetCursorPos` rule can tell it from the hand. Closing it needs raw input (backlog,
+/// Task 28c option (b)); the test `replay_a_warp_merged_with_windows_own_move_is_open_under_hardware`
+/// pins it. Every unlock still needs the owner's PIN at the Windows Hello prompt. A move
+/// that isn't hardware still ends the rest even at the same position: after
+/// moves this window never saw (the cursor over another window, or moves Windows merged into
+/// one), a warp back to the very same pixel can't be told from a still hand.
+///
+/// **Where the cursor was** (Task 28c review I1, I2). The position is `GetCursorPos`, recorded
+/// only from input messages, never from a posted or sent move. After a `WM_MOUSELEAVE`, and
+/// while `TME_LEAVE` isn't armed on the window or the button that got the move, it is unknown:
+/// the cursor may have moved where this window never saw it, so the first move back only
+/// records it. The procedures arm `TME_LEAVE` on every move they get.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClickGate {
+    live: LiveClock,
+    press: PressTracker,
+    /// The cursor's screen position at the last move this window saw, or at the last restart
+    /// (Task 28b review m1). `None` when it couldn't be read: then no move counts until one
+    /// whose position is known.
+    last_at: Option<(i32, i32)>,
+    /// `WM_MOUSEACTIVATE` for a left press came; each live tick clears it.
+    click_activated: bool,
+    /// The accept button's own procedure is handling a real release inside it (Task 28c).
+    own_release: bool,
+    /// `TME_LEAVE` is armed on the window, and on the accept button (review I2).
+    window_tracked: bool,
+    button_tracked: bool,
+}
+
+impl ClickGate {
+    /// No time in front, no press, no rest.
+    pub const fn new() -> Self {
+        Self {
+            live: LiveClock {
+                in_front_since: None,
+            },
+            press: PressTracker {
+                hover_since: None,
+                press: None,
+            },
+            last_at: None,
+            click_activated: false,
+            own_release: false,
+            window_tracked: false,
+            button_tracked: false,
+        }
+    }
+
+    /// The window lost the front, moved or was resized, or Merge moved: the delay, the press
+    /// and the rest start again, and `cursor` is where the cursor is now.
+    pub fn restart(&mut self, cursor: Option<(i32, i32)>) {
+        self.live.restart();
+        self.press.cancel();
+        self.last_at = cursor;
+    }
+
+    /// The live timer's sample at `now`; whether the buttons are live.
+    pub fn tick(&mut self, in_front: bool, now: Instant) -> bool {
+        self.click_activated = false;
+        self.live.tick(in_front, now)
+    }
+
+    /// Whether the buttons are live at `now` by the window's own clock.
+    pub fn is_live(&self, now: Instant) -> bool {
+        self.live.is_live(now)
+    }
+
+    /// `WM_MOUSEACTIVATE` for a left press: that press brings the window to the front.
+    pub fn mouse_activate(&mut self) {
+        self.click_activated = true;
+    }
+
+    /// One move the window or the button got; `on_accept` when its point is on the accept
+    /// button where this window gets it (the grey button for the window, the live one for the
+    /// button). Whether it counted towards the rest.
+    /// `tracked` when `TME_LEAVE` was armed on the window that got it.
+    fn judge_move(&mut self, tracked: bool, on_accept: bool, m: PointerMsg, now: Instant) -> bool {
+        let moved = tracked && m.at.is_some_and(|at| cursor_moved(self.last_at, at));
+        if m.is_input() {
+            self.last_at = m.at;
+        }
+        let counts = grey_rest_move(on_accept, moved, m.origin, m.device, m.sent);
+        // A real move on the button that left the cursor where it was is Windows' own move
+        // under a still cursor: it neither counts nor ends the rest.
+        if counts || !(on_accept && m.real()) {
+            self.press.on_move(counts, now);
+        }
+        counts
+    }
+
+    /// A `WM_MOUSEMOVE` to the window itself (moves over the grey accept button come here);
+    /// whether it counted towards the rest ([`grey_rest_move`]).
+    pub fn window_move(&mut self, over_grey_accept: bool, m: PointerMsg, now: Instant) -> bool {
+        self.judge_move(self.window_tracked, over_grey_accept, m, now)
+    }
+
+    /// After a move to the window: whether `TME_LEAVE` is now armed on it.
+    pub fn window_tracking(&mut self, armed: bool) {
+        self.window_tracked = armed;
+        if !armed {
+            self.last_at = None;
+        }
+    }
+
+    /// `WM_MOUSELEAVE` to the window; `on_accept` when the cursor is now on the accept button
+    /// (it turned on under the pointer), where the rest goes on. Either way where the cursor is
+    /// is unknown until the next move (review I2).
+    pub fn window_leave(&mut self, on_accept: bool) {
+        self.window_tracked = false;
+        self.last_at = None;
+        if !on_accept {
+            self.press.on_leave();
+        }
+    }
+
+    /// A `WM_LBUTTONDOWN` to the window itself: a press on the grey accept button is refused,
+    /// as the click that brought the window to the front or as one before the buttons were live.
+    /// Any press here forgets where the cursor is (re-review N2): while the button is down,
+    /// another thread can take the capture and move the cursor where this window never sees it.
+    /// The rest is untouched, and the next move just records the place.
+    pub fn window_press(&mut self, over_grey_accept: bool) -> Option<Refusal> {
+        self.window_tracked = false;
+        self.last_at = None;
+        let brought_forward = std::mem::replace(&mut self.click_activated, false);
+        over_grey_accept.then(|| grey_click_refusal(brought_forward))
+    }
+
+    /// A `WM_MOUSEMOVE` to the accept button; whether it counted towards the rest.
+    pub fn button_move(&mut self, inside: bool, m: PointerMsg, now: Instant) -> bool {
+        self.judge_move(self.button_tracked, inside, m, now)
+    }
+
+    /// After a move to the accept button: whether `TME_LEAVE` is now armed on it.
+    pub fn button_tracking(&mut self, armed: bool) {
+        self.button_tracked = armed;
+        if !armed {
+            self.last_at = None;
+        }
+    }
+
+    /// `WM_MOUSELEAVE` to the accept button: the rest ends, and where the cursor is is unknown
+    /// until the next move (review I2).
+    pub fn button_leave(&mut self) {
+        self.button_tracked = false;
+        self.last_at = None;
+        self.press.on_leave();
+    }
+
+    /// A `WM_LBUTTONDOWN` or `WM_LBUTTONDBLCLK` to the accept button.
+    pub fn button_press(&mut self, inside: bool, m: PointerMsg, now: Instant) {
+        self.press.on_press(inside && m.real(), m.device, now);
+    }
+
+    /// A `WM_LBUTTONUP` to the accept button: whether it arms the button ([`arms_accept`]),
+    /// and otherwise which gate refused it ([`release_refusal`]).
+    pub fn button_release(&mut self, inside: bool, m: PointerMsg) -> (bool, Option<Refusal>) {
+        let press = self.press.on_release();
+        let input = ButtonInput {
+            msg: WM_LBUTTONUP,
+            over_button: inside,
+            origin: m.origin,
+            device: m.device,
+            sent_by_another_thread: m.sent,
+            pressed_by_hardware: press.is_ok(),
+        };
+        self.own_release = inside && m.real();
+        let armed = arms_accept(input);
+        (armed, release_refusal(input, press))
+    }
+
+    /// The button's own procedure has handled the release.
+    pub fn release_done(&mut self) {
+        self.own_release = false;
+    }
+
+    /// `WM_CAPTURECHANGED` to the accept button. Within its own release after a real release
+    /// inside it (the button gives the capture back), the press is gone and the rest stays, so
+    /// clicking again without moving can count (Task 28c); any other loss of the capture drops
+    /// both, and forgets where the cursor is (re-review N2): the capture may have gone to
+    /// another thread, and the cursor with it, unseen.
+    pub fn capture_changed(&mut self) {
+        if self.own_release {
+            self.press.drop_press();
+        } else {
+            self.press.cancel();
+            self.button_tracked = false;
+            self.last_at = None;
+        }
+    }
+
+    /// `WM_CANCELMODE` to the accept button.
+    pub fn cancel_mode(&mut self) {
+        self.press.cancel();
+    }
 }
 
 /// Whether a message to the read-only text or a button would change what it shows (re-review 3
@@ -1668,20 +1934,12 @@ thread_local! {
     static BUTTON_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     /// The EDIT class's original window procedure, kept when the text is subclassed.
     static EDIT_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
-    /// The asking window's time in front.
-    static LIVE: std::cell::Cell<LiveClock> = const {
-        std::cell::Cell::new(LiveClock { in_front_since: None })
-    };
-    /// The accept button's press and hover.
-    static PRESS: std::cell::Cell<PressTracker> = const {
-        std::cell::Cell::new(PressTracker { hover_since: None, press: None })
-    };
+    /// The asking window's click gates: its time in front, the accept button's press and rest
+    /// (Task 28c).
+    static GATE: std::cell::Cell<ClickGate> = const { std::cell::Cell::new(ClickGate::new()) };
     /// Why the release being handled by the accept button's own procedure didn't arm it, for
     /// the `WM_COMMAND` that procedure sends (Task 28b); set and cleared around that one call.
     static RELEASE_REFUSAL: std::cell::Cell<Option<Refusal>> = const { std::cell::Cell::new(None) };
-    /// The next left press is the one that brought the window to the front (`WM_MOUSEACTIVATE`).
-    /// Each live tick clears it, so it can't outlast that press.
-    static CLICK_ACTIVATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The asking window's status line (Task 28b).
     static STATUS: std::cell::Cell<StatusLine> = const {
         std::cell::Cell::new(StatusLine { state: ButtonsState::TurningOn, refusal: None })
@@ -1690,8 +1948,6 @@ thread_local! {
     static ACCEPT_LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// The STATIC class's original window procedure, kept when the status line is subclassed.
     static STATUS_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
-    /// The cursor's screen position at the last restart of the delay (Task 28b review m1).
-    static RESTART_CURSOR: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
     /// lil itself is setting the status line's text (the subclass refuses everyone else).
     static OWN_STATUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The asking window's last known place and size, to tell a move or resize.
@@ -1702,14 +1958,39 @@ thread_local! {
     };
 }
 
-/// Changes this thread's accept-button press state.
-fn with_press<T>(f: impl FnOnce(&mut PressTracker) -> T) -> T {
-    PRESS.with(|c| {
-        let mut press = c.get();
-        let out = f(&mut press);
-        c.set(press);
+/// Changes this thread's click gates ([`ClickGate`]).
+fn with_gate<T>(f: impl FnOnce(&mut ClickGate) -> T) -> T {
+    GATE.with(|c| {
+        let mut gate = c.get();
+        let out = f(&mut gate);
+        c.set(gate);
         out
     })
+}
+
+/// The pointer message this thread is handling: its source, and where the cursor really is
+/// (`GetCursorPos`, never the message's `lParam`: review I1).
+fn pointer_msg() -> PointerMsg {
+    let (origin, device) = current_input_source();
+    PointerMsg {
+        origin,
+        device,
+        // SAFETY: a query about the message this thread is handling.
+        sent: unsafe { InSendMessage() }.as_bool(),
+        at: cursor_screen(),
+    }
+}
+
+/// Arms `TME_LEAVE` on `hwnd`; whether it is armed.
+fn track_leave(hwnd: HWND) -> bool {
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    // SAFETY: a local structure, for this thread's own window.
+    unsafe { TrackMouseEvent(&mut track) }.is_ok()
 }
 
 /// `control`'s place and size in its parent's client area.
@@ -1804,18 +2085,6 @@ fn point_inside(button: HWND, lp: LPARAM) -> bool {
         && y < rect.bottom
 }
 
-/// Whether the mouse message being handled is a real pointer message inside `button`, handled
-/// on its own thread: hardware origin, a mouse, touch, pen or touchpad, not sent.
-fn real_pointer_inside(button: HWND, lp: LPARAM) -> (bool, InputDevice) {
-    let (origin, device) = current_input_source();
-    // SAFETY: a query about the message this thread is handling.
-    let sent = unsafe { InSendMessage() }.as_bool();
-    (
-        is_real_pointer(origin, device, sent) && point_inside(button, lp),
-        device,
-    )
-}
-
 /// The original procedure kept in `slot`, or `None` before it was kept.
 fn original_proc(slot: &'static std::thread::LocalKey<std::cell::Cell<isize>>) -> WNDPROC {
     let original = slot.with(|p| p.get());
@@ -1839,24 +2108,20 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         match msg {
             _ if text_change(msg) => return LRESULT(0),
             WM_MOUSEMOVE => {
-                let (real, _) = real_pointer_inside(hwnd, lp);
-                with_press(|p| p.on_move(real, now));
-                if real {
-                    let mut track = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut track);
-                }
+                let m = pointer_msg();
+                with_gate(|g| g.button_move(point_inside(hwnd, lp), m, now));
+                // Armed on every move, so leaving always ends the rest and forgets where the
+                // cursor was (review I2).
+                let armed = track_leave(hwnd);
+                with_gate(|g| g.button_tracking(armed));
             }
-            WM_MOUSELEAVE => with_press(PressTracker::on_leave),
+            WM_MOUSELEAVE => with_gate(ClickGate::button_leave),
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-                let (real, device) = real_pointer_inside(hwnd, lp);
-                with_press(|p| p.on_press(real, device, now));
+                let m = pointer_msg();
+                with_gate(|g| g.button_press(point_inside(hwnd, lp), m, now));
             }
-            WM_CAPTURECHANGED | WM_CANCELMODE => with_press(PressTracker::cancel),
+            WM_CAPTURECHANGED => with_gate(ClickGate::capture_changed),
+            WM_CANCELMODE => with_gate(ClickGate::cancel_mode),
             WM_WINDOWPOSCHANGED => {
                 // Moved, resized, or its place can't be read: the delay starts again.
                 let place = place_in_parent(hwnd);
@@ -1867,26 +2132,23 @@ extern "system" fn accept_button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             WM_LBUTTONUP => {
-                let (origin, device) = current_input_source();
-                let press = with_press(PressTracker::on_release);
-                let input = ButtonInput {
-                    msg,
-                    over_button: point_inside(hwnd, lp),
-                    origin,
-                    device,
-                    sent_by_another_thread: InSendMessage().as_bool(),
-                    pressed_by_hardware: press.is_ok(),
-                };
-                if arms_accept(input) {
+                let m = pointer_msg();
+                let (armed, refusal) = with_gate(|g| g.button_release(point_inside(hwnd, lp), m));
+                // The button's own procedure releases the capture (WM_CAPTURECHANGED, back
+                // here) and reports the click (WM_COMMAND to the window) within this call.
+                let result = if armed {
                     ARMED.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
                     let result = CallWindowProcW(Some(original), hwnd, msg, wp, lp);
                     ARMED.store(0, std::sync::atomic::Ordering::SeqCst);
-                    return result;
-                }
-                // Not armed: the click this release reports (if any) says why (Task 28b).
-                RELEASE_REFUSAL.with(|r| r.set(release_refusal(input, press)));
-                let result = CallWindowProcW(Some(original), hwnd, msg, wp, lp);
-                RELEASE_REFUSAL.with(|r| r.set(None));
+                    result
+                } else {
+                    // Not armed: the click this release reports (if any) says why (Task 28b).
+                    RELEASE_REFUSAL.with(|r| r.set(refusal));
+                    let result = CallWindowProcW(Some(original), hwnd, msg, wp, lp);
+                    RELEASE_REFUSAL.with(|r| r.set(None));
+                    result
+                };
+                with_gate(ClickGate::release_done);
                 return result;
             }
             _ => {}
@@ -1954,7 +2216,7 @@ fn show_status(window: HWND) {
 fn current_buttons_state(window: HWND) -> ButtonsState {
     // SAFETY: a plain query.
     let in_front = unsafe { GetForegroundWindow() } == window;
-    buttons_state(in_front, LIVE.with(|c| c.get().is_live(Instant::now())))
+    buttons_state(in_front, GATE.with(|c| c.get().is_live(Instant::now())))
 }
 
 /// A click on the accept button didn't count: the status line says which gate refused it, and
@@ -2040,14 +2302,9 @@ fn set_buttons_enabled(window: HWND, enabled: bool) {
 /// The asking window lost the front, moved or was resized: the buttons stop working until it
 /// has been in front for [`BUTTONS_LIVE_AFTER`] again.
 fn restart_live(window: HWND) {
-    LIVE.with(|c| {
-        let mut clock = c.get();
-        clock.restart();
-        c.set(clock);
-    });
-    with_press(PressTracker::cancel);
-    // Only a move away from here counts towards the rest over the grey button (review m1).
-    RESTART_CURSOR.with(|c| c.set(cursor_screen()));
+    // Only a move away from here counts towards the rest (review m1).
+    let cursor = cursor_screen();
+    with_gate(|g| g.restart(cursor));
     set_buttons_enabled(window, false);
 }
 
@@ -2250,7 +2507,7 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     // Enabled and live by our own clock: another program can enable the button
                     // with EnableWindow, but it can't move the clock.
                     enabled: accept.is_some_and(|b| IsWindowEnabled(b).as_bool())
-                        && LIVE.with(|c| c.get().is_live(Instant::now())),
+                        && GATE.with(|c| c.get().is_live(Instant::now())),
                 };
                 if let Some(choice) = choice_from_command(command) {
                     record_choice(hwnd, choice);
@@ -2268,15 +2525,15 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             WM_MOUSEACTIVATE => {
                 // A click on the window while another is in front (Task 28b).
                 if ((lp.0 >> 16) & 0xffff) as u32 == WM_LBUTTONDOWN {
-                    CLICK_ACTIVATED.with(|c| c.set(true));
+                    with_gate(ClickGate::mouse_activate);
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_LBUTTONDOWN => {
                 // A grey button gets no mouse input: a press on it comes here (Task 28b).
-                let brought_forward = CLICK_ACTIVATED.with(|c| c.replace(false));
-                if over_accept(hwnd, message_point(lp), true) {
-                    refuse_click(hwnd, grey_click_refusal(brought_forward));
+                let over = over_accept(hwnd, message_point(lp), true);
+                if let Some(refusal) = with_gate(|g| g.window_press(over)) {
+                    refuse_click(hwnd, refusal);
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2284,30 +2541,15 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 // Moves over the grey button come here too; real ones count towards the rest
                 // (plan 4a ruling 2026-10-25). A move here anywhere else, or one that isn't
                 // real, starts it again.
-                // Only a cursor that moved since the last restart counts, so the window or the
-                // button sliding under a still cursor never does (review m1).
-                let (origin, device) = current_input_source();
-                let (x, y) = message_point(lp);
-                let mut screen = windows::Win32::Foundation::POINT { x, y };
-                let moved = ClientToScreen(hwnd, &mut screen).as_bool()
-                    && cursor_moved(RESTART_CURSOR.with(|c| c.get()), (screen.x, screen.y));
-                let real = grey_rest_move(
-                    over_accept(hwnd, (x, y), true),
-                    moved,
-                    origin,
-                    device,
-                    InSendMessage().as_bool(),
-                );
-                with_press(|p| p.on_move(real, Instant::now()));
-                if real {
-                    let mut track = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut track);
-                }
+                // Only a cursor that moved since the last move or restart counts, so the window
+                // or the button sliding under a still cursor never does (review m1, Task 28c).
+                // Where the cursor is comes from GetCursorPos, and only from input messages
+                // (review I1); TME_LEAVE is armed on every move (review I2).
+                let m = pointer_msg();
+                let over = over_accept(hwnd, message_point(lp), true);
+                with_gate(|g| g.window_move(over, m, Instant::now()));
+                let armed = track_leave(hwnd);
+                with_gate(|g| g.window_tracking(armed));
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_MOUSELEAVE => {
@@ -2318,18 +2560,13 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 let on_button = GetCursorPos(&mut cursor).is_ok()
                     && ScreenToClient(hwnd, &mut cursor).as_bool()
                     && over_accept(hwnd, (cursor.x, cursor.y), false);
+                with_gate(|g| g.window_leave(on_button));
                 match GetDlgItem(Some(hwnd), ID_ACCEPT as i32) {
                     // Track the button's own leave, so leaving it drops the rest (review m2).
                     Ok(accept) if on_button => {
-                        let mut track = TRACKMOUSEEVENT {
-                            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                            dwFlags: TME_LEAVE,
-                            hwndTrack: accept,
-                            dwHoverTime: 0,
-                        };
-                        let _ = TrackMouseEvent(&mut track);
+                        let _ = track_leave(accept);
                     }
-                    _ => with_press(PressTracker::on_leave),
+                    _ => {}
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2357,14 +2594,8 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 if choice_of(hwnd.0 as isize).is_some() {
                     let _ = KillTimer(Some(hwnd), TIMER_LIVE);
                 } else {
-                    CLICK_ACTIVATED.with(|c| c.set(false));
                     let in_front = GetForegroundWindow() == hwnd;
-                    let live = LIVE.with(|c| {
-                        let mut clock = c.get();
-                        let live = clock.tick(in_front, Instant::now());
-                        c.set(clock);
-                        live
-                    });
+                    let live = with_gate(|g| g.tick(in_front, Instant::now()));
                     set_buttons_enabled(hwnd, live);
                     let changed = STATUS.with(|s| {
                         let mut status = s.get();
@@ -2761,7 +2992,7 @@ mod tests {
             p.on_press(true, device, at(hover * 2));
             assert_eq!(
                 p.on_release(),
-                Err(Refusal::NoRest),
+                Err(Refusal::NoMove),
                 "{device:?} with no hover"
             );
             let mut p = PressTracker::default();
@@ -2784,7 +3015,7 @@ mod tests {
         p.on_move(true, at(0));
         p.on_leave();
         p.on_press(true, InputDevice::Mouse, at(hover * 2));
-        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        assert_eq!(p.on_release(), Err(Refusal::NoMove));
         // A press that isn't real is put down to the press, even after a long hover.
         let mut p = PressTracker::default();
         p.on_move(true, at(0));
@@ -2808,7 +3039,7 @@ mod tests {
         p.on_press(true, InputDevice::Mouse, at(hover * 3));
         assert_eq!(
             p.on_release(),
-            Err(Refusal::NoRest),
+            Err(Refusal::NoMove),
             "the hover went with the cancel"
         );
     }
@@ -2824,10 +3055,15 @@ mod tests {
             Refusal::NotPointer,
             Refusal::NoRealPress,
             Refusal::NoRest,
+            Refusal::NoMove,
         ];
         for (i, a) in all.iter().enumerate() {
             let text = a.message("Merge");
             assert!(!text.is_empty(), "{a:?}");
+            // Task 28c: the status line is about 450 px wide and three lines tall in the
+            // dialog font (about 80 characters a line), so every message fits in two lines
+            // with room to spare, with "Approve" too.
+            assert!(a.message("Approve").chars().count() <= 160, "{a:?}");
             assert!(
                 a.name()
                     .bytes()
@@ -2839,14 +3075,24 @@ mod tests {
                 assert_ne!(a.name(), b.name(), "{a:?} {b:?}");
             }
         }
+        // Task 28c: a still hand can't start the rest, so every message that leads to another
+        // click on the button says to move the pointer a little on it first.
         assert_eq!(
-            Refusal::NoRest.message("Merge"),
-            "Rest the pointer on Merge for a moment, then click."
+            Refusal::NoMove.message("Merge"),
+            "Move the pointer a little on Merge, then click it."
         );
         assert_eq!(
-            Refusal::NoRest.message("Approve"),
-            "Rest the pointer on Approve for a moment, then click."
+            Refusal::NoMove.message("Approve"),
+            "Move the pointer a little on Approve, then click it."
         );
+        for a in [Refusal::NotInFront, Refusal::NotLiveYet, Refusal::NoRest] {
+            assert!(
+                a.message("Merge")
+                    .contains("move the pointer a little on Merge"),
+                "{a:?}"
+            );
+            assert!(!a.message("Merge").contains("Rest the pointer"), "{a:?}");
+        }
         assert!(
             Refusal::NotLiveYet
                 .message("Merge")
@@ -2933,7 +3179,7 @@ mod tests {
             at(hover * 3),
         );
         p.on_press(true, InputDevice::Mouse, at(hover * 3 + 1));
-        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        assert_eq!(p.on_release(), Err(Refusal::NoMove));
         // Parked, then moved off the button within the window: the rest is gone.
         let mut p = PressTracker::default();
         p.on_move(
@@ -2951,7 +3197,7 @@ mod tests {
             at(1),
         );
         p.on_press(true, InputDevice::Mouse, at(hover * 3));
-        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        assert_eq!(p.on_release(), Err(Refusal::NoMove));
     }
 
     /// Task 28b review m1: a move over the grey button counts towards the rest only when the
@@ -2992,7 +3238,7 @@ mod tests {
             at(0),
         );
         p.on_press(true, InputDevice::Mouse, at(hover * 3));
-        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        assert_eq!(p.on_release(), Err(Refusal::NoMove));
         // The owner's hand then really moves it onto the button: that counts.
         let moved = cursor_moved(Some((100, 200)), (104, 201));
         p.on_move(
@@ -3178,6 +3424,928 @@ mod tests {
         s.refuse(Refusal::NotInFront, TurningOn);
         assert!(!s.tick(TurningOn));
         assert_eq!(s.text("Approve"), Refusal::NotInFront.message("Approve"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Task 28c: the owner's click sequences, replayed through the window's own gates.
+    // ---------------------------------------------------------------------------------------
+
+    /// What Windows reports for the `WM_MOUSEMOVE` it makes itself under a still cursor: when
+    /// the window comes to the top, when Merge turns on under the pointer, and after a button
+    /// releases the capture. Microsoft documents only that `IMO_SYSTEM` is "the system has
+    /// injected the input message"; what these moves report on this PC is unverified (Task 28
+    /// check 11), so every replay runs under each answer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fakes {
+        /// No such move is sent.
+        NoMove,
+        /// It reports `IMO_SYSTEM` (the likeliest reading of the docs).
+        System,
+        /// It reports `IMO_HARDWARE` with the mouse.
+        Hardware,
+    }
+
+    const ALL_FAKES: [Fakes; 3] = [Fakes::NoMove, Fakes::System, Fakes::Hardware];
+
+    /// Where the cursor is, as Windows routes mouse input to the asking window.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Under {
+        Outside,
+        /// The read-only text (its moves and presses go to the EDIT, not the gates).
+        Text,
+        /// The window itself: the button row, and Merge while it is grey.
+        Window,
+        /// Merge while it is live.
+        Merge,
+    }
+
+    // The window on the screen: 720x520. Merge is 110x30 at the bottom right.
+    const WINDOW: (i32, i32, i32, i32) = (400, 200, 1120, 720);
+    const TEXT: (i32, i32, i32, i32) = (410, 240, 1110, 660);
+    const MERGE_RECT: (i32, i32, i32, i32) = (870, 672, 980, 702);
+    const MERGE: (i32, i32) = (925, 687);
+    const ROW: (i32, i32) = (840, 690);
+    const BODY: (i32, i32) = (700, 400);
+    const TASKBAR: (i32, i32) = (700, 1060);
+    const START: (i32, i32) = (200, 300);
+
+    fn inside_rect((x, y): (i32, i32), (l, t, r, b): (i32, i32, i32, i32)) -> bool {
+        x >= l && x < r && y >= t && y < b
+    }
+
+    /// One owner click as the window judged it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Click {
+        Accepted,
+        /// The gate's log name.
+        Refused(&'static str),
+    }
+
+    /// The asking window as Windows drives it, over [`ClickGate`] and [`StatusLine`], with the
+    /// same calls `owner_wndproc` and `accept_button_proc` make.
+    struct Replay {
+        fakes: Fakes,
+        gate: ClickGate,
+        status: StatusLine,
+        t0: Instant,
+        ms: u64,
+        next_tick: u64,
+        in_front: bool,
+        enabled: bool,
+        cursor: (i32, i32),
+        /// `TME_LEAVE` is armed on the window, or on Merge: the procedures arm it on every
+        /// move they get (and the window's leave arms it on Merge when it carries the rest),
+        /// and Windows posts a leave only while it is armed (review m1).
+        window_armed: bool,
+        button_armed: bool,
+        clicks: Vec<Click>,
+        trace: Vec<String>,
+    }
+
+    impl Replay {
+        /// The window opens (its first placement restarts the delay), in front or behind.
+        fn open(fakes: Fakes, in_front: bool) -> Self {
+            let mut gate = ClickGate::new();
+            gate.restart(Some(START));
+            Self {
+                fakes,
+                gate,
+                status: StatusLine::default(),
+                t0: Instant::now(),
+                ms: 0,
+                next_tick: 250,
+                in_front,
+                enabled: false,
+                cursor: START,
+                window_armed: false,
+                button_armed: false,
+                clicks: Vec::new(),
+                trace: Vec::new(),
+            }
+        }
+
+        fn now(&self) -> Instant {
+            self.t0 + Duration::from_millis(self.ms)
+        }
+
+        fn under(&self, p: (i32, i32)) -> Under {
+            if inside_rect(p, MERGE_RECT) && self.enabled {
+                Under::Merge
+            } else if inside_rect(p, TEXT) {
+                Under::Text
+            } else if inside_rect(p, WINDOW) {
+                Under::Window
+            } else {
+                Under::Outside
+            }
+        }
+
+        fn msg(&self, origin: InputOrigin) -> PointerMsg {
+            PointerMsg {
+                origin,
+                device: InputDevice::Mouse,
+                sent: false,
+                at: Some(self.cursor),
+            }
+        }
+
+        /// A move at the cursor, to whatever is under it.
+        fn deliver(&mut self, origin: InputOrigin) {
+            let m = self.msg(origin);
+            self.deliver_msg(m);
+        }
+
+        /// A move message `m` to whatever is under the cursor. The procedures arm `TME_LEAVE`
+        /// on every move they get.
+        fn deliver_msg(&mut self, m: PointerMsg) {
+            let now = self.now();
+            match self.under(self.cursor) {
+                Under::Merge => {
+                    self.gate.button_move(true, m, now);
+                    self.button_armed = true;
+                    self.gate.button_tracking(true);
+                }
+                Under::Window => {
+                    let grey = inside_rect(self.cursor, MERGE_RECT) && !self.enabled;
+                    self.gate.window_move(grey, m, now);
+                    self.window_armed = true;
+                    self.gate.window_tracking(true);
+                }
+                Under::Text | Under::Outside => {}
+            }
+        }
+
+        /// Another program posts (`sent: false`) or sends a `WM_MOUSEMOVE` to whatever is under
+        /// the cursor, claiming the cursor is at `claim` (review I1).
+        fn forged_move(&mut self, claim: (i32, i32), sent: bool) {
+            self.deliver_msg(PointerMsg {
+                origin: if sent {
+                    InputOrigin::Hardware
+                } else {
+                    InputOrigin::Unavailable
+                },
+                device: InputDevice::Mouse,
+                sent,
+                at: Some(claim),
+            });
+        }
+
+        /// The leaves Windows posts when the cursor goes from `from` to `to`: only to a window
+        /// whose `TME_LEAVE` is armed.
+        fn leave(&mut self, from: Under, to: Under) {
+            if from == Under::Merge && to != Under::Merge && self.button_armed {
+                self.button_armed = false;
+                self.gate.button_leave();
+            }
+            if from == Under::Window && to != Under::Window && self.window_armed {
+                self.window_armed = false;
+                let carried = to == Under::Merge;
+                self.gate.window_leave(carried);
+                // Carrying the rest, the window arms the leave on Merge.
+                self.button_armed |= carried;
+            }
+        }
+
+        /// The cursor goes to `p` by moves this window never gets: over another program's
+        /// window lying on top of it, or merged by Windows into one (review I2).
+        fn unseen_to(&mut self, p: (i32, i32)) {
+            let from = self.under(self.cursor);
+            self.leave(from, Under::Outside);
+            self.cursor = p;
+        }
+
+        /// The move Windows makes itself under a still cursor, as [`Fakes`] says.
+        fn fake_move(&mut self) {
+            match self.fakes {
+                Fakes::NoMove => {}
+                Fakes::System => self.deliver(InputOrigin::System),
+                Fakes::Hardware => self.deliver(InputOrigin::Hardware),
+            }
+        }
+
+        /// The cursor goes to `p` (moved by `origin`), with the leaves Windows posts on the way.
+        fn place(&mut self, p: (i32, i32), origin: InputOrigin) {
+            let (from, to) = (self.under(self.cursor), self.under(p));
+            self.leave(from, to);
+            self.cursor = p;
+            self.deliver(origin);
+        }
+
+        /// Time passes; the live timer ticks every 250 ms.
+        fn wait(&mut self, ms: u64) {
+            let end = self.ms + ms;
+            while self.next_tick <= end {
+                self.ms = self.next_tick;
+                self.next_tick += 250;
+                let live = self.gate.tick(self.in_front, self.now());
+                if live != self.enabled {
+                    let was = self.under(self.cursor);
+                    self.enabled = live;
+                    // Merge turned on (or off) under the pointer: Windows routes it anew.
+                    if inside_rect(self.cursor, MERGE_RECT) {
+                        let now_under = self.under(self.cursor);
+                        self.leave(was, now_under);
+                        self.fake_move();
+                    }
+                }
+                self.status
+                    .tick(buttons_state(self.in_front, self.gate.is_live(self.now())));
+            }
+            self.ms = end;
+        }
+
+        /// The owner's hand moves the pointer to `p` in `steps` real moves, 10 ms apart.
+        fn move_to(&mut self, p: (i32, i32), steps: i32) {
+            let (x0, y0) = self.cursor;
+            for i in 1..=steps {
+                self.wait(10);
+                let q = (x0 + (p.0 - x0) * i / steps, y0 + (p.1 - y0) * i / steps);
+                self.place(q, InputOrigin::Hardware);
+            }
+        }
+
+        /// A small real move on the button and back, as the status line asks.
+        fn nudge(&mut self) {
+            let (x, y) = self.cursor;
+            self.move_to((x + 2, y + 1), 2);
+            self.move_to((x, y), 2);
+        }
+
+        /// Another program warps the cursor to `p` (`SetCursorPos`).
+        fn warp(&mut self, p: (i32, i32)) {
+            self.place(p, InputOrigin::System);
+        }
+
+        /// The window or Merge slides under the still cursor: the delay restarts.
+        /// Another program warps the cursor to `p` and at once makes Windows send one of its own
+        /// moves (it shows or hides a window of its own, or changes the z-order), before this
+        /// window's thread pumps its queue: Windows merges the two into one move at `p`, which
+        /// reports what Windows' own moves report (Task 28c re-review N1).
+        fn merged_warp(&mut self, p: (i32, i32)) {
+            let origin = match self.fakes {
+                // No own move: only the warp's.
+                Fakes::NoMove | Fakes::System => InputOrigin::System,
+                Fakes::Hardware => InputOrigin::Hardware,
+            };
+            self.place(p, origin);
+        }
+
+        fn slide(&mut self) {
+            self.gate.restart(Some(self.cursor));
+            self.enabled = false;
+            self.fake_move();
+        }
+
+        /// The owner clicks the flashing taskbar button: the window comes to the front, and
+        /// the cursor is on the taskbar.
+        fn activate_by_taskbar(&mut self) {
+            assert_eq!(self.under(self.cursor), Under::Outside);
+            self.in_front = true;
+        }
+
+        fn refuse(&mut self, refusal: Refusal) {
+            let state = buttons_state(self.in_front, self.gate.is_live(self.now()));
+            self.status.refuse(refusal, state);
+            self.clicks.push(Click::Refused(refusal.name()));
+        }
+
+        /// The owner presses and releases (80 ms) without moving.
+        fn click(&mut self) {
+            self.click_from(InputOrigin::Hardware);
+        }
+
+        fn click_from(&mut self, origin: InputOrigin) {
+            let under = self.under(self.cursor);
+            if !self.in_front && under != Under::Outside {
+                // WM_MOUSEACTIVATE, then the window comes to the top under the cursor.
+                self.gate.mouse_activate();
+                self.in_front = true;
+                self.fake_move();
+            }
+            let at = self.ms;
+            match under {
+                Under::Window => {
+                    let grey = inside_rect(self.cursor, MERGE_RECT) && !self.enabled;
+                    if let Some(refusal) = self.gate.window_press(grey) {
+                        self.refuse(refusal);
+                    }
+                    self.wait(80);
+                }
+                Under::Merge => {
+                    let (m, now) = (self.msg(origin), self.now());
+                    self.gate.button_press(true, m, now);
+                    self.wait(80);
+                    let (armed, refusal) = self.gate.button_release(true, self.msg(origin));
+                    // Within the button's own procedure: ReleaseCapture, then BN_CLICKED.
+                    self.gate.capture_changed();
+                    let command = ButtonCommand {
+                        clicked: true,
+                        from_accept: true,
+                        from_deny: false,
+                        armed,
+                        sent_by_another_thread: false,
+                        enabled: self.enabled && self.gate.is_live(self.now()),
+                    };
+                    self.gate.release_done();
+                    match choice_from_command(command) {
+                        Some(Choice::Accepted) => self.clicks.push(Click::Accepted),
+                        _ => {
+                            let refusal = click_refusal(command, refusal).expect("a refusal");
+                            self.refuse(refusal);
+                        }
+                    }
+                    // The capture went: Windows makes a move under the cursor.
+                    self.fake_move();
+                }
+                Under::Text | Under::Outside => self.wait(80),
+            }
+            if inside_rect(self.cursor, MERGE_RECT) {
+                let said = self.status.text("Merge");
+                self.trace
+                    .push(format!("{at:>5} ms: {:?} | {said}", self.clicks.last()));
+            }
+        }
+
+        fn report(&self, name: &str) {
+            println!("{name} ({:?}):", self.fakes);
+            for line in &self.trace {
+                println!("  {line}");
+            }
+        }
+    }
+
+    fn refused(name: &'static str) -> Click {
+        Click::Refused(name)
+    }
+
+    /// Each natural sequence: the first refusal it gets, then what follows when the owner
+    /// clicks again without moving and, if that is refused too, moves a little as the status
+    /// line says. With Windows' own moves reported as `IMO_SYSTEM`, a still click after Merge
+    /// turns on, after the window comes to the top or after a click can't be told from a warp,
+    /// so the line says to move and the click after that merges.
+    fn assert_second_or_after_a_nudge(r: &Replay, first: &'static str) {
+        assert_eq!(r.clicks[0], refused(first), "{:?}", r.fakes);
+        match r.fakes {
+            Fakes::NoMove | Fakes::Hardware => {
+                assert_eq!(r.clicks[1..], [Click::Accepted], "{:?}", r.fakes)
+            }
+            Fakes::System => assert_eq!(
+                r.clicks[1..],
+                [refused("no_move"), Click::Accepted],
+                "{:?}",
+                r.fakes
+            ),
+        }
+    }
+
+    /// Clicks again without moving, then (if still refused) moves a little and clicks.
+    fn click_again_then_nudge(r: &mut Replay) {
+        r.click();
+        r.wait(1_000);
+        if r.clicks.last() != Some(&Click::Accepted) {
+            r.nudge();
+            r.wait(300);
+            r.click();
+        }
+    }
+
+    /// The window opens behind and flashes; the owner clicks its taskbar button, moves onto
+    /// Merge while it is still grey, holds still and clicks; then clicks again without moving.
+    #[test] // spec: QA-088
+    fn replay_behind_then_taskbar_then_still_clicks_on_merge() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, false);
+            r.wait(2_000);
+            r.move_to(TASKBAR, 20);
+            r.activate_by_taskbar();
+            r.wait(100);
+            r.move_to(ROW, 30);
+            r.move_to(MERGE, 8);
+            r.wait(200);
+            r.click(); // about 0.7 s after it came to the front: grey
+            r.wait(1_500);
+            click_again_then_nudge(&mut r);
+            r.report("behind, taskbar");
+            assert_second_or_after_a_nudge(&r, "not_live_yet");
+        }
+    }
+
+    /// The window opens behind; the owner's very first click is on grey Merge itself, which
+    /// brings the window forward; then they wait and click again without moving.
+    #[test] // spec: QA-088
+    fn replay_behind_then_first_click_on_merge_brings_it_forward() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, false);
+            r.wait(2_000);
+            r.move_to(ROW, 30);
+            r.move_to(MERGE, 8);
+            r.wait(300);
+            r.click(); // brings the window forward
+            r.wait(1_500);
+            click_again_then_nudge(&mut r);
+            r.report("behind, first click on Merge");
+            assert_second_or_after_a_nudge(&r, "not_in_front");
+        }
+    }
+
+    /// The window opens behind; the owner clicks into the text to bring it forward, then moves
+    /// onto Merge and clicks while it is grey, then again without moving.
+    #[test] // spec: QA-088
+    fn replay_behind_then_click_in_the_text_then_merge() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, false);
+            r.wait(2_000);
+            r.move_to(BODY, 20);
+            r.click(); // into the text: the window comes forward
+            r.move_to(ROW, 30);
+            r.move_to(MERGE, 8);
+            r.wait(150);
+            r.click();
+            r.wait(1_500);
+            click_again_then_nudge(&mut r);
+            r.report("behind, click in the text");
+            assert_second_or_after_a_nudge(&r, "not_live_yet");
+        }
+    }
+
+    /// The window opens in front. The owner reads, moves onto live Merge and clicks at once
+    /// (too soon), then clicks again without moving. A deliberate first click merges at once.
+    #[test] // spec: QA-088
+    fn replay_in_front_a_quick_click_then_a_still_click() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(ROW, 30);
+            r.move_to(MERGE, 5);
+            r.click(); // 50 ms after reaching Merge
+            r.wait(700);
+            click_again_then_nudge(&mut r);
+            r.report("in front, quick click");
+            assert_second_or_after_a_nudge(&r, "no_rest");
+
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(ROW, 30);
+            r.move_to(MERGE, 5);
+            r.wait(300);
+            r.click();
+            r.report("in front, deliberate click");
+            assert_eq!(r.clicks, [Click::Accepted], "{fakes:?}");
+        }
+    }
+
+    /// Every natural first refusal, then the owner does what the status line says (moves the
+    /// pointer a little on Merge and clicks): the second deliberate click merges, whatever
+    /// Windows reports for its own moves.
+    #[test] // spec: QA-088
+    fn replay_doing_what_the_status_line_says_merges_on_the_second_click() {
+        for fakes in ALL_FAKES {
+            // Behind; taskbar; onto grey Merge; clicked too early.
+            let mut r = Replay::open(fakes, false);
+            r.wait(2_000);
+            r.move_to(TASKBAR, 20);
+            r.activate_by_taskbar();
+            r.move_to(MERGE, 30);
+            r.click();
+            r.wait(1_500);
+            r.nudge();
+            r.wait(300);
+            r.click();
+            r.report("behind, taskbar, as the line says");
+            assert_eq!(
+                r.clicks,
+                [refused("not_live_yet"), Click::Accepted],
+                "{fakes:?}"
+            );
+
+            // Behind; the first click on grey Merge brings it forward.
+            let mut r = Replay::open(fakes, false);
+            r.wait(2_000);
+            r.move_to(MERGE, 30);
+            r.click();
+            r.wait(1_500);
+            r.nudge();
+            r.wait(300);
+            r.click();
+            assert_eq!(
+                r.clicks,
+                [refused("not_in_front"), Click::Accepted],
+                "{fakes:?}"
+            );
+
+            // In front; the window opened under the still pointer, right on Merge.
+            let mut r = Replay::open(fakes, true);
+            r.cursor = MERGE;
+            r.gate.restart(Some(MERGE));
+            r.wait(2_000);
+            r.click();
+            r.wait(500);
+            r.nudge();
+            r.wait(300);
+            r.click();
+            assert_eq!(r.clicks, [refused("no_move"), Click::Accepted], "{fakes:?}");
+
+            // In front; too quick a click.
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(ROW, 30);
+            r.move_to(MERGE, 5);
+            r.click();
+            r.wait(500);
+            r.nudge();
+            r.wait(300);
+            r.click();
+            assert_eq!(r.clicks, [refused("no_rest"), Click::Accepted], "{fakes:?}");
+        }
+    }
+
+    /// Task 28c: a click's own release (the button gives the capture back after a real release
+    /// inside it) ends the press but not the rest. Any other loss of the capture, a cancelled
+    /// mode, or a release that isn't a real one inside the button ends both.
+    #[test] // spec: QA-088
+    fn only_the_buttons_own_real_release_keeps_the_rest() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let real = |x: i32| PointerMsg {
+            origin: InputOrigin::Hardware,
+            device: InputDevice::Mouse,
+            sent: false,
+            at: Some((x, 10)),
+        };
+        // Rested from 0 ms; a press at 50 ms is too soon.
+        let rested = || {
+            let mut g = ClickGate::new();
+            g.restart(Some((0, 0)));
+            g.button_tracking(true);
+            assert!(g.button_move(true, real(1), at(0)));
+            g.button_press(true, real(1), at(50));
+            g
+        };
+        // The owner's own release: the rest goes on, so a still press at 400 ms counts.
+        let mut g = rested();
+        assert_eq!(
+            g.button_release(true, real(1)),
+            (false, Some(Refusal::NoRest))
+        );
+        g.capture_changed();
+        g.release_done();
+        g.button_press(true, real(1), at(400));
+        assert_eq!(g.button_release(true, real(1)), (true, None));
+        // The press itself is still used up: a second release without a press arms nothing.
+        g.capture_changed();
+        g.release_done();
+        assert!(!g.button_release(true, real(1)).0);
+
+        // A posted (not hardware) release, a release outside the button, a capture lost at
+        // any other time, or WM_CANCELMODE: the rest is gone.
+        let posted = PointerMsg {
+            origin: InputOrigin::Unavailable,
+            ..real(1)
+        };
+        for end in 0..4 {
+            let mut g = rested();
+            match end {
+                0 => {
+                    g.button_release(true, posted);
+                    g.capture_changed();
+                    g.release_done();
+                }
+                1 => {
+                    g.button_release(false, real(1));
+                    g.capture_changed();
+                    g.release_done();
+                }
+                2 => g.capture_changed(),
+                _ => g.cancel_mode(),
+            }
+            g.button_press(true, real(1), at(400));
+            assert_eq!(
+                g.button_release(true, real(1)),
+                (false, Some(Refusal::NoMove)),
+                "end {end}"
+            );
+        }
+
+        // A hardware-reported move that left the cursor where it was neither counts nor ends
+        // the rest; one that isn't hardware ends it even at the same place.
+        let mut g = rested();
+        g.button_release(true, real(1));
+        g.capture_changed();
+        g.release_done();
+        assert!(!g.button_move(true, real(1), at(200)));
+        g.button_press(true, real(1), at(400));
+        assert_eq!(g.button_release(true, real(1)), (true, None));
+        let mut g = rested();
+        g.button_release(true, real(1));
+        g.capture_changed();
+        g.release_done();
+        let system = PointerMsg {
+            origin: InputOrigin::System,
+            ..real(1)
+        };
+        assert!(!g.button_move(true, system, at(200)));
+        g.button_press(true, real(1), at(400));
+        assert_eq!(g.button_release(true, real(1)).1, Some(Refusal::NoMove));
+        // After a restart, a hardware move at the cursor's place then never counts.
+        let mut g = ClickGate::new();
+        g.restart(Some((1, 10)));
+        g.button_tracking(true);
+        assert!(!g.button_move(true, real(1), at(0)));
+        g.button_press(true, real(1), at(400));
+        assert_eq!(g.button_release(true, real(1)).1, Some(Refusal::NoMove));
+
+        // Review I1: a posted or sent move never records where the cursor is, whatever it
+        // claims; a real move then at the cursor's true place still doesn't count.
+        for forged in [
+            PointerMsg {
+                origin: InputOrigin::Unavailable,
+                ..real(5)
+            },
+            PointerMsg {
+                sent: true,
+                ..real(5)
+            },
+        ] {
+            let mut g = ClickGate::new();
+            g.restart(Some((1, 10)));
+            g.button_tracking(true);
+            assert!(!g.button_move(true, forged, at(0)));
+            assert!(!g.button_move(true, real(1), at(10)), "{forged:?}");
+        }
+        // Review I2: after a leave, or while the leave isn't armed, the first move back only
+        // records where the cursor is; the next one at a new place counts.
+        for forget in 0..2 {
+            let mut g = ClickGate::new();
+            g.restart(Some((0, 0)));
+            g.button_tracking(true);
+            assert!(g.button_move(true, real(1), at(0)));
+            if forget == 0 {
+                g.button_leave();
+            } else {
+                g.button_tracking(false);
+            }
+            g.button_tracking(false);
+            assert!(!g.button_move(true, real(7), at(10)), "forget {forget}");
+            g.button_tracking(true);
+            assert!(!g.button_move(true, real(7), at(20)), "forget {forget}");
+            assert!(g.button_move(true, real(8), at(30)), "forget {forget}");
+        }
+        // The window's own leave forgets it too, even when it carries the rest onto Merge.
+        let mut g = ClickGate::new();
+        g.restart(Some((0, 0)));
+        g.window_tracking(true);
+        assert!(g.window_move(true, real(1), at(0)));
+        g.window_leave(true);
+        assert!(!g.button_move(true, real(9), at(10)));
+    }
+
+    /// Clicks, then a still click 500 ms later, then another: none may merge.
+    fn three_still_clicks(r: &mut Replay) {
+        for _ in 0..3 {
+            r.click();
+            r.wait(500);
+        }
+    }
+
+    /// Review I1: a posted or sent move, whatever point it claims, never sets where the gate
+    /// thinks the cursor is. Otherwise, after a warp or a slide, Windows' own move under the
+    /// still cursor would look like a move somewhere new and count towards the rest.
+    #[test] // spec: QA-088, QA-036
+    fn replay_posted_or_sent_moves_cant_plant_a_cursor_position() {
+        for fakes in ALL_FAKES {
+            for sent in [false, true] {
+                // A warp onto live Merge, then a forged move claiming the cursor is elsewhere.
+                let mut r = Replay::open(fakes, true);
+                r.wait(3_000);
+                r.move_to(ROW, 30);
+                r.wait(500);
+                r.warp(MERGE);
+                r.forged_move((0, 0), sent);
+                three_still_clicks(&mut r);
+                r.report("warp, then a forged move");
+                assert!(
+                    r.clicks.iter().all(|c| *c == refused("no_move")),
+                    "warp, {fakes:?}, sent {sent}: {:?}",
+                    r.clicks
+                );
+
+                // Merge slides under the parked pointer; a forged move claims it is elsewhere;
+                // Merge turns on again under the pointer.
+                let mut r = Replay::open(fakes, true);
+                r.wait(3_000);
+                r.move_to((MERGE.0 - 200, MERGE.1), 20);
+                r.wait(500);
+                r.cursor = MERGE;
+                r.slide();
+                r.forged_move((0, 0), sent);
+                r.wait(1_500);
+                three_still_clicks(&mut r);
+                assert!(
+                    r.clicks.iter().all(|c| *c == refused("no_move")),
+                    "slide, {fakes:?}, sent {sent}: {:?}",
+                    r.clicks
+                );
+            }
+        }
+    }
+
+    /// Review I2: the cursor reaches Merge by moves this window never gets (over another
+    /// program's window lying on top of it, which then goes). Windows' own move when Merge is
+    /// uncovered under the still hand must not count as a move somewhere new: after a leave
+    /// the position is unknown, and the first move back only records it.
+    #[test] // spec: QA-088, QA-036
+    fn replay_moves_this_window_never_saw_dont_count() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(ROW, 30);
+            r.wait(500);
+            // An overlay lies over Merge; the hand moves onto it, then it goes.
+            r.unseen_to(MERGE);
+            r.fake_move();
+            r.wait(500);
+            three_still_clicks(&mut r);
+            r.report("unseen moves");
+            assert!(
+                r.clicks.iter().all(|c| *c == refused("no_move")),
+                "{fakes:?}: {:?}",
+                r.clicks
+            );
+            // The same while Merge is still grey, then it turns on under the pointer.
+            let mut r = Replay::open(fakes, false);
+            r.wait(2_000);
+            r.move_to(TASKBAR, 20);
+            r.activate_by_taskbar();
+            r.move_to(ROW, 10);
+            r.unseen_to(MERGE);
+            r.fake_move();
+            r.wait(1_500);
+            three_still_clicks(&mut r);
+            assert!(
+                r.clicks.iter().all(|c| *c == refused("no_move")),
+                "grey, {fakes:?}: {:?}",
+                r.clicks
+            );
+        }
+    }
+
+    /// Task 28c re-review N1, **pinned as open** (ruled a documented residual 2026-10-25): a warp
+    /// merged with Windows' own move into one move. While Merge is grey, the cursor is on the
+    /// window's own row; another program warps it onto grey Merge and at once triggers one of
+    /// Windows' own moves, so the window gets a single move at the new place. If Windows' own
+    /// moves report `IMO_HARDWARE`, that move is a real move somewhere new, the rest starts,
+    /// and a still owner click once Merge is live merges. No `GetCursorPos` rule can tell it
+    /// from the hand; closing it needs raw input (backlog: Task 28c option (b), with the Phase B
+    /// measurement of what that merged move reports). The Merge gate is defence in depth: every
+    /// unlock still needs the owner's PIN at the Windows Hello prompt. This test records the
+    /// case; when it is closed, the Hardware row becomes all `no_move`.
+    #[test] // spec: QA-088, QA-036
+    fn replay_a_warp_merged_with_windows_own_move_is_open_under_hardware() {
+        for fakes in ALL_FAKES {
+            let mut r = Replay::open(fakes, true);
+            r.move_to(ROW, 20);
+            r.wait(100);
+            r.merged_warp(MERGE);
+            r.wait(1_500);
+            three_still_clicks(&mut r);
+            r.report("merged warp");
+            match fakes {
+                Fakes::NoMove | Fakes::System => assert!(
+                    r.clicks.iter().all(|c| *c == refused("no_move")),
+                    "{fakes:?}: {:?}",
+                    r.clicks
+                ),
+                // OPEN (backlog, option (b)): a still owner click merges.
+                Fakes::Hardware => assert_eq!(r.clicks[0], Click::Accepted, "{fakes:?}"),
+            }
+        }
+    }
+
+    /// Task 28c re-review N2: a press on the window itself, or the accept button losing the
+    /// capture to anything but its own real release, forgets where the cursor is: another
+    /// thread holding the capture could have moved it unseen. A press doesn't move the cursor,
+    /// so the next move just records it, and the rest itself is untouched.
+    #[test] // spec: QA-088, QA-036
+    fn a_press_or_a_lost_capture_forgets_where_the_cursor_was() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let real = |x: i32| PointerMsg {
+            origin: InputOrigin::Hardware,
+            device: InputDevice::Mouse,
+            sent: false,
+            at: Some((x, 10)),
+        };
+        // The window's own press (grey Merge, or the click that brings it forward).
+        let mut g = ClickGate::new();
+        g.restart(Some((0, 0)));
+        g.window_tracking(true);
+        assert!(g.window_move(true, real(1), at(0)));
+        assert_eq!(g.window_press(true), Some(Refusal::NotLiveYet));
+        // Windows' own move after the capture went, at a place this window never saw.
+        assert!(!g.window_move(true, real(5), at(10)));
+        g.window_tracking(true);
+        assert!(g.window_move(true, real(6), at(20)));
+        // The rest from before the press is still there.
+        g.button_tracking(true);
+        g.button_press(true, real(6), at(400));
+        assert_eq!(g.button_release(true, real(6)), (true, None));
+
+        // Merge loses the capture during a held press, not by its own real release.
+        let mut g = ClickGate::new();
+        g.restart(Some((0, 0)));
+        g.button_tracking(true);
+        assert!(g.button_move(true, real(1), at(0)));
+        g.button_press(true, real(1), at(400));
+        g.capture_changed();
+        assert!(!g.button_move(true, real(5), at(410)));
+        g.button_tracking(true);
+        assert!(g.button_move(true, real(6), at(420)));
+    }
+
+    /// The gates the replays must not loosen: a warp, a slide, the live delay and input that
+    /// isn't a real pointer never merge, however long the owner then waits or clicks.
+    #[test] // spec: QA-088, QA-036
+    fn replay_a_warp_a_slide_or_injected_input_never_merges() {
+        for fakes in ALL_FAKES {
+            // A warp onto live Merge while the owner's hand is still: no click counts.
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(ROW, 30);
+            r.wait(500);
+            r.warp(MERGE);
+            for _ in 0..4 {
+                r.click();
+                r.wait(400);
+            }
+            r.report("warp");
+            assert!(
+                r.clicks.iter().all(|c| *c == refused("no_move")),
+                "warp, {fakes:?}: {:?}",
+                r.clicks
+            );
+
+            // The owner rested on Merge and moved away; the cursor was warped back.
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(MERGE, 30);
+            r.wait(500);
+            r.move_to(BODY, 10);
+            r.warp(MERGE);
+            r.click();
+            r.wait(400);
+            r.click();
+            r.report("warp back");
+            assert!(
+                r.clicks.iter().all(|c| *c == refused("no_move")),
+                "warp back, {fakes:?}: {:?}",
+                r.clicks
+            );
+
+            // Merge slides under the parked pointer: no click counts, while it is grey or
+            // after it turns on again.
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to((MERGE.0 - 200, MERGE.1), 20);
+            r.wait(500);
+            r.cursor = MERGE; // the window moved 200 px left under the still cursor
+            r.slide();
+            for _ in 0..6 {
+                r.wait(400);
+                r.click();
+            }
+            r.report("slide");
+            assert!(
+                r.clicks.iter().all(|c| *c != Click::Accepted),
+                "slide, {fakes:?}: {:?}",
+                r.clicks
+            );
+
+            // Clicks that aren't from the hardware pointer, after a real rest: never.
+            let mut r = Replay::open(fakes, true);
+            r.wait(3_000);
+            r.move_to(MERGE, 30);
+            r.wait(500);
+            for origin in [
+                InputOrigin::Injected,
+                InputOrigin::System,
+                InputOrigin::Unavailable,
+            ] {
+                r.click_from(origin);
+                r.wait(400);
+            }
+            assert!(
+                r.clicks.iter().all(|c| *c == refused("not_pointer")),
+                "injected, {fakes:?}: {:?}",
+                r.clicks
+            );
+
+            // In front, rested on Merge, but clicked within the live delay: grey.
+            let mut r = Replay::open(fakes, true);
+            r.move_to(MERGE, 30);
+            r.wait(300);
+            r.click();
+            assert_eq!(r.clicks, [refused("not_live_yet")], "early, {fakes:?}");
+        }
     }
 
     /// Re-review 3 m2 and m4: other programs can't relabel the buttons or rewrite the text.
