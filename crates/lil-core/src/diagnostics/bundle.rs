@@ -20,16 +20,17 @@
 //! that never replaces), so nothing is written anywhere else. No path is handed out twice: a
 //! taken name, or one this core handed out already, is skipped for the next number. Then the
 //! folder keeps the newest [`KEEP_BUNDLES`] bundles, ordered by time stamp, then number (as a
-//! number); a bundle of the new one's second or later is never removed, so a burst within one
-//! second keeps every bundle of it, and the next bundle trims the older ones. A log whose file
-//! name a rule changes is named `logs/redacted-<n>.<date>.log`. Nothing is sent anywhere
+//! number); a bundle whose file was made less than [`YOUNG_BUNDLE`] ago (by the file system's
+//! creation time, not its name's time stamp) is never removed, so a burst keeps every bundle
+//! of it, and after the clock moves back no bundle removes the one made before it. A log whose
+//! file name a rule changes is named `logs/redacted-<n>.<date>.log`. Nothing is sent anywhere
 //! (ARCH-122).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lil_platform::Env;
 use lil_protocol::{BUILD_ID, ErrorBody, PROTOCOL, codes, schema_hash};
@@ -48,8 +49,11 @@ use crate::tools::CallCtx;
 pub const LOG_TAIL_BYTES: u64 = 5 * 1024 * 1024;
 /// How much of the logs goes in, in all.
 pub const LOGS_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
-/// How many bundles the diagnostics folder keeps, beyond those of the newest bundle's second.
+/// How many bundles the diagnostics folder keeps, beyond those made less than
+/// [`YOUNG_BUNDLE`] ago.
 pub const KEEP_BUNDLES: usize = 10;
+/// A bundle made less than this long ago (by its file's creation time) is never removed.
+pub const YOUNG_BUNDLE: Duration = Duration::from_secs(60);
 /// A bundle's name before its time stamp.
 const BUNDLE_PREFIX: &str = "lilith-diagnostics-";
 /// The manifest's `bundle` version.
@@ -335,7 +339,7 @@ fn write_bundle(
         set().contains(&key(candidate))
     })?;
     set().insert(key(&path));
-    prune_bundles(env, &lil_schema::time::compact(parts.unix_secs));
+    prune_bundles(env);
     Ok(BundleResult {
         path: path.display().to_string(),
         bytes: bytes.len() as u64,
@@ -352,15 +356,35 @@ fn bundle_order(name: &str) -> Option<(String, u64)> {
         Some((stamp, k)) => (stamp, k.parse().ok()?),
         None => (stem, 1),
     };
-    let stamped = stamp.len() == 16 && stamp.as_bytes()[8] == b'T' && stamp.ends_with('Z');
+    let b = stamp.as_bytes();
+    let stamped = b.len() == 16
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 => *c == b'T',
+            15 => *c == b'Z',
+            _ => c.is_ascii_digit(),
+        });
     stamped.then(|| (stamp.to_string(), number))
 }
 
+/// Whether the file at `path` was made less than [`YOUNG_BUNDLE`] ago, by the file system's
+/// creation time (real time, whatever the name's time stamp says); a time that can't be read
+/// counts as young.
+fn is_young(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.created())
+        .map_or(true, |created| {
+            SystemTime::now()
+                .duration_since(created)
+                .map_or(true, |age| age < YOUNG_BUNDLE)
+        })
+}
+
 /// Keeps the newest [`KEEP_BUNDLES`] bundles of the diagnostics folder: while there are more,
-/// the oldest is removed (by time stamp, then number), but never one stamped `current` (the
-/// second of the bundle just made, which every path handed out in that second shares) or
-/// later. Other files are never touched; one that can't be removed is left.
-fn prune_bundles(env: &Env, current: &str) {
+/// the oldest is removed (by time stamp, then number), but never one made less than
+/// [`YOUNG_BUNDLE`] ago ([`is_young`]), so neither a burst nor a clock moved back makes a
+/// bundle remove one made just before it. Other files are never touched; one that can't be
+/// removed is left.
+fn prune_bundles(env: &Env) {
     let dir = env.diagnostics_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -372,11 +396,15 @@ fn prune_bundles(env: &Env, current: &str) {
         .collect();
     bundles.sort();
     let mut excess = bundles.len().saturating_sub(KEEP_BUNDLES);
-    for ((stamp, _), name) in &bundles {
-        if excess == 0 || stamp.as_str() >= current {
+    for (_, name) in &bundles {
+        if excess == 0 {
             break;
         }
-        match fsops::remove_suite_cache_file(env, &dir.join(name)) {
+        let path = dir.join(name);
+        if is_young(&path) {
+            continue;
+        }
+        match fsops::remove_suite_cache_file(env, &path) {
             Ok(()) => excess -= 1,
             Err(e) => {
                 tracing::warn!(bundle = %name, error = %e, "an old diagnostics bundle could not be removed");

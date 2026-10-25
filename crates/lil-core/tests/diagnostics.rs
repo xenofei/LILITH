@@ -243,8 +243,17 @@ fn profile_folder_and_machine_name_are_rewritten() {
         "built on <machine>, logs jobs.<machine>.2026-10.jsonl, host <machine>."
     );
     assert_eq!(n, 3);
-    let (kept, none) = r.text("TESTBOX_7QX and XTESTBOX_7Q");
-    assert_eq!((kept.as_str(), none), ("TESTBOX_7QX and XTESTBOX_7Q", 0));
+    // A name of 6 characters or more goes inside a word too; a shorter one only whole.
+    let (inside, n) = r.text("TESTBOX_7QX and XTESTBOX_7Q");
+    assert_eq!((inside.as_str(), n), ("<machine>X and X<machine>", 2));
+    let short = Redactor {
+        machine: Some("PC7Q".to_string()),
+        ..Redactor::default()
+    };
+    assert_eq!(
+        short.text("PC7QX and XPC7Q and PC7Q").0,
+        "PC7QX and XPC7Q and <machine>"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -855,12 +864,15 @@ fn every_canary_is_gone_from_every_entry() {
     ));
     let _core = CoreFixture::start_with_env(&env, &[("COMPUTERNAME", &canary.machine)]);
     let mut pipe = session(&env, None);
-    // Each canary after a space, and each after a `\n` (an escape before a value, N1).
+    // Each canary after a space, after a `\n` (an escape before a value, N1), after an ANSI
+    // colour code and after `%3D`.
     let spaced = canary.parts.join(" ");
     let lined = canary.parts.join("\n");
+    let coloured = format!("\u{1b}[32m{}", canary.parts.join("\u{1b}[0m\u{1b}[32m"));
+    let encoded = canary.parts.join("%3D");
 
-    // A log line holding the canaries three times: plain, `Debug`-escaped and line by line;
-    // and a log whose file name holds the account name.
+    // A log line holding the canaries five times: plain, `Debug`-escaped, line by line,
+    // coloured and percent-joined; and a log whose file name holds the account name.
     let today = lil_schema::time::date(
         SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -868,7 +880,7 @@ fn every_canary_is_gone_from_every_entry() {
             .as_secs() as i64,
     );
     let line = json!({"fields": {"message": spaced, "report": format!("{spaced:?}"),
-                                 "lines": lined}});
+                                 "lines": lined, "coloured": coloured, "encoded": encoded}});
     write_file(
         &env.env.logs_dir().join(format!("plant.{today}.log")),
         format!("{line}\n").as_bytes(),
@@ -933,8 +945,10 @@ fn every_canary_is_gone_from_every_entry() {
         found.keys()
     );
 
-    // Each stage did its part in the plant log (so skipping one stage fails here).
-    let copies = 3;
+    // Each stage did its part in the plant log (so skipping one stage fails here), and no
+    // terminal control sequence is left.
+    assert!(!plant.contains(r"\u001b"), "{plant}");
+    let copies = 5;
     assert_eq!(
         plant.matches("%USERPROFILE%").count(),
         canary.paths * copies,
@@ -997,8 +1011,8 @@ async fn a_bundle_in_the_same_second_never_replaces_another() {
 }
 
 /// The folder keeps the newest 10 bundles, by time stamp and then number compared as a number:
-/// a burst within one second keeps every bundle of it, and a bundle a second later trims the
-/// older ones back to 10, keeping the newest second's.
+/// a burst keeps every bundle of it while they are young, and once they are older than a
+/// minute, a bundle a second later trims them back to 10, the oldest first.
 #[tokio::test] // spec: ARCH-121, P4a-R19
 async fn a_bundle_a_second_later_trims_the_folder_back_to_ten() {
     let env = TestEnv::new();
@@ -1027,6 +1041,10 @@ async fn a_bundle_a_second_later_trims_the_folder_back_to_ten() {
     want.insert(notes.display().to_string());
     assert_eq!(listed(), want, "a burst of 15 in one second keeps all 15");
 
+    // Made 2 minutes ago, as far as the file system knows: old enough to remove.
+    for path in &burst {
+        created_ago(Path::new(path), Duration::from_secs(120));
+    }
     clock.advance(Duration::from_secs(1));
     let later = d.bundle(&ctx, None).await.unwrap().path;
     // The oldest go: no suffix, then -2 … -6 (numbers, so -10 … -15 are newer than -2).
@@ -1037,11 +1055,74 @@ async fn a_bundle_a_second_later_trims_the_folder_back_to_ten() {
     assert!(!later.ends_with("-2.zip"), "{later}");
 }
 
+/// Sets the file system's creation time of `path` to `ago` before now.
+#[allow(clippy::disallowed_methods)]
+fn created_ago(path: &Path, ago: Duration) {
+    use std::os::windows::fs::FileTimesExt as _;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_created(SystemTime::now() - ago))
+        .unwrap();
+}
+
+/// The diagnostics folder's files.
+fn diagnostics_files(env: &TestEnv) -> BTreeSet<String> {
+    std::fs::read_dir(env.env.diagnostics_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path().display().to_string())
+        .collect()
+}
+
+/// Retention never removes a bundle whose file was made less than 60 s ago, judged by the
+/// file system's creation time, not the name's time stamp. After the clock moves back, the
+/// bundles stamped later sort as the newest; still no bundle removes the one made before it,
+/// and the older files go instead.
+#[tokio::test] // spec: ARCH-121, P4a-R19
+async fn a_clock_moved_back_never_makes_a_bundle_remove_the_one_before_it() {
+    let env = TestEnv::new();
+    let clock = FakeClock::new();
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let d = Diagnostics::new(
+        env.env.clone(),
+        clock.clone(),
+        events.clone(),
+        DiagnosticsSources::default(),
+    );
+    let ctx = common::ctx(&env, lil_protocol::CallerKind::Cli, &events);
+    // Ten bundles an hour ahead, made 2 minutes ago as far as the file system knows.
+    clock.shift_utc(3600);
+    let mut ahead = Vec::new();
+    for _ in 0..10 {
+        ahead.push(d.bundle(&ctx, None).await.unwrap().path);
+        clock.advance(Duration::from_secs(1));
+    }
+    for path in &ahead {
+        created_ago(Path::new(path), Duration::from_secs(120));
+    }
+    // The clock goes back past them; three bundles a second apart.
+    clock.shift_utc(-3700);
+    let mut made: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        made.push(d.bundle(&ctx, None).await.unwrap().path);
+        for path in &made {
+            assert!(Path::new(path).exists(), "{path} was removed: {made:?}");
+        }
+        clock.advance(Duration::from_secs(1));
+    }
+    // Back to 10: the three new ones, and the newest seven by time stamp.
+    let want: BTreeSet<String> = ahead[3..].iter().chain(&made).cloned().collect();
+    assert_eq!(diagnostics_files(&env), want);
+}
+
 /// A message is redacted whole before the 2,000-character cut, and the cut never leaves part
-/// of a word, so no fragment of a secret or a path is left that no rule knows.
+/// of a word, so no fragment of a secret or a path is left that no rule knows. A label with a
+/// space straddling the cut shows that the order matters: cut first, its first word would
+/// stay.
 #[tokio::test] // spec: ARCH-121, QA-084
 async fn a_long_error_message_is_redacted_before_it_is_cut() {
     let env = TestEnv::new();
+    env.suite_toml_set(
+        "[[claude_code.profiles]]\nid = \"p_cut\"\nlabel = \"Straddle Qz7 Label\"\n",
+    );
     let events = Arc::new(EventBus::new(FakeClock::new()));
     let d = diagnostics(&env, &events);
     let token = format!("ghp_{}", "Zz9".repeat(12));
@@ -1061,6 +1142,18 @@ async fn a_long_error_message_is_redacted_before_it_is_cut() {
     let last = errors["errors"][0]["last_message"].as_str().unwrap();
     assert!(!last.contains("ghp_") && !last.contains("Zz9"), "{last}");
     assert!(last.chars().count() <= 2000, "{}", last.len());
+
+    // The label straddles the cut: the cut keeps 1,999 characters and goes back to the last
+    // space, so cut first, "Straddle" (characters 1,989 to 1,996) would stay and the rest go.
+    let message = format!("{} Straddle Qz7 Label after", "x".repeat(1988));
+    d.record_error("long.label", None, &message, 2);
+    let result = d.bundle(&ctx, None).await.unwrap();
+    let text = &entries(Path::new(&result.path))["errors.json"];
+    let errors: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(errors["errors"][0]["code"], "long.label", "{errors}");
+    for part in ["Straddle", "Qz7", "Label"] {
+        assert!(!text.contains(part), "{part} is in errors.json:\n{text}");
+    }
 }
 
 #[test] // spec: ARCH-121

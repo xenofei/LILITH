@@ -1,21 +1,27 @@
 //! The diagnostics bundle's redaction (ARCH-121, QA-084, AI-092; Appendix G "Diagnostics").
 //!
-//! [`Compiled::text`] runs these rules over every entry, in order; each replacement counts
-//! once:
+//! [`Compiled::text`] runs these rules over every entry, in order, and then again until
+//! nothing changes, at most [`MAX_PASSES`] times, so a value encoded inside another encoding
+//! goes too; each replacement counts once:
 //!
-//! 0. **Decoding.** `%5C`, `%2F`, `%3A`, `%40` and `%20`, and the JSON escapes `\u005c`,
-//!    `\u002f`, `\u003a`, `\u0040`, `\u0020` and those of non-ASCII characters, are decoded
-//!    first (a backslash stays escaped as `\\`), so an encoded path, name or address is seen.
+//! 0. **Terminal control sequences and decoding.** First every terminal control sequence is
+//!    removed: CSI (`ESC [`, parameters, a final byte), OSC (`ESC ]` to a BEL or `ESC \`) and
+//!    any other `ESC` with its intermediate and final bytes, the `ESC` raw or written `\u001b`,
+//!    `\x1b` or `\u{1b}` after any run of `\`; a run of them between two word characters leaves
+//!    a space. Then one level of encoding is decoded: `%5C`, `%2F`, `%3A`, `%40`, `%20`, `%2B`,
+//!    `%3D` and `%25`, percent-encoded UTF-8, and the `\uXXXX` (after any run of `\`), `&#NN;`
+//!    and `&#xHH;` forms of those characters and of non-ASCII ones (a backslash stays escaped
+//!    as `\`), so an encoded path, name or address is seen.
 //! 1. **Names**: every Claude Code profile label and profile folder (`config_dir`) of
-//!    `suite.toml`, and any other name given, as written or JSON-escaped, in any letter case,
-//!    as a whole word: `<redacted>`.
+//!    `suite.toml`, and any other name given, as written or JSON-escaped: `<redacted>`.
 //! 2. **The user-profile folder**: `%USERPROFILE%`, in its long form and its 8.3 short form,
 //!    in any letter case, with any run of `\` or `/` as a separator (so escaped once or twice),
-//!    with or without a `\\?\` prefix, ending where a name can't go on (owner decision
-//!    2026-10-22).
-//! 3. **SIDs** (`S-1-<n>-<n>…`, any case): `<sid>`.
-//! 4. **`<scheme>:open/<base64url>`** with a payload that decodes: `open/<redacted>`.
-//! 5. **Deny URL tokens** (`deny/<confirmation id>/<token>`): the token.
+//!    with or without a `\?\` prefix (owner decision 2026-10-22).
+//! 3. **SIDs** (`S-1-<n>-<n>…`, any case), whatever follows them: `<sid>`.
+//! 4. **`<scheme>:open/<payload>`** under a suite scheme (also `lil://open/`, and with `/`
+//!    escaped), whether the payload decodes or not: `open/<redacted>`.
+//! 5. **Deny URL tokens** (`deny/<confirmation id>/<token>`, each `/` escaped or not): the
+//!    token.
 //! 6. **Well-known secret formats**, with no key before them: GitHub tokens (`gh[pousr]_…`,
 //!    `github_pat_…`), Hugging Face (`hf_…`), Anthropic and OpenAI keys (`sk-ant-…`, `sk-…`),
 //!    age secret keys (`AGE-SECRET-KEY-1…`), Slack (`xox[abpr]-…`), AWS key ids (`AKIA…`) and
@@ -23,18 +29,24 @@
 //! 7. **Credential Manager targets**: [`names::APP_NAME`] or [`names::LEGACY_APP_NAME`], an
 //!    optional `-<channel>`, then `/<name>`, in any letter case; a quoted target to its quote.
 //! 8. **E-mail addresses** (`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`).
-//! 9. **The account name** (the profile folder's last part, 4 characters or more), in any
-//!    letter case, as a whole word: `<user>`.
-//! 10. **The computer name** (its NetBIOS and DNS names, and their machine-id spellings), in any
-//!     letter case, as a whole word: `<machine>`.
+//! 9. **The account name** (the profile folder's last part, 4 characters or more): `<user>`.
+//! 10. **The computer name** (its NetBIOS and DNS names, and their machine-id spellings):
+//!     `<machine>`.
 //! 11. **Values under scrub-word keys** ([`SCRUB_WORDS`], upper-cased). A key is a run of
 //!     letters, digits, `_`, `-` and `.`, optionally quoted (with any escaping), followed by
 //!     `=` or `:` (never `::`, a Rust path, and never a `.rs` file's line number). Its value is
-//!     the quoted string (with any escaping), the bracketed JSON, a `Debug` call such as
-//!     `Some("…")` or `Secret("…")` to its closing parenthesis, or the word after it (two words
-//!     after `Bearer`, `Basic`, `Digest` or `Token`). A flag holding a scrub word
-//!     (`--api-key`) takes the next argument as its value, space-separated or the next
-//!     element of an array.
+//!     the quoted string (with any escaping), a TOML multi-line string (`'''…'''` or
+//!     `"""…"""`, escaped any number of times) to its closer or, never closed, to the end of
+//!     its line, the bracketed JSON, a `Debug` call such as `Some("…")` or `Secret("…")` to its
+//!     closing parenthesis, or the word after it (two words after `Bearer`, `Basic`, `Digest`
+//!     or `Token`). A flag holding a scrub word (`--api-key`) takes the next argument as its
+//!     value, space-separated or the next element of an array.
+//!
+//! The known literals of rules 1, 2, 9 and 10 match in any letter case, a run of `\` or `/`
+//! matching any such run; one of [`ANYWHERE_CHARS`] characters or more goes wherever it is,
+//! inside a word too, and a shorter one only as a whole word. No literal is matched inside a
+//! placeholder. Whether a value starts a word is one test for every rule ([`starts_word`]),
+//! which counts an escape right before it as a boundary.
 //!
 //! In `suite.toml` the TOML is read first ([`Redactor::toml`]): every value under a scrub-word
 //! key or table, and each `[[claude_code.profiles]]` `label`; then the rules above over the
@@ -48,6 +60,11 @@ use lil_platform::names;
 
 /// How many decode-and-redact passes [`Redactor::text`] makes at most.
 pub const MAX_PASSES: usize = 3;
+/// A known literal this long or longer (in characters) goes wherever it is, inside a word too;
+/// a shorter one only as a whole word.
+pub const ANYWHERE_CHARS: usize = 6;
+/// The longest OSC body (`ESC ]` … BEL or `ESC \`) that is looked through for its end.
+const MAX_OSC_BYTES: usize = 4096;
 /// What a redacted value becomes.
 pub const REDACTED: &str = "<redacted>";
 /// What the user-profile folder becomes.
@@ -58,6 +75,8 @@ pub const MACHINE: &str = "<machine>";
 pub const SID: &str = "<sid>";
 /// What the account name becomes.
 pub const USER: &str = "<user>";
+/// The placeholders, which no literal is ever matched inside.
+const PLACEHOLDERS: [&str; 5] = [PROFILE, REDACTED, USER, MACHINE, SID];
 /// Appendix F's scrub words: a key holding one (upper-cased) has its value redacted.
 pub const SCRUB_WORDS: [&str; 7] = [
     "KEY",
@@ -203,10 +222,11 @@ impl Compiled {
 
     /// One decode-and-redact pass over `s` (module docs).
     fn pass(&self, s: &str, n: &mut u32) -> String {
-        let s = decode_escapes(s);
+        let s = strip_terminal(s);
+        let s = decode_escapes(&s);
         let mut s = s.into_owned();
         for word in &self.words {
-            s = replace_words(&s, word, REDACTED, n);
+            s = replace_literal(&s, word, REDACTED, n);
         }
         let s = self.profile(&s, n);
         let s = sids(&s, n);
@@ -216,10 +236,10 @@ impl Compiled {
         let s = targets(&s, n);
         let mut s = emails(&s, n);
         if let Some(user) = &self.user {
-            s = replace_words(&s, user, USER, n);
+            s = replace_literal(&s, user, USER, n);
         }
         for form in &self.machines {
-            s = replace_words(&s, form, MACHINE, n);
+            s = replace_literal(&s, form, MACHINE, n);
         }
         keys(&s, n)
     }
@@ -265,6 +285,149 @@ impl Compiled {
     }
 }
 
+/// An `ESC` at byte `i` of `b`: the raw byte, or `\u001b`, `\x1b` or `\u{1b}` after any run of
+/// `\` (a JSON string, or one inside another). Its end, how many of the run's backslashes
+/// stay (the escapes of other levels, as [`decode_escapes`] keeps them), and whether it was
+/// the raw byte.
+fn esc_at(b: &[u8], i: usize) -> Option<(usize, usize, bool)> {
+    match *b.get(i)? {
+        0x1b => return Some((i + 1, 0, true)),
+        b'\\' => {}
+        _ => return None,
+    }
+    let run = b[i..].iter().take_while(|c| **c == b'\\').count();
+    let rest = &b[i + run..];
+    let body = if rest.len() >= 5 && rest[0] == b'u' && rest[1..5].eq_ignore_ascii_case(b"001b") {
+        5
+    } else if rest.len() >= 3 && rest[0] == b'x' && rest[1..3].eq_ignore_ascii_case(b"1b") {
+        3
+    } else if rest.starts_with(b"u{") {
+        let digits = rest[2..]
+            .iter()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        let hex = std::str::from_utf8(&rest[2..2 + digits]).unwrap_or_default();
+        (digits > 0
+            && rest.get(2 + digits) == Some(&b'}')
+            && u32::from_str_radix(hex, 16) == Ok(0x1b))
+        .then_some(3 + digits)?
+    } else {
+        return None;
+    };
+    let keep = if run % 2 == 1 { run - 1 } else { run - 2 };
+    Some((i + run + body, keep, false))
+}
+
+/// The end of the string terminator `ESC \` at byte `j`, if one is there: after a raw `ESC`
+/// one `\`, after a written one a `\` written as `\\` (any even run).
+fn st_at(b: &[u8], j: usize) -> Option<usize> {
+    let (end, _, raw) = esc_at(b, j)?;
+    let run = b[end..].iter().take_while(|c| **c == b'\\').count();
+    let take = if raw { run.min(1) } else { run - run % 2 };
+    (take > 0).then_some(end + take)
+}
+
+/// The end of a BEL at byte `j`: the raw byte, or `\u0007`, `\x07` or `\a` after a run of `\`.
+fn bel_at(b: &[u8], j: usize) -> Option<usize> {
+    if b.get(j) == Some(&0x07) {
+        return Some(j + 1);
+    }
+    let run = b.get(j..)?.iter().take_while(|c| **c == b'\\').count();
+    let rest = &b[j + run..];
+    if run == 0 {
+        None
+    } else if rest.starts_with(b"u0007") {
+        Some(j + run + 5)
+    } else if rest.starts_with(b"x07") {
+        Some(j + run + 3)
+    } else if rest.starts_with(b"a") {
+        Some(j + run + 1)
+    } else {
+        None
+    }
+}
+
+/// The end of the terminal control sequence whose `ESC` ([`esc_at`]) ends at `p`: a lone
+/// `ESC \`, CSI `[` (parameters, intermediates, a final byte), OSC `]` to its BEL or `ESC \`,
+/// or another `ESC` with its intermediates and final byte; just the `ESC` when what follows is
+/// none of these. A `"` or a `\` never belongs to one, so JSON stays JSON.
+fn sequence_end(b: &[u8], start: usize, p: usize) -> usize {
+    let at = |j: usize| b.get(j).copied();
+    let in_range = |c: Option<u8>, lo: u8, hi: u8| c.is_some_and(|c| (lo..=hi).contains(&c));
+    if let Some(end) = st_at(b, start) {
+        return end;
+    }
+    match at(p) {
+        Some(b'[') => {
+            let mut j = p + 1;
+            while in_range(at(j), 0x30, 0x3f) {
+                j += 1;
+            }
+            while in_range(at(j), 0x20, 0x2f) && at(j) != Some(b'"') {
+                j += 1;
+            }
+            if in_range(at(j), 0x40, 0x7e) && at(j) != Some(b'\\') {
+                j + 1
+            } else {
+                p + 1
+            }
+        }
+        Some(b']') => {
+            let mut j = p + 1;
+            while j < b.len() && j - p <= MAX_OSC_BYTES && !matches!(b[j], b'"' | b'\n') {
+                if let Some(end) = bel_at(b, j).or_else(|| st_at(b, j)) {
+                    return end;
+                }
+                j += 1;
+            }
+            p + 1
+        }
+        _ => {
+            let mut j = p;
+            while in_range(at(j), 0x20, 0x2f) && at(j) != Some(b'"') {
+                j += 1;
+            }
+            if in_range(at(j), 0x30, 0x7e) && at(j) != Some(b'\\') {
+                j + 1
+            } else {
+                p
+            }
+        }
+    }
+}
+
+/// `s` with every terminal control sequence removed (module docs, rule 0); borrowed when it
+/// has none. A run of them between two word characters leaves a space, so a value right after
+/// one still starts a word.
+fn strip_terminal(s: &str) -> Cow<'_, str> {
+    if !s.contains('\u{1b}') && !s.contains("1b") && !s.contains("1B") {
+        return Cow::Borrowed(s);
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut last, mut i) = (0, 0);
+    while i < b.len() {
+        let Some((p, keep, _)) = esc_at(b, i) else {
+            i += 1;
+            continue;
+        };
+        out.push_str(&s[last..i + keep]);
+        let mut end = sequence_end(b, i, p);
+        // The sequences right after it go with it.
+        while let Some((p, 0, _)) = esc_at(b, end) {
+            end = sequence_end(b, end, p);
+        }
+        let joins = |c: Option<char>| c.is_some_and(word_char);
+        if joins(out.chars().next_back()) && joins(s[end..].chars().next()) {
+            out.push(' ');
+        }
+        last = end;
+        i = end;
+    }
+    out.push_str(&s[last..]);
+    Cow::Owned(out)
+}
+
 /// `s` with one level of the encodings of rule 0 decoded (module docs); borrowed when there are
 /// none. `%25` decodes to `%`, so a twice percent-encoded form is decoded by the next pass; a
 /// run of percent-encoded bytes that is UTF-8 decodes to its characters; a `\uXXXX` escape
@@ -283,7 +446,7 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
     // What a code point decodes to, if it is one rule 0 decodes.
     let decoded = |code: u32| match code {
         0x5c => Some(r"\\".to_string()),
-        0x2f | 0x3a | 0x40 | 0x20 => char::from_u32(code).map(String::from),
+        0x2f | 0x3a | 0x40 | 0x20 | 0x2b | 0x3d => char::from_u32(code).map(String::from),
         0xa0.. => char::from_u32(code).map(String::from),
         _ => None,
     };
@@ -409,9 +572,10 @@ impl ProfileForm {
 
     /// The end of this form in `s` from byte `i`, if it is there: an optional `\\?\` prefix,
     /// the drive (or, without a prefix, none), then each part after a separator, in any letter
-    /// case, and then a place where a name can't go on ([`name_ends_at`]). A separator is any
-    /// run of `\` or `/`, so a path escaped once (JSON) or twice (`Debug` text inside a JSON
-    /// line) matches too, and so does the prefix in any of those spellings.
+    /// case; and, for a form shorter than [`ANYWHERE_CHARS`], then a place where a name can't
+    /// go on ([`name_ends_at`]). A separator is any run of `\` or `/`, so a path escaped once
+    /// (JSON) or twice (`Debug` text inside a JSON line) matches too, and so does the prefix in
+    /// any of those spellings.
     fn match_at(&self, s: &str, i: usize) -> Option<usize> {
         let b = s.as_bytes();
         let mut j = i;
@@ -434,7 +598,7 @@ impl ProfileForm {
             j += separator_at(b, j)?;
             j = match_ignoring_case(s, j, part)?;
         }
-        name_ends_at(s, j).then_some(j)
+        (self.len() >= ANYWHERE_CHARS || name_ends_at(s, j)).then_some(j)
     }
 }
 
@@ -482,9 +646,12 @@ fn word_char(c: char) -> bool {
 
 /// Whether a value may start at byte `i` of `s`, the one "not inside a word" test every rule
 /// uses: at the text's start, after a character that isn't a word character (as `word`
-/// says), or right after an escape (`\n`, `\r`, `\t`, `\b`, `\f` or `\uXXXX`, after any run of
-/// `\`): a JSON or string escape is a boundary, so a value at the start of an escaped line is
-/// found too. (`\"`, `\\` and `\/` end in a character that is no word character anyway.)
+/// says), or right after an escape: `\n`, `\r`, `\t`, `\b`, `\f`, `\v`, `\a`, `\e` or `\0`,
+/// `\xXX`, `\uXXXX` or `\UXXXXXXXX` (after any run of `\`), or `%XX`, decoded or not. An
+/// escape is a boundary, so a value at the start of an escaped line is found too. (`\"`,
+/// `\\`, `\/`, `\u{…}`, `&#NN;` and `&#xHH;` end in a character that is no word character
+/// anyway, and a terminal control sequence is stripped first, leaving a space between two
+/// word characters.)
 fn starts_word(s: &str, i: usize, word: impl Fn(char) -> bool) -> bool {
     if !s.is_char_boundary(i) {
         return false;
@@ -492,36 +659,84 @@ fn starts_word(s: &str, i: usize, word: impl Fn(char) -> bool) -> bool {
     let Some(prev) = s[..i].chars().next_back() else {
         return true;
     };
-    if !word(prev) {
-        return true;
-    }
-    let b = s.as_bytes();
-    let after_backslash = |at: usize| at > 0 && b[at - 1] == b'\\';
-    if matches!(prev, 'n' | 'r' | 't' | 'b' | 'f') && after_backslash(i - 1) {
-        return true;
-    }
-    i >= 6
-        && b[i - 5] == b'u'
-        && b[i - 4..i].iter().all(u8::is_ascii_hexdigit)
-        && after_backslash(i - 5)
+    !word(prev) || after_escape(s.as_bytes(), i)
 }
 
-/// Every whole-word `word` replaced by `with`, in any letter case: where the word starts (or
-/// ends) with a letter, digit or `_`, it starts a word ([`starts_word`]) and the character
-/// after it isn't one.
-fn replace_words(s: &str, word: &str, with: &str, n: &mut u32) -> String {
-    let (Some(first), Some(final_char)) = (word.chars().next(), word.chars().next_back()) else {
+/// Whether byte `i` of `b` comes right after one of [`starts_word`]'s escapes.
+fn after_escape(b: &[u8], i: usize) -> bool {
+    let after_backslash = |at: usize| at > 0 && b[at - 1] == b'\\';
+    // `letter` then `digits` hex digits, ending at `i`, after a `\`.
+    let hex_escape = |letter: u8, digits: usize| {
+        i > digits
+            && b[i - digits - 1] == letter
+            && b[i - digits..i].iter().all(u8::is_ascii_hexdigit)
+            && after_backslash(i - digits - 1)
+    };
+    (i >= 2
+        && matches!(
+            b[i - 1],
+            b'n' | b'r' | b't' | b'b' | b'f' | b'v' | b'a' | b'e' | b'0'
+        )
+        && after_backslash(i - 1))
+        || hex_escape(b'x', 2)
+        || hex_escape(b'u', 4)
+        || hex_escape(b'U', 8)
+        || (i >= 3 && b[i - 3] == b'%' && b[i - 2..i].iter().all(u8::is_ascii_hexdigit))
+}
+
+/// The end of the known literal `literal` in `s` from byte `j`, compared after normalising: in
+/// any letter case, and with a run of `\` or `/` in it matching any run of `\` or `/`.
+fn match_literal(s: &str, j: usize, literal: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut j = j;
+    let mut want = literal.chars().peekable();
+    while let Some(c) = want.next() {
+        if matches!(c, '\\' | '/') {
+            while want.next_if(|c| matches!(c, '\\' | '/')).is_some() {}
+            j += separator_at(b, j)?;
+            continue;
+        }
+        let got = s.get(j..)?.chars().next()?;
+        if !got.to_lowercase().eq(c.to_lowercase()) {
+            return None;
+        }
+        j += got.len_utf8();
+    }
+    Some(j)
+}
+
+/// Every known literal `literal` ([`match_literal`]) replaced by `with`, never inside a
+/// placeholder: wherever it is when it is [`ANYWHERE_CHARS`] characters or more, else as a
+/// whole word (where it starts or ends with a letter, digit or `_`, it starts a word,
+/// [`starts_word`], and the character after it isn't one).
+fn replace_literal(s: &str, literal: &str, with: &str, n: &mut u32) -> String {
+    let (Some(first), Some(final_char)) = (literal.chars().next(), literal.chars().next_back())
+    else {
         return s.to_string();
     };
+    let anywhere = literal.chars().count() >= ANYWHERE_CHARS;
+    let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
     while i < s.len() {
+        if matches!(b[i], b'%' | b'<')
+            && let Some(p) = PLACEHOLDERS.iter().find(|p| s[i..].starts_with(**p))
+        {
+            i += p.len();
+            continue;
+        }
         let c = s[i..].chars().next().unwrap_or_default();
-        let before_ok = !word_char(first) || starts_word(s, i, word_char);
-        if before_ok
-            && c.to_lowercase().eq(first.to_lowercase())
-            && let Some(end) = match_ignoring_case(s, i, word)
-            && (!word_char(final_char) || !s[end..].chars().next().is_some_and(word_char))
+        let first_ok = if matches!(first, '\\' | '/') {
+            matches!(c, '\\' | '/')
+        } else {
+            c.to_lowercase().eq(first.to_lowercase())
+        };
+        if first_ok
+            && (anywhere || !word_char(first) || starts_word(s, i, word_char))
+            && let Some(end) = match_literal(s, i, literal)
+            && (anywhere
+                || !word_char(final_char)
+                || !s[end..].chars().next().is_some_and(word_char))
         {
             out.push_str(&s[last..i]);
             out.push_str(with);
@@ -663,21 +878,41 @@ fn open_payloads(s: &str, n: &mut u32) -> String {
     out
 }
 
-/// `deny/cf_<16 hex>/<32 hex>` with its token replaced.
+/// `deny/cf_<16 hex>/<32 hex>` with its token replaced; each `/` may be escaped (`\/`, with any
+/// run of `\`).
 fn deny_tokens(s: &str, n: &mut u32) -> String {
-    const HEAD: &str = "deny/cf_";
     let b = s.as_bytes();
     let hex = |range: std::ops::Range<usize>| {
         b.get(range)
             .is_some_and(|r| r.iter().all(u8::is_ascii_hexdigit))
     };
+    // A `/`, escaped with any run of `\` or not: its length.
+    let slash = |at: usize| {
+        let run = b[at.min(b.len())..]
+            .iter()
+            .take_while(|c| **c == b'\\')
+            .count();
+        (b.get(at + run) == Some(&b'/')).then_some(run + 1)
+    };
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
-    while i + HEAD.len() <= b.len() {
-        if b[i..i + HEAD.len()].eq_ignore_ascii_case(HEAD.as_bytes()) {
-            let id = i + HEAD.len();
-            let token = id + 17;
-            if hex(id..id + 16) && b.get(id + 16) == Some(&b'/') && hex(token..token + 32) {
+    while i + 4 <= b.len() {
+        let id = b[i..i + 4]
+            .eq_ignore_ascii_case(b"deny")
+            .then(|| slash(i + 4))
+            .flatten()
+            .map(|len| i + 4 + len)
+            .filter(|cf| {
+                b.get(*cf..cf + 3)
+                    .is_some_and(|h| h.eq_ignore_ascii_case(b"cf_"))
+            })
+            .map(|cf| cf + 3);
+        if let Some(id) = id
+            && hex(id..id + 16)
+            && let Some(len) = slash(id + 16)
+        {
+            let token = id + 16 + len;
+            if hex(token..token + 32) {
                 out.push_str(&s[last..token]);
                 out.push_str(REDACTED);
                 *n += 1;
@@ -1125,7 +1360,7 @@ fn value_at(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
         Quote::None | Quote::Single => inner.to_string(),
     };
     // A TOML multi-line string (`'''…'''`, `"""…"""`, or `"""` escaped any number of times):
-    // to its closing delimiter, or the text's end.
+    // to its closing delimiter, or, never closed, to the end of its line.
     let escaped_triple = escaped_quote_at(b, k).and_then(|run| {
         let one = format!("{}\"", "\\".repeat(run));
         s[k..].starts_with(&one.repeat(3)).then(|| one.repeat(3))
@@ -1137,8 +1372,13 @@ fn value_at(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
         .or(escaped_triple);
     if let Some(delim) = triple {
         let inner = k + delim.len();
-        let close = s[inner..].find(&delim).map_or(s.len(), |p| inner + p);
-        let end = (close + delim.len()).min(s.len());
+        let (close, end) = match s[inner..].find(&delim) {
+            Some(p) => (inner + p, inner + p + delim.len()),
+            None => {
+                let line_end = s[inner..].find('\n').map_or(s.len(), |p| inner + p);
+                (line_end, line_end)
+            }
+        };
         return (s[inner..close] != *REDACTED)
             .then(|| (k, end, format!("{delim}{REDACTED}{delim}")));
     }
@@ -1496,8 +1736,10 @@ mod tests {
         }
     }
 
+    /// The profile folder is a literal of 6 characters or more: it goes wherever it is, even
+    /// where a longer folder name goes on after it (over-redaction is safe).
     #[test] // spec: ARCH-121
-    fn profile_forms_parse_and_match_only_whole_names() {
+    fn profile_forms_parse_and_match_anywhere() {
         assert_eq!(
             ProfileForm::parse(r"C:\Users\Fake"),
             Some(ProfileForm {
@@ -1515,9 +1757,8 @@ mod tests {
                 r"D:\x and c:/users/fake/üNÏ name/y",
                 r"D:\x and %USERPROFILE%/y",
             ),
-            (r"C:\Users\Fake\Ünï Name2\x", r"C:\Users\Fake\Ünï Name2\x"),
-            // Another folder, though the account name in it goes.
-            (r"C:\Users\Fake\Ünï Name.old", r"C:\Users\Fake\<user>.old"),
+            (r"C:\Users\Fake\Ünï Name2\x", r"%USERPROFILE%2\x"),
+            (r"C:\Users\Fake\Ünï Name.old", r"%USERPROFILE%.old"),
             (r"in C:\Users\Fake\Ünï Name.", r"in %USERPROFILE%."),
             (r"C%3A%5CUsers%5CFake%5CÜnï%20Name%5Cx", r"%USERPROFILE%\\x"),
             (
@@ -1543,7 +1784,11 @@ mod tests {
             assert_eq!(n, 1, "{text} -> {out}");
             assert!(out.starts_with("%USERPROFILE%"), "{out}");
         }
-        assert_eq!(compiled.text(r"C:\Users\Fake\LONGPR~12").1, 0);
+        // A literal of 6 characters or more goes even inside a longer name.
+        assert_eq!(
+            compiled.text(r"C:\Users\Fake\LONGPR~12"),
+            ("%USERPROFILE%2".to_string(), 1)
+        );
     }
 
     #[test] // spec: ARCH-121
@@ -1633,22 +1878,80 @@ mod tests {
         assert_eq!(r.text("--token --verbose").1, 0, "a flag is no value");
     }
 
+    /// A known literal of 6 characters or more goes wherever it is, inside a word and inside
+    /// text with no spaces; a shorter one only as a whole word; a placeholder is never
+    /// redacted again.
     #[test] // spec: ARCH-121
-    fn names_and_the_account_go_as_whole_words() {
+    fn known_literals_go_anywhere_and_short_ones_as_whole_words() {
         let r = Redactor {
             labels: vec!["Night Owl".into(), "Work".into()],
             profile_dir: Some(r"C:\Users\Fake\probeuser".into()),
             machine: Some("PROBEBOX-01".into()),
-            machine_names: vec!["probebox-01-long-dns-name".into()],
+            machine_names: vec!["probebox-01-long-dns-name".into(), "PC07".into()],
             names: vec![r"D:\claude\night-owl-x".into()],
         };
-        let (out, _) = r.text(
-            r"night owl and Workspace and Work; probeuser on PROBEBOX-01\probeuser via probebox-01-long-dns-name.lan, D:\claude\night-owl-x",
-        );
+        for (text, want) in [
+            (
+                r"night owl and Workspace and Work; probeuser on PROBEBOX-01\probeuser via probebox-01-long-dns-name.lan, D:\claude\night-owl-x",
+                r"<redacted> and Workspace and <redacted>; <user> on <machine>\<user> via <machine>.lan, <redacted>",
+            ),
+            (
+                "xprobeuserx and NightOwl and xNight Owlx",
+                "x<user>x and NightOwl and x<redacted>x",
+            ),
+            (
+                "用户probeuser登录 ユーザーPROBEBOX-01のPC",
+                "用户<user>登录 ユーザー<machine>のPC",
+            ),
+            (
+                "PC07 and PC07x and xPC07 and Workers",
+                "<machine> and PC07x and xPC07 and Workers",
+            ),
+        ] {
+            assert_eq!(r.text(text).0, want, "{text}");
+        }
+        // The test channel's account name is `profile`: it goes inside words, never inside a
+        // placeholder.
+        let r = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\profile".into()),
+            ..Redactor::default()
+        };
         assert_eq!(
-            out,
-            r"<redacted> and Workspace and <redacted>; <user> on <machine>\<user> via <machine>.lan, <redacted>"
+            r.text(r"C:\Users\Fake\profile\x and hardware_profile, <redacted>")
+                .0,
+            r"%USERPROFILE%\x and hardware_<user>, <redacted>"
         );
+    }
+
+    /// `config_dir`, the labels and the profile folder match after normalising: `/` and `\`
+    /// are the same, a run of them is one, and letter case is ignored.
+    #[test] // spec: ARCH-121
+    fn paths_and_labels_match_after_normalising() {
+        let r = Redactor {
+            labels: vec![r"Team/Night Owl".into()],
+            names: vec![r"D:\claude\owl-dir".into()],
+            ..Redactor::default()
+        };
+        for (text, secret) in [
+            // `Debug` inside JSON, as `tracing::warn!(dir = ?path)` writes it.
+            (
+                r#"{"m":"cfg { dir: \"D:\\\\claude\\\\owl-dir\" }"}"#,
+                "owl-dir",
+            ),
+            ("D:/claude/owl-dir/x", "owl-dir"),
+            (r"d:\CLAUDE\\Owl-Dir", "owl-dir"),
+            (r"D:\\\\claude//owl-dir", "owl-dir"),
+            (r"team\night owl", "night owl"),
+            (r#"{"m":"TEAM\\\\Night Owl"}"#, "night owl"),
+        ] {
+            let (out, n) = r.text(text);
+            assert!(!out.to_lowercase().contains(secret), "{text} -> {out}");
+            assert!(n >= 1, "{text} -> {out}");
+            if text.starts_with('{') {
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
+            }
+        }
     }
 
     #[test] // spec: ARCH-121
@@ -1662,30 +1965,58 @@ mod tests {
         assert!(out.contains("kept = 1"), "{out}");
     }
 
-    /// A JSON or string escape right before a value is a word boundary for every rule (one
-    /// helper, [`starts_word`]): `\n`, `\t`, `\r` and `\u000a` before each kind of value.
+    /// An escape right before a value is a word boundary for every rule (one helper,
+    /// [`starts_word`]): the `\n` kind, `\xXX`, `\uXXXX`, `\UXXXXXXXX`, `%XX` (decoded or not),
+    /// `&#NN;` / `&#xHH;`, and a terminal control sequence, which is stripped, before each kind
+    /// of value that needs a boundary (short literals, SIDs, tokens, targets and keys).
     #[test] // spec: ARCH-121
     fn an_escape_before_a_value_is_a_boundary_for_every_rule() {
         let r = Redactor {
-            labels: vec!["Night Owl".into()],
-            profile_dir: Some(r"C:\Users\Fake\probeuser".into()),
-            machine: Some("PROBEBOX-01".into()),
-            machine_names: vec!["probebox-01-longer-host".into()],
+            labels: vec!["Owl".into()],
+            profile_dir: Some(r"C:\Users\Fake\abby".into()),
+            machine: Some("PC07".into()),
+            machine_names: Vec::new(),
             names: vec![r"D:\claude\owl-dir".into()],
         };
         let ghp = format!("ghp_{}", "A1".repeat(18));
         let values = [
-            ("probeuser", "<user>"),
-            ("PROBEBOX-01", "<machine>"),
-            ("probebox-01-longer-host", "<machine>"),
-            ("Night Owl", "<redacted>"),
+            ("abby", "<user>"),
+            ("PC07", "<machine>"),
+            ("Owl", "<redacted>"),
             (r"D:\\claude\\owl-dir", "<redacted>"),
             ("S-1-5-21-1-2-3-1001", "<sid>"),
             (ghp.as_str(), "<redacted>"),
             ("LILITH-dev/github/agent-token", "<redacted>"),
+            ("api_key=hunter2secret", "<redacted>"),
+        ];
+        // Each as it stands in a JSON string.
+        let escapes = [
+            r"\n",
+            r"\t",
+            r"\r",
+            r"\u000a",
+            r"\\n",
+            r"\\0",
+            r"\\v",
+            r"\\e",
+            r"\\a",
+            r"\\x0a",
+            r"\\U0000000A",
+            "%0A",
+            "%22",
+            "%2C",
+            "%3D",
+            "&#10;",
+            "&#x0a;",
+            r"\u001b[32m",
+            r"\u001b[0;1m",
+            r"\\x1b[1m",
+            r"\\u{1b}[0m",
+            r"\\u001b[33m",
+            r"\u001b]0;title\u0007",
         ];
         for (value, placeholder) in values {
-            for escape in [r"\n", r"\t", r"\r", r"\u000a", r"\\n"] {
+            for escape in escapes {
                 let text = format!(r#"{{"m":"first line{escape}{value} rest"}}"#);
                 let (out, n) = r.text(&text);
                 assert!(
@@ -1696,9 +2027,116 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&out)
                     .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
             }
+            // The raw escape byte, as a terminal writes it.
+            let text = format!("first line\u{1b}[32m{value}\u{1b}[0m rest");
+            let (out, _) = r.text(&text);
+            assert!(
+                out.contains(placeholder) && !out.contains('\u{1b}'),
+                "{out}"
+            );
         }
         // Still not inside a word.
-        assert_eq!(r.text("xprobeuser and probeusers").1, 0);
+        assert_eq!(r.text("xabby and abbys and PC07x and Owls").1, 0);
+    }
+
+    /// Terminal control sequences go before the rules, in every spelling of their `ESC`: CSI
+    /// (`ESC [` … a final byte), OSC (`ESC ]` … BEL or `ESC \`) and the other `ESC x` pairs;
+    /// between two letters they leave a space.
+    #[test] // spec: ARCH-121
+    fn terminal_control_sequences_are_stripped_first() {
+        let r = Redactor {
+            labels: vec!["Night Owl".into()],
+            profile_dir: Some(r"C:\Users\Fake\probeuser".into()),
+            machine: Some("PROBEBOX-01".into()),
+            ..Redactor::default()
+        };
+        for (text, want) in [
+            (
+                r#"{"m":"\u001b[3mtoken\u001b[0m\u001b[2m=\u001b[0mhunter2secret"}"#,
+                r#"{"m":"token=<redacted>"}"#,
+            ),
+            (
+                r#"{"m":"\u001b[1mS-1-5-21-111-222-333-1001\u001b[0m"}"#,
+                r#"{"m":"<sid>"}"#,
+            ),
+            (
+                r#"{"m":"\u001b[32mprobeuser@PROBEBOX-01\u001b[0m:~$ ls"}"#,
+                r#"{"m":"<user>@<machine>:~$ ls"}"#,
+            ),
+            (
+                r#"{"m":"\u001b[1mNight Owl\u001b[0m"}"#,
+                r#"{"m":"<redacted>"}"#,
+            ),
+            (
+                r#"{"m":"\u001b[0mLILITH-dev/github-token"}"#,
+                r#"{"m":"<redacted>"}"#,
+            ),
+            (
+                r#"{"m":"see \u001b]8;;file:///C:/Users/Fake/probeuser/x.png\u001b\\here\u001b]8;;\u001b\\ now"}"#,
+                r#"{"m":"see here now"}"#,
+            ),
+            (
+                r#"{"m":"\u001b]0;C:\\Users\\Fake\\probeuser\u0007title"}"#,
+                r#"{"m":"title"}"#,
+            ),
+            (
+                r#"{"m":"a\u001b[1mb and c \u001b[1md"}"#,
+                r#"{"m":"a b and c d"}"#,
+            ),
+            (
+                r#"{"m":"\u001b7saved\u001b8 \u001b(Bset"}"#,
+                r#"{"m":"saved set"}"#,
+            ),
+            (
+                r#"{"m":"\\u{1b}[32mok\\x1b[0m \\u001b[1mfine"}"#,
+                r#"{"m":"ok fine"}"#,
+            ),
+            ("\u{1b}[31mred\u{1b}[0m text", "red text"),
+        ] {
+            let (out, _) = r.text(text);
+            assert_eq!(out, want, "{text}");
+            if text.starts_with('{') {
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
+            }
+        }
+    }
+
+    /// A Deny token with escaped `/`, and an `open/` payload holding the percent escapes
+    /// base64 uses (`%2B`, `%2F`, `%3D`), go as the plain forms do; so does a key's value after
+    /// `%3D`.
+    #[test] // spec: ARCH-121, APP-020
+    fn escaped_deny_tokens_and_percent_encoded_payloads_go() {
+        let r = Redactor::default();
+        let token = "c0ffee".repeat(5) + "ab";
+        for (text, secret) in [
+            (
+                format!(r#"{{"u":"lil-dev:deny\/cf_0123456789abcdef\/{token}"}}"#),
+                token.as_str(),
+            ),
+            (
+                format!(r#"{{"u":"lil-dev:deny\\\/cf_0123456789abcdef\\\/{token}"}}"#),
+                token.as_str(),
+            ),
+            (
+                "lil:open/QzpcVXNlcnNc%2BcHJvYmV1c2VyXFBpY3R1cmVz".to_string(),
+                "cHJvYmV1",
+            ),
+            ("lil:open/QzpcVXNl%2fcHJv%3D%3D x".to_string(), "cHJv"),
+            ("api_key%3Dhunter2secret".to_string(), "hunter2secret"),
+            (
+                "next=%2Fcb%3Ftoken%3Dhunter2secret".to_string(),
+                "hunter2secret",
+            ),
+        ] {
+            let (out, n) = r.text(&text);
+            assert!(!out.contains(secret), "{text} -> {out}");
+            assert!(n >= 1, "{text}");
+            if text.starts_with('{') {
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
+            }
+        }
     }
 
     #[test] // spec: ARCH-121
@@ -1784,5 +2222,12 @@ mod tests {
                 .0
                 .ends_with(" and on")
         );
+        // Never closed: only to the end of its own line, never the rest of the entry.
+        let entry = "{\n  \"prompt\": \"api_key = '''PRB-12\",\n  \"untrusted\": true\n}";
+        let (out, _) = r.text(entry);
+        assert!(!out.contains("PRB-12"), "{out}");
+        assert!(out.ends_with("\n  \"untrusted\": true\n}"), "{out}");
+        let (out, _) = r.text("api_key = \"\"\"PRB-13\nkept = 2");
+        assert_eq!(out, "api_key = \"\"\"<redacted>\"\"\"\nkept = 2");
     }
 }
