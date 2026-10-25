@@ -1757,13 +1757,13 @@ fn window_thread(
         };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let work = info.rcWork;
-            let (ww, wh) = (work.right - work.left, work.bottom - work.top);
-            let (w, h) = (720.min(ww - 32), 520.min(wh - 32));
+            let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
+            let (w, h) = (720.min(work_w - 32), 520.min(work_h - 32));
             let _ = SetWindowPos(
                 hwnd,
                 None,
-                work.left + (ww - w) / 2,
-                work.top + (wh - h) / 2,
+                work.left + (work_w - w) / 2,
+                work.top + (work_h - h) / 2,
                 w,
                 h,
                 SWP_NOZORDER | SWP_NOACTIVATE,
