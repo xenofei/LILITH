@@ -257,6 +257,9 @@ impl Session {
     /// ([`ClientError::Timeout`]; the call may still have reached the core, which the session
     /// then has no events from).
     ///
+    /// A topic the session already has is left as it is: no restart, and its cursor and last
+    /// seq are kept.
+    ///
     /// Calls on topics (this and [`Session::unsubscribe`]) take turns, in the order they get
     /// to the front, and wait for the one before: a call that finds the session's topic list
     /// first also gets to the core first, so the last call wins on both. The `start_hard_cap`
