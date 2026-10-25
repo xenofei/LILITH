@@ -80,12 +80,15 @@ fn tree(dir: &Path, skip: &Path, out: &mut Vec<(PathBuf, String)>) {
 }
 
 /// The Claude Code side outside `CLAUDE_CONFIG_DIR`: the profile folder and the suite's other
-/// Claude Code profiles.
+/// Claude Code profiles. The test channel's Start-menu folder, `profile\Programs`, is left out:
+/// the same `y` lets the doctor write the notification shortcut there (plan 4a, APP-022).
 fn outside_profile(env: &TestEnv) -> Vec<(PathBuf, String)> {
     let skip = profile(env);
     let mut out = Vec::new();
     tree(&env.root().join("profile"), &skip, &mut out);
     tree(&env.env.claude_profiles_dir(), &skip, &mut out);
+    let programs = env.root().join(r"profile\Programs");
+    out.retain(|(path, _)| !path.starts_with(&programs));
     out.sort();
     out
 }
