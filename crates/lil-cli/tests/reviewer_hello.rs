@@ -134,7 +134,9 @@ struct FakeHello {
     answer: Answer,
     click: Click,
     remove_fails: bool,
-    face: FaceSignIn,
+    face: RefCell<FaceSignIn>,
+    /// Face sign-in from the click on: turned on while the window waited (Phase B review m2).
+    face_after_click: Option<FaceSignIn>,
     /// What the window that owns each prompt showed.
     shown: RefCell<Vec<String>>,
 }
@@ -149,14 +151,15 @@ impl FakeHello {
             answer: Answer::Ok,
             click: Click::Accept,
             remove_fails: false,
-            face: FaceSignIn::Off,
+            face: RefCell::new(FaceSignIn::Off),
+            face_after_click: None,
             shown: RefCell::default(),
         }
     }
 
     fn with_face(log: &Log, face: FaceSignIn) -> Self {
         Self {
-            face,
+            face: RefCell::new(face),
             ..Self::new(log)
         }
     }
@@ -233,7 +236,7 @@ impl HelloPlatform for FakeHello {
         self.tpm
     }
     fn face_sign_in(&self) -> FaceSignIn {
-        self.face.clone()
+        self.face.borrow().clone()
     }
     fn kek_enroll(&self, credential: &str, shown: &str) -> io::Result<()> {
         self.note(format!("hello:kek_enroll {credential}"));
@@ -246,8 +249,13 @@ impl HelloPlatform for FakeHello {
         challenge: &[u8; 32],
         shown: &str,
         accept: Option<&str>,
+        ready: &dyn Fn() -> io::Result<()>,
     ) -> io::Result<Zeroizing<[u8; 32]>> {
         self.window(shown, accept)?;
+        if let Some(face) = &self.face_after_click {
+            *self.face.borrow_mut() = face.clone();
+        }
+        ready()?;
         self.note(format!(
             "hello:kek_derive {credential} {:02x}",
             challenge[0]
@@ -865,27 +873,44 @@ fn status_names_the_route_and_whether_the_key_is_hardware_held() {
 }
 
 /// Owner decision 2026-10-24: Windows Hello unlocks the reviewer key only while face sign-in is
-/// off. On, or unknown: approvals and merges use the passphrase and say why, `enroll` refuses
-/// before asking anything, and `status` shows it.
+/// off. On (Phase B review I1): at approve or merge time LILITH removes its enrolment (both
+/// files and the credential; the passphrase file stays), uses the passphrase and says how to
+/// re-enrol. Unknown: nothing is removed, the passphrase is used with a warning. `enroll`
+/// refuses before asking anything, and `status` shows it.
 #[test] // spec: QA-088
 fn windows_hello_is_used_only_while_face_sign_in_is_off() {
     for face in [FaceSignIn::On, FaceSignIn::Unknown("WinBio said no".into())] {
         // Enrolled while face was off; now it is on (or can't be told).
         let home = Home::with_key();
+        let key_before = home.key_bytes();
         enroll_kek(&home, &FakeHello::new(&log()));
         let l = log();
         let hello = FakeHello::with_face(&l, face.clone());
         let said = RefCell::new(Vec::new());
         let pem = unlock_like_approve(&home, &hello, &asks(&l, PASS), &said).unwrap();
         assert_eq!(&pem[..], PEM);
-        assert_eq!(events(&l), ["passphrase:asked"], "{face:?}");
         let said = said.borrow().join("\n");
         assert!(said.contains("face sign-in"), "{said}");
+        assert_eq!(home.key_bytes(), key_before, "the passphrase file changed");
         if face == FaceSignIn::On {
+            // All three removed, then the passphrase; Windows Hello never raised.
+            assert_eq!(
+                events(&l),
+                [
+                    format!("hello:kek_remove {CREDENTIAL}"),
+                    "passphrase:asked".to_string()
+                ]
+            );
+            assert!(home.hello_files().is_empty(), "{:?}", home.hello_files());
             assert!(
                 said.contains("Settings > Accounts > Sign-in options"),
                 "{said}"
             );
+            assert!(said.contains("lil dev reviewer-hello enroll"), "{said}");
+        } else {
+            // Unknown: nothing removed.
+            assert_eq!(events(&l), ["passphrase:asked"], "{face:?}");
+            assert_eq!(home.hello_files().len(), 2);
         }
 
         let text = status(&home.profile, &hello).join("\n");
@@ -913,6 +938,44 @@ fn windows_hello_is_used_only_while_face_sign_in_is_off() {
     let home = Home::with_key();
     let text = status(&home.profile, &FakeHello::new(&log())).join("\n");
     assert!(text.contains("Face sign-in: off"), "{text}");
+
+    // `status` with face sign-in on removes the enrolment too.
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let l = log();
+    let text = status(&home.profile, &FakeHello::with_face(&l, FaceSignIn::On)).join("\n");
+    assert!(text.contains("Face sign-in: on"), "{text}");
+    assert!(text.contains("not enrolled"), "{text}");
+    assert!(home.hello_files().is_empty());
+    assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
+}
+
+/// Phase B review m2: the face check runs again right before Windows Hello is raised. Face
+/// sign-in turned on while the window waited: the enrolment is removed, Windows Hello isn't
+/// raised, and the passphrase is asked.
+#[test] // spec: QA-088
+fn face_sign_in_is_checked_again_right_before_the_prompt() {
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let l = log();
+    let hello = FakeHello {
+        face_after_click: Some(FaceSignIn::On),
+        ..FakeHello::new(&l)
+    };
+    let said = RefCell::new(Vec::new());
+    let pem = unlock_like_approve(&home, &hello, &asks(&l, PASS), &said).unwrap();
+    assert_eq!(&pem[..], PEM);
+    assert_eq!(
+        events(&l),
+        [
+            "window:Approve".to_string(),
+            format!("hello:kek_remove {CREDENTIAL}"),
+            "passphrase:asked".to_string()
+        ]
+    );
+    assert!(home.hello_files().is_empty());
+    let said = said.borrow().join("\n");
+    assert!(said.contains("face sign-in is on"), "{said}");
 }
 
 #[test] // spec: QA-088

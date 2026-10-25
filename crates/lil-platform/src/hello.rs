@@ -74,7 +74,7 @@ use windows::Win32::Devices::BiometricFramework::{
 };
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_PRESENT, GUID_DEVCLASS_BIOMETRIC, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
 };
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::Foundation::{HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM};
@@ -639,14 +639,18 @@ pub fn kek_enroll(credential: &str, shown: &str) -> io::Result<()> {
 /// [`kek_derive_for_window`], owned by an [`OwnerWindow`] in front that shows `shown` (for a
 /// merge, the summary and the audit, P4a-R38). With `accept` ("Merge", "Approve"), Windows
 /// Hello is asked only after you clicked it; "Deny", closing the window or no choice within
-/// [`HELLO_WAIT`] refuses (`PermissionDenied`).
+/// [`HELLO_WAIT`] refuses (`PermissionDenied`). `ready` runs right before Windows Hello is
+/// raised, after the click (Phase B review m2: the caller's face check, not up to 120 s
+/// earlier); its error stops the call and is returned as it is.
 pub fn kek_derive(
     credential: &str,
     challenge: &[u8; 32],
     shown: &str,
     accept: Option<&str>,
+    ready: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<Zeroizing<[u8; 32]>> {
     in_front(shown, accept, |hwnd| {
+        ready()?;
         kek_derive_for_window(hwnd, credential, challenge)
     })
 }
@@ -699,68 +703,170 @@ pub enum FaceUnit {
     Failed(String),
 }
 
-/// The verdict from the face cameras' answers and whether any biometric device is present
-/// (pure). Any enrollment: on. Any failure without an enrollment: unknown, so the caller uses
-/// the passphrase. No face camera listed: off only when no biometric device is present at all
-/// (face can't sign in on this PC); with one present, WinBio may be hiding it from this program
-/// (Enhanced Sign-in Security does), so unknown. Otherwise off.
-pub fn face_sign_in_from(
-    units: Result<Vec<FaceUnit>, String>,
-    biometric_device_present: Result<bool, String>,
-) -> FaceSignIn {
-    let units = match units {
+/// What the face check read ([`face_sign_in_from`]'s input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaceReading {
+    /// Each system-pool face camera's answer for this user.
+    pub face_units: Result<Vec<FaceUnit>, String>,
+    /// The device instance ids of every unit WinBio lists to this program: face cameras in any
+    /// pool, and fingerprint readers.
+    pub listed_devices: Result<Vec<String>, String>,
+    /// The device instance ids of the present devices of the Biometric device class.
+    pub present_devices: Result<Vec<String>, String>,
+}
+
+/// The verdict (pure). Any enrollment on a face camera: on. A face camera that failed: unknown.
+/// A present biometric device that WinBio doesn't list to this program could be a face camera
+/// it hides (Enhanced Sign-in Security does), so unknown (Phase B review m1); a device WinBio
+/// lists as a fingerprint reader is accounted for and doesn't count (m3). Any read that failed:
+/// unknown. Otherwise off. A face camera that is unplugged when this runs isn't present, so it
+/// reads off: the check runs again right before each Windows Hello prompt (m2).
+pub fn face_sign_in_from(reading: FaceReading) -> FaceSignIn {
+    let units = match reading.face_units {
         Ok(units) => units,
         Err(why) => return FaceSignIn::Unknown(why),
     };
-    if units.is_empty() {
-        return match biometric_device_present {
-            Ok(false) => FaceSignIn::Off,
-            Ok(true) => FaceSignIn::Unknown(
-                "a biometric device is present, but WinBio lists no face camera to LILITH (Enhanced Sign-in Security can hide it)".into(),
-            ),
-            Err(why) => FaceSignIn::Unknown(why),
-        };
-    }
     if units
         .iter()
         .any(|u| matches!(u, FaceUnit::Enrolled(n) if *n > 0))
     {
         return FaceSignIn::On;
     }
-    match units.iter().find_map(|u| match u {
+    if let Some(why) = units.iter().find_map(|u| match u {
         FaceUnit::Failed(why) => Some(why.clone()),
         _ => None,
     }) {
-        Some(why) => FaceSignIn::Unknown(why),
-        None => FaceSignIn::Off,
+        return FaceSignIn::Unknown(why);
     }
+    let present = match reading.present_devices {
+        Ok(present) => present,
+        Err(why) => return FaceSignIn::Unknown(why),
+    };
+    if present.is_empty() {
+        return FaceSignIn::Off;
+    }
+    let listed = match reading.listed_devices {
+        Ok(listed) => listed,
+        Err(why) => return FaceSignIn::Unknown(why),
+    };
+    let unlisted = present
+        .iter()
+        .filter(|device| !listed.iter().any(|l| l.eq_ignore_ascii_case(device)))
+        .count();
+    if unlisted > 0 {
+        return FaceSignIn::Unknown(format!(
+            "{unlisted} biometric device(s) that WinBio doesn't list to LILITH could be a face camera (Enhanced Sign-in Security can hide one)"
+        ));
+    }
+    FaceSignIn::Off
 }
 
 /// `WINBIO_TYPE_FACIAL_FEATURES` (winbio_types.h); not in `windows` 0.62.2.
 const WINBIO_TYPE_FACIAL_FEATURES: u32 = 0x0000_0002;
+/// `WINBIO_TYPE_FINGERPRINT` (winbio_types.h).
+const WINBIO_TYPE_FINGERPRINT: u32 = 0x0000_0008;
 /// `WINBIO_FLAG_DEFAULT` (winbio_types.h).
 const WINBIO_FLAG_DEFAULT: u32 = 0;
 /// `WINBIO_ID_TYPE_SID` (winbio_types.h).
 const WINBIO_ID_TYPE_SID: u32 = 3;
 
-/// Whether Windows Hello face recognition is enrolled for this user, read-only through the
-/// Windows Biometric Framework: `WinBioEnumBiometricUnits(WINBIO_TYPE_FACIAL_FEATURES)` lists the
-/// face cameras, and for each one in the system pool (the pool Windows Hello sign-in uses),
-/// `WinBioEnumEnrollments` in a system-pool session asks for this user's enrollments, the user
-/// named by the SID of this process's token. No camera is turned on, nothing is captured, no
-/// prompt is shown and nothing is changed. Relied on: that Windows Hello Face keeps its
-/// templates in the system pool under the user's SID, and that `WINBIO_E_UNKNOWN_ID` means none.
-/// When WinBio lists no face camera, the device list (`SetupDiGetClassDevsW` for the Biometric
-/// device class, present devices only) tells whether there is no biometric hardware at all
-/// (off) or hardware WinBio doesn't show this program (unknown). Any failure is
-/// [`FaceSignIn::Unknown`].
+/// How long the face check may take (Phase B review m5): its WinBio calls are synchronous calls
+/// to the biometric service, which can be busy or starting.
+pub const FACE_CHECK_LIMIT: Duration = Duration::from_secs(5);
+
+/// Whether Windows Hello face recognition is enrolled for this user, read-only:
+/// - `WinBioEnumBiometricUnits(WINBIO_TYPE_FACIAL_FEATURES)` lists the face cameras; for each
+///   one in the system pool (the pool Windows Hello sign-in uses), `WinBioEnumEnrollments` in a
+///   system-pool session asks for this user's enrollments, the user named by the SID of this
+///   process's token;
+/// - `WinBioEnumBiometricUnits(WINBIO_TYPE_FINGERPRINT)` and the face cameras give the devices
+///   WinBio lists, and `SetupDiGetClassDevsW` for the Biometric device class (present devices)
+///   gives the devices there are ([`face_sign_in_from`]).
+///
+/// No camera is turned on, nothing is captured, no prompt is shown and nothing is changed.
+/// Relied on: that Windows Hello Face keeps its templates in the system pool under the user's
+/// SID, that `WINBIO_E_UNKNOWN_ID` means none, and that a unit's `DeviceInstanceId` is its
+/// device's instance id. It runs on its own thread for at most [`FACE_CHECK_LIMIT`]; past that,
+/// and on any failure, it is [`FaceSignIn::Unknown`].
 pub fn face_sign_in() -> FaceSignIn {
-    face_sign_in_from(face_units(), biometric_device_present())
+    within(FACE_CHECK_LIMIT, || face_sign_in_from(read_face())).unwrap_or_else(|| {
+        FaceSignIn::Unknown(format!(
+            "the biometric service didn't answer within {} s",
+            FACE_CHECK_LIMIT.as_secs()
+        ))
+    })
 }
 
-/// Whether any device of the Biometric class is present (read-only device enumeration).
-fn biometric_device_present() -> Result<bool, String> {
-    // SAFETY: a device list for one class, read for its first member and destroyed once.
+/// `f`'s result when it finishes within `limit` on a thread of its own, else `None` (the
+/// thread is left to finish by itself).
+pub fn within<T: Send + 'static>(
+    limit: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("face-check".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.recv_timeout(limit).ok()
+}
+
+fn read_face() -> FaceReading {
+    let (face_units, face_devices) = match face_units() {
+        Ok((units, devices)) => (Ok(units), Ok(devices)),
+        Err(why) => (Err(why.clone()), Err(why)),
+    };
+    let listed_devices = face_devices.and_then(|mut devices| {
+        devices.extend(unit_devices(WINBIO_TYPE_FINGERPRINT)?);
+        Ok(devices)
+    });
+    FaceReading {
+        face_units,
+        listed_devices,
+        present_devices: biometric_devices(),
+    }
+}
+
+/// A unit schema's device instance id.
+fn instance_id(unit: &WINBIO_UNIT_SCHEMA) -> String {
+    let end = unit
+        .DeviceInstanceId
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(unit.DeviceInstanceId.len());
+    String::from_utf16_lossy(&unit.DeviceInstanceId[..end])
+}
+
+/// The units WinBio lists for `factor`, copied out of WinBio's buffer.
+fn list_units(factor: u32) -> Result<Vec<WINBIO_UNIT_SCHEMA>, String> {
+    // SAFETY: the out-pointers are valid; WinBio's buffer is read within its reported length
+    // and freed once with `WinBioFree`.
+    unsafe {
+        let mut schema: *mut WINBIO_UNIT_SCHEMA = std::ptr::null_mut();
+        let mut count = 0usize;
+        WinBioEnumBiometricUnits(factor, &mut schema, &mut count)
+            .map_err(|e| format!("WinBioEnumBiometricUnits({factor:#x}): {e}"))?;
+        if schema.is_null() {
+            return Ok(Vec::new());
+        }
+        let units = std::slice::from_raw_parts(schema, count).to_vec();
+        let _ = WinBioFree(schema.cast());
+        Ok(units)
+    }
+}
+
+/// The device instance ids of the units WinBio lists for `factor`.
+fn unit_devices(factor: u32) -> Result<Vec<String>, String> {
+    Ok(list_units(factor)?.iter().map(instance_id).collect())
+}
+
+/// The device instance ids of the present devices of the Biometric class (read-only device
+/// enumeration).
+fn biometric_devices() -> Result<Vec<String>, String> {
+    // SAFETY: a device list for one class, read member by member and destroyed once; each
+    // instance id is read into a local buffer.
     unsafe {
         let set = SetupDiGetClassDevsW(
             Some(&GUID_DEVCLASS_BIOMETRIC),
@@ -769,17 +875,34 @@ fn biometric_device_present() -> Result<bool, String> {
             DIGCF_PRESENT,
         )
         .map_err(|e| format!("SetupDiGetClassDevsW: {e}"))?;
-        let mut data = SP_DEVINFO_DATA {
-            cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-            ..Default::default()
-        };
-        let present = match SetupDiEnumDeviceInfo(set, 0, &mut data) {
-            Ok(()) => Ok(true),
-            Err(e) if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() => Ok(false),
-            Err(e) => Err(format!("SetupDiEnumDeviceInfo: {e}")),
-        };
+        let mut devices = Vec::new();
+        let mut result = Ok(());
+        for index in 0.. {
+            let mut data = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            match SetupDiEnumDeviceInfo(set, index, &mut data) {
+                Ok(()) => {}
+                Err(e) if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() => break,
+                Err(e) => {
+                    result = Err(format!("SetupDiEnumDeviceInfo: {e}"));
+                    break;
+                }
+            }
+            let mut buf = [0u16; 512];
+            let mut needed = 0u32;
+            if let Err(e) =
+                SetupDiGetDeviceInstanceIdW(set, &data, Some(&mut buf), Some(&mut needed))
+            {
+                result = Err(format!("SetupDiGetDeviceInstanceIdW: {e}"));
+                break;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            devices.push(String::from_utf16_lossy(&buf[..end]));
+        }
         let _ = SetupDiDestroyDeviceInfoList(set);
-        present
+        result.map(|()| devices)
     }
 }
 
@@ -822,30 +945,23 @@ fn current_identity() -> Result<WINBIO_IDENTITY, String> {
     }
 }
 
-/// Each system-pool face camera's answer for this user.
-fn face_units() -> Result<Vec<FaceUnit>, String> {
-    // SAFETY: WinBio calls with valid out-pointers; each buffer WinBio allocates is read within
-    // its reported length and freed once with `WinBioFree`.
+/// Each system-pool face camera's answer for this user, and the device instance ids of every
+/// face camera WinBio lists (any pool).
+fn face_units() -> Result<(Vec<FaceUnit>, Vec<String>), String> {
+    let all = list_units(WINBIO_TYPE_FACIAL_FEATURES)?;
+    let devices = all.iter().map(instance_id).collect();
+    let units: Vec<u32> = all
+        .iter()
+        .filter(|u| u.PoolType == WINBIO_POOL_SYSTEM.0)
+        .map(|u| u.UnitId)
+        .collect();
+    if units.is_empty() {
+        return Ok((Vec::new(), devices));
+    }
+    let identity = current_identity()?;
+    // SAFETY: WinBio calls with valid out-pointers; each subfactor buffer is freed once with
+    // `WinBioFree`, and the session is closed by `WinBioSession`.
     unsafe {
-        let mut schema: *mut WINBIO_UNIT_SCHEMA = std::ptr::null_mut();
-        let mut count = 0usize;
-        WinBioEnumBiometricUnits(WINBIO_TYPE_FACIAL_FEATURES, &mut schema, &mut count)
-            .map_err(|e| format!("WinBioEnumBiometricUnits: {e}"))?;
-        let units: Vec<u32> = if schema.is_null() {
-            Vec::new()
-        } else {
-            let list = std::slice::from_raw_parts(schema, count)
-                .iter()
-                .filter(|u| u.PoolType == WINBIO_POOL_SYSTEM.0)
-                .map(|u| u.UnitId)
-                .collect();
-            let _ = WinBioFree(schema.cast());
-            list
-        };
-        if units.is_empty() {
-            return Ok(Vec::new());
-        }
-        let identity = current_identity()?;
         let session = WinBioSession(
             WinBioOpenSession(
                 WINBIO_TYPE_FACIAL_FEATURES,
@@ -856,7 +972,7 @@ fn face_units() -> Result<Vec<FaceUnit>, String> {
             )
             .map_err(|e| format!("WinBioOpenSession: {e}"))?,
         );
-        Ok(units
+        let answers = units
             .into_iter()
             .map(|unit| {
                 let mut subfactors: *mut u8 = std::ptr::null_mut();
@@ -879,7 +995,8 @@ fn face_units() -> Result<Vec<FaceUnit>, String> {
                     }
                 }
             })
-            .collect())
+            .collect();
+        Ok((answers, devices))
     }
 }
 
@@ -2247,34 +2364,104 @@ mod tests {
     #[test] // spec: QA-088
     fn face_sign_in_is_on_when_any_camera_has_this_users_face_and_unknown_when_unsure() {
         use FaceUnit::*;
-        let face = |units: Result<Vec<FaceUnit>, String>| face_sign_in_from(units, Ok(true));
-        // No face camera and no biometric device at all: face can't sign in on this PC.
-        assert_eq!(face_sign_in_from(Ok(vec![]), Ok(false)), FaceSignIn::Off);
-        // No face camera listed, but a biometric device is there (hidden from WinBio, as
-        // Enhanced Sign-in Security does), or the device list failed: can't tell.
+        let ids = |list: &[&str]| -> Result<Vec<String>, String> {
+            Ok(list.iter().map(|s| s.to_string()).collect())
+        };
+        let reading = |units: Vec<FaceUnit>, listed: &[&str], present: &[&str]| FaceReading {
+            face_units: Ok(units),
+            listed_devices: ids(listed),
+            present_devices: ids(present),
+        };
+        // No biometric device at all: face can't sign in on this PC.
+        assert_eq!(
+            face_sign_in_from(reading(vec![], &[], &[])),
+            FaceSignIn::Off
+        );
+        // m1: a present device WinBio doesn't list (hidden, as Enhanced Sign-in Security
+        // does) could be a face camera: can't tell, also when another face camera is listed.
         assert!(matches!(
-            face_sign_in_from(Ok(vec![]), Ok(true)),
+            face_sign_in_from(reading(vec![], &[], &["SWD\\HIDDEN"])),
             FaceSignIn::Unknown(_)
         ));
+        assert!(matches!(
+            face_sign_in_from(reading(
+                vec![NotEnrolled],
+                &["USB\\WEBCAM"],
+                &["USB\\WEBCAM", "SWD\\HIDDEN"]
+            )),
+            FaceSignIn::Unknown(_)
+        ));
+        // m3: a fingerprint reader WinBio lists is accounted for: off (ids compare
+        // case-insensitively).
         assert_eq!(
-            face_sign_in_from(Ok(vec![]), Err("SetupDi".into())),
-            FaceSignIn::Unknown("SetupDi".into())
+            face_sign_in_from(reading(vec![], &["usb\\fp"], &["USB\\FP"])),
+            FaceSignIn::Off
         );
-        assert_eq!(face(Ok(vec![NotEnrolled, Enrolled(0)])), FaceSignIn::Off);
-        assert_eq!(face(Ok(vec![NotEnrolled, Enrolled(1)])), FaceSignIn::On);
-        // An enrollment wins over another camera's failure.
+        // Every present device listed, no enrollment for this user: off.
         assert_eq!(
-            face(Ok(vec![Failed("x".into()), Enrolled(2)])),
+            face_sign_in_from(reading(
+                vec![NotEnrolled, Enrolled(0)],
+                &["A", "B"],
+                &["A", "B"]
+            )),
+            FaceSignIn::Off
+        );
+        // Any enrollment: on, even with another camera failing or a hidden device.
+        assert_eq!(
+            face_sign_in_from(reading(vec![NotEnrolled, Enrolled(1)], &[], &["X"])),
             FaceSignIn::On
         );
         assert_eq!(
-            face(Ok(vec![NotEnrolled, Failed("E_ACCESSDENIED".into())])),
-            FaceSignIn::Unknown("E_ACCESSDENIED".into())
+            face_sign_in_from(reading(vec![Failed("x".into()), Enrolled(2)], &[], &[])),
+            FaceSignIn::On
         );
         assert_eq!(
-            face(Err("WinBioEnumBiometricUnits: off".into())),
-            FaceSignIn::Unknown("WinBioEnumBiometricUnits: off".into())
+            face_sign_in_from(reading(
+                vec![NotEnrolled, Failed("E_ACCESSDENIED".into())],
+                &[],
+                &[]
+            )),
+            FaceSignIn::Unknown("E_ACCESSDENIED".into())
         );
+        // Any read that failed: can't tell.
+        let failed = |face_units, listed_devices, present_devices| {
+            face_sign_in_from(FaceReading {
+                face_units,
+                listed_devices,
+                present_devices,
+            })
+        };
+        assert_eq!(
+            failed(Err("WinBio: off".into()), ids(&[]), ids(&[])),
+            FaceSignIn::Unknown("WinBio: off".into())
+        );
+        assert_eq!(
+            failed(Ok(vec![]), ids(&[]), Err("SetupDi".into())),
+            FaceSignIn::Unknown("SetupDi".into())
+        );
+        assert_eq!(
+            failed(
+                Ok(vec![]),
+                Err("fingerprint list".into()),
+                ids(&["USB\\FP"])
+            ),
+            FaceSignIn::Unknown("fingerprint list".into())
+        );
+    }
+
+    /// m5: a face check that doesn't finish within its limit gives up (the caller then reads
+    /// unknown); one that does gives its answer.
+    #[test] // spec: QA-088
+    fn a_face_check_that_hangs_gives_up_at_the_limit() {
+        assert_eq!(within(Duration::from_secs(5), || 7), Some(7));
+        let started = Instant::now();
+        let r = within(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(2));
+            7
+        });
+        assert_eq!(r, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(FACE_CHECK_LIMIT, Duration::from_secs(5));
     }
 
     /// Reads this PC's real face enrollment state (read-only: no camera, no prompt, nothing

@@ -3559,9 +3559,11 @@ mod tests {
             _: &[u8; 32],
             shown: &str,
             accept: Option<&str>,
+            ready: &dyn Fn() -> std::io::Result<()>,
         ) -> std::io::Result<Zeroizing<[u8; 32]>> {
             self.shown.borrow_mut().push(shown.into());
             self.accepts.borrow_mut().push(accept.map(str::to_string));
+            ready()?;
             if self.fail {
                 return Err(std::io::Error::other(
                     "the Windows Hello window couldn't be brought to the front",
@@ -3782,6 +3784,10 @@ mod tests {
             assert!(hello.shown.borrow().is_empty(), "Windows Hello was called");
             let said = prompt.said().join("\n");
             assert!(said.contains("face sign-in"), "{said}");
+            // I1: on removes LILITH's enrolment; unknown keeps it.
+            let enrolled = reviewer_hello::hello_file_path_in(profile.path()).exists()
+                && reviewer_hello::hello_age_path_in(profile.path()).exists();
+            assert_eq!(enrolled, face != reviewer_hello::FaceSignIn::On, "{face:?}");
             assert_eq!(prompt.asked().len(), 1, "{:?}", prompt.asked());
 
             // No terminal: refused before anything runs.

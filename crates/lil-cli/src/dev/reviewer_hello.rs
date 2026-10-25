@@ -22,7 +22,9 @@
 //! while face recognition isn't enrolled for Windows Hello on this account
 //! ([`face_blocks_hello`]), so the prompt always needs a deliberate PIN or fingerprint. While it
 //! is on, or can't be told, the passphrase is used and you are told why; `enroll` refuses, and
-//! `status` shows it.
+//! `status` shows it. Found on, LILITH also removes its own enrolment ([`face_gate`]; Phase B
+//! review I1): with face sign-in on, any program running as you could open it with your face.
+//! The check runs when the enrolment is read and again right before each Windows Hello prompt.
 //!
 //! **In front first (QA-088, Phase B ruling).** The window that owns the Windows Hello prompt
 //! shows what you are confirming (for a merge, the summary and the audit, P4a-R38). When
@@ -259,6 +261,36 @@ pub fn face_blocks_hello(face: &FaceSignIn) -> Option<String> {
     }
 }
 
+/// The face rule applied to an enrolment in `profile` (owner decision 2026-10-24; Phase B
+/// review I1, plan 4a ruling): `Ok(())` while `face` is off. On: a face could complete the
+/// credential's prompt for any program running as you, so LILITH removes its own Windows Hello
+/// enrolment ([`remove`]: the two files, then the key credential, which never prompts; the
+/// passphrase file stays), and the error says so and how to enrol again. Unknown: the enrolment
+/// stays, and the error is the warning. Either error means: use the passphrase.
+pub fn face_gate(
+    profile: &Path,
+    platform: &dyn HelloPlatform,
+    face: &FaceSignIn,
+) -> Result<(), String> {
+    let Some(why) = face_blocks_hello(face) else {
+        return Ok(());
+    };
+    if *face != FaceSignIn::On {
+        return Err(format!(
+            "{why}. The Windows Hello enrolment stays; turn face sign-in off, or make sure it is off, in Settings > Accounts > Sign-in options"
+        ));
+    }
+    let what = match remove(profile, platform) {
+        Ok(removed) if removed.is_empty() => String::new(),
+        Ok(_) => " LILITH removed its Windows Hello enrolment (app-key.hello.toml, app-key.hello.age and the key credential), because with face sign-in on any program running as you could open it with your face; your passphrase key stays. To use Windows Hello again, turn face sign-in off, then run `lil dev reviewer-hello enroll`".into(),
+        Err(e) => format!(
+            " Removing LILITH's Windows Hello enrolment failed ({}); run `lil dev reviewer-hello remove` now, because with face sign-in on any program running as you could open it with your face",
+            one_line(&format!("{e:#}"))
+        ),
+    };
+    Err(format!("{why}.{what}"))
+}
+
 /// The Windows Hello calls (P4a-R38), one seam: [`WindowsHello`] for real, a fake in tests.
 /// `shown` is what the window that owns the prompt shows.
 pub trait HelloPlatform {
@@ -277,13 +309,16 @@ pub trait HelloPlatform {
     /// With `accept` ("Merge", "Approve"), the window has that button and "Deny", and Windows
     /// Hello is raised only after the accept click; "Deny", closing the window or no choice in
     /// time (the window never brought forward included) is a `PermissionDenied` error, which
-    /// refuses outright (Task 28 fix round 2, Phase B ruling).
+    /// refuses outright (Task 28 fix round 2, Phase B ruling). `ready` runs right before
+    /// Windows Hello is raised, after the click; its error stops the call (Phase B review m2:
+    /// the face check runs again there).
     fn kek_derive(
         &self,
         credential: &str,
         challenge: &[u8; 32],
         shown: &str,
         accept: Option<&str>,
+        ready: &dyn Fn() -> io::Result<()>,
     ) -> io::Result<Zeroizing<[u8; 32]>>;
     /// Deletes the key credential; one that isn't there is fine. No prompt.
     fn kek_remove(&self, credential: &str) -> io::Result<()>;
@@ -314,8 +349,9 @@ impl HelloPlatform for WindowsHello {
         challenge: &[u8; 32],
         shown: &str,
         accept: Option<&str>,
+        ready: &dyn Fn() -> io::Result<()>,
     ) -> io::Result<Zeroizing<[u8; 32]>> {
-        lil_platform::hello::kek_derive(credential, challenge, shown, accept)
+        lil_platform::hello::kek_derive(credential, challenge, shown, accept, ready)
     }
     fn kek_remove(&self, credential: &str) -> io::Result<()> {
         lil_platform::hello::kek_remove(credential)
@@ -388,6 +424,8 @@ impl Unlocker for NoTerminal<'_> {
 /// goes wrong is [`KeyError::Cancelled`] or [`KeyError::Unavailable`], after `say` has told you
 /// why.
 pub struct HelloUnlocker<'a> {
+    /// Where the enrolment is: the face rule may remove it ([`face_gate`]).
+    profile: PathBuf,
     file: HelloFile,
     sealed: Vec<u8>,
     platform: &'a dyn HelloPlatform,
@@ -413,6 +451,11 @@ fn hello_error(say: &dyn Fn(&str), e: &io::Error) -> KeyError {
 impl HelloUnlocker<'_> {
     /// Unlocks with the owner window showing `shown`.
     pub fn unlock_showing(&self, shown: &str) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        // The face rule again, right before Windows Hello is raised (Phase B review m2).
+        let face_off = || {
+            face_gate(&self.profile, self.platform, &self.platform.face_sign_in())
+                .map_err(io::Error::other)
+        };
         let kek = self
             .platform
             .kek_derive(
@@ -420,6 +463,7 @@ impl HelloUnlocker<'_> {
                 &self.file.challenge,
                 shown,
                 self.accept.as_deref(),
+                &face_off,
             )
             .map_err(|e| hello_error(self.say, &e))?;
         let passphrase = hex(&kek[..]);
@@ -480,11 +524,12 @@ pub fn enrolled_hello<'a>(
 ) -> Option<HelloUnlocker<'a>> {
     match read_enrolment(profile) {
         Ok(None) => None,
-        Ok(Some(_)) if let Some(why) = face_blocks_hello(&platform.face_sign_in()) => {
+        Ok(Some(_)) if let Err(why) = face_gate(profile, platform, &platform.face_sign_in()) => {
             say(&format!("Windows Hello isn't used: {why}."));
             None
         }
         Ok(Some((file, sealed))) => Some(HelloUnlocker {
+            profile: profile.to_path_buf(),
             file,
             sealed,
             platform,
@@ -655,8 +700,13 @@ pub fn enroll(
         platform
             .kek_enroll(CREDENTIAL, shown)
             .map_err(|e| anyhow!("Windows Hello didn't create the key: {e}"))?;
+        // The face rule again, right before the sign prompt (Phase B review m2).
+        let face_off = || match face_blocks_hello(&platform.face_sign_in()) {
+            None => Ok(()),
+            Some(why) => Err(io::Error::other(why)),
+        };
         let kek = platform
-            .kek_derive(CREDENTIAL, &challenge, shown, None)
+            .kek_derive(CREDENTIAL, &challenge, shown, None, &face_off)
             .map_err(|e| anyhow!("Windows Hello didn't sign: {e}"))?;
         let passphrase = hex(&kek[..]);
         drop(kek);
@@ -684,7 +734,8 @@ pub fn enroll(
 }
 
 /// What `lil dev reviewer-hello status` prints: the passphrase file, the route, and whether the
-/// key is likely hardware-held (never "hardware-bound", QA-088). Never prompts.
+/// key is likely hardware-held (never "hardware-bound", QA-088), and face sign-in. Never
+/// prompts. Face sign-in on removes the enrolment first ([`face_gate`]).
 pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
     let key = key_path_in(profile);
     let mut out = vec![format!(
@@ -692,6 +743,11 @@ pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
         key.display(),
         if key.exists() { "present" } else { "missing" }
     )];
+    let face = platform.face_sign_in();
+    let face_line = match read_enrolment(profile) {
+        Ok(Some(_)) => face_gate(profile, platform, &face).err(),
+        _ => face_blocks_hello(&face),
+    };
     match read_enrolment(profile) {
         Ok(None) => out.push(
             "Windows Hello: not enrolled; approvals and merges ask for the passphrase.".into(),
@@ -723,8 +779,7 @@ pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
             "not set up"
         }
     ));
-    let face = platform.face_sign_in();
-    out.push(match face_blocks_hello(&face) {
+    out.push(match face_line {
         None => "Face sign-in: off, so Windows Hello can unlock the reviewer key (a PIN or fingerprint at its prompt).".into(),
         Some(why) => format!(
             "Face sign-in: {} ({why}).",
