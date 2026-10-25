@@ -3,12 +3,19 @@
 //! date), a new file each day, 14 kept per process, and a day's file stopped at 64 MiB with one
 //! `log_capped` line; a panic hook that logs `panic` with its location before the previous
 //! hook runs; and a first `logging started` line with the process name and id.
+//!
+//! Several processes of one name (one `lil-mcp` per Claude Code session) append to the same
+//! day's file, so the cap counts the file: each line is written under the file's append lock
+//! (`LockFileEx` on `[2⁶⁴−2, +1)`), after reading the file's length and whether it already
+//! ends with the `log_capped` line. A panic raised while a line is being written logs nothing
+//! (the writer's lock is held), so the hook can't deadlock on it.
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::env::Env;
 
@@ -36,6 +43,14 @@ pub fn init(env: &Env, process: &str) -> io::Result<LogGuard> {
 /// As [`init`].
 pub fn init_at(dir: &Path, process: &str, cap_bytes: u64) -> io::Result<LogGuard> {
     let writer = DailyWriter::new(dir, process, cap_bytes, utc_today)?;
+    init_with(writer, process)
+}
+
+/// [`init_at`] with a writer of its own (tests: a writer whose date fails).
+///
+/// # Errors
+/// If the process already has a global `tracing` subscriber.
+pub fn init_with(writer: DailyWriter, process: &str) -> io::Result<LogGuard> {
     tracing_subscriber::fmt()
         .json()
         .with_ansi(false)
@@ -49,7 +64,10 @@ pub fn init_at(dir: &Path, process: &str, cap_bytes: u64) -> io::Result<LogGuard
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
         let text = info.payload_as_str().unwrap_or("(no message)");
-        tracing::error!(%location, panic = text, "panic");
+        // A panic inside a line's write would wait on the writer's own lock.
+        if !IN_WRITE.with(Cell::get) {
+            tracing::error!(%location, panic = text, "panic");
+        }
         previous(info);
     }));
     // Every process's log starts with a line, so its file is there from the start.
@@ -78,9 +96,35 @@ struct Inner {
 struct Day {
     date: String,
     file: File,
-    written: u64,
     capped: bool,
+    /// The file's length after this writer's last line: another length means another
+    /// process wrote meanwhile, maybe its `log_capped` line.
+    seen: u64,
 }
+
+thread_local! {
+    /// Set while this thread writes a line (the panic hook then logs nothing).
+    static IN_WRITE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// [`IN_WRITE`] for as long as it is held.
+struct Writing;
+
+impl Writing {
+    fn enter() -> Writing {
+        IN_WRITE.with(|w| w.set(true));
+        Writing
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        IN_WRITE.with(|w| w.set(false));
+    }
+}
+
+/// How long a line waits for another process's append lock before it is written without it.
+const APPEND_LOCK_WAIT: Duration = Duration::from_millis(200);
 
 impl DailyWriter {
     /// A writer for `process` in `dir` (made if missing), with the date from `today`
@@ -127,19 +171,19 @@ impl Inner {
         if self.open.as_ref().is_none_or(|d| d.date != date) {
             self.open = None;
             let path = self.dir.join(format!("{}.{date}.log", self.process));
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .create(true)
                 .read(true)
                 .append(true)
                 .open(&path)?;
-            let written = file.metadata()?.len();
-            let capped = ends_capped(&mut file, written);
+            let len = file.metadata()?.len();
+            let capped = ends_capped(&file, len);
             prune(&self.dir, &self.process);
             self.open = Some(Day {
                 date,
                 file,
-                written,
                 capped,
+                seen: len,
             });
         }
         Ok(self.open.as_mut().expect("opened above"))
@@ -148,19 +192,26 @@ impl Inner {
 
 impl Write for DailyWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _writing = Writing::enter();
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let cap = inner.cap;
         let day = inner.day()?;
         if day.capped {
             return Ok(buf.len());
         }
-        if day.written + buf.len() as u64 > cap {
+        // The file, not this writer, is what the cap counts: other processes append too.
+        let _lock = append_lock(&day.file);
+        let len = day.file.metadata()?.len();
+        let capped_by_another = len != day.seen && ends_capped(&day.file, len);
+        if capped_by_another || len + buf.len() as u64 > cap {
             day.capped = true;
-            day.file.write_all(capped_line(cap).as_bytes())?;
+            if !capped_by_another && !ends_capped(&day.file, len) {
+                (&day.file).write_all(capped_line(cap).as_bytes())?;
+            }
             return Ok(buf.len());
         }
-        day.file.write_all(buf)?;
-        day.written += buf.len() as u64;
+        (&day.file).write_all(buf)?;
+        day.seen = len + buf.len() as u64;
         Ok(buf.len())
     }
 
@@ -177,9 +228,76 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DailyWriter {
     }
 }
 
+/// The file's append lock, waited for up to [`APPEND_LOCK_WAIT`]; `None` past that (the line
+/// is then written without it) or when the lock can't be taken at all.
+fn append_lock(file: &File) -> Option<crate::fs::AppendLock<'_>> {
+    let until = Instant::now() + APPEND_LOCK_WAIT;
+    loop {
+        match crate::fs::try_lock_append(file) {
+            Ok(Some(lock)) => return Some(lock),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+            _ => return None,
+        }
+    }
+}
+
+/// Removes `<process>.<YYYY-MM-DD>.log` files in `dir` dated more than [`LOG_FILES_KEPT`]
+/// days before today (UTC): the files of a process name no longer used, which [`prune`]
+/// never reaches (the core's `core.<date>.log` from before plan 4a). Other files are never
+/// touched; a file that can't be deleted is left.
+pub fn prune_retired(dir: &Path, process: &str) {
+    prune_retired_at(dir, process, &utc_today());
+}
+
+/// [`prune_retired`] with `today` given (`YYYY-MM-DD`, tests).
+pub fn prune_retired_at(dir: &Path, process: &str, today: &str) {
+    let Some(today) = days_of(today) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{process}.");
+    for name in entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+    {
+        let old = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".log"))
+            .and_then(days_of)
+            .is_some_and(|day| today - day > LOG_FILES_KEPT as i64);
+        if old {
+            let _ = std::fs::remove_file(dir.join(&name));
+        }
+    }
+}
+
+/// Days since 1970-01-01 of a `YYYY-MM-DD` date (Howard Hinnant's days-from-civil).
+fn days_of(date: &str) -> Option<i64> {
+    if !is_date(date) {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (
+        date[..4].parse().ok()?,
+        date[5..7].parse().ok()?,
+        date[8..].parse().ok()?,
+    );
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 /// Whether the file's last line is the `log_capped` line (a process that starts again on a
 /// capped day writes no second one).
-fn ends_capped(file: &mut File, len: u64) -> bool {
+fn ends_capped(mut file: &File, len: u64) -> bool {
     let from = len.saturating_sub(512);
     let mut tail = Vec::new();
     file.seek(SeekFrom::Start(from)).is_ok()
@@ -277,6 +395,9 @@ mod tests {
         assert_eq!(at(1_709_251_199), "2024-02-29T23:59:59.000000Z");
         assert_eq!(at(1_709_251_200), "2024-03-01T00:00:00.000000Z");
         assert!(is_date("2026-10-24"));
+        assert_eq!(days_of("1970-01-01"), Some(0));
+        assert_eq!(days_of("2024-03-01"), Some(1_709_251_200 / 86_400));
+        assert_eq!(days_of("2026-13-01"), None);
         for bad in ["2026-1-24", "2026/10/24", "2026-10-2x", "notes"] {
             assert!(!is_date(bad), "{bad}");
         }

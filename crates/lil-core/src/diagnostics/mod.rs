@@ -149,9 +149,13 @@ const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the su
     errors, a hardware snapshot, the engines' status and environment, and the newest 5 MiB of \
     each process's newest log; with job_id, that job's summary and its tool arguments \
     (untrusted). Secrets, Claude Code profile labels, e-mail addresses and Credential Manager \
-    names are redacted, the user-profile folder becomes %USERPROFILE% and the computer name \
-    <machine>. It never holds a workspace file, and nothing is sent anywhere: the bundle \
-    leaves this PC only when you hand it on.";
+    names, Windows SIDs, well-known token formats and open/ link targets are redacted, the \
+    user-profile folder becomes %USERPROFILE%, the account name <user> and the computer name \
+    <machine>. Still in it: the names of other programs and network adapters (the hardware \
+    snapshot), the job's arguments with any prompt text, and model file names and workspace \
+    paths outside the user-profile folder (the logs). It never holds a workspace file; a bundle \
+    made in the same second as another gets a name of its own, the folder keeps the newest 10, \
+    and nothing is sent anywhere: the bundle leaves this PC only when you hand it on.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

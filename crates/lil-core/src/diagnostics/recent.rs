@@ -10,6 +10,8 @@ use crate::telemetry::format_ts;
 
 /// How many error outcomes are kept.
 pub const RECENT_CAPACITY: usize = 1000;
+/// The longest `last_message` kept, in characters; a longer one ends `…`.
+pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// `diagnostics.recent`'s largest and default `limit`.
 pub const MAX_RECENT: u32 = 200;
 pub const DEFAULT_RECENT: u32 = 50;
@@ -50,7 +52,13 @@ impl Ring {
         self.records.push_back(ErrorRecord {
             code: code.to_string(),
             tool: tool.map(str::to_string),
-            message: message.to_string(),
+            message: if message.chars().count() > MAX_MESSAGE_CHARS {
+                let mut cut: String = message.chars().take(MAX_MESSAGE_CHARS - 1).collect();
+                cut.push('…');
+                cut
+            } else {
+                message.to_string()
+            },
             at_ms,
         });
     }

@@ -610,6 +610,35 @@ impl Env {
         std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty())
     }
 
+    /// The computer's DNS host name (`GetComputerNameExW(ComputerNamePhysicalDnsHostname)`)
+    /// on every channel: `COMPUTERNAME` is the NetBIOS name, at most 15 characters, so a
+    /// longer host name is another spelling a diagnostics bundle replaces (ARCH-121). `None`
+    /// when Windows doesn't give one.
+    pub fn dns_host_name(&self) -> Option<String> {
+        use windows::Win32::System::SystemInformation::{
+            ComputerNamePhysicalDnsHostname, GetComputerNameExW,
+        };
+        use windows::core::PWSTR;
+        let mut len = 0u32;
+        // SAFETY: a null buffer with length 0 asks for the length needed, written to `len`.
+        let _ = unsafe { GetComputerNameExW(ComputerNamePhysicalDnsHostname, None, &mut len) };
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize];
+        // SAFETY: `buf` holds `len` UTF-16 units, as `len` says; the call writes at most that.
+        unsafe {
+            GetComputerNameExW(
+                ComputerNamePhysicalDnsHostname,
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut len,
+            )
+        }
+        .ok()?;
+        buf.truncate(len as usize);
+        Some(String::from_utf16_lossy(&buf)).filter(|n| !n.is_empty())
+    }
+
     /// `<user_profile>`: the user-profile folder (on a test channel `<test root>\profile`),
     /// which a diagnostics bundle replaces with `%USERPROFILE%` (ARCH-121).
     pub fn user_profile(&self) -> PathBuf {

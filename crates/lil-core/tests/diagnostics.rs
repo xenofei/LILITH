@@ -3,7 +3,10 @@
 //! profile labels, e-mail addresses, Credential Manager targets, Deny URL tokens, the profile
 //! folder and the computer name), recent errors by code, the `diagnostics` topic, and a bundle
 //! run that opens no socket. The redactor is driven directly with hostile fixtures; the bundle
-//! through a real test-channel core.
+//! through a real test-channel core, with a canary of each kind planted in a log line, an
+//! error message, a job's arguments and a panic.
+
+mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -34,8 +37,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 fn redactor(labels: &[&str]) -> Redactor {
     Redactor {
         labels: labels.iter().map(|l| (*l).to_string()).collect(),
-        profile_dir: None,
-        machine: None,
+        ..Redactor::default()
     }
 }
 
@@ -196,6 +198,7 @@ fn profile_folder_and_machine_name_are_rewritten() {
         labels: Vec::new(),
         profile_dir: Some(long_text.clone()),
         machine: Some("TESTBOX_7Q".to_string()),
+        ..Redactor::default()
     };
     let json_escaped = serde_json::to_string(&format!(r"{long_text}\AppData\x.log")).unwrap();
     // A `Debug` path inside a JSON line: escaped twice.
@@ -420,8 +423,10 @@ fn bundle_holds_the_listed_entries_and_no_workspace_file() {
     env.register_workspace(&ws, true);
     let profile_dir = env.env.user_profile().join("claude-diag");
     env.suite_toml_set(&format!(
-        "[bundle_redaction]\nSESSION_TOKEN = \"{SECRET}\"\nowner = \"{EMAIL}\"\n\n\
+        "[bundle_redaction]\nSESSION_TOKEN = \"{SECRET}\"\nowner = \"{EMAIL}\"\n\
+         folder = '{}'\n\n\
          [[claude_code.profiles]]\nid = \"p_diag\"\nlabel = \"{LABEL}\"\nconfig_dir = '{}'\n",
+        env.env.user_profile().join("Documents").display(),
         profile_dir.display()
     ));
     let _core = CoreFixture::start(&env);
@@ -728,4 +733,231 @@ fn nothing_is_sent_anywhere() {
     assert!(path_of(&result).exists(), "{result}");
     let after = lil_platform::sockets::sockets_of(core.pid()).unwrap();
     assert!(after.is_empty(), "{after:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Canaries, names, retention, the log tail and the network.
+// ---------------------------------------------------------------------------------------------
+
+/// The canaries of [`every_canary_is_gone_from_every_entry`], built at run time: the profile
+/// folder (in three spellings), the computer name, a SID, a token of each well-known format, an
+/// `open/` payload, an e-mail address and a secret under a scrub-word key.
+struct Canaries {
+    machine: String,
+    secret: String,
+    /// What no entry may hold, in any letter case.
+    forbidden: Vec<String>,
+    /// All of them in one text, as a log line, an error, a job argument and a panic carry it.
+    text: String,
+}
+
+fn canaries(env: &TestEnv) -> Canaries {
+    use base64::Engine as _;
+    let machine = "CANARYBOX-7Q".to_string();
+    let profile = env.env.user_profile().display().to_string();
+    let picture = format!(r"{profile}\Pictures\canary-pic.png");
+    let sid = "S-1-5-21-4111111111-4222222222-4333333333-1042".to_string();
+    let tokens = vec![
+        format!("ghp_{}", "Ca1".repeat(12)),
+        format!("gho_{}", "Cb2".repeat(12)),
+        format!("ghu_{}", "Cc3".repeat(12)),
+        format!("ghs_{}", "Cd4".repeat(12)),
+        format!("ghr_{}", "Ce5".repeat(12)),
+        format!("github_pat_11{}", "Cf6_".repeat(15)),
+        format!("hf_{}", "Cg7".repeat(12)),
+        format!("sk-ant-api03-{}", "Ch8-".repeat(12)),
+        format!("sk-proj-{}", "Ci9".repeat(12)),
+        format!("AGE-SECRET-KEY-1{}", "CJ0".repeat(20)),
+        format!(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJjYW5hcnkifQ.{}",
+            "Ck1".repeat(10)
+        ),
+    ];
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&picture);
+    let open = format!("lil-{}:open/{payload}", env.env.channel());
+    let email = "canary.person@example.com".to_string();
+    let secret = "canary-secret-value-5e1b".to_string();
+    let text = format!(
+        "{picture} {} {} {machine} {sid} {open} {email} api_key={secret} {}",
+        picture.replace('\\', "/"),
+        picture.to_uppercase(),
+        tokens.join(" ")
+    );
+    let mut forbidden = vec![
+        profile.clone(),
+        profile.replace('\\', "/"),
+        profile.replace('\\', r"\\"),
+        machine.clone(),
+        sid,
+        payload,
+        email,
+        secret.clone(),
+    ];
+    forbidden.extend(tokens);
+    Canaries {
+        machine,
+        secret,
+        forbidden,
+        text,
+    }
+}
+
+#[test] // spec: ARCH-121, QA-084, ARCH-119
+fn every_canary_is_gone_from_every_entry() {
+    let env = TestEnv::new();
+    let canary = canaries(&env);
+    let _core = CoreFixture::start_with_env(&env, &[("COMPUTERNAME", &canary.machine)]);
+    let mut pipe = session(&env, None);
+
+    // A log line, plain and with the text `Debug`-escaped inside it.
+    let today = lil_schema::time::date(
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    );
+    let line = json!({"fields": {"message": canary.text, "report": format!("{:?}", canary.text),
+                                 "api_key": canary.secret}});
+    write_file(
+        &env.env.logs_dir().join(format!("plant.{today}.log")),
+        format!("{line}\n").as_bytes(),
+    );
+    // An error message.
+    let unknown = pipe.tool(&format!("no.such {}", canary.text), json!({}), None);
+    assert_eq!(unknown["error"]["code"], "tool.unknown", "{unknown}");
+    // A job's arguments.
+    let submitted = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "estimate_key": canary.text}),
+        Some("canary-job"),
+    );
+    let id = submitted["job"]["job_id"].as_str().unwrap().to_string();
+    wait_done(&mut pipe, &id);
+    // A panic.
+    let panicked = pipe.tool("test.panic", json!({"message": canary.text}), None);
+    assert_eq!(panicked["error"]["code"], "core.bug", "{panicked}");
+
+    let result = bundle(&mut pipe, json!({"job_id": id}), "canary-bundle");
+    let found = entries(&path_of(&result));
+    for planted in [
+        format!("logs/plant.{today}.log"),
+        "errors.json".to_string(),
+        "job.json".to_string(),
+    ] {
+        assert!(
+            found.contains_key(&planted),
+            "no {planted}: {:?}",
+            found.keys()
+        );
+    }
+    assert!(
+        found["errors.json"].contains("core.bug"),
+        "{}",
+        found["errors.json"]
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(name, text)| name.starts_with("logs/lil-core.") && text.contains("\"panic\"")),
+        "the panic is in the core's log"
+    );
+    for (name, text) in &found {
+        let (name_l, text_l) = (name.to_lowercase(), text.to_lowercase());
+        for c in &canary.forbidden {
+            let c = c.to_lowercase();
+            assert!(!name_l.contains(&c), "the entry name {name} holds {c:?}");
+            assert!(!text_l.contains(&c), "{name} holds {c:?}:\n{text}");
+        }
+    }
+}
+
+#[tokio::test] // spec: ARCH-121, P4a-R19
+async fn a_bundle_in_the_same_second_never_replaces_another() {
+    let env = TestEnv::new();
+    let events = Arc::new(EventBus::new(FakeClock::new()));
+    // The fake clock never moves: every bundle has the same second.
+    let d = diagnostics(&env, &events);
+    let ctx = common::ctx(&env, lil_protocol::CallerKind::Cli, &events);
+    let first = d.bundle(&ctx, None).await.unwrap();
+    let first_bytes = std::fs::read(&first.path).unwrap();
+    d.record_error("x.changed", None, "the second bundle differs", 1);
+    let second = d.bundle(&ctx, None).await.unwrap();
+    let third = d.bundle(&ctx, None).await.unwrap();
+    assert!(second.path.ends_with("-2.zip"), "{second:?}");
+    assert!(third.path.ends_with("-3.zip"), "{third:?}");
+    assert_eq!(
+        second.path.replace("-2.zip", ".zip"),
+        first.path,
+        "the same second's name"
+    );
+    assert_eq!(
+        std::fs::read(&first.path).unwrap(),
+        first_bytes,
+        "the first is kept"
+    );
+    assert!(entries(Path::new(&second.path))["errors.json"].contains("x.changed"));
+
+    // The folder keeps the newest 10, the one just made always among them; other files stay.
+    let notes = env.env.diagnostics_dir().join("notes.txt");
+    write_file(&notes, b"mine");
+    let mut made = vec![first.path, second.path, third.path];
+    for _ in 0..9 {
+        made.push(d.bundle(&ctx, None).await.unwrap().path);
+    }
+    let left: BTreeSet<String> = std::fs::read_dir(env.env.diagnostics_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path().display().to_string())
+        .collect();
+    let want: BTreeSet<String> = made[made.len() - 10..]
+        .iter()
+        .cloned()
+        .chain([notes.display().to_string()])
+        .collect();
+    assert_eq!(left, want);
+}
+
+#[test] // spec: ARCH-121
+fn read_tail_keeps_the_newest_bytes_from_a_line_start() {
+    use lil_core::store::fsops::read_tail;
+    let env = TestEnv::new();
+    let log = env.root().join("t.log");
+    write_file(&log, b"aaaa\nbbbb\ncccc\n");
+    let tail = |max| String::from_utf8(read_tail(&log, max).unwrap()).unwrap();
+    assert_eq!(tail(100), "aaaa\nbbbb\ncccc\n", "a shorter file whole");
+    assert_eq!(tail(15), "aaaa\nbbbb\ncccc\n", "exactly max");
+    assert_eq!(tail(10), "bbbb\ncccc\n", "a window that starts at a line");
+    assert_eq!(tail(7), "cccc\n", "cut to the next line");
+    assert_eq!(tail(3), "", "no line starts in the window");
+    let one = env.root().join("one.log");
+    write_file(&one, b"no newline at all");
+    assert_eq!(String::from_utf8(read_tail(&one, 5).unwrap()).unwrap(), "");
+}
+
+/// The diagnostics module can't send anything: it names no network API (ARCH-122).
+#[test] // spec: ARCH-122, QA-085
+fn the_diagnostics_module_names_no_network_api() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("diagnostics");
+    let mut read = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        read += 1;
+        for api in [
+            "reqwest",
+            "TcpStream",
+            "TcpListener",
+            "UdpSocket",
+            "std::net",
+            "tokio::net",
+            "hyper",
+            "tungstenite",
+            "WinHttp",
+            "WSAStartup",
+        ] {
+            assert!(!text.contains(api), "{} names {api}", path.display());
+        }
+    }
+    assert!(read >= 4, "{read} files in {}", dir.display());
 }

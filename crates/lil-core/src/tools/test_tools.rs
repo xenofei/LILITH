@@ -6,7 +6,7 @@
 //! | `test.echo` | read | `{text}` | `{text}` |
 //! | `test.write` | write | `{label, fail?, pad?}` | `{label, executions}`; `fail: true` → `params.invalid`; `pad: n` adds `padding`, n bytes long |
 //! | `test.block` | write | `{gate}` | `{gate, executions}` once a test opens the gate |
-//! | `test.panic` | read | `{}` | panics |
+//! | `test.panic` | read | `{message?}` | panics, with `message` when given |
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
 //! | `test.destructive` | destructive | `{cost?}` (a decimal string) | `{count}`: its runs in this core |
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
@@ -527,9 +527,20 @@ struct DestructiveResult {
     count: u64,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PanicArgs {
+    /// What the panic says (default `test.panic was called`).
+    #[serde(default)]
+    message: Option<String>,
+}
+
 /// `test.panic`'s body.
-fn boom() -> Result<(Nothing, String), ErrorBody> {
-    panic!("test.panic was called")
+fn boom(args: PanicArgs) -> Result<(Nothing, String), ErrorBody> {
+    match args.message {
+        Some(message) => panic!("{message}"),
+        None => panic!("test.panic was called"),
+    }
 }
 
 fn params_invalid(ctx: &CallCtx, message: String) -> ErrorBody {
@@ -1064,7 +1075,7 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         "Test channels only: panics (QA-012).",
         EffectClass::Read,
         TEST_MODULE,
-        |_ctx, _args: NoArgs| Box::pin(async move { boom() }),
+        |_ctx, args: PanicArgs| Box::pin(async move { boom(args) }),
     ));
 
     reg.register(typed_tool(

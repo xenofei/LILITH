@@ -187,7 +187,7 @@ fn racing_starts_yield_one_core() {
     let core_logs: Vec<String> = std::fs::read_dir(&logs)
         .unwrap_or_else(|e| panic!("cannot list {}: {e}", logs.display()))
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("core.") && name.ends_with(".log"))
+        .filter(|name| name.starts_with("lil-core.") && name.ends_with(".log"))
         .collect();
     assert_eq!(core_logs.len(), 1, "{core_logs:?}");
     stop(&cfg);

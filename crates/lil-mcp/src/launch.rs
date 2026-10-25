@@ -147,7 +147,8 @@ pub fn checked(core_dir: &Path, exe: &Path, args: &[String], scheme: &str) -> Op
         registered == installed.args.as_slice(),
         open_url(url, scheme),
     ) else {
-        tracing::warn!(app = %installed.app, ?args, "the core's launch command is not the app's registered one; nothing is started");
+        // Only the shape: an argument can be a path or a ref (an `open/` payload).
+        tracing::warn!(app = %installed.app, args = args.len(), "the core's launch command is not the app's registered one; nothing is started");
         return None;
     };
     let mut launched = installed.args;

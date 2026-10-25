@@ -1,5 +1,6 @@
 //! `diagnostics.bundle` (ARCH-121, QA-084; P4a-R19; Appendix G "Diagnostics"): one zip,
-//! `<local dir>\diagnostics\lilith-diagnostics-<YYYYMMDDTHHMMSSZ>.zip`, holding
+//! `<local dir>\diagnostics\lilith-diagnostics-<YYYYMMDDTHHMMSSZ>.zip` (or `-2`, `-3` … when a
+//! bundle of that second is there: it is never replaced), holding
 //!
 //! - `manifest.json`: `{bundle: 1, created, build_id, channel, protocol}`;
 //! - `versions.json`: the core, each app that said hello, ComfyUI, the Qt pair and
@@ -9,13 +10,15 @@
 //! - `hardware.json`: the telemetry `Snapshot`;
 //! - `engines.json`: `{status: engines.status, environment: engines.environment}`;
 //! - `logs/<file>`: the newest [`LOG_TAIL_BYTES`] of each process's newest
-//!   `<process>.<YYYY-MM-DD>.log`, cut at a line start and redacted line by line;
+//!   `<process>.<YYYY-MM-DD>.log`, cut at a line start and redacted line by line, at most
+//!   [`LOGS_TOTAL_BYTES`] in all (`lil-core`'s first, then by name);
 //! - with a job, `job.json`: `{job, tool, arguments, untrusted: true}`.
 //!
 //! Never a workspace file. Every entry is redacted ([`super::redact`]); `redactions` counts
 //! the replacements. The zip is built in memory and written by the store's cache writer
-//! (`fsops::write_suite_cache_file`: a temp file in the diagnostics folder, then a move), so
-//! nothing is written anywhere else. Nothing is sent anywhere (ARCH-122).
+//! (`fsops::write_new_suite_cache_file`: a temp file in the diagnostics folder, then a move
+//! that never replaces), so nothing is written anywhere else; then the folder keeps the newest
+//! [`KEEP_BUNDLES`] bundles. Nothing is sent anywhere (ARCH-122).
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write as _};
@@ -28,7 +31,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::redact::{Compiled, Redactor, profile_labels};
+use super::redact::{Compiled, Redactor, profile_values};
 use super::{Diagnostics, MAX_RECENT};
 use crate::engines::comfyui::environment;
 use crate::jobs::JobId;
@@ -37,6 +40,12 @@ use crate::tools::CallCtx;
 
 /// How much of each process's newest log goes in.
 pub const LOG_TAIL_BYTES: u64 = 5 * 1024 * 1024;
+/// How much of the logs goes in, in all.
+pub const LOGS_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// How many bundles the diagnostics folder keeps.
+pub const KEEP_BUNDLES: usize = 10;
+/// A bundle's name before its time stamp.
+const BUNDLE_PREFIX: &str = "lilith-diagnostics-";
 /// The manifest's `bundle` version.
 const BUNDLE_VERSION: u32 = 1;
 
@@ -211,13 +220,18 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
             None
         }
     };
-    let redactor = Redactor {
-        labels: suite_toml
+    let profiles = |key: &str| {
+        suite_toml
             .as_deref()
-            .map(profile_labels)
-            .unwrap_or_default(),
+            .map(|doc| profile_values(doc, key))
+            .unwrap_or_default()
+    };
+    let redactor = Redactor {
+        labels: profiles("label"),
         profile_dir: Some(env.user_profile().display().to_string()),
         machine: env.computer_name(),
+        machine_names: env.dns_host_name().into_iter().collect(),
+        names: profiles("config_dir"),
     }
     .compile();
     let mut redactions = 0u32;
@@ -235,17 +249,23 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
             entries.push(("suite.toml".to_string(), text));
         }
     }
+    let mut budget = LOGS_TOTAL_BYTES;
     for path in newest_logs(&env.logs_dir()) {
         let Some(file) = path.file_name().map(|f| f.to_string_lossy().into_owned()) else {
             continue;
         };
-        let bytes = match fsops::read_tail(&path, LOG_TAIL_BYTES) {
+        if budget == 0 {
+            tracing::warn!(log = %file, "the bundle's logs are full; it leaves this one out");
+            continue;
+        }
+        let bytes = match fsops::read_tail(&path, LOG_TAIL_BYTES.min(budget)) {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(log = %file, error = %e, "a log can't be read; the bundle leaves it out");
                 continue;
             }
         };
+        budget = budget.saturating_sub(bytes.len() as u64);
         let (text, n) = redact_lines(&redactor, &String::from_utf8_lossy(&bytes));
         redactions += n;
         entries.push((format!("logs/{file}"), text));
@@ -262,16 +282,52 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
     }
     let bytes = zip.finish().map_err(std::io::Error::other)?.into_inner();
     let path = env.diagnostics_dir().join(format!(
-        "lilith-diagnostics-{}.zip",
+        "{BUNDLE_PREFIX}{}.zip",
         lil_schema::time::compact(parts.unix_secs)
     ));
-    fsops::write_suite_cache_file(env, &path, &bytes)?;
+    let path = fsops::write_new_suite_cache_file(env, &path, &bytes)?;
+    prune_bundles(env, &path);
     Ok(BundleResult {
         path: path.display().to_string(),
         bytes: bytes.len() as u64,
         files: entries.into_iter().map(|(name, _)| name).collect(),
         redactions,
     })
+}
+
+/// Removes all but the newest [`KEEP_BUNDLES`] bundles of the diagnostics folder: `written`,
+/// the one just made, and the newest others by their time stamp and number. Other files are
+/// never touched; one that can't be removed is left.
+fn prune_bundles(env: &Env, written: &Path) {
+    let written = written
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let dir = env.diagnostics_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    // (stamp, number, name) of each bundle.
+    let mut bundles: Vec<(String, u32, String)> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| Some(name) != written.as_ref())
+        .filter_map(|name| {
+            let stem = name.strip_prefix(BUNDLE_PREFIX)?.strip_suffix(".zip")?;
+            let (stamp, number) = match stem.split_once('-') {
+                Some((stamp, k)) => (stamp, k.parse().ok()?),
+                None => (stem, 1),
+            };
+            let stamped = stamp.len() == 16 && stamp.as_bytes()[8] == b'T' && stamp.ends_with('Z');
+            stamped.then(|| (stamp.to_string(), number, name.clone()))
+        })
+        .collect();
+    bundles.sort();
+    let excess = bundles.len().saturating_sub(KEEP_BUNDLES - 1);
+    for (_, _, name) in &bundles[..excess] {
+        if let Err(e) = fsops::remove_suite_cache_file(env, &dir.join(name)) {
+            tracing::warn!(bundle = %name, error = %e, "an old diagnostics bundle could not be removed");
+        }
+    }
 }
 
 /// `text` redacted line by line.
@@ -316,9 +372,14 @@ fn newest_logs(dir: &Path) -> Vec<PathBuf> {
             newest.insert(process.to_string(), date.to_string());
         }
     }
-    newest
+    // The core's own log first, then by name.
+    let mut logs: Vec<(bool, String, String)> = newest
         .into_iter()
-        .map(|(process, date)| dir.join(format!("{process}.{date}.log")))
+        .map(|(process, date)| (process != "lil-core", process, date))
+        .collect();
+    logs.sort();
+    logs.into_iter()
+        .map(|(_, process, date)| dir.join(format!("{process}.{date}.log")))
         .collect()
 }
 

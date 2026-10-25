@@ -136,8 +136,108 @@ pub fn write_suite_cache_file(
     path: &Path,
     bytes: &[u8],
 ) -> std::io::Result<()> {
+    let (_, temp) = cache_temp(env, path, bytes)?;
+    let placed = match move_new(&temp, path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // `.<name>.<pid>-<n>.bak`, beside the temp file.
+            let backup = temp.with_extension("bak");
+            let replaced = replace(path, &temp, &backup);
+            settle_replace(path, &backup, replaced, move_new)
+        }
+        other => other,
+    };
+    if placed.is_err() {
+        let _ = remove_file(&temp);
+    }
+    placed
+}
+
+/// How many names [`write_new_suite_cache_file`] tries: `<name>`, then `<stem>-2.<ext>` up to
+/// `<stem>-99.<ext>`.
+pub const NEW_CACHE_NAMES: u32 = 99;
+
+/// [`write_suite_cache_file`], but never replacing a file: the temp file is moved (without
+/// `MOVEFILE_REPLACE_EXISTING`) to `path`, or, when a file has that name, to
+/// `<stem>-2.<ext>`, `<stem>-3.<ext>` … up to [`NEW_CACHE_NAMES`] names; no name is checked
+/// before the move, so two writers never take the same one. Returns the name it took (a
+/// diagnostics bundle made in the same second as another, Appendix G "Diagnostics").
+///
+/// # Errors
+/// As [`write_suite_cache_file`]; `AlreadyExists` when every name is taken.
+pub fn write_new_suite_cache_file(
+    env: &lil_platform::Env,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    let (dir, temp) = cache_temp(env, path, bytes)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name.as_str(), ""),
+    };
+    for k in 1..=NEW_CACHE_NAMES {
+        let target = if k == 1 {
+            path.to_path_buf()
+        } else {
+            dir.join(format!("{stem}-{k}{ext}"))
+        };
+        match move_new(&temp, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                let _ = remove_file(&temp);
+                return Err(e);
+            }
+        }
+    }
+    let _ = remove_file(&temp);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "{} and its {} numbered names are all taken",
+            path.display(),
+            NEW_CACHE_NAMES - 1
+        ),
+    ))
+}
+
+/// Removes the file `path` of one of the suite's cache folders (the same check as
+/// [`write_suite_cache_file`]): the diagnostics folder's older bundles.
+///
+/// # Errors
+/// `PermissionDenied` for a path outside the two folders; the removal's error.
+pub fn remove_suite_cache_file(env: &lil_platform::Env, path: &Path) -> std::io::Result<()> {
+    check_cache_path(env, path)?;
+    remove_file(path)
+}
+
+/// The checks of [`write_suite_cache_file`], then `bytes` in a new temp file beside `path`
+/// (the folder made, a day's leftovers swept first): the folder and the temp file.
+fn cache_temp<'p>(
+    env: &lil_platform::Env,
+    path: &'p Path,
+    bytes: &[u8],
+) -> std::io::Result<(&'p Path, PathBuf)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    let (dir, name) = check_cache_path(env, path)?;
+    ensure_dir(dir)?;
+    sweep_leftovers(dir);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
+    let temp = write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none())?;
+    Ok((dir, temp))
+}
+
+/// `path`'s folder and file name, when it is a file directly in the `.lilref` cache or the
+/// diagnostics folder with a name Windows reads as a plain file ([`write_suite_cache_file`]).
+fn check_cache_path<'p>(
+    env: &lil_platform::Env,
+    path: &'p Path,
+) -> std::io::Result<(&'p Path, &'p std::ffi::OsStr)> {
     let refuse = |why: &str| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -174,23 +274,7 @@ pub fn write_suite_cache_file(
     {
         return Err(refuse("its folder is another one"));
     }
-    ensure_dir(dir)?;
-    sweep_leftovers(dir);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
-    let temp = write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none())?;
-    let placed = match move_new(&temp, path) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let backup = dir.join(format!("{stem}.bak"));
-            let replaced = replace(path, &temp, &backup);
-            settle_replace(path, &backup, replaced, move_new)
-        }
-        other => other,
-    };
-    if placed.is_err() {
-        let _ = remove_file(&temp);
-    }
-    placed
+    Ok((dir, name))
 }
 
 /// The newest `max` bytes of `path` (all of it when it is shorter), cut so they start at a
